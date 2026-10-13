@@ -14,7 +14,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/launch"
-	"github.com/cozy-creator/cozy/internal/machines"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/packagepublish"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -38,7 +37,6 @@ type managedRentals struct {
 	// an external capacity edge: queued machine executions must be re-asked
 	// immediately rather than waiting for the next poll or a new CLI request.
 	wakeQueue func()
-	installs  *machines.Installs
 	// forget closes the daemon's connection to a machine whose rental ended.
 	forget func(string)
 	// placeReleased places again the runs a rental proven gone left in the outbox.
@@ -831,9 +829,6 @@ func (m *managedRentals) watch(quit <-chan struct{}) {
 			}
 			m.report()
 		}
-		if m.installs != nil {
-			m.installs.Wake()
-		}
 		select {
 		case reask <- struct{}{}:
 		default:
@@ -1207,9 +1202,6 @@ func (m *managedRentals) reattach(ids []string) {
 		}
 	}
 	if len(ids) > 0 {
-		if m.installs != nil {
-			m.installs.Wake()
-		}
 		m.wakeQueueAsync()
 	}
 }

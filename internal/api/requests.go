@@ -784,22 +784,25 @@ type Lifecycle struct {
 	MachineExecution *MachineExecutionView `json:"machine_execution,omitempty"`
 	Number           int64                 `json:"number"`
 	Kind             string                `json:"kind"`
-	RequestID        string                `json:"request_id"`
-	Status           string                `json:"status"`
-	Package          string                `json:"package"`
-	Function         string                `json:"function"`
-	Release          string                `json:"release,omitempty"`
-	Attempt          uint64                `json:"attempt"`
-	Attempts         int                   `json:"attempts"`
-	QueuedMS         int64                 `json:"queued_ms"`
-	ExecutionMS      int64                 `json:"execution_ms"`
-	ExecutionKnown   bool                  `json:"execution_known"`
-	AttemptWallMS    int64                 `json:"attempt_wall_ms,omitempty"`
-	ProgressStage    string                `json:"progress_stage,omitempty"`
-	StageFraction    *float64              `json:"stage_fraction,omitempty"`
-	OverallFraction  *float64              `json:"overall_fraction,omitempty"`
-	Position         *int64                `json:"position,omitempty"`
-	Total            *int64                `json:"total,omitempty"`
+	// Target is what an operation (install, remove, download, upload, warm) puts on its
+	// machine; a function's run names its package and function instead.
+	Target          string   `json:"target,omitempty"`
+	RequestID       string   `json:"request_id"`
+	Status          string   `json:"status"`
+	Package         string   `json:"package"`
+	Function        string   `json:"function"`
+	Release         string   `json:"release,omitempty"`
+	Attempt         uint64   `json:"attempt"`
+	Attempts        int      `json:"attempts"`
+	QueuedMS        int64    `json:"queued_ms"`
+	ExecutionMS     int64    `json:"execution_ms"`
+	ExecutionKnown  bool     `json:"execution_known"`
+	AttemptWallMS   int64    `json:"attempt_wall_ms,omitempty"`
+	ProgressStage   string   `json:"progress_stage,omitempty"`
+	StageFraction   *float64 `json:"stage_fraction,omitempty"`
+	OverallFraction *float64 `json:"overall_fraction,omitempty"`
+	Position        *int64   `json:"position,omitempty"`
+	Total           *int64   `json:"total,omitempty"`
 	// RemainingMS is read-only compatibility with older daemons; future-stage time is unknown.
 	RemainingMS *int64 `json:"remaining_ms,omitempty"`
 	// StageRemainingMS estimates only the current counted stage; later stages are unknown.
@@ -962,15 +965,25 @@ func (s *Server) lifecycleOf(row records.Request) Lifecycle {
 	return life
 }
 
+// runKind is the kind a run is listed under: a function's run (`invocation`), a job, or an
+// operation's own kind with its target.
+func runKind(row records.Request) (string, string) {
+	switch {
+	case row.IsJob():
+		return "job", ""
+	case row.IsOperation():
+		op, _ := row.Operation()
+		return row.Kind, op.Target()
+	}
+	return "invocation", ""
+}
+
 func (s *Server) lifecycleFacts(row records.Request) Lifecycle {
 	if link, problem := s.store.MachineExecution(row.ID); problem == nil && link != nil {
 		state := s.machineJobState(row, link)
 		machine := s.machineWord(row, link)
-		kind := "invocation"
-		if row.IsJob() {
-			kind = "job"
-		}
-		life := Lifecycle{Number: row.Number, Kind: kind, RequestID: row.ID, Status: state.Status,
+		kind, target := runKind(row)
+		life := Lifecycle{Number: row.Number, Kind: kind, Target: target, RequestID: row.ID, Status: state.Status,
 			Package: row.Package, Function: row.Entrypoint, Release: row.Release, Attempt: state.Attempt, Attempts: state.Attempts,
 			ExecutionMS: state.ExecutionMS, ExecutionKnown: state.ExecutionKnown, Memo: state.Memo,
 			AttemptWallMS: state.AttemptWallMS, QueuedMS: state.QueuedMS,
@@ -1003,10 +1016,7 @@ func (s *Server) lifecycleFacts(row records.Request) Lifecycle {
 		}
 		return life
 	}
-	kind := "invocation"
-	if row.IsJob() {
-		kind = "job"
-	}
+	kind, _ := runKind(row)
 	life := Lifecycle{
 		Number: row.Number, Kind: kind, RequestID: row.ID,
 		Status: s.publicStatusOf(row), Package: row.Package,

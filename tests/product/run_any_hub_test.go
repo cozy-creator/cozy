@@ -35,7 +35,7 @@ func TestARunFindsItsRentalOnAnyHub(t *testing.T) {
 	if link == nil || link.MachineID != parityRental || !link.Collected {
 		t.Fatalf("the run did not execute on tessa: %+v", link)
 	}
-	if code, out = runCozy(t, root, "run", "list", "--no-watch"); code != 0 || !regexp.MustCompile(`(?m)^NUMBER +TARGET +MACHINE `).MatchString(out) ||
+	if code, out = runCozy(t, root, "run", "list", "--no-watch"); code != 0 || !regexp.MustCompile(`(?m)^NUMBER +KIND +TARGET +MACHINE `).MatchString(out) ||
 		regexp.MustCompile(`(?m)^NUMBER .*\bHUB\b`).MatchString(out) || !strings.Contains(out, "tessa") {
 		t.Fatalf("run list does not show the run's machine without a hub [exit %d]\n%s", code, out)
 	}

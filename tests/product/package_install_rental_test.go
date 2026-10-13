@@ -3,7 +3,6 @@ package producttest
 import (
 	"bytes"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -25,15 +24,9 @@ import (
 // command asks the Hub nothing: the machine reads the release at its hub (the newest when
 // none is named) and answers which it installed. No worker, Python environment or weights.
 func TestPackageInstallRental(t *testing.T) {
-	for _, test := range []struct {
-		name, version, installed, rental string
-		// older: a daemon from before package_verbs takes exact releases only, so the
-		// command reads the newest at the hub itself.
-		older bool
-	}{
-		{"latest-by-name", "", "2.0.0", "kirukiru", false},
-		{"pinned-by-id", "1.2.3", "1.2.3", "rental-proof", false},
-		{"older-daemon", "", "2.0.0", "kirukiru", true},
+	for _, test := range []struct{ name, version, rental string }{
+		{"latest-by-name", "", "kirukiru"},
+		{"pinned-by-id", "1.2.3", "rental-proof"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			check := func(problem *exit.Error) {
@@ -42,12 +35,8 @@ func TestPackageInstallRental(t *testing.T) {
 					t.Fatal(problem)
 				}
 			}
-			var preparations atomic.Int32
+			var operations atomic.Int32
 			hubPeer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if test.older && r.Method == "GET" && r.URL.Path == "/v1/packages/paul/minimax-h3" {
-					_, _ = w.Write([]byte(`{"package":{"name":"minimax-h3"},"releases":[{"release":"1.2.3"},{"release":"2.0.0"}]}`))
-					return
-				}
 				t.Errorf("a rental installation asked the Hub: %s %s", r.Method, r.URL)
 				http.Error(w, "unexpected request", 500)
 			}))
@@ -56,34 +45,25 @@ func TestPackageInstallRental(t *testing.T) {
 				if r.Method == "GET" && r.URL.Path == "/" {
 					return
 				}
-				if r.Method == "GET" && r.URL.Path == "/v1/capabilities" { // it carries v1 installs
-					_, _ = fmt.Fprintf(w, `{"machine_v1":true,"package_verbs":%t}`, !test.older)
+				if r.Method == "GET" && r.URL.Path == "/v1/capabilities" {
+					_, _ = w.Write([]byte(`{"machine_v1":true,"operations":true}`))
 					return
 				}
-				if r.Method == "GET" && r.URL.Path == "/v1/local/rentals/rental-proof/installs/install-proof" { // the command follows it
-					_ = json.NewEncoder(w).Encode(api.RentalInstallStatus{RentalInstall: records.RentalInstall{ID: "install-proof", RentalID: "rental-proof",
-						State: "succeeded", Selection: records.RentalInstallSelection{Package: "paul/minimax-h3", Release: test.version},
-						Result: json.RawMessage(`{"package":"paul/minimax-h3","release":"` + test.installed + `"}`)}})
-					return
-				}
-				if r.Method != "POST" || r.URL.Path != "/v1/local/rentals/rental-proof/prepare" || r.Header.Get("Authorization") == "" {
+				if r.Method != "POST" || r.URL.Path != "/v1/local/machines/rental-proof/operations" || r.Header.Get("Authorization") == "" {
 					t.Errorf("unexpected daemon request: %s %s", r.Method, r.URL)
 					http.Error(w, "unexpected request", 500)
 					return
 				}
-				var request api.RentalPackagePrepareRequest
-				if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				var op records.Operation
+				if err := json.NewDecoder(r.Body).Decode(&op); err != nil {
 					t.Error(err)
 				}
-				sent := test.version
-				if test.older {
-					sent = test.installed
+				if op.Package != "paul/minimax-h3" || op.Release != test.version || op.Hub != hubPeer.URL || len(op.Models) != 0 || op.Kind() != "install" {
+					t.Errorf("wrong operation or implicit model selection: %+v", op)
 				}
-				if request.Package != "paul/minimax-h3" || request.Release != sent || request.Hub != hubPeer.URL || len(request.Models) != 0 {
-					t.Errorf("wrong preparation or implicit model selection: %+v", request)
-				}
-				preparations.Add(1)
-				_ = json.NewEncoder(w).Encode(api.RentalPackagePrepareResult{ID: "install-proof", RentalID: "rental-proof", Selection: request, State: "queued"})
+				operations.Add(1)
+				w.WriteHeader(http.StatusAccepted)
+				_ = json.NewEncoder(w).Encode(api.Handle{Number: 41, RequestID: "op-proof", Status: "queued"})
 			}))
 			defer localPeer.Close()
 			layout, problem := home.Open(t.TempDir())
@@ -103,7 +83,7 @@ func TestPackageInstallRental(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			args := []string{"package", "install", "paul/minimax-h3", "--rental=" + test.rental}
+			args := []string{"package", "install", "paul/minimax-h3", "--rental=" + test.rental, "--no-wait"}
 			if test.version != "" {
 				args = append(args, "--version="+test.version)
 			}
@@ -112,8 +92,8 @@ func TestPackageInstallRental(t *testing.T) {
 				t.Fatal(err)
 			}
 			err = parsed.Run(&cli.Runtime{Cfg: config.Config{Home: layout.Root, HubURL: hubPeer.URL}, Out: &out, Err: &diagnostic, Mode: output.Mode{JSON: true, Full: true}})
-			if err != nil || preparations.Load() != 1 || !strings.Contains(out.String(), `"status":"succeeded","target":"paul/minimax-h3@`+test.installed+`"`) {
-				t.Fatalf("rental install: %v; preparations=%d; output=%s", err, preparations.Load(), &out)
+			if err != nil || operations.Load() != 1 || !strings.Contains(out.String(), `"number":41`) || !strings.Contains(out.String(), `"kind":"install"`) {
+				t.Fatalf("rental install: %v; operations=%d; output=%s", err, operations.Load(), &out)
 			}
 			_, installed, problem := store.ActivePackage(hubPeer.URL, "paul/minimax-h3")
 			check(problem)

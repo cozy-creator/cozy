@@ -18,7 +18,7 @@ func TestAWarmSetChangesOneMemberAndKeepsTheRest(t *testing.T) {
 	}
 	current := []*v1.WarmItem{member("paul/sdxl", "generate", v1.WarmLevel_WARM_LEVEL_IMPORTED),
 		member("paul/anima", "generate", v1.WarmLevel_WARM_LEVEL_HOST)}
-	selection := records.RentalInstallSelection{Package: "paul/sdxl", Release: "2.6.0", Entrypoint: "generate", Warm: "host",
+	selection := records.Operation{Package: "paul/sdxl", Release: "2.6.0", Entrypoint: "generate", Warm: "host",
 		Models: []records.ModelRef{{Choice: true, Package: "paul/sdxl", Slot: "model", BindingPath: "model", Model: "paul/sdxl", Release: "1.0.0",
 			Ladder: []records.ModelRung{{GPU: "*", Lane: "bf16", Manifest: "sha256:" + strings.Repeat("ab", 32)}}}}}
 	set, problem := warmSetV1(current, selection)

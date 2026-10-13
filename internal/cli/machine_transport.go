@@ -2,7 +2,6 @@ package cli
 
 import (
 	"context"
-	"encoding/json"
 	"net/url"
 	"strings"
 	"sync"
@@ -15,7 +14,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/machineendpoint"
 	"github.com/cozy-creator/cozy/internal/machines"
 	"github.com/cozy-creator/cozy/internal/machinev1"
-	"github.com/cozy-creator/cozy/internal/records"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -41,21 +39,6 @@ func (m *machineRuns) ValidateEndpoint(ctx context.Context, ep *machineendpoint.
 		return exit.Named(exit.Credential, "machine.endpoint_unauthorized", "the machine does not authorize this host's key: %s", status.Convert(err).Message())
 	}
 	return machines.Transport(err)
-}
-
-// Prewarm makes one installation on its machine without running anything: `cozy package
-// install`, `cozy model download` and `cozy model upload`, as a warm run.
-// A machine older than this cozy takes the Hub's target software first, once.
-func (m *machineRuns) Prewarm(ctx context.Context, row records.RentalInstall, report func(machines.InstallProgress)) (json.RawMessage, *exit.Error) {
-	result, problem := m.prewarmV1(ctx, row, report)
-	if problem == nil || problem.ErrName() != "machine.upgrade_required" {
-		return result, problem
-	}
-	report(machines.InstallProgress{Stage: "updating the machine's software"})
-	if next := m.followTargetV1(row.RentalID, row.Selection.Hub); next != "" {
-		return nil, exit.Named(problem.Code, problem.ErrName(), "%s; %s", problem.Message, next)
-	}
-	return m.prewarmV1(ctx, row, report)
 }
 
 // Status reads one machine's picture over cozy.machine.v1 as its owner.

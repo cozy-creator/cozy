@@ -111,6 +111,5 @@ func handleMachineModelDownload(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	selection := records.RentalInstallSelection{Models: []records.ModelRef{model}}
-	return enqueueRentalInstall(ctx, machine, selection, ctx.Inv.Bool("--await"))
+	return runOperation(ctx, machine, records.Operation{Models: []records.ModelRef{model}}, ctx.Inv.Bool("--await"))
 }

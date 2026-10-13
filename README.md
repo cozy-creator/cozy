@@ -89,15 +89,12 @@ until `cozy machine start` or the next local run, and the daemon never starts it
 collect accepted work. Optional `machine.webrtc_port` in the Cozy config
 enables its WebRTC media listener; Hub grants cannot change machine listening ports.
 
-Observe an already accepted package or model installation with
-`cozy machine installs show <rental-install-id>`; add `--await` to keep watching
-without submitting another operation. `cozy machine installs cancel <id>` withdraws
-only queued work that has never dispatched. Active or interrupted attempts remain
-protected. Both commands default to this computer; `--rental=<name-or-id>` selects
-an existing rental. Repeating cancellation returns the same canceled receipt.
-Temporary machine unavailability retains accepted installation work in the queue,
-including before any progress was reported. Machine install/start completion wakes
-that work; repeated automatic retries do not spin while the machine is unavailable.
+Every long-running command on a machine is a run with its own number: package installs,
+updates and removals, model downloads and uploads, and warm-set changes, beside function runs.
+`cozy run list` shows each one's KIND; `cozy run show|watch <n>` follow its progress and
+`cozy run cancel <n>` stops it: before dispatch it never starts; on its machine its downloads
+and installs stop, keeping the bytes already landed, so asking again resumes. An upload that has
+begun pushing to its Hub ends on its own and refuses the cancel. Ctrl-C only detaches.
 
 For development on an explicitly pinned owned worker, `cozy machine show
 --machine-endpoint-file <file>` reads its live status. `cozy machine update

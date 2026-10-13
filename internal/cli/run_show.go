@@ -492,7 +492,7 @@ func handleRunShow(ctx *Context) *exit.Error {
 
 func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
 	report := runReport{Number: life.Number, RequestID: life.RequestID, Status: life.Status,
-		Target: strings.Trim(life.Package+"/"+life.Function, "/"), Release: life.Release, Machine: life.Machine,
+		Target: lifeTarget(life), Release: life.Release, Machine: life.Machine,
 		ErrorType: life.ErrorType, ErrorCode: life.ErrorCode, Error: life.Error,
 		Memoized: life.Memoized, Computation: life.Computation, Unmemoized: life.Unmemoized,
 		CreatedAt: life.CreatedAt, QueuedMS: life.QueuedMS,

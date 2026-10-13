@@ -177,12 +177,6 @@ func serveDaemon(ctx *Context) *exit.Error {
 	// pinned machine executions as soon as the hub publishes an attachable
 	// worker, including after a daemon restart.
 	fleet.wakeQueue = c.WakeQueue
-	installContext, cancelInstalls := context.WithCancel(context.Background())
-	installs := machineset.NewInstalls(st, machines.Prewarm, ctx.Out)
-	installs.Rental = readProjection
-	fleet.installs = installs
-	installsStopped := make(chan struct{})
-	defer cancelInstalls()
 
 	// One per-launch CLI credential rides the daemon's own held 0600 record. It is never
 	// printed, logged, or placed on argv, and rotates with every launch. The public web
@@ -195,15 +189,11 @@ func serveDaemon(ctx *Context) *exit.Error {
 	}
 
 	server := api.New(api.Options{
-		RuntimeUpdate:       updates.Start,
-		RentalKeepalive:     fleet.keepalive,
-		RentalInstall:       installs.Accept,
-		RentalInstallStatus: installs.Status,
-		RentalInstallCancel: installs.Cancel,
+		RuntimeUpdate:   updates.Start,
+		RentalKeepalive: fleet.keepalive,
 		MachineReady: func(machine string) {
 			machines.WakeMachine(machine)
 			c.WakeQueue()
-			installs.Wake()
 		},
 		MachineExecutions: machines,
 		Orchestrator:      c, Cfg: ctx.Cfg, Creds: creds, Addr: addr,
@@ -218,8 +208,6 @@ func serveDaemon(ctx *Context) *exit.Error {
 		closeListeners()
 		return e
 	}
-	go func() { defer close(installsStopped); installs.Run(installContext) }()
-	defer func() { cancelInstalls(); <-installsStopped }()
 	httpServer.Open(handler)
 	go func() { _ = c.Serve() }()
 
@@ -315,8 +303,6 @@ func serveDaemon(ctx *Context) *exit.Error {
 
 	<-stop
 	close(quit)
-	cancelInstalls()
-	<-installsStopped
 	// Disconnect uploads/observation immediately. Runtime owns accepted execution;
 	// canceling this client context never sends an execution-cancel command.
 	machines.cancel()

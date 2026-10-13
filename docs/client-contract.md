@@ -331,9 +331,7 @@ installed build. Records at an older schema are refused, never migrated.
 | `GET /v1/local/machines/{machine}/status` | local | yes | one machine's picture as it reports it (cozy.machine.v1 Status): software, GPUs, live runs, environments, disk, idle deadline |
 | `POST /v1/local/machines/{machine}/ready` | local | yes | notify the controller of an availability edge after install or start; resume already accepted work without creating requests |
 | `GET /v1/local/machines/{machine}/logs/{log}` | local | yes | one log a machine keeps (`tensorfs`: TensorFS's transport decisions), oldest line first, `?tail_bytes=` the newest; an older machine answers a note in `unavailable` |
-| `POST /v1/local/rentals/{rental_id}/prepare` | local | yes | durably accept exact package or model installation; return 202 with the queued intent before the rental is ready |
-| `GET /v1/local/rentals/{rental_id}/installs/{id}` | local | yes | one queued installation's state and, while it runs, the machine's latest stage and byte counts |
-| `POST /v1/local/rentals/{rental_id}/installs/{id}/cancel` | local | yes | cancel only a queued installation atomically against dispatch; repeated cancellation is idempotent; dispatched work is preserved |
+| `POST /v1/local/machines/{machine}/operations` | local | yes | record one package or model operation on a machine (`local` or a rental id) as a numbered run and start it; the same operation still unsettled there is answered instead; `/v1/requests/{id}` and its cancel follow it like any run |
 | `POST /v1/local/rentals/{rental_id}/runtime-update` | local | yes | start or rejoin a durable per-rental Runtime update; the CLI may disconnect without canceling it |
 | `GET /v1/local/rentals/{rental_id}/runtime-update` | local | yes | read the selected update, phase, actual result, or reconciliation error |
 | `POST /v1/local/daemon/down` | local | yes | non-destructive disconnect guarded by required online work; `{force:true}` overrides that guard without canceling work; mutually exclusive `{all:true}` requests cancellation and paid teardown |

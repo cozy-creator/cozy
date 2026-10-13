@@ -197,10 +197,13 @@ func TestOneDaemonServesTwoHubs(t *testing.T) {
 	}
 	store, problem = records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
-	upload, problem := store.RentalInstall(accepted.ID)
+	upload, problem := store.RequestByReference(accepted.ID)
 	fatal(t, problem)
 	store.Close()
-	if upload == nil || upload.Selection.Hub != hubB || upload.Selection.Destination != "proof/multi-hub" {
+	if upload == nil {
+		t.Fatalf("the upload %s is not recorded", accepted.ID)
+	}
+	if op, _ := upload.Operation(); upload.Kind != "upload" || op.Hub != hubB || op.Destination != "proof/multi-hub" {
 		t.Fatalf("the upload did not record hub b: %+v", upload)
 	}
 
@@ -739,7 +742,7 @@ func TestRunsWithoutAHubStayListed(t *testing.T) {
 		t.Fatalf("the default listing is not every hub's: %+v", all)
 	}
 	// A run goes straight to its machine: the list shows the machine, not the hub.
-	if code, out := runCozy(t, root, "run", "list", "--no-watch"); code != 0 || !regexp.MustCompile(`(?m)^NUMBER +TARGET +MACHINE `).MatchString(out) ||
+	if code, out := runCozy(t, root, "run", "list", "--no-watch"); code != 0 || !regexp.MustCompile(`(?m)^NUMBER +KIND +TARGET +MACHINE `).MatchString(out) ||
 		regexp.MustCompile(`(?m)^NUMBER .*\bHUB\b`).MatchString(out) {
 		t.Fatalf("the default listing shows a hub column or no machine [%d]:\n%s", code, out)
 	}
@@ -884,9 +887,9 @@ func TestLocalMachineServesEveryHubWhereItIs(t *testing.T) {
 	fatal(t, problem)
 	defer store.Close()
 	for deadline := time.Now().Add(3 * time.Minute); ; time.Sleep(250 * time.Millisecond) {
-		row, problem := store.RentalInstall(accepted.ID)
+		row, problem := store.RequestByReference(accepted.ID)
 		fatal(t, problem)
-		if row != nil && (row.State == "succeeded" || row.State == "failed") {
+		if row != nil && records.Settled(row.State) {
 			break
 		}
 		if time.Now().After(deadline) {

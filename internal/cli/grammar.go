@@ -61,37 +61,12 @@ func (c *CreditsBuyCmd) Run(r *Runtime) error {
 }
 
 type MachineCmd struct {
-	Installs MachineInstallsCmd `cmd:"" help:"Observe accepted package and model installations, or cancel queued ones."`
-	Install  MachineInstallCmd  `cmd:"" help:"Install a worker cohort's Host and Runtime as this computer's machine."`
-	Update   MachineUpdateCmd   `cmd:"" help:"Development: update an explicitly pinned owned endpoint; accepted work finishes before activation."`
-	Show     MachineShowCmd     `cmd:"" help:"Show this computer's machine."`
-	Start    MachineStartCmd    `cmd:"" help:"Start this computer's machine, or adopt the running one."`
-	Stop     MachineStopCmd     `cmd:"" help:"Stop this computer's machine; it stays stopped until it is started or a local run starts it."`
-	Logs     MachineLogsCmd     `cmd:"" help:"Print a log this computer's machine keeps."`
-}
-
-type MachineInstallsCmd struct {
-	Show   MachineInstallShowCmd   `cmd:"" help:"Show an existing installation and its reported progress; never submit work."`
-	Cancel MachineInstallCancelCmd `cmd:"" help:"Cancel one queued installation; already dispatched work is preserved."`
-}
-
-type MachineInstallShowCmd struct {
-	ID     string `arg:"" name:"installation-id" help:"The accepted rental-install identifier."`
-	Rental string `default:"local" help:"Machine name or rental id; defaults to this computer."`
-	Await  bool   `help:"Observe this existing installation until it settles; interruption only detaches."`
-}
-
-func (c *MachineInstallShowCmd) Run(r *Runtime) error {
-	return r.call(handleMachineInstallShow, []string{c.ID}, bools("--await", c.Await), values("--rental", c.Rental), false)
-}
-
-type MachineInstallCancelCmd struct {
-	ID     string `arg:"" name:"installation-id" help:"The queued rental-install identifier to cancel."`
-	Rental string `default:"local" help:"Machine name or rental id; defaults to this computer."`
-}
-
-func (c *MachineInstallCancelCmd) Run(r *Runtime) error {
-	return r.call(handleMachineInstallCancel, []string{c.ID}, nil, values("--rental", c.Rental), false)
+	Install MachineInstallCmd `cmd:"" help:"Install a worker cohort's Host and Runtime as this computer's machine."`
+	Update  MachineUpdateCmd  `cmd:"" help:"Development: update an explicitly pinned owned endpoint; accepted work finishes before activation."`
+	Show    MachineShowCmd    `cmd:"" help:"Show this computer's machine."`
+	Start   MachineStartCmd   `cmd:"" help:"Start this computer's machine, or adopt the running one."`
+	Stop    MachineStopCmd    `cmd:"" help:"Stop this computer's machine; it stays stopped until it is started or a local run starts it."`
+	Logs    MachineLogsCmd    `cmd:"" help:"Print a log this computer's machine keeps."`
 }
 
 type MachineInstallCmd struct {

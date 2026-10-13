@@ -2,6 +2,7 @@ package producttest
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os"
 	"os/exec"
@@ -11,9 +12,7 @@ import (
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/config"
-	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/machines"
-	"github.com/cozy-creator/cozy/internal/records"
 )
 
 // `cozy model download` without --rental installs into this computer's machine through the
@@ -64,42 +63,33 @@ func TestLocalModelDownloadRunsOnThisComputersMachine(t *testing.T) {
 	h.hubAccess.signIn(t, root)
 	code, out := runCozy(t, root, "model", "download", "proof/model#"+manifest, "--json")
 	var accepted struct {
-		ID     string `json:"id"`
-		Rental string `json:"rental"`
+		Number  int64  `json:"number"`
+		Kind    string `json:"kind"`
+		Machine string `json:"machine"`
 	}
-	if code != 0 || json.Unmarshal([]byte(out), &accepted) != nil || accepted.Rental != machines.Local || accepted.ID == "" {
-		t.Fatalf("local model download was not accepted for this computer's machine [exit %d]\n%s", code, out)
+	if code != 0 || json.Unmarshal([]byte(out), &accepted) != nil || accepted.Machine != machines.Local || accepted.Number == 0 || accepted.Kind != "download" {
+		t.Fatalf("local model download was not a numbered run on this computer's machine [exit %d]\n%s", code, out)
 	}
-	layout, problem := home.Open(root)
-	fatal(t, problem)
-	store, problem := records.Open(layout.DB)
-	fatal(t, problem)
-	defer store.Close()
-	var settled *records.RentalInstall
+	number := fmt.Sprint(accepted.Number)
+	var settled struct {
+		Status string `json:"status"`
+		Error  string `json:"error"`
+	}
 	deadline := time.Now().Add(3 * time.Minute)
-	for settled == nil && time.Now().Before(deadline) {
-		row, problem := store.RentalInstall(accepted.ID)
-		fatal(t, problem)
-		if row != nil && (row.State == "succeeded" || row.State == "failed") {
-			settled = row
-		}
+	for settled.Status != "failed" && settled.Status != "completed" && time.Now().Before(deadline) {
+		_, shown := runCozy(t, root, "run", "show", number, "--json")
+		_ = json.Unmarshal([]byte(lastJSONLine(shown)), &settled)
 		time.Sleep(250 * time.Millisecond)
 	}
-	if settled == nil {
-		t.Fatal("the local machine never settled the installation")
-	}
-	t.Logf("local installation settled: %s %s: %s", settled.State, settled.ErrorCode, settled.Error)
+	t.Logf("local download run %s settled: %+v", number, settled)
 	// The stand-in hub serves bytes that are not the model, so this computer's machine refuses
 	// the download by its own name. What must never appear is a rental-only refusal or a
 	// classic local worker.
-	if settled.State != "failed" || strings.HasPrefix(settled.ErrorCode, "rental.") ||
-		!strings.HasPrefix(settled.ErrorCode, "machine") && !strings.Contains(settled.ErrorCode, "download") {
-		t.Fatalf("the installation did not reach the local Host: %+v", settled)
+	if settled.Status != "failed" || strings.Contains(settled.Error, "rental") {
+		t.Fatalf("the download did not reach the local machine: %+v", settled)
 	}
-	requests, problem := store.Requests("", "", 10)
-	fatal(t, problem)
-	if len(requests) != 0 {
-		t.Fatalf("a model download submitted a run: %+v", requests)
+	if code, listed := runCozy(t, root, "run", "list", "--json"); code != 0 || !strings.Contains(listed, `"kind":"download"`) {
+		t.Fatalf("run list does not show the download [exit %d]\n%s", code, listed)
 	}
 }
 

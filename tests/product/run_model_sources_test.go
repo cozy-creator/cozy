@@ -281,25 +281,27 @@ func TestCatalogCheckpointReferenceRoundTripsThroughRun(t *testing.T) {
 	}
 }
 
-// queuedTransfer runs a model transfer and answers the installation it queued on this
+// queuedTransfer runs a model transfer and answers the operation it recorded for this
 // computer's machine, as the daemon recorded it: the models, file and destination the
 // command froze.
-func queuedTransfer(t *testing.T, root string, args ...string) records.RentalInstallSelection {
+func queuedTransfer(t *testing.T, root string, args ...string) records.Operation {
 	t.Helper()
 	code, out := runCozy(t, root, args...)
 	var accepted struct {
 		ID string `json:"id"`
 	}
 	if code != 0 || json.Unmarshal([]byte(lastJSONLine(out)), &accepted) != nil || accepted.ID == "" {
-		t.Fatalf("%v was not queued [exit %d]: %s", args, code, out)
+		t.Fatalf("%v was not recorded [exit %d]: %s", args, code, out)
 	}
 	st, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	defer st.Close()
-	install, problem := st.RentalInstall(accepted.ID)
+	request, problem := st.RequestByReference(accepted.ID)
 	fatal(t, problem)
-	if install == nil {
-		t.Fatalf("installation %s is not recorded", accepted.ID)
+	if request == nil || !request.IsOperation() {
+		t.Fatalf("operation %s is not recorded: %+v", accepted.ID, request)
 	}
-	return install.Selection
+	op, problem := request.Operation()
+	fatal(t, problem)
+	return op
 }
