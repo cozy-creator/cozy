@@ -51,7 +51,9 @@ func TestARentalRunNeverStartsThisComputersMachine(t *testing.T) {
 	h.mu.Lock()
 	h.rentals[parityRental] = map[string]any{"rental_id": parityRental, "name": "tessa", "state": "ready",
 		"requested_accelerator_model": "CPU", "accelerator_count": 1, "hourly_rate_usd_micros": 1,
-		"worker_address": launch.Addr, "media_address": launch.MediaAddr}
+		"worker_address": launch.Addr, "media_address": launch.MediaAddr, "machine_name": "tessa",
+		"cert_pem":  string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: launch.Leaf})),
+		"worker_id": launch.WorkerID, "worker_boot_id": launch.BootID, "creator_public_key": identity.PublicKey()}
 	h.mu.Unlock()
 	fatal(t, rental.Attach(layout, store, records.Rental{ID: parityRental, MachineName: "tessa", SKU: "cpu", State: "ready",
 		AcceleratorModel: "CPU", AcceleratorCount: 1, HourlyRateUSDMicros: 1, Hub: h.server.URL,
