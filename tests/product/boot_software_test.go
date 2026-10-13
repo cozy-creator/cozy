@@ -22,10 +22,11 @@ import (
 	"github.com/cozy-creator/cozy/internal/workertls"
 )
 
-// A rental's newly attached boot runs the Hub's target software before it takes work:
-// Calcifer sends its machine Run kind: update with the target's published versions, once per
-// boot, older or newer alike. A boot already on the target is left as it is; a target the
-// machine cannot install leaves it serving its own software, and that boot is not tried again.
+// A rental's newly attached boot runs the Hub's pinned software before it takes work:
+// Calcifer sends its machine Run kind: update with the pin's published versions, once per boot,
+// older or newer alike. Unpinned, the target is what the current image bakes and a boot moves
+// only forward to it. A boot already on the target is left as it is; a target the machine
+// cannot install leaves it serving its own software, and that boot is not tried again.
 func TestARentalBootFollowsTheHubsTarget(t *testing.T) {
 	root, store, launch, identity, _, h := statusRentalHub(t)
 	layout, problem := home.Open(root)
@@ -94,10 +95,14 @@ func TestARentalBootFollowsTheHubsTarget(t *testing.T) {
 	if row := boot(booted); row.State != "succeeded" || !result(row).Unchanged {
 		t.Fatalf("a boot already on the target was updated: %+v", row)
 	}
-	// Moving the target back to an older release is a rollback; forward again, a release.
+	// Pinning an older release is a rollback; forward again, a release. An older image's
+	// software, unpinned, never moves a boot back.
 	if older := olderRelease(t, "cozy-runtime", booted["runtime"]); older != "" {
+		if row := boot(map[string]string{"runtime": older, "tensorfs": booted["tensorfs"]}); row.State != "succeeded" || !result(row).Unchanged || !samePair(running(), booted) {
+			t.Fatalf("an unpinned older target moved the boot back: %+v, running %v", row, running())
+		}
 		for _, version := range []string{older, booted["runtime"]} {
-			target := map[string]string{"runtime": version, "tensorfs": booted["tensorfs"]}
+			target := map[string]string{"runtime": version, "tensorfs": booted["tensorfs"], "pinned": "true"}
 			if row := boot(target); row.State != "succeeded" || result(row).Unchanged || !samePair(running(), target) {
 				t.Fatalf("the boot did not follow the target to %v: %+v, running %v", target, row, running())
 			}

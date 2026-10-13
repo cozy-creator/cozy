@@ -265,6 +265,13 @@ func olderMachineHome(t *testing.T, machine *olderMachine) (string, *records.Sto
 		AcceleratorCount: 1, HourlyRateUSDMicros: 100000, Hub: hub.server.URL, Address: listener.Addr().String(),
 		MediaAddress: "127.0.0.1:1", ExpectedWorkerID: olderWorkerID, ExpectedWorkerBootID: olderBootID}
 	cert := string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
+	// As Tensorhub serves a ready rental: its endpoint, boot and the creator key it authorizes.
+	hub.mu.Lock()
+	for key, value := range map[string]any{"worker_address": row.Address, "media_address": row.MediaAddress, "cert_pem": cert,
+		"worker_id": olderWorkerID, "worker_boot_id": olderBootID, "creator_public_key": identity.PublicKey()} {
+		hub.rentals[olderRental][key] = value
+	}
+	hub.mu.Unlock()
 	fatal(t, rental.Attach(layout, store, row, cert, secret.New(strings.Repeat("m", 43)), identity))
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+hub.server.URL+
 		"\ntensorhub_token: rental-idle-test\ncalcifer:\n  idle_shutdown_s: 0\n"), 0o600))

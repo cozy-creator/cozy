@@ -68,7 +68,7 @@ type fakeRentalHub struct {
 	// byID counts each rental's reads by id.
 	reads int
 	byID  map[string]int
-	// software is the target pair GET /v1/software answers; unset, none.
+	// software is the pair GET /v1/software answers ("pinned": "true" pins it); unset, none.
 	software map[string]string
 	// providers is each `?provider=` the catalog was asked for ("" for none); as Tensorhub,
 	// the catalog names no provider.
@@ -103,7 +103,7 @@ func newFakeRentalHub(t *testing.T, port int) *fakeRentalHub {
 	mux.HandleFunc("GET /v1/software", func(w http.ResponseWriter, r *http.Request) {
 		h.mu.Lock()
 		defer h.mu.Unlock()
-		_ = json.NewEncoder(w).Encode(map[string]string{"runtime": h.software["runtime"], "tensorfs": h.software["tensorfs"]})
+		_ = json.NewEncoder(w).Encode(map[string]any{"runtime": h.software["runtime"], "tensorfs": h.software["tensorfs"], "pinned": h.software["pinned"] == "true"})
 	})
 	// Ordinary fixtures provide the real account census. Tests of an unavailable
 	// route must opt into that refusal explicitly.

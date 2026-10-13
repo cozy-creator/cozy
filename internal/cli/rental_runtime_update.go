@@ -20,6 +20,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/output"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/scratch"
+	"github.com/cozy-creator/cozy/internal/wheel"
 	"github.com/cozy-creator/cozy/internal/workertls"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/machine/v1"
 )
@@ -72,9 +73,9 @@ type runtimeUpdateResult struct {
 	Note      string       `json:"note,omitempty"`
 }
 
-// Boot brings a rental's newly attached worker boot to the Hub's target software before it
-// takes work. Only a new boot is followed, so an explicit update stands until the pod boots
-// again.
+// Boot brings a rental's newly attached worker boot to the Hub's pinned software before it
+// takes work; unpinned, only forward from an older image. Only a new boot is followed, so an
+// explicit update stands until the pod boots again.
 func (u *rentalRuntimeUpdates) Boot(id string) {
 	current, problem := u.machines.store.RuntimeUpdate(id)
 	if problem == nil && current != nil && current.Active() {
@@ -271,6 +272,10 @@ func (u *rentalRuntimeUpdates) update(ctx context.Context, row *records.RuntimeU
 		if target.Runtime == "" {
 			return finish("the Hub names no target software")
 		}
+		// Unpinned, the target is what the current image bakes: a boot never moves back to it.
+		if !target.Pinned && wheel.NewerVersion(result.From.Runtime, target.Runtime) {
+			return finish("it runs newer software than the Hub's current image")
+		}
 		cohort.Runtime, cohort.TensorFS = &machinev1.Member{Version: target.Runtime}, &machinev1.Member{Version: target.TensorFS}
 		// Recorded as exact versions: a Calcifer that resumes this update installs what was resolved.
 		selection.RuntimeVersion, selection.TensorFSVersion = target.Runtime, target.TensorFS
@@ -456,10 +461,10 @@ func heldBy(c *localapi.Client, machine string) string {
 	return strings.Join(runs, ", ") + "; `cozy run cancel <n>` stops one"
 }
 
-// bootSoftware is a new rental's software once the Hub's target is in place, for `rental new`
-// to show: the fields, or the note saying why it kept its image's.
+// bootSoftware is a new rental's software once the Hub's pin is in place, for `rental new`
+// to show: the fields, or the note saying why it kept its image's. Unpinned, it runs its image's.
 // The versions are named, never left empty: a Calcifer older than this cozy reads an empty
-// request as the newest published pair, and a Hub naming no target asks for nothing.
+// request as the newest published pair.
 func bootSoftware(ctx *Context, rentalID, machine string) ([]output.Field, string) {
 	hctx, cancel := hub.Context()
 	target, problem := client(ctx).Software(hctx)
@@ -467,7 +472,7 @@ func bootSoftware(ctx *Context, rentalID, machine string) ([]output.Field, strin
 	if problem != nil {
 		return nil, "it keeps its image's software: the Hub's target could not be read: " + problem.Message
 	}
-	if target.Runtime == "" {
+	if !target.Pinned {
 		return nil, ""
 	}
 	c, problem := dial(ctx)

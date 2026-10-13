@@ -195,6 +195,13 @@ func sortedUnique(values []string) []string {
 	return out
 }
 
+// NewerVersion answers whether a is a later PEP 440 release than b; an unparseable one is not.
+func NewerVersion(a, b string) bool {
+	left, errLeft := pep440.Parse(a)
+	right, errRight := pep440.Parse(b)
+	return errLeft == nil && errRight == nil && left.GreaterThan(right)
+}
+
 // SameVersion compares two PEP 440 spellings of one release, so "1.0.0-rc.2" and the
 // "1.0.0rc2" a build backend normalizes it to are one version.
 func SameVersion(a, b string) bool {
