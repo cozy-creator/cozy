@@ -10,8 +10,8 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-// A Hub whose database was reset no longer knows a rental this host still records
-// (production 2026-09-27: pr-8a0e63fa, failed before readiness on 2026-09-23). That one
+// A Hub whose database was reset no longer knows a rental this host still records as live
+// (production 2026-09-27: pr-8a0e63fa). Its 404 is not proof the pod is gone, so that one
 // row must stay visible and kept, and must not stop `rental list` or `rental new`.
 func TestHubUnknownHostRentalDoesNotBlockOtherRentalVerbs(t *testing.T) {
 	root, hubURL, stand := rentalEndRoot(t, "rental-hub-unknown")
@@ -24,9 +24,8 @@ func TestHubUnknownHostRentalDoesNotBlockOtherRentalVerbs(t *testing.T) {
 	fatal(t, problem)
 	fatal(t, store.RecordRental(records.Rental{
 		ID: orphan, MachineName: "kimanjirou", SKU: "a100-sxm4-80gb", AcceleratorModel: "NVIDIA A100-SXM4-80GB",
-		AcceleratorCount: 1, HourlyRateUSDMicros: 1_390_000, State: "failed", Hub: hubURL,
+		AcceleratorCount: 1, HourlyRateUSDMicros: 1_390_000, State: "ready", Hub: hubURL,
 		RentedAt: "2026-09-23T23:44:01Z",
-		Failure:  records.RentalFailure{Code: "container_exited_before_readiness", Provider: "runpod", ProviderResourceID: "9b4eeyi6yh97ry"},
 	}))
 	store.Close()
 
@@ -94,10 +93,10 @@ func TestHubUnknownHostRentalDoesNotBlockOtherRentalVerbs(t *testing.T) {
 	}
 }
 
-// Tensorhub records `failed` only after proving the provider resource absent, so a host
-// row holding that verdict settles when the Hub later loses the record; a Hub-unknown row
-// the host never saw terminal stays refused (TestRentalEndKeepsRecordedMachineWhenHubCannotConfirmRelease).
-func TestRentalEndForgetsHubUnknownRentalTheHubHadFailed(t *testing.T) {
+// Tensorhub records `failed` only after proving the provider resource absent, so a host row
+// holding that verdict is forgotten even when the Hub has since lost the record: nothing is
+// released, and the board never shows it again.
+func TestAHubFailedRentalIsForgottenAfterTheHubLosesIt(t *testing.T) {
 	root, hubURL, stand := rentalEndRoot(t, "rental-hub-unknown-end")
 	const orphan = "pr-8a0e63fa7e215e0ec17f"
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
@@ -119,19 +118,15 @@ func TestRentalEndForgetsHubUnknownRentalTheHubHadFailed(t *testing.T) {
 		original.ServeHTTP(w, r)
 	})
 
-	code, out := runCozy(t, root, "rental", "end", orphan, "--json")
-	if code != 0 || !strings.Contains(out, `"state":"ended"`) || !strings.Contains(out, `"forgotten":true`) {
-		t.Fatalf("a rental the Hub had failed was not settled [exit %d]\n%s", code, out)
+	if code, out := runCozy(t, root, "rental", "list", "--json", "--full"); code != 0 || strings.Contains(out, orphan) {
+		t.Fatalf("the failed rental still reaches the board [exit %d]\n%s", code, out)
 	}
 	store, problem = records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()
 	row, problem := store.RentalRow(orphan)
 	fatal(t, problem)
-	if row != nil {
-		t.Fatalf("the settled rental is still recorded: %+v", row)
-	}
-	if code, out := runCozy(t, root, "rental", "list", "--json", "--full"); code != 0 || strings.Contains(out, orphan) {
-		t.Fatalf("the settled rental still reaches the board [exit %d]\n%s", code, out)
+	if row != nil || stand.releases(orphan) != 0 {
+		t.Fatalf("the failed rental was kept or released: %+v", row)
 	}
 }
