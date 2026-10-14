@@ -151,7 +151,7 @@ func submitH3Reference(t *testing.T, release string) {
 	fatal(t, problem)
 	expected, _, problem := launch.ParsePayload(entrypoint, nil, payloadPath)
 	fatal(t, problem)
-	expected, _, problem = launch.ParseAssets(entrypoint, expected, []string{"references.0.image=" + image0, "references.1.image=" + image1}, nil, nil)
+	expected, _, problem = launch.ParseAssets(entrypoint, expected, []string{"references.0.image=" + image0, "references.1.image=" + image1}, nil, nil, nil)
 	fatal(t, problem)
 	if !bytes.Equal(expected, row.Payload) {
 		t.Fatalf("payload changed: %s != %s", row.Payload, expected)

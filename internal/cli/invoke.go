@@ -251,7 +251,7 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 		return problem
 	}
 	prepareImage := imagePreparer(ctx)
-	input, assets, e := launch.ParseAssets(ep, input, ctx.Inv.Values["--asset"], ctx.Inv.Values["--asset-fidelity"], prepareImage)
+	input, assets, e := launch.ParseAssets(ep, input, ctx.Inv.Values["--asset"], overrides.Files, ctx.Inv.Values["--asset-fidelity"], prepareImage)
 	if e != nil {
 		return e
 	}

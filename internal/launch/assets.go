@@ -3,7 +3,9 @@ package launch
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -22,7 +24,8 @@ import (
 // to a scalar or to a misspelled field.
 type ImagePreparer func(source string, kind AssetsKind) (string, *exit.Error)
 
-func ParseAssets(ep *Entrypoint, payload json.RawMessage, specs, fidelities []string, prepare ImagePreparer) (json.RawMessage, []records.AssetBinding, *exit.Error) {
+// files are positional local files, each bound to the one input that accepts its media.
+func ParseAssets(ep *Entrypoint, payload json.RawMessage, specs, files, fidelities []string, prepare ImagePreparer) (json.RawMessage, []records.AssetBinding, *exit.Error) {
 	// JSON filenames join the ordinary --asset path before any fingerprinting or grants.
 	// Clear only these local spellings so setAssetRef can insert their verified identity.
 	var embedded []string
@@ -38,7 +41,7 @@ func ParseAssets(ep *Entrypoint, payload json.RawMessage, specs, fidelities []st
 		return nil, nil, problem
 	}
 	specs = append(embedded, specs...)
-	if len(specs) == 0 && len(fidelities) == 0 && ep.Assets == nil {
+	if len(specs) == 0 && len(files) == 0 && len(fidelities) == 0 && ep.Assets == nil {
 		return payload, nil, nil
 	}
 	var document map[string]any
@@ -52,6 +55,11 @@ func ParseAssets(ep *Entrypoint, payload json.RawMessage, specs, fidelities []st
 			document[ep.Assets.Parameter] = []any{}
 		}
 	}
+	bound, problem := positionalSpecs(ep, document, specs, files)
+	if problem != nil {
+		return nil, nil, problem
+	}
+	specs = append(specs, bound...)
 
 	if problem := preflightAssetCount(ep, document, specs); problem != nil {
 		return nil, nil, problem
@@ -190,8 +198,7 @@ func ParseAssets(ep *Entrypoint, payload json.RawMessage, specs, fidelities []st
 // Explicit path syntax wins over label/field assignment, so a=b.png stays a
 // filename in /refs/a=b.png, ~/refs/a=b.png or ./refs/a=b.png.
 func splitAssetArgument(ep *Entrypoint, spec string) (field, source, label string, named bool) {
-	if filepath.IsAbs(spec) || spec == "~" || strings.HasPrefix(spec, "~/") ||
-		strings.HasPrefix(spec, "./") || strings.HasPrefix(spec, "../") {
+	if explicitPath(spec) {
 		return "", spec, "", false
 	}
 	field, source, named = strings.Cut(spec, "=")
@@ -202,6 +209,197 @@ func splitAssetArgument(ep *Entrypoint, spec string) (field, source, label strin
 		return field, source, "", true
 	}
 	return "", source, field, false
+}
+
+func explicitPath(spec string) bool {
+	return filepath.IsAbs(spec) || spec == "~" || strings.HasPrefix(spec, "~/") ||
+		strings.HasPrefix(spec, "./") || strings.HasPrefix(spec, "../")
+}
+
+// mediaInput is one input a positional file can fill: a request asset field, a list of
+// them, or one kind of the declared Assets collection.
+type mediaInput struct {
+	Name, Kind   string
+	MediaTypes   []string
+	List, Assets bool
+}
+
+func mediaInputs(ep *Entrypoint) []mediaInput {
+	var out []mediaInput
+	if ep.Assets != nil {
+		for _, kind := range ep.Assets.Kinds {
+			out = append(out, mediaInput{Name: ep.Assets.Parameter, Kind: kind.Kind, MediaTypes: kind.MediaTypes, List: true, Assets: true})
+		}
+	}
+	for i := range ep.Request.Fields {
+		field := &ep.Request.Fields[i]
+		if kind, list := mediaKind(field.Type); kind != "" && !isAssetsField(field, ep.Assets) {
+			out = append(out, mediaInput{Name: field.Name, Kind: kind, MediaTypes: field.AssetBound.MediaTypes, List: list})
+		}
+	}
+	return out
+}
+
+// mediaKind is an asset type's kind, through an optional union with null; list is a list of
+// assets. Any other type answers "".
+func mediaKind(raw json.RawMessage) (kind string, list bool) {
+	var schema struct {
+		Asset string            `json:"asset"`
+		List  json.RawMessage   `json:"list"`
+		Union []json.RawMessage `json:"union"`
+	}
+	if json.Unmarshal(raw, &schema) != nil {
+		return "", false
+	}
+	switch {
+	case schema.Asset != "":
+		return schema.Asset, false
+	case len(schema.List) > 0:
+		if kind, nested := mediaKind(schema.List); !nested {
+			return kind, kind != ""
+		}
+	case len(schema.Union) == 2:
+		for i, branch := range schema.Union {
+			if string(branch) == `"null"` {
+				return mediaKind(schema.Union[1-i])
+			}
+		}
+	}
+	return "", false
+}
+
+// accepts ranks how the input takes mediaType: 2 as its own kind, 1 as a generic file, 0 not.
+func (in mediaInput) accepts(mediaType string) int {
+	if !(AssetField{MediaTypes: in.MediaTypes}).AcceptsMediaType(mediaType) {
+		return 0
+	}
+	switch category, _, _ := strings.Cut(mediaType, "/"); in.Kind {
+	case category:
+		return 2
+	case "file":
+		return 1
+	}
+	return 0
+}
+
+// positionalFile answers whether a bare term is a local file for a media input: an existing
+// regular file, never a key=value term unless spelled as a path. A path that names nothing is
+// refused, so a typo is never read as text for a string or enum field.
+func positionalFile(ep *Entrypoint, term string) (bool, *exit.Error) {
+	path := explicitPath(term) && !strings.ContainsAny(term, " \t\n")
+	if !path && strings.Contains(term, "=") || len(mediaInputs(ep)) == 0 {
+		return false, nil
+	}
+	expanded, err := config.ExpandHome(term)
+	if err == nil {
+		var info os.FileInfo
+		if info, err = os.Stat(expanded); err == nil && !info.Mode().IsRegular() {
+			err = fmt.Errorf("not a regular file")
+		}
+	}
+	if err == nil {
+		return true, nil
+	}
+	if path {
+		return false, exit.New(exit.NotFound, "input file %s: %s", term, err)
+	}
+	return false, nil
+}
+
+// positionalSpecs binds each positional file to the one input that accepts its media by
+// declared kind (a video to the video input, an image to an image input), as the --asset
+// spelling of that binding. A single input already bound is not free; a file two free inputs
+// accept equally, or none, is refused with the inputs named.
+func positionalSpecs(ep *Entrypoint, document map[string]any, specs, files []string) ([]string, *exit.Error) {
+	inputs := mediaInputs(ep)
+	taken, next := map[string]bool{}, map[string]int{}
+	for name, value := range document {
+		if list, ok := value.([]any); ok {
+			next[name] = len(list)
+		} else if value != nil && value != "" {
+			taken[name] = true
+		}
+	}
+	for _, spec := range specs {
+		field, _, _, named := splitAssetArgument(ep, spec)
+		if parts, problem := assetPath(strings.TrimSpace(field)); named && problem == nil {
+			name, _ := canonicalFieldKey(ep, parts[0])
+			taken[name] = true
+			if len(parts) > 1 {
+				if index, err := strconv.Atoi(parts[1]); err == nil {
+					next[name] = max(next[name], index+1)
+				}
+			}
+		}
+	}
+	out := make([]string, 0, len(files))
+	for _, file := range files {
+		absolute, err := config.ExpandHome(file)
+		if err == nil {
+			absolute, err = filepath.Abs(absolute)
+		}
+		if err != nil {
+			return nil, exit.New(exit.NotFound, "cannot resolve input file %s: %s", file, err)
+		}
+		_, mediaType, problem := inputasset.Probe(absolute)
+		if problem != nil {
+			return nil, problem
+		}
+		var names, spellings []string
+		chosen, rank := mediaInput{}, 0
+		for _, input := range inputs {
+			r := input.accepts(mediaType)
+			if r == 0 || r < rank || !input.List && taken[input.Name] || r == rank && slices.Contains(names, input.Name) {
+				continue
+			}
+			if r > rank {
+				names, spellings, rank = nil, nil, r
+			}
+			spelling := input.Name + "="
+			if input.Assets {
+				spelling = ""
+			} else if input.List {
+				spelling = fmt.Sprintf("%s.%d=", input.Name, next[input.Name])
+			}
+			names, spellings, chosen = append(names, input.Name), append(spellings, spelling), input
+		}
+		switch len(names) {
+		case 0:
+			return nil, exit.Named(exit.Validation, "positional_file_unbound",
+				"%s is %s, which no free input of %s accepts", file, mediaType, ep.Name).
+				WithRemedy("its media inputs: %s", mediaInputPhrase(inputs))
+		case 1:
+			out = append(out, spellings[0]+absolute)
+			if chosen.List {
+				next[chosen.Name]++
+			} else {
+				taken[chosen.Name] = true
+			}
+		default:
+			for i := range spellings {
+				spellings[i] = "--asset " + spellings[i] + file
+			}
+			return nil, exit.Named(exit.Usage, "positional_file_ambiguous",
+				"%s is %s, which inputs %s each accept", file, mediaType, strings.Join(names, " and ")).
+				WithRemedy("name one: %s", strings.Join(spellings, " or "))
+		}
+	}
+	return out, nil
+}
+
+func mediaInputPhrase(inputs []mediaInput) string {
+	var names []string
+	kinds := map[string][]string{}
+	for _, input := range inputs {
+		if _, seen := kinds[input.Name]; !seen {
+			names = append(names, input.Name)
+		}
+		kinds[input.Name] = append(kinds[input.Name], input.Kind)
+	}
+	for i, name := range names {
+		names[i] = name + " (" + strings.Join(kinds[name], ", ") + ")"
+	}
+	return strings.Join(names, ", ")
 }
 
 // LegacyFileTerm returns the first `key=@file` payload term. That spelling embeds bytes

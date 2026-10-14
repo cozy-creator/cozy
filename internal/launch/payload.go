@@ -20,7 +20,8 @@ import (
 )
 
 // The `run` payload grammar (cozy-runtime-cli.md), the same one cr-016 implements for a
-// bare-venv run: a positional PRIMARY filling the first declared field, `key=value`
+// bare-venv run: a positional PRIMARY filling the first declared non-media field, positional
+// local files each filling the one media input that accepts their kind, `key=value`
 // scalars, `key=@file` local file contents encoded as one JSON string,
 // `key:=<json>` raw JSON for nested values, and
 // `--input <file>` supplying the whole payload with `key=value` merged on top.
@@ -45,6 +46,8 @@ type RunKeys struct {
 	// Runtime/package compatibility declaration resolves components and bounds later;
 	// the CLI only canonicalizes syntax and decimal weights here.
 	Overlays map[string][]ModelOverlay
+	// Files are the positional local files ParseAssets binds by media kind.
+	Files []string
 }
 
 // ParsePayload builds one request document from the argv terms, and collects the reserved
@@ -113,6 +116,12 @@ func ParsePayload(ep *Entrypoint, terms []string, infile string) (
 
 	var positional []string
 	for _, term := range terms {
+		if file, problem := positionalFile(ep, term); problem != nil {
+			return nil, RunKeys{}, problem
+		} else if file {
+			keys.Files = append(keys.Files, term)
+			continue
+		}
 		if strings.HasPrefix(term, "model.") && strings.Contains(term, "=") {
 			if strings.Contains(term, ".lora:=") || strings.HasSuffix(strings.SplitN(term, "=", 2)[0], ".lora") {
 				if problem := parseModelOverlayTerm(ep, term, &keys); problem != nil {
@@ -193,14 +202,19 @@ func ParsePayload(ep *Entrypoint, terms []string, infile string) (
 	}
 
 	if len(positional) > 0 {
+		// The FIRST declared field a text value can fill, in the author's own declaration
+		// order (msgspec preserves it), never a name this module blesses.
 		primary := ""
-		if len(ep.Request.Fields) > 0 {
-			// The FIRST declared field, in the author's own declaration order (msgspec
-			// preserves it), never a name this module blesses.
-			primary = ep.Request.Fields[0].Name
+		for i := range ep.Request.Fields {
+			if field := &ep.Request.Fields[i]; !isAssetsField(field, ep.Assets) {
+				if kind, _ := mediaKind(field.Type); kind == "" {
+					primary = field.Name
+					break
+				}
+			}
 		}
 		if primary == "" {
-			return nil, RunKeys{}, exit.Usagef("%s takes no positional value: it declares no request field", ep.Name)
+			return nil, RunKeys{}, exit.Usagef("%s has no request field a positional text value fills", ep.Name)
 		}
 		if len(positional) > 1 {
 			return nil, RunKeys{}, exit.Usagef("%s takes ONE positional value (%s); got %d",

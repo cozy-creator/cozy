@@ -39,7 +39,7 @@ func TestH3ReferenceImageUsesPublishedTaggedUnion(t *testing.T) {
 	must(t, err)
 	must(t, png.Encode(file, image.NewRGBA(image.Rect(0, 0, 64, 64))))
 	must(t, file.Close())
-	input, assets, problem := launch.ParseAssets(ep, input, []string{"references.0.image=" + imagePath}, nil, nil)
+	input, assets, problem := launch.ParseAssets(ep, input, []string{"references.0.image=" + imagePath}, nil, nil, nil)
 	fatal(t, problem)
 	fatal(t, payloadProblem("paul/minimax-h3", ep, input))
 	if len(assets) != 1 || assets[0].FieldPath != "references.0.image" || assets[0].Length <= 0 ||
