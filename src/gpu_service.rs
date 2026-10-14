@@ -4734,6 +4734,35 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// Gate (f), runs 5673/5674 on one GPU: the older root's two ready first steps wait behind
+    /// the younger holder's step in flight. Each pass visits both; the second's own claim must
+    /// not hide the holder, so the root logs one wait naming it, not one per pass flipping to
+    /// nobody (each wait entry also woke the next pass).
+    #[test]
+    fn a_roots_ready_steps_log_one_wait_for_one_blocker() {
+        let (root, pool, engine) = pool_of(1);
+        let [older, younger, _] = running_roots(&engine, ["older", "younger", "unused"]);
+        let holds = (pool.root(&engine, &older, 1).unwrap(), pool.root(&engine, &younger, 1).unwrap());
+        let (a, b) = (older.root_seq(), younger.root_seq());
+        let lane = pool.root_lane(&engine, b, &mut [None]).unwrap();
+        let (_, step) = pool.place(&engine, &plan("step", 1), (b, None), Some(lane.clone()), &mut [None]).unwrap();
+        for _ in 0..3 {
+            let mut claims = [None];
+            assert!(pool.root_lane(&engine, a, &mut claims).is_none());
+            assert!(pool.root_lane(&engine, a, &mut claims).is_none());
+            assert_eq!(pool.root_lane(&engine, b, &mut claims), Some(lane.clone()));
+            assert!(pool.place(&engine, &plan("step", 1), (b, None), Some(lane.clone()), &mut claims).is_none(), "no new step");
+        }
+        drop(step);
+        assert_eq!(pool.root_lane(&engine, a, &mut [None]), Some(0..1));
+        assert_eq!(allocation_log(&engine, &older.id), [
+            ("wait".into(), vec![], request(&younger)), ("grant".into(), vec![0], String::new()),
+        ]);
+        drop(holds);
+        pool.stop().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn an_explicit_root_keeps_its_children_in_its_two_gpu_lane() {
         let (root, pool, engine) = pool_of(4);
