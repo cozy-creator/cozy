@@ -446,6 +446,7 @@ func (s *Server) publicStatusOf(row records.Request) string {
 // releases once the request is recorded.
 func (s *Server) resolvePlan(ctx context.Context, hub string, sub Submission, lease **install.Lease) (orchestrator.Submission, *exit.Error) {
 	out := orchestrator.Submission{
+		Hub:     hub,
 		Package: sub.Package, Entrypoint: sub.Function, Payload: []byte(sub.Input),
 		Outputs: sub.Outputs, PlanID: sub.PlanID, Assets: sub.LocalAssets,
 		Release: sub.Release,
@@ -631,7 +632,7 @@ func (s *Server) resolveLocalServing(ctx context.Context, sub Submission,
 		return out, problem
 	}
 	out.NeedsAccelerator = needsAccelerator
-	revision, problem := s.packages.LocalInstallation(installID)
+	revision, problem := s.packages.LocalInstallation(installID, out.Hub)
 	if problem != nil {
 		return out, problem
 	}
@@ -685,7 +686,7 @@ func (s *Server) resolvePendingServing(ctx context.Context, sub Submission, out 
 	out.InstallID, out.Release = placement.InstallID, placement.Release
 	out.NeedsAccelerator = needsAccelerator
 	if !spec.Preparation.Published {
-		revision, problem := s.packages.LocalInstallation(placement.InstallID)
+		revision, problem := s.packages.LocalInstallation(placement.InstallID, out.Hub)
 		if problem != nil {
 			return out, problem
 		}

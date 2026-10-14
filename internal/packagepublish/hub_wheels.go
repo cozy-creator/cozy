@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/pelletier/go-toml/v2"
 )
@@ -17,14 +18,23 @@ import (
 // HubWheels are the wheels a uv.lock selects from Tensorhub account indexes, and the package
 // each such distribution is. A machine may not reach that Hub (one on this computer), so
 // unpublished code carries them: each is named by its locked hash and fetched only for a
-// machine that does not hold it. Size is 0 where the index stated none.
-func HubWheels(lock []byte) ([]RegistryRow, map[string]string, *exit.Error) {
+// machine that does not hold it. Size is 0 where the index stated none. During dispatch,
+// targetHub must match each callee's locked Hub: model defaults are resolved there.
+func HubWheels(lock []byte, targetHub string) ([]RegistryRow, map[string]string, *exit.Error) {
 	var document capturedLock
 	if len(lock) == 0 {
 		return nil, nil, nil
 	}
 	if int64(len(lock)) > maxLockBytes || toml.Unmarshal(lock, &document) != nil {
 		return nil, nil, exit.Named(exit.Validation, "private_dependency_lock_invalid", "the package's uv.lock is unreadable")
+	}
+	wanted := ""
+	if targetHub != "" {
+		var problem *exit.Error
+		wanted, problem = config.HubOrigin(targetHub)
+		if problem != nil {
+			return nil, nil, problem
+		}
 	}
 	var rows []RegistryRow
 	packages := map[string]string{}
@@ -34,6 +44,16 @@ func HubWheels(lock []byte) ([]RegistryRow, map[string]string, *exit.Error) {
 			continue
 		}
 		name := normalizedProjectName(entry.Name)
+		if wanted != "" {
+			origin, _ := url.Parse(entry.Source.Registry)
+			origin.Path, origin.RawPath = "", ""
+			locked, _ := config.HubOrigin(origin.String())
+			if locked != wanted {
+				return nil, nil, exit.Named(exit.Validation, "local_package_lock_hub_mismatch",
+					"%s is locked from %s (%s), but this run uses %s", name, locked, organization, wanted).
+					WithRemedy("run `cozy package lock` against %s and reinstall the local package", wanted)
+			}
+		}
 		packages[name] = organization + "/" + name
 		for _, candidate := range entry.Wheels {
 			hash, hashed := strings.CutPrefix(candidate.Hash, "sha256:")
@@ -59,7 +79,7 @@ func KeptHubWheel(store string, row RegistryRow) string {
 // time is its last use: the install sweep drops wheels no install used for a month.
 func KeepHubWheels(ctx context.Context, project, store string) *exit.Error {
 	lock, _ := os.ReadFile(filepath.Join(project, "uv.lock"))
-	rows, _, problem := HubWheels(lock)
+	rows, _, problem := HubWheels(lock, "")
 	for _, row := range rows {
 		if problem != nil {
 			break
