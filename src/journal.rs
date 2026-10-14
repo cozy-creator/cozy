@@ -166,6 +166,42 @@ pub struct ExecutorFacts {
     pub pid: u32,
     pub runtime_version: String,
     pub tensorfs_version: String,
+    #[serde(default)]
+    pub tensord_version: String,
+    #[serde(default)]
+    pub tensord_commit: Option<String>,
+}
+
+/// The software that actually served one attempt, not the machine's current installation.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct SoftwareFacts {
+    pub attempt_ordinal: u32,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub tensord: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tensord_commit: Option<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub runtime: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub tensorfs: String,
+}
+
+impl ExecutorFacts {
+    pub fn observed(pid: u32, runtime_version: String, tensorfs_version: String) -> Self {
+        Self {
+            pid, runtime_version, tensorfs_version,
+            tensord_version: env!("CARGO_PKG_VERSION").into(),
+            tensord_commit: option_env!("TENSORD_COMMIT").map(str::to_owned),
+        }
+    }
+
+    pub fn software(&self, attempt_ordinal: u32) -> SoftwareFacts {
+        SoftwareFacts {
+            attempt_ordinal, tensord: self.tensord_version.clone(),
+            tensord_commit: self.tensord_commit.clone(),
+            runtime: self.runtime_version.clone(), tensorfs: self.tensorfs_version.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

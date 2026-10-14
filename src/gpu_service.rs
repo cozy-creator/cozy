@@ -2496,11 +2496,10 @@ impl GpuPool {
                 }
             }
         };
-        let facts = crate::journal::ExecutorFacts {
-            pid: session.executor.birth.pid,
-            runtime_version: session.executor.hello.runtime_version.clone(),
-            tensorfs_version: session.executor.hello.tensorfs_version.clone(),
-        };
+        let facts = crate::journal::ExecutorFacts::observed(
+            session.executor.birth.pid, session.executor.hello.runtime_version.clone(),
+            session.executor.hello.tensorfs_version.clone(),
+        );
         if !engine.authorize_managed(id, Some(facts))? {
             engine.finish_stopped(id)?;
             self.keep_idle(session);
@@ -4086,7 +4085,8 @@ pub(crate) fn record_measurements(engine: &Engine, id: &str, reply: &Frame) {
                 .is_some_and(|name| name.starts_with("attention."))
         })
         .collect();
-    let measurements = serde_json::json!({"attribution": reply.attribution,
+    let software = engine.get(id).ok().and_then(|run| run.executor.map(|executor| executor.software(run.attempt)));
+    let measurements = serde_json::json!({"attribution": reply.attribution, "software": software,
         "execution": reply.execution, "observations": attention});
     let recorded = serde_json::to_vec(&measurements)
         .map_err(io::Error::other)
