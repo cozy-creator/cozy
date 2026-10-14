@@ -1271,7 +1271,9 @@ impl Store {
         }
         if let Some(header_ref) = parsed.header() {
             crate::checkpoint::load_header(self, header_ref)?;
-            crate::checkpoint::walk(self, &parsed)?.require_resident(self)?;
+            // Whole here, or what is absent is its origin's ([`crate::origin`]).
+            crate::checkpoint::walk(self, &parsed)?
+                .require_held(self, &crate::ingest::custody::live(&self.root)?)?;
         }
         Ok(())
     }

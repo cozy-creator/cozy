@@ -405,8 +405,9 @@ impl Walk {
         Ok(())
     }
 
-    /// Every reached object present, or held by a live source operation's publication
-    /// custodian. A complete checkpoint for publication, never a readable one.
+    /// Every reached object present, or held by its origin or a live source operation's
+    /// publication custodian (`custody::live`). Complete for publication; what is absent a
+    /// reader fetches first.
     pub fn require_held(
         &self,
         store: &Store,
@@ -418,7 +419,7 @@ impl Walk {
                     Code::OBJECT_ABSENT,
                     format!(
                         "{} is committed by this manifest but neither resident nor held by \
-                         a live publication custodian",
+                         its origin or a live publication custodian",
                         r.id()
                     ),
                 );

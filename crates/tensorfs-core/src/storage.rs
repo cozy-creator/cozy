@@ -347,11 +347,13 @@ pub struct StagedCheckpoint<'a> {
 impl Census {
     /// Validate one retained checkpoint against its exact staged bytes and the complete
     /// blob inventory. Checkpoint retention has no release label or lane, but it carries
-    /// the same closed object graph.
+    /// the same closed object graph. An absent `custodied` object is its origin's, and the
+    /// facts are what is here.
     pub fn validate_checkpoint_inputs(
         manifest_ref: &ObjectRef,
         staged: StagedCheckpoint<'_>,
         inventory: &BTreeMap<String, InventoryEntry>,
+        custodied: &BTreeSet<String>,
     ) -> Result<CheckpointFacts> {
         let StagedCheckpoint {
             manifest: manifest_bytes,
@@ -416,6 +418,7 @@ impl Census {
                 insert_ref(&mut objects, "file", object)?;
             }
         }
+        objects.retain(|sha256, _| inventory.contains_key(sha256) || !custodied.contains(sha256));
         let mut object_bytes = 0u64;
         for (kind, object) in objects.values() {
             if inventory.get(&object.sha256).map(|entry| entry.length) != Some(object.length) {
@@ -957,6 +960,7 @@ impl Census {
                 header: header_bytes.as_deref(),
             },
             &self.inventory,
+            &self.custodied,
         )?;
         Self::append_checkpoint_facts(repository, checkpoint, facts, projection);
         Ok(())
@@ -1537,6 +1541,7 @@ mod tests {
                 header: Some(&header_bytes),
             },
             &inventory,
+            &BTreeSet::new(),
         )
         .unwrap();
         let kinds: BTreeMap<_, _> = facts
@@ -2010,6 +2015,7 @@ mod tests {
                 header: Some(&header_bytes),
             },
             &inventory,
+            &BTreeSet::new(),
         )
         .unwrap();
         assert_eq!(facts.objects.len(), 1);
@@ -2026,13 +2032,14 @@ mod tests {
                     header: Some(&header_bytes),
                 },
                 &missing_header,
+                &BTreeSet::new(),
             )
             .unwrap_err()
             .code,
             Code::OBJECT_ABSENT
         );
         assert_eq!(
-            Census::validate_checkpoint_inputs(&manifest_ref, staged(b"not the header"), &BTreeMap::new())
+            Census::validate_checkpoint_inputs(&manifest_ref, staged(b"not the header"), &BTreeMap::new(), &BTreeSet::new())
                 .unwrap_err()
                 .code,
             Code::OBJECT_ID_MISMATCH

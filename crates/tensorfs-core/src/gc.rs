@@ -193,8 +193,10 @@ pub(crate) fn unretained_manifests(store: &Store, wanted: &[ObjectRef]) -> Resul
     };
     let everything =
         || -> Result<Vec<ObjectRef>> { Ok(manifests(session_holds(store)?.0).collect()) };
-    let passes: [&dyn Fn() -> Result<Vec<ObjectRef>>; 3] =
-        [&repositories, &named_roots, &everything];
+    // Not a root: a checkpoint here in part whose origin keeps it whole ([`crate::origin`]).
+    let origins = || crate::origin::manifests(store);
+    let passes: [&dyn Fn() -> Result<Vec<ObjectRef>>; 4] =
+        [&repositories, &named_roots, &everything, &origins];
     let mut missing = wanted.to_vec();
     for pass in passes {
         if missing.is_empty() {

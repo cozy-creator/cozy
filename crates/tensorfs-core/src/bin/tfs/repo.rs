@@ -304,6 +304,7 @@ pub fn cmd_repo_apply(current: &str, mutation: &Path, flags: &Flags) -> ExitCode
                             header: header.as_deref(),
                         },
                         &inventory,
+                        &Default::default(),
                     ) {
                         Ok(facts) => facts,
                         Err(error) => return bail(error),
@@ -323,6 +324,7 @@ pub fn cmd_repo_apply(current: &str, mutation: &Path, flags: &Flags) -> ExitCode
                             header: header.as_deref(),
                         },
                         &inventory,
+                        &Default::default(),
                     ) {
                         Ok(facts) => facts,
                         Err(error) => return bail(error),

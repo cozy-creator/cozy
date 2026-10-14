@@ -1005,6 +1005,9 @@ mod source_channel_tests {
         let output = commit(&store, &meta, &output_id, 1).unwrap().manifest;
         release_guards(&meta, Some(writer.writer_hold), writer.source_leases);
         assert_eq!(crate::origin::evidence(&root, &output).unwrap().as_deref(), Some("hub.test/org/source"));
+        let repo = crate::repository::RepositoryName::new("local", "output").unwrap();
+        let mutation = crate::repository::Mutation::ReplaceLocal { repo, version: "94".repeat(32), manifest: output.clone() };
+        store.apply_repository(None, &mutation, &crate::store::Fault::default()).unwrap();
         crate::gc::collect(&root, false).unwrap();
         assert!(!store.contains(&absent.sha256));
 

@@ -105,6 +105,27 @@ fn read(path: &Path) -> Result<Option<Origin>> {
     Origin::parse(&bytes).map(Some)
 }
 
+/// Every attested manifest still here: each a checkpoint its origin keeps whole, so a
+/// derivation may take it as a source.
+pub(crate) fn manifests(store: &Store) -> Result<Vec<ObjectRef>> {
+    let entries = match fs::read_dir(dir(store.root())) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(error) => return Err(io("list", error)),
+    };
+    let mut out = vec![];
+    for entry in entries {
+        let path = entry.map_err(|error| io("list", error))?.path();
+        if path.file_name().is_some_and(|name| name.to_string_lossy().starts_with('.')) {
+            continue;
+        }
+        if let Some(origin) = read(&path)?.filter(|origin| store.manifest_path(&origin.manifest.sha256).is_file()) {
+            out.push(origin.manifest);
+        }
+    }
+    Ok(out)
+}
+
 /// Every absent object of an attested manifest still here: what its origin holds for it.
 pub fn custodied(store_root: &Path) -> Result<BTreeSet<String>> {
     let entries = match fs::read_dir(dir(store_root)) {
