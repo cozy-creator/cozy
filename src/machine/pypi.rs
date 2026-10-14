@@ -35,7 +35,7 @@ pub fn wheel(
         Deadline::none(),
         &ledger,
     )
-    .map_err(|e| io::Error::other(e.to_string()))?;
+    .map_err(|e| io::Error::other(format!("PyPI {project} {version}: {e}")))?;
     #[derive(serde::Deserialize)]
     struct File {
         filename: String,
