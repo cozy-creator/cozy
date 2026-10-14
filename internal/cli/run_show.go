@@ -651,9 +651,6 @@ func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
 			c.Label, c.Status, c.Error, c.ErrorCode = record.Label, record.Status, record.Error, record.ErrorCode
 			c.Memoized, c.Computation, c.Unmemoized = record.Memoized, record.Computation, record.Unmemoized
 			c.Software = readExecutionSoftware(record.Software)
-			if c.Software != nil && c.Software.Runtime != "" {
-				c.Runtime = executorEvent{Runtime: c.Software.Runtime, TensorFS: c.Software.TensorFS}.String()
-			}
 			c.StartUnixMS = record.CalledUnixMS
 			c.MS = float64(at.UnixMilli() - record.CalledUnixMS)
 			c.callTiming = record.callTiming
@@ -811,6 +808,14 @@ func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
 	}
 	sortStages(report.Stages)
 	for _, c := range calls {
+		if c.Software != nil {
+			if c.Software.AttemptOrdinal > 0 {
+				c.Attempt = c.Software.AttemptOrdinal
+			}
+			if c.Software.Runtime != "" {
+				c.Runtime = executorEvent{Runtime: c.Software.Runtime, TensorFS: c.Software.TensorFS}.String()
+			}
+		}
 		// A call's own timeline reads in the order it happened.
 		c.Stages = append(c.Stages, c.timed...)
 		sort.SliceStable(c.Stages, func(i, j int) bool { return c.Stages[i].StartUnixMS < c.Stages[j].StartUnixMS })
