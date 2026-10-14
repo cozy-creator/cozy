@@ -11,6 +11,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -26,43 +28,50 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// opsMachine is a rental's machine as far as one operation goes: it takes the operation's warm
-// run, reports its download, and ends it canceled when its owner cancels it.
+// opsMachine is a rental's machine as far as its operations go: it takes each operation's run,
+// reports its progress, and ends it canceled when its owner cancels it.
 type opsMachine struct {
 	v1.UnimplementedMachineServer
 	mu      sync.Mutex
 	changed *sync.Cond
 	specs   []*v1.RunSpec
-	log     []*v1.RunEvent
+	logs    map[string][]*v1.RunEvent
 }
 
 func newOpsMachine() *opsMachine {
-	m := &opsMachine{}
+	m := &opsMachine{logs: map[string][]*v1.RunEvent{}}
 	m.changed = sync.NewCond(&m.mu)
 	return m
 }
 
 func (m *opsMachine) Status(_ *v1.StatusRequest, stream grpc.ServerStreamingServer[v1.StatusFrame]) error {
-	return stream.Send(&v1.StatusFrame{WorkerId: "ops-worker", BootId: "ops-boot", Phase: "ready",
-		Capabilities: []string{"warm/1", "warm/2", "remove/1", "upload/1", "local-models/1"}})
+	return stream.Send(&v1.StatusFrame{WorkerId: "ops-worker", BootId: "ops-boot", Phase: "ready", Runtime: "0.23.34", Tensorfs: "0.6.1",
+		Capabilities: []string{"warm/1", "warm/2", "remove/1", "upload/1", "local-models/1", "update/1"}})
 }
 
 func (m *opsMachine) append(id string, event *v1.RunEvent) {
-	event.Sequence = uint64(len(m.log) + 1)
-	m.log = append(m.log, event)
+	event.Sequence = uint64(len(m.logs[id]) + 1)
+	m.logs[id] = append(m.logs[id], event)
 	m.changed.Broadcast()
+}
+
+// sent is every run spec the machine was sent.
+func (m *opsMachine) sent() []*v1.RunSpec {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return slices.Clone(m.specs)
 }
 
 func (m *opsMachine) Run(request *v1.RunRequest, stream grpc.ServerStreamingServer[v1.RunEvent]) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if request.Spec != nil && len(m.specs) == 0 {
+	if request.Spec != nil && m.logs[request.Id] == nil {
 		m.specs = append(m.specs, request.Spec)
 		m.append(request.Id, &v1.RunEvent{Event: &v1.RunEvent_State{State: &v1.RunState{Id: request.Id, Number: 1, State: "queued", Sequence: 2}}})
-		m.append(request.Id, &v1.RunEvent{Event: &v1.RunEvent_Progress{Progress: &v1.Progress{Stage: "downloading paul/demo",
+		m.append(request.Id, &v1.RunEvent{Event: &v1.RunEvent_Progress{Progress: &v1.Progress{Stage: "preparing",
 			Fraction: -1, BytesDone: 1 << 20, BytesTotal: 4 << 20}}})
 	}
-	if len(m.log) == 0 {
+	if len(m.logs[request.Id]) == 0 {
 		return status.Errorf(codes.NotFound, "no run %s", request.Id)
 	}
 	go func() {
@@ -71,16 +80,17 @@ func (m *opsMachine) Run(request *v1.RunRequest, stream grpc.ServerStreamingServ
 		m.changed.Broadcast()
 		m.mu.Unlock()
 	}()
-	head := &v1.RunEvent{Event: &v1.RunEvent_State{State: &v1.RunState{Id: request.Id, Number: 1, State: "queued", Sequence: uint64(len(m.log))}}}
+	head := &v1.RunEvent{Event: &v1.RunEvent_State{State: &v1.RunState{Id: request.Id, Number: 1, State: "queued", Sequence: uint64(len(m.logs[request.Id]))}}}
 	if err := stream.Send(head); err != nil {
 		return err
 	}
 	for sent := request.After; ; {
-		for ; sent < uint64(len(m.log)); sent++ {
-			if err := stream.Send(m.log[sent]); err != nil {
+		log := m.logs[request.Id]
+		for ; sent < uint64(len(log)); sent++ {
+			if err := stream.Send(log[sent]); err != nil {
 				return err
 			}
-			if m.log[sent].GetOutcome() != nil {
+			if log[sent].GetOutcome() != nil {
 				return nil
 			}
 		}
@@ -94,7 +104,8 @@ func (m *opsMachine) Run(request *v1.RunRequest, stream grpc.ServerStreamingServ
 func (m *opsMachine) Control(_ context.Context, request *v1.ControlRequest) (*v1.RunState, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if request.Action == v1.Action_ACTION_CANCEL && m.log[len(m.log)-1].GetOutcome() == nil {
+	log := m.logs[request.Id]
+	if request.Action == v1.Action_ACTION_CANCEL && len(log) > 0 && log[len(log)-1].GetOutcome() == nil {
 		m.append(request.Id, &v1.RunEvent{Event: &v1.RunEvent_State{State: &v1.RunState{Id: request.Id, Number: 1, State: "canceled"}}})
 		m.append(request.Id, &v1.RunEvent{Event: &v1.RunEvent_Outcome{Outcome: &v1.Outcome{Status: "canceled",
 			Reason: &v1.Reason{Code: "canceled", Message: "canceled by its owner", Origin: "request"}}}})
@@ -102,10 +113,9 @@ func (m *opsMachine) Control(_ context.Context, request *v1.ControlRequest) (*v1
 	return &v1.RunState{Id: request.Id, Number: 1, State: "canceled"}, nil
 }
 
-// A package install on a rental is a run like any other: it gets the next run number, `run
-// list` shows it with its kind, the same install asked again while it runs is that run, and
-// `run cancel` reaches the machine and ends it canceled.
-func TestAnOperationIsANumberedRunTheOwnerCancels(t *testing.T) {
+// opsRental is a home whose Calcifer holds the ready rental kirin on machine.
+func opsRental(t *testing.T) (string, *opsMachine) {
+	t.Helper()
 	h := newFakeRentalHub(t, 0)
 	served := h.server.Config.Handler
 	h.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -122,7 +132,7 @@ func TestAnOperationIsANumberedRunTheOwnerCancels(t *testing.T) {
 	fatal(t, problem)
 	store, problem := records.Open(layout.DB)
 	fatal(t, problem)
-	defer store.Close()
+	t.Cleanup(store.Close)
 	must(t, os.MkdirAll(layout.Rentals, 0o700))
 	owner, problem := rental.OwnerIdentityAt(layout.RentalCreatorIdentity("pr-ops"))
 	fatal(t, problem)
@@ -135,7 +145,7 @@ func TestAnOperationIsANumberedRunTheOwnerCancels(t *testing.T) {
 	server := grpc.NewServer(grpc.Creds(credentials.NewTLS(&tls.Config{Certificates: []tls.Certificate{cert}})))
 	v1.RegisterMachineServer(server, machine)
 	go server.Serve(listener)
-	defer server.Stop()
+	t.Cleanup(server.Stop)
 	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Certificate[0]})
 	must(t, os.WriteFile(layout.RentalCert("pr-ops"), certPEM, 0o600))
 	fatal(t, store.RecordRental(records.Rental{ID: "pr-ops", MachineName: "kirin", SKU: "cpu", State: "ready", Hub: h.server.URL,
@@ -147,7 +157,14 @@ func TestAnOperationIsANumberedRunTheOwnerCancels(t *testing.T) {
 		"hourly_rate_usd_micros": int64(1), "accelerator_count": 1, "requested_accelerator_model": "CPU"}
 	h.mu.Unlock()
 	startCalciferProcess(t, root)
+	return root, machine
+}
 
+// A package install on a rental is a run like any other: it gets the next run number, `run
+// list` shows it with its kind, the same install asked again while it runs is that run, and
+// `run cancel` reaches the machine and ends it canceled.
+func TestAnOperationIsANumberedRunTheOwnerCancels(t *testing.T) {
+	root, machine := opsRental(t)
 	install := func() (run struct {
 		Number int64
 		Kind   string
@@ -161,14 +178,8 @@ func TestAnOperationIsANumberedRunTheOwnerCancels(t *testing.T) {
 	}
 	first := install()
 	number := fmt.Sprint(first.Number)
-	waitFor(t, root, "the machine taking the install as a warm run", func() bool {
-		machine.mu.Lock()
-		defer machine.mu.Unlock()
-		return len(machine.specs) == 1
-	})
-	machine.mu.Lock()
-	spec := machine.specs[0]
-	machine.mu.Unlock()
+	waitFor(t, root, "the machine taking the install as a warm run", func() bool { return len(machine.sent()) == 1 })
+	spec := machine.sent()[0]
 	if spec.Kind != v1.RunKind_RUN_KIND_WARM || spec.GetRelease().GetPackage() != "paul/demo" || spec.Entrypoint != "" {
 		t.Fatalf("the install is not a warm run of its release: %+v", spec)
 	}
@@ -190,5 +201,64 @@ func TestAnOperationIsANumberedRunTheOwnerCancels(t *testing.T) {
 		_, shown := runCozy(t, root, "run", "show", number, "--json")
 		var run struct{ Status string }
 		return json.Unmarshal([]byte(lastJSONLine(shown)), &run) == nil && run.Status == "canceled"
+	})
+}
+
+// `cozy rental update` is a numbered run like an install: kind update, its machine takes Run
+// kind: update naming the versions, the rental's other work is not sent until it settles, and
+// `run cancel` reaches the machine and ends it canceled.
+func TestARentalUpdateIsANumberedRunTheOwnerCancels(t *testing.T) {
+	root, machine := opsRental(t)
+	alone := filepath.Join(t.TempDir(), "tensorfs-0.6.1-py3-none-any.whl")
+	must(t, os.WriteFile(alone, []byte("wheel"), 0o600))
+	if code, out := runCozy(t, root, "rental", "update", "kirin", "--tensorfs-wheel", alone, "--json"); code == 0 || !strings.Contains(out, "requires --runtime-wheel") {
+		t.Fatalf("a TensorFS wheel alone was admitted [exit %d]: %s", code, out)
+	}
+	code, out := runCozy(t, root, "rental", "update", "kirin", "--runtime-version=0.23.35", "--tensorfs-version=0.6.1", "--no-wait", "--json")
+	var update struct {
+		Number int64
+		Kind   string
+	}
+	if code != 0 || json.Unmarshal([]byte(lastJSONLine(out)), &update) != nil || update.Number == 0 || update.Kind != "update" {
+		t.Fatalf("rental update is not a numbered run [exit %d]: %s\n%s", code, out, tail(filepath.Join(root, "calcifer.log")))
+	}
+	number := fmt.Sprint(update.Number)
+	waitFor(t, root, "the machine taking the update", func() bool { return len(machine.sent()) == 1 })
+	spec := machine.sent()[0]
+	var payload map[string]string
+	if spec.Kind != v1.RunKind_RUN_KIND_UPDATE || json.Unmarshal(spec.Payload, &payload) != nil ||
+		payload["runtime"] != "0.23.35" || payload["tensorfs"] != "0.6.1" {
+		t.Fatalf("the update is not Run kind: update naming its versions: %+v", spec)
+	}
+	code, out = runCozy(t, root, "run", "list", "--json")
+	var listed struct {
+		Invocations []map[string]any `json:"invocations"`
+	}
+	if code != 0 || json.Unmarshal([]byte(out), &listed) != nil || len(listed.Invocations) != 1 || listed.Invocations[0]["kind"] != "update" ||
+		listed.Invocations[0]["machine"] != "kirin" || listed.Invocations[0]["target"] != "runtime 0.23.35, tensorfs 0.6.1" {
+		t.Fatalf("run list does not show the update as a run [exit %d]: %s", code, out)
+	}
+	// Work for the rental waits for its update, so it lands on the new software.
+	if code, out := runCozy(t, root, "package", "install", "paul/demo", "--rental=kirin", "--no-wait", "--json"); code != 0 {
+		t.Fatalf("package install --rental [exit %d]: %s", code, out)
+	}
+	waitFor(t, root, "the install waiting for the update", func() bool {
+		log, _ := os.ReadFile(filepath.Join(root, "calcifer.log"))
+		return strings.Contains(string(log), "this rental is updating its software (run "+number+")")
+	})
+	if sent := machine.sent(); len(sent) != 1 {
+		t.Fatalf("work was sent during the update: %+v", sent)
+	}
+	if code, out := runCozy(t, root, "run", "cancel", number, "--json"); code != 0 {
+		t.Fatalf("run cancel %s [exit %d]: %s", number, code, out)
+	}
+	waitFor(t, root, "the canceled update ending canceled", func() bool {
+		_, shown := runCozy(t, root, "run", "show", number, "--json")
+		var run struct{ Status string }
+		return json.Unmarshal([]byte(lastJSONLine(shown)), &run) == nil && run.Status == "canceled"
+	})
+	eventually(t, root, "the install sent once the update settled", func() bool {
+		sent := machine.sent()
+		return len(sent) == 2 && sent[1].Kind == v1.RunKind_RUN_KIND_WARM
 	})
 }

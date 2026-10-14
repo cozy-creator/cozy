@@ -235,37 +235,6 @@ func TestAcceptedRunObserverAttachesAgainWithoutResubmission(t *testing.T) {
 	}
 }
 
-func TestAcceptedRunObserverRetriesTemporaryRentalResolutionRefusal(t *testing.T) {
-	peer := &observerLeasePeer{expiring: make(chan struct{}), expireRelease: make(chan struct{})}
-	root, store, request, _ := observerLeaseFixture(t, peer, true)
-	select {
-	case <-peer.expiring:
-	case <-time.After(12 * time.Second):
-		t.Fatal("rental peer did not accept the first submission")
-	}
-	observerEventually(t, func() bool { accepted, _ := store.RunV1(request.ID); return accepted })
-	// Exercise the real resolver's read of a temporary maintenance hold. No updater is
-	// invoked: this test owns the retained record and releases it after the refusal.
-	update, problem := store.BeginRuntimeUpdate("pr-observer", "lease-boot", nil)
-	if problem != nil {
-		t.Fatal(problem)
-	}
-	close(peer.expireRelease)
-	observerEventually(t, func() bool {
-		log, _ := os.ReadFile(filepath.Join(root, "calcifer.log"))
-		return strings.Contains(string(log), "this rental is updating its software")
-	})
-	update.State = "succeeded"
-	fatal(t, store.SaveRuntimeUpdate(*update))
-	observerEventually(t, func() bool {
-		row, _ := store.MachineExecution(request.ID)
-		return row != nil && row.Collected
-	})
-	if peer.specs.Load() != 1 || peer.attaches.Load() != 1 || peer.controls.Load() != 0 {
-		t.Fatalf("specs=%d attaches=%d controls=%d", peer.specs.Load(), peer.attaches.Load(), peer.controls.Load())
-	}
-}
-
 func TestEndingRentalStopsAuthorityRecoveryWithoutControllingWork(t *testing.T) {
 	peer := &observerLeasePeer{expiring: make(chan struct{}), expireRelease: make(chan struct{})}
 	root, store, request, _ := observerLeaseFixture(t, peer, true)

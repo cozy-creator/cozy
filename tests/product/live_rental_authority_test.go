@@ -116,64 +116,6 @@ func TestLiveRentalSelectorsIgnoreHistoryAndMissingProjection(t *testing.T) {
 	}
 }
 
-func TestRentalObservationReplacesEndpointAndOldBootUpdateHold(t *testing.T) {
-	layout, problem := home.Open(t.TempDir())
-	fatal(t, problem)
-	store, problem := records.Open(layout.DB)
-	fatal(t, problem)
-	defer store.Close()
-	row := records.Rental{ID: "pr-replaced", MachineName: "retained-alias", StableMachineName: "old-name", State: "ready", Hub: "https://hub.invalid", AcceleratorModel: "H100", AcceleratorCount: 1, HourlyRateUSDMicros: 100000, Address: "old.invalid:1", ExpectedWorkerID: "old-worker", ExpectedWorkerBootID: "old-boot"}
-	fatal(t, store.RecordRental(row))
-	update, problem := store.BeginRuntimeUpdate(row.ID, row.ExpectedWorkerBootID, []byte(`{"runtime_version":"0.23.25"}`))
-	fatal(t, problem)
-	update.State = "updating"
-	fatal(t, store.SaveRuntimeUpdate(*update))
-	if problem := store.RuntimeUpdateHold(row.ID); problem == nil {
-		t.Fatal("old update did not hold its own boot")
-	}
-	row.Address, row.ExpectedWorkerID, row.ExpectedWorkerBootID, row.StableMachineName = "new.invalid:2", "new-worker", "new-boot", "new-name"
-	fatal(t, store.RecordRental(row)) // Acquisition replay must accept a Hub replacement.
-	if problem := store.RuntimeUpdateHold(row.ID); problem != nil {
-		t.Fatalf("old incarnation still blocked replacement: %v", problem)
-	}
-	next, problem := store.BeginRuntimeUpdate(row.ID, row.ExpectedWorkerBootID, update.Selection)
-	fatal(t, problem)
-	if next.ID == update.ID {
-		t.Fatal("different boot reused the old native update identity")
-	}
-	update.State = "failed"
-	if problem := store.SaveRuntimeUpdate(*update); problem == nil {
-		t.Fatal("stale updater overwrote replacement operation")
-	}
-	row.State, row.Failure.Code = "degraded", "readiness.provider_stopped"
-	fatal(t, store.ObserveRental(row))
-	stopped, problem := store.RuntimeUpdate(row.ID)
-	fatal(t, problem)
-	if stopped.Active() || !strings.Contains(stopped.Error, "provider reports this rental stopped") {
-		t.Fatalf("provider stop retained update hold: %+v", stopped)
-	}
-	row.State, row.Failure.Code = "ready", ""
-	fatal(t, store.ObserveRental(row))
-	stopped, problem = store.RuntimeUpdate(row.ID)
-	fatal(t, problem)
-	if stopped.Active() {
-		t.Fatal("observed resume restarted a canceled software change")
-	}
-	next, problem = store.BeginRuntimeUpdate(row.ID, row.ExpectedWorkerBootID, update.Selection)
-	fatal(t, problem) // A new explicit update remains possible after resume.
-	row.State = "released"
-	fatal(t, store.ObserveRental(row))
-	settled, problem := store.RuntimeUpdate(row.ID)
-	fatal(t, problem)
-	if settled.Active() || !strings.Contains(settled.Error, "Hub confirmed") {
-		t.Fatalf("gone rental kept update active: %+v", settled)
-	}
-	next.State = "updating"
-	if problem := store.SaveRuntimeUpdate(*next); problem == nil {
-		t.Fatal("late observer resurrected ended rental update")
-	}
-}
-
 func TestRentalSecretSweepRequiresAffirmativeHubAbsence(t *testing.T) {
 	layout, problem := home.Open(t.TempDir())
 	fatal(t, problem)

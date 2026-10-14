@@ -10,7 +10,6 @@ package reclaim
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -138,43 +137,10 @@ func Tmp(l home.Layout, st *records.Store) (Swept, *exit.Error) {
 		}
 		return Swept{}, exit.Internalf("cannot scan the tmp root %s: %s", l.Tmp, err)
 	}
-	protected := map[string]bool{"locks": true}
-	if st != nil {
-		updates, problem := st.ActiveRuntimeUpdates()
-		if problem != nil {
-			return Swept{}, problem
-		}
-		for _, update := range updates {
-			// Public and local updates share this stage, including the pre-plan window.
-			protected["runtime-updates"] = true
-			if len(update.Selection) == 0 {
-				continue
-			}
-			type localWheel struct {
-				Path string `json:"path"`
-			}
-			var selection struct {
-				LocalRuntime  *localWheel `json:"local_runtime"`
-				LocalTensorFS *localWheel `json:"local_tensorfs"`
-			}
-			if err := json.Unmarshal(update.Selection, &selection); err != nil {
-				return Swept{}, exit.Internalf("cannot read active Runtime update staging: %s", err)
-			}
-			for _, wheel := range []*localWheel{selection.LocalRuntime, selection.LocalTensorFS} {
-				if wheel == nil {
-					continue
-				}
-				relative, err := filepath.Rel(l.Tmp, wheel.Path)
-				if err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) && !filepath.IsAbs(relative) {
-					protected[strings.Split(relative, string(filepath.Separator))[0]] = true
-				}
-			}
-		}
-	}
 	var swept Swept
 	var first *exit.Error
 	for _, entry := range entries {
-		if protected[entry.Name()] {
+		if entry.Name() == "locks" {
 			continue
 		}
 		swept.Scanned++

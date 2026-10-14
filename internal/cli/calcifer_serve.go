@@ -149,9 +149,6 @@ func serveCalcifer(ctx *Context) *exit.Error {
 	}
 	machines := newMachineRuns(ctx, l, st, resolver, fleet, found)
 	defer machines.cancel()
-	updates := &rentalRuntimeUpdates{machines: machines}
-	machines.updates = updates
-	fleet.boot = updates.Boot
 	fleet.wakeMachine = machines.WakeMachine
 	fleet.machineStatus = machines.statuses
 	c, e := orchestrator.Open(orchestrator.Options{
@@ -196,7 +193,6 @@ func serveCalcifer(ctx *Context) *exit.Error {
 	}
 
 	server := api.New(api.Options{
-		RuntimeUpdate:   updates.Start,
 		RentalKeepalive: fleet.keepalive,
 		MachineReady: func(machine string) {
 			machines.WakeMachine(machine)
@@ -210,6 +206,13 @@ func serveCalcifer(ctx *Context) *exit.Error {
 		},
 		Shutdown: func() { stop <- syscall.SIGTERM },
 	})
+	machines.submit = server.SubmitOperation
+	// A new boot takes its Hub's target software before its work, as an update run.
+	fleet.boot = func(id string) {
+		if _, problem := machines.followTarget(id); problem != nil {
+			fmt.Fprintf(ctx.Out, "rental %s keeps its software: %s\n", id, problem.Message)
+		}
+	}
 	handler, e := server.Handler()
 	if e != nil {
 		closeListeners()
@@ -256,9 +259,8 @@ func serveCalcifer(ctx *Context) *exit.Error {
 		}},
 		{"run recovery", func() string {
 			go fleet.releaseOrphaned()
-			updates.Resume()
 			machines.Resume()
-			return "rental reconciliation started; Runtime updates and run observers resumed"
+			return "rental reconciliation started; run observers resumed"
 		}},
 		// cl-076: an install directory is reachable only through its record, so a records.db
 		// that was lost or rebuilt strands every one of them on disk with no verb able to

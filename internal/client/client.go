@@ -445,18 +445,6 @@ func (c *Client) MachineReady(machine string) *exit.Error {
 	return c.call(http.MethodPost, "/v1/local/machines/"+url.PathEscape(machine)+"/ready", nil, nil)
 }
 
-func (c *Client) UpdateRentalRuntime(rentalID string, request api.RuntimeUpdateRequest) (api.RuntimeUpdate, *exit.Error) {
-	var result api.RuntimeUpdate
-	problem := c.call(http.MethodPost, "/v1/local/rentals/"+url.PathEscape(rentalID)+"/runtime-update", request, &result)
-	return result, problem
-}
-
-func (c *Client) RentalRuntimeUpdate(rentalID string) (api.RuntimeUpdate, *exit.Error) {
-	var result api.RuntimeUpdate
-	problem := c.call(http.MethodGet, "/v1/local/rentals/"+url.PathEscape(rentalID)+"/runtime-update", nil, &result)
-	return result, problem
-}
-
 // Down stops Calcifer. A plain down never cancels work and names what is in flight.
 // Under all=true, Calcifer requests cancellation and returns the exact paid obligations
 // the caller must terminate and confirm through Tensorhub before retrying.

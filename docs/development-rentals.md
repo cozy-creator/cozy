@@ -11,12 +11,10 @@ cozy rental new h100-sxm5-80gb
 cozy rental update <name>
 ```
 
-`cozy rental update` selects the approved SDK pair from the active compatible Hub
-image profile. It updates only Runtime/TensorFS, retaining model bytes, intermediate
-work and the heavy Torch/CUDA environment. Active execution is never interrupted.
-The live Calcifer holds only the target rental out of new dispatch, and the
-existing worker guardian owns installation, rollback and status across disconnects.
-Another rental and the local Calcifer remain available.
+`cozy rental update` installs the Hub's target Runtime/TensorFS pair (or the versions or
+wheels it names) as a numbered `update` run, retaining model bytes and the heavy Torch/CUDA
+environment. Active execution is never interrupted; the rental's unsent work waits for the
+run, and `cozy run cancel` stops it before it activates. See `rental-runtime-updates.md`.
 
 For an operator-owned SSH identity, set `rentals.ssh_public_key` to its public key
 path or pass `--ssh-public-key FILE` on acquisition. Relative config paths resolve

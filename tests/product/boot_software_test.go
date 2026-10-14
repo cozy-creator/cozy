@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -16,17 +17,17 @@ import (
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/machinev1"
-	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
 	"github.com/cozy-creator/cozy/internal/secret"
 	"github.com/cozy-creator/cozy/internal/workertls"
 )
 
-// A rental's newly attached boot runs the Hub's pinned software before it takes work:
-// Calcifer sends its machine Run kind: update with the pin's published versions, once per boot,
-// older or newer alike. Unpinned, the target is what the current image bakes and a boot moves
-// only forward to it. A boot already on the target is left as it is; a target the machine
-// cannot install leaves it serving its own software, and that boot is not tried again.
+// A rental's newly attached boot runs the Hub's pinned software before it takes work: Calcifer
+// records an update run, once per boot, which sends its machine Run kind: update with the pin's
+// published versions, older or newer alike. Unpinned, the target is what the current image
+// bakes and a boot moves only forward to it. A boot already on the target is answered
+// unchanged; a target the machine cannot install leaves it serving its own software, and that
+// boot is not tried again.
 func TestARentalBootFollowsTheHubsTarget(t *testing.T) {
 	root, store, launch, identity, _, h := statusRentalHub(t)
 	layout, problem := home.Open(root)
@@ -59,11 +60,41 @@ func TestARentalBootFollowsTheHubsTarget(t *testing.T) {
 			time.Sleep(200 * time.Millisecond)
 		}
 	}
+	type update struct {
+		Number int64
+		Status string
+		Error  string
+		Result struct{ From, To map[string]string }
+	}
+	latest := func() (newest update) {
+		t.Helper()
+		code, out := runCozy(t, root, "run", "list", "--json")
+		var listed struct {
+			Invocations []struct {
+				Number int64
+				Kind   string
+			} `json:"invocations"`
+		}
+		if code != 0 || json.Unmarshal([]byte(out), &listed) != nil {
+			t.Fatalf("run list [exit %d]\n%s", code, out)
+		}
+		for _, run := range listed.Invocations {
+			if run.Kind == "update" && run.Number > newest.Number {
+				newest.Number = run.Number
+			}
+		}
+		if newest.Number > 0 {
+			_, shown := runCozy(t, root, "run", "show", strconv.FormatInt(newest.Number, 10), "--json")
+			must(t, json.Unmarshal([]byte(lastJSONLine(shown)), &newest))
+		}
+		return newest
+	}
+	unchanged := func(run update) bool { return samePair(run.Result.From, run.Result.To) }
 	booted := running()
-	previous := ""
+	previous := int64(0)
 	// The Hub lists the rental on its machine's boot while this host still holds an earlier one:
 	// the next reconcile attaches the boot and brings it to target.
-	boot := func(target map[string]string) *records.RuntimeUpdate {
+	boot := func(target map[string]string) update {
 		t.Helper()
 		fatal(t, store.RebootRental(parityRental, launch.WorkerID, "an-earlier-boot", launch.Addr, launch.MediaAddr))
 		h.fakeRentalHub.mu.Lock()
@@ -75,67 +106,52 @@ func TestARentalBootFollowsTheHubsTarget(t *testing.T) {
 		if code, out := runCozy(t, root, "rental", "list", "--no-watch", "--json"); code != 0 {
 			t.Fatalf("rental list [exit %d]\n%s", code, out)
 		}
-		eventually(t, root, "the boot's update ends", func() bool {
-			row, problem := store.RuntimeUpdate(parityRental)
-			return problem == nil && row != nil && row.ID != previous && row.BootID == launch.BootID && !row.Active()
+		var run update
+		eventually(t, root, "the boot's update run ends", func() bool {
+			run = latest()
+			return run.Number > previous && (run.Status == "completed" || run.Status == "failed")
 		})
-		row, problem := store.RuntimeUpdate(parityRental)
-		fatal(t, problem)
-		previous = row.ID
-		return row
-	}
-	result := func(row *records.RuntimeUpdate) (out struct {
-		To        map[string]string
-		Unchanged bool
-	}) {
-		must(t, json.Unmarshal(row.Result, &out))
-		return out
+		previous = run.Number
+		return run
 	}
 
-	if row := boot(booted); row.State != "succeeded" || !result(row).Unchanged {
-		t.Fatalf("a boot already on the target was updated: %+v", row)
+	if run := boot(booted); run.Status != "completed" || !unchanged(run) {
+		t.Fatalf("a boot already on the target was updated: %+v", run)
 	}
 	// Pinning an older release is a rollback; forward again, a release. An older image's
 	// software, unpinned, never moves a boot back.
 	if older := olderRelease(t, "cozy-runtime", booted["runtime"]); older != "" {
-		if row := boot(map[string]string{"runtime": older, "tensorfs": booted["tensorfs"]}); row.State != "succeeded" || !result(row).Unchanged || !samePair(running(), booted) {
-			t.Fatalf("an unpinned older target moved the boot back: %+v, running %v", row, running())
+		if run := boot(map[string]string{"runtime": older, "tensorfs": booted["tensorfs"]}); run.Status != "completed" || !unchanged(run) || !samePair(running(), booted) {
+			t.Fatalf("an unpinned older target moved the boot back: %+v, running %v", run, running())
 		}
 		for _, version := range []string{older, booted["runtime"]} {
 			target := map[string]string{"runtime": version, "tensorfs": booted["tensorfs"], "pinned": "true"}
-			if row := boot(target); row.State != "succeeded" || result(row).Unchanged || !samePair(running(), target) {
-				t.Fatalf("the boot did not follow the target to %v: %+v, running %v", target, row, running())
+			if run := boot(target); run.Status != "completed" || unchanged(run) || !samePair(running(), target) {
+				t.Fatalf("the boot did not follow the target to %v: %+v, running %v", target, run, running())
 			}
 		}
 	} else {
 		t.Logf("Runtime %s has no older published release: the install in both directions is not exercised", booted["runtime"])
 	}
 	failed := boot(map[string]string{"runtime": "999.0.0", "tensorfs": booted["tensorfs"]})
-	if failed.State != "failed" || !strings.Contains(failed.Error, "999.0.0") || !samePair(running(), booted) {
+	if failed.Status != "failed" || !samePair(running(), booted) {
 		t.Fatalf("an uninstallable target did not leave the boot serving its own software: %+v, running %v", failed, running())
 	}
-	if code, out := runCozy(t, root, "rental", "list", "--no-watch", "--json"); code != 0 || strings.Contains(out, "updating its software") {
-		t.Fatalf("the failed boot still holds the rental [exit %d]\n%s", code, out)
+	if code, out := runCozy(t, root, "rental", "list", "--no-watch", "--json"); code != 0 {
+		t.Fatalf("rental list [exit %d]\n%s", code, out)
 	}
-	if again, problem := store.RuntimeUpdate(parityRental); problem != nil || again.ID != failed.ID {
-		t.Fatalf("the same boot was tried again: %+v %v", again, problem)
+	if again := latest(); again.Number != failed.Number {
+		t.Fatalf("the same boot was tried again: %+v", again)
 	}
-	// Asked with nothing named, an update is the Hub's target too.
+	// Asked with nothing named, an update is the Hub's target, named exactly.
 	h.fakeRentalHub.mu.Lock()
 	h.software = booted
 	h.fakeRentalHub.mu.Unlock()
 	code, out := runCozy(t, root, "rental", "update", "tessa", "--json")
 	var shown map[string]any
-	if code != 0 || json.Unmarshal([]byte(lastJSONLine(out)), &shown) != nil || shown["status"] != "unchanged: it already runs this software" {
+	if code != 0 || json.Unmarshal([]byte(lastJSONLine(out)), &shown) != nil || shown["unchanged"] != true ||
+		shown["target"] != "runtime "+booted["runtime"]+", tensorfs "+booted["tensorfs"] {
 		t.Fatalf("rental update with nothing named [exit %d]\n%s", code, out)
-	}
-	// The cozy names the target's versions: a Calcifer older than it reads an empty request as the
-	// newest published pair.
-	asked, problem := store.RuntimeUpdate(parityRental)
-	fatal(t, problem)
-	var selection map[string]any
-	if json.Unmarshal(asked.Selection, &selection) != nil || selection["runtime_version"] != booted["runtime"] || selection["tensorfs_version"] != booted["tensorfs"] {
-		t.Fatalf("rental update sent no versions: %s", asked.Selection)
 	}
 }
 

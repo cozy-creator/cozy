@@ -86,7 +86,6 @@ type Server struct {
 	rentalInventory func(context.Context, string, bool, bool) (RentalInventory, *exit.Error)
 	rentalKeepalive func(context.Context, string) (RentalKeepaliveResult, *exit.Error)
 	machineReady    func(string)
-	runtimeUpdate   func(string, RuntimeUpdateRequest) (*records.RuntimeUpdate, *exit.Error)
 
 	// shutdown asks the process that owns this server to drain and stop — `cozy down`'s
 	// cooperative tier (#449). The route refuses when the builder wired none.
@@ -140,7 +139,6 @@ type Options struct {
 	RentalInventory func(ctx context.Context, hub string, allHubs, reconcile bool) (RentalInventory, *exit.Error)
 	RentalKeepalive func(context.Context, string) (RentalKeepaliveResult, *exit.Error)
 	MachineReady    func(machine string)
-	RuntimeUpdate   func(string, RuntimeUpdateRequest) (*records.RuntimeUpdate, *exit.Error)
 	// Shutdown is the cooperative-down hook the shutdown route calls (#449).
 	Shutdown func()
 }
@@ -156,7 +154,7 @@ func New(opt Options) *Server {
 		orchestrator:      opt.Orchestrator, store: opt.Orchestrator.Store(),
 		layout: opt.Orchestrator.Layout(), cfg: opt.Cfg, creds: opt.Creds,
 		addr: opt.Addr, log: opt.Log, web: opt.Web, packages: opt.Packages,
-		rentals: opt.Rentals, rentalInventory: opt.RentalInventory, rentalKeepalive: opt.RentalKeepalive, machineReady: opt.MachineReady, runtimeUpdate: opt.RuntimeUpdate, shutdown: opt.Shutdown,
+		rentals: opt.Rentals, rentalInventory: opt.RentalInventory, rentalKeepalive: opt.RentalKeepalive, machineReady: opt.MachineReady, shutdown: opt.Shutdown,
 	}
 }
 
@@ -216,33 +214,31 @@ func (s *Server) recordSubmission(spec orchestrator.Submission) (records.Request
 func (s *Server) Handler() (http.Handler, *exit.Error) {
 	mux := http.NewServeMux()
 	handlers := map[string]http.HandlerFunc{
-		"GET /v1/capabilities":                              s.capabilities,
-		"POST /v1/requests":                                 s.submit,
-		"GET /v1/requests":                                  s.listRequests,
-		"GET /v1/requests/{id}":                             s.getRequest,
-		"POST /v1/local/requests/{id}/abandon":              s.abandonRequest,
-		"POST /v1/requests/{id}/cancel":                     s.cancelRequest,
-		"GET /v1/requests/{id}/events":                      s.requestEvents,
-		"GET /v1/media/{media_id}":                          s.media,
-		"GET /v1/local/attempts/{attempt_key}/triage":       s.attemptTriage,
-		"GET /v1/local/requests/{id}/evidence":              s.requestEvidence,
-		"POST /v1/local/rentals/{rental_id}/keepalive":      s.keepRentalAlive,
-		"GET /v1/local/rentals":                             s.listRentals,
-		"GET /v1/local/machines/{machine}/status":           s.machineStatus,
-		"POST /v1/local/machines/{machine}/ready":           s.machineBecameReady,
-		"GET /v1/local/machines/{machine}/logs/{log}":       s.machineLog,
-		"POST /v1/local/machines/{machine}/operations":      s.submitOperation,
-		"POST /v1/local/rentals/{rental_id}/runtime-update": s.startRuntimeUpdate,
-		"GET /v1/local/rentals/{rental_id}/runtime-update":  s.readRuntimeUpdate,
-		"POST /v1/local/calcifer/down":                      s.downCalcifer,
-		"POST /v1/local/jobs":                               s.submitJob,
-		"GET /v1/local/jobs/{id}":                           s.getJob,
-		"POST /v1/local/jobs/{id}/pause":                    s.pauseJob,
-		"POST /v1/local/jobs/{id}/resume":                   s.resumeJob,
-		"POST /v1/local/jobs/{id}/cancel":                   s.cancelJob,
-		"GET /{$}":                                          s.webUI,
-		"GET /app.css":                                      s.webUI,
-		"GET /app.js":                                       s.webUI,
+		"GET /v1/capabilities":                         s.capabilities,
+		"POST /v1/requests":                            s.submit,
+		"GET /v1/requests":                             s.listRequests,
+		"GET /v1/requests/{id}":                        s.getRequest,
+		"POST /v1/local/requests/{id}/abandon":         s.abandonRequest,
+		"POST /v1/requests/{id}/cancel":                s.cancelRequest,
+		"GET /v1/requests/{id}/events":                 s.requestEvents,
+		"GET /v1/media/{media_id}":                     s.media,
+		"GET /v1/local/attempts/{attempt_key}/triage":  s.attemptTriage,
+		"GET /v1/local/requests/{id}/evidence":         s.requestEvidence,
+		"POST /v1/local/rentals/{rental_id}/keepalive": s.keepRentalAlive,
+		"GET /v1/local/rentals":                        s.listRentals,
+		"GET /v1/local/machines/{machine}/status":      s.machineStatus,
+		"POST /v1/local/machines/{machine}/ready":      s.machineBecameReady,
+		"GET /v1/local/machines/{machine}/logs/{log}":  s.machineLog,
+		"POST /v1/local/machines/{machine}/operations": s.submitOperation,
+		"POST /v1/local/calcifer/down":                 s.downCalcifer,
+		"POST /v1/local/jobs":                          s.submitJob,
+		"GET /v1/local/jobs/{id}":                      s.getJob,
+		"POST /v1/local/jobs/{id}/pause":               s.pauseJob,
+		"POST /v1/local/jobs/{id}/resume":              s.resumeJob,
+		"POST /v1/local/jobs/{id}/cancel":              s.cancelJob,
+		"GET /{$}":                                     s.webUI,
+		"GET /app.css":                                 s.webUI,
+		"GET /app.js":                                  s.webUI,
 	}
 	registered := map[string]bool{}
 	for _, r := range Routes {

@@ -31,7 +31,8 @@ type machineRuns struct {
 	sent     sync.Map
 	placed   map[string]string // the last placement decision recorded per waiting run
 	machines *machines.Resolver
-	updates  *rentalRuntimeUpdates
+	// submit records an operation as a run (api.Server.SubmitOperation), once Calcifer serves.
+	submit func(machine string, op records.Operation) (records.Request, bool, *exit.Error)
 	// submitting stops each request's submission work in flight (upload, preparation,
 	// staging) once its cancel is durable; guarded by mu.
 	submitting map[string]context.CancelFunc

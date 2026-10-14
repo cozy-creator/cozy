@@ -28,7 +28,8 @@ type Cohort struct {
 	Agent             string
 }
 
-func (c Cohort) spec() (*pb.RunSpec, error) {
+// Spec is the cohort as Run kind: update takes it; a Wheel member is an input written first.
+func (c Cohort) Spec() (*pb.RunSpec, error) {
 	payload := map[string]string{}
 	var inputs []*pb.InputFile
 	for field, member := range map[string]*Member{"runtime": c.Runtime, "tensorfs": c.TensorFS} {
@@ -58,7 +59,7 @@ func (c Cohort) spec() (*pb.RunSpec, error) {
 // the outcome, calling each with every event. The update restarts the machine's service, so
 // a lost stream is attached again from the last event seen for as long as ctx allows.
 func (c *Client) Update(ctx context.Context, id string, cohort Cohort, each func(*pb.RunEvent)) (*pb.Outcome, error) {
-	spec, err := cohort.spec()
+	spec, err := cohort.Spec()
 	if err != nil {
 		return nil, err
 	}

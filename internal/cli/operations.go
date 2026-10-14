@@ -130,6 +130,7 @@ func emitOperation(ctx *Context, machine string, op records.Operation, number in
 			Package, Entrypoint, Level string
 			HeldBack                   string `json:"held_back"`
 		} `json:"set"`
+		softwareResult
 	}
 	_ = json.Unmarshal(raw, &result)
 	target := op.Target()
@@ -154,6 +155,11 @@ func emitOperation(ctx *Context, machine string, op records.Operation, number in
 		published := result.Models[0].Published
 		fields = append(fields, output.Field{K: "destination", V: published.Destination}, output.Field{K: "checkpoint", V: published.Checkpoint})
 		shown = append(shown, "destination", "checkpoint")
+	}
+	if op.Software != nil && raw != nil {
+		fields = append(fields, output.Field{K: "runtime", V: result.To.Runtime}, output.Field{K: "tensorfs", V: result.To.TensorFS},
+			output.Field{K: "previous_runtime", V: result.From.Runtime}, output.Field{K: "unchanged", V: result.From == result.To})
+		shown = append(shown, "runtime", "tensorfs", "unchanged")
 	}
 	record := compactRecord(fields, shown...)
 	if raw == nil {

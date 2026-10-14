@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strings"
 	"syscall"
 
@@ -16,7 +15,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/machines"
 	"github.com/cozy-creator/cozy/internal/output"
 	"github.com/cozy-creator/cozy/internal/records"
-	"github.com/cozy-creator/cozy/internal/scratch"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/machine/v1"
 )
 
@@ -72,17 +70,29 @@ func handleEndpointUpdate(ctx *Context) *exit.Error {
 		return exit.Usagef("--idempotency-key must contain 1 to 200 bytes")
 	}
 	observe := ctx.Inv.Bool("--observe")
-	selection := runtimeUpdateSelection{RuntimeVersion: ctx.Inv.Value("--runtime-version"), TensorFSVersion: ctx.Inv.Value("--tensorfs-version")}
+	software := records.SoftwareUpdate{RuntimeVersion: ctx.Inv.Value("--runtime-version"), TensorFSVersion: ctx.Inv.Value("--tensorfs-version")}
 	runtimeWheel, tensorfsWheel := ctx.Inv.Value("--runtime-wheel"), ctx.Inv.Value("--tensorfs-wheel")
-	named := runtimeWheel != "" || tensorfsWheel != "" || selection.RuntimeVersion != "" || selection.TensorFSVersion != ""
+	named := runtimeWheel != "" || tensorfsWheel != "" || software.RuntimeVersion != "" || software.TensorFSVersion != ""
 	if observe && (named || ctx.Inv.Bool("--keep-agent")) {
 		return exit.Usagef("--observe takes the endpoint and update id only; it submits no software selection")
 	}
 	if !observe && !named {
 		return exit.Usagef("name the software to update, or use --observe to follow an accepted update")
 	}
-	if runtimeWheel != "" && selection.RuntimeVersion != "" || tensorfsWheel != "" && selection.TensorFSVersion != "" {
+	if runtimeWheel != "" && software.RuntimeVersion != "" || tensorfsWheel != "" && software.TensorFSVersion != "" {
 		return exit.Usagef("name a wheel or a version for each member, not both")
+	}
+	for _, member := range []struct {
+		path string
+		into **records.Wheel
+	}{{runtimeWheel, &software.RuntimeWheel}, {tensorfsWheel, &software.TensorFSWheel}} {
+		if member.path == "" {
+			continue
+		}
+		var problem *exit.Error
+		if *member.into, problem = measureWheel(member.path); problem != nil {
+			return problem
+		}
 	}
 	call, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop() // Disconnect only: the accepted update belongs to the machine.
@@ -91,32 +101,6 @@ func handleEndpointUpdate(ctx *Context) *exit.Error {
 		return problem
 	}
 	defer machine.Client.Close()
-	var snapshots []*scratch.Dir
-	defer func() {
-		for _, snapshot := range snapshots {
-			snapshot.Release()
-		}
-	}()
-	for _, member := range []struct {
-		path string
-		into **runtimeUpdateWheel
-	}{
-		{runtimeWheel, &selection.LocalRuntime}, {tensorfsWheel, &selection.LocalTensorFS},
-	} {
-		if member.path == "" {
-			continue
-		}
-		absolute, err := filepath.Abs(member.path)
-		if err != nil {
-			return exit.New(exit.Validation, "cannot resolve update wheel: %s", err)
-		}
-		wheel, snapshot, problem := freezeRuntimeWheel(home.Paths(ctx.Cfg.Home).Tmp, absolute)
-		if problem != nil {
-			return problem
-		}
-		*member.into = wheel
-		snapshots = append(snapshots, snapshot)
-	}
 	last := ""
 	progress := func(event *pb.RunEvent) {
 		stage := event.GetProgress().GetStage()
@@ -139,7 +123,7 @@ func handleEndpointUpdate(ctx *Context) *exit.Error {
 		if ctx.Inv.Bool("--keep-agent") {
 			agent = "explicit"
 		}
-		cohort, problem := runtimeUpdateCohort(call, machine.Client, selection, agent)
+		cohort, problem := runtimeUpdateCohort(call, machine.Client, software, agent)
 		if problem != nil {
 			return problem
 		}
@@ -156,7 +140,7 @@ func handleEndpointUpdate(ctx *Context) *exit.Error {
 	if outcome.GetStatus() != "succeeded" {
 		return exit.Named(exit.Failed, "machine.runtime_update_failed", "update %q: %s", id, either(outcome.GetReason().GetMessage(), outcome.GetReason().GetCode()))
 	}
-	var result runtimeUpdateResult
+	var result softwareResult
 	if json.Unmarshal(outcome.GetResult(), &result) != nil || result.To.Runtime == "" || result.To.TensorFS == "" {
 		return exit.Named(exit.Structural, "machine.update_result_unreadable", "update %q succeeded, but its software result cannot be read; inspect the endpoint with cozy machine show", id)
 	}

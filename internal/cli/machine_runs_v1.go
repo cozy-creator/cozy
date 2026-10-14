@@ -206,45 +206,6 @@ func marketRefusal(problem *exit.Error) bool {
 	return problem.ErrName() == "rental.no_inventory" || problem.ErrName() == "rental.catalog_empty"
 }
 
-// followTargetV1 updates a machine to the Hub's target software and answers "" once it runs
-// other software, else the next step its owner takes.
-func (m *machineRuns) followTargetV1(machine, origin string) string {
-	if machines.IsLocal(machine) {
-		changed, kept := m.machines.Host.FollowTarget(m.ctx, client(m.context.forHub(origin)))
-		if changed {
-			return ""
-		}
-		return cmp.Or(kept, "this computer's machine has no installed software to update") +
-			"; `cozy machine install` takes the Hub's target software, or name newer wheels with --runtime-wheel/--tensorfs-wheel"
-	}
-	name := machine
-	if row, _ := m.store.RentalRow(machine); row != nil && row.MachineName != "" {
-		name = row.MachineName
-	}
-	update, problem := m.updates.follow(machine)
-	for problem == nil && update.Active() && m.ctx.Err() == nil {
-		select {
-		case <-m.ctx.Done():
-		case <-time.After(time.Second):
-		}
-		update, problem = m.store.RuntimeUpdate(machine)
-		if problem == nil && update == nil {
-			problem = exit.New(exit.Conflict, "its update record is gone")
-		}
-	}
-	var result runtimeUpdateResult
-	switch {
-	case problem != nil:
-		return fmt.Sprintf("it could not take the Hub's target software (%s); `cozy rental update %s` retries", problem.Message, name)
-	case update.State == "failed":
-		return fmt.Sprintf("its update to the Hub's target software failed (%s); `cozy rental update %s` retries, or `cozy rental end %s` and rent a new machine", update.Error, name, name)
-	case json.Unmarshal(update.Result, &result) == nil && !result.Unchanged:
-		return ""
-	}
-	return fmt.Sprintf("%s runs Runtime %s (%s); update it to a release that serves this run: `cozy rental update %s --runtime-version <version> --tensorfs-version <version>`",
-		name, result.From.Runtime, result.Note, name)
-}
-
 // catchUpV1 records what an accepted run's machine holds now, for a reader: its state and its
 // log up to the head the machine names, without waiting for more.
 func (m *machineRuns) catchUpV1(ctx context.Context, request records.Request) *exit.Error {
@@ -291,6 +252,14 @@ func (m *machineRuns) stepV1(parent context.Context, request records.Request, li
 	sent, problem := m.store.RunV1Marked(request.ID, records.RunV1Sent)
 	if problem != nil {
 		return false, problem
+	}
+	if !accepted && !sent && !link.CancelRequested && request.Kind != "update" {
+		// Work waits for its machine's software update, so it lands on the new software.
+		if update, problem := m.store.PendingUpdate(link.MachineID); problem != nil {
+			return false, problem
+		} else if update != nil {
+			return false, exit.Named(exit.Unavailable, "rental.maintenance", "this rental is updating its software (run %d); work waits for it", update.Number)
+		}
 	}
 	// Only a submission may start this computer's machine; observing attaches to a running one.
 	dial := ctx
@@ -684,6 +653,9 @@ func (m *machineRuns) operationSpecV1(ctx context.Context, request records.Reque
 	frame, err := machine.Status(ctx)
 	if err != nil {
 		return nil, machines.Transport(err)
+	}
+	if op.Software != nil {
+		return m.updateSpecV1(ctx, machine, frame, *op.Software)
 	}
 	capabilities := frame.GetCapabilities()
 	needs := map[string]bool{"warm/1": true, "upload/1": request.Kind == "upload", "local-models/1": op.HoldsLocally(),

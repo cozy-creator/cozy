@@ -12,13 +12,14 @@ import (
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/machinev1"
+	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/workertls"
 )
 
-// `cozy rental update` with local wheels sends them to the rental's machine with Write and
-// runs Run kind: update there: the machine restarts its service on the candidate in place
-// (same boot), Calcifer records the outcome, and a Calcifer that crashed mid-update attaches
-// to the same update rather than starting another.
+// `cozy rental update` with local wheels is a numbered update run: Calcifer writes them to the
+// rental's machine and runs Run kind: update there; the machine restarts its service on the
+// candidate in place (same boot), and a Calcifer that crashed mid-update attaches to the same
+// run rather than starting another.
 func TestRentalUpdateRunsOnTheMachineAcrossACalciferCrash(t *testing.T) {
 	root, store, launch, identity, calcifer := statusRental(t)
 	pin, err := workertls.ParsePin(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: launch.Leaf}))
@@ -62,31 +63,38 @@ func TestRentalUpdateRunsOnTheMachineAcrossACalciferCrash(t *testing.T) {
 
 	first := localBuild(t, *machineRuntimeWheel, "v1update")
 	shown := update(first)
-	if shown["runtime"] != version(first) || shown["status"] != "ready" || runtime() != version(first) {
+	if shown["kind"] != "update" || shown["runtime"] != version(first) || shown["status"] != "completed" || runtime() != version(first) {
 		t.Fatalf("the update did not leave the machine on %s: %v", version(first), shown)
 	}
 
-	// Calcifer crashes while the machine updates; the next Calcifer finishes the same update.
+	// Calcifer crashes while the machine updates; the next Calcifer finishes the same update run.
 	second := localBuild(t, *machineRuntimeWheel, "v1crash")
 	command := exec.Command("/usr/bin/nice", "-n", "19", cozyBin, "rental", "update", "tessa", "--runtime-wheel", second, "--tensorfs-wheel", *machineTensorFSWheel, "--json")
 	command.Env = childEnv(t, root)
 	must(t, command.Start())
 	t.Cleanup(func() { _ = command.Process.Kill(); _ = command.Wait() })
+	var sent *records.Request
 	eventually(t, root, "Calcifer sends the update", func() bool {
-		row, problem := store.RuntimeUpdate(parityRental)
-		return problem == nil && row != nil && row.State == "updating"
+		pending, problem := store.PendingUpdate(parityRental)
+		if problem != nil || pending == nil {
+			return false
+		}
+		marked, problem := store.RunV1Marked(pending.ID, records.RunV1Sent)
+		sent = pending
+		return problem == nil && marked
 	})
-	sent, problem := store.RuntimeUpdate(parityRental)
-	fatal(t, problem)
 	calcifer = crashAndRestartTransactionCalcifer(t, calcifer)
 	_ = calcifer
 	eventually(t, root, "the resumed update settles", func() bool {
-		row, problem := store.RuntimeUpdate(parityRental)
-		return problem == nil && row != nil && !row.Active()
+		row, problem := store.RequestRow(sent.ID)
+		return problem == nil && row != nil && records.Settled(row.State)
 	})
-	settled, problem := store.RuntimeUpdate(parityRental)
+	settled, problem := store.RequestRow(sent.ID)
 	fatal(t, problem)
-	if settled.ID != sent.ID || settled.State != "succeeded" || runtime() != version(second) {
-		t.Fatalf("the resumed update did not settle the sent one: sent %s, settled %+v, machine on %s", sent.ID, settled, runtime())
+	if settled.State != "succeeded" || runtime() != version(second) {
+		t.Fatalf("the resumed update did not settle the sent one: %+v, machine on %s", settled, runtime())
+	}
+	if again, problem := store.PendingUpdate(parityRental); problem != nil || again != nil {
+		t.Fatalf("a second update started: %+v %v", again, problem)
 	}
 }

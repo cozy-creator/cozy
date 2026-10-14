@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"path/filepath"
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
@@ -40,15 +41,38 @@ func (s *Server) submitOperation(w http.ResponseWriter, r *http.Request) {
 		}
 		op.Hub = selected
 	}
-	if problem := validOperation(op); problem != nil {
+	recorded, fresh, problem := s.SubmitOperation(r.PathValue("machine"), op)
+	if problem != nil {
 		s.refuseTyped(w, r, problem)
 		return
 	}
-	machine := r.PathValue("machine")
+	status := http.StatusOK
+	if fresh {
+		status = http.StatusAccepted
+	}
+	s.ok(w, r, status, s.handleOf(recorded, 0))
+}
+
+// SubmitOperation records op on machine as a run under the next run number and starts it
+// (fresh); the same operation still unsettled there is answered instead.
+func (s *Server) SubmitOperation(machine string, op records.Operation) (records.Request, bool, *exit.Error) {
+	if problem := validOperation(op); problem != nil {
+		return records.Request{}, false, problem
+	}
+	if op.Software != nil {
+		// Read at the rental's own Hub, so its boot's update and `rental new`'s are one run.
+		rented, problem := s.store.RentalRow(machine)
+		if problem != nil {
+			return records.Request{}, false, problem
+		}
+		if rented == nil {
+			return records.Request{}, false, exit.New(exit.Validation, "a software update runs on a rental this computer holds; `cozy machine install` updates its own machine")
+		}
+		op.Hub = rented.Hub
+	}
 	payload, err := json.Marshal(op)
 	if err != nil {
-		s.refuseTyped(w, r, exit.Internalf("cannot encode the operation: %s", err))
-		return
+		return records.Request{}, false, exit.Internalf("cannot encode the operation: %s", err)
 	}
 	digest := sha256.Sum256(append([]byte(op.Kind()+"\x00"+machine+"\x00"), payload...))
 	spec := orchestrator.Submission{RequestID: records.NewID("op"), IdemKey: records.NewID("operation"),
@@ -58,28 +82,22 @@ func (s *Server) submitOperation(w http.ResponseWriter, r *http.Request) {
 	if machine != records.LocalMachine {
 		spec.RequestedRental = machine
 	}
-	recorded, problem := s.store.PendingOperation(machine, spec.BodyDigest)
-	fresh := false
-	if problem == nil && recorded == nil {
-		var row records.Request
-		row, fresh, problem = s.recordSubmission(spec)
-		recorded = &row
+	if recorded, problem := s.store.PendingOperation(machine, spec.BodyDigest); problem != nil {
+		return records.Request{}, false, problem
+	} else if recorded != nil {
+		return *recorded, false, nil
 	}
-	if problem != nil {
-		s.refuseTyped(w, r, problem)
-		return
+	row, fresh, problem := s.recordSubmission(spec)
+	if problem == nil && fresh {
+		s.activateRecorded(row)
 	}
-	if fresh {
-		s.activateRecorded(*recorded)
-	}
-	status := http.StatusOK
-	if fresh {
-		status = http.StatusAccepted
-	}
-	s.ok(w, r, status, s.handleOf(*recorded, 0))
+	return row, fresh, problem
 }
 
 func validOperation(op records.Operation) *exit.Error {
+	if op.Software != nil {
+		return validSoftware(op)
+	}
 	if op.Package != "" {
 		if _, problem := canonicalPackageRef(op.Package); problem != nil {
 			return problem
@@ -138,6 +156,38 @@ func validOperation(op records.Operation) *exit.Error {
 		}
 		if _, err := canonical.Raw(model.Manifest); err != nil {
 			return exit.New(exit.Validation, "a model download's manifest is not a canonical digest")
+		}
+	}
+	return nil
+}
+
+// validSoftware refuses a software update that names anything else, nothing, a wheel and a
+// version of one package, or TensorFS's wheel alone.
+func validSoftware(op records.Operation) *exit.Error {
+	software := *op.Software
+	if op.Package != "" || op.Release != "" || len(op.Models) > 0 || op.Destination != "" || op.Write != "" ||
+		op.Entrypoint != "" || op.Warm != "" || op.Local != "" || op.Remove != "" {
+		return exit.New(exit.Validation, "a software update names nothing else")
+	}
+	if software.Target {
+		if software != (records.SoftwareUpdate{Target: true}) {
+			return exit.New(exit.Validation, "a software update takes the Hub's target or names its software, not both")
+		}
+		return nil
+	}
+	if software.RuntimeWheel != nil && software.RuntimeVersion != "" || software.TensorFSWheel != nil && software.TensorFSVersion != "" {
+		return exit.New(exit.Validation, "name a wheel or a version, not both")
+	}
+	if software.TensorFSWheel != nil && software.RuntimeWheel == nil {
+		return exit.New(exit.Validation, "--tensorfs-wheel requires --runtime-wheel")
+	}
+	if software == (records.SoftwareUpdate{}) {
+		return exit.New(exit.Validation, "a software update names a Runtime or TensorFS")
+	}
+	for _, wheel := range []*records.Wheel{software.RuntimeWheel, software.TensorFSWheel} {
+		if wheel != nil && (!filepath.IsAbs(wheel.Path) || !strings.HasSuffix(wheel.Path, ".whl") || wheel.Length <= 0 ||
+			!strings.HasPrefix(wheel.Digest, "sha256:") || len(wheel.Digest) != len("sha256:")+64) {
+			return exit.New(exit.Validation, "an update wheel is an absolute .whl path measured by its sha256 digest and length")
 		}
 	}
 	return nil

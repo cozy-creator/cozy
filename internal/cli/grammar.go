@@ -671,10 +671,11 @@ type RentalUpdateCmd struct {
 	TensorFSWheel string `name:"tensorfs-wheel" predictor:"file" help:"Development only: pair --runtime-wheel with this local native TensorFS wheel."`
 	Runtime       string `name:"runtime-version" help:"Install this published Runtime release; with no wheel or version, the Hub's target pair."`
 	TensorFS      string `name:"tensorfs-version" help:"Install this published TensorFS release."`
+	NoWait        bool   `name:"no-wait" help:"Answer once the update is a numbered run instead of following it to its outcome."`
 }
 
 func (c *RentalUpdateCmd) Run(r *Runtime) error {
-	return r.call(handleRentalUpdate, []string{c.Rental}, nil, values("--runtime-wheel", c.RuntimeWheel, "--tensorfs-wheel", c.TensorFSWheel,
+	return r.call(handleRentalUpdate, []string{c.Rental}, bools("--no-wait", c.NoWait), values("--runtime-wheel", c.RuntimeWheel, "--tensorfs-wheel", c.TensorFSWheel,
 		"--runtime-version", c.Runtime, "--tensorfs-version", c.TensorFS), false)
 }
 

@@ -75,67 +75,6 @@ func statusRentalHub(t *testing.T) (string, *records.Store, *machines.Launch, re
 	return root, store, launch, identity, calcifer, h
 }
 
-// The accepted update survives a provider replacement. Its old address, TLS pin,
-// worker ID and boot are deliberately unusable; the real native successor must
-// answer before the retained software choice can finish.
-func TestRentalUpdateResumesOnAuthoritativeNativeReplacement(t *testing.T) {
-	root, store, launch, identity, _, h := statusRentalHub(t)
-	cert := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: launch.Leaf})
-	pin, err := workertls.ParsePin(cert)
-	must(t, err)
-	machine, err := machinev1.Dial(launch.Addr, pin.TLSConfig(), launch.WorkerID, identity.Signer())
-	must(t, err)
-	defer machine.Close()
-	call, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
-	status, err := machine.Status(call)
-	must(t, err)
-	if code, out := runCozy(t, root, "down"); code != 0 {
-		t.Fatalf("stop isolated observer: %d %s", code, out)
-	}
-	row, problem := store.RentalRow(parityRental)
-	fatal(t, problem)
-	row.Address, row.ExpectedWorkerID, row.ExpectedWorkerBootID = "127.0.0.1:1", "obsolete-worker", "obsolete-boot"
-	fatal(t, store.RecordRental(*row))
-	must(t, os.WriteFile(row.CertPath, []byte("obsolete pin"), 0600))
-	selection, err := json.Marshal(map[string]string{"runtime_version": status.Runtime, "tensorfs_version": status.Tensorfs})
-	must(t, err)
-	old, problem := store.BeginRuntimeUpdate(parityRental, row.ExpectedWorkerBootID, selection)
-	fatal(t, problem)
-	old.State = "updating"
-	fatal(t, store.SaveRuntimeUpdate(*old))
-	startCalciferProcess(t, root)
-	eventually(t, root, "accepted update moves to native replacement", func() bool {
-		current, problem := store.RuntimeUpdate(parityRental)
-		return problem == nil && current != nil && current.ID != old.ID && !current.Active()
-	})
-	current, problem := store.RuntimeUpdate(parityRental)
-	fatal(t, problem)
-	if current.State != "succeeded" || current.BootID != launch.BootID || string(current.Selection) != string(selection) {
-		t.Fatalf("replacement lost accepted software selection: %+v\n%s", current, tail(filepath.Join(root, "calcifer.log")))
-	}
-	old.State = "failed"
-	if problem := store.SaveRuntimeUpdate(*old); problem == nil {
-		t.Fatal("old observer overwrote successor")
-	}
-	if code, out := runCozy(t, root, "rental", "show", "tessa", "--json"); code != 0 || !strings.Contains(out, status.Runtime) {
-		t.Fatalf("fresh endpoint did not serve machine status: %d %s", code, out)
-	}
-	active, problem := store.BeginRuntimeUpdate(parityRental, launch.BootID, selection)
-	fatal(t, problem)
-	h.mu.Lock()
-	h.rentals[parityRental]["state"] = "released"
-	h.mu.Unlock()
-	if code, out := runCozy(t, root, "rental", "show", parityRental, "--json"); code != 0 || !strings.Contains(out, "released") {
-		t.Fatalf("off state was hidden: %d %s", code, out)
-	}
-	settled, problem := store.RuntimeUpdate(parityRental)
-	fatal(t, problem)
-	if settled.ID != active.ID || settled.Active() {
-		t.Fatalf("stopped rental update stayed active: %+v", settled)
-	}
-}
-
 // Ordinary CLI -> actual calcifer/records -> the rental's machine over cozy.machine.v1. Only an
 // explicit keepalive moves the machine's deadline: listing and a Calcifer restart never do, and
 // an ending rental is not kept alive.

@@ -185,7 +185,7 @@ func handleRent(ctx *Context) *exit.Error {
 	ready := attachable
 	notes := []string{"billing continues until `cozy rental end " + ready.ID + "` confirms release",
 		idleReleaseNote()}
-	software, kept := bootSoftware(ctx, ready.ID, row.DisplayName())
+	software, kept := bootSoftware(ctx, ready.ID)
 	if kept != "" {
 		notes = append(notes, kept)
 	}
@@ -1469,7 +1469,7 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 	} else {
 		list.Aggregates = append(list.Aggregates, output.Field{K: "live", V: jsonFact{true}})
 	}
-	haveFailure, haveHubUnknown, haveUpdate := false, false, false
+	haveFailure, haveHubUnknown := false, false
 	now := time.Now()
 	for _, r := range rows {
 		activity := api.RentalActivity{}
@@ -1477,9 +1477,6 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 			activity = *r.Activity
 		}
 		state := rentalStateCell(r.State, r.Boot, now)
-		if r.RuntimeUpdate != "" {
-			state, haveUpdate = state+" (updating its software)", true
-		}
 		if r.HubUnknown {
 			state += " (unknown to Hub)"
 		}
@@ -1532,7 +1529,7 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 			[3]string{"provider state", "provider_state", r.Failure.ProviderState},
 			[3]string{"provider refusal", "provider_refusal", r.ProviderRefusal})
 		for key, value := range map[string]string{"sku": r.SKU, "accelerator": r.AcceleratorModel,
-			"address": r.Address, "media_address": r.MediaAddress, "hub": r.Hub, "runtime_update": r.RuntimeUpdate,
+			"address": r.Address, "media_address": r.MediaAddress, "hub": r.Hub,
 			"rented_at": r.RentedAt, "ready_at": r.ReadyAt, "bought_for": r.BoughtFor,
 			"release_due_at":           r.ReleaseDue,
 			"base_worker_image_digest": either(r.BaseWorkerImageDigest, r.Failure.BaseWorkerImageDigest),
@@ -1564,10 +1561,6 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 	if haveHubUnknown {
 		list.TypedFields = append(list.TypedFields, "hub_unknown")
 		list.TypedAllFields = append(list.TypedAllFields, "hub_unknown")
-	}
-	if haveUpdate {
-		list.TypedFields = append(list.TypedFields, "runtime_update")
-		list.TypedAllFields = append(list.TypedAllFields, "runtime_update")
 	}
 	// THE HUB'S HALF (cl-199, on th-199). Everything above is what this host FILED, and
 	// the incident of 2026-09-07 is the gap between that and what the account is

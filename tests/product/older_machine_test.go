@@ -94,7 +94,9 @@ func (m *olderMachine) Run(request *v1.RunRequest, stream grpc.ServerStreamingSe
 		var to map[string]string
 		_ = json.Unmarshal(spec.GetPayload(), &to)
 		from := map[string]string{"runtime": m.runtime, "tensorfs": m.tensorfs}
-		m.runtime, m.tensorfs, m.updates = to["runtime"], to["tensorfs"], m.updates+1
+		if to["runtime"] != m.runtime || to["tensorfs"] != m.tensorfs { // a pair it runs is answered unchanged
+			m.runtime, m.tensorfs, m.updates = to["runtime"], to["tensorfs"], m.updates+1
+		}
 		result, _ = json.Marshal(map[string]any{"from": from, "to": map[string]string{"runtime": m.runtime, "tensorfs": m.tensorfs}})
 	case spec != nil && m.runtime != m.serves:
 		m.refusals++
@@ -223,9 +225,9 @@ func olderMachineHome(t *testing.T, machine *olderMachine) (string, *records.Sto
 	t.Cleanup(store.Close)
 	t.Cleanup(func() {
 		if t.Failed() {
-			update, _ := store.RuntimeUpdate(olderRental)
+			update, _ := store.PendingUpdate(olderRental)
 			log, _ := os.ReadFile(filepath.Join(root, "calcifer.log"))
-			t.Logf("software update: %+v\ncalcifer log:\n%s", update, log)
+			t.Logf("pending software update: %+v\ncalcifer log:\n%s", update, log)
 			for _, id := range []string{"run-accepted-earlier", "run-after-the-target"} {
 				_, show := runCozy(t, root, "run", "show", id, "--json")
 				t.Logf("%s: %s", id, show)
