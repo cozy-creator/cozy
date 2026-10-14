@@ -371,11 +371,10 @@ impl Jobs {
             executor.retain_until_exit(root_allocation);
         }
         executor.retain_until_exit(WakeOnExit(Arc::downgrade(engine)));
-        let facts = ExecutorFacts {
-            pid: executor.birth.pid,
-            runtime_version: executor.hello.runtime_version.clone(),
-            tensorfs_version: executor.hello.tensorfs_version.clone(),
-        };
+        let facts = ExecutorFacts::observed(
+            executor.birth.pid, executor.hello.runtime_version.clone(),
+            executor.hello.tensorfs_version.clone(),
+        );
         if !engine.authorize_managed(id, Some(facts))? {
             engine.finish_stopped(id)?;
             executor.shutdown()?;
@@ -1774,6 +1773,8 @@ fn weights_current(engine: Arc<Engine>, record: &Execution) -> Arc<dyn Fn() -> b
 mod prefetch_tests;
 #[cfg(test)]
 mod progress_tests;
+#[cfg(test)]
+mod software_tests;
 
 #[cfg(test)]
 mod exact_tests {
