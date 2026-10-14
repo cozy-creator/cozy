@@ -213,17 +213,12 @@ impl Writer {
             holds: Mutex::new(Some((begun.writer_hold, begun.source_leases))),
         })
     }
-    fn source_read_into(&self, alias: &str, component: &str, key: &str, role: &str, offset: u64, into: &mut [u8]) -> Result<()> {
-        let holds = self.holds.lock().unwrap();
-        let (_, leases) = holds.as_ref().ok_or_else(released)?;
-        let lease = leases
-            .iter()
-            .find(|(held, _)| held == alias)
-            .map(|(_, lease)| lease)
-            .ok_or_else(|| Refusal {
-                code: Code::ROOT_ABSENT,
-                detail: format!("no source alias {alias:?} on this derived writer"),
-            })?;
+    /// A source part's bytes, under the lease that pins it: the source's own from begin, or for
+    /// a part of a source here in part, one taken when it is first read, after `fetch`.
+    #[allow(clippy::too_many_arguments)]
+    fn source_read_into(&self, alias: &str, component: &str, key: &str, role: &str, offset: u64, into: &mut [u8], fetch: Fetch) -> Result<()> {
+        let mut holds = self.holds.lock().unwrap();
+        let (_, leases) = holds.as_mut().ok_or_else(released)?;
         let view = self.sources.iter().find(|view| view.fact.alias == alias).ok_or_else(|| Refusal {
             code: Code::ROOT_ABSENT,
             detail: format!("no source alias {alias:?} on this derived writer"),
@@ -235,9 +230,23 @@ impl Writer {
             );
         }
         let part = header_part(view, component, key, role)?;
+        let covers = |lease: &ReadLease| part.segments().iter().all(|s| lease.objects().contains(s));
+        let at = match leases.iter().position(|(held, lease)| held == alias && covers(lease)) {
+            Some(at) => at,
+            None => {
+                let absent: Vec<ObjectRef> =
+                    part.segments().iter().filter(|s| !self.store.contains(&s.sha256)).cloned().collect();
+                if !absent.is_empty() {
+                    fetch(&view.fact.manifest, &absent)?;
+                }
+                let lease = read::acquire(&self.store, &self.meta, &view.fact.manifest.sha256, part.segments().to_vec())?.0;
+                leases.push((alias.to_string(), lease));
+                leases.len() - 1
+            }
+        };
         check_writer(&self.meta, &self.transaction, self.session)?;
         let what = format!("{component}/{key}#{role}");
-        read::read_part_into(lease, &what, part, offset, into.len() as u64, into)?;
+        read::read_part_into(&leases[at].1, &what, part, offset, into.len() as u64, into)?;
         check_writer(&self.meta, &self.transaction, self.session)
     }
 
@@ -276,12 +285,18 @@ fn header_part<'v>(view: &'v SourceView, component: &str, key: &str, role: &str)
         })
 }
 
-/// What the owner keeps of a writer's progress: each checkpoint as it lands and the receipt.
+/// Makes absent objects of a source checkpoint (`manifest`) here in part resident: the owner's
+/// verified pull from its origin ([`crate::origin`]).
+pub type Fetch<'a> = &'a (dyn Fn(&ObjectRef, &[ObjectRef]) -> Result<()> + Sync);
+
+/// What the owner keeps of a writer's progress (each checkpoint as it lands and the receipt),
+/// and how it fetches what a source here in part lacks.
 pub struct Hooks<'a> {
     /// Refuses once the execution that owns the writer is no longer current.
     pub check_current: &'a (dyn Fn() -> Result<()> + Sync),
     pub record_checkpoint: &'a (dyn Fn(&Json) + Sync),
     pub record_receipt: &'a (dyn Fn(&ReceiptFacts) + Sync),
+    pub fetch: Fetch<'a>,
 }
 
 /// Serve one prebound writer until its commit, fence or peer loss, then fence what is live.
@@ -452,7 +467,7 @@ pub fn serve_source(
     source: &ObjectRef,
     stream: UnixStream,
     check_current: &(dyn Fn() -> Result<()> + Sync),
-    fetch: &(dyn Fn(&[ObjectRef]) -> Result<()> + Sync),
+    fetch: Fetch,
 ) -> Result<()> {
     let mut channel = Channel(stream);
     let mut leases: Vec<ReadLease> = vec![];
@@ -549,7 +564,7 @@ pub fn serve_source(
                             let absent: Vec<ObjectRef> =
                                 part.segments().iter().filter(|s| !store.contains(&s.sha256)).cloned().collect();
                             if !absent.is_empty() {
-                                fetch(&absent)?;
+                                fetch(source, &absent)?;
                             }
                             leases.push(read::acquire(store, meta, &source.sha256, part.segments().to_vec())?.0);
                             leases.len() - 1
@@ -644,6 +659,7 @@ fn read_source(writer: &Writer, channel: &mut Channel, request: &Json, hooks: &H
         &fields.text("role")?,
         fields.uint("offset")?,
         &mut target,
+        hooks.fetch,
     )?;
     (hooks.check_current)()?;
     channel.send(&obj(vec![("length", num(length))])?)?;
@@ -911,7 +927,7 @@ mod source_channel_tests {
         let (client, server) = UnixStream::pair().unwrap();
         std::thread::scope(|scope| {
             let held =
-                scope.spawn(|| serve_source(&store, &meta, &receipt.manifest, server, &|| Ok(()), &|_| unreachable!()));
+                scope.spawn(|| serve_source(&store, &meta, &receipt.manifest, server, &|| Ok(()), &|_, _| unreachable!()));
             let mut client = Channel(client);
             client
                 .send(
@@ -1001,7 +1017,7 @@ mod source_channel_tests {
             order: vec![("model".into(), "other".into()), ("model".into(), "weight".into())],
             max_new_bytes: 0,
         };
-        let writer = begin(&store, &meta, &output_id, 1, inherit, None).unwrap();
+        let writer = begin(&store, &meta, &output_id, 1, inherit.clone(), None).unwrap();
         let output = commit(&store, &meta, &output_id, 1).unwrap().manifest;
         release_guards(&meta, Some(writer.writer_hold), writer.source_leases);
         assert_eq!(crate::origin::evidence(&root, &output).unwrap().as_deref(), Some("hub.test/org/source"));
@@ -1011,12 +1027,23 @@ mod source_channel_tests {
         crate::gc::collect(&root, false).unwrap();
         assert!(!store.contains(&absent.sha256));
 
-        // Reads fetch only what is absent, once.
+        // Reads fetch only what is absent, once: a writer's source reads, then a source channel's.
         let fetched = Mutex::new(vec![]);
-        let fetch = |objects: &[ObjectRef]| -> Result<()> {
+        let fetch = |manifest: &ObjectRef, objects: &[ObjectRef]| -> Result<()> {
+            assert!(*manifest == output || *manifest == source);
             fetched.lock().unwrap().extend(objects.iter().cloned());
             store.put_stream(&mut held_back.as_slice(), Some(&absent), &crate::store::Fault::default()).map(drop)
         };
+        let reread = Declaration { work_fingerprint: Some(format!("sha256:{}", "45".repeat(32))), ..inherit.clone() };
+        let writer = Writer::begin(&store, std::sync::Arc::new(Meta::open(&store).unwrap()), &format!("sha256:{}", "95".repeat(32)), 1, reread, None).unwrap();
+        let mut copied = vec![0u8; 2048];
+        writer.source_read_into("source", "model", "other", "value", 0, &mut copied, &fetch).unwrap();
+        assert_eq!(copied, held_back);
+        writer.source_read_into("source", "model", "other", "value", 0, &mut copied, &fetch).unwrap();
+        assert_eq!(*fetched.lock().unwrap(), vec![absent.clone()]);
+        drop(writer);
+        fetched.lock().unwrap().clear();
+        std::fs::remove_file(store.object_path(&absent.sha256)).unwrap();
         let (client, server) = UnixStream::pair().unwrap();
         std::thread::scope(|scope| {
             let served = scope.spawn(|| serve_source(&store, &meta, &output, server, &|| Ok(()), &fetch));
