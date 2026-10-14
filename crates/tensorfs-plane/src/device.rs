@@ -501,6 +501,7 @@ struct Bounce {
 
 /// One copy stream and the thread that feeds it, in submission order.
 pub struct Mover {
+    name: String,
     tx: Mutex<Option<Sender<CopyJob>>>,
     thread: Mutex<Option<JoinHandle<()>>>,
 }
@@ -519,13 +520,14 @@ impl Mover {
         let (tx, rx) = channel::<CopyJob>();
         let (ok_tx, ok_rx) = channel::<Result<()>>();
         let thread = std::thread::Builder::new()
-            .name(name)
+            .name(name.clone())
             .spawn(move || mover_main(m, rx, ok_tx))
             .map_err(|e| Error::Io(format!("spawn mover: {e}")))?;
         ok_rx
             .recv()
             .map_err(|_| Error::Io("mover died at start".into()))??;
         Ok(Mover {
+            name,
             tx: Mutex::new(Some(tx)),
             thread: Mutex::new(Some(thread)),
         })
@@ -533,10 +535,10 @@ impl Mover {
 
     /// Queue a copy. On `Err` the job was dropped without calling `done`.
     pub fn submit(&self, job: CopyJob) -> Result<()> {
-        match self.tx.lock().unwrap().as_ref() {
-            Some(tx) => tx.send(job).map_err(|_| Error::Closed),
-            None => Err(Error::Closed),
+        if self.tx.lock().unwrap().as_ref().is_some_and(|tx| tx.send(job).is_ok()) {
+            return Ok(());
         }
+        Err(Error::Closed(format!("copy stream {} has stopped", self.name)))
     }
 
     /// Close the queue: the thread drains its stream, frees its buffers and exits by itself.

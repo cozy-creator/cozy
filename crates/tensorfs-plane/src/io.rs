@@ -209,7 +209,7 @@ impl Source {
         self.fds.lock().unwrap().clear();
         #[cfg(feature = "store")]
         if let Some(l) = self.lease.write().unwrap().take() {
-            l.release(self.meta.as_ref().ok_or(Error::Closed)?)?;
+            l.release(self.meta.as_ref().ok_or_else(|| Error::Closed("a store lease without its store".into()))?)?;
         }
         Ok(())
     }
@@ -267,7 +267,7 @@ impl Source {
         if let Some(lease) = guard.as_ref() {
             lease.covers(o)?;
         } else if self.handed.is_none() {
-            return Err(Error::Closed);
+            return Err(Error::Closed("the source's store lease has ended".into()));
         }
         let fds = self.fds(&o.obj, tally)?;
         let a = PART_ALIGN;

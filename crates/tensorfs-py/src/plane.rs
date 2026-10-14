@@ -52,7 +52,7 @@ fn err(py: Python<'_>, e: Error) -> PyErr {
         Error::CudaUnavailable(_) => CudaUnavailable::new_err(msg),
         Error::Invalid(_) => Invalid::new_err(msg),
         Error::Io(_) => IoError::new_err(msg),
-        Error::Closed => Closed::new_err(msg),
+        Error::Closed(_) => Closed::new_err(msg),
     };
     let v = x.value(py);
     let _ = v.setattr("code", e.code());

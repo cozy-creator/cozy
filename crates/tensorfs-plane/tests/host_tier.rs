@@ -357,7 +357,8 @@ fn close_refuses_twice_and_releases_the_lease() {
     let before = fx.holds();
     plane.close_ws(ws).unwrap();
     assert_eq!(fx.holds(), before - 1, "the last weight set on a source ends its lease");
-    assert!(matches!(plane.close_ws(ws), Err(Error::Closed)));
+    // A late caller is told which weight set closed, not a bare "closed" (run 5894).
+    assert!(matches!(plane.close_ws(ws), Err(Error::Closed(why)) if why.contains("\"unet\"")));
     assert_eq!(plane.stats().host.used, 0);
     // The store's hold is gone: a fresh lease and GC-free close work.
     let (lease, _) = read::acquire(&fx.store, &fx.meta, "after", fx.objects.clone()).unwrap();

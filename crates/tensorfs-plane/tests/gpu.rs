@@ -1095,3 +1095,62 @@ fn holes_reach_the_device_from_the_object_files_and_staged_regions_from_the_layo
     p.close().unwrap();
     drop(fill);
 }
+
+/// Run 5894's shape, a managed executor's sealed layout whose holes read the object files it
+/// was handed: a stage's region is unmapped mid-stage (out-of-memory recovery), and its next
+/// demand fill fails. That acquire reports the fill's own cause, and a later acquire fills the
+/// region again: one failed fill never fails every acquire for the rest of the process.
+#[test]
+#[ignore = "GPU"]
+fn a_failed_demand_fill_reports_its_cause_and_the_next_acquire_fills_again() {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::FileExt;
+    use tensorfs_plane::layout::{ItemSource, Layout};
+    let fx = Fixture::new("gpu-refill");
+    let layout = Layout::build(&fx.plan(), &regions()).unwrap();
+    let (fd, fill) = tensorfs_plane::host::open_sealed("unet", &layout, None, Some(&[1])).unwrap();
+    let (lease, _) = tensorfs_core::read::acquire(&fx.store, &fx.meta, "test", fx.objects.clone()).unwrap();
+    let source = tensorfs_plane::io::Source::new(fx.store.clone(), fx.meta.clone(), lease, true, 0);
+    fill.fill(&layout, &source, 3, &tensorfs_plane::io::IoTally::default()).unwrap();
+    // The handed files are copies, so the hole region 2 reads can be made to fail and recover.
+    let dir = fx.root.join("handed");
+    std::fs::create_dir_all(&dir).unwrap();
+    let copy = |o: &tensorfs_core::ids::ObjectRef| {
+        let path = dir.join(&o.sha256);
+        std::fs::copy(fx.store.blob_path(&o.sha256), &path).unwrap();
+        (o.clone(), std::fs::OpenOptions::new().read(true).write(true).open(path).unwrap())
+    };
+    let files: Vec<_> = fx.objects.iter().map(copy).collect();
+    let hole = layout.regions[2]
+        .items
+        .iter()
+        .find_map(|it| match &it.source {
+            ItemSource::Object(o) => Some(o.obj.sha256.clone()),
+            ItemSource::Inline(_) => None,
+        })
+        .unwrap();
+    let file = files.iter().find(|(o, _)| o.sha256 == hole).unwrap().1.try_clone().unwrap();
+    let whole = std::fs::read(fx.store.blob_path(&hole)).unwrap();
+    let p = plane();
+    let ws = p.register_staged("unet", &fx.plan(), &regions(), fd.as_raw_fd(), files).unwrap();
+    let s = Stream::new();
+    p.set_vram_budget(DEV, 512 << 20).unwrap();
+    p.want(ws, Tier::Device(DEV), None, 0, false).unwrap().wait().unwrap();
+    for r in 0..3 {
+        resident(&p, ws, &s, r).release(s.raw()).unwrap();
+    }
+    s.sync();
+    // Mid-stage, room is made: region 2 leaves the device. Its object then reads short.
+    assert!(p.drop_regions(ws, Tier::Device(DEV), Some(&[2])).unwrap() > 0);
+    file.set_len(whole.len() as u64 / 2).unwrap();
+    let failed = p.acquire(ws, DEV, 2, s.raw(), None).err();
+    assert!(matches!(failed, Some(Error::Io(_))), "the fill's own cause: {failed:?}");
+    assert!(p.events().iter().any(|e| e.kind == "fill_failed" && e.region == Some(2)));
+    // The object reads whole again: the next acquire fills the region, exact.
+    file.write_all_at(&whole[whole.len() / 2..], whole.len() as u64 / 2).unwrap();
+    resident(&p, ws, &s, 2).release(s.raw()).unwrap();
+    s.sync();
+    assert!(p.stats().poisoned.is_none());
+    p.close().unwrap();
+    drop(fill);
+}

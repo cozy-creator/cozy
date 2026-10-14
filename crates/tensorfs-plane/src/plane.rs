@@ -243,6 +243,8 @@ pub(crate) struct Core {
     /// and its supervisor (TensorD in Cozy) replaces the executor after Runtime reports it.
     pub poisoned: Option<String>,
     pub sets: Vec<Option<Ws>>,
+    /// Every weight set's name by id, closed ones included: what a late caller is told.
+    pub names: Vec<String>,
     pub arenas: Vec<Arena>,
     pub host_budget: u64,
     pub host_used: u64,
@@ -307,10 +309,17 @@ impl Core {
         }
     }
     pub fn ws(&self, id: WsId) -> Result<&Ws> {
-        self.sets.get(id.0 as usize).and_then(Option::as_ref).ok_or(Error::Closed)
+        self.sets.get(id.0 as usize).and_then(Option::as_ref).ok_or_else(|| self.closed(id))
     }
     pub fn ws_mut(&mut self, id: WsId) -> Result<&mut Ws> {
-        self.sets.get_mut(id.0 as usize).and_then(Option::as_mut).ok_or(Error::Closed)
+        if !self.sets.get(id.0 as usize).is_some_and(Option::is_some) {
+            return Err(self.closed(id));
+        }
+        Ok(self.sets[id.0 as usize].as_mut().unwrap())
+    }
+    fn closed(&self, id: WsId) -> Error {
+        let name = self.names.get(id.0 as usize).map_or("?", String::as_str);
+        Error::Closed(format!("weight set {name:?} (#{}) was closed", id.0))
     }
     pub fn event(&mut self, e: Event) {
         if self.events.len() == EVENT_RING {
@@ -889,8 +898,10 @@ impl Inner {
         Ok(())
     }
 
-    /// A stream-scoped lease on a resident region. A region not resident is filled on demand
-    /// (a miss) at its last wanted priority. No host block unless the fill is not yet queued.
+    /// A stream-scoped lease on a resident region. A region not resident, or whose last fill
+    /// failed, is filled on demand (a miss) at its last wanted priority: a failure is the cause
+    /// the acquire that waited on it reports, never the region's state for the rest of the
+    /// process. No host block unless the fill is not yet queued.
     pub(crate) fn acquire_home(self: &Arc<Self>, ws: WsId, d: usize, r: u32, stream: u64, tag: &str, prio: Option<i64>) -> Result<Lease> {
         let dev = &self.devices[d];
         let _g = dev.bind()?;
@@ -903,7 +914,7 @@ impl Inner {
                 reg.prio = p;
             }
             commit(reg)?;
-            if matches!(reg.state, DState::Absent) {
+            if matches!(reg.state, DState::Absent | DState::Invalid(_)) {
                 let prio = reg.prio;
                 let pin = reg.pin;
                 c.dstats[d].misses += 1;
@@ -1084,6 +1095,7 @@ impl Plane {
                 core: Mutex::new(Core {
                     poisoned: None,
                     sets: Vec::new(),
+                    names: Vec::new(),
                     arenas,
                     host_budget: 0,
                     host_used: 0,
@@ -1217,6 +1229,7 @@ impl Plane {
         };
         let mut c = self.lock();
         c.sets.push(Some(ws));
+        c.names.push(name.to_string());
         WsId(c.sets.len() as u32 - 1)
     }
 
@@ -1513,10 +1526,10 @@ impl Plane {
 
     // ------------------------------------------------------------ resident access
 
-    /// A stream-scoped lease on a resident region. A region not resident is filled on demand
-    /// (a miss) at its last wanted priority. No host block unless the fill is not yet queued.
-    /// `prio`, when given, becomes the region's priority first (the demand fill evicts only
-    /// below it).
+    /// A stream-scoped lease on a resident region. A region not resident, or whose last fill
+    /// failed, is filled on demand (a miss) at its last wanted priority. No host block unless
+    /// the fill is not yet queued. `prio`, when given, becomes the region's priority first
+    /// (the demand fill evicts only below it).
     pub fn acquire(&self, ws: WsId, ordinal: i32, r: u32, stream: u64, prio: Option<i64>) -> Result<Lease> {
         let d = self.dev(ordinal)?;
         self.inner.acquire_home(ws, d, r, stream, "", prio)
@@ -1999,7 +2012,9 @@ impl Ticket {
                     },
                     Tier::Device(o) => {
                         let d = self.inner.devices.iter().position(|x| x.ordinal == o).unwrap();
-                        let Some(dw) = w.devs[d].as_mut() else { return Err(Error::Closed) };
+                        let Some(dw) = w.devs[d].as_mut() else {
+                            return Err(Error::Closed(format!("weight set {:?} left device {o}", w.name)));
+                        };
                         let reg = &mut dw.regs[r as usize];
                         commit(reg)?;
                         match &reg.state {
@@ -2082,7 +2097,9 @@ impl Lease {
         }
         match self.kind {
             LeaseKind::Home => {
-                let reg = &mut c.ws_mut(self.ws)?.devs[self.dev].as_mut().ok_or(Error::Closed)?.regs[self.region as usize];
+                let w = c.ws_mut(self.ws)?;
+                let gone = || Error::Closed(format!("weight set {:?} left device slot {}", w.name, self.dev));
+                let reg = &mut w.devs[self.dev].as_mut().ok_or_else(gone)?.regs[self.region as usize];
                 reg.live -= 1;
                 prune(&mut reg.pending);
                 reg.pending.push(ev);

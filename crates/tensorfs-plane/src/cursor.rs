@@ -95,13 +95,17 @@ impl Cur {
     }
 }
 
+fn closed(id: u64) -> Error {
+    Error::Closed(format!("cursor {id} was closed"))
+}
+
 /// Queue copies for streamed positions, in order, while the window and the ring allow.
 fn pump(inner: &Arc<Inner>, c: &mut Core, id: u64) -> Result<()> {
     loop {
         if c.poisoned.is_some() {
             return Ok(()); // nothing new goes to a device whose state is ambiguous
         }
-        let cur = c.cursors.get_mut(&id).ok_or(Error::Closed)?;
+        let cur = c.cursors.get_mut(&id).ok_or_else(|| closed(id))?;
         let k = cur.next_submit;
         if cur.orphaned || k >= cur.streamed_total() || k - cur.done >= cur.window {
             return Ok(());
@@ -122,7 +126,7 @@ fn pump(inner: &Arc<Inner>, c: &mut Core, id: u64) -> Result<()> {
 
 /// Queue the copy for streamed position `k` into the ring at `off`, after `waits`.
 fn submit(inner: &Arc<Inner>, c: &mut Core, id: u64, k: u64, off: u64, waits: Vec<EvRef>) -> Result<()> {
-    let cur = c.cursors.get_mut(&id).ok_or(Error::Closed)?;
+    let cur = c.cursors.get_mut(&id).ok_or_else(|| closed(id))?;
     let (ws, d, mover) = (cur.ws, cur.dev, cur.mover);
     let r = cur.streamed[(k % cur.streamed.len() as u64) as usize];
     let dst = cur.ring_base + off;
@@ -206,7 +210,7 @@ fn submit(inner: &Arc<Inner>, c: &mut Core, id: u64, k: u64, off: u64, waits: Ve
 
 /// Mark position `k`'s ring bytes free after `freed`, count it done, and queue what fits.
 fn hand_on(inner: &Arc<Inner>, c: &mut Core, id: u64, k: u64, freed: Option<EvRef>) -> Result<()> {
-    let cur = c.cursors.get_mut(&id).ok_or(Error::Closed)?;
+    let cur = c.cursors.get_mut(&id).ok_or_else(|| closed(id))?;
     if let Some(p) = cur.placed.iter_mut().find(|p| p.k == k) {
         p.freed = Some(freed);
     }
@@ -216,7 +220,7 @@ fn hand_on(inner: &Arc<Inner>, c: &mut Core, id: u64, k: u64, freed: Option<EvRe
 
 /// A streamed lease ended: its bytes are reusable after `ev`.
 pub(crate) fn release_ring(inner: &Arc<Inner>, c: &mut Core, id: u64, k: u64, ev: EvRef) -> Result<()> {
-    c.cursors.get_mut(&id).ok_or(Error::Closed)?.live -= 1;
+    c.cursors.get_mut(&id).ok_or_else(|| closed(id))?.live -= 1;
     hand_on(inner, c, id, k, Some(ev))?;
     reap(inner, c, id);
     Ok(())
@@ -236,7 +240,7 @@ fn reap(inner: &Arc<Inner>, c: &mut Core, id: u64) {
 /// failed copy is drained before it is reported). A poisoned plane keeps the ring mapped.
 fn finish(inner: &Arc<Inner>, c: &mut Core, id: u64) -> Result<()> {
     c.check()?;
-    let cur = c.cursors.remove(&id).ok_or(Error::Closed)?;
+    let cur = c.cursors.remove(&id).ok_or_else(|| closed(id))?;
     let d = cur.dev;
     let _g = inner.devices[d].bind()?;
     let freed = cur.placed.iter().filter_map(|p| p.freed.as_ref().and_then(Option::as_ref));
@@ -266,7 +270,7 @@ fn finish(inner: &Arc<Inner>, c: &mut Core, id: u64) -> Result<()> {
 
 /// Hand position `k` on unread: if queued, its bytes are free once its copy lands.
 fn skip<'a>(inner: &'a Arc<Inner>, mut c: MutexGuard<'a, Core>, id: u64, k: u64) -> Result<MutexGuard<'a, Core>> {
-    let cur = c.cursors.get_mut(&id).ok_or(Error::Closed)?;
+    let cur = c.cursors.get_mut(&id).ok_or_else(|| closed(id))?;
     if k >= cur.next_submit {
         // Never queued: it takes no ring bytes.
         cur.next_submit = k + 1;
@@ -274,7 +278,7 @@ fn skip<'a>(inner: &'a Arc<Inner>, mut c: MutexGuard<'a, Core>, id: u64, k: u64)
         pump(inner, &mut c, id)?;
         return Ok(c);
     }
-    while !c.cursors.get(&id).ok_or(Error::Closed)?.ready.contains_key(&k) {
+    while !c.cursors.get(&id).ok_or_else(|| closed(id))?.ready.contains_key(&k) {
         c = inner.cv.wait(c).unwrap();
     }
     let ev = c.cursors.get_mut(&id).unwrap().ready.remove(&k).unwrap().ok();
@@ -452,11 +456,11 @@ impl Cursor {
     /// described in the module doc.
     pub fn acquire(&self, r: u32, stream: u64) -> Result<Lease> {
         let inner = &self.inner;
-        let d = inner.core.lock().unwrap().cursors.get(&self.id).ok_or(Error::Closed)?.dev;
+        let d = inner.core.lock().unwrap().cursors.get(&self.id).ok_or_else(|| closed(self.id))?.dev;
         let _g = inner.devices[d].bind()?;
         let mut c = inner.core.lock().unwrap();
         c.check()?;
-        let cur = c.cursors.get(&self.id).ok_or(Error::Closed)?;
+        let cur = c.cursors.get(&self.id).ok_or_else(|| closed(self.id))?;
         let (ws, tag) = (cur.ws, cur.tag.clone());
         let from = cur.pos;
         let Some(p) = cur.ahead(r) else {
@@ -484,7 +488,7 @@ impl Cursor {
         }
         let t0 = std::time::Instant::now();
         let ev = loop {
-            let cur = c.cursors.get(&self.id).ok_or(Error::Closed)?;
+            let cur = c.cursors.get(&self.id).ok_or_else(|| closed(self.id))?;
             match cur.ready.get(&k) {
                 Some(Ok(e)) => break e.clone(),
                 Some(Err(e)) => return Err(e.clone()),
@@ -575,7 +579,7 @@ impl Drop for RingView {
 
 pub(crate) fn ring_view(inner: &Arc<Inner>, id: u64) -> Result<RingView> {
     let mut c = inner.core.lock().unwrap();
-    let k = c.cursors.get_mut(&id).ok_or(Error::Closed)?;
+    let k = c.cursors.get_mut(&id).ok_or_else(|| closed(id))?;
     k.views += 1;
     let d = k.dev;
     Ok(RingView {

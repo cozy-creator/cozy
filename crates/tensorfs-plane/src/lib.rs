@@ -67,8 +67,9 @@ pub enum Error {
     Io(String),
     #[error("source: {0}")]
     Source(#[from] tensorfs_core::err::Refusal),
-    #[error("closed")]
-    Closed,
+    /// What closed: a weight set, a cursor, a copy stream.
+    #[error("closed: {0}")]
+    Closed(String),
 }
 
 impl Error {
@@ -85,7 +86,7 @@ impl Error {
             Error::Invalid(_) => "INVALID",
             Error::Io(_) => "IO",
             Error::Source(_) => "SOURCE",
-            Error::Closed => "CLOSED",
+            Error::Closed(_) => "CLOSED",
         }
     }
 }
