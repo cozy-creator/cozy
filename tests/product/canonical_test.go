@@ -188,22 +188,22 @@ func TestPackageInterface(t *testing.T) {
 	}
 
 	// Model inputs and dependencies are not hardware facts: a job runs where its declared
-	// accelerator says, and an undeclared one refuses before any machine is chosen.
+	// accelerator says, and an undeclared one wants a GPU.
 	gpuRaw := []byte(`{"application":"h3:tools","entrypoints":[],"format":"cozy.package.interface/1","jobs":[{"accelerator":true,"models":[{"class":"H3Dits","component_use":{},"path":"four_lane.models.dits"}],"name":"four_lane","publishes":false,"request":{"fields":[]},"result":{"fields":[]}}]}`)
 	gpuDescriptor, problem := launch.DecodePackageInterface(gpuRaw)
 	fatal(t, problem)
 	gpuJob, problem := gpuDescriptor.Function("four_lane")
 	fatal(t, problem)
-	if gpu, problem := gpuJob.NeedsAccelerator("h3/tools"); problem != nil || !gpu {
-		t.Fatalf("a job declaring accelerator=True runs on a GPU, got %v %v", gpu, problem)
+	if !gpuJob.NeedsAccelerator() {
+		t.Fatal("a job declaring accelerator=True runs on a GPU")
 	}
 	cpuRaw := []byte(`{"application":"probe:app","entrypoints":[],"format":"cozy.package.interface/1","jobs":[{"name":"scan","publishes":false,"request":{"fields":[]},"result":{"fields":[]}}]}`)
 	cpuDescriptor, problem := launch.DecodePackageInterface(cpuRaw)
 	fatal(t, problem)
 	undeclared, problem := cpuDescriptor.Function("scan")
 	fatal(t, problem)
-	if _, problem := undeclared.NeedsAccelerator("probe/probe"); problem == nil || problem.Name != "package.job_accelerator_undeclared" {
-		t.Fatalf("an undeclared job was given a machine class: %v", problem)
+	if !undeclared.NeedsAccelerator() {
+		t.Fatal("an undeclared job wants a GPU")
 	}
 	// Author-supplied resources are not a fact this host reads: machine class comes from
 	// the release dependency set, so the member is ignored rather than honoured or refused.

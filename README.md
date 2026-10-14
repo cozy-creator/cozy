@@ -441,9 +441,9 @@ async def main(ctx, *, model: RestorationModel) -> int:
 entrypoint: Runtime constructs them through the weight plane and memory manager, and the run
 holds its GPU while its children run beside it. One that writes weights outputs, uses job
 services or reads a bare `Model` source runs as a job, as does one without Model slots. A job
-declares where its body computes, `accelerator = true` (GPU) or `false` (CPU) under `[tool.cozy]`,
-as a package job declares `app.job(accelerator=...)`; nothing infers it, and an undeclared job is
-refused before any machine is rented.
+may declare where its body computes, `accelerator = true` (GPU) or `false` (CPU) under
+`[tool.cozy]`, as a package job declares `app.job(accelerator=...)`; nothing infers it, and an
+undeclared job takes the machine's GPU (CPU on a machine without one).
 `[tool.cozy.models]` entries are the slot's default ladder, exactly as `defaults=` declares
 it; `model.<slot>=org/model@release/lane` overrides it per run. The optional context supplies
 cancellation, logs, progress and metrics. Discovery checks the script's syntax without
