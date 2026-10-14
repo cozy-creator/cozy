@@ -51,10 +51,12 @@ type endpointUpdatePeer struct {
 	accepted   chan struct{}
 	finish     chan struct{}
 	finishOnce sync.Once
+	acceptOnce sync.Once
 	current    string
 	controls   atomic.Int32
 	writes     atomic.Int32
 	reconnects atomic.Int32
+	result     []byte
 }
 
 func (p *endpointUpdatePeer) authorize(ctx context.Context) error {
@@ -148,7 +150,7 @@ func (p *endpointUpdatePeer) Run(request *v1.RunRequest, stream grpc.ServerStrea
 		}
 	}
 	if first {
-		close(p.accepted)
+		p.acceptOnce.Do(func() { close(p.accepted) })
 		return status.Error(codes.Unavailable, "service restart")
 	}
 	if request.Spec == nil && request.After == 1 {
@@ -162,7 +164,7 @@ func (p *endpointUpdatePeer) Run(request *v1.RunRequest, stream grpc.ServerStrea
 	p.mu.Lock()
 	p.current = "0.20.0"
 	p.mu.Unlock()
-	return stream.Send(&v1.RunEvent{Sequence: 2, Event: &v1.RunEvent_Outcome{Outcome: &v1.Outcome{Status: "succeeded", Result: []byte(`{"from":{"runtime":"0.19.0","tensorfs":"0.4.0"},"to":{"runtime":"0.20.0","tensorfs":"0.4.0"}}`)}}})
+	return stream.Send(&v1.RunEvent{Sequence: 2, Event: &v1.RunEvent_Outcome{Outcome: &v1.Outcome{Status: "succeeded", Result: p.result}}})
 }
 
 func endpointUpdateFixture(t *testing.T) (string, string, *endpointUpdatePeer, *atomic.Int32) {
@@ -187,7 +189,8 @@ func endpointUpdateFixture(t *testing.T) (string, string, *endpointUpdatePeer, *
 	certSource.Close()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	must(t, err)
-	peer := &endpointUpdatePeer{public: public, objects: map[string][]byte{}, specs: map[string]*v1.RunSpec{}, accepted: make(chan struct{}), finish: make(chan struct{}), current: "0.19.0"}
+	peer := &endpointUpdatePeer{public: public, objects: map[string][]byte{}, specs: map[string]*v1.RunSpec{}, accepted: make(chan struct{}), finish: make(chan struct{}), current: "0.19.0",
+		result: []byte(`{"from":{"runtime":"0.19.0","tensorfs":"0.4.0"},"to":{"runtime":"0.20.0","tensorfs":"0.4.0"}}`)}
 	server := grpc.NewServer(grpc.Creds(credentials.NewTLS(&tls.Config{MinVersion: tls.VersionTLS12, Certificates: []tls.Certificate{cert}})))
 	v1.RegisterMachineServer(server, peer)
 	go server.Serve(listener)
@@ -239,6 +242,25 @@ func TestEndpointSoftwareUpdateUsesOwnerPreservesTensorFSAndReattaches(t *testin
 	fatal(t, problem)
 	if !bytes.Equal(before, after) || len(rentals) != 0 || hubCalls.Load() != 0 || calcifer.Probe(config.Config{Home: root}).Up || peer.controls.Load() != 0 {
 		t.Fatal("endpoint maintenance changed config, enrolled a rental, asked a Hub, started Calcifer, or sent Control")
+	}
+}
+
+// A wheel rebuilt at the running version is other software: the machine reports each wheel's
+// bytes, and the update is unchanged only when those match too.
+func TestEndpointUpdateOfARebuiltWheelAtTheRunningVersionIsAChange(t *testing.T) {
+	root, endpoint, peer, _ := endpointUpdateFixture(t)
+	wheel := filepath.Join(root, "cozy_runtime-0.19.0-py3-none-any.whl")
+	must(t, os.WriteFile(wheel, bytes.Repeat([]byte("rebuilt-wheel"), 100), 0600))
+	peer.finishOnce.Do(func() { close(peer.finish) })
+	for i, change := range []struct {
+		to        string
+		unchanged bool
+	}{{"bbbb", false}, {"aaaa", true}} {
+		peer.result = []byte(`{"from":{"runtime":"0.19.0","tensorfs":"0.4.0","runtime_sha256":"aaaa"},"to":{"runtime":"0.19.0","tensorfs":"0.4.0","runtime_sha256":"` + change.to + `"}}`)
+		code, out := runCozy(t, root, "machine", "update", "--machine-endpoint-file", endpoint, "--idempotency-key", "rebuilt-"+strconv.Itoa(i), "--runtime-wheel", wheel, "--keep-agent", "--json")
+		if code != 0 || !strings.Contains(out, `"unchanged":`+strconv.FormatBool(change.unchanged)) {
+			t.Fatalf("a %s wheel at the running version: %d %s", change.to, code, out)
+		}
 	}
 }
 

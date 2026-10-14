@@ -147,6 +147,6 @@ func handleEndpointUpdate(ctx *Context) *exit.Error {
 	return emit(ctx, output.Record{Fields: []output.Field{
 		{K: "machine", V: machine.Name}, {K: "update_id", V: id}, {K: "status", V: "ready"},
 		{K: "runtime", V: result.To.Runtime}, {K: "tensorfs", V: result.To.TensorFS},
-		{K: "previous_runtime", V: result.From.Runtime},
+		{K: "previous_runtime", V: result.From.Runtime}, {K: "unchanged", V: result.From == result.To},
 	}})
 }
