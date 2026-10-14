@@ -54,7 +54,7 @@ func manualRentalWorkload(ctx *Context, existing *records.RentalOperation) (hub.
 		if parsed.Kind != modelsource.HuggingFace && parsed.Kind != modelsource.Civitai {
 			return workload, exit.Usagef("--model %q is not a Hugging Face or Civitai source", spec)
 		}
-		plan, problem := planNativeIngest(ctx, cwd, parsed, ctx.Inv.Values["--source-profile"])
+		plan, problem := planNativeIngest(ctx, parsed, ctx.Inv.Values["--source-profile"])
 		if problem != nil {
 			return workload, problem
 		}

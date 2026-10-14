@@ -29,16 +29,16 @@ func TestSlowRuntimeMetadataIsAnswered(t *testing.T) {
 	root := t.TempDir()
 	slowRuntime := filepath.Join(root, "cozy-runtime") //cozy:allow a stand-in runtime, not this host's
 	must(t, os.WriteFile(slowRuntime, []byte("#!/bin/sh\n/bin/sleep 6\n"+
-		`printf '{"recipe":{"name":"slow"}}\n'`+"\n"), 0o700))
+		`printf '{"status":"slow"}\n'`+"\n"), 0o700))
 	tool := launch.RuntimeCLI{Bin: slowRuntime, Dir: root, Home: root} //cozy:allow drives the metadata verb directly
 
 	started := time.Now()
-	recipe, e := tool.ModelIngestionPlan(context.Background(), "acme/slow", "main")
+	prepared, e := tool.PrepareImage(context.Background(), filepath.Join(root, "slow.png"), launch.AssetsKind{})
 	if e != nil {
 		t.Fatalf("a runtime answering in %s was refused: %s", time.Since(started), briefly(e))
 	}
-	if recipe == nil || recipe.Name != "slow" {
-		t.Fatalf("the runtime's own answer was not read: %+v", recipe)
+	if prepared.Status != "slow" {
+		t.Fatalf("the runtime's own answer was not read: %+v", prepared)
 	}
 	if elapsed := time.Since(started); elapsed < 5*time.Second {
 		t.Fatalf("the stand-in runtime answered in %s; this arm only means something "+
