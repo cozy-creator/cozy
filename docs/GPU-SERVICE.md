@@ -47,7 +47,8 @@ Acceptance, journal, progress and output custody stay in `Engine`; scheduling st
   own place. A root that released or yielded comes back at its place among the waiting roots
   and never displaces a holder: holders keep their lanes between their steps. A waiting step
   keeps free GPUs from younger requests. Each `grant`/`wait`/`release` is a `gpu` entry in the
-  root's log (`RunEvent.gpu`); a wait is logged again whenever its blocker changes.
+  root's log (`RunEvent.gpu`); a wait is logged again only when its blocker (the oldest other
+  request claiming, holding or calling on its lane) changes.
 - An accelerator job keeps one GPU of its root's lane for its life; only its family calls there.
 - The `GpuPlan` id hashes {actor, generation, entrypoint, slots, degree}. It is journaled as a
   `Preparation`, and `submit` records `preparation_id`.

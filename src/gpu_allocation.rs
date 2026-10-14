@@ -78,10 +78,11 @@ impl Table {
         self.gpus[device].root.is_none_or(|holder| first && holder > root)
             && claims.get(device).copied().flatten().is_none_or(|claimer| claimer == root)
     }
-    /// The oldest request besides `root` that holds, needs or still calls on a GPU of `lane`.
+    /// The oldest request besides `root` that claims, holds or still calls on a GPU of `lane`;
+    /// `root`'s own claim from an earlier step this pass hides none of them.
     fn other(&self, lane: Range<usize>, root: u64, claims: &Claims) -> Option<u64> {
-        lane.filter_map(|d| claims.get(d).copied().flatten().or(self.gpus[d].root).or(self.gpus[d].running))
-            .filter(|other| *other != root).min()
+        lane.flat_map(|d| [claims.get(d).copied().flatten(), self.gpus[d].root, self.gpus[d].running])
+            .flatten().filter(|other| *other != root).min()
     }
     /// No call runs and no accelerator job stays on `root`'s lane.
     fn between_steps(&self, root: u64) -> bool {
@@ -372,6 +373,7 @@ mod tests {
         let mut claims = [None; 2];
         let (lane, yielded) = gpus.lane(2, &mut claims);
         assert!(matches!(lane, Lane::Waiting { behind: Some(1), new: true }) && yielded.is_empty());
+        assert!(matches!(gpus.lane(2, &mut claims).0, Lane::Waiting { behind: Some(1), new: false }), "its next step this pass");
         assert!(gpus.call(Some(3), None, 1..2, &claims).is_some());
         // Nor does A after its release.
         gpus.release(1);
