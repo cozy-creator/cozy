@@ -212,6 +212,12 @@ tfs get <root> sha256:<blob> --range 0:1048576 --out -   # bytes to stdout, unde
   `ensure::relieve` runs the same policy whenever no more than the reserve is free.
 - **The Hub CA** (`--ca-file`, `ca_file=`) is added to process trust; an untrusted hub is
   `TLS_UNTRUSTED`, never retried.
+- **Part of a checkpoint** (`ensure_part`, `tfs ensure --component`): its manifest, header
+  and assets with the named components and objects; none named, its structure alone. Nothing
+  records a part. The hub is attested as the origin of the rest (`origins/<manifest>`): GC,
+  storage and repositories accept an absent object its origin holds, a derivation over it
+  carries the absent objects by reference (and attests its output to the same origin), and a
+  reader fetches what it reads first. A TensorD job reads its Hub model inputs this way.
 
 ## Durability
 
