@@ -1,7 +1,6 @@
 package producttest
 
 import (
-	"database/sql"
 	"encoding/json"
 	"os"
 	"os/exec"
@@ -42,12 +41,7 @@ func TestRentalNewWaitsOutARecordsWriter(t *testing.T) {
 	stand.rent = refusedAnswer("pr-busywriterproof0001", "pending_acquisition", &asks)
 	startCalciferProcess(t, root)
 
-	writer, err := sql.Open("sqlite", filepath.Join(root, "creator.sqlite")+"?_txlock=immediate")
-	must(t, err)
-	defer writer.Close()
-	tx, err := writer.Begin()
-	must(t, err)
-	defer tx.Rollback()
+	release := holdRecords(t, root)
 	cmd := exec.Command("/usr/bin/nice", "-n", "19", cozyBin, "rental", "new", "cpu", "--json")
 	cmd.Env = childEnv(t, root)
 	var out strings.Builder
@@ -65,11 +59,11 @@ func TestRentalNewWaitsOutARecordsWriter(t *testing.T) {
 	if asks.Load() != 0 {
 		t.Fatalf("rental new asked for a pod before it could record the ask:\n%s", out.String())
 	}
-	must(t, tx.Commit())
+	release()
 	select {
 	case <-done:
 	case <-time.After(60 * time.Second):
-		t.Fatal("rental new did not continue after the writer committed")
+		t.Fatal("rental new did not continue after the writer let go")
 	}
 	if strings.Contains(out.String(), "database is locked") || asks.Load() != 1 {
 		t.Fatalf("the ask did not reach the hub once after the writer let go (%d asks):\n%s", asks.Load(), out.String())
