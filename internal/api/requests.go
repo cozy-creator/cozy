@@ -1329,7 +1329,8 @@ func (s *Server) fillWait(life *Lifecycle) {
 }
 
 // fillGPUWait says an active Runtime execution waits for GPUs, how many, and the first
-// other run of this host holding them; when only this run's own calls hold them, how many.
+// other run of this host holding them, in its machine's acceptance order (a run accepted
+// later is only borrowing them); when only this run's own calls hold them, how many.
 func (s *Server) fillGPUWait(life *Lifecycle, row records.Request) {
 	if life.Status != "queued" && life.Status != "in_progress" {
 		return
@@ -1350,7 +1351,10 @@ func (s *Server) fillGPUWait(life *Lifecycle, row records.Request) {
 		if problem == nil && blocker != nil && blocker.ParentRequestID == row.ID {
 			own++
 		} else if problem == nil && blocker != nil {
-			life.WaitingFor = &orchestrator.WaitingRun{Number: blocker.Number, RequestID: blocker.ID}
+			mine, accepted := s.store.MachineRunNumber(row.ID)
+			theirs, known := s.store.MachineRunNumber(blocker.ID)
+			life.WaitingFor = &orchestrator.WaitingRun{Number: blocker.Number, RequestID: blocker.ID,
+				Borrowing: accepted && known && theirs > mine}
 			return
 		}
 	}
