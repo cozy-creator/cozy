@@ -47,7 +47,7 @@ func TestTypedTreeAssetArgumentsRejectAmbiguousFields(t *testing.T) {
 	} {
 		payload, files, _, problem := launch.ParseTreeAssets(entry, []byte(`{}`), specs)
 		if problem == nil {
-			_, _, problem = launch.ParseAssets(entry, payload, files, nil, nil)
+			_, _, problem = launch.ParseAssets(entry, payload, files, nil, nil, nil)
 		}
 		if problem == nil {
 			t.Fatalf("invalid Tree inputs accepted: %v", specs)

@@ -408,6 +408,9 @@ models and output have separate sections. A call missing required arguments
 prints their names and the argument list before resolving or downloading a model.
 Functions whose arguments all have defaults may be invoked without values.
 Payload arguments and flags may be interleaved, including repeated `--asset` flags.
+A positional local file fills the one input that declares its media kind
+(`cozy run org/seedvr2/upscale clip.mp4` binds `video`); a file two inputs accept, or none,
+is refused with those inputs named. One positional text value fills the first non-media field.
 
 For local execution, a matching GPU ladder rung selects the preferred lane. If
 the local GPU is not listed, Cozy uses the first declared lane instead. The ladder

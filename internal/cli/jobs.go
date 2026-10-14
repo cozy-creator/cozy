@@ -60,7 +60,7 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 	// THE PAYLOAD IS TYPED AGAINST THE RECORDED SCHEMA before a job exists — the same
 	// client-side check `cozy run` makes, over the job's own declared request struct.
 	input, overrides, e := launch.ParsePayload(&launch.Entrypoint{
-		Name: job.Name, Request: job.Request, Result: job.Result, Models: job.Models,
+		Name: job.Name, Request: job.Request, Result: job.Result, Models: job.Models, Assets: job.Assets,
 	}, terms, ctx.Inv.Value("--in"))
 	if e != nil {
 		return e
@@ -74,7 +74,7 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 	if e != nil {
 		return e
 	}
-	input, assets, e := launch.ParseAssets(job, input, assetFiles, ctx.Inv.Values["--asset-fidelity"], prepareImage)
+	input, assets, e := launch.ParseAssets(job, input, assetFiles, overrides.Files, ctx.Inv.Values["--asset-fidelity"], prepareImage)
 	if e != nil {
 		return e
 	}

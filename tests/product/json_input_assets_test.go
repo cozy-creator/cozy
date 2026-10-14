@@ -41,7 +41,7 @@ func TestJSONAssetFilesUseOrdinaryBindings(t *testing.T) {
 	if !strings.Contains(string(payload), imagePath) || !strings.Contains(string(payload), "./not-a-file.png") {
 		t.Fatalf("JSON-relative asset resolution changed ordinary text: %s", payload)
 	}
-	resolved, assets, problem := launch.ParseAssets(ep, payload, nil, nil, nil)
+	resolved, assets, problem := launch.ParseAssets(ep, payload, nil, nil, nil, nil)
 	if problem != nil {
 		t.Fatal(problem)
 	}
@@ -54,11 +54,11 @@ func TestJSONAssetFilesUseOrdinaryBindings(t *testing.T) {
 	if strings.Contains(string(resolved), imagePath) || !strings.Contains(string(resolved), assets[0].Digest) {
 		t.Fatalf("worker payload leaked filename or omitted asset identity: %s", resolved)
 	}
-	_, explicit, problem := launch.ParseAssets(ep, []byte(`{"overall":"x","references":[{"name":"hero","description":"A person"}]}`), []string{"references.0.image=" + imagePath}, nil, nil)
+	_, explicit, problem := launch.ParseAssets(ep, []byte(`{"overall":"x","references":[{"name":"hero","description":"A person"}]}`), []string{"references.0.image=" + imagePath}, nil, nil, nil)
 	if problem != nil || len(explicit) != 1 || explicit[0].Digest != assets[0].Digest {
 		t.Fatalf("--asset differs: %+v %v", explicit, problem)
 	}
-	_, _, problem = launch.ParseAssets(ep, payload, []string{"references.0.image=" + imagePath}, nil, nil)
+	_, _, problem = launch.ParseAssets(ep, payload, []string{"references.0.image=" + imagePath}, nil, nil, nil)
 	if problem == nil || !strings.Contains(problem.Message, "more than once") {
 		t.Fatalf("duplicate input silently accepted: %v", problem)
 	}
@@ -75,7 +75,7 @@ func TestJSONAssetFilesUseOrdinaryBindings(t *testing.T) {
 			}
 			p, _, problem := launch.ParsePayload(ep, nil, requestPath)
 			if problem == nil {
-				_, _, problem = launch.ParseAssets(ep, p, nil, nil, nil)
+				_, _, problem = launch.ParseAssets(ep, p, nil, nil, nil, nil)
 			}
 			if problem == nil {
 				t.Fatal("invalid media accepted")
@@ -92,7 +92,7 @@ func TestJSONAssetWalkRespectsUnionTagsAndReferences(t *testing.T) {
 		{Name: "choice", Type: json.RawMessage(`{"union":[{"asset":"image"},{"literal":["automatic"]}]}`)},
 	}}}
 	payload := []byte(`{"item":{"kind":"text","value":"/not/a/file"},"ambiguous":"/also/not/a/file","known":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","choice":"automatic"}`)
-	_, assets, problem := launch.ParseAssets(ep, payload, nil, nil, nil)
+	_, assets, problem := launch.ParseAssets(ep, payload, nil, nil, nil, nil)
 	if problem != nil || len(assets) != 0 {
 		t.Fatalf("text/reference was interpreted as a filename: %v %+v", problem, assets)
 	}
