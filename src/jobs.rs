@@ -1773,6 +1773,8 @@ fn weights_current(engine: Arc<Engine>, record: &Execution) -> Arc<dyn Fn() -> b
 mod prefetch_tests;
 #[cfg(test)]
 mod progress_tests;
+#[cfg(test)]
+mod software_tests;
 
 #[cfg(test)]
 mod exact_tests {
