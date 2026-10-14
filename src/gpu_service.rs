@@ -4598,11 +4598,12 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// A root job accepted as request `key`.
     fn root_job(engine: &Engine, key: &str, gpus: u32, accelerator: bool) -> Execution {
-        engine.submit(key, crate::journal::Invocation {
+        engine.accept_run("actor", key, key, crate::journal::Invocation {
             package: "p".into(), generation: "0".repeat(32), module: "p:app".into(),
             entrypoint: "run".into(), job: true, gpus, accelerator, ..Default::default()
-        }).unwrap()
+        }).unwrap().0
     }
     /// The root's `gpu` log entries: (state, gpus, behind).
     fn allocation_log(engine: &Engine, id: &str) -> Vec<(String, Vec<u64>, String)> {

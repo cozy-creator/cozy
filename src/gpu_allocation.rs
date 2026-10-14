@@ -36,8 +36,9 @@ struct Gpu {
     keeps: usize,
     /// Calls running there, all of one family.
     calling: usize,
-    /// The family of the calls running there, if any.
+    /// The family of the calls running there, if any, and their root.
     caller: Option<String>,
+    running: Option<u64>,
 }
 struct Root {
     width: usize,
@@ -77,9 +78,10 @@ impl Table {
         self.gpus[device].root.is_none_or(|holder| first && holder > root)
             && claims.get(device).copied().flatten().is_none_or(|claimer| claimer == root)
     }
-    /// The oldest request besides `root` that holds or needs a GPU of `lane`.
+    /// The oldest request besides `root` that holds, needs or still calls on a GPU of `lane`.
     fn other(&self, lane: Range<usize>, root: u64, claims: &Claims) -> Option<u64> {
-        lane.filter_map(|device| claims.get(device).copied().flatten().or(self.gpus[device].root)).filter(|other| *other != root).min()
+        lane.filter_map(|d| claims.get(d).copied().flatten().or(self.gpus[d].root).or(self.gpus[d].running))
+            .filter(|other| *other != root).min()
     }
     /// No call runs and no accelerator job stays on `root`'s lane.
     fn between_steps(&self, root: u64) -> bool {
@@ -245,8 +247,8 @@ impl Allocations {
             return None;
         }
         for d in devices.clone() {
-            table.gpus[d].calling += 1;
-            table.gpus[d].caller = family.map(String::from);
+            let gpu = &mut table.gpus[d];
+            (gpu.calling, gpu.caller, gpu.running) = (gpu.calling + 1, family.map(String::from), root);
         }
         Some(Permit { table: self.clone(), devices, keep: false })
     }
@@ -258,7 +260,8 @@ impl Allocations {
         let gpu = table.gpus.get_mut(device)?;
         let ours = gpu.family.as_deref() == Some(family);
         let calls_here = gpu.calling > 0 && gpu.caller.as_deref() != Some(family);
-        if gpu.root != Some(root) || !(ours || gpu.family.is_none() && !calls_here && !yielding) {
+        let taken = gpu.family.is_some() || calls_here || yielding;
+        if gpu.root != Some(root) || (taken && !ours) {
             return None;
         }
         gpu.family = Some(family.into());
@@ -296,7 +299,7 @@ impl Drop for Permit {
                 false => {
                     gpu.calling -= 1;
                     if gpu.calling == 0 {
-                        gpu.caller = None;
+                        (gpu.caller, gpu.running) = (None, None);
                     }
                 }
             }
