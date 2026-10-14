@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"context"
 	"fmt"
 	"os"
 	"slices"
@@ -10,7 +9,6 @@ import (
 	localapi "github.com/cozy-creator/cozy/internal/client"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
-	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/machines"
 	"github.com/cozy-creator/cozy/internal/modelsource"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -100,37 +98,22 @@ func uploadOperation(ctx *Context, parsed modelsource.Source, destination string
 	return records.Operation{Models: []records.ModelRef{model}, Destination: destination}, nil
 }
 
-// nativeIngestPlan is one provider source as a rented ingest converts it: pinned, narrowed
-// to its reviewed profiles, with the Runtime recipe that owns its metadata when one exists.
-// Upload runs it; `cozy rental new --model` sizes the pod's disk from its bytes.
+// nativeIngestPlan is one provider source as a rented ingest converts it: pinned and narrowed
+// to its reviewed profiles. Upload runs it; `cozy rental new --model` sizes the pod's disk
+// from its bytes.
 type nativeIngestPlan struct {
 	source   publishSource
 	profiles []string
-	recipe   *launch.ModelIngestionRecipe
 }
 
-func planNativeIngest(ctx *Context, cwd string, parsed modelsource.Source, profiles []string) (nativeIngestPlan, *exit.Error) {
+func planNativeIngest(ctx *Context, parsed modelsource.Source, profiles []string) (nativeIngestPlan, *exit.Error) {
 	// The provider resolves moving URL spellings to an immutable identity first. No
 	// weights are downloaded by this inventory.
 	source, problem := resolvePublishSource(ctx, parsed.Canonical)
 	if problem != nil {
 		return nativeIngestPlan{}, problem
 	}
-	pinned := source.Resolution.Source
-	var recipe *launch.ModelIngestionRecipe
-	if parsed.Kind == modelsource.HuggingFace && parsed.Member == "" && len(profiles) == 0 {
-		tool, problem := launch.BuiltinOperationsTool(cwd, ctx.Cfg.Home, ctx.Cfg.Tool())
-		if problem != nil {
-			return nativeIngestPlan{}, problem
-		}
-		if recipe, problem = tool.ModelIngestionPlan(context.Background(), pinned.Org+"/"+pinned.Repo, pinned.Revision); problem != nil {
-			return nativeIngestPlan{}, problem
-		}
-	}
-	if recipe != nil {
-		profiles = []string{recipe.Profile}
-	}
-	named := nativeIngestPlan{source: source, profiles: profiles, recipe: recipe}
+	named := nativeIngestPlan{source: source, profiles: profiles}
 	asIs := slices.Contains(profiles, tfs.AsIsProfile)
 	if len(profiles) > 0 && !asIs {
 		narrowed, problem := narrowSourceToProfiles(ctx, source, profiles)
@@ -163,7 +146,7 @@ func planNativeIngest(ctx *Context, cwd string, parsed modelsource.Source, profi
 	if source, problem = selectPublishMembers(source, conversion.Members); problem != nil {
 		return nativeIngestPlan{}, problem
 	}
-	return nativeIngestPlan{source: source, profiles: profiles, recipe: recipe}, nil
+	return nativeIngestPlan{source: source, profiles: profiles}, nil
 }
 
 // hostUnaware is this host's TensorFS not recognizing a profile or fingerprint. The host

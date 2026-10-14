@@ -122,7 +122,7 @@ func sourceRentalBytes(ctx *Context, models []orchestrator.ModelRef) (int64, *ex
 		profiles = append(profiles, model.Profiles...)
 	}
 	slices.Sort(profiles)
-	plan, problem := planNativeIngest(ctx, cwd, parsed, slices.Compact(profiles))
+	plan, problem := planNativeIngest(ctx, parsed, slices.Compact(profiles))
 	return plan.source.Bytes, problem
 }
 
