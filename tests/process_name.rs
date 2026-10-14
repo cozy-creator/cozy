@@ -1,0 +1,58 @@
+//! The actual CPU service keeps its name when launched through update/proc executable aliases.
+use std::{
+    fs,
+    io::{BufRead, BufReader},
+    path::{Path, PathBuf},
+    process::{Child, Command, Stdio},
+};
+
+struct OwnedService {
+    child: Child,
+    root: PathBuf,
+}
+
+impl OwnedService {
+    fn start(executable: &Path, root: PathBuf) -> Self {
+        fs::create_dir_all(&root).unwrap();
+        let mut child = Command::new(executable)
+            .arg("serve").arg("--state").arg(root.join("state"))
+            .arg("--host-bytes").arg("0")
+            .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut ready = String::new();
+        stdout.read_line(&mut ready).unwrap();
+        assert!(ready.starts_with("READY "), "service did not start: {ready}");
+        let service = Self { child, root };
+        let process = PathBuf::from(format!("/proc/{}", service.child.id()));
+        assert_eq!(fs::read_to_string(process.join("comm")).unwrap().trim(), "tensord");
+        let maps = fs::read_to_string(process.join("maps")).unwrap();
+        assert!(!maps.contains("libcuda") && !maps.contains("libnvidia-ml"));
+        service
+    }
+}
+
+impl Drop for OwnedService {
+    fn drop(&mut self) {
+        // Explicit teardown of these test-owned services, never a product timeout or sweep.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+#[test]
+fn cpu_service_name_survives_current_and_proc_executable_aliases() {
+    let directory = std::env::temp_dir().join(format!("tensord-name-{}", std::process::id()));
+    fs::create_dir_all(&directory).unwrap();
+    let current = directory.join("current");
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_tensord"), &current).unwrap();
+    let first = OwnedService::start(&current, directory.join("current-state"));
+    // /proc/self/exe from inside TensorD has this same executable alias. From this test,
+    // `self` would be the test binary, so use the live service's exact PID instead.
+    let executable = PathBuf::from(format!("/proc/{}/exe", first.child.id()));
+    let second = OwnedService::start(&executable, directory.join("proc-state"));
+    drop(second);
+    drop(first);
+    fs::remove_file(current).unwrap();
+    fs::remove_dir(directory).unwrap();
+}
