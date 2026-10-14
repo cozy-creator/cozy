@@ -106,7 +106,7 @@ impl Server {
         let paths =
             tensord::machine::update::Paths::new(&root.join("state"), &root.join("image"));
         identity.updates = Some(
-            tensord::machine::update::Updates::open(paths, Box::new(|| true), None).unwrap(),
+            tensord::machine::update::Updates::open(paths, Box::new(|| true), None, None).unwrap(),
         );
         let pem = identity.cert_pem.clone();
         let mut backend = NativeBackend::new(service.clone(), identity.authority.clone(), store);
@@ -245,6 +245,7 @@ async fn canceled_ids_refuse_updates_and_another_actors_update_never_shadows_the
         error.metadata().get("cozy-error-code").unwrap(),
         "update_control_unsupported"
     );
+    // Over Run's API a cancel reaches the update itself; this reserved one never started.
     let error = server
         .client
         .control(request(
@@ -257,11 +258,7 @@ async fn canceled_ids_refuse_updates_and_another_actors_update_never_shadows_the
         ))
         .await
         .unwrap_err();
-    assert_eq!(error.code(), Code::FailedPrecondition);
-    assert_eq!(
-        error.metadata().get("cozy-error-code").unwrap(),
-        "update_control_unsupported"
-    );
+    assert_eq!(error.code(), Code::NotFound);
     assert_eq!(server.cancel("shared", ALICE).await, canceled);
     server.canceled("shared", None).await;
     server.stop().await;
@@ -282,7 +279,8 @@ async fn canceled_ids_refuse_updates_and_another_actors_update_never_shadows_the
     )
     .unwrap();
     let mut restarted = Server::open(&root.0).await;
-    let error = restarted
+    // A cancel of a finished update answers its end.
+    let ended = restarted
         .client
         .control(request(
             v1::ControlRequest {
@@ -293,12 +291,9 @@ async fn canceled_ids_refuse_updates_and_another_actors_update_never_shadows_the
             None,
         ))
         .await
-        .unwrap_err();
-    assert_eq!(error.code(), Code::FailedPrecondition);
-    assert_eq!(
-        error.metadata().get("cozy-error-code").unwrap(),
-        "update_control_unsupported"
-    );
+        .unwrap()
+        .into_inner();
+    assert_eq!(ended.state, "succeeded");
     assert_eq!(
         restarted.cancel("shared", ALICE).await.number,
         canceled.number

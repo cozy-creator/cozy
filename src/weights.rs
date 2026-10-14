@@ -471,6 +471,8 @@ impl Weights {
             policy: publishing.policy(),
             progress: &|_, _| (),
             streams: 8,
+            stop: None,
+            commit: &|| true,
         })
         .map(drop)
         .map_err(|e| {

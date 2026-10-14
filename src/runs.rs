@@ -531,10 +531,7 @@ impl Runs {
                     &tensorfs_core::sha256::hex_digest(format!("{actor}\0{id}").as_bytes())[..40]
                 );
                 let stage = format!("uploading to {destination}");
-                // Pushed objects cannot be taken back: from here the upload ends on its own.
-                if !stoppable.commit() {
-                    return Err(refused(crate::published::CANCELED, "the run was canceled before its upload began"));
-                }
+                // A cancel stops the push; only finalizing, which publishes, cannot be taken back.
                 let published = tensorfs_core::transport::publish(&tensorfs_core::transport::Publication {
                     store: publisher.store(),
                     hub: publishing.origin(),
@@ -545,10 +542,16 @@ impl Runs {
                     policy: publishing.policy(),
                     progress: &|done, total| observe(&stage, done, total),
                     streams: 8,
+                    stop,
+                    commit: &|| stoppable.commit(),
                 })
-                .map_err(|e| {
-                    let (code, message) = publishing.reason("weights_publication_failed", e);
-                    refused(code, message)
+                .map_err(|e| match stoppable.stop.is_cancelled() {
+                    true => refused(crate::published::CANCELED,
+                        "the run was canceled while it uploaded: nothing was published, and the Hub keeps what landed for an upload asked again"),
+                    false => {
+                        let (code, message) = publishing.reason("weights_publication_failed", e);
+                        refused(code, message)
+                    }
                 })?;
                 row["published"] = json!({"destination": destination,
                     "checkpoint": published.checkpoint, "converged": published.converged});

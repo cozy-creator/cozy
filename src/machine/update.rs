@@ -3,7 +3,8 @@
 //! pair, wait for measured idleness, then restart the service on it in place. Executors' package environments take the new pair; a candidate Runtime wheel that
 //! bundles TensorD also replaces the service binary (the stable parent runs it). The
 //! previous pair and binary stay installed; a candidate that never proves readiness is rolled
-//! back by the parent. Boot id, leaf, journal and outputs are kept.
+//! back by the parent. Boot id, leaf, journal and outputs are kept. A cancel ends an update
+//! that has not begun activating (`canceled`); a pair the machine already runs is unchanged.
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -13,6 +14,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
+use tensorfs_core::{store::Store, transport::PullCancellation};
 
 /// The service's exit status asking its parent to exec the selected application.
 pub const REPLACE_EXIT: i32 = 75;
@@ -27,7 +29,7 @@ pub struct Pair {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Status {
     pub operation: String,
-    /// waiting | preparing | waiting_activation | installing | starting | succeeded | rolled_back | failed
+    /// waiting | preparing | waiting_activation | installing | starting | succeeded | rolled_back | failed | canceled
     pub state: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub error: String,
@@ -46,7 +48,7 @@ pub struct Step {
 }
 impl Status {
     pub fn terminal(&self) -> bool {
-        matches!(self.state.as_str(), "succeeded" | "rolled_back" | "failed")
+        matches!(self.state.as_str(), "succeeded" | "rolled_back" | "failed" | "canceled")
     }
     fn enter(&mut self, state: &str) {
         if self.state != state || self.history.is_empty() {
@@ -180,7 +182,7 @@ pub fn recover_activation(paths: &Paths) -> io::Result<bool> {
             Ok(false)
         }
         "rolled_back" => rollback_pending(paths, &status.error),
-        "waiting" | "preparing" | "waiting_activation" | "installing" | "failed" => {
+        "waiting" | "preparing" | "waiting_activation" | "installing" | "failed" | "canceled" => {
             rollback_pending(paths, "machine_restarted: software publication did not finish")
         }
         state => Err(invalid(&format!("cannot recover update state {state}"))),
@@ -218,6 +220,10 @@ pub struct Updates {
     status: Mutex<Option<Status>>,
     idle: Box<dyn Fn() -> bool + Send + Sync>,
     lifecycle: Option<Arc<super::lifecycle::Lifecycle>>,
+    /// Where published wheels land (`pypi::wheel`).
+    store: Option<Arc<Store>>,
+    /// The running update's stop: its cancel ends the download in flight.
+    stop: Mutex<PullCancellation>,
 }
 
 impl Updates {
@@ -225,6 +231,7 @@ impl Updates {
         paths: Paths,
         idle: Box<dyn Fn() -> bool + Send + Sync>,
         lifecycle: Option<Arc<super::lifecycle::Lifecycle>>,
+        store: Option<Arc<Store>>,
     ) -> io::Result<Arc<Self>> {
         fs::create_dir_all(paths.update("staged"))?;
         fs::File::open(&paths.engine)?.sync_all()?;
@@ -243,6 +250,8 @@ impl Updates {
             status: Mutex::new(status),
             idle,
             lifecycle,
+            store,
+            stop: Mutex::default(),
         }))
     }
 
@@ -291,6 +300,32 @@ impl Updates {
             .unwrap()
             .clone()
             .filter(|s| s.operation == operation)
+    }
+
+    /// Cancels update `operation` before it activates: it ends `canceled`, its candidate is
+    /// removed and admission reopens. Once activating it ends on its own (ResourceBusy).
+    pub fn cancel(&self, operation: &str) -> io::Result<Status> {
+        let mut current = self.status.lock().unwrap();
+        let status = current
+            .as_mut()
+            .filter(|s| s.operation == operation)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "this machine has no such update"))?;
+        if status.terminal() {
+            return Ok(status.clone());
+        }
+        if !matches!(status.state.as_str(), "waiting" | "preparing" | "waiting_activation") {
+            return Err(io::Error::new(
+                io::ErrorKind::ResourceBusy,
+                "this update is activating and ends on its own",
+            ));
+        }
+        let mut canceled = status.clone();
+        canceled.error = "canceled by its owner".into();
+        canceled.enter("canceled");
+        write_json(&self.paths.update("status.json"), &canceled)?;
+        *status = canceled.clone();
+        self.stop.lock().unwrap().cancel();
+        Ok(canceled)
     }
 
     /// The executors' Runtime/TensorFS pair.
@@ -399,19 +434,25 @@ impl Updates {
         status.enter("waiting");
         write_json(&self.paths.update("status.json"), &status).map_err(server)?;
         *current = Some(status.clone());
+        *self.stop.lock().unwrap() = PullCancellation::default();
         drop(current);
         let updates = self.clone();
         std::thread::Builder::new()
             .name("runtime-update".into())
             .spawn(move || {
                 if let Err(error) = updates.run(&request, exit) {
-                    if let Err(persist) = updates.set(|s| {
+                    let failed = updates.set(|s| {
                         if !s.terminal() {
                             s.error = error.to_string();
                             s.enter("failed");
                         }
-                    }) {
-                        eprintln!("tensord: Runtime update failed: {error}; status: {persist}");
+                    });
+                    // A canceled update's status already says so.
+                    match failed {
+                        Err(persist) if persist.kind() != io::ErrorKind::Interrupted => {
+                            eprintln!("tensord: Runtime update failed: {error}; status: {persist}")
+                        }
+                        _ => {}
                     }
                 }
             })
@@ -419,9 +460,13 @@ impl Updates {
         Ok(status)
     }
 
+    /// Changes the running update's status; one a cancel ended stays ended (Interrupted).
     fn set(&self, change: impl FnOnce(&mut Status)) -> io::Result<()> {
         let mut current = self.status.lock().unwrap();
         if let Some(mut status) = current.clone() {
+            if status.state == "canceled" {
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "the update was canceled"));
+            }
             change(&mut status);
             write_json(&self.paths.update("status.json"), &status)?;
             *current = Some(status);
@@ -430,6 +475,17 @@ impl Updates {
     }
 
     fn run(&self, request: &Request, exit: fn(i32)) -> io::Result<()> {
+        let from = pair_in(&self.paths.sdk());
+        let running = |choice: &Option<Choice>, version: &str| {
+            choice.as_ref().is_none_or(|c| c.file.is_empty() && c.version == version)
+        };
+        if running(&request.runtime, &from.runtime) && running(&request.tensorfs, &from.tensorfs) {
+            // Nothing to install: the machine already runs this pair.
+            return self.set(|s| {
+                s.to = from.clone();
+                s.enter("succeeded");
+            });
+        }
         self.set(|s| s.enter("preparing"))?;
         let sdk = self.paths.engine.join("sdk");
         fs::create_dir_all(&sdk)?;
@@ -439,41 +495,14 @@ impl Updates {
         // prepares a fresh immutable generation, including a historical operation's retry.
         let candidate = sdk.join(format!("candidate-{}", hex(&super::identity::random::<16>()?)));
         fs::create_dir(&candidate)?;
-        let mut agent = None;
-        for (distribution, choice) in [
-            ("cozy_runtime", &request.runtime),
-            ("tensorfs", &request.tensorfs),
-        ] {
-            let wheel = match choice {
-                Some(choice) => self.resolve(distribution, choice)?,
-                None => existing_wheel(&self.paths.sdk(), distribution)?,
-            };
-            let name = wheel
-                .file_name()
-                .and_then(|n| n.to_str())
-                .ok_or_else(|| invalid("wheel name"))?
-                .to_owned();
-            let bundled = verify_wheel(&wheel, distribution)?;
-            let prepared = candidate.join(&name);
-            fs::copy(&wheel, &prepared)?;
-            fs::File::open(prepared)?.sync_all()?;
-            if let Some(binary) = bundled.filter(|_| request.agent != "explicit") {
-                agent = bundled_tensord(&binary, &candidate)?;
-            }
+        let prepared = self
+            .prepare(request, &candidate)
+            .and_then(|prepared| self.set(|s| s.enter("installing")).map(|_| prepared));
+        if prepared.is_err() {
+            // Never selected: nothing refers to it.
+            let _ = fs::remove_dir_all(&candidate);
         }
-        fs::File::open(&candidate)?.sync_all()?;
-        let to = pair_in(&candidate);
-        self.set(|s| s.to = to.clone())?;
-        // No new work is admitted from here; work admitted before drains first.
-        let _activation = self.lifecycle.as_ref().map(|l| l.activate()).transpose()
-            .map_err(|refused| io::Error::other(refused.message().to_string()))?;
-        if !(self.idle)() {
-            self.set(|s| s.enter("waiting_activation"))?;
-            while !(self.idle)() {
-                std::thread::sleep(std::time::Duration::from_secs(1));
-            }
-        }
-        self.set(|s| s.enter("installing"))?;
+        let (agent, to, _activation) = prepared?;
         let pending = Pending {
             status: self.status.lock().unwrap().clone().unwrap_or_default(),
             sdk_before: previous_link(&self.paths.current_sdk_link())?,
@@ -512,6 +541,54 @@ impl Updates {
         Ok(())
     }
 
+    /// Stages and verifies the pair in `candidate`, then closes admission and waits for the
+    /// work admitted before to drain. A cancel ends it at any step (Interrupted).
+    fn prepare(
+        &self,
+        request: &Request,
+        candidate: &Path,
+    ) -> io::Result<(Option<PathBuf>, Pair, Option<super::lifecycle::Activation>)> {
+        let mut agent = None;
+        for (distribution, choice) in [
+            ("cozy_runtime", &request.runtime),
+            ("tensorfs", &request.tensorfs),
+        ] {
+            let wheel = match choice {
+                Some(choice) => self.resolve(distribution, choice)?,
+                None => existing_wheel(&self.paths.sdk(), distribution)?,
+            };
+            let name = wheel
+                .file_name()
+                .and_then(|n| n.to_str())
+                .ok_or_else(|| invalid("wheel name"))?
+                .to_owned();
+            let bundled = verify_wheel(&wheel, distribution)?;
+            let prepared = candidate.join(&name);
+            fs::copy(&wheel, &prepared)?;
+            fs::File::open(prepared)?.sync_all()?;
+            if let Some(binary) = bundled.filter(|_| request.agent != "explicit") {
+                agent = bundled_tensord(&binary, candidate)?;
+            }
+        }
+        fs::File::open(candidate)?.sync_all()?;
+        let to = pair_in(candidate);
+        self.set(|s| s.to = to.clone())?;
+        // No new work is admitted from here; work admitted before drains first.
+        let activation = self.lifecycle.as_ref().map(|l| l.activate()).transpose()
+            .map_err(|refused| io::Error::other(refused.message().to_string()))?;
+        if !(self.idle)() {
+            self.set(|s| s.enter("waiting_activation"))?;
+            while !(self.idle)() {
+                // Waiting makes no progress of its own: the work it waits on is judged by its own.
+                if self.status.lock().unwrap().as_ref().is_some_and(Status::terminal) {
+                    return Err(io::Error::new(io::ErrorKind::Interrupted, "the update was canceled"));
+                }
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+        }
+        Ok((agent, to, activation))
+    }
+
     /// A staged {file, sha256} or a published {version} fetched from PyPI with its digest checked.
     fn resolve(&self, distribution: &str, choice: &Choice) -> io::Result<PathBuf> {
         if !choice.file.is_empty() {
@@ -532,11 +609,9 @@ impl Updates {
         if choice.version.is_empty() {
             return Err(invalid("a pair member names a staged file or a version"));
         }
-        super::pypi::wheel(
-            distribution,
-            &choice.version,
-            &self.paths.update("downloads"),
-        )
+        let store = self.store.as_ref().ok_or_else(|| invalid("this machine fetches no published wheels"))?;
+        let stop = self.stop.lock().unwrap().clone();
+        super::pypi::wheel(distribution, &choice.version, &self.paths.update("downloads"), store, &stop)
     }
 }
 
@@ -816,7 +891,7 @@ mod tests {
         let earlier = lifecycle.admit().unwrap();
         let drained = lifecycle.clone();
         let idle = Box::new(move || drained.admitted() == 0);
-        let updates = Updates::open(paths.clone(), idle, Some(lifecycle.clone())).unwrap();
+        let updates = Updates::open(paths.clone(), idle, Some(lifecycle.clone()), None).unwrap();
         let candidate = wheel(&root, "cozy_runtime", "0.2.0", None);
         let file = candidate.file_name().unwrap().to_str().unwrap().to_owned();
         let (sha256, _) = updates.stage(&file, &mut fs::File::open(&candidate).unwrap()).unwrap();
@@ -834,6 +909,69 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// A cancel ends an update before it activates: it ends `canceled`, its candidate is
+    /// removed, nothing is selected and admission reopens. Once activating, it is refused.
+    #[test]
+    fn a_canceled_update_ends_before_activation() {
+        let root = std::env::temp_dir().join(format!("cm-canceled-update-{}", uuid::Uuid::new_v4()));
+        let paths = Paths::new(&root.join("engine"), &root);
+        fs::create_dir_all(&paths.image_wheels).unwrap();
+        wheel(&paths.image_wheels, "cozy_runtime", "0.1.0", None);
+        wheel(&paths.image_wheels, "tensorfs", "0.1.0", None);
+        let lifecycle = super::super::lifecycle::Lifecycle::open(root.join("idle.json"), false, true, super::super::lifecycle::IDLE_GRACE_MS).unwrap();
+        let earlier = lifecycle.admit().unwrap();
+        let drained = lifecycle.clone();
+        let updates = Updates::open(paths.clone(), Box::new(move || drained.admitted() == 0), Some(lifecycle.clone()), None).unwrap();
+        let candidate = wheel(&root, "cozy_runtime", "0.2.0", None);
+        let request = update_request(&updates, "u1", &candidate);
+        updates.request(request, |_| panic!("a canceled update activated")).unwrap();
+        state(&updates, "u1", "waiting_activation");
+        assert_eq!(updates.cancel("u1").unwrap().state, "canceled");
+        // Admission reopens and the candidate goes, with the earlier run still admitted.
+        while lifecycle.admit().is_err() || fs::read_dir(root.join("engine/sdk")).unwrap().next().is_some() {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        drop(earlier);
+        let persisted: Status = serde_json::from_slice(&fs::read(paths.update("status.json")).unwrap()).unwrap();
+        assert_eq!(persisted.state, "canceled");
+        assert!(fs::symlink_metadata(paths.current_sdk_link()).is_err(), "a canceled update selected software");
+        assert_eq!(updates.cancel("u1").unwrap().state, "canceled", "a repeated cancel answers its end");
+        assert_eq!(updates.cancel("other").unwrap_err().kind(), io::ErrorKind::NotFound);
+        fs::remove_dir_all(root).unwrap();
+
+        let activating = Activation::prepare();
+        let updates = Updates::open(activating.paths.clone(), Box::new(|| true), None, None).unwrap();
+        assert_eq!(updates.cancel("transaction").unwrap_err().kind(), io::ErrorKind::ResourceBusy);
+        assert_eq!(updates.update("transaction").unwrap().state, "installing");
+    }
+
+    /// A pair the machine already runs installs nothing: the update succeeds unchanged at once.
+    #[test]
+    fn the_running_pair_is_an_unchanged_update() {
+        let root = std::env::temp_dir().join(format!("cm-unchanged-update-{}", uuid::Uuid::new_v4()));
+        let paths = Paths::new(&root.join("engine"), &root);
+        fs::create_dir_all(&paths.image_wheels).unwrap();
+        wheel(&paths.image_wheels, "cozy_runtime", "0.1.0", None);
+        wheel(&paths.image_wheels, "tensorfs", "0.1.0", None);
+        let updates = Updates::open(paths.clone(), Box::new(|| true), None, None).unwrap();
+        let request = Request {
+            operation: "same".into(), agent: "bundled".into(), pin: None,
+            runtime: Some(Choice { version: "0.1.0".into(), ..Default::default() }),
+            tensorfs: Some(Choice { version: "0.1.0".into(), ..Default::default() }),
+        };
+        updates.request(request, |_| panic!("an unchanged update restarted the service")).unwrap();
+        loop {
+            let status = updates.update("same").unwrap();
+            if status.terminal() {
+                assert_eq!((status.state.as_str(), &status.to), ("succeeded", &status.from));
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!root.join("engine/sdk").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
     /// An update the service stopped during before activation is failed, not left running.
     #[test]
     fn an_update_stopped_before_activation_fails() {
@@ -843,7 +981,7 @@ mod tests {
         status.enter("preparing");
         fs::create_dir_all(paths.update("")).unwrap();
         write_json(&paths.update("status.json"), &status).unwrap();
-        let updates = Updates::open(paths, Box::new(|| true), None).unwrap();
+        let updates = Updates::open(paths, Box::new(|| true), None, None).unwrap();
         let stopped = updates.update("u1").unwrap();
         assert_eq!(stopped.state, "failed");
         assert!(stopped.error.starts_with("machine_restarted"));
@@ -906,12 +1044,12 @@ mod tests {
             if changed_links >= 2 {
                 relink(&transaction.paths.current_agent_link(), Some(&transaction.new.join("tensord"))).unwrap();
             }
-            let updates = Updates::open(transaction.paths.clone(), Box::new(|| true), None).unwrap();
+            let updates = Updates::open(transaction.paths.clone(), Box::new(|| true), None, None).unwrap();
             assert!(updates.commit().is_err(), "unpublished state committed");
             assert!(recover_activation(&transaction.paths).unwrap());
             transaction.links(&transaction.old);
             assert!(!transaction.paths.update("pending.json").exists());
-            let recovered = Updates::open(transaction.paths.clone(), Box::new(|| true), None).unwrap();
+            let recovered = Updates::open(transaction.paths.clone(), Box::new(|| true), None, None).unwrap();
             assert_eq!(recovered.update("transaction").unwrap().state, "rolled_back");
             assert!(!recover_activation(&transaction.paths).unwrap());
         }
@@ -926,7 +1064,7 @@ mod tests {
         assert!(!recover_activation(&transaction.paths).unwrap());
         assert!(transaction.paths.update("pending.json").exists());
         transaction.links(&transaction.new);
-        let updates = Updates::open(transaction.paths.clone(), Box::new(|| true), None).unwrap();
+        let updates = Updates::open(transaction.paths.clone(), Box::new(|| true), None, None).unwrap();
         // Keep the old pending bytes to simulate death after writing succeeded, before removal.
         let pending = fs::read(transaction.paths.update("pending.json")).unwrap();
         updates.commit().unwrap();
@@ -986,7 +1124,7 @@ mod tests {
     fn committed_success_is_visible_even_when_pending_cleanup_fails() {
         let transaction = Activation::prepare();
         transaction.state("starting");
-        let updates = Updates::open(transaction.paths.clone(), Box::new(|| true), None).unwrap();
+        let updates = Updates::open(transaction.paths.clone(), Box::new(|| true), None, None).unwrap();
         let mut succeeded = updates.update("transaction").unwrap();
         succeeded.enter("succeeded");
         // Fail the actual cleanup operation after the commit decision has already been read.
@@ -1010,7 +1148,7 @@ mod tests {
     fn failed_commit_is_observable_without_a_fabricated_terminal_outcome() {
         let transaction = Activation::prepare();
         transaction.state("starting");
-        let updates = Updates::open(transaction.paths.clone(), Box::new(|| true), None).unwrap();
+        let updates = Updates::open(transaction.paths.clone(), Box::new(|| true), None, None).unwrap();
         let before = fs::read(transaction.paths.update("status.json")).unwrap();
         fs::remove_file(transaction.paths.update("status.json")).unwrap();
         fs::create_dir(transaction.paths.update("status.json")).unwrap();
@@ -1041,7 +1179,7 @@ mod tests {
     fn operation_ids_never_name_or_delete_software_directories() {
         let transaction = Activation::prepare();
         rollback_pending(&transaction.paths, "fixture").unwrap();
-        let updates = Updates::open(transaction.paths.clone(), Box::new(|| true), None).unwrap();
+        let updates = Updates::open(transaction.paths.clone(), Box::new(|| true), None, None).unwrap();
         let candidate = wheel(&transaction.root, "cozy_runtime", "0.3.0", None);
         let original = fs::read_dir(&transaction.old).unwrap().count();
         for id in [".", ".."] {
@@ -1060,7 +1198,7 @@ mod tests {
     fn retrying_a_historical_operation_preserves_its_selected_generation() {
         let transaction = Activation::prepare();
         rollback_pending(&transaction.paths, "fixture").unwrap();
-        let updates = Updates::open(transaction.paths.clone(), Box::new(|| true), None).unwrap();
+        let updates = Updates::open(transaction.paths.clone(), Box::new(|| true), None, None).unwrap();
         let candidate = wheel(&transaction.root, "cozy_runtime", "0.3.0", None);
         let request = update_request(&updates, "A", &candidate);
         updates.request(request, |code| assert_eq!(code, REPLACE_EXIT)).unwrap();
@@ -1087,7 +1225,7 @@ mod tests {
     #[test]
     fn a_failed_status_write_does_not_advance_the_in_memory_state() {
         let transaction = Activation::prepare();
-        let updates = Updates::open(transaction.paths.clone(), Box::new(|| true), None).unwrap();
+        let updates = Updates::open(transaction.paths.clone(), Box::new(|| true), None, None).unwrap();
         fs::remove_file(transaction.paths.update("status.json")).unwrap();
         fs::create_dir(transaction.paths.update("status.json")).unwrap();
         assert!(updates.set(|s| s.enter("starting")).is_err());

@@ -35,6 +35,8 @@ fn publish(
         policy: catalog.policy(),
         progress: &|_, _| (),
         streams: 2,
+        stop: None,
+        commit: &|| true,
     })
     .map(drop)
 }
@@ -163,6 +165,8 @@ fn publish_with(
         policy,
         progress: &|_, _| (),
         streams: 2,
+        stop: None,
+        commit: &|| true,
     })
     .map(drop)
 }

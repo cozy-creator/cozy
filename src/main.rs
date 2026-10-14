@@ -197,6 +197,7 @@ fn run_machine(
             paths.clone(),
             Box::new(idle),
             Some(lifecycle.clone()),
+            Some(owner.lock().unwrap().store()),
         )?
     };
     identity.updates = Some(updates.clone());

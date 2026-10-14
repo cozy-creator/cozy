@@ -196,8 +196,8 @@ pub struct Stoppable {
     pub stop: PullCancellation,
 }
 impl Stoppable {
-    /// From here on the run cannot stop (an upload pushing to its Hub): it refuses cancellation.
-    /// False when it was canceled first.
+    /// From here on the run cannot stop (an upload finalizing at its Hub): it refuses
+    /// cancellation. False when it was canceled first.
     pub fn commit(&self) -> bool {
         let mut preparations = self.engine.preparations.lock().unwrap();
         let Some((stop, committed)) = preparations.get_mut(&self.id) else {
@@ -222,7 +222,7 @@ fn stop_preparation(
     if preparations.get(id).is_some_and(|(_, committed)| *committed) {
         return Err(io::Error::new(
             io::ErrorKind::ResourceBusy,
-            "this run is uploading to its Hub and ends on its own; its upload cannot be canceled",
+            "this run's upload is finalizing at its Hub and ends on its own",
         ));
     }
     let record = journal()?;

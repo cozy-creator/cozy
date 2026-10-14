@@ -1113,14 +1113,7 @@ impl Publisher {
                 sha256: file.sha256.clone(),
                 length: probe(&file.url, policy, &ledger).map_err(failed)?,
             };
-            let (plan, _) = FetchPlan::of_objects(&self.store, "package-files", std::slice::from_ref(&object))
-                .map_err(failed)?;
-            if !plan.wanted.is_empty() {
-                let grant = DeliveryGrant::mint(&plan, &object).map_err(failed)?;
-                let ranged = Ranged { streams: transport::STREAMS, part: 1 << 20 };
-                transport::fetch_ranged(&self.store, &grant, &file.url, policy, &Anonymous, Deadline::none(), &ledger, ranged, None)
-                    .map_err(failed)?;
-            }
+            fetch_file(&self.store, &file.url, &object, policy, &ledger).map_err(failed)?;
         }
         let blob = self.store.blob_path(&file.sha256);
         let path = wheels.join(&file.name);
@@ -1794,6 +1787,19 @@ fn hub_file(line: &str, source: &hub::Source) -> Option<HubFile> {
         sha256: sha256.to_ascii_lowercase(),
         name: name.to_string(),
     })
+}
+
+/// One file named by its digest, into this machine's store: a download that stops moving
+/// fails on its measured stillness, `ledger`'s stop ends it, and what landed stays for the
+/// next ask. Answers the blob's path.
+pub(crate) fn fetch_file(store: &Store, url: &str, object: &ObjectRef, policy: &SourcePolicy, ledger: &Ledger) -> Result<PathBuf, Refusal> {
+    let (plan, _) = FetchPlan::of_objects(store, "package-files", std::slice::from_ref(object))?;
+    if !plan.wanted.is_empty() {
+        let grant = DeliveryGrant::mint(&plan, object)?;
+        let ranged = Ranged { streams: transport::STREAMS, part: 1 << 20 };
+        transport::fetch_ranged(store, &grant, url, policy, &Anonymous, Deadline::none(), ledger, ranged, None)?;
+    }
+    Ok(store.blob_path(&object.sha256))
 }
 
 /// A file's length, asked again on a fresh connection while an ask stays silent past the

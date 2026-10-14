@@ -18,8 +18,8 @@ selector, legacy submission closure or deployment compatibility gate.
 
 Software updates retain their existing payload/status/rollback journal. They reserve actor/ID
 ownership in the machine journal before update admission. Ordinary acceptance and cancellation
-check that reservation in their SQLite transaction: update-first refuses Control as unsupported;
-cancel-first refuses a later UPDATE. An update ID stays reserved across restart. A refused update
+check that reservation in their SQLite transaction: update-first routes Control CANCEL to the update
+itself (it ends before activation, else `cancel_unavailable`); cancel-first refuses a later UPDATE. An update ID stays reserved across restart. A refused update
 may be retried as an update under the same ID; it cannot become an ordinary run or cancellation.
 
 Attachment prefers the actor's ordinary/canceled record over another actor's machine-wide update

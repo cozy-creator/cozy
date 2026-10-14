@@ -337,7 +337,7 @@ fn spec_of(mut spec: v1::RunSpec) -> Result<(crate::runs::Spec, Option<v1::HubAc
 }
 
 /// A typed refusal: the status carries its code as `cozy-error-code`, its message as text.
-fn refused(code: &str, message: &str) -> Status {
+pub(super) fn refused(code: &str, message: &str) -> Status {
     let status = match code {
         "run_id_conflict" => Status::already_exists(message),
         c if c.starts_with("invalid") => Status::invalid_argument(message),
@@ -702,7 +702,10 @@ impl<B: MachineBackend> v1::machine_server::Machine for MachineV1<B> {
         let (identity, actor, id) = (self.identity.clone(), caller.actor, request.id.clone());
         if Self::call(&self.backend, move |backend| super::machine_update::owns(&identity, backend, actor,
             &v1::RunRequest { id, ..Default::default() })).await? {
-            return Err(refused("update_control_unsupported", "software update runs do not support Control"));
+            if request.action != v1::Action::Cancel as i32 {
+                return Err(refused("update_control_unsupported", "a software update run is only canceled"));
+            }
+            return super::machine_update::cancel(&self.identity, &request.id).await.map(Response::new);
         }
         let action = match v1::Action::try_from(request.action) {
             Ok(v1::Action::Cancel) => domain::MachineExecutionAction::Cancel,

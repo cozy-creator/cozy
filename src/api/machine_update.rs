@@ -221,6 +221,26 @@ fn submit(
         .map_err(|(code, message)| refusal(code, message))
 }
 
+/// Cancels update `id` before it activates; one activating refuses (`cancel_unavailable`).
+pub(super) async fn cancel(identity: &MachineIdentity, id: &str) -> Result<v1::RunState, Status> {
+    let updates = identity
+        .updates
+        .clone()
+        .ok_or_else(|| Status::failed_precondition("this machine does not update in place"))?;
+    let operation = id.to_string();
+    let canceled = tokio::task::spawn_blocking(move || updates.cancel(&operation))
+        .await
+        .map_err(|_| Status::internal("machine operation stopped"))?;
+    match canceled {
+        Ok(update) => Ok(state(id, &update)),
+        Err(error) => Err(match error.kind() {
+            std::io::ErrorKind::NotFound => Status::not_found(error.to_string()),
+            std::io::ErrorKind::ResourceBusy => super::machine_v1::refused("cancel_unavailable", &error.to_string()),
+            _ => Status::internal(error.to_string()),
+        }),
+    }
+}
+
 fn refusal(code: u16, message: String) -> Status {
     match code {
         400 => Status::invalid_argument(message),
@@ -245,6 +265,7 @@ fn state(id: &str, update: &Update) -> v1::RunState {
         state: match update.state.as_str() {
             "waiting" => "queued",
             "succeeded" => "succeeded",
+            "canceled" => "canceled",
             "rolled_back" | "failed" => "failed",
             _ => "running",
         }
@@ -285,6 +306,7 @@ fn step_event(update: &Update, step: &crate::machine::update::Step) -> v1::run_e
     };
     match step.state.as_str() {
         "succeeded" => outcome("succeeded", ""),
+        "canceled" => outcome("canceled", "canceled"),
         "rolled_back" => outcome("failed", "update_rolled_back"),
         "failed" => outcome("failed", "update_failed"),
         stage => v1::run_event::Event::Progress(v1::Progress {
