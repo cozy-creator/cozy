@@ -281,6 +281,7 @@ func insertCallV1(tx *sql.Tx, id string, attempt int64, call *v1.Call) error {
 		} `json:"attribution"`
 		Execution    json.RawMessage `json:"execution"`
 		Observations json.RawMessage `json:"observations"`
+		Software     json.RawMessage `json:"software"`
 	}
 	_ = json.Unmarshal(call.Measurements, &measured)
 	record := map[string]any{"request": call.Run, "parent": id, "index": call.Index, "attempt": attempt,
@@ -288,6 +289,9 @@ func insertCallV1(tx *sql.Tx, id string, attempt int64, call *v1.Call) error {
 		"called_unix_ms": call.CalledAtMs, "stages": measured.Attribution.Stages, "steps": measured.Attribution.Steps,
 		"execution": measured.Execution, "observations": measured.Observations,
 		"memoized": call.Memoized, "computation_digest": call.ComputationDigest, "unmemoized": call.Unmemoized}
+	if len(measured.Software) > 0 {
+		record["software"] = measured.Software
+	}
 	if code := call.GetReason().GetCode(); code != "" {
 		record["error_code"] = code
 	}
