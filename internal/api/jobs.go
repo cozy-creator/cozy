@@ -464,6 +464,7 @@ func (s *Server) resolveJob(ctx context.Context, hub string, sub JobSubmission, 
 		return orchestrator.Submission{}, nil, exit.Usagef("a fresh rental cannot name an existing worker")
 	}
 	out := orchestrator.Submission{
+		Hub:  hub,
 		Kind: "job", RetainWork: sub.RetainWork, RetryOf: sub.RetryOf, Package: sub.Package, Entrypoint: sub.Function,
 		Payload: []byte(sub.Input), Org: strings.TrimSpace(sub.Org), Assets: append([]records.AssetBinding(nil), sub.LocalAssets...),
 		Release: sub.Release, OutputDirectory: sub.OutputDirectory,
@@ -686,7 +687,7 @@ func (s *Server) resolveLocalJob(ctx context.Context, sub JobSubmission,
 		return out, exit.Named(exit.NotFound, "unknown_job",
 			"%s registers no job named %q", sub.Package, sub.Function)
 	}
-	revision, problem := s.packages.LocalInstallation(installID, "")
+	revision, problem := s.packages.LocalInstallation(installID, out.Hub)
 	if problem != nil {
 		return out, problem
 	}

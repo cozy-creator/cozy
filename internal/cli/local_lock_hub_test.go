@@ -40,7 +40,7 @@ func TestLocalLockHubRefusalPrecedesMachineSourceAndRun(t *testing.T) {
 		t.Fatal(problem)
 	}
 	m := machineRuns{resolver: NewResolver(store, config.Config{Home: root})}
-	// No transport exists: even inspecting it would panic. The selected rental's
+	// No transport exists: even inspecting it would panic. The run's package/model
 	// Hub must reject the lock before source upload or machine submission.
 	manifest, sent, problem := m.localSourceV1(t.Context(), nil, "lock-proof", "http://127.0.0.1:8819")
 	if problem == nil || problem.Name != "local_package_lock_hub_mismatch" || manifest != "" || sent {
