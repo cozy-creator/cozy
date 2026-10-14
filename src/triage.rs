@@ -73,11 +73,10 @@ pub fn write(
             "traceback": capped(facts.traceback, MAX_TRACEBACK),
         },
         "executor": {"pid": facts.executor_pid, "stderr_tail": capped(facts.stderr_tail, MAX_STDERR as usize)},
-        "software": {
-            "tensord": env!("CARGO_PKG_VERSION"),
-            "runtime": executor.map(|e| e.runtime_version.as_str()),
-            "tensorfs": executor.map(|e| e.tensorfs_version.as_str()),
-        },
+        "software": executor.map(|executor| executor.software(facts.attempt)).unwrap_or_else(|| {
+            // A launch failure has no executor; only this TensorD was observed.
+            crate::journal::ExecutorFacts::observed(0, String::new(), String::new()).software(facts.attempt)
+        }),
     });
     let bytes = serde_json_canonicalizer::to_vec(&bundle).map_err(io::Error::other)?;
     let directory = root.join("triage");

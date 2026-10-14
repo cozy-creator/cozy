@@ -24,6 +24,9 @@ fn main() {
     }
 }
 fn run() -> io::Result<()> {
+    // Linux resets comm to the executable basename after a /proc/self/exe or current exec.
+    nix::sys::prctl::set_name(c"tensord")
+        .map_err(|error| io::Error::other(format!("cannot set TensorD process name: {error}")))?;
     // Whatever this process inherited (a parent's readiness, key or credential pipe) reaches
     // nothing it starts; descriptors it hands on are handed explicitly.
     tensord::process::cloexec_from(3);
