@@ -686,7 +686,7 @@ func (s *Server) resolveLocalJob(ctx context.Context, sub JobSubmission,
 		return out, exit.Named(exit.NotFound, "unknown_job",
 			"%s registers no job named %q", sub.Package, sub.Function)
 	}
-	revision, problem := s.packages.LocalInstallation(installID)
+	revision, problem := s.packages.LocalInstallation(installID, "")
 	if problem != nil {
 		return out, problem
 	}

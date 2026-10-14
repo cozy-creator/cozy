@@ -631,7 +631,7 @@ func (s *Server) resolveLocalServing(ctx context.Context, sub Submission,
 		return out, problem
 	}
 	out.NeedsAccelerator = needsAccelerator
-	revision, problem := s.packages.LocalInstallation(installID)
+	revision, problem := s.packages.LocalInstallation(installID, "")
 	if problem != nil {
 		return out, problem
 	}
@@ -685,7 +685,7 @@ func (s *Server) resolvePendingServing(ctx context.Context, sub Submission, out 
 	out.InstallID, out.Release = placement.InstallID, placement.Release
 	out.NeedsAccelerator = needsAccelerator
 	if !spec.Preparation.Published {
-		revision, problem := s.packages.LocalInstallation(placement.InstallID)
+		revision, problem := s.packages.LocalInstallation(placement.InstallID, "")
 		if problem != nil {
 			return out, problem
 		}

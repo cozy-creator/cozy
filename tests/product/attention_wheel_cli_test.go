@@ -172,7 +172,7 @@ with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_STORED) as target:
 			t.Fatal("scalar success silently lost the whole-run unused-pin warning")
 		}
 		install := activeInstall(t, root, localWeightlessRef)
-		source, problem := localpackage.Open(install, home.Paths(root).HubWheels(), nil)
+		source, problem := localpackage.Open(install, home.Paths(root).HubWheels(), nil, "")
 		fatal(t, problem)
 		// The code travels to a rented machine file by file, the vendored candidate wheel
 		// among them.

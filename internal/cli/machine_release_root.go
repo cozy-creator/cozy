@@ -19,8 +19,8 @@ import (
 // digest, and whether any byte moved. This computer's machine reads the project where it is;
 // another keeps one tree per package, so only what changed since this Calcifer last sent it
 // there is offered again.
-func (m *machineRuns) localSourceV1(ctx context.Context, machine *machines.V1, install string) (string, bool, *exit.Error) {
-	source, problem := m.resolver.LocalInstallation(install)
+func (m *machineRuns) localSourceV1(ctx context.Context, machine *machines.V1, install, targetHub string) (string, bool, *exit.Error) {
+	source, problem := m.resolver.LocalInstallation(install, targetHub)
 	if problem != nil {
 		return "", false, problem
 	}

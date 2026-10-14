@@ -46,7 +46,7 @@ type Resolver struct {
 
 // LocalInstallation is the code of the unpublished install a request names, as its machine
 // takes it: read from the install's own source root, never staged.
-func (r *Resolver) LocalInstallation(installID string) (localpackage.Installation, *exit.Error) {
+func (r *Resolver) LocalInstallation(installID, targetHub string) (localpackage.Installation, *exit.Error) {
 	install, problem := r.store.Install(installID)
 	if problem != nil {
 		return localpackage.Installation{}, problem
@@ -54,9 +54,13 @@ func (r *Resolver) LocalInstallation(installID string) (localpackage.Installatio
 	if install == nil {
 		return localpackage.Installation{}, exit.New(exit.NotFound, "install %s does not exist", installID)
 	}
+	origin := targetHub
+	if origin == "" {
+		origin = install.Hub
+	}
 	return localpackage.Open(*install, home.Paths(r.cfg.Home).HubWheels(), func() (packagepublish.Namespace, *exit.Error) {
-		return r.namespaceAt(install.Hub)
-	})
+		return r.namespaceAt(origin)
+	}, targetHub)
 }
 
 // EditableSnapshot is one reading of an editable install's live source tree against the

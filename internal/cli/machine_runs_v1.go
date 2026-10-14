@@ -533,7 +533,7 @@ func (m *machineRuns) specV1(ctx context.Context, request records.Request, machi
 	}
 	began := time.Now()
 	if request.LocalInstallationID != "" {
-		manifest, sent, problem := m.localSourceV1(ctx, machine, request.InstallID)
+		manifest, sent, problem := m.localSourceV1(ctx, machine, request.InstallID, m.context.forHub(request.Hub).Cfg.HubURL)
 		if problem != nil {
 			return nil, problem
 		}
@@ -714,7 +714,7 @@ func (m *machineRuns) operationSpecV1(ctx context.Context, request records.Reque
 		spec.Kind, spec.Source = v1.RunKind_RUN_KIND_REMOVE, &v1.RunSpec_Installation{Installation: op.Remove}
 	case op.Local != "":
 		// This computer's local code: only the files the machine's tree lacks go.
-		manifest, sent, problem := m.localSourceV1(ctx, machine, op.Local)
+		manifest, sent, problem := m.localSourceV1(ctx, machine, op.Local, m.context.forHub(origin).Cfg.HubURL)
 		if problem != nil {
 			return nil, problem
 		}

@@ -48,7 +48,7 @@ type Installation struct {
 // Open reads install's project as it is now. hubWheels is where this home keeps the Tensorhub
 // wheels its lock selects; namespace answers the caller's account index for a project that
 // names it before it has a lock.
-func Open(install records.PackageInstall, hubWheels string, namespace packagepublish.NamespaceSource) (Installation, *exit.Error) {
+func Open(install records.PackageInstall, hubWheels string, namespace packagepublish.NamespaceSource, targetHub string) (Installation, *exit.Error) {
 	project := install.ProjectDir
 	if install.SourceKind != "local" || project == "" {
 		return Installation{}, exit.New(exit.NotFound, "install %s holds no package source to send", install.ID)
@@ -106,7 +106,7 @@ func Open(install records.PackageInstall, hubWheels string, namespace packagepub
 	}
 	sort.Slice(out.Files, func(i, j int) bool { return out.Files[i].Name < out.Files[j].Name })
 	lock, _ := os.ReadFile(filepath.Join(pack.Tree, "uv.lock"))
-	wheels, callees, problem := packagepublish.HubWheels(lock)
+	wheels, callees, problem := packagepublish.HubWheels(lock, targetHub)
 	if problem != nil {
 		return Installation{}, problem
 	}
