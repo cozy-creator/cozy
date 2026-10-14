@@ -38,12 +38,16 @@ Acceptance, journal, progress and output custody stay in `Engine`; scheduling st
   one call per GPU. It ends at `Context.release_gpus()` (CPU roots only; in-flight calls keep
   their GPUs until they return) or the root executor's exit. A standalone call is its own root
   for the call's duration. Children carry `root` and accelerator `family`, stamped at acceptance.
-- Order: ready runs dispatch by (root acceptance, id). From its first child call or prefetch
-  until it binds (its CPU start-up), and while a step waits, an older root claims the lane it
-  needs for the pass; a younger root or standalone call binds only GPUs no older root claims. A
-  root that never asks (a CPU-only job) keeps no place. A released root's next step queues at
-  its original place and never preempts. Each `grant`/`wait`/`release` is a `gpu` entry in the
-  root's log (`RunEvent.gpu`). Preparing roots (model downloads) claim nothing yet.
+- Order: ready runs dispatch by (root acceptance, id). A root takes its place only with a GPU
+  step ready: one still downloading weights or in CPU start-up claims nothing, so younger ready
+  roots use the GPUs meanwhile. A root's first waiting step claims, for the pass, a lane no
+  older root holds; its younger holders yield at their next step boundary: they start no new
+  step (calls in flight, their own children and accelerator jobs finish; nothing is preempted),
+  then their lanes end (a `release` naming the root it went to) and they queue again at their
+  own place. A root that released or yielded comes back at its place among the waiting roots
+  and never displaces a holder: holders keep their lanes between their steps. A waiting step
+  keeps free GPUs from younger requests. Each `grant`/`wait`/`release` is a `gpu` entry in the
+  root's log (`RunEvent.gpu`); a wait is logged again whenever its blocker changes.
 - An accelerator job keeps one GPU of its root's lane for its life; only its family calls there.
 - The `GpuPlan` id hashes {actor, generation, entrypoint, slots, degree}. It is journaled as a
   `Preparation`, and `submit` records `preparation_id`.
@@ -59,7 +63,7 @@ Acceptance, journal, progress and output custody stay in `Engine`; scheduling st
   without evicting any (a replica when the plan runs elsewhere too; a plan with nothing learned
   fits only a GPU that holds nothing); or, when the plan runs nowhere or inside its root's lane,
   any free one. A waiting standalone call claims the GPUs it waits for. A prefetch loads only
-  inside its root's bound lane, after that root's queued requests, and ends at its release. A GPU that never ran the plan first copies its learned facts from one that did.
+  inside its root's bound lane, after queued requests of that root and older ones, and ends at its release. A GPU that never ran the plan first copies its learned facts from one that did.
   Replicas share the host tier's layouts and are ordinary tenants of their GPU's memory policy. A
   new executor's GPU is logged as `memory: {"event": "place"}`; `loads.jsonl` and `invokes.jsonl`
   name each line's `gpus`.

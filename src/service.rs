@@ -423,8 +423,8 @@ impl Service {
             }
         }
     }
-    /// One pass over the ready runs, by root acceptance (Slurm FIFO): an older root, ready or
-    /// still in its CPU start-up, keeps the GPUs it needs (`claims`) from younger ones.
+    /// One pass over the ready runs, by root acceptance (Slurm FIFO): an older request with a
+    /// ready GPU step keeps the GPUs it waits for (`claims`) from younger ones.
     fn dispatch_ready(&self) -> io::Result<()> {
         let stopped = self.stopped.lock().unwrap();
         if *stopped {
@@ -445,8 +445,6 @@ impl Service {
             || active.iter().any(|r| is_gpu(r) && !self.engine.owns(&r.id));
         let gpu = self.gpu();
         let mut claims = vec![None; gpu.as_ref().map_or(0, |gpu| gpu.width())];
-        // Started roots not bound to a lane yet: each keeps its place ahead of younger runs.
-        let mut pending = gpu.as_ref().map(|gpu| gpu.pending()).unwrap_or_default().into_iter().peekable();
         let jobs = self.jobs.lock().unwrap().clone();
         // A job mostly waits on its children, and a call waiting on its own takes none:
         // only they take CPU room.
@@ -462,12 +460,6 @@ impl Service {
             return Ok(());
         }
         for record in self.engine.ready()? {
-            let root = record.root_seq();
-            while let Some((older, width)) = pending.next_if(|(seq, _)| *seq <= root) {
-                if let (Some(gpu), true) = (&gpu, older < root) {
-                    gpu.claim(older, width, &mut claims);
-                }
-            }
             let held = match self.catalog.resolve(&record.invocation.generation) {
                 Ok(held) => held,
                 Err(error) => {
