@@ -3,6 +3,8 @@
 # dependencies = ["cozy-runtime>=0.18.24,<1", "tensorfs>=0.3.51,<0.4", "numpy>=1.26,<3", "tensor-quant-source>=0.1.0,<0.2"]
 # [tool.uv.sources]
 # tensor-quant-source = {path = "./quant_source", editable = true}
+# [tool.cozy]
+# accelerator = false
 # ///
 from cozy_runtime.author import ModelArtifact
 from cozy_runtime.derive.operations import QuantizationPlan, quantize

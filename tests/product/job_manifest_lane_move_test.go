@@ -20,7 +20,7 @@ func TestJobReadsTheSelectedCheckpointAfterItsLaneMoves(t *testing.T) {
 	selected := []byte(`{"fixture":"selected root"}`)
 	digest, err := canonical.Spell(canonical.Digest(selected))
 	must(t, err)
-	iface := []byte(`{"application":"q:app","entrypoints":[],"format":"cozy.package.interface/1","jobs":[{"models":[{"class":"Source","component_use":{},"path":"quantize.models.dits"},{"class":"Source","component_use":{},"path":"quantize.models.shared"}],"name":"quantize","publishes":false,"request":{"fields":[{"name":"steps","type":"int"}]},"result":{"fields":[]},"weights_outputs":[{"max_bytes":1048576,"mime_type":"application/vnd.cozy.model-manifest","output_id":"fp8"}]}]}`)
+	iface := []byte(`{"application":"q:app","entrypoints":[],"format":"cozy.package.interface/1","jobs":[{"accelerator":false,"models":[{"class":"Source","component_use":{},"path":"quantize.models.dits"},{"class":"Source","component_use":{},"path":"quantize.models.shared"}],"name":"quantize","publishes":false,"request":{"fields":[{"name":"steps","type":"int"}]},"result":{"fields":[]},"weights_outputs":[{"max_bytes":1048576,"mime_type":"application/vnd.cozy.model-manifest","output_id":"fp8"}]}]}`)
 	contract, problem := launch.DecodePackageInterface(iface)
 	fatal(t, problem)
 	var detail hub.PackageReleaseDetail

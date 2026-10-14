@@ -38,5 +38,5 @@ async def verify(ctx: Context, *, report: ReportFile, tree: Tree) -> Verified:
 
 
 app = App()
-app.job(produce)
-app.job(verify)
+app.job(produce, accelerator=False)
+app.job(verify, accelerator=False)

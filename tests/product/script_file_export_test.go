@@ -102,8 +102,8 @@ class ImageReport(msgspec.Struct, frozen=True):
 async def produce_image(ctx:Context, *, out:Outputs)->ImageReport:
     return ImageReport(out.save_image(Image.new("RGB", (16,16), (10,20,30)), format="png"))
 app=App()
-app.job(produce)
-app.job(produce_image)
+app.job(produce, accelerator=False)
+app.job(produce_image, accelerator=False)
 `), 0600))
 	header := fmt.Sprintf(`# /// script
 # requires-python=">=3.12,<3.13"
@@ -111,6 +111,8 @@ app.job(produce_image)
 # [tool.uv.sources]
 # cozy-runtime={path=%q}
 # file-producer={path="./producer"}
+# [tool.cozy]
+# accelerator = false
 # ///
 `, version, wheel)
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))

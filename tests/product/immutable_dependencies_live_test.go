@@ -57,7 +57,7 @@ class Result(msgspec.Struct):
 async def double(ctx: Context, *, value: int) -> Result:
     import numpy as np
     return Result(int(np.asarray([value, value]).sum()))
-app.job(double)
+app.job(double, accelerator=False)
 `
 	must(t, os.WriteFile(filepath.Join(library, "numerical_tools.py"), []byte(module), 0600))
 	metadata := fmt.Sprintf(`[project]
@@ -83,6 +83,8 @@ cozy-runtime={path=%s}
 # [tool.uv.sources]
 # cozy-runtime={path=%s}
 # numerical-tools={path="./library",editable=true}
+# [tool.cozy]
+# accelerator = false
 # ///
 from numerical_tools import double
 async def main(ctx):

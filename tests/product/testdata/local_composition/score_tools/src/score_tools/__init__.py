@@ -32,4 +32,4 @@ async def score(ctx: Context, *, model: Candidate, tel: Telemetry) -> Result:
 
 
 app = App()
-app.job(score)
+app.job(score, accelerator=False)

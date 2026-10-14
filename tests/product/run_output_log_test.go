@@ -607,7 +607,7 @@ def segment(out, k, frames):
     return out.save_video_stream(events()).video
 class Film(msgspec.Struct):
     video: Annotated[VideoAsset, AssetBound(media_types=("video/mp4",))]
-@app.job(emits_media=True)
+@app.job(emits_media=True, accelerator=False)
 def film(ctx: Context, payload: Request, out: Outputs) -> Film:
     """Three segments joined as they land: each revision is the video so far."""
     join = out.join_video(AUDIO)
@@ -623,7 +623,7 @@ def film(ctx: Context, payload: Request, out: Outputs) -> Film:
 class Grown(msgspec.Struct):
     image: Annotated[ImageAsset, AssetBound(media_types=("image/png",))]
     frames: list[ImageAsset]
-@app.job(emits_media=True)
+@app.job(emits_media=True, accelerator=False)
 def grow(ctx: Context, payload: Request, out: Outputs) -> Grown:
     """Three revisions of image and one frame each, each after its gate file appears."""
     frames = []

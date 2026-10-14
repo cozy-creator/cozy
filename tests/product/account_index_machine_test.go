@@ -90,7 +90,7 @@ class AddResult(msgspec.Struct):
 app = App()
 
 
-@app.job
+@app.job(accelerator=False)
 def add(payload: AddRequest) -> AddResult:
     return AddResult(value=payload.value + org_relative_dep.VALUE)
 `,
@@ -227,7 +227,7 @@ async def touch(ctx: Context, *, value: int, source: Probe) -> Touched:
 
 
 app = App()
-app.job(touch)
+app.job(touch, accelerator=False)
 `, "[cozy.application]\ndefault = org_relative_dep:app\n")
 	var open atomic.Bool
 	open.Store(true)
@@ -257,7 +257,7 @@ class AddResult(msgspec.Struct):
 app = App()
 
 
-@app.job
+@app.job(accelerator=False)
 async def add(payload: AddRequest) -> AddResult:
     return AddResult(value=(await touch(value=payload.value)).value)
 `)

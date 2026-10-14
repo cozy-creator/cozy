@@ -78,9 +78,9 @@ async def internal_job(ctx: Context, *, value: int) -> Value:
     ctx.raise_if_cancelled()
     return Value(value + 1)
 
-app.job(internal=True)(internal_job)
+app.job(internal=True, accelerator=False)(internal_job)
 
-@app.job
+@app.job(accelerator=False)
 async def long_form(ctx: Context, payload: Request) -> Value:
     first = await segment(value=40)
     return await internal_job(value=first.value)

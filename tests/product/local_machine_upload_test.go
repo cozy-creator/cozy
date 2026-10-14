@@ -65,7 +65,7 @@ async def convert(ctx: Context, *, n: int) -> ModelArtifact:
     return ctx.adopt_model(receipt)
 
 
-app.job(convert, weights=(WeightsOutput("model", max_new_bytes=65536),))
+app.job(convert, weights=(WeightsOutput("model", max_new_bytes=65536),), accelerator=False)
 `), 0o600))
 	if out, err := exec.Command("uv", "lock", "--project", project).CombinedOutput(); err != nil {
 		t.Fatalf("locking the weights package: %v\n%s", err, out)

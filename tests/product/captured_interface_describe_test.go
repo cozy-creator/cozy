@@ -14,7 +14,7 @@ func TestCapturedSourceDescribesItsVerifiedInstalledInterface(t *testing.T) {
 	installed := filepath.Join(root, "install")
 	source := filepath.Join(installed, "source")
 	must(t, os.MkdirAll(source, 0700))
-	raw := []byte(`{"format":"cozy.package.interface/1","application":"missing_module:app","entrypoints":[],"jobs":[{"name":"main","models":[],"request":{"fields":[]},"result":{"fields":[]},"publishes":false}]}`)
+	raw := []byte(`{"format":"cozy.package.interface/1","application":"missing_module:app","entrypoints":[],"jobs":[{"accelerator":false,"name":"main","models":[],"request":{"fields":[]},"result":{"fields":[]},"publishes":false}]}`)
 	iface, problem := launch.DecodePackageInterface(raw)
 	fatal(t, problem)
 	if len(iface.Raw) == 0 {

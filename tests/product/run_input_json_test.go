@@ -22,7 +22,7 @@ func runInputJSONRoot(t *testing.T) string {
 		`"entrypoints":[{"name":"long_form","request":{"fields":[{"name":"style","type":"str"},{"name":"mode","type":"str"},{"name":"seed","type":"int"},` +
 		`{"name":"references","type":{"list":{"fields":[{"name":"name","type":"str"},{"name":"kind","type":"str"},{"name":"description","type":"str"}]}}},` +
 		`{"name":"segments","type":{"list":{"fields":[{"name":"prompt","type":"str"},{"name":"duration_s","type":"float"}]}}}]},"result":{"fields":[]}}],` +
-		`"jobs":[{"name":"prepare","publishes":false,"request":{"fields":[{"name":"shots","type":{"list":{"fields":[{"name":"prompt","type":"str"},{"name":"seed","type":"int"}]}}},{"name":"steps","type":"int"}]},"result":{"fields":[]}}]}`)
+		`"jobs":[{"accelerator":false,"name":"prepare","publishes":false,"request":{"fields":[{"name":"shots","type":{"list":{"fields":[{"name":"prompt","type":"str"},{"name":"seed","type":"int"}]}}},{"name":"steps","type":"int"}]},"result":{"fields":[]}}]}`)
 	iface, problem := launch.DecodePackageInterface(raw)
 	fatal(t, problem)
 	var detail hub.PackageReleaseDetail

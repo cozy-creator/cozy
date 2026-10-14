@@ -46,6 +46,8 @@ func TestUnpublishedNamedRentalUsesPrivateDependencyVersions(t *testing.T) {
 # dependencies = ["cozy-runtime>=%s", "msgspec>=0.21,<0.22"]
 # [tool.uv]
 # constraint-dependencies = ["msgspec==0.21.1"]
+# [tool.cozy]
+# accelerator = false
 # ///
 def main(ctx):
     raise AssertionError("an unreachable rental must not execute")
@@ -118,7 +120,7 @@ class Result(msgspec.Struct):
 async def value(ctx: Context) -> Result:
     return Result(1)
 app = App()
-app.job(value)
+app.job(value, accelerator=False)
 `), 0600))
 	wheels := filepath.Join(filepath.Dir(script), "wheels")
 	if out, err := exec.Command("uv", "build", "--wheel", "--out-dir", wheels, library).CombinedOutput(); err != nil {

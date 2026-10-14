@@ -108,4 +108,4 @@ async def produce(ctx: Context) -> ModelArtifact:
         writer.add_config("pipeline", b"{}")
         return ctx.adopt_model(writer.commit())
 
-app.job(produce, weights=(WeightsOutput("weights", max_new_bytes=4096),))
+app.job(produce, weights=(WeightsOutput("weights", max_new_bytes=4096),), accelerator=False)

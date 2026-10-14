@@ -174,7 +174,7 @@ class TouchResult(msgspec.Struct):
 app = App()
 
 
-@app.job(defaults={"source": [{"gpu": "*", "lane": "`+lane+`"}]})
+@app.job(defaults={"source": [{"gpu": "*", "lane": "`+lane+`"}]}, accelerator=False)
 def touch(payload: TouchRequest, source: Probe) -> TouchResult:
     return TouchResult(value=payload.value + 1)
 `), 0o600))

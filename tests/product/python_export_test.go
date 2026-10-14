@@ -147,7 +147,7 @@ only-include = ["operation.py"]
 func TestPythonScriptLockUsesRuntimeExecutable(t *testing.T) {
 	_, version, log := pythonExportToolchain(t)
 	path := filepath.Join(t.TempDir(), "operation.py")
-	must(t, os.WriteFile(path, []byte("# /// script\n# requires-python = '>=3.12'\n# dependencies = []\n# ///\nprint('not executed during capture')\n"), 0600))
+	must(t, os.WriteFile(path, []byte("# /// script\n# requires-python = '>=3.12'\n# dependencies = []\n# [tool.cozy]\n# accelerator = false\n# ///\nprint('not executed during capture')\n"), 0600))
 	pack, problem := packagepublish.PrepareScript(context.Background(), path, t.TempDir(), nil)
 	fatal(t, problem)
 	defer pack.Close()

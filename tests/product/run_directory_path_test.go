@@ -50,7 +50,7 @@ func TestRunExplicitPackageDirectoryCapturesItsTypedInterface(t *testing.T) {
 	if code == 0 || !strings.Contains(out, "local_package_not_found") {
 		t.Fatalf("missing directory: %d %s", code, out)
 	}
-	must(t, os.WriteFile(filepath.Join(project, "directory_proof", "__init__.py"), []byte(strings.Replace(source, "@app.job(internal=True)", "@app.job", 1)), 0600))
+	must(t, os.WriteFile(filepath.Join(project, "directory_proof", "__init__.py"), []byte(strings.Replace(source, "@app.job(internal=True, accelerator=False)", "@app.job", 1)), 0600))
 	code, out = run("./project")
 	if code != 0 || !strings.Contains(out, "hidden_job") || !strings.Contains(out, "verify_value") || !strings.Contains(out, "Reading local package") {
 		t.Fatalf("multiple callable directory, read again after its edit: %d %s", code, out)
@@ -112,11 +112,11 @@ class Request(msgspec.Struct):
     value: int = 7
 class Result(msgspec.Struct):
     value: int
-@app.job
+@app.job(accelerator=False)
 def verify_value(payload: Request, ctx: Context) -> Result:
     from .helper import increment
     return Result(increment(payload.value))
-@app.job(internal=True)
+@app.job(internal=True, accelerator=False)
 def hidden_job(payload: Request, ctx: Context) -> Result:
     return Result(payload.value)
 raise RuntimeError("directory source must not execute during description")
@@ -171,7 +171,7 @@ func runDirectoryOnExplicitEndpoint(t *testing.T, serving bool) {
 	project, _, source := directoryProofProject(t)
 	source = strings.Replace(source, "raise RuntimeError(\"directory source must not execute during description\")\n", "", 1)
 	if serving {
-		source = strings.Replace(source, "@app.job\ndef verify_value", "@app.entrypoint\ndef verify_value", 1)
+		source = strings.Replace(source, "@app.job(accelerator=False)\ndef verify_value", "@app.entrypoint\ndef verify_value", 1)
 	}
 	must(t, os.WriteFile(filepath.Join(project, "directory_proof", "__init__.py"), []byte(source), 0600))
 	code, out := runCozy(t, root, "run", project+"/verify-value", "--machine-endpoint-file", endpoint, "--await", "--json")

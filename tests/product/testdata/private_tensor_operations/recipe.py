@@ -4,6 +4,8 @@
 # [tool.uv.sources]
 # tensor-source = {path = "./source"}
 # tensor-candidate = {path = "./candidate"}
+# [tool.cozy]
+# accelerator = false
 # ///
 from tensor_source import compute as source
 from tensor_candidate import compute as candidate

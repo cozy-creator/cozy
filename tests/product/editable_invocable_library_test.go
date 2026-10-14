@@ -73,7 +73,7 @@ class Result(msgspec.Struct):
 async def value(ctx: Context) -> Result:
     return Result(42)
 app = App()
-app.job(value)
+app.job(value, accelerator=False)
 `
 	module := filepath.Join(library, "editable_leaf.py")
 	must(t, os.WriteFile(module, []byte(body), 0600))
@@ -82,6 +82,8 @@ app.job(value)
 # dependencies = ["cozy-runtime>=%s", "editable-leaf-proof>=1.0.0"]
 # [tool.uv.sources]
 %s# editable-leaf-proof = {path = %q, editable = true}
+# [tool.cozy]
+# accelerator = false
 # ///
 from editable_leaf import value
 async def main(ctx):

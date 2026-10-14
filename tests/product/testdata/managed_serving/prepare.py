@@ -4,6 +4,8 @@
 # [tool.uv.sources]
 # cozy-runtime = {path=__WHEEL__}
 # model-tools = {path="./model_tools"}
+# [tool.cozy]
+# accelerator = false
 # ///
 from cozy_runtime.author import ActivationCapture
 from model_tools import generate, helper, produce

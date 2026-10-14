@@ -25,7 +25,7 @@ func TestForeignCalleeLockIsRefusedBeforeRunAdmission(t *testing.T) {
 		"proof.py": "from cozy_runtime.author import App\nimport msgspec\napp=App()\n" +
 			"class Input(msgspec.Struct):\n    value: int=1\n" +
 			"class Result(msgspec.Struct):\n    value: int\n" +
-			"@app.job\ndef execute(payload: Input) -> Result:\n    return Result(payload.value)\n",
+			"@app.job(accelerator=False)\ndef execute(payload: Input) -> Result:\n    return Result(payload.value)\n",
 		"uv.lock": "version=1\nrequires-python='>=3.12,<3.13'\n[[package]]\nname='lock-hub-proof'\nversion='1.0.0'\nsource={editable='.'}\n" +
 			"[[package]]\nname='qwen-image-2'\nversion='0.5.0'\nsource={registry='https://tensorhub.com/v1/index/fidika/simple/'}\n",
 	}

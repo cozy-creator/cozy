@@ -70,8 +70,8 @@ class Value(msgspec.Struct):
 @invocable(memoize=True)
 async def child(ctx: Context, *, seed: int, number: int | float, ordered: list[int]) -> Value:
     return Value(seed, number, ordered, type(number).__name__)
-app.job(internal=True)(child)
-@app.job
+app.job(internal=True, accelerator=False)(child)
+@app.job(accelerator=False)
 async def echo(ctx: Context, payload: Request) -> Value:
     return await child(seed=payload.seed, number=payload.number, ordered=payload.ordered)
 `), 0o600))

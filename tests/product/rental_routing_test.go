@@ -11,38 +11,35 @@ import (
 	"github.com/cozy-creator/cozy/internal/rental"
 )
 
+// A job's machine class is its declared accelerator, whatever its dependencies say; an
+// undeclared job refuses before any SKU is considered.
 func TestPublishedJobRentalClass(t *testing.T) {
 	skus := offeredSKUs()
-	tests := []struct {
-		name         string
-		requirements []string
-		wantSKU      string
+	torch := []string{"cozy-runtime<1.0.0,>=0.0.33", "msgspec>=0.19", "numpy>=1.26", "torch<3,>=2.13"}
+	for _, test := range []struct {
+		name        string
+		accelerator bool
+		wantSKU     string
 	}{
-		{
-			name: "SDXL three-lane CPU producer",
-			requirements: []string{
-				"cozy-jobs==0.0.14", "cozy-runtime<1.0.0,>=0.0.34",
-			},
-			wantSKU: "cpu",
-		},
-		{
-			name: "MiniMax H3 CUDA producer",
-			requirements: []string{
-				"cozy-jobs==0.0.13", "cozy-runtime<1.0.0,>=0.0.33", "msgspec>=0.19",
-				"numpy>=1.26", "torch<3,>=2.13",
-			},
-			wantSKU: "rtx-4090",
-		},
-	}
-	for _, test := range tests {
+		{name: "a CPU conversion beside torch", accelerator: false, wantSKU: "cpu"},
+		{name: "a GPU table producer", accelerator: true, wantSKU: "rtx-4090"},
+	} {
 		t.Run(test.name, func(t *testing.T) {
-			sku, _, mismatch, ok := choose(skus,
-				launch.AcceleratorRequired(test.requirements),
-				rental.Constraints{Requirements: test.requirements})
+			job := launch.Entrypoint{Name: "lane", Kind: "job", Accelerator: &test.accelerator}
+			gpu, problem := job.NeedsAccelerator("org/tools")
+			if problem != nil {
+				t.Fatal(problem)
+			}
+			sku, _, mismatch, ok := choose(skus, gpu, rental.Constraints{Requirements: torch})
 			if !ok || sku.Name != test.wantSKU {
 				t.Fatalf("selected %+v, found=%v mismatch=%q; want %s", sku, ok, mismatch, test.wantSKU)
 			}
 		})
+	}
+	undeclared := launch.Entrypoint{Name: "lane", Kind: "job"}
+	if _, problem := undeclared.NeedsAccelerator("org/tools"); problem == nil ||
+		problem.Name != "package.job_accelerator_undeclared" {
+		t.Fatalf("an undeclared job was given a machine class: %v", problem)
 	}
 }
 
@@ -67,6 +64,7 @@ func TestReleaseRefusedBeforeRentalSpend(t *testing.T) {
 		name           string
 		requirements   []string
 		requiresPython string
+		cpu            bool
 		skus           []hub.RentalSKU
 		wantSKU        string
 		wantMismatch   string
@@ -81,6 +79,7 @@ func TestReleaseRefusedBeforeRentalSpend(t *testing.T) {
 			name:           "interpreter above the fleet",
 			requirements:   []string{"cozy-runtime<1.0.0,>=0.0.34"},
 			requiresPython: ">=3.13",
+			cpu:            true,
 			skus:           offeredSKUs(),
 			wantMismatch:   "this base is cp312",
 		},
@@ -107,8 +106,7 @@ func TestReleaseRefusedBeforeRentalSpend(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			sku, _, mismatch, ok := choose(test.skus,
-				launch.AcceleratorRequired(test.requirements),
+			sku, _, mismatch, ok := choose(test.skus, !test.cpu,
 				rental.Constraints{Requirements: test.requirements, RequiresPython: test.requiresPython})
 			if test.wantSKU != "" {
 				if !ok || sku.Name != test.wantSKU {

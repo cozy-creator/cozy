@@ -46,6 +46,8 @@ func TestCaptureReaderHandoffReleasesWriterBeforeAwait(t *testing.T) {
 # dependencies=["cozy-runtime>=%s"]
 # [tool.uv.sources]
 # cozy-runtime={path=%q}
+# [tool.cozy]
+# accelerator = false
 # ///
 from pathlib import Path
 import time

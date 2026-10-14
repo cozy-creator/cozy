@@ -74,10 +74,10 @@ class Picture(msgspec.Struct):
     image: Annotated[ImageAsset, AssetBound(media_types=("image/png",))]
 class Text(msgspec.Struct):
     text: str
-@app.job
+@app.job(accelerator=False)
 def text(payload:Request)->Text:
     return Text("done")
-@app.job(emits_media=True)
+@app.job(emits_media=True, accelerator=False)
 def picture(payload:Request,out:Outputs)->Picture:
     return Picture(out.save_image(ImageFrame(2,2,bytes([255,0,0])*4),format="png"))
 `), 0600))

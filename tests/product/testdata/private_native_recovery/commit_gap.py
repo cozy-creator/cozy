@@ -4,6 +4,8 @@
 # [tool.uv.sources]
 # tensor-source = {path = "./source", editable = true}
 # tensor-candidate = {path = "./candidate", editable = true}
+# [tool.cozy]
+# accelerator = false
 # ///
 from cozy_runtime.author import ModelArtifact
 from tensor_source import compute as source

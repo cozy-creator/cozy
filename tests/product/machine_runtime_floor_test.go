@@ -69,6 +69,8 @@ func TestAMachineNamesTheRuntimeItNeeds(t *testing.T) {
 # dependencies=["cozy-runtime>=%s"]
 # [tool.uv.sources]
 # cozy-runtime={path=%q}
+# [tool.cozy]
+# accelerator = false
 # ///
 from typing import Annotated
 from cozy_runtime.author import AssetBound, ImageAsset, ImageFrame, Outputs
