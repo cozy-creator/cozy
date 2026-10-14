@@ -61,7 +61,9 @@ type runReport struct {
 	GPUs   []reportGPU   `json:"gpus,omitempty"`
 	// Transport is how a group's GPUs exchanged data: Runtime's record, kept whole.
 	Transport json.RawMessage `json:"transport,omitempty"`
-	Calls     []reportCall    `json:"calls,omitempty"`
+	// Memory is its executor's device memory: peaks, holdings at the end, what it paged.
+	Memory *runMemory   `json:"memory,omitempty"`
+	Calls  []reportCall `json:"calls,omitempty"`
 	// Resolved is what the machine installed and which checkpoint each Model slot ran: the
 	// run's reproducible identity, recorded by the machine that chose it.
 	Resolved json.RawMessage     `json:"resolved,omitempty"`
@@ -128,6 +130,7 @@ type reportCall struct {
 	Steps       []reportSteps      `json:"steps,omitempty"`
 	// Transport is how its GPUs exchanged data: Runtime's record, kept whole.
 	Transport json.RawMessage `json:"transport,omitempty"`
+	Memory    *runMemory      `json:"memory,omitempty"`
 
 	timed []reportStage // its latest record's attribution stages, beside Stages until sorted
 }
@@ -243,6 +246,7 @@ type triageEvidence struct {
 		} `json:"attribution"`
 		Execution    executionRecord `json:"execution"`
 		Observations []observation   `json:"observations"`
+		Memory       *runMemory      `json:"memory"`
 	} `json:"measurements"`
 }
 
@@ -497,6 +501,7 @@ type callEvent struct {
 	Execution    json.RawMessage `json:"execution"`
 	Observations json.RawMessage `json:"observations"`
 	Software     json.RawMessage `json:"software"`
+	Memory       *runMemory      `json:"memory"`
 }
 
 func handleRunShow(ctx *Context) *exit.Error {
@@ -650,7 +655,7 @@ func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
 			c.Parent, c.Index, c.Attempt, c.Module, c.Function = record.Parent, record.Index, record.Attempt, record.Module, record.Export
 			c.Label, c.Status, c.Error, c.ErrorCode = record.Label, record.Status, record.Error, record.ErrorCode
 			c.Memoized, c.Computation, c.Unmemoized = record.Memoized, record.Computation, record.Unmemoized
-			c.Software = readExecutionSoftware(record.Software)
+			c.Software, c.Memory = readExecutionSoftware(record.Software), record.Memory
 			c.StartUnixMS = record.CalledUnixMS
 			c.MS = float64(at.UnixMilli() - record.CalledUnixMS)
 			c.callTiming = record.callTiming
@@ -791,7 +796,7 @@ func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
 		}
 		execution := triage.Measurements.Execution
 		report.Degree, report.GPUs = execution.Degree, execution.gpus(triage.Measurements.Observations)
-		report.Transport = execution.Transport
+		report.Transport, report.Memory = execution.Transport, triage.Measurements.Memory
 		if boot := execution.Executor; boot.StartedUnixMS > 0 {
 			report.Stages = append(report.Stages, setupStage("executor boot", boot.StartedUnixMS,
 				boot.MS, created, topLegs(boot.Legs)))
@@ -845,7 +850,7 @@ func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
 		}
 		root := reportCall{Request: life.RequestID, Module: life.Package, Function: life.Function, Label: "this run",
 			Runtime: report.Runtime, Software: report.Software,
-			Status: status, GPUs: report.GPUs, Transport: report.Transport, StartUnixMS: started.UnixMilli(), MS: float64(life.ExecutionMS),
+			Status: status, GPUs: report.GPUs, Transport: report.Transport, Memory: report.Memory, StartUnixMS: started.UnixMilli(), MS: float64(life.ExecutionMS),
 			Steps: report.Steps, Stages: []reportStage{},
 			Memoized: report.Memoized, Computation: report.Computation, Unmemoized: report.Unmemoized}
 		for _, stage := range report.Stages {
@@ -1173,6 +1178,7 @@ func (r runReport) Emit(w io.Writer, mode output.Mode) error {
 	}
 	emitTimeline(w, table, r.Stages, r.Steps, offset, mode.Full)
 	emitGPUs(w, table, r.GPUs, r.Transport, r.Steps, offset, mode.Full)
+	emitMemory(w, r.Memory)
 	if len(r.Calls) == 0 {
 		return nil
 	}
@@ -1288,6 +1294,7 @@ func (c reportCall) emit(w io.Writer, table *tabwriter.Writer, calls int, offset
 	}
 	emitTimeline(w, table, c.Stages, c.Steps, offset, full)
 	emitGPUs(w, table, c.GPUs, c.Transport, c.Steps, offset, full)
+	emitMemory(w, c.Memory)
 }
 
 func (c reportCall) state() string {

@@ -8,23 +8,35 @@ import (
 	"github.com/cozy-creator/cozy/internal/machines"
 )
 
-// handleMachineLogs is `cozy machine logs --tensorfs`: the TensorFS transport decisions this
-// computer's machine logged, read through the same machine call a rental answers.
+// handleMachineLogs is `cozy machine logs --tensorfs|--memory`: a log this computer's machine
+// keeps, read through the same machine call a rental answers.
 func handleMachineLogs(ctx *Context) *exit.Error {
-	if !ctx.Inv.Bool("--tensorfs") {
-		return exit.Usagef("name the log to print: --tensorfs")
+	name, problem := machineLogName(ctx)
+	if problem != nil {
+		return problem
 	}
-	return printMachineLog(ctx, machines.Local, "this computer's machine")
+	return printMachineLog(ctx, machines.Local, name, "this computer's machine")
 }
 
-// printMachineLog prints the TensorFS log a machine keeps, oldest line first. A machine whose
-// agent predates the read, or whose TensorFS has logged nothing, prints a note and succeeds.
-func printMachineLog(ctx *Context, machine, label string) *exit.Error {
+// machineLogName is the log a `--tensorfs` or `--memory` flag names.
+func machineLogName(ctx *Context) (string, *exit.Error) {
+	switch {
+	case ctx.Inv.Bool("--tensorfs"):
+		return "tensorfs", nil
+	case ctx.Inv.Bool("--memory"):
+		return "memory", nil
+	}
+	return "", exit.Usagef("name the log to print: --tensorfs or --memory")
+}
+
+// printMachineLog prints a log a machine keeps, oldest line first. A machine whose agent
+// predates the read, or that has logged nothing there, prints a note and succeeds.
+func printMachineLog(ctx *Context, machine, name, label string) *exit.Error {
 	calcifer, problem := dial(ctx)
 	if problem != nil {
 		return problem
 	}
-	log, problem := calcifer.MachineLog(machine, "tensorfs", 0)
+	log, problem := calcifer.MachineLog(machine, name, 0)
 	if problem != nil {
 		return problem
 	}
@@ -36,7 +48,7 @@ func printMachineLog(ctx *Context, machine, label string) *exit.Error {
 	case log.Unavailable != "":
 		fmt.Fprintf(ctx.Err, "%s: %s\n", label, log.Unavailable)
 	case log.Text == "":
-		fmt.Fprintf(ctx.Err, "%s has logged no TensorFS transport decisions (TensorFS 0.3.82 and later log them)\n", label)
+		fmt.Fprintf(ctx.Err, "%s has logged nothing in its %s log\n", label, name)
 	default:
 		fmt.Fprint(ctx.Out, log.Text)
 	}
