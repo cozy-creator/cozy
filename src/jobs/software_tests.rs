@@ -55,7 +55,7 @@ fn a_successful_cpu_attempt_keeps_its_actual_software_after_reload() {
     assert_eq!(expected.tensord, env!("CARGO_PKG_VERSION"));
     assert_eq!(expected.tensord_commit.as_deref(), option_env!("TENSORD_COMMIT"));
     drop(engine);
-    let journal = Journal::open(&root.join("state/execution")).unwrap();
+    let journal = Journal::open(&root.join("state")).unwrap();
     let reopened: Value = serde_json::from_slice(&journal.measurements(&run.id).unwrap().unwrap()).unwrap();
     assert_eq!(reopened["software"], measured["software"]);
     eprintln!("CPU attempt software: {}", measured["software"]);
