@@ -209,11 +209,23 @@ pub fn recv_fd(stream: &UnixStream) -> io::Result<OwnedFd> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::MetadataExt;
+
+    /// This process's descriptors open on `file`. Tests share the process and its
+    /// descriptor table, so only descriptors of this test's own memfd are counted.
+    fn descriptors_of(file: &std::fs::File) -> usize {
+        let own = file.metadata().unwrap();
+        std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(|entry| std::fs::metadata(entry.ok()?.path()).ok())
+            .filter(|open| (open.dev(), open.ino()) == (own.dev(), own.ino()))
+            .count()
+    }
+
     #[test]
     fn truncated_descriptor_batch_closes_delivered_prefix() {
         let (send, receive) = UnixStream::pair().unwrap();
         let file = crate::os::memfd().unwrap();
-        let baseline = std::fs::read_dir("/proc/self/fd").unwrap().count();
         let rights = vec![file.as_raw_fd(); 32];
         sendmsg::<()>(
             send.as_raw_fd(),
@@ -224,9 +236,6 @@ mod tests {
         )
         .unwrap();
         assert!(recv_fd(&receive).is_err());
-        assert_eq!(
-            std::fs::read_dir("/proc/self/fd").unwrap().count(),
-            baseline
-        );
+        assert_eq!(descriptors_of(&file), 1);
     }
 }
