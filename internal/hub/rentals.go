@@ -57,6 +57,12 @@ const (
 	RentalReleased         = "released"
 )
 
+// RentalProviderStopped is the failure code of a degraded rental whose provider stopped its
+// machine. Tensorhub keeps the rental, unattachable, and never replaces it: it returns if the
+// provider resumes the machine and ends after 15 minutes idle. Renting another is the caller's
+// decision.
+const RentalProviderStopped = "readiness.provider_stopped"
+
 // RentalAbsent reports states Tensorhub commits only after proving provider
 // absence. Degraded, draining, and unknown states may still be billing.
 func RentalAbsent(state string) bool {

@@ -1027,7 +1027,9 @@ func rentalProvisionFailure(id string, r hub.Rental) *exit.Error {
 
 func copyRentalObservation(row *records.Rental, remote hub.Rental) {
 	row.StableMachineName = remote.StableMachineName
-	if remote.Failure == nil || remote.Failure.Code == "" {
+	// The first failure recorded is the one a rental's runs settle with; a later observation
+	// (a second provider stop) does not rewrite it.
+	if remote.Failure == nil || remote.Failure.Code == "" || row.Failure.Code != "" {
 		return
 	}
 	row.Failure = records.RentalFailure{
@@ -1224,6 +1226,10 @@ func handleRentalShow(ctx *Context) *exit.Error {
 		if list.TypedRows[i]["state"] == "ready" {
 			status, notes := rentalStatus(client, selected[0], !ctx.Mode().Human || ctx.Mode().JSON)
 			record.Fields, record.AllFields, record.Notes = append(record.Fields, status...), append(record.AllFields, status...), notes
+		}
+		if r := selected[0]; r.State == hub.RentalDegraded && r.Failure.Code == hub.RentalProviderStopped {
+			record.Notes = append(record.Notes, providerStoppedNote(r))
+			record.Next = append([]string{"cozy rental new " + r.SKU}, record.Next...)
 		}
 		return emit(ctx, record)
 	}
@@ -1479,6 +1485,10 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 		}
 		if r.Unverified {
 			state += " (unverified)"
+		}
+		if r.State == hub.RentalDegraded && r.Failure.Code == hub.RentalProviderStopped {
+			state = "stopped by provider"
+			list.Trail = append(list.Trail, providerStoppedNote(r))
 		}
 		if since, err := time.Parse(time.RFC3339Nano, r.UnreachableSince); err == nil && r.State == hub.RentalReady {
 			state += " (unreachable " + durationClock(now.Sub(since)) + ")"
@@ -1874,6 +1884,14 @@ func roughDuration(d time.Duration) string {
 }
 
 // idleShutdownNote is the owner's rule: every rental, used or not, ends itself when idle.
+// providerStoppedNote says what a provider stop means and what the renter can do: Tensorhub
+// keeps the rental but never replaces its machine.
+func providerStoppedNote(r api.RentalSummary) string {
+	return fmt.Sprintf("Rental %s (%s) was stopped by its provider. Tensorhub keeps it but does not replace it: "+
+		"it returns if the provider resumes it, and ends after 15 minutes idle. "+
+		"To keep working now: `cozy rental new %s` (and `cozy rental end %s`).", r.ID, r.MachineName, r.SKU, r.ID)
+}
+
 func idleShutdownNote() string {
 	return "Rentals end themselves after 15 minutes idle (no queued or running job)."
 }
