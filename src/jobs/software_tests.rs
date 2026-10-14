@@ -4,13 +4,14 @@ use crate::{device_executor::Baseline, journal::{Invocation, Journal}};
 use std::process::Command;
 
 #[test]
+#[ignore = "actual CPU provenance gate requires an explicitly installed cpu_software SDK fixture"]
 fn a_successful_cpu_attempt_keeps_its_actual_software_after_reload() {
     let python = PathBuf::from(std::env::var("TENSORD_SOFTWARE_TEST_PYTHON")
         .expect("explicit interpreter with the cpu_software fixture installed"));
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cpu_software");
     let root = std::env::temp_dir().join(format!("cm-software-{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(&root).unwrap();
-    let described = Command::new(&python).args(["-m", "cozy_runtime", "--json", "--dir"])
+    let described = Command::new(python.with_file_name("cozy-runtime")).args(["--json", "--dir"])
         .arg(fixture).arg("describe").output().unwrap();
     assert!(described.status.success(), "{}", String::from_utf8_lossy(&described.stderr));
     let interface = root.join("interface.json");
