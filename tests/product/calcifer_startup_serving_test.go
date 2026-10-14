@@ -1,7 +1,6 @@
 package producttest
 
 import (
-	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -51,22 +50,20 @@ func silentHub(t *testing.T) string {
 	return "http://" + listener.Addr().String()
 }
 
-// holdRecords is another live writer on the records: it holds SQLite's write lock until
-// the returned function is called.
+// holdRecords is another live writer on the records: it waits its turn as every records
+// writer does (a running Calcifer may be writing), then holds SQLite's write lock until the
+// returned function is called.
 func holdRecords(t *testing.T, root string) func() {
 	t.Helper()
-	db, err := sql.Open("sqlite", filepath.Join(root, "creator.sqlite"))
+	db, err := records.OpenDB(filepath.Join(root, "creator.sqlite"))
 	must(t, err)
-	conn, err := db.Conn(context.Background())
-	must(t, err)
-	_, err = conn.ExecContext(context.Background(), "BEGIN IMMEDIATE")
+	tx, err := db.Begin()
 	must(t, err)
 	released := false
 	release := func() {
 		if !released {
 			released = true
-			_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
-			conn.Close()
+			_ = tx.Rollback()
 			db.Close()
 		}
 	}

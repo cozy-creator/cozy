@@ -163,13 +163,17 @@ func Open(path string) (*Store, *exit.Error) {
 	return open(path)
 }
 
+// OpenDB opens the records database with Store's driver and pragmas, leaving its schema
+// alone: one more writer, which waits out the others as Store's writers do.
+func OpenDB(path string) (*sql.DB, error) { return sql.Open(driverName, path+pragmas) }
+
 // open accepts an empty database, the current schema, schema 49 (migrated), or a newer one.
 // The current schema evolves additively: verifySchema adds any table, column or index the
 // authored DDL has and the database lacks. Any other older schema is refused.
 func open(path string) (*Store, *exit.Error) {
 	// No `file:` prefix: the driver hands an unprefixed name to SQLite verbatim, so a
 	// local root containing `%` or `#` stays a path instead of becoming a URI to decode.
-	db, err := sql.Open(driverName, path+pragmas)
+	db, err := OpenDB(path)
 	if err != nil {
 		return nil, exit.Internalf("cannot open the local records database %s: %s", path, err)
 	}
