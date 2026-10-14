@@ -286,11 +286,15 @@ func (r *Resolver) ResolveRemoteRelease(origin, pkg, release, function string,
 	if problem != nil {
 		return empty, nil, problem
 	}
-	requirements, packageInterface, problem := r.releaseInterface(origin, ref, release)
+	packageInterface, problem := r.releaseInterface(origin, ref, release)
 	if problem != nil {
 		return empty, nil, problem
 	}
 	entrypoint, problem := packageInterface.Function(function)
+	if problem != nil {
+		return empty, nil, problem
+	}
+	accelerator, problem := entrypoint.NeedsAccelerator(pkg)
 	if problem != nil {
 		return empty, nil, problem
 	}
@@ -315,7 +319,7 @@ func (r *Resolver) ResolveRemoteRelease(origin, pkg, release, function string,
 		}
 		return orchestrator.LogicalPackage{Package: pkg, Release: release, Function: function,
 			Outputs: launch.OutputSlots(entrypoint.Result), Models: models,
-			NeedsAccelerator: launch.AcceleratorRequired(requirements)}, entrypoint, nil
+			NeedsAccelerator: accelerator}, entrypoint, nil
 	}
 	if len(models) != len(entrypoint.Models) {
 		return empty, nil, exit.Named(exit.Validation, "rental.model_selection_incomplete",
@@ -395,7 +399,7 @@ func (r *Resolver) ResolveRemoteRelease(origin, pkg, release, function string,
 	return orchestrator.LogicalPackage{
 		Package: pkg, Release: release,
 		Function: function, Outputs: launch.OutputSlots(entrypoint.Result), PlanID: planID,
-		Models: models, NeedsAccelerator: launch.AcceleratorRequired(requirements),
+		Models: models, NeedsAccelerator: accelerator,
 	}, entrypoint, nil
 }
 
@@ -423,7 +427,7 @@ func (r *Resolver) ResolveRemoteJob(origin, pkg, release, function string,
 	if problem != nil {
 		return empty, nil, problem
 	}
-	requirements, packageInterface, problem := r.releaseInterface(origin, ref, release)
+	packageInterface, problem := r.releaseInterface(origin, ref, release)
 	if problem != nil {
 		return empty, nil, problem
 	}
@@ -434,6 +438,10 @@ func (r *Resolver) ResolveRemoteJob(origin, pkg, release, function string,
 	if job.Kind != "job" || job.DescriptorID == "" {
 		return empty, nil, exit.Named(exit.Validation, "rental.job_descriptor_invalid",
 			"%s is not a published job callable", function)
+	}
+	accelerator, problem := job.NeedsAccelerator(pkg)
+	if problem != nil {
+		return empty, nil, problem
 	}
 	models = append([]orchestrator.ModelRef(nil), models...)
 	sort.Slice(models, func(i, j int) bool { return models[i].Slot < models[j].Slot })
@@ -503,41 +511,35 @@ func (r *Resolver) ResolveRemoteJob(origin, pkg, release, function string,
 	return orchestrator.LogicalJob{
 		Package: pkg, Release: release,
 		Function: function, DescriptorID: job.DescriptorID, Outputs: outputs,
-		WeightsOutputs: weights, NeedsAccelerator: job.NeedsAccelerator(requirements), Models: models,
+		WeightsOutputs: weights, NeedsAccelerator: accelerator, Models: models,
 		ProducerParams: params,
 	}, job, nil
 }
 
-// releaseInterface is a published release's interface and locked closure: this computer's
-// verified install of it when there is one, else the interface its machine described here (a
-// run on a known machine reads no Hub), else Tensorhub's release card (choosing a machine).
-func (r *Resolver) releaseInterface(origin string, ref hub.Ref, release string) ([]string, *launch.PackageInterface, *exit.Error) {
+// releaseInterface is a published release's interface: this computer's verified install of it
+// when there is one, else the interface its machine described here (a run on a known machine
+// reads no Hub), else Tensorhub's release card (choosing a machine).
+func (r *Resolver) releaseInterface(origin string, ref hub.Ref, release string) (*launch.PackageInterface, *exit.Error) {
 	if _, installed, problem := r.store.ActivePackage(r.cfg.ForHub(origin).HubURL, ref.String()); problem == nil && installed != nil &&
 		installed.Version == release {
-		if held, packageInterface, problem := r.installPackageInterface(installed.ID); problem == nil {
-			return strings.Split(held.Closure, "\n"), packageInterface, nil
+		if _, packageInterface, problem := r.installPackageInterface(installed.ID); problem == nil {
+			return packageInterface, nil
 		}
 	}
 	if kept := readKeptRelease(home.Paths(r.cfg.Home).Root, r.cfg.ForHub(origin).HubURL, ref.String(), release); kept.Interface != nil {
-		packageInterface, problem := launch.DecodePackageInterface(kept.Interface)
-		return kept.Requirements, packageInterface, problem
+		return launch.DecodePackageInterface(kept.Interface)
 	}
 	ctx, cancel := hub.Context()
 	defer cancel()
 	detail, problem := r.catalog(origin).PackageRelease(ctx, ref, release)
 	if problem != nil {
-		return nil, nil, problem
+		return nil, problem
 	}
 	if detail.Release.Release != release {
-		return nil, nil, exit.Named(exit.Conflict, "rental.package_release_changed",
+		return nil, exit.Named(exit.Conflict, "rental.package_release_changed",
 			"Tensorhub answered release %s@%s for the queued release %s", ref, detail.Release.Release, release)
 	}
-	requirements, problem := detail.Requirements()
-	if problem != nil {
-		return nil, nil, problem
-	}
-	packageInterface, problem := launch.DecodePackageInterface(detail.PackageInterface)
-	return requirements, packageInterface, problem
+	return launch.DecodePackageInterface(detail.PackageInterface)
 }
 
 func (r *Resolver) Entrypoint(installID, name string) (*launch.Entrypoint, bool, *exit.Error) {
@@ -549,15 +551,8 @@ func (r *Resolver) Entrypoint(installID, name string) (*launch.Entrypoint, bool,
 	if problem != nil {
 		return nil, false, problem
 	}
-	accelerator := entrypoint.NeedsAccelerator(strings.Split(install.Closure, "\n"))
-	if entrypoint.Kind == "job" && entrypoint.Accelerator == nil && len(entrypoint.Models) == 0 && len(entrypoint.WeightsOutputs) == 0 {
-		parent, problem := r.store.CompositionParent(installID, name)
-		if problem != nil {
-			return nil, false, problem
-		}
-		accelerator = accelerator && !parent
-	}
-	return entrypoint, accelerator, nil
+	accelerator, problem := entrypoint.NeedsAccelerator(install.Package)
+	return entrypoint, accelerator, problem
 }
 
 func (r *Resolver) installRecord(installID string) (*records.PackageInstall, *exit.Error) {
@@ -595,12 +590,7 @@ func (r *Resolver) installFacts(installID string) (*launch.Facts, *exit.Error) {
 	if problem != nil {
 		return nil, problem
 	}
-	facts.CPUOrchestration, problem = r.store.HasChildBindings(installID)
-	if problem != nil {
-		return nil, problem
-	}
-	facts.SelfCallable, problem = r.store.SelfCallableEntrypoints(installID)
-	return facts, problem
+	return facts, nil
 }
 
 // Jobs names the `@job` functions one installed package registers, with the PackageInterface

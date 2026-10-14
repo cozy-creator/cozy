@@ -23,7 +23,7 @@ func TestPrivateScriptRequiresMainWithoutExecutingSource(t *testing.T) {
 	if wheel := *privateScriptRuntimeWheel; wheel != "" {
 		metadata += fmt.Sprintf("# [tool.uv.sources]\n# cozy-runtime = {path = %q}\n", wheel)
 	}
-	metadata += "# ///\n"
+	metadata += "# [tool.cozy]\n# accelerator = false\n# ///\n"
 	must(t, os.WriteFile(p, []byte(metadata+`raise RuntimeError("client must never execute this module")
 def first():
     pass
@@ -68,6 +68,8 @@ func TestPrivateScriptTypedOutputsUseNormalAttempt(t *testing.T) {
 # dependencies = ["cozy-runtime[media]"]
 # [tool.uv.sources]
 # cozy-runtime = {path = %q}
+# [tool.cozy]
+# accelerator = false
 # ///
 from typing import Annotated
 from cozy_runtime.author import AssetBound, ImageFrame, ImageAsset, Outputs, Telemetry
@@ -146,7 +148,9 @@ class Probe(Model[object], encoded_leaves="accept"):
 # dependencies=["cozy-runtime>=`+runtimeFixtureVersion(t, *privateScriptRuntimeWheel)+`","private-script-model-types>=0.0.1"]
 # [tool.uv.sources]
 # private-script-model-types={path="./model_types",editable=true}
-`+sources+`# ///
+`+sources+`# [tool.cozy]
+# accelerator = false
+# ///
 raise RuntimeError("client script imported during description")
 from model_types import Probe
 

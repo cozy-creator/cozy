@@ -21,7 +21,7 @@ func TestRunTakesAScriptPathHoweverItIsSpelled(t *testing.T) {
 	t.Cleanup(func() { _ = removeAllForce(root) })
 	project := t.TempDir()
 	script := []byte("# /// script\n# requires-python=\">=3.12,<3.13\"\n# dependencies=[\"cozy-runtime>=" +
-		hostruntime.PackageFloor + "\"]\n# ///\ndef main(): pass\n")
+		hostruntime.PackageFloor + "\"]\n# [tool.cozy]\n# accelerator = false\n# ///\ndef main(): pass\n")
 	for _, path := range []string{"examples/client-scripts/h3_lanes.py", "lanes/h3.py"} {
 		must(t, os.MkdirAll(filepath.Join(project, filepath.Dir(path)), 0o755))
 		must(t, os.WriteFile(filepath.Join(project, path), script, 0o600))
@@ -60,7 +60,8 @@ func TestDescribeShowsAJobsAcceleratorDeclaration(t *testing.T) {
 	must(t, err)
 	t.Cleanup(func() { _ = removeAllForce(root) })
 	for _, test := range []struct{ declared, human, json string }{
-		{"", "runs on: CPU", `"accelerator":false`}, {"# [tool.cozy]\n# accelerator = true\n", "runs on: GPU", `"accelerator":true`},
+		{"# [tool.cozy]\n# accelerator = false\n", "runs on: CPU", `"accelerator":false`},
+		{"# [tool.cozy]\n# accelerator = true\n", "runs on: GPU", `"accelerator":true`},
 	} {
 		script := filepath.Join(t.TempDir(), "job.py")
 		must(t, os.WriteFile(script, []byte("# /// script\n# requires-python=\">=3.12,<3.13\"\n# dependencies=[\"cozy-runtime>="+

@@ -27,7 +27,7 @@ func runModelCatalog(t *testing.T, configure ...func(*http.ServeMux, *hub.Packag
 	manifest := []byte(`{"fixture":"small root, not model closure bytes"}`)
 	digest, err := canonical.Spell(canonical.Digest(manifest))
 	must(t, err)
-	iface := []byte(`{"application":"q:app","entrypoints":[],"format":"cozy.package.interface/1","jobs":[{"models":[{"class":"Source","component_use":{},"path":"quantize.models.dits"},{"class":"Source","component_use":{},"path":"quantize.models.shared"}],"name":"quantize","publishes":false,"request":{"fields":[{"name":"steps","type":"int"}]},"result":{"fields":[]},"weights_outputs":[{"max_bytes":1048576,"mime_type":"application/vnd.cozy.model-manifest","output_id":"fp8"}]}]}`)
+	iface := []byte(`{"application":"q:app","entrypoints":[],"format":"cozy.package.interface/1","jobs":[{"accelerator":false,"models":[{"class":"Source","component_use":{},"path":"quantize.models.dits"},{"class":"Source","component_use":{},"path":"quantize.models.shared"}],"name":"quantize","publishes":false,"request":{"fields":[{"name":"steps","type":"int"}]},"result":{"fields":[]},"weights_outputs":[{"max_bytes":1048576,"mime_type":"application/vnd.cozy.model-manifest","output_id":"fp8"}]}]}`)
 	contract, problem := launch.DecodePackageInterface(iface)
 	fatal(t, problem)
 	var detail hub.PackageReleaseDetail
@@ -255,6 +255,37 @@ func TestRunPublishedModelJobKeepsPayloadAndDeclaresRentalClosure(t *testing.T) 
 	fatal(t, problem)
 	if replayed.ID != row.ID || replayed.BodyDigest != row.BodyDigest {
 		t.Fatal("replay changed request identity")
+	}
+}
+
+// A job that declares no accelerator has no machine class: it refuses before any rental
+// is quoted or bought, never by running on a CPU it did not ask for.
+func TestAnUndeclaredJobRefusesBeforeAnyRental(t *testing.T) {
+	root, mu, posts, _, _ := runModelCatalog(t, func(_ *http.ServeMux, detail *hub.PackageReleaseDetail) {
+		detail.PackageInterface = bytes.Replace(detail.PackageInterface, []byte(`"accelerator":false,`), nil, 1)
+		contract, problem := launch.DecodePackageInterface(detail.PackageInterface)
+		fatal(t, problem)
+		detail.Release.PackageInterfaceDigest = assessmentDigest(contract.Raw)
+		detail.Release.PackageInterfaceLength = int64(len(detail.PackageInterface))
+	})
+	startCalciferProcess(t, root)
+	code, out := runCozy(t, root, "run", "proof/quantize/quantize", "model.dits=proof/source@1.0.0/bf16",
+		"model.shared=proof/source@1.0.0/bf16", "steps=7", "--upload-to", "proof/output", "--rental-only",
+		"--json", "--idempotency-key", "undeclared-job")
+	if code == 0 || !strings.Contains(out, "package.job_accelerator_undeclared") ||
+		!strings.Contains(out, "proof/quantize job quantize declares no accelerator") {
+		t.Fatalf("an undeclared job was not refused: %d %s", code, out)
+	}
+	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
+	fatal(t, problem)
+	defer store.Close()
+	if row, problem := store.RequestByIdempotencyKey("undeclared-job"); problem != nil || row != nil {
+		t.Fatalf("an undeclared job was queued: %+v %v", row, problem)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(*posts) != 0 {
+		t.Fatalf("an undeclared job reached a rental: %s", (*posts)[0])
 	}
 }
 

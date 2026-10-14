@@ -4,6 +4,8 @@
 # [tool.uv.sources]
 # cozy-runtime={path=__WHEEL__}
 # byte-tools={path="./byte_tools",editable=true}
+# [tool.cozy]
+# accelerator = false
 # ///
 from byte_tools import produce, verify
 

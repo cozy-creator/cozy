@@ -134,7 +134,7 @@ class Input(msgspec.Struct):
 app = App()
 
 
-@app.job
+@app.job(accelerator=False)
 async def main(payload: Input) -> Result:
     return await touch(value=payload.value)
 `)

@@ -91,8 +91,8 @@ async def compose(value: int) -> Result:
     previous = await first(value=value)
     return await second(value=previous.value)
 app = App()
-app.job(first)
-app.job(second)
+app.job(first, accelerator=False)
+app.job(second, accelerator=False)
 `
 	module := filepath.Join(library, "wheel_proof.py")
 	must(t, os.WriteFile(module, []byte(body), 0o600))
@@ -105,6 +105,8 @@ app.job(second)
 # dependencies = ["cozy-runtime>=%s", "unpublished-wheel-proof>=0.1.0"]
 # [tool.uv.sources]
 %s# unpublished-wheel-proof = {path = %q}
+# [tool.cozy]
+# accelerator = false
 # ///
 from wheel_proof import compose
 async def main(ctx):

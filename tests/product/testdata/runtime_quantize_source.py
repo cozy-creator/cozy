@@ -44,5 +44,5 @@ async def inspect(ctx: Context, *, original: QuantizationSource,
         assert any(payload)
         return Checked(True)
 
-app.job(produce, weights=(WeightsOutput("model", max_new_bytes=65536),))
-app.job(inspect)
+app.job(produce, weights=(WeightsOutput("model", max_new_bytes=65536),), accelerator=False)
+app.job(inspect, accelerator=False)

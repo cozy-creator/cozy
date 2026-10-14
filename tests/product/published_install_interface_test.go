@@ -70,7 +70,7 @@ class Request(msgspec.Struct):
     value: int = 1
 class Result(msgspec.Struct):
     value: int
-@app.job
+@app.job(accelerator=False)
 def main(payload: Request) -> Result:
     return Result(payload.value)
 `, imports, version)), 0600))

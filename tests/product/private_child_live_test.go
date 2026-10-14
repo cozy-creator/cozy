@@ -90,7 +90,7 @@ class Result(msgspec.Struct, frozen=True):
 		} else {
 			body += "async def compute(ctx: Context, *, value: int, factor: int) -> Result:\n    if factor == 0:\n        raise ValueError('candidate quality gate failed')\n    return Result(value * factor)\n"
 		}
-		body += "app = App()\napp.job(compute)\n"
+		body += "app = App()\napp.job(compute, accelerator=False)\n"
 		must(t, os.WriteFile(filepath.Join(lib, module+".py"), []byte(body), 0o600))
 	}
 	script := filepath.Join(project, "recipe.py")
@@ -104,6 +104,8 @@ class Result(msgspec.Struct, frozen=True):
 # [tool.uv.sources]
 ` + runtimeScriptSource + `# private-source = {path = "./source"}
 # private-candidate = {path = "./candidate"}
+# [tool.cozy]
+# accelerator = false
 # ///
 from private_source import compute as source
 from private_candidate import compute as candidate

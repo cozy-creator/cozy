@@ -83,15 +83,16 @@ func (f *Facts) Job(function string) (*JobFacts, *exit.Error) {
 		})
 		outputs = append(outputs, output.OutputID)
 	}
+	accelerator, problem := declared.NeedsAccelerator(f.Install.Package)
+	if problem != nil {
+		return nil, problem
+	}
 	facts := &JobFacts{
 		Name: function, Request: declared.Request, Result: declared.Result, Assets: declared.Assets, DescriptorID: declared.DescriptorID, Outputs: outputs,
 		Internal:         declared.Internal,
 		WeightsOutputs:   weightsOutputs,
 		Publishes:        declared.Publishes,
-		NeedsAccelerator: declared.NeedsAccelerator(strings.Split(f.Install.Closure, "\n")),
-	}
-	if declared.Accelerator == nil && f.CPUOrchestration && !f.SelfCallable[function] && len(declared.Models) == 0 && len(declared.WeightsOutputs) == 0 {
-		facts.NeedsAccelerator = false
+		NeedsAccelerator: accelerator,
 	}
 	facts.RetainsArtifacts = len(ModelArtifactPaths(declared.Result)) > 0 || len(RetainedAssetPaths(declared)) > 0
 	for _, model := range declared.Models {

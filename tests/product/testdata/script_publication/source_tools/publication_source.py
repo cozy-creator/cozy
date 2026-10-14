@@ -25,4 +25,4 @@ async def produce(ctx: Context, *, value: int, private_note: str = "") -> ModelA
         return ctx.adopt_model(writer.commit())
 
 app = App()
-app.job(produce, weights=(WeightsOutput("model", max_new_bytes=1 << 16),))
+app.job(produce, weights=(WeightsOutput("model", max_new_bytes=1 << 16),), accelerator=False)

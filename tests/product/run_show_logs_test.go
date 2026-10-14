@@ -29,7 +29,7 @@ class AddResult(msgspec.Struct):
 app = App()
 
 
-@app.job
+@app.job(accelerator=False)
 def add(payload: AddRequest, tel: Telemetry) -> AddResult:
     tel.log("adding one", amount=payload.value)
     tel.log("the value is odd", level="warning")

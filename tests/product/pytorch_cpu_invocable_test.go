@@ -84,7 +84,7 @@ async def square_sum(ctx:Context,*,offset:int)->Result:
     values=torch.arange(4,dtype=torch.int64,device="cpu")
     assert not torch.cuda.is_initialized()
     return Result(int((values*values).sum())+offset,str(values.device),torch.version.cuda is not None)
-app.job(square_sum)
+app.job(square_sum, accelerator=False)
 `
 	must(t, os.WriteFile(filepath.Join(library, "cpu_torch_ops.py"), []byte(module), 0600))
 	body := fmt.Sprintf(`# /// script
@@ -98,6 +98,8 @@ app.job(square_sum)
 # name="pytorch-cpu"
 # url="https://download.pytorch.org/whl/cpu"
 # explicit=true
+# [tool.cozy]
+# accelerator = false
 # ///
 from cpu_torch_ops import square_sum
 async def main()->int:

@@ -40,7 +40,7 @@ async def quantize(ctx: Context, *, source: QuantizationSource, encoding: str,
 
 
 app = App()
-app.job(quantize, weights=(WeightsOutput("model", max_new_bytes=1 << 20),))
+app.job(quantize, weights=(WeightsOutput("model", max_new_bytes=1 << 20),), accelerator=False)
 
 
 @invocable(memoize=True)
@@ -57,4 +57,4 @@ async def graft(ctx: Context, *, source: QuantizationSource) -> ModelArtifact:
         return ctx.adopt_model(writer.receipt if writer.receipt is not None else writer.commit())
 
 
-app.job(graft, weights=(WeightsOutput("model", max_new_bytes=0),))
+app.job(graft, weights=(WeightsOutput("model", max_new_bytes=0),), accelerator=False)

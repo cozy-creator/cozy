@@ -51,6 +51,8 @@ func TestOrdinaryScriptTreeResultExportsCompleteClosure(t *testing.T) {
 # dependencies=["cozy-runtime>=%s"]
 # [tool.uv.sources]
 # cozy-runtime={path=%q}
+# [tool.cozy]
+# accelerator = false
 # ///
 from cozy_runtime.author import Outputs, Tree
 

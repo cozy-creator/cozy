@@ -30,7 +30,7 @@ func TestAnUnlockedPackageSuggestsALock(t *testing.T) {
 		write("lock_tip.py", "import msgspec\nfrom cozy_runtime.author import App, Context, invocable\n"+
 			"class Result(msgspec.Struct):\n    count: int\n"+
 			"@invocable\nasync def count(ctx: Context, *, count: int) -> Result:\n    return Result(count)\n"+
-			"app=App()\napp.job(count)\n")
+			"app=App()\napp.job(count, accelerator=False)\n")
 		if locked {
 			if data, err := exec.Command(uv, "lock", "--no-progress", "--project", dir).CombinedOutput(); err != nil {
 				t.Fatalf("lock fixture: %v\n%s", err, data)

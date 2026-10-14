@@ -48,7 +48,7 @@ class Input(msgspec.Struct):
     value: int = 1
 class Result(msgspec.Struct):
     value: int
-@app.job
+@app.job(accelerator=False)
 def execute(payload: Input) -> Result:
     return Result(payload.value)
 `,

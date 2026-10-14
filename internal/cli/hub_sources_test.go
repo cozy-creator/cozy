@@ -67,7 +67,7 @@ func TestSelectedHubScopesInstalledAndCachedPackageMetadata(t *testing.T) {
 			cfg := config.Config{Home: root, HubURL: source.URL}
 			resolver := NewResolver(store, cfg)
 			ref, _ := hub.ParseRef(pkg)
-			_, selected, problem := resolver.releaseInterface(source.URL, ref, otherRelease)
+			selected, problem := resolver.releaseInterface(source.URL, ref, otherRelease)
 			if problem != nil {
 				t.Fatal(problem)
 			}

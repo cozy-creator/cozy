@@ -5,6 +5,8 @@
 # cozy-runtime={path=__RUNTIME_WHEEL__}
 # quantize-tools={path="./quantize_tools"}
 # score-tools={path="./score_tools"}
+# [tool.cozy]
+# accelerator = false
 # ///
 from cozy_runtime.author.sources import download_huggingface,convert_cozytensors
 from quantize_tools import graft,quantize

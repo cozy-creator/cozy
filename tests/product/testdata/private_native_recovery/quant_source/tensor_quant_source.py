@@ -25,4 +25,4 @@ async def compute(ctx: Context) -> ModelArtifact:
         return ctx.adopt_model(writer.commit())
 
 app = App()
-app.job(compute, weights=(WeightsOutput("model", max_new_bytes=3145728),))
+app.job(compute, weights=(WeightsOutput("model", max_new_bytes=3145728),), accelerator=False)

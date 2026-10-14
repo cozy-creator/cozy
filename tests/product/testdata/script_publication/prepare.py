@@ -3,6 +3,8 @@
 # dependencies = ["cozy-runtime>=0.14.1", "tensorfs>=0.3.36", "publication-source-tools>=0.0.1"]
 # [tool.uv.sources]
 # publication-source-tools = {path = "./source_tools", editable = true}
+# [tool.cozy]
+# accelerator = false
 # ///
 """Tiny native publication plumbing proof; no trained-model quality claim."""
 from cozy_runtime.author.publication import publish_release, upload_checkpoint

@@ -22,7 +22,9 @@ func TestAwaitedJobJSONSeparatesEventsAndResult(t *testing.T) {
 	if wheel := *privateScriptRuntimeWheel; wheel != "" {
 		metadata += fmt.Sprintf("# [tool.uv.sources]\n# cozy-runtime = {path = %q}\n", wheel)
 	}
-	must(t, os.WriteFile(script, []byte(metadata+`# ///
+	must(t, os.WriteFile(script, []byte(metadata+`# [tool.cozy]
+# accelerator = false
+# ///
 def main(ctx):
     ctx.raise_if_cancelled()
 `), 0600))

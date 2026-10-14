@@ -105,7 +105,7 @@ async def make(ctx: Context, out: Outputs, *, gate: str, size: int) -> Result:
     return Result(out.save_bytes(bytes(i % 251 for i in range(size)), media_type="application/octet-stream"))
 
 app = App()
-app.job(make)
+app.job(make, accelerator=False)
 `), 0o600))
 	if out, err := exec.Command("uv", "lock", "--project", project).CombinedOutput(); err != nil {
 		t.Fatalf("locking authored lifecycle fixture: %v\n%s", err, out)

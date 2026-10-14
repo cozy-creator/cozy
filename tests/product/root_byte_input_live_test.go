@@ -137,7 +137,7 @@ async def verify(ctx: Context, *, report: ReportFile, tree: Tree) -> Verified:
     assert (tree.path / "extra.txt").read_text() == msgspec.json.decode(raw)["variant"]
     return Verified(hashlib.sha256(raw).hexdigest(), len(raw))
 app = App()
-app.job(verify)
+app.job(verify, accelerator=False)
 `)
 	must(t, os.WriteFile(filepath.Join(library, "byte_tools.py"), module, 0600))
 	metadata := fmt.Sprintf(`[project]
@@ -163,6 +163,8 @@ only-include=["byte_tools.py"]
 # [tool.uv.sources]
 # cozy-runtime={path=%q}
 # byte-tools={path="./byte_tools",editable=true}
+# [tool.cozy]
+# accelerator = false
 # ///
 import asyncio
 from typing import Annotated

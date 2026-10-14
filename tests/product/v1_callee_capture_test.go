@@ -54,11 +54,11 @@ func TestV1CapturedPackageCallsNestedJobsOnTheRealMachine(t *testing.T) {
 		body := "import msgspec\nfrom cozy_runtime.author import App, Context, invocable\nclass Result(msgspec.Struct, frozen=True):\n    value: int\n"
 		switch node {
 		case "leaf":
-			body += "@invocable(memoize=True)\nasync def compute(ctx: Context, *, value: int) -> Result:\n    return Result(value + 100)\napp=App()\napp.job(compute)\n"
+			body += "@invocable(memoize=True)\nasync def compute(ctx: Context, *, value: int) -> Result:\n    return Result(value + 100)\napp=App()\napp.job(compute, accelerator=False)\n"
 		case "nested":
-			body += "from callee_leaf_proof import compute as leaf\n@invocable(memoize=True)\nasync def compute(ctx: Context, *, value: int) -> Result:\n    result=await leaf(value=value)\n    return Result(result.value * 2)\napp=App()\napp.job(compute)\n"
+			body += "from callee_leaf_proof import compute as leaf\n@invocable(memoize=True)\nasync def compute(ctx: Context, *, value: int) -> Result:\n    result=await leaf(value=value)\n    return Result(result.value * 2)\napp=App()\napp.job(compute, accelerator=False)\n"
 		case "caller":
-			body += "from callee_nested_proof import compute\nclass Input(msgspec.Struct):\n    value: int = 7\napp=App()\n@app.job\nasync def main(payload: Input) -> Result:\n    result=await compute(value=payload.value)\n    return Result(result.value)\n"
+			body += "from callee_nested_proof import compute\nclass Input(msgspec.Struct):\n    value: int = 7\napp=App()\n@app.job(accelerator=False)\nasync def main(payload: Input) -> Result:\n    result=await compute(value=payload.value)\n    return Result(result.value)\n"
 		}
 		must(t, os.WriteFile(filepath.Join(dir, module+".py"), []byte(body), 0o600))
 	}
@@ -142,14 +142,14 @@ func TestACapturedPackageInstallsOnAMachineWhoseRuntimeDiffers(t *testing.T) {
 		module := "skew_" + node
 		dependencies, extra := `"cozy-runtime>=0.18.89", "msgspec>=0.19,<1"`, ""
 		body := "import msgspec\nfrom cozy_runtime.author import App, Context, invocable\napp = App()\nclass Squared(msgspec.Struct):\n    square: int\n" +
-			"@invocable()\nasync def square(ctx: Context, *, value: int) -> Squared:\n    return Squared(value * value)\napp.job(square)\n"
+			"@invocable()\nasync def square(ctx: Context, *, value: int) -> Squared:\n    return Squared(value * value)\napp.job(square, accelerator=False)\n"
 		if node == "caller" {
 			// The lock picks a published Runtime other than the machine's.
 			dependencies += `, "skew-callee>=1.0.0"`
 			extra = fmt.Sprintf("[tool.uv]\nconstraint-dependencies = [\"cozy-runtime!=%s\"]\n[tool.uv.sources]\nskew-callee = {path = \"../callee\"}\n", machine)
 			body = "import msgspec\nfrom cozy_runtime.author import App, Context\nfrom skew_callee import square\napp = App()\n" +
 				"class Survey(msgspec.Struct):\n    values: list[int]\nclass Surveyed(msgspec.Struct):\n    squares: list[int]\n" +
-				"async def survey(ctx: Context, payload: Survey) -> Surveyed:\n    return Surveyed([(await square(value=v)).square for v in payload.values])\napp.job(survey)\n"
+				"async def survey(ctx: Context, payload: Survey) -> Surveyed:\n    return Surveyed([(await square(value=v)).square for v in payload.values])\napp.job(survey, accelerator=False)\n"
 		}
 		metadata := fmt.Sprintf("[project]\nname=%q\nversion=\"1.0.0\"\nrequires-python=\">=3.12,<3.13\"\ndependencies=[%s]\n%s[project.entry-points.\"cozy.application\"]\ndefault=%q\n[build-system]\nrequires=[\"hatchling\"]\nbuild-backend=\"hatchling.build\"\n[tool.hatch.build.targets.wheel]\nonly-include=[%q]\n",
 			"skew-"+node, dependencies, extra, module+":app", module+".py")

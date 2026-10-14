@@ -1,8 +1,6 @@
 package cli
 
 import (
-	"strings"
-
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/inputasset"
 	"github.com/cozy-creator/cozy/internal/launch"
@@ -64,9 +62,12 @@ func (r *Resolver) PrivateRentalNeedsAccelerator(request records.Request) (bool,
 			if (job.Kind != "job" && job.Kind != "entrypoint") || job.Invocable == nil || job.Invocable.Module != binding.Module || job.Invocable.Export != binding.Export {
 				return false, exit.Named(exit.Conflict, "child.export_changed", "captured child has no exact callable for rental sizing")
 			}
-			// The callable's own declaration, else the closure JobsInstall reads; no
-			// package code needs importing again merely to choose a machine class.
-			needed = needed || job.NeedsAccelerator(strings.Split(child.Closure, "\n"))
+			// The callable's own declaration; no package code is imported to choose a machine class.
+			accelerator, problem := job.NeedsAccelerator(child.Package)
+			if problem != nil {
+				return false, problem
+			}
+			needed = needed || accelerator
 			queue = append(queue, binding.ChildInstallID)
 		}
 	}

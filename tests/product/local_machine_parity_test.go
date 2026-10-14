@@ -264,7 +264,7 @@ class AddResult(msgspec.Struct):
 app = App()
 
 
-@app.job
+@app.job(accelerator=False)
 def add(payload: AddRequest) -> AddResult:
     return AddResult(value=payload.value + 1)
 

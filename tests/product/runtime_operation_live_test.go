@@ -78,7 +78,9 @@ only-include=["runtime_quantize_source.py"]
 # dependencies=["cozy-runtime>=%s", "native-quantize-fixture>=1.0.0"]
 # [tool.uv.sources]
 # native-quantize-fixture={path="./library", editable=true}
-%s# ///
+%s# [tool.cozy]
+# accelerator = false
+# ///
 from cozy_runtime.derive.operations import QuantizationPlan, quantize
 from runtime_quantize_source import produce, inspect
 async def main(ctx):
@@ -95,7 +97,9 @@ async def main(ctx):
 # requires-python=">=3.12,<3.13"
 # dependencies=["cozy-runtime>=%s"]
 # [tool.uv.sources]
-%s# ///
+%s# [tool.cozy]
+# accelerator = false
+# ///
 async def main(ctx):
     ctx.log("This script does not quantize")
 `, version, strings.ReplaceAll(runtimeSource, "cozy-runtime =", "# cozy-runtime ="))

@@ -104,13 +104,13 @@ class AddResult(msgspec.Struct):
 app = App()
 
 
-@app.job
+@app.job(accelerator=False)
 def slow(payload: SlowRequest) -> AddResult:
     time.sleep(payload.seconds)
     return AddResult(value=payload.seconds)
 
 
-@app.job
+@app.job(accelerator=False)
 def paced(ctx: Context, payload: SlowRequest) -> AddResult:
     for _ in range(payload.seconds * 20):
         time.sleep(0.05)
@@ -118,7 +118,7 @@ def paced(ctx: Context, payload: SlowRequest) -> AddResult:
     return AddResult(value=payload.seconds)
 
 
-@app.job
+@app.job(accelerator=False)
 def add(payload: AddRequest) -> AddResult:
     return AddResult(value=payload.value + 1)
 `), 0o600))

@@ -56,7 +56,7 @@ class Script(msgspec.Struct):
     gate: str
 class Shown(msgspec.Struct):
     video: Annotated[FileAsset, AssetBound(media_types=("video/mp4",))]
-@app.job(emits_media=True)
+@app.job(emits_media=True, accelerator=False)
 def script(ctx: Context, payload: Script, out: Outputs) -> Shown:
     """step-<k>.json: {op: append|replace|end, file, duration_us}. done-<k> once published."""
     gate, parts = Path(payload.gate), out._attempt.spool / "parts"

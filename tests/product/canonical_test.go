@@ -187,28 +187,23 @@ func TestPackageInterface(t *testing.T) {
 		}
 	}
 
-	// Model inputs are not hardware facts: this job could transform their TensorFS bytes on
-	// CPU. The immutable release dependency set selects the machine class instead.
-	gpuRaw := []byte(`{"application":"h3:tools","entrypoints":[],"format":"cozy.package.interface/1","jobs":[{"models":[{"class":"H3Dits","component_use":{},"path":"four_lane.models.dits"}],"name":"four_lane","publishes":false,"request":{"fields":[]},"result":{"fields":[]}}]}`)
+	// Model inputs and dependencies are not hardware facts: a job runs where its declared
+	// accelerator says, and an undeclared one refuses before any machine is chosen.
+	gpuRaw := []byte(`{"application":"h3:tools","entrypoints":[],"format":"cozy.package.interface/1","jobs":[{"accelerator":true,"models":[{"class":"H3Dits","component_use":{},"path":"four_lane.models.dits"}],"name":"four_lane","publishes":false,"request":{"fields":[]},"result":{"fields":[]}}]}`)
 	gpuDescriptor, problem := launch.DecodePackageInterface(gpuRaw)
 	fatal(t, problem)
-	_, problem = gpuDescriptor.Function("four_lane")
+	gpuJob, problem := gpuDescriptor.Function("four_lane")
 	fatal(t, problem)
-	if launch.AcceleratorRequired([]string{
-		"cozy-jobs==0.0.14", "cozy-runtime<1.0.0,>=0.0.34",
-	}) {
-		t.Fatal("the SDXL TensorFS/NumPy release selected accelerator capacity")
+	if gpu, problem := gpuJob.NeedsAccelerator("h3/tools"); problem != nil || !gpu {
+		t.Fatalf("a job declaring accelerator=True runs on a GPU, got %v %v", gpu, problem)
 	}
 	cpuRaw := []byte(`{"application":"probe:app","entrypoints":[],"format":"cozy.package.interface/1","jobs":[{"name":"scan","publishes":false,"request":{"fields":[]},"result":{"fields":[]}}]}`)
 	cpuDescriptor, problem := launch.DecodePackageInterface(cpuRaw)
 	fatal(t, problem)
-	_, problem = cpuDescriptor.Function("scan")
+	undeclared, problem := cpuDescriptor.Function("scan")
 	fatal(t, problem)
-	if !launch.AcceleratorRequired([]string{
-		"cozy-jobs==0.0.13", "cozy-runtime<1.0.0,>=0.0.33", "msgspec>=0.19",
-		"numpy>=1.26", "torch<3,>=2.13",
-	}) {
-		t.Fatal("the H3 release's exact torch requirement did not select accelerator capacity")
+	if _, problem := undeclared.NeedsAccelerator("probe/probe"); problem == nil || problem.Name != "package.job_accelerator_undeclared" {
+		t.Fatalf("an undeclared job was given a machine class: %v", problem)
 	}
 	// Author-supplied resources are not a fact this host reads: machine class comes from
 	// the release dependency set, so the member is ignored rather than honoured or refused.

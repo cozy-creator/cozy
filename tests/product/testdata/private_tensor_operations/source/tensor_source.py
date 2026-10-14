@@ -27,4 +27,4 @@ async def compute(ctx: Context, *, value: int) -> ModelArtifact:
 
 
 app = App()
-app.job(compute, weights=(WeightsOutput("weights", max_new_bytes=4096),))
+app.job(compute, weights=(WeightsOutput("weights", max_new_bytes=4096),), accelerator=False)
