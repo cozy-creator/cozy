@@ -592,7 +592,10 @@ Human progress is automatic with `--await`; no separate progress flag is needed.
 redraws in place (the run, finished stages with their durations, each active stage's bar) and
 settles to one record; piped or with `TERM=dumb` it appends plain lines. `NO_COLOR` drops color.
 A model download is its own line with its bytes, rate and time, and a step held for weights is
-timed without the wait; `cozy run show` lists every download, prefetches included.
+timed without the wait; `cozy run show` lists every download, prefetches included, and each
+run's and call's device memory: torch's peaks (whole and per stage), the executor process at the
+end (context, torch, weights, budget, cap), weights paged in and given back, allocator cache drops
+and OOMs, and a refused stage's shortfall (`--json`: `memory`).
 Model overrides accept `--model.<param>=org/model@release/lane` after the target;
 the existing `model.<param>=...` payload spelling has the same meaning.
 Without an override, Cozy uses the owner's Tensorhub binding, then the selected function's
@@ -659,6 +662,7 @@ cozy rental list --ended           # the ended ones only
 cozy rental show otter             # one rental's facts, including accrued spend, ended or not
 cozy rental logs otter -f          # operators (Tensorhub admins): the boot log, followed while it boots
 cozy rental logs otter --tensorfs  # TensorFS's transport decisions: hedges, lane grants, wins, pull walks
+cozy rental logs otter --memory    # TensorD's GPU memory decisions: caps, floors, placements, sheds
 cozy run org/package/generate --rental=otter prompt="moonlit lake"
 cozy rental end otter
 ```
@@ -740,6 +744,7 @@ These commands have deliberately different scopes:
 ```sh
 cozy machine stop # stop this computer's machine and free its GPU; `cozy machine start` or the next run starts it
 cozy machine logs --tensorfs # this computer's TensorFS transport decisions
+cozy machine logs --memory   # this computer's GPU memory decisions
 cozy down         # stop Calcifer; runs, uploads and rentals continue
 cozy down --all   # cancel all work, end all rentals, then stop Calcifer
 ```

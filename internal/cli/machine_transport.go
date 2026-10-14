@@ -146,7 +146,7 @@ func originKey(origin string) string {
 
 // machineLogs maps the log names clients use to the logs machines keep: the name
 // cozy.machine.v1 Read takes, and worker.v1's.
-var machineLogs = map[string]struct{ name string }{"tensorfs": {"tensorfs-transport"}}
+var machineLogs = map[string]struct{ name string }{"tensorfs": {"tensorfs-transport"}, "memory": {"memory"}}
 
 // MachineLog reads one log a machine keeps, with Read.
 func (m *machineRuns) MachineLog(ctx context.Context, machine, log string, tailBytes uint64) (api.MachineLog, *exit.Error) {

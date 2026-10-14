@@ -1,0 +1,337 @@
+{
+ "measurements": {
+  "attribution": {
+   "folded_names": 0,
+   "method": "perf_counter deltas accumulated in place: count/total/min/max/first/last and wall bounds per named span; step tracks keep up to 512 [end_unix_ms, ms] points",
+   "stages": {
+    "decode": {
+     "count": 1,
+     "ended_unix_ms": 1792004431860,
+     "first_ms": 385.045,
+     "last_ms": 385.045,
+     "max_ms": 385.045,
+     "mean_ms": 385.045,
+     "min_ms": 385.045,
+     "started_unix_ms": 1792004431475,
+     "total_ms": 385.045
+    },
+    "denoise": {
+     "count": 1,
+     "ended_unix_ms": 1792004431447,
+     "first_ms": 5581.3,
+     "last_ms": 5581.3,
+     "max_ms": 5581.3,
+     "mean_ms": 5581.3,
+     "min_ms": 5581.3,
+     "started_unix_ms": 1792004425866,
+     "total_ms": 5581.3
+    },
+    "encode": {
+     "count": 1,
+     "ended_unix_ms": 1792004425859,
+     "first_ms": 94.249,
+     "last_ms": 94.249,
+     "max_ms": 94.249,
+     "mean_ms": 94.249,
+     "min_ms": 94.249,
+     "started_unix_ms": 1792004425764,
+     "total_ms": 94.249
+    },
+    "encode_webp": {
+     "count": 1,
+     "ended_unix_ms": 1792004431865,
+     "first_ms": 0.791,
+     "last_ms": 0.791,
+     "max_ms": 0.791,
+     "mean_ms": 0.791,
+     "min_ms": 0.791,
+     "started_unix_ms": 1792004431864,
+     "total_ms": 0.791
+    },
+    "loading weights": {
+     "count": 2,
+     "ended_unix_ms": 1792004431504,
+     "first_ms": 79.223,
+     "last_ms": 26.699,
+     "max_ms": 79.223,
+     "mean_ms": 52.961,
+     "min_ms": 26.699,
+     "started_unix_ms": 1792004425712,
+     "total_ms": 105.922
+    },
+    "tokenize": {
+     "count": 1,
+     "ended_unix_ms": 1792004425685,
+     "first_ms": 1.33,
+     "last_ms": 1.33,
+     "max_ms": 1.33,
+     "mean_ms": 1.33,
+     "min_ms": 1.33,
+     "started_unix_ms": 1792004425684,
+     "total_ms": 1.33
+    }
+   },
+   "steps": {
+    "denoise": {
+     "count": 20,
+     "ended_unix_ms": 1792004431327,
+     "first_ms": 289.196,
+     "last_ms": 277.598,
+     "max_ms": 332.506,
+     "mean_ms": 273.138,
+     "min_ms": 157.901,
+     "series": [
+      [
+       1792004426153,
+       289.196
+      ],
+      [
+       1792004426311,
+       157.901
+      ],
+      [
+       1792004426585,
+       273.382
+      ],
+      [
+       1792004426857,
+       272.882
+      ],
+      [
+       1792004427131,
+       273.075
+      ],
+      [
+       1792004427404,
+       273.337
+      ],
+      [
+       1792004427677,
+       273.232
+      ],
+      [
+       1792004427950,
+       273.315
+      ],
+      [
+       1792004428224,
+       273.289
+      ],
+      [
+       1792004428497,
+       273.763
+      ],
+      [
+       1792004428830,
+       332.506
+      ],
+      [
+       1792004429108,
+       277.789
+      ],
+      [
+       1792004429385,
+       277.192
+      ],
+      [
+       1792004429663,
+       277.53
+      ],
+      [
+       1792004429940,
+       277.116
+      ],
+      [
+       1792004430217,
+       277.32
+      ],
+      [
+       1792004430495,
+       277.636
+      ],
+      [
+       1792004430772,
+       277.392
+      ],
+      [
+       1792004431049,
+       277.315
+      ],
+      [
+       1792004431327,
+       277.598
+      ]
+     ],
+     "series_dropped": 0,
+     "started_unix_ms": 1792004425864,
+     "total_ms": 5462.769
+    }
+   }
+  },
+  "execution": {
+   "construction": {
+    "fill_ms": 0.0,
+    "legs_ms": {
+     "admission": 0.0,
+     "attention_pin": 23.4,
+     "backend_ctor": 338.5,
+     "checkpoint_headers": 77.9,
+     "construct.census": 89.2,
+     "construct.factory": 624.1,
+     "construct.fill": 1642.1,
+     "construct.fit": 38.6,
+     "construct_and_register": 2593.8,
+     "construction_config": 1.2,
+     "cuda_init": 0.0,
+     "execution_plan": 0.0,
+     "install": 127.8,
+     "lease_acquire": 22.6,
+     "measure_device": 95.8,
+     "package_import": 0.0,
+     "qualify": 2322.4,
+     "resolve": 322.8,
+     "runtime_imports": 0.2,
+     "torch_import": 0.1
+    },
+    "prepare_ms": 5938.51,
+    "prepared_unix_ms": 1792004398381,
+    "warm_ms": 0.0
+   },
+   "degree": 1,
+   "executor": {
+    "legs_ms": {
+     "cuda_init": 1636.6,
+     "fork": 254.8,
+     "package_import": 26619.6,
+     "package_warmup": 0.1,
+     "runtime_imports": 81.6,
+     "torch_import": 5712.6
+    },
+    "ms": 1636.7,
+    "started_unix_ms": 1792004390795
+   },
+   "ranks": [
+    {
+     "arch": "sm_89",
+     "attention": {
+      "impl": "efficient+flash",
+      "kernels": [
+       {
+        "kernel": "sdpa",
+        "line": "ready",
+        "served": true,
+        "state": "ready"
+       }
+      ],
+      "observed": "sdpa",
+      "requested": ""
+     },
+     "end_us": 1792004431871226,
+     "ordinal": 0,
+     "pid": 1218,
+     "rank": 0,
+     "start_us": 1792004425672323,
+     "uuid": "GPU-250df676-69f4-01be-ad0b-31f7b5fbdc2a"
+    }
+   ],
+   "spread": {}
+  },
+  "memory": {
+   "activation_peak_bytes": 486574592,
+   "alloc_ooms": 0,
+   "alloc_retries": 0,
+   "bounce_bytes": 0,
+   "budget_bytes": 6479544320,
+   "cache_released_bytes": 1113587712,
+   "cache_releases": 1,
+   "cap_bytes": 8102739968,
+   "context_bytes": 243269632,
+   "disk_bytes": 837099784,
+   "evictions": 42,
+   "modes": {
+    "vae.decode": "chunked 32"
+   },
+   "oom_retries": 0,
+   "paged_in_bytes": 837099784,
+   "paged_out": 0,
+   "paged_out_bytes": 0,
+   "peak_allocated_bytes": 1295620608,
+   "peak_reserved_bytes": 1314914304,
+   "process_bytes": 6903824384,
+   "register_failed": 0,
+   "reserved_bytes": 203423744,
+   "shortfall": null,
+   "stage_peaks": {
+    "decode": 1304070656,
+    "denoise": 486574592,
+    "encode": 194902016
+   },
+   "weights_bytes": 6457131008
+  },
+  "observations": [
+   {
+    "at_unix_ms": 1792004431868,
+    "attempt_key": "2",
+    "fields": {
+     "component": "model/unet",
+     "dense_reference": "",
+     "pin": "",
+     "sites": 140
+    },
+    "kind": "confession",
+    "name": "attention.selected",
+    "seq": 19,
+    "value": "sdpa"
+   },
+   {
+    "at_unix_ms": 1792004431868,
+    "attempt_key": "2",
+    "fields": {
+     "component": "model/vae",
+     "dense_reference": "",
+     "pin": "",
+     "sites": 2
+    },
+    "kind": "confession",
+    "name": "attention.selected",
+    "seq": 20,
+    "value": "sdpa"
+   },
+   {
+    "at_unix_ms": 1792004431868,
+    "attempt_key": "2",
+    "fields": {
+     "component": "model/unet",
+     "dense_reference": "",
+     "pin": "",
+     "sites": 140
+    },
+    "kind": "confession",
+    "name": "attention.restored",
+    "seq": 21,
+    "value": "sdpa"
+   },
+   {
+    "at_unix_ms": 1792004431868,
+    "attempt_key": "2",
+    "fields": {
+     "component": "model/vae",
+     "dense_reference": "",
+     "pin": "",
+     "sites": 2
+    },
+    "kind": "confession",
+    "name": "attention.restored",
+    "seq": 22,
+    "value": "sdpa"
+   }
+  ],
+  "software": {
+   "attempt_ordinal": 1,
+   "runtime": "0.23.37+dev.hecf0aab01931f3e11f511ff45e30b6cb9e523122413585c482e689fa624ae2e2",
+   "tensord": "0.5.29",
+   "tensord_commit": "9182be51d21893715e02855e5afb604614b3e247",
+   "tensorfs": "0.6.1"
+  }
+ }
+}

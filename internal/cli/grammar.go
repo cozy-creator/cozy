@@ -118,11 +118,12 @@ func (c *MachineStopCmd) Run(r *Runtime) error {
 }
 
 type MachineLogsCmd struct {
-	TensorFS bool `name:"tensorfs" help:"TensorFS's transport decisions: one line per hedge, lane grant, win and pull walk."`
+	TensorFS bool `name:"tensorfs" xor:"log" help:"TensorFS's transport decisions: one line per hedge, lane grant, win and pull walk."`
+	Memory   bool `name:"memory" xor:"log" help:"TensorD's GPU memory decisions: caps, floors, placements, sheds and estimates."`
 }
 
 func (c *MachineLogsCmd) Run(r *Runtime) error {
-	return r.call(handleMachineLogs, nil, bools("--tensorfs", c.TensorFS), nil, false)
+	return r.call(handleMachineLogs, nil, bools("--tensorfs", c.TensorFS, "--memory", c.Memory), nil, false)
 }
 
 type CalciferCmd struct {
@@ -645,7 +646,7 @@ type RentalCmd struct {
 	SSHInfo     RentalSSHInfoCmd     `cmd:"" name:"ssh-info" help:"Read the current SSH endpoint of an attached development rental."`
 	List        RentalListCmd        `cmd:"" help:"List rented machines, live on a terminal."`
 	Show        RentalShowCmd        `cmd:"" help:"Show one rental: state, rate, accrued spend and every other fact."`
-	Logs        RentalLogsCmd        `cmd:"" help:"Print the provider's boot log of a rental's attempt (operators only: Tensorhub admins), or with --tensorfs its machine's TensorFS log."`
+	Logs        RentalLogsCmd        `cmd:"" help:"Print the provider's boot log of a rental's attempt (operators only: Tensorhub admins), or with --tensorfs or --memory its machine's own log."`
 	New         RentalNewCmd         `cmd:"" help:"Start a private rental, or list available machine types."`
 	End         RentalEndCmd         `cmd:"" help:"End a private rental and stop billing."`
 	EndExternal RentalEndExternalCmd `cmd:"" name:"end-external" hidden:"" help:"Operator tooling: destroy an explicitly identified Vast instance that has no Hub rental record."`
@@ -747,7 +748,8 @@ type RentalLogsCmd struct {
 	Rental   string `arg:"" name:"rental" predictor:"rental" help:"Rental machine name or id."`
 	Follow   bool   `short:"f" help:"Operators: keep printing the boot log while the rental boots, onto any attempt a replan starts."`
 	Attempt  int    `help:"Operators: the boot attempt number, from 1; default the latest."`
-	TensorFS bool   `name:"tensorfs" help:"Print the rental machine's TensorFS transport decisions instead: one line per hedge, lane grant, win and pull walk."`
+	TensorFS bool   `name:"tensorfs" xor:"log" help:"Print the rental machine's TensorFS transport decisions instead: one line per hedge, lane grant, win and pull walk."`
+	Memory   bool   `name:"memory" xor:"log" help:"Print the rental machine's GPU memory decisions instead: caps, floors, placements, sheds and estimates."`
 }
 
 func (c *RentalLogsCmd) Run(r *Runtime) error {
@@ -755,7 +757,7 @@ func (c *RentalLogsCmd) Run(r *Runtime) error {
 	if c.Attempt != 0 {
 		attempt = intText(c.Attempt)
 	}
-	return r.call(handleRentalLogs, []string{c.Rental}, bools("--follow", c.Follow, "--tensorfs", c.TensorFS), values("--attempt", attempt), false)
+	return r.call(handleRentalLogs, []string{c.Rental}, bools("--follow", c.Follow, "--tensorfs", c.TensorFS, "--memory", c.Memory), values("--attempt", attempt), false)
 }
 
 type UpCmd struct{}

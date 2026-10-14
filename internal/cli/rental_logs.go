@@ -19,7 +19,8 @@ import (
 // handleRentalLogs is `cozy rental logs <rental>`: for an operator (a Tensorhub admin), every
 // line the provider logged while the rental's latest (or --attempt) attempt booted, kept by its
 // Hub after the pod is gone. -f follows a rental still coming up, onto each attempt a replan
-// starts, until it is up or over. --tensorfs reads the machine's own log, for any renter.
+// starts, until it is up or over. --tensorfs and --memory read the machine's own logs, for any
+// renter.
 func handleRentalLogs(ctx *Context) *exit.Error {
 	attempt := 0
 	if text := ctx.Inv.Value("--attempt"); text != "" {
@@ -34,11 +35,12 @@ func handleRentalLogs(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	if ctx.Inv.Bool("--tensorfs") {
+	if ctx.Inv.Bool("--tensorfs") || ctx.Inv.Bool("--memory") {
 		if ctx.Inv.Bool("--follow") || attempt != 0 {
-			return exit.Usagef("--tensorfs reads the machine's own log; --follow and --attempt read the provider's boot log")
+			return exit.Usagef("--tensorfs and --memory read the machine's own log; --follow and --attempt read the provider's boot log")
 		}
-		return printMachineLog(ctx, id, "rental "+subject)
+		name, _ := machineLogName(ctx)
+		return printMachineLog(ctx, id, name, "rental "+subject)
 	}
 	hubClient := client(ctx.forHub(origin))
 	interrupt := make(chan os.Signal, 1)
