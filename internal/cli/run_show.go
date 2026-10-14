@@ -32,14 +32,15 @@ type runReport struct {
 	Release   string `json:"release,omitempty"`
 	Machine   string `json:"machine,omitempty"`
 	// Runtime is the cozy-runtime (and TensorFS) the run's own executor loaded.
-	Runtime        string `json:"runtime,omitempty"`
-	CreatedAt      string `json:"created_at"`
-	QueuedMS       int64  `json:"queued_ms"`
-	ExecutionMS    *int64 `json:"execution_ms"`
-	ExecutionKnown bool   `json:"execution_known"`
-	AttemptWallMS  int64  `json:"attempt_wall_ms,omitempty"`
-	WallMS         int64  `json:"wall_ms,omitempty"`
-	Waiting        string `json:"waiting,omitempty"`
+	Runtime        string             `json:"runtime,omitempty"`
+	Software       *executionSoftware `json:"software,omitempty"`
+	CreatedAt      string             `json:"created_at"`
+	QueuedMS       int64              `json:"queued_ms"`
+	ExecutionMS    *int64             `json:"execution_ms"`
+	ExecutionKnown bool               `json:"execution_known"`
+	AttemptWallMS  int64              `json:"attempt_wall_ms,omitempty"`
+	WallMS         int64              `json:"wall_ms,omitempty"`
+	Waiting        string             `json:"waiting,omitempty"`
 	// Allocation is the run's own GPU allocation while it runs: held (on GPUs), waiting, released.
 	Allocation *records.GPUAllocation `json:"allocation,omitempty"`
 	ErrorType  string                 `json:"error_type,omitempty"`
@@ -104,26 +105,27 @@ type reportCall struct {
 	callTiming
 	Phase       string `json:"phase,omitempty"`
 	timingAt    int64
-	Number      int           `json:"number"` // its place in the run's call order, from 1
-	Request     string        `json:"request"`
-	Parent      string        `json:"parent,omitempty"`
-	Index       int           `json:"index"` // its index among its parent's calls
-	Attempt     int64         `json:"attempt,omitempty"`
-	Module      string        `json:"module,omitempty"`
-	Function    string        `json:"function,omitempty"`
-	Label       string        `json:"label,omitempty"`
-	Status      string        `json:"status,omitempty"`      // empty until Runtime records it settled
-	Memoized    bool          `json:"memoized,omitempty"`    // answered from a result its machine held; nothing ran
-	Computation string        `json:"computation,omitempty"` // a memoized call's computation, ran or answered
-	Unmemoized  string        `json:"unmemoized,omitempty"`  // why a memoizable call was neither looked up nor held
-	Error       string        `json:"error,omitempty"`
-	ErrorCode   string        `json:"error_code,omitempty"`
-	Runtime     string        `json:"runtime,omitempty"` // the SDK its executor loaded
-	GPUs        []reportGPU   `json:"gpus,omitempty"`    // its grants' cards, then its execution's records
-	StartUnixMS int64         `json:"start_unix_ms,omitempty"`
-	MS          float64       `json:"ms"`
-	Stages      []reportStage `json:"stages"`
-	Steps       []reportSteps `json:"steps,omitempty"`
+	Number      int                `json:"number"` // its place in the run's call order, from 1
+	Request     string             `json:"request"`
+	Parent      string             `json:"parent,omitempty"`
+	Index       int                `json:"index"` // its index among its parent's calls
+	Attempt     int64              `json:"attempt,omitempty"`
+	Module      string             `json:"module,omitempty"`
+	Function    string             `json:"function,omitempty"`
+	Label       string             `json:"label,omitempty"`
+	Status      string             `json:"status,omitempty"`      // empty until Runtime records it settled
+	Memoized    bool               `json:"memoized,omitempty"`    // answered from a result its machine held; nothing ran
+	Computation string             `json:"computation,omitempty"` // a memoized call's computation, ran or answered
+	Unmemoized  string             `json:"unmemoized,omitempty"`  // why a memoizable call was neither looked up nor held
+	Error       string             `json:"error,omitempty"`
+	ErrorCode   string             `json:"error_code,omitempty"`
+	Runtime     string             `json:"runtime,omitempty"` // the SDK its executor loaded
+	Software    *executionSoftware `json:"software,omitempty"`
+	GPUs        []reportGPU        `json:"gpus,omitempty"` // its grants' cards, then its execution's records
+	StartUnixMS int64              `json:"start_unix_ms,omitempty"`
+	MS          float64            `json:"ms"`
+	Stages      []reportStage      `json:"stages"`
+	Steps       []reportSteps      `json:"steps,omitempty"`
 	// Transport is how its GPUs exchanged data: Runtime's record, kept whole.
 	Transport json.RawMessage `json:"transport,omitempty"`
 
@@ -232,7 +234,9 @@ type triageSetup struct {
 }
 
 type triageEvidence struct {
+	Software     json.RawMessage `json:"software"`
 	Measurements struct {
+		Software    json.RawMessage `json:"software"`
 		Attribution struct {
 			Stages map[string]triageTrack `json:"stages"`
 			Steps  map[string]triageTrack `json:"steps"`
@@ -240,6 +244,41 @@ type triageEvidence struct {
 		Execution    executionRecord `json:"execution"`
 		Observations []observation   `json:"observations"`
 	} `json:"measurements"`
+}
+
+// executionSoftware is one attempt's captured software, including an executor's SDK fallback.
+// Optional provenance is read separately so an unfamiliar field never hides other evidence.
+type executionSoftware struct {
+	AttemptOrdinal int64  `json:"attempt_ordinal,omitempty"`
+	TensorD        string `json:"tensord,omitempty"`
+	TensorDCommit  string `json:"tensord_commit,omitempty"`
+	Runtime        string `json:"runtime,omitempty"`
+	TensorFS       string `json:"tensorfs,omitempty"`
+}
+
+func readExecutionSoftware(raw json.RawMessage) *executionSoftware {
+	var software executionSoftware
+	if json.Unmarshal(raw, &software) != nil || (software.TensorD == "" && software.Runtime == "" && software.TensorFS == "") {
+		return nil
+	}
+	return &software
+}
+
+func (s executionSoftware) String() string {
+	var parts []string
+	if s.TensorD != "" {
+		agent := "TensorD " + s.TensorD
+		if s.TensorDCommit != "" {
+			agent += " (" + clip(s.TensorDCommit, 12) + ")"
+		}
+		parts = append(parts, agent)
+	}
+	if s.Runtime != "" {
+		parts = append(parts, executorEvent{Runtime: s.Runtime, TensorFS: s.TensorFS}.String())
+	} else if s.TensorFS != "" {
+		parts = append(parts, "tensorfs "+s.TensorFS)
+	}
+	return strings.Join(parts, " · ")
 }
 
 // executionRecord is Runtime's record of one attempt's execution: a run's, or a call's.
@@ -457,6 +496,7 @@ type callEvent struct {
 	// field there never hides the call.
 	Execution    json.RawMessage `json:"execution"`
 	Observations json.RawMessage `json:"observations"`
+	Software     json.RawMessage `json:"software"`
 }
 
 func handleRunShow(ctx *Context) *exit.Error {
@@ -610,6 +650,7 @@ func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
 			c.Parent, c.Index, c.Attempt, c.Module, c.Function = record.Parent, record.Index, record.Attempt, record.Module, record.Export
 			c.Label, c.Status, c.Error, c.ErrorCode = record.Label, record.Status, record.Error, record.ErrorCode
 			c.Memoized, c.Computation, c.Unmemoized = record.Memoized, record.Computation, record.Unmemoized
+			c.Software = readExecutionSoftware(record.Software)
 			c.StartUnixMS = record.CalledUnixMS
 			c.MS = float64(at.UnixMilli() - record.CalledUnixMS)
 			c.callTiming = record.callTiming
@@ -741,6 +782,13 @@ func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
 	}
 	var triage triageEvidence
 	if len(evidence.Triage) > 0 && json.Unmarshal(evidence.Triage, &triage) == nil {
+		report.Software = readExecutionSoftware(triage.Measurements.Software)
+		if report.Software == nil {
+			report.Software = readExecutionSoftware(triage.Software)
+		}
+		if report.Software != nil && report.Software.Runtime != "" {
+			report.Runtime = executorEvent{Runtime: report.Software.Runtime, TensorFS: report.Software.TensorFS}.String()
+		}
 		execution := triage.Measurements.Execution
 		report.Degree, report.GPUs = execution.Degree, execution.gpus(triage.Measurements.Observations)
 		report.Transport = execution.Transport
@@ -760,6 +808,14 @@ func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
 	}
 	sortStages(report.Stages)
 	for _, c := range calls {
+		if c.Software != nil {
+			if c.Software.AttemptOrdinal > 0 {
+				c.Attempt = c.Software.AttemptOrdinal
+			}
+			if c.Software.Runtime != "" {
+				c.Runtime = executorEvent{Runtime: c.Software.Runtime, TensorFS: c.Software.TensorFS}.String()
+			}
+		}
 		// A call's own timeline reads in the order it happened.
 		c.Stages = append(c.Stages, c.timed...)
 		sort.SliceStable(c.Stages, func(i, j int) bool { return c.Stages[i].StartUnixMS < c.Stages[j].StartUnixMS })
@@ -788,6 +844,7 @@ func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
 			status = "succeeded" // a call's status is Runtime's word, as its calls' rows say it
 		}
 		root := reportCall{Request: life.RequestID, Module: life.Package, Function: life.Function, Label: "this run",
+			Runtime: report.Runtime, Software: report.Software,
 			Status: status, GPUs: report.GPUs, Transport: report.Transport, StartUnixMS: started.UnixMilli(), MS: float64(life.ExecutionMS),
 			Steps: report.Steps, Stages: []reportStage{},
 			Memoized: report.Memoized, Computation: report.Computation, Unmemoized: report.Unmemoized}
@@ -1057,7 +1114,9 @@ func (r runReport) Emit(w io.Writer, mode output.Mode) error {
 	if r.Machine != "" {
 		fmt.Fprintf(w, "  on %s", r.Machine)
 	}
-	if r.Runtime != "" {
+	if r.Software != nil {
+		fmt.Fprintf(w, "  %s", r.Software.String())
+	} else if r.Runtime != "" {
 		fmt.Fprintf(w, "  %s", r.Runtime)
 	}
 	if r.Waiting != "" {
@@ -1211,7 +1270,9 @@ func (c reportCall) emit(w io.Writer, table *tabwriter.Writer, calls int, offset
 	if len(c.GPUs) > 0 {
 		fmt.Fprintf(w, " · GPUs %s", gpuList(c.GPUs))
 	}
-	if c.Runtime != "" {
+	if c.Software != nil {
+		fmt.Fprintf(w, " · %s", c.Software.String())
+	} else if c.Runtime != "" {
 		fmt.Fprintf(w, " · %s", c.Runtime)
 	}
 	fmt.Fprintln(w)
