@@ -128,15 +128,15 @@ fn keyed(name: &str, prefix: &str, length: usize) -> bool {
 
 /// Only this layout's environments leave. Unknown entries in a package home are preserved.
 fn collect_environments(home: &Path, named: &HashSet<PathBuf>) -> usize {
-    let mut kept = 0;
+    let root = fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+    // A named but missing environment still retains its source for recovery.
+    let kept = named.iter().filter(|env| env.parent() == Some(root.as_path())).count();
     for entry in fs::read_dir(home).into_iter().flatten().flatten() {
         let path = entry.path();
         if !keyed(&entry.file_name().to_string_lossy(), "env-", 16) || !path.is_dir() {
             continue;
         }
-        if named.contains(&fs::canonicalize(&path).unwrap_or_else(|_| path.clone())) {
-            kept += 1;
-        } else {
+        if !named.contains(&fs::canonicalize(&path).unwrap_or_else(|_| path.clone())) {
             let _ = fs::remove_dir_all(&path);
             let _ = fs::remove_file(path.with_extension("constraints.txt"));
             let _ = fs::remove_dir_all(path.with_extension("wheels"));
@@ -771,6 +771,10 @@ mod tests {
         assert!(!first_home.exists());
         assert!(second_home.is_dir());
         assert_eq!(fs::read_to_string(home.join("unknown-owner/work")).unwrap(), "preserve");
+        let second_env = fs::read_link(m.installer.generations.join(&edited.generation).join("env")).unwrap();
+        fs::remove_dir_all(second_env).unwrap();
+        sources.collect("alice", "local/tensord-cpu-input");
+        assert!(second_home.join("tree/cpu_input/__init__.py").is_file(), "a named generation retains source even if its environment is missing");
         let _ = fs::remove_dir_all(m.root);
     }
 
