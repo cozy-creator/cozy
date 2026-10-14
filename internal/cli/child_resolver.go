@@ -63,11 +63,7 @@ func (r *Resolver) PrivateRentalNeedsAccelerator(request records.Request) (bool,
 				return false, exit.Named(exit.Conflict, "child.export_changed", "captured child has no exact callable for rental sizing")
 			}
 			// The callable's own declaration; no package code is imported to choose a machine class.
-			accelerator, problem := job.NeedsAccelerator(child.Package)
-			if problem != nil {
-				return false, problem
-			}
-			needed = needed || accelerator
+			needed = needed || job.NeedsAccelerator()
 			queue = append(queue, binding.ChildInstallID)
 		}
 	}

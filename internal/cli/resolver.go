@@ -294,10 +294,6 @@ func (r *Resolver) ResolveRemoteRelease(origin, pkg, release, function string,
 	if problem != nil {
 		return empty, nil, problem
 	}
-	accelerator, problem := entrypoint.NeedsAccelerator(pkg)
-	if problem != nil {
-		return empty, nil, problem
-	}
 	models = append([]orchestrator.ModelRef(nil), models...)
 	sort.Slice(models, func(i, j int) bool { return models[i].Slot < models[j].Slot })
 	if choices(models) || len(capturedModelChoices(models)) > 0 {
@@ -319,7 +315,7 @@ func (r *Resolver) ResolveRemoteRelease(origin, pkg, release, function string,
 		}
 		return orchestrator.LogicalPackage{Package: pkg, Release: release, Function: function,
 			Outputs: launch.OutputSlots(entrypoint.Result), Models: models,
-			NeedsAccelerator: accelerator}, entrypoint, nil
+			NeedsAccelerator: entrypoint.NeedsAccelerator()}, entrypoint, nil
 	}
 	if len(models) != len(entrypoint.Models) {
 		return empty, nil, exit.Named(exit.Validation, "rental.model_selection_incomplete",
@@ -399,7 +395,7 @@ func (r *Resolver) ResolveRemoteRelease(origin, pkg, release, function string,
 	return orchestrator.LogicalPackage{
 		Package: pkg, Release: release,
 		Function: function, Outputs: launch.OutputSlots(entrypoint.Result), PlanID: planID,
-		Models: models, NeedsAccelerator: accelerator,
+		Models: models, NeedsAccelerator: entrypoint.NeedsAccelerator(),
 	}, entrypoint, nil
 }
 
@@ -438,10 +434,6 @@ func (r *Resolver) ResolveRemoteJob(origin, pkg, release, function string,
 	if job.Kind != "job" || job.DescriptorID == "" {
 		return empty, nil, exit.Named(exit.Validation, "rental.job_descriptor_invalid",
 			"%s is not a published job callable", function)
-	}
-	accelerator, problem := job.NeedsAccelerator(pkg)
-	if problem != nil {
-		return empty, nil, problem
 	}
 	models = append([]orchestrator.ModelRef(nil), models...)
 	sort.Slice(models, func(i, j int) bool { return models[i].Slot < models[j].Slot })
@@ -511,7 +503,7 @@ func (r *Resolver) ResolveRemoteJob(origin, pkg, release, function string,
 	return orchestrator.LogicalJob{
 		Package: pkg, Release: release,
 		Function: function, DescriptorID: job.DescriptorID, Outputs: outputs,
-		WeightsOutputs: weights, NeedsAccelerator: accelerator, Models: models,
+		WeightsOutputs: weights, NeedsAccelerator: job.NeedsAccelerator(), Models: models,
 		ProducerParams: params,
 	}, job, nil
 }
@@ -543,7 +535,7 @@ func (r *Resolver) releaseInterface(origin string, ref hub.Ref, release string) 
 }
 
 func (r *Resolver) Entrypoint(installID, name string) (*launch.Entrypoint, bool, *exit.Error) {
-	install, packageInterface, problem := r.installPackageInterface(installID)
+	_, packageInterface, problem := r.installPackageInterface(installID)
 	if problem != nil {
 		return nil, false, problem
 	}
@@ -551,8 +543,7 @@ func (r *Resolver) Entrypoint(installID, name string) (*launch.Entrypoint, bool,
 	if problem != nil {
 		return nil, false, problem
 	}
-	accelerator, problem := entrypoint.NeedsAccelerator(install.Package)
-	return entrypoint, accelerator, problem
+	return entrypoint, entrypoint.NeedsAccelerator(), nil
 }
 
 func (r *Resolver) installRecord(installID string) (*records.PackageInstall, *exit.Error) {

@@ -71,9 +71,6 @@ func runModelCatalog(t *testing.T, configure ...func(*http.ServeMux, *hub.Packag
 		}
 		_ = json.NewEncoder(w).Encode(resolution)
 	})
-	mux.HandleFunc("GET /v1/rental-skus", func(w http.ResponseWriter, _ *http.Request) {
-		_ = json.NewEncoder(w).Encode(hub.RentalProducts([]hub.RentalSKU{{Name: "cpu", AcceleratorModel: "CPU", AcceleratorCount: 1, PriceUSDMicrosPerHour: 100_000, BaseWorkerProfile: "python3.12-cpu-linux-x86"}}))
-	})
 	mux.HandleFunc("POST /v1/rentals", func(w http.ResponseWriter, r *http.Request) {
 		raw, err := io.ReadAll(r.Body)
 		if err != nil {
@@ -87,6 +84,11 @@ func runModelCatalog(t *testing.T, configure ...func(*http.ServeMux, *hub.Packag
 	})
 	for _, apply := range configure {
 		apply(mux, &detail)
+	}
+	if _, pattern := mux.Handler(httptest.NewRequest("GET", "http://hub/v1/rental-skus", nil)); pattern == "" {
+		mux.HandleFunc("GET /v1/rental-skus", func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(hub.RentalProducts([]hub.RentalSKU{{Name: "cpu", AcceleratorModel: "CPU", AcceleratorCount: 1, PriceUSDMicrosPerHour: 100_000, BaseWorkerProfile: "python3.12-cpu-linux-x86"}}))
+		})
 	}
 	if _, pattern := mux.Handler(httptest.NewRequest("GET", "http://hub/v1/rentals", nil)); pattern == "" {
 		mux.HandleFunc("GET /v1/rentals", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(`{"rentals":[]}`)) })
@@ -258,34 +260,46 @@ func TestRunPublishedModelJobKeepsPayloadAndDeclaresRentalClosure(t *testing.T) 
 	}
 }
 
-// A job that declares no accelerator has no machine class: it refuses before any rental
-// is quoted or bought, never by running on a CPU it did not ask for.
-func TestAnUndeclaredJobRefusesBeforeAnyRental(t *testing.T) {
-	root, mu, posts, _, _ := runModelCatalog(t, func(_ *http.ServeMux, detail *hub.PackageReleaseDetail) {
+// A job that declares no accelerator wants a GPU: the CLI asks the Hub for the GPU machine,
+// not the cheaper CPU ones offered beside it.
+func TestAnUndeclaredJobRentsAGPUMachine(t *testing.T) {
+	root, mu, posts, _, _ := runModelCatalog(t, func(mux *http.ServeMux, detail *hub.PackageReleaseDetail) {
 		detail.PackageInterface = bytes.Replace(detail.PackageInterface, []byte(`"accelerator":false,`), nil, 1)
 		contract, problem := launch.DecodePackageInterface(detail.PackageInterface)
 		fatal(t, problem)
 		detail.Release.PackageInterfaceDigest = assessmentDigest(contract.Raw)
 		detail.Release.PackageInterfaceLength = int64(len(detail.PackageInterface))
+		mux.HandleFunc("GET /v1/rental-skus", func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(hub.RentalProducts([]hub.RentalSKU{
+				{Name: "cpu", AcceleratorModel: "CPU", AcceleratorCount: 1, PriceUSDMicrosPerHour: 100_000, BaseWorkerProfile: "python3.12-cpu-linux-x86"},
+				{Name: "rtx-4090", AcceleratorModel: "NVIDIA GeForce RTX 4090", AcceleratorCount: 1, VRAMGB: 24, ComputeCapability: "8.9",
+					PriceUSDMicrosPerHour: 740_000, BaseWorkerProfile: "torch2.13.0-cu130-cp312-linux-x86"}}))
+		})
 	})
 	startCalciferProcess(t, root)
 	code, out := runCozy(t, root, "run", "proof/quantize/quantize", "model.dits=proof/source@1.0.0/bf16",
 		"model.shared=proof/source@1.0.0/bf16", "steps=7", "--upload-to", "proof/output", "--rental-only",
 		"--json", "--idempotency-key", "undeclared-job")
-	if code == 0 || !strings.Contains(out, "package.job_accelerator_undeclared") ||
-		!strings.Contains(out, "proof/quantize job quantize declares no accelerator") {
-		t.Fatalf("an undeclared job was not refused: %d %s", code, out)
+	if code != 0 {
+		t.Fatalf("an undeclared job did not queue: %d %s", code, out)
 	}
-	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
+	deadline := time.Now().Add(15 * time.Second)
+	var paid []byte
+	for len(paid) == 0 {
+		mu.Lock()
+		if len(*posts) > 0 {
+			paid = append([]byte(nil), (*posts)[0]...)
+		}
+		mu.Unlock()
+		if time.Now().After(deadline) {
+			t.Fatalf("no rental declaration: %s", tail(filepath.Join(root, "calcifer.log")))
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	request, problem := hub.ParseRentalRequestBytes(paid)
 	fatal(t, problem)
-	defer store.Close()
-	if row, problem := store.RequestByIdempotencyKey("undeclared-job"); problem != nil || row != nil {
-		t.Fatalf("an undeclared job was queued: %+v %v", row, problem)
-	}
-	mu.Lock()
-	defer mu.Unlock()
-	if len(*posts) != 0 {
-		t.Fatalf("an undeclared job reached a rental: %s", (*posts)[0])
+	if request.SKU != "rtx-4090" || request.AcceleratorCount != 1 {
+		t.Fatalf("an undeclared job did not ask for a GPU machine: %s", paid)
 	}
 }
 

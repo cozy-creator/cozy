@@ -12,34 +12,27 @@ import (
 )
 
 // A job's machine class is its declared accelerator, whatever its dependencies say; an
-// undeclared job refuses before any SKU is considered.
+// undeclared job wants a GPU.
 func TestPublishedJobRentalClass(t *testing.T) {
 	skus := offeredSKUs()
 	torch := []string{"cozy-runtime<1.0.0,>=0.0.33", "msgspec>=0.19", "numpy>=1.26", "torch<3,>=2.13"}
+	cpu, gpu := false, true
 	for _, test := range []struct {
 		name        string
-		accelerator bool
+		accelerator *bool
 		wantSKU     string
 	}{
-		{name: "a CPU conversion beside torch", accelerator: false, wantSKU: "cpu"},
-		{name: "a GPU table producer", accelerator: true, wantSKU: "rtx-4090"},
+		{name: "a CPU conversion beside torch", accelerator: &cpu, wantSKU: "cpu"},
+		{name: "a GPU table producer", accelerator: &gpu, wantSKU: "rtx-4090"},
+		{name: "an undeclared job", wantSKU: "rtx-4090"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			job := launch.Entrypoint{Name: "lane", Kind: "job", Accelerator: &test.accelerator}
-			gpu, problem := job.NeedsAccelerator("org/tools")
-			if problem != nil {
-				t.Fatal(problem)
-			}
-			sku, _, mismatch, ok := choose(skus, gpu, rental.Constraints{Requirements: torch})
+			job := launch.Entrypoint{Name: "lane", Kind: "job", Accelerator: test.accelerator}
+			sku, _, mismatch, ok := choose(skus, job.NeedsAccelerator(), rental.Constraints{Requirements: torch})
 			if !ok || sku.Name != test.wantSKU {
 				t.Fatalf("selected %+v, found=%v mismatch=%q; want %s", sku, ok, mismatch, test.wantSKU)
 			}
 		})
-	}
-	undeclared := launch.Entrypoint{Name: "lane", Kind: "job"}
-	if _, problem := undeclared.NeedsAccelerator("org/tools"); problem == nil ||
-		problem.Name != "package.job_accelerator_undeclared" {
-		t.Fatalf("an undeclared job was given a machine class: %v", problem)
 	}
 }
 
