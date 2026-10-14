@@ -34,6 +34,9 @@ type waitFacts struct {
 type WaitingRun struct {
 	Number    int64  `json:"number"`
 	RequestID string `json:"request_id"`
+	// Borrowing: its machine accepted it after the waiting run; it uses the GPUs only until
+	// its current step ends.
+	Borrowing bool `json:"borrowing,omitempty"`
 }
 
 // decorate adds the wait facts and the request's package to an event payload. The

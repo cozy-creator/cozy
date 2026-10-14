@@ -563,7 +563,8 @@ func (s *Store) MachineGPUsHeld(requestID string) (int, *exit.Error) {
 }
 
 // MachineGPUAllocation is the run's own GPU allocation as its newest machine event says:
-// held (with its GPUs), waiting or released; nil before its first GPU step.
+// held (with its GPUs), waiting, released, or yielded (released for an older run's ready
+// step, named by its number when it is local); nil before its first GPU step.
 func (s *Store) MachineGPUAllocation(requestID string) (*GPUAllocation, *exit.Error) {
 	var kind, body string
 	err := s.db.QueryRow(`SELECT type, payload FROM request_events WHERE request_id=?
@@ -576,21 +577,39 @@ func (s *Store) MachineGPUAllocation(requestID string) (*GPUAllocation, *exit.Er
 		return nil, exit.Internalf("cannot read the GPU allocation of %s: %s", requestID, err)
 	}
 	var event struct {
-		Ordinals []int `json:"ordinals"`
+		Ordinals  []int    `json:"ordinals"`
+		BlockedBy []string `json:"blocked_by"`
 	}
 	_ = json.Unmarshal([]byte(body), &event)
 	state := map[string]string{"machine.gpu.grant": "held", "machine.gpu.wait": "waiting", "machine.gpu.release": "released"}[kind]
 	allocation := &GPUAllocation{State: state}
-	if state == "held" {
+	switch {
+	case state == "held":
 		allocation.GPUs = event.Ordinals
+	case state == "released" && len(event.BlockedBy) > 0:
+		allocation.State = "yielded"
+		if to, _ := s.RequestByReference(event.BlockedBy[0]); to != nil {
+			allocation.To = to.Number
+		}
 	}
 	return allocation, nil
 }
 
-// GPUAllocation is a run's GPU allocation: held (on GPUs), waiting or released.
+// MachineRunNumber is the run's number on the machine that last accepted it: that machine's
+// acceptance order, which its GPU queue follows. False before any acceptance.
+func (s *Store) MachineRunNumber(requestID string) (uint64, bool) {
+	var number sql.NullInt64
+	err := s.db.QueryRow(`SELECT json_extract(payload,'$.number') FROM request_events
+		WHERE request_id=? AND type=? ORDER BY seq DESC LIMIT 1`, requestID, RunV1Accepted).Scan(&number)
+	return uint64(number.Int64), err == nil && number.Int64 > 0
+}
+
+// GPUAllocation is a run's GPU allocation: held (on GPUs), waiting, released or yielded (to
+// run To).
 type GPUAllocation struct {
 	State string `json:"state"`
 	GPUs  []int  `json:"gpus,omitempty"`
+	To    int64  `json:"to,omitempty"`
 }
 
 // MachineGPUWaiting is Runtime's gpu.wait body: the call, the device count it needs and the

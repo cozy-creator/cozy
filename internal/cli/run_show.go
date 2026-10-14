@@ -1124,8 +1124,8 @@ func (r runReport) Emit(w io.Writer, mode output.Mode) error {
 	}
 	if r.Allocation != nil && r.Allocation.State == "held" {
 		fmt.Fprintf(w, "\nholding %s", gpuNames(gpuEvent{Ordinals: r.Allocation.GPUs}.cards()))
-	} else if r.Allocation != nil && r.Allocation.State == "released" {
-		fmt.Fprintf(w, "\nGPUs released")
+	} else if released := gpuRelease(r.Allocation); released != "" {
+		fmt.Fprintf(w, "\n%s", released)
 	}
 	if r.Error != "" {
 		fmt.Fprintf(w, "\nerror %s: %s", cmp.Or(r.ErrorCode, r.ErrorType), r.Error)

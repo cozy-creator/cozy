@@ -1361,11 +1361,7 @@ func PhaseCell(life api.Lifecycle) string {
 		return joinParts(w.subject(bootMachine(life)), w.elapsed)
 	}
 	if life.Phase == orchestrator.PhaseGPUWait {
-		detail := life.PhaseDetail
-		if life.WaitingFor != nil {
-			detail += fmt.Sprintf(", behind run %d", life.WaitingFor.Number)
-		}
-		return "waiting for GPU (" + detail + ")"
+		return "waiting for GPU (" + life.PhaseDetail + gpuBlocker(life) + ")"
 	}
 	if life.Phase == orchestrator.PhaseOwnerReconciliation {
 		return "awaiting owner reconciliation: machine authorization expired (publication " + life.PhaseDetail + ")"
@@ -1492,10 +1488,41 @@ func progressValue(life api.Lifecycle) string {
 	if stage != "" {
 		overall = stage + " " + overall
 	}
-	if life.GPUAllocation != nil && life.GPUAllocation.State == "released" {
-		overall += " · GPUs released"
+	if released := gpuRelease(life.GPUAllocation); released != "" {
+		overall += " · " + released
 	}
 	return overall
+}
+
+// gpuBlocker names the run a GPU wait is behind, in its machine's acceptance order: a run
+// numbered later here that the machine accepted first says so, and one it accepted later
+// only borrows the GPUs until its current step ends.
+func gpuBlocker(life api.Lifecycle) string {
+	switch blocker := life.WaitingFor; {
+	case blocker == nil:
+		return ""
+	case blocker.Borrowing:
+		return fmt.Sprintf(", run %d hands them over after its current step", blocker.Number)
+	case blocker.Number > life.Number:
+		return fmt.Sprintf(", behind run %d, which reached the machine first", blocker.Number)
+	default:
+		return fmt.Sprintf(", behind run %d", blocker.Number)
+	}
+}
+
+// gpuRelease says a run's GPUs went back: released, or yielded to an older run's ready step.
+func gpuRelease(allocation *records.GPUAllocation) string {
+	switch {
+	case allocation == nil:
+		return ""
+	case allocation.State == "yielded" && allocation.To > 0:
+		return fmt.Sprintf("GPUs yielded to run %d", allocation.To)
+	case allocation.State == "yielded":
+		return "GPUs yielded to an older run"
+	case allocation.State == "released":
+		return "GPUs released"
+	}
+	return ""
 }
 
 // reconnecting is a running run whose machine this computer lost: what it last heard is not
