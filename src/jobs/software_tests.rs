@@ -1,6 +1,6 @@
 //! Actual CPU executor/socket/result/receipt path; no machine-global SDK attribution.
 use super::*;
-use crate::{device_executor::Baseline, journal::Journal};
+use crate::{device_executor::Baseline, journal::{Invocation, Journal}};
 use std::process::Command;
 
 #[test]

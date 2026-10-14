@@ -10,3 +10,4 @@ dependencies = ["cozy-runtime>=0.23.33,<0.24"]
 
 [tool.setuptools.packages.find]
 where = ["."]
+include = ["cpu_software*"]
