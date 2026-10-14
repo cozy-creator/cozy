@@ -1649,7 +1649,7 @@ mod tests {
 
     /// A local package whose build never returns (its backend sleeps, moving no byte and no
     /// CPU), written for `alice`; the backend writes its PID to `pid`.
-    fn hanging_package(objects: &Objects, pid: &Path) -> String {
+    fn hanging_package(objects: &Objects, pid: &Path, editable: bool) -> String {
         let backend = format!(
             "import os, time\ndef hang(*args, **kwargs):\n    open({pid:?}, 'w').write(str(os.getpid()))\n    time.sleep(3600)\n\
              get_requires_for_build_wheel = prepare_metadata_for_build_wheel = build_wheel = hang\n\
@@ -1659,16 +1659,26 @@ mod tests {
             [project]\nname = \"hanging-build\"\nversion = \"0.1.0\"\nrequires-python = \">=3.12\"\n\
             [project.entry-points.\"cozy.application\"]\ndefault = \"hang:app\"\n";
         let mut archive = tar::Builder::new(Vec::new());
+        let mut files = vec![];
         for (name, body) in [("pyproject.toml", pyproject.to_string()), ("hang.py", backend), ("package.toml", "[application]\nobject = \"hang:app\"\n".into())] {
+            if editable {
+                let (digest, length) = write(objects, "alice", body.as_bytes());
+                files.push(json!({"name":name, "digest":digest, "length":length}));
+                continue;
+            }
             let mut header = tar::Header::new_gnu();
             header.set_size(body.len() as u64);
             header.set_mode(0o644);
             header.set_cksum();
             archive.append_data(&mut header, name, body.as_bytes()).unwrap();
         }
-        let (source, length) = write(objects, "alice", &archive.into_inner().unwrap());
-        let manifest = json!({"package": "local/hanging-build", "release": "0.1.0",
-            "python_version": "3.12", "source": {"digest": source, "length": length}});
+        let mut manifest = json!({"package": "local/hanging-build", "release": "0.1.0", "python_version": "3.12"});
+        if editable {
+            manifest["files"] = files.into();
+        } else {
+            let (source, length) = write(objects, "alice", &archive.into_inner().unwrap());
+            manifest["source"] = json!({"digest":source, "length":length});
+        }
         write(objects, "alice", manifest.to_string().as_bytes()).0
     }
 
@@ -1692,9 +1702,10 @@ mod tests {
     /// not left running behind a run that says canceled.
     #[test]
     fn a_canceled_preparation_kills_its_install() {
-        let root = std::env::temp_dir().join(format!("cm-cancel-{}", uuid::Uuid::new_v4()));
+        for editable in [false, true] {
+        let root = std::env::temp_dir().join(format!("cm-cancel-{editable}-{}", uuid::Uuid::new_v4()));
         let (runs, objects) = local_runs(&root);
-        let manifest = hanging_package(&objects, &root.join("backend.pid"));
+        let manifest = hanging_package(&objects, &root.join("backend.pid"), editable);
         let accepted = runs.submit("alice", "warm-1", spec(Source::Local(manifest), true, "w1")).unwrap();
         let backend = backend_pid(&runs.service.engine, &accepted.id, &root.join("backend.pid"));
         let canceled = runs.service.engine.cancel_run("alice", "warm-1").unwrap();
@@ -1703,7 +1714,11 @@ mod tests {
             std::thread::sleep(Duration::from_millis(100));
         }
         assert_eq!(settled(&runs.service.engine, &accepted.id).state, State::Canceled);
+        assert!(runs.service.engine.installations("alice").unwrap().is_empty(), "a canceled install binds no generation");
+        runs.local.as_ref().unwrap().collect("alice", "local/hanging-build");
+        assert!(!root.join("editable").join(&tensorfs_core::sha256::hex_digest(b"alice")[..16]).join("hanging-build").exists());
         let _ = fs::remove_dir_all(root);
+        }
     }
 
     /// An install that stops moving fails on that measurement, never hanging its run.
@@ -1711,7 +1726,7 @@ mod tests {
     fn a_wedged_install_fails_its_run() {
         let root = std::env::temp_dir().join(format!("cm-wedge-{}", uuid::Uuid::new_v4()));
         let (runs, objects) = local_runs(&root);
-        let manifest = hanging_package(&objects, &root.join("backend.pid"));
+        let manifest = hanging_package(&objects, &root.join("backend.pid"), false);
         let accepted = runs.submit("alice", "warm-1", spec(Source::Local(manifest), true, "w1")).unwrap();
         let backend = backend_pid(&runs.service.engine, &accepted.id, &root.join("backend.pid"));
         let failed = settled(&runs.service.engine, &accepted.id);

@@ -1,10 +1,9 @@
 //! A run's local source: unpublished code, named by the digest of its manifest object.
 //!
-//! A live project is installed editable. The machine holds one copy of it per signer and
-//! package: a rental's is the tree the CLI syncs file by file (only the files that changed are
-//! written), this computer's is the project directory itself. Its environment is built from
-//! the project's lock and kept while the lock stands, so an edit costs a description and a
-//! fresh executor of that package, never an install.
+//! A remote editable project and its libraries are kept under the exact manifest's source
+//! home. Each environment points at that home, so a later install cannot rewrite code or data
+//! an accepted run still reads. This computer's explicit live path is read in place, never
+//! copied. Both use the shared dependency cache.
 use crate::{
     api::{
         install::{prepare_editable, prepare_uploaded, InstallerConfig},
@@ -104,7 +103,7 @@ pub struct LocalSources {
     pub objects: Arc<Objects>,
     pub installer: InstallerConfig,
     pub store: Arc<Store>,
-    /// Each signer's live packages, beside the generations: `<signer>/<package>/{tree,env-*}`.
+    /// Each signer's packages: remote `source-<manifest>/{tree,env-*}`, direct paths `env-*`.
     editable: PathBuf,
     installing: Mutex<()>,
 }
@@ -121,6 +120,29 @@ fn inside(name: &str) -> Result<&Path, Refused> {
 /// The files the tree under `home` holds, by name; none while it is absent or half written.
 fn held_tree(home: &Path) -> BTreeMap<String, String> {
     fs::read(home.join("tree.json")).ok().and_then(|raw| serde_json::from_slice(&raw).ok()).unwrap_or_default()
+}
+
+fn keyed(name: &str, prefix: &str, length: usize) -> bool {
+    name.strip_prefix(prefix).is_some_and(|key| key.len() == length && key.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// Only this layout's environments leave. Unknown entries in a package home are preserved.
+fn collect_environments(home: &Path, named: &HashSet<PathBuf>) -> usize {
+    let mut kept = 0;
+    for entry in fs::read_dir(home).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if !keyed(&entry.file_name().to_string_lossy(), "env-", 16) || !path.is_dir() {
+            continue;
+        }
+        if named.contains(&fs::canonicalize(&path).unwrap_or_else(|_| path.clone())) {
+            kept += 1;
+        } else {
+            let _ = fs::remove_dir_all(&path);
+            let _ = fs::remove_file(path.with_extension("constraints.txt"));
+            let _ = fs::remove_dir_all(path.with_extension("wheels"));
+        }
+    }
+    kept
 }
 
 fn refused(code: &'static str, message: impl Into<String>) -> Refused {
@@ -193,27 +215,18 @@ impl LocalSources {
     }
 
     /// A local source's objects, its manifest and every member this machine needs written:
-    /// what a run takes custody of when it is accepted. A live tree needs only the files it
-    /// does not hold already, and a directory read in place none. One the signer did not write
-    /// is `local_source_incomplete`, naming it.
+    /// what a run takes custody of when it is accepted. Every captured member is retained:
+    /// a cached generation may be collected while this run waits to install. The caller's
+    /// object cache still avoids reuploading unchanged bytes. A directory read in place needs
+    /// none of its files. One the signer did not write is `local_source_incomplete`, naming it.
     pub fn written(&self, actor: &str, digest: &str) -> Result<Vec<ObjectRef>, Refused> {
         let (manifest, own) = open_manifest(&self.objects, actor, digest)?;
         let mut written = vec![own];
-        let live = !manifest.files.is_empty();
-        let home = match live {
-            true => self.home(actor, &manifest.package)?,
-            false => PathBuf::new(),
-        };
-        // A directory read in place needs none of its files; a tree, those it does not hold;
-        // an environment already built, none of the wheels it was built from.
-        let held = match live && manifest.path.is_empty() {
-            true => held_tree(&home),
-            false => BTreeMap::new(),
-        };
-        let files = manifest.files.iter().filter(|f| manifest.path.is_empty() && held.get(&f.name) != Some(&f.held()));
-        let built = live && self.environment(&home, &manifest).join(".ready").is_file();
-        let wheels = manifest.wheels.iter().filter(|_| !built);
-        let members = manifest.source.iter().chain(wheels).chain(&manifest.requirements).chain(files);
+        if !manifest.files.is_empty() || !manifest.path.is_empty() {
+            self.home(actor, &manifest.package)?;
+        }
+        let files = manifest.files.iter().filter(|_| manifest.path.is_empty());
+        let members = manifest.source.iter().chain(&manifest.wheels).chain(&manifest.requirements).chain(files);
         for m in members {
             written.push(written_member(&self.objects, actor, m)?);
         }
@@ -222,7 +235,7 @@ impl LocalSources {
 
     /// The environment a live manifest runs in: one per lock, project metadata, local path
     /// dependencies, carried wheels and this machine's interpreter, SDK pair and runner.
-    /// Everything else of the project may change under it.
+    /// Remote environments live beside their immutable source; direct paths remain live.
     fn environment(&self, home: &Path, manifest: &Manifest) -> PathBuf {
         let own = manifest.own();
         let held = |name: &str| {
@@ -279,17 +292,18 @@ impl LocalSources {
         Ok(tree)
     }
 
-    /// A live project, installed editable: its tree synced (or read in place), its environment
-    /// built only when the project's lock or a path dependency changed.
+    /// Install editable against this manifest's remote tree, or the explicit direct path.
     fn install_live(
         &self,
         service: &Service,
         actor: &str,
         alias: String,
         manifest: Manifest,
+        digest: &str,
         stop: Option<&PullCancellation>,
     ) -> Result<Installation, Refused> {
         let home = self.home(actor, &manifest.package)?;
+        let home = if manifest.path.is_empty() { home.join(format!("source-{digest}")) } else { home };
         fs::create_dir_all(&home)?;
         let root = match manifest.path.is_empty() {
             true => self.sync(actor, &home, &manifest.files)?,
@@ -358,8 +372,8 @@ impl LocalSources {
         Ok(installed)
     }
 
-    /// Drop what `actor`'s live `package` no longer runs in: every environment of it no
-    /// generation names, and its whole home once none is left (the package was removed).
+    /// Keep remote source homes while a generation names their environment. Only completed,
+    /// recognized source homes leave; partial or unknown homes are preserved for recovery.
     pub fn collect(&self, actor: &str, package: &str) {
         let Ok(home) = self.home(actor, package) else {
             return;
@@ -371,19 +385,22 @@ impl LocalSources {
             .flatten()
             .filter_map(|generation| fs::read_link(generation.path().join("env")).ok())
             .collect();
-        let mut kept = 0;
+        let kept = collect_environments(&home, &named);
         for entry in fs::read_dir(&home).into_iter().flatten().flatten() {
             let path = entry.path();
-            let environment = entry.file_name().to_string_lossy().starts_with("env-") && path.is_dir();
-            if environment && named.contains(&fs::canonicalize(&path).unwrap_or_else(|_| path.clone())) {
-                kept += 1;
-            } else if environment {
+            if keyed(&entry.file_name().to_string_lossy(), "source-", 64)
+                && !held_tree(&path).is_empty() && collect_environments(&path, &named) == 0
+            {
                 let _ = fs::remove_dir_all(&path);
-                let _ = fs::remove_file(path.with_extension("constraints.txt"));
             }
         }
         if kept == 0 {
-            let _ = fs::remove_dir_all(&home);
+            // The pre-generation layout's tree, once no old environment points at it.
+            if !held_tree(&home).is_empty() {
+                let _ = fs::remove_dir_all(home.join("tree"));
+                let _ = fs::remove_file(home.join("tree.json"));
+            }
+            let _ = fs::remove_dir(&home); // Only an empty home; never erase unknown entries.
         }
     }
 
@@ -411,9 +428,9 @@ impl LocalSources {
             }
         }
         let member = |m: &Member| written_member(&self.objects, actor, m);
-        let (manifest, _) = open_manifest(&self.objects, actor, digest)?;
+        let (manifest, object) = open_manifest(&self.objects, actor, digest)?;
         if !manifest.files.is_empty() || !manifest.path.is_empty() {
-            return self.install_live(service, actor, alias, manifest, stop);
+            return self.install_live(service, actor, alias, manifest, &object.sha256, stop);
         }
         if !manifest.package.starts_with("local/") || (manifest.source.is_none() && manifest.wheels.is_empty()) {
             return Err(refused(
@@ -662,11 +679,10 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    /// A live tree installs editable. An edit writes only the file that changed, replaces it
-    /// in the one tree the machine keeps and describes the project again in the environment
-    /// it already has; a file the project dropped leaves the tree.
+    /// Remote edits get independent editable trees/environments. Explicit direct paths keep
+    /// reading the authored directory in place.
     #[test]
-    fn a_live_tree_is_one_copy_and_an_edit_keeps_its_environment() {
+    fn remote_edits_keep_prior_sources_and_direct_paths_stay_live() {
         let m = machine("cm-live");
         let sources = LocalSources::new(m.objects.clone(), m.installer.clone(), m.store.clone());
         let project = m.root.join("project");
@@ -686,15 +702,16 @@ mod tests {
         let first = manifest(live_files(&m.objects, "alice", &project, &["pyproject.toml", "package.toml", "cpu_input/__init__.py", "notes.txt"]), none.clone());
         let installed = sources.install(&m.service, "alice", &first, None).unwrap();
         let home = sources.home("alice", "local/tensord-cpu-input").unwrap();
-        assert_eq!(fs::read_to_string(home.join("tree/notes.txt")).unwrap(), "dropped by the edit");
+        let first_home = home.join(format!("source-{}", first.trim_start_matches("sha256:")));
+        assert_eq!(fs::read_to_string(first_home.join("tree/notes.txt")).unwrap(), "dropped by the edit");
         let held = m.service.catalog.resolve(&installed.generation).unwrap();
         let environment = fs::read_link(m.installer.generations.join(&installed.generation).join("env")).unwrap();
-        assert!(environment.starts_with(fs::canonicalize(&home).unwrap()), "{environment:?}");
+        assert!(environment.starts_with(fs::canonicalize(&first_home).unwrap()), "{environment:?}");
         // The environment imports the tree itself: nothing of the project was copied into it.
         let imported = run(Command::new(&held.record.python).args(["-I", "-c", "import cpu_input; print(cpu_input.__file__)"]));
-        assert_eq!(Path::new(&imported), fs::canonicalize(home.join("tree/cpu_input/__init__.py")).unwrap());
+        assert_eq!(Path::new(&imported), fs::canonicalize(first_home.join("tree/cpu_input/__init__.py")).unwrap());
 
-        // The edit: one file changed, one dropped. Only the changed file is asked for.
+        // Unchanged objects are cached, but acceptance retains every captured member.
         let source = fs::read_to_string(project.join("cpu_input/__init__.py")).unwrap();
         fs::write(project.join("cpu_input/__init__.py"), source + "\nEDITED = True\n").unwrap();
         let unchanged = |name: &str| {
@@ -704,7 +721,7 @@ mod tests {
         let mut files = vec![unchanged("pyproject.toml"), unchanged("package.toml")];
         files.extend(live_files(&m.objects, "alice", &project, &["cpu_input/__init__.py"]));
         let second = manifest(files, none.clone());
-        assert_eq!(sources.written("alice", &second).unwrap().len(), 2, "the manifest and the one edited file");
+        assert_eq!(sources.written("alice", &second).unwrap().len(), 4, "the manifest and every captured file");
         // Another signer holds no tree: every file is asked of it.
         let theirs = sources.written("bob", &second).err().unwrap();
         assert_eq!(theirs.code, "local_source_incomplete");
@@ -714,11 +731,14 @@ mod tests {
         let code = m.service.catalog.resolve(&edited.generation).unwrap().record.source_digest;
         assert!(held.record.source_digest.starts_with("sha256:") && code.starts_with("sha256:") && code != held.record.source_digest,
             "{} then {code}", held.record.source_digest);
-        assert_eq!(fs::read_link(m.installer.generations.join(&edited.generation).join("env")).unwrap(), environment);
-        assert!(!home.join("tree/notes.txt").exists());
+        assert_ne!(fs::read_link(m.installer.generations.join(&edited.generation).join("env")).unwrap(), environment);
+        let second_home = home.join(format!("source-{}", second.trim_start_matches("sha256:")));
+        assert!(!second_home.join("tree/notes.txt").exists());
+        assert!(first_home.join("tree/notes.txt").is_file());
+        assert_eq!(run(Command::new(&held.record.python).args(["-I", "-c", "import cpu_input; print(hasattr(cpu_input, 'EDITED'))"])), "False");
         let python = m.service.catalog.resolve(&edited.generation).unwrap().record.python;
         assert_eq!(run(Command::new(&python).args(["-I", "-c", "import cpu_input; print(cpu_input.EDITED)"])), "True");
-        assert_eq!(fs::read_dir(&home).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().starts_with("env-") && e.path().is_dir()).count(), 1);
+        assert_eq!(fs::read_dir(&home).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().starts_with("source-") && e.path().is_dir()).count(), 2);
 
         // This computer's machine reads the live directory in place: nothing is written for it
         // but the manifest, and its environment imports the project where it is.
@@ -744,6 +764,91 @@ mod tests {
         assert!(!sources.home("carol", "local/tensord-cpu-input").unwrap().exists());
         sources.collect("alice", "local/tensord-cpu-input");
         assert!(environment.is_dir());
+        fs::remove_dir_all(m.installer.generations.join(&installed.generation)).unwrap();
+        fs::create_dir_all(home.join("unknown-owner")).unwrap();
+        fs::write(home.join("unknown-owner/work"), "preserve").unwrap();
+        sources.collect("alice", "local/tensord-cpu-input");
+        assert!(!first_home.exists());
+        assert!(second_home.is_dir());
+        assert_eq!(fs::read_to_string(home.join("unknown-owner/work")).unwrap(), "preserve");
+        let _ = fs::remove_dir_all(m.root);
+    }
+
+    /// Two already-running processes import a library module and read its package data only
+    /// after a second remote install. The unchanged root's editable library must be isolated.
+    #[test]
+    fn concurrent_remote_runs_keep_late_library_imports_and_data() {
+        use std::io::{BufRead, BufReader};
+        use std::process::{Child, ChildStdout, Stdio};
+
+        fn waiting(python: &Path) -> (Child, BufReader<ChildStdout>) {
+            let code = "from pathlib import Path\nimport cpu_library\nprint('ready', flush=True)\ninput()\nfrom cpu_library.late import VALUE\nprint(VALUE + '|' + Path(cpu_library.__file__).with_name('data.txt').read_text(), flush=True)\n";
+            let mut child = Command::new(python).args(["-I", "-u", "-c", code])
+                .stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+            let mut reader = BufReader::new(child.stdout.take().unwrap());
+            let mut ready = String::new();
+            reader.read_line(&mut ready).unwrap();
+            assert_eq!(ready.trim(), "ready");
+            (child, reader)
+        }
+        fn finish(mut child: Child, mut reader: BufReader<ChildStdout>) -> String {
+            child.stdin.take().unwrap().write_all(b"\n").unwrap();
+            let mut result = String::new();
+            reader.read_line(&mut result).unwrap();
+            assert!(child.wait().unwrap().success());
+            result.trim().to_string()
+        }
+
+        let m = machine("cm-live-libraries");
+        let sources = LocalSources::new(m.objects.clone(), m.installer.clone(), m.store.clone());
+        let project = m.root.join("project");
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        fs::create_dir_all(project.join("cpu_input")).unwrap();
+        for name in ["pyproject.toml", "package.toml", "cpu_input/__init__.py"] {
+            fs::copy(fixtures.join("cpu_input").join(name), project.join(name)).unwrap();
+        }
+        fs::create_dir_all(project.join("deps/library/cpu_library")).unwrap();
+        fs::write(project.join("deps/library/pyproject.toml"), "[build-system]\nrequires = [\"uv_build>=0.12.7,<0.13\"]\nbuild-backend = \"uv_build\"\n[project]\nname = \"late-library\"\nversion = \"0.1.0\"\nrequires-python = \">=3.12\"\n[tool.uv.build-backend]\nmodule-name = \"cpu_library\"\nmodule-root = \"\"\n").unwrap();
+        fs::write(project.join("deps/library/cpu_library/__init__.py"), "# An ordinary editable library, with no callee capture.\n").unwrap();
+        let pyproject = fs::read_to_string(project.join("pyproject.toml")).unwrap();
+        fs::write(project.join("pyproject.toml"), pyproject.replace("\"msgspec>=0.19,<1\"", "\"msgspec>=0.19,<1\", \"late-library\"")
+            + "\n[tool.uv.sources]\nlate-library = { path = \"deps/library\", editable = true }\n").unwrap();
+        let library = project.join("deps/library/cpu_library");
+        fs::write(library.join("late.py"), "VALUE = 'old-code'\n").unwrap();
+        fs::write(library.join("data.txt"), "old-data").unwrap();
+        run(Command::new("uv").args(["lock", "--python", "3.12", "--project"]).arg(&project));
+        let files = ["pyproject.toml", "uv.lock", "package.toml", "cpu_input/__init__.py",
+            "deps/library/pyproject.toml", "deps/library/cpu_library/__init__.py",
+            "deps/library/cpu_library/late.py", "deps/library/cpu_library/data.txt"];
+        let manifest = || {
+            let document = serde_json::json!({"package":"local/tensord-cpu-input", "release":"0.1.0", "python_version":"3.12",
+                "files":live_files(&m.objects, "alice", &project, &files), "locals":["deps/library"]});
+            write(&m.objects, "alice", document.to_string().as_bytes()).digest
+        };
+        let first = manifest();
+        let a = sources.install(&m.service, "alice", &first, None).unwrap();
+        let held_a = m.service.catalog.resolve(&a.generation).unwrap();
+        let (child_a, reader_a) = waiting(&held_a.record.python);
+        fs::write(library.join("late.py"), "VALUE = 'new-code'\n").unwrap();
+        fs::write(library.join("data.txt"), "new-data").unwrap();
+        let second = manifest();
+        let b = sources.install(&m.service, "alice", &second, None).unwrap();
+        let held_b = m.service.catalog.resolve(&b.generation).unwrap();
+        assert_eq!(held_a.record.source_digest, held_b.record.source_digest, "only its editable library changed");
+        assert_ne!(held_a.record.python, held_b.record.python);
+        let (child_b, reader_b) = waiting(&held_b.record.python);
+        sources.collect("alice", "local/tensord-cpu-input");
+
+        // Cached source is not a custody substitute after Store GC. A caller must write the
+        // missing object before acceptance; doing so reopens the exact existing generation.
+        let old = write(&m.objects, "alice", b"VALUE = 'old-code'\n");
+        fs::remove_file(m.store.object_path(old.digest.trim_start_matches("sha256:"))).unwrap();
+        assert_eq!(sources.written("alice", &first).unwrap_err().code, "local_source_incomplete");
+        write(&m.objects, "alice", b"VALUE = 'old-code'\n");
+        assert_eq!(sources.written("alice", &first).unwrap().len(), files.len() + 1);
+        assert_eq!(sources.install(&m.service, "alice", &first, None).unwrap().generation, a.generation);
+        assert_eq!(finish(child_a, reader_a), "old-code|old-data");
+        assert_eq!(finish(child_b, reader_b), "new-code|new-data");
         let _ = fs::remove_dir_all(m.root);
     }
 
