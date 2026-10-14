@@ -22,11 +22,15 @@ impl OwnedService {
         let mut ready = String::new();
         stdout.read_line(&mut ready).unwrap();
         assert!(ready.starts_with("READY "), "service did not start: {ready}");
-        let service = Self { child, root };
+        let mut admin = String::new();
+        stdout.read_line(&mut admin).unwrap();
+        assert!(admin.starts_with("ADMIN "), "service admin did not start: {admin}");
+        let mut service = Self { child, root };
         let process = PathBuf::from(format!("/proc/{}", service.child.id()));
         assert_eq!(fs::read_to_string(process.join("comm")).unwrap().trim(), "tensord");
         let maps = fs::read_to_string(process.join("maps")).unwrap();
         assert!(!maps.contains("libcuda") && !maps.contains("libnvidia-ml"));
+        assert!(service.child.try_wait().unwrap().is_none());
         service
     }
 }
