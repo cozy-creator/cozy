@@ -897,3 +897,43 @@ fn a_part_is_held_from_collection_until_its_hold_drops() {
     tensorfs_core::gc::collect(&root, false).unwrap();
     assert!(first.iter().all(|o| !store.contains(&o.sha256)));
 }
+
+#[test]
+fn a_reader_takes_a_checkpoint_in_part_and_its_hub_keeps_the_rest() {
+    let dir = temporary("part-objects");
+    let root = store(&dir);
+    let (checkpoint, first, second) = two_components(16 << 10);
+    let hub = hub(Arc::new(checkpoint), None, Duration::ZERO, serve_all());
+    let store = Store::open(&root).unwrap();
+    let host = tensorfs_core::transport::base_host(&hub.base).unwrap();
+    let credential = tensorfs_core::transport::credential_from_spec("", vec![host]).unwrap();
+    let policy = tensorfs_core::transport::SourcePolicy::default();
+    let mut request =
+        tensorfs_core::ensure::Request::new(&store, &hub.base, "acme/model@r1", &credential, &policy);
+    request.lane = "public";
+
+    // Its structure alone: no part moves, and the Hub is its origin for every one.
+    let (structure, hold) = tensorfs_core::ensure::ensure_part(&request).unwrap();
+    assert!(first.iter().chain(&second).all(|o| hub.gets(&o.sha256) == 0));
+    let evidence = tensorfs_core::origin::evidence(&root, &structure.manifest).unwrap();
+    assert_eq!(evidence, Some(format!("{} acme/model@r1", hub.base)));
+    let custodied = tensorfs_core::ingest::custody::live(&root).unwrap();
+    assert!(first.iter().chain(&second).all(|o| custodied.contains(&o.sha256)));
+    drop(hold);
+
+    // One object as a reader reaches it.
+    let wanted = vec![second[1].clone()];
+    request.objects = &wanted;
+    let (_, hold) = tensorfs_core::ensure::ensure_part(&request).unwrap();
+    assert!(store.contains(&second[1].sha256));
+    assert_eq!(hub.gets(&second[1].sha256), 1);
+    assert!(first.iter().chain(&second[..1]).all(|o| hub.gets(&o.sha256) == 0));
+    drop(hold);
+
+    let foreign = vec![ObjectRef::of(b"not of this checkpoint")];
+    request.objects = &foreign;
+    assert_eq!(
+        tensorfs_core::ensure::ensure_part(&request).err().unwrap().code,
+        tensorfs_core::err::Code::NOT_CONTAINED
+    );
+}

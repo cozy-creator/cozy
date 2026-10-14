@@ -442,17 +442,20 @@ pub fn serve_derived_replay(receipt: &ReceiptFacts, stream: UnixStream, hooks: &
     served
 }
 
-/// Serve one exact source's inspection, checks and part reads until the peer closes. Part
-/// reads pin the source under a read lease, held until the channel ends.
+/// Serve one exact source's inspection, checks and part reads until the peer closes. A source
+/// here whole is pinned under one read lease at its first check or read; one here in part (its
+/// origin holds the rest, [`crate::origin`]) pins each part as it is first read, after `fetch`
+/// makes its absent objects resident. Leases are held until the channel ends.
 pub fn serve_source(
     store: &Store,
     meta: &Meta,
     source: &ObjectRef,
     stream: UnixStream,
     check_current: &(dyn Fn() -> Result<()> + Sync),
+    fetch: &(dyn Fn(&[ObjectRef]) -> Result<()> + Sync),
 ) -> Result<()> {
     let mut channel = Channel(stream);
-    let mut lease: Option<ReadLease> = None;
+    let mut leases: Vec<ReadLease> = vec![];
     let mut view: Option<SourceView> = None;
     let served = (|| -> Result<()> {
         loop {
@@ -486,11 +489,18 @@ pub fn serve_source(
                 let configs = header.configs.iter().map(|(name, _)| name.clone()).collect();
                 view = Some(inspect_source(store, meta, source.clone(), components, configs)?.view);
             }
-            if op != "inspect" && lease.is_none() {
-                lease = Some(read::acquire_cozytensors(store, meta, &store.read_manifest(source)?)?.0);
+            if op != "inspect" && leases.is_empty() {
+                let walk = crate::checkpoint::walk_cozytensors(store, &store.read_manifest(source)?)?;
+                let mut objects: Vec<ObjectRef> = walk.distinct().into_iter().cloned().collect();
+                if !objects.iter().all(|object| store.contains(&object.sha256)) {
+                    objects = vec![view.as_ref().unwrap().fact.header.clone()];
+                }
+                leases.push(read::acquire(store, meta, &source.sha256, objects)?.0);
             }
-            if let Some(lease) = &lease {
-                lease.recheck(meta)?;
+            if op == "check" {
+                for lease in &leases {
+                    lease.recheck(meta)?;
+                }
             }
             match op.as_str() {
                 "inspect" => {
@@ -533,10 +543,23 @@ pub fn serve_source(
                     }
                     let (component, key, role) = (fields.text("component")?, fields.text("key")?, fields.text("role")?);
                     let part = header_part(view.as_ref().unwrap(), &component, &key, &role)?;
+                    let at = match leases.iter().position(|lease| part.segments().iter().all(|s| lease.objects().contains(s))) {
+                        Some(at) => at,
+                        None => {
+                            let absent: Vec<ObjectRef> =
+                                part.segments().iter().filter(|s| !store.contains(&s.sha256)).cloned().collect();
+                            if !absent.is_empty() {
+                                fetch(&absent)?;
+                            }
+                            leases.push(read::acquire(store, meta, &source.sha256, part.segments().to_vec())?.0);
+                            leases.len() - 1
+                        }
+                    };
+                    leases[at].recheck(meta)?;
                     let mut data = vec![0; length as usize];
                     let what = format!("{component}/{key}#{role}");
-                    read::read_part_into(lease.as_ref().unwrap(), &what, part, fields.uint("offset")?, length, &mut data)?;
-                    lease.as_ref().unwrap().recheck(meta)?;
+                    read::read_part_into(&leases[at], &what, part, fields.uint("offset")?, length, &mut data)?;
+                    leases[at].recheck(meta)?;
                     check_current()?;
                     channel.send(&obj(vec![("result", num(length))])?)?;
                     for chunk in data.chunks(CHUNK) {
@@ -551,7 +574,7 @@ pub fn serve_source(
     if let Err(refusal) = &served {
         let _ = channel.refuse(refusal);
     }
-    if let Some(lease) = lease {
+    for lease in leases {
         let _ = lease.release(meta);
     }
     served
@@ -888,7 +911,7 @@ mod source_channel_tests {
         let (client, server) = UnixStream::pair().unwrap();
         std::thread::scope(|scope| {
             let held =
-                scope.spawn(|| serve_source(&store, &meta, &receipt.manifest, server, &|| Ok(())));
+                scope.spawn(|| serve_source(&store, &meta, &receipt.manifest, server, &|| Ok(()), &|_| unreachable!()));
             let mut client = Channel(client);
             client
                 .send(
@@ -913,6 +936,97 @@ mod source_channel_tests {
             drop(client);
             held.join().unwrap().unwrap();
         });
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn read_part(client: &mut Channel, source: &ObjectRef, key: &str) -> Vec<u8> {
+        let request = format!(
+            r#"{{"op":"read","manifest":"{}","manifest_length":{},"component":"model","key":"{key}","role":"value","offset":0,"length":2048}}"#,
+            source.id(),
+            source.length
+        );
+        client.send(&jcs::parse(request.as_bytes(), METADATA).unwrap()).unwrap();
+        let Some(Frame::Json(answer)) = client.receive().unwrap() else { panic!("read reply absent") };
+        let answer = String::from_utf8(jcs::write(&answer)).unwrap();
+        assert!(!answer.contains("\"error\""), "{answer}");
+        let mut data = vec![];
+        while data.len() < 2048 {
+            let Some(Frame::Bytes(chunk)) = client.receive().unwrap() else { panic!("bytes absent") };
+            data.extend(chunk);
+        }
+        data
+    }
+
+    #[test]
+    fn a_source_held_in_part_derives_by_reference_and_reads_through_its_origin() {
+        let root = std::env::temp_dir().join(format!("native-source-origin-{}", crate::meta::now_nanos_unique()));
+        let store = Store::init(&root).unwrap();
+        let meta = Meta::open(&store).unwrap();
+        let source_id = format!("sha256:{}", "93".repeat(32));
+        let mut declaration = super::super::tests::created_declaration();
+        let mut other = declaration.components[0].add[0].clone();
+        other.key = "other".into();
+        declaration.components[0].add.push(other);
+        declaration.order.push(("model".into(), "other".into()));
+        declaration.max_new_bytes = 4096;
+        let writer = begin(&store, &meta, &source_id, 1, declaration, None).unwrap();
+        let (weight, held_back) = (vec![0x21u8; 2048], vec![0x42u8; 2048]);
+        for (key, bytes) in [("weight", &weight), ("other", &held_back)] {
+            super::super::add_part(&store, &meta, &source_id, 1, ("model", key, "value"), &mut bytes.as_slice()).unwrap();
+        }
+        let source = commit(&store, &meta, &source_id, 1).unwrap().manifest;
+        release_guards(&meta, Some(writer.writer_hold), writer.source_leases);
+
+        // The origin holds `other`; this store has the rest.
+        let absent = ObjectRef::of(&held_back);
+        std::fs::remove_file(store.object_path(&absent.sha256)).unwrap();
+        crate::origin::attest(&store, &source, "hub.test/org/source").unwrap();
+        assert!(crate::ingest::custody::live(&root).unwrap().contains(&absent.sha256));
+
+        // A derivation inherits it by reference, and its output names the same origin.
+        let output_id = format!("sha256:{}", "94".repeat(32));
+        let inherit = Declaration {
+            files: Vec::new(),
+            objects: Vec::new(),
+            work_fingerprint: Some(format!("sha256:{}", "44".repeat(32))),
+            sources: vec![Source { alias: "source".into(), manifest: source.clone() }],
+            components: vec![ComponentDeclaration {
+                target: "model".into(),
+                source: Some("source".into()),
+                source_component: Some("model".into()),
+                drop: Vec::new(),
+                add: Vec::new(),
+            }],
+            configs: Vec::new(),
+            order: vec![("model".into(), "other".into()), ("model".into(), "weight".into())],
+            max_new_bytes: 0,
+        };
+        let writer = begin(&store, &meta, &output_id, 1, inherit, None).unwrap();
+        let output = commit(&store, &meta, &output_id, 1).unwrap().manifest;
+        release_guards(&meta, Some(writer.writer_hold), writer.source_leases);
+        assert_eq!(crate::origin::evidence(&root, &output).unwrap().as_deref(), Some("hub.test/org/source"));
+        crate::gc::collect(&root, false).unwrap();
+        assert!(!store.contains(&absent.sha256));
+
+        // Reads fetch only what is absent, once.
+        let fetched = Mutex::new(vec![]);
+        let fetch = |objects: &[ObjectRef]| -> Result<()> {
+            fetched.lock().unwrap().extend(objects.iter().cloned());
+            store.put_stream(&mut held_back.as_slice(), Some(&absent), &crate::store::Fault::default()).map(drop)
+        };
+        let (client, server) = UnixStream::pair().unwrap();
+        std::thread::scope(|scope| {
+            let served = scope.spawn(|| serve_source(&store, &meta, &output, server, &|| Ok(()), &fetch));
+            let mut client = Channel(client);
+            assert_eq!(read_part(&mut client, &output, "weight"), weight);
+            assert!(fetched.lock().unwrap().is_empty());
+            assert_eq!(read_part(&mut client, &output, "other"), held_back);
+            assert_eq!(read_part(&mut client, &output, "other"), held_back);
+            assert_eq!(*fetched.lock().unwrap(), vec![absent.clone()]);
+            drop(client);
+            served.join().unwrap().unwrap();
+        });
+        assert!(crate::ingest::custody::live(&root).unwrap().is_empty());
         let _ = std::fs::remove_dir_all(root);
     }
 }

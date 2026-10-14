@@ -754,19 +754,20 @@ pub fn resolve_closure(request: &PullRequest<'_>) -> Result<hub::Closure> {
     )
 }
 
-/// The part of `closure` the named components reach: the manifest, its header, the header's
-/// assets and those components' parts. The manifest and then the header land first, two small
-/// pulls, since only they say which object is whose. A component the header does not name
-/// refuses.
+/// The part of `closure` the named components and objects reach: the manifest, its header, the
+/// header's assets, those components' parts and those part objects. The manifest and then the
+/// header land first, two small pulls, since only they say which object is whose. A component
+/// or object the header does not name refuses.
 pub fn narrow(
     request: &PullRequest<'_>,
     closure: &hub::Closure,
     components: &[String],
+    wanted: &[ObjectRef],
 ) -> Result<hub::Closure> {
     let stage = |objects: Vec<ObjectRef>| -> Result<()> {
         let mut part = closure.clone();
         part.objects = objects;
-        part.components = components.to_vec();
+        part.part = true;
         let pull_part = PullRequest {
             cancellation: request.cancellation.clone(),
             store: request.store,
@@ -811,9 +812,11 @@ pub fn narrow(
         objects.extend(asset.segments.iter().cloned());
     }
     for (component, _, tensor) in header.tensors() {
-        if components.contains(component) {
-            for (_, part) in &tensor.parts {
-                objects.extend(part.segments().iter().cloned());
+        for (_, part) in &tensor.parts {
+            for segment in part.segments() {
+                if components.contains(component) || wanted.contains(segment) {
+                    objects.push(segment.clone());
+                }
             }
         }
     }
@@ -821,7 +824,13 @@ pub fn narrow(
     objects.dedup_by(|a, b| a.sha256 == b.sha256);
     let mut narrowed = closure.clone();
     narrowed.objects = objects;
-    narrowed.components = components.to_vec();
+    narrowed.part = true;
+    if let Some(absent) = wanted.iter().find(|object| !narrowed.objects.contains(object)) {
+        return refuse(
+            Code::NOT_CONTAINED,
+            format!("{} is not a part of this checkpoint", absent.id()),
+        );
+    }
     Ok(narrowed)
 }
 
@@ -983,7 +992,7 @@ pub fn pull(request: &PullRequest<'_>) -> Result<PullReport> {
     if plan.wanted.is_empty() && records_checkpoint(request.store, &closure) {
         return Ok(report);
     }
-    if !closure.components.is_empty() {
+    if closure.part {
         // Part of a checkpoint: each object it names is proved resident, and nothing records
         // the checkpoint, whose closure is not all here.
         plan.complete_objects(request.store)?;
@@ -1097,7 +1106,7 @@ fn pinned_local_closure(request: &PullRequest<'_>) -> Option<hub::Closure> {
         complete: true,
         // Served only when nothing is wanted, so it authorizes no presign.
         presign_max_digests: 0,
-        components: Vec::new(),
+        part: false,
     })
 }
 

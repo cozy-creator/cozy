@@ -51,6 +51,8 @@ pub struct Request<'a> {
     /// Make only these components resident (with the manifest, header and assets): the ones a
     /// caller runs first. Empty: the whole checkpoint, recorded once it is all here.
     pub components: &'a [String],
+    /// A part ensure's objects beside its components: the ones a reader is about to read.
+    pub objects: &'a [ObjectRef],
     pub cancellation: Option<PullCancellation>,
     pub streams: usize,
     /// The transport ledger's resolution; configuration, never a verdict.
@@ -76,6 +78,7 @@ impl<'a> Request<'a> {
             step: "",
             keep: &[],
             components: &[],
+            objects: &[],
             cancellation: None,
             streams: transport::PULL_STREAMS,
             sample_seconds: transport::SAMPLE_SECONDS,
@@ -232,12 +235,11 @@ impl Drop for PartHold {
     }
 }
 
-/// [`ensure`] of `request.components` alone, its objects held until the hold drops. The hold
-/// is taken while this ensure still leads its flight, so no collection runs between the two.
+/// [`ensure`] of the manifest, header and assets with `request.components` and
+/// `request.objects` alone (neither: the checkpoint's structure), its objects held until the
+/// hold drops. The hold is taken while this ensure still leads its flight, so no collection
+/// runs between the two. The hub is attested as the origin of the rest ([`crate::origin`]).
 pub fn ensure_part(request: &Request<'_>) -> Result<(Ensured, PartHold)> {
-    if request.components.is_empty() {
-        return crate::err::refuse(Code::MISSING_FIELD, "a part names its components");
-    }
     let (ensured, hold) = run(request, true)?;
     Ok((ensured, hold.expect("a part ensure holds what it landed")))
 }
@@ -266,9 +268,10 @@ fn run(request: &Request<'_>, hold: bool) -> Result<(Ensured, Option<PartHold>)>
     let mut closure = ticking(tick, &resolving, || {
         transport::resolve_closure(&request.pull(request.store))
     })?;
-    if !request.components.is_empty() {
+    let narrowed = hold || !request.components.is_empty() || !request.objects.is_empty();
+    if narrowed {
         closure = ticking(tick, &resolving, || {
-            transport::narrow(&request.pull(request.store), &closure, request.components)
+            transport::narrow(&request.pull(request.store), &closure, request.components, request.objects)
         })?;
     }
     let declared = closure.manifest.length + closure.objects.iter().map(|o| o.length).sum::<u64>();
@@ -372,6 +375,9 @@ fn run(request: &Request<'_>, hold: bool) -> Result<(Ensured, Option<PartHold>)>
         counters.origin_bytes.load(Ordering::Relaxed) as f64 / started.elapsed().as_secs_f64(),
         counters.attempt.load(Ordering::Relaxed),
     );
+    if narrowed {
+        crate::origin::attest(request.store, &closure.manifest, &format!("{} {}", request.hub, request.refspec))?;
+    }
     let part = if hold {
         let meta = crate::meta::Meta::open(request.store)?;
         let owner = crate::meta::owner(request.store.root());

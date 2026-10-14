@@ -305,6 +305,7 @@ pub(crate) fn collect_locked(
     if let Some(catalog) = &catalog {
         catalog.prune_verifications(|sha256| store.object_path(sha256).is_file())?;
     }
+    crate::origin::prune(store)?;
     Ok(report)
 }
 
