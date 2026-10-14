@@ -30,12 +30,16 @@ import (
 // place and rolls back a candidate that never proves ready; a cancel ends it before it
 // activates. The rental's unsent work waits for it (stepV1), so it lands on the new software.
 
+// softwarePair is the software a machine runs, each wheel by version and by content: a wheel
+// rebuilt at the same version is other software.
 type softwarePair struct {
-	Runtime  string `json:"runtime"`
-	TensorFS string `json:"tensorfs"`
+	Runtime        string `json:"runtime"`
+	TensorFS       string `json:"tensorfs"`
+	RuntimeSHA256  string `json:"runtime_sha256"`
+	TensorFSSHA256 string `json:"tensorfs_sha256"`
 }
 
-// softwareResult is a finished update's result; From equal to To is unchanged.
+// softwareResult is a finished update's result; From equal to To, bytes included, is unchanged.
 type softwareResult struct{ From, To softwarePair }
 
 var wheelName = regexp.MustCompile(`^[A-Za-z0-9_.+-]+\.whl$`)
