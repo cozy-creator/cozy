@@ -3,6 +3,10 @@
 //! pushed under its signed grants and verified, and the publication is finalized. The Hub's
 //! finalization job is the commit's only authority, so the call follows it to its end. A
 //! checkpoint the repository already holds converges with no transfer.
+//!
+//! The caller may stop it until it finalizes: pushes in flight end within a sampling tick and
+//! nothing is finalized, so no checkpoint appears. The Hub keeps every object it verified
+//! (the publication's holds last until it idles out), so asking again resumes from there.
 
 use std::collections::BTreeMap;
 use std::sync::{mpsc, Mutex};
@@ -15,7 +19,7 @@ use crate::ids::ObjectRef;
 use crate::store::Store;
 use crate::transport::credential::CredentialProvider;
 use crate::transport::hub::call_method;
-use crate::transport::ledger::{Deadline, Ledger};
+use crate::transport::ledger::{Deadline, Ledger, PullCancellation};
 use crate::transport::policy::SourcePolicy;
 use crate::transport::push::{push_object, UploadGrant};
 
@@ -116,6 +120,11 @@ pub struct Publication<'a> {
     pub progress: &'a (dyn Fn(u64, u64) + Sync),
     /// Pushes in flight.
     pub streams: usize,
+    /// Stops the publication before it finalizes (`publish`'s module note).
+    pub stop: Option<&'a PullCancellation>,
+    /// Asked once every object is held, just before finalizing, which cannot be taken back:
+    /// false stops the publication there, as `stop` does.
+    pub commit: &'a (dyn Fn() -> bool + Sync),
 }
 
 /// What the Hub committed.
@@ -198,7 +207,10 @@ fn ids(objects: &[String]) -> Vec<u8> {
 /// Put `p.manifest` in `p.destination`'s custody at `p.hub`.
 pub fn publish(p: &Publication) -> Result<Published> {
     let client = crate::transport::http::Client::new();
-    let ledger = Ledger::new();
+    let ledger = match p.stop {
+        Some(stop) => Ledger::new().with_cancellation(stop.clone()),
+        None => Ledger::new(),
+    };
     let deadline = Deadline::none();
     let repository = repository(p.destination)?;
     let checkpoint = p.manifest.id();
@@ -301,6 +313,9 @@ pub fn publish(p: &Publication) -> Result<Published> {
                 &ledger,
             );
             scope.spawn(move || loop {
+                if let Err(stopped) = ledger.check_running() {
+                    failed.lock().unwrap().get_or_insert(stopped);
+                }
                 if failed.lock().unwrap().is_some() {
                     break;
                 }
@@ -438,8 +453,22 @@ pub fn publish(p: &Publication) -> Result<Published> {
     if let Some(refusal) = failed.into_inner().unwrap() {
         return Err(refusal);
     }
+    ledger.check_running()?;
+    if !(p.commit)() {
+        return refuse(
+            Code::TRANSFER_FAILED,
+            "the publication was stopped before it finalized; the Hub keeps what it verified",
+        );
+    }
 
-    // Finalize, then follow the Hub's finalization job to its end.
+    // Finalize, then follow the Hub's finalization job to its end: committed, it is no
+    // longer the caller's to stop.
+    let ledger = Ledger::new();
+    let call = |method: &str, path: &str, payload: &[u8]| {
+        call_method(
+            &client, method, p.hub, path, payload, p.credential, p.policy, deadline, &ledger,
+        )
+    };
     let finalize = body(Value::obj(vec![
         ("manifest_id", Value::str(checkpoint.clone())),
         ("manifest_length", Value::uint(p.manifest.length)),

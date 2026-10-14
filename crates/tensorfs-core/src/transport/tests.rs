@@ -5385,6 +5385,8 @@ struct PublicationHub {
     blocked: String,
     released_after_refill: bool,
     max_unverified_grants: usize,
+    /// Ends a `held` PUT of the blocked object, unanswered.
+    release: bool,
 }
 
 fn publication_hub(manifest: Vec<u8>) -> (Origin, Arc<Mutex<PublicationHub>>) {
@@ -5430,6 +5432,13 @@ fn publication_hub(manifest: Vec<u8>) -> (Origin, Arc<Mutex<PublicationHub>>) {
                 *hub.puts.entry(id.clone()).or_default() += 1;
                 hub.mode
             };
+            if mode == "held" && id == hub.lock().unwrap().blocked && !hub.lock().unwrap().release {
+                // Its body arrived; its answer waits until the test lets it go, unrecorded.
+                while !hub.lock().unwrap().release {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                return status(500, b"never answered");
+            }
             if mode == "rolling" && id == hub.lock().unwrap().blocked {
                 let start = std::time::Instant::now();
                 loop {
@@ -5486,7 +5495,7 @@ fn publication_hub(manifest: Vec<u8>) -> (Origin, Arc<Mutex<PublicationHub>>) {
             }
             "PUT" => {
                 hub.declared = objects(&request.body, "objects");
-                if hub.mode == "rolling" {
+                if matches!(hub.mode, "rolling" | "held") {
                     let blocked = hub.declared.iter().position(|id| *id == hub.blocked).unwrap();
                     hub.declared.swap(1, blocked);
                 }
@@ -5629,6 +5638,8 @@ fn publish_pushes_what_the_hub_lacks_and_follows_its_finalization() {
         policy: &policy,
         progress: &progress,
         streams: 4,
+        stop: None,
+        commit: &|| true,
     };
     let published = super::publish(&publication).unwrap();
     assert_eq!(published.checkpoint, checkpoint.manifest.id());
@@ -5685,6 +5696,8 @@ fn publish_asks_for_a_large_closure_in_requests_the_hub_accepts() {
         policy: &policy,
         progress: &|_, _| {},
         streams: 4,
+        stop: None,
+        commit: &|| true,
     })
     .unwrap();
     assert_eq!(published.checkpoint, checkpoint.manifest.id());
@@ -5727,6 +5740,8 @@ fn publish_renews_only_expired_authority_and_keeps_long_puts_live() {
             policy: &policy,
             progress: &|done, total| *progress.lock().unwrap() = (done, total),
             streams: 2,
+            stop: None,
+            commit: &|| true,
         });
         let state = state.lock().unwrap();
         assert!(state.max_selection <= 2);
@@ -5785,6 +5800,8 @@ fn publish_refills_slots_while_a_large_put_waits_and_renews() {
         policy: &policy,
         progress: &|_, _| {},
         streams: 8,
+        stop: None,
+        commit: &|| true,
     }).unwrap();
     let state = state.lock().unwrap();
     assert!(state.released_after_refill, "later objects must finish before the slow PUT is released");
@@ -5793,6 +5810,109 @@ fn publish_refills_slots_while_a_large_put_waits_and_renews() {
     assert_eq!(state.puts[&blocked], 1, "heartbeat does not restart a moving PUT");
     assert_eq!(state.verified.len(), state.declared.len() - 1);
     assert_eq!(published.checkpoint, checkpoint.manifest.id());
+    drop(state);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// A publication its caller stops mid-push ends within a sampling tick of the stop, finalizes
+/// nothing (no checkpoint appears), and the same operation resumes it: only the object whose
+/// PUT was cut short is pushed again.
+#[test]
+fn a_stopped_publication_finalizes_nothing_and_resumes() {
+    let root = temporary("publish-stopped");
+    let store = Store::init(&root).unwrap();
+    let mut sizes = vec![512; 8];
+    sizes[0] = 1 << 20;
+    let checkpoint = Arc::new(checkpoint_sizes(&sizes));
+    let source = hub_origin(Arc::clone(&checkpoint), |_, _| None);
+    let policy = local_policy();
+    pull(&request_for(&store, &source.base, &policy)).unwrap();
+    let blocked = checkpoint.objects.iter().find(|o| o.length == 1 << 20).unwrap().id();
+    let (hub, state) = publication_hub(checkpoint.bodies[&checkpoint.manifest.sha256].clone());
+    {
+        let mut state = state.lock().unwrap();
+        state.mode = "held";
+        state.blocked = blocked.clone();
+    }
+    let stop = super::PullCancellation::default();
+    let publication = |stop| super::Publication {
+        store: &store,
+        hub: &hub.base,
+        destination: "acme/model",
+        manifest: &checkpoint.manifest,
+        operation: "stopped",
+        credential: &Anonymous,
+        policy: &policy,
+        progress: &|_, _| {},
+        streams: 4,
+        stop,
+        commit: &|| true,
+    };
+    let stopped = std::thread::scope(|scope| {
+        let running = scope.spawn(|| super::publish(&publication(Some(&stop))));
+        let started = std::time::Instant::now();
+        while !{
+            let state = state.lock().unwrap();
+            state.puts.contains_key(&blocked) && state.uploaded.len() + 2 == state.declared.len()
+        } {
+            assert!(started.elapsed() < Duration::from_secs(30), "the push never reached the held PUT");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let asked = std::time::Instant::now();
+        stop.cancel();
+        let stopped = running.join().unwrap();
+        (stopped, asked.elapsed())
+    });
+    let (stopped, took) = stopped;
+    assert_eq!(stopped.unwrap_err().code, Code::TRANSFER_FAILED);
+    assert!(took < Duration::from_secs_f64(2.0 * super::SAMPLE_SECONDS), "stopped after {took:?}");
+    {
+        let mut state = state.lock().unwrap();
+        assert_eq!(state.finalized, 0, "a stopped publication finalized");
+        assert!(!state.uploaded.contains_key(&blocked));
+        state.release = true;
+    }
+    let resumed = super::publish(&publication(None)).unwrap();
+    assert_eq!(resumed.checkpoint, checkpoint.manifest.id());
+    let state = state.lock().unwrap();
+    assert_eq!(state.finalized, 1);
+    assert_eq!(state.puts[&blocked], 2);
+    assert!(state.puts.iter().all(|(id, n)| *id == blocked || *n == 1), "resumed pushes repeat landed objects: {:?}", state.puts);
+    assert_eq!(state.uploaded.len() + 1, state.declared.len());
+    drop(state);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// Declined at its commit point, a publication with every object held finalizes nothing; asked
+/// again it pushes nothing and finalizes once.
+#[test]
+fn a_publication_declined_at_its_commit_point_finalizes_nothing() {
+    let root = temporary("publish-declined");
+    let store = Store::init(&root).unwrap();
+    let checkpoint = Arc::new(checkpoint(4, 512));
+    let source = hub_origin(Arc::clone(&checkpoint), |_, _| None);
+    let policy = local_policy();
+    pull(&request_for(&store, &source.base, &policy)).unwrap();
+    let (hub, state) = publication_hub(checkpoint.bodies[&checkpoint.manifest.sha256].clone());
+    let publication = |commit: &'static (dyn Fn() -> bool + Sync)| super::Publication {
+        store: &store,
+        hub: &hub.base,
+        destination: "acme/model",
+        manifest: &checkpoint.manifest,
+        operation: "declined",
+        credential: &Anonymous,
+        policy: &policy,
+        progress: &|_, _| {},
+        streams: 2,
+        stop: None,
+        commit,
+    };
+    assert_eq!(super::publish(&publication(&|| false)).unwrap_err().code, Code::TRANSFER_FAILED);
+    assert_eq!(state.lock().unwrap().finalized, 0);
+    super::publish(&publication(&|| true)).unwrap();
+    let state = state.lock().unwrap();
+    assert_eq!(state.finalized, 1);
+    assert!(state.puts.values().all(|n| *n == 1));
     drop(state);
     let _ = std::fs::remove_dir_all(root);
 }

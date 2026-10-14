@@ -198,6 +198,8 @@ pub fn push_object(
     let mut last_refusal: Option<Refusal> = None;
     let mut attempt = 0;
     while attempt < PUT_ATTEMPTS {
+        // A stopped push is over, not a send to repeat.
+        ledger.check_running()?;
         attempt += 1;
         let last = attempt == PUT_ATTEMPTS;
         let checked = policy.check(&grant.url)?;
