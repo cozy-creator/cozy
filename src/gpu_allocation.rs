@@ -1,9 +1,13 @@
 //! GPU allocations, as Slurm's: a root run (a request with no parent) holds a contiguous lane
 //! of GPUs from its first GPU step until `Context.release_gpus()` or its executor's exit, and
-//! its calls (steps) run only there, one call per GPU at a time. Roots wait in acceptance
-//! order: from its first request for GPU work (a child call or prefetch) until it binds, an
-//! older root claims the lane it needs from younger ones (`Claims`). A released root's next
-//! step queues at its original place and never preempts. An accelerator job keeps one GPU of
+//! its calls (steps) run only there, one call per GPU at a time. Roots queue by acceptance and
+//! take their place only with a GPU step ready (`Claims`): a root still downloading or in CPU
+//! start-up claims nothing, so younger ready roots use the GPUs meanwhile. A holder keeps its
+//! lane between its steps; only an older root's first ready step takes it from a younger
+//! holder, at the holder's next step boundary: the holder starts no new step, its calls in
+//! flight and their families finish (nothing is preempted), then its lane ends and it queues
+//! again at its own place. A root that released (or yielded) its lane comes back at its place
+//! among the waiting ones and never displaces a holder. An accelerator job keeps one GPU of
 //! its root's lane for its life; only its family (it and its descendants) call there. A call's
 //! family may call where it calls: a served call waiting on its child shares its GPU with it.
 use std::{
@@ -12,7 +16,7 @@ use std::{
     sync::{Arc, Condvar, Mutex},
 };
 
-/// Per GPU, the older waiting root that needs it in this dispatch pass.
+/// Per GPU, the oldest request waiting for it in this dispatch pass.
 pub(crate) type Claims = [Option<u64>];
 
 pub(crate) struct Allocations {
@@ -39,13 +43,13 @@ struct Root {
     width: usize,
     lane: Option<Range<usize>>,
     released: bool,
-    /// It asked for GPU work: from then on it claims its lane until bound.
-    wants: bool,
-    /// A wait was reported and no lane bound since.
-    waiting: bool,
+    /// It held a lane before: its later steps wait for free GPUs, displacing no holder.
+    started: bool,
+    /// The blocker its newest reported wait named, until it binds.
+    reported: Option<Option<u64>>,
     holders: usize,
 }
-/// A root's lane, or the root it waits behind. `new`: the first answer since it changed.
+/// A root's lane, or the request it waits behind. `new`: the first answer since it changed.
 pub(crate) enum Lane {
     Held { lane: Range<usize>, new: bool },
     Waiting { behind: Option<u64>, new: bool },
@@ -67,10 +71,36 @@ impl Table {
         gpu.root.is_none() && gpu.family.is_none() && gpu.calling == 0
             && claims.get(device).copied().flatten().is_none_or(|claimer| claimer == root)
     }
-    /// Who besides `root` holds or needs a GPU of `lane`.
-    fn other(&self, lane: Range<usize>, root: u64, claims: &Claims) -> impl Iterator<Item = u64> + '_ {
-        let claims: Vec<_> = lane.clone().map(|device| claims.get(device).copied().flatten()).collect();
-        lane.zip(claims).filter_map(move |(device, claim)| claim.or(self.gpus[device].root)).filter(move |other| *other != root)
+    /// `root` gets `device` at the latest at its holder's next step boundary: no other request
+    /// waits for it first, and it is free or (for a root's first step) a younger root holds it.
+    fn obtainable(&self, device: usize, root: u64, first: bool, claims: &Claims) -> bool {
+        self.gpus[device].root.is_none_or(|holder| first && holder > root)
+            && claims.get(device).copied().flatten().is_none_or(|claimer| claimer == root)
+    }
+    /// The oldest request besides `root` that holds or needs a GPU of `lane`.
+    fn other(&self, lane: Range<usize>, root: u64, claims: &Claims) -> Option<u64> {
+        lane.filter_map(|device| claims.get(device).copied().flatten().or(self.gpus[device].root)).filter(|other| *other != root).min()
+    }
+    /// No call runs and no accelerator job stays on `root`'s lane.
+    fn between_steps(&self, root: u64) -> bool {
+        self.gpus.iter().filter(|gpu| gpu.root == Some(root)).all(|gpu| gpu.calling == 0 && gpu.family.is_none())
+    }
+    /// An older root's first ready step waits for `root`'s lane: it starts no new step.
+    fn yielding(&self, root: u64, claims: &Claims) -> bool {
+        self.gpus.iter().zip(claims).any(|(gpu, claim)| {
+            gpu.root == Some(root) && claim.is_some_and(|claimer| claimer < root && self.roots.contains_key(&claimer))
+        })
+    }
+    /// A call of `family` continues a step in flight: its family calls or keeps a GPU.
+    fn continuing(&self, family: Option<&str>) -> bool {
+        family.is_some_and(|family| self.gpus.iter().any(|gpu| {
+            gpu.caller.as_deref() == Some(family) || gpu.family.as_deref() == Some(family)
+        }))
+    }
+    fn bind(&mut self, root: u64, lane: Range<usize>) {
+        lane.clone().for_each(|d| self.gpus[d].root = Some(root));
+        let entry = self.roots.get_mut(&root).expect("a registered root");
+        (entry.lane, entry.released, entry.started, entry.reported) = (Some(lane), false, true, None);
     }
 }
 
@@ -82,10 +112,10 @@ impl Allocations {
     /// `root` holds an allocation `width` GPUs wide, unbound until its first step, for as long
     /// as the hold lives.
     pub(crate) fn register(self: &Arc<Self>, root: u64, width: usize) -> Hold {
-        let width = width.clamp(1, self.table.lock().unwrap().gpus.len().max(1));
         let mut table = self.table.lock().unwrap();
+        let width = width.clamp(1, table.gpus.len().max(1));
         table.roots.entry(root)
-            .or_insert(Root { width, lane: None, released: false, wants: false, waiting: false, holders: 0 })
+            .or_insert(Root { width, lane: None, released: false, started: false, reported: None, holders: 0 })
             .holders += 1;
         Hold { table: self.clone(), root }
     }
@@ -102,22 +132,12 @@ impl Allocations {
             (None, false) => None,
         }
     }
-    /// `root` asked for GPU work (a child call or prefetch): it keeps its place from now on.
-    pub(crate) fn want(&self, root: u64) {
-        if let Some(root) = self.table.lock().unwrap().roots.get_mut(&root) {
-            root.wants = true;
-        }
-    }
-    /// Roots that want GPUs, unbound and not released, oldest first, with their widths.
-    pub(crate) fn pending(&self) -> Vec<(u64, usize)> {
-        let table = self.table.lock().unwrap();
-        table.roots.iter().filter(|(_, r)| r.wants && r.lane.is_none() && !r.released).map(|(seq, r)| (*seq, r.width)).collect()
-    }
     /// A registered root's width (0: none).
     pub(crate) fn width(&self, root: u64) -> usize {
         self.table.lock().unwrap().roots.get(&root).map_or(0, |r| r.width)
     }
-    /// Keep the lane `root` would take from later roots in this pass; the root it waits behind.
+    /// Keep the lane `root` would take from later requests in this pass; the request it waits
+    /// behind.
     pub(crate) fn claim(&self, root: u64, width: usize, claims: &mut Claims) -> Option<u64> {
         let table = self.table.lock().unwrap();
         let width = width.min(table.gpus.len());
@@ -127,39 +147,71 @@ impl Allocations {
                 (free, std::cmp::Reverse(*start))
             })
             .unwrap_or(0);
-        let behind = table.other(start..start + width, root, claims).next();
+        let behind = table.other(start..start + width, root, claims);
         for claim in claims.iter_mut().skip(start).take(width) {
             claim.get_or_insert(root);
         }
         behind
     }
-    /// `root`'s lane, binding the first lane of its width whose GPUs are free and claimed by
-    /// no older root; else it claims one and waits.
-    pub(crate) fn lane(&self, root: u64, claims: &mut Claims) -> Lane {
+    /// `root`'s lane for its ready step, binding the first lane of its width whose GPUs are
+    /// free and claimed by no older request. Else, for its first step, it waits for a lane no
+    /// older root holds: its younger holders yield at their next step boundary (those between
+    /// steps now: returned with the lanes that ended). Otherwise it waits behind the oldest
+    /// blocker, keeping only free GPUs from later requests.
+    pub(crate) fn lane(&self, root: u64, claims: &mut Claims) -> (Lane, Vec<(u64, Range<usize>)>) {
         let mut table = self.table.lock().unwrap();
         let Some(entry) = table.roots.get(&root) else {
-            return Lane::Waiting { behind: None, new: false };
+            return (Lane::Waiting { behind: None, new: false }, vec![]);
         };
         if let Some(lane) = &entry.lane {
-            return Lane::Held { lane: lane.clone(), new: false };
+            return (Lane::Held { lane: lane.clone(), new: false }, vec![]);
         }
-        let width = entry.width.min(table.gpus.len());
-        let free = (0..=table.gpus.len() - width)
-            .find(|start| (*start..start + width).all(|d| table.free(d, root, claims)));
-        match free {
-            Some(start) => {
+        let (width, first) = (entry.width.min(table.gpus.len()), !entry.started);
+        let starts = 0..=table.gpus.len() - width;
+        if let Some(start) = starts.clone().find(|start| (*start..start + width).all(|d| table.free(d, root, claims))) {
+            table.bind(root, start..start + width);
+            return (Lane::Held { lane: start..start + width, new: true }, vec![]);
+        }
+        let (obtainable, _, start) = starts
+            .map(|start| {
                 let lane = start..start + width;
-                lane.clone().for_each(|d| table.gpus[d].root = Some(root));
-                let entry = table.roots.get_mut(&root).expect("a registered root");
-                (entry.lane, entry.released, entry.waiting) = (Some(lane.clone()), false, false);
-                Lane::Held { lane, new: true }
+                let free = lane.clone().filter(|d| table.free(*d, root, claims)).count();
+                (lane.clone().all(|d| table.obtainable(d, root, first, claims)), free, std::cmp::Reverse(start))
+            })
+            .max()
+            .expect("a lane of its width");
+        let lane = start.0..start.0 + width;
+        let mut yielded = vec![];
+        if obtainable {
+            let mut holders: Vec<u64> = lane.clone().filter_map(|d| table.gpus[d].root).collect();
+            holders.dedup();
+            holders.retain(|holder| table.between_steps(*holder));
+            for holder in holders {
+                let entry = table.roots.get_mut(&holder).expect("a holder is registered");
+                let ended = entry.lane.take().expect("a holder has a lane");
+                ended.clone().for_each(|d| table.gpus[d].root = None);
+                yielded.push((holder, ended));
             }
-            None => {
-                let new = !std::mem::replace(&mut table.roots.get_mut(&root).expect("a registered root").waiting, true);
+            if lane.clone().all(|d| table.free(d, root, claims)) {
+                table.bind(root, lane.clone());
                 drop(table);
-                Lane::Waiting { behind: self.claim(root, width, claims), new }
+                self.freed.notify_all();
+                return (Lane::Held { lane, new: true }, yielded);
             }
         }
+        let behind = table.other(lane.clone(), root, claims);
+        for d in lane {
+            if obtainable || table.gpus[d].root.is_none_or(|holder| holder < root) {
+                claims[d].get_or_insert(root);
+            }
+        }
+        let entry = table.roots.get_mut(&root).expect("a registered root");
+        let new = entry.reported.replace(behind) != Some(behind);
+        drop(table);
+        if !yielded.is_empty() {
+            self.freed.notify_all();
+        }
+        (Lane::Waiting { behind, new }, yielded)
     }
     /// End `root`'s lane now; a call in flight keeps its GPUs until it returns. The lane ended.
     pub(crate) fn release(&self, root: u64) -> Option<Range<usize>> {
@@ -173,8 +225,9 @@ impl Allocations {
         Some(lane)
     }
     /// A call on `devices`: inside `root`'s lane when it is registered, else on GPUs no root
-    /// holds or older root claims (a standalone call: its own root; `None`: machine warming).
-    /// No GPU may be calling or kept outside `family`.
+    /// holds or older request claims (a standalone call: its own root; `None`: machine
+    /// warming). No GPU may be calling or kept outside `family`. A yielding root's call runs
+    /// only when it continues a step in flight.
     pub(crate) fn call(self: &Arc<Self>, root: Option<u64>, family: Option<&str>, devices: Range<usize>, claims: &Claims) -> Option<Permit> {
         let mut table = self.table.lock().unwrap();
         let registered = root.is_some_and(|root| table.roots.contains_key(&root));
@@ -187,7 +240,7 @@ impl Allocations {
             let shared = family.is_some() && gpu.caller.as_deref() == family;
             placed && (gpu.calling == 0 || shared)
                 && gpu.family.as_deref().is_none_or(|kept| Some(kept) == family)
-        });
+        }) && !(registered && root.is_some_and(|root| table.yielding(root, claims)) && !table.continuing(family));
         if !usable {
             return None;
         }
@@ -197,13 +250,15 @@ impl Allocations {
         }
         Some(Permit { table: self.clone(), devices, keep: false })
     }
-    /// Keep `device` of `root`'s lane for accelerator job family `family` while it lives.
-    pub(crate) fn keep(self: &Arc<Self>, root: u64, family: &str, device: usize) -> Option<Permit> {
+    /// Keep `device` of `root`'s lane for accelerator job family `family` while it lives (a
+    /// yielding root's only for a family keeping it already).
+    pub(crate) fn keep(self: &Arc<Self>, root: u64, family: &str, device: usize, claims: &Claims) -> Option<Permit> {
         let mut table = self.table.lock().unwrap();
+        let yielding = table.yielding(root, claims);
         let gpu = table.gpus.get_mut(device)?;
         let ours = gpu.family.as_deref() == Some(family);
         let calls_here = gpu.calling > 0 && gpu.caller.as_deref() != Some(family);
-        if gpu.root != Some(root) || !(ours || gpu.family.is_none() && !calls_here) {
+        if gpu.root != Some(root) || !(ours || gpu.family.is_none() && !calls_here && !yielding) {
             return None;
         }
         gpu.family = Some(family.into());
@@ -274,7 +329,7 @@ impl Drop for Hold {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn held(lane: Lane) -> Range<usize> {
+    fn held((lane, _): (Lane, Vec<(u64, Range<usize>)>)) -> Range<usize> {
         match lane {
             Lane::Held { lane, .. } => lane,
             Lane::Waiting { .. } => panic!("expected a held lane"),
@@ -282,22 +337,45 @@ mod tests {
     }
 
     #[test]
-    fn a_younger_root_takes_only_gpus_no_older_waiting_root_needs() {
+    fn a_younger_holder_yields_only_to_an_older_root_that_gets_its_lane() {
         let gpus = Allocations::new(4);
-        let (_x, _a, _b) = (gpus.register(1, 2), gpus.register(2, 4), gpus.register(3, 2));
+        let (_x, _a, _y) = (gpus.register(1, 2), gpus.register(2, 4), gpus.register(3, 2));
         assert_eq!(held(gpus.lane(1, &mut [None; 4])), 0..2);
+        assert_eq!(held(gpus.lane(3, &mut [None; 4])), 2..4, "A is not ready: Y takes the free half");
+        let segment = gpus.call(Some(3), Some("y-segment"), 2..4, &[None; 4]).unwrap();
+        // A is ready but older X holds half its lane: A waits behind X, claiming only the GPUs
+        // younger work cannot keep from it, and Y goes on between its steps.
         let mut claims = [None; 4];
-        // A (older, in CPU start-up) asked for GPU work and needs every GPU: B may not bind
-        // the free half. A root that never asks (a CPU-only job) keeps no place.
-        assert!(gpus.pending().is_empty());
-        gpus.want(2);
-        gpus.want(3);
-        assert_eq!(gpus.pending(), [(2, 4), (3, 2)]);
-        assert_eq!(gpus.claim(2, 4, &mut claims), Some(1));
-        assert!(matches!(gpus.lane(3, &mut claims), Lane::Waiting { behind: Some(2), .. }));
-        assert!(gpus.call(Some(4), None, 2..3, &claims).is_none(), "a standalone call waits too");
-        // Without the older demand the younger root binds the free half.
-        assert_eq!(held(gpus.lane(3, &mut [None; 4])), 2..4);
+        let (lane, yielded) = gpus.lane(2, &mut claims);
+        assert!(matches!(lane, Lane::Waiting { behind: Some(1), new: true }));
+        assert!(yielded.is_empty());
+        assert_eq!(claims, [Some(2), Some(2), None, None]);
+        drop(segment);
+        assert!(gpus.call(Some(3), None, 2..3, &claims).is_some(), "no yield to a root that cannot bind");
+        assert!(gpus.call(Some(4), None, 0..1, &claims).is_none(), "a younger standalone call waits");
+    }
+
+    #[test]
+    fn only_a_roots_first_step_takes_a_younger_holders_lane() {
+        let gpus = Allocations::new(2);
+        let (_a, _b, _c) = (gpus.register(1, 1), gpus.register(2, 1), gpus.register(3, 1));
+        assert_eq!(held(gpus.lane(2, &mut [None; 2])), 0..1);
+        assert_eq!(held(gpus.lane(3, &mut [None; 2])), 1..2);
+        // A's first step: B, between steps, yields now; C keeps its GPU.
+        let (lane, yielded) = gpus.lane(1, &mut [None; 2]);
+        assert!(matches!(lane, Lane::Held { new: true, .. }));
+        assert_eq!(yielded, [(2, 0..1)]);
+        // B started before: it waits for a free GPU and never displaces C.
+        let mut claims = [None; 2];
+        let (lane, yielded) = gpus.lane(2, &mut claims);
+        assert!(matches!(lane, Lane::Waiting { behind: Some(1), new: true }) && yielded.is_empty());
+        assert!(gpus.call(Some(3), None, 1..2, &claims).is_some());
+        // Nor does A after its release.
+        gpus.release(1);
+        assert_eq!(held(gpus.lane(2, &mut [None; 2])), 0..1);
+        let mut claims = [None; 2];
+        assert!(matches!(gpus.lane(1, &mut claims).0, Lane::Waiting { behind: Some(2), .. }));
+        assert!(gpus.call(Some(2), None, 0..1, &claims).is_some());
     }
 
     #[test]
@@ -305,11 +383,11 @@ mod tests {
         let gpus = Allocations::new(2);
         let _root = gpus.register(5, 2);
         held(gpus.lane(5, &mut [None; 2]));
-        let job = gpus.keep(5, "job", 0).unwrap();
-        assert!(gpus.keep(5, "sibling", 0).is_none());
+        let job = gpus.keep(5, "job", 0, &[None; 2]).unwrap();
+        assert!(gpus.keep(5, "sibling", 0, &[None; 2]).is_none());
         assert!(gpus.call(Some(5), None, 0..1, &[None; 2]).is_none(), "a sibling's call goes elsewhere");
         let borrowed = gpus.call(Some(5), Some("job"), 0..2, &[None; 2]).unwrap();
-        let nested = gpus.keep(5, "job", 0).unwrap();
+        let nested = gpus.keep(5, "job", 0, &[None; 2]).unwrap();
         assert!(gpus.upkeep(1..2).is_none());
         drop((borrowed, job));
         assert!(gpus.call(Some(5), None, 0..1, &[None; 2]).is_none(), "the nested job still keeps it");

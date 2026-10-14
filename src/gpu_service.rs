@@ -607,11 +607,11 @@ impl Drop for WakeOnExit {
     }
 }
 
-/// Whether an accepted call (of `root`'s, when named) waits in the queue for a GPU.
+/// Whether an accepted call waits in the queue for a GPU: any, or of `root` or an older root.
 fn gpu_request_queued(engine: &Engine, root: Option<u64>) -> bool {
     engine.ready().is_ok_and(|ready| ready.iter().any(|record| {
         let gpu = record.invocation.accelerator || record.submission.as_ref().is_some_and(|s| !s.preparation_id.is_empty());
-        gpu && root.is_none_or(|root| record.root_seq() == root)
+        gpu && root.is_none_or(|root| record.root_seq() <= root)
     }))
 }
 
@@ -1488,18 +1488,6 @@ impl GpuPool {
             engine: Arc::downgrade(engine),
         })
     }
-    /// Roots that asked for GPU work, bound to no lane and not released, oldest first.
-    pub(crate) fn pending(&self) -> Vec<(u64, usize)> {
-        self.allocations.pending()
-    }
-    /// `root` asked for GPU work (a child call or prefetch): it keeps its place from now on.
-    pub(crate) fn want(&self, root: u64) {
-        self.allocations.want(root);
-    }
-    /// Keep the lane `root` would take from younger roots in this dispatch pass.
-    pub(crate) fn claim(&self, root: u64, width: usize, claims: &mut Claims) {
-        self.allocations.claim(root, width, claims);
-    }
     /// `Context.release_gpus()` of a root: its lane ends now; its next step queues again at
     /// its original place.
     pub(crate) fn release(&self, engine: &Engine, root: u64) {
@@ -1507,10 +1495,15 @@ impl GpuPool {
             self.note_gpus(engine, root, "release", lane, None);
         }
     }
-    /// `root`'s lane, bound now when free; None while it waits (each transition is logged on
-    /// the root run as a `gpu` entry).
+    /// `root`'s lane, bound now when free; None while it waits. Each transition is logged on
+    /// the root run as a `gpu` entry: a grant, a wait naming its current blocker, and a lane
+    /// that ended for it as its younger holder's release behind it.
     pub(crate) fn root_lane(&self, engine: &Engine, root: u64, claims: &mut Claims) -> Option<std::ops::Range<usize>> {
-        match self.allocations.lane(root, claims) {
+        let (lane, yielded) = self.allocations.lane(root, claims);
+        for (holder, lane) in yielded {
+            self.note_gpus(engine, holder, "release", lane, Some(root));
+        }
+        match lane {
             crate::gpu_allocation::Lane::Held { lane, new } => {
                 if new {
                     self.note_gpus(engine, root, "grant", lane.clone(), None);
@@ -1544,7 +1537,7 @@ impl GpuPool {
         let (root, family) = (record.root_seq(), record.family().unwrap_or(&record.id));
         let Some(lane) = self.root_lane(engine, root, claims) else { return Ok(None) };
         for start in lane {
-            if let Some(token) = self.allocations.keep(root, family, start) {
+            if let Some(token) = self.allocations.keep(root, family, start, claims) {
                 let permit = Permit { pool: self.clone(), engine: Arc::downgrade(engine), token: Some(token) };
                 return Ok(Some(JobAllocation { permit, devices: self.lane_devices(start, 1)?, start }));
             }
@@ -1744,7 +1737,8 @@ impl GpuPool {
                 if !pool.hosting(&key).is_empty() {
                     return pool.note_prewarm(&key, asked.elapsed(), Default::default(), &Ok("already loaded"));
                 }
-                // Its root's queued requests go first; a released lane ends the hint.
+                // Queued requests of its root and older roots go first; a released lane ends
+                // the hint.
                 let (start, _permit) = loop {
                     if !active() { return; }
                     match pool.allocations.bound(root) {
@@ -4620,23 +4614,29 @@ mod tests {
         }).collect()
     }
 
+    fn running_roots(engine: &Arc<Engine>, keys: [&str; 3]) -> [Execution; 3] {
+        keys.map(|key| {
+            let job = root_job(engine, key, 0, false);
+            engine.dispatch_managed(&job.id, |_, _| Ok(())).unwrap();
+            job
+        })
+    }
+    fn request(record: &Execution) -> String {
+        record.submission.as_ref().map(|s| s.request_id.clone()).unwrap_or_default()
+    }
+
     #[test]
     fn a_root_keeps_its_lane_between_steps_and_later_roots_wait_in_acceptance_order() {
         let (root, pool, engine) = pool_of(4);
-        let (first, second) = (root_job(&engine, "first", 0, false), root_job(&engine, "second", 0, false));
-        engine.dispatch_managed(&first.id, |_, _| Ok(())).unwrap();
-        engine.dispatch_managed(&second.id, |_, _| Ok(())).unwrap();
+        let [first, second, _] = running_roots(&engine, ["first", "second", "unused"]);
         let first_allocation = pool.root(&engine, &first, 4).unwrap();
         let second_allocation = pool.root(&engine, &second, 2).unwrap();
         let (a, b) = (first.root_seq(), second.root_seq());
-        // The older root, still in its CPU start-up, keeps every GPU from the younger one.
-        pool.want(a);
-        assert_eq!(pool.pending(), [(a, 4)]);
+        // Both ready: the older root binds, the younger waits.
         let mut claims = [None; 4];
-        pool.claim(a, 4, &mut claims);
-        assert!(pool.root_lane(&engine, b, &mut claims).is_none());
-        let lane = pool.root_lane(&engine, a, &mut [None; 4]).unwrap();
+        let lane = pool.root_lane(&engine, a, &mut claims).unwrap();
         assert_eq!(lane, 0..4);
+        assert!(pool.root_lane(&engine, b, &mut claims).is_none());
         // A reference on one GPU, then a group over the lane: nobody else runs in the gap.
         let (gpu, reference) = pool.place(&engine, &plan("reference", 1), (a, None), Some(lane.clone()), &mut [None; 4]).unwrap();
         assert_eq!(gpu, 0);
@@ -4649,16 +4649,18 @@ mod tests {
         pool.release(&engine, a);
         assert!(pool.root_lane(&engine, b, &mut [None; 4]).is_none());
         drop(segment);
-        assert_eq!(pool.root_lane(&engine, b, &mut [None; 4]), Some(0..2));
-        // The released root comes back ahead of every later root but never preempts: it waits
-        // for the lane it needs, while a later standalone call may not take the free half.
+        let lane = pool.root_lane(&engine, b, &mut [None; 4]).unwrap();
+        assert_eq!(lane, 0..2);
+        // The released root comes back ahead of every later root but never displaces the
+        // holder: it waits for the lane, the holder's steps go on, a later standalone call
+        // may not take the free half.
         let mut claims = [None; 4];
         assert!(pool.root_lane(&engine, a, &mut claims).is_none());
+        let (_, step) = pool.place(&engine, &plan("image", 1), (b, None), Some(lane), &mut claims).unwrap();
         assert!(pool.place(&engine, &plan("other", 1), (9, None), None, &mut claims).is_none());
-        drop(second_allocation);
+        drop((step, second_allocation));
         assert_eq!(pool.root_lane(&engine, a, &mut [None; 4]), Some(0..4));
         drop(first_allocation);
-        let request = |record: &Execution| record.submission.as_ref().map(|s| s.request_id.clone()).unwrap_or_default();
         assert_eq!(allocation_log(&engine, &first.id), [
             ("grant".into(), vec![0, 1, 2, 3], String::new()), ("release".into(), vec![0, 1, 2, 3], String::new()),
             ("wait".into(), vec![], request(&second)), ("grant".into(), vec![0, 1, 2, 3], String::new()),
@@ -4668,6 +4670,63 @@ mod tests {
             ("wait".into(), vec![], request(&first)), ("grant".into(), vec![0, 1], String::new()),
         ]);
         assert!(pool.place(&engine, &plan("other", 4), (9, None), None, &mut [None; 4]).is_some(), "exits end the lanes");
+        pool.stop().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// An older root still downloading its weights claims no GPU: a younger ready root runs
+    /// meanwhile and hands its lane over at its next step boundary once the older one's first
+    /// step is ready. Its step in flight, a served call's own child included, finishes first.
+    #[test]
+    fn a_younger_root_runs_while_an_older_one_downloads_and_yields_at_its_step_boundary() {
+        let (root, pool, engine) = pool_of(2);
+        let [big, small, _] = running_roots(&engine, ["big", "small", "unused"]);
+        let holds = (pool.root(&engine, &big, 2).unwrap(), pool.root(&engine, &small, 2).unwrap());
+        let (a, b) = (big.root_seq(), small.root_seq());
+        let lane = pool.root_lane(&engine, b, &mut [None; 2]).unwrap();
+        assert_eq!(lane, 0..2);
+        let (_, image) = pool.place(&engine, &plan("image", 1), (b, None), Some(lane.clone()), &mut [None; 2]).unwrap();
+        drop(image);
+        let (_, served) = pool.place(&engine, &plan("served", 1), (b, Some("served")), Some(lane.clone()), &mut [None; 2]).unwrap();
+        // The big root's first step is ready.
+        let mut claims = [None; 2];
+        assert!(pool.root_lane(&engine, a, &mut claims).is_none());
+        assert!(pool.place(&engine, &plan("image", 1), (b, None), Some(lane.clone()), &mut claims).is_none(), "no new step");
+        let (_, child) = pool.place(&engine, &plan("child", 1), (b, Some("served")), Some(lane.clone()), &mut claims).unwrap();
+        drop((child, served));
+        let mut claims = [None; 2];
+        assert_eq!(pool.root_lane(&engine, a, &mut claims), Some(0..2));
+        assert!(pool.root_lane(&engine, b, &mut claims).is_none());
+        assert_eq!(allocation_log(&engine, &big.id), [
+            ("wait".into(), vec![], request(&small)), ("grant".into(), vec![0, 1], String::new()),
+        ]);
+        assert_eq!(allocation_log(&engine, &small.id), [
+            ("grant".into(), vec![0, 1], String::new()), ("release".into(), vec![0, 1], request(&big)),
+            ("wait".into(), vec![], request(&big)),
+        ]);
+        drop(holds);
+        pool.stop().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A waiting root's wait names its current blocker: a new entry when it changes.
+    #[test]
+    fn a_waiting_roots_entry_follows_its_current_blocker() {
+        let (root, pool, engine) = pool_of(2);
+        let [x, y, a] = running_roots(&engine, ["x", "y", "a"]);
+        let (x_hold, holds) = (pool.root(&engine, &x, 2).unwrap(), [pool.root(&engine, &y, 2).unwrap(), pool.root(&engine, &a, 2).unwrap()]);
+        assert_eq!(pool.root_lane(&engine, x.root_seq(), &mut [None; 2]), Some(0..2));
+        // y is still downloading; a waits behind x.
+        assert!(pool.root_lane(&engine, a.root_seq(), &mut [None; 2]).is_none());
+        assert!(pool.root_lane(&engine, a.root_seq(), &mut [None; 2]).is_none());
+        drop(x_hold);
+        let mut claims = [None; 2];
+        assert_eq!(pool.root_lane(&engine, y.root_seq(), &mut claims), Some(0..2));
+        assert!(pool.root_lane(&engine, a.root_seq(), &mut claims).is_none());
+        assert_eq!(allocation_log(&engine, &a.id), [
+            ("wait".into(), vec![], request(&x)), ("wait".into(), vec![], request(&y)),
+        ]);
+        drop(holds);
         pool.stop().unwrap();
         fs::remove_dir_all(root).unwrap();
     }

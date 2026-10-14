@@ -909,9 +909,6 @@ impl Jobs {
                 ),
                 code => (code, refusal.message),
             })?;
-        if let Some(pool) = service.gpu() {
-            pool.want(job.root_seq());
-        }
         // A pausing job starts nothing new; a resumed one's held call goes on.
         let engine = &service.engine;
         let held = match Self::holding(engine, &parent.id) {
@@ -1146,9 +1143,6 @@ impl Jobs {
         ))?;
         let job = service.engine.get(&parent.id)
             .map_err(|error| ("child_call_refused", error.to_string()))?;
-        if let Some(pool) = service.gpu() {
-            pool.want(job.root_seq());
-        }
         runs.prefetch(&job, application, entrypoint, choices)
             .map_err(|error| (error.code, error.message))?;
         Ok(Answer::ok(frame.seq))
