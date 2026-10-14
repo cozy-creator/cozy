@@ -379,12 +379,19 @@ impl LocalSources {
             return;
         };
         let _installing = self.installing.lock().unwrap();
-        let named: HashSet<PathBuf> = fs::read_dir(&self.installer.generations)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .filter_map(|generation| fs::read_link(generation.path().join("env")).ok())
-            .collect();
+        // An unavailable or partial inventory says nothing about which sources are unused.
+        let Ok(generations) = fs::read_dir(&self.installer.generations)
+            .and_then(|entries| entries.collect::<std::io::Result<Vec<_>>>()) else { return; };
+        let mut named = HashSet::new();
+        for generation in generations {
+            let env = generation.path().join("env");
+            match fs::read_link(&env) {
+                Ok(target) => { named.insert(target); }
+                // Published generations own an ordinary environment directory.
+                Err(error) if error.kind() == std::io::ErrorKind::InvalidInput && env.is_dir() => {}
+                Err(_) => return,
+            }
+        }
         let kept = collect_environments(&home, &named);
         for entry in fs::read_dir(&home).into_iter().flatten().flatten() {
             let path = entry.path();
@@ -707,6 +714,15 @@ mod tests {
         let held = m.service.catalog.resolve(&installed.generation).unwrap();
         let environment = fs::read_link(m.installer.generations.join(&installed.generation).join("env")).unwrap();
         assert!(environment.starts_with(fs::canonicalize(&first_home).unwrap()), "{environment:?}");
+        // Published generations have a directory, not an editable env symlink. They remain
+        // ordinary inventory entries; a failed directory read must retain every live source.
+        fs::create_dir_all(m.installer.generations.join("published/env")).unwrap();
+        let unavailable = m.root.join("unavailable-generations");
+        fs::rename(&m.installer.generations, &unavailable).unwrap();
+        sources.collect("alice", "local/tensord-cpu-input");
+        assert!(environment.join("bin/python").is_file());
+        assert!(first_home.join("tree/notes.txt").is_file());
+        fs::rename(&unavailable, &m.installer.generations).unwrap();
         // The environment imports the tree itself: nothing of the project was copied into it.
         let imported = run(Command::new(&held.record.python).args(["-I", "-c", "import cpu_input; print(cpu_input.__file__)"]));
         assert_eq!(Path::new(&imported), fs::canonicalize(first_home.join("tree/cpu_input/__init__.py")).unwrap());
