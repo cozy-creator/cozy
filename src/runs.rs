@@ -1703,21 +1703,21 @@ mod tests {
     #[test]
     fn a_canceled_preparation_kills_its_install() {
         for editable in [false, true] {
-        let root = std::env::temp_dir().join(format!("cm-cancel-{editable}-{}", uuid::Uuid::new_v4()));
-        let (runs, objects) = local_runs(&root);
-        let manifest = hanging_package(&objects, &root.join("backend.pid"), editable);
-        let accepted = runs.submit("alice", "warm-1", spec(Source::Local(manifest), true, "w1")).unwrap();
-        let backend = backend_pid(&runs.service.engine, &accepted.id, &root.join("backend.pid"));
-        let canceled = runs.service.engine.cancel_run("alice", "warm-1").unwrap();
-        assert_eq!(canceled.state, State::Canceled);
-        while !gone(backend) {
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        assert_eq!(settled(&runs.service.engine, &accepted.id).state, State::Canceled);
-        assert!(runs.service.engine.installations("alice").unwrap().is_empty(), "a canceled install binds no generation");
-        runs.local.as_ref().unwrap().collect("alice", "local/hanging-build");
-        assert!(!root.join("editable").join(&tensorfs_core::sha256::hex_digest(b"alice")[..16]).join("hanging-build").exists());
-        let _ = fs::remove_dir_all(root);
+            let root = std::env::temp_dir().join(format!("cm-cancel-{editable}-{}", uuid::Uuid::new_v4()));
+            let (runs, objects) = local_runs(&root);
+            let manifest = hanging_package(&objects, &root.join("backend.pid"), editable);
+            let accepted = runs.submit("alice", "warm-1", spec(Source::Local(manifest), true, "w1")).unwrap();
+            let backend = backend_pid(&runs.service.engine, &accepted.id, &root.join("backend.pid"));
+            let canceled = runs.service.engine.cancel_run("alice", "warm-1").unwrap();
+            assert_eq!(canceled.state, State::Canceled);
+            while !gone(backend) {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            assert_eq!(settled(&runs.service.engine, &accepted.id).state, State::Canceled);
+            assert!(runs.service.engine.installations("alice").unwrap().is_empty(), "a canceled install binds no generation");
+            runs.local.as_ref().unwrap().collect("alice", "local/hanging-build");
+            assert!(!root.join("editable").join(&tensorfs_core::sha256::hex_digest(b"alice")[..16]).join("hanging-build").exists());
+            let _ = fs::remove_dir_all(root);
         }
     }
 

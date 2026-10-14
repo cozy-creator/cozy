@@ -775,14 +775,14 @@ mod tests {
     }
 
     /// Two already-running processes import a library module and read its package data only
-    /// after a second remote install. The unchanged root's editable library must be isolated.
+    /// after a second remote install. The main stays unchanged; late root/library files change.
     #[test]
-    fn concurrent_remote_runs_keep_late_library_imports_and_data() {
-        use std::io::{BufRead, BufReader};
+    fn concurrent_remote_runs_keep_late_imports_and_data() {
+        use std::io::{BufRead, BufReader, Write};
         use std::process::{Child, ChildStdout, Stdio};
 
         fn waiting(python: &Path) -> (Child, BufReader<ChildStdout>) {
-            let code = "from pathlib import Path\nimport cpu_library\nprint('ready', flush=True)\ninput()\nfrom cpu_library.late import VALUE\nprint(VALUE + '|' + Path(cpu_library.__file__).with_name('data.txt').read_text(), flush=True)\n";
+            let code = "from pathlib import Path\nimport cpu_library, cpu_input\nprint('ready', flush=True)\ninput()\nfrom cpu_library.late import VALUE\nfrom cpu_input.late import VALUE as ROOT\nprint(ROOT + '|' + Path(cpu_input.__file__).with_name('root-data.txt').read_text() + '|' + VALUE + '|' + Path(cpu_library.__file__).with_name('data.txt').read_text(), flush=True)\n";
             let mut child = Command::new(python).args(["-I", "-u", "-c", code])
                 .stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
             let mut reader = BufReader::new(child.stdout.take().unwrap());
@@ -814,10 +814,12 @@ mod tests {
         fs::write(project.join("pyproject.toml"), pyproject.replace("\"msgspec>=0.19,<1\"", "\"msgspec>=0.19,<1\", \"late-library\"")
             + "\n[tool.uv.sources]\nlate-library = { path = \"deps/library\", editable = true }\n").unwrap();
         let library = project.join("deps/library/cpu_library");
+        fs::write(project.join("cpu_input/late.py"), "VALUE = 'old-root-code'\n").unwrap();
+        fs::write(project.join("cpu_input/root-data.txt"), "old-root-data").unwrap();
         fs::write(library.join("late.py"), "VALUE = 'old-code'\n").unwrap();
         fs::write(library.join("data.txt"), "old-data").unwrap();
         run(Command::new("uv").args(["lock", "--python", "3.12", "--project"]).arg(&project));
-        let files = ["pyproject.toml", "uv.lock", "package.toml", "cpu_input/__init__.py",
+        let files = ["pyproject.toml", "uv.lock", "package.toml", "cpu_input/__init__.py", "cpu_input/late.py", "cpu_input/root-data.txt",
             "deps/library/pyproject.toml", "deps/library/cpu_library/__init__.py",
             "deps/library/cpu_library/late.py", "deps/library/cpu_library/data.txt"];
         let manifest = || {
@@ -829,15 +831,19 @@ mod tests {
         let a = sources.install(&m.service, "alice", &first, None).unwrap();
         let held_a = m.service.catalog.resolve(&a.generation).unwrap();
         let (child_a, reader_a) = waiting(&held_a.record.python);
+        fs::write(project.join("cpu_input/late.py"), "VALUE = 'new-root-code'\n").unwrap();
+        fs::write(project.join("cpu_input/root-data.txt"), "new-root-data").unwrap();
         fs::write(library.join("late.py"), "VALUE = 'new-code'\n").unwrap();
         fs::write(library.join("data.txt"), "new-data").unwrap();
         let second = manifest();
         let b = sources.install(&m.service, "alice", &second, None).unwrap();
         let held_b = m.service.catalog.resolve(&b.generation).unwrap();
-        assert_eq!(held_a.record.source_digest, held_b.record.source_digest, "only its editable library changed");
+        assert_ne!(held_a.record.source_digest, held_b.record.source_digest, "late authored files are another computation");
         assert_ne!(held_a.record.python, held_b.record.python);
         let (child_b, reader_b) = waiting(&held_b.record.python);
         sources.collect("alice", "local/tensord-cpu-input");
+        assert_eq!(finish(child_a, reader_a), "old-root-code|old-root-data|old-code|old-data");
+        assert_eq!(finish(child_b, reader_b), "new-root-code|new-root-data|new-code|new-data");
 
         // Cached source is not a custody substitute after Store GC. A caller must write the
         // missing object before acceptance; doing so reopens the exact existing generation.
@@ -847,8 +853,6 @@ mod tests {
         write(&m.objects, "alice", b"VALUE = 'old-code'\n");
         assert_eq!(sources.written("alice", &first).unwrap().len(), files.len() + 1);
         assert_eq!(sources.install(&m.service, "alice", &first, None).unwrap().generation, a.generation);
-        assert_eq!(finish(child_a, reader_a), "old-code|old-data");
-        assert_eq!(finish(child_b, reader_b), "new-code|new-data");
         let _ = fs::remove_dir_all(m.root);
     }
 
@@ -884,8 +888,9 @@ mod tests {
         let held = m.service.catalog.resolve(&installed.generation).unwrap();
         let callee = held.record.callees.iter().find(|c| c.distribution == "tensord-cpu-memo").expect("the carried callee App");
         assert_eq!((callee.package.as_str(), callee.version.as_str()), ("proof/tensord-cpu-memo", "0.1.0"));
-        // Its environment built, the wheels it was built from are no longer asked for.
-        assert_eq!(sources.written("alice", &with).unwrap().len(), 1);
+        // Acceptance roots the captured files and carried wheel even when its environment
+        // exists: that environment could be reclaimed before a queued run uses it.
+        assert_eq!(sources.written("alice", &with).unwrap().len(), files.len() + 3);
         // Without the wheel the lock's own source is all there is, and uv says so.
         let why = sources.install(&m.service, "alice", &manifest(serde_json::json!([])), None).err().unwrap().message;
         assert!(why.contains("package_dependency_operation_failed: uv sync --frozen exited") && why.contains("tensord-cpu-memo"), "{why}");

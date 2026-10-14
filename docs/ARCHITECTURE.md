@@ -93,7 +93,7 @@ that descends from the machine. Same-UID package code is still not sandboxed.
 | `runs.rs` | Run sources and preparation inside a run: accepted at once, install/download as its progress, the Hub capability in memory only. A warm run with no entrypoint installs and fetches its choices; one with no code makes provider sources and uploads to its weights destination | `Runs`, `Spec`, `Source` | D1 |
 | `weights.rs` | A job's weights: `weights_writer` sources and outputs over TensorFS's native channels; an adopted output kept in a local repository, recorded as a manifest product, published to the run's weights destination | `Weights`, `Grant` | D1 |
 | `objects.rs` | Write: resumable content-addressed objects into the store, recorded per signer | `Objects`, `Writer` | D1 |
-| `local_source.rs` | A run's local source: a live project installed editable, one synced tree (or the directory itself on this computer) and one environment per signer and package | `LocalSources`, `Manifest` | D1 |
+| `local_source.rs` | A run's local source: each remote manifest owns its source tree and editable environment; explicit local paths read the directory in place | `LocalSources`, `Manifest` | D1 |
 | `machine/` | Launch grant, lifetime identity, readiness receipt, rental lifecycle, supervision, SSH, runtime update, the direct player endpoint (`player.rs`), the embedded Python client and installer helper (`client.rs`) | `Grant`, `Readiness`, `Lifecycle` | D2 |
 | `native_inputs.rs` | Native input custody into TensorFS + journal | `SourceIntake`, `IntakeJournal` | D1 |
 | `catalog.rs` | Immutable package environment generations and their holds | `Catalog`, `Generation`, `HeldGeneration` | D1 |

@@ -141,10 +141,10 @@ def install_editable(*, project: Path, environment: Path, wheels: list[Path], di
                      python_requires: str, python_version: str, generations: Path, client_wheel: Path,
                      python: str, sdk: list[Path] = (), callees: dict[str, str] | None = None,
                      indexes: list[str] = (), source_digest: str = ""):
-    """A live project, installed editable: `environment` is built once from the project's lock
-    and kept while the lock stands, and every call publishes a generation that describes the
-    project as it is now and runs in that environment. An edit costs a description, never an
-    install. `wheels` are locked dependencies the caller carries because this machine cannot
+    """Install editable in the controller's source home and environment. Remote captures keep
+    separate source homes/environments; direct local paths reuse their live environment while
+    its lock stands. A ready environment is reused, and every call publishes a generation
+    describing that source. `wheels` are locked dependencies the caller carries because this machine cannot
     fetch them: each installs from its file, at the version the lock selected. `indexes` (name=url)
     are those the project's sources name without declaring: a lock already pins where each
     dependency comes from, so only an unlocked project resolves against them."""
