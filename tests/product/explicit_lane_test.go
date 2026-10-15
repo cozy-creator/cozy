@@ -3,7 +3,6 @@ package producttest
 import (
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/records"
@@ -75,19 +74,20 @@ func TestExplicitLaneWaitsForTheAttachingRentalAndNeverBuysAround(t *testing.T) 
 	waitFor(t, root, "the placement waiting on the H100", func() bool {
 		return len(placementEvents(t, store, row.ID)) > 0
 	})
+	// The H100 is ready but not yet attached: the request is placed on it at once and waits
+	// there for its machine, and nothing is bought around it.
 	placement := placementEvent(t, store, row.ID)
 	verdicts, fits := candidateVerdicts(placement), candidateFits(placement)
-	if verdicts["yumichika"] != "attaching" || verdicts["rtx-4090"] != fourKShort ||
-		verdicts["h100-80"] != "excluded:attaching: yumichika" || verdicts["b200"] != "excluded:attaching: yumichika" {
+	if verdicts["yumichika"] != "chosen" || verdicts["rtx-4090"] != fourKShort {
 		t.Fatalf("verdicts %v", verdicts)
 	}
 	if fits["yumichika"] != "rung_asserted" || fits["rtx-4090"] != "lane_bytes 103.0 GiB (working memory unmeasured) of 24 GB" ||
 		fits["b200"] != "lane_bytes 103.0 GiB (working memory unmeasured) of 180 GB" {
 		t.Fatalf("fits %v", fits)
 	}
-	if placement["override"] != "fp8-adaln-pruned" || placement["rental"] != nil || placement["bought"] != false ||
-		placement["line"] != "placement: wait for yumichika (h100-80, fp8-adaln-pruned) to attach — balanced" {
-		t.Fatalf("the wait record: %v", placement)
+	if placement["override"] != "fp8-adaln-pruned" || placement["rental"] != yumichika.ID || placement["bought"] != false ||
+		placement["line"] != "placement: reuse yumichika (h100-80, fp8-adaln-pruned) — balanced, unmeasured" {
+		t.Fatalf("the placement record: %v", placement)
 	}
 	if ladder, _ := placement["ladder"].([]any); len(ladder) != 1 || ladder[0] != "H100=fp8-adaln-pruned > B200=mxfp8-adaln-pruned > *=bf16-full" {
 		t.Fatalf("the record does not carry the owner's ladder: %v", placement["ladder"])
@@ -97,26 +97,9 @@ func TestExplicitLaneWaitsForTheAttachingRentalAndNeverBuysAround(t *testing.T) 
 			t.Fatalf("a candidate under an override carries a rung: %v", c)
 		}
 	}
-	if queued, problem := store.RequestByIdempotencyKey("explicit-wait"); problem != nil || queued.Worker != "" || settled(queued.State) {
-		t.Fatalf("the waiting request is %+v; want queued and unpinned", queued)
-	}
-	// The worker attaches — address and certificate land on the row — and the fleet's next
-	// observation pins the waiting request to the H100. Calcifer's own reconcile can
-	// rewrite the row from a read taken before the attach, so it is re-asserted until seen.
-	cert := filepath.Join(root, "yumichika.pem")
-	must(t, os.WriteFile(cert, []byte("fixture"), 0600))
-	attached := yumichika
-	attached.Address, attached.CertPath = "127.0.0.1:1", cert
-	fatal(t, store.RecordRental(attached))
-	var placements []map[string]any
-	waitFor(t, root, "the request pinned to the attached H100 and the reuse recorded", func() bool {
-		if current, problem := store.RentalRow(yumichika.ID); problem == nil && current != nil && current.CertPath == "" {
-			_ = store.RecordRental(attached)
-		}
-		placements = placementEvents(t, store, row.ID)
+	waitFor(t, root, "the request pinned to the H100", func() bool {
 		current, problem := store.RequestByIdempotencyKey("explicit-wait")
-		return problem == nil && current != nil && current.Worker == yumichika.ID &&
-			candidateVerdicts(placements[len(placements)-1])["yumichika"] == "chosen"
+		return problem == nil && current != nil && current.Worker == yumichika.ID
 	})
 	pinned, problem := store.RequestByIdempotencyKey("explicit-wait")
 	fatal(t, problem)
@@ -125,17 +108,6 @@ func TestExplicitLaneWaitsForTheAttachingRentalAndNeverBuysAround(t *testing.T) 
 	}
 	if asks := h.postedSKUs(); len(asks) != 0 {
 		t.Fatalf("a fitting rental was bought around: %v", asks)
-	}
-	if last := candidateVerdicts(placements[len(placements)-1]); len(placements) < 2 || last["rtx-4090"] != fourKShort {
-		t.Fatalf("%d placement record(s), last %v; want the wait and then the reuse", len(placements), last)
-	}
-	log, err := os.ReadFile(filepath.Join(root, "calcifer.log"))
-	must(t, err)
-	for _, want := range []string{"placement: wait for yumichika (h100-80, fp8-adaln-pruned) to attach — balanced",
-		"placement: reuse yumichika (h100-80, fp8-adaln-pruned) — balanced, unmeasured;"} {
-		if !strings.Contains(string(log), want) {
-			t.Fatalf("calcifer.log does not say %q:\n%s", want, tail(filepath.Join(root, "calcifer.log")))
-		}
 	}
 }
 
