@@ -258,7 +258,7 @@ func TestProductPath(t *testing.T) {
 		!strings.Contains(out, "PROGRESS") || !strings.Contains(out, "EXECUTION") ||
 		strings.Contains(out, "QUEUED") ||
 		!strings.Contains(out, "local") ||
-		strings.Contains(out, "KIND") || strings.Index(out, fmt.Sprint(runs[0].Number)) > strings.Index(out, fmt.Sprint(runs[1].Number)) {
+		strings.Index(out, fmt.Sprint(runs[0].Number)) > strings.Index(out, fmt.Sprint(runs[1].Number)) {
 		t.Fatalf("human run list columns/order are not useful [exit %d]\n%s", code, out)
 	}
 

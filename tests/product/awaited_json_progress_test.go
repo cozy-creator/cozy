@@ -12,9 +12,9 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-func TestAwaitedJobJSONSeparatesEventsAndResult(t *testing.T) {
+func TestAwaitedRunJSONSeparatesEventsAndResult(t *testing.T) {
 	integration(t)
-	root, err := os.MkdirTemp("", "cozy-job-json-")
+	root, err := os.MkdirTemp("", "cozy-run-json-")
 	must(t, err)
 	t.Cleanup(func() { _, _ = runCozy(t, root, "down", "--all"); _ = os.RemoveAll(root) })
 	script := filepath.Join(t.TempDir(), "simple.py")
@@ -31,7 +31,7 @@ def main(ctx):
 	code, stdout, stderr := runCozyStreams(t, root, "--json", "run", script, "--await", "--full")
 	var result map[string]any
 	if code != 0 || json.Unmarshal([]byte(stdout), &result) != nil || result["status"] != "completed" {
-		t.Fatalf("job did not return one final JSON document: code=%d stdout=%s stderr=%s", code, stdout, stderr)
+		t.Fatalf("the run did not return one final JSON document: code=%d stdout=%s stderr=%s", code, stdout, stderr)
 	}
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
@@ -65,7 +65,7 @@ def main(ctx):
 	for _, line := range strings.Split(strings.TrimSpace(stderr), "\n") {
 		var event map[string]any
 		if err := json.Unmarshal([]byte(line), &event); err != nil || event["type"] == nil {
-			t.Fatalf("job stderr contains a non-event: %q (%v)", line, err)
+			t.Fatalf("the run's stderr contains a non-event: %q (%v)", line, err)
 		}
 	}
 }

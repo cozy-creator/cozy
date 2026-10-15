@@ -156,14 +156,19 @@ func TestEndpointRunSignsWithItsRentalKey(t *testing.T) {
 	}
 	root, err := os.MkdirTemp(os.TempDir(), "cze")
 	must(t, err)
-	// The rental's Hub: it answers the ready rental whose machine the endpoint names.
+	// The rental's Hub: it answers the ready rental whose machine the endpoint names, and where
+	// a signed-in run's machine reaches it.
 	var standin []byte
-	hubServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1/rentals/pr-standin" || standin == nil {
+	var hubServer *httptest.Server
+	hubServer = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/v1/rentals/pr-standin" && standin != nil:
+			_, _ = w.Write(standin)
+		case r.URL.Path == "/v1/execution-environment":
+			_ = json.NewEncoder(w).Encode(map[string]any{"environment": map[string]string{"TENSORHUB_ORIGIN": hubServer.URL}})
+		default:
 			http.NotFound(w, r)
-			return
 		}
-		_, _ = w.Write(standin)
 	}))
 	t.Cleanup(hubServer.Close)
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+hubServer.URL+"\ntensorhub_token: endpoint-test\n"), 0o600))

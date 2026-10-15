@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/config"
@@ -64,8 +65,9 @@ func TestARentalRunNamesTheNewestReleaseWhateverIsInstalledHere(t *testing.T) {
 			}
 			store.Close()
 			startCalciferProcess(t, root)
+			// This Hub offers no machine, so the run fails at placement; the request names its release first.
 			code, out := runCozy(t, root, "run", "proof/releases/compute", "--rental-only", "--json", "--idempotency-key", "release-proof")
-			if code != 0 {
+			if code != 0 && !strings.Contains(out, "rental.catalog_empty") {
 				t.Fatalf("submission failed [exit %d]: %s", code, out)
 			}
 			store, problem = records.Open(filepath.Join(root, "creator.sqlite"))

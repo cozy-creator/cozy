@@ -23,7 +23,7 @@ func TestTopLevelMediaExportsAndTextDoesNotCreateDirectory(t *testing.T) {
 	wheel, err := filepath.Abs(*privateScriptRuntimeWheel)
 	must(t, err)
 	version := runtimeFixtureVersion(t, wheel)
-	root, err := os.MkdirTemp("", "cozy-job-export-")
+	root, err := os.MkdirTemp("", "cozy-media-export-")
 	must(t, err)
 	control := filepath.Join(t.TempDir(), "control")
 	uv := func(args ...string) {
@@ -48,7 +48,7 @@ func TestTopLevelMediaExportsAndTextDoesNotCreateDirectory(t *testing.T) {
 	})
 	project := t.TempDir()
 	metadata := fmt.Sprintf(`[project]
-name="job-media-export-proof"
+name="media-export-proof"
 version="0.0.1"
 requires-python=">=3.12,<3.13"
 dependencies=["cozy-runtime>=%s"]
@@ -94,8 +94,8 @@ def picture(payload:Request,out:Outputs)->Picture:
 		return result
 	}
 	run("package", "install", project, "--json")
-	run("run", "local/job-media-export-proof/text", "--await", "--json")
-	defaultDir := filepath.Join(root, "outputs", "local-job-media-export-proof")
+	run("run", "local/media-export-proof/text", "--await", "--json")
+	defaultDir := filepath.Join(root, "outputs", "local-media-export-proof")
 	if _, err := os.Stat(defaultDir); !os.IsNotExist(err) {
 		t.Fatalf("a text-only run created an outputs directory: %v", err)
 	}
@@ -104,7 +104,7 @@ def picture(payload:Request,out:Outputs)->Picture:
 	defer store.Close()
 	for _, explicit := range []bool{false, true} {
 		directory := defaultDir
-		args := []string{"run", "local/job-media-export-proof/picture", "--await", "--json"}
+		args := []string{"run", "local/media-export-proof/picture", "--await", "--json"}
 		if explicit {
 			directory = filepath.Join(root, "custom-output")
 			args = append(args, "--out", directory)

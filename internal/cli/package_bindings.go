@@ -81,10 +81,10 @@ func handlePackageBindings(ctx *Context) *exit.Error {
 		}
 		l.Rows = append(l.Rows, row)
 	}
-	declared, serving := map[string]bool{}, map[string]bool{}
+	declared, constructed := map[string]bool{}, map[string]bool{}
 	for _, entrypoint := range packageInterface.Entrypoints {
 		for _, slot := range entrypoint.Models {
-			serving[slot.Path] = true
+			constructed[slot.Path] = constructed[slot.Path] || !slot.Weights
 		}
 	}
 	slots := declaredModelSlots(packageInterface.Entrypoints)
@@ -112,8 +112,8 @@ func handlePackageBindings(ctx *Context) *exit.Error {
 		l.Notes = []string{ref.String() + "@" + release + " declares no model slots."}
 	}
 	for _, row := range l.Rows {
-		// A job's model input may come from its caller; only a serving slot needs one.
-		if row["source"] == "none" && serving[row["slot"]] {
+		// A `Weights[M]` argument is its caller's raw input; only a constructed slot needs one.
+		if row["source"] == "none" && constructed[row["slot"]] {
 			l.Next = []string{"cozy package bind " + ref.String() + " " + row["slot"] + " <org/model@release> --gpu <GPU>=<lane>"}
 			break
 		}
