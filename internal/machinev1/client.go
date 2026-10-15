@@ -85,7 +85,9 @@ func Dial(addr string, tlsConfig *tls.Config, worker string, signer Signer) (*Cl
 	c.dialUploads = func() (*grpc.ClientConn, error) { return grpc.NewClient(addr, uploading...) }
 	warming, stop := context.WithCancel(context.Background())
 	c.stop = stop
-	go c.warm(warming)
+	if host, _, err := net.SplitHostPort(addr); err != nil || host != "localhost" && !net.ParseIP(host).IsLoopback() {
+		go c.warm(warming) // this computer's machine has no path to keep warm
+	}
 	return c, nil
 }
 
