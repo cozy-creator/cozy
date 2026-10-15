@@ -171,6 +171,15 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 		s.refuseTyped(w, r, problem)
 		return
 	}
+	// Object order and whitespace are not intent: the identity hashes the normalized input.
+	if len(sub.Input) > 0 {
+		normalized, err := canonical.NormalizeApplication(sub.Input)
+		if err != nil {
+			s.refuseTyped(w, r, exit.New(exit.Validation, "input cannot be encoded as canonical JSON: %s", err))
+			return
+		}
+		sub.Input = normalized
+	}
 	selectedHub, e := s.hubOf(r)
 	if e != nil {
 		s.refuseTyped(w, r, e)

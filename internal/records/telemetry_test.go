@@ -47,9 +47,11 @@ func TestTelemetryRowsAreBatchedInOrderAndKept(t *testing.T) {
 		observe(&v1.RunEvent{Sequence: 2 * k, AtMs: 1, Event: &v1.RunEvent_Progress{Progress: &v1.Progress{Stage: "denoise", Fraction: float64(k) / 40}}})
 	}
 	observe(log(19, "before 10")) // resent by a reattach
-	observe(&v1.RunEvent{Sequence: 100, Event: &v1.RunEvent_State{State: &v1.RunState{Id: "run", State: "paused", Attempt: 1}}})
+	// A transition: the run queues again on its machine, then runs.
+	observe(&v1.RunEvent{Sequence: 100, Event: &v1.RunEvent_State{State: &v1.RunState{Id: "run", State: "queued", Attempt: 1}}})
+	observe(&v1.RunEvent{Sequence: 101, Event: &v1.RunEvent_State{State: &v1.RunState{Id: "run", State: "running", Attempt: 1}}})
 	for k := uint64(1); k <= 5; k++ {
-		observe(log(100+k, fmt.Sprint("after ", k)))
+		observe(log(101+k, fmt.Sprint("after ", k)))
 	}
 	// The writer batches these without any transition; then the outcome follows them.
 	for until := time.Now().Add(time.Minute); ; time.Sleep(10 * time.Millisecond) {
@@ -74,27 +76,29 @@ func TestTelemetryRowsAreBatchedInOrderAndKept(t *testing.T) {
 		t.Fatal(problem.Message)
 	}
 	var logs []string
-	progress, paused, ended := 0, -1, -1
+	progress, resumed, ended := 0, -1, -1
 	for i, row := range rows {
 		switch row.Type {
 		case "request.log":
 			line := fmt.Sprint(row.Payload["message"])
-			if strings.HasPrefix(line, "before") != (paused < 0) || ended >= 0 {
+			if strings.HasPrefix(line, "before") != (resumed < 0) || ended >= 0 {
 				t.Fatalf("%s is on the wrong side of a transition", line)
 			}
 			logs = append(logs, line)
 		case "machine.progress":
 			progress++
-		case "request.paused":
-			paused = i
+		case "run.in_progress":
+			if len(logs) > 0 {
+				resumed = i
+			}
 		case "run.completed":
 			ended = i
 		}
 	}
 	if len(logs) != 45 || logs[0] != "before 1" || logs[39] != "before 40" || logs[44] != "after 5" || progress != 40 || ended < 0 {
-		t.Fatalf("logs %d (%v … %v), progress %d, paused at %d, ended at %d", len(logs), logs[0], logs[len(logs)-1], progress, paused, ended)
+		t.Fatalf("logs %d (%v … %v), progress %d, running again at %d, ended at %d", len(logs), logs[0], logs[len(logs)-1], progress, resumed, ended)
 	}
-	if link, _ := s.MachineExecution("run"); link == nil || link.RemoteCursor != 105 {
+	if link, _ := s.MachineExecution("run"); link == nil || link.RemoteCursor != 106 {
 		t.Fatalf("cursor %+v", link)
 	}
 }
