@@ -69,6 +69,32 @@ pub fn process_ended(birth: &ProcessBirth) -> io::Result<bool> {
     }
 }
 
+/// Ended or certain to end: gone, a zombie, exiting, or with SIGKILL pending. A process the
+/// kernel is tearing down, perhaps in uninterruptible sleep, still holds its files.
+pub fn dying(birth: &ProcessBirth) -> io::Result<bool> {
+    const PF_EXITING: u64 = 0x4;
+    if process_ended(birth)? {
+        return Ok(true);
+    }
+    match process_stat(birth.pid) {
+        Ok(stat) if stat.flags & PF_EXITING != 0 => return Ok(true),
+        Ok(_) => {}
+        Err(error) if gone(&error) => return Ok(true),
+        Err(error) => return Err(error),
+    }
+    let status = match fs::read_to_string(format!("/proc/{}/status", birth.pid)) {
+        Ok(status) => status,
+        Err(error) if gone(&error) => return Ok(true),
+        Err(error) => return Err(error),
+    };
+    let kill = 1u64 << (libc::SIGKILL - 1);
+    Ok(status
+        .lines()
+        .filter_map(|line| line.strip_prefix("SigPnd:").or_else(|| line.strip_prefix("ShdPnd:")))
+        .filter_map(|mask| u64::from_str_radix(mask.trim(), 16).ok())
+        .any(|mask| mask & kill != 0))
+}
+
 /// `/proc/<pid>` vanished: ENOENT, or ESRCH when the process was reaped mid-read.
 pub fn gone(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
@@ -83,6 +109,8 @@ fn boot_id() -> io::Result<String> {
 struct Stat {
     state: char,
     pgrp: i32,
+    /// The kernel's PF_* flags.
+    flags: u64,
     start_ticks: u64,
 }
 
@@ -101,6 +129,7 @@ fn process_stat(pid: u32) -> io::Result<Stat> {
     Ok(Stat {
         state: field(0)?.chars().next().unwrap_or('?'),
         pgrp: field(2)?.parse().map_err(io::Error::other)?,
+        flags: field(6)?.parse().map_err(io::Error::other)?,
         start_ticks: field(19)?.parse().map_err(io::Error::other)?,
     })
 }

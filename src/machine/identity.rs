@@ -21,7 +21,10 @@ pub struct Lifetime {
 
 /// One machine per root. Every machine on a root holds this lock for its life, and a launcher
 /// probes it before it starts or replaces one: the Go agent's `agent.lock`, so each agent
-/// excludes the other. The kernel releases it when the last machine process is gone.
+/// excludes the other. The kernel releases it when the last machine process is gone. A
+/// killed predecessor's service holds it a moment longer, exiting (perhaps in uninterruptible
+/// sleep, its descriptors already closed): a live holder refuses the root, and a lock only
+/// dying processes or none hold is waited out until the kernel releases it.
 pub fn hold(layout: &Layout) -> io::Result<()> {
     use fs2::FileExt;
     fs::create_dir_all(&layout.state)?;
@@ -32,18 +35,33 @@ pub fn hold(layout: &Layout) -> io::Result<()> {
         .truncate(false)
         .mode(0o600)
         .open(layout.state.join("agent.lock"))?;
-    lock.try_lock_exclusive().map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            format!(
-                "another machine owns the root {}",
-                layout.root.display()
-            ),
-        )
-    })?;
+    if lock.try_lock_exclusive().is_err() {
+        let dying = |pid: &u32| crate::process::process_birth(*pid).and_then(|birth| crate::process::dying(&birth)).unwrap_or(true);
+        if let Some(live) = holders(&lock)?.into_iter().find(|pid| !dying(pid)) {
+            let root = layout.root.display();
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("another machine owns the root {root} (pid {live})")));
+        }
+        lock.lock_exclusive()?;
+    }
     // Held by this parent and the service it forks; never by an executor (close-on-exec).
     std::mem::forget(lock);
     Ok(())
+}
+
+/// Every process with `file` open, but for this descriptor of it.
+fn holders(file: &File) -> io::Result<Vec<u32>> {
+    use std::os::{fd::AsRawFd, unix::fs::MetadataExt};
+    let (own, probe) = (file.metadata()?, (std::process::id(), file.as_raw_fd().to_string()));
+    let mut found = vec![];
+    for entry in fs::read_dir("/proc")? {
+        let Some(pid) = entry?.file_name().to_str().and_then(|name| name.parse::<u32>().ok()) else { continue };
+        let Ok(fds) = fs::read_dir(format!("/proc/{pid}/fd")) else { continue };
+        let open = fds.flatten().filter(|fd| (pid, fd.file_name().to_string_lossy().into_owned()) != probe);
+        if open.filter_map(|fd| fs::metadata(fd.path()).ok()).any(|meta| (meta.dev(), meta.ino()) == (own.dev(), own.ino())) {
+            found.push(pid);
+        }
+    }
+    Ok(found)
 }
 
 /// Mints or reopens this root's lifetime. A root booted by the Go agent keeps its boot id
@@ -164,6 +182,30 @@ fn invalid(detail: &str) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A holder just killed is waited out, never refused; a live one is refused.
+    #[test]
+    fn a_killed_holder_is_waited_out_and_a_live_one_refused() {
+        const HOLD: &str = "import fcntl, sys, time; f = open(sys.argv[1], 'a'); \
+            fcntl.flock(f, fcntl.LOCK_EX); print('held', flush=True); time.sleep(600)";
+        let root = std::env::temp_dir().join(format!("tensord-hold-{}", URL_SAFE_NO_PAD.encode(random::<9>().unwrap())));
+        let layout = Layout::new(&root, None);
+        fs::create_dir_all(&layout.state).unwrap();
+        let mut holder = std::process::Command::new("python3").args(["-c", HOLD]).arg(layout.state.join("agent.lock"))
+            .stdout(std::process::Stdio::piped()).spawn().unwrap();
+        holder.stdout.take().unwrap().read_exact(&mut [0u8; 5]).unwrap();
+        let birth = crate::process::process_birth(holder.id()).unwrap();
+        assert!(!crate::process::dying(&birth).unwrap());
+        assert_eq!(hold(&layout).unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        holder.kill().unwrap();
+        assert!(crate::process::dying(&birth).unwrap());
+        hold(&layout).unwrap();
+        holder.wait().unwrap();
+        assert!(crate::process::dying(&birth).unwrap());
+        // This process holds it now: a second machine here is refused.
+        assert_eq!(hold(&layout).unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn lifetime_survives_restart_and_adopts_a_go_booted_root() {
