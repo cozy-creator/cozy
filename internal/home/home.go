@@ -109,13 +109,6 @@ func Paths(root string) Layout {
 	return l
 }
 
-// DependencyCache is disposable immutable payload storage under tmp/: a capture holds its
-// scratch claim shared while it reads, and a Calcifer that starts with no capture reading it
-// reclaims it with the rest of tmp/.
-func (l Layout) DependencyCache() string {
-	return filepath.Join(l.Tmp, "dependency-objects")
-}
-
 // HubWheels holds each wheel an unpublished package's lock selects from a Tensorhub index, once
 // per hash, for its machines.
 func (l Layout) HubWheels() string {
@@ -163,11 +156,6 @@ func (l Layout) PendingRentalCreatorIdentity(operationKey string) string {
 // public — trusting exactly this PEM and no CA is what makes the pin a pin (#445).
 func (l Layout) RentalCert(id string) string { return filepath.Join(l.Rentals, id+".pem") }
 
-// AcquisitionLocks is the model-acquisition flock directory: one lock file per exact
-// Manifest, electing the one live mover across processes. Lock files are ephemeral
-// coordination, created on demand; the empty directory is pruned at boot.
-func (l Layout) AcquisitionLocks() string { return filepath.Join(l.Tmp, "locks") }
-
 // InstallDir is where one install's source tree and venv live. The directory is replaced
 // wholesale, never mutated. "generations" was the wrong name for the FOLDER -- in a product
 // that generates media, a top-level `generations/` reads as the output namespace, which is
@@ -193,32 +181,10 @@ func (l Layout) PublicationRoot(org, requestID string) string {
 	return filepath.Join(l.Publications, org, "_job-"+requestID)
 }
 
-// PublicationStage is where ONE attempt of a job is granted to write. It is under the
-// publication root but is not the addressable publication: `.staging` is outside the
-// output-id namespace (an output id is a declared result FIELD PATH and cannot begin with
-// a dot), so a committed bundle and an attempt in flight never share a name.
-func (l Layout) PublicationStage(org, requestID string, attempt uint64) string {
-	return filepath.Join(l.PublicationRoot(org, requestID), ".staging", "a"+itoa(attempt))
-}
-
 // PackageOutputs is where one package's result files are kept: `outputs/<org>-<name>`.
 // The org/name separator becomes a dash so a package is one directory, never a tree.
 func (l Layout) PackageOutputs(pkg string) string {
 	return filepath.Join(l.Outputs, strings.ReplaceAll(pkg, "/", "-"))
-}
-
-func itoa(n uint64) string {
-	if n == 0 {
-		return "0"
-	}
-	var buf [20]byte
-	i := len(buf)
-	for n > 0 {
-		i--
-		buf[i] = byte('0' + n%10)
-		n /= 10
-	}
-	return string(buf[i:])
 }
 
 // VenvPython is the interpreter inside one venv — `bin/python` where venvs have a bin,

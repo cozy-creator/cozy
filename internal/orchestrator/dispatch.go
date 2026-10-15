@@ -3,7 +3,6 @@ package orchestrator
 import (
 	"encoding/base64"
 	"strings"
-	"time"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -108,31 +107,6 @@ type Result struct {
 	Cause      string
 	Outputs    []records.Output
 	Body       []byte // the TerminalBody document, exactly as it was digested
-}
-
-// Submit records the request and dispatches its FIRST attempt. It is idempotent in the
-// strong sense: the same key with the same body answers with the recorded request and
-// its current attempt, and never starts a second execution. Re-dispatch is the
-// orchestrator's requeue PROJECTION over a terminal, never a client repeating itself.
-func (c *Orchestrator) Submit(s Submission) (string, uint64, *exit.Error) {
-	id, attempt, _, e := c.SubmitDetail(s)
-	return id, attempt, e
-}
-
-// SubmitDetail is Submit plus the one fact an HTTP host must not guess: whether THIS
-// call started the work. A client that retried a timed-out POST needs "202, I started it"
-// and "200, this key was already yours" to be different answers, and inferring it from
-// equal request ids is a race.
-func (c *Orchestrator) SubmitDetail(s Submission) (string, uint64, bool, *exit.Error) {
-	req, fresh, e := c.RecordSubmission(s)
-	if e != nil {
-		return "", 0, false, e
-	}
-	if !fresh {
-		return req.ID, uint64(req.Ordinal), false, nil
-	}
-	attempt, e := c.activateRecorded(req)
-	return req.ID, attempt, true, e
 }
 
 // ActivateRecordedRequest is the second half for callers that transactionally
@@ -445,109 +419,12 @@ func (c *Orchestrator) retireClassic(req records.Request) {
 	c.RetryOutputExport(req.ID)
 	go c.cleanupRequestAssets(req)
 	c.logf("%s FAILED before any offer: %s", req.ID, cause.Message)
-	c.signalClosed(requestWaitKey(req.ID), cause)
 }
 
 // DefaultMaxOutputMiB is the per-output bound when Options.MaxOutputMiB is unset. It
 // matches the Runtime/package media object envelope; attempt and pod quotas still bound
 // the aggregate.
 const DefaultMaxOutputMiB int64 = 512
-
-// Await blocks until the attempt is closed — the terminal accepted, its outputs visible,
-// and the ack sent. The error it returns is the orchestrator's PROJECTION of the neutral
-// terminal, never a worker-authored retryability claim.
-func (c *Orchestrator) Await(requestID string, attempt uint64, timeout time.Duration) (*Result, *exit.Error) {
-	w, release := c.acquireWait(key(requestID, attempt))
-	defer release()
-	if row, e := c.opt.Store.AttemptRow(requestID, int64(attempt)); e == nil && row != nil && row.State == "closed" {
-		w.markClosed(outcomeError(row.TerminalStatus, row.TerminalCause, row.SafeMessage))
-	}
-	select {
-	case <-w.closed:
-	case <-time.After(timeout):
-		return nil, exit.New(exit.Deadline, "%s#%d did not reach a terminal in %s",
-			requestID, attempt, timeout)
-	}
-	row, e := c.opt.Store.AttemptRow(requestID, int64(attempt))
-	if e != nil {
-		return nil, e
-	}
-	if row == nil {
-		return nil, exit.Internalf("%s#%d closed with no row", requestID, attempt)
-	}
-	outs, e := c.opt.Store.VisibleOutputs(requestID)
-	if e != nil {
-		return nil, e
-	}
-	return &Result{
-		RequestID: requestID, Attempt: attempt, AttemptKey: row.AttemptKey,
-		Status: row.TerminalStatus, Cause: row.TerminalCause,
-		Outputs: outs, Body: row.TerminalBody,
-	}, w.err
-}
-
-// AwaitSettled blocks until the REQUEST settles — through however many requeued
-// ordinals the orchestrator's projection minted. This is what a caller waits on; an
-// individual attempt is the orchestrator's business.
-func (c *Orchestrator) AwaitSettled(requestID string, timeout time.Duration) (*Result, *exit.Error) {
-	w, release := c.acquireWait(requestWaitKey(requestID))
-	defer release()
-	if row, e := c.opt.Store.RequestRow(requestID); e == nil && row != nil && settledState(row.State) {
-		attempts, read := c.opt.Store.Attempts(requestID)
-		if read == nil && len(attempts) > 0 {
-			last := attempts[len(attempts)-1]
-			w.markClosed(outcomeError(last.TerminalStatus, last.TerminalCause, last.SafeMessage))
-		} else {
-			w.markClosed(exit.Named(exit.Failed, row.State, "request %s settled %s before an attempt", requestID, row.State))
-		}
-	}
-	select {
-	case <-w.closed:
-	case <-time.After(timeout):
-		return nil, exit.New(exit.Deadline, "%s did not settle in %s", requestID, timeout)
-	}
-	row, e := c.opt.Store.RequestRow(requestID)
-	if e != nil || row == nil {
-		return nil, exit.Internalf("%s settled with no row", requestID)
-	}
-	attempts, e := c.opt.Store.Attempts(requestID)
-	if e != nil || len(attempts) == 0 {
-		return nil, exit.Internalf("%s settled with no attempt", requestID)
-	}
-	last := attempts[len(attempts)-1]
-	outs, e := c.opt.Store.VisibleOutputs(requestID)
-	if e != nil {
-		return nil, e
-	}
-	return &Result{
-		RequestID: requestID, Attempt: uint64(last.Attempt), AttemptKey: last.AttemptKey,
-		Status: last.TerminalStatus, Cause: last.TerminalCause, Outputs: outs,
-		Body: last.TerminalBody,
-	}, w.err
-}
-
-// AwaitAccepted blocks until AttemptAccepted is journaled — the acceptance boundary a
-// submit→accepted benchmark measures.
-func (c *Orchestrator) AwaitAccepted(requestID string, attempt uint64, timeout time.Duration) *exit.Error {
-	w, release := c.acquireWait(key(requestID, attempt))
-	defer release()
-	if row, e := c.opt.Store.AttemptRow(requestID, int64(attempt)); e == nil && row != nil {
-		if row.AcceptedAt != "" {
-			w.markAccepted()
-		}
-		if row.State == "closed" {
-			w.markClosed(outcomeError(row.TerminalStatus, row.TerminalCause, row.SafeMessage))
-		}
-	}
-	select {
-	case <-w.accepted:
-		return nil
-	case <-w.closed:
-		return w.err
-	case <-time.After(timeout):
-		return exit.New(exit.Deadline, "%s#%d was not accepted in %s", requestID, attempt, timeout)
-	}
-}
 
 // ClientCancelGraceMS is the one cooperative attempt-cancellation policy. It is a
 // cancellation budget carried to Runtime, never a stall or caller deadline.

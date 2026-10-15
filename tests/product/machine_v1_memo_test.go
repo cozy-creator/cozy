@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -142,11 +141,7 @@ func memoMachine(t *testing.T) (root, counter string) {
 			_ = removeAllForce(root)
 		}
 	})
-	project := filepath.Join(t.TempDir(), "cpu_memo")
-	must(t, os.CopyFS(project, os.DirFS(filepath.Join(filepath.Dir(*cpuLongform), "cpu_memo"))))
-	if out, err := exec.Command("uv", "lock", "--directory", project).CombinedOutput(); err != nil {
-		t.Fatalf("uv lock: %v\n%s", err, out)
-	}
+	project := tensordFixture(t, filepath.Join(filepath.Dir(*cpuLongform), "cpu_memo"))
 	if code, out := runCozy(t, root, "package", "install", project); code != 0 {
 		t.Fatalf("package install [exit %d]\n%s", code, out)
 	}

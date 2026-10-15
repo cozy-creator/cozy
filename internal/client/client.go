@@ -457,9 +457,3 @@ func (c *Client) Down(all bool) (api.DownResult, *exit.Error) {
 	e := c.call(http.MethodPost, "/v1/local/calcifer/down", body, &out)
 	return out, e
 }
-
-func (c *Client) KeepRentalAlive(id string) (api.RentalKeepaliveResult, *exit.Error) {
-	var result api.RentalKeepaliveResult
-	problem := c.call(http.MethodPost, "/v1/local/rentals/"+url.PathEscape(id)+"/keepalive", nil, &result)
-	return result, problem
-}

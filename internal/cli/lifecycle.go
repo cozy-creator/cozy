@@ -276,7 +276,7 @@ func offlineDownBlockers(ctx *Context) ([]string, *exit.Error) {
 	var blockers []string
 	for _, o := range obligations {
 		switch o.Kind {
-		case "invocation", "job", "rental", "rental_operation":
+		case "invocation", "rental", "rental_operation":
 			blockers = append(blockers, o.String())
 		}
 	}

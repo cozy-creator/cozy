@@ -135,20 +135,6 @@ func GPUCountUnusable(available int, requested uint32) string {
 	return ""
 }
 
-// Size pins the selection onto one machine and holds its device to what the pinned lanes
-// need (cl-168, cl-170): Models, Rung and Lane, then Fit — the rule that sized it — and
-// the verdict that keeps it out, no_rung or vram_short. `device` is false for a CPU-class
-// request, or a machine the catalog no longer sizes: nothing is compared.
-//
-// Component-staged selections with exact workload/manifest/SKU evidence use the
-// larger of resident weights and the observed total allocator peak. Without exact
-// total evidence they use declared residency and report the missing measurement.
-// Other selections retain the legacy weights-plus-working estimate.
-func Size(c *orchestrator.PlacementCandidate, models []records.ModelRef, accelerator string,
-	vramGB int64, device bool, working records.WorkingPeaks) {
-	size(c, models, accelerator, vramGB, device, working, c.GPUs)
-}
-
 func size(c *orchestrator.PlacementCandidate, models []records.ModelRef, accelerator string,
 	vramGB int64, device bool, working records.WorkingPeaks, count int) {
 	c.RunGPUs = count

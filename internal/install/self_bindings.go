@@ -7,7 +7,7 @@ import (
 )
 
 // CaptureSelfBindings records one immutable child binding per `@invocable`
-// job or serving entrypoint an install exposes to itself.
+// function an install exposes to itself.
 //
 // A binding is the frozen resolution of one callable — which install, which
 // entrypoint, which carrier revision — and every consumer reads it: the child

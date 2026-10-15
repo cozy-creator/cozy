@@ -301,30 +301,6 @@ func (s *Store) SpawnWorker(w WorkerProcess) *exit.Error {
 	return nil
 }
 
-// AttachWorker journals a worker this host did not spawn (a rented pod's, cl-015). It is
-// SpawnWorker minus the device arbitration, and that subtraction is the whole reason it
-// exists: the envelope fence arbitrates a scarce LOCAL resource, and a process on someone
-// else's machine holds none of it. Routing an attach through the fence refused it with
-// `a worker process needs a device envelope` — a local rule applied to a non-local fact.
-//
-// The identity fence is still here: the instance id is the primary key, so re-attaching
-// one rental lands on its own row rather than accumulating one per request.
-func (s *Store) AttachWorker(w WorkerProcess) *exit.Error {
-	if _, err := s.db.Exec(`
-		INSERT INTO worker_processes(instance_id,package,install_id,worker_id,
-		  devices,pid,birth,state,opened_at)
-		VALUES(?,?,?,?,'',0,'','spawned',?)
-		ON CONFLICT(instance_id) DO UPDATE SET
-		  install_id=excluded.install_id,
-		  session_id=NULL,
-		  state='spawned', opened_at=excluded.opened_at, closed_at=''`,
-		w.InstanceID, w.Package, nullable(w.InstallID), w.WorkerID,
-		now()); err != nil {
-		return exit.Internalf("cannot journal the attached worker %s: %s", w.InstanceID, err)
-	}
-	return nil
-}
-
 func nullable(s string) any {
 	if s == "" {
 		return nil
@@ -358,46 +334,6 @@ func (s *Store) DeviceHolders(devices []string) ([]string, *exit.Error) {
 		out = append(out, id)
 	}
 	return out, nil
-}
-
-// BindSession records what Register reported. session_id is the WORKER's to mint; the
-// orchestrator only binds it, and the unique index refuses two live workers sharing one.
-func (s *Store) BindSession(instanceID, sessionID string) *exit.Error {
-	res, err := s.db.Exec(`UPDATE worker_processes
-		SET session_id=?, state='registered'
-		WHERE instance_id=? AND state != 'closed'`, sessionID, instanceID)
-	if err != nil {
-		return exit.New(exit.Conflict, "cannot bind session %s to %s: %s", sessionID, instanceID, err).
-			WithRemedy("a session_id is bound to at most one live worker")
-	}
-	if n, _ := res.RowsAffected(); n != 1 {
-		return exit.New(exit.Conflict, "no live worker process %s to bind session %s to",
-			instanceID, sessionID)
-	}
-	return nil
-}
-
-// WorkerStarted attaches the OS process-birth identity to a row whose device grant was
-// already journaled. The grant comes FIRST and the process second: a process that was
-// never admitted cannot exist, and the identity that proves it is the kernel's.
-func (s *Store) WorkerStarted(instanceID string, pid int, birth string) *exit.Error {
-	if pid <= 0 || birth == "" {
-		return exit.Named(exit.Conflict, "worker_birth_identity_missing",
-			"worker %s started without a complete OS process-birth identity", instanceID).
-			WithRemedy("stop the child before releasing its device grant")
-	}
-	result, err := s.db.Exec(`UPDATE worker_processes SET pid=?, birth=?, state='spawned'
-		WHERE instance_id=? AND worker_id='local' AND state='spawned_without_birth'`,
-		pid, birth, instanceID)
-	if err != nil {
-		return exit.Internalf("cannot record the birth identity of %s: %s", instanceID, err)
-	}
-	if changed, _ := result.RowsAffected(); changed != 1 {
-		return exit.Named(exit.Conflict, "worker_birth_identity_not_pending",
-			"worker %s has no pending local birth identity", instanceID).
-			WithRemedy("only the launcher that reserved this worker may attach its OS identity")
-	}
-	return nil
 }
 
 // CloseWorker releases the process row AND, with it, its device grant.
@@ -1106,70 +1042,6 @@ func (s *Store) BindRequestPlan(id, planID string) *exit.Error {
 	return nil
 }
 
-// BindRemoteInvocation records the exact invocation identity learned from the worker
-// after logical package_set resolution. The client never supplies these values.
-func (s *Store) BindRemoteInvocation(id, planID, installation string) *exit.Error {
-	if id == "" || planID == "" || installation == "" {
-		return exit.Internalf("cannot bind an incomplete remote invocation identity")
-	}
-	result, err := s.db.Exec(`UPDATE requests SET plan_id=?,installation_id=?
-		WHERE id=? AND (plan_id='' OR plan_id=?) AND installation_id=''`,
-		planID, installation, id, planID)
-	if err != nil {
-		return exit.Internalf("cannot bind request %s remote invocation: %s", id, err)
-	}
-	changed, err := result.RowsAffected()
-	if err != nil {
-		return exit.Internalf("cannot read request %s remote invocation binding result: %s", id, err)
-	}
-	if changed == 1 {
-		return nil
-	}
-	var heldPlan, heldInstallation string
-	if err := s.db.QueryRow(`SELECT plan_id,installation_id FROM requests WHERE id=?`, id).Scan(
-		&heldPlan, &heldInstallation); err != nil {
-		return exit.Internalf("cannot read request %s remote invocation binding: %s", id, err)
-	}
-	if heldPlan != planID || heldInstallation != installation {
-		return exit.Named(exit.Conflict, "request_invocation_identity_changed",
-			"request %s already binds a different worker-derived invocation identity", id)
-	}
-	return nil
-}
-
-// MarkLocalPackageUploaded crosses the durable boundary between verified carrier
-// acknowledgements and DesiredLocalPackageSet. The caller proves every acknowledgement belongs
-// to this exact boot/session before moving the marker; a replacement boot therefore overwrites an
-// old marker only after it has independently re-received and verified the whole revision.
-func (s *Store) MarkLocalPackageUploaded(id, digest, bootID string) *exit.Error {
-	if id == "" || digest == "" || bootID == "" {
-		return exit.Internalf("cannot record an incomplete local package upload")
-	}
-	result, err := s.db.Exec(`UPDATE requests SET local_package_uploaded_boot_id=?
-		WHERE id=? AND local_installation_id=?`, bootID, id, digest)
-	if err != nil {
-		return exit.Internalf("cannot record request %s local package upload: %s", id, err)
-	}
-	changed, err := result.RowsAffected()
-	if err != nil {
-		return exit.Internalf("cannot read request %s local package upload result: %s", id, err)
-	}
-	if changed == 1 {
-		return nil
-	}
-	var heldDigest string
-	if err := s.db.QueryRow(`SELECT local_installation_id FROM requests WHERE id=?`, id).
-		Scan(&heldDigest); err != nil {
-		return exit.Internalf("cannot read request %s local package upload: %s", id, err)
-	}
-	if heldDigest != digest {
-		return exit.Named(exit.Conflict, "local_package_revision_changed",
-			"request %s already names another local package revision", id)
-	}
-	return exit.Named(exit.Conflict, "local_package_request_changed",
-		"request %s cannot record its verified local package boot", id)
-}
-
 // PinRental pins one still-queued --rental request to the rental routing chose for it:
 // the argmin lane at dispatch, or the rental the capacity decision stages its placement
 // on (cl-092 step 4). A cancellation that wins first leaves worker empty, which tells a
@@ -1223,20 +1095,6 @@ func (s *Store) PinRequestModels(id string, models []ModelRef) *exit.Error {
 		return exit.Internalf("cannot encode request %s models: %s", id, err)
 	}
 	if _, err := s.db.Exec(`UPDATE requests SET models=? WHERE id=? AND rental=1 AND worker=''
-		AND state IN ('submitted','queued','requeue_pending')`, string(encoded), id); err != nil {
-		return exit.Internalf("cannot record request %s models: %s", id, err)
-	}
-	return nil
-}
-
-// PinMachineModels records the rungs the executing machine's measured devices fixed, before
-// its submission is frozen.
-func (s *Store) PinMachineModels(id string, models []ModelRef) *exit.Error {
-	encoded, err := json.Marshal(models)
-	if err != nil {
-		return exit.Internalf("cannot encode request %s models: %s", id, err)
-	}
-	if _, err := s.db.Exec(`UPDATE requests SET models=? WHERE id=?
 		AND state IN ('submitted','queued','requeue_pending')`, string(encoded), id); err != nil {
 		return exit.Internalf("cannot record request %s models: %s", id, err)
 	}
@@ -1493,30 +1351,6 @@ func (s *Store) Owed() ([]Request, *exit.Error) {
 		r, err := scanRequest(rows)
 		if err != nil {
 			return nil, exit.Internalf("cannot read an owed request row: %s", err)
-		}
-		out = append(out, r)
-	}
-	return out, nil
-}
-
-// Unsettled is every request that holds an OPEN attempt: one this authority assigned and
-// has no terminal for. These are not owed capacity — they are owed a TERMINAL, and the
-// only thing that can produce one is the supervisor's own journal replayed by a worker in
-// the same slot (worker-protocol/02 §6.2).
-func (s *Store) Unsettled() ([]Request, *exit.Error) {
-	rows, err := s.db.Query(`SELECT ` + requestCols + ` FROM requests r
-		WHERE EXISTS (SELECT 1 FROM attempts a WHERE a.request_id=r.id
-		              AND a.state IN (` + openAttemptStates + `))
-		ORDER BY r.created_at, r.id`)
-	if err != nil {
-		return nil, exit.Internalf("cannot read the unsettled requests: %s", err)
-	}
-	defer rows.Close()
-	var out []Request
-	for rows.Next() {
-		r, err := scanRequest(rows)
-		if err != nil {
-			return nil, exit.Internalf("cannot read an unsettled request row: %s", err)
 		}
 		out = append(out, r)
 	}
@@ -1788,17 +1622,6 @@ func ordinalLaws(tx *sql.Tx, requestID string) (int64, *exit.Error) {
 	return max.Int64 + 1, nil
 }
 
-// NextOrdinal answers what the next ordinal WOULD be, under the same laws. It is a
-// question, not a claim: minting is `Dispatch`'s, in the transaction that writes the row.
-func (s *Store) NextOrdinal(requestID string) (int64, *exit.Error) {
-	tx, err := s.db.Begin()
-	if err != nil {
-		return 0, exit.Internalf("cannot begin the ordinal transaction: %s", err)
-	}
-	defer tx.Rollback()
-	return ordinalLaws(tx, requestID)
-}
-
 // Dispatch MINTS the ordinal and journals the assignment in ONE transaction, before
 // StartAttempt goes out: a terminal may only cross a restart when the persisted assignment
 // authorizes it, and an ordinal may only exist when its row does.
@@ -1927,22 +1750,6 @@ func (s *Store) AbortDispatch(requestID string, attempt int64, sessionID, reason
 	if err := tx.Commit(); err != nil {
 		return exit.Internalf("the dispatch-abort transaction did not commit for %s#%d: %s",
 			requestID, attempt, err)
-	}
-	return nil
-}
-
-// MediaCleanupOwed derives cleanup work from durable attempt state. Only an aborted
-// pre-offer assignment or an acknowledged closed outcome is disposable; a terminal that
-// has not been acked still needs its remote outputs for replay.
-func (s *Store) MediaCleanupOwed(instanceID string) ([]Attempt, *exit.Error) {
-	return s.attemptsWhere(`instance_id=? AND media_cleaned=0
-		AND state IN ('dispatch_aborted','closed')`, instanceID)
-}
-
-func (s *Store) MarkMediaCleaned(requestID string, attempt int64) *exit.Error {
-	if _, err := s.db.Exec(`UPDATE attempts SET media_cleaned=1 WHERE request_id=? AND attempt=?`,
-		requestID, attempt); err != nil {
-		return exit.Internalf("cannot record media cleanup for %s#%d: %s", requestID, attempt, err)
 	}
 	return nil
 }
@@ -2264,37 +2071,6 @@ func (s *Store) Attempts(requestID string) ([]Attempt, *exit.Error) {
 	return s.attemptsWhere(`request_id=?`, requestID)
 }
 
-// OpenAttemptsOf is every attempt one worker INSTANCE still owes a terminal for. It is
-// what a orchestrator asks when that worker's process dies: those attempts are not
-// finished and not failed — they are unsettled, and the only thing that can settle one is
-// the supervisor's own journal, replayed by a worker in the SAME slot.
-func (s *Store) OpenAttemptsOf(instanceID string) ([]Attempt, *exit.Error) {
-	return s.attemptsWhere(`instance_id=? AND state IN (`+openAttemptStates+`)`, instanceID)
-}
-
-// ReadyRequeues are committed requeue decisions whose old terminal has crossed the
-// acknowledgement boundary. BeginRequeue changes them to queued.
-func (s *Store) ReadyRequeues() ([]Request, *exit.Error) {
-	rows, err := s.db.Query(`SELECT ` + requestCols + ` FROM requests
-		WHERE state='requeue_pending' AND EXISTS (
-		  SELECT 1 FROM attempts a WHERE a.request_id=requests.id
-		  AND a.attempt=requests.ordinal AND a.state='closed')
-		ORDER BY created_at,id`)
-	if err != nil {
-		return nil, exit.Internalf("cannot read pending requeues: %s", err)
-	}
-	defer rows.Close()
-	var out []Request
-	for rows.Next() {
-		r, err := scanRequest(rows)
-		if err != nil {
-			return nil, exit.Internalf("cannot read a pending requeue: %s", err)
-		}
-		out = append(out, r)
-	}
-	return out, nil
-}
-
 func (s *Store) attemptsWhere(where string, args ...any) ([]Attempt, *exit.Error) {
 	rows, err := s.db.Query(`SELECT request_id,attempt,attempt_key,instance_id,session_id,
 		invocation_digest,invocation,weights_outputs,state,plan_digest,construction,plan_summary,terminal_id,
@@ -2337,138 +2113,6 @@ func (s *Store) TriageBundle(attemptKey string) (subject string, bundle []byte, 
 
 // blobOrEmpty keeps a NOT NULL blob column honest: an absent bundle is zero bytes.
 func blobOrEmpty(b []byte) []byte {
-	if b == nil {
-		return []byte{}
-	}
-	return b
-}
-
-const weightsFinalizationCols = `request_id,attempt,instance_id,owner_scope,invocation_digest,
-	output_slot,disposition,receipt_digest,scratch_root_id,result_outcome,
-	result_receipt_digest,result_receipt_bytes,
-	recorded_at,completed_at`
-
-func scanWeightsFinalization(row interface{ Scan(...any) error }) (WeightsFinalization, error) {
-	var f WeightsFinalization
-	err := row.Scan(&f.RequestID, &f.Attempt, &f.InstanceID, &f.OwnerScope,
-		&f.InvocationDigest, &f.OutputSlot, &f.Disposition, &f.ReceiptDigest,
-		&f.ScratchRootID, &f.ResultOutcome, &f.ResultReceiptDigest, &f.ResultReceiptBytes,
-		&f.RecordedAt, &f.CompletedAt)
-	return f, err
-}
-
-// WeightsFinalization reads the exact first-wins intent for one semantic output.
-func (s *Store) WeightsFinalization(requestID, invocationDigest, outputSlot string) (*WeightsFinalization, *exit.Error) {
-	f, err := scanWeightsFinalization(s.db.QueryRow(`SELECT `+weightsFinalizationCols+`
-		FROM weights_finalizations WHERE request_id=? AND invocation_digest=? AND output_slot=?`,
-		requestID, invocationDigest, outputSlot))
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, exit.Internalf("cannot read weights finalization %s/%s: %s",
-			requestID, outputSlot, err)
-	}
-	return &f, nil
-}
-
-// PendingWeightsFinalizations is the exact decision set that must be (re)sent before
-// this attempt's outcome may be acknowledged. Ordering by slot makes replay deterministic.
-func (s *Store) PendingWeightsFinalizations(requestID string, attempt int64) ([]WeightsFinalization, *exit.Error) {
-	rows, err := s.db.Query(`SELECT `+weightsFinalizationCols+` FROM weights_finalizations
-		WHERE request_id=? AND attempt=? AND completed_at='' ORDER BY output_slot`, requestID, attempt)
-	if err != nil {
-		return nil, exit.Internalf("cannot read pending weights finalizations of %s#%d: %s",
-			requestID, attempt, err)
-	}
-	defer rows.Close()
-	out := []WeightsFinalization{}
-	for rows.Next() {
-		f, err := scanWeightsFinalization(rows)
-		if err != nil {
-			return nil, exit.Internalf("cannot read a weights finalization row: %s", err)
-		}
-		out = append(out, f)
-	}
-	return out, nil
-}
-
-func (s *Store) WeightsFinalizationsOf(requestID string) ([]WeightsFinalization, *exit.Error) {
-	rows, err := s.db.Query(`SELECT `+weightsFinalizationCols+` FROM weights_finalizations
-		WHERE request_id=? ORDER BY attempt,output_slot`, requestID)
-	if err != nil {
-		return nil, exit.Internalf("cannot read weights finalizations of %s: %s", requestID, err)
-	}
-	defer rows.Close()
-	out := []WeightsFinalization{}
-	for rows.Next() {
-		f, err := scanWeightsFinalization(rows)
-		if err != nil {
-			return nil, exit.Internalf("cannot read a weights finalization row: %s", err)
-		}
-		out = append(out, f)
-	}
-	return out, nil
-}
-
-// RecordWeightsFinalizeResult journals Runtime's typed replayable result. The same result is
-// idempotent; a changed result for the first-wins decision conflicts forever.
-func (s *Store) RecordWeightsFinalizeResult(result WeightsFinalization) (applied bool, e *exit.Error) {
-	tx, err := s.db.Begin()
-	if err != nil {
-		return false, exit.Internalf("cannot begin the weights finalize result transaction: %s", err)
-	}
-	defer tx.Rollback()
-	held, err := scanWeightsFinalization(tx.QueryRow(`SELECT `+weightsFinalizationCols+`
-		FROM weights_finalizations WHERE request_id=? AND invocation_digest=? AND output_slot=?`,
-		result.RequestID, result.InvocationDigest, result.OutputSlot))
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, exit.New(exit.NotFound, "no weights final intent for %s/%s",
-			result.RequestID, result.OutputSlot)
-	}
-	if err != nil {
-		return false, exit.Internalf("cannot read weights final intent %s/%s: %s",
-			result.RequestID, result.OutputSlot, err)
-	}
-	if held.InstanceID != result.InstanceID {
-		return false, exit.New(exit.Conflict,
-			"weights finalize result for %s/%s came from worker %s; %s owns the transaction",
-			result.RequestID, result.OutputSlot, result.InstanceID, held.InstanceID)
-	}
-	if held.CompletedAt != "" {
-		if held.ResultOutcome != result.ResultOutcome ||
-			held.ResultReceiptDigest != result.ResultReceiptDigest ||
-			!bytes.Equal(held.ResultReceiptBytes, result.ResultReceiptBytes) {
-			return false, exit.New(exit.Conflict,
-				"weights finalization %s/%s already completed with a different typed result",
-				result.RequestID, result.OutputSlot)
-		}
-		return false, nil
-	}
-	completed := now()
-	updated, err := tx.Exec(`UPDATE weights_finalizations SET result_outcome=?,
-		result_receipt_digest=?,result_receipt_bytes=?,completed_at=?
-		WHERE request_id=? AND invocation_digest=? AND output_slot=? AND completed_at=''`,
-		result.ResultOutcome, result.ResultReceiptDigest, blob(result.ResultReceiptBytes), completed,
-		result.RequestID, result.InvocationDigest, result.OutputSlot)
-	if err != nil {
-		return false, exit.Internalf("cannot record weights finalize result %s/%s: %s",
-			result.RequestID, result.OutputSlot, err)
-	}
-	if n, _ := updated.RowsAffected(); n != 1 {
-		return false, exit.New(exit.Conflict, "weights finalization %s/%s moved while completing",
-			result.RequestID, result.OutputSlot)
-	}
-	if err := tx.Commit(); err != nil {
-		return false, exit.Internalf("cannot commit weights finalize result %s/%s: %s",
-			result.RequestID, result.OutputSlot, err)
-	}
-	return true, nil
-}
-
-// blob keeps a NOT NULL BLOB column NOT NULL. An ABANDON_UNCOMMITTED completion carries
-// no receipt at all, and a nil slice is a NULL rather than the empty evidence it means.
-func blob(b []byte) []byte {
 	if b == nil {
 		return []byte{}
 	}
@@ -2587,97 +2231,4 @@ type Checkpoint struct {
 	// admitted only if the attempt it names is open under this same session. It is an
 	// input to the admission, not a fact about the checkpoint.
 	SessionID string
-}
-
-// RecordCheckpoint journals the orchestrator's copy of one durable save and answers with
-// the row plus what happened: RECORDED (new), REPLAYED (the same identity again) or
-// CONFLICT (the same keys, different bytes). It never replaces a recorded digest — the
-// worker's own journal already made that fact durable, and a orchestrator that overwrote
-// it would be a second authority over one fact.
-// A fourth answer joins the three: UNKNOWN_ATTEMPT, when the frame names an attempt that
-// is not open under the sending session. Ownership is checked INSIDE the insert — one
-// INSERT...SELECT...WHERE EXISTS, atomic by construction — so a terminal landing between a
-// separate check and the write cannot slip a checkpoint into a closed attempt.
-func (s *Store) RecordCheckpoint(c Checkpoint) (Checkpoint, string, *exit.Error) {
-	// OWNERSHIP FIRST, and it decides before anything is read back. A sender that does not
-	// own an open attempt learns nothing about what is journaled under it — not even that
-	// a key is taken, which is what answering CONFLICT would have told it.
-	var open int
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM attempts
-		WHERE request_id=? AND attempt=? AND session_id=?
-		AND state IN ('offered','accepted','recovered_open')`,
-		c.RequestID, c.Attempt, c.SessionID).Scan(&open); err != nil {
-		return c, "", exit.Internalf("cannot read the attempt of a checkpoint: %s", err)
-	}
-	if open != 1 {
-		return c, "UNKNOWN_ATTEMPT", unknownAttempt(c)
-	}
-	held, err := s.db.Query(`SELECT `+checkpointCols+` FROM job_checkpoints
-		WHERE request_id=? AND attempt=? AND operation_key=? AND logical_key=?`,
-		c.RequestID, c.Attempt, c.OperationKey, c.LogicalKey)
-	if err != nil {
-		return c, "", exit.Internalf("cannot read the checkpoint journal: %s", err)
-	}
-	defer held.Close()
-	if held.Next() {
-		var row Checkpoint
-		if err := held.Scan(&row.RequestID, &row.Attempt, &row.OperationKey, &row.LogicalKey,
-			&row.ContentDigest, &row.ReceiptID, &row.Outcome, &row.RecordedAt); err != nil {
-			return c, "", exit.Internalf("cannot read a checkpoint row: %s", err)
-		}
-		if row.ContentDigest != c.ContentDigest {
-			return row, "CONFLICT", nil
-		}
-		return row, "REPLAYED", nil
-	}
-	c.ReceiptID = NewID("crc")
-	c.Outcome, c.RecordedAt = "RECORDED", now()
-	res, err := s.db.Exec(`INSERT INTO job_checkpoints(request_id,attempt,operation_key,
-		logical_key,content_digest,receipt_id,outcome,recorded_at)
-		SELECT ?,?,?,?,?,?,?,?
-		WHERE EXISTS (SELECT 1 FROM attempts WHERE request_id=? AND attempt=? AND session_id=?
-		              AND state IN ('offered','accepted','recovered_open'))`,
-		c.RequestID, c.Attempt, c.OperationKey, c.LogicalKey, c.ContentDigest,
-		c.ReceiptID, c.Outcome, c.RecordedAt,
-		c.RequestID, c.Attempt, c.SessionID)
-	if err != nil {
-		return c, "", exit.Internalf("cannot journal the checkpoint: %s", err)
-	}
-	// The pre-check above answers; THIS is the authority. A terminal landing between the
-	// two closes the attempt and the insert writes nothing — one statement, no window.
-	if n, _ := res.RowsAffected(); n != 1 {
-		return c, "UNKNOWN_ATTEMPT", unknownAttempt(c)
-	}
-	return c, "RECORDED", nil
-}
-
-func unknownAttempt(c Checkpoint) *exit.Error {
-	return exit.New(exit.NotFound,
-		"checkpoint %s/%s refused: %s#%d is not an OPEN attempt of session %s",
-		c.OperationKey, c.LogicalKey, c.RequestID, c.Attempt, c.SessionID).
-		WithRemedy("a checkpoint belongs to the attempt that is running it, and only its " +
-			"own session may declare one")
-}
-
-const checkpointCols = `request_id,attempt,operation_key,logical_key,content_digest,
-	receipt_id,outcome,recorded_at`
-
-// Checkpoints lists one request's journaled checkpoint identities, in arrival order.
-func (s *Store) Checkpoints(requestID string) ([]Checkpoint, *exit.Error) {
-	rows, err := s.db.Query(`SELECT `+checkpointCols+` FROM job_checkpoints
-		WHERE request_id=? ORDER BY attempt, recorded_at`, requestID)
-	if err != nil {
-		return nil, exit.Internalf("cannot list the checkpoints of %s: %s", requestID, err)
-	}
-	defer rows.Close()
-	var out []Checkpoint
-	for rows.Next() {
-		var c Checkpoint
-		if err := rows.Scan(&c.RequestID, &c.Attempt, &c.OperationKey, &c.LogicalKey,
-			&c.ContentDigest, &c.ReceiptID, &c.Outcome, &c.RecordedAt); err != nil {
-			return nil, exit.Internalf("cannot read a checkpoint row: %s", err)
-		}
-		out = append(out, c)
-	}
-	return out, nil
 }

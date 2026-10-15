@@ -2,10 +2,7 @@ package orchestrator
 
 import (
 	"bytes"
-	"crypto/sha256"
-	"encoding/hex"
 	"sort"
-	"strings"
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/archive"
@@ -241,47 +238,6 @@ func pinnedPackage(pkg, rental string) string {
 		return pkg
 	}
 	return pkg + "@" + rental
-}
-
-func (p DesiredPlacement) EntrypointDigest(name string) (string, *exit.Error) {
-	for _, entrypoint := range p.Entrypoints {
-		if entrypoint.Name == name {
-			return entrypoint.Digest, nil
-		}
-	}
-	return "", exit.Named(exit.NotFound, "entrypoint_not_selected",
-		"the selected PlacementSet has no entrypoint %q", name)
-}
-
-// InstanceID is the package's stable local worker SLOT identity. Creator's records store
-// owns attempts across child restarts; Runtime itself retains no recovery state. A NEW
-// install is a genuinely new instance and gets a new id.
-func (p DesiredPlacement) InstanceID() string {
-	sum := sha256.Sum256([]byte("slot/" + p.Package + "/" + p.InstallID))
-	return "ins-" + hex.EncodeToString(sum[:12])
-}
-
-func (s WorkerLaunchSpec) InstanceID() string {
-	if s.Connection != nil && s.Connection.RentalID != "" {
-		return rentalInstanceID(s.Connection.RentalID)
-	}
-	return s.Placement.InstanceID()
-}
-
-func rentalInstanceID(id string) string {
-	sum := sha256.Sum256([]byte("rental/" + id))
-	return "ins-" + hex.EncodeToString(sum[:12])
-}
-
-// PlacementID is the RecordOwner-minted routing + journal key for the one placement this
-// slot hosts (#481; renamed from deployment_id — tensorhub's "deployment" is an id-less
-// semantic tuple and the collision was real). Routing, NEVER identity: an InvocationSpec
-// digest excludes it, so the same invocation is the same work wherever it routes.
-func (p DesiredPlacement) PlacementID() string {
-	if p.PlacementIDValue != "" {
-		return p.PlacementIDValue
-	}
-	return "plc-" + strings.TrimPrefix(p.InstanceID(), "ins-")
 }
 
 // ReportCadence is the worker's OWN ObservedWorkerState period, a protocol fact rather

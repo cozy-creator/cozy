@@ -167,9 +167,11 @@ async def main(ctx):
 				t.Fatalf("Runtime did not execute source and builtin: %+v", first)
 			}
 		} else {
+			// The source and the builtin quantize write weights, so they are never memoized:
+			// they run again and TensorFS answers each derivation with the same checkpoint.
 			for index := range 2 {
-				if children[index].Executions != 0 || first[index].Computation == "" || first[index].Computation != children[index].Computation {
-					t.Fatalf("caller edit invalidated Runtime computation: first=%+v edited=%+v", first, children)
+				if string(children[index].Result) != string(first[index].Result) {
+					t.Fatalf("caller edit changed a Runtime derivation: first=%+v edited=%+v", first, children)
 				}
 			}
 		}

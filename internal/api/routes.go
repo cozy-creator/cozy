@@ -9,7 +9,7 @@ package api
 //	Core  — Cozy's implemented request-level API and the proposed common core for
 //	        future servers. Cross-host parity requires conformance proof; it is not
 //	        asserted by this registry.
-//	Local — the Cozy-only extension module: jobs, rentals, lifecycle, and
+//	Local — the Cozy-only extension module: rentals, lifecycle, and
 //	        localhost web assets. Its URL mount makes
 //	        that boundary visible in the URL.
 

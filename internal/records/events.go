@@ -620,12 +620,6 @@ type MachineGPUWaiting struct {
 	BlockedBy []string `json:"blocked_by"`
 }
 
-// RecordMachineTriage keeps a Runtime execution's triage bundle beside its events, once
-// per attempt; MachineTriage reads the newest back.
-func (s *Store) RecordMachineTriage(requestID string, attempt int64, bundle []byte) *exit.Error {
-	return recordMachineTriage(s.db, requestID, attempt, bundle)
-}
-
 // execer is the database or one of its transactions.
 type execer interface {
 	Exec(string, ...any) (sql.Result, error)

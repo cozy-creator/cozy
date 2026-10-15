@@ -2,6 +2,7 @@ package records
 
 import (
 	"encoding/json"
+
 	"github.com/cozy-creator/cozy/internal/exit"
 )
 

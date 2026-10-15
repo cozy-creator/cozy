@@ -161,20 +161,18 @@ func QualifyInterface(raw []byte, account string) ([]byte, *exit.Error) {
 		return nil, exit.Named(exit.Structural, "package_interface_invalid", "the package interface is not a JSON object")
 	}
 	changed := false
-	for _, group := range []string{"entrypoints", "jobs"} {
-		callables, _ := document[group].([]any)
-		for _, callable := range callables {
-			row, _ := callable.(map[string]any)
-			models, _ := row["models"].([]any)
-			for _, model := range models {
-				slot, _ := model.(map[string]any)
-				ladder, _ := slot["default_ladder"].([]any)
-				for _, rung := range ladder {
-					fields, _ := rung.(map[string]any)
-					lane, _ := fields["lane"].(string)
-					if name, _, found := strings.Cut(lane, "@"); found && !strings.Contains(name, "/") {
-						fields["lane"], changed = account+"/"+lane, true
-					}
+	callables, _ := document["entrypoints"].([]any)
+	for _, callable := range callables {
+		row, _ := callable.(map[string]any)
+		models, _ := row["models"].([]any)
+		for _, model := range models {
+			slot, _ := model.(map[string]any)
+			ladder, _ := slot["default_ladder"].([]any)
+			for _, rung := range ladder {
+				fields, _ := rung.(map[string]any)
+				lane, _ := fields["lane"].(string)
+				if name, _, found := strings.Cut(lane, "@"); found && !strings.Contains(name, "/") {
+					fields["lane"], changed = account+"/"+lane, true
 				}
 			}
 		}

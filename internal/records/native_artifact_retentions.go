@@ -20,11 +20,3 @@ type NativeArtifactRetention struct {
 	ManifestLength                                                                                          int64
 	ReceiptDigest, TransactionID, OwnerRequestID, OwnerWorker, RetentionID, InstanceID, WorkerBootID, State string
 }
-
-const nativeArtifactCols = `artifact_kind,producer_attempt,producer_output_id,content_bytes,consumer_id,parent_request_id,kind,slot,producer_id,manifest_id,manifest_length,receipt_digest,transaction_id,owner_request_id,owner_worker,retention_id,instance_id,worker_boot_id,state`
-
-func scanNativeArtifact(row interface{ Scan(...any) error }) (NativeArtifactRetention, error) {
-	var h NativeArtifactRetention
-	err := row.Scan(&h.ArtifactKind, &h.ProducerAttempt, &h.ProducerOutputID, &h.ContentBytes, &h.ConsumerID, &h.ParentRequestID, &h.Kind, &h.Slot, &h.ProducerID, &h.ManifestID, &h.ManifestLength, &h.ReceiptDigest, &h.TransactionID, &h.OwnerRequestID, &h.OwnerWorker, &h.RetentionID, &h.InstanceID, &h.WorkerBootID, &h.State)
-	return h, err
-}
