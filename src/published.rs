@@ -81,6 +81,9 @@ pub struct Request {
     pub choices: Vec<domain::ModelChoice>,
     /// 0 selects the widest supported machine group; otherwise exactly this many GPUs.
     pub gpus: u32,
+    /// A call's: its imports start as soon as it installs. A warm run imports only when its
+    /// level asks (`downloaded` never does).
+    pub imports: bool,
 }
 
 /// A Hub checkpoint as a run names it (th-245): `repository` at `release` (empty: the newest) in
@@ -758,8 +761,11 @@ impl Publisher {
         self.generation(service.catalog.root(), &identity, &wanted, job)?;
         let held = service.catalog.resolve(&identity).map_err(io_failure)?;
         if let Some(gpu) = service.gpu() {
-            // Its kernels compile while its weights come.
+            // Its kernels compile, and a call's imports run, while its weights come.
             gpu.kernel_boot(held.clone());
+            if request.imports {
+                gpu.prespawn(held.clone(), None);
+            }
         }
         service
             .engine
@@ -2179,7 +2185,7 @@ mod tests {
             source: hub::Source::new("https://hub.example", None, vec![], None).unwrap(),
             package: "org/package".into(), release: "1".into(), installed: None,
             owner: "org".into(), catalog_revision: String::new(), providers: Providers::default(),
-            entrypoint: "render".into(), choices: vec![], gpus: 0,
+            entrypoint: "render".into(), choices: vec![], gpus: 0, imports: true,
         };
         let default = Publisher::resolution_key("installed", &request, "4xH100");
         request.gpus = 2;
@@ -2556,5 +2562,35 @@ mod tests {
         assert!(publisher.bindings(&service, &hub, "local/pkg", "r2").unwrap().is_empty());
         assert_eq!(heard.lock().unwrap().len(), 2, "nothing else was asked: {heard:?}");
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A call's weights come from its preparation on (Next, smallest component first) before its
+    /// executor can ask, and keep coming while its first channel is open: nothing is dropped as
+    /// the executor takes over. Once that channel closes, the preparation's fetches end.
+    #[test]
+    fn a_calls_preparation_fetches_ahead_until_its_first_channel_closes() {
+        let bench = Bench::new();
+        let manifest = checkpoint(&bench.source, 30, 10);
+        let (hub, named, _) = bench.hub("acme/ahead", &manifest, 100);
+        bench.publisher.structure(&hub, std::slice::from_ref(&named), &Job::default()).unwrap();
+        let store = bench.publisher.store().clone();
+        let ahead = crate::access::Fetch::new(store.clone(), Some(hub.clone()), vec![manifest.id()], 3);
+        ahead.ahead(&[(manifest.id(), vec!["model".to_string()])]).unwrap();
+        let call = crate::access::Fetch::new(store.clone(), Some(hub), vec![manifest.id()], 3);
+        call.replaces(Some(ahead.clone()));
+        let channel = call.channel().unwrap();
+        let started = Instant::now();
+        while !crate::access::whole(&store, &manifest.id(), &[]) {
+            assert!(started.elapsed() < Duration::from_secs(60), "the preparation's fetches stopped");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(ahead.channel().is_ok(), "the preparation's fetches last while the first channel is open");
+        drop(channel);
+        let started = Instant::now();
+        while ahead.channel().is_ok() {
+            assert!(started.elapsed() < Duration::from_secs(10), "the first channel closed and they went on");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _ = fs::remove_dir_all(&bench.root);
     }
 }

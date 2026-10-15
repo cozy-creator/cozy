@@ -66,9 +66,11 @@ pub fn header(store: &Store, manifest: &ObjectRef) -> io::Result<Header> {
     tensorfs_core::checkpoint::load_header(store, header).map_err(io::Error::other)
 }
 
-/// Every object `components` of `header` read (all of them when empty), each once.
+/// Every object `components` of `header` read (all of them when empty), each once, in header
+/// order.
 pub fn objects(header: &Header, components: &[String]) -> Vec<ObjectRef> {
-    let mut objects: Vec<ObjectRef> = (header.components.iter())
+    let mut seen = BTreeSet::new();
+    (header.components.iter())
         .filter(|(name, _)| components.is_empty() || components.contains(name))
         .flat_map(|(_, tensors)| tensors.iter().flat_map(|(_, tensor)| tensor.parts.iter()))
         .filter_map(|(_, part)| match &part.body {
@@ -76,10 +78,8 @@ pub fn objects(header: &Header, components: &[String]) -> Vec<ObjectRef> {
             Body::Inline(_) => None,
         })
         .flatten()
-        .collect();
-    objects.sort_by(|a, b| a.sha256.cmp(&b.sha256));
-    objects.dedup();
-    objects
+        .filter(|object| seen.insert(object.sha256.clone()))
+        .collect()
 }
 
 /// Whether every object of `components` of `manifest` is here (`downloaded`). Once true it is
@@ -122,6 +122,8 @@ pub struct Fetch {
     stop: PullCancellation,
     channels: Mutex<Vec<UnixStream>>,
     kept: Mutex<Vec<Ticket>>,
+    /// What fetched for this call before it could ask: ended by its first channel.
+    replaced: Mutex<Option<Arc<Fetch>>>,
 }
 
 impl Fetch {
@@ -135,6 +137,7 @@ impl Fetch {
             stop: PullCancellation::default(),
             channels: Mutex::default(),
             kept: Mutex::default(),
+            replaced: Mutex::default(),
         })
     }
 
@@ -193,12 +196,50 @@ impl Fetch {
         }
         channels.push(server.try_clone()?);
         let (fetcher, grant) = (self.fetcher()?, fetch::Grant { run: self.order, origins, stop: PullCancellation::default() });
+        // What fetched before the executor could ask lasts until its first channel closes:
+        // by then a later one re-asserted, so nothing on the wire is dropped in between.
+        let replaced = self.replaced.lock().unwrap().take();
         std::thread::Builder::new().name("fetch-channel".into()).spawn(move || {
             if let Err(refusal) = fetch::serve(&fetcher, grant, server) {
                 eprintln!("fetch channel: {refusal}");
             }
+            if let Some(replaced) = replaced {
+                replaced.end();
+            }
         })?;
         Ok(File::from(OwnedFd::from(client)))
+    }
+
+    /// `previous` (a run's preparation's fetches) ends when this call's first channel closes, or
+    /// with the call.
+    pub fn replaces(&self, previous: Option<Arc<Fetch>>) {
+        *self.replaced.lock().unwrap() = previous;
+    }
+
+    /// Want each of `selected`'s (manifest, components) components at Next before the call's
+    /// executor can ask, in Runtime's Start-pass order: the smallest component first, header
+    /// order inside. Held until the call's first channel closes, or the call ends.
+    pub fn ahead(&self, selected: &[(String, Vec<String>)]) -> io::Result<()> {
+        let mut wanted = vec![];
+        for (manifest, components) in selected {
+            let manifest = held(&self.store, manifest)?;
+            let Some((origin, access)) = self.source(&manifest)? else {
+                continue;
+            };
+            let header = header(&self.store, &manifest)?;
+            for component in components {
+                let objects = objects(&header, std::slice::from_ref(component));
+                let bytes: u64 = objects.iter().map(|o| o.length).sum();
+                wanted.push((bytes, origin.clone(), access.clone(), objects));
+            }
+        }
+        wanted.sort_by_key(|(bytes, ..)| *bytes);
+        let fetcher = self.fetcher()?;
+        let mut kept = self.kept.lock().unwrap();
+        for (rank, (_, origin, access, objects)) in wanted.into_iter().enumerate() {
+            kept.push(fetcher.want(&origin, access, &objects, Priority::Next { run: self.order, rank: rank as u32 }));
+        }
+        Ok(())
     }
 
     /// Want `components` of each of `selected` (manifest, components) at Behind, held until the
@@ -247,6 +288,9 @@ impl Fetch {
             let _ = channel.shutdown(Shutdown::Both);
         }
         self.kept.lock().unwrap().clear();
+        if let Some(replaced) = self.replaced.lock().unwrap().take() {
+            replaced.end();
+        }
     }
 }
 

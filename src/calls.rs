@@ -195,8 +195,10 @@ impl Calls {
     /// One call's fetches of `plan`'s checkpoints, under its run's Hub access and ordered by
     /// its root's acceptance; they end with the call, or at once with its run's cancel.
     pub(crate) fn fetch(&self, record: &Execution, plan: &Plan) -> Arc<crate::access::Fetch> {
-        let hub = self.runs.upgrade().and_then(|runs| runs.hub(&record.id));
+        let runs = self.runs.upgrade();
+        let hub = runs.as_ref().and_then(|runs| runs.hub(&record.id));
         let fetch = crate::access::Fetch::new(self.store.clone(), hub, plan.manifests(), record.root_seq());
+        fetch.replaces(runs.and_then(|runs| runs.ahead(&record.id)));
         let mut fetches = self.fetches.lock().unwrap();
         let live = fetches.entry(record.id.clone()).or_default();
         live.retain(|fetch| fetch.strong_count() > 0);

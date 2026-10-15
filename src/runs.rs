@@ -107,8 +107,8 @@ pub struct RunContext {
     pub(crate) gpus: u32,
     pub(crate) models: Vec<domain::ModelChoice>,
     pub(crate) weights_destination: String,
-    /// What its import-only executor's Start fetches ahead, until the run ends.
-    pub(crate) _ahead: Option<Arc<crate::access::Fetch>>,
+    /// What its weights come under before its call's executor asks (`Fetch::ahead`).
+    pub(crate) ahead: Option<Arc<crate::access::Fetch>>,
 }
 
 /// A choice for the run's own slots: a bare parameter, or one under its own name.
@@ -532,13 +532,18 @@ impl Runs {
         let interface: Value = serde_json::from_slice(&installation.interface)
             .map_err(|_| refused("package_interface_invalid", "held interface is corrupt"))?;
         let generation = self.service.catalog.resolve(&installation.generation)?;
-        // A call's imports start now, beside the rest of its preparation, and its weights before
-        // them; a warm run imports only when its level asks (`downloaded` never does).
+        // A call's weights come from here on, in the Start pass's order, until its executor
+        // asks for them itself; its imports start now unless they already did at install. A
+        // warm run imports only when its level asks (`downloaded` never does).
         let mut ahead = None;
         if let (false, Some(gpu)) = (spec.warm, self.service.gpu()) {
             let fetching = plan.as_ref().zip(self.publisher.as_ref()).map(|(plan, publisher)| {
                 let order = self.service.engine.get(id).map_or(u64::MAX, |record| record.root_seq());
                 let fetch = crate::access::Fetch::new(publisher.store().clone(), hub.clone(), plan.manifests(), order);
+                let selected: Vec<_> = plan.selections().into_iter().map(|s| (s.manifest, s.components)).collect();
+                if let Err(error) = fetch.ahead(&selected) {
+                    eprintln!("run {id}: its weights' early fetch: {error}");
+                }
                 (plan.clone(), fetch)
             });
             ahead = fetching.as_ref().map(|(_, fetch)| fetch.clone());
@@ -648,7 +653,7 @@ impl Runs {
                 gpus: spec.gpus,
                 models: spec.models.clone(),
                 weights_destination: spec.weights_destination.clone(),
-                _ahead: ahead,
+                ahead,
             };
             self.contexts.lock().unwrap().insert(id.into(), context);
         }
@@ -877,6 +882,7 @@ impl Runs {
                     entrypoint: entrypoint.into(),
                     choices: choices.to_vec(),
                     gpus: spec.gpus,
+                    imports: !spec.warm,
                 };
                 let prepared = publisher
                     .prepare_now(&self.service, actor, &request, observe, stop)
@@ -1070,6 +1076,11 @@ impl Runs {
             (false, Some(hub)) => Ok(Some(crate::weights::Destination { repository, hub })),
             (false, None) => Err(io::Error::other("a weights destination needs the run's Hub access, and the run has none")),
         }
+    }
+
+    /// The fetches a run's preparation started, for its call to end once its executor asks.
+    pub fn ahead(&self, id: &str) -> Option<Arc<crate::access::Fetch>> {
+        self.contexts.lock().unwrap().get_mut(id).and_then(|context| context.ahead.take())
     }
 
     /// The Hub a run reads and writes: its own access, else the machine's.
