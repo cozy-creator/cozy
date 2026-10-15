@@ -480,6 +480,28 @@ impl Publisher {
         Ok(resolved)
     }
 
+    /// The owner's bindings of `package`'s slots (`cozy package bind`), read at its Hub once per
+    /// catalog revision and journaled: a warm run asks the Hub nothing. Local code has none.
+    fn bindings(&self, service: &Service, source: &hub::Source, package: &str, revision: &str) -> Result<Vec<Value>, Failure> {
+        let Some((org, name)) = package.split_once('/').filter(|(org, _)| *org != "local") else {
+            return Ok(vec![]);
+        };
+        let key = json!([hub::origin_key(&source.origin).unwrap_or_default(), "bindings", package]).to_string();
+        let held = service.engine.with_journal(|j| j.named(&key, revision)).map_err(io_failure)?;
+        if let Some(rows) = held.and_then(|held| serde_json::from_str(&held).ok()) {
+            return Ok(rows);
+        }
+        let path = format!("/v1/packages/{}/{}/bindings", hub::escape(org), hub::escape(name));
+        let read = Catalog::new(source).map_err(|e| ("catalog_read_failed", e.0))?.json(&path);
+        let rows = match read {
+            Ok(read) => read["bindings"].as_array().cloned().unwrap_or_default(),
+            Err(refusal) if refusal.0.contains("HTTP 404") => vec![],
+            Err(refusal) => return Err(("catalog_read_failed", refusal.0)),
+        };
+        service.engine.with_journal(|j| j.bind_named(&key, revision, &Value::Array(rows.clone()).to_string())).map_err(io_failure)?;
+        Ok(rows)
+    }
+
     /// A Hub checkpoint resolved and downloaded whole into the store (a warm run's model
     /// choice: `cozy model download`); answers what the Hub named.
     pub(crate) fn download(
@@ -1110,6 +1132,7 @@ impl Publisher {
         let width = gpu.width();
         let degree = crate::gpu_service::group_degree(&slots, request.gpus, width);
         let (mut grants, mut checkpoints) = (vec![], Vec::<Named>::new());
+        let mut bound = None;
         for slot in &slots {
             let path = slot
                 .get("path")
@@ -1118,11 +1141,19 @@ impl Publisher {
                 .to_string();
             let parameter = path.rsplit('.').next().unwrap_or_default().to_string();
             job.stage(format!("choosing the model for {path}"));
+            // The run's choice, else the package owner's binding, else the declared default.
+            let asked = request.choices.iter().find(|c| c.parameter == path || c.parameter == parameter);
+            let owners = match (asked, &mut bound) {
+                (Some(_), _) => None,
+                (None, Some(rows)) => bound_choice(rows, &path, &installation.package),
+                (None, unread) => {
+                    let rows = unread.insert(self.bindings(service, &request.source, &installation.package, &request.catalog_revision)?);
+                    bound_choice(rows, &path, &installation.package)
+                }
+            };
             let declared = default_choice(slot, &path, &installation.package, &request.owner);
-            let choice = request
-                .choices
-                .iter()
-                .find(|c| c.parameter == path || c.parameter == parameter)
+            let choice = asked
+                .or(owners.as_ref())
                 .or(declared.as_ref())
                 .ok_or_else(|| choice_absent(&path, &installation.package))?;
             if !choice.source.is_empty() {
@@ -1501,6 +1532,24 @@ pub(crate) fn default_choice(slot: &Value, path: &str, package: &str, owner: &st
         });
     }
     (!choice.rungs.is_empty()).then_some(choice)
+}
+
+/// A slot's choice as its owner bound it (`cozy package bind`): a model release and its ladder.
+fn bound_choice(rows: &[Value], path: &str, package: &str) -> Option<domain::ModelChoice> {
+    let row = rows.iter().find(|row| row["slot"] == path)?;
+    let model = row["model"].as_str()?;
+    let repository = match (model.contains('/'), package.split_once('/')) {
+        (true, _) => model.to_string(),
+        (false, Some((org, _))) => format!("{org}/{model}"),
+        (false, None) => return None,
+    };
+    let rung = |rung: &Value| {
+        let gpus = rung["gpus"].as_u64().unwrap_or(0) as u32;
+        Some(domain::ModelRung { gpu: rung["gpu"].as_str().unwrap_or("*").into(), gpus, lane: rung["lane"].as_str()?.into() })
+    };
+    let rungs: Vec<_> = row["ladder"].as_array()?.iter().map(rung).collect::<Option<_>>()?;
+    let release = row["release"].as_str()?.to_string();
+    (!rungs.is_empty()).then(|| domain::ModelChoice { parameter: path.into(), repository, release, rungs, ..Default::default() })
 }
 
 /// A slot with neither a choice nor a declared default.
@@ -2472,5 +2521,40 @@ mod tests {
         assert_eq!(count(&heard, "GET /o/"), 2 + 16, "each object once");
         pool.stop().unwrap();
         let _ = fs::remove_dir_all(&bench.root);
+    }
+
+    /// A slot no run chooses takes its package owner's binding (`cozy package bind`) over the
+    /// declared default: read once per catalog revision and journaled, so a second run asks the
+    /// Hub nothing and a moved revision reads it again. Local code has no bindings.
+    #[test]
+    fn an_owners_binding_chooses_an_unchosen_slot_once_per_revision() {
+        let root = std::env::temp_dir().join(format!("cm-bound-{}", uuid::Uuid::new_v4()));
+        let source = Store::ensure(&root.join("source")).unwrap();
+        let manifest = checkpoint(&source, 1, 9);
+        let service = Service::open(&root.join("state"), &root.join("g"), 1).unwrap();
+        let store = Arc::new(Store::ensure_owned(&root.join("store")).unwrap());
+        let publisher = Publisher::new(&root.join("published"), PackageSdk::default(), store).unwrap();
+        let model = names_hub::Model { repository: "acme/model".into(), release: "1.0.0".into(), lane: "bf16".into(), manifest };
+        let ladder = json!([{"gpu": "RTX 3060", "lane": "fp8"}, {"gpu": "*", "lane": "bf16"}]);
+        let package = names_hub::Package { name: "acme/pkg".into(), release: "1.0.0".into(), interface: json!({}),
+            wheel: "pkg-1.0.0-py3-none-any.whl".into(), bytes: vec![], callees: vec![], pypi: String::new(),
+            bindings: json!([{"slot": "render.models.model", "model": "acme/model", "release": "1.0.0", "ladder": ladder, "revision": 2}]) };
+        let (origin, heard) = names_hub::serve(&source, model, Some(package));
+        let hub = hub::Source::new(&origin, None, vec!["localhost".into()], None).unwrap();
+        let reads = || count(&heard, "GET /v1/packages/acme/pkg/bindings");
+        let path = "render.models.model";
+        let rows = publisher.bindings(&service, &hub, "acme/pkg", "r1").unwrap();
+        let bound = bound_choice(&rows, path, "acme/pkg").unwrap();
+        assert_eq!((bound.repository.as_str(), bound.release.as_str()), ("acme/model", "1.0.0"));
+        assert_eq!(choose(&bound, path, ("NVIDIA GeForce RTX 3060", 1)).unwrap().lane, "fp8");
+        assert_eq!(choose(&bound, path, ("NVIDIA H100 80GB HBM3", 1)).unwrap().lane, "bf16");
+        assert!(bound_choice(&rows, "render.models.other", "acme/pkg").is_none(), "an unbound slot keeps its default");
+        assert_eq!(publisher.bindings(&service, &hub, "acme/pkg", "r1").unwrap(), rows);
+        assert_eq!(reads(), 1, "a second run under the same revision asks the Hub nothing");
+        publisher.bindings(&service, &hub, "acme/pkg", "r2").unwrap();
+        assert_eq!(reads(), 2, "a moved revision reads the bindings again");
+        assert!(publisher.bindings(&service, &hub, "local/pkg", "r2").unwrap().is_empty());
+        assert_eq!(heard.lock().unwrap().len(), 2, "nothing else was asked: {heard:?}");
+        let _ = fs::remove_dir_all(&root);
     }
 }

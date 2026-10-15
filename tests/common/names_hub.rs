@@ -34,6 +34,8 @@ pub struct Package {
     pub callees: Vec<(String, Vec<u8>)>,
     /// The lock's other rows (PyPI's), verbatim.
     pub pypi: String,
+    /// Its owner's slot bindings (`cozy package bind`), as the Hub lists them.
+    pub bindings: Value,
 }
 
 struct Served {
@@ -156,6 +158,9 @@ async fn answer(State(served): State<Arc<Served>>, method: Method, uri: Uri, hea
             let package = package.unwrap();
             json(json!({"package": package.name, "releases": [
                 {"release": package.release}, {"release": "0.9.0"}, {"release": "9.0.0", "yanked": true}]}))
+        }
+        (Method::GET, p) if package.is_some_and(|package| p == format!("/v1/packages/{}/bindings", package.name)) => {
+            json(json!({"bindings": package.unwrap().bindings}))
         }
         (Method::GET, p) if p == release_path => {
             let package = package.unwrap();

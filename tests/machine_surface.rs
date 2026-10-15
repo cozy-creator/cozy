@@ -1501,6 +1501,7 @@ mod v1_api {
             bytes: wheel("pkg", "1.0.0"),
             callees: vec![],
             pypi: String::new(),
+            bindings: serde_json::json!([]),
         };
         let (origin, heard) = names_hub::serve(&store, model, Some(package));
         let machine = Machine::start().await;
@@ -2505,6 +2506,7 @@ mod v1_api {
             name: "acme/tensord-cpu-caller".into(), release: "0.1.0".into(),
             interface: described["interface"].clone(), wheel: root, bytes: root_bytes, callees: vec![callee],
             pypi: String::from_utf8(pypi.stdout).unwrap(),
+            bindings: serde_json::json!([]),
         };
         let (origin, _) = names_hub::serve(&store, model, Some(package));
         let counter = machine.root.join("published-measured");
