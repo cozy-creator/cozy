@@ -764,7 +764,7 @@ impl Publisher {
             // Its kernels compile, and a call's imports run, while its weights come.
             gpu.kernel_boot(held.clone());
             if request.imports {
-                gpu.prespawn(held.clone(), None);
+                gpu.prespawn(held.clone());
             }
         }
         service

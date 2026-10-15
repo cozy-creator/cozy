@@ -497,6 +497,10 @@ impl Runs {
                 let installed = local.install(&self.service, actor, digest, Some(&stoppable.stop))?;
                 self.supersede(actor, &installed)?;
                 local.collect(actor, &installed.package);
+                // A call's imports start as soon as its code is installed, as a release's do.
+                if let (false, Some(gpu)) = (spec.warm, self.service.gpu()) {
+                    gpu.prespawn(self.service.catalog.resolve(&installed.generation)?);
+                }
                 Some(installed)
             }
         };
@@ -537,17 +541,16 @@ impl Runs {
         // warm run imports only when its level asks (`downloaded` never does).
         let mut ahead = None;
         if let (false, Some(gpu)) = (spec.warm, self.service.gpu()) {
-            let fetching = plan.as_ref().zip(self.publisher.as_ref()).map(|(plan, publisher)| {
+            ahead = plan.as_ref().zip(self.publisher.as_ref()).map(|(plan, publisher)| {
                 let order = self.service.engine.get(id).map_or(u64::MAX, |record| record.root_seq());
                 let fetch = crate::access::Fetch::new(publisher.store().clone(), hub.clone(), plan.manifests(), order);
                 let selected: Vec<_> = plan.selections().into_iter().map(|s| (s.manifest, s.components)).collect();
                 if let Err(error) = fetch.ahead(&selected) {
                     eprintln!("run {id}: its weights' early fetch: {error}");
                 }
-                (plan.clone(), fetch)
+                fetch
             });
-            ahead = fetching.as_ref().map(|(_, fetch)| fetch.clone());
-            gpu.prespawn(generation.clone(), fetching);
+            gpu.prespawn(generation.clone());
         }
         if !generation.record.sdk_fallback.is_empty() {
             let warning = format!("{} {}: {}", installation.package, installation.release, generation.record.sdk_fallback);

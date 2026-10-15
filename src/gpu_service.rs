@@ -1238,7 +1238,7 @@ impl Pool {
             return "this machine imports nothing ahead for it (no fork, or it binds no model)";
         };
         if start {
-            parent.set(self.import_only(held, None));
+            parent.set(self.import_only(held));
         }
         parent.wait_started();
         match (parent.ready(), parent.failed()) {
@@ -1872,7 +1872,7 @@ impl Pool {
                 let asked = Instant::now();
                 if let Some((zygote, start)) = pool.zygote(&held) {
                     if start {
-                        zygote.set(pool.import_only(&held, Some((&plan, &*fetch))));
+                        zygote.set(pool.import_only(&held));
                     }
                     zygote.wait_started();
                 }
@@ -2167,7 +2167,7 @@ impl Pool {
 
     /// Start a generation's import-only executor in the background for a call being prepared,
     /// so its imports overlap the rest of the preparation.
-    pub fn prespawn(self: &Arc<Self>, held: HeldGeneration, ahead: Option<(Plan, Arc<crate::access::Fetch>)>) {
+    pub fn prespawn(self: &Arc<Self>, held: HeldGeneration) {
         if self.zygotes.lock().unwrap().contains_key(&parent_app(&held)) {
             return;
         }
@@ -2187,7 +2187,7 @@ impl Pool {
             .name("executor-prespawn".into())
             .spawn(move || {
                 let state = match pool.upgrade() {
-                    Some(pool) => pool.import_only(&held, ahead.as_ref().map(|(plan, fetch)| (plan, &**fetch))),
+                    Some(pool) => pool.import_only(&held),
                     None => ZygoteState::Off("the GPU pool ended".into()),
                 };
                 zygote.set(state);
@@ -2281,9 +2281,7 @@ impl Pool {
 
     /// Spawn an executor of `held` and import torch, the Runtime and the package with no
     /// device (`Start.import_only`), to fork executors from.
-    /// `held`'s import-only executor. `ahead`: the call it starts for, whose Start pass schedules
-    /// that call's weights before any import (the forked child re-asserts at its own Start).
-    fn import_only(&self, held: &HeldGeneration, ahead: Option<(&Plan, &crate::access::Fetch)>) -> ZygoteState {
+    fn import_only(&self, held: &HeldGeneration) -> ZygoteState {
         let started = (|| {
             let (root, socket, directory) = self.executor_endpoint()?;
             let mut executor = DeviceExecutor::spawn_owned(
@@ -2307,12 +2305,12 @@ impl Pool {
                     devices: self.lane_devices(0, self.devices.len().min(1) as u32)?,
                     application: held.record.application.clone(),
                     call_interfaces: crate::calls::call_interfaces(held, &interface),
-                    constructions: ahead.map(|(plan, _)| constructions(plan)).unwrap_or_default(),
+                    constructions: vec![],
                     package_interface: interface,
                     sequence_parallel_degree: 1,
                     import_only: true,
                 },
-                &mut Ahead(ahead.map(|(_, fetch)| fetch)),
+                &mut device_executor::Baseline,
             )?;
             if !reply.ok {
                 executor.shutdown()?;
@@ -2720,7 +2718,7 @@ impl Pool {
                 break;
             };
             if start {
-                zygote.set(self.import_only(held, None));
+                zygote.set(self.import_only(held));
             }
             match zygote.fork(config.take().expect("one config per launch"), &on_birth)? {
                 Forked::Ready(executor) => {
