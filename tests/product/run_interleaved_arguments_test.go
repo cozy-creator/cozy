@@ -80,7 +80,7 @@ func interleavedAssetsRoot(t *testing.T, extra ...map[string]any) string {
 	detail.ExecutionRequirements = []string{"cozy-runtime>=0.2.25"}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/packages/proof/assets", func(w http.ResponseWriter, _ *http.Request) {
-		_ = json.NewEncoder(w).Encode(hub.PackageCard{Package: hub.Resource{Name: "assets"}, Releases: []hub.ReleaseSummary{{Release: "1.0.0"}}})
+		_ = json.NewEncoder(w).Encode(hub.PackageCard{Package: hub.Resource{Org: "proof", Name: "assets"}, Releases: []hub.ReleaseSummary{{Release: "1.0.0"}}})
 	})
 	mux.HandleFunc("GET /v1/packages/proof/assets/releases/1.0.0", func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(detail)

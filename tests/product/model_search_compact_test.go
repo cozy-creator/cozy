@@ -17,7 +17,7 @@ import (
 )
 
 func TestModelSearchCompactColumnsPreserveFullData(t *testing.T) {
-	model := hub.Resource{Name: strings.TrimSuffix(strings.Repeat("model-", 8), "-"), Family: strings.Repeat("家族", 15)}
+	model := hub.Resource{Org: "proof", Name: strings.TrimSuffix(strings.Repeat("model-", 8), "-"), Family: strings.Repeat("家族", 15)}
 	release := "candidate-" + strings.Repeat("変換", 30)
 	longLane := "fp8-" + strings.Repeat("量子化", 30)
 	card := hub.ModelCard{Model: model, Releases: []hub.ModelReleaseSummary{
@@ -94,8 +94,8 @@ func TestModelSearchCompactColumnsPreserveFullData(t *testing.T) {
 }
 
 func TestModelSearchSelectsAvailableReleaseAndInfoKeepsLaneSizes(t *testing.T) {
-	model := hub.Resource{Name: "model", Family: "minimax-h3"}
-	empty := hub.Resource{Name: "unreleased"}
+	model := hub.Resource{Org: "proof", Name: "model", Family: "minimax-h3"}
+	empty := hub.Resource{Org: "proof", Name: "unreleased"}
 	manifest := "sha256:" + strings.Repeat("a", 64)
 	card := hub.ModelCard{Model: model, Releases: []hub.ModelReleaseSummary{
 		{ReleaseSummary: hub.ReleaseSummary{Release: "withdrawn", Yanked: true}},
