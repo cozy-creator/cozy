@@ -298,11 +298,6 @@ impl Service {
         invocation.gpus = call.gpus;
         invocation.inputs = call.inputs;
         invocation.degree = call.degree;
-        let available = self.gpu().map_or(0, |gpu| gpu.width());
-        if call.degree == 0 && invocation.gpus as usize > available {
-            return Err(io::Error::new(io::ErrorKind::Unsupported, format!(
-                "gpu_count_unavailable: requested {} GPUs; this machine has {available}", invocation.gpus)));
-        }
         invocation.parent = call.parent;
         let record = self.engine.bind_prepared(id, invocation, preparation, memo, answer)?;
         self.retain(&record, held.retention());
@@ -316,10 +311,7 @@ impl Service {
         let entry = interface["entrypoints"].as_array()
             .and_then(|rows| rows.iter().find(|row| row["name"] == invocation.entrypoint.as_str()))
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "this application declares no such entrypoint"))?;
-        match self.pool() {
-            Some(pool) => pool.degree(entry, invocation.gpus),
-            None => Ok(0),
-        }
+        Ok(self.pool().map_or(0, |pool| pool.degree(entry, invocation.gpus)))
     }
     fn retain(&self, record: &Execution, hold: Arc<File>) {
         if !record.state.terminal() {

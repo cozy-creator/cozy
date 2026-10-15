@@ -72,7 +72,7 @@ impl Generation {
                 let models = entry.get("models")?.as_array()?;
                 models.iter().any(crate::gpu_service::constructed).then_some(models)
             })
-            .filter_map(|models| crate::gpu_service::group_degree(models, 0, available).ok())
+            .map(|models| crate::gpu_service::group_degree(models, 0, available))
             .max()
             .unwrap_or(0)
     }

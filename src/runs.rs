@@ -585,7 +585,7 @@ impl Runs {
         let entry = declared.expect("checked above");
         let degree = match (&plan, self.service.pool()) {
             (Some(plan), _) => plan.degree,
-            (None, Some(pool)) => pool.degree(entry, spec.gpus).map_err(|e| refused("gpu_count_unavailable", e.to_string()))?,
+            (None, Some(pool)) => pool.degree(entry, spec.gpus),
             (None, None) => 0,
         };
         // A memoized callable's run is answered from the success this machine holds for its
@@ -958,6 +958,7 @@ impl Runs {
                 })
                 .collect(),
             attention_kernel: context.attention_kernel,
+            // The caller's count caps a child's group; the child's own declaration picks within it.
             gpus: context.gpus,
             hub: context.hub,
             providers: context.providers,

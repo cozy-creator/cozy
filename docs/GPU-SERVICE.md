@@ -28,8 +28,8 @@ Acceptance, journal, progress and output custody stay in `Engine`; scheduling st
 - Choices with `source`, `profiles` or `adapters` are unsupported.
 - Exactly one `ModelGrant` must match each slot. Declared `component_use` must be within its components.
 - Degree: the widest group every slot declares (`sequence_parallel.degrees`, one always)
-  within the machine envelope. `RunSpec.gpus > 0` requests that exact degree and refuses an
-  unsupported count. Model lanes/checkpoint overrides never change it; weight ladders fit
+  within the machine envelope and `RunSpec.gpus` when positive: a cap the run's children inherit,
+  never a refusal. Model lanes/checkpoint overrides never change it; weight ladders fit
   within the selected group. Busy GPUs cause queuing, not a smaller group.
 - Degree 0 (deviceless): `accelerator=False`, or a machine without GPUs. Such a call runs on a
   pooled deviceless executor within CPU room; idle ones are ended by host pressure, least recently
