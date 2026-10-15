@@ -75,7 +75,7 @@ func (s *Store) MachinePackageTransfer(request, boot, revision string) (MachineP
 }
 
 // e/r are the observer and request aliases. Explicit Runtime release is stronger
-// than a status projection. A failed or paused root remains live after its small
+// than a status projection. A failed root remains live after its small
 // error result is collected, and cancellation alone never proves native cleanup.
 // Local abandonment stops observation; it cannot waive remote lifecycle custody.
 const machineExecutionLive = `(NOT ` + machineExecutionLost + ` AND NOT ` + machineRetentionReleased + ` AND (

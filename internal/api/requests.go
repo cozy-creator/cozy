@@ -1234,7 +1234,7 @@ func (s *Server) listRequests(w http.ResponseWriter, r *http.Request) {
 		state = "failed"
 	case "canceled":
 		state = "canceled"
-	case "paused", "pausing", "canceling", "finalizing":
+	case "canceling", "finalizing":
 		state = strings.TrimSpace(r.URL.Query().Get("status"))
 	default:
 		s.refuse(w, r, http.StatusBadRequest, "invalid_status",

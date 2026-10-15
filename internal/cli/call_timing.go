@@ -78,7 +78,7 @@ func (e callPhaseEvent) valid() bool {
 		return false
 	}
 	switch e.Phase {
-	case "queued", "preparing", "running", "finalizing", "paused", "terminal":
+	case "queued", "preparing", "running", "finalizing", "terminal":
 		return true
 	}
 	return false

@@ -35,7 +35,7 @@ func TestPublishedCompositionSpecReadsNoHub(t *testing.T) {
 	defer store.Close()
 	cfg := config.Config{Home: root, HubURL: server.URL}
 	m := machineRuns{context: &Context{Cfg: cfg}, layout: layout, store: store, resolver: NewResolver(store, cfg)}
-	request := records.Request{ID: "film", Kind: "job", Package: "alice/film", Release: "1.36.1", Entrypoint: "long_form"}
+	request := records.Request{ID: "film", Kind: "invocation", Package: "alice/film", Release: "1.36.1", Entrypoint: "long_form"}
 	if !request.ComposesChildren() {
 		t.Fatal("the request must be a composition root")
 	}
