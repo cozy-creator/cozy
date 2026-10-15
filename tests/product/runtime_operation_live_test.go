@@ -132,10 +132,10 @@ async def main(ctx):
 		reference := ""
 		for _, line := range strings.Split(output, "\n") {
 			var answer struct {
-				Job string `json:"job"`
+				ID string `json:"id"`
 			}
-			if json.Unmarshal([]byte(line), &answer) == nil && answer.Job != "" {
-				reference = answer.Job
+			if json.Unmarshal([]byte(line), &answer) == nil && answer.ID != "" {
+				reference = answer.ID
 			}
 		}
 		if reference == "" {

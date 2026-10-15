@@ -280,8 +280,8 @@ A machine's models are a cache it manages itself: unused ones expire, and a mach
 evicts them. There is no remove or gc verb, and nothing but the machine deletes from its store.
 
 Upload an already canonical local alias, or ingest a provider source with `model download`.
-Run quantization and other weight-producing jobs through the ordinary package command.
-The job receives prepared model inputs and its typed payload; TensorFS owns provider
+Run quantization and other weight-producing functions through the ordinary package command.
+The function receives its model inputs and typed payload; TensorFS owns provider
 conversion. The destination owner must match the account shown by `cozy auth`:
 
 ```sh
@@ -312,14 +312,14 @@ cozy model publish org/model --release 1.0.0 --lane fp16=sha256:<checkpoint> --l
 ```
 
 The package that serves the model owns the recipe (which components and layers). Its quantizer
-is a job that takes the model and declares one weights output named for the lane (`fp8`,
-`mxfp8`); `cozy_runtime.derive` supplies the encodings. The verb runs that job as the
-conversion below, choosing the installed package whose quantizer the checkpoint's components
-satisfy, or `--package org/name`. A model no package quantizes is refused, naming the job a
-package would need.
+is a function that takes the model as a `Weights[M]` argument and declares one weights output
+named for the lane (`fp8`, `mxfp8`); `cozy_runtime.derive` supplies the encodings. The verb runs
+that function as the conversion below, choosing the installed package whose quantizer the
+checkpoint's components satisfy, or `--package org/name`. A model no package quantizes is
+refused, naming the function a package would need.
 
-A conversion job — model inputs and at least one declared weight output — reads
-`cozy run <job> <input> [<org/model>]`: the first positional binds its first model input, the
+A conversion — a function with model inputs and at least one declared weights output — reads
+`cozy run <fn> <input> [<org/model>]`: the first positional binds its first model input, the
 second is the `--upload-to` destination (it may be the input's own repository), and any
 further input is `model.<param>=<ref>`. Each output
 is uploaded as a private checkpoint named by its output slot; publish a release with `cozy model publish`.
@@ -347,7 +347,7 @@ install active and does not stop other packages.
 `--input=request.json` or `--input=~/request.yaml` reads the whole payload, including
 nested lists such as `segments`, from a JSON or YAML file (`.yaml`/`.yml`; YAML 1.2, so
 `yes` stays a string). Inline arguments override file values; use `field:=<json>` for a
-nested inline value. `--input-tree` separately binds a job input directory.
+nested inline value. `--asset <field>=<directory>` binds a Tree input.
 
 A field the function does not declare, at any depth, is dropped with one warning naming it
 (`--json` and `cozy run show` carry it as `warnings`). Types, required fields and bounds are
@@ -360,21 +360,23 @@ through the same asset bindings as `--asset references.0.image=/path/to/hero.png
 Ordinary description/prompt strings are never interpreted as files. Supplying the same
 field in the file and with `--asset` is an error. These inputs accept local files, not URLs.
 
-`--upload-to` uploads each declared weight output as an owner-only immutable checkpoint;
-it publishes no release. A rented job run without it keeps those outputs retained on its
+`--upload-to` uploads each declared weights output, from any function that declares one, as an
+owner-only immutable checkpoint; it publishes no release. A rented run without it keeps those
+outputs retained on its
 rental until `cozy rental end`; `cozy run upload <run>[#<output>] <org/model>` uploads one
 later, straight from the rental and without running again, and a repeat resumes or returns
 the same checkpoint. `--source-profile slot=profile` narrows each foreign
-input to a reviewed TensorFS profile. Currently every foreign input must name the same
-provider source and all model slots must be foreign; mixed inputs and multiple independent
-sources refuse before acquisition. Tensorhub inputs use the ordinary exact model resolver.
+input to a reviewed TensorFS profile. A provider source runs on a named machine, or on a fresh
+rental when every model input names the same source, which sizes the rental. Tensorhub inputs
+use the ordinary exact model resolver.
 The Hub measures their shared closure when sizing a rental; a manifest's small metadata
 length is never a disk-size estimate.
 
-Submission records an ordinary `job-*` run; `--await` watches it and `cozy run watch <job-id>` attaches later.
-Use `--idempotency-key` to replay the same request. Existing source operations continue
-through their recorded intent after an upgrade. `--producer` on model upload/download is
-removed; jobs have one invocation surface.
+Every function's run is an ordinary request: `--await` watches it and `cozy run watch <run>`
+attaches later; `cozy run cancel <run>` is its only control. `--timeout` cancels it on its
+machine when it passes, whether or not a client waits. A canceled or failed run submitted again
+is a new run whose memoized steps the machine answers from its memo. Use `--idempotency-key` to
+replay the same request.
 
 Publish, repoint, add, or remove release lanes separately. Omitted lanes stay unchanged:
 
@@ -393,7 +395,7 @@ Deletion drops Tensorhub's references only; its GC reclaims objects no other mod
 Checkpoint IDs are immutable. Release labels and their lane maps are mutable owner pointers. Ordinary
 consumers follow a release lane so fixes take effect; accepted runs freeze the checkpoint they resolved.
 
-With `--rental-only` or a named `--rental`, job packages resolve directly to their latest non-yanked immutable
+With `--rental-only` or a named `--rental`, published packages resolve directly to their latest non-yanked immutable
 Tensorhub releases. The transfer intent pins `(package, release)`; downloaded execution files carry
 their own exact refs, including `metadata/package-interface.json`.
 They do not need to be installable in the laptop's local Python environment. Local production still
@@ -401,7 +403,7 @@ uses the ordinary installed package. `--rental-only` skips local capacity and re
 external attempt. Downloads that could rent currently refuse until Creator wires the negotiated
 weights-read return plane; local-only sources under `--rental` remain local.
 
-## Run packages and jobs
+## Run packages
 
 Inspect a function with `cozy run org/package/function --describe`; its request,
 models and output have separate sections. A call missing required arguments
@@ -439,14 +441,12 @@ async def main(ctx, *, model: RestorationModel) -> int:
     return len(frames)
 ```
 
-`main` takes what a package function takes: Model slots, services such as `Outputs` and
-`Telemetry`, and typed assets. A `main` that runs Model slots is served like a package
-entrypoint: Runtime constructs them through the weight plane and memory manager, and the run
-holds its GPU while its children run beside it. One that writes weights outputs, uses job
-services or reads a bare `Model` source runs as a job, as does one without Model slots. A job
-may declare where its body computes, `accelerator = true` (GPU) or `false` (CPU) under
-`[tool.cozy]`, as a package job declares `app.job(accelerator=...)`; nothing infers it, and an
-undeclared job takes the machine's GPU (CPU on a machine without one).
+`main` takes what a package function takes: Model slots, `Weights[M]` sources, services such as
+`Outputs` and `Telemetry`, and typed assets. Runtime constructs Model slots through the weight
+plane and memory manager; a `Weights[M]` argument is read raw and never constructed. A script
+runs on the machine's GPU (CPU on a machine without one) unless it declares
+`accelerator = false` under `[tool.cozy]`, as a package function declares
+`app.entrypoint(accelerator=False)`; nothing infers it.
 `[tool.cozy.models]` entries are the slot's default ladder, exactly as `defaults=` declares
 it; `model.<slot>=org/model@release/lane` overrides it per run. The optional context supplies
 cancellation, logs, progress and metrics. Discovery checks the script's syntax without
@@ -461,20 +461,12 @@ cozy run ./experiment.py --rental-only --await
 cozy run ./experiment.py --rental-only --await
 ```
 
-To explicitly continue development on an earlier run's retained machine and record that
-relationship, use the optional retry handle:
-
-```sh
-cozy run ./experiment.py --retry <prior-run-id> --rental-only --await
-```
-
 A local package runs from its directory, as an editable Python install does: nothing is
 copied on this computer, and only its interface is read here, from source. This computer's
 machine installs it in place; a rental keeps one copy, sent only the files that changed. Each
 machine builds the package's environment once and again only when its lock, its project
-metadata or a local path dependency changes; an ordinary edit costs no install. A corrected
-retry creates a new record linked to the previous run; it never rewrites the old attempt's
-result. Code goes directly to the authenticated machine, without a Tensorhub package
+metadata or a local path dependency changes; an ordinary edit costs no install. A run of edited
+code is a new run; it never rewrites an earlier run's result. Code goes directly to the authenticated machine, without a Tensorhub package
 publication or intermediate upload; published dependencies still come from their package
 indexes.
 

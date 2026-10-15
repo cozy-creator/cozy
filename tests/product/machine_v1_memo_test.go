@@ -10,8 +10,8 @@ import (
 	"testing"
 )
 
-// A job's memoized call that ran on a machine is held by that machine: the package's next job
-// has the same call answered without running, and the new one runs. This computer carries no
+// A memoized call that ran on a machine is held by that machine: the package's next run has
+// the same call answered without running, and the new one runs. This computer carries no
 // results; the machine answers where its results are.
 func TestMemoizedCallsAreAnsweredFromTheMachinesMemo(t *testing.T) {
 	root, counter := memoMachine(t)
@@ -29,20 +29,20 @@ func TestMemoizedCallsAreAnsweredFromTheMachinesMemo(t *testing.T) {
 		must(t, os.WriteFile(in, raw, 0o600))
 		code, out := runCozy(t, root, "run", "local/tensord-cpu-memo/survey", "--input", in, "--await", "--json")
 		var run struct {
-			Job    string `json:"job"`
+			ID     string `json:"id"`
 			Result struct {
 				Squares []int `json:"squares"`
 			} `json:"result"`
 		}
-		if code != 0 || json.Unmarshal([]byte(lastJSONLine(out)), &run) != nil || run.Job == "" {
+		if code != 0 || json.Unmarshal([]byte(lastJSONLine(out)), &run) != nil || run.ID == "" {
 			t.Fatalf("survey %v [exit %d]\n%s", values, code, out)
 		}
-		code, shown := runCozy(t, root, "run", "show", run.Job, "--json")
+		code, shown := runCozy(t, root, "run", "show", run.ID, "--json")
 		var report struct {
 			Calls []shownCall `json:"calls"`
 		}
 		if code != 0 || json.Unmarshal([]byte(lastJSONLine(shown)), &report) != nil {
-			t.Fatalf("run show %s [exit %d]\n%s", run.Job, code, shown)
+			t.Fatalf("run show %s [exit %d]\n%s", run.ID, code, shown)
 		}
 		var calls []shownCall
 		for _, call := range report.Calls {

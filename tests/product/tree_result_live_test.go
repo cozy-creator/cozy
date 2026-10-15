@@ -82,7 +82,7 @@ def main(*, out: Outputs) -> Tree:
 		var result map[string]any
 		for _, line := range strings.Split(out, "\n") {
 			var value map[string]any
-			if json.Unmarshal([]byte(line), &value) == nil && value["job"] != nil {
+			if json.Unmarshal([]byte(line), &value) == nil && value["id"] != nil {
 				result = value
 			}
 		}
@@ -103,7 +103,7 @@ def main(*, out: Outputs) -> Tree:
 		if len(first) < 48<<10 || string(first) != string(second) || len(empty) != 0 {
 			t.Fatal("Tree closure lost nested, duplicate or empty bytes")
 		}
-		request, problem := store.RequestByReference(fmt.Sprint(result["job"]))
+		request, problem := store.RequestByReference(fmt.Sprint(result["id"]))
 		fatal(t, problem)
 		if request == nil || request.State != "succeeded" {
 			t.Fatal("Tree root did not collect")

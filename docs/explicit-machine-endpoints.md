@@ -48,4 +48,4 @@ A machine that serves `cozy.machine.v1` is given that access inside each run ins
 keeps none, so nothing is cached for it and logout asks it for nothing.
 
 The explicit selector flag is not a claim that the chosen machine implements every
-operation; jobs, browser selection and boot refresh remain separate gates.
+operation; browser selection and boot refresh remain separate gates.
