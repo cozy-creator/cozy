@@ -51,7 +51,7 @@ pub fn py_fit<'p>(
             .or_refuse(py)?,
     )
     .or_refuse(py)?;
-    let header = Header::parse(header).or_refuse(py)?;
+    let header = Header::from_stored(header).or_refuse(py)?;
     let custody = Custody::parse(custody).or_refuse(py)?;
     let observed = match observations {
         Some(bytes) => Some(CapabilityRecords::parse_observed(bytes).or_refuse(py)?),
@@ -216,7 +216,7 @@ pub fn object_id(data: &[u8]) -> String {
     ids::object_id(data)
 }
 
-/// Validate canonical CozyTensorsHeader bytes; return them as plain Python data.
+/// Decode admitted CozyTensorsHeader bytes; return them as plain Python data.
 #[pyfunction]
 #[pyo3(signature = (data, closure=None))]
 pub fn parse_header<'p>(
@@ -224,7 +224,7 @@ pub fn parse_header<'p>(
     data: &[u8],
     closure: Option<&PyClosure>,
 ) -> PyResult<Bound<'p, PyAny>> {
-    let h = Header::parse(data).or_refuse(py)?;
+    let h = Header::from_stored(data).or_refuse(py)?;
     if let Some(c) = closure {
         h.validate(&c.inner).or_refuse(py)?;
     }

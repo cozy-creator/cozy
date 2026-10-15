@@ -251,7 +251,7 @@ pub fn put_doc<D: crate::ids::StoredDoc>(store: &Store, d: &D) -> Result<ObjectR
 }
 
 pub fn load_header(store: &Store, r: &ObjectRef) -> Result<Header> {
-    Header::parse(&read_object(store, r, limits::DOC_MAX_BYTES)?)
+    Header::from_stored(&read_object(store, r, limits::DOC_MAX_BYTES)?)
 }
 
 /// The closure the header's `encodings` list names. An absent spec object is state (3) of

@@ -945,12 +945,9 @@ impl Census {
         projection: &mut Projection,
     ) -> Result<()> {
         let (manifest, manifest_bytes) = self.manifest(&checkpoint.manifest)?;
+        // `validate_checkpoint_inputs` parses the header; this only reads it.
         let header_bytes = match manifest.header() {
-            Some(reference) => {
-                let bytes = self.blob("CozyTensors header", reference)?;
-                Header::parse(&bytes)?;
-                Some(bytes)
-            }
+            Some(reference) => Some(self.blob("CozyTensors header", reference)?),
             None => None,
         };
         let facts = Self::validate_checkpoint_inputs(

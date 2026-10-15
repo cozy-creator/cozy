@@ -374,11 +374,10 @@ pub fn fit(
             });
         };
 
+        let stored_by_key: std::collections::HashMap<&str, &crate::header::Tensor> =
+            stored_tensors.iter().map(|(key, tensor)| (key.as_str(), tensor)).collect();
         for (key, requirement) in required_tensors {
-            let Some((_, stored)) = stored_tensors
-                .iter()
-                .find(|(stored_key, _)| stored_key == key)
-            else {
+            let Some(stored) = stored_by_key.get(key.as_str()) else {
                 return Ok(Fit::TensorMissing {
                     component: component.clone(),
                     key: key.clone(),
@@ -421,9 +420,10 @@ pub fn fit(
         // A stored key the code does not build is skipped, on every custody: the code may
         // build less than an older checkpoint stores (Qwen's text encoder dropped `lm_head`).
         for (key, stored) in stored_tensors {
+            // Requirements are sorted by key (`TensorRequirements::new`).
             if required_tensors
-                .iter()
-                .any(|(required_key, _)| required_key == key)
+                .binary_search_by(|(required_key, _)| required_key.as_str().cmp(key))
+                .is_ok()
             {
                 continue;
             }

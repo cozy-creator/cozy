@@ -1617,7 +1617,7 @@ impl PyStore {
         let m = checkpoint::load_manifest(&self.store, &r).or_refuse(py)?;
         let header = m
             .header()
-            .map(|reference| checkpoint::load_header(&self.store, reference)?.canonical_bytes())
+            .map(|reference| checkpoint::read_object(&self.store, reference, tensorfs_core::limits::DOC_MAX_BYTES))
             .transpose()
             .or_refuse(py)?;
         Ok((m.clone(), m.canonical_bytes(), header))
@@ -1747,7 +1747,7 @@ impl PyLease {
         max_bytes: u64,
     ) -> PyResult<Bound<'p, PyBytes>> {
         let header_ref = ObjectRef::of(header);
-        let header = Header::parse(header).or_refuse(py)?;
+        let header = Header::from_stored(header).or_refuse(py)?;
         let asset = header
             .assets
             .iter()
@@ -1783,7 +1783,7 @@ impl PyLease {
         into: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
         let header_ref = ObjectRef::of(header);
-        let header = Header::parse(header).or_refuse(py)?;
+        let header = Header::from_stored(header).or_refuse(py)?;
         let name = format!("{component}/{key}/{role}");
         let part = header
             .components

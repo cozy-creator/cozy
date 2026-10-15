@@ -74,7 +74,7 @@ pub fn plan(
     components: Option<Vec<String>>,
     window: u64,
 ) -> PyResult<PyPlan> {
-    let h = Header::parse(header).or_refuse(py)?;
+    let h = Header::from_stored(header).or_refuse(py)?;
     let scope = components.unwrap_or_else(|| h.components.iter().map(|(c, _)| c.clone()).collect());
     let p = read::plan_for_traversal(&h, &traversal, &scope, window).or_refuse(py)?;
     Ok(PyPlan { plan: p })

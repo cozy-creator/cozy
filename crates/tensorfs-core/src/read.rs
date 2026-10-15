@@ -366,7 +366,8 @@ pub fn read_into(lease: &ReadLease, r: &ObjectRange, buf: &mut [u8]) -> Result<(
 }
 
 /// Reassemble one header-declared asset through this lease's already verified descriptors.
-/// `max_bytes` is the caller's allocation bound; assets above it refuse before allocation.
+/// Each segment is content-addressed and the header that composes them is too, so the whole
+/// is not hashed again. `max_bytes` is the caller's allocation bound.
 pub fn read_asset(lease: &ReadLease, name: &str, asset: &Asset, max_bytes: u64) -> Result<Vec<u8>> {
     if asset.logical_length > max_bytes {
         return refuse(
@@ -394,10 +395,13 @@ pub fn read_asset(lease: &ReadLease, name: &str, asset: &Asset, max_bytes: u64) 
             code: Code::SIZE_CAP,
             detail: format!("asset {name:?}: segment length does not fit this platform"),
         })?;
-        let end = offset.checked_add(segment_length).ok_or_else(|| Refusal {
-            code: Code::ARITH_OVERFLOW,
-            detail: format!("asset {name:?}: segment offsets overflow"),
-        })?;
+        let end = offset
+            .checked_add(segment_length)
+            .filter(|end| *end <= length)
+            .ok_or_else(|| Refusal {
+                code: Code::BYTE_LENGTH_MISMATCH,
+                detail: format!("asset {name:?}: segments exceed its {length} B"),
+            })?;
         read_into(
             lease,
             &ObjectRange {
@@ -409,14 +413,10 @@ pub fn read_asset(lease: &ReadLease, name: &str, asset: &Asset, max_bytes: u64) 
         )?;
         offset = end;
     }
-    let digest = crate::sha256::hex_digest(&bytes);
-    if offset as u64 != asset.logical_length || digest != asset.logical_sha256 {
+    if offset as u64 != asset.logical_length {
         return refuse(
-            Code::WHOLE_DIGEST_MISMATCH,
-            format!(
-                "asset {name:?}: reassembled {offset} B sha256:{digest}, header claims {} B sha256:{}",
-                asset.logical_length, asset.logical_sha256
-            ),
+            Code::BYTE_LENGTH_MISMATCH,
+            format!("asset {name:?}: segments total {offset} B, header claims {} B", asset.logical_length),
         );
     }
     Ok(bytes)

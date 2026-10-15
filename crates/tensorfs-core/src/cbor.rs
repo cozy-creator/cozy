@@ -12,10 +12,38 @@ use crate::limits;
 use crate::relation::{Carrier, Dim, Relation};
 use crate::spec::{EncodingSpec, Role};
 
-fn malformed(what: &str, error: impl std::fmt::Display) -> Refusal {
+fn malformed(what: impl std::fmt::Display, error: impl std::fmt::Display) -> Refusal {
     Refusal {
         code: Code::MALFORMED_CBOR,
         detail: format!("{what}: {error}"),
+    }
+}
+
+/// Where a decode is, spelled only when a refusal names it: a header carries thousands of
+/// fields, and formatting each one's path up front cost more than decoding it.
+#[derive(Clone, Copy)]
+enum At<'a> {
+    Root(&'static str),
+    Field(&'a At<'a>, &'static str),
+    Index(&'a At<'a>, &'static str, usize),
+}
+
+impl<'a> At<'a> {
+    fn field(&'a self, name: &'static str) -> At<'a> {
+        At::Field(self, name)
+    }
+    fn index(&'a self, name: &'static str, index: usize) -> At<'a> {
+        At::Index(self, name, index)
+    }
+}
+
+impl std::fmt::Display for At<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            At::Root(name) => f.write_str(name),
+            At::Field(parent, name) => write!(f, "{parent}.{name}"),
+            At::Index(parent, name, index) => write!(f, "{parent}.{name}[{index}]"),
+        }
     }
 }
 
@@ -61,7 +89,7 @@ fn emit<T>(
     })
 }
 
-fn exact_array(d: &mut Decoder<'_>, what: &str, want: u64) -> Result<()> {
+fn exact_array(d: &mut Decoder<'_>, what: &At<'_>, want: u64) -> Result<()> {
     match d.array().map_err(|e| malformed(what, e))? {
         Some(got) if got == want => Ok(()),
         Some(got) => refuse(
@@ -75,7 +103,7 @@ fn exact_array(d: &mut Decoder<'_>, what: &str, want: u64) -> Result<()> {
     }
 }
 
-fn list_len(d: &mut Decoder<'_>, what: &str, cap: usize, nonempty: bool) -> Result<usize> {
+fn list_len(d: &mut Decoder<'_>, what: &At<'_>, cap: usize, nonempty: bool) -> Result<usize> {
     let n = match d.array().map_err(|e| malformed(what, e))? {
         Some(n) => usize::try_from(n).map_err(|_| malformed(what, "array length over usize"))?,
         None => {
@@ -97,7 +125,7 @@ fn list_len(d: &mut Decoder<'_>, what: &str, cap: usize, nonempty: bool) -> Resu
     Ok(n)
 }
 
-fn text(d: &mut Decoder<'_>, what: &str, max: usize) -> Result<String> {
+fn text(d: &mut Decoder<'_>, what: &At<'_>, max: usize) -> Result<String> {
     let value = d.str().map_err(|e| malformed(what, e))?;
     if value.is_empty() || value.len() > max || !value.bytes().all(|b| (0x20..=0x7e).contains(&b)) {
         return refuse(
@@ -108,7 +136,7 @@ fn text(d: &mut Decoder<'_>, what: &str, max: usize) -> Result<String> {
     Ok(value.to_string())
 }
 
-fn uint(d: &mut Decoder<'_>, what: &str) -> Result<u64> {
+fn uint(d: &mut Decoder<'_>, what: &At<'_>) -> Result<u64> {
     d.u64().map_err(|e| malformed(what, e))
 }
 
@@ -126,7 +154,7 @@ fn digest_bytes(what: &str, hex: &str) -> Result<[u8; 32]> {
     Ok(out)
 }
 
-fn digest_hex(d: &mut Decoder<'_>, what: &str) -> Result<String> {
+fn digest_hex(d: &mut Decoder<'_>, what: &At<'_>) -> Result<String> {
     let bytes = d.bytes().map_err(|e| malformed(what, e))?;
     if bytes.len() != 32 {
         return refuse(
@@ -147,7 +175,7 @@ fn encode_ref(e: &mut Encoder<Bounded>, r: &ObjectRef) -> Result<()> {
     Ok(())
 }
 
-fn decode_ref(d: &mut Decoder<'_>, what: &str) -> Result<ObjectRef> {
+fn decode_ref(d: &mut Decoder<'_>, what: &At<'_>) -> Result<ObjectRef> {
     exact_array(d, what, 2)?;
     Ok(ObjectRef {
         sha256: digest_hex(d, what)?,
@@ -163,7 +191,7 @@ fn encode_shape(e: &mut Encoder<Bounded>, shape: &[u64]) -> Result<()> {
     Ok(())
 }
 
-fn decode_shape(d: &mut Decoder<'_>, what: &str) -> Result<Vec<u64>> {
+fn decode_shape(d: &mut Decoder<'_>, what: &At<'_>) -> Result<Vec<u64>> {
     let n = list_len(d, what, limits::MAX_RANK, false)?;
     (0..n).map(|_| uint(d, what)).collect()
 }
@@ -182,7 +210,7 @@ fn encode_optional<T>(
 
 fn decode_optional<T>(
     d: &mut Decoder<'_>,
-    what: &str,
+    what: &At<'_>,
     read: impl FnOnce(&mut Decoder<'_>) -> Result<T>,
 ) -> Result<Option<T>> {
     match list_len(d, what, 1, false)? {
@@ -210,14 +238,14 @@ fn encode_carrier(e: &mut Encoder<Bounded>, carrier: &Carrier) -> Result<()> {
     Ok(())
 }
 
-fn decode_carrier(d: &mut Decoder<'_>, what: &str) -> Result<Carrier> {
+fn decode_carrier(d: &mut Decoder<'_>, what: &At<'_>) -> Result<Carrier> {
     let length = list_len(d, what, 2, true)?;
-    match uint(d, &format!("{what}.tag"))? {
+    match uint(d, &what.field("tag"))? {
         0 if length == 1 => Ok(Carrier::SameAsLogical),
         1 if length == 2 => {
-            let count = list_len(d, &format!("{what}.dtypes"), 32, true)?;
+            let count = list_len(d, &what.field("dtypes"), 32, true)?;
             let dtypes = (0..count)
-                .map(|_| Dtype::from_code(uint(d, &format!("{what}.dtype"))?))
+                .map(|_| Dtype::from_code(uint(d, &what.field("dtype"))?))
                 .collect::<Result<Vec<_>>>()?;
             Ok(Carrier::Set(dtypes))
         }
@@ -268,31 +296,31 @@ fn encode_dim(e: &mut Encoder<Bounded>, dim: &Dim) -> Result<()> {
     Ok(())
 }
 
-fn decode_dim(d: &mut Decoder<'_>, what: &str) -> Result<Dim> {
+fn decode_dim(d: &mut Decoder<'_>, what: &At<'_>) -> Result<Dim> {
     let length = list_len(d, what, 4, true)?;
-    let tag = uint(d, &format!("{what}.tag"))?;
+    let tag = uint(d, &what.field("tag"))?;
     let dim = match (tag, length) {
         (0, 2) => Dim::Axis {
-            axis: uint(d, &format!("{what}.axis"))?,
+            axis: uint(d, &what.field("axis"))?,
         },
         (1, 3) => Dim::Div {
-            axis: uint(d, &format!("{what}.axis"))?,
-            by: uint(d, &format!("{what}.by"))?,
+            axis: uint(d, &what.field("axis"))?,
+            by: uint(d, &what.field("by"))?,
         },
         (2, 3) => Dim::CeilDiv {
-            axis: uint(d, &format!("{what}.axis"))?,
-            by: uint(d, &format!("{what}.by"))?,
+            axis: uint(d, &what.field("axis"))?,
+            by: uint(d, &what.field("by"))?,
         },
         (3, 4) => Dim::CeilBlock {
-            axis: uint(d, &format!("{what}.axis"))?,
-            block: uint(d, &format!("{what}.block"))?,
-            mul: uint(d, &format!("{what}.mul"))?,
+            axis: uint(d, &what.field("axis"))?,
+            block: uint(d, &what.field("block"))?,
+            mul: uint(d, &what.field("mul"))?,
         },
         (4, 2) => Dim::ElementsDiv {
-            by: uint(d, &format!("{what}.by"))?,
+            by: uint(d, &what.field("by"))?,
         },
         (5, 2) => Dim::Lit {
-            value: uint(d, &format!("{what}.value"))?,
+            value: uint(d, &what.field("value"))?,
         },
         _ => {
             return refuse(
@@ -322,14 +350,14 @@ fn encode_relation(e: &mut Encoder<Bounded>, relation: &Relation) -> Result<()> 
     Ok(())
 }
 
-fn decode_relation(d: &mut Decoder<'_>, what: &str) -> Result<Relation> {
+fn decode_relation(d: &mut Decoder<'_>, what: &At<'_>) -> Result<Relation> {
     let length = list_len(d, what, 2, true)?;
-    match uint(d, &format!("{what}.tag"))? {
+    match uint(d, &what.field("tag"))? {
         0 if length == 1 => Ok(Relation::Same),
         1 if length == 2 => {
-            let count = list_len(d, &format!("{what}.dims"), limits::MAX_RANK, false)?;
+            let count = list_len(d, &what.field("dims"), limits::MAX_RANK, false)?;
             let dims = (0..count)
-                .map(|index| decode_dim(d, &format!("{what}.dims[{index}]")))
+                .map(|index| decode_dim(d, &what.index("dims", index)))
                 .collect::<Result<Vec<_>>>()?;
             Ok(Relation::Dims(dims))
         }
@@ -364,27 +392,27 @@ fn encode_encoding_into(e: &mut Encoder<Bounded>, spec: &EncodingSpec) -> Result
     Ok(())
 }
 
-fn decode_encoding_from(d: &mut Decoder<'_>, what: &str) -> Result<EncodingSpec> {
+fn decode_encoding_from(d: &mut Decoder<'_>, what: &At<'_>) -> Result<EncodingSpec> {
     exact_array(d, what, 4)?;
-    let count = list_len(d, &format!("{what}.logical_dtypes"), 32, true)?;
+    let count = list_len(d, &what.field("logical_dtypes"), 32, true)?;
     let logical_dtypes = (0..count)
-        .map(|_| Dtype::from_code(uint(d, &format!("{what}.logical_dtype"))?))
+        .map(|_| Dtype::from_code(uint(d, &what.field("logical_dtype"))?))
         .collect::<Result<Vec<_>>>()?;
-    let logical_rank = decode_optional(d, &format!("{what}.logical_rank"), |d| {
-        uint(d, &format!("{what}.logical_rank.value"))
+    let logical_rank = decode_optional(d, &what.field("logical_rank"), |d| {
+        uint(d, &what.field("logical_rank").field("value"))
     })?;
-    let count = list_len(d, &format!("{what}.roles"), limits::MAX_PARTS, true)?;
+    let count = list_len(d, &what.field("roles"), limits::MAX_PARTS, true)?;
     let mut roles = Vec::with_capacity(count);
     for index in 0..count {
-        let role_what = format!("{what}.roles[{index}]");
+        let role_what = what.index("roles", index);
         exact_array(d, &role_what, 3)?;
-        let name = text(d, &format!("{role_what}.name"), limits::MAX_NAME_BYTES)?;
-        let carrier = decode_carrier(d, &format!("{role_what}.carrier"))?;
-        let shape = decode_relation(d, &format!("{role_what}.shape"))?;
+        let name = text(d, &role_what.field("name"), limits::MAX_NAME_BYTES)?;
+        let carrier = decode_carrier(d, &role_what.field("carrier"))?;
+        let shape = decode_relation(d, &role_what.field("shape"))?;
         roles.push((name, Role { carrier, shape }));
     }
-    let vectors = decode_optional(d, &format!("{what}.vectors"), |d| {
-        decode_ref(d, &format!("{what}.vectors.value"))
+    let vectors = decode_optional(d, &what.field("vectors"), |d| {
+        decode_ref(d, &what.field("vectors").field("value"))
     })?;
     let spec = EncodingSpec {
         logical_dtypes,
@@ -407,7 +435,7 @@ pub(crate) fn decode_encoding(bytes: &[u8]) -> Result<EncodingSpec> {
         return refuse(Code::SIZE_CAP, "nested encoding exceeds its cap");
     }
     let mut decoder = Decoder::new(bytes);
-    let spec = decode_encoding_from(&mut decoder, "encoding")?;
+    let spec = decode_encoding_from(&mut decoder, &At::Root("encoding"))?;
     if decoder.position() != bytes.len() || encode_encoding(&spec)? != bytes {
         return refuse(
             Code::NONCANONICAL_ENCODING,
@@ -456,11 +484,11 @@ pub(crate) fn encoded_tensor_identity(tensor: &Tensor) -> Result<String> {
     Ok(crate::ids::object_id(&encoder.into_writer().bytes))
 }
 
-fn decode_part(d: &mut Decoder<'_>, what: &str) -> Result<(String, Part)> {
+fn decode_part(d: &mut Decoder<'_>, what: &At<'_>) -> Result<(String, Part)> {
     exact_array(d, what, 4)?;
-    let role = text(d, &format!("{what}.role"), limits::MAX_NAME_BYTES)?;
-    let dtype = Dtype::from_code(uint(d, &format!("{what}.dtype"))?)?;
-    let shape = decode_shape(d, &format!("{what}.shape"))?;
+    let role = text(d, &what.field("role"), limits::MAX_NAME_BYTES)?;
+    let dtype = Dtype::from_code(uint(d, &what.field("dtype"))?)?;
+    let shape = decode_shape(d, &what.field("shape"))?;
     let body = match d.datatype().map_err(|e| malformed(what, e))? {
         Type::Bytes => {
             let bytes = d.bytes().map_err(|e| malformed(what, e))?;
@@ -477,10 +505,10 @@ fn decode_part(d: &mut Decoder<'_>, what: &str) -> Result<(String, Part)> {
             Body::Inline(bytes.to_vec())
         }
         Type::Array => {
-            let n = list_len(d, &format!("{what}.segments"), limits::MAX_SEGMENTS, true)?;
+            let n = list_len(d, &what.field("segments"), limits::MAX_SEGMENTS, true)?;
             let mut segments = Vec::with_capacity(n);
             for i in 0..n {
-                segments.push(decode_ref(d, &format!("{what}.segments[{i}]"))?);
+                segments.push(decode_ref(d, &what.index("segments", i))?);
             }
             Body::Segments(segments)
         }
@@ -521,15 +549,15 @@ fn encode_tensor(
 
 fn decode_tensor(
     d: &mut Decoder<'_>,
-    what: &str,
-    encodings: &[EncodingSpec],
+    what: &At<'_>,
+    encodings: &[String],
 ) -> Result<(String, Tensor)> {
     exact_array(d, what, 5)?;
-    let key = text(d, &format!("{what}.key"), limits::MAX_KEY_BYTES)?;
-    let dtype = Dtype::from_code(uint(d, &format!("{what}.dtype"))?)?;
-    let shape = decode_shape(d, &format!("{what}.shape"))?;
+    let key = text(d, &what.field("key"), limits::MAX_KEY_BYTES)?;
+    let dtype = Dtype::from_code(uint(d, &what.field("dtype"))?)?;
+    let shape = decode_shape(d, &what.field("shape"))?;
     let encoding_index =
-        usize::try_from(uint(d, &format!("{what}.encoding"))?).map_err(|_| Refusal {
+        usize::try_from(uint(d, &what.field("encoding"))?).map_err(|_| Refusal {
             code: Code::NUMBER_RANGE,
             detail: format!("{what}: encoding index is outside this platform's usize range"),
         })?;
@@ -542,11 +570,11 @@ fn decode_tensor(
                 encodings.len()
             ),
         })?
-        .object_id();
-    let n = list_len(d, &format!("{what}.parts"), limits::MAX_PARTS, true)?;
+        .clone();
+    let n = list_len(d, &what.field("parts"), limits::MAX_PARTS, true)?;
     let mut parts = Vec::with_capacity(n);
     for i in 0..n {
-        parts.push(decode_part(d, &format!("{what}.parts[{i}]"))?);
+        parts.push(decode_part(d, &what.index("parts", i))?);
     }
     Ok((
         key,
@@ -618,6 +646,8 @@ pub fn encode_header_unvalidated(header: &Header) -> Result<Vec<u8>> {
     Ok(e.into_writer().bytes)
 }
 
+static HEADER: At<'static> = At::Root("header");
+
 fn decode(bytes: &[u8]) -> Result<Header> {
     if bytes.len() > Header::MAX_BYTES {
         return refuse(
@@ -630,8 +660,8 @@ fn decode(bytes: &[u8]) -> Result<Header> {
         );
     }
     let mut d = Decoder::new(bytes);
-    exact_array(&mut d, "header", 5)?;
-    let format = text(&mut d, "header.format", 64)?;
+    exact_array(&mut d, &HEADER, 5)?;
+    let format = text(&mut d, &HEADER.field("format"), 64)?;
     if format != Header::FORMAT {
         return refuse(
             Code::UNKNOWN_FORMAT,
@@ -639,15 +669,15 @@ fn decode(bytes: &[u8]) -> Result<Header> {
         );
     }
 
-    let config_count = list_len(&mut d, "header.configs", limits::MAX_COMPONENTS, false)?;
+    let config_count = list_len(&mut d, &HEADER.field("configs"), limits::MAX_COMPONENTS, false)?;
     let mut configs = Vec::with_capacity(config_count);
     for i in 0..config_count {
-        let what = format!("header.configs[{i}]");
+        let what = HEADER.index("configs", i);
         exact_array(&mut d, &what, 2)?;
-        let name = text(&mut d, &format!("{what}.name"), limits::MAX_NAME_BYTES)?;
+        let name = text(&mut d, &what.field("name"), limits::MAX_NAME_BYTES)?;
         let config = d
             .bytes()
-            .map_err(|error| malformed(&format!("{what}.canonical_json"), error))?;
+            .map_err(|error| malformed(&what.field("canonical_json"), error))?;
         if config.len() > limits::DOC_MAX_BYTES {
             return refuse(
                 Code::SIZE_CAP,
@@ -657,24 +687,24 @@ fn decode(bytes: &[u8]) -> Result<Header> {
         configs.push((name, config.to_vec()));
     }
 
-    let asset_count = list_len(&mut d, "header.assets", limits::MAX_ENTRIES, false)?;
+    let asset_count = list_len(&mut d, &HEADER.field("assets"), limits::MAX_ENTRIES, false)?;
     let mut assets = Vec::with_capacity(asset_count);
     for i in 0..asset_count {
-        let what = format!("header.assets[{i}]");
+        let what = HEADER.index("assets", i);
         exact_array(&mut d, &what, 5)?;
-        let name = text(&mut d, &format!("{what}.name"), limits::MAX_KEY_BYTES)?;
-        let logical_sha256 = digest_hex(&mut d, &format!("{what}.logical_digest"))?;
-        let logical_length = uint(&mut d, &format!("{what}.logical_length"))?;
-        let media_type = text(&mut d, &format!("{what}.media_type"), 128)?;
+        let name = text(&mut d, &what.field("name"), limits::MAX_KEY_BYTES)?;
+        let logical_sha256 = digest_hex(&mut d, &what.field("logical_digest"))?;
+        let logical_length = uint(&mut d, &what.field("logical_length"))?;
+        let media_type = text(&mut d, &what.field("media_type"), 128)?;
         let count = list_len(
             &mut d,
-            &format!("{what}.segments"),
+            &what.field("segments"),
             limits::MAX_SEGMENTS,
             true,
         )?;
         let mut segments = Vec::with_capacity(count);
         for j in 0..count {
-            segments.push(decode_ref(&mut d, &format!("{what}.segments[{j}]"))?);
+            segments.push(decode_ref(&mut d, &what.index("segments", j))?);
         }
         assets.push((
             name,
@@ -687,23 +717,24 @@ fn decode(bytes: &[u8]) -> Result<Header> {
         ));
     }
 
-    let encoding_count = list_len(&mut d, "header.encodings", limits::MAX_TOTAL_REFS, true)?;
+    let encoding_count = list_len(&mut d, &HEADER.field("encodings"), limits::MAX_TOTAL_REFS, true)?;
     let mut encodings = Vec::with_capacity(encoding_count);
     for i in 0..encoding_count {
-        let what = format!("header.encodings[{i}]");
+        let what = HEADER.index("encodings", i);
         encodings.push(decode_encoding_from(&mut d, &what)?);
     }
 
-    let component_count = list_len(&mut d, "header.components", limits::MAX_COMPONENTS, false)?;
+    let encoding_ids: Vec<String> = encodings.iter().map(EncodingSpec::object_id).collect();
+    let component_count = list_len(&mut d, &HEADER.field("components"), limits::MAX_COMPONENTS, false)?;
     let mut components = Vec::with_capacity(component_count);
     let mut tensor_count = 0usize;
     for i in 0..component_count {
-        let what = format!("header.components[{i}]");
+        let what = HEADER.index("components", i);
         exact_array(&mut d, &what, 2)?;
-        let name = text(&mut d, &format!("{what}.name"), limits::MAX_NAME_BYTES)?;
+        let name = text(&mut d, &what.field("name"), limits::MAX_NAME_BYTES)?;
         let count = list_len(
             &mut d,
-            &format!("{what}.tensors"),
+            &what.field("tensors"),
             limits::MAX_TENSORS,
             true,
         )?;
@@ -717,8 +748,8 @@ fn decode(bytes: &[u8]) -> Result<Header> {
         for j in 0..count {
             tensors.push(decode_tensor(
                 &mut d,
-                &format!("{what}.tensors[{j}]"),
-                &encodings,
+                &what.index("tensors", j),
+                &encoding_ids,
             )?);
         }
         components.push((name, tensors));
@@ -737,14 +768,21 @@ fn decode(bytes: &[u8]) -> Result<Header> {
     })
 }
 
+/// Bytes from outside (a publication, a conformance case): judged once, canonical included.
 pub fn decode_header(bytes: &[u8]) -> Result<Header> {
     let header = decode(bytes)?;
-    if encode_header(&header)? != bytes {
+    header.validate_structure()?;
+    if encode_header_unvalidated(&header)? != bytes {
         return refuse(
             Code::NONCANONICAL_ENCODING,
             "stored header bytes are not the restricted deterministic CBOR encoding of their content",
         );
     }
-    header.validate_structure()?;
     Ok(header)
+}
+
+/// Admitted bytes, named by their digest, were judged where they were encoded or
+/// published: reading them only decodes them.
+pub fn decode_stored_header(bytes: &[u8]) -> Result<Header> {
+    decode(bytes)
 }

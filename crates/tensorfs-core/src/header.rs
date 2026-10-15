@@ -685,6 +685,11 @@ impl Header {
     pub fn parse(bytes: &[u8]) -> Result<Self> {
         <Self as crate::ids::StoredDoc>::parse(bytes)
     }
+    /// A header already admitted under its digest: decoded, not judged again. `parse` judges
+    /// bytes from outside; `validate` is for callers that need the spec checks.
+    pub fn from_stored(bytes: &[u8]) -> Result<Self> {
+        crate::cbor::decode_stored_header(bytes)
+    }
     pub fn canonical_bytes(&self) -> Result<Vec<u8>> {
         <Self as crate::ids::StoredDoc>::canonical_bytes(self)
     }

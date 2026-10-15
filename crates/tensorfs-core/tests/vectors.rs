@@ -1534,3 +1534,27 @@ fn the_committed_corpus_is_what_the_builder_writes() {
 fn regenerate() {
     generate(&default_dir());
 }
+
+/// Canonicality is judged where bytes come from outside (`Header::parse`); bytes the Store
+/// admitted under their digest are decoded, not encoded again to be compared.
+#[test]
+fn stored_headers_are_decoded_not_judged_again() {
+    let (ha, _) = header_a(None);
+    let canonical = ok!(ha.canonical_bytes());
+    let loose = binary_sub(&canonical, &[0x85], &[0x98, 0x05]);
+    assert_eq!(
+        Header::parse(&loose).unwrap_err().code,
+        tensorfs_core::err::Code::NONCANONICAL_ENCODING
+    );
+
+    let root = std::env::temp_dir().join(format!("tensorfs-stored-header-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    let store = ok!(tensorfs_core::store::Store::init(&root));
+    let fault = tensorfs_core::store::Fault::default();
+    for bytes in [&canonical, &loose] {
+        let reference = ObjectRef::of(bytes);
+        ok!(store.put_stream(&mut bytes.as_slice(), Some(&reference), &fault));
+        assert_eq!(ok!(tensorfs_core::checkpoint::load_header(&store, &reference)), ha);
+    }
+    ok!(fs::remove_dir_all(&root));
+}
