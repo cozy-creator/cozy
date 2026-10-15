@@ -460,6 +460,9 @@ func (m *machineRuns) place(ctx context.Context, request records.Request, link *
 				}
 				return request, exit.New(exit.Canceled, "submission stopped before machine selection")
 			}
+			if m.fleet != nil {
+				m.fleet.placed(request.ID)
+			}
 		}
 		if problem := m.store.LinkMachineExecution(request.ID, machine); problem != nil {
 			return request, problem

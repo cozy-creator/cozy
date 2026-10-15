@@ -46,6 +46,8 @@ type ladderHub struct {
 	soldOut    map[string]bool
 	rentals    map[string]map[string]any
 	throughput []hub.ModelThroughput
+	// throughputReads and skuReads count the placement reads of each kind.
+	throughputReads, skuReads int
 	// provisions makes a bought pod come up READY with the triple the ask pinned, so the
 	// buy completes and the placement is recorded; otherwise the fixture pod fails.
 	provisions bool
@@ -243,6 +245,7 @@ func newOrgLadderHub(t *testing.T, org string, authored ...[]launch.ModelDefault
 	mux.HandleFunc("GET /v1/models/"+org+"/minimax/throughput", func(w http.ResponseWriter, _ *http.Request) {
 		h.mu.Lock()
 		defer h.mu.Unlock()
+		h.throughputReads++
 		if h.throughput == nil {
 			http.NotFound(w, nil)
 			return
@@ -252,6 +255,7 @@ func newOrgLadderHub(t *testing.T, org string, authored ...[]launch.ModelDefault
 	mux.HandleFunc("GET /v1/rental-skus", func(w http.ResponseWriter, _ *http.Request) {
 		h.mu.Lock()
 		defer h.mu.Unlock()
+		h.skuReads++
 		_ = json.NewEncoder(w).Encode(hub.RentalProducts(h.market))
 	})
 	mux.HandleFunc("GET /v1/rentals", func(w http.ResponseWriter, _ *http.Request) {

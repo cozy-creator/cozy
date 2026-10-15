@@ -65,6 +65,64 @@ type managedRentals struct {
 	buying map[string]records.Rental
 	// settling is each rental whose release is in flight; reconcile leaves it to that release.
 	settling map[string]bool
+	// prepared is each waiting request's placement inputs, read once (placementInputs).
+	preparedMu sync.Mutex
+	prepared   map[string]placementInputs
+}
+
+// placementInputs are what a request's placement reads of its release and models. They do not
+// change while it waits for a machine, so a placement asked again every few seconds while a
+// rental boots reads the release, its children's ladders and the model's throughput once.
+type placementInputs struct {
+	metadata    records.Request
+	childModels []records.ModelRef
+	constraints rental.Constraints
+	throughput  []hub.ModelThroughput
+}
+
+func (m *managedRentals) placementInputs(scoped *Context, origin string, req records.Request, resolver *Resolver) (placementInputs, *exit.Error) {
+	m.preparedMu.Lock()
+	held, ok := m.prepared[req.ID]
+	m.preparedMu.Unlock()
+	if ok {
+		return held, nil
+	}
+	var in placementInputs
+	var problem *exit.Error
+	if in.metadata, problem = rentalMetadata(scoped, req); problem != nil {
+		return in, problem
+	}
+	if req.InstallID == "" {
+		in.childModels, problem = resolver.PublishedChildModels(scoped, in.metadata)
+	} else {
+		in.childModels, problem = resolver.UnpublishedChildModels(req)
+	}
+	if problem != nil {
+		return in, problem
+	}
+	// ONE READING OF THE RELEASE for both halves of the decision: a machine already up and
+	// a machine that would be bought are held to the same declared degrees (cl-179).
+	if in.constraints, problem = RentalConstraints(scoped, in.metadata); problem != nil {
+		return in, problem
+	}
+	req.Models = records.OneSelectionPerSlot(req.Models, in.childModels)
+	if in.throughput, problem = m.throughput(origin, req); problem != nil {
+		return in, problem
+	}
+	m.preparedMu.Lock()
+	defer m.preparedMu.Unlock()
+	if m.prepared == nil {
+		m.prepared = map[string]placementInputs{}
+	}
+	m.prepared[req.ID] = in
+	return in, nil
+}
+
+// placed forgets a request's placement inputs once it has its machine.
+func (m *managedRentals) placed(id string) {
+	m.preparedMu.Lock()
+	defer m.preparedMu.Unlock()
+	delete(m.prepared, id)
 }
 
 // rentalCensus is one hub's answer to "what does this account own there".
@@ -339,21 +397,12 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.PlacementDec
 	// choice (cl-210). A request sized by its own model slots retains only those;
 	// unrelated captures must not inflate its residency or preparation selection. Its
 	// own selection is made once and supersedes any callee default for the same slot.
-	metadata, problem := rentalMetadata(scoped, req)
+	inputs, problem := m.placementInputs(scoped, origin, req, resolver)
 	if problem != nil {
 		return none, "", problem
 	}
-	var childModels []records.ModelRef
-	if req.InstallID == "" {
-		childModels, problem = resolver.PublishedChildModels(scoped, metadata)
-	} else {
-		childModels, problem = resolver.UnpublishedChildModels(req)
-	}
-	if problem != nil {
-		return none, "", problem
-	}
-	req.Models = records.OneSelectionPerSlot(req.Models, childModels)
-	needsAccelerator = needsAccelerator || req.GPUs > 0 || req.SizedByOwnModels() || len(childModels) > 0
+	req.Models = records.OneSelectionPerSlot(req.Models, inputs.childModels)
+	needsAccelerator = needsAccelerator || req.GPUs > 0 || req.SizedByOwnModels() || len(inputs.childModels) > 0
 	link, problem := m.store.MachineExecution(req.ID)
 	if problem != nil {
 		return none, "", problem
@@ -372,17 +421,8 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.PlacementDec
 	}
 	decision := orchestrator.PlacementDecision{Tier: m.ctx.Cfg.PlacementPrefer,
 		ConfigDigest: m.ctx.Cfg.Digest, Ladder: rental.Ladder(req.Models), Override: rental.Override(req.Models)}
-	// ONE READING OF THE RELEASE for both halves of the decision: a machine already up and
-	// a machine that would be bought are held to the same declared degrees (cl-179).
-	constraints, constraintProblem := RentalConstraints(scoped, metadata)
-	if constraintProblem != nil {
-		return none, "", constraintProblem
-	}
+	constraints, throughput := inputs.constraints, inputs.throughput
 	if constraints.Working, problem = m.store.WorkingPeaks(req); problem != nil {
-		return none, "", problem
-	}
-	throughput, problem := m.throughput(origin, req)
-	if problem != nil {
 		return none, "", problem
 	}
 	var purchases []orchestrator.PlacementCandidate
