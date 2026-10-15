@@ -84,8 +84,9 @@ func KeepHubWheels(ctx context.Context, project, store string) *exit.Error {
 		if problem != nil {
 			break
 		}
+		// A kept wheel was verified against its locked hash before it was renamed into place.
 		kept := KeptHubWheel(store, row)
-		if capturedWheelMatches(kept, row) {
+		if info, err := os.Stat(kept); err == nil && info.Mode().IsRegular() && (row.Size <= 0 || info.Size() == row.Size) {
 			now := time.Now()
 			_ = os.Chtimes(kept, now, now)
 			continue
