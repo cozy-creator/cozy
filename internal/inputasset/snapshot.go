@@ -1,6 +1,7 @@
 package inputasset
 
 import (
+	"cmp"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -65,7 +66,7 @@ func CaptureTree(destination, field, directory string, maximum int64) (records.A
 		if err != nil {
 			return records.AssetBinding{}, exit.Internalf("cannot open input tree member: %s", err)
 		}
-		member, problem := captureFile(destination, input, name, min(maximum, MaxRootInputBytes)-total)
+		member, problem := captureFile(destination, input, name, min(maximum, MaxRootInputBytes)-total, "")
 		input.Close()
 		if problem != nil {
 			return records.AssetBinding{}, problem
@@ -114,7 +115,14 @@ func CaptureFile(destination string, binding records.AssetBinding) (records.Asse
 		return binding, exit.Internalf("cannot capture input file: %s", err)
 	}
 	defer input.Close()
-	member, problem := captureFile(destination, input, "payload", min(binding.MaxBytes, MaxRootInputBytes))
+	// The submitting command hashed the file a moment ago (Fingerprint): one unchanged since,
+	// as Verify judges it, is copied under that digest without hashing it again. A machine
+	// verifies every object it receives, so a wrong one fails, never runs.
+	known := ""
+	if _, same := unchanged(binding.LocalPath, binding); same {
+		known = binding.Digest
+	}
+	member, problem := captureFile(destination, input, "payload", min(binding.MaxBytes, MaxRootInputBytes), known)
 	if problem != nil {
 		return binding, problem
 	}
@@ -130,7 +138,9 @@ func CaptureFile(destination string, binding records.AssetBinding) (records.Asse
 	return binding, nil
 }
 
-func captureFile(destination string, input *os.File, name string, maximum int64) (resultfiles.TreeMember, *exit.Error) {
+// captureFile copies input into destination's members under its digest: known, else hashed as
+// it is copied.
+func captureFile(destination string, input *os.File, name string, maximum int64, known string) (resultfiles.TreeMember, *exit.Error) {
 	info, err := input.Stat()
 	if err != nil || !info.Mode().IsRegular() || info.Size() < 0 || info.Size() > maximum {
 		return resultfiles.TreeMember{}, exit.New(exit.Validation, "input exceeds its bounded file capacity")
@@ -146,7 +156,11 @@ func captureFile(destination string, input *os.File, name string, maximum int64)
 	temporary := output.Name()
 	defer func() { output.Close(); _ = os.Remove(temporary) }()
 	hash := sha256.New()
-	written, err := io.Copy(io.MultiWriter(output, hash), io.LimitReader(input, maximum+1))
+	var sink io.Writer = io.MultiWriter(output, hash)
+	if known != "" {
+		sink = output
+	}
+	written, err := io.Copy(sink, io.LimitReader(input, maximum+1))
 	current, statErr := input.Stat()
 	if err != nil || statErr != nil || written != info.Size() || current.Size() != info.Size() || !current.ModTime().Equal(info.ModTime()) {
 		return resultfiles.TreeMember{}, exit.New(exit.Conflict, "input changed while its bytes were captured")
@@ -157,7 +171,7 @@ func captureFile(destination string, input *os.File, name string, maximum int64)
 	if err := output.Close(); err != nil {
 		return resultfiles.TreeMember{}, exit.Internalf("cannot close captured input: %s", err)
 	}
-	digest := "sha256:" + hex.EncodeToString(hash.Sum(nil))
+	digest := cmp.Or(known, "sha256:"+hex.EncodeToString(hash.Sum(nil)))
 	if err := os.Rename(temporary, filepath.Join(directory, strings.TrimPrefix(digest, "sha256:"))); err != nil {
 		return resultfiles.TreeMember{}, exit.Internalf("cannot commit captured input: %s", err)
 	}
