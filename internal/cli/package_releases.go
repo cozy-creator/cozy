@@ -155,7 +155,7 @@ func handlePackagePublish(ctx *Context) *exit.Error {
 	for _, dependency := range pack.Vendored {
 		record.Notes = append(record.Notes, packagepublish.VendoredNote(account.Name, dependency))
 	}
-	record.Notes = append(record.Notes, changed(ctx, ref)...)
+	record.Notes = append(record.Notes, packageChanged(ctx, ref)...)
 	return emit(ctx, record)
 }
 
@@ -201,7 +201,7 @@ func handlePackageYank(ctx *Context) *exit.Error {
 		{K: "status", V: "yanked"}, {K: "changed", V: yanked.Changed},
 		{K: "yanked_at", V: yanked.YankedAt},
 	}, "package", "release", "status")
-	record.Notes = changed(ctx, ref)
+	record.Notes = packageChanged(ctx, ref)
 	return emit(ctx, record)
 }
 

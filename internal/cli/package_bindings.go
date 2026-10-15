@@ -178,7 +178,7 @@ func handlePackageBind(ctx *Context) *exit.Error {
 		{K: "revision", V: written.Binding.Revision}, {K: "status", V: "bound"},
 		{K: "changed", V: written.Changed},
 	}, "package", "slot", "model", "release", "ladder", "revision", "status", "changed")
-	record.Notes = changed(ctx, ref)
+	record.Notes = packageChanged(ctx, ref)
 	return emit(ctx, record)
 }
 
@@ -194,6 +194,18 @@ func changed(ctx *Context, ref hub.Ref) []string {
 		return []string{"machines keep what they resolved of " + ref.String() + ": " + problem.Message}
 	}
 	return nil
+}
+
+// packageChanged is changed for a package: its owner rows are also read now, under the new
+// revision, so the next run reads none and runs what was just bound or published.
+func packageChanged(ctx *Context, ref hub.Ref) []string {
+	notes := changed(ctx, ref)
+	hctx, cancel := hub.Context()
+	defer cancel()
+	if rows, problem := client(ctx).PackageBindingRows(hctx, ref); problem == nil {
+		client(ctx).KeepPackageBindings(ref, catalogRevision(ctx), rows)
+	}
+	return notes
 }
 
 func handlePackageUnbind(ctx *Context) *exit.Error {
@@ -226,7 +238,7 @@ func handlePackageUnbind(ctx *Context) *exit.Error {
 		{K: "package", V: ref.String()}, {K: "slot", V: slot},
 		{K: "status", V: "unbound"}, {K: "changed", V: result.Changed},
 	}, "package", "slot", "status", "changed")
-	record.Notes = changed(ctx, ref)
+	record.Notes = packageChanged(ctx, ref)
 	return emit(ctx, record)
 }
 
