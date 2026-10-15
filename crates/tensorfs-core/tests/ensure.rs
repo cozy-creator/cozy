@@ -418,3 +418,65 @@ fn a_pressure_pass_reports_the_disk_and_keeps_what_it_is_told() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+
+/// A pod's container caps its tasks (a vast RTX 5060 Ti: `pids.max` 1280) below the threads
+/// concurrent pulls start. A stream thread the cap refuses is backpressure: the pull lands on
+/// the streams that started. On 0.9.0 the refusal panicked past the pull's sampler and `tfs
+/// ensure` never returned, holding the manifest's flight (TensorD 0.5.30 prepare wedge).
+#[test]
+fn an_ensure_whose_stream_threads_the_container_refuses_lands() {
+    const TASKS: u64 = 48;
+    let cap = format!("TasksMax={TASKS}");
+    let scope = ["systemd-run", "--user", "--scope", "-q", "-p", cap.as_str()];
+    let usable = Command::new(scope[0])
+        .args(&scope[1..])
+        .arg("true")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    if !usable {
+        eprintln!("SKIPPED: no systemd user manager to create a task-limited cgroup");
+        return;
+    }
+    let dir = temporary("tasks");
+    let root = store(&dir);
+    // 251 objects: the pull asks for a stream for each.
+    let checkpoint = Arc::new(checkpoint(251, 4096, 9));
+    let hub = hub(vec![Arc::clone(&checkpoint)], None, Duration::ZERO, serve_all());
+    let inner = ensure(&root, &hub.base, &[]);
+    let out = dir.join("stdout");
+    let mut child = Command::new(scope[0])
+        .args(&scope[1..])
+        .arg(inner.get_program())
+        .args(inner.get_args())
+        .env("TFS_CREDENTIAL", "")
+        .stdout(std::fs::File::create(&out).unwrap())
+        .spawn()
+        .unwrap();
+    // Test harness bound on a wedged pull; the product has no such limit.
+    let until = std::time::Instant::now() + Duration::from_secs(90);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() > until {
+            let _ = child.kill();
+            panic!("the ensure never ended under {cap}");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let stdout = std::fs::read_to_string(&out).unwrap();
+    let run = Run { ok: status.success(), lines: stdout.lines().map(parse).collect(), stdout };
+    assert_result(&run, &checkpoint);
+    let log = std::fs::read_to_string(root.join("logs/transport.log")).unwrap();
+    let walk = log.lines().rfind(|line| line.contains(" walk ")).unwrap();
+    let streams: u64 = walk
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix("streams="))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(streams < TASKS, "the cap refused none of its streams: {walk}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

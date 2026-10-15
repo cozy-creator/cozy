@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 use std::os::unix::net::UnixStream;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::derived::channel::{array, num, obj, reference, text, uint, Channel, Frame};
 use crate::err::{refuse, Code, Refusal, Result};
@@ -53,12 +53,15 @@ pub fn serve(fetcher: &Fetcher, grant: Grant, stream: UnixStream) -> Result<()> 
                 ])?
             }
         };
-        sender.lock().unwrap().send(&frame)
+        sender.lock().unwrap_or_else(PoisonError::into_inner).send(&frame)
     };
     let mut scheduled: Vec<Ticket> = vec![];
     let readers: Mutex<HashMap<String, Arc<Ticket>>> = Mutex::default();
     let served = std::thread::scope(|scope| {
-        let served = loop {
+        // The channel's waits end with it, by return or by unwind alike: the scope never
+        // waits on a wait whose objects may never come.
+        let _stop = Stop(&grant.stop);
+        loop {
             let request = match receiver.receive() {
                 Ok(Some(Frame::Json(request))) => request,
                 Ok(None) => break Ok(()),
@@ -102,7 +105,7 @@ pub fn serve(fetcher: &Fetcher, grant: Grant, stream: UnixStream) -> Result<()> 
                             let ticket = Arc::clone(
                                 readers
                                     .lock()
-                                    .unwrap()
+                                    .unwrap_or_else(PoisonError::into_inner)
                                     .entry(parsed.origin.manifest.sha256.clone())
                                     .or_insert_with(|| {
                                         Arc::new(fetcher.want(
@@ -115,8 +118,12 @@ pub fn serve(fetcher: &Fetcher, grant: Grant, stream: UnixStream) -> Result<()> 
                             );
                             let (reply, stop) = (&reply, &grant.stop);
                             let objects = parsed.objects;
-                            scope.spawn(move || reply(id, ticket.wait(&objects, stop).map(|()| Json::Null)));
-                            Ok(None)
+                            let wait = move || reply(id, ticket.wait(&objects, stop).map(|()| Json::Null));
+                            // A thread the container refuses: this wait is answered here, first.
+                            match std::thread::Builder::new().spawn_scoped(scope, wait.clone()) {
+                                Ok(_) => Ok(None),
+                                Err(_) => wait().map(|()| None),
+                            }
                         }
                     });
             let sent = match answered {
@@ -127,12 +134,19 @@ pub fn serve(fetcher: &Fetcher, grant: Grant, stream: UnixStream) -> Result<()> 
             if let Err(refusal) = sent {
                 break Err(refusal);
             }
-        };
-        grant.stop.cancel();
-        served
+        }
     });
     drop(scheduled);
     served
+}
+
+/// Cancels a channel's waits as it ends.
+struct Stop<'a>(&'a PullCancellation);
+
+impl Drop for Stop<'_> {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
 }
 
 /// One request, checked against the grant.

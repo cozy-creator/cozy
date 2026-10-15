@@ -405,6 +405,118 @@ fn the_executor_channel_schedules_waits_and_answers_presence() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Six cold checkpoints of 200 objects each, for many tickets in one process.
+fn many(hub_base: &str) -> Vec<(Arc<Checkpoint>, Origin)> {
+    (0..6)
+        .map(|at| {
+            let checkpoint = Arc::new(components(&format!("acme/many{at}"), &[200], 4096, 40 + at, &[]));
+            let origin = Origin {
+                hub: hub_base.to_string(),
+                refspec: checkpoint.refspec(),
+                lane: checkpoint.lane.clone(),
+                manifest: checkpoint.manifest.clone(),
+            };
+            (checkpoint, origin)
+        })
+        .collect()
+}
+
+/// A pod's container caps its tasks (a vast RTX 5060 Ti: `pids.max` 1280) below the streams
+/// one process's Fetcher starts for many tickets at once. A thread the cap refuses is
+/// backpressure: every wait answers, and every checkpoint lands. On f869b3f the refused
+/// spawn panicked the driver, which never started again, and every wait polled forever.
+#[test]
+fn many_tickets_in_a_task_capped_process_all_land() {
+    let scope = ["systemd-run", "--user", "--scope", "-q", "-p", "TasksMax=48"];
+    let usable = std::process::Command::new(scope[0]).args(&scope[1..]).arg("true").output();
+    if !usable.is_ok_and(|output| output.status.success()) {
+        eprintln!("SKIPPED: no systemd user manager to create a task-limited cgroup");
+        return;
+    }
+    let dir = temporary("fetch-tasks");
+    store(&dir);
+    // The hub runs here, outside the cap: only the fetching process is limited.
+    let checkpoints = many("");
+    let hub = hub(checkpoints.iter().map(|(c, _)| Arc::clone(c)).collect(), None, Duration::ZERO, serve_all());
+    let mut child = std::process::Command::new(scope[0])
+        .args(&scope[1..])
+        .arg(std::env::current_exe().unwrap())
+        .args(["--exact", "task_capped_child", "--nocapture"])
+        .env("TFS_FETCH_CHILD", &dir)
+        .env("TFS_FETCH_HUB", &hub.base)
+        .spawn()
+        .unwrap();
+    // Test harness bound on a wedged fetcher; the product has no such limit.
+    let began = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if began.elapsed() > Duration::from_secs(90) {
+            let _ = child.kill();
+            panic!("the waits never answered under TasksMax=48");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert!(status.success());
+    let store = Store::open(&dir.join("store")).unwrap();
+    for (checkpoint, _) in &checkpoints {
+        assert!(checkpoint.bodies.keys().all(|hex| store.contains(hex) || store.manifest_path(hex).is_file()));
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn task_capped_child() {
+    let (Some(dir), Some(base)) = (std::env::var_os("TFS_FETCH_CHILD"), std::env::var_os("TFS_FETCH_HUB")) else {
+        return;
+    };
+    let store = Store::open(&std::path::Path::new(&dir).join("store")).unwrap();
+    let fetcher = Fetcher::of(&store).unwrap();
+    let checkpoints = many(base.to_str().unwrap());
+    let tickets: Vec<_> = (checkpoints.iter())
+        .map(|(checkpoint, origin)| fetcher.want(origin, access(), &checkpoint.blobs, Priority::Now))
+        .collect();
+    std::thread::scope(|scope| {
+        let waits: Vec<_> = tickets.iter().map(|ticket| scope.spawn(|| ticket.wait(&[], &never()))).collect();
+        waits.into_iter().for_each(|wait| wait.join().unwrap().unwrap());
+    });
+}
+
+/// A credential that panics on every object GET: a fault inside a download's own stream.
+struct Panicking;
+
+impl tensorfs_core::transport::CredentialProvider for Panicking {
+    fn headers(&self, ask: &tensorfs_core::transport::Ask) -> Vec<(String, String)> {
+        assert!(!ask.url.target.starts_with("/obj/"), "a credential that panics on objects");
+        vec![]
+    }
+}
+
+/// A download that panics ends the waits on what it left unlanded with a refusal, and the
+/// downloader goes on: a later wait lands the checkpoint the panic took down with it. On
+/// f869b3f the panicking stream left its run waiting on it forever.
+#[test]
+fn a_panicking_download_ends_its_waits_and_the_fetcher_goes_on() {
+    let dir = temporary("fetch-panic");
+    let store = Store::open(&store(&dir)).unwrap();
+    let (bad, good) = (
+        Arc::new(components("acme/bad", &[8], 16 << 10, 60, &[])),
+        Arc::new(components("acme/good", &[8], 16 << 10, 61, &[])),
+    );
+    let hub = hub(vec![Arc::clone(&bad), Arc::clone(&good)], None, Duration::ZERO, serve_all());
+    let fetcher = Fetcher::new(&store, 8, SAMPLE).unwrap();
+    let panicking: Arc<dyn Access> = Arc::new(Plain { credential: Panicking, policy: SourcePolicy::default() });
+    let refused = fetcher.want(&origin(&hub, &bad), panicking, &bad.blobs, Priority::Now).wait(&[], &never());
+    assert!(refused.is_err(), "a panicking download's wait answered Ok");
+    let landed = fetcher.want(&origin(&hub, &good), access(), &good.blobs, Priority::Now);
+    if landed.wait(&[], &never()).is_err() {
+        landed.wait(&[], &never()).unwrap();
+    }
+    assert!(good.bodies.keys().all(|hex| store.contains(hex) || store.manifest_path(hex).is_file()));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The executor's side of the framing: a kind byte, a big-endian length, JSON.
 struct Peer(UnixStream);
 

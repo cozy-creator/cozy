@@ -276,9 +276,19 @@ fn ticking_mut<T>(every: Duration, mut tick: impl FnMut() + Send, work: impl FnO
                 tick();
             }
         });
-        let out = work();
-        *stop.0.lock().unwrap() = true;
-        stop.1.notify_all();
-        out
+        let _stop = Stop(&stop);
+        work()
     })
+}
+
+/// Stops a ticker as its work ends, by return or by unwind alike: a panic in the work (a
+/// thread the container refused) would otherwise leave its scope waiting forever on a ticker
+/// that never stops (TensorD 0.5.30 prepare wedge, 2026-10-15).
+struct Stop<'a>(&'a (Mutex<bool>, Condvar));
+
+impl Drop for Stop<'_> {
+    fn drop(&mut self) {
+        *self.0 .0.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        self.0 .1.notify_all();
+    }
 }

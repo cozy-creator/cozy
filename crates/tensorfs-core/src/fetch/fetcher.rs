@@ -20,7 +20,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
-use std::sync::{Arc, Condvar, Mutex, RwLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, PoisonError, RwLock, Weak};
 use std::time::Duration;
 
 use crate::err::{refuse, Code, Refusal, Result};
@@ -178,6 +178,29 @@ impl State {
             entry.refusal = Some(refusal);
         }
         self.requeue(sha256);
+    }
+
+    /// Every queued entry `origin` alone supplies ends refused.
+    fn refuse_origin(&mut self, origin: &Origin, refusal: &Refusal) {
+        let only: Vec<String> = (self.queue.iter())
+            .filter(|(_, _, sha256)| self.entries[sha256].origins == [origin.clone()])
+            .map(|(_, _, sha256)| sha256.clone())
+            .collect();
+        for sha256 in only {
+            self.refuse(&sha256, refusal.clone());
+        }
+    }
+
+    /// Every entry not landed ends refused: no ticket waits on a downloader that cannot run.
+    fn refuse_unlanded(&mut self, refusal: &Refusal) {
+        let unlanded: Vec<String> = (self.entries.iter())
+            .filter(|(_, entry)| entry.phase != Phase::Refused)
+            .map(|(sha256, _)| sha256.clone())
+            .collect();
+        for sha256 in unlanded {
+            self.unreserve(&sha256);
+            self.refuse(&sha256, refusal.clone());
+        }
     }
 
     /// What `sha256` set aside on the disk is free again.
@@ -609,24 +632,36 @@ impl Shared {
                         .spawn(move || me.drive());
                     match spawned {
                         Ok(driver) => *self.driver.lock().unwrap() = Some(driver),
-                        Err(_) => state.driving = false,
+                        Err(error) => {
+                            state.driving = false;
+                            let detail = format!("no downloader could start: {error}");
+                            state.refuse_unlanded(&Refusal { code: Code::TRANSFER_FAILED, detail });
+                        }
                     }
                 }
             }
         }
         if let (Some(origin), Some(me)) = (resolve, self.me.upgrade()) {
             let resolving = origin.clone();
-            let spawned = std::thread::Builder::new()
-                .name("tensorfs-closure".into())
-                .spawn(move || me.resolve(&resolving));
-            if spawned.is_err() {
-                self.state
-                    .lock()
-                    .unwrap()
-                    .origins
-                    .get_mut(&origin)
-                    .unwrap()
-                    .resolving = false;
+            let spawned = std::thread::Builder::new().name("tensorfs-closure".into()).spawn(move || {
+                // A resolution that panics ends what waits on it, as one that fails does.
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Arc::clone(&me).resolve(&resolving))).is_err() {
+                    let mut state = me.state.lock().unwrap_or_else(PoisonError::into_inner);
+                    if let Some(source) = state.origins.get_mut(&resolving) {
+                        source.resolving = false;
+                    }
+                    let detail = "the closure resolution panicked".to_string();
+                    state.refuse_origin(&resolving, &Refusal { code: Code::IO_FAILED, detail });
+                    drop(state);
+                    me.changed.notify_all();
+                    me.pulse.beat();
+                }
+            });
+            if let Err(error) = spawned {
+                let mut state = self.state.lock().unwrap();
+                state.origins.get_mut(&origin).unwrap().resolving = false;
+                let detail = format!("no closure resolution could start: {error}");
+                state.refuse_origin(&origin, &Refusal { code: Code::TRANSFER_FAILED, detail });
             }
         }
         self.changed.notify_all();
@@ -725,13 +760,7 @@ impl Shared {
                     supply
                 }
                 Err(refusal) => {
-                    let only: Vec<String> = (state.queue.iter())
-                        .filter(|(_, _, sha256)| state.entries[sha256].origins == [origin.clone()])
-                        .map(|(_, _, sha256)| sha256.clone())
-                        .collect();
-                    for sha256 in only {
-                        state.refuse(&sha256, refusal.clone());
-                    }
+                    state.refuse_origin(origin, &refusal);
                     None
                 }
             }
@@ -889,13 +918,22 @@ impl Shared {
                     state = self.changed.wait_timeout(state, POLL).unwrap().0;
                 }
             }
-            if let Err(refusal) = self.run() {
-                if self.stop.is_cancelled() {
-                    self.state.lock().unwrap().driving = false;
-                    return;
-                }
-                eprintln!("tensorfs fetch: {refusal}");
+            // A run that fails or panics (a thread the container refused) ends what it left
+            // unlanded with its reason: its tickets answer, and the driver never spins on it.
+            let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.run()));
+            if self.stop.is_cancelled() {
+                self.state.lock().unwrap_or_else(PoisonError::into_inner).driving = false;
+                return;
             }
+            let refusal = match ran {
+                Ok(Ok(())) => continue,
+                Ok(Err(refusal)) => refusal,
+                Err(_) => Refusal { code: Code::IO_FAILED, detail: "the downloader panicked".into() },
+            };
+            eprintln!("tensorfs fetch: {refusal}");
+            self.state.lock().unwrap_or_else(PoisonError::into_inner).refuse_unlanded(&refusal);
+            self.changed.notify_all();
+            self.pulse.beat();
         }
     }
 
