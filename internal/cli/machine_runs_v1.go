@@ -546,12 +546,8 @@ func (m *machineRuns) specV1(ctx context.Context, request records.Request, machi
 			if asset.Snapshot != nil && asset.Snapshot.Path != "" {
 				path = filepath.Join(asset.Snapshot.Path+".files", strings.TrimPrefix(asset.Digest, "sha256:"))
 			}
-			object, err := machine.WriteFile(ctx, path)
-			if err != nil {
-				return nil, machines.Transport(err)
-			}
-			if object.Digest != asset.Digest || int64(object.Length) != asset.Length {
-				return nil, exit.Named(exit.Conflict, "input_changed", "%s changed since the run was submitted", path)
+			if problem := writeHeldV1(ctx, machine, path, asset.Digest, asset.Length); problem != nil {
+				return nil, problem
 			}
 		}
 		spec.Inputs = append(spec.Inputs, &v1.InputFile{Field: asset.FieldPath, Digest: asset.Digest,
@@ -743,15 +739,25 @@ func writeTreeV1(ctx context.Context, machine *machines.V1, snapshot *records.By
 		return problem
 	}
 	for _, member := range members {
-		object, err := machine.WriteFile(ctx, filepath.Join(snapshot.Path+".files", strings.TrimPrefix(member.Digest, "sha256:")))
-		if err != nil {
-			return machines.Transport(err)
-		}
-		if object.Digest != member.Digest {
-			return exit.Named(exit.Conflict, "input_changed", "tree member %s changed since the run was submitted", member.Path)
+		path := filepath.Join(snapshot.Path+".files", strings.TrimPrefix(member.Digest, "sha256:"))
+		if problem := writeHeldV1(ctx, machine, path, member.Digest, member.Length); problem != nil {
+			return problem
 		}
 	}
 	if _, err := machine.WriteBytes(ctx, snapshot.Body); err != nil {
+		return machines.Transport(err)
+	}
+	return nil
+}
+
+// writeHeldV1 writes a file under its captured digest: the machine verifies what it receives.
+func writeHeldV1(ctx context.Context, machine *machines.V1, path, digest string, length int64) *exit.Error {
+	file, err := os.Open(path)
+	if err != nil {
+		return machines.Transport(err)
+	}
+	defer file.Close()
+	if err := machine.Write(ctx, digest, uint64(length), file); err != nil {
 		return machines.Transport(err)
 	}
 	return nil
