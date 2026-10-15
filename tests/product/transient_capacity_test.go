@@ -253,3 +253,31 @@ func containsAll(haystack string, needles ...string) bool {
 	}
 	return true
 }
+
+// A request waiting on a machine still coming up is placed again every few seconds. What it
+// reads of its release and model (the release, its children's ladders, the model's
+// throughput) does not change while it waits, so it is read once; the market is read again.
+func TestAWaitingPlacementReadsItsModelOnce(t *testing.T) {
+	h := fleetHub(t)
+	h.sell()
+	h.mu.Lock()
+	h.throughput = []hub.ModelThroughput{}
+	h.mu.Unlock()
+	root := fleetRoot(t, h, 20)
+	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
+	fatal(t, problem)
+	defer store.Close()
+	plantRental(t, root, h, store, "pr-karam", "karam", "acquiring", false)
+	startCalciferProcess(t, root)
+	submitExplicit(t, root, "waiting-reads")
+	waitFor(t, root, "three placements of the waiting request", func() bool {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		return h.skuReads >= 3
+	})
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.throughputReads != 1 {
+		t.Fatalf("%d placements read the model's throughput %d times; once is enough", h.skuReads, h.throughputReads)
+	}
+}
