@@ -31,7 +31,12 @@ func handlePackageBindings(ctx *Context) *exit.Error {
 	hctx, cancel := hub.Context()
 	defer cancel()
 	c := client(ctx)
-	rows, problem := c.PackageBindings(hctx, ref)
+	raw, problem := c.PackageBindingRows(hctx, ref)
+	if problem != nil {
+		return packageHubProblem(ctx, ref.String(), problem)
+	}
+	c.KeepPackageBindings(ref, catalogRevision(ctx), raw) // what a run reads of them
+	rows, problem := hub.UsableBindings(ref, raw)
 	if problem != nil {
 		return packageHubProblem(ctx, ref.String(), problem)
 	}
