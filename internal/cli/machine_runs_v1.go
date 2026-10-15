@@ -1112,7 +1112,7 @@ func writeOutputV1(ctx context.Context, machine *machines.V1, run, directory str
 	if problem := resultfiles.Preflight(directory); problem != nil {
 		return problem
 	}
-	if digestOf(product.Path) == product.Digest {
+	if holds(product.Path, product.Digest, product.Length) {
 		return nil
 	}
 	held := func(n int64) { progress(n, product.Length) }
@@ -1127,7 +1127,7 @@ func writeOutputV1(ctx context.Context, machine *machines.V1, run, directory str
 		if problem != nil {
 			return unwritable(problem)
 		}
-		if digestOf(product.Path) == product.Digest { // another read of this run placed it
+		if holds(product.Path, product.Digest, product.Length) { // another read of this run placed it
 			_ = os.Remove(partial)
 			file.Close()
 			return nil
@@ -1163,7 +1163,7 @@ func writeOutputV1(ctx context.Context, machine *machines.V1, run, directory str
 			}
 			return machines.Transport(err)
 		}
-		if digestOf(partial) != product.Digest {
+		if !holds(partial, product.Digest, product.Length) {
 			_ = os.Remove(partial)
 			if offset > 0 && prefix == 0 {
 				return read(0) // the kept bytes were not whole (a process ended mid-read)
@@ -1264,7 +1264,7 @@ func readTreeV1(ctx context.Context, machine *machines.V1, run, directory string
 		if err != nil {
 			return machines.Transport(err)
 		}
-		if digestOf(target) != member.Digest {
+		if !holds(target, member.Digest, member.Length) {
 			return exit.Named(exit.Conflict, "output_revision_changed", "%s moved past revision %d while it was read", product.Output, product.Rev)
 		}
 		return nil
@@ -1341,17 +1341,19 @@ func outputIndexV1(product records.Product) uint32 {
 	return 0
 }
 
-func digestOf(path string) string {
+// holds says the file at path is exactly these bytes; one of another length is not read.
+func holds(path, digest string, length int64) bool {
 	file, err := os.Open(path)
 	if err != nil {
-		return ""
+		return false
 	}
 	defer file.Close()
-	hash := sha256.New()
-	if _, err := io.Copy(hash, file); err != nil {
-		return ""
+	if info, err := file.Stat(); err != nil || info.Size() != length {
+		return false
 	}
-	return "sha256:" + hex.EncodeToString(hash.Sum(nil))
+	hash := sha256.New()
+	_, err = io.Copy(hash, file)
+	return err == nil && "sha256:"+hex.EncodeToString(hash.Sum(nil)) == digest
 }
 
 // collectV1 settles the run with its outcome: every output file at its final revision (each
