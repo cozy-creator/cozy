@@ -85,7 +85,7 @@ func TerminalEvent(eventType string) bool { return terminalTypes[eventType] }
 
 // StateEvent is the event a run's move into `state` records: its OpenAI Responses-style
 // name for a lifecycle state (run.created, run.in_progress, run.completed, run.failed,
-// run.canceled), else request.<state> for a control step such as pausing.
+// run.canceled), else request.<state> for a control step such as canceling.
 func StateEvent(state string) string {
 	switch state {
 	case "submitted":
