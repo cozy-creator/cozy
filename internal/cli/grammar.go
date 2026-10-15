@@ -356,7 +356,7 @@ type ModelCmd struct {
 	Download ModelDownloadCmd `cmd:"" help:"Download a model into a local destination or an owned rental store."`
 	List     ModelListCmd     `cmd:"" help:"List local model releases."`
 	Upload   ModelUploadCmd   `cmd:"" help:"Ingest a model with its required metadata and upload an owner-only checkpoint."`
-	Quantize ModelQuantizeCmd `cmd:"" help:"Write a model's int8 or fp8 lane with the package that serves it, as an owner-only checkpoint."`
+	Quantize ModelQuantizeCmd `cmd:"" help:"Write a model's fp8, int8 or nvfp4 lane with the package that serves it, as an owner-only checkpoint."`
 	Publish  ModelPublishCmd  `cmd:"" help:"Update a release's mutable lane pointers."`
 	Retarget ModelRetargetCmd `cmd:"" help:"Move one existing release lane to another retained checkpoint."`
 	Yank     ModelYankCmd     `cmd:"" help:"Yank a model release."`
@@ -435,6 +435,7 @@ type ModelQuantizeCmd struct {
 	Destination    string  `arg:"" optional:"" name:"destination" help:"Tensorhub repository (org/name) for the new checkpoint; default: the model's own."`
 	FP8            bool    `name:"fp8" help:"Write the fp8 lane (row-scaled FP8 weights)."`
 	INT8           bool    `name:"int8" help:"Write the int8 lane (row-scaled INT8 weights; the fast lane on consumer cards)."`
+	NVFP4          bool    `name:"nvfp4" help:"Write the nvfp4 lane (block-scaled FP4 weights; Blackwell's FP4 tensor cores)."`
 	Package        string  `help:"Package (org/name) whose quantizer to run; default: the installed package that serves this model."`
 	Rental         *string `predictor:"rental" help:"Run on this existing rental name or id; never buy a replacement. Default: this computer."`
 	RentalOnly     bool    `help:"Require a remote rental instead of local capacity."`
@@ -448,7 +449,7 @@ func (c *ModelQuantizeCmd) Run(r *Runtime) error {
 		return problem
 	}
 	return r.call(handleModelQuantize, []string{c.Model, c.Destination}, bools(
-		"--fp8", c.FP8, "--int8", c.INT8, "--rental-only", c.RentalOnly, "--await", c.Await),
+		"--fp8", c.FP8, "--int8", c.INT8, "--nvfp4", c.NVFP4, "--rental-only", c.RentalOnly, "--await", c.Await),
 		values("--rental", rentalName, "--package", c.Package, "--idempotency-key", c.IdempotencyKey), false)
 }
 

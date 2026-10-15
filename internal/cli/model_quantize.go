@@ -11,7 +11,7 @@ import (
 )
 
 // quantizedLanes are the lanes `cozy model quantize` can ask a package for, one flag each.
-var quantizedLanes = []string{"fp8", "int8"}
+var quantizedLanes = []string{"fp8", "int8", "nvfp4"}
 
 // handleModelQuantize runs the quantizer of the package that serves a model. The package
 // owns the recipe (which components and layers); a quantizer is its function that takes the
