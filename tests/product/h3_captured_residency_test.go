@@ -101,7 +101,7 @@ func TestH3ServingRentalIgnoresCapturedSiblingResidency(t *testing.T) {
 
 	// The same captured segment remains available to the CPU long_form parent;
 	// its model defaults still participate in choosing a suitable rental.
-	request.Entrypoint, request.Kind = "long_form", "job"
+	request.Entrypoint = "long_form"
 	request.NeedsAccelerator, request.Models = false, nil
 	children, problem = resolver.UnpublishedChildModels(request)
 	fatal(t, problem)

@@ -358,7 +358,7 @@ func TestARentalAskNobodyCanFinishFails(t *testing.T) {
 // acceptedLocalRun records a run this computer's machine accepted and was running.
 func acceptedLocalRun(t *testing.T, store *records.Store, id string, request records.Request) records.Request {
 	t.Helper()
-	request.ID, request.IdemKey, request.Kind, request.Payload = id, "idem-"+id, "job", []byte(`{}`)
+	request.ID, request.IdemKey, request.Payload = id, "idem-"+id, []byte(`{}`)
 	request.Package, request.Entrypoint, request.BodyDigest, request.MachineExecutionObserver = "proof/example", "generate", childDigest("7"), true
 	row, _, problem := store.Submit(request)
 	fatal(t, problem)

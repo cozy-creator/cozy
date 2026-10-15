@@ -41,7 +41,7 @@ func TestRunShowSaysHowTheMachineMemoAnsweredARun(t *testing.T) {
 	record("run-memo-computed", "serving", "running", &v1.Outcome{ComputationDigest: computed, ExecutionMs: 40})
 	record("run-memo-unmet", "serving", "running", &v1.Outcome{Unmemoized: "seed not given", ExecutionMs: 40})
 	record("run-memo-older", "serving", "running", &v1.Outcome{ExecutionMs: 40})
-	record("job-memo-calls", "job", "running", &v1.Outcome{ExecutionMs: 40},
+	record("run-memo-calls", "serving", "running", &v1.Outcome{ExecutionMs: 40},
 		&v1.Call{Unmemoized: "seed not given"}, &v1.Call{Memoized: true, ComputationDigest: held})
 	defer publicationControlAPI(t, o)()
 
@@ -95,12 +95,12 @@ func TestRunShowSaysHowTheMachineMemoAnsweredARun(t *testing.T) {
 		}
 	}
 
-	report, text := show("job-memo-calls")
+	report, text := show("run-memo-calls")
 	byRequest := map[string]int{}
 	for i, call := range report.Calls {
 		byRequest[call.Request] = i
 	}
-	unmet, reused := report.Calls[byRequest["job-memo-calls/0"]], report.Calls[byRequest["job-memo-calls/1"]]
+	unmet, reused := report.Calls[byRequest["run-memo-calls/0"]], report.Calls[byRequest["run-memo-calls/1"]]
 	if report.Memoized || report.Computation != "" || report.Unmemoized != "" || memoLine.MatchString(text) ||
 		unmet.Unmemoized != "seed not given" || unmet.Memoized || reused.Unmemoized != "" || !reused.Memoized || reused.Computation != held ||
 		!strings.Contains(text, fmt.Sprintf("  call %d not memoized: seed not given\n", unmet.Number)) || !strings.Contains(text, "reused (memo)") {
@@ -108,7 +108,7 @@ func TestRunShowSaysHowTheMachineMemoAnsweredARun(t *testing.T) {
 	}
 	for number, memo := range map[int]string{unmet.Number: "memo: not memoized: seed not given",
 		reused.Number: "memo: served from this machine's memo (nothing ran) · " + held} {
-		code, call := runCozy(t, o.root, "run", "show", "job-memo-calls", "--call", fmt.Sprint(number))
+		code, call := runCozy(t, o.root, "run", "show", "run-memo-calls", "--call", fmt.Sprint(number))
 		if code != 0 || memoLine.FindString(call) != memo {
 			t.Fatalf("run show --call %d [%d] does not say %q:\n%s", number, code, memo, call)
 		}
