@@ -4,10 +4,9 @@
 and the target machine. A package without parallel execution uses one GPU. Model
 repositories, releases and weight lanes do not choose execution width.
 
-Use `--gpus=2` to require exactly two GPUs for GPU work in that run. The machine
-rejects an unsupported count rather than silently narrowing or widening it. This
-also applies to GPU child calls: a two-GPU request cannot invoke a GPU operation
-that only supports one GPU. CPU orchestration itself remains on the CPU.
+Use `--gpus=2` to cap the run's GPU work at two GPUs: each GPU call, the run's own and
+its children's, uses the GPUs it declares, up to two (TensorD 0.5.33 and later). CPU
+orchestration itself remains on the CPU.
 
 An explicit count reserves a disjoint group on the target machine. On a four-GPU
 machine, two two-GPU runs can use separate groups. An orchestration run retains

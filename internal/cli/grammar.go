@@ -508,7 +508,7 @@ type RunCmd struct {
 }
 
 type RunExecuteCmd struct {
-	GPUs                *uint32  `name:"gpus" help:"Use exactly this many GPUs for each GPU operation; omit to use the largest package-supported configuration on the machine."`
+	GPUs                *uint32  `name:"gpus" help:"Cap each GPU call at this many GPUs: each uses what it declares, up to this count; omit to cap at the machine's GPUs."`
 	MachineEndpointFile string   `name:"machine-endpoint-file" predictor:"file" help:"Run on this explicitly pinned owned machine using the controller's existing signing identity; never register or rent a machine."`
 	Target              string   `arg:"" name:"target" predictor:"callable" help:"Package callable org/package[/function], explicit ./project[/function], or a Python script."`
 	Input               []string `arg:"" optional:"" name:"input" help:"Primary value (a conversion job takes <input-model> [<org/model> destination]), field=value payload and model.<param>=reference overrides (Tensorhub, hf://, or civitai://)."`
