@@ -218,9 +218,9 @@ pub fn converter(name: &str) -> Result<&'static Converter> {
 /// cannot say that.
 ///
 /// A component may be named MORE THAN ONCE, and that is the vocabulary a mixed-allocation
-/// carrier needs: `transformer=mxfp8/1,transformer=fp8-rowwise/1` says this one component's
-/// tensors are drawn from those two encodings, and the carrier's own per-tensor roles pick
-/// which is which. The widening stops at the component on purpose — a set that spanned the
+/// carrier needs: `transformer=fp8-scaled-scalar/1,transformer=fp8-rowwise/1` says this one
+/// component's tensors are drawn from those two encodings, and the carrier's own per-tensor
+/// roles pick which is which. The widening stops at the component on purpose — a set that spanned the
 /// SNAPSHOT would let the transformer's encoding admit a text-encoder tensor, which is the
 /// one-rule-over-the-tree this type exists to refuse.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -697,7 +697,7 @@ pub struct RoleMap {
     pub companions: &'static [(&'static str, &'static str)],
 }
 
-pub const ROLE_MAPS: [RoleMap; 5] = [
+pub const ROLE_MAPS: [RoleMap; 4] = [
     RoleMap {
         alias: "plain/1",
         data: "value",
@@ -717,11 +717,6 @@ pub const ROLE_MAPS: [RoleMap; 5] = [
     },
     RoleMap {
         alias: "fp8-rowwise/1",
-        data: "data",
-        companions: &[(".weight_scale", "scale")],
-    },
-    RoleMap {
-        alias: "mxfp8/1",
         data: "data",
         companions: &[(".weight_scale", "scale")],
     },

@@ -1,4 +1,0 @@
-doc: encoding
-expect: ok
-id: sha256:7e9b1ad8f2e5ddd236a4d4303042d632a96eadef4f25d44eb0fb63124cec7cfd
-note: ceil-block scale relation; vectorless

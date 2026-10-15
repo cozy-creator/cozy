@@ -61,14 +61,6 @@ fn f32_from_e2m1(n: u8) -> f32 {
     }
 }
 
-/// E8M0: a bare power-of-two exponent byte, bias 127. 0xff is NaN.
-fn f32_from_e8m0(b: u8) -> f32 {
-    if b == 0xff {
-        return f32::NAN;
-    }
-    2f32.powi(b as i32 - 127)
-}
-
 fn f32_from_half(b: [u8; 2]) -> f32 {
     let h = u16::from_le_bytes(b) as u32;
     let (sign, exp, man) = ((h >> 15) & 1, (h >> 10) & 0x1f, h & 0x3ff);
@@ -245,35 +237,6 @@ fn fp8_scalar_inner(c: &Case, fold_input: bool, skip_scale: bool, narrow: bool) 
     Some(out)
 }
 
-/// MXFP8: value[i,j] = e4m3(data[i,j]) * 2^(E8M0(scale[i, j/32]) - 127)
-fn mxfp8(c: &Case) -> Option<Vec<u8>> {
-    mxfp8_inner(c, 32)
-}
-fn mxfp8_wrong_block(c: &Case) -> Option<Vec<u8>> {
-    mxfp8_inner(c, 16)
-}
-
-fn mxfp8_inner(c: &Case, block: usize) -> Option<Vec<u8>> {
-    let d = role(c, "data")?;
-    let s = role(c, "scale")?;
-    let rows = *c.logical_shape.first()? as usize;
-    let cols = *c.logical_shape.get(1)? as usize;
-    let blocks = s.shape.get(1).copied().unwrap_or(1) as usize;
-    let mut out = Vec::new();
-    for i in 0..rows {
-        for j in 0..cols {
-            let b = (j / block).min(blocks - 1);
-            let e = f32_from_e8m0(s.bits[i * blocks + b]);
-            put_logical(
-                c.logical_dtype,
-                f32_from_e4m3fn(d.bits[i * cols + j]) * e,
-                &mut out,
-            );
-        }
-    }
-    Some(out)
-}
-
 /// nvfp4 W4A4: value[i,j] = e2m1(nibble) * e4m3(weight_scale[i, j/16]) * weight_scale_2
 fn nvfp4(c: &Case) -> Option<Vec<u8>> {
     nvfp4_inner(c, false, false)
@@ -391,10 +354,6 @@ fn candidates(alias: &str) -> Vec<Candidate> {
             mk("int8-convrot256", false, int8_convrot256),
             mk("int8-convrot256:unrotated", true, int8_convrot_unrotated),
             mk("int8-convrot256:scale-by-column", true, int8_convrot_scale_by_column),
-        ],
-        "mxfp8/1" => vec![
-            mk("mxfp8", false, mxfp8),
-            mk("mxfp8:block-16", true, mxfp8_wrong_block),
         ],
         "nvfp4-w4a4/1" => vec![
             mk("nvfp4", false, nvfp4),

@@ -119,7 +119,6 @@ fn mined(name: &str) -> EncodingVectors {
             include_bytes!("../../../vectors/mined/fp8-scaled-scalar-weight-only.json")
         }
         "nvfp4-w4a4" => include_bytes!("../../../vectors/mined/nvfp4-w4a4.json"),
-        "mxfp8" => include_bytes!("../../../vectors/mined/mxfp8.json"),
         "int8-convrot256" => include_bytes!("../../../vectors/mined/int8-convrot256.json"),
         other => panic!("no mined vector set {other:?}"),
     };
@@ -248,25 +247,6 @@ pub fn seeds() -> Vec<Seed> {
         // real int8 producer in the quarry is svdq's low-rank factor quantizer, which is
         // per-block-32 over rank-32 factors, not per-channel -- a different geometry that
         // belongs to `svdq-microscale/1`. Schema with no path is what the conventions forbid.
-        seed(
-            "mxfp8/1",
-            float.clone(),
-            Some(2),
-            vec![
-                ("data", role(set(&[Dtype::F8E4M3FN]), Relation::Same)),
-                (
-                    "scale",
-                    role(
-                        set(&[Dtype::U8]),
-                        dims(vec![
-                            Dim::Axis { axis: 0 },
-                            Dim::CeilDiv { axis: 1, by: 32 },
-                        ]),
-                    ),
-                ),
-            ],
-            Some(mined("mxfp8")),
-        ),
         // int8 W8A8 with ComfyUI's ConvRot: each row is rotated by the orthonormal regular
         // Hadamard H4(x)H4(x)H4(x)H4 per 256 input channels, then quantized per output row.
         // value[i,j] = scale[i] * (data[i] . H)[j] / 16, the integer Hadamard sum times the

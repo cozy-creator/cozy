@@ -67,6 +67,37 @@ fn probe_spec() -> EncodingSpec {
     }
 }
 
+/// The `ceil_div` relation over an inner dim with a remainder: [4, 65] stores a [4, 3] scale.
+/// Never a platform alias.
+fn ceil_div_spec() -> EncodingSpec {
+    use tensorfs_core::relation::{Carrier, Dim, Relation};
+    use tensorfs_core::spec::Role;
+    EncodingSpec {
+        logical_dtypes: vec![Dtype::Bf16],
+        logical_rank: Some(2),
+        roles: vec![
+            (
+                "data".to_string(),
+                Role {
+                    carrier: Carrier::Set(vec![Dtype::F8E4M3FN]),
+                    shape: Relation::Same,
+                },
+            ),
+            (
+                "scale".to_string(),
+                Role {
+                    carrier: Carrier::Set(vec![Dtype::U8]),
+                    shape: Relation::Dims(vec![
+                        Dim::Axis { axis: 0 },
+                        Dim::CeilDiv { axis: 1, by: 32 },
+                    ]),
+                },
+            ),
+        ],
+        vectors: None,
+    }
+}
+
 fn pattern(n: usize) -> Vec<u8> {
     (0..n).map(|i| (i * 31 + 7) as u8).collect()
 }
@@ -327,7 +358,6 @@ fn build_corpus() -> TfsResult<(Vec<Case>, Vec<EncodingSpec>)> {
     let (hn, _) = header_nvfp4();
     let plain = seed_spec("plain/1", 0);
     let fp8 = seed_spec("fp8-rowwise/1", 0);
-    let mxfp8 = seed_spec("mxfp8/1", 0);
     let svdq = seed_spec("svdq-microscale/1", 0);
     // the corpus closure ships the WHOLE platform namespace, not only the cited specs
     let mut specs: Vec<EncodingSpec> = registry::seeds().into_iter().map(|s| s.spec).collect();
@@ -381,13 +411,35 @@ fn build_corpus() -> TfsResult<(Vec<Case>, Vec<EncodingSpec>)> {
         plain.canonical_bytes(),
         "entry zero; carries vectors",
     ));
+    let ceil = ceil_div_spec();
+    let hc = Header {
+        configs: vec![],
+        assets: vec![],
+        encodings: encodings_of(&[&ceil]),
+        components: vec![(
+            "transformer".to_string(),
+            vec![(
+                "blocks.0.mlp.fc1.weight".to_string(),
+                Tensor {
+                    dtype: Dtype::Bf16,
+                    shape: vec![4, 65],
+                    encoding: ceil.object_id(),
+                    parts: vec![
+                        ("data".to_string(), part_of(Dtype::F8E4M3FN, vec![4, 65])),
+                        ("scale".to_string(), part_of(Dtype::U8, vec![4, 3])),
+                    ],
+                },
+            )],
+        )],
+    };
     cases.push(ok_case(
-        "encoding",
-        "mxfp8",
-        "encoding",
-        mxfp8.canonical_bytes(),
-        "ceil-block scale relation; vectorless",
+        "header",
+        "ceil-div",
+        "header",
+        hc.conformance_bytes()?,
+        "ceil_div rounds a remainder up: 65 / 32 stores 3 blocks",
     ));
+    specs.push(ceil);
     cases.push(ok_case(
         "encoding",
         "svdq-microscale",

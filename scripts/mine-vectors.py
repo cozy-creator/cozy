@@ -142,31 +142,6 @@ def quantize_fp8_rowwise(w):
     return q, scale  # scale is [out, 1]; v1 stores scale.reshape(-1)
 
 
-def quantize_mxfp8(w, block=32):
-    """INDEPENDENT SECOND IMPLEMENTATION, not a v1 producer: v1 has NO MX producer at all
-    (E8M0 appears there only as one decode line, hf_fp8_blockwise.py:275, from which the
-    convention `scale = 2^(byte - 127)` is taken). Written from the OCP Microscaling spec:
-    the shared block scale is the power of two that puts the block's amax at the top of
-    E4M3's range, floor-clamped into E8M0's exponent domain. The E4M3 cast itself is
-    torch's real one, so only the exponent choice is ours."""
-    wf = w.float()
-    out_f, in_f = wf.shape
-    nb = (in_f + block - 1) // block
-    pad = nb * block - in_f
-    if pad:
-        wf = torch.nn.functional.pad(wf, (0, pad))
-    blocks = wf.reshape(out_f, nb, block)
-    amax = blocks.abs().amax(dim=-1)
-    # exponent such that amax / 2^e <= 448; E4M3's max exponent is 8 (448 = 1.75*2^8)
-    e = torch.where(amax > 0, torch.floor(torch.log2(amax)) - 8.0,
-                    torch.zeros_like(amax))
-    e = e.clamp(min=-127.0, max=127.0)
-    byte = (e + 127.0).to(torch.uint8)
-    scale = torch.exp2(byte.float() - 127.0)
-    q = (blocks / scale.unsqueeze(-1)).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn)
-    return q.reshape(out_f, nb * block)[:, :in_f].contiguous(), byte, scale
-
-
 # ---------------------------------------------------------------- the material
 
 def material(rows, cols, seed=0):
@@ -211,18 +186,6 @@ def mine_nvfp4():
             "weight": ("u8", [16, 32], raw(packed)),
             "weight_scale": ("f8_e4m3fn", [16, 4], raw(bs)),
             "weight_scale_2": ("f32", [], raw(ws2.reshape(()))),
-        })
-
-
-def mine_mxfp8():
-    w = material(4, 64, 3)
-    q, byte, scale = quantize_mxfp8(w)
-    deq = q.float() * scale.repeat_interleave(32, dim=1)[:, :64]
-    for lg in ("f32", "bf16"):
-        t = deq if lg == "f32" else deq.to(torch.bfloat16)
-        emit(f"mxfp8-4x64-{lg}", lg, [4, 64], raw(t), {
-            "data": ("f8_e4m3fn", [4, 64], raw(q)),
-            "scale": ("u8", [4, 2], raw(byte)),
         })
 
 
@@ -323,7 +286,6 @@ def mine_fp8_scaled_scalar():
 MINERS = {
     "fp8-rowwise": mine_fp8_rowwise,
     "nvfp4-w4a4": mine_nvfp4,
-    "mxfp8": mine_mxfp8,
     "fp8-scaled-scalar": mine_fp8_scaled_scalar,
     "int8-convrot256": mine_int8_convrot256,
 }
