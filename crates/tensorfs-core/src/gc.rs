@@ -598,7 +598,11 @@ mod tests {
         ));
         let store = Store::init(&root).unwrap();
         let held = store
-            .put_stream(&mut &b"a live session's candidate"[..], None, &Fault::default())
+            .put_stream(
+                &mut &b"a live session's candidate"[..],
+                None,
+                &Fault::default(),
+            )
             .unwrap()
             .obj;
         tx::ensure_session_root(&root, "live", "_tensorfs").unwrap();

@@ -151,10 +151,17 @@ fn temporary(name: &str) -> std::path::PathBuf {
     ))
 }
 
-fn made_header(store: &Store, made: &tensorfs_core::source_model::Made) -> tensorfs_core::header::Header {
+fn made_header(
+    store: &Store,
+    made: &tensorfs_core::source_model::Made,
+) -> tensorfs_core::header::Header {
     load_header(
         store,
-        store.read_manifest(&made.manifest).unwrap().header().unwrap(),
+        store
+            .read_manifest(&made.manifest)
+            .unwrap()
+            .header()
+            .unwrap(),
     )
     .unwrap()
 }
@@ -184,13 +191,30 @@ fn a_transformers_repository_carries_its_config_tokenizer_and_processor() {
     .unwrap();
     assert_eq!(made.profiles, ["as-is/1"]);
     let header = made_header(&store, &made);
-    let components: Vec<_> = header.components.iter().map(|(name, _)| name.as_str()).collect();
+    let components: Vec<_> = header
+        .components
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect();
     assert_eq!(components, ["model"]);
-    let configs: Vec<_> = header.configs.iter().map(|(name, _)| name.as_str()).collect();
+    let configs: Vec<_> = header
+        .configs
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect();
     assert!(configs.contains(&"model"), "{configs:?}");
-    let config = &header.configs.iter().find(|(name, _)| name == "model").unwrap().1;
+    let config = &header
+        .configs
+        .iter()
+        .find(|(name, _)| name == "model")
+        .unwrap()
+        .1;
     assert!(String::from_utf8_lossy(config).contains("\"model_type\""));
-    let assets: Vec<_> = header.assets.iter().map(|(name, _)| name.as_str()).collect();
+    let assets: Vec<_> = header
+        .assets
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect();
     for file in [
         "chat_template.jinja",
         "generation_config.json",
@@ -214,8 +238,12 @@ struct Mirror {
 
 impl Mirror {
     fn of(repo: &str, revision: &str, extra: Vec<(String, Vec<u8>)>) -> (Mirror, String) {
-        let tree = format!("https://huggingface.co/api/models/{repo}/tree/{revision}?recursive=true");
-        let listing = std::process::Command::new("curl").args(["-sSfL", &tree]).output().unwrap();
+        let tree =
+            format!("https://huggingface.co/api/models/{repo}/tree/{revision}?recursive=true");
+        let listing = std::process::Command::new("curl")
+            .args(["-sSfL", &tree])
+            .output()
+            .unwrap();
         assert!(listing.status.success(), "{tree}");
         let rows: Vec<serde_json::Value> = serde_json::from_slice(&listing.stdout).unwrap();
         let mut files: Vec<(String, Vec<u8>)> = rows
@@ -224,7 +252,10 @@ impl Mirror {
             .map(|row| {
                 let path = row["path"].as_str().unwrap().to_string();
                 let url = format!("https://huggingface.co/{repo}/resolve/{revision}/{path}");
-                let body = std::process::Command::new("curl").args(["-sSfL", &url]).output().unwrap();
+                let body = std::process::Command::new("curl")
+                    .args(["-sSfL", &url])
+                    .output()
+                    .unwrap();
                 assert!(body.status.success(), "{url}");
                 (path, body.stdout)
             })
@@ -270,10 +301,15 @@ fn serve(mut socket: std::net::TcpStream, files: &std::collections::BTreeMap<Str
         }
         let text = String::from_utf8_lossy(&head).to_string();
         let mut first = text.lines().next().unwrap().split_whitespace();
-        let (method, target) = (first.next().unwrap().to_string(), first.next().unwrap().to_string());
+        let (method, target) = (
+            first.next().unwrap().to_string(),
+            first.next().unwrap().to_string(),
+        );
         let range = text.lines().find_map(|line| {
             let (name, value) = line.split_once(':')?;
-            let (a, b) = name.eq_ignore_ascii_case("range").then_some(value.trim())?
+            let (a, b) = name
+                .eq_ignore_ascii_case("range")
+                .then_some(value.trim())?
                 .strip_prefix("bytes=")?
                 .split_once('-')?;
             Some((a.parse::<usize>().ok()?, b.parse::<usize>().ok()?))
@@ -290,7 +326,10 @@ fn serve(mut socket: std::net::TcpStream, files: &std::collections::BTreeMap<Str
                 .collect();
             Some(serde_json::to_vec(&rows).unwrap())
         } else {
-            path.splitn(6, '/').nth(5).and_then(|name| files.get(name)).cloned()
+            path.splitn(6, '/')
+                .nth(5)
+                .and_then(|name| files.get(name))
+                .cloned()
         };
         let Some(body) = body else {
             let _ = socket.write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n");
@@ -299,11 +338,20 @@ fn serve(mut socket: std::net::TcpStream, files: &std::collections::BTreeMap<Str
         let (status, slice) = match range {
             Some((a, b)) => {
                 let b = b.min(body.len() - 1);
-                (format!("206 Partial Content\r\ncontent-range: bytes {a}-{b}/{}", body.len()), &body[a..=b])
+                (
+                    format!(
+                        "206 Partial Content\r\ncontent-range: bytes {a}-{b}/{}",
+                        body.len()
+                    ),
+                    &body[a..=b],
+                )
             }
             None => ("200 OK".to_string(), &body[..]),
         };
-        let head = format!("HTTP/1.1 {status}\r\ncontent-length: {}\r\netag: \"m\"\r\n\r\n", slice.len());
+        let head = format!(
+            "HTTP/1.1 {status}\r\ncontent-length: {}\r\netag: \"m\"\r\n\r\n",
+            slice.len()
+        );
         let sent = socket.write_all(head.as_bytes()).is_ok()
             && (method == "HEAD" || socket.write_all(slice).is_ok());
         if !sent {
@@ -326,7 +374,11 @@ fn a_diffusers_repository_is_its_index_components_and_nothing_else() {
         let url = format!(
             "https://huggingface.co/hf-internal-testing/tiny-flux-pipe/resolve/a98bc4ec6a80c47c477ed22d7e81c79872d9c723/{name}"
         );
-        std::process::Command::new("curl").args(["-sSfL", &url]).output().unwrap().stdout
+        std::process::Command::new("curl")
+            .args(["-sSfL", &url])
+            .output()
+            .unwrap()
+            .stdout
     };
     let variant = tensors("transformer/diffusion_pytorch_model.safetensors");
     let (mirror, source) = Mirror::of(
@@ -334,7 +386,10 @@ fn a_diffusers_repository_is_its_index_components_and_nothing_else() {
         "a98bc4ec6a80c47c477ed22d7e81c79872d9c723",
         vec![
             ("variants/fp8/model.safetensors".into(), variant),
-            ("variants/fp8/config.json".into(), tensors("transformer/config.json")),
+            (
+                "variants/fp8/config.json".into(),
+                tensors("transformer/config.json"),
+            ),
         ],
     );
     let root = temporary("diffusers-extra");
@@ -360,14 +415,33 @@ fn a_diffusers_repository_is_its_index_components_and_nothing_else() {
         ["text_encoder", "text_encoder_2", "transformer", "vae"]
     );
     let configs = names(&header.configs);
-    for name in ["model_index", "scheduler", "text_encoder", "text_encoder_2", "transformer", "vae"] {
+    for name in [
+        "model_index",
+        "scheduler",
+        "text_encoder",
+        "text_encoder_2",
+        "transformer",
+        "vae",
+    ] {
         assert!(configs.contains(&name), "{name} not in {configs:?}");
     }
-    assert!(!configs.iter().any(|name| name.contains("variants")), "{configs:?}");
+    assert!(
+        !configs.iter().any(|name| name.contains("variants")),
+        "{configs:?}"
+    );
     let assets = names(&header.assets);
-    assert!(assets.iter().any(|name| name.starts_with("tokenizer/")), "{assets:?}");
-    assert!(assets.iter().any(|name| name.starts_with("tokenizer_2/")), "{assets:?}");
-    assert!(!assets.iter().any(|name| name.starts_with("variants/")), "{assets:?}");
+    assert!(
+        assets.iter().any(|name| name.starts_with("tokenizer/")),
+        "{assets:?}"
+    );
+    assert!(
+        assets.iter().any(|name| name.starts_with("tokenizer_2/")),
+        "{assets:?}"
+    );
+    assert!(
+        !assets.iter().any(|name| name.starts_with("variants/")),
+        "{assets:?}"
+    );
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -419,7 +493,12 @@ fn a_transformers_repository_is_its_root_model_and_nothing_else() {
     assert_eq!(names(&header.components), ["model"]);
     assert!(names(&header.configs).contains(&"model"));
     let assets = names(&header.assets);
-    for file in ["chat_template.jinja", "generation_config.json", "tokenizer.json", "tokenizer_config.json"] {
+    for file in [
+        "chat_template.jinja",
+        "generation_config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+    ] {
         assert!(assets.contains(&file), "{file} not in {assets:?}");
     }
     let _ = std::fs::remove_dir_all(root);

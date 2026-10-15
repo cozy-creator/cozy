@@ -247,7 +247,7 @@ fn list_selected_observed(
     credentials: &dyn CredentialProvider,
     deadline: Deadline,
     ledger: &Ledger,
-    files: Option<&[String]>,
+    wanted: Option<&dyn Fn(&str) -> bool>,
     mut unnameable: Option<&mut Vec<String>>,
 ) -> Result<Vec<SourceMember>> {
     let policy = endpoints.policy(uri);
@@ -286,7 +286,9 @@ fn list_selected_observed(
                     let Some(path) = json_str(row, "path") else {
                         return refuse(Code::MISSING_FIELD, "a tree row names no path");
                     };
-                    if files.is_some_and(|files| !files.iter().any(|file| file == path)) {
+                    // Before any check of its own: a gated repository masks the digests of
+                    // carriers a metadata-only selection never reads.
+                    if wanted.is_some_and(|wanted| !wanted(path)) {
                         continue;
                     }
                     if !member_path(path) {
@@ -1307,13 +1309,19 @@ pub fn resolve_files(
     };
     let ledger = Ledger::new();
     let policy = endpoints.policy(uri);
-    let listed =
-        list_selected_observed(uri, endpoints, credentials, deadline, &ledger, None, None)?;
-    let mut selected: Vec<&SourceMember> = listed
-        .iter()
-        .filter(|m| !is_safetensors(&m.member) && !is_index(&m.member))
-        .filter(|m| crate::manifest::check_path(&m.member).is_ok() && wanted(&m.member))
-        .collect();
+    let ordinary = |m: &str| {
+        !is_safetensors(m) && !is_index(m) && crate::manifest::check_path(m).is_ok() && wanted(m)
+    };
+    let listed = list_selected_observed(
+        uri,
+        endpoints,
+        credentials,
+        deadline,
+        &ledger,
+        Some(&ordinary),
+        None,
+    )?;
+    let mut selected: Vec<&SourceMember> = listed.iter().collect();
     selected.sort_by(|a, b| a.member.cmp(&b.member));
     selected.dedup_by(|a, b| a.member == b.member);
     if selected.is_empty() {
@@ -2315,7 +2323,11 @@ mod tests {
             FILE_SELECTION_MAX_BYTES + 1
         );
         for (listing, name, outcome) in [
-            (r#"[{"type":"file","path":"config.json","size":2}]"#.to_string(), "absent.json", None),
+            (
+                r#"[{"type":"file","path":"config.json","size":2}]"#.to_string(),
+                "absent.json",
+                None,
+            ),
             (oversized, "config.json", Some(Code::SIZE_CAP)),
         ] {
             let (base, _, handle) =

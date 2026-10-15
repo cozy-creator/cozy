@@ -256,7 +256,10 @@ impl Provider {
 enum Layout {
     /// A Diffusers pipeline: its index, component configs and asset folders, and the folders
     /// of the components that hold weights.
-    Diffusers { files: Resolution, weights: Vec<String> },
+    Diffusers {
+        files: Resolution,
+        weights: Vec<String>,
+    },
     /// A Transformers model at the repository root: its config and root metadata files.
     Transformers(Resolution),
 }
@@ -267,11 +270,12 @@ impl Layout {
     /// loads (not a native `consolidated.safetensors` beside it).
     fn holds(&self, member: &str) -> bool {
         match self {
-            Layout::Diffusers { weights, .. } => {
-                weights.iter().any(|folder| member.starts_with(folder.as_str()))
-            }
+            Layout::Diffusers { weights, .. } => weights
+                .iter()
+                .any(|folder| member.starts_with(folder.as_str())),
             Layout::Transformers(_) => {
-                !member.contains('/') && (member.starts_with("model.") || member.starts_with("model-"))
+                !member.contains('/')
+                    && (member.starts_with("model.") || member.starts_with("model-"))
             }
         }
     }
@@ -630,7 +634,11 @@ pub fn make(store: &Store, request: &Request) -> Result<Made> {
     };
     if let (Some(provider), Some(layout)) = (&provider, own_metadata) {
         metadata.push((
-            Provider::new(provider.uri.clone(), request.access, &request.access.credential)?,
+            Provider::new(
+                provider.uri.clone(),
+                request.access,
+                &request.access.credential,
+            )?,
             layout.files(),
         ));
     }
@@ -989,12 +997,18 @@ fn metadata_files(
         }
         configs.insert(index.member.trim_end_matches(".json").to_string(), body);
         let folders = assets(&components);
-        return Ok((configs, files(&|m| folders.iter().any(|f| m.starts_with(f.as_str())))));
+        return Ok((
+            configs,
+            files(&|m| folders.iter().any(|f| m.starts_with(f.as_str()))),
+        ));
     }
     let Some(config) = row("config.json") else {
         return Ok((configs, vec![]));
     };
-    configs.insert("model".into(), constructible(document(store, &config.object)?)?);
+    configs.insert(
+        "model".into(),
+        constructible(document(store, &config.object)?)?,
+    );
     Ok((configs, files(&|m| m != "config.json")))
 }
 
@@ -1014,7 +1028,9 @@ fn constructible(config: Vec<u8>) -> Result<Vec<u8>> {
                 }
                 changed
             }
-            Json::Arr(items) => items.iter_mut().fold(false, |changed, item| strip(item) | changed),
+            Json::Arr(items) => items
+                .iter_mut()
+                .fold(false, |changed, item| strip(item) | changed),
             _ => false,
         }
     }
@@ -1066,7 +1082,9 @@ mod tests {
         assert!(!String::from_utf8(kept.clone())
             .unwrap()
             .contains("_name_or_path"));
-        assert!(String::from_utf8(kept.clone()).unwrap().contains("_class_name"));
+        assert!(String::from_utf8(kept.clone())
+            .unwrap()
+            .contains("_class_name"));
         assert!(String::from_utf8(kept).unwrap().contains("hidden_size"));
     }
 
@@ -1082,7 +1100,11 @@ mod tests {
             weights: vec!["transformer/".into(), "vae/".into()],
         };
         assert!(pipeline.holds("transformer/diffusion_pytorch_model.safetensors.index.json"));
-        for other in ["variants/fp8r/model.safetensors", "model.safetensors", "transformer2/x.safetensors"] {
+        for other in [
+            "variants/fp8r/model.safetensors",
+            "model.safetensors",
+            "transformer2/x.safetensors",
+        ] {
             assert!(!pipeline.holds(other), "{other}");
         }
         let model = Layout::Transformers(none);
