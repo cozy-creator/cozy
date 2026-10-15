@@ -55,7 +55,7 @@ func ParseInput(raw []byte) (Input, error) {
 	if json.Unmarshal([]byte(in.GraphJSON), &graph) != nil || len(graph) == 0 || len(in.GraphJSON) > 4<<20 {
 		return in, errors.New("graph_json must contain a nonempty Comfy API graph below 4 MiB")
 	}
-	if in.Port < 1 || in.Port > 65535 || in.TimeoutS < 1 || in.TimeoutS > 7200 || (in.ExpectedSteps != 8 && in.ExpectedSteps != 30) {
+	if in.Port < 1 || in.Port > 65535 || in.TimeoutS < 1 || in.TimeoutS > 7200 || in.ExpectedSteps < 1 {
 		return in, errors.New("invalid Comfy port, timeout or expected step count")
 	}
 	if !strings.HasPrefix(in.OutputRoot, "/") || (in.Trace && !strings.HasPrefix(in.TraceRoot, "/")) {
