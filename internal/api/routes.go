@@ -67,7 +67,7 @@ var Routes = []Route{
 	// ---- the LOCAL extension module ----
 	{"GET", "/v1/local/attempts/{attempt_key}/triage", Local, true, false, false, "",
 		"one attempt's kept triage bundle from its own attempt row; 404 when none was kept",
-		"run/job failure remedies"},
+		"run failure remedies"},
 	{"POST", "/v1/local/requests/{id}/abandon", Local, true, true, false, "",
 		"abandon local Runtime-run tracking without confirming remote stop or releasing a rental",
 		"`cozy run cancel --abandon`"},

@@ -480,11 +480,8 @@ messages. Persisted `private-revision` markers, historical SQLite column names, 
 remain readable. They are compatibility identifiers, not another package mode. Private rentals
 and access controls retain their security meaning.
 
-Failed unpublished package jobs keep their resumable work and rental. `cozy run pause <id>` stops execution
-while retaining that state; `cozy run resume <id>` runs the exact captured revision again.
-Changed code or parameters are captured by a new run, optionally linked with `--retry`.
-`cozy run cancel <id>` abandons the retained
-work, releasing only resources with no other owner. Retained rentals continue billing.
+`cozy run cancel <id>` stops a run. Submitting the same function again is a new run whose
+finished memoized steps are answered from the machine's memo.
 Cancellation records intent and returns the observed state. If a sent submission's
 acceptance is unknown, it remains `canceling` until the machine closes its key or
 confirms the execution outcome. Use `cozy run cancel <id> --await` to wait for that
@@ -492,14 +489,12 @@ confirmation. Work never submitted cancels immediately.
 If the machine cannot be reconciled, `cozy run cancel <id> --abandon` permanently
 ends local tracking while retaining the original submission and any real receipts
 or outcomes. This does **not** confirm remote work stopped or end any rental.
-The abandoned run cannot be resubmitted or resumed; late real facts remain history
-without reopening it. `--abandon` cannot be combined with `--await`.
-An unchanged deterministic failure is not automatically retried. `--await` returns when a
-transaction blocks or pauses, and the ordinary run view explains the stopped state.
+Late real facts about an abandoned run remain history without reopening it. `--abandon` cannot
+be combined with `--await`. A failure is not automatically retried.
 
 An invocable dependency exposes an ordinary typed Python call. Its implementation is its own
-package in the caller's environment. Calling one creates an ordinary managed child job. A reusable computation
-opts in with `@invocable(memoize=True)` and registers through `app.job(function)`.
+package in the caller's environment. Calling one creates an ordinary managed child run. A reusable computation
+opts in with `@invocable(memoize=True)`.
 Arbitrary helper functions and external effects do not become cached operations.
 An editable source library declares its App in `package.toml` (`[application] object =
 "my_algorithm:app"`) and the matching `pyproject.toml` entry point
@@ -565,8 +560,8 @@ edit of a path dependency rebuilds the machine's environment for the next run. A
 library call runs inside its caller; only operations participating in the managed memoization
 contract reuse completed computation.
 
-Serving entrypoints and bounded jobs use the same command. Cozy reads the installed package interface
-to determine the callable lifecycle:
+Every function is called the same way. Cozy reads the installed package interface for its
+arguments, machine class and outputs:
 
 ```sh
 cozy run org/package/generate \
@@ -622,9 +617,7 @@ omitted integer `seed`, so an unseeded run draws fresh entropy.
 Every run says where its files are. Result files land in the package's own store,
 `~/.cozy/outputs/<org>-<package>/`, or under `--out DIR`; either way each file is named by its own
 content digest, `<sha256>.<ext>`, so regenerating the same bytes lands on the same file and two
-different results never collide. This includes top-level job images, audio, and videos. Jobs keep
-their internal publication custody and export independent user copies; child artifacts and native
-checkpoints stay internal. Text-only results create no output directory. Input assets are read from
+different results never collide. Child artifacts and native checkpoints stay internal. Text-only results create no output directory. Input assets are read from
 the original input paths without copying them. Keep those files available and unchanged until the
 request finishes; missing or modified inputs are refused before execution. Downloaded or resized
 media lives in the system temporary directory under `cozy/`, named by its content hash.
@@ -633,8 +626,7 @@ Calcifer probes the destination writable at submit and refuses typed (`output_de
 before any execution, and records the destination with the request, so closing the command or
 restarting Cozy does not lose where the files are.
 
-Local Runtime workers start on demand. Successful serving workers may remain resident for warm
-reuse; job workers are reclaimed at terminal.
+Local Runtime workers start on demand and may remain resident for warm reuse.
 
 ## Private rentals
 
@@ -686,10 +678,9 @@ their shared object closure and required disk headroom. This declares capacity n
 and models are prepared when requests run. Retrying the same idempotency key reuses the pinned
 set, including when `--model` is omitted on the retry.
 
-Rentals end themselves after 15 minutes idle: no job queued for or running on the
-machine. The machine enforces this, with or without Creator. Every run is a job
-(warm-ups, uploads and conversions too); updates, paused jobs, an open connection and
-status polling are idle time. `cozy rental end <name>` ends one now.
+Rentals end themselves after 15 minutes idle: no run queued for or running on the
+machine. The machine enforces this, with or without Creator. Warm-ups, uploads and
+conversions are runs too; updates, an open connection and status polling are idle time. `cozy rental end <name>` ends one now.
 
 `cozy rental keepalive <name>` resets that 15-minute clock once and prints the
 deadline the machine answered. It authenticates directly to the pinned rental Host,

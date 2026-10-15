@@ -10,7 +10,7 @@ func humanCancellationActor(actor string) string {
 	if actor == "" {
 		return "system"
 	}
-	for _, marker := range []string{"user", "cozy run cancel", "cozy job cancel", "cozy down --all", "cozy rental end", "sigint", "interrupt"} {
+	for _, marker := range []string{"user", "cozy run cancel", "cozy down --all", "cozy rental end", "sigint", "interrupt"} {
 		if strings.Contains(actor, marker) {
 			return "user"
 		}

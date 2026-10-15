@@ -75,12 +75,11 @@ the new one's GPU quote and storage estimate fit `rental.max_owner_hourly_spend_
 checked atomically, and refuses otherwise with `rental.fleet_spend_cap`. Creator reuses the
 cheapest idle rental first, otherwise buys the cheapest offered SKU; a product the cap
 refuses is excluded and the next one tried. Every rental, manual or
-Creator-managed, ends itself after 900 seconds with no job queued for or running on it; the
+Creator-managed, ends itself after 900 seconds with no run queued for or running on it; the
 machine enforces this, with or without Creator, and an acknowledged
 `cozy rental keepalive <name>` resets that clock once. Creator only reports the deadline the
-machine's Status names. A managed rental whose assigned requests are terminal, their output
-bytes mirrored, and their outcome acknowledgements sent is released at once when its work was
-a job. `cozy rental end` releases one now.
+machine's Status names. A managed rental whose requests are terminal stays for reuse until that
+deadline. `cozy rental end` releases one now.
 
 A generic rental becomes attachable when Tensorhub publishes its pinned worker location.
 The paid request contains only the SKU, media-token hash, and Creator public key; package and
@@ -114,8 +113,7 @@ kind's encoded byte limit applies per file; Runtime owns decoded byte limits.
 Optional kind counts are compiled from the author's argument-level `AssetLimits`
 annotation. The CLI, API admission and inherited child inputs use the same count
 check over observed MIME metadata.
-An exact named payload asset still uses `--asset <field-path>=<file>`, including
-on jobs, and takes precedence over a same-spelled label. Named fields and the
+An exact named payload asset still uses `--asset <field-path>=<file>`, and takes precedence over a same-spelled label. Named fields and the
 declared collection can coexist.
 
 `--asset-fidelity alice=high` or `--asset-fidelity 0=low` records an optional
@@ -383,8 +381,8 @@ reusable operation. This is an author contract, not a proof of arbitrary Python 
 The Runtime workspace records cache results from verified successful terminals before outcome ACKs.
 Lookup uses the computation key and an already-recorded consumer request; a HIT acquires
 independent native holds before returning. Creator persists a pending lookup obligation
-before the RPC, so pause/cancel and owner restart reconcile even a lost response. Once the
-request owns a result, resuming it does not depend on the cache entry still existing.
+before the RPC, so cancel and owner restart reconcile even a lost response. Once the
+request owns a result, it does not depend on the cache entry still existing.
 Local and rented execution address this same journal through RuntimePreparation or the
 authenticated Host. Request history never becomes a second cache authority. Declined
 optional cache admission leaves the successful result unchanged; an unresolved journal
@@ -486,8 +484,7 @@ after a Calcifer restart. A lost reply reuses the recorded command identity.
 
 `--await` waits for the authoritative terminal outcome. Recording intent does not
 claim that remote execution has stopped, and a completed outcome remains unchanged.
-Watcher or API disconnection never creates cancellation intent. Pause and resume
-retain their existing generation-checked control behavior.
+Watcher or API disconnection never creates cancellation intent.
 
 ### Machine run duration
 

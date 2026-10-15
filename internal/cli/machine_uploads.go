@@ -21,7 +21,7 @@ func handleRunUpload(ctx *Context) *exit.Error {
 		return problem
 	}
 	return exit.Named(exit.NotFound, "run_output.absent", "run %s is not a cozy.machine.v1 run this host recorded", run).
-		WithRemedy("run the job again with --upload-to %s", ref.String())
+		WithRemedy("run the function again with --upload-to %s", ref.String())
 }
 
 // uploadV1Output puts a cozy.machine.v1 run's weights output in destination: a warm run on the

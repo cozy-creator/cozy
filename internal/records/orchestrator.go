@@ -128,11 +128,11 @@ CREATE TABLE IF NOT EXISTS attempts (
 )`
 
 var orchestratorSchema = []string{workerProcessesDDL, workerSessionIndex, requestsDDL, childRequestIndex, `
--- The PUBLICATION (cl-004). One row per job request, written INSIDE the terminal
+-- The PUBLICATION (cl-004). One row per weights-writing request, written INSIDE the terminal
 -- transaction: a publication that a terminal did not commit does not exist, which is
 -- what "killing before commit exposes no partial bundle" means as a schema property
 -- rather than as a check. The status column is the terminal's own verdict STAMPED as
--- metadata: a failed run's landed writes still land (jobs.md), and nothing here gates it.
+-- metadata: a failed run's landed writes still land, and nothing here gates it.
 CREATE TABLE IF NOT EXISTS publications (
   request_id   TEXT PRIMARY KEY REFERENCES requests(id),
   attempt      INTEGER NOT NULL,

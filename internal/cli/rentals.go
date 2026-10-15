@@ -1886,14 +1886,14 @@ func providerStoppedNote(r api.RentalSummary) string {
 }
 
 func idleShutdownNote() string {
-	return "Rentals end themselves after 15 minutes idle (no queued or running job)."
+	return "Rentals end themselves after 15 minutes idle (no queued or running work)."
 }
 
 func idleReleaseNote() string {
-	return "rentals end themselves after 15 minutes idle (no queued or running job); cozy rental keepalive <name> resets that clock once"
+	return "rentals end themselves after 15 minutes idle (no queued or running work); cozy rental keepalive <name> resets that clock once"
 }
 
-// releaseDue is when a machine ends itself unless a job is queued or running by then: to a
+// releaseDue is when a machine ends itself unless a run is queued or running by then: to a
 // person how long until then and the clock time, typed the moment. Zero names none.
 func releaseDue(ms int64, typed bool) []output.Field {
 	if ms <= 0 {
