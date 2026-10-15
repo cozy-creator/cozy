@@ -305,3 +305,55 @@ func authoredInterfaceDocument(t *testing.T, ladder json.RawMessage) []byte {
 	must(t, err)
 	return body
 }
+
+// The owner's bindings are kept as read. A run while the Hub cannot answer for them runs the
+// owner's lane (production run 6987 ran the declared bf16 default instead and later runs kept
+// it), and a home that never read them falls back to the declared default with a warning but
+// keeps nothing: once the Hub answers, the next run is the owner's.
+func TestAKeptOwnerBindingOutlivesAnUnreachableHub(t *testing.T) {
+	h := newLadderHub(t, authoredH3("bf16-full"))
+	h.bind(goodLadder())
+	run := func(root, key string) (string, string) {
+		t.Helper()
+		code, out, stderr := runCozyStreams(t, root, "run", ladderPackage+"/generate", "steps=1", "--rental-only", "--json", "--idempotency-key", key)
+		store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
+		fatal(t, problem)
+		defer store.Close()
+		row, problem := store.RequestByIdempotencyKey(key)
+		fatal(t, problem)
+		if row == nil || len(row.Models) != 1 || len(row.Models[0].Ladder) == 0 {
+			t.Fatalf("%s was not recorded with its model [exit %d]: %s %s", key, code, out, stderr)
+		}
+		return row.Models[0].Ladder[0].Lane, stderr
+	}
+	unreachable := func(down bool) {
+		h.mu.Lock()
+		h.bindingsUnavailable = down
+		h.mu.Unlock()
+	}
+	root := ladderRoot(t, h)
+	t.Cleanup(func() { _, _ = runCozy(t, root, "down", "--all") })
+	if lane, _ := run(root, "reachable"); lane != ladderLane {
+		t.Fatalf("the reachable Hub's owner binding was not run: %s", lane)
+	}
+	// The catalog moves (a publish elsewhere) while the Hub cannot answer for the bindings.
+	unreachable(true)
+	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
+	fatal(t, problem)
+	_, problem = store.ChangeBindingRevision()
+	store.Close()
+	fatal(t, problem)
+	if lane, stderr := run(root, "unreachable"); lane != ladderLane || strings.Contains(stderr, "declared defaults") {
+		t.Fatalf("an unreachable Hub replaced the kept owner binding with %s: %s", lane, stderr)
+	}
+
+	fresh := ladderRoot(t, h)
+	t.Cleanup(func() { _, _ = runCozy(t, fresh, "down", "--all") })
+	if lane, stderr := run(fresh, "never-read"); lane != "bf16-full" || !strings.Contains(stderr, "using the release's declared defaults") {
+		t.Fatalf("a home that never read the bindings did not say it ran the declared default (%s): %s", lane, stderr)
+	}
+	unreachable(false)
+	if lane, _ := run(fresh, "answered"); lane != ladderLane {
+		t.Fatalf("the declared default chosen while the Hub was out of reach was kept: %s", lane)
+	}
+}

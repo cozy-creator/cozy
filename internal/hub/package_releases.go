@@ -383,6 +383,33 @@ func (c *Client) PackageBindings(ctx context.Context, ref Ref, slots ...string) 
 	if e != nil {
 		return nil, e
 	}
+	return UsableBindings(ref, rows, slots...)
+}
+
+// keptBindings are a package's owner rows as this client last read them, and the catalog
+// revision it read them under.
+type keptBindings struct {
+	Revision string              `json:"revision"`
+	Rows     []PackageBindingRow `json:"rows"`
+}
+
+// KeptPackageBindings are the owner rows of ref this client last read and the catalog revision
+// it read them under; ok is false before any read.
+func (c *Client) KeptPackageBindings(ref Ref) (rows []PackageBindingRow, revision string, ok bool) {
+	var kept keptBindings
+	if !loadRelease(c.releaseCachePath("bindings", ref, "owner", ""), &kept) {
+		return nil, "", false
+	}
+	return kept.Rows, kept.Revision, true
+}
+
+// KeepPackageBindings keeps ref's owner rows as read under revision.
+func (c *Client) KeepPackageBindings(ref Ref, revision string, rows []PackageBindingRow) {
+	storeRelease(c.releaseCachePath("bindings", ref, "owner", ""), keptBindings{Revision: revision, Rows: rows})
+}
+
+// UsableBindings are the owner rows for `slots` (every slot when none is named), each usable.
+func UsableBindings(ref Ref, rows []PackageBindingRow, slots ...string) ([]PackageBindingRow, *exit.Error) {
 	seen := make(map[string]bool, len(rows))
 	var used []PackageBindingRow
 	for _, row := range rows {

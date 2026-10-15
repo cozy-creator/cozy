@@ -534,7 +534,7 @@ func exactRunModels(ctx *Context, target Target, ep *launch.Entrypoint, override
 		}
 	}
 	models, problem := resolveRunModels(ctx, target, ep, overrides, chosen, resolve)
-	if raw, err := json.Marshal(models); problem == nil && kept != "" && err == nil &&
+	if raw, err := json.Marshal(models); problem == nil && kept != "" && err == nil && !ctx.provisional &&
 		os.MkdirAll(filepath.Dir(kept), 0o700) == nil && os.WriteFile(kept+".tmp", raw, 0o600) == nil {
 		_ = os.Rename(kept+".tmp", kept)
 	}
@@ -554,7 +554,7 @@ func keptRunModelsPath(ctx *Context, target Target, ep *launch.Entrypoint, overr
 	if problem != nil {
 		return ""
 	}
-	identity, err := json.Marshal([]any{"run-models/1", ctx.Cfg.HubURL, target.Package, target.Release, target.InstallID,
+	identity, err := json.Marshal([]any{"run-models/2", ctx.Cfg.HubURL, target.Package, target.Release, target.InstallID,
 		ep.Name, ep.Models, overrides, chosen, client(ctx).CredentialIdentity(), revision})
 	if err != nil {
 		return ""
@@ -776,11 +776,13 @@ func invocationModelSpecs(ctx *Context, target Target, ep *launch.Entrypoint,
 	return out, nil
 }
 
-// invocationDefaultBindings reads the package's CURRENT default bindings for these slots from
-// the hub (th-116, cl-166): mutable owner-written rows, each a model release and its ladder.
-// Owner rows take precedence; only absent rows use the selected callable metadata. A Hub that
-// cannot answer (one without owner bindings, or out of reach) leaves the release's declared
-// defaults, with a warning.
+// invocationDefaultBindings are the package's default bindings for these slots (th-116,
+// cl-166): the owner's rows, each a model release and its ladder, where absent the selected
+// callable's declared defaults. A run reads no Hub for them: the rows this client read at the
+// current catalog revision stand. Once the revision moves they are read again; while that read
+// is out of reach, or still under way, the rows read before stand. Only a package whose rows
+// were never read falls back to its declared defaults, with a warning. A choice made from rows
+// not read at this revision is used but never kept (Context.provisional).
 func invocationDefaultBindings(ctx *Context, target Target, slots []launch.Slot) (
 	map[string]hub.PackageBindingRow, *exit.Error,
 ) {
@@ -788,17 +790,34 @@ func invocationDefaultBindings(ctx *Context, target Target, slots []launch.Slot)
 	if problem != nil {
 		return nil, problem
 	}
-	hctx, cancel := hub.Context()
-	defer cancel()
 	paths := make([]string, len(slots))
 	for i, slot := range slots {
 		paths[i] = slot.Path
 	}
-	rows, problem := client(ctx).PackageBindings(hctx, ref, paths...)
-	if problem != nil && problem.ErrName() != "hub.package_bindings_invalid" {
-		fmt.Fprintf(ctx.Err, "warning: %s owner bindings are not readable (%s); using the release's declared defaults\n", target.Package, problem.Message)
-		rows, problem = nil, nil
+	catalog, revision := client(ctx), catalogRevision(ctx)
+	rows, readAt, known := catalog.KeptPackageBindings(ref)
+	if !known || readAt != revision {
+		read := func() ([]hub.PackageBindingRow, *exit.Error) {
+			hctx, cancel := hub.Context()
+			defer cancel()
+			fresh, problem := catalog.PackageBindingRows(hctx, ref)
+			if problem == nil {
+				catalog.KeepPackageBindings(ref, revision, fresh)
+			}
+			return fresh, problem
+		}
+		if known {
+			// The rows read before stand for this run; the next one finds them refreshed.
+			ctx.provisional = true
+			go func() { _, _ = read() }()
+		} else if fresh, problem := read(); problem == nil {
+			rows = fresh
+		} else {
+			ctx.provisional = true
+			fmt.Fprintf(ctx.Err, "warning: %s owner bindings are not readable (%s); using the release's declared defaults\n", target.Package, problem.Message)
+		}
 	}
+	used, problem := hub.UsableBindings(ref, rows, paths...)
 	if problem != nil {
 		remedy := "choose the model per run: model.<param>=org/model@release"
 		if problem.Remedy != "" {
@@ -808,7 +827,7 @@ func invocationDefaultBindings(ctx *Context, target Target, slots []launch.Slot)
 			"%s default bindings are unusable: %s", target.Package, problem.Message).
 			WithRemedy("%s", remedy)
 	}
-	return effectiveModelBindings(slots, rows, ref.Org), nil
+	return effectiveModelBindings(slots, used, ref.Org), nil
 }
 
 func resolveRemoteModel(ctx *Context, cards cardReader, packageName string, slot launch.Slot, raw, wantedLane string,
