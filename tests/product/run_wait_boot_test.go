@@ -121,18 +121,18 @@ func TestWaitingRunNamesItsBootingRental(t *testing.T) {
 		return life.RentalBoot != nil && life.WaitReason != ""
 	})
 	if life.Status != "queued" || life.Machine != "nonomiya" || life.RentalBoot.Datacenter != "AP-IN-1" ||
-		!strings.Contains(life.WaitReason, "rental "+rental+" is acquiring; its retained worker is not attachable") {
+		!strings.Contains(life.WaitReason, "rental "+rental+" is booting") {
 		t.Fatalf("the waiting run's record: %+v", life)
 	}
 	activeLog := regexp.MustCompile(`boot log active (just now|[0-9]s ago)`)
-	for _, want := range []string{"waiting for nonomiya to boot · 6m", "AP-IN-1 · container not started · boot log active"} {
+	for _, want := range []string{"waiting for " + rental + " to boot · 6m", "AP-IN-1 · container not started · boot log active"} {
 		if !strings.Contains(human, want) || !activeLog.MatchString(human) {
 			t.Fatalf("run list does not say %q with an advancing boot log:\n%s", want, human)
 		}
 	}
 	code, shown := runCozy(t, root, "run", "show", run)
-	if code != 0 || !regexp.MustCompile(`run \d+ queued  paul/minimax-h3/long_form  on nonomiya\n`+
-		`waiting for nonomiya to boot · AP-IN-1 · 6m · container not started · boot log active`).MatchString(shown) {
+	if code != 0 || !regexp.MustCompile(`run \d+ queued  paul/minimax-h3/long_form \S+  on nonomiya\n`+
+		`waiting for `+rental+` to boot · AP-IN-1 · 6m · container not started · boot log active`).MatchString(shown) {
 		t.Fatalf("run show [%d]:\n%s", code, shown)
 	}
 	code, fleet := runCozy(t, root, "rental", "list", "--no-watch")
@@ -169,7 +169,7 @@ func TestWaitingRunNamesItsBootingRental(t *testing.T) {
 			return pattern.MatchString(screen(raw.String()))
 		})
 	}
-	drawn("the boot", regexp.MustCompile(`(?m)^  ▸ waiting for nonomiya to boot · AP-IN-1 · 6m\d+s\n`+
+	drawn("the boot", regexp.MustCompile(`(?m)^  ▸ waiting for `+rental+` to boot · AP-IN-1 · 6m\d+s\n`+
 		`    container not started · boot log active (just now|\ds ago)\n    4 × NVIDIA H100 80GB HBM3 · \$11\.96/hour`))
 
 	// The host goes silent: the boot log stops, and every view says how long ago it moved.
@@ -203,17 +203,17 @@ func TestWaitingRunNamesItsBootingRental(t *testing.T) {
 			"ended_at": started.Add(5 * time.Minute), "failure_code": "provider_never_started", "observed_max_ms": 294_000}}
 	logging = true
 	mu.Unlock()
-	drawn("the replan", regexp.MustCompile(`(?m)^  ▸ boot attempt 2 of rental nonomiya · now EU-RO-1 · 6m\d+s\n`+
+	drawn("the replan", regexp.MustCompile(`(?m)^  ▸ boot attempt 2 of rental `+rental+` · now EU-RO-1 · 6m\d+s\n`+
 		`    replanned from AP-IN-1 after 5m \(no progress past the observed 4\.9m max\)\n`+
 		`    pulling image · boot log active (just now|\ds ago)\n`))
 	until("run show naming the replan", func() bool {
 		_, shown = runCozy(t, root, "run", "show", run)
-		return regexp.MustCompile(`boot attempt 2 of rental nonomiya · replanned from AP-IN-1 after 5m ` +
+		return regexp.MustCompile(`boot attempt 2 of rental ` + rental + ` · replanned from AP-IN-1 after 5m ` +
 			`\(no progress past the observed 4\.9m max\) · now EU-RO-1 · \d+s · pulling image · boot log active`).MatchString(shown)
 	})
 	life, human = list()
 	if life.Status != "queued" || life.RentalBoot == nil || life.RentalBoot.Attempt != 2 ||
-		!strings.Contains(human, "boot attempt 2 of rental nonomiya · ") ||
+		!strings.Contains(human, "boot attempt 2 of rental "+rental+" · ") ||
 		!strings.Contains(human, "now EU-RO-1 · pulling image · boot log active") {
 		t.Fatalf("the run does not continue on the replacement: %+v\n%s", life.RentalBoot, human)
 	}

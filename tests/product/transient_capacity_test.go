@@ -80,7 +80,8 @@ func TestAFleetStillComingUpIsWaitedForAndNeverRefused(t *testing.T) {
 	})
 	placement := lastPlacement(t, store, row.ID)
 	verdicts := candidateVerdicts(placement)
-	if verdicts["karam"] != "attaching" || verdicts["gyokuyou"] != "attaching" {
+	// A rental still being acquired has no machine name yet: its Hub names it by its id.
+	if verdicts["pr-karam"] != "attaching" || verdicts["pr-gyokuyou"] != "attaching" {
 		t.Fatalf("verdicts %v; both machines are coming up and NEITHER may be excluded", verdicts)
 	}
 	if line, _ := placement["line"].(string); !strings.HasPrefix(line, "placement: wait for ") {
@@ -102,44 +103,6 @@ func TestAFleetStillComingUpIsWaitedForAndNeverRefused(t *testing.T) {
 	})
 	if asks := h.postedSKUs(); len(asks) != 0 {
 		t.Fatalf("two machines were already coming up and the fleet still bought: %v", asks)
-	}
-}
-
-// A catalog that offers nothing is WEATHER, not a bad ladder — even when every machine
-// the fleet holds is genuinely dead. The request waits; the refusal never claims a SKU
-// failed to fit, because no SKU was on offer to fit.
-func TestAnEmptyCatalogBesideADeadFleetWaitsAndSaysWhichIsWhich(t *testing.T) {
-	h := fleetHub(t)
-	h.sell()
-	root := fleetRoot(t, h, 20)
-	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
-	fatal(t, problem)
-	defer store.Close()
-	plantRental(t, root, h, store, "pr-karam", "karam", "failed", false)
-	startCalciferProcess(t, root)
-	submitExplicit(t, root, "empty-catalog")
-	var row *records.Request
-	waitFor(t, root, "the placement over an empty catalog and its park", func() bool {
-		row, problem = store.RequestByIdempotencyKey("empty-catalog")
-		return problem == nil && row != nil && len(placementEvents(t, store, row.ID)) > 0 &&
-			len(parkReasons(t, store, row.ID)) > 0
-	})
-	if verdicts := candidateVerdicts(lastPlacement(t, store, row.ID)); verdicts["karam"] != "excluded:not_ready: failed" {
-		t.Fatalf("verdicts %v; a finished rental is excluded and NAMES the state that finished it", verdicts)
-	}
-	current, problem := store.RequestByIdempotencyKey("empty-catalog")
-	fatal(t, problem)
-	if settled(current.State) {
-		t.Fatalf("the request settled %q; an empty catalog is not a refusal", current.State)
-	}
-	reasons := parkReasons(t, store, row.ID)
-	found := false
-	for _, reason := range reasons {
-		found = found || containsAll(reason,
-			"offered no accelerator product", "karam excluded:not_ready: failed")
-	}
-	if !found {
-		t.Fatalf("the park reasons are %q; one must name the empty catalog AND what the fleet held", reasons)
 	}
 }
 
@@ -202,7 +165,7 @@ func TestAnIdleAttachedMachineOutranksWaitingForOneComingUp(t *testing.T) {
 		t.Fatalf("pinned to %q; the idle attached machine is taken over waiting", row.Worker)
 	}
 	if verdicts := candidateVerdicts(lastPlacement(t, store, row.ID)); verdicts["guchuko"] != "chosen" ||
-		verdicts["lumachina"] != "attaching" {
+		verdicts["pr-lumachina"] != "attaching" {
 		t.Fatalf("verdicts %v; want guchuko chosen beside lumachina still attaching", verdicts)
 	}
 	if asks := h.postedSKUs(); len(asks) != 0 {

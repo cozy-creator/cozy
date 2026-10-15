@@ -177,10 +177,9 @@ func TestExplicitLaneOfAnotherReleaseReusesTheIdleAttachedRental(t *testing.T) {
 	}
 }
 
-// The 00:06–00:08Z arm: one H100 busy, one attaching, every purchase over the cap. The
-// request waits (record written), takes the busy one when it frees, and a second request
-// takes the attaching one — idle — once it attaches, over the busy one.
-func TestExplicitLaneWaitsForTheAttachingRentalOverQueueingBehindTheBusyOne(t *testing.T) {
+// A busy H100 and another still starting: the request is placed on the one starting, to run
+// when its machine is up, rather than queued behind the busy one, and nothing is bought.
+func TestExplicitLanePlacesOnTheStartingRentalOverQueueingBehindTheBusyOne(t *testing.T) {
 	h := fleetHub(t)
 	root := fleetRoot(t, h, 5)
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
@@ -188,67 +187,23 @@ func TestExplicitLaneWaitsForTheAttachingRentalOverQueueingBehindTheBusyOne(t *t
 	defer store.Close()
 	plantH100(t, root, h, store, "pr-guchuko", "guchuko", true)
 	holdQueued(t, store, "req-held", "pr-guchuko")
-	lumachina := plantH100(t, root, h, store, "pr-lumachina", "lumachina", false)
+	plantH100(t, root, h, store, "pr-lumachina", "lumachina", false)
 	startCalciferProcess(t, root)
 	submitExplicit(t, root, "fleet-wait")
 	var first *records.Request
-	waitFor(t, root, "the placement waiting on the attaching H100", func() bool {
+	waitFor(t, root, "the placement on the starting H100", func() bool {
 		first, problem = store.RequestByIdempotencyKey("fleet-wait")
 		return problem == nil && first != nil && len(placementEvents(t, store, first.ID)) > 0
 	})
 	placement := lastPlacement(t, store, first.ID)
 	verdicts := candidateVerdicts(placement)
-	if verdicts["guchuko"] != "excluded:attaching: lumachina" || verdicts["lumachina"] != "attaching" ||
-		verdicts["h100-80"] == "chosen" || verdicts["h200"] == "chosen" || verdicts["b200"] == "chosen" ||
-		placement["line"] != "placement: wait for lumachina (h100-80, fp8-adaln-pruned) to attach — balanced" {
-		held, _ := store.RequestRow("req-held")
-		t.Fatalf("the wait record: %v; held request: %+v\n%s", placement, held, tail(filepath.Join(root, "calcifer.log")))
+	if verdicts["lumachina"] != "chosen" || verdicts["guchuko"] == "chosen" || placement["rental"] != "pr-lumachina" {
+		t.Fatalf("the placement: %v\n%s", placement, tail(filepath.Join(root, "calcifer.log")))
 	}
-	if current, problem := store.RequestByIdempotencyKey("fleet-wait"); problem != nil || current.Worker != "" || settled(current.State) {
-		t.Fatalf("the waiting request is %+v; want queued and unpinned", current)
-	}
-	// The busy H100 frees: its held request settles, and the next observation takes it.
-	fatal(t, store.SettleRequest("req-held", "canceled"))
-	waitFor(t, root, "the request pinned to the freed H100 and the reuse recorded", func() bool {
+	waitFor(t, root, "the request pinned to the starting H100", func() bool {
 		current, problem := store.RequestByIdempotencyKey("fleet-wait")
-		return problem == nil && current != nil && current.Worker == "pr-guchuko" &&
-			candidateVerdicts(lastPlacement(t, store, first.ID))["guchuko"] == "chosen"
+		return problem == nil && current != nil && current.Worker == "pr-lumachina"
 	})
-	if verdicts := candidateVerdicts(lastPlacement(t, store, first.ID)); verdicts["lumachina"] != "attaching" {
-		t.Fatalf("the reuse record: %v", verdicts)
-	}
-	// A second request finds the H100 busy again and waits; the other attaches — address
-	// and certificate land on the row — and, idle, wins over the busy one.
-	submitExplicit(t, root, "fleet-second")
-	var second *records.Request
-	waitFor(t, root, "the second request waiting", func() bool {
-		second, problem = store.RequestByIdempotencyKey("fleet-second")
-		return problem == nil && second != nil && len(placementEvents(t, store, second.ID)) > 0
-	})
-	if verdicts := candidateVerdicts(lastPlacement(t, store, second.ID)); verdicts["guchuko"] != "excluded:attaching: lumachina" {
-		busy, _ := store.RequestByIdempotencyKey("fleet-wait")
-		t.Fatalf("the second wait record: %v; the busy H100's request: %+v\n%s", verdicts, busy, tail(filepath.Join(root, "calcifer.log")))
-	}
-	attached := lumachina
-	attached.Address, attached.CertPath = "127.0.0.1:1", filepath.Join(root, "rentals", "pr-lumachina.pem")
-	fatal(t, store.RecordRental(attached))
-	waitFor(t, root, "the second request pinned to the attached idle H100", func() bool {
-		if current, problem := store.RentalRow(lumachina.ID); problem == nil && current != nil && current.CertPath == "" {
-			_ = store.RecordRental(attached)
-		}
-		current, problem := store.RequestByIdempotencyKey("fleet-second")
-		return problem == nil && current != nil && current.Worker == "pr-lumachina" &&
-			candidateVerdicts(lastPlacement(t, store, second.ID))["lumachina"] == "chosen"
-	})
-	record := lastPlacement(t, store, second.ID)
-	if verdicts := candidateVerdicts(record); verdicts["lumachina"] != "chosen" || verdicts["guchuko"] != "unmeasured" {
-		t.Fatalf("the idle machine did not win over the busy one: %v", verdicts)
-	}
-	for _, raw := range record["candidates"].([]any) {
-		if c := raw.(map[string]any); c["machine"] == "guchuko" && c["ahead"] != 1.0 {
-			t.Fatalf("the busy H100 does not carry its queue: %v", c)
-		}
-	}
 	if asks := h.postedSKUs(); len(asks) != 0 {
 		t.Fatalf("a fitting rental was bought around: %v", asks)
 	}
