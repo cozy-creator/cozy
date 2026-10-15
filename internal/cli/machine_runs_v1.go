@@ -524,24 +524,28 @@ func (m *machineRuns) specV1(ctx context.Context, request records.Request, machi
 		spec.Source = &v1.RunSpec_Release{Release: &v1.Release{Package: request.Package, Release: request.Release}}
 	}
 	began = time.Now()
+	// Inputs are written side by side, eight at a time: each write is a round trip or more.
+	var (
+		wait    sync.WaitGroup
+		mu      sync.Mutex
+		failure *exit.Error
+		slots   = make(chan struct{}, 8)
+	)
 	for _, asset := range request.Assets {
-		if asset.MediaType == resultfiles.TreeMediaType && asset.Snapshot != nil {
-			// A Tree input: each member the run captured, then its manifest, which the input names.
-			if problem := writeTreeV1(ctx, machine, asset.Snapshot); problem != nil {
-				return nil, problem
-			}
-		} else {
-			// The bytes the run captured at submission: its snapshot's member, else the file itself.
-			path := asset.LocalPath
-			if asset.Snapshot != nil && asset.Snapshot.Path != "" {
-				path = filepath.Join(asset.Snapshot.Path+".files", strings.TrimPrefix(asset.Digest, "sha256:"))
-			}
-			if problem := writeHeldV1(ctx, machine, path, asset.Digest, asset.Length); problem != nil {
-				return nil, problem
-			}
-		}
+		wait.Go(func() {
+			slots <- struct{}{}
+			defer func() { <-slots }()
+			problem := writeInputV1(ctx, machine, asset)
+			mu.Lock()
+			defer mu.Unlock()
+			failure = cmp.Or(failure, problem)
+		})
 		spec.Inputs = append(spec.Inputs, &v1.InputFile{Field: asset.FieldPath, Digest: asset.Digest,
 			Length: uint64(asset.Length), MediaType: asset.MediaType, Order: asset.Order})
+	}
+	wait.Wait()
+	if failure != nil {
+		return nil, failure
 	}
 	if len(request.Assets) > 0 {
 		m.submissionStage(request.ID, "inputs", fmt.Sprintf("%d input(s)", len(request.Assets)), began)
@@ -720,6 +724,19 @@ func (m *machineRuns) writeTreesV1(ctx context.Context, request records.Request,
 	}
 	m.submissionStage(request.ID, "trees", request.Trees, began)
 	return nil
+}
+
+// writeInputV1 writes one input as the run captured it: a tree's members, then its manifest,
+// which the input names; else the file's bytes (its snapshot's member, else the file itself).
+func writeInputV1(ctx context.Context, machine *machines.V1, asset records.AssetBinding) *exit.Error {
+	if asset.MediaType == resultfiles.TreeMediaType && asset.Snapshot != nil {
+		return writeTreeV1(ctx, machine, asset.Snapshot)
+	}
+	path := asset.LocalPath
+	if asset.Snapshot != nil && asset.Snapshot.Path != "" {
+		path = filepath.Join(asset.Snapshot.Path+".files", strings.TrimPrefix(asset.Digest, "sha256:"))
+	}
+	return writeHeldV1(ctx, machine, path, asset.Digest, asset.Length)
 }
 
 // writeTreeV1 writes a captured tree to the machine: each member file, then the manifest.
