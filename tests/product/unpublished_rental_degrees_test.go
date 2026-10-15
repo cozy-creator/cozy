@@ -91,7 +91,7 @@ func TestUnpublishedRentalPreservesSelectedFunctionDegrees(t *testing.T) {
 				t.Fatalf("a local package carried Python %q; its machine selects one within its bounds", constraints.PythonVersion)
 			}
 			for _, width := range []int{2, 4, 8} {
-				verdict := rental.WidthUnusable(width, arm.function == "segment", constraints)
+				verdict := rental.WidthUnusable(width, false, constraints)
 				if (verdict == "") != slices.Contains(arm.want, width) {
 					t.Fatalf("width %d got %q for authored degrees %v", width, verdict, arm.want)
 				}

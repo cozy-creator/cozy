@@ -165,7 +165,7 @@ func TestEndpointRunSignsWithItsRentalKey(t *testing.T) {
 		case r.URL.Path == "/v1/rentals/pr-standin" && standin != nil:
 			_, _ = w.Write(standin)
 		case r.URL.Path == "/v1/execution-environment":
-			_ = json.NewEncoder(w).Encode(map[string]any{"environment": map[string]string{"TENSORHUB_ORIGIN": hubServer.URL}})
+			_ = json.NewEncoder(w).Encode(map[string]any{"environment": map[string]string{"TENSORHUB_ORIGIN": hubServer.URL, "TENSORHUB_PUBLIC_ORIGIN": hubServer.URL}})
 		default:
 			http.NotFound(w, r)
 		}
@@ -262,7 +262,7 @@ func TestEndpointRunSignsWithItsRentalKey(t *testing.T) {
 	must(t, err)
 	code, submitted := run()
 	var accepted struct {
-		ID string `json:"id"`
+		ID string `json:"run"`
 	}
 	if code != 0 || json.Unmarshal([]byte(lastJSONLine(submitted)), &accepted) != nil || accepted.ID == "" {
 		t.Fatalf("the rental-signed run was not accepted [exit %d]\n%s", code, submitted)

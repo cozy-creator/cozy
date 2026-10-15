@@ -104,7 +104,7 @@ def picture(payload:Request,out:Outputs)->Picture:
 	defer store.Close()
 	for _, explicit := range []bool{false, true} {
 		directory := defaultDir
-		args := []string{"run", "local/media-export-proof/picture", "--await", "--json"}
+		args := []string{"run", "local/media-export-proof/picture", "--await", "--json", "--full"}
 		if explicit {
 			directory = filepath.Join(root, "custom-output")
 			args = append(args, "--out", directory)
