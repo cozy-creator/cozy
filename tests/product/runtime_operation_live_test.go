@@ -114,8 +114,11 @@ async def main(ctx):
 	}
 	bindings, problem := store.ChildBindings(plain.InstallID)
 	fatal(t, problem)
-	if len(bindings) != 0 {
-		t.Fatal("unrelated script eagerly prepared a numerical operation")
+	// Its own main is its only callable.
+	for _, binding := range bindings {
+		if binding.ChildInstallID != plain.InstallID {
+			t.Fatalf("unrelated script eagerly prepared a numerical operation: %+v", binding)
+		}
 	}
 	var first []machineChildProof
 	for i := range 2 {
@@ -170,7 +173,7 @@ async def main(ctx):
 			// The source and the builtin quantize write weights, so they are never memoized:
 			// they run again and TensorFS answers each derivation with the same checkpoint.
 			for index := range 2 {
-				if string(children[index].Result) != string(first[index].Result) {
+				if checkpointOf(t, children[index].Result) != checkpointOf(t, first[index].Result) {
 					t.Fatalf("caller edit changed a Runtime derivation: first=%+v edited=%+v", first, children)
 				}
 			}
