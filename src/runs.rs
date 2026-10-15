@@ -577,6 +577,19 @@ impl Runs {
                 true => self.warm_models(actor, id, &spec, &*observe, stoppable)?,
                 false => vec![],
             };
+            // A function's warm run ends holding what its constructions read (`downloaded`).
+            if let (Some(plan), Some(publisher)) = (&plan, &self.publisher) {
+                let fetch = crate::access::Fetch::new(publisher.store().clone(), hub.clone(), plan.manifests(), u64::MAX);
+                let selected: Vec<_> = plan.selections().into_iter().map(|s| (s.manifest, s.components)).collect();
+                let report = |done, total| observe("downloading its weights", done, total);
+                fetch.download(&selected, &stoppable.stop, &report).map_err(|e| match stoppable.stop.is_cancelled() {
+                    true => refused(crate::published::CANCELED, "the run was canceled while it downloaded"),
+                    false => {
+                        let text = e.to_string();
+                        refused(if text.starts_with("machine_disk_full") { "machine_disk_full" } else { "model_fetch_failed" }, text)
+                    }
+                })?;
+            }
             // The installed release and its interface, in the warm run's result.
             let installed = json!({"package": installation.package, "release": installation.release,
                 "interface": interface});

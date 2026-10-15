@@ -227,6 +227,27 @@ impl Fetch {
         Ok(())
     }
 
+    /// `keep`, then wait until it is all here, reporting its bytes (a warm run of a function).
+    pub fn download(&self, selected: &[(String, Vec<String>)], stop: &PullCancellation, progress: &(dyn Fn(u64, u64) + Sync)) -> io::Result<()> {
+        self.keep(selected)?;
+        let kept = self.kept.lock().unwrap();
+        std::thread::scope(|scope| {
+            let waits: Vec<_> = kept.iter().map(|ticket| scope.spawn(move || ticket.wait(&[], stop))).collect();
+            loop {
+                let sum = kept.iter().map(Ticket::progress).fold((0, 0), |(d, t), (dd, tt)| (d + dd, t + tt));
+                progress(sum.0, sum.1);
+                if waits.iter().all(|wait| wait.is_finished()) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            for wait in waits {
+                wait.join().map_err(|_| io::Error::other("a download wait panicked"))?.map_err(failed)?;
+            }
+            Ok(())
+        })
+    }
+
     /// Its waits fail, its channels close and every ticket it holds drops.
     pub fn end(&self) {
         let mut channels = self.channels.lock().unwrap();
