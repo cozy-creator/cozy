@@ -56,6 +56,7 @@ func TestModelQuantizeRunsTheServingPackagesQuantizer(t *testing.T) {
 		"no installed package quantizes":    {"proof/source", "--fp8"},
 		"proof/quantize 1.0.0 has no mxfp8": {"proof/source", "--mxfp8", "--package", "proof/quantize"},
 		"weights output named mxfp8":        {"proof/source", "--mxfp8", "--package", "proof/quantize"},
+		"proof/quantize 1.0.0 has no int8":  {"proof/source", "--int8", "--package", "proof/quantize"},
 		"is a local alias":                  {"local/source", "--fp8"},
 	} {
 		if code, out := runCozy(t, root, append([]string{"model", "quantize", "--rental-only"}, args...)...); code == 0 || !strings.Contains(out, name) {
