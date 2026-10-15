@@ -219,18 +219,21 @@ pub fn write_session(store_root: &Path, root: &IngestSession) -> Result<()> {
     };
     let dir = candidate_dir(store_root, &root.session);
     fs::create_dir_all(&dir).map_err(|e| io("mkdir ingest candidate", e))?;
-    fs::write(dir.join("session.json"), root.canonical_bytes())
-        .map_err(|e| io("write ingest session", e))
+    // Renamed into place: a concurrent reader sees the whole root or none, never a torn one.
+    let staged = dir.join(format!("session.json.{}", crate::meta::now_nanos_unique()));
+    fs::write(&staged, root.canonical_bytes()).map_err(|e| io("write ingest session", e))?;
+    fs::rename(&staged, dir.join("session.json")).map_err(|e| io("install ingest session", e))
 }
 
 pub fn read_session(store_root: &Path, session: &str) -> Result<IngestSession> {
     let p = candidate_dir(store_root, session).join("session.json");
     match fs::read(&p) {
         Ok(b) => IngestSession::parse(&b),
-        Err(_) => refuse(
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => refuse(
             Code::ROOT_ABSENT,
             format!("no ingest session {session:?}: reaped, never created, or already installed"),
         ),
+        Err(e) => Err(io("read ingest session", e)),
     }
 }
 

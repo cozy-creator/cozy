@@ -1283,20 +1283,17 @@ fn resolve_with(
     })
 }
 
-/// Resolve only explicitly named ordinary files at one immutable HF revision.
-/// No suffix has special meaning here: selecting Python bytes never executes them,
-/// and selecting an index does not expand it into tensor shards. Tensor carriers
-/// continue to use `resolve` and reviewed profile/carrier selection.
-///
-/// A name ending in `/` selects every ordinary file under that folder (a tokenizer or
-/// processor, whose file set varies by class); tensor carriers there are never selected.
+/// Resolve the ordinary files `wanted` selects at one immutable HF revision, from one
+/// listing; `None` when it selects none. Selecting Python bytes never executes them, and
+/// selecting an index does not expand it into tensor shards: tensor carriers are never
+/// selected here, they continue to use `resolve` and reviewed profile/carrier selection.
 pub fn resolve_files(
     uri: &SourceUri,
-    files: &[String],
+    wanted: &dyn Fn(&str) -> bool,
     endpoints: &Endpoints,
     credentials: &dyn CredentialProvider,
     deadline: Deadline,
-) -> Result<Resolution> {
+) -> Result<Option<Resolution>> {
     let SourceUri::HuggingFace {
         org,
         repo,
@@ -1308,70 +1305,26 @@ pub fn resolve_files(
             "ordinary file selection requires HuggingFace",
         );
     };
-    if files.is_empty() || files.len() > MEMBER_MAX {
-        return refuse(
-            Code::COUNT_CAP,
-            "ordinary file selection count is outside the bound",
-        );
-    }
-    let (folders, mut names): (Vec<String>, Vec<String>) =
-        files.iter().cloned().partition(|name| name.ends_with('/'));
-    names.sort();
-    names.dedup();
-    if names
-        .iter()
-        .chain(&folders)
-        .map(|name| name.trim_end_matches('/'))
-        .any(|name| !member_path(name) || crate::manifest::check_path(name).is_err())
-    {
-        return refuse(
-            Code::PATH_ILLEGAL,
-            "ordinary file selection requires exact member or folder paths",
-        );
-    }
     let ledger = Ledger::new();
     let policy = endpoints.policy(uri);
-    let filter = folders.is_empty().then_some(names.as_slice());
     let listed =
-        list_selected_observed(uri, endpoints, credentials, deadline, &ledger, filter, None)?;
-    for folder in &folders {
-        let before = names.len();
-        names.extend(
-            listed
-                .iter()
-                .filter(|m| m.member.starts_with(folder.as_str()))
-                .filter(|m| !is_safetensors(&m.member) && !is_index(&m.member))
-                .map(|m| m.member.clone()),
-        );
-        if names.len() == before {
-            return refuse(
-                Code::MISSING_FIELD,
-                format!("the source has no ordinary file under {folder:?}"),
-            );
-        }
+        list_selected_observed(uri, endpoints, credentials, deadline, &ledger, None, None)?;
+    let mut selected: Vec<&SourceMember> = listed
+        .iter()
+        .filter(|m| !is_safetensors(&m.member) && !is_index(&m.member))
+        .filter(|m| crate::manifest::check_path(&m.member).is_ok() && wanted(&m.member))
+        .collect();
+    selected.sort_by(|a, b| a.member.cmp(&b.member));
+    selected.dedup_by(|a, b| a.member == b.member);
+    if selected.is_empty() {
+        return Ok(None);
     }
-    names.sort();
-    names.dedup();
-    if names.len() > MEMBER_MAX {
+    if selected.len() > MEMBER_MAX {
         return refuse(
             Code::COUNT_CAP,
             "ordinary file selection count is outside the bound",
         );
     }
-    // Establish the whole roster before fetching any body. A missing later member
-    // must not turn a partial requested tree into a successful smaller selection.
-    let selected = names
-        .iter()
-        .map(|name| {
-            listed
-                .iter()
-                .find(|member| &member.member == name)
-                .ok_or_else(|| Refusal {
-                    code: Code::MISSING_FIELD,
-                    detail: format!("the source does not contain requested file {name:?}"),
-                })
-        })
-        .collect::<Result<Vec<_>>>()?;
     let listed_bytes = selected.iter().try_fold(0u64, |total, member| {
         total.checked_add(member.length.unwrap_or(0))
     });
@@ -1442,11 +1395,11 @@ pub fn resolve_files(
         });
     }
     let canonical = format!("hf://{org}/{repo}@{revision}");
-    Ok(Resolution {
+    Ok(Some(Resolution {
         selection_sha256: selection_digest(&canonical, &resolved),
         canonical,
         members: resolved,
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -2278,17 +2231,14 @@ mod tests {
             allow_local: true,
             ..Endpoints::default()
         };
-        let mut names = vec![
-            "config.json".into(),
-            "tokenizer files/tokenizer.json".into(),
-        ];
-        let selected =
-            resolve_files(&uri, &names, &endpoints, &Anonymous, Deadline::none()).unwrap();
-        names.reverse();
-        assert_eq!(
-            selected,
-            resolve_files(&uri, &names, &endpoints, &Anonymous, Deadline::none()).unwrap()
-        );
+        let wanted = |m: &str| m == "config.json" || m == "tokenizer files/tokenizer.json";
+        let resolved = || {
+            resolve_files(&uri, &wanted, &endpoints, &Anonymous, Deadline::none())
+                .unwrap()
+                .unwrap()
+        };
+        let selected = resolved();
+        assert_eq!(selected, resolved());
         assert_eq!(
             selected
                 .members
@@ -2359,21 +2309,14 @@ mod tests {
     }
 
     #[test]
-    fn explicit_files_refuse_missing_and_over_budget_before_fetching_bodies() {
-        for (names, listing, code) in [
-            (
-                vec!["absent.json".into(), "config.json".into()],
-                r#"[{"type":"file","path":"config.json","size":2}]"#.to_string(),
-                Code::MISSING_FIELD,
-            ),
-            (
-                vec!["config.json".into()],
-                format!(
-                    r#"[{{"type":"file","path":"config.json","size":{}}}]"#,
-                    FILE_SELECTION_MAX_BYTES + 1
-                ),
-                Code::SIZE_CAP,
-            ),
+    fn files_select_nothing_absent_and_refuse_over_budget_before_fetching_bodies() {
+        let oversized = format!(
+            r#"[{{"type":"file","path":"config.json","size":{}}}]"#,
+            FILE_SELECTION_MAX_BYTES + 1
+        );
+        for (listing, name, outcome) in [
+            (r#"[{"type":"file","path":"config.json","size":2}]"#.to_string(), "absent.json", None),
+            (oversized, "config.json", Some(Code::SIZE_CAP)),
         ] {
             let (base, _, handle) =
                 origin(1, move |_| ok_body(listing.as_bytes(), "application/json"));
@@ -2383,32 +2326,13 @@ mod tests {
                 allow_local: true,
                 ..Endpoints::default()
             };
-            assert_eq!(
-                resolve_files(&uri, &names, &endpoints, &Anonymous, Deadline::none())
-                    .unwrap_err()
-                    .code,
-                code
-            );
+            let wanted = |m: &str| m == name;
+            let resolved = resolve_files(&uri, &wanted, &endpoints, &Anonymous, Deadline::none());
+            match outcome {
+                None => assert_eq!(resolved.unwrap(), None),
+                Some(code) => assert_eq!(resolved.unwrap_err().code, code),
+            }
             handle.join().unwrap();
-        }
-        let uri = SourceUri::parse(&format!("hf://org/repo@{}", "ab".repeat(20))).unwrap();
-        for names in [
-            vec!["../config.json".into()],
-            vec!["*.json".into()],
-            vec!["/config.json".into()],
-        ] {
-            assert_eq!(
-                resolve_files(
-                    &uri,
-                    &names,
-                    &Endpoints::default(),
-                    &Anonymous,
-                    Deadline::none()
-                )
-                .unwrap_err()
-                .code,
-                Code::PATH_ILLEGAL
-            );
         }
     }
 
@@ -2434,14 +2358,10 @@ mod tests {
             allow_local: true,
             ..Endpoints::default()
         };
-        let selected = resolve_files(
-            &uri,
-            &["tokenizer/".into(), "unet/config.json".into()],
-            &endpoints,
-            &Anonymous,
-            Deadline::none(),
-        )
-        .unwrap();
+        let wanted = |m: &str| m.starts_with("tokenizer/") || m == "unet/config.json";
+        let selected = resolve_files(&uri, &wanted, &endpoints, &Anonymous, Deadline::none())
+            .unwrap()
+            .unwrap();
         let members: Vec<&str> = selected.members.iter().map(|m| m.member.as_str()).collect();
         assert_eq!(
             members,
@@ -2451,17 +2371,10 @@ mod tests {
                 "unet/config.json"
             ]
         );
+        let vae = |m: &str| m.starts_with("vae/");
         assert_eq!(
-            resolve_files(
-                &uri,
-                &["vae/".into()],
-                &endpoints,
-                &Anonymous,
-                Deadline::none()
-            )
-            .unwrap_err()
-            .code,
-            Code::MISSING_FIELD
+            resolve_files(&uri, &vae, &endpoints, &Anonymous, Deadline::none()).unwrap(),
+            None
         );
         handle.join().unwrap();
         assert!(!seen
@@ -2489,16 +2402,11 @@ mod tests {
             allow_local: true,
             ..Endpoints::default()
         };
+        let config = |m: &str| m == "config.json";
         assert_eq!(
-            resolve_files(
-                &uri,
-                &["config.json".into()],
-                &endpoints,
-                &Anonymous,
-                Deadline::none()
-            )
-            .unwrap_err()
-            .code,
+            resolve_files(&uri, &config, &endpoints, &Anonymous, Deadline::none())
+                .unwrap_err()
+                .code,
             Code::LENGTH_MISMATCH
         );
         handle.join().unwrap();
@@ -2524,14 +2432,10 @@ mod tests {
             allow_local: true,
             ..Endpoints::default()
         };
-        let selected = resolve_files(
-            &uri,
-            &["config.json".into()],
-            &endpoints,
-            &Anonymous,
-            Deadline::none(),
-        )
-        .unwrap();
+        let config = |m: &str| m == "config.json";
+        let selected = resolve_files(&uri, &config, &endpoints, &Anonymous, Deadline::none())
+            .unwrap()
+            .unwrap();
         let root = temporary("changed-files");
         let store = Store::init(&root).unwrap();
         let producer = ObjectRef::of(b"changed-files-producer").id();
@@ -2575,14 +2479,10 @@ mod tests {
             allow_local: true,
             ..Endpoints::default()
         };
-        let selected = resolve_files(
-            &uri,
-            &["empty.py".into()],
-            &endpoints,
-            &Anonymous,
-            Deadline::none(),
-        )
-        .unwrap();
+        let empty = |m: &str| m == "empty.py";
+        let selected = resolve_files(&uri, &empty, &endpoints, &Anonymous, Deadline::none())
+            .unwrap()
+            .unwrap();
         assert_eq!(selected.members[0].object, ObjectRef::of(b""));
         let root = temporary("empty-files");
         let store = Store::init(&root).unwrap();

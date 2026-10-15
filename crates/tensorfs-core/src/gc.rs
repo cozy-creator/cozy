@@ -70,7 +70,12 @@ fn holds_except(store: &Store, idle: &[ObjectRef]) -> Result<(Vec<HeldKey>, Vec<
     let mut lines: BTreeMap<String, Vec<u8>> = BTreeMap::new();
     let mut sessions = Vec::new();
     for session in tx::sessions(store) {
-        let root = tx::read_session(store.root(), &session)?;
+        // A root another writer removes (its operation released) or has not yet written
+        // holds nothing; it is not this walk's failure.
+        let root = match tx::read_session(store.root(), &session) {
+            Err(absent) if absent.code == Code::ROOT_ABSENT => continue,
+            root => root?,
+        };
         // An object the operation's publication custodian already holds is not in flight:
         // the journal stops naming it, so the local copy is ordinary unreferenced bytes.
         let custody = crate::ingest::custody::read_session(store.root(), &session)?;
@@ -578,6 +583,49 @@ mod tests {
         lease.release(&meta).unwrap();
         collect(&root, false).unwrap();
         assert!(!present(&leased));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A concurrent ingest that creates and releases its own session root (run 6801 failed
+    /// composing on ROOT_ABSENT naming its neighbour 6802's released conversion) never fails
+    /// a walk of the others, which keep their holds.
+    #[test]
+    fn a_session_released_during_the_walk_fails_no_one() {
+        let root = std::env::temp_dir().join(format!(
+            "tensorfs-gc-released-{}-{}",
+            std::process::id(),
+            meta::now_nanos_unique()
+        ));
+        let store = Store::init(&root).unwrap();
+        let held = store
+            .put_stream(&mut &b"a live session's candidate"[..], None, &Fault::default())
+            .unwrap()
+            .obj;
+        tx::ensure_session_root(&root, "live", "_tensorfs").unwrap();
+        tx::name_candidates(&root, "live", std::slice::from_ref(&held)).unwrap();
+        let holds = |store: &Store| {
+            let (holds, sessions) = session_holds(store).unwrap();
+            assert!(sessions.contains(&"live".to_string()), "{sessions:?}");
+            assert!(holds.iter().any(|hold| hold.sha256 == held.sha256));
+        };
+        // Its directory is still there, its root already gone.
+        fs::create_dir_all(tx::candidate_dir(&root, "leaving")).unwrap();
+        holds(&store);
+        let churn = std::thread::spawn({
+            let root = root.clone();
+            let held = held.clone();
+            move || {
+                for _ in 0..300 {
+                    tx::ensure_session_root(&root, "churn", "_tensorfs").unwrap();
+                    tx::name_candidates(&root, "churn", std::slice::from_ref(&held)).unwrap();
+                    fs::remove_dir_all(tx::candidate_dir(&root, "churn")).unwrap();
+                }
+            }
+        });
+        while !churn.is_finished() {
+            holds(&store);
+        }
+        churn.join().unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 }

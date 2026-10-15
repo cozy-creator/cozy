@@ -6,9 +6,11 @@
 //! A source is `hf://<org>/<repo>@<40-hex>[/<member>]`, `civitai://<version>[/<file>]`, or
 //! `object://sha256:<hex>/<file>`: a file this Store already holds (a client wrote it), made
 //! like a Civitai single file with no provider at all.
-//! A Hugging Face repository brings its Diffusers index, each component's config and its
-//! tokenizers; a source with no index (a Civitai single file) takes them from its converters'
-//! pinned reference repository. Members and the conversion journal stay retained until the
+//! A Hugging Face repository is the model its own layout describes: a Diffusers pipeline's
+//! components with its index, each component's config and its tokenizers, or an as-is
+//! Transformers model's root weights with its config, tokenizer, processor and chat
+//! templates. A source with neither (a Civitai single file) takes its configs from its
+//! converters' pinned reference repository. Members and the conversion journal stay retained until the
 //! model is committed, so an interrupted call resumes where it stopped.
 
 use std::collections::BTreeMap;
@@ -33,6 +35,16 @@ const FORMAT: &str = "cozy.source-model/1";
 /// The documents a Hugging Face Diffusers repository names its pipeline components in.
 const DIFFUSERS_INDEXES: [&str; 2] = ["model_index.json", "modular_model_index.json"];
 const ASSET_KINDS: [&str; 3] = ["Tokenizer", "Processor", "FeatureExtractor"];
+/// A Transformers tokenizer's root files beside `tokenizer.*` and `*_config.json`.
+const TOKENIZER_FILES: [&str; 7] = [
+    "special_tokens_map.json",
+    "added_tokens.json",
+    "vocab.json",
+    "vocab.txt",
+    "merges.txt",
+    "spiece.model",
+    "sentencepiece.bpe.model",
+];
 /// Config keys a saved config carries that name where it was saved from; a construction
 /// config never names a source, so these are dropped.
 const PATH_SUFFIXES: [&str; 5] = ["_path", "_dir", "_file", "_url", "_repo"];
@@ -160,54 +172,129 @@ impl Provider {
         Ok(read.heads)
     }
 
-    /// The named ordinary files the pinned revision holds; one it lacks is not selected.
-    fn files(&self, names: &[String]) -> Result<Option<Resolution>> {
-        match providers::resolve_files(
+    /// The ordinary files `wanted` selects at the pinned revision, from one listing.
+    fn files(&self, wanted: &dyn Fn(&str) -> bool) -> Result<Option<Resolution>> {
+        providers::resolve_files(
             &self.uri,
-            names,
+            wanted,
             &self.endpoints,
             &self.credentials,
             Deadline::none(),
-        ) {
-            Ok(found) => Ok(Some(found)),
-            Err(refusal) if refusal.code == Code::MISSING_FIELD => {
-                let mut found: Option<Resolution> = None;
-                for name in names.iter().filter(|_| names.len() > 1) {
-                    if let Some(one) = self.files(std::slice::from_ref(name))? {
-                        found = Some(match found {
-                            Some(all) => merge(all, one),
-                            None => one,
-                        });
-                    }
-                }
-                Ok(found)
-            }
-            Err(refusal) => Err(refusal),
+        )
+    }
+
+    /// One small document of `found`, whole.
+    fn document(&self, found: &Resolution, member: &str) -> Result<Option<Vec<u8>>> {
+        let Some(row) = found.members.iter().find(|row| row.member == member) else {
+            return Ok(None);
+        };
+        let one = Resolution {
+            members: vec![row.clone()],
+            ..found.clone()
+        };
+        Ok(self.heads(&one)?.into_iter().next().map(|head| head.head))
+    }
+
+    /// The repository's own layout: a Diffusers pipeline, else a Transformers model.
+    fn layout(&self) -> Result<Option<Layout>> {
+        match self.diffusers()? {
+            Some(layout) => Ok(Some(layout)),
+            None => self.transformers(),
         }
     }
 
     /// A Diffusers repository's index, each component's construction config and every
     /// tokenizer or processor file.
-    fn diffusers(&self) -> Result<Option<Resolution>> {
+    fn diffusers(&self) -> Result<Option<Layout>> {
+        let Some(indexes) = self.files(&|m| DIFFUSERS_INDEXES.contains(&m))? else {
+            return Ok(None);
+        };
         for index in DIFFUSERS_INDEXES {
-            let Some(pinned) = self.files(&[index.to_string()])? else {
-                continue;
-            };
-            let heads = self.heads(&pinned)?;
-            let Some(body) = heads.first().map(|h| h.head.clone()) else {
+            let Some(body) = self.document(&indexes, index)? else {
                 continue;
             };
             let components = components(&body)?;
-            let mut names = vec![index.to_string()];
-            let mut configs: Vec<_> = constructors(&components).into_values().collect();
-            configs.sort();
-            configs.dedup();
-            names.extend(configs);
-            names.extend(assets(&components));
-            return self.files(&names);
+            let configs: Vec<_> = constructors(&components).into_values().collect();
+            let folders = assets(&components);
+            let wanted = |m: &str| {
+                m == index
+                    || configs.iter().any(|c| c == m)
+                    || folders.iter().any(|f| m.starts_with(f.as_str()))
+            };
+            let weights = components
+                .values()
+                .filter(|(kind, _)| !asset(kind))
+                .map(|(_, folder)| format!("{folder}/"))
+                .collect();
+            return Ok(self
+                .files(&wanted)?
+                .map(|files| Layout::Diffusers { files, weights }));
         }
         Ok(None)
     }
+
+    /// A Transformers repository: a root `config.json` naming its model, with the root's
+    /// generation config, tokenizer, processor and chat template files.
+    fn transformers(&self) -> Result<Option<Layout>> {
+        let Some(found) = self.files(&transformers_file)? else {
+            return Ok(None);
+        };
+        let Some(config) = self.document(&found, "config.json")? else {
+            return Ok(None);
+        };
+        let named = match jcs::parse(&config, crate::limits::DOC_MAX_BYTES) {
+            Ok(Json::Obj(fields)) => fields
+                .iter()
+                .any(|(key, _)| key == "model_type" || key == "architectures"),
+            _ => false,
+        };
+        Ok(named.then_some(Layout::Transformers(found)))
+    }
+}
+
+/// What a Hugging Face repository builds its model from beside the tensors, by its own layout.
+enum Layout {
+    /// A Diffusers pipeline: its index, component configs and asset folders, and the folders
+    /// of the components that hold weights.
+    Diffusers { files: Resolution, weights: Vec<String> },
+    /// A Transformers model at the repository root: its config and root metadata files.
+    Transformers(Resolution),
+}
+
+impl Layout {
+    /// Whether a tensor carrier is part of the model the layout describes: one of the
+    /// pipeline's components, or the root `model.safetensors[.index.json]` Transformers
+    /// loads (not a native `consolidated.safetensors` beside it).
+    fn holds(&self, member: &str) -> bool {
+        match self {
+            Layout::Diffusers { weights, .. } => {
+                weights.iter().any(|folder| member.starts_with(folder.as_str()))
+            }
+            Layout::Transformers(_) => {
+                !member.contains('/') && (member.starts_with("model.") || member.starts_with("model-"))
+            }
+        }
+    }
+
+    fn files(self) -> Resolution {
+        match self {
+            Layout::Diffusers { files, .. } | Layout::Transformers(files) => files,
+        }
+    }
+}
+
+/// A Transformers model's root metadata: its configs (`config.json`, `*_config.json`),
+/// tokenizer and processor files and chat templates.
+fn transformers_file(member: &str) -> bool {
+    if let Some(template) = member.strip_prefix("additional_chat_templates/") {
+        return !template.contains('/');
+    }
+    !member.contains('/')
+        && (member == "config.json"
+            || member.ends_with("_config.json")
+            || member.starts_with("tokenizer.")
+            || member.starts_with("chat_template")
+            || TOKENIZER_FILES.contains(&member))
 }
 
 /// `{component: (class, folder)}` from a classic or modular Diffusers index.
@@ -276,17 +363,6 @@ fn assets(components: &BTreeMap<String, (String, String)>) -> Vec<String> {
     folders.sort();
     folders.dedup();
     folders
-}
-
-/// Members of two resolutions as one selection (metadata riding beside the carriers).
-fn merge(mut into: Resolution, other: Resolution) -> Resolution {
-    for row in other.members {
-        if !into.members.iter().any(|m| m.member == row.member) {
-            into.members.push(row);
-        }
-    }
-    into.members.sort_by(|a, b| a.member.cmp(&b.member));
-    into
 }
 
 /// Members whose header plans the conversion; ordinary files never are.
@@ -480,6 +556,26 @@ pub fn make(store: &Store, request: &Request) -> Result<Made> {
         Some(provider) => provider.heads(selection),
         None => local_heads(store, selection),
     };
+    let layout = match &provider {
+        Some(provider) if matches!(provider.uri, SourceUri::HuggingFace { .. }) => {
+            provider.layout()?
+        }
+        _ => None,
+    };
+    // Unless a carrier or a reviewed profile is named, the model is what the repository's
+    // layout describes: a pipeline's components or the root Transformers model, never
+    // every folder the repository also carries.
+    let automatic = request.profiles.is_empty() || *request.profiles == [model_source::AS_IS];
+    let own: Vec<String> = resolution
+        .members
+        .iter()
+        .filter(|row| row.carrier && layout.as_ref().is_some_and(|l| l.holds(&row.member)))
+        .map(|row| row.member.clone())
+        .collect();
+    let resolution = match named.is_none() && automatic && !own.is_empty() {
+        true => resolution.select(&own)?,
+        false => resolution,
+    };
     let candidates: Vec<String> = resolution
         .members
         .iter()
@@ -525,22 +621,18 @@ pub fn make(store: &Store, request: &Request) -> Result<Made> {
     let slots = slots(&profiles)?;
 
     // What the model is built from beside its tensors: the repository's own Diffusers index,
-    // configs and tokenizers, or those of its converters' pinned reference repository.
+    // configs and tokenizers, an as-is Transformers model's root config and tokenizer, or
+    // those of its converters' pinned reference repository.
     let mut metadata: Vec<(Provider, Resolution)> = vec![];
-    if let Some(provider) = provider
-        .as_ref()
-        .filter(|p| matches!(p.uri, SourceUri::HuggingFace { .. }))
-    {
-        if let Some(found) = provider.diffusers()? {
-            metadata.push((
-                Provider::new(
-                    provider.uri.clone(),
-                    request.access,
-                    &request.access.credential,
-                )?,
-                found,
-            ));
-        }
+    let own_metadata = match layout {
+        Some(Layout::Transformers(_)) if profiles != [model_source::AS_IS] => None,
+        layout => layout,
+    };
+    if let (Some(provider), Some(layout)) = (&provider, own_metadata) {
+        metadata.push((
+            Provider::new(provider.uri.clone(), request.access, &request.access.credential)?,
+            layout.files(),
+        ));
     }
     if metadata.is_empty() {
         let mut references = vec![];
@@ -568,7 +660,7 @@ pub fn make(store: &Store, request: &Request) -> Result<Made> {
                 code: Code::MISSING_FIELD,
                 detail: format!("converter reference {reference} has no pipeline index"),
             })?;
-            metadata.push((reference_provider, found));
+            metadata.push((reference_provider, found.files()));
         }
     }
 
@@ -805,7 +897,7 @@ fn compose(
             }
         }
     }
-    let added = added_configs(store, metadata)?;
+    let (added, objects) = metadata_files(store, metadata)?;
     for name in added.keys() {
         if bodies.contains_key(name) {
             return refuse(
@@ -817,7 +909,6 @@ fn compose(
             target: name.clone(),
         });
     }
-    let objects = asset_files(store, metadata)?;
     let declaration = Declaration {
         work_fingerprint: Some(computation.to_string()),
         sources,
@@ -870,62 +961,71 @@ fn document(store: &Store, object: &ObjectRef) -> Result<Vec<u8>> {
     Ok(body)
 }
 
-fn index(metadata: &[providers::ResolvedMember]) -> Option<&providers::ResolvedMember> {
-    metadata
-        .iter()
-        .find(|row| DIFFUSERS_INDEXES.contains(&row.member.as_str()))
-}
-
-/// The pipeline index (by its stem) and each component's construction config (by its
-/// component), as landed beside the carriers.
-fn added_configs(
+/// The configs (by name) and asset files a model takes from the metadata landed beside its
+/// carriers: a Diffusers index (by its stem) with each component's construction config and
+/// its tokenizer and processor folders, or a Transformers root `config.json` (the lone
+/// component `model`'s) with its root tokenizer, processor and template files.
+#[allow(clippy::type_complexity)]
+fn metadata_files(
     store: &Store,
     metadata: &[providers::ResolvedMember],
-) -> Result<BTreeMap<String, Vec<u8>>> {
-    let Some(found) = index(metadata) else {
-        return Ok(BTreeMap::new());
+) -> Result<(BTreeMap<String, Vec<u8>>, Vec<(String, ObjectRef)>)> {
+    let row = |path: &str| metadata.iter().find(|row| row.member == path);
+    let files = |keep: &dyn Fn(&str) -> bool| {
+        metadata
+            .iter()
+            .filter(|row| keep(&row.member))
+            .map(|row| (row.member.clone(), row.object.clone()))
+            .collect()
     };
-    let body = document(store, &found.object)?;
-    let mut added = BTreeMap::new();
-    for (name, path) in constructors(&components(&body)?) {
-        if let Some(row) = metadata.iter().find(|row| row.member == path) {
-            added.insert(name, constructible(document(store, &row.object)?)?);
+    let mut configs = BTreeMap::new();
+    if let Some(index) = DIFFUSERS_INDEXES.iter().find_map(|name| row(name)) {
+        let body = document(store, &index.object)?;
+        let components = components(&body)?;
+        for (name, path) in constructors(&components) {
+            if let Some(found) = row(&path) {
+                configs.insert(name, constructible(document(store, &found.object)?)?);
+            }
+        }
+        configs.insert(index.member.trim_end_matches(".json").to_string(), body);
+        let folders = assets(&components);
+        return Ok((configs, files(&|m| folders.iter().any(|f| m.starts_with(f.as_str())))));
+    }
+    let Some(config) = row("config.json") else {
+        return Ok((configs, vec![]));
+    };
+    configs.insert("model".into(), constructible(document(store, &config.object)?)?);
+    Ok((configs, files(&|m| m != "config.json")))
+}
+
+/// A saved config minus its private save-time keys (`_name_or_path`), at any depth.
+fn constructible(config: Vec<u8>) -> Result<Vec<u8>> {
+    fn strip(value: &mut Json) -> bool {
+        match value {
+            Json::Obj(fields) => {
+                let before = fields.len();
+                fields.retain(|(key, _)| {
+                    let lower = key.to_lowercase();
+                    !(key.starts_with('_') && PATH_SUFFIXES.iter().any(|s| lower.ends_with(s)))
+                });
+                let mut changed = fields.len() != before;
+                for (_, field) in fields.iter_mut() {
+                    changed |= strip(field);
+                }
+                changed
+            }
+            Json::Arr(items) => items.iter_mut().fold(false, |changed, item| strip(item) | changed),
+            _ => false,
         }
     }
-    added.insert(found.member.trim_end_matches(".json").to_string(), body);
-    Ok(added)
-}
-
-/// A saved config minus its private save-time keys (`_name_or_path`).
-fn constructible(config: Vec<u8>) -> Result<Vec<u8>> {
-    let Json::Obj(mut document) = jcs::parse(&config, crate::limits::DOC_MAX_BYTES)? else {
+    let mut document = jcs::parse(&config, crate::limits::DOC_MAX_BYTES)?;
+    if !matches!(document, Json::Obj(_)) {
         return refuse(Code::WRONG_TYPE, "a component config is not an object");
-    };
-    let before = document.len();
-    document.retain(|(key, _)| {
-        let lower = key.to_lowercase();
-        !(key.starts_with('_') && PATH_SUFFIXES.iter().any(|s| lower.ends_with(s)))
-    });
-    if document.len() == before {
-        return Ok(config);
     }
-    Ok(jcs::write(&Json::Obj(document)))
-}
-
-/// Every tokenizer and processor file landed beside the carriers, by reference.
-fn asset_files(
-    store: &Store,
-    metadata: &[providers::ResolvedMember],
-) -> Result<Vec<(String, ObjectRef)>> {
-    let Some(found) = index(metadata) else {
-        return Ok(vec![]);
-    };
-    let folders = assets(&components(&document(store, &found.object)?)?);
-    Ok(metadata
-        .iter()
-        .filter(|row| folders.iter().any(|f| row.member.starts_with(f.as_str())))
-        .map(|row| (row.member.clone(), row.object.clone()))
-        .collect())
+    Ok(match strip(&mut document) {
+        true => jcs::write(&document),
+        false => config,
+    })
 }
 
 #[cfg(test)]
@@ -959,11 +1059,65 @@ mod tests {
         assert_eq!(built["scheduler"], "scheduler/scheduler_config.json");
         assert!(!built.contains_key("tokenizer"));
         assert_eq!(assets(&found), ["tokenizer/"]);
-        let config = br#"{"_name_or_path":"/x","_class_name":"UNet","sample_size":128}"#.to_vec();
+        let config = br#"{"_name_or_path":"/x","_class_name":"UNet","sample_size":128,
+            "text_config":{"_name_or_path":"y","hidden_size":4}}"#
+            .to_vec();
         let kept = constructible(config).unwrap();
         assert!(!String::from_utf8(kept.clone())
             .unwrap()
             .contains("_name_or_path"));
-        assert!(String::from_utf8(kept).unwrap().contains("_class_name"));
+        assert!(String::from_utf8(kept.clone()).unwrap().contains("_class_name"));
+        assert!(String::from_utf8(kept).unwrap().contains("hidden_size"));
+    }
+
+    #[test]
+    fn a_layout_holds_its_own_model_and_names_its_metadata() {
+        let none = Resolution {
+            canonical: String::new(),
+            members: vec![],
+            selection_sha256: String::new(),
+        };
+        let pipeline = Layout::Diffusers {
+            files: none.clone(),
+            weights: vec!["transformer/".into(), "vae/".into()],
+        };
+        assert!(pipeline.holds("transformer/diffusion_pytorch_model.safetensors.index.json"));
+        for other in ["variants/fp8r/model.safetensors", "model.safetensors", "transformer2/x.safetensors"] {
+            assert!(!pipeline.holds(other), "{other}");
+        }
+        let model = Layout::Transformers(none);
+        assert!(model.holds("model.safetensors") && model.holds("model.safetensors.index.json"));
+        for other in ["consolidated.safetensors", "original/model.safetensors"] {
+            assert!(!model.holds(other), "{other}");
+        }
+        for file in [
+            "config.json",
+            "generation_config.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "tokenizer.model",
+            "special_tokens_map.json",
+            "added_tokens.json",
+            "merges.txt",
+            "vocab.json",
+            "preprocessor_config.json",
+            "processor_config.json",
+            "video_preprocessor_config.json",
+            "chat_template.jinja",
+            "chat_template.json",
+            "additional_chat_templates/tool_use.jinja",
+        ] {
+            assert!(transformers_file(file), "{file}");
+        }
+        for file in [
+            "README.md",
+            "LICENSE",
+            "system_prompts.json",
+            "text_encoder/config.json",
+            "onnx/config.json",
+            "teaser.jpg",
+        ] {
+            assert!(!transformers_file(file), "{file}");
+        }
     }
 }

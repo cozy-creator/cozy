@@ -142,3 +142,65 @@ fn a_held_file_becomes_a_local_model_with_no_provider() {
     assert!(!refused.detail.is_empty());
     let _ = std::fs::remove_dir_all(root);
 }
+
+fn temporary(name: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "source-model-{name}-{}-{}",
+        std::process::id(),
+        tensorfs_core::meta::now_nanos_unique()
+    ))
+}
+
+fn made_header(store: &Store, made: &tensorfs_core::source_model::Made) -> tensorfs_core::header::Header {
+    load_header(
+        store,
+        store.read_manifest(&made.manifest).unwrap().header().unwrap(),
+    )
+    .unwrap()
+}
+
+/// A plain Transformers repository is servable as uploaded: its root model with the config
+/// as the construction config and the tokenizer, processor, generation config and chat
+/// template as assets, never the README.
+#[test]
+#[ignore = "real network: huggingface.co"]
+fn a_transformers_repository_carries_its_config_tokenizer_and_processor() {
+    let root = temporary("transformers");
+    let store = Store::init(&root).unwrap();
+    let progress = |_: &str, _: u64, _: u64| {};
+    let access = Access::default();
+    let made = make(
+        &store,
+        &Request {
+            source: "hf://trl-internal-testing/tiny-Qwen2_5_VLForConditionalGeneration@62f13fe1c31492fb4195c72ec52cbb736f72fefb",
+            profiles: &[],
+            name: "tiny-qwen-vl",
+            access: &access,
+            registry: None,
+            progress: &progress,
+            cancellation: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(made.profiles, ["as-is/1"]);
+    let header = made_header(&store, &made);
+    let components: Vec<_> = header.components.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(components, ["model"]);
+    let configs: Vec<_> = header.configs.iter().map(|(name, _)| name.as_str()).collect();
+    assert!(configs.contains(&"model"), "{configs:?}");
+    let config = &header.configs.iter().find(|(name, _)| name == "model").unwrap().1;
+    assert!(String::from_utf8_lossy(config).contains("\"model_type\""));
+    let assets: Vec<_> = header.assets.iter().map(|(name, _)| name.as_str()).collect();
+    for file in [
+        "chat_template.jinja",
+        "generation_config.json",
+        "preprocessor_config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "video_preprocessor_config.json",
+    ] {
+        assert!(assets.contains(&file), "{file} not in {assets:?}");
+    }
+    assert!(!assets.contains(&"README.md"), "{assets:?}");
+    let _ = std::fs::remove_dir_all(root);
+}
