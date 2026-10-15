@@ -40,7 +40,7 @@ def source_handle(store, source, *, claimed=None, current=lambda: None):
     errors = []
     def serve():
         try:
-            serve_source(store, source, owner.detach(), check_current=current, admit_io=contextlib.nullcontext)
+            serve_source(store, owner.detach(), source.manifest, source.length, check_current=current)
         except Exception as exc:
             errors.append(exc)
     thread = threading.Thread(target=serve, daemon=True)
@@ -137,7 +137,7 @@ def isolation():
         client, owner = socket.socketpair()
         process = subprocess.Popen([sys.executable, __file__, "--isolated-client", store.root, source.manifest, str(source.length), str(client.fileno()), hashlib.sha256(data).hexdigest()], pass_fds=(client.fileno(),))
         client.close()
-        serve_source(store, source, owner.detach(), check_current=lambda: None, admit_io=contextlib.nullcontext)
+        serve_source(store, owner.detach(), source.manifest, source.length)
         assert process.wait(10) == 0
         print("PASS UID65533 cannot open Store and reads 2MiB plus native geometry/identity only through its exact source FD", flush=True)
 

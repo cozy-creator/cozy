@@ -181,3 +181,43 @@ pub fn serve_fetch(
     let grant = fetch::Grant { run, origins: granted, stop: Default::default() };
     py.detach(|| fetch::serve(&fetcher, grant, stream)).or_refuse(py)
 }
+
+/// Serve one exact source's channel on `fd` (a connected Unix stream; ownership passes here)
+/// until its peer closes it: the owner's half of `SourceCapability.from_fd`, for tests and
+/// tools. `check_current` is called before each operation; what it raises ends the channel and
+/// is raised here.
+#[pyfunction]
+#[pyo3(signature = (store, fd, manifest, length, *, check_current=None))]
+pub fn serve_source(
+    py: Python<'_>,
+    store: &PyStore,
+    fd: i32,
+    manifest: &str,
+    length: u64,
+    check_current: Option<Py<PyAny>>,
+) -> PyResult<()> {
+    use std::os::fd::FromRawFd;
+    let sha256 = manifest.strip_prefix("sha256:").unwrap_or(manifest).to_string();
+    let source = tensorfs_core::ids::ObjectRef { sha256, length };
+    // SAFETY: the caller hands over a connected descriptor it no longer uses.
+    let stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
+    let raised: Mutex<Option<PyErr>> = Mutex::new(None);
+    let check = || -> Result<(), Refusal> {
+        let Some(check) = &check_current else { return Ok(()) };
+        Python::attach(|py| match check.bind(py).call0() {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                let detail = error.to_string();
+                raised.lock().unwrap().get_or_insert(error);
+                Err(Refusal { code: Code::LEASE_REVOKED, detail })
+            }
+        })
+    };
+    let served = py.detach(|| {
+        tensorfs_core::derived::channel::serve_source(&store.store, &store.meta, &source, stream, &check, None)
+    });
+    if let Some(error) = raised.lock().unwrap().take() {
+        return Err(error);
+    }
+    served.or_refuse(py)
+}

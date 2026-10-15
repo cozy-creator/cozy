@@ -158,6 +158,7 @@ fn store_api(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(ensure::ensure, m)?)?;
     m.add_function(wrap_pyfunction!(ensure::relieve, m)?)?;
     m.add_function(wrap_pyfunction!(ensure::serve_fetch, m)?)?;
+    m.add_function(wrap_pyfunction!(ensure::serve_source, m)?)?;
     m.add_function(wrap_pyfunction!(store::transfer_streams, m)?)?;
     m.add("STREAM_MEMORY", tensorfs_core::transport::STREAM_MEMORY)?;
     m.add("AS_IS_PROFILE", tensorfs_core::ingest::source::AS_IS)?;

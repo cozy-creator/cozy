@@ -118,13 +118,7 @@ def source_handle(store, source, current=lambda: None):
 
     def serve():
         try:
-            serve_source(
-                store,
-                source,
-                remote.detach(),
-                check_current=current,
-                admit_io=contextlib.nullcontext,
-            )
+            serve_source(store, remote.detach(), source.manifest, source.length, check_current=current)
         except Exception as exc:
             errors.append(exc)
 

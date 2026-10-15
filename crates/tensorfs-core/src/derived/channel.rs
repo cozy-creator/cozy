@@ -1,6 +1,6 @@
 //! The trusted owner's half of an executor's two native weight channels: one authorized derived
 //! writer ([`serve_derived`]) and one exact source ([`serve_source`]). The executor's halves are
-//! `python/tensorfs/_derived_channel.py` and `_source_channel.py`. A frame is a kind byte and a
+//! `python/tensorfs/_derived_channel.py` and `derived.SourceClient`. A frame is a kind byte and a
 //! big-endian u32 length, then JSON or at most 1 MiB of bytes. The peer names no Store,
 //! transaction or path: the owner bound all of them before handing it the connected stream.
 use super::{

@@ -501,8 +501,7 @@ def exercise():
 
         def inspect_owner():
             try:
-                serve_source(store, fixed, right.detach(), check_current=lambda: None,
-                             admit_io=lambda: contextlib.nullcontext())
+                serve_source(store, right.detach(), fixed.manifest, fixed.length)
             except Exception as error:
                 failures.append(error)
 
@@ -578,10 +577,7 @@ def exercise():
         refused_components = []
         def serve_ordered_source():
             try:
-                serve_source(
-                    store, ordered_source, right.detach(), check_current=lambda: None,
-                    admit_io=lambda: contextlib.nullcontext(),
-                )
+                serve_source(store, right.detach(), ordered_source.manifest, ordered_source.length)
             except tensorfs.errors.Refusal as exc:
                 refused_components.append(exc.code)
         ordered_thread = threading.Thread(target=serve_ordered_source, daemon=True)
@@ -665,8 +661,7 @@ def isolation():
 
         def inspect_owner():
             try:
-                serve_source(store, source, source_right.detach(), check_current=lambda: None,
-                             admit_io=lambda: contextlib.nullcontext())
+                serve_source(store, source_right.detach(), source.manifest, source.length)
             except Exception as exc:
                 errors.append(exc)
 

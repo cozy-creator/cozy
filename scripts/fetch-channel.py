@@ -77,9 +77,17 @@ def prove(binary: str, root: Path) -> None:
 
         def do_GET(self) -> None:
             digest = self.path.rsplit("/", 1)[-1]
-            gets[digest] += 1
             body = bodies[digest]
-            self.send_response(200)
+            requested = self.headers.get("Range")
+            gets[digest] += requested is None or requested.startswith("bytes=0-")
+            if requested:
+                first, last = (int(value) for value in requested.removeprefix("bytes=").split("-"))
+                part = body[first:last + 1]
+                self.send_response(206)
+                self.send_header("Content-Range", f"bytes {first}-{first + len(part) - 1}/{len(body)}")
+                body = part
+            else:
+                self.send_response(200)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)

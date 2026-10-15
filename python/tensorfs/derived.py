@@ -8,12 +8,16 @@ embedding owner; creating a Python object grants no access to a Store.
 from __future__ import annotations
 
 import base64
+import threading
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Any, Literal, cast
 
-from ._derived_channel import DerivedTransaction, serve_derived, serve_derived_replay
+from . import _ext
+from ._derived_channel import (
+    ChannelRefusal, DerivedTransaction, _Channel, _METADATA, _READ, serve_derived, serve_derived_replay,
+)
 from .records import (
     CheckpointReceipt, DerivedReceipt, ObjectRef, PartReceipt, InspectedSource,
     DeclarationTargets, DeclarationConfigs, DeclarationFiles, DerivationArguments, PartDeclaration,
@@ -130,8 +134,6 @@ class SourceCapability(Source):
     @classmethod
     def from_fd(cls, manifest: str, length: int, fd: int) -> SourceCapability:
         """Own a preconnected inspector for one exact already-admitted source."""
-        from ._source_channel import SourceClient
-
         client = SourceClient(fd, Source(manifest, length))
         return cls(manifest, length, client.inspect, client.close, client.read_part_into, client.check)
 
@@ -247,7 +249,83 @@ def derive(output: OutputCapability, declaration: Derivation) -> DerivedTransact
     return output.open(declaration)
 
 
-from ._source_channel import serve_source  # noqa: E402
+class SourceClient:
+    def __init__(self, fd: int, source: Source) -> None:
+        self.channel = _Channel(fd)
+        self.source = source
+        self.lock = threading.Lock()
+
+    def close(self) -> None:
+        self.channel.close()
+
+    def _result(self, request: dict[str, Any]) -> Any:
+        self.channel.send(request)
+        answer = self.channel.reply()
+        if "result" not in answer:
+            raise ChannelRefusal("MISSING_FIELD", "source answer has no result")
+        return answer["result"]
+
+    def _receive_into(self, view: memoryview) -> None:
+        while view:
+            block = self.channel.receive()
+            if not isinstance(block, bytes) or not block or len(block) > len(view):
+                raise ChannelRefusal("LENGTH_MISMATCH", "invalid source byte stream")
+            view[:len(block)] = block
+            view = view[len(block):]
+
+    def inspect(self, components: Sequence[str], configs: Sequence[str]) -> SourceInspection:
+        with self.lock:
+            try:
+                value = self._result({"op": "inspect", "components": list(components), "configs": list(configs)})
+                if not isinstance(value, dict):
+                    raise ChannelRefusal("WRONG_TYPE", "invalid source inspection response")
+                total = 0
+                for config in value["configs"]:
+                    length = config.pop("length")
+                    if type(length) is not int or not 0 <= length <= _METADATA - total:
+                        raise ChannelRefusal("SIZE_CAP", "source configurations exceed their bound")
+                    total += length
+                    data = bytearray(length)
+                    self._receive_into(memoryview(data))
+                    config["data"] = bytes(data)
+                result = SourceInspection.from_native(cast(InspectedSource, value))
+                if result.source != self.source:
+                    raise ChannelRefusal("TRANSACTION_CONFLICT", "source inspection changed identity")
+                return result
+            except BaseException:
+                self.channel.close()
+                raise
+
+    def check(self) -> None:
+        with self.lock:
+            try:
+                if self._result({"op": "check", "manifest": self.source.manifest, "manifest_length": self.source.length}) is not None:
+                    raise ChannelRefusal("WRONG_TYPE", "invalid source check response")
+            except BaseException:
+                self.channel.close()
+                raise
+
+    def read_part_into(self, component: str, key: str, role: str, offset: int, into: object) -> None:
+        view = memoryview(into)  # type: ignore[arg-type]
+        if view.readonly or not view.c_contiguous or view.nbytes > _READ:
+            raise ChannelRefusal("SIZE_CAP", "source read needs a bounded writable contiguous buffer")
+        view = view.cast("B")
+        with self.lock:
+            try:
+                length = self._result({"op": "read", "manifest": self.source.manifest, "manifest_length": self.source.length, "component": component, "key": key,
+                                       "role": role, "offset": offset, "length": len(view)})
+                if type(length) is not int or length != len(view):
+                    raise ChannelRefusal("LENGTH_MISMATCH", "source read changed its length")
+                self._receive_into(view)
+            except BaseException:
+                self.channel.close()
+                raise
+
+
+if _ext.STORE:
+    #: The owner's half of a source channel, for tests and tools: ``serve_source(store, fd,
+    #: manifest, length, *, check_current=None)`` serves until the peer closes it.
+    serve_source = _ext.serve_source
 
 
 __all__ = [
@@ -269,5 +347,6 @@ __all__ = [
     "derive",
     "serve_derived",
     "serve_derived_replay",
-    "serve_source",
 ]
+if _ext.STORE:
+    __all__.append("serve_source")
