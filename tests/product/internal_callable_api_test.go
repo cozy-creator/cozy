@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -12,6 +13,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
+	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/secret"
 )
 
@@ -67,6 +69,12 @@ func TestInternalCallablesRefuseDirectHTTPBeforeRecording(t *testing.T) {
 				"input": map[string]any{}, "rental": arm.rental}
 			if !arm.rental || strings.HasPrefix(arm.pkg, "local/") {
 				body["install_id"] = "internal-api-install"
+			}
+			if strings.HasPrefix(arm.pkg, "local/") {
+				// A local package resolves under its install's lease: the install is recorded.
+				_, problem := o.store.Activate(records.PackageInstall{ID: "internal-api-install", Package: arm.pkg, Major: 1,
+					Version: "1.0.0", SourceKind: "local", Dir: filepath.Join(o.cfg.Home, "installs", "internal-api-install"), Platform: "linux-x86"})
+				fatal(t, problem)
 			}
 			raw, err := json.Marshal(body)
 			must(t, err)

@@ -27,7 +27,7 @@ func runModelCatalog(t *testing.T, configure ...func(*http.ServeMux, *hub.Packag
 	manifest := []byte(`{"fixture":"small root, not model closure bytes"}`)
 	digest, err := canonical.Spell(canonical.Digest(manifest))
 	must(t, err)
-	iface := []byte(`{"application":"q:app","entrypoints":[{"accelerator":false,"models":[{"class":"Model","component_use":{},"path":"quantize.models.dits","weights":true},{"class":"Model","component_use":{},"path":"quantize.models.shared","weights":true}],"name":"quantize","publishes":false,"request":{"fields":[{"name":"steps","type":"int"}]},"result":{"fields":[]},"weights_outputs":[{"max_bytes":1048576,"mime_type":"application/vnd.cozy.model-manifest","output_id":"fp8"}]}]}`)
+	iface := []byte(`{"application":"q:app","entrypoints":[{"accelerator":false,"models":[{"class":"Model","component_use":{},"path":"quantize.models.dits","weights":true},{"class":"Model","component_use":{},"path":"quantize.models.shared","weights":true}],"name":"quantize","publishes":false,"request":{"fields":[{"name":"steps","type":"int"}]},"result":{"fields":[]},"weights_outputs":[{"max_bytes":1048576,"mime_type":"application/vnd.cozy.model-manifest","output_id":"fp8"}]}],"format":"cozy.package.interface/1"}`)
 	contract, problem := launch.DecodePackageInterface(iface)
 	fatal(t, problem)
 	var detail hub.PackageReleaseDetail
