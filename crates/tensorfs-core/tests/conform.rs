@@ -311,6 +311,51 @@ fn nvfp4_inner(c: &Case, swap: bool, skip_global: bool) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// int8-convrot256: value[i,j] = f32(sum_k data[i,k] * H[k,j]) * scale[i] / 16 over each
+/// 256-group, H = H4(x)H4(x)H4(x)H4 with H4's -1 where the two base-4 digits sum to 3.
+fn int8_convrot256(c: &Case) -> Option<Vec<u8>> {
+    int8_convrot_inner(c, false, false)
+}
+fn int8_convrot_unrotated(c: &Case) -> Option<Vec<u8>> {
+    int8_convrot_inner(c, true, false)
+}
+fn int8_convrot_scale_by_column(c: &Case) -> Option<Vec<u8>> {
+    int8_convrot_inner(c, false, true)
+}
+
+fn hadamard_sign(k: usize, j: usize) -> i32 {
+    let mut sign = 1;
+    for digit in 0..4 {
+        if (k >> (2 * digit)) % 4 + (j >> (2 * digit)) % 4 == 3 {
+            sign = -sign;
+        }
+    }
+    sign
+}
+
+fn int8_convrot_inner(c: &Case, unrotated: bool, wrong_axis: bool) -> Option<Vec<u8>> {
+    let d = role(c, "data")?;
+    let s = role(c, "scale")?;
+    let rows = *c.logical_shape.first()? as usize;
+    let cols = *c.logical_shape.get(1)? as usize;
+    let mut out = Vec::new();
+    for i in 0..rows {
+        for j in 0..cols {
+            let group = j - j % 256;
+            let q = |k: usize| d.bits[i * cols + group + k] as i8 as i32;
+            let sum = if unrotated {
+                q(j % 256) * 16
+            } else {
+                (0..256).map(|k| q(k) * hadamard_sign(k, j % 256)).sum()
+            };
+            let o = if wrong_axis { (j % rows) * 4 } else { i * 4 };
+            let sc = f32::from_le_bytes(s.bits[o..o + 4].try_into().ok()?);
+            put_logical(c.logical_dtype, sum as f32 * sc * 0.0625, &mut out);
+        }
+    }
+    Some(out)
+}
+
 fn candidates(alias: &str) -> Vec<Candidate> {
     let mk = |name, wrong, decode| Candidate {
         name,
@@ -341,6 +386,11 @@ fn candidates(alias: &str) -> Vec<Candidate> {
             ),
             mk("fp8-scaled-scalar:scale-ignored", true, fp8_scaled_no_scale),
             mk("fp8-scaled-scalar:f32-math", true, fp8_scaled_f32_math),
+        ],
+        "int8-convrot256/1" => vec![
+            mk("int8-convrot256", false, int8_convrot256),
+            mk("int8-convrot256:unrotated", true, int8_convrot_unrotated),
+            mk("int8-convrot256:scale-by-column", true, int8_convrot_scale_by_column),
         ],
         "mxfp8/1" => vec![
             mk("mxfp8", false, mxfp8),

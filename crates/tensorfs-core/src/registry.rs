@@ -120,6 +120,7 @@ fn mined(name: &str) -> EncodingVectors {
         }
         "nvfp4-w4a4" => include_bytes!("../../../vectors/mined/nvfp4-w4a4.json"),
         "mxfp8" => include_bytes!("../../../vectors/mined/mxfp8.json"),
+        "int8-convrot256" => include_bytes!("../../../vectors/mined/int8-convrot256.json"),
         other => panic!("no mined vector set {other:?}"),
     };
     EncodingVectors::parse_fixture(bytes).expect("mined vectors are frozen canonical data")
@@ -265,6 +266,23 @@ pub fn seeds() -> Vec<Seed> {
                 ),
             ],
             Some(mined("mxfp8")),
+        ),
+        // int8 W8A8 with ComfyUI's ConvRot: each row is rotated by the orthonormal regular
+        // Hadamard H4(x)H4(x)H4(x)H4 per 256 input channels, then quantized per output row.
+        // value[i,j] = scale[i] * (data[i] . H)[j] / 16, the integer Hadamard sum times the
+        // f32 scale in f32, then the logical cast. Mined from cozy-runtime's own producer.
+        seed(
+            "int8-convrot256/1",
+            float.clone(),
+            Some(2),
+            vec![
+                ("data", role(set(&[Dtype::I8]), Relation::Same)),
+                (
+                    "scale",
+                    role(set(&[Dtype::F32]), dims(vec![Dim::Axis { axis: 0 }])),
+                ),
+            ],
+            Some(mined("int8-convrot256")),
         ),
         Seed {
             alias: "svdq-microscale/1",

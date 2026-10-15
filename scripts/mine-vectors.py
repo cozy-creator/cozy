@@ -11,6 +11,9 @@ actually shipped — not what v2's Rust reader believes.
     ~/cozy/python-gen-worker/src/gen_worker/models/w4a4.py          quantize_nvfp4_tensor
     ~/cozy/python-gen-worker/src/gen_worker/convert/writer.py:546   the fp8 w8a8 quantizer
 
+`int8-convrot256` is mined from v2's own producer, cozy-runtime's `encode_int8_convrot256`,
+copied verbatim below with its file citation.
+
 `fp8-scaled-scalar` is mined a step further: nothing is copied at all. The producer class
 is IMPORTED and CALLED — ComfyUI's own `TensorCoreFP8E4M3Layout.quantize(..., "recalculate")`
 and comfy_kitchen's own `quantize_fp8` / `dequantize_fp8` kernels, which run on CPU. It
@@ -36,6 +39,7 @@ import os
 import pathlib
 import sys
 
+import numpy as np
 import torch
 
 E2M1_MAX = 6.0
@@ -222,6 +226,44 @@ def mine_mxfp8():
         })
 
 
+# ------------------------------------------------- cozy-runtime's int8 producer, verbatim
+
+# cozy-runtime src/cozy_runtime/derive/microscale.py: hadamard256 and
+# encode_int8_convrot256, the producer of every `int8-convrot256/1` tensor.
+def hadamard256(values):
+    rows, cols = values.shape
+    work = values.reshape(-1, 4, 4, 4, 4)
+    for axis in range(1, 5):
+        a, b, c, d = (np.take(work, i, axis=axis) for i in range(4))
+        work = np.stack((a + b + c - d, a + b - c + d, a - b + c + d, b + c + d - a), axis=axis)
+    return work.reshape(rows, cols)
+
+
+def quantize_int8_convrot256(w):
+    rotated = hadamard256(w.astype(np.float64)) / 16.0
+    amax = np.abs(rotated).max(axis=-1)
+    scale = np.maximum(amax / 127.0, 1e-12).astype(np.float32)
+    q = np.clip(np.rint(rotated / scale.astype(np.float64)[:, None]), -127.0, 127.0)
+    return q.astype(np.int8), scale
+
+
+def mine_int8_convrot256():
+    """The value law: `scale[i] * (data[i] . H)[j] / 16`, H the regular Hadamard
+    H4(x)H4(x)H4(x)H4 per 256 input channels. The Hadamard sum of int8 is an exact integer;
+    it is multiplied by the f32 scale IN F32 (one rounding), by 1/16 (exact), then cast to the
+    logical dtype. An outlier, a zero row and a negative extreme are planted."""
+    w = material(4, 512, 6).numpy()
+    w[3, 300] = -9.25
+    q, scale = quantize_int8_convrot256(w)
+    sums = hadamard256(q.astype(np.int32)).astype(np.float32)
+    deq = torch.from_numpy((sums * scale[:, None]) * np.float32(0.0625))
+    for lg, dt in (("f32", torch.float32), ("bf16", torch.bfloat16), ("f16", torch.float16)):
+        emit(f"int8-convrot256-4x512-{lg}", lg, [4, 512], raw(deq.to(dt)), {
+            "data": ("i8", [4, 512], q.tobytes()),
+            "scale": ("f32", [4], scale.tobytes()),
+        })
+
+
 # ---------------------------------------------------------------- ComfyUI, imported
 
 # ComfyUI v0.33.0, 2f35f4a08176d993cded35dac3332be4f7287f41; comfy_kitchen 0.2.31.
@@ -283,6 +325,7 @@ MINERS = {
     "nvfp4-w4a4": mine_nvfp4,
     "mxfp8": mine_mxfp8,
     "fp8-scaled-scalar": mine_fp8_scaled_scalar,
+    "int8-convrot256": mine_int8_convrot256,
 }
 
 if __name__ == "__main__":
