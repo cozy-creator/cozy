@@ -477,10 +477,11 @@ fn task_capped_child() {
     let tickets: Vec<_> = (checkpoints.iter())
         .map(|(checkpoint, origin)| fetcher.want(origin, access(), &checkpoint.blobs, Priority::Now))
         .collect();
-    std::thread::scope(|scope| {
-        let waits: Vec<_> = tickets.iter().map(|ticket| scope.spawn(|| ticket.wait(&[], &never()))).collect();
-        waits.into_iter().for_each(|wait| wait.join().unwrap().unwrap());
-    });
+    // Waited one after another on this thread: the cap is for the Fetcher's threads, not the
+    // test's, and every ticket is already wanted at once.
+    for ticket in &tickets {
+        ticket.wait(&[], &never()).unwrap();
+    }
 }
 
 /// A credential that panics on every object GET: a fault inside a download's own stream.
