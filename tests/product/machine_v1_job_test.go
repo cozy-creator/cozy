@@ -13,6 +13,8 @@ import (
 	"image"
 	"image/color"
 	"image/png"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"os/exec"
@@ -22,7 +24,10 @@ import (
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/capability"
+	"github.com/cozy-creator/cozy/internal/config"
+	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/records"
+	"github.com/cozy-creator/cozy/internal/rental"
 )
 
 // tensordFixture is a copy of one of tensord's test packages, locked against
@@ -151,6 +156,17 @@ func TestEndpointRunSignsWithItsRentalKey(t *testing.T) {
 	}
 	root, err := os.MkdirTemp(os.TempDir(), "cze")
 	must(t, err)
+	// The rental's Hub: it answers the ready rental whose machine the endpoint names.
+	var standin []byte
+	hubServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/rentals/pr-standin" || standin == nil {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write(standin)
+	}))
+	t.Cleanup(hubServer.Close)
+	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+hubServer.URL+"\ntensorhub_token: endpoint-test\n"), 0o600))
 	provisionMachine(t, root)
 	t.Cleanup(func() {
 		_, _ = runCozy(t, root, "machine", "stop")
@@ -180,7 +196,7 @@ func TestEndpointRunSignsWithItsRentalKey(t *testing.T) {
 	address := fmt.Sprintf("127.0.0.1:%d", agent.WorkerPort)
 	endpoint := filepath.Join(root, "endpoint.json")
 	document, _ := json.Marshal(map[string]string{"format": "cozy.machine.endpoint/1", "address": address,
-		"worker_id": agent.WorkerID, "worker_boot_id": "boot", "tls_certificate_pem": string(leaf), "execution_workspace_id": "workspace"})
+		"worker_id": agent.WorkerID, "worker_boot_id": "boot", "tls_certificate_pem": string(leaf), "execution_workspace_id": "pr-standin"})
 	must(t, os.WriteFile(endpoint, document, 0o600))
 	// The machine authorizes the key it started with; this computer's owner key becomes
 	// another one the machine does not know.
@@ -221,7 +237,7 @@ func TestEndpointRunSignsWithItsRentalKey(t *testing.T) {
 		t.Fatal(problem)
 	}
 	problem = store.RecordRental(records.Rental{ID: "pr-standin", MachineName: "standin", State: "ready", Address: address,
-		SKU: "virtual-1", AcceleratorModel: "Virtual Accelerator", AcceleratorCount: 1, HourlyRateUSDMicros: 1,
+		SKU: "virtual-1", AcceleratorModel: "Virtual Accelerator", AcceleratorCount: 1, HourlyRateUSDMicros: 1, Hub: hubServer.URL,
 		CertPath: filepath.Join(root, "machine", "leaf.pem"), ExpectedWorkerID: agent.WorkerID, ExpectedWorkerBootID: "boot",
 		RentedAt: time.Now().UTC().Format(time.RFC3339)})
 	store.Close()
@@ -230,6 +246,15 @@ func TestEndpointRunSignsWithItsRentalKey(t *testing.T) {
 	}
 	must(t, os.MkdirAll(filepath.Join(root, "rentals"), 0o700))
 	must(t, os.WriteFile(filepath.Join(root, "rentals", "pr-standin.creator.pem"), authorized, 0o600))
+	identity, problem := rental.CreatorIdentityFor(home.Paths(root), "pr-standin")
+	if problem != nil {
+		t.Fatal(problem)
+	}
+	standin, err = json.Marshal(map[string]any{"rental_id": "pr-standin", "name": "standin", "state": "ready",
+		"requested_accelerator_model": "Virtual Accelerator", "accelerator_count": 1, "worker_address": address,
+		"cert_pem": string(leaf), "worker_id": agent.WorkerID, "worker_boot_id": "boot",
+		"creator_public_key": identity.PublicKey(), "hourly_rate_usd_micros": 1})
+	must(t, err)
 	code, submitted := run()
 	var accepted struct {
 		ID string `json:"id"`

@@ -375,7 +375,7 @@ func replaySubmission(sub Submission, recorded records.Request) orchestrator.Sub
 		Rental:              sub.Rental || sub.RentalRequired || sub.RentNew || sub.RequestedRental != "",
 		RentalRequired:      sub.RentalRequired || sub.RentNew || sub.RequestedRental != "",
 		RequestedRental:     sub.RequestedRental, RentNew: sub.RentNew,
-		Models: models, NeedsAccelerator: recorded.NeedsAccelerator,
+		Models: models, NeedsAccelerator: recorded.NeedsAccelerator, WritesWeights: recorded.WritesWeights,
 		OutputDirectory: sub.OutputDirectory,
 		// Replays compare the caller's requested execution path with the original.
 		AttentionKernel: sub.AttentionKernel, GPUs: sub.GPUs,
@@ -548,6 +548,7 @@ func (s *Server) resolvePlan(ctx context.Context, hub string, sub Submission, le
 		return out, nil, e
 	}
 	markWeights(out.Models, entrypoint)
+	out.WritesWeights = len(entrypoint.WeightsOutputs) > 0
 	out.ModelTransfer, e = weightsDestination(entrypoint, sub.WeightsDestination)
 	return out, entrypoint, e
 }
