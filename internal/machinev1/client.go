@@ -21,7 +21,6 @@ import (
 	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/keepalive"
-	"google.golang.org/protobuf/types/known/emptypb"
 )
 
 // ScopeMachine is the cap action that authorizes every call as its signer.
@@ -48,7 +47,6 @@ type Client struct {
 	lanes             []*grpc.ClientConn
 	upload            *grpc.ClientConn
 	ranges            atomic.Int32
-	stop              context.CancelFunc
 }
 
 // Dial connects to the machine at addr whose pinned leaf tlsConfig trusts; worker is the
@@ -83,38 +81,7 @@ func Dial(addr string, tlsConfig *tls.Config, worker string, signer Signer) (*Cl
 		return conn, err
 	})})
 	c.dialUploads = func() (*grpc.ClientConn, error) { return grpc.NewClient(addr, uploading...) }
-	warming, stop := context.WithCancel(context.Background())
-	c.stop = stop
-	if host, _, err := net.SplitHostPort(addr); err != nil || host != "localhost" && !net.ParseIP(host).IsLoopback() {
-		go c.warm(warming) // this computer's machine has no path to keep warm
-	}
 	return c, nil
-}
-
-// warmEvery paces what an open upload connection carries while no write uses it: less than
-// TCP's retransmission timeout (200 ms at least), so the kernel never finds it idle and the
-// next run's inputs leave at the rate the last ones reached, not from slow start. Over 150 ms,
-// a 475 KB write after a 2-minute pause took 6 round trips idle and 1 kept warm.
-const warmEvery = 100 * time.Millisecond
-
-// warm sends a call the machine answers at once (it serves no such method) on the upload
-// connection while it is open and ready. Nothing is dialed for it.
-func (c *Client) warm(ctx context.Context) {
-	tick := time.NewTicker(warmEvery)
-	defer tick.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-tick.C:
-		}
-		c.lanesMu.Lock()
-		upload := c.upload
-		c.lanesMu.Unlock()
-		if upload != nil && upload.GetState() == connectivity.Ready {
-			_ = upload.Invoke(ctx, "/cozy.machine.v1.Machine/Warm", &emptypb.Empty{}, &emptypb.Empty{})
-		}
-	}
 }
 
 // synWait is how long a connection attempt waits for the machine's SYN-ACK before it also
@@ -184,9 +151,6 @@ var dialSocket = func(ctx context.Context, addr string) (net.Conn, error) {
 
 // Close ends the connection and its lanes.
 func (c *Client) Close() error {
-	if c.stop != nil {
-		c.stop()
-	}
 	c.lanesMu.Lock()
 	for i, lane := range c.lanes {
 		if lane != nil {
