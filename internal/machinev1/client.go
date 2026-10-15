@@ -59,18 +59,19 @@ func Dial(addr string, tlsConfig *tls.Config, worker string, signer Signer) (*Cl
 		grpc.WithPerRPCCredentials(caps{c}),
 		grpc.WithInitialWindowSize(16<<20), grpc.WithInitialConnWindowSize(32<<20),
 		// A ping every 20 s keeps NAT mappings on the path alive through a quiet run, and an
-		// unanswered one ends a dead connection so the run is attached again at once. The
-		// connection is never closed for want of calls: the next run's first write after a
-		// pause would pay a new TCP and TLS handshake.
+		// unanswered one ends a dead connection so the run is attached again at once.
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{Time: 20 * time.Second, Timeout: 20 * time.Second, PermitWithoutStream: true}),
-		grpc.WithIdleTimeout(0),
 		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(16<<20), grpc.MaxCallSendMsgSize(16<<20)))
+	// Read lanes close after gRPC's idle time. The control and upload connections never close
+	// for want of calls: a run's first write after a pause would pay a new TCP and TLS handshake.
+	reading := slices.Clone(options)
+	c.dial = func() (*grpc.ClientConn, error) { return grpc.NewClient(addr, reading...) }
+	options = append(options, grpc.WithIdleTimeout(0))
 	conn, err := grpc.NewClient(addr, options...)
 	if err != nil {
 		return nil, err
 	}
 	c.conn, c.Machine = conn, pb.NewMachineClient(conn)
-	c.dial = func() (*grpc.ClientConn, error) { return grpc.NewClient(addr, options...) }
 	// Uploads ride their own connection, its socket holding little unsent: over a slow uplink a
 	// keepalive ping then waits behind kilobytes, not seconds, of an upload, and a connection an
 	// upload loses takes no run or status with it.
@@ -297,7 +298,7 @@ func (c *Client) ReadLog(ctx context.Context, name string, tail uint64, w io.Wri
 func (c *Client) read(ctx context.Context, request *pb.ReadRequest, w io.Writer) (*pb.ReadFrame, int64, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	stream, err := c.Machine.Read(ctx, request)
+	stream, err := c.lane(0).Read(ctx, request)
 	if err != nil {
 		return nil, 0, err
 	}

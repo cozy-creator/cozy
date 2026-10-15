@@ -414,10 +414,11 @@ func retryable(err error) bool {
 	return false
 }
 
-// lane is the connection lane i reads on: the client's own for lane 0, else one of its own,
-// dialed when first used and again after redial drops it.
+// lane is the connection lane i reads on, dialed when first used and again after redial drops
+// it. None is the client's own: a run's Run, events and Cancel would queue behind the bytes
+// a download has in flight there (2.6–6.6 s to a new run's first frame during a 900 MiB one).
 func (c *Client) lane(i int) pb.MachineClient {
-	if i == 0 || c.dial == nil {
+	if c.dial == nil {
 		return c.Machine
 	}
 	c.lanesMu.Lock()
@@ -435,12 +436,11 @@ func (c *Client) lane(i int) pb.MachineClient {
 	return pb.NewMachineClient(c.lanes[i])
 }
 
-// redial drops lane i's connection so its next range goes on a fresh one. Lane 0's is the
-// client's own, which other calls ride, and is kept.
+// redial drops lane i's connection so its next range goes on a fresh one.
 func (c *Client) redial(i int) {
 	c.lanesMu.Lock()
 	defer c.lanesMu.Unlock()
-	if i > 0 && i < len(c.lanes) && c.lanes[i] != nil {
+	if i < len(c.lanes) && c.lanes[i] != nil {
 		_ = c.lanes[i].Close()
 		c.lanes[i] = nil
 	}
