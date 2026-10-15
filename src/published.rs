@@ -627,8 +627,9 @@ impl Publisher {
             return Ok(None);
         };
         let plan = gpu.plan(&preparation)?;
-        // The bytes may have been reclaimed since; then the model is fetched again.
-        if gpu.source_facts(&plan.selections()).is_err() {
+        // Its structure may have been reclaimed since; then the model resolves again. An
+        // object reclaimed is fetched again by whatever reads it.
+        if !gpu.holds(&plan) {
             return Ok(None);
         }
         Ok(Some(Prepared {

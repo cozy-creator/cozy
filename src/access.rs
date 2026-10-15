@@ -6,7 +6,7 @@
 //! (or its run is canceled) its waits fail, its channels close and their tickets drop.
 use crate::hub;
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     fs::File,
     io,
     net::Shutdown,
@@ -82,13 +82,23 @@ pub fn objects(header: &Header, components: &[String]) -> Vec<ObjectRef> {
     objects
 }
 
-/// Whether every object of `components` of `manifest` is here (`downloaded`).
+/// Whether every object of `components` of `manifest` is here (`downloaded`). Once true it is
+/// remembered (Status asks every second); a later eviction is fetched again by its reader.
 pub fn whole(store: &Store, manifest: &str, components: &[String]) -> bool {
+    static WHOLE: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+    let key = format!("{}\0{manifest}\0{components:?}", store.root().display());
+    if WHOLE.lock().unwrap().contains(&key) {
+        return true;
+    }
     let read = || -> io::Result<bool> {
         let header = header(store, &held(store, manifest)?)?;
         Ok(objects(&header, components).iter().all(|o| store.contains(&o.sha256)))
     };
-    read().unwrap_or(false)
+    let whole = read().unwrap_or(false);
+    if whole {
+        WHOLE.lock().unwrap().insert(key);
+    }
+    whole
 }
 
 pub fn failed(refusal: Refusal) -> io::Error {

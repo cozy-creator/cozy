@@ -2170,6 +2170,9 @@ impl Pool {
     /// Start a generation's import-only executor in the background for a call being prepared,
     /// so its imports overlap the rest of the preparation.
     pub fn prespawn(self: &Arc<Self>, held: HeldGeneration) {
+        if self.zygotes.lock().unwrap().contains_key(&parent_app(&held)) {
+            return;
+        }
         if !self.parent_fits(&held) {
             eprintln!(
                 "executor prespawn skipped for {}: no host room",
@@ -2843,16 +2846,6 @@ impl Pool {
         fetch: Option<Arc<crate::access::Fetch>>,
     ) -> io::Result<bool> {
         let (start, degree) = (session.start, plan.degree);
-        // Its weights' fetches end with it: a run's under its access, a prewarm's under its own.
-        let raw = match plan.sources.is_empty() {
-            true => None,
-            false => {
-                let manifests: Vec<SelectedManifest> = plan.sources.iter()
-                    .map(|source| SelectedManifest { manifest: source.manifest.clone(), components: vec![] })
-                    .collect();
-                Some(ModelSources::open_shared(self.store.clone(), &manifests)?)
-            }
-        };
         let construction = plan.construction.clone();
         let gpus = self.lane(start, degree)?;
         let gpu = gpus.first().map(|device| &device.memory);
@@ -2888,7 +2881,7 @@ impl Pool {
             caller: None,
             weights: None,
             fetch: fetch.as_ref(),
-            raw: raw.as_ref(),
+            raw: &plan.sources,
         };
         if !session.loaded {
             let interface_path = self.interface_file(&session.executor, held)?;
@@ -4303,8 +4296,8 @@ struct Callbacks<'a> {
     weights: Option<(&'a crate::weights::Weights, &'a crate::weights::Grant)>,
     /// The call's fetches: its readers wait on them, and its executor asks for channels.
     fetch: Option<&'a Arc<crate::access::Fetch>>,
-    /// Its `Weights[M]` sources' headers and assets (`model_source`), for Runtime to plan.
-    raw: Option<&'a ModelSources>,
+    /// Its `Weights[M]` sources, whose headers and assets `model_source` answers too.
+    raw: &'a [crate::gpu_service::PlanSource],
 }
 impl Services for Callbacks<'_> {
     fn object_files(&mut self, frame: &Frame, plan: Option<File>) -> io::Result<(Answer, Vec<File>)> {
@@ -4476,8 +4469,16 @@ impl Services for Callbacks<'_> {
         if frame.kind == Kind::ModelSource {
             drop(descriptor);
             // A refusal is an answer: that executor fails its load with the reason.
-            let raw = self.raw.filter(|raw| raw.selected_facts(&frame.manifest).is_ok());
-            return Ok(match raw.unwrap_or(self.sources.as_ref()).serve(frame) {
+            // A `Weights[M]` source's header and assets too, for Runtime to plan its reads.
+            let id = |m: &str| m.trim_start_matches("sha256:").to_string();
+            let served = match self.raw.iter().any(|s| id(&s.manifest) == id(&frame.manifest)) {
+                true => {
+                    let selected = [SelectedManifest { manifest: frame.manifest.clone(), components: vec![] }];
+                    ModelSources::open_shared(self.pool.store.clone(), &selected).and_then(|raw| raw.serve(frame))
+                }
+                false => self.sources.serve(frame),
+            };
+            return Ok(match served {
                 Ok((answer, file)) => (answer, Some(file)),
                 Err(error) => {
                     let mut answer = Answer::unavailable(frame.seq);
