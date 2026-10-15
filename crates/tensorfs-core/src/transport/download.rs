@@ -891,30 +891,31 @@ impl<'a> Run<'_, 'a> {
             self.minted.fetch_max(now, Ordering::AcqRel);
         }
         let url = match (url, stale) {
-            (Ok(url), _) => url,
+            (Ok(url), _) => Ok(url),
             (Err(_), _) if self.stopped().is_some() => {
                 return Outcome::Stop(self.stopped().unwrap())
             }
             // A refused re-authorization still names the origin's answer.
-            (Err(refusal), Some(status)) => {
-                return Outcome::Fatal(Refusal {
-                    code: Code::TRANSFER_FAILED,
-                    detail: format!(
-                        "{}: the object store answered {status} and re-authorizing was \
-                         refused — {}",
-                        wanted.id(),
-                        refusal.detail
-                    ),
-                })
-            }
-            // The hub's weather is asked again a sample on: a lasting download's objects end
-            // on measured stillness, never on a blip.
-            (Err(refusal), None) if job.feed.lasting() && matches!(refusal.code, Code::TRANSFER_FAILED | Code::HUB_UNREACHABLE) => {
+            (Err(refusal), Some(status)) => Err(Refusal {
+                code: Code::TRANSFER_FAILED,
+                detail: format!(
+                    "{}: the object store answered {status} and re-authorizing was refused — {}",
+                    wanted.id(),
+                    refusal.detail
+                ),
+            }),
+            (Err(refusal), None) => Err(refusal),
+        };
+        let url = match url {
+            Ok(url) => url,
+            // The link's or the hub's weather is asked again a sample on: a lasting download's
+            // objects end on measured stillness, never on a blip.
+            Err(refusal) if job.feed.lasting() && matches!(refusal.code, Code::TRANSFER_FAILED | Code::HUB_UNREACHABLE) => {
                 chunk.due = Instant::now() + job.ledger.sample();
                 self.state.lock().unwrap().last = Some(named(refusal, &wanted.id()));
                 return Outcome::Again(vec![chunk]);
             }
-            (Err(refusal), None) => return Outcome::Fatal(refusal),
+            Err(refusal) => return Outcome::Fatal(refusal),
         };
         let attempt = Arc::new(Attempt::default());
         let ledger = job.ledger.for_request(Arc::clone(&attempt), self.tick());

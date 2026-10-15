@@ -297,12 +297,15 @@ impl Served {
         let (status, reply, truncate) = match (method.as_str(), path.as_str()) {
             ("POST", "/v1/tensorfs/closure") => {
                 self.count("closure");
+                // `model[@release][@sha256:<hex>]`: by model, a pinned digest naming its manifest.
                 let asked = field("ref").unwrap_or_default();
-                match self
-                    .checkpoints
-                    .iter()
-                    .find(|c| c.refspec() == asked || c.model == asked)
-                {
+                let mut parts = asked.split('@');
+                let model = parts.next().unwrap_or_default().to_string();
+                let pinned = parts.find_map(|part| part.strip_prefix("sha256:").map(str::to_string));
+                let named = |c: &&Arc<Checkpoint>| {
+                    c.model == model && pinned.as_ref().is_none_or(|hex| *hex == c.manifest.sha256)
+                };
+                match self.checkpoints.iter().find(named) {
                     Some(c) => {
                         let (status, reply) = json(Value::obj(vec![
                             ("complete", Value::Bool(true)),

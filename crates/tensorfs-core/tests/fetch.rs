@@ -304,6 +304,29 @@ fn a_short_disk_evicts_an_idle_partial_checkpoint_and_keeps_ticketed_objects() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A checkpoint held in part that nothing used for the cache's TTL goes, whole.
+#[test]
+fn an_idle_partial_checkpoint_goes_at_its_ttl() {
+    let dir = temporary("fetch-ttl");
+    let root = store(&dir);
+    let store = Store::open(&root).unwrap();
+    let checkpoint = Arc::new(components("acme/model", &[2], 16 << 10, 9, &[]));
+    let hub = hub(vec![Arc::clone(&checkpoint)], None, Duration::ZERO, serve_all());
+    {
+        let fetcher = Fetcher::new(&store, 8, SAMPLE).unwrap();
+        let ticket = fetcher.want(&origin(&hub, &checkpoint), access(), &checkpoint.blobs[..1], Priority::Now);
+        ticket.wait(&[], &never()).unwrap();
+    }
+    let present = |o: &ObjectRef| store.contains(&o.sha256) || store.manifest_path(&o.sha256).is_file();
+    tensorfs_core::gc::collect_idle(&root, &[], Duration::from_secs(3600)).unwrap();
+    assert!(present(&checkpoint.blobs[0]) && present(&checkpoint.manifest));
+    std::thread::sleep(Duration::from_millis(20));
+    tensorfs_core::gc::collect_idle(&root, &[], Duration::from_millis(1)).unwrap();
+    assert!(!present(&checkpoint.blobs[0]) && !present(&checkpoint.manifest) && !present(&checkpoint.header));
+    assert_eq!(tensorfs_core::origin::of(&root, &checkpoint.manifest).unwrap(), None);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The executor's channel: a schedule is fetched at Next, `present` answers, a wait answers
 /// once its object lands, and a checkpoint the grant does not select is refused.
 #[test]

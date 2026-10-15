@@ -54,7 +54,6 @@ const SWITCHES: &[&str] = &[
 /// are present without one.
 const VALUED: &[&str] = &[
     "allow-hosts", "blocks", "ca-file", "candidates", "carrier", "checkpoint-bytes", "closure",
-    "component",
     "config", "content-type", "credential-file", "disk-budget", "expect", "expect-length", "fault",
     "grant-file", "header", "holds", "hub", "inventory", "isolation-tier", "keep", "lane",
     "manifest", "max-download-bytes", "max-download-objects", "max-redirects", "member", "need",

@@ -103,10 +103,15 @@ struct Handle {
 }
 
 impl Drop for Handle {
+    /// The last handle ends the downloader and waits for it: no request or temp file of this
+    /// fetcher outlives it.
     fn drop(&mut self) {
         self.shared.stop.cancel();
         self.shared.changed.notify_all();
         self.shared.pulse.beat();
+        if let Some(driver) = self.shared.driver.lock().unwrap().take() {
+            let _ = driver.join();
+        }
     }
 }
 
@@ -125,6 +130,7 @@ struct Shared {
     gate: RwLock<()>,
     /// One disk admission at a time.
     admitting: Mutex<()>,
+    driver: Mutex<Option<std::thread::JoinHandle<()>>>,
     me: Weak<Shared>,
 }
 
@@ -300,6 +306,7 @@ impl Fetcher {
             stop: PullCancellation::default(),
             gate: RwLock::default(),
             admitting: Mutex::default(),
+            driver: Mutex::default(),
             me: me.clone(),
         });
         Ok(Fetcher(Arc::new(Handle { shared })))
@@ -344,6 +351,8 @@ impl Fetcher {
             id,
             origin: origin.clone(),
         };
+        // Its last use, for the TTL of a checkpoint held in part.
+        crate::origin::touch(&shared.store, &origin.manifest);
         let structure = shared.pending_structure(origin);
         shared.add(id, &[structure, objects.to_vec()].concat(), at.key());
         shared.advance(origin);
@@ -598,8 +607,9 @@ impl Shared {
                     let spawned = std::thread::Builder::new()
                         .name("tensorfs-fetch".into())
                         .spawn(move || me.drive());
-                    if spawned.is_err() {
-                        state.driving = false;
+                    match spawned {
+                        Ok(driver) => *self.driver.lock().unwrap() = Some(driver),
+                        Err(_) => state.driving = false,
                     }
                 }
             }
@@ -1165,14 +1175,18 @@ impl OriginSupply {
 
     /// The objects of this origin the fetcher will open next, most urgent first, that hold
     /// no fresh URL; and how many waiting ones do.
-    fn upcoming(&self) -> (Vec<String>, usize) {
+    /// `open`: those already opened first, which need theirs now.
+    fn upcoming(&self, open: bool) -> (Vec<String>, usize) {
         let Some(shared) = self.shared.upgrade() else {
             return (vec![], 0);
         };
         let state = shared.state.lock().unwrap();
         let leases = self.leases.lock().unwrap();
         let (mut unminted, mut fresh) = (vec![], 0);
-        for (_, _, sha256) in &state.queue {
+        let opened = (state.entries.values())
+            .filter(|e| open && e.phase == Phase::Open)
+            .map(|e| &e.object.sha256);
+        for sha256 in opened.chain(state.queue.iter().map(|(_, _, sha256)| sha256)) {
             if state.entries[sha256].origins.first() != Some(&self.origin) {
                 continue;
             }
@@ -1192,7 +1206,7 @@ impl OriginSupply {
             .map(|o| o.sha256.clone())
             .into_iter()
             .collect();
-        for sha256 in self.upcoming().0 {
+        for sha256 in self.upcoming(true).0 {
             if digests.len() >= window {
                 break;
             }
@@ -1234,7 +1248,7 @@ impl OriginSupply {
         if self.minting.busy() {
             return;
         }
-        let (unminted, fresh) = self.upcoming();
+        let (unminted, fresh) = self.upcoming(false);
         if unminted.is_empty() || fresh * 2 >= self.closure.presign_max_digests.max(1) {
             return;
         }

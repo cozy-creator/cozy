@@ -154,6 +154,7 @@ pub fn ensure(request: &Request<'_>) -> Result<Ensured> {
         let mut pull = PullRequest::new(store, request.hub, request.refspec, request.access.credential(), request.access.policy());
         pull.lane = request.lane;
         pull.cancellation = request.cancellation.clone();
+        pull.sample_seconds = request.sample_seconds;
         transport::resolve_closure(&pull)
     })?;
     let model = request.refspec.split('@').next().unwrap_or_default();
