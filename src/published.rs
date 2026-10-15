@@ -1132,7 +1132,7 @@ impl Publisher {
         let width = gpu.width();
         let degree = crate::gpu_service::group_degree(&slots, request.gpus, width);
         let (mut grants, mut checkpoints) = (vec![], Vec::<Named>::new());
-        let mut bound = None;
+        let mut bound: Option<Vec<Value>> = None;
         for slot in &slots {
             let path = slot
                 .get("path")
