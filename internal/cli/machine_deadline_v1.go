@@ -15,7 +15,7 @@ func deadlineCancel(actor string) bool { return strings.HasPrefix(actor, deadlin
 
 // enforceDeadlineV1 cancels a cozy.machine.v1 run when its request deadline passes, as a
 // worker.v1 machine does from its spec: Calcifer records the cancel as `cozy run cancel`
-// would, attributed to the deadline, and Control delivers it. A rented run never bills past
+// would, attributed to the deadline, and Cancel delivers it. A rented run never bills past
 // its owner's deadline, whether or not a client still waits. The answer stops the timer.
 func (m *machineRuns) enforceDeadlineV1(request records.Request) func() {
 	timeout, deadline, problem := m.store.RequestExecutionTiming(request.ID)
@@ -32,7 +32,7 @@ func (m *machineRuns) enforceDeadlineV1(request records.Request) func() {
 			fmt.Fprintf(m.context.Out, "machine execution %s: its --timeout passed and the cancel was not recorded: %s\n", request.ID, problem.Message)
 			return
 		}
-		_ = m.Control(m.ctx, *current, "cancel")
+		_ = m.Cancel(m.ctx, *current)
 	})
 	return func() { timer.Stop() }
 }

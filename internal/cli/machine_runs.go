@@ -226,27 +226,24 @@ func (m *machineRuns) collectionRefused(id string) bool {
 	return problem == nil && code != ""
 }
 
-// Control wakes Calcifer's durable cancellation delivery. A foreground controller
+// Cancel wakes Calcifer's durable cancellation delivery. A foreground controller
 // instead waits for the machine's acknowledgement before its CLI owner can close it;
 // --await separately observes the terminal outcome. A stopped local machine stays
-// canceling until `cozy run cancel` starts it. Pause/resume keep their synchronous path.
-func (m *machineRuns) Control(parent context.Context, request records.Request, action string) *exit.Error {
-	if action == "cancel" {
-		if m.foreground {
-			accepted, problem := m.store.RunV1(request.ID)
-			if problem != nil {
-				return problem
-			}
-			sent, problem := m.store.RunV1Marked(request.ID, records.RunV1Sent)
-			if problem != nil {
-				return problem
-			}
-			if accepted || sent {
-				return m.controlV1(parent, request, action)
-			}
+// canceling until `cozy run cancel` starts it.
+func (m *machineRuns) Cancel(parent context.Context, request records.Request) *exit.Error {
+	if m.foreground {
+		accepted, problem := m.store.RunV1(request.ID)
+		if problem != nil {
+			return problem
 		}
-		m.Withdraw(request.ID)
-		return m.Start(request)
+		sent, problem := m.store.RunV1Marked(request.ID, records.RunV1Sent)
+		if problem != nil {
+			return problem
+		}
+		if accepted || sent {
+			return m.cancelV1(parent, request)
+		}
 	}
-	return m.controlV1(parent, request, action)
+	m.Withdraw(request.ID)
+	return m.Start(request)
 }

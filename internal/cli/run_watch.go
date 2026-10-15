@@ -36,31 +36,11 @@ func handleRunWatch(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	switch {
-	case strings.HasPrefix(id, "job-"):
-		state, problem := client.Job(id)
-		if problem != nil {
-			return problem
-		}
-		return watchJob(ctx, client, state)
-	default:
-		life, problem := client.Request(id)
-		if problem != nil {
-			return problem
-		}
-		if life.Kind == "job" {
-			state, problem := client.Job(id)
-			if problem != nil {
-				return problem
-			}
-			return watchJob(ctx, client, state)
-		}
-		return watchInvocation(ctx, client, life.RequestID)
+	life, problem := client.Request(id)
+	if problem != nil {
+		return problem
 	}
-}
-
-func watchJob(ctx *Context, client *localclient.Client, state api.JobState) *exit.Error {
-	return followJob(ctx, client, state.JobID, recordedRunStart(state.CreatedAt))
+	return watchInvocation(ctx, client, life.RequestID)
 }
 
 func watchInvocation(ctx *Context, client *localclient.Client, id string) *exit.Error {

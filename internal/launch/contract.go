@@ -22,16 +22,7 @@ func UsageLine(target string, ep *Entrypoint) string {
 			line += " model." + other.Param + "=<ref>"
 		}
 	}
-	// An invocable job also carries each model parameter as a request field for managed
-	// calls; on the command line that input is the slot binding above, so it is not repeated.
-	params := map[string]bool{}
-	for _, slot := range ep.Models {
-		params[slot.Param] = true
-	}
 	for i := range ep.Request.Fields {
-		if ep.Invocable != nil && params[ep.Request.Fields[i].Name] {
-			continue
-		}
 		line += " " + usageTerm(&ep.Request.Fields[i], ep.Assets)
 	}
 	return line
@@ -135,8 +126,8 @@ func unionPhrase(raw json.RawMessage) string {
 func DescribeContract(target string, ep *Entrypoint, bindings map[string]string) string {
 	var b strings.Builder
 	b.WriteString(target)
-	if ep.Kind == "job" {
-		b.WriteString(" (job)\n  runs on: " + ep.RunsOn())
+	if !ep.NeedsAccelerator() {
+		b.WriteString("\n  runs on: CPU")
 	}
 	b.WriteString("\n")
 	if len(ep.Request.Fields) == 0 {
@@ -149,6 +140,9 @@ func DescribeContract(target string, ep *Entrypoint, bindings map[string]string)
 		b.WriteString("  models:\n")
 		for _, slot := range ep.Models {
 			b.WriteString("    " + slot.Param + ": " + slot.Class)
+			if slot.Weights {
+				b.WriteString(" weights")
+			}
 			if binding := bindings[slot.Path]; binding != "" {
 				b.WriteString(" (default: " + binding + ")")
 			}
@@ -274,20 +268,11 @@ func (d *PackageInterface) RawRequest(name string) (json.RawMessage, bool) {
 			Name    string          `json:"name"`
 			Request json.RawMessage `json:"request"`
 		} `json:"entrypoints"`
-		Jobs []struct {
-			Name    string          `json:"name"`
-			Request json.RawMessage `json:"request"`
-		} `json:"jobs"`
 	}
 	if json.Unmarshal(d.Raw, &doc) != nil {
 		return nil, false
 	}
 	for _, row := range doc.Entrypoints {
-		if row.Name == name {
-			return row.Request, true
-		}
-	}
-	for _, row := range doc.Jobs {
 		if row.Name == name {
 			return row.Request, true
 		}

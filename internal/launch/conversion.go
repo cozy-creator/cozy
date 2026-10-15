@@ -6,11 +6,11 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 )
 
-// ConversionSlot is the primary input of a conversion job: the first declared model input
-// of a job with at least one weights output. Such a job reads `cozy run <job> <input>
-// [<org/model>]`: the input is any model reference that slot accepts, the second positional
-// is the checkpoint destination `--upload-to` also names, and any further model input is
-// bound with `model.<param>=`.
+// ConversionSlot is the primary input of a conversion: the first declared model input of a
+// function with at least one weights output. It reads `cozy run <fn> <input> [<org/model>]`:
+// the input is any model reference that slot accepts, the second positional is the
+// destination `--upload-to` also names, and any further model input is bound with
+// `model.<param>=`.
 func ConversionSlot(ep *Entrypoint) *Slot {
 	if len(ep.Models) == 0 || len(ep.WeightsOutputs) == 0 {
 		return nil
@@ -18,7 +18,7 @@ func ConversionSlot(ep *Entrypoint) *Slot {
 	return &ep.Models[0]
 }
 
-// ConversionTerms rewrites a conversion job's bare positionals into the ordinary
+// ConversionTerms rewrites a conversion's bare positionals into the ordinary
 // `model.<param>=<ref>` term and returns the destination, if one was given.
 func ConversionTerms(target string, ep *Entrypoint, terms []string) ([]string, string, *exit.Error) {
 	slot := ConversionSlot(ep)

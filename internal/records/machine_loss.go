@@ -167,7 +167,7 @@ func settleLost(tx *sql.Tx, machine, request, lost, code string) *exit.Error {
 	if err := tx.QueryRow(`SELECT failure_code,ready_at<>'' FROM rentals WHERE id=?`, machine).Scan(&cause, &served); err != nil && err != sql.ErrNoRows {
 		return exit.Internalf("cannot read lost machine cause: %s", err)
 	}
-	rows, err := tx.Query(`SELECT e.machine_id,r.id,r.state,r.retain_work,r.rental=1 AND r.requested_rental='',
+	rows, err := tx.Query(`SELECT e.machine_id,r.id,r.state,r.rental=1 AND r.requested_rental='',
  e.cancel_requested,length(e.submission)>0 OR `+runV1SentHere+`,length(e.receipt)>0,length(e.outcome)>0
  FROM machine_executions e JOIN requests r ON r.id=e.request_id
  WHERE e.machine_id<>'' AND (e.machine_id=?1 OR `+executionRental+`=?1) AND (?2='' OR e.request_id=?2) AND `+machineExecutionOwed, machine, request)
@@ -175,13 +175,13 @@ func settleLost(tx *sql.Tx, machine, request, lost, code string) *exit.Error {
 		return exit.Internalf("cannot read destroyed machine observers: %s", err)
 	}
 	type observation struct {
-		machine, id, state                                     string
-		retained, placeable, cancel, sent, accepted, hasResult bool
+		machine, id, state                           string
+		placeable, cancel, sent, accepted, hasResult bool
 	}
 	var observations []observation
 	for rows.Next() {
 		var value observation
-		if err := rows.Scan(&value.machine, &value.id, &value.state, &value.retained, &value.placeable,
+		if err := rows.Scan(&value.machine, &value.id, &value.state, &value.placeable,
 			&value.cancel, &value.sent, &value.accepted, &value.hasResult); err != nil {
 			rows.Close()
 			return exit.Internalf("cannot read destroyed machine observer: %s", err)
@@ -196,20 +196,11 @@ func settleLost(tx *sql.Tx, machine, request, lost, code string) *exit.Error {
 	for _, value := range observations {
 		// Placed again only off a machine that had served: one lost before it was ever ready
 		// fails its runs, or a market that cannot boot them would be bought from forever.
-		if !value.accepted && value.placeable && !value.retained && served && (value.state == "submitted" || value.state == "queued") {
+		if !value.accepted && value.placeable && served && (value.state == "submitted" || value.state == "queued") {
 			if problem := releaseUnconfirmedTx(tx, value.id, value.machine, cause); problem != nil {
 				return problem
 			}
 			continue
-		}
-		if value.retained {
-			failed, problem := failLostRetainedWorkTx(tx, value.id, value.machine, cause)
-			if problem != nil {
-				return problem
-			}
-			if failed {
-				continue
-			}
 		}
 		message := "its rental ended before it finished"
 		if settledRequestState(value.state) {
@@ -245,7 +236,7 @@ func settleLost(tx *sql.Tx, machine, request, lost, code string) *exit.Error {
 				next = "canceled"
 			}
 		}
-		if _, err := tx.Exec(`UPDATE requests SET state=?,retain_work=0 WHERE id=?`, next, value.id); err != nil {
+		if _, err := tx.Exec(`UPDATE requests SET state=? WHERE id=?`, next, value.id); err != nil {
 			return exit.Internalf("cannot project destroyed execution: %s", err)
 		}
 		if next != "succeeded" {

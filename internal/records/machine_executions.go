@@ -6,6 +6,7 @@ package records
 import (
 	"database/sql"
 	"errors"
+
 	"github.com/cozy-creator/cozy/internal/exit"
 )
 
@@ -80,7 +81,7 @@ func (s *Store) MachinePackageTransfer(request, boot, revision string) (MachineP
 const machineExecutionLive = `(NOT ` + machineExecutionLost + ` AND NOT ` + machineRetentionReleased + ` AND (
  (length(e.receipt)=0 AND (e.cancel_requested=1 OR ` + machineExecutionAbandoned + `) AND length(e.submission)>0 AND NOT EXISTS
  (SELECT 1 FROM request_events closed WHERE closed.request_id=r.id AND closed.type='machine.submission_closed')) OR
- (length(e.receipt)=0 AND r.state NOT IN ('refused','failed','succeeded','abandoned','pausing','paused','canceled')) OR
+ (length(e.receipt)=0 AND r.state NOT IN ('refused','failed','succeeded','abandoned','canceled')) OR
  (length(e.receipt)>0 AND (r.state!='succeeded' OR e.collected=0 OR e.cancel_requested=1 OR length(e.pending_control)>0))))`
 
 // Recipient custody (staged inputs, collected models) outlives the execution. It is owed to
@@ -392,7 +393,7 @@ func (s *Store) CancelUnacceptedRun(id string) *exit.Error {
 // projectCancellationTx moves an unfinished run to `state` with its event. A finished run
 // keeps its terminal: what settles after it is a note, never a second status.
 func projectCancellationTx(tx *sql.Tx, id, state, scope string) error {
-	projected, err := tx.Exec(`UPDATE requests SET state=?,retain_work=0 WHERE id=? AND state NOT IN (`+settledRequestStates+`)`, state, id)
+	projected, err := tx.Exec(`UPDATE requests SET state=? WHERE id=? AND state NOT IN (`+settledRequestStates+`)`, state, id)
 	if err != nil {
 		return err
 	}

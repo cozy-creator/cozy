@@ -27,8 +27,7 @@ func EnvironmentPython(inst records.PackageInstall) (string, *exit.Error) {
 
 // Read gathers an install's facts: where its source is, the surface it proved at install,
 // and how this host's Runtime is asked about it — immutable installs use their verified
-// interface, while live editable checkouts use source. The tool is resolved when a question is
-// asked (Job), so a host that never asks one needs none.
+// interface, while live editable checkouts use source.
 func Read(inst records.PackageInstall, cozyHome string, env []string) (*Facts, *exit.Error) {
 	source := SourceDir(inst)
 	d, e := ReadPackageInterface(PackageInterfacePath(inst.Dir))

@@ -29,26 +29,21 @@ func effectiveModelBindings(slots []launch.Slot, overrides []hub.PackageBindingR
 	return out
 }
 
-func declaredModelSlots(callables ...[]launch.Entrypoint) []launch.Slot {
+func declaredModelSlots(callables []launch.Entrypoint) []launch.Slot {
 	var slots []launch.Slot
-	for _, group := range callables {
-		for _, callable := range group {
-			slots = append(slots, callable.Models...)
-		}
+	for _, callable := range callables {
+		slots = append(slots, callable.Models...)
 	}
 	return slots
 }
 
 // missingModelDefaults describes deployment readiness, not permission to supply
-// explicit model inputs to a local or rented invocation. Jobs have no default
-// serving deployment and may take unpublished model inputs from their caller.
+// explicit model inputs to a local or rented invocation. A `Weights[M]` argument is the
+// caller's raw input and needs no default.
 func missingModelDefaults(callable *launch.Entrypoint, defaults map[string]hub.PackageBindingRow) []string {
-	if callable.Kind == "job" {
-		return nil
-	}
 	var missing []string
 	for _, slot := range callable.Models {
-		if _, bound := defaults[slot.Path]; !bound {
+		if _, bound := defaults[slot.Path]; !bound && !slot.Weights {
 			missing = append(missing, slot.Param)
 		}
 	}

@@ -2,13 +2,10 @@ package orchestrator
 
 import (
 	"encoding/base64"
-	"encoding/json"
-	"sort"
 	"strings"
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
-	"github.com/cozy-creator/cozy/internal/custody"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/machineendpoint"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -22,13 +19,14 @@ type Submission struct {
 	RequestID                string // server-reserved identity for request-owned input capture
 	MachineExecutionObserver bool
 	MachineEndpoint          *machineendpoint.Endpoint
-	TimeoutMS                int64
-	DeadlineUnixMS           uint64
-	IdemKey                  string // the caller's idempotency key
-	Package                  string // org/name
-	Entrypoint               string // the function
-	PlanID                   string // the entrypoint_binding_plan_id this attempt binds
-	Release                  string // explicit published release; empty lets the machine select it
+	// TimeoutMS is the caller's --timeout; DeadlineUnixMS is when its run is canceled.
+	TimeoutMS      int64
+	DeadlineUnixMS uint64
+	IdemKey        string // the caller's idempotency key
+	Package        string // org/name
+	Entrypoint     string // the function
+	PlanID         string // the entrypoint_binding_plan_id this attempt binds
+	Release        string // explicit published release; empty lets the machine select it
 	// LocalInstallationID is the exact staged wheel-set identity for one editable rental.
 	LocalInstallationID string
 	Models              []ModelRef
@@ -45,12 +43,6 @@ type Submission struct {
 	// by field path with exact set equality is what makes a two-output result
 	// unswappable; a positional grant would silently cross them (decisions #248).
 	Outputs []string
-	// WeightsOutputs is the explicit Runtime-authored WeightsSink subset. Rev5's generic
-	// OutputBinding carries no kind, so this is persisted beside the InvocationSpec and is
-	// never inferred from an arriving receipt. The M0 lane is weights-only: when non-empty,
-	// this set is the complete output set for the job.
-	WeightsOutputs []WeightsOutput
-	ProducerParams []string
 
 	// BodyDigest is the caller's own digest of the WHOLE submission it is making
 	// idempotent, not merely of the payload. cl-006 supplies the digest of
@@ -60,20 +52,12 @@ type Submission struct {
 	// Empty falls back to the payload's digest.
 	BodyDigest string
 
-	// Kind is the ATTEMPT CLASS: "" or `serving`, or `job`. A job carries two more facts
-	// a serving request has no version of.
-	Kind                string
-	RetainWork          bool
-	ReleaseImplicitWork bool
-	RetryOf             string
-	ChildReusable       bool
-	ChildArtifacts      bool
-	// Org is the publishing org whose scratch repo this job publishes into.
-	Org string
-	// Trees are the job's typed input TREES as `ref=dir`, one grant input each.
+	// Kind is a function's call ("") or an operation's kind.
+	Kind string
+	// Trees are the typed input TREES as `ref=dir`, captured before the request is recorded.
 	Trees []string
-	// NeedsAccelerator is derived from the selected package's immutable dependency facts.
-	// It is the only machine-class decision retained on a request.
+	// NeedsAccelerator is the function's declared machine class: false only for
+	// `accelerator=False`. It is the only machine-class decision retained on a request.
 	NeedsAccelerator bool
 
 	// Warnings are recorded with the request, one request.warning event each.
@@ -108,20 +92,12 @@ type Submission struct {
 	// default) and the result-file contract. It changes no execution fact and is settled
 	// independently after the terminal mirror.
 	OutputExport *records.OutputExportIntent
-	// ModelTransfer is a privileged materializer/finalizer attached to this
-	// ordinary request. It changes no lifecycle, placement, attempt, or event fact.
+	// ModelTransfer is the weights destination: the requester's repository the machine
+	// publishes the function's weights outputs to. Nil keeps them on the machine.
 	ModelTransfer *records.ModelTransferIntent
 }
 
 const WeightsManifestMime = "application/vnd.cozy.model-manifest"
-
-// WeightsOutput is one bounded WeightsSink slot projected from the installed job
-// descriptor. MaxBytes bounds only newly written table/config bytes, not inherited closure.
-type WeightsOutput struct {
-	OutputID string `json:"output_id"`
-	MimeType string `json:"mime_type"`
-	MaxBytes uint64 `json:"max_bytes"`
-}
 
 // Result is what one closed attempt produced.
 type Result struct {
@@ -196,8 +172,8 @@ func (c *Orchestrator) RecordSubmission(s Submission) (records.Request, bool, *e
 
 func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) {
 	if s.RentNew {
-		if s.RequestedRental != "" || s.RetryOf != "" {
-			return records.Request{}, nil, exit.Usagef("a fresh rental cannot reuse a selected machine or retained run")
+		if s.RequestedRental != "" {
+			return records.Request{}, nil, exit.Usagef("a fresh rental cannot reuse a selected machine")
 		}
 		s.RentalRequired = true
 	}
@@ -210,15 +186,6 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 	if s.RentalRequired {
 		s.Rental = true
 	}
-	if s.RetainWork && s.Kind != "job" {
-		return records.Request{}, nil, exit.Named(exit.Validation, "retain_work_not_job",
-			"retained work is an ordinary unpublished package job capability")
-	}
-	weightsOutputs, weightsBytes, e := normalizeWeightsOutputs(s)
-	if e != nil {
-		return records.Request{}, nil, e
-	}
-	s.WeightsOutputs = weightsOutputs
 	bodyDigest := s.BodyDigest
 	if bodyDigest == "" {
 		identity := s.Payload
@@ -291,9 +258,6 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 	id := s.RequestID
 	if id == "" {
 		id = records.NewID("req")
-		if s.Kind == "job" {
-			id = records.NewID("job")
-		}
 	}
 	req := records.Request{
 		MachineEndpoint:          s.MachineEndpoint,
@@ -304,8 +268,8 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 		Release:             s.Release,
 		LocalInstallationID: s.LocalInstallationID,
 		Outputs:             strings.Join(s.Outputs, ","),
-		Assets:              s.Assets, WeightsOutputs: string(weightsBytes),
-		Kind: s.Kind, RetainWork: s.RetainWork, ReleaseImplicitWork: s.ReleaseImplicitWork, RetryOf: s.RetryOf, ChildArtifacts: s.ChildArtifacts, NeedsAccelerator: s.NeedsAccelerator, Org: s.Org, Trees: strings.Join(s.Trees, ","),
+		Assets:              s.Assets,
+		Kind:                s.Kind, NeedsAccelerator: s.NeedsAccelerator,
 		RequestedRental: s.RequestedRental,
 		AttentionKernel: s.AttentionKernel, GPUs: s.GPUs,
 		Worker: s.Worker, InstallID: s.InstallID, Rental: s.Rental,
@@ -314,10 +278,11 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 		Warnings: s.Warnings,
 	}
 	event := map[string]any{
-		"retain_work": s.RetainWork,
-		"package":     s.Package, "function": s.Entrypoint,
+		"package": s.Package, "function": s.Entrypoint,
 		"body_digest": bodyDigest, "plan_id": s.PlanID, "outputs": s.Outputs,
-		"weights_outputs": weightsOutputs,
+	}
+	if s.ModelTransfer != nil {
+		event["weights_destination"] = s.ModelTransfer.Destination
 	}
 	if s.MachineEndpoint != nil {
 		event["machine_endpoint"] = s.MachineEndpoint
@@ -342,54 +307,6 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 		}
 	}
 	return req, event, nil
-}
-
-func normalizeWeightsOutputs(s Submission) ([]WeightsOutput, []byte, *exit.Error) {
-	if len(s.WeightsOutputs) == 0 {
-		return nil, []byte("[]"), nil
-	}
-	if s.Kind != "job" {
-		return nil, nil, exit.Named(exit.Validation, "weights_output_not_job",
-			"weights outputs are valid only on a job submission")
-	}
-	if len(s.WeightsOutputs) > custody.MaxWeightsReceipts {
-		return nil, nil, exit.Named(exit.Validation, "weights_output_count_cap",
-			"%d weights outputs exceeds the protocol cap of %d",
-			len(s.WeightsOutputs), custody.MaxWeightsReceipts)
-	}
-	rows := append([]WeightsOutput(nil), s.WeightsOutputs...)
-	sort.Slice(rows, func(i, j int) bool { return rows[i].OutputID < rows[j].OutputID })
-	ids := make(map[string]bool, len(rows))
-	for _, row := range rows {
-		if row.OutputID == "" || ids[row.OutputID] {
-			return nil, nil, exit.Named(exit.Validation, "weights_output_identity",
-				"weights output slots are non-empty and unique; %q is repeated or empty", row.OutputID)
-		}
-		if row.MimeType != WeightsManifestMime || row.MaxBytes > (uint64(1)<<53)-1 {
-			return nil, nil, exit.Named(exit.Validation, "weights_output_contract",
-				"weights output %s must declare MIME %s and a new-byte cap in 0..2^53-1",
-				row.OutputID, WeightsManifestMime)
-		}
-		ids[row.OutputID] = true
-	}
-	// OutputBinding/1 has no kind. Until that schema gap is closed, an WeightsSink job is
-	// weights-only so a missing receipt can be classified without guessing about asset slots.
-	if len(ids) != len(s.Outputs) {
-		return nil, nil, exit.Named(exit.Structural, "mixed_job_output_kinds",
-			"this rev5 lane requires weights-only jobs; %d weights slots do not close %d outputs",
-			len(ids), len(s.Outputs))
-	}
-	for _, id := range s.Outputs {
-		if !ids[id] {
-			return nil, nil, exit.Named(exit.Structural, "mixed_job_output_kinds",
-				"job output %q is not in the explicit weights-output set", id)
-		}
-	}
-	data, err := json.Marshal(rows)
-	if err != nil {
-		return nil, nil, exit.Internalf("cannot persist weights output declarations: %s", err)
-	}
-	return rows, data, nil
 }
 
 func (c *Orchestrator) logRecordedReplay(req records.Request, idempotencyKey string) {
@@ -490,9 +407,6 @@ func requestSlot(req records.Request) string {
 	}
 	if req.InstallID != "" {
 		slot += "/install/" + req.InstallID
-	}
-	if req.IsJob() {
-		slot += "/job/" + req.Entrypoint
 	}
 	return slot
 }

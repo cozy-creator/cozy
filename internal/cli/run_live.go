@@ -115,14 +115,6 @@ func (p *RunProgress) describeRun(life api.Lifecycle) {
 	p.Describe(runReference(life.Number, life.RequestID), life.Package+"/"+life.Function, life.Machine, life.Status)
 }
 
-func (p *RunProgress) describeJob(state api.JobState) {
-	machine := ""
-	if state.MachineExecution != nil {
-		machine = state.MachineExecution.Machine
-	}
-	p.Describe(runReference(state.Number, state.JobID), state.Package+"/"+state.Function, machine, state.Status)
-}
-
 // Say prints a message during the watch: above the live region, or verbatim elsewhere.
 func (p *RunProgress) Say(text string) {
 	p.mu.Lock()

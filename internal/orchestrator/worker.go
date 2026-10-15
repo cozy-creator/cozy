@@ -4,10 +4,11 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
-	"github.com/cozy-creator/cozy/internal/archive"
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/cozy-creator/cozy/internal/archive"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -54,14 +55,6 @@ type DesiredPlacement struct {
 	// own defaults). A projection like Entrypoints, never identity: the editable refresh
 	// re-prepares a worker under the same selection a run gave it.
 	Models []ModelRef `json:"models,omitempty"`
-	// Hidden names the entrypoints this placement deliberately does NOT serve (#572d).
-	// Recorded so an operator reading a placement can tell "no binding was staged" from
-	// "a binding was staged and broke".
-	// Jobs is the JOB-mode declaration (cl-004). A worker is in exactly ONE mode — the
-	// DesiredWorkerState's own oneof says which — so a placement carries bindings or jobs,
-	// never both, and `IsJob` is read from it rather than re-derived from what happens to
-	// be populated later.
-	Jobs []*JobPlan `json:"jobs,omitempty"`
 }
 
 // PlacementFromExact validates the one selected PlacementSet and builds only the
@@ -250,9 +243,6 @@ func pinnedPackage(pkg, rental string) string {
 	return pkg + "@" + rental
 }
 
-// IsJob answers the worker's mode.
-func (p DesiredPlacement) IsJob() bool { return len(p.Jobs) > 0 }
-
 func (p DesiredPlacement) EntrypointDigest(name string) (string, *exit.Error) {
 	for _, entrypoint := range p.Entrypoints {
 		if entrypoint.Name == name {
@@ -263,22 +253,11 @@ func (p DesiredPlacement) EntrypointDigest(name string) (string, *exit.Error) {
 		"the selected PlacementSet has no entrypoint %q", name)
 }
 
-// IsJob answers the worker's mode, from the one placement it hosts.
-func (s WorkerLaunchSpec) IsJob() bool { return s.Placement.IsJob() }
-
 // InstanceID is the package's stable local worker SLOT identity. Creator's records store
 // owns attempts across child restarts; Runtime itself retains no recovery state. A NEW
 // install is a genuinely new instance and gets a new id.
 func (p DesiredPlacement) InstanceID() string {
-	slot := "slot/" + p.Package + "/" + p.InstallID
-	if p.IsJob() {
-		// A JOB worker is its own slot: one worker per (package, install, job function),
-		// because a JobDirective names ONE job and a worker is in one mode. It is also what
-		// lets a serving worker and a job worker of the same package coexist instead of
-		// fighting over one instance id.
-		slot += "/job/" + p.Jobs[0].Function
-	}
-	sum := sha256.Sum256([]byte(slot))
+	sum := sha256.Sum256([]byte("slot/" + p.Package + "/" + p.InstallID))
 	return "ins-" + hex.EncodeToString(sum[:12])
 }
 

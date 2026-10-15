@@ -24,7 +24,7 @@ func scriptTarget(ctx *Context) (Target, *launch.PackageInterface, *exit.Error) 
 	if problem != nil {
 		return Target{}, nil, problem
 	}
-	callables := append(append([]launch.Entrypoint{}, surface.Entrypoints...), surface.Jobs...)
+	callables := surface.Entrypoints
 	if len(callables) != 1 {
 		reclaimSnapshot(ctx, target)
 		return Target{}, nil, exit.Named(exit.Validation, "script_entrypoint_count",

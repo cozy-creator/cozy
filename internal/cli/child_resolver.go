@@ -55,15 +55,15 @@ func (r *Resolver) PrivateRentalNeedsAccelerator(request records.Request) (bool,
 			if problem != nil {
 				return false, problem
 			}
-			job, problem := surface.Function(binding.Entrypoint)
+			callee, problem := surface.Function(binding.Entrypoint)
 			if problem != nil {
 				return false, problem
 			}
-			if (job.Kind != "job" && job.Kind != "entrypoint") || job.Invocable == nil || job.Invocable.Module != binding.Module || job.Invocable.Export != binding.Export {
+			if callee.Invocable == nil || callee.Invocable.Module != binding.Module || callee.Invocable.Export != binding.Export {
 				return false, exit.Named(exit.Conflict, "child.export_changed", "captured child has no exact callable for rental sizing")
 			}
 			// The callable's own declaration; no package code is imported to choose a machine class.
-			needed = needed || job.NeedsAccelerator()
+			needed = needed || callee.NeedsAccelerator()
 			queue = append(queue, binding.ChildInstallID)
 		}
 	}

@@ -52,8 +52,6 @@ CREATE TABLE IF NOT EXISTS requests (
   created_at   TEXT    NOT NULL,
   kind         TEXT    NOT NULL DEFAULT 'serving',
   needs_accelerator INTEGER NOT NULL DEFAULT 0,
-  org          TEXT    NOT NULL DEFAULT '',
-  trees        TEXT    NOT NULL DEFAULT '',
   worker       TEXT    NOT NULL DEFAULT '',
   machine      TEXT    NOT NULL DEFAULT '',
   rental       INTEGER NOT NULL DEFAULT 0,
@@ -67,9 +65,6 @@ CREATE TABLE IF NOT EXISTS requests (
   gpus INTEGER NOT NULL DEFAULT 0,
   models       TEXT    NOT NULL DEFAULT '[]',
   weights_outputs TEXT NOT NULL DEFAULT '[]',
-  retain_work INTEGER NOT NULL DEFAULT 0 CHECK(retain_work IN (0,1)),
-  retry_of TEXT NOT NULL DEFAULT '',
-  reuse_scope TEXT NOT NULL DEFAULT '',
   control_revision INTEGER NOT NULL DEFAULT 0 CHECK(control_revision>=0),
   parent_request_id TEXT NOT NULL DEFAULT '',
   parent_call_index INTEGER NOT NULL DEFAULT -1 CHECK(parent_call_index>=-1 AND parent_call_index<4294967296),
@@ -209,7 +204,7 @@ CREATE TABLE IF NOT EXISTS weights_finalizations (
 // refusal, the idle exit — reads these; a request in any other
 // state is settled and an attempt in any other state is closed.
 const (
-	activeRequestStates = `'submitted','queued','dispatching','requeue_pending','finalizing','pausing','paused','canceling','releasing'`
+	activeRequestStates = `'submitted','queued','dispatching','requeue_pending','finalizing','canceling','releasing'`
 	openAttemptStates   = `'preparing','offered','accepted','recovered_open','terminal'`
 	// settledRequestStates is the SQL spelling of settledRequestState: a row here owes
 	// nothing and no later observation may contradict it.
@@ -486,17 +481,8 @@ type Request struct {
 	State     string
 	Ordinal   int64
 	CreatedAt string
-	// Kind is the ATTEMPT CLASS: `serving` or `job`. It is the one discriminator the
-	// whole job branch hangs off, and it lives on the request because a requeue must
-	// re-derive the same class without a client saying so again (cr-009: a job is an
-	// attempt class on the one machinery, not a second runtime).
+	// Kind is `serving` for a function's call, or an operation's kind.
 	Kind string
-	// RetainWork preserves a unpublished package job's artifacts and capacity until the owner
-	// resumes or permanently cancels it, including after an attempt fails.
-	RetainWork bool
-	// ReleaseImplicitWork is derived from a new captured result schema.
-	// Its durable authority is successful_work_releases, not this admission-only field.
-	ReleaseImplicitWork bool `json:"-"`
 	// MachineExecutionObserver is admission-only. The marker is committed with
 	// this request, before any scheduler can create a local attempt.
 	MachineExecutionObserver bool                      `json:"-"`
@@ -506,11 +492,7 @@ type Request struct {
 	Placement      string `json:"-"`
 	DeadlineUnixMS uint64 `json:"-"` // frozen submission event is its durable source
 	// Warnings are admission-only: each becomes one request.warning event with the row.
-	Warnings []Warning `json:"-"`
-	// RetryOf names immutable predecessor history; ReuseScope identifies the
-	// retained operation namespace shared by explicitly related revisions.
-	RetryOf                string
-	ReuseScope             string
+	Warnings               []Warning `json:"-"`
 	ControlRevision        uint64
 	ParentRequestID        string
 	ParentCallIndex        int64
@@ -520,15 +502,9 @@ type Request struct {
 	ChildArtifacts         bool
 	ReusedFrom             string
 	OrchestrationDirective []byte
-	// NeedsAccelerator is derived once from the selected package's immutable
-	// dependency facts. It is not an author-supplied resource request.
+	// NeedsAccelerator is the function's declared machine class: false only for
+	// `accelerator=False`.
 	NeedsAccelerator bool
-	// Org is the publishing org a job's scratch repo is named under. Empty for serving.
-	Org string
-	// Trees are the job's typed input TREES, `ref=dir` joined by commas. Each becomes
-	// one grant input `tree:<ref>`; a field naming a ref the grant does not cover never
-	// reaches a filesystem.
-	Trees string
 	// Worker names an ATTACHED remote worker (a rental id) this request must run on.
 	// It lives on the request because a requeue must re-derive the same placement
 	// without a client saying so again. Empty = any local worker.
@@ -553,15 +529,11 @@ type Request struct {
 	// Models are exact package-slot-to-model bindings resolved before rental creation.
 	// They are local request state and are disclosed only after worker attachment.
 	Models []ModelRef
-	// WeightsOutputs is the immutable WeightsSink output subset projected beside the
-	// InvocationSpec. Rev5 OutputBinding has no kind, so this may never be inferred from
-	// ordinary asset outputs or from whichever receipts happen to arrive.
-	WeightsOutputs string
 	// OutputExport is a CLI-authenticated, PackageInterface-derived local publication intent.
 	// It is recorded in its own durable row in the same transaction as this request.
 	OutputExport *OutputExportIntent
-	// ModelTransfer is a source materializer/output finalizer attached to this
-	// ordinary request. It owns no lifecycle, placement, attempt, or event identity.
+	// ModelTransfer is the run's weights destination: the requester's repository the machine
+	// publishes the function's weights outputs to, and the checkpoints it published there.
 	ModelTransfer *ModelTransferIntent
 	// PlannedSourceBytes is what a script ingest declares it will pull, so a rental
 	// bought for it is sized to the ingest. Recorded at submission; read back through
@@ -616,9 +588,10 @@ type ModelRef struct {
 	Package       string            `json:"package"`
 	Slot          string            `json:"slot"`
 	// BindingPath is the exact interface Model path used for package preparation.
-	// Jobs keep Slot as the bare invocation parameter; serving already uses a path.
 	BindingPath string `json:"binding_path,omitempty"`
-	Model       string `json:"model"`
+	// Weights is a `Weights[M]` slot: its checkpoint is read raw, never constructed.
+	Weights bool   `json:"weights,omitempty"`
+	Model   string `json:"model"`
 	// CatalogRepository is populated only by native local/Hub model resolution.
 	// Model also carries synthetic producer/slot names for private artifacts;
 	// those never gain repository authority from their spelling.
@@ -819,11 +792,9 @@ const (
 	// accelerator — an explicit override off the ladder, or bound to none — so the whole
 	// lane's bytes are the need, conservatively.
 	FitLaneBytes = "lane_bytes"
-	// FitDeriveOnly: the request is a JOB, whose Model inputs cozy-runtime never
-	// constructs — they are derive-only Manifest capabilities with no load, no component
-	// scope and no residency (cozy-runtime `internal/worker/plan.py` JobBinding) — so no
-	// component of one is ever on the device and no figure is compared.
-	FitDeriveOnly = "derive_only"
+	// FitWeights: a `Weights[M]` argument, read raw and never constructed, so no component
+	// of it is ever on the device and no figure is compared.
+	FitWeights = "weights"
 )
 
 // Residency is what a pinned selection must hold on one device at once, and the rule that
@@ -855,14 +826,9 @@ type Residency struct {
 // with no component bytes, the owner's rung for this accelerator and lane asserts the fit
 // with no figure, and failing that the lane's whole bytes stand in. Summed over slots,
 // because one callable holds its slots at once. Independently scheduled captured
-// callables use their maximum resident group, not the sum across the workflow.
-//
-// `job` sizes the SAME selection as a job's inputs instead, and there the answer is
-// nothing: cozy-runtime hands a job a derive-only view of the Manifest and refuses load
-// and component access on it, so a job's model never reaches the device however large its
-// closure is. Sizing one by the components a SERVING construction would stage is a figure
-// about a different run (cl-180).
-func Resident(models []ModelRef, accelerator string, job bool) Residency {
+// callables use their maximum resident group, not the sum across the workflow. A
+// `Weights[M]` argument is read raw and never reaches the device.
+func Resident(models []ModelRef, accelerator string) Residency {
 	groups := map[string][]ModelRef{}
 	for _, model := range models {
 		groups[model.Callable] = append(groups[model.Callable], model)
@@ -871,22 +837,22 @@ func Resident(models []ModelRef, accelerator string, job bool) Residency {
 		var peak Residency
 		// Callable groups execute independently; slots inside each group are simultaneous.
 		for _, key := range slices.Sorted(maps.Keys(groups)) {
-			current := residentTogether(groups[key], accelerator, job && key == "")
+			current := residentTogether(groups[key], accelerator)
 			if current.Bytes > peak.Bytes || peak.Fit == "" {
 				peak = current
 			}
 		}
 		return peak
 	}
-	return residentTogether(models, accelerator, job)
+	return residentTogether(models, accelerator)
 }
 
-func residentTogether(models []ModelRef, accelerator string, job bool) Residency {
+func residentTogether(models []ModelRef, accelerator string) Residency {
 	var out Residency
 	var fits, needs []string
 	for _, model := range models {
-		bytes, need, fit := model.resident(accelerator, job)
-		if !job {
+		bytes, need, fit := model.resident(accelerator)
+		if !model.Weights {
 			for _, adapter := range model.Adapters {
 				bytes = addResidencyBytes(bytes, adapter.Bytes)
 			}
@@ -910,9 +876,9 @@ func addResidencyBytes(current, additional int64) int64 {
 	return current + additional
 }
 
-func (m ModelRef) resident(accelerator string, job bool) (int64, string, string) {
-	if job {
-		return 0, "", FitDeriveOnly
+func (m ModelRef) resident(accelerator string) (int64, string, string) {
+	if m.Weights {
+		return 0, "", FitWeights
 	}
 	if len(m.ComponentBytes) > 0 {
 		bytes, need := m.largestGroup()
@@ -969,8 +935,8 @@ func Lanes(models []ModelRef) string {
 const requestCols = `id,idem_key,body_digest,package,entrypoint,plan_id,package_release,
 	local_installation_id,local_package_uploaded_boot_id,
 	installation_id,payload,outputs,
-	state,ordinal,created_at,kind,needs_accelerator,org,trees,worker,machine,rental,rental_required,
-	COALESCE(install_id,''),assets,capture,attention_kernel,models,weights_outputs,retain_work,retry_of,reuse_scope,control_revision,
+	state,ordinal,created_at,kind,needs_accelerator,worker,machine,rental,rental_required,
+	COALESCE(install_id,''),assets,capture,attention_kernel,models,control_revision,
 	parent_request_id,parent_call_index,child_intent_digest,child_target_digest,child_reusable,reused_from,orchestration_directive,child_artifacts,requested_rental,rent_new,hub,gpus`
 
 func requestScanTargets(r *Request, assets, models *string) []any {
@@ -978,8 +944,8 @@ func requestScanTargets(r *Request, assets, models *string) []any {
 		&r.Release, &r.LocalInstallationID,
 		&r.LocalPackageUploadedBootID, &r.InstallationID, &r.Payload, &r.Outputs,
 		&r.State, &r.Ordinal, &r.CreatedAt,
-		&r.Kind, &r.NeedsAccelerator, &r.Org, &r.Trees, &r.Worker, &r.Machine, &r.Rental, &r.RentalRequired,
-		&r.InstallID, assets, &r.Capture, &r.AttentionKernel, models, &r.WeightsOutputs, &r.RetainWork, &r.RetryOf, &r.ReuseScope, &r.ControlRevision,
+		&r.Kind, &r.NeedsAccelerator, &r.Worker, &r.Machine, &r.Rental, &r.RentalRequired,
+		&r.InstallID, assets, &r.Capture, &r.AttentionKernel, models, &r.ControlRevision,
 		&r.ParentRequestID, &r.ParentCallIndex, &r.ChildIntentDigest, &r.ChildTargetDigest, &r.ChildReusable, &r.ReusedFrom, &r.OrchestrationDirective, &r.ChildArtifacts, &r.RequestedRental, &r.RentNew, &r.Hub, &r.GPUs}
 }
 
@@ -1008,10 +974,6 @@ func scanNumberedRequest(row interface{ Scan(...any) error }) (Request, error) {
 	return finishRequestScan(r, assets, models, err)
 }
 
-// IsJob answers the attempt class. The default spelling is `serving` so a row written
-// before the column existed reads as what it was.
-func (r Request) IsJob() bool { return r.Kind == "job" }
-
 // OwnModels are this caller's model inputs. Captured defaults can belong to callees,
 // imported or of the same package; they remain on the request for child resolution but
 // are not its inputs. A selection binds the caller when its package is the caller's and
@@ -1037,21 +999,18 @@ func (r Request) bindsOwnSlot(model ModelRef) bool {
 	return false
 }
 
-// SizedByOwnModels says the request's own execution holds its model slots on a device, so
-// its rental is chosen for them and never for its callees' defaults: a serving callable
-// constructs its slots, and a job's Model inputs are derive-only unless its package itself
-// needs an accelerator.
+// SizedByOwnModels says the request's own execution constructs model slots on a GPU, so its
+// rental is chosen for them and never for its callees' defaults. A CPU function
+// (`accelerator=False`) holds none on a device, and a `Weights[M]` argument is never
+// constructed.
 func (r Request) SizedByOwnModels() bool {
-	return len(r.OwnModels()) > 0 && (r.NeedsAccelerator || !r.IsJob())
+	return r.NeedsAccelerator && slices.ContainsFunc(r.OwnModels(), func(m ModelRef) bool { return !m.Weights })
 }
 
 // ComposesChildren says the request's own execution may host managed children that need
-// capacity of their own. A request sized by its own slots holds them itself, and a
-// weights-producing job runs on Runtime's ordinary job slot, beneath which Runtime refuses
-// every model-bearing child ("managed child cannot coexist with an ancestor on the device
-// lane", worker/machine_calls.py `_check_ancestors`).
+// capacity of their own; a request sized by its own slots holds them itself.
 func (r Request) ComposesChildren() bool {
-	return !r.SizedByOwnModels() && !(r.IsJob() && r.WeightsOutputs != "" && r.WeightsOutputs != "[]")
+	return !r.SizedByOwnModels()
 }
 
 // RequestRow reads one request back. Requeue re-derives its dispatch from this row and
@@ -1070,9 +1029,6 @@ func (s *Store) RequestRow(id string) (*Request, *exit.Error) {
 	}
 	if transfer != nil {
 		r.ModelTransfer = &transfer.ModelTransferIntent
-		if transfer.HasAcquisition() {
-			r.Models = append([]ModelRef(nil), transfer.Models...)
-		}
 	}
 	return &r, nil
 }
@@ -1653,9 +1609,6 @@ func prepareRequest(r Request) (Request, string, string, string, *exit.Error) {
 	if r.ParentRequestID == "" {
 		r.ParentCallIndex = -1
 	}
-	if r.RetainWork {
-		r.ReuseScope = r.ID
-	}
 	assets := []byte("[]")
 	if len(r.Assets) > 0 {
 		var err error
@@ -1684,11 +1637,7 @@ func submitRequestTx(tx *sql.Tx, r Request, assets, models, exportOutputs string
 	existing, err := scanRequest(tx.QueryRow(
 		`SELECT `+requestCols+` FROM requests WHERE idem_key=?`, r.IdemKey))
 	if err == nil {
-		originalRetention, retentionErr := submittedRetainWorkTx(tx, existing)
-		if retentionErr != nil {
-			return Request{}, false, exit.Internalf("cannot read original retention intent: %s", retentionErr)
-		}
-		if existing.BodyDigest != r.BodyDigest || originalRetention != r.RetainWork || existing.RetryOf != r.RetryOf {
+		if existing.BodyDigest != r.BodyDigest {
 			return Request{}, false, exit.New(exit.Conflict,
 				"idempotency key %s already names a request with a different body", r.IdemKey).
 				WithRemedy("one key, one body: %s was recorded, %s was submitted",
@@ -1703,11 +1652,6 @@ func submitRequestTx(tx *sql.Tx, r Request, assets, models, exportOutputs string
 	if !errors.Is(err, sql.ErrNoRows) {
 		return Request{}, false, exit.Internalf("cannot read request %s: %s", r.IdemKey, err)
 	}
-	if r.RetryOf != "" {
-		if problem := retainRetryTx(tx, &r); problem != nil {
-			return Request{}, false, problem
-		}
-	}
 	if r.Rental && r.Worker != "" {
 		if problem := refuseReleasedRental(tx, r.Worker); problem != nil {
 			return Request{}, false, problem
@@ -1721,18 +1665,18 @@ func submitRequestTx(tx *sql.Tx, r Request, assets, models, exportOutputs string
 	if _, err := tx.Exec(`INSERT INTO requests(id,idem_key,body_digest,package,entrypoint,
 		plan_id,package_release,local_installation_id,
 		local_package_uploaded_boot_id,installation_id,
-		payload,outputs,state,ordinal,created_at,kind,needs_accelerator,org,trees,worker,machine,rental,rental_required,install_id,assets,attention_kernel,models,
-		weights_outputs,retain_work,retry_of,reuse_scope,control_revision,parent_request_id,parent_call_index,child_intent_digest,child_target_digest,child_reusable,reused_from,orchestration_directive,child_artifacts,requested_rental,rent_new,hub,gpus)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?, ?,0,?,?,?,?,?,?,
-		COALESCE((SELECT COALESCE(NULLIF(stable_machine_name,''),machine_name) FROM rentals WHERE id=?),''),?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		payload,outputs,state,ordinal,created_at,kind,needs_accelerator,worker,machine,rental,rental_required,install_id,assets,attention_kernel,models,
+		control_revision,parent_request_id,parent_call_index,child_intent_digest,child_target_digest,child_reusable,reused_from,orchestration_directive,child_artifacts,requested_rental,rent_new,hub,gpus)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?, ?,0,?,?,?,?,
+		COALESCE((SELECT COALESCE(NULLIF(stable_machine_name,''),machine_name) FROM rentals WHERE id=?),''),?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		r.ID, r.IdemKey, r.BodyDigest, r.Package, r.Entrypoint, r.PlanID,
 		r.Release, r.LocalInstallationID,
 		r.LocalPackageUploadedBootID, r.InstallationID, r.Payload,
-		r.Outputs, r.State, r.CreatedAt, r.Kind, r.NeedsAccelerator, r.Org, r.Trees, r.Worker,
+		r.Outputs, r.State, r.CreatedAt, r.Kind, r.NeedsAccelerator, r.Worker,
 		machineRental, r.Rental,
 		r.RentalRequired,
 		nullable(r.InstallID),
-		assets, r.AttentionKernel, models, r.WeightsOutputs, r.RetainWork, r.RetryOf, r.ReuseScope, r.ControlRevision,
+		assets, r.AttentionKernel, models, r.ControlRevision,
 		r.ParentRequestID, r.ParentCallIndex, r.ChildIntentDigest, r.ChildTargetDigest, r.ChildReusable, r.ReusedFrom, blobOrEmpty(r.OrchestrationDirective), r.ChildArtifacts, r.RequestedRental, r.RentNew, r.Hub, r.GPUs); err != nil {
 		return Request{}, false, exit.Internalf("cannot record request %s: %s", r.ID, err)
 	}
@@ -1746,10 +1690,6 @@ func submitRequestTx(tx *sql.Tx, r Request, assets, models, exportOutputs string
 		}
 		if _, err := tx.Exec(`INSERT INTO machine_executions(request_id,machine_id) VALUES(?,?)`, r.ID, machine); err != nil {
 			return Request{}, false, exit.Internalf("cannot mark machine execution observation: %s", err)
-		}
-	} else {
-		if problem := armSuccessfulWorkTx(tx, r); problem != nil {
-			return Request{}, false, problem
 		}
 	}
 	if problem := recordOutputExportTx(tx, r.ID, r.OutputExport, exportOutputs); problem != nil {
@@ -1975,7 +1915,7 @@ func (s *Store) AbortDispatch(requestID string, attempt int64, sessionID, reason
 			requestID, attempt, sessionID)
 	}
 	request, err := tx.Exec(`UPDATE requests SET state=CASE WHEN state='dispatching' THEN 'submitted' ELSE state END
-		WHERE id=? AND ordinal=? AND state IN ('dispatching','pausing','canceling')`, requestID, attempt)
+		WHERE id=? AND ordinal=? AND state IN ('dispatching','canceling')`, requestID, attempt)
 	if err != nil {
 		return exit.Internalf("cannot return request %s to submitted: %s", requestID, err)
 	}

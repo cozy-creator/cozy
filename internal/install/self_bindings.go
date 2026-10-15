@@ -32,9 +32,8 @@ func CaptureSelfBindings(st *records.Store, inst records.PackageInstall, surface
 		}
 		surface = read
 	}
-	entries := append(append([]launch.Entrypoint(nil), surface.Jobs...), surface.Entrypoints...)
-	bindings := make([]records.ChildBinding, 0, len(entries))
-	for _, entry := range entries {
+	bindings := make([]records.ChildBinding, 0, len(surface.Entrypoints))
+	for _, entry := range surface.Entrypoints {
 		if entry.Invocable == nil {
 			continue
 		}

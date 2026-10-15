@@ -458,46 +458,6 @@ func (c *Client) Down(all bool) (api.DownResult, *exit.Error) {
 	return out, e
 }
 
-// ------------------------------------------------------------------ the JOB family
-
-// SubmitJob posts one bounded job under an idempotency key. It never answers "busy":
-// no capacity is a queued STATE, and the handle says which.
-func (c *Client) SubmitJob(sub api.JobSubmission, key string) (api.JobHandle, *exit.Error) {
-	var h api.JobHandle
-	if problem := c.requireGPUCount(sub.GPUs); problem != nil {
-		return h, problem
-	}
-	if problem := c.requireModelOverrides(sub.Package, sub.Function, sub.Models); problem != nil {
-		return h, problem
-	}
-	e := c.call("POST", "/v1/local/jobs", sub, &h, "Idempotency-Key", key)
-	return h, e
-}
-
-// Job reads one job's state document.
-func (c *Client) Job(id string) (api.JobState, *exit.Error) {
-	return c.JobContext(context.Background(), id)
-}
-
-// RecordedJob is RecordedRequest for a job.
-func (c *Client) RecordedJob(id string) (api.JobState, *exit.Error) {
-	var state api.JobState
-	e := c.call("GET", "/v1/local/jobs/"+id+"?observe=false", nil, &state)
-	return state, e
-}
-
-func (c *Client) JobContext(ctx context.Context, id string) (api.JobState, *exit.Error) {
-	var state api.JobState
-	e := c.callContext(ctx, "GET", "/v1/local/jobs/"+id, nil, &state)
-	return state, e
-}
-
-// CancelJob REQUESTS cancellation. A running job's own journaled terminal settles it; a
-// queued one leaves the queue and settles here. The actor names who is canceling.
-func (c *Client) CancelJob(id, actor string) *exit.Error {
-	return c.call("POST", "/v1/local/jobs/"+id+"/cancel", map[string]string{"actor": actor}, nil)
-}
-
 func (c *Client) KeepRentalAlive(id string) (api.RentalKeepaliveResult, *exit.Error) {
 	var result api.RentalKeepaliveResult
 	problem := c.call(http.MethodPost, "/v1/local/rentals/"+url.PathEscape(id)+"/keepalive", nil, &result)

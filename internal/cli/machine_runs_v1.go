@@ -22,13 +22,11 @@ import (
 	"github.com/cozy-creator/cozy/internal/accountauth"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
-	"github.com/cozy-creator/cozy/internal/inputasset"
 	"github.com/cozy-creator/cozy/internal/machines"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/resultfiles"
 	"github.com/cozy-creator/cozy/internal/runoutputs"
-	"github.com/cozy-creator/cozy/internal/scratch"
 	v1 "github.com/cozy-creator/cozy/protocol/cozy/machine/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -76,7 +74,7 @@ func (m *machineRuns) loopV1(request records.Request) {
 		}
 		// Unsent work never starts after cancellation. Sent work still needs its machine's
 		// outcome, even when acceptance was lost or a stopped local machine settled it here.
-		if !accepted && (link.CancelRequested || records.Settled(current.State) || records.RetainedState(current.State)) {
+		if !accepted && (link.CancelRequested || records.Settled(current.State)) {
 			if !link.CancelRequested || !sent {
 				return
 			}
@@ -100,9 +98,9 @@ func (m *machineRuns) loopV1(request records.Request) {
 		}
 		// This computer's machine is proven gone (its process, not a slow answer), so a run it
 		// accepted is over: it fails, or ends canceled when that was asked, and is never run
-		// again. A paused run rests in the machine's own records until it starts.
+		// again.
 		if problem != nil && problem.ErrName() == "machine.stopped" && accepted &&
-			!records.Settled(current.State) && current.State != "paused" {
+			!records.Settled(current.State) {
 			if lost := m.store.StopMachineExecution(request.ID, link.MachineID); lost == nil {
 				fmt.Fprintf(m.context.Out, "machine execution %s: %s\n", request.ID, records.MachineStoppedMessage)
 				return
@@ -505,15 +503,9 @@ func (m *machineRuns) specV1(ctx context.Context, request records.Request, machi
 		return nil, problem
 	}
 	spec.CatalogRevision = revision
-	if problem := m.writeTreesV1(ctx, request, machine, spec); problem != nil {
-		return nil, problem
-	}
-	if request.IsJob() {
-		spec.Kind = v1.RunKind_RUN_KIND_JOB
-		if request.ModelTransfer != nil && request.ModelTransfer.Destination != "" {
-			// The machine publishes the job's weights outputs there itself.
-			spec.WeightsDestination = request.ModelTransfer.Destination
-		}
+	if request.ModelTransfer != nil {
+		// The machine publishes the function's weights outputs there itself.
+		spec.WeightsDestination = request.ModelTransfer.Destination
 	}
 	began := time.Now()
 	if request.LocalInstallationID != "" {
@@ -719,33 +711,6 @@ func (m *machineRuns) operationSpecV1(ctx context.Context, request records.Reque
 		spec.Providers = providers
 	}
 	return spec, nil
-}
-
-// writeTreesV1 writes each `--input-tree ref=dir` to the machine as writeTreeV1 does; the
-// spec names its manifest as an input of the tree media type under the payload's ref.
-func (m *machineRuns) writeTreesV1(ctx context.Context, request records.Request, machine *machines.V1, spec *v1.RunSpec) *exit.Error {
-	if request.Trees == "" {
-		return nil
-	}
-	work, problem := scratch.Temp(m.layout.Tmp, "input-trees-")
-	if problem != nil {
-		return problem
-	}
-	defer work.Release()
-	began := time.Now()
-	for index, pair := range strings.Split(request.Trees, ",") {
-		ref, directory, _ := strings.Cut(pair, "=")
-		tree, problem := inputasset.CaptureTree(filepath.Join(work.Path, strconv.Itoa(index)), ref, directory, inputasset.MaxRootInputBytes)
-		if problem != nil {
-			return problem
-		}
-		if problem := writeTreeV1(ctx, machine, tree.Snapshot); problem != nil {
-			return problem
-		}
-		spec.Inputs = append(spec.Inputs, &v1.InputFile{Field: ref, Digest: tree.Digest, Length: uint64(tree.Length), MediaType: resultfiles.TreeMediaType})
-	}
-	m.submissionStage(request.ID, "trees", request.Trees, began)
-	return nil
 }
 
 // writeInputV1 writes one input as the run captured it: a tree's members, then its manifest,
@@ -1454,32 +1419,24 @@ func (m *machineRuns) collectV1(ctx context.Context, request records.Request, ma
 	return m.store.RecordRunOutcomeV1(request.ID, end)
 }
 
-// controlV1 sends a run's cancel, pause or resume to its machine.
-func (m *machineRuns) controlV1(ctx context.Context, request records.Request, action string) *exit.Error {
-	value, known := map[string]v1.Action{"cancel": v1.Action_ACTION_CANCEL, "pause": v1.Action_ACTION_PAUSE, "resume": v1.Action_ACTION_RESUME}[action]
-	if !known {
-		return exit.New(exit.Validation, "unknown machine execution control")
-	}
+// cancelV1 sends a run's cancel to its machine.
+func (m *machineRuns) cancelV1(ctx context.Context, request records.Request) *exit.Error {
 	link, problem := m.store.MachineExecution(request.ID)
 	if problem != nil || link == nil {
 		return problem
 	}
-	machine, problem := m.machines.DialV1(machines.AttachOnly(ctx), link.MachineID, m.runHolder(request, action+"ing"))
+	machine, problem := m.machines.DialV1(machines.AttachOnly(ctx), link.MachineID, m.runHolder(request, "canceling"))
 	if problem != nil {
 		return problem
 	}
 	defer machine.Close()
-	state, err := machine.Control(ctx, request.ID, value)
+	state, err := machine.Control(ctx, request.ID, v1.Action_ACTION_CANCEL)
 	if err != nil {
-		if action == "cancel" && status.Code(err) == codes.NotFound {
+		if status.Code(err) == codes.NotFound {
 			// A machine that never took the run ends its cancellation here.
 			return m.store.CancelUnacceptedRun(request.ID)
 		}
 		return machines.Transport(err)
-	}
-	// A running job stops before it rests paused: until then it is pausing.
-	if action == "pause" && state.State != "paused" {
-		state.State = "pausing"
 	}
 	if problem := m.store.ObserveRunV1(request.ID, &v1.RunEvent{Event: &v1.RunEvent_State{State: state}}, nil); problem != nil {
 		return problem

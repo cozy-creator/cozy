@@ -17,9 +17,6 @@ func handleWarm(ctx *Context, target Target, ep *launch.Entrypoint, level string
 	if level != "off" && !slices.Contains(records.WarmLevels, level) {
 		return exit.Usagef("--warm=%s is not one of %s or off", level, strings.Join(records.WarmLevels, ", "))
 	}
-	if ep.Kind == "job" {
-		return exit.Usagef("--warm keeps a serving function ready; %s is a job", target.Function)
-	}
 	if ctx.endpoint != nil || ctx.Inv.Bool("--rent-new") || ctx.Inv.Bool("--rental-only") || ctx.Inv.Bool("--rental") {
 		return exit.Usagef("--warm names its machine: this computer's, or --rental=<name>")
 	}

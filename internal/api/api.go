@@ -111,14 +111,7 @@ type Resolver interface {
 	ResolveInstall(installID string, models []orchestrator.ModelRef) (orchestrator.WorkerLaunchSpec, *exit.Error)
 	ResolveRemoteRelease(hub, pkg, release, function string, models []orchestrator.ModelRef) (
 		orchestrator.LogicalPackage, *launch.Entrypoint, *exit.Error)
-	ResolveRemoteJob(hub, pkg, release, function string, models []orchestrator.ModelRef,
-		deferredModels bool) (orchestrator.LogicalJob, *launch.Entrypoint, *exit.Error)
 	Entrypoint(installID, name string) (*launch.Entrypoint, bool, *exit.Error)
-	// Jobs names the `@job` functions one installed package registers, with the
-	// descriptor id each resolves to. The job submit route resolves a function to its
-	// digest through this and never lets a client name one (cl-004).
-	Jobs(hub, pkg string) ([]launch.JobFacts, *exit.Error)
-	JobsInstall(installID string) ([]launch.JobFacts, *exit.Error)
 }
 
 // Options is the frozen input to one API server.
@@ -231,11 +224,6 @@ func (s *Server) Handler() (http.Handler, *exit.Error) {
 		"GET /v1/local/machines/{machine}/logs/{log}":  s.machineLog,
 		"POST /v1/local/machines/{machine}/operations": s.submitOperation,
 		"POST /v1/local/calcifer/down":                 s.downCalcifer,
-		"POST /v1/local/jobs":                          s.submitJob,
-		"GET /v1/local/jobs/{id}":                      s.getJob,
-		"POST /v1/local/jobs/{id}/pause":               s.pauseJob,
-		"POST /v1/local/jobs/{id}/resume":              s.resumeJob,
-		"POST /v1/local/jobs/{id}/cancel":              s.cancelJob,
 		"GET /{$}":                                     s.webUI,
 		"GET /app.css":                                 s.webUI,
 		"GET /app.js":                                  s.webUI,
@@ -340,8 +328,7 @@ func (s *Server) guard(route Route, h http.HandlerFunc) http.Handler {
 				"one key names one request forever; retrying under it is safe by construction")
 			return
 		}
-		if route.Mutation && route.Path != "/v1/local/calcifer/down" &&
-			route.Path != "/v1/requests" && route.Path != "/v1/local/jobs" {
+		if route.Mutation && route.Path != "/v1/local/calcifer/down" && route.Path != "/v1/requests" {
 			s.shutdownAdmission.RLock()
 			defer s.shutdownAdmission.RUnlock()
 			if s.shuttingDown {

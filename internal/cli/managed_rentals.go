@@ -387,7 +387,7 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.PlacementDec
 	}
 	var purchases []orchestrator.PlacementCandidate
 	if req.RequestedRental == "" {
-		purchases = rental.Purchases(skus, req.Models, needsAccelerator, req.IsJob(), constraints)
+		purchases = rental.Purchases(skus, req.Models, needsAccelerator, !req.SizedByOwnModels(), constraints)
 	}
 	var capped *exit.Error
 	m.mu.Lock()
@@ -447,7 +447,7 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.PlacementDec
 		}
 		rental.Conclude(decision.Candidates, i)
 		decision.RentalID, decision.Models = rentalID, c.Models
-		if !decision.Bought && c.Ahead > 0 && req.RequestedRental == "" && !req.RetainWork && !runtimeOwned {
+		if !decision.Bought && c.Ahead > 0 && req.RequestedRental == "" && !runtimeOwned {
 			// Preparation may use this candidate, but its occupied seat is not an
 			// assignment. The local queue can still take another ready rental;
 			// dispatch records the chosen worker when it reserves a free seat.
@@ -548,7 +548,7 @@ func (m *managedRentals) attachedLocked(origin string, req records.Request, runt
 			return nil, problem
 		}
 		disk := rental.Disk{HaveGB: m.disks[row.ID], RetainedBytes: retained, SourceBytes: sourceBytes}
-		if rental.Standing(&c, req.Models, row, sku.VRAMGB, needsAccelerator, offered, req.IsJob(), constraints, disk) {
+		if rental.Standing(&c, req.Models, row, sku.VRAMGB, needsAccelerator, offered, !req.SizedByOwnModels(), constraints, disk) {
 			if busy[row.ID] {
 				c.Verdict = orchestrator.VerdictAttaching
 				out = append(out, c)
@@ -604,11 +604,7 @@ func (m *managedRentals) standingLocked(row records.Rental, req records.Request,
 		if problem != nil {
 			return "", problem
 		}
-		retained, problem := m.store.RentalHasRetainedJob(row.ID)
-		if problem != nil {
-			return "", problem
-		}
-		if live || retained && (!req.IsJob() || !req.RetainWork) {
+		if live {
 			return orchestrator.ExcludedModeConflict, nil
 		}
 	}
@@ -1739,7 +1735,7 @@ func RentalConstraints(ctx *Context, req records.Request) (rental.Constraints, *
 	// Both sources apply the requested function's declared intersection. An unreadable
 	// interface declares no width, so wide products remain excluded rather than guessed.
 	if declared != nil {
-		if entrypoint, e := declared.Function(req.Entrypoint); e == nil && entrypoint.Kind != "job" {
+		if entrypoint, e := declared.Function(req.Entrypoint); e == nil {
 			out.Degrees = entrypoint.SequenceParallelDegrees()
 		}
 	}

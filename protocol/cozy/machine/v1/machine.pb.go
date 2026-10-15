@@ -30,7 +30,6 @@ type RunKind int32
 
 const (
 	RunKind_RUN_KIND_CALL   RunKind = 0
-	RunKind_RUN_KIND_JOB    RunKind = 1
 	RunKind_RUN_KIND_WARM   RunKind = 2 // prepare only: install and download, then succeed
 	RunKind_RUN_KIND_UPDATE RunKind = 3 // stage, verify and activate a software cohort at idle
 	// `remove/1`: the caller's installations of the source leave the machine: an installation
@@ -44,14 +43,12 @@ const (
 var (
 	RunKind_name = map[int32]string{
 		0: "RUN_KIND_CALL",
-		1: "RUN_KIND_JOB",
 		2: "RUN_KIND_WARM",
 		3: "RUN_KIND_UPDATE",
 		4: "RUN_KIND_REMOVE",
 	}
 	RunKind_value = map[string]int32{
 		"RUN_KIND_CALL":   0,
-		"RUN_KIND_JOB":    1,
 		"RUN_KIND_WARM":   2,
 		"RUN_KIND_UPDATE": 3,
 		"RUN_KIND_REMOVE": 4,
@@ -149,8 +146,6 @@ type Action int32
 const (
 	Action_ACTION_UNSPECIFIED Action = 0
 	Action_ACTION_CANCEL      Action = 1
-	Action_ACTION_PAUSE       Action = 2
-	Action_ACTION_RESUME      Action = 3
 )
 
 // Enum value maps for Action.
@@ -158,14 +153,10 @@ var (
 	Action_name = map[int32]string{
 		0: "ACTION_UNSPECIFIED",
 		1: "ACTION_CANCEL",
-		2: "ACTION_PAUSE",
-		3: "ACTION_RESUME",
 	}
 	Action_value = map[string]int32{
 		"ACTION_UNSPECIFIED": 0,
 		"ACTION_CANCEL":      1,
-		"ACTION_PAUSE":       2,
-		"ACTION_RESUME":      3,
 	}
 )
 
@@ -444,7 +435,7 @@ type RunSpec struct {
 	// once more at the Hub.
 	CatalogRevision    string          `protobuf:"bytes,10,opt,name=catalog_revision,json=catalogRevision,proto3" json:"catalog_revision,omitempty"`
 	AttentionKernel    string          `protobuf:"bytes,12,opt,name=attention_kernel,json=attentionKernel,proto3" json:"attention_kernel,omitempty"`
-	WeightsDestination string          `protobuf:"bytes,13,opt,name=weights_destination,json=weightsDestination,proto3" json:"weights_destination,omitempty"` // org/name: a job's weights outputs, or a warm run's source model
+	WeightsDestination string          `protobuf:"bytes,13,opt,name=weights_destination,json=weightsDestination,proto3" json:"weights_destination,omitempty"` // org/name: the requester's repository for the call's weights outputs, or a warm run's source model
 	Hub                *HubAccess      `protobuf:"bytes,14,opt,name=hub,proto3" json:"hub,omitempty"`                                                         // where the run reads, and its capability there
 	Owner              string          `protobuf:"bytes,15,opt,name=owner,proto3" json:"owner,omitempty"`                                                     // the account that org-relative references of local code name
 	Providers          *ProviderAccess `protobuf:"bytes,16,opt,name=providers,proto3" json:"providers,omitempty"`                                             // provider tokens for source models, memory only like hub
@@ -1497,7 +1488,7 @@ type RunState struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Id            string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
 	Number        uint64                 `protobuf:"varint,2,opt,name=number,proto3" json:"number,omitempty"`     // this machine's run number
-	State         string                 `protobuf:"bytes,3,opt,name=state,proto3" json:"state,omitempty"`        // queued, preparing, running, paused, succeeded, failed, canceled
+	State         string                 `protobuf:"bytes,3,opt,name=state,proto3" json:"state,omitempty"`        // queued, preparing, running, succeeded, failed, canceled
 	Sequence      uint64                 `protobuf:"varint,4,opt,name=sequence,proto3" json:"sequence,omitempty"` // the log's head
 	Attempt       uint32                 `protobuf:"varint,5,opt,name=attempt,proto3" json:"attempt,omitempty"`
 	Waiting       string                 `protobuf:"bytes,6,opt,name=waiting,proto3" json:"waiting,omitempty"` // why a queued run waits, for people
@@ -3630,25 +3621,22 @@ const file_cozy_machine_v1_machine_proto_rawDesc = "" +
 	"\x04data\x18\x04 \x01(\fR\x04data\"9\n" +
 	"\vWriteResult\x12\x16\n" +
 	"\x06digest\x18\x01 \x01(\tR\x06digest\x12\x12\n" +
-	"\x04held\x18\x02 \x01(\x04R\x04held*k\n" +
+	"\x04held\x18\x02 \x01(\x04R\x04held*_\n" +
 	"\aRunKind\x12\x11\n" +
-	"\rRUN_KIND_CALL\x10\x00\x12\x10\n" +
-	"\fRUN_KIND_JOB\x10\x01\x12\x11\n" +
+	"\rRUN_KIND_CALL\x10\x00\x12\x11\n" +
 	"\rRUN_KIND_WARM\x10\x02\x12\x13\n" +
 	"\x0fRUN_KIND_UPDATE\x10\x03\x12\x13\n" +
-	"\x0fRUN_KIND_REMOVE\x10\x04*\x9e\x01\n" +
+	"\x0fRUN_KIND_REMOVE\x10\x04\"\x04\b\x01\x10\x01*\x9e\x01\n" +
 	"\tWarmLevel\x12\x1a\n" +
 	"\x16WARM_LEVEL_UNSPECIFIED\x10\x00\x12\x18\n" +
 	"\x14WARM_LEVEL_INSTALLED\x10\x01\x12\x19\n" +
 	"\x15WARM_LEVEL_DOWNLOADED\x10\x02\x12\x17\n" +
 	"\x13WARM_LEVEL_IMPORTED\x10\x03\x12\x13\n" +
 	"\x0fWARM_LEVEL_HOST\x10\x04\x12\x12\n" +
-	"\x0eWARM_LEVEL_GPU\x10\x05*X\n" +
+	"\x0eWARM_LEVEL_GPU\x10\x05*?\n" +
 	"\x06Action\x12\x16\n" +
 	"\x12ACTION_UNSPECIFIED\x10\x00\x12\x11\n" +
-	"\rACTION_CANCEL\x10\x01\x12\x10\n" +
-	"\fACTION_PAUSE\x10\x02\x12\x11\n" +
-	"\rACTION_RESUME\x10\x032\xe5\x02\n" +
+	"\rACTION_CANCEL\x10\x01\"\x04\b\x02\x10\x02\"\x04\b\x03\x10\x032\xe5\x02\n" +
 	"\aMachine\x12H\n" +
 	"\x06Status\x12\x1e.cozy.machine.v1.StatusRequest\x1a\x1c.cozy.machine.v1.StatusFrame0\x01\x12?\n" +
 	"\x03Run\x12\x1b.cozy.machine.v1.RunRequest\x1a\x19.cozy.machine.v1.RunEvent0\x01\x12E\n" +
