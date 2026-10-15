@@ -139,7 +139,7 @@ var schema = append([]string{installsDDL, pinsDDL, childBindingsDDL}, append(orc
 	append(modelTransferSchema, append(eventSchema, append(rentalSchema, packageEventSchema...)...)...)...)...)
 
 func init() {
-	schema = append(schema, successfulWorkDDL, weightsRetentionsDDL, operationLookupsDDL, nativeCallsDDL, nativeArtifactRetentionsDDL, byteOutputsDDL, nativeByteOutputIndex, childArgumentsDDL, activeChildRequestIndex, activeNativeCallIndex, servingPlacementsDDL, operationContextsDDL)
+	schema = append(schema, weightsRetentionsDDL, operationLookupsDDL, nativeCallsDDL, nativeArtifactRetentionsDDL, byteOutputsDDL, nativeByteOutputIndex, childArgumentsDDL, activeChildRequestIndex, activeNativeCallIndex, servingPlacementsDDL, operationContextsDDL)
 	schema = append(schema, machineExecutionSchema...)
 	schema = append(schema, bindingRevisionDDL, hubBindingsRevisionDDL,
 		deviceMemoryMeasurementsDDL, deviceMemoryMeasurementsIndex, hubCreditDDL)
@@ -643,7 +643,7 @@ func (s *Store) Unreferenced() ([]PackageInstall, *exit.Error) {
 			WHERE newer.source_kind='local' AND newer.package=i.package AND newer.version=i.version
 			AND (newer.created_at > i.created_at OR (newer.created_at = i.created_at AND newer.id > i.id))
 		))
-		AND NOT EXISTS(SELECT 1 FROM requests WHERE install_id=i.id AND (state IN (` + activeRequestStates + `) OR (retain_work=1 AND state='succeeded' AND child_artifacts=1)))
+		AND NOT EXISTS(SELECT 1 FROM requests WHERE install_id=i.id AND (state IN (` + activeRequestStates + `)))
 		AND NOT EXISTS(SELECT 1 FROM private_child_bindings WHERE child_install_id=i.id AND parent_install_id!=i.id)
 		ORDER BY i.created_at`)
 	if err != nil {
@@ -701,7 +701,7 @@ func (s *Store) ForgetIfUnreferenced(id string) (bool, *exit.Error) {
 	// not sever the result schema from a completed child still owned by its parent.
 	var held bool
 	if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM pins WHERE install_id=?)
-		OR EXISTS(SELECT 1 FROM requests WHERE install_id=? AND (state IN (`+activeRequestStates+`) OR (retain_work=1 AND state='succeeded' AND child_artifacts=1)))
+		OR EXISTS(SELECT 1 FROM requests WHERE install_id=? AND (state IN (`+activeRequestStates+`)))
 		OR EXISTS(SELECT 1 FROM private_child_bindings WHERE child_install_id=? AND parent_install_id!=child_install_id)
 		OR EXISTS(SELECT 1 FROM worker_processes WHERE install_id=? AND state!='closed')
 		OR EXISTS(SELECT 1 FROM installs candidate

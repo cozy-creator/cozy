@@ -9,14 +9,14 @@ import (
 	"github.com/cozy-creator/cozy/internal/inputasset"
 )
 
-// ParseTreeAssets routes named Tree directories through the same native snapshot
-// intake as explicit job input trees. File and media arguments remain unchanged.
+// ParseTreeAssets routes named Tree directories (`--asset <field>=<dir>`) to the native
+// snapshot intake. File and media arguments remain unchanged.
 func ParseTreeAssets(entry *Entrypoint, payload json.RawMessage, specs []string) (json.RawMessage, []string, []string, *exit.Error) {
 	var document map[string]any
 	decoder := json.NewDecoder(bytes.NewReader(payload))
 	decoder.UseNumber()
 	if decoder.Decode(&document) != nil || document == nil {
-		return nil, nil, nil, exit.New(exit.Validation, "job asset arguments are unreadable")
+		return nil, nil, nil, exit.New(exit.Validation, "asset arguments are unreadable")
 	}
 	var files, trees []string
 	seen := map[string]bool{}

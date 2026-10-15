@@ -3,6 +3,7 @@ package records
 import (
 	"bytes"
 	"encoding/json"
+
 	"github.com/cozy-creator/cozy/internal/archive"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
@@ -33,7 +34,7 @@ func BoundServingPlacement(request Request, attempt Attempt) (canonical.Doc, *ex
 	if len(attempt.ServingPlacementSet) == 0 && envelope.Serving.Bindings == "" {
 		return nil, nil
 	}
-	if request.IsJob() || len(attempt.ServingPlacementSet) == 0 || len(attempt.ServingPlacementSet) > custody.MaxMetadataBytes {
+	if len(attempt.ServingPlacementSet) == 0 || len(attempt.ServingPlacementSet) > custody.MaxMetadataBytes {
 		return refuse()
 	}
 	invocation, err := archive.Read(attempt.InvocationCanonical, archive.Invocation)

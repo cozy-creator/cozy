@@ -153,29 +153,7 @@ func runTarget(ctx *Context, target Target, packageInterface *launch.PackageInte
 	if level := ctx.Inv.Value("--warm"); level != "" {
 		return handleWarm(ctx, target, callable, level)
 	}
-	if callable.Kind != "job" {
-		if ctx.Inv.Value("--timeout") != "" && !ctx.Inv.Bool("--await") {
-			return exit.Usagef("--timeout requires --await for serving callables").
-				WithRemedy("a detached serving call has no client waiting to enforce a caller deadline")
-		}
-		if ctx.Inv.Value("--retry") != "" {
-			return exit.Usagef("--retry applies only to job transactions")
-		}
-		if ctx.Inv.Value("--upload-to") != "" {
-			return exit.Usagef("--upload-to applies only to job callables")
-		}
-		if len(ctx.Inv.Values["--input"]) > 0 {
-			return exit.Usagef("--input-tree applies only to a job callable")
-		}
-		if ctx.Inv.Value("--org") != "" {
-			return exit.Usagef("--org applies only to a job callable")
-		}
-		return handleRun(ctx, target, callable)
-	}
-	if ctx.Inv.Bool("--await") {
-		ctx.Inv.Bools["--follow"] = true
-	}
-	return handleJobSubmit(ctx, target, callable)
+	return handleRun(ctx, target, callable)
 }
 
 // Invocation spelling is forgiving; stored requests and model slots keep the author's name.
@@ -242,7 +220,15 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 			"%s embeds file bytes into a JSON string and cannot name a remote input grant", legacy).
 			WithRemedy("use `--asset <field-path>=<file>`; the field path becomes the exact worker-protocol input id")
 	}
-	input, overrides, e := launch.ParsePayload(ep, ctx.Inv.Args[1:], ctx.Inv.Value("--in"))
+	terms, positional, e := launch.ConversionTerms(target.Package+"/"+target.Function, ep, ctx.Inv.Args[1:])
+	if e != nil {
+		return e
+	}
+	destination, e := uploadDestination(ctx, ep, positional)
+	if e != nil {
+		return e
+	}
+	input, overrides, e := launch.ParsePayload(ep, terms, ctx.Inv.Value("--in"))
 	if e != nil {
 		return e
 	}
@@ -251,7 +237,15 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 		return problem
 	}
 	prepareImage := imagePreparer(ctx)
-	input, assets, e := launch.ParseAssets(ep, input, ctx.Inv.Values["--asset"], overrides.Files, ctx.Inv.Values["--asset-fidelity"], prepareImage)
+	input, assetFiles, assetTrees, e := launch.ParseTreeAssets(ep, input, ctx.Inv.Values["--asset"])
+	if e != nil {
+		return e
+	}
+	trees, e := treeDirectories(assetTrees)
+	if e != nil {
+		return e
+	}
+	input, assets, e := launch.ParseAssets(ep, input, assetFiles, overrides.Files, ctx.Inv.Values["--asset-fidelity"], prepareImage)
 	if e != nil {
 		return e
 	}
@@ -287,7 +281,14 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	if e != nil {
 		return e
 	}
-	if sourced(models) && (!chosen || managedRental && selectedRental == "") {
+	// A fresh rental for a call whose every slot names one provider source is sized to that
+	// source, as `cozy rental new --model` sizes one.
+	var plannedSourceBytes int64
+	if sourced(models) && chosen && managedRental && selectedRental == "" && oneSource(ep, models) {
+		if plannedSourceBytes, e = sourceRentalBytes(ctx, models); e != nil {
+			return e
+		}
+	} else if sourced(models) && (!chosen || managedRental && selectedRental == "") {
 		return exit.Usagef("a provider-source model runs on a named machine").
 			WithRemedy("add --rental=<name>; the machine resolves, narrows and converts the source itself")
 	}
@@ -327,7 +328,9 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 		Models:          models,
 		OutputDirectory: outputDirectory,
 		AttentionKernel: attentionKernel, GPUs: gpus,
-		Ignored: ignored,
+		Ignored:            ignored,
+		WeightsDestination: destination, Trees: trees, PlannedSourceBytes: plannedSourceBytes,
+		TimeoutMS: (deadline + time.Millisecond - 1).Milliseconds(),
 	}, key)
 	releaseSnapshotReader(target)
 	if e != nil {
@@ -762,11 +765,8 @@ func invocationModelSpecs(ctx *Context, target Target, ep *launch.Entrypoint,
 					"%s has no authored default for model slot %s", target.Package, slot.Path).
 					WithRemedy("model.%s=org/model@release[/lane]", slot.Param)
 			}
-			message := fmt.Sprintf("%s has no owner binding or authored default for model slot %s", target.Package, slot.Path)
-			if ep.Kind != "job" {
-				message = fmt.Sprintf("%s/%s is disabled in this deployment: no default model binding for %s", target.Package, ep.Name, slot.Param)
-			}
-			return nil, exit.Named(exit.NotFound, "package_default_model_unavailable", "%s", message).
+			return nil, exit.Named(exit.NotFound, "package_default_model_unavailable",
+				"%s/%s is disabled in this deployment: no default model binding for %s", target.Package, ep.Name, slot.Param).
 				WithRemedy("bind it: %s — or override this run: model.%s=org/model@release[/lane]",
 					bindRemedy(target.Package, slot.Path), slot.Param)
 		}
@@ -964,9 +964,6 @@ func handleRunCancel(ctx *Context) *exit.Error {
 	if close != nil {
 		defer close()
 	}
-	if strings.HasPrefix(id, "job-") {
-		return cancelJob(ctx)
-	}
 	client, problem := dial(ctx)
 	if problem != nil {
 		return problem
@@ -976,9 +973,6 @@ func handleRunCancel(ctx *Context) *exit.Error {
 	before, problem := client.RecordedRequest(id)
 	if problem != nil {
 		return problem
-	}
-	if before.Kind == "job" {
-		return cancelJob(ctx)
 	}
 	// A settled run holding nothing is final. A completed machine run holds nothing a cancel
 	// would release unless its machine keeps the result: this host's own collection, in
@@ -1198,9 +1192,6 @@ func runListRows(rows []api.Lifecycle) output.List {
 		if life.Retaining {
 			typed["retaining"] = true
 		}
-		if life.RetryAvailable {
-			typed["retry_available"] = true
-		}
 		if life.RentalID != "" {
 			typed["rental_id"] = life.RentalID
 		}
@@ -1392,16 +1383,12 @@ func PhaseCell(life api.Lifecycle) string {
 		activity = "downloading models"
 	case orchestrator.PhasePreparing:
 		activity = "setting up package"
-		if life.Kind == "job" {
-			activity = "preparing inputs"
-		}
 	case orchestrator.PhaseWarming:
 		activity = "loading models"
 	}
 	parts := []string{activity}
 	// Older Calcifers carried completed download counters into these phases.
-	// Job preparation may report real conversion progress; serving setup cannot.
-	if life.Phase == orchestrator.PhaseWarming || life.Phase == orchestrator.PhasePreparing && life.Kind != "job" {
+	if life.Phase == orchestrator.PhaseWarming || life.Phase == orchestrator.PhasePreparing {
 		return activity
 	}
 	if life.PhaseMovedBytes != nil {
@@ -2692,7 +2679,18 @@ func renderRun(ctx *Context, life api.Lifecycle, terminal *localapi.Event, stopp
 	if len(outs) > 0 {
 		fields = append(fields, output.Field{K: "outputs", V: outs})
 	}
+	if life.ModelDestination != "" {
+		fields = append(fields, output.Field{K: "model_destination", V: life.ModelDestination})
+	}
+	if len(life.ModelOutputs) > 0 {
+		fields = append(fields, output.Field{K: "model_outputs", V: life.ModelOutputs})
+	}
 	notes := []string{}
+	if len(life.RetainedOutputs) > 0 {
+		machine := life.RetainedOutputs[0].Machine
+		notes = append(notes, fmt.Sprintf("retained outputs stay on %s until `cozy rental end %s`; "+
+			"`cozy run upload` sends one to a private checkpoint without running again", machine, machine))
+	}
 	if len(saved) > 0 {
 		paths := make([]string, 0, len(saved))
 		opaque := false
@@ -2739,6 +2737,9 @@ func renderRun(ctx *Context, life api.Lifecycle, terminal *localapi.Event, stopp
 	if len(saved) > 0 {
 		defaults = append(defaults, "saved")
 	}
+	if len(life.ModelOutputs) > 0 {
+		defaults = append(defaults, "model_outputs")
+	}
 	defaults = append(defaults, "queued", "execution")
 	rec := compactRecord(fields, defaults...)
 	if ctx.Mode().Human && !ctx.Mode().Full && len(saved) > 0 {
@@ -2746,7 +2747,20 @@ func renderRun(ctx *Context, life api.Lifecycle, terminal *localapi.Event, stopp
 	}
 	rec.Notes = notes
 	code := exit.JobTerminal(mapTerminal(status))
+	if code == exit.OK && life.ModelDestination != "" && life.ErrorType != "" {
+		return exit.Named(exit.Conflict, life.ErrorType, "run %s completed without uploading to %s: %s",
+			runReference(life.Number, life.RequestID), life.ModelDestination, life.Error)
+	}
 	if code == exit.OK {
+		if hint := modelPublishHint(life); hint != "" {
+			rec.Next = []string{hint}
+			if quantize := modelQuantizeHint(ctx, life); quantize != "" {
+				rec.Next = append(rec.Next, quantize)
+			}
+		} else if len(life.RetainedOutputs) > 0 {
+			rec.Next = []string{"cozy run upload " + runReference(life.Number, life.RequestID) + "#" +
+				life.RetainedOutputs[0].Output + " <org/model> --await"}
+		}
 		return emit(ctx, rec)
 	}
 	humanStatus := status
@@ -3315,10 +3329,10 @@ func emitDescribe(ctx *Context, target Target, packageInterface *launch.PackageI
 		if !ok {
 			return exit.Internalf("the package interface does not carry %s's request struct", ep.Name)
 		}
-		// A job's accelerator declaration rides beside its request: true, false, or null.
+		// A CPU function's declaration rides beside its request: `"accelerator": false`.
 		var doc map[string]json.RawMessage
-		if ep.Kind == "job" && json.Unmarshal(raw, &doc) == nil {
-			doc["accelerator"], _ = json.Marshal(ep.Accelerator)
+		if !ep.NeedsAccelerator() && json.Unmarshal(raw, &doc) == nil {
+			doc["accelerator"] = json.RawMessage("false")
 			var out bytes.Buffer
 			encoder := json.NewEncoder(&out)
 			encoder.SetEscapeHTML(false)
@@ -3369,7 +3383,7 @@ func emitFunctions(ctx *Context, target Target, packageInterface *launch.Package
 	for _, name := range packageInterface.PublicNames() {
 		callable, _ := packageInterface.Function(name)
 		availability := modelDefaultAvailability(callable, defaults)
-		if bindingProblem != nil && callable.Kind != "job" && len(callable.Models) > 0 {
+		if bindingProblem != nil && len(callable.Models) > 0 {
 			availability = "unknown: defaults unavailable"
 		}
 		list.Rows = append(list.Rows, map[string]string{"function": name, "availability": availability})

@@ -1,9 +1,6 @@
 package records
 
-import (
-	"database/sql"
-	"strings"
-)
+import "strings"
 
 type runStatusGroup struct {
 	public string
@@ -39,19 +36,3 @@ func publicRunStatusSQL() string {
 	text.WriteString(" ELSE requests.state END")
 	return text.String()
 }
-
-// RetainedRetryAvailable uses the same read-only admission checks as --retry.
-// It creates no descendant, rental hold, operation, or authority receipt.
-func (s *Store) RetainedRetryAvailable(row Request) bool {
-	if !row.IsJob() || row.State != "failed" {
-		return false
-	}
-	var machine bool
-	if err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM machine_executions WHERE request_id=?)`, row.ID).Scan(&machine); err != nil {
-		return false
-	}
-	candidate := Request{Kind: "job", RetainWork: true, RetryOf: row.ID, MachineExecutionObserver: machine}
-	return retainRetryFrom(s.db, &candidate, row) == nil
-}
-
-type retryReader interface{ QueryRow(string, ...any) *sql.Row }

@@ -30,19 +30,3 @@ func ServingCallArguments(body []byte) ([]byte, map[string]json.RawMessage, *exi
 	}
 	return payload, models, nil
 }
-
-// ChildArguments is the accepted call's canonical preimage, independent of serving payload.
-func (s *Store) ChildArguments(request Request) ([]byte, *exit.Error) {
-	if request.IsJob() {
-		return append([]byte(nil), request.Payload...), nil
-	}
-	var body []byte
-	if err := s.db.QueryRow(`SELECT body FROM request_child_arguments WHERE request_id=?`, request.ID).Scan(&body); err != nil {
-		return nil, exit.Named(exit.Conflict, "child.arguments_absent", "serving child arguments are unavailable")
-	}
-	payload, _, problem := ServingCallArguments(body)
-	if problem != nil || !bytes.Equal(payload, request.Payload) {
-		return nil, exit.Named(exit.Conflict, "child.arguments_changed", "serving child arguments differ from its recorded payload")
-	}
-	return body, nil
-}

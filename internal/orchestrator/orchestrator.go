@@ -56,18 +56,6 @@ type LogicalPackage struct {
 	NeedsAccelerator bool
 }
 
-type LogicalJob struct {
-	Package          string
-	Release          string
-	Function         string
-	DescriptorID     string
-	Outputs          []string
-	WeightsOutputs   []WeightsOutput
-	NeedsAccelerator bool
-	Models           []ModelRef
-	ProducerParams   []string
-}
-
 type ModelRef = records.ModelRef
 
 // PlacementDecision is the capacity decision's whole record (cl-165, placement-economics.md):
@@ -267,10 +255,10 @@ func (d PlacementDecision) payload() map[string]any {
 const (
 	// ExcludedProtocol: new directives use the current generated wire contract.
 	ExcludedProtocol = "protocol_unsupported"
-	// ExcludedSpent: a completed managed job rental is retained custody, not capacity.
+	// ExcludedSpent: a completed managed rental is retained custody, not capacity.
 	ExcludedSpent = "managed_job_spent"
-	// ExcludedModeConflict: the rental's worker already holds the other half of the
-	// `oneof mode` — a job where a serving set is wanted, or the reverse.
+	// ExcludedModeConflict: work Creator drives would replace a machine whose executions
+	// Runtime still owns.
 	ExcludedModeConflict = "mode_conflict"
 	// ExcludedWrongClass: CPU rental cannot satisfy an accelerator requirement.
 	ExcludedWrongClass = "wrong_class"

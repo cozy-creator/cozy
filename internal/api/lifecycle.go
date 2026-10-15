@@ -233,7 +233,7 @@ func (s *Server) newDownRentals(rentals []LifecycleIdentity) bool {
 // cancelForDown asks each request's owner to stop it: the machine executing it, or
 // Calcifer for its own model transfer.
 func (s *Server) cancelForDown(ctx context.Context, row records.Request) (bool, *exit.Error) {
-	if owned, problem := s.controlMachineExecution(ctx, row, "cancel", "cozy down --all"); owned {
+	if owned, problem := s.cancelMachineExecution(ctx, row, "cozy down --all"); owned {
 		return problem == nil && row.State != "canceling", problem
 	}
 	return true, s.orchestrator.CancelQueued(row.ID, "cozy down --all")

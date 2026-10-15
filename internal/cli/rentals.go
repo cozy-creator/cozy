@@ -1994,7 +1994,7 @@ func handleRentRelease(ctx *Context) *exit.Error {
 		(known.Operation == nil || known.Operation.State != hub.RentalReleased) {
 		return rentalReleaseUnconfirmed(id)
 	}
-	if problem := st.RequestRetainedRentalAbandonment(id, "cozy rental end"); problem != nil {
+	if problem := st.FenceRentalRelease(id); problem != nil {
 		return problem
 	}
 	if verdict != rentalLive {
@@ -2211,9 +2211,6 @@ func (w *releaseWatch) interrupted() *exit.Error {
 // it is entitled to, naming the record that proves this host once held the machine.
 func (w *releaseWatch) finish(l home.Layout, st *records.Store, operationKey string, had, destroyed bool,
 	op *records.RentalOperation, note string) *exit.Error {
-	if problem := st.CompleteRetainedRentalAbandonment(w.id, "cozy rental end"); problem != nil {
-		return problem
-	}
 	forgotten := false
 	if had {
 		var problem *exit.Error

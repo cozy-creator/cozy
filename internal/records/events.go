@@ -375,7 +375,7 @@ func (s *Store) TerminalOverallFraction(requestID string, attempt int64) (*float
 	err := s.db.QueryRow(`SELECT payload FROM request_events
 		WHERE request_id=? AND attempt=? AND type IN (
 		'run.completed','run.failed','run.canceled','request.attempt_failed',
-		'request.pausing','request.canceling','request.finalizing')
+		'request.canceling','request.finalizing')
 		AND json_extract(payload,'$.overall_fraction') IS NOT NULL
 		ORDER BY seq DESC LIMIT 1`, requestID, attempt).Scan(&body)
 	if err == sql.ErrNoRows {

@@ -87,7 +87,7 @@ func handlePackageBindings(ctx *Context) *exit.Error {
 			serving[slot.Path] = true
 		}
 	}
-	slots := declaredModelSlots(packageInterface.Entrypoints, packageInterface.Jobs)
+	slots := declaredModelSlots(packageInterface.Entrypoints)
 	sort.Slice(slots, func(i, j int) bool { return slots[i].Path < slots[j].Path })
 	for _, slot := range slots {
 		declared[slot.Path] = true
@@ -265,17 +265,10 @@ func verifyPackageSlot(ctx context.Context, c *hub.Client, ref hub.Ref, slot str
 	if problem != nil {
 		return problem
 	}
-	var declared []string
-	for _, callables := range [][]launch.Entrypoint{packageInterface.Entrypoints, packageInterface.Jobs} {
-		for i := range callables {
-			for _, candidate := range callables[i].Models {
-				if candidate.Path == slot {
-					return nil
-				}
-				declared = append(declared, candidate.Path)
-			}
-		}
+	if packageInterface.DeclaresSlot(slot) {
+		return nil
 	}
+	declared := packageInterface.ModelSlotPaths()
 	sort.Strings(declared)
 	return exit.Named(exit.NotFound, "binding.slot_not_found",
 		"%s@%s declares no model slot %q (slots: %s)", ref.String(), release, slot,

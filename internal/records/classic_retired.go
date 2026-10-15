@@ -67,7 +67,7 @@ func (s *Store) RetireClassicWork() ([]string, *exit.Error) {
 		if r.state == "canceling" {
 			state, event = "canceled", "run.canceled"
 		}
-		if _, err := tx.Exec(`UPDATE requests SET state=?,retain_work=0 WHERE id=?`, state, r.id); err != nil {
+		if _, err := tx.Exec(`UPDATE requests SET state=? WHERE id=?`, state, r.id); err != nil {
 			return nil, exit.Internalf("cannot settle classic request %s: %s", r.id, err)
 		}
 		if err := appendEventTx(tx, r.id, event, r.ordinal, map[string]any{

@@ -1,8 +1,9 @@
 package cli
 
 import (
-	"github.com/cozy-creator/cozy/internal/exit"
 	"strconv"
+
+	"github.com/cozy-creator/cozy/internal/exit"
 )
 
 // CLI is the complete public command grammar. Kong derives parsing and help from
@@ -439,7 +440,7 @@ type ModelQuantizeCmd struct {
 	Rental         *string `predictor:"rental" help:"Run on this existing rental name or id; never buy a replacement. Default: this computer."`
 	RentalOnly     bool    `help:"Require a remote rental instead of local capacity."`
 	Await          bool    `help:"Watch the run until it settles, then print the checkpoint and the publish command."`
-	IdempotencyKey string  `help:"Stable request identity for exact replay; otherwise a rented re-run reattaches or resumes."`
+	IdempotencyKey string  `help:"Stable request identity for exact replay."`
 }
 
 func (c *ModelQuantizeCmd) Run(r *Runtime) error {
@@ -499,8 +500,6 @@ type RunCmd struct {
 	Upload  RunUploadCmd  `cmd:"" help:"Upload a run's retained output, from the rental holding it, as a private checkpoint in org/model without running it again."`
 	Execute RunExecuteCmd `cmd:"" default:"withargs" hidden:""`
 	Cancel  RunCancelCmd  `cmd:"" help:"Cancel a queued or running run."`
-	Pause   RunPauseCmd   `cmd:"" help:"Pause a private transaction and retain its work."`
-	Resume  RunResumeCmd  `cmd:"" help:"Resume a paused transaction from its captured code and retained work."`
 	List    RunListCmd    `cmd:"" help:"List current and past runs."`
 	Watch   RunWatchCmd   `cmd:"" help:"Watch one recorded run until it settles."`
 	Play    RunPlayCmd    `cmd:"" help:"Print a link that plays a run's output in any browser, live as it grows, straight from the machine running it, local or rented."`
@@ -511,11 +510,11 @@ type RunExecuteCmd struct {
 	GPUs                *uint32  `name:"gpus" help:"Use exactly this many GPUs for each GPU operation; omit to use the largest package-supported configuration on the machine."`
 	MachineEndpointFile string   `name:"machine-endpoint-file" predictor:"file" help:"Run on this explicitly pinned owned machine using the controller's existing signing identity; never register or rent a machine."`
 	Target              string   `arg:"" name:"target" predictor:"callable" help:"Package callable org/package[/function], explicit ./project[/function], or a Python script."`
-	Input               []string `arg:"" optional:"" name:"input" help:"Primary value (a conversion job takes <input-model> [<org/model> destination]), field=value payload and model.<param>=reference overrides (Tensorhub, hf://, or civitai://)."`
+	Input               []string `arg:"" optional:"" name:"input" help:"Primary value (a function writing weights takes <input-model> [<org/model> destination]), field=value payload and model.<param>=reference overrides (Tensorhub, hf://, or civitai://)."`
 	Out                 string   `help:"Output directory." predictor:"dir"`
 	Timeout             string   `help:"Request deadline."`
 	PayloadFile         string   `name:"input" predictor:"file" help:"Read the whole payload from a JSON or YAML file, e.g. --input=~/request.yaml; inline fields override file values."`
-	Assets              []string `name:"asset" predictor:"binding-file" help:"Attach a file or label=file to a declared Assets input; field-path=file binds a named payload asset."`
+	Assets              []string `name:"asset" predictor:"binding-file" help:"Attach a file or label=file to a declared Assets input; field-path=file binds a named payload asset, field-path=directory a Tree."`
 	AssetFidelity       []string `name:"asset-fidelity" help:"Set a declared asset hint as label-or-index=auto|low|medium|high (repeatable)."`
 	LoRAs               []string `name:"lora" sep:"none" help:"Apply an ordered LoRA as model-parameter:component=reference[,strength] (repeatable)."`
 	AttentionKernel     string   `name:"attention-kernel" help:"Development override for this request: backend (all sites) or [model/]component=backend, e.g. model/fl2va_dit=kitchen-int8. It serves every step and waits for its own compile; only where it cannot run (this GPU, a site's shape) does a site keep its default kernel, and cozy run show says which and why."`
@@ -523,10 +522,7 @@ type RunExecuteCmd struct {
 	RentNew             bool     `help:"Buy a fresh managed rental for this run; do not reuse existing machines."`
 	RentalOnly          bool     `help:"Require a remote rental even when local capacity is ready."`
 	IdempotencyKey      string   `help:"Stable request identity for safe retries."`
-	Retry               string   `help:"Retry with current code while retaining compatible work from this prior run."`
-	Trees               []string `name:"input-tree" predictor:"binding-dir" help:"Bind a job input tree as ref=directory."`
-	Org                 string   `help:"Job publication organization (defaults to local)."`
-	UploadTo            string   `help:"Upload the job's declared weight outputs as private checkpoints to org/model; no release is published."`
+	UploadTo            string   `help:"Upload the function's declared weights outputs as private checkpoints to org/model; no release is published."`
 	SourceProfiles      []string `name:"source-profile" help:"Map a foreign model input to a reviewed TensorFS source profile as slot=profile (repeatable)."`
 	Await               bool     `help:"Show progress and wait for the result; --json writes JSONL events to stderr and one result to stdout."`
 	Describe            bool     `help:"Print the callable's request contract instead of running it."`
@@ -553,8 +549,7 @@ func (c *RunExecuteCmd) Run(r *Runtime) error {
 		"--machine-endpoint-file", c.MachineEndpointFile,
 		"--attention-kernel", c.AttentionKernel, "--lora", c.LoRAs, "--gpus", gpus,
 		"--in", c.PayloadFile, "--asset", c.Assets, "--asset-fidelity", c.AssetFidelity,
-		"--idempotency-key", c.IdempotencyKey, "--retry", c.Retry, "--input", c.Trees, "--org", c.Org,
-		"--upload-to", c.UploadTo, "--source-profile", c.SourceProfiles,
+		"--idempotency-key", c.IdempotencyKey, "--upload-to", c.UploadTo, "--source-profile", c.SourceProfiles,
 		"--warm", c.Warm), !c.Describe)
 }
 
@@ -582,22 +577,6 @@ type RunCancelCmd struct {
 	ID      string `arg:"" name:"run" help:"Run id."`
 	Await   bool   `help:"Wait until the machine confirms the cancellation outcome."`
 	Abandon bool   `help:"Abandon local Runtime-run tracking only; does not confirm remote stop or end a rental."`
-}
-
-type RunPauseCmd struct {
-	ID string `arg:"" name:"run" help:"Run id."`
-}
-
-func (c *RunPauseCmd) Run(r *Runtime) error {
-	return r.call(handleRunPause, []string{c.ID}, nil, nil, true)
-}
-
-type RunResumeCmd struct {
-	ID string `arg:"" name:"run" help:"Run id."`
-}
-
-func (c *RunResumeCmd) Run(r *Runtime) error {
-	return r.call(handleRunResume, []string{c.ID}, nil, nil, true)
 }
 
 func (c *RunCancelCmd) Run(r *Runtime) error {

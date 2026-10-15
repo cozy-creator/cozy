@@ -18,28 +18,9 @@ import (
 	"github.com/cozy-creator/cozy/internal/scratch"
 )
 
+// freezeMachineInputs captures a run's root files and trees for its machine before the run
+// is recorded: each named tree directory becomes a snapshot its Tree field names by digest.
 func (s *Server) freezeMachineInputs(spec *orchestrator.Submission, entry *launch.Entrypoint) (*scratch.Dir, *exit.Error) {
-	if s.machineExecutions == nil || (spec.InstallID == "" && entry == nil) {
-		return nil, nil
-	}
-	if spec.InstallID == "" && !publishedMachineJob(*spec) {
-		return nil, nil
-	}
-	if entry == nil {
-		jobs, problem := s.packages.JobsInstall(spec.InstallID)
-		if problem != nil {
-			return nil, problem
-		}
-		for _, job := range jobs {
-			if job.Name == spec.Entrypoint {
-				entry = &launch.Entrypoint{Name: job.Name, Request: job.Request, Assets: job.Assets}
-				break
-			}
-		}
-	}
-	if entry == nil {
-		return nil, exit.New(exit.Conflict, "captured root has no input declaration")
-	}
 	references, problem := launch.TreeInputRefs(entry, spec.Payload)
 	if problem != nil {
 		return nil, problem
@@ -76,11 +57,7 @@ func (s *Server) freezeMachineInputs(spec *orchestrator.Submission, entry *launc
 	if len(spec.Assets) == 0 && len(wanted) == 0 {
 		return nil, nil
 	}
-	prefix := "req"
-	if spec.Kind == "job" {
-		prefix = "job"
-	}
-	spec.RequestID = records.NewID(prefix)
+	spec.RequestID = records.NewID("req")
 	stage, problem := scratch.Named(s.layout.Tmp, spec.RequestID)
 	if problem != nil {
 		return nil, problem

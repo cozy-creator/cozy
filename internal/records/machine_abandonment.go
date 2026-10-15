@@ -52,7 +52,7 @@ func (s *Store) AbandonMachineExecution(id, actor, why string) (bool, *exit.Erro
 	if !settledRequestState(state) {
 		next = "abandoned"
 	}
-	if _, err := tx.Exec(`UPDATE requests SET state=?,retain_work=0 WHERE id=?`, next, id); err != nil {
+	if _, err := tx.Exec(`UPDATE requests SET state=? WHERE id=?`, next, id); err != nil {
 		return false, exit.Internalf("cannot close abandoned local intent: %s", err)
 	}
 	if next != "succeeded" {

@@ -11,10 +11,8 @@ import (
 )
 
 // RetryOutputExport settles one Calcifer-owned publication obligation — the package's
-// store under outputs/ or the caller's --out. Serving files are already at that
-// destination. Top-level jobs retain internal publication custody and materialize
-// independent user copies of their declared media. Both settle the same export row
-// after proving the accepted set matches its pre-execution contract.
+// store under outputs/ or the caller's --out, where a machine's observer already wrote
+// each output — after proving the accepted set matches its pre-execution contract.
 // It never changes the execution terminal and never trusts a terminal path.
 func (c *Orchestrator) RetryOutputExport(requestID string) {
 	c.mu.Lock()
@@ -71,13 +69,6 @@ func (c *Orchestrator) RetryOutputExport(requestID string) {
 		c.failOutputExport(requestID, problem)
 		return
 	}
-	if request.IsJob() {
-		outputs, problem = materializeJobMedia(*export, outputs)
-		if problem != nil {
-			c.failOutputExport(requestID, problem)
-			return
-		}
-	}
 	paths, problem := outputExportPaths(*export, outputs)
 	if problem != nil {
 		c.failOutputExport(requestID, problem)
@@ -89,28 +80,6 @@ func (c *Orchestrator) RetryOutputExport(requestID string) {
 	}
 	c.logf("output export %s published %d file(s) under %s", requestID, len(paths), export.Directory)
 	c.reclaimTmp(requestID)
-}
-
-func materializeJobMedia(export records.OutputExport, outputs []records.Output) ([]records.Output, *exit.Error) {
-	accepted := make(map[string]records.Output, len(outputs))
-	for _, output := range outputs {
-		accepted[output.OutputID] = output
-	}
-	media := make([]records.Output, 0, len(export.Outputs))
-	for _, intended := range export.Outputs {
-		output, ok := accepted[intended.OutputID]
-		if !ok || output.MimeType != intended.MediaType {
-			return nil, exit.Named(exit.Validation, "output_export_contract_mismatch",
-				"accepted output %s does not match its pre-execution media contract", intended.OutputID)
-		}
-		path, problem := resultfiles.Materialize(output.Path, export.Directory, output.Digest, output.MimeType, output.Length)
-		if problem != nil {
-			return nil, problem
-		}
-		output.Path = path
-		media = append(media, output)
-	}
-	return media, nil
 }
 
 // reclaimTmp removes one settled request's `tmp/<id>/` if its writer did not — the

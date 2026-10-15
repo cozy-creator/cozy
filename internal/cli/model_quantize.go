@@ -14,9 +14,9 @@ import (
 var quantizedLanes = []string{"fp8", "mxfp8", "int8"}
 
 // handleModelQuantize runs the quantizer of the package that serves a model. The package
-// owns the recipe (which components and layers); a quantizer is its job that takes the model
-// and declares one weights output named for the lane. It is the ordinary conversion run,
-// `cozy run <package>/<job> <checkpoint> <org/model>`, on the machine the run names.
+// owns the recipe (which components and layers); a quantizer is its function that takes the
+// model and declares one weights output named for the lane. It is the ordinary conversion
+// run, `cozy run <package>/<fn> <checkpoint> <org/model>`, on the machine the run names.
 func handleModelQuantize(ctx *Context) *exit.Error {
 	lane := ""
 	for _, name := range quantizedLanes {
@@ -60,8 +60,8 @@ func handleModelQuantize(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	job := quantizer(surface, lane)
-	if job == nil {
+	fn := quantizer(surface, lane)
+	if fn == nil {
 		reclaimSnapshot(ctx, target)
 		return noQuantizer(lane, "%s %s has no %s quantizer", target.Package, target.Release, lane)
 	}
@@ -73,8 +73,8 @@ func handleModelQuantize(ctx *Context) *exit.Error {
 			return problem
 		}
 	}
-	target.Function = job.Name
-	ctx.Inv.Args = []string{target.Package + "/" + job.Name, source, destination}
+	target.Function = fn.Name
+	ctx.Inv.Args = []string{target.Package + "/" + fn.Name, source, destination}
 	return runTarget(ctx, target, surface)
 }
 
@@ -96,15 +96,13 @@ func holdCheckpoint(ctx *Context, source string) *exit.Error {
 }
 
 // quantizer is the package's function that writes `lane`: a model input and one weights
-// output named for the lane. Runtime 0.25 declares it as an entrypoint, older ones as a job.
+// output named for the lane.
 func quantizer(surface *launch.PackageInterface, lane string) *launch.Entrypoint {
-	for _, functions := range [][]launch.Entrypoint{surface.Entrypoints, surface.Jobs} {
-		for i := range functions {
-			fn := &functions[i]
-			if !fn.Internal && launch.ConversionSlot(fn) != nil && len(fn.WeightsOutputs) == 1 &&
-				fn.WeightsOutputs[0].OutputID == lane {
-				return fn
-			}
+	for i := range surface.Entrypoints {
+		fn := &surface.Entrypoints[i]
+		if !fn.Internal && launch.ConversionSlot(fn) != nil && len(fn.WeightsOutputs) == 1 &&
+			fn.WeightsOutputs[0].OutputID == lane {
+			return fn
 		}
 	}
 	return nil
@@ -113,7 +111,7 @@ func quantizer(surface *launch.PackageInterface, lane string) *launch.Entrypoint
 func noQuantizer(lane, format string, args ...any) *exit.Error {
 	return exit.Named(exit.NotFound, "model.quantizer_not_found", format, args...).
 		WithRemedy("a package quantizes its models with a function that takes the model and declares one weights output named %s, "+
-			"such as `%s(ctx, *, source: <Model>, tel) -> ModelArtifact` registered with `weights=(WeightsOutput(%q, ...),)`; "+
+			"such as `%s(ctx, *, source: Weights[<Model>], tel) -> ModelArtifact` registered with `weights=(WeightsOutput(%q, ...),)`; "+
 			"name the package with --package org/name", lane, lane, lane)
 }
 
@@ -192,7 +190,7 @@ func servingQuantizer(ctx *Context, lane string, ref hub.Ref, checkpoint string)
 		if problem != nil {
 			continue
 		}
-		if job := quantizer(surface, lane); job != nil && len(launch.MissingComponents(job.Models[0], components)) == 0 {
+		if fn := quantizer(surface, lane); fn != nil && len(launch.MissingComponents(fn.Models[0], components)) == 0 {
 			found = append(found, install.Package)
 		}
 	}

@@ -6,13 +6,15 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"github.com/cozy-creator/cozy/internal/archive"
 	"io"
 	"net/http"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
+
+	"github.com/cozy-creator/cozy/internal/archive"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -64,8 +66,19 @@ type Submission struct {
 	GPUs uint32 `json:"gpus,omitempty"`
 	// Ignored names the undeclared fields the client dropped from Input; the run records
 	// them as its warning.
-	Ignored    []string `json:"ignored_fields,omitempty"`
-	AttemptKey string   `json:"-"`
+	Ignored []string `json:"ignored_fields,omitempty"`
+	// WeightsDestination is the requester's repository (org/model) the machine publishes the
+	// function's weights outputs to; empty keeps them on the machine for `cozy run upload`.
+	WeightsDestination string `json:"weights_destination,omitempty"`
+	// Trees are typed input TREES as `ref=<directory>`, captured before the run is recorded.
+	Trees []string `json:"trees,omitempty"`
+	// PlannedSourceBytes is what a provider source the run converts will pull, so a rental
+	// bought for it is sized to it.
+	PlannedSourceBytes int64 `json:"planned_source_bytes,omitempty"`
+	// TimeoutMS is the caller's --timeout: Calcifer cancels the run when it passes, whether
+	// or not a client still waits.
+	TimeoutMS  int64  `json:"timeout_ms,omitempty"`
+	AttemptKey string `json:"-"`
 }
 
 // Handle is the 202 answer: the request's id and where to go next. Verbatim from the
@@ -130,7 +143,8 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 		s.refuseTyped(w, r, problem)
 		return
 	}
-	if (len(sub.LocalAssets) > 0 || sub.OutputDirectory != "" || sub.RequestedRental != "" || sub.MachineEndpoint != nil) && !s.cliAuthenticated(r) {
+	if (len(sub.LocalAssets) > 0 || len(sub.Trees) > 0 || sub.OutputDirectory != "" || sub.RequestedRental != "" ||
+		sub.MachineEndpoint != nil || sub.WeightsDestination != "") && !s.cliAuthenticated(r) {
 		s.refuse(w, r, http.StatusForbidden, "cli_credential_required",
 			"local assets and output directories require the OS-protected CLI credential",
 			"use `cozy run --asset <field-path>=<file>`; this build exposes no browser asset-upload route")
@@ -201,8 +215,9 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 		}
 	} else {
 		var lease *install.Lease
+		var entrypoint *launch.Entrypoint
 		defer func() { lease.Release() }()
-		spec, e = s.resolvePlan(r.Context(), selectedHub, sub, &lease)
+		spec, entrypoint, e = s.resolvePlan(r.Context(), selectedHub, sub, &lease)
 		if e != nil {
 			s.refuseTyped(w, r, e)
 			return
@@ -223,14 +238,14 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 			s.refuseTyped(w, r, e)
 			return
 		}
-		// An inference root is Runtime's to execute on whichever machine runs it: its root
-		// bytes are frozen for native staging before anything is recorded.
+		// Every run is Runtime's to execute on whichever machine runs it: its root bytes and
+		// trees are frozen for native staging before anything is recorded.
 		if s.machineExecutions == nil {
 			s.refuseTyped(w, r, exit.Unavailablef("this Calcifer runs no machines"))
 			return
 		}
 		spec.MachineExecutionObserver = true
-		inputStage, e = s.freezeMachineInputs(&spec, &launch.Entrypoint{Name: spec.Entrypoint})
+		inputStage, e = s.freezeMachineInputs(&spec, entrypoint)
 		defer inputStage.Release()
 		if e != nil {
 			s.refuseTyped(w, r, e)
@@ -241,6 +256,19 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 	if sub.MachineEndpoint != nil {
 		spec.MachineEndpoint = sub.MachineEndpoint
 		spec.Worker = sub.MachineEndpoint.Name()
+	}
+	if sub.TimeoutMS < 0 || sub.TimeoutMS > int64((1<<63-1)/int64(time.Millisecond)) {
+		s.refuseTyped(w, r, exit.New(exit.Validation, "timeout is outside the supported duration range"))
+		return
+	}
+	spec.TimeoutMS = sub.TimeoutMS
+	if existing != nil {
+		if _, spec.DeadlineUnixMS, e = s.store.RequestExecutionTiming(existing.ID); e != nil {
+			s.refuseTyped(w, r, e)
+			return
+		}
+	} else if spec.TimeoutMS > 0 {
+		spec.DeadlineUnixMS = uint64(time.Now().UnixMilli() + spec.TimeoutMS)
 	}
 	// THE BODY DIGEST is over the whole submission the key names, not over the payload
 	// alone: one key that named a different FUNCTION must conflict as loudly as one
@@ -317,7 +345,7 @@ func replaySubmission(sub Submission, recorded records.Request) orchestrator.Sub
 		payload = []byte("{}")
 	}
 	return orchestrator.Submission{
-		Package: sub.Package, Entrypoint: sub.Function, Payload: payload,
+		Package: sub.Package, Entrypoint: sub.Function, Payload: payload, ModelTransfer: recorded.ModelTransfer,
 		Outputs: outputs, PlanID: planID, Worker: recorded.Worker, Assets: assets,
 		InstallID: installID, Release: release,
 		LocalInstallationID: recorded.LocalInstallationID,
@@ -385,6 +413,12 @@ func submissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
 	if spec.RequestedRental != "" {
 		doc["requested_rental"] = spec.RequestedRental
 	}
+	if spec.ModelTransfer != nil {
+		doc["weights_destination"] = spec.ModelTransfer.Destination
+	}
+	if spec.TimeoutMS > 0 {
+		doc["timeout_ms"] = spec.TimeoutMS
+	}
 	if len(spec.Models) > 0 {
 		refs := append([]orchestrator.ModelRef(nil), spec.Models...)
 		sort.Slice(refs, func(i, j int) bool { return refs[i].Slot < refs[j].Slot })
@@ -444,7 +478,7 @@ func (s *Server) publicStatusOf(row records.Request) string {
 // a client never names a plan digest and a submission can never bind a binding this host
 // did not install. The local install it resolves is leased into lease, which the caller
 // releases once the request is recorded.
-func (s *Server) resolvePlan(ctx context.Context, hub string, sub Submission, lease **install.Lease) (orchestrator.Submission, *exit.Error) {
+func (s *Server) resolvePlan(ctx context.Context, hub string, sub Submission, lease **install.Lease) (orchestrator.Submission, *launch.Entrypoint, *exit.Error) {
 	out := orchestrator.Submission{
 		Hub:     hub,
 		Package: sub.Package, Entrypoint: sub.Function, Payload: []byte(sub.Input),
@@ -454,10 +488,10 @@ func (s *Server) resolvePlan(ctx context.Context, hub string, sub Submission, le
 		RequestedRental: sub.RequestedRental, RentNew: sub.RentNew,
 		Models:          append([]orchestrator.ModelRef(nil), sub.Models...),
 		AttentionKernel: sub.AttentionKernel, GPUs: sub.GPUs,
-		OutputDirectory: sub.OutputDirectory,
+		OutputDirectory: sub.OutputDirectory, Trees: sub.Trees, PlannedSourceBytes: sub.PlannedSourceBytes,
 	}
 	if problem := s.validateRequestedRental(out.RequestedRental); problem != nil {
-		return out, problem
+		return out, nil, problem
 	}
 	if len(out.Payload) == 0 {
 		out.Payload = []byte("{}")
@@ -465,42 +499,64 @@ func (s *Server) resolvePlan(ctx context.Context, hub string, sub Submission, le
 	// Only immutable package metadata is validated here. The scheduler chooses and records
 	// the machine after admission.
 	if s.packages == nil {
-		return out, exit.Unavailablef("this Calcifer resolves no packages")
+		return out, nil, exit.Unavailablef("this Calcifer resolves no packages")
 	}
+	var entrypoint *launch.Entrypoint
+	var e *exit.Error
 	if strings.HasPrefix(sub.Package, "local/") {
-		if sub.InstallID != "" {
-			var problem *exit.Error
-			if *lease, problem = install.LeaseInstall(s.layout, s.store, sub.InstallID); problem != nil {
-				return out, problem
+		installID := sub.InstallID
+		if installID != "" {
+			*lease, e = install.LeaseInstall(s.layout, s.store, installID)
+		} else {
+			var editable bool
+			installID, editable, *lease, e = s.leaseRefreshed(sub.Package)
+			if e == nil && !editable {
+				e = exit.Named(exit.Conflict, "local_package_install_invalid",
+					"%s is not one editable local package", sub.Package)
 			}
-			return s.resolveLocalServing(ctx, sub, out, sub.InstallID)
 		}
-		refreshed, editable, leased, refreshProblem := s.leaseRefreshed(sub.Package)
-		*lease = leased
-		if refreshProblem != nil {
-			return out, refreshProblem
+		if e == nil {
+			out, entrypoint, e = s.resolveLocalServing(ctx, sub, out, installID)
 		}
-		if !editable {
-			return out, exit.Named(exit.Conflict, "local_package_install_invalid",
-				"%s is not one editable local package", sub.Package)
-		}
-		return s.resolveLocalServing(ctx, sub, out, refreshed)
+	} else {
+		out, entrypoint, e = s.resolveRemote(hub, sub, out)
 	}
+	if e != nil {
+		return out, nil, e
+	}
+	markWeights(out.Models, entrypoint)
+	out.ModelTransfer, e = weightsDestination(entrypoint, sub.WeightsDestination)
+	return out, entrypoint, e
+}
+
+// markWeights flags each selection that binds a `Weights[M]` argument: read raw, never
+// constructed, so it is never sized onto a device.
+func markWeights(models []orchestrator.ModelRef, entrypoint *launch.Entrypoint) {
+	for i := range models {
+		for _, slot := range entrypoint.Models {
+			if slot.Weights && (models[i].BindingSlot() == slot.Path || models[i].Slot == slot.Param) {
+				models[i].Weights = true
+			}
+		}
+	}
+}
+
+func (s *Server) resolveRemote(hub string, sub Submission, out orchestrator.Submission) (orchestrator.Submission, *launch.Entrypoint, *exit.Error) {
 	release, e := s.installedRelease(hub, sub.Package, sub.Release, sub.InstallID)
 	if e != nil {
-		return out, e
+		return out, nil, e
 	}
 	sub.Release, sub.InstallID, out.Release = release, "", release
 	if sub.Release == "" {
-		return out, exit.Unavailablef("remote execution requires one exact Tensorhub package release")
+		return out, nil, exit.Unavailablef("remote execution requires one exact Tensorhub package release")
 	}
 	logical, entrypoint, e := s.packages.ResolveRemoteRelease(hub,
 		sub.Package, sub.Release, sub.Function, sub.Models)
 	if e != nil {
-		return out, e
+		return out, nil, e
 	}
 	if logical.Package != sub.Package || logical.Release != sub.Release {
-		return out, exit.Named(exit.Conflict, "install_package_mismatch",
+		return out, nil, exit.Named(exit.Conflict, "install_package_mismatch",
 			"queued remote release does not match the resolved Tensorhub release")
 	}
 	out.PlanID = logical.PlanID
@@ -510,12 +566,32 @@ func (s *Server) resolvePlan(ctx context.Context, hub string, sub Submission, le
 		out.Outputs = logical.Outputs
 	}
 	if e := validateInputs(entrypoint, &out); e != nil {
-		return out, e
+		return out, nil, e
 	}
 	if e := s.deriveOutputExport(entrypoint, &out); e != nil {
-		return out, e
+		return out, nil, e
 	}
-	return out, nil
+	return out, entrypoint, nil
+}
+
+// weightsDestination is where the machine publishes a function's weights outputs: the
+// requester's own repository, under the run's capability. Only a function that declares
+// weights outputs takes one.
+func weightsDestination(entrypoint *launch.Entrypoint, destination string) (*records.ModelTransferIntent, *exit.Error) {
+	if destination == "" {
+		return nil, nil
+	}
+	if len(entrypoint.WeightsOutputs) == 0 {
+		return nil, exit.Usagef("%s declares no weights outputs to upload", entrypoint.Name)
+	}
+	if e := hub.ValidPublicationDestination(destination); e != nil {
+		return nil, e
+	}
+	intent := &records.ModelTransferIntent{Kind: "model-upload", Destination: destination}
+	for _, output := range entrypoint.WeightsOutputs {
+		intent.Outputs = append(intent.Outputs, records.ModelTransferOutput{Name: output.OutputID})
+	}
+	return intent, records.NormalizeModelTransferIntent(intent)
 }
 
 // installedRelease is the published release a local install pins. A machine prepares the
@@ -542,10 +618,9 @@ func (s *Server) installedRelease(origin, pkg, release, installID string) (strin
 // files exports nothing and records no obligation.
 func (s *Server) deriveOutputExport(entrypoint *launch.Entrypoint, out *orchestrator.Submission) *exit.Error {
 	paths := launch.AssetPaths(entrypoint.Result)
-	// Jobs export every declared asset, including generic files. Native model
-	// artifacts and weight outputs remain separate and have no asset paths. A list of
-	// assets exports each product published into it.
-	if len(paths) == 0 && len(launch.AssetLists(entrypoint.Result)) == 0 && (out.Kind == "job" || len(out.Outputs) == 0) {
+	// Native model artifacts and weight outputs have no asset paths. A list of assets
+	// exports each product published into it.
+	if len(paths) == 0 && len(launch.AssetLists(entrypoint.Result)) == 0 {
 		return nil
 	}
 	intent, problem := s.outputExportIntent(out)
@@ -558,7 +633,7 @@ func (s *Server) deriveOutputExport(entrypoint *launch.Entrypoint, out *orchestr
 			fixed++
 		}
 	}
-	if out.Kind != "job" && len(paths) != fixed {
+	if len(paths) != fixed {
 		return exit.Named(exit.Validation, "output_export_set_mismatch",
 			"package result declares %d asset paths for %d granted outputs", len(paths), len(out.Outputs))
 	}
@@ -602,17 +677,17 @@ func (s *Server) outputExportIntent(out *orchestrator.Submission) (*records.Outp
 
 func (s *Server) resolveLocalServing(ctx context.Context, sub Submission,
 	out orchestrator.Submission, installID string,
-) (orchestrator.Submission, *exit.Error) {
+) (orchestrator.Submission, *launch.Entrypoint, *exit.Error) {
 	spec, problem := s.packages.ResolveInstall(installID, sub.Models)
 	if problem != nil {
-		return out, problem
+		return out, nil, problem
 	}
 	if spec.Preparation != nil {
 		return s.resolvePendingServing(ctx, sub, out, spec)
 	}
 	placement := spec.Placement
 	if placement.Package != sub.Package {
-		return out, exit.Named(exit.Conflict, "install_package_mismatch",
+		return out, nil, exit.Named(exit.Conflict, "install_package_mismatch",
 			"install %s serves %s, not %s", installID, placement.Package, sub.Package)
 	}
 	if len(out.Models) == 0 {
@@ -622,19 +697,19 @@ func (s *Server) resolveLocalServing(ctx context.Context, sub Submission,
 	}
 	planID, outputs, problem := placementPlan(placement, sub.Function)
 	if problem != nil {
-		return out, problem
+		return out, nil, problem
 	}
 	entrypoint, needsAccelerator, problem := s.packages.Entrypoint(installID, sub.Function)
 	if problem != nil {
-		return out, problem
+		return out, nil, problem
 	}
 	if problem := validateInputs(entrypoint, &out); problem != nil {
-		return out, problem
+		return out, nil, problem
 	}
 	out.NeedsAccelerator = needsAccelerator
 	revision, problem := s.packages.LocalInstallation(installID, out.Hub)
 	if problem != nil {
-		return out, problem
+		return out, nil, problem
 	}
 	out.InstallID, out.PlanID = installID, planID
 	out.Release = revision.Release
@@ -643,9 +718,9 @@ func (s *Server) resolveLocalServing(ctx context.Context, sub Submission,
 		out.Outputs = outputs
 	}
 	if problem := s.deriveOutputExport(entrypoint, &out); problem != nil {
-		return out, problem
+		return out, nil, problem
 	}
-	return out, nil
+	return out, entrypoint, nil
 }
 
 // leaseRefreshed refreshes pkg and, when it is editable, leases the install it now runs
@@ -668,27 +743,27 @@ func (s *Server) leaseRefreshed(pkg string) (string, bool, *install.Lease, *exit
 // resolvePendingServing retains only code and model selections. The worker's
 // completed preparation supplies the binding digest before ordinary dispatch.
 func (s *Server) resolvePendingServing(ctx context.Context, sub Submission, out orchestrator.Submission,
-	spec orchestrator.WorkerLaunchSpec) (orchestrator.Submission, *exit.Error) {
+	spec orchestrator.WorkerLaunchSpec) (orchestrator.Submission, *launch.Entrypoint, *exit.Error) {
 	placement := spec.Placement
 	if placement.Package != sub.Package || spec.Preparation == nil {
-		return out, exit.Named(exit.Conflict, "install_package_mismatch", "unprepared install names another package")
+		return out, nil, exit.Named(exit.Conflict, "install_package_mismatch", "unprepared install names another package")
 	}
 	entrypoint, needsAccelerator, problem := s.packages.Entrypoint(placement.InstallID, sub.Function)
 	if problem != nil {
-		return out, problem
+		return out, nil, problem
 	}
 	if len(entrypoint.Models) > 0 && len(out.Models) == 0 {
-		return out, exit.Named(exit.Validation, "package_model_binding_required", "%s/%s requires exact model selections", sub.Package, sub.Function)
+		return out, nil, exit.Named(exit.Validation, "package_model_binding_required", "%s/%s requires exact model selections", sub.Package, sub.Function)
 	}
 	if problem := validateInputs(entrypoint, &out); problem != nil {
-		return out, problem
+		return out, nil, problem
 	}
 	out.InstallID, out.Release = placement.InstallID, placement.Release
 	out.NeedsAccelerator = needsAccelerator
 	if !spec.Preparation.Published {
 		revision, problem := s.packages.LocalInstallation(placement.InstallID, out.Hub)
 		if problem != nil {
-			return out, problem
+			return out, nil, problem
 		}
 		out.LocalInstallationID = revision.ID
 	}
@@ -696,9 +771,9 @@ func (s *Server) resolvePendingServing(ctx context.Context, sub Submission, out 
 		out.Outputs = launch.OutputSlots(entrypoint.Result)
 	}
 	if problem := s.deriveOutputExport(entrypoint, &out); problem != nil {
-		return out, problem
+		return out, nil, problem
 	}
-	return out, nil
+	return out, entrypoint, nil
 }
 
 // validateInputs checks the payload and every local asset against the entrypoint that
@@ -845,11 +920,17 @@ type Lifecycle struct {
 	ErrorType        string         `json:"error_type,omitempty"`
 	// ErrorCode is the originating component's stable code (for example a pod's
 	// `insufficient_storage`) when the failure did not originate in Creator.
-	ErrorCode      string `json:"error_code,omitempty"`
-	Error          string `json:"error,omitempty"`
-	Retaining      bool   `json:"retaining,omitempty"`
-	RetryAvailable bool   `json:"retry_available,omitempty"`
-	StoppedEventID int64  `json:"stopped_event_id,omitempty"` // an older Calcifer's blocked stop
+	ErrorCode string `json:"error_code,omitempty"`
+	Error     string `json:"error,omitempty"`
+	// Retaining: its machine still holds work for this run.
+	Retaining      bool  `json:"retaining,omitempty"`
+	StoppedEventID int64 `json:"stopped_event_id,omitempty"` // an older Calcifer's blocked stop
+	// ModelDestination is the repository the machine publishes the function's weights
+	// outputs to; ModelOutputs name each output's published checkpoint once it is there.
+	ModelDestination string            `json:"model_destination,omitempty"`
+	ModelOutputs     map[string]string `json:"model_outputs,omitempty"`
+	// RetainedOutputs are held on the machine that produced them, not on this host.
+	RetainedOutputs []RetainedOutput `json:"retained_outputs,omitempty"`
 	// CanceledBy is the recorded actor behind a canceled run (cl-108): the explicit
 	// `cozy run cancel`, a caller-authored --timeout, `cozy down --all` — never blank
 	// for a run this Calcifer canceled on request.
@@ -966,13 +1047,10 @@ func (s *Server) lifecycleOf(row records.Request) Lifecycle {
 	return life
 }
 
-// runKind is the kind a run is listed under: a function's run (`invocation`), a job, or an
+// runKind is the kind a run is listed under: a function's run (`invocation`), or an
 // operation's own kind with its target.
 func runKind(row records.Request) (string, string) {
-	switch {
-	case row.IsJob():
-		return "job", ""
-	case row.IsOperation():
+	if row.IsOperation() {
 		op, _ := row.Operation()
 		return row.Kind, op.Target()
 	}
@@ -981,17 +1059,7 @@ func runKind(row records.Request) (string, string) {
 
 func (s *Server) lifecycleFacts(row records.Request) Lifecycle {
 	if link, problem := s.store.MachineExecution(row.ID); problem == nil && link != nil {
-		state := s.machineJobState(row, link)
-		machine := s.machineWord(row, link)
-		kind, target := runKind(row)
-		life := Lifecycle{Number: row.Number, Kind: kind, Target: target, RequestID: row.ID, Status: state.Status,
-			Package: row.Package, Function: row.Entrypoint, Release: row.Release, Attempt: state.Attempt, Attempts: state.Attempts,
-			ExecutionMS: state.ExecutionMS, ExecutionKnown: state.ExecutionKnown, Memo: state.Memo,
-			AttemptWallMS: state.AttemptWallMS, QueuedMS: state.QueuedMS,
-			Result: state.Result, Error: state.Error, ErrorType: state.ErrorType, ErrorCode: state.ErrorCode, Outputs: state.Outputs, Output: state.Output,
-			Rental: row.Rental, RentalID: row.Worker, Machine: machine, CreatedAt: row.CreatedAt,
-			ResponseURL: "/v1/requests/" + row.ID, MachineExecution: state.MachineExecution,
-			Retaining: state.Retaining, RetryAvailable: state.RetryAvailable, StoppedEventID: state.StoppedEventID}
+		life := s.machineLifecycle(row, link)
 		if life.Status == "queued" {
 			if phase, ok := s.orchestrator.PhaseOf(row.ID); ok {
 				fillPhase(&life, phase)
@@ -1005,13 +1073,6 @@ func (s *Server) lifecycleFacts(row records.Request) Lifecycle {
 			life.ObservationLost, _ = s.store.ObservationLost(row.ID)
 		}
 		s.fillGPUWait(&life, row)
-		life.OutputExport = s.outputExportOf(row.ID)
-		if life.Status == "canceled" {
-			// A canceled run says WHO (cl-108), whichever machine ran it.
-			if actor, _, _, problem := s.store.CancelAttribution(row.ID); problem == nil {
-				life.CanceledBy = actor
-			}
-		}
 		if awaiting, problem := s.store.MachinePublicationsAwaitingOwner(row.ID); problem == nil && len(awaiting) > 0 {
 			life.Phase, life.PhaseDetail = orchestrator.PhaseOwnerReconciliation, awaiting[0].Publication
 		}
@@ -1025,8 +1086,6 @@ func (s *Server) lifecycleFacts(row records.Request) Lifecycle {
 		ResponseURL: "/v1/requests/" + row.ID, CreatedAt: row.CreatedAt,
 		Outputs: []MediaRef{}, Rental: row.Rental, RentalID: row.Worker,
 	}
-	life.Retaining, _ = s.store.RequestRetaining(row)
-	life.RetryAvailable = s.store.RetainedRetryAvailable(row)
 	if row.RequestedRental != "" {
 		life.RequestedRental, life.RequestedMachine = row.RequestedRental, row.Machine
 	}
@@ -1220,7 +1279,7 @@ func (s *Server) cancelRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	actor := requestActor(r)
-	if s.machineRequestControl(w, r, *row, "cancel", actor) {
+	if s.machineRequestCancel(w, r, *row, actor) {
 		return
 	}
 	if status := contractStatus(row.State); status == "completed" || status == "failed" || status == "canceled" {
@@ -1378,3 +1437,75 @@ func GPUWaitDetail(width, held int, ownRun bool) string {
 	}
 	return detail
 }
+
+// Memo is how its machine's memo answered a memoizable run: from a result it held (nothing
+// ran), the computation it ran or answered, or why it was neither looked up nor held.
+type Memo struct {
+	Memoized    bool   `json:"memoized,omitempty"`
+	Computation string `json:"computation,omitempty"`
+	Unmemoized  string `json:"unmemoized,omitempty"`
+}
+
+func parseStamp(s string) time.Time {
+	t, err := time.Parse(time.RFC3339Nano, s)
+	if err != nil {
+		return time.Time{}
+	}
+	return t
+}
+
+// queuedMS is the time a request spent WAITING: from submission to its first dispatch,
+// or — for a request that never dispatched — to its terminal, or to now while it waits.
+func queuedMS(row records.Request, attempts []records.Attempt, terminalAt string) int64 {
+	began := parseStamp(row.CreatedAt)
+	if began.IsZero() {
+		return 0
+	}
+	end := time.Now().UTC()
+	if len(attempts) > 0 {
+		if dispatched := parseStamp(attempts[0].DispatchedAt); !dispatched.IsZero() {
+			end = dispatched
+		}
+	} else if settledRequestState(row.State) {
+		if terminal := parseStamp(terminalAt); !terminal.IsZero() {
+			end = terminal
+		}
+	}
+	return max(end.Sub(began).Milliseconds(), 0)
+}
+
+// executionMS is the time a request spent RUNNING: each attempt from its dispatch to its
+// close (or to the terminal, or to now while it runs), summed. Queue time is never in it.
+func executionMS(row records.Request, attempts []records.Attempt, terminalAt string) int64 {
+	var total int64
+	now := time.Now().UTC()
+	terminal := parseStamp(terminalAt)
+	for _, attempt := range attempts {
+		began := parseStamp(attempt.DispatchedAt)
+		if began.IsZero() {
+			continue
+		}
+		end := now
+		switch {
+		case attempt.ClosedAt != "":
+			if closed := parseStamp(attempt.ClosedAt); !closed.IsZero() {
+				end = closed
+			}
+		case settledRequestState(row.State) && !terminal.IsZero():
+			end = terminal
+		}
+		total += max(end.Sub(began).Milliseconds(), 0)
+	}
+	return total
+}
+
+func settledRequestState(state string) bool {
+	switch state {
+	case "succeeded", "failed", "canceled", "refused", "abandoned":
+		return true
+	default:
+		return false
+	}
+}
+
+// ------------------------------------------------------------------------- cancel

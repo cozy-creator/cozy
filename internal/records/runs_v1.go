@@ -47,7 +47,7 @@ func (s *Store) MarkRunV1Sent(id string) (bool, *exit.Error) {
 	if err != nil {
 		return false, exit.Internalf("cannot read machine dispatch: %s", err)
 	}
-	if machine == "" || canceled || abandoned || Settled(state) || state == "pausing" || state == "paused" {
+	if machine == "" || canceled || abandoned || Settled(state) {
 		return false, nil
 	}
 	if !sent {
@@ -174,11 +174,8 @@ func projectRunV1(tx *sql.Tx, id string, state *v1.RunState, atMS int64) error {
 		next = "queued"
 	case "running":
 		next = "dispatching"
-	case "pausing", "paused":
-		next = state.State
 	}
-	// A pausing job's root still reads running until it has stopped.
-	if next == "" || Settled(current) || current == "pausing" && next == "dispatching" {
+	if next == "" || Settled(current) {
 		return nil
 	}
 	if cancel {
@@ -193,11 +190,6 @@ func projectRunV1(tx *sql.Tx, id string, state *v1.RunState, atMS int64) error {
 	}
 	if next == "dispatching" && current != "dispatching" {
 		if err := appendEventTx(tx, id, "run.in_progress", int64(state.Attempt), stamped("started_unix_ms")); err != nil {
-			return err
-		}
-	}
-	if next == "paused" && current != "paused" {
-		if err := appendEventTx(tx, id, "request.paused", int64(state.Attempt), stamped("paused_unix_ms")); err != nil {
 			return err
 		}
 	}
@@ -473,7 +465,7 @@ func recordRunEndV1(tx *sql.Tx, id string, attempt uint64, raw []byte, end RunEn
 	if _, err := tx.Exec(`UPDATE machine_executions SET outcome=?, pending_control=x'', cancel_requested=0 WHERE request_id=?`, raw, id); err != nil {
 		return exit.Internalf("cannot retain the run's outcome: %s", err)
 	}
-	if _, err := tx.Exec(`UPDATE requests SET state=CASE WHEN state='canceled' THEN state ELSE ? END, retain_work=0 WHERE id=?`, state, id); err != nil {
+	if _, err := tx.Exec(`UPDATE requests SET state=CASE WHEN state='canceled' THEN state ELSE ? END WHERE id=?`, state, id); err != nil {
 		return exit.Internalf("cannot settle the run: %s", err)
 	}
 	finished := map[string]any{"machine_execution": true, "state": outcome.Status}

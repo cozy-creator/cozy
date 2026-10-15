@@ -48,28 +48,28 @@ type PackageInterface struct {
 	Format      string
 	Application string
 	Entrypoints []Entrypoint
-	Jobs        []Entrypoint
 	Unavailable map[string]*exit.Error
 	Raw         json.RawMessage
 }
 
-// Entrypoint is one callable surface: its request schema, its declared model slots, and
-// its result shape.
+// Entrypoint is one function: its request schema, its declared model slots, and its result
+// shape. Every function is called the same way; what it may write is its declaration.
 type Entrypoint struct {
-	Name         string `json:"name"`
-	Internal     bool   `json:"internal,omitempty"`
-	Kind         string `json:"-"`
+	Name     string `json:"name"`
+	Internal bool   `json:"internal,omitempty"`
+	// DescriptorID is `descriptor_id`: sha256 of the entry's canonical bytes, derived here
+	// exactly as `cozy-runtime describe <fn> --json` derives it, never stored.
 	DescriptorID string `json:"-"`
 	Models       []Slot `json:"models"`
 	Request      Struct `json:"request"`
 	Result       Struct `json:"result"`
 	Publishes    bool   `json:"publishes"`
-	// WeightsOutputs is the job's explicit WeightsSink slot set. It is separate from
-	// result asset fields because worker-protocol rev5 OutputBinding has no kind.
+	// WeightsOutputs are the TensorFS model outputs (lanes) the function writes.
 	WeightsOutputs []WeightsOutput `json:"weights_outputs"`
 	Invocable      *Invocable      `json:"invocable,omitempty"`
 	Assets         *AssetsSlot     `json:"assets,omitempty"`
-	// Accelerator is a job's own execution-device declaration; nil when undeclared.
+	// Accelerator is written only as false: the function never opens CUDA. Absent, it runs
+	// on the machine's GPU when the machine has one.
 	Accelerator *bool `json:"accelerator,omitempty"`
 }
 
@@ -107,7 +107,9 @@ type Slot struct {
 	Fusion           string                 `json:"fusion,omitempty"`
 	SequenceParallel json.RawMessage        `json:"sequence_parallel,omitempty"`
 	DefaultLadder    []ModelDefaultRung     `json:"default_ladder,omitempty"`
-	DefaultBinding   *hub.PackageBindingRow `json:"-"`
+	// Weights is a `Weights[M]` argument: the raw checkpoint, read and never constructed.
+	Weights        bool                   `json:"weights,omitempty"`
+	DefaultBinding *hub.PackageBindingRow `json:"-"`
 }
 
 // ModelDefaultRung binds a GPU pattern to a full org/model@release/lane reference.
@@ -244,7 +246,7 @@ func MissingComponents(slot Slot, available []string) []string {
 
 func validateEntrypoint(ep *Entrypoint) *exit.Error {
 	if ep.Name == "" {
-		return exit.New(exit.Validation, "package interface carries an unnamed %s", ep.Kind)
+		return exit.New(exit.Validation, "package interface carries an unnamed function")
 	}
 	for i := range ep.Models {
 		slot := &ep.Models[i]
@@ -277,9 +279,6 @@ func validateEntrypoint(ep *Entrypoint) *exit.Error {
 				"%s result %s contains a native output in a collection without fixed destination grants", ep.Name, path).
 				WithRemedy("return one FileAsset or Tree, or a fixed msgspec.Struct with named output fields")
 		}
-	}
-	if ep.Kind != "job" && len(ep.WeightsOutputs) > 0 {
-		return exit.New(exit.Validation, "%s declares weights outputs outside the job surface", ep.Name)
 	}
 	seenWeights := map[string]bool{}
 	for _, output := range ep.WeightsOutputs {
@@ -365,8 +364,7 @@ func ReadPackageInterface(path string) (*PackageInterface, *exit.Error) {
 }
 
 // DecodePackageInterface reads the package-interface/1 members this host consumes and derives
-// its canonical interface facts. Collection membership supplies callable kind; the document
-// does not repeat it.
+// each function's descriptor identity.
 func DecodePackageInterface(data []byte) (*PackageInterface, *exit.Error) {
 	if len(data) > canonical.DocMax {
 		return nil, exit.New(exit.Validation, "%s exceeds the %d-byte cap", PackageInterfaceFile, canonical.DocMax)
@@ -379,7 +377,6 @@ func DecodePackageInterface(data []byte) (*PackageInterface, *exit.Error) {
 		Format      string            `json:"format"`
 		Application string            `json:"application"`
 		Entrypoints []json.RawMessage `json:"entrypoints"`
-		Jobs        []json.RawMessage `json:"jobs"`
 	}
 	if err := json.Unmarshal(normalized, &doc); err != nil {
 		return nil, exit.New(exit.Validation, "%s is not a package interface document: %s", PackageInterfaceFile, err)
@@ -388,28 +385,23 @@ func DecodePackageInterface(data []byte) (*PackageInterface, *exit.Error) {
 		return nil, exit.New(exit.Validation, "%s format/application is invalid", PackageInterfaceFile)
 	}
 	d := &PackageInterface{Format: doc.Format, Application: doc.Application, Unavailable: map[string]*exit.Error{}, Raw: normalized}
-	for kind, rows := range map[string][]json.RawMessage{"entrypoint": doc.Entrypoints, "job": doc.Jobs} {
-		for _, raw := range rows {
-			callable, problem := decodeCallable(kind, raw)
-			switch {
-			case problem != nil:
-				if problem.Remedy == "" {
-					problem.Remedy = "update cozy, or call another function of this package"
-				}
-				d.Unavailable[callable.Name] = problem
-			case kind == "job":
-				d.Jobs = append(d.Jobs, callable)
-			default:
-				d.Entrypoints = append(d.Entrypoints, callable)
+	for _, raw := range doc.Entrypoints {
+		callable, problem := decodeCallable(raw)
+		if problem != nil {
+			if problem.Remedy == "" {
+				problem.Remedy = "update cozy, or call another function of this package"
 			}
+			d.Unavailable[callable.Name] = problem
+			continue
 		}
+		d.Entrypoints = append(d.Entrypoints, callable)
 	}
 	return d, nil
 }
 
-// decodeCallable reads one entrypoint or job. One this host cannot read is refused alone: its
-// problem answers every call of it.
-func decodeCallable(kind string, raw json.RawMessage) (Entrypoint, *exit.Error) {
+// decodeCallable reads one function. One this host cannot read is refused alone: its problem
+// answers every call of it.
+func decodeCallable(raw json.RawMessage) (Entrypoint, *exit.Error) {
 	var extra struct {
 		Name           string                       `json:"name"`
 		Internal       json.RawMessage              `json:"internal"`
@@ -417,7 +409,7 @@ func decodeCallable(kind string, raw json.RawMessage) (Entrypoint, *exit.Error) 
 		WeightsOutputs []map[string]json.RawMessage `json:"weights_outputs"`
 	}
 	_ = json.Unmarshal(raw, &extra)
-	callable := Entrypoint{Name: extra.Name, Kind: kind}
+	callable := Entrypoint{Name: extra.Name}
 	if err := json.Unmarshal(raw, &callable); err != nil {
 		return Entrypoint{Name: extra.Name}, exit.New(exit.Validation, "%s is not readable here: %s", extra.Name, err)
 	}
@@ -426,21 +418,19 @@ func decodeCallable(kind string, raw json.RawMessage) (Entrypoint, *exit.Error) 
 		return callable, exit.New(exit.Validation, "%s internal must be a boolean", callable.Name)
 	}
 	admitAssetsSlot(&callable, extra.Assets)
-	if kind == "job" {
-		// A new-byte budget has no safe default: zero would refuse the job's own output.
-		for _, output := range extra.WeightsOutputs {
-			if budget, present := output["max_bytes"]; !present || string(budget) == "null" {
-				return callable, exit.New(exit.Validation, "%s weights outputs need an explicit max_bytes", callable.Name)
-			}
+	// A new-byte budget has no safe default: zero would refuse the function's own output.
+	for _, output := range extra.WeightsOutputs {
+		if budget, present := output["max_bytes"]; !present || string(budget) == "null" {
+			return callable, exit.New(exit.Validation, "%s weights outputs need an explicit max_bytes", callable.Name)
 		}
-		digest := sha256.Sum256(append([]byte("cozy.runtime.job-descriptor\x00"), raw...))
-		callable.DescriptorID, _ = canonical.Spell(digest[:])
 	}
+	digest := sha256.Sum256(append([]byte("cozy.runtime.descriptor\x00"), raw...))
+	callable.DescriptorID, _ = canonical.Spell(digest[:])
 	problem := validateEntrypoint(&callable)
 	return callable, problem
 }
 
-// Function finds one entrypoint or job by name.
+// Function finds one function by name.
 func (d *PackageInterface) Function(name string) (*Entrypoint, *exit.Error) {
 	if problem, unavailable := d.Unavailable[name]; unavailable {
 		return nil, problem
@@ -448,11 +438,6 @@ func (d *PackageInterface) Function(name string) (*Entrypoint, *exit.Error) {
 	for i := range d.Entrypoints {
 		if d.Entrypoints[i].Name == name {
 			return &d.Entrypoints[i], nil
-		}
-	}
-	for i := range d.Jobs {
-		if d.Jobs[i].Name == name {
-			return &d.Jobs[i], nil
 		}
 	}
 	return nil, exit.New(exit.NotFound, "this release registers no function %q", name).
@@ -465,7 +450,7 @@ func (d *PackageInterface) DeclaresSlot(path string) bool {
 	declares := func(callable Entrypoint) bool {
 		return slices.ContainsFunc(callable.Models, func(slot Slot) bool { return slot.Path == path })
 	}
-	return slices.ContainsFunc(d.Entrypoints, declares) || slices.ContainsFunc(d.Jobs, declares)
+	return slices.ContainsFunc(d.Entrypoints, declares)
 }
 
 // RequirePublic guards user-facing discovery and root submission. Managed child
@@ -478,11 +463,11 @@ func (e *Entrypoint) RequirePublic() *exit.Error {
 	return nil
 }
 
-// ModelSlotPaths is every entrypoint and job model-slot path, sorted unique: the
-// wire's model_slot_paths.
+// ModelSlotPaths is every function's model-slot path, sorted unique: the wire's
+// model_slot_paths.
 func (d *PackageInterface) ModelSlotPaths() []string {
 	paths := []string{}
-	for _, entry := range append(append([]Entrypoint(nil), d.Entrypoints...), d.Jobs...) {
+	for _, entry := range d.Entrypoints {
 		for _, model := range entry.Models {
 			paths = append(paths, model.Path)
 		}
@@ -494,7 +479,7 @@ func (d *PackageInterface) ModelSlotPaths() []string {
 // Names lists all registered callables for execution and dependency capture.
 func (d *PackageInterface) Names() []string { return d.names(false) }
 
-// PublicNames lists only externally callable entrypoints and jobs.
+// PublicNames lists only externally callable functions.
 func (d *PackageInterface) PublicNames() []string { return d.names(true) }
 
 func (d *PackageInterface) names(publicOnly bool) []string {
@@ -502,11 +487,6 @@ func (d *PackageInterface) names(publicOnly bool) []string {
 	for _, e := range d.Entrypoints {
 		if !publicOnly || !e.Internal {
 			out = append(out, e.Name)
-		}
-	}
-	for _, j := range d.Jobs {
-		if !publicOnly || !j.Internal {
-			out = append(out, j.Name)
 		}
 	}
 	sort.Strings(out)
@@ -584,8 +564,8 @@ func typeOf(raw json.RawMessage) (kind string, nested Struct) {
 	if _, ok := object["literal"]; ok {
 		return "literal", Struct{}
 	}
-	// A job's typed INPUT tree (cr-009). It is not an asset and not a scalar struct: its
-	// wire value is a REF, and the grant is what turns that ref into a readable path.
+	// A typed INPUT tree. It is not an asset and not a scalar struct: its wire value is a
+	// REF, and the captured tree is what turns that ref into readable bytes.
 	if kind, ok := object["input"]; ok && string(kind) == `"tree"` {
 		return "tree", Struct{}
 	}

@@ -18,9 +18,6 @@ func RentalOwedBy(st *records.Store, row records.Rental) (bool, *exit.Error) {
 	if owed, problem := st.RentalHasMachineObligations(row.ID); problem != nil || owed {
 		return owed, problem
 	}
-	if retained, problem := st.RentalRetainsWork(row.ID); problem != nil || retained {
-		return retained, problem
-	}
 	if row.ManagedRequestID == "" {
 		return false, nil
 	}
@@ -46,5 +43,5 @@ func RentalSpent(st *records.Store, row records.Rental) (bool, *exit.Error) {
 	if problem != nil {
 		return false, problem
 	}
-	return !found || last.Kind == "job" || last.ClosedAt.IsZero(), nil
+	return !found || last.ClosedAt.IsZero(), nil
 }

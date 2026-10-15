@@ -16,7 +16,7 @@ func (s *Store) RentalWorkCounts(id, buyer string) (queued, running int, problem
 	const accepted = `EXISTS(SELECT 1 FROM machine_executions e WHERE e.request_id=r.id AND length(e.receipt)>0)`
 	err := s.db.QueryRow(`SELECT
  COALESCE(SUM(CASE WHEN r.state IN ('submitted','queued','requeue_pending') AND NOT `+accepted+` THEN 1 ELSE 0 END),0),
- COALESCE(SUM(CASE WHEN r.state IN ('dispatching','finalizing','pausing','canceling') OR
+ COALESCE(SUM(CASE WHEN r.state IN ('dispatching','finalizing','canceling') OR
  r.state IN ('submitted','queued','requeue_pending') AND `+accepted+` OR
  EXISTS(SELECT 1 FROM attempts a WHERE a.request_id=r.id AND a.state IN ('preparing','offered','accepted','recovered_open')) THEN 1 ELSE 0 END),0)
  FROM requests r WHERE `+pinned+` OR

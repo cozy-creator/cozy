@@ -3,13 +3,13 @@ package api
 import (
 	"context"
 	"encoding/json"
-	"github.com/cozy-creator/cozy/internal/archive"
 	"math"
 	"net/http"
 	"regexp"
-	"slices"
 	"strconv"
 	"time"
+
+	"github.com/cozy-creator/cozy/internal/archive"
 
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/machineendpoint"
@@ -18,9 +18,8 @@ import (
 
 type MachineExecutions interface {
 	Refresh(context.Context, records.Request) *exit.Error
-	// Cancel control only wakes delivery of recorded intent; it must not wait
-	// for remote I/O. Pause and resume retain synchronous control semantics.
-	Control(context.Context, records.Request, string) *exit.Error
+	// Cancel only wakes delivery of recorded intent; it must not wait for remote I/O.
+	Cancel(context.Context, records.Request) *exit.Error
 	// Withdraw stops a canceled request's submission work that has not reached Runtime.
 	Withdraw(string)
 	// Status is one machine's picture as it reports it (cozy.machine.v1 Status).
@@ -189,7 +188,8 @@ func (s *Server) machineWord(row records.Request, link *records.MachineExecution
 	return link.MachineID
 }
 
-func (s *Server) machineJobState(row records.Request, link *records.MachineExecution) JobState {
+// machineLifecycle is a run its machine executes, as this computer observes it.
+func (s *Server) machineLifecycle(row records.Request, link *records.MachineExecution) Lifecycle {
 	machine := s.machineWord(row, link)
 	view := &MachineExecutionView{Accepted: len(link.Receipt) > 0, Machine: machine, Collected: link.Collected, AbandonedLocally: link.Abandoned}
 	v1run, _ := s.store.RunV1(row.ID)
@@ -220,12 +220,14 @@ func (s *Server) machineJobState(row records.Request, link *records.MachineExecu
 			}
 		}
 	}
-	state := JobState{
-		Number: row.Number, JobID: row.ID, Status: s.publicStatusOf(row), Package: row.Package,
-		Function: row.Entrypoint, Attempt: uint64(row.Ordinal), Attempts: int(row.Ordinal),
-		RetainWork: row.RetainWork, Retaining: retaining, RetainedOutputs: retained,
-		RetryAvailable: s.store.RetainedRetryAvailable(row),
-		CreatedAt:      row.CreatedAt, EventsURL: "/v1/requests/" + row.ID + "/events", Outputs: []MediaRef{},
+	kind, target := runKind(row)
+	state := Lifecycle{
+		Number: row.Number, Kind: kind, Target: target, RequestID: row.ID, Status: s.publicStatusOf(row),
+		Package: row.Package, Function: row.Entrypoint, Release: row.Release,
+		Attempt: uint64(row.Ordinal), Attempts: int(row.Ordinal),
+		Retaining: retaining, RetainedOutputs: retained,
+		Rental: row.Rental, RentalID: row.Worker, Machine: machine,
+		CreatedAt: row.CreatedAt, ResponseURL: "/v1/requests/" + row.ID, Outputs: []MediaRef{},
 		MachineExecution: view,
 	}
 	state.OutputExport = s.outputExportOf(row.ID)
@@ -249,12 +251,6 @@ func (s *Server) machineJobState(row records.Request, link *records.MachineExecu
 		}
 	}
 	if !view.Accepted {
-		if state.Status == "queued" {
-			state.Stage = "waiting for durable machine acceptance"
-			if len(link.Submission) > 0 {
-				state.Stage = "reconciling durable machine acceptance"
-			}
-		}
 		if events, problem := s.store.EventsAfter(row.ID, 0, 256); problem == nil {
 			for _, event := range events {
 				if event.Type == "run.failed" {
@@ -265,14 +261,6 @@ func (s *Server) machineJobState(row records.Request, link *records.MachineExecu
 			}
 		}
 	}
-	if view.Accepted && state.Status == "in_progress" {
-		// No live fanout carries Runtime-owned progress; the imported sample does.
-		if samples, problem := s.store.MachineProgressSamples(row.ID, row.Ordinal); problem == nil && len(samples) > 0 {
-			state.Progress = samples[0]
-			state.Stage, _ = samples[0]["stage"].(string)
-		}
-	}
-	var terminal *archive.Terminal
 	if outcome := records.RunV1Outcome(link); v1run && outcome != nil {
 		// A cozy.machine.v1 run's outcome carries its result, typed reason and memo.
 		state.Memo = Memo{Memoized: outcome.Memoized, Computation: outcome.ComputationDigest, Unmemoized: outcome.Unmemoized}
@@ -287,7 +275,6 @@ func (s *Server) machineJobState(row records.Request, link *records.MachineExecu
 		}
 	} else if len(link.Outcome) > 0 && !v1run {
 		if body, err := archive.ReadOutcome(link.Outcome); err == nil {
-			terminal = body
 			if state.ErrorType == "" && body.Cause != "" && body.Status != 1 {
 				state.Error = body.Message
 				state.ErrorType = body.Cause
@@ -307,13 +294,6 @@ func (s *Server) machineJobState(row records.Request, link *records.MachineExecu
 			}
 		}
 	}
-	if intervals, problem := s.store.MachineExecutionIntervals(row.ID); problem != nil {
-		view.ObservationError = problem.Message
-	} else {
-		if !v1run {
-			state.AttemptWallMS = machineAttemptWallMS(row, link, intervals, terminal, time.Now().UnixMilli())
-		}
-	}
 	if v1run {
 		// Until its machine measures the run, its execution is its time running so far.
 		live := !records.Settled(row.State)
@@ -329,7 +309,7 @@ func (s *Server) machineJobState(row records.Request, link *records.MachineExecu
 		state.ExecutionMS, state.ExecutionKnown = int64(outcome.ExecutionMs), true
 	}
 	if state.Status == "canceled" {
-		// A canceled run says WHO (cl-108), as a job without a machine does.
+		// A canceled run says WHO (cl-108).
 		if actor, _, _, problem := s.store.CancelAttribution(row.ID); problem == nil {
 			state.CanceledBy = actor
 		}
@@ -337,78 +317,8 @@ func (s *Server) machineJobState(row records.Request, link *records.MachineExecu
 	return state
 }
 
-// Machine attempts belong to Runtime. Count each admission-to-outcome interval,
-// just as local attempts count dispatch-to-close. Paused/retry gaps and delayed
-// result collection are outside those intervals. An active interval alone uses
-// the current clock; a terminal interval never grows when read back later.
-func machineAttemptWallMS(row records.Request, link *records.MachineExecution, intervals []records.MachineExecutionInterval, terminal *archive.Terminal, now int64) int64 {
-	receipt, err := archive.ReadReceipt(link.Receipt)
-	if err != nil || receipt.RequestID != row.ID ||
-		receipt.AcceptedMS == 0 || receipt.AcceptedMS > math.MaxInt64 {
-		return 0
-	}
-	type span struct{ start, end int64 }
-	spans := map[int64]span{1: {start: int64(receipt.AcceptedMS)}}
-	for _, interval := range intervals {
-		if interval.Attempt <= 0 {
-			continue
-		}
-		value := spans[interval.Attempt]
-		if interval.Attempt > 1 {
-			if stamp := parseStamp(interval.ResumedAt); !stamp.IsZero() {
-				value.start = stamp.UnixMilli()
-			}
-		}
-		if stamp := parseStamp(interval.FinishedAt); !stamp.IsZero() {
-			value.end = stamp.UnixMilli()
-		}
-		spans[interval.Attempt] = value
-	}
-	current := max(row.Ordinal, 1)
-	if _, exists := spans[current]; !exists {
-		spans[current] = span{}
-	}
-	var total int64
-	for attempt, value := range spans {
-		if attempt == current && (value.start == 0 || value.end == 0) {
-			// Older observations may have retained the terminal without its event
-			// page. The outcome's own measured runtime is the bounded fallback.
-			if terminal != nil && terminal.Attempt == uint64(attempt) &&
-				terminal.RuntimeMS <= math.MaxInt64 && !slices.Contains(terminal.Unverified, "runtime_ms") {
-				total += int64(terminal.RuntimeMS)
-				continue
-			}
-			switch row.State {
-			case "submitted", "queued", "dispatching", "pausing", "canceling":
-				value.end = now
-			}
-		}
-		if value.start > 0 && value.end > value.start {
-			total += value.end - value.start
-		}
-	}
-	return total
-}
-
-func (s *Server) machineJobControl(w http.ResponseWriter, r *http.Request, row records.Request, action, actor string) bool {
-	owned, problem := s.controlMachineExecution(r.Context(), row, action, actor)
-	if !owned {
-		return false
-	}
-	if problem != nil {
-		s.refuseTyped(w, r, problem)
-		return true
-	}
-	if latest, e := s.store.RequestRow(row.ID); e == nil && latest != nil {
-		latest.Number = row.Number
-		row = *latest
-	}
-	s.ok(w, r, http.StatusAccepted, s.jobStateOf(row))
-	return true
-}
-
-func (s *Server) machineRequestControl(w http.ResponseWriter, r *http.Request, row records.Request, action, actor string) bool {
-	owned, problem := s.controlMachineExecution(r.Context(), row, action, actor)
+func (s *Server) machineRequestCancel(w http.ResponseWriter, r *http.Request, row records.Request, actor string) bool {
+	owned, problem := s.cancelMachineExecution(r.Context(), row, actor)
 	if !owned {
 		return false
 	}
@@ -424,7 +334,7 @@ func (s *Server) machineRequestControl(w http.ResponseWriter, r *http.Request, r
 	return true
 }
 
-func (s *Server) controlMachineExecution(ctx context.Context, row records.Request, action, actor string) (bool, *exit.Error) {
+func (s *Server) cancelMachineExecution(ctx context.Context, row records.Request, actor string) (bool, *exit.Error) {
 	link, problem := s.store.MachineExecution(row.ID)
 	if problem != nil {
 		return true, problem
@@ -433,12 +343,9 @@ func (s *Server) controlMachineExecution(ctx context.Context, row records.Reques
 		return false, nil
 	}
 	if link.Abandoned {
-		if action == "cancel" {
-			return true, nil
-		}
-		return true, exit.Named(exit.Conflict, "request.abandoned", "this run was abandoned locally and cannot be resumed")
+		return true, nil
 	}
-	if action == "cancel" && records.Settled(row.State) && !row.RetainWork {
+	if records.Settled(row.State) {
 		// Already terminal and holding nothing a cancel would release: the same answer
 		// again, without asking the machine. A completed run's collection releases what it
 		// holds; any other ended run its Runtime still retains is released by this cancel.
@@ -447,22 +354,16 @@ func (s *Server) controlMachineExecution(ctx context.Context, row records.Reques
 			return true, problem
 		}
 	}
-	if action == "cancel" {
-		if actor == "" {
-			actor = "an unnamed api client"
-		}
-		if _, problem := s.store.RequestMachineCancellation(row.ID, actor); problem != nil {
-			return true, problem
-		}
-		// Control's cancel arm only wakes the existing observer. The durable
-		// request survives a closing Calcifer or an unavailable machine.
-		if s.machineExecutions != nil {
-			_ = s.machineExecutions.Control(ctx, row, action)
-		}
-		return true, nil
+	if actor == "" {
+		actor = "an unnamed api client"
 	}
-	if s.machineExecutions == nil {
-		return true, exit.Unavailablef("this client cannot control Runtime-owned execution")
+	if _, problem := s.store.RequestMachineCancellation(row.ID, actor); problem != nil {
+		return true, problem
 	}
-	return true, s.machineExecutions.Control(ctx, row, action)
+	// Cancel only wakes the existing observer. The durable request survives a closing
+	// Calcifer or an unavailable machine.
+	if s.machineExecutions != nil {
+		_ = s.machineExecutions.Cancel(ctx, row)
+	}
+	return true, nil
 }

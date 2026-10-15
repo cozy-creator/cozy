@@ -1013,23 +1013,6 @@ func (s *Store) RentalWorkByID() (map[string]RentalWork, *exit.Error) {
 	return work, nil
 }
 
-// RentalHasRetainedJob keeps unacknowledged job outcomes and unfinished successful
-// publications out of new capacity, even after a connection or request has failed.
-// This does not retire or release a manually rented machine.
-func (s *Store) RentalHasRetainedJob(id string) (bool, *exit.Error) {
-	var retained bool
-	err := s.db.QueryRow(`SELECT EXISTS (
-		SELECT 1 FROM requests r JOIN attempts a ON a.request_id=r.id
-		WHERE r.worker=? AND r.rental=1 AND r.kind='job' AND (
-		  a.state='terminal' OR (a.state='closed' AND a.terminal_status='SUCCEEDED'
-		    AND EXISTS (SELECT 1 FROM request_model_transfers t WHERE t.request_id=r.id
-		      AND t.state NOT IN ('completed','canceled')))))`, id).Scan(&retained)
-	if err != nil {
-		return false, exit.Internalf("cannot read retained jobs for rented machine %s: %s", id, err)
-	}
-	return retained, nil
-}
-
 // RentalLastSettlement includes preparation that settled before an attempt
 // existed. ClosedAt stays zero in that case; SettledAt comes from the atomic
 // terminal request event, so idle grace survives missed sweeps and restarts.
@@ -1054,10 +1037,10 @@ func rentalLastSettlement(reader rentalReader, id string) (RentalLastSettlement,
 		  AND a.state IN ('terminal','closed') AND a.closed_at<>''
 		  ORDER BY a.attempt DESC LIMIT 1),''),
 		COALESCE((SELECT e.at FROM request_events e WHERE e.request_id=r.id
-		  AND e.type IN ('client.machine_work_finished','run.completed','run.failed','run.canceled','request.paused')
+		  AND e.type IN ('client.machine_work_finished','run.completed','run.failed','run.canceled')
 		  ORDER BY (e.type='client.machine_work_finished') DESC,e.seq DESC LIMIT 1),'')
 		FROM requests r WHERE `+pinned+` AND r.rental=1
-		  AND r.state IN ('succeeded','failed','canceled','refused','abandoned','paused')`, args...)
+		  AND r.state IN ('succeeded','failed','canceled','refused','abandoned')`, args...)
 	if err != nil {
 		return RentalLastSettlement{}, false, exit.Internalf(
 			"cannot read settlements for rental %s: %s", id, err)
@@ -1166,12 +1149,12 @@ func (s *Store) PinnedRentalWork(rentalID string) ([]Request, *exit.Error) {
 }
 
 // ReleaseUnattemptedRentalAssignment releases only an automatic, unoffered
-// routing choice. A purchase still owed to this request, uploaded private code,
-// retained work, and even a refused historical offer preserve their custody.
+// routing choice. A purchase still owed to this request, uploaded private code and even a
+// refused historical offer preserve their custody.
 func (s *Store) ReleaseUnattemptedRentalAssignment(requestID, rentalID string) (bool, *exit.Error) {
 	result, err := s.db.Exec(`UPDATE requests SET worker=''
 		WHERE id=? AND worker=? AND requested_rental='' AND rental=1
-		  AND state IN ('submitted','queued') AND ordinal=0 AND retain_work=0
+		  AND state IN ('submitted','queued') AND ordinal=0
 		  AND local_package_uploaded_boot_id=''
 		  AND NOT EXISTS (SELECT 1 FROM attempts WHERE request_id=requests.id)
 		  AND NOT EXISTS (SELECT 1 FROM rental_operations WHERE managed_request_id=requests.id
@@ -1343,4 +1326,13 @@ func (s *Store) OrphanedRentalWork() ([]Request, *exit.Error) {
 		out = append(out, r)
 	}
 	return out, nil
+}
+
+// FenceRentalRelease precedes an explicitly requested provider release: no new work is
+// admitted to a machine whose bytes are about to vanish.
+func (s *Store) FenceRentalRelease(rental string) *exit.Error {
+	if _, err := s.db.Exec(`UPDATE rentals SET state='release_requested' WHERE id=? AND state NOT IN ('failed','released')`, rental); err != nil {
+		return exit.Internalf("cannot fence released rental admission: %s", err)
+	}
+	return nil
 }
