@@ -102,7 +102,7 @@ func TestPublicRunStatusWatchAcceptsOlderCalciferWithoutStopIdentity(t *testing.
 					fmt.Fprint(w, "id: 3\ndata: "+`{"type":"request.blocked","request_id":"legacy-stop","sequence_number":3,"at":"2026-09-26T01:00:01Z","payload":{"status":"blocked","error_type":"dependency.missing","error":"repair input"}}`+"\n\n")
 					return
 				}
-				// Deliberately omit retry_available and stopped_event_id, as old releases do.
+				// Deliberately omit stopped_event_id, as old releases do.
 				_ = json.NewEncoder(w).Encode(map[string]any{"number": 1, "kind": kind, "request_id": "legacy-stop", "status": "blocked", "created_at": "2026-09-26T01:00:00Z", "error_type": "dependency.missing", "error": "repair input"})
 			}))
 			defer server.Close()
