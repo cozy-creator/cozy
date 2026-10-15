@@ -26,7 +26,7 @@ func invocationNamesRoot(t *testing.T, raw []byte) (string, <-chan api.Submissio
 		switch {
 		case r.Method == "GET" && r.URL.Path == "/":
 		case r.Method == "GET" && r.URL.Path == "/v1/packages/proof/names":
-			_ = json.NewEncoder(w).Encode(hub.PackageCard{Package: hub.Resource{Name: "names"}, Releases: []hub.ReleaseSummary{{Release: "1.0.0"}}})
+			_ = json.NewEncoder(w).Encode(hub.PackageCard{Package: hub.Resource{Org: "proof", Name: "names"}, Releases: []hub.ReleaseSummary{{Release: "1.0.0"}}})
 		case r.Method == "GET" && r.URL.Path == "/v1/packages/proof/names/releases/1.0.0":
 			var detail hub.PackageReleaseDetail
 			detail.PackageInterface = raw

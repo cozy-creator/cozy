@@ -30,7 +30,7 @@ func TestARentalRunNamesTheNewestReleaseWhateverIsInstalledHere(t *testing.T) {
 			fatal(t, problem)
 			mux := http.NewServeMux()
 			mux.HandleFunc("GET /v1/packages/proof/releases", func(w http.ResponseWriter, _ *http.Request) {
-				_ = json.NewEncoder(w).Encode(hub.PackageCard{Package: hub.Resource{Name: "releases"},
+				_ = json.NewEncoder(w).Encode(hub.PackageCard{Package: hub.Resource{Org: "proof", Name: "releases"},
 					Releases: []hub.ReleaseSummary{{Release: "2.9.0"}, {Release: "2.10.0"}}})
 			})
 			mux.HandleFunc("GET /v1/packages/proof/releases/releases/{release}", func(w http.ResponseWriter, r *http.Request) {

@@ -69,7 +69,7 @@ func TestInternalCallablesAreAbsentFromCLIAndRefuseDirectRun(t *testing.T) {
 	detail.ExecutionRequirements = []string{"cozy-runtime>=0.2.25"}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/packages/proof/internal", func(w http.ResponseWriter, _ *http.Request) {
-		_ = json.NewEncoder(w).Encode(hub.PackageCard{Package: hub.Resource{Name: "internal"}, Releases: []hub.ReleaseSummary{{Release: "1.0.0"}}})
+		_ = json.NewEncoder(w).Encode(hub.PackageCard{Package: hub.Resource{Org: "proof", Name: "internal"}, Releases: []hub.ReleaseSummary{{Release: "1.0.0"}}})
 	})
 	mux.HandleFunc("GET /v1/packages/proof/internal/releases/1.0.0", func(w http.ResponseWriter, _ *http.Request) { _ = json.NewEncoder(w).Encode(detail) })
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {

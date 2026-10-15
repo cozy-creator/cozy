@@ -40,7 +40,7 @@ func runModelCatalog(t *testing.T, configure ...func(*http.ServeMux, *hub.Packag
 	var posts [][]byte
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/packages/proof/quantize", func(w http.ResponseWriter, _ *http.Request) {
-		_ = json.NewEncoder(w).Encode(hub.PackageCard{Package: hub.Resource{Name: "quantize"}, Releases: []hub.ReleaseSummary{{Release: "1.0.0"}}})
+		_ = json.NewEncoder(w).Encode(hub.PackageCard{Package: hub.Resource{Org: "proof", Name: "quantize"}, Releases: []hub.ReleaseSummary{{Release: "1.0.0"}}})
 	})
 	mux.HandleFunc("GET /v1/packages/proof/quantize/releases/1.0.0", func(w http.ResponseWriter, _ *http.Request) { _ = json.NewEncoder(w).Encode(detail) })
 	mux.HandleFunc("POST /v1/packages/proof/quantize/download", func(w http.ResponseWriter, r *http.Request) {
@@ -52,7 +52,7 @@ func runModelCatalog(t *testing.T, configure ...func(*http.ServeMux, *hub.Packag
 		_ = json.NewEncoder(w).Encode(declaredInstallPlan("quantize", r.URL.Query().Get("release"), current))
 	})
 	mux.HandleFunc("GET /v1/models/proof/source", func(w http.ResponseWriter, _ *http.Request) {
-		_ = json.NewEncoder(w).Encode(hub.ModelCard{Model: hub.Resource{Name: "source"}, Releases: []hub.ModelReleaseSummary{{ReleaseSummary: hub.ReleaseSummary{Release: "1.0.0"}, Lanes: []hub.ModelLaneSummary{{Lane: "bf16", ManifestID: digest, Bytes: 210_000_000_000}}}}})
+		_ = json.NewEncoder(w).Encode(hub.ModelCard{Model: hub.Resource{Org: "proof", Name: "source"}, Releases: []hub.ModelReleaseSummary{{ReleaseSummary: hub.ReleaseSummary{Release: "1.0.0"}, Lanes: []hub.ModelLaneSummary{{Lane: "bf16", ManifestID: digest, Bytes: 210_000_000_000}}}}})
 	})
 	mux.HandleFunc("GET /v1/models/proof/source/releases/1.0.0/lanes/bf16/manifest", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(manifest) })
 	mux.HandleFunc("GET /v1/models/resolve", func(w http.ResponseWriter, r *http.Request) {

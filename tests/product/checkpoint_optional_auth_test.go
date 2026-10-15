@@ -71,7 +71,7 @@ func TestCheckpointReadsUseOptionalOwnerCredentials(t *testing.T) {
 			defer server.Close()
 			source := &checkpointTokenSource{token: secret.New(test.machine)}
 			client := hub.New(config.Config{HubURL: server.URL, HubToken: secret.New(test.token)}, "checkpoint-auth-proof").WithTokenSource(source)
-			ref := hub.Ref{Name: "source"}
+			ref := hub.Ref{Org: "proof", Name: "source"}
 			_, manifestErr := client.CheckpointManifest(context.Background(), ref, "fixture")
 			_, readsErr := client.CheckpointReads(context.Background(), ref, "fixture", nil)
 			_, resolveErr := client.ResolveModel(context.Background(), "proof/source#sha256:fixture", "")
