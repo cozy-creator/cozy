@@ -129,7 +129,7 @@ func TestRentalListLiveBoard(t *testing.T) {
 	}
 	if !regexp.MustCompile(`MACHINE\s+SKU\s+GPUS\s+STATE\s+\$/HOUR\s+SPENT\s+UPTIME\s+RUNNING\s+QUEUED\s+ENDS`).MatchString(listed) ||
 		!strings.Contains(listed, "Remote machines running: 1") ||
-		!strings.Contains(listed, "Rentals end themselves after 15 minutes idle (no queued or running job).") {
+		!strings.Contains(listed, "Rentals end themselves after 15 minutes idle (no queued or running work).") {
 		t.Fatalf("piped snapshot lost the ruled surface\n%s", listed)
 	}
 	// Bare `cozy rental` names the group's VERBS; it is not one of them. The live table

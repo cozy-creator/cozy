@@ -16,7 +16,7 @@ func TestCancellationPresentationPreservesMachineVocabulary(t *testing.T) {
 	fatal(t, problem)
 	defer store.Close()
 	for i, tc := range []struct{ actor, want string }{
-		{"cozy run cancel", "cancelled by user"}, {"cozy job cancel", "cancelled by user"},
+		{"cozy run cancel", "cancelled by user"},
 		{"cozy down --all", "cancelled by user"}, {"cozy rental end fixture", "cancelled by user"},
 		{"deadline", "cancelled by system"}, {"provider timeout", "cancelled by system"}, {"", "cancelled"},
 	} {

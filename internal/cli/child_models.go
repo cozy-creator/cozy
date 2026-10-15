@@ -98,11 +98,11 @@ func (r *Resolver) UnpublishedChildModels(request records.Request) ([]records.Mo
 			if problem != nil {
 				return nil, problem
 			}
-			job, problem := surface.Function(binding.Entrypoint)
+			fn, problem := surface.Function(binding.Entrypoint)
 			if problem != nil {
 				return nil, problem
 			}
-			for _, slot := range job.Models {
+			for _, slot := range fn.Models {
 				selected, problem := r.childModelLadder(r.catalog(request.Hub), child.Package, binding.Entrypoint, slot)
 				if problem != nil {
 					// This is advisory sizing for an unknown future call. An
