@@ -43,6 +43,7 @@ func TestRunListETAKeepsMeasuredStageSeparateFromUnknownFutureWork(t *testing.T)
 			Event: &v1.RunEvent_State{State: &v1.RunState{Id: request.ID, Number: 1, State: "running", Attempt: 1}}}, nil))
 	}
 	type progressRow struct {
+		Kind             string   `json:"kind"`
 		Stage            string   `json:"progress_stage"`
 		RemainingMS      *int64   `json:"remaining_ms"`
 		StageRemainingMS *int64   `json:"stage_remaining_ms"`
@@ -63,6 +64,9 @@ func TestRunListETAKeepsMeasuredStageSeparateFromUnknownFutureWork(t *testing.T)
 	report(8744, &v1.Progress{Stage: "denoise", Fraction: .15})
 	report(46875, &v1.Progress{Stage: "denoise", Fraction: .173333, Completed: 1, Total: 30, StepMs: 35541.02015681565})
 	row := list()
+	if row.Kind != "run" {
+		t.Fatalf("a job is a run, not KIND %q", row.Kind)
+	}
 	if row.RemainingMS != nil {
 		t.Fatalf("authored progress weights invented whole-run ETA %dms; later decode work is unknown", *row.RemainingMS)
 	}

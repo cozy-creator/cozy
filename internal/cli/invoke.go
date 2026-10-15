@@ -1542,12 +1542,8 @@ func watchRunList(ctx *Context, client *localapi.Client, limit int) *exit.Error 
 }
 
 func invocationFields(life api.Lifecycle) []output.Field {
-	kind := life.Kind
-	if kind == "" {
-		kind = "invocation"
-	}
 	fields := []output.Field{
-		{K: "number", V: life.Number}, {K: "id", V: life.RequestID}, {K: "kind", V: kind},
+		{K: "number", V: life.Number}, {K: "id", V: life.RequestID}, {K: "kind", V: runKind(life.Kind)},
 		{K: "target", V: lifeTarget(life)},
 		{K: "machine", V: life.Machine},
 		{K: "rental_id", V: life.RentalID},
@@ -1564,9 +1560,10 @@ func lifeTarget(life api.Lifecycle) string {
 	return either(life.Target, strings.Trim(life.Package+"/"+life.Function, "/"))
 }
 
-// runKind is the KIND column: a function's run, a job, or the operation's kind.
+// runKind is the KIND column: every function execution is a run, a job included; an
+// operation shows its own kind.
 func runKind(kind string) string {
-	if kind == "" || kind == "invocation" {
+	if kind == "" || kind == "invocation" || kind == "job" {
 		return "run"
 	}
 	return kind

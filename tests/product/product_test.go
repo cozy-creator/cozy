@@ -229,7 +229,7 @@ func TestProductPath(t *testing.T) {
 	}
 	for index, row := range runs {
 		if row.Number < 1 || !strings.HasPrefix(row.ID, "req-") ||
-			row.Kind != "invocation" || row.QueuedMS < 0 || row.ExecutionMS < 0 ||
+			row.Kind != "run" || row.QueuedMS < 0 || row.ExecutionMS < 0 ||
 			row.Attempts < 1 {
 			t.Fatalf("run list row %d is not useful: %+v", index, row)
 		}
@@ -272,7 +272,7 @@ func TestProductPath(t *testing.T) {
 		t.Fatal("completed local job is absent from run list")
 	}
 	// The ordinary local package job now has a real attempt and retained history.
-	if runs[0].Kind != "job" || runs[0].Status != "completed" ||
+	if runs[0].Kind != "run" || runs[0].Status != "completed" ||
 		runs[0].QueuedMS < 0 || runs[0].ExecutionMS < 0 || runs[0].Attempts != 1 {
 		t.Fatalf("local job row lost its attempt or clocks: %+v", runs)
 	}
