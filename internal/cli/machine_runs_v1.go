@@ -361,10 +361,12 @@ func (m *machineRuns) stepV1(parent context.Context, request records.Request, li
 		}
 		if outcome := event.GetOutcome(); outcome != nil {
 			observed := time.Now().UnixMilli()
+			var landed map[string]string
 			if fetch != nil {
 				fetch.finish() // the newest revisions land, their progress shown
+				landed = fetch.landed
 			}
-			problem := m.collectV1(ctx, request, machine, outcome, event.AtMs, observed)
+			problem := m.collectV1(ctx, request, machine, outcome, landed, event.AtMs, observed)
 			// A collection the connection cut is not the run's end here: it is attached again.
 			return problem == nil || problem.ErrName() != "machine_execution.transport_unavailable", problem
 		}
@@ -1347,7 +1349,7 @@ func holds(path, digest string, length int64) bool {
 // collectV1 settles the run with its outcome: every output file at its final revision (each
 // judged; the export records those delivered and why the others were not), the triage bundle
 // beside a failure, then the outcome itself.
-func (m *machineRuns) collectV1(ctx context.Context, request records.Request, machine *machines.V1, outcome *v1.Outcome, finished, observed int64) *exit.Error {
+func (m *machineRuns) collectV1(ctx context.Context, request records.Request, machine *machines.V1, outcome *v1.Outcome, landed map[string]string, finished, observed int64) *exit.Error {
 	// A destination that refuses its files, or bytes the machine no longer serves: the
 	// result stays with the machine, and `cozy run watch` collects it once the cause is gone.
 	var failure *exit.Error
@@ -1362,6 +1364,11 @@ func (m *machineRuns) collectV1(ctx context.Context, request records.Request, ma
 		var paths, failed []string
 		for _, product := range records.Fold(products) {
 			if product.Path == "" {
+				continue
+			}
+			// A file this run's reads just verified at this revision is not read again.
+			if info, err := os.Stat(product.Path); landed[product.Item] == product.Digest && err == nil && info.Size() == product.Length {
+				paths = append(paths, product.Path)
 				continue
 			}
 			if problem := writeOutputV1(ctx, machine, request.ID, export.Directory, product, -1, nil); problem != nil {
