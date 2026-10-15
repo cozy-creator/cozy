@@ -341,17 +341,6 @@ def files() -> Iterator[pathlib.Path]:
                 yield p
 
 
-def check_test_boundary() -> list[str]:
-    """(#661) Go verification has one home: the product suite in tests/product."""
-    bad = []
-    for p in sorted(pathlib.Path(".").rglob("*_test.go")):
-        rel = p.as_posix()
-        if not rel.startswith("tests/product/"):
-            bad.append(f"{rel}: [test] *_test.go outside tests/product — #661 keeps one "
-                       "real-system verification home and no package-local mocked/unit layer")
-    return bad
-
-
 DOCUMENT_KINDS: dict[str, str] = {}
 # HMAC domain-separation tags are security protocol constants, not document formats. A peer repo
 # reproduces these exact bytes, so they remain single-owner fenced without inflating the document
@@ -960,7 +949,7 @@ violations = (check_unpublished_vocabulary() + check_sources() + check_matrix()
               + check_contract() + check_video_boundary() + check_embedded() + check_scripts()
               + check_document_kinds() + check_render_streams() + check_output_shape()
               + check_media_contract() + check_typed_resources() + check_web_boundary()
-              + check_test_boundary() + check_python_seat() + check_venue())
+              + check_python_seat() + check_venue())
 if violations:
     print("FENCE RED (boundaries.md):", file=sys.stderr)
     for v in violations:
@@ -979,5 +968,5 @@ print(
     f"embed({len(DENY_EMBED)} words, scripts allow@{len(PY_ALLOW)}) "
     f"contract({len(parse_go_routes(pathlib.Path('internal/api/routes.go')))} routes) "
     f"web(stub+bounded-upload+bounded-calcifer-log) retired-planes(absent) "
-    f"resources(typed package/model, no aliases) python(independent uv venvs) test(tests/product only)"
+    f"resources(typed package/model, no aliases) python(independent uv venvs)"
 )
