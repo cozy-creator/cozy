@@ -260,6 +260,10 @@ func (m *machineRuns) stepV1(parent context.Context, request records.Request, li
 		} else if update != nil {
 			return false, exit.Named(exit.Unavailable, "rental.maintenance", "this rental is updating its software (run %d); work waits for it", update.Number)
 		}
+		// And for the work sent there before it, so a machine takes its work in submission order.
+		if problem := m.awaitTurn(ctx, request.ID, link.MachineID); problem != nil {
+			return false, problem
+		}
 	}
 	// Only a submission may start this computer's machine; observing attaches to a running one.
 	dial := ctx
@@ -389,6 +393,21 @@ func (m *machineRuns) stepV1(parent context.Context, request records.Request, li
 		// reaches the head. Read that outcome to retry a previously refused collection.
 		if catchUp && !terminal && (head <= uint64(max(link.RemoteCursor, 0)) || event.Sequence >= head) {
 			return false, nil
+		}
+	}
+}
+
+// awaitTurn holds a run until every run sent to its machine before it was confirmed there.
+func (m *machineRuns) awaitTurn(ctx context.Context, id, machine string) *exit.Error {
+	for {
+		ahead, problem := m.store.RunAhead(machine, id)
+		if problem != nil || ahead == "" {
+			return problem
+		}
+		select {
+		case <-ctx.Done():
+			return exit.New(exit.Canceled, "run %s stopped waiting for run %s on %s", id, ahead, machine)
+		case <-time.After(time.Second):
 		}
 	}
 }

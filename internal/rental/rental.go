@@ -251,9 +251,9 @@ func tokenAt(path, subject string) (secret.Value, *exit.Error) {
 	return v, nil
 }
 
-// Known is the non-secret target question. The HTTP layer asks it so a submission
-// naming an absent or not-yet-published pod is refused before a request row exists, and
-// so its plan resolves from the exact persisted snapshot. It never reads the media bearer.
+// Known is the non-secret target question the HTTP layer asks before a request row exists:
+// only a rental nobody holds, or one that has ended, is refused. A machine still starting is
+// not: its work queues and is sent once the machine is ready. It never reads the media bearer.
 func Known(read func(string) (*records.Rental, *exit.Error)) func(string) (*orchestrator.DesiredPlacement, *exit.Error) {
 	return func(id string) (*orchestrator.DesiredPlacement, *exit.Error) {
 		row, e := read(id)
@@ -263,17 +263,9 @@ func Known(read func(string) (*records.Rental, *exit.Error)) func(string) (*orch
 		if row == nil {
 			return nil, unknown(id)
 		}
-		if row.State != hub.RentalReady {
-			return nil, exit.Named(exit.Unavailable, "rental.not_ready",
-				"rental %s is %s; Tensorhub has not published an attachable worker", id, row.State).
-				WithRemedy("`cozy rental` shows its provider lifecycle")
-		}
-		if row.Address == "" {
-			return nil, noAddress(id, row.State)
-		}
-		if row.CertPath == "" && row.CertificatePEM == "" {
-			return nil, exit.Unavailablef("rental %s has exact control but its WorkerTarget is not attached yet", id).
-				WithRemedy("wait for `cozy rental new` to validate and atomically publish the target")
+		if records.RentalTerminalState(row.State) {
+			return nil, exit.Named(exit.NotFound, "rental.selection_unavailable", "rental %s is %s", id, row.State).
+				WithRemedy("`cozy rental` names the machines this host rents").WithNext("cozy rental")
 		}
 		return &orchestrator.DesiredPlacement{}, nil
 	}
