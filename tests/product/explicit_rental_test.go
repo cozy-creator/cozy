@@ -220,7 +220,7 @@ func TestRequestedRentalIsSubmissionIdentity(t *testing.T) {
 }
 
 func TestNamedRentalReplayAfterEndUsesExistingCalciferRequest(t *testing.T) {
-	for _, kind := range []string{"serving"} {
+	for _, kind := range []string{"serving", "lane"} {
 		t.Run(kind, func(t *testing.T) {
 			h := newLadderHub(t)
 			h.bind(goodLadder())
@@ -236,7 +236,7 @@ func TestNamedRentalReplayAfterEndUsesExistingCalciferRequest(t *testing.T) {
 			installedHere(t, root, h.server.URL, ladderPackage, "1.0.0")
 			startCalciferProcess(t, root)
 			args := []string{"run", ladderPackage + "/generate", "steps=1", "--rental=isao", "--json", "--idempotency-key=ended-replay"}
-			if kind == "job" {
+			if kind == "lane" {
 				args = []string{"run", ladderPackage + "/lane", "--model.pruned=proof/minimax@1.0.0-rc.1/fp8-adaln-pruned", "--rental=isao", "--json", "--idempotency-key=ended-replay"}
 			}
 			_, firstOut := runCozy(t, root, args...)

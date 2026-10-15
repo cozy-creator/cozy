@@ -126,7 +126,6 @@ func TestPackageSetupAndModelLoadingHaveDistinctLabels(t *testing.T) {
 	}{
 		{orchestrator.PhasePreparing, "invocation", "setting up package"},
 		{orchestrator.PhaseWarming, "invocation", "loading models"},
-		{orchestrator.PhasePreparing, "job", "preparing inputs"},
 	} {
 		if got := cli.PhaseCell(api.Lifecycle{Status: "queued", Phase: tc.phase, Kind: tc.kind}); got != tc.want {
 			t.Errorf("%s/%s = %q, want %q", tc.kind, tc.phase, got, tc.want)

@@ -184,23 +184,30 @@ func TestPackageInterface(t *testing.T) {
 		}
 	}
 
-	// Model inputs and dependencies are not hardware facts: a job runs where its declared
-	// accelerator says, and an undeclared one wants a GPU.
-	gpuRaw := []byte(`{"application":"h3:tools","entrypoints":[],"format":"cozy.package.interface/1","jobs":[{"accelerator":true,"models":[{"class":"H3Dits","component_use":{},"path":"four_lane.models.dits"}],"name":"four_lane","publishes":false,"request":{"fields":[]},"result":{"fields":[]}}]}`)
+	// Model inputs and dependencies are not hardware facts: a function runs on CPU only when it
+	// declares `accelerator: false`; an undeclared one, with or without models, wants a GPU. A
+	// `jobs` list from an older Runtime is not read.
+	gpuRaw := []byte(`{"application":"h3:tools","entrypoints":[{"models":[{"class":"H3Dits","component_use":{},"path":"four_lane.models.dits","weights":true}],"name":"four_lane","publishes":false,"request":{"fields":[]},"result":{"fields":[]}}],"format":"cozy.package.interface/1"}`)
 	gpuDescriptor, problem := launch.DecodePackageInterface(gpuRaw)
 	fatal(t, problem)
-	gpuJob, problem := gpuDescriptor.Function("four_lane")
+	gpuFunction, problem := gpuDescriptor.Function("four_lane")
 	fatal(t, problem)
-	if !gpuJob.NeedsAccelerator() {
-		t.Fatal("a job declaring accelerator=True runs on a GPU")
+	if !gpuFunction.NeedsAccelerator() || !gpuFunction.Models[0].Weights {
+		t.Fatal("an undeclared function reading Weights wants a GPU")
 	}
-	cpuRaw := []byte(`{"application":"probe:app","entrypoints":[],"format":"cozy.package.interface/1","jobs":[{"name":"scan","publishes":false,"request":{"fields":[]},"result":{"fields":[]}}]}`)
+	cpuRaw := []byte(`{"application":"probe:app","entrypoints":[{"accelerator":false,"name":"scan","publishes":false,"request":{"fields":[]},"result":{"fields":[]}},{"name":"plain","publishes":false,"request":{"fields":[]},"result":{"fields":[]}}],"format":"cozy.package.interface/1","jobs":[{"name":"old","publishes":false,"request":{"fields":[]},"result":{"fields":[]}}]}`)
 	cpuDescriptor, problem := launch.DecodePackageInterface(cpuRaw)
 	fatal(t, problem)
-	undeclared, problem := cpuDescriptor.Function("scan")
+	cpu, problem := cpuDescriptor.Function("scan")
 	fatal(t, problem)
-	if !undeclared.NeedsAccelerator() {
-		t.Fatal("an undeclared job wants a GPU")
+	if cpu.NeedsAccelerator() {
+		t.Fatal("a function declaring accelerator=False runs on a GPU")
+	}
+	if plain, _ := cpuDescriptor.Function("plain"); !plain.NeedsAccelerator() {
+		t.Fatal("an undeclared model-less function does not want a GPU")
+	}
+	if _, problem := cpuDescriptor.Function("old"); problem == nil {
+		t.Fatal("a function from a retired jobs list was read")
 	}
 	// Author-supplied resources are not a fact this host reads: machine class comes from
 	// the release dependency set, so the member is ignored rather than honoured or refused.

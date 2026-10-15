@@ -80,7 +80,7 @@ func (m *foregroundCancelMachine) Run(request *v1.RunRequest, stream grpc.Server
 }
 
 func TestForegroundCancelDeliversBeforeExitAndAwaitStillWaitsForTerminal(t *testing.T) {
-	for _, kind := range []string{"serving", "job"} {
+	for _, kind := range []string{"serving"} {
 		t.Run(kind, func(t *testing.T) {
 			root := t.TempDir()
 			layout, problem := home.Open(root)

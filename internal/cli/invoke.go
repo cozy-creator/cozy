@@ -1553,10 +1553,9 @@ func lifeTarget(life api.Lifecycle) string {
 	return either(life.Target, strings.Trim(life.Package+"/"+life.Function, "/"))
 }
 
-// runKind is the KIND column: every function execution is a run, a job included; an
-// operation shows its own kind.
+// runKind is the KIND column: a function's run, or the operation's kind.
 func runKind(kind string) string {
-	if kind == "" || kind == "invocation" || kind == "job" {
+	if kind == "" || kind == "invocation" {
 		return "run"
 	}
 	return kind

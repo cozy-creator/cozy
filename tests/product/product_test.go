@@ -269,12 +269,12 @@ func TestProductPath(t *testing.T) {
 	}
 	runs = listRuns()
 	if len(runs) == 0 {
-		t.Fatal("completed local job is absent from run list")
+		t.Fatal("completed local run is absent from run list")
 	}
-	// The ordinary local package job now has a real attempt and retained history.
+	// The ordinary local package run has a real attempt and retained history.
 	if runs[0].Kind != "run" || runs[0].Status != "completed" ||
 		runs[0].QueuedMS < 0 || runs[0].ExecutionMS < 0 || runs[0].Attempts != 1 {
-		t.Fatalf("local job row lost its attempt or clocks: %+v", runs)
+		t.Fatalf("local run row lost its attempt or clocks: %+v", runs)
 	}
 	if code, out := runCozy(t, root, "run", "watch", fmt.Sprint(runs[0].Number), "--json"); code != 0 ||
 		!strings.Contains(out, `"status":"completed"`) {
