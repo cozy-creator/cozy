@@ -194,6 +194,13 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 		// below, so a different body conflicts, but its source is not
 		// opened merely to answer an already-recorded request.
 		spec = replaySubmission(sub, *existing)
+		if captured(existing.Assets) {
+			// The first submission froze its files and trees: the replay names those captures.
+			if spec.Payload, spec.Assets, e = replayMachineInputSnapshots(spec.Payload, spec.Assets, sub.Trees, *existing); e != nil {
+				s.refuseTyped(w, r, e)
+				return
+			}
+		}
 		if link, problem := s.store.MachineExecution(existing.ID); problem == nil && link != nil {
 			spec.MachineExecutionObserver = true
 		}

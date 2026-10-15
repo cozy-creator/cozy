@@ -116,9 +116,10 @@ func (s *Server) freezeMachineInputs(spec *orchestrator.Submission, entry *launc
 	return stage, nil
 }
 
-func uncapturedRootBytes(assets []records.AssetBinding) bool {
+// captured answers whether a recorded run froze any of its input bytes.
+func captured(assets []records.AssetBinding) bool {
 	for _, asset := range assets {
-		if asset.Snapshot == nil {
+		if asset.Snapshot != nil {
 			return true
 		}
 	}

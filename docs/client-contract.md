@@ -333,11 +333,6 @@ installed build. Records at an older schema are refused, never migrated.
 | `GET /v1/local/machines/{machine}/logs/{log}` | local | yes | one log a machine keeps (`tensorfs`: TensorFS's transport decisions), oldest line first, `?tail_bytes=` the newest; an older machine answers a note in `unavailable` |
 | `POST /v1/local/machines/{machine}/operations` | local | yes | record one package, model or rental software (`software`) operation on a machine (`local` or a rental id) as a numbered run and start it; the same operation still unsettled there is answered instead; `/v1/requests/{id}` and its cancel follow it like any run |
 | `POST /v1/local/calcifer/down` | local | yes | non-destructive disconnect guarded by required online work; `{force:true}` overrides that guard without canceling work; mutually exclusive `{all:true}` requests cancellation and paid teardown |
-| `POST /v1/local/jobs` | local | yes | submit one bounded job (CLI-authenticated `local_assets` use the same immutable staging and input grants as requests); `Idempotency-Key`; 202 with the handle and its publication repo |
-| `GET /v1/local/jobs/{id}` | local | yes | one job: state, queue position, publication, checkpoints, bill where a rate exists; `model_sources` names every selected source file that has NOT verified, with the worker's own `safe_code`/`safe_detail` |
-| `POST /v1/local/jobs/{id}/pause` | local | yes | fence active attempts while preserving the same request and retained work |
-| `POST /v1/local/jobs/{id}/resume` | local | yes | queue the same paused request with its captured execution inputs |
-| `POST /v1/local/jobs/{id}/cancel` | local | yes | persist cancellation and its actor before contacting the machine; accepted work remains canceling until its outcome is known |
 | `GET /{$}` | local | no | embedded localhost web UI entrypoint |
 | `GET /app.css` | local | no | embedded localhost web UI stylesheet |
 | `GET /app.js` | local | no | embedded localhost web UI script |
@@ -346,72 +341,34 @@ Uploads are capped at 64 MiB, hashed while streaming, atomically published under
 deduplicated, and served only by opaque `upl-<sha256>` id. The future browser flow will bind those
 ids into invocation assets; it will never send a host filesystem path.
 
-### The job family is local
+### One request kind
 
-A job is an ATTEMPT CLASS in the same Calcifer, not a second scheduler: the same
-orchestrator places and dispatches it, and the same record owner gives it an ordinal,
-settles its terminal transaction, and streams it over the same durable event route
-(`GET /v1/requests/{id}/events` — there is no second event authority anywhere, and
-`cozy run` follows it).
+Every function is called through `POST /v1/requests`; there is no second submit family. A
+CLI-authenticated submission may also carry:
 
-The family is local because a job's typed input trees are directories the caller already
-owns (`{"trees":["<ref>=<dir>"]}`). Client filesystem paths are not part of the proposed
-common core.
+- `weights_destination`: `org/model`, the requester's repository the machine publishes the
+  function's declared weights outputs to, each as an owner-only checkpoint (refused for a
+  function that declares none). The lifecycle then names `model_destination` and, once
+  published, `model_outputs` (output → checkpoint). Without it the outputs stay on the
+  machine (`retained_outputs`) until `cozy run upload` publishes one.
+- `trees`: `<ref>=<directory>`, captured with the request; the Tree field naming the ref
+  receives the directory.
+- `timeout_ms`: the run is canceled on its machine when it passes, whether or not a client
+  waits.
 
-Two answers a job carries that a request does not:
-
-- **`publication`** — the durable publication the job's landed writes became:
-  `{repo, root, status, entries, bytes, committed_at}` under the scratch repo
-  `<org>/_job-<job-id>`. An attempt writes into a per-attempt STAGE and the record owner
-  promotes it into the addressable root after the terminal is verified; the row is written
-  INSIDE the terminal transaction, so a publication a terminal did not commit does not
-  exist. `status` is the terminal's verdict STAMPED as metadata; a failed run's landed
-  writes still land. Model-producing jobs instead expose `checkpoints` after their
-  typed receipts and destination publication are verified.
-- **`bill`** — ABSENT unless the host was configured with an explicit local rate. There is
-  no `$0.00`: a fabricated zero is a claim about money nobody measured.
-
-A CLI-authenticated job may attach output publication independently of input acquisition:
-`"model_transfer":{"kind":"model-upload","destination":"org/model","outputs":[{"name":"model"}]}`.
-Its `models` remain the exact ModelRefs validated against the job's declared parameters.
-The source, source_selection, source_license, source_files, input_lane, source_profiles
-and local_only fields are absent in this form; partial acquisition declarations refuse.
-The existing receipt, upload, finalization and cancellation paths handle its outputs.
-
-Remote output-only publication requires `worker` to pin an existing, suitably prepared
-rental. Exact manifest lengths are metadata sizes and cannot size the input closure or
-the producer's output working set, so this form does not purchase a new rental. A normal
-source-transfer intent still declares its source and selection, profile bindings and
-inspected headers, and uses the existing source preparation and checkpoint-custody path.
+The only control is cancel. A canceled or failed run submitted again is a new run, and its
+machine answers every memoized step that already finished from its memo.
 
 `queue_position` and `queue_depth` are one atomic orchestrator scheduling snapshot. Nothing
 is retried: a typed refusal, a failure or a loss after the machine took the work ends the
-request with its reason. Only work the machine never took is placed again. Several jobs
+request with its reason. Only work the machine never took is placed again. Several runs
 submitted at once queue against one worker and drain in submission order.
 
-### Private transactions and child calls
-
-`retain_work:true` makes an ordinary unpublished package job retain its exact inputs, implementation
-and native intermediate work across failed or paused attempts. `pause` durably fences
-admission and reaches `paused` only after its writers and child writers stop. `resume`
-continues the same captured request. Work ends completed or failed; a failure before its
-machine took the run can be retried by a corrected new request with `retry_of`, which
-accepts the prior public run number or ID.
-The new request selects the same physical store; run lineage scopes artifact grants and
-history, while completed computation is cached by the Host independently of run IDs.
-Fresh unrelated runs on that workspace can reuse compatible completed operations. The old
-payload and attempt outcomes stay immutable. Cancellation releases only the caller's
-ownership. Explicit rental release also abandons its dependent transactions.
-
-Private source/weights checkpoints stay on that worker; they are not implicitly uploaded
-to Tensorhub. `--upload-to` remains the explicit final-output upload choice. A job
-document's `retaining` boolean reports continuing resource custody, including successful
-private model outputs. Such a completed job can be explicitly canceled to release custody
-without rewriting its successful execution outcome.
+### Child calls
 
 Child calls use the current parent attempt's authenticated worker stream. The owner joins
 the requested interface/module/export to an immutable dependency captured in that parent's
-install, then creates an ordinary job. The child status includes `parent_request_id`,
+install, then creates an ordinary request. The child status includes `parent_request_id`,
 `parent_call_index`, and, for an acquired previous result, `reused_from`. A reused child has
 no invented execution attempt. Scalar results can complete immediately; model results stay
 `finalizing` until native independent retention is confirmed.
@@ -534,10 +491,10 @@ retain their existing generation-checked control behavior.
 
 ### Machine run duration
 
-Machine lifecycle and job documents carry `execution_known` beside `execution_ms`.
-Execution is the run's time running on its machine, every attempt summed; preparation,
-queueing and pauses do not count. While the run is live it is its running intervals so
-far, by its machine's clock: it ticks while running and holds while paused. At the end
+Machine lifecycle documents carry `execution_known` beside `execution_ms`.
+Execution is the run's time running on its machine, every attempt summed; preparation and
+queueing do not count. While the run is live it is its running time so far, by its
+machine's clock. At the end
 the machine's own measurement replaces it. `cozy run list`, `run show` and `run watch`
 print `—` (`execution_ms: null` in list and show JSON; zero with `execution_known: false`
 in the API) before a run first runs, and for an ended run its machine did not measure.

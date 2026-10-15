@@ -315,6 +315,100 @@ func TestObservingAV1RunNeverStartsAStoppedMachine(t *testing.T) {
 	}
 }
 
+// Cancel and run again: a film canceled while its second segment renders is submitted again as
+// the same request, and the machine answers the finished first segment from its memo; only the
+// rest render. There is no pause: a memoized step's result is kept whatever its root does.
+func TestCanceledFilmSubmittedAgainSkipsItsFinishedSegments(t *testing.T) {
+	if *machineHostBinary == "" || *cpuLongform == "" {
+		t.Skip("requires -machine-host=<tensord> and -cpu-longform=<tensord>/tests/fixtures/cpu_longform")
+	}
+	root, err := os.MkdirTemp(os.TempDir(), "czr")
+	must(t, err)
+	unpressuredMachine(t, root)
+	t.Cleanup(func() {
+		_, _ = runCozy(t, root, "machine", "stop")
+		_, _ = runCozy(t, root, "down")
+		if t.Failed() {
+			t.Logf("evidence retained at %s\nmachine log tail:\n%s", root, tail(filepath.Join(root, "machine", "host.log")))
+		} else {
+			_ = removeAllForce(root)
+		}
+	})
+	project := filepath.Join(t.TempDir(), "cpu_longform")
+	must(t, os.CopyFS(project, os.DirFS(*cpuLongform)))
+	if out, err := exec.Command("uv", "lock", "--directory", project).CombinedOutput(); err != nil {
+		t.Fatalf("uv lock: %v\n%s", err, out)
+	}
+	if code, out := runCozy(t, root, "package", "install", project); code != 0 {
+		t.Fatalf("package install [exit %d]\n%s", code, out)
+	}
+	var encoded bytes.Buffer
+	must(t, png.Encode(&encoded, image.NewRGBA(image.Rect(0, 0, 2, 2))))
+	reference := filepath.Join(root, "ref.png")
+	must(t, os.WriteFile(reference, encoded.Bytes(), 0o600))
+	in := filepath.Join(root, "req.json")
+	segments := []string{"a canceled dawn", "a held storm", "a later calm"}
+	request, _ := json.Marshal(map[string]any{"segments": segments, "hold": 15.0, "hold_at": 1})
+	must(t, os.WriteFile(in, request, 0o600))
+	run := []string{"run", "local/tensord-cpu-longform/long_form", "--input", in, "--asset", "reference=" + reference, "--json"}
+	type shownCall struct {
+		Function    string `json:"function"`
+		Status      string `json:"status"`
+		Memoized    bool   `json:"memoized"`
+		Computation string `json:"computation"`
+	}
+	calls := func(number string) []shownCall {
+		t.Helper()
+		_, shown := runCozy(t, root, "run", "show", number, "--json")
+		var report struct {
+			Calls []shownCall `json:"calls"`
+		}
+		_ = json.Unmarshal([]byte(lastJSONLine(shown)), &report)
+		var segment []shownCall
+		for _, call := range report.Calls {
+			if call.Function == "render_segment" {
+				segment = append(segment, call)
+			}
+		}
+		return segment
+	}
+
+	if code, out := runCozy(t, root, run...); code != 0 {
+		t.Fatalf("detached submit [exit %d]\n%s", code, out)
+	}
+	landed(t, "the first segment to finish while the second holds", func() bool {
+		done := calls("1")
+		return len(done) >= 1 && (done[0].Status == "succeeded" || done[0].Status == "completed")
+	})
+	if code, out := runCozy(t, root, "run", "cancel", "1", "--await", "--json"); code != 0 || !strings.Contains(out, "cancel") {
+		t.Fatalf("cancel [exit %d]\n%s", code, out)
+	}
+	first := calls("1")
+	if len(first) == 0 || first[0].Computation == "" {
+		t.Fatalf("the canceled film kept no record of its finished segment: %+v", first)
+	}
+
+	out := filepath.Join(root, "film")
+	code, document := runCozy(t, root, append(run, "--await", "--out", out)...)
+	if code != 0 {
+		t.Fatalf("the film submitted again did not complete [exit %d]\n%s", code, document)
+	}
+	again := calls("2")
+	if len(again) != len(segments) || !again[0].Memoized || again[0].Computation != first[0].Computation ||
+		again[1].Memoized || again[2].Memoized {
+		t.Fatalf("the finished segment was not answered from the memo, or the rest were:\nfirst %+v\nagain %+v", first, again)
+	}
+	files, err := filepath.Glob(filepath.Join(out, "*video*"))
+	if err != nil || len(files) != 1 {
+		t.Fatalf("want one saved film in %s, got %v\n%s", out, files, document)
+	}
+	film, err := os.ReadFile(files[0])
+	must(t, err)
+	if lines := strings.Split(strings.TrimSuffix(string(film), "\n"), "\n"); len(lines) != len(segments) {
+		t.Fatalf("the film is not every segment in order:\n%s", film)
+	}
+}
+
 // `--timeout` is the run's deadline on cozy.machine.v1 as on worker.v1: when it passes the run
 // is canceled on its machine, attributed to the deadline, whether or not a client waits.
 func TestRunTimeoutCancelsTheRunOnItsMachine(t *testing.T) {

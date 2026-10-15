@@ -12,18 +12,16 @@ next command's Calcifer picks each piece up where it was:
   content) and sent under the same frozen identity, which a machine answers once;
 - an accepted run is observed from its durable cursor, and its outputs are collected
   into the outputs folder;
-- a pending cancel or pause is sent again under the same command id;
+- a pending cancel is sent again under the same command id;
 - output exports and uploads, model transfers, rental acquisitions, installations and
   Runtime updates resume from their rows.
 
-Startup does not submit a failed, paused, canceled, refused, or completed execution merely
+Startup does not submit a failed, canceled, refused, or completed execution merely
 because the client restarted. Work an older Calcifer left `blocked` fails at startup with the
 reason it stopped for.
 
 `cozy down --all` keeps its destructive meaning: cancel work and end rentals. The idle
-exit waits until nothing is left to manage. Work at rest is not managed: a paused run and a
-finished one keeping its results wait for the next command, whose Calcifer resumes or serves
-them. An accepted run whose machine on this computer is gone (its process, not a slow
+exit waits until nothing is left to manage. An accepted run whose machine on this computer is gone (its process, not a slow
 answer) fails as `machine_stopped`. A paid rental ask that was never answered fails once
 the command making it is gone, and stays replayable under its `--idempotency-key`; one whose
 rental the Hub answers 404 for is closed.

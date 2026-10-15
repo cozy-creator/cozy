@@ -76,7 +76,7 @@ nothing, so no package code runs on the publisher's host and no environment is b
 question. A committed file that differs from that reading, or is absent, is refused as
 `package_publish.interface_stale`, naming the first difference; on a match the committed file
 uploads unchanged. The same static reading, by the same host tool, is what install compares
-with the committed release and what a job's descriptor id is read from (cl-175). Publication
+with the committed release and what a function's descriptor id is read from (cl-175). Publication
 derives no checkpoint evidence, code topology, tensor requirements, or compatibility cache.
 
 The uploaded artifacts are a standard sdist at `artifacts/source/<sdist>.tar.gz`,
