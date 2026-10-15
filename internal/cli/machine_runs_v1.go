@@ -154,11 +154,17 @@ func (m *machineRuns) loopV1(request records.Request) {
 			}
 		}
 		// A run its machine may hold is attached again while that machine lives, however long
-		// it cannot be reached: this computer's machine, or a rental the fleet's sweep has not
-		// seen end (it settles that rental's runs, and the loop then stops). The connection's
-		// keepalive measures a silent machine; this paces the attempts after.
-		if problem != nil && accepted {
-			_ = m.store.LoseObservation(request.ID, problem.Message)
+		// it cannot be reached: this computer's machine, or a rental not recorded here as ending
+		// or ended (the fleet's sweep records what its Hub says). The connection's keepalive
+		// measures a silent machine; this paces the attempts after.
+		if problem != nil && (accepted || sent) {
+			if accepted {
+				_ = m.store.LoseObservation(request.ID, problem.Message)
+			}
+			if row, _ := m.store.RentalRow(link.MachineID); row != nil && (row.State == hub.RentalReleaseRequested || hub.RentalAbsent(row.State)) {
+				fmt.Fprintf(m.context.Out, "machine execution %s: rental %s is %s; observation stopped\n", request.ID, link.MachineID, row.State)
+				return
+			}
 		}
 		switch {
 		case problem == nil:
