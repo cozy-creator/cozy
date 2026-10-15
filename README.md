@@ -203,7 +203,6 @@ the Store's fetcher: `tfs ensure`. This does not construct a Python/PyTorch mode
 tensors GPU-resident. `tfs fetch` remains the lower-level acquisition interface.
 
 ```bash
-tfs capabilities                      # ensure/1, get-range/1, deliver/1, pressure/1
 tfs ensure <root> org/name@1.0.0 --hub https://hub --lane fp8 --step "load" \
     [--ca-file hub-ca.pem] [--allow-hosts objects.example] [--keep sha256:<manifest>]...
 tfs get <root> sha256:<blob> --range 0:1048576 --out -   # bytes to stdout, under a read lease
@@ -218,8 +217,7 @@ tfs get <root> sha256:<blob> --range 0:1048576 --out -   # bytes to stdout, unde
 - **Admission is disk only**: wanted bytes plus 16 + 3 inodes per object must fit under a
   reserve of 1/50 of the filesystem (clamped to 1–10 GiB) and 32 inodes, after what other live
   flights still owe. Short, the GC policy runs: unreferenced bytes, then idle checkpoints held
-  in part, then delivered products (`Store.deliver_tree_root`, oldest first), then cached
-  lanes; then `CAPACITY_EXHAUSTED`. `ensure::relieve` runs the same
+  in part, then cached lanes; then `CAPACITY_EXHAUSTED`. `ensure::relieve` runs the same
   policy whenever no more than the reserve is free.
 - **The Hub CA** (`--ca-file`) is added to process trust; an untrusted hub is
   `TLS_UNTRUSTED`, never retried. Nothing stalls on a timer: a download that lands nothing

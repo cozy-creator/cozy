@@ -54,45 +54,6 @@ pub struct Report {
     pub scratch_reaped: u64,
 }
 
-impl Report {
-    pub fn line(&self) -> String {
-        let verb = if self.dry_run {
-            "would reclaim"
-        } else {
-            "reclaimed"
-        };
-        format!(
-            "{verb} {} B in {} objects, kept {} B in {} objects under retained roots",
-            self.reclaimed_bytes,
-            self.reclaimed_blobs + self.reclaimed_manifests,
-            self.kept_bytes,
-            self.kept_objects,
-        )
-    }
-
-    pub fn json(&self) -> Vec<u8> {
-        use crate::canon::Value;
-        crate::canon::write(&Value::obj(vec![
-            ("dry_run", Value::Bool(self.dry_run)),
-            ("kept_bytes", Value::uint(self.kept_bytes)),
-            ("kept_objects", Value::uint(self.kept_objects)),
-            ("reclaimed_blobs", Value::uint(self.reclaimed_blobs)),
-            ("reclaimed_bytes", Value::uint(self.reclaimed_bytes)),
-            ("reclaimed_manifests", Value::uint(self.reclaimed_manifests)),
-            (
-                "sessions",
-                Value::arr(
-                    self.sessions
-                        .iter()
-                        .map(|s| Value::str(s.as_str()))
-                        .collect(),
-                ),
-            ),
-            ("scratch_reaped", Value::uint(self.scratch_reaped)),
-        ]))
-    }
-}
-
 /// The filesystem's holds: every candidate an open ingest session root names, PLUS every
 /// object its conversion journals name. A candidate whose bytes sit in `manifests/` is a
 /// manifest hold (its closure stays live through the plan's held-manifest walk); anything
@@ -143,9 +104,7 @@ fn holds_except(store: &Store, idle: &[ObjectRef]) -> Result<(Vec<HeldKey>, Vec<
         .collect::<Result<Vec<_>>>()?;
     holds.extend(crate::derived::retained_objects(store)?);
     holds.extend(crate::source_artifact::held_objects(store)?);
-    holds.extend(crate::checkpoint_root::held_objects(store)?);
     holds.extend(crate::ensure::held_objects(store)?);
-    holds.extend(crate::keyed_roots::held_objects(store)?);
     holds.extend(crate::object_roots::held_objects(store)?);
     // A checkpoint held in part is a cache root ([`crate::origin`]).
     let idle: BTreeSet<&str> = idle.iter().map(|manifest| manifest.sha256.as_str()).collect();
@@ -195,8 +154,6 @@ pub(crate) fn unretained_manifests(store: &Store, wanted: &[ObjectRef]) -> Resul
     let named_roots = || -> Result<Vec<ObjectRef>> {
         let mut named = crate::derived::rooted_manifests(store)?;
         named.extend(manifests(crate::source_artifact::held_objects(store)?));
-        named.extend(manifests(crate::checkpoint_root::held_objects(store)?));
-        named.extend(manifests(crate::keyed_roots::held_objects(store)?));
         Ok(named)
     };
     let everything =

@@ -34,9 +34,6 @@ ring = { version = "0.17", optional = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { version = "0.31.3", default-features = false, features = ["fs", "user"], optional = true }
 
-[build-dependencies]
-sha2 = "0.10"
-
 [dev-dependencies]
 libc = "0.2"
 rcgen = "0.13"

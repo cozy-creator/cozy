@@ -418,29 +418,7 @@ pub fn release(store: &Store, owner: &str) -> Result<()> {
     root.released = true;
     root.objects.clear();
     write(store, &root)?;
-    match fs::remove_file(path(store, owner)?.with_extension("delivered")) {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(io(e)),
-        _ => {}
-    }
     crate::transport::sources::discard_owner(store, owner)
-}
-
-/// Mark a retained tree delivered. Idempotent; the first delivery's time is kept. Nothing
-/// reads the mark: a tree keeps its bytes until `release`.
-pub fn deliver(store: &Store, owner: &str) -> Result<()> {
-    let _lock = lock(store)?;
-    match read(store, owner)? {
-        Some(root) if !root.released => {}
-        _ => return refuse(Code::ROOT_ABSENT, "tree owner is absent or released"),
-    }
-    match OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path(store, owner)?.with_extension("delivered"))
-    {
-        Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => Err(io(e)),
-        _ => Ok(()),
-    }
 }
 
 pub(crate) fn held_objects(store: &Store) -> Result<Vec<HeldKey>> {

@@ -2,7 +2,6 @@
 //! manifests, which point at immutable blobs.  Fixed namespace locations provide the types;
 //! neither stored JSON shape carries a format tag.
 
-use std::cmp::Ordering;
 
 use crate::canon::{as_arr, as_str, Extra, Fields, Value};
 use crate::err::{refuse, Code, Result};
@@ -894,10 +893,6 @@ pub fn apply(current: Option<&[u8]>, mutation: &Mutation) -> Result<Option<Repos
             Ok(None)
         }
     }
-}
-
-pub fn compare_release_key(left: &Release, right: &Release) -> Ordering {
-    left.key().cmp(right.key())
 }
 
 #[cfg(test)]

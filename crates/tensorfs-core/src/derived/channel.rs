@@ -4,7 +4,7 @@
 //! big-endian u32 length, then JSON or at most 1 MiB of bytes. The peer names no Store,
 //! transaction or path: the owner bound all of them before handing it the connected stream.
 use super::{
-    add_config, add_indexed_part, begin, check_writer, checkpoint_indexed, commit, completed,
+    add_config, add_indexed_part, check_writer, checkpoint_indexed, commit, completed,
     config_write_bound, fence, finish_writer, inspect_source, part_write_bound, release_guards,
     transaction_id, writer_store, Additions, CheckpointCursor, ComponentDeclaration,
     ConfigDeclaration, Declaration, PartDeclaration, PartSource, ReceiptFacts, Source, SourceView,
@@ -168,17 +168,6 @@ pub struct Writer {
 type Holds = (Hold, Vec<(String, ReadLease)>);
 
 impl Writer {
-    pub fn begin(
-        store: &Store,
-        meta: std::sync::Arc<Meta>,
-        transaction: &str,
-        session: u64,
-        declaration: Declaration,
-        checkpoint: Option<&ObjectRef>,
-    ) -> Result<Writer> {
-        let begun = begin(store, &meta, transaction, session, declaration, checkpoint)?;
-        Self::from_begin(store, meta, transaction, session, begun)
-    }
 
     /// Open an owner-authorized replacement attempt with a durable native session ID.
     pub fn begin_next(
@@ -917,6 +906,7 @@ fn json(value: &Value) -> Json {
 
 #[cfg(test)]
 mod source_channel_tests {
+    use super::super::begin;
     use super::*;
 
     #[test]
@@ -1084,7 +1074,9 @@ mod source_channel_tests {
         let fetch = Fetching { fetcher: &fetcher, access, stop: &stop };
         let gets = || hub.hits(&format!("/obj/{}", absent.sha256));
         let reread = Declaration { work_fingerprint: Some(format!("sha256:{}", "45".repeat(32))), ..inherit.clone() };
-        let writer = Writer::begin(&store, std::sync::Arc::new(Meta::open(&store).unwrap()), &format!("sha256:{}", "95".repeat(32)), 1, reread, None).unwrap();
+        let (reader_meta, id) = (std::sync::Arc::new(Meta::open(&store).unwrap()), format!("sha256:{}", "95".repeat(32)));
+        let begun = begin(&store, &reader_meta, &id, 1, reread, None).unwrap();
+        let writer = Writer::from_begin(&store, reader_meta, &id, 1, begun).unwrap();
         let mut copied = vec![0u8; 2048];
         writer.source_read_into("source", "model", "other", "value", 0, &mut copied, Some(&fetch)).unwrap();
         assert_eq!(copied, held_back);

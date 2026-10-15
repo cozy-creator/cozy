@@ -43,7 +43,6 @@ pub enum Located {
 #[derive(Debug, Clone)]
 pub struct SegIndex {
     starts: Vec<u64>,
-    total: u64,
     stride: Option<u64>,
 }
 
@@ -60,13 +59,8 @@ impl SegIndex {
             && segs[segs.len() - 1].length <= first;
         SegIndex {
             starts,
-            total,
             stride: if uniform { Some(first) } else { None },
         }
-    }
-
-    pub fn total(&self) -> u64 {
-        self.total
     }
 
     /// O(1) on a uniform run, O(log n) otherwise. Zero fetches either way.
@@ -180,14 +174,6 @@ impl Part {
         match &self.body {
             Body::Segments(s) => s,
             Body::Inline(_) => &[],
-        }
-    }
-
-    /// Build the offset index. Only meaningful for a segmented part.
-    pub fn index(&self) -> Option<SegIndex> {
-        match &self.body {
-            Body::Segments(s) => Some(SegIndex::of(s)),
-            Body::Inline(_) => None,
         }
     }
 

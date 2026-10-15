@@ -3,8 +3,6 @@
 
 #![forbid(unsafe_code)]
 
-#[cfg(feature = "store")]
-pub mod asset_update;
 pub mod b64;
 #[cfg(feature = "store")]
 mod cache_roots;
@@ -47,8 +45,6 @@ pub mod ids;
 #[cfg(feature = "store")]
 pub mod ingest;
 pub mod jcs;
-#[cfg(feature = "store")]
-pub mod keyed_roots;
 pub mod limits;
 pub mod machine;
 pub mod manifest;
@@ -95,14 +91,9 @@ pub mod vectors;
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// What callers may feature-detect by name instead of by version: `ensure`, ranged `get`
-/// under a lease, delivered-product marks, the pressure pass, and keyed cache roots.
+/// under a lease, and the pressure pass.
 pub const CAPABILITIES: &[&str] = &[
-    "deliver/1",
     "ensure/1",
     "get-range/1",
-    "keyed-roots/1",
     "pressure/1",
 ];
-
-/// Conservative identity of the actual native converter build, not its version label.
-pub const IMPLEMENTATION_SHA256: &str = env!("TENSORFS_IMPLEMENTATION_SHA256");

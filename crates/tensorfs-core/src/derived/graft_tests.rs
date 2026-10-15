@@ -121,19 +121,9 @@ fn graft_receipt_recovery_and_independent_custody_preserve_exact_segments() {
     let header = checkpoint::load_header(&store, &receipt.header).unwrap();
     assert_eq!(header.components[0].1[1].1.parts[0].1, exact_part);
     release_guards(&meta, Some(writer.writer_hold), writer.source_leases);
-    let owner = format!("sha256:{}", "a4".repeat(32));
-    let digest = ObjectRef::of(&crate::canon::write(&receipt.to_value())).id();
-    retain_result(&store, &meta, &id, &digest, &owner).unwrap();
-    dispose(&store, &meta, &id).unwrap();
-    crate::gc::collect(store.root(), false).unwrap();
     store.read_manifest(&receipt.manifest).unwrap();
     for object in &objects {
         store.open_verified(&object.sha256).unwrap();
-    }
-    release_retention(&store, &meta, &id, &digest, &owner).unwrap();
-    crate::gc::collect(store.root(), false).unwrap();
-    for object in objects {
-        assert!(!store.contains(&object.sha256));
     }
     std::fs::remove_dir_all(store.root()).unwrap();
 }

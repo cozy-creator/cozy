@@ -44,10 +44,6 @@ impl Receipt {
             detail,
         }
     }
-    pub fn on(mut self, device: &str) -> Receipt {
-        self.device = device.to_string();
-        self
-    }
 }
 
 impl Receipt {
@@ -78,13 +74,5 @@ impl Receipts {
     }
     pub fn count(&self, degraded: &str) -> usize {
         self.0.iter().filter(|r| r.degraded == degraded).count()
-    }
-    pub fn print(&self) {
-        for r in &self.0 {
-            println!(
-                "  RECEIPT {} op={} {} — {}",
-                r.degraded, r.op, r.device, r.detail
-            );
-        }
     }
 }

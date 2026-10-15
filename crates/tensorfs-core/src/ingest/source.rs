@@ -72,10 +72,6 @@ impl CarrierSet {
         Self { by_member }
     }
 
-    pub fn path_of(&self, member: &str) -> Option<&Path> {
-        self.by_member.get(member).map(PathBuf::as_path)
-    }
-
     pub fn members(&self) -> &BTreeMap<String, PathBuf> {
         &self.by_member
     }
@@ -4001,7 +3997,7 @@ mod tests {
             let member = format!("{directory}/model.safetensors.index.json");
             let carrier = CarrierInput {
                 member: Some(member.clone()),
-                path: set.path_of(&member).unwrap().to_path_buf(),
+                path: set.members()[&member].clone(),
             };
             let (header, raw) = read_carrier(&carrier, &set).expect("a sharded carrier reads");
             assert_eq!(header.shards.len(), 2, "{member} joins two shards");

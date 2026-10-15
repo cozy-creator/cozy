@@ -176,14 +176,6 @@ impl Manifest {
         refs
     }
 
-    pub fn listings(&self, blob: &ObjectRef) -> Vec<&str> {
-        self.entries
-            .iter()
-            .filter(|(_, entry)| entry.blob() == blob)
-            .map(|(path, _)| path.as_str())
-            .collect()
-    }
-
     fn validate(&self) -> Result<()> {
         if self.entries.is_empty() {
             return refuse(Code::MISSING_FIELD, "a manifest lists at least one entry");

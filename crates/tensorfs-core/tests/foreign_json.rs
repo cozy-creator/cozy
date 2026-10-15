@@ -6,7 +6,7 @@ use std::{
 };
 use tensorfs_core::{
     err::Code,
-    ingest::{carrier, fingerprint},
+    ingest::carrier,
 };
 
 fn root(name: &str) -> PathBuf {
@@ -59,13 +59,6 @@ fn publisher_metadata_in_any_json_spelling_reads() {
     assert_eq!(h.meta("ss_learning_rate"), None);
     assert_eq!(h.meta("ss_seed"), None);
     assert_eq!(h.meta("nested"), None);
-    assert_eq!(
-        fingerprint::evidence_stamps(&h).unwrap(),
-        vec![(
-            "modelspec.architecture".to_string(),
-            "stable-diffusion-xl-v1-base/lora".to_string()
-        )]
-    );
     let _ = fs::remove_dir_all(dir);
 }
 
@@ -128,14 +121,4 @@ fn an_index_with_extra_fields_and_per_shard_metadata_reads() {
         .collect();
     assert_eq!(formats, vec!["pt", "pt; shard 2"]);
     let _ = fs::remove_dir_all(dir);
-}
-
-#[test]
-fn a_comfy_quant_marker_with_fields_this_build_does_not_read_decodes() {
-    let marker = br#"{"format": "float8_e4m3fn", "full_precision_matrix_mult": true, "scale": 0.5, "note": "caf\u00e9"}"#;
-    let mut padded = marker.to_vec();
-    padded.resize(marker.len() + 5, 0);
-    let decoded = fingerprint::decode_comfy_quant("x.comfy_quant", &padded).unwrap();
-    assert_eq!(decoded.format, "float8_e4m3fn");
-    assert!(decoded.full_precision_matrix_mult);
 }

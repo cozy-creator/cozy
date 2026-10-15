@@ -108,17 +108,6 @@ fn trust_checks_load_the_catalog_once_and_bad_bytes_are_still_caught() {
     ));
     assert!(!changed.exists());
 
-    // Bytes changed under an intact binding are the scrub's to find, and it finds them.
-    let hidden = store.blob_path(&objects[2].sha256);
-    rewrite_in_place(&hidden, true);
-    assert_eq!(
-        store.verify(&objects[2].sha256).unwrap(),
-        Verdict::Verified { rehashed: false }
-    );
-    let scrub = store.scrub(1.0, 0).unwrap();
-    assert_eq!(scrub.removed, 1);
-    assert!(!hidden.exists());
-
     // Landing hashes: bytes that are not the declared object are never installed.
     let declared = ObjectRef::of(&[8u8; 5000]);
     let refused = store

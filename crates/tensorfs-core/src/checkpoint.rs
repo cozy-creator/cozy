@@ -10,7 +10,7 @@ use std::io::{Read, Write};
 
 use crate::dtype::{checked_bytes, Dtype};
 use crate::err::{refuse, Code, Refusal, Result};
-use crate::header::{Body, Closure, Header, Located, Part};
+use crate::header::{Body, Closure, Header, Part};
 use crate::ids::ObjectRef;
 use crate::limits;
 use crate::manifest::Manifest;
@@ -192,26 +192,6 @@ pub fn materialize<W: Write>(store: &Store, what: &str, part: &Part, w: &mut W) 
         }
     }
     Ok(sha256::hex(&h.finish()))
-}
-
-/// A bounded slice of a part, fetched through the derived offsets and nothing else.
-pub fn read_span(store: &Store, what: &str, part: &Part, off: u64, len: u64) -> Result<Vec<u8>> {
-    match part.locate(what, off, len)? {
-        Located::Inline { off, len } => {
-            let b = match &part.body {
-                Body::Inline(s) => s.clone(),
-                Body::Segments(_) => unreachable!(),
-            };
-            Ok(b[off as usize..(off + len) as usize].to_vec())
-        }
-        Located::Segments(spans) => {
-            let mut out = Vec::with_capacity(len as usize);
-            for s in spans {
-                out.extend_from_slice(&store.read_range(&s.obj.sha256, s.off, s.len)?);
-            }
-            Ok(out)
-        }
-    }
 }
 
 // ------------------------------------------------------------------ documents

@@ -371,16 +371,10 @@ pub(crate) struct Verified {
 #[derive(Debug)]
 pub struct VerifiedFile {
     file: File,
-    sha256: String,
     len: u64,
 }
 
 impl VerifiedFile {
-    /// The id these bytes were proven to have.
-    pub fn sha256(&self) -> &str {
-        &self.sha256
-    }
-
     /// The length observed on the verified descriptor (`fstat`, never a second `stat`).
     pub fn len(&self) -> u64 {
         self.len
@@ -427,15 +421,6 @@ pub enum Verdict {
     Verified { rehashed: bool },
     Invalidated { why: String },
     CorruptRemoved { why: String },
-}
-
-#[derive(Debug, Default, Clone)]
-pub struct Scrub {
-    pub scanned: usize,
-    pub sampled: usize,
-    pub rehashed: usize,
-    pub removed: usize,
-    pub bytes_hashed: u64,
 }
 
 impl Store {
@@ -874,50 +859,6 @@ impl Store {
         )
     }
 
-    /// Prepare the Store for read leases created by a separate unprivileged uid.
-    ///
-    /// TensorFS owns these internal paths and exact modes. Callers request the policy; they do
-    /// not create or chmod Store internals themselves.
-    pub fn prepare_readers(&self) -> Result<()> {
-        for (path, mode) in [
-            (self.root.clone(), 0o755),
-            (self.root.join("repos"), 0o755),
-            (self.root.join("manifests"), 0o755),
-            (self.root.join("blobs"), 0o755),
-            (self.root.join("checkouts"), 0o755),
-            (self.root.join("tmp"), 0o755),
-            (self.root.join("tmp/leases"), 0o1733),
-            (self.root.join("tmp/writers"), 0o755),
-        ] {
-            prepare_reader_dir(&path, mode)?;
-        }
-        let lock_path = self.root.join("tmp/writers/recovery.lock");
-        let lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .mode(0o666)
-            .custom_flags(O_NOFOLLOW)
-            .open(&lock_path)
-            .map_err(|error| io(format!("open {}", lock_path.display()), error))?;
-        if !lock
-            .metadata()
-            .map_err(|error| io("stat recovery lock", error))?
-            .is_file()
-        {
-            return refuse(
-                Code::NOT_REGULAR_FILE,
-                format!("{} is not a regular file", lock_path.display()),
-            );
-        }
-        lock.set_permissions(fs::Permissions::from_mode(0o666))
-            .map_err(|error| io("chmod recovery lock", error))?;
-        lock.sync_all()
-            .map_err(|error| io("sync recovery lock", error))?;
-        fsync_dir(&self.root.join("tmp/writers"))
-    }
-
     /// Public directory ownership follows the Store owner, not whichever trusted writer
     /// first touches a hash prefix. A privileged broker may write beside the Store owner;
     /// its new directories must not strand that owner behind root-owned 0755 prefixes.
@@ -1009,62 +950,6 @@ impl Store {
                 .map_err(|error| io("assign metadata to Store owner", error))?;
         }
         Ok(())
-    }
-
-    /// Sorted Manifest ids whose CozyTensors runtime closures are verifiably resident.
-    ///
-    /// Ordinary snapshots, incomplete models, malformed Manifests, and corrupt/missing reached
-    /// objects are conservatively absent from the answer.
-    pub fn complete_cozytensors_manifests(&self) -> Result<Vec<String>> {
-        let mut manifests = Vec::new();
-        for first in read_dir(&self.root.join("manifests"))? {
-            if !is_real_dir(&first)? {
-                continue;
-            }
-            for second in read_dir(&first)? {
-                if !is_real_dir(&second)? {
-                    continue;
-                }
-                for path in read_dir(&second)? {
-                    let metadata = match fs::symlink_metadata(&path) {
-                        Ok(metadata) if metadata.is_file() => metadata,
-                        Ok(_) => continue,
-                        Err(error) => return Err(io("stat Manifest candidate", error)),
-                    };
-                    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-                        continue;
-                    };
-                    let Some(digest) = name.strip_suffix(".json") else {
-                        continue;
-                    };
-                    if hex64("Manifest candidate", digest).is_err()
-                        || self.manifest_path(digest) != path
-                    {
-                        continue;
-                    }
-                    let reference = ObjectRef {
-                        sha256: digest.to_string(),
-                        length: metadata.len(),
-                    };
-                    let Ok(manifest) = self.read_manifest(&reference) else {
-                        continue;
-                    };
-                    crate::stats::presence_pass();
-                    let Ok(walk) = crate::checkpoint::walk_cozytensors(self, &manifest) else {
-                        continue;
-                    };
-                    let complete = walk.distinct().into_iter().all(|object| {
-                        self.open_verified(&object.sha256)
-                            .is_ok_and(|file| file.len() == object.length)
-                    });
-                    if complete {
-                        manifests.push(reference.id());
-                    }
-                }
-            }
-        }
-        manifests.sort();
-        Ok(manifests)
     }
 
     /// A malformed id has NO path in this store. `hex[0..2]` panics on a short string, and a
@@ -1690,74 +1575,6 @@ impl Store {
         self.put_stream(&mut f, expect, fault)
     }
 
-    /// Copy one exact object between stores through the same verified read and admission
-    /// doors used everywhere else. Store layout never escapes this module: the source is
-    /// opened once through `open_verified`, and the destination hashes, length-checks and
-    /// publishes without clobbering through `put_stream`.
-    pub fn transfer_object(&self, destination: &Store, want: &ObjectRef) -> Result<Put> {
-        // A retried transfer streams NOTHING: the destination's own predicate
-        // (`record_valid` — may these bytes be trusted without hashing them again?, the
-        // same question `FetchPlan::of` asks) answers before any byte moves, so a retried
-        // 99 GB store-to-store materialization is a stat, not a re-copy.
-        if let Ok(rec) = destination.record_valid(&want.sha256) {
-            if rec.length == want.length {
-                return Ok(Put {
-                    obj: want.clone(),
-                    admitted: false,
-                });
-            }
-            return refuse(
-                Code::LENGTH_MISMATCH,
-                format!(
-                    "{} is {} bytes in the destination store, expected {}",
-                    want.id(),
-                    rec.length,
-                    want.length
-                ),
-            );
-        }
-        let mut source = self.open_verified(&want.sha256)?;
-        if source.len() != want.length {
-            return refuse(
-                Code::LENGTH_MISMATCH,
-                format!(
-                    "{} is {} bytes in the source store, expected {}",
-                    want.id(),
-                    source.len(),
-                    want.length
-                ),
-            );
-        }
-        let put = destination.put_stream(&mut source, Some(want), &Fault::default())?;
-        if !put.admitted {
-            let installed = destination.open_verified(&want.sha256)?;
-            if installed.len() != want.length {
-                return refuse(
-                    Code::LENGTH_MISMATCH,
-                    format!(
-                        "{} is {} bytes in the destination store, expected {}",
-                        want.id(),
-                        installed.len(),
-                        want.length
-                    ),
-                );
-            }
-        }
-        Ok(put)
-    }
-
-    pub fn transfer_manifest(&self, destination: &Store, want: &ObjectRef) -> Result<Put> {
-        let manifest = self.read_manifest(want)?;
-        let put = destination.put_manifest(&manifest)?;
-        if put.obj != *want {
-            return refuse(
-                Code::OBJECT_ID_MISMATCH,
-                "transferred manifest identity changed during admission",
-            );
-        }
-        Ok(put)
-    }
-
     // ------------------------------------------------------------ records
 
     fn write_record(&self, rec: &VRecord) -> Result<()> {
@@ -1837,7 +1654,7 @@ impl Store {
     /// `open_verified` plus the fact a caller may need to report: whether trusting these
     /// bytes cost a rehash (missing or disagreeing record) rather than a record lookup.
     pub fn open_verified_reporting(&self, hex: &str) -> Result<(VerifiedFile, bool)> {
-        let (verdict, file) = self.verify_pinned(hex, false)?;
+        let (verdict, file) = self.verify_pinned(hex)?;
         let rehashed = !matches!(verdict, Verdict::Verified { rehashed: false });
         match (verdict, file) {
             (Verdict::CorruptRemoved { why }, _) => refuse(
@@ -1850,7 +1667,6 @@ impl Store {
                 Ok((
                     VerifiedFile {
                         file: f,
-                        sha256: hex.to_string(),
                         len,
                     },
                     rehashed,
@@ -1909,19 +1725,9 @@ impl Store {
     /// is missing or any bound fact moved. That rehash is CORRECTNESS, not paranoia, and it
     /// is not optional.
     ///
-    /// PARANOID MODE IS DELETED (owner ruling 2026-08-25). The per-read full-rehash option
-    /// was 16.6x slower, had no consumer, and gave integrity checking a second home.
-    /// `scrub` — the rate-knobbed whole-store sweep — is now the ONLY deliberate
-    /// full-rehash door, and it reaches the forced path through `rehash` below rather than
-    /// through a flag anyone can pass on a read.
+    /// There is no forced full rehash (owner ruling 2026-08-25).
     pub fn verify(&self, hex: &str) -> Result<Verdict> {
-        Ok(self.verify_pinned(hex, false)?.0)
-    }
-
-    /// The scrub's door: rehash this object whatever its record says. Not reachable from
-    /// the read path, the CLI, or the wheel — only from `scrub`.
-    fn rehash(&self, hex: &str) -> Result<Verdict> {
-        Ok(self.verify_pinned(hex, true)?.0)
+        Ok(self.verify_pinned(hex)?.0)
     }
 
     /// Verify through ONE descriptor and hand it back with the verdict.
@@ -1930,19 +1736,18 @@ impl Store {
     /// the fd itself for the rehash — so the pathname is resolved exactly once. The
     /// returned `File` is the object those facts are about; `None` only after corrupt removal,
     /// where there is nothing to hand out.
-    fn verify_pinned(&self, hex: &str, force: bool) -> Result<(Verdict, Option<File>)> {
+    fn verify_pinned(&self, hex: &str) -> Result<(Verdict, Option<File>)> {
         let mut f = self.open_nofollow(hex)?;
         let md = f.metadata().map_err(|e| io("fstat object", e))?;
-        let disagreement = match self.record(hex) {
-            None => Some("no verification record".to_string()),
-            Some(rec) => rec.disagreement(hex, &md),
+        let why = match self.record(hex) {
+            None => "no verification record".to_string(),
+            Some(rec) => match rec.disagreement(hex, &md) {
+                None => return Ok((Verdict::Verified { rehashed: false }, Some(f))),
+                Some(why) => why,
+            },
         };
-        if disagreement.is_none() && !force {
-            return Ok((Verdict::Verified { rehashed: false }, Some(f)));
-        }
         let got = self.hash_fd(&mut f)?;
         if got != hex {
-            let why = disagreement.unwrap_or_else(|| "scrub rehash".to_string());
             // Remove the NAME: whatever is at the path now must stop satisfying reads. The
             // descriptor is dropped with `f` — corrupt bytes are never handed back.
             self.remove_corrupt_blob(hex)?;
@@ -1955,13 +1760,7 @@ impl Store {
         }
         let md = f.metadata().map_err(|e| io("fstat object", e))?;
         self.write_record(&VRecord::of(hex, &md))?;
-        Ok((
-            match disagreement {
-                None => Verdict::Verified { rehashed: true },
-                Some(why) => Verdict::Invalidated { why },
-            },
-            Some(f),
-        ))
+        Ok((Verdict::Invalidated { why }, Some(f)))
     }
 
     pub fn hash_object(&self, hex: &str) -> Result<String> {
@@ -1997,7 +1796,7 @@ impl Store {
         Ok(())
     }
 
-    // ------------------------------------------------------------ scrub / reap
+    // ------------------------------------------------------------ objects / reap
 
     pub fn objects(&self) -> Result<Vec<String>> {
         let mut out = Vec::new();
@@ -2015,44 +1814,6 @@ impl Store {
         }
         out.sort();
         Ok(out)
-    }
-
-    /// ONE knob, and since the 2026-08-25 owner ruling the ONE deliberate full-rehash door.
-    /// `rate` is the fraction of objects rehashed this pass, chosen deterministically from
-    /// (pass, id). Everything else gets its record checked, and a record that disagrees is
-    /// rehashed anyway.
-    pub fn scrub(&self, rate: f64, pass: u64) -> Result<Scrub> {
-        let mut s = Scrub::default();
-        for hex in self.objects()? {
-            s.scanned += 1;
-            let sampled = sample(pass, &hex) < rate;
-            if sampled {
-                s.sampled += 1;
-            }
-            let size = stat(&self.object_path(&hex)).map(|m| m.len()).unwrap_or(0);
-            match if sampled {
-                self.rehash(&hex)?
-            } else {
-                self.verify(&hex)?
-            } {
-                Verdict::Verified { rehashed } => {
-                    if rehashed {
-                        s.rehashed += 1;
-                        s.bytes_hashed += size;
-                    }
-                }
-                Verdict::Invalidated { .. } => {
-                    s.rehashed += 1;
-                    s.bytes_hashed += size;
-                }
-                Verdict::CorruptRemoved { .. } => {
-                    s.rehashed += 1;
-                    s.bytes_hashed += size;
-                    s.removed += 1;
-                }
-            }
-        }
-        Ok(s)
     }
 
     /// Reap the admission temps whose writer is GONE. A temp is scratch by construction:
@@ -2306,27 +2067,6 @@ fn open_real_directory(path: &Path) -> Result<File> {
     Ok(directory)
 }
 
-fn prepare_reader_dir(path: &Path, mode: u32) -> Result<()> {
-    match fs::create_dir(path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(io(format!("mkdir {}", path.display()), error)),
-    }
-    let directory = open_real_directory(path)?;
-    directory
-        .set_permissions(fs::Permissions::from_mode(mode))
-        .map_err(|error| io(format!("chmod directory {}", path.display()), error))?;
-    directory
-        .sync_all()
-        .map_err(|error| io(format!("sync directory {}", path.display()), error))
-}
-
-fn is_real_dir(path: &Path) -> Result<bool> {
-    fs::symlink_metadata(path)
-        .map(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
-        .map_err(|error| io(format!("stat directory {}", path.display()), error))
-}
-
 // ---------------------------------------------------------------- helpers
 
 fn cleanup<T>(tmp: &Path, e: Refusal) -> Result<T> {
@@ -2419,11 +2159,4 @@ pub(crate) fn fsync_entry_dir(root: &Path, dir: &Path) -> Result<()> {
         set.insert(identity);
     }
     Ok(())
-}
-
-/// Deterministic [0,1) sample position for (pass, object) — the one scrub knob's input.
-fn sample(pass: u64, hex: &str) -> f64 {
-    let d = sha256::digest(format!("{pass}:{hex}").as_bytes());
-    let v = u32::from_be_bytes([d[0], d[1], d[2], d[3]]);
-    v as f64 / u32::MAX as f64
 }

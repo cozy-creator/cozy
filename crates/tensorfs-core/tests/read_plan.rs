@@ -66,10 +66,6 @@ fn selecting_parts_preserves_native_windows_and_rebases_only_destinations() {
         offset += selected.len;
     }
     assert_eq!(full.items[1].dest_off, 4, "the original plan is unchanged");
-    assert_eq!(
-        selected.batches(512).iter().map(|p| p.bytes).sum::<u64>(),
-        selected.bytes
-    );
 }
 
 #[test]
@@ -98,7 +94,6 @@ fn selection_does_not_weaken_the_complete_plan_gate() {
     let empty = full.select(&[]).unwrap();
     assert!(empty.items.is_empty());
     assert_eq!((empty.bytes, empty.io_bytes, empty.inline_parts), (0, 0, 0));
-    assert!(empty.batches(512).is_empty());
     assert_eq!(
         empty
             .select(&["model/weight#value".into()])

@@ -4,20 +4,6 @@ use crate::canon::{write, Value};
 use crate::capability::CapabilityRecord;
 use crate::fit::Fit;
 
-pub const FIT_KEYS: &[&str] = &[
-    "code",
-    "component",
-    "custody",
-    "detail",
-    "device",
-    "encoding",
-    "ignored",
-    "ignored_bytes",
-    "key",
-    "routes",
-    "warning",
-];
-
 pub const CAPABILITY_KEYS: &[&str] = &[
     "admitted",
     "code",

@@ -4,7 +4,6 @@ use std::fs;
 use std::path::PathBuf;
 
 use tensorfs_core::canon;
-use tensorfs_core::err::Code;
 use tensorfs_core::gc;
 use tensorfs_core::ids::{Doc, ObjectRef};
 use tensorfs_core::manifest::Manifest;
@@ -181,17 +180,6 @@ fn an_unknown_entry_kind_is_carried_and_kept_and_refuses_only_to_materialize() {
     assert!(
         store.contains(&link.sha256),
         "GC deleted an opaque entry's object"
-    );
-
-    assert_eq!(
-        tensorfs_core::project::ordinary_file(&manifest, "a.txt").unwrap(),
-        &file
-    );
-    assert_eq!(
-        tensorfs_core::project::ordinary_file(&manifest, "b")
-            .unwrap_err()
-            .code,
-        Code::UNKNOWN_FIELD
     );
     let _ = fs::remove_dir_all(root);
 }

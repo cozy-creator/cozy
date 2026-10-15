@@ -1,13 +1,10 @@
-//! Disposable local checkouts and explicit byte materialization.
+//! Disposable local checkouts.
 
 use std::collections::HashSet;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs;
 use std::path::{Component, Path, PathBuf};
 
-use crate::canon;
 use crate::err::{refuse, Code, Refusal, Result};
-use crate::ids::ObjectRef;
 use crate::manifest::{Entry, Manifest};
 use crate::store::Store;
 
@@ -170,87 +167,15 @@ pub fn checkout(
     Ok(result)
 }
 
-/// Resolve the one kind `materialize` may copy. A typed CozyTensors entry is visible in
-/// checkout, but remains a header rather than an ordinary-file materialization subject.
-pub fn ordinary_file<'a>(manifest: &'a Manifest, path: &str) -> Result<&'a ObjectRef> {
-    match manifest
-        .entries()
-        .iter()
-        .find(|(candidate, _)| candidate == path)
-    {
-        Some((_, Entry::CozyTensors(_))) => refuse(
-            Code::PROJECTION_WEIGHT_PATH,
-            "materialize selects ordinary files only",
-        ),
-        Some((_, entry)) => entry.materializable(path),
-        None => refuse(
-            Code::NOT_CONTAINED,
-            format!("manifest has no path {path:?}"),
-        ),
-    }
-}
-
-/// Write an independent physical copy of one selected ordinary manifest entry.
-pub fn materialize(store: &Store, blob: &ObjectRef, destination: &Path) -> Result<u64> {
-    let directory = destination.parent().unwrap_or(Path::new("."));
-    fs::create_dir_all(directory).map_err(|error| io("mkdir materialize", error))?;
-    let temporary = directory.join(format!(
-        ".materialize-{}-{}-{}",
-        std::process::id(),
-        &blob.sha256[..12],
-        crate::meta::now_nanos_unique(),
-    ));
-    let mut output = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)
-        .map_err(|error| io("create materialize", error))?;
-    let written = match store.read_into(&blob.sha256, &mut output) {
-        Ok(written) => written,
-        Err(error) => {
-            let _ = fs::remove_file(&temporary);
-            return Err(error);
-        }
-    };
-    if written != blob.length {
-        let _ = fs::remove_file(&temporary);
-        return refuse(
-            Code::LENGTH_MISMATCH,
-            format!(
-                "{} delivered {written} bytes, expected {}",
-                blob.id(),
-                blob.length
-            ),
-        );
-    }
-    output
-        .flush()
-        .map_err(|error| io("flush materialized file", error))?;
-    output
-        .sync_all()
-        .map_err(|error| io("fsync materialized file", error))?;
-    drop(output);
-    fs::rename(&temporary, destination).map_err(|error| io("rename materialized file", error))?;
-    Ok(written)
-}
-
-pub fn render(bytes: &[u8], max: usize) -> Result<String> {
-    if let Ok(header) = crate::header::Header::parse(bytes) {
-        return Ok(canon::pretty(&header.diagnostic_value()?, 0));
-    }
-    let value = canon::parse_canonical(bytes, max)?;
-    Ok(canon::pretty(&value, 0))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::dtype::Dtype;
     use crate::header::{Closure, Header, Part, Tensor};
+    use crate::ids::ObjectRef;
     use crate::manifest::Draft;
     use crate::store::{Fault, Store};
     use std::os::unix::fs::PermissionsExt;
-    use std::sync::{Arc, Barrier};
 
     fn temporary(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -451,72 +376,4 @@ mod tests {
         fs::remove_dir_all(fixture.root).unwrap();
     }
 
-    #[test]
-    fn materialize_selection_keeps_cozytensors_typed_and_ordinary_files_unchanged() {
-        let fixture = projection_fixture("materialize-kind");
-        assert_eq!(
-            ordinary_file(&fixture.manifest, "config.txt").unwrap(),
-            &fixture.ordinary
-        );
-        assert_eq!(
-            ordinary_file(&fixture.manifest, "model.cozytensors")
-                .unwrap_err()
-                .code,
-            Code::PROJECTION_WEIGHT_PATH
-        );
-        assert_eq!(
-            ordinary_file(&fixture.manifest, "absent").unwrap_err().code,
-            Code::NOT_CONTAINED
-        );
-        fs::remove_dir_all(fixture.root).unwrap();
-    }
-
-    #[test]
-    fn concurrent_materializations_do_not_share_a_temp_name() {
-        let root = std::env::temp_dir().join(format!(
-            "tensorfs-materialize-{}-{}",
-            std::process::id(),
-            crate::meta::now_nanos_unique()
-        ));
-        let store = Arc::new(Store::init(&root).unwrap());
-        let bytes = vec![7u8; 1 << 20];
-        let object = store
-            .put_stream(
-                &mut bytes.as_slice(),
-                Some(&ObjectRef::of(&bytes)),
-                &Fault::default(),
-            )
-            .unwrap()
-            .obj;
-        let destination = root.join("out.bin");
-        let barrier = Arc::new(Barrier::new(3));
-        let mut threads = Vec::new();
-        for _ in 0..2 {
-            let store = Arc::clone(&store);
-            let object = object.clone();
-            let destination = destination.clone();
-            let barrier = Arc::clone(&barrier);
-            threads.push(std::thread::spawn(move || {
-                barrier.wait();
-                materialize(&store, &object, &destination)
-            }));
-        }
-        barrier.wait();
-        for thread in threads {
-            assert_eq!(thread.join().unwrap().unwrap(), bytes.len() as u64);
-        }
-        assert_eq!(fs::read(destination).unwrap(), bytes);
-        assert_eq!(
-            fs::read_dir(&root)
-                .unwrap()
-                .flatten()
-                .filter(|entry| entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with(".materialize-"))
-                .count(),
-            0
-        );
-        let _ = fs::remove_dir_all(root);
-    }
 }

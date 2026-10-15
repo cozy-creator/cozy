@@ -5,7 +5,7 @@
 //! would be a place for the two languages to disagree about which reader a vector names.
 //! There is exactly one reader per document either way; this says which one.
 
-use crate::err::{refuse, Code, Refusal, Result};
+use crate::err::{refuse, Code, Result};
 use crate::header::{Closure, Header};
 use crate::ids::{Doc, Plain};
 use crate::ingest::transaction::IngestSession;
@@ -95,21 +95,4 @@ pub fn run_doc(
         tensor_schema,
         manifest,
     })
-}
-
-/// The receipt's binding check over five documents that arrive as bytes — the cross-vector
-/// assertion, reachable from either harness.
-pub fn receipt_binds(
-    receipt: &[u8],
-    subject: &[u8],
-    manifest: &[u8],
-    header: &[u8],
-    stamp: &[u8],
-) -> std::result::Result<(), Refusal> {
-    let r = IngestVerificationReceipt::parse(receipt)?;
-    let s = IngestSubject::parse(subject)?;
-    let m = Manifest::parse(manifest)?;
-    let h = Header::parse(header)?;
-    let t = crate::ingest::stamp::Stamp::parse(stamp)?;
-    r.binds(&s, &m, &h, &t)
 }
