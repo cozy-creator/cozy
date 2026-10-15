@@ -73,6 +73,10 @@ func observedRental(ctx *Context, store *records.Store, id string) (*records.Ren
 	}
 	layout := home.Paths(ctx.Cfg.Home)
 	key, problem := rental.CreatorIdentityFor(layout, id)
+	if problem != nil && row.CertPath == "" && attaching(store, id) {
+		// Rented here and just ready: Calcifer attaches it on its next look, and work waits.
+		return nil, exit.Named(exit.Unavailable, "rental.not_ready", "rental %s is ready; this computer is attaching it", id)
+	}
 	if problem != nil {
 		return nil, problem
 	}
@@ -81,6 +85,12 @@ func observedRental(ctx *Context, store *records.Store, id string) (*records.Ren
 	}
 	row.CertificatePEM = remote.CertPEM
 	return row, nil
+}
+
+// attaching answers whether this host's acquisition of rental id has not attached it yet.
+func attaching(store *records.Store, id string) bool {
+	operations, _ := store.ActiveRentalOperations()
+	return slices.ContainsFunc(operations, func(op records.RentalOperation) bool { return op.RentalID == id && op.State != "attached" })
 }
 
 func resolveLiveRental(ctx *Context, store *records.Store, name string) (rental.Live, *exit.Error) {

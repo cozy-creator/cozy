@@ -80,6 +80,26 @@ func (s *Store) RunV1Marked(id, mark string) (bool, *exit.Error) {
 	return found, nil
 }
 
+// RunAhead is the earliest run sent to machine before id that the machine has not confirmed,
+// "" when none: work queued for one machine reaches it in submission order. Its software
+// update is not in that line; work waits for the update instead.
+func (s *Store) RunAhead(machine, id string) (string, *exit.Error) {
+	var ahead string
+	err := s.db.QueryRow(`SELECT r.id FROM machine_executions e JOIN requests r ON r.id=e.request_id
+ JOIN requests this ON this.id=?2
+ WHERE e.machine_id=?1 AND r.kind<>'update' AND (r.created_at,r.id)<(this.created_at,this.id)
+ AND r.state IN ('submitted','queued') AND length(e.receipt)=0 AND e.cancel_requested=0
+ AND NOT `+machineExecutionAbandoned+` AND NOT `+machineExecutionLost+`
+ ORDER BY r.created_at,r.id LIMIT 1`, machine, id).Scan(&ahead)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	if err != nil {
+		return "", exit.Internalf("cannot read the runs ahead of %s on %s: %s", id, machine, err)
+	}
+	return ahead, nil
+}
+
 // RunV1State is the run's accepted RunState (its machine number), nil before acceptance.
 func RunV1State(link *MachineExecution) *v1.RunState {
 	var state v1.RunState
