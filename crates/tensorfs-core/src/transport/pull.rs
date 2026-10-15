@@ -76,7 +76,7 @@ impl<F: FnMut(u64)> FetchObserver for F {
     }
 }
 
-pub(super) fn shared_client() -> &'static Client {
+pub(crate) fn shared_client() -> &'static Client {
     static CLIENT: OnceLock<Client> = OnceLock::new();
     CLIENT.get_or_init(Client::new)
 }
@@ -307,11 +307,11 @@ impl ObjectUrls for BTreeMap<String, String> {
 /// lease's AGE against that declared life, and reaching that decision from the wire means
 /// racing a clock. The rule is worth testing directly, with a lease whose age is stated
 /// rather than waited for.
-pub(super) struct Lease {
-    pub(super) url: String,
-    pub(super) minted: Instant,
+pub(crate) struct Lease {
+    pub(crate) url: String,
+    pub(crate) minted: Instant,
     /// What the HUB said this URL is good for.
-    pub(super) lifetime: Duration,
+    pub(crate) lifetime: Duration,
 }
 
 impl Lease {
@@ -321,7 +321,7 @@ impl Lease {
     /// many seconds anything should take, it moves when the hub moves, and what it buys is a
     /// stated guarantee — every object begins its transfer holding at least half a URL's
     /// life, whatever that life happens to be.
-    fn spent(&self) -> bool {
+    pub(crate) fn spent(&self) -> bool {
         self.minted.elapsed() * 2 >= self.lifetime
     }
 }
@@ -349,13 +349,18 @@ pub(super) struct Leases<'a> {
 }
 
 #[derive(Default)]
-pub(super) struct Minting {
+pub(crate) struct Minting {
     active: Mutex<bool>,
     ready: Condvar,
 }
 
 impl Minting {
-    fn acquire(&self, ledger: &Ledger, deadline: Deadline) -> Result<MintOwner<'_>> {
+    /// Whether another caller holds the right to mint.
+    pub(crate) fn busy(&self) -> bool {
+        *self.active.lock().unwrap()
+    }
+
+    pub(crate) fn acquire(&self, ledger: &Ledger, deadline: Deadline) -> Result<MintOwner<'_>> {
         let mut active = self.active.lock().unwrap();
         while *active {
             ledger.check_running()?;
@@ -371,7 +376,7 @@ impl Minting {
     }
 }
 
-struct MintOwner<'a>(&'a Minting);
+pub(crate) struct MintOwner<'a>(&'a Minting);
 impl Drop for MintOwner<'_> {
     fn drop(&mut self) {
         *self.0.active.lock().unwrap() = false;
@@ -631,22 +636,21 @@ pub(super) fn fetch_wanted_bounded(
     let streams = crate::descriptors::streams_within(super::memory::transfer_streams(
         streams.clamp(1, PULL_STREAMS),
     ));
+    let grant = |object: &ObjectRef| DeliveryGrant::mint(plan, object);
+    let batch =
+        super::download::Batch::new(&plan.wanted, &grant, urls, policy, credential, on_object);
+    let chunk = super::download::CHUNK_BYTES;
     let walked = super::download::Download {
         store,
-        wanted: &plan.wanted,
-        grant: &|object| DeliveryGrant::mint(plan, object),
-        urls,
-        chunk: super::download::CHUNK_BYTES,
+        feed: &batch,
+        chunk,
         ranged: true,
-        policy,
-        credential,
         deadline,
         ledger,
-        on_object,
         backfill: backfill.as_ref(),
         keep: None,
     }
-    .run(streams, None)?;
+    .run(batch.streams(streams, chunk), None)?;
     if let Some(backfill) = backfill {
         backfill.finish_offers();
     }
@@ -706,16 +710,20 @@ impl<'a> PullRequest<'a> {
 
 /// The pull's egress policy: the caller's, plus the hub it named.
 fn pull_policy(request: &PullRequest<'_>) -> SourcePolicy {
-    let mut policy = request.policy.clone();
-    // One resolution per host for this pull, however many objects it asks for.
+    hub_policy(request.base, request.policy)
+}
+
+/// `policy`, plus the hub at `base`: naming a hub declares it, and a loopback hub a local
+/// deployment. One resolution per host for whatever uses it.
+pub(crate) fn hub_policy(base: &str, policy: &SourcePolicy) -> SourcePolicy {
+    let mut policy = policy.clone();
     policy.resolved = Default::default();
-    // Naming a hub base IS declaring it, and a loopback hub declares a local deployment.
-    if let Ok(host) = policy::base_host(request.base) {
+    if let Ok(host) = policy::base_host(base) {
         if !policy.allows_host(&host) {
             policy.allowed_hosts.push(host);
         }
     }
-    if policy::is_loopback_origin(request.base) {
+    if policy::is_loopback_origin(base) {
         policy.allow_local = true;
     }
     policy
@@ -752,86 +760,6 @@ pub fn resolve_closure(request: &PullRequest<'_>) -> Result<hub::Closure> {
         request.deadline,
         &ledger,
     )
-}
-
-/// The part of `closure` the named components and objects reach: the manifest, its header, the
-/// header's assets, those components' parts and those part objects. The manifest and then the
-/// header land first, two small pulls, since only they say which object is whose. A component
-/// or object the header does not name refuses.
-pub fn narrow(
-    request: &PullRequest<'_>,
-    closure: &hub::Closure,
-    components: &[String],
-    wanted: &[ObjectRef],
-) -> Result<hub::Closure> {
-    let stage = |objects: Vec<ObjectRef>| -> Result<()> {
-        let mut part = closure.clone();
-        part.objects = objects;
-        part.part = true;
-        let pull_part = PullRequest {
-            cancellation: request.cancellation.clone(),
-            store: request.store,
-            base: request.base,
-            refspec: request.refspec,
-            lane: request.lane,
-            credential: request.credential,
-            policy: request.policy,
-            deadline: request.deadline,
-            streams: request.streams,
-            session: request.session,
-            sample_seconds: request.sample_seconds,
-            on_plan: None,
-            on_object: None,
-            closure: Some(&part),
-        };
-        pull(&pull_part).map(drop)
-    };
-    stage(vec![closure.manifest.clone()])?;
-    let manifest = request.store.read_manifest(&closure.manifest)?;
-    let Some(header_ref) = manifest.header().cloned() else {
-        return refuse(
-            Code::ATTACHMENT_CARDINALITY,
-            "not a checkpoint manifest: no cozytensors header attachment",
-        );
-    };
-    stage(vec![header_ref.clone()])?;
-    let header = crate::checkpoint::load_header(request.store, &header_ref)?;
-    if let Some(absent) = components.iter().find(|name| {
-        !header
-            .components
-            .iter()
-            .any(|(component, _)| component == *name)
-    }) {
-        return refuse(
-            Code::NOT_CONTAINED,
-            format!("component {absent:?} is not in this checkpoint"),
-        );
-    }
-    let mut objects = vec![header_ref];
-    for (_, asset) in &header.assets {
-        objects.extend(asset.segments.iter().cloned());
-    }
-    for (component, _, tensor) in header.tensors() {
-        for (_, part) in &tensor.parts {
-            for segment in part.segments() {
-                if components.contains(component) || wanted.contains(segment) {
-                    objects.push(segment.clone());
-                }
-            }
-        }
-    }
-    objects.sort_by(|a, b| a.sha256.cmp(&b.sha256));
-    objects.dedup_by(|a, b| a.sha256 == b.sha256);
-    let mut narrowed = closure.clone();
-    narrowed.objects = objects;
-    narrowed.part = true;
-    if let Some(absent) = wanted.iter().find(|object| !narrowed.objects.contains(object)) {
-        return refuse(
-            Code::NOT_CONTAINED,
-            format!("{} is not a part of this checkpoint", absent.id()),
-        );
-    }
-    Ok(narrowed)
 }
 
 /// What a pull actually did — counted, never estimated.
@@ -992,12 +920,6 @@ pub fn pull(request: &PullRequest<'_>) -> Result<PullReport> {
     if plan.wanted.is_empty() && records_checkpoint(request.store, &closure) {
         return Ok(report);
     }
-    if closure.part {
-        // Part of a checkpoint: each object it names is proved resident, and nothing records
-        // the checkpoint, whose closure is not all here.
-        plan.complete_objects(request.store)?;
-        return Ok(report);
-    }
     // The proof and the index row both write the catalog; a contended catalog waits for its
     // live holder (`catalog::lock`), so a busy moment never throws a landed walk away.
     match closure.scope.as_str() {
@@ -1106,12 +1028,11 @@ fn pinned_local_closure(request: &PullRequest<'_>) -> Option<hub::Closure> {
         complete: true,
         // Served only when nothing is wanted, so it authorizes no presign.
         presign_max_digests: 0,
-        part: false,
     })
 }
 
 /// The local index row already says what this pull would record.
-fn records_checkpoint(store: &Store, closure: &hub::Closure) -> bool {
+pub(crate) fn records_checkpoint(store: &Store, closure: &hub::Closure) -> bool {
     let Some(repo) = closure
         .model
         .split_once('/')
@@ -1165,7 +1086,7 @@ fn holds_lane(repository: Option<&crate::repository::Repository>, closure: &hub:
 ///
 /// Record the verified checkpoint and lane in one transaction. Concurrent additions to
 /// other lanes merge; a conflicting change to this lane retains its refusal.
-fn record_locally(store: &Store, closure: &hub::Closure) -> Result<()> {
+pub(crate) fn record_locally(store: &Store, closure: &hub::Closure) -> Result<()> {
     use crate::repository::{Mutation, ReleaseLane, Repository, RepositoryName};
 
     let Some((org, name)) = closure.model.split_once('/') else {

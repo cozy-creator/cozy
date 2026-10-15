@@ -18,10 +18,12 @@ use crate::ids::ObjectRef;
 use crate::jcs::{self, Json};
 use crate::meta::{Hold, Meta};
 use crate::read::{self, ReadLease};
+use crate::fetch::{Access, Fetcher, Priority, Ticket};
 use crate::store::Store;
+use crate::transport::PullCancellation;
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 const JSON: u8 = 0;
 const BYTES: u8 = 1;
@@ -158,6 +160,8 @@ pub struct Writer {
     additions: Additions,
     cursor: Mutex<Option<CheckpointCursor>>,
     holds: Mutex<Option<Holds>>,
+    /// Interest in what its sources held in part lack, for the writer's life.
+    tickets: Mutex<Vec<Ticket>>,
 }
 
 /// A writer's work hold and its sources' read leases, by alias.
@@ -211,12 +215,13 @@ impl Writer {
             additions: begun.additions,
             cursor: Mutex::new(None),
             holds: Mutex::new(Some((begun.writer_hold, begun.source_leases))),
+            tickets: Mutex::default(),
         })
     }
     /// A source part's bytes, under the lease that pins it: the source's own from begin, or for
     /// a part of a source here in part, one taken when it is first read, after `fetch`.
     #[allow(clippy::too_many_arguments)]
-    fn source_read_into(&self, alias: &str, component: &str, key: &str, role: &str, offset: u64, into: &mut [u8], fetch: Fetch) -> Result<()> {
+    fn source_read_into(&self, alias: &str, component: &str, key: &str, role: &str, offset: u64, into: &mut [u8], fetch: Option<&Fetching>) -> Result<()> {
         let mut holds = self.holds.lock().unwrap();
         let (_, leases) = holds.as_mut().ok_or_else(released)?;
         let view = self.sources.iter().find(|view| view.fact.alias == alias).ok_or_else(|| Refusal {
@@ -236,8 +241,8 @@ impl Writer {
             None => {
                 let absent: Vec<ObjectRef> =
                     part.segments().iter().filter(|s| !self.store.contains(&s.sha256)).cloned().collect();
-                if !absent.is_empty() {
-                    fetch(&view.fact.manifest, &absent)?;
+                if let (false, Some(fetch)) = (absent.is_empty(), fetch) {
+                    fetch.wait(&view.fact.manifest, &absent, &mut self.tickets.lock().unwrap())?;
                 }
                 let lease = read::acquire(&self.store, &self.meta, &view.fact.manifest.sha256, part.segments().to_vec())?.0;
                 leases.push((alias.to_string(), lease));
@@ -285,9 +290,32 @@ fn header_part<'v>(view: &'v SourceView, component: &str, key: &str, role: &str)
         })
 }
 
-/// Makes absent objects of a source checkpoint (`manifest`) here in part resident: the owner's
-/// verified pull from its origin ([`crate::origin`]).
-pub type Fetch<'a> = &'a (dyn Fn(&ObjectRef, &[ObjectRef]) -> Result<()> + Sync);
+/// How a reader of a source held here in part makes its absent objects present: the Store's
+/// fetcher, the access the attempt fetches under, and the stop that ends its waits. They come
+/// from the origin the source's custody record names ([`crate::origin`]).
+pub struct Fetching<'a> {
+    pub fetcher: &'a Fetcher,
+    pub access: Arc<dyn Access>,
+    pub stop: &'a PullCancellation,
+}
+
+impl Fetching<'_> {
+    /// Wait for `absent` objects of `manifest`, under a ticket `tickets` keeps for its origin.
+    fn wait(&self, manifest: &ObjectRef, absent: &[ObjectRef], tickets: &mut Vec<Ticket>) -> Result<()> {
+        let origin = crate::origin::of(self.fetcher.store().root(), manifest)?.ok_or_else(|| Refusal {
+            code: Code::OBJECT_ABSENT,
+            detail: format!("{} lacks {} and no origin holds it", manifest.id(), absent[0].id()),
+        })?;
+        let at = match tickets.iter().position(|ticket| *ticket.origin() == origin) {
+            Some(at) => at,
+            None => {
+                tickets.push(self.fetcher.want(&origin, Arc::clone(&self.access), &[], Priority::Now));
+                tickets.len() - 1
+            }
+        };
+        tickets[at].wait(absent, self.stop)
+    }
+}
 
 /// What the owner keeps of a writer's progress (each checkpoint as it lands and the receipt),
 /// and how it fetches what a source here in part lacks.
@@ -296,7 +324,8 @@ pub struct Hooks<'a> {
     pub check_current: &'a (dyn Fn() -> Result<()> + Sync),
     pub record_checkpoint: &'a (dyn Fn(&Json) + Sync),
     pub record_receipt: &'a (dyn Fn(&ReceiptFacts) + Sync),
-    pub fetch: Fetch<'a>,
+    /// None: every source is here whole, and an absent object refuses.
+    pub fetch: Option<&'a Fetching<'a>>,
 }
 
 /// Serve one prebound writer until its commit, fence or peer loss, then fence what is live.
@@ -467,10 +496,11 @@ pub fn serve_source(
     source: &ObjectRef,
     stream: UnixStream,
     check_current: &(dyn Fn() -> Result<()> + Sync),
-    fetch: Fetch,
+    fetch: Option<&Fetching>,
 ) -> Result<()> {
     let mut channel = Channel(stream);
     let mut leases: Vec<ReadLease> = vec![];
+    let mut tickets: Vec<Ticket> = vec![];
     let mut view: Option<SourceView> = None;
     let served = (|| -> Result<()> {
         loop {
@@ -563,8 +593,8 @@ pub fn serve_source(
                         None => {
                             let absent: Vec<ObjectRef> =
                                 part.segments().iter().filter(|s| !store.contains(&s.sha256)).cloned().collect();
-                            if !absent.is_empty() {
-                                fetch(source, &absent)?;
+                            if let (false, Some(fetch)) = (absent.is_empty(), fetch) {
+                                fetch.wait(source, &absent, &mut tickets)?;
                             }
                             leases.push(read::acquire(store, meta, &source.sha256, part.segments().to_vec())?.0);
                             leases.len() - 1
@@ -707,12 +737,12 @@ impl Read for Pull<'_, '_, '_> {
     }
 }
 
-enum Frame {
+pub(crate) enum Frame {
     Json(Json),
     Bytes(Vec<u8>),
 }
 
-struct Channel(UnixStream);
+pub(crate) struct Channel(pub(crate) UnixStream);
 
 impl Channel {
     fn write(&mut self, kind: u8, body: &[u8]) -> Result<()> {
@@ -726,7 +756,7 @@ impl Channel {
                 detail: format!("weight channel write: {e}"),
             })
     }
-    fn send(&mut self, value: &Json) -> Result<()> {
+    pub(crate) fn send(&mut self, value: &Json) -> Result<()> {
         let raw = jcs::write(value);
         if raw.len() > METADATA {
             return refuse(Code::SIZE_CAP, "derived metadata exceeds its bound");
@@ -741,7 +771,7 @@ impl Channel {
         self.send(&obj(vec![("error", Json::Str(refusal.code.as_str().into())), ("detail", Json::Str(detail))])?)
     }
     /// The next frame, or None when the peer closed between frames.
-    fn receive(&mut self) -> Result<Option<Frame>> {
+    pub(crate) fn receive(&mut self) -> Result<Option<Frame>> {
         let mut head = [0u8; 5];
         match self.0.read_exact(&mut head) {
             Ok(()) => (),
@@ -835,21 +865,21 @@ fn object<'a>(what: &str, value: &'a Json) -> Result<&'a [(String, Json)]> {
     }
 }
 
-fn array<'a>(what: &str, value: &'a Json) -> Result<&'a [Json]> {
+pub(crate) fn array<'a>(what: &str, value: &'a Json) -> Result<&'a [Json]> {
     match value {
         Json::Arr(items) => Ok(items),
         _ => refuse(Code::WRONG_TYPE, format!("{what} is an array")),
     }
 }
 
-fn text<'a>(what: &str, value: &'a Json) -> Result<&'a str> {
+pub(crate) fn text<'a>(what: &str, value: &'a Json) -> Result<&'a str> {
     match value {
         Json::Str(text) => Ok(text),
         _ => refuse(Code::WRONG_TYPE, format!("{what} is a string")),
     }
 }
 
-fn uint(what: &str, value: &Json) -> Result<u64> {
+pub(crate) fn uint(what: &str, value: &Json) -> Result<u64> {
     match value {
         Json::Num(n) if *n >= 0.0 && n.fract() == 0.0 => Ok(*n as u64),
         _ => refuse(Code::NUMBER_RANGE, format!("{what} is a nonnegative integer")),
@@ -860,17 +890,17 @@ fn shape(value: &Json) -> Result<Vec<u64>> {
     array("shape", value)?.iter().map(|d| uint("shape", d)).collect()
 }
 
-fn reference(id: &str, length: u64) -> Result<ObjectRef> {
+pub(crate) fn reference(id: &str, length: u64) -> Result<ObjectRef> {
     let sha256 = id.strip_prefix("sha256:").unwrap_or(id).to_string();
     crate::ids::hex64("ObjectRef", &sha256)?;
     Ok(ObjectRef { sha256, length })
 }
 
-fn num(value: u64) -> Json {
+pub(crate) fn num(value: u64) -> Json {
     Json::Num(value as f64)
 }
 
-fn obj(pairs: Vec<(&str, Json)>) -> Result<Json> {
+pub(crate) fn obj(pairs: Vec<(&str, Json)>) -> Result<Json> {
     Json::object(pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
 }
 
@@ -927,7 +957,7 @@ mod source_channel_tests {
         let (client, server) = UnixStream::pair().unwrap();
         std::thread::scope(|scope| {
             let held =
-                scope.spawn(|| serve_source(&store, &meta, &receipt.manifest, server, &|| Ok(()), &|_, _| unreachable!()));
+                scope.spawn(|| serve_source(&store, &meta, &receipt.manifest, server, &|| Ok(()), None));
             let mut client = Channel(client);
             client
                 .send(
@@ -995,8 +1025,25 @@ mod source_channel_tests {
 
         // The origin holds `other`; this store has the rest.
         let absent = ObjectRef::of(&held_back);
+        let walk = crate::checkpoint::walk(&store, &store.read_manifest(&source).unwrap()).unwrap();
+        let mut objects: Vec<ObjectRef> = walk.distinct().into_iter().cloned().collect();
+        objects.sort_by(|a, b| a.sha256.cmp(&b.sha256));
+        let bodies = (objects.iter())
+            .map(|o| (o.sha256.clone(), std::fs::read(store.object_path(&o.sha256)).unwrap()))
+            .chain([(source.sha256.clone(), std::fs::read(store.manifest_path(&source.sha256)).unwrap())])
+            .collect();
+        let hub = crate::transport::tests::hub_origin(
+            std::sync::Arc::new(crate::transport::tests::Checkpoint { bodies, manifest: source.clone(), objects }),
+            |_, _| None,
+        );
         std::fs::remove_file(store.object_path(&absent.sha256)).unwrap();
-        crate::origin::attest(&store, &source, "hub.test/org/source").unwrap();
+        let origin = crate::fetch::Origin {
+            hub: hub.base.clone(),
+            refspec: "acme/model@r1".into(),
+            lane: "public".into(),
+            manifest: source.clone(),
+        };
+        crate::origin::attest(&store, &source, &origin).unwrap();
         assert!(crate::ingest::custody::live(&root).unwrap().contains(&absent.sha256));
 
         // A derivation inherits it by reference, and its output names the same origin.
@@ -1020,7 +1067,7 @@ mod source_channel_tests {
         let writer = begin(&store, &meta, &output_id, 1, inherit.clone(), None).unwrap();
         let output = commit(&store, &meta, &output_id, 1).unwrap().manifest;
         release_guards(&meta, Some(writer.writer_hold), writer.source_leases);
-        assert_eq!(crate::origin::evidence(&root, &output).unwrap().as_deref(), Some("hub.test/org/source"));
+        assert_eq!(crate::origin::of(&root, &output).unwrap(), Some(origin.clone()));
         let repo = crate::repository::RepositoryName::new("local", "output").unwrap();
         let mutation = crate::repository::Mutation::ReplaceLocal { repo, version: "94".repeat(32), manifest: output.clone() };
         store.apply_repository(None, &mutation, &crate::store::Fault::default()).unwrap();
@@ -1028,31 +1075,32 @@ mod source_channel_tests {
         assert!(!store.contains(&absent.sha256));
 
         // Reads fetch only what is absent, once: a writer's source reads, then a source channel's.
-        let fetched = Mutex::new(vec![]);
-        let fetch = |manifest: &ObjectRef, objects: &[ObjectRef]| -> Result<()> {
-            assert!(*manifest == output || *manifest == source);
-            fetched.lock().unwrap().extend(objects.iter().cloned());
-            store.put_stream(&mut held_back.as_slice(), Some(&absent), &crate::store::Fault::default()).map(drop)
-        };
+        let fetcher = Fetcher::new(&store, 8, std::time::Duration::from_millis(50)).unwrap();
+        let stop = PullCancellation::default();
+        let access: Arc<dyn Access> = Arc::new(crate::fetch::Plain {
+            credential: crate::transport::Anonymous,
+            policy: crate::transport::SourcePolicy::default(),
+        });
+        let fetch = Fetching { fetcher: &fetcher, access, stop: &stop };
+        let gets = || hub.hits(&format!("/obj/{}", absent.sha256));
         let reread = Declaration { work_fingerprint: Some(format!("sha256:{}", "45".repeat(32))), ..inherit.clone() };
         let writer = Writer::begin(&store, std::sync::Arc::new(Meta::open(&store).unwrap()), &format!("sha256:{}", "95".repeat(32)), 1, reread, None).unwrap();
         let mut copied = vec![0u8; 2048];
-        writer.source_read_into("source", "model", "other", "value", 0, &mut copied, &fetch).unwrap();
+        writer.source_read_into("source", "model", "other", "value", 0, &mut copied, Some(&fetch)).unwrap();
         assert_eq!(copied, held_back);
-        writer.source_read_into("source", "model", "other", "value", 0, &mut copied, &fetch).unwrap();
-        assert_eq!(*fetched.lock().unwrap(), vec![absent.clone()]);
+        writer.source_read_into("source", "model", "other", "value", 0, &mut copied, Some(&fetch)).unwrap();
+        assert_eq!(gets(), 1);
         drop(writer);
-        fetched.lock().unwrap().clear();
         std::fs::remove_file(store.object_path(&absent.sha256)).unwrap();
         let (client, server) = UnixStream::pair().unwrap();
         std::thread::scope(|scope| {
-            let served = scope.spawn(|| serve_source(&store, &meta, &output, server, &|| Ok(()), &fetch));
+            let served = scope.spawn(|| serve_source(&store, &meta, &output, server, &|| Ok(()), Some(&fetch)));
             let mut client = Channel(client);
             assert_eq!(read_part(&mut client, &output, "weight"), weight);
-            assert!(fetched.lock().unwrap().is_empty());
+            assert_eq!(gets(), 1);
             assert_eq!(read_part(&mut client, &output, "other"), held_back);
             assert_eq!(read_part(&mut client, &output, "other"), held_back);
-            assert_eq!(*fetched.lock().unwrap(), vec![absent.clone()]);
+            assert_eq!(gets(), 2);
             drop(client);
             served.join().unwrap().unwrap();
         });

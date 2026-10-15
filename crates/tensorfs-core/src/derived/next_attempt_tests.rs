@@ -233,7 +233,7 @@ fn closing_an_old_native_channel_cannot_fence_its_replacement() {
             check_current: &|| Ok(()),
             record_checkpoint: &|_| panic!("closed peer checkpointed"),
             record_receipt: &|_| panic!("closed peer committed"),
-            fetch: &|_, _| unreachable!(),
+            fetch: None,
         },
     )
     .unwrap();

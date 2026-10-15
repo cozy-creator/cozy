@@ -1,324 +1,20 @@
 //! `tfs ensure` against a REAL Store and a REAL loopback hub (plain and TLS): closure,
 //! presign and object GETs over sockets this test starts, driven through the shipped binary.
 
-use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpListener;
-use std::path::{Path, PathBuf};
+mod common;
+
+use std::io::{BufRead, BufReader};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tensorfs_core::canon::{self, Value};
-use tensorfs_core::dtype::Dtype;
-use tensorfs_core::header::{Body, Closure, Header, Part, Tensor};
-use tensorfs_core::ids::{Doc, ObjectRef};
+use common::{checkpoint, hub, serve_all, store, temporary, tls_config, Answer, Checkpoint, Rule};
+use tensorfs_core::ids::ObjectRef;
 use tensorfs_core::jcs::{self, Json};
-use tensorfs_core::manifest::{Draft, Entry};
-use tensorfs_core::registry;
 use tensorfs_core::store::Store;
 
 const TFS: &str = env!("CARGO_BIN_EXE_tfs");
-
-fn temporary(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "tfs-ensure-{name}-{}-{}",
-        std::process::id(),
-        tensorfs_core::meta::now_nanos_unique()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
-fn store(dir: &Path) -> PathBuf {
-    let root = dir.join("store");
-    Store::init(&root).unwrap();
-    root
-}
-
-// ---------------------------------------------------------------- a real checkpoint
-
-struct Checkpoint {
-    bodies: HashMap<String, Vec<u8>>,
-    manifest: ObjectRef,
-    /// Header and blobs, manifest excluded: what the hub's closure lists.
-    objects: Vec<ObjectRef>,
-    blobs: Vec<ObjectRef>,
-}
-
-fn checkpoint(blobs: usize, size: usize, salt: u8) -> Checkpoint {
-    let spec = registry::seeds()
-        .into_iter()
-        .find(|seed| seed.alias == "plain/1")
-        .unwrap()
-        .spec;
-    let mut bodies = HashMap::new();
-    let (mut tensors, mut refs) = (Vec::new(), Vec::new());
-    for index in 0..blobs {
-        let body: Vec<u8> = (0..size)
-            .map(|at| ((at * 31 + index * 7 + salt as usize) % 251) as u8)
-            .collect();
-        let object = ObjectRef::of(&body);
-        tensors.push((
-            format!("blocks.{index}.weight"),
-            Tensor {
-                dtype: Dtype::F32,
-                shape: vec![(size / 4) as u64],
-                encoding: spec.object_id(),
-                parts: vec![(
-                    "value".into(),
-                    Part {
-                        dtype: Dtype::F32,
-                        shape: vec![(size / 4) as u64],
-                        body: Body::Segments(vec![object.clone()]),
-                    },
-                )],
-            },
-        ));
-        refs.push(object.clone());
-        bodies.insert(object.sha256.clone(), body);
-    }
-    let header = Header {
-        configs: Vec::new(),
-        assets: Vec::new(),
-        encodings: vec![spec],
-        components: vec![("model".into(), tensors)],
-    };
-    header.validate(&Closure::default()).unwrap();
-    let header_bytes = header.canonical_bytes().unwrap();
-    let header_ref = ObjectRef::of(&header_bytes);
-    bodies.insert(header_ref.sha256.clone(), header_bytes);
-    let manifest = Draft {
-        entries: vec![("model.cozytensors".into(), Entry::CozyTensors(header_ref))],
-    }
-    .seal()
-    .unwrap()
-    .canonical_bytes();
-    let manifest_ref = ObjectRef::of(&manifest);
-    bodies.insert(manifest_ref.sha256.clone(), manifest);
-    let mut objects: Vec<ObjectRef> = bodies
-        .iter()
-        .filter(|(hex, _)| **hex != manifest_ref.sha256)
-        .map(|(hex, body)| ObjectRef {
-            sha256: hex.clone(),
-            length: body.len() as u64,
-        })
-        .collect();
-    objects.sort_by(|a, b| a.sha256.cmp(&b.sha256));
-    Checkpoint {
-        bodies,
-        manifest: manifest_ref,
-        objects,
-        blobs: refs,
-    }
-}
-
-fn row(object: &ObjectRef) -> Value {
-    Value::obj(vec![
-        ("length", Value::uint(object.length)),
-        ("sha256", Value::str(object.sha256.clone())),
-    ])
-}
-
-// ---------------------------------------------------------------- the loopback hub
-
-/// How one object GET is answered: its body, or `Truncate` (declare it, send half, close).
-enum Answer {
-    Body,
-    Truncate,
-}
-
-type Rule = Arc<dyn Fn(&str, usize) -> Answer + Send + Sync>;
-
-struct Hub {
-    base: String,
-    gets: Arc<Mutex<HashMap<String, usize>>>,
-}
-
-impl Hub {
-    fn gets(&self, hex: &str) -> usize {
-        *self.gets.lock().unwrap().get(hex).unwrap_or(&0)
-    }
-    /// Object GETs, closures not counted.
-    fn total_gets(&self) -> usize {
-        let gets = self.gets.lock().unwrap();
-        gets.iter().filter(|(key, _)| *key != "closure").map(|(_, n)| n).sum()
-    }
-}
-
-/// A hub serving `checkpoint` as `acme/model@r1` lane `public`. `rule` answers each object
-/// GET by (digest, how many times it was asked); `gap` paces every object body.
-fn hub(
-    checkpoint: Arc<Checkpoint>,
-    tls: Option<Arc<rustls::ServerConfig>>,
-    gap: Duration,
-    rule: Rule,
-) -> Hub {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let scheme = if tls.is_some() { "https" } else { "http" };
-    let base = format!(
-        "{scheme}://127.0.0.1:{}",
-        listener.local_addr().unwrap().port()
-    );
-    let gets: Arc<Mutex<HashMap<String, usize>>> = Arc::default();
-    let (served_base, served_gets) = (base.clone(), Arc::clone(&gets));
-    std::thread::spawn(move || {
-        for socket in listener.incoming() {
-            let Ok(socket) = socket else { return };
-            let (checkpoint, tls, rule) = (Arc::clone(&checkpoint), tls.clone(), Arc::clone(&rule));
-            let (base, gets) = (served_base.clone(), Arc::clone(&served_gets));
-            std::thread::spawn(move || match tls {
-                Some(config) => {
-                    let conn = rustls::ServerConnection::new(config).unwrap();
-                    let mut stream = rustls::StreamOwned::new(conn, socket);
-                    serve(&mut stream, &checkpoint, &base, &gets, gap, &rule);
-                    stream.conn.send_close_notify();
-                    let _ = stream.flush();
-                }
-                None => serve(&mut { socket }, &checkpoint, &base, &gets, gap, &rule),
-            });
-        }
-    });
-    Hub { base, gets }
-}
-
-fn serve(
-    stream: &mut (impl Read + Write),
-    checkpoint: &Checkpoint,
-    base: &str,
-    gets: &Mutex<HashMap<String, usize>>,
-    gap: Duration,
-    rule: &Rule,
-) {
-    let Some((method, path, body)) = request(stream) else {
-        return;
-    };
-    let json = |value: Value| (200, canon::write(&value));
-    let (status, reply, truncate) = match (method.as_str(), path.as_str()) {
-        ("POST", "/v1/tensorfs/closure") => {
-            *gets.lock().unwrap().entry("closure".into()).or_insert(0) += 1;
-            let (status, reply) = json(Value::obj(vec![
-                ("complete", Value::Bool(true)),
-                ("lane", Value::str("public")),
-                ("manifest", row(&checkpoint.manifest)),
-                ("model", Value::str("acme/model")),
-                (
-                    "objects",
-                    Value::arr(checkpoint.objects.iter().map(row).collect()),
-                ),
-                ("presign_max_digests", Value::uint(1024)),
-                ("release", Value::str("r1")),
-                ("scope", Value::str("runtime")),
-            ]));
-            (status, reply, false)
-        }
-        ("POST", "/v1/tensorfs/presign") => {
-            let Value::Obj(fields) = canon::parse(&body, 1 << 20).unwrap() else {
-                panic!("presign body")
-            };
-            let Some((_, Value::Arr(digests))) = fields.into_iter().find(|(k, _)| k == "digests")
-            else {
-                panic!("presign digests")
-            };
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs();
-            let urls = digests
-                .into_iter()
-                .map(|d| {
-                    let Value::Str(hex) = d else { panic!() };
-                    let url = Value::str(format!("{base}/obj/{hex}"));
-                    (hex, url)
-                })
-                .collect();
-            let (status, reply) = json(Value::obj(vec![
-                ("expires_at_unix", Value::uint(now + 3600)),
-                ("server_time_unix", Value::uint(now)),
-                ("urls", Value::map(urls)),
-            ]));
-            (status, reply, false)
-        }
-        ("GET", path) if path.starts_with("/obj/") => {
-            let hex = path["/obj/".len()..].to_string();
-            let asked = {
-                let mut gets = gets.lock().unwrap();
-                let count = gets.entry(hex.clone()).or_insert(0);
-                *count += 1;
-                *count
-            };
-            match checkpoint.bodies.get(&hex) {
-                Some(body) => (
-                    200,
-                    body.clone(),
-                    matches!(rule(&hex, asked), Answer::Truncate),
-                ),
-                None => (404, b"no such object".to_vec(), false),
-            }
-        }
-        _ => (404, b"no such route".to_vec(), false),
-    };
-    let head = format!(
-        "HTTP/1.1 {status} X\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-        reply.len()
-    );
-    let _ = stream.write_all(head.as_bytes());
-    let sent = if truncate {
-        &reply[..reply.len() / 2]
-    } else {
-        &reply[..]
-    };
-    if gap.is_zero() || !path.starts_with("/obj/") {
-        let _ = stream.write_all(sent);
-        return;
-    }
-    for piece in sent.chunks(sent.len().div_ceil(4).max(1)) {
-        std::thread::sleep(gap);
-        if stream
-            .write_all(piece)
-            .and_then(|()| stream.flush())
-            .is_err()
-        {
-            return;
-        }
-    }
-}
-
-fn request(stream: &mut impl Read) -> Option<(String, String, Vec<u8>)> {
-    let (mut collected, mut buf) = (Vec::new(), [0u8; 4096]);
-    let split = loop {
-        if let Some(at) = collected.windows(4).position(|w| w == b"\r\n\r\n") {
-            break at;
-        }
-        let n = stream.read(&mut buf).ok()?;
-        if n == 0 {
-            return None;
-        }
-        collected.extend_from_slice(&buf[..n]);
-    };
-    let head = String::from_utf8_lossy(&collected[..split]).to_string();
-    let mut body = collected[split + 4..].to_vec();
-    let mut line = head.lines().next()?.split_whitespace();
-    let (method, target) = (line.next()?.to_string(), line.next()?.to_string());
-    let length: usize = head
-        .lines()
-        .filter_map(|l| l.split_once(':'))
-        .find(|(k, _)| k.trim().eq_ignore_ascii_case("content-length"))
-        .and_then(|(_, v)| v.trim().parse().ok())
-        .unwrap_or(0);
-    while body.len() < length {
-        let n = stream.read(&mut buf).ok()?;
-        if n == 0 {
-            break;
-        }
-        body.extend_from_slice(&buf[..n]);
-    }
-    Some((method, target.split('?').next()?.to_string(), body))
-}
-
-fn serve_all() -> Rule {
-    Arc::new(|_, _| Answer::Body)
-}
 
 // ---------------------------------------------------------------- the binary
 
@@ -414,8 +110,7 @@ fn assert_result(run: &Run, checkpoint: &Checkpoint) -> Json {
     assert_eq!(text(&result, "manifest"), checkpoint.manifest.id());
     assert_eq!(text(&result, "model"), "acme/model");
     assert_eq!(text(&result, "lane"), "public");
-    let total: u64 = checkpoint.bodies.values().map(|b| b.len() as u64).sum();
-    assert_eq!(num(&result, "bytes_total"), total);
+    assert_eq!(num(&result, "bytes_total"), checkpoint.total());
     result
 }
 
@@ -433,14 +128,13 @@ fn a_cold_ensure_reports_and_lands_and_a_warm_one_moves_nothing() {
     let dir = temporary("cold-warm");
     let root = store(&dir);
     let checkpoint = Arc::new(checkpoint(3, 64 << 10, 1));
-    let hub = hub(Arc::clone(&checkpoint), None, Duration::ZERO, serve_all());
+    let hub = hub(vec![Arc::clone(&checkpoint)], None, Duration::ZERO, serve_all());
     let total: u64 = checkpoint.bodies.values().map(|b| b.len() as u64).sum();
 
     let cold = run(&root, &hub.base, &[]);
     let result = assert_result(&cold, &checkpoint);
     assert_eq!(num(&result, "bytes_held"), 0);
     assert_eq!(num(&result, "bytes_fetched"), total);
-    assert_eq!(num(&result, "attempts"), 1);
     assert!(!flag(&result, "joined"));
     let progress = cold.events("ensure.progress");
     assert_eq!(text(progress[0], "phase"), "resolving");
@@ -477,7 +171,7 @@ fn a_held_checkpoint_named_by_digest_asks_the_hub_nothing() {
     let dir = temporary("held-digest");
     let root = store(&dir);
     let checkpoint = Arc::new(checkpoint(2, 16 << 10, 7));
-    let hub = hub(Arc::clone(&checkpoint), None, Duration::ZERO, serve_all());
+    let hub = hub(vec![Arc::clone(&checkpoint)], None, Duration::ZERO, serve_all());
     let refspec = format!("acme/model@{}", checkpoint.manifest.id());
     let by_digest = |lane: &str| {
         let mut command = Command::new(TFS);
@@ -504,7 +198,7 @@ fn a_ranged_get_streams_exact_bytes_under_a_lease() {
     let dir = temporary("get-range");
     let root = store(&dir);
     let checkpoint = Arc::new(checkpoint(1, 256 << 10, 2));
-    let hub = hub(Arc::clone(&checkpoint), None, Duration::ZERO, serve_all());
+    let hub = hub(vec![Arc::clone(&checkpoint)], None, Duration::ZERO, serve_all());
     assert_result(&run(&root, &hub.base, &[]), &checkpoint);
     let blob = &checkpoint.blobs[0];
     let body = &checkpoint.bodies[&blob.sha256];
@@ -547,13 +241,8 @@ fn concurrent_ensures_of_one_manifest_share_one_fetch() {
     let root = store(&dir);
     let checkpoint = Arc::new(checkpoint(4, 64 << 10, 3));
     // Paced so the leader is still fetching when the follower asks.
-    let hub = hub(
-        Arc::clone(&checkpoint),
-        None,
-        Duration::from_millis(150),
-        serve_all(),
-    );
-    let mut leader = ensure(&root, &hub.base, &["--streams", "1"])
+    let hub = hub(vec![Arc::clone(&checkpoint)], None, Duration::from_millis(250), serve_all());
+    let mut leader = ensure(&root, &hub.base, &[])
         .stdout(Stdio::piped())
         .spawn()
         .unwrap();
@@ -600,13 +289,12 @@ fn an_attempt_that_landed_objects_is_retried_and_one_that_landed_none_is_stalled
             Answer::Body
         }
     });
-    let hub_a = hub(Arc::clone(&checkpoint), None, Duration::ZERO, rule);
+    let hub_a = hub(vec![Arc::clone(&checkpoint)], None, Duration::ZERO, rule);
     let recovered = run(&store(&dir), &hub_a.base, &[]);
-    let result = assert_result(&recovered, &checkpoint);
-    assert_eq!(num(&result, "attempts"), 1, "{}", recovered.stdout);
+    assert_result(&recovered, &checkpoint);
 
     let never: Rule = Arc::new(|_, _| Answer::Truncate);
-    let hub_b = hub(Arc::clone(&checkpoint), None, Duration::ZERO, never);
+    let hub_b = hub(vec![Arc::clone(&checkpoint)], None, Duration::ZERO, never);
     let root = dir.join("stalled");
     Store::init(&root).unwrap();
     let stalled = run(&root, &hub_b.base, &[]);
@@ -619,36 +307,13 @@ fn an_attempt_that_landed_objects_is_retried_and_one_that_landed_none_is_stalled
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A loopback TLS server config under a fresh self-signed authority, and that authority.
-fn tls_config() -> (Arc<rustls::ServerConfig>, String) {
-    let key = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
-    let cert = rustls::pki_types::CertificateDer::from(key.cert.der().to_vec());
-    let private = rustls::pki_types::PrivateKeyDer::try_from(key.key_pair.serialize_der())
-        .unwrap()
-        .clone_key();
-    let config = rustls::ServerConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()
-    .unwrap()
-    .with_no_client_auth()
-    .with_single_cert(vec![cert], private)
-    .unwrap();
-    (Arc::new(config), key.cert.pem())
-}
-
 #[test]
 fn an_untrusted_hub_is_terminal_and_its_named_ca_admits_it() {
     let dir = temporary("tls");
     let root = store(&dir);
     let (config, pem) = tls_config();
     let checkpoint = Arc::new(checkpoint(2, 16 << 10, 5));
-    let hub = hub(
-        Arc::clone(&checkpoint),
-        Some(config),
-        Duration::ZERO,
-        serve_all(),
-    );
+    let hub = hub(vec![Arc::clone(&checkpoint)], Some(config), Duration::ZERO, serve_all());
 
     let untrusted = run(&root, &hub.base, &[]);
     assert_eq!(refused(&untrusted), ("TLS_UNTRUSTED".to_string(), false));
@@ -670,21 +335,17 @@ fn an_untrusted_hub_is_terminal_and_its_named_ca_admits_it() {
 #[test]
 fn trust_added_after_a_refusal_reaches_the_same_process() {
     use tensorfs_core::ensure::{self, Event, Phase, Request};
+    use tensorfs_core::fetch::Plain;
     use tensorfs_core::transport::{self, Anonymous, SourcePolicy};
     let dir = temporary("trust-in-process");
     let store = Store::init(&dir.join("store")).unwrap();
     let (config, pem) = tls_config();
     let checkpoint = Arc::new(checkpoint(2, 16 << 10, 7));
-    let hub = hub(
-        Arc::clone(&checkpoint),
-        Some(config),
-        Duration::ZERO,
-        serve_all(),
-    );
-    let policy = SourcePolicy::default();
+    let hub = hub(vec![Arc::clone(&checkpoint)], Some(config), Duration::ZERO, serve_all());
+    let access = Arc::new(Plain { credential: Anonymous, policy: SourcePolicy::default() });
     let events = Mutex::new(Vec::new());
     let on_event = |event: &Event| events.lock().unwrap().push(event.clone());
-    let mut request = Request::new(&store, &hub.base, "acme/model@r1", &Anonymous, &policy);
+    let mut request = Request::new(&store, &hub.base, "acme/model@r1", access);
     request.lane = "public";
     request.step = "warm";
     request.on_event = Some(&on_event);
@@ -717,7 +378,7 @@ fn a_closure_the_disk_cannot_hold_is_refused_before_a_byte_moves() {
     };
     huge.objects.push(petabyte);
     huge.objects.sort_by(|a, b| a.sha256.cmp(&b.sha256));
-    let hub = hub(Arc::new(huge), None, Duration::ZERO, serve_all());
+    let hub = hub(vec![Arc::new(huge)], None, Duration::ZERO, serve_all());
     let full = run(&root, &hub.base, &[]);
     assert_eq!(
         refused(&full),
@@ -757,223 +418,3 @@ fn a_pressure_pass_reports_the_disk_and_keeps_what_it_is_told() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-// ---------------------------------------------------------------- components first
-
-/// A checkpoint whose `first` and `second` components each reach their own two blobs.
-fn two_components(size: usize) -> (Checkpoint, Vec<ObjectRef>, Vec<ObjectRef>) {
-    let spec = registry::seeds()
-        .into_iter()
-        .find(|seed| seed.alias == "plain/1")
-        .unwrap()
-        .spec;
-    let mut bodies = HashMap::new();
-    let mut components = Vec::new();
-    let mut reached = Vec::new();
-    for (salt, name) in ["first", "second"].into_iter().enumerate() {
-        let mut tensors = Vec::new();
-        let mut refs = Vec::new();
-        for index in 0..2 {
-            let body: Vec<u8> = (0..size)
-                .map(|at| ((at * 31 + index * 7 + salt * 13) % 251) as u8)
-                .collect();
-            let object = ObjectRef::of(&body);
-            tensors.push((
-                format!("blocks.{index}.weight"),
-                Tensor {
-                    dtype: Dtype::F32,
-                    shape: vec![(size / 4) as u64],
-                    encoding: spec.object_id(),
-                    parts: vec![(
-                        "value".into(),
-                        Part {
-                            dtype: Dtype::F32,
-                            shape: vec![(size / 4) as u64],
-                            body: Body::Segments(vec![object.clone()]),
-                        },
-                    )],
-                },
-            ));
-            refs.push(object.clone());
-            bodies.insert(object.sha256.clone(), body);
-        }
-        components.push((name.to_string(), tensors));
-        reached.push(refs);
-    }
-    let header = Header {
-        configs: Vec::new(),
-        assets: Vec::new(),
-        encodings: vec![spec],
-        components,
-    };
-    header.validate(&Closure::default()).unwrap();
-    let header_bytes = header.canonical_bytes().unwrap();
-    let header_ref = ObjectRef::of(&header_bytes);
-    bodies.insert(header_ref.sha256.clone(), header_bytes);
-    let manifest = Draft {
-        entries: vec![("model.cozytensors".into(), Entry::CozyTensors(header_ref))],
-    }
-    .seal()
-    .unwrap()
-    .canonical_bytes();
-    let manifest_ref = ObjectRef::of(&manifest);
-    bodies.insert(manifest_ref.sha256.clone(), manifest);
-    let mut objects: Vec<ObjectRef> = bodies
-        .iter()
-        .filter(|(hex, _)| **hex != manifest_ref.sha256)
-        .map(|(hex, body)| ObjectRef {
-            sha256: hex.clone(),
-            length: body.len() as u64,
-        })
-        .collect();
-    objects.sort_by(|a, b| a.sha256.cmp(&b.sha256));
-    let second = reached.pop().unwrap();
-    let first = reached.pop().unwrap();
-    let blobs = first.iter().chain(&second).cloned().collect();
-    let checkpoint = Checkpoint {
-        bodies,
-        manifest: manifest_ref,
-        objects,
-        blobs,
-    };
-    (checkpoint, first, second)
-}
-
-#[test]
-fn a_component_first_ensure_lands_only_that_component_and_the_whole_one_lands_the_rest() {
-    let dir = temporary("components-first");
-    let root = store(&dir);
-    let (checkpoint, first, second) = two_components(64 << 10);
-    let checkpoint = Arc::new(checkpoint);
-    let hub = hub(Arc::clone(&checkpoint), None, Duration::ZERO, serve_all());
-    let total: u64 = checkpoint.bodies.values().map(|b| b.len() as u64).sum();
-    let second_bytes: u64 = second.iter().map(|o| o.length).sum();
-
-    let part = run(&root, &hub.base, &["--component", "first"]);
-    assert!(part.ok, "{}", part.stdout);
-    let result = part.last().clone();
-    assert_eq!(text(&result, "event"), "ensure.result", "{}", part.stdout);
-    assert_eq!(num(&result, "bytes_total"), total - second_bytes);
-    assert!(first.iter().all(|o| hub.gets(&o.sha256) == 1));
-    assert!(second.iter().all(|o| hub.gets(&o.sha256) == 0));
-
-    // The rest of the checkpoint: only the second component's blobs move, and it records.
-    let whole = run(&root, &hub.base, &[]);
-    let result = assert_result(&whole, &checkpoint);
-    assert_eq!(num(&result, "bytes_fetched"), second_bytes);
-    assert!(checkpoint.blobs.iter().all(|o| hub.gets(&o.sha256) == 1));
-    let warm = run(&root, &hub.base, &[]);
-    assert_eq!(num(&assert_result(&warm, &checkpoint), "bytes_fetched"), 0);
-
-    let absent = run(&root, &hub.base, &["--component", "third"]);
-    assert_eq!(refused(&absent).0, "NOT_CONTAINED");
-}
-
-#[test]
-fn a_part_is_held_from_collection_until_its_hold_drops() {
-    let dir = temporary("part-hold");
-    let root = store(&dir);
-    let (checkpoint, first, _) = two_components(16 << 10);
-    let hub = hub(Arc::new(checkpoint), None, Duration::ZERO, serve_all());
-    let store = Store::open(&root).unwrap();
-    let host = tensorfs_core::transport::base_host(&hub.base).unwrap();
-    let credential = tensorfs_core::transport::credential_from_spec("", vec![host]).unwrap();
-    let policy = tensorfs_core::transport::SourcePolicy::default();
-    let components = vec!["first".to_string()];
-    let mut request = tensorfs_core::ensure::Request::new(
-        &store,
-        &hub.base,
-        "acme/model@r1",
-        &credential,
-        &policy,
-    );
-    request.lane = "public";
-    request.components = &components;
-    let (_, hold) = tensorfs_core::ensure::ensure_part(&request).unwrap();
-    assert!(first.iter().all(|o| store.contains(&o.sha256)));
-    // Nothing records part of a checkpoint: the hold alone keeps it from collection.
-    assert!(tensorfs_core::gc::collect(&root, false).is_err());
-    assert!(first.iter().all(|o| store.contains(&o.sha256)));
-    drop(hold);
-    tensorfs_core::gc::collect(&root, false).unwrap();
-    assert!(first.iter().all(|o| !store.contains(&o.sha256)));
-}
-
-#[test]
-fn a_reader_takes_a_checkpoint_in_part_and_its_hub_keeps_the_rest() {
-    let dir = temporary("part-objects");
-    let root = store(&dir);
-    let (checkpoint, first, second) = two_components(16 << 10);
-    let hub = hub(Arc::new(checkpoint), None, Duration::ZERO, serve_all());
-    let store = Store::open(&root).unwrap();
-    let host = tensorfs_core::transport::base_host(&hub.base).unwrap();
-    let credential = tensorfs_core::transport::credential_from_spec("", vec![host]).unwrap();
-    let policy = tensorfs_core::transport::SourcePolicy::default();
-    let mut request =
-        tensorfs_core::ensure::Request::new(&store, &hub.base, "acme/model@r1", &credential, &policy);
-    request.lane = "public";
-
-    // Its structure alone: no part moves, and the Hub is its origin for every one.
-    let (structure, hold) = tensorfs_core::ensure::ensure_part(&request).unwrap();
-    assert!(first.iter().chain(&second).all(|o| hub.gets(&o.sha256) == 0));
-    let evidence = tensorfs_core::origin::evidence(&root, &structure.manifest).unwrap();
-    assert_eq!(evidence, Some(format!("{} acme/model@r1", hub.base)));
-    let custodied = tensorfs_core::ingest::custody::live(&root).unwrap();
-    assert!(first.iter().chain(&second).all(|o| custodied.contains(&o.sha256)));
-    drop(hold);
-
-    // One object as a reader reaches it.
-    let wanted = vec![second[1].clone()];
-    request.objects = &wanted;
-    let (_, hold) = tensorfs_core::ensure::ensure_part(&request).unwrap();
-    assert!(store.contains(&second[1].sha256));
-    assert_eq!(hub.gets(&second[1].sha256), 1);
-    assert!(first.iter().chain(&second[..1]).all(|o| hub.gets(&o.sha256) == 0));
-    drop(hold);
-
-    let foreign = vec![ObjectRef::of(b"not of this checkpoint")];
-    request.objects = &foreign;
-    assert_eq!(
-        tensorfs_core::ensure::ensure_part(&request).err().unwrap().code,
-        tensorfs_core::err::Code::NOT_CONTAINED
-    );
-}
-
-/// A reader's fetches of a checkpoint held in part share one closure; however many readers
-/// ask for an object at once, the hub sends it once; an object of another checkpoint is
-/// refused.
-#[test]
-fn a_checkpoint_held_in_part_resolves_once_and_pulls_each_object_once() {
-    let dir = temporary("parts");
-    let root = store(&dir);
-    let (checkpoint, first, second) = two_components(16 << 10);
-    // Each object answer takes a while, so the concurrent asks below overlap.
-    let hub = hub(Arc::new(checkpoint), None, Duration::from_millis(20), serve_all());
-    let store = Store::open(&root).unwrap();
-    let host = tensorfs_core::transport::base_host(&hub.base).unwrap();
-    let credential = tensorfs_core::transport::credential_from_spec("", vec![host]).unwrap();
-    let policy = tensorfs_core::transport::SourcePolicy::default();
-    let mut request =
-        tensorfs_core::ensure::Request::new(&store, &hub.base, "acme/model@r1", &credential, &policy);
-    request.lane = "public";
-    drop(tensorfs_core::ensure::ensure_part(&request).unwrap());
-    let structure = hub.gets("closure");
-
-    let parts = tensorfs_core::ensure::Parts::default();
-    let fetch = |objects: &[ObjectRef]| {
-        let mut request = tensorfs_core::ensure::Request::new(&store, &hub.base, "acme/model@r1", &credential, &policy);
-        (request.lane, request.objects) = ("public", objects);
-        parts.fetch(&request)
-    };
-    std::thread::scope(|scope| {
-        let (fetch, first) = (&fetch, &first);
-        let readers: Vec<_> = (0..4).map(|_| scope.spawn(move || fetch(first))).collect();
-        readers.into_iter().for_each(|reader| reader.join().unwrap().unwrap());
-    });
-    assert!(first.iter().all(|o| store.contains(&o.sha256) && hub.gets(&o.sha256) == 1));
-    fetch(&second[..1]).unwrap();
-    fetch(&second).unwrap();
-    assert!(second.iter().all(|o| store.contains(&o.sha256) && hub.gets(&o.sha256) == 1));
-    assert_eq!(hub.gets("closure"), structure + 1, "one closure for every fetch");
-    let foreign = vec![ObjectRef::of(b"not of this checkpoint")];
-    assert_eq!(fetch(&foreign).unwrap_err().code, tensorfs_core::err::Code::NOT_CONTAINED);
-}

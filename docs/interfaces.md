@@ -38,6 +38,10 @@ standalone checkpoint construction is a separate Runtime API. Job source/output 
 require the existing `weights` grant, even when the installed library contains a Store.
 Work without model or weights requirements remains usable without these offers.
 
+Weights are fetched only by the Store's `fetch::Fetcher`, in TensorD. Runtime directs it
+through the attempt's fetch channel (`tensorfs.fetch.Fetch`: `schedule`, `wait`, `present`),
+scoped to the manifests the attempt selected; it never names a hub, credential or path.
+
 These are operation contracts, not whole-peer version checks. They do not require equal
 Runtime, TensorD, Hub or TensorFS versions, and do not sandbox arbitrary same-UID code.
 

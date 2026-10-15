@@ -56,7 +56,7 @@ impl Request {
     }
 }
 
-enum Serve {
+pub(crate) enum Serve {
     /// Read the request, then hold the socket without sending response headers.
     StallHead,
     /// A controlled real-socket exchange for cancellation races.
@@ -108,13 +108,13 @@ fn status(code: u16, body: &[u8]) -> Serve {
 
 type Dispatch = Arc<dyn Fn(&Request) -> Serve + Send + Sync>;
 
-struct Origin {
-    base: String,
+pub(crate) struct Origin {
+    pub(crate) base: String,
     hits: Arc<Mutex<HashMap<String, usize>>>,
 }
 
 impl Origin {
-    fn hits(&self, path: &str) -> usize {
+    pub(crate) fn hits(&self, path: &str) -> usize {
         *self.hits.lock().unwrap().get(path).unwrap_or(&0)
     }
     fn total_hits(&self) -> usize {
@@ -289,12 +289,12 @@ fn read_request(socket: &mut TcpStream) -> Option<Request> {
 
 /// A synthetic checkpoint whose runtime closure is `blobs + header`: one tensor per blob,
 /// each carried as a segment, exactly the shape a hub `closure` answer declares.
-struct Checkpoint {
+pub(crate) struct Checkpoint {
     /// Every object body the ORIGIN can serve, by bare hex digest (manifest included).
-    bodies: HashMap<String, Vec<u8>>,
-    manifest: ObjectRef,
+    pub(crate) bodies: HashMap<String, Vec<u8>>,
+    pub(crate) manifest: ObjectRef,
     /// The closure rows: header + blobs, sorted by digest, manifest EXCLUDED.
-    objects: Vec<ObjectRef>,
+    pub(crate) objects: Vec<ObjectRef>,
 }
 
 fn checkpoint(blobs: usize, size: usize) -> Checkpoint {
@@ -424,7 +424,7 @@ fn presign_value(request_body: &[u8], base: &str) -> Value {
 }
 
 /// The standard hub emulation: closure + presign + object GETs, with per-object override.
-fn hub_origin(
+pub(crate) fn hub_origin(
     checkpoint: Arc<Checkpoint>,
     special: impl Fn(&str, usize) -> Option<Serve> + Send + Sync + 'static,
 ) -> Origin {
@@ -1332,8 +1332,8 @@ fn ensure_records_source_after_cancellation_lands_the_last_object() {
     // ensure supplies its resolved closure to pull. An empty wanted set must still
     // complete the source record that the canceled flight never committed.
     let refspec = format!("acme/model@r1@{}", checkpoint.manifest.id());
-    let mut resumed =
-        crate::ensure::Request::new(&store, &origin.base, &refspec, &Anonymous, &policy);
+    let access = Arc::new(crate::fetch::Plain { credential: Anonymous, policy: policy.clone() });
+    let mut resumed = crate::ensure::Request::new(&store, &origin.base, &refspec, access);
     resumed.lane = "public";
     resumed.cancellation = Some(super::PullCancellation::default());
     let calls = origin.total_hits();

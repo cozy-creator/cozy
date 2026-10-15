@@ -3766,11 +3766,11 @@ pub fn commit(
     walk.require_held(store, &crate::ingest::custody::live(store.root())?)?;
     // What it inherits and this store lacks stays where its sources' origin holds it.
     if walk.distinct().iter().any(|object| !store.contains(&object.sha256)) {
-        let evidence = sources
-            .iter()
-            .find_map(|source| crate::origin::evidence(store.root(), &source.fact.manifest).ok().flatten())
-            .unwrap_or_else(|| format!("derived {transaction}"));
-        crate::origin::attest(store, &manifest_ref, &evidence)?;
+        let origin = (sources.iter())
+            .find_map(|source| crate::origin::of(store.root(), &source.fact.manifest).ok().flatten());
+        if let Some(origin) = origin {
+            crate::origin::attest(store, &manifest_ref, &origin)?;
+        }
     }
     let (inherited_payload_objects, inherited_payload_bytes) =
         inherit_observation(&header, &row_before)?;

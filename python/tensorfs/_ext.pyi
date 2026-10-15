@@ -26,7 +26,7 @@ Native input and result records live in `tensorfs.records`. Python names the Rus
 contract without reimplementing validation or changing its dictionary/tuple ABI.
 """
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from os import PathLike
 from types import ModuleType
 from typing import Literal, Self
@@ -772,10 +772,9 @@ def ensure(
     allowed_hosts: Sequence[str] = ...,
     allow_local: bool = False,
     keep: Sequence[str] = ...,
-    streams: int = ...,
-    streams_start: int = ...,
     sample_seconds: float | None = None,
     cancellation: PullCancellation | None = None,
     progress: Callable[[EnsureEvent], object] | None = None,
 ) -> EnsureResult: ...
 def relieve(store: Store, *, keep: Sequence[str] = ...) -> Relief: ...
+def serve_fetch(store: Store, fd: int, *, origins: Sequence[Mapping[str, object]], run: int = 0) -> None: ...

@@ -161,12 +161,11 @@ class EnsureEvent(TypedDict):
     bytes_total: int
     #: Bytes per second over the last sample.
     rate: float
-    attempt: int
 
 
 class EnsureResult(TypedDict):
-    """What :func:`ensure` did. ``bytes_fetched``, ``bytes_cached`` and
-    ``cache_written_bytes`` over ``bytes_total`` are the cache observation."""
+    """What :func:`ensure` did. ``bytes_fetched`` and ``bytes_cached`` over
+    ``bytes_total`` are the cache observation."""
 
     model: str
     release: str
@@ -178,9 +177,7 @@ class EnsureResult(TypedDict):
     bytes_held: int
     bytes_fetched: int
     bytes_cached: int
-    cache_written_bytes: int
     collected_bytes: int
-    attempts: int
     joined: bool
     seconds: float
 

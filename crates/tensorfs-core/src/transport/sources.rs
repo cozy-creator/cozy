@@ -7,7 +7,7 @@
 //! chunk. A process that resumes re-hashes every recorded chunk, forgets any that no longer
 //! match, and asks only for what is not covered. The finished file is hashed whole and
 //! committed to the Store from where it lies; bytes that hash wrong start the object over.
-use super::download::{Download, PART_BYTES};
+use super::download::{Batch, Download, PART_BYTES};
 use super::{CredentialProvider, Deadline, Ledger, PullCancellation, SourcePolicy, STREAMS};
 use crate::err::{refuse, Code, Refusal, Result};
 use crate::fetch::{DeliveryGrant, FetchPlan};
@@ -305,7 +305,7 @@ impl Part {
 }
 
 /// What a source download reports and keeps, shared by its objects.
-pub(super) struct Keep<'a> {
+pub(crate) struct Keep<'a> {
     pub owner: &'a str,
     pub fault: &'a Fault,
     progress: SourceProgress<'a>,
@@ -364,25 +364,25 @@ pub(crate) fn fetch_sources(
     let on_object = |object: &ObjectRef, bytes: u64, _| {
         moved.lock().unwrap().insert(object.sha256.clone(), bytes);
     };
-    Download {
+    let grant = |object: &ObjectRef| {
+        let at = jobs.iter().position(|job| job.grant.object == *object);
+        Ok(jobs[at.expect("a wanted object has a job")].grant.clone())
+    };
+    let batch = Batch::new(&wanted, &grant, &urls, policy, credentials, Some(&on_object));
+    let chunk = options.checkpoint_bytes.clamp(1 << 20, 1 << 30);
+    let walked = Download {
         store,
-        wanted: &wanted,
-        grant: &|object| {
-            let at = jobs.iter().position(|job| job.grant.object == *object);
-            Ok(jobs[at.expect("a wanted object has a job")].grant.clone())
-        },
-        urls: &urls,
-        chunk: options.checkpoint_bytes.clamp(1 << 20, 1 << 30),
+        feed: &batch,
+        chunk,
         ranged: false,
-        policy,
-        credential: credentials,
         deadline,
         ledger,
-        on_object: Some(&on_object),
         backfill: None,
         keep: Some(&keep),
     }
-    .run(super::transfer_streams(options.streams.clamp(1, 128)), None)?;
+    .run(batch.streams(super::transfer_streams(options.streams.clamp(1, 128)), chunk), None);
+    drop(batch);
+    walked?;
     let moved = moved.into_inner().unwrap();
     Ok(jobs
         .iter()

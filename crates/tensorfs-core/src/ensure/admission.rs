@@ -26,7 +26,7 @@ pub(super) const METADATA_INODES: u64 = 16;
 pub(super) const OBJECT_INODES: u64 = 3;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(super) struct Space {
+pub(crate) struct Space {
     pub bytes: u64,
     pub inodes: u64,
 }
@@ -102,7 +102,7 @@ impl Disk {
 }
 
 /// What `disk` admits once its reserve and `others` are set aside.
-pub(super) fn free(disk: &Disk, others: Space) -> Space {
+pub(crate) fn free(disk: &Disk, others: Space) -> Space {
     Space {
         bytes: disk
             .available

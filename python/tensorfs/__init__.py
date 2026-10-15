@@ -181,8 +181,6 @@ def ensure(
     allowed_hosts: Sequence[str] = (),
     allow_local: bool = False,
     keep: Sequence[str] = (),
-    streams: int = 512,
-    streams_start: int = 16,
     sample_seconds: float | None = None,
     cancellation: PullCancellation | None = None,
     progress: Callable[[EnsureEvent], object] | None = None,
@@ -190,7 +188,7 @@ def ensure(
     """Make one model resident in ``store``: resolve ``ref`` (``org/name[@release][@sha256:<hex>]``)
     at ``hub``, share one flight per manifest with every process on this Store, admit it
     against the disk (running the GC policy when short; ``keep`` names manifests it must not
-    evict), and pull, retrying only after measured progress. ``ca_file`` adds the hub's CA to
+    evict), and fetch what it lacks through the Store's fetcher. ``ca_file`` adds the hub's CA to
     this process's trust. Refusals raise typed ``errors.*`` (``TlsUntrusted``, ``RefNotFound``,
     ``CredentialRequired``, ``CapacityExhausted``, ``Stalled``, ``HubRefused``, ...); a raising
     ``progress`` cancels and its exception is re-raised."""
@@ -206,8 +204,6 @@ def ensure(
         allowed_hosts=allowed_hosts,
         allow_local=allow_local,
         keep=keep,
-        streams=streams,
-        streams_start=streams_start,
         sample_seconds=sample_seconds,
         cancellation=cancellation,
         progress=progress,

@@ -680,7 +680,8 @@ impl<'a> Run<'a> {
                 }
                 seen.lock().unwrap().push((Instant::now(), event.clone()));
             };
-            let mut request = Request::new(&store, &hub_base, "acme/model@r1", &Anonymous, &policy);
+            let access = Arc::new(tensorfs_core::fetch::Plain { credential: Anonymous, policy });
+            let mut request = Request::new(&store, &hub_base, "acme/model@r1", access);
             request.lane = "public";
             request.step = "fault proof";
             request.cancellation = Some(stop);
@@ -689,7 +690,7 @@ impl<'a> Run<'a> {
             request.on_event = Some(&on_event);
             let _ = tx.send(ensure::ensure(&request));
         });
-        let mut last = (Instant::now(), None::<(Phase, u64, u32)>);
+        let mut last = (Instant::now(), None::<(Phase, u64)>);
         let result = loop {
             match rx.recv_timeout(sample()) {
                 Ok(result) => break result,
@@ -700,7 +701,7 @@ impl<'a> Run<'a> {
                 .lock()
                 .unwrap()
                 .last()
-                .map(|(_, e)| (e.phase, e.bytes_done, e.attempt));
+                .map(|(_, e)| (e.phase, e.bytes_done));
             if latest != last.1 {
                 last = (Instant::now(), latest);
             } else if last.0.elapsed() > quiet {
@@ -1079,8 +1080,7 @@ fn a_link_blip_before_any_object_lands_is_re_attempted_and_only_stillness_stalls
     );
     let root = store(&temporary("blip"));
     // Nothing counts asks: the pull itself asks again and the first attempt lands it all.
-    let ensured = assert_landed(&Run::new(&blip, &root).ensure(), &blip, &root);
-    assert_eq!(ensured.attempts, 1, "{}", blip.log());
+    assert_landed(&Run::new(&blip, &root).ensure(), &blip, &root);
 
     let down = hub(
         Arc::clone(&checkpoint),
@@ -1340,8 +1340,8 @@ fn a_hub_unavailable_through_every_re_ask_is_weather_not_a_verdict() {
         },
     );
     let root = store(&dir);
-    let ensured = assert_landed(&Run::new(&hub, &root).ensure(), &hub, &root);
-    assert!(ensured.attempts >= 2, "{}", hub.log());
+    assert_landed(&Run::new(&hub, &root).ensure(), &hub, &root);
+    assert!(hub.asks("presign") >= 5, "{}", hub.log());
 }
 
 #[test]

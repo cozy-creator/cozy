@@ -181,13 +181,39 @@ admission (below), which the machine's one Store now owns (proto-063).
 never weather: retrying it fails at the same byte forever, which is exactly what the
 generic `IO_FAILED` an out-of-space write used to raise bought on rented hardware.
 
+## Fetch: the one downloader
+
+`fetch::Fetcher` is the Store's one downloader; Runtime directs it, TensorD owns it.
+[`Fetcher::want`] takes interest in objects of one origin (`hub`, `org/name@release`, lane,
+manifest) at a priority and answers a ticket; `Ticket::wait` raises objects to `Now` and returns
+once they are present; dropping the ticket releases the interest.
+
+- **One fetch per object**: objects are deduplicated by digest across tickets; one closure per
+  origin, resolved only when something is absent (a warm run asks the hub nothing); presigns
+  are batched and minted ahead; the transport is the pull's (8 MiB ranged chunks, slow ones
+  asked again against their peers).
+- **Order**: `Now` (a reader is blocked), then `Next { run, rank }` by run acceptance and rank,
+  then `Behind` (warm sets, hints), which runs only while nothing more urgent is out. `Now`
+  takes streams from `Next` when none is free. Nothing is fetched without a live ticket.
+- **Structure first**: a ticket also wants its origin's manifest, header and assets. Once
+  they are here the origin is attested (`origins/<manifest>`, its objects indexed once): the
+  checkpoint held in part is a cache root. GC keeps its present objects; at low disk they are
+  evicted first (least recently used, structure kept) and ticketed or leased ones stay;
+  `gc::collect_idle` drops it once unused for its TTL.
+- **Executors** never fetch: TensorD serves each attempt `fetch::serve` over a socket, scoped
+  to its selected manifests, and Runtime calls `tensorfs.fetch.Fetch` (`schedule`, `wait`,
+  `present`). A derived writer or source channel reading a source held in part waits on a
+  ticket with the origin its custody record names.
+- **Failure**: a refused object (hub refusal, wrong bytes, no measured progress) fails the
+  waits on it, named with its origin; a later `want` asks again. A short disk refuses
+  `CAPACITY_EXHAUSTED` before a byte of the object moves.
+
 ## Ensure: model download
 
-`ensure` makes a model's serialized bytes and metadata resident in the Store. TensorD
-uses the embedded Rust acquisition API for its managed Store; standalone Store owners can
-use `tfs ensure` or `tensorfs.ensure`. This does not construct a Python/PyTorch model or
-make its tensors GPU-resident. Managed Runtime receives the resulting sources and buffers
-from TensorD. `tfs fetch` and `tensorfs.pull` remain lower-level acquisition interfaces.
+`ensure` makes a whole model's serialized bytes and metadata resident in the Store, through
+the Store's fetcher: `tfs ensure` and `tensorfs.ensure`. This does not construct a
+Python/PyTorch model or make its tensors GPU-resident. `tfs fetch` and `tensorfs.pull` remain
+lower-level acquisition interfaces.
 
 ```bash
 tfs capabilities                      # ensure/1, get-range/1, deliver/1, pressure/1
@@ -197,28 +223,20 @@ tfs get <root> sha256:<blob> --range 0:1048576 --out -   # bytes to stdout, unde
 ```
 
 - **Stdout is JSON lines**: `ensure.progress` samples (`model`, `step`, `phase`,
-  `bytes_done`, `bytes_total`, `rate`, `attempt`), then one `ensure.result` (exit 0) or
-  `ensure.refused` with `code` and `resumable` (exit 1). The result's fetched, cached and
-  cache-written bytes are the Hub's cache observation.
+  `bytes_done`, `bytes_total`, `rate`), then one `ensure.result` (exit 0) or
+  `ensure.refused` with `code` and `resumable` (exit 1). The result's fetched and cached
+  bytes are the Hub's cache observation.
 - **One flight per manifest per Store**, across processes: a second `ensure` of the same
   manifest waits (`phase: waiting`, the leader's bytes) and moves nothing (`joined: true`).
-- **Retries are earned**: an attempt that failed on the link is retried only when it landed
-  an object; one that landed none is `STALLED`. Stalled streams are judged by the
-  transport's measured ledger; nothing is a timer.
 - **Admission is disk only**: wanted bytes plus 16 + 3 inodes per object must fit under a
   reserve of 1/50 of the filesystem (clamped to 1–10 GiB) and 32 inodes, after what other live
-  flights still owe. Short, the GC policy runs: unreferenced bytes, then delivered products
-  (`Store.deliver_tree_root`, oldest first), then cached lanes; then `CAPACITY_EXHAUSTED`.
-  `ensure::relieve` runs the same policy whenever no more than the reserve is free.
+  flights still owe. Short, the GC policy runs: unreferenced bytes, then idle checkpoints held
+  in part, then delivered products (`Store.deliver_tree_root`, oldest first), then cached
+  lanes; then `CAPACITY_EXHAUSTED`. `ensure::relieve` runs the same
+  policy whenever no more than the reserve is free.
 - **The Hub CA** (`--ca-file`, `ca_file=`) is added to process trust; an untrusted hub is
-  `TLS_UNTRUSTED`, never retried.
-- **Part of a checkpoint** (`ensure_part`, `tfs ensure --component`): its manifest, header
-  and assets with the named components and objects; none named, its structure alone. Nothing
-  records a part. The hub is attested as the origin of the rest (`origins/<manifest>`): GC,
-  storage and repositories accept an absent object its origin holds, a derivation over it
-  carries the absent objects by reference (and attests its output to the same origin), and a
-  reader fetches what it reads first. A TensorD job reads its Hub model inputs this way,
-  through `ensure::Parts`: one closure for all its fetches, each object pulled once.
+  `TLS_UNTRUSTED`, never retried. Nothing stalls on a timer: a download that lands nothing
+  past its measured patience is `STALLED`.
 
 ## Durability
 

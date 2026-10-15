@@ -18,6 +18,12 @@
 //! `sources` for a selected source's members, kept on disk across processes. Such an
 //! origin may not answer ranges, so an object's first chunk goes alone: a 206 queues the
 //! rest, a 200 is the whole object. Where it redirects to is asked for the rest directly.
+//!
+//! Objects come from a [`Feed`]: a fixed [`Batch`] (a pull, a source download, one ranged
+//! fetch), or [`crate::fetch::Fetcher`]'s queue, which grows while the download runs. Each
+//! open object has a [`Cell`]: its urgency orders the queue, and a request for a lower class
+//! (Now, Next, Behind) gives way to waiting work of a higher one. A batch's refusal ends it;
+//! a lasting feed's refusal ends only its object.
 
 use super::decisions;
 use super::ledger::{Attempt, Deadline, Ledger, STALL_FACTOR};
@@ -39,8 +45,8 @@ use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::os::unix::fs::{FileExt as _, OpenOptionsExt};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 /// One request's bytes. Measured on a pod at 128 workers: 4, 8 and 16 MiB chunks all move
@@ -97,11 +103,204 @@ pub const PART_BYTES: u64 = 64 << 20;
 /// peers' pace, before it is judged.
 const PIECE_BYTES: u64 = 1 << 20;
 
+/// The classes of urgency, as a [`Cell`] key's top two bits.
+pub(crate) const NOW: u64 = 0;
+pub(crate) const NEXT: u64 = 1 << 62;
+pub(crate) const BEHIND: u64 = 2 << 62;
+
+/// What a feed and the download share about one open object: its urgency (a smaller key is
+/// sooner; [`NOW`], [`NEXT`] or [`BEHIND`] in the top two bits) and whether it is still wanted.
+pub(crate) struct Cell {
+    key: AtomicU64,
+    gone: AtomicBool,
+}
+
+impl Cell {
+    pub fn new(key: u64) -> Arc<Cell> {
+        Arc::new(Cell {
+            key: AtomicU64::new(key),
+            gone: AtomicBool::new(false),
+        })
+    }
+    pub fn key(&self) -> u64 {
+        self.key.load(Ordering::Acquire)
+    }
+    pub fn set(&self, key: u64) {
+        self.key.store(key, Ordering::Release);
+    }
+    fn class(&self) -> u64 {
+        self.key() >> 62
+    }
+    pub fn gone(&self) -> bool {
+        self.gone.load(Ordering::Acquire)
+    }
+    /// Nothing wants the object any more: its chunks are dropped and its requests stopped.
+    pub fn leave(&self) {
+        self.gone.store(true, Ordering::Release);
+    }
+}
+
+/// Wakes a download's workers and its watch: anything that changes what they may do beats.
+#[derive(Default)]
+pub(crate) struct Pulse {
+    beats: Mutex<u64>,
+    beat: Condvar,
+}
+
+impl Pulse {
+    pub fn seen(&self) -> u64 {
+        *self.beats.lock().unwrap()
+    }
+    pub fn beat(&self) {
+        *self.beats.lock().unwrap() += 1;
+        self.beat.notify_all();
+    }
+    /// Until a beat after `seen`, for at most `at_most`.
+    pub fn wait(&self, seen: u64, at_most: Duration) {
+        let beats = self.beats.lock().unwrap();
+        drop(self.beat.wait_timeout_while(beats, at_most, |beats| *beats == seen));
+    }
+}
+
+/// Where one object's URL, egress policy and credential come from.
+pub(crate) trait Supply: Send + Sync {
+    /// See [`ObjectUrls::url_for_while`]; `at` is the object's place in its batch.
+    fn url(&self, at: usize, object: &ObjectRef, stale: bool, ledger: &Ledger) -> Result<String>;
+    fn policy(&self) -> &SourcePolicy;
+    fn credential(&self) -> &dyn CredentialProvider;
+}
+
+/// One object a feed hands its download.
+pub(crate) struct Opening<'a> {
+    pub at: usize,
+    pub grant: DeliveryGrant,
+    pub supply: Arc<dyn Supply + 'a>,
+    pub cell: Arc<Cell>,
+}
+
+/// Where a download's objects come from, most urgent first, and where their ends are told.
+pub(crate) trait Feed<'a>: Sync {
+    /// The most urgent object waiting to be opened, if its key is below `before`.
+    fn open(&self, before: u64) -> Result<Option<Opening<'a>>>;
+    /// The key of the most urgent object waiting to be opened.
+    fn waiting(&self) -> Option<u64>;
+    /// One object (opened with `cell`) landed, from which door and with the bytes this
+    /// download moved, or was refused.
+    fn ended(&self, object: &ObjectRef, cell: &Cell, outcome: Result<(ObjectSource, u64)>);
+    /// A refused object ends only itself; a feed that does not last ends at its first refusal.
+    fn lasting(&self) -> bool;
+    fn pulse(&self) -> &Pulse;
+    /// Held shared while an object is admitted, so a collection can exclude admissions.
+    fn gate(&self) -> Option<&RwLock<()>> {
+        None
+    }
+}
+
+/// URLs, policy and credential a caller holds for a whole batch.
+struct Given<'a> {
+    urls: &'a dyn ObjectUrls,
+    policy: &'a SourcePolicy,
+    credential: &'a dyn CredentialProvider,
+}
+
+impl Supply for Given<'_> {
+    fn url(&self, at: usize, object: &ObjectRef, stale: bool, ledger: &Ledger) -> Result<String> {
+        self.urls.url_for_while(at, object, stale, ledger)
+    }
+    fn policy(&self) -> &SourcePolicy {
+        self.policy
+    }
+    fn credential(&self) -> &dyn CredentialProvider {
+        self.credential
+    }
+}
+
+/// A fixed list of objects opened in order, all equally urgent: its first refusal ends it.
+pub(super) struct Batch<'a> {
+    wanted: &'a [ObjectRef],
+    grant: &'a (dyn Fn(&ObjectRef) -> Result<DeliveryGrant> + Sync),
+    supply: Arc<dyn Supply + 'a>,
+    on_object: Option<ObjectObserver<'a>>,
+    next: Mutex<usize>,
+    cell: Arc<Cell>,
+    pulse: Pulse,
+}
+
+impl<'a> Batch<'a> {
+    pub fn new(
+        wanted: &'a [ObjectRef],
+        grant: &'a (dyn Fn(&ObjectRef) -> Result<DeliveryGrant> + Sync),
+        urls: &'a dyn ObjectUrls,
+        policy: &'a SourcePolicy,
+        credential: &'a dyn CredentialProvider,
+        on_object: Option<ObjectObserver<'a>>,
+    ) -> Batch<'a> {
+        Batch {
+            wanted,
+            grant,
+            supply: Arc::new(Given {
+                urls,
+                policy,
+                credential,
+            }),
+            on_object,
+            next: Mutex::new(0),
+            cell: Cell::new(NEXT),
+            pulse: Pulse::default(),
+        }
+    }
+
+    /// `streams`, or fewer when the batch has fewer chunks of `chunk` bytes.
+    pub fn streams(&self, streams: usize, chunk: u64) -> usize {
+        let chunks: usize = (self.wanted.iter())
+            .map(|object| object.length.div_ceil(chunk).max(1) as usize)
+            .sum();
+        streams.min(chunks).max(1)
+    }
+}
+
+impl<'a> Feed<'a> for Batch<'a> {
+    fn open(&self, _before: u64) -> Result<Option<Opening<'a>>> {
+        let at = {
+            let mut next = self.next.lock().unwrap();
+            if *next >= self.wanted.len() {
+                return Ok(None);
+            }
+            *next += 1;
+            *next - 1
+        };
+        Ok(Some(Opening {
+            at,
+            grant: (self.grant)(&self.wanted[at])?,
+            supply: Arc::clone(&self.supply),
+            cell: Arc::clone(&self.cell),
+        }))
+    }
+    fn waiting(&self) -> Option<u64> {
+        (*self.next.lock().unwrap() < self.wanted.len()).then_some(NEXT)
+    }
+    fn ended(&self, object: &ObjectRef, _cell: &Cell, outcome: Result<(ObjectSource, u64)>) {
+        if let (Some(observer), Ok((door, moved))) = (self.on_object, outcome) {
+            observer(object, moved, door);
+        }
+    }
+    fn lasting(&self) -> bool {
+        false
+    }
+    fn pulse(&self) -> &Pulse {
+        &self.pulse
+    }
+}
+
 /// An object being downloaded: its file, and what is still out.
-struct Object {
-    /// Its place in `wanted`, which is how the URL supply names it.
+struct Object<'a> {
+    /// Its place in its batch, which is how a batch's URL supply names it.
     at: usize,
     grant: DeliveryGrant,
+    supply: Arc<dyn Supply + 'a>,
+    cell: Arc<Cell>,
+    /// Its end was told to the feed.
+    told: AtomicBool,
     cache: Option<(CacheKind, CacheTrust)>,
     path: PathBuf,
     file: File,
@@ -119,7 +318,7 @@ struct Object {
     moved: AtomicU64,
 }
 
-impl Drop for Object {
+impl Drop for Object<'_> {
     fn drop(&mut self) {
         if self.part.is_none() {
             let _ = std::fs::remove_file(&self.path);
@@ -128,8 +327,8 @@ impl Drop for Object {
 }
 
 /// Bytes `first..end` of one object. An empty range is the object's commit.
-struct Chunk {
-    object: Arc<Object>,
+struct Chunk<'a> {
+    object: Arc<Object<'a>>,
     first: u64,
     end: u64,
     /// Not asked before this: an origin's stated wait, or one sample after an ask that
@@ -147,9 +346,9 @@ struct Chunk {
     unit: (u64, u64),
 }
 
-impl Chunk {
+impl<'a> Chunk<'a> {
     /// This chunk's fields for a piece cut from its front.
-    fn take(&self) -> Chunk {
+    fn take(&self) -> Chunk<'a> {
         Chunk {
             object: Arc::clone(&self.object),
             ..*self
@@ -158,7 +357,7 @@ impl Chunk {
 }
 
 /// A request on the wire, as the watch sees it.
-struct Flight {
+struct Flight<'a> {
     attempt: Arc<Attempt>,
     subject: String,
     range: (u64, u64),
@@ -168,6 +367,9 @@ struct Flight {
     /// When its body was last judged, and with how many bytes.
     judged: Option<Instant>,
     seen: u64,
+    object: Arc<Object<'a>>,
+    /// Stopped for more urgent work: its range goes back whole, and it is no slow request.
+    preempted: bool,
 }
 
 /// A request as the others see it: ended, or still running (`open`) as of the watch's tick.
@@ -181,10 +383,13 @@ struct Peer {
     small: bool,
 }
 
-enum Outcome {
+enum Outcome<'a> {
     Home,
-    Again(Vec<Chunk>),
+    Again(Vec<Chunk<'a>>),
+    /// This object is refused.
     Fatal(Refusal),
+    /// The download itself was stopped.
+    Stop(Refusal),
 }
 
 /// How a request ended short of its chunk.
@@ -208,13 +413,10 @@ impl From<Refusal> for Ended {
     }
 }
 
-#[derive(Default)]
-struct State {
-    queue: VecDeque<Chunk>,
-    /// The next index of `plan.wanted` nobody has opened, and ones a full descriptor table
-    /// sent back.
-    next: usize,
-    again: VecDeque<usize>,
+struct State<'a> {
+    queue: VecDeque<Chunk<'a>>,
+    /// Objects a full descriptor table sent back, opened again first.
+    again: VecDeque<Opening<'a>>,
     /// Workers holding a chunk or opening an object.
     busy: usize,
     /// The last requests that ended, as many as there are streams, oldest first.
@@ -225,38 +427,31 @@ struct State {
     done: bool,
 }
 
-pub(super) struct Download<'a> {
+pub(crate) struct Download<'a> {
     pub store: &'a Store,
-    pub wanted: &'a [ObjectRef],
-    /// The door's grant for one wanted object.
-    pub grant: &'a (dyn Fn(&ObjectRef) -> Result<DeliveryGrant> + Sync),
-    pub urls: &'a dyn ObjectUrls,
+    pub feed: &'a dyn Feed<'a>,
     /// One request's bytes, and whether the origin is known to answer ranges.
     pub chunk: u64,
     pub ranged: bool,
-    pub policy: &'a SourcePolicy,
-    pub credential: &'a dyn CredentialProvider,
     pub deadline: Deadline,
     pub ledger: &'a Ledger,
-    pub on_object: Option<ObjectObserver<'a>>,
     pub backfill: Option<&'a BackfillBatch<'a>>,
     /// A source download: objects kept on disk under their owner, resumable.
     pub keep: Option<&'a Keep<'a>>,
 }
 
-struct Run<'a> {
-    job: &'a Download<'a>,
-    state: Mutex<State>,
-    /// Workers wait here for a chunk; the watch waits on `over` for the end.
-    wake: Condvar,
-    over: Condvar,
-    flights: Vec<Mutex<Option<Flight>>>,
+struct Run<'r, 'a> {
+    job: &'r Download<'a>,
+    state: Mutex<State<'a>>,
+    flights: Vec<Mutex<Option<Flight<'a>>>>,
     fetched: AtomicU64,
     bytes_moved: AtomicU64,
     cached: AtomicU64,
     bytes_cached: AtomicU64,
     requests: AtomicU64,
     restarts: AtomicU64,
+    opened: AtomicU64,
+    opened_bytes: AtomicU64,
     began: Instant,
     /// When each worker began waiting on the hub for a URL, in ms since `began` plus one.
     /// A wait of a sample or more is the hub's to judge, and is not the pull standing still.
@@ -269,26 +464,27 @@ struct Run<'a> {
     writers: Writers,
 }
 
-impl Download<'_> {
-    /// Download `wanted` with `streams` requests in flight. `observer` hears the bytes home
-    /// so far, on this thread.
+impl<'a> Download<'a> {
+    /// Download what the feed hands out with `streams` requests in flight, until it has
+    /// nothing more. `observer` hears the bytes home so far, on this thread.
     pub fn run(
         &self,
         streams: usize,
         mut observer: Option<&mut dyn FetchObserver>,
     ) -> Result<WalkOutcome> {
         let began = Instant::now();
-        let chunks: usize = self
-            .wanted
-            .iter()
-            .map(|object| object.length.div_ceil(self.chunk).max(1) as usize)
-            .sum();
-        let streams = streams.min(chunks).max(1);
+        let streams = streams.max(1);
         let run = Run {
             job: self,
-            state: Mutex::new(State::default()),
-            wake: Condvar::new(),
-            over: Condvar::new(),
+            state: Mutex::new(State {
+                queue: VecDeque::new(),
+                again: VecDeque::new(),
+                busy: 0,
+                shown: VecDeque::new(),
+                last: None,
+                failure: None,
+                done: false,
+            }),
             flights: (0..streams).map(|_| Mutex::new(None)).collect(),
             fetched: AtomicU64::new(0),
             bytes_moved: AtomicU64::new(0),
@@ -296,6 +492,8 @@ impl Download<'_> {
             bytes_cached: AtomicU64::new(0),
             requests: AtomicU64::new(0),
             restarts: AtomicU64::new(0),
+            opened: AtomicU64::new(0),
+            opened_bytes: AtomicU64::new(0),
             began,
             minting: (0..streams).map(|_| AtomicU64::new(0)).collect(),
             minted: AtomicU64::new(0),
@@ -328,8 +526,8 @@ impl Download<'_> {
             "walk",
             &format!(
                 "{} {}",
-                self.wanted.len(),
-                self.wanted.iter().map(|object| object.length).sum::<u64>()
+                run.opened.load(Ordering::Relaxed),
+                run.opened_bytes.load(Ordering::Relaxed)
             ),
             &format!(
                 "fetched={} cached={} moved={} seconds={:.1} streams={streams} writers={} \
@@ -351,13 +549,20 @@ impl Download<'_> {
     }
 }
 
-impl Run<'_> {
+impl<'a> Run<'_, 'a> {
     fn work(&self, slot: usize) {
-        let mut buffer = vec![0u8; 256 << 10];
+        // Taken at the first chunk: a lasting download's idle workers hold no buffer.
+        let mut buffer = Vec::new();
         while let Some(chunk) = self.take() {
+            let object = Arc::clone(&chunk.object);
             let outcome = match chunk.first == chunk.end {
                 true => self.commit(&chunk.object),
-                false => self.request(slot, chunk, &mut buffer),
+                false => {
+                    if buffer.is_empty() {
+                        buffer = vec![0u8; 256 << 10];
+                    }
+                    self.request(slot, chunk, &mut buffer)
+                }
             };
             let mut state = self.state.lock().unwrap();
             state.busy -= 1;
@@ -368,56 +573,99 @@ impl Run<'_> {
                         state.queue.push_front(chunk);
                     }
                 }
-                Outcome::Fatal(refusal) => self.fail(&mut state, refusal),
+                Outcome::Fatal(refusal) => self.refused(&mut state, &object, refusal),
+                Outcome::Stop(refusal) => self.fail(&mut state, refusal),
             }
-            self.wake.notify_all();
+            drop(state);
+            self.job.feed.pulse().beat();
         }
     }
 
-    /// The next chunk that is due. With none, the next object is opened and its chunks
-    /// queued; with nothing left to open, the worker waits for one to come due or back.
-    fn take(&self) -> Option<Chunk> {
-        let wanted = self.job.wanted;
-        let mut state = self.state.lock().unwrap();
+    /// One object is refused: a lasting feed loses that object alone, a batch ends.
+    fn refused(&self, state: &mut State<'a>, object: &Object<'a>, refusal: Refusal) {
+        if !self.job.feed.lasting() {
+            return self.fail(state, refusal);
+        }
+        object.cell.leave();
+        if !object.told.swap(true, Ordering::AcqRel) {
+            self.job.feed.ended(&object.grant.object, &object.cell, Err(refusal));
+        }
+    }
+
+    /// The next chunk that is due, most urgent first. An object waiting to be opened that is
+    /// more urgent than every due chunk is opened first and its chunks queued; with nothing
+    /// to take or open, the worker waits for one to come due, back, or fed.
+    fn take(&self) -> Option<Chunk<'a>> {
+        let feed = self.job.feed;
         loop {
-            if state.failure.is_some() {
+            // Read before looking: whatever changes after this beats, so no wake is missed.
+            let seen = feed.pulse().seen();
+            let mut state = self.state.lock().unwrap();
+            if state.failure.is_some() || state.done {
                 return None;
             }
+            state.queue.retain(|chunk| !chunk.object.cell.gone());
             let now = Instant::now();
-            if let Some(index) = state.queue.iter().position(|chunk| chunk.due <= now) {
+            let due = (state.queue.iter().enumerate())
+                .filter(|(_, chunk)| chunk.due <= now)
+                .min_by_key(|(at, chunk)| (chunk.object.cell.key(), *at))
+                .map(|(at, chunk)| (at, chunk.object.cell.key()));
+            let before = due.map_or(u64::MAX, |(_, key)| key);
+            let again = state.again.front().map(|opening| opening.cell.key());
+            let waiting = again.or_else(|| feed.waiting()).filter(|key| *key < before);
+            // Behind work waits while anything more urgent is out.
+            let next = waiting.or(due.map(|(_, key)| key));
+            let held = next.is_some_and(|key| key >> 62 == BEHIND >> 62) && self.urgent(&state);
+            if let (Some((at, _)), None, false) = (due, waiting, held) {
                 state.busy += 1;
-                return state.queue.remove(index);
+                return state.queue.remove(at);
             }
-            let open = state.again.pop_front().or_else(|| {
-                (state.next < wanted.len()).then(|| {
-                    state.next += 1;
-                    state.next - 1
-                })
-            });
-            if let Some(at) = open {
+            if waiting.is_some() && !held {
+                let again = state.again.pop_front();
                 state.busy += 1;
                 drop(state);
-                let opened = self.open(at);
+                let opening = match again {
+                    Some(again) => Ok(Some(again)),
+                    None => feed.open(before),
+                };
+                let opened = opening.map(|opening| opening.map(|opening| {
+                    let chunks = self.open(&opening);
+                    (opening, chunks)
+                }));
                 state = self.state.lock().unwrap();
                 state.busy -= 1;
                 match opened {
-                    Ok(chunks) => state.queue.extend(chunks),
+                    Ok(None) => {}
+                    Ok(Some((_, Ok(chunks)))) => state.queue.extend(chunks),
                     // A full descriptor table is backpressure: open it again a sample on.
-                    Err(refusal) if refusal.code == Code::FD_HEADROOM => {
-                        state.again.push_front(at);
+                    Ok(Some((opening, Err(refusal)))) if refusal.code == Code::FD_HEADROOM => {
+                        state.again.push_front(opening);
                         state.last = Some(refusal);
-                        let sample = self.job.ledger.sample();
-                        state = self.wake.wait_timeout(state, sample).unwrap().0;
+                        drop(state);
+                        feed.pulse().wait(feed.pulse().seen(), self.job.ledger.sample());
+                        continue;
+                    }
+                    Ok(Some((opening, Err(refusal)))) => {
+                        let refusal = named(refusal, &opening.grant.object.id());
+                        if feed.lasting() {
+                            opening.cell.leave();
+                            drop(state);
+                            feed.ended(&opening.grant.object, &opening.cell, Err(refusal));
+                            feed.pulse().beat();
+                            continue;
+                        }
+                        self.fail(&mut state, refusal);
                     }
                     Err(refusal) => self.fail(&mut state, refusal),
                 }
-                self.wake.notify_all();
+                drop(state);
+                feed.pulse().beat();
                 continue;
             }
-            if state.queue.is_empty() && state.busy == 0 {
+            if state.queue.is_empty() && state.busy == 0 && feed.waiting().is_none() {
                 state.done = true;
-                self.wake.notify_all();
-                self.over.notify_all();
+                drop(state);
+                feed.pulse().beat();
                 return None;
             }
             let wait = state
@@ -429,7 +677,8 @@ impl Run<'_> {
                     due.min(self.job.ledger.sample())
                 })
                 .max(Duration::from_millis(1));
-            state = self.wake.wait_timeout(state, wait).unwrap().0;
+            drop(state);
+            feed.pulse().wait(seen, wait);
         }
     }
 
@@ -439,16 +688,18 @@ impl Run<'_> {
             // cannot replace its diagnosis.
             state.failure = Some(refusal);
             self.job.ledger.cancel();
-            self.over.notify_all();
+            self.job.feed.pulse().beat();
         }
     }
 
-    /// One object off the wanted list: answered by the mounted cache, or given a temp file
-    /// and cut into chunks.
-    fn open(&self, at: usize) -> Result<Vec<Chunk>> {
+    /// One object off the feed: answered by the mounted cache, or given a temp file and cut
+    /// into chunks.
+    fn open(&self, opening: &Opening<'a>) -> Result<Vec<Chunk<'a>>> {
         let job = self.job;
-        let wanted = &job.wanted[at];
-        let grant = (job.grant)(wanted)?;
+        let wanted = &opening.grant.object;
+        let grant = opening.grant.clone();
+        self.opened.fetch_add(1, Ordering::Relaxed);
+        self.opened_bytes.fetch_add(wanted.length, Ordering::Relaxed);
         let kind = Some(match grant.destination {
             Destination::Manifest => CacheKind::Manifest,
             Destination::Blob => CacheKind::Blob,
@@ -465,9 +716,8 @@ impl Run<'_> {
                     // Cached bytes never reach a socket, and they are progress too.
                     job.ledger.moved(wanted.length);
                     self.landed.fetch_add(wanted.length, Ordering::Relaxed);
-                    if let Some(observer) = job.on_object {
-                        observer(wanted, wanted.length, ObjectSource::Cache);
-                    }
+                    let cache = Ok((ObjectSource::Cache, wanted.length));
+                    job.feed.ended(wanted, &opening.cell, cache);
                     return Ok(Vec::new());
                 }
                 // This read proved the cached bytes wrong: the backfill replaces them.
@@ -501,8 +751,11 @@ impl Run<'_> {
         // An origin that may not range is asked for the first chunk alone.
         let asked = if job.ranged { chunks.len() } else { 1 };
         let object = Arc::new(Object {
-            at,
+            at: opening.at,
             grant,
+            supply: Arc::clone(&opening.supply),
+            cell: Arc::clone(&opening.cell),
+            told: AtomicBool::new(false),
             cache,
             path,
             file,
@@ -568,7 +821,7 @@ impl Run<'_> {
     }
 
     /// The origin answered a range: the object's other chunks join the queue.
-    fn rest(&self, lead: &Chunk) {
+    fn rest(&self, lead: &Chunk<'a>) {
         let rest = std::mem::take(&mut *lead.object.rest.lock().unwrap());
         let mut state = self.state.lock().unwrap();
         for (first, end) in rest.into_iter().rev() {
@@ -584,7 +837,8 @@ impl Run<'_> {
                 unit: (first, end),
             });
         }
-        self.wake.notify_all();
+        drop(state);
+        self.job.feed.pulse().beat();
     }
 
     /// A piece is home. When it was its chunk's last, a source download records the chunk.
@@ -608,9 +862,17 @@ impl Run<'_> {
         Ok(())
     }
 
+    /// The download's own stop, or its deadline, as a refusal.
+    fn stopped(&self) -> Option<Refusal> {
+        let job = self.job;
+        (job.ledger.check_running())
+            .and_then(|()| job.deadline.remaining().map(|_| ()))
+            .err()
+    }
+
     /// One GET for a chunk, written at its offsets. Whatever ends it early, the bytes that
     /// landed stay and the rest goes back on the queue.
-    fn request(&self, slot: usize, mut chunk: Chunk, buffer: &mut [u8]) -> Outcome {
+    fn request(&self, slot: usize, mut chunk: Chunk<'a>, buffer: &mut [u8]) -> Outcome<'a> {
         let job = self.job;
         let object = Arc::clone(&chunk.object);
         let wanted = &object.grant.object;
@@ -621,9 +883,7 @@ impl Run<'_> {
         let delivery = object.delivery.lock().unwrap().clone();
         let url = match delivery.clone() {
             Some(delivery) => Ok(delivery),
-            None => job
-                .urls
-                .url_for_while(object.at, wanted, stale.is_some(), job.ledger),
+            None => (object.supply).url(object.at, wanted, stale.is_some(), job.ledger),
         };
         self.minting[slot].store(0, Ordering::Release);
         if self.began.elapsed() - asked >= job.ledger.sample() {
@@ -632,6 +892,9 @@ impl Run<'_> {
         }
         let url = match (url, stale) {
             (Ok(url), _) => url,
+            (Err(_), _) if self.stopped().is_some() => {
+                return Outcome::Stop(self.stopped().unwrap())
+            }
             // A refused re-authorization still names the origin's answer.
             (Err(refusal), Some(status)) => {
                 return Outcome::Fatal(Refusal {
@@ -643,6 +906,13 @@ impl Run<'_> {
                         refusal.detail
                     ),
                 })
+            }
+            // The hub's weather is asked again a sample on: a lasting download's objects end
+            // on measured stillness, never on a blip.
+            (Err(refusal), None) if job.feed.lasting() && matches!(refusal.code, Code::TRANSFER_FAILED | Code::HUB_UNREACHABLE) => {
+                chunk.due = Instant::now() + job.ledger.sample();
+                self.state.lock().unwrap().last = Some(named(refusal, &wanted.id()));
+                return Outcome::Again(vec![chunk]);
             }
             (Err(refusal), None) => return Outcome::Fatal(refusal),
         };
@@ -658,11 +928,17 @@ impl Run<'_> {
             patience: 1 << chunk.drops.min(6),
             judged: None,
             seen: 0,
+            object: Arc::clone(&object),
+            preempted: false,
         });
         self.requests.fetch_add(1, Ordering::Relaxed);
         let ended = self.stream(&mut chunk, &url, delivery.is_some(), &ledger, buffer);
-        *self.flights[slot].lock().unwrap() = None;
+        let preempted = (self.flights[slot].lock().unwrap().take()).is_some_and(|f| f.preempted);
         self.show(&attempt, began, asked);
+        // Nothing wants it any more: what landed goes with its temp file.
+        if object.cell.gone() {
+            return Outcome::Home;
+        }
         // What this ask added: a whole answer to a resumed range starts the object over.
         let moved = chunk.first.saturating_sub(asked.0);
         let (refusal, stated) = match ended {
@@ -679,19 +955,21 @@ impl Run<'_> {
                 return Outcome::Again(vec![chunk]);
             }
             Err(Ended::Retry(refusal, stated)) => (refusal, stated),
+            // The first failure is the diagnosis; a stopped pull's own refusal is not.
             Err(Ended::Fatal(refusal)) => {
-                // The first failure is the diagnosis; a stopped pull's own refusal is not.
-                let stopped = job.ledger.check_running().err();
-                return Outcome::Fatal(stopped.unwrap_or_else(|| named(refusal, &wanted.id())));
+                return match self.stopped() {
+                    Some(stopped) => Outcome::Stop(stopped),
+                    None => Outcome::Fatal(named(refusal, &wanted.id())),
+                }
             }
         };
         // The pull itself was stopped, or its deadline passed: nothing is asked again.
-        if let Err(stopped) = job
-            .ledger
-            .check_running()
-            .and_then(|()| job.deadline.remaining().map(|_| ()))
-        {
-            return Outcome::Fatal(stopped);
+        if let Some(stopped) = self.stopped() {
+            return Outcome::Stop(stopped);
+        }
+        // Stopped for more urgent work: the rest goes back whole, due at once.
+        if preempted {
+            return Outcome::Again(vec![chunk]);
         }
         let dropped = attempt.stopped.load(Ordering::Acquire);
         chunk.drops += dropped as u32;
@@ -751,7 +1029,7 @@ impl Run<'_> {
     /// Ask for `chunk` and write what arrives, advancing `chunk.first` as bytes land.
     fn stream(
         &self,
-        chunk: &mut Chunk,
+        chunk: &mut Chunk<'a>,
         url: &str,
         delivered: bool,
         ledger: &Ledger,
@@ -771,8 +1049,8 @@ impl Run<'_> {
         let opened = open_object(
             shared_client(),
             url,
-            job.policy,
-            job.credential,
+            object.supply.policy(),
+            object.supply.credential(),
             job.deadline,
             ledger,
             if whole && job.ranged { &[] } else { &range },
@@ -900,10 +1178,15 @@ impl Run<'_> {
     }
 
     /// Every chunk is home: hash the file and commit it at the digest it hashed to.
-    fn commit(&self, object: &Object) -> Outcome {
+    fn commit(&self, object: &Object<'a>) -> Outcome<'a> {
         let job = self.job;
         let wanted = &object.grant.object;
         let moved = object.moved.load(Ordering::Relaxed);
+        if object.cell.gone() {
+            return Outcome::Home;
+        }
+        // A collection the feed runs excludes admissions while it plans and deletes.
+        let _gate = job.feed.gate().map(|gate| gate.read().unwrap());
         let fault = job
             .keep
             .map_or(&Fault::default(), |keep| keep.fault)
@@ -958,10 +1241,63 @@ impl Run<'_> {
             // Local admission is complete; replication never delays this object's report.
             backfill.offer(kind, wanted, trust);
         }
-        if let Some(observer) = job.on_object {
-            observer(wanted, moved, ObjectSource::Origin);
+        if !object.told.swap(true, Ordering::AcqRel) {
+            job.feed.ended(wanted, &object.cell, Ok((ObjectSource::Origin, moved)));
         }
         Outcome::Home
+    }
+
+    /// Whether a request or a due chunk of a class more urgent than Behind is out: Behind work
+    /// runs only while there is none.
+    fn urgent(&self, state: &State<'a>) -> bool {
+        let behind = BEHIND >> 62;
+        state.queue.iter().any(|chunk| chunk.object.cell.class() < behind)
+            || self.job.feed.waiting().is_some_and(|key| key >> 62 < behind)
+            || (self.flights.iter()).any(|flight| {
+                (flight.lock().unwrap().as_ref()).is_some_and(|f| f.object.cell.class() < behind)
+            })
+    }
+
+    /// Requests of a lower class give way to waiting work of a higher one, one for each
+    /// waiting chunk no free worker will take, least urgent first; Behind requests stop
+    /// whenever more urgent work is out. A request whose object nothing wants stops too.
+    fn preempt(&self, state: &State<'a>) {
+        let now = Instant::now();
+        let due = || state.queue.iter().filter(|chunk| chunk.due <= now);
+        let fed = self.job.feed.waiting().map(|key| key >> 62);
+        let again = state.again.iter().map(|opening| opening.cell.key() >> 62);
+        let waiting = due().map(|chunk| chunk.object.cell.class()).chain(fed).chain(again).min();
+        let urgent = self.urgent(state);
+        let mut need = waiting.map_or(0, |class| {
+            due().filter(|chunk| chunk.object.cell.class() == class).count()
+                + usize::from(fed == Some(class))
+                + state.again.len()
+        });
+        need = need.saturating_sub(self.flights.len().saturating_sub(state.busy));
+        let mut victims = Vec::new();
+        for (slot, flight) in self.flights.iter().enumerate() {
+            let mut flight = flight.lock().unwrap();
+            let Some(flight) = flight.as_mut() else {
+                continue;
+            };
+            let class = flight.object.cell.class();
+            if flight.object.cell.gone() || (urgent && class == BEHIND >> 62) {
+                flight.preempted = true;
+                flight.attempt.stopped.store(true, Ordering::Release);
+            } else if waiting.is_some_and(|waiting| class > waiting) {
+                match flight.preempted {
+                    true => need = need.saturating_sub(1),
+                    false => victims.push((class, slot)),
+                }
+            }
+        }
+        victims.sort_by(|a, b| b.cmp(a));
+        for (_, slot) in victims.into_iter().take(need) {
+            if let Some(flight) = self.flights[slot].lock().unwrap().as_mut() {
+                flight.preempted = true;
+                flight.attempt.stopped.store(true, Ordering::Release);
+            }
+        }
     }
 
     /// The one rule, five times a sample: a request that has waited far longer for its first
@@ -969,33 +1305,38 @@ impl Run<'_> {
     /// same time, is dropped. Peers are the requests still running and those that ended
     /// since its window began, never history, so a pod whose every request is slow drops
     /// none. And the pull's own end: nothing new has landed for twice its measured patience.
+    /// Between those, every beat gives waiting work its way ([`Run::preempt`]).
     fn watch(&self, observer: &mut Option<&mut dyn FetchObserver>) {
         let job = self.job;
+        let pulse = job.feed.pulse();
         let sample = self.tick();
         // The most bytes ever home, and when that last grew while requests were being asked.
         let (mut most, mut grew) = (0, Instant::now());
-        let mut state = self.state.lock().unwrap();
+        let mut judge = Instant::now() + sample;
         loop {
+            let seen = pulse.seen();
+            let state = self.state.lock().unwrap();
             if state.done || state.failure.is_some() {
                 return;
             }
-            state = self.over.wait_timeout(state, sample).unwrap().0;
+            self.preempt(&state);
+            drop(state);
+            let left = judge.saturating_duration_since(Instant::now());
+            if !left.is_zero() {
+                pulse.wait(seen, left);
+                continue;
+            }
+            judge = Instant::now() + sample;
             if let Some(observer) = observer.as_mut() {
                 // Told outside the lock: an observer may be slow, and workers must not wait.
-                drop(state);
                 observer.moved(self.landed.load(Ordering::Relaxed));
-                state = self.state.lock().unwrap();
             }
+            let mut state = self.state.lock().unwrap();
             if state.done || state.failure.is_some() {
                 return;
             }
-            let stopped = job
-                .ledger
-                .check_running()
-                .and_then(|()| job.deadline.remaining().map(|_| ()));
-            if let Err(refusal) = stopped {
+            if let Some(refusal) = self.stopped() {
                 self.fail(&mut state, refusal);
-                self.wake.notify_all();
                 return;
             }
             let floor = sample.as_secs_f64() * 2.0;
@@ -1057,6 +1398,9 @@ impl Run<'_> {
                     continue;
                 };
                 flying = true;
+                if flight.preempted {
+                    continue;
+                }
                 let bytes = flight.attempt.bytes.load(Ordering::Relaxed);
                 let (began, waited) = (flight.began, flight.began.elapsed().as_secs_f64());
                 let patience = flight.patience as f64;
@@ -1145,9 +1489,25 @@ impl Run<'_> {
                         )),
                     ),
                 };
-                self.fail(&mut state, refusal);
-                self.wake.notify_all();
-                return;
+                if !job.feed.lasting() {
+                    self.fail(&mut state, refusal);
+                    return;
+                }
+                // A lasting download loses what it was asking for, and goes on.
+                let refusal = Refusal { code: Code::STALLED, ..refusal };
+                let mut asked: Vec<Arc<Object<'a>>> =
+                    (state.queue.iter()).map(|chunk| Arc::clone(&chunk.object)).collect();
+                for flight in &self.flights {
+                    if let Some(flight) = flight.lock().unwrap().as_ref() {
+                        asked.push(Arc::clone(&flight.object));
+                    }
+                }
+                for object in asked {
+                    self.refused(&mut state, &object, named(refusal.clone(), &object.grant.object.id()));
+                }
+                drop(state);
+                pulse.beat();
+                (most, grew) = (landed, Instant::now());
             }
         }
     }
@@ -1253,22 +1613,21 @@ pub fn fetch_ranged(
     observer: Option<&mut dyn FetchObserver>,
 ) -> Result<Fetched> {
     let urls = BTreeMap::from([(grant.object.sha256.clone(), url.to_string())]);
+    let wanted = std::slice::from_ref(&grant.object);
+    let granted = |_: &ObjectRef| Ok(grant.clone());
+    let batch = Batch::new(wanted, &granted, &urls, policy, credential, None);
+    let chunk = ranged.part.clamp(1 << 20, 1 << 30);
     let outcome = Download {
         store,
-        wanted: std::slice::from_ref(&grant.object),
-        grant: &|_| Ok(grant.clone()),
-        urls: &urls,
-        chunk: ranged.part.clamp(1 << 20, 1 << 30),
+        feed: &batch,
+        chunk,
         ranged: false,
-        policy,
-        credential,
         deadline,
         ledger,
-        on_object: None,
         backfill: None,
         keep: None,
     }
-    .run(ranged.streams.clamp(1, 64), observer)?;
+    .run(batch.streams(ranged.streams.clamp(1, 64), chunk), observer)?;
     Ok(Fetched {
         object: grant.object.clone(),
         transferred: outcome.bytes_moved,

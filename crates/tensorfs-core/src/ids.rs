@@ -37,7 +37,7 @@ pub fn object_id(bytes: &[u8]) -> String {
     format!("sha256:{}", sha256::hex_digest(bytes))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ObjectRef {
     pub sha256: String,
     pub length: u64,

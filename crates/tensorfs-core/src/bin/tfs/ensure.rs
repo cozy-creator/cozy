@@ -6,10 +6,11 @@
 use std::io::Write;
 use std::path::Path;
 use std::process::ExitCode;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use tensorfs_core::canon::{self, Value};
 use tensorfs_core::ensure::{self, Ensured, Event, Request};
+use tensorfs_core::fetch::Plain;
 use tensorfs_core::err::Refusal;
 use tensorfs_core::store::Store;
 use tensorfs_core::transport;
@@ -35,20 +36,19 @@ fn say(out: &Mutex<std::io::Stdout>, line: String) {
 
 fn progress(event: &Event) -> String {
     format!(
-        "{{\"event\":\"ensure.progress\",\"model\":{},\"step\":{},\"phase\":\"{}\",\"bytes_done\":{},\"bytes_total\":{},\"rate\":{:.1},\"attempt\":{}}}",
+        "{{\"event\":\"ensure.progress\",\"model\":{},\"step\":{},\"phase\":\"{}\",\"bytes_done\":{},\"bytes_total\":{},\"rate\":{:.1}}}",
         quoted(&event.model),
         quoted(&event.step),
         event.phase.as_str(),
         event.bytes_done,
         event.bytes_total,
         event.rate,
-        event.attempt,
     )
 }
 
 fn result(r: &Ensured) -> String {
     format!(
-        "{{\"event\":\"ensure.result\",\"model\":{},\"release\":{},\"lane\":{},\"scope\":{},\"manifest\":\"{}\",\"manifest_length\":{},\"bytes_total\":{},\"bytes_held\":{},\"bytes_fetched\":{},\"bytes_cached\":{},\"cache_written_bytes\":{},\"collected_bytes\":{},\"attempts\":{},\"joined\":{},\"seconds\":{:.3}}}",
+        "{{\"event\":\"ensure.result\",\"model\":{},\"release\":{},\"lane\":{},\"scope\":{},\"manifest\":\"{}\",\"manifest_length\":{},\"bytes_total\":{},\"bytes_held\":{},\"bytes_fetched\":{},\"bytes_cached\":{},\"collected_bytes\":{},\"joined\":{},\"seconds\":{:.3}}}",
         quoted(&r.model),
         quoted(&r.release),
         quoted(&r.lane),
@@ -59,9 +59,7 @@ fn result(r: &Ensured) -> String {
         r.bytes_held,
         r.bytes_fetched,
         r.bytes_cached,
-        r.cache_written_bytes,
         r.collected_bytes,
-        r.attempts,
         r.joined,
         r.seconds,
     )
@@ -118,16 +116,12 @@ pub fn cmd_ensure(root: &Path, refspec: &str, flags: &Flags) -> ExitCode {
         .into_iter()
         .map(str::to_string)
         .collect();
-    let components: Vec<String> = flag_all(flags, "component")
-        .into_iter()
-        .map(str::to_string)
-        .collect();
     let on_event = |event: &Event| say(&out, progress(event));
-    let mut request = Request::new(&store, hub, refspec, &credential, &policy);
+    let access = Arc::new(Plain { credential, policy });
+    let mut request = Request::new(&store, hub, refspec, access);
     request.lane = flag(flags, "lane").unwrap_or("");
     request.step = step;
     request.keep = &keep;
-    request.components = &components;
     request.streams = flag_num(flags, "streams", transport::PULL_STREAMS);
     request.sample_seconds = flag_num(flags, "sample-seconds", transport::SAMPLE_SECONDS);
     request.on_event = Some(&on_event);
