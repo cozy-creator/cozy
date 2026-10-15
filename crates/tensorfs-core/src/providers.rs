@@ -444,7 +444,8 @@ fn list_selected_observed(
             members
         }
     };
-    if members.is_empty() {
+    // A selection that matches nothing is an answer; a source with no member is not.
+    if members.is_empty() && wanted.is_none() {
         return refuse(Code::MISSING_FIELD, "the source reaches no member");
     }
     if members.len() > MEMBER_MAX {
