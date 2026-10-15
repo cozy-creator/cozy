@@ -63,9 +63,8 @@ remains authoritative. Only objects a pull fetched from the origin are backfille
 is never offered. Backfill hashes while writing a hidden unique sibling, fsyncs, and links it
 without clobbering, so concurrent writers converge and an interrupted write never has a final
 name. That publication is the cache's integrity record: an exact-length blob at its name is
-present without being read. A pull that reads an entry corrupt, and `tfs reclaim run --demote`, which
-drops the local copy, re-verify instead and repair a corrupt regular entry by syncing its
-replacement before an atomic rename. Publication pins the
+present without being read. A pull that reads an entry corrupt re-verifies instead and
+repairs a corrupt regular entry by syncing its replacement before an atomic rename. Publication pins the
 configured cache root and opens each fanout directory without following symlinks; all temporary,
 link and rename operations stay relative to those directory descriptors. Symlink and nonregular
 entries remain unavailable. Repair grants no custody and adds no cache garbage collector.
@@ -130,6 +129,19 @@ takes its root as an argument. Nor does a
 writer marker create the root it locks, so no command lays down a skeleton Store in whatever
 directory it happened to be run from.
 
+Python exposes the same resolver. Passing a root remains supported and always wins:
+
+```python
+import tensorfs
+
+store = tensorfs.Store.ensure()
+other = tensorfs.Store.open("/srv/tensorfs")
+```
+
+`Store.init`/`tfs store init` accept only an absent or exactly empty real directory. Use
+`Store.ensure` for normal startup: it initializes that same narrow case, but requires a nonempty
+root to be a real current Store with a valid `tensorfs.sqlite`. Neither operation follows a root
+or namespace symlink, merges foreign files into a Store, or recognizes an older layout.
 
 ## Disk budget
 
@@ -235,67 +247,17 @@ uses `syncfs`: on a shared filesystem it also waits for every other writer's pag
 
 ## Reclamation
 
-`gc` collects what nothing names. **`reclaim` chooses what to stop naming.** Two acts, two
-verbs — and every one of them refuses on a Store with no recorded disk budget.
-
-```text
-tfs reclaim usage <root> --rows <rows.jsonl> [--keep <keep.jsonl>] [--candidates <cand.jsonl>]
-tfs reclaim plan  <root> --need <bytes> [--keep <org>/<name>]... [--out <plan.json>]
-tfs reclaim run   <root> --plan <plan.json> --assume-upstream [--demote]
-```
+`gc` collects what nothing names. Under disk pressure TensorD calls
+`gc::collect_cached_for`, which frees garbage first and then the fewest least-recently-used
+cache roots that cover the need (`reclaim::plan`). Roots in use and held objects are never
+dropped.
 
 **Reclaimable bytes are a property of the candidate SET, never of a model.** On a
-content-addressed store two models can be backed by one object, so *"deleting a model might
-reclaim almost no space because it was de-duped with one we want to keep"*. `reclaim usage`
-answers both halves and neither is derivable from the other:
-
-- per candidate, `bytes_marginal` — what dropping THAT ONE frees while the keep set and
-  every other candidate stand;
-- one `kind:"all"` row, `bytes_total` — what dropping every candidate frees.
-
-Two models sharing a 200 KB base each exclude it from their own marginal, so the set frees
-200 KB more than the sum. **A caller that adds the rows up under-estimates by the whole of
-the sharing.** The `all` row also carries `occupancy_bytes`, `budget_bytes` and
-`headroom_bytes`, so a caller asking how full the Store is has one answer rather than two
-that can disagree; it is deliberately not a filesystem statistic.
-
-Every number comes from the same walk the collection performs, with the deletions not yet
-applied, so the estimate and the act cannot drift.
-
-`reclaim plan` ranks by **marginal bytes per drop**, ties broken by the oldest-recorded
-root — not by model size, which picks the wrong victim exactly when dedup is working, and
-not by recency alone, which ranks access when the budget is about bytes. A root that would
-free nothing never survives into a plan. If the whole droppable set frees less than
-`--need` the plan refuses `RECLAIM_INSUFFICIENT` naming the shortfall, rather than emptying
-the Store and failing anyway.
-
-`reclaim run` requires `--assume-upstream`: the caller must first confirm that the
-selected roots have durable upstream custody. A valid cache entry cannot supply that
-promise because a cache owner may delete it at any time. Without the declaration, all
-named local roots and bytes are preserved, even when `--demote` was requested.
-
-With that declaration, `--demote` optionally warms the repo cache from verified local
-bytes before repository roots are removed and ordinary GC runs. Failed cache writes do
-not prevent reclaiming bytes whose upstream copy the caller has already confirmed.
-Objects still named by a retained repository or hold remain protected by GC.
-
-`reclaim run` takes the same store-wide exclusivity `gc` does and refuses `STORE_BUSY`
-naming the live holder, so it cannot run beside a reader that holds a lease.
-
-
-Python exposes the same resolver. Passing a root remains supported and always wins:
-
-```python
-import tensorfs
-
-store = tensorfs.Store.ensure()
-other = tensorfs.Store.open("/srv/tensorfs")
-```
-
-`Store.init`/`tfs store init` accept only an absent or exactly empty real directory. Use
-`Store.ensure` for normal startup: it initializes that same narrow case, but requires a nonempty
-root to be a real current Store with a valid `tensorfs.sqlite`. Neither operation follows a root
-or namespace symlink, merges foreign files into a Store, or recognizes an older layout.
+content-addressed store two models can be backed by one object, so dropping one may free
+almost nothing. The planner ranks by marginal bytes per drop, never proposes a root that
+frees nothing, and refuses `RECLAIM_INSUFFICIENT` rather than emptying the Store when the
+droppable set cannot cover the need. Its figure is re-derived through the same census walk
+the collection performs, so the estimate and the act cannot drift.
 
 ## Build and test
 

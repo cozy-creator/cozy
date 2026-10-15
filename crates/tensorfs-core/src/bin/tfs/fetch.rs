@@ -8,7 +8,6 @@
 //! inside `Store::put_stream`.
 
 use std::fs;
-use std::io;
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Mutex;
@@ -25,9 +24,7 @@ use crate::{bail, flag, Flags};
 
 // ---------------------------------------------------------------- the one transport (tfs-050)
 
-use tensorfs_core::transport::{
-    self, credential_from_spec, Anonymous, Deadline, PullRequest, SourcePolicy,
-};
+use tensorfs_core::transport::{self, credential_from_spec, Deadline, PullRequest, SourcePolicy};
 
 pub(crate) fn policy_of(flags: &Flags) -> SourcePolicy {
     SourcePolicy {
@@ -195,98 +192,6 @@ pub fn cmd_pull(root: &Path, refspec: &str, flags: &Flags) -> ExitCode {
 // ------------------------------------------------------------ the observation channel
 
 // ------------------------------------------------------------ the staging area
-
-/// The push destination, reaching the child exactly the way the credential does (tfs-050) —
-/// never argv, which is world-readable in `/proc`, and a presigned PUT is a bearer secret.
-/// A minted grant is a destination AND the headers its signature covers, so the two travel
-/// as ONE document and there is no spelling that spends the URL without its conditions:
-/// `--grant-file <path>` or one deliberately-set `TFS_PUSH_GRANT`, the URL on the first
-/// line then one `name: value` per signed header. `--url <presigned|->` remains for a bare
-/// destination that signs nothing, `-` reading it from stdin. Exactly one of the three.
-fn grant_of(flags: &Flags) -> Result<transport::UploadGrant, ExitCode> {
-    use std::io::BufRead;
-    let file = flag(flags, "grant-file");
-    let environment = std::env::var("TFS_PUSH_GRANT").unwrap_or_default();
-    let url = flag(flags, "url");
-    let given = [
-        file.is_some(),
-        !environment.trim().is_empty(),
-        url.is_some(),
-    ];
-    if given.iter().filter(|named| **named).count() != 1 {
-        eprintln!(
-            "exactly one of --grant-file <path>, TFS_PUSH_GRANT, or --url <presigned|-> \
-             names the destination"
-        );
-        return Err(ExitCode::from(2));
-    }
-    let document = match file {
-        Some(path) => match fs::read_to_string(path) {
-            Ok(text) => Some(text),
-            Err(error) => {
-                eprintln!("REFUSED IO_FAILED: read {path}: {error}");
-                return Err(ExitCode::FAILURE);
-            }
-        },
-        None if !environment.trim().is_empty() => Some(environment),
-        None => None,
-    };
-    if let Some(document) = document {
-        return match transport::UploadGrant::parse(&document) {
-            Ok(grant) => Ok(grant),
-            Err(refusal) => {
-                eprintln!("REFUSED {refusal}");
-                Err(ExitCode::FAILURE)
-            }
-        };
-    }
-    let url = url.unwrap_or_default();
-    if url != "-" {
-        return Ok(transport::UploadGrant::to(url));
-    }
-    let mut line = String::new();
-    if io::stdin().lock().read_line(&mut line).is_err() {
-        eprintln!("REFUSED SOURCE_NOT_ALLOWED: could not read the URL from stdin");
-        return Err(ExitCode::FAILURE);
-    }
-    Ok(transport::UploadGrant::to(line.trim()))
-}
-
-/// `tfs push <root> <sha256> --grant-file <path> [--manifest]` — the upload half: one
-/// verified store object to the one destination a grant names, under the exact headers
-/// its signature covers, 412 a success under `If-None-Match: *`.
-pub fn cmd_push(root: &Path, id: &str, flags: &Flags) -> ExitCode {
-    let store = ok!(Store::open(root));
-    let sha256 = ok!(tensorfs_core::ids::hex64("push object", id));
-    let grant = match grant_of(flags) {
-        Ok(grant) => grant,
-        Err(code) => return code,
-    };
-    let ledger = transport::Ledger::new();
-    let pushed = ok!(transport::push_object(
-        &store,
-        &sha256,
-        crate::flag_on(flags, "manifest"),
-        &grant,
-        &policy_of(flags),
-        &Anonymous,
-        deadline_of(flags),
-        &ledger,
-        flag(flags, "content-type").unwrap_or(""),
-    ));
-    println!("pushed       {}", pushed.object.id());
-    println!("status       HTTP {}", pushed.http_status);
-    println!(
-        "sent         {} B{}",
-        pushed.bytes_sent,
-        if pushed.landed_precondition {
-            " (the immutable key already held these exact bytes)"
-        } else {
-            ""
-        }
-    );
-    ExitCode::SUCCESS
-}
 
 /// PullProgress is the walk's own reporting counter: totals through each door and the
 /// cadence they are printed at.

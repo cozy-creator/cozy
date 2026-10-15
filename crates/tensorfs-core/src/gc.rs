@@ -507,7 +507,7 @@ pub fn collect_cached_for(
     }
     let need = need.max(1) - collected.reclaimed_bytes;
     let roots = roots(&store, protected_manifests)?;
-    let plan = match crate::reclaim::plan_managed(&store, need, &roots.keep, &roots.holds) {
+    let plan = match crate::reclaim::plan(&store, need, &roots.keep, &roots.holds) {
         Ok(plan) => plan,
         Err(error) if error.code == Code::RECLAIM_INSUFFICIENT => return Ok(collected),
         Err(error) => return Err(error),

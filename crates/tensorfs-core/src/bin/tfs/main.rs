@@ -37,30 +37,29 @@ const USAGE: &str = "usage: tfs <verb> ...
   store rebuild <census> --rows <jsonl>
   gc headers <census> --out <jsonl>
   gc plan <census> --holds <jsonl> --out <jsonl>
-  reclaim usage|plan|run <root>
   put|get <root> ..., reap <root>
   checkpoint write <root> [--plain] [--blocks <n>] [--no-configs]
-  fetch <root> <ref> --hub <base>, push <root> <sha256> --grant-file <f>
+  fetch <root> <ref> --hub <base>
   ensure <root> <ref> --hub <base>
   repo-cache restore|resume|chain ...
   ingest bank <dialect> <converter> ..., ingest source-members|source-plan|plan|run|install|reap ...";
 
 /// Flags that never take a value.
 const SWITCHES: &[&str] = &[
-    "allow-local", "assume-upstream", "demote", "dry-run", "json", "keys", "no-configs",
+    "allow-local", "dry-run", "keys", "no-configs",
     "no-disk-budget", "no-journal", "no-netns", "no-repo-cache", "plain", "progress",
 ];
 /// Flags that take the next token as their value; given last, or before another flag, they
 /// are present without one.
 const VALUED: &[&str] = &[
-    "allow-hosts", "blocks", "ca-file", "candidates", "carrier", "checkpoint-bytes", "closure",
-    "config", "content-type", "credential-file", "disk-budget", "expect", "expect-length", "fault",
-    "grant-file", "header", "holds", "hub", "inventory", "isolation-tier", "keep", "lane",
-    "manifest", "max-download-bytes", "max-download-objects", "max-redirects", "member", "need",
+    "allow-hosts", "blocks", "ca-file", "carrier", "checkpoint-bytes", "closure",
+    "config", "credential-file", "disk-budget", "expect", "expect-length", "fault",
+    "header", "holds", "hub", "inventory", "isolation-tier", "keep", "lane",
+    "manifest", "max-download-bytes", "max-download-objects", "max-redirects", "member",
     "observed", "order", "out", "part-mib", "plan", "progress-bytes", "range", "ready", "refs",
     "registry", "repo-cache", "rlimit-as-mb", "rlimit-fsize-mb", "rows", "sample-seconds",
     "scale", "session", "slow-ms", "source", "source-name", "source-plan", "source-profile",
-    "spec-variant", "step", "streams", "target", "tenant", "timeout", "url",
+    "spec-variant", "step", "streams", "target", "tenant", "timeout",
 ];
 
 fn usage() -> ExitCode {
@@ -131,9 +130,6 @@ fn main() -> ExitCode {
             repo::cmd_repo_apply(current, Path::new(mutation), &flags)
         }
         ["key", kind, rest @ ..] => repo::cmd_key(kind, rest),
-        ["reclaim", "usage", store] => repo::cmd_reclaim_usage(Path::new(store), &flags),
-        ["reclaim", "plan", store] => repo::cmd_reclaim_plan(Path::new(store), &flags),
-        ["reclaim", "run", store] => repo::cmd_reclaim_run(Path::new(store), &flags),
         ["gc", "headers", census] => repo::cmd_gc_headers(Path::new(census), &flags),
         ["gc", "plan", census] => repo::cmd_gc_plan(Path::new(census), &flags),
         ["ingest", "bank", dia, conv] => ingest::cmd_bank(dia, conv, &flags),
@@ -161,7 +157,6 @@ fn main() -> ExitCode {
         }
         ["ingest", "reap", r] => ingest::cmd_reap(Path::new(r), &flags),
         ["fetch", r, refspec] => fetch::cmd_pull(Path::new(r), refspec, &flags),
-        ["push", r, i] => fetch::cmd_push(Path::new(r), i, &flags),
         ["cbor", "encode", f] => cmd_cbor("encode", Path::new(f), &flags),
         ["cbor", "decode", f] => cmd_cbor("decode", Path::new(f), &flags),
         ["cbor", "check", f] => cmd_cbor("check", Path::new(f), &flags),

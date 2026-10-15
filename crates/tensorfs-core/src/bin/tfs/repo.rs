@@ -6,16 +6,13 @@ use std::process::ExitCode;
 use tensorfs_core::canon::Value;
 use tensorfs_core::catalog::WriterGuard;
 use tensorfs_core::err::{Code, Refusal};
-use tensorfs_core::gc;
 use tensorfs_core::header::{Body, Header};
 use tensorfs_core::ids::{Doc, ObjectRef};
 use tensorfs_core::manifest::Manifest;
-use tensorfs_core::reclaim;
 use tensorfs_core::repository::{self, Mutation, Repository};
 use tensorfs_core::storage::{
     self, Census, CheckpointFacts as CensusCheckpointFacts, InventoryEntry, StagedCheckpoint,
 };
-use tensorfs_core::store::Store;
 
 use crate::{bail, flag, Flags};
 
@@ -573,170 +570,6 @@ pub fn cmd_rebuild(census: &Path, flags: &Flags) -> ExitCode {
         projection.releases.len(),
         projection.objects.len()
     );
-    ExitCode::SUCCESS
-}
-
-// ---------------------------------------------------------------- reclamation (tfs-065)
-//
-// `gc` collects what nothing names; `reclaim` chooses what to stop naming. Two acts, two
-// names — and this half only ever produces a document.
-
-/// The holds a plan must respect: the same ones `tfs gc` computes, so a reclaim estimate
-/// can never promise bytes an open ingest session is standing on.
-fn reclaim_holds(store: &Store) -> Result<Vec<storage::HeldKey>, Refusal> {
-    gc::session_holds(store).map(|(holds, _)| holds)
-}
-
-/// Read a `{"name":..,"org":..}` JSONL list of repositories. The same shape `tfs repo
-/// list --rows` emits, so a caller filters that output rather than inventing a format.
-fn read_repo_list(path: &str) -> Result<Vec<repository::RepositoryName>, Refusal> {
-    let bytes = fs::read(Path::new(path)).map_err(|error| Refusal {
-        code: Code::IO_FAILED,
-        detail: format!("read {path}: {error}"),
-    })?;
-    let mut names = Vec::new();
-    for line in bytes.split(|byte| *byte == b'\n') {
-        if line.is_empty() {
-            continue;
-        }
-        let value = tensorfs_core::canon::parse_canonical(line, 16 * 1024)?;
-        let mut fields = tensorfs_core::canon::Fields::new("RepositoryRow", &value)?;
-        let name = fields.req_str("name")?.to_string();
-        let org = fields.req_str("org")?.to_string();
-        names.push(repository::RepositoryName::new(org, name)?);
-    }
-    Ok(names)
-}
-
-pub fn cmd_reclaim_usage(root: &Path, flags: &Flags) -> ExitCode {
-    let Some(rows) = flag(flags, "rows") else {
-        eprintln!("--rows <jsonl> is required");
-        return ExitCode::from(2);
-    };
-    let mut keep = Vec::new();
-    let mut candidates = Vec::new();
-    for (list, into) in [("keep", &mut keep), ("candidates", &mut candidates)] {
-        if let Some(path) = flag(flags, list) {
-            match read_repo_list(path) {
-                Ok(names) => *into = names,
-                Err(error) => return bail(error),
-            }
-        }
-    }
-    let store = ok!(Store::open(root));
-    let usage = match reclaim_holds(&store)
-        .and_then(|holds| reclaim::usage(&store, &keep, &candidates, &holds))
-    {
-        Ok(usage) => usage,
-        Err(error) => return bail(error),
-    };
-    if let Err(error) = storage::write_json_lines(Path::new(rows), &usage.json_lines()) {
-        return bail(error);
-    }
-    // Both per-root numbers, always. `bytes_closure` alone reads as "what this model costs"
-    // and is the figure that picks the wrong victim; `bytes_marginal` alone hides that
-    // dropping two roots together frees what neither frees apart — which is why the set
-    // total is printed beside them rather than left to be summed.
-    for root in &usage.roots {
-        println!(
-            "{}/{}  closure {} B  marginal {} B",
-            root.org, root.name, root.bytes_closure, root.bytes_solo
-        );
-    }
-    println!(
-        "all {} candidate(s) together free {} B ({} B already unreferenced); holding {} B \
-         of a {} B budget, {} B of headroom",
-        usage.roots.len(),
-        usage.bytes_total,
-        usage.bytes_unreferenced,
-        usage.occupancy_bytes,
-        usage.budget_bytes,
-        usage.headroom_bytes,
-    );
-    ExitCode::SUCCESS
-}
-
-pub fn cmd_reclaim_plan(root: &Path, flags: &Flags) -> ExitCode {
-    let Some(need) = flag(flags, "need") else {
-        eprintln!("--need <bytes> is required");
-        return ExitCode::from(2);
-    };
-    let Ok(need) = need.parse::<u64>() else {
-        eprintln!("--need takes a byte count, not {need:?}");
-        return ExitCode::from(2);
-    };
-    let mut keep = Vec::new();
-    for (name, value) in flags {
-        if name != "keep" {
-            continue;
-        }
-        let Some((org, repo)) = value.split_once('/') else {
-            eprintln!("--keep takes <org>/<name>, not {value:?}");
-            return ExitCode::from(2);
-        };
-        match repository::RepositoryName::new(org, repo) {
-            Ok(value) => keep.push(value),
-            Err(error) => return bail(error),
-        }
-    }
-    let store = ok!(Store::open(root));
-    let plan =
-        ok!(reclaim_holds(&store).and_then(|holds| reclaim::plan(&store, need, &keep, &holds)));
-    if let Some(output) = flag(flags, "out") {
-        if let Err(error) = fs::write(Path::new(output), plan.json()) {
-            return bail(Refusal {
-                code: Code::IO_FAILED,
-                detail: format!("write {output}: {error}"),
-            });
-        }
-    }
-    if crate::flag_on(flags, "json") {
-        println!("{}", String::from_utf8_lossy(&plan.json()));
-    } else {
-        println!("{}", plan.line());
-        for victim in &plan.victims {
-            println!(
-                "  drop {}/{}  frees {} B (closure {} B)  cumulative {} B",
-                victim.org,
-                victim.name,
-                victim.marginal_bytes,
-                victim.bytes_closure,
-                victim.cumulative_bytes
-            );
-        }
-    }
-    ExitCode::SUCCESS
-}
-
-pub fn cmd_reclaim_run(root: &Path, flags: &Flags) -> ExitCode {
-    let Some(plan) = flag(flags, "plan") else {
-        eprintln!("--plan <plan.json> is required");
-        return ExitCode::from(2);
-    };
-    let document = match fs::read(Path::new(plan)) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            return bail(Refusal {
-                code: Code::IO_FAILED,
-                detail: format!("read {plan}: {error}"),
-            })
-        }
-    };
-    let drop = ok!(reclaim::victims_of(&document));
-    let options = reclaim::RunOptions {
-        demote: crate::flag_on(flags, "demote"),
-        assume_upstream: crate::flag_on(flags, "assume-upstream"),
-    };
-    let store = ok!(Store::open(root));
-    let report = ok!(reclaim::run(&store, &drop, options));
-    if crate::flag_on(flags, "json") {
-        println!("{}", String::from_utf8_lossy(&report.json()));
-    } else {
-        println!("{}", report.line());
-        for dropped in &report.roots_dropped {
-            println!("  dropped {dropped}");
-        }
-    }
     ExitCode::SUCCESS
 }
 

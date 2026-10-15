@@ -245,10 +245,7 @@ fn external_collection_cannot_unlink_an_owners_live_read_pin() {
     let scratch = Scratch::new();
     let root = scratch.store();
     let owner = Process::start(&root, "owned");
-    let shared = Store::open(&root)
-        .unwrap()
-        .bind_disk_budget(Some(1 << 20))
-        .unwrap();
+    let shared = Store::open(&root).unwrap();
     let object = ObjectRef::of(b"external reader");
     let path = shared.object_path(&object.sha256);
     assert!(path.is_file());
@@ -260,23 +257,6 @@ fn external_collection_cannot_unlink_an_owners_live_read_pin() {
         tensorfs_core::catalog::WriterGuard::lock_rebuild(&root)
             .unwrap_err()
             .code,
-        Code::STORE_BUSY
-    );
-    let absent = tensorfs_core::repository::RepositoryName {
-        org: "local".into(),
-        name: "absent".into(),
-    };
-    assert_eq!(
-        tensorfs_core::reclaim::run(
-            &shared,
-            &[absent],
-            tensorfs_core::reclaim::RunOptions {
-                assume_upstream: true,
-                ..Default::default()
-            },
-        )
-        .unwrap_err()
-        .code,
         Code::STORE_BUSY
     );
     assert!(path.is_file());
