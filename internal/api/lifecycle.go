@@ -172,14 +172,14 @@ func (s *Server) StopUnlessManaging(managing func() ([]string, *exit.Error)) ([]
 }
 
 // inFlight is the work a plain down leaves running: runs, acquisitions, installations
-// and exports, but not idle rentals or retained work at rest. A run's own export is the
+// and exports, but not idle rentals. A run's own export is the
 // run. It is a report; a census that cannot be read stops nothing.
 func (s *Server) inFlight() []LifecycleIdentity {
 	obligations, _ := s.store.Obligations() // kinds in order: a run precedes its export
 	var out []LifecycleIdentity
 	listed := map[string]bool{}
 	for _, o := range obligations {
-		if o.Kind == "attempt" || o.Kind == "rental" || listed[o.ID] || o.AtRest() {
+		if o.Kind == "attempt" || o.Kind == "rental" || listed[o.ID] {
 			continue
 		}
 		listed[o.ID] = true

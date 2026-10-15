@@ -15,7 +15,7 @@ import (
 // retainedAssetRef is an existing content reference; a bare JSON string is a local filename.
 const retainedAssetRef = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
 
-const declaredAssetsInterface = `{"application":"assets:app","format":"cozy.package.interface/1","jobs":[],"entrypoints":[{"name":"run","assets":{"parameter":"assets","kinds":[{"kind":"image","max_bytes":1024,"max_decoded_bytes":4096,"media_types":["image/png"]}]},"request":{"fields":[{"name":"prompt","type":"str"},{"name":"assets","constraints":{"min_length":1,"max_length":3},"type":{"list":{"fields":[{"name":"asset","type":{"asset":"file"}},{"name":"label","type":"str","wire":"optional"},{"name":"fidelity","type":{"literal":["auto","high","low","medium"]},"wire":"optional"}]}}},{"name":"poster","type":{"asset":"image"},"asset_bound":{"max_bytes":1024,"media_types":["image/png"]},"wire":"optional"}]},"result":{"fields":[]}}]}`
+const declaredAssetsInterface = `{"application":"assets:app","format":"cozy.package.interface/1","entrypoints":[{"name":"run","assets":{"parameter":"assets","kinds":[{"kind":"image","max_bytes":1024,"max_decoded_bytes":4096,"media_types":["image/png"]}]},"request":{"fields":[{"name":"prompt","type":"str"},{"name":"assets","constraints":{"min_length":1,"max_length":3},"type":{"list":{"fields":[{"name":"asset","type":{"asset":"file"}},{"name":"label","type":"str","wire":"optional"},{"name":"fidelity","type":{"literal":["auto","high","low","medium"]},"wire":"optional"}]}}},{"name":"poster","type":{"asset":"image"},"asset_bound":{"max_bytes":1024,"media_types":["image/png"]},"wire":"optional"}]},"result":{"fields":[]}}]}`
 
 func assetsCallable(t *testing.T) *launch.Entrypoint {
 	t.Helper()

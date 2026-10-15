@@ -23,7 +23,6 @@ import (
 //	never sent, or sent and unconfirmed   back in the outbox and placed again, same identity
 //	selected with --rental                settled with the lost rental's cause; it may not move
 //	confirmed                             failed with the machine's loss, saying so
-//	private transaction                   fails as retained work; its bytes died with the pod
 //	succeeded                             keeps its success: a real outcome is never overwritten
 //
 // A rental that is only unreachable (degraded) proves nothing: its unconfirmed run waits on it.
@@ -60,15 +59,14 @@ func TestARentalsFailureRecoversItsRuns(t *testing.T) {
 			ReadyAt: time.Now().Add(-time.Hour).UTC().Format(time.RFC3339Nano)}))
 	}
 	type arm struct {
-		kind, selected, rental        string
-		sent, accepted, retained, won bool
+		selected, rental    string
+		sent, accepted, won bool
 	}
 	arms := map[string]arm{
 		"req-lost-queued-a": {}, "req-lost-queued-b": {},
 		"req-lost-selected":  {selected: "rental-lost"},
 		"req-lost-sent":      {sent: true},
 		"req-lost-running":   {sent: true, accepted: true},
-		"job-lost-retained":  {kind: "job", sent: true, accepted: true, retained: true},
 		"req-lost-succeeded": {sent: true, accepted: true, won: true},
 		"req-unreachable":    {sent: true, rental: "rental-unreachable"},
 	}
@@ -79,8 +77,8 @@ func TestARentalsFailureRecoversItsRuns(t *testing.T) {
 		}
 		body, _ := canonical.Spell(canonical.Digest([]byte(id)))
 		_, _, problem := store.Submit(records.Request{ID: id, IdemKey: "idem-" + id, BodyDigest: body, Package: "fake/lost",
-			Release: "1", Entrypoint: "generate", Kind: arm.kind, Payload: []byte("{}"), Rental: true, Worker: arm.rental,
-			RequestedRental: arm.selected, RetainWork: arm.retained, MachineExecutionObserver: true})
+			Release: "1", Entrypoint: "generate", Payload: []byte("{}"), Rental: true, Worker: arm.rental,
+			RequestedRental: arm.selected, MachineExecutionObserver: true})
 		fatal(t, problem)
 		fatal(t, store.LinkMachineExecution(id, arm.rental))
 		if arm.sent {
@@ -136,7 +134,7 @@ func TestARentalsFailureRecoversItsRuns(t *testing.T) {
 		fatal(t, problem)
 		owed, problem := store.MachineExecutionOwesWork(id)
 		fatal(t, problem)
-		errType, _, errText, problem := store.SettledFailure(id)
+		errType, _, _, problem := store.SettledFailure(id)
 		fatal(t, problem)
 		events, problem := store.EventsAfter(id, 0, 100)
 		fatal(t, problem)
@@ -149,7 +147,7 @@ func TestARentalsFailureRecoversItsRuns(t *testing.T) {
 			if settled(row.State) || link.MachineID != "rental-unreachable" || said["request.queued"] != nil || !owed {
 				t.Fatalf("%s left a machine that is only unreachable: %+v link=%q events=%v", id, row, link.MachineID, said)
 			}
-		case !arm.accepted && arm.selected == "" && !arm.retained:
+		case !arm.accepted && arm.selected == "":
 			queued := said["request.queued"]
 			if settled(row.State) || link.MachineID != "" || row.Worker != "" || row.Machine != "nitian" ||
 				queued["machine_id"] != "rental-lost" || !strings.Contains(fmt.Sprint(queued["reason"]), "readiness.receipt_conflict") {
@@ -163,10 +161,6 @@ func TestARentalsFailureRecoversItsRuns(t *testing.T) {
 		case arm.won:
 			if row.State != "succeeded" {
 				t.Fatalf("%s: its machine's failure overwrote a real success: %+v", id, row)
-			}
-		case arm.retained:
-			if row.State != "failed" || row.RetainWork || errType != "request.state_lost" || errText != records.LostRetainedWorkMessage || owed {
-				t.Fatalf("%s: retained work did not fail as lost: %+v %s %s owed=%v", id, row, errType, errText, owed)
 			}
 		default:
 			lost := said["client.machine_lost"]

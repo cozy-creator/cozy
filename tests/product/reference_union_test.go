@@ -82,7 +82,7 @@ func TestH3ReferenceImageUsesPublishedTaggedUnion(t *testing.T) {
 }
 
 func TestTaggedUnionKeepsLiteralAndOrdinaryUnionValidation(t *testing.T) {
-	raw := []byte(`{"application":"proof:app","entrypoints":[{"name":"run","request":{"fields":[{"name":"item","type":{"tag_field":"kind","union":[{"tag":1,"fields":[{"name":"value","type":"int"}]},{"tag":2,"fields":[{"name":"value","type":"str"}]}]}},{"name":"optional","type":{"union":["null","int"]}}]},"result":{"fields":[]}}],"format":"cozy.package.interface/1","jobs":[]}`)
+	raw := []byte(`{"application":"proof:app","entrypoints":[{"name":"run","request":{"fields":[{"name":"item","type":{"tag_field":"kind","union":[{"tag":1,"fields":[{"name":"value","type":"int"}]},{"tag":2,"fields":[{"name":"value","type":"str"}]}]}},{"name":"optional","type":{"union":["null","int"]}}]},"result":{"fields":[]}}],"format":"cozy.package.interface/1"}`)
 	iface, problem := launch.DecodePackageInterface(raw)
 	fatal(t, problem)
 	ep, problem := iface.Function("run")
@@ -98,7 +98,7 @@ func TestTaggedUnionKeepsLiteralAndOrdinaryUnionValidation(t *testing.T) {
 }
 
 func TestUntaggedStructDropsAnEmptyFieldName(t *testing.T) {
-	raw := []byte(`{"application":"proof:app","entrypoints":[{"name":"run","request":{"fields":[{"name":"item","type":{"fields":[{"name":"value","type":"int"}]}}]},"result":{"fields":[]}}],"format":"cozy.package.interface/1","jobs":[]}`)
+	raw := []byte(`{"application":"proof:app","entrypoints":[{"name":"run","request":{"fields":[{"name":"item","type":{"fields":[{"name":"value","type":"int"}]}}]},"result":{"fields":[]}}],"format":"cozy.package.interface/1"}`)
 	iface, problem := launch.DecodePackageInterface(raw)
 	fatal(t, problem)
 	ep, problem := iface.Function("run")

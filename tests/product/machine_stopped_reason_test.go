@@ -9,10 +9,10 @@ import (
 	v1 "github.com/cozy-creator/cozy/protocol/cozy/machine/v1"
 )
 
-// A run whose machine stopped mid-run says so plainly, says it was not retried, and names how
-// to run it again: in `run list` and in `run watch`, whether its machine sent the reason's code
-// or (before tensord 0.1.1) only its internal words.
-func TestARunWhoseMachineStoppedSaysSoAndHowToRunItAgain(t *testing.T) {
+// A run whose machine stopped mid-run says so plainly and says it was not retried: in `run list`
+// and in `run watch`, whether its machine sent the reason's code or (before tensord 0.1.1) only
+// its internal words.
+func TestARunWhoseMachineStoppedSaysSoPlainly(t *testing.T) {
 	for name, reason := range map[string]*v1.Reason{
 		"coded":  {Code: records.MachineStopped, Message: "machine_stopped: the machine running this run stopped mid-run", Origin: "machine"},
 		"legacy": {Code: "failed", Message: "owner lost before durable result custody; exact executor birth has ended; started work will not be replayed", Origin: "machine"},
@@ -51,12 +51,10 @@ func TestARunWhoseMachineStoppedSaysSoAndHowToRunItAgain(t *testing.T) {
 					Code    string `json:"code"`
 					Message string `json:"message"`
 				} `json:"error"`
-				Next []string `json:"next"`
 			}
 			if code == 0 || json.Unmarshal([]byte(out), &watched) != nil || watched.Error.Code != records.MachineStopped ||
-				!strings.Contains(watched.Error.Message, plain) || strings.Contains(watched.Error.Message, "custody") ||
-				len(watched.Next) == 0 || !strings.HasPrefix(watched.Next[0], "cozy run proof/example/generate --retry ") {
-				t.Fatalf("run watch does not say plainly what happened and how to run it again [%d]: %s", code, out)
+				!strings.Contains(watched.Error.Message, plain) || strings.Contains(watched.Error.Message, "custody") {
+				t.Fatalf("run watch does not say plainly what happened [%d]: %s", code, out)
 			}
 		})
 	}

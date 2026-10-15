@@ -97,8 +97,8 @@ func TestWorkflowMemoryIsMaximumCallableAndSumWithinCallable(t *testing.T) {
 		{Callable: "p/h3/ref2va", ComponentBytes: map[string]int64{"dit": 60 << 30}},
 		{Callable: "p/qwen/image", ComponentBytes: map[string]int64{"transformer": 30 << 30}},
 	}
-	models = append(models, records.ModelRef{ComponentBytes: map[string]int64{"derive_only_input": 200 << 30}})
-	got := records.Resident(models, "H100", true)
+	models = append(models, records.ModelRef{Weights: true, ComponentBytes: map[string]int64{"raw_input": 200 << 30}})
+	got := records.Resident(models, "H100")
 	if got.Bytes != 64<<30 {
 		t.Fatalf("CPU workflow child peak %d; want 64 GiB, not 154 GiB", got.Bytes)
 	}

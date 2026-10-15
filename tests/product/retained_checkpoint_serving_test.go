@@ -32,7 +32,7 @@ func TestRunServingAcceptsRetainedCheckpointWithoutRelease(t *testing.T) {
 	defer store.Close()
 	row, problem := store.RequestByIdempotencyKey("retained-serving")
 	fatal(t, problem)
-	if row == nil || row.IsJob() || len(row.Models) != 1 {
+	if row == nil || len(row.Models) != 1 {
 		t.Fatalf("candidate did not create one ordinary serving request: %+v", row)
 	}
 	model := row.Models[0]

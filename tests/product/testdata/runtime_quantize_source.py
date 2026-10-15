@@ -1,18 +1,19 @@
 """Native bytes and a fresh reader for the shared Runtime invocation contract."""
 import io
 import struct
+from typing import Any
+
 import msgspec
 import tensorfs
 from cozy_runtime.author import (
-    App, Context, ModelArtifact, WeightsOutput, WeightsReader, invocable,
+    App, Context, ModelArtifact, Weights, WeightsOutput, invocable,
 )
 from tensorfs.derived import Derivation, Part, Target, Tensor
-from cozy_runtime.derive.operations import QuantizationSource
 
 app = App()
 PLAIN = dict(tensorfs.seed_digests())["plain/1"]
 
-@invocable(memoize=True)
+@invocable
 async def produce(ctx: Context) -> ModelArtifact:
     matrix = Tensor("f16", (16, 32), PLAIN,
                            {"value": Part("f16", (16, 32))})
@@ -31,18 +32,16 @@ async def produce(ctx: Context) -> ModelArtifact:
 class Checked(msgspec.Struct):
     nonzero: bool
 
-@invocable(memoize=False)
-async def inspect(ctx: Context, *, original: QuantizationSource,
-                  candidate: QuantizationSource, reader: WeightsReader) -> Checked:
-    with reader.open(original) as source, reader.open(candidate) as result:
-        tensor = result.tensor("body", "layer.weight")
-        assert tensor.logical_dtype == "f16"
-        assert set(tensor.parts) == {"data", "scale"}
-        assert source.identity("body", "layer.bias") == result.identity("body", "layer.bias")
-        payload = bytearray(512)
-        result.read_part_into("body", "layer.weight", "data", 0, payload)
-        assert any(payload)
-        return Checked(True)
+@invocable
+async def inspect(ctx: Context, *, original: Weights[Any], candidate: Weights[Any]) -> Checked:
+    tensor = candidate.tensor("body", "layer.weight")
+    assert tensor.logical_dtype == "f16"
+    assert set(tensor.parts) == {"data", "scale"}
+    assert original.identity("body", "layer.bias") == candidate.identity("body", "layer.bias")
+    payload = bytearray(512)
+    candidate.read_into("body", "layer.weight", "data", 0, payload)
+    assert any(payload)
+    return Checked(True)
 
-app.job(produce, weights=(WeightsOutput("model", max_new_bytes=65536),), accelerator=False)
-app.job(inspect, accelerator=False)
+app.entrypoint(produce, weights=(WeightsOutput("model", max_new_bytes=65536),), accelerator=False)
+app.entrypoint(inspect, accelerator=False)

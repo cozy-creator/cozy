@@ -2,21 +2,18 @@ import io
 import struct
 
 import tensorfs
+from typing import Any
+
 from cozy_runtime.author import (
-    App, Context, Loader, Model, ModelArtifact, WeightsOutput, invocable,
+    App, Context, ModelArtifact, Weights, WeightsOutput, invocable,
 )
 from tensorfs.derived import Derivation, Part, Target, Tensor
 
 PLAIN = next(digest for alias, digest in tensorfs.seed_digests() if alias == "plain/1")
 
 
-class Source(Model[object]):
-    def load(self, loader: Loader) -> None:
-        raise AssertionError("derive-only input must not load")
-
-
-@invocable(memoize=True)
-async def compute(ctx: Context, *, source: Source, factor: int) -> ModelArtifact:
+@invocable
+async def compute(ctx: Context, *, source: Weights[Any], factor: int) -> ModelArtifact:
     if factor == 0:
         raise ValueError("candidate quality gate failed")
     tensor = Tensor(
@@ -39,4 +36,4 @@ async def compute(ctx: Context, *, source: Source, factor: int) -> ModelArtifact
 
 
 app = App()
-app.job(compute, weights=(WeightsOutput("weights", max_new_bytes=4096),), accelerator=False)
+app.entrypoint(compute, weights=(WeightsOutput("weights", max_new_bytes=4096),), accelerator=False)

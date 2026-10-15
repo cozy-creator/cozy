@@ -26,26 +26,16 @@ func TestResultCollectionsRequireFixedNativeOutputPaths(t *testing.T) {
 		{"fixed-struct", `{"fields":[{"name":"file","type":{"asset":"file"}},{"name":"tree","type":{"input":"tree"}},{"name":"scores","type":{"list":"float"}}]}`, ""},
 	} {
 		t.Run(arm.name, func(t *testing.T) {
-			for _, kind := range []string{"jobs", "entrypoints"} {
-				other := "entrypoints"
-				if kind == "entrypoints" {
-					other = "jobs"
-				}
-				jobFields := `,"publishes":false,"weights_outputs":[]`
-				if kind == "entrypoints" {
-					jobFields = ""
-				}
-				body := fmt.Sprintf(`{"format":"cozy.package.interface/1","application":"control:app","%s":[],"%s":[{"name":"main","models":[],"request":{"fields":[{"name":"inputs","type":{"list":{"asset":"file"}}}]},"result":{"fields":[{"name":"value","type":%s}]}%s}]}`, other, kind, arm.result, jobFields)
-				_, problem := callableOf(t, []byte(body), "main")
-				if arm.refusedPath == "" {
-					fatal(t, problem)
-					continue
-				}
-				if problem == nil || problem.ErrName() != "output_collection_unsupported" ||
-					!strings.Contains(problem.Error(), "result "+arm.refusedPath+" contains") ||
-					!strings.Contains(problem.Remedy, "Tree") {
-					t.Fatalf("%s result collection did not refuse with a path/remedy: %v", kind, problem)
-				}
+			body := fmt.Sprintf(`{"format":"cozy.package.interface/1","application":"control:app","entrypoints":[{"name":"main","models":[],"request":{"fields":[{"name":"inputs","type":{"list":{"asset":"file"}}}]},"result":{"fields":[{"name":"value","type":%s}]},"publishes":false}]}`, arm.result)
+			_, problem := callableOf(t, []byte(body), "main")
+			if arm.refusedPath == "" {
+				fatal(t, problem)
+				return
+			}
+			if problem == nil || problem.ErrName() != "output_collection_unsupported" ||
+				!strings.Contains(problem.Error(), "result "+arm.refusedPath+" contains") ||
+				!strings.Contains(problem.Remedy, "Tree") {
+				t.Fatalf("result collection did not refuse with a path/remedy: %v", problem)
 			}
 		})
 	}

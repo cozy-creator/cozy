@@ -14,7 +14,7 @@ func TestCapturedSourceDescribesItsVerifiedInstalledInterface(t *testing.T) {
 	installed := filepath.Join(root, "install")
 	source := filepath.Join(installed, "source")
 	must(t, os.MkdirAll(source, 0700))
-	raw := []byte(`{"format":"cozy.package.interface/1","application":"missing_module:app","entrypoints":[],"jobs":[{"accelerator":false,"name":"main","models":[],"request":{"fields":[]},"result":{"fields":[]},"publishes":false}]}`)
+	raw := []byte(`{"format":"cozy.package.interface/1","application":"missing_module:app","entrypoints":[{"accelerator":false,"name":"main","models":[],"request":{"fields":[]},"result":{"fields":[]},"publishes":false}]}`)
 	iface, problem := launch.DecodePackageInterface(raw)
 	fatal(t, problem)
 	if len(iface.Raw) == 0 {
@@ -29,12 +29,12 @@ func TestCapturedSourceDescribesItsVerifiedInstalledInterface(t *testing.T) {
 	if facts.RuntimeCLI.PackageInterface != path {
 		t.Fatal("immutable capture was treated as live editable source")
 	}
-	// Neither source code nor an environment Python exists. The actual Runtime
-	// derives the descriptor from the verified installed interface, without import.
-	job, problem := facts.Job("main")
+	// Neither source code nor an environment Python exists: the descriptor is derived from
+	// the verified installed interface, without import.
+	main, problem := facts.PackageInterface.Function("main")
 	fatal(t, problem)
-	if job.DescriptorID == "" {
-		t.Fatal("Runtime returned no descriptor")
+	if main.DescriptorID == "" || main.NeedsAccelerator() {
+		t.Fatalf("the installed interface lost its descriptor or machine class: %+v", main)
 	}
 	mutable := record
 	mutable.SourceRef = filepath.Join(root, "author-checkout")

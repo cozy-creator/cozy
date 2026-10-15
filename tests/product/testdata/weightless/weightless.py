@@ -1,9 +1,8 @@
 """cl-013's acceptance package: a REAL invoke with no model, no weights, no GPU.
 
-`gpu` DERIVES from the signature (cozy-runtime `_describe.py`): a handler with no `Model`
-parameter is a CPU handler, so the orchestrator grants it no device and this package runs
-on any machine — including a Windows runner, which is the whole point of the launch tier's
-Windows slice. Its release depends on `cozy-runtime[media]` only (msgspec, protobuf,
+Every function declares `accelerator=False`: it never opens CUDA, so the machine grants it
+no device and this package runs on any machine — including a Windows runner, which is the
+whole point of the launch tier's Windows slice. Its release depends on `cozy-runtime[media]` only (msgspec, protobuf,
 grpcio and the exact PyAV wheel — no torch, CUDA or tensorfs), so a clean machine can
 install it over a residential line in seconds. PyAV exists solely for the `relay` fixture.
 
@@ -70,7 +69,7 @@ class EchoOutput(msgspec.Struct):
     text: str
 
 
-@app.entrypoint
+@app.entrypoint(accelerator=False)
 def echo(payload: RefuseInput) -> EchoOutput:
     """Scalar-only result: no file output or output directory."""
     return EchoOutput(payload.why)
@@ -84,7 +83,7 @@ class LabelsInput(msgspec.Struct, forbid_unknown_fields=True):
     labels: list[Label]
 
 
-@app.entrypoint
+@app.entrypoint(accelerator=False)
 def labels(payload: LabelsInput) -> EchoOutput:
     """A nested request: a list of structs."""
     return EchoOutput(",".join(label.text for label in payload.labels))
@@ -108,7 +107,7 @@ class RelayOutput(msgspec.Struct):
     image: Annotated[ImageAsset, AssetBound(media_types=("image/webp",))]
 
 
-@app.entrypoint
+@app.entrypoint(accelerator=False)
 def tile(ctx: Context, payload: TileInput, out: Outputs, tel: Telemetry) -> TileOutput:
     """A deterministic RGB tile from a linear congruential sequence — real computation
     whose output is a real WebP the runtime encodes, with nothing to load first."""
@@ -155,27 +154,27 @@ def tile(ctx: Context, payload: TileInput, out: Outputs, tel: Telemetry) -> Tile
     )
 
 
-@app.job(accelerator=False)
+@app.entrypoint(accelerator=False)
 def tile_job(payload: TileInput) -> TileJobOutput:
-    """Weightless remote-job fixture; its value proves frozen local revision replay."""
+    """Weightless CPU fixture; its value proves frozen local revision replay."""
     return TileJobOutput(size=payload.size, seed=payload.seed, revision=REVISION)
 
 
-@app.entrypoint
+@app.entrypoint(accelerator=False)
 def refuse(payload: RefuseInput) -> TileOutput:
     """The REFUSED terminal on the same weightless path, so the fixture observes both
     verdicts of the terminal transaction rather than only the happy one."""
     raise InvalidRequest(payload.why)
 
 
-@app.entrypoint
+@app.entrypoint(accelerator=False)
 def fail(payload: RefuseInput) -> TileOutput:
     """The FAILED terminal: an exception the handler never typed. Its traceback is what a
     triage bundle exists to carry off a dead pod (cl-101)."""
     raise RuntimeError(payload.why)
 
 
-@app.entrypoint
+@app.entrypoint(accelerator=False)
 def relay(
     payload: RelayInput, ctx: Context, decoder: MediaDecoder, out: Outputs, tel: Telemetry
 ) -> RelayOutput:
@@ -198,7 +197,7 @@ def relay(
     )
 
 
-@app.entrypoint
+@app.entrypoint(accelerator=False)
 def video_transport(payload: VideoTransportInput) -> VideoTransportOutput:
     """A package-descriptor-only seam for the remote byte-plane product proof.
 

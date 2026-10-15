@@ -117,7 +117,7 @@ func seedProbe(t *testing.T, h *machineHub, root string, venues ...string) map[s
 }
 
 // probeModel answers proof/probe's model card and its bf16 lane's manifest, as the CLI reads
-// them to bind each rung of a ladder to its exact checkpoint and size the job (th-241). It
+// them to bind each rung of a ladder to its exact checkpoint and size the run (th-241). It
 // answers false for any other request.
 func probeModel(t *testing.T, resolved map[string]any) func(http.ResponseWriter, *http.Request) bool {
 	t.Helper()
@@ -139,8 +139,8 @@ func probeModel(t *testing.T, resolved map[string]any) func(http.ResponseWriter,
 	}
 }
 
-// probeProject is the parity package with a CPU job reading one Model slot by its authored
-// default lane: a derive-only Manifest capability, so the job never loads it.
+// probeProject is the parity package with a CPU function taking one Weights[M] argument by its
+// authored default lane: the raw checkpoint, never constructed, so the function never loads it.
 func probeProject(t *testing.T, lane string) string {
 	t.Helper()
 	return probeProjectOn(t, machines.Source{RuntimeWheel: *machineRuntimeWheel, TensorFSWheel: *machineTensorFSWheel}, lane)
@@ -151,7 +151,7 @@ func probeProjectOn(t *testing.T, source machines.Source, lane string) string {
 	t.Helper()
 	project := parityProjectOn(t, source)
 	must(t, os.WriteFile(filepath.Join(project, "machine_parity.py"), []byte(`import msgspec
-from cozy_runtime.author import App, Loader, Model
+from cozy_runtime.author import App, Loader, Model, Weights
 
 
 class Nothing:
@@ -160,7 +160,7 @@ class Nothing:
 
 class Probe(Model[Nothing]):
     def load(self, loader: Loader) -> None:
-        raise RuntimeError("a job never loads its Model")
+        raise RuntimeError("a Weights argument is never constructed")
 
 
 class TouchRequest(msgspec.Struct, forbid_unknown_fields=True):
@@ -174,8 +174,8 @@ class TouchResult(msgspec.Struct):
 app = App()
 
 
-@app.job(defaults={"source": [{"gpu": "*", "lane": "`+lane+`"}]}, accelerator=False)
-def touch(payload: TouchRequest, source: Probe) -> TouchResult:
+@app.entrypoint(defaults={"source": [{"gpu": "*", "lane": "`+lane+`"}]}, accelerator=False)
+def touch(payload: TouchRequest, source: Weights[Probe]) -> TouchResult:
     return TouchResult(value=payload.value + 1)
 `), 0o600))
 	return project

@@ -96,7 +96,7 @@ func TestShellCompletion(t *testing.T) {
 
 func seedCompletionRoot(t *testing.T, root string) {
 	t.Helper()
-	iface := []byte(`{"application":"q:app","entrypoints":[],"format":"cozy.package.interface/1","jobs":[{"models":[],"name":"prepare","publishes":false,"request":{"fields":[]},"result":{"fields":[]},"weights_outputs":[]}]}`)
+	iface := []byte(`{"application":"q:app","entrypoints":[{"models":[],"name":"prepare","publishes":false,"request":{"fields":[]},"result":{"fields":[]},"weights_outputs":[]}],"format":"cozy.package.interface/1"}`)
 	parsed, problem := launch.DecodePackageInterface(iface)
 	fatal(t, problem)
 	if len(parsed.Raw) == 0 {

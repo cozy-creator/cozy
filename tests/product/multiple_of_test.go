@@ -10,7 +10,7 @@ import (
 )
 
 func multipleOfInterface(kind, multiple string) []byte {
-	return []byte(fmt.Sprintf(`{"format":"cozy.package.interface/1","application":"example:app","entrypoints":[{"name":"generate","models":[],"request":{"fields":[{"name":"value","type":%q,"constraints":{"multiple_of":%s}}]},"result":{"fields":[]}}],"jobs":[]}`, kind, multiple))
+	return []byte(fmt.Sprintf(`{"format":"cozy.package.interface/1","application":"example:app","entrypoints":[{"name":"generate","models":[],"request":{"fields":[{"name":"value","type":%q,"constraints":{"multiple_of":%s}}]},"result":{"fields":[]}}]}`, kind, multiple))
 }
 
 func TestMultipleOfInterfaceAndExactPayload(t *testing.T) {

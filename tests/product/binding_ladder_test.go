@@ -80,21 +80,17 @@ func newLadderHub(t *testing.T, authored ...[]launch.ModelDefaultRung) *ladderHu
 // newOrgLadderHub is the same stand-in for another account's h3 package and minimax model.
 func newOrgLadderHub(t *testing.T, org string, authored ...[]launch.ModelDefaultRung) *ladderHub {
 	t.Helper()
-	// `generate` is the serving entrypoint whose methods stage components. `lane` is the
-	// se-037 shape: a JOB whose model input is a derive-only source it reads the header of
-	// and inherits by reference — its class declares no component_use, and it writes one
-	// 64 KiB config per output.
-	iface := []byte(`{"application":"h3:app","entrypoints":[{"name":"generate","models":[{"class":"H3","component_use":{"condition_fl2va_media":["video_vae"],"condition_ref2va_media":["audio_vae","video_vae"],"condition_text":["text_encoder"],"decode_audio":["audio_vae"],"decode_video":["video_vae"],"sample_fl2va":["fl2va_dit"],"sample_ref2va":["ref2va_dit"]},"path":"generate.models.model"}],"request":{"fields":[{"name":"steps","type":"int"}]},"result":{"fields":[]}}],"format":"cozy.package.interface/1","jobs":[{"accelerator":true,"name":"lane","models":[{"class":"Source","component_use":{},"path":"lane.models.pruned"}],"publishes":false,"request":{"fields":[]},"result":{"fields":[]},"weights_outputs":[{"max_bytes":65536,"mime_type":"application/vnd.cozy.model-manifest","output_id":"attn8"}]}]}`)
+	// `generate` is the function whose methods stage components. `lane` is the se-037 shape:
+	// its model input is a `Weights` source it reads the header of and inherits by reference —
+	// it declares no component_use, and it writes one 64 KiB config per output.
+	iface := []byte(`{"application":"h3:app","entrypoints":[{"name":"generate","models":[{"class":"H3","component_use":{"condition_fl2va_media":["video_vae"],"condition_ref2va_media":["audio_vae","video_vae"],"condition_text":["text_encoder"],"decode_audio":["audio_vae"],"decode_video":["video_vae"],"sample_fl2va":["fl2va_dit"],"sample_ref2va":["ref2va_dit"]},"path":"generate.models.model"}],"request":{"fields":[{"name":"steps","type":"int"}]},"result":{"fields":[]}},{"name":"lane","models":[{"class":"Model","component_use":{},"path":"lane.models.pruned","weights":true}],"publishes":false,"request":{"fields":[]},"result":{"fields":[]},"weights_outputs":[{"max_bytes":65536,"mime_type":"application/vnd.cozy.model-manifest","output_id":"attn8"}]}],"format":"cozy.package.interface/1"}`)
 	if len(authored) > 0 {
 		var doc map[string]any
 		must(t, json.Unmarshal(iface, &doc))
-		for index, group := range []string{"entrypoints", "jobs"} {
-			if index >= len(authored) {
-				break
-			}
-			call := doc[group].([]any)[0].(map[string]any)
+		for index, authoredLadder := range authored {
+			call := doc["entrypoints"].([]any)[index].(map[string]any)
 			slot := call["models"].([]any)[0].(map[string]any)
-			slot["default_ladder"] = authored[index]
+			slot["default_ladder"] = authoredLadder
 		}
 		var err error
 		iface, err = json.Marshal(doc)
@@ -716,10 +712,10 @@ func candidateVerdicts(placement map[string]any) map[string]string {
 // tensors by reference and writes 550 bytes, but the sizer held the card to the
 // components a SERVING construction of that lane would stage. The 24 GB card was
 // excluded, two rtx-6000-ada pods sat in `acquiring` for 22 and 24 minutes, and ~32 s of
-// work cost 849 s of wall. cozy-runtime gives a job a derive-only view of the Manifest
-// and refuses load and component access on it, so a job's model is never on the device:
-// the cheap card is admissible and the record says `derive_only` rather than a figure.
-func TestAJobIsNotSizedByTheComponentsItNeverStages(t *testing.T) {
+// work cost 849 s of wall. A `Weights[M]` argument is read raw and never constructed, so
+// it is never on the device: the cheap card is admissible and the record says `weights`
+// rather than a figure.
+func TestAWeightsArgumentIsNotSizedByTheComponentsItNeverStages(t *testing.T) {
 	h := newLadderHub(t)
 	h.bind(goodLadder())
 	// The cheapest card is refused for stock, so the walk itself is the evidence: the
@@ -729,33 +725,33 @@ func TestAJobIsNotSizedByTheComponentsItNeverStages(t *testing.T) {
 	startCalciferProcess(t, root)
 	_, out := runCozy(t, root, "run", ladderPackage+"/lane",
 		"--model.pruned="+ladderModel+"@"+ladderRelease+"/"+ladderLane,
-		"--rental-only", "--json", "--idempotency-key", "job-derive-fit")
+		"--rental-only", "--json", "--idempotency-key", "weights-fit")
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()
-	queued, problem := store.RequestByIdempotencyKey("job-derive-fit")
+	queued, problem := store.RequestByIdempotencyKey("weights-fit")
 	fatal(t, problem)
-	if queued == nil || queued.Kind != "job" {
-		t.Fatalf("the by-reference job was not submitted: %s", out)
+	if queued == nil {
+		t.Fatalf("the by-reference call was not submitted: %s", out)
 	}
-	if len(queued.Models) != 1 || queued.Models[0].Manifest != fp8Manifest ||
+	if len(queued.Models) != 1 || queued.Models[0].Manifest != fp8Manifest || !queued.Models[0].Weights ||
 		queued.Models[0].ComponentBytes["text_encoder"] != textEncoderNeed {
-		t.Fatalf("the job did not carry the sized lane it reads: %+v", queued.Models)
+		t.Fatalf("the call did not carry the sized lane it reads as Weights: %+v", queued.Models)
 	}
 	waitFor(t, root, "the walk passing the cheapest card", func() bool { return len(h.postedSKUs()) >= 2 })
 	posted := h.postedSKUs()
 	if !strings.HasPrefix(posted[0], "rtx-4090/") || !strings.HasPrefix(posted[1], "rtx-5090/") {
-		t.Fatalf("paid asks %v; want the cheapest cards first for a job that stages nothing", posted)
+		t.Fatalf("paid asks %v; want the cheapest cards first for a call that stages nothing", posted)
 	}
 	log := tail(filepath.Join(root, "calcifer.log"))
-	for _, want := range []string{"renting rtx-4090", "(lane fp8-adaln-pruned, fit derive_only)",
+	for _, want := range []string{"renting rtx-4090", "(lane fp8-adaln-pruned, fit weights)",
 		"rtx-4090 has no inventory; choosing again without it", "renting rtx-5090"} {
 		if !strings.Contains(log, want) {
 			t.Fatalf("calcifer.log does not say %q:\n%s", want, log)
 		}
 	}
 	if strings.Contains(log, "vram_short") {
-		t.Fatalf("a job's derive-only model excluded a card for memory:\n%s", log)
+		t.Fatalf("a Weights argument excluded a card for memory:\n%s", log)
 	}
 }
 

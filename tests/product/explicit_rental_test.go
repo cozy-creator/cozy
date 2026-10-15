@@ -198,41 +198,9 @@ func TestAutomaticAndNamedRentalChoicesAllowPrivateSDKVersions(t *testing.T) {
 	}
 }
 
-func TestRequestedRentalFlowsToChildAndRetainedRetry(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "creator.sqlite")
-	st, problem := records.Open(path)
-	fatal(t, problem)
-	defer st.Close()
-	fatal(t, st.RecordRental(records.Rental{ID: "wanted", MachineName: "isao", AcceleratorModel: "CPU", AcceleratorCount: 1, HourlyRateUSDMicros: 100000, State: "ready"}))
-	parent, _, problem := st.Submit(records.Request{ID: "parent", IdemKey: "parent", BodyDigest: childDigest("a"), Package: "local/script", Entrypoint: "main", Payload: []byte("{}"), Rental: true, RentalRequired: true, Worker: "wanted", RequestedRental: "wanted"})
-	fatal(t, problem)
-	fatal(t, st.SpawnWorker(records.WorkerProcess{InstanceID: "private-worker", Package: "local/script", WorkerID: "worker", Devices: []string{"cpu"}}))
-	parent = offerChildParent(t, st, parent)
-	call := records.Request{ID: "child", IdemKey: "child", BodyDigest: childDigest("b"), Package: "local/op", Entrypoint: "run", Payload: []byte("{}"), ParentRequestID: parent.ID, ParentCallIndex: 0, ChildIntentDigest: childDigest("c"), ChildTargetDigest: childDigest("d")}
-	child, _, problem := st.SubmitChild(call, 1, childDigest("1"), "private-boot", nil)
-	fatal(t, problem)
-	if child.Worker != "wanted" || child.RequestedRental != "wanted" {
-		t.Fatalf("child escaped affinity: %+v", child)
-	}
-	_, problem = st.FailQueuedRequest(child.ID, retainedFailure("proof", "pause child"))
-	fatal(t, problem)
-	retried, _, problem := st.Submit(records.Request{ID: "retry", IdemKey: "retry", BodyDigest: childDigest("e"), Package: "local/op", Entrypoint: "run", Payload: []byte("{}")})
-	fatal(t, problem)
-	if retried.Worker != "wanted" || retried.RequestedRental != "wanted" {
-		t.Fatalf("retry escaped affinity: %+v", retried)
-	}
-	if changed, problem := st.UnpinRentalWork(retried.ID, "wanted"); problem != nil || changed {
-		t.Fatalf("retry became automatic: %v %v", changed, problem)
-	}
-	call.ID, call.IdemKey, call.ParentCallIndex, call.RequestedRental = "wrong-child", "wrong-child", 1, "other"
-	if _, _, problem := st.SubmitChild(call, 1, childDigest("1"), "private-boot", nil); problem == nil {
-		t.Fatal("child replaced parent affinity")
-	}
-}
-
 func TestRequestedRentalIsSubmissionIdentity(t *testing.T) {
 	o := hostOwner(t, "requested-rental-identity")
-	for _, kind := range []string{"serving", "job"} {
+	for _, kind := range []string{"serving"} {
 		sub := orchestrator.Submission{Kind: kind, Package: "proof/model", Entrypoint: "run", Payload: []byte("{}"), IdemKey: kind, Rental: true, RentalRequired: true, RequestedRental: "wanted"}
 		first, fresh, problem := o.c.RecordSubmission(sub)
 		fatal(t, problem)
@@ -252,7 +220,7 @@ func TestRequestedRentalIsSubmissionIdentity(t *testing.T) {
 }
 
 func TestNamedRentalReplayAfterEndUsesExistingCalciferRequest(t *testing.T) {
-	for _, kind := range []string{"serving", "job"} {
+	for _, kind := range []string{"serving"} {
 		t.Run(kind, func(t *testing.T) {
 			h := newLadderHub(t)
 			h.bind(goodLadder())

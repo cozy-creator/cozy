@@ -10,13 +10,14 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-// The H3 conversion agent, 2026-09-27: every job of a package whose closure names torch was
-// accelerator-class, so the pure-CPU conversions sdxl `prepare`/`fp8` and anima `fp8` read
-// excluded:wrong_class on the owner's CPU pod. A job's own `accelerator` declaration decides
-// its class. The package here names torch, binds its serving slot, and declares one CPU and
-// one GPU conversion of the same shape; each is sent to the owner's named CPU rental through
-// the real binary and Calcifer against the stand-in hub, which buys nothing.
-func TestDeclaredJobAcceleratorDecidesTheRentalClass(t *testing.T) {
+// The H3 conversion agent, 2026-09-27: every function of a package whose closure names torch
+// was accelerator-class, so the pure-CPU conversions sdxl `prepare`/`fp8` and anima `fp8` read
+// excluded:wrong_class on the owner's CPU pod. A function's own declaration decides its class:
+// `accelerator: false` is CPU, undeclared is the machine's GPU. The package here names torch,
+// binds its serving slot, and declares one CPU and one undeclared conversion of the same
+// shape; each is sent to the owner's named CPU rental through the real binary and Calcifer
+// against the stand-in hub, which buys nothing.
+func TestDeclaredAcceleratorDecidesTheRentalClass(t *testing.T) {
 	h := newLadderHub(t)
 	h.bind(goodLadder())
 	var doc map[string]any
@@ -24,15 +25,16 @@ func TestDeclaredJobAcceleratorDecidesTheRentalClass(t *testing.T) {
 	// As sdxl's `generate`: invocable, so a CPU workflow could call it and reserve its slot.
 	doc["entrypoints"].([]any)[0].(map[string]any)["invocable"] = map[string]any{"context": "ctx", "defaults": map[string]any{},
 		"enum_members": map[string]any{}, "export": "generate", "module": "h3", "parameters": []any{"steps"}, "type_names": map[string]any{}}
-	cpu := doc["jobs"].([]any)[0].(map[string]any)
+	cpu := doc["entrypoints"].([]any)[1].(map[string]any)
 	cpu["accelerator"] = false
 	gpu := map[string]any{}
 	for key, value := range cpu {
 		gpu[key] = value
 	}
-	gpu["name"], gpu["accelerator"] = "tables", true
-	gpu["models"] = []any{map[string]any{"class": "Source", "component_use": map[string]any{}, "path": "tables.models.pruned"}}
-	doc["jobs"] = append(doc["jobs"].([]any), gpu)
+	delete(gpu, "accelerator")
+	gpu["name"] = "tables"
+	gpu["models"] = []any{map[string]any{"class": "Model", "component_use": map[string]any{}, "path": "tables.models.pruned", "weights": true}}
+	doc["entrypoints"] = append(doc["entrypoints"].([]any), gpu)
 	iface, err := json.Marshal(doc)
 	must(t, err)
 	h.iface = iface
@@ -60,11 +62,11 @@ func TestDeclaredJobAcceleratorDecidesTheRentalClass(t *testing.T) {
 		return row
 	}
 
-	// A named rental is where each job goes; what the machine cannot run, it refuses. Each
-	// job's own declaration still decides its class.
+	// A named rental is where each call goes; what the machine cannot run, it refuses. Each
+	// function's own declaration still decides its class.
 	converted := run("lane", "declared-cpu")
 	tables := run("tables", "declared-gpu")
-	waitFor(t, root, "both jobs pinned to the named rental", func() bool {
+	waitFor(t, root, "both calls pinned to the named rental", func() bool {
 		converted, problem = store.RequestByIdempotencyKey("declared-cpu")
 		if problem != nil || converted == nil {
 			return false
@@ -73,10 +75,10 @@ func TestDeclaredJobAcceleratorDecidesTheRentalClass(t *testing.T) {
 		return problem == nil && tables != nil && converted.Worker != "" && tables.Worker != ""
 	})
 	if converted.NeedsAccelerator || converted.Worker != "pr-karam" {
-		t.Fatalf("the CPU-declared job went to %q (accelerator %v)", converted.Worker, converted.NeedsAccelerator)
+		t.Fatalf("the CPU-declared call went to %q (accelerator %v)", converted.Worker, converted.NeedsAccelerator)
 	}
 	if !tables.NeedsAccelerator || tables.Worker != "pr-karam" {
-		t.Fatalf("the GPU-declared job went to %q (accelerator %v)", tables.Worker, tables.NeedsAccelerator)
+		t.Fatalf("the undeclared call went to %q (accelerator %v)", tables.Worker, tables.NeedsAccelerator)
 	}
 	if asks := h.postedSKUs(); len(asks) != 0 {
 		t.Fatalf("a named rental bought %v", asks)

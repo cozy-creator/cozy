@@ -9,7 +9,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 )
 
-// Graft-only jobs write no new tensor payload. Their explicit zero budget must
+// Graft-only writers write no new tensor payload. Their explicit zero budget must
 // survive interface admission, while absent or malformed limits still refuse.
 func TestWeightsInterfaceAcceptsExplicitZeroNewBytes(t *testing.T) {
 	for _, arm := range []struct {
@@ -30,11 +30,11 @@ func TestWeightsInterfaceAcceptsExplicitZeroNewBytes(t *testing.T) {
 	} {
 		t.Run(arm.name, func(t *testing.T) {
 			row := fmt.Sprintf(`{"output_id":"model","mime_type":%q%s}`, orchestrator.WeightsManifestMime, arm.cap)
-			body := fmt.Sprintf(`{"format":"cozy.package.interface/1","application":"graft:app","entrypoints":[],"jobs":[{"name":"project","publishes":false,"request":{"fields":[]},"result":{"fields":[]},"weights_outputs":[%s]}]}`, row)
+			body := fmt.Sprintf(`{"format":"cozy.package.interface/1","application":"graft:app","entrypoints":[{"name":"project","publishes":false,"request":{"fields":[]},"result":{"fields":[]},"weights_outputs":[%s]}]}`, row)
 			parsed, problem := launch.DecodePackageInterface([]byte(body))
-			var job *launch.Entrypoint
+			var fn *launch.Entrypoint
 			if problem == nil {
-				job, problem = parsed.Function("project")
+				fn, problem = parsed.Function("project")
 			}
 			if (problem == nil) != arm.ok {
 				t.Fatalf("admission = %v, want accepted=%v", problem, arm.ok)
@@ -44,7 +44,7 @@ func TestWeightsInterfaceAcceptsExplicitZeroNewBytes(t *testing.T) {
 			}
 			var expected launch.WeightsOutput
 			must(t, json.Unmarshal([]byte(row), &expected))
-			if got := job.WeightsOutputs[0]; got != expected {
+			if got := fn.WeightsOutputs[0]; got != expected {
 				t.Fatalf("admission changed the output contract: %+v != %+v", got, expected)
 			}
 		})

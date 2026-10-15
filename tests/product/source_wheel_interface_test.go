@@ -65,7 +65,7 @@ func TestEmbeddedInterfacePreservesWheelTagsMembersAndExistingMetadata(t *testin
 	root := t.TempDir()
 	source := prebuiltProjectWheel(t, root, "cozy-weightless-package", "cp312-cp312-manylinux_2_28_x86_64", "weightless:app")
 	original := readInterfaceWheel(t, source)
-	document := []byte(`{"application":"weightless:app","entrypoints":[],"jobs":[],"future_field":true}`)
+	document := []byte(`{"application":"weightless:app","entrypoints":[],"future_field":true}`)
 	target := filepath.Join(root, "described", filepath.Base(source))
 	result, problem := wheel.EmbedInterface(source, target, document)
 	fatal(t, problem)

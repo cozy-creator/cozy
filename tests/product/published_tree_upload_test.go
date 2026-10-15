@@ -10,11 +10,11 @@ import (
 	"testing"
 )
 
-// A published job run on this computer with --upload-to takes its Tree input like every other
-// job: Calcifer captures the directory and the machine materializes it for the callable,
-// whether it is bound with --input-tree or --asset. The stand-in Hub serves no checkpoint
-// publication, so each run ends at its upload call, after the job ran against the tree.
-func TestAPublishedUploadJobStagesItsInputTree(t *testing.T) {
+// A published function run on this computer with --upload-to takes its Tree input like every
+// other call: Calcifer captures the directory bound with --asset and the machine materializes
+// it for the callable. The stand-in Hub serves no checkpoint publication, so each run ends at
+// its upload call, after the function ran against the tree.
+func TestAPublishedUploadCallStagesItsInputTree(t *testing.T) {
 	h, root, _, store := parityMachines(t)
 	h.hubAccess.signIn(t, root)
 	project := parityProject(t)
@@ -54,10 +54,10 @@ async def convert(ctx: Context, *, files: Tree) -> ModelArtifact:
     return ctx.adopt_model(receipt)
 
 
-app.job(convert, weights=(WeightsOutput("model", max_new_bytes=65536),), accelerator=False)
+app.entrypoint(convert, weights=(WeightsOutput("model", max_new_bytes=65536),), accelerator=False)
 `), 0o600))
 	if out, err := exec.Command("uv", "lock", "--project", project).CombinedOutput(); err != nil {
-		t.Fatalf("locking the tree job: %v\n%s", err, out)
+		t.Fatalf("locking the tree function: %v\n%s", err, out)
 	}
 	publishParityRelease(t, h, root, project)
 	if code, out := runCozy(t, root, "package", "install", parityPublished); code != 0 {
@@ -67,7 +67,7 @@ app.job(convert, weights=(WeightsOutput("model", max_new_bytes=65536),), acceler
 	must(t, os.MkdirAll(filepath.Join(data, "nested"), 0o755))
 	must(t, os.WriteFile(filepath.Join(data, "a.txt"), []byte("alpha"), 0o600))
 	must(t, os.WriteFile(filepath.Join(data, "nested", "b.bin"), []byte("\x00\x01beta"), 0o600))
-	for number, binding := range [][]string{{"files=data", "--input-tree", "data=" + data}, {"--asset", "files=" + data}} {
+	for number, binding := range [][]string{{"--asset", "files=" + data}} {
 		key := "tree-upload-" + strconv.Itoa(number)
 		args := append([]string{"run", parityPublished + "/convert", "--upload-to", "proof/model", "--await", "--json", "--idempotency-key", key}, binding...)
 		code, out := runCozy(t, root, args...)
@@ -90,7 +90,7 @@ app.job(convert, weights=(WeightsOutput("model", max_new_bytes=65536),), acceler
 	// A rental the fleet places takes the tree too: it is captured before any machine is chosen.
 	if code, out := runCozy(t, root, "run", parityPublished+"/convert", "--asset", "files="+data, "--upload-to", "proof/model",
 		"--rental-only", "--json", "--idempotency-key", "tree-fleet"); code != 0 {
-		t.Fatalf("a fleet-placed tree job was refused [exit %d]\n%s", code, out)
+		t.Fatalf("a fleet-placed tree call was refused [exit %d]\n%s", code, out)
 	}
 	request, problem := store.RequestByIdempotencyKey("tree-fleet")
 	fatal(t, problem)

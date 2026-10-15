@@ -10,7 +10,7 @@ from tensorfs.derived import Derivation, Part, Target, Tensor
 PLAIN = next(digest for alias, digest in tensorfs.seed_digests() if alias == "plain/1")
 
 
-@invocable(memoize=True)
+@invocable
 async def compute(ctx: Context, *, value: int) -> ModelArtifact:
     tensor = Tensor(
         logical_dtype="f32", shape=(512,), encoding=PLAIN,
@@ -27,4 +27,4 @@ async def compute(ctx: Context, *, value: int) -> ModelArtifact:
 
 
 app = App()
-app.job(compute, weights=(WeightsOutput("weights", max_new_bytes=4096),), accelerator=False)
+app.entrypoint(compute, weights=(WeightsOutput("weights", max_new_bytes=4096),), accelerator=False)

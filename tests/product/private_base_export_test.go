@@ -36,7 +36,7 @@ class Request(msgspec.Struct, forbid_unknown_fields=True):
 class Result(msgspec.Struct):
     value: int
 app = App()
-@app.job(accelerator=False)
+@app.entrypoint(accelerator=False)
 def run(ctx: Context, payload: Request) -> Result:
     return Result(payload.value)
 `), 0600))

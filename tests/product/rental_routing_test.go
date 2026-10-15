@@ -11,24 +11,23 @@ import (
 	"github.com/cozy-creator/cozy/internal/rental"
 )
 
-// A job's machine class is its declared accelerator, whatever its dependencies say; an
-// undeclared job wants a GPU.
-func TestPublishedJobRentalClass(t *testing.T) {
+// A function's machine class is its declared accelerator, whatever its dependencies say: CPU
+// only for `accelerator=False`; an undeclared function wants a GPU.
+func TestPublishedFunctionRentalClass(t *testing.T) {
 	skus := offeredSKUs()
 	torch := []string{"cozy-runtime<1.0.0,>=0.0.33", "msgspec>=0.19", "numpy>=1.26", "torch<3,>=2.13"}
-	cpu, gpu := false, true
+	cpu := false
 	for _, test := range []struct {
 		name        string
 		accelerator *bool
 		wantSKU     string
 	}{
 		{name: "a CPU conversion beside torch", accelerator: &cpu, wantSKU: "cpu"},
-		{name: "a GPU table producer", accelerator: &gpu, wantSKU: "rtx-4090"},
-		{name: "an undeclared job", wantSKU: "rtx-4090"},
+		{name: "an undeclared function", wantSKU: "rtx-4090"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			job := launch.Entrypoint{Name: "lane", Accelerator: test.accelerator}
-			sku, _, mismatch, ok := choose(skus, job.NeedsAccelerator(), rental.Constraints{Requirements: torch})
+			fn := launch.Entrypoint{Name: "lane", Accelerator: test.accelerator}
+			sku, _, mismatch, ok := choose(skus, fn.NeedsAccelerator(), rental.Constraints{Requirements: torch})
 			if !ok || sku.Name != test.wantSKU {
 				t.Fatalf("selected %+v, found=%v mismatch=%q; want %s", sku, ok, mismatch, test.wantSKU)
 			}
@@ -169,7 +168,7 @@ func rentalDownloadPlan(pkg, release string) hub.PackageDownloadPlan {
 	wheel := []byte(name + " wheel")
 	return hub.PackageDownloadPlan{Release: release,
 		PackageConfig:    exact([]byte("[application]\nobject = \"proof:app\"\n")),
-		PackageInterface: exact([]byte(`{"application":"proof:app","entrypoints":[],"format":"cozy.package.interface/1","jobs":[]}`)),
+		PackageInterface: exact([]byte(`{"application":"proof:app","entrypoints":[],"format":"cozy.package.interface/1"}`)),
 		Pyproject:        exact([]byte("[project]\nname = \"" + name + "\"\nversion = \"" + release + "\"\nrequires-python = \">=3.12\"\ndependencies = []\n")),
 		UVLock:           exact([]byte("version = 1\nrequires-python = \">=3.12\"\n\n[[package]]\nname = \"" + name + "\"\nversion = \"" + release + "\"\nsource = { editable = \".\" }\n")),
 		Downloads: []hub.PackageInstallDownload{{Kind: "project_wheel",

@@ -71,16 +71,16 @@ async def segment(ctx: Context, *, value: int) -> Value:
     ctx.raise_if_cancelled()
     return Value(value + 1)
 
-app.entrypoint(internal=True)(segment)
+app.entrypoint(internal=True, accelerator=False)(segment)
 
 @invocable
 async def internal_job(ctx: Context, *, value: int) -> Value:
     ctx.raise_if_cancelled()
     return Value(value + 1)
 
-app.job(internal=True, accelerator=False)(internal_job)
+app.entrypoint(internal=True, accelerator=False)(internal_job)
 
-@app.job(accelerator=False)
+@app.entrypoint(accelerator=False)
 async def long_form(ctx: Context, payload: Request) -> Value:
     first = await segment(value=40)
     return await internal_job(value=first.value)
@@ -136,5 +136,5 @@ async def long_form(ctx: Context, payload: Request) -> Value:
 	if extra, problem := store.RequestByReference("2"); problem != nil || extra != nil {
 		t.Fatalf("refused internal root was recorded: %+v %v", extra, problem)
 	}
-	t.Logf("ordinary CLI parent %s completed with both serving/job internal children; direct roots refused", row.ID)
+	t.Logf("ordinary CLI parent %s completed with both internal children; direct roots refused", row.ID)
 }

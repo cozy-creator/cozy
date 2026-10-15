@@ -13,11 +13,11 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-// quantizerJob is a package's quantizer for one lane: a model input and one weights output
+// quantizer is a package's quantizer for one lane: a Weights input and one weights output
 // named for the lane.
-func quantizerJob(lane string) string {
-	return `{"models":[{"class":"Source","component_use":{"denoise":["model"]},"path":"` + lane + `.models.source"}],"name":"` + lane +
-		`","publishes":false,"request":{"fields":[{"name":"source","type":{"union":["null",{"input":"model"}]},"wire":"optional"}]},` +
+func quantizer(lane string) string {
+	return `{"accelerator":false,"models":[{"class":"Source","component_use":{"denoise":["model"]},"path":"` + lane + `.models.source","weights":true}],"name":"` + lane +
+		`","request":{"fields":[]},` +
 		`"result":{"input":"model"},"weights_outputs":[{"max_bytes":1048576,"mime_type":"application/vnd.cozy.model-manifest","output_id":"` + lane + `"}]}`
 }
 
@@ -39,10 +39,10 @@ func installQuantizer(t *testing.T, root, pkg string, iface []byte) {
 }
 
 // `cozy model quantize <model> --fp8` is the serving package's quantizer run as an ordinary
-// conversion: the job whose one weights output is named for the lane, bound to the exact
+// conversion: the function whose one weights output is named for the lane, bound to the exact
 // checkpoint, uploading to the model's own repository.
 func TestModelQuantizeRunsTheServingPackagesQuantizer(t *testing.T) {
-	iface := []byte(`{"application":"q:app","entrypoints":[],"format":"cozy.package.interface/1","jobs":[` + quantizerJob("fp8") + `]}`)
+	iface := []byte(`{"application":"q:app","entrypoints":[` + quantizer("fp8") + `],"format":"cozy.package.interface/1"}`)
 	root, _, _, digest, _ := runModelCatalog(t, func(_ *http.ServeMux, detail *hub.PackageReleaseDetail) {
 		contract, problem := launch.DecodePackageInterface(iface)
 		fatal(t, problem)

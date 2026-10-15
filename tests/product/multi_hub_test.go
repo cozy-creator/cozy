@@ -671,7 +671,7 @@ func TestLocalRunKeepsConfiguredHubDespiteCachedInstall(t *testing.T) {
 		Verified: true, SourceKind: "tensorhub", SourceRef: "proof/alpha@1.0.0", Dir: layout.InstallDir("5555555555555555"), Hub: hubA.URL}
 	iface := []byte(`{"format":"cozy.package.interface/1","application":"alpha:app","entrypoints":[{"name":"generate",` +
 		`"models":[{"class":"Model","path":"generate.models.model","component_use":{}}],` +
-		`"request":{"fields":[]},"result":{"fields":[]}}],"jobs":[]}`)
+		`"request":{"fields":[]},"result":{"fields":[]}}]}`)
 	must(t, os.MkdirAll(filepath.Dir(launch.PackageInterfacePath(install.Dir)), 0o700))
 	must(t, os.WriteFile(launch.PackageInterfacePath(install.Dir), iface, 0o444))
 	_, problem = store.Activate(install)
@@ -762,7 +762,7 @@ func TestLocalMachineServesEveryHubWhereItIs(t *testing.T) {
 		t.Skip("requires -machine-host: this computer's machine reads the releases")
 	}
 	iface := json.RawMessage(`{"format":"cozy.package.interface/1","application":"app:app","entrypoints":[{"name":"generate",` +
-		`"models":[],"request":{"fields":[]},"result":{"fields":[]}}],"jobs":[]}`)
+		`"models":[],"request":{"fields":[]},"result":{"fields":[]}}]}`)
 	type door struct {
 		asked, workers, fetchedAs sync.Map
 	}

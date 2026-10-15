@@ -10,10 +10,10 @@ import (
 
 func treeArgumentEntry(t *testing.T) *launch.Entrypoint {
 	t.Helper()
-	raw := []byte(`{"format":"cozy.package.interface/1","application":"fixture:app","entrypoints":[],"jobs":[{"name":"main","models":[],"publishes":false,"weights_outputs":[],"request":{"fields":[{"name":"resume_from","type":{"union":["null",{"input":"tree"}]},"wire":"optional","asset_bound":{"max_bytes":200000}},{"name":"nested","type":{"union":["null",{"fields":[{"name":"prefix","type":{"union":["null",{"input":"tree"}]},"wire":"optional"}]}]},"wire":"optional"},{"name":"report","type":{"asset":"file"},"wire":"optional"}]},"result":{"fields":[]}}]}`)
+	raw := []byte(`{"format":"cozy.package.interface/1","application":"fixture:app","entrypoints":[{"name":"main","models":[],"publishes":false,"weights_outputs":[],"request":{"fields":[{"name":"resume_from","type":{"union":["null",{"input":"tree"}]},"wire":"optional","asset_bound":{"max_bytes":200000}},{"name":"nested","type":{"union":["null",{"fields":[{"name":"prefix","type":{"union":["null",{"input":"tree"}]},"wire":"optional"}]}]},"wire":"optional"},{"name":"report","type":{"asset":"file"},"wire":"optional"}]},"result":{"fields":[]}}]}`)
 	parsed, problem := launch.DecodePackageInterface(raw)
 	fatal(t, problem)
-	return &parsed.Jobs[0]
+	return &parsed.Entrypoints[0]
 }
 
 func TestTypedTreeAssetArgumentsPreserveOptionalNestedAndFileInputs(t *testing.T) {

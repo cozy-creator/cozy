@@ -12,16 +12,16 @@ import (
 	"github.com/cozy-creator/cozy/internal/machines"
 )
 
-// A machine stopped while its Runtime winds down a running job runs a job on its very next
+// A machine stopped while its Runtime winds down a running call runs a call on its very next
 // boot (run 1486): the Host waits for that Runtime to exit, killing it if it stalls, and the
 // new Runtime waits for the old one's worker root instead of failing its boot.
-func TestAMachineStoppedMidJobRunsAJobOnItsNextBoot(t *testing.T) {
+func TestAMachineStoppedMidCallRunsACallOnItsNextBoot(t *testing.T) {
 	_, root, _, store := parityMachines(t)
 	if code, out := runCozy(t, root, "package", "install", restartProject(t)); code != 0 {
 		t.Fatalf("installing the restart package [exit %d]\n%s", code, out)
 	}
 	go runCozy(t, root, "run", "local/restart-proof/slow", "seconds=120", "--json", "--idempotency-key", "slow")
-	eventually(t, root, "the slow job running on this computer's machine", func() bool {
+	eventually(t, root, "the slow call running on this computer's machine", func() bool {
 		row, problem := store.RequestByIdempotencyKey("slow")
 		if problem != nil || row == nil {
 			return false
@@ -55,12 +55,12 @@ func TestAMachineStoppedMidJobRunsAJobOnItsNextBoot(t *testing.T) {
 	}
 	code, out := runCozy(t, root, "run", "local/restart-proof/add", "value=41", "--await", "--json")
 	if code != 0 || !strings.Contains(out, `"value":42`) {
-		t.Fatalf("the first job on the next boot failed [exit %d]\n%s", code, out)
+		t.Fatalf("the first call on the next boot failed [exit %d]\n%s", code, out)
 	}
 }
 
-// restartProject is local/restart-proof: a job that runs until canceled, one that stops when
-// paused or canceled, and a quick one.
+// restartProject is local/restart-proof: a function that runs until it ends, one that stops when
+// canceled, and a quick one.
 func restartProject(t *testing.T) string {
 	t.Helper()
 	project := filepath.Join(t.TempDir(), "restart-proof")
@@ -104,13 +104,13 @@ class AddResult(msgspec.Struct):
 app = App()
 
 
-@app.job(accelerator=False)
+@app.entrypoint(accelerator=False)
 def slow(payload: SlowRequest) -> AddResult:
     time.sleep(payload.seconds)
     return AddResult(value=payload.seconds)
 
 
-@app.job(accelerator=False)
+@app.entrypoint(accelerator=False)
 def paced(ctx: Context, payload: SlowRequest) -> AddResult:
     for _ in range(payload.seconds * 20):
         time.sleep(0.05)
@@ -118,7 +118,7 @@ def paced(ctx: Context, payload: SlowRequest) -> AddResult:
     return AddResult(value=payload.seconds)
 
 
-@app.job(accelerator=False)
+@app.entrypoint(accelerator=False)
 def add(payload: AddRequest) -> AddResult:
     return AddResult(value=payload.value + 1)
 `), 0o600))

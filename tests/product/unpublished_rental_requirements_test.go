@@ -120,7 +120,7 @@ class Result(msgspec.Struct):
 async def value(ctx: Context) -> Result:
     return Result(1)
 app = App()
-app.job(value, accelerator=False)
+app.entrypoint(value, accelerator=False)
 `), 0600))
 	wheels := filepath.Join(filepath.Dir(script), "wheels")
 	if out, err := exec.Command("uv", "build", "--wheel", "--out-dir", wheels, library).CombinedOutput(); err != nil {

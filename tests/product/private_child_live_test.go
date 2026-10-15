@@ -160,10 +160,8 @@ async def main():
 	if status != 0 {
 		t.Fatalf("fresh scalar run did not reuse its local workspace [%d]: %s", status, out)
 	}
-	fresh, problem := store.RequestByReference("4")
-	fatal(t, problem)
 	cached := machineChildren(t, root, store, "4")
-	if fresh.RetryOf != "" || len(cached) != 2 || cached[0].Executions != 0 || cached[1].Executions != 0 || cached[0].Computation != originalA.Computation || cached[1].Computation != thirdB.Computation {
+	if len(cached) != 2 || cached[0].Executions != 0 || cached[1].Executions != 0 || cached[0].Computation != originalA.Computation || cached[1].Computation != thirdB.Computation {
 		t.Fatalf("fresh scalar run computed instead of acquiring cached results: %+v", cached)
 	}
 	old, problem := store.RequestRow(first.ID)

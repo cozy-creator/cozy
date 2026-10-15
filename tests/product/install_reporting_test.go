@@ -63,7 +63,7 @@ only-include = ["reporting.py"]
 		return hub.ExactDocument{CanonicalBytes: raw, Digest: fmt.Sprintf("sha256:%x", sha256.Sum256(raw)), Length: int64(len(raw))}
 	}
 	return hub.PackageDownloadPlan{Release: "1.0.1", PackageConfig: exact([]byte("[application]\nobject = \"reporting:app\"\n")),
-		PackageInterface: exact([]byte(`{"application":"reporting:app","entrypoints":[],"format":"cozy.package.interface/1","jobs":[]}`)),
+		PackageInterface: exact([]byte(`{"application":"reporting:app","entrypoints":[],"format":"cozy.package.interface/1"}`)),
 		Pyproject:        exact([]byte(pyproject)), UVLock: exact(lock), Downloads: []hub.PackageInstallDownload{{
 			Kind: "project_wheel", Path: filename, Distribution: "install-reporting", Version: "1.0.1",
 			Digest: fmt.Sprintf("sha256:%x", sha256.Sum256(wheel)), Length: int64(len(wheel)),

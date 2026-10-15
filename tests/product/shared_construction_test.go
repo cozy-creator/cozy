@@ -38,7 +38,7 @@ func TestRemoteReleaseSharesSlotsOfOneConstruction(t *testing.T) {
 		`{"name":"first_last_frame_to_video","models":[{"class":"H3Model","component_use":{"sample":["dit"]},"path":"first_last_frame_to_video.models.model"}],"request":{"fields":[]},"result":{"fields":[]}},` +
 		`{"name":"reference_media_to_video","models":[{"class":"H3Model","component_use":{"sample":["dit"]},"path":"reference_media_to_video.models.model"}],"request":{"fields":[]},"result":{"fields":[]}},` +
 		`{"name":"upscale","models":[{"class":"Upscaler","component_use":{"run":["net"]},"path":"upscale.models.model"}],"request":{"fields":[]},"result":{"fields":[]}}` +
-		`],"format":"cozy.package.interface/1","jobs":[]}`)
+		`],"format":"cozy.package.interface/1"}`)
 	contract, problem := launch.DecodePackageInterface(iface)
 	fatal(t, problem)
 	var detail hub.PackageReleaseDetail

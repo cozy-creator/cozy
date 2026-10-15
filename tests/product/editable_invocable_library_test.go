@@ -73,7 +73,7 @@ class Result(msgspec.Struct):
 async def value(ctx: Context) -> Result:
     return Result(42)
 app = App()
-app.job(value, accelerator=False)
+app.entrypoint(value, accelerator=False)
 `
 	module := filepath.Join(library, "editable_leaf.py")
 	must(t, os.WriteFile(module, []byte(body), 0600))

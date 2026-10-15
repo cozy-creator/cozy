@@ -59,7 +59,7 @@ func invocationNamesRoot(t *testing.T, raw []byte) (string, <-chan api.Submissio
 }
 
 func TestInvocationSeparatorsPreserveRegisteredNames(t *testing.T) {
-	for _, kind := range []string{"entrypoints", "jobs"} {
+	for _, kind := range []string{"entrypoints"} {
 		for _, registered := range []string{"long_form_cuts", "long-form-cuts", "long_form-cuts"} {
 			t.Run(kind+"/"+registered, func(t *testing.T) {
 				raw := []byte(`{"format":"cozy.package.interface/1","application":"proof:app","` + kind + `":[{"name":"` + registered + `","publishes":false,"request":{"fields":[]},"result":{"fields":[]}}]}`)
@@ -80,10 +80,10 @@ func TestInvocationSeparatorsPreserveRegisteredNames(t *testing.T) {
 	}
 }
 
-func TestInvocationSeparatorsSubmitRegisteredJobName(t *testing.T) {
+func TestInvocationSeparatorsSubmitRegisteredName(t *testing.T) {
 	for _, registered := range []string{"long_form", "long-form"} {
 		t.Run(registered, func(t *testing.T) {
-			raw := []byte(`{"format":"cozy.package.interface/1","application":"proof:app","jobs":[{"name":"` + registered + `","publishes":false,"request":{"fields":[]},"result":{"fields":[]}}]}`)
+			raw := []byte(`{"format":"cozy.package.interface/1","application":"proof:app","entrypoints":[{"name":"` + registered + `","publishes":false,"request":{"fields":[]},"result":{"fields":[]}}]}`)
 			root, submitted := invocationNamesRoot(t, raw)
 			for _, spelling := range []string{"long_form", "long-form"} {
 				code, out := runCozy(t, root, "run", "proof/names/"+spelling, "--rental-only", "--json")
@@ -96,7 +96,7 @@ func TestInvocationSeparatorsSubmitRegisteredJobName(t *testing.T) {
 						t.Fatalf("submission lost its authored target: %+v", submission)
 					}
 				default:
-					t.Fatal("missing job submission")
+					t.Fatal("missing submission")
 				}
 			}
 		})
@@ -104,7 +104,7 @@ func TestInvocationSeparatorsSubmitRegisteredJobName(t *testing.T) {
 }
 
 func TestInvocationSeparatorsKeepRefusalsAndAmbiguity(t *testing.T) {
-	raw := []byte(`{"format":"cozy.package.interface/1","application":"proof:app","jobs":[{"name":"internal_job","internal":true,"publishes":false,"request":{"fields":[]},"result":{"fields":[]}},{"name":"future_job","internal":"future","publishes":false,"request":{"fields":[]},"result":{"fields":[]}},{"name":"long_form_cuts","publishes":false,"request":{"fields":[]},"result":{"fields":[]}},{"name":"long-form-cuts","publishes":false,"request":{"fields":[]},"result":{"fields":[]}}]}`)
+	raw := []byte(`{"format":"cozy.package.interface/1","application":"proof:app","entrypoints":[{"name":"internal_job","internal":true,"publishes":false,"request":{"fields":[]},"result":{"fields":[]}},{"name":"future_job","internal":"future","publishes":false,"request":{"fields":[]},"result":{"fields":[]}},{"name":"long_form_cuts","publishes":false,"request":{"fields":[]},"result":{"fields":[]}},{"name":"long-form-cuts","publishes":false,"request":{"fields":[]},"result":{"fields":[]}}]}`)
 	root, _ := invocationNamesRoot(t, raw)
 	surface, problem := launch.DecodePackageInterface(raw)
 	fatal(t, problem)

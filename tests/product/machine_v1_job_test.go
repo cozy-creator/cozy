@@ -28,9 +28,9 @@ import (
 var cpuLongform = flag.String("cpu-longform", "", "tensord tests/fixtures/cpu_longform: H3 long-form's shape on CPU")
 
 // `cozy run <pkg>/long_form` on a machine that serves cozy.machine.v1, as a user types it: a
-// job whose file input is a reference image, each segment a child run of the package's own
+// CPU function whose file input is a reference image, each segment a child run of the package's own
 // invocable, the film published after every segment and saved to --out at its end.
-func TestMachineV1JobRendersSegmentsThroughChildRuns(t *testing.T) {
+func TestMachineV1LongFormRendersSegmentsThroughChildRuns(t *testing.T) {
 	if *machineHostBinary == "" || *cpuLongform == "" {
 		t.Skip("requires -machine-host=<tensord> and -cpu-longform=<tensord>/tests/fixtures/cpu_longform")
 	}
@@ -72,7 +72,7 @@ func TestMachineV1JobRendersSegmentsThroughChildRuns(t *testing.T) {
 		"--asset", "reference="+reference, "--await", "--json", "--out", out)
 	skipWithoutMachine(t, code, document)
 	if code != 0 {
-		t.Fatalf("the job did not succeed [exit %d]\n%s", code, document)
+		t.Fatalf("the run did not succeed [exit %d]\n%s", code, document)
 	}
 	var run struct {
 		Status string          `json:"status"`
@@ -81,7 +81,7 @@ func TestMachineV1JobRendersSegmentsThroughChildRuns(t *testing.T) {
 	if json.Unmarshal([]byte(lastJSONLine(document)), &run) != nil || run.Status != "completed" && run.Status != "succeeded" {
 		t.Fatalf("the run's document is not a completed run\n%s", document)
 	}
-	// Each segment saw the job's reference (as the machine prepared it) and continued the
+	// Each segment saw the run's reference (as the machine prepared it) and continued the
 	// previous segment's context: the saved film is every segment's line, in order.
 	files, err := filepath.Glob(filepath.Join(out, "*video*"))
 	if err != nil || len(files) != 1 {
@@ -106,7 +106,7 @@ func TestMachineV1JobRendersSegmentsThroughChildRuns(t *testing.T) {
 	if code, shown := runCozy(t, root, "run", "show", "1", "--json"); code != 0 || !strings.Contains(shown, "Video (segments 1-3)") {
 		t.Fatalf("run show does not name the film's last revision [exit %d]\n%s", code, shown)
 	}
-	// A job's model choice for a slot that exists nowhere (this segment function declares no
+	// A model choice for a slot that exists nowhere (this segment function declares no
 	// model slot) is a warning, never a refusal: the film is rendered all the same.
 	code, document = runCozy(t, root, "run", "local/tensord-cpu-longform/long_form", "--input", in,
 		"--asset", "reference="+reference, "model.render_segment.models.base=alice/model", "--await", "--json")
@@ -118,12 +118,11 @@ func TestMachineV1JobRendersSegmentsThroughChildRuns(t *testing.T) {
 	}
 }
 
-// A job on an explicit endpoint runs in the foreground (no Calcifer owns it), with its pause and
-// resume, and an endpoint that is one of this host's rentals is signed with that rental's own
-// key: a rental's machine authorizes it, not this computer's machine owner key. Here this
-// computer's machine stands in for the rental: its key moves to a rental's credential and the
-// owner key is replaced.
-func TestEndpointJobSignsWithItsRentalKeyAndPauses(t *testing.T) {
+// A run on an explicit endpoint runs in the foreground (no Calcifer owns it), and an endpoint that
+// is one of this host's rentals is signed with that rental's own key: a rental's machine
+// authorizes it, not this computer's machine owner key. Here this computer's machine stands in
+// for the rental: its key moves to a rental's credential and the owner key is replaced.
+func TestEndpointRunSignsWithItsRentalKey(t *testing.T) {
 	if *machineHostBinary == "" || *cpuLongform == "" {
 		t.Skip("requires -machine-host=<tensord> and -cpu-longform=<tensord>/tests/fixtures/cpu_longform")
 	}
@@ -197,7 +196,7 @@ func TestEndpointJobSignsWithItsRentalKeyAndPauses(t *testing.T) {
 		t.Fatalf("the machine accepted a key it does not authorize [exit %d]\n%s", code, refused)
 	}
 	// Once the endpoint is a recorded rental holding the authorized key, that key signs and the
-	// job is accepted.
+	// run is accepted.
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	if problem != nil {
 		t.Fatal(problem)
@@ -213,31 +212,14 @@ func TestEndpointJobSignsWithItsRentalKeyAndPauses(t *testing.T) {
 	must(t, os.MkdirAll(filepath.Join(root, "rentals"), 0o700))
 	must(t, os.WriteFile(filepath.Join(root, "rentals", "pr-standin.creator.pem"), authorized, 0o600))
 	code, submitted := run()
-	var job struct {
-		ID       string `json:"run"`
-		Accepted bool   `json:"machine_accepted"`
+	var accepted struct {
+		ID string `json:"id"`
 	}
-	if code != 0 || json.Unmarshal([]byte(lastJSONLine(submitted)), &job) != nil || job.ID == "" || !job.Accepted {
-		t.Fatalf("the rental-signed job was not accepted [exit %d]\n%s", code, submitted)
+	if code != 0 || json.Unmarshal([]byte(lastJSONLine(submitted)), &accepted) != nil || accepted.ID == "" {
+		t.Fatalf("the rental-signed run was not accepted [exit %d]\n%s", code, submitted)
 	}
-	status := func() string {
-		_, shown := runCozy(t, root, "run", "show", job.ID, "--json")
-		var state struct {
-			Status string `json:"status"`
-		}
-		_ = json.Unmarshal([]byte(lastJSONLine(shown)), &state)
-		return state.Status
-	}
-	// Pause, then resume, each from its own foreground command on the recorded endpoint.
-	if code, paused := runCozy(t, root, "run", "pause", job.ID, "--json"); code != 0 {
-		t.Fatalf("run pause [exit %d]\n%s", code, paused)
-	}
-	landed(t, "the job to rest paused", func() bool { return status() == "paused" })
-	if code, resumed := runCozy(t, root, "run", "resume", job.ID, "--json"); code != 0 {
-		t.Fatalf("run resume [exit %d]\n%s", code, resumed)
-	}
-	if code, watched := runCozy(t, root, "run", "watch", job.ID, "--json"); code != 0 {
-		t.Fatalf("the resumed job did not complete [exit %d]\n%s", code, watched)
+	if code, watched := runCozy(t, root, "run", "watch", accepted.ID, "--json"); code != 0 {
+		t.Fatalf("the run did not complete [exit %d]\n%s", code, watched)
 	}
 	files, _ := filepath.Glob(filepath.Join(out, "*video*"))
 	if len(files) != 1 {
@@ -246,11 +228,11 @@ func TestEndpointJobSignsWithItsRentalKeyAndPauses(t *testing.T) {
 	film, err := os.ReadFile(files[0])
 	must(t, err)
 	if lines := strings.Count(string(film), "\n"); lines != 3 {
-		t.Fatalf("the resumed job's film has %d segments:\n%s", lines, film)
+		t.Fatalf("the run's film has %d segments:\n%s", lines, film)
 	}
 	// The film's play link comes from the endpoint's own machine, and its capability is signed
 	// by the rental key that machine authorizes.
-	code, played := runCozy(t, root, "run", "play", job.ID, "--json")
+	code, played := runCozy(t, root, "run", "play", accepted.ID, "--json")
 	var printed struct{ Link string }
 	if code != 0 || json.Unmarshal([]byte(lastJSONLine(played)), &printed) != nil {
 		t.Fatalf("run play [exit %d]\n%s", code, played)

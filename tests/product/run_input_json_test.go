@@ -21,8 +21,8 @@ func runInputJSONRoot(t *testing.T) string {
 	raw := []byte(`{"application":"fixture:app","format":"cozy.package.interface/1",` +
 		`"entrypoints":[{"name":"long_form","request":{"fields":[{"name":"style","type":"str"},{"name":"mode","type":"str"},{"name":"seed","type":"int"},` +
 		`{"name":"references","type":{"list":{"fields":[{"name":"name","type":"str"},{"name":"kind","type":"str"},{"name":"description","type":"str"}]}}},` +
-		`{"name":"segments","type":{"list":{"fields":[{"name":"prompt","type":"str"},{"name":"duration_s","type":"float"}]}}}]},"result":{"fields":[]}}],` +
-		`"jobs":[{"accelerator":false,"name":"prepare","publishes":false,"request":{"fields":[{"name":"shots","type":{"list":{"fields":[{"name":"prompt","type":"str"},{"name":"seed","type":"int"}]}}},{"name":"steps","type":"int"}]},"result":{"fields":[]}}]}`)
+		`{"name":"segments","type":{"list":{"fields":[{"name":"prompt","type":"str"},{"name":"duration_s","type":"float"}]}}}]},"result":{"fields":[]}},` +
+		`{"accelerator":false,"name":"prepare","publishes":false,"request":{"fields":[{"name":"shots","type":{"list":{"fields":[{"name":"prompt","type":"str"},{"name":"seed","type":"int"}]}}},{"name":"steps","type":"int"}]},"result":{"fields":[]}}]}`)
 	iface, problem := launch.DecodePackageInterface(raw)
 	fatal(t, problem)
 	var detail hub.PackageReleaseDetail
@@ -78,18 +78,11 @@ func TestRunInputJSONFileAndAliasPreserveNestedPayload(t *testing.T) {
 		!strings.Contains(string(request.Payload), `"steps":8`) || strings.Contains(string(request.Payload), "First shot") {
 		t.Fatalf("nested inline override changed: %+v %s", request, out)
 	}
-	// The tree option still binds a directory rather than the JSON payload despite the
-	// old internal Values key also being "--input".
-	code, out := runCozy(t, root, "run", "proof/input/prepare", "--input="+infile,
-		"--input-tree", "prior="+filepath.Join(root, "missing"), "--rental-only", "--json")
-	if code == 0 || !strings.Contains(out, "--input-tree prior") || !strings.Contains(out, "not a directory") {
-		t.Fatalf("JSON input suppressed tree validation: %d %s", code, out)
-	}
 }
 
 func TestRunHelpUsesInputJSONName(t *testing.T) {
 	code, out := runCozy(t, t.TempDir(), "run", "proof/input/prepare", "--help")
-	if code != 0 || !strings.Contains(out, "--input=") || !strings.Contains(out, "YAML") || !strings.Contains(out, "--input-tree=") {
+	if code != 0 || !strings.Contains(out, "--input=") || !strings.Contains(out, "YAML") || strings.Contains(out, "--input-tree") {
 		t.Fatalf("input help: %d %s", code, out)
 	}
 }

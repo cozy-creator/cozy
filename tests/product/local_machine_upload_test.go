@@ -12,7 +12,7 @@ import (
 	"testing"
 )
 
-// weightsProject is local/weights-proof: one job that derives a small checkpoint into its
+// weightsProject is local/weights-proof: one function that derives a small checkpoint into its
 // declared weights output.
 func weightsProject(t *testing.T) string {
 	t.Helper()
@@ -47,7 +47,7 @@ app = App()
 PLAIN = dict(tensorfs.seed_digests())["plain/1"]
 
 
-@invocable(memoize=True)
+@invocable
 async def convert(ctx: Context, *, n: int) -> ModelArtifact:
     definition = Derivation(
         sources={},
@@ -65,7 +65,7 @@ async def convert(ctx: Context, *, n: int) -> ModelArtifact:
     return ctx.adopt_model(receipt)
 
 
-app.job(convert, weights=(WeightsOutput("model", max_new_bytes=65536),), accelerator=False)
+app.entrypoint(convert, weights=(WeightsOutput("model", max_new_bytes=65536),), accelerator=False)
 `), 0o600))
 	if out, err := exec.Command("uv", "lock", "--project", project).CombinedOutput(); err != nil {
 		t.Fatalf("locking the weights package: %v\n%s", err, out)

@@ -34,7 +34,7 @@ func TestPublishedRequirementsDedupeRepeatedWheelsAndAcceptNewLocalWheels(t *tes
 		Package: "proof/export-proof", Release: "1.0.0",
 		IndexURL:      "https://example.com/simple",
 		PackageConfig: exact("[application]\nobject = 'proof:app'\n"),
-		Selection:     install.Selection{PackageInterface: exact(`{"format":"cozy.package.interface/1","application":"proof:app","entrypoints":[],"jobs":[]}`)},
+		Selection:     install.Selection{PackageInterface: exact(`{"format":"cozy.package.interface/1","application":"proof:app","entrypoints":[]}`)},
 		Pyproject:     exact("[project]\nname = 'export-proof'\nversion = '1.0.0'\nrequires-python = '>=3.12'\n"),
 		UVLock:        exact("version = 1\nrevision = 3\nrequires-python = '>=3.12'\n[[package]]\nname = 'export-proof'\nversion = '1.0.0'\nsource = { virtual = '.' }\n"),
 		ProjectWheel:  wheel("export-proof", "1"),

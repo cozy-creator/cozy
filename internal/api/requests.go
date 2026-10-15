@@ -344,8 +344,15 @@ func replaySubmission(sub Submission, recorded records.Request) orchestrator.Sub
 	if len(payload) == 0 {
 		payload = []byte("{}")
 	}
+	// The caller's destination is part of what the key names: another one conflicts.
+	transfer := recorded.ModelTransfer
+	if sub.WeightsDestination == "" {
+		transfer = nil
+	} else if transfer == nil || transfer.Destination != sub.WeightsDestination {
+		transfer = &records.ModelTransferIntent{Kind: "model-upload", Destination: sub.WeightsDestination}
+	}
 	return orchestrator.Submission{
-		Package: sub.Package, Entrypoint: sub.Function, Payload: payload, ModelTransfer: recorded.ModelTransfer,
+		Package: sub.Package, Entrypoint: sub.Function, Payload: payload, ModelTransfer: transfer,
 		Outputs: outputs, PlanID: planID, Worker: recorded.Worker, Assets: assets,
 		InstallID: installID, Release: release,
 		LocalInstallationID: recorded.LocalInstallationID,

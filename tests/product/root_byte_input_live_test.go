@@ -137,7 +137,7 @@ async def verify(ctx: Context, *, report: ReportFile, tree: Tree) -> Verified:
     assert (tree.path / "extra.txt").read_text() == msgspec.json.decode(raw)["variant"]
     return Verified(hashlib.sha256(raw).hexdigest(), len(raw))
 app = App()
-app.job(verify, accelerator=False)
+app.entrypoint(verify, accelerator=False)
 `)
 	must(t, os.WriteFile(filepath.Join(library, "byte_tools.py"), module, 0600))
 	metadata := fmt.Sprintf(`[project]

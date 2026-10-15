@@ -13,9 +13,6 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/launch"
-	"github.com/cozy-creator/cozy/internal/modeltransfer"
-	"github.com/cozy-creator/cozy/internal/orchestrator"
-	"github.com/cozy-creator/cozy/internal/records"
 )
 
 func TestNumberProfile(t *testing.T) {
@@ -227,4 +224,3 @@ func TestPackageInterfaceComponentLowerBound(t *testing.T) {
 		t.Fatalf("undeclared component lower bound = %v, want none", got)
 	}
 }
-

@@ -1,2 +1,0 @@
-[application]
-object = "tensor_quant_source:app"

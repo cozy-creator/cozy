@@ -90,7 +90,7 @@ class AddResult(msgspec.Struct):
 app = App()
 
 
-@app.job(accelerator=False)
+@app.entrypoint(accelerator=False)
 def add(payload: AddRequest) -> AddResult:
     return AddResult(value=payload.value + org_relative_dep.VALUE)
 `,
@@ -196,8 +196,8 @@ func TestAccountIndexDependencyTravelsWithItsCapture(t *testing.T) {
 	}
 }
 
-// A local package calls a job of another package it takes from its author's account index. That
-// job's Model slot declares a default ladder and nobody bound or chose a model for it. Each
+// A local package calls a function of another package it takes from its author's account index.
+// That function's Weights slot declares a default ladder and nobody bound or chose a model for it. Each
 // machine gives the slot its declared default: no binding is read at any Hub and the caller
 // names nothing (run 5327 failed `model_choice_absent` on exactly this).
 func TestAnIndexCalleesUnchosenSlotTakesItsDeclaredDefault(t *testing.T) {
@@ -205,7 +205,7 @@ func TestAnIndexCalleesUnchosenSlotTakesItsDeclaredDefault(t *testing.T) {
 	h.hubAccess.account = indexAccount
 	seedProbe(t, h, root, machines.Local, "tessa")
 	wheel := orgRelativeWheel(t, "1.0.0", `import msgspec
-from cozy_runtime.author import App, Context, Loader, Model, invocable
+from cozy_runtime.author import App, Context, Loader, Model, Weights, invocable
 
 
 class Nothing:
@@ -214,7 +214,7 @@ class Nothing:
 
 class Probe(Model[Nothing]):
     def load(self, loader: Loader) -> None:
-        raise RuntimeError("a job never loads its Model")
+        raise RuntimeError("a Weights argument never loads its Model")
 
 
 class Touched(msgspec.Struct, frozen=True):
@@ -222,12 +222,12 @@ class Touched(msgspec.Struct, frozen=True):
 
 
 @invocable(defaults={"source": [{"gpu": "*", "lane": "proof/probe@1.0.0/bf16"}]})
-async def touch(ctx: Context, *, value: int, source: Probe) -> Touched:
+async def touch(ctx: Context, *, value: int, source: Weights[Probe]) -> Touched:
     return Touched(value + 7)
 
 
 app = App()
-app.job(touch, accelerator=False)
+app.entrypoint(touch, accelerator=False)
 `, "[cozy.application]\ndefault = org_relative_dep:app\n")
 	var open atomic.Bool
 	open.Store(true)
@@ -257,7 +257,7 @@ class AddResult(msgspec.Struct):
 app = App()
 
 
-@app.job(accelerator=False)
+@app.entrypoint(accelerator=False)
 async def add(payload: AddRequest) -> AddResult:
     return AddResult(value=(await touch(value=payload.value)).value)
 `)

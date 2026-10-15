@@ -370,6 +370,12 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 		return e
 	}
 	if terminal == nil && !invocationSettled(life.Status) {
+		if ctx.endpoint != nil {
+			// A foreground controller ends with this command: its machine accepts the run first.
+			if life, e = awaitAcceptance(c, life); e != nil {
+				return e
+			}
+		}
 		return renderSubmittedRun(ctx, life, !handle.Replay)
 	}
 	life, e = waitOutputExport(c, life)
@@ -2787,6 +2793,10 @@ func renderRun(ctx *Context, life api.Lifecycle, terminal *localapi.Event, stopp
 	if why != "" {
 		e.Message = fmt.Sprintf("request %s ended %s: %s — %s",
 			life.RequestID, humanStatus, errType, why)
+	}
+	if errType == records.MachineStopped {
+		// Its machine stopped under it: it ends named, and running it again is a new run.
+		e.Name, e.Message = records.MachineStopped, fmt.Sprintf("run %s ended failed: %s", runReference(life.Number, life.RequestID), why)
 	}
 	// A canceled run is LOUD about WHO ended it (cl-108) — never a quiet no-output end.
 	if mapTerminal(status) == "canceled" && life.CanceledBy != "" {
