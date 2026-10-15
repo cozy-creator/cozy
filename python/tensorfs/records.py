@@ -231,8 +231,6 @@ class GCResult(TypedDict):
     reclaimed_bytes: int
     reclaimed_blobs: int
     reclaimed_manifests: int
-    kept_bytes: int
-    kept_objects: int
     sessions: list[str]
     scratch_reaped: int
 

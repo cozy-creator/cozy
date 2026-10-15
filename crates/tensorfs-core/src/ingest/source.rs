@@ -4564,7 +4564,7 @@ mod tests {
             .collect();
         assert!(!objects.is_empty());
         let report = crate::gc::collect(store.root(), false).unwrap();
-        assert!(report.kept_objects > 0, "the journal held nothing");
+        assert!(!report.sessions.is_empty(), "the journal held nothing");
         assert_eq!(report.reclaimed_blobs, 0);
         for path in &objects {
             assert!(path.is_file(), "gc reclaimed in-flight conversion output");

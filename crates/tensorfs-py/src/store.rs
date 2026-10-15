@@ -1836,8 +1836,6 @@ pub fn gc<'p>(py: Python<'p>, root: PathBuf) -> PyResult<Bound<'p, PyDict>> {
     result.set_item("reclaimed_bytes", report.reclaimed_bytes)?;
     result.set_item("reclaimed_blobs", report.reclaimed_blobs)?;
     result.set_item("reclaimed_manifests", report.reclaimed_manifests)?;
-    result.set_item("kept_bytes", report.kept_bytes)?;
-    result.set_item("kept_objects", report.kept_objects)?;
     result.set_item("sessions", report.sessions)?;
     result.set_item("scratch_reaped", report.scratch_reaped)?;
     Ok(result)

@@ -17,7 +17,7 @@
 //! - an open ingest session root (`tmp/ingest/<session>/session.json`) names its candidate
 //!   objects until `tfs ingest reap` abandons it explicitly, so the window between
 //!   `ingest run` and `ingest install` — no live process, a dead writer marker — keeps its
-//!   bytes. Those are the `kept` objects a report names.
+//!   bytes.
 //!
 //! Crash safety: an object is unlinked before its catalog row is dropped, so a crash leaves
 //! at most a row for an absent object, which the next pass prunes. A re-run converges: what
@@ -46,9 +46,6 @@ pub struct Report {
     pub reclaimed_bytes: u64,
     pub reclaimed_blobs: u64,
     pub reclaimed_manifests: u64,
-    /// Unreferenced by every repository, kept because an open ingest session names them.
-    pub kept_bytes: u64,
-    pub kept_objects: u64,
     pub sessions: Vec<String>,
     /// Orphan `put-` temps and dead lease markers removed: scratch nothing live holds.
     pub scratch_reaped: u64,
@@ -228,17 +225,7 @@ pub(crate) fn collect_locked(
     let (mut holds, sessions) = session_holds(store)?;
     holds.extend(pinned(store, owner.as_deref())?);
     report.sessions = sessions;
-    let census = Census::open(root)?;
-    let plan = census.gc_plan(&holds)?;
-    if !holds.is_empty() {
-        let planned: BTreeSet<&str> = plan.iter().map(|row| row.key.as_str()).collect();
-        for row in census.gc_plan(&[])? {
-            if !planned.contains(row.key.as_str()) {
-                report.kept_bytes += row.length;
-                report.kept_objects += 1;
-            }
-        }
-    }
+    let plan = Census::open(root)?.gc_plan(&holds)?;
     for row in &plan {
         report.reclaimed_bytes += row.length;
         match row.kind {

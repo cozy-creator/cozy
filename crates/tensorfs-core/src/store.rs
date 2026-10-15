@@ -1539,11 +1539,16 @@ impl Store {
         fault.hit("chmod");
         let dst = self.object_path(&verified.sha256);
         let dir = dst.parent().unwrap().to_path_buf();
-        if let Err(error) = self.prepare_owned_directory(&dir) {
-            return cleanup(tmp, error);
+        // No-clobber admission: link() refuses to replace an installed object. Its fanout
+        // directory is made only the first time one is missing.
+        let mut linked = fs::hard_link(tmp, &dst);
+        if linked.as_ref().is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) {
+            if let Err(error) = self.prepare_owned_directory(&dir) {
+                return cleanup(tmp, error);
+            }
+            linked = fs::hard_link(tmp, &dst);
         }
-        // No-clobber admission: link() refuses to replace an installed object.
-        let admitted = match fs::hard_link(tmp, &dst) {
+        let admitted = match linked {
             Ok(()) => true,
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
             Err(e) => return cleanup(tmp, io(format!("link {}", dst.display()), e)),

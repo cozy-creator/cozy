@@ -138,39 +138,6 @@ impl ReadLease {
     }
 }
 
-/// The complete-descriptor-set headroom question, answered from `/proc` with std alone.
-/// `None` means the platform cannot answer (no `/proc`, an "unlimited" soft limit): the
-/// pre-check is skipped and a failing open at acquire still refuses before any read.
-/// `None` when the process can hold `need` more descriptors, raising its soft limit up to
-/// the hard limit if that is what it takes. `Some((limit, open, want))` only past the hard
-/// limit.
-fn fd_shortfall(need: usize) -> Option<(u64, u64, u64)> {
-    use rustix::process::{getrlimit, setrlimit, Resource, Rlimit};
-    /// Fds the pre-check leaves free for stdio, locks and whatever the caller opens next.
-    const MARGIN: u64 = 64;
-    let open = std::fs::read_dir("/proc/self/fd").ok()?.count() as u64;
-    let want = need as u64 + open + MARGIN;
-    let limit = getrlimit(Resource::Nofile);
-    let soft = limit.current?;
-    if want <= soft {
-        return None;
-    }
-    let raised = limit.maximum.unwrap_or(want);
-    if raised >= want
-        && setrlimit(
-            Resource::Nofile,
-            Rlimit {
-                current: Some(raised),
-                maximum: limit.maximum,
-            },
-        )
-        .is_ok()
-    {
-        return None;
-    }
-    Some((limit.maximum.unwrap_or(soft).max(soft), open, want))
-}
-
 /// Acquire a lease over an explicit object set, verifying every object first and PINNING
 /// its descriptor. Verification and reading share one `open` (`open_verified`); nothing
 /// after this function resolves an object pathname.
@@ -185,24 +152,11 @@ pub fn acquire(
     let owner = crate::meta::owner(store.root());
     let _admitting = owner.as_ref().map(|owner| owner.gate.read().unwrap());
     let hold = meta.read_hold(owner.as_ref(), &objects)?;
-    // Admission proves RLIMIT_NOFILE headroom for the COMPLETE descriptor set (H3 serves
-    // 3,627 distinct objects — never an assumable count) or refuses typed.
-    let distinct: HashSet<&str> = objects.iter().map(|o| o.sha256.as_str()).collect();
-    if let Some((soft, open, want)) = fd_shortfall(distinct.len()) {
-        let _ = hold.release(meta);
-        return refuse(
-            Code::FD_HEADROOM,
-            format!(
-                "this lease pins {} verified descriptors and the process already holds \
-                 {open} fds under an RLIMIT_NOFILE hard limit of {soft} ({want} needed \
-                 with margin) — raise the hard limit; the reader will not fall back to \
-                 re-resolving pathnames",
-                distinct.len()
-            ),
-        );
-    }
+    // One descriptor per distinct object (H3 pins 3,627): the soft limit is raised to the
+    // hard one once, and a table that still runs out refuses FD_HEADROOM at the open.
+    crate::descriptors::raise();
     let mut rx = Receipts::default();
-    let mut files: HashMap<String, VerifiedFile> = HashMap::with_capacity(distinct.len());
+    let mut files: HashMap<String, VerifiedFile> = HashMap::with_capacity(objects.len());
     for o in &objects {
         if let Some(vf) = files.get(&o.sha256) {
             if vf.len() != o.length {

@@ -156,6 +156,26 @@ pub(crate) fn configure(connection: &Connection, path: &Path) -> Result<()> {
         .map_err(|error| sql("configure catalog", error))
 }
 
+pub(crate) type Judged = OnceLock<Mutex<std::collections::HashSet<(u64, u64, std::time::SystemTime)>>>;
+
+/// Run `judge` once per process per catalog file: device, inode and birth time, so a rebuilt
+/// catalog is judged again even on a reused inode. Without a birth time it is judged every
+/// time; an absent catalog is judged, and refused, every time.
+pub(crate) fn once_per_file(judged: &'static Judged, path: &Path, judge: impl FnOnce() -> Result<()>) -> Result<()> {
+    let judged = judged.get_or_init(Default::default);
+    let identity = fs::metadata(path)
+        .ok()
+        .and_then(|metadata| Some((metadata.dev(), metadata.ino(), metadata.created().ok()?)));
+    if identity.is_some_and(|identity| judged.lock().unwrap_or_else(|error| error.into_inner()).contains(&identity)) {
+        return Ok(());
+    }
+    judge()?;
+    if let Some(identity) = identity {
+        judged.lock().unwrap_or_else(|error| error.into_inner()).insert(identity);
+    }
+    Ok(())
+}
+
 /// A connection to an existing catalog of exactly this schema.
 fn validated(path: &Path) -> Result<Connection> {
     if !path.is_file() {
@@ -423,9 +443,11 @@ impl Catalog {
         Ok(catalog)
     }
 
+    /// The catalog under `root`, its schema judged once per process per catalog file.
     pub fn open(root: &Path) -> Result<Self> {
+        static JUDGED: Judged = OnceLock::new();
         let path = Self::path(root);
-        validated(&path)?;
+        once_per_file(&JUDGED, &path, || validated(&path).map(drop))?;
         Ok(Self { path })
     }
 
@@ -1608,6 +1630,26 @@ mod tests {
             std::process::id(),
             crate::meta::now_nanos_unique()
         ))
+    }
+
+    /// Opening a catalog judges its schema once per catalog file, and a replaced file again.
+    #[test]
+    fn a_catalog_is_judged_once_per_file() {
+        let root = temporary("judged");
+        crate::store::Store::init(&root).unwrap();
+        Catalog::open(&root).unwrap();
+        let opened = connections_opened(&root);
+        for _ in 0..100 {
+            Catalog::open(&root).unwrap();
+        }
+        assert_eq!(connections_opened(&root), opened);
+        let path = Catalog::path(&root);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+        fs::write(&path, b"").unwrap();
+        assert_eq!(Catalog::open(&root).unwrap_err().code, Code::UNKNOWN_FORMAT);
+        fs::remove_dir_all(root).unwrap();
     }
 
     /// Another process holding the catalog's write lock: this test binary, re-run as

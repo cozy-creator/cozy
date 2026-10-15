@@ -170,7 +170,8 @@ impl Meta {
             lease_dir,
             recovery_lock: writer_dir.join("recovery.lock"),
         };
-        store.trust().with_connection(Self::ensure_part_rows)?;
+        static MIGRATED: crate::catalog::Judged = std::sync::OnceLock::new();
+        crate::catalog::once_per_file(&MIGRATED, &meta.db, || store.trust().with_connection(Self::ensure_part_rows))?;
         Ok(meta)
     }
 
@@ -728,6 +729,31 @@ mod setup_tests {
             .unwrap();
         Meta::open(&store).unwrap();
         assert_eq!(crate::catalog::connections_opened(&root) - opened, 1);
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Opening Meta once its catalog has the part rows asks nothing of the writer lock: a
+    /// live writer does not delay it.
+    #[test]
+    fn meta_open_waits_for_no_writer_once_the_catalog_has_part_rows() {
+        let root = std::env::temp_dir().join(format!(
+            "tensorfs-meta-writer-{}-{}",
+            std::process::id(),
+            now_nanos_unique()
+        ));
+        let store = Store::init(&root).unwrap();
+        Meta::open(&store).unwrap();
+        let writer = Connection::open(crate::catalog::Catalog::path(&root)).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let (sent, opened) = std::sync::mpsc::channel();
+        let again = store.clone();
+        std::thread::spawn(move || sent.send(Meta::open(&again).map(drop)));
+        opened
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("Meta::open waited behind a live writer")
+            .unwrap();
+        writer.execute_batch("ROLLBACK").unwrap();
         drop(store);
         fs::remove_dir_all(root).unwrap();
     }
