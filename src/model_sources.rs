@@ -85,7 +85,7 @@ impl ModelSources {
             if header_bytes.len() as u64 != header_ref.length {
                 return Err(failure("selected header length differs from its manifest"));
             }
-            let header = Header::parse(&header_bytes).map_err(failure)?;
+            let header = Header::from_stored(&header_bytes).map_err(failure)?;
             // No components named: all of them (a `Weights[M]` source, planned by Runtime).
             let wanted: BTreeSet<&str> = match selection.components.is_empty() {
                 true => header.components.iter().map(|(name, _)| name.as_str()).collect(),
