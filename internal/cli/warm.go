@@ -20,9 +20,6 @@ func handleWarm(ctx *Context, target Target, ep *launch.Entrypoint, level string
 	if ep.Kind == "job" {
 		return exit.Usagef("--warm keeps a serving function ready; %s is a job", target.Function)
 	}
-	if strings.HasPrefix(target.Package, "local/") || target.Snapshot {
-		return exit.Usagef("--warm keeps a published package release ready; %s is local code", target.Package)
-	}
 	if ctx.endpoint != nil || ctx.Inv.Bool("--rent-new") || ctx.Inv.Bool("--rental-only") || ctx.Inv.Bool("--rental") {
 		return exit.Usagef("--warm names its machine: this computer's, or --rental=<name>")
 	}
@@ -47,5 +44,14 @@ func handleWarm(ctx *Context, target Target, ep *launch.Entrypoint, level string
 	if _, _, problem := ensureCalcifer(ctx); problem != nil {
 		return problem
 	}
-	return runOperation(ctx, either(ctx.Inv.Value("--rental"), machines.Local), op, true)
+	machine := either(ctx.Inv.Value("--rental"), machines.Local)
+	if target.InstallID != "" && level != "off" {
+		// Local code is installed on the machine first, as `cozy package install <dir>` does;
+		// the warm set then names that installation.
+		install := records.Operation{Package: target.Package, Release: target.Release, Hub: ctx.Cfg.HubURL, Local: target.InstallID}
+		if _, problem := settleOperation(ctx, machine, install); problem != nil {
+			return problem
+		}
+	}
+	return runOperation(ctx, machine, op, true)
 }

@@ -21,7 +21,7 @@ func TestAWarmSetChangesOneMemberAndKeepsTheRest(t *testing.T) {
 	selection := records.Operation{Package: "paul/sdxl", Release: "2.6.0", Entrypoint: "generate", Warm: "host",
 		Models: []records.ModelRef{{Choice: true, Package: "paul/sdxl", Slot: "model", BindingPath: "model", Model: "paul/sdxl", Release: "1.0.0",
 			Ladder: []records.ModelRung{{GPU: "*", Lane: "bf16", Manifest: "sha256:" + strings.Repeat("ab", 32)}}}}}
-	set, problem := warmSetV1(current, selection)
+	set, problem := warmSetV1(current, nil, selection)
 	if problem != nil {
 		t.Fatal(problem)
 	}
@@ -38,11 +38,29 @@ func TestAWarmSetChangesOneMemberAndKeepsTheRest(t *testing.T) {
 		t.Fatalf("the member was not replaced with its new level and models: %v", changed)
 	}
 	selection.Warm = "off"
-	if set, _ = warmSetV1(current, selection); len(set.Items) != 1 || set.Items[0].GetRelease().GetPackage() != "paul/anima" {
+	if set, _ = warmSetV1(current, nil, selection); len(set.Items) != 1 || set.Items[0].GetRelease().GetPackage() != "paul/anima" {
 		t.Fatalf("off did not remove the member: %v", set.Items)
 	}
 	selection.Warm = "hot"
-	if _, problem := warmSetV1(current, selection); problem == nil {
+	if _, problem := warmSetV1(current, nil, selection); problem == nil {
 		t.Fatal("an unknown level was accepted")
+	}
+}
+
+// Local code is warmed as the installation its machine holds of it: the member names that
+// installation, replaces the one warmed before, and is refused while the machine holds none.
+func TestALocalPackageIsWarmedAsItsInstallation(t *testing.T) {
+	current := []*v1.WarmItem{{Source: &v1.WarmItem_Installation{Installation: "local-old"}, Entrypoint: "main", Level: v1.WarmLevel_WARM_LEVEL_HOST}}
+	environments := []*v1.Environment{{Installation: "local-old", Package: "local/probe"}, {Installation: "paul-sdxl", Package: "paul/sdxl", Hub: "https://tensorhub.com"}}
+	selection := records.Operation{Package: "local/probe", Release: "0.1.0", Entrypoint: "main", Warm: "gpu"}
+	set, problem := warmSetV1(current, environments, selection)
+	if problem != nil {
+		t.Fatal(problem)
+	}
+	if len(set.Items) != 1 || set.Items[0].GetInstallation() != "local-old" || set.Items[0].Level != v1.WarmLevel_WARM_LEVEL_GPU {
+		t.Fatalf("the local member is not its installation at the asked level: %v", set.Items)
+	}
+	if _, problem := warmSetV1(nil, environments[1:], selection); problem == nil || problem.ErrName() != "warm.local_not_installed" {
+		t.Fatalf("a local package the machine holds no installation of was warmed: %v", problem)
 	}
 }

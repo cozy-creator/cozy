@@ -586,11 +586,16 @@ func modelChoicesV1(request records.Request, models []records.ModelRef) ([]*v1.M
 }
 
 // warmSetV1 is the machine's warm set with the operation's member added, changed or (`off`)
-// removed; the other members are sent back as the machine reported them.
-func warmSetV1(current []*v1.WarmItem, op records.Operation) (*v1.WarmSet, *exit.Error) {
+// removed; the other members are sent back as the machine reported them. Local code is named
+// by the installation the machine holds of it.
+func warmSetV1(current []*v1.WarmItem, environments []*v1.Environment, op records.Operation) (*v1.WarmSet, *exit.Error) {
+	packages := map[string]string{}
+	for _, environment := range environments {
+		packages[environment.GetInstallation()] = environment.GetPackage()
+	}
 	set := &v1.WarmSet{}
 	for _, item := range current {
-		if item.GetRelease().GetPackage() == op.Package && item.GetEntrypoint() == op.Entrypoint {
+		if item.GetEntrypoint() == op.Entrypoint && (item.GetRelease().GetPackage() == op.Package || packages[item.GetInstallation()] == op.Package) {
 			continue
 		}
 		item.Holds, item.HeldBack = "", ""
@@ -607,9 +612,20 @@ func warmSetV1(current []*v1.WarmItem, op records.Operation) (*v1.WarmSet, *exit
 	if problem != nil {
 		return nil, problem
 	}
-	release := &v1.Release{Package: op.Package, Release: op.Release}
-	set.Items = append(set.Items, &v1.WarmItem{Source: &v1.WarmItem_Release{Release: release},
-		Entrypoint: op.Entrypoint, Models: models, Level: v1.WarmLevel(level + 1)})
+	item := &v1.WarmItem{Source: &v1.WarmItem_Release{Release: &v1.Release{Package: op.Package, Release: op.Release}},
+		Entrypoint: op.Entrypoint, Models: models, Level: v1.WarmLevel(level + 1)}
+	if strings.HasPrefix(op.Package, "local/") {
+		item.Source = nil
+		for installation, pkg := range packages {
+			if pkg == op.Package && strings.HasPrefix(installation, "local-") {
+				item.Source = &v1.WarmItem_Installation{Installation: installation}
+			}
+		}
+		if item.Source == nil {
+			return nil, exit.Named(exit.NotFound, "warm.local_not_installed", "this machine holds no installation of %s", op.Package)
+		}
+	}
+	set.Items = append(set.Items, item)
 	return set, nil
 }
 
@@ -668,7 +684,7 @@ func (m *machineRuns) operationSpecV1(ctx context.Context, request records.Reque
 	}
 	if op.Warm != "" {
 		// A warm set member: the machine's whole set goes back with this one changed.
-		if spec.Set, problem = warmSetV1(frame.GetWarm(), op); problem != nil {
+		if spec.Set, problem = warmSetV1(frame.GetWarm(), frame.GetEnvironments(), op); problem != nil {
 			return nil, problem
 		}
 		op.Models = nil
