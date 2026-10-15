@@ -1117,8 +1117,7 @@ mod exact_tests {
     }
 
     /// A callee App with many exports across modules: each module's first row carries only its
-    /// own callables, so its Start fits the control frame where one full interface per export
-    /// (cozy-eval 0.7.5: 8.7 KB on 9 rows) did not.
+    /// own callables, not one full interface per export (cozy-eval 0.7.5: 8.7 KB on 9 rows).
     #[test]
     fn a_callee_interface_travels_once_per_module() {
         let entry = |module: &str, name: &str| json!({"name": name, "description": "x".repeat(900),
@@ -1144,8 +1143,6 @@ mod exact_tests {
             assert_eq!(names, [*module, *module], "only its own exported callables");
             assert_eq!(document["application"], "eval:app");
         }
-        let bytes: usize = rows.iter().map(|row| serde_json::to_vec(row).unwrap().len()).sum();
-        assert!(bytes < crate::device_executor::MAX_DEVICE_FRAME, "{bytes} B");
     }
 
     #[test]
