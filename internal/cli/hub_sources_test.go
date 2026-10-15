@@ -37,7 +37,7 @@ func TestSelectedHubScopesInstalledAndCachedPackageMetadata(t *testing.T) {
 			surface := func(name, model string) []byte {
 				return []byte(`{"format":"cozy.package.interface/1","application":"shared:app","entrypoints":[{"name":"` + name +
 					`","models":[{"class":"Model","path":"` + name + `.models.model","component_use":{},"default_ladder":[{"gpu":"*","lane":"proof/` + model +
-					`@1.0.0/bf16"}]}],"request":{"fields":[]},"result":{"fields":[]}}],"jobs":[]}`)
+					`@1.0.0/bf16"}]}],"request":{"fields":[]},"result":{"fields":[]}}]}`)
 			}
 			a, b := surface("from_a", "model-a"), surface("from_b", "model-b")
 			var served atomic.Int32

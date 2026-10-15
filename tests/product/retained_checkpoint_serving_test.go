@@ -14,7 +14,7 @@ import (
 // Its acquisition route refuses all rentals; this proves no model execution.
 func TestRunServingAcceptsRetainedCheckpointWithoutRelease(t *testing.T) {
 	root, _, _, digest, manifest := runModelCatalog(t, func(_ *http.ServeMux, detail *hub.PackageReleaseDetail) {
-		iface := []byte(`{"application":"q:app","entrypoints":[{"models":[{"class":"Source","component_use":{},"path":"generate.models.model"}],"name":"generate","request":{"fields":[{"name":"prompt","type":"str"}]},"result":{"fields":[]}}],"format":"cozy.package.interface/1","jobs":[]}`)
+		iface := []byte(`{"application":"q:app","entrypoints":[{"models":[{"class":"Source","component_use":{},"path":"generate.models.model"}],"name":"generate","request":{"fields":[{"name":"prompt","type":"str"}]},"result":{"fields":[]}}],"format":"cozy.package.interface/1"}`)
 		contract, problem := launch.DecodePackageInterface(iface)
 		fatal(t, problem)
 		detail.PackageInterface = iface
