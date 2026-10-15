@@ -162,3 +162,19 @@ func TestPythonScriptLockUsesRuntimeExecutable(t *testing.T) {
 		t.Fatalf("script lock not exercised: %s", raw)
 	}
 }
+
+// A script may name a dependency by URL or git (`pkg @ <url>`), as uv locks it; the project made
+// from it builds, as its machine builds it (run 6401 failed in hatchling on a git diffusers).
+func TestAScriptWithADirectReferenceBuilds(t *testing.T) {
+	uv, err := exec.LookPath("uv")
+	must(t, err)
+	pythonExportToolchain(t)
+	path := filepath.Join(t.TempDir(), "operation.py")
+	must(t, os.WriteFile(path, []byte("# /// script\n# requires-python = '>=3.12'\n# dependencies = ['six @ https://files.pythonhosted.org/packages/b7/ce/149a00dd41f10bc29e5921b496af8b574d8413afcd5e30dfa0ed46c2cc5e/six-1.17.0-py2.py3-none-any.whl']\n# [tool.cozy]\n# accelerator = false\n# ///\nprint('not executed during capture')\n"), 0600))
+	pack, problem := packagepublish.PrepareScript(context.Background(), path, t.TempDir(), nil)
+	fatal(t, problem)
+	defer pack.Close()
+	if out, err := exec.Command(uv, "build", "--wheel", "--out-dir", t.TempDir(), pack.Tree).CombinedOutput(); err != nil {
+		t.Fatalf("the script's project does not build: %v\n%s", err, out)
+	}
+}

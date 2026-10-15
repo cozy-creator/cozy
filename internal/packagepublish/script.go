@@ -100,9 +100,12 @@ func PrepareScript(ctx context.Context, path, scripts string, namespace Namespac
 	if tool == nil {
 		tool = map[string]any{}
 	}
-	tool["hatch"] = map[string]any{"build": map[string]any{"targets": map[string]any{
-		"wheel": map[string]any{"only-include": []string{"cozy_script.py", "cozy_script_entry.py"}},
-	}}}
+	// A dependency may be named by a git or URL reference (PEP 508), as uv locks it; hatchling
+	// refuses to build such a project unless told to allow them.
+	tool["hatch"] = map[string]any{"metadata": map[string]any{"allow-direct-references": true},
+		"build": map[string]any{"targets": map[string]any{
+			"wheel": map[string]any{"only-include": []string{"cozy_script.py", "cozy_script_entry.py"}},
+		}}}
 	document := map[string]any{
 		"project": map[string]any{
 			"name": name, "version": "0.0.0", "requires-python": metadata.RequiresPython,
