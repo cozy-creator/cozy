@@ -217,7 +217,8 @@ tfs get <root> sha256:<blob> --range 0:1048576 --out -   # bytes to stdout, unde
   records a part. The hub is attested as the origin of the rest (`origins/<manifest>`): GC,
   storage and repositories accept an absent object its origin holds, a derivation over it
   carries the absent objects by reference (and attests its output to the same origin), and a
-  reader fetches what it reads first. A TensorD job reads its Hub model inputs this way.
+  reader fetches what it reads first. A TensorD job reads its Hub model inputs this way,
+  through `ensure::Parts`: one closure for all its fetches, each object pulled once.
 
 ## Durability
 

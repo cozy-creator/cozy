@@ -108,6 +108,7 @@ impl Origin {
                 opened.lock().unwrap().push(socket.try_clone().unwrap());
                 count.fetch_add(1, Ordering::Relaxed);
                 let (config, records, handle) = (config.clone(), records.clone(), handle.clone());
+                let raw = socket.try_clone().unwrap();
                 children.push(thread::spawn(move || {
                     thread::sleep(setup);
                     let mut stream: Box<dyn Io> = match config {
@@ -169,6 +170,9 @@ impl Origin {
                             || reply.close
                             || ask.header("connection") == Some("close")
                         {
+                            if reply.close {
+                                let _ = raw.shutdown(Shutdown::Both);
+                            }
                             return;
                         }
                     }
@@ -318,13 +322,14 @@ fn duplicate_credential_header_order_is_not_collapsed_into_one_scope() {
 }
 
 #[test]
-fn only_complete_unambiguous_http11_length_bodies_enter_the_pool() {
-    for raw in [
-        "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nabc",
-        "HTTP/1.0 200 OK\r\nContent-Length: 3\r\n\r\nabc",
-        "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nContent-Length: 3\r\n\r\nabc",
-        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n",
-        "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabcunsolicited",
+fn only_complete_unambiguous_http11_bodies_enter_the_pool() {
+    for (raw, reused) in [
+        ("HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nabc", false),
+        ("HTTP/1.0 200 OK\r\nContent-Length: 3\r\n\r\nabc", false),
+        ("HTTP/1.1 200 OK\r\nContent-Length: 3\r\nContent-Length: 3\r\n\r\nabc", false),
+        ("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 3\r\n\r\n3\r\nabc\r\n0\r\n\r\n", false),
+        ("HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabcunsolicited", false),
+        ("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n", true),
     ] {
         let origin = Origin::new(false, Duration::ZERO, move |_, _| Reply {
             bytes: raw.as_bytes().to_vec(),
@@ -337,7 +342,7 @@ fn only_complete_unambiguous_http11_length_bodies_enter_the_pool() {
                 b"abc"
             );
         }
-        assert_eq!(origin.count(), 2, "{raw}");
+        assert_eq!(origin.count(), if reused { 1 } else { 2 }, "{raw}");
     }
     let origin = Origin::new(false, Duration::ZERO, |_, _| {
         Reply::body(&vec![42; 1 << 20])
@@ -437,7 +442,7 @@ fn truncated_responses_and_closed_idle_peers_do_not_poison_the_next_range() {
     // Simulate a peer retiring its idle keep-alive connection. The retained entry
     // must be discarded without manufacturing bytes or escaping the checked peer.
     for socket in origin.sockets.lock().unwrap().iter() {
-        socket.shutdown(Shutdown::Both).unwrap();
+        let _ = socket.shutdown(Shutdown::Both);
     }
     assert_eq!(ask(&client, &checked, &ranged()).unwrap(), b"abcdef");
     assert_eq!(origin.count(), 3);
@@ -699,4 +704,33 @@ fn concurrent_pushes_to_one_origin_keep_their_sockets_across_signed_objects() {
     assert!(origin.count() <= streams, "{} connections", origin.count());
     drop(asks);
     let _ = std::fs::remove_dir_all(root);
+}
+
+/// A pull's hub calls ride one warm connection, chunked answers included; one the hub retired
+/// as the next call arrived is asked again on a fresh connection, at once.
+#[test]
+fn hub_calls_ride_one_warm_connection_and_a_retired_one_is_asked_again() {
+    let origin = Origin::new(true, Duration::ZERO, |_, number| {
+        if number == 3 {
+            return Reply { bytes: vec![], close: true };
+        }
+        let body = r#"{"expires_at_unix":2000,"server_time_unix":1000,"urls":{"ab":"https://localhost/o/ab"}}"#;
+        let bytes = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{body}\r\n0\r\n\r\n",
+            body.len()
+        );
+        Reply { bytes: bytes.into_bytes(), close: false }
+    });
+    let client = origin.client();
+    let ledger = Ledger::with_resolution(Duration::from_millis(10));
+    let presign = || {
+        crate::transport::hub::presign(&client, &origin.url, &["ab".into()], &Anonymous, &Origin::policy(), Deadline::none(), &ledger)
+    };
+    for _ in 0..2 {
+        assert_eq!(presign().unwrap().urls, vec![("ab".to_string(), "https://localhost/o/ab".to_string())]);
+    }
+    assert_eq!(origin.count(), 1, "two calls, one connection");
+    assert!(presign().is_ok());
+    assert_eq!(origin.asks.lock().unwrap().len(), 4);
+    assert_eq!(origin.count(), 2, "the retired connection's call, asked again on a fresh one");
 }

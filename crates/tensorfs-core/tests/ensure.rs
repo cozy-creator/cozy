@@ -937,3 +937,43 @@ fn a_reader_takes_a_checkpoint_in_part_and_its_hub_keeps_the_rest() {
         tensorfs_core::err::Code::NOT_CONTAINED
     );
 }
+
+/// A reader's fetches of a checkpoint held in part share one closure; however many readers
+/// ask for an object at once, the hub sends it once; an object of another checkpoint is
+/// refused.
+#[test]
+fn a_checkpoint_held_in_part_resolves_once_and_pulls_each_object_once() {
+    let dir = temporary("parts");
+    let root = store(&dir);
+    let (checkpoint, first, second) = two_components(16 << 10);
+    // Each object answer takes a while, so the concurrent asks below overlap.
+    let hub = hub(Arc::new(checkpoint), None, Duration::from_millis(20), serve_all());
+    let store = Store::open(&root).unwrap();
+    let host = tensorfs_core::transport::base_host(&hub.base).unwrap();
+    let credential = tensorfs_core::transport::credential_from_spec("", vec![host]).unwrap();
+    let policy = tensorfs_core::transport::SourcePolicy::default();
+    let mut request =
+        tensorfs_core::ensure::Request::new(&store, &hub.base, "acme/model@r1", &credential, &policy);
+    request.lane = "public";
+    drop(tensorfs_core::ensure::ensure_part(&request).unwrap());
+    let structure = hub.gets("closure");
+
+    let parts = tensorfs_core::ensure::Parts::default();
+    let fetch = |objects: &[ObjectRef]| {
+        let mut request = tensorfs_core::ensure::Request::new(&store, &hub.base, "acme/model@r1", &credential, &policy);
+        (request.lane, request.objects) = ("public", objects);
+        parts.fetch(&request)
+    };
+    std::thread::scope(|scope| {
+        let (fetch, first) = (&fetch, &first);
+        let readers: Vec<_> = (0..4).map(|_| scope.spawn(move || fetch(first))).collect();
+        readers.into_iter().for_each(|reader| reader.join().unwrap().unwrap());
+    });
+    assert!(first.iter().all(|o| store.contains(&o.sha256) && hub.gets(&o.sha256) == 1));
+    fetch(&second[..1]).unwrap();
+    fetch(&second).unwrap();
+    assert!(second.iter().all(|o| store.contains(&o.sha256) && hub.gets(&o.sha256) == 1));
+    assert_eq!(hub.gets("closure"), structure + 1, "one closure for every fetch");
+    let foreign = vec![ObjectRef::of(b"not of this checkpoint")];
+    assert_eq!(fetch(&foreign).unwrap_err().code, tensorfs_core::err::Code::NOT_CONTAINED);
+}

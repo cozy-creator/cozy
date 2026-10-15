@@ -497,12 +497,15 @@ fn call_once(
     let response = presenting(credential, &ask, |presented| {
         let mut headers = vec![("content-type".to_string(), "application/json".to_string())];
         headers.extend_from_slice(presented);
-        crate::transport::http::request(
+        // A pull's hub calls ride one warm connection: a fresh TCP and TLS handshake per
+        // presign cost a tunnelled hub a second each (run 6013), and `call` re-asks them all.
+        crate::transport::http::send(
             client,
             &checked,
             method,
             &headers,
-            (method != "GET").then_some(body),
+            (method != "GET").then_some(crate::transport::http::Payload::Bytes(body)),
+            Some(&headers),
             deadline,
             ledger,
             // THE CONTROL PLANE (tfs-106). Every wait in this exchange answers to the pull's

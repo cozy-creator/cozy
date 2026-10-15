@@ -16,6 +16,7 @@ mod flight;
 pub use admission::{relieve, Disk, Relief};
 pub(crate) use flight::held_objects;
 
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -244,22 +245,93 @@ pub fn ensure_part(request: &Request<'_>) -> Result<(Ensured, PartHold)> {
     Ok((ensured, hold.expect("a part ensure holds what it landed")))
 }
 
-fn run(request: &Request<'_>, hold: bool) -> Result<(Ensured, Option<PartHold>)> {
-    let started = Instant::now();
-    let model = request.refspec.split('@').next().unwrap_or_default();
-    let say = |phase: Phase, bytes_done: u64, bytes_total: u64, rate: f64, attempt: u32| {
-        if let Some(on_event) = request.on_event {
-            on_event(&Event {
-                model: model.to_string(),
-                step: request.step.to_string(),
-                phase,
-                bytes_done,
-                bytes_total,
-                rate,
-                attempt,
+/// A checkpoint held here in part ([`ensure_part`]) and its readers' fetches of the rest from
+/// the hub it came from: its closure resolved once, each object pulled once however many
+/// readers ask for it at once, and what each pull landed held until this drops.
+#[derive(Default)]
+pub struct Parts {
+    closure: Mutex<Option<Arc<transport::Closure>>>,
+    landing: Mutex<BTreeSet<String>>,
+    landed: Condvar,
+    holds: Mutex<Vec<PartHold>>,
+}
+
+impl Parts {
+    /// Make `request.objects` resident: those another fetch is pulling are waited for, the
+    /// rest pulled in one walk. The request names the same checkpoint every time.
+    pub fn fetch(&self, request: &Request<'_>) -> Result<()> {
+        loop {
+            let mine = {
+                let mut landing = self.landing.lock().unwrap();
+                loop {
+                    let absent: Vec<&ObjectRef> =
+                        request.objects.iter().filter(|o| !request.store.contains(&o.sha256)).collect();
+                    if absent.is_empty() {
+                        return Ok(());
+                    }
+                    let mut mine: Vec<ObjectRef> =
+                        absent.into_iter().filter(|o| !landing.contains(&o.sha256)).cloned().collect();
+                    if !mine.is_empty() {
+                        mine.sort_by(|a, b| a.sha256.cmp(&b.sha256));
+                        mine.dedup();
+                        landing.extend(mine.iter().map(|o| o.sha256.clone()));
+                        break mine;
+                    }
+                    landing = self.landed.wait(landing).unwrap();
+                }
+            };
+            let pulled = self.pull(request, &mine);
+            let mut landing = self.landing.lock().unwrap();
+            for object in &mine {
+                landing.remove(&object.sha256);
+            }
+            self.landed.notify_all();
+            drop(landing);
+            pulled?;
+        }
+    }
+
+    fn pull(&self, request: &Request<'_>, wanted: &[ObjectRef]) -> Result<()> {
+        let started = Instant::now();
+        let closure = self.closure(request)?;
+        let contained = |o: &ObjectRef| {
+            closure.objects.binary_search_by(|c| c.sha256.cmp(&o.sha256)).is_ok_and(|at| closure.objects[at] == *o)
+        };
+        if let Some(foreign) = wanted.iter().find(|o| !contained(o)) {
+            return Err(Refusal {
+                code: Code::NOT_CONTAINED,
+                detail: format!("{} is not a part of this checkpoint", foreign.id()),
             });
         }
-    };
+        let part = transport::Closure {
+            model: closure.model.clone(),
+            release: closure.release.clone(),
+            lane: closure.lane.clone(),
+            scope: closure.scope.clone(),
+            manifest: closure.manifest.clone(),
+            objects: wanted.to_vec(),
+            complete: true,
+            presign_max_digests: closure.presign_max_digests,
+            part: true,
+        };
+        let (_, hold) = land(request, &part, false, true, started)?;
+        self.holds.lock().unwrap().extend(hold);
+        Ok(())
+    }
+
+    fn closure(&self, request: &Request<'_>) -> Result<Arc<transport::Closure>> {
+        let mut closure = self.closure.lock().unwrap();
+        if let Some(closure) = &*closure {
+            return Ok(closure.clone());
+        }
+        let resolved = Arc::new(transport::resolve_closure(&request.pull(request.store))?);
+        Ok(closure.insert(resolved).clone())
+    }
+}
+
+fn run(request: &Request<'_>, hold: bool) -> Result<(Ensured, Option<PartHold>)> {
+    let started = Instant::now();
+    let say = events(request);
     let tick = Duration::from_secs_f64(EVENT_SECONDS);
     // Resolving says so once per tick: a hub that takes its time is time passing on the
     // caller's display, never silence, and the caller's cancellation still ends it.
@@ -274,6 +346,39 @@ fn run(request: &Request<'_>, hold: bool) -> Result<(Ensured, Option<PartHold>)>
             transport::narrow(&request.pull(request.store), &closure, request.components, request.objects)
         })?;
     }
+    land(request, &closure, narrowed, hold, started)
+}
+
+/// What a request's events say, as they happen.
+fn events<'r>(request: &'r Request<'_>) -> impl Fn(Phase, u64, u64, f64, u32) + Sync + 'r {
+    let model = request.refspec.split('@').next().unwrap_or_default();
+    move |phase, bytes_done, bytes_total, rate, attempt| {
+        if let Some(on_event) = request.on_event {
+            on_event(&Event {
+                model: model.to_string(),
+                step: request.step.to_string(),
+                phase,
+                bytes_done,
+                bytes_total,
+                rate,
+                attempt,
+            });
+        }
+    }
+}
+
+/// Make `closure` resident: lead its manifest's flight, admit, pull. `attest` records the hub
+/// as the origin of what a part leaves absent; `hold` keeps what landed.
+fn land(
+    request: &Request<'_>,
+    closure: &transport::Closure,
+    attest: bool,
+    hold: bool,
+    started: Instant,
+) -> Result<(Ensured, Option<PartHold>)> {
+    let say = events(request);
+    let model = request.refspec.split('@').next().unwrap_or_default();
+    let tick = Duration::from_secs_f64(EVENT_SECONDS);
     let declared = closure.manifest.length + closure.objects.iter().map(|o| o.length).sum::<u64>();
     let flight = Flight::lead(
         request.store,
@@ -375,7 +480,7 @@ fn run(request: &Request<'_>, hold: bool) -> Result<(Ensured, Option<PartHold>)>
         counters.origin_bytes.load(Ordering::Relaxed) as f64 / started.elapsed().as_secs_f64(),
         counters.attempt.load(Ordering::Relaxed),
     );
-    if narrowed {
+    if attest {
         crate::origin::attest(request.store, &closure.manifest, &format!("{} {}", request.hub, request.refspec))?;
     }
     let part = if hold {

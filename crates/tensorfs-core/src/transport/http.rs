@@ -210,7 +210,7 @@ const MAX_IDLE: usize = 32;
 /// A connection belongs to its origin and the credentials sent on it, never to one
 /// request target: a signed CDN URL changes per resolve, and keying on it meant the
 /// delivery hop never reused a socket.
-#[derive(PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 struct Scope {
     https: bool,
     host: String,
@@ -888,9 +888,14 @@ impl BodyReader<'_> {
     /// reader is dropped: the consumer may still spend seconds hashing, fsyncing and
     /// committing what arrived, and the next object's GET should find this socket idle.
     fn recycle_if_consumed(&mut self) {
-        // Only a fully consumed, unambiguous Content-Length response is reusable.
-        // Dropped/failed bodies, chunked bodies and EOF-delimited replies close.
-        if !matches!(self.framing, Framing::Length { remaining: 0 }) || self.raw_len() != 0 {
+        // Only a fully consumed, unambiguously framed response is reusable: its
+        // Content-Length read, or its last chunk and trailers. Dropped/failed bodies and
+        // EOF-delimited replies close.
+        let consumed = matches!(
+            self.framing,
+            Framing::Length { remaining: 0 } | Framing::Chunked { done: true, .. }
+        );
+        if !consumed || self.raw_len() != 0 {
             return;
         }
         let Some(recycle) = self.recycle.take() else {
@@ -1090,6 +1095,7 @@ impl BodyReader<'_> {
                             in_chunk: 0,
                             done: true,
                         };
+                        self.recycle_if_consumed();
                         return Ok(0);
                     }
                     in_chunk = size;
@@ -1217,12 +1223,23 @@ pub fn send<'l>(
     fail: Code,
 ) -> Result<Response<'l>> {
     ledger.check_running()?;
-    let opened = Instant::now();
     let scope = pool.map(|scoped| Scope::of(checked, scoped));
-    let cached = scope.as_ref().and_then(|scope| client.take(scope, checked));
-    let mut wire = if let Some(wire) = cached {
-        wire
-    } else {
+    let exchange = |wire: Wire, opened: Instant| {
+        exchange(
+            client, checked, method, headers, body, scope.as_ref(), wire, opened, deadline, ledger,
+            judge, write_silence, fail,
+        )
+    };
+    // An idle connection its origin closed meanwhile fails before any answer: every pooled
+    // exchange is idempotent, so it is made again on a fresh connection.
+    if let Some(wire) = scope.as_ref().and_then(|scope| client.take(scope, checked)) {
+        match exchange(wire, Instant::now()) {
+            Err(refusal) if refusal.code == fail && ledger.check_running().is_ok() => {}
+            answered => return answered,
+        }
+    }
+    let opened = Instant::now();
+    let wire = {
         let sock = connect(checked, deadline, ledger, judge, fail)?;
         if checked.https {
             let name = ServerName::try_from(checked.host.clone()).map_err(|_| Refusal {
@@ -1258,7 +1275,26 @@ pub fn send<'l>(
             Wire::Plain(sock)
         }
     };
+    exchange(wire, opened)
+}
 
+/// One request written on `wire` and its answer's head read.
+#[allow(clippy::too_many_arguments)]
+fn exchange<'l>(
+    client: &Client,
+    checked: &CheckedUrl,
+    method: &str,
+    headers: &[(String, String)],
+    body: Option<Payload<'_>>,
+    scope: Option<&Scope>,
+    mut wire: Wire,
+    opened: Instant,
+    deadline: Deadline,
+    ledger: &'l Ledger,
+    judge: Judge,
+    write_silence: Option<Duration>,
+    fail: Code,
+) -> Result<Response<'l>> {
     let default_port = if checked.https { 443 } else { 80 };
     let mut head = format!("{method} {} HTTP/1.1\r\n", checked.target);
     if checked.port == default_port {
@@ -1327,20 +1363,19 @@ pub fn send<'l>(
     ledger.answered();
 
     let framing = framing_of(status, &response_headers, fail)?;
+    let lengths = response_headers.iter().filter(|(name, _)| name == "content-length").count();
     let reusable = http11
         && status >= 200
-        && matches!(framing, Framing::Length { .. })
-        && response_headers
-            .iter()
-            .filter(|(name, _)| name == "content-length")
-            .count()
-            == 1
+        && match framing {
+            Framing::Length { .. } => lengths == 1,
+            Framing::Chunked { .. } => lengths == 0,
+            Framing::Eof => false,
+        }
         && !response_headers.iter().any(|(name, value)| {
-            name == "transfer-encoding"
-                || name == "connection"
-                    && value
-                        .split(',')
-                        .any(|part| part.trim().eq_ignore_ascii_case("close"))
+            name == "connection"
+                && value
+                    .split(',')
+                    .any(|part| part.trim().eq_ignore_ascii_case("close"))
         });
     Ok(Response {
         status,
@@ -1349,7 +1384,7 @@ pub fn send<'l>(
             wire: Some(wire),
             recycle: scope
                 .filter(|_| reusable)
-                .map(|scope| Box::new((Arc::clone(&client.idle), scope))),
+                .map(|scope| Box::new((Arc::clone(&client.idle), scope.clone()))),
             framing,
             raw: spill,
             raw_at: 0,
