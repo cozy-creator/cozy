@@ -10,10 +10,9 @@ policy. Runtime constructs models and performs GPU operations through the local 
 and device APIs within those grants; TensorD may retain exported GPU allocation handles.
 Serialized Store content, prepared CPU buffers and GPU tensors have distinct lifetimes.
 
-The default inference reader returns owned Torch tensors (install `tensorfs[torch]`).
-Torch loads only when tensor access is requested. Storage and metadata remain lightweight.
-The following standalone Store example fills caller-owned buffers. Managed Runtime uses
-owner-supplied sources and buffers instead of opening the managed Store::
+TensorFS never imports Torch. The following standalone Store example fills caller-owned
+buffers. Managed Runtime uses owner-supplied sources and buffers instead of opening the
+managed Store::
 
     import torch, tensorfs
 
@@ -47,14 +46,6 @@ from . import errors
 from .records import (
     CheckpointReceipt, DerivedReceipt, ObjectRef, PartReceipt, FitResult, TensorPart,
     Asset, Encoding, TensorLogical, InlinePart, SegmentedPart, Tensor, Header, EnsureEvent, EnsureResult, Relief,
-)
-from ._tensors import (
-    TensorAccessError,
-    TensorAllocation,
-    TensorReader,
-    from_parts,
-    physical_tensors,
-    tensors,
 )
 from .derived import (
     Derivation,
@@ -229,12 +220,6 @@ DTYPES: dict[str, int] = dtypes()
 
 __all__ = [
     "STORE",
-    "TensorAccessError",
-    "TensorAllocation",
-    "TensorReader",
-    "from_parts",
-    "physical_tensors",
-    "tensors",
     "Derivation",
     "OutputCapability",
     "SourceCapability",

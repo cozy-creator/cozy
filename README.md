@@ -120,29 +120,6 @@ Plus one bounded operational DTO, `source-plan.json`, specified below. Naming th
 make them stored formats; refusing to name them only made the count look smaller than the
 system.
 
-## PyTorch tensor access
-
-Install `tensorfs[torch]` for the default Python inference interface. Plain `import tensorfs` and the storage/metadata APIs remain Torch-free. Reads return owned tensors; closing the reader does not invalidate them.
-
-This example opens a standalone Store explicitly. Managed Runtime execution uses the
-source capabilities and buffers TensorD supplies instead of opening the managed Store.
-
-```python
-import tensorfs
-
-store = tensorfs.Store.open("/var/lib/tensorfs")
-with tensorfs.tensors(store, manifest, components=("dit",)) as weights:
-    weight = weights.get("dit", "blocks.0.to_q.weight", device="cuda:0")
-```
-
-The reader also accepts an existing scoped `SourceCapability`, which it borrows without opening a Store or closing the caller's capability. One `get` reads one tensor through native verified part reads. CPU output is direct; CUDA output uses bounded pinned staging and waits for transfer completion before returning. No source file is mapped writable, and no full model is materialized.
-
-Plain encodings return `torch.Tensor`; the two current rowwise FP8 encodings return released TorchAO 0.18.0 `Float8Tensor` with exact encoded bytes and scales. Other codecs refuse before allocation/read. The default FP8 object has upstream weight-only semantics when used by a standard `nn.Linear`; that upstream forward may dequantize. TensorFS performs no load-time dequantization or requantization.
-
-`get(..., out=tensor)` fills an exact caller-owned destination and preserves its execution options. An omitted `device` uses `out.device`, or CPU when no output is provided; an explicit device must match the output. Source access is checked or leased before allocating destination storage. `allocator=callback` alternatively allocates each validated physical `TensorAllocation`. In managed execution, Runtime plans these operations within TensorD's memory grants. Caller-provided output may be partially written if a read fails; no successful tensor result is returned. Physical destination version counters are incremented even after a partial write so Runtime residency checks cannot reuse an old verdict.
-
-`tensorfs.from_parts(spec, parts, *, mm_config=None, kernel_preference=None, act_quant_kwargs=None)` adopts existing physical Torch allocations without copying. `spec` is `tensorfs.derived.Tensor`; it retains the native logical dtype/shape, encoding ID and `Part` metadata. Execution options must be the reviewed upstream objects; they cannot override stored geometry. Runtime supplies its activation/GEMM policy and owns Parameter assignment and LoRA. `tensorfs.physical_tensors(value)` exposes supported physical leaves for census without reconstructing logical weights.
-
 ## Store root
 
 TensorFS owns its Store location independently of Creator. User-facing entrypoints resolve one

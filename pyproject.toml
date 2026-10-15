@@ -13,9 +13,6 @@ classifiers = [
     "Programming Language :: Rust",
 ]
 
-[project.optional-dependencies]
-torch = ["torch>=2.11", "torchao==0.18.0", "numpy>=1.26"]
-
 [tool.maturin]
 manifest-path = "crates/tensorfs-py/Cargo.toml"
 module-name = "tensorfs._ext"

@@ -155,16 +155,6 @@ jobs:
           bash scripts/wheel-smoke.sh "${RUNNER_TEMP}/smoke" python3.12 --skip-build --wheels "$PWD/dist"
           sudo "${RUNNER_TEMP}/smoke/venv/bin/python" scripts/scoped-derived.py --isolation
           sudo "${RUNNER_TEMP}/smoke/venv/bin/python" scripts/scoped-model-reader.py --isolation
-      - name: Optional PyTorch interface over the built wheel
-        env:
-          CUDA_VISIBLE_DEVICES: ""
-          UV_TORCH_BACKEND: cpu
-        run: |
-          uv venv "${RUNNER_TEMP}/tensor-interface" --python 3.12
-          for wheel in dist/*.whl; do
-            uv pip install --python "${RUNNER_TEMP}/tensor-interface/bin/python" "$wheel[torch]" "torch==2.13.0"
-          done
-          "${RUNNER_TEMP}/tensor-interface/bin/python" scripts/torch-interface.py
       # A newer-host CLI swapped into the portable wheel must falsify its platform tag.
       - run: |
           for wheel in dist/*.whl; do
