@@ -485,11 +485,17 @@ func (m *machineRuns) specV1(ctx context.Context, request records.Request, machi
 		return m.operationSpecV1(ctx, request, machine)
 	}
 	if request.GPUs > 0 {
-		frame, err := machine.Status(ctx)
-		if err != nil {
-			return nil, machines.Transport(err)
+		// What a machine can do changes only with its boot: asked once per boot, not per run.
+		key := machine.Name + "\x00" + machine.BootID
+		capabilities, held := m.capabilities.Load(key)
+		if !held {
+			frame, err := machine.Status(ctx)
+			if err != nil {
+				return nil, machines.Transport(err)
+			}
+			capabilities, _ = m.capabilities.LoadOrStore(key, frame.GetCapabilities())
 		}
-		if !slices.Contains(frame.GetCapabilities(), "run-gpus/1") {
+		if !slices.Contains(capabilities.([]string), "run-gpus/1") {
 			return nil, exit.Named(exit.Structural, "machine.gpu_count_unsupported",
 				"%s cannot honor an explicit GPU count; nothing was submitted", machine.Name).
 				WithRemedy("%s", machines.RuntimeUpdate(machine.Name))

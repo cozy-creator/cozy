@@ -28,9 +28,11 @@ type machineRuns struct {
 	// reach the machine before that command returns; observation remains detachable.
 	foreground bool
 	// sent is what each machine boot was last sent of each unpublished package (machinev1.Held).
-	sent     sync.Map
-	placed   map[string]string // the last placement decision recorded per waiting run
-	machines *machines.Resolver
+	sent sync.Map
+	// capabilities are each machine boot's, as its Status first stated them.
+	capabilities sync.Map
+	placed       map[string]string // the last placement decision recorded per waiting run
+	machines     *machines.Resolver
 	// submit records an operation as a run (api.Server.SubmitOperation), once Calcifer serves.
 	submit func(machine string, op records.Operation) (records.Request, bool, *exit.Error)
 	// submitting stops each request's submission work in flight (upload, preparation,
