@@ -9,7 +9,8 @@ dist/
 vectors/store/meta/
 vectors/store/verified/
 vectors/store/tmp/
-wheel-data/
+wheel-data/scripts/*
+!wheel-data/scripts/.gitkeep
 
 # Agent task and ownership notes stay out of history
 .task/

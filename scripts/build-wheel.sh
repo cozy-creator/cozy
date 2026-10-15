@@ -39,7 +39,6 @@ case "$said" in
     *) echo "built tfs says \"$said\", not version $version — refusing to stage" >&2; exit 1 ;;
 esac
 
-rm -rf wheel-data
 mkdir -p wheel-data/scripts
 install -m 755 target/release/tfs wheel-data/scripts/tfs
 
