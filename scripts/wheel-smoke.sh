@@ -50,29 +50,20 @@ echo "installed into fresh venv: $("$work/venv/bin/python" -V)"
 # a refusal class the facade forgot to re-export: all of them stop here.
 "$work/venv/bin/python" scripts/stub_conform.py
 "$work/venv/bin/python" scripts/typed-consumer.py
-"$work/venv/bin/python" scripts/source-artifacts.py
-"$work/venv/bin/python" scripts/ensure-proof.py "$work/venv/bin/tfs"
-"$work/venv/bin/python" scripts/pull-control-proof.py "$work/venv/bin/tfs"
 "$work/venv/bin/python" scripts/import-tree.py
-"$work/venv/bin/python" scripts/keyed-roots.py
-"$work/venv/bin/python" scripts/trust-index.py
 "$work/venv/bin/python" scripts/fit-runs.py
 "$work/venv/bin/python" scripts/derived-resume.py
 "$work/venv/bin/python" scripts/derived-declaration.py
-"$work/venv/bin/python" scripts/derived-assets.py
 "$work/venv/bin/python" scripts/derived-graft.py
-"$work/venv/bin/python" scripts/derived-retention.py
 "$work/venv/bin/python" scripts/read-model-parts.py
 "$work/venv/bin/python" scripts/derived-writer-concurrency.py
 "$work/venv/bin/python" scripts/scoped-derived.py
 "$work/venv/bin/python" scripts/scoped-model-reader.py
 "$work/venv/bin/python" scripts/read-plan-selection.py
-"$work/venv/bin/python" scripts/read-lease-concurrency.py "$fixture" "$SNAP"
+"$work/venv/bin/python" scripts/read-lease-concurrency.py
 "$work/venv/bin/python" scripts/plane-host-tier.py
-"$work/venv/bin/python" scripts/stats.py "$fixture" "$SNAP"
 # The frozen corpus, through the FACADE. `cargo test --test vectors` runs the same vectors
 # through Rust; this proves the marshal boundary agrees — same ids, same typed refusals.
-"$work/venv/bin/python" scripts/facade-conform.py
 
 "$work/venv/bin/python" - "$fixture" "$SNAP" <<'PY'
 import hashlib, os, pathlib, sys, tempfile
@@ -83,14 +74,7 @@ print("import tensorfs OK ->", tensorfs.__file__, tensorfs.__version__)
 
 with tempfile.TemporaryDirectory(prefix="tensorfs-default-home-") as default_root:
     os.environ["TENSORFS_HOME"] = default_root
-    assert tensorfs.home() == default_root
-    assert tensorfs.home(pathlib.Path(default_root) / "explicit") == str(
-        pathlib.Path(default_root) / "explicit"
-    )
-    default_store = tensorfs.Store.ensure()
-    assert default_store.root == default_root
-    default_store.prepare_readers()
-    assert default_store.complete_cozytensors_manifests() == []
+    assert tensorfs.Store.ensure().root == default_root
     assert tensorfs.Store.ensure().root == default_root
     del os.environ["TENSORFS_HOME"]
 
@@ -110,122 +94,47 @@ names = [(c, k) for c in header["components"] for k in header["components"][c]]
 comp, key = names[0]
 tensor = header["components"][comp][key]
 print(f"named tensor: {comp}/{key} {tensor['logical']['logical_dtype']} {tensor['logical']['shape']}")
-
-order = names
-plan = tensorfs.plan(info["header"], order, window=1 << 16)
-slots = [memoryview(bytearray(1 << 18)) for _ in range(3)]
-digest = hashlib.sha256()
+plan = tensorfs.plan(info["header"], names, window=1 << 16)
+assert len(plan) > 0 and plan.bytes > 0
 
 with store.acquire_cozytensors(snap) as lease:
     print(f"lease: {len(lease.objects)} objects, {lease.bytes} B verified")
-    first_id, first_length = lease.objects[0]
     for asset_name, asset in header["assets"].items():
         asset_bytes = lease.read_asset(info["header"], asset_name)
         assert len(asset_bytes) == asset["logical_length"]
         assert hashlib.sha256(asset_bytes).hexdigest() == asset["logical_sha256"]
-
-    def on_batch(b):
-        digest.update(slots[b.slot][: b.nbytes])
-        b.release()
-
-    st = lease.stream(plan, slots, on_batch, readers=2)
-
-got = digest.hexdigest()
-print(f"streamed {st['items']} items, {st['bytes']} B -> sha256 {got[:16]}…")
-assert st["items"] > 0 and st["bytes"] > 0
+    role, part = next(iter(tensor["parts"].items()))
+    segments = part.get("segments", [])
+    data = bytearray(sum(s["length"] for s in segments) if segments else len(part["inline"]))
+    lease.read_part_into(info["header"], comp, key, role, 0, data)
+    offset = 0
+    for segment in segments:
+        chunk = data[offset:offset + segment["length"]]
+        assert hashlib.sha256(chunk).hexdigest() == segment["sha256"]
+        offset += segment["length"]
+    assert segments or data == part["inline"]
+print(f"read {comp}/{key} {role}: {len(data)} B, matches the header")
 
 with tempfile.TemporaryDirectory(prefix="tensorfs-transfer-") as transfer_root:
-    destination = tensorfs.Store.init(transfer_root)
+    destination = tensorfs.Store.init(pathlib.Path(transfer_root) / "store")
     operation = destination.begin_operation("wheel-acquire", "tensorhub", "smoke")
     operation.hold_manifest(snap, len(info["manifest"]))
     closure = store.walk_cozytensors(snap)
+    copy = pathlib.Path(transfer_root) / "object"
     for reached in closure:
-        operation.hold_blob(reached["id"], reached["length"])
-        tensorfs.transfer_object(store, destination, reached["id"], reached["length"])
-    admitted_manifest = tensorfs.transfer_manifest(
-        store, destination, snap, len(info["manifest"])
-    )
-    assert admitted_manifest["id"] == "sha256:" + snap
-    declared = sorted({(row["id"], row["length"]) for row in closure})
-    pull = tensorfs.fetch_plan(
-        destination,
-        "wheel-runtime-closure",
-        snap,
-        len(info["manifest"]),
-        declared,
-    )
-    assert not pull["wanted"]
-    assert tensorfs.fetch_complete_cozytensors(destination, pull["document"]) == (
-        len(info["manifest"]) + sum(length for _, length in declared)
-    )
-    assert all(isinstance(config, bytes) for config in header["configs"].values())
-    repo_bytes = operation.commit_release(None, "1.0.0", "cpu", snap, len(info["manifest"]))
-    assert destination.repo_get("tensorhub", "smoke") == repo_bytes
-    assert destination.resolve_release("tensorhub", "smoke", "1.0.0", "cpu") == {
-        "org": "tensorhub",
-        "name": "smoke",
-        "version": "1.0.0",
-        "revision": 1,
-        "lane": "cpu",
-        "manifest_digest": "sha256:" + snap,
-        "manifest_length": len(info["manifest"]),
-    }
-    local_a = destination.replace_local(
-        None, "dev-model", "sha256:" + "11" * 32,
-        snap, len(info["manifest"]),
-    )
-    assert destination.resolve_local("dev-model") == {
-        "name": "dev-model",
-        "source_selection": "sha256:" + "11" * 32,
-        "manifest_digest": "sha256:" + snap,
-        "manifest_length": len(info["manifest"]),
-    }
-    local_b = destination.replace_local(
-        local_a, "dev-model", "sha256:" + "22" * 32,
-        snap, len(info["manifest"]),
-    )
-    assert destination.repo_get("local", "dev-model") == local_b
-    assert destination.resolve_local("dev-model")["source_selection"] == "sha256:" + "22" * 32
-    try:
-        destination.replace_local(
-            local_a, "dev-model", "sha256:" + "33" * 32,
-            snap, len(info["manifest"]),
-        )
-        raise AssertionError("stale local alias replacement succeeded")
-    except tensorfs.errors.RepositoryConflict:
-        pass
-    destination.remove_local(local_b, "dev-model")
-    try:
-        destination.resolve_local("dev-model")
-        raise AssertionError("removed local alias resolved")
-    except tensorfs.errors.RepositoryAbsent:
-        pass
-    try:
-        destination.resolve_release("tensorhub", "smoke", "1.0.1", "cpu")
-        raise AssertionError("missing release resolved")
-    except tensorfs.errors.ReleaseAbsent:
-        pass
+        copy.write_bytes(store.document(reached["id"], reached["length"]))
+        destination.put_file(copy, reached["id"], reached["length"])
+    admitted = destination.put_manifest(info["manifest"], "sha256:" + snap, len(info["manifest"]))
+    assert admitted["id"] == "sha256:" + snap
+    operation.commit_release(None, "1.0.0", "cpu", snap, len(info["manifest"]))
     with destination.acquire_manifest(snap) as acquired:
         assert acquired.objects
-    print(f"acquisition: {len(closure)} blobs -> manifest -> repository CAS -> lease")
-
-try:
-    tensorfs.platform_gate("win32")
-except tensorfs.errors.PlatformUnsupported as e:
-    print("platform gate:", e.code)
+    print(f"acquisition: {len(closure)} objects -> manifest -> repository -> lease")
 
 try:
     tensorfs.parse_header(info["manifest"])
 except tensorfs.errors.MalformedCbor as e:
     print("typed refusal :", e.code, "|", e.detail[:60])
-
-try:
-    store.prepare_model_source(
-        "wheel-source-proof", "sha256:" + "44" * 32, [], [], [],
-    )
-    raise AssertionError("empty model source preparation succeeded")
-except tensorfs.errors.CountCap as e:
-    print("source facade :", e.code, "| one compiled planner/executor")
 
 print("SMOKE GREEN")
 PY

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Select native part windows from a complete plan and stream exact bytes through its lease."""
+"""Select native part windows from a complete plan and read exact bytes through its lease."""
 
 import io
 import tempfile
@@ -54,26 +54,23 @@ def main():
             assert after == {**before, "dest_off": offset}
             offset += after["len"]
         assert full.items() == original
-        assert (selected.bytes, selected.io_bytes, selected.inline_parts) == (2052, 2048, 1)
+        assert selected.bytes == 2052
         assert selected.order == full.order
         refused("DUPLICATE_KEY", lambda: full.select([targets[0], targets[0]]))
         refused("MISSING_FIELD", lambda: full.select(["model/no-such-part#value"]))
         empty = full.select([])
-        assert len(empty) == empty.bytes == empty.io_bytes == empty.inline_parts == empty.batches(512) == 0
-        slots = [memoryview(bytearray(512)) for _ in range(2)]
-        batches = {}
-
-        def receive(batch):
-            batches[batch.index] = bytes(slots[batch.slot][:batch.nbytes])
-            batch.release()
-
+        assert len(empty) == empty.bytes == 0
         with store.acquire_cozytensors(manifest) as lease:
-            result = lease.stream(selected, slots, receive, readers=2)
-            assert b"".join(batches[index] for index in sorted(batches)) == data + bias
-            assert (result["bytes"], result["io_bytes"], result["items"]) == (2052, 2048, 17)
-            assert lease.stream(empty, slots, receive, readers=2)["bytes"] == 0
+            read = bytearray()
+            for row in actual:
+                if row["source"] == "inline":
+                    continue
+                chunk = bytearray(row["len"])
+                lease.read_into(row["object"], row["object_length"], row["off"], row["len"], chunk)
+                read += chunk
+            assert read == data
         print("read plan selection green: complete census retained; 16 data windows + inline bias; "
-              "native sources/order unchanged, compact destinations, exact leased stream, empty/duplicate/unknown arms")
+              "native sources/order unchanged, compact destinations, exact leased reads, empty/duplicate/unknown arms")
 
 
 if __name__ == "__main__":

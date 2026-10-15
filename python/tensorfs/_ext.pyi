@@ -31,94 +31,30 @@ from os import PathLike
 from types import ModuleType
 from typing import Literal, Self
 from .records import (
-    AbandonResult,
-    Asset,
-    AssetUpdate,
-    BatchItem,
-    CapabilityResult,
     CheckoutResult,
-    CheckpointObject,
     CheckpointReceipt,
-    CheckpointRoot,
-    CheckpointTransfer,
-    ConfigDeclaration,
     DeclarationConfigs,
     DeclarationFiles,
     DeclarationSources,
     DeclarationTargets,
-    DerivationArguments,
     DerivedLookup,
     DerivedReceipt,
-    DerivedSource,
     DerivedWriteEstimate,
-    Disposition,
     DispositionResult,
-    DocumentResult,
-    Durability,
-    Encoding,
-    EnsureEvent,
-    EnsureResult,
-    FetchAdmission,
-    FetchPlan,
     FitResult,
-    FitRoutes,
     GCResult,
     Header,
-    InheritObservation,
-    InlinePart,
-    InspectedComponent,
-    InspectedConfig,
-    InspectedPart,
     InspectedSource,
-    InspectedTensor,
-    KeyedRoot,
-    LocalRow,
-    ManifestDocument,
-    ManifestEntry,
     ManifestRow,
-    MaterializedSource,
     ObjectKey,
-    ObjectRef,
-    PartDeclaration,
-    PartKey,
     PartReceipt,
-    PartSelection,
-    PreparedModelSource,
-    PreparedSelection,
-    PreparedSource,
-    PullResult,
     PutResult,
     ReadItem,
-    ReadReceipt,
     Reader,
-    ReleaseLane,
-    ReleaseRow,
-    Relief,
-    RemovedRepository,
-    RetainedResult,
-    SegmentedPart,
-    SelectedSource,
-    SourceBytes,
-    SourceCarrier,
-    SourceCheckpoint,
-    SourceCheckpointKey,
     SourceCheckpointPage,
-    SourceFacts,
-    SourceHead,
-    SourceMember,
-    SourceObject,
-    SourceProfile,
-    Stats,
-    StreamResult,
-    TargetDeclaration,
-    Tensor,
-    TensorDeclaration,
     TensorKey,
-    TensorLogical,
-    TensorPart,
     TensorRequirementRow,
     TreeRoot,
-    VerifyResult,
     WalkObject,
 )
 
@@ -285,39 +221,14 @@ CODES: dict[str, type[Refusal]]
 
 # --------------------------------------------------------------------------------- reads
 
-class Batch:
-    """One filled slot in the reader ring. `release()` is a positive act: the slot is not
-    recycled until the caller says the DMA out of it has completed."""
-
-    @property
-    def index(self) -> int: ...
-    @property
-    def slot(self) -> int: ...
-    @property
-    def nbytes(self) -> int: ...
-    @property
-    def io_bytes(self) -> int: ...
-    @property
-    def read_ms(self) -> int: ...
-    @property
-    def released(self) -> bool: ...
-    def items(self) -> list[BatchItem]: ...
-    def release(self) -> bool: ...
-    def __enter__(self) -> Self: ...
-    def __exit__(self, *_args: object) -> bool: ...
 
 class ReadPlan:
     def select(self, whats: Sequence[str]) -> ReadPlan: ...
     @property
     def bytes(self) -> int: ...
     @property
-    def io_bytes(self) -> int: ...
-    @property
-    def inline_parts(self) -> int: ...
-    @property
     def order(self) -> str: ...
     def items(self) -> list[ReadItem]: ...
-    def batches(self, slot_bytes: int) -> int: ...
     def __len__(self) -> int: ...
 
 class ReadLease:
@@ -333,10 +244,7 @@ class ReadLease:
     @property
     def objects(self) -> list[tuple[str, int]]: ...
     @property
-    def receipts(self) -> list[ReadReceipt]: ...
-    @property
     def live(self) -> bool: ...
-    def recheck(self) -> None: ...
     def release(self) -> None: ...
     def read_into(
         self, object: str, object_length: int, off: int, length: int, into: object
@@ -345,13 +253,6 @@ class ReadLease:
     def read_part_into(
         self, header: _Bytes, component: str, key: str, role: str, off: int, into: object
     ) -> None: ...
-    def stream(
-        self,
-        plan: ReadPlan,
-        slots: Sequence[object],
-        on_batch: Callable[[Batch], object],
-        readers: int = 4,
-    ) -> StreamResult: ...
     def __enter__(self) -> Self: ...
     def __exit__(self, *_args: object) -> bool: ...
 
@@ -365,7 +266,6 @@ class Closure:
 class Operation:
     """One repository operation's exact CAS holds, released when it commits or is dropped."""
 
-    def hold_blob(self, identity: str, length: int) -> None: ...
     def hold_manifest(self, identity: str, length: int) -> None: ...
     def commit_release(
         self,
@@ -379,7 +279,6 @@ class Operation:
 class DerivedWriter:
     def part_write_bound(self, component: str, key: str, role: str) -> int: ...
     def config_write_bound(self, name: str) -> int: ...
-    def sources(self) -> list[SourceFacts]: ...
     def completed_parts(self) -> list[tuple[str, str, str]]: ...
     def completed_configs(self) -> list[str]: ...
     def checkpoint(self, operation_id: str, slot: str, *, previous: ObjectKey | None = None) -> CheckpointReceipt: ...
@@ -416,97 +315,26 @@ class Store:
     def init(root: StrPath | None = None) -> Store: ...
     @property
     def root(self) -> str: ...
-    def bind_fingerprint_registry(self, data: bytes | None) -> None: ...
-    @property
-    def implementation_sha256(self) -> str: ...
-    def verify_checkpoint_source(
-        self, repository: str, manifest_id: str, manifest_length: int,
-    ) -> None: ...
-    def retain_checkpoint_root(
-        self, owner: str, repository: str, manifest_id: str, manifest_length: int,
-    ) -> CheckpointRoot: ...
-    def checkpoint_root(self, owner: str) -> CheckpointRoot | None: ...
-    def release_checkpoint_root(
-        self, owner: str, repository: str, manifest_id: str, manifest_length: int,
-    ) -> CheckpointRoot: ...
-    def create_tree_root(self, owner: str, manifest_id: str, manifest_length: int) -> TreeRoot: ...
     def import_tree(
         self, owner: str, manifest_bytes: bytes, files: Sequence[tuple[str, StrPath]],
     ) -> TreeRoot: ...
-    def retain_tree_root(self, source_owner: str, owner: str) -> TreeRoot: ...
-    def tree_root(self, owner: str) -> TreeRoot | None: ...
-    def deliver_tree_root(self, owner: str) -> None: ...
-    def release_tree_root(self, owner: str) -> None: ...
-    def release_tree_retention(self, source_owner: str, receipt_digest: str, owner: str) -> None: ...
-    def adopt_source_progress(self, source_owner: str, owner: str) -> TreeRoot: ...
-    def put_keyed_root(
-        self, space: str, key: str, manifest_bytes: bytes, files: Sequence[tuple[str, StrPath]],
-    ) -> KeyedRoot: ...
-    def keyed_root(self, space: str, key: str) -> KeyedRoot | None: ...
-    def keyed_roots(self, space: str) -> list[KeyedRoot]: ...
-    def drop_keyed_root(self, space: str, key: str) -> bool: ...
-    def resolve_source(
-        self, source_uri: str, carriers: Sequence[str] = ..., *, profiles: Sequence[str] = ..., files: Sequence[str] = ..., credential: str = ...,
-        huggingface: str | None = None, civitai: str | None = None, allow_local: bool = False,
-        registry: bytes | None = None,
-    ) -> SelectedSource: ...
-    # progress(present, total): durable bytes of the selection's distinct objects, called
-    # from download threads; an exception it raises stops the download and is re-raised.
-    def materialize_source(
-        self, owner: str, members: Sequence[SourceMember], *,
-        allowed_hosts: Sequence[str], credential_hosts: Sequence[str] = ...,
-        credential: str = ..., allow_local: bool = False,
-        progress: Callable[[int, int], object] | None = None,
-    ) -> MaterializedSource: ...
-    # An empty checkpoints list with adopt_from_operation_id snapshots the stopped
-    # predecessor's verified local journal before normal independent adoption.
-    def prepare_source_artifact(
-        self, source_owner: str, operation_id: str, profiles: Sequence[SourceProfile], *,
-        checkpoints: Sequence[SourceCheckpointKey] = ...,
-        adopt_from_operation_id: str | None = None,
-        registry: bytes | None = None,
-    ) -> PreparedModelSource: ...
     #: Read-only: the mount is recorded on the Store by `tfs store ensure --repo-cache`,
     #: and no caller of this facade passes one.
     @property
     def repo_cache(self) -> str | None: ...
-    def prepare_readers(self) -> None: ...
-    def complete_cozytensors_manifests(self) -> list[str]: ...
-    def contains(self, hex: str) -> bool: ...
-    def update_model_assets(
-        self,
-        manifest_id: str,
-        manifest_length: int,
-        copies: Sequence[tuple[str, str, str]] = ...,
-        inherits: Sequence[tuple[str, str]] = ...,
-        drops: Sequence[str] = ...,
-    ) -> AssetUpdate: ...
-    def inherit_model_assets(
-        self,
-        target_manifest_id: str,
-        target_manifest_length: int,
-        source_manifest_id: str,
-        source_manifest_length: int,
-        names: Sequence[str] = ...,
-    ) -> AssetUpdate: ...
-    def objects(self) -> list[str]: ...
-    def reap_holds(self) -> list[str]: ...
 
     # -- content
+    def contains(self, hex: str) -> bool: ...
     def put_file(
         self, path: StrPath, expect: str | None = None, expect_length: int | None = None
     ) -> PutResult: ...
-    def put_reader(self, reader: Reader, expect: str, expect_length: int) -> PutResult: ...
     def put_manifest(
         self, data: bytes, expect: str | None = None, expect_length: int | None = None
     ) -> PutResult: ...
-    def verify(self, hex: str) -> VerifyResult: ...
     def document(self, hex: str, max_bytes: int = ...) -> bytes: ...
     def manifest(self, hex: str) -> ManifestRow: ...
-    def walk(self, hex: str) -> list[WalkObject]: ...
     def walk_cozytensors(self, hex: str) -> list[WalkObject]: ...
     def checkout(self, hex: str, dest: StrPath, symlink: bool = True) -> CheckoutResult: ...
-    def materialize(self, hex: str, path: str, dest: StrPath) -> int: ...
 
     # -- leases
     def acquire(self, manifest: str, objects: Sequence[ObjectKey]) -> ReadLease: ...
@@ -515,60 +343,10 @@ class Store:
 
     # -- repository
     def begin_operation(self, operation_id: str, org: str, name: str) -> Operation: ...
-    def repo_get(self, org: str, name: str) -> bytes: ...
-    def resolve_release(self, org: str, name: str, version: str, lane: str) -> ReleaseRow: ...
-    def resolve_local(self, name: str) -> LocalRow: ...
-    def replace_local(
-        self,
-        current: bytes | None,
-        name: str,
-        source_selection: str,
-        manifest_id: str,
-        manifest_length: int,
-    ) -> bytes: ...
-    def remove_local(self, current: bytes, name: str) -> RemovedRepository: ...
-    def update_release(
-        self,
-        current: bytes,
-        org: str,
-        name: str,
-        version: str,
-        expected_revision: int,
-        set: Sequence[ReleaseLane],
-        remove: Sequence[str],
-    ) -> bytes: ...
-    def yank_release(
-        self, current: bytes, org: str, name: str, version: str, expected_revision: int
-    ) -> bytes: ...
-
-    # Headers fix the plan before bodies arrive. Only landed physical carriers are read.
-    def prepare_model_source(
-        self,
-        operation_id: str,
-        source_selection_digest: str,
-        profiles: Sequence[SourceProfile],
-        roster: Sequence[SourceCarrier],
-        landed: Sequence[str],
-        *,
-        checkpoints: Sequence[SourceCheckpointKey] = ...,
-        adopt_from_operation_id: str | None = ...,
-        registry: bytes | None = None,
-        write_budget_bytes: int | None = None,
-    ) -> PreparedModelSource: ...
     def checkpoint_page(
         self, head_id: str, head_length: int, *, operation_id: str, slot: str,
         plan_digest: str, offset: int = 0, limit: int = 128,
     ) -> SourceCheckpointPage: ...
-    def checkpoint_push(
-        self, object_id: str, length: int, manifest: bool, grant: str, *, allow_local: bool = False,
-    ) -> CheckpointTransfer: ...
-    def checkpoint_fetch(
-        self, object_id: str, length: int, manifest: bool, url: str, *, allow_local: bool = False,
-        derived_restore: tuple[str, int] | None = None,
-    ) -> CheckpointTransfer: ...
-    def source_checkpoints(self, operation_id: str) -> list[SourceCheckpoint]: ...
-    def model_source_operations(self) -> list[str]: ...
-    def release_model_source(self, operation_id: str) -> None: ...
 
     # -- derived
     def inspect_derived_source(
@@ -620,39 +398,16 @@ class Store:
         head_id: str, head_length: int, *, operation_id: str, slot: str,
     ) -> CheckpointReceipt: ...
     def derived_lookup(self, transaction_id: str) -> DerivedLookup: ...
-    def derived_fence(self, transaction_id: str, writer_session_id: int) -> bool: ...
-    def derived_abandon(self, transaction_id: str) -> AbandonResult: ...
     def derived_adopt(self, transaction_id: str, scratch_root_id: str) -> DispositionResult: ...
     def derived_dispose(self, transaction_id: str) -> DispositionResult: ...
-    def retain_derived_result(self, transaction_id: str, expected_receipt_digest: str, retention_id: str) -> RetainedResult: ...
-    def release_derived_retention(self, transaction_id: str, expected_receipt_digest: str, retention_id: str) -> RetainedResult: ...
 
 # ------------------------------------------------------------------------ module functions
 
-def home(root: StrPath | None = None) -> str: ...
-def platform_gate(platform: str) -> None: ...
-
-def stats() -> Stats: ...
 def object_id(data: bytes) -> str: ...
 def parse_header(data: bytes, closure: Closure | None = None) -> Header: ...
-def parse_manifest(data: bytes) -> ManifestDocument: ...
-def run_doc(
-    doc: str,
-    data: bytes,
-    closure: Closure | None = None,
-    platform: Sequence[str] | None = None,
-) -> DocumentResult: ...
-def receipt_binds(
-    receipt: bytes, subject: bytes, manifest: bytes, header: bytes, stamp: bytes
-) -> None: ...
-def recanonicalize(doc: str, data: bytes) -> bytes: ...
-def render(data: bytes, max_bytes: int) -> str: ...
-def doc_kinds() -> list[str]: ...
-def platform_digests() -> list[str]: ...
 def seed_digests() -> list[tuple[str, str]]: ...
 def dtypes() -> dict[str, int]: ...
 def manifest_max_bytes() -> int: ...
-def capability(encoding: str, device: str, observations: bytes | None = None) -> CapabilityResult: ...
 
 #: The raw census comparison. `tensorfs.fit` is the typed wrapper and is what callers use.
 def _fit(
@@ -670,113 +425,11 @@ def plan(
     components: Sequence[str] | None = None,
     window: int = ...,
 ) -> ReadPlan: ...
-def gc(root: StrPath, dry_run: bool = False, *, evict_cached: bool = False, keep_manifests: list[str] = ...) -> GCResult: ...
-def read_source_heads(
-    source_uri: str,
-    members: Sequence[SourceMember],
-    *,
-    credential: str = ...,
-    huggingface: str | None = None,
-    civitai: str | None = None,
-    allow_local: bool = False,
-) -> list[tuple[str, bytes]]: ...
-def select_source_profile(
-    store: Store,
-    heads: Sequence[SourceHead],
-    *,
-    registry: bytes | None = None,
-) -> str: ...
-def source_profile_converters(
-    store: Store,
-    profiles: Sequence[str],
-    *,
-    registry: bytes | None = None,
-) -> list[tuple[str, str | None]]: ...
-def prepare_selected_source(
-    store: Store,
-    operation_id: str,
-    source_selection_digest: str,
-    profiles: Sequence[SourceProfile],
-    members: Sequence[SourceBytes],
-    *,
-    registry: bytes | None = None,
-    write_budget_bytes: int | None = None,
-) -> PreparedSelection: ...
-def record_model_source_custody(
-    store: Store, operation_id: str, objects: Sequence[ObjectKey], evidence: str
-) -> None: ...
-def model_source_objects(store: Store, operation_id: str) -> list[SourceObject]: ...
-def transfer_object(
-    source: Store, destination: Store, object_id: str, expected_length: int
-) -> PutResult: ...
-def transfer_manifest(
-    source: Store, destination: Store, manifest_id: str, expected_length: int
-) -> PutResult: ...
-def fetch_plan(
-    store: Store,
-    session: str,
-    manifest: str,
-    manifest_length: int,
-    declared: Sequence[ObjectKey],
-) -> FetchPlan: ...
-def fetch_admit(store: Store, plan: bytes, object_id: str, reader: Reader) -> FetchAdmission: ...
-def fetch_complete(store: Store, plan: bytes) -> int: ...
-def fetch_complete_cozytensors(store: Store, plan: bytes) -> int: ...
-class PullCancellation:
-    def __init__(self) -> None: ...
-    def cancel(self) -> None: ...
-    @property
-    def cancelled(self) -> bool: ...
+def gc(root: StrPath) -> GCResult: ...
 
-#: The most memory one transfer stream holds, whatever its object's size.
-STREAM_MEMORY: int
-#: The profile a source no reviewed profile recognizes is selected under: stored as-is.
-AS_IS_PROFILE: str
-
-# Concurrent transfer streams whose buffers fit the memory available now: at most `wanted`,
-# at least 1 (cgroup limit less unreclaimable usage, or MemAvailable).
-def transfer_streams(wanted: int) -> int: ...
-
-def pull(
-    store: Store,
-    hub: str,
-    refspec: str,
-    *,
-    lane: str = ...,
-    credential: str = ...,
-    timeout: float | None = None,
-    session: str = ...,
-    streams: int = ...,
-    streams_start: int = ...,
-    allowed_hosts: Sequence[str] = ...,
-    allow_local: bool = False,
-    sample_seconds: float | None = None,
-    cancellation: PullCancellation | None = None,
-    progress: Callable[[int, int], object] | None = None,
-) -> PullResult: ...
-
-#: Feature names a caller may detect instead of versions ("ensure/1", ...).
-CAPABILITIES: list[str]
-#: The store, downloader, ingest and GC bindings are present (False: a plane-only build).
+#: The store, derived-writer and GC bindings are present (False: a plane-only build).
 STORE: bool
 
-def ensure(
-    store: Store,
-    ref: str,
-    *,
-    hub: str,
-    lane: str = ...,
-    step: str = ...,
-    credential: str = ...,
-    ca_file: StrPath | None = None,
-    allowed_hosts: Sequence[str] = ...,
-    allow_local: bool = False,
-    keep: Sequence[str] = ...,
-    sample_seconds: float | None = None,
-    cancellation: PullCancellation | None = None,
-    progress: Callable[[EnsureEvent], object] | None = None,
-) -> EnsureResult: ...
-def relieve(store: Store, *, keep: Sequence[str] = ...) -> Relief: ...
 def serve_fetch(store: Store, fd: int, *, origins: Sequence[Mapping[str, object]], run: int = 0) -> None: ...
 def serve_source(
     store: Store, fd: int, manifest: str, length: int, *, check_current: Callable[[], object] | None = None

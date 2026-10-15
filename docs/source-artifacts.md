@@ -1,32 +1,13 @@
 # Retained sources and interrupted download recovery
 
-The native integration API accepts an already pinned provider URI and reviewed carrier
-selection. `Store.resolve_source` delegates to the provider resolver and its index/shard
-closure. `Store.materialize_source` consumes those exact rows without re-listing. These
-are deployment-adapter APIs: Creator still owns moving-ref acceptance, credentials and
-permission. An author-facing facade should pass a SourceArtifact capability, not URLs,
-credentials, or local paths.
-
-`resolve_source(uri, carriers, *, credential="", huggingface=None, civitai=None,
-allow_local=False)` returns the selected `(member, sha256, exact_length, URL)` rows,
-provider policy, accepted source spelling/selection digest, and content manifest identity.
-Endpoint overrides are for privileged deployment/tests. The content identity is the
-ordinary-file Manifest: logical names, raw SHA-256 and exact lengths. URL, origin and
-credential do not appear in that manifest or retained root.
-
-`materialize_source(owner, members, *, allowed_hosts, credential_hosts=[], credential="",
-allow_local=False, progress=None)` returns `artifact` plus per-call `transferred_bytes`.
-Artifact fields are owner, manifest_digest, manifest_length, complete and released. Owner
-IDs are prefixed SHA-256 identities assigned by the caller's operation journal. They are
-not user retry IDs. `progress(present, total)` is called from download threads as bytes
-become durable: held bytes plus bytes this call retained, over the selection's distinct
-object bytes. An exception it raises stops the download, keeps retained bytes, and is
-re-raised.
+TensorD resolves a pinned provider URI and its reviewed carrier selection, then retains the
+selected members as a source tree. The content identity is the ordinary-file Manifest:
+logical names, raw SHA-256 and exact lengths. URL, origin and credential do not appear in
+that manifest or retained root.
 
 The downloader moves up to 16 ranged GETs at once across all members, fewer when the
 memory this process can use (cgroup limit less unreclaimable usage, or MemAvailable) does not
-hold 16 streams' buffers; `tensorfs.transfer_streams(wanted)` answers the same question for
-a caller's own upload window. Each object is one
+hold 16 streams' buffers. Each object is one
 sparse file of verified runs; a run is asked for with one GET from its reached byte to its
 end and retains progress every 64 MiB: bytes are fdatasynced before the run's extent and
 digest are recorded by atomic rename. When no whole run is left to start, an idle stream
@@ -42,39 +23,21 @@ must match the pinned length and SHA-256 before the same native no-clobber CAS a
 used by ordinary writes. The prefix file becomes the CAS object; there is no second full
 staging write. Actual prefix bytes count in Store occupancy.
 
-A source owner fences its writer with kernel locks. `adopt_source_progress(source_owner,
-owner)` refuses a live or released predecessor, independently retains completed raw objects,
-and copies verified partial bytes into an independently writable recipient prefix. This
-copy is bounded by retained progress and is charged to disk occupancy. Only the donor's prefix
-is copied; its later runs are fetched again. Releasing the source then leaves the
-recipient intact. A plain retry of the same owner performs no such copy.
-An origin that ignores a Range restarts the object as one body from zero and counts
-repeated bytes. Expired delivery
-URLs preserve progress for a refreshed adapter call. The common HTTP opener refuses
+A source owner fences its writer with kernel locks. An origin that ignores a Range restarts
+the object as one body from zero and counts repeated bytes. Expired delivery URLs preserve
+progress for a refreshed adapter call. The common HTTP opener refuses
 transformed Content-Encoding before any body bytes reach the prefix.
 
-`retain_tree_root(source_owner, owner)` acquires independent custody of a completed tree.
-`release_tree_root(owner)` is permanent and idempotent after creation, cleans owned partial
-bytes, and never releases another owner. Native filesystem roots participate in GC even
-when no Python process is alive. `create_tree_root` can retain an already admitted ordinary
-file Manifest; it does not accept a CozyTensors checkpoint disguised as a source tree.
-
-`prepare_source_artifact(source_owner, operation_id, profiles, *, checkpoints=[],
-adopt_from_operation_id=None)` builds the existing native converter's roster from retained
-members. Carrier paths stay inside native code. It returns the existing prepare_model_source
-result, including native progress heads; callers repeat incomplete calls until complete.
-Its `spent` observations do not authorize deletion of the separately retained raw artifact.
-New tensor groups charge the current Store occupancy, including retained raw inputs.
+`source_artifact::release` is permanent and idempotent after creation, cleans owned
+partial bytes, and never releases another owner. Native filesystem roots participate in GC.
 
 Conversion preparation and tensor-operation journals are keyed by the request and the
 re-derived conversion plan (converter name, ordered ops, carrier headers), never by the
 TensorFS build. An upgraded or differently built process replays completed preparations and
 resumes partial ones. A change to a converter's output bytes renames the converter or bumps
 the `tensorfs.conversion-journal` domain tag.
-`Store.implementation_sha256` remains an informational build fingerprint.
 
-Qualification runs `cargo test --workspace`, plus `scripts/source-artifacts.py` against the
-compiled Python extension (included in wheel smoke). Subprocess tests use real SIGKILLs
+Qualification runs `cargo test --workspace`. Subprocess tests use real SIGKILLs
 around prefix fsync/checkpoint/admission, verify request offsets, full readback and moved
 bytes, and cover custody, tampering, URL replacement, ignored Range and GC. No GPU or paid
 provider is needed for these contracts.

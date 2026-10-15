@@ -73,8 +73,7 @@ def main():
             if marker is not None:
                 marker.write_bytes(saved)
                 assert writer.fence()
-            store.derived_abandon(transaction)
-            assert store.derived_lookup(transaction)["state"] == "abandoned"
+            assert store.derived_lookup(transaction)["state"] != "committed"
         print("writer hold green: revoked and released guards refuse commit; no receipt minted")
 
 

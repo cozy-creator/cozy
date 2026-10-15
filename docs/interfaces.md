@@ -81,9 +81,9 @@ retains transaction authority and checks the attempt behind that channel.
 - `DerivedReceipt`: transaction and declaration identity, source facts, header, manifest,
   added objects and inheritance observations.
 
-The four types are also exported from `tensorfs` and `tensorfs.derived`, so package
-authors can annotate their existing scoped interface. `DerivedSource` and `InheritObservation`
-name nested records in `tensorfs.records`. A checkpoint's existing nullable prefixed
+The four types are also exported from `tensorfs.derived`, so package authors can annotate
+their existing scoped interface. `DerivedSource` and `InheritObservation` name nested
+records in `tensorfs.records`. A checkpoint's existing nullable prefixed
 `head` field stays unchanged; this typing change introduces no new document format.
 Native Store writers and scoped channels return the same ordinary dictionaries. Rust
 continues to validate and canonicalize them. Python annotations neither revalidate
@@ -99,7 +99,6 @@ native documents nor discard harmless extra fields from a newer producer.
 | `commit()` | Finalize the artifact and return native facts; another local call returns the held receipt |
 | Owner retry/resume | Bind a new writer attempt to the same transaction |
 | Owner abandonment | Explicitly abandon the transaction through the owner's existing operation |
-| Owner retain/release | Manage independent custody of the committed result |
 
 A receipt is not a grant or an independent retention claim. The owner validates retained
 custody before giving a replay receipt to another attempt. Socket loss is not cancellation.
@@ -139,14 +138,12 @@ formats, canonical bytes and Python runtime representations are unchanged.
 
 | Consumer operations | Input/result records | Native producer |
 |---|---|---|
-| Standalone or owner content admission, copying, walking | `PutResult`, `VerifyResult`, `WalkObject`, `CheckoutResult` | `store.rs`, `project.rs`, `checkpoint.rs` |
-| Verified acquisition and streamed reads | `ObjectKey`, `ReadItem`, `BatchItem`, `ReadReceipt`, `StreamResult` | `read.rs`, `receipt.rs` |
-| Repository pointers and retained roots | `ReleaseLane`, `ReleaseRow`, `LocalRow`, `TreeRoot`, `CheckpointRoot`, `KeyedRoot` | `repository.rs`, root modules |
-| Owner source preparation and acquisition | `SourceMember`, `SourceProfile`, `SourceCarrier`, `SelectedSource`, `PreparedModelSource`, `PreparedSelection`, `FetchPlan`, `PullResult`, `EnsureEvent`, `EnsureResult` | `providers`, `source_model.rs`, `ingest`, `fetch.rs`, `ensure.rs` |
+| Content admission, walking, checkout | `PutResult`, `WalkObject`, `CheckoutResult`, `TreeRoot` | `store.rs`, `project.rs`, `checkpoint.rs`, `source_artifact.rs` |
+| Verified acquisition and reads | `ObjectKey`, `ReadItem` | `read.rs` |
 | Native derived inputs | `DeclarationSources`, `DeclarationTargets`, `DeclarationConfigs`, `DeclarationFiles`, `DerivationArguments` | `derived.rs`; native Python declaration parser |
-| Scoped inspection and writer recovery | `InspectedSource`, `SourceFacts`, `DerivedLookup`, `DispositionResult`, `RetainedResult` | `derived.rs`, `derived/retention.rs` |
-| Store pressure and maintenance | `Relief`, `GCResult` | `reclaim.rs`, `gc.rs` |
-| Document and compatibility inspection | `Header`, `ManifestDocument`, `DocumentResult`, `CapabilityResult`, `FitResult` | `header.rs`, `manifest.rs`, `corpus.rs`, `machine.rs` |
+| Scoped inspection and writer recovery | `InspectedSource`, `SourceFacts`, `DerivedLookup`, `DispositionResult` | `derived.rs` |
+| Store maintenance | `GCResult` | `gc.rs` |
+| Document inspection | `Header`, `ManifestRow`, `FitResult` | `header.rs`, `manifest.rs`, `machine.rs` |
 
 Package authors keep using the typed `Derivation` inputs in `tensorfs.derived`.
 `native_arguments()` now describes the same native map/tuple shapes to the type checker.
@@ -161,9 +158,9 @@ should use that mapping type rather than require a mutable `dict[str, Any]`.
 
 `ObjectKey` names the existing `(object_id, length)` tuple, while `ObjectRef` names the
 canonical `{sha256, length}` mapping. The aliases document existing native arguments;
-they are not additional storage objects or grants. Source/roster aliases document each
-field order beside their definitions. `SourceInspection.from_native` takes the actual
-`InspectedSource` producer shape; callers should pass native inspection results directly.
+they are not additional storage objects or grants. `SourceInspection.from_native` takes
+the actual `InspectedSource` producer shape; callers should pass native inspection results
+directly.
 
 Rust consumers already use `ObjectRef`, `ReceiptFacts`, typed Store/read/derived methods
 and explicit ownership. This Python contract cleanup does not add parallel Rust wrappers.

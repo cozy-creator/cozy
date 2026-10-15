@@ -89,9 +89,8 @@ Three schemas are STORED — written to a path, digested, and identified by thei
 A model Manifest selects one typed CozyTensors entry and may also carry ordinary files
 such as a README, license, or sample image. `Store.walk_cozytensors` and
 `Store.acquire_cozytensors` cover only the selected header and its transitive model assets and
-tensor parts; configs are canonical JSON bytes inside the header. The existing
-`Store.walk` and `Store.acquire_manifest` retain their
-full-snapshot meaning, including every ordinary sibling.
+tensor parts; configs are canonical JSON bytes inside the header. `Store.acquire_manifest`
+keeps its full-snapshot meaning, including every ordinary sibling.
 
 While that lease is live, `lease.read_asset(header_bytes, name, max_bytes=64<<20)` reads a
 header-declared tokenizer or other model asset through the same pinned verified descriptors,
@@ -188,9 +187,8 @@ once they are present; dropping the ticket releases the interest.
 ## Ensure: model download
 
 `ensure` makes a whole model's serialized bytes and metadata resident in the Store, through
-the Store's fetcher: `tfs ensure` and `tensorfs.ensure`. This does not construct a
-Python/PyTorch model or make its tensors GPU-resident. `tfs fetch` and `tensorfs.pull` remain
-lower-level acquisition interfaces.
+the Store's fetcher: `tfs ensure`. This does not construct a Python/PyTorch model or make its
+tensors GPU-resident. `tfs fetch` remains the lower-level acquisition interface.
 
 ```bash
 tfs capabilities                      # ensure/1, get-range/1, deliver/1, pressure/1
@@ -211,7 +209,7 @@ tfs get <root> sha256:<blob> --range 0:1048576 --out -   # bytes to stdout, unde
   in part, then delivered products (`Store.deliver_tree_root`, oldest first), then cached
   lanes; then `CAPACITY_EXHAUSTED`. `ensure::relieve` runs the same
   policy whenever no more than the reserve is free.
-- **The Hub CA** (`--ca-file`, `ca_file=`) is added to process trust; an untrusted hub is
+- **The Hub CA** (`--ca-file`) is added to process trust; an untrusted hub is
   `TLS_UNTRUSTED`, never retried. Nothing stalls on a timer: a download that lands nothing
   past its measured patience is `STALLED`.
 
@@ -290,10 +288,7 @@ Python exposes the same resolver. Passing a root remains supported and always wi
 ```python
 import tensorfs
 
-root = tensorfs.home()
 store = tensorfs.Store.ensure()
-store.prepare_readers()
-held = store.complete_cozytensors_manifests()
 other = tensorfs.Store.open("/srv/tensorfs")
 ```
 
@@ -326,7 +321,6 @@ no CLI or document form.
 | `encoding_unsupported` | (5) the package refuses encoded leaves |
 | `encoding_unqualified` | (6) with `--device`, every encoded leaf has a qualification record for that class (plain storage has nothing to qualify) |
 
-`tensorfs.capability(encoding, device, observations=None)` answers the device axis alone.
 TensorFS has no compatibility grade or search plane.
 
 Each named construction config is one bounded RFC 8785 JSON-object byte string stored directly in
@@ -348,7 +342,7 @@ cargo build --release --bin tfs
 uv run --python 3.12 --project conformance/cbor/python \
   python scripts/cbor-conformance.py --tfs target/release/tfs conform
 
-# the end-to-end test: wheel -> fresh venv -> real store -> lease/plan/ring/CAS
+# the end-to-end test: wheel -> fresh venv -> real store -> lease/plan/CAS
 bash scripts/wheel-smoke.sh
 ```
 
@@ -379,8 +373,6 @@ Blob admission hashes while streaming, installs with no-clobber semantics, and r
 rebuildable verification observation in SQLite. Each process loads those rows once per catalog
 into memory; a trust check is an `fstat` compared with the row's `(dev, ino, length, mtime)`,
 and a changed or unrecorded object is rehashed.
-`tensorfs.stats()` returns this process's `catalog_opens`, `presence_passes` (closure walks that
-prove every object resident) and `repo_cache_verified_reads`; diff two snapshots around a call.
 Manifests use the same digest/length identity but
 live under their typed namespace. A blob or Manifest that fails an exact rehash is removed from its
 authoritative path immediately; TensorFS retains no forensic copy. A writer holds an advisory lock
@@ -474,8 +466,8 @@ target               component=encoding,...
 ```
 
 The built-in reviewed registry ships with TensorFS and is extended, never replaced, by reviewed data
-bound to a Store (`Store.bind_fingerprint_registry(bytes)`: a pinned file or the Hub's registry) and by
-bytes a caller supplies to `prepare_model_source(registry=...)`. Newer entries replace older ones
+bound to a Store (`fingerprint-registry.json`: a pinned file or the Hub's registry) and by
+bytes a caller supplies to a source preparation (`registry=`). Newer entries replace older ones
 under the same key and keep their own provenance, so an older TensorFS can ingest models banked after
 it shipped. The CLI `--registry` flag remains for platform review and tests. A provider may present a
 superset of candidate headers. TensorFS selects one exact reviewed subset and refuses if multiple
@@ -492,7 +484,7 @@ come with their index. One component is `model`; several are named by folder or 
 `"state":"normalized"`, and reviewed converters that predate the record write none. Malformed
 carriers still refuse.
 
-The CLI and Python facade call the same `tensorfs-core::ingest::source` planner/executor. They do not
+The CLI calls the `tensorfs-core::ingest::source` planner/executor. They do not
 trust or reinterpret asserted fields: the core re-reads carrier headers and the exact registry,
 reproduces the unique source plan byte-for-byte, then executes its sources, target, order, and
 session through the ordinary streaming ingest/CAS pass.
@@ -509,27 +501,8 @@ unreviewed member refuses. Unique keysets need no member. Equal headers with no 
 admit multiple assignments and refuse; a provider adapter may supply a member only when its own
 pinned metadata binds that exact member to the downloaded path.
 
-Standalone Python Store owners can use the compiled source-preparation facade directly:
-
-```python
-prepared = store.prepare_model_source(
-    operation_id,
-    source_selection_digest,
-    [("dits", "hf/minimax-h3/native-dual-bf16/1"),
-     ("shared", "hf/minimax-h3/shared-bf16/1")],
-    [(member, object_id, length, local_path, exact_header_bytes), ...],
-    landed_members,
-    checkpoints=[(slot, previous_head_id, previous_head_length), ...],
-)
-# prepared = {complete, replayed, sources, checkpoints, spent,
-#             converted_roles, resumed_roles, deferred_ops, converted_bytes, largest_op_bytes}
-# Only after the operation is adopted or explicitly abandoned:
-store.release_model_source(operation_id)
-```
-
-TensorD performs managed source acquisition/preparation through the corresponding Rust
-APIs. Runtime's package jobs use scoped source/output interfaces for their tensor work;
-the direct Store example above does not describe a managed executor opening the Store.
+TensorD performs managed source acquisition/preparation through the Rust APIs. Runtime's
+package jobs use scoped source/output interfaces for their tensor work.
 
 The sorted roster contains all members from the outset. Headers are exact JSON index bytes or
 the safetensors eight-byte length plus header JSON. Every body length is pinned; only members in
@@ -546,7 +519,7 @@ profile is complete. Partial work returns separate `checkpoints` rows:
 `{slot, head, head_length, plan_digest, index, bytes}`. These are **local** progress, not a claim of
 remote durability. The existing immutable Link format carries at most 128 new refs per link and
 an opaque journal snapshot. `Store.checkpoint_page` validates operation/slot/plan and
-returns bounded refs, predecessor and progress references. Fetch/PUT use `Store.checkpoint_fetch/push` over the existing transport.
+returns bounded refs, predecessor and progress references.
 
 Derived writers use the same checkpoint transport. `Store.begin_derived` requires
 `work_fingerprint=` in addition to its existing transaction, epoch and declaration arguments.
@@ -643,17 +616,4 @@ census and its construction order. For bounded paging, cache that complete plan 
 Selection uses exact existing part `what` identifiers, keeps every native window and source
 ObjectRef for those parts in native order, and compacts destination offsets. Duplicate or
 unknown identifiers refuse before I/O; an empty selection returns an empty plan. The original
-plan is unchanged, and selected plans use the same lease, stream and caller-owned ring.
-
-A committed derived result can acquire independent private retention without changing its
-execution receipt: `Store.retain_derived_result(transaction_id, expected_receipt_digest,
-retention_id)`. The caller supplies an exact SHA-256 retention identity; the result names
-the original transaction, receipt, and manifest. It verifies native retained custody and
-resident verification records without copying tensor payloads.
-
-`Store.release_derived_retention` takes the same three arguments and releases only that
-retention owner. Its durable tombstone rejects delayed reacquisition, including release
-before acquire. The original transaction can be disposed independently. Native GC finds
-these manifest roots directly from the filesystem, without relying on request or transaction
-metadata. Eligibility and authorization belong to the caller; this API provides storage
-retention and never schedules computation or publishes a model repository.
+plan is unchanged, and selected plans read through the same lease.

@@ -8,12 +8,10 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 use tensorfs_core::canon::Value;
 use tensorfs_core::capability::CapabilityRecords;
-#[cfg(feature = "store")]
-use tensorfs_core::corpus;
 use tensorfs_core::dtype::Dtype;
 use tensorfs_core::fit::{Custody, TensorRequirements};
 use tensorfs_core::header::{Closure as CoreClosure, Header};
-use tensorfs_core::ids::{self, Doc};
+use tensorfs_core::ids;
 use tensorfs_core::manifest::Manifest;
 use tensorfs_core::registry;
 use tensorfs_core::spec::EncodingSpec;
@@ -74,43 +72,6 @@ pub fn py_fit<'p>(
     let out = marshal(py, &value)?.cast_into::<PyDict>()?;
     out.set_item("ok", verdict.is_ok())?;
     Ok(out)
-}
-
-/// `tensorfs.capability(encoding, device, observations=None)`: is this (encoding, device)
-/// pair qualified — the compiled-in reference records widened by what a card observed.
-#[pyfunction]
-#[pyo3(signature = (encoding, device, observations=None))]
-pub fn capability<'p>(
-    py: Python<'p>,
-    encoding: &str,
-    device: &str,
-    observations: Option<&[u8]>,
-) -> PyResult<Bound<'p, PyDict>> {
-    let mut records = registry::capability_records();
-    if let Some(bytes) = observations {
-        records = records.with_observed(CapabilityRecords::parse_observed(bytes).or_refuse(py)?);
-    }
-    let encoding = registry::seeds()
-        .iter()
-        .find(|s| s.alias == encoding)
-        .map(|s| s.spec.object_id())
-        .unwrap_or_else(|| encoding.to_string());
-    let decision = records.admit(&encoding, device);
-    let qualified: Vec<&str> = records
-        .records
-        .iter()
-        .filter(|r| r.encoding == encoding)
-        .map(|r| r.device.as_str())
-        .collect();
-    let (record, refusal) = match &decision {
-        Ok(r) => (Some(*r), String::new()),
-        Err(e) => (None, e.detail.clone()),
-    };
-    let doc =
-        tensorfs_core::machine::capability_json(record, &encoding, device, &refusal, &qualified);
-    let value = tensorfs_core::canon::parse_canonical(&doc, tensorfs_core::limits::DOC_MAX_BYTES)
-        .or_refuse(py)?;
-    Ok(marshal(py, &value)?.cast_into::<PyDict>()?)
 }
 
 /// Canonical `Value` -> plain Python data. The document's shape survives; its Rust types do
@@ -270,62 +231,6 @@ pub fn parse_header<'p>(
     marshal_header(py, &h)
 }
 
-/// Validate canonical Manifest bytes.
-#[pyfunction]
-pub fn parse_manifest<'p>(py: Python<'p>, data: &[u8]) -> PyResult<Bound<'p, PyAny>> {
-    let m = Manifest::parse(data).or_refuse(py)?;
-    marshal(py, &m.to_value())
-}
-
-#[cfg(feature = "store")]
-#[pyfunction]
-#[pyo3(signature = (doc, data, closure=None, platform=None))]
-pub fn run_doc<'p>(
-    py: Python<'p>,
-    doc: &str,
-    data: &[u8],
-    closure: Option<&PyClosure>,
-    platform: Option<Vec<String>>,
-) -> PyResult<Bound<'p, PyDict>> {
-    let empty = CoreClosure::default();
-    let closure = closure.map(|closure| &closure.inner).unwrap_or(&empty);
-    let platform = platform.unwrap_or_else(registry::platform_digests);
-    let outcome = corpus::run_doc(doc, data, closure, &platform).or_refuse(py)?;
-    let result = PyDict::new(py);
-    result.set_item("id", outcome.id)?;
-    result.set_item("tensor_schema", outcome.tensor_schema)?;
-    result.set_item("manifest", outcome.manifest)?;
-    Ok(result)
-}
-
-#[cfg(feature = "store")]
-#[pyfunction]
-pub fn receipt_binds(
-    py: Python<'_>,
-    receipt: &[u8],
-    subject: &[u8],
-    manifest: &[u8],
-    header: &[u8],
-    stamp: &[u8],
-) -> PyResult<()> {
-    corpus::receipt_binds(receipt, subject, manifest, header, stamp).or_refuse(py)
-}
-
-#[cfg(feature = "store")]
-#[pyfunction]
-pub fn doc_kinds() -> Vec<String> {
-    corpus::DOC_KINDS
-        .iter()
-        .map(|kind| kind.to_string())
-        .collect()
-}
-
-/// The platform-aliased encoding digests this build admits at the border.
-#[pyfunction]
-pub fn platform_digests() -> Vec<String> {
-    registry::platform_digests()
-}
-
 /// (alias, spec digest) for every seeded encoding. Aliases are display; digests are identity.
 #[pyfunction]
 pub fn seed_digests() -> Vec<(String, String)> {
@@ -363,31 +268,4 @@ pub fn dtypes(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
 #[pyfunction]
 pub fn manifest_max_bytes() -> usize {
     Manifest::MAX_BYTES
-}
-
-#[cfg(feature = "store")]
-/// Bytes -> the pretty PROJECTION of a canonical document. Projection-only by construction:
-/// what comes back is a string, and no reader in this system accepts it.
-#[pyfunction]
-pub fn render(py: Python<'_>, data: &[u8], max_bytes: usize) -> PyResult<String> {
-    tensorfs_core::project::render(data, max_bytes).or_refuse(py)
-}
-
-/// Canonical re-emission: parse and write back. `sha256(stored) == object_id` universally,
-/// so a document that does not survive this was never canonical.
-#[pyfunction]
-pub fn recanonicalize<'p>(py: Python<'p>, doc: &str, data: &[u8]) -> PyResult<Bound<'p, PyBytes>> {
-    let out = match doc {
-        "header" => Header::parse(data)
-            .or_refuse(py)?
-            .canonical_bytes()
-            .or_refuse(py)?,
-        "manifest" => Manifest::parse(data).or_refuse(py)?.canonical_bytes(),
-        other => {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "recanonicalize does not carry {other:?}"
-            )))
-        }
-    };
-    Ok(PyBytes::new(py, &out))
 }

@@ -160,8 +160,7 @@ def exercise():
         record_matches(part, PartReceipt)
         source_receipt = native.commit()
         receipt_matches(source_receipt)
-        assert tensorfs.ObjectRef is ObjectRef
-        assert tensorfs.DerivedReceipt is DerivedReceipt
+        assert tensorfs.derived.ObjectRef is ObjectRef
         assert tensorfs.derived.DerivedReceipt is DerivedReceipt
         ref = source_receipt["manifest"]
         plan = declaration(size, Source("sha256:" + ref["sha256"], ref["length"]))
@@ -254,7 +253,7 @@ def exercise():
             reopened.fence()
 
         owner = Owner(open_writer(store, 12, small, 4096))
-        store.derived_fence(identity(12), 1)
+        fencer = open_writer(store, 12, small, 4096, epoch=2)  # a higher epoch fences the first
         try:
             owner.client.add_part("model", "weight", "value", b"x" * 4096)
         except tensorfs.errors.WriterFenced:
@@ -262,6 +261,7 @@ def exercise():
         else:
             raise AssertionError("stale writer accepted bytes")
         owner.finish(refused=True)
+        fencer.fence()
 
         def fail_record(receipt):
             raise RuntimeError("injected owner ACK failure")

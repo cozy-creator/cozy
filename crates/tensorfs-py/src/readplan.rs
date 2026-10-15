@@ -24,16 +24,6 @@ impl PyPlan {
     fn bytes(&self) -> u64 {
         self.plan.bytes
     }
-    /// The DISK leg — `bytes` minus what the header carries inline. Throughput belongs to
-    /// this one; inline bytes never touch a device.
-    #[getter]
-    fn io_bytes(&self) -> u64 {
-        self.plan.io_bytes
-    }
-    #[getter]
-    fn inline_parts(&self) -> usize {
-        self.plan.inline_parts
-    }
     #[getter]
     fn order(&self) -> &'static str {
         self.plan.order.as_str()
@@ -65,11 +55,6 @@ impl PyPlan {
             l.append(d)?;
         }
         Ok(l)
-    }
-
-    /// How the plan tiles into slots of `slot_bytes` — the batch count the ring will run.
-    fn batches(&self, slot_bytes: u64) -> usize {
-        self.plan.batches(slot_bytes).len()
     }
 }
 

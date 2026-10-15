@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-"""Real process death and empty-Store recovery through the installed wheel and HTTP plane."""
+"""Real process death and empty-Store recovery through the installed wheel."""
 
-import hashlib
 import io
 import json
 import os
@@ -9,8 +8,6 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from threading import Thread
 
 import tensorfs
 
@@ -72,39 +69,6 @@ def child(root):
 
 
 def main():
-    bodies = {}
-    requests = []
-
-    class Objects(BaseHTTPRequestHandler):
-        def log_message(self, *_args):
-            pass
-
-        def do_PUT(self):
-            requests.append(("PUT", self.path))
-            body = self.rfile.read(int(self.headers["Content-Length"]))
-            assert hashlib.sha256(body).hexdigest() == self.path[1:]
-            present = self.path in bodies
-            if present:
-                assert bodies[self.path] == body
-            else:
-                bodies[self.path] = body
-            self.send_response(412 if present else 200)
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-
-        def do_GET(self):
-            requests.append(("GET", self.path))
-            body = bodies[self.path]
-            selected = self.headers.get("Range")
-            self.send_response(206 if selected else 200)
-            if selected:
-                lo, hi = map(int, selected.removeprefix("bytes=").split("-"))
-                self.send_header("Content-Range", f"bytes {lo}-{hi}/{len(body)}")
-                body = body[lo:hi + 1]
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
     with tempfile.TemporaryDirectory(prefix="tensorfs-derived-resume-") as area:
         area = Path(area)
         result = subprocess.run([sys.executable, __file__, "--child", str(area / "original")],
@@ -113,10 +77,6 @@ def main():
         checkpoint = json.loads(result.stdout)
         head = checkpoint["head"], checkpoint["head_length"]
         store = tensorfs.Store.open(area / "original")
-        server = ThreadingHTTPServer(("127.0.0.1", 0), Objects)
-        thread = Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        origin = f"http://127.0.0.1:{server.server_port}"
         replacement = tensorfs.Store.init(area / "replacement")
         delivered = set()
         transferred = 0
@@ -125,35 +85,28 @@ def main():
             nonlocal transferred
             if identity in delivered:
                 return
-            url = origin + "/" + identity.removeprefix("sha256:")
-            store.checkpoint_push(identity, length, False, url, allow_local=True)
-            fetched = replacement.checkpoint_fetch(identity, length, False, url, allow_local=True)
-            transferred += fetched["transferred"]
-            warm = replacement.checkpoint_fetch(identity, length, False, url, allow_local=True)
-            assert warm["held"] and warm["transferred"] == 0
+            body = area / "object"
+            body.write_bytes(store.document(identity, length))
+            replacement.put_file(body, identity, length)
+            transferred += length
             delivered.add(identity)
 
         cursor = head
-        try:
-            while cursor:
-                transfer(*cursor)
-                offset = 0
-                while True:
-                    page = replacement.checkpoint_page(*cursor, operation_id="request", slot="output",
-                        plan_digest=checkpoint["plan_digest"], offset=offset, limit=1)
-                    assert len(page["objects"]) <= 1
-                    for obj in page["objects"]:
-                        assert obj["kind"] == "blob"
-                        transfer(obj["object_id"], obj["length"])
-                    cursor_next = page["previous"]
-                    offset = page["next_offset"]
-                    if offset is None:
-                        break
-                cursor = cursor_next
-        finally:
-            server.shutdown()
-            server.server_close()
-            thread.join()
+        while cursor:
+            transfer(*cursor)
+            offset = 0
+            while True:
+                page = replacement.checkpoint_page(*cursor, operation_id="request", slot="output",
+                    plan_digest=checkpoint["plan_digest"], offset=offset, limit=1)
+                assert len(page["objects"]) <= 1
+                for obj in page["objects"]:
+                    assert obj["kind"] == "blob"
+                    transfer(obj["object_id"], obj["length"])
+                cursor_next = page["previous"]
+                offset = page["next_offset"]
+                if offset is None:
+                    break
+            cursor = cursor_next
 
         writer = begin(store, 8)
         assert writer.completed_parts() == [("model", "weight", "data")]
@@ -195,38 +148,11 @@ def main():
         expected = finish(clean)
         assert recovered == local == expected
         assert recovered["declaration_digest"] == tensorfs.object_id(declaration)
-        document = expected["manifest"]
-        identity, length = "sha256:" + document["sha256"], document["length"]
-        document_store = tensorfs.Store.init(area / "manifest-only")
-        server = ThreadingHTTPServer(("127.0.0.1", 0), Objects)
-        thread = Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        url = f"http://127.0.0.1:{server.server_port}/{document['sha256']}"
-        try:
-            before = len(requests)
-            refused("LENGTH_MISMATCH", lambda: store.checkpoint_push(
-                identity, length + 1, True, url, allow_local=True))
-            refused("LENGTH_MISMATCH", lambda: store.checkpoint_push(
-                tensorfs.object_id(DATA), len(DATA) + 1, False, url, allow_local=True))
-            assert len(requests) == before
-            store.checkpoint_push(identity, length, True, url, allow_local=True)
-            fetched = document_store.checkpoint_fetch(identity, length, True, url, allow_local=True)
-            assert fetched["transferred"] == length and not fetched["held"]
-            before = len(requests)
-            refused("LENGTH_MISMATCH", lambda: document_store.checkpoint_fetch(
-                identity, length + 1, True, url, allow_local=True))
-            warm = document_store.checkpoint_fetch(identity, length, True, url, allow_local=True)
-            assert warm["held"] and warm["transferred"] == 0 and len(requests) == before
-        finally:
-            server.shutdown()
-            server.server_close()
-            thread.join()
         for current in [store, replacement, clean_store]:
             current.derived_dispose(TRANSACTION)
         print(f"derived resume: process death inside scale, retained {len(DATA)} B data role, "
-              f"{len(delivered)} HTTP objects / {transferred} B, warm fetch 0 B, "
-              "next checkpoint excludes prior data, higher epoch and empty Store match clean receipt; "
-              "manifest PUT/GET/warm reuse and wrong-length no-network/no-deletion arms pass")
+              f"{len(delivered)} objects / {transferred} B copied to an empty Store, "
+              "next checkpoint excludes prior data, higher epoch and empty Store match clean receipt")
 
 
 if __name__ == "__main__":
