@@ -105,7 +105,7 @@ async def make(ctx: Context, out: Outputs, *, gate: str, size: int) -> Result:
     return Result(out.save_bytes(bytes(i % 251 for i in range(size)), media_type="application/octet-stream"))
 
 app = App()
-app.job(make, accelerator=False)
+app.entrypoint(make, accelerator=False)
 `), 0o600))
 	if out, err := exec.Command("uv", "lock", "--project", project).CombinedOutput(); err != nil {
 		t.Fatalf("locking authored lifecycle fixture: %v\n%s", err, out)
@@ -189,7 +189,7 @@ func TestV1CancelFencesDelayedNativeAcceptance(t *testing.T) {
 	fatal(t, problem)
 	fatal(t, store.LinkMachineExecution(request.ID, machines.Local))
 	fatal(t, store.AppendEvent(request.ID, records.RunV1Sent, 0, map[string]any{"machine": machines.Local}))
-	stream, err := machine.Run(t.Context(), request.ID, 0, &v1.RunSpec{Kind: v1.RunKind_RUN_KIND_JOB, Entrypoint: "make", Payload: payload,
+	stream, err := machine.Run(t.Context(), request.ID, 0, &v1.RunSpec{Kind: v1.RunKind_RUN_KIND_CALL, Entrypoint: "make", Payload: payload,
 		Source: &v1.RunSpec_Installation{Installation: installation}})
 	must(t, err)
 	landed(t, "native acceptance blocked on the real writer lock", func() bool {
@@ -419,7 +419,7 @@ func TestV1LostAcceptanceReattachesWithoutLocalPackage(t *testing.T) {
 	fatal(t, problem)
 	fatal(t, store.LinkMachineExecution(request.ID, machines.Local))
 	fatal(t, store.AppendEvent(request.ID, records.RunV1Sent, 0, map[string]any{"machine": machines.Local}))
-	stream, err := machine.Run(t.Context(), request.ID, 0, &v1.RunSpec{Kind: v1.RunKind_RUN_KIND_JOB, Entrypoint: "make", Payload: payload,
+	stream, err := machine.Run(t.Context(), request.ID, 0, &v1.RunSpec{Kind: v1.RunKind_RUN_KIND_CALL, Entrypoint: "make", Payload: payload,
 		Source: &v1.RunSpec_Installation{Installation: installation}})
 	must(t, err)
 	for {
@@ -479,7 +479,7 @@ func TestV1CancelWhileDownReachesARunWhoseAcceptanceWasLost(t *testing.T) {
 	fatal(t, problem)
 	fatal(t, store.LinkMachineExecution(request.ID, machines.Local))
 	fatal(t, store.AppendEvent(request.ID, records.RunV1Sent, 0, map[string]any{"machine": machines.Local}))
-	stream, err := machine.Run(t.Context(), request.ID, 0, &v1.RunSpec{Kind: v1.RunKind_RUN_KIND_JOB, Entrypoint: "make", Payload: payload,
+	stream, err := machine.Run(t.Context(), request.ID, 0, &v1.RunSpec{Kind: v1.RunKind_RUN_KIND_CALL, Entrypoint: "make", Payload: payload,
 		Source: &v1.RunSpec_Installation{Installation: installation}})
 	must(t, err)
 	landed(t, "the job executing behind its closed gate", func() bool {

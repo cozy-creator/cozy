@@ -12,11 +12,11 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-// A conversion job (model inputs and weights outputs) reads `cozy run <job> <input> <org/model>`:
+// A conversion (model inputs and weights outputs) reads `cozy run <fn> <input> <org/model>`:
 // the same request as model.<first param>= plus --upload-to; later inputs stay model.<param>=.
-func TestConversionJobReadsInputAndDestinationPositionals(t *testing.T) {
+func TestConversionReadsInputAndDestinationPositionals(t *testing.T) {
 	root, _, _, digest, _ := runModelCatalog(t, func(_ *http.ServeMux, detail *hub.PackageReleaseDetail) {
-		iface := []byte(`{"application":"q:app","entrypoints":[],"format":"cozy.package.interface/1","jobs":[{"accelerator":false,"models":[{"class":"Source","component_use":{},"path":"quantize.models.source"},{"class":"Source","component_use":{},"path":"quantize.models.base"}],"invocable":{"capabilities":["weights"],"context":"ctx","defaults":{"request/base":null,"request/source":null},"enum_members":{},"export":"quantize","memoize":true,"module":"q","parameters":["source","base","steps"],"type_names":{"request":"quantizeRequest"}},"name":"quantize","publishes":false,"request":{"fields":[{"name":"source","type":{"union":["null",{"input":"model"}]},"wire":"optional"},{"name":"base","type":{"union":["null",{"input":"model"}]},"wire":"optional"},{"name":"steps","type":"int"}]},"result":{"fields":[]},"weights_outputs":[{"max_bytes":1048576,"mime_type":"application/vnd.cozy.model-manifest","output_id":"fp8"}]}]}`)
+		iface := []byte(`{"application":"q:app","entrypoints":[{"accelerator":false,"invocable":{"capabilities":["weights"],"context":"ctx","defaults":{},"enum_members":{},"export":"quantize","memoize":false,"module":"q","parameters":["steps"],"type_names":{"request":"quantizeRequest"}},"models":[{"class":"Model","component_use":{},"encoded_leaves":"refuse","path":"quantize.models.source","weights":true},{"class":"Model","component_use":{},"encoded_leaves":"refuse","path":"quantize.models.base","weights":true}],"name":"quantize","request":{"fields":[{"name":"steps","type":"int"}]},"result":{"input":"model"},"weights_outputs":[{"max_bytes":1048576,"mime_type":"application/vnd.cozy.model-manifest","output_id":"fp8"}]}],"format":"cozy.package.interface/1"}`)
 		contract, problem := launch.DecodePackageInterface(iface)
 		fatal(t, problem)
 		detail.PackageInterface = iface

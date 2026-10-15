@@ -77,7 +77,7 @@ async def inspect_assets(ctx: Context, *, assets: Pictures) -> Result:
     ctx.raise_if_cancelled()
     return Result([assets.info(i).label for i in range(len(assets))],[assets.info(i).id for i in range(len(assets))],[image.tobytes().hex() for image in assets],[assets.info(i).fidelity for i in range(len(assets))])
 app=App()
-app.job(inspect_assets, accelerator=False)
+app.entrypoint(inspect_assets, accelerator=False)
 `)
 	write(project, "pyproject.toml", metadata("labelled-assets-parent", "label_parent", `,"labelled-assets-child>=0.1.0"`, `labelled-assets-child={path="./child"}`))
 	write(project, "package.toml", "[application]\nobject=\"label_parent:app\"\n")
@@ -90,7 +90,7 @@ app=App()
 @invocable(memoize=False)
 async def run(ctx: Context, *, assets: Pictures) -> Result:
     return await inspect_assets(assets=assets.select(1,0))
-app.job(run, accelerator=False)
+app.entrypoint(run, accelerator=False)
 `)
 	for _, dir := range []string{child, project} {
 		if out, err := exec.Command("uv", "lock", "--project", dir).CombinedOutput(); err != nil {

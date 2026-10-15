@@ -74,7 +74,7 @@ class SumResult(msgspec.Struct):
 app = App()
 
 
-@app.job(accelerator=True)
+@app.entrypoint
 def gpu_sum(payload: SumRequest) -> SumResult:
     import torch
 

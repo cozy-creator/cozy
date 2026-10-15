@@ -21,20 +21,20 @@ func servingAvailabilityInterface(t *testing.T) []byte {
 			"default_ladder": []any{map[string]any{"gpu": "*", "lane": ladderModel + "@" + ladderRelease + "/" + ladderLane}}},
 		map[string]any{"class": "Adapter", "component_use": map[string]any{}, "path": "variant.models.adapter"},
 	}
+	// A Weights[M] argument is the caller's raw input: no default needed to be available.
 	document["entrypoints"] = append(entrypoints, variant, map[string]any{
 		"name": "ping", "request": map[string]any{"fields": []any{}}, "result": map[string]any{"fields": []any{}},
-	})
-	document["jobs"] = []any{map[string]any{
-		"name": "quantize", "publishes": false,
-		"models":  []any{map[string]any{"class": "Source", "component_use": map[string]any{}, "path": "quantize.models.source"}},
+	}, map[string]any{
+		"name": "quantize", "publishes": false, "accelerator": false,
+		"models":  []any{map[string]any{"class": "Model", "component_use": map[string]any{}, "path": "quantize.models.source", "weights": true}},
 		"request": map[string]any{"fields": []any{}}, "result": map[string]any{"fields": []any{}},
-	}}
+	})
 	raw, err = json.Marshal(document)
 	must(t, err)
 	return raw
 }
 
-func TestServingListDistinguishesUnboundDeploymentFromJobs(t *testing.T) {
+func TestServingListDistinguishesUnboundDeploymentFromRawInputs(t *testing.T) {
 	root, path, _, _ := admissionRoot(t, servingAvailabilityInterface(t), "H100", false)
 	code, out := runAdmissionCLI(t, root, path, "run", ladderPackage, "--json")
 	if code != 0 {

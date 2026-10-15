@@ -82,7 +82,7 @@ func TestH3ServingRentalIgnoresCapturedSiblingResidency(t *testing.T) {
 	if candidate.Verdict != "" || len(children) != 0 {
 		t.Fatalf("one H3 serving slot acquired %d unrelated captured slots: %s", len(children), candidate.Verdict)
 	}
-	if need := records.Resident(candidate.Models, h100SXM, false); need.Bytes != textBytes {
+	if need := records.Resident(candidate.Models, h100SXM); need.Bytes != textBytes {
 		t.Fatalf("actual one-slot H3 need = %+v", need)
 	}
 
@@ -91,7 +91,7 @@ func TestH3ServingRentalIgnoresCapturedSiblingResidency(t *testing.T) {
 	independent := model
 	independent.Slot = "fl2va.models.independent_model"
 	models = []records.ModelRef{model, independent}
-	if need := records.Resident(models, h100SXM, false); need.Bytes != 2*textBytes {
+	if need := records.Resident(models, h100SXM); need.Bytes != 2*textBytes {
 		t.Fatalf("independent resident slots were collapsed: %+v", need)
 	}
 	candidate = rental.Purchases([]hub.RentalSKU{sku}, models, true, false, constraints)[0]

@@ -89,13 +89,11 @@ def main(ctx: Context) -> ModelArtifact:
 	defer store.Close()
 	request, problem := store.RequestByReference("1")
 	fatal(t, problem)
-	if request == nil || request.State != "succeeded" || request.WeightsOutputs == "" {
+	if request == nil || request.State != "succeeded" {
 		t.Fatalf("ordinary weights attempt missing: %+v", request)
 	}
-	children, problem := store.Children(request.ID)
-	fatal(t, problem)
-	if len(children) != 0 {
-		t.Fatalf("helper import produced child requests: %+v", children)
+	if children := creatorChildren(t, root, request.ID); children != 0 {
+		t.Fatalf("helper import produced %d child requests", children)
 	}
 	if calls := machineChildren(t, root, store, "1"); len(calls) != 0 {
 		t.Fatalf("ordinary helper import dispatched a managed child: %+v", calls)

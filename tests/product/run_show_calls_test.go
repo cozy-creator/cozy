@@ -199,7 +199,7 @@ async def render(ctx: Context, tel: Telemetry, *, index: int) -> Rendered:
 app.entrypoint(render)
 
 
-@app.job(accelerator=False)
+@app.entrypoint(accelerator=False)
 async def film(ctx: Context, payload: FilmRequest, tel: Telemetry) -> Film:
     for index in range(3):
         with tel.scope(f"Segment {index + 1} of 3"):

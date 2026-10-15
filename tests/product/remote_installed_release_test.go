@@ -25,7 +25,7 @@ func TestARentalRunNamesTheNewestReleaseWhateverIsInstalledHere(t *testing.T) {
 			name = "installed here uses latest"
 		}
 		t.Run(name, func(t *testing.T) {
-			iface := []byte(`{"format":"cozy.package.interface/1","application":"proof:app","entrypoints":[],"jobs":[{"accelerator":false,"name":"compute","models":[],"publishes":false,"request":{"fields":[]},"result":{"fields":[]},"weights_outputs":[]}]}`)
+			iface := []byte(`{"format":"cozy.package.interface/1","application":"proof:app","entrypoints":[{"accelerator":false,"name":"compute","models":[],"publishes":false,"request":{"fields":[]},"result":{"fields":[]},"weights_outputs":[]}]}`)
 			parsed, problem := launch.DecodePackageInterface(iface)
 			fatal(t, problem)
 			mux := http.NewServeMux()

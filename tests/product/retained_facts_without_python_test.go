@@ -19,7 +19,7 @@ func TestReadRetainedFactsWithoutLocalPython(t *testing.T) {
 			if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 				t.Fatal(err)
 			}
-			if err := os.WriteFile(path, []byte(`{"format":"cozy.package.interface/1","application":"example:app","entrypoints":[],"jobs":[]}`), 0600); err != nil {
+			if err := os.WriteFile(path, []byte(`{"format":"cozy.package.interface/1","application":"example:app","entrypoints":[]}`), 0600); err != nil {
 				t.Fatal(err)
 			}
 			inst := records.PackageInstall{ID: sourceKind, Dir: dir, SourceKind: sourceKind, Python: "3.12.12"}

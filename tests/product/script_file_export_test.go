@@ -102,8 +102,8 @@ class ImageReport(msgspec.Struct, frozen=True):
 async def produce_image(ctx:Context, *, out:Outputs)->ImageReport:
     return ImageReport(out.save_image(Image.new("RGB", (16,16), (10,20,30)), format="png"))
 app=App()
-app.job(produce, accelerator=False)
-app.job(produce_image, accelerator=False)
+app.entrypoint(produce, accelerator=False)
+app.entrypoint(produce_image, accelerator=False)
 `), 0600))
 	header := fmt.Sprintf(`# /// script
 # requires-python=">=3.12,<3.13"
@@ -173,7 +173,7 @@ async def main()->Annotated[FileAsset,AssetBound(max_bytes=1024,media_types=("ap
 			if file["digest"] != "sha256:"+hex.EncodeToString(digest[:]) {
 				t.Fatal("export changed the accepted digest")
 			}
-			request, problem := store.RequestByReference(fmt.Sprint(result["job"]))
+			request, problem := store.RequestByReference(fmt.Sprint(result["id"]))
 			fatal(t, problem)
 			export, problem := store.OutputExportOf(request.ID)
 			fatal(t, problem)

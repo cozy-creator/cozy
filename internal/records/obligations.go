@@ -57,7 +57,3 @@ func (s *Store) Obligations() ([]Obligation, *exit.Error) {
 }
 
 func (o Obligation) String() string { return o.Kind + " " + o.ID + " (" + o.State + ")" }
-
-// AtRest is work that waits on its owner alone: a finished run keeping its results. Nothing
-// happens to it until a command asks, so it holds no Calcifer up.
-func (o Obligation) AtRest() bool { return o.State == "succeeded" }

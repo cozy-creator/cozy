@@ -17,7 +17,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-const internalCallablesInterface = `{"format":"cozy.package.interface/1","application":"fixture:app","entrypoints":[{"name":"generate","request":{"fields":[]},"result":{"fields":[]}},{"name":"segment","internal":true,"request":{"fields":[]},"result":{"fields":[]}}],"jobs":[{"name":"long_form","publishes":false,"request":{"fields":[]},"result":{"fields":[]}},{"name":"internal_job","internal":true,"publishes":false,"request":{"fields":[]},"result":{"fields":[]}}]}`
+const internalCallablesInterface = `{"format":"cozy.package.interface/1","application":"fixture:app","entrypoints":[{"name":"generate","request":{"fields":[]},"result":{"fields":[]}},{"accelerator":false,"name":"internal_job","internal":true,"request":{"fields":[]},"result":{"fields":[]}},{"accelerator":false,"name":"long_form","request":{"fields":[]},"result":{"fields":[]}},{"name":"segment","internal":true,"request":{"fields":[]},"result":{"fields":[]}}]}`
 
 func TestInternalCallablesStayInExecutionInterface(t *testing.T) {
 	surface, problem := launch.DecodePackageInterface([]byte(internalCallablesInterface))
@@ -97,7 +97,7 @@ func TestInternalCallablesAreAbsentFromCLIAndRefuseDirectRun(t *testing.T) {
 	for _, name := range []string{"long_form", "long-form"} {
 		code, out = runCozy(t, root, "run", "proof/internal/"+name, "--describe")
 		if code != 0 || !strings.Contains(out, "proof/internal/long_form") {
-			t.Fatalf("job spelling did not resolve to its registered name: %s: %d %s", name, code, out)
+			t.Fatalf("a separator spelling did not resolve to its registered name: %s: %d %s", name, code, out)
 		}
 	}
 	if _, err := os.Stat(filepath.Join(root, "creator.sqlite")); err == nil {

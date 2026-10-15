@@ -210,14 +210,14 @@ func TestAnOldHostToolIsBroughtForward(t *testing.T) {
 		"from cozy_runtime.author import App, Context, invocable\n"+
 		"class Result(msgspec.Struct):\n    labels: list[str]\n"+
 		"@invocable\nasync def inspect(ctx: Context, *, count: int) -> Result:\n    return Result([str(count)])\n"+
-		"app=App()\napp.job(inspect, accelerator=False)\n")
+		"app=App()\napp.entrypoint(inspect, accelerator=False)\n")
 	write(filepath.Join(project, "pyproject.toml"), pyproject("labelled-parent", "label_parent",
 		`"labelled-child>=0.1.0"`, "[tool.uv.sources]\nlabelled-child={path=\"./child\"}\n"))
 	write(filepath.Join(project, "package.toml"), "[application]\nobject=\"label_parent:app\"\n")
 	write(filepath.Join(project, "label_parent.py"), "from cozy_runtime.author import App, Context, invocable\n"+
 		"from label_child import Result, inspect\n"+
 		"@invocable\nasync def run(ctx: Context, *, count: int) -> Result:\n    return await inspect(count=count)\n"+
-		"app=App()\napp.job(run, accelerator=False)\n")
+		"app=App()\napp.entrypoint(run, accelerator=False)\n")
 	lock := exec.Command(uv, "lock", "--no-progress", "--project", project)
 	lock.Env = append(os.Environ(), "UV_CACHE_DIR="+strings.TrimSpace(string(cache)))
 	if data, err := lock.CombinedOutput(); err != nil {
@@ -287,7 +287,7 @@ func TestAPackageOnANewerSDKIsDescribedAfterAnUpgrade(t *testing.T) {
 		"class Drawn(msgspec.Struct):\n    text: str\n"+
 		"@invocable(memoize=Memoize(requires=(\"seed\",)))\n"+
 		"async def draw(ctx: Context, *, prompt: str, seed: int | None = None) -> Drawn:\n    return Drawn(prompt)\n"+
-		"app = App()\napp.job(draw, accelerator=False)\n")
+		"app = App()\napp.entrypoint(draw, accelerator=False)\n")
 	lock := exec.Command(uv, "lock", "--no-progress", "--project", project)
 	lock.Env = uvEnv
 	if data, err := lock.CombinedOutput(); err != nil {

@@ -10,7 +10,7 @@ import (
 // request's `lora_mode` reaches the Runtime whatever the callable declares, and only
 // "bake" or "per_step" pass; a callable declaring its own field of that name keeps it.
 func TestLoRAModeRidesEveryRequest(t *testing.T) {
-	raw := []byte(`{"application":"proof:app","entrypoints":[{"name":"run","request":{"fields":[{"name":"prompt","type":"str"}]},"result":{"fields":[]}}],"format":"cozy.package.interface/1","jobs":[]}`)
+	raw := []byte(`{"application":"proof:app","entrypoints":[{"name":"run","request":{"fields":[{"name":"prompt","type":"str"}]},"result":{"fields":[]}}],"format":"cozy.package.interface/1"}`)
 	iface, problem := launch.DecodePackageInterface(raw)
 	fatal(t, problem)
 	ep, problem := iface.Function("run")

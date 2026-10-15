@@ -137,7 +137,7 @@ func TestUnpublishedChildLocalArtifactsShareWorkspaceMemoization(t *testing.T) {
 		}
 		parent, problem := store.RequestByReference(strconv.Itoa(1 + cycle))
 		fatal(t, problem)
-		if parent == nil || parent.RetryOf != "" || parent.Worker != "" {
+		if parent == nil || parent.Worker != "" {
 			t.Fatalf("local fresh run gained retry or rental identity: %+v", parent)
 		}
 		children := machineChildren(t, root, store, strconv.Itoa(1+cycle))

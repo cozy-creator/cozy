@@ -27,7 +27,7 @@ func runModelCatalog(t *testing.T, configure ...func(*http.ServeMux, *hub.Packag
 	manifest := []byte(`{"fixture":"small root, not model closure bytes"}`)
 	digest, err := canonical.Spell(canonical.Digest(manifest))
 	must(t, err)
-	iface := []byte(`{"application":"q:app","entrypoints":[],"format":"cozy.package.interface/1","jobs":[{"accelerator":false,"models":[{"class":"Source","component_use":{},"path":"quantize.models.dits"},{"class":"Source","component_use":{},"path":"quantize.models.shared"}],"name":"quantize","publishes":false,"request":{"fields":[{"name":"steps","type":"int"}]},"result":{"fields":[]},"weights_outputs":[{"max_bytes":1048576,"mime_type":"application/vnd.cozy.model-manifest","output_id":"fp8"}]}]}`)
+	iface := []byte(`{"application":"q:app","entrypoints":[{"accelerator":false,"models":[{"class":"Model","component_use":{},"path":"quantize.models.dits","weights":true},{"class":"Model","component_use":{},"path":"quantize.models.shared","weights":true}],"name":"quantize","publishes":false,"request":{"fields":[{"name":"steps","type":"int"}]},"result":{"fields":[]},"weights_outputs":[{"max_bytes":1048576,"mime_type":"application/vnd.cozy.model-manifest","output_id":"fp8"}]}]}`)
 	contract, problem := launch.DecodePackageInterface(iface)
 	fatal(t, problem)
 	var detail hub.PackageReleaseDetail
@@ -152,8 +152,10 @@ func TestRunForeignModelInputsRefuseBeforeAcquisition(t *testing.T) {
 	}{
 		{"extra profile", append(append([]string{}, base...), "--source-profile", "dits=x/1", "--source-profile", "shared=y/1", "--source-profile", "other=z/1"), "names no model parameter of quantize"},
 		{"duplicate profile", append(append([]string{}, base...), "--source-profile", "dits=x/1", "--source-profile", "dits=y/1"), "names slot dits twice"},
-		{"two sources", append(append([]string{}, base[:4]...), append([]string{"model.shared=civitai://123"}, base[5:]...)...), "model_source.multiple_sources_unsupported"},
-		{"mixed inputs", append(append([]string{}, base[:4]...), append([]string{"model.shared=proof/source@1.0.0/bf16"}, base[5:]...)...), "model_source.mixed_inputs_unsupported"},
+		// A fleet-bought machine is sized to one provider source naming every slot; anything
+		// else runs on a named machine.
+		{"two sources", append(append([]string{}, base[:4]...), append([]string{"model.shared=civitai://123"}, base[5:]...)...), "runs on a named machine"},
+		{"mixed inputs", append(append([]string{}, base[:4]...), append([]string{"model.shared=proof/source@1.0.0/bf16"}, base[5:]...)...), "runs on a named machine"},
 		{"unknown model slot", append(append(append([]string{}, base[:5]...), "model.other="+source), base[5:]...), "model_slot_unknown"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -208,27 +210,29 @@ func TestManualRentalAcceptsRetainedCheckpointIdentity(t *testing.T) {
 	}
 }
 
-func TestRunPublishedModelJobKeepsPayloadAndDeclaresRentalClosure(t *testing.T) {
-	root, mu, posts, digest, manifest := runModelCatalog(t)
+func TestRunPublishedWeightsCallKeepsPayloadAndDeclaresRentalClosure(t *testing.T) {
+	root, mu, posts, digest, _ := runModelCatalog(t)
 	input := filepath.Join(root, "quantize.json")
 	must(t, os.WriteFile(input, []byte(`{"steps":7}`), 0600))
-	args := []string{"run", "proof/quantize/quantize", "model.dits=proof/source@1.0.0/bf16", "model.shared=proof/source@1.0.0/bf16", "--input", input, "--upload-to", "proof/output", "--rental-only", "--json", "--full", "--idempotency-key", "published-model-job"}
+	args := []string{"run", "proof/quantize/quantize", "model.dits=proof/source@1.0.0/bf16", "model.shared=proof/source@1.0.0/bf16", "--input", input, "--upload-to", "proof/output", "--rental-only", "--json", "--full", "--idempotency-key", "published-weights-call"}
 	startCalciferProcess(t, root)
 	code, out := runCozy(t, root, args...)
 	if code != 0 {
-		t.Fatalf("ordinary modeled job did not queue: %d %s", code, out)
+		t.Fatalf("an ordinary weights call did not queue: %d %s", code, out)
 	}
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()
-	row, problem := store.RequestByIdempotencyKey("published-model-job")
+	row, problem := store.RequestByIdempotencyKey("published-weights-call")
 	fatal(t, problem)
-	if row == nil || row.Kind != "job" || !bytes.Equal(row.Payload, []byte(`{"steps":7}`)) || len(row.Models) != 2 || row.ModelTransfer == nil || row.ModelTransfer.HasAcquisition() {
+	if row == nil || row.IsOperation() || !bytes.Equal(row.Payload, []byte(`{"steps":7}`)) || len(row.Models) != 2 ||
+		row.ModelTransfer == nil || row.ModelTransfer.Destination != "proof/output" || row.ModelTransfer.HasAcquisition() {
 		t.Fatalf("ordinary request changed: %+v", row)
 	}
 	for _, model := range row.Models {
-		if (model.Slot != "dits" && model.Slot != "shared") || model.Manifest != digest || model.ManifestLength != int64(len(manifest)) || model.BindingPath != "quantize.models."+model.Slot {
-			t.Fatalf("job grant lost exact root identity: %+v", model)
+		if (model.BindingSlot() != "quantize.models.dits" && model.BindingSlot() != "quantize.models.shared") ||
+			model.Manifest != digest || !model.Weights {
+			t.Fatalf("a Weights selection lost its exact identity: %+v", model)
 		}
 	}
 	deadline := time.Now().Add(15 * time.Second)
@@ -251,18 +255,19 @@ func TestRunPublishedModelJobKeepsPayloadAndDeclaresRentalClosure(t *testing.T) 
 	}
 	code, out = runCozy(t, root, args...)
 	if code != 0 {
-		t.Fatalf("same job replay failed: %d %s", code, out)
+		t.Fatalf("same call replay failed: %d %s", code, out)
 	}
-	replayed, problem := store.RequestByIdempotencyKey("published-model-job")
+	replayed, problem := store.RequestByIdempotencyKey("published-weights-call")
 	fatal(t, problem)
 	if replayed.ID != row.ID || replayed.BodyDigest != row.BodyDigest {
 		t.Fatal("replay changed request identity")
 	}
 }
 
-// A job that declares no accelerator wants a GPU: the CLI asks the Hub for the GPU machine,
-// not the cheaper CPU ones offered beside it.
-func TestAnUndeclaredJobRentsAGPUMachine(t *testing.T) {
+// A function that declares no accelerator wants a GPU: the CLI asks the Hub for the GPU
+// machine, not the cheaper CPU ones offered beside it. Its Weights[M] arguments are read raw,
+// so they size no device memory.
+func TestAnUndeclaredFunctionRentsAGPUMachine(t *testing.T) {
 	root, mu, posts, _, _ := runModelCatalog(t, func(mux *http.ServeMux, detail *hub.PackageReleaseDetail) {
 		detail.PackageInterface = bytes.Replace(detail.PackageInterface, []byte(`"accelerator":false,`), nil, 1)
 		contract, problem := launch.DecodePackageInterface(detail.PackageInterface)
@@ -279,9 +284,9 @@ func TestAnUndeclaredJobRentsAGPUMachine(t *testing.T) {
 	startCalciferProcess(t, root)
 	code, out := runCozy(t, root, "run", "proof/quantize/quantize", "model.dits=proof/source@1.0.0/bf16",
 		"model.shared=proof/source@1.0.0/bf16", "steps=7", "--upload-to", "proof/output", "--rental-only",
-		"--json", "--idempotency-key", "undeclared-job")
+		"--json", "--idempotency-key", "undeclared-call")
 	if code != 0 {
-		t.Fatalf("an undeclared job did not queue: %d %s", code, out)
+		t.Fatalf("an undeclared call did not queue: %d %s", code, out)
 	}
 	deadline := time.Now().Add(15 * time.Second)
 	var paid []byte
@@ -299,7 +304,7 @@ func TestAnUndeclaredJobRentsAGPUMachine(t *testing.T) {
 	request, problem := hub.ParseRentalRequestBytes(paid)
 	fatal(t, problem)
 	if request.SKU != "rtx-4090" || request.AcceleratorCount != 1 {
-		t.Fatalf("an undeclared job did not ask for a GPU machine: %s", paid)
+		t.Fatalf("an undeclared call did not ask for a GPU machine: %s", paid)
 	}
 }
 

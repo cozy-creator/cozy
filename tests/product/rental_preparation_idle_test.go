@@ -105,7 +105,7 @@ func TestRentalPreparationSettlementEndsItsWorkAcrossRestart(t *testing.T) {
 				ReadyAt:  time.Now().Add(-time.Hour).UTC().Format(time.RFC3339Nano)}))
 			_, _, problem = store.Submit(records.Request{ID: requestID, IdemKey: requestID,
 				BodyDigest: "sha256:" + strings.Repeat("a", 64),
-				Package: "proof/preparing", Entrypoint: "prepare", Payload: []byte("{}"),
+				Package:    "proof/preparing", Entrypoint: "prepare", Payload: []byte("{}"),
 				Rental: true, RentalRequired: true, Worker: rentalID, RequestedRental: rentalID})
 			fatal(t, problem)
 			// Observe the queued setup before starting the real Calcifer below.

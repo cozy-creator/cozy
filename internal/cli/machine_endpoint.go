@@ -2,12 +2,16 @@ package cli
 
 import (
 	"cmp"
+	"context"
 	"io"
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
+	"time"
 
 	"github.com/cozy-creator/cozy/internal/api"
 	"github.com/cozy-creator/cozy/internal/calcifer"
@@ -75,7 +79,7 @@ func endpointController(ctx *Context, ep *machineendpoint.Endpoint) (func(), *ex
 			http.Error(w, "foreground controller authentication required", http.StatusUnauthorized)
 			return
 		}
-		// A run of this target is observed and controlled by id, a request's or a job's.
+		// A run of this target is observed and controlled by its id.
 		if id, ok := runIDOf(r.URL.Path); ok {
 			row, problem := st.RequestByReference(id)
 			if problem != nil || row == nil {
@@ -89,7 +93,7 @@ func endpointController(ctx *Context, ep *machineendpoint.Endpoint) (func(), *ex
 			}
 		}
 		_, run := runIDOf(r.URL.Path)
-		submit := r.URL.Path == "/v1/requests" || r.URL.Path == "/v1/local/jobs"
+		submit := r.URL.Path == "/v1/requests"
 		if r.Method == http.MethodPost && !submit && !run || r.Method == http.MethodDelete && r.URL.Path == "/v1/local/calcifer" {
 			http.Error(w, "foreground operation is scoped to this request lifecycle", http.StatusForbidden)
 			return
@@ -191,13 +195,10 @@ func rentalEndpoint(ctx *Context, l home.Layout, st *records.Store) func(*machin
 	}
 }
 
-// runIDOf is the run a path observes or controls: `/v1/requests/<id>/…` or
-// `/v1/local/jobs/<id>/…`.
+// runIDOf is the run a path observes or controls: `/v1/requests/<id>/…`.
 func runIDOf(path string) (string, bool) {
-	for _, prefix := range []string{"/v1/requests/", "/v1/local/jobs/"} {
-		if rest, ok := strings.CutPrefix(path, prefix); ok && rest != "" {
-			return strings.Split(rest, "/")[0], true
-		}
+	if rest, ok := strings.CutPrefix(path, "/v1/requests/"); ok && rest != "" {
+		return strings.Split(rest, "/")[0], true
 	}
 	return "", false
 }
@@ -245,4 +246,24 @@ func rentalMachineEndpoint(ctx *Context, name string) (*machineendpoint.Endpoint
 		return nil, exit.New(exit.Validation, "rental %s is not reachable as a machine endpoint: %s", name, err)
 	}
 	return ep, nil
+}
+
+// awaitAcceptance follows a run until its machine's durable receipt, or until it settles. A
+// signal detaches only this caller; it never cancels the run nor stands in for acceptance.
+func awaitAcceptance(client *localapi.Client, life api.Lifecycle) (api.Lifecycle, *exit.Error) {
+	wait, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	for life.MachineExecution != nil && !life.MachineExecution.Accepted && !invocationSettled(life.Status) {
+		select {
+		case <-wait.Done():
+			return life, nil
+		case <-time.After(200 * time.Millisecond):
+		}
+		next, problem := client.Request(life.RequestID)
+		if problem != nil {
+			return life, problem
+		}
+		life = next
+	}
+	return life, nil
 }

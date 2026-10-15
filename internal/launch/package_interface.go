@@ -99,14 +99,14 @@ type WeightsOutput struct {
 // optional `sequence_parallel` document. `stamps` is a RETIRED member: every release published before the cut ships an
 // empty map, which reads as nothing declared, and a value in it refuses by name below.
 type Slot struct {
-	Class            string                 `json:"class"`
-	Path             string                 `json:"path"`
-	Param            string                 `json:"-"`
-	ComponentUse     map[string][]string    `json:"component_use"`
-	EncodedLeaves    string                 `json:"encoded_leaves,omitempty"`
-	Fusion           string                 `json:"fusion,omitempty"`
-	SequenceParallel json.RawMessage        `json:"sequence_parallel,omitempty"`
-	DefaultLadder    []ModelDefaultRung     `json:"default_ladder,omitempty"`
+	Class            string              `json:"class"`
+	Path             string              `json:"path"`
+	Param            string              `json:"-"`
+	ComponentUse     map[string][]string `json:"component_use"`
+	EncodedLeaves    string              `json:"encoded_leaves,omitempty"`
+	Fusion           string              `json:"fusion,omitempty"`
+	SequenceParallel json.RawMessage     `json:"sequence_parallel,omitempty"`
+	DefaultLadder    []ModelDefaultRung  `json:"default_ladder,omitempty"`
 	// Weights is a `Weights[M]` argument: the raw checkpoint, read and never constructed.
 	Weights        bool                   `json:"weights,omitempty"`
 	DefaultBinding *hub.PackageBindingRow `json:"-"`

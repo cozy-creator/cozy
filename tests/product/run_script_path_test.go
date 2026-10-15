@@ -54,29 +54,34 @@ func TestRunTakesAScriptPathHoweverItIsSpelled(t *testing.T) {
 	}
 }
 
-// --describe says where a job runs: its own accelerator declaration, in both outputs.
-func TestDescribeShowsAJobsAcceleratorDeclaration(t *testing.T) {
+// --describe says where a function runs: CPU when it declares `accelerator = false`, in both
+// outputs; an undeclared one runs on the machine's GPU and says nothing.
+func TestDescribeShowsACPUDeclaration(t *testing.T) {
 	root, err := os.MkdirTemp(scratchBase, "describe-accelerator-")
 	must(t, err)
 	t.Cleanup(func() { _ = removeAllForce(root) })
-	for _, test := range []struct{ declared, human, json string }{
-		{"# [tool.cozy]\n# accelerator = false\n", "runs on: CPU", `"accelerator":false`},
-		{"# [tool.cozy]\n# accelerator = true\n", "runs on: GPU", `"accelerator":true`},
+	for _, test := range []struct {
+		declared string
+		cpu      bool
+	}{
+		{"# [tool.cozy]\n# accelerator = false\n", true},
+		{"", false},
 	} {
-		script := filepath.Join(t.TempDir(), "job.py")
+		script := filepath.Join(t.TempDir(), "main.py")
 		must(t, os.WriteFile(script, []byte("# /// script\n# requires-python=\">=3.12,<3.13\"\n# dependencies=[\"cozy-runtime>="+
 			hostruntime.PackageFloor+"\"]\n"+test.declared+"# ///\ndef main(): pass\n"), 0o600))
-		if code, out := runCozy(t, root, "run", script, "--describe"); code != 0 || !strings.Contains(out, test.human) {
-			t.Fatalf("human --describe omitted %q [exit %d]: %s", test.human, code, out)
+		if code, out := runCozy(t, root, "run", script, "--describe"); code != 0 || strings.Contains(out, "runs on: CPU") != test.cpu {
+			t.Fatalf("human --describe CPU=%t [exit %d]: %s", test.cpu, code, out)
 		}
-		if code, out := runCozy(t, root, "run", script, "--describe", "--json"); code != 0 || !strings.Contains(out, test.json) {
-			t.Fatalf("--describe --json omitted %s [exit %d]: %s", test.json, code, out)
+		if code, out := runCozy(t, root, "run", script, "--describe", "--json"); code != 0 || strings.Contains(out, `"accelerator":false`) != test.cpu {
+			t.Fatalf("--describe --json CPU=%t [exit %d]: %s", test.cpu, code, out)
 		}
 	}
 }
 
-// A script is a single-file package: a main that runs a Model slot is served like a package
-// entrypoint, not a job, its slot read from the editable library's source.
+// A script is a single-file package whose main is always an entrypoint: a Model slot it
+// constructs and a Weights[M] argument it reads raw both describe, read from the editable
+// library's source.
 func TestAScriptThatRunsAModelSlotIsServed(t *testing.T) {
 	root, err := os.MkdirTemp(scratchBase, "script-model-")
 	must(t, err)
@@ -98,8 +103,8 @@ func TestAScriptThatRunsAModelSlotIsServed(t *testing.T) {
 		"# [tool.cozy.models]\n# model = \"acme/probe@1.0/fp8\"\n# ///\n"+
 		"from probe_lib import Probe\n\ndef main(*, model: Probe) -> int:\n    return model.run()\n"), 0o600))
 	code, out := runCozy(t, root, "run", script, "--describe")
-	if code != 0 || strings.Contains(out, "(job)") || !strings.Contains(out, "model: Probe") {
-		t.Fatalf("a script running a Model slot was not described as served [exit %d]: %s", code, out)
+	if code != 0 || !strings.Contains(out, "model: Probe") || strings.Contains(out, "model: Probe weights") {
+		t.Fatalf("a script running a Model slot was not described [exit %d]: %s", code, out)
 	}
 	// Its library travels with it as a local package's does: named relative to its project.
 	projects, _ := filepath.Glob(filepath.Join(root, "scripts", "cozy-script-*"))
@@ -111,5 +116,17 @@ func TestAScriptThatRunsAModelSlotIsServed(t *testing.T) {
 	relative, _ := filepath.Rel(projects[0], library)
 	if !strings.Contains(string(raw), "path = '"+relative+"'") {
 		t.Fatalf("the library source is not %s relative to the script project:\n%s", relative, raw)
+	}
+	reader := filepath.Join(project, "reader.py")
+	must(t, os.WriteFile(reader, []byte("# /// script\n# requires-python=\">=3.12,<3.13\"\n"+
+		"# dependencies=[\"cozy-runtime>="+hostruntime.PackageFloor+"\", \"probe-lib\"]\n"+
+		"# [tool.uv.sources]\n# probe-lib = {path = \"./probe-lib\", editable = true}\n"+
+		"# [tool.cozy]\n# accelerator = false\n"+
+		"# [tool.cozy.models]\n# source = \"acme/probe@1.0/fp8\"\n# ///\n"+
+		"from cozy_runtime.author import Weights\nfrom probe_lib import Probe\n\n"+
+		"def main(*, source: Weights[Probe]) -> int:\n    return len(source.components())\n"), 0o600))
+	code, out = runCozy(t, root, "run", reader, "--describe")
+	if code != 0 || !strings.Contains(out, "source: Probe weights") || !strings.Contains(out, "runs on: CPU") {
+		t.Fatalf("a script reading a Weights argument was not described [exit %d]: %s", code, out)
 	}
 }

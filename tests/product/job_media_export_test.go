@@ -15,7 +15,7 @@ import (
 )
 
 // Exercise the real CLI, Calcifer, Runtime, accepted publication and exporter.
-func TestTopLevelJobMediaExportsAndTextDoesNotCreateDirectory(t *testing.T) {
+func TestTopLevelMediaExportsAndTextDoesNotCreateDirectory(t *testing.T) {
 	integration(t)
 	if *privateScriptRuntimeWheel == "" {
 		t.Skip("requires an exact published Runtime wheel")
@@ -74,10 +74,10 @@ class Picture(msgspec.Struct):
     image: Annotated[ImageAsset, AssetBound(media_types=("image/png",))]
 class Text(msgspec.Struct):
     text: str
-@app.job(accelerator=False)
+@app.entrypoint(accelerator=False)
 def text(payload:Request)->Text:
     return Text("done")
-@app.job(emits_media=True, accelerator=False)
+@app.entrypoint(emits_media=True, accelerator=False)
 def picture(payload:Request,out:Outputs)->Picture:
     return Picture(out.save_image(ImageFrame(2,2,bytes([255,0,0])*4),format="png"))
 `), 0600))
@@ -97,7 +97,7 @@ def picture(payload:Request,out:Outputs)->Picture:
 	run("run", "local/job-media-export-proof/text", "--await", "--json")
 	defaultDir := filepath.Join(root, "outputs", "local-job-media-export-proof")
 	if _, err := os.Stat(defaultDir); !os.IsNotExist(err) {
-		t.Fatalf("text-only job created outputs directory: %v", err)
+		t.Fatalf("a text-only run created an outputs directory: %v", err)
 	}
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
@@ -111,15 +111,15 @@ def picture(payload:Request,out:Outputs)->Picture:
 		}
 		result := run(args...)
 		if result["status"] != "completed" {
-			t.Fatalf("media job failed: %+v", result)
+			t.Fatalf("the media run failed: %+v", result)
 		}
 		saved, ok := result["saved"].([]any)
 		if !ok || len(saved) != 1 {
-			t.Fatalf("job omitted saved media: %+v", result)
+			t.Fatalf("the run omitted saved media: %+v", result)
 		}
 		entry := saved[0].(map[string]any)
 		target := entry["path"].(string)
-		request, problem := store.RequestByReference(fmt.Sprint(result["job"]))
+		request, problem := store.RequestByReference(fmt.Sprint(result["id"]))
 		fatal(t, problem)
 		// The image is its item's one stable file, named by run and output, never by content.
 		if target != filepath.Join(directory, fmt.Sprintf("%d-image.png", request.Number)) {

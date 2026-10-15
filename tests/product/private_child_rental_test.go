@@ -3,7 +3,6 @@ package producttest
 import (
 	"os"
 	"path/filepath"
-	"strconv"
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
@@ -27,7 +26,12 @@ func TestPrivateRentalIncludesChildGPUWithoutGrantingItToParent(t *testing.T) {
 			child := cleanupTestInstall(layout, "2222222222222222", "1.0.0")
 			// The child's declared accelerator decides; its closure has torch either way.
 			child.Closure = "cozy-runtime==0.4.0\ntorch==2.13.0"
-			raw, err := canonical.NormalizeJCS([]byte(`{"format":"cozy.package.interface/1","application":"private_ops:app","entrypoints":[],"jobs":[{"name":"compute","accelerator":` + strconv.FormatBool(gpu) + `,"models":[],"request":{"fields":[]},"result":{"fields":[]},"publishes":false,"weights_outputs":[],"invocable":{"context":"ctx","module":"private_ops","export":"compute","parameters":[],"defaults":{},"type_names":{},"enum_members":{},"memoize":true,"capabilities":[]}}]}`))
+			// The child's declared machine class: `accelerator` is written only as false.
+			accelerator := `"accelerator":false,`
+			if gpu {
+				accelerator = ""
+			}
+			raw, err := canonical.NormalizeJCS([]byte(`{"format":"cozy.package.interface/1","application":"private_ops:app","entrypoints":[{"name":"compute",` + accelerator + `"models":[],"request":{"fields":[]},"result":{"fields":[]},"publishes":false,"weights_outputs":[],"invocable":{"context":"ctx","module":"private_ops","export":"compute","parameters":[],"defaults":{},"type_names":{},"enum_members":{},"memoize":true,"capabilities":[]}}]}`))
 			must(t, err)
 
 			must(t, os.MkdirAll(filepath.Dir(launch.PackageInterfacePath(child.Dir)), 0o700))

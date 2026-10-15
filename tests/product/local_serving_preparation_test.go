@@ -11,7 +11,7 @@ import (
 // A published install's preparation metadata retains the exact interface bytes the machine
 // path sends; a digest alone cannot satisfy Runtime's preparation request.
 func TestLocalPreparationRetainsPublishedInterface(t *testing.T) {
-	iface, problem := launch.DecodePackageInterface([]byte(`{"format":"cozy.package.interface/1","application":"proof:app","entrypoints":[],"jobs":[]}`))
+	iface, problem := launch.DecodePackageInterface([]byte(`{"format":"cozy.package.interface/1","application":"proof:app","entrypoints":[]}`))
 	fatal(t, problem)
 	facts := launch.Facts{Install: records.PackageInstall{ID: "published", Package: "proof/model",
 		Version: "1.0.0", SourceKind: "tensorhub", Dir: t.TempDir()},

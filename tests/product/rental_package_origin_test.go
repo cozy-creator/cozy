@@ -257,7 +257,7 @@ class AddResult(msgspec.Struct):
     value: int
     report: Annotated[FileAsset, AssetBound(max_bytes=1024, media_types=("text/plain",))]
 app = App()
-@app.job(accelerator=False)
+@app.entrypoint(accelerator=False)
 def add(payload: AddRequest, out: Outputs) -> AddResult:
     return AddResult(payload.value + 100, out.save_bytes(b"newer release output\n", media_type="text/plain"))
 `), 0o600))

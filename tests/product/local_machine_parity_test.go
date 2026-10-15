@@ -264,12 +264,12 @@ class AddResult(msgspec.Struct):
 app = App()
 
 
-@app.job(accelerator=False)
+@app.entrypoint(accelerator=False)
 def add(payload: AddRequest) -> AddResult:
     return AddResult(value=payload.value + 1)
 
 
-@app.entrypoint
+@app.entrypoint(accelerator=False)
 def echo(payload: AddRequest) -> AddResult:
     return AddResult(value=payload.value * 2)
 

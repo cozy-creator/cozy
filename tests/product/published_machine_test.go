@@ -31,7 +31,7 @@ type publishedRouteObserver struct{}
 func (publishedRouteObserver) Refresh(context.Context, records.Request) *exit.Error { return nil }
 func (publishedRouteObserver) Withdraw(string)                                      {}
 func (publishedRouteObserver) Forget(string)                                        {}
-func (publishedRouteObserver) Cancel(context.Context, records.Request) *exit.Error { return nil }
+func (publishedRouteObserver) Cancel(context.Context, records.Request) *exit.Error  { return nil }
 
 // Every rented published call is a Runtime execution, as is a local published install.
 func TestPublishedMachineRoutingOwnsEveryRentedCall(t *testing.T) {

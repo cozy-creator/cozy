@@ -18,9 +18,9 @@ func idleRecord(t *testing.T, store *records.Store, id string, at time.Time) rec
 	return row
 }
 
-// RUNNING and QUEUED count each machine's own work, never fleet work elsewhere or work
-// retained after it settled; when the machine ends itself is its own to say.
-func TestRentalWorkCountsScopeWorkAndRetainedState(t *testing.T) {
+// RUNNING and QUEUED count each machine's own work, never fleet work elsewhere or work that
+// settled; when the machine ends itself is its own to say.
+func TestRentalWorkCountsScopeWork(t *testing.T) {
 	store, problem := records.Open(filepath.Join(t.TempDir(), "records.sqlite"))
 	fatal(t, problem)
 	defer store.Close()
@@ -46,29 +46,13 @@ func TestRentalWorkCountsScopeWorkAndRetainedState(t *testing.T) {
 	if work() == 0 {
 		t.Fatal("pinned work was not counted")
 	}
-	state, p := store.RequestPause(request.ID, "clock proof")
-	fatal(t, p)
-	if state != "paused" {
-		changed, p := store.CompleteRequestPause(request.ID)
-		fatal(t, p)
-		if !changed {
-			t.Fatal("pause did not settle")
-		}
-	}
-	if work() != 0 {
-		t.Fatal("retained paused work counted as work")
-	}
-	failed := recordPrivateTransaction(t, store, "failed", row.ID)
-	changed, p := store.FailQueuedRequest(failed.ID, retainedFailure("fixture", "failed before it started"))
+	changed, p := store.FailQueuedRequest(request.ID, retainedFailure("fixture", "failed before it started"))
 	fatal(t, p)
 	if !changed {
 		t.Fatal("failed fixture did not settle")
 	}
 	if work() != 0 {
 		t.Fatal("failed work counted as work")
-	}
-	if retained, p := store.RentalRetainsWork(row.ID); p != nil || !retained {
-		t.Fatal("counting destroyed or ignored retained custody", p)
 	}
 }
 

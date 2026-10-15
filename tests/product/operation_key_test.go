@@ -17,7 +17,7 @@ func TestOperationKeyExcludesHistoryAndPreservesObservableInputs(t *testing.T) {
 	request := records.Request{ID: "first", ParentRequestID: "parent1", ChildTargetDigest: childDigest("3"), Payload: payload(artifact, "observable-a"), Models: []records.ModelRef{{Slot: "source", Manifest: artifact.Manifest.Digest, ManifestLength: 161}}}
 	key, problem := records.OperationKey(request)
 	fatal(t, problem)
-	request.ID, request.ParentRequestID, request.ReuseScope, request.RetryOf = "fresh", "unrelated-parent", "new-scope", ""
+	request.ID, request.ParentRequestID = "fresh", "unrelated-parent"
 	artifact.ProducerRequestID, artifact.TensorFSReceiptDigest = "producer-b", childDigest("4")
 	request.Payload = payload(artifact, "observable-a")
 	reused, problem := records.OperationKey(request)

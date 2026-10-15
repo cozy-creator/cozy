@@ -32,9 +32,7 @@ func machineChildren(t *testing.T, root string, store *records.Store, parentRef 
 	if parent == nil {
 		t.Fatalf("no parent %s", parentRef)
 	}
-	children, problem := store.Children(parent.ID)
-	fatal(t, problem)
-	if len(children) != 0 {
+	if creatorChildren(t, root, parent.ID) != 0 {
 		t.Fatal("Creator owns Runtime children")
 	}
 	db, err := sql.Open("sqlite", "file:"+rustJournal(root)+"?mode=ro&_pragma=busy_timeout(5000)")
@@ -101,6 +99,18 @@ func machineChildren(t *testing.T, root string, store *records.Store, parentRef 
 }
 
 // rustJournal is this computer's machine's execution journal.
+// creatorChildren counts the child requests this computer's records hold for parent: a
+// machine's children are its own runs, never Creator's.
+func creatorChildren(t *testing.T, root, parent string) int {
+	t.Helper()
+	db, err := sql.Open("sqlite", "file:"+filepath.Join(root, "creator.sqlite")+"?mode=ro&_pragma=busy_timeout(5000)")
+	must(t, err)
+	defer db.Close()
+	var count int
+	must(t, db.QueryRow(`SELECT COUNT(*) FROM requests WHERE parent_request_id=?`, parent).Scan(&count))
+	return count
+}
+
 func rustJournal(root string) string {
 	return filepath.Join(root, "machine", "root", "var", "lib", "cozy", "tensord", "execution", "executions.sqlite3")
 }

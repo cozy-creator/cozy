@@ -300,7 +300,7 @@ func authoredInterfaceDocument(t *testing.T, ladder json.RawMessage) []byte {
 	if ladder != nil {
 		slot["default_ladder"] = ladder
 	}
-	doc := map[string]any{"format": "cozy.package.interface/1", "application": "proof:app", "entrypoints": []any{map[string]any{"name": "generate", "request": map[string]any{"fields": []any{}}, "result": map[string]any{"fields": []any{}}, "models": []any{slot}}}, "jobs": []any{}}
+	doc := map[string]any{"format": "cozy.package.interface/1", "application": "proof:app", "entrypoints": []any{map[string]any{"name": "generate", "request": map[string]any{"fields": []any{}}, "result": map[string]any{"fields": []any{}}, "models": []any{slot}}}}
 	body, err := json.Marshal(doc)
 	must(t, err)
 	return body

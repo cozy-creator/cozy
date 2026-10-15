@@ -2,7 +2,7 @@ package producttest
 
 // cl-175 — package code is untrusted; analysis never executes it. Every reading of a package's
 // surface is THIS host's cozy-runtime (>= hostruntime.ToolFloor) parsing source: at publish
-// pre-flight, at install, and for a job's descriptor id. So a package whose module imports
+// pre-flight, at install, and for a function's descriptor id. So a package whose module imports
 // torch at the top installs and publishes on a host whose package environment has no torch —
 // the fixture's venv is `cozy-runtime[media]` and this test adds nothing to it. A second
 // top-level import names a module that exists nowhere, so the proof does not rest on what
@@ -48,12 +48,12 @@ func TestStaticDescribeNeverImportsPackageCode(t *testing.T) {
 		t.Fatalf("the package environment %s carries torch; the proof needs it absent\n%s", python, out)
 	}
 
-	// (b) A job's descriptor id is read the same way, by the same host tool.
+	// (b) A function's descriptor id is read the same way, from the same reading.
 	facts, problem := launch.Read(install, root, childEnv(t, root))
 	fatal(t, problem)
-	job, problem := facts.Job("tile_job")
+	tileJob, problem := facts.PackageInterface.Function("tile_job")
 	fatal(t, problem)
-	if job.DescriptorID == "" {
+	if tileJob.DescriptorID == "" {
 		t.Fatal("tile_job was read without a descriptor id")
 	}
 

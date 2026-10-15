@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -20,7 +19,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/secret"
-	v1 "github.com/cozy-creator/cozy/protocol/cozy/machine/v1"
 )
 
 // A handoff its machine has not confirmed does not hold `cozy down`: Calcifer stops, names it

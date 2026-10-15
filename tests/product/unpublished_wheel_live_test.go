@@ -91,8 +91,8 @@ async def compose(value: int) -> Result:
     previous = await first(value=value)
     return await second(value=previous.value)
 app = App()
-app.job(first, accelerator=False)
-app.job(second, accelerator=False)
+app.entrypoint(first, accelerator=False)
+app.entrypoint(second, accelerator=False)
 `
 	module := filepath.Join(library, "wheel_proof.py")
 	must(t, os.WriteFile(module, []byte(body), 0o600))

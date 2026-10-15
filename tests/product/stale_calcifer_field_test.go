@@ -14,7 +14,6 @@ func TestFieldFromNewerClientIsIgnoredByAnOlderCalcifer(t *testing.T) {
 	calcifer := startCalciferProcess(t, root)
 	submission := map[string]any{"package": "proof/p", "function": "f", "input": map[string]any{}}
 	for path, body := range map[string]map[string]any{
-		"/v1/requests":   submission,
 		"/v1/requests": submission,
 	} {
 		key := strings.ReplaceAll(path, "/", "-")

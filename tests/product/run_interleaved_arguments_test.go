@@ -22,7 +22,7 @@ func TestRunDescribeAcceptsPayloadAfterOptions(t *testing.T) {
 	h := newLadderHub(t)
 	root := ladderRoot(t, h)
 	// This is the user's ordering: a prompt, two reference flags, more payload,
-	// and placement/wait flags. Describe proves parsing without starting a job.
+	// and placement/wait flags. Describe proves parsing without starting a run.
 	args := []string{"run", ladderPackage + "/generate", "prompt=Picture-1.",
 		"--asset=/missing/a=b.png", "--asset=/missing/c=d.png", "duration_s=14", "steps=30",
 		"--rental-only", "--await", "--describe", "--json"}
@@ -57,17 +57,17 @@ func interleavedAssetsRoot(t *testing.T, extra ...map[string]any) string {
 	t.Helper()
 	var doc map[string]any
 	must(t, json.Unmarshal([]byte(declaredAssetsInterface), &doc))
-	job := doc["entrypoints"].([]any)[0].(map[string]any)
-	job["name"], job["publishes"], job["weights_outputs"] = "prepare", false, []any{}
-	fields := job["request"].(map[string]any)["fields"].([]any)
+	fn := doc["entrypoints"].([]any)[0].(map[string]any)
+	fn["name"], fn["publishes"], fn["weights_outputs"] = "prepare", false, []any{}
+	fields := fn["request"].(map[string]any)["fields"].([]any)
 	for _, name := range []string{"steps", "seed"} {
 		fields = append(fields, map[string]any{"name": name, "type": "int", "wire": "optional"})
 	}
 	for _, field := range extra {
 		fields = append(fields, field)
 	}
-	job["request"].(map[string]any)["fields"] = fields
-	doc["jobs"], doc["entrypoints"] = []any{job}, []any{}
+	fn["request"].(map[string]any)["fields"] = fields
+	doc["entrypoints"] = []any{fn}
 	raw, err := json.Marshal(doc)
 	must(t, err)
 	iface, problem := launch.DecodePackageInterface(raw)

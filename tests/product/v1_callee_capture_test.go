@@ -15,7 +15,7 @@ import (
 
 // Component-boundary proof: real CLI/Calcifer and machine on an isolated fixture root,
 // candidate SDK wheels, three ordinary packages. It never installs a personal machine.
-func TestV1CapturedPackageCallsNestedJobsOnTheRealMachine(t *testing.T) {
+func TestV1CapturedPackageCallsNestedFunctionsOnTheRealMachine(t *testing.T) {
 	if *machineHostBinary == "" || *privateChildRuntimeWheel == "" || *tensorfsFixtureWheel == "" {
 		t.Skip("requires actual machine and paired Runtime/TensorFS fixture wheels")
 	}
@@ -54,11 +54,11 @@ func TestV1CapturedPackageCallsNestedJobsOnTheRealMachine(t *testing.T) {
 		body := "import msgspec\nfrom cozy_runtime.author import App, Context, invocable\nclass Result(msgspec.Struct, frozen=True):\n    value: int\n"
 		switch node {
 		case "leaf":
-			body += "@invocable(memoize=True)\nasync def compute(ctx: Context, *, value: int) -> Result:\n    return Result(value + 100)\napp=App()\napp.job(compute, accelerator=False)\n"
+			body += "@invocable(memoize=True)\nasync def compute(ctx: Context, *, value: int) -> Result:\n    return Result(value + 100)\napp=App()\napp.entrypoint(compute, accelerator=False)\n"
 		case "nested":
-			body += "from callee_leaf_proof import compute as leaf\n@invocable(memoize=True)\nasync def compute(ctx: Context, *, value: int) -> Result:\n    result=await leaf(value=value)\n    return Result(result.value * 2)\napp=App()\napp.job(compute, accelerator=False)\n"
+			body += "from callee_leaf_proof import compute as leaf\n@invocable(memoize=True)\nasync def compute(ctx: Context, *, value: int) -> Result:\n    result=await leaf(value=value)\n    return Result(result.value * 2)\napp=App()\napp.entrypoint(compute, accelerator=False)\n"
 		case "caller":
-			body += "from callee_nested_proof import compute\nclass Input(msgspec.Struct):\n    value: int = 7\napp=App()\n@app.job(accelerator=False)\nasync def main(payload: Input) -> Result:\n    result=await compute(value=payload.value)\n    return Result(result.value)\n"
+			body += "from callee_nested_proof import compute\nclass Input(msgspec.Struct):\n    value: int = 7\napp=App()\n@app.entrypoint(accelerator=False)\nasync def main(payload: Input) -> Result:\n    result=await compute(value=payload.value)\n    return Result(result.value)\n"
 		}
 		must(t, os.WriteFile(filepath.Join(dir, module+".py"), []byte(body), 0o600))
 	}
@@ -70,7 +70,7 @@ func TestV1CapturedPackageCallsNestedJobsOnTheRealMachine(t *testing.T) {
 		t.Fatalf("ordinary caller installation failed [%d]: %s", code, out)
 	}
 	if code, out := runCozy(t, root, "run", "local/callee-caller-proof/main", "--await", "--json"); code != 0 || !strings.Contains(out, `"value":214`) {
-		t.Fatalf("ordinary nested package job did not return 214 [%d]: %s", code, out)
+		t.Fatalf("ordinary nested package call did not return 214 [%d]: %s", code, out)
 	}
 	// Nothing was staged on this computer for it: the machine was sent the install's own files.
 	if _, err := os.Stat(filepath.Join(root, "local-packages")); !os.IsNotExist(err) {
@@ -79,7 +79,7 @@ func TestV1CapturedPackageCallsNestedJobsOnTheRealMachine(t *testing.T) {
 	db, err := sql.Open("sqlite", "file:"+filepath.Join(root, "machine/root/var/lib/cozy/tensord/execution/executions.sqlite3")+"?mode=ro")
 	must(t, err)
 	defer db.Close()
-	// The run's three executed jobs.
+	// The run's three executed calls, each a CPU function.
 	rows, err := db.Query("SELECT invocation FROM executions WHERE id <= 3 ORDER BY id")
 	must(t, err)
 	defer rows.Close()
@@ -90,20 +90,20 @@ func TestV1CapturedPackageCallsNestedJobsOnTheRealMachine(t *testing.T) {
 		must(t, rows.Scan(&raw))
 		var invocation struct {
 			Package, Generation, Parent string
-			Job                         bool
+			Degree                      uint32
 		}
 		must(t, json.Unmarshal(raw, &invocation))
 		if invocation.Parent == "" {
 			generation = invocation.Generation
 		}
-		if !invocation.Job || invocation.Generation != generation {
-			t.Fatalf("callee job escaped the captured environment or kind: %+v", invocation)
+		if invocation.Degree != 0 || invocation.Generation != generation {
+			t.Fatalf("callee escaped the captured environment or its CPU declaration: %+v", invocation)
 		}
 		generation = invocation.Generation
 		packages = append(packages, invocation.Package)
 	}
 	must(t, rows.Err())
-	// A local generation labels its root by distribution; dispatched child jobs
+	// A local generation labels its root by distribution; dispatched child calls
 	// retain the logical package identities recorded by the captured callees map.
 	if strings.Join(packages, ",") != "callee-caller-proof,local/callee-nested-proof,local/callee-leaf-proof" {
 		t.Fatalf("children lost their independent package identities: %v", packages)
@@ -142,14 +142,14 @@ func TestACapturedPackageInstallsOnAMachineWhoseRuntimeDiffers(t *testing.T) {
 		module := "skew_" + node
 		dependencies, extra := `"cozy-runtime>=0.18.89", "msgspec>=0.19,<1"`, ""
 		body := "import msgspec\nfrom cozy_runtime.author import App, Context, invocable\napp = App()\nclass Squared(msgspec.Struct):\n    square: int\n" +
-			"@invocable()\nasync def square(ctx: Context, *, value: int) -> Squared:\n    return Squared(value * value)\napp.job(square, accelerator=False)\n"
+			"@invocable()\nasync def square(ctx: Context, *, value: int) -> Squared:\n    return Squared(value * value)\napp.entrypoint(square, accelerator=False)\n"
 		if node == "caller" {
 			// The lock picks a published Runtime other than the machine's.
 			dependencies += `, "skew-callee>=1.0.0"`
 			extra = fmt.Sprintf("[tool.uv]\nconstraint-dependencies = [\"cozy-runtime!=%s\"]\n[tool.uv.sources]\nskew-callee = {path = \"../callee\"}\n", machine)
 			body = "import msgspec\nfrom cozy_runtime.author import App, Context\nfrom skew_callee import square\napp = App()\n" +
 				"class Survey(msgspec.Struct):\n    values: list[int]\nclass Surveyed(msgspec.Struct):\n    squares: list[int]\n" +
-				"async def survey(ctx: Context, payload: Survey) -> Surveyed:\n    return Surveyed([(await square(value=v)).square for v in payload.values])\napp.job(survey, accelerator=False)\n"
+				"async def survey(ctx: Context, payload: Survey) -> Surveyed:\n    return Surveyed([(await square(value=v)).square for v in payload.values])\napp.entrypoint(survey, accelerator=False)\n"
 		}
 		metadata := fmt.Sprintf("[project]\nname=%q\nversion=\"1.0.0\"\nrequires-python=\">=3.12,<3.13\"\ndependencies=[%s]\n%s[project.entry-points.\"cozy.application\"]\ndefault=%q\n[build-system]\nrequires=[\"hatchling\"]\nbuild-backend=\"hatchling.build\"\n[tool.hatch.build.targets.wheel]\nonly-include=[%q]\n",
 			"skew-"+node, dependencies, extra, module+":app", module+".py")
