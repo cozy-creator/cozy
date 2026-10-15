@@ -299,9 +299,6 @@ pub enum DeviceCommand {
         #[serde(skip_serializing_if = "Option::is_none")]
         cap_bytes: Option<u64>,
     },
-    Prefetch {
-        construction: String,
-    },
     /// Map a loaded construction's weights onto the GPU inside `cap_bytes`, nothing run
     /// (`weights.map/1`): a warm set member at `gpu`.
     Map {
@@ -379,7 +376,6 @@ impl DeviceCommand {
             Self::PrepareRequest { .. } => "prepare_request",
             Self::Invoke { .. } => "invoke",
             Self::Budget { .. } => "budget",
-            Self::Prefetch { .. } => "prefetch",
             Self::Map { .. } => "map",
             Self::Share => "share",
             Self::Revoke { .. } => "revoke",

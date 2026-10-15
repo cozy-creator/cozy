@@ -6,7 +6,7 @@
 //! (or its run is canceled) its waits fail, its channels close and their tickets drop.
 use crate::hub;
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::BTreeSet,
     fs::File,
     io,
     net::Shutdown,
@@ -119,7 +119,6 @@ pub struct Fetch {
     /// Its schedules' order: the root run's acceptance, or after every run (no run).
     order: u64,
     manifests: Vec<String>,
-    accesses: Mutex<HashMap<Origin, Arc<dyn Access>>>,
     stop: PullCancellation,
     channels: Mutex<Vec<UnixStream>>,
     kept: Mutex<Vec<Ticket>>,
@@ -133,7 +132,6 @@ impl Fetch {
             hub,
             order,
             manifests,
-            accesses: Mutex::default(),
             stop: PullCancellation::default(),
             channels: Mutex::default(),
             kept: Mutex::default(),
@@ -152,14 +150,7 @@ impl Fetch {
         let hub = self.hub.as_ref().ok_or_else(|| {
             io::Error::other(format!("model_fetch_failed: {} is here in part and this call names no Hub", manifest.id()))
         })?;
-        let mut accesses = self.accesses.lock().unwrap();
-        let access = match accesses.get(&origin) {
-            Some(access) => access.clone(),
-            None => {
-                let access: Arc<dyn Access> = of(hub, &origin).map_err(|(_, why)| io::Error::other(why))?;
-                accesses.entry(origin.clone()).or_insert(access).clone()
-            }
-        };
+        let access: Arc<dyn Access> = of(hub, &origin).map_err(|(_, why)| io::Error::other(why))?;
         Ok(Some((origin, access)))
     }
 

@@ -397,8 +397,6 @@ struct Session {
     /// Its plane's running counts when its last call ended: a call's memory record counts
     /// from them.
     counted: device_executor::PlaneFacts,
-    /// Why its weights come from the store, not the sealed host tier (an older SDK).
-    unsealed: Option<String>,
 }
 
 /// How a session's executor came to exist, for the load record.
@@ -2762,22 +2760,6 @@ impl Pool {
         executor.retain_until_exit(directory);
         executor.retain_until_exit(WakeOnExit(Arc::downgrade(engine)));
         executor.keep_memo(self.memo.clone());
-        // Weights come from the machine's sealed host tier: handed out while it fills, and
-        // streamed when it does not fit. An executor whose SDK cannot adopt a sealed layout
-        // (an older TensorFS or Runtime: version skew) still serves: it reads its weights from
-        // the store and the page cache itself, and every call it serves says so in its log.
-        let sealed = ["weight_plane/1", "host_tiers.sealed/1"]
-            .into_iter()
-            .find(|needed| !executor.hello.offers(needed));
-        let unsealed = sealed.filter(|_| !plan.slots.is_empty()).map(|missing| {
-            let text = format!(
-                "its executor (Runtime {}, TensorFS {}) lacks {missing}: its weights are read \
-                 from the store and the page cache, without the machine's sealed host tier",
-                executor.hello.runtime_version, executor.hello.tensorfs_version
-            );
-            eprintln!("{}: {text}", plan.construction);
-            text
-        });
         let selections = plan.selections();
         let id = self.serving.next.fetch_add(1, Ordering::Relaxed);
         self.serving.held.lock().unwrap().insert(
@@ -2804,11 +2786,9 @@ impl Pool {
                 })
             })
             .collect::<io::Result<Vec<_>>>()?;
-        // TensorD starts filling CPU layouts through TensorFS while Runtime imports and
-        // constructs the model. GPU allocation/transfers still happen in the executor.
-        if unsealed.is_none() {
-            self.host.prepare(grants.clone(), staged);
-        }
+        // Weights come from the machine's sealed host tier, filled through TensorFS (what is
+        // here, while Runtime imports and constructs the model; the rest as it lands).
+        self.host.prepare(grants.clone(), staged);
         Ok(Session {
             plan: plan.construction.clone(),
             start,
@@ -2826,7 +2806,6 @@ impl Pool {
             launch,
             invoked: false,
             counted: Default::default(),
-            unsealed,
         })
     }
 
@@ -3033,9 +3012,9 @@ impl Pool {
                             true => String::new(),
                             false => engine.get(id)?.invocation.attention_kernel,
                         },
-                        sealed_tiers: session.unsealed.is_none(),
+                        sealed_tiers: true,
                         model_sources: true,
-                        staged_tiers: session.unsealed.is_none(),
+                        staged_tiers: true,
                         pinned_bytes: at_load.then_some(pinned),
                         device_weights: sharing,
                         cap_bytes: load_cap,
@@ -3087,11 +3066,6 @@ impl Pool {
         }
         if load_only {
             return Ok(true);
-        }
-        if let Some(text) = &session.unsealed {
-            if let Err(error) = engine.append_log(id, "warning", text) {
-                eprintln!("run {id}: {text} ({error})");
-            }
         }
         let record = engine.get(id)?;
         let prepared = session.executor.command(
