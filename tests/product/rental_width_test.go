@@ -32,9 +32,9 @@ func TestWideProductsAreOnlyBoughtForAPackageThatDeclaresTheDegree(t *testing.T)
 		{Name: "h100", AcceleratorModel: "NVIDIA H100 80GB HBM3", AcceleratorCount: 4,
 			VRAMGB: 80, PriceUSDMicrosPerHour: 13_960_000},
 	}
-	verdicts := func(constraints rental.Constraints, job bool) map[string]string {
+	verdicts := func(constraints rental.Constraints, composes bool) map[string]string {
 		out := map[string]string{}
-		for _, c := range rental.Purchases(skus, nil, true, job, constraints) {
+		for _, c := range rental.Purchases(skus, nil, true, composes, constraints) {
 			out[orchestrator.MachineLabel(c.SKU, c.GPUs)] = c.Verdict
 		}
 		return out
@@ -67,13 +67,13 @@ func TestWideProductsAreOnlyBoughtForAPackageThatDeclaresTheDegree(t *testing.T)
 			t.Fatalf("supported subset was excluded on %s: %q", name, partial[name])
 		}
 	}
-	// A JOB shards nothing: one bounded attempt on a wide pod idles every card but one for
-	// the whole hour, whatever the package declares.
-	jobs := verdicts(rental.Constraints{Degrees: []int{2, 4}}, true)
+	// A composition shards nothing itself: a wide pod idles every card but one for the
+	// whole hour, whatever the package declares.
+	compositions := verdicts(rental.Constraints{Degrees: []int{2, 4}}, true)
 	for _, name := range []string{"2x h100", "4x h100"} {
-		if !strings.Contains(jobs[name], "width_undeclared") ||
-			!strings.Contains(jobs[name], "a job shards none of them") {
-			t.Fatalf("%s was buyable for a job: %q", name, jobs[name])
+		if !strings.Contains(compositions[name], "width_undeclared") ||
+			!strings.Contains(compositions[name], "no callee shards over them") {
+			t.Fatalf("%s was buyable for a composition: %q", name, compositions[name])
 		}
 	}
 }

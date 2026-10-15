@@ -20,7 +20,7 @@ import (
 
 // Typed Python observes the input's number kind and exact unsigned seed. Its managed
 // child returns those values through the real machine/result/controller boundary.
-func TestApplicationJSONTypedMachineJobPreserves64BitValuesAndNumberKind(t *testing.T) {
+func TestApplicationJSONTypedMachineCallPreserves64BitValuesAndNumberKind(t *testing.T) {
 	if *machineHostBinary == "" || *privateScriptRuntimeWheel == "" {
 		t.Skip("requires -machine-host and -script-runtime-wheel")
 	}
