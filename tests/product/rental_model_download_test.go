@@ -28,7 +28,7 @@ func TestRentalModelSelectorFreezesLatestMatchingLane(t *testing.T) {
 			return
 		}
 		lane := hub.ModelLaneSummary{Lane: "fp8-pruned", ManifestID: digest, Bytes: 123, Components: []string{"transformer"}, ComponentBytes: map[string]int64{"transformer": 123}}
-		json.NewEncoder(w).Encode(hub.ModelCard{Model: hub.Resource{Org: "paul", Name: "minimax-h3"}, Releases: []hub.ModelReleaseSummary{
+		json.NewEncoder(w).Encode(hub.ModelCard{Model: hub.Resource{Name: "minimax-h3"}, Releases: []hub.ModelReleaseSummary{
 			{ReleaseSummary: hub.ReleaseSummary{Release: "1.0", CutAt: "2026-01-01T00:00:00Z"}, Lanes: []hub.ModelLaneSummary{lane}},
 			{ReleaseSummary: hub.ReleaseSummary{Release: "2.0", CutAt: "2026-02-01T00:00:00Z"}, Lanes: []hub.ModelLaneSummary{lane}},
 			{ReleaseSummary: hub.ReleaseSummary{Release: "3.0", CutAt: "2026-03-01T00:00:00Z", Yanked: true}, Lanes: []hub.ModelLaneSummary{lane}},
@@ -66,7 +66,7 @@ func TestRentalModelDownloadQueuesExactSelectionWhileBooting(t *testing.T) {
 			http.Error(w, "unexpected", 500)
 			return
 		}
-		json.NewEncoder(w).Encode(hub.ModelCard{Model: hub.Resource{Org: "paul", Name: "minimax-h3"}, Releases: []hub.ModelReleaseSummary{{ReleaseSummary: hub.ReleaseSummary{Release: "2.0", CutAt: "2026-02-01T00:00:00Z"}, Lanes: []hub.ModelLaneSummary{{Lane: "fp8-pruned", ManifestID: digest, Bytes: 123, ComponentBytes: map[string]int64{"transformer": 123}}}}}})
+		json.NewEncoder(w).Encode(hub.ModelCard{Model: hub.Resource{Name: "minimax-h3"}, Releases: []hub.ModelReleaseSummary{{ReleaseSummary: hub.ReleaseSummary{Release: "2.0", CutAt: "2026-02-01T00:00:00Z"}, Lanes: []hub.ModelLaneSummary{{Lane: "fp8-pruned", ManifestID: digest, Bytes: 123, ComponentBytes: map[string]int64{"transformer": 123}}}}}})
 	}))
 	defer hubPeer.Close()
 	var accepted records.Operation
@@ -140,7 +140,7 @@ func TestRentalModelLatestUsesVersionOrderWithoutDates(t *testing.T) {
 		t.Run(versions[1], func(t *testing.T) {
 			peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				lane := hub.ModelLaneSummary{Lane: "fp8-pruned", ManifestID: "sha256:" + strings.Repeat("c", 64), Bytes: 1}
-				json.NewEncoder(w).Encode(hub.ModelCard{Model: hub.Resource{Org: "paul", Name: "minimax-h3"}, Releases: []hub.ModelReleaseSummary{
+				json.NewEncoder(w).Encode(hub.ModelCard{Model: hub.Resource{Name: "minimax-h3"}, Releases: []hub.ModelReleaseSummary{
 					{ReleaseSummary: hub.ReleaseSummary{Release: versions[0]}, Lanes: []hub.ModelLaneSummary{lane}},
 					{ReleaseSummary: hub.ReleaseSummary{Release: versions[1]}, Lanes: []hub.ModelLaneSummary{lane}},
 				}})

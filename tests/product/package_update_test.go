@@ -180,7 +180,7 @@ func TestPackageUpdatePreservesConcurrentLocalSelection(t *testing.T) {
 	replacement.Package, replacement.SourceKind, replacement.Hub = pkg, "local", server.URL
 	must(t, os.MkdirAll(replacement.Dir, 0700))
 	mux.HandleFunc("GET /v1/packages/proof/install-reporting", func(w http.ResponseWriter, _ *http.Request) {
-		_ = json.NewEncoder(w).Encode(hub.PackageCard{Package: hub.Resource{Org: "proof", Name: "install-reporting"}, Releases: []hub.ReleaseSummary{{Release: "1.0.1"}}})
+		_ = json.NewEncoder(w).Encode(hub.PackageCard{Package: hub.Resource{Name: "install-reporting"}, Releases: []hub.ReleaseSummary{{Release: "1.0.1"}}})
 	})
 	mux.HandleFunc("POST /v1/packages/proof/install-reporting/download", func(w http.ResponseWriter, _ *http.Request) {
 		// Another installer switches this package after bulk inventory selection.

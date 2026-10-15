@@ -8,7 +8,7 @@ import (
 
 func TestMachinePackageUploadProgressBelongsToItsSubmittingRoot(t *testing.T) {
 	store, first := pendingNativeFixture(t)
-	second, _, problem := store.Submit(records.Request{ID: "job-second", IdemKey: "second", Package: first.Package, Entrypoint: "main", Kind: "job", Payload: []byte(`{}`), BodyDigest: childDigest("1"), MachineExecutionObserver: true})
+	second, _, problem := store.Submit(records.Request{ID: "job-second", IdemKey: "second", Package: first.Package, Entrypoint: "main", Payload: []byte(`{}`), BodyDigest: childDigest("1"), MachineExecutionObserver: true})
 	fatal(t, problem)
 	boot, revision := "retained-worker-boot", childDigest("7")
 	progress := map[string]any{"worker_boot_id": boot, "revision": revision}

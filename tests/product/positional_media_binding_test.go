@@ -142,13 +142,13 @@ func TestRunPositionalMediaThroughTheCLI(t *testing.T) {
 		detail.Release.PackageInterfaceLength = int64(len(iface.Raw))
 		detail.ExecutionRequirements = []string{"cozy-runtime>=0.23.0"}
 		detail.RequiresPython = ">=3.12,<3.13"
-		card := hub.PackageCard{Package: hub.Resource{Org: "proof", Name: name}, Releases: []hub.ReleaseSummary{{Release: "1.0.0"}}}
+		card := hub.PackageCard{Package: hub.Resource{Name: name}, Releases: []hub.ReleaseSummary{{Release: "1.0.0"}}}
 		mux.HandleFunc("GET /v1/packages/proof/"+name, func(w http.ResponseWriter, _ *http.Request) { _ = json.NewEncoder(w).Encode(card) })
 		mux.HandleFunc("GET /v1/packages/proof/"+name+"/releases/1.0.0", func(w http.ResponseWriter, _ *http.Request) { _ = json.NewEncoder(w).Encode(detail) })
 		mux.HandleFunc("GET /v1/packages/proof/"+name+"/bindings", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(`{"bindings":[]}`)) })
 	}
 	mux.HandleFunc("GET /v1/models/proof/seedvr2-7b", func(w http.ResponseWriter, _ *http.Request) {
-		_ = json.NewEncoder(w).Encode(hub.ModelCard{Model: hub.Resource{Org: "proof", Name: "seedvr2-7b"},
+		_ = json.NewEncoder(w).Encode(hub.ModelCard{Model: hub.Resource{Name: "seedvr2-7b"},
 			Releases: []hub.ModelReleaseSummary{{ReleaseSummary: hub.ReleaseSummary{Release: "0.1.0"},
 				Lanes: []hub.ModelLaneSummary{{Lane: "original", ManifestID: manifest, Bytes: 1 << 30, Components: []string{"conditioning", "dit", "vae"}}}}}})
 	})

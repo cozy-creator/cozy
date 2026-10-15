@@ -38,7 +38,7 @@ func TestH3ServingRentalIgnoresCapturedSiblingResidency(t *testing.T) {
 	if model.ComponentBytes["text_encoder"] != textBytes {
 		t.Fatal("failure fixture lost measured text-encoder bytes")
 	}
-	card := hub.ModelCard{Model: hub.Resource{Org: "paul", Name: "minimax-h3"},
+	card := hub.ModelCard{Model: hub.Resource{Name: "minimax-h3"},
 		Releases: []hub.ModelReleaseSummary{{ReleaseSummary: hub.ReleaseSummary{Release: "1.0.0-rc.2"},
 			Lanes: []hub.ModelLaneSummary{{Lane: "fp8-pruned", ManifestID: model.Manifest, Bytes: model.Bytes,
 				Components: slices.Sorted(maps.Keys(model.ComponentBytes)), ComponentBytes: model.ComponentBytes}}}}}

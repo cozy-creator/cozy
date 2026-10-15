@@ -23,7 +23,7 @@ func TestRunFailureKeepsCodeSeparateFromMessage(t *testing.T) {
 			o := hostOwner(t, strings.ReplaceAll(message, " ", "_"))
 			id := "job-structured-error"
 			_, _, problem := o.store.Submit(records.Request{ID: id, IdemKey: id,
-				Package: "local/proof", Entrypoint: "main", Kind: "job", Payload: []byte(`{}`),
+				Package: "local/proof", Entrypoint: "main", Payload: []byte(`{}`),
 				BodyDigest: childDigest("b"), MachineExecutionObserver: true})
 			fatal(t, problem)
 			fatal(t, o.store.LinkMachineExecution(id, "pr-unreachable"))

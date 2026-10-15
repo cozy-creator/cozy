@@ -19,22 +19,22 @@ import (
 
 // Real CLI subprocesses read a published package and submit through their normal HTTP
 // transport. The Calcifer fixture observes submission without starting machine work.
-func invocationNamesRoot(t *testing.T, raw []byte) (string, <-chan api.JobSubmission) {
+func invocationNamesRoot(t *testing.T, raw []byte) (string, <-chan api.Submission) {
 	t.Helper()
-	submitted := make(chan api.JobSubmission, 8)
+	submitted := make(chan api.Submission, 8)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == "GET" && r.URL.Path == "/":
 		case r.Method == "GET" && r.URL.Path == "/v1/packages/proof/names":
-			_ = json.NewEncoder(w).Encode(hub.PackageCard{Package: hub.Resource{Org: "proof", Name: "names"}, Releases: []hub.ReleaseSummary{{Release: "1.0.0"}}})
+			_ = json.NewEncoder(w).Encode(hub.PackageCard{Package: hub.Resource{Name: "names"}, Releases: []hub.ReleaseSummary{{Release: "1.0.0"}}})
 		case r.Method == "GET" && r.URL.Path == "/v1/packages/proof/names/releases/1.0.0":
 			var detail hub.PackageReleaseDetail
 			detail.PackageInterface = raw
 			detail.Release.Release = "1.0.0"
 			detail.Release.PackageInterfaceLength = int64(len(raw))
 			_ = json.NewEncoder(w).Encode(detail)
-		case r.Method == "POST" && r.URL.Path == "/v1/local/jobs":
-			var submission api.JobSubmission
+		case r.Method == "POST" && r.URL.Path == "/v1/requests":
+			var submission api.Submission
 			if err := json.NewDecoder(r.Body).Decode(&submission); err != nil {
 				t.Error(err)
 			}

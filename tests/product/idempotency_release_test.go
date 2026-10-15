@@ -21,8 +21,7 @@ func TestCanceledRunReleasesItsIdempotencyKey(t *testing.T) {
 	defer st.Close()
 
 	recorded, fresh, e := st.Submit(records.Request{
-		ID: "req-idem-1", Kind: "job", Package: "paul/minimax-h3-tools", Entrypoint: "four-lane",
-		Org: "paul", IdemKey: "model-transfer-test", Payload: []byte("{}"),
+		ID: "req-idem-1", Package: "paul/minimax-h3-tools", Entrypoint: "four-lane", IdemKey: "model-transfer-test", Payload: []byte("{}"),
 	})
 	fatal(t, e)
 	if !fresh {
@@ -58,8 +57,7 @@ func TestCanceledRunReleasesItsIdempotencyKey(t *testing.T) {
 	}
 
 	second, fresh2, e := st.Submit(records.Request{
-		ID: "req-idem-2", Kind: "job", Package: "paul/minimax-h3-tools", Entrypoint: "four-lane",
-		Org: "paul", IdemKey: "model-transfer-test", Payload: []byte("{}"),
+		ID: "req-idem-2", Package: "paul/minimax-h3-tools", Entrypoint: "four-lane", IdemKey: "model-transfer-test", Payload: []byte("{}"),
 	})
 	fatal(t, e)
 	if !fresh2 || second.ID == recorded.ID {
@@ -73,8 +71,7 @@ func TestCanceledRunReleasesItsIdempotencyKey(t *testing.T) {
 	}
 	fatal(t, func() *exit.Error {
 		_, _, e := st.Submit(records.Request{
-			Kind: "job", Package: "paul/minimax-h3-tools", Entrypoint: "four-lane",
-			Org: "paul", ID: "req-idem-3", IdemKey: "keep-succeeded", Payload: []byte("{}")})
+			Package: "paul/minimax-h3-tools", Entrypoint: "four-lane", ID: "req-idem-3", IdemKey: "keep-succeeded", Payload: []byte("{}")})
 		return e
 	}())
 	if got, e := st.RequestByIdempotencyKey("keep-succeeded"); e != nil || got == nil {

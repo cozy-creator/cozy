@@ -17,7 +17,7 @@ import (
 func replacementRequest(t *testing.T, store *records.Store, id, worker string) {
 	t.Helper()
 	_, _, problem := store.Submit(records.Request{ID: id, IdemKey: id, BodyDigest: "sha256:" + strings.Repeat("7", 64),
-		Package: "proof/source-producer", Release: "1", Entrypoint: "convert", Kind: "job", Rental: true, Worker: worker, Payload: []byte("{}"), Outputs: "[]", WeightsOutputs: "[]",
+		Package: "proof/source-producer", Release: "1", Entrypoint: "convert", Rental: true, Worker: worker, Payload: []byte("{}"), Outputs: "[]",
 		ModelTransfer: &records.ModelTransferIntent{Kind: "model-upload", Destination: "proof/model", Source: "hf://proof/source@" + strings.Repeat("1", 40), SourceSelection: "sha256:" + strings.Repeat("2", 64), SourceProfiles: map[string]string{"input": "source-profile"}, SourceFiles: []records.ModelTransferSourceFile{{Member: "index.json", SHA256: strings.Repeat("3", 64), Length: 2, Header: []byte("{}")}}, Outputs: []records.ModelTransferOutput{{Name: "model"}}}})
 	fatal(t, problem)
 }

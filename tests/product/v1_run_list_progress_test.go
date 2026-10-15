@@ -29,7 +29,7 @@ func TestRunListShowsTheMachinesLastProgress(t *testing.T) {
 	}
 	store := open()
 	request, _, problem := store.Submit(records.Request{ID: "list-progress", IdemKey: "list-progress", Package: "local/proof",
-		Entrypoint: "main", Kind: "job", Payload: []byte(`{}`), BodyDigest: childDigest("b"), MachineExecutionObserver: true})
+		Entrypoint: "main", Payload: []byte(`{}`), BodyDigest: childDigest("b"), MachineExecutionObserver: true})
 	fatal(t, problem)
 	fatal(t, store.LinkMachineExecution(request.ID, "pr-unreachable"))
 	fatal(t, store.AppendEvent(request.ID, records.RunV1Sent, 0, map[string]any{"machine": "pr-unreachable"}))

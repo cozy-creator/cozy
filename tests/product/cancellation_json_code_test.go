@@ -21,7 +21,7 @@ func TestCancellationPresentationPreservesMachineVocabulary(t *testing.T) {
 		{"deadline", "cancelled by system"}, {"provider timeout", "cancelled by system"}, {"", "cancelled"},
 	} {
 		id := fmt.Sprintf("job-cancellation-presentation-%d", i)
-		_, _, problem := store.Submit(records.Request{ID: id, IdemKey: id, BodyDigest: childDigest("c"), Package: "proof/presentation", Entrypoint: "main", Kind: "job", Payload: []byte(`{}`)})
+		_, _, problem := store.Submit(records.Request{ID: id, IdemKey: id, BodyDigest: childDigest("c"), Package: "proof/presentation", Entrypoint: "main", Payload: []byte(`{}`)})
 		fatal(t, problem)
 		changed, problem := store.CancelQueuedRequest(id, map[string]any{"actor": tc.actor, "status": "CANCELED", "outputs": []any{}, "requeuing": false})
 		fatal(t, problem)

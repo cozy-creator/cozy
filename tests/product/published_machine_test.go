@@ -18,16 +18,12 @@ import (
 
 type publishedRouteResolver struct{ api.Resolver }
 
-func (publishedRouteResolver) ResolveRemoteJob(hub, pkg, release, function string, models []orchestrator.ModelRef, deferred bool) (orchestrator.LogicalJob, *launch.Entrypoint, *exit.Error) {
-	return orchestrator.LogicalJob{Package: pkg, Release: release, Function: function, DescriptorID: childDigest("9")}, &launch.Entrypoint{Name: function, Kind: "job", Request: launch.Struct{Fields: []launch.Field{}}, Result: launch.Struct{Fields: []launch.Field{}}}, nil
+func (publishedRouteResolver) ResolveRemoteRelease(hub, pkg, release, function string, models []orchestrator.ModelRef) (orchestrator.LogicalPackage, *launch.Entrypoint, *exit.Error) {
+	return orchestrator.LogicalPackage{Package: pkg, Release: release, Function: function, PlanID: childDigest("9")}, &launch.Entrypoint{Name: function, Request: launch.Struct{Fields: []launch.Field{}}, Result: launch.Struct{Fields: []launch.Field{}}}, nil
 }
 
 func (publishedRouteResolver) ResolveInstall(id string, _ []orchestrator.ModelRef) (orchestrator.WorkerLaunchSpec, *exit.Error) {
 	return orchestrator.WorkerLaunchSpec{Placement: orchestrator.DesiredPlacement{Package: "alice/ops", Release: "1.0.0", InstallID: id}}, nil
-}
-
-func (publishedRouteResolver) JobsInstall(string) ([]launch.JobFacts, *exit.Error) {
-	return []launch.JobFacts{{Name: "main", DescriptorID: childDigest("9"), Request: launch.Struct{Fields: []launch.Field{}}, Result: launch.Struct{Fields: []launch.Field{}}}}, nil
 }
 
 type publishedRouteObserver struct{}
@@ -35,12 +31,10 @@ type publishedRouteObserver struct{}
 func (publishedRouteObserver) Refresh(context.Context, records.Request) *exit.Error { return nil }
 func (publishedRouteObserver) Withdraw(string)                                      {}
 func (publishedRouteObserver) Forget(string)                                        {}
-func (publishedRouteObserver) Control(context.Context, records.Request, string) *exit.Error {
-	return nil
-}
+func (publishedRouteObserver) Cancel(context.Context, records.Request) *exit.Error { return nil }
 
-// Every rented published job is a Runtime execution, as is a local published install.
-func TestPublishedMachineRoutingOwnsEveryRentedJob(t *testing.T) {
+// Every rented published call is a Runtime execution, as is a local published install.
+func TestPublishedMachineRoutingOwnsEveryRentedCall(t *testing.T) {
 	o := hostOwner(t, "published-machine-routing")
 	_, problem := o.store.Activate(records.PackageInstall{ID: "published-local-install", Package: "alice/ops", Major: 1, Version: "1.0.0", SourceKind: "tensorhub", Hub: o.cfg.HubURL, Dir: t.TempDir(), Platform: "linux-x86_64"})
 	fatal(t, problem)
@@ -61,7 +55,7 @@ func TestPublishedMachineRoutingOwnsEveryRentedJob(t *testing.T) {
 		}
 		raw, err := json.Marshal(body)
 		must(t, err)
-		request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:11111/v1/local/jobs", bytes.NewReader(raw))
+		request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:11111/v1/requests", bytes.NewReader(raw))
 		request.RemoteAddr = "127.0.0.1:12345"
 		request.Header.Set("Content-Type", "application/json")
 		request.Header.Set("Authorization", "Bearer "+bearer)

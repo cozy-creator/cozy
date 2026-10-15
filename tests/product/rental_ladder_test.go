@@ -417,7 +417,7 @@ func ladderRequest(t *testing.T, store *records.Store, id string) {
 	t.Helper()
 	_, _, problem := store.Submit(records.Request{ID: id, IdemKey: id, BodyDigest: "sha256:" + strings.Repeat("8", 64),
 		Package: "paul/minimax-h3", Entrypoint: "generate", Release: "1.0.0", Rental: true,
-		Payload: []byte("{}"), Outputs: "[]", WeightsOutputs: "[]"})
+		Payload: []byte("{}"), Outputs: "[]"})
 	fatal(t, problem)
 }
 

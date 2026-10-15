@@ -10,19 +10,17 @@ import (
 )
 
 func TestRentalReassignmentPreservesExecutionAndPurchaseCustody(t *testing.T) {
-	for _, mode := range []string{"unattempted", "explicit", "retained", "uploaded", "purchased", "attempted"} {
+	for _, mode := range []string{"unattempted", "explicit", "uploaded", "purchased", "attempted"} {
 		t.Run(mode, func(t *testing.T) {
 			st, problem := records.Open(filepath.Join(t.TempDir(), "creator.sqlite"))
 			fatal(t, problem)
 			defer st.Close()
 			row := records.Rental{ID: "pr-busy", MachineName: "busy", SKU: "cpu", AcceleratorModel: "CPU", AcceleratorCount: 1, HourlyRateUSDMicros: 1, State: "ready", Hub: "proof"}
 			fatal(t, st.RecordRental(row))
-			request := records.Request{ID: "job-replan", IdemKey: "replan", BodyDigest: "sha256:" + strings.Repeat("a", 64), Package: "proof/video", Entrypoint: "generate", PlanID: "plan", Payload: []byte(`{}`), Outputs: "[]", Kind: "job", Worker: row.ID, Rental: true, RentalRequired: true}
+			request := records.Request{ID: "job-replan", IdemKey: "replan", BodyDigest: "sha256:" + strings.Repeat("a", 64), Package: "proof/video", Entrypoint: "generate", PlanID: "plan", Payload: []byte(`{}`), Outputs: "[]", Worker: row.ID, Rental: true, RentalRequired: true}
 			switch mode {
 			case "explicit":
 				request.RequestedRental = row.ID
-			case "retained":
-				request.RetainWork = true
 			case "uploaded":
 				request.LocalPackageUploadedBootID = "boot-busy"
 			}
@@ -35,7 +33,7 @@ func TestRentalReassignmentPreservesExecutionAndPurchaseCustody(t *testing.T) {
 			}
 			if mode == "attempted" {
 				fatal(t, st.SpawnWorker(records.WorkerProcess{InstanceID: "instance", Package: request.Package, WorkerID: "worker", Devices: []string{"cpu"}}))
-				_, problem := st.Dispatch(records.Attempt{RequestID: request.ID, InstanceID: "instance", SessionID: "session", InvocationCanonical: []byte(`{}`), WeightsOutputs: `[]`})
+				_, problem := st.Dispatch(records.Attempt{RequestID: request.ID, InstanceID: "instance", SessionID: "session", InvocationCanonical: []byte(`{}`)})
 				fatal(t, problem)
 			}
 			changed, problem := st.ReleaseUnattemptedRentalAssignment(request.ID, row.ID)

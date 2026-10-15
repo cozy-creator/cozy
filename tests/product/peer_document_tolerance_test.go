@@ -71,21 +71,21 @@ func TestHubAnswersWithAdditiveFieldsAreRead(t *testing.T) {
 	defer server.Close()
 	client := hub.New(config.Config{HubURL: server.URL, HubToken: secret.New("proof")}, "peer-tolerance")
 
-	checkpoint, problem := client.FinalizePublication(t.Context(), hub.Ref{Org: "proof", Name: "model"}, "op-1",
+	checkpoint, problem := client.FinalizePublication(t.Context(), hub.Ref{Name: "model"}, "op-1",
 		hub.FinalizePublicationRequest{ManifestID: "sha256:" + strings.Repeat("a", 64), ManifestLength: 9}, "finalize")
 	fatal(t, problem)
 	if checkpoint.CheckpointID != "ckpt-1" || checkpoint.Manifest.Length != 9 {
 		t.Fatalf("finalization with additive fields was misread: %+v", checkpoint)
 	}
 
-	detail, problem := client.PackageRelease(t.Context(), hub.Ref{Org: "proof", Name: "demo"}, "1.0.0")
+	detail, problem := client.PackageRelease(t.Context(), hub.Ref{Name: "demo"}, "1.0.0")
 	fatal(t, problem)
 	requirements, problem := detail.Requirements()
 	fatal(t, problem)
 	if !slices.Equal(requirements, []string{"numpy", "torch>=2"}) {
 		t.Fatalf("requirements were not normalized: %q", requirements)
 	}
-	bare, problem := client.PackageRelease(t.Context(), hub.Ref{Org: "proof", Name: "bare"}, "1.0.0")
+	bare, problem := client.PackageRelease(t.Context(), hub.Ref{Name: "bare"}, "1.0.0")
 	fatal(t, problem)
 	if requirements, problem := bare.Requirements(); problem != nil || len(requirements) != 0 {
 		t.Fatalf("a release without requirements: %q %v", requirements, problem)

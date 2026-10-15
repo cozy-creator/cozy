@@ -17,11 +17,11 @@ import (
 
 type nestedPayloadResolver struct{ publishedRouteResolver }
 
-func (nestedPayloadResolver) ResolveRemoteJob(hub, pkg, release, function string, models []orchestrator.ModelRef, deferred bool) (orchestrator.LogicalJob, *launch.Entrypoint, *exit.Error) {
-	return orchestrator.LogicalJob{Package: pkg, Release: release, Function: function, DescriptorID: childDigest("9")}, &launch.Entrypoint{Name: function, Kind: "job", Request: launch.Struct{Fields: []launch.Field{{Name: "shots", Type: json.RawMessage(`{"list":{"fields":[{"name":"prompt","type":"str"},{"name":"seed","type":"int"},{"name":"duration_s","type":"int"}]}}`)}}}, Result: launch.Struct{Fields: []launch.Field{}}}, nil
+func (nestedPayloadResolver) ResolveRemoteRelease(hub, pkg, release, function string, models []orchestrator.ModelRef) (orchestrator.LogicalPackage, *launch.Entrypoint, *exit.Error) {
+	return orchestrator.LogicalPackage{Package: pkg, Release: release, Function: function, PlanID: childDigest("9")}, &launch.Entrypoint{Name: function, Request: launch.Struct{Fields: []launch.Field{{Name: "shots", Type: json.RawMessage(`{"list":{"fields":[{"name":"prompt","type":"str"},{"name":"seed","type":"int"},{"name":"duration_s","type":"int"}]}}`)}}}, Result: launch.Struct{Fields: []launch.Field{}}}, nil
 }
 
-func TestJobNestedPayloadIsCanonicalBeforeIdentity(t *testing.T) {
+func TestNestedPayloadIsCanonicalBeforeIdentity(t *testing.T) {
 	o := hostOwner(t, "nested-job-payload")
 	fatal(t, o.store.RecordRental(records.Rental{ID: "nested-rental", MachineName: "nested-host", SKU: "cpu", AcceleratorModel: "CPU", State: "ready", Hub: "http://127.0.0.1:1", Address: "127.0.0.1:1", AcceleratorCount: 1, HourlyRateUSDMicros: 1}))
 	const bearer = "nested-payload-test"
@@ -30,7 +30,7 @@ func TestJobNestedPayloadIsCanonicalBeforeIdentity(t *testing.T) {
 	var id, digest string
 	for _, payload := range []string{`{"shots":[{"prompt":"rover","seed":1234,"duration_s":15}]}`, `{ "shots": [ {"duration_s":15,"seed":1234,"prompt":"rover"} ] }`} {
 		body := []byte(`{"package":"alice/ops","release":"1.0.0","function":"main","input":` + payload + `,"rental":true,"requested_rental":"nested-rental"}`)
-		request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:11111/v1/local/jobs", bytes.NewReader(body))
+		request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:11111/v1/requests", bytes.NewReader(body))
 		request.RemoteAddr = "127.0.0.1:12345"
 		request.Header.Set("Content-Type", "application/json")
 		request.Header.Set("Authorization", "Bearer "+bearer)

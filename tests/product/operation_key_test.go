@@ -14,7 +14,7 @@ func TestOperationKeyExcludesHistoryAndPreservesObservableInputs(t *testing.T) {
 		must(t, err)
 		return raw
 	}
-	request := records.Request{ID: "first", ParentRequestID: "parent1", ReuseScope: "scope1", RetryOf: "old", ChildTargetDigest: childDigest("3"), Payload: payload(artifact, "observable-a"), Models: []records.ModelRef{{Slot: "source", Manifest: artifact.Manifest.Digest, ManifestLength: 161}}}
+	request := records.Request{ID: "first", ParentRequestID: "parent1", ChildTargetDigest: childDigest("3"), Payload: payload(artifact, "observable-a"), Models: []records.ModelRef{{Slot: "source", Manifest: artifact.Manifest.Digest, ManifestLength: 161}}}
 	key, problem := records.OperationKey(request)
 	fatal(t, problem)
 	request.ID, request.ParentRequestID, request.ReuseScope, request.RetryOf = "fresh", "unrelated-parent", "new-scope", ""

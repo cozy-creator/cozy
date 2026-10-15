@@ -13,10 +13,10 @@ import (
 	"github.com/cozy-creator/cozy/internal/home"
 )
 
-// The built CLI reattaches years after the durable terminal, twice. Both run
-// kinds must report recorded request time, not time since creation at viewing.
+// The built CLI reattaches years after the durable terminal, twice. It must report recorded
+// request time, not time since creation at viewing.
 func TestCompletedRunWatchUsesRecordedWallTime(t *testing.T) {
-	for _, kind := range []string{"job", "invocation"} {
+	for _, kind := range []string{"invocation"} {
 		for _, stamp := range []struct {
 			name, start, end string
 			known            bool
@@ -29,11 +29,7 @@ func TestCompletedRunWatchUsesRecordedWallTime(t *testing.T) {
 		} {
 			t.Run(kind+"/"+stamp.name, func(t *testing.T) {
 				id := "req-recorded-wall"
-				if kind == "job" {
-					id = "job-recorded-wall"
-				}
 				life := api.Lifecycle{Number: 1, Kind: kind, RequestID: id, Status: "completed", Package: "proof/wall", Function: "run", CreatedAt: stamp.start, QueuedMS: 1234, ExecutionMS: 60000}
-				job := api.JobState{Number: 1, JobID: id, Status: "completed", Package: life.Package, Function: life.Function, CreatedAt: stamp.start, QueuedMS: life.QueuedMS, ExecutionMS: life.ExecutionMS, ExecutionKnown: true, MachineExecution: &api.MachineExecutionView{Accepted: true, Collected: true}}
 				event := api.Envelope{Type: "run.completed", RequestID: id, SequenceNumber: 7, At: stamp.end}
 				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 					switch r.URL.Path {
@@ -41,8 +37,6 @@ func TestCompletedRunWatchUsesRecordedWallTime(t *testing.T) {
 						w.WriteHeader(http.StatusOK)
 					case "/v1/requests/1", "/v1/requests/" + id:
 						_ = json.NewEncoder(w).Encode(life)
-					case "/v1/local/jobs/" + id, "/v1/local/jobs/1":
-						_ = json.NewEncoder(w).Encode(job)
 					case "/v1/requests/" + id + "/events":
 						w.Header().Set("Content-Type", "text/event-stream")
 						raw, err := json.Marshal(event)

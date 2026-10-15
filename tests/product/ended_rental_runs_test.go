@@ -24,7 +24,7 @@ import (
 func endpointRunOnRental(t *testing.T, store *records.Store, root, label string, ep *machineendpoint.Endpoint, cancel bool) records.Request {
 	t.Helper()
 	request, _, problem := store.SubmitWithEvent(records.Request{ID: "rented-" + label, IdemKey: "rented-" + label, Package: "local/rented",
-		Entrypoint: "main", Kind: "job", Payload: []byte(`{}`), BodyDigest: childDigest("1"), MachineExecutionObserver: true,
+		Entrypoint: "main", Payload: []byte(`{}`), BodyDigest: childDigest("1"), MachineExecutionObserver: true,
 		OutputExport: &records.OutputExportIntent{Directory: filepath.Join(root, "out", label),
 			Outputs: []records.OutputExportEntry{{OutputID: "image", MediaType: "image/webp"}}}},
 		map[string]any{"machine_endpoint": ep})

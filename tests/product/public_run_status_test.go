@@ -31,7 +31,7 @@ func TestPublicRunStatusShowsFailedRetainedWork(t *testing.T) {
 	fatal(t, problem)
 	_, problem = o.store.CompleteRequestPause(paused.ID)
 	fatal(t, problem)
-	refused, _, problem := o.store.Submit(records.Request{ID: "refused-at-the-door", IdemKey: "refused-at-the-door", Kind: "job", Package: "local/private-proof", Entrypoint: "prepare", Payload: []byte(`{}`), BodyDigest: childDigest("1"), RetainWork: true, MachineExecutionObserver: true})
+	refused, _, problem := o.store.Submit(records.Request{ID: "refused-at-the-door", IdemKey: "refused-at-the-door", Package: "local/private-proof", Entrypoint: "prepare", Payload: []byte(`{}`), BodyDigest: childDigest("1"), MachineExecutionObserver: true})
 	fatal(t, problem)
 	fatal(t, o.store.LinkMachineExecution(refused.ID, "local"))
 	_, problem = o.store.MarkRunV1Sent(refused.ID)

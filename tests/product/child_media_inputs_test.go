@@ -31,7 +31,7 @@ func TestChildMediaBorrowsOnlyParentInputs(t *testing.T) {
 	if asset.LocalPath != original {
 		t.Fatal("binding copied the original", asset.LocalPath)
 	}
-	parent, _, problem := store.Submit(records.Request{ID: "req-media-parent", IdemKey: "media-parent", BodyDigest: childDigest("8"), Package: "local/parent", Entrypoint: "run", Kind: "job", Payload: []byte(`{}`), RetainWork: true, Assets: []records.AssetBinding{asset}})
+	parent, _, problem := store.Submit(records.Request{ID: "req-media-parent", IdemKey: "media-parent", BodyDigest: childDigest("8"), Package: "local/parent", Entrypoint: "run", Payload: []byte(`{}`), Assets: []records.AssetBinding{asset}})
 	fatal(t, problem)
 	fatal(t, store.SpawnWorker(records.WorkerProcess{InstanceID: "private-worker", Package: "local/test", WorkerID: "worker", Devices: []string{"cpu"}}))
 	parent = offerChildParent(t, store, parent)
@@ -42,7 +42,7 @@ func TestChildMediaBorrowsOnlyParentInputs(t *testing.T) {
 	if len(forwarded) != 1 || forwarded[0].FieldPath != "media.image" || forwarded[0].LocalPath != asset.LocalPath || forwarded[0].Digest != asset.Digest {
 		t.Fatalf("unexpected inherited media: %+v", forwarded)
 	}
-	call := records.Request{ID: "req-media-child", IdemKey: "media-child", BodyDigest: childDigest("3"), Package: "local/score", Entrypoint: "score", Kind: "job", Payload: payload, ParentRequestID: parent.ID, ParentCallIndex: 0, ChildIntentDigest: childDigest("4"), ChildTargetDigest: childDigest("5"), Assets: forwarded}
+	call := records.Request{ID: "req-media-child", IdemKey: "media-child", BodyDigest: childDigest("3"), Package: "local/score", Entrypoint: "score", Payload: payload, ParentRequestID: parent.ID, ParentCallIndex: 0, ChildIntentDigest: childDigest("4"), ChildTargetDigest: childDigest("5"), Assets: forwarded}
 	child, _, problem := store.SubmitChild(call, 1, childDigest("1"), "private-boot", nil)
 	fatal(t, problem)
 	held, problem := store.RequestRow(child.ID)
@@ -91,7 +91,7 @@ func TestChildMediaBorrowsOnlyParentInputs(t *testing.T) {
 func TestJobMediaRequiresLocalCredentialBeforePathRead(t *testing.T) {
 	root := t.TempDir()
 	calcifer := startCalciferProcess(t, root)
-	response := calcifer.call(t, http.MethodPost, "/v1/local/jobs", map[string]any{
+	response := calcifer.call(t, http.MethodPost, "/v1/requests", map[string]any{
 		"package": "local/proof", "function": "score", "input": map[string]any{},
 		"local_assets": []map[string]any{{"field_path": "image", "local_path": "/not-a-granted-file", "digest": childDigest("8"), "length": 1}},
 	}, "Authorization", "")

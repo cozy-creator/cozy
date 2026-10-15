@@ -115,8 +115,8 @@ func TestPackageInterface(t *testing.T) {
 	if assessmentDigest(doc.Raw) != want {
 		t.Fatalf("package-interface identity %s != %s", assessmentDigest(doc.Raw), want)
 	}
-	if len(doc.Entrypoints) != 1 || doc.Entrypoints[0].Kind != "entrypoint" {
-		t.Fatalf("entrypoint kind is not inferred from collection membership: %+v", doc.Entrypoints)
+	if len(doc.Entrypoints) != 1 {
+		t.Fatalf("one function decodes as one entrypoint: %+v", doc.Entrypoints)
 	}
 	// The declared constraints are real Cozy validators, not documentation.
 	ep := &doc.Entrypoints[0]
@@ -228,30 +228,3 @@ func TestPackageInterfaceComponentLowerBound(t *testing.T) {
 	}
 }
 
-// TestSubmissionFillsUndeclaredProfiles mirrors the H3 four-lane dispatch: the
-// published package interface declares no source selection (cr-077): the caller's
-// intent binds every producer model input, and a missing or extra one refuses.
-func TestSubmissionFillsUndeclaredProfiles(t *testing.T) {
-	intent := &records.ModelTransferIntent{Kind: "model-upload", Destination: "paul/minimax-h3",
-		Source: "hf://MiniMaxAI/MiniMax-H3@" + strings.Repeat("4", 40), SourceSelection: "sha256:" + strings.Repeat("2", 64),
-		SourceProfiles: map[string]string{
-			"dits":   "hf/minimax-h3/native-dual-bf16/1",
-			"shared": "hf/minimax-h3/shared-bf16/1",
-		},
-		Outputs: []records.ModelTransferOutput{{Name: "full"}}}
-	spec := orchestrator.Submission{Package: "paul/minimax-h3-tools", Entrypoint: "four-lane",
-		ModelTransfer:  intent,
-		ProducerParams: []string{"dits", "shared"},
-		WeightsOutputs: []orchestrator.WeightsOutput{{OutputID: "full"}}}
-	if problem := modeltransfer.ValidateSubmission(spec); problem != nil {
-		t.Fatalf("intent must bind every model input: %s", problem.Message)
-	}
-	spec.ProducerParams = []string{"dits", "shared", "third"}
-	if problem := modeltransfer.ValidateSubmission(spec); problem == nil {
-		t.Fatal("unfilled model input must refuse")
-	}
-	spec.ProducerParams = []string{"dits"}
-	if problem := modeltransfer.ValidateSubmission(spec); problem == nil {
-		t.Fatal("an intent naming more inputs than the job declares must refuse")
-	}
-}

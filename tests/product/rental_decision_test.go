@@ -198,7 +198,7 @@ func TestRentalProvenanceSurvivesToTheRecord(t *testing.T) {
 	managed := rental.AcquisitionReason(records.Request{
 		ID: "req-59119a5207ab58898ac5d626", Package: "paul/sdxl"})
 	job := rental.AcquisitionReason(records.Request{
-		ID: "job-177b899c60b525988346f2fe", Package: "paul/minimax-h3-tools", Kind: "job"})
+		ID: "job-177b899c60b525988346f2fe", Package: "paul/minimax-h3-tools"})
 
 	// The managed reason must actually SAY something. The old behaviour was "", and an
 	// empty reason is the defect: assert non-empty and that it names its request.

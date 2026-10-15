@@ -40,7 +40,7 @@ func TestRunShowPrintsEachCallsGPUs(t *testing.T) {
 	o := hostOwner(t, "run-show-call-gpus")
 	id := "job-call-gpus"
 	_, _, problem := o.store.Submit(records.Request{ID: id, IdemKey: id, Package: "paul/minimax-h3",
-		Entrypoint: "long_form", Kind: "job", Payload: []byte(`{}`), BodyDigest: childDigest("c"),
+		Entrypoint: "long_form", Payload: []byte(`{}`), BodyDigest: childDigest("c"),
 		MachineExecutionObserver: true})
 	fatal(t, problem)
 	fatal(t, o.store.LinkMachineExecution(id, "pr-unreachable"))

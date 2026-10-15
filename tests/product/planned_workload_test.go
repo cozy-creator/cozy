@@ -44,8 +44,7 @@ func submitH3Transfer(t *testing.T, store *records.Store, requestID string) {
 	}
 	_, created, problem := store.Submit(records.Request{
 		ID: requestID, IdemKey: requestID, BodyDigest: "sha256:" + strings.Repeat("c", 64),
-		Package: "paul/minimax-h3-tools", Entrypoint: "four-lane", State: "queued",
-		Kind: "job", Payload: []byte("{}"), Outputs: "[]", WeightsOutputs: "[]",
+		Package: "paul/minimax-h3-tools", Entrypoint: "four-lane", State: "queued", Payload: []byte("{}"), Outputs: "[]",
 		ModelTransfer: intent,
 	})
 	fatal(t, problem)
@@ -140,7 +139,7 @@ func TestDeclaredServingModelsReadsTheResolvedSelection(t *testing.T) {
 	_, created, problem := store.Submit(records.Request{
 		ID: "req-serve", IdemKey: "req-serve", BodyDigest: "sha256:" + strings.Repeat("c", 64),
 		Package: "paul/h3-video", Entrypoint: "generate", State: "queued",
-		Payload: []byte("{}"), Outputs: "[]", WeightsOutputs: "[]",
+		Payload: []byte("{}"), Outputs: "[]",
 		Release: "1.0.0", Models: h3ServingModels(),
 	})
 	fatal(t, problem)

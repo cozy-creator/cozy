@@ -65,7 +65,7 @@ func TestRunListSaysHowManyOlderRunsItLeftOut(t *testing.T) {
 func TestPackageSearchSaysHowToSeeEveryMatch(t *testing.T) {
 	var packages []hub.Resource
 	for index := 1; index <= 30; index++ {
-		packages = append(packages, hub.Resource{Org: "proof", Name: fmt.Sprintf("pkg-%02d", index), LatestRelease: "1.0.0"})
+		packages = append(packages, hub.Resource{Name: fmt.Sprintf("pkg-%02d", index), LatestRelease: "1.0.0"})
 	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/packages" {
