@@ -122,10 +122,16 @@ func serveCalcifer(ctx *Context) *exit.Error {
 	readRental := func(id string) (*records.Rental, *exit.Error) { return observedRental(ctx, st, id) }
 	rentals := rental.Resolver(l, readRental)
 	readProjection := func(id string) (*records.Rental, *exit.Error) { return liveRentalProjection(ctx, st, id) }
-	// A submission to a ready rental this host recorded asks no Hub: dispatch reads its Hub
-	// when it dials the machine. Any other is read at its Hub.
-	knownRentals := rental.Known(func(id string) (*records.Rental, *exit.Error) {
+	// A ready rental this host recorded, which the fleet's sweep keeps current.
+	recorded := func(id string) *records.Rental {
 		if row, _ := st.RentalRow(id); row != nil && row.State == hub.RentalReady && row.Address != "" && row.CertPath != "" {
+			return row
+		}
+		return nil
+	}
+	// Submitting to a recorded ready rental, or dialing it, asks no Hub. Any other is read there.
+	knownRentals := rental.Known(func(id string) (*records.Rental, *exit.Error) {
+		if row := recorded(id); row != nil {
 			return row, nil
 		}
 		return readProjection(id)
@@ -142,6 +148,7 @@ func serveCalcifer(ctx *Context) *exit.Error {
 		Host:     localMachine, HubOrigin: ctx.Cfg.HubURL,
 		Hub:     func(origin string) *hub.Client { return client(ctx.forHub(origin)) },
 		Rentals: rentals, RentalHub: func(id string) *hub.Client { return client(fleet.atRental(id)) },
+		Recorded:       rental.Resolver(l, func(id string) (*records.Rental, *exit.Error) { return recorded(id), nil }),
 		UseRental:      func(id, holder string) (func(), *exit.Error) { return fleet.owner.UseRental(id, holder) },
 		RentalKey:      func(id string) (rental.CreatorIdentity, *exit.Error) { return rental.CreatorIdentityFor(l, id) },
 		EndpointRental: rentalEndpoint(ctx, l, st),

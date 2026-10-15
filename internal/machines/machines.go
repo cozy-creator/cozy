@@ -38,9 +38,11 @@ type Resolver struct {
 	// and Hub a client for an origin as the signed-in user.
 	HubOrigin string
 	Hub       func(origin string) *hub.Client
-	// Rentals reads a rental's dial identity; RentalHub is the client for the hub it was
-	// bought from; UseRental holds it against release while in use.
+	// Rentals reads a rental's dial identity at its Hub, and Recorded as this computer recorded
+	// it; RentalHub is the client for the hub it was bought from; UseRental holds it against
+	// release while in use.
 	Rentals   func(string) (*orchestrator.RemoteTarget, *exit.Error)
+	Recorded  func(string) (*orchestrator.RemoteTarget, *exit.Error)
 	RentalHub func(string) *hub.Client
 	UseRental func(id, holder string) (func(), *exit.Error)
 	RentalKey func(string) (rental.CreatorIdentity, *exit.Error)
@@ -115,8 +117,7 @@ func (r *Resolver) resolve(ctx context.Context, name, holder string, machine *pl
 		return target{name: name, addr: launch.Addr, workerID: launch.WorkerID, bootID: launch.BootID, pin: pin, key: key,
 			lifetime: fmt.Sprint(launch.PID)}, nil
 	}
-	// Refresh the Hub incarnation before checking an update's boot-scoped hold.
-	remote, problem := r.Rentals(name)
+	remote, problem := r.rentalIdentity(name)
 	if problem == nil && (remote == nil || remote.Connection == nil) {
 		problem = exit.New(exit.Conflict, "rental %s has no dial identity", name)
 	}
@@ -124,6 +125,20 @@ func (r *Resolver) resolve(ctx context.Context, name, holder string, machine *pl
 		return target{}, problem
 	}
 	return r.rentalTarget(name, holder, remote.Connection, machine)
+}
+
+// rentalIdentity is where a rental is dialed: as recorded, so a run reads no Hub, until a
+// connection to that record broke; then, or with no usable record, as its Hub states it.
+func (r *Resolver) rentalIdentity(name string) (*orchestrator.RemoteTarget, *exit.Error) {
+	r.mu.Lock()
+	kept := r.v1[name]
+	r.mu.Unlock()
+	if r.Recorded != nil && (kept == nil || !kept.client.Broken()) {
+		if remote, problem := r.Recorded(name); problem == nil && remote != nil && remote.Connection != nil {
+			return remote, nil
+		}
+	}
+	return r.Rentals(name)
 }
 
 // rentalTarget holds a rental for holder and names its dial identity.
