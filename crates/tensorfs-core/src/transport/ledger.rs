@@ -165,8 +165,6 @@ pub struct Ledger {
     worst_gap: Arc<Mutex<Duration>>,
     progress: Arc<Mutex<Progress>>,
     attempt: Option<Arc<Attempt>>,
-    #[cfg(test)]
-    clock: Option<Arc<dyn Fn() -> Instant + Send + Sync>>,
 }
 
 impl Ledger {
@@ -189,33 +187,12 @@ impl Ledger {
                 worst_still: Duration::ZERO,
             })),
             attempt: None,
-            #[cfg(test)]
-            clock: None,
         }
     }
 
     pub fn with_cancellation(mut self, cancellation: PullCancellation) -> Self {
         self.caller_cancellation = Some(cancellation);
         self
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_clock(
-        sample: Duration,
-        clock: impl Fn() -> Instant + Send + Sync + 'static,
-    ) -> Self {
-        let mut ledger = Self::with_resolution(sample);
-        ledger.progress.lock().unwrap().advanced = clock();
-        ledger.clock = Some(Arc::new(clock));
-        ledger
-    }
-
-    fn now(&self) -> Instant {
-        #[cfg(test)]
-        if let Some(clock) = &self.clock {
-            return clock();
-        }
-        Instant::now()
     }
 
     /// A terminal object failure stops the whole pull, including already-open
@@ -302,8 +279,6 @@ impl Ledger {
             worst_gap: Arc::clone(&self.worst_gap),
             progress: Arc::clone(&self.progress),
             attempt: Some(attempt),
-            #[cfg(test)]
-            clock: self.clock.clone(),
         }
     }
 
@@ -311,6 +286,12 @@ impl Ledger {
     /// but the pull did get somewhere, and the next wait must be measured from here.
     pub fn answered(&self) {
         self.advance(0);
+    }
+
+    /// The pull's silence was judged a stall and everything it was asking is asked again: the
+    /// silence ends here and teaches nothing, as a condemned stream's does not.
+    pub(crate) fn condemned(&self) {
+        self.progress.lock().unwrap().advanced = Instant::now();
     }
 
     /// The transfer starts NOW. Everything before it — opening the store, splitting the
@@ -331,7 +312,7 @@ impl Ledger {
     /// stream cannot raise the bar the next stream is judged by.
     fn advance(&self, bytes: u64) {
         let mut progress = self.progress.lock().unwrap();
-        let now = self.now();
+        let now = Instant::now();
         let gap = now.saturating_duration_since(progress.advanced);
         if gap > progress.worst_still {
             progress.worst_still = gap;
@@ -385,7 +366,7 @@ impl Ledger {
         let progress = self.progress.lock().unwrap();
         Still {
             moved: progress.moved,
-            silent: self.now().saturating_duration_since(progress.advanced),
+            silent: Instant::now().saturating_duration_since(progress.advanced),
         }
     }
 }

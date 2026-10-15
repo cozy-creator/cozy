@@ -44,6 +44,9 @@ pub struct Answer<'a> {
 }
 
 impl<'a> Answer<'a> {
+    pub(crate) fn of(status: u16, headers: &'a [(String, String)], presented: &'a [(String, String)]) -> Answer<'a> {
+        Answer { status, headers, presented }
+    }
     pub fn header(&self, name: &str) -> Option<&'a str> {
         find(self.headers, name)
     }

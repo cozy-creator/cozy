@@ -19,8 +19,8 @@ use tensorfs_core::{
     providers::{self, Provenance, Pulled, Resolution, ResolvedMember},
     store::{Fault, Store},
     transport::{
-        memory_available, push_object, streams_within, transfer_streams, Anonymous, Deadline,
-        Ledger, PullCancellation, SourceDownload, SourcePolicy, UploadGrant, STREAM_MEMORY,
+        push_object, Anonymous, Deadline, Ledger, PullCancellation, SourceDownload, SourcePolicy,
+        UploadGrant,
     },
 };
 
@@ -920,11 +920,9 @@ fn push_memory_child() {
     let grew = peak_resident().saturating_sub(before);
     println!("PUSHED 16 x 16 MiB, peak resident grew {grew} B");
     assert_eq!(origin.puts.load(Ordering::Relaxed), 16);
-    // 256 MiB crossed the sockets; the pushes may hold their streams' buffers and no more.
-    assert!(
-        grew < 16 * STREAM_MEMORY + (16 << 20),
-        "pushes buffered {grew} B"
-    );
+    // 256 MiB crossed the sockets; the pushes may hold their streams' buffers (2 MiB each)
+    // and no more.
+    assert!(grew < 16 * (2 << 20) + (16 << 20), "pushes buffered {grew} B");
 }
 
 #[test]
@@ -942,31 +940,10 @@ fn sixteen_concurrent_pushes_hold_stream_buffers_not_objects() {
 }
 
 #[test]
-fn streams_are_sized_to_the_memory_budget() {
-    assert_eq!(streams_within(16, None), 16);
-    assert_eq!(streams_within(16, Some(1 << 40)), 16);
-    assert_eq!(streams_within(16, Some(5 * STREAM_MEMORY)), 5);
-    assert_eq!(
-        streams_within(16, Some(0)),
-        1,
-        "a starved host still moves one stream"
-    );
-    assert!(memory_available().is_some_and(|bytes| bytes > 0));
-}
-
-#[test]
 fn bounded_memory_child() {
     let Some(dir) = std::env::var_os("TFS_DOWNLOAD_CHILD") else {
         return;
     };
-    let available = memory_available().unwrap();
-    let streams = transfer_streams(1024);
-    println!("BUDGET {available} B allows {streams} streams");
-    // The scope's 64 MiB, not the host's gigabytes, decides.
-    assert!(
-        available < 64 << 20 && streams < 32,
-        "{available} B, {streams} streams"
-    );
     let name = "model.safetensors";
     let origin = Origin::start(vec![(name, body(77, 16 * MIB))], 16 << 20, |_, _| {
         Act::Serve
@@ -983,14 +960,10 @@ fn bounded_memory_child() {
     verify(&store, &origin, &[name]);
     let live = origin.most_live.load(Ordering::SeqCst);
     println!("DOWNLOADED with at most {live} live streams");
-    assert!(
-        live <= streams,
-        "{live} streams against a budget of {streams}"
-    );
 }
 
 #[test]
-fn a_memory_limited_scope_downloads_with_fewer_streams() {
+fn a_memory_limited_scope_downloads() {
     let scope = [
         "systemd-run",
         "--user",
@@ -1020,7 +993,7 @@ fn a_memory_limited_scope_downloads_with_fewer_streams() {
     );
     for line in text
         .lines()
-        .filter(|line| line.contains("BUDGET") || line.contains("DOWNLOADED"))
+        .filter(|line| line.contains("DOWNLOADED"))
     {
         println!("{line}");
     }

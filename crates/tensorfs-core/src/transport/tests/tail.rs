@@ -224,9 +224,13 @@ fn large_objects_are_ranged_chunks_and_small_ones_one_get() {
     // A coarse sample: this counts requests, and a loaded host must not add a restart.
     let (_, report, _) = timed_pull_sampling(&hub, &checkpoint, "chunks", 1.0);
     let chunks = 3 * OBJECT / CHUNK_BYTES as usize;
-    assert_eq!(hub.ranged.load(Ordering::Relaxed), chunks);
+    // Idle workers take the backs of running chunks: more asks, never a byte twice.
+    let ranged = hub.ranged.load(Ordering::Relaxed);
+    assert!(ranged >= chunks, "{ranged} ranged asks for {chunks} chunks");
     // The header and the manifest are each smaller than a chunk.
-    assert_eq!(report.requests as usize, chunks + 2, "{report:?}");
+    assert_eq!(report.requests as usize, ranged + 2, "{report:?}");
+    let total: u64 = checkpoint.bodies.values().map(|b| b.len() as u64).sum();
+    assert_eq!(report.bytes_moved, total, "{report:?}");
     assert_eq!(report.restarts, 0);
 }
 

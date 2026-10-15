@@ -39,7 +39,7 @@ mod dpop;
 mod http;
 mod hub;
 mod ledger;
-mod memory;
+mod net;
 mod policy;
 mod pull;
 mod publish;
@@ -61,7 +61,6 @@ pub use ledger::{
     Deadline, Ledger, PullCancellation, FETCH_ATTEMPTS, PULL_STREAMS, SAMPLE_SECONDS, STALL_FACTOR,
     STILL_SAMPLES, STREAMS,
 };
-pub use memory::{memory_available, streams_within, transfer_streams, STREAM_MEMORY};
 pub use policy::{base_host, blocked, is_loopback_origin, resolve, CheckedUrl, SourcePolicy};
 pub use pull::{
     fetch_wanted, pull, resolve_closure, FetchObserver, Fetched, ObjectSource, ObjectUrls,

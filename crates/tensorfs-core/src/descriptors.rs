@@ -1,5 +1,5 @@
-//! File descriptors as a budget: raised to what the process may have, measured before a
-//! transfer sizes itself, and an exhausted table reported as backpressure.
+//! File descriptors: raised to what the process may have, and an exhausted table reported as
+//! backpressure.
 //!
 //! Run 1297 (2026-09-27) grew a pull toward 128 streams under a 1,024 soft RLIMIT_NOFILE;
 //! each object in flight holds a socket, a temp file, writer markers and a catalog
@@ -8,14 +8,12 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Once;
 
-/// Descriptors one object stream may hold at once, and what it is spent on: the object
-/// socket and one pooled idle socket (2); the temp file and the two writer-marker files of
-/// its admission, nested once more by the catalog record (5); the catalog connection and its
-/// journal (2); and the transient DNS socket or contender of a retry (3).
-pub const PER_STREAM: u64 = 12;
+/// Descriptors one request in flight may hold: its socket and an idle one, its object's temp
+/// file, and that object's admission.
+pub const PER_REQUEST: u64 = 4;
 
-/// Descriptors left for everything that is not a stream: stdio, the Store's own locks, the
-/// hub calls, the progress channel and whatever the caller opens next.
+/// Descriptors kept back for what is not a transfer: stdio, the Store's own locks, the hub
+/// calls, the progress channel and whatever the caller opens next.
 pub const MARGIN: u64 = 64;
 
 static RAISE: Once = Once::new();
@@ -49,17 +47,15 @@ pub fn available() -> Option<u64> {
     Some(soft.saturating_sub(open).saturating_sub(MARGIN))
 }
 
-/// Object streams the descriptor table allows now: at most `wanted`, at least one.
-pub fn streams_within(wanted: usize) -> usize {
-    streams_for(wanted, available())
-}
-
-/// `streams_within` against a stated number of free descriptors.
-pub fn streams_for(wanted: usize, available: Option<u64>) -> usize {
-    let fits = available.map_or(usize::MAX, |free| {
-        usize::try_from(free / PER_STREAM).unwrap_or(usize::MAX)
-    });
-    wanted.min(fits).max(1)
+/// Requests in flight the raised descriptor limit holds, at most `wanted`: a budget sized once
+/// from the limit, not from what happens to be free.
+pub fn requests(wanted: usize) -> usize {
+    raise();
+    let soft = rustix::process::getrlimit(rustix::process::Resource::Nofile).current;
+    soft.map_or(wanted, |soft| {
+        usize::try_from(soft.saturating_sub(MARGIN) / PER_REQUEST).unwrap_or(usize::MAX)
+    })
+    .clamp(1, wanted)
 }
 
 /// Whether `error` is the descriptor table being full, counting it when it is. Call it
@@ -85,18 +81,6 @@ pub fn exhaustions() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_budget_is_descriptors_over_per_stream_cost() {
-        assert_eq!(streams_for(128, Some(PER_STREAM * 10)), 10);
-        assert_eq!(streams_for(8, Some(PER_STREAM * 10)), 8);
-        assert_eq!(streams_for(128, Some(0)), 1, "one stream is always allowed");
-        assert_eq!(
-            streams_for(128, None),
-            128,
-            "an unmeasurable table is not a shortage"
-        );
-    }
 
     #[test]
     fn only_a_full_table_counts_as_exhaustion() {

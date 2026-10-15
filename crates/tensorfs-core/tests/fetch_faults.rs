@@ -182,6 +182,8 @@ fn enveloped(code: u16, error: &str) -> Fault {
 
 /// Which asks a fault answers: a route (`closure`, `presign`, an object's hex, or `*` for
 /// every object) and the 1-based asks of that route it covers.
+/// `route` is `closure`, `presign`, an object's hex, `*` for any object, or `<hex>@<n>` for an
+/// object asked on a URL from the hub's `n`th presign.
 struct Rule {
     route: String,
     asks: std::ops::RangeInclusive<usize>,
@@ -355,6 +357,7 @@ fn serve(
     let Some(asked) = read_request(&mut socket) else {
         return;
     };
+    let minted = (asked.query.split('&')).find_map(|field| field.strip_prefix("gen="));
     let route = match (asked.method.as_str(), asked.path.as_str()) {
         ("POST", "/v1/tensorfs/closure") => "closure".to_string(),
         ("POST", "/v1/tensorfs/presign") => "presign".to_string(),
@@ -373,7 +376,9 @@ fn serve(
             .rules
             .iter()
             .find(|rule| {
-                (rule.route == route || (object && rule.route == "*")) && rule.asks.contains(&ask)
+                let generation = minted.map(|n| format!("{route}@{n}"));
+                let named = rule.route == route || Some(&rule.route) == generation.as_ref();
+                (named || (object && rule.route == "*")) && rule.asks.contains(&ask)
             })
             .map(|rule| rule.fault.clone());
         ledger.log.push(format!(
@@ -386,7 +391,6 @@ fn serve(
         }
         (ask, fault)
     };
-    let _ = ask;
     if let Some(Fault::Delay(wait)) = fault {
         std::thread::sleep(wait);
     }
@@ -395,11 +399,10 @@ fn serve(
     }
     let body = match route.as_str() {
         "closure" => closure(checkpoint, &asked.body, config),
-        "presign" => presign(&asked.body, base, config.lifetime, config.declared),
+        "presign" => presign(&asked.body, base, config.lifetime, config.declared, ask),
         hex => {
-            let dies: u128 = asked
-                .query
-                .strip_prefix("dies=")
+            let dies: u128 = (asked.query.split('&'))
+                .find_map(|field| field.strip_prefix("dies="))
                 .and_then(|stamp| stamp.parse().ok())
                 .expect("every URL this hub mints carries its death");
             if now_ms() > dies {
@@ -577,7 +580,13 @@ fn closure(checkpoint: &Checkpoint, asked: &[u8], config: &Config) -> Vec<u8> {
     ]))
 }
 
-fn presign(asked: &[u8], base: &str, lifetime: Duration, declared: Option<Duration>) -> Vec<u8> {
+fn presign(
+    asked: &[u8],
+    base: &str,
+    lifetime: Duration,
+    declared: Option<Duration>,
+    generation: usize,
+) -> Vec<u8> {
     let Some(Value::Arr(digests)) = field(asked, "digests") else {
         panic!("a presign names its digests")
     };
@@ -590,7 +599,7 @@ fn presign(asked: &[u8], base: &str, lifetime: Duration, declared: Option<Durati
         .into_iter()
         .map(|digest| {
             let Value::Str(hex) = digest else { panic!() };
-            let url = Value::str(format!("{base}/obj/{hex}?dies={dies}"));
+            let url = Value::str(format!("{base}/obj/{hex}?dies={dies}&gen={generation}"));
             (hex, url)
         })
         .collect();
@@ -1099,6 +1108,55 @@ fn a_link_blip_before_any_object_lands_is_re_attempted_and_only_stillness_stalls
         "STALLED after {:?}",
         started.elapsed()
     );
+}
+
+/// A stalled object is asked again on a URL minted afresh for as long as anything else moves
+/// into its Store, and no count of restarts refuses it (run 6496 refused one STALLED after two
+/// restarts at 0 B/s while another download moved; asked again 2 s later it landed). With
+/// nothing else moving, one fresh ask that comes to nothing ends it STALLED.
+#[test]
+fn a_stalled_object_is_asked_again_while_anything_else_moves() {
+    let slow = checkpoint(1, 4 << 20, 23);
+    let checkpoint = checkpoint(2, 64 << 10, 22);
+    let victim = blob(&checkpoint, 0);
+    // Silent on the URLs of the first two presigns, answered on the third's.
+    let stuck = || {
+        hub(
+            Arc::clone(&checkpoint),
+            Config {
+                rules: (1..=2)
+                    .map(|n| on(&format!("{victim}@{n}"), 1..=usize::MAX, Fault::Stall(0)))
+                    .collect(),
+                ..Config::default()
+            },
+        )
+    };
+    let alone = stuck();
+    let root = store(&temporary("stuck-alone"));
+    assert_refused(&Run::new(&alone, &root).ensure(), &alone, &root, Code::STALLED);
+    assert_eq!(alone.asks("presign"), 2, "{}", alone.log());
+
+    let moving = hub(
+        slow,
+        Config {
+            rules: vec![on("*", 1..=usize::MAX, Fault::Slow(Duration::from_secs(60)))],
+            ..Config::default()
+        },
+    );
+    let stop = PullCancellation::default();
+    let root = store(&temporary("stuck-beside"));
+    let mut elsewhere = Run::new(&moving, &root);
+    (elsewhere.cancellation, elsewhere.streams) = (Some(stop.clone()), 1);
+    let beside = stuck();
+    let landed = std::thread::scope(|scope| {
+        let elsewhere = scope.spawn(|| elsewhere.ensure());
+        let landed = Run::new(&beside, &root).ensure();
+        stop.cancel();
+        let _ = elsewhere.join();
+        landed
+    });
+    assert_landed(&landed, &beside, &root);
+    assert!(beside.asks("presign") >= 3, "{}", beside.log());
 }
 
 /// A pull killed mid-object strands its partial temp; the next ensure takes it, because GC,

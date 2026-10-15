@@ -293,6 +293,8 @@ fn an_attempt_that_landed_objects_is_retried_and_one_that_landed_none_is_stalled
     let recovered = run(&store(&dir), &hub_a.base, &[]);
     assert_result(&recovered, &checkpoint);
 
+    // An origin that never finishes an answer: asked again with URLs minted afresh, and
+    // with nothing else moving, refused as stalled.
     let never: Rule = Arc::new(|_, _| Answer::Truncate);
     let hub_b = hub(vec![Arc::clone(&checkpoint)], None, Duration::ZERO, never);
     let root = dir.join("stalled");
@@ -304,6 +306,7 @@ fn an_attempt_that_landed_objects_is_retried_and_one_that_landed_none_is_stalled
         "{}",
         stalled.stdout
     );
+    assert!(hub_b.gets("presign") >= 2, "never minted afresh");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -419,9 +422,9 @@ fn a_pressure_pass_reports_the_disk_and_keeps_what_it_is_told() {
 }
 
 
-/// A pod's container caps its tasks (a vast RTX 5060 Ti: `pids.max` 1280) below the threads
-/// concurrent pulls start. A stream thread the cap refuses is backpressure: the pull lands on
-/// the streams that started. On 0.9.0 the refusal panicked past the pull's sampler and `tfs
+/// A pod's container caps its tasks (a vast RTX 5060 Ti: `pids.max` 1280). Requests in flight
+/// are tasks, not threads: a pull keeps more of them in flight than the cap allows threads,
+/// and lands. On 0.9.0 a refused stream thread panicked past the pull's sampler and `tfs
 /// ensure` never returned, holding the manifest's flight (TensorD 0.5.30 prepare wedge).
 #[test]
 fn an_ensure_whose_stream_threads_the_container_refuses_lands() {
@@ -477,6 +480,6 @@ fn an_ensure_whose_stream_threads_the_container_refuses_lands() {
         .unwrap()
         .parse()
         .unwrap();
-    assert!(streams < TASKS, "the cap refused none of its streams: {walk}");
+    assert!(streams > TASKS, "more requests in flight than the cap allows threads: {walk}");
     let _ = std::fs::remove_dir_all(&dir);
 }

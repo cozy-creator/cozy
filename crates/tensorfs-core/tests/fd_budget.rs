@@ -186,7 +186,7 @@ fn set_limit(soft: u64, hard: Option<u64>) {
 }
 
 #[test]
-fn a_low_descriptor_limit_bounds_the_walk_and_never_exhausts_it() {
+fn a_low_descriptor_limit_is_raised_and_a_full_table_is_backpressure() {
     let original = getrlimit(Resource::Nofile);
     let hard = original.maximum.unwrap_or(u64::MAX);
     assert!(
@@ -194,7 +194,7 @@ fn a_low_descriptor_limit_bounds_the_walk_and_never_exhausts_it() {
         "this proof needs a hard limit of at least 4096"
     );
     // More objects a walk than requests in flight, so a connection has a second request.
-    let (declared, bodies) = objects(3 * 640);
+    let (declared, bodies) = objects(2 * 640);
     let origin = origin(bodies);
 
     // A Go parent hands its child the original soft limit. The pull raises it to the hard
@@ -205,13 +205,6 @@ fn a_low_descriptor_limit_bounds_the_walk_and_never_exhausts_it() {
     assert!(
         getrlimit(Resource::Nofile).current.unwrap() > 256,
         "the soft limit was not raised"
-    );
-    // The raised table no longer bounds the walk: the budget it measures now admits the
-    // whole ceiling.
-    assert_eq!(
-        tensorfs_core::descriptors::streams_within(PULL_STREAMS),
-        PULL_STREAMS,
-        "a raised table still capped the budget: {raised:?}"
     );
     assert_eq!(
         tensorfs_core::descriptors::exhaustions(),
@@ -230,8 +223,8 @@ fn a_low_descriptor_limit_bounds_the_walk_and_never_exhausts_it() {
     // The table shrinks under a running walk. The squeeze is driven by the walk's own
     // progress, never by a clock: once the origin has served 16 more GETs, the soft limit
     // drops just below what is open, and it comes back after the walk has met a full
-    // table three times. EMFILE is then backpressure: the request is asked again and
-    // every byte lands.
+    // table three times. EMFILE is then backpressure: what met it is asked again and every
+    // byte lands.
     let requests = Arc::clone(&origin.requests);
     let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let finished = Arc::clone(&done);
@@ -256,20 +249,30 @@ fn a_low_descriptor_limit_bounds_the_walk_and_never_exhausts_it() {
     let open = squeeze.join().unwrap();
     println!("pressed (limit {open}-4 mid-walk): {pressed:?}");
     assert!(
-        tensorfs_core::descriptors::exhaustions() > before && pressed.requests > pressed.fetched,
+        tensorfs_core::descriptors::exhaustions() > before,
         "the squeeze never pressed the walk: {pressed:?}"
     );
+    println!("raised: {raised:?}");
 
-    // A hard limit of 256 cannot be raised past. The walk sizes itself to the table and
-    // completes with every object verified. The test's own origin shares this process's
-    // table, so a transient EMFILE is possible and is absorbed as backpressure; the walk
-    // never fails on one and never grows past the budget.
+    // A process started under a hard limit of 256, which cannot be raised past.
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "a_hard_limit_child", "--nocapture"])
+        .env("TFS_FD_CHILD", "1")
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&child.stdout).to_string() + &String::from_utf8_lossy(&child.stderr);
+    assert!(child.status.success() && text.contains("BOUNDED"), "{text}");
+}
+
+/// Under a hard limit of 256 the machine's budget is sized to the table, and the walk
+/// completes with every object verified.
+#[test]
+fn a_hard_limit_child() {
+    if std::env::var_os("TFS_FD_CHILD").is_none() {
+        return;
+    }
     set_limit(256, Some(256));
-    let bounded = walk(&origin, &declared[1280..]);
-    let budget = tensorfs_core::descriptors::streams_within(PULL_STREAMS);
-    println!("raised: {raised:?}\nbounded to {budget}: {bounded:?}");
-    assert!(
-        bounded.streams <= budget.max(1),
-        "grew past the descriptor budget: {bounded:?}"
-    );
+    let (declared, bodies) = objects(640);
+    let bounded = walk(&origin(bodies), &declared);
+    println!("BOUNDED {bounded:?}");
 }

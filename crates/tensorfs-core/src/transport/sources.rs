@@ -377,10 +377,9 @@ pub(crate) fn fetch_sources(
         ranged: false,
         deadline,
         ledger,
-        backfill: None,
         keep: Some(&keep),
     }
-    .run(batch.streams(super::transfer_streams(options.streams.clamp(1, 128)), chunk), None);
+    .run(batch.streams(options.streams.clamp(1, 128), chunk), None);
     drop(batch);
     walked?;
     let moved = moved.into_inner().unwrap();

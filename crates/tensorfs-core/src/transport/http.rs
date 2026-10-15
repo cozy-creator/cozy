@@ -84,7 +84,7 @@ pub enum Judge {
 /// wrong machine. It is also what makes the verdict terminal in `hub::call` instead of
 /// re-asked three more times: a re-ask reaches the identical conclusion on its first tick and
 /// would only overwrite this diagnosis with a duller one.
-fn transfer_verdict(
+pub(super) fn transfer_verdict(
     judge: Judge,
     ledger: &Ledger,
     since: Instant,
@@ -160,7 +160,7 @@ fn stream_verdict(judge: Judge, ledger: &Ledger, advanced: Instant, phase: &str)
 /// exchange's own failure code, which `hub::call` re-asks. Before a byte of the pull has
 /// moved this is the only bound a black-holed hub meets. The head wait is never judged this
 /// way: a live hub may take its time, and a dead one is found by TCP keepalive.
-fn handshake_verdict(
+pub(super) fn handshake_verdict(
     judge: Judge,
     ledger: &Ledger,
     advanced: Instant,
@@ -183,7 +183,7 @@ fn handshake_verdict(
 }
 
 impl Judge {
-    fn silent_is_stall(self) -> bool {
+    pub(super) fn silent_is_stall(self) -> bool {
         matches!(self, Judge::Stream | Judge::Silence)
     }
 }
@@ -204,14 +204,13 @@ struct Tls {
 type IdlePool = Arc<Mutex<Vec<Idle>>>;
 
 // This bounds retained descriptors, not in-flight transfers (the caller owns those).
-// `descriptors::PER_STREAM` counts one idle socket per stream.
 const MAX_IDLE: usize = 32;
 
 /// A connection belongs to its origin and the credentials sent on it, never to one
 /// request target: a signed CDN URL changes per resolve, and keying on it meant the
 /// delivery hop never reused a socket.
 #[derive(Clone, PartialEq, Eq)]
-struct Scope {
+pub(super) struct Scope {
     https: bool,
     host: String,
     port: u16,
@@ -220,7 +219,7 @@ struct Scope {
 }
 
 impl Scope {
-    fn of(checked: &CheckedUrl, headers: &[(String, String)]) -> Self {
+    pub(super) fn of(checked: &CheckedUrl, headers: &[(String, String)]) -> Self {
         let mut hash = crate::sha256::Sha256::new();
         for (name, value) in headers {
             // Preserve duplicate-header ordering as well as values: an origin
@@ -308,6 +307,26 @@ fn recanted(
     }
 }
 
+/// `checked`'s origin completed a verified handshake in this process.
+pub(super) fn verified(checked: &CheckedUrl) {
+    VERIFIED.lock().unwrap().insert((checked.host.clone(), checked.port));
+}
+
+/// [`recanted`] without its wait: the caller asks again a sample on, waiting nothing here.
+pub(super) fn recanted_now(checked: &CheckedUrl, refusal: Refusal, ledger: &Ledger, fail: Code) -> Refusal {
+    let origin = (checked.host.clone(), checked.port);
+    if refusal.code != Code::TLS_UNTRUSTED || !VERIFIED.lock().unwrap().contains(&origin) {
+        return refusal;
+    }
+    match ledger.still().silent > ledger.stillness() {
+        true => refusal,
+        false => Refusal {
+            code: fail,
+            detail: format!("{} — {} verified earlier in this process", refusal.detail, checked.host),
+        },
+    }
+}
+
 /// Trust the PEM certificates in `pem` for every client this process uses.
 pub fn trust_roots(pem: &[u8]) -> Result<usize> {
     let roots: Vec<_> = CertificateDer::pem_slice_iter(pem)
@@ -374,7 +393,7 @@ impl Client {
         }
     }
 
-    fn tls(&self) -> Arc<rustls::ClientConfig> {
+    pub(super) fn tls(&self) -> Arc<rustls::ClientConfig> {
         let mut tls = self.tls.lock().unwrap();
         let generation = TRUST_GENERATION.load(Ordering::Acquire);
         if !self.fixed && tls.generation != generation {
@@ -667,7 +686,7 @@ fn connect(
 /// silence and a peer that answers none of `STILL_SAMPLES` probes, a sample apart, is gone.
 /// A live hub that is merely slow ACKs every probe and is waited for; a dead host or a
 /// dropped tunnel fails the read as weather, which the caller asks again.
-fn keepalive(socket: &TcpStream, ledger: &Ledger) {
+pub(super) fn keepalive(socket: &impl std::os::fd::AsFd, ledger: &Ledger) {
     use rustix::net::sockopt;
     let second = Duration::from_secs(1);
     let _ = sockopt::set_socket_keepalive(socket, true);
@@ -766,6 +785,7 @@ impl<'l> Response<'l> {
         &self.headers
     }
 
+    #[cfg(test)]
     pub fn into_body(self) -> BodyReader<'l> {
         self.body
     }
@@ -789,13 +809,7 @@ impl<'l> Response<'l> {
     /// delta-seconds, or an HTTP-date against the answer's own `Date`. `None` when it
     /// states nothing readable.
     pub fn stated_wait(&self) -> Option<Duration> {
-        let value = self.header("retry-after")?.trim();
-        if let Ok(seconds) = value.parse::<u64>() {
-            return Some(Duration::from_secs(seconds));
-        }
-        let at = http_date(value)?;
-        let now = http_date(self.header("date")?)?;
-        Some(Duration::from_secs(at.saturating_sub(now)))
+        stated_wait(&self.headers)
     }
 
     /// The whole body, refused above `cap` rather than truncated.
@@ -816,6 +830,19 @@ impl<'l> Response<'l> {
             out.extend_from_slice(&buf[..n]);
         }
     }
+}
+
+/// The wait `headers` state (`Retry-After`), read in the origin's own clock: delta-seconds,
+/// or an HTTP-date against the answer's own `Date`. `None` when they state nothing readable.
+pub(super) fn stated_wait(headers: &[(String, String)]) -> Option<Duration> {
+    let header = |name: &str| headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str());
+    let value = header("retry-after")?.trim();
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+    let at = http_date(value)?;
+    let now = http_date(header("date")?)?;
+    Some(Duration::from_secs(at.saturating_sub(now)))
 }
 
 /// RFC 9110 IMF-fixdate (`Sun, 06 Nov 1994 08:49:37 GMT`) as Unix seconds.

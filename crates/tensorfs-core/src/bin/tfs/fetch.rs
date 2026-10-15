@@ -78,13 +78,6 @@ fn credential_of(
 /// `tfs fetch <root> <ref>` — closure, plan against the REAL store, the N-way walk
 /// presigning `wanted` as it reaches it, the completion proof. A warm store asks one
 /// question and moves nothing.
-///
-/// The mounted immutable object cache — consulted between the local Store and the origin,
-/// and published onward into — is the STORE's, recorded by `tfs store ensure --repo-cache`
-/// and read off the handle this opens. There is no flag: a fetch does not get to name a
-/// cache, because the cache is a fact about the deployment and not about this pull. An
-/// unbound Store is a pull with no cache, and a cache that is missing, cold, corrupt,
-/// read-only or unmounted degrades to exactly that pull.
 pub fn cmd_pull(root: &Path, refspec: &str, flags: &Flags) -> ExitCode {
     // Before the open, which is where an unclean shutdown's recovery runs.
     let before = tensorfs_core::stats::snapshot();
@@ -133,17 +126,7 @@ pub fn cmd_pull(root: &Path, refspec: &str, flags: &Flags) -> ExitCode {
     let seconds = started.elapsed().as_secs_f64();
     let after = tensorfs_core::stats::snapshot();
     progress.settle();
-    if !tensorfs_core::repo_cache::finish_optional_backfills() {
-        eprintln!("repo cache replication incomplete; local fetch remains complete");
-    }
-    // Exactly one model pull owns this receipt; a shared library process may
-    // concurrently finish other pulls without contaminating this observation.
     let quoted = |value: &str| String::from_utf8(canon::write(&canon::Value::str(value))).unwrap();
-    eprintln!(
-        "{{\"event\":\"pull.cache\",\"model\":{},\"manifest\":{},\"scope\":{},\"cache_written_bytes\":{},\"cache_bytes\":{},\"total_bytes\":{}}}",
-        quoted(&report.model), quoted(&report.manifest), quoted(&report.scope),
-        report.cache_writes.bytes(), report.bytes_cached, report.bytes_total,
-    );
     // What the requests cost and what admitting them cost: a pull whose batches take most
     // of the wall time is held by the disk, not the link. `durability` says which syncs the
     // disk the Store lives on made it pay, and what an unclean shutdown before this pull
@@ -176,10 +159,6 @@ pub fn cmd_pull(root: &Path, refspec: &str, flags: &Flags) -> ExitCode {
     println!(
         "held         {} object(s), {} B — NOT fetched",
         report.held, report.bytes_held
-    );
-    println!(
-        "cached       {} object(s), {} B — from the mounted cache, NOT the origin",
-        report.cached, report.bytes_cached
     );
     println!(
         "fetched      {} object(s), {} B, {} stream(s)",

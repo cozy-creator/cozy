@@ -260,7 +260,7 @@ fn events<'r>(request: &'r Request<'_>) -> impl Fn(Phase, u64, u64, f64) + Sync 
 
 /// Run `work`, calling `tick` once per `every` until it returns.
 fn ticking<T>(every: Duration, tick: &(dyn Fn() + Sync), work: impl FnOnce() -> T) -> T {
-    ticking_mut(every, || tick(), work)
+    ticking_mut(every, tick, work)
 }
 
 fn ticking_mut<T>(every: Duration, mut tick: impl FnMut() + Send, work: impl FnOnce() -> T) -> T {

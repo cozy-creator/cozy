@@ -940,14 +940,11 @@ impl Shared {
     /// One downloader run: until nothing is queued or open.
     fn run(&self) -> Result<()> {
         crate::descriptors::raise();
-        let streams = crate::descriptors::streams_within(transport::transfer_streams(self.streams));
+        let streams = self.streams;
         let ledger = Ledger::with_resolution(self.sample).with_cancellation(self.stop.clone());
         ledger.transfer_begins();
         let epoch = crate::unsynced::Epoch::begin(&self.store)?;
         let store = self.store.syncing(epoch.clone());
-        let backfill = store
-            .repo_cache()
-            .map(|cache| crate::repo_cache::BackfillBatch::new(cache.clone(), &store, BACKFILL_OFFERS));
         let ran = Download {
             store: &store,
             feed: self,
@@ -955,13 +952,9 @@ impl Shared {
             ranged: true,
             deadline: Deadline::none(),
             ledger: &ledger,
-            backfill: backfill.as_ref(),
             keep: None,
         }
         .run(streams, None);
-        if let Some(backfill) = backfill {
-            backfill.finish_offers();
-        }
         if let Some(epoch) = epoch {
             epoch.finish()?;
         }
@@ -1040,9 +1033,6 @@ impl Shared {
             .collect()
     }
 }
-
-/// Offers a run's repo-cache backfill keeps while the cache's pool is busy.
-const BACKFILL_OFFERS: usize = 4096;
 
 impl<'a> Feed<'a> for Shared {
     fn open(&self, before: u64) -> Result<Option<Opening<'a>>> {
@@ -1181,7 +1171,6 @@ struct OriginSupply {
     leases: Mutex<HashMap<String, Lease>>,
     minting: Minting,
     shared: Weak<Shared>,
-    me: Weak<OriginSupply>,
 }
 
 impl OriginSupply {
@@ -1191,7 +1180,7 @@ impl OriginSupply {
         access: Arc<dyn Access>,
         shared: Weak<Shared>,
     ) -> Arc<OriginSupply> {
-        Arc::new_cyclic(|me| OriginSupply {
+        Arc::new(OriginSupply {
             origin: origin.clone(),
             policy: transport::hub_policy(&origin.hub, access.policy()),
             closure,
@@ -1199,7 +1188,6 @@ impl OriginSupply {
             leases: Mutex::default(),
             minting: Minting::default(),
             shared,
-            me: me.clone(),
         })
     }
 
@@ -1281,52 +1269,27 @@ impl OriginSupply {
     }
 
     /// When fewer than half a window of this origin's waiting objects hold fresh URLs, the
-    /// next window is minted on its own thread while the current one downloads.
-    fn ahead(&self) {
-        if self.minting.busy() {
-            return;
-        }
+    /// asker that sees it mints the next window, unless another already is.
+    fn ahead(&self, ledger: &Ledger) {
         let (unminted, fresh) = self.upcoming(false);
         if unminted.is_empty() || fresh * 2 >= self.closure.presign_max_digests.max(1) {
             return;
         }
-        let (Some(shared), Some(supply)) = (self.shared.upgrade(), self.me.upgrade()) else {
-            return;
-        };
-        let _ = std::thread::Builder::new()
-            .name("tensorfs-presign".into())
-            .spawn(move || {
-                let ledger = Ledger::new().with_cancellation(shared.stop.clone());
-                if let Ok(_minting) = supply.minting.acquire(&ledger, Deadline::none()) {
-                    let _ = supply.mint(None, &ledger);
-                }
-            });
-    }
-
-    fn retire(&self, sha256: &str) -> bool {
-        self.leases
-            .lock()
-            .unwrap()
-            .remove(sha256)
-            .is_none_or(|lease| lease.spent())
+        if let Some(_minting) = self.minting.try_acquire() {
+            let _ = self.mint(None, ledger);
+        }
     }
 }
 
 impl Supply for OriginSupply {
     fn url(&self, _at: usize, object: &ObjectRef, stale: bool, ledger: &Ledger) -> Result<String> {
         ledger.check_running()?;
-        if stale && !self.retire(&object.sha256) {
-            return refuse(
-                Code::TRANSFER_FAILED,
-                format!(
-                    "{}: the object store refused a URL minted moments ago, with most of the life \
-                     the hub declared for it still to run",
-                    object.id()
-                ),
-            );
+        // A refused URL is minted afresh whatever its declared life: the origin's clock rules.
+        if stale {
+            self.leases.lock().unwrap().remove(&object.sha256);
         }
         if let Some(url) = self.fresh(&object.sha256) {
-            self.ahead();
+            self.ahead(ledger);
             return Ok(url);
         }
         let _minting = self.minting.acquire(ledger, Deadline::none())?;

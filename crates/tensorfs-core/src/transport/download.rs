@@ -1,13 +1,18 @@
 //! The pull's downloader, the way an S3 client does it. The wanted objects are cut into
 //! fixed ranged chunks on one queue, `streams` workers each GET one chunk into its
-//! object's temp file, and a finished file is hashed and committed to the Store.
+//! object's temp file, and a finished file is hashed and committed to the Store. A worker is
+//! a task on the network runtime (`net`), and its writes, hashes and blocking calls go to two
+//! small pools: a run's threads are as many with 512 requests in flight as with one, and
+//! every run in the process shares one budget of requests in flight (`in_flight`).
 //!
 //! One rule per request: one that fails, or waits or moves far slower than the requests
 //! running beside it over the same time, is dropped, and the rest of its chunk is asked
 //! again on fresh connections, in 1 MiB pieces. A pod whose every request is slow restarts
 //! none (vast 5090s, 2026-10-10: 885 restarts in 42 s against a median of the few early
-//! asks that came home). The pull ends on an answer asking again cannot change, or when
-//! nothing new has landed for twice its measured patience.
+//! asks that came home). A batch ends on an answer asking again cannot change, or when
+//! nothing new has landed for twice its measured patience. A lasting feed then asks again
+//! with URLs minted afresh, for as long as any download into its Store moves, and once when
+//! none does; its objects end only on the origin refusing a fresh URL, wrong bytes, or that.
 //!
 //! Why chunks: a cold R2 object answers each MiB after its own delay, usually under a
 //! second and sometimes a minute. One GET for the object pays every delay in a row (runs
@@ -25,19 +30,21 @@
 //! (Now, Next, Behind) gives way to waiting work of a higher one. A batch's refusal ends it;
 //! a lasting feed's refusal ends only its object.
 
+use super::credential::{Answer, Ask};
 use super::decisions;
 use super::ledger::{Attempt, Deadline, Ledger, STALL_FACTOR};
+use super::net;
 use super::pull::{
-    open_object, shared_client, FetchObserver, Fetched, ObjectObserver, ObjectSource, ObjectUrls,
-    Opened, WalkOutcome,
+    absolute_location, shared_client, FetchObserver, Fetched, ObjectObserver, ObjectSource,
+    ObjectUrls, WalkOutcome, RETRYABLE_STATUS,
 };
 use super::sources::{missing, Keep, Part};
 use super::STREAMS;
+use super::http::Judge;
 use super::{CredentialProvider, SourcePolicy};
 use crate::err::{refuse, Code, Refusal, Result};
 use crate::fetch::{DeliveryGrant, Destination};
 use crate::ids::ObjectRef;
-use crate::repo_cache::{BackfillBatch, CacheKind, CacheRead, CacheTrust};
 use crate::store::{Fault, Store, Verified, PUT_TEMP};
 use fs2::FileExt;
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -46,53 +53,125 @@ use std::io::Read;
 use std::os::unix::fs::{FileExt as _, OpenOptionsExt};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use futures::FutureExt;
 use std::panic::AssertUnwindSafe;
-use std::sync::{Arc, Condvar, Mutex, PoisonError, RwLock};
+use std::sync::{mpsc, Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 /// One request's bytes. Measured on a pod at 128 workers: 4, 8 and 16 MiB chunks all move
 /// what whole 64 MiB GETs move (1.1-1.3 GB/s); 1 MiB chunks move half.
 pub const CHUNK_BYTES: u64 = 8 << 20;
 
-/// The most writes into temp files at once, whatever the requests in flight. A buffered
-/// write is a copy into the page cache: the kernel's writeback writes the disk, and one
-/// file's writes take turns on its inode lock, so more writers add no bytes, only threads
-/// stalled in the kernel. With one writer per request (512) a 6.5 GiB pull on a laptop left
-/// 180 threads in uninterruptible sleep, load at 396 and the disk's IO pressure full for ten
-/// minutes. Requests beyond this wait their turn holding their read buffer, so in-flight
-/// unwritten bytes stay at most one buffer per request.
+/// The most writes into temp files at once, whatever the requests in flight: the write
+/// pool's threads. A buffered write is a copy into the page cache: the kernel's writeback
+/// writes the disk, and one file's writes take turns on its inode lock, so more writers add no
+/// bytes, only threads stalled in the kernel. With one writer per request (512) a 6.5 GiB pull
+/// on a laptop left 180 threads in uninterruptible sleep, load at 396 and the disk's IO
+/// pressure full for ten minutes. Requests beyond this wait their turn holding what they
+/// gathered, so in-flight unwritten bytes stay at most one write per request.
 pub const WRITERS: usize = 8;
 
-/// Turns at writing, `WRITERS` at once; `peak` is the most that ever wrote together.
-struct Writers {
-    free: Mutex<usize>,
-    freed: Condvar,
-    peak: AtomicUsize,
+/// Jobs the async workers hand to threads: file writes, hashing and commits, and the hub,
+/// DNS and admission calls that block. A few threads serve every request in flight.
+type Job<'s> = Box<dyn FnOnce() + Send + 's>;
+
+/// A download's threads for work that blocks: at most `threads` of them, started for the run
+/// and ended with it. A thread the container refuses is backpressure; with none, a job runs
+/// on its caller.
+struct Offload<'s> {
+    jobs: Mutex<Option<mpsc::Sender<Job<'s>>>>,
+    started: usize,
+    busy: Arc<AtomicUsize>,
+    /// The most jobs that ever ran together.
+    peak: Arc<AtomicUsize>,
 }
 
-impl Writers {
-    fn new() -> Self {
-        Writers {
-            free: Mutex::new(WRITERS),
-            freed: Condvar::new(),
-            peak: AtomicUsize::new(0),
+impl<'s> Offload<'s> {
+    fn start<'e>(scope: &'s std::thread::Scope<'s, 'e>, threads: usize, name: &str) -> Offload<'s> {
+        let (sender, receiver) = mpsc::channel::<Job<'s>>();
+        let receiver = Arc::new(Mutex::new(receiver));
+        let started = (0..threads)
+            .take_while(|_| {
+                let receiver = Arc::clone(&receiver);
+                let serve = move || loop {
+                    let job = receiver.lock().unwrap_or_else(PoisonError::into_inner).recv();
+                    match job {
+                        Ok(job) => job(),
+                        Err(_) => return,
+                    }
+                };
+                std::thread::Builder::new().name(name.into()).spawn_scoped(scope, serve).is_ok()
+            })
+            .count();
+        Offload {
+            jobs: Mutex::new(Some(sender)),
+            started,
+            busy: Arc::default(),
+            peak: Arc::default(),
         }
     }
 
-    fn write(&self, file: &File, data: &[u8], at: u64) -> std::io::Result<()> {
-        let mut free = self.free.lock().unwrap();
-        while *free == 0 {
-            free = self.freed.wait(free).unwrap();
+    /// `job` on one of the threads, awaited. A job that panics resumes its panic here.
+    async fn run<T: Send + 's>(&self, job: impl FnOnce() -> T + Send + 's) -> T {
+        let (answer, answered) = futures::channel::oneshot::channel();
+        let (busy, peak) = (Arc::clone(&self.busy), Arc::clone(&self.peak));
+        let job: Job<'s> = Box::new(move || {
+            peak.fetch_max(busy.fetch_add(1, Ordering::AcqRel) + 1, Ordering::Relaxed);
+            let _ = answer.send(std::panic::catch_unwind(AssertUnwindSafe(job)));
+            busy.fetch_sub(1, Ordering::AcqRel);
+        });
+        let refused = match (self.started, self.jobs.lock().unwrap_or_else(PoisonError::into_inner).as_ref()) {
+            (1.., Some(jobs)) => jobs.send(job).err().map(|refused| refused.0),
+            _ => Some(job),
+        };
+        if let Some(job) = refused {
+            job();
         }
-        *free -= 1;
-        self.peak.fetch_max(WRITERS - *free, Ordering::Relaxed);
-        drop(free);
-        let written = file.write_all_at(data, at);
-        *self.free.lock().unwrap() += 1;
-        self.freed.notify_one();
-        written
+        match answered.await {
+            Ok(Ok(value)) => value,
+            Ok(Err(panic)) => std::panic::resume_unwind(panic),
+            Err(_) => panic!("an offloaded job ended without its answer"),
+        }
+    }
+
+    /// No more jobs: the threads end once the queued ones are done.
+    fn close(&self) {
+        self.jobs.lock().unwrap_or_else(PoisonError::into_inner).take();
     }
 }
+
+/// A download's two pools: writes into temp files apart from the control work, so a slow
+/// hub or a hashing commit never holds a request's bytes back.
+struct Pools<'s> {
+    writes: Offload<'s>,
+    control: Offload<'s>,
+}
+
+/// Threads for control work: a URL mint, a DNS check, an admission, a commit's hash and fsync.
+const CONTROL: usize = 8;
+
+/// The requests this process keeps in flight, every download together: one budget for the
+/// machine (TensorD owns its Store), never a fresh 512 per pull, and no more than its
+/// descriptor table holds.
+fn in_flight() -> &'static (usize, tokio::sync::Semaphore) {
+    static BUDGET: std::sync::OnceLock<(usize, tokio::sync::Semaphore)> = std::sync::OnceLock::new();
+    BUDGET.get_or_init(|| {
+        let requests = crate::descriptors::requests(super::PULL_STREAMS);
+        (requests, tokio::sync::Semaphore::new(requests))
+    })
+}
+
+/// Bytes every download into `store` (the machine's) has brought home in this process, net
+/// of bytes moved again. A run that stands still is asked again for as long as another moves.
+fn moved(store: &Store) -> Arc<AtomicU64> {
+    static MOVED: std::sync::LazyLock<Mutex<HashMap<PathBuf, Arc<AtomicU64>>>> =
+        std::sync::LazyLock::new(Mutex::default);
+    Arc::clone(MOVED.lock().unwrap().entry(store.root().to_path_buf()).or_default())
+}
+
+/// What a request gathers before handing a write to its pool: one write per this many bytes,
+/// not one per network frame.
+const WRITE_BYTES: usize = 256 << 10;
 
 /// One request's bytes from a source origin. Larger, because every ask walks the origin's
 /// redirect again (0.41 s against HuggingFace, and its resolve endpoint is rate-limited).
@@ -145,7 +224,7 @@ impl Cell {
 #[derive(Default)]
 pub(crate) struct Pulse {
     beats: Mutex<u64>,
-    beat: Condvar,
+    beaten: tokio::sync::Notify,
 }
 
 impl Pulse {
@@ -154,12 +233,17 @@ impl Pulse {
     }
     pub fn beat(&self) {
         *self.beats.lock().unwrap() += 1;
-        self.beat.notify_all();
+        self.beaten.notify_waiters();
     }
     /// Until a beat after `seen`, for at most `at_most`.
-    pub fn wait(&self, seen: u64, at_most: Duration) {
-        let beats = self.beats.lock().unwrap();
-        drop(self.beat.wait_timeout_while(beats, at_most, |beats| *beats == seen));
+    async fn changed(&self, seen: u64, at_most: Duration) {
+        let beaten = self.beaten.notified();
+        tokio::pin!(beaten);
+        beaten.as_mut().enable();
+        if self.seen() != seen {
+            return;
+        }
+        let _ = tokio::time::timeout(at_most, beaten).await;
     }
 }
 
@@ -302,7 +386,6 @@ struct Object<'a> {
     cell: Arc<Cell>,
     /// Its end was told to the feed.
     told: AtomicBool,
-    cache: Option<(CacheKind, CacheTrust)>,
     path: PathBuf,
     file: File,
     /// A source download's kept file and record, in place of a temp file.
@@ -315,6 +398,8 @@ struct Object<'a> {
     units: Mutex<HashMap<u64, (u64, usize)>>,
     /// Where the origin last redirected this object's URL, asked directly until refused.
     delivery: Mutex<Option<String>>,
+    /// The pull stood still on it: its next ask holds a URL minted afresh.
+    remint: AtomicBool,
     /// Bytes requests wrote for it, bytes asked twice included.
     moved: AtomicU64,
 }
@@ -338,6 +423,8 @@ struct Chunk<'a> {
     stated: bool,
     /// The origin refused the URL the last ask held, with this status.
     stale: Option<u16>,
+    /// This ask's URL was minted afresh for it: the origin's refusal of it is final.
+    fresh: bool,
     /// Times this range was dropped. Each doubles what the next ask is given before it is
     /// judged, so an origin that is honestly slow still answers.
     drops: u32,
@@ -358,10 +445,22 @@ impl<'a> Chunk<'a> {
 }
 
 /// A request on the wire, as the watch sees it.
+/// How far one request may go and how far it has come. An idle worker takes the back half of
+/// what a running request still has to bring, so the last objects of a download are many
+/// requests side by side, not one slow one: no byte is asked twice.
+struct Reach {
+    end: AtomicU64,
+    received: AtomicU64,
+}
+
 struct Flight<'a> {
     attempt: Arc<Attempt>,
     subject: String,
     range: (u64, u64),
+    reach: Arc<Reach>,
+    /// The chunk the request serves, and whether its origin has yet to show it ranges.
+    unit: (u64, u64),
+    lead: bool,
     began: Instant,
     /// How many fair windows this request gets before it is judged.
     patience: u32,
@@ -414,6 +513,13 @@ impl From<Refusal> for Ended {
     }
 }
 
+/// A worker's next step, decided under the run's lock and taken outside it.
+enum Next<'a> {
+    Take(Option<Chunk<'a>>),
+    Open(Option<Opening<'a>>, u64),
+    Wait(u64, Duration),
+}
+
 struct State<'a> {
     queue: VecDeque<Chunk<'a>>,
     /// Objects a full descriptor table sent back, opened again first.
@@ -436,7 +542,6 @@ pub(crate) struct Download<'a> {
     pub ranged: bool,
     pub deadline: Deadline,
     pub ledger: &'a Ledger,
-    pub backfill: Option<&'a BackfillBatch<'a>>,
     /// A source download: objects kept on disk under their owner, resumable.
     pub keep: Option<&'a Keep<'a>>,
 }
@@ -447,8 +552,6 @@ struct Run<'r, 'a> {
     flights: Vec<Mutex<Option<Flight<'a>>>>,
     fetched: AtomicU64,
     bytes_moved: AtomicU64,
-    cached: AtomicU64,
-    bytes_cached: AtomicU64,
     requests: AtomicU64,
     restarts: AtomicU64,
     opened: AtomicU64,
@@ -462,19 +565,25 @@ struct Run<'r, 'a> {
     /// Bytes home in temp files and from the cache. A whole answer to a resumed range takes
     /// its object's bytes back out, so asking the same bytes forever is not progress.
     landed: AtomicU64,
-    writers: Writers,
+    /// Disk work under way: commits, admissions and writes.
+    local: AtomicUsize,
+    /// Bytes home in every download into this Store (`moved`).
+    everywhere: Arc<AtomicU64>,
 }
 
 impl<'a> Download<'a> {
     /// Download what the feed hands out with `streams` requests in flight, until it has
-    /// nothing more. `observer` hears the bytes home so far, on this thread.
+    /// nothing more. `observer` hears the bytes home so far, on this thread. The requests are
+    /// tasks on the network runtime, their blocking work on two small pools: the threads are
+    /// as many with 512 in flight as with one.
     pub fn run(
         &self,
         streams: usize,
         mut observer: Option<&mut dyn FetchObserver>,
     ) -> Result<WalkOutcome> {
         let began = Instant::now();
-        let streams = streams.max(1);
+        // More workers than the machine's budget would only hold objects open while they wait.
+        let streams = streams.clamp(1, in_flight().0);
         let run = Run {
             job: self,
             state: Mutex::new(State {
@@ -489,8 +598,6 @@ impl<'a> Download<'a> {
             flights: (0..streams).map(|_| Mutex::new(None)).collect(),
             fetched: AtomicU64::new(0),
             bytes_moved: AtomicU64::new(0),
-            cached: AtomicU64::new(0),
-            bytes_cached: AtomicU64::new(0),
             requests: AtomicU64::new(0),
             restarts: AtomicU64::new(0),
             opened: AtomicU64::new(0),
@@ -499,33 +606,32 @@ impl<'a> Download<'a> {
             minting: (0..streams).map(|_| AtomicU64::new(0)).collect(),
             minted: AtomicU64::new(0),
             landed: AtomicU64::new(0),
-            writers: Writers::new(),
+            local: AtomicUsize::new(0),
+            everywhere: moved(self.store),
         };
-        let streams = std::thread::scope(|scope| {
-            // A thread the container refuses to start is backpressure, never a panic: the
-            // queue runs on the streams that started, and a run none started fails. A stream
-            // that panics ends the run: its chunk would keep its peers waiting.
-            let mut started = 0;
-            while started < streams {
-                let (run, slot) = (&run, started);
-                let spawned = std::thread::Builder::new().spawn_scoped(scope, move || {
-                    if std::panic::catch_unwind(AssertUnwindSafe(|| run.work(slot))).is_err() {
-                        let refusal = Refusal { code: Code::IO_FAILED, detail: "a stream panicked".into() };
-                        run.fail(&mut run.state.lock().unwrap_or_else(PoisonError::into_inner), refusal);
-                    }
+        let writers = std::thread::scope(|scope| {
+            let pools = Pools {
+                writes: Offload::start(scope, WRITERS, "tensorfs-write"),
+                control: Offload::start(scope, CONTROL, "tensorfs-work"),
+            };
+            let ran = net::block_on(async {
+                // A stream that panics ends the walk: its chunk would keep its peers waiting.
+                let streams = (0..streams).map(|slot| {
+                    AssertUnwindSafe(run.work(&pools, slot)).catch_unwind().map(|worked| {
+                        if worked.is_err() {
+                            let refusal = Refusal { code: Code::IO_FAILED, detail: "a stream panicked".into() };
+                            run.fail(&mut run.state.lock().unwrap_or_else(PoisonError::into_inner), refusal);
+                        }
+                    })
                 });
-                if let Err(error) = spawned {
-                    if started == 0 {
-                        let detail = format!("no stream could start: {error}");
-                        let refusal = Refusal { code: Code::TRANSFER_FAILED, detail };
-                        run.fail(&mut run.state.lock().unwrap(), refusal);
-                    }
-                    break;
-                }
-                started += 1;
+                futures::future::join(futures::future::join_all(streams), run.watch(&mut observer)).await;
+            });
+            if let Err(refusal) = ran {
+                run.fail(&mut run.state.lock().unwrap(), refusal);
             }
-            run.watch(&mut observer);
-            started
+            pools.writes.close();
+            pools.control.close();
+            pools.writes.peak.load(Ordering::Relaxed)
         });
         if let Some(observer) = observer.as_mut() {
             observer.moved(run.landed.load(Ordering::Relaxed));
@@ -534,10 +640,8 @@ impl<'a> Download<'a> {
         let outcome = WalkOutcome {
             fetched: run.fetched.load(Ordering::Relaxed),
             bytes_moved: run.bytes_moved.load(Ordering::Relaxed),
-            cached: run.cached.load(Ordering::Relaxed),
-            bytes_cached: run.bytes_cached.load(Ordering::Relaxed),
             streams,
-            writers: run.writers.peak.load(Ordering::Relaxed),
+            writers,
             requests: run.requests.load(Ordering::Relaxed),
             restarts: run.restarts.load(Ordering::Relaxed),
         };
@@ -550,10 +654,9 @@ impl<'a> Download<'a> {
                 run.opened_bytes.load(Ordering::Relaxed)
             ),
             &format!(
-                "fetched={} cached={} moved={} seconds={:.1} streams={streams} writers={} \
-                 requests={} restarts={} outcome={}",
+                "fetched={} moved={} seconds={:.1} streams={streams} writers={} requests={} \
+                 restarts={} outcome={}",
                 outcome.fetched,
-                outcome.cached,
                 outcome.bytes_moved,
                 began.elapsed().as_secs_f64(),
                 outcome.writers,
@@ -570,19 +673,28 @@ impl<'a> Download<'a> {
 }
 
 impl<'a> Run<'_, 'a> {
-    fn work(&self, slot: usize) {
-        // Taken at the first chunk: a lasting download's idle workers hold no buffer.
-        let mut buffer = Vec::new();
-        while let Some(chunk) = self.take() {
+    async fn work<'s>(&'s self, pools: &Pools<'s>, slot: usize)
+    where
+        'a: 's,
+    {
+        while let Some(chunk) = self.take(pools).await {
             let object = Arc::clone(&chunk.object);
             let outcome = match chunk.first == chunk.end {
-                true => self.commit(&chunk.object),
-                false => {
-                    if buffer.is_empty() {
-                        buffer = vec![0u8; 256 << 10];
+                true => {
+                    let committing = Arc::clone(&object);
+                    match self.locally(pools.control.run(move || self.commit(&committing))).await {
+                        // A full descriptor table is backpressure: the commit waits a sample.
+                        Outcome::Fatal(refusal) if refusal.code == Code::FD_HEADROOM => {
+                            net::shed();
+                            let mut chunk = chunk;
+                            chunk.due = Instant::now() + self.job.ledger.sample();
+                            self.state.lock().unwrap().last = Some(refusal);
+                            Outcome::Again(vec![chunk])
+                        }
+                        outcome => outcome,
                     }
-                    self.request(slot, chunk, &mut buffer)
                 }
+                false => self.request(pools, slot, chunk).await,
             };
             let mut state = self.state.lock().unwrap();
             state.busy -= 1;
@@ -615,91 +727,174 @@ impl<'a> Run<'_, 'a> {
     /// The next chunk that is due, most urgent first. An object waiting to be opened that is
     /// more urgent than every due chunk is opened first and its chunks queued; with nothing
     /// to take or open, the worker waits for one to come due, back, or fed.
-    fn take(&self) -> Option<Chunk<'a>> {
+    async fn take<'s>(&'s self, pools: &Pools<'s>) -> Option<Chunk<'a>>
+    where
+        'a: 's,
+    {
         let feed = self.job.feed;
         loop {
-            // Read before looking: whatever changes after this beats, so no wake is missed.
-            let seen = feed.pulse().seen();
-            let mut state = self.state.lock().unwrap();
-            if state.failure.is_some() || state.done {
-                return None;
-            }
-            state.queue.retain(|chunk| !chunk.object.cell.gone());
-            let now = Instant::now();
-            let due = (state.queue.iter().enumerate())
-                .filter(|(_, chunk)| chunk.due <= now)
-                .min_by_key(|(at, chunk)| (chunk.object.cell.key(), *at))
-                .map(|(at, chunk)| (at, chunk.object.cell.key()));
-            let before = due.map_or(u64::MAX, |(_, key)| key);
-            let again = state.again.front().map(|opening| opening.cell.key());
-            let waiting = again.or_else(|| feed.waiting()).filter(|key| *key < before);
-            // Behind work waits while anything more urgent is out.
-            let next = waiting.or(due.map(|(_, key)| key));
-            let held = next.is_some_and(|key| key >> 62 == BEHIND >> 62) && self.urgent(&state);
-            if let (Some((at, _)), None, false) = (due, waiting, held) {
-                state.busy += 1;
-                return state.queue.remove(at);
-            }
-            if waiting.is_some() && !held {
-                let again = state.again.pop_front();
-                state.busy += 1;
-                drop(state);
-                let opening = match again {
-                    Some(again) => Ok(Some(again)),
-                    None => feed.open(before),
-                };
-                let opened = opening.map(|opening| opening.map(|opening| {
-                    let chunks = self.open(&opening);
-                    (opening, chunks)
-                }));
-                state = self.state.lock().unwrap();
-                state.busy -= 1;
-                match opened {
-                    Ok(None) => {}
-                    Ok(Some((_, Ok(chunks)))) => state.queue.extend(chunks),
-                    // A full descriptor table is backpressure: open it again a sample on.
-                    Ok(Some((opening, Err(refusal)))) if refusal.code == Code::FD_HEADROOM => {
-                        state.again.push_front(opening);
-                        state.last = Some(refusal);
-                        drop(state);
-                        feed.pulse().wait(feed.pulse().seen(), self.job.ledger.sample());
-                        continue;
+            match self.next() {
+                Next::Take(chunk) => return chunk,
+                Next::Wait(seen, wait) => feed.pulse().changed(seen, wait).await,
+                Next::Open(again, before) => {
+                    let opened = self.locally(pools.control.run(move || {
+                            let opening = match again {
+                                Some(again) => Ok(Some(again)),
+                                None => feed.open(before),
+                            };
+                            opening.map(|opening| opening.map(|opening| {
+                                let chunks = self.open(&opening);
+                                (opening, chunks)
+                            }))
+                        }))
+                        .await;
+                    if let Some(backoff) = self.opened(opened) {
+                        feed.pulse().changed(feed.pulse().seen(), backoff).await;
                     }
-                    Ok(Some((opening, Err(refusal)))) => {
-                        let refusal = named(refusal, &opening.grant.object.id());
-                        if feed.lasting() {
-                            opening.cell.leave();
-                            drop(state);
-                            feed.ended(&opening.grant.object, &opening.cell, Err(refusal));
-                            feed.pulse().beat();
-                            continue;
-                        }
-                        self.fail(&mut state, refusal);
-                    }
-                    Err(refusal) => self.fail(&mut state, refusal),
                 }
-                drop(state);
-                feed.pulse().beat();
-                continue;
             }
-            if state.queue.is_empty() && state.busy == 0 && feed.waiting().is_none() {
-                state.done = true;
-                drop(state);
-                feed.pulse().beat();
-                return None;
-            }
-            let wait = state
-                .queue
-                .iter()
-                .map(|chunk| chunk.due.saturating_duration_since(now))
-                .min()
-                .map_or(self.job.ledger.sample(), |due| {
-                    due.min(self.job.ledger.sample())
-                })
-                .max(Duration::from_millis(1));
-            drop(state);
-            feed.pulse().wait(seen, wait);
         }
+    }
+
+    /// Bytes home (negative: moved again), in this run and in its Store's count.
+    fn home(&self, bytes: i64) {
+        self.landed.fetch_add(bytes as u64, Ordering::Relaxed);
+        self.everywhere.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    /// `work` awaited as this run's own disk work: the watch does not count it as stillness.
+    async fn locally<T>(&self, work: impl std::future::Future<Output = T>) -> T {
+        self.local.fetch_add(1, Ordering::AcqRel);
+        let done = work.await;
+        self.local.fetch_sub(1, Ordering::AcqRel);
+        done
+    }
+
+    /// What a worker does next, decided under the run's lock: take a due chunk, open the
+    /// next object, or wait for a beat.
+    fn next(&self) -> Next<'a> {
+        let feed = self.job.feed;
+        // Read before looking: whatever changes after this beats, so no wake is missed.
+        let seen = feed.pulse().seen();
+        let mut state = self.state.lock().unwrap();
+        if state.failure.is_some() || state.done {
+            return Next::Take(None);
+        }
+        state.queue.retain(|chunk| !chunk.object.cell.gone());
+        let now = Instant::now();
+        let due = (state.queue.iter().enumerate())
+            .filter(|(_, chunk)| chunk.due <= now)
+            .min_by_key(|(at, chunk)| (chunk.object.cell.key(), *at))
+            .map(|(at, chunk)| (at, chunk.object.cell.key()));
+        let before = due.map_or(u64::MAX, |(_, key)| key);
+        let again = state.again.front().map(|opening| opening.cell.key());
+        let waiting = again.or_else(|| feed.waiting()).filter(|key| *key < before);
+        // Behind work waits while anything more urgent is out.
+        let next = waiting.or(due.map(|(_, key)| key));
+        let held = next.is_some_and(|key| key >> 62 == BEHIND >> 62) && self.urgent(&state);
+        if let (Some((at, _)), None, false) = (due, waiting, held) {
+            state.busy += 1;
+            return Next::Take(state.queue.remove(at));
+        }
+        if waiting.is_some() && !held {
+            state.busy += 1;
+            return Next::Open(state.again.pop_front(), before);
+        }
+        if let (None, false, Some(stolen)) = (due, held, self.steal()) {
+            state.busy += 1;
+            return Next::Take(Some(stolen));
+        }
+        if state.queue.is_empty() && state.busy == 0 && feed.waiting().is_none() {
+            state.done = true;
+            drop(state);
+            feed.pulse().beat();
+            return Next::Take(None);
+        }
+        let wait = (state.queue.iter())
+            .map(|chunk| chunk.due.saturating_duration_since(now))
+            .min()
+            .map_or(self.job.ledger.sample(), |due| due.min(self.job.ledger.sample()))
+            .max(Duration::from_millis(1));
+        Next::Wait(seen, wait)
+    }
+
+    /// With nothing else to do, the back half of the running request with the most still to
+    /// come: two requests then bring it side by side. A request with under two pieces left, an
+    /// origin not yet known to range, and an object nothing wants are left alone.
+    fn steal(&self) -> Option<Chunk<'a>> {
+        let (mut best, mut most) = (None, 2 * PIECE_BYTES);
+        for (slot, flight) in self.flights.iter().enumerate() {
+            let flight = flight.lock().unwrap();
+            let Some(flight) = flight.as_ref().filter(|f| !f.lead && !f.preempted && !f.object.cell.gone()) else {
+                continue;
+            };
+            let left = (flight.reach.end.load(Ordering::Acquire))
+                .saturating_sub(flight.reach.received.load(Ordering::Acquire));
+            if left >= most {
+                (best, most) = (Some(slot), left);
+            }
+        }
+        let flight = self.flights[best?].lock().unwrap();
+        let flight = flight.as_ref()?;
+        let end = flight.reach.end.load(Ordering::Acquire);
+        let received = flight.reach.received.load(Ordering::Acquire);
+        let split = (received + (end - received) / 2).next_multiple_of(64 << 10).min(end);
+        if split <= received || split >= end {
+            return None;
+        }
+        (flight.reach.end).compare_exchange(end, split, Ordering::AcqRel, Ordering::Acquire).ok()?;
+        let object = Arc::clone(&flight.object);
+        object.left.fetch_add(1, Ordering::AcqRel);
+        if let Some((_, out)) = object.units.lock().unwrap().get_mut(&flight.unit.0) {
+            *out += 1;
+        }
+        Some(Chunk {
+            object,
+            first: split,
+            end,
+            due: Instant::now(),
+            stated: false,
+            stale: None,
+            fresh: false,
+            drops: 0,
+            lead: false,
+            unit: flight.unit,
+        })
+    }
+
+    /// What opening an object gave, filed: its chunks queued, or its refusal told. A full
+    /// descriptor table is backpressure: the object is opened again after the backoff this
+    /// answers.
+    #[allow(clippy::type_complexity)]
+    fn opened(&self, opened: Result<Option<(Opening<'a>, Result<Vec<Chunk<'a>>>)>>) -> Option<Duration> {
+        let feed = self.job.feed;
+        let mut state = self.state.lock().unwrap();
+        state.busy -= 1;
+        match opened {
+            Ok(None) => {}
+            Ok(Some((_, Ok(chunks)))) => state.queue.extend(chunks),
+            Ok(Some((opening, Err(refusal)))) if refusal.code == Code::FD_HEADROOM => {
+                net::shed();
+                state.again.push_front(opening);
+                state.last = Some(refusal);
+                return Some(self.job.ledger.sample());
+            }
+            Ok(Some((opening, Err(refusal)))) => {
+                let refusal = named(refusal, &opening.grant.object.id());
+                if feed.lasting() {
+                    opening.cell.leave();
+                    drop(state);
+                    feed.ended(&opening.grant.object, &opening.cell, Err(refusal));
+                    feed.pulse().beat();
+                    return None;
+                }
+                self.fail(&mut state, refusal);
+            }
+            Err(refusal) => self.fail(&mut state, refusal),
+        }
+        drop(state);
+        feed.pulse().beat();
+        None
     }
 
     fn fail(&self, state: &mut State, refusal: Refusal) {
@@ -712,40 +907,14 @@ impl<'a> Run<'_, 'a> {
         }
     }
 
-    /// One object off the feed: answered by the mounted cache, or given a temp file and cut
-    /// into chunks.
+    /// One object off the feed, given a temp file (a source download's kept file) and cut into
+    /// chunks.
     fn open(&self, opening: &Opening<'a>) -> Result<Vec<Chunk<'a>>> {
         let job = self.job;
         let wanted = &opening.grant.object;
         let grant = opening.grant.clone();
         self.opened.fetch_add(1, Ordering::Relaxed);
         self.opened_bytes.fetch_add(wanted.length, Ordering::Relaxed);
-        let kind = Some(match grant.destination {
-            Destination::Manifest => CacheKind::Manifest,
-            Destination::Blob => CacheKind::Blob,
-        });
-        let mut cache = None;
-        let mounted = job.store.repo_cache().filter(|_| job.keep.is_none());
-        if let (Some(kind), Some(mounted)) = (kind, mounted) {
-            let mut trust = CacheTrust::Name;
-            match mounted.admit(job.store, kind, wanted)? {
-                CacheRead::Hit => {
-                    self.cached.fetch_add(1, Ordering::Relaxed);
-                    self.bytes_cached
-                        .fetch_add(wanted.length, Ordering::Relaxed);
-                    // Cached bytes never reach a socket, and they are progress too.
-                    job.ledger.moved(wanted.length);
-                    self.landed.fetch_add(wanted.length, Ordering::Relaxed);
-                    let cache = Ok((ObjectSource::Cache, wanted.length));
-                    job.feed.ended(wanted, &opening.cell, cache);
-                    return Ok(Vec::new());
-                }
-                // This read proved the cached bytes wrong: the backfill replaces them.
-                CacheRead::Corrupt => trust = CacheTrust::Rehash,
-                CacheRead::Missing | CacheRead::Unavailable => {}
-            }
-            cache = Some((kind, trust));
-        }
         let length = wanted.length;
         let (path, file, part, chunks) = match job.keep {
             Some(keep) => {
@@ -776,7 +945,6 @@ impl<'a> Run<'_, 'a> {
             supply: Arc::clone(&opening.supply),
             cell: Arc::clone(&opening.cell),
             told: AtomicBool::new(false),
-            cache,
             path,
             file,
             part,
@@ -789,6 +957,7 @@ impl<'a> Run<'_, 'a> {
                     .collect(),
             ),
             delivery: Mutex::new(None),
+            remint: AtomicBool::new(false),
             moved: AtomicU64::new(0),
         });
         let chunk = |(first, end)| Chunk {
@@ -798,6 +967,7 @@ impl<'a> Run<'_, 'a> {
             due: Instant::now(),
             stated: false,
             stale: None,
+            fresh: false,
             drops: 0,
             lead: !job.ranged,
             unit: (first, end),
@@ -852,6 +1022,7 @@ impl<'a> Run<'_, 'a> {
                 due: Instant::now(),
                 stated: false,
                 stale: None,
+                fresh: false,
                 drops: 0,
                 lead: false,
                 unit: (first, end),
@@ -892,24 +1063,40 @@ impl<'a> Run<'_, 'a> {
 
     /// One GET for a chunk, written at its offsets. Whatever ends it early, the bytes that
     /// landed stay and the rest goes back on the queue.
-    fn request(&self, slot: usize, mut chunk: Chunk<'a>, buffer: &mut [u8]) -> Outcome<'a> {
+    async fn request<'s>(&'s self, pools: &Pools<'s>, slot: usize, mut chunk: Chunk<'a>) -> Outcome<'a>
+    where
+        'a: 's,
+    {
         let job = self.job;
         let object = Arc::clone(&chunk.object);
         let wanted = &object.grant.object;
-        // The URL first: a wait on the hub is the hub's to judge, not this request's.
+        // The URL first: a wait on the hub is the hub's to judge, not this request's, and a
+        // wait for a free control thread is neither.
         let stale = chunk.stale.take();
-        let asked = self.began.elapsed();
-        self.minting[slot].store(asked.as_millis() as u64 + 1, Ordering::Release);
         let delivery = object.delivery.lock().unwrap().clone();
+        chunk.fresh = false;
         let url = match delivery.clone() {
             Some(delivery) => Ok(delivery),
-            None => (object.supply).url(object.at, wanted, stale.is_some(), job.ledger),
+            None => {
+                let minting = Arc::clone(&object);
+                let stale = stale.is_some() || object.remint.swap(false, Ordering::AcqRel);
+                chunk.fresh = stale;
+                pools
+                    .control
+                    .run(move || {
+                        let asked = self.began.elapsed();
+                        self.minting[slot].store(asked.as_millis() as u64 + 1, Ordering::Release);
+                        let url = minting.supply.url(minting.at, &minting.grant.object, stale, job.ledger);
+                        self.minting[slot].store(0, Ordering::Release);
+                        let now = self.began.elapsed();
+                        if now - asked >= job.ledger.sample() {
+                            self.minted.fetch_max(now.as_millis() as u64, Ordering::AcqRel);
+                        }
+                        url
+                    })
+                    .await
+            }
         };
-        self.minting[slot].store(0, Ordering::Release);
-        if self.began.elapsed() - asked >= job.ledger.sample() {
-            let now = self.began.elapsed().as_millis() as u64;
-            self.minted.fetch_max(now, Ordering::AcqRel);
-        }
         let url = match (url, stale) {
             (Ok(url), _) => Ok(url),
             (Err(_), _) if self.stopped().is_some() => {
@@ -928,8 +1115,7 @@ impl<'a> Run<'_, 'a> {
         };
         let url = match url {
             Ok(url) => url,
-            // The link's or the hub's weather is asked again a sample on: a lasting download's
-            // objects end on measured stillness, never on a blip.
+            // The link's or the hub's weather is asked again a sample on.
             Err(refusal) if job.feed.lasting() && matches!(refusal.code, Code::TRANSFER_FAILED | Code::HUB_UNREACHABLE) => {
                 chunk.due = Instant::now() + job.ledger.sample();
                 self.state.lock().unwrap().last = Some(named(refusal, &wanted.id()));
@@ -937,14 +1123,22 @@ impl<'a> Run<'_, 'a> {
             }
             Err(refusal) => return Outcome::Fatal(refusal),
         };
+        // One of the machine's requests in flight, held to this request's end.
+        let Ok(_flying) = in_flight().1.acquire().await else {
+            return Outcome::Stop(Refusal { code: Code::TRANSFER_FAILED, detail: "the request budget closed".into() });
+        };
         let attempt = Arc::new(Attempt::default());
         let ledger = job.ledger.for_request(Arc::clone(&attempt), self.tick());
         let began = Instant::now();
         let asked = (chunk.first, chunk.end);
+        let reach = Arc::new(Reach { end: AtomicU64::new(chunk.end), received: AtomicU64::new(chunk.first) });
         *self.flights[slot].lock().unwrap() = Some(Flight {
             attempt: Arc::clone(&attempt),
             subject: decisions::object(wanted),
             range: asked,
+            reach: Arc::clone(&reach),
+            unit: chunk.unit,
+            lead: chunk.lead,
             began,
             patience: 1 << chunk.drops.min(6),
             judged: None,
@@ -953,7 +1147,7 @@ impl<'a> Run<'_, 'a> {
             preempted: false,
         });
         self.requests.fetch_add(1, Ordering::Relaxed);
-        let ended = self.stream(&mut chunk, &url, delivery.is_some(), &ledger, buffer);
+        let ended = self.stream(pools, &mut chunk, &url, delivery.is_some(), &ledger, &reach).await;
         let preempted = (self.flights[slot].lock().unwrap().take()).is_some_and(|f| f.preempted);
         self.show(&attempt, began, asked);
         // Nothing wants it any more: what landed goes with its temp file.
@@ -1048,17 +1242,22 @@ impl<'a> Run<'_, 'a> {
     }
 
     /// Ask for `chunk` and write what arrives, advancing `chunk.first` as bytes land.
-    fn stream(
-        &self,
+    async fn stream<'s>(
+        &'s self,
+        pools: &Pools<'s>,
         chunk: &mut Chunk<'a>,
         url: &str,
         delivered: bool,
         ledger: &Ledger,
-        buffer: &mut [u8],
-    ) -> std::result::Result<(), Ended> {
+        reach: &Reach,
+    ) -> std::result::Result<(), Ended>
+    where
+        'a: 's,
+    {
         let job = self.job;
-        let object = &chunk.object;
+        let object = Arc::clone(&chunk.object);
         let wanted = &object.grant.object;
+        let lead = chunk.lead;
         // A Hub object that is one chunk is one plain GET. A source request always names its
         // range: a 206 is how the origin says it ranges, and its stand-ins answer only ranges.
         let whole = chunk.first == 0 && chunk.end == wanted.length;
@@ -1067,16 +1266,8 @@ impl<'a> Run<'_, 'a> {
             format!("bytes={}-{}", chunk.first, chunk.end - 1),
         )];
         let mut hops = Vec::new();
-        let opened = open_object(
-            shared_client(),
-            url,
-            object.supply.policy(),
-            object.supply.credential(),
-            job.deadline,
-            ledger,
-            if whole && job.ranged { &[] } else { &range },
-            &mut |checked, _| hops.push(checked.url()),
-        )?;
+        let asked: &[(String, String)] = if whole && job.ranged { &[] } else { &range };
+        let opened = open_object(pools, url, &object, ledger, asked, &mut hops).await?;
         // A redirect target that refuses is forgotten, and the object's URL asked again.
         if delivered && !matches!(opened, Opened::Body(_) | Opened::Retryable(..)) {
             *object.delivery.lock().unwrap() = None;
@@ -1102,13 +1293,20 @@ impl<'a> Run<'_, 'a> {
                 let stated = stated.filter(|wait| Instant::now().checked_add(*wait).is_some());
                 return Err(Ended::Retry(answered, stated));
             }
-            // The signature was refused: the next ask re-authorizes, if that is honest.
+            // Refused: the next ask holds a URL minted afresh, and a refusal of that is the
+            // origin's verdict.
             Opened::Expired(status) => {
-                chunk.stale = Some(status);
                 let answered = Refusal {
                     code: Code::TRANSFER_FAILED,
                     detail: format!("the object store answered {status}"),
                 };
+                if chunk.fresh {
+                    return Err(Ended::Fatal(Refusal {
+                        detail: format!("{} to a URL minted afresh", answered.detail),
+                        ..answered
+                    }));
+                }
+                chunk.stale = Some(status);
                 return Err(Ended::Retry(answered, Some(Duration::ZERO)));
             }
             // An origin's own answer no retry can change is a fact, not weather.
@@ -1145,7 +1343,7 @@ impl<'a> Run<'_, 'a> {
                 // What this chunk's earlier asks moved is moved again.
                 let again = chunk.first - chunk.unit.0;
                 job.store.discarded(again);
-                self.landed.fetch_sub(again, Ordering::Relaxed);
+                self.home(-(again as i64));
                 chunk.first = 0;
                 if chunk.lead {
                     chunk.end = wanted.length;
@@ -1168,34 +1366,72 @@ impl<'a> Run<'_, 'a> {
                 }));
             }
         }
-        let mut body = response.into_body();
-        while chunk.first < chunk.end {
-            let want = (chunk.end - chunk.first).min(buffer.len() as u64) as usize;
-            let read = body.read_refusing(&mut buffer[..want])?;
-            if read == 0 {
-                return Err(Ended::Retry(
-                    Refusal {
-                        code: Code::TRANSFER_FAILED,
-                        detail: format!(
-                            "the origin closed its answer {} B short",
-                            chunk.end - chunk.first
-                        ),
-                    },
-                    None,
-                ));
+        let mut body = response.body;
+        // A lead chunk the origin answered whole now reaches the object's end; no other range
+        // is reset, as an idle worker may already have taken its back (`Run::steal`).
+        if lead {
+            reach.end.store(chunk.end, Ordering::Release);
+        }
+        let asked_end = chunk.end;
+        // Frames gather into one write of up to `WRITE_BYTES`, handed to the write pool.
+        let mut gathered: Vec<u8> = Vec::new();
+        while chunk.first < reach.end.load(Ordering::Acquire) {
+            // A body that fails still keeps what it gave: the next ask is for the rest.
+            let (data, failed) = match body.chunk().await {
+                Ok(data) => (data, None),
+                Err(refusal) => (None, Some(refusal)),
+            };
+            let ended = data.is_none();
+            if let Some(data) = &data {
+                let left = reach.end.load(Ordering::Acquire).saturating_sub(chunk.first) as usize;
+                let taken = data.len().min(left.saturating_sub(gathered.len()));
+                gathered.extend_from_slice(&data[..taken]);
+                reach.received.store(chunk.first + gathered.len() as u64, Ordering::Release);
+                // A steal that raced this frame: the bytes past its new end are the thief's.
+                let end = reach.end.load(Ordering::Acquire);
+                gathered.truncate(end.saturating_sub(chunk.first) as usize);
+                self.home(taken as i64);
             }
-            if let Err(error) = self
-                .writers
-                .write(&object.file, &buffer[..read], chunk.first)
-            {
-                return Err(Ended::Fatal(crate::store::classify_io(format!("write {}", object.path.display()), error)));
+            chunk.end = reach.end.load(Ordering::Acquire);
+            let full = chunk.first + gathered.len() as u64 >= chunk.end;
+            if !gathered.is_empty() && (gathered.len() >= WRITE_BYTES || full || ended) {
+                let bytes = std::mem::take(&mut gathered);
+                let (file, offset, length) = (Arc::clone(&object), chunk.first, bytes.len() as u64);
+                let written = self.locally(pools.writes.run(move || file.file.write_all_at(&bytes, offset))).await;
+                written.map_err(|error| {
+                    Ended::Fatal(crate::store::classify_io(format!("write {}", object.path.display()), error))
+                })?;
+                self.wrote(chunk, &object, length);
             }
-            chunk.first += read as u64;
-            object.moved.fetch_add(read as u64, Ordering::Relaxed);
-            self.landed.fetch_add(read as u64, Ordering::Relaxed);
-            job.store.moved(read as u64);
+            if let Some(refusal) = failed {
+                return Err(Ended::from(refusal));
+            }
+            if ended {
+                break;
+            }
+        }
+        chunk.end = reach.end.load(Ordering::Acquire);
+        if chunk.first < chunk.end {
+            return Err(Ended::Retry(
+                Refusal {
+                    code: Code::TRANSFER_FAILED,
+                    detail: format!("the origin closed its answer {} B short", chunk.end - chunk.first),
+                },
+                None,
+            ));
+        }
+        // Its end read, the connection serves the next ask; a range cut short leaves it.
+        if chunk.end == asked_end {
+            let _ = body.chunk().await;
         }
         Ok(())
+    }
+
+    /// `bytes` more of `chunk` are written: the chunk advances.
+    fn wrote(&self, chunk: &mut Chunk<'a>, object: &Object<'a>, bytes: u64) {
+        chunk.first += bytes;
+        object.moved.fetch_add(bytes, Ordering::Relaxed);
+        self.job.store.moved(bytes);
     }
 
     /// Every chunk is home: hash the file and commit it at the digest it hashed to.
@@ -1239,6 +1475,9 @@ impl<'a> Run<'_, 'a> {
         // Wrong bytes are the door's verdict on the origin: nothing is asked again, and a
         // kept download starts over the next time it is asked for.
         if let Err(refusal) = admitted {
+            if refusal.code == Code::FD_HEADROOM {
+                return Outcome::Fatal(refusal);
+            }
             job.store.discarded(moved);
             if let (Some(part), Some(keep), Code::OBJECT_ID_MISMATCH) =
                 (&object.part, job.keep, refusal.code)
@@ -1258,10 +1497,6 @@ impl<'a> Run<'_, 'a> {
         job.ledger.answered();
         self.fetched.fetch_add(1, Ordering::Relaxed);
         self.bytes_moved.fetch_add(moved, Ordering::Relaxed);
-        if let (Some((kind, trust)), Some(backfill)) = (object.cache, job.backfill) {
-            // Local admission is complete; replication never delays this object's report.
-            backfill.offer(kind, wanted, trust);
-        }
         if !object.told.swap(true, Ordering::AcqRel) {
             job.feed.ended(wanted, &object.cell, Ok((ObjectSource::Origin, moved)));
         }
@@ -1327,24 +1562,28 @@ impl<'a> Run<'_, 'a> {
     /// since its window began, never history, so a pod whose every request is slow drops
     /// none. And the pull's own end: nothing new has landed for twice its measured patience.
     /// Between those, every beat gives waiting work its way ([`Run::preempt`]).
-    fn watch(&self, observer: &mut Option<&mut dyn FetchObserver>) {
+    async fn watch(&self, observer: &mut Option<&mut dyn FetchObserver>) {
         let job = self.job;
         let pulse = job.feed.pulse();
         let sample = self.tick();
-        // The most bytes ever home, and when that last grew while requests were being asked.
+        // The most bytes ever home, and when that last grew while requests were being asked;
+        // what the process and this run then had home, and whether this run has since asked
+        // again with fresh URLs.
         let (mut most, mut grew) = (0, Instant::now());
+        let (mut since, mut reasked) = ((self.everywhere.load(Ordering::Relaxed), 0), false);
         let mut judge = Instant::now() + sample;
         loop {
             let seen = pulse.seen();
-            let state = self.state.lock().unwrap();
-            if state.done || state.failure.is_some() {
-                return;
+            {
+                let state = self.state.lock().unwrap();
+                if state.done || state.failure.is_some() {
+                    return;
+                }
+                self.preempt(&state);
             }
-            self.preempt(&state);
-            drop(state);
             let left = judge.saturating_duration_since(Instant::now());
             if !left.is_zero() {
-                pulse.wait(seen, left);
+                pulse.changed(seen, left).await;
                 continue;
             }
             judge = Instant::now() + sample;
@@ -1489,7 +1728,13 @@ impl<'a> Run<'_, 'a> {
                 since != 0 && elapsed - Duration::from_millis(since - 1) >= sample
             });
             if landed > most || !asking || on_hub {
-                (most, grew) = (most.max(landed), now);
+                reasked &= landed <= most;
+                (most, grew, since) = (most.max(landed), now, (self.everywhere.load(Ordering::Relaxed), landed));
+                continue;
+            }
+            // This run's own disk work (a commit's hash and fsync, an admission, a write) is
+            // not the origin standing still: the verdict waits for it, and still counts.
+            if self.local.load(Ordering::Acquire) > 0 {
                 continue;
             }
             let minted = self.began + Duration::from_millis(self.minted.load(Ordering::Acquire));
@@ -1514,21 +1759,56 @@ impl<'a> Run<'_, 'a> {
                     self.fail(&mut state, refusal);
                     return;
                 }
-                // A lasting download loses what it was asking for, and goes on.
-                let refusal = Refusal { code: Code::STALLED, ..refusal };
-                let mut asked: Vec<Arc<Object<'a>>> =
-                    (state.queue.iter()).map(|chunk| Arc::clone(&chunk.object)).collect();
-                for flight in &self.flights {
-                    if let Some(flight) = flight.lock().unwrap().as_ref() {
-                        asked.push(Arc::clone(&flight.object));
+                let elsewhere = self.everywhere.load(Ordering::Relaxed).wrapping_sub(since.0) as i64
+                    > landed.wrapping_sub(since.1) as i64;
+                let verdict = if elsewhere || !reasked { "reask" } else { "stalled" };
+                decisions::record(
+                    job.store,
+                    verdict,
+                    "run",
+                    &format!(
+                        "still_s={:.1} patience_s={:.1} home={most} elsewhere={elsewhere}",
+                        grew.elapsed().as_secs_f64(),
+                        patience.as_secs_f64(),
+                    ),
+                );
+                if elsewhere || !reasked {
+                    // Asked again for what it was asking for, each URL minted afresh, for as
+                    // long as anything else moves, and once when nothing does.
+                    state.last = Some(refusal);
+                    let now = Instant::now();
+                    for chunk in state.queue.iter_mut().filter(|chunk| chunk.first < chunk.end) {
+                        (chunk.due, chunk.stated) = (now, false);
+                        chunk.object.remint.store(true, Ordering::Release);
                     }
-                }
-                for object in asked {
-                    self.refused(&mut state, &object, named(refusal.clone(), &object.grant.object.id()));
+                    for flight in &self.flights {
+                        if let Some(flight) = flight.lock().unwrap().as_mut() {
+                            flight.attempt.stopped.store(true, Ordering::Release);
+                            *flight.object.delivery.lock().unwrap() = None;
+                            flight.object.remint.store(true, Ordering::Release);
+                        }
+                    }
+                    job.ledger.condemned();
+                    reasked = true;
+                } else {
+                    // Nothing in the process moves, even on fresh URLs: what this run was
+                    // asking for is refused, and the download goes on.
+                    let refusal = Refusal { code: Code::STALLED, ..refusal };
+                    let mut asked: Vec<Arc<Object<'a>>> =
+                        (state.queue.iter()).map(|chunk| Arc::clone(&chunk.object)).collect();
+                    for flight in &self.flights {
+                        if let Some(flight) = flight.lock().unwrap().as_ref() {
+                            asked.push(Arc::clone(&flight.object));
+                        }
+                    }
+                    for object in asked {
+                        self.refused(&mut state, &object, named(refusal.clone(), &object.grant.object.id()));
+                    }
+                    reasked = false;
                 }
                 drop(state);
                 pulse.beat();
-                (most, grew) = (landed, Instant::now());
+                (most, grew, since) = (landed, Instant::now(), (self.everywhere.load(Ordering::Relaxed), landed));
             }
         }
     }
@@ -1570,6 +1850,99 @@ impl Read for Verifying<'_> {
         self.at += read as u64;
         Ok(read)
     }
+}
+
+enum Opened<'l> {
+    Body(net::Response<'l>),
+    /// A transient answer, and the wait the origin stated for it, if any.
+    Retryable(u16, Option<Duration>),
+    /// The origin refused the URL (401, 403, 404): asked again with one minted afresh.
+    Expired(u16),
+    Refused(Refusal),
+}
+
+/// One GET of `object`, redirect hops walked BY HAND so every hop faces the same predicate
+/// and the credential is re-asked per host (a scoped credential cannot leak onto a CDN).
+/// `extra` (a range) follows the credential. Each hop's URL joins `hops`.
+async fn open_object<'l, 's, 'a: 's>(
+    pools: &Pools<'s>,
+    url: &str,
+    object: &Arc<Object<'a>>,
+    ledger: &'l Ledger,
+    extra: &[(String, String)],
+    hops: &mut Vec<String>,
+) -> Result<Opened<'l>> {
+    let mut target = url.to_string();
+    let redirects = object.supply.policy().max_redirects;
+    for _hop in 0..=redirects {
+        let (supply, asked) = (Arc::clone(&object.supply), target.clone());
+        let checked = Arc::new(pools.control.run(move || supply.policy().check(&asked)).await?);
+        let mut retried = false;
+        let response = loop {
+            let (supply, url) = (Arc::clone(&object.supply), Arc::clone(&checked));
+            let presented = pools
+                .control
+                .run(move || supply.credential().headers(&Ask { method: "GET", url: &url }))
+                .await;
+            let headers: Vec<(String, String)> = presented.iter().chain(extra).cloned().collect();
+            let response = net::get(shared_client(), &checked, &headers, ledger, Judge::Stream, Code::TRANSFER_FAILED).await?;
+            let again = !retried && {
+                let (supply, url, status) = (Arc::clone(&object.supply), Arc::clone(&checked), response.status);
+                let answered = response.headers().to_vec();
+                pools
+                    .control
+                    .run(move || {
+                        let answer = Answer::of(status, &answered, &presented);
+                        supply.credential().answered(&Ask { method: "GET", url: &url }, &answer)
+                    })
+                    .await
+            };
+            if !again {
+                break response;
+            }
+            retried = true;
+            response.discard().await;
+        };
+        let status = response.status;
+        hops.push(checked.url());
+        if (300..400).contains(&status) {
+            let Some(location) = response.header("location").map(str::to_string) else {
+                return refuse(Code::REDIRECT_REFUSED, "origin redirected with no Location");
+            };
+            let Some(absolute) = absolute_location(&checked, &location) else {
+                return refuse(Code::REDIRECT_REFUSED, "origin redirected with an unusable Location");
+            };
+            if redirects == 0 {
+                return refuse(
+                    Code::REDIRECT_REFUSED,
+                    "a presigned GET has no business redirecting, and following one would open \
+                     a URL the predicate never saw",
+                );
+            }
+            target = absolute;
+            response.discard().await;
+            continue;
+        }
+        if status == 200 || status == 206 {
+            return Ok(Opened::Body(response));
+        }
+        if RETRYABLE_STATUS.contains(&status) {
+            let wait = response.stated_wait();
+            response.discard().await;
+            return Ok(Opened::Retryable(status, wait));
+        }
+        if matches!(status, 401 | 403 | 404) {
+            return Ok(Opened::Expired(status));
+        }
+        return Ok(Opened::Refused(Refusal {
+            code: Code::TRANSFER_FAILED,
+            detail: format!("the object store answered {status}"),
+        }));
+    }
+    refuse(
+        Code::REDIRECT_REFUSED,
+        format!("more than {redirects} redirect hop(s); a longer chain is a loop or an evasion"),
+    )
 }
 
 /// One figure of a peer, and whether it is only a floor.
@@ -1645,7 +2018,6 @@ pub fn fetch_ranged(
         ranged: false,
         deadline,
         ledger,
-        backfill: None,
         keep: None,
     }
     .run(batch.streams(ranged.streams.clamp(1, 64), chunk), observer)?;

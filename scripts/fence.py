@@ -26,6 +26,7 @@ DENY = ["torch", "cudarc", "cust", "tch", "reqwest", "hyper", "ureq", "curl", "o
 ALLOW = {
     "rustls": ("crates/tensorfs-core/Cargo.toml", "crates/tensorfs-core/src/transport/"),
     "webpki": ("crates/tensorfs-core/Cargo.toml", "crates/tensorfs-core/src/transport/"),
+    "hyper": ("crates/tensorfs-core/Cargo.toml", "crates/tensorfs-core/src/transport/"),
 }
 SCAN = ["crates/*/Cargo.toml", "crates/*/src/**/*.rs"]
 RANK = {"tensorfs-core": 0, "tensorfs-plane": 1, "tensorfs-py": 2}
