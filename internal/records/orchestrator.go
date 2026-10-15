@@ -64,7 +64,7 @@ CREATE TABLE IF NOT EXISTS requests (
   attention_kernel TEXT NOT NULL DEFAULT '',
   gpus INTEGER NOT NULL DEFAULT 0,
   models       TEXT    NOT NULL DEFAULT '[]',
-  weights_outputs TEXT NOT NULL DEFAULT '[]',
+  writes_weights INTEGER NOT NULL DEFAULT 0,
   control_revision INTEGER NOT NULL DEFAULT 0 CHECK(control_revision>=0),
   parent_request_id TEXT NOT NULL DEFAULT '',
   parent_call_index INTEGER NOT NULL DEFAULT -1 CHECK(parent_call_index>=-1 AND parent_call_index<4294967296),
@@ -441,6 +441,8 @@ type Request struct {
 	// NeedsAccelerator is the function's declared machine class: false only for
 	// `accelerator=False`.
 	NeedsAccelerator bool
+	// WritesWeights says the function declares weights outputs: a conversion.
+	WritesWeights bool
 	// Worker names an ATTACHED remote worker (a rental id) this request must run on.
 	// It lives on the request because a requeue must re-derive the same placement
 	// without a client saying so again. Empty = any local worker.
@@ -873,7 +875,7 @@ const requestCols = `id,idem_key,body_digest,package,entrypoint,plan_id,package_
 	installation_id,payload,outputs,
 	state,ordinal,created_at,kind,needs_accelerator,worker,machine,rental,rental_required,
 	COALESCE(install_id,''),assets,capture,attention_kernel,models,control_revision,
-	parent_request_id,parent_call_index,child_intent_digest,child_target_digest,child_reusable,reused_from,orchestration_directive,child_artifacts,requested_rental,rent_new,hub,gpus`
+	parent_request_id,parent_call_index,child_intent_digest,child_target_digest,child_reusable,reused_from,orchestration_directive,child_artifacts,requested_rental,rent_new,hub,gpus,writes_weights`
 
 func requestScanTargets(r *Request, assets, models *string) []any {
 	return []any{&r.ID, &r.IdemKey, &r.BodyDigest, &r.Package, &r.Entrypoint, &r.PlanID,
@@ -882,7 +884,7 @@ func requestScanTargets(r *Request, assets, models *string) []any {
 		&r.State, &r.Ordinal, &r.CreatedAt,
 		&r.Kind, &r.NeedsAccelerator, &r.Worker, &r.Machine, &r.Rental, &r.RentalRequired,
 		&r.InstallID, assets, &r.Capture, &r.AttentionKernel, models, &r.ControlRevision,
-		&r.ParentRequestID, &r.ParentCallIndex, &r.ChildIntentDigest, &r.ChildTargetDigest, &r.ChildReusable, &r.ReusedFrom, &r.OrchestrationDirective, &r.ChildArtifacts, &r.RequestedRental, &r.RentNew, &r.Hub, &r.GPUs}
+		&r.ParentRequestID, &r.ParentCallIndex, &r.ChildIntentDigest, &r.ChildTargetDigest, &r.ChildReusable, &r.ReusedFrom, &r.OrchestrationDirective, &r.ChildArtifacts, &r.RequestedRental, &r.RentNew, &r.Hub, &r.GPUs, &r.WritesWeights}
 }
 
 func finishRequestScan(r Request, assets, models string, err error) (Request, error) {
@@ -944,9 +946,11 @@ func (r Request) SizedByOwnModels() bool {
 }
 
 // ComposesChildren says the request's own execution may host managed children that need
-// capacity of their own; a request sized by its own slots holds them itself.
+// capacity of their own. A request sized by its own slots holds them itself, and a
+// conversion is sized by its own arguments alone: a lane write that reads its source raw
+// was once held to the serving components of its package's other functions.
 func (r Request) ComposesChildren() bool {
-	return !r.SizedByOwnModels()
+	return !r.SizedByOwnModels() && !r.WritesWeights
 }
 
 // RequestRow reads one request back. Requeue re-derives its dispatch from this row and
@@ -1500,9 +1504,9 @@ func submitRequestTx(tx *sql.Tx, r Request, assets, models, exportOutputs string
 		plan_id,package_release,local_installation_id,
 		local_package_uploaded_boot_id,installation_id,
 		payload,outputs,state,ordinal,created_at,kind,needs_accelerator,worker,machine,rental,rental_required,install_id,assets,attention_kernel,models,
-		control_revision,parent_request_id,parent_call_index,child_intent_digest,child_target_digest,child_reusable,reused_from,orchestration_directive,child_artifacts,requested_rental,rent_new,hub,gpus)
+		control_revision,parent_request_id,parent_call_index,child_intent_digest,child_target_digest,child_reusable,reused_from,orchestration_directive,child_artifacts,requested_rental,rent_new,hub,gpus,writes_weights)
 		VALUES(?,?,?,?,?,?,?,?,?,?,?,?, ?,0,?,?,?,?,
-		COALESCE((SELECT COALESCE(NULLIF(stable_machine_name,''),machine_name) FROM rentals WHERE id=?),''),?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		COALESCE((SELECT COALESCE(NULLIF(stable_machine_name,''),machine_name) FROM rentals WHERE id=?),''),?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		r.ID, r.IdemKey, r.BodyDigest, r.Package, r.Entrypoint, r.PlanID,
 		r.Release, r.LocalInstallationID,
 		r.LocalPackageUploadedBootID, r.InstallationID, r.Payload,
@@ -1511,7 +1515,7 @@ func submitRequestTx(tx *sql.Tx, r Request, assets, models, exportOutputs string
 		r.RentalRequired,
 		nullable(r.InstallID),
 		assets, r.AttentionKernel, models, r.ControlRevision,
-		r.ParentRequestID, r.ParentCallIndex, r.ChildIntentDigest, r.ChildTargetDigest, r.ChildReusable, r.ReusedFrom, blobOrEmpty(r.OrchestrationDirective), r.ChildArtifacts, r.RequestedRental, r.RentNew, r.Hub, r.GPUs); err != nil {
+		r.ParentRequestID, r.ParentCallIndex, r.ChildIntentDigest, r.ChildTargetDigest, r.ChildReusable, r.ReusedFrom, blobOrEmpty(r.OrchestrationDirective), r.ChildArtifacts, r.RequestedRental, r.RentNew, r.Hub, r.GPUs, r.WritesWeights); err != nil {
 		return Request{}, false, exit.Internalf("cannot record request %s: %s", r.ID, err)
 	}
 	if r.MachineExecutionObserver {

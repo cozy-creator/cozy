@@ -20,13 +20,13 @@ func TestMemoizedCallsAreAnsweredFromTheMachinesMemo(t *testing.T) {
 		Memoized    bool   `json:"memoized"`
 		Computation string `json:"computation"`
 	}
-	// survey runs one job and returns its squares and its calls as `run show --json` shows them.
+	// survey runs once and returns its squares and its calls as `run show --json` shows them.
 	survey := func(values ...int) ([]int, []shownCall) {
 		t.Helper()
 		in := filepath.Join(t.TempDir(), "req.json")
 		raw, _ := json.Marshal(map[string]any{"values": values, "counter": counter})
 		must(t, os.WriteFile(in, raw, 0o600))
-		code, out := runCozy(t, root, "run", "local/tensord-cpu-memo/survey", "--input", in, "--await", "--json")
+		code, out := runCozy(t, root, "run", "local/tensord-cpu-memo/survey", "--input", in, "--await", "--json", "--fields=id,status,result")
 		var run struct {
 			ID     string `json:"id"`
 			Result struct {

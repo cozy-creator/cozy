@@ -58,6 +58,8 @@ type Submission struct {
 	// NeedsAccelerator is the function's declared machine class: false only for
 	// `accelerator=False`. It is the only machine-class decision retained on a request.
 	NeedsAccelerator bool
+	// WritesWeights says the function declares weights outputs.
+	WritesWeights bool
 
 	// Warnings are recorded with the request, one request.warning event each.
 	Warnings []records.Warning
@@ -243,7 +245,7 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 		LocalInstallationID: s.LocalInstallationID,
 		Outputs:             strings.Join(s.Outputs, ","),
 		Assets:              s.Assets,
-		Kind:                s.Kind, NeedsAccelerator: s.NeedsAccelerator,
+		Kind:                s.Kind, NeedsAccelerator: s.NeedsAccelerator, WritesWeights: s.WritesWeights,
 		RequestedRental: s.RequestedRental,
 		AttentionKernel: s.AttentionKernel, GPUs: s.GPUs,
 		Worker: s.Worker, InstallID: s.InstallID, Rental: s.Rental,

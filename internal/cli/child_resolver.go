@@ -11,11 +11,11 @@ import (
 // a package whose captured bindings are the calls it makes is a composition root, so one that
 // writes weights still reserves capacity for its children.
 func (r *Resolver) composesChildren(request records.Request) (bool, *exit.Error) {
-	if request.InstallID == "" {
+	if request.InstallID == "" || request.SizedByOwnModels() {
 		return false, nil
 	}
-	if request.ComposesChildren() || request.SizedByOwnModels() {
-		return request.ComposesChildren(), nil
+	if request.ComposesChildren() {
+		return true, nil
 	}
 	return r.store.HasChildBindings(request.InstallID)
 }
