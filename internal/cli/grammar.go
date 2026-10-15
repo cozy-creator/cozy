@@ -356,7 +356,7 @@ type ModelCmd struct {
 	Download ModelDownloadCmd `cmd:"" help:"Download a model into a local destination or an owned rental store."`
 	List     ModelListCmd     `cmd:"" help:"List local model releases."`
 	Upload   ModelUploadCmd   `cmd:"" help:"Ingest a model with its required metadata and upload an owner-only checkpoint."`
-	Quantize ModelQuantizeCmd `cmd:"" help:"Write a model's fp8, mxfp8 or int8 lane with the package that serves it, as an owner-only checkpoint."`
+	Quantize ModelQuantizeCmd `cmd:"" help:"Write a model's int8 or fp8 lane with the package that serves it, as an owner-only checkpoint."`
 	Publish  ModelPublishCmd  `cmd:"" help:"Update a release's mutable lane pointers."`
 	Retarget ModelRetargetCmd `cmd:"" help:"Move one existing release lane to another retained checkpoint."`
 	Yank     ModelYankCmd     `cmd:"" help:"Yank a model release."`
@@ -434,7 +434,6 @@ type ModelQuantizeCmd struct {
 	Model          string  `arg:"" name:"model" help:"Tensorhub model: org/name (its newest release), org/name@release/lane, or one checkpoint org/name#sha256:<checkpoint>. The machine fetches it if it does not hold it; no model download is needed first."`
 	Destination    string  `arg:"" optional:"" name:"destination" help:"Tensorhub repository (org/name) for the new checkpoint; default: the model's own."`
 	FP8            bool    `name:"fp8" help:"Write the fp8 lane (row-scaled FP8 weights)."`
-	MXFP8          bool    `name:"mxfp8" help:"Write the mxfp8 lane (block-scaled MXFP8 weights)."`
 	INT8           bool    `name:"int8" help:"Write the int8 lane (row-scaled INT8 weights; the fast lane on consumer cards)."`
 	Package        string  `help:"Package (org/name) whose quantizer to run; default: the installed package that serves this model."`
 	Rental         *string `predictor:"rental" help:"Run on this existing rental name or id; never buy a replacement. Default: this computer."`
@@ -449,7 +448,7 @@ func (c *ModelQuantizeCmd) Run(r *Runtime) error {
 		return problem
 	}
 	return r.call(handleModelQuantize, []string{c.Model, c.Destination}, bools(
-		"--fp8", c.FP8, "--mxfp8", c.MXFP8, "--int8", c.INT8, "--rental-only", c.RentalOnly, "--await", c.Await),
+		"--fp8", c.FP8, "--int8", c.INT8, "--rental-only", c.RentalOnly, "--await", c.Await),
 		values("--rental", rentalName, "--package", c.Package, "--idempotency-key", c.IdempotencyKey), false)
 }
 

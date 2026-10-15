@@ -51,13 +51,12 @@ func TestModelQuantizeRunsTheServingPackagesQuantizer(t *testing.T) {
 		detail.Release.PackageInterfaceLength = int64(len(iface))
 	})
 	for name, args := range map[string][]string{
-		"name the lane to write":            {"proof/source"},
-		"one run writes one lane":           {"proof/source", "--fp8", "--mxfp8"},
-		"no installed package quantizes":    {"proof/source", "--fp8"},
-		"proof/quantize 1.0.0 has no mxfp8": {"proof/source", "--mxfp8", "--package", "proof/quantize"},
-		"weights output named mxfp8":        {"proof/source", "--mxfp8", "--package", "proof/quantize"},
-		"proof/quantize 1.0.0 has no int8":  {"proof/source", "--int8", "--package", "proof/quantize"},
-		"is a local alias":                  {"local/source", "--fp8"},
+		"name the lane to write":           {"proof/source"},
+		"one run writes one lane":          {"proof/source", "--fp8", "--int8"},
+		"no installed package quantizes":   {"proof/source", "--fp8"},
+		"weights output named int8":        {"proof/source", "--int8", "--package", "proof/quantize"},
+		"proof/quantize 1.0.0 has no int8": {"proof/source", "--int8", "--package", "proof/quantize"},
+		"is a local alias":                 {"local/source", "--fp8"},
 	} {
 		if code, out := runCozy(t, root, append([]string{"model", "quantize", "--rental-only"}, args...)...); code == 0 || !strings.Contains(out, name) {
 			t.Fatalf("%v did not refuse with %q: %d %s", args, name, code, out)
