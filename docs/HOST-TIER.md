@@ -26,7 +26,11 @@ executor death and model switches. The host-tier implementation uses no CUDA or 
   too, never a session failure by itself. The executor either uses another supported granted
   source or reports that it cannot load the weight set. Legacy peers may use their older
   store-reading route; current managed Runtime requires owner-provided sources.
-- `sealed_prefetch` carries all of a construction's plans: each is opened and queued at once.
+- A checkpoint held in part (its structure, as preparation lands it): the filler fetches each
+  region's absent objects through the call's ticket (Now) and copies regions in order as they land;
+  `sealed_stage` stages in the order asked. A cold `sealed_tier` with nothing staged waits for nothing;
+  `object_files` waits for every object of its plan. A region that will never be copied is failed,
+  and its layout opened afresh on the next ask.
 
 ## Staged layouts (`host_tiers.staged/1`)
 

@@ -1,3 +1,4 @@
+pub mod access;
 pub mod adapter_views;
 mod archive;
 pub mod api;

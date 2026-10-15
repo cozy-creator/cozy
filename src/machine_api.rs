@@ -688,7 +688,7 @@ impl MachineBackend for NativeBackend {
                 .with_journal(|journal| journal.preparations_of(&actor, &installed.alias))
                 .map_err(problem)?;
             let downloaded = gpu.as_ref().is_some_and(|gpu| {
-                bound.iter().any(|bound| gpu.plan(bound).is_ok_and(|plan| gpu.holds(&plan)))
+                bound.iter().any(|bound| gpu.plan(bound).is_ok_and(|plan| gpu.downloaded(&plan)))
             });
             let base = match downloaded {
                 true => Level::Downloaded,

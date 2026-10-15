@@ -12,14 +12,14 @@ use crate::{
     journal::{CallMemo, Execution, Failure, InputFile, Installation, Outcome, Preparation, ResultRecord},
     local_source::LocalSources,
     objects::{Objects, Refused},
-    published::{declares_models, Named, Parts, Providers, Publisher, Request},
+    published::{declares_models, Providers, Publisher, Request},
     service::{Call, Service},
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde_json::{json, Value};
 use tensorfs_core::{ids::ObjectRef, transport::PullCancellation};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::HashMap,
     io,
     sync::{Arc, Mutex},
 };
@@ -273,12 +273,7 @@ impl Runs {
                     let stoppable = this.service.engine.stoppable(&run);
                     let outcome = this.prepare(&actor, &run, spec, &stoppable);
                     let ended = match outcome {
-                        Ok(None) => {
-                            if let Some(publisher) = &this.publisher {
-                                publisher.complete_behind(&this.service, &run);
-                            }
-                            Ok(())
-                        }
+                        Ok(None) => Ok(()),
                         Ok(Some(result)) => this
                             .service
                             .engine
@@ -376,7 +371,7 @@ impl Runs {
                 let named = crate::published::choose(choice, &choice.parameter, (&gpu, width))
                     .map_err(|(code, message)| refused(code, message))?;
                 let stage = format!("downloading {}", choice.repository);
-                let named = publisher.download(&self.service, hub_access()?, named, &spec.catalog_revision, false, stop, &|done, total| {
+                let named = publisher.download(&self.service, hub_access()?, named, &spec.catalog_revision, stop, &|done, total| {
                     observe(&stage, done, total)
                 })?;
                 let sha256 = named.manifest.trim_start_matches("sha256:").to_string();
@@ -709,7 +704,11 @@ impl Runs {
             rows.push(json!({"package": installation.package, "release": installation.release,
                 "entrypoint": item.entrypoint}));
             let held = self.service.catalog.resolve(&installation.generation)?;
-            members.push(Member::new(held, plan, item.level));
+            // A member's weights come under the warm run's access, after every run's.
+            let fetch = self.publisher.as_ref().zip(plan.as_ref()).map(|(publisher, plan)| {
+                crate::access::Fetch::new(publisher.store().clone(), hub.clone(), plan.manifests(), u64::MAX)
+            });
+            members.push(Member::new(held, plan, item.level, fetch));
         }
         self.service
             .engine
@@ -1014,7 +1013,12 @@ impl Runs {
                 Ok((installation, Some(plan))) if plan.degree > 0 && !plan.slots.is_empty() => {
                     match runs.service.catalog.resolve(&installation.generation)
                         .and_then(|held| held.application(&application)) {
-                        Ok(held) => gpu.prefetch(&runs.service.engine, held, plan, (root, family.clone()), owner.clone()),
+                        Ok(held) => {
+                            // Its weights come after its root's own, under the child's access.
+                            let hub = spec.hub.clone().or_else(|| runs.own_hub.clone());
+                            let fetch = crate::access::Fetch::new(gpu.store().clone(), hub, plan.manifests(), root);
+                            gpu.prefetch(&runs.service.engine, held, plan, (root, family.clone()), owner.clone(), fetch)
+                        }
                         Err(error) => eprintln!("prefetch of {entrypoint}: {error}"),
                     }
                 }
@@ -1030,50 +1034,20 @@ impl Runs {
         Ok(())
     }
 
-    /// Where a run's weights outputs go (the requester's repository, under its capability) and
-    /// how its sources held in part fetch what they lack, from the Hub each was resolved at.
-    pub fn weights_access(
-        &self,
-        id: &str,
-        plan: &crate::gpu_service::Plan,
-    ) -> io::Result<(Option<crate::weights::Destination>, Option<crate::weights::Fetch>)> {
-        let context = self.contexts.lock().unwrap().get(id).cloned();
-        let hub = context.as_ref().and_then(|c| c.hub.clone()).or_else(|| self.own_hub.clone());
-        let repository = context.map(|c| c.weights_destination).unwrap_or_default();
-        let destination = match (repository.is_empty(), &hub) {
-            (true, _) => None,
-            (false, Some(hub)) => Some(crate::weights::Destination { repository, hub: hub.clone() }),
-            (false, None) => {
-                return Err(io::Error::other(
-                    "a weights destination needs the run's Hub access, and the run has none",
-                ))
-            }
-        };
-        let origins: BTreeMap<String, (Named, Parts)> = plan
-            .sources
-            .iter()
-            .filter(|source| !source.repository.is_empty() && !source.repository.starts_with("local/"))
-            .map(|source| {
-                let named = Named {
-                    repository: source.repository.clone(),
-                    release: source.release.clone(),
-                    lane: source.lane.clone(),
-                    manifest: source.manifest.clone(),
-                };
-                (source.manifest.clone(), (named, Parts::default()))
-            })
-            .collect();
-        let fetch = match (&self.publisher, hub) {
-            (Some(publisher), Some(hub)) if !origins.is_empty() => {
-                let (publisher, service) = (publisher.clone(), self.service.clone());
-                Some(Arc::new(move |manifest: &ObjectRef, objects: &[ObjectRef]| {
-                    let (named, parts) = origins.get(&manifest.id()).ok_or("this source names no Hub checkpoint")?;
-                    publisher.fetch_part(&service, &hub, named, parts, objects).map_err(|(code, message)| format!("{code}: {message}"))
-                }) as crate::weights::Fetch)
-            }
-            _ => None,
-        };
-        Ok((destination, fetch))
+    /// Where a run's weights outputs go: the requester's repository, under its capability.
+    pub fn destination(&self, id: &str) -> io::Result<Option<crate::weights::Destination>> {
+        let repository = self.contexts.lock().unwrap().get(id).map(|c| c.weights_destination.clone()).unwrap_or_default();
+        match (repository.is_empty(), self.hub(id)) {
+            (true, _) => Ok(None),
+            (false, Some(hub)) => Ok(Some(crate::weights::Destination { repository, hub })),
+            (false, None) => Err(io::Error::other("a weights destination needs the run's Hub access, and the run has none")),
+        }
+    }
+
+    /// The Hub a run reads and writes: its own access, else the machine's.
+    pub fn hub(&self, id: &str) -> Option<hub::Source> {
+        let context = self.contexts.lock().unwrap().get(id).and_then(|c| c.hub.clone());
+        context.or_else(|| self.own_hub.clone())
     }
 
     /// A run ended: its children prepare no more, and its access is forgotten.

@@ -9,7 +9,7 @@
 //! A layout can instead expose unstaged regions through granted object descriptors, or use
 //! a sealed streaming window that TensorD refills as Runtime claims regions. These are data
 //! paths for a granted weight set, not permission for the executor to open the managed Store.
-use crate::{host_memory::HostMemory, os};
+use crate::{access::Fetch, host_memory::HostMemory, os};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -229,10 +229,12 @@ enum Job {
         layout: Arc<Layout>,
         open: Arc<OpenFill>,
         prefill: bool,
+        fetch: Option<Arc<Fetch>>,
     },
     Stage {
         key: String,
         regions: Vec<u32>,
+        fetch: Option<Arc<Fetch>>,
     },
 }
 struct Peer {
@@ -358,6 +360,11 @@ impl HostTier {
     /// memory now (sized from the manifest) and read its objects ahead. The layout itself
     /// needs the model code's plan; when it arrives the fill mostly copies.
     pub fn prepare(self: &Arc<Self>, grants: Vec<HostGrant>, staged: bool) {
+        // What is not here yet comes as its executor directs; only what is here is started on.
+        let grants: Vec<HostGrant> = (grants.into_iter())
+            .filter(|g| crate::access::objects(&g.header, &g.components.iter().cloned().collect::<Vec<_>>())
+                .iter().all(|o| self.store.contains(&o.sha256)))
+            .collect();
         if staged {
             // Its executor stages only what streams and reads the rest from the files: warm
             // the page cache (reclaimable), allocate nothing.
@@ -405,7 +412,7 @@ impl HostTier {
             for body in bodies {
                 let filled = serde_json::from_slice::<SealedPlan>(&body)
                     .map_err(failure)
-                    .and_then(|plan| tier.ensure(&plan, &grants, &body, true, None).map(|_| ()));
+                    .and_then(|plan| tier.ensure(&plan, &grants, &body, true, None, None).map(|_| ()));
                 if let Err(error) = filled {
                     eprintln!("host tier prefill skipped: {error}");
                 }
@@ -501,6 +508,7 @@ impl HostTier {
         grants: &[HostGrant],
         request: SealedRequest<'_>,
         plan: File,
+        fetch: Option<&Arc<Fetch>>,
     ) -> io::Result<Option<File>> {
         // Only an executor that reads holes from object files gets a layout staged in part.
         let stage = match self.staged_peer(peer)? {
@@ -508,17 +516,17 @@ impl HostTier {
             false => None,
         };
         let (plan, body) = Self::plan(request, plan)?;
-        let mut key = self.ensure(&plan, grants, &body, false, stage.clone())?;
+        let mut key = self.ensure(&plan, grants, &body, false, stage.clone(), fetch)?;
         match stage.as_deref() {
             // A layout another executor had staged in part: this one stages what it asked for.
             Some(regions) => {
-                self.stage_regions(&key, regions);
+                self.stage_regions(&key, regions, fetch);
             }
             // It reads no holes (a CPU executor, an older Runtime): the rest is staged when the
             // tier has room for all of it; else it reads through a window of its own.
-            None if !self.stage_rest(&key) => {
+            None if !self.stage_rest(&key, fetch) => {
                 let (read_plan, layout) = Self::layout(&plan, grants)?;
-                key = self.stream(format!("{key}.whole"), &plan, read_plan, layout)?;
+                key = self.stream(format!("{key}.whole"), &plan, read_plan, layout, fetch)?;
             }
             None => {}
         }
@@ -569,6 +577,7 @@ impl HostTier {
         body: &[u8],
         prefill: bool,
         mut stage: Option<Vec<u32>>,
+        fetch: Option<&Arc<Fetch>>,
     ) -> io::Result<String> {
         let (read_plan, layout) = Self::layout(plan, grants)?;
         let key = layout.digest.clone();
@@ -627,7 +636,7 @@ impl HostTier {
                 if let Some(fd) = reserved {
                     drop(fd); // the component's reservation: a window is smaller
                 }
-                return self.stream(key, plan, read_plan, layout);
+                return self.stream(key, plan, read_plan, layout, fetch);
             }
         }
         state.ledger.reserved_used += u64::from(reserved.is_some());
@@ -666,6 +675,7 @@ impl HostTier {
                     layout,
                     open,
                     prefill,
+                    fetch: fetch.cloned(),
                 };
                 // A send fails only once the filler is gone with the tier: the job's drop
                 // poisons the layout, so no adopter waits for it.
@@ -692,7 +702,16 @@ impl HostTier {
         plan: &SealedPlan,
         read_plan: read::ReadPlan,
         layout: Layout,
+        fetch: Option<&Arc<Fetch>>,
     ) -> io::Result<String> {
+        // A window reads any region at any time: everything it may read is here first.
+        if let Some(fetch) = fetch {
+            let objects: Vec<_> = read_plan.items.iter().filter_map(|item| match &item.source {
+                Item::Object(range) => Some(range.obj.clone()),
+                Item::Inline(_) => None,
+            }).collect();
+            fetch.wait(&crate::access::held(&self.store, &plan.manifest)?, &objects)?;
+        }
         let span = layout
             .regions
             .iter()
@@ -765,18 +784,11 @@ impl HostTier {
     /// The filler: one layout's bytes, then it is complete (charged what it holds) or, failed,
     /// dropped (its adopters see the failure in its Ready words).
     fn run(&self, job: Job) {
-        let (key, plan, body, layout, open, prefill) = match job {
-            Job::Fill {
-                key,
-                plan,
-                body,
-                layout,
-                open,
-                prefill,
-            } => (key, plan, body, layout, open, prefill),
-            Job::Stage { key, regions } => return self.run_stage(&key, &regions),
+        let (key, plan, body, layout, open, prefill, fetch) = match job {
+            Job::Fill { key, plan, body, layout, open, prefill, fetch } => (key, plan, body, layout, open, prefill, fetch),
+            Job::Stage { key, regions, fetch } => return self.run_stage(&key, &regions, fetch.as_deref()),
         };
-        let filled = self.fill(&plan, &layout, &open);
+        let filled = self.fill(&plan, &layout, &open, fetch.as_deref());
         drop(open); // a layout staged in part keeps the mapping in its entry; a whole one lets go
         let mut state = self.state.lock().unwrap();
         match filled {
@@ -809,7 +821,7 @@ impl HostTier {
     /// Stage `regions` of a layout staged in part, in order, as far as the tier has room;
     /// returns the regions now staged or staging (all of them for a whole layout). The filler
     /// copies them; adopters wait per region, and a region left a hole reads the files.
-    fn stage_regions(&self, key: &str, regions: &[u32]) -> Vec<u32> {
+    fn stage_regions(&self, key: &str, regions: &[u32], fetch: Option<&Arc<Fetch>>) -> Vec<u32> {
         let mut state = self.state.lock().unwrap();
         let limit = |state: &State| {
             let host = crate::host_memory::read();
@@ -851,6 +863,7 @@ impl HostTier {
             let job = Job::Stage {
                 key: key.to_string(),
                 regions: taken,
+                fetch: fetch.cloned(),
             };
             let _ = self.fills.lock().unwrap().send(job);
         }
@@ -860,7 +873,7 @@ impl HostTier {
     /// Every remaining region of a layout staged in part, for an adopter that reads no holes:
     /// all of them when the tier has room, else none (the sparse copy does not grow). False:
     /// the layout keeps holes.
-    fn stage_rest(&self, key: &str) -> bool {
+    fn stage_rest(&self, key: &str, fetch: Option<&Arc<Fetch>>) -> bool {
         let rest: Vec<u32> = {
             let state = self.state.lock().unwrap();
             let Some(Slot::Open(Entry {
@@ -883,11 +896,11 @@ impl HostTier {
             }
             rest
         };
-        self.stage_regions(key, &rest).len() == rest.len()
+        self.stage_regions(key, &rest, fetch).len() == rest.len()
     }
 
-    /// The filler's half of `stage_regions`: a lease over the regions' objects, then copy.
-    fn run_stage(&self, key: &str, regions: &[u32]) {
+    /// The filler's half of `stage_regions`: each region copied in order as its objects land.
+    fn run_stage(&self, key: &str, regions: &[u32], fetch: Option<&Fetch>) {
         let taken = {
             let state = self.state.lock().unwrap();
             match state.slots.get(key) {
@@ -900,26 +913,9 @@ impl HostTier {
         let Some((open, layout, manifest)) = taken else {
             return;
         };
-        let mut objects = BTreeMap::new();
-        for &r in regions {
-            for item in &layout.regions[r as usize].items {
-                if let tensorfs_plane::layout::ItemSource::Object(range) = &item.source {
-                    objects.insert(range.obj.sha256.clone(), range.obj.clone());
-                }
-            }
-        }
-        let staged = read::acquire(
-            &self.store,
-            &self.meta,
-            &manifest,
-            objects.into_values().collect(),
-        )
-        .map_err(failure)
-        .and_then(|(lease, _)| {
-            let source = Source::new(self.store.clone(), self.meta.clone(), lease, true, 0);
-            let tally = IoTally::default();
-            open.stage(regions, &layout, &source, self.config.fill_threads, &tally)
-                .map_err(failure)
+        let tally = IoTally::default();
+        let staged = self.landing(&manifest, &layout, regions, fetch, |batch, source| {
+            open.stage(batch, &layout, source, self.config.fill_threads, &tally).map(drop)
         });
         let mut state = self.state.lock().unwrap();
         if let Some(Slot::Open(entry)) = state.slots.get_mut(key) {
@@ -927,12 +923,63 @@ impl HostTier {
                 entry.charged = entry.charged.max(meta.blocks() * 512);
             }
         }
-        if let Err(error) = staged {
+        if let Err((error, rest)) = staged {
+            // Its adopters see the regions failed; the next ask opens the layout afresh.
             eprintln!("host tier staging of {regions:?} failed: {error}");
+            fail(&open, &layout, &rest);
+            state.slots.remove(key);
             state.ledger.failed += 1;
         }
         drop(state);
         self.filled.notify_all();
+    }
+
+    /// `regions` of `layout` copied in their order: the next one once its objects are here
+    /// (absent ones fetched now through `fetch`; none: they must be here), with those after it
+    /// already here in the same lease. On failure, the regions not copied.
+    fn landing(
+        &self,
+        manifest: &str,
+        layout: &Layout,
+        regions: &[u32],
+        fetch: Option<&Fetch>,
+        copy: impl Fn(&[u32], &Source) -> tensorfs_plane::Result<()>,
+    ) -> Result<(), (io::Error, Vec<u32>)> {
+        let objects = |batch: &[u32]| -> Vec<tensorfs_core::ids::ObjectRef> {
+            let mut objects = BTreeMap::new();
+            for &r in batch {
+                for item in &layout.regions[r as usize].items {
+                    if let tensorfs_plane::layout::ItemSource::Object(range) = &item.source {
+                        objects.insert(range.obj.sha256.clone(), range.obj.clone());
+                    }
+                }
+            }
+            objects.into_values().collect()
+        };
+        let mut at = 0;
+        while at < regions.len() {
+            let rest = || regions[at..].to_vec();
+            if let Some(fetch) = fetch {
+                let waited = crate::access::held(&self.store, manifest)
+                    .and_then(|held| fetch.wait(&held, &objects(&regions[at..=at])));
+                waited.map_err(|error| (error, rest()))?;
+            }
+            let here = |r: &u32| objects(&[*r]).iter().all(|o| self.store.contains(&o.sha256));
+            let end = at + 1 + regions[at + 1..].iter().take_while(|r| here(r)).count();
+            let batch = &regions[at..end];
+            let copied = match objects(batch) {
+                listed if listed.is_empty() => copy(batch, &Source::files(Vec::new(), false, 0)).map_err(failure),
+                listed => read::acquire(&self.store, &self.meta, hex(manifest), listed)
+                    .map_err(failure)
+                    .and_then(|(lease, _)| {
+                        let source = Source::new(self.store.clone(), self.meta.clone(), lease, true, 0);
+                        copy(batch, &source).map_err(failure)
+                    }),
+            };
+            copied.map_err(|error| (error, rest()))?;
+            at = end;
+        }
+        Ok(())
     }
 
     /// More of a layout staged in part, for `peer`: `regions` it now streams every step
@@ -943,6 +990,7 @@ impl HostTier {
         grants: &[HostGrant],
         request: SealedRequest<'_>,
         plan: File,
+        fetch: Option<&Arc<Fetch>>,
     ) -> io::Result<Vec<u32>> {
         if !self.staged_peer(peer)? {
             return Err(denied("this executor reads no holes"));
@@ -950,7 +998,7 @@ impl HostTier {
         let regions = request.stage.unwrap_or_default().to_vec();
         let (plan, _) = Self::plan(request, plan)?;
         let (_, layout) = Self::layout(&plan, grants)?;
-        Ok(self.stage_regions(&layout.digest, &regions))
+        Ok(self.stage_regions(&layout.digest, &regions, fetch))
     }
 
     /// The verified object files behind `plan`, read-only, for `peer`'s holes: the store's
@@ -961,6 +1009,7 @@ impl HostTier {
         grants: &[HostGrant],
         request: SealedRequest<'_>,
         plan: File,
+        fetch: Option<&Arc<Fetch>>,
     ) -> io::Result<Vec<(tensorfs_core::ids::ObjectRef, File)>> {
         if !self.staged_peer(peer)? {
             return Err(denied("this executor reads no holes"));
@@ -972,6 +1021,10 @@ impl HostTier {
             if let Item::Object(range) = &item.source {
                 objects.insert(range.obj.sha256.clone(), range.obj.clone());
             }
+        }
+        if let Some(fetch) = fetch {
+            let all: Vec<_> = objects.values().cloned().collect();
+            fetch.wait(&crate::access::held(&self.store, &plan.manifest)?, &all)?;
         }
         objects
             .into_values()
@@ -1052,42 +1105,6 @@ impl HostTier {
     }
 
     /// The plan the executor sent: a sealed memfd of exactly the declared bytes and digest.
-    /// Open every plan of one construction (`SealedPrefetch`), in order, while its executor
-    /// registers them: the filler fills them in that order and each `seal` ask finds its own.
-    pub fn prefetch(
-        self: &Arc<Self>,
-        peer: u64,
-        grants: &[HostGrant],
-        request: SealedRequest<'_>,
-        plans: File,
-    ) -> io::Result<()> {
-        if !self.state.lock().unwrap().peers.contains_key(&peer) {
-            return Err(denied("host tier peer is not a registered live executor"));
-        }
-        let body = Self::body(request, plans)?;
-        let plans: Vec<serde_json::Value> = serde_json::from_slice(&body).map_err(failure)?;
-        let mut queued = Vec::new();
-        for value in plans {
-            let body = serde_json::to_vec(&value)?;
-            queued.push((
-                serde_json::from_value::<SealedPlan>(value).map_err(failure)?,
-                body,
-            ));
-        }
-        // An executor that stages what streams gets layouts with nothing staged yet: it asks
-        // for its streamed regions once its stages plan them.
-        let stage = self.staged_peer(peer)?.then(Vec::new);
-        let (tier, grants) = (self.clone(), grants.to_vec());
-        std::thread::spawn(move || {
-            for (plan, body) in queued {
-                if let Err(error) = tier.ensure(&plan, &grants, &body, true, stage.clone()) {
-                    eprintln!("host tier prefetch skipped: {error}");
-                }
-            }
-        });
-        Ok(())
-    }
-
     fn plan(request: SealedRequest<'_>, plan: File) -> io::Result<(SealedPlan, Vec<u8>)> {
         let body = Self::body(request, plan)?;
         Ok((serde_json::from_slice(&body).map_err(failure)?, body))
@@ -1115,49 +1132,23 @@ impl HostTier {
         Ok(body)
     }
 
-    fn fill(&self, plan: &SealedPlan, layout: &Layout, open: &OpenFill) -> io::Result<Fill> {
-        // A lease over the objects of what this layout stages, not its holes.
-        let mut objects = BTreeMap::new();
-        for (r, region) in layout.regions.iter().enumerate() {
-            if open.hole(r as u32) {
-                continue;
-            }
-            for item in &region.items {
-                if let tensorfs_plane::layout::ItemSource::Object(range) = &item.source {
-                    objects.insert(range.obj.sha256.clone(), range.obj.clone());
-                }
-            }
-        }
+    /// What this layout stages (not its holes), region by region in layout order as its
+    /// objects land: an adopter waits per region, never for the whole.
+    fn fill(&self, plan: &SealedPlan, layout: &Layout, open: &OpenFill, fetch: Option<&Fetch>) -> io::Result<Fill> {
+        let regions: Vec<u32> = (0..layout.regions.len() as u32).filter(|&r| !open.hole(r)).collect();
         let started = (Instant::now(), disk_read_bytes());
         let tally = IoTally::default();
-        if objects.is_empty() {
-            // Nothing staged (or only inline bytes): no lease to take.
-            let source = Source::files(Vec::new(), false, 0);
-            open.fill(layout, &source, 1, &tally).map_err(failure)?;
-            return Ok(Fill {
-                name: plan.name.clone(),
-                ..Fill::default()
-            });
+        let filled = self.landing(&plan.manifest, layout, &regions, fetch, |batch, source| {
+            open.stage(batch, layout, source, self.config.fill_threads, &tally).map(drop)
+        });
+        if let Err((error, rest)) = filled {
+            fail(open, layout, &rest);
+            return Err(error);
         }
-        let (lease, _) = read::acquire(
-            &self.store,
-            &self.meta,
-            hex(&plan.manifest),
-            objects.into_values().collect(),
-        )
-        .map_err(failure)?;
-        let source = Source::new(self.store.clone(), self.meta.clone(), lease, true, 0);
-        open.fill(layout, &source, self.config.fill_threads, &tally)
-            .map_err(failure)?;
-        drop(source); // ends the lease and its descriptors: one descriptor per layout stays
         let read = |n: &std::sync::atomic::AtomicU64| n.load(std::sync::atomic::Ordering::Relaxed);
-        let bytes = (0..layout.regions.len() as u32)
-            .filter(|&r| !open.hole(r))
-            .map(|r| layout.regions[r as usize].span)
-            .sum();
         Ok(Fill {
             name: plan.name.clone(),
-            bytes,
+            bytes: regions.iter().map(|&r| layout.regions[r as usize].span).sum(),
             ms: started.0.elapsed().as_secs_f64() * 1e3,
             cached_bytes: read(&tally.cached_bytes),
             direct_bytes: read(&tally.direct_bytes),
@@ -1299,6 +1290,14 @@ fn serve(
     let source = Source::new(store.clone(), meta.clone(), lease, true, 0);
     open.serve(layout, &source, threads, tally, stop)
         .map_err(failure)
+}
+
+/// `regions` that will never be copied, marked failed so no adopter waits for them: staging
+/// them from no files fails each region an object backs.
+fn fail(open: &OpenFill, layout: &Layout, regions: &[u32]) {
+    if !regions.is_empty() {
+        let _ = open.stage(regions, layout, &Source::files(Vec::new(), false, 0), 1, &IoTally::default());
+    }
 }
 
 /// The SHA-256 (hex) of `files`' objects in order, one `<sha256>:<length>\n` line each: what an

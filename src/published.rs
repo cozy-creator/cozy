@@ -3,6 +3,7 @@
 //! release's locked requirements with uv; model by owner binding ladder, then a TensorFS
 //! download) with its `release_root_preparing` progress answers.
 use crate::{
+    access,
     api::domain,
     gpu_service::{Plan, Pool, ModelGrant},
     hub::{self, Catalog},
@@ -23,7 +24,6 @@ use std::{
     sync::{Arc, Condvar, Mutex},
     time::{Duration, Instant},
 };
-pub(crate) use tensorfs_core::ensure::Parts;
 use tensorfs_core::{
     err::{Code, Refusal},
     fetch::{DeliveryGrant, FetchPlan},
@@ -93,6 +93,8 @@ pub(crate) struct Named {
     pub lane: String,
     /// `sha256:<hex>`; empty until resolved.
     pub manifest: String,
+    /// The manifest's length, once resolved (0 for an adapter named by hash).
+    pub length: u64,
 }
 
 impl Named {
@@ -106,8 +108,13 @@ impl Named {
             .map_err(|e| ("catalog_read_failed", e.0))?
             .closure(&refspec, &self.lane)
             .map_err(|e| refused("model_resolution_failed", e))?;
-        (self.release, self.lane, self.manifest) = (closure.release, closure.lane, closure.manifest.id());
+        (self.release, self.lane, self.manifest, self.length) =
+            (closure.release, closure.lane, closure.manifest.id(), closure.manifest.length);
         Ok(self)
+    }
+
+    pub(crate) fn object(&self) -> ObjectRef {
+        ObjectRef { sha256: self.manifest.trim_start_matches("sha256:").into(), length: self.length }
     }
 
     /// The ref a pull names: a release's lane pinned to its manifest, which the Hub checks is that
@@ -116,15 +123,6 @@ impl Named {
         match self.release.is_empty() {
             true => format!("{}@{}", self.repository, self.manifest),
             false => format!("{}@{}@{}", self.repository, self.release, self.manifest),
-        }
-    }
-
-    fn of(grant: &ModelGrant) -> Self {
-        Self {
-            repository: grant.repository.clone(),
-            release: grant.release.clone(),
-            lane: grant.lane.clone(),
-            manifest: grant.manifest.clone(),
         }
     }
 }
@@ -144,8 +142,6 @@ struct Job {
     progress: Mutex<Progress>,
     changed: Condvar,
     observer: Option<Observer>,
-    /// A hint's preparation: no call waits on its downloads (`Lanes`).
-    behind: bool,
     /// Its run's stop: a cancel ends its downloads and installs.
     stop: Option<PullCancellation>,
 }
@@ -215,96 +211,8 @@ pub struct Publisher {
     sdk: PackageSdk,
     store: Arc<Store>,
     jobs: Mutex<HashMap<String, Arc<Job>>>,
-    /// Manifests preparations are fetching, counted per preparation (`Fetching`).
-    fetching: Mutex<HashMap<String, usize>>,
-    /// Checkpoints a run started on part of: the rest downloads behind it (`complete_behind`).
-    remainders: Mutex<HashMap<String, Remainder>>,
-    lanes: Lanes,
     /// One maker per source: a second asker waits, then finds it held (runs 5393/5394).
     making: Mutex<HashMap<String, Arc<Mutex<()>>>>,
-}
-
-/// Downloads a call waits on run at once, at full speed. One none waits on (a hint's, a
-/// checkpoint's remainder) goes behind them: it starts only while there are none, stops as
-/// one starts, keeping what it landed, and starts again once none is left.
-#[derive(Default)]
-struct Lanes {
-    state: Mutex<(usize, Vec<PullCancellation>)>,
-    changed: Condvar,
-}
-
-impl Lanes {
-    fn run<T>(&self, behind: bool, stop: Option<&PullCancellation>,
-        pull: impl Fn(Option<PullCancellation>) -> Result<T, Failure>) -> Result<T, Failure> {
-        if !behind {
-            let _waited = Waited::on(self);
-            return match pull(stop.cloned()) {
-                Err(_) if stop.is_some_and(PullCancellation::is_cancelled) => Err(canceled()),
-                result => result,
-            };
-        }
-        loop {
-            let stop = PullCancellation::default();
-            self.changed.wait_while(self.state.lock().unwrap(), |(waited, _)| *waited > 0).unwrap().1.push(stop.clone());
-            let result = pull(Some(stop.clone()));
-            let yielded = stop.is_cancelled();
-            stop.cancel();
-            self.state.lock().unwrap().1.retain(|stop| !stop.is_cancelled());
-            match result {
-                Err(_) if yielded => continue,
-                result => return result,
-            }
-        }
-    }
-}
-
-/// One download a call waits on, from its start to its end: every one behind it stops.
-struct Waited<'a>(&'a Lanes);
-impl<'a> Waited<'a> {
-    fn on(lanes: &'a Lanes) -> Self {
-        let (waited, behind) = &mut *lanes.state.lock().unwrap();
-        *waited += 1;
-        behind.drain(..).for_each(|stop| stop.cancel());
-        Self(lanes)
-    }
-}
-impl Drop for Waited<'_> {
-    fn drop(&mut self) {
-        self.0.state.lock().unwrap().0 -= 1;
-        self.0.changed.notify_all();
-    }
-}
-
-/// The rest of a checkpoint whose declared components a run downloaded first.
-struct Remainder {
-    checkpoint: Named,
-    source: hub::Source,
-    /// What the parts landed, held from GC until the whole checkpoint is recorded.
-    holds: Vec<tensorfs_core::ensure::PartHold>,
-    started: bool,
-}
-
-/// Streams a remainder downloads with: well under a foreground pull's, so the running request
-/// keeps the link and the disk.
-const BEHIND_STREAMS: usize = 64;
-
-/// One preparation's manifests in `Publisher::fetching`, released when it ends.
-struct Fetching<'a> {
-    publisher: &'a Publisher,
-    manifests: Vec<String>,
-}
-impl Drop for Fetching<'_> {
-    fn drop(&mut self) {
-        let mut fetching = self.publisher.fetching.lock().unwrap();
-        for manifest in &self.manifests {
-            if let Some(count) = fetching.get_mut(manifest) {
-                *count -= 1;
-                if *count == 0 {
-                    fetching.remove(manifest);
-                }
-            }
-        }
-    }
 }
 
 impl Publisher {
@@ -315,9 +223,6 @@ impl Publisher {
             sdk,
             store,
             jobs: Mutex::new(HashMap::new()),
-            fetching: Mutex::new(HashMap::new()),
-            remainders: Mutex::new(HashMap::new()),
-            lanes: Lanes::default(),
             making: Mutex::new(HashMap::new()),
         }))
     }
@@ -392,8 +297,7 @@ impl Publisher {
     }
 
     /// One run's preparation on the calling thread, reported through `observe`: a held
-    /// installation and resolution answer at once. One nobody observes is a hint's
-    /// (`model_prefetch`): no call waits on it, so its downloads go behind (`Lanes`).
+    /// installation and resolution answer at once.
     pub fn prepare_now(
         &self,
         service: &Arc<Service>,
@@ -406,7 +310,6 @@ impl Publisher {
             return Ok(prepared);
         }
         let job = Job {
-            behind: observe.is_none(),
             observer: observe,
             stop: stop.cloned(),
             ..Default::default()
@@ -430,77 +333,48 @@ impl Publisher {
                 format!("{path} names a source and a catalog checkpoint"),
             ));
         }
-        let made = self.make(&choice.source, &choice.profiles, providers, job.behind, job.stop.as_ref(), &|stage, moved, total| {
+        let made = self.make(&choice.source, &choice.profiles, providers, job.stop.as_ref(), &|stage, moved, total| {
             job.set(Progress::Preparing {
                 stage: format!("{stage} for {path}"),
                 moved,
                 total,
             })
         })?;
-        let manifest = self
-            .store
-            .read_manifest(&made.manifest)
-            .map_err(|e| ("model_source_failed", e.to_string()))?;
-        let header = manifest
-            .header()
-            .map(|reference| tensorfs_core::checkpoint::load_header(&self.store, reference))
-            .transpose()
-            .map_err(|e| ("model_source_failed", e.to_string()))?;
         Ok(ModelGrant {
             package: installation.package.clone(),
             slot: path.to_string(),
             repository: made.repository,
             release: String::new(),
             lane: String::new(),
-            manifest: format!("sha256:{}", made.manifest.sha256),
-            components: header
-                .map(|h| h.components.into_iter().map(|(name, _)| name).collect())
-                .unwrap_or_default(),
+            manifest: made.manifest.id(),
+            components: self.components(&made.manifest.id())?,
         })
     }
 
     /// The component names a held checkpoint's header declares.
     fn components(&self, manifest: &str) -> Result<Vec<String>, Failure> {
-        let sha = manifest.trim_start_matches("sha256:");
-        let absent = |e: String| ("checkpoint_absent", format!("{manifest}: {e}"));
-        let length = fs::metadata(self.store.manifest_path(sha)).map_err(|e| absent(e.to_string()))?.len();
-        let held = self
-            .store
-            .read_manifest(&tensorfs_core::ids::ObjectRef { sha256: sha.to_string(), length })
-            .map_err(|e| absent(e.to_string()))?;
-        let header = held
-            .header()
-            .map(|reference| tensorfs_core::checkpoint::load_header(&self.store, reference))
-            .transpose()
-            .map_err(|e| absent(e.to_string()))?;
-        Ok(header.map(|h| h.components.into_iter().map(|(name, _)| name).collect()).unwrap_or_default())
+        let header = access::held(&self.store, manifest).and_then(|held| access::header(&self.store, &held));
+        let header = header.map_err(|e| ("checkpoint_absent", format!("{manifest}: {e}")))?;
+        Ok(header.components.into_iter().map(|(name, _)| name).collect())
     }
 
     /// A slot's model this machine's store holds, by its exact manifest.
     fn held_grant(&self, installation: &Installation, path: &str, reference: &domain::Ref) -> Result<ModelGrant, Failure> {
-        let sha = sha256::hex(&reference.digest);
-        let manifest = self.store.read_manifest(&tensorfs_core::ids::ObjectRef { sha256: sha.clone(), length: reference.length })
-            .map_err(|_| ("checkpoint_absent", format!("{path} names checkpoint sha256:{sha}, which this machine does not hold")))?;
-        let header = manifest
-            .header()
-            .map(|reference| tensorfs_core::checkpoint::load_header(&self.store, reference))
-            .transpose()
-            .map_err(|e| ("checkpoint_absent", e.to_string()))?;
+        let manifest = format!("sha256:{}", sha256::hex(&reference.digest));
+        let absent = |_| ("checkpoint_absent", format!("{path} names checkpoint {manifest}, which this machine does not hold"));
         Ok(ModelGrant {
             package: installation.package.clone(),
             slot: path.to_string(),
             repository: String::new(),
             release: String::new(),
             lane: String::new(),
-            manifest: format!("sha256:{sha}"),
-            components: header
-                .map(|h| h.components.into_iter().map(|(name, _)| name).collect())
-                .unwrap_or_default(),
+            components: self.components(&manifest).map_err(absent)?,
+            manifest,
         })
     }
 
     /// The store models are made and held in.
-    pub fn store(&self) -> &Store {
+    pub fn store(&self) -> &Arc<Store> {
         &self.store
     }
 
@@ -513,12 +387,12 @@ impl Publisher {
         stop: Option<&PullCancellation>,
         progress: &(dyn Fn(&str, u64, u64) + Sync),
     ) -> Result<tensorfs_core::source_model::Made, Refused> {
-        self.make(source, profiles, providers, false, stop, progress)
+        self.make(source, profiles, providers, stop, progress)
             .map_err(|(code, message)| Refused { code, message })
     }
 
-    /// A provider source made into a local model (`make_source`) in its lane (`Lanes`).
-    fn make(&self, source: &str, profiles: &[String], providers: &Providers, behind: bool,
+    /// A provider source made into a local model (`make_source`), one maker per source.
+    fn make(&self, source: &str, profiles: &[String], providers: &Providers,
         stop: Option<&PullCancellation>, progress: &(dyn Fn(&str, u64, u64) + Sync),
     ) -> Result<tensorfs_core::source_model::Made, Failure> {
         let mut sorted = profiles.to_vec();
@@ -527,7 +401,7 @@ impl Publisher {
         let gate = self.making.lock().unwrap().entry(key.clone()).or_default().clone();
         let made = {
             let _one = gate.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            self.lanes.run(behind, stop, |stop| make_source(&self.store, source, profiles, providers, stop, progress))
+            make_source(&self.store, source, profiles, providers, stop.cloned(), progress)
         };
         let mut making = self.making.lock().unwrap();
         if Arc::strong_count(&gate) == 2 {
@@ -536,14 +410,55 @@ impl Publisher {
         made
     }
 
-    /// One resolved checkpoint downloaded (`ensure_with`) in its lane (`Lanes`), under what no
-    /// store GC may evict as each attempt starts (`protected`).
-    fn ensure(&self, service: &Service, source: &hub::Source, checkpoint: &Named, pull: &Pull,
-        bytes: &(dyn Fn(u64, u64) + Sync)) -> Result<Option<tensorfs_core::ensure::PartHold>, Failure> {
-        self.lanes.run(pull.behind, pull.stop.as_ref(), |stop| {
-            let keep = self.protected(service).map_err(io_failure)?;
-            ensure_with(&self.store, source, checkpoint, &keep, pull, stop, bytes)
+    /// `named` downloaded whole (TensorFS `ensure`, on the Store's fetcher) under its access,
+    /// beside what no store GC may evict (`protected`): what a caller asked for whole (`cozy
+    /// model download`, an adapter).
+    fn ensure(&self, service: &Service, source: &hub::Source, named: &Named, stop: Option<&PullCancellation>,
+        bytes: &(dyn Fn(u64, u64) + Sync)) -> Result<(), Failure> {
+        let mut keep = self.protected(service).map_err(io_failure)?;
+        keep.push(named.manifest.clone());
+        let refspec = named.refspec();
+        let catalog = access::of(source, &crate::access::origin(source, &named.repository, &named.release, &named.lane, &named.object()))?;
+        let on_event = |event: &tensorfs_core::ensure::Event| bytes(event.bytes_done, event.bytes_total);
+        let mut request = tensorfs_core::ensure::Request::new(&self.store, &source.origin, &refspec, catalog.clone());
+        (request.lane, request.keep, request.cancellation) = (&named.lane, &keep, stop.cloned());
+        request.on_event = Some(&on_event);
+        tensorfs_core::ensure::ensure(&request).map(drop).map_err(|e| match stop.is_some_and(PullCancellation::is_cancelled) {
+            true => canceled(),
+            false => {
+                let (code, message) = refused("model_download_failed", e);
+                catalog.reason(code, message)
+            }
         })
+    }
+
+    /// Each Hub checkpoint's structure (manifest, header, assets), landed at once: which of its
+    /// objects come, and when, its calls direct (`access`). A held structure asks the Hub nothing.
+    fn structure(&self, source: &hub::Source, checkpoints: &[Named], job: &Job) -> Result<(), Failure> {
+        if checkpoints.is_empty() {
+            return Ok(());
+        }
+        let names: Vec<String> = checkpoints.iter().map(|n| format!("{}@{} {}", n.repository, n.release, n.lane)).collect();
+        job.stage(format!("resolving {}", names.join(" and ")));
+        let fetcher = tensorfs_core::fetch::Fetcher::of(&self.store).map_err(|e| refused("model_download_failed", e))?;
+        let stop = job.stop.clone().unwrap_or_default();
+        let mut wanted = vec![];
+        for named in checkpoints {
+            let origin = crate::access::origin(source, &named.repository, &named.release, &named.lane, &named.object());
+            let catalog = access::of(source, &origin)?;
+            let ticket = fetcher.want(&origin, catalog.clone(), &[], tensorfs_core::fetch::Priority::Now);
+            wanted.push((ticket, catalog));
+        }
+        for (ticket, catalog) in wanted {
+            ticket.wait(&[], &stop).map_err(|e| match stop.is_cancelled() {
+                true => canceled(),
+                false => {
+                    let (code, message) = refused("model_download_failed", e);
+                    catalog.reason(code, message)
+                }
+            })?;
+        }
+        Ok(())
     }
 
     /// The checkpoint `named` is: a hash as given, a name as the Hub answers it (one closure
@@ -556,116 +471,33 @@ impl Publisher {
         let origin = hub::origin_key(&source.origin).unwrap_or_default();
         let name = json!([origin, named.repository, named.release, named.lane]).to_string();
         let held = service.engine.with_journal(|j| j.named(&name, revision)).map_err(io_failure)?;
-        if let Some([release, lane, manifest]) = held.and_then(|held| serde_json::from_str::<[String; 3]>(&held).ok()) {
-            return Ok(Named { release, lane, manifest, ..named });
+        if let Some((release, lane, manifest, length)) = held.and_then(|held| serde_json::from_str(&held).ok()) {
+            return Ok(Named { release, lane, manifest, length, ..named });
         }
         let resolved = named.at_hub(source)?;
-        let answer = json!([resolved.release, resolved.lane, resolved.manifest]).to_string();
+        let answer = json!([resolved.release, resolved.lane, resolved.manifest, resolved.length]).to_string();
         service.engine.with_journal(|j| j.bind_named(&name, revision, &answer)).map_err(io_failure)?;
         Ok(resolved)
     }
 
-    /// A Hub checkpoint resolved and downloaded into the store (a warm run's model choice),
-    /// held from eviction while it downloads; answers what the Hub named. In `part` (a job's
-    /// model input) only its structure lands: the job's reads fetch the rest they need
-    /// (`fetch_part`), and the Hub keeps what they never read.
-    #[allow(clippy::too_many_arguments)]
+    /// A Hub checkpoint resolved and downloaded whole into the store (a warm run's model
+    /// choice: `cozy model download`); answers what the Hub named.
     pub(crate) fn download(
         &self,
         service: &Service,
         source: &hub::Source,
         named: Named,
         revision: &str,
-        part: bool,
         stop: Option<&PullCancellation>,
         bytes: &(dyn Fn(u64, u64) + Sync),
     ) -> Result<Named, Refused> {
         let failed = |(code, message)| Refused { code, message };
         let named = self.resolve(service, source, named, revision).map_err(failed)?;
         // A checkpoint this store already holds whole, in that repository, moves nothing.
-        let sha256 = named.manifest.trim_start_matches("sha256:");
-        if let Ok(meta) = std::fs::metadata(self.store.manifest_path(sha256)) {
-            let held = tensorfs_core::ids::ObjectRef { sha256: sha256.to_string(), length: meta.len() };
-            if tensorfs_core::checkpoint_root::check_source(&self.store, &named.repository, &held).is_ok() {
-                return Ok(named);
-            }
+        if tensorfs_core::checkpoint_root::check_source(&self.store, &named.repository, &named.object()).is_err() {
+            self.ensure(service, source, &named, stop, bytes).map_err(failed)?;
         }
-        let _fetching = self.fetch(vec![named.manifest.clone()]);
-        let pull = Pull { part, stop: stop.cloned(), ..Pull::default() };
-        self.ensure(service, source, &named, &pull, bytes).map_err(failed)?;
         Ok(named)
-    }
-
-    /// Objects of a checkpoint held here in part (`download` in part), fetched from its Hub as a
-    /// job reads them, through the `parts` its reads share (one closure, each object once).
-    pub(crate) fn fetch_part(&self, service: &Service, source: &hub::Source, named: &Named, parts: &Parts,
-        objects: &[ObjectRef]) -> Result<(), Failure> {
-        self.lanes.run(false, None, |stop| {
-            let keep = self.protected(service).map_err(io_failure)?;
-            let pull = Pull { part: true, objects: objects.to_vec(), ..Pull::default() };
-            requesting(&self.store, source, named, &keep, &pull, stop, &|_, _| (), |request| parts.fetch(request))
-        })
-    }
-
-    /// Downloads the rest of every checkpoint `run`'s preparation took part of, once the run
-    /// is on its GPU, behind every download a call waits on (`Lanes`); its parts stay held
-    /// from GC until it is recorded.
-    pub fn complete_behind(self: &Arc<Self>, service: &Arc<Service>, run: &str) {
-        let pending: Vec<String> = {
-            let mut remainders = self.remainders.lock().unwrap();
-            remainders
-                .iter_mut()
-                .filter(|(_, remainder)| !remainder.started)
-                .map(|(manifest, remainder)| {
-                    remainder.started = true;
-                    manifest.clone()
-                })
-                .collect()
-        };
-        for manifest in pending {
-            let (this, service, run) = (self.clone(), service.clone(), run.to_string());
-            let spawned = std::thread::Builder::new()
-                .name("remainder".into())
-                .spawn(move || this.remainder(&service, &run, &manifest));
-            if let Err(error) = spawned {
-                eprintln!("checkpoint remainder: {error}");
-            }
-        }
-    }
-
-    fn remainder(&self, service: &Service, run: &str, manifest: &str) {
-        while matches!(
-            service.engine.get(run).map(|record| record.state),
-            Ok(crate::journal::State::Queued | crate::journal::State::Starting)
-        ) {
-            std::thread::sleep(Duration::from_secs(1));
-        }
-        let Some((checkpoint, source)) = self
-            .remainders
-            .lock()
-            .unwrap()
-            .get(manifest)
-            .map(|r| (r.checkpoint.clone(), r.source.clone()))
-        else {
-            return;
-        };
-        let pull = Pull { streams: Some(BEHIND_STREAMS), behind: true, ..Pull::default() };
-        let outcome = self.ensure(service, &source, &checkpoint, &pull, &|_, _| ());
-        if let Err((code, detail)) = outcome {
-            eprintln!("checkpoint {manifest}: the rest did not download ({code}: {detail})");
-        }
-        self.remainders.lock().unwrap().remove(manifest);
-    }
-
-    fn fetch(&self, manifests: Vec<String>) -> Fetching<'_> {
-        let mut fetching = self.fetching.lock().unwrap();
-        for manifest in &manifests {
-            *fetching.entry(manifest.clone()).or_default() += 1;
-        }
-        Fetching {
-            publisher: self,
-            manifests,
-        }
     }
 
     /// The store's share of the machine's self-managing caches (`reclaim`), with what it
@@ -677,14 +509,12 @@ impl Publisher {
         })
     }
 
-    /// What no store GC may evict: what live executors read, what preparations are fetching
-    /// (this one's included), and the prepared models and job model inputs of every
-    /// unfinished run, paused and unknown states included. A journal or plan that cannot be
-    /// read is an error, never a shorter list: the caller then runs no store GC this pass.
+    /// What no store GC may evict: what live executors read and the checkpoints of every
+    /// unfinished run, unknown states included (what is being fetched, its tickets hold). A
+    /// journal or plan that cannot be read is an error, never a shorter list: the caller then
+    /// runs no store GC this pass.
     fn protected(&self, service: &Service) -> io::Result<Vec<String>> {
         let mut keep = service.pool().map(|pool| pool.serving()).unwrap_or_default();
-        keep.extend(self.fetching.lock().unwrap().keys().cloned());
-        keep.extend(self.remainders.lock().unwrap().keys().cloned());
         for record in service.engine.with_journal(|journal| journal.unfinished())? {
             let Some(submission) = record.submission.filter(|s| !s.preparation_id.is_empty()) else {
                 continue;
@@ -1279,7 +1109,7 @@ impl Publisher {
         let gpu_model = gpu.config().envelope().first().map(|d| gpu_name(d)).unwrap_or_default();
         let width = gpu.width();
         let degree = crate::gpu_service::group_degree(&slots, request.gpus, width);
-        let mut grants = vec![];
+        let (mut grants, mut checkpoints) = (vec![], Vec::<Named>::new());
         for slot in &slots {
             let path = slot
                 .get("path")
@@ -1312,77 +1142,18 @@ impl Publisher {
             grants.push(ModelGrant {
                 package: installation.package.clone(),
                 slot: path,
-                repository: named.repository,
-                release: named.release,
-                lane: named.lane,
-                manifest: named.manifest,
+                repository: named.repository.clone(),
+                release: named.release.clone(),
+                lane: named.lane.clone(),
+                manifest: named.manifest.clone(),
                 components: vec![],
             });
+            if !named.repository.starts_with("local/") && !checkpoints.iter().any(|c| c.manifest == named.manifest) {
+                checkpoints.push(named);
+            }
         }
-        let _fetching = self.fetch(grants.iter().map(|g| g.manifest.clone()).collect());
-        // One download per checkpoint (a source model is already here), all at once: a LoRA
-        // never waits behind its 100 GB base.
-        // A slot that declares the components its callable uses has those downloaded first;
-        // the rest of its checkpoint follows once the run is on its GPU (`complete_behind`).
-        let declared: HashMap<&str, Vec<&str>> = slots
-            .iter()
-            .filter_map(|slot| {
-                let path = slot.get("path")?.as_str()?;
-                let components = slot.get("components")?.as_array()?;
-                Some((path, components.iter().filter_map(Value::as_str).collect()))
-            })
-            .collect();
-        let mut parts: HashMap<&str, Option<Vec<String>>> = HashMap::new();
-        for grant in &grants {
-            // An exact choice names no components before its header is here: the slot's
-            // declared ones are its part (a checkpoint lacking one downloads whole).
-            let part: Option<Vec<String>> =
-                declared.get(grant.slot.as_str()).map(|names| names.iter().map(|n| n.to_string()).collect());
-            let part = part.filter(|part| !part.is_empty());
-            // A checkpoint two slots share downloads whole if either needs all of it.
-            let merged = match (parts.remove(grant.manifest.as_str()), part) {
-                (Some(Some(mut a)), Some(b)) => {
-                    a.extend(b);
-                    a.sort();
-                    a.dedup();
-                    Some(a)
-                }
-                (None, part) => part,
-                _ => None,
-            };
-            parts.insert(grant.manifest.as_str(), merged);
-        }
-        // A `Weights[M]` slot's checkpoint lands as its structure alone: its reads fetch the
-        // objects they need (`fetch_part`), and the Hub keeps what they never read.
-        let raw: std::collections::BTreeSet<&str> = slots
-            .iter()
-            .filter(|slot| !crate::gpu_service::constructed(slot))
-            .filter_map(|slot| slot.get("path")?.as_str())
-            .collect();
-        let structure = |manifest: &str| {
-            grants.iter().filter(|g| g.manifest == manifest).all(|g| raw.contains(g.slot.as_str()))
-        };
-        let mut fetched = std::collections::BTreeSet::new();
-        let downloads: Vec<(&ModelGrant, Vec<String>, bool)> = grants
-            .iter()
-            .filter(|g| fetched.insert(g.manifest.clone()) && !g.repository.is_empty() && !g.repository.starts_with("local/"))
-            .map(|g| (g, parts.get(g.manifest.as_str()).cloned().flatten().unwrap_or_default(), structure(&g.manifest)))
-            .collect();
-        let landed = download_all(self, service, &request.source, &downloads, job)?;
-        let mut remainders = self.remainders.lock().unwrap();
-        for (grant, hold) in landed.into_iter().filter(|(grant, _)| !structure(&grant.manifest)) {
-            remainders
-                .entry(grant.manifest.clone())
-                .or_insert_with(|| Remainder {
-                    checkpoint: Named::of(grant),
-                    source: request.source.clone(),
-                    holds: Vec::new(),
-                    started: false,
-                })
-                .holds
-                .push(hold);
-        }
-        drop(remainders);
+        // Each checkpoint lands as its structure: what of it comes, and when, its calls direct.
+        self.structure(&request.source, &checkpoints, job)?;
         for grant in grants.iter_mut().filter(|g| g.components.is_empty() && !g.repository.is_empty()) {
             grant.components = self.components(&grant.manifest)?;
         }
@@ -1459,7 +1230,8 @@ pub(crate) fn choose(choice: &domain::ModelChoice, path: &str, (gpu, width): (&s
         }
         false => choice.lane.clone(),
     };
-    let named = Named { repository: choice.repository.clone(), release: choice.release.clone(), lane, manifest };
+    let length = choice.manifest.as_ref().map_or(0, |m| m.length);
+    let named = Named { repository: choice.repository.clone(), release: choice.release.clone(), lane, manifest, length };
     Ok(named)
 }
 
@@ -1505,147 +1277,6 @@ fn make_source(
     .map_err(|e| refused("model_source_failed", e))
 }
 
-/// How one ensure pulls: some components only (held until dropped), its streams, and whether
-/// no call waits on it (`Lanes`).
-#[derive(Default)]
-struct Pull {
-    components: Vec<String>,
-    /// Part objects beside `components`.
-    objects: Vec<ObjectRef>,
-    /// Part of the checkpoint (its structure, `components` and `objects`), never the whole.
-    part: bool,
-    streams: Option<usize>,
-    behind: bool,
-    stop: Option<PullCancellation>,
-}
-
-/// Download one resolved checkpoint: a release's lane anonymously, the owner's checkpoint by
-/// hash under the run's capability; `keep` names what its GC must not evict (`protected`).
-fn ensure_with(
-    store: &Store,
-    source: &hub::Source,
-    checkpoint: &Named,
-    keep: &[String],
-    pull: &Pull,
-    cancellation: Option<PullCancellation>,
-    bytes: &(dyn Fn(u64, u64) + Sync),
-) -> Result<Option<tensorfs_core::ensure::PartHold>, Failure> {
-    requesting(store, source, checkpoint, keep, pull, cancellation, bytes, |request| {
-        if !pull.part && pull.components.is_empty() {
-            return tensorfs_core::ensure::ensure(request).map(|_| None);
-        }
-        match tensorfs_core::ensure::ensure_part(request) {
-            Ok((_, hold)) => Ok(Some(hold)),
-            // A component the slot declares that this checkpoint lacks: the whole of it, as
-            // for a slot that declares none.
-            Err(e) if e.code == tensorfs_core::err::Code::NOT_CONTAINED && !pull.part => {
-                (request.components, request.objects) = (&[], &[]);
-                tensorfs_core::ensure::ensure(request).map(|_| None)
-            }
-            Err(e) => Err(e),
-        }
-    })
-}
-
-/// `checkpoint` as a TensorFS ensure request from its Hub (`pull` its part and streams), handed
-/// to `ensure`; a refusal answered as the run's reason.
-#[allow(clippy::too_many_arguments)]
-fn requesting<T>(
-    store: &Store,
-    source: &hub::Source,
-    checkpoint: &Named,
-    keep: &[String],
-    pull: &Pull,
-    cancellation: Option<PullCancellation>,
-    bytes: &(dyn Fn(u64, u64) + Sync),
-    ensure: impl FnOnce(&mut tensorfs_core::ensure::Request) -> tensorfs_core::err::Result<T>,
-) -> Result<T, Failure> {
-    let (model, manifest) = (checkpoint.repository.as_str(), checkpoint.manifest.as_str());
-    let catalog = match checkpoint.release.is_empty() {
-        true => Catalog::for_op(source, hub::Op::Read { model, manifest })?,
-        false => Catalog::new(source).map_err(|e| ("catalog_read_failed", e.0))?,
-    };
-    let refspec = checkpoint.refspec();
-    let mut keep = keep.to_vec();
-    keep.push(manifest.to_string());
-    let on_event = |event: &tensorfs_core::ensure::Event| bytes(event.bytes_done, event.bytes_total);
-    let mut request = tensorfs_core::ensure::Request::new(
-        store,
-        catalog.origin(),
-        &refspec,
-        catalog.credential(),
-        catalog.policy(),
-    );
-    request.lane = &checkpoint.lane;
-    request.keep = &keep;
-    request.on_event = Some(&on_event);
-    request.cancellation = cancellation;
-    (request.components, request.objects) = (&pull.components, &pull.objects);
-    if let Some(streams) = pull.streams {
-        request.streams = streams;
-    }
-    ensure(&mut request).map_err(|e| {
-        let (code, message) = refused("model_download_failed", e);
-        catalog.reason(code, message)
-    })
-}
-
-/// Every checkpoint a preparation needs, downloaded at once under one stage whose bytes are
-/// their sum; a checkpoint with a part named downloads that part only, and answers its hold.
-/// The first refusal is the answer, once every download has ended.
-fn download_all<'g>(
-    publisher: &Publisher,
-    service: &Service,
-    source: &hub::Source,
-    grants: &[(&'g ModelGrant, Vec<String>, bool)],
-    job: &Job,
-) -> Result<Vec<(&'g ModelGrant, tensorfs_core::ensure::PartHold)>, Failure> {
-    if grants.is_empty() {
-        return Ok(Vec::new());
-    }
-    let names: Vec<String> = grants
-        .iter()
-        .map(|(g, part, structure)| match (part.is_empty(), structure) {
-            (_, true) => format!("{}@{} {} (structure)", g.repository, g.release, g.lane),
-            (true, false) => format!("{}@{} {}", g.repository, g.release, g.lane),
-            (false, false) => format!("{}@{} {} ({})", g.repository, g.release, g.lane, part.join(", ")),
-        })
-        .collect();
-    job.stage(format!("downloading {}", names.join(" and ")));
-    let moved = Mutex::new(vec![(0u64, 0u64); grants.len()]);
-    let results: Vec<Result<Option<tensorfs_core::ensure::PartHold>, Failure>> = std::thread::scope(|scope| {
-        let handles: Vec<_> = grants
-            .iter()
-            .enumerate()
-            .map(|(at, (grant, part, structure))| {
-                let moved = &moved;
-                scope.spawn(move || {
-                    let pull = Pull { components: part.clone(), part: *structure, behind: job.behind, stop: job.stop.clone(), ..Pull::default() };
-                    publisher.ensure(service, source, &Named::of(grant), &pull, &|done, total| {
-                        let (done, total) = {
-                            let mut moved = moved.lock().unwrap();
-                            moved[at] = (done, total);
-                            moved.iter().fold((0, 0), |(d, t), (dd, tt)| (d + dd, t + tt))
-                        };
-                        job.bytes(done, total);
-                    })
-                })
-            })
-            .collect();
-        handles
-            .into_iter()
-            .map(|h| h.join().unwrap_or_else(|_| Err(("model_download_failed", "a download thread panicked".to_string()))))
-            .collect()
-    });
-    let mut held = Vec::new();
-    for ((grant, _, _), result) in grants.iter().zip(results) {
-        if let Some(hold) = result? {
-            held.push((*grant, hold));
-        }
-    }
-    Ok(held)
-}
-
 /// A TensorFS refusal as a run's reason; a download the disk cannot fit is its own.
 fn refused(code: &'static str, refusal: tensorfs_core::err::Refusal) -> Failure {
     match refusal.code {
@@ -1671,24 +1302,9 @@ fn apply_adapters(
         return Ok(());
     }
     let store = &publisher.store;
-    // Each adapter is held from GC (`protected`) while the next one downloads.
-    let mut fetching = vec![];
     job.stage(format!("preparing model adapters for {}", grant.slot));
-    let object = |manifest: &str| -> Result<tensorfs_core::ids::ObjectRef, Failure> {
-        let hex = manifest.trim_start_matches("sha256:");
-        // A held manifest's file is its exact canonical bytes.
-        let length = fs::metadata(store.manifest_path(hex))
-            .map_err(|e| {
-                (
-                    "model_download_failed",
-                    format!("manifest {hex} is not held: {e}"),
-                )
-            })?
-            .len();
-        Ok(tensorfs_core::ids::ObjectRef {
-            sha256: hex.to_string(),
-            length,
-        })
+    let object = |manifest: &str| {
+        access::held(store, manifest).map_err(|e| ("model_download_failed", format!("manifest {manifest} is not held: {e}")))
     };
     let mut selections = vec![];
     for adapter in &choice.adapters {
@@ -1702,13 +1318,14 @@ fn apply_adapters(
                 release: adapter.release.clone(),
                 lane: adapter.lane.clone(),
                 manifest: adapter.manifest.clone(),
+                length: 0,
             })?;
-            let pull = Pull { behind: job.behind, stop: job.stop.clone(), ..Pull::default() };
-            publisher.ensure(service, source, &named, &pull, &|d, t| job.bytes(d, t))?;
+            // An adapter is small and its view composes from all of it: it comes whole.
+            publisher.ensure(service, source, &named, job.stop.as_ref(), &|d, t| job.bytes(d, t))?;
             named.manifest
         } else {
             // A provider-source LoRA (civitai://, hf://) is made here, normalized at ingest.
-            let made = publisher.make(&adapter.source, &adapter.profiles, providers, job.behind, job.stop.as_ref(), &|stage, moved, total| {
+            let made = publisher.make(&adapter.source, &adapter.profiles, providers, job.stop.as_ref(), &|stage, moved, total| {
                 job.set(Progress::Preparing {
                     stage: format!("{stage} for an adapter of {}", grant.slot),
                     moved,
@@ -1717,7 +1334,6 @@ fn apply_adapters(
             })?;
             format!("sha256:{}", made.manifest.sha256)
         };
-        fetching.push(publisher.fetch(vec![manifest.clone()]));
         let strength = if adapter.scale.is_empty() {
             1.0
         } else {
@@ -2549,7 +2165,7 @@ mod tests {
     #[test]
     fn a_checkpoint_pulls_pinned_to_its_release_or_by_the_owners_hash() {
         let manifest = format!("sha256:{}", "ab".repeat(32));
-        let named = Named { repository: "o/m".into(), release: "1.0.0".into(), lane: "fp8".into(), manifest: manifest.clone() };
+        let named = Named { repository: "o/m".into(), release: "1.0.0".into(), lane: "fp8".into(), manifest: manifest.clone(), length: 9 };
         assert_eq!(named.refspec(), format!("o/m@1.0.0@{manifest}"));
         let private = Named { release: String::new(), ..named };
         assert_eq!(private.refspec(), format!("o/m@{manifest}"));
@@ -2663,7 +2279,6 @@ mod tests {
     struct Bench {
         root: PathBuf,
         source: Arc<Store>,
-        service: Arc<Service>,
         publisher: Arc<Publisher>,
     }
 
@@ -2671,10 +2286,9 @@ mod tests {
         fn new() -> Self {
             let root = std::env::temp_dir().join(format!("cm-lanes-{}", uuid::Uuid::new_v4()));
             let source = Arc::new(Store::ensure(&root.join("source")).unwrap());
-            let service = Service::open(&root.join("state"), &root.join("g"), 1).unwrap();
-            let store = Arc::new(Store::ensure(&root.join("store")).unwrap());
+            let store = Arc::new(Store::ensure_owned(&root.join("store")).unwrap());
             let publisher = Publisher::new(&root.join("published"), PackageSdk::default(), store).unwrap();
-            Self { root, source, service, publisher }
+            Self { root, source, publisher }
         }
 
         fn hub(&self, repository: &str, manifest: &ObjectRef, pace: u64) -> (hub::Source, Named, names_hub::Heard) {
@@ -2685,7 +2299,7 @@ mod tests {
                 manifest: manifest.clone(),
             };
             let (origin, heard) = names_hub::paced(&self.source, model, None, Duration::from_millis(pace));
-            let named = Named { repository: repository.into(), release: "1.0.0".into(), lane: "bf16".into(), manifest: manifest.id() };
+            let named = Named { repository: repository.into(), release: "1.0.0".into(), lane: "bf16".into(), manifest: manifest.id(), length: manifest.length };
             (hub::Source::new(&origin, None, vec!["localhost".into()], None).unwrap(), named, heard)
         }
     }
@@ -2694,128 +2308,123 @@ mod tests {
         heard.lock().unwrap().iter().filter(|h| h.starts_with(asked)).count()
     }
 
-    /// A job's Hub model input lands as its structure alone. Its reads over the job's source
-    /// channel fetch the objects they reach, each once, under one closure; the Hub keeps the
-    /// rest.
-    #[test]
-    fn a_job_reads_its_model_input_in_part_through_its_source_channel() {
+    /// One channel request answered (frames: a kind byte, a u32 length, JSON); Null once the
+    /// channel is closed.
+    fn ask(channel: &mut std::os::unix::net::UnixStream, request: Value) -> Value {
         use std::io::{Read, Write};
+        let body = serde_json::to_vec(&request).unwrap();
+        let frame = [&[0u8][..], &(body.len() as u32).to_be_bytes(), &body].concat();
+        let mut head = [0; 5];
+        if channel.write_all(&frame).is_err() || channel.read_exact(&mut head).is_err() {
+            return Value::Null;
+        }
+        let mut reply = vec![0; u32::from_be_bytes(head[1..].try_into().unwrap()) as usize];
+        channel.read_exact(&mut reply).unwrap();
+        serde_json::from_slice(&reply).unwrap()
+    }
+
+    /// A checkpoint a run chose lands as its structure alone: one closure, its manifest and
+    /// header, and an origin attested for what it lacks. Resolved again, it asks the Hub nothing.
+    #[test]
+    fn a_chosen_checkpoint_lands_as_its_structure_alone() {
         let bench = Bench::new();
         let manifest = checkpoint(&bench.source, 20, 4);
         let (hub, named, heard) = bench.hub("acme/source", &manifest, 0);
-        let objects = || count(&heard, "GET /o/");
-        let named = bench.publisher.download(&bench.service, &hub, named, "", true, None, &|_, _| ()).unwrap();
-        let structure = objects();
-        assert!(structure <= 2, "{structure} objects for the manifest and header");
-        let weights = crate::weights::Weights::new(Arc::new(Store::open(bench.publisher.store().root()).unwrap())).unwrap();
-        let closures = || count(&heard, "POST /v1/tensorfs/closure");
-        let resolved = closures();
-        let (publisher, service, parts) = (bench.publisher.clone(), bench.service.clone(), Parts::default());
-        let fetch: crate::weights::Fetch = Arc::new(move |_, wanted| {
-            publisher.fetch_part(&service, &hub, &named, &parts, wanted).map_err(|(code, message)| format!("{code}: {message}"))
-        });
-        let grant = crate::weights::Grant::new("owner", "run", &bench.root, [(manifest.id(), manifest.length)].into(),
-            BTreeMap::new(), None, crate::weights::GrantAuthority {
-                current: Arc::new(|| true), bind_output: Arc::new(|_, _| Ok(())), fetch: Some(fetch), replay: None });
-        let frame = crate::device_executor::Frame { operation: "source".into(), manifest: manifest.id(), ..Default::default() };
-        let (answer, channel, _) = weights.answer(&grant, &frame);
-        assert!(answer.ok, "{}", answer.detail);
-        let mut channel = std::os::unix::net::UnixStream::from(std::os::fd::OwnedFd::from(channel.unwrap()));
-        let mut read = |key: &str| -> Vec<u8> {
-            let request = json!({"op": "read", "manifest": manifest.id(), "manifest_length": manifest.length,
-                "component": "model", "key": key, "role": "value", "offset": 0, "length": 32768});
-            let body = serde_json::to_vec(&request).unwrap();
-            channel.write_all(&[0]).unwrap();
-            channel.write_all(&(body.len() as u32).to_be_bytes()).unwrap();
-            channel.write_all(&body).unwrap();
-            let mut data = vec![];
-            let frame = |channel: &mut std::os::unix::net::UnixStream| {
-                let mut head = [0; 5];
-                channel.read_exact(&mut head).unwrap();
-                let mut body = vec![0; u32::from_be_bytes(head[1..].try_into().unwrap()) as usize];
-                channel.read_exact(&mut body).unwrap();
-                (head[0], body)
-            };
-            let (kind, reply) = frame(&mut channel);
-            assert_eq!((kind, serde_json::from_slice::<Value>(&reply).unwrap()), (0, json!({"result": 32768})));
-            while data.len() < 32768 {
-                data.extend(frame(&mut channel).1);
-            }
-            data
-        };
-        let first = read("w007");
-        assert_eq!(first[4..8], [7, 4, 0, 0]);
-        assert_eq!(objects(), structure + 1);
-        assert_eq!(read("w007"), first);
-        assert_eq!(read("w011")[4..8], [11, 4, 0, 0]);
-        assert_eq!(objects(), structure + 2, "each object once; the other 18 stay at the Hub");
-        assert_eq!(closures(), resolved + 1, "one closure for every read");
+        let job = Job::default();
+        bench.publisher.structure(&hub, std::slice::from_ref(&named), &job).unwrap();
+        let store = bench.publisher.store();
+        assert_eq!(count(&heard, "GET /o/"), 2, "the manifest and the header: {heard:?}");
+        assert_eq!(count(&heard, "POST /v1/tensorfs/closure"), 1);
+        assert!(!crate::access::whole(store, &manifest.id(), &[]));
+        let origin = tensorfs_core::origin::of(store.root(), &manifest).unwrap().unwrap();
+        assert_eq!((origin.refspec.as_str(), origin.lane.as_str()), ("acme/source@1.0.0", "bf16"));
+        let asked = heard.lock().unwrap().len();
+        bench.publisher.structure(&hub, &[named], &job).unwrap();
+        assert_eq!(heard.lock().unwrap().len(), asked, "a held structure asks nothing");
         let _ = fs::remove_dir_all(&bench.root);
     }
 
-    /// Over a real link a download no call waits on (a hint's, a remainder) stops while one a
-    /// call waits on runs, and starts again once it ends, keeping what it landed.
+    /// Two calls reading one checkpoint held in part (two sessions, one model) fetch each object
+    /// once; once all of it is here, a call's waits and channel ask the Hub nothing (a warm run).
     #[test]
-    fn a_download_no_call_waits_on_goes_behind_one_a_call_does() {
+    fn calls_sharing_a_checkpoint_fetch_each_object_once_and_a_warm_one_asks_nothing() {
         let bench = Bench::new();
-        let (later, now) = (checkpoint(&bench.source, 40, 1), checkpoint(&bench.source, 8, 2));
-        let (behind_hub, behind, behind_heard) = bench.hub("acme/later", &later, 25);
-        let (waited_hub, waited, _) = bench.hub("acme/now", &now, 300);
-        let objects = |heard| count(heard, "GET /o/");
-        let pull = Pull { streams: Some(1), behind: true, ..Pull::default() };
+        let manifest = checkpoint(&bench.source, 24, 5);
+        let (hub, named, heard) = bench.hub("acme/shared", &manifest, 20);
+        bench.publisher.structure(&hub, std::slice::from_ref(&named), &Job::default()).unwrap();
+        let store = bench.publisher.store().clone();
+        let objects = crate::access::objects(&crate::access::header(&store, &manifest).unwrap(), &[]);
+        let call = |order| crate::access::Fetch::new(store.clone(), Some(hub.clone()), vec![manifest.id()], order);
+        let (first, second) = (call(1), call(2));
         std::thread::scope(|scope| {
-            let hint = scope.spawn(|| bench.publisher.ensure(&bench.service, &behind_hub, &behind, &pull, &|_, _| ()));
-            while objects(&behind_heard) < 3 && !hint.is_finished() {
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            let before = objects(&behind_heard);
-            bench.publisher.download(&bench.service, &waited_hub, waited, "", false, None, &|_, _| ()).unwrap();
-            let during = objects(&behind_heard) - before;
-            // Alongside, it would have asked for ~12 more objects in the 300 ms the call took.
-            assert!(during <= 2, "{during} objects moved behind a download a call waited on");
-            hint.join().unwrap().unwrap();
+            scope.spawn(|| first.wait(&manifest, &objects).unwrap());
+            scope.spawn(|| second.wait(&manifest, &objects[..12]).unwrap());
         });
-        assert_eq!(count(&behind_heard, "POST /v1/tensorfs/closure"), 2, "it stopped and started again");
-        let asked: Vec<String> = behind_heard.lock().unwrap().iter().filter(|h| h.starts_with("GET /o/")).cloned().collect();
-        let distinct: std::collections::BTreeSet<_> = asked.iter().collect();
-        assert!(asked.len() <= distinct.len() + 1, "what it landed before it stopped is kept: {asked:?}");
-        for (repository, manifest) in [("acme/later", &later), ("acme/now", &now)] {
-            tensorfs_core::checkpoint_root::check_source(bench.publisher.store(), repository, manifest).unwrap();
+        assert!(crate::access::whole(&store, &manifest.id(), &[]));
+        assert_eq!(count(&heard, "GET /o/"), 2 + 24, "each object once: {heard:?}");
+        let asked = heard.lock().unwrap().len();
+        let warm = call(3);
+        warm.wait(&manifest, &objects).unwrap();
+        let mut channel = std::os::unix::net::UnixStream::from(std::os::fd::OwnedFd::from(warm.channel().unwrap()));
+        let rows: Vec<Value> = objects.iter().map(|o| json!({"sha256": o.sha256, "length": o.length})).collect();
+        let waited = ask(&mut channel, json!({"id": 1, "op": "wait", "manifest": manifest.id(), "objects": rows}));
+        assert_eq!(waited, json!({"id": 1, "result": null}));
+        assert_eq!(heard.lock().unwrap().len(), asked, "a warm call asks the Hub nothing");
+        let _ = fs::remove_dir_all(&bench.root);
+    }
+
+    /// What a call's executor schedules downloads only while the call lives: its end (or its
+    /// run's cancel) closes the channel, fails its waits and drops its tickets, and the fetcher
+    /// stops. What landed stays.
+    #[test]
+    fn an_ended_call_drops_its_tickets() {
+        let bench = Bench::new();
+        let manifest = checkpoint(&bench.source, 40, 6);
+        let (hub, named, heard) = bench.hub("acme/canceled", &manifest, 100);
+        bench.publisher.structure(&hub, std::slice::from_ref(&named), &Job::default()).unwrap();
+        let store = bench.publisher.store().clone();
+        let objects = crate::access::objects(&crate::access::header(&store, &manifest).unwrap(), &[]);
+        let fetch = crate::access::Fetch::new(store.clone(), Some(hub.clone()), vec![manifest.id()], 7);
+        let mut channel = std::os::unix::net::UnixStream::from(std::os::fd::OwnedFd::from(fetch.channel().unwrap()));
+        let rows: Vec<Value> = objects.iter().map(|o| json!({"sha256": o.sha256, "length": o.length})).collect();
+        let scheduled = ask(&mut channel, json!({"id": 1, "op": "schedule", "manifest": manifest.id(), "objects": rows, "rank": 0}));
+        assert_eq!(scheduled, json!({"id": 1, "result": null}));
+        while count(&heard, "GET /o/") < 2 + 4 {
+            std::thread::sleep(Duration::from_millis(5));
         }
+        fetch.end();
+        let waited = ask(&mut channel, json!({"id": 2, "op": "wait", "manifest": manifest.id(), "objects": rows}));
+        assert_ne!(waited, json!({"id": 2, "result": null}), "a wait after the end never answers present");
+        // Every request went out at once and each answer takes 100 ms: the ones on the wire stop.
+        let landed = || objects.iter().filter(|o| store.contains(&o.sha256)).count();
+        std::thread::sleep(Duration::from_millis(300));
+        let at_end = landed();
+        std::thread::sleep(Duration::from_millis(700));
+        assert_eq!(landed(), at_end, "nothing lands once its tickets dropped");
+        assert!(at_end < objects.len(), "{at_end} of {} landed: it stopped short", objects.len());
+        assert!(store.manifest_path(&manifest.sha256).is_file(), "the structure stays");
         let _ = fs::remove_dir_all(&bench.root);
     }
 
-    /// A call needing the checkpoint a hint is downloading takes it over at full speed rather
-    /// than waiting behind it, and shows its bytes done of the whole, what the hint landed
-    /// included; the hint then finds it here and moves nothing more.
+    /// A warm set member's `downloaded`: its call wants what its constructions read, behind every
+    /// run, and the level is reached as that ticket completes.
     #[test]
-    fn a_call_takes_over_the_download_a_hint_started() {
+    fn warm_downloaded_comes_from_its_tickets_completion() {
         let bench = Bench::new();
-        let later = checkpoint(&bench.source, 40, 3);
-        // Two doors to the one checkpoint tell the hint's object asks from the call's.
-        let (hint_hub, named, hint_heard) = bench.hub("acme/later", &later, 50);
-        let (call_hub, _, call_heard) = bench.hub("acme/later", &later, 50);
-        let objects = |heard| count(heard, "GET /o/");
-        let seen = Mutex::new(Vec::new());
-        let pull = Pull { streams: Some(1), behind: true, ..Pull::default() };
-        std::thread::scope(|scope| {
-            let hint = scope.spawn(|| bench.publisher.ensure(&bench.service, &hint_hub, &named, &pull, &|_, _| ()));
-            while objects(&hint_heard) < 3 && !hint.is_finished() {
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            bench.publisher.download(&bench.service, &call_hub, named.clone(), "", false, None, &|done, total| {
-                seen.lock().unwrap().push((done, total))
-            })
-            .unwrap();
-            let hinted = objects(&hint_heard);
-            assert!(objects(&call_heard) + hinted >= 40 && hinted <= 6, "the call fetched the rest: {hinted} by the hint");
-            hint.join().unwrap().unwrap();
-            assert_eq!(objects(&hint_heard), hinted, "the hint moved nothing after the call");
-        });
-        let seen = seen.into_inner().unwrap();
-        let total = seen.last().unwrap().1;
-        assert_eq!(seen.last(), Some(&(total, total)));
-        assert!(seen.iter().any(|&(done, all)| all == total && done > 0 && done < total), "{seen:?}");
+        let manifest = checkpoint(&bench.source, 16, 7);
+        let (hub, named, heard) = bench.hub("acme/warm", &manifest, 10);
+        bench.publisher.structure(&hub, std::slice::from_ref(&named), &Job::default()).unwrap();
+        let store = bench.publisher.store().clone();
+        let selected = [(manifest.id(), vec!["model".to_string()])];
+        assert!(!crate::access::whole(&store, &manifest.id(), &selected[0].1));
+        let member = crate::access::Fetch::new(store.clone(), Some(hub.clone()), vec![manifest.id()], u64::MAX);
+        member.keep(&selected).unwrap();
+        let started = Instant::now();
+        while !crate::access::whole(&store, &manifest.id(), &selected[0].1) {
+            assert!(started.elapsed() < Duration::from_secs(60), "never downloaded: {heard:?}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(count(&heard, "GET /o/"), 2 + 16);
         let _ = fs::remove_dir_all(&bench.root);
     }
 }

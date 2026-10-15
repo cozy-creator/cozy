@@ -354,14 +354,17 @@ pub struct Member {
     pub level: Level,
     /// Why it holds less than `level`, from the last pass over the set.
     held_back: Mutex<&'static str>,
+    /// Its weights' fetches, under the warm run's access, for as long as it is in the set.
+    fetch: Option<Arc<crate::access::Fetch>>,
 }
 impl Member {
-    pub fn new(held: HeldGeneration, plan: Option<Plan>, level: Level) -> Arc<Self> {
+    pub fn new(held: HeldGeneration, plan: Option<Plan>, level: Level, fetch: Option<Arc<crate::access::Fetch>>) -> Arc<Self> {
         Arc::new(Self {
             held,
             plan,
             level,
             held_back: Mutex::new(""),
+            fetch,
         })
     }
 }
@@ -1001,13 +1004,20 @@ impl Pool {
         let _pass = self.keeping.lock().unwrap();
         self.quiet_pass();
         for member in self.warm_set(actor) {
+            // From `downloaded` up, what its constructions read comes behind every call's.
+            if let (Some(plan), Some(fetch), true) = (&member.plan, &member.fetch, member.level >= Level::Downloaded) {
+                let selected: Vec<_> = plan.selections().into_iter().map(|s| (s.manifest, s.components)).collect();
+                if let Err(error) = fetch.keep(&selected) {
+                    eprintln!("warm set: downloading {}: {error}", plan.construction);
+                }
+            }
             let held_back = match (&member.plan, member.level) {
                 (_, Level::Installed) => "",
                 (None, _) => UNBOUND,
                 (_, Level::Downloaded) => "",
                 (_, Level::Imported) => self.import(&member.held),
                 (Some(plan), Level::Host | Level::Gpu) => match self.import(&member.held) {
-                    "" => self.load_member(engine, &member.held, plan, member.level),
+                    "" => self.load_member(engine, &member, plan),
                     held_back => held_back,
                 },
             };
@@ -1030,13 +1040,8 @@ impl Pool {
         }
     }
     /// A member's executor loaded when the call slot is free: empty once it is, else why not.
-    fn load_member(
-        self: &Arc<Self>,
-        engine: &Arc<Engine>,
-        held: &HeldGeneration,
-        plan: &Plan,
-        level: Level,
-    ) -> &'static str {
+    fn load_member(self: &Arc<Self>, engine: &Arc<Engine>, member: &Member, plan: &Plan) -> &'static str {
+        let (held, level) = (&member.held, member.level);
         if self.level(&plan.construction).is_some_and(|holds| holds >= level) {
             return "";
         }
@@ -1048,7 +1053,7 @@ impl Pool {
             return "a request is queued; it loads after";
         }
         let asked = Instant::now();
-        let mut result = self.prewarm(engine, held, plan.clone(), 0, true);
+        let mut result = self.prewarm(engine, held, plan.clone(), 0, true, member.fetch.clone());
         if let (Ok("loaded" | "already loaded"), Level::Gpu) = (&result, level) {
             result = self.map_member(plan);
         }
@@ -1142,7 +1147,7 @@ impl Pool {
         match (executor, &member.plan) {
             (Some(level), _) => level,
             _ if imported().is_some_and(|parent| parent.ready()) => Level::Imported,
-            (None, Some(plan)) if self.holds(plan) => Level::Downloaded,
+            (None, Some(plan)) if self.downloaded(plan) => Level::Downloaded,
             _ => Level::Installed,
         }
     }
@@ -1192,12 +1197,20 @@ impl Pool {
             self.ended(plan, start, degree);
         }
     }
-    /// Whether the store holds every model `plan` binds.
+    pub fn store(&self) -> &Arc<Store> {
+        &self.store
+    }
+    /// Whether the store holds the structure of every model `plan` binds.
     pub fn holds(&self, plan: &Plan) -> bool {
         plan.selections().iter().all(|selected| {
             let hex = selected.manifest.trim_start_matches("sha256:");
             self.store.manifest_path(hex).exists()
         })
+    }
+    /// Every object its constructions read is here: `downloaded`.
+    pub fn downloaded(&self, plan: &Plan) -> bool {
+        let selections = plan.selections();
+        selections.iter().all(|s| crate::access::whole(&self.store, &s.manifest, &s.components))
     }
     /// The highest level each App of each generation holds now (keyed `(generation,
     /// application)`): an import-only parent, or an executor. A callee's executors in a
@@ -1848,7 +1861,7 @@ impl Pool {
     /// already there (it never makes room), without waiting for the parent's own run to end.
     /// It takes the GPU's call slot like any call, so a child call in flight finishes first, and
     /// loads only inside its root's lane: once bound, until released.
-    pub fn prefetch(self: &Arc<Self>, engine: &Arc<Engine>, held: HeldGeneration, plan: Plan, (root, family): (u64, Option<String>), owner: String) {
+    pub fn prefetch(self: &Arc<Self>, engine: &Arc<Engine>, held: HeldGeneration, plan: Plan, (root, family): (u64, Option<String>), owner: String, fetch: Arc<crate::access::Fetch>) {
         let (pool, engine) = (self.clone(), engine.clone());
         let started = std::thread::Builder::new()
             .name("executor-prefetch".into())
@@ -1886,7 +1899,7 @@ impl Pool {
                 };
                 if !active() { return; }
                 let waited = asked.elapsed();
-                let result = pool.prewarm(&engine, &held, plan, start, false);
+                let result = pool.prewarm(&engine, &held, plan, start, false, Some(fetch));
                 pool.settle_lane(&key, start, degree);
                 pool.note_prewarm(&key, waited, asked.elapsed() - waited, &result);
             });
@@ -1927,6 +1940,7 @@ impl Pool {
         plan: Plan,
         start: usize,
         member: bool,
+        fetch: Option<Arc<crate::access::Fetch>>,
     ) -> io::Result<&'static str> {
         if self.sessions.lock().unwrap().contains_key(&session_key(&plan.construction, start)) {
             return Ok("already loaded");
@@ -1964,7 +1978,7 @@ impl Pool {
             self.devices[start].memory.with(|gpu| gpu.spawned(&plan.construction, birth.pid));
             Ok(())
         })?;
-        match self.call(engine, "", held, plan, &load_caps, &mut session, true, None) {
+        match self.call(engine, "", held, plan, &load_caps, &mut session, true, None, fetch) {
             Ok(_) => {
                 self.keep_idle(session);
                 Ok("loaded")
@@ -2648,7 +2662,8 @@ impl Pool {
         let fresh = plan.clone();
         let error = {
             let mut session = session;
-            match self.call(engine, id, &held, plan, &load_caps, &mut session, false, calls) {
+            let fetch = calls.map(|calls| engine.get(id).map(|record| calls.fetch(&record, &plan))).transpose()?;
+            match self.call(engine, id, &held, plan, &load_caps, &mut session, false, calls, fetch) {
                 Ok(true) => {
                     self.keep_idle(session);
                     return Ok(());
@@ -2824,8 +2839,19 @@ impl Pool {
         session: &mut Session,
         load_only: bool,
         calls: Option<&Arc<crate::calls::Calls>>,
+        fetch: Option<Arc<crate::access::Fetch>>,
     ) -> io::Result<bool> {
         let (start, degree) = (session.start, plan.degree);
+        // Its weights' fetches end with it: a run's under its access, a prewarm's under its own.
+        let raw = match plan.sources.is_empty() {
+            true => None,
+            false => {
+                let manifests: Vec<SelectedManifest> = plan.sources.iter()
+                    .map(|source| SelectedManifest { manifest: source.manifest.clone(), components: vec![] })
+                    .collect();
+                Some(ModelSources::open_shared(self.store.clone(), &manifests)?)
+            }
+        };
         let construction = plan.construction.clone();
         let gpus = self.lane(start, degree)?;
         let gpu = gpus.first().map(|device| &device.memory);
@@ -2860,6 +2886,8 @@ impl Pool {
             spool: None,
             caller: None,
             weights: None,
+            fetch: fetch.as_ref(),
+            raw: raw.as_ref(),
         };
         if !session.loaded {
             let interface_path = self.interface_file(&session.executor, held)?;
@@ -3204,9 +3232,9 @@ impl Pool {
         let interface = session.executor.root_path().join("package-interface.json");
         let caller = calls.map(|calls| calls.caller(&record, held, document, &interface, &spool).0);
         callbacks.caller = caller.as_ref();
-        let grant = match calls {
-            Some(calls) => calls.grant(engine, &record, &plan, document, &spool)?,
-            None => None,
+        let grant = match (calls, &fetch) {
+            (Some(calls), Some(fetch)) => calls.grant(engine, &record, &plan, document, &spool, fetch)?,
+            _ => None,
         };
         callbacks.weights = calls.zip(grant.as_ref()).map(|(calls, grant)| (calls.weights(), grant));
         session.executor.waits = caller.as_ref().map(|caller| caller.waits(engine));
@@ -4272,6 +4300,10 @@ struct Callbacks<'a> {
     caller: Option<&'a crate::calls::Caller>,
     /// Its weights broker and grant: its `Weights[M]` sources and weights outputs.
     weights: Option<(&'a crate::weights::Weights, &'a crate::weights::Grant)>,
+    /// The call's fetches: its readers wait on them, and its executor asks for channels.
+    fetch: Option<&'a Arc<crate::access::Fetch>>,
+    /// Its `Weights[M]` sources' headers and assets (`model_source`), for Runtime to plan.
+    raw: Option<&'a ModelSources>,
 }
 impl Services for Callbacks<'_> {
     fn object_files(&mut self, frame: &Frame, plan: Option<File>) -> io::Result<(Answer, Vec<File>)> {
@@ -4284,7 +4316,7 @@ impl Services for Callbacks<'_> {
             length: frame.length,
             stage: None,
         };
-        match self.host.object_files(self.peer, self.grants, request, plan) {
+        match self.host.object_files(self.peer, self.grants, request, plan, self.fetch) {
             Ok(files) => {
                 answer.ok = true;
                 answer.code.clear();
@@ -4375,25 +4407,6 @@ impl Services for Callbacks<'_> {
         frame: &Frame,
         descriptor: Option<File>,
     ) -> io::Result<(Answer, Option<File>)> {
-        if frame.kind == Kind::SealedPrefetch {
-            let mut answer = Answer::unavailable(frame.seq);
-            let plans =
-                descriptor.ok_or_else(|| io::Error::other("sealed prefetch omitted its plans"))?;
-            let request = SealedRequest {
-                sha256: &frame.sha256,
-                length: frame.length,
-                stage: None,
-            };
-            match self.host.prefetch(self.peer, self.grants, request, plans) {
-                Ok(()) => {
-                    answer.ok = true;
-                    answer.code.clear();
-                    answer.detail.clear();
-                }
-                Err(error) => answer.detail = error.to_string(),
-            }
-            return Ok((answer, None));
-        }
         if frame.kind == Kind::SealedTier {
             let mut answer = Answer::unavailable(frame.seq);
             let plan = descriptor
@@ -4405,7 +4418,7 @@ impl Services for Callbacks<'_> {
             };
             // A refusal belongs to this weight set; the executor determines whether another
             // supported source remains. It does not grant permission to open the Store.
-            match self.host.seal(self.peer, self.grants, request, plan) {
+            match self.host.seal(self.peer, self.grants, request, plan, self.fetch) {
                 Ok(granted) => {
                     (answer.ok, answer.held) = (true, granted.is_some());
                     answer.code.clear();
@@ -4428,7 +4441,7 @@ impl Services for Callbacks<'_> {
                 length: frame.length,
                 stage: frame.stage_regions.as_deref(),
             };
-            match self.host.stage(self.peer, self.grants, request, plan) {
+            match self.host.stage(self.peer, self.grants, request, plan, self.fetch) {
                 Ok(staged) => {
                     answer.ok = true;
                     answer.code.clear();
@@ -4439,10 +4452,31 @@ impl Services for Callbacks<'_> {
             }
             return Ok((answer, None));
         }
+        if frame.kind == Kind::FetchChannel {
+            drop(descriptor);
+            let mut answer = Answer::unavailable(frame.seq);
+            let Some(fetch) = self.fetch else {
+                return Ok((answer, None));
+            };
+            return Ok(match fetch.channel() {
+                Ok(channel) => {
+                    (answer.ok, answer.descriptor) = (true, true);
+                    answer.code.clear();
+                    answer.detail.clear();
+                    (answer, Some(channel))
+                }
+                Err(error) => {
+                    answer.code = "fetch_channel_refused".into();
+                    answer.detail = error.to_string();
+                    (answer, None)
+                }
+            });
+        }
         if frame.kind == Kind::ModelSource {
             drop(descriptor);
             // A refusal is an answer: that executor fails its load with the reason.
-            return Ok(match self.sources.serve(frame) {
+            let raw = self.raw.filter(|raw| raw.selected_facts(&frame.manifest).is_ok());
+            return Ok(match raw.unwrap_or(self.sources.as_ref()).serve(frame) {
                 Ok((answer, file)) => (answer, Some(file)),
                 Err(error) => {
                     let mut answer = Answer::unavailable(frame.seq);

@@ -579,15 +579,24 @@ impl Catalog {
     /// traded here, so a capability the Hub refused, or that expired, ends the operation
     /// before any request goes out without it.
     pub fn for_op(source: &Source, op: Op) -> Result<Self, (&'static str, String)> {
+        let catalog = Self::scoped(source, op)?;
+        if let Some(presenter) = &catalog.credential {
+            let tokens = Tokens { capability: presenter.capability.clone(), origin: source.origin.clone() };
+            if tokens.current().is_none() {
+                if let Some(ended) = presenter.capability.ended() {
+                    return Err(ended);
+                }
+            }
+        }
+        Ok(catalog)
+    }
+
+    /// `for_op` with nothing traded until a request needs the token (a fetch whose objects
+    /// are all here asks nothing).
+    pub fn scoped(source: &Source, op: Op) -> Result<Self, (&'static str, String)> {
         let mut catalog = Self::new(source).map_err(|e| ("catalog_read_failed", e.0))?;
         match &source.capability {
             Some(capability) if capability.names(op) => {
-                let tokens = Tokens { capability: capability.clone(), origin: source.origin.clone() };
-                if tokens.current().is_none() {
-                    if let Some(ended) = capability.ended() {
-                        return Err(ended);
-                    }
-                }
                 catalog.credential = Some(Presenter {
                     capability: capability.clone(),
                     origin: source.origin.clone(),

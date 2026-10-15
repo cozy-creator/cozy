@@ -35,6 +35,9 @@ pub struct Calls {
     parents: Mutex<HashMap<String, Arc<Parent>>>,
     /// Every attempt's weights sources and outputs (`weights_writer`).
     weights: crate::weights::Weights,
+    store: Arc<Store>,
+    /// Each live call's fetches, by run: its cancel ends them at once.
+    fetches: Mutex<HashMap<String, Vec<Weak<crate::access::Fetch>>>>,
 }
 
 /// A running attempt that calls: its signer, spool, callables and calls.
@@ -165,7 +168,9 @@ impl Calls {
             service: Arc::downgrade(service),
             runs: runs.map_or_else(Weak::new, Arc::downgrade),
             parents: Mutex::new(HashMap::new()),
-            weights: crate::weights::Weights::new(store)?,
+            weights: crate::weights::Weights::new(store.clone())?,
+            store,
+            fetches: Mutex::default(),
         });
         if let Err(error) = calls.sweep_canceled_outputs(&service.engine) {
             eprintln!("startup canceled native outputs: {error}");
@@ -185,6 +190,18 @@ impl Calls {
 
     pub(crate) fn weights(&self) -> &crate::weights::Weights {
         &self.weights
+    }
+
+    /// One call's fetches of `plan`'s checkpoints, under its run's Hub access and ordered by
+    /// its root's acceptance; they end with the call, or at once with its run's cancel.
+    pub(crate) fn fetch(&self, record: &Execution, plan: &Plan) -> Arc<crate::access::Fetch> {
+        let hub = self.runs.upgrade().and_then(|runs| runs.hub(&record.id));
+        let fetch = crate::access::Fetch::new(self.store.clone(), hub, plan.manifests(), record.root_seq());
+        let mut fetches = self.fetches.lock().unwrap();
+        let live = fetches.entry(record.id.clone()).or_default();
+        live.retain(|fetch| fetch.strong_count() > 0);
+        live.push(Arc::downgrade(&fetch));
+        fetch
     }
 
     /// `record`'s attempt as a caller of its environment's callables (`document`: its App's
@@ -218,8 +235,8 @@ impl Calls {
     }
 
     /// The attempt's weights grant: its plan's `Weights[M]` sources, the weights outputs its
-    /// function declares, where they are published and how a source held in part fetches what
-    /// it lacks. None when it reads and writes no weights.
+    /// function declares, where they are published and the call's `fetch` of what a source
+    /// held in part lacks. None when it reads and writes no weights.
     pub(crate) fn grant(
         &self,
         engine: &Arc<Engine>,
@@ -227,6 +244,7 @@ impl Calls {
         plan: &Plan,
         document: &Value,
         spool: &Path,
+        fetch: &Arc<crate::access::Fetch>,
     ) -> io::Result<Option<crate::weights::Grant>> {
         let entry = document["entrypoints"]
             .as_array()
@@ -242,10 +260,11 @@ impl Calls {
         if plan.sources.is_empty() && outputs.is_empty() {
             return Ok(None);
         }
-        let (destination, fetch) = match self.runs.upgrade() {
-            Some(runs) => runs.weights_access(&record.id, plan)?,
-            None => (None, None),
+        let destination = match self.runs.upgrade() {
+            Some(runs) => runs.destination(&record.id)?,
+            None => None,
         };
+        let fetch = Some(fetch.clone());
         let sources = plan.sources.iter().map(|s| (s.manifest.clone(), s.length)).collect();
         let actor = record.submission.as_ref().map(|s| s.actor.clone()).unwrap_or_default();
         let (run, attempt) = (record.id.clone(), record.attempt);
@@ -342,6 +361,7 @@ impl Calls {
         if service.engine.get(id).is_ok_and(|r| r.state == State::Queued) {
             return;
         }
+        self.fetches.lock().unwrap().remove(id);
         self.stop_children(id);
         if let Some(runs) = self.runs.upgrade() {
             runs.end(id);
@@ -357,6 +377,11 @@ impl Calls {
         if let Some(service) = self.service.upgrade() {
             if let Err(error) = self.sweep_canceled_outputs(&service.engine) {
                 eprintln!("canceled native outputs: {error}");
+            }
+        }
+        for fetch in self.fetches.lock().unwrap().remove(&record.id).into_iter().flatten() {
+            if let Some(fetch) = fetch.upgrade() {
+                fetch.end();
             }
         }
         if record.state.terminal() {

@@ -90,7 +90,8 @@ that descends from the machine. Same-UID package code is still not sandboxed.
 | `products.rs` | Run output log: `Outputs.publish` custody and `product` events (SET/APPEND, composite parts) | `publish`, `retain`, `document` | G |
 | `triage.rs` | One bounded triage bundle per failed attempt, named by its outcome | `TriageRef`, `Facts` | G |
 | `hub.rs` | Hub access (th-241, th-245): anonymous reads by name (catalog, closure); a run's capability traded once for a DPoP-bound token (JWT-bearer, leaf-signed assertion) and presented only on the private operations it names | `Leaf`, `Capability`, `Source`, `Catalog`, `Op` | D1 |
-| `published.rs` | Package and model preparation: releases and models from the Hub, provider-source models via TensorFS `source_model`, held per release and resolution; downloads keep the serving set out of GC | `Publisher`, `Request`, `Prepared` | D1 |
+| `published.rs` | Package and model preparation: releases from the Hub, each model's checkpoint chosen (rung, name+release+lane → manifest) and landed as its structure only, provider-source models via TensorFS `source_model`, held per release and resolution | `Publisher`, `Request`, `Prepared` | D1 |
+| `access.rs` | What a call's weights are fetched under: origins and their Hub access (the run's capability for the owner's checkpoint by hash), readers' waits (Now), the executor's `fetch_channel` (TensorFS `fetch::serve`) and a warm member's `downloaded` ticket, all ended with the call or its run's cancel | `Fetch` | D1 |
 | `adapter_views.rs` | Caller LoRA adapters as a zero-copy TensorFS derivation | — | D1 |
 | `runs.rs` | Run sources and preparation inside a run: accepted at once, install/download as its progress, the Hub capability in memory only. A warm run with no entrypoint installs and fetches its choices; one with no code makes provider sources and uploads to its weights destination | `Runs`, `Spec`, `Source` | D1 |
 | `weights.rs` | An attempt's weights: `weights_writer` sources and outputs over TensorFS's native channels; an adopted output kept in a local repository, recorded as a manifest product, published to the run's weights destination | `Weights`, `Grant` | D1 |
@@ -114,7 +115,7 @@ that descends from the machine. Same-UID package code is still not sandboxed.
 | `os.rs` | memfd, seals, peer credentials (`SO_PEERPIDFD`, `pidfd_open` fallback), pidfd exit | — | E |
 | `owner.rs` | Weight peers, import, sealed memfd cache (LRU/TTL), leases per pidfd; store claim through TensorFS `ensure_owned` | `Owner` | B1 |
 | `protocol.rs` | Private control-socket protocol (length-prefixed JSON + `SCM_RIGHTS`) | `Request`, `Command`, `Reply` | E |
-| `host_tier.rs` | Degree 1 host tier: machine-filled sealed layouts, adopted read-only, sized by live headroom | `HostTier`, `HostGrant`, `TierLimit`, `HostTierFacts` | B1 |
+| `host_tier.rs` | Degree 1 host tier: machine-filled sealed layouts, adopted read-only, sized by live headroom; a region's absent objects are fetched (Now) and copied as they land | `HostTier`, `HostGrant`, `TierLimit`, `HostTierFacts` | B1 |
 | `host_memory.rs` | Live host headroom (cgroup v1/v2 path, `MemAvailable`) | `HostMemory` | B1 |
 | `model_sources.rs` | Selected model headers/assets as verified bytes and sealed read-only descriptors; component byte facts for planning | `ModelSources`, `SelectedManifest` | B1 |
 | `resident_custody.rs` | Degree 2: executor-exported GPU regions kept as driver fds (no CUDA), leases, revocation | `ResidentCustody`, `HoldingKey`, `SharedRegion` | C |

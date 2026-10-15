@@ -406,7 +406,6 @@ pub enum Kind {
     SealedTier,
     SealedStage,
     ObjectFiles,
-    SealedPrefetch,
     DeviceTier,
     BudgetCell,
     DeviceRoom,
@@ -424,6 +423,8 @@ pub enum Kind {
     ModelPrefetch,
     /// An attempt's weights: one source read, one output written, or an output adopted.
     WeightsWriter,
+    /// A fresh channel over the call's checkpoints held in part (`access::Fetch::channel`).
+    FetchChannel,
     /// A `progress` event carrying a retained `log` observation (`Telemetry.log`).
     Log,
     #[default]

@@ -4,6 +4,7 @@
 //! repository, becomes a product of the run's log (its digest the output's manifest) and, with
 //! a weights destination, is published there before the adopt is answered.
 use crate::{
+    access::Fetch,
     device_executor::{Answer, Frame},
     hub,
 };
@@ -31,8 +32,6 @@ pub const MANIFEST_MEDIA: &str = "application/vnd.cozy.model-manifest";
 const EXCHANGE_MAX: u64 = 64 << 20;
 
 type BindOutput = Arc<dyn Fn(&str, &str) -> io::Result<()> + Send + Sync>;
-/// Makes objects of a source held here in part present, from the Hub it came from.
-pub type Fetch = Arc<dyn Fn(&ObjectRef, &[ObjectRef]) -> Result<(), String> + Send + Sync>;
 
 /// Execution-owner hooks: current attempt authority, durable output association, the
 /// sources' fetch, and the identity a committed derivation replays under (its function's code
@@ -40,7 +39,7 @@ pub type Fetch = Arc<dyn Fn(&ObjectRef, &[ObjectRef]) -> Result<(), String> + Se
 pub struct GrantAuthority {
     pub current: Arc<dyn Fn() -> bool + Send + Sync>,
     pub bind_output: BindOutput,
-    pub fetch: Option<Fetch>,
+    pub fetch: Option<Arc<Fetch>>,
     pub replay: Option<String>,
 }
 
@@ -66,7 +65,7 @@ pub struct Grant {
     pub current: Arc<dyn Fn() -> bool + Send + Sync>,
     /// Persist the run/output association before any native transaction can begin.
     bind_output: BindOutput,
-    fetch: Option<Fetch>,
+    fetch: Option<Arc<Fetch>>,
     replay: Option<String>,
     opened: Mutex<BTreeMap<String, String>>,
     /// Publications attempted and not yet in the run's log.
@@ -172,13 +171,15 @@ impl Weights {
         let source = reference(&frame.manifest, length)?;
         let (client, server) = UnixStream::pair().map_err(io_refusal)?;
         let (store, meta, current) = (self.store.clone(), self.meta.clone(), grant.current.clone());
-        let fetch = fetching(grant.fetch.clone());
+        let fetch = grant.fetch.clone();
         std::thread::Builder::new()
             .name("weights-source".into())
             .spawn(move || {
                 let check = move || current_or_refuse(&*current);
-                if let Err(refusal) = channel::serve_source(&store, &meta, &source, server, &check, &fetch)
-                {
+                let served = fetching(fetch.as_deref(), &source, |fetching| {
+                    channel::serve_source(&store, &meta, &source, server, &check, fetching)
+                });
+                if let Err(refusal) = served {
                     eprintln!("weights source {}: {}", source.id(), refusal.detail);
                 }
             })
@@ -232,7 +233,8 @@ impl Weights {
             .unwrap()
             .insert(transaction.clone(), slot.clone());
         let (client, server) = UnixStream::pair().map_err(io_refusal)?;
-        let (hooks_current, fetch) = (grant.current.clone(), fetching(grant.fetch.clone()));
+        let (hooks_current, fetch) = (grant.current.clone(), grant.fetch.clone());
+        let read = declaration.sources.first().map(|source| source.manifest.clone());
         let (store, meta) = (self.store.clone(), self.meta.clone());
         let (operation, output) = (grant.run.clone(), slot.clone());
         let committed = match derived::lookup(&store, &meta, &transaction).map_err(tfs)? {
@@ -250,18 +252,25 @@ impl Weights {
             .name("weights-output".into())
             .spawn(move || {
                 let check = move || current_or_refuse(&*hooks_current);
-                let hooks = channel::Hooks {
-                    check_current: &check,
-                    record_checkpoint: &|_: &tensorfs_core::jcs::Json| (),
-                    record_receipt: &|_: &derived::ReceiptFacts| (),
-                    fetch: &fetch,
-                };
-                let served = match (&writer, &committed) {
-                    (Some(writer), _) => {
-                        channel::serve_derived(writer, server, &operation, &output, None, &hooks)
+                let serve = |fetch: Option<&channel::Fetching>| {
+                    let hooks = channel::Hooks {
+                        check_current: &check,
+                        record_checkpoint: &|_: &tensorfs_core::jcs::Json| (),
+                        record_receipt: &|_: &derived::ReceiptFacts| (),
+                        fetch,
+                    };
+                    match (&writer, &committed) {
+                        (Some(writer), _) => {
+                            channel::serve_derived(writer, server, &operation, &output, None, &hooks)
+                        }
+                        (None, Some(receipt)) => channel::serve_derived_replay(receipt, server, &hooks),
+                        (None, None) => Ok(()),
                     }
-                    (None, Some(receipt)) => channel::serve_derived_replay(receipt, server, &hooks),
-                    (None, None) => Ok(()),
+                };
+                // A derivation's sources share their Hub: its first one's access fetches them.
+                let served = match &read {
+                    Some(read) => fetching(fetch.as_deref(), read, serve),
+                    None => serve(None),
                 };
                 if let Err(refusal) = served {
                     eprintln!("weights output {output}: {}", refusal.detail);
@@ -501,17 +510,20 @@ impl Weights {
     }
 }
 
-/// A run's fetch as TensorFS's: what its source lacks, from the Hub it came from.
-fn fetching(fetch: Option<Fetch>) -> impl Fn(&ObjectRef, &[ObjectRef]) -> tensorfs_core::err::Result<()> + Sync {
-    move |manifest, objects| match &fetch {
-        Some(fetch) => fetch(manifest, objects).map_err(|detail| tensorfs_core::err::Refusal {
-            code: tensorfs_core::err::Code::TRANSFER_FAILED,
-            detail,
-        }),
-        None => Err(tensorfs_core::err::Refusal {
-            code: tensorfs_core::err::Code::OBJECT_ABSENT,
-            detail: format!("{} of {} is not here and this run names no Hub it came from", objects[0].id(), manifest.id()),
-        }),
+/// `serve` with the derived channel's fetch of `manifest`'s absent objects, under the call's
+/// access (none: every source is here whole, and an absent object refuses).
+fn fetching(
+    fetch: Option<&Fetch>,
+    manifest: &ObjectRef,
+    serve: impl FnOnce(Option<&channel::Fetching>) -> tensorfs_core::err::Result<()>,
+) -> tensorfs_core::err::Result<()> {
+    let found = fetch.map(|fetch| fetch.fetching(manifest)).transpose().map_err(|e| tensorfs_core::err::Refusal {
+        code: tensorfs_core::err::Code::TRANSFER_FAILED,
+        detail: e.to_string(),
+    })?;
+    match found.flatten() {
+        Some((fetcher, access, stop)) => serve(Some(&channel::Fetching { fetcher: &fetcher, access, stop: &stop })),
+        None => serve(None),
     }
 }
 

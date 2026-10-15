@@ -65,12 +65,6 @@ impl ModelSources {
         let mut selected = BTreeMap::new();
         for selection in selections {
             let manifest = digest(&selection.manifest)?.to_owned();
-            if selection.components.is_empty() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "model selection names components",
-                ));
-            }
             let length = fs::metadata(store.manifest_path(&manifest))?.len();
             let snapshot = store
                 .read_manifest(&ObjectRef {
@@ -92,7 +86,11 @@ impl ModelSources {
                 return Err(failure("selected header length differs from its manifest"));
             }
             let header = Header::parse(&header_bytes).map_err(failure)?;
-            let wanted: BTreeSet<&str> = selection.components.iter().map(String::as_str).collect();
+            // No components named: all of them (a `Weights[M]` source, planned by Runtime).
+            let wanted: BTreeSet<&str> = match selection.components.is_empty() {
+                true => header.components.iter().map(|(name, _)| name.as_str()).collect(),
+                false => selection.components.iter().map(String::as_str).collect(),
+            };
             let mut traversal = Vec::new();
             for component in &wanted {
                 let tensors = header

@@ -29,6 +29,9 @@ use tensorfs_core::{
 };
 use tensorfs_plane::{layout::Layout, Plane, PlaneConfig, Tier};
 
+#[path = "common/names_hub.rs"]
+mod names_hub;
+
 const MIB: usize = 1 << 20;
 
 fn bytes_of(key: &str, n: usize) -> Vec<u8> {
@@ -303,7 +306,7 @@ fn ask(tier: &HostTier, peer: u64, fx: &Fixture) -> Option<File> {
             length,
             stage: None,
         },
-        plan,
+        plan, None,
     )
     .unwrap()
 }
@@ -383,7 +386,7 @@ fn unheld_layouts_go_oldest_first_and_held_ones_never() {
                 length,
                 stage: None,
             },
-            plan,
+            plan, None,
         )
     };
     // `other` lives in another store: the tier reads its own, so bring the bytes over.
@@ -446,7 +449,7 @@ fn a_released_layout_something_still_holds_stays_charged() {
         stage: None,
     };
     drop(
-        tier.seal(b, &[other.grant()], request, plan)
+        tier.seal(b, &[other.grant()], request, plan, None)
             .unwrap()
             .expect("streamed"),
     );
@@ -511,7 +514,7 @@ fn a_plan_outside_the_executors_selection_or_unsealed_is_refused() {
                 length,
                 stage: None,
             },
-            plan,
+            plan, None,
         )
         .unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
@@ -525,7 +528,7 @@ fn a_plan_outside_the_executors_selection_or_unsealed_is_refused() {
                 length,
                 stage: None,
             },
-            plan
+            plan, None
         )
         .is_err());
     // An unsealed plan could change after it was checked.
@@ -540,7 +543,7 @@ fn a_plan_outside_the_executors_selection_or_unsealed_is_refused() {
                 length: 2,
                 stage: None,
             },
-            open
+            open, None
         )
         .is_err());
     // An unregistered peer gets nothing.
@@ -554,7 +557,7 @@ fn a_plan_outside_the_executors_selection_or_unsealed_is_refused() {
                 length,
                 stage: None,
             },
-            plan
+            plan, None
         )
         .is_err());
     assert_eq!(tier.facts().ledger.fills.len(), 0);
@@ -647,7 +650,7 @@ fn inside_a_256_mib_scope() {
                 length,
                 stage: None,
             },
-            plan,
+            plan, None,
         )
         .unwrap();
     let granted = granted.expect("never refused");
@@ -732,35 +735,6 @@ fn a_first_load_fills_into_memory_reserved_at_admission() {
     );
 }
 
-/// An executor sends all its components' plans at once (`SealedPrefetch`): the tier fills them
-/// in the background and the ask that follows finds its layout filled or filling.
-#[test]
-fn a_prefetch_fills_while_the_executor_registers_and_the_ask_finds_it() {
-    let fx = Fixture::new("prefetch", &[3 * MIB, 40 * MIB]);
-    let tier = tier(&fx, 1 << 30);
-    let (_executor, a) = Executor::spawn(&tier);
-    let doc = serde_json::json!([{
-        "manifest": fx.manifest, "name": "sdxl/unet", "layout": "sha256:00", "window": 4 << 20,
-        "traversal": fx.traversal(), "components": ["unet"], "regions": fx.regions(), "parts": [],
-    }]);
-    let body = serde_json::to_vec(&doc).unwrap();
-    let sha256 = format!("{:x}", Sha256::digest(&body));
-    let request = SealedRequest {
-        sha256: &sha256,
-        length: body.len() as u64,
-        stage: None,
-    };
-    tier.prefetch(a, &[fx.grant()], request, sealed(&body))
-        .unwrap();
-    fx.adopt(&ask(&tier, a, &fx).expect("prefetched"));
-    let facts = tier.facts();
-    assert_eq!(
-        (facts.ledger.fills.len(), facts.entries),
-        (1, 1),
-        "{facts:?}"
-    );
-}
-
 /// A first load with nothing filled: the executor gets its layout the moment it is created and
 /// each region the moment it is in, so its load never waits for the whole fill; an older
 /// executor asking for the same layout gets it complete.
@@ -826,7 +800,7 @@ fn a_failed_fill_is_an_error_for_its_adopters_and_leaves_the_tier() {
             length,
             stage: None,
         },
-        plan,
+        plan, None,
     );
     assert!(match again {
         Ok(Some(granted)) => !fx.adopt_filling(&granted),
@@ -951,7 +925,7 @@ fn staged_ask(tier: &HostTier, peer: u64, fx: &Fixture, stage: &[u32]) -> File {
             length,
             stage: Some(stage),
         },
-        plan,
+        plan, None,
     )
     .unwrap()
     .expect("a layout, staged in part")
@@ -976,7 +950,7 @@ fn a_staged_executor_gets_only_what_it_streams_staged_and_object_files_for_the_r
     // The holes' bytes: the verified object files, handed over read-only.
     let (plan, sha256, length) = fx.plan(&["unet"]);
     let request = SealedRequest { sha256: &sha256, length, stage: None };
-    let files = tier.object_files(a, &[fx.grant()], request, plan).unwrap();
+    let files = tier.object_files(a, &[fx.grant()], request, plan, None).unwrap();
     assert!(!files.is_empty());
     for (_, file) in &files {
         // SAFETY: a scalar fcntl query on a descriptor we hold.
@@ -1002,7 +976,7 @@ fn a_staged_executor_gets_only_what_it_streams_staged_and_object_files_for_the_r
     // Its stream grows: region 2 is staged too, and only it.
     let (plan, sha256, length) = fx.plan(&["unet"]);
     let request = SealedRequest { sha256: &sha256, length, stage: Some(&[2]) };
-    assert_eq!(tier.stage(a, &[fx.grant()], request, plan).unwrap(), vec![2]);
+    assert_eq!(tier.stage(a, &[fx.grant()], request, plan, None).unwrap(), vec![2]);
     host.wait_ready(2).unwrap();
     assert!(host.hole(1) && host.hole(3));
     let facts = settled(&tier);
@@ -1087,3 +1061,60 @@ fn concurrent_windows_never_spend_the_same_room() {
         drop((first, second));
     }
 }
+
+/// A layout of a checkpoint the machine holds in part (its structure, as a run's preparation
+/// lands it): registered cold it waits for nothing; each region its stream asks for is fetched
+/// through the call's ticket and copied as it lands, in that order, every byte checked. Each
+/// object comes once, and what nobody read stays at the Hub.
+#[test]
+fn a_staged_region_waits_on_its_ticket_and_nothing_else_downloads() {
+    use tensorfs_core::{fetch::{Fetcher, Priority}, transport::PullCancellation};
+    let fx = Fixture::new("fetched", &[2 * MIB, 3 * MIB, MIB + 7, 5 * MIB]);
+    let hex = fx.manifest.trim_start_matches("sha256:").to_string();
+    let length = fs::metadata(fx.store.manifest_path(&hex)).unwrap().len();
+    let manifest = ObjectRef { sha256: hex, length };
+    let model = names_hub::Model { repository: "acme/unet".into(), release: "1.0.0".into(), lane: "bf16".into(), manifest: manifest.clone() };
+    let (origin, heard) = names_hub::paced(&fx.store, model, None, Duration::from_millis(30));
+    let gets = || heard.lock().unwrap().iter().filter(|h| h.starts_with("GET /o/")).count();
+    let root = std::env::temp_dir().join(format!("machine-tier-partial-{}", tensorfs_core::meta::now_nanos_unique()));
+    let store = Arc::new(Store::ensure_owned(&root).unwrap());
+    let hub = tensord::hub::Source::new(&origin, None, vec!["localhost".into()], None).unwrap();
+    let at = tensord::access::origin(&hub, "acme/unet", "1.0.0", "bf16", &manifest);
+    let access = tensord::access::of(&hub, &at).unwrap();
+    Fetcher::of(&store).unwrap().want(&at, access, &[], Priority::Now).wait(&[], &PullCancellation::default()).unwrap();
+    let structure = gets();
+    let tier = HostTier::new(store.clone(), HostTierConfig { fill_threads: 2, ttl: Duration::from_secs(3600), plans: None }, Box::new(Fixed(1 << 30))).unwrap();
+    let fetch = tensord::access::Fetch::new(store.clone(), Some(hub), vec![fx.manifest.clone()], 1);
+    let (_executor, a) = Executor::spawn_staged(&tier);
+    let (plan, sha256, length) = fx.plan(&["unet"]);
+    let cold = SealedRequest { sha256: &sha256, length, stage: Some(&[]) };
+    let granted = tier.seal(a, &[fx.grant()], cold, plan, Some(&fetch)).unwrap().expect("a layout with nothing staged");
+    assert_eq!(gets(), structure, "registering a cold layout fetches nothing");
+    let layout = fx.layout();
+    let host = tensorfs_plane::host::HostMem::adopt_sealed(granted.as_raw_fd(), &layout).unwrap();
+    let (plan, sha256, length) = fx.plan(&["unet"]);
+    let request = SealedRequest { sha256: &sha256, length, stage: Some(&[2, 0]) };
+    assert_eq!(tier.stage(a, &[fx.grant()], request, plan, Some(&fetch)).unwrap(), vec![2, 0]);
+    host.wait_ready(2).unwrap();
+    host.wait_ready(0).unwrap();
+    assert!(host.hole(1) && host.hole(3));
+    for part in layout.parts.iter().filter(|p| p.region == 0 || p.region == 2) {
+        let key = part.what.trim_start_matches("unet/").trim_end_matches("#value");
+        let n = fx.tensors.iter().find(|(k, _)| k == key).unwrap().1;
+        let mut got = vec![0; n];
+        granted.read_exact_at(&mut got, part.offset).unwrap();
+        assert!(got == bytes_of(key, n), "{} differs", part.what);
+    }
+    let objects: BTreeSet<String> = [0usize, 2]
+        .iter()
+        .flat_map(|&r| layout.regions[r].items.iter())
+        .filter_map(|item| match &item.source {
+            tensorfs_plane::layout::ItemSource::Object(range) => Some(range.obj.sha256.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(gets(), structure + objects.len(), "each staged object once, nothing else: {heard:?}");
+    drop(fetch);
+    let _ = fs::remove_dir_all(root);
+}
+

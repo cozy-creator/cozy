@@ -237,7 +237,7 @@ impl Service {
             id => self.engine.preparation(actor, id).ok()?,
         };
         let plan = bound.and_then(|bound| gpu.plan(&bound).ok()).filter(|plan| gpu.holds(plan));
-        Some(Member::new(held, plan, Level::named(&kept.level)?))
+        Some(Member::new(held, plan, Level::named(&kept.level)?, None))
     }
 
     pub fn submit(
