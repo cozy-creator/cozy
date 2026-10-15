@@ -1,6 +1,7 @@
 """One path for every call on a GPU machine: a deviceless root calls a GPU child, a GPU root
-calls a child on its own GPU, and a raw-GPU call runs beside a warm executor without ending
-it. Each answers its process and device so a caller sees where it ran."""
+calls a child on its own GPU, a raw-GPU call runs beside a warm executor without ending it, and
+a deviceless job calls children whose model slot declares one GPU. Each answers its process and
+device so a caller sees where it ran."""
 from __future__ import annotations
 
 import asyncio
@@ -8,7 +9,7 @@ import os
 
 import msgspec
 
-from cozy_runtime.author import App, Context, invocable
+from cozy_runtime.author import App, Config, Context, Loader, Model, invocable, uses_components
 
 app = App()
 
@@ -97,3 +98,56 @@ async def raw(ctx: Context, payload: Request) -> Ran:
     """A raw-GPU call: its own torch memory, no model."""
     tensor = _torch().full((32 << 20,), 3.0, device=str(ctx.device))
     return Ran(ctx.device.type, os.getpid(), float(tensor.sum().item()))
+
+
+class Graph:
+    """The checkpoint's one tensor, `model.weight`."""
+
+    def __init__(self) -> None:
+        module = _torch().nn.Module()
+        module.weight = _torch().nn.Parameter(_torch().empty(2048), requires_grad=False)
+        self.components = {"model": module}
+
+
+def _graph(config: Config) -> Graph:
+    return Graph()
+
+
+class Tiny(Model[Graph]):
+    """A constructed slot that declares no group: one GPU, as birefnet's and the describer's."""
+
+    graph: Graph
+
+    def load(self, loader: Loader) -> None:
+        self.graph = loader.construct(Graph, factory=_graph)
+
+    @uses_components("model")
+    def weight(self) -> object:
+        return self.graph.components["model"].weight
+
+
+@invocable
+async def modeled(ctx: Context, *, model: Tiny, hold_s: float = 0.0) -> Ran:
+    if ctx.device.type != "cuda":
+        raise ValueError("a modeled child got no GPU")
+    for _ in range(max(0, int(hold_s * 20))):
+        ctx.raise_if_cancelled()
+        await asyncio.sleep(0.05)
+    return Ran(str(ctx.device), os.getpid(), 0.0)
+
+
+app.entrypoint(internal=True)(modeled)
+
+
+class Children(msgspec.Struct):
+    children: list[Ran]
+
+
+@app.entrypoint(accelerator=False)
+async def cpu_job(ctx: Context, payload: Request) -> Children:
+    """H3 long_form's shape: deviceless, holding its run's GPUs while one-GPU children run."""
+
+    async def child() -> Ran:
+        return await modeled(hold_s=payload.hold_s)
+
+    return Children(list(await asyncio.gather(child(), child())))
