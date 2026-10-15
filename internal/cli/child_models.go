@@ -86,6 +86,9 @@ func (r *Resolver) UnpublishedChildModels(request records.Request) ([]records.Mo
 			return nil, problem
 		}
 		for _, binding := range bindings {
+			if ownFunction(request, binding) {
+				continue
+			}
 			child, problem := r.store.Install(binding.ChildInstallID)
 			if problem != nil {
 				return nil, problem

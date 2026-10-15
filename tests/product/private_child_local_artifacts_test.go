@@ -153,7 +153,7 @@ func TestUnpublishedChildLocalArtifactsReplayTheirDerivations(t *testing.T) {
 		}
 		// A writes weights, so it is never memoized: it runs again and TensorFS answers its
 		// derivation from the committed transaction, the same checkpoint.
-		if string(children[0].Result) != string(originalA.Result) {
+		if checkpointOf(t, children[0].Result) != checkpointOf(t, originalA.Result) {
 			t.Fatalf("cycle %d changed A's checkpoint: original=%+v actual=%+v", cycle, originalA, children[0])
 		}
 		if cycle < 3 {
@@ -163,11 +163,11 @@ func TestUnpublishedChildLocalArtifactsReplayTheirDerivations(t *testing.T) {
 			if cycle == 1 && children[1].Intent == originalB.Intent {
 				t.Fatal("parameter edit reused B's failed input")
 			}
-			if cycle == 2 && (string(children[1].Result) == string(latestB.Result) || children[1].Intent != latestB.Intent) {
+			if cycle == 2 && (checkpointOf(t, children[1].Result) == checkpointOf(t, latestB.Result) || children[1].Intent != latestB.Intent) {
 				t.Fatal("same-version library edit did not change only implementation identity")
 			}
 			latestB = children[1]
-		} else if string(children[1].Result) != string(latestB.Result) {
+		} else if checkpointOf(t, children[1].Result) != checkpointOf(t, latestB.Result) {
 			t.Fatalf("unchanged B did not replay its derivation: %+v", children[1])
 		}
 		link, issue := store.MachineExecution(parent.ID)
@@ -220,4 +220,18 @@ func TestUnpublishedChildLocalArtifactsReplayTheirDerivations(t *testing.T) {
 			t.Fatal("private intake modified the author's lock files")
 		}
 	}
+}
+
+// checkpointOf is a call's result without the run that produced it: the same derivation
+// answered for another run is the same checkpoint.
+func checkpointOf(t *testing.T, result []byte) string {
+	t.Helper()
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(result, &fields) != nil {
+		return string(result)
+	}
+	delete(fields, "producer_request_id")
+	out, err := json.Marshal(fields)
+	must(t, err)
+	return string(out)
 }

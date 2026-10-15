@@ -1,6 +1,8 @@
 package cli
 
 import (
+	"slices"
+
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/inputasset"
 	"github.com/cozy-creator/cozy/internal/launch"
@@ -9,7 +11,7 @@ import (
 
 // composesChildren is Request.ComposesChildren for an installed request, with one exception:
 // a package whose captured bindings are the calls it makes is a composition root, so one that
-// writes weights still reserves capacity for its children.
+// writes weights still reserves capacity for its children. Its own function is no call.
 func (r *Resolver) composesChildren(request records.Request) (bool, *exit.Error) {
 	if request.InstallID == "" || request.SizedByOwnModels() {
 		return false, nil
@@ -17,7 +19,13 @@ func (r *Resolver) composesChildren(request records.Request) (bool, *exit.Error)
 	if request.ComposesChildren() {
 		return true, nil
 	}
-	return r.store.HasChildBindings(request.InstallID)
+	bindings, problem := r.store.ChildBindings(request.InstallID)
+	return slices.ContainsFunc(bindings, func(b records.ChildBinding) bool { return !ownFunction(request, b) }), problem
+}
+
+// ownFunction says a captured binding is the request's own function, not a call it makes.
+func ownFunction(request records.Request, binding records.ChildBinding) bool {
+	return binding.ChildInstallID == request.InstallID && binding.Entrypoint == request.Entrypoint
 }
 
 // PrivateRentalNeedsAccelerator sizes the rental for its captured children while
