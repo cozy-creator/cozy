@@ -69,14 +69,14 @@ func submitH3Reference(t *testing.T, release string) {
 	var paidPosts atomic.Int64
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/packages/paul/minimax-h3", func(w http.ResponseWriter, _ *http.Request) {
-		_ = json.NewEncoder(w).Encode(hub.PackageCard{Package: hub.Resource{Org: "paul", Name: "minimax-h3"}, Releases: []hub.ReleaseSummary{{Release: release}}})
+		_ = json.NewEncoder(w).Encode(hub.PackageCard{Package: hub.Resource{Name: "minimax-h3"}, Releases: []hub.ReleaseSummary{{Release: release}}})
 	})
 	mux.HandleFunc("GET /v1/packages/paul/minimax-h3/releases/"+release, func(w http.ResponseWriter, _ *http.Request) { _ = json.NewEncoder(w).Encode(detail) })
 	mux.HandleFunc("GET /v1/packages/paul/minimax-h3/bindings", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(`{"bindings":[]}`)) })
 	const manifest = "sha256:c3b72104aff017e77fc9f5b427c8cd0c5f8dc7c4cbe604584e89f9fc24f1025a"
 	mux.HandleFunc("GET /v1/models/paul/minimax-h3", func(w http.ResponseWriter, _ *http.Request) {
 		card := hub.ModelCard{
-			Model: hub.Resource{Org: "paul", Name: "minimax-h3"},
+			Model: hub.Resource{Name: "minimax-h3"},
 			Releases: []hub.ModelReleaseSummary{{
 				ReleaseSummary: hub.ReleaseSummary{Release: "1.0.0-rc.1"},
 				Lanes: []hub.ModelLaneSummary{{Lane: "bf16-full", ManifestID: manifest,

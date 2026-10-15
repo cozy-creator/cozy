@@ -22,7 +22,7 @@ func TestRentalSettlementOrdersWholeAndFractionalSeconds(t *testing.T) {
 	const rentalID, first, second = "rental-clock", "job-first", "job-second"
 	submit := func(id string) {
 		t.Helper()
-		_, _, problem := store.Submit(records.Request{ID: id, IdemKey: id, Kind: "job",
+		_, _, problem := store.Submit(records.Request{ID: id, IdemKey: id,
 			Package: "proof/clock", Entrypoint: "run", Payload: []byte("{}"),
 			BodyDigest: "sha256:" + strings.Repeat("a", 64), Rental: true, Worker: rentalID})
 		fatal(t, problem)
@@ -104,7 +104,7 @@ func TestRentalPreparationSettlementEndsItsWorkAcrossRestart(t *testing.T) {
 				CertPath: filepath.Join(root, "unavailable.pem"),
 				ReadyAt:  time.Now().Add(-time.Hour).UTC().Format(time.RFC3339Nano)}))
 			_, _, problem = store.Submit(records.Request{ID: requestID, IdemKey: requestID,
-				BodyDigest: "sha256:" + strings.Repeat("a", 64), Kind: "job",
+				BodyDigest: "sha256:" + strings.Repeat("a", 64),
 				Package: "proof/preparing", Entrypoint: "prepare", Payload: []byte("{}"),
 				Rental: true, RentalRequired: true, Worker: rentalID, RequestedRental: rentalID})
 			fatal(t, problem)

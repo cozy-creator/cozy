@@ -91,8 +91,7 @@ func TestACalciferServesWhileItsStartupWorkWaits(t *testing.T) {
 	fatal(t, problem)
 	for i := range 3 {
 		id, rental := fmt.Sprintf("job-blocked-%d", i), fmt.Sprintf("pr-failed-%d", i)
-		_, _, problem := store.Submit(records.Request{ID: id, IdemKey: id, Package: "proof/blocked", Entrypoint: "main",
-			Kind: "job", Payload: []byte(`{}`), BodyDigest: childDigest("1"), MachineExecutionObserver: true, Hub: hub})
+		_, _, problem := store.Submit(records.Request{ID: id, IdemKey: id, Package: "proof/blocked", Entrypoint: "main", Payload: []byte(`{}`), BodyDigest: childDigest("1"), MachineExecutionObserver: true, Hub: hub})
 		fatal(t, problem)
 		fatal(t, store.LinkMachineExecution(id, rental))
 		fatal(t, store.RecordRental(records.Rental{ID: rental, MachineName: rental, SKU: "cpu", AcceleratorModel: "CPU",

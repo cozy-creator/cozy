@@ -53,9 +53,8 @@ func idleRoot(t *testing.T, name string) (string, *records.Store) {
 // already failed. The next Calcifer fails each with its reason, keeps every row, and leaves.
 func TestCalciferEndsWorkAnOlderCalciferLeftWaiting(t *testing.T) {
 	root, store := idleRoot(t, "work-ends")
-	blocked, _, problem := store.Submit(records.Request{ID: "job-blocked-refused", IdemKey: "job-blocked-refused", Kind: "job",
-		Package: "local/sage2-lease-proof", Entrypoint: "prove", Payload: []byte(`{}`), BodyDigest: childDigest("1"),
-		RetainWork: true, MachineExecutionObserver: true,
+	blocked, _, problem := store.Submit(records.Request{ID: "job-blocked-refused", IdemKey: "job-blocked-refused",
+		Package: "local/sage2-lease-proof", Entrypoint: "prove", Payload: []byte(`{}`), BodyDigest: childDigest("1"), MachineExecutionObserver: true,
 		OutputExport: &records.OutputExportIntent{Directory: filepath.Join(root, "out"),
 			Outputs: []records.OutputExportEntry{{OutputID: "witness", MediaType: "application/json"}}}})
 	fatal(t, problem)
@@ -63,7 +62,7 @@ func TestCalciferEndsWorkAnOlderCalciferLeftWaiting(t *testing.T) {
 	const reason = "runtime preparation failed: 'sage2-lease-proof' exposes 0 cozy.application entries"
 	fatal(t, store.AppendEvent(blocked.ID, "request.blocked", 0, map[string]any{"status": "blocked",
 		"error_type": "machine_execution.prepare_refused", "error": reason}))
-	failedRun, _, problem := store.Submit(records.Request{ID: "job-failed-upload", IdemKey: "job-failed-upload", Kind: "job",
+	failedRun, _, problem := store.Submit(records.Request{ID: "job-failed-upload", IdemKey: "job-failed-upload",
 		Package: "local/sdxl", Entrypoint: "fp8", Payload: []byte(`{}`), BodyDigest: childDigest("2"), MachineExecutionObserver: true,
 		ModelTransfer: &records.ModelTransferIntent{Kind: "model-upload", Destination: "fidika/sdxl", Outputs: []records.ModelTransferOutput{{Name: "fp8"}}}})
 	fatal(t, problem)
@@ -139,7 +138,7 @@ func TestAnExportToAnInvalidDestinationFailsOnce(t *testing.T) {
 	root, store := idleRoot(t, "export-invalid")
 	blocker := filepath.Join(root, "not-a-directory")
 	must(t, os.WriteFile(blocker, []byte("a file where the folder should be"), 0o600))
-	request, _, problem := store.Submit(records.Request{ID: "req-export-invalid", IdemKey: "req-export-invalid", Kind: "job",
+	request, _, problem := store.Submit(records.Request{ID: "req-export-invalid", IdemKey: "req-export-invalid",
 		Package: "local/export-proof", Entrypoint: "main", Payload: []byte(`{}`), BodyDigest: childDigest("3"),
 		OutputExport: &records.OutputExportIntent{Directory: filepath.Join(blocker, "out"),
 			Outputs: []records.OutputExportEntry{{OutputID: "report", MediaType: "application/json"}}}})
@@ -289,7 +288,7 @@ func TestACancelTheMachineNeverTookEndsCanceled(t *testing.T) {
 		CertificatePEM: string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Certificate[0]}))}
 	startCalciferProcess(t, root)
 	row, _, problem := store.SubmitWithEvent(records.Request{ID: "req-never-taken", IdemKey: "never-taken", Package: "proof/never",
-		Entrypoint: "main", Kind: "job", Payload: []byte(`{}`), BodyDigest: childDigest("1"), MachineExecutionObserver: true,
+		Entrypoint: "main", Payload: []byte(`{}`), BodyDigest: childDigest("1"), MachineExecutionObserver: true,
 		ModelTransfer: &records.ModelTransferIntent{Kind: "model-upload", Destination: "proof/never", Outputs: []records.ModelTransferOutput{{Name: "model"}}}},
 		map[string]any{"machine_endpoint": ep})
 	fatal(t, problem)
@@ -404,8 +403,8 @@ func TestWorkAtRestDoesNotHoldTheCalcifer(t *testing.T) {
 	acceptedLocalRun(t, store, "job-paused", records.Request{RetainWork: true})
 	fatal(t, store.ObserveRunV1("job-paused", &v1.RunEvent{Sequence: 1, Event: &v1.RunEvent_State{
 		State: &v1.RunState{Id: "job-paused", Number: 1, State: "paused", Sequence: 1, Attempt: 1}}}, nil))
-	_, _, problem := store.Submit(records.Request{ID: "job-kept", IdemKey: "idem-job-kept", Kind: "job", Package: "proof/example",
-		Entrypoint: "generate", Payload: []byte(`{}`), BodyDigest: childDigest("8"), RetainWork: true, ChildArtifacts: true,
+	_, _, problem := store.Submit(records.Request{ID: "job-kept", IdemKey: "idem-job-kept", Package: "proof/example",
+		Entrypoint: "generate", Payload: []byte(`{}`), BodyDigest: childDigest("8"), ChildArtifacts: true,
 		MachineExecutionObserver: true})
 	fatal(t, problem)
 	fatal(t, store.LinkMachineExecution("job-kept", machines.Local))

@@ -65,7 +65,7 @@ func TestPackageReleaseFinalizeWaitsForQueuedCommit(t *testing.T) {
 	defer server.Close()
 
 	client := hub.New(config.Config{HubURL: server.URL, HubToken: secret.New("proof")}, "package-release-test")
-	ref := hub.Ref{Org: "paul", Name: "demo"}
+	ref := hub.Ref{Name: "demo"}
 	initial, problem := client.CommitPackageRelease(t.Context(), ref, "1.0.0", "pub-1", nil, "publish demo", "3.12.12")
 	if problem != nil {
 		t.Fatalf("finalize: %s", problem)
@@ -91,7 +91,7 @@ func TestPackageReleaseStatusRendersTypedFailure(t *testing.T) {
 	}))
 	defer server.Close()
 	client := hub.New(config.Config{HubURL: server.URL, HubToken: secret.New("proof")}, "package-release-test")
-	status, problem := client.PackageReleaseStatus(t.Context(), hub.Ref{Org: "paul", Name: "demo"}, "1.0.0")
+	status, problem := client.PackageReleaseStatus(t.Context(), hub.Ref{Name: "demo"}, "1.0.0")
 	if problem != nil {
 		t.Fatalf("status: %s", problem)
 	}

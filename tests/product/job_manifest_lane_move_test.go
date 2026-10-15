@@ -31,11 +31,11 @@ func TestJobReadsTheSelectedCheckpointAfterItsLaneMoves(t *testing.T) {
 	detail.ExecutionRequirements = []string{"cozy-runtime>=0.2.25"}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/packages/proof/quantize", func(w http.ResponseWriter, _ *http.Request) {
-		_ = json.NewEncoder(w).Encode(hub.PackageCard{Package: hub.Resource{Org: "proof", Name: "quantize"}, Releases: []hub.ReleaseSummary{{Release: "1.0.0"}}})
+		_ = json.NewEncoder(w).Encode(hub.PackageCard{Package: hub.Resource{Name: "quantize"}, Releases: []hub.ReleaseSummary{{Release: "1.0.0"}}})
 	})
 	mux.HandleFunc("GET /v1/packages/proof/quantize/releases/1.0.0", func(w http.ResponseWriter, _ *http.Request) { _ = json.NewEncoder(w).Encode(detail) })
 	mux.HandleFunc("GET /v1/models/proof/source", func(w http.ResponseWriter, _ *http.Request) {
-		_ = json.NewEncoder(w).Encode(hub.ModelCard{Model: hub.Resource{Org: "proof", Name: "source"}, Releases: []hub.ModelReleaseSummary{{ReleaseSummary: hub.ReleaseSummary{Release: "1.0.0"},
+		_ = json.NewEncoder(w).Encode(hub.ModelCard{Model: hub.Resource{Name: "source"}, Releases: []hub.ModelReleaseSummary{{ReleaseSummary: hub.ReleaseSummary{Release: "1.0.0"},
 			Lanes: []hub.ModelLaneSummary{{Lane: "bf16", ManifestID: digest, Bytes: 1_000, Components: []string{"model"}}}}}})
 	})
 	mux.HandleFunc("GET /v1/models/proof/source/releases/1.0.0/lanes/bf16/manifest", func(w http.ResponseWriter, _ *http.Request) {

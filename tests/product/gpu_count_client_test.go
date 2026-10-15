@@ -15,7 +15,7 @@ import (
 
 func TestExplicitGPUCountRequiresControllerSupportBeforeSubmission(t *testing.T) {
 	for _, supported := range []bool{false, true} {
-		for _, job := range []bool{false, true} {
+		{
 			var posts int
 			var captured uint32
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -30,23 +30,16 @@ func TestExplicitGPUCountRequiresControllerSupportBeforeSubmission(t *testing.T)
 				}
 				_ = json.NewDecoder(r.Body).Decode(&body)
 				captured = body.GPUs
-				_, _ = w.Write([]byte(`{"request_id":"recorded","job_id":"recorded"}`))
+				_, _ = w.Write([]byte(`{"request_id":"recorded"}`))
 			}))
 			c := localapi.At(config.Config{}, strings.TrimPrefix(server.URL, "http://"), secret.Mint())
-			if job {
-				_, problem := c.SubmitJob(api.JobSubmission{Package: "local/fixture", Function: "job", GPUs: 2}, "two")
-				if (problem == nil) != supported {
-					t.Fatalf("job support=%v: %v", supported, problem)
-				}
-			} else {
-				_, problem := c.Submit(api.Submission{Package: "local/fixture", Function: "call", GPUs: 2}, "two")
-				if (problem == nil) != supported {
-					t.Fatalf("call support=%v: %v", supported, problem)
-				}
+			_, problem := c.Submit(api.Submission{Package: "local/fixture", Function: "call", GPUs: 2}, "two")
+			if (problem == nil) != supported {
+				t.Fatalf("call support=%v: %v", supported, problem)
 			}
 			server.Close()
 			if supported && (posts != 1 || captured != 2) || !supported && posts != 0 {
-				t.Fatalf("support=%v job=%v posts=%d count=%d", supported, job, posts, captured)
+				t.Fatalf("support=%v posts=%d count=%d", supported, posts, captured)
 			}
 		}
 	}

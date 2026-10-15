@@ -55,7 +55,7 @@ func TestPrivateModelPreflightDefersAbsentCapturedInputs(t *testing.T) {
 				ChildInstallID: child.ID,
 				Module:         "private_ops", Export: "compute", Entrypoint: "compute"}}))
 			resolver := cli.NewResolver(store, config.Config{Home: layout.Root, HubURL: catalog.server.URL, HubToken: secret.New("ladder-test")})
-			models, problem := resolver.UnpublishedChildModels(records.Request{InstallID: parent.ID, Kind: "job"})
+			models, problem := resolver.UnpublishedChildModels(records.Request{InstallID: parent.ID})
 			switch mode {
 			case "job-unbound", "entrypoint-unbound":
 				fatal(t, problem)

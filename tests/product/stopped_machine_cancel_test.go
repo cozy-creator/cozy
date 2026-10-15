@@ -28,7 +28,7 @@ func TestCancelOnTheStoppedLocalMachineStartsItAndDelivers(t *testing.T) {
 	payload, err := json.Marshal(map[string]any{"gate": filepath.Join(root, "stopped-cancel-gate"), "size": 64})
 	must(t, err)
 	request, _, problem := store.Submit(records.Request{ID: "native-stopped-cancel", IdemKey: "native-stopped-cancel",
-		Package: "local/native-lifecycle", Entrypoint: "make", Kind: "job", Payload: payload,
+		Package: "local/native-lifecycle", Entrypoint: "make", Payload: payload,
 		BodyDigest: childDigest("e"), MachineExecutionObserver: true})
 	fatal(t, problem)
 	fatal(t, store.LinkMachineExecution(request.ID, machines.Local))

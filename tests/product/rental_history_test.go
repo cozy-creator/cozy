@@ -79,7 +79,7 @@ func TestRentalHistoryShowsEachRentalsLifetimeRunsAndCost(t *testing.T) {
 	fatal(t, problem)
 	fatal(t, store.AdvanceRentalOperation(op.Key, "pr-heron-ended", "released"))
 	run := func(id, rental, state string, dispatched bool) {
-		_, _, problem := store.Submit(records.Request{ID: id, IdemKey: id, Package: "proof/history", Entrypoint: "main", Kind: "job",
+		_, _, problem := store.Submit(records.Request{ID: id, IdemKey: id, Package: "proof/history", Entrypoint: "main",
 			Payload: []byte(`{}`), BodyDigest: childDigest("1"), Rental: true, RequestedRental: rental})
 		fatal(t, problem)
 		if dispatched {

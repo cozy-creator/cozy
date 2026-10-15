@@ -20,7 +20,7 @@ func TestARunWhoseMachineStoppedSaysSoAndHowToRunItAgain(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			o := hostOwner(t, "machine-stopped-"+name)
 			id := "req-machine-stopped"
-			request, _, problem := o.store.Submit(records.Request{ID: id, IdemKey: "idem-" + id, Kind: "job",
+			request, _, problem := o.store.Submit(records.Request{ID: id, IdemKey: "idem-" + id,
 				BodyDigest: "sha256:" + sixtyFour("7"), Package: "proof/example", Entrypoint: "generate",
 				Payload: []byte("{}"), MachineExecutionObserver: true})
 			fatal(t, problem)

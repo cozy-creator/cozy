@@ -184,7 +184,7 @@ func TestV1CancelFencesDelayedNativeAcceptance(t *testing.T) {
 	payload, err := json.Marshal(map[string]any{"gate": filepath.Join(root, "delayed-gate"), "size": 64})
 	must(t, err)
 	request, _, problem := store.Submit(records.Request{ID: "native-delayed-acceptance", IdemKey: "native-delayed-acceptance",
-		Package: "local/native-lifecycle", Entrypoint: "make", Kind: "job", Payload: payload,
+		Package: "local/native-lifecycle", Entrypoint: "make", Payload: payload,
 		BodyDigest: childDigest("d"), MachineExecutionObserver: true})
 	fatal(t, problem)
 	fatal(t, store.LinkMachineExecution(request.ID, machines.Local))
@@ -414,7 +414,7 @@ func TestV1LostAcceptanceReattachesWithoutLocalPackage(t *testing.T) {
 	payload, err := json.Marshal(map[string]any{"gate": gate, "size": 64})
 	must(t, err)
 	request, _, problem := store.Submit(records.Request{ID: "native-lost-acceptance", IdemKey: "native-lost-acceptance",
-		Package: "local/unavailable-package", LocalInstallationID: "unavailable-local-installation", Entrypoint: "make", Kind: "job",
+		Package: "local/unavailable-package", LocalInstallationID: "unavailable-local-installation", Entrypoint: "make",
 		Payload: payload, BodyDigest: childDigest("e"), MachineExecutionObserver: true})
 	fatal(t, problem)
 	fatal(t, store.LinkMachineExecution(request.ID, machines.Local))
@@ -474,7 +474,7 @@ func TestV1CancelWhileDownReachesARunWhoseAcceptanceWasLost(t *testing.T) {
 	payload, err := json.Marshal(map[string]any{"gate": gate, "size": 64})
 	must(t, err)
 	request, _, problem := store.Submit(records.Request{ID: "native-lost-cancel", IdemKey: "native-lost-cancel",
-		Package: "local/native-lifecycle", Entrypoint: "make", Kind: "job", Payload: payload,
+		Package: "local/native-lifecycle", Entrypoint: "make", Payload: payload,
 		BodyDigest: childDigest("f"), MachineExecutionObserver: true})
 	fatal(t, problem)
 	fatal(t, store.LinkMachineExecution(request.ID, machines.Local))

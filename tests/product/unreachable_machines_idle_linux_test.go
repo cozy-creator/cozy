@@ -22,8 +22,7 @@ func TestRunsOnUnreachableMachinesLeaveTheCalciferIdle(t *testing.T) {
 	fatal(t, problem)
 	for i := range 200 {
 		id, machine := fmt.Sprintf("remote-run-%03d", i), fmt.Sprintf("endpoint-%016x", i)
-		_, _, problem := store.Submit(records.Request{ID: id, IdemKey: id, Package: "proof/remote", Entrypoint: "main",
-			Kind: "job", Payload: []byte(`{}`), BodyDigest: childDigest("1"), MachineExecutionObserver: true})
+		_, _, problem := store.Submit(records.Request{ID: id, IdemKey: id, Package: "proof/remote", Entrypoint: "main", Payload: []byte(`{}`), BodyDigest: childDigest("1"), MachineExecutionObserver: true})
 		fatal(t, problem)
 		fatal(t, store.LinkMachineExecution(id, machine))
 		fatal(t, store.AcceptRunV1(id, machine, &v1.RunState{Id: id, Number: uint64(i + 1), State: "running", Attempt: 1}))

@@ -24,7 +24,7 @@ func TestLocalResultInterfaceSurvivesInstallRemoval(t *testing.T) {
 	fatal(t, problem)
 	entry, problem := surface.Function("main")
 	fatal(t, problem)
-	request, _, problem := store.Submit(records.Request{ID: "job-local-result", IdemKey: "local-result", Package: "local/example", Release: "1.0.0", Entrypoint: "main", Kind: "job", PlanID: entry.DescriptorID, Payload: []byte(`{}`), BodyDigest: childDigest("1"), MachineExecutionObserver: true, LocalInstallationID: "local-result-install"})
+	request, _, problem := store.Submit(records.Request{ID: "job-local-result", IdemKey: "local-result", Package: "local/example", Release: "1.0.0", Entrypoint: "main", PlanID: entry.DescriptorID, Payload: []byte(`{}`), BodyDigest: childDigest("1"), MachineExecutionObserver: true, LocalInstallationID: "local-result-install"})
 	fatal(t, problem)
 	fatal(t, store.LinkMachineExecution(request.ID, "pr-owned-machine"))
 	// A frozen record emitted by the original binding producer, not a retired submission API.

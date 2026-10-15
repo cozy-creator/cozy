@@ -19,7 +19,7 @@ func TestARunThatPublishedItsWeightsNamesTheCheckpointAndThePublishCommand(t *te
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	request, _, problem := store.Submit(records.Request{ID: "quantize-run", IdemKey: "quantize-run",
-		Package: "proof/quantize", Entrypoint: "fp8", Kind: "job", Payload: []byte(`{}`),
+		Package: "proof/quantize", Entrypoint: "fp8", Payload: []byte(`{}`),
 		BodyDigest: childDigest("1"), MachineExecutionObserver: true,
 		ModelTransfer: &records.ModelTransferIntent{Kind: "model-upload", Destination: "proof/quantized",
 			Outputs: []records.ModelTransferOutput{{Name: "fp8"}}}})

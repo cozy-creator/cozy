@@ -25,17 +25,12 @@ func (r *exactReleaseResolver) ResolveRemoteRelease(_, _, _, _ string, _ []orche
 	return orchestrator.LogicalPackage{}, nil, exit.Named(exit.Unavailable, "proof.source_lookup", "explicit release lookup observed")
 }
 
-func (r *exactReleaseResolver) ResolveRemoteJob(_, _, _, _ string, _ []orchestrator.ModelRef, _ bool) (orchestrator.LogicalJob, *launch.Entrypoint, *exit.Error) {
-	r.reads++
-	return orchestrator.LogicalJob{}, nil, exit.Named(exit.Unavailable, "proof.source_lookup", "explicit release lookup observed")
-}
-
 // The API runs a published package as one exact release, which its client sends (#1157: the
 // installed one, the newest kept under the catalog revision, or the one the machine names).
 // A submission naming none is refused before any lookup and records nothing; one naming its
 // release is resolved as that release.
 func TestPublishedAdmissionRequiresAnExactRelease(t *testing.T) {
-	for kind, path := range map[string]string{"entrypoints": "/v1/requests", "jobs": "/v1/local/jobs"} {
+	for kind, path := range map[string]string{"calls": "/v1/requests"} {
 		t.Run(kind, func(t *testing.T) {
 			o := hostOwner(t, "exact-release-"+kind)
 			resolver := &exactReleaseResolver{}

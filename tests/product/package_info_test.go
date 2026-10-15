@@ -16,7 +16,7 @@ import (
 // newest first by version, each with its publication time and yanked state.
 func TestPackageInfoListsReleases(t *testing.T) {
 	card := hub.PackageCard{
-		Package: hub.Resource{Org: "proof", Name: "releases", LatestRelease: "1.10.0"},
+		Package: hub.Resource{Name: "releases", LatestRelease: "1.10.0"},
 		Releases: []hub.ReleaseSummary{
 			{Release: "1.2.0", CutAt: "2026-09-26T10:00:00.123Z"},
 			{Release: "1.10.0", CutAt: "2026-09-27T10:00:00Z"},

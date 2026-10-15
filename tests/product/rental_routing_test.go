@@ -27,7 +27,7 @@ func TestPublishedJobRentalClass(t *testing.T) {
 		{name: "an undeclared job", wantSKU: "rtx-4090"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			job := launch.Entrypoint{Name: "lane", Kind: "job", Accelerator: test.accelerator}
+			job := launch.Entrypoint{Name: "lane", Accelerator: test.accelerator}
 			sku, _, mismatch, ok := choose(skus, job.NeedsAccelerator(), rental.Constraints{Requirements: torch})
 			if !ok || sku.Name != test.wantSKU {
 				t.Fatalf("selected %+v, found=%v mismatch=%q; want %s", sku, ok, mismatch, test.wantSKU)

@@ -204,11 +204,11 @@ func TestRequestedRentalFlowsToChildAndRetainedRetry(t *testing.T) {
 	fatal(t, problem)
 	defer st.Close()
 	fatal(t, st.RecordRental(records.Rental{ID: "wanted", MachineName: "isao", AcceleratorModel: "CPU", AcceleratorCount: 1, HourlyRateUSDMicros: 100000, State: "ready"}))
-	parent, _, problem := st.Submit(records.Request{ID: "parent", IdemKey: "parent", BodyDigest: childDigest("a"), Package: "local/script", Entrypoint: "main", Kind: "job", Payload: []byte("{}"), RetainWork: true, Rental: true, RentalRequired: true, Worker: "wanted", RequestedRental: "wanted"})
+	parent, _, problem := st.Submit(records.Request{ID: "parent", IdemKey: "parent", BodyDigest: childDigest("a"), Package: "local/script", Entrypoint: "main", Payload: []byte("{}"), Rental: true, RentalRequired: true, Worker: "wanted", RequestedRental: "wanted"})
 	fatal(t, problem)
 	fatal(t, st.SpawnWorker(records.WorkerProcess{InstanceID: "private-worker", Package: "local/script", WorkerID: "worker", Devices: []string{"cpu"}}))
 	parent = offerChildParent(t, st, parent)
-	call := records.Request{ID: "child", IdemKey: "child", BodyDigest: childDigest("b"), Package: "local/op", Entrypoint: "run", Kind: "job", Payload: []byte("{}"), ParentRequestID: parent.ID, ParentCallIndex: 0, ChildIntentDigest: childDigest("c"), ChildTargetDigest: childDigest("d")}
+	call := records.Request{ID: "child", IdemKey: "child", BodyDigest: childDigest("b"), Package: "local/op", Entrypoint: "run", Payload: []byte("{}"), ParentRequestID: parent.ID, ParentCallIndex: 0, ChildIntentDigest: childDigest("c"), ChildTargetDigest: childDigest("d")}
 	child, _, problem := st.SubmitChild(call, 1, childDigest("1"), "private-boot", nil)
 	fatal(t, problem)
 	if child.Worker != "wanted" || child.RequestedRental != "wanted" {
@@ -216,7 +216,7 @@ func TestRequestedRentalFlowsToChildAndRetainedRetry(t *testing.T) {
 	}
 	_, problem = st.FailQueuedRequest(child.ID, retainedFailure("proof", "pause child"))
 	fatal(t, problem)
-	retried, _, problem := st.Submit(records.Request{ID: "retry", IdemKey: "retry", BodyDigest: childDigest("e"), Package: "local/op", Entrypoint: "run", Kind: "job", Payload: []byte("{}"), RetainWork: true, RetryOf: child.ID})
+	retried, _, problem := st.Submit(records.Request{ID: "retry", IdemKey: "retry", BodyDigest: childDigest("e"), Package: "local/op", Entrypoint: "run", Payload: []byte("{}")})
 	fatal(t, problem)
 	if retried.Worker != "wanted" || retried.RequestedRental != "wanted" {
 		t.Fatalf("retry escaped affinity: %+v", retried)

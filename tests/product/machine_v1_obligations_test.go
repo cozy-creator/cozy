@@ -31,8 +31,7 @@ func TestRuntimeObligationsPreventPrematureRentalRelease(t *testing.T) {
 			store, problem := records.Open(filepath.Join(t.TempDir(), "creator.sqlite"))
 			fatal(t, problem)
 			defer store.Close()
-			request, _, problem := store.Submit(records.Request{ID: "job-owed", IdemKey: "owed", Package: "local/example", Entrypoint: "main",
-				Kind: "job", Payload: []byte(`{}`), BodyDigest: childDigest("1"), MachineExecutionObserver: true})
+			request, _, problem := store.Submit(records.Request{ID: "job-owed", IdemKey: "owed", Package: "local/example", Entrypoint: "main", Payload: []byte(`{}`), BodyDigest: childDigest("1"), MachineExecutionObserver: true})
 			fatal(t, problem)
 			fatal(t, store.LinkMachineExecution(request.ID, "pr-owned-machine"))
 			if scenario.sent {

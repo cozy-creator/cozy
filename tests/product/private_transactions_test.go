@@ -11,41 +11,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-// Lifecycle commands operate on an existing request. A miss must reach
-// Calcifer's typed job lookup, without treating pause/resume as package names or
-// creating a replacement transaction.
-func TestUnpublishedTransactionCommandsResolveExistingRequest(t *testing.T) {
-	root := t.TempDir()
-	calcifer := startCalciferProcess(t, root)
-	for _, action := range []string{"pause", "resume"} {
-		t.Run(action, func(t *testing.T) {
-			response := calcifer.call(t, http.MethodPost,
-				"/v1/local/jobs/req-private-transaction-absent/"+action,
-				map[string]any{"actor": "product proof"})
-			if response.Status != http.StatusNotFound || response.code() != "not_found" {
-				t.Errorf("%s must resolve an existing transaction: %s", action, response.brief())
-			}
-			code, stdout, stderr := runCozyStreams(t, root, "run", action,
-				"req-private-transaction-absent", "--json")
-			var document struct {
-				Error struct {
-					Code string `json:"code"`
-				} `json:"error"`
-			}
-			if err := json.Unmarshal([]byte(stdout), &document); err != nil ||
-				code == 0 || document.Error.Code != "not_found" {
-				t.Errorf("run %s must report the owner's missing transaction [exit %d]: stdout=%s stderr=%s",
-					action, code, stdout, stderr)
-			}
-		})
-	}
-	if requests := listInvocations(t, root); len(requests) != 0 {
-		t.Fatalf("lifecycle commands created requests: %+v", requests)
-	}
-}
-
-// retainedFailure is a retained job's failure before it started, as a refused preparation
-// records it.
+// retainedFailure is a run's failure before it started, as a refused preparation records it.
 func retainedFailure(code, detail string) map[string]any {
 	return records.QueuedFailure(exit.Named(exit.Failed, code, "%s", detail))
 }
@@ -55,12 +21,11 @@ func recordPrivateTransaction(t *testing.T, store *records.Store, label, rentalI
 	request := records.Request{
 		ID: "req-private-" + label, IdemKey: "idem-private-" + label,
 		BodyDigest: "sha256:" + strings.Repeat("a", 64),
-		Package:    "local/private-proof", Entrypoint: "prepare", Kind: "job", Org: "local",
+		Package:    "local/private-proof", Entrypoint: "prepare",
 		Release: "1.0.0", PlanID: "sha256:" + strings.Repeat("b", 64),
 		LocalInstallationID: "sha256:" + strings.Repeat("c", 64),
 		Payload:             []byte(`{"source_revision":"frozen","seed":17,"quality_bar":0.95}`),
 		Worker:              rentalID, Rental: rentalID != "", RentalRequired: rentalID != "",
-		RetainWork: true,
 	}
 	_, fresh, problem := store.Submit(request)
 	fatal(t, problem)
@@ -81,7 +46,7 @@ func assertPrivateTransactionIdentity(t *testing.T, store *records.Store, before
 		after.Package != before.Package || after.Entrypoint != before.Entrypoint || after.Release != before.Release ||
 		after.PlanID != before.PlanID || after.LocalInstallationID != before.LocalInstallationID ||
 		after.InstallationID != before.InstallationID || !bytes.Equal(after.Payload, before.Payload) ||
-		!after.RetainWork || after.Worker != before.Worker || after.Ordinal != before.Ordinal {
+		after.Worker != before.Worker || after.Ordinal != before.Ordinal {
 		t.Fatalf("transaction identity or state changed: before=%+v after=%+v want-state=%s", before, after, state)
 	}
 }

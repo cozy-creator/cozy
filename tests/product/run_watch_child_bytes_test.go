@@ -15,7 +15,7 @@ func TestRunWatchShowsAChildCallsDownloadBytes(t *testing.T) {
 	o := hostOwner(t, "child-download-bytes")
 	id := "job-child-bytes"
 	_, _, problem := o.store.Submit(records.Request{ID: id, IdemKey: id, Package: "paul/minimax-h3",
-		Entrypoint: "long_form", Kind: "job", Payload: []byte(`{}`), BodyDigest: childDigest("d"),
+		Entrypoint: "long_form", Payload: []byte(`{}`), BodyDigest: childDigest("d"),
 		MachineExecutionObserver: true})
 	fatal(t, problem)
 	fatal(t, o.store.LinkMachineExecution(id, "pr-unreachable"))

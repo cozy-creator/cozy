@@ -23,89 +23,6 @@ import (
 	v1 "github.com/cozy-creator/cozy/protocol/cozy/machine/v1"
 )
 
-// v1RetainedRun records a cozy.machine.v1 run on rental, kept for its owner.
-func v1RetainedRun(t *testing.T, store *records.Store, label, rental string) records.Request {
-	t.Helper()
-	request, _, problem := store.Submit(records.Request{ID: "req-retained-" + label, IdemKey: "retained-" + label,
-		BodyDigest: "sha256:" + strings.Repeat("a", 64), Package: "local/retained-proof", Entrypoint: "prepare", Kind: "job",
-		Payload: []byte(`{"seed":17}`), Worker: rental, Rental: true, RentalRequired: true, RetainWork: true, MachineExecutionObserver: true})
-	fatal(t, problem)
-	fatal(t, store.LinkMachineExecution(request.ID, rental))
-	return request
-}
-
-// `cozy down` disconnects; it never ends work kept for its owner. A paused run, a failed one
-// and a finished one whose result is still on its machine stay exactly as they were across
-// two disconnects, and so does their rental.
-func TestCalciferDownPreservesInactiveRetainedWork(t *testing.T) {
-	root := t.TempDir()
-	startCalciferProcess(t, root)
-	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
-	fatal(t, problem)
-	defer store.Close()
-	const rental = "pr-retained-disconnect"
-	fatal(t, store.RecordRental(records.Rental{ID: rental, MachineName: "heron", AcceleratorModel: "CPU", AcceleratorCount: 1, State: "ready", Hub: "http://127.0.0.1:1", HourlyRateUSDMicros: 1}))
-	paused := v1RetainedRun(t, store, "paused", rental)
-	_, problem = store.MarkRunV1Sent(paused.ID)
-	fatal(t, problem)
-	fatal(t, store.AcceptRunV1(paused.ID, rental, &v1.RunState{Id: paused.ID, Number: 1, State: "running", Attempt: 1}))
-	fatal(t, store.ObserveRunV1(paused.ID, &v1.RunEvent{Sequence: 1, Event: &v1.RunEvent_State{State: &v1.RunState{Id: paused.ID, Number: 1, State: "paused", Sequence: 1, Attempt: 1}}}, nil))
-	failed := v1RetainedRun(t, store, "failed", rental)
-	_, problem = store.FailQueuedRequest(failed.ID, retainedFailure("fixture.failed", "retained inputs"))
-	fatal(t, problem)
-	finished := v1RetainedRun(t, store, "finished", rental)
-	_, problem = store.MarkRunV1Sent(finished.ID)
-	fatal(t, problem)
-	fatal(t, store.AcceptRunV1(finished.ID, rental, &v1.RunState{Id: finished.ID, Number: 2, State: "running", Attempt: 1}))
-	fatal(t, store.RecordRunOutcomeV1(finished.ID, records.RunEndV1{Outcome: &v1.Outcome{Status: "succeeded", Result: []byte(`{}`)},
-		Refused: exit.Named(exit.Unavailable, "output.write_failed", "this computer could not write the run's output")}))
-	kept := filepath.Join(root, "retained-output.txt")
-	must(t, os.WriteFile(kept, []byte("retained result"), 0o600))
-	before := map[string]*records.Request{}
-	links := map[string]*records.MachineExecution{}
-	for _, id := range []string{paused.ID, failed.ID, finished.ID} {
-		before[id], problem = store.RequestRow(id)
-		fatal(t, problem)
-		links[id], problem = store.MachineExecution(id)
-		fatal(t, problem)
-	}
-	if !before[paused.ID].RetainWork || before[paused.ID].State != "paused" || before[failed.ID].State != "failed" {
-		t.Fatal("the fixture's paused and failed runs are not as recorded")
-	}
-	for cycle := range 2 {
-		code, out := runCozy(t, root, "down", "--json")
-		if code != 0 || !strings.Contains(out, `"calcifer":"stopped"`) {
-			t.Fatalf("retained down [%d]: %s", code, out)
-		}
-		if calcifer.Probe(config.Config{Home: root}).Up {
-			t.Fatal("Calcifer remained online")
-		}
-		for id, prior := range before {
-			current, problem := store.RequestRow(id)
-			fatal(t, problem)
-			link, problem := store.MachineExecution(id)
-			fatal(t, problem)
-			if current == nil || current.State != prior.State || current.BodyDigest != prior.BodyDigest || current.Worker != prior.Worker || current.RetainWork != prior.RetainWork ||
-				link.CancelRequested || link.Collected != links[id].Collected || !bytes.Equal(link.Receipt, links[id].Receipt) || !bytes.Equal(link.Outcome, links[id].Outcome) {
-				t.Fatalf("retained run %s changed: before=%+v after=%+v", id, prior, current)
-			}
-		}
-		row, problem := store.RentalRow(rental)
-		fatal(t, problem)
-		if row == nil || row.State != "ready" {
-			t.Fatal("disconnect ended or forgot the rental")
-		}
-		if raw, err := os.ReadFile(kept); err != nil || string(raw) != "retained result" {
-			t.Fatal("disconnect changed output bytes")
-		}
-		if cycle == 0 {
-			if code, out = runCozy(t, root, "up", "--json"); code != 0 {
-				t.Fatalf("up [%d]: %s", code, out)
-			}
-		}
-	}
-}
-
 // A handoff its machine has not confirmed does not hold `cozy down`: Calcifer stops, names it
 // in flight, and leaves it exactly as it was, neither canceled nor accepted, for the next
 // Calcifer to confirm. A second down is a no-op.
@@ -115,8 +32,7 @@ func TestCalciferDownDoesNotCancelAnUnconfirmedHandoff(t *testing.T) {
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()
-	request, _, problem := store.Submit(records.Request{ID: "job-handoff", IdemKey: "handoff", Package: "local/example", Entrypoint: "main",
-		Kind: "job", Payload: []byte(`{}`), BodyDigest: childDigest("1"), MachineExecutionObserver: true})
+	request, _, problem := store.Submit(records.Request{ID: "job-handoff", IdemKey: "handoff", Package: "local/example", Entrypoint: "main", Payload: []byte(`{}`), BodyDigest: childDigest("1"), MachineExecutionObserver: true})
 	fatal(t, problem)
 	fatal(t, store.LinkMachineExecution(request.ID, "pr-unreachable-machine"))
 	if sent, problem := store.MarkRunV1Sent(request.ID); problem != nil || !sent {
@@ -152,12 +68,12 @@ type shutdownRaceResolver struct {
 	release chan struct{}
 }
 
-func (r shutdownRaceResolver) ResolveRemoteJob(hub, pkg, release, function string, models []orchestrator.ModelRef, deferred bool) (orchestrator.LogicalJob, *launch.Entrypoint, *exit.Error) {
+func (r shutdownRaceResolver) ResolveRemoteRelease(hub, pkg, release, function string, models []orchestrator.ModelRef) (orchestrator.LogicalPackage, *launch.Entrypoint, *exit.Error) {
 	if r.entered != nil {
 		close(r.entered)
 		<-r.release
 	}
-	return r.publishedRouteResolver.ResolveRemoteJob(hub, pkg, release, function, models, deferred)
+	return r.publishedRouteResolver.ResolveRemoteRelease(hub, pkg, release, function, models)
 }
 
 func TestCalciferDownFencesConcurrentMachineIntake(t *testing.T) {
@@ -205,7 +121,7 @@ func TestCalciferDownFencesConcurrentMachineIntake(t *testing.T) {
 			}
 			submission := map[string]any{"package": "alice/ops", "release": "1.0.0", "function": "main", "input": map[string]any{}, "rental": true, "requested_rental": "pr-shutdown-race"}
 			replied := make(chan *httptest.ResponseRecorder, 1)
-			go func() { replied <- call("/v1/local/jobs", submission) }()
+			go func() { replied <- call("/v1/requests", submission) }()
 			if beforeCommit {
 				select {
 				case <-entered:

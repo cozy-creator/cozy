@@ -144,12 +144,12 @@ async def echo(ctx: Context, payload: Request) -> Value:
 	cfg := config.Config{Home: root, HubURL: config.DefaultHubURL}
 	client, problem := localapi.Open(cfg, calcifer.Probe(cfg))
 	fatal(t, problem)
-	sub := api.JobSubmission{Package: "local/application-json-proof", Function: "echo", Input: json.RawMessage(`{"seed":18446744073709551615,"number":1.0,"ordered":[2,1]}`)}
-	h, problem := client.SubmitJob(sub, "json-api-semantic-replay")
+	sub := api.Submission{Package: "local/application-json-proof", Function: "echo", Input: json.RawMessage(`{"seed":18446744073709551615,"number":1.0,"ordered":[2,1]}`)}
+	h, problem := client.Submit(sub, "json-api-semantic-replay")
 	fatal(t, problem)
-	var state api.JobState
+	var state api.Lifecycle
 	landed(t, "typed API job to complete", func() bool {
-		state, problem = client.Job(h.JobID)
+		state, problem = client.Request(h.RequestID)
 		fatal(t, problem)
 		if state.Status == "failed" || state.Status == "canceled" {
 			t.Fatalf("typed API root ended %s: %s %s", state.Status, state.ErrorCode, state.Error)
@@ -160,14 +160,14 @@ async def echo(ctx: Context, payload: Request) -> Value:
 	must(t, err)
 	check(result, 18446744073709551615, "float", []uint64{2, 1})
 	sub.Input = json.RawMessage("{ \"ordered\": [2, 1], \"number\": 1e0, \"seed\": 18446744073709551615 }")
-	replay, problem := client.SubmitJob(sub, "json-api-semantic-replay")
+	replay, problem := client.Submit(sub, "json-api-semantic-replay")
 	fatal(t, problem)
-	if !replay.Replay || replay.JobID != h.JobID {
+	if !replay.Replay || replay.RequestID != h.RequestID {
 		t.Fatalf("equivalent API request did not reattach: %+v", replay)
 	}
 	for _, changed := range []string{`{"seed":18446744073709551614,"number":1.0,"ordered":[2,1]}`, `{"seed":18446744073709551615,"number":1,"ordered":[2,1]}`, `{"seed":18446744073709551615,"number":1.0,"ordered":[1,2]}`} {
 		sub.Input = json.RawMessage(changed)
-		if _, problem := client.SubmitJob(sub, "json-api-semantic-replay"); problem == nil || problem.Code != exit.Conflict {
+		if _, problem := client.Submit(sub, "json-api-semantic-replay"); problem == nil || problem.Code != exit.Conflict {
 			t.Fatalf("changed API intent did not conflict: %s (%v)", changed, problem)
 		}
 	}

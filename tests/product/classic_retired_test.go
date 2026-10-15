@@ -29,15 +29,13 @@ func TestCalciferStartRetiresClassicWork(t *testing.T) {
 	canceling := recordPrivateTransaction(t, store, "classic-canceling", "")
 	heldFinalization(t, store, canceling)
 	machine := records.Request{ID: "req-machine-local", IdemKey: "idem-machine-local",
-		BodyDigest: queued.BodyDigest, Package: queued.Package, Entrypoint: queued.Entrypoint,
-		Kind: "job", Org: "local", Release: queued.Release, PlanID: queued.PlanID,
-		LocalInstallationID: queued.LocalInstallationID, Payload: queued.Payload,
-		RetainWork: true, MachineExecutionObserver: true}
+		BodyDigest: queued.BodyDigest, Package: queued.Package, Entrypoint: queued.Entrypoint, Release: queued.Release, PlanID: queued.PlanID,
+		LocalInstallationID: queued.LocalInstallationID, Payload: queued.Payload, MachineExecutionObserver: true}
 	_, _, problem = store.Submit(machine)
 	fatal(t, problem)
 	fatal(t, store.LinkMachineExecution(machine.ID, "local"))
 	transfer := records.Request{ID: "req-pass-through", IdemKey: "idem-pass-through", BodyDigest: queued.BodyDigest,
-		Package: "cozy/platform", Entrypoint: "model-pass-through", Kind: "job", Org: "local",
+		Package: "cozy/platform", Entrypoint: "model-pass-through",
 		PlanID: "sha256:" + strings.Repeat("0", 64), Payload: []byte("{}")}
 	_, _, problem = store.Submit(transfer)
 	fatal(t, problem)

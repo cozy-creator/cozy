@@ -22,8 +22,8 @@ func TestSettledArchivedRunWithACancelLeavesTheCalciferIdle(t *testing.T) {
 	store, problem := records.Open(path)
 	fatal(t, problem)
 	request, _, problem := store.Submit(records.Request{ID: "archive-run", IdemKey: "saved-worker",
-		Package: "local/archived", Entrypoint: "main", Kind: "job", Payload: []byte(`{}`),
-		BodyDigest: childDigest("1"), RetainWork: true, MachineExecutionObserver: true})
+		Package: "local/archived", Entrypoint: "main", Payload: []byte(`{}`),
+		BodyDigest: childDigest("1"), MachineExecutionObserver: true})
 	fatal(t, problem)
 	fatal(t, store.LinkMachineExecution(request.ID, "local"))
 	store.Close()

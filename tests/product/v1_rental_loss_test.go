@@ -14,7 +14,7 @@ import (
 func rentedRunV1(t *testing.T, store *records.Store, label string, accepted bool) records.Request {
 	t.Helper()
 	request, _, problem := store.Submit(records.Request{ID: "lost-" + label, IdemKey: "lost-" + label, Package: "local/rented",
-		Entrypoint: "main", Kind: "job", Payload: []byte(`{}`), BodyDigest: childDigest("1"), MachineExecutionObserver: true,
+		Entrypoint: "main", Payload: []byte(`{}`), BodyDigest: childDigest("1"), MachineExecutionObserver: true,
 		Rental: true, Worker: "pr-owned-machine"})
 	fatal(t, problem)
 	fatal(t, store.LinkMachineExecution(request.ID, "pr-owned-machine"))

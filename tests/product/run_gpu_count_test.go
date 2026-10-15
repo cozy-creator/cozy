@@ -143,14 +143,14 @@ func TestRetryRetainsGPUCountAndRefusesAChangedCount(t *testing.T) {
 	for _, count := range []uint32{0, 2, 4} {
 		store, problem := records.Open(filepath.Join(t.TempDir(), "creator.sqlite"))
 		fatal(t, problem)
-		prior, _, problem := store.Submit(records.Request{ID: "prior", IdemKey: "prior", Kind: "job", Package: "local/example", Entrypoint: "main",
-			GPUs: 2, Payload: []byte(`{}`), BodyDigest: childDigest("1"), RetainWork: true, MachineExecutionObserver: true})
+		prior, _, problem := store.Submit(records.Request{ID: "prior", IdemKey: "prior", Package: "local/example", Entrypoint: "main",
+			GPUs: 2, Payload: []byte(`{}`), BodyDigest: childDigest("1"), MachineExecutionObserver: true})
 		fatal(t, problem)
 		fatal(t, store.LinkMachineExecution(prior.ID, "local"))
 		_, problem = store.FailQueuedRequest(prior.ID, retainedFailure("preparation_failed", "fixture"))
 		fatal(t, problem)
-		retry, _, problem := store.Submit(records.Request{ID: "retry", IdemKey: "retry", Kind: "job", Package: prior.Package, Entrypoint: "main",
-			GPUs: count, Payload: []byte(`{}`), BodyDigest: childDigest("2"), RetainWork: true, RetryOf: prior.ID, MachineExecutionObserver: true})
+		retry, _, problem := store.Submit(records.Request{ID: "retry", IdemKey: "retry", Package: prior.Package, Entrypoint: "main",
+			GPUs: count, Payload: []byte(`{}`), BodyDigest: childDigest("2"), MachineExecutionObserver: true})
 		if count == 4 {
 			if problem == nil || problem.ErrName() != "request.retry_gpu_count_changed" {
 				t.Fatalf("count changed: %v", problem)
