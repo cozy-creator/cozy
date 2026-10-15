@@ -115,8 +115,8 @@ def observe(
     expected_steps: int = 8,
     require_existing_state: bool = False,
 ) -> dict[str, Any]:
-    if type(expected_steps) is not int or expected_steps not in (8, 30):
-        raise ValueError("H3 trace expects exactly8 Turbo or30 regular denoising steps")
+    if type(expected_steps) is not int or expected_steps < 1:
+        raise ValueError("expected_steps must be a positive step count")
     graph = json.loads(graph_json)
     if not isinstance(graph, dict) or not graph:
         raise ValueError("graph_json must encode a nonempty Comfy API graph")
