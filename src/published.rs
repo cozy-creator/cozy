@@ -2439,17 +2439,18 @@ mod tests {
         bench.publisher.structure(&hub, std::slice::from_ref(&named), &Job::default()).unwrap();
         let store = bench.publisher.store().clone();
         let generations = crate::catalog::Catalog::new(&bench.root.join("generations")).unwrap();
-        let dir = generations.root().join("g-warm");
+        let identity = "ab".repeat(16);
+        let dir = generations.root().join(&identity);
         fs::create_dir_all(dir.join("env/bin")).unwrap();
         fs::write(dir.join("env/bin/python"), "").unwrap();
         File::create(dir.join(".hold")).unwrap();
         let interface = json!({"application": "pkg:app", "entrypoints": [{"name": "render",
             "models": [{"path": "render.models.model", "class": "M"}]}]});
-        fs::write(dir.join("generation.json"), json!({"identity": "g-warm", "package": "acme/pkg", "version": "1.0.0",
+        fs::write(dir.join("generation.json"), json!({"identity": identity, "package": "acme/pkg", "version": "1.0.0",
             "application": "pkg:app", "python": dir.join("env/bin/python"), "interface": interface}).to_string()).unwrap();
-        let held = generations.resolve("g-warm").unwrap();
+        let held = generations.resolve(&identity).unwrap();
         let binding = crate::device_executor::Binding { snapshot: manifest.id(), components: vec!["model".into()], ..Default::default() };
-        let plan = Plan { id: "warm".into(), construction: "warm".into(), installation: "i".into(), generation: "g-warm".into(),
+        let plan = Plan { id: "warm".into(), construction: "warm".into(), installation: "i".into(), generation: identity.clone(),
             entrypoint: "render".into(), slots: vec![PlanSlot { binding, selected_encoded_bytes: 0 }], sources: vec![], degree: 1 };
         let config = serde_json::from_value(json!({"devices": "GPU-test-0", "authorized_device_limit_bytes": null, "prespawn": true})).unwrap();
         let pool = Pool::new(&bench.root.join("gpu"), config, store.clone()).unwrap();
