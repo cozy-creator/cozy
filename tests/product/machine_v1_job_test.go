@@ -25,6 +25,33 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
+// tensordFixture is a copy of one of tensord's test packages, locked against
+// -machine-runtime-wheel and -machine-tensorfs-wheel when the run names an unreleased pair.
+func tensordFixture(t *testing.T, source string) string {
+	t.Helper()
+	project := filepath.Join(t.TempDir(), filepath.Base(source))
+	must(t, os.CopyFS(project, os.DirFS(source)))
+	if *machineRuntimeWheel != "" {
+		sources := "\n[tool.uv.sources]\n"
+		for name, wheel := range map[string]string{"cozy-runtime": *machineRuntimeWheel, "tensorfs": *machineTensorFSWheel} {
+			if wheel != "" {
+				absolute, err := filepath.Abs(wheel)
+				must(t, err)
+				sources += fmt.Sprintf("%s = {path = %q}\n", name, absolute)
+			}
+		}
+		manifest, err := os.OpenFile(filepath.Join(project, "pyproject.toml"), os.O_APPEND|os.O_WRONLY, 0)
+		must(t, err)
+		_, err = manifest.WriteString(sources)
+		must(t, err)
+		must(t, manifest.Close())
+	}
+	if out, err := exec.Command("uv", "lock", "--directory", project).CombinedOutput(); err != nil {
+		t.Fatalf("uv lock: %v\n%s", err, out)
+	}
+	return project
+}
+
 var cpuLongform = flag.String("cpu-longform", "", "tensord tests/fixtures/cpu_longform: H3 long-form's shape on CPU")
 
 // `cozy run <pkg>/long_form` on a machine that serves cozy.machine.v1, as a user types it: a
@@ -46,11 +73,7 @@ func TestMachineV1LongFormRendersSegmentsThroughChildRuns(t *testing.T) {
 			_ = removeAllForce(root)
 		}
 	})
-	project := filepath.Join(t.TempDir(), "cpu_longform")
-	must(t, os.CopyFS(project, os.DirFS(*cpuLongform)))
-	if out, err := exec.Command("uv", "lock", "--directory", project).CombinedOutput(); err != nil {
-		t.Fatalf("uv lock: %v\n%s", err, out)
-	}
+	project := tensordFixture(t, *cpuLongform)
 	if code, out := runCozy(t, root, "package", "install", project); code != 0 {
 		t.Fatalf("package install [exit %d]\n%s", code, out)
 	}
@@ -138,11 +161,7 @@ func TestEndpointRunSignsWithItsRentalKey(t *testing.T) {
 			_ = removeAllForce(root)
 		}
 	})
-	project := filepath.Join(t.TempDir(), "cpu_longform")
-	must(t, os.CopyFS(project, os.DirFS(*cpuLongform)))
-	if out, err := exec.Command("uv", "lock", "--directory", project).CombinedOutput(); err != nil {
-		t.Fatalf("uv lock: %v\n%s", err, out)
-	}
+	project := tensordFixture(t, *cpuLongform)
 	if code, out := runCozy(t, root, "package", "install", project); code != 0 {
 		t.Fatalf("package install [exit %d]\n%s", code, out)
 	}
@@ -267,11 +286,7 @@ func TestObservingAV1RunNeverStartsAStoppedMachine(t *testing.T) {
 			_ = removeAllForce(root)
 		}
 	})
-	project := filepath.Join(t.TempDir(), "cpu_longform")
-	must(t, os.CopyFS(project, os.DirFS(*cpuLongform)))
-	if out, err := exec.Command("uv", "lock", "--directory", project).CombinedOutput(); err != nil {
-		t.Fatalf("uv lock: %v\n%s", err, out)
-	}
+	project := tensordFixture(t, *cpuLongform)
 	if code, out := runCozy(t, root, "package", "install", project); code != 0 {
 		t.Fatalf("package install [exit %d]\n%s", code, out)
 	}
@@ -334,11 +349,7 @@ func TestCanceledFilmSubmittedAgainSkipsItsFinishedSegments(t *testing.T) {
 			_ = removeAllForce(root)
 		}
 	})
-	project := filepath.Join(t.TempDir(), "cpu_longform")
-	must(t, os.CopyFS(project, os.DirFS(*cpuLongform)))
-	if out, err := exec.Command("uv", "lock", "--directory", project).CombinedOutput(); err != nil {
-		t.Fatalf("uv lock: %v\n%s", err, out)
-	}
+	project := tensordFixture(t, *cpuLongform)
 	if code, out := runCozy(t, root, "package", "install", project); code != 0 {
 		t.Fatalf("package install [exit %d]\n%s", code, out)
 	}
@@ -427,11 +438,7 @@ func TestRunTimeoutCancelsTheRunOnItsMachine(t *testing.T) {
 			_ = removeAllForce(root)
 		}
 	})
-	project := filepath.Join(t.TempDir(), "cpu_longform")
-	must(t, os.CopyFS(project, os.DirFS(*cpuLongform)))
-	if out, err := exec.Command("uv", "lock", "--directory", project).CombinedOutput(); err != nil {
-		t.Fatalf("uv lock: %v\n%s", err, out)
-	}
+	project := tensordFixture(t, *cpuLongform)
 	if code, out := runCozy(t, root, "package", "install", project); code != 0 {
 		t.Fatalf("package install [exit %d]\n%s", code, out)
 	}
@@ -487,11 +494,7 @@ func TestMachineV1InputTreeReachesTheCallable(t *testing.T) {
 			_ = removeAllForce(root)
 		}
 	})
-	project := filepath.Join(t.TempDir(), "cpu_tree")
-	must(t, os.CopyFS(project, os.DirFS(*cpuTree)))
-	if out, err := exec.Command("uv", "lock", "--directory", project).CombinedOutput(); err != nil {
-		t.Fatalf("uv lock: %v\n%s", err, out)
-	}
+	project := tensordFixture(t, *cpuTree)
 	if code, out := runCozy(t, root, "package", "install", project); code != 0 {
 		t.Fatalf("package install [exit %d]\n%s", code, out)
 	}

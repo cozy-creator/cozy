@@ -2,7 +2,6 @@ package records
 
 import (
 	"cmp"
-	"database/sql"
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -71,22 +70,4 @@ func (s *Store) AbandonMachineExecution(id, actor, why string) (bool, *exit.Erro
 		return false, exit.Internalf("cannot commit local abandonment: %s", err)
 	}
 	return true, nil
-}
-
-// Retain late positive facts without turning an abandoned user's run back into
-// remote execution intent. The first real outcome remains its canonical evidence.
-func recordAbandonedOutcome(tx *sql.Tx, id string, attempt uint64, digest string, raw []byte) *exit.Error {
-	var exists bool
-	if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM request_events WHERE request_id=? AND type='client.abandoned_machine_outcome' AND json_extract(payload,'$.outcome_digest')=?)`, id, digest).Scan(&exists); err != nil {
-		return exit.Internalf("cannot read late outcome evidence: %s", err)
-	}
-	if !exists {
-		if err := appendEventTx(tx, id, "client.abandoned_machine_outcome", int64(attempt), map[string]any{"outcome_digest": digest, "outcome": raw}); err != nil {
-			return exit.Internalf("cannot retain late outcome evidence: %s", err)
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		return exit.Internalf("cannot commit late outcome evidence: %s", err)
-	}
-	return nil
 }

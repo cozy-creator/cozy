@@ -8,7 +8,6 @@ import (
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/api"
-	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
@@ -35,7 +34,7 @@ func providerModelSource(raw string) (string, bool, *exit.Error) {
 	return source.Canonical, true, nil
 }
 
-// sourceRentalBytes sizes a rental bought for a provider-source job as `cozy rental new
+// sourceRentalBytes sizes a rental bought for a provider-source call as `cozy rental new
 // --model` does: the source's reviewed carriers, after the header preflight that refuses
 // before anything is bought (tfs-076). Provider reads only; the machine makes the source.
 func sourceRentalBytes(ctx *Context, models []orchestrator.ModelRef) (int64, *exit.Error) {
@@ -132,9 +131,4 @@ func modelQuantizeHint(ctx *Context, life api.Lifecycle) string {
 		return command + " --await"
 	}
 	return ""
-}
-
-func manifestBytes(raw []byte, manifest string) bool {
-	digest, err := canonical.Spell(canonical.Digest(raw))
-	return err == nil && len(raw) > 0 && digest == manifest
 }

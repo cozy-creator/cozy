@@ -217,11 +217,7 @@ func TestCozy1FollowsAJobsFilmOnAV1Machine(t *testing.T) {
 		t.Skip("requires -machine-host=<tensord> and -cpu-longform=<tensord>/tests/fixtures/cpu_longform")
 	}
 	root, port := cozy1Root(t)
-	project := filepath.Join(t.TempDir(), "cpu_longform")
-	must(t, os.CopyFS(project, os.DirFS(*cpuLongform)))
-	if out, err := exec.Command("uv", "lock", "--directory", project).CombinedOutput(); err != nil {
-		t.Fatalf("uv lock: %v\n%s", err, out)
-	}
+	project := tensordFixture(t, *cpuLongform)
 	if code, out := runCozy(t, root, "package", "install", project); code != 0 {
 		t.Fatalf("package install [exit %d]\n%s", code, out)
 	}

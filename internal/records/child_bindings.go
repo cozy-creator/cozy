@@ -1,9 +1,6 @@
 package records
 
 import (
-	"database/sql"
-	"errors"
-
 	"github.com/cozy-creator/cozy/internal/exit"
 )
 
@@ -64,17 +61,6 @@ func scanChildBinding(row interface{ Scan(...any) error }) (ChildBinding, error)
 	var binding ChildBinding
 	err := row.Scan(&binding.ParentInstallID, &binding.Module, &binding.Export, &binding.ChildInstallID, &binding.Entrypoint)
 	return binding, err
-}
-
-func (s *Store) ChildBinding(parentInstall, module, export string) (*ChildBinding, *exit.Error) {
-	binding, err := scanChildBinding(s.db.QueryRow(`SELECT `+childBindingCols+` FROM private_child_bindings WHERE parent_install_id=? AND module=? AND export=?`, parentInstall, module, export))
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, exit.Internalf("cannot read frozen child binding: %s", err)
-	}
-	return &binding, nil
 }
 
 func (s *Store) RecordChildBindings(bindings []ChildBinding) *exit.Error {

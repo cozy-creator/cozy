@@ -3,6 +3,7 @@ package records
 import (
 	"database/sql"
 	"encoding/json"
+
 	"github.com/cozy-creator/cozy/internal/exit"
 )
 
@@ -45,9 +46,4 @@ func machineInputsIn(q interface {
 		return nil, exit.Internalf("cannot finish input receipt read: %s", err)
 	}
 	return result, nil
-}
-
-// MachineInputs reads retained input custody from the owner's event history.
-func (s *Store) MachineInputs(request string) ([]MachineInput, *exit.Error) {
-	return machineInputsIn(s.db, request)
 }

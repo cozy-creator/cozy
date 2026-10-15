@@ -530,33 +530,6 @@ func splitMajor(ref string) (pkg string, major int, ok bool) {
 	return name, n, true
 }
 
-// List names every package this host can resolve.
-func (r *Resolver) List() []string {
-	out := []string{}
-	if r.store != nil {
-		if installed, e := r.store.Installed(); e == nil {
-			for _, g := range installed {
-				out = append(out, g.Package)
-			}
-		}
-	}
-	sort.Strings(out)
-	return dedupe(out)
-}
-
-func dedupe(in []string) []string {
-	out := in[:0]
-	var last string
-	for i, v := range in {
-		if i > 0 && v == last {
-			continue
-		}
-		out = append(out, v)
-		last = v
-	}
-	return out
-}
-
 // shareModelSlots binds only complete sibling constructions (h3a-018). Every slot
 // must have a default satisfied by an already-selected model; a partial sibling
 // would leave stranded selections that Runtime correctly refuses at preparation.

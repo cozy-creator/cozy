@@ -36,16 +36,6 @@ type Options struct {
 	Rentals func(id string) (*RemoteTarget, *exit.Error)
 }
 
-type RentalObservation struct {
-	RentalID       string
-	Accelerator    string
-	DeviceCount    int
-	Backend        string
-	WorkerInstance string
-	WorkerID       string
-	WorkerBootID   string
-}
-
 type LogicalPackage struct {
 	Package          string
 	Release          string
@@ -299,8 +289,7 @@ type Orchestrator struct {
 	closingCtx    context.Context
 	cancelClosing context.CancelFunc
 
-	mu    sync.Mutex
-	waits map[string]*wait // by request#attempt
+	mu sync.Mutex
 	// outputExporting serializes retries of one durable local --out obligation.
 	outputExporting map[string]bool
 	// pending is the queue of machine executions owed a start, in submission order.
@@ -321,15 +310,6 @@ type Orchestrator struct {
 	transferWake map[string]chan struct{}
 }
 
-type wait struct {
-	accepted chan struct{}
-	closed   chan struct{}
-	once     sync.Once
-	onceA    sync.Once
-	refs     int
-	err      *exit.Error
-}
-
 // Open builds the orchestrator. No listener binds here: the owner DIALS each worker's
 // own socket (#436); a second Calcifer on one root fails on the Calcifer lock instead.
 func Open(opt Options) (*Orchestrator, *exit.Error) {
@@ -339,7 +319,6 @@ func Open(opt Options) (*Orchestrator, *exit.Error) {
 	c := &Orchestrator{
 		opt:             opt,
 		done:            make(chan struct{}),
-		waits:           map[string]*wait{},
 		outputExporting: map[string]bool{},
 		starting:        map[string]bool{},
 		parked:          map[string]string{},
@@ -378,14 +357,6 @@ func (c *Orchestrator) logf(format string, args ...any) {
 	c.mu.Unlock()
 }
 
-// Events is the orchestrator's own recent activity, for status rendering. Runtime events
-// reach a client through here and never bypass the orchestrator.
-func (c *Orchestrator) Events() []string {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return append([]string(nil), c.events...)
-}
-
 // Store is the lifecycle authority this orchestrator writes. cl-006's API reads requests,
 // attempts, outputs and durable events through it — the same rows, never a second copy.
 func (c *Orchestrator) Store() *records.Store { return c.opt.Store }
@@ -398,40 +369,6 @@ func (c *Orchestrator) Layout() home.Layout { return c.opt.Layout }
 func (c *Orchestrator) emit(requestID, eventType string, attempt uint64, payload map[string]any) {
 	if e := c.opt.Store.AppendEvent(requestID, eventType, int64(attempt), payload); e != nil {
 		c.logf("event %s for %s NOT appended: %s", eventType, requestID, e.Message)
-	}
-}
-
-func key(requestID string, attempt uint64) string {
-	return fmt.Sprintf("%s#%d", requestID, attempt)
-}
-
-// acquireWait retains only live callers. Terminal/acceptance signals never create a map
-// entry of their own, so fire-and-forget requests cannot accumulate one wait forever.
-func (c *Orchestrator) acquireWait(k string) (*wait, func()) {
-	c.mu.Lock()
-	w, ok := c.waits[k]
-	if !ok {
-		w = &wait{accepted: make(chan struct{}), closed: make(chan struct{})}
-		c.waits[k] = w
-	}
-	w.refs++
-	c.mu.Unlock()
-	return w, func() {
-		c.mu.Lock()
-		w.refs--
-		if w.refs == 0 && c.waits[k] == w {
-			delete(c.waits, k)
-		}
-		c.mu.Unlock()
-	}
-}
-
-func (c *Orchestrator) signalClosed(k string, e *exit.Error) {
-	c.mu.Lock()
-	w := c.waits[k]
-	c.mu.Unlock()
-	if w != nil {
-		w.markClosed(e)
 	}
 }
 
@@ -587,8 +524,6 @@ func (c *Orchestrator) CancelQueued(requestID, actor string) *exit.Error {
 	c.signalTransfer(requestID)
 	c.forget(requestID)
 	c.logf("%s canceled before any attempt", requestID)
-	c.signalClosed(requestWaitKey(requestID),
-		exit.New(exit.Canceled, "%s was canceled before any attempt was dispatched", requestID))
 	c.cleanupRequestAssets(*row)
 	c.reviveQueue()
 	return nil
@@ -605,15 +540,4 @@ func (c *Orchestrator) forget(requestID string) {
 	}
 	c.pending = out
 	delete(c.parked, requestID)
-}
-
-// requestWaitKey names the request-level wait, which may span several attempt ordinals.
-func requestWaitKey(requestID string) string { return "request:" + requestID }
-
-func (w *wait) markAccepted() { w.onceA.Do(func() { close(w.accepted) }) }
-func (w *wait) markClosed(e *exit.Error) {
-	w.once.Do(func() {
-		w.err = e
-		close(w.closed)
-	})
 }

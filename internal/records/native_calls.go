@@ -15,24 +15,3 @@ const nativeCallsDDL = `CREATE TABLE IF NOT EXISTS native_calls (
  cancel_requested INTEGER NOT NULL DEFAULT 0 CHECK(cancel_requested IN (0,1)),
  UNIQUE(parent_request_id,call_index)
 )`
-
-type NativeCall struct {
-	ID, ParentRequestID              string
-	ParentAttempt                    int64
-	CancelRequested                  bool
-	CallIndex                        int64
-	Kind, Operation, IntentDigest    string
-	Request, Frozen                  []byte
-	State                            string
-	Result, NativeReceipt            []byte
-	SafeCode                         string
-	Worker, InstanceID, WorkerBootID string
-}
-
-const nativeCallColumns = `id,parent_request_id,call_index,kind,operation,intent_digest,request,frozen,state,result,native_receipt,safe_code,worker,instance_id,worker_boot_id,parent_attempt,cancel_requested`
-
-func scanNativeCall(row interface{ Scan(...any) error }) (NativeCall, error) {
-	var call NativeCall
-	err := row.Scan(&call.ID, &call.ParentRequestID, &call.CallIndex, &call.Kind, &call.Operation, &call.IntentDigest, &call.Request, &call.Frozen, &call.State, &call.Result, &call.NativeReceipt, &call.SafeCode, &call.Worker, &call.InstanceID, &call.WorkerBootID, &call.ParentAttempt, &call.CancelRequested)
-	return call, err
-}

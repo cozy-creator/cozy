@@ -18,7 +18,7 @@ type Capabilities struct {
 	RunGPUs          bool `json:"run_gpus"`
 	MachineEndpoints bool `json:"machine_endpoints"`
 	ModelOverrides   bool `json:"model_overrides"`
-	// MachineV1 is a controller that runs work on cozy.machine.v1 machines (calls and jobs).
+	// MachineV1 is a controller that runs work on cozy.machine.v1 machines.
 	MachineV1 bool `json:"machine_v1"`
 	// Operations is a controller that records package and model operations as numbered runs.
 	Operations bool `json:"operations"`

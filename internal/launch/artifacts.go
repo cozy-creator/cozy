@@ -48,10 +48,6 @@ type RuntimeCLI struct {
 	Env               []string // the allowlisted child environment (config.Tool)
 }
 
-func (r RuntimeCLI) callContext(ctx context.Context, out any, verb ...string) *exit.Error {
-	return r.callInputContext(ctx, nil, out, verb...)
-}
-
 func (r RuntimeCLI) callInputContext(ctx context.Context, input []byte, out any, verb ...string) *exit.Error {
 	args := []string{"--json", "--dir", r.Dir}
 	if r.PackageInterface != "" {

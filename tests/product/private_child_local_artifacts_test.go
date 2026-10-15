@@ -16,7 +16,7 @@ import (
 // The same A/B author files used by the real rental proof run here through the
 // ordinary local CLI on this computer's machine, whose Store keeps the results. No Docker,
 // PodHost replacement, native ACK or cache is faked.
-func TestUnpublishedChildLocalArtifactsShareWorkspaceMemoization(t *testing.T) {
+func TestUnpublishedChildLocalArtifactsReplayTheirDerivations(t *testing.T) {
 	integration(t)
 	control := filepath.Join(t.TempDir(), "control")
 	uv := func(args ...string) {
@@ -151,8 +151,10 @@ func TestUnpublishedChildLocalArtifactsShareWorkspaceMemoization(t *testing.T) {
 			}
 			continue
 		}
-		if children[0].Executions != 0 || children[0].Computation != originalA.Computation || string(children[0].Result) != string(originalA.Result) {
-			t.Fatalf("cycle %d recomputed or changed A: original=%+v actual=%+v", cycle, originalA, children[0])
+		// A writes weights, so it is never memoized: it runs again and TensorFS answers its
+		// derivation from the committed transaction, the same checkpoint.
+		if string(children[0].Result) != string(originalA.Result) {
+			t.Fatalf("cycle %d changed A's checkpoint: original=%+v actual=%+v", cycle, originalA, children[0])
 		}
 		if cycle < 3 {
 			if children[1].Executions != 1 {
@@ -161,12 +163,12 @@ func TestUnpublishedChildLocalArtifactsShareWorkspaceMemoization(t *testing.T) {
 			if cycle == 1 && children[1].Intent == originalB.Intent {
 				t.Fatal("parameter edit reused B's failed input")
 			}
-			if cycle == 2 && (children[1].Computation == latestB.Computation || children[1].Intent != latestB.Intent) {
+			if cycle == 2 && (string(children[1].Result) == string(latestB.Result) || children[1].Intent != latestB.Intent) {
 				t.Fatal("same-version library edit did not change only implementation identity")
 			}
 			latestB = children[1]
-		} else if children[1].Executions != 0 || children[1].Computation != latestB.Computation || string(children[1].Result) != string(latestB.Result) {
-			t.Fatalf("unchanged B did not use the shared workspace result: %+v", children[1])
+		} else if string(children[1].Result) != string(latestB.Result) {
+			t.Fatalf("unchanged B did not replay its derivation: %+v", children[1])
 		}
 		link, issue := store.MachineExecution(parent.ID)
 		fatal(t, issue)

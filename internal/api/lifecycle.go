@@ -12,7 +12,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-// LifecycleIdentity is one durable obligation: an invocation, job, rental, paid
+// LifecycleIdentity is one durable obligation: an invocation, rental, paid
 // acquisition, installation or output export, by id and state.
 type LifecycleIdentity struct {
 	Kind  string `json:"kind"`
@@ -198,7 +198,7 @@ func (s *Server) downBlockers() ([]LifecycleIdentity, []LifecycleIdentity, *exit
 	for _, o := range obligations {
 		identity := LifecycleIdentity{Kind: o.Kind, ID: o.ID, State: o.State}
 		switch o.Kind {
-		case "invocation", "job":
+		case "invocation":
 			active = append(active, identity)
 		case "rental", "rental_operation":
 			rentals = append(rentals, identity)

@@ -594,17 +594,6 @@ func (e *Entrypoint) TypeOfField(name string) (json.RawMessage, bool) {
 	return nil, false
 }
 
-// InputKind returns the compact package-interface kind for one request field.
-func (e *Entrypoint) InputKind(name string) (string, bool) {
-	for _, field := range e.Request.Fields {
-		if field.Name == name {
-			kind, _ := typeOf(field.Type)
-			return kind, true
-		}
-	}
-	return "", false
-}
-
 // RequestFields names every declared request field, in the author's declaration order.
 func (e *Entrypoint) RequestFields() []string {
 	out := make([]string, 0, len(e.Request.Fields))
@@ -612,11 +601,6 @@ func (e *Entrypoint) RequestFields() []string {
 		out = append(out, f.Name)
 	}
 	return out
-}
-
-// AllowsGPUCount checks an explicit execution group against the authored model capability.
-func (s Slot) AllowsGPUCount(count int) bool {
-	return count >= 0 && (count <= 1 || s.sequenceParallelDegrees()[count])
 }
 
 // SupportedGPUCounts is package-code capability, including the unpartitioned path.

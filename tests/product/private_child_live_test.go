@@ -90,7 +90,7 @@ class Result(msgspec.Struct, frozen=True):
 		} else {
 			body += "async def compute(ctx: Context, *, value: int, factor: int) -> Result:\n    if factor == 0:\n        raise ValueError('candidate quality gate failed')\n    return Result(value * factor)\n"
 		}
-		body += "app = App()\napp.job(compute, accelerator=False)\n"
+		body += "app = App()\napp.entrypoint(compute, accelerator=False)\n"
 		must(t, os.WriteFile(filepath.Join(lib, module+".py"), []byte(body), 0o600))
 	}
 	script := filepath.Join(project, "recipe.py")
@@ -132,7 +132,7 @@ async def main():
 	fatal(t, problem)
 	code = strings.Replace(code, "factor=0", "factor=2", 1)
 	must(t, os.WriteFile(script, []byte(code), 0o600))
-	status, out = runCozyPath(t, root, path, "run", script, "--retry", "1", "--await", "--json")
+	status, out = runCozyPath(t, root, path, "run", script, "--await", "--json")
 	if status != 0 {
 		t.Fatalf("edited parent did not complete [%d]: %s", status, out)
 	}
@@ -146,7 +146,7 @@ async def main():
 	raw, err := os.ReadFile(implementation)
 	must(t, err)
 	must(t, os.WriteFile(implementation, []byte(strings.Replace(string(raw), "return Result(value * factor)", "return Result(value * factor + 1)", 1)), 0o600))
-	status, out = runCozyPath(t, root, path, "run", script, "--retry", "1", "--await", "--json")
+	status, out = runCozyPath(t, root, path, "run", script, "--await", "--json")
 	if status != 0 {
 		t.Fatalf("same-version library edit did not execute [%d]: %s", status, out)
 	}
