@@ -1,0 +1,83 @@
+name: dev-build
+# Builds release.yaml's archives for any ref and runs one targeted test command, off the dev box:
+#   gh workflow run dev-build.yaml -R cozy-creator/cozy -f ref=<sha> [-f build=none] [-f test='go test ./internal/run/...']
+# The artifact is cozy-cli-<sha>: cozy-<os>-<arch>.tar.gz for every release platform, the player
+# and SHA256SUMS, stamped dev-<sha>. No whole-suite default: `test` is empty unless given.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag or SHA to build
+        type: string
+        default: master
+      build:
+        description: "cli: the release archives; none: tests only"
+        type: string
+        default: cli
+      test:
+        description: Targeted test command, run with bash at the ref in a delegated cgroup; empty runs none
+        type: string
+        default: ''
+      runner:
+        description: Runner label
+        type: string
+        default: ubuntu-latest
+      nonce:
+        description: Caller's id, shown in the run name so the caller can find its run
+        type: string
+        default: ''
+run-name: dev-build ${{ inputs.ref }} ${{ inputs.build }} ${{ inputs.nonce }}
+
+permissions:
+  contents: read
+
+jobs:
+  dev:
+    runs-on: ${{ inputs.runner }}
+    # Hang bound, not a work budget.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref }}
+      - id: sha
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      # Caches modules and the build cache keyed on go.sum.
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.0'
+          check-latest: false
+      - uses: astral-sh/setup-uv@v6
+        if: inputs.test != ''
+        with:
+          version: '0.12.11'
+      # The release recipe (release.yaml): umask 0002, -buildvcs=false, scripts/release.sh.
+      - name: Build the release archives
+        if: inputs.build == 'cli'
+        env:
+          GOFLAGS: -buildvcs=false
+          GOTOOLCHAIN: local
+          SHA: ${{ steps.sha.outputs.sha }}
+        run: |
+          umask 0002
+          find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+          git checkout -- .
+          scripts/release.sh "dev-$SHA"
+      - if: inputs.build == 'cli'
+        uses: actions/upload-artifact@v4
+        with:
+          name: cozy-cli-${{ steps.sha.outputs.sha }}
+          path: dist/dev-${{ steps.sha.outputs.sha }}/
+          if-no-files-found: error
+          retention-days: 7
+      # ci.yaml's isolation: the product tests' executor containment needs a delegated cgroup subtree.
+      - if: inputs.test != ''
+        env:
+          TEST: ${{ inputs.test }}
+        run: |
+          sudo systemd-run --wait --pipe --collect \
+            --unit="cozy-dev-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --uid="$(id -u)" --gid="$(id -g)" --property=Delegate=yes --working-directory="$PWD" \
+            --setenv="PATH=$PATH" --setenv="HOME=$HOME" --setenv=CGO_ENABLED=0 --setenv=UV_TORCH_BACKEND=cpu \
+            --setenv="GOCACHE=$(go env GOCACHE)" --setenv="GOMODCACHE=$(go env GOMODCACHE)" \
+            bash -euo pipefail -c "$TEST"
