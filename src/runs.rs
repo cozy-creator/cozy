@@ -530,6 +530,11 @@ impl Runs {
         let interface: Value = serde_json::from_slice(&installation.interface)
             .map_err(|_| refused("package_interface_invalid", "held interface is corrupt"))?;
         let generation = self.service.catalog.resolve(&installation.generation)?;
+        // A call's imports start now, beside the rest of its preparation; a warm run imports
+        // only when its level asks (`downloaded` never does).
+        if let (false, Some(gpu)) = (spec.warm, self.service.gpu()) {
+            gpu.prespawn(generation.clone());
+        }
         if !generation.record.sdk_fallback.is_empty() {
             let warning = format!("{} {}: {}", installation.package, installation.release, generation.record.sdk_fallback);
             if let Err(error) = self.service.engine.append_log(id, "warning", &warning) {

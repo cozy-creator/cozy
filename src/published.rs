@@ -735,9 +735,8 @@ impl Publisher {
         self.generation(service.catalog.root(), &identity, &wanted, job)?;
         let held = service.catalog.resolve(&identity).map_err(io_failure)?;
         if let Some(gpu) = service.gpu() {
-            // Its kernel compiles and its imports overlap the model download.
+            // Its kernels compile while its weights come.
             gpu.kernel_boot(held.clone());
-            gpu.prespawn(held.clone());
         }
         service
             .engine
@@ -1719,7 +1718,7 @@ fn split_lock(lock: &str, name: &str, release: &str, own_sdk: bool) -> Result<Lo
 
 #[cfg(test)]
 #[path = "../tests/common/names_hub.rs"]
-mod names_hub;
+pub(crate) mod names_hub;
 
 #[cfg(test)]
 mod tests {
@@ -2425,6 +2424,51 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(count(&heard, "GET /o/"), 2 + 16);
+        let _ = fs::remove_dir_all(&bench.root);
+    }
+
+    /// `--warm=downloaded` never starts an executor or imports, even where calls prespawn:
+    /// the member wants its constructions' objects behind every run and reports `installed`
+    /// (downloading) until every one is here, then exactly `downloaded`.
+    #[test]
+    fn a_member_warmed_to_downloaded_only_downloads() {
+        use crate::gpu_service::{Level, Member, Plan, PlanSlot, Pool};
+        let bench = Bench::new();
+        let manifest = checkpoint(&bench.source, 16, 8);
+        let (hub, named, heard) = bench.hub("acme/warmed", &manifest, 200);
+        bench.publisher.structure(&hub, std::slice::from_ref(&named), &Job::default()).unwrap();
+        let store = bench.publisher.store().clone();
+        let generations = crate::catalog::Catalog::new(&bench.root.join("generations")).unwrap();
+        let dir = generations.root().join("g-warm");
+        fs::create_dir_all(dir.join("env/bin")).unwrap();
+        fs::write(dir.join("env/bin/python"), "").unwrap();
+        File::create(dir.join(".hold")).unwrap();
+        let interface = json!({"application": "pkg:app", "entrypoints": [{"name": "render",
+            "models": [{"path": "render.models.model", "class": "M"}]}]});
+        fs::write(dir.join("generation.json"), json!({"identity": "g-warm", "package": "acme/pkg", "version": "1.0.0",
+            "application": "pkg:app", "python": dir.join("env/bin/python"), "interface": interface}).to_string()).unwrap();
+        let held = generations.resolve("g-warm").unwrap();
+        let binding = crate::device_executor::Binding { snapshot: manifest.id(), components: vec!["model".into()], ..Default::default() };
+        let plan = Plan { id: "warm".into(), construction: "warm".into(), installation: "i".into(), generation: "g-warm".into(),
+            entrypoint: "render".into(), slots: vec![PlanSlot { binding, selected_encoded_bytes: 0 }], sources: vec![], degree: 1 };
+        let config = serde_json::from_value(json!({"devices": "GPU-test-0", "authorized_device_limit_bytes": null, "prespawn": true})).unwrap();
+        let pool = Pool::new(&bench.root.join("gpu"), config, store.clone()).unwrap();
+        let engine = crate::execution::Engine::open(&bench.root.join("execution")).unwrap();
+        let fetch = crate::access::Fetch::new(store.clone(), Some(hub), plan.manifests(), u64::MAX);
+        pool.set_members("alice", vec![Member::new(held, Some(plan), Level::Downloaded, Some(fetch))]);
+        pool.keep(&engine, "alice");
+        let [(level, held_back)] = pool.members("alice")[..] else { panic!("one member") };
+        assert_eq!((level, held_back), (Level::Installed, "its weights are downloading"));
+        let started = Instant::now();
+        while pool.members("alice")[0].0 < Level::Downloaded {
+            assert!(pool.levels().is_empty(), "nothing imports or starts");
+            assert!(started.elapsed() < Duration::from_secs(60), "never downloaded: {heard:?}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(pool.members("alice"), [(Level::Downloaded, "")]);
+        assert!(pool.levels().is_empty(), "nothing imports or starts");
+        assert_eq!(count(&heard, "GET /o/"), 2 + 16, "each object once");
+        pool.stop().unwrap();
         let _ = fs::remove_dir_all(&bench.root);
     }
 }

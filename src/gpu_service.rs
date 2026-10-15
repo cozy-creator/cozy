@@ -1014,6 +1014,7 @@ impl Pool {
             let held_back = match (&member.plan, member.level) {
                 (_, Level::Installed) => "",
                 (None, _) => UNBOUND,
+                (Some(plan), Level::Downloaded) if !self.downloaded(plan) => "its weights are downloading",
                 (_, Level::Downloaded) => "",
                 (_, Level::Imported) => self.import(&member.held),
                 (Some(plan), Level::Host | Level::Gpu) => match self.import(&member.held) {
@@ -2166,8 +2167,8 @@ impl Pool {
         }
     }
 
-    /// Start a generation's import-only executor in the background after its install, so its
-    /// imports overlap the model download before the first request.
+    /// Start a generation's import-only executor in the background for a call being prepared,
+    /// so its imports overlap the rest of the preparation.
     pub fn prespawn(self: &Arc<Self>, held: HeldGeneration) {
         if !self.parent_fits(&held) {
             eprintln!(
