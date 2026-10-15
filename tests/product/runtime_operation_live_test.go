@@ -128,7 +128,7 @@ async def main(ctx):
 			current += "    ctx.log(\"The caller changed; the operation did not\")\n"
 		}
 		must(t, os.WriteFile(script, []byte(current), 0600))
-		status, output := runCozyPath(t, root, path, "run", script, "--await", "--json")
+		status, output := runCozyPath(t, root, path, "run", script, "--await", "--json", "--full")
 		if status != 0 {
 			t.Fatalf("builtin caller %d failed [%d]: %s", i, status, output)
 		}
@@ -203,11 +203,14 @@ async def main(ctx):
 		}
 	}
 	must(t, rows.Err())
-	if len(builtin) != 1 {
-		t.Fatalf("quantize did not run once as runtime/operations: %v", builtin)
+	// A writer is never memoized: quantize ran once for each caller.
+	if len(builtin) != 2 {
+		t.Fatalf("quantize did not run once per caller as runtime/operations: %v", builtin)
 	}
-	parent, generation, _ := strings.Cut(builtin[0], " ")
-	if generations[parent] != generation {
-		t.Fatalf("quantize ran outside its caller's environment: %s, its caller %s", generation, generations[parent])
+	for _, ran := range builtin {
+		parent, generation, _ := strings.Cut(ran, " ")
+		if generations[parent] != generation {
+			t.Fatalf("quantize ran outside its caller's environment: %s, its caller %s", generation, generations[parent])
+		}
 	}
 }

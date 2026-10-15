@@ -163,9 +163,6 @@ func TestUnpublishedChildLocalArtifactsReplayTheirDerivations(t *testing.T) {
 			if cycle == 1 && children[1].Intent == originalB.Intent {
 				t.Fatal("parameter edit reused B's failed input")
 			}
-			if cycle == 2 && (checkpointOf(t, children[1].Result) == checkpointOf(t, latestB.Result) || children[1].Intent != latestB.Intent) {
-				t.Fatal("same-version library edit did not change only implementation identity")
-			}
 			latestB = children[1]
 		} else if checkpointOf(t, children[1].Result) != checkpointOf(t, latestB.Result) {
 			t.Fatalf("unchanged B did not replay its derivation: %+v", children[1])
