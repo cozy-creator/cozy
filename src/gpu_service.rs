@@ -1238,7 +1238,7 @@ impl Pool {
             return "this machine imports nothing ahead for it (no fork, or it binds no model)";
         };
         if start {
-            parent.set(self.import_only(held));
+            parent.set(self.import_only(held, None));
         }
         parent.wait_started();
         match (parent.ready(), parent.failed()) {
@@ -1872,7 +1872,7 @@ impl Pool {
                 let asked = Instant::now();
                 if let Some((zygote, start)) = pool.zygote(&held) {
                     if start {
-                        zygote.set(pool.import_only(&held));
+                        zygote.set(pool.import_only(&held, Some((&plan, &*fetch))));
                     }
                     zygote.wait_started();
                 }
@@ -2167,7 +2167,7 @@ impl Pool {
 
     /// Start a generation's import-only executor in the background for a call being prepared,
     /// so its imports overlap the rest of the preparation.
-    pub fn prespawn(self: &Arc<Self>, held: HeldGeneration) {
+    pub fn prespawn(self: &Arc<Self>, held: HeldGeneration, ahead: Option<(Plan, Arc<crate::access::Fetch>)>) {
         if self.zygotes.lock().unwrap().contains_key(&parent_app(&held)) {
             return;
         }
@@ -2187,7 +2187,7 @@ impl Pool {
             .name("executor-prespawn".into())
             .spawn(move || {
                 let state = match pool.upgrade() {
-                    Some(pool) => pool.import_only(&held),
+                    Some(pool) => pool.import_only(&held, ahead.as_ref().map(|(plan, fetch)| (plan, &**fetch))),
                     None => ZygoteState::Off("the GPU pool ended".into()),
                 };
                 zygote.set(state);
@@ -2281,7 +2281,9 @@ impl Pool {
 
     /// Spawn an executor of `held` and import torch, the Runtime and the package with no
     /// device (`Start.import_only`), to fork executors from.
-    fn import_only(&self, held: &HeldGeneration) -> ZygoteState {
+    /// `held`'s import-only executor. `ahead`: the call it starts for, whose Start pass schedules
+    /// that call's weights before any import (the forked child re-asserts at its own Start).
+    fn import_only(&self, held: &HeldGeneration, ahead: Option<(&Plan, &crate::access::Fetch)>) -> ZygoteState {
         let started = (|| {
             let (root, socket, directory) = self.executor_endpoint()?;
             let mut executor = DeviceExecutor::spawn_owned(
@@ -2305,12 +2307,12 @@ impl Pool {
                     devices: self.lane_devices(0, self.devices.len().min(1) as u32)?,
                     application: held.record.application.clone(),
                     call_interfaces: crate::calls::call_interfaces(held, &interface),
-                    constructions: vec![],
+                    constructions: ahead.map(|(plan, _)| constructions(plan)).unwrap_or_default(),
                     package_interface: interface,
                     sequence_parallel_degree: 1,
                     import_only: true,
                 },
-                &mut device_executor::Baseline,
+                &mut Ahead(ahead.map(|(_, fetch)| fetch)),
             )?;
             if !reply.ok {
                 executor.shutdown()?;
@@ -2718,7 +2720,7 @@ impl Pool {
                 break;
             };
             if start {
-                zygote.set(self.import_only(held));
+                zygote.set(self.import_only(held, None));
             }
             match zygote.fork(config.take().expect("one config per launch"), &on_birth)? {
                 Forked::Ready(executor) => {
@@ -2866,15 +2868,7 @@ impl Pool {
             let interface_path = self.interface_file(&session.executor, held)?;
             let used: Vec<_> = gpus.iter().map(|d| d.memory.used()).collect();
             let starting = Instant::now();
-            let constructions = plan
-                .slots
-                .iter()
-                .map(|slot| Construction {
-                    path: slot.binding.model_binding_path.clone(),
-                    manifest: slot.binding.snapshot.clone(),
-                    components: slot.binding.components.clone(),
-                })
-                .collect();
+            let constructions = constructions(&plan);
             // Rank 0 spawns and forms every follower inside this command; its watch meters
             // the whole group's work, so formation ends only on measured lack of progress.
             let started = command_ok(session.executor.command_with(
@@ -4243,6 +4237,41 @@ pub(crate) fn command_ok(frame: Frame) -> io::Result<Frame> {
         }))
     }
 }
+/// Each constructed slot's checkpoint and components: what a Start schedules first.
+fn constructions(plan: &Plan) -> Vec<Construction> {
+    let slot = |slot: &PlanSlot| Construction {
+        path: slot.binding.model_binding_path.clone(),
+        manifest: slot.binding.snapshot.clone(),
+        components: slot.binding.components.clone(),
+    };
+    plan.slots.iter().map(slot).collect()
+}
+
+/// A call's `fetch_channel` answers: a fresh channel over its checkpoints held in part.
+struct Ahead<'a>(Option<&'a crate::access::Fetch>);
+impl Services for Ahead<'_> {
+    fn request(&mut self, frame: &Frame, descriptor: Option<File>) -> io::Result<(Answer, Option<File>)> {
+        drop(descriptor);
+        let mut answer = Answer::unavailable(frame.seq);
+        let (Kind::FetchChannel, Some(fetch)) = (frame.kind, self.0) else {
+            return Ok((answer, None));
+        };
+        Ok(match fetch.channel() {
+            Ok(channel) => {
+                (answer.ok, answer.descriptor) = (true, true);
+                answer.code.clear();
+                answer.detail.clear();
+                (answer, Some(channel))
+            }
+            Err(error) => {
+                answer.code = "fetch_channel_refused".into();
+                answer.detail = error.to_string();
+                (answer, None)
+            }
+        })
+    }
+}
+
 struct Callbacks<'a> {
     engine: &'a Arc<Engine>,
     id: &'a str,
@@ -4421,24 +4450,7 @@ impl Services for Callbacks<'_> {
             return Ok((answer, None));
         }
         if frame.kind == Kind::FetchChannel {
-            drop(descriptor);
-            let mut answer = Answer::unavailable(frame.seq);
-            let Some(fetch) = self.fetch else {
-                return Ok((answer, None));
-            };
-            return Ok(match fetch.channel() {
-                Ok(channel) => {
-                    (answer.ok, answer.descriptor) = (true, true);
-                    answer.code.clear();
-                    answer.detail.clear();
-                    (answer, Some(channel))
-                }
-                Err(error) => {
-                    answer.code = "fetch_channel_refused".into();
-                    answer.detail = error.to_string();
-                    (answer, None)
-                }
-            });
+            return Ahead(self.fetch.map(|fetch| &**fetch)).request(frame, descriptor);
         }
         if frame.kind == Kind::ModelSource {
             drop(descriptor);

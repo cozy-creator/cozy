@@ -107,6 +107,8 @@ pub struct RunContext {
     pub(crate) gpus: u32,
     pub(crate) models: Vec<domain::ModelChoice>,
     pub(crate) weights_destination: String,
+    /// What its import-only executor's Start fetches ahead, until the run ends.
+    pub(crate) _ahead: Option<Arc<crate::access::Fetch>>,
 }
 
 /// A choice for the run's own slots: a bare parameter, or one under its own name.
@@ -530,10 +532,17 @@ impl Runs {
         let interface: Value = serde_json::from_slice(&installation.interface)
             .map_err(|_| refused("package_interface_invalid", "held interface is corrupt"))?;
         let generation = self.service.catalog.resolve(&installation.generation)?;
-        // A call's imports start now, beside the rest of its preparation; a warm run imports
-        // only when its level asks (`downloaded` never does).
+        // A call's imports start now, beside the rest of its preparation, and its weights before
+        // them; a warm run imports only when its level asks (`downloaded` never does).
+        let mut ahead = None;
         if let (false, Some(gpu)) = (spec.warm, self.service.gpu()) {
-            gpu.prespawn(generation.clone());
+            let fetching = plan.as_ref().zip(self.publisher.as_ref()).map(|(plan, publisher)| {
+                let order = self.service.engine.get(id).map_or(u64::MAX, |record| record.root_seq());
+                let fetch = crate::access::Fetch::new(publisher.store().clone(), hub.clone(), plan.manifests(), order);
+                (plan.clone(), fetch)
+            });
+            ahead = fetching.as_ref().map(|(_, fetch)| fetch.clone());
+            gpu.prespawn(generation.clone(), fetching);
         }
         if !generation.record.sdk_fallback.is_empty() {
             let warning = format!("{} {}: {}", installation.package, installation.release, generation.record.sdk_fallback);
@@ -639,6 +648,7 @@ impl Runs {
                 gpus: spec.gpus,
                 models: spec.models.clone(),
                 weights_destination: spec.weights_destination.clone(),
+                _ahead: ahead,
             };
             self.contexts.lock().unwrap().insert(id.into(), context);
         }
