@@ -736,6 +736,34 @@ func (s *Store) CompleteRentalAttachment(key string, row Rental, stage func() *e
 
 // RentalByMachine resolves either a memorable machine name, in any case, or the opaque
 // Tensorhub id.
+// RentalsNamed are the rentals recorded under name: the one whose ID it is, else every one
+// whose machine name it is, on any Hub and in any state.
+func (s *Store) RentalsNamed(name string) ([]Rental, *exit.Error) {
+	if r, problem := s.RentalRow(name); problem != nil || r != nil {
+		if r == nil {
+			return nil, problem
+		}
+		return []Rental{*r}, nil
+	}
+	rows, err := s.db.Query(`SELECT `+rentalCols+` FROM rentals WHERE machine_name=? OR stable_machine_name=?`, strings.ToLower(name), strings.ToLower(name))
+	if err != nil {
+		return nil, exit.Internalf("cannot read rented machine %s: %s", name, err)
+	}
+	defer rows.Close()
+	var out []Rental
+	for rows.Next() {
+		r, err := scanRental(rows)
+		if err != nil {
+			return nil, exit.Internalf("cannot read rented machine %s: %s", name, err)
+		}
+		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, exit.Internalf("cannot read rented machine %s: %s", name, err)
+	}
+	return out, nil
+}
+
 func (s *Store) RentalByMachine(name string) (*Rental, *exit.Error) {
 	// The rental ID is authoritative even when a provider name collides with an alias.
 	if r, problem := s.RentalRow(name); problem != nil || r != nil {

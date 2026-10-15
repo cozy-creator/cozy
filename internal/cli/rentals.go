@@ -1184,9 +1184,9 @@ func handleRentalShow(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	selected := inventory.Select(typed)
+	selected := selectedRentals(ctx, inventory, typed)
 	if len(selected) > 1 {
-		return exit.Named(exit.Conflict, "rental.machine_name_ambiguous", "machine %q identifies multiple live rentals; use a rental ID", typed)
+		return ambiguousRentals(typed, selected)
 	}
 	if len(selected) == 0 {
 		return showEndedRental(ctx, typed)

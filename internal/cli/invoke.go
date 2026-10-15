@@ -3194,8 +3194,8 @@ func startedRental(ctx *Context, name string) bool {
 		return false
 	}
 	defer store.Close()
-	row, _ := store.RentalByMachine(name)
-	return recordedRental(store, name) != "" && !acquiringState(row.State)
+	held, _ := recordedRental(ctx, store, name)
+	return held.ID != "" && !acquiringState(held.State)
 }
 
 // machineRelease is the newest release of pkg from the selected Hub that the run's named
