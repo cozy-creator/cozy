@@ -11,7 +11,7 @@ import (
 )
 
 // quantizedLanes are the lanes `cozy model quantize` can ask a package for, one flag each.
-var quantizedLanes = []string{"fp8", "mxfp8"}
+var quantizedLanes = []string{"fp8", "mxfp8", "int8"}
 
 // handleModelQuantize runs the quantizer of the package that serves a model. The package
 // owns the recipe (which components and layers); a quantizer is its job that takes the model
@@ -95,14 +95,16 @@ func holdCheckpoint(ctx *Context, source string) *exit.Error {
 	return problem
 }
 
-// quantizer is the package's job that writes `lane`: a model input and one weights output
-// named for the lane.
+// quantizer is the package's function that writes `lane`: a model input and one weights
+// output named for the lane. Runtime 0.25 declares it as an entrypoint, older ones as a job.
 func quantizer(surface *launch.PackageInterface, lane string) *launch.Entrypoint {
-	for i := range surface.Jobs {
-		job := &surface.Jobs[i]
-		if !job.Internal && launch.ConversionSlot(job) != nil && len(job.WeightsOutputs) == 1 &&
-			job.WeightsOutputs[0].OutputID == lane {
-			return job
+	for _, functions := range [][]launch.Entrypoint{surface.Entrypoints, surface.Jobs} {
+		for i := range functions {
+			fn := &functions[i]
+			if !fn.Internal && launch.ConversionSlot(fn) != nil && len(fn.WeightsOutputs) == 1 &&
+				fn.WeightsOutputs[0].OutputID == lane {
+				return fn
+			}
 		}
 	}
 	return nil
@@ -110,7 +112,7 @@ func quantizer(surface *launch.PackageInterface, lane string) *launch.Entrypoint
 
 func noQuantizer(lane, format string, args ...any) *exit.Error {
 	return exit.Named(exit.NotFound, "model.quantizer_not_found", format, args...).
-		WithRemedy("a package quantizes its models with a job that takes the model and declares one weights output named %s, "+
+		WithRemedy("a package quantizes its models with a function that takes the model and declares one weights output named %s, "+
 			"such as `%s(ctx, *, source: <Model>, tel) -> ModelArtifact` registered with `weights=(WeightsOutput(%q, ...),)`; "+
 			"name the package with --package org/name", lane, lane, lane)
 }
