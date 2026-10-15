@@ -10,7 +10,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/resultfiles"
 )
 
-func TestJobMediaExportRejectsChangedCustodyAndSymlinkDestination(t *testing.T) {
+func TestMediaExportRejectsChangedCustodyAndSymlinkDestination(t *testing.T) {
 	root := t.TempDir()
 	source := filepath.Join(root, "accepted")
 	body := []byte("accepted bytes")

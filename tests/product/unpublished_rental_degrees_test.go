@@ -42,7 +42,7 @@ func TestUnpublishedRentalPreservesSelectedFunctionDegrees(t *testing.T) {
 		{"actual H3 serving", "fl2va", []int{2, 4}},
 		{"undeclared selected slot", "fl2va", nil},
 		{"independent slot intersection", "fl2va", []int{4}},
-		{"job remains ungrouped", "segment", nil},
+		{"segment declares its own degrees", "segment", []int{2, 4}},
 		{"missing requested function", "absent", nil},
 	} {
 		t.Run(arm.name, func(t *testing.T) {
