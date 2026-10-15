@@ -560,11 +560,8 @@ func (m *machineRuns) specV1(ctx context.Context, request records.Request, machi
 	if len(request.Assets) > 0 {
 		m.submissionStage(request.ID, "inputs", fmt.Sprintf("%d input(s)", len(request.Assets)), began)
 	}
-	models, problem := m.runModels(request)
-	if problem != nil {
-		return nil, problem
-	}
-	if spec.Models, problem = modelChoicesV1(request, models); problem != nil {
+	// Only the run's own choices: its machine gives each child slot the callee's default.
+	if spec.Models, problem = modelChoicesV1(request, request.Models); problem != nil {
 		return nil, problem
 	}
 	// The selected Hub supplies package/model access independently of rental ownership.
@@ -585,47 +582,6 @@ func (m *machineRuns) specV1(ctx context.Context, request records.Request, machi
 		spec.Providers = providers
 	}
 	return spec, nil
-}
-
-// runModels are every model choice a run's machine needs: the run's own and, for a published
-// release that composes children, its callees' Hub bindings, each sent by name (th-245).
-// Unpublished code has no Hub binding: its machine gives each callee slot the default ladder
-// the callee declares (run 5327 named one under another package and failed
-// `model_choice_absent`).
-//
-// The callees' bindings are kept under the catalog revision, as the run's own are
-// (exactRunModels): a warm run reads nothing at any Hub.
-func (m *machineRuns) runModels(request records.Request) ([]records.ModelRef, *exit.Error) {
-	if !request.ComposesChildren() || request.InstallID != "" {
-		return request.Models, nil
-	}
-	children, problem := m.childModels(request)
-	if problem != nil {
-		return nil, problem
-	}
-	return records.OneSelectionPerSlot(request.Models, children), nil
-}
-
-func (m *machineRuns) childModels(request records.Request) ([]records.ModelRef, *exit.Error) {
-	kept := ""
-	if revision, problem := m.store.BindingRevision(m.context.forHub(request.Hub).Cfg.HubURL); problem == nil {
-		identity, err := json.Marshal([]any{"child-models/1", request.Hub, request.Package, request.Release, request.InstallID,
-			request.Entrypoint, client(m.context.forHub(request.Hub)).CredentialIdentity(), revision})
-		if err == nil {
-			name := sha256.Sum256(identity)
-			kept = filepath.Join(m.layout.Root, "releases", "children", hex.EncodeToString(name[:16])+".json")
-		}
-	}
-	var children []records.ModelRef
-	if raw, err := os.ReadFile(kept); kept != "" && err == nil && json.Unmarshal(raw, &children) == nil {
-		return children, nil
-	}
-	children, problem := m.resolver.PublishedChildModels(m.context.forHub(request.Hub), request)
-	if raw, err := json.Marshal(children); problem == nil && kept != "" && err == nil &&
-		os.MkdirAll(filepath.Dir(kept), 0o700) == nil && os.WriteFile(kept+".tmp", raw, 0o600) == nil {
-		_ = os.Rename(kept+".tmp", kept)
-	}
-	return children, problem
 }
 
 // modelChoicesV1 are a run's model choices as a v1 spec names them.

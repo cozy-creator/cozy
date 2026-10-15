@@ -1,8 +1,6 @@
 package cli
 
 import (
-	"strings"
-
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
@@ -11,29 +9,20 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-// A captured child's model slot has ONE authority and it is not the calling package.
-//
-// A retained ModelArtifact in the child's payload stays first: that is the private
-// transaction lineage, where a parent acquired weights itself and hands them down. When
-// the payload names none, the slot resolves the way a top-level `cozy run <package>/<callable>`
-// resolves it — the owner's Hub binding, else the callee's authored default ladder — and
-// the rung is chosen by the machine that will actually run the child. Package code never
-// spells a model here; it only says which of its own callables to run.
-//
-// Without this a composition parent that holds no device cannot name a model at all:
-// declaring a slot of its own would make it device-holding and cost it the CPU
-// orchestration role (decision #601), and the runtime cannot inject one because the child
-// payload is converted from the caller's own arguments.
+// A child's model slot is chosen by the machine that runs it: a retained ModelArtifact in the
+// child's payload, else a choice the caller named, else the callee's authored default ladder,
+// with the rung for that machine's GPUs. Before any machine exists, a composition's rental is
+// sized by those same defaults.
 
-// childModelLadder is the selection with its rung still open: the owner's binding or the
-// callee's authored default, every rung resolved against the model card the way a rented
-// top-level run resolves it. The machine decision reads this to keep a composition off a
+// childModelLadder is a callee slot's authored default with its rung still open, every rung
+// resolved against the model card. The machine decision reads it to keep a composition off a
 // card no shot of it declares a lane for.
-func (r *Resolver) childModelLadder(origin, pkg, entrypoint string, slot launch.Slot) (orchestrator.ModelRef, *exit.Error) {
+func (r *Resolver) childModelLadder(cards cardReader, pkg, entrypoint string, slot launch.Slot) (orchestrator.ModelRef, *exit.Error) {
 	var empty orchestrator.ModelRef
-	binding, problem := r.childSlotBinding(origin, pkg, entrypoint, slot)
-	if problem != nil {
-		return empty, problem
+	binding := slot.Default(packageOwner(pkg, []launch.Slot{slot}, r.namespace))
+	if binding == nil || len(binding.Ladder) == 0 {
+		return empty, exit.Named(exit.NotFound, "child.model_unbound",
+			"%s declares no default for %s model slot %s", pkg, entrypoint, slot.Path)
 	}
 	model, release, _, _, problem := hub.ParseModelRef(binding.Ref())
 	if problem != nil {
@@ -46,12 +35,11 @@ func (r *Resolver) childModelLadder(origin, pkg, entrypoint string, slot launch.
 	if ref.Org == "local" {
 		return empty, exit.Named(exit.Unavailable, "child.model_local_selection",
 			"%s selects the private local model %s for %s, which cannot be granted to a captured child",
-			pkg, ref.String(), slot.Path).
-			WithRemedy("publish the model under a non-local org, or hand the child a retained ModelArtifact")
+			pkg, ref.String(), slot.Path)
 	}
 	hctx, cancel := hub.Context()
 	defer cancel()
-	_, selected, problem := modelReleaseCard(hctx, r.catalog(origin), ref, release)
+	_, selected, problem := modelReleaseCard(hctx, cards, ref, release)
 	if problem != nil {
 		return empty, problem
 	}
@@ -74,40 +62,6 @@ func (r *Resolver) childModelLadder(origin, pkg, entrypoint string, slot launch.
 	return orchestrator.ModelRef{Package: pkg, Slot: slot.Param, BindingPath: slot.Path,
 		Model: ref.String(), CatalogRepository: ref.String(), Release: selected.Release, ComponentUse: slot.ComponentUse,
 		SupportedGPUs: slot.SupportedGPUCounts(), Ladder: rungs}, nil
-}
-
-// childSlotBinding is the selection order minus the run key: a run key belongs to the
-// caller's own invocation and a captured child has none. An editable package has no hub
-// row and stands on its authored default, exactly as a top-level run of it does.
-func (r *Resolver) childSlotBinding(origin, pkg, entrypoint string, slot launch.Slot) (hub.PackageBindingRow, *exit.Error) {
-	var rows []hub.PackageBindingRow
-	if !strings.HasPrefix(pkg, "local/") {
-		ref, problem := hub.ParseRef(pkg)
-		if problem != nil {
-			return hub.PackageBindingRow{}, problem
-		}
-		hctx, cancel := hub.Context()
-		defer cancel()
-		read, problem := r.catalog(origin).PackageBindings(hctx, ref)
-		if problem != nil {
-			return hub.PackageBindingRow{}, exit.Named(problem.Code, "child.model_binding_unreadable",
-				"%s default bindings are not readable: %s", pkg, problem.Message)
-		}
-		rows = read
-	}
-	binding, ok := effectiveModelBindings([]launch.Slot{slot}, rows, packageOwner(pkg, []launch.Slot{slot}, r.namespace))[slot.Path]
-	if !ok {
-		return hub.PackageBindingRow{}, exit.Named(exit.NotFound, "child.model_unbound",
-			"%s has no owner binding or authored default for %s model slot %s",
-			pkg, entrypoint, slot.Path).
-			WithRemedy("bind it: %s", bindRemedy(pkg, slot.Path))
-	}
-	if len(binding.Ladder) == 0 {
-		return hub.PackageBindingRow{}, exit.Named(exit.Validation, "child.model_ladder_empty",
-			"%s names no default lane for %s model slot %s", pkg, entrypoint, slot.Path).
-			WithRemedy("declare a default lane: %s", bindRemedy(pkg, slot.Path))
-	}
-	return binding, nil
 }
 
 // UnpublishedChildModels supplies captured defaults for a CPU request's rental choice.
@@ -149,7 +103,7 @@ func (r *Resolver) UnpublishedChildModels(request records.Request) ([]records.Mo
 				return nil, problem
 			}
 			for _, slot := range job.Models {
-				selected, problem := r.childModelLadder(request.Hub, child.Package, binding.Entrypoint, slot)
+				selected, problem := r.childModelLadder(r.catalog(request.Hub), child.Package, binding.Entrypoint, slot)
 				if problem != nil {
 					// This is advisory sizing for an unknown future call. An
 					// inaccessible default may be unused or explicitly overridden;

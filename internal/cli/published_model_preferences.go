@@ -2,28 +2,81 @@ package cli
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"os"
+	"path/filepath"
 
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/install"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-// PublishedChildModels uses the same exact lock and callable metadata as capture.
-// A CPU workflow needs capacity for its children; their group counts are combined
-// by placement's maximum, since each child reserves its own execution group. The
-// request's own callable is never its own child: its slots are already selected.
+// PublishedChildModels size a rental for a published composition before any machine is known:
+// each callee slot's authored default, as its machine will choose it. A run never reads them.
+// Everything they read is fixed by the exact release, so they are kept under it and read once;
+// an answer that missed a card or lane is read again next time.
 func (r *Resolver) PublishedChildModels(command *Context, request records.Request) ([]records.ModelRef, *exit.Error) {
-	// An unversioned request has no exact closure to walk; RentalConstraints answers it.
 	if !request.ComposesChildren() || request.Release == "" {
 		return nil, nil
 	}
+	kept := ""
+	if identity, err := json.Marshal([]any{"child-models/2", command.Cfg.HubURL, request.Package, request.Release,
+		request.Entrypoint, client(command).CredentialIdentity()}); err == nil {
+		name := sha256.Sum256(identity)
+		kept = filepath.Join(home.Paths(command.Cfg.Home).Root, "releases", "children", hex.EncodeToString(name[:16])+".json")
+	}
+	var models []records.ModelRef
+	if raw, err := os.ReadFile(kept); kept != "" && err == nil && json.Unmarshal(raw, &models) == nil {
+		return models, nil
+	}
+	slots, problem := r.publishedChildSlots(command, request)
+	if problem != nil {
+		return nil, problem
+	}
+	var refs []string
+	for _, slot := range slots {
+		if binding := slot.slot.Default(packageOwner(slot.pkg, []launch.Slot{slot.slot}, r.namespace)); binding != nil {
+			refs = append(refs, binding.Ref())
+		}
+	}
+	cards, complete := readCards(command, refs), true
+	for _, slot := range slots {
+		model, problem := r.childModelLadder(cards, slot.pkg, slot.entry, slot.slot)
+		if problem != nil {
+			// A slot with no default stays optional; a card or lane the Hub lacked is asked again.
+			complete = complete && problem.ErrName() == "child.model_unbound"
+			continue
+		}
+		model.Slot = slot.slot.Path
+		model.Callable = slot.pkg + "/" + slot.entry
+		models = append(models, model)
+	}
+	if raw, err := json.Marshal(models); complete && kept != "" && err == nil &&
+		os.MkdirAll(filepath.Dir(kept), 0o700) == nil && os.WriteFile(kept+".tmp", raw, 0o600) == nil {
+		_ = os.Rename(kept+".tmp", kept)
+	}
+	return models, nil
+}
+
+// childSlot is one model slot a composition's closure declares.
+type childSlot struct {
+	pkg, entry string
+	slot       launch.Slot
+}
+
+// publishedChildSlots are the model slots of every callable the release's locked closure
+// publishes, except the request's own: its slots are already selected.
+func (r *Resolver) publishedChildSlots(command *Context, request records.Request) ([]childSlot, *exit.Error) {
 	root := request.Package + "@" + request.Release
 	ctx, cancel := hub.Context()
 	defer cancel()
 	seen, visiting := map[string]bool{}, map[string]bool{}
-	var models []records.ModelRef
+	var slots []childSlot
 	var walk func(records.Request, int) *exit.Error
 	walk = func(selected records.Request, depth int) *exit.Error {
 		key := selected.Package + "@" + selected.Release
@@ -44,13 +97,7 @@ func (r *Resolver) PublishedChildModels(command *Context, request records.Reques
 				continue
 			}
 			for _, slot := range entry.Models {
-				model, problem := r.childModelLadder(request.Hub, selected.Package, entry.Name, slot)
-				if problem != nil {
-					continue
-				} // Unused or explicitly overridden defaults stay optional.
-				model.Slot = slot.Path
-				model.Callable = selected.Package + "/" + entry.Name
-				models = append(models, model)
+				slots = append(slots, childSlot{pkg: selected.Package, entry: entry.Name, slot: slot})
 			}
 		}
 		lock, problem := exactPackageInstallDocument("uv.lock", plan.UVLock)
@@ -71,10 +118,7 @@ func (r *Resolver) PublishedChildModels(command *Context, request records.Reques
 		}
 		return nil
 	}
-	if problem := walk(request, 0); problem != nil {
-		return nil, problem
-	}
-	return models, nil
+	return slots, walk(request, 0)
 }
 
 func publishedPlanInterface(plan hub.PackageDownloadPlan) (*launch.PackageInterface, *exit.Error) {

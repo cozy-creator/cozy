@@ -17,7 +17,7 @@ import (
 // the unavailable fact; the actual omitted-argument call must refuse, as covered
 // by TestCapturedModelDefaultsDoNotAcquireUnusedOrInaccessibleModels.
 func TestPrivateModelPreflightDefersAbsentCapturedInputs(t *testing.T) {
-	for _, mode := range []string{"job-unbound", "entrypoint-unbound", "job-default", "job-owner-unreadable"} {
+	for _, mode := range []string{"job-unbound", "entrypoint-unbound", "job-default"} {
 		t.Run(mode, func(t *testing.T) {
 			catalog := newLadderHub(t)
 			layout, problem := home.Open(t.TempDir())
@@ -29,12 +29,8 @@ func TestPrivateModelPreflightDefersAbsentCapturedInputs(t *testing.T) {
 			child := cleanupTestInstall(layout, "2222222222222222", "1.0.0")
 			child.Package = "local/private_ops"
 			slot := map[string]any{"class": "Source", "path": "compute.models.source", "component_use": map[string]any{}}
-			if mode == "job-default" || mode == "job-owner-unreadable" {
+			if mode == "job-default" {
 				slot["default_ladder"] = authoredH3(ladderLane)
-			}
-			if mode == "job-owner-unreadable" {
-				child.Package = ladderPackage
-				catalog.bindingsUnavailable = true
 			}
 			call := map[string]any{"name": "compute", "models": []any{slot},
 				"request": map[string]any{"fields": []any{}}, "result": map[string]any{"fields": []any{}},
@@ -61,7 +57,7 @@ func TestPrivateModelPreflightDefersAbsentCapturedInputs(t *testing.T) {
 			resolver := cli.NewResolver(store, config.Config{Home: layout.Root, HubURL: catalog.server.URL, HubToken: secret.New("ladder-test")})
 			models, problem := resolver.UnpublishedChildModels(records.Request{InstallID: parent.ID, Kind: "job"})
 			switch mode {
-			case "job-unbound", "entrypoint-unbound", "job-owner-unreadable":
+			case "job-unbound", "entrypoint-unbound":
 				fatal(t, problem)
 				if len(models) != 0 {
 					t.Fatal("future retained artifact acquired a fabricated static selection")
