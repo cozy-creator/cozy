@@ -3,7 +3,7 @@ package rental
 import (
 	"cmp"
 	"context"
-	"slices"
+	"fmt"
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -36,7 +36,7 @@ func (r LiveResolver) Resolve(ctx context.Context, typed string) (Live, *exit.Er
 	if problem != nil {
 		return Live{}, problem
 	}
-	hint := ""
+	recorded := map[string]bool{}
 	if r.Store != nil {
 		row, problem := r.Store.RentalRow(typed)
 		if problem != nil {
@@ -45,16 +45,18 @@ func (r LiveResolver) Resolve(ctx context.Context, typed string) (Live, *exit.Er
 		if row != nil {
 			return r.Read(ctx, typed)
 		}
-		if named, _ := r.Store.RentalByMachine(typed); named != nil && named.Hub != "" {
-			hint = named.Hub
-			origins = append([]string{hint}, slices.DeleteFunc(origins, func(o string) bool { return o == hint })...)
+		named, _ := r.Store.RentalsNamed(typed)
+		for _, row := range named {
+			recorded[row.Hub] = true
 		}
 	}
+	// Every Hub is asked: a name that live rentals on two Hubs share is refused, naming both.
 	var unanswered *exit.Error
+	var found []Candidate
 	for _, origin := range origins {
 		selected, problem := r.named(ctx, origin, typed)
 		// A hub this computer holds no login for lists none of its rentals, unless it recorded one there.
-		if problem != nil && problem.ErrName() == SignedOut && origin != hint {
+		if problem != nil && problem.ErrName() == SignedOut && !recorded[origin] {
 			continue
 		}
 		if problem != nil && problem.ErrName() != "rental.machine_name_ambiguous" {
@@ -65,12 +67,18 @@ func (r LiveResolver) Resolve(ctx context.Context, typed string) (Live, *exit.Er
 			return Live{}, problem
 		}
 		if selected != nil {
-			// The listing establishes identity; the ID read supplies the current endpoint and
-			// catches a rental ending between selection and action. Selection never judges
-			// whether a rental can be attached: ending one the Hub describes badly must work.
-			remote, problem := r.Client(origin).RentalView(ctx, selected.ID)
-			return Live{Hub: origin, Rental: remote}, problem
+			found = append(found, Candidate{ID: selected.ID, Name: selected.DisplayName(), Hub: origin})
 		}
+	}
+	if len(found) > 1 {
+		return Live{}, Ambiguous(typed, found)
+	}
+	if len(found) == 1 {
+		// The listing establishes identity; the ID read supplies the current endpoint and
+		// catches a rental ending between selection and action. Selection never judges
+		// whether a rental can be attached: ending one the Hub describes badly must work.
+		remote, problem := r.Client(found[0].Hub).RentalView(ctx, found[0].ID)
+		return Live{Hub: found[0].Hub, Rental: remote}, problem
 	}
 	// A portable string is not proof that it is an ID. Only an affirmative Hub read can
 	// resolve an unlisted ID; a name's 404 never proves absence.
@@ -83,6 +91,19 @@ func (r LiveResolver) Resolve(ctx context.Context, typed string) (Live, *exit.Er
 		return Live{}, unanswered
 	}
 	return Live{}, exit.Named(exit.NotFound, "rental.selection_unavailable", "no live rental is named %q on any hub this computer is signed in to", typed)
+}
+
+// Candidate is one rental a name may mean: its ID, its name and its Hub.
+type Candidate struct{ ID, Name, Hub string }
+
+// Ambiguous refuses a name that several rentals answer to, naming each.
+func Ambiguous(name string, candidates []Candidate) *exit.Error {
+	named := make([]string, len(candidates))
+	for i, c := range candidates {
+		named[i] = fmt.Sprintf("%s (%s) on %s", c.Name, c.ID, c.Hub)
+	}
+	return exit.Named(exit.Conflict, "rental.machine_name_ambiguous", "machine %q names several live rentals: %s", name, strings.Join(named, ", ")).
+		WithRemedy("name the Hub with --tensorhub=<hub>, or use a rental ID")
 }
 
 // SignedOut is the refusal of a hub this computer holds no login for.

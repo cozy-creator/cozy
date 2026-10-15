@@ -1,8 +1,10 @@
 package cli
 
 import (
+	"context"
 	"slices"
 
+	"github.com/cozy-creator/cozy/internal/api"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
@@ -12,7 +14,7 @@ import (
 
 func liveRentalResolver(ctx *Context, store *records.Store) rental.LiveResolver {
 	return rental.LiveResolver{Store: store,
-		Origins: func() ([]string, *exit.Error) { return selectedHubFirst(ctx, store) },
+		Origins: func() ([]string, *exit.Error) { return rentalHubs(ctx, store) },
 		Client:  func(origin string) *hub.Client { return client(ctx.forHub(origin)) },
 	}
 }
@@ -22,8 +24,8 @@ func liveRentalResolver(ctx *Context, store *records.Store) rental.LiveResolver 
 // own Hub when it dials it); any other is resolved at the Hubs. Verbs that end or change a
 // rental resolve it at its Hub (resolveLiveRental).
 func selectedRental(ctx *Context, store *records.Store, name string) (string, *exit.Error) {
-	if id := recordedRental(store, name); id != "" {
-		return id, nil
+	if held, problem := recordedRental(ctx, store, name); held.ID != "" || problem != nil {
+		return held.ID, problem
 	}
 	live, problem := resolveLiveRental(ctx, store, name)
 	if problem != nil {
@@ -35,13 +37,66 @@ func selectedRental(ctx *Context, store *records.Store, name string) (string, *e
 	return live.Rental.ID, nil
 }
 
-// recordedRental is the ID of the rental this host recorded and still holds by that ID or name;
-// "" for any other.
-func recordedRental(store *records.Store, name string) string {
-	if row, _ := store.RentalByMachine(name); row != nil && !hub.RentalAbsent(row.State) && row.State != hub.RentalReleaseRequested {
-		return row.ID
+// recordedRental is the live rental this host recorded under name (its ID or machine name),
+// read with no Hub: on the Hub --tensorhub names, else on any Hub, where a name recorded rentals
+// on several Hubs share is refused, naming each. Zero when none matches, or when a rental this
+// host did not record answers to it too in Calcifer's last census: its Hub then decides.
+func recordedRental(ctx *Context, store *records.Store, name string) (api.RentalSummary, *exit.Error) {
+	rows, problem := store.RentalsNamed(name)
+	if problem != nil {
+		return api.RentalSummary{}, problem
 	}
-	return ""
+	var held []api.RentalSummary
+	for _, row := range rows {
+		if hub.RentalAbsent(row.State) || row.State == hub.RentalReleaseRequested ||
+			!everyHub(ctx) && ctx.Cfg.ForHub(row.Hub).HubURL != ctx.Cfg.HubURL {
+			continue
+		}
+		held = append(held, api.RentalSummary{ID: row.ID, MachineName: row.DisplayName(), Hub: row.Hub, State: row.State})
+	}
+	if len(held) == 0 {
+		return api.RentalSummary{}, nil
+	}
+	client, problem := dial(ctx)
+	if problem != nil {
+		return api.RentalSummary{}, problem
+	}
+	inventory, problem := client.RentalInventory(context.Background(), false, true)
+	if problem != nil {
+		return api.RentalSummary{}, problem
+	}
+	if others := selectedRentals(ctx, api.RentalInventory{Unrecorded: inventory.Unrecorded}, name); slices.ContainsFunc(others,
+		func(row api.RentalSummary) bool { return !hub.RentalAbsent(row.State) }) {
+		return api.RentalSummary{}, nil
+	}
+	if len(held) > 1 {
+		return api.RentalSummary{}, ambiguousRentals(name, held)
+	}
+	return held[0], nil
+}
+
+// selectedRentals are the rentals inventory holds under typed (an ID, else a name): on the Hub
+// --tensorhub names, else on every Hub.
+func selectedRentals(ctx *Context, inventory api.RentalInventory, typed string) []api.RentalSummary {
+	return slices.DeleteFunc(inventory.Select(typed), func(row api.RentalSummary) bool {
+		return !everyHub(ctx) && ctx.Cfg.ForHub(row.Hub).HubURL != ctx.Cfg.HubURL
+	})
+}
+
+func ambiguousRentals(typed string, rows []api.RentalSummary) *exit.Error {
+	candidates := make([]rental.Candidate, len(rows))
+	for i, row := range rows {
+		candidates[i] = rental.Candidate{ID: row.ID, Name: row.MachineName, Hub: row.Hub}
+	}
+	return rental.Ambiguous(typed, candidates)
+}
+
+// rentalHubs are the Hubs a rental is looked for on: the one --tensorhub names, else every one.
+func rentalHubs(ctx *Context, store *records.Store) ([]string, *exit.Error) {
+	if !everyHub(ctx) {
+		return []string{ctx.Cfg.HubURL}, nil
+	}
+	return selectedHubFirst(ctx, store)
 }
 
 // selectedHubFirst is every hub a rental may live on, the command's own first.
