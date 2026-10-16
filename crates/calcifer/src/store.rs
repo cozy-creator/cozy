@@ -1250,35 +1250,6 @@ fn move_machine(tx: &Transaction, from: &str, to: &str, alias: Option<&str>) -> 
     Ok(())
 }
 
-fn put_machine_in(tx: &Transaction, machine: &MachineRow) -> Result<()> {
-    let (worker, address, pin) = match &machine.endpoint {
-        Some(e) => (Some(&e.worker_id), Some(&e.address), Some(e.pin.to_vec())),
-        None => (None, None, None),
-    };
-    tx.execute(
-        "INSERT INTO machines (name, kind, hub, rental_id, worker_id, address, pin, key, state,
-             served, reason, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
-         ON CONFLICT (name) DO UPDATE SET kind = ?2, hub = ?3, rental_id = ?4, worker_id = ?5,
-             address = ?6, pin = ?7, key = ?8, state = ?9, served = served OR ?10, reason = ?11",
-        params![
-            machine.name,
-            machine_kind(machine.kind),
-            machine.hub,
-            machine.rental_id,
-            worker,
-            address,
-            pin,
-            machine.key.to_string_lossy(),
-            machine_state(machine.state),
-            machine.served || machine.endpoint.is_some(),
-            machine.reason,
-            now_ms(),
-        ],
-    )?;
-    Ok(())
-}
-
 /// What a Hub is asked to do, recorded before it is asked.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AskKind {
