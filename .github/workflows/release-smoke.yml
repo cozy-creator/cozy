@@ -1,0 +1,131 @@
+name: release-smoke
+# dist global-artifacts job (dist-workspace.toml): a failure here stops the release before it is hosted.
+# The CPU smoke of design §6.4 on every release runner, against this run's own artifacts served from a local
+# mirror (COZY_DOWNLOAD_URL is the release location for the installers and `cozy update` alike): install
+# script, --version, PATH, up, hub list, package search (tensorhub.com, anonymous), update to this release,
+# down. A verb answering not_ported is skipped, so the smoke grows as the verbs land.
+on:
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
+
+jobs:
+  mirror:
+    # build-global-artifacts builds the installers beside this job; this builds the same ones.
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.mirror.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: cargo-dist-cache
+          path: ~/.cargo/bin/
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: artifacts-*
+          path: target/distrib/
+          merge-multiple: true
+      - id: mirror
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag }}
+        run: |
+          chmod +x ~/.cargo/bin/dist
+          tag=; [ -z "$TAG" ] || [ "$TAG" = dry-run ] || tag=--tag=$TAG
+          dist build $tag --artifacts=global --output-format=json > target/distrib/global-dist-manifest.json
+          mkdir mirror
+          # The release's dist-manifest.json: every build's manifest merged, as `dist host` merges them.
+          jq -s 'reduce .[] as $m ({}; . * $m)' target/distrib/*-dist-manifest.json > mirror/dist-manifest.json
+          cp target/distrib/cozy-* target/distrib/sha256.sum mirror/
+          echo "version=$(jq -r '.releases[0].app_version' mirror/dist-manifest.json)" >> "$GITHUB_OUTPUT"
+          {
+            echo '| archive | archive MB | binary MB |'
+            echo '|---|---|---|'
+            for f in mirror/cozy-*.tar.gz mirror/cozy-*.zip; do
+              case $f in
+                *.zip) bin=$(unzip -Z1 "$f" | grep -E '(^|/)cozy\.exe$'); size=$(unzip -p "$f" "$bin" | wc -c) ;;
+                *) bin=$(tar -tzf "$f" | grep -E '(^|/)cozy$'); size=$(tar -xzOf "$f" "$bin" | wc -c) ;;
+              esac
+              echo "| ${f#mirror/} | $(du -k "$f" | awk '{printf "%.1f", $1/1024}') | $(awk -v b="$size" 'BEGIN{printf "%.1f", b/1048576}') |"
+            done
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Every archive carries this workflow's attestation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for f in mirror/cozy-*.tar.gz mirror/cozy-*.zip; do
+            gh attestation verify "$f" -R "$GITHUB_REPOSITORY" --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml"
+          done
+      - uses: actions/upload-artifact@v7
+        with:
+          name: smoke-mirror
+          path: mirror/
+
+  smoke:
+    needs: mirror
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, windows-2025, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    # Hang bound, not a work budget.
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: smoke-mirror
+          path: mirror
+      - env:
+          VERSION: ${{ needs.mirror.outputs.version }}
+        run: |
+          python=python3; [ "$RUNNER_OS" != Windows ] || python=python
+          $python -m http.server 8123 --bind 127.0.0.1 --directory mirror > /dev/null 2>&1 &
+          export COZY_DOWNLOAD_URL=http://127.0.0.1:8123
+          until curl -sf "$COZY_DOWNLOAD_URL/dist-manifest.json" > /dev/null; do sleep 1; done
+
+          if [ "$RUNNER_OS" = Windows ]; then
+            powershell -NoProfile -ExecutionPolicy Bypass -c "irm $COZY_DOWNLOAD_URL/cozy-installer.ps1 | iex"
+            cozy=$HOME/.cozy/bin/cozy.exe
+            path=$(powershell -NoProfile -c "[Environment]::GetEnvironmentVariable('Path', 'User')")
+            case ${path,,} in *'\.cozy\bin'*) ;; *) echo "::error::the user PATH lacks .cozy\bin: $path"; exit 1 ;; esac
+          else
+            curl -sSf "$COZY_DOWNLOAD_URL/cozy-installer.sh" | sh
+            cozy=$HOME/.cozy/bin/cozy
+            found=$(env -i HOME="$HOME" PATH=/usr/bin:/bin sh -lc 'command -v cozy')
+            [ "$found" = "$cozy" ] || { echo "::error::a login shell finds '$found', not $cozy"; exit 1; }
+          fi
+          version=$("$cozy" --version)
+          echo "$version"
+          [ "$version" = "cozy $VERSION" ]
+
+          fail=0
+          # `cozy --json <verb…>`; a verb not ported yet is skipped. ran=1 when it succeeded.
+          step() {
+            ran=0 code=0
+            out=$("$cozy" --json "$@") || code=$?
+            if [ "$code" = 2 ] && printf '%s' "$out" | grep -q '"code":"not_ported"'; then
+              echo "skipped, not ported: cozy $*"
+              return
+            fi
+            printf '%s\n' "$out"
+            if [ "$code" = 0 ]; then ran=1; else echo "::error::cozy $* exited $code"; fail=1; fi
+          }
+          step up
+          step hub list
+          step package search sdxl
+          touch before-update
+          step update "$VERSION"
+          if [ "$ran" = 1 ]; then
+            [ "$cozy" -nt before-update ] || { echo "::error::cozy update $VERSION left the binary in place"; fail=1; }
+            [ "$("$cozy" --version)" = "cozy $VERSION" ] || { echo "::error::the updated binary is not cozy $VERSION"; fail=1; }
+          fi
+          step down
+          exit $fail

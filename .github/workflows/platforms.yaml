@@ -1,15 +1,18 @@
 name: platforms
-# Native build and vet on every desktop platform, Linux x86_64 as the control. Manual only:
-# macOS bills 10x and Windows 2x, so run it per question, never per push.
-#   gh workflow run platforms.yaml -R cozy-creator/cozy --ref <branch> [-f os='["windows-2025"]'] [-f test='go test ./internal/flock/...']
-# The Rust workspace builds and lints on every runner; `test` may name `cargo test -p <crate>`.
+# The Rust workspace builds, lints and passes the cozy-platform seams on every release runner, Linux x86_64
+# as the control; the job's verdict is that. The Go tree's build and vet are reported, not judged (it is
+# deleted at xs-043 G). Nightly on master, and per question:
+#   gh workflow run platforms.yaml -R cozy-creator/cozy --ref <branch> [-f os='["windows-2025"]'] [-f test='cargo test -p <crate>']
+# A release (release.yml) needs a green run on its commit covering every release runner (release-gate.yml).
 on:
+  schedule:
+    - cron: '17 4 * * *'
   workflow_dispatch:
     inputs:
       os:
         description: JSON list of runner labels
         type: string
-        default: '["ubuntu-24.04", "ubuntu-24.04-arm", "macos-15", "windows-2025"]'
+        default: '["ubuntu-24.04", "ubuntu-24.04-arm", "macos-15", "windows-2025", "windows-11-arm"]'
       test:
         description: Optional command run with bash after the build; empty runs none
         type: string
@@ -30,7 +33,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: ${{ fromJSON(inputs.os) }}
+        os: ${{ fromJSON(inputs.os || '["ubuntu-24.04", "ubuntu-24.04-arm", "macos-15", "windows-2025", "windows-11-arm"]') }}
     defaults:
       run:
         shell: bash
@@ -64,6 +67,12 @@ jobs:
         continue-on-error: true
         run: cargo clippy --workspace --all-targets --locked -- -D warnings 2>&1 | tee rust.txt; exit "${PIPESTATUS[0]}"
 
+      # --include-ignored installs a real user service: hosted runners only.
+      - name: Seams
+        id: seams
+        continue-on-error: true
+        run: cargo test -p cozy-platform --test seams --locked -- --include-ignored 2>&1 | tee seams.txt; exit "${PIPESTATUS[0]}"
+
       - name: Test
         if: inputs.test != ''
         id: test
@@ -77,9 +86,9 @@ jobs:
         run: |
           {
             echo "## ${{ matrix.os }}"
-            echo "build=${{ steps.build.outcome }} vet=${{ steps.vet.outcome }} run=${{ steps.run.outcome }} rust=${{ steps.rust.outcome }} test=${{ steps.test.outcome }}"
+            echo "rust=${{ steps.rust.outcome }} seams=${{ steps.seams.outcome }} test=${{ steps.test.outcome }} go: build=${{ steps.build.outcome }} vet=${{ steps.vet.outcome }} run=${{ steps.run.outcome }}"
             echo '```'
-            cat build.txt vet.txt rust.txt 2>/dev/null | head -200
+            cat rust.txt seams.txt build.txt vet.txt 2>/dev/null | head -200
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
@@ -92,10 +101,11 @@ jobs:
             vet.txt
             run.txt
             rust.txt
+            seams.txt
             test.txt
           if-no-files-found: ignore
           retention-days: 30
 
       - name: Verdict
         if: always()
-        run: test "${{ steps.build.outcome }}/${{ steps.run.outcome }}/${{ steps.rust.outcome }}" = success/success/success
+        run: test "${{ steps.rust.outcome }}/${{ steps.seams.outcome }}" = success/success && test "${{ steps.test.outcome }}" != failure
