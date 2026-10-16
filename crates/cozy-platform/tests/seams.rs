@@ -105,7 +105,6 @@ fn child(args: &[String]) {
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     match args[..] {
         ["sleep"] => ready_and_wait(),
-        ["exit"] => {}
         ["hold", kind, path, record] => {
             let kind = if kind == "shared" {
                 Kind::Shared
@@ -316,11 +315,13 @@ fn an_exact_handle_never_names_another_birth() {
     };
     assert!(Exact::open(&reborn).unwrap().is_none());
     assert_eq!(reborn.state().unwrap(), State::Gone);
-    let mut exited = child_command(&["exit"]).spawn().unwrap();
-    // Unreaped, its PID cannot be reused; reaped and released, its birth names nothing.
-    let birth = Birth::of(exited.id()).unwrap();
-    exited.wait().unwrap();
-    drop(exited);
+    let mut ended = child_command(&["sleep"]).spawn().unwrap();
+    ready(ended.stdout.take().unwrap());
+    let birth = Birth::of(ended.id()).unwrap();
+    ended.kill().unwrap();
+    ended.wait().unwrap();
+    // Reaped and released, its birth names nothing.
+    drop(ended);
     assert!(Exact::open(&birth).unwrap().is_none());
     assert_eq!(birth.state().unwrap(), State::Gone);
 }
