@@ -1,0 +1,11 @@
+[package]
+name = "cozy"
+description = "One binary: the cozy CLI, Calcifer, TensorD and TensorFS"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+clap.workspace = true

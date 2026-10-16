@@ -1,0 +1,3 @@
+/proto/cozy/machine/v1/machine.proto comes from TensorD until TensorD moves into this workspace:
+repository=https://github.com/cozy-creator/tensord
+commit=e0ae464d24f8c1100ba83b31dceb9a62b6ecebbc (PR #307, xs-042)

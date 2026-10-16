@@ -1,6 +1,7 @@
 name: dev-build
 # Builds release.yaml's archives for any ref and runs one targeted test command, off the dev box:
 #   gh workflow run dev-build.yaml -R cozy-creator/cozy -f ref=<sha> [-f build=none] [-f test='go test ./internal/run/...']
+#   Rust: -f build=none -f test='cargo test -p cozy-proto'
 # The artifact is cozy-cli-<sha>: cozy-<os>-<arch>.tar.gz for every release platform, the player
 # and SHA256SUMS, stamped dev-<sha>. No whole-suite default: `test` is empty unless given.
 on:
@@ -49,6 +50,9 @@ jobs:
           check-latest: false
       - uses: astral-sh/setup-uv@v6
         if: inputs.test != ''
+      # The Rust workspace: rust-toolchain.toml's toolchain installs on first use.
+      - uses: Swatinem/rust-cache@v2
+        if: inputs.test != ''
         with:
           version: '0.12.11'
       # The release recipe (release.yaml): umask 0002, -buildvcs=false, scripts/release.sh.
@@ -80,4 +84,5 @@ jobs:
             --uid="$(id -u)" --gid="$(id -g)" --property=Delegate=yes --working-directory="$PWD" \
             --setenv="PATH=$PATH" --setenv="HOME=$HOME" --setenv=CGO_ENABLED=0 --setenv=UV_TORCH_BACKEND=cpu \
             --setenv="GOCACHE=$(go env GOCACHE)" --setenv="GOMODCACHE=$(go env GOMODCACHE)" \
+            --setenv=CARGO_TERM_COLOR=never \
             bash -euo pipefail -c "$TEST"
