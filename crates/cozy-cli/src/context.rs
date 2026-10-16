@@ -69,6 +69,16 @@ impl Context {
 
     /// `hub` as this computer's signed-in user; refused when it has no device key there.
     pub fn hub_signed_in(&self, hub: &Hub) -> Result<hub_client::Client, Error> {
+        let credential = Credential::User(self.hub_session(hub)?);
+        Ok(hub_client::Client::connect(
+            &hub.origin,
+            self.http().clone(),
+            credential,
+        ))
+    }
+
+    /// This computer's device key at `hub` and the Bearer it mints, kept beside it.
+    pub fn hub_session(&self, hub: &Hub) -> Result<Arc<UserSession>, Error> {
         if !self.signed_in(hub) {
             return Err(Error::new(
                 Kind::Credential,
@@ -78,13 +88,10 @@ impl Context {
             .next(login(hub)));
         }
         let key = DeviceKey::load(&hub.device_key(&self.home)).map_err(hub_error)?;
-        let session = UserSession::new(key, Some(hub.bearer(&self.home)));
-        let credential = Credential::User(Arc::new(session));
-        Ok(hub_client::Client::connect(
-            &hub.origin,
-            self.http().clone(),
-            credential,
-        ))
+        Ok(Arc::new(UserSession::new(
+            key,
+            Some(hub.bearer(&self.home)),
+        )))
     }
 
     /// Signed in when this computer is, else anonymous: what public and owned reads both need.
@@ -125,9 +132,11 @@ pub fn hub_error(error: impl Into<hub_client::Error>) -> Error {
             remedy,
         } => {
             let kind = match status {
-                401 | 403 => Kind::Credential,
+                401 => Kind::Credential,
+                403 => Kind::Forbidden,
                 404 => Kind::NotFound,
                 409 | 410 => Kind::Conflict,
+                429 => Kind::Unavailable,
                 400..=499 => Kind::Validation,
                 _ => Kind::Unavailable,
             };
