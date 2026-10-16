@@ -26,7 +26,9 @@ publish-jobs = []
 # Both gate `host` by their result (a failed plan-job would skip the builds, which `host` accepts).
 local-artifacts-jobs = ["./release-gate"]
 global-artifacts-jobs = ["./release-smoke"]
+# One archive format everywhere (Windows 10+ ships tar): `cozy update` unpacks only this.
 unix-archive = ".tar.gz"
+windows-archive = ".tar.gz"
 
 [dist.github-custom-runners]
 global = "ubuntu-24.04"

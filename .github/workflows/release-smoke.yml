@@ -25,9 +25,14 @@ jobs:
         with:
           name: cargo-dist-cache
           path: ~/.cargo/bin/
+      # What build-global-artifacts starts from; its own uploads may already be there too, so name these.
       - uses: actions/download-artifact@v8
         with:
-          pattern: artifacts-*
+          name: artifacts-plan-dist-manifest
+          path: target/distrib/
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: artifacts-build-local-*
           path: target/distrib/
           merge-multiple: true
       - id: mirror
@@ -37,7 +42,8 @@ jobs:
         run: |
           chmod +x ~/.cargo/bin/dist
           tag=; [ -z "$TAG" ] || [ "$TAG" = dry-run ] || tag=--tag=$TAG
-          dist build $tag --artifacts=global --output-format=json > target/distrib/global-dist-manifest.json
+          dist build $tag --artifacts=global --output-format=json > global-dist-manifest.json
+          mv global-dist-manifest.json target/distrib/
           mkdir mirror
           # The release's dist-manifest.json: every build's manifest merged, as `dist host` merges them.
           jq -s 'reduce .[] as $m ({}; . * $m)' target/distrib/*-dist-manifest.json > mirror/dist-manifest.json
@@ -46,11 +52,9 @@ jobs:
           {
             echo '| archive | archive MB | binary MB |'
             echo '|---|---|---|'
-            for f in mirror/cozy-*.tar.gz mirror/cozy-*.zip; do
-              case $f in
-                *.zip) bin=$(unzip -Z1 "$f" | grep -E '(^|/)cozy\.exe$'); size=$(unzip -p "$f" "$bin" | wc -c) ;;
-                *) bin=$(tar -tzf "$f" | grep -E '(^|/)cozy$'); size=$(tar -xzOf "$f" "$bin" | wc -c) ;;
-              esac
+            for f in mirror/cozy-*.tar.gz; do
+              bin=$(tar -tzf "$f" | grep -E '/cozy(\.exe)?$')
+              size=$(tar -xzOf "$f" "$bin" | wc -c)
               echo "| ${f#mirror/} | $(du -k "$f" | awk '{printf "%.1f", $1/1024}') | $(awk -v b="$size" 'BEGIN{printf "%.1f", b/1048576}') |"
             done
           } | tee -a "$GITHUB_STEP_SUMMARY"
@@ -58,7 +62,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          for f in mirror/cozy-*.tar.gz mirror/cozy-*.zip; do
+          for f in mirror/cozy-*.tar.gz; do
             gh attestation verify "$f" -R "$GITHUB_REPOSITORY" --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml"
           done
       - uses: actions/upload-artifact@v7
