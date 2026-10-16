@@ -1,5 +1,8 @@
-//! The HKCU `Run` key: started at logon with no admin. With no manager to ask, `start` spawns the
-//! service detached and keeps its birth beside the home, and `stop` ends exactly that birth.
+//! The HKCU `Run` key: started at logon with no admin. Logon gives a console program a console
+//! window; `announce` leaves it at once (a brief flash). `conhost --headless` was measured
+//! unusable: it ends at its stdin's end, so a service started that way never runs. With no
+//! manager to ask, the service's birth is kept beside the home (`start` records it, and so does
+//! the service's own `announce`), and `stop` ends exactly that birth.
 use super::ServiceSpec;
 use crate::{
     Error, Result,
@@ -14,7 +17,10 @@ use std::{
 };
 use windows_sys::Win32::{
     Foundation::ERROR_FILE_NOT_FOUND,
-    System::Registry::{HKEY_CURRENT_USER, REG_SZ, RegDeleteKeyValueW, RegSetKeyValueW},
+    System::{
+        Console::{FreeConsole, GetConsoleProcessList},
+        Registry::{HKEY_CURRENT_USER, REG_SZ, RegDeleteKeyValueW, RegSetKeyValueW},
+    },
 };
 
 const RUN: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
@@ -67,10 +73,19 @@ pub(super) fn start(dir: &Path, spec: &ServiceSpec) -> Result<()> {
         .stdout(stdout)
         .stderr(stderr);
     let tree = process::spawn(command, Lifetime::Detached)?;
-    let birth = Birth::of(tree.pid())?;
-    fs::create_dir_all(dir).map_err(Error::io("create directory", dir))?;
-    let record = format!("{} {}", birth.pid, birth.start_ticks);
-    crate::durable::replace(&birth_path(dir, &spec.name), record.as_bytes(), 0o600)
+    record(dir, &spec.name, &Birth::of(tree.pid())?)
+}
+
+pub(super) fn announce(dir: &Path, name: &str) -> Result<()> {
+    // A console with no other process on it was opened for this service (a logon start): leave it
+    // so its window closes. A terminal's console has the shell on it too, and stays.
+    let mut processes = [0u32; 2];
+    // SAFETY: a writable array of the stated length.
+    if unsafe { GetConsoleProcessList(processes.as_mut_ptr(), processes.len() as u32) } == 1 {
+        // SAFETY: detaching this process from its console; nothing here writes to it afterwards.
+        unsafe { FreeConsole() };
+    }
+    record(dir, name, &Birth::own()?)
 }
 
 pub(super) fn stop(dir: &Path, name: &str) -> Result<()> {
@@ -102,7 +117,13 @@ pub(super) fn uninstall(_: &Path, name: &str) -> Result<()> {
     registry("delete", status)
 }
 
-/// The birth `start` recorded, while it still runs.
+fn record(dir: &Path, name: &str, birth: &Birth) -> Result<()> {
+    fs::create_dir_all(dir).map_err(Error::io("create directory", dir))?;
+    let record = format!("{} {}", birth.pid, birth.start_ticks);
+    crate::durable::replace(&birth_path(dir, name), record.as_bytes(), 0o600)
+}
+
+/// The recorded birth, while it still runs.
 fn running(dir: &Path, name: &str) -> Result<Option<Exact>> {
     let path = birth_path(dir, name);
     let record = match fs::read_to_string(&path) {
