@@ -23,7 +23,7 @@ macro_rules! ok {
 }
 
 const USAGE: &str = "usage: tfs <verb> ...
-  version
+  version [--json]
   key blob|manifest <sha256> | repo <org> <name>
   cbor encode|decode|check <file> [--out <file>]
   manifest build <entries.jsonl> --out <manifest.json>
@@ -42,7 +42,7 @@ const USAGE: &str = "usage: tfs <verb> ...
 
 /// Flags that never take a value.
 const SWITCHES: &[&str] = &[
-    "allow-local", "dry-run", "keys", "no-configs",
+    "allow-local", "dry-run", "json", "keys", "no-configs",
     "no-disk-budget", "no-netns", "plain", "progress",
 ];
 /// Flags that take the next token as their value; given last, or before another flag, they
@@ -98,7 +98,7 @@ fn main() -> ExitCode {
     let args = accept_printed_ids(args);
     let a: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     match a.as_slice() {
-        ["version"] => cmd_version(),
+        ["version"] => cmd_version(flag_on(&flags, "json")),
         ["store", "init", r] => cmd_store_init(Path::new(r), &flags),
         ["store", "rebuild", r] => repo::cmd_rebuild(Path::new(r), &flags),
         ["put", r, f] => cmd_put(Path::new(r), Path::new(f), &flags),
@@ -151,7 +151,8 @@ fn main() -> ExitCode {
 /// `tfs <version> sha256:<digest of this binary's own bytes>` — one line, machine-parsed by
 /// tensorhub and cozy-creator at startup (tfs-051). Byte-identical builds print the same
 /// digest; two builds stamped with one version cannot hide behind it.
-fn cmd_version() -> ExitCode {
+/// `tfs <version> sha256:<own digest>`, or with `--json` that and the Store contract.
+fn cmd_version(json: bool) -> ExitCode {
     let bytes = match std::env::current_exe().and_then(fs::read) {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -159,11 +160,18 @@ fn cmd_version() -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    println!(
-        "tfs {} sha256:{}",
-        env!("CARGO_PKG_VERSION"),
-        tensorfs_core::sha256::hex_digest(&bytes)
-    );
+    let digest = tensorfs_core::sha256::hex_digest(&bytes);
+    if json {
+        let record = serde_json::json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "sha256": digest,
+            "store_format": tensorfs_core::STORE_FORMAT,
+            "claim_protocol": tensorfs_core::CLAIM_PROTOCOL,
+        });
+        println!("{record}");
+    } else {
+        println!("tfs {} sha256:{digest}", env!("CARGO_PKG_VERSION"));
+    }
     ExitCode::SUCCESS
 }
 
