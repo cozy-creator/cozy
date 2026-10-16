@@ -94,6 +94,10 @@ pub(super) fn kill(handle: &Handle, _: &Birth) -> io::Result<()> {
     Ok(())
 }
 
+pub(super) fn set_name(_: &str) -> crate::Result<()> {
+    Err(crate::Error::unsupported(crate::Seam::Process))
+}
+
 pub(super) fn wait(handle: &Handle, period: Option<Duration>) -> io::Result<bool> {
     signaled(&handle.0, period)
 }

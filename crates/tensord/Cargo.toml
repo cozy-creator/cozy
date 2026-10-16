@@ -25,6 +25,7 @@ serde.workspace = true
 serde_json = { workspace = true, features = ["raw_value"] }
 serde_json_canonicalizer.workspace = true
 sha2.workspace = true
+tar.workspace = true
 tensorfs-core = { workspace = true, features = ["store"] }
 tensorfs-plane = { workspace = true, features = ["store"] }
 tokio.workspace = true
@@ -42,7 +43,6 @@ zip = { version = "7", default-features = false, features = ["deflate-flate2"] }
 hmac = "0.12"
 png = "0.17"
 image-webp = "0.2"
-tar = "0.4"
 rustls-pemfile = "2"
 time = "0.3"
 

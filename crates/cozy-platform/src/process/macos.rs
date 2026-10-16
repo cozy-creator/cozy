@@ -83,11 +83,18 @@ pub(super) fn kill(_: &Handle, birth: &Birth) -> io::Result<()> {
         Err(error) => return Err(error),
     };
     // SAFETY: plain syscall on scalars.
-    unix::gone_is_done(unsafe { libc::kill(birth.pid as libc::pid_t, libc::SIGKILL) })?;
+    unix::signaled(
+        unsafe { libc::kill(birth.pid as libc::pid_t, libc::SIGKILL) },
+        birth.pid,
+    )?;
     if info.pbi_pgid == birth.pid {
         unix::signal_group(birth.pid)?;
     }
     Ok(())
+}
+
+pub(super) fn set_name(_: &str) -> crate::Result<()> {
+    Err(crate::Error::unsupported(crate::Seam::Process))
 }
 
 pub(super) fn wait(handle: &Handle, period: Option<Duration>) -> io::Result<bool> {
@@ -117,6 +124,14 @@ fn info(pid: u32) -> io::Result<libc::proc_bsdinfo> {
         Some(0) | None => io::ErrorKind::NotFound.into(),
         _ => error,
     })
+}
+
+/// Exited, a zombie included, or gone altogether.
+pub(super) fn exited(pid: u32) -> bool {
+    match info(pid) {
+        Ok(info) => info.pbi_status == libc::SZOMB,
+        Err(error) => gone(&error),
+    }
 }
 
 fn start(info: &libc::proc_bsdinfo) -> u64 {

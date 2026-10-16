@@ -1,7 +1,8 @@
 //! `cozy calcifer`, the role entry. One Calcifer per home, held by `calcifer.lock`: it opens its
 //! store (resuming every run it owes), serves the loopback API, and only then publishes its
-//! `Holder` record, which is the readiness signal. It exits once nothing is owed and no client is
-//! connected, or on `POST /v1/down`; machines keep running what they accepted either way.
+//! `Holder` record, which is the readiness signal. It exits once nothing is owed, no client is
+//! connected and no client is starting it (`wanted.lock`), or on `POST /v1/down`; machines keep
+//! running what they accepted either way.
 use std::{
     io,
     net::{Ipv4Addr, SocketAddr},
@@ -20,7 +21,7 @@ use cozy_platform::{
     service::Services,
 };
 use cozy_proto::{
-    calcifer::{Holder, REFUSED},
+    calcifer::{Holder, REFUSED, WANTED},
     config::{self, Flags, Loaded},
     error::{Envelope, Error, Kind},
 };
@@ -180,14 +181,16 @@ pub async fn serve(loaded: &Loaded) -> Result<Stopped, Error> {
     let mut owed = calcifer.owed_changed();
     let stopped = api.stopped();
     tokio::pin!(stopped);
+    // Checked at once (a login start owing nothing stops here) and on every change after.
+    let wanted = LockFile::new(home.calcifer().join(WANTED));
     let why = loop {
+        if api.stop_unless_owed(&open, &wanted).await {
+            break Stopped::Idle;
+        }
         tokio::select! {
             () = &mut stopped => break Stopped::Down,
             _ = owed.changed() => {}
             _ = open.changed() => {}
-        }
-        if api.stop_unless_owed(&open).await {
-            break Stopped::Idle;
         }
     };
     api.stop();
