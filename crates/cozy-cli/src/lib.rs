@@ -1,8 +1,12 @@
 //! The `cozy` command line. One module per verb group; each owns its clap arguments and handler.
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
-use cozy_proto::error::{Error, Kind};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::{ArgValueCompleter, CompleteEnv};
+use cozy_proto::{
+    config::{self, Flags},
+    error::{Error, Kind},
+};
 
 mod account;
 mod completion;
@@ -13,7 +17,7 @@ mod doctor;
 mod hub;
 mod machine;
 mod model;
-mod output;
+pub mod output;
 mod package;
 mod run;
 mod update;
@@ -31,7 +35,7 @@ struct Cli {
     #[arg(long, global = true)]
     json: bool,
     /// The Hub to use instead of the current one (`cozy hub use`).
-    #[arg(long, global = true, value_name = "HUB")]
+    #[arg(long, global = true, value_name = "HUB", add = ArgValueCompleter::new(completion::hubs))]
     tensorhub: Option<String>,
     #[command(subcommand)]
     command: Command,
@@ -73,14 +77,27 @@ enum Command {
     Doctor(doctor::Args),
 }
 
-/// Parses the command line, runs it and renders its refusal. Exit codes: 0 success, 1 a
-/// refusal or a run that did not succeed, 2 a usage error.
+/// Parses the command line, loads the config once, runs the verb and renders its refusal. Exit
+/// codes: 0 success, 1 a refusal or a run that did not succeed, 2 a usage error.
 pub fn main() -> ExitCode {
-    let cli = Cli::parse();
-    let ctx = Context {
-        json: cli.json,
-        tensorhub: cli.tensorhub,
+    CompleteEnv::with_factory(Cli::command)
+        .var(completion::VAR)
+        .complete();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => return usage(error),
     };
+    let loaded = match config::load(Flags {
+        tensorhub: cli.tensorhub,
+    }) {
+        Ok(loaded) => loaded,
+        Err(error) => return output::refuse(cli.json, &error),
+    };
+    let warnings = loaded.warnings.clone();
+    let ctx = Context::new(cli.json, loaded, output::Term::detect());
+    for warning in &warnings {
+        output::warn(&ctx, warning);
+    }
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(runtime) => runtime,
         Err(error) => {
@@ -94,6 +111,26 @@ pub fn main() -> ExitCode {
         Ok(code) => code,
         Err(error) => output::refusal(&ctx, &error),
     }
+}
+
+/// clap's own rendering for a person; with `--json` the typed envelope, exit 2.
+fn usage(error: clap::Error) -> ExitCode {
+    use clap::error::ErrorKind;
+    let json = std::env::args_os().any(|arg| arg == "--json");
+    if !json
+        || matches!(
+            error.kind(),
+            ErrorKind::DisplayHelp
+                | ErrorKind::DisplayVersion
+                | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+        )
+    {
+        error.exit();
+    }
+    let message = error.render().to_string();
+    let message = message.lines().next().unwrap_or_default();
+    let message = message.strip_prefix("error: ").unwrap_or(message);
+    output::refuse(true, &Error::new(Kind::Usage, "usage", message))
 }
 
 async fn dispatch(ctx: &Context, command: Command) -> Result<ExitCode, Error> {
@@ -128,7 +165,7 @@ fn not_ported(verb: &str) -> Error {
 
 #[cfg(test)]
 mod tests {
-    use clap::CommandFactory;
+    use clap::CommandFactory as _;
 
     #[test]
     fn the_grammar_is_consistent() {

@@ -8,10 +8,19 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+anstream.workspace = true
+anstyle.workspace = true
 clap.workspace = true
+clap_complete.workspace = true
+comfy-table.workspace = true
+cozy-platform.workspace = true
 cozy-proto.workspace = true
+serde.workspace = true
 serde_json.workspace = true
+supports-hyperlinks.workspace = true
 tokio.workspace = true
+toml_edit.workspace = true
+url.workspace = true
 
 [lints]
 workspace = true

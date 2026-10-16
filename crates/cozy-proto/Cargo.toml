@@ -1,6 +1,6 @@
 [package]
 name = "cozy-proto"
-description = "The wire types every cozy process shares: cozy.machine.v1, Cozy-Cap, the error envelope and ids"
+description = "The wire types every cozy process shares: cozy.machine.v1, Cozy-Cap, the error envelope, ids and config.toml"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,15 +9,19 @@ publish.workspace = true
 
 [dependencies]
 base64.workspace = true
+cozy-platform.workspace = true
 ed25519-dalek.workspace = true
+figment.workspace = true
 hex.workspace = true
 prost.workspace = true
 serde.workspace = true
+serde_ignored.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 tonic.workspace = true
 tonic-prost.workspace = true
+url.workspace = true
 
 [build-dependencies]
 protoc-bin-vendored.workspace = true
