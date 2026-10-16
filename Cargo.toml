@@ -4,7 +4,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.8.0"
+version = "0.9.0"
 edition = "2024"
 rust-version = "1.99"
 license = "MIT"
@@ -12,6 +12,7 @@ publish = false
 
 [workspace.dependencies]
 calcifer = { path = "crates/calcifer" }
+cozy-cli = { path = "crates/cozy-cli" }
 cozy-platform = { path = "crates/cozy-platform" }
 cozy-proto = { path = "crates/cozy-proto" }
 
@@ -47,3 +48,7 @@ windows-sys = "0.61"
 lto = "fat"
 codegen-units = 1
 strip = true
+
+[workspace.lints.clippy]
+# Every verb returns the one typed refusal; it is not on a hot path.
+result_large_err = "allow"
