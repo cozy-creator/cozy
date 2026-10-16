@@ -165,6 +165,7 @@ impl ModelRef {
     }
 
     /// The machine's choice for `parameter`.
+    #[cfg_attr(not(test), expect(dead_code, reason = "run's model.<slot>= and model download/upload call it next"))]
     pub(crate) fn choice(&self, parameter: &str) -> ModelChoice {
         let mut choice = ModelChoice {
             parameter: parameter.to_owned(),
@@ -190,13 +191,6 @@ impl ModelRef {
         choice
     }
 
-    /// The Hub repository it names, if any.
-    pub(crate) fn repo(&self) -> Option<&Repo> {
-        match self {
-            ModelRef::Hub { repo, .. } | ModelRef::Checkpoint { repo, .. } => Some(repo),
-            _ => None,
-        }
-    }
 }
 
 impl fmt::Display for ModelRef {

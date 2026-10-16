@@ -6,7 +6,7 @@ use cozy_proto::error::{Error, Kind};
 use hub_client::types::{ModelLaneRetarget, ModelRelease, ModelReleaseUpdate};
 use serde::Serialize;
 
-use super::refs::{Repo, checkpoint, label};
+use super::refs::{ModelRef, Repo, checkpoint, label};
 use super::{Delete, Publish, Retarget, Yank};
 use crate::Context;
 use crate::output::{self, Record};
@@ -138,11 +138,11 @@ struct Deleted {
 
 /// Never prompts: `--yes` is the confirmation, and without it nothing is sent.
 pub(crate) async fn delete(ctx: &Context, args: Delete) -> Result<ExitCode, Error> {
-    let (name, one) = match args.model.split_once('#') {
-        Some((name, id)) => (name, Some(checkpoint(id)?)),
-        None => (args.model.as_str(), None),
+    let (repo, one) = match ModelRef::parse(&args.model)? {
+        ModelRef::Checkpoint { repo, manifest } => (repo, Some(manifest)),
+        ModelRef::Hub { repo, release: None, lane: None } => (repo, None),
+        _ => return Err(usage("model_ref_invalid", format!("{:?}: delete takes org/name or org/name#sha256:…", args.model))),
     };
-    let repo = Repo::hub(name)?;
     let hub = ctx.hub()?;
     if !args.yes {
         return Err(usage("model_delete_unconfirmed", format!("deleting {} from {} cannot be undone", args.model, hub.origin))

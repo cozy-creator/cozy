@@ -6,7 +6,7 @@ use cozy_proto::error::{Error, Kind};
 use hub_client::types::{ModelCard, ModelCatalogRelease, ModelFamilyUpdate};
 use serde::Serialize;
 
-use super::refs::{Repo, label};
+use super::refs::{ModelRef, Repo};
 use super::{Family, Info, Search};
 use crate::Context;
 use crate::output::{self, Record, Table};
@@ -124,11 +124,12 @@ struct Detail {
 }
 
 pub(crate) async fn info(ctx: &Context, args: Info) -> Result<ExitCode, Error> {
-    let (name, selected) = match args.model.split_once('@') {
-        Some((name, release)) => (name, Some(label("release", release)?)),
-        None => (args.model.as_str(), None),
+    let (repo, selected) = match ModelRef::parse(&args.model)? {
+        ModelRef::Hub { repo, release, lane: None } => (repo, release),
+        _ => {
+            return Err(Error::new(Kind::Usage, "model_ref_invalid", format!("{:?}: info reads org/name[@release]", args.model)));
+        }
     };
-    let repo = Repo::parse(name)?;
     let client = ctx.hub_anonymous(&ctx.hub()?)?;
     let card = ctx.hub_answer(client.get_model(&repo.org, &repo.name).await)?;
     let releases: Vec<Release> = card
