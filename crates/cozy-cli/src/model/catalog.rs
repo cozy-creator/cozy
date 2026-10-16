@@ -29,7 +29,7 @@ struct Searched {
 }
 
 fn available(release: &ModelCatalogRelease) -> bool {
-    !release.release.is_empty() && release.yanked != Some(true) && release.yanked_at.is_none()
+    !release.release.is_empty() && release.yanked != Some(true) && release.yanked_at.as_deref().is_none_or(str::is_empty)
 }
 
 fn found(card: &ModelCard) -> Found {
@@ -140,7 +140,7 @@ pub(crate) async fn info(ctx: &Context, args: Info) -> Result<ExitCode, Error> {
         .map(|r| Release {
             release: r.release.clone(),
             revision: r.revision,
-            created_at: r.cut_at.map(|t| t.to_rfc3339()),
+            created_at: r.cut_at.clone().filter(|t| !t.is_empty()),
             yanked: !available(r),
             lanes: r
                 .lanes
@@ -162,7 +162,7 @@ pub(crate) async fn info(ctx: &Context, args: Info) -> Result<ExitCode, Error> {
     let view = Detail {
         model: repo.to_string(),
         family: card.model.family.filter(|f| !f.is_empty()),
-        created_at: card.model.created_at.to_rfc3339(),
+        created_at: card.model.created_at,
         releases,
     };
     if ctx.json {
