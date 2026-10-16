@@ -6,7 +6,6 @@ use std::{
 };
 
 use calcifer::store::{Endpoint, ImportedOutput, ImportedRun, MachineRow, State};
-use chrono::DateTime;
 use cozy_platform::paths::Home;
 use cozy_proto::{
     calcifer::{Kind, MachineKind, MachineState, Reason, Status},
@@ -212,16 +211,19 @@ fn keys(from: &Path, into: &Home, plan: &mut Plan) -> Result<(), String> {
             .flatten()
             .filter(|s| {
                 s.device_key_id == key.id
-                    && DateTime::parse_from_rfc3339(&s.expires_at)
-                        .is_ok_and(|t| t.timestamp() > now())
+                    && s.expires_at
+                        .parse::<jiff::Timestamp>()
+                        .is_ok_and(|t| t > jiff::Timestamp::now())
             })
         else {
             continue;
         };
         let bearer = hub_client::Bearer {
             token: session.access_token,
-            expires: DateTime::parse_from_rfc3339(&session.expires_at)
-                .map_or(0, |t| t.timestamp() as u64),
+            expires: session
+                .expires_at
+                .parse::<jiff::Timestamp>()
+                .map_or(0, |t| t.as_second() as u64),
             device_key_id: session.device_key_id,
         };
         plan.files.push(File {
@@ -716,13 +718,7 @@ fn target(request: &Request) -> String {
 }
 
 fn ms(text: &str) -> Option<i64> {
-    DateTime::parse_from_rfc3339(text)
+    text.parse::<jiff::Timestamp>()
         .ok()
-        .map(|t| t.timestamp_millis())
-}
-
-fn now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64)
+        .map(|t| t.as_millisecond())
 }

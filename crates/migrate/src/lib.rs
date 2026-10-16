@@ -14,7 +14,6 @@ use std::{
     io::Write as _,
     path::{Path, PathBuf},
     process::ExitCode,
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use calcifer::store::{Store, StoreError};
@@ -280,12 +279,7 @@ fn archive(from: &Path, into: &Home, entries: &[Entry]) -> Result<PathBuf, Strin
     let fail = |e: std::io::Error| e.to_string();
     let backups = into.backups();
     std::fs::create_dir_all(&backups).map_err(fail)?;
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64);
-    let stamp = chrono::DateTime::from_timestamp(now, 0)
-        .unwrap_or_default()
-        .format("%Y%m%dT%H%M%SZ");
+    let stamp = jiff::Timestamp::now().strftime("%Y%m%dT%H%M%SZ");
     let path = backups.join(format!("go-cli-state-{stamp}.tar"));
     let staged = backups.join(format!(".go-cli-state-{stamp}.tar.partial"));
     let mut options = std::fs::OpenOptions::new();

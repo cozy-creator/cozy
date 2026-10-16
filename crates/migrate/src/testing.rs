@@ -181,7 +181,7 @@ pub fn build(root: &Path) -> Vec<PathBuf> {
         LIVE_NAME,
         "ready",
         tensorhub,
-        "203.0.113.7:7443",
+        "127.0.0.1:1",
         "worker-live",
     );
     rental(

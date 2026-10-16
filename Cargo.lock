@@ -499,6 +499,7 @@ dependencies = [
  "cozy-proto",
  "hex",
  "hub-client",
+ "migrate",
  "reqwest",
  "serde_json",
  "sha2",
@@ -1695,6 +1696,33 @@ name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
+
+[[package]]
+name = "migrate"
+version = "0.9.0"
+dependencies = [
+ "base64 0.22.1",
+ "calcifer",
+ "clap",
+ "cozy-platform",
+ "cozy-proto",
+ "ed25519-dalek",
+ "hex",
+ "hub-client",
+ "jiff",
+ "migrate",
+ "prost",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2",
+ "tar",
+ "tempfile",
+ "tokio",
+ "toml_edit",
+]
 
 [[package]]
 name = "mime"

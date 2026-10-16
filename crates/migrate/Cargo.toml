@@ -10,13 +10,13 @@ publish.workspace = true
 [dependencies]
 base64.workspace = true
 calcifer.workspace = true
-chrono.workspace = true
 clap.workspace = true
 cozy-platform.workspace = true
 cozy-proto.workspace = true
 ed25519-dalek = { workspace = true, features = ["pem", "pkcs8"] }
 hex.workspace = true
 hub-client.workspace = true
+jiff.workspace = true
 prost.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
@@ -32,7 +32,9 @@ testing = []
 
 [dev-dependencies]
 migrate = { path = ".", features = ["testing"] }
+reqwest = { workspace = true, features = ["json"] }
 tempfile.workspace = true
+tokio.workspace = true
 
 [lints]
 workspace = true

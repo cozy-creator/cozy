@@ -1,12 +1,12 @@
 //! The importer on a synthetic Go home: what lands in Calcifer's real store, the keys and the
 //! config, what is archived, and what stays.
-use std::path::Path;
+use std::{path::Path, time::Duration};
 
 use calcifer::store::{State, Store};
-use cozy_platform::paths::Home;
+use cozy_platform::{lock::LockFile, paths::Home};
 use cozy_proto::{
-    calcifer::{MachineKind, MachineState, Status},
-    config::{Config, Hub},
+    calcifer::{Holder, MachineKind, MachineState, RunList, Status},
+    config::{Config, Hub, Loaded},
 };
 use migrate::{
     Args, Fate,
@@ -302,4 +302,73 @@ fn an_import_into_another_home_leaves_user_content_in_place() {
     assert!(
         !from.join("creator.sqlite").exists() && from.join("calcifer").symlink_metadata().is_err()
     );
+}
+
+/// The real Calcifer serves the imported store: the history under Go's numbers, and the runs still
+/// owed, waiting on their machines.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn calcifer_serves_the_imported_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join(".cozy");
+    testing::build(&root);
+    migrate::run(&args(&root, &root)).unwrap();
+    let loaded = Loaded {
+        config: Config::default(),
+        home: Home::at(&root),
+        user_home: dir.path().to_owned(),
+        warnings: vec![],
+    };
+    let lock = LockFile::new(loaded.home.calcifer_lock());
+    let task = tokio::spawn(async move { calcifer::serve::serve(&loaded).await });
+    // A hang bound for a Calcifer that never starts; the product waits without one.
+    let holder: Holder = tokio::time::timeout(Duration::from_secs(120), async {
+        loop {
+            if let Some(holder) = lock
+                .holder()
+                .unwrap()
+                .and_then(|b| serde_json::from_slice(&b).ok())
+            {
+                break holder;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let client = reqwest::Client::new();
+    let url = |path: &str| format!("http://{}{path}", holder.address);
+    let list: RunList = client
+        .get(url("/v1/runs?limit=100"))
+        .bearer_auth(&holder.token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let numbers: Vec<u64> = list.runs.iter().map(|r| r.number).collect();
+    assert_eq!(
+        numbers,
+        (1..=Expected::RUNS as u64).rev().collect::<Vec<_>>()
+    );
+    let owed = list
+        .runs
+        .iter()
+        .find(|r| r.id.as_str() == testing::OWED)
+        .unwrap();
+    assert_eq!(
+        (owed.status, owed.machine.as_deref()),
+        (Status::InProgress, Some(testing::LIVE_NAME))
+    );
+    let done = list.runs.iter().find(|r| r.number == 1).unwrap();
+    assert_eq!(done.status, Status::Completed);
+    let down = client
+        .post(url("/v1/down"))
+        .bearer_auth(&holder.token)
+        .send()
+        .await
+        .unwrap();
+    assert!(down.status().is_success());
+    drop(client);
+    task.await.unwrap().unwrap();
 }
