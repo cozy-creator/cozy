@@ -19,8 +19,9 @@ use axum::{
     },
     routing::{get, post},
 };
+use cozy_platform::lock::{Kind as LockKind, LockFile};
 use cozy_proto::{
-    calcifer::{Down, Event, Run, RunList, Status, Submitted},
+    calcifer::{Down, Event, On, Run, RunList, Status, SubmitRun, Submitted},
     error::{Envelope, Error, Kind},
     ids::RunId,
 };
@@ -67,13 +68,17 @@ impl Api {
     }
 
     /// Closes the admission gate, after any mutation in flight, when no client is connected
-    /// (`open` counts them) and nothing is owed. Answers whether this call closed it.
-    pub async fn stop_unless_owed(&self, open: &watch::Receiver<usize>) -> bool {
+    /// (`open` counts them), nothing is owed and no client is starting it (`wanted` is free).
+    /// Answers whether this call closed it.
+    pub async fn stop_unless_owed(&self, open: &watch::Receiver<usize>, wanted: &LockFile) -> bool {
         if *open.borrow() > 0 {
             return false;
         }
         let mut stopping = self.stopping.write().await;
-        let idle = !*stopping && *open.borrow() == 0 && self.calcifer.owed().is_empty();
+        let idle = !*stopping
+            && *open.borrow() == 0
+            && self.calcifer.owed().is_empty()
+            && matches!(wanted.try_lock(LockKind::Exclusive), Ok(Some(_)));
         *stopping |= idle;
         idle
     }
@@ -161,6 +166,14 @@ impl From<crate::Error> for Refusal {
                 format!("idempotency key {key:?} already names another run"),
             )
             .remedy("submit a different run under a new key"),
+            crate::Error::Store(StoreError::UnknownMachine(name)) if name == "local" => Error::new(
+                Kind::NotFound,
+                "machine_not_found",
+                "this computer's machine is not enabled",
+            )
+            .remedy("`cozy machine enable` makes this computer a machine")
+            .next("cozy run … --on any")
+            .next("cozy machine list"),
             crate::Error::Store(StoreError::UnknownMachine(name)) => Error::new(
                 Kind::NotFound,
                 "machine_not_found",
@@ -227,14 +240,14 @@ fn refusal(api: &Api, peer: &Peer, request: &Request) -> Option<Refusal> {
     };
     if !peer.addr.ip().is_loopback() {
         Some(refuse(
-            Kind::Credential,
+            Kind::Forbidden,
             "not_loopback",
             "Calcifer serves the loopback interface only",
         ))
     } else if !header(header::HOST).is_some_and(|host| api.hosts.contains(&host)) {
         Some(
             refuse(
-                Kind::Credential,
+                Kind::Forbidden,
                 "host_not_allowed",
                 format!("Host {:?} is not this Calcifer", header(header::HOST)),
             )
@@ -248,7 +261,7 @@ fn refusal(api: &Api, peer: &Peer, request: &Request) -> Option<Refusal> {
             .any(|host| origin == format!("http://{host}"))
     {
         Some(refuse(
-            Kind::Credential,
+            Kind::Forbidden,
             "origin_not_allowed",
             format!("Origin {origin:?} may not reach Calcifer"),
         ))
@@ -353,7 +366,16 @@ async fn submit(
     IdempotencyKey(key): IdempotencyKey,
     body: Result<Bytes, BytesRejection>,
 ) -> Result<(StatusCode, Json<Submitted>), Refusal> {
-    let submitted = api.calcifer.submit(&key, parse(&body?)?).await?;
+    let submit: SubmitRun = parse(&body?)?;
+    if submit.on == On::New(None) {
+        return Err(refuse(
+            Kind::Unavailable,
+            "placement_unavailable",
+            "`--on new` needs the Hub's placement, which this Calcifer cannot ask yet",
+        )
+        .remedy("name a machine with `--on <machine>`, or queue for one with `--on any`"));
+    }
+    let submitted = api.calcifer.submit(&key, submit).await?;
     let status = if submitted.replay {
         StatusCode::OK
     } else {
