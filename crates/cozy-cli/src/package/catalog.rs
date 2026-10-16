@@ -137,7 +137,7 @@ pub async fn info(ctx: &Context, package: &PackageRef) -> Result<ExitCode, Error
 }
 
 /// A package this Hub does not have, named with the Hub searched and where to look instead.
-pub(crate) fn missing(error: Error, package: &PackageRef, hub: &str) -> Error {
+fn missing(error: Error, package: &PackageRef, hub: &str) -> Error {
     if error.kind != Kind::NotFound {
         return error;
     }

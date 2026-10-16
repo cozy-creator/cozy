@@ -1,4 +1,6 @@
 //! `cozy package`: find packages on a Hub, keep them on machines, and publish your own.
+//!
+//! Only `lock` and `publish` need uv, on the author's computer, and neither runs package code.
 use std::process::ExitCode;
 
 use clap::Subcommand;
@@ -6,7 +8,9 @@ use cozy_proto::error::{Error, Kind};
 
 use crate::Context;
 
+mod author;
 mod catalog;
+mod registry;
 
 #[derive(clap::Args, Debug)]
 pub struct Args {
@@ -29,40 +33,66 @@ enum Command {
         /// org/name
         package: String,
     },
+    /// Lock this project's dependencies for the Hub and account it publishes to (needs uv).
+    Lock {
+        /// Let this dependency move to its newest compatible release; repeat for each.
+        #[arg(long = "upgrade-package", value_name = "PACKAGE")]
+        upgrade: Vec<String>,
+    },
+    /// Publish this project as <account>/<name>@<version> (needs uv).
+    Publish,
+    /// Yank a release: machines that hold it keep it, nothing new installs it.
+    Yank {
+        /// org/name@release
+        release: String,
+    },
 }
 
 pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
     match args.command {
         Command::Search { query, limit } => catalog::search(ctx, &query.join(" "), limit).await,
         Command::Info { package } => catalog::info(ctx, &PackageRef::parse(&package)?).await,
+        Command::Lock { upgrade } => author::lock(ctx, &upgrade).await,
+        Command::Publish => author::publish(ctx).await,
+        Command::Yank { release } => author::yank(ctx, &PackageRef::parse(&release)?).await,
     }
 }
 
-/// `org/name`, lowercased: names are one identity in any case.
+/// `org/name[@release]`, lowercased: names are one identity in any case.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PackageRef {
     pub org: String,
     pub name: String,
+    pub release: Option<String>,
 }
 
 impl PackageRef {
     pub fn parse(text: &str) -> Result<Self, Error> {
         let text = text.trim();
+        let (path, release) = match text.split_once('@') {
+            Some((path, release)) => (path, Some(release.to_owned())),
+            None => (text, None),
+        };
         let valid = |part: &str| {
             !part.is_empty()
                 && part
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
         };
-        match text.split_once('/') {
-            Some((org, name)) if valid(org) && valid(name) => Ok(Self {
-                org: org.to_ascii_lowercase(),
-                name: name.to_ascii_lowercase(),
-            }),
+        match path.split_once('/') {
+            Some((org, name))
+                if valid(org) && valid(name) && release.as_deref().is_none_or(valid) =>
+            {
+                Ok(Self {
+                    org: org.to_ascii_lowercase(),
+                    name: name.to_ascii_lowercase(),
+                    release,
+                })
+            }
             _ => Err(Error::new(
                 Kind::Usage,
                 "package_ref_invalid",
-                format!("{text:?} is not org/name"),
+                format!("{text:?} is not org/name or org/name@release"),
             )),
         }
     }
