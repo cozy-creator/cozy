@@ -16,11 +16,12 @@ use calcifer::{
 };
 use common::{SilentHub, Tensord};
 use cozy_platform::{
-    lock::{Kind as LockKind, LockFile},
+    durable,
+    lock::{Held, Kind as LockKind, LockFile},
     paths::Home,
 };
 use cozy_proto::{
-    calcifer::{Down, Event, Holder, Run, RunList, Status, Submitted},
+    calcifer::{Down, Event, Holder, Run, RunList, Status, Submitted, WANTED},
     config::{Config, Loaded},
     error::Envelope,
 };
@@ -39,17 +40,22 @@ struct Calcifer {
 }
 
 impl Calcifer {
-    /// Starts `serve` and waits for a record this process published.
+    /// Starts `serve` as the CLI does: wanting it (`wanted.lock`) until its first answer.
     async fn start(home: &Path) -> Self {
+        let wanted = want(home);
         let loaded = loaded(home);
         let watched = loaded.home.clone();
         let task = tokio::spawn(async move { serve(&loaded).await });
         let holder = record(&watched, |h| h.pid == std::process::id()).await;
-        Self {
+        let calcifer = Self {
             task,
             holder,
             client: Client::new(),
-        }
+        };
+        let first = calcifer.request(Method::GET, "/v1/runs").send().await;
+        assert_eq!(first.unwrap().status(), StatusCode::OK);
+        drop(wanted);
+        calcifer
     }
 
     fn request(&self, method: Method, path: &str) -> RequestBuilder {
@@ -110,6 +116,14 @@ impl Calcifer {
             .unwrap()
             .unwrap()
     }
+}
+
+/// A client's claim that it is starting Calcifer on `home`.
+fn want(home: &Path) -> Held {
+    let dir = Home::at(home).calcifer();
+    durable::private_dir(&dir).unwrap();
+    let wanted = LockFile::new(dir.join(WANTED)).try_lock(LockKind::Shared);
+    wanted.unwrap().expect("a shared lock")
 }
 
 /// A home's load, as `cozy calcifer` reads it, with the defaults (any free port).
@@ -421,6 +435,7 @@ async fn serve_until_killed() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_killed_calcifer_leaves_a_record_the_next_one_replaces() {
     let home = tempfile::tempdir().unwrap();
+    let wanted = want(home.path());
     let mut child = Command::new(std::env::current_exe().unwrap())
         .args([
             "serve_until_killed",
@@ -437,6 +452,7 @@ async fn a_killed_calcifer_leaves_a_record_the_next_one_replaces() {
     let stale = record(&Home::at(home.path()), |h| h.pid == pid).await;
     child.kill().unwrap();
     child.wait().unwrap();
+    drop(wanted);
     let lock = LockFile::new(Home::at(home.path()).calcifer_lock());
     let left: Holder = serde_json::from_slice(&lock.holder().unwrap().unwrap()).unwrap();
     assert_eq!(left, stale, "SIGKILL leaves the record behind");
@@ -566,4 +582,64 @@ async fn down_names_what_is_owed_the_machine_keeps_running_it_and_the_next_calci
         Stopped::Idle,
         "it exits by itself once nothing is owed"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_calcifer_owing_nothing_stops_at_once_unless_a_client_wants_it() {
+    let home = tempfile::tempdir().unwrap();
+    let unwanted = tokio::time::timeout(PATIENCE, serve(&loaded(home.path()))).await;
+    assert_eq!(unwanted.unwrap().unwrap(), Stopped::Idle, "a login start");
+    let lock = LockFile::new(Home::at(home.path()).calcifer_lock());
+    assert_eq!(lock.holder().unwrap(), None);
+
+    let calcifer = Calcifer::start(home.path()).await;
+    let again = calcifer.request(Method::GET, "/v1/runs").send().await;
+    assert_eq!(
+        again.unwrap().status(),
+        StatusCode::OK,
+        "its client is connected"
+    );
+    assert_eq!(calcifer.stopped().await, Stopped::Idle);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_run_for_a_disabled_local_machine_an_unknown_one_or_bare_new_is_refused_unrecorded() {
+    let home = tempfile::tempdir().unwrap();
+    let calcifer = Calcifer::start(home.path()).await;
+    let spec = common::warm_spec("http://127.0.0.1:9", vec![]);
+    let submit = |on: &str| {
+        calcifer
+            .request(Method::POST, "/v1/runs")
+            .header("idempotency-key", on)
+            .json(&submission(on, &spec))
+            .send()
+    };
+    let local = submit("local").await.unwrap();
+    assert_eq!(local.status(), StatusCode::NOT_FOUND);
+    let local = local.json::<Envelope>().await.unwrap().error;
+    assert_eq!(local.code, "machine_not_found");
+    assert_eq!(local.message, "this computer's machine is not enabled");
+    assert_eq!(
+        local.remedy.as_deref(),
+        Some("`cozy machine enable` makes this computer a machine")
+    );
+    assert_eq!(local.next, ["cozy run … --on any", "cozy machine list"]);
+    let other = submit("kiyui").await.unwrap().json::<Envelope>().await;
+    assert_eq!(other.unwrap().error.message, r#"no machine named "kiyui""#);
+    let new = submit("new").await.unwrap();
+    assert_eq!(new.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        new.json::<Envelope>().await.unwrap().error.code,
+        "placement_unavailable"
+    );
+    let listed: RunList = calcifer
+        .request(Method::GET, "/v1/runs")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(listed.runs.is_empty(), "nothing was recorded");
+    assert_eq!(calcifer.stopped().await, Stopped::Idle);
 }
