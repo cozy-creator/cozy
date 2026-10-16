@@ -14,10 +14,13 @@ use interface::{Callable, Interface};
 use target::Target;
 
 mod bind;
+pub(crate) mod board;
 mod catalog;
 mod describe;
 mod follow;
 pub(crate) mod interface;
+mod list;
+mod show;
 mod spec;
 mod target;
 
@@ -101,8 +104,8 @@ enum Warm {
 enum Verb {
     /// Runs on every Hub, newest first.
     List {
-        /// Only runs in this state: queued, in_progress, completed, failed, canceled.
-        #[arg(long)]
+        /// Only runs in this state.
+        #[arg(long, value_parser = ["queued", "in_progress", "completed", "failed", "canceled"])]
         state: Option<String>,
         /// Only this package's runs.
         #[arg(long)]
@@ -156,8 +159,21 @@ enum Verb {
 
 pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
     match args.verb {
-        Some(Verb::List { .. }) => Err(crate::not_ported("run list")),
-        Some(Verb::Show { .. }) => Err(crate::not_ported("run show")),
+        Some(Verb::List {
+            state,
+            package,
+            limit,
+            watch,
+        }) => {
+            let query = list::Query {
+                status: state,
+                package,
+                before: None,
+                limit,
+            };
+            list::exec(ctx, query, watch).await
+        }
+        Some(Verb::Show { run }) => show::exec(ctx, &run).await,
         Some(Verb::Watch { run }) => {
             let run = ctx.calcifer().await?.run(&run).await?;
             Ok(exit_code(&follow(ctx, run, false).await?))

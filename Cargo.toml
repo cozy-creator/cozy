@@ -47,6 +47,7 @@ progenitor-client = "0.15.1"
 prost = "0.14"
 protoc-bin-vendored = "3"
 quote = "1"
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 reqwest = { version = "0.13", default-features = false, features = ["form", "http2", "json", "query", "rustls", "stream"] }
 rusqlite = { version = "0.40", features = ["bundled"] }

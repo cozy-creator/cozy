@@ -22,6 +22,7 @@ indicatif.workspace = true
 infer.workspace = true
 progenitor-client.workspace = true
 prost.workspace = true
+ratatui.workspace = true
 reqwest.workspace = true
 self-replace.workspace = true
 semver.workspace = true
