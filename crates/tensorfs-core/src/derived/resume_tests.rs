@@ -86,7 +86,7 @@ fn transfer(from: &Store, into: &Store, head: &ObjectRef) {
             let page = crate::durability::local_window(from, &object, offset, 1).unwrap();
             assert!(page.objects.len() <= 1);
             for (kind, object) in page.objects {
-                assert_eq!(kind, crate::repo_cache::CacheKind::Blob);
+                assert_eq!(kind, crate::durability::Kind::Blob);
                 let mut bytes = Vec::new();
                 from.read_into(&object.sha256, &mut bytes).unwrap();
                 into.put_stream(&mut bytes.as_slice(), Some(&object), &Default::default())
@@ -857,7 +857,7 @@ fn source_free_restore_holds_survive_gc_until_begin_or_explicit_abandon() {
     admit(&head);
     let page = crate::durability::local_window(&target, &head, 0, 128).unwrap();
     for (kind, object) in page.objects {
-        assert_eq!(kind, crate::repo_cache::CacheKind::Blob);
+        assert_eq!(kind, crate::durability::Kind::Blob);
         admit(&object);
     }
     assert!(matches!(

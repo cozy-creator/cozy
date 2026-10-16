@@ -46,6 +46,8 @@ pub struct Checkpoint {
     /// Each component's blobs, in component order.
     pub components: Vec<Vec<ObjectRef>>,
     pub blobs: Vec<ObjectRef>,
+    /// An anonymous reader could read it (the closure's `public`).
+    pub public: bool,
 }
 
 impl Checkpoint {
@@ -159,6 +161,7 @@ pub fn components(
         objects,
         blobs: reached.iter().flatten().cloned().collect(),
         components: reached,
+        public: true,
     }
 }
 
@@ -314,6 +317,7 @@ impl Served {
                             ("model", Value::str(c.model.clone())),
                             ("objects", Value::arr(c.objects.iter().map(row).collect())),
                             ("presign_max_digests", Value::uint(1024)),
+                            ("public", Value::Bool(c.public)),
                             ("release", Value::str(c.release.clone())),
                             ("scope", Value::str("runtime")),
                         ]));

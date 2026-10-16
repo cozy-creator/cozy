@@ -33,7 +33,7 @@
 
 mod api;
 mod credential;
-mod decisions;
+pub(crate) mod decisions;
 mod download;
 mod dpop;
 mod http;

@@ -60,7 +60,7 @@ pub type ObjectObserver<'a> = &'a (dyn Fn(&ObjectRef, u64, ObjectSource) + Sync)
 /// still completes and the totals still add up, and the bytes are quietly re-bought.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObjectSource {
-    Cache,
+    Volume,
     Origin,
 }
 
@@ -859,6 +859,7 @@ fn pinned_local_closure(request: &PullRequest<'_>) -> Option<hub::Closure> {
         complete: true,
         // Served only when nothing is wanted, so it authorizes no presign.
         presign_max_digests: 0,
+        public: false,
     })
 }
 

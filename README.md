@@ -35,49 +35,20 @@ A writable local TensorFS root has exactly one host owner. SQLite/advisory locks
 processes on that host; they are not a cross-host lock service and must not sit on NFS as shared
 mutation authority. Multi-host publication and GC use Tensorhub's R2/PostgreSQL control plane.
 
-Workers may additionally use a root (for example, `/workspace/cozy/repo-cache`) as an optional
-datacenter cache. The example path is deployment policy, not part of the TensorFS format.
+**Datacenter volume.** A Fetcher may be given a shared directory (a datacenter's NFS volume,
+mounted by the Hub at `/cache`) as a second source between the local Store and the Hub. It holds
+immutable objects only, at `objects/<2 hex>/<2 hex>/<64 hex>`, with temps in `tmp/`:
 
-**The cache is a property of the Store, recorded once at setup.** `tfs store init <root>
---repo-cache <cache>` writes the mount into `<store-root>/repo-cache`; `--no-repo-cache` clears
-it. Every later handle — `Store::open`, `Store::ensure`, and so every fetch, conversion, restore
-and resume — reads it from there, so no request, protocol field, function argument or child
-environment ever carries a mount path. The record is LOCAL to the Store and never on the cache,
-which holds immutable objects only. Reading it can only change cost: an absent, unreadable or
-malformed record is simply no cache, because a Store that would not open is an availability
-failure and cache state may never cause one. Binding performs no I/O on the cache path, since a
-stat on a hung mount does not return.
-
-The cache is not a TensorFS Store and contains only immutable repository objects:
-
-```text
-blobs/<first-2-hex>/<next-2-hex>/<64-lowercase-hex>
-manifests/<first-2-hex>/<next-2-hex>/<64-lowercase-hex>.json
-```
-
-There is no SQLite file, repository projection, lease, operation, verification authority, or GC
-in that cache. Every hit is checked against an exact SHA-256 and length while TensorFS copies it
-directly into the ordinary local Store. Missing, corrupt,
-read-only, full, and unavailable cache states are soft misses; the authenticated cloud source
-remains authoritative. Only objects a pull fetched from the origin are backfilled; a held object
-is never offered. Backfill hashes while writing a hidden unique sibling, fsyncs, and links it
-without clobbering, so concurrent writers converge and an interrupted write never has a final
-name. That publication is the cache's integrity record: an exact-length blob at its name is
-present without being read. A pull that reads an entry corrupt re-verifies instead and
-repairs a corrupt regular entry by syncing its replacement before an atomic rename. Publication pins the
-configured cache root and opens each fanout directory without following symlinks; all temporary,
-link and rename operations stay relative to those directory descriptors. Symlink and nonregular
-entries remain unavailable. Repair grants no custody and adds no cache garbage collector.
-
-Cache calls perform synchronous filesystem I/O and must run on a worker data path or subprocess,
-never its control loop. A mounted filesystem which stops responding cannot provide a timely soft
-miss from inside the blocked syscall, so subprocess progress/termination and live hung-mount proof
-remain the supervisor's responsibility.
-
-The production paths never name a cache directory: `tfs fetch`, `tfs ingest run`, `tfs repo-cache restore <store> ...` and
-`tfs repo-cache resume <store> ...` use whatever the Store is bound to, and an unbound Store is a
-run with no cache rather than a refusal — except a restore, where "bring these bytes back off the
-cache" with no cache is a caller mistake and says so.
+- **Read:** an absent object is read from the volume first and hashed into the Store through the
+  same door a download uses; a missing, wrong-length or corrupt entry falls back to the Hub. A hit
+  still costs one closure read per origin (the access check) and no presign.
+- **Write-back:** objects that arrived from the Hub through a public origin are copied back
+  (temp, fsync, rename; skipped when present), at most two at a time and only while nothing more
+  urgent waits. Private checkpoints never reach the volume.
+- **Eviction:** an object's mtime is its last use. A write that finds the volume short first
+  removes temps and objects unused for the TTL, then the oldest, and skips when still short.
+- **Stalls:** a volume operation silent beyond the transport's stall rule is abandoned to the
+  Hub, and the tier is suspended until every stuck operation returns.
 
 Three schemas are STORED — written to a path, digested, and identified by their exact bytes:
 
@@ -148,8 +119,7 @@ or namespace symlink, merges foreign files into a Store, or recognizes an older 
 **A Store may be given a disk budget, and having one is the whole opt-in.** `tfs store
 ensure <root> --disk-budget <bytes>` writes the number into `<store-root>/disk-budget`;
 `--no-disk-budget` clears it. Every later handle reads it back, and `store info`/`store
-ensure` print `disk-budget: <n> B, holding <m> B` so a supervisor can fence the readback
-the way it fences `repo-cache:`.
+ensure` print `disk-budget: <n> B, holding <m> B` so a supervisor can fence the readback.
 
 **A Store with no budget behaves exactly as it did before the budget existed.** Nothing is
 enforced, nothing is reclaimed, and nothing disappears — which is the point: a personal

@@ -95,7 +95,6 @@ fn store_api(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(store::gc, m)?)?;
     m.add_function(wrap_pyfunction!(serve::serve_fetch, m)?)?;
     m.add_function(wrap_pyfunction!(serve::serve_source, m)?)?;
-    m.add_class::<store::PyRepoObjectCache>()?;
     m.add_class::<store::PyStore>()?;
     m.add_class::<store::PyOperation>()?;
     m.add_class::<store::PyDerivedWriter>()?;

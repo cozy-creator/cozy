@@ -23,11 +23,9 @@ use std::time::Instant;
 
 use tensorfs_core::canon::{self, as_arr, as_str, Fields, Value};
 use tensorfs_core::checkpoint as ck;
-use tensorfs_core::durability;
 use tensorfs_core::err::Code;
 use tensorfs_core::header::tensor_schema_digest_of;
 use tensorfs_core::ids::{ObjectRef, Plain};
-use tensorfs_core::ingest::carrier::SourceHeader;
 use tensorfs_core::ingest::convert::{self, Class, Effect};
 use tensorfs_core::ingest::fingerprint::{
     self, Banked, FingerprintRegistry, SourceProfile, SourceProfileComponent, SourceProfileVariant,
@@ -692,21 +690,11 @@ pub fn cmd_plan_source(path: &Path) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// `outer` carries the flags that describe THIS RUN rather than the plan: where the pod's
-/// repo cache is mounted and how often the conversion should make itself resumable
-/// elsewhere. They are deliberately not in the closed plan document, because a plan is a
-/// claim about what will be produced and a mount point is a fact about one machine — the
-/// same plan run with and without a cache must produce the same bytes.
-pub fn cmd_run_source(root: &Path, path: &Path, outer: &Flags) -> ExitCode {
+pub fn cmd_run_source(root: &Path, path: &Path) -> ExitCode {
     let (closed, _, mut flags) = match prepare_closed_source_plan(path) {
         Ok(result) => result,
         Err(code) => return code,
     };
-    for (key, value) in outer.iter() {
-        if matches!(key.as_str(), "checkpoint-bytes") {
-            flags.push((key.clone(), value.clone()));
-        }
-    }
     let order_path = root
         .join("tmp")
         .join(format!("source-plan-{}.order.json", closed.session));
@@ -1009,7 +997,6 @@ pub fn cmd_run(root: &Path, target: &str, f: &Flags) -> ExitCode {
                 | "order"
                 | "tenant"
                 | "isolation-tier"
-                | "checkpoint-bytes"
                 | "source-profile"
         ) {
             argv.push(format!("--{k}"));
@@ -1195,74 +1182,14 @@ pub fn cmd_worker(root: &Path, target: &str, f: &Flags) -> ExitCode {
             ok!(v.check(&seed.spec));
         }
     }
-    // THE DURABILITY HALF. The cache is the STORE's — `tfs store ensure --repo-cache` bound
-    // it and this handle carries it — and it is a PATH and never a mode: an unbound Store is
-    // a conversion with no cache, and a cache that is missing, read-only, full or unmounted
-    // degrades to exactly that conversion. What it buys is that converted objects stop being
-    // pod-local while the conversion is still running — the reason a released pod used to
-    // cost the whole run, and the half the conversion journal beside it cannot supply
-    // because it dies with the pod.
-    let cache = store.repo_cache().is_some();
-    let headers: Vec<(std::path::PathBuf, &SourceHeader)> = p
-        .files
-        .iter()
-        .map(|file| (file.path.clone(), &file.header))
-        .collect();
-    // The SAME identity the conversion journal keys its file on. One plan-identity function,
-    // so the two planes cannot disagree about which conversion this is.
-    let plan_digest = format!(
-        "sha256:{}",
-        tensorfs_core::ingest::journal::plan_digest(&p.plan, &headers)
-    );
-    println!("plan         {plan_digest}");
-    let policy = durability::Policy {
-        chain: &session,
-        operation: &session,
-        plan: &plan_digest,
-        interval: flag_num(f, "checkpoint-bytes", durability::INTERVAL_BYTES),
-    };
-    let (converted, durable) = durability::with(&store, &policy, |mirror| {
-        tx::execute(
-            &store,
-            &p.plan,
-            &p.files,
-            &source_core::plain_specs(&p.seeds),
-            &configs,
-            &session,
-            mirror,
-        )
-    });
-    if cache {
-        let mirrored = durable.mirror;
-        println!(
-            "write-through {} object(s) stored, {} already present, {} refused — {} B durable \
-             over {} chain link(s){}",
-            mirrored.stored,
-            mirrored.present,
-            mirrored.unavailable,
-            mirrored.durable.bytes,
-            durable.journal.links,
-            if mirrored.durable.stalled {
-                " (the cache stopped answering; this run is no longer resumable elsewhere)"
-            } else {
-                ""
-            }
-        );
-        if let Some(head) = &durable.journal.head {
-            // The chain is immutable and lives on the cache; THIS DIGEST IS THE MUTABLE
-            // CELL, and it is printed rather than written because its home is the hub,
-            // advanced by compare-and-set on the monotonic byte watermark beside it. A
-            // mutable pointer on a volume shared by every pod of one owner is the hazard
-            // the local-Store decision exists to refuse.
-            println!(
-                "chain        {} links {} bytes {}",
-                head.id(),
-                durable.journal.links,
-                durable.journal.bytes
-            );
-        }
-    }
-    let mut out = ok!(converted);
+    let mut out = ok!(tx::execute(
+        &store,
+        &p.plan,
+        &p.files,
+        &source_core::plain_specs(&p.seeds),
+        &configs,
+        &session,
+    ));
     let got = out.header.tensor_schema_digest();
     if got != predicted {
         eprintln!(

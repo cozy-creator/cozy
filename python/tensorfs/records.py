@@ -180,7 +180,8 @@ class ManifestRow(TypedDict):
 class Stats(TypedDict):
     catalog_opens: int
     presence_passes: int
-    repo_cache_verified_reads: int
+    volume_written_bytes: int
+    volume_skipped_bytes: int
     admission_batches: int
     admitted_objects: int
     admission_nanos: int

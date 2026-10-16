@@ -229,7 +229,7 @@ impl PullProgress {
                 state.origin_bytes += moved;
                 state.origin_objects += 1;
             }
-            ObjectSource::Cache => {
+            ObjectSource::Volume => {
                 state.cache_bytes += moved;
                 state.cache_objects += 1;
             }

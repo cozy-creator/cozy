@@ -104,7 +104,7 @@ fn switches_keep_their_positionals_and_unknown_flags_warn() {
             .output()
             .unwrap()
     };
-    let init = tfs(&["store", "init", "--no-repo-cache", named.to_str().unwrap(), "--streams-start", "4"]);
+    let init = tfs(&["store", "init", named.to_str().unwrap(), "--streams-start", "4"]);
     assert!(init.status.success(), "{}", String::from_utf8_lossy(&init.stderr));
     assert!(named.join("blobs").is_dir() && !environment.exists());
     assert!(String::from_utf8_lossy(&init.stderr).contains("unknown flag --streams-start"));

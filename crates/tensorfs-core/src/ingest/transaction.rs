@@ -21,7 +21,6 @@ use crate::header::{Closure, Header, Part, Tensor};
 use crate::ids::{ascii_name, hex64, Doc, ObjectRef, Plain};
 use crate::limits;
 use crate::manifest::Manifest;
-use crate::repo_cache::{CacheKind, Mirror};
 use crate::repository::{Mutation, ReleaseLane, RepositoryName};
 use crate::spec::EncodingSpec;
 use crate::store::Store;
@@ -622,13 +621,6 @@ fn journal_of(store: &Store, plan: &Plan, files: &[SourceFile], session: &str) -
 /// Streaming by construction, unchanged: an identity-class role is copied through a fixed
 /// buffer and never resident, so peak RSS is a function of the buffer and the header, not of
 /// the artifact. What is new is that peak *lost work* is now also a function of neither.
-/// **`mirror` is the durability half, and it is offered to per OP rather than per run.**
-/// The conversion journal above makes an op's MEANING durable on this pod's disk; the mirror
-/// makes its BYTES durable off this pod entirely, so a reclaimed rental costs the
-/// re-conversion of one checkpoint interval instead of the whole artifact. The offer never
-/// blocks and never fails (see [`Mirror`]), so a slow, stalled or absent mount changes what
-/// this pass COSTS and never what it produces. `None` is a conversion with no cache, which is
-/// every local ingest.
 #[allow(clippy::too_many_arguments)]
 pub fn convert(
     store: &Store,
@@ -637,7 +629,6 @@ pub fn convert(
     journal: &mut Journal,
     operation: &str,
     carriers: Carriers<'_>,
-    mirror: Option<&Mirror>,
 ) -> Result<Progress> {
     convert_bounded(
         store,
@@ -646,7 +637,6 @@ pub fn convert(
         journal,
         operation,
         carriers,
-        mirror,
         None,
         &super::custody::Custody::default(),
     )
@@ -660,7 +650,6 @@ fn convert_bounded(
     journal: &mut Journal,
     operation: &str,
     carriers: Carriers<'_>,
-    mirror: Option<&Mirror>,
     mut budget: Option<&mut Budget>,
     custody: &super::custody::Custody,
 ) -> Result<Progress> {
@@ -796,34 +785,6 @@ fn convert_bounded(
         if let Some(budget) = budget.as_deref_mut() {
             budget.largest_op = budget.largest_op.max(progress.written - written_before);
         }
-        // THE MEANING IS ON THIS DISK; NOW THE BYTES LEAVE IT. The order is the guarantee:
-        // the journal names the part before anything publishes it, so a crash between the
-        // two leaves a journalled op whose objects are only local — which the next run
-        // re-converts or re-publishes, never trusts.
-        if let Some(mirror) = mirror {
-            for (_, part) in &tparts {
-                mirror.offer_part(part);
-            }
-            // One snapshot of the whole op -> part map per checkpoint interval, not per op:
-            // it is a file, and hashing it 3,699 times over an H3 tree would spend gigabytes
-            // of SHA-256 restating what one snapshot per 4 GiB already says.
-            if mirror.progress_due() {
-                crate::durability::snapshot_conversion(store, mirror, journal, operation)?;
-            }
-            // One op is one unit of this pass's work. The chain wakes on this and on nothing
-            // else — never on a clock — so a link is taken because bytes became durable.
-            mirror.at_unit();
-        }
-    }
-    // The LAST snapshot, whatever the interval says — the same reasoning the last chain link
-    // is taken under. A pass that ends part-way into an interval has those ops journalled,
-    // and publishing the objects without the map that names them would make a resuming pod
-    // re-convert work whose bytes it is already holding.
-    if let Some(mirror) = mirror {
-        if progress.converted_roles > 0 {
-            crate::durability::snapshot_conversion(store, mirror, journal, operation)?;
-            mirror.at_unit();
-        }
     }
     Ok(progress)
 }
@@ -844,8 +805,6 @@ pub struct Finalize<'a> {
     /// resumed run reports the work IT did and not the artifact's totals.
     pub pass: &'a Progress,
     pub elapsed_ms: i64,
-    /// The write-through, so the header and Manifest leave this pod with everything else.
-    pub mirror: Option<&'a Mirror>,
 }
 
 pub fn finalize(store: &Store, request: Finalize<'_>) -> Result<Outcome> {
@@ -857,7 +816,6 @@ pub fn finalize(store: &Store, request: Finalize<'_>) -> Result<Outcome> {
         operation,
         pass,
         elapsed_ms,
-        mirror,
     } = request;
     plan.require_order()?;
     let mut comps: Vec<(String, Vec<(String, Tensor)>)> = Vec::new();
@@ -952,14 +910,6 @@ pub fn finalize(store: &Store, request: Finalize<'_>) -> Result<Outcome> {
         .obj;
     let manifest = build_manifest(&header, &header_ref, &closure)?;
     let manifest_ref = store.put_manifest_held(&manifest, Some(operation))?.obj;
-    // The header and the Manifest go LAST and they go together: they are what makes the rest
-    // walkable. With them on the cache a fresh pod restores the whole checkpoint from one
-    // digest; without them it has the bytes and no way to name them.
-    if let Some(mirror) = mirror {
-        mirror.offer(CacheKind::Blob, &header_ref);
-        mirror.offer(CacheKind::Manifest, &manifest_ref);
-        mirror.at_unit();
-    }
     // The two documents nothing else names yet. Written into the session root so the
     // filesystem hold protocol keeps them until the coordinator installs or releases.
     name_candidates(
@@ -1010,7 +960,6 @@ pub fn execute(
     specs: &[(String, EncodingSpec)],
     configs: &[(String, Vec<u8>)],
     operation: &str,
-    mirror: Option<&Mirror>,
 ) -> Result<Outcome> {
     let t0 = Instant::now();
     let mut journal = journal_of(store, plan, files, operation)?;
@@ -1021,7 +970,6 @@ pub fn execute(
         &mut journal,
         operation,
         Carriers::All,
-        mirror,
     )?;
     finalize(
         store,
@@ -1033,7 +981,6 @@ pub fn execute(
             operation,
             pass: &progress,
             elapsed_ms: t0.elapsed().as_millis() as i64,
-            mirror,
         },
     )
 }
@@ -1052,7 +999,6 @@ pub fn advance(
     configs: &[(String, Vec<u8>)],
     operation: &str,
     carriers: Carriers<'_>,
-    mirror: Option<&Mirror>,
 ) -> Result<(Progress, Option<Outcome>)> {
     let mut journal = journal_of(store, plan, files, operation)?;
     advance_journal(
@@ -1063,7 +1009,6 @@ pub fn advance(
         configs,
         operation,
         carriers,
-        mirror,
         &mut journal,
         None,
         &super::custody::Custody::default(),
@@ -1081,14 +1026,13 @@ pub fn advance_journal(
     configs: &[(String, Vec<u8>)],
     operation: &str,
     carriers: Carriers<'_>,
-    mirror: Option<&Mirror>,
     journal: &mut Journal,
     budget: Option<&mut Budget>,
     custody: &super::custody::Custody,
 ) -> Result<(Progress, Option<Outcome>)> {
     let t0 = Instant::now();
     let progress = convert_bounded(
-        store, plan, files, journal, operation, carriers, mirror, budget, custody,
+        store, plan, files, journal, operation, carriers, budget, custody,
     )?;
     if !progress.complete() {
         return Ok((progress, None));
@@ -1103,7 +1047,6 @@ pub fn advance_journal(
             operation,
             pass: &progress,
             elapsed_ms: t0.elapsed().as_millis() as i64,
-            mirror,
         },
     )?;
     Ok((progress, Some(outcome)))
@@ -1124,9 +1067,7 @@ pub fn convert_journal(
     budget: Option<&mut Budget>,
     custody: &super::custody::Custody,
 ) -> Result<Progress> {
-    convert_bounded(
-        store, plan, files, journal, operation, carriers, None, budget, custody,
-    )
+    convert_bounded(store, plan, files, journal, operation, carriers, budget, custody)
 }
 
 #[cfg(test)]

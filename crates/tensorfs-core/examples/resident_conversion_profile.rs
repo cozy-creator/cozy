@@ -157,7 +157,6 @@ fn main() {
         &[],
         operation,
         carriers,
-        None,
     )
     .unwrap();
     let elapsed = began.elapsed().as_nanos() as u64;

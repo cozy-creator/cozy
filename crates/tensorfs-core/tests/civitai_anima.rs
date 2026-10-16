@@ -401,7 +401,6 @@ fn a_synthetic_carrier_with_the_real_layout_ingests_to_the_constructor_census() 
         &[],
         "convert",
         transaction::Carriers::All,
-        None,
     )
     .unwrap();
     let header = outcome.unwrap().header;

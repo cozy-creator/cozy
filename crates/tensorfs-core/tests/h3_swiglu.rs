@@ -140,7 +140,6 @@ fn fused_gate_value_rows_convert_and_resume_for_both_dits_and_refiners() {
             &[],
             "convert",
             transaction::Carriers::All,
-            None,
         )
         .unwrap();
         assert_eq!(progress.converted_roles, 3);
@@ -169,7 +168,6 @@ fn fused_gate_value_rows_convert_and_resume_for_both_dits_and_refiners() {
             &[],
             "convert",
             transaction::Carriers::All,
-            None,
         )
         .unwrap();
         assert_eq!(again.resumed_roles, 3);

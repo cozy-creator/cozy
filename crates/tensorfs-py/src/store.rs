@@ -27,7 +27,6 @@ use tensorfs_core::manifest::Manifest;
 use tensorfs_core::meta::{Hold, Meta};
 use tensorfs_core::project;
 use tensorfs_core::read::{self, ObjectRange, ReadLease as CoreLease};
-use tensorfs_core::repo_cache::{CacheKind, RepoObjectCache as CoreRepoObjectCache};
 use tensorfs_core::repository::{Mutation, ReleaseLane, RepositoryName};
 use tensorfs_core::storage;
 use tensorfs_core::store::{Fault, Store as CoreStore};
@@ -451,66 +450,6 @@ fn receipt<'p>(py: Python<'p>, receipt: &derived::ReceiptFacts) -> PyResult<Boun
 
 // ---------------------------------------------------------------- store
 
-#[pyclass(name = "RepoObjectCache")]
-pub struct PyRepoObjectCache {
-    cache: CoreRepoObjectCache,
-}
-
-#[pymethods]
-impl PyRepoObjectCache {
-    #[new]
-    fn new(root: PathBuf) -> Self {
-        Self {
-            cache: CoreRepoObjectCache::new(root),
-        }
-    }
-
-    #[getter]
-    fn root(&self) -> String {
-        self.cache.root().display().to_string()
-    }
-
-    #[pyo3(signature = (store, object_id, length, *, manifest=false))]
-    fn admit(
-        &self,
-        py: Python<'_>,
-        store: &PyStore,
-        object_id: &str,
-        length: u64,
-        manifest: bool,
-    ) -> PyResult<&'static str> {
-        let object = obj_ref(py, object_id, length)?;
-        let kind = if manifest {
-            CacheKind::Manifest
-        } else {
-            CacheKind::Blob
-        };
-        py.detach(|| self.cache.admit(&store.store, kind, &object))
-            .or_refuse(py)
-            .map(|status| status.as_str())
-    }
-
-    #[pyo3(signature = (store, object_id, length, *, manifest=false))]
-    fn backfill(
-        &self,
-        py: Python<'_>,
-        store: &PyStore,
-        object_id: &str,
-        length: u64,
-        manifest: bool,
-    ) -> PyResult<&'static str> {
-        let object = obj_ref(py, object_id, length)?;
-        let kind = if manifest {
-            CacheKind::Manifest
-        } else {
-            CacheKind::Blob
-        };
-        py.detach(|| self.cache.backfill_store(&store.store, kind, &object))
-            .or_refuse(py)
-            .map(|status| status.as_str())
-    }
-}
-
 fn tree_root_dict<'p>(
     py: Python<'p>,
     root: &tensorfs_core::source_artifact::TreeRoot,
@@ -604,13 +543,6 @@ impl PyStore {
         self.store.contains(hex.trim_start_matches("sha256:"))
     }
 
-    #[getter]
-    fn repo_cache(&self) -> Option<String> {
-        self.store
-            .repo_cache()
-            .map(|cache| cache.root().display().to_string())
-    }
-
     fn begin_operation(
         &self,
         py: Python<'_>,
@@ -684,8 +616,8 @@ impl PyStore {
             row.set_item(
                 "kind",
                 match kind {
-                    tensorfs_core::repo_cache::CacheKind::Blob => "blob",
-                    tensorfs_core::repo_cache::CacheKind::Manifest => "manifest",
+                    tensorfs_core::durability::Kind::Blob => "blob",
+                    tensorfs_core::durability::Kind::Manifest => "manifest",
                 },
             )?;
             row.set_item("object_id", object.id())?;

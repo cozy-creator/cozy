@@ -66,8 +66,6 @@ pub mod reclaim;
 pub mod registry;
 pub mod relation;
 #[cfg(feature = "store")]
-pub mod repo_cache;
-#[cfg(feature = "store")]
 pub mod repository;
 pub mod sha256;
 #[cfg(feature = "store")]

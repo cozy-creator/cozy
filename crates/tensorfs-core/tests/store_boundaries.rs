@@ -1,6 +1,6 @@
 use std::fs;
-use std::os::unix::fs::{symlink, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::os::unix::fs::symlink;
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tensorfs_core::err::Code;
@@ -15,10 +15,6 @@ fn temporary(name: &str) -> PathBuf {
             .unwrap()
             .as_nanos()
     ))
-}
-
-fn mode(path: &Path) -> u32 {
-    fs::symlink_metadata(path).unwrap().permissions().mode() & 0o7777
 }
 
 /// Many writers ensuring one brand-new root at once: one creates it, the others open it,
@@ -122,116 +118,6 @@ fn ensure_initializes_only_absent_or_empty_real_roots() {
         assert_eq!(Store::open(&store_root).unwrap_err().code, Code::STORE_ERA);
     }
     fs::remove_dir_all(root).unwrap();
-}
-
-/// THE BINDING IS A PROPERTY OF THE STORE, and this is the whole of what that claims.
-///
-/// It survives the process that wrote it (a pod boots, sets up once, and converts for
-/// hours under a different handle in a different program); it is LOCAL, never on the cache,
-/// because #612 gives the NFS root immutable Manifest and blob paths and nothing else; and
-/// no shape of it can turn a Store that would open into a Store that will not, because a
-/// cache is only ever allowed to change cost.
-#[test]
-fn the_repo_cache_binding_survives_reopen_and_can_never_refuse_a_store() {
-    let root = temporary("repo-cache-binding");
-    let store_root = root.join("store");
-    let cache = root.join("repo-cache");
-    let store = Store::init(&store_root).unwrap();
-    assert!(
-        store.repo_cache().is_none(),
-        "a new Store is bound to nothing"
-    );
-
-    let store = store.bind_repo_cache(Some(&cache)).unwrap();
-    assert_eq!(store.repo_cache().map(|c| c.root()), Some(&*cache));
-    // A DIFFERENT HANDLE, made the way every later command makes one.
-    assert_eq!(
-        Store::open(&store_root)
-            .unwrap()
-            .repo_cache()
-            .map(|c| c.root()),
-        Some(&*cache)
-    );
-    assert_eq!(
-        Store::ensure(&store_root)
-            .unwrap()
-            .repo_cache()
-            .map(|c| c.root()),
-        Some(&*cache)
-    );
-    // Recording the mount created nothing on it. `bind` performs no I/O on the cache path:
-    // a stat on a hard NFS mount that has stopped answering never returns, and setup is not
-    // allowed to hang on the one thing that may only cost latency.
-    assert!(!cache.exists());
-
-    // Rebinding replaces; the record is DECLARATIVE and never accumulates.
-    let elsewhere = root.join("other-cache");
-    let store = store.bind_repo_cache(Some(&elsewhere)).unwrap();
-    assert_eq!(store.repo_cache().map(|c| c.root()), Some(&*elsewhere));
-    let store = store.bind_repo_cache(None).unwrap();
-    assert!(store.repo_cache().is_none());
-    assert!(Store::open(&store_root).unwrap().repo_cache().is_none());
-    // Clearing a binding that is already absent is not an error.
-    store.bind_repo_cache(None).unwrap();
-
-    // A cache INSIDE the Store, or a Store inside the cache, is refused at bind time —
-    // where it is a caller's mistake and not weather.
-    for overlap in [store_root.clone(), store_root.join("blobs"), root.clone()] {
-        assert_eq!(
-            Store::open(&store_root)
-                .unwrap()
-                .bind_repo_cache(Some(&overlap))
-                .unwrap_err()
-                .code,
-            Code::STORE_ERA,
-            "{} was accepted as a cache root",
-            overlap.display()
-        );
-    }
-    assert_eq!(
-        Store::open(&store_root)
-            .unwrap()
-            .bind_repo_cache(Some(Path::new("relative/cache")))
-            .unwrap_err()
-            .code,
-        Code::KEY_GRAMMAR
-    );
-
-    // AND THE PART THAT MATTERS MOST: garbage where the binding lives is NO BINDING, never
-    // a refusal. A Store that would not open because a cache record was unreadable would be
-    // a cache failure that cost availability, which is exactly what #612 forbids.
-    let binding = store_root.join("repo-cache");
-    for junk in [
-        b"not-absolute\n".to_vec(),
-        b"\n".to_vec(),
-        Vec::new(),
-        vec![0u8; 8],
-        vec![b'/'; 9000],
-    ] {
-        fs::write(&binding, &junk).unwrap();
-        let reopened = Store::open(&store_root).unwrap();
-        assert!(
-            reopened.repo_cache().is_none(),
-            "{junk:?} was read as a mount point"
-        );
-        assert!(!reopened.objects().unwrap().is_empty() || reopened.objects().is_ok());
-    }
-    // A symlink where the binding lives is read through O_NOFOLLOW, so it is not a binding
-    // either — and still not a refusal.
-    fs::remove_file(&binding).unwrap();
-    symlink(&cache, &binding).unwrap();
-    assert!(Store::open(&store_root).unwrap().repo_cache().is_none());
-    fs::remove_file(&binding).unwrap();
-
-    // The binding is a plain local file beside the namespaces, readable by the pod's other
-    // uid, and nothing about it reaches the cache.
-    Store::open(&store_root)
-        .unwrap()
-        .bind_repo_cache(Some(&cache))
-        .unwrap();
-    assert_eq!(mode(&binding), 0o644);
-    assert!(!cache.exists());
-    let _ = fs::remove_dir_all(root);
 }
 
 // Run this arm as root as well as in the ordinary suite. Separate CLI processes

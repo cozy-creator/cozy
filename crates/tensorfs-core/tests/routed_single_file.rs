@@ -207,7 +207,6 @@ fn one_pass_splits_transposes_squeezes_and_narrows_to_the_canonical_keys() {
             &[],
             "convert",
             transaction::Carriers::All,
-            None,
         )
         .unwrap()
     };
@@ -274,7 +273,6 @@ fn a_value_f16_cannot_hold_refuses_and_an_unreviewed_layout_never_plans() {
         &[],
         "convert",
         transaction::Carriers::All,
-        None,
     )
     .unwrap_err();
     assert_eq!(refusal.code, Code::NUMBER_RANGE, "{}", refusal.detail);

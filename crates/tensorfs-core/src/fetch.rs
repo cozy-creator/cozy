@@ -26,8 +26,11 @@ mod fetcher;
 
 mod serve;
 
+mod volume;
+
 pub use fetcher::{Access, Fetcher, Origin, Plain, Priority, Ticket};
 pub use serve::{serve, Grant};
+pub use volume::Volume;
 
 use crate::canon::{self, as_arr, Fields, Value};
 use crate::err::{refuse, Code, Result};

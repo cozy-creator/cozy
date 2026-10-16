@@ -191,7 +191,6 @@ fn trainer_fused_projection_and_converted_qkv_have_the_same_heads() {
             &[],
             "projection-proof",
             transaction::Carriers::All,
-            None,
         )
         .unwrap();
         let out = out.unwrap();
@@ -266,7 +265,6 @@ fn both_dialects_permute_only_b_rows_and_resume_without_new_bytes() {
             &[],
             "convert",
             transaction::Carriers::All,
-            None,
         )
         .unwrap();
         let out = out.unwrap();
@@ -310,7 +308,6 @@ fn both_dialects_permute_only_b_rows_and_resume_without_new_bytes() {
             &[],
             "convert",
             transaction::Carriers::All,
-            None,
         )
         .unwrap();
         assert_eq!(again.written, 0);

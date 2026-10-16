@@ -232,12 +232,12 @@ fn a_transformers_repository_carries_its_config_tokenizer_and_processor() {
 /// A real Hugging Face repository at a pinned revision, mirrored whole (real network) and
 /// served from loopback with `extra` files added: the repository as its owner might have
 /// grown it, read through the real provider, download, conversion and composition path.
-struct Mirror {
+struct HfRepo {
     base: String,
 }
 
-impl Mirror {
-    fn of(repo: &str, revision: &str, extra: Vec<(String, Vec<u8>)>) -> (Mirror, String) {
+impl HfRepo {
+    fn of(repo: &str, revision: &str, extra: Vec<(String, Vec<u8>)>) -> (HfRepo, String) {
         let tree =
             format!("https://huggingface.co/api/models/{repo}/tree/{revision}?recursive=true");
         let listing = std::process::Command::new("curl")
@@ -271,7 +271,7 @@ impl Mirror {
                 std::thread::spawn(move || serve(socket, &files));
             }
         });
-        (Mirror { base }, format!("hf://{repo}@{revision}"))
+        (HfRepo { base }, format!("hf://{repo}@{revision}"))
     }
 
     fn access(&self) -> Access {
@@ -381,7 +381,7 @@ fn a_diffusers_repository_is_its_index_components_and_nothing_else() {
             .stdout
     };
     let variant = tensors("transformer/diffusion_pytorch_model.safetensors");
-    let (mirror, source) = Mirror::of(
+    let (mirror, source) = HfRepo::of(
         "hf-internal-testing/tiny-flux-pipe",
         "a98bc4ec6a80c47c477ed22d7e81c79872d9c723",
         vec![
@@ -464,7 +464,7 @@ fn a_transformers_repository_is_its_root_model_and_nothing_else() {
     )
     .unwrap();
     let revision: serde_json::Value = serde_json::from_str(&revision).unwrap();
-    let (mirror, source) = Mirror::of(
+    let (mirror, source) = HfRepo::of(
         "trl-internal-testing/tiny-Qwen3ForCausalLM",
         revision["sha"].as_str().unwrap(),
         vec![

@@ -1208,7 +1208,7 @@ pub struct VerifiedModelSourceFile {
 
 /// The full immutable source roster and the bodies currently available. Arrival and local
 /// paths do not identify the work. Output stays in the local Store until the RecordOwner
-/// uploads and acknowledges its checkpoint chain; this call never waits for a cache mount.
+/// uploads and acknowledges its checkpoint chain.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrepareModelSource {
     pub operation_id: String,
@@ -1959,7 +1959,6 @@ fn prepare_model_source_with_budget(
             &[],
             &request.operation_id,
             transaction::Carriers::Ready(&ready),
-            None,
             &mut journal,
             Some(budget),
             &custody,
@@ -2488,7 +2487,7 @@ mod tests {
 
     /// `floats` present makes every tensor a REAL CAS object rather than an inline body.
     /// The inline threshold is 256 B, so a request built from four-byte scalars publishes
-    /// nothing at all and any assertion about a cache over it would pass vacuously.
+    /// nothing at all and any assertion about its objects would pass vacuously.
     fn fixture_sized(
         root: &Path,
         bad_second_encoding: bool,
@@ -3644,92 +3643,6 @@ mod tests {
     }
 
     #[test]
-    fn a_bound_cache_does_not_block_or_claim_source_checkpoint_durability() {
-        let root = temporary("bound-local-checkpoint");
-        let (store, registry, request) = fixture_sized(&root, false, Some(1024));
-        let cache_root = root.join("repo-cache");
-        let store = store.bind_repo_cache(Some(&cache_root)).unwrap();
-        let existed = cache_root.exists();
-        let prepared =
-            prepare_model_source_with_registry(&store, &request, "fixture:registry", &registry)
-                .unwrap();
-        assert!(prepared.complete);
-        assert_eq!(prepared.checkpoints.len(), 2);
-        assert!(prepared
-            .checkpoints
-            .iter()
-            .all(|row| row.head.head.is_some() && row.head.bytes > 0));
-        assert_eq!(
-            cache_root.exists(),
-            existed,
-            "local checkpoint export must not touch NFS"
-        );
-        for checkpoint in &prepared.checkpoints {
-            let link =
-                durability::local_link(&store, checkpoint.head.head.as_ref().unwrap()).unwrap();
-            assert_eq!(link.plan, checkpoint.plan_digest);
-            assert!(link.progress.is_some());
-        }
-        let _ = fs::remove_dir_all(root);
-    }
-
-    /// The other half of the ruling: a binding that names a mount which is not there costs
-    /// the conversion its resumability and NOTHING ELSE. Same request, same registry, same
-    /// manifests — the run degrades to local-only in silence, exactly as an unbound Store
-    /// does, because cache failure is allowed to change cost and never authority.
-    #[test]
-    fn a_binding_to_an_absent_mount_degrades_to_a_local_only_conversion() {
-        let bound_root = temporary("absent-mount");
-        let (store, registry, request) = fixture_sized(&bound_root, false, Some(1024));
-        // A mount point that is NOT A DIRECTORY, which is what an unmounted volume looks
-        // like from inside the container: every path under it fails to open and fails to be
-        // created, for every object, in both directions.
-        let stub = bound_root.join("never");
-        fs::write(&stub, b"not a mount").unwrap();
-        let absent = stub.join("mounted");
-        let store = store.bind_repo_cache(Some(&absent)).unwrap();
-        let degraded =
-            prepare_model_source_with_registry(&store, &request, "fixture:registry", &registry)
-                .unwrap();
-        assert!(
-            degraded
-                .checkpoints
-                .iter()
-                .all(|row| row.head.head.is_some()),
-            "local progress must remain exportable when the cache is absent"
-        );
-        assert!(!absent.exists(), "a missing cache must not be conjured");
-
-        let plain_root = temporary("no-mount");
-        let (plain_store, plain_registry, plain_request) =
-            fixture_sized(&plain_root, false, Some(1024));
-        assert!(plain_store.repo_cache().is_none());
-        let plain = prepare_model_source_with_registry(
-            &plain_store,
-            &plain_request,
-            "fixture:registry",
-            &plain_registry,
-        )
-        .unwrap();
-        assert_eq!(
-            degraded
-                .sources
-                .iter()
-                .map(|s| (&s.slot, &s.manifest_digest, s.manifest_length))
-                .collect::<Vec<_>>(),
-            plain
-                .sources
-                .iter()
-                .map(|s| (&s.slot, &s.manifest_digest, s.manifest_length))
-                .collect::<Vec<_>>(),
-            "the cache changed what the conversion produced"
-        );
-        for root in [bound_root, plain_root] {
-            let _ = fs::remove_dir_all(root);
-        }
-    }
-
-    #[test]
     fn metadata_failure_exposes_no_result_or_output_holds() {
         let root = temporary("partial");
         let (store, registry, request) = fixture(&root, true);
@@ -4190,7 +4103,7 @@ mod tests {
                     "the caller can impose a smaller bounded page"
                 );
                 for (kind, object) in refs {
-                    assert_eq!(kind, crate::repo_cache::CacheKind::Blob);
+                    assert_eq!(kind, crate::durability::Kind::Blob);
                     let mut bytes = Vec::new();
                     incremental.read_into(&object.sha256, &mut bytes).unwrap();
                     replacement
@@ -4516,7 +4429,6 @@ mod tests {
             &[],
             "journal-operation",
             transaction::Carriers::Landed(&[true, false]),
-            None,
         )
         .unwrap();
         assert!(incomplete.is_none(), "no header exists over part of a plan");
@@ -4580,7 +4492,6 @@ mod tests {
             &[],
             "journal-operation",
             transaction::Carriers::All,
-            None,
         )
         .unwrap();
         assert!(resumed.complete());
@@ -4614,7 +4525,6 @@ mod tests {
             &plain_specs(&prepared2.seeds),
             &[],
             "one-shot",
-            None,
         )
         .unwrap();
         assert_eq!(one_shot.manifest_ref, outcome.manifest_ref);
@@ -4661,7 +4571,6 @@ mod tests {
             &mut journal,
             "partial",
             transaction::Carriers::Landed(&[true, false]),
-            None,
         )
         .unwrap();
         let refusal = transaction::finalize(
@@ -4674,7 +4583,6 @@ mod tests {
                 operation: "partial",
                 pass: &transaction::Progress::default(),
                 elapsed_ms: 0,
-                mirror: None,
             },
         )
         .unwrap_err();

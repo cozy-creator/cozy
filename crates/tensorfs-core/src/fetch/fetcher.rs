@@ -16,21 +16,28 @@
 //! - **Disk.** An object is admitted before it is opened. A short disk is relieved by GC
 //!   (garbage, idle partial checkpoints' objects, least recently used cache roots); one still
 //!   short refuses the object `CAPACITY_EXHAUSTED`.
+//! - **Volume.** Given a datacenter volume ([`Fetcher::with_volume`]), an absent object is read
+//!   from it before the Hub, and objects of public origins that came from the Hub are written
+//!   back at Behind. A volume operation that stalls goes to the Hub, and the volume is left
+//!   alone until every stalled operation returns.
 //! - **Failure.** A refused object fails the waits on it; a later want or wait asks again.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::hash::BuildHasher;
 use std::path::PathBuf;
-use std::sync::{Arc, Condvar, Mutex, PoisonError, RwLock, Weak};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, RwLock, Weak};
 use std::time::Duration;
 
 use crate::err::{refuse, Code, Refusal, Result};
-use crate::fetch::{DeliveryGrant, FetchPlan};
+use crate::fetch::volume::{Op, Wrote};
+use crate::fetch::{DeliveryGrant, FetchPlan, Volume};
 use crate::ids::{Doc, ObjectRef};
 use crate::meta::{Hold, Meta};
 use crate::store::Store;
 use crate::transport::{
     self, Cell, CredentialProvider, Deadline, Download, Feed, Lease, Ledger, Minting, ObjectSource, Opening,
-    PullCancellation, Pulse, SourcePolicy, Supply, BEHIND, CHUNK_BYTES, NEXT, NOW,
+    PullCancellation, Pulse, SourcePolicy, Supply, BEHIND, CHUNK_BYTES, NEXT, NOW, STALL_FACTOR,
 };
 
 /// A checkpoint at its hub: where the objects absent here come from.
@@ -109,8 +116,10 @@ impl Drop for Handle {
         self.shared.stop.cancel();
         self.shared.changed.notify_all();
         self.shared.pulse.beat();
-        if let Some(driver) = self.shared.driver.lock().unwrap().take() {
-            let _ = driver.join();
+        for thread in [&self.shared.driver, &self.shared.tender] {
+            if let Some(thread) = thread.lock().unwrap().take() {
+                let _ = thread.join();
+            }
         }
     }
 }
@@ -131,6 +140,14 @@ struct Shared {
     /// One disk admission at a time.
     admitting: Mutex<()>,
     driver: Mutex<Option<std::thread::JoinHandle<()>>>,
+    volume: OnceLock<Volume>,
+    /// The thread that starts volume operations and judges them stalled.
+    tender: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// The longest silence a volume operation has shown between two of its beats.
+    worst: Arc<AtomicU64>,
+    /// Write-backs go in this process's own random order, so machines filling one model at
+    /// once split it.
+    shuffle: std::collections::hash_map::RandomState,
     me: Weak<Shared>,
 }
 
@@ -147,7 +164,51 @@ struct State {
     reserved: u64,
     admitted: u64,
     driving: bool,
+    tier: Tier,
 }
+
+/// The volume's work, under the fetcher's lock.
+#[derive(Default)]
+struct Tier {
+    /// Each operation not yet returned, and the entry a read holds open.
+    running: HashMap<u64, Running>,
+    next: u64,
+    /// Operations abandoned as stalled and not yet returned: the volume is left alone while
+    /// any is.
+    stuck: usize,
+    /// Touches and write-backs, by shuffled key.
+    behind: BTreeMap<(u64, String), Back>,
+}
+
+impl Tier {
+    /// Where `entry` is fetched from now: the Hub while the volume is left alone.
+    fn via(&self, entry: &Entry) -> Via {
+        match self.stuck {
+            0 => entry.via,
+            _ => Via::Hub,
+        }
+    }
+
+    fn running(&self, reads: bool) -> usize {
+        self.running.values().filter(|r| r.read.is_some() == reads).count()
+    }
+}
+
+struct Running {
+    op: Arc<Op>,
+    read: Option<(String, Arc<Cell>)>,
+    abandoned: bool,
+}
+
+enum Back {
+    Touch,
+    Write { object: ObjectRef, manifest: bool, replace: bool },
+}
+
+/// Volume reads and writes in flight at most: 16 readers outrun the local disk (2.6-3.7 GB/s
+/// measured), and one writer moves 60 MB/s of the volume's 68.
+const READS: usize = 16;
+const WRITES: usize = 2;
 
 /// The queue holds `sha256` at its key while it is queued, and not otherwise.
 fn requeue(entries: &mut HashMap<String, Entry>, queue: &mut BTreeSet<(u64, u64, String)>, sha256: &str) {
@@ -225,6 +286,10 @@ impl State {
 /// One absent object some ticket wants.
 struct Entry {
     object: ObjectRef,
+    /// Where it is fetched from next.
+    via: Via,
+    /// The volume's copy was refused: the Hub's is written over it.
+    replace: bool,
     seq: u64,
     cell: Arc<Cell>,
     /// Each interested ticket and its key.
@@ -242,6 +307,12 @@ struct Entry {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Via {
+    Volume,
+    Hub,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
     Queued,
     Open,
@@ -256,7 +327,7 @@ struct Interest {
     objects: HashMap<String, (ObjectRef, u64)>,
     holds: Vec<Hold>,
     fetched: u64,
-    cached: u64,
+    volume: u64,
 }
 
 /// One origin: its closure, the supply its fetches use, and how far its structure landed.
@@ -330,6 +401,10 @@ impl Fetcher {
             gate: RwLock::default(),
             admitting: Mutex::default(),
             driver: Mutex::default(),
+            volume: OnceLock::new(),
+            tender: Mutex::default(),
+            worst: Arc::default(),
+            shuffle: Default::default(),
             me: me.clone(),
         });
         Ok(Fetcher(Arc::new(Handle { shared })))
@@ -337,6 +412,25 @@ impl Fetcher {
 
     pub fn store(&self) -> &Store {
         &self.0.shared.store
+    }
+
+    /// This fetcher reads `volume` before the Hub and fills it. Set once: a later volume is
+    /// ignored.
+    pub fn with_volume(self, volume: Volume) -> Fetcher {
+        let shared = &self.0.shared;
+        let mut tender = shared.tender.lock().unwrap();
+        if tender.is_none() && shared.volume.get().is_none() {
+            let me = Arc::clone(shared);
+            let spawned = std::thread::Builder::new()
+                .name("tensorfs-volume".into())
+                .spawn(move || me.tend());
+            if let Ok(thread) = spawned {
+                let _ = shared.volume.set(volume);
+                *tender = Some(thread);
+            }
+        }
+        drop(tender);
+        self
     }
 
     /// Interest in `objects` of `origin`, and in its structure, at `at`. Never blocks on the
@@ -361,7 +455,7 @@ impl Fetcher {
                     objects: HashMap::new(),
                     holds: vec![],
                     fetched: 0,
-                    cached: 0,
+                    volume: 0,
                 },
             );
             let source = state.origins.entry(origin.clone()).or_default();
@@ -491,13 +585,13 @@ impl Ticket {
             })
     }
 
-    /// Bytes of this ticket's objects that landed from the origin and from the repo cache.
-    pub(crate) fn landed(&self) -> (u64, u64) {
+    /// Bytes of this ticket's objects that landed from the Hub and from the volume.
+    pub fn landed(&self) -> (u64, u64) {
         let state = self.fetcher.0.shared.state.lock().unwrap();
         state
             .tickets
             .get(&self.id)
-            .map_or((0, 0), |t| (t.fetched, t.cached))
+            .map_or((0, 0), |t| (t.fetched, t.volume))
     }
 
     fn objects(&self) -> Vec<ObjectRef> {
@@ -566,6 +660,11 @@ impl Shared {
                 interest.holds.push(hold);
             }
             let origin = interest.origin.clone();
+            // The volume first, when there is one.
+            let first = match self.volume.get() {
+                Some(_) => Via::Volume,
+                None => Via::Hub,
+            };
             for (object, present) in objects.iter().zip(present) {
                 let wanted = interest
                     .objects
@@ -583,6 +682,8 @@ impl Shared {
                     .entry(object.sha256.clone())
                     .or_insert_with(|| Entry {
                         object: object.clone(),
+                        via: first,
+                        replace: false,
                         seq,
                         cell: Cell::new(key),
                         interest: HashMap::new(),
@@ -601,6 +702,7 @@ impl Shared {
                 if entry.phase == Phase::Refused {
                     entry.phase = Phase::Queued;
                     entry.cell = Cell::new(key);
+                    entry.via = first;
                 }
                 entry
                     .cell
@@ -890,6 +992,11 @@ impl Shared {
                     source.supply = None;
                 }
             }
+            if interest.fetched + interest.volume > 0 {
+                let what = format!("{} {}", interest.origin.refspec, interest.origin.lane);
+                let bytes = format!("hub {} B volume {} B", interest.fetched, interest.volume);
+                transport::decisions::record(&self.store, "fetched", &what, &bytes);
+            }
             interest.holds
         };
         for hold in holds {
@@ -899,10 +1006,18 @@ impl Shared {
         self.pulse.beat();
     }
 
-    /// The most urgent queued entry whose origin can supply it.
+    /// The most urgent queued entry the Hub fetches (`via`) whose origin can supply it: its
+    /// closure is the access check, for the volume too.
     fn best<'s>(&self, state: &'s State) -> Option<&'s (u64, u64, String)> {
+        self.next(state, Via::Hub)
+    }
+
+    fn next<'s>(&self, state: &'s State, via: Via) -> Option<&'s (u64, u64, String)> {
         let supplied = |o: &Origin| state.origins.get(o).is_some_and(|s| s.supply.is_some());
-        (state.queue.iter()).find(|(_, _, sha256)| state.entries[sha256].origins.iter().any(supplied))
+        (state.queue.iter()).find(|(_, _, sha256)| {
+            let entry = &state.entries[sha256];
+            state.tier.via(entry) == via && entry.origins.iter().any(supplied)
+        })
     }
 
     /// The downloader, while anything is queued, until the fetcher ends.
@@ -1022,6 +1137,20 @@ impl Shared {
         Ok(())
     }
 
+    /// `object`'s grant, admitted against the disk; `None` when it is already here.
+    fn grant(&self, object: &ObjectRef, manifest: bool, cell: &Cell) -> Result<Option<DeliveryGrant>> {
+        self.admit(object, cell)?;
+        let one = std::slice::from_ref(object);
+        let (plan, _) = match manifest {
+            true => FetchPlan::of(&self.store, "fetch", object, one)?,
+            false => FetchPlan::of_objects(&self.store, "fetch", one)?,
+        };
+        match plan.wanted.is_empty() {
+            true => Ok(None),
+            false => DeliveryGrant::mint(&plan, object).map(Some),
+        }
+    }
+
     /// The manifests of every origin a live ticket names: GC keeps their present objects.
     fn protected(&self) -> Vec<String> {
         let state = self.state.lock().unwrap();
@@ -1059,20 +1188,7 @@ impl<'a> Feed<'a> for Shared {
                 self.landed(&object, &cell, None);
                 continue;
             }
-            let manifest = (supply.origin.manifest == object).then_some(&object);
-            let granted = self.admit(&object, &cell).and_then(|()| {
-                let (plan, _) = match manifest {
-                    Some(manifest) => {
-                        FetchPlan::of(&self.store, "fetch", manifest, std::slice::from_ref(manifest))?
-                    }
-                    None => FetchPlan::of_objects(&self.store, "fetch", std::slice::from_ref(&object))?,
-                };
-                match plan.wanted.is_empty() {
-                    true => Ok(None),
-                    false => DeliveryGrant::mint(&plan, &object).map(Some),
-                }
-            });
-            match granted {
+            match self.grant(&object, supply.origin.manifest == object, &cell) {
                 Ok(Some(grant)) => {
                     let supply: Arc<dyn Supply + 'a> = supply;
                     return Ok(Some(Opening {
@@ -1141,11 +1257,12 @@ impl Shared {
                         if let Some(interest) = state.tickets.get_mut(id) {
                             match door {
                                 Some(ObjectSource::Origin) => interest.fetched += object.length,
-                                Some(ObjectSource::Cache) => interest.cached += object.length,
+                                Some(ObjectSource::Volume) => interest.volume += object.length,
                                 None => {}
                             }
                         }
                     }
+                    self.behind(state, &entry, door);
                 }
             }
             (state.origins.iter())
@@ -1158,6 +1275,215 @@ impl Shared {
         for origin in origins {
             self.advance(&origin);
         }
+    }
+}
+
+/// The volume tier: reads before the Hub, write-backs and touches at Behind, each on a thread
+/// of its own outside the Store's pools, and the stall rule over them.
+impl Shared {
+    /// Until the fetcher ends: abandon stalled operations, then start what may start.
+    fn tend(self: Arc<Self>) {
+        let mut state = self.state.lock().unwrap();
+        while !self.stop.is_cancelled() {
+            if self.volume.get().is_some() {
+                self.abandon_stalled(&mut state);
+                if state.tier.stuck == 0 {
+                    self.start_reads(&mut state);
+                    self.start_writes(&mut state);
+                }
+            }
+            state = self.changed.wait_timeout(state, POLL).unwrap().0;
+        }
+    }
+
+    /// The transport's stall rule: silent beyond the floor and beyond `STALL_FACTOR` times the
+    /// worst gap a volume operation has shown. A stalled read's object goes to the Hub, and
+    /// nothing new starts on the volume until every stalled operation returns.
+    fn abandon_stalled(&self, state: &mut State) {
+        let worst = Duration::from_nanos(self.worst.load(Ordering::Acquire));
+        let patience = worst.mul_f64(STALL_FACTOR).max(self.sample * transport::STILL_SAMPLES);
+        let stalled: Vec<u64> = (state.tier.running.iter())
+            .filter(|(_, r)| !r.abandoned && r.op.silent() > patience)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in &stalled {
+            let running = state.tier.running.get_mut(id).unwrap();
+            running.abandoned = true;
+            running.op.abandon();
+            let read = running.read.clone();
+            if state.tier.stuck == 0 {
+                let silent = format!("silent past {patience:?}: objects come from the Hub until it answers");
+                self.note(&silent);
+            }
+            state.tier.stuck += 1;
+            if let Some((sha256, cell)) = read {
+                let open = |e: &&mut Entry| Arc::ptr_eq(&e.cell, &cell) && e.phase == Phase::Open;
+                if let Some(entry) = state.entries.get_mut(&sha256).filter(open) {
+                    entry.via = Via::Hub;
+                    entry.phase = Phase::Queued;
+                    entry.cell = Cell::new(cell.key());
+                    state.unreserve(&sha256);
+                    state.requeue(&sha256);
+                }
+            }
+        }
+        if !stalled.is_empty() {
+            self.changed.notify_all();
+            self.pulse.beat();
+        }
+    }
+
+    fn begin(&self, state: &mut State, read: Option<(String, Arc<Cell>)>) -> (u64, Arc<Op>) {
+        let op = Arc::new(Op::new(Arc::clone(&self.worst)));
+        state.tier.next += 1;
+        let id = state.tier.next;
+        let running = Running { op: Arc::clone(&op), read, abandoned: false };
+        state.tier.running.insert(id, running);
+        (id, op)
+    }
+
+    /// Operation `id` returned: whether it had been abandoned.
+    fn finish(&self, id: u64) -> bool {
+        let mut state = self.state.lock().unwrap();
+        let abandoned = state.tier.running.remove(&id).is_some_and(|r| r.abandoned);
+        if abandoned {
+            state.tier.stuck = state.tier.stuck.saturating_sub(1);
+            if state.tier.stuck == 0 {
+                self.note("answers again");
+            }
+        }
+        drop(state);
+        self.changed.notify_all();
+        abandoned
+    }
+
+    fn start_reads(&self, state: &mut State) {
+        while state.tier.running(true) < READS {
+            let Some((_, _, sha256)) = self.next(state, Via::Volume).cloned() else {
+                return;
+            };
+            let entry = state.entries.get_mut(&sha256).unwrap();
+            entry.phase = Phase::Open;
+            let (object, cell) = (entry.object.clone(), Arc::clone(&entry.cell));
+            let manifest = entry.origins.iter().any(|o| o.manifest == object);
+            state.requeue(&sha256);
+            let (id, op) = self.begin(state, Some((sha256.clone(), Arc::clone(&cell))));
+            let me = self.me.upgrade().expect("a tending fetcher lives");
+            let spawned = std::thread::Builder::new()
+                .name("tensorfs-volume-io".into())
+                .spawn(move || me.read(id, &op, object, &cell, manifest));
+            if spawned.is_err() {
+                state.tier.running.remove(&id);
+                let entry = state.entries.get_mut(&sha256).unwrap();
+                (entry.via, entry.phase) = (Via::Hub, Phase::Queued);
+                state.requeue(&sha256);
+                return;
+            }
+        }
+    }
+
+    /// Touches and write-backs, while nothing more urgent than Behind waits.
+    fn start_writes(&self, state: &mut State) {
+        let urgent = (state.entries.values()).any(|e| e.phase != Phase::Refused && e.cell.key() < BEHIND);
+        while !urgent && state.tier.running(false) < WRITES {
+            let Some(((_, sha256), back)) = state.tier.behind.pop_first() else {
+                return;
+            };
+            let (id, op) = self.begin(state, None);
+            let me = self.me.upgrade().expect("a tending fetcher lives");
+            let spawned = std::thread::Builder::new()
+                .name("tensorfs-volume-io".into())
+                .spawn(move || me.write(id, &op, &sha256, back));
+            if spawned.is_err() {
+                state.tier.running.remove(&id);
+                return;
+            }
+        }
+    }
+
+    /// Read `object` off the volume into the Store; a miss or wrong bytes go to the Hub.
+    fn read(&self, id: u64, op: &Op, object: ObjectRef, cell: &Arc<Cell>, manifest: bool) {
+        let volume = self.volume.get().unwrap();
+        let bytes = match self.present(&object) {
+            true => Some(vec![]),
+            false => volume.read(&object, op),
+        };
+        if self.finish(id) || cell.gone() {
+            return;
+        }
+        let landed = bytes.map(|bytes| {
+            self.grant(&object, manifest, cell).and_then(|grant| match grant {
+                None => Ok(None),
+                Some(grant) => {
+                    let _gate = self.gate.read().unwrap();
+                    grant.admit(&self.store, &mut bytes.as_slice()).map(|_| Some(ObjectSource::Volume))
+                }
+            })
+        });
+        match landed {
+            Some(Ok(door)) => self.landed(&object, cell, door),
+            Some(Err(refusal)) if !matches!(refusal.code, Code::OBJECT_ID_MISMATCH | Code::LENGTH_MISMATCH) => {
+                self.ended(&object, cell, Err(refusal))
+            }
+            wrong => self.to_hub(&object, cell, wrong.is_some()),
+        }
+    }
+
+    /// The volume does not hold `object` whole: the Hub fetches it, and with `replace` its copy
+    /// is written over the volume's.
+    fn to_hub(&self, object: &ObjectRef, cell: &Arc<Cell>, replace: bool) {
+        let mut state = self.state.lock().unwrap();
+        let entry = (state.entries.get_mut(&object.sha256))
+            .filter(|e| Arc::ptr_eq(&e.cell, cell) && e.phase == Phase::Open);
+        if let Some(entry) = entry {
+            (entry.via, entry.phase) = (Via::Hub, Phase::Queued);
+            entry.replace |= replace;
+            state.unreserve(&object.sha256);
+            state.requeue(&object.sha256);
+        }
+        drop(state);
+        self.changed.notify_all();
+        self.pulse.beat();
+    }
+
+    fn write(&self, id: u64, op: &Op, sha256: &str, back: Back) {
+        let volume = self.volume.get().unwrap();
+        match back {
+            Back::Touch => volume.touch(sha256, op),
+            Back::Write { object, manifest, replace } => {
+                if volume.write(&self.store, &object, manifest, replace, op) == Wrote::Failed {
+                    self.note(&format!("{} was not written", object.id()));
+                }
+            }
+        }
+        self.finish(id);
+    }
+
+    /// A line in the Store's transport log about the volume.
+    fn note(&self, detail: &str) {
+        let root = self.volume.get().map(|v| v.root().display().to_string()).unwrap_or_default();
+        transport::decisions::record(&self.store, "volume", &root, detail);
+    }
+
+    /// What a landed entry leaves for the volume: a touch of what it read, or a write-back of
+    /// what a public origin brought from the Hub.
+    fn behind(&self, state: &mut State, entry: &Entry, door: Option<ObjectSource>) {
+        if self.volume.get().is_none() {
+            return;
+        }
+        let object = &entry.object;
+        let public = |o: &Origin| state.origins.get(o).and_then(|s| s.closure.as_ref()).is_some_and(|c| c.public);
+        let back = match door {
+            Some(ObjectSource::Volume) => Back::Touch,
+            Some(ObjectSource::Origin) if entry.origins.iter().any(public) => Back::Write {
+                object: object.clone(),
+                manifest: entry.origins.iter().any(|o| o.manifest == *object),
+                replace: entry.replace,
+            },
+            _ => return,
+        };
+        let key = self.shuffle.hash_one(&object.sha256);
+        state.tier.behind.insert((key, object.sha256.clone()), back);
     }
 }
 
@@ -1213,7 +1539,8 @@ impl OriginSupply {
             .filter(|e| open && e.phase == Phase::Open)
             .map(|e| &e.object.sha256);
         for sha256 in opened.chain(state.queue.iter().map(|(_, _, sha256)| sha256)) {
-            if state.entries[sha256].origins.first() != Some(&self.origin) {
+            let entry = &state.entries[sha256];
+            if entry.origins.first() != Some(&self.origin) || state.tier.via(entry) != Via::Hub {
                 continue;
             }
             match leases.get(sha256).is_some_and(|lease| !lease.spent()) {

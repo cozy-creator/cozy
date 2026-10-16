@@ -20,7 +20,6 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{fchown, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -309,10 +308,6 @@ pub trait Progress: Send + Sync {
 pub struct Store {
     root: PathBuf,
     progress: Option<std::sync::Arc<dyn Progress>>,
-    /// The optional mounted immutable object cache THIS Store is bound to, read off
-    /// [`REPO_CACHE_BINDING`] when the handle was made. See that constant for why the
-    /// binding is a property of the Store and not an argument of every operation.
-    cache: Option<crate::repo_cache::RepoObjectCache>,
     /// The optional disk budget THIS Store is held to, read off [`DISK_BUDGET`] when the
     /// handle was made. `None` is the default and means every operation behaves exactly as
     /// it did before tfs-064. See that constant.
@@ -332,7 +327,6 @@ impl std::fmt::Debug for Store {
         f.debug_struct("Store")
             .field("root", &self.root)
             .field("observed", &self.progress.is_some())
-            .field("repo_cache", &self.cache.as_ref().map(|c| c.root()))
             .field("disk", &self.disk)
             .field("owned", &self.owner.is_some())
             .finish()
@@ -546,7 +540,6 @@ impl Store {
         Ok(Store {
             root: root.to_path_buf(),
             progress: None,
-            cache: read_repo_cache_binding(root),
             budget: read_disk_budget(root),
             trust: crate::catalog::Trust::of(root),
             disk: crate::disk::filesystem(root),
@@ -650,81 +643,13 @@ impl Store {
         &self.trust
     }
 
-    /// The mounted immutable object cache this Store is bound to, or `None`.
-    ///
-    /// Every production consumer of the cache reads it from HERE and no operation takes one
-    /// as an argument. See [`REPO_CACHE_BINDING`].
-    pub fn repo_cache(&self) -> Option<&crate::repo_cache::RepoObjectCache> {
-        self.cache.as_ref()
-    }
-
-    /// Record (`Some`) or clear (`None`) this Store's cache binding, and return the handle
-    /// that carries the result. DECLARATIVE on purpose: a setup that says nothing about the
-    /// cache is a setup that says the Store has none, so a pod whose volume went away stops
-    /// mirroring instead of quietly keeping a stale binding.
-    ///
-    /// **This touches the cache path exactly zero times.** The path is checked as a STRING
-    /// -- absolute, not the Store and not inside it -- and never stat'd, because a stat on a
-    /// hard NFS mount that has stopped answering blocks forever and setup would then hang on
-    /// the thing that is only allowed to cost latency. Whether the mount is really there is
-    /// answered per object, by the cache itself, as `unavailable`.
-    pub fn bind_repo_cache(self, cache: Option<&Path>) -> Result<Store> {
-        let path = self.root.join(REPO_CACHE_BINDING);
-        let Some(cache) = cache else {
-            match fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(io("clear repo cache binding", error)),
-            }
-            fsync_dir(&self.root)?;
-            return Ok(Store {
-                cache: None,
-                ..self
-            });
-        };
-        validate_repo_cache_root(cache, &self.root)?;
-        let mut bytes = cache.as_os_str().as_encoded_bytes().to_vec();
-        bytes.push(b'\n');
-        let temp = self.root.join(format!(
-            "tmp/repo-cache.{}.{}",
-            std::process::id(),
-            crate::meta::now_nanos_unique()
-        ));
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .mode(0o644)
-            .custom_flags(O_NOFOLLOW)
-            .open(&temp)
-            .map_err(|error| io("open repo cache binding temp", error))?;
-        let written = file
-            .write_all(&bytes)
-            .and_then(|()| file.sync_all())
-            .map_err(|error| io("write repo cache binding", error));
-        drop(file);
-        if let Err(refusal) = written {
-            let _ = fs::remove_file(&temp);
-            return Err(refusal);
-        }
-        if let Err(error) = fs::rename(&temp, &path) {
-            let _ = fs::remove_file(&temp);
-            return Err(io("install repo cache binding", error));
-        }
-        fsync_dir(&self.root)?;
-        Ok(Store {
-            cache: Some(crate::repo_cache::RepoObjectCache::new(cache)),
-            ..self
-        })
-    }
-
     /// The disk budget this Store is held to, or `None`. See [`DISK_BUDGET`].
     pub fn disk_budget(&self) -> Option<u64> {
         self.budget
     }
 
     /// Record (`Some`) or clear (`None`) this Store's disk budget, and return the handle
-    /// that carries the result. DECLARATIVE, exactly like the cache binding: a setup that
-    /// says nothing about the budget is a setup that says the Store has none, so a pod
+    /// that carries the result. DECLARATIVE: a setup that says nothing about the budget is a setup that says the Store has none, so a pod
     /// re-provisioned without one stops enforcing instead of quietly keeping a stale number.
     pub fn bind_disk_budget(self, budget: Option<u64>) -> Result<Store> {
         let path = self.root.join(DISK_BUDGET);
@@ -1904,61 +1829,8 @@ fn validate_store_root(root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Where a Store records the cache it is bound to: one absolute path, one line, LOCAL.
-///
-/// **The binding is a property of the Store because the cache is a property of the
-/// deployment, not of any request.** The alternative -- a path threaded through every
-/// caller -- makes a mount point part of a protocol, of a Python signature, and of a spawn
-/// class's environment allowlist, all so that a layer with no other use for the fact can
-/// hand it back to the layer that already had it. Recording it once at setup means
-/// `prepare_model_source`, `fetch` and a restore all find the same cache without anyone
-/// passing one, and the pod's Runtime child never has to learn where the mount is.
-///
-/// **It lives on local disk beside the Store and never in the catalog.** `tensorfs.sqlite`
-/// is a rebuildable projection of repository/manifest/blob files (`Catalog::open` says as
-/// much, and refuses a Store whose catalog is absent as "recovery-only until `tfs store
-/// rebuild`"). A cache binding is not derivable from any of those files, so a rebuild would
-/// drop it silently and mirroring would stop with nothing to see. It is also not on the
-/// cache itself, which under #612 holds immutable Manifest/blob paths and nothing else.
-///
-/// **Reading it can only cost, never refuse.** An absent, unreadable or malformed file is
-/// no binding at all -- not an error -- because a Store that will not open is an
-/// availability failure and cache state is forbidden to cause one. A path that is not a
-/// path refuses at BIND time, where it is a caller's mistake rather than weather.
-pub const REPO_CACHE_BINDING: &str = "repo-cache";
-
-/// The longest binding this reads. `PATH_MAX` with room for the newline; a longer file is
-/// not a mount point.
-const REPO_CACHE_BINDING_MAX: u64 = 4097;
-
-fn validate_repo_cache_root(cache: &Path, store: &Path) -> Result<()> {
-    if !cache.is_absolute() {
-        return refuse(
-            Code::KEY_GRAMMAR,
-            format!("repo cache root {} is not absolute", cache.display()),
-        );
-    }
-    if cache.as_os_str().as_encoded_bytes().len() as u64 >= REPO_CACHE_BINDING_MAX {
-        return refuse(
-            Code::SIZE_CAP,
-            "repo cache root is longer than a filesystem path",
-        );
-    }
-    if cache == store || cache.starts_with(store) || store.starts_with(cache) {
-        return refuse(
-            Code::STORE_ERA,
-            format!(
-                "repo cache root {} overlaps the Store at {}; the cache is never the Store",
-                cache.display(),
-                store.display()
-            ),
-        );
-    }
-    Ok(())
-}
-
 /// Where a Store records the disk budget it is held to: one decimal byte count, one line,
-/// LOCAL, beside the cache binding and for the same reasons (see [`REPO_CACHE_BINDING`]).
+/// LOCAL, never in the catalog, which a rebuild derives from the Store's files alone.
 ///
 /// **The presence of this record is the whole opt-in.** The owner's requirement was that
 /// reclamation must not be default-on -- *"users would be confused if files start
@@ -1978,8 +1850,7 @@ pub const DISK_BUDGET: &str = "disk-budget";
 /// longer file is not a number.
 const DISK_BUDGET_MAX: u64 = 32;
 
-/// Read the budget, or nothing. Like the cache binding, reading can only cost, never
-/// refuse: an absent, unreadable or malformed record is no budget at all, because a Store
+/// Read the budget, or nothing. Reading can only cost, never refuse: an absent, unreadable or malformed record is no budget at all, because a Store
 /// that will not open is an availability failure and a policy record may not cause one. A
 /// number that is not a number refuses at BIND time, where it is a caller's mistake.
 fn read_disk_budget(root: &Path) -> Option<u64> {
@@ -1994,32 +1865,6 @@ fn read_disk_budget(root: &Path) -> Option<u64> {
     let mut bytes = Vec::new();
     file.take(DISK_BUDGET_MAX).read_to_end(&mut bytes).ok()?;
     std::str::from_utf8(&bytes).ok()?.trim().parse::<u64>().ok()
-}
-
-/// Read the binding, or nothing. Weather, never authority -- see [`REPO_CACHE_BINDING`].
-fn read_repo_cache_binding(root: &Path) -> Option<crate::repo_cache::RepoObjectCache> {
-    let path = root.join(REPO_CACHE_BINDING);
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(O_NOFOLLOW)
-        .open(&path)
-        .ok()?;
-    if !file.metadata().ok()?.is_file() {
-        return None;
-    }
-    let mut bytes = Vec::new();
-    file.take(REPO_CACHE_BINDING_MAX)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    while bytes.last().is_some_and(|b| *b == b'\n' || *b == b'\r') {
-        bytes.pop();
-    }
-    if bytes.is_empty() || bytes.contains(&0) {
-        return None;
-    }
-    let cache = PathBuf::from(std::ffi::OsString::from_vec(bytes));
-    validate_repo_cache_root(&cache, root).ok()?;
-    Some(crate::repo_cache::RepoObjectCache::new(cache))
 }
 
 /// Serializes Store creation on one root across threads and processes. A lock on the root
@@ -2042,7 +1887,6 @@ fn open_validated(root: &Path) -> Result<Store> {
     let store = Store {
         root: root.to_path_buf(),
         progress: None,
-        cache: read_repo_cache_binding(root),
         budget: read_disk_budget(root),
         trust: crate::catalog::Trust::of(root),
         disk: crate::disk::filesystem(root),

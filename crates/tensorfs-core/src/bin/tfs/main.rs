@@ -6,11 +6,9 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use tensorfs_core::canon;
-use tensorfs_core::durability;
 use tensorfs_core::err::Refusal;
 use tensorfs_core::header::Header;
-use tensorfs_core::ids::{Doc, ObjectRef};
-use tensorfs_core::repo_cache::{CacheKind, RepoObjectCache};
+use tensorfs_core::ids::ObjectRef;
 use tensorfs_core::store::{Fault, Store, FAULT_STAGES};
 
 type TfsResult<T> = tensorfs_core::err::Result<T>;
@@ -33,7 +31,7 @@ const USAGE: &str = "usage: tfs <verb> ...
   manifest get|walk <root> <sha256> ...
   repo inspect <repo.json> --rows <jsonl>
   repo apply <current.json|-> <mutation.json> --out <file> --rows <jsonl> [--manifest <m> --header <h> --inventory <i>]
-  store init <root> [--repo-cache <cache> | --no-repo-cache]
+  store init <root> [--disk-budget <bytes> | --no-disk-budget]
   store rebuild <census> --rows <jsonl>
   gc headers <census> --out <jsonl>
   gc plan <census> --holds <jsonl> --out <jsonl>
@@ -41,23 +39,22 @@ const USAGE: &str = "usage: tfs <verb> ...
   checkpoint write <root> [--plain] [--blocks <n>] [--no-configs]
   fetch <root> <ref> --hub <base>
   ensure <root> <ref> --hub <base>
-  repo-cache restore|resume|chain ...
   ingest bank <dialect> <converter> ..., ingest source-members|source-plan|plan|run|install|reap ...";
 
 /// Flags that never take a value.
 const SWITCHES: &[&str] = &[
     "allow-local", "dry-run", "keys", "no-configs",
-    "no-disk-budget", "no-journal", "no-netns", "no-repo-cache", "plain", "progress",
+    "no-disk-budget", "no-netns", "plain", "progress",
 ];
 /// Flags that take the next token as their value; given last, or before another flag, they
 /// are present without one.
 const VALUED: &[&str] = &[
-    "allow-hosts", "blocks", "ca-file", "carrier", "checkpoint-bytes", "closure",
+    "allow-hosts", "blocks", "ca-file", "carrier", "closure",
     "config", "credential-file", "disk-budget", "expect", "expect-length", "fault",
     "header", "holds", "hub", "inventory", "isolation-tier", "keep", "lane",
     "manifest", "max-download-bytes", "max-download-objects", "max-redirects", "member",
-    "observed", "order", "out", "part-mib", "plan", "progress-bytes", "range", "ready", "refs",
-    "registry", "repo-cache", "rlimit-as-mb", "rlimit-fsize-mb", "rows", "sample-seconds",
+    "observed", "order", "out", "part-mib", "progress-bytes", "range", "ready", "refs",
+    "registry", "rlimit-as-mb", "rlimit-fsize-mb", "rows", "sample-seconds",
     "scale", "session", "slow-ms", "source", "source-name", "source-plan", "source-profile",
     "spec-variant", "step", "streams", "target", "tenant", "timeout",
 ];
@@ -108,15 +105,6 @@ fn main() -> ExitCode {
         ["ensure", r, refspec] => ensure::cmd_ensure(Path::new(r), refspec, &flags),
         ["store", "init", r] => cmd_store_init(Path::new(r), &flags),
         ["store", "rebuild", r] => repo::cmd_rebuild(Path::new(r), &flags),
-        ["repo-cache", "restore", store, object, length] => {
-            cmd_repo_cache_restore(Path::new(store), object, length, &flags)
-        }
-        ["repo-cache", "resume", store, object, length] => {
-            cmd_repo_cache_resume(Path::new(store), object, length, &flags)
-        }
-        ["repo-cache", "chain", cache, object, length] => {
-            cmd_repo_cache_chain(Path::new(cache), object, length)
-        }
         ["put", r, f] => cmd_put(Path::new(r), Path::new(f), &flags),
         ["get", r, h] => cmd_get(Path::new(r), h, &flags),
         ["reap", r] => cmd_reap(Path::new(r)),
@@ -144,7 +132,7 @@ fn main() -> ExitCode {
         },
         ["ingest", "plan", t] => ingest::cmd_plan(t, &flags),
         ["ingest", "run", r] => match flag(&flags, "source-plan") {
-            Some(path) => ingest::cmd_run_source(Path::new(r), Path::new(path), &flags),
+            Some(path) => ingest::cmd_run_source(Path::new(r), Path::new(path)),
             None => {
                 eprintln!("ingest run requires a target or --source-plan <json>");
                 ExitCode::from(2)
@@ -181,166 +169,6 @@ fn cmd_version() -> ExitCode {
         tensorfs_core::sha256::hex_digest(&bytes)
     );
     ExitCode::SUCCESS
-}
-
-fn cache_args(kind: &str, object: &str, length: &str) -> TfsResult<(CacheKind, ObjectRef)> {
-    let kind = CacheKind::parse(kind).ok_or_else(|| Refusal {
-        code: tensorfs_core::err::Code::WRONG_TYPE,
-        detail: format!("repo cache kind {kind:?} is not blob or manifest"),
-    })?;
-    let sha256 = tensorfs_core::ids::hex64("repo cache object", object)?;
-    let length = length.parse::<u64>().map_err(|_| Refusal {
-        code: tensorfs_core::err::Code::NUMBER_RANGE,
-        detail: format!("repo cache length {length:?} is not an unsigned integer"),
-    })?;
-    Ok((kind, ObjectRef { sha256, length }))
-}
-
-/// `tfs repo-cache restore` — bring one whole checkpoint back off the cache.
-///
-/// This is the ordinary answer to "the pod that converted this is gone." The Manifest is
-/// admitted, its closure walked, and every object the local Store does not already hold is
-/// admitted from the cache through the SAME door a pull uses. There is no adoption on trust
-/// and no second admission path: a cached object whose bytes disagree with its id is removed
-/// and reported, and the completion proof at the end is the Store's own local walk.
-fn cmd_repo_cache_restore(store: &Path, object: &str, length: &str, flags: &Flags) -> ExitCode {
-    let (_, manifest) = ok!(cache_args("manifest", object, length));
-    let store = ok!(Store::open(store));
-    let session = flag(flags, "session").unwrap_or("restore");
-    let report = ok!(durability::restore_checkpoint(&store, session, &manifest));
-    print_restore(&report)
-}
-
-/// `tfs repo-cache resume` — bring back everything a conversion had already made durable,
-/// and the map of what those bytes MEAN.
-///
-/// The chain head names links that live on the cache; each is read at its exact digest, and
-/// the chain is DISCARDED WHOLE unless every link was written under the plan `--plan` names
-/// — the plan a resuming run re-derives from the source headers alone, for zero tensor
-/// bytes. A discarded chain restores nothing and succeeds: the run converts afresh.
-///
-/// The objects come back exactly as a checkpoint's closure does. The conversion journal the
-/// newest link points at is installed beside them under `--session`, so the next
-/// `tfs ingest run` reuses the ops it describes instead of re-converting them — after
-/// `transaction::convert` re-checks every journalled part against the Store's own admission
-/// law, which is why a journal restored beside objects that did not survive costs a
-/// re-conversion and never a wrong artifact. `--no-journal` restores the bytes alone.
-fn cmd_repo_cache_resume(store: &Path, object: &str, length: &str, flags: &Flags) -> ExitCode {
-    let Some(plan) = flag(flags, "plan") else {
-        eprintln!(
-            "REFUSED MISSING_FIELD: resume requires --plan <sha256:...>, the digest of the plan \
-             re-derived from these sources; without it a chain cannot be shown to be this \
-             conversion's"
-        );
-        return ExitCode::FAILURE;
-    };
-    let (_, head) = ok!(cache_args("blob", object, length));
-    let store = ok!(Store::open(store));
-    let session = flag(flags, "session").unwrap_or("resume");
-    let cache = match store.repo_cache() {
-        Some(cache) => cache.clone(),
-        None => {
-            eprintln!(
-                "REFUSED MISSING_FIELD: {} is bound to no repo cache; bind one with \
-                 `tfs store ensure --repo-cache <root>`",
-                store.root().display()
-            );
-            return ExitCode::FAILURE;
-        }
-    };
-    let chain = ok!(durability::chain(&cache, &head));
-    let set = match durability::fold(&chain, plan) {
-        Ok(set) => set,
-        Err(error) if error.code == tensorfs_core::err::Code::IO_FAILED => return bail(error),
-        Err(error) => {
-            println!(
-                "chain        DISCARDED {}: {} — nothing restored; the conversion starts a new chain",
-                error.code.as_str(),
-                error.detail
-            );
-            return ExitCode::SUCCESS;
-        }
-    };
-    println!(
-        "chain        {} link(s) over operation {} — {} B declared durable",
-        set.links, set.operation, set.bytes
-    );
-    let report = ok!(durability::restore_objects(&store, session, &set.blobs, &set.manifests));
-    if !flag_on(flags, "no-journal") {
-        match set.progress.last() {
-            Some(snapshot) => {
-                let digest = plan.trim_start_matches("sha256:");
-                let tenant = flag(flags, "tenant").unwrap_or("dev");
-                match durability::restore_conversion(&store, session, tenant, digest, snapshot) {
-                    Ok(()) => println!(
-                        "conversion   {} installed under session {session} — the ops it names \
-                         are re-checked, never trusted",
-                        snapshot.id()
-                    ),
-                    // The bytes are back either way; without the map they are re-converted,
-                    // which costs CPU and never correctness.
-                    Err(error) => println!(
-                        "conversion   REFUSED {}: {} — the objects stand and the conversion \
-                         re-derives what they mean",
-                        error.code.as_str(),
-                        error.detail
-                    ),
-                }
-            }
-            None => println!("conversion   no journal snapshot is durable; every op re-converts"),
-        }
-    }
-    print_restore(&report)
-}
-
-/// `tfs repo-cache chain` — the links a head names, root first, reading nothing but the
-/// cache. It is how an operator sees whether a run's watermark is ADVANCING, which is the
-/// only honest question to ask about a long conversion: not how many minutes it has taken,
-/// but whether more of it is durable than the last time anyone looked.
-fn cmd_repo_cache_chain(cache: &Path, object: &str, length: &str) -> ExitCode {
-    let (_, head) = ok!(cache_args("blob", object, length));
-    let cache = RepoObjectCache::new(cache);
-    let chain = ok!(durability::chain(&cache, &head));
-    for link in &chain {
-        let object = link.object_ref();
-        println!(
-            "{:<6} {} {} B durable, {} blob(s), {} manifest(s), plan {}, length {}",
-            link.index,
-            object.id(),
-            link.bytes,
-            link.blobs.len(),
-            link.manifests.len(),
-            link.plan,
-            object.length
-        );
-    }
-    println!("operation    {}", chain[0].operation);
-    ExitCode::SUCCESS
-}
-
-fn print_restore(report: &tensorfs_core::durability::Restored) -> ExitCode {
-    println!(
-        "held         {} object(s), {} B — NOT restored",
-        report.held, report.bytes_held
-    );
-    println!(
-        "restored     {} object(s), {} B — from the cache, verified into this Store",
-        report.admitted, report.bytes_admitted
-    );
-    println!(
-        "absent       {} object(s) the cache could not answer for, {} corrupt",
-        report.missing, report.corrupt
-    );
-    if report.complete {
-        println!("complete     every declared object is resident and verified");
-        ExitCode::SUCCESS
-    } else {
-        eprintln!(
-            "REFUSED OBJECT_ABSENT: the cache did not hold the whole declared set; what it \
-             held is now local and proved, and the rest has to be produced again"
-        );
-        ExitCode::FAILURE
-    }
 }
 
 // ------------------------------------------------------------------ store CLI
@@ -409,30 +237,8 @@ mod repo;
 mod snap;
 mod watch;
 
-/// `tfs store init|ensure|info <root>` — and, on the two SETUP verbs, the one place a
-/// deployment says where its repo cache is.
-///
-/// `--repo-cache <root>` records the mount ON THE STORE, so every later handle finds it and
-/// no operation is ever handed one. `--no-repo-cache` records that there is none. Neither
-/// flag leaves whatever the Store already carried; the pair exists so that a caller whose
-/// binding must track an environment — the pod supervisor, whose volume is bound per
-/// datacenter — passes exactly one on EVERY boot and can never inherit a mount that has
-/// gone away. A human running `tfs store init ~/.tensorfs` passes neither and gets what
-/// they had.
-///
-/// Neither flag touches the cache path. See `Store::bind_repo_cache`: a stat on a hard NFS
-/// mount that has stopped answering never returns, and boot is not allowed to hang on the
-/// thing that may only cost latency.
+/// `tfs store init <root>`, recording or clearing its disk budget.
 fn cmd_store_init(root: &Path, flags: &Flags) -> ExitCode {
-    let bind = match (flag(flags, "repo-cache"), flag_on(flags, "no-repo-cache")) {
-        (Some(_), true) => {
-            eprintln!("--repo-cache and --no-repo-cache say opposite things; pass one");
-            return ExitCode::from(2);
-        }
-        (Some(path), false) => Some(Some(PathBuf::from(path))),
-        (None, true) => Some(None),
-        (None, false) => None,
-    };
     let budget = match (flag(flags, "disk-budget"), flag_on(flags, "no-disk-budget")) {
         (Some(_), true) => {
             eprintln!("--disk-budget and --no-disk-budget say opposite things; pass one");
@@ -449,25 +255,11 @@ fn cmd_store_init(root: &Path, flags: &Flags) -> ExitCode {
         (None, false) => None,
     };
     let mut s = ok!(Store::init(root));
-    if let Some(cache) = bind {
-        s = ok!(s.bind_repo_cache(cache.as_deref()));
-    }
     if let Some(budget) = budget {
         s = ok!(s.bind_disk_budget(budget));
     }
     println!("root:       {}", s.root().display());
     println!("blobs:      {}", ok!(s.objects()).len());
-    println!(
-        "repo-cache: {}",
-        match s.repo_cache() {
-            Some(cache) => cache.root().display().to_string(),
-            None => "(none)".to_string(),
-        }
-    );
-    // Printed in the same readback shape as repo-cache, and for the same reason: a
-    // supervisor fences the line to prove the tfs it was baked with implements the flag it
-    // just passed, rather than trusting a zero exit (tensorhub pod-supervisor
-    // supervise.go:229-234).
     println!(
         "disk-budget: {}",
         match s.disk_budget() {

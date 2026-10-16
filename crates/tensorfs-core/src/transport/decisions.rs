@@ -19,7 +19,7 @@ pub(super) fn object(object: &ObjectRef) -> String {
     )
 }
 
-pub(super) fn record(store: &Store, kind: &str, subject: &str, detail: &str) {
+pub(crate) fn record(store: &Store, kind: &str, subject: &str, detail: &str) {
     let dir = store.root().join("logs");
     let path = dir.join("transport.log");
     let _ = fs::create_dir_all(&dir);

@@ -37,7 +37,7 @@ from ._ext import (
 # The ordinary Python wheel always includes the store; a Rust build without it is
 # plane-only and serves no Store.
 if TYPE_CHECKING or STORE:
-    from ._ext import DerivedWriter, ReadLease, RepoObjectCache, Store, gc
+    from ._ext import DerivedWriter, ReadLease, Store, gc
 
 
 def parse_header(data: bytes, closure: Closure | None = None) -> Header:
@@ -109,4 +109,4 @@ __all__ = [
     "seed_digests",
 ]
 if STORE:
-    __all__ += ["DerivedWriter", "ReadLease", "RepoObjectCache", "Store", "gc"]
+    __all__ += ["DerivedWriter", "ReadLease", "Store", "gc"]
