@@ -1,0 +1,498 @@
+//! Calcifer's local API: what the CLI sends Calcifer over loopback HTTP, the records it answers,
+//! and the Responses-style events of one run (SSE, and `--json` NDJSON on the CLI).
+//!
+//! Durable events carry a `sequence_number`, per run and monotonic; a reconnect with
+//! `starting_after=N` gets the run's current lifecycle event, each output item changed after N at
+//! its newest revision, and every log line after N. Live events (`run.progress`, `run.waiting`)
+//! carry none and are never replayed, but the latest of each is sent on connect. The terminal
+//! events `run.completed`, `run.failed` and `run.canceled` end the stream.
+use std::{fmt, path::PathBuf};
+
+use serde::{Deserialize, Serialize};
+
+use crate::ids::{Digest, RunId};
+
+/// What a run does on its machine (`RunSpec.kind`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Kind {
+    Call,
+    Warm,
+    Update,
+    Remove,
+}
+
+/// Where a run goes: `local`, a machine's name, `any`, or `new[:sku]`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "String", into = "String")]
+pub enum On {
+    Machine(String),
+    Any,
+    New(Option<String>),
+}
+
+/// `POST /v1/runs`, with an `Idempotency-Key` header: one key names one submission forever.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SubmitRun {
+    pub on: On,
+    /// The Tensorhub origin the run belongs to.
+    pub hub: String,
+    pub kind: Kind,
+    /// What it runs, for people (`org/pkg/fn@release`).
+    pub target: String,
+    /// The machine's `RunSpec`, protobuf-encoded: the spec as it is sent, frozen at submit.
+    #[serde(with = "base64_bytes")]
+    pub spec: Vec<u8>,
+    /// The files `spec.inputs` names, read once at submit.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inputs: Vec<StagedInput>,
+    /// Where outputs land; absent: `~/.cozy/outputs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub out: Option<PathBuf>,
+}
+
+/// A local file a run's spec names as an input.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StagedInput {
+    pub path: PathBuf,
+    pub digest: Digest,
+    pub length: u64,
+}
+
+/// The answer to a submit: 202 when this call recorded the run, 200 (`replay`) when the key had.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Submitted {
+    pub run: Run,
+    pub replay: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Status {
+    /// Not yet accepted by a machine (still in the outbox, or sent and unconfirmed).
+    Queued,
+    InProgress,
+    Completed,
+    Failed,
+    Canceled,
+}
+
+/// One run as Calcifer holds it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Run {
+    pub id: RunId,
+    pub number: u64,
+    pub kind: Kind,
+    pub target: String,
+    pub hub: String,
+    pub machine: Option<String>,
+    pub status: Status,
+    #[serde(default)]
+    pub cancel_requested: bool,
+    /// The machine's own word for the run: `preparing`, `queued`, `running`, ….
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_state: Option<String>,
+    /// Why a run that did not succeed ended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<Reason>,
+    #[serde(default)]
+    pub output: Vec<OutputItem>,
+    pub created_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepted_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settled_at_ms: Option<i64>,
+    /// Live: why a queued run waits, from Calcifer's memory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting: Option<String>,
+    /// Live: the machine's latest progress.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<Progress>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Reason {
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ItemStatus {
+    InProgress,
+    Completed,
+    Incomplete,
+}
+
+/// One output of a run at its newest revision, rewritten in place.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputItem {
+    /// `<number>/<name>`, or `<number>/<name>/<i>` for a list's item `i`.
+    pub id: String,
+    pub name: String,
+    /// A list item's 1-based index; 0 for a single output.
+    pub index: u32,
+    pub rev: u64,
+    pub length: u64,
+    pub media_type: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub label: String,
+    pub status: ItemStatus,
+    /// The final bytes' digest, once done.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<Digest>,
+    /// Where its bytes land on this computer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathBuf>,
+}
+
+/// The machine's progress report, as it last sent it.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Progress {
+    pub stage: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fraction: Option<f64>,
+    #[serde(default)]
+    pub completed: u64,
+    #[serde(default)]
+    pub total: u64,
+    #[serde(default)]
+    pub bytes_done: u64,
+    #[serde(default)]
+    pub bytes_total: u64,
+    #[serde(default)]
+    pub step_ms: f64,
+}
+
+/// One event of a run's stream.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum Event {
+    #[serde(rename = "run.created")]
+    Created { sequence_number: u64, run: Run },
+    #[serde(rename = "run.queued")]
+    Queued { sequence_number: u64, run: Run },
+    #[serde(rename = "run.in_progress")]
+    InProgress { sequence_number: u64, run: Run },
+    #[serde(rename = "run.completed")]
+    Completed { sequence_number: u64, run: Run },
+    #[serde(rename = "run.failed")]
+    Failed { sequence_number: u64, run: Run },
+    #[serde(rename = "run.canceled")]
+    Canceled { sequence_number: u64, run: Run },
+    #[serde(rename = "output_item.added")]
+    OutputAdded {
+        sequence_number: u64,
+        output_index: u32,
+        item: OutputItem,
+    },
+    #[serde(rename = "output_item.delta")]
+    OutputDelta {
+        sequence_number: u64,
+        output_index: u32,
+        item_id: String,
+        rev: u64,
+        length: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        appended_from: Option<u64>,
+    },
+    #[serde(rename = "output_item.done")]
+    OutputDone {
+        sequence_number: u64,
+        output_index: u32,
+        item: OutputItem,
+    },
+    #[serde(rename = "run.log")]
+    Log {
+        sequence_number: u64,
+        at_ms: i64,
+        level: String,
+        text: String,
+    },
+    #[serde(rename = "run.progress")]
+    Progress { progress: Progress },
+    #[serde(rename = "run.waiting")]
+    Waiting { reason: String },
+}
+
+impl Event {
+    /// The lifecycle event that says `run` as it is now; `created` for its first.
+    pub fn lifecycle(sequence_number: u64, run: Run, created: bool) -> Self {
+        match run.status {
+            Status::Queued if created => Event::Created {
+                sequence_number,
+                run,
+            },
+            Status::Queued => Event::Queued {
+                sequence_number,
+                run,
+            },
+            Status::InProgress => Event::InProgress {
+                sequence_number,
+                run,
+            },
+            Status::Completed => Event::Completed {
+                sequence_number,
+                run,
+            },
+            Status::Failed => Event::Failed {
+                sequence_number,
+                run,
+            },
+            Status::Canceled => Event::Canceled {
+                sequence_number,
+                run,
+            },
+        }
+    }
+
+    /// The event's place in its run's durable stream; `None` for a live event.
+    pub fn sequence_number(&self) -> Option<u64> {
+        match self {
+            Event::Created {
+                sequence_number, ..
+            }
+            | Event::Queued {
+                sequence_number, ..
+            }
+            | Event::InProgress {
+                sequence_number, ..
+            }
+            | Event::Completed {
+                sequence_number, ..
+            }
+            | Event::Failed {
+                sequence_number, ..
+            }
+            | Event::Canceled {
+                sequence_number, ..
+            }
+            | Event::OutputAdded {
+                sequence_number, ..
+            }
+            | Event::OutputDelta {
+                sequence_number, ..
+            }
+            | Event::OutputDone {
+                sequence_number, ..
+            }
+            | Event::Log {
+                sequence_number, ..
+            } => Some(*sequence_number),
+            Event::Progress { .. } | Event::Waiting { .. } => None,
+        }
+    }
+
+    /// Whether the run ends here: the stream closes after it.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            Event::Completed { .. } | Event::Failed { .. } | Event::Canceled { .. }
+        )
+    }
+}
+
+/// `GET /v1/runs`, newest first.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RunList {
+    pub runs: Vec<Run>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MachineKind {
+    /// This computer's machine.
+    Local,
+    /// A machine rented through a Hub.
+    Rental,
+    /// Another computer's machine, added by address.
+    Added,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MachineState {
+    /// No address yet: runs to it wait in the outbox.
+    Booting,
+    Ready,
+    Ended,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Machine {
+    pub name: String,
+    pub kind: MachineKind,
+    pub state: MachineState,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub hub: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rental_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+    /// Why it ended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// `GET /v1/machines`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MachineList {
+    pub machines: Vec<Machine>,
+}
+
+/// `POST /v1/machines`: rent one (with an `Idempotency-Key`) or add another computer's.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum NewMachine {
+    Rent {
+        sku: String,
+        hub: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        gpus: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        disk_gb: Option<u32>,
+    },
+    Add {
+        name: String,
+        address: String,
+        /// `sha256:<hex>` of the machine's TLS leaf.
+        fingerprint: Digest,
+    },
+}
+
+/// `POST /v1/down`: Calcifer stops; machines keep running what they accepted.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Down {
+    pub stopping: bool,
+    /// What Calcifer still owes, which the next Calcifer resumes.
+    pub owed: Vec<String>,
+}
+
+impl Kind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Kind::Call => "call",
+            Kind::Warm => "warm",
+            Kind::Update => "update",
+            Kind::Remove => "remove",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        [Kind::Call, Kind::Warm, Kind::Update, Kind::Remove]
+            .into_iter()
+            .find(|kind| kind.as_str() == text)
+    }
+}
+
+impl From<String> for On {
+    fn from(text: String) -> Self {
+        match text.as_str() {
+            "any" => On::Any,
+            "new" => On::New(None),
+            _ => match text.strip_prefix("new:") {
+                Some(sku) => On::New(Some(sku.to_owned())),
+                None => On::Machine(text),
+            },
+        }
+    }
+}
+
+impl From<On> for String {
+    fn from(on: On) -> Self {
+        on.to_string()
+    }
+}
+
+impl fmt::Display for On {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            On::Machine(name) => f.write_str(name),
+            On::Any => f.write_str("any"),
+            On::New(None) => f.write_str("new"),
+            On::New(Some(sku)) => write!(f, "new:{sku}"),
+        }
+    }
+}
+
+mod base64_bytes {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use serde::{Deserialize, Deserializer, Serializer, de::Error as _};
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&STANDARD.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        STANDARD
+            .decode(String::deserialize(deserializer)?)
+            .map_err(D::Error::custom)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(status: Status) -> Run {
+        Run {
+            id: RunId::mint([1; 12]),
+            number: 3,
+            kind: Kind::Call,
+            target: "fidika/sdxl/generate".into(),
+            hub: "https://tensorhub.com".into(),
+            machine: Some("local".into()),
+            status,
+            cancel_requested: false,
+            machine_state: None,
+            reason: None,
+            output: vec![],
+            created_at_ms: 1,
+            accepted_at_ms: None,
+            settled_at_ms: None,
+            waiting: None,
+            progress: None,
+        }
+    }
+
+    #[test]
+    fn events_carry_responses_names_and_sequence_numbers() {
+        let created = Event::lifecycle(1, run(Status::Queued), true);
+        let json = serde_json::to_value(&created).unwrap();
+        assert_eq!(json["type"], "run.created");
+        assert_eq!(json["sequence_number"], 1);
+        assert_eq!(serde_json::from_value::<Event>(json).unwrap(), created);
+        let done = Event::lifecycle(9, run(Status::Canceled), false);
+        assert!(done.is_terminal());
+        assert_eq!(serde_json::to_value(&done).unwrap()["type"], "run.canceled");
+        let live = Event::Waiting {
+            reason: "booting".into(),
+        };
+        assert_eq!(live.sequence_number(), None);
+        assert_eq!(
+            serde_json::to_value(&live).unwrap(),
+            serde_json::json!({"type": "run.waiting", "reason": "booting"})
+        );
+    }
+
+    #[test]
+    fn a_submission_round_trips_with_its_spec_in_base64_and_unknown_fields_ignored() {
+        let submit = SubmitRun {
+            on: On::New(Some("rtx-4090".into())),
+            hub: "https://tensorhub.com".into(),
+            kind: Kind::Warm,
+            target: "fidika/sdxl".into(),
+            spec: vec![8, 2],
+            inputs: vec![],
+            out: None,
+        };
+        let mut json = serde_json::to_value(&submit).unwrap();
+        assert_eq!(json["on"], "new:rtx-4090");
+        assert_eq!(json["spec"], "CAI=");
+        json["from_a_newer_cli"] = serde_json::json!(true);
+        assert_eq!(serde_json::from_value::<SubmitRun>(json).unwrap(), submit);
+        for on in ["local", "any", "new", "new:h100", "kiyui"] {
+            assert_eq!(On::from(on.to_owned()).to_string(), on);
+        }
+    }
+}

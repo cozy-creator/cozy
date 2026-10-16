@@ -1,0 +1,344 @@
+//! The outbox and its followers against a real TensorD process (`COZY_TEST_TENSORD`). Runs are
+//! warm runs of a release from a Hub that never answers, so they stay preparing until they are
+//! canceled or the Hub goes away; no Runtime is involved.
+mod common;
+
+use std::{path::Path, sync::Arc, time::Duration};
+
+use calcifer::{Calcifer, Link, LinkError, store::State};
+use common::{SilentHub, Tensord, until};
+use cozy_proto::{
+    calcifer::{Event, Kind, On, Status, SubmitRun},
+    ids::RunId,
+};
+
+fn open(home: &Path) -> Arc<Calcifer> {
+    Calcifer::open(&home.join("calcifer"), &home.join("outputs")).unwrap()
+}
+
+fn submit(on: &str, spec: Vec<u8>, inputs: Vec<cozy_proto::calcifer::StagedInput>) -> SubmitRun {
+    SubmitRun {
+        on: On::from(on.to_owned()),
+        hub: "https://tensorhub.com".into(),
+        kind: Kind::Warm,
+        target: "cozy-test/held".into(),
+        spec,
+        inputs,
+        out: None,
+    }
+}
+
+fn is_status(status: Status) -> impl Fn(&Event) -> bool {
+    move |event| match event {
+        Event::Queued { run, .. }
+        | Event::InProgress { run, .. }
+        | Event::Completed { run, .. }
+        | Event::Failed { run, .. }
+        | Event::Canceled { run, .. } => run.status == status,
+        _ => false,
+    }
+}
+
+fn reason_of(event: &Event) -> String {
+    match event {
+        Event::Failed { run, .. } | Event::Canceled { run, .. } => run.reason.clone().unwrap().code,
+        other => panic!("not an end: {other:?}"),
+    }
+}
+
+/// Waits until the store records the run settled.
+async fn settled(calcifer: &Calcifer, id: &RunId) {
+    for _ in 0..1200 {
+        if calcifer.store().run(id.as_str()).unwrap().unwrap().state == State::Settled {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("run {id} never settled");
+}
+
+/// The machine's own answer about the run, with a link of the test's.
+async fn on_machine(machine: &Tensord, id: &RunId) -> Result<String, LinkError> {
+    let link = Link::new(&machine.endpoint, common::key())?;
+    link.run(id.as_str(), 0, None)
+        .await
+        .map(|(state, _)| state.state)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_run_is_sent_with_its_input_accepted_and_canceled_by_its_machine() {
+    let home = tempfile::tempdir().unwrap();
+    let key = common::key_file(home.path());
+    let machine = Tensord::start();
+    let hub = SilentHub::new();
+    let calcifer = open(home.path());
+    calcifer.put_machine(&machine.row("m", &key)).unwrap();
+    let mut events = calcifer.subscribe();
+    let (staged, input) = common::input_file(home.path(), b"not really a png");
+    let spec = common::warm_spec(&hub.origin(), vec![input]);
+    let submitted = calcifer
+        .submit("k1", submit("m", spec.clone(), vec![staged.clone()]))
+        .await
+        .unwrap();
+    let id = submitted.run.id.clone();
+    assert!(!submitted.replay);
+    until(&mut events, &id, is_status(Status::InProgress)).await;
+    let staged_copy = home
+        .path()
+        .join("calcifer/inputs")
+        .join(staged.digest.to_string().trim_start_matches("sha256:"));
+    assert!(
+        staged_copy.exists(),
+        "the input stays staged while its run is unsettled"
+    );
+    let again = calcifer
+        .submit("k1", submit("m", spec, vec![staged]))
+        .await
+        .unwrap();
+    assert!(again.replay && again.run.id == id);
+
+    calcifer.cancel(&id).unwrap();
+    let end = until(&mut events, &id, |e| e.is_terminal()).await;
+    assert_eq!(
+        reason_of(&end),
+        "canceled",
+        "the machine's own outcome: {end:?}"
+    );
+    assert_eq!(on_machine(&machine, &id).await.unwrap(), "canceled");
+    for _ in 0..100 {
+        if !staged_copy.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(!staged_copy.exists(), "no unsettled run names the input");
+}
+
+/// Calcifer stops while its machine holds the run; the run ends without it (canceled at the
+/// machine directly); the next Calcifer attaches from the durable cursor and records that end once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_run_settles_once_after_calcifer_restarts() {
+    let home = tempfile::tempdir().unwrap();
+    let key = common::key_file(home.path());
+    let machine = Tensord::start();
+    let hub = SilentHub::new();
+    let first = open(home.path());
+    first.put_machine(&machine.row("m", &key)).unwrap();
+    let mut events = first.subscribe();
+    let id = first
+        .submit(
+            "k",
+            submit("m", common::warm_spec(&hub.origin(), vec![]), vec![]),
+        )
+        .await
+        .unwrap()
+        .run
+        .id;
+    until(&mut events, &id, is_status(Status::InProgress)).await;
+    first.close();
+    assert_eq!(
+        first.store().run(id.as_str()).unwrap().unwrap().state,
+        State::Accepted
+    );
+    drop(first);
+    let link = Link::new(&machine.endpoint, common::key()).unwrap();
+    link.cancel(id.as_str()).await.unwrap();
+    assert_eq!(on_machine(&machine, &id).await.unwrap(), "canceled");
+
+    let second = open(home.path());
+    settled(&second, &id).await;
+    let all = second.store().events_after(id.as_str(), 0).unwrap();
+    assert_eq!(all.iter().filter(|e| e.is_terminal()).count(), 1, "{all:?}");
+    assert_eq!(
+        reason_of(all.last().unwrap()),
+        "canceled",
+        "the machine's own outcome"
+    );
+    let row = second.store().run(id.as_str()).unwrap().unwrap();
+    assert!(row.cursor > 0, "the cursor reached the outcome");
+    second.close();
+    let third = open(home.path());
+    assert_eq!(
+        third.store().events_after(id.as_str(), 0).unwrap(),
+        all,
+        "nothing more was recorded"
+    );
+    third.close();
+}
+
+/// A run to a machine with no endpoint waits in the outbox, unsent, and goes as soon as the
+/// machine is reachable; one canceled while it waits is never sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runs_wait_for_a_booting_machine_and_a_cancel_there_never_sends() {
+    let home = tempfile::tempdir().unwrap();
+    let key = common::key_file(home.path());
+    let hub = SilentHub::new();
+    let calcifer = open(home.path());
+    calcifer
+        .put_machine(&common::machine("m", None, &key))
+        .unwrap();
+    let mut events = calcifer.subscribe();
+    let waits = calcifer
+        .submit(
+            "k1",
+            submit("m", common::warm_spec(&hub.origin(), vec![]), vec![]),
+        )
+        .await
+        .unwrap()
+        .run
+        .id;
+    let canceled = calcifer
+        .submit(
+            "k2",
+            submit("m", common::warm_spec(&hub.origin(), vec![]), vec![]),
+        )
+        .await
+        .unwrap()
+        .run
+        .id;
+    let waiting = until(&mut events, &waits, |e| matches!(e, Event::Waiting { .. })).await;
+    assert!(matches!(waiting, Event::Waiting { reason } if reason.contains("start")));
+    calcifer.cancel(&canceled).unwrap();
+    assert_eq!(
+        calcifer
+            .store()
+            .run(canceled.as_str())
+            .unwrap()
+            .unwrap()
+            .status,
+        Some(Status::Canceled)
+    );
+    assert_eq!(
+        calcifer.store().run(waits.as_str()).unwrap().unwrap().state,
+        State::Queued
+    );
+
+    let machine = Tensord::start();
+    calcifer.put_machine(&machine.row("m", &key)).unwrap();
+    until(&mut events, &waits, is_status(Status::InProgress)).await;
+    assert!(
+        matches!(
+            on_machine(&machine, &canceled).await,
+            Err(LinkError::NotFound)
+        ),
+        "never sent"
+    );
+    calcifer.cancel(&waits).unwrap();
+    until(&mut events, &waits, |e| e.is_terminal()).await;
+    calcifer.close();
+}
+
+/// A Calcifer that crossed the send boundary and stopped before the machine got the run: the
+/// next one attaches, hears NotFound, and sends it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sent_run_its_machine_never_got_is_sent_again_after_a_restart() {
+    let home = tempfile::tempdir().unwrap();
+    let key = common::key_file(home.path());
+    let hub = SilentHub::new();
+    let first = open(home.path());
+    first
+        .put_machine(&common::machine("m", None, &key))
+        .unwrap();
+    let id = first
+        .submit(
+            "k",
+            submit("m", common::warm_spec(&hub.origin(), vec![]), vec![]),
+        )
+        .await
+        .unwrap()
+        .run
+        .id;
+    first.close();
+    assert!(first.store().mark_sent(id.as_str(), "m").unwrap());
+    drop(first);
+
+    let machine = Tensord::start();
+    let second = open(home.path());
+    let mut events = second.subscribe();
+    second.put_machine(&machine.row("m", &key)).unwrap();
+    until(&mut events, &id, is_status(Status::InProgress)).await;
+    assert_eq!(on_machine(&machine, &id).await.unwrap(), "preparing");
+    second.cancel(&id).unwrap();
+    until(&mut events, &id, |e| e.is_terminal()).await;
+    second.close();
+}
+
+/// A machine that served and is proven gone before it confirmed a run Calcifer placed: the run
+/// returns to the outbox and is accepted elsewhere under the same id.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_run_lost_before_acceptance_is_placed_again_under_its_id() {
+    let home = tempfile::tempdir().unwrap();
+    let key = common::key_file(home.path());
+    let hub = SilentHub::new();
+    let mut gone = Tensord::start();
+    let row = gone.row("a", &key);
+    gone.stop();
+    let other = Tensord::start();
+    let calcifer = open(home.path());
+    calcifer.put_machine(&row).unwrap();
+    calcifer.put_machine(&other.row("b", &key)).unwrap();
+    let mut events = calcifer.subscribe();
+    let id = calcifer
+        .submit(
+            "k",
+            submit("any", common::warm_spec(&hub.origin(), vec![]), vec![]),
+        )
+        .await
+        .unwrap()
+        .run
+        .id;
+    assert!(calcifer.place(&id, "a").unwrap());
+    until(
+        &mut events,
+        &id,
+        |e| matches!(e, Event::Waiting { reason } if reason.contains("unreachable")),
+    )
+    .await;
+    assert_eq!(
+        calcifer.store().run(id.as_str()).unwrap().unwrap().state,
+        State::Sent
+    );
+
+    calcifer.machine_ended("a", "its rental ended").unwrap();
+    let back = calcifer.store().run(id.as_str()).unwrap().unwrap();
+    assert_eq!((back.state, back.machine), (State::Queued, None));
+    assert!(calcifer.place(&id, "b").unwrap());
+    until(&mut events, &id, is_status(Status::InProgress)).await;
+    assert_eq!(on_machine(&other, &id).await.unwrap(), "preparing");
+    calcifer.cancel(&id).unwrap();
+    until(&mut events, &id, |e| e.is_terminal()).await;
+    calcifer.close();
+}
+
+/// A machine proven gone after it accepted a run: the run ends FAILED and is never sent again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_run_lost_after_acceptance_fails_and_is_not_run_again() {
+    let home = tempfile::tempdir().unwrap();
+    let key = common::key_file(home.path());
+    let hub = SilentHub::new();
+    let mut machine = Tensord::start();
+    let calcifer = open(home.path());
+    calcifer.put_machine(&machine.row("a", &key)).unwrap();
+    let mut events = calcifer.subscribe();
+    let id = calcifer
+        .submit(
+            "k",
+            submit("any", common::warm_spec(&hub.origin(), vec![]), vec![]),
+        )
+        .await
+        .unwrap()
+        .run
+        .id;
+    calcifer.place(&id, "a").unwrap();
+    until(&mut events, &id, is_status(Status::InProgress)).await;
+    machine.stop();
+    calcifer.machine_ended("a", "its rental ended").unwrap();
+    let end = until(&mut events, &id, |e| e.is_terminal()).await;
+    assert_eq!(reason_of(&end), "machine_lost");
+    let row = calcifer.store().run(id.as_str()).unwrap().unwrap();
+    assert_eq!(
+        (row.state, row.machine.as_deref()),
+        (State::Settled, Some("a"))
+    );
+    calcifer.close();
+}
