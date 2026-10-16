@@ -1,4 +1,4 @@
-//! `cozy model download` on a real machine: TensorD 0.6.0 from the cozy-runtime wheel
+//! `cozy model download|list` on a real machine: TensorD 0.6.0 from the cozy-runtime wheel
 //! (COZY_TEST_TENSORD) added to this home's Calcifer. The machine makes the model from a tiny
 //! public Hugging Face repository; no weight byte lands in the controller's home.
 #![cfg(unix)]
@@ -33,6 +33,15 @@ fn download_makes_a_provider_source_on_the_machine() {
     let held = home.cozy(["model", "download", "local/tiny", "--on", "m1"]);
     assert_eq!(held.code, 0, "{held:?}");
     assert!(held.stdout.contains("local/tiny"), "{held:?}");
+
+    // `model list` reads the machine's Status: every machine by default, one with --on.
+    for args in [&["--json", "model", "list"][..], &["--json", "model", "list", "--on", "m1"]] {
+        let listed = home.json(args);
+        let rows = listed["models"].as_array().unwrap();
+        assert!(rows.iter().any(|r| r["machine"] == "m1" && r["model"] == "local/tiny"), "{listed}");
+    }
+    let missing = home.cozy(["--json", "model", "list", "--on", "nowhere"]);
+    assert_eq!((missing.code, missing.refusal()["code"].as_str()), (1, Some("machine_not_found")), "{missing:?}");
 
     // An unpinned source is the machine's refusal, which names the pinned grammar.
     let unpinned = home.cozy(["--json", "model", "download", "hf://hf-internal-testing/tiny-random-gpt2", "local/x", "--on", "m1"]);

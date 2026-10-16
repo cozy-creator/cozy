@@ -1,4 +1,5 @@
-//! `cozy model download|upload`: warm runs on the machine `--on` names. The machine fetches,
+//! `cozy model list|download|upload`: models on machines. Download and upload are warm runs on
+//! the machine `--on` names. The machine fetches,
 //! makes and publishes the bytes itself, so no weight passes through this computer; a local file
 //! goes to the machine as the run's input.
 use std::io::Read as _;
@@ -10,12 +11,13 @@ use cozy_proto::error::{Error, Kind};
 use cozy_proto::ids::Digest;
 use cozy_proto::machine::{ModelChoice, RunKind as SpecKind, RunSpec};
 use prost::Message as _;
+use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
 use super::refs::{ModelRef, Repo};
-use super::{Download, Upload};
+use super::{Download, List, Upload};
 use crate::Context;
-use crate::output::{self, Record};
+use crate::output::{self, Record, Table};
 use crate::run::Placement;
 
 fn usage(code: &str, message: impl Into<String>) -> Error {
@@ -162,6 +164,71 @@ pub(crate) async fn upload(ctx: &Context, args: Upload) -> Result<ExitCode, Erro
     }
     let target = format!("{} → {destination}", args.source);
     warm(ctx, &args.placement, args.detach, target, made, destination.to_string()).await
+}
+
+/// One checkpoint a machine holds, and its repository's bytes there.
+#[derive(Serialize)]
+struct Held {
+    machine: String,
+    model: String,
+    release: String,
+    lane: String,
+    checkpoint: String,
+    yanked: bool,
+    bytes: u64,
+    /// The repository's bytes other held models share.
+    shared_bytes: u64,
+}
+
+/// What every machine holds (or the one `--on` names), from its latest Status through Calcifer.
+pub(crate) async fn list(ctx: &Context, args: List) -> Result<ExitCode, Error> {
+    let machines = ctx.calcifer().await?.machines().await?.machines;
+    if let Some(on) = args.on.as_ref().filter(|on| !machines.iter().any(|m| m.name == **on)) {
+        return Err(Error::new(Kind::NotFound, "machine_not_found", format!("no machine named {on}")).next("cozy machine list"));
+    }
+    let (mut rows, mut stores, mut silent) = (vec![], vec![], vec![]);
+    for machine in machines.iter().filter(|m| args.on.as_ref().is_none_or(|on| *on == m.name)) {
+        let Some(status) = &machine.status else {
+            silent.push(machine.name.as_str());
+            continue;
+        };
+        stores.push(format!("{}: {} in {} models", machine.name, output::bytes(status.models_bytes), status.models.len()));
+        for model in &status.models {
+            let held = |release: &str, lane: &str, checkpoint: &str, yanked| Held {
+                machine: machine.name.clone(),
+                model: model.repository.clone(),
+                release: release.into(),
+                lane: lane.into(),
+                checkpoint: checkpoint.into(),
+                yanked,
+                bytes: model.total_bytes,
+                shared_bytes: model.total_bytes.saturating_sub(model.unique_bytes),
+            };
+            if model.checkpoints.is_empty() {
+                rows.push(held("", "", "", false));
+            }
+            rows.extend(model.checkpoints.iter().map(|c| held(&c.release, &c.lane, &c.manifest, c.yanked)));
+        }
+    }
+    if ctx.json {
+        output::json(&serde_json::json!({ "models": rows }));
+        return Ok(ExitCode::SUCCESS);
+    }
+    let mut table = Table::new(ctx, ["machine", "model", "release", "lane", "size", "shared"]);
+    for row in &rows {
+        let lane = if row.yanked { format!("{} (yanked)", row.lane) } else { row.lane.clone() };
+        let (size, shared) = (output::bytes(row.bytes), output::bytes(row.shared_bytes));
+        table = table.row([row.machine.as_str(), &row.model, &row.release, &lane, &size, &shared]);
+    }
+    // A store's total counts shared content once.
+    for store in stores {
+        table = table.note(store);
+    }
+    if !silent.is_empty() {
+        table = table.note(format!("no Status yet from {}", silent.join(", ")));
+    }
+    table.print();
+    Ok(ExitCode::SUCCESS)
 }
 
 #[cfg(test)]
