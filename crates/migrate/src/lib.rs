@@ -281,7 +281,7 @@ fn imported(into: &Home) -> Result<bool, Error> {
 fn archive(from: &Path, into: &Home, entries: &[Entry]) -> Result<PathBuf, String> {
     let fail = |e: std::io::Error| e.to_string();
     let backups = into.backups();
-    std::fs::create_dir_all(&backups).map_err(fail)?;
+    durable::private_dir(&backups).map_err(|e| e.to_string())?;
     let stamp = jiff::Timestamp::now().strftime("%Y%m%dT%H%M%SZ");
     let path = backups.join(format!("go-cli-state-{stamp}.tar"));
     let staged = backups.join(format!(".go-cli-state-{stamp}.tar.partial"));

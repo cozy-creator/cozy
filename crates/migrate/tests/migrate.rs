@@ -190,6 +190,14 @@ fn an_import_in_place_records_the_go_home_and_archives_its_state() {
         (lost.status, lost.reason.unwrap().code.as_str()),
         (Status::Failed, "not_migrated")
     );
+    let endpoint = store
+        .record(&store.run("req-endpoint").unwrap().unwrap())
+        .unwrap();
+    assert_eq!(
+        endpoint.output[0].export_error.as_deref(),
+        Some("not kept across the migration"),
+        "a settled item with no file is never fetched"
+    );
     let install = store.run("req-install").unwrap().unwrap();
     assert_eq!(install.target, "fidika/sdxl@1.2.0");
 

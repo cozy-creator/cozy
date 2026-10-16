@@ -1370,10 +1370,12 @@ fn import_run(tx: &Transaction, run: &ImportedRun) -> Result<()> {
     )?;
     for (seq, output) in (2_i64..).zip(&run.outputs) {
         let path = output.path.as_ref().map(|p| p.to_string_lossy());
+        // A settled run's item with no file stays without one: its machine is gone.
+        let lost = path.is_none() && run.state == State::Settled;
         tx.execute(
             "INSERT INTO outputs (run, name, idx, rev, length, digest, media_type, label, duration_us, done, path,
-                 exported_rev, created_seq, seq)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13)",
+                 exported_rev, failed_rev, export_error, created_seq, seq)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?15)",
             params![
                 id,
                 output.name,
@@ -1387,6 +1389,8 @@ fn import_run(tx: &Transaction, run: &ImportedRun) -> Result<()> {
                 output.done,
                 path,
                 path.is_some().then_some(output.rev as i64),
+                lost.then_some(output.rev as i64),
+                lost.then_some("not kept across the migration"),
                 seq,
             ],
         )?;
