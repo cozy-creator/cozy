@@ -129,6 +129,22 @@ async fn a_user_and_a_machine_at_a_real_hub() {
         Err(other) => panic!("a quote neither priced nor refused: {other}"),
     }
 
+    // Placement for bare `--on new`: this account publishes no package, and the refusal is typed.
+    let placement = types::RentalPlacementRequest {
+        package: format!("{account}/absent"),
+        release: None,
+        function: "generate".into(),
+        bits: None,
+        gpus: None,
+    };
+    let (status, _) = refused(
+        anonymous
+            .place_rental(&placement)
+            .await
+            .map_err(Error::from),
+    );
+    assert_eq!(status, 404);
+
     // A closure read: the model has no release yet, and the refusal is typed.
     let closure = types::TensorfsClosureRequest {
         after: None,

@@ -9,9 +9,13 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use calcifer::store::{Endpoint, MachineRow};
-use cozy_platform::durable;
+use cozy_platform::{
+    durable,
+    lock::{Held, Kind as LockKind, LockFile},
+    paths::Home,
+};
 use cozy_proto::{
-    calcifer::{Event, MachineKind, MachineState},
+    calcifer::{Event, MachineKind, MachineState, WANTED},
     ids::{Digest, RunId},
     machine as v1,
 };
@@ -21,6 +25,15 @@ use sha2::{Digest as _, Sha256};
 use tokio::sync::broadcast;
 
 pub const WORKER: &str = "calcifer-test";
+
+/// A client's claim that it is starting Calcifer on `home` (`wanted.lock`, shared): the CLI holds
+/// it until Calcifer's first answer, so a Calcifer owing nothing waits for that client.
+pub fn want(home: &Path) -> Held {
+    let dir = Home::at(home).calcifer();
+    durable::private_dir(&dir).unwrap();
+    let wanted = LockFile::new(dir.join(WANTED)).try_lock(LockKind::Shared);
+    wanted.unwrap().expect("a shared lock")
+}
 
 pub fn key() -> SigningKey {
     SigningKey::from_bytes(&[33; 32])
@@ -42,6 +55,11 @@ pub struct Tensord {
 
 impl Tensord {
     pub fn start() -> Self {
+        Self::start_args(&[])
+    }
+
+    /// As `start`, with more `serve` arguments.
+    pub fn start_args(extra: &[&std::ffi::OsStr]) -> Self {
         let binary = std::env::var_os("COZY_TEST_TENSORD")
             .expect("COZY_TEST_TENSORD names the tensord binary these tests run against");
         let root = tempfile::tempdir().unwrap();
@@ -71,6 +89,7 @@ impl Tensord {
             .arg("--machine-config")
             .arg(config.join("machine.json"))
             .args(["--listen", "127.0.0.1:0", "--host-bytes", "0"])
+            .args(extra)
             .stdout(Stdio::null())
             .spawn()
             .unwrap();

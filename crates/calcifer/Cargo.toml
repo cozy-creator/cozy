@@ -29,6 +29,7 @@ thiserror.workspace = true
 tokio.workspace = true
 tokio-rustls.workspace = true
 tokio-stream.workspace = true
+tokio-util.workspace = true
 tonic = { workspace = true, features = ["channel"] }
 tower.workspace = true
 tracing.workspace = true

@@ -9,6 +9,7 @@ use cozy_proto::{
 };
 
 mod account;
+pub mod calcifer_client;
 mod completion;
 pub mod context;
 mod credits;
