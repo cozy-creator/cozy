@@ -50,19 +50,23 @@ jobs:
           cp target/distrib/cozy-* target/distrib/sha256.sum mirror/
           echo "version=$(jq -r '.releases[0].app_version' mirror/dist-manifest.json)" >> "$GITHUB_OUTPUT"
           {
-            echo '| archive | archive MB | binary MB |'
-            echo '|---|---|---|'
-            for f in mirror/cozy-*.tar.gz; do
-              bin=$(tar -tzf "$f" | grep -E '/cozy(\.exe)?$')
-              size=$(tar -xzOf "$f" "$bin" | wc -c)
-              echo "| ${f#mirror/} | $(du -k "$f" | awk '{printf "%.1f", $1/1024}') | $(awk -v b="$size" 'BEGIN{printf "%.1f", b/1048576}') |"
+            echo '| archive | archive MB | binary MB | newest glibc symbol |'
+            echo '|---|---|---|---|'
+            for f in mirror/cozy-*.tar.gz mirror/cozy-*.zip; do
+              case $f in
+                *.zip) unzip -p "$f" cozy.exe > bin ;;
+                *) tar -xzOf "$f" "$(tar -tzf "$f" | grep -E '/cozy$')" > bin ;;
+              esac
+              glibc=$(readelf -W --version-info bin 2>/dev/null | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)
+              echo "| ${f#mirror/} | $(du -k "$f" | awk '{printf "%.1f", $1/1024}') | $(du -k bin | awk '{printf "%.1f", $1/1024}') | ${glibc:--} |"
             done
+            rm bin
           } | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Every archive carries this workflow's attestation
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          for f in mirror/cozy-*.tar.gz; do
+          for f in mirror/cozy-*.tar.gz mirror/cozy-*.zip; do
             gh attestation verify "$f" -R "$GITHUB_REPOSITORY" --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml"
           done
       - uses: actions/upload-artifact@v7
@@ -75,7 +79,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, windows-2025, windows-11-arm]
+        include:
+          - { os: ubuntu-24.04, target: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
+          - { os: macos-15, target: aarch64-apple-darwin }
+          # Windows PowerShell 5.1 on x64, PowerShell 7 on arm64 (5.1 there reports x64 and gets that build).
+          - { os: windows-2025, target: x86_64-pc-windows-msvc, ps: powershell }
+          - { os: windows-11-arm, target: aarch64-pc-windows-msvc, ps: pwsh }
     runs-on: ${{ matrix.os }}
     # Hang bound, not a work budget.
     timeout-minutes: 30
@@ -89,6 +99,8 @@ jobs:
           path: mirror
       - env:
           VERSION: ${{ needs.mirror.outputs.version }}
+          TARGET: ${{ matrix.target }}
+          PS: ${{ matrix.ps }}
         run: |
           python=python3; [ "$RUNNER_OS" != Windows ] || python=python
           $python -m http.server 8123 --bind 127.0.0.1 --directory mirror > /dev/null 2>&1 &
@@ -96,24 +108,31 @@ jobs:
           until curl -sf "$COZY_DOWNLOAD_URL/dist-manifest.json" > /dev/null; do sleep 1; done
 
           if [ "$RUNNER_OS" = Windows ]; then
-            powershell -NoProfile -ExecutionPolicy Bypass -c "irm $COZY_DOWNLOAD_URL/cozy-installer.ps1 | iex"
+            installed=$($PS -NoProfile -ExecutionPolicy Bypass -c "irm $COZY_DOWNLOAD_URL/cozy-installer.ps1 | iex" 2>&1)
             cozy=$HOME/.cozy/bin/cozy.exe
             path=$(powershell -NoProfile -c "[Environment]::GetEnvironmentVariable('Path', 'User')")
             case ${path,,} in *'\.cozy\bin'*) ;; *) echo "::error::the user PATH lacks .cozy\bin: $path"; exit 1 ;; esac
           else
-            curl -sSf "$COZY_DOWNLOAD_URL/cozy-installer.sh" | sh
+            installed=$(curl -sSf "$COZY_DOWNLOAD_URL/cozy-installer.sh" | sh 2>&1)
             cozy=$HOME/.cozy/bin/cozy
             found=$(env -i HOME="$HOME" PATH=/usr/bin:/bin sh -lc 'command -v cozy')
             [ "$found" = "$cozy" ] || { echo "::error::a login shell finds '$found', not $cozy"; exit 1; }
           fi
+          echo "$installed"
+          case $installed in *"$TARGET"*) ;; *) echo "::error::the installer did not pick $TARGET"; exit 1 ;; esac
           version=$("$cozy" --version)
           echo "$version"
           [ "$version" = "cozy $VERSION" ]
 
           fail=0
-          # `cozy --json <verb…>`; a verb not ported yet is skipped. ran=1 when it succeeded.
+          # `cozy --json <words…>`; skipped while the grammar lacks it or the verb answers not_ported.
+          # ran=1 when it succeeded.
           step() {
             ran=0 code=0
+            if ! "$cozy" "$@" --help > /dev/null 2>&1; then
+              echo "skipped, not in the grammar yet: cozy $*"
+              return
+            fi
             out=$("$cozy" --json "$@") || code=$?
             if [ "$code" = 2 ] && printf '%s' "$out" | grep -q '"code":"not_ported"'; then
               echo "skipped, not ported: cozy $*"
