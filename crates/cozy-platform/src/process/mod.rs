@@ -64,7 +64,8 @@ pub struct Exact {
 }
 
 impl Exact {
-    /// `None` when that birth has been reaped or its PID names another process now.
+    /// `None` when that birth has been reaped (on Windows: has exited) or its PID names another
+    /// process now.
     pub fn open(birth: &Birth) -> Result<Option<Exact>> {
         let handle = sys::open(birth).map_err(Error::os("open a process handle"))?;
         Ok(handle.map(|handle| Exact {

@@ -65,10 +65,17 @@ pub(super) fn state(birth: &Birth) -> io::Result<State> {
     Ok(State::Live)
 }
 
+/// An exited process is refused: Windows has no reaping, and any process (a console host) may keep
+/// a dead one's object alive with a handle.
 pub(super) fn open(birth: &Birth) -> io::Result<Option<Handle>> {
     let access = PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE | PROCESS_TERMINATE;
     match open_process(birth.pid, access) {
-        Ok(process) if created(&process)? == birth.start_ticks => Ok(Some(Handle(process))),
+        Ok(process)
+            if created(&process)? == birth.start_ticks
+                && !signaled(&process, Some(Duration::ZERO))? =>
+        {
+            Ok(Some(Handle(process)))
+        }
         Ok(_) => Ok(None),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
