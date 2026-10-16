@@ -103,6 +103,62 @@ impl Bound {
     }
 }
 
+impl Bound {
+    /// The payload's canonical JSON: sorted keys, no whitespace, exact integers.
+    pub fn canonical_payload(&self) -> Vec<u8> {
+        canonical(&Value::Object(self.payload.clone())).into_bytes()
+    }
+}
+
+/// JSON with sorted keys and no whitespace, whatever serde_json's map order.
+fn canonical(value: &Value) -> String {
+    match value {
+        Value::Object(object) => {
+            let mut keys: Vec<&String> = object.keys().collect();
+            keys.sort();
+            let members: Vec<String> = keys
+                .into_iter()
+                .map(|k| format!("{}:{}", Value::String(k.clone()), canonical(&object[k])))
+                .collect();
+            format!("{{{}}}", members.join(","))
+        }
+        Value::Array(values) => format!(
+            "[{}]",
+            values.iter().map(canonical).collect::<Vec<_>>().join(",")
+        ),
+        other => other.to_string(),
+    }
+}
+
+/// A warm run's model choices: `model.<slot>=`, `--lora` and a conversion's input model. It
+/// carries no payload, so any other term is refused.
+pub fn warm_choices(callable: &Callable, terms: &Terms) -> Result<Vec<Choice>, Error> {
+    let mut binder = Binder {
+        target: "",
+        callable,
+        terms,
+        document: Map::new(),
+        choices: BTreeMap::new(),
+        files: Vec::new(),
+    };
+    let mut inputs = terms.inputs.clone();
+    binder.conversion(&mut inputs)?;
+    let positional = binder.read_terms(&inputs)?;
+    binder.loras()?;
+    if !positional.is_empty()
+        || !binder.document.is_empty()
+        || !binder.files.is_empty()
+        || !terms.assets.is_empty()
+        || terms.input_file.is_some()
+    {
+        return Err(usage(
+            "warm_inputs",
+            "--warm keeps a function ready and takes no inputs, only model.<slot>= and --lora choices",
+        ));
+    }
+    Ok(binder.choices.into_values().collect())
+}
+
 /// Binds `terms` for `callable`; `target` names it in messages (`org/pkg/fn`).
 pub fn bind(target: &str, callable: &Callable, terms: &Terms) -> Result<Bound, Error> {
     let mut binder = Binder {

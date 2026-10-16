@@ -92,6 +92,10 @@ fn scalars_take_their_declared_types() {
     );
     assert!(bound.ignored.is_empty() && bound.files.is_empty() && bound.models.is_empty());
     assert_eq!(
+        String::from_utf8(bound.canonical_payload()).unwrap(),
+        r#"{"aspect_ratio":"16:9","guidance":7.0,"hidiffusion":true,"megapixels":2,"prompt":"a cat","seed":7,"steps":20}"#
+    );
+    assert_eq!(
         sdxl.ok("generate", &["prompt=x", "seed=null"]).payload["seed"],
         Value::Null
     );
@@ -567,4 +571,22 @@ fn an_omitted_integer_seed_follows_the_key() {
             .payload
             .contains_key("seed")
     );
+}
+
+#[test]
+fn a_warm_run_takes_only_model_choices() {
+    let sdxl = Case::new("sdxl-2.10.0");
+    let choices = warm_choices(
+        sdxl.callable("generate"),
+        &sdxl.terms(&["model.model=fidika/base@2"]),
+    )
+    .unwrap();
+    assert_eq!(choices[0].reference.as_deref(), Some("fidika/base@2"));
+    assert!(
+        warm_choices(sdxl.callable("generate"), &sdxl.terms(&[]))
+            .unwrap()
+            .is_empty()
+    );
+    let refused = warm_choices(sdxl.callable("generate"), &sdxl.terms(&["prompt=x"])).unwrap_err();
+    assert_eq!(refused.code, "warm_inputs");
 }
