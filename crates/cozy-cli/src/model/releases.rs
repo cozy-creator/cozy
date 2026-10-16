@@ -9,6 +9,7 @@ use serde::Serialize;
 use super::refs::{ModelRef, Repo, checkpoint, label};
 use super::{Delete, Publish, Retarget, Yank};
 use crate::Context;
+use crate::context::hub_answer;
 use crate::output::{self, Record};
 
 fn usage(code: &str, message: impl Into<String>) -> Error {
@@ -79,7 +80,7 @@ pub(crate) async fn publish(ctx: &Context, args: Publish) -> Result<ExitCode, Er
     }
     let client = ctx.hub_signed_in(&ctx.hub()?)?;
     // The write names the revision this read saw: a concurrent change refuses instead of losing.
-    let current = match ctx.hub_answer(client.get_model(&repo.org, &repo.name).await) {
+    let current = match hub_answer(client.get_model(&repo.org, &repo.name).await) {
         Ok(card) => card.releases.into_iter().find(|r| r.release == release),
         Err(e) if e.kind == Kind::NotFound => None,
         Err(e) => return Err(e),
@@ -100,7 +101,7 @@ pub(crate) async fn publish(ctx: &Context, args: Publish) -> Result<ExitCode, Er
         set_lanes: set,
         remove_lanes: remove,
     };
-    let answer = ctx.hub_answer(client.update_model_release(&repo.org, &repo.name, &release, &update).await)?;
+    let answer = hub_answer(client.update_model_release(&repo.org, &repo.name, &release, &update).await)?;
     show(ctx, &repo, answer)
 }
 
@@ -110,7 +111,7 @@ pub(crate) async fn retarget(ctx: &Context, args: Retarget) -> Result<ExitCode, 
     let lane = label("--lane", &args.lane)?;
     let body = ModelLaneRetarget { checkpoint_id: checkpoint(&args.to)? };
     let client = ctx.hub_signed_in(&ctx.hub()?)?;
-    let answer = ctx.hub_answer(client.retarget_model_lane(&repo.org, &repo.name, &release, &lane, &body).await)?;
+    let answer = hub_answer(client.retarget_model_lane(&repo.org, &repo.name, &release, &lane, &body).await)?;
     show(ctx, &repo, answer)
 }
 
@@ -118,7 +119,7 @@ pub(crate) async fn yank(ctx: &Context, args: Yank) -> Result<ExitCode, Error> {
     let repo = Repo::hub(&args.model)?;
     let release = label("--release", &args.release)?;
     let client = ctx.hub_signed_in(&ctx.hub()?)?;
-    let answer = ctx.hub_answer(client.yank_model_release(&repo.org, &repo.name, &release).await)?;
+    let answer = hub_answer(client.yank_model_release(&repo.org, &repo.name, &release).await)?;
     show(ctx, &repo, answer)
 }
 
@@ -151,7 +152,7 @@ pub(crate) async fn delete(ctx: &Context, args: Delete) -> Result<ExitCode, Erro
     let client = ctx.hub_signed_in(&hub)?;
     let view = match one {
         Some(manifest) => {
-            let answer = ctx.hub_answer(client.remove_model_checkpoint(&repo.org, &repo.name, &manifest).await)?;
+            let answer = hub_answer(client.remove_model_checkpoint(&repo.org, &repo.name, &manifest).await)?;
             Deleted {
                 model: repo.to_string(),
                 removed: answer.removed,
@@ -161,7 +162,7 @@ pub(crate) async fn delete(ctx: &Context, args: Delete) -> Result<ExitCode, Erro
             }
         }
         None => {
-            let answer = ctx.hub_answer(client.delete_model(&repo.org, &repo.name).await)?;
+            let answer = hub_answer(client.delete_model(&repo.org, &repo.name).await)?;
             Deleted {
                 model: answer.model,
                 checkpoint: None,

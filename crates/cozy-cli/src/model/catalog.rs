@@ -9,6 +9,7 @@ use serde::Serialize;
 use super::refs::{ModelRef, Repo};
 use super::{Family, Info, Search};
 use crate::Context;
+use crate::context::hub_answer;
 use crate::output::{self, Record, Table};
 
 /// One search row: the model's first available release in the Hub's order, and its lanes.
@@ -46,17 +47,17 @@ fn found(card: &ModelCard) -> Found {
 }
 
 pub(crate) async fn search(ctx: &Context, args: Search) -> Result<ExitCode, Error> {
-    let client = ctx.hub_anonymous(&ctx.hub()?)?;
+    let client = ctx.hub_anonymous(&ctx.hub()?);
     let exact = match (&args.family, args.query.as_slice()) {
         (None, [one]) => Repo::parse(one).ok(),
         _ => None,
     };
     let (cards, total) = match exact {
-        Some(repo) => (vec![ctx.hub_answer(client.get_model(&repo.org, &repo.name).await)?], 1),
+        Some(repo) => (vec![hub_answer(client.get_model(&repo.org, &repo.name).await)?], 1),
         None => {
             let query = args.query.join(" ");
             let q = Some(query.as_str()).filter(|q| !q.is_empty());
-            let answer = ctx.hub_answer(client.search_models(args.family.as_deref(), Some(args.limit.into()), q).await)?;
+            let answer = hub_answer(client.search_models(args.family.as_deref(), Some(args.limit.into()), q).await)?;
             // One card read per model, all at once.
             let mut reads = tokio::task::JoinSet::new();
             for (i, model) in answer.models.into_iter().take(args.limit as usize).enumerate() {
@@ -66,7 +67,7 @@ pub(crate) async fn search(ctx: &Context, args: Search) -> Result<ExitCode, Erro
             let mut cards = BTreeMap::new();
             while let Some(read) = reads.join_next().await {
                 let (i, card) = read.map_err(|e| Error::new(Kind::Internal, "card_read", e.to_string()))?;
-                cards.insert(i, ctx.hub_answer(card)?);
+                cards.insert(i, hub_answer(card)?);
             }
             (cards.into_values().collect(), answer.search.total)
         }
@@ -130,8 +131,8 @@ pub(crate) async fn info(ctx: &Context, args: Info) -> Result<ExitCode, Error> {
             return Err(Error::new(Kind::Usage, "model_ref_invalid", format!("{:?}: info reads org/name[@release]", args.model)));
         }
     };
-    let client = ctx.hub_anonymous(&ctx.hub()?)?;
-    let card = ctx.hub_answer(client.get_model(&repo.org, &repo.name).await)?;
+    let client = ctx.hub_anonymous(&ctx.hub()?);
+    let card = hub_answer(client.get_model(&repo.org, &repo.name).await)?;
     let releases: Vec<Release> = card
         .releases
         .iter()
@@ -194,7 +195,7 @@ pub(crate) async fn family(ctx: &Context, args: Family) -> Result<ExitCode, Erro
     let repo = Repo::hub(&args.model)?;
     let family = if args.clear { String::new() } else { args.family.unwrap_or_default() };
     let client = ctx.hub_signed_in(&ctx.hub()?)?;
-    let answer = ctx.hub_answer(client.set_model_family(&repo.org, &repo.name, &ModelFamilyUpdate { family }).await)?;
+    let answer = hub_answer(client.set_model_family(&repo.org, &repo.name, &ModelFamilyUpdate { family }).await)?;
     let view = FamilySet {
         model: repo.to_string(),
         family: answer.model.family.filter(|f| !f.is_empty()),
