@@ -6,7 +6,7 @@
 //! its newest revision, and every log line after N. Live events (`run.progress`, `run.waiting`)
 //! carry none and are never replayed, but the latest of each is sent on connect. The terminal
 //! events `run.completed`, `run.failed` and `run.canceled` end the stream.
-use std::{fmt, path::PathBuf};
+use std::{fmt, net::SocketAddr, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -418,6 +418,22 @@ pub struct Down {
     pub stopping: bool,
     /// What Calcifer still owes, which the next Calcifer resumes.
     pub owed: Vec<String>,
+}
+
+/// The file in Calcifer's directory (`~/.cozy/calcifer`) that says, as an `error::Envelope`, why
+/// the last start failed; a successful start deletes it.
+pub const REFUSED: &str = "refused.json";
+
+/// What a serving Calcifer publishes beside its lock (`calcifer.lock.holder`, 0600, one JSON
+/// line): where its API listens and the bearer it wants, fresh at every start. Absent while the
+/// lock is held: Calcifer is still opening its store.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Holder {
+    pub address: SocketAddr,
+    pub token: String,
+    pub pid: u32,
+    pub version: String,
+    pub started_at_ms: i64,
 }
 
 impl Kind {
