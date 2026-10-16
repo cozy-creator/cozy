@@ -24,16 +24,16 @@ import (
 // Distribution is the Runtime's Python distribution and executable name.
 const Distribution = "cozy-runtime"
 
-const ToolFloor = "0.25.0"
+const ToolFloor = "0.26.0"
 
 // ToolRelease is the Runtime this Cozy is released with: what it reads packages with. A tool
 // on PATH older than this is brought forward into this Cozy's own tool directory, never
 // refused (newer type resolution, such as a callee package's types, lives in newer tools).
-const ToolRelease = "0.25.0"
+const ToolRelease = "0.26.0"
 
 // PackageFloor is the first package SDK whose executor states its protocol revision and native
 // interfaces in its hello.
-const PackageFloor = "0.25.0"
+const PackageFloor = "0.26.0"
 
 var floor, release = pep440.MustParse(ToolFloor), pep440.MustParse(ToolRelease)
 
