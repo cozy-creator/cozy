@@ -71,6 +71,16 @@ fn main() {
             false,
         ),
         (
+            "a_tree_whose_leader_exited_is_killed_quietly",
+            a_tree_whose_leader_exited_is_killed_quietly,
+            false,
+        ),
+        (
+            "a_process_takes_its_role_name",
+            a_process_takes_its_role_name,
+            false,
+        ),
+        (
             "the_gpu_probe_answers_without_a_driver",
             the_gpu_probe_answers_without_a_driver,
             false,
@@ -105,6 +115,10 @@ fn child(args: &[String]) {
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     match args[..] {
         ["sleep"] => ready_and_wait(),
+        ["named", name] => {
+            process::set_name(name).unwrap();
+            ready_and_wait();
+        }
         ["hold", kind, path, record] => {
             let kind = if kind == "shared" {
                 Kind::Shared
@@ -210,6 +224,11 @@ fn a_held_lock_is_refused_until_its_holder_dies() {
     holder.wait().unwrap();
     waited.recv().unwrap();
     let held = waiter.join().unwrap();
+    assert_eq!(
+        lock.holder().unwrap(),
+        None,
+        "the next exclusive taker erases a killed holder's record"
+    );
     held.publish(b"holder 2").unwrap();
     assert!(lock.try_lock(Kind::Exclusive).unwrap().is_none());
     assert_eq!(lock.holder().unwrap().as_deref(), Some(&b"holder 2"[..]));
@@ -368,6 +387,41 @@ fn a_detached_process_outlives_its_spawner() {
     assert_eq!(birth.state().unwrap(), State::Live);
     detached.kill().unwrap();
     detached.wait().unwrap();
+}
+
+/// macOS answers EPERM, not ESRCH, when it signals an exited, unreaped process or its group.
+fn a_tree_whose_leader_exited_is_killed_quietly() {
+    if cfg!(windows) {
+        return println!("Windows ends a tree through its job");
+    }
+    let mut tree = process::spawn(child_command(&["sleep"]), Lifetime::Owned).unwrap();
+    ready(tree.stdout().unwrap());
+    let leader = Birth::of(tree.pid()).unwrap();
+    let status = Command::new("kill")
+        .args(["-KILL", &tree.pid().to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    // Unreaped, it stays a zombie; this samples until the kernel shows it exited.
+    while leader.state().unwrap() != State::Gone {
+        thread::sleep(Duration::from_millis(5));
+    }
+    tree.kill().unwrap();
+    assert!(!tree.wait().unwrap().success());
+}
+
+fn a_process_takes_its_role_name() {
+    if !cfg!(target_os = "linux") {
+        let refused = process::set_name("seams").unwrap_err();
+        assert!(refused.is_unsupported(), "{refused}");
+        return;
+    }
+    let mut child = child_command(&["named", "calcifer"]).spawn().unwrap();
+    ready(child.stdout.take().unwrap());
+    let comm = fs::read_to_string(format!("/proc/{}/comm", child.id())).unwrap();
+    assert_eq!(comm.trim(), "calcifer");
+    child.kill().unwrap();
+    child.wait().unwrap();
 }
 
 fn the_gpu_probe_answers_without_a_driver() {
