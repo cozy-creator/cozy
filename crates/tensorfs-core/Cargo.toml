@@ -44,6 +44,9 @@ futures = { version = "0.3.31", default-features = false, features = ["std", "ex
 nix = { version = "0.31.3", default-features = false, features = ["fs", "user"], optional = true }
 
 [dev-dependencies]
-fuser = { version = "0.15", default-features = false }
 libc = "0.2"
 rcgen = "0.13"
+
+# FUSE-mounted volume tests are Linux-only (macOS needs macFUSE, Windows has none).
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+fuser = { version = "0.15", default-features = false }

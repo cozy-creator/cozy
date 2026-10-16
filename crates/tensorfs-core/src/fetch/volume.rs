@@ -20,7 +20,11 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
-use rustix::fs::{AtFlags, OFlags, StatxFlags, CWD};
+use rustix::fs::OFlags;
+#[cfg(target_os = "linux")]
+use rustix::fs::{AtFlags, StatxFlags, CWD};
+#[cfg(not(target_os = "linux"))]
+use std::os::unix::fs::MetadataExt;
 
 use crate::admission::Disk;
 use crate::ids::{Doc, ObjectRef};
@@ -59,10 +63,16 @@ impl Volume {
     /// Read from cached attributes, so a hung mount cannot hold the caller.
     pub fn mounted(root: impl Into<PathBuf>, ttl: Duration) -> Option<Volume> {
         let root = root.into();
+        #[cfg(target_os = "linux")]
         let device = |path: &Path| {
             let flags = AtFlags::STATX_DONT_SYNC;
             let stat = rustix::fs::statx(CWD, path, flags, StatxFlags::BASIC_STATS).ok()?;
-            Some((stat.stx_dev_major, stat.stx_dev_minor))
+            Some((u64::from(stat.stx_dev_major), u64::from(stat.stx_dev_minor)))
+        };
+        // No cached-attribute stat off Linux: a hung mount can hold this caller.
+        #[cfg(not(target_os = "linux"))]
+        let device = |path: &Path| {
+            Some((fs::metadata(path).ok()?.dev(), 0u64))
         };
         (device(&root)? != device(root.parent()?)?).then(|| Volume::new(root, ttl))
     }
