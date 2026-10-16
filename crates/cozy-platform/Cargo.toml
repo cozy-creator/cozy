@@ -32,3 +32,6 @@ serde_json.workspace = true
 [[test]]
 name = "seams"
 harness = false
+
+[lints]
+workspace = true
