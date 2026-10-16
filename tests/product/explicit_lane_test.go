@@ -9,17 +9,17 @@ import (
 )
 
 // cl-170, the run that filed it (2026-09-07 22:27Z, req-91ca03bbf302e11e7ecb1ae9). An explicit
-// `model.model=paul/minimax-h3@1.0.0-rc.1/fp8-adaln-pruned` on a card publishing no component
-// bytes made EVERY product "rung 1, rung_asserted" — the override had become a one-lane
-// ladder — and the user's ready H100 was `excluded:unattached` for the seconds before its
+// `model.model=paul/minimax-h3@1.0.0-rc.1/fp8-adaln-pruned` was placed as if every product
+// fit it, and the user's ready H100 was `excluded:unattached` for the seconds before its
 // worker's control stream opened, so a 24 GB RTX 4090 was bought for the 103 GB lane and
 // refused on the pod (device_shortfall, short by 35.8 GB). The next request reused another
-// 4090 over the attached H100 on the rung tie. These arms drive the real binary and Calcifer
-// against the stand-in hub with the card's lanes unsized, as the card stood.
+// 4090 over the attached H100. These arms drive the real binary and Calcifer against the
+// stand-in hub: every product is held to the components the explicit lane stages.
 
 const (
-	explicitFP8 = "model.model=proof/minimax@1.0.0-rc.1/fp8-adaln-pruned"
-	fourKShort  = "excluded:vram_short: needs 103.0 GiB resident (lane fp8-adaln-pruned), rtx-4090 has 24 GB"
+	explicitFP8 = "model.model=proof/minimax@1.0.0-rc.1/fp8"
+	fourKShort  = textEncoderVerdict + ", rtx-4090 has 24 GB"
+	h100Fit     = "components 51.5 GiB (total memory unmeasured for this exact workload/SKU) of 80 GB"
 )
 
 // placementEvents is every durable `request.placement` record of the request, oldest first.
@@ -51,10 +51,8 @@ func candidateFits(placement map[string]any) map[string]string {
 }
 
 func TestExplicitLaneWaitsForTheAttachingRentalAndNeverBuysAround(t *testing.T) {
-	h := newLadderHub(t)
-	h.unsized = true
-	h.bind(goodLadder())
-	root := ladderRoot(t, h)
+	h := newStandInHub(t)
+	root := standInRoot(t, h)
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()
@@ -81,21 +79,13 @@ func TestExplicitLaneWaitsForTheAttachingRentalAndNeverBuysAround(t *testing.T) 
 	if verdicts["yumichika"] != "chosen" || verdicts["rtx-4090"] != fourKShort {
 		t.Fatalf("verdicts %v", verdicts)
 	}
-	if fits["yumichika"] != "rung_asserted" || fits["rtx-4090"] != "lane_bytes 103.0 GiB (working memory unmeasured) of 24 GB" ||
-		fits["b200"] != "lane_bytes 103.0 GiB (working memory unmeasured) of 180 GB" {
+	if fits["yumichika"] != h100Fit ||
+		fits["b200"] != "components 51.5 GiB (total memory unmeasured for this exact workload/SKU) of 180 GB" {
 		t.Fatalf("fits %v", fits)
 	}
-	if placement["override"] != "fp8-adaln-pruned" || placement["rental"] != yumichika.ID || placement["bought"] != false ||
-		placement["line"] != "placement: reuse yumichika (h100-80, fp8-adaln-pruned) — balanced, unmeasured" {
+	if placement["override"] != "fp8" || placement["rental"] != yumichika.ID || placement["bought"] != false ||
+		placement["line"] != "placement: reuse yumichika (h100-80, fp8) — balanced, unmeasured" {
 		t.Fatalf("the placement record: %v", placement)
-	}
-	if ladder, _ := placement["ladder"].([]any); len(ladder) != 1 || ladder[0] != "H100=fp8-adaln-pruned > B200=mxfp8-adaln-pruned > *=bf16-full" {
-		t.Fatalf("the record does not carry the owner's ladder: %v", placement["ladder"])
-	}
-	for _, raw := range placement["candidates"].([]any) {
-		if c := raw.(map[string]any); c["rung"] != nil {
-			t.Fatalf("a candidate under an override carries a rung: %v", c)
-		}
 	}
 	waitFor(t, root, "the request pinned to the H100", func() bool {
 		current, problem := store.RequestByIdempotencyKey("explicit-wait")
@@ -103,7 +93,7 @@ func TestExplicitLaneWaitsForTheAttachingRentalAndNeverBuysAround(t *testing.T) 
 	})
 	pinned, problem := store.RequestByIdempotencyKey("explicit-wait")
 	fatal(t, problem)
-	if pinned.Models[0].Lane != "fp8-adaln-pruned" || pinned.Models[0].Manifest != fp8Manifest {
+	if pinned.Models[0].Lane != "fp8" || pinned.Models[0].Manifest != fp8Manifest || !pinned.Models[0].Choice {
 		t.Fatalf("pinned %+v; want the explicit fp8 lane", pinned.Models[0])
 	}
 	if asks := h.postedSKUs(); len(asks) != 0 {
@@ -112,15 +102,13 @@ func TestExplicitLaneWaitsForTheAttachingRentalAndNeverBuysAround(t *testing.T) 
 }
 
 func TestExplicitLaneReusesTheFittingRentalOverTheCheaperShortOne(t *testing.T) {
-	h := newLadderHub(t)
-	h.unsized = true
-	h.bind(goodLadder())
-	root := ladderRoot(t, h)
+	h := newStandInHub(t)
+	root := standInRoot(t, h)
 	cert := filepath.Join(root, "fixture.pem")
 	must(t, os.WriteFile(cert, []byte("fixture"), 0600))
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
-	// Two attached rentals: the cheaper 4090 sorts first and used to win the rung tie.
+	// Two attached rentals: the cheaper 4090 sorts first.
 	for _, seed := range []records.Rental{
 		{AcceleratorCount: 1, ID: "pr-hairu", MachineName: "hairu", SKU: "rtx-4090", AcceleratorModel: "NVIDIA GeForce RTX 4090",
 			HourlyRateUSDMicros: 740_000, State: "ready", Address: "127.0.0.1:1", CertPath: cert, Hub: h.server.URL},
@@ -146,8 +134,8 @@ func TestExplicitLaneReusesTheFittingRentalOverTheCheaperShortOne(t *testing.T) 
 	if row == nil {
 		t.Fatalf("the run was not submitted: %s", out)
 	}
-	if row.Worker != "pr-yumichika" || row.Models[0].Lane != "fp8-adaln-pruned" || row.Models[0].Manifest != fp8Manifest {
-		t.Fatalf("pinned to %q with %+v; want pr-yumichika on fp8-adaln-pruned", row.Worker, row.Models[0])
+	if row.Worker != "pr-yumichika" || row.Models[0].Lane != "fp8" || row.Models[0].Manifest != fp8Manifest {
+		t.Fatalf("pinned to %q with %+v; want pr-yumichika on fp8", row.Worker, row.Models[0])
 	}
 	if asks := h.postedSKUs(); len(asks) != 0 {
 		t.Fatalf("two attached rentals and the fleet still bought: %v", asks)
@@ -158,11 +146,11 @@ func TestExplicitLaneReusesTheFittingRentalOverTheCheaperShortOne(t *testing.T) 
 		verdicts["h100-80"] != "unmeasured" {
 		t.Fatalf("verdicts %v", verdicts)
 	}
-	if fits["yumichika"] != "rung_asserted" || fits["hairu"] != "lane_bytes 103.0 GiB (working memory unmeasured) of 24 GB" {
+	if fits["yumichika"] != h100Fit {
 		t.Fatalf("fits %v", fits)
 	}
-	if placement["override"] != "fp8-adaln-pruned" || placement["rental"] != "pr-yumichika" ||
-		placement["line"] != "placement: reuse yumichika (h100-80, fp8-adaln-pruned) — balanced, unmeasured" {
+	if placement["override"] != "fp8" || placement["rental"] != "pr-yumichika" ||
+		placement["line"] != "placement: reuse yumichika (h100-80, fp8) — balanced, unmeasured" {
 		t.Fatalf("the record: %v", placement)
 	}
 }

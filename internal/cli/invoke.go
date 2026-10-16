@@ -205,6 +205,10 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	if gpuProblem != nil {
 		return gpuProblem
 	}
+	bits, e := runBits(ctx)
+	if e != nil {
+		return e
+	}
 	deadline, e := runDeadline(ctx)
 	if e != nil {
 		return e
@@ -292,13 +296,18 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 		return exit.Usagef("a provider-source model runs on a named machine").
 			WithRemedy("add --rental=<name>; the machine resolves, narrows and converts the source itself")
 	}
-	// Every slot is chosen here, whatever machine runs the call: it reads no binding or model
-	// card at a Hub, only each named release lane's closure (th-245).
-	if models, e = exactRunModels(ctx, target, ep, overrides.Models, models, resolveInvocationModels); e != nil {
-		return e
-	}
 	if models, e = applyModelAdapters(ctx, target, ep, models, overrides.Overlays); e != nil {
 		return e
+	}
+	// Every machine is sent the run's choices alone and picks each lane itself (xs-042). Only
+	// a machine the fleet is about to choose is sized here, by the lanes it would serve.
+	if models, e = exactCheckpoints(ctx, ep, models); e != nil {
+		return e
+	}
+	if managedRental && selectedRental == "" {
+		if models, e = sizedRunModels(ctx, target, ep, models, int(bits)); e != nil {
+			return e
+		}
 	}
 	outputDirectory, e := requestedOutputDirectory(ctx)
 	if e != nil {
@@ -327,7 +336,7 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 		RequestedRental: selectedRental,
 		Models:          models,
 		OutputDirectory: outputDirectory,
-		AttentionKernel: attentionKernel, GPUs: gpus,
+		AttentionKernel: attentionKernel, GPUs: gpus, Bits: bits,
 		Ignored:            ignored,
 		WeightsDestination: destination, Trees: trees, PlannedSourceBytes: plannedSourceBytes,
 		TimeoutMS: (deadline + time.Millisecond - 1).Milliseconds(),
@@ -386,11 +395,11 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	return renderRun(ctx, life, terminal, stopped, saved, submitted)
 }
 
-// modelChoices are a published call's explicit `model.<param>=` selections, parsed and
-// nothing more: the machine that runs the call resolves them and every other slot for its
-// own devices. A provider source is only pinned to its commit (one metadata read, none when
-// the caller named the commit); the machine narrows and converts it. It answers false for a
-// call the machine cannot take that way.
+// modelChoices are a call's explicit `model.<param>=` selections, parsed and nothing more:
+// the machine that runs the call resolves them and every other slot for its own devices. A
+// provider source is only pinned to its commit (one metadata read, none when the caller named
+// the commit); the machine narrows and converts it. It answers false for a call the machine
+// cannot take that way.
 func modelChoices(ctx *Context, target Target, ep *launch.Entrypoint, overrides map[string]string) ([]orchestrator.ModelRef, bool, *exit.Error) {
 	profiles, problem := parseSourceProfileFlags(ctx)
 	if problem != nil {
@@ -450,13 +459,12 @@ func modelChoices(ctx *Context, target Target, ep *launch.Entrypoint, overrides 
 	for parameter := range profiles {
 		return nil, false, exit.Usagef("--source-profile %s names no model parameter of %s", parameter, target.Function)
 	}
-	// Unpublished code is a root naming its installation; its open slots resolve here under the
-	// owner the root names (exactRunModels). Code that calls other unpublished code goes by
-	// capture instead, unless every slot names one provider source.
+	// Code that calls other unpublished code goes by capture, unless every slot names one
+	// provider source.
 	if (strings.HasPrefix(target.Package, "local/") || target.Snapshot) && !oneSource(ep, out) {
 		calls, problem := callsUnpublished(ctx, target.InstallID)
 		if problem != nil || calls {
-			return capturedModelChoices(out), false, problem
+			return out, false, problem
 		}
 	}
 	return out, true, nil
@@ -523,458 +531,81 @@ func pinnedProviderSource(ctx *Context, raw string) (string, *exit.Error) {
 	return source.Canonical, nil
 }
 
-// exactRunModels are a run's model choices: every Hub slot of ep resolved here, an explicit
-// choice to its release lane and an unchosen slot to its binding's ladder, beside the provider
-// sources the caller named and its captured children's choices. The machine is sent their
-// names and resolves each release lane at the Hub (th-245).
-//
-// Kept under the catalog revision this client knows, as a machine once kept its own: a warm
-// run reads nothing at any Hub, and a publish, yank or bind (here or stated by the Hub) moves
-// the revision and so resolves again.
-func exactRunModels(ctx *Context, target Target, ep *launch.Entrypoint, overrides map[string]string,
-	chosen []orchestrator.ModelRef,
-	resolve func(*Context, Target, *launch.Entrypoint, map[string]string) ([]orchestrator.ModelRef, *exit.Error),
-) ([]orchestrator.ModelRef, *exit.Error) {
-	kept := keptRunModelsPath(ctx, target, ep, overrides, chosen)
-	if raw, err := os.ReadFile(kept); kept != "" && err == nil {
-		var models []orchestrator.ModelRef
-		if json.Unmarshal(raw, &models) == nil {
-			return models, nil
-		}
-	}
-	models, problem := resolveRunModels(ctx, target, ep, overrides, chosen, resolve)
-	if raw, err := json.Marshal(models); problem == nil && kept != "" && err == nil && !ctx.provisional &&
-		os.MkdirAll(filepath.Dir(kept), 0o700) == nil && os.WriteFile(kept+".tmp", raw, 0o600) == nil {
-		_ = os.Rename(kept+".tmp", kept)
-	}
-	return models, problem
-}
-
-// keptRunModelsPath names one run's resolved models: its Hub, code, callable and declared
-// slots, choices, the signed-in credential (org-relative names are its account's) and the
-// catalog revision. "" when the revision cannot be read.
-func keptRunModelsPath(ctx *Context, target Target, ep *launch.Entrypoint, overrides map[string]string, chosen []orchestrator.ModelRef) string {
-	_, store, _, problem := open(ctx.Cfg, false)
-	if problem != nil {
-		return ""
-	}
-	revision, problem := store.BindingRevision(ctx.Cfg.HubURL)
-	store.Close()
-	if problem != nil {
-		return ""
-	}
-	identity, err := json.Marshal([]any{"run-models/2", ctx.Cfg.HubURL, target.Package, target.Release, target.InstallID,
-		ep.Name, ep.Models, overrides, chosen, client(ctx).CredentialIdentity(), revision})
-	if err != nil {
-		return ""
-	}
-	name := sha256.Sum256(identity)
-	return filepath.Join(home.Paths(ctx.Cfg.Home).Root, "releases", "models", hex.EncodeToString(name[:16])+".json")
-}
-
-func resolveRunModels(ctx *Context, target Target, ep *launch.Entrypoint, overrides map[string]string,
-	chosen []orchestrator.ModelRef,
-	resolve func(*Context, Target, *launch.Entrypoint, map[string]string) ([]orchestrator.ModelRef, *exit.Error),
-) ([]orchestrator.ModelRef, *exit.Error) {
-	var out []orchestrator.ModelRef
-	sourced := map[string]bool{}
-	for _, model := range chosen {
-		if model.Source != "" && model.Callable == "" {
-			sourced[model.BindingSlot()] = true
-			out = append(out, model)
-		}
-	}
-	hubSlots := *ep
-	hubSlots.Models = slices.DeleteFunc(slices.Clone(ep.Models), func(slot launch.Slot) bool { return sourced[slot.Path] })
-	if len(hubSlots.Models) > 0 {
-		resolved, problem := resolve(ctx, target, &hubSlots, overrides)
-		if problem != nil {
-			return nil, problem
-		}
-		out = append(out, resolved...)
-	}
-	for _, child := range capturedModelChoices(chosen) {
-		// A choice for a slot this package does not declare is the machine's to ignore, with a
-		// warning in the run's log: nothing is read at a Hub for it.
-		if target.surface != nil && child.Package == target.Package && !target.surface.DeclaresSlot(child.BindingSlot()) {
-			out = append(out, child)
+// exactCheckpoints resolves each choice naming a checkpoint by hash alone to the retained
+// checkpoint, with the manifest length its machine is sent.
+func exactCheckpoints(ctx *Context, ep *launch.Entrypoint, models []orchestrator.ModelRef) ([]orchestrator.ModelRef, *exit.Error) {
+	hctx, cancel := hub.Context()
+	defer cancel()
+	out := slices.Clone(models)
+	for i, model := range out {
+		if model.Source != "" || model.Release != "" || model.Manifest == "" || model.HubCheckpoint {
 			continue
 		}
-		pinned, problem := pinModelChoice(ctx, child)
-		if problem != nil {
+		slot := launch.Slot{Path: model.BindingSlot()}
+		if j := slices.IndexFunc(ep.Models, func(own launch.Slot) bool { return own.Path == slot.Path }); j >= 0 && model.Callable == "" {
+			slot = ep.Models[j]
+		}
+		var problem *exit.Error
+		if out[i], problem = sizedModel(hctx, client(ctx), slot, model, 8); problem != nil {
 			return nil, problem
 		}
-		out = append(out, pinned)
 	}
 	return out, nil
 }
 
-// pinModelChoice is a named model choice at its exact checkpoint: a provider source or a pinned
-// manifest as it is, else the release and lane it names resolved at the Hub.
-func pinModelChoice(ctx *Context, model orchestrator.ModelRef) (orchestrator.ModelRef, *exit.Error) {
-	if model.Source != "" || model.Manifest != "" {
-		return model, nil
-	}
-	spec := model.Model
-	if model.Release != "" {
-		spec += "@" + model.Release
-	}
-	hctx, cancel := hub.Context()
-	defer cancel()
-	resolved, problem := client(ctx).ResolveModel(hctx, spec, model.Lane)
-	if problem != nil {
-		return model, problem
-	}
-	if resolved.Model != model.Model || resolved.ManifestID == "" {
-		return model, exit.Named(exit.Conflict, "rental.model_resolution_changed",
-			"Tensorhub returned no exact checkpoint for %s", spec)
-	}
-	model.Release, model.Lane, model.Manifest, model.ManifestLength = resolved.Release, resolved.Lane, resolved.ManifestID, resolved.ManifestLength
-	return model, nil
-}
-
-// invocationModelSpec is one slot's selection before the card is read: an explicit
-// `model.<param>=` run key pins Ref (and possibly Lane); a bare run takes Ref from the
-// owner binding or authored default; its ladder decides the lane. Beside a run key the binding is
-// only the owner's word on where that lane fits (cl-170): evidence, never a choice.
-type invocationModelSpec struct {
-	Slot     string
-	Ref      string
-	Lane     string
-	Explicit bool
-	Binding  *hub.PackageBindingRow
-}
-
-// resolveInvocationModels applies the one selection order for every machine: an explicit
-// `model.<param>=` run key, then a Hub owner override, then the selected callable's
-// authored default ladder. The whole ladder travels; the machine that runs the call pins
-// its rung from the devices it measured. Editable packages use authored defaults without a
-// Hub override.
-func resolveInvocationModels(ctx *Context, target Target, ep *launch.Entrypoint,
-	overrides map[string]string,
-) ([]orchestrator.ModelRef, *exit.Error) {
-	selected, problem := invocationModelSpecs(ctx, target, ep, overrides)
-	if problem != nil || len(selected) == 0 {
-		return nil, problem
-	}
-	return resolveSelectedInvocationModels(ctx, target, ep, selected)
-}
-
-func resolveSelectedInvocationModels(ctx *Context, target Target, ep *launch.Entrypoint,
-	selected []invocationModelSpec,
-) ([]orchestrator.ModelRef, *exit.Error) {
-	slots := make(map[string]launch.Slot, len(ep.Models))
+// sizedRunModels are a run's choices with the facts a rental the fleet chooses is sized by
+// (xs-042 §3): each chosen Hub model's lane bytes, and each other slot's default at the lane
+// its machine's rules would serve, at bits or the slot's own. No machine is sent a default:
+// it loads the slot's default itself.
+func sizedRunModels(ctx *Context, target Target, ep *launch.Entrypoint, models []orchestrator.ModelRef, bits int) ([]orchestrator.ModelRef, *exit.Error) {
+	owner := packageOwner(target.Package, ep.Models, commandNamespace(ctx))
+	refs := make([]string, 0, len(ep.Models)+len(models))
 	for _, slot := range ep.Models {
-		slots[slot.Path] = slot
+		chosen := slices.ContainsFunc(models, func(model orchestrator.ModelRef) bool {
+			return model.Callable == "" && model.BindingSlot() == slot.Path && (model.Model != "" || model.Source != "")
+		})
+		if def := slot.DefaultRef(owner); def != "" {
+			refs = append(refs, def)
+		} else if !chosen {
+			// Refused before any card is read or machine bought: its machine could not run it.
+			return nil, noDefault(target.Package, slot)
+		}
 	}
-	refs := make([]string, 0, len(selected))
-	for _, spec := range selected {
-		refs = append(refs, spec.Ref)
+	for _, model := range models {
+		refs = append(refs, model.Model)
 	}
 	cards := readCards(ctx, refs)
-	out := make([]orchestrator.ModelRef, 0, len(selected))
-	for _, spec := range selected {
-		slot, ok := slots[spec.Slot]
-		if !ok {
-			return nil, exit.Internalf("resolved model slot %s is absent from the package interface", spec.Slot)
-		}
-		var row orchestrator.ModelRef
-		var problem *exit.Error
-		if spec.Explicit {
-			row, problem = resolveRemoteModel(ctx, cards, target.Package, slot, spec.Ref, spec.Lane, spec.Binding)
-		} else {
-			row, problem = resolveRemoteLadder(ctx, cards, target.Package, slot, spec)
-		}
-		if problem != nil {
-			return nil, problem
-		}
-		row.Choice = spec.Explicit
-		out = append(out, row)
-	}
-	return out, nil
-}
-
-func invocationModelSpecs(ctx *Context, target Target, ep *launch.Entrypoint,
-	overrides map[string]string,
-) ([]invocationModelSpec, *exit.Error) {
-	if len(ep.Models) == 0 {
-		return nil, nil
-	}
-	// ParsePayload already resolved every `model.<param>=` key onto a declared slot
-	// path; here each ref parses once through the one grammar, with the lane carried
-	// beside the ref the way the resolvers take it.
-	selected := make(map[string]invocationModelSpec, len(overrides))
-	for slotPath, raw := range overrides {
-		source, provider, problem := providerModelSource(raw)
-		if problem != nil {
-			return nil, problem
-		}
-		if provider {
-			selected[slotPath] = invocationModelSpec{Slot: slotPath, Ref: source, Explicit: true}
-			continue
-		}
-		model, release, lane, manifest, problem := hub.ParseModelRef(raw)
-		if problem != nil {
-			return nil, problem
-		}
-		ref := model
-		if release != "" {
-			ref += "@" + release
-		}
-		if manifest != "" {
-			ref += "#" + manifest
-		}
-		selected[slotPath] = invocationModelSpec{Slot: slotPath, Ref: ref, Lane: lane, Explicit: true}
-	}
-	// Editable packages have no Hub override; their selected source still declares
-	// the same immutable default metadata as a published package.
-	editable := strings.HasPrefix(target.Package, "local/")
-	defaults := map[string]hub.PackageBindingRow{}
-	if !editable {
-		var problem *exit.Error
-		if defaults, problem = invocationDefaultBindings(ctx, target, ep.Models); problem != nil {
-			// A slot a run key covers needs no binding: beside it the read is only the
-			// owner's word on the lane's fit (cl-170), and a hub that cannot give it
-			// leaves the lane held to its own bytes rather than refusing the run.
-			if len(selected) < len(ep.Models) {
-				return nil, problem
-			}
-			defaults = map[string]hub.PackageBindingRow{}
-		}
-	} else {
-		defaults = effectiveModelBindings(ep.Models, nil, packageOwner(target.Package, ep.Models, commandNamespace(ctx)))
-	}
-	out := make([]invocationModelSpec, 0, len(ep.Models))
-	for _, slot := range ep.Models {
-		if spec, ok := selected[slot.Path]; ok {
-			if binding, bound := defaults[slot.Path]; bound {
-				spec.Binding = &binding
-			}
-			out = append(out, spec)
-			continue
-		}
-		binding, ok := defaults[slot.Path]
-		if !ok {
-			if editable && slot.RelativeDefault() {
-				_, problem := commandNamespace(ctx)()
-				message := "the caller on this Tensorhub is unknown"
-				if problem != nil {
-					message = problem.Message
-				}
-				return nil, exit.Named(exit.Unavailable, "package_model_default_owner_unknown",
-					"%s default %s for model slot %s names your account's model, but %s",
-					target.Package, slot.DefaultBinding.Ref(), slot.Path, message).
-					WithRemedy("sign in on %s, or override this run: model.%s=org/model@release[/lane]", ctx.Cfg.HubURL, slot.Param)
-			}
-			if editable {
-				return nil, exit.Named(exit.Usage, "package_model_override_required",
-					"%s has no authored default for model slot %s", target.Package, slot.Path).
-					WithRemedy("model.%s=org/model@release[/lane]", slot.Param)
-			}
-			return nil, exit.Named(exit.NotFound, "package_default_model_unavailable",
-				"%s/%s is disabled in this deployment: no default model binding for %s", target.Package, ep.Name, slot.Param).
-				WithRemedy("bind it: %s — or override this run: model.%s=org/model@release[/lane]",
-					bindRemedy(target.Package, slot.Path), slot.Param)
-		}
-		out = append(out, invocationModelSpec{Slot: slot.Path, Ref: binding.Ref(), Binding: &binding})
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Slot < out[j].Slot })
-	return out, nil
-}
-
-// invocationDefaultBindings are the package's default bindings for these slots (th-116,
-// cl-166): the owner's rows, each a model release and its ladder, where absent the selected
-// callable's declared defaults. A run reads no Hub for them: the rows this client read at the
-// current catalog revision stand. Once the revision moves they are read again; while that read
-// is out of reach, or still under way, the rows read before stand. Only a package whose rows
-// were never read falls back to its declared defaults, with a warning. A choice made from rows
-// not read at this revision is used but never kept (Context.provisional).
-func invocationDefaultBindings(ctx *Context, target Target, slots []launch.Slot) (
-	map[string]hub.PackageBindingRow, *exit.Error,
-) {
-	ref, problem := hub.ParseRef(target.Package)
-	if problem != nil {
-		return nil, problem
-	}
-	paths := make([]string, len(slots))
-	for i, slot := range slots {
-		paths[i] = slot.Path
-	}
-	catalog, revision := client(ctx), catalogRevision(ctx)
-	rows, readAt, known := catalog.KeptPackageBindings(ref)
-	if !known || readAt != revision {
-		read := func() ([]hub.PackageBindingRow, *exit.Error) {
-			hctx, cancel := hub.Context()
-			defer cancel()
-			fresh, problem := catalog.PackageBindingRows(hctx, ref)
-			if problem == nil {
-				catalog.KeepPackageBindings(ref, revision, fresh)
-			}
-			return fresh, problem
-		}
-		if known {
-			// The rows read before stand for this run; the next one finds them refreshed.
-			ctx.provisional = true
-			go func() { _, _ = read() }()
-		} else if fresh, problem := read(); problem == nil {
-			rows = fresh
-		} else {
-			ctx.provisional = true
-			fmt.Fprintf(ctx.Err, "warning: %s owner bindings are not readable (%s); using the release's declared defaults\n", target.Package, problem.Message)
-		}
-	}
-	used, problem := hub.UsableBindings(ref, rows, paths...)
-	if problem != nil {
-		remedy := "choose the model per run: model.<param>=org/model@release"
-		if problem.Remedy != "" {
-			remedy = problem.Remedy + " — or " + remedy
-		}
-		return nil, exit.Named(problem.Code, "package_default_model_unavailable",
-			"%s default bindings are unusable: %s", target.Package, problem.Message).
-			WithRemedy("%s", remedy)
-	}
-	return effectiveModelBindings(slots, used, ref.Org), nil
-}
-
-func resolveRemoteModel(ctx *Context, cards cardReader, packageName string, slot launch.Slot, raw, wantedLane string,
-	binding *hub.PackageBindingRow) (orchestrator.ModelRef, *exit.Error) {
-	// Exact checkpoint inputs use Hub-owned facts; named selections use the release
-	// card. Both freeze a verified repository/manifest identity before preparation.
-	var empty orchestrator.ModelRef
-	modelName, release, refLane, manifest, problem := hub.ParseModelRef(raw)
-	if problem != nil {
-		return empty, problem
-	}
-	if refLane != "" {
-		if wantedLane != "" && wantedLane != refLane {
-			return empty, exit.Usagef("%q asks for lane %q while lane %q was already selected",
-				raw, refLane, wantedLane)
-		}
-		wantedLane = refLane
-	}
-	ref, problem := hub.ParseRef(modelName)
-	if problem != nil {
-		return empty, problem
-	}
-	if ref.Org == "local" {
-		return empty, localModelOnMachine(ref)
-	}
 	hctx, cancel := hub.Context()
 	defer cancel()
-	if manifest != "" && release == "" {
-		if wantedLane != "" {
-			return empty, exit.Usagef("a checkpoint digest without a release cannot select a lane")
-		}
-		resolved, problem := client(ctx).ResolveModel(hctx, ref.String()+"@"+manifest, "")
-		if problem != nil {
-			return empty, problem
-		}
-		if resolved.Model != ref.String() || resolved.ManifestID != manifest ||
-			resolved.ManifestLength <= 0 || resolved.Bytes <= 0 {
-			return empty, exit.Named(exit.Conflict, "rental.model_resolution_changed",
-				"Tensorhub returned different or incomplete checkpoint facts for %s", raw)
-		}
-		if problem := requireCheckpointComponents(raw, slot, resolved.Components); problem != nil {
-			return empty, problem
-		}
-		return orchestrator.ModelRef{Package: packageName, Slot: slot.Path,
-			Model: ref.String(), CatalogRepository: ref.String(), Manifest: manifest, HubCheckpoint: true,
-			ManifestLength: resolved.ManifestLength, Bytes: resolved.Bytes,
-			ComponentBytes: resolved.ComponentBytes, ComponentUse: slot.ComponentUse}, nil
-	}
-	_, selected, problem := modelReleaseCardForLane(hctx, cards, ref, release, wantedLane)
-	if problem != nil {
-		return empty, problem
-	}
-	warnYanked(ctx, ref, selected)
-	release = selected.Release
-	if wantedLane != "" {
-		if _, problem := laneOf(ref, selected, wantedLane); problem != nil {
-			return empty, problem
-		}
-	}
-	manifestLanes := map[string][]string{}
-	manifestBytes := map[string]int64{}
-	manifestComponents := map[string][]string{}
-	manifestComponentBytes := map[string]map[string]int64{}
-	for _, lane := range selected.Lanes {
-		if (manifest == "" || lane.ManifestID == manifest) &&
-			(wantedLane == "" || lane.Lane == wantedLane) {
-			manifestLanes[lane.ManifestID] = append(manifestLanes[lane.ManifestID], lane.Lane)
-			manifestBytes[lane.ManifestID] = lane.Bytes
-			manifestComponents[lane.ManifestID] = lane.Components
-			manifestComponentBytes[lane.ManifestID] = lane.ComponentBytes
-		}
-	}
-	if manifest != "" && len(manifestLanes[manifest]) == 0 {
-		return empty, exit.New(exit.NotFound, "model %s@%s does not contain manifest %s",
-			ref.String(), release, manifest)
-	}
-	if manifest == "" {
-		if len(manifestLanes) != 1 && binding != nil && binding.Model == ref.String() {
-			// Several lanes and no lane named: the owner's ladder for this model picks
-			// one per machine, exactly as it does for an unselected slot.
-			if rungs, problem := ladderRungs(ctx, ref, selected, slot, raw, binding.Ladder); problem == nil && len(rungs) > 0 {
-				return orchestrator.ModelRef{Package: packageName, Slot: slot.Path, Model: ref.String(),
-					CatalogRepository: ref.String(), Release: release, ComponentUse: slot.ComponentUse, Ladder: rungs}, nil
+	out := slices.Clone(models)
+	for _, slot := range ep.Models {
+		i := slices.IndexFunc(out, func(model orchestrator.ModelRef) bool {
+			return model.Callable == "" && model.BindingSlot() == slot.Path
+		})
+		switch {
+		case i >= 0 && (out[i].Source != "" || out[i].HubCheckpoint):
+			// Sized already: by the source the machine converts (PlannedSourceBytes), or the
+			// checkpoint named by hash.
+		case i >= 0 && out[i].Model != "":
+			sized, problem := sizedModel(hctx, cards, slot, out[i], cmp.Or(bits, slot.Bits()))
+			if problem != nil {
+				return nil, problem
 			}
-		}
-		// Else the release's default lane (th-245), else its only manifest.
-		for _, lane := range selected.Lanes {
-			if wantedLane == "" && lane.Lane == selected.DefaultLane {
-				manifest, wantedLane = lane.ManifestID, lane.Lane
+			out[i] = sized
+		default:
+			sized, problem := sizedDefault(hctx, cards, target.Package, owner, slot, bits)
+			if problem != nil {
+				return nil, problem
 			}
-		}
-		if manifest == "" && len(manifestLanes) != 1 {
-			return empty, exit.Usagef("model %s@%s has %d manifests", ref.String(), release, len(manifestLanes)).
-				WithRemedy("append /<lane> or #sha256:<digest> to select one exact manifest")
-		}
-		for digest := range manifestLanes {
-			if manifest == "" {
-				manifest = digest
+			if i < 0 {
+				out = append(out, sized)
+				continue
 			}
+			// Adapters on the default: the choice carries its bytes, never its lane.
+			out[i].Bytes, out[i].ComponentBytes, out[i].ComponentUse = sized.Bytes, sized.ComponentBytes, sized.ComponentUse
 		}
 	}
-	if _, err := canonical.Raw(manifest); err != nil {
-		return empty, exit.Named(exit.Conflict, "rental.model_manifest_invalid",
-			"Tensorhub returned an invalid manifest for %s@%s", ref.String(), release)
-	}
-	lanes := manifestLanes[manifest]
-	sort.Strings(lanes)
-	if wantedLane != "" {
-		lanes = []string{wantedLane}
-	}
-	if problem := requireCheckpointComponents(raw, slot, manifestComponents[manifest]); problem != nil {
-		return empty, problem
-	}
-	return orchestrator.ModelRef{Package: packageName, Slot: slot.Path,
-		Model: ref.String(), CatalogRepository: ref.String(), Release: release, Lane: lanes[0], Manifest: manifest,
-		Bytes: manifestBytes[manifest], ComponentBytes: manifestComponentBytes[manifest],
-		ComponentUse: slot.ComponentUse, Ladder: assertedRungs(binding, ref, selected)}, nil
-}
-
-// assertedRungs is the owner's ladder carried beside an explicit lane (cl-170): each rung
-// resolved to the selected release's lane of that name, saying where the owner puts each
-// lane of THIS model — the evidence a machine decision reads for the fit of the lane the
-// run key chose, never a choice. The binding's release is not required (cl-174): a rung
-// names a card and a lane, and on 2026-09-08 a package bound to rc.2 sized an explicit
-// rc.1 lane of the same name by whole-lane bytes, refusing two H100s that were running
-// that very lane. A binding for another model, or a rung naming a lane the selected
-// release lacks, says nothing here.
-func assertedRungs(binding *hub.PackageBindingRow, ref hub.Ref, selected *hub.ModelReleaseSummary) []records.ModelRung {
-	if binding == nil || binding.Model != ref.String() {
-		return nil
-	}
-	var rungs []records.ModelRung
-	for _, rung := range binding.Ladder {
-		lane, problem := laneOf(ref, selected, rung.Lane)
-		if problem != nil {
-			continue
-		}
-		rungs = append(rungs, records.ModelRung{GPU: rung.GPU, GPUs: rung.GPUs, Lane: rung.Lane,
-			Manifest: lane.ManifestID, Bytes: lane.Bytes, ComponentBytes: lane.ComponentBytes})
-	}
-	return rungs
+	return out, nil
 }
 
 func handleRunCancel(ctx *Context) *exit.Error {
@@ -3379,48 +3010,15 @@ func emitDescribe(ctx *Context, target Target, packageInterface *launch.PackageI
 		return nil
 	}
 	fmt.Fprint(ctx.Out, launch.DescribeContract(target.Package+"/"+ep.Name, ep,
-		describeBindings(ctx, target, ep)))
+		packageOwner(target.Package, ep.Models, commandNamespace(ctx))))
 	return nil
 }
 
-// describeBindings resolves each slot's CURRENT default binding — the same mutable hub
-// pointers a bare run resolves (th-116) — best effort: the contract stays readable
-// offline, with an unreadable default rendered as no default rather than a refusal.
-func describeBindings(ctx *Context, target Target, ep *launch.Entrypoint) map[string]string {
-	if len(ep.Models) == 0 || strings.HasPrefix(target.Package, "local/") {
-		return nil
-	}
-	rows, problem := invocationDefaultBindings(ctx, target, ep.Models)
-	if problem != nil {
-		return nil
-	}
-	out := make(map[string]string, len(rows))
-	for slot, row := range rows {
-		out[slot] = row.Ref()
-	}
-	return out
-}
-
 func emitFunctions(ctx *Context, target Target, packageInterface *launch.PackageInterface) *exit.Error {
-	var public []launch.Entrypoint
-	for _, entrypoint := range packageInterface.Entrypoints {
-		if !entrypoint.Internal {
-			public = append(public, entrypoint)
-		}
-	}
-	slots := declaredModelSlots(public)
-	defaults := effectiveModelBindings(slots, nil, packageOwner(target.Package, slots, commandNamespace(ctx)))
-	var bindingProblem *exit.Error
-	if len(slots) > 0 && !strings.HasPrefix(target.Package, "local/") {
-		defaults, bindingProblem = invocationDefaultBindings(ctx, target, slots)
-	}
 	list := output.List{Name: "functions", Fields: []string{"function", "availability"}, AllFields: []string{"function", "availability"}}
 	for _, name := range packageInterface.PublicNames() {
 		callable, _ := packageInterface.Function(name)
-		availability := modelDefaultAvailability(callable, defaults)
-		if bindingProblem != nil && len(callable.Models) > 0 {
-			availability = "unknown: defaults unavailable"
-		}
+		availability := modelDefaultAvailability(callable)
 		list.Rows = append(list.Rows, map[string]string{"function": name, "availability": availability})
 		if availability == "available" && len(list.Next) < 2 {
 			list.Next = append(list.Next, "cozy run "+target.Package+"/"+name)

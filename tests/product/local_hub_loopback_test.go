@@ -87,7 +87,7 @@ func TestALoopbackHubServesItsMachineWhileItsPublicOriginIsDown(t *testing.T) {
 		}
 	})
 	provisionMachine(t, root)
-	if code, out := runCozy(t, root, "package", "install", probeProject(t, "proof/probe@1.0.0/bf16")); code != 0 {
+	if code, out := runCozy(t, root, "package", "install", probeProject(t, "proof/probe@1.0.0")); code != 0 {
 		t.Fatalf("editable install [exit %d]\n%s", code, out)
 	}
 	run := func() string {
@@ -102,8 +102,8 @@ func TestALoopbackHubServesItsMachineWhileItsPublicOriginIsDown(t *testing.T) {
 		return seen
 	}
 	seen := run()
-	// The CLI reads the model card; the machine pulls the checkpoint's bytes at the loopback origin.
-	for _, read := range []string{"GET /v1/models/proof/probe", "POST /v1/tensorfs/closure", "POST /v1/tensorfs/presign",
+	// The machine resolves the model and pulls the checkpoint's bytes at the loopback origin.
+	for _, read := range []string{"POST /v1/tensorfs/closure", "POST /v1/tensorfs/presign",
 		"GET /o/" + ref(header)["sha256"].(string)} {
 		if !strings.Contains(seen, read) {
 			t.Errorf("%q was not read at the Hub's loopback origin; it saw:\n%s", read, seen)

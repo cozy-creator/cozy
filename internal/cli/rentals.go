@@ -861,7 +861,7 @@ func computeCapabilityText(value string) string {
 // rentalPrice is the catalog's per-hour figure. It DELEGATES rather than formatting
 // money a second way: this and usdPerHourBare rendered the same micros through two
 // independent implementations, so rounding one left `$0.46/hour` on the fleet line
-// beside `$0.463504/hr` in the ladder. One spelling of money, one place to change it.
+// beside `$0.463504/hr` in the placement record. One spelling of money, one place to change it.
 func rentalPrice(micros int64) string {
 	return usdPerHourBare(micros) + "/hr"
 }

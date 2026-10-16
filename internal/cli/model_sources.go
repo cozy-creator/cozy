@@ -16,24 +16,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 )
 
-func providerModelSource(raw string) (string, bool, *exit.Error) {
-	if !strings.Contains(raw, "://") {
-		return "", false, nil
-	}
-	cwd, err := os.Getwd()
-	if err != nil {
-		return "", false, exit.Internalf("cannot resolve the current directory: %s", err)
-	}
-	source, problem := modelsource.Parse(raw, cwd)
-	if problem != nil {
-		return "", false, problem
-	}
-	if source.Kind != modelsource.HuggingFace && source.Kind != modelsource.Civitai {
-		return "", false, exit.Usagef("model input %q is not a Tensorhub, Hugging Face, or Civitai reference", raw)
-	}
-	return source.Canonical, true, nil
-}
-
 // sourceRentalBytes sizes a rental bought for a provider-source call as `cozy rental new
 // --model` does: the source's reviewed carriers, after the header preflight that refuses
 // before anything is bought (tfs-076). Provider reads only; the machine makes the source.

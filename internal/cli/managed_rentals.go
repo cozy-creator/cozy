@@ -72,7 +72,7 @@ type managedRentals struct {
 
 // placementInputs are what a request's placement reads of its release and models. They do not
 // change while it waits for a machine, so a placement asked again every few seconds while a
-// rental boots reads the release, its children's ladders and the model's throughput once.
+// rental boots reads the release, its children's defaults and the model's throughput once.
 type placementInputs struct {
 	metadata    records.Request
 	childModels []records.ModelRef
@@ -370,12 +370,12 @@ func offeredNames(skus []hub.RentalSKU) string {
 
 // acquire is the placement decision for a --rental request no rental holds a placement
 // for (placement-economics.md, cl-165). The candidates are the fleet's ready rentals —
-// the cl-132 exclusions still apply — and the catalog's purchasable products, each
-// pinned to the lane its rung of the binding ladder selects (or the lane the request
-// pinned itself) and priced from the live catalog; the model's published throughput rows
-// give each its expected time and cost, and placement.prefer picks. --rental is
-// permission AND intent to spend (owner ruling 2026-09-03). The chosen machine is pinned
-// to THIS request alone, with the lane its rung names, in one write; a buy the hub
+// the cl-132 exclusions still apply — and the catalog's purchasable products, each held
+// to the bytes of the lanes the request is sized by (xs-042) and priced from the live
+// catalog; the model's published throughput rows give each its expected time and cost,
+// and placement.prefer picks. --rental is permission AND intent to spend (owner ruling
+// 2026-09-03). The chosen machine is pinned to THIS request alone, with the selection it
+// was sized by, in one write; a buy the hub
 // refuses for stock drops that product and the choice repeats. A fitting rental whose
 // worker has not attached yet — a purchase in flight included — is waited for, never
 // bought around (cl-170) nor queued around (cl-174): the decision returns with no rental
@@ -420,7 +420,7 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.PlacementDec
 		bySKU[machineKey{sku.Name, sku.AcceleratorCount}] = sku
 	}
 	decision := orchestrator.PlacementDecision{Tier: m.ctx.Cfg.PlacementPrefer,
-		ConfigDigest: m.ctx.Cfg.Digest, Ladder: rental.Ladder(req.Models), Override: rental.Override(req.Models)}
+		ConfigDigest: m.ctx.Cfg.Digest, Override: rental.Override(req.Models)}
 	constraints, throughput := inputs.constraints, inputs.throughput
 	if constraints.Working, problem = m.store.WorkingPeaks(req); problem != nil {
 		return none, "", problem
@@ -673,9 +673,9 @@ func (m *managedRentals) throughput(origin string, req records.Request) ([]hub.M
 	return client(m.at(origin)).ModelThroughput(hctx, ref)
 }
 
-// buyLocked is one paid ask for the chosen product. Under the lock the request's
-// selection is pinned to that machine's lane, so the rental POST declares the lane the
-// pod will hold (th-155), and the paid operation is recorded and reserved: every other
+// buyLocked is one paid ask for the chosen product. Under the lock the request's sized
+// selection is recorded, so the rental POST declares the models the pod will hold (th-155),
+// and the paid operation is recorded and reserved: every other
 // placement sees the machine on its way. The ask and the boot, named while it passes
 // (cl-121), run with the lock released; a purchase the Hub never finishes holds only
 // its own request.
@@ -741,13 +741,9 @@ func (m *managedRentals) observeDiskLocked(id string, seen hub.Rental) {
 	m.disks[id] = seen.ContainerDiskGB
 }
 
-// pinText is a candidate's pin for a log line; the rung is named when the ladder chose.
+// pinText is a candidate's sizing for a log line.
 func pinText(c orchestrator.PlacementCandidate) string {
-	text := fmt.Sprintf("lane %s, fit %s", orNone(c.Lane), orNone(c.Fit))
-	if c.Rung > 0 {
-		return fmt.Sprintf("rung %d, %s", c.Rung, text)
-	}
-	return text
+	return fmt.Sprintf("lane %s, fit %s", orNone(c.Lane), orNone(c.Fit))
 }
 
 func (m *managedRentals) catalog(origin string) ([]hub.RentalSKU, *exit.Error) {

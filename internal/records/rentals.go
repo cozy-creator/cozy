@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"strings"
 	"time"
-	"unicode"
 
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/rentalid"
@@ -143,7 +142,7 @@ func managedRentalOperationKey(q interface {
 		return "", false, exit.Internalf("cannot read managed rental history: %s", err)
 	}
 	// A rejected operation never named a pod (the hub refused the SKU before any paid
-	// obligation), so the next rung of the ladder is a fresh operation, not a replay.
+	// obligation), so the next product asked for is a fresh operation, not a replay.
 	if state != "released" && state != "rejected" {
 		return key, true, nil
 	}
@@ -802,36 +801,6 @@ func (r Rental) DisplayName() string {
 // whose pod holds no device at all — so it reports no accelerator, grants no envelope,
 // and can host no device group however wide its `accelerator_count` reads.
 func CPUAccelerator(model string) bool { return strings.EqualFold(model, "CPU") }
-
-// RungMatches is a binding rung's gpu pattern against a machine's accelerator: the
-// literal "*" fits every machine, a host without an NVIDIA device included; anything
-// else is AcceleratorMatches.
-func RungMatches(gpu, accelerator string) bool {
-	return gpu == "*" || AcceleratorMatches(gpu, accelerator)
-}
-
-// AcceleratorMatches accepts an observed device name that carries the requested pattern
-// as an in-order token subsequence, case-insensitively: "H200" and "NVIDIA H200" both name
-// an observed "NVIDIA H200"; "H100" names "NVIDIA H100 80GB HBM3" and "NVIDIA H100 NVL"
-// alike, and never an H200.
-func AcceleratorMatches(requested, observed string) bool {
-	split := func(s string) []string {
-		return strings.FieldsFunc(strings.ToLower(s), func(r rune) bool {
-			return !unicode.IsLetter(r) && !unicode.IsDigit(r)
-		})
-	}
-	want, have := split(requested), split(observed)
-	if len(want) == 0 || len(have) == 0 {
-		return false
-	}
-	i := 0
-	for _, tok := range have {
-		if i < len(want) && tok == want[i] {
-			i++
-		}
-	}
-	return i == len(want)
-}
 
 // RentalRow reads one rental, or nil when this host rented no such thing.
 func (s *Store) RentalRow(id string) (*Rental, *exit.Error) {

@@ -25,7 +25,7 @@ import (
 // minutes INSIDE its own acquisition window, and the recorded decision carried no
 // purchase candidate at all, because Tensorhub's catalog answered with nothing of the
 // request's class in that instant. Neither fact was permanent. Both reached the owner as
-// a sentence about the ladder.
+// a sentence about the model.
 //
 // These arms drive the REAL binary and the REAL Calcifer against the stand-in hub, with the
 // fleet and the market in the exact shapes of that minute.
@@ -34,7 +34,7 @@ import (
 // `attached` gives it the worker triple a serving pod carries; a machine still coming up
 // has none, which is what makes it indistinguishable from a dead one until the state is
 // read.
-func plantRental(t *testing.T, root string, h *ladderHub, store *records.Store,
+func plantRental(t *testing.T, root string, h *standInHub, store *records.Store,
 	id, machine, state string, attached bool,
 ) records.Rental {
 	t.Helper()
@@ -106,12 +106,11 @@ func TestAFleetStillComingUpIsWaitedForAndNeverRefused(t *testing.T) {
 	}
 }
 
-// The permanent arm, unchanged: a market that DOES offer machines, none of which any rung
-// of the ladder names, still fails terminally — and now it is the only thing that does.
-func TestAMarketNoRungNamesStillFailsTerminally(t *testing.T) {
+// The permanent arm, unchanged: a market that DOES offer machines, none of which holds the
+// run's lanes, still fails terminally — and now it is the only thing that does.
+func TestAMarketNothingFitsStillFailsTerminally(t *testing.T) {
 	h := fleetHub(t)
-	h.bind(hub.PackageBindingRow{Slot: ladderSlot, Model: ladderModel, Release: "1.0.0-rc.2",
-		Ladder: []hub.BindingRung{{GPU: "MI300X", Lane: "fp8-adaln-pruned"}}, Revision: 4})
+	h.sell(market20260907()[:2]...) // the 24 GB and 32 GB cards alone
 	root := fleetRoot(t, h, 20)
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
@@ -119,19 +118,19 @@ func TestAMarketNoRungNamesStillFailsTerminally(t *testing.T) {
 	plantRental(t, root, h, store, "pr-karam", "karam", "failed", false)
 	startCalciferProcess(t, root)
 	runCozy(t, root, "run", "proof/h3/generate", "steps=1", "--rental-only", "--json",
-		"--idempotency-key", "no-rung")
+		"--idempotency-key", "nothing-fits")
 	var row *records.Request
-	waitFor(t, root, "the request failing on a ladder no offered machine fits", func() bool {
-		row, problem = store.RequestByIdempotencyKey("no-rung")
+	waitFor(t, root, "the request failing on a model no offered machine holds", func() bool {
+		row, problem = store.RequestByIdempotencyKey("nothing-fits")
 		return problem == nil && row != nil && settled(row.State)
 	})
 	if row.State != "failed" {
-		t.Fatalf("the request settled %q; a ladder no machine fits is terminal", row.State)
+		t.Fatalf("the request settled %q; a model no machine holds is terminal", row.State)
 	}
 	cause := lastEventField(t, store, row.ID, "run.failed", "error_type")
 	if reason := failureReason(t, store, row.ID); cause != "rental.no_fitting_sku" ||
-		!containsAll(reason, "no_rung") {
-		t.Fatalf("the failure is %s / %q; want rental.no_fitting_sku over no_rung verdicts", cause, reason)
+		!containsAll(reason, "vram_short") {
+		t.Fatalf("the failure is %s / %q; want rental.no_fitting_sku over vram_short verdicts", cause, reason)
 	}
 	if asks := h.postedSKUs(); len(asks) != 0 {
 		t.Fatalf("nothing fit and the fleet still bought: %v", asks)
@@ -146,7 +145,7 @@ func TestAnIdleAttachedMachineOutranksWaitingForOneComingUp(t *testing.T) {
 	h := fleetHub(t)
 	// Only the h200 purchase is measured, so the tier's winner is a BUY: an unmeasured
 	// candidate does not compete with a measured one (placement-economics.md).
-	h.throughput = []hub.ModelThroughput{{Release: "1.0.0-rc.1", Lane: "fp8-adaln-pruned",
+	h.throughput = []hub.ModelThroughput{{Release: "1.0.0-rc.1", Lane: "fp8",
 		SKU: "h200", MedianS: 10, PrepareS: 10}}
 	root := fleetRoot(t, h, 20)
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
@@ -218,7 +217,7 @@ func containsAll(haystack string, needles ...string) bool {
 }
 
 // A request waiting on a machine still coming up is placed again every few seconds. What it
-// reads of its release and model (the release, its children's ladders, the model's
+// reads of its release and model (the release, its children's defaults, the model's
 // throughput) does not change while it waits, so it is read once; the market is read again.
 func TestAWaitingPlacementReadsItsModelOnce(t *testing.T) {
 	h := fleetHub(t)

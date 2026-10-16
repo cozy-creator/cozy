@@ -100,7 +100,7 @@ func TestAScriptThatRunsAModelSlotIsServed(t *testing.T) {
 	must(t, os.WriteFile(script, []byte("# /// script\n# requires-python=\">=3.12,<3.13\"\n"+
 		"# dependencies=[\"cozy-runtime>="+hostruntime.PackageFloor+"\", \"probe-lib\"]\n"+
 		"# [tool.uv.sources]\n# probe-lib = {path = \"./probe-lib\", editable = true}\n"+
-		"# [tool.cozy.models]\n# model = \"acme/probe@1.0/fp8\"\n# ///\n"+
+		"# [tool.cozy.models]\n# model = \"acme/probe@1.0\"\n# ///\n"+
 		"from probe_lib import Probe\n\ndef main(*, model: Probe) -> int:\n    return model.run()\n"), 0o600))
 	code, out := runCozy(t, root, "run", script, "--describe")
 	if code != 0 || !strings.Contains(out, "model: Probe") || strings.Contains(out, "model: Probe weights") {
@@ -122,7 +122,7 @@ func TestAScriptThatRunsAModelSlotIsServed(t *testing.T) {
 		"# dependencies=[\"cozy-runtime>="+hostruntime.PackageFloor+"\", \"probe-lib\"]\n"+
 		"# [tool.uv.sources]\n# probe-lib = {path = \"./probe-lib\", editable = true}\n"+
 		"# [tool.cozy]\n# accelerator = false\n"+
-		"# [tool.cozy.models]\n# source = \"acme/probe@1.0/fp8\"\n# ///\n"+
+		"# [tool.cozy.models]\n# source = \"acme/probe@1.0\"\n# ///\n"+
 		"from cozy_runtime.author import Weights\nfrom probe_lib import Probe\n\n"+
 		"def main(*, source: Weights[Probe]) -> int:\n    return len(source.components())\n"), 0o600))
 	code, out = runCozy(t, root, "run", reader, "--describe")

@@ -502,7 +502,7 @@ func (m *machineRuns) specV1(ctx context.Context, request records.Request, machi
 		}
 	}
 	spec := &v1.RunSpec{Kind: v1.RunKind_RUN_KIND_CALL, Entrypoint: request.Entrypoint, Payload: request.Payload,
-		AttentionKernel: request.AttentionKernel, Gpus: request.GPUs}
+		AttentionKernel: request.AttentionKernel, Gpus: request.GPUs, Bits: request.Bits}
 	if request.LocalInstallationID != "" || strings.HasPrefix(request.Package, "local/") {
 		// Only unpublished code names its owner: its org-relative defaults are the owner's.
 		spec.Owner = m.runAccount(request)
@@ -614,7 +614,7 @@ func warmSetV1(current []*v1.WarmItem, environments []*v1.Environment, op record
 		return nil, problem
 	}
 	item := &v1.WarmItem{Source: &v1.WarmItem_Release{Release: &v1.Release{Package: op.Package, Release: op.Release}},
-		Entrypoint: op.Entrypoint, Models: models, Level: v1.WarmLevel(level + 1)}
+		Entrypoint: op.Entrypoint, Models: models, Level: v1.WarmLevel(level + 1), Bits: op.Bits}
 	if strings.HasPrefix(op.Package, "local/") {
 		item.Source = nil
 		for installation, pkg := range packages {

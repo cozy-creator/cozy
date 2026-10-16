@@ -19,11 +19,11 @@ import (
 )
 
 func TestRunDescribeAcceptsPayloadAfterOptions(t *testing.T) {
-	h := newLadderHub(t)
-	root := ladderRoot(t, h)
+	h := newStandInHub(t)
+	root := standInRoot(t, h)
 	// This is the user's ordering: a prompt, two reference flags, more payload,
 	// and placement/wait flags. Describe proves parsing without starting a run.
-	args := []string{"run", ladderPackage + "/generate", "prompt=Picture-1.",
+	args := []string{"run", h3Package + "/generate", "prompt=Picture-1.",
 		"--asset=/missing/a=b.png", "--asset=/missing/c=d.png", "duration_s=14", "steps=30",
 		"--rental-only", "--await", "--describe", "--json"}
 	code, out := runCozy(t, root, args...)

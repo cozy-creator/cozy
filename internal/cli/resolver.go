@@ -296,91 +296,36 @@ func (r *Resolver) ResolveRemoteRelease(origin, pkg, release, function string,
 	}
 	models = append([]orchestrator.ModelRef(nil), models...)
 	sort.Slice(models, func(i, j int) bool { return models[i].Slot < models[j].Slot })
-	if choices(models) || len(capturedModelChoices(models)) > 0 {
-		// The caller's own choices ride, each exact before it reaches a machine.
-		for _, model := range models {
-			if model.Choice && model.Callable != "" {
-				_, path, valid := launch.CapturedModelSlot(model.Package + "/" + model.BindingSlot())
-				callee, _, _ := strings.Cut(path, ".models.")
-				if !valid || model.Callable != model.Package+"/"+callee {
-					return empty, nil, exit.Named(exit.Validation, "rental.model_selection_mismatch",
-						"captured model selection needs an exact callable slot")
-				}
-				continue // Runtime checks membership in the captured graph before acceptance
-			}
-			if model.Package != pkg || !slices.ContainsFunc(entrypoint.Models, func(slot launch.Slot) bool { return slot.Path == model.Slot }) {
-				return empty, nil, exit.Named(exit.Validation, "rental.model_selection_mismatch",
-					"model selection does not bind a slot of %s", function)
-			}
-		}
-		return orchestrator.LogicalPackage{Package: pkg, Release: release, Function: function,
-			Outputs: launch.OutputSlots(entrypoint.Result), Models: models,
-			NeedsAccelerator: entrypoint.NeedsAccelerator()}, entrypoint, nil
-	}
-	if len(models) != len(entrypoint.Models) {
-		return empty, nil, exit.Named(exit.Validation, "rental.model_selection_incomplete",
-			"%s requires exactly one model for each of its %d slots", function, len(entrypoint.Models))
-	}
-	bySlot := make(map[string]orchestrator.ModelRef, len(models))
+	// The caller's own choices, and the defaults a rental for the run is sized by, each bind a
+	// slot of the function, or a captured callee's; the machine resolves every other slot.
 	for _, model := range models {
-		if _, exists := bySlot[model.Slot]; exists {
-			return empty, nil, exit.Named(exit.Validation, "rental.model_selection_mismatch",
-				"model slot %s was selected more than once", model.Slot)
-		}
-		bySlot[model.Slot] = model
-	}
-	for _, slot := range entrypoint.Models {
-		model, selected := bySlot[slot.Path]
-		// A retained Hub checkpoint has no release/lane yet. It is the same
-		// exact downloadable input already accepted by jobs; an unbound name or
-		// operation-local manifest is not a replacement for that resolved fact.
-		if model.Package != pkg || model.Slot != slot.Path ||
-			(model.Release == "" && (!model.Downloadable() || model.Lane != "" || model.ManifestLength <= 0)) {
-			return empty, nil, exit.Named(exit.Validation, "rental.model_selection_mismatch",
-				"model selection does not bind exact slot %s", slot.Path)
-		}
-		if !selected {
-			return empty, nil, exit.Named(exit.Validation, "rental.model_selection_mismatch",
-				"model selection does not bind exact slot %s", slot.Path)
-		}
-		if _, problem := hub.ParseRef(model.Model); problem != nil {
-			return empty, nil, problem
-		}
-		// Exact, or a ladder every rung of which is exact: the machine decision pins one
-		// rung once the machine exists (cl-166).
-		exact := []string{model.Manifest}
-		if !model.Pinned() {
-			exact = exact[:0]
-			for _, rung := range model.Ladder {
-				exact = append(exact, rung.Manifest)
+		if model.Choice && model.Callable != "" {
+			_, path, valid := launch.CapturedModelSlot(model.Package + "/" + model.BindingSlot())
+			callee, _, _ := strings.Cut(path, ".models.")
+			if !valid || model.Callable != model.Package+"/"+callee {
+				return empty, nil, exit.Named(exit.Validation, "rental.model_selection_mismatch",
+					"captured model selection needs an exact callable slot")
 			}
+			continue // Runtime checks membership in the captured graph before acceptance
 		}
-		if len(exact) == 0 {
-			return empty, nil, exit.Named(exit.Validation, "rental.model_manifest_invalid",
-				"model selection for %s has neither an exact manifest nor a ladder", slot.Path)
+		if model.Package != pkg || !slices.ContainsFunc(entrypoint.Models, func(slot launch.Slot) bool { return slot.Path == model.Slot }) {
+			return empty, nil, exit.Named(exit.Validation, "rental.model_selection_mismatch",
+				"model selection does not bind a slot of %s", function)
 		}
-		for _, manifest := range exact {
-			if _, err := canonical.Raw(manifest); err != nil {
+		// A checkpoint named by hash alone is one exact retained checkpoint at the Hub.
+		if model.HubCheckpoint || model.Release == "" && model.Manifest != "" {
+			if _, err := canonical.Raw(model.Manifest); model.Manifest != "" && err != nil {
 				return empty, nil, exit.Named(exit.Validation, "rental.model_manifest_invalid",
-					"model selection for %s has no exact manifest", slot.Path)
+					"model selection for %s has no exact manifest", model.Slot)
 			}
-		}
-	}
-	if len(models) > 0 && len(packageInterface.Entrypoints) > 1 {
-		// ONE PLACEMENT PER CONSTRUCTION (h3a-018). The selection also binds every
-		// sibling slot the owner bound to the same model release under the same ladder,
-		// so the pod prepares both entrypoints once and a switch between them is a
-		// dispatch. Owner overrides and authored defaults use the same selection here.
-		// Sharing only saves a later preparation, so an unreadable override set skips it.
-		ctx, cancel := hub.Context()
-		defer cancel()
-		if rows, problem := r.catalog(origin).PackageBindings(ctx, ref); problem == nil {
-			defaults := effectiveModelBindings(declaredModelSlots(packageInterface.Entrypoints), rows, ref.Org)
-			shareModelSlots(models, entrypoint, packageInterface.Entrypoints, defaults)
+			if !model.Downloadable() || model.Release != "" || model.Lane != "" || model.ManifestLength <= 0 {
+				return empty, nil, exit.Named(exit.Validation, "rental.model_selection_mismatch",
+					"model selection for %s names no exact retained checkpoint", model.Slot)
+			}
 		}
 	}
 	planID := ""
-	if len(models) == 0 {
+	if len(models) == 0 && len(entrypoint.Models) == 0 {
 		body, err := canonical.Write(map[string]canonical.Value{
 			"name": function, "slots": []canonical.Value{},
 		})
@@ -397,16 +342,6 @@ func (r *Resolver) ResolveRemoteRelease(origin, pkg, release, function string,
 		Function: function, Outputs: launch.OutputSlots(entrypoint.Result), PlanID: planID,
 		Models: models, NeedsAccelerator: entrypoint.NeedsAccelerator(),
 	}, entrypoint, nil
-}
-
-// choices answers whether every selection is the caller's own, left to the machine.
-func choices(models []orchestrator.ModelRef) bool {
-	for _, model := range models {
-		if !model.Choice {
-			return false
-		}
-	}
-	return true
 }
 
 // releaseInterface is a published release's interface: this computer's verified install of it
@@ -528,73 +463,4 @@ func splitMajor(ref string) (pkg string, major int, ok bool) {
 		n = n*10 + int(c-'0')
 	}
 	return name, n, true
-}
-
-// shareModelSlots binds only complete sibling constructions (h3a-018). Every slot
-// must have a default satisfied by an already-selected model; a partial sibling
-// would leave stranded selections that Runtime correctly refuses at preparation.
-func shareModelSlots(models []orchestrator.ModelRef, own *launch.Entrypoint, all []launch.Entrypoint,
-	defaults map[string]hub.PackageBindingRow) {
-	classes := make(map[string]string, len(own.Models))
-	for _, slot := range own.Models {
-		classes[slot.Path] = slot.Class
-	}
-	for i := range models {
-		models[i].SharedSlots = nil
-	}
-siblingLoop:
-	for i := range all {
-		sibling := &all[i]
-		if sibling.Name == own.Name {
-			continue
-		}
-		selected := make(map[int][]string)
-		for _, slot := range sibling.Models {
-			row, bound := defaults[slot.Path]
-			if !bound {
-				continue siblingLoop
-			}
-			matched := false
-			for j, model := range models {
-				if slot.Class == classes[model.Slot] && row.Model == model.Model &&
-					row.Release == model.Release && ladderOffers(row.Ladder, model) {
-					selected[j] = append(selected[j], slot.Path)
-					matched = true
-					break
-				}
-			}
-			if !matched {
-				continue siblingLoop
-			}
-		}
-		for j, slots := range selected {
-			models[j].SharedSlots = append(models[j].SharedSlots, slots...)
-		}
-	}
-	for i := range models {
-		sort.Strings(models[i].SharedSlots)
-	}
-}
-
-// ladderOffers answers whether a sibling's ladder serves the selection: rung for rung the
-// same ladder when the selection still carries one, or a rung on the pinned lane when the
-// caller pinned it explicitly.
-func ladderOffers(ladder []hub.BindingRung, model orchestrator.ModelRef) bool {
-	if model.Pinned() {
-		for _, rung := range ladder {
-			if rung.Lane == model.Lane {
-				return true
-			}
-		}
-		return false
-	}
-	if len(ladder) != len(model.Ladder) {
-		return false
-	}
-	for i, rung := range ladder {
-		if rung.GPU != model.Ladder[i].GPU || rung.Lane != model.Ladder[i].Lane {
-			return false
-		}
-	}
-	return true
 }

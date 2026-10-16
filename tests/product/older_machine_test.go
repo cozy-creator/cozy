@@ -217,12 +217,7 @@ func TestAnOlderMachineTakesTheTargetBeforeNewWork(t *testing.T) {
 // a submitter of calls to it; the Hub's target is Runtime 0.18.102.
 func olderMachineHome(t *testing.T, machine *olderMachine) (string, *records.Store, func(string)) {
 	t.Helper()
-	root := t.TempDir()
-	layout, problem := home.Open(root)
-	fatal(t, problem)
-	store, problem := records.Open(layout.DB)
-	fatal(t, problem)
-	t.Cleanup(store.Close)
+	root, store, _ := attachedMachineHome(t, machine)
 	t.Cleanup(func() {
 		if t.Failed() {
 			update, _ := store.PendingUpdate(olderRental)
@@ -237,6 +232,25 @@ func olderMachineHome(t *testing.T, machine *olderMachine) (string, *records.Sto
 			machine.mu.Unlock()
 		}
 	})
+	return root, store, func(id string) {
+		t.Helper()
+		_, _, problem := store.Submit(records.Request{ID: id, IdemKey: id, Package: "proof/example", Release: "1.0.0",
+			Entrypoint: "main", Kind: "call", Payload: []byte(`{}`), BodyDigest: childDigest(id), MachineExecutionObserver: true})
+		fatal(t, problem)
+		fatal(t, store.LinkMachineExecution(id, olderRental))
+	}
+}
+
+// attachedMachineHome attaches the rental "elder" served by machine, an in-process
+// cozy.machine.v1 server, and answers the root, its records and the stand-in Hub.
+func attachedMachineHome(t *testing.T, machine v1.MachineServer) (string, *records.Store, *fakeRentalHub) {
+	t.Helper()
+	root := t.TempDir()
+	layout, problem := home.Open(root)
+	fatal(t, problem)
+	store, problem := records.Open(layout.DB)
+	fatal(t, problem)
+	t.Cleanup(store.Close)
 	identity, problem := rental.PendingCreatorIdentity(layout, "older-machine")
 	fatal(t, problem)
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -277,13 +291,7 @@ func olderMachineHome(t *testing.T, machine *olderMachine) (string, *records.Sto
 	fatal(t, rental.Attach(layout, store, row, cert, secret.New(strings.Repeat("m", 43)), identity))
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+hub.server.URL+
 		"\ntensorhub_token: rental-idle-test\ncalcifer:\n  idle_shutdown_s: 0\n"), 0o600))
-	return root, store, func(id string) {
-		t.Helper()
-		_, _, problem := store.Submit(records.Request{ID: id, IdemKey: id, Package: "proof/example", Release: "1.0.0",
-			Entrypoint: "main", Kind: "call", Payload: []byte(`{}`), BodyDigest: childDigest(id), MachineExecutionObserver: true})
-		fatal(t, problem)
-		fatal(t, store.LinkMachineExecution(id, olderRental))
-	}
+	return root, store, hub
 }
 
 func reachesState(t *testing.T, root string, store *records.Store, id, state string) {

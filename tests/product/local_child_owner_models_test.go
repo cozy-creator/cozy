@@ -104,7 +104,7 @@ class Result(msgspec.Struct):
     value: int
 
 
-@invocable(defaults={"source": [{"gpu": "*", "lane": "probe@1.0.0/bf16"}]})
+@invocable(defaults={"source": "probe@1.0.0"})
 async def touch(ctx: Context, *, value: int, source: Probe) -> Result:
     return Result(value + 1 + source.weight())
 

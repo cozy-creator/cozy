@@ -12,7 +12,8 @@ import (
 
 // handleWarm is `cozy run <target> --warm=<level>`: instead of running the function, the
 // machine keeps it ready up to that level, a member of its warm set; `off` takes it out. Its
-// `model.<param>=` choices and --lora are the member's models.
+// `model.<param>=` choices and --lora are the member's models, and --bits its precision; the
+// machine resolves every slot, as for a run.
 func handleWarm(ctx *Context, target Target, ep *launch.Entrypoint, level string) *exit.Error {
 	if level != "off" && !slices.Contains(records.WarmLevels, level) {
 		return exit.Usagef("--warm=%s is not one of %s or off", level, strings.Join(records.WarmLevels, ", "))
@@ -20,7 +21,11 @@ func handleWarm(ctx *Context, target Target, ep *launch.Entrypoint, level string
 	if ctx.endpoint != nil || ctx.Inv.Bool("--rent-new") || ctx.Inv.Bool("--rental-only") || ctx.Inv.Bool("--rental") {
 		return exit.Usagef("--warm names its machine: this computer's, or --rental=<name>")
 	}
-	op := records.Operation{Package: target.Package, Release: target.Release, Entrypoint: target.Function, Warm: level}
+	bits, problem := runBits(ctx)
+	if problem != nil {
+		return problem
+	}
+	op := records.Operation{Package: target.Package, Release: target.Release, Entrypoint: target.Function, Warm: level, Bits: bits}
 	if level != "off" {
 		_, overrides, problem := launch.ParsePayload(ep, ctx.Inv.Args[1:], ctx.Inv.Value("--in"))
 		if problem != nil {
@@ -30,8 +35,7 @@ func handleWarm(ctx *Context, target Target, ep *launch.Entrypoint, level string
 		if problem != nil {
 			return problem
 		}
-		// The member's every slot is resolved here (th-241): the machine reads no binding.
-		if models, problem = exactRunModels(ctx, target, ep, overrides.Models, models, resolveInvocationModels); problem != nil {
+		if models, problem = exactCheckpoints(ctx, ep, models); problem != nil {
 			return problem
 		}
 		if op.Models, problem = applyModelAdapters(ctx, target, ep, models, overrides.Overlays); problem != nil {

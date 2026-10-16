@@ -12,6 +12,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
+	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/modelsource"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -135,17 +136,22 @@ func validOperation(op records.Operation) *exit.Error {
 		downloads = nil
 	}
 	if op.Warm != "" {
-		// A warm set member: its function's models arrive resolved (exact or exact rungs).
+		// A warm set member: its models are the caller's choices; the machine resolves them.
 		if op.Package == "" || op.Entrypoint == "" || op.Destination != "" {
 			return exit.New(exit.Validation, "a warm set member names one package function")
 		}
 		downloads = nil
+	} else if op.Bits != 0 {
+		return exit.New(exit.Validation, "only a warm set member names bits")
+	}
+	if problem := launch.ValidateBits(op.Bits); problem != nil {
+		return problem
 	}
 	for _, model := range downloads {
 		if !model.Downloadable() {
 			return exit.New(exit.Validation, "a model download names a downloadable Hub checkpoint")
 		}
-		if op.Package == "" && (model.Package != "" || model.Slot != "" || model.BindingPath != "" || len(model.SharedSlots) > 0) {
+		if op.Package == "" && (model.Package != "" || model.Slot != "" || model.BindingPath != "") {
 			return exit.New(exit.Validation, "a standalone model download names no package slots")
 		}
 		if model.Model == "" || model.Manifest == "" || op.Package != "" && (model.Package != op.Package || model.Slot == "") {

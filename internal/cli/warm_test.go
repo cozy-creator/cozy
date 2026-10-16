@@ -10,7 +10,8 @@ import (
 
 // `--warm` sends the machine's whole set back with one member changed: others stay as sent
 // (without what Status added), the member is replaced, `off` removes it, and an unknown level
-// is refused before anything is sent. A member's models travel by name: its binding's rungs, lanes only.
+// is refused before anything is sent. A member carries its bits and the caller's choices by
+// name; a fact a rental was sized by is never sent, and no lane the caller did not name.
 func TestAWarmSetChangesOneMemberAndKeepsTheRest(t *testing.T) {
 	member := func(pkg, fn string, level v1.WarmLevel) *v1.WarmItem {
 		return &v1.WarmItem{Source: &v1.WarmItem_Release{Release: &v1.Release{Package: pkg, Release: "1.0.0"}},
@@ -18,9 +19,10 @@ func TestAWarmSetChangesOneMemberAndKeepsTheRest(t *testing.T) {
 	}
 	current := []*v1.WarmItem{member("paul/sdxl", "generate", v1.WarmLevel_WARM_LEVEL_IMPORTED),
 		member("paul/anima", "generate", v1.WarmLevel_WARM_LEVEL_HOST)}
-	selection := records.Operation{Package: "paul/sdxl", Release: "2.6.0", Entrypoint: "generate", Warm: "host",
+	selection := records.Operation{Package: "paul/sdxl", Release: "2.6.0", Entrypoint: "generate", Warm: "host", Bits: 4,
 		Models: []records.ModelRef{{Choice: true, Package: "paul/sdxl", Slot: "model", BindingPath: "model", Model: "paul/sdxl", Release: "1.0.0",
-			Ladder: []records.ModelRung{{GPU: "*", Lane: "bf16", Manifest: "sha256:" + strings.Repeat("ab", 32)}}}}}
+			Bytes: 7 << 30}, {Package: "paul/sdxl", Slot: "vae", BindingPath: "vae", Model: "paul/vae", Release: "1.0.0",
+			Lane: "int8", Manifest: "sha256:" + strings.Repeat("ab", 32)}}}
 	set, problem := warmSetV1(current, nil, selection)
 	if problem != nil {
 		t.Fatal(problem)
@@ -32,9 +34,9 @@ func TestAWarmSetChangesOneMemberAndKeepsTheRest(t *testing.T) {
 	if kept.GetRelease().GetPackage() != "paul/anima" || kept.Holds != "" || kept.HeldBack != "" || kept.Level != v1.WarmLevel_WARM_LEVEL_HOST {
 		t.Fatalf("the other member was not sent back as asked: %v", kept)
 	}
-	if changed.GetRelease().GetRelease() != "2.6.0" || changed.Level != v1.WarmLevel_WARM_LEVEL_HOST ||
+	if changed.GetRelease().GetRelease() != "2.6.0" || changed.Level != v1.WarmLevel_WARM_LEVEL_HOST || changed.Bits != 4 ||
 		len(changed.Models) != 1 || changed.Models[0].Parameter != "model" || changed.Models[0].Repository != "paul/sdxl" ||
-		len(changed.Models[0].Rungs) != 1 || changed.Models[0].Rungs[0].Lane != "bf16" || changed.Models[0].Manifest != "" {
+		changed.Models[0].Lane != "" || changed.Models[0].Manifest != "" {
 		t.Fatalf("the member was not replaced with its new level and models: %v", changed)
 	}
 	selection.Warm = "off"

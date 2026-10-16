@@ -10,7 +10,6 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
-	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/machines"
 	"github.com/cozy-creator/cozy/internal/output"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -104,7 +103,7 @@ func handleMachineModelDownload(ctx *Context) *exit.Error {
 	if machine == "" {
 		machine = machines.Local
 	}
-	model, problem := resolveRemoteModel(ctx, client(ctx), "", launch.Slot{}, ctx.Inv.Args[0], ctx.Inv.Value("--lane"), nil)
+	model, problem := exactModel(ctx, ctx.Inv.Args[0], ctx.Inv.Value("--lane"))
 	if problem != nil {
 		return problem
 	}

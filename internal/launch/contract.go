@@ -121,9 +121,9 @@ func unionPhrase(raw json.RawMessage) string {
 }
 
 // DescribeContract is the callable's whole contract, rendered for a person: the request
-// fields, the model slots, and the result shape. `bindings` maps a slot path to its
-// current default binding line, "" meaning unresolved.
-func DescribeContract(target string, ep *Entrypoint, bindings map[string]string) string {
+// fields, the model slots with their defaults (an org-relative one qualified by owner), and
+// the result shape.
+func DescribeContract(target string, ep *Entrypoint, owner string) string {
 	var b strings.Builder
 	b.WriteString(target)
 	if !ep.NeedsAccelerator() {
@@ -143,8 +143,8 @@ func DescribeContract(target string, ep *Entrypoint, bindings map[string]string)
 			if slot.Weights {
 				b.WriteString(" weights")
 			}
-			if binding := bindings[slot.Path]; binding != "" {
-				b.WriteString(" (default: " + binding + ")")
+			if def := slot.DefaultRef(owner); def != "" {
+				b.WriteString(" (default: " + def + ")")
 			}
 			b.WriteString("\n")
 		}
