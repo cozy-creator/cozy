@@ -2,6 +2,7 @@
 
 pub mod calcifer;
 pub mod capability;
+pub mod config;
 pub mod error;
 pub mod ids;
 
