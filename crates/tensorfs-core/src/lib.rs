@@ -27,7 +27,7 @@ pub mod dtype;
 #[cfg(feature = "store")]
 pub mod durability;
 #[cfg(feature = "store")]
-pub mod ensure;
+pub mod admission;
 pub mod err;
 #[cfg(feature = "store")]
 pub mod fetch;
@@ -87,11 +87,3 @@ pub mod vectors;
 
 /// This TensorFS's release version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-
-/// What callers may feature-detect by name instead of by version: `ensure`, ranged `get`
-/// under a lease, and the pressure pass.
-pub const CAPABILITIES: &[&str] = &[
-    "ensure/1",
-    "get-range/1",
-    "pressure/1",
-];

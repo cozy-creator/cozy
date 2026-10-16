@@ -244,7 +244,11 @@ pub fn hub(
     };
     std::thread::spawn(move || {
         for socket in listener.incoming() {
-            let Ok(socket) = socket else { return };
+            // A full descriptor table (fd_budget's squeeze) is this server's too: accept again.
+            let Ok(socket) = socket else {
+                std::thread::sleep(Duration::from_millis(1));
+                continue;
+            };
             let (served, tls) = (served.clone(), tls.clone());
             std::thread::spawn(move || match tls {
                 Some(config) => {

@@ -43,8 +43,21 @@ pub fn raise() {
 /// `None` when the platform cannot say (no `/proc`, or no soft limit).
 pub fn available() -> Option<u64> {
     let soft = rustix::process::getrlimit(rustix::process::Resource::Nofile).current?;
-    let open = std::fs::read_dir("/proc/self/fd").ok()?.count() as u64;
+    let open = match std::fs::read_dir("/proc/self/fd") {
+        Ok(open) => open.count() as u64,
+        // Counting takes a descriptor too: a table too full to count is full.
+        Err(error) if full(&error) => return Some(0),
+        Err(_) => return None,
+    };
     Some(soft.saturating_sub(open).saturating_sub(MARGIN))
+}
+
+fn full(error: &std::io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(code) if code == rustix::io::Errno::MFILE.raw_os_error()
+            || code == rustix::io::Errno::NFILE.raw_os_error()
+    )
 }
 
 /// Requests in flight the raised descriptor limit holds, at most `wanted`: a budget sized once
@@ -61,11 +74,7 @@ pub fn requests(wanted: usize) -> usize {
 /// Whether `error` is the descriptor table being full, counting it when it is. Call it
 /// where an open, socket or resolution fails, before the error loses its errno.
 pub fn exhausted(error: &std::io::Error) -> bool {
-    let full = matches!(
-        error.raw_os_error(),
-        Some(code) if code == rustix::io::Errno::MFILE.raw_os_error()
-            || code == rustix::io::Errno::NFILE.raw_os_error()
-    );
+    let full = full(error);
     if full {
         EXHAUSTED.fetch_add(1, Ordering::Relaxed);
     }

@@ -414,6 +414,10 @@ impl Fetcher {
         &self.0.shared.store
     }
 
+    pub(crate) fn sample(&self) -> Duration {
+        self.0.shared.sample
+    }
+
     /// This fetcher reads `volume` before the Hub and fills it. Set once: a later volume is
     /// ignored.
     pub fn with_volume(self, volume: Volume) -> Fetcher {
@@ -476,7 +480,14 @@ impl Fetcher {
         ticket
     }
 
-    pub(crate) fn seed(&self, origin: &Origin, closure: transport::Closure) {
+    /// The closure `origin` resolved to, once something of it was asked for or seeded.
+    pub(crate) fn closure(&self, origin: &Origin) -> Option<Arc<transport::Closure>> {
+        self.0.shared.state.lock().unwrap().origins.get(origin)?.closure.clone()
+    }
+
+    /// `origin`'s closure as its caller already resolved it: the Fetcher asks the hub nothing
+    /// more for it.
+    pub fn seed(&self, origin: &Origin, closure: transport::Closure) {
         let mut state = self.0.shared.state.lock().unwrap();
         let source = state.origins.entry(origin.clone()).or_default();
         if source.closure.is_none() {
@@ -1078,9 +1089,9 @@ impl Shared {
 
     /// Whether `bytes` more fit the disk and the Store's budget, beyond its reserve.
     fn short(&self, bytes: u64, objects: u64) -> Result<Option<u64>> {
-        let need = crate::ensure::Space::of(bytes, objects);
-        let disk = crate::ensure::Disk::measure(self.store.root())?;
-        let free = crate::ensure::free(&disk, crate::ensure::Space::default());
+        let need = crate::admission::Space::of(bytes, objects);
+        let disk = crate::admission::Disk::measure(self.store.root())?;
+        let free = crate::admission::free(&disk, crate::admission::Space::default());
         let mut short = (need.bytes > free.bytes || need.inodes > free.inodes)
             .then(|| need.bytes.saturating_sub(free.bytes).max(1));
         if let Some(budget) = self.store.disk_budget() {

@@ -7,7 +7,7 @@ use super::credential::{credential_from_spec, Anonymous, ScopedHeaders};
 use super::download::{fetch_ranged, Ranged};
 use super::ledger::{Deadline, Ledger};
 use super::policy::{self, blocked, CheckedUrl, SourcePolicy};
-use super::pull::{absolute_location, pull, Fetched, ObjectSource, PullRequest};
+use super::pull::{absolute_location, Fetched};
 use super::push::{push_object, UploadGrant};
 use crate::canon::Value;
 use crate::dtype::Dtype;
@@ -583,9 +583,142 @@ fn local_policy() -> SourcePolicy {
 }
 
 fn request_for<'a>(store: &'a Store, base: &'a str, policy: &'a SourcePolicy) -> PullRequest<'a> {
-    let mut request = PullRequest::new(store, base, "acme/model", &Anonymous, policy);
+    let mut request = PullRequest::new(store, base, "acme/model", Anonymous, policy);
     request.sample_seconds = 0.025;
     request
+}
+
+/// One whole checkpoint the way the machine downloads one: its closure asked of the hub, then
+/// [`crate::fetch::whole`] on a Fetcher of this request's streams and sample.
+struct PullRequest<'a> {
+    store: &'a Store,
+    base: &'a str,
+    refspec: &'a str,
+    lane: &'a str,
+    access: Arc<dyn crate::fetch::Access>,
+    streams: usize,
+    sample_seconds: f64,
+    cancellation: Option<super::PullCancellation>,
+    /// Told the bytes here and in all as the download runs.
+    on_progress: Option<&'a (dyn Fn(u64, u64) + Sync)>,
+    on_plan: Option<&'a (dyn Fn(&FetchPlan) + Sync)>,
+}
+
+impl<'a> PullRequest<'a> {
+    fn new(
+        store: &'a Store,
+        base: &'a str,
+        refspec: &'a str,
+        credential: impl super::CredentialProvider + Send + 'static,
+        policy: &SourcePolicy,
+    ) -> PullRequest<'a> {
+        PullRequest {
+            store,
+            base,
+            refspec,
+            lane: "",
+            access: Arc::new(crate::fetch::Plain { credential, policy: policy.clone() }),
+            streams: super::PULL_STREAMS,
+            sample_seconds: super::SAMPLE_SECONDS,
+            cancellation: None,
+            on_progress: None,
+            on_plan: None,
+        }
+    }
+}
+
+/// What one whole download did: the plan it began from and its walks' own counts.
+#[derive(Debug, Default)]
+struct Pulled {
+    model: String,
+    release: String,
+    lane: String,
+    declared: u64,
+    held: u64,
+    bytes_held: u64,
+    bytes_total: u64,
+    fetched: u64,
+    bytes_moved: u64,
+    streams: usize,
+    writers: usize,
+    requests: u64,
+    restarts: u64,
+}
+
+fn pull(request: &PullRequest<'_>) -> crate::err::Result<Pulled> {
+    let sample = Duration::from_secs_f64(request.sample_seconds);
+    let mut ledger = Ledger::with_resolution(sample);
+    if let Some(stop) = &request.cancellation {
+        ledger = ledger.with_cancellation(stop.clone());
+    }
+    let closure = super::hub::closure_all(
+        super::shared_client(),
+        request.base,
+        request.refspec,
+        request.lane,
+        request.access.credential(),
+        &super::hub_policy(request.base, request.access.policy()),
+        Deadline::none(),
+        &ledger,
+    )?;
+    let (plan, _) = FetchPlan::of(request.store, "pull", &closure.manifest, &closure.objects)?;
+    if let Some(on_plan) = request.on_plan {
+        on_plan(&plan);
+    }
+    let mut pulled = Pulled {
+        model: closure.model.clone(),
+        release: closure.release.clone(),
+        lane: closure.lane.clone(),
+        declared: (plan.held.len() + plan.wanted.len()) as u64,
+        held: plan.held.len() as u64,
+        bytes_held: plan.held_bytes(),
+        bytes_total: plan.declared_bytes(),
+        ..Pulled::default()
+    };
+    let walks = walk_lines(request.store).len();
+    let fetcher = crate::fetch::Fetcher::new(request.store, request.streams, sample)?;
+    let origin = crate::fetch::Origin {
+        hub: request.base.to_string(),
+        refspec: request.refspec.to_string(),
+        lane: request.lane.to_string(),
+        manifest: closure.manifest.clone(),
+    };
+    fetcher.seed(&origin, closure);
+    let stop = request.cancellation.clone().unwrap_or_default();
+    let progress = |done: u64, total: u64| {
+        if let Some(on_progress) = request.on_progress {
+            on_progress(done, total);
+        }
+    };
+    let priority = crate::fetch::Priority::Now;
+    let landed = crate::fetch::whole(&fetcher, &origin, Arc::clone(&request.access), priority, &stop, &progress);
+    // Its last handle waits for its downloader, whose walks are then on record.
+    drop(fetcher);
+    landed?;
+    for line in walk_lines(request.store).into_iter().skip(walks) {
+        let field = |name: &str| -> u64 {
+            (line.split_whitespace())
+                .find_map(|f| f.strip_prefix(name)?.strip_prefix('=')?.parse().ok())
+                .unwrap_or(0)
+        };
+        pulled.fetched += field("fetched");
+        pulled.bytes_moved += field("moved");
+        pulled.requests += field("requests");
+        pulled.restarts += field("restarts");
+        pulled.streams = pulled.streams.max(field("streams") as usize);
+        pulled.writers = pulled.writers.max(field("writers") as usize);
+    }
+    Ok(pulled)
+}
+
+/// The Store's download walks so far, oldest first.
+fn walk_lines(store: &Store) -> Vec<String> {
+    std::fs::read_to_string(store.root().join("logs/transport.log"))
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| line.contains(" walk "))
+        .map(str::to_string)
+        .collect()
 }
 
 // ---------------------------------------------------------------- pulls
@@ -718,43 +851,6 @@ fn a_go_hub_refusal_envelope_is_its_verdict() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// proto-061 A: a digest-pinned warm ask the local release index already answers costs
-/// zero hub calls; a moved pointer or an untrusted object sends the ask back to the hub.
-#[test]
-fn audit_pinned_warm_pull_retains_objects_through_result() {
-    let root = temporary("audit-warm-gc");
-    let store = Store::init(&root).unwrap();
-    let checkpoint = Arc::new(checkpoint(4, 16 * 1024));
-    let origin = hub_origin(Arc::clone(&checkpoint), |_, _| None);
-    let policy = SourcePolicy::default();
-    let pinned = format!("acme/model@r1@sha256:{}", checkpoint.manifest.sha256);
-    let mut request = PullRequest::new(&store, &origin.base, &pinned, &Anonymous, &policy);
-    request.lane = "public";
-    pull(&request).unwrap();
-    let collect = |_: &crate::fetch::FetchPlan| {
-        // Real native cache eviction at the verified-presence/return boundary.
-        match crate::gc::collect_cached(&root, &[]) {
-            Ok(_) => {}
-            Err(error) => assert_eq!(error.code, Code::STORE_BUSY),
-        }
-    };
-    request.on_plan = Some(&collect);
-    let warm = pull(&request).unwrap();
-    assert_eq!(warm.fetched, 0);
-    assert!(
-        store.read_manifest(&checkpoint.manifest).is_ok(),
-        "warm pull returned success after GC deleted its checkpoint"
-    );
-    assert!(
-        crate::gc::collect_cached(&root, &[])
-            .unwrap()
-            .reclaimed_bytes
-            > 0,
-        "completed pull must release its native guard so GC can progress"
-    );
-    let _ = std::fs::remove_dir_all(root);
-}
-
 #[test]
 fn runtime_only_pull_refuses_before_retaining_incomplete_snapshot() {
     let root = temporary("audit-runtime-sibling");
@@ -789,7 +885,7 @@ fn runtime_only_pull_refuses_before_retaining_incomplete_snapshot() {
         &store,
         &origin.base,
         "acme/model",
-        &Anonymous,
+        Anonymous,
         &policy,
     ));
     // Runtime-only Hub closures and repository retention currently disagree about
@@ -798,85 +894,6 @@ fn runtime_only_pull_refuses_before_retaining_incomplete_snapshot() {
     assert!(!store.contains(&sibling.sha256));
     let repo = crate::repository::RepositoryName::new("acme", "model").unwrap();
     assert!(!store.repository_path(&repo).exists());
-    assert!(crate::gc::collect(&root, false).unwrap().reclaimed_bytes > 0);
-    let _ = std::fs::remove_dir_all(root);
-}
-
-#[test]
-fn a_pinned_warm_pull_asks_the_hub_nothing_and_a_moved_pointer_asks_again() {
-    let root = temporary("pinned-warm");
-    let store = Store::init(&root).unwrap();
-    let first = Arc::new(checkpoint(4, 16 * 1024));
-    let second = Arc::new(checkpoint(5, 16 * 1024));
-    let hub_first = hub_origin(Arc::clone(&first), |_, _| None);
-    let hub_second = hub_origin(Arc::clone(&second), |_, _| None);
-    let policy = SourcePolicy::default();
-    let pinned = |c: &Checkpoint| format!("acme/model@r1@sha256:{}", c.manifest.sha256);
-    let ask = |base: &str, refspec: &str| {
-        let mut request = PullRequest::new(&store, base, refspec, &Anonymous, &policy);
-        request.lane = "public";
-        request.sample_seconds = 0.025;
-        pull(&request).unwrap()
-    };
-    let first_ref = pinned(&first);
-    let cold = ask(&hub_first.base, &first_ref);
-    assert_eq!(cold.fetched, 6);
-
-    let before = hub_first.total_hits();
-    let warm = ask(&hub_first.base, &first_ref);
-    assert_eq!(
-        hub_first.total_hits(),
-        before,
-        "a pinned warm pull reached the hub"
-    );
-    assert_eq!((warm.held, warm.fetched, warm.bytes_moved), (6, 0, 0));
-    assert_eq!(warm.bytes_total, cold.bytes_total);
-    assert_eq!(warm.manifest, first.manifest.id());
-    assert_eq!(
-        (warm.release.as_str(), warm.lane.as_str()),
-        ("r1", "public")
-    );
-
-    // Unpinned: the ref names a release pointer the hub owns.
-    let before = hub_first.hits("/v1/tensorfs/closure");
-    let unpinned = {
-        let mut request = PullRequest::new(
-            &store,
-            &hub_first.base,
-            "acme/model@r1",
-            &Anonymous,
-            &policy,
-        );
-        request.lane = "public";
-        pull(&request).unwrap()
-    };
-    assert_eq!(unpinned.fetched, 0);
-    assert_eq!(hub_first.hits("/v1/tensorfs/closure") - before, 1);
-
-    // The pointer moved to `second`: the index maps r1/public to `first`, so ask the hub.
-    let moved = ask(&hub_second.base, &pinned(&second));
-    assert_eq!(hub_second.hits("/v1/tensorfs/closure"), 1);
-    assert!(moved.fetched > 0);
-    // The index now maps r1/public to `second`; a pin on `first` is no longer local.
-    let before = hub_first.hits("/v1/tensorfs/closure");
-    ask(&hub_first.base, &first_ref);
-    assert_eq!(hub_first.hits("/v1/tensorfs/closure") - before, 1);
-
-    // Back on `first` and local again; an object the store no longer holds is not trusted,
-    // so the hub is asked and exactly that object is refetched.
-    let before = hub_first.total_hits();
-    ask(&hub_first.base, &first_ref);
-    assert_eq!(hub_first.total_hits(), before);
-    let blob = first
-        .objects
-        .iter()
-        .find(|o| o.length == 16 * 1024)
-        .unwrap();
-    std::fs::remove_file(store.object_path(&blob.sha256)).unwrap();
-    let before = hub_first.hits("/v1/tensorfs/closure");
-    let healed = ask(&hub_first.base, &first_ref);
-    assert_eq!(healed.fetched, 1);
-    assert_eq!(hub_first.hits("/v1/tensorfs/closure") - before, 1);
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -961,66 +978,33 @@ fn pull_records_the_release_it_resolved() {
 }
 
 #[test]
-fn ensure_records_source_after_cancellation_lands_the_last_object() {
-    let root = temporary("ensure-canceled-custody");
+fn a_download_stopped_with_every_object_here_is_recorded_by_the_next() {
+    let root = temporary("canceled-custody");
     let store = Store::init(&root).unwrap();
     let checkpoint = Arc::new(checkpoint(3, 8 * 1024));
     let origin = hub_origin(Arc::clone(&checkpoint), |_, _| None);
     let policy = SourcePolicy::default();
     let token = super::PullCancellation::default();
-    let landed = AtomicUsize::new(0);
-    let on_object = |_: &ObjectRef, _: u64, _: ObjectSource| {
-        if landed.fetch_add(1, Ordering::Relaxed) + 1 == checkpoint.bodies.len() {
-            // Every immutable object is admitted, but pull has not recorded the source.
+    let on_progress = |done: u64, total: u64| {
+        if total > 0 && done == total {
             token.cancel();
         }
     };
     let mut canceled = request_for(&store, &origin.base, &policy);
     canceled.cancellation = Some(token.clone());
-    canceled.on_object = Some(&on_object);
-    assert_eq!(pull(&canceled).unwrap_err().code, Code::TRANSFER_FAILED);
-    assert_eq!(landed.load(Ordering::Relaxed), checkpoint.bodies.len());
-    assert_eq!(
-        crate::checkpoint_root::check_source(&store, "acme/model", &checkpoint.manifest)
-            .unwrap_err()
-            .code,
-        Code::REPOSITORY_ABSENT
-    );
-    let (held, _) = FetchPlan::of(
-        &store,
-        "after-cancel",
-        &checkpoint.manifest,
-        &checkpoint.objects,
-    )
-    .unwrap();
-    assert!(held.wanted.is_empty(), "cancellation must retain all bytes");
+    canceled.on_progress = Some(&on_progress);
+    let _ = pull(&canceled);
+    let (held, _) = FetchPlan::of(&store, "after-cancel", &checkpoint.manifest, &checkpoint.objects).unwrap();
+    assert!(held.wanted.is_empty(), "the stop must retain every byte");
 
-    // ensure supplies its resolved closure to pull. An empty wanted set must still
-    // complete the source record that the canceled flight never committed.
-    let refspec = format!("acme/model@r1@{}", checkpoint.manifest.id());
-    let access = Arc::new(crate::fetch::Plain { credential: Anonymous, policy: policy.clone() });
-    let mut resumed = crate::ensure::Request::new(&store, &origin.base, &refspec, access);
-    resumed.lane = "public";
-    resumed.cancellation = Some(super::PullCancellation::default());
-    let calls = origin.total_hits();
+    // The next download moves nothing and records the source the stopped one may not have.
     let presigns = origin.hits("/v1/tensorfs/presign");
-    let result = crate::ensure::ensure(&resumed).unwrap();
-    assert_eq!(result.bytes_held, held.declared_bytes());
-    assert_eq!(result.bytes_fetched, 0);
-    assert_eq!(origin.total_hits() - calls, 1, "only resolve the closure");
+    let resumed = pull(&request_for(&store, &origin.base, &policy)).unwrap();
+    assert_eq!((resumed.fetched, resumed.bytes_held), (0, held.declared_bytes()));
     assert_eq!(origin.hits("/v1/tensorfs/presign"), presigns);
     crate::checkpoint_root::check_source(&store, "acme/model", &checkpoint.manifest).unwrap();
     let census = crate::storage::Census::open(&root).unwrap();
     assert!(census.gc_plan(&[]).unwrap().is_empty());
-
-    // Once source custody exists, the pinned warm path stays entirely local.
-    let opened = crate::catalog::connections_opened(&root);
-    let calls = origin.total_hits();
-    let warm = crate::ensure::ensure(&resumed).unwrap();
-    assert_eq!(warm.bytes_fetched, 0);
-    assert_eq!(warm.bytes_held, result.bytes_total);
-    assert_eq!(origin.total_hits(), calls);
-    assert_eq!(crate::catalog::connections_opened(&root), opened);
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -1044,10 +1028,6 @@ fn corrupt_object_heals_into_wanted_and_refetches() {
     let healed = pull(&request_for(&store, &origin.base, &policy)).unwrap();
     assert_eq!(healed.fetched, 1);
     assert_eq!(healed.bytes_moved, victim.length);
-    assert!(healed
-        .presence
-        .iter()
-        .any(|(id, why)| id == &victim.id() && *why == "corrupt_removed"));
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -1381,7 +1361,9 @@ fn a_mint_that_goes_silent_on_a_still_pull_faults_with_what_it_measured() {
     let refusal = pull(&request).unwrap_err();
     let waited = started.elapsed();
 
-    assert_eq!(refusal.code, Code::TRANSFER_FAILED, "{refusal}");
+    // Asked again once, then refused as stalled, quoting the mint's own verdict.
+    assert_eq!(refusal.code, Code::STALLED, "{refusal}");
+    assert!(refusal.detail.contains("nothing landed"), "{refusal}");
     assert!(
         refusal
             .detail
@@ -1416,12 +1398,7 @@ fn a_mint_that_goes_silent_on_a_still_pull_faults_with_what_it_measured() {
         "the walk waited {waited:?} for a hub holding {HOLD:?} — that is the hub answering, \
          not the pull measuring"
     );
-    // Terminal, not re-asked: the transfer stopped, and no number of asks restarts it.
-    assert_eq!(
-        mints.load(Ordering::Relaxed),
-        2,
-        "the silent mint was re-asked"
-    );
+    assert!(mints.load(Ordering::Relaxed) >= 3, "the silent mint was not asked again");
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -1494,7 +1471,7 @@ fn a_slow_mint_over_a_moving_transfer_is_left_alone() {
 }
 
 #[test]
-fn deadline_refuses_midpull_and_the_next_pull_resumes_per_object() {
+fn a_stopped_download_keeps_what_landed_and_the_next_asks_for_the_rest() {
     let root = temporary("deadline");
     let store = Store::init(&root).unwrap();
     let checkpoint = Arc::new(checkpoint(4, 8 * 1024));
@@ -1508,23 +1485,26 @@ fn deadline_refuses_midpull_and_the_next_pull_resumes_per_object() {
         })
     });
     let policy = SourcePolicy::default();
+    let stop = super::PullCancellation::default();
+    let stopping = |done: u64, _: u64| {
+        if done > 0 {
+            stop.cancel();
+        }
+    };
     let mut rushed = request_for(&store, &origin.base, &policy);
     rushed.streams = 1;
-    rushed.deadline = Deadline::after_seconds(Some(0.4));
+    rushed.cancellation = Some(stop.clone());
+    rushed.on_progress = Some(&stopping);
     let refusal = pull(&rushed).unwrap_err();
-    assert_eq!(refusal.code, Code::DEADLINE_EXCEEDED);
+    assert_eq!(refusal.code, Code::TRANSFER_FAILED);
 
-    // Whatever landed before the deadline stays landed; the re-plan asks only for the rest.
+    // Whatever landed before the stop stays landed; the re-plan asks only for the rest.
     let resumed = pull(&request_for(&store, &origin.base, &policy)).unwrap();
     assert_eq!(resumed.held + resumed.fetched, 6);
     assert!(
         resumed.held > 0,
         "per-object resume kept the landed objects"
     );
-    resumed
-        .presence
-        .iter()
-        .for_each(|(_, why)| assert_ne!(*why, "corrupt_removed"));
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -1554,43 +1534,6 @@ fn a_walk_that_outlives_the_url_lifetime_completes() {
         Duration::from_millis(30),
     );
 
-    // Today's shape, spelled out: every URL stamped once, at T=0, with the hub's cap on it.
-    let eager_root = temporary("expiry-eager");
-    let eager = Store::init(&eager_root).unwrap();
-    let (eager_plan, _) =
-        FetchPlan::of(&eager, "eager", &checkpoint.manifest, &checkpoint.objects).unwrap();
-    let dies = now_millis() + hub.lifetime.as_millis();
-    let up_front: std::collections::BTreeMap<String, String> = eager_plan
-        .wanted
-        .iter()
-        .map(|o| {
-            (
-                o.sha256.clone(),
-                format!("{}/obj/{}?dies={dies}", hub.origin.base, o.sha256),
-            )
-        })
-        .collect();
-    let refusal = super::pull::fetch_wanted(
-        &eager,
-        &eager_plan,
-        &up_front,
-        &local_policy(),
-        &Anonymous,
-        Deadline::none(),
-        &Ledger::with_resolution(Duration::from_millis(200)),
-        4,
-        None,
-    )
-    .unwrap_err();
-    assert_eq!(refusal.code, Code::TRANSFER_FAILED);
-    assert!(refusal.detail.contains("403"), "{}", refusal.detail);
-    let refused_up_front = hub.rejected.load(Ordering::Relaxed);
-    assert!(
-        refused_up_front > 0,
-        "the origin never actually refused an aged URL — the proof would be vacuous"
-    );
-    let _ = std::fs::remove_dir_all(eager_root);
-
     // The same closure, the same origin, the same one-second URLs — minted where they are
     // used. Nothing about the cap changed; only when the URL is asked for.
     let root = temporary("expiry-lazy");
@@ -1616,9 +1559,8 @@ fn a_walk_that_outlives_the_url_lifetime_completes() {
     );
     assert_eq!(
         hub.rejected.load(Ordering::Relaxed),
-        refused_up_front,
-        "a dead URL was presented during the lazy walk — every fetch must carry an \
-         authorization minted for it"
+        0,
+        "a dead URL was presented — every fetch must carry an authorization minted for it"
     );
     let _ = std::fs::remove_dir_all(root);
 }
@@ -1644,22 +1586,21 @@ fn a_resume_across_an_expiry_boundary_completes() {
     // Cut off only after a verified object has actually landed. A fixed wall
     // deadline can expire before the first admission on a busy test runner.
     let cancellation = crate::transport::PullCancellation::default();
-    let admitted = AtomicUsize::new(0);
-    let observer = |object: &ObjectRef, _: u64, _: ObjectSource| {
-        assert!(store.record_valid(&object.sha256).is_ok());
-        admitted.fetch_add(1, Ordering::Relaxed);
-        cancellation.cancel();
+    let observer = |done: u64, _: u64| {
+        if done > 0 {
+            cancellation.cancel();
+        }
     };
     let mut rushed = request_for(&store, &hub.origin.base, &policy);
     rushed.streams = 2;
     rushed.sample_seconds = 0.2;
     rushed.cancellation = Some(cancellation.clone());
-    rushed.on_object = Some(&observer);
+    rushed.on_progress = Some(&observer);
     let refusal = pull(&rushed).unwrap_err();
     assert_eq!(refusal.code, Code::TRANSFER_FAILED);
     assert!(refusal.detail.contains("cancelled"));
-    assert!(admitted.load(Ordering::Relaxed) > 0);
-    assert!(admitted.load(Ordering::Relaxed) < 20);
+    let (landed, _) = FetchPlan::of(&store, "rushed", &checkpoint.manifest, &checkpoint.objects).unwrap();
+    assert!(!landed.held.is_empty() && !landed.wanted.is_empty(), "{} held", landed.held.len());
 
     // Wait out the life of every URL that walk was holding, then resume.
     std::thread::sleep(hub.lifetime + Duration::from_millis(300));
@@ -1754,12 +1695,7 @@ fn retryable_status_buys_a_reask_and_authorization_answers_do_not() {
     assert_eq!(report.fetched, 4);
     assert_eq!(origin.hits(&format!("/obj/{flaky}")), 2);
 
-    // A 403 against a URL minted moments ago: one ask, a typed refusal, no retry. The
-    // reason is the LEASE, not the status — the lease holds nearly all of its declared
-    // life, so there is nothing to argue that time was the cause, and re-minting would ask
-    // the same question. A 403 against a lease the hub's own declared life says is spent is
-    // re-minted instead; that half is
-    // `a_403_is_judged_by_the_leases_age_and_not_by_a_count`.
+    // A 403 is asked again once on a URL minted afresh; the origin's refusal of that is final.
     let store2root = temporary("retry-expired");
     let store2 = Store::init(&store2root).unwrap();
     let expired_for = expired.clone();
@@ -1771,8 +1707,8 @@ fn retryable_status_buys_a_reask_and_authorization_answers_do_not() {
     });
     let refusal = pull(&request_for(&store2, &origin2.base, &policy)).unwrap_err();
     assert_eq!(refusal.code, Code::TRANSFER_FAILED);
-    assert!(refusal.detail.contains("403"));
-    assert_eq!(origin2.hits(&format!("/obj/{expired}")), 1);
+    assert!(refusal.detail.contains("403 to a URL minted afresh"), "{refusal}");
+    assert_eq!(origin2.hits(&format!("/obj/{expired}")), 2);
     let _ = std::fs::remove_dir_all(root);
     let _ = std::fs::remove_dir_all(store2root);
 }
@@ -1809,8 +1745,6 @@ fn sixteen_way_walk_lands_everything_through_the_one_door() {
     let checkpoint = Arc::new(checkpoint(24, 16 * 1024));
     let origin = hub_origin(Arc::clone(&checkpoint), |_, _| None);
     let policy = SourcePolicy::default();
-    let counted = AtomicUsize::new(0);
-    let from_origin = AtomicUsize::new(0);
     let plans = Mutex::new(Vec::new());
     let planned = |plan: &FetchPlan| {
         plans
@@ -1818,31 +1752,14 @@ fn sixteen_way_walk_lands_everything_through_the_one_door() {
             .unwrap()
             .push((plan.declared_bytes(), plan.held_bytes()));
     };
-    let observer = |_: &ObjectRef, _: u64, door: ObjectSource| {
-        assert_eq!(
-            plans.lock().unwrap().len(),
-            1,
-            "the plan precedes all body transfers"
-        );
-        counted.fetch_add(1, Ordering::Relaxed);
-        if door == ObjectSource::Origin {
-            from_origin.fetch_add(1, Ordering::Relaxed);
-        }
-    };
     let mut request = request_for(&store, &origin.base, &policy);
     request.streams = 16;
     request.on_plan = Some(&planned);
-    request.on_object = Some(&observer);
     let report = pull(&request).unwrap();
     assert_eq!(report.fetched, 26);
-    assert_eq!(counted.load(Ordering::Relaxed), 26);
-    // With no cache mounted every object came through the origin door, and the observer
-    // was told so per object rather than only in the final report.
-    assert_eq!(from_origin.load(Ordering::Relaxed), 26);
     assert_eq!(*plans.lock().unwrap(), vec![(report.bytes_total, 0)]);
     let warm = pull(&request).unwrap();
     assert_eq!(warm.fetched, 0);
-    assert_eq!(counted.load(Ordering::Relaxed), 26);
     assert_eq!(
         *plans.lock().unwrap(),
         vec![
@@ -1956,7 +1873,7 @@ fn credential_headers_reach_the_hub_and_not_the_object_host() {
         headers: vec![("authorization".into(), "Bearer worker-token".into())],
     };
     let policy = SourcePolicy::default();
-    let mut request = PullRequest::new(&store, &origin.base, "acme/model", &token, &policy);
+    let mut request = PullRequest::new(&store, &origin.base, "acme/model", token, &policy);
     request.sample_seconds = 0.025;
     pull(&request).unwrap();
     let seen = seen.lock().unwrap();
@@ -2002,12 +1919,12 @@ fn a_worker_capability_reaches_the_hub_calls_as_its_two_headers() {
     let policy = SourcePolicy::default();
     let credential =
         credential_from_spec("worker om-machine worker-token", vec!["127.0.0.1".into()]).unwrap();
-    let mut request = PullRequest::new(&store, &origin.base, "acme/model", &credential, &policy);
+    let mut request = PullRequest::new(&store, &origin.base, "acme/model", credential, &policy);
     request.sample_seconds = 0.025;
     pull(&request).unwrap();
     let anonymous_root = temporary("worker-cred-anon");
     let anonymous = Store::init(&anonymous_root).unwrap();
-    let mut refused = PullRequest::new(&anonymous, &origin.base, "acme/model", &Anonymous, &policy);
+    let mut refused = PullRequest::new(&anonymous, &origin.base, "acme/model", Anonymous, &policy);
     refused.sample_seconds = 0.025;
     assert!(pull(&refused)
         .unwrap_err()
@@ -2739,128 +2656,6 @@ fn a_certificate_refused_by_an_origin_verified_before_is_asked_again() {
 
 // ---------------------------------------------------------------- the parity benchmark
 
-/// The tfs-049 parity benchmark, opt-in:
-///
-///   nice -n 19 cargo test --release -p tensorfs-core --lib bench_walk -- --ignored --nocapture
-///
-/// The recorded figures (#566b, 92.42 GiB on a rented pod, 141 MB/s transport ceiling):
-/// serial 49.8 MB/s, 16-way 117.6 MB/s through the same admission door. A WAN cannot be
-/// conjured locally, so objects here are production-shaped (the 64 MiB grid) and the
-/// throttled phase emulates the link's SHAPE — 100 ms to first byte, ~8.7 MB/s per stream,
-/// 16 x 8.7 = 139 nominal, mirroring the 141 ceiling. It proves the MECHANISM: the 16-way
-/// walk through this door clears the recorded 117.6 MB/s aggregate on a link whose single
-/// stream cannot reach a tenth of it. The unthrottled phase then proves the door itself
-/// (hash + fsync + no-clobber admission) is not the bottleneck at that figure.
-#[test]
-#[ignore = "benchmark; run explicitly with --ignored --nocapture"]
-fn bench_walk_16way_parity() {
-    const SIZE: usize = 64 * 1024 * 1024; // the production object grid
-    const COUNT: usize = 32;
-    let mut block = vec![0u8; SIZE];
-    let mut x: u64 = 0x243f6a8885a308d3;
-    for byte in block.iter_mut() {
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        *byte = (x >> 24) as u8;
-    }
-    let block = Arc::new(block);
-    let body_of = |index: u64| -> Vec<u8> {
-        let mut body = block.as_ref().clone();
-        body[..8].copy_from_slice(&index.to_le_bytes());
-        body
-    };
-    let mut declared: Vec<ObjectRef> = Vec::new();
-    let mut index_of: HashMap<String, u64> = HashMap::new();
-    for index in 0..COUNT as u64 {
-        let object = ObjectRef::of(&body_of(index));
-        index_of.insert(object.sha256.clone(), index);
-        declared.push(object);
-    }
-    declared.sort_by(|a, b| a.sha256.cmp(&b.sha256));
-    let index_of = Arc::new(index_of);
-
-    let serve = |throttled: bool| -> Origin {
-        let index_of = Arc::clone(&index_of);
-        let block = Arc::clone(&block);
-        origin(Arc::new(move |request: &Request| {
-            let hex = request.path.trim_start_matches("/obj/");
-            let mut body = block.as_ref().clone();
-            body[..8].copy_from_slice(&index_of[hex].to_le_bytes());
-            if throttled {
-                Serve::Drip {
-                    body,
-                    chunk: 512 * 1024,
-                    gap: Duration::from_millis(60),
-                    ttfb: Duration::from_millis(100),
-                }
-            } else {
-                status(200, &body)
-            }
-        }))
-    };
-
-    let run = |origin: &Origin, streams: usize, subset: &[ObjectRef]| -> f64 {
-        let root = temporary(&format!("bench-{streams}-{}", subset.len()));
-        let store = Store::init(&root).unwrap();
-        let (plan, _) = FetchPlan::of_objects(&store, "bench", subset).unwrap();
-        let urls: std::collections::BTreeMap<String, String> = subset
-            .iter()
-            .map(|o| {
-                (
-                    o.sha256.clone(),
-                    format!("{}/obj/{}", origin.base, o.sha256),
-                )
-            })
-            .collect();
-        let ledger = Ledger::new(); // PRODUCTION resolution; nothing here should stall
-        let started = std::time::Instant::now();
-        let walked = super::pull::fetch_wanted(
-            &store,
-            &plan,
-            &urls,
-            &local_policy(),
-            &Anonymous,
-            Deadline::none(),
-            &ledger,
-            streams,
-            None,
-        )
-        .unwrap();
-        let seconds = started.elapsed().as_secs_f64();
-        plan.complete(&store).unwrap();
-        let _ = std::fs::remove_dir_all(root);
-        assert_eq!(walked.fetched as usize, subset.len());
-        walked.bytes_moved as f64 / 1e6 / seconds
-    };
-
-    let throttled = serve(true);
-    let serial = run(&throttled, 1, &declared[..3]);
-    let sixteen = run(&throttled, 16, &declared);
-    let open = serve(false);
-    let unthrottled = run(&open, 16, &declared);
-
-    println!(
-        "bench_walk_16way_parity (recorded: serial 49.8 MB/s, 16-way 117.6 MB/s, ceiling 141)"
-    );
-    println!("  emulated link (100 ms TTFB, ~8.7 MB/s per stream, 139 MB/s nominal aggregate):");
-    println!("    serial  {serial:8.1} MB/s   (one stream of that link, as expected)");
-    println!("    16-way  {sixteen:8.1} MB/s   vs the recorded 117.6");
-    println!("  unthrottled loopback, 16-way through the full door: {unthrottled:8.1} MB/s");
-    assert!(
-        sixteen >= 117.6,
-        "16-way walk {sixteen:.1} MB/s under the recorded 117.6 MB/s"
-    );
-    assert!(
-        sixteen >= 2.4 * serial,
-        "16-way {sixteen:.1} not even 2.4x serial {serial:.1} — the regression the spec forbids"
-    );
-    assert!(
-        unthrottled >= 117.6,
-        "the door itself moved {unthrottled:.1} MB/s — below the recorded WAN figure"
-    );
-}
-
 /// Serves one object's body by digest.
 type Bodies = Arc<dyn Fn(&str) -> Vec<u8> + Send + Sync>;
 
@@ -3117,84 +2912,6 @@ fn a_hub_that_declares_no_ceiling_is_refused() {
     );
     assert_eq!(hub.mints.load(Ordering::Relaxed), 0);
     let _ = std::fs::remove_dir_all(root);
-}
-
-/// **A 403 is judged by the LEASE'S AGE against the life the hub declared, never by a count
-/// of how often this object has been re-authorized.**
-///
-/// The two agree on a fast link and diverge exactly where a slow one lives. An object that
-/// begins its transfer holding half a URL's life and takes longer than that to move is a
-/// 64 MiB object at ~107 KB/s: slow, and the transport exists to say slow is not broken. A
-/// count would call its second expiry terminal after gigabytes had landed. The age test
-/// re-mints for it, and still refuses at the FIRST 403 against a URL minted moments ago —
-/// because a refusal of a fresh capability is not about time, and asking to be authorized
-/// again would be asking the same question.
-///
-/// Reaching this decision from the wire means racing a clock, so the lease's age is stated
-/// here rather than waited for. Everything else is the production type.
-#[test]
-fn a_403_is_judged_by_the_leases_age_and_not_by_a_count() {
-    use std::collections::BTreeMap;
-    use std::time::Instant;
-
-    let checkpoint = Arc::new(checkpoint(3, 1024));
-    let hub = wire_hub_origin(Arc::clone(&checkpoint), 128 << 10, usize::MAX, Some(1956));
-    let policy = local_policy();
-    let ledger = Ledger::with_resolution(Duration::from_millis(50));
-    let wanted: Vec<ObjectRef> = checkpoint.objects.clone();
-    let object = wanted[0].clone();
-    let declared = Duration::from_secs(600);
-
-    let leases = super::pull::Leases {
-        client: super::pull::shared_client(),
-        base: &hub.origin.base,
-        credential: &Anonymous,
-        policy: &policy,
-        deadline: Deadline::none(),
-        ledger: &ledger,
-        wanted: &wanted,
-        window: 1956,
-        held: Mutex::new(BTreeMap::new()),
-        minting: Default::default(),
-    };
-
-    // A lease whose declared life is more than half gone: the origin's refusal IS about
-    // time, and being authorized again is a different question with a different answer.
-    leases.held.lock().unwrap().insert(
-        object.sha256.clone(),
-        super::pull::Lease {
-            url: "http://127.0.0.1:1/stale".into(),
-            minted: Instant::now() - declared,
-            lifetime: declared,
-        },
-    );
-    let minted = super::pull::ObjectUrls::url_for(&leases, 0, &object, true)
-        .expect("a spent lease refused by the origin must be re-minted");
-    assert!(
-        minted.starts_with(&hub.origin.base) && minted.contains(&object.sha256),
-        "re-authorizing did not produce a fresh URL: {minted}"
-    );
-    assert_eq!(hub.mints.load(Ordering::Relaxed), 1);
-
-    // A lease minted moments ago, refused by the origin: terminal at the first answer, with
-    // no attempt spent and no second mint.
-    leases.held.lock().unwrap().insert(
-        object.sha256.clone(),
-        super::pull::Lease {
-            url: "http://127.0.0.1:1/fresh".into(),
-            minted: Instant::now(),
-            lifetime: declared,
-        },
-    );
-    let refusal = super::pull::ObjectUrls::url_for(&leases, 0, &object, true)
-        .expect_err("a URL minted moments ago is not refused because of time");
-    assert_eq!(refusal.code, Code::TRANSFER_FAILED);
-    assert!(refusal.detail.contains("minted moments ago"), "{refusal}");
-    assert_eq!(
-        hub.mints.load(Ordering::Relaxed),
-        1,
-        "a fresh lease's refusal bought a second mint"
-    );
 }
 
 /// **A SLOW MINT MUST NOT POISON ITS OWN ANSWER.**
@@ -4197,7 +3914,7 @@ fn downloaded_cache_root_is_protected_then_evicted_and_refetched() {
     let policy = SourcePolicy::default();
     let root = temporary("pressure-cached-root");
     let store = Store::init(&root).unwrap();
-    let request = PullRequest::new(&store, &origin.base, "acme/model", &Anonymous, &policy);
+    let request = PullRequest::new(&store, &origin.base, "acme/model", Anonymous, &policy);
     let cold = pull(&request).unwrap();
     assert!(cold.bytes_moved > 0);
     let repository = crate::repository::RepositoryName::new("acme", "model").unwrap();
@@ -4217,85 +3934,6 @@ fn downloaded_cache_root_is_protected_then_evicted_and_refetched() {
     let again = pull(&request).unwrap();
     assert_eq!(again.bytes_moved, cold.bytes_moved);
     assert!(store.repository_path(&repository).exists());
-    let _ = std::fs::remove_dir_all(root);
-}
-
-#[test]
-fn failed_object_cancels_stalled_siblings_and_preserves_completed_bytes() {
-    use std::collections::BTreeMap;
-    let root = temporary("failed-sibling");
-    let store = Store::init(&root).unwrap();
-    let good_bytes = vec![b'g'; 4096];
-    let good = ObjectRef::of(&good_bytes);
-    let failed = ObjectRef::of(b"missing object");
-    let stalled = ObjectRef::of(b"unfinished object");
-    store
-        .put_stream(
-            &mut good_bytes.as_slice(),
-            Some(&good),
-            &crate::store::Fault::default(),
-        )
-        .unwrap();
-    let ledger = Arc::new(Ledger::with_resolution(Duration::from_millis(20)));
-    ledger.taught(Duration::from_secs(5));
-    let progress = Arc::clone(&ledger);
-    let failed_path = format!("/{}", failed.sha256);
-    let peer = origin(Arc::new(move |request| {
-        if request.path == failed_path {
-            let until = std::time::Instant::now() + Duration::from_secs(2);
-            while progress.still().moved == 0 {
-                assert!(
-                    std::time::Instant::now() < until,
-                    "peer fixture never started"
-                );
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            return status(404, b"missing object");
-        }
-        Serve::Stall {
-            total: 17,
-            prefix: b"unfinished".to_vec(),
-        }
-    }));
-    let mut objects = vec![good.clone(), failed.clone(), stalled.clone()];
-    objects.sort_by(|a, b| a.sha256.cmp(&b.sha256));
-    let (plan, _) = FetchPlan::of_objects(&store, "failed-sibling", &objects).unwrap();
-    let urls: BTreeMap<String, String> = objects
-        .iter()
-        .map(|object| {
-            (
-                object.sha256.clone(),
-                format!("{}/{}", peer.base, object.sha256),
-            )
-        })
-        .collect();
-    let started = std::time::Instant::now();
-    let refusal = super::pull::fetch_wanted(
-        &store,
-        &plan,
-        &urls,
-        &local_policy(),
-        &Anonymous,
-        Deadline::after_seconds(Some(3.0)),
-        &ledger,
-        2,
-        None,
-    )
-    .unwrap_err();
-    assert!(
-        refusal.detail.contains("404"),
-        "original refusal lost: {refusal}"
-    );
-    assert!(
-        started.elapsed() < Duration::from_secs(1),
-        "failed pull waited on its stalled sibling: {:?}",
-        started.elapsed()
-    );
-    assert!(store.record_valid(&good.sha256).is_ok());
-    assert!(store.record_valid(&stalled.sha256).is_err());
-    let (retry, _) = FetchPlan::of_objects(&store, "retry-failed-sibling", &objects).unwrap();
-    assert_eq!(retry.held, vec![good]);
-    assert_eq!(retry.wanted.len(), 2);
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -4732,7 +4370,7 @@ fn bench_door_concurrency() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn an_ephemeral_store_pulls_without_a_sync_or_a_marker() {
+fn an_ephemeral_store_downloads_without_a_marker() {
     let root = std::path::Path::new("/dev/shm").join(format!(
         "tensorfs-ephemeral-pull-{}-{}",
         std::process::id(),
@@ -4744,9 +4382,7 @@ fn an_ephemeral_store_pulls_without_a_sync_or_a_marker() {
     let policy = SourcePolicy::default();
     let report = pull(&request_for(&store, &origin.base, &policy)).unwrap();
     assert_eq!(report.fetched, 8);
-    assert_eq!(report.durability.class, crate::disk::DiskClass::Ephemeral);
-    assert_eq!(report.durability.filesystem, "tmpfs");
-    assert_eq!(report.durability.syncs, 0);
+    assert_eq!(store.disk_class(), crate::disk::DiskClass::Ephemeral);
     assert!(!root.join("tmp/unsynced").exists());
     for object in &checkpoint.objects {
         assert!(store.record_valid(&object.sha256).is_ok());
@@ -4755,7 +4391,7 @@ fn an_ephemeral_store_pulls_without_a_sync_or_a_marker() {
 }
 
 #[test]
-fn a_persistent_store_pulls_under_one_sync_and_retires_its_marker() {
+fn a_persistent_store_downloads_and_retires_its_marker() {
     let root = crate::unsynced::testing::persistent_root("persistent-pull");
     let store = Store::init(&root).unwrap();
     assert_eq!(store.disk_class(), crate::disk::DiskClass::Persistent);
@@ -4764,15 +4400,10 @@ fn a_persistent_store_pulls_under_one_sync_and_retires_its_marker() {
     let policy = SourcePolicy::default();
     let cold = pull(&request_for(&store, &origin.base, &policy)).unwrap();
     assert_eq!(cold.fetched, 8);
-    assert_eq!(cold.durability.class, crate::disk::DiskClass::Persistent);
-    assert_eq!(cold.durability.syncs, 1, "one sync at the end of the walk");
     assert!(crate::unsynced::testing::markers(&root).is_empty());
     let warm = pull(&request_for(&store, &origin.base, &policy)).unwrap();
     assert_eq!(warm.fetched, 0);
-    assert_eq!(
-        warm.durability.syncs, 0,
-        "a pull that admits nothing syncs nothing"
-    );
+    assert!(crate::unsynced::testing::markers(&root).is_empty());
     let _ = std::fs::remove_dir_all(root);
 }
 

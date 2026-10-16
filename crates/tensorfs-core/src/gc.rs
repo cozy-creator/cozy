@@ -106,7 +106,6 @@ fn holds_except(store: &Store, idle: &[ObjectRef]) -> Result<(Vec<HeldKey>, Vec<
         .collect::<Result<Vec<_>>>()?;
     holds.extend(crate::derived::retained_objects(store)?);
     holds.extend(crate::source_artifact::held_objects(store)?);
-    holds.extend(crate::ensure::held_objects(store)?);
     holds.extend(crate::object_roots::held_objects(store)?);
     // A checkpoint held in part is a cache root ([`crate::origin`]).
     let idle: BTreeSet<&str> = idle.iter().map(|manifest| manifest.sha256.as_str()).collect();

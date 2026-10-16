@@ -21,7 +21,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use rustix::fs::{AtFlags, OFlags, StatxFlags, CWD};
 
-use crate::ensure::Disk;
+use crate::admission::Disk;
 use crate::ids::{Doc, ObjectRef};
 use crate::store::Store;
 

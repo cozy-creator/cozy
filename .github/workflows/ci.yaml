@@ -33,7 +33,7 @@ jobs:
 
   # Model weights must keep arriving (run 2322, 2026-10-01): slow chunk answers, resets,
   # stalls, 5xx/429/Retry-After, expired URLs, wrong bytes, hub weather and verdicts,
-  # cancellation and resume, all over real loopback HTTP through `ensure` and `pull`.
+  # cancellation and resume, all over real loopback HTTP through the Fetcher (`fetch::whole`).
   download-path:
     if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
@@ -46,7 +46,7 @@ jobs:
         env:
           BASE: ${{ github.base_ref }}
         run: |
-          path='^(crates/tensorfs-core/src/(transport/|ensure|fetch\.rs|store\.rs|catalog|meta\.rs|gc\.rs|unsynced|bin/tfs/ensure\.rs)|crates/tensorfs-core/tests/(fetch_faults|ensure)\.rs|crates/tensorfs-py/src/|Cargo\.(toml|lock)$|\.github/workflows/ci\.yaml$)'
+          path='^(crates/tensorfs-core/src/(transport/|fetch|admission|store\.rs|catalog|meta\.rs|gc\.rs|unsynced)|crates/tensorfs-core/tests/(fetch_faults|fd_budget)\.rs|crates/tensorfs-py/src/|Cargo\.(toml|lock)$|\.github/workflows/ci\.yaml$)'
           if [ -n "$BASE" ] && ! git diff --name-only "origin/$BASE...HEAD" | grep -qE "$path"; then
             echo "run=false" >> "$GITHUB_OUTPUT"
           else
@@ -57,7 +57,7 @@ jobs:
       - if: steps.scope.outputs.run == 'true'
         uses: Swatinem/rust-cache@v2
       - if: steps.scope.outputs.run == 'true'
-        run: cargo test -p tensorfs-core --test fetch_faults --test ensure -- --test-threads=2
+        run: cargo test -p tensorfs-core --test fetch_faults --test fd_budget -- --test-threads=2
       - if: steps.scope.outputs.run == 'true'
         run: "cargo test -p tensorfs-core --lib transport:: -- --test-threads=2"
 

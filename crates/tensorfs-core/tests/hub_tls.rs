@@ -145,23 +145,8 @@ fn a_tls_alert_from_the_peer_is_weather_and_asked_again() {
     let (port, pem, _accepted) = private_hub(1);
     let ca = dir.join("hub-ca.pem");
     std::fs::write(&ca, pem).unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_tfs"))
-        .args(["ensure", root.to_str().unwrap(), "proof/model"])
-        .args(["--hub", &format!("https://127.0.0.1:{port}")])
-        .args([
-            "--ca-file",
-            ca.to_str().unwrap(),
-            "--sample-seconds",
-            "0.05",
-        ])
-        .env("TFS_CREDENTIAL", "")
-        .output()
-        .unwrap();
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("\"code\":\"REF_NOT_FOUND\"") && stdout.contains("checkpoint_not_found"),
-        "{stdout}"
-    );
+    let (ok, stderr) = fetch(&root, port, &["--ca-file", ca.to_str().unwrap(), "--sample-seconds", "0.05"]);
+    assert!(!ok && stderr.contains("REFUSED REF_NOT_FOUND") && stderr.contains("checkpoint_not_found"), "{stderr}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -187,40 +172,24 @@ fn a_hub_that_never_speaks_tls_is_weather_and_never_a_hang() {
         }
     });
     let mut child = Command::new(env!("CARGO_BIN_EXE_tfs"))
-        .args(["ensure", root.to_str().unwrap(), "proof/model"])
+        .args(["fetch", root.to_str().unwrap(), "proof/model"])
         .args(["--hub", &format!("https://127.0.0.1:{port}")])
         .args(["--sample-seconds", "0.05"])
         .env("TFS_CREDENTIAL", "")
-        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    // A hang guard on output, not a verdict: tfs ensure prints a line every second.
-    let stdout = child.stdout.take().unwrap();
-    let (lines, read) = mpsc::channel();
-    std::thread::spawn(move || {
-        use std::io::BufRead;
-        for line in std::io::BufReader::new(stdout)
-            .lines()
-            .map_while(|l| l.ok())
-        {
-            let _ = lines.send(line);
+    // A hang guard, not a verdict: the ledger's patience at 50 ms ends it long before.
+    let began = std::time::Instant::now();
+    while child.try_wait().unwrap().is_none() {
+        if began.elapsed() > std::time::Duration::from_secs(60) {
+            let _ = child.kill();
+            panic!("tfs fetch hung on a hub that never speaks TLS");
         }
-    });
-    let mut last = String::new();
-    loop {
-        match read.recv_timeout(std::time::Duration::from_secs(30)) {
-            Ok(line) => last = line,
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                let _ = child.kill();
-                panic!("tfs ensure printed nothing for 30 s; last: {last}");
-            }
-        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    assert!(!child.wait().unwrap().success());
-    assert!(
-        last.contains("\"code\":\"HUB_UNREACHABLE\"") && last.contains("\"resumable\":true"),
-        "{last}"
-    );
+    let out = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success() && stderr.contains("REFUSED HUB_UNREACHABLE"), "{stderr}");
     let _ = std::fs::remove_dir_all(&dir);
 }

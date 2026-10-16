@@ -1,32 +1,28 @@
-//! Disk admission for one flight, and the GC policy that makes room. Disk only: nothing here
-//! looks at RAM (owner rule: no RAM floor; the Runtime pages to disk).
+//! The disk a download is admitted against, and the GC pass that relieves a low one. Disk
+//! only: nothing here looks at RAM (owner rule: no RAM floor; the Runtime pages to disk).
 //!
-//! A reserve of 1/50 of the filesystem, clamped to 1–10 GiB, and 32 inodes is never admitted; a
-//! download needs its wanted bytes and 16 + 3 inodes per wanted object; live flights'
-//! unwritten remainders are already spoken for. A disk is low when no more than the reserve
-//! is free. For a flight that does not fit, or a low disk, GC takes unreferenced bytes and
-//! then the fewest least-recently-used cache roots that cover what is missing; roots that
-//! cannot cover it stay (`gc::collect_cached_for`), and the answer after that is the answer.
+//! A reserve of 1/50 of the filesystem, clamped to 1–10 GiB, and 32 inodes is never admitted;
+//! an object needs its bytes and 3 inodes, a download 16 more. A disk is low when no more than
+//! the reserve is free; GC then takes unreferenced bytes and the fewest least-recently-used
+//! cache roots that cover what is missing (`gc::collect_cached_for`).
 
 use std::ops::Add;
 use std::path::Path;
 
-use crate::err::{refuse, Code, Refusal, Result};
+use crate::err::{Code, Refusal, Result};
 use crate::gc;
 use crate::store::Store;
-
-use super::flight::{self, Flight, Record};
 
 /// 1/50 of the filesystem, at least 1 GiB and at most 10 GiB: 2% of a large disk can be
 /// everything still free on it.
 const RESERVE_BYTES: (u64, u64) = (1 << 30, 10 << 30);
 const RESERVE_DIVISOR: u64 = 50;
 const RESERVE_INODES: u64 = 32;
-pub(super) const METADATA_INODES: u64 = 16;
-pub(super) const OBJECT_INODES: u64 = 3;
+const METADATA_INODES: u64 = 16;
+const OBJECT_INODES: u64 = 3;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct Space {
+pub struct Space {
     pub bytes: u64,
     pub inodes: u64,
 }
@@ -54,6 +50,7 @@ impl Space {
         }
     }
 
+    #[cfg(test)]
     fn within(self, free: Space) -> bool {
         self.bytes <= free.bytes && self.inodes <= free.inodes
     }
@@ -102,7 +99,7 @@ impl Disk {
 }
 
 /// What `disk` admits once its reserve and `others` are set aside.
-pub(crate) fn free(disk: &Disk, others: Space) -> Space {
+pub fn free(disk: &Disk, others: Space) -> Space {
     Space {
         bytes: disk
             .available
@@ -126,66 +123,6 @@ fn collect(store: &Store, protected: &[String], short: u64) -> (u64, Option<Refu
     }
 }
 
-/// Live flights under the admission gate: what they still owe the disk, and their
-/// manifests, which GC may not evict.
-fn flights(store: &Store, mine: &str, keep: &[String]) -> Result<(Space, Vec<String>)> {
-    let live = flight::live(store, mine)?;
-    let owed = live
-        .iter()
-        .filter_map(|(_, record)| record.as_ref().map(Record::remaining))
-        .fold(Space::default(), Add::add);
-    let mut protected = keep.to_vec();
-    protected.extend(live.into_iter().map(|(manifest, _)| manifest));
-    protected.extend((!mine.is_empty()).then(|| mine.to_string()));
-    Ok((owed, protected))
-}
-
-/// Admit `record`'s flight, collecting under the GC policy when it does not fit. Returns
-/// the bytes collected. `keep` names manifests GC may not evict.
-pub(super) fn admit(
-    store: &Store,
-    flight: &Flight,
-    record: &Record,
-    keep: &[String],
-    collecting: &dyn Fn(),
-) -> Result<u64> {
-    let need = Space::of(record.wanted_bytes, record.wanted_objects);
-    let _gate = flight::gate(store)?;
-    let (others, protected) = flights(store, &flight.manifest, keep)?;
-    let short = |disk: &Disk| {
-        let free = free(disk, others);
-        (!need.within(free)).then(|| need.bytes.saturating_sub(free.bytes))
-    };
-    let mut disk = Disk::measure(store.root())?;
-    let (mut freed, mut unable) = (0, None);
-    if let Some(short) = short(&disk) {
-        collecting();
-        (freed, unable) = collect(store, &protected, short);
-        disk = Disk::measure(store.root())?;
-    }
-    if short(&disk).is_none() {
-        flight.record(record)?;
-        return Ok(freed);
-    }
-    let free = free(&disk, others);
-    let inodes = match disk.inodes {
-        0 => String::new(),
-        _ => format!(" ({} inodes, {} free)", need.inodes, free.inodes),
-    };
-    let why = unable.map_or(String::new(), |r| format!("; GC could not run: {r}"));
-    refuse(
-        Code::CAPACITY_EXHAUSTED,
-        format!(
-            "this download needs {} B{inodes}; the disk under {} admits {} B after its \
-             reserve and {} B still owed to other downloads; GC freed {freed} B{why}",
-            need.bytes,
-            store.root().display(),
-            free.bytes,
-            others.bytes,
-        ),
-    )
-}
-
 /// What one pass over a low disk found and did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Relief {
@@ -199,14 +136,12 @@ pub struct Relief {
 }
 
 /// One pass over a low disk: GC frees what brings it back above its reserve, or only the
-/// unreferenced bytes when no cache roots cover that. Live flights' manifests and `keep`
-/// are never evicted. A disk that is not low is left alone.
+/// unreferenced bytes when no cache roots cover that. `keep` is never evicted, nor what a
+/// fetch holds. A disk that is not low is left alone.
 pub fn relieve(store: &Store, keep: &[String]) -> Result<Relief> {
-    let _gate = flight::gate(store)?;
-    let (_, protected) = flights(store, "", keep)?;
     let mut disk = Disk::measure(store.root())?;
     let short = disk.short();
-    let (freed, unable) = short.map_or((0, None), |short| collect(store, &protected, short));
+    let (freed, unable) = short.map_or((0, None), |short| collect(store, keep, short));
     if short.is_some() {
         disk = Disk::measure(store.root())?;
     }

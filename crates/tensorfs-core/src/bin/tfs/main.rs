@@ -36,9 +36,8 @@ const USAGE: &str = "usage: tfs <verb> ...
   gc headers <census> --out <jsonl>
   gc plan <census> --holds <jsonl> --out <jsonl>
   put|get <root> ..., reap <root>
+  fetch <root> <ref> --hub <base> [--lane <lane>]
   checkpoint write <root> [--plain] [--blocks <n>] [--no-configs]
-  fetch <root> <ref> --hub <base>
-  ensure <root> <ref> --hub <base>
   ingest bank <dialect> <converter> ..., ingest source-members|source-plan|plan|run|install|reap ...";
 
 /// Flags that never take a value.
@@ -85,9 +84,7 @@ fn accept_printed_ids(args: Vec<String>) -> Vec<String> {
 
 fn main() -> ExitCode {
     let (args, flags) = split_flags(std::env::args().skip(1).collect());
-    // `ensure` names its CA itself so a bad file is a refusal on its own channel.
-    let ensure = args.first().is_some_and(|verb| verb == "ensure");
-    if let (Some(path), false) = (flag(&flags, "ca-file"), ensure) {
+    if let Some(path) = flag(&flags, "ca-file") {
         let trusted = fs::read(path)
             .map_err(|e| format!("IO_FAILED: read {path}: {e}"))
             .and_then(|pem| {
@@ -102,7 +99,6 @@ fn main() -> ExitCode {
     let a: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     match a.as_slice() {
         ["version"] => cmd_version(),
-        ["ensure", r, refspec] => ensure::cmd_ensure(Path::new(r), refspec, &flags),
         ["store", "init", r] => cmd_store_init(Path::new(r), &flags),
         ["store", "rebuild", r] => repo::cmd_rebuild(Path::new(r), &flags),
         ["put", r, f] => cmd_put(Path::new(r), Path::new(f), &flags),
@@ -144,7 +140,7 @@ fn main() -> ExitCode {
             ingest::cmd_install(Path::new(r), s, org, name, version, lane, &flags)
         }
         ["ingest", "reap", r] => ingest::cmd_reap(Path::new(r), &flags),
-        ["fetch", r, refspec] => fetch::cmd_pull(Path::new(r), refspec, &flags),
+        ["fetch", r, refspec] => fetch::cmd_fetch(Path::new(r), refspec, &flags),
         ["cbor", "encode", f] => cmd_cbor("encode", Path::new(f), &flags),
         ["cbor", "decode", f] => cmd_cbor("decode", Path::new(f), &flags),
         ["cbor", "check", f] => cmd_cbor("check", Path::new(f), &flags),
@@ -203,13 +199,6 @@ fn split_flags(argv: Vec<String>) -> (Vec<String>, Flags) {
 fn flag<'a>(f: &'a Flags, k: &str) -> Option<&'a str> {
     f.iter().find(|(a, _)| a == k).map(|(_, v)| v.as_str())
 }
-/// Every value given for a REPEATABLE flag, in the order they were typed.
-fn flag_all<'a>(f: &'a Flags, k: &str) -> Vec<&'a str> {
-    f.iter()
-        .filter(|(a, _)| a == k)
-        .map(|(_, v)| v.as_str())
-        .collect()
-}
 fn flag_on(f: &Flags, k: &str) -> bool {
     flag(f, k).is_some()
 }
@@ -230,7 +219,6 @@ fn bail(e: Refusal) -> ExitCode {
 }
 
 mod ckpt;
-mod ensure;
 mod fetch;
 mod ingest;
 mod repo;

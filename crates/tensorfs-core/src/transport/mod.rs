@@ -62,14 +62,11 @@ pub use ledger::{
     STILL_SAMPLES, STREAMS,
 };
 pub use policy::{base_host, blocked, is_loopback_origin, resolve, CheckedUrl, SourcePolicy};
-pub use pull::{
-    fetch_wanted, pull, resolve_closure, FetchObserver, Fetched, ObjectSource, ObjectUrls,
-    PullReport, PullRequest, WalkOutcome, RETRYABLE_STATUS,
-};
+pub use pull::{FetchObserver, Fetched, ObjectSource, ObjectUrls, WalkOutcome, RETRYABLE_STATUS};
 pub use publish::{publish, Publication, Published};
 pub use push::{push_object, Pushed, UploadGrant, MAX_GRANT_BYTES, PUT_ATTEMPTS};
 
 pub use sources::{SourceDownload, SourceProgress};
 
 pub(crate) use download::{Cell, Download, Feed, Opening, Pulse, Supply, BEHIND, NEXT, NOW};
-pub(crate) use pull::{hub_policy, record_locally as record, records_checkpoint as records, shared_client, Lease, Minting};
+pub(crate) use pull::{hub_policy, record_locally as record, shared_client, Lease, Minting};

@@ -1111,7 +1111,7 @@ impl<'a> Run<'_, 'a> {
                         let url = minting.supply.url(minting.at, &minting.grant.object, stale, job.ledger);
                         self.minting[slot].store(0, Ordering::Release);
                         let now = self.began.elapsed();
-                        if now - asked >= job.ledger.sample() {
+                        if url.is_ok() && now - asked >= job.ledger.sample() {
                             self.minted.fetch_max(now.as_millis() as u64, Ordering::AcqRel);
                         }
                         url
@@ -1139,6 +1139,7 @@ impl<'a> Run<'_, 'a> {
             Ok(url) => url,
             // The link's or the hub's weather is asked again a sample on.
             Err(refusal) if job.feed.lasting() && matches!(refusal.code, Code::TRANSFER_FAILED | Code::HUB_UNREACHABLE) => {
+                self.ended.fetch_add(1, Ordering::Relaxed);
                 chunk.due = Instant::now() + job.ledger.sample();
                 self.state.lock().unwrap().last = Some(named(refusal, &wanted.id()));
                 return Outcome::Again(vec![chunk]);
@@ -1778,9 +1779,10 @@ impl<'a> Run<'_, 'a> {
                     .any(|chunk| chunk.first < chunk.end && !(chunk.stated && chunk.due > now));
             let landed = self.landed.load(Ordering::Relaxed);
             let elapsed = self.began.elapsed();
-            let on_hub = self.minting.iter().any(|since| {
-                let since = since.load(Ordering::Acquire);
-                since != 0 && elapsed - Duration::from_millis(since - 1) >= sample
+            // A mint is the hub's to judge, until one has been judged and asked again.
+            let on_hub = self.ended.load(Ordering::Relaxed) == since.2 && self.minting.iter().any(|asked| {
+                let asked = asked.load(Ordering::Acquire);
+                asked != 0 && elapsed - Duration::from_millis(asked - 1) >= sample
             });
             if landed > most || !asking || on_hub {
                 reasked &= landed <= most;

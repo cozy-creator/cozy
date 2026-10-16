@@ -1388,7 +1388,8 @@ impl Store {
     ) -> Result<Put> {
         let _writer = crate::catalog::WriterGuard::acquire(&self.root)?;
         let verified = self.stream_verified(r, expect, fault, PUT_TEMP)?;
-        self.admit_verified(verified, fault, operation)
+        let tmp = verified.tmp.clone();
+        self.admit_verified(verified, fault, operation).or_else(|refusal| cleanup(&tmp, refusal))
     }
 
     /// Common no-clobber admission after streaming or durable-prefix digest verification.
@@ -1404,10 +1405,9 @@ impl Store {
         fault: &Fault,
         operation: Option<&str>,
     ) -> Result<Put> {
-        let catalog = match crate::catalog::Catalog::open(&self.root) {
-            Ok(catalog) => catalog,
-            Err(refusal) => return cleanup(&verified.tmp, refusal),
-        };
+        // A catalog it cannot open (a full descriptor table) publishes nothing and leaves
+        // the temp to its caller, which may ask again.
+        let catalog = crate::catalog::Catalog::open(&self.root)?;
         let _writer = crate::catalog::WriterGuard::acquire(&self.root)?;
         let object = ObjectRef {
             sha256: verified.sha256.clone(),
