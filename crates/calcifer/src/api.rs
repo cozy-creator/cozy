@@ -240,14 +240,14 @@ fn refusal(api: &Api, peer: &Peer, request: &Request) -> Option<Refusal> {
     };
     if !peer.addr.ip().is_loopback() {
         Some(refuse(
-            Kind::Credential,
+            Kind::Forbidden,
             "not_loopback",
             "Calcifer serves the loopback interface only",
         ))
     } else if !header(header::HOST).is_some_and(|host| api.hosts.contains(&host)) {
         Some(
             refuse(
-                Kind::Credential,
+                Kind::Forbidden,
                 "host_not_allowed",
                 format!("Host {:?} is not this Calcifer", header(header::HOST)),
             )
@@ -261,7 +261,7 @@ fn refusal(api: &Api, peer: &Peer, request: &Request) -> Option<Refusal> {
             .any(|host| origin == format!("http://{host}"))
     {
         Some(refuse(
-            Kind::Credential,
+            Kind::Forbidden,
             "origin_not_allowed",
             format!("Origin {origin:?} may not reach Calcifer"),
         ))

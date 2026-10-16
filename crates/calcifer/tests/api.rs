@@ -280,7 +280,7 @@ async fn the_guard_chain_refuses_a_foreign_host_origin_bearer_or_missing_key() {
         .header(header::HOST, format!("evil.test:{port}"));
     assert_eq!(
         refusal(rebound).await,
-        refused(StatusCode::UNAUTHORIZED, "host_not_allowed")
+        refused(StatusCode::FORBIDDEN, "host_not_allowed")
     );
     for path in ["/v1/runs", "/v1/runs/1/events"] {
         let method = if path == "/v1/runs" {
@@ -294,7 +294,7 @@ async fn the_guard_chain_refuses_a_foreign_host_origin_bearer_or_missing_key() {
             .header(header::ORIGIN, "http://evil.test");
         assert_eq!(
             refusal(foreign).await,
-            refused(StatusCode::UNAUTHORIZED, "origin_not_allowed"),
+            refused(StatusCode::FORBIDDEN, "origin_not_allowed"),
             "{path}"
         );
     }
