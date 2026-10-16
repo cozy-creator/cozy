@@ -15,11 +15,13 @@ clap_complete.workspace = true
 comfy-table.workspace = true
 cozy-platform.workspace = true
 cozy-proto.workspace = true
+futures-util = { workspace = true, features = ["alloc"] }
 getrandom.workspace = true
 hex.workspace = true
 hub-client.workspace = true
 indicatif.workspace = true
 infer.workspace = true
+pep508_rs.workspace = true
 progenitor-client.workspace = true
 prost.workspace = true
 ratatui.workspace = true
@@ -34,6 +36,7 @@ sigstore-verify.workspace = true
 supports-hyperlinks.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["signal"] }
+toml.workspace = true
 toml_edit.workspace = true
 url.workspace = true
 

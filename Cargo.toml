@@ -43,6 +43,7 @@ nvml-wrapper = "0.13"
 openapiv3 = "2"
 prettyplease = "0.2"
 progenitor = { version = "0.15.1", default-features = false }
+pep508_rs = "0.9"
 progenitor-client = "0.15.1"
 prost = "0.14"
 protoc-bin-vendored = "3"
@@ -71,6 +72,7 @@ tokio-rustls = { version = "0.26.6", default-features = false, features = ["aws_
 tokio-stream = "0.1.19"
 tokio-util = { version = "0.7", features = ["io"] }
 # figment's toml 0.8 already builds this one.
+toml = "0.8"
 toml_edit = "0.22.27"
 tonic = { version = "0.14.6", default-features = false, features = ["codegen"] }
 tonic-prost = "0.14.6"
