@@ -10,7 +10,9 @@ use common::{SilentHub, Tensord, until};
 use cozy_proto::{
     calcifer::{Event, Kind, On, Status, SubmitRun},
     ids::RunId,
+    machine as v1,
 };
+use prost::Message as _;
 
 fn open(home: &Path) -> Arc<Calcifer> {
     Calcifer::open(&home.join("calcifer"), &home.join("outputs")).unwrap()
@@ -25,6 +27,7 @@ fn submit(on: &str, spec: Vec<u8>, inputs: Vec<cozy_proto::calcifer::StagedInput
         spec,
         inputs,
         out: None,
+        warnings: vec![],
     }
 }
 
@@ -75,9 +78,12 @@ async fn a_run_is_sent_with_its_input_accepted_and_canceled_by_its_machine() {
     calcifer.put_machine(&machine.row("m", &key)).unwrap();
     let mut events = calcifer.subscribe();
     let (staged, input) = common::input_file(home.path(), b"not really a png");
+    // A file the spec refers to without naming it an input (a model's `object://` source).
+    let (object, _) = common::input_file(home.path(), b"not really safetensors either");
     let spec = common::warm_spec(&hub.origin(), vec![input]);
+    let given = vec![staged.clone(), object.clone()];
     let submitted = calcifer
-        .submit("k1", submit("m", spec.clone(), vec![staged.clone()]))
+        .submit("k1", submit("m", spec.clone(), given.clone()))
         .await
         .unwrap();
     let id = submitted.run.id.clone();
@@ -91,8 +97,13 @@ async fn a_run_is_sent_with_its_input_accepted_and_canceled_by_its_machine() {
         staged_copy.exists(),
         "the input stays staged while its run is unsettled"
     );
+    let link = Link::new(&machine.endpoint, common::key()).unwrap();
+    for written in [&staged, &object] {
+        let held = link.held(&written.digest, written.length).await.unwrap();
+        assert_eq!(held, written.length, "written before the send");
+    }
     let again = calcifer
-        .submit("k1", submit("m", spec, vec![staged]))
+        .submit("k1", submit("m", spec, given))
         .await
         .unwrap();
     assert!(again.replay && again.run.id == id);
@@ -239,15 +250,20 @@ async fn a_sent_run_its_machine_never_got_is_sent_again_after_a_restart() {
     first
         .put_machine(&common::machine("m", None, &key))
         .unwrap();
-    let id = first
-        .submit(
-            "k",
-            submit("m", common::warm_spec(&hub.origin(), vec![]), vec![]),
-        )
-        .await
-        .unwrap()
-        .run
-        .id;
+    // The spec names no Hub: the run's own Hub is filled in at the send.
+    let spec = v1::RunSpec {
+        kind: v1::RunKind::Warm as i32,
+        source: Some(v1::run_spec::Source::Release(v1::Release {
+            package: "cozy-test/held".into(),
+            release: String::new(),
+        })),
+        ..Default::default()
+    };
+    let submitted = SubmitRun {
+        hub: hub.origin(),
+        ..submit("m", spec.encode_to_vec(), vec![])
+    };
+    let id = first.submit("k", submitted).await.unwrap().run.id;
     first.close();
     assert!(first.store().mark_sent(id.as_str(), "m").unwrap());
     drop(first);
@@ -257,7 +273,11 @@ async fn a_sent_run_its_machine_never_got_is_sent_again_after_a_restart() {
     let mut events = second.subscribe();
     second.put_machine(&machine.row("m", &key)).unwrap();
     until(&mut events, &id, is_status(Status::InProgress)).await;
-    assert_eq!(on_machine(&machine, &id).await.unwrap(), "preparing");
+    assert_eq!(
+        on_machine(&machine, &id).await.unwrap(),
+        "preparing",
+        "held by its Hub, not failed for want of one"
+    );
     second.cancel(&id).unwrap();
     until(&mut events, &id, |e| e.is_terminal()).await;
     second.close();

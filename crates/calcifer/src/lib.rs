@@ -57,6 +57,8 @@ pub struct Calcifer {
     drivers: Mutex<HashMap<RunId, Arc<Notify>>>,
     machines: Mutex<HashMap<String, Machine>>,
     tasks: Mutex<JoinSet<()>>,
+    /// Orders staging a run's inputs against deleting a settled run's.
+    staging: Mutex<()>,
 }
 
 /// What a run is doing now, never stored: the latest of each live event.
@@ -117,6 +119,7 @@ impl Calcifer {
             drivers: Mutex::default(),
             machines: Mutex::default(),
             tasks: Mutex::default(),
+            staging: Mutex::default(),
         });
         calcifer.sweep_inputs()?;
         for id in calcifer.store.unsettled()? {
@@ -153,13 +156,8 @@ impl Calcifer {
                 serde_json::to_vec(&submit).expect("serializes")
             ))
         );
-        let inputs = self.inputs.clone();
-        let staged = submit.inputs.clone();
-        tokio::task::spawn_blocking(move || stage(&inputs, &spec, &staged))
-            .await
-            .map_err(|e| Error::Invalid(e.to_string()))??;
-        let (machine, pinned) = match submit.on {
-            On::Machine(name) => (Some(name), true),
+        let (machine, pinned) = match &submit.on {
+            On::Machine(name) => (Some(name.clone()), true),
             On::Any | On::New(_) => (None, false),
         };
         let new = NewRun {
@@ -171,8 +169,20 @@ impl Calcifer {
             pinned,
             spec: submit.spec,
             out_dir: submit.out.unwrap_or_else(|| self.outputs.clone()),
+            warnings: submit.warnings,
+            inputs: vec![],
         };
-        let (row, fresh) = self.store.submit(key, &digest, new)?;
+        let (me, key, given) = (self.clone(), key.to_owned(), submit.inputs);
+        let (row, fresh) = tokio::task::spawn_blocking(move || {
+            // Copied first; then, against a settled run's deletion of the same objects, checked
+            // again and recorded under one guard.
+            stage(&me.inputs, &spec, &given)?;
+            let _staging = lock(&me.staging);
+            let inputs = stage(&me.inputs, &spec, &given)?;
+            Ok::<_, Error>(me.store.submit(&key, &digest, NewRun { inputs, ..new })?)
+        })
+        .await
+        .map_err(|e| Error::Invalid(e.to_string()))??;
         if fresh {
             let created = self.store.events_after(row.id.as_str(), 0)?;
             self.publish(&row.id, created);
@@ -442,21 +452,25 @@ impl Calcifer {
         pause: &mut Pause,
     ) -> Result<(), Stop> {
         let id = run.id.as_str();
+        // The spec as sent: finished under the machine's send lock, so a warm set merges into what
+        // the machine reported after the runs sent before it.
         let spec = || {
-            v1::RunSpec::decode(run.spec.as_slice()).map_err(|e| {
+            let mut spec = v1::RunSpec::decode(run.spec.as_slice()).map_err(|e| {
                 Stop::Refused(Reason {
                     code: "spec_unreadable".into(),
                     message: format!("the stored spec: {e}"),
                 })
-            })
+            })?;
+            self.finish_spec(run, &mut spec);
+            Ok::<_, Stop>(spec)
         };
         let mut canceled = false;
         let (state, stream) = match run.state {
             State::Settled => return Ok(()),
             State::Queued => {
-                let spec = spec()?;
-                self.write_inputs(link, &spec).await?;
+                self.write_inputs(link, run).await?;
                 let _turn = sending.lock().await;
+                let spec = spec()?;
                 if !self.store.mark_sent(id, machine)? {
                     return Ok(());
                 }
@@ -470,9 +484,9 @@ impl Calcifer {
                 // It may be there: attach first, and send again only to a machine that never got it.
                 match link.run(id, run.cursor, None).await {
                     Err(LinkError::NotFound) if run.state == State::Sent => {
-                        let spec = spec()?;
-                        self.write_inputs(link, &spec).await?;
-                        link.run(id, 0, Some(spec)).await?
+                        self.write_inputs(link, run).await?;
+                        let _turn = sending.lock().await;
+                        link.run(id, 0, Some(spec()?)).await?
                     }
                     attached => attached?,
                 }
@@ -550,10 +564,22 @@ impl Calcifer {
             match frame.event {
                 Some(Frame::Log(line)) => batch.logs.push((frame.at_ms, line.level, line.text)),
                 Some(Frame::Call(call)) => {
-                    let mut text = format!("{} {}", call.function, call.status);
-                    if let Some(reason) = call.reason {
-                        text = format!("{text}: {}", reason.message);
-                    }
+                    let call = cozy_proto::calcifer::Call {
+                        run: call.run,
+                        index: call.index,
+                        function: call.function,
+                        label: call.label,
+                        status: call.status,
+                        called_at_ms: call.called_at_ms,
+                        finished_at_ms: call.finished_at_ms,
+                        measurements: serde_json::from_slice(&call.measurements).ok(),
+                        reason: call.reason.map(|r| Reason {
+                            code: r.code,
+                            message: r.message,
+                        }),
+                        memoized: call.memoized,
+                    };
+                    let text = serde_json::to_string(&call).expect("serializes");
                     batch.logs.push((frame.at_ms, "call".into(), text));
                 }
                 Some(Frame::Product(product)) => batch.products.push(product),
@@ -608,43 +634,38 @@ impl Calcifer {
         Ok(())
     }
 
-    async fn write_inputs(&self, link: &Link, spec: &v1::RunSpec) -> Result<(), Stop> {
-        let mut written = HashSet::new();
-        for input in &spec.inputs {
-            if !written.insert(&input.digest) {
-                continue;
-            }
-            let path = self.inputs.join(input.digest.trim_start_matches("sha256:"));
+    async fn write_inputs(&self, link: &Link, run: &RunRow) -> Result<(), Stop> {
+        for (digest, length) in &run.inputs {
+            let path = self.inputs.join(hex::encode(digest.bytes()));
             let file = tokio::fs::File::open(&path).await.map_err(|e| {
                 Stop::Refused(Reason {
                     code: "input_missing".into(),
                     message: format!(
-                        "input {} is no longer staged at {}: {e}",
-                        input.digest,
+                        "input {digest} is no longer staged at {}: {e}",
                         path.display()
                     ),
                 })
             })?;
-            let digest = input.digest.parse::<Digest>().map_err(|e| {
-                Stop::Refused(Reason {
-                    code: "input_invalid".into(),
-                    message: format!("{}: {e}", input.digest),
-                })
-            })?;
-            link.write(&digest, input.length, file).await?;
+            link.write(digest, *length, file).await?;
         }
         Ok(())
     }
 
+    /// The spec as the machine is sent it: the run's Hub origin, unless the spec names one.
+    fn finish_spec(&self, run: &RunRow, spec: &mut v1::RunSpec) {
+        if spec.hub.is_none() && !run.hub.is_empty() {
+            spec.hub = Some(v1::HubAccess {
+                origin: run.hub.clone(),
+                ..Default::default()
+            });
+        }
+    }
+
     /// Deletes the staged inputs of a settled run that no unsettled run names.
     fn release_inputs(&self, run: &RunRow) {
-        let Ok(spec) = v1::RunSpec::decode(run.spec.as_slice()) else {
-            return;
-        };
-        for input in spec.inputs {
-            if let Ok(digest) = input.digest.parse::<Digest>()
-                && let Ok(false) = self.store.input_in_use(&digest)
-            {
+        let _staging = lock(&self.staging);
+        for (digest, _) in &run.inputs {
+            if let Ok(false) = self.store.input_in_use(digest) {
                 let _ = std::fs::remove_file(self.inputs.join(hex::encode(digest.bytes())));
             }
         }
@@ -670,50 +691,64 @@ impl Calcifer {
     }
 }
 
-/// Copies each file the spec names into `inputs/<sha256 hex>`, checking its digest and length,
-/// unless a copy is already there.
-fn stage(inputs: &Path, spec: &v1::RunSpec, staged: &[StagedInput]) -> Result<(), Error> {
+/// Copies each given file into `inputs/<sha256 hex>`, checking its digest and length, unless a
+/// copy is there, and answers the objects the run's machine is written: every given file and every
+/// object `spec.inputs` names, each of which must be staged.
+fn stage(
+    inputs: &Path,
+    spec: &v1::RunSpec,
+    given: &[StagedInput],
+) -> Result<Vec<(Digest, u64)>, Error> {
+    let mut objects = vec![];
+    for source in given {
+        let target = inputs.join(hex::encode(source.digest.bytes()));
+        if !target.exists() {
+            copy_checked(inputs, source, &target)?;
+        }
+        objects.push((source.digest, source.length));
+    }
     for input in &spec.inputs {
         let invalid = |message: String| Error::Invalid(format!("input {}: {message}", input.field));
         let digest: Digest = input.digest.parse().map_err(|e: &str| invalid(e.into()))?;
-        let target = inputs.join(hex::encode(digest.bytes()));
-        if target.exists() {
-            continue;
+        if !inputs.join(hex::encode(digest.bytes())).exists() {
+            return Err(invalid(format!("no file was given for {digest}")));
         }
-        let source = staged
-            .iter()
-            .find(|s| s.digest == digest)
-            .ok_or_else(|| invalid(format!("no file was given for {digest}")))?;
-        let failed = |message: String| Error::Input {
-            path: source.path.clone(),
-            message,
-        };
-        let mut from = std::fs::File::open(&source.path).map_err(|e| failed(e.to_string()))?;
-        let mut part =
-            tempfile::NamedTempFile::new_in(inputs).map_err(|e| failed(e.to_string()))?;
-        let (mut hasher, mut length, mut buffer) = (Sha256::new(), 0u64, vec![0; 1 << 20]);
-        loop {
-            let read = from.read(&mut buffer).map_err(|e| failed(e.to_string()))?;
-            if read == 0 {
-                break;
-            }
-            hasher.update(&buffer[..read]);
-            part.write_all(&buffer[..read])
-                .map_err(|e| failed(e.to_string()))?;
-            length += read as u64;
-        }
-        let got = Digest::from_bytes(hasher.finalize().into());
-        if got != digest || length != input.length || length != source.length {
-            return Err(failed(format!(
-                "it holds {length} bytes with digest {got}, not {} with {digest}",
-                input.length
-            )));
-        }
-        part.as_file()
-            .sync_all()
-            .map_err(|e| failed(e.to_string()))?;
-        part.persist(&target).map_err(|e| failed(e.to_string()))?;
+        objects.push((digest, input.length));
     }
+    objects.sort();
+    objects.dedup_by_key(|(digest, _)| *digest);
+    Ok(objects)
+}
+
+fn copy_checked(inputs: &Path, source: &StagedInput, target: &Path) -> Result<(), Error> {
+    let failed = |message: String| Error::Input {
+        path: source.path.clone(),
+        message,
+    };
+    let mut from = std::fs::File::open(&source.path).map_err(|e| failed(e.to_string()))?;
+    let mut part = tempfile::NamedTempFile::new_in(inputs).map_err(|e| failed(e.to_string()))?;
+    let (mut hasher, mut length, mut buffer) = (Sha256::new(), 0u64, vec![0; 1 << 20]);
+    loop {
+        let read = from.read(&mut buffer).map_err(|e| failed(e.to_string()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        part.write_all(&buffer[..read])
+            .map_err(|e| failed(e.to_string()))?;
+        length += read as u64;
+    }
+    let got = Digest::from_bytes(hasher.finalize().into());
+    if got != source.digest || length != source.length {
+        return Err(failed(format!(
+            "it holds {length} bytes with digest {got}, not {} with {}",
+            source.length, source.digest
+        )));
+    }
+    part.as_file()
+        .sync_all()
+        .map_err(|e| failed(e.to_string()))?;
+    part.persist(target).map_err(|e| failed(e.to_string()))?;
     Ok(())
 }
 

@@ -3,10 +3,10 @@ mod common;
 
 use std::{path::Path, sync::Arc};
 
-use calcifer::store::{Acceptance, Batch, NewRun, State, Store, StoreError};
+use calcifer::store::{Acceptance, Batch, NewRun, RunFilter, State, Store, StoreError};
 use cozy_proto::{
-    calcifer::{Event, ItemStatus, Kind, Status},
-    ids::RunId,
+    calcifer::{Call, Event, ItemStatus, Kind, Status, Warning},
+    ids::{Digest, RunId},
     machine as v1,
 };
 
@@ -20,6 +20,8 @@ fn new_run(n: u8, machine: Option<&str>, pinned: bool) -> NewRun {
         pinned,
         spec: common::warm_spec("https://tensorhub.com", vec![]),
         out_dir: "/tmp/outputs".into(),
+        warnings: vec![],
+        inputs: vec![],
     }
 }
 
@@ -43,9 +45,16 @@ fn a_key_names_one_submission_forever_across_a_reopen() {
     store
         .put_machine(&common::machine("m", None, Path::new("/k")))
         .unwrap();
-    let (first, fresh) = store
-        .submit("key-1", "sha256:a", new_run(1, Some("m"), true))
-        .unwrap();
+    let staged = Digest::of(b"an input");
+    let warned = NewRun {
+        warnings: vec![Warning {
+            code: "unknown_field".into(),
+            message: "dropped `steps`".into(),
+        }],
+        inputs: vec![(staged, 8)],
+        ..new_run(1, Some("m"), true)
+    };
+    let (first, fresh) = store.submit("key-1", "sha256:a", warned).unwrap();
     assert!(fresh);
     assert_eq!((first.number, first.state), (1, State::Queued));
     let (second, _) = store
@@ -68,16 +77,68 @@ fn a_key_names_one_submission_forever_across_a_reopen() {
         store.submit("key-5", "d", new_run(5, Some("nowhere"), true)),
         Err(StoreError::UnknownMachine(_))
     ));
-    let newest: Vec<u64> = store
-        .runs(None, 10)
-        .unwrap()
-        .iter()
-        .map(|r| r.number)
-        .collect();
-    assert_eq!(newest, [2, 1]);
-    assert_eq!(store.runs(Some(2), 10).unwrap()[0].id, first.id);
+    let listed = |filter: RunFilter| {
+        let (rows, older) = store.runs(&filter).unwrap();
+        (rows.iter().map(|r| r.number).collect::<Vec<_>>(), older)
+    };
+    let all = || RunFilter {
+        limit: 10,
+        ..Default::default()
+    };
+    assert_eq!(listed(all()), (vec![2, 1], 0));
+    assert_eq!(listed(RunFilter { limit: 1, ..all() }), (vec![2], 1));
+    assert_eq!(
+        listed(RunFilter {
+            before: Some(2),
+            ..all()
+        }),
+        (vec![1], 0)
+    );
+    assert_eq!(
+        listed(RunFilter {
+            machine: Some("m".into()),
+            ..all()
+        }),
+        (vec![1], 0)
+    );
+    assert_eq!(
+        listed(RunFilter {
+            target: Some("fidika/sdxl".into()),
+            ..all()
+        }),
+        (vec![2, 1], 0)
+    );
+    assert_eq!(
+        listed(RunFilter {
+            target: Some("fidika/flux".into()),
+            ..all()
+        }),
+        (vec![], 0)
+    );
+    assert_eq!(
+        listed(RunFilter {
+            status: Some(Status::Queued),
+            ..all()
+        }),
+        (vec![2, 1], 0)
+    );
+    assert_eq!(
+        listed(RunFilter {
+            status: Some(Status::InProgress),
+            ..all()
+        }),
+        (vec![], 0)
+    );
     assert_eq!(store.run_by_number(2).unwrap().unwrap().id, second.id);
-    assert_eq!(store.unsettled().unwrap(), vec![first.id, second.id]);
+    let record = store.record(&first).unwrap();
+    assert_eq!(record.warnings[0].code, "unknown_field");
+    assert!(store.input_in_use(&staged).unwrap());
+    store.request_cancel(first.id.as_str()).unwrap();
+    assert!(
+        !store.input_in_use(&staged).unwrap(),
+        "a settled run holds no staged input"
+    );
+    assert_eq!(store.unsettled().unwrap(), vec![second.id]);
 }
 
 /// The send boundary and a cancel race on two threads over many runs: every run is either sent
@@ -266,9 +327,24 @@ fn a_reconnect_replays_the_newest_picture_after_its_cursor() {
         .to_string();
     assert!(store.mark_sent(&id, "m").unwrap());
     store.accept(&id, "m", &state(&id)).unwrap();
+    let call = Call {
+        run: id.clone(),
+        index: 0,
+        function: "generate".into(),
+        label: String::new(),
+        status: "succeeded".into(),
+        called_at_ms: 1,
+        finished_at_ms: 2,
+        measurements: Some(serde_json::json!({"execution": {"gpus": [0]}})),
+        reason: None,
+        memoized: false,
+    };
     let logged = Batch {
         cursor: 1 << 33,
-        logs: vec![(1, "info".into(), "installing".into())],
+        logs: vec![
+            (1, "info".into(), "installing".into()),
+            (2, "call".into(), serde_json::to_string(&call).unwrap()),
+        ],
         products: vec![product("image", 0, 1)],
         machine_state: Some("running".into()),
     };
@@ -304,6 +380,9 @@ fn a_reconnect_replays_the_newest_picture_after_its_cursor() {
     let outcome = v1::Outcome {
         status: "succeeded".into(),
         outputs: vec![product("image", 0, 3)],
+        result: br#"{"caption":"a cat"}"#.to_vec(),
+        measurements: br#"{"stages":[]}"#.to_vec(),
+        execution_ms: 1234,
         ..Default::default()
     };
     let settled = store.settle(&id, &outcome, 3 << 33).unwrap();
@@ -320,8 +399,11 @@ fn a_reconnect_replays_the_newest_picture_after_its_cursor() {
         .iter()
         .map(|e| serde_json::to_value(e).unwrap()["type"].clone())
         .collect();
-    assert_eq!(kinds, ["run.log", "output_item.done", "run.completed"]);
-    let Event::OutputDone { item, .. } = &all[1] else {
+    assert_eq!(
+        kinds,
+        ["run.log", "run.call", "output_item.done", "run.completed"]
+    );
+    let Event::OutputDone { item, .. } = &all[2] else {
         unreachable!()
     };
     assert_eq!(
@@ -329,6 +411,14 @@ fn a_reconnect_replays_the_newest_picture_after_its_cursor() {
         (3, ItemStatus::Completed, "1/image")
     );
     assert!(item.sha256.is_some());
+    let row = store.run(&id).unwrap().unwrap();
+    let detail = store.detail(&row).unwrap();
+    assert_eq!(detail.result, Some(serde_json::json!({"caption": "a cat"})));
+    assert_eq!(detail.execution_ms, Some(1234));
+    assert_eq!(detail.measurements, Some(serde_json::json!({"stages": []})));
+    assert_eq!(detail.calls, vec![call]);
+    let plain = store.record(&row).unwrap();
+    assert!(plain.calls.is_empty() && plain.measurements.is_none() && plain.result.is_some());
     let numbers: Vec<_> = all.iter().filter_map(Event::sequence_number).collect();
     assert!(numbers.windows(2).all(|w| w[0] < w[1]));
     assert!(
