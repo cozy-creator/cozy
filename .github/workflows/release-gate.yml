@@ -1,7 +1,9 @@
 name: release-gate
 # dist local-artifacts job (dist-workspace.toml): a release needs a green platforms.yaml run on its own
-# commit that covered every release runner. A dry run reports the verdict without refusing.
-# The release carries gates.json: its commit, that platforms run, and this release run (its smoke).
+# commit that covered every release runner, and the newest tensorfs wheel on PyPI must speak this tree's
+# store format and claim protocol (design §2). A dry run reports the verdicts without refusing.
+# The release carries gates.json: its commit, that platforms run, that tensorfs version, and this
+# release run (its smoke).
 on:
   workflow_call:
     inputs:
@@ -13,6 +15,8 @@ jobs:
   platforms:
     runs-on: ubuntu-24.04
     steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
       - env:
           GH_TOKEN: ${{ github.token }}
           SHA: ${{ github.sha }}
@@ -21,19 +25,23 @@ jobs:
           RUNNERS: ubuntu-24.04 ubuntu-24.04-arm macos-15 windows-2025 windows-11-arm
         run: |
           runs=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs
+          refusals=()
           platforms=
           for id in $(gh run list -R "$GITHUB_REPOSITORY" -w platforms.yaml --commit "$SHA" --status success -L 50 --json databaseId -q '.[].databaseId'); do
             green=" $(gh run view "$id" -R "$GITHUB_REPOSITORY" --json jobs -q '[.jobs[] | select(.conclusion == "success") | .name] | join(" ")') "
             missing=$(for r in $RUNNERS; do case $green in *" $r "*) ;; *) printf '%s ' "$r" ;; esac; done)
             [ -n "$missing" ] || { platforms=$runs/$id; break; }
           done
+          [ -n "$platforms" ] || refusals+=("no green platforms.yaml run on $SHA covers $RUNNERS; run: gh workflow run platforms.yaml --ref $REF")
+          tensorfs=$(python3 crates/tensorfs/scripts/format_contract.py binary 2> format.err) || refusals+=("$(cat format.err)")
           mkdir gates
-          jq -n --arg commit "$SHA" --arg platforms "$platforms" --arg release "$runs/$GITHUB_RUN_ID" \
-            '{commit: $commit, platforms: (if $platforms == "" then null else $platforms end), release: $release}' | tee gates/gates.json
-          [ -z "$platforms" ] || exit 0
-          msg="no green platforms.yaml run on $SHA covers $RUNNERS; run: gh workflow run platforms.yaml --ref $REF"
-          if [ -n "$TAG" ] && [ "$TAG" != dry-run ]; then echo "::error::$msg"; exit 1; fi
-          echo "::warning::$msg"
+          jq -n --arg commit "$SHA" --arg platforms "$platforms" --arg tensorfs "$tensorfs" --arg release "$runs/$GITHUB_RUN_ID" \
+            '{commit: $commit, platforms: (($platforms | select(. != "")) // null), tensorfs: (($tensorfs | select(. != "")) // null), release: $release}' \
+            | tee gates/gates.json
+          [ ${#refusals[@]} -gt 0 ] || exit 0
+          level=warning; [ -z "$TAG" ] || [ "$TAG" = dry-run ] || level=error
+          for refusal in "${refusals[@]}"; do echo "::$level::$refusal"; done
+          [ "$level" = warning ]
       # host releases every artifacts-* upload.
       - uses: actions/upload-artifact@v7
         with:
