@@ -1,0 +1,334 @@
+//! `cozy run`: run a function on a machine, and the verbs over runs.
+use std::{path::PathBuf, process::ExitCode};
+
+use cozy_proto::error::{Error, Kind};
+
+use crate::{Context, output};
+use bind::Terms;
+use catalog::Card;
+use interface::{Callable, Interface};
+use target::Target;
+
+mod bind;
+mod catalog;
+mod describe;
+pub(crate) mod interface;
+mod target;
+
+#[derive(clap::Args, Debug)]
+#[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
+pub struct Args {
+    #[command(subcommand)]
+    verb: Option<Verb>,
+    #[command(flatten)]
+    run: Box<RunArgs>,
+}
+
+#[derive(clap::Args, Debug)]
+struct RunArgs {
+    /// `org/pkg[/fn][@release]`, `./dir[/fn]` or `./script.py`; without a function, its functions.
+    #[arg(required = true, value_name = "TARGET")]
+    target: Option<String>,
+    /// `key=value`, `key:=json`, `model.<slot>=<ref>`, one positional value, input files.
+    #[arg(value_name = "INPUT")]
+    inputs: Vec<String>,
+    #[command(flatten)]
+    placement: Placement,
+    /// Use at most N GPUs for the run and its calls.
+    #[arg(long, value_name = "N")]
+    gpus: Option<u32>,
+    /// Weight precision for every model; absent, the machine's rules choose per GPU.
+    #[arg(long, value_parser = ["16", "8", "4"])]
+    bits: Option<String>,
+    /// The whole payload from a JSON or YAML file; inline inputs override it.
+    #[arg(long = "input", value_name = "FILE")]
+    input_file: Option<PathBuf>,
+    /// Attach a file: `field.path=FILE`, `label=FILE`, or `FILE` into the declared assets.
+    #[arg(long = "asset", value_name = "[NAME=]FILE")]
+    assets: Vec<String>,
+    /// Apply a LoRA: `slot:component=ref[,strength]`, in order.
+    #[arg(long = "lora", value_name = "SLOT:COMPONENT=REF")]
+    loras: Vec<String>,
+    /// Where the outputs land (default ~/.cozy/outputs).
+    #[arg(long, value_name = "DIR")]
+    out: Option<PathBuf>,
+    /// Print the run's record at once instead of following it.
+    #[arg(long)]
+    detach: bool,
+    /// Keep the function ready instead of running it.
+    #[arg(long, value_enum, value_name = "LEVEL")]
+    warm: Option<Warm>,
+    /// Print the function's request contract instead of running it.
+    #[arg(long)]
+    describe: bool,
+    /// Names one submission forever: a retry with it never runs twice.
+    #[arg(long, value_name = "KEY")]
+    idempotency_key: Option<String>,
+}
+
+/// Where a run goes; shared by every verb that submits one.
+#[derive(clap::Args, Debug, Clone)]
+pub struct Placement {
+    /// `local`, a machine's name, `any`, or `new[:sku]` to rent one.
+    #[arg(long = "on", value_name = "MACHINE", default_value = "local")]
+    on: String,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum Warm {
+    Installed,
+    Downloaded,
+    Imported,
+    Host,
+    Gpu,
+    /// Take it out of the machine's warm set.
+    Off,
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum Verb {
+    /// Runs on every Hub, newest first.
+    List {
+        /// Only runs in this state: queued, in_progress, completed, failed, canceled.
+        #[arg(long)]
+        state: Option<String>,
+        /// Only this package's runs.
+        #[arg(long)]
+        package: Option<String>,
+        /// At most N runs (default 50; 0 shows all).
+        #[arg(long, value_name = "N")]
+        limit: Option<u64>,
+        /// A live board, redrawn as runs change.
+        #[arg(long)]
+        watch: bool,
+    },
+    /// One run: its result, outputs, calls, logs and how it ran.
+    Show {
+        /// The run's number or id.
+        run: String,
+    },
+    /// Follow a run until it ends; Ctrl-C stops watching, never the run.
+    Watch {
+        /// The run's number or id.
+        run: String,
+    },
+    /// Cancel a queued or running run.
+    Cancel {
+        /// The run's number or id.
+        run: String,
+    },
+    /// Print a link that plays a run's output in a browser, straight from its machine.
+    Play {
+        /// The run's number or id.
+        run: String,
+        /// The output to play: its name, or name/index for one item of a list.
+        #[arg(long, default_value = "video")]
+        output: String,
+        /// How long the link works: anyone holding it may watch until then.
+        #[arg(long, default_value = "24h")]
+        expires: String,
+    },
+    /// Upload a run's weights output as a private checkpoint in org/model, from its machine.
+    Upload {
+        /// The run's number or id, and `#output` when it wrote more than one.
+        #[arg(value_name = "RUN[#OUTPUT]")]
+        run: String,
+        /// The destination repository.
+        #[arg(value_name = "ORG/MODEL")]
+        model: String,
+        /// Print the upload's run record at once instead of following it.
+        #[arg(long)]
+        detach: bool,
+    },
+}
+
+pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
+    match args.verb {
+        Some(Verb::List { .. }) => Err(crate::not_ported("run list")),
+        Some(Verb::Show { .. }) => Err(crate::not_ported("run show")),
+        Some(Verb::Watch { .. }) => Err(crate::not_ported("run watch")),
+        Some(Verb::Cancel { .. }) => Err(crate::not_ported("run cancel")),
+        Some(Verb::Play { .. }) => Err(crate::not_ported("run play")),
+        Some(Verb::Upload { .. }) => Err(crate::not_ported("run upload")),
+        None => run(ctx, *args.run).await,
+    }
+}
+
+async fn run(ctx: &Context, args: RunArgs) -> Result<ExitCode, Error> {
+    let cwd = std::env::current_dir()
+        .map_err(|e| Error::new(Kind::Internal, "cwd", format!("the working directory: {e}")))?;
+    let raw = args.target.as_deref().unwrap_or_default();
+    let (package, function, release) = match Target::parse(raw, &cwd)? {
+        Target::Published {
+            package,
+            function,
+            release,
+        } => (package, function, release),
+        Target::Directory { .. } | Target::Script(_) => {
+            return Err(crate::not_ported("run ./local-code")
+                .remedy("local code runs once machines describe it (xs-043 unit T); publish it, or use the Go cozy"));
+        }
+    };
+    let hub = ctx.hub()?;
+    let (mut card, read) = catalog::card(ctx, &hub, &package, release.as_deref(), false).await?;
+    let Some(function) = function else {
+        functions(ctx, &package, &card);
+        return Ok(ExitCode::SUCCESS);
+    };
+    if args.describe {
+        let callable = callable(&package, &card.interface, &function)?;
+        if ctx.json {
+            output::json(&card.request(&callable.name));
+        } else {
+            anstream::print!(
+                "{}",
+                describe::contract(&format!("{package}/{}", callable.name), callable)
+            );
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+    let terms = Terms {
+        inputs: args.inputs,
+        input_file: args.input_file,
+        assets: args.assets,
+        loras: args.loras,
+        key: args.idempotency_key.unwrap_or_else(mint_key),
+        cwd,
+        user_home: ctx.user_home.clone(),
+    };
+    let mut bound = bind(ctx, &package, &card, &function, &terms)?;
+    // A kept card that lacks a field the run names may be older than the release the machine
+    // runs: read the newest once, and bind again.
+    if release.is_none()
+        && !read
+        && !bound.1.ignored.is_empty()
+        && let Ok((newer, _)) = catalog::card(ctx, &hub, &package, None, true).await
+        && newer.release != card.release
+    {
+        card = newer;
+        bound = bind(ctx, &package, &card, &function, &terms)?;
+    }
+    let (target, bound) = bound;
+    if let Some(warning) = bound.warning(&target) {
+        output::warn(ctx, &warning);
+    }
+    Err(crate::not_ported("run (submitting to Calcifer)"))
+}
+
+/// Binds `terms` to `function` of `card`; a person's refusal lists the arguments.
+fn bind(
+    ctx: &Context,
+    package: &str,
+    card: &Card,
+    function: &str,
+    terms: &Terms,
+) -> Result<(String, bind::Bound), Error> {
+    let callable = callable(package, &card.interface, function)?;
+    let target = format!("{package}/{}", callable.name);
+    let bound = bind::bind(&target, callable, terms).map_err(|mut error| {
+        if !ctx.json && error.code == "request_payload_invalid" {
+            error.message = format!(
+                "{}\n\n{}",
+                error.message,
+                describe::arguments(callable).trim_end()
+            );
+        }
+        error
+    })?;
+    Ok((target, bound))
+}
+
+/// The function `asked` names: exact, else the one name equal with `-` as `_`.
+fn callable<'a>(
+    package: &str,
+    interface: &'a Interface,
+    asked: &str,
+) -> Result<&'a Callable, Error> {
+    let fold = |name: &str| name.replace('-', "_");
+    let found = interface
+        .callables
+        .iter()
+        .find(|c| c.name == asked)
+        .or_else(|| {
+            let mut matches = interface
+                .callables
+                .iter()
+                .filter(|c| fold(&c.name) == fold(asked));
+            matches.next().filter(|_| matches.next().is_none())
+        });
+    match found {
+        Some(callable) if callable.internal => Err(Error::new(
+            Kind::NotFound,
+            "callable_internal",
+            format!("{package}/{} is an internal function", callable.name),
+        )
+        .remedy("call a public function of the package")),
+        Some(callable) => Ok(callable),
+        None => {
+            if let Some((name, why)) = interface
+                .unavailable
+                .iter()
+                .find(|(name, _)| fold(name) == fold(asked))
+            {
+                return Err(Error::new(
+                    Kind::Unavailable,
+                    "callable_unreadable",
+                    format!("{package}/{name} is not readable by this cozy: {why}"),
+                )
+                .remedy("update cozy, or call another function of the package"));
+            }
+            let public = interface.public();
+            let mut error = Error::new(
+                Kind::NotFound,
+                "callable_unknown",
+                format!("{package} has no function {asked:?}"),
+            )
+            .remedy(format!("its functions: {}", public.join(", ")));
+            for name in public.iter().take(2) {
+                error = error.next(format!("cozy run {package}/{name}"));
+            }
+            Err(error)
+        }
+    }
+}
+
+/// `cozy run org/pkg`: the package's public functions.
+fn functions(ctx: &Context, package: &str, card: &Card) {
+    let public = card.interface.public();
+    let runs_on = |name: &str| {
+        let cpu = card
+            .interface
+            .callables
+            .iter()
+            .any(|c| c.name == name && c.accelerator == Some(false));
+        if cpu { "CPU" } else { "GPU" }
+    };
+    if ctx.json {
+        let rows: Vec<_> = public
+            .iter()
+            .map(|name| serde_json::json!({"function": name, "runs_on": runs_on(name)}))
+            .collect();
+        output::json(
+            &serde_json::json!({"package": package, "release": card.release, "functions": rows}),
+        );
+        return;
+    }
+    let mut table = output::Table::new(ctx, ["FUNCTION", "RUNS ON"]);
+    for name in &public {
+        table = table.row([*name, runs_on(name)]);
+    }
+    table.note(format!("{package} {}", card.release)).print();
+    let next: Vec<String> = public
+        .iter()
+        .take(2)
+        .map(|name| format!("cozy run {package}/{name} --describe"))
+        .collect();
+    output::next(ctx, &next.iter().map(String::as_str).collect::<Vec<_>>());
+}
+
+/// A fresh idempotency key: one key names one submission forever.
+fn mint_key() -> String {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).expect("the OS has randomness");
+    format!("idem-{}", hex::encode(bytes))
+}
