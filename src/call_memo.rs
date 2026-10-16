@@ -2,7 +2,7 @@
 //! child call, is answered from the success this machine holds for its signer under the same
 //! computation, and starts nothing; a success is held (`Objects::hold_memo`). A computation is
 //! the callable's operation identity, its request as given (files by content), its attention
-//! choice and the models it runs with. An author's condition (`memo_requires`) names the
+//! pin and bits and the models it runs with. An author's condition (`memo_requires`) names the
 //! parameters a request must give for it to be memoizable at all.
 use crate::{api::domain::ModelChoice, catalog::Generation, gpu_service::Plan, journal::InputFile};
 use serde_json::{json, Value};
@@ -24,7 +24,7 @@ pub fn of(
     invocable: &Value,
     request: &Value,
     files: &[InputFile],
-    attention: &str,
+    (attention, bits): (&str, u32),
     models: Value,
 ) -> Memo {
     if invocable["memoize"].as_bool() != Some(true) {
@@ -45,8 +45,12 @@ pub fn of(
     };
     let mut files: Vec<_> = files.iter().map(|f| json!([f.input_id, f.digest, f.media_type])).collect();
     files.sort_by_key(|file| file.to_string());
-    let computation = json!({"operation": operation, "request": checkpoints(request), "files": files,
+    let mut computation = json!({"operation": operation, "request": checkpoints(request), "files": files,
         "attention": attention, "models": models});
+    // At 16 bits every attention site is exact, whatever lane served.
+    if bits != 0 {
+        computation["bits"] = bits.into();
+    }
     Memo::Key(format!("sha256:{}", sha256::hex_digest(&crate::boundary_json::exact(&computation))))
 }
 
@@ -138,7 +142,7 @@ mod tests {
             .unwrap()
         };
         let key = |generation: &Generation, application: &str, invocable: &Value| {
-            match of(generation, application, invocable, &json!({"value": 3}), &[], "", json!([])) {
+            match of(generation, application, invocable, &json!({"value": 3}), &[], ("", 0), json!([])) {
                 Memo::Key(key) => key,
                 _ => panic!("not memoizable"),
             }
@@ -156,7 +160,7 @@ mod tests {
         // The root's declared identity is not this machine's reading: its files key it.
         let own = invocable("root", "own", Some(&same));
         assert_ne!(key(&before, "", &own), key(&generation("sha256:one", "sha256:moved"), "", &own));
-        assert!(matches!(of(&generation("sha256:one", ""), "", &own, &json!({}), &[], "", json!([])), Memo::Off));
+        assert!(matches!(of(&generation("sha256:one", ""), "", &own, &json!({}), &[], ("", 0), json!([])), Memo::Off));
     }
 
     /// An author's condition names parameters a request must give: absent or null, the call is
@@ -167,7 +171,7 @@ mod tests {
             "version": "1", "application": "p:app", "python": "/p", "source_digest": "sha256:p", "interface": {}}))
             .unwrap();
         let seeded = json!({"module": "p", "export": "paint", "memoize": true, "memo_requires": ["seed", "steps"]});
-        let memo = |request: Value, files: &[InputFile]| of(&generation, "", &seeded, &request, files, "", json!([]));
+        let memo = |request: Value, files: &[InputFile]| of(&generation, "", &seeded, &request, files, ("", 0), json!([]));
         for request in [json!({"prompt": "fox", "steps": 4}), json!({"prompt": "fox", "seed": null, "steps": 4})] {
             assert!(matches!(memo(request, &[]), Memo::Unmet(why) if why == "seed not given"));
         }
@@ -185,6 +189,6 @@ mod tests {
         assert_eq!(key(fox.clone(), &[file("sha256:a")]), key(fox.clone(), &[file("sha256:a")]));
         assert_ne!(key(fox.clone(), &[file("sha256:a")]), key(fox, &[file("sha256:b")]));
         let plain = json!({"module": "p", "export": "paint"});
-        assert!(matches!(of(&generation, "", &plain, &json!({}), &[], "", json!([])), Memo::Off));
+        assert!(matches!(of(&generation, "", &plain, &json!({}), &[], ("", 0), json!([])), Memo::Off));
     }
 }
