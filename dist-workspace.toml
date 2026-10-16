@@ -17,7 +17,7 @@ install-updater = false
 dispatch-releases = true
 precise-builds = true
 source-tarball = false
-pr-run-mode = "skip"
+pr-run-mode = "upload"
 github-attestations = true
 tap = "cozy-creator/homebrew-tap"
 # Homebrew's formula is built with every release and pushed nowhere until the owner opens the tap.
