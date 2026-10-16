@@ -468,8 +468,13 @@ version = "0.9.0"
 dependencies = [
  "calcifer",
  "cozy-cli",
+ "cozy-platform",
+ "cozy-proto",
+ "hub-client",
+ "reqwest",
  "serde_json",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -484,6 +489,7 @@ dependencies = [
  "cozy-platform",
  "cozy-proto",
  "hub-client",
+ "progenitor-client",
  "reqwest",
  "serde",
  "serde_json",

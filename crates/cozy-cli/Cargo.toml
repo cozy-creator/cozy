@@ -16,6 +16,7 @@ comfy-table.workspace = true
 cozy-platform.workspace = true
 cozy-proto.workspace = true
 hub-client.workspace = true
+progenitor-client.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
