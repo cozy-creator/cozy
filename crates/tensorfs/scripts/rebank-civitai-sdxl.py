@@ -30,7 +30,7 @@ def main():
     raw = (corpus / observed["file"]).read_bytes()
     assert len(raw) == observed["header_bytes"] == 8 + struct.unpack("<Q", raw[:8])[0]
     assert hashlib.sha256(raw).hexdigest() == observed["header_sha256"]
-    registry_path = ROOT / "vectors/fingerprints/registry.json"
+    registry_path = ROOT / "crates/tensorfs-core/vectors/fingerprints/registry.json"
     registry = json.loads(registry_path.read_text())
     routes = json.loads((ROOT / "crates/tensorfs-core/src/ingest/routes/sdxl.routes.json").read_text())
     converter = routes["converter"]

@@ -18,7 +18,7 @@ def main() -> None:
     args = parser.parse_args()
     vectors = ROOT / "vectors/instrument-headers"
     fixtures = json.loads((vectors / "MANIFEST.json").read_bytes())
-    registry_path = ROOT / "vectors/fingerprints/registry.json"
+    registry_path = ROOT / "crates/tensorfs-core/vectors/fingerprints/registry.json"
     registry = json.loads(registry_path.read_bytes())
     changes = []
     header_bytes = 0

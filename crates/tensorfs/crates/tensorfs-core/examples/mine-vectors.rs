@@ -1,5 +1,5 @@
 //! PRODUCER-MINED vector rows (scripts/mine-vectors.py) into the canonical vector document
-//! `vectors/mined/<name>.json`:
+//! this crate's `vectors/mined/<name>.json`, compiled into the registry:
 //!
 //!     cargo run -p tensorfs-core --example mine-vectors -- <rows> <name> [<match>]
 
@@ -120,7 +120,7 @@ fn mine(rows: &std::path::Path, name: &str, want: &str) -> ExitCode {
     }
     }
     let d: std::path::PathBuf = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../vectors/mined")
+        .join("vectors/mined")
         .components()
         .collect();
     if let Err(e) = std::fs::create_dir_all(&d) {

@@ -23,7 +23,7 @@ def main() -> None:
     parser.add_argument("--tfs", required=True, type=Path)
     parser.add_argument("--write", action="store_true")
     args = parser.parse_args()
-    registry_path = ROOT / "vectors/fingerprints/registry.json"
+    registry_path = ROOT / "crates/tensorfs-core/vectors/fingerprints/registry.json"
     registry = json.loads(registry_path.read_text())
     headers = ROOT / "vectors/h3-headers"
     changes = []

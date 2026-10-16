@@ -33,7 +33,7 @@ pub const BUILTIN_REGISTRY: &str = "builtin:fingerprint-registry/1";
 /// a refusal.
 pub const AS_IS: &str = "as-is/1";
 pub const BUILTIN_REGISTRY_BYTES: &[u8] =
-    include_bytes!("../../../../vectors/fingerprints/registry.json");
+    include_bytes!("../../vectors/fingerprints/registry.json");
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CarrierInput {

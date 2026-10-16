@@ -112,14 +112,14 @@ fn seed(
 /// which real producer emitted each one.
 fn mined(name: &str) -> EncodingVectors {
     let bytes: &[u8] = match name {
-        "fp8-rowwise" => include_bytes!("../../../vectors/mined/fp8-rowwise.json"),
-        "fp8-rowwise-keepdim" => include_bytes!("../../../vectors/mined/fp8-rowwise-keepdim.json"),
-        "fp8-scaled-scalar" => include_bytes!("../../../vectors/mined/fp8-scaled-scalar.json"),
+        "fp8-rowwise" => include_bytes!("../vectors/mined/fp8-rowwise.json"),
+        "fp8-rowwise-keepdim" => include_bytes!("../vectors/mined/fp8-rowwise-keepdim.json"),
+        "fp8-scaled-scalar" => include_bytes!("../vectors/mined/fp8-scaled-scalar.json"),
         "fp8-scaled-scalar-weight-only" => {
-            include_bytes!("../../../vectors/mined/fp8-scaled-scalar-weight-only.json")
+            include_bytes!("../vectors/mined/fp8-scaled-scalar-weight-only.json")
         }
-        "nvfp4-w4a4" => include_bytes!("../../../vectors/mined/nvfp4-w4a4.json"),
-        "int8-convrot256" => include_bytes!("../../../vectors/mined/int8-convrot256.json"),
+        "nvfp4-w4a4" => include_bytes!("../vectors/mined/nvfp4-w4a4.json"),
+        "int8-convrot256" => include_bytes!("../vectors/mined/int8-convrot256.json"),
         other => panic!("no mined vector set {other:?}"),
     };
     EncodingVectors::parse_fixture(bytes).expect("mined vectors are frozen canonical data")
