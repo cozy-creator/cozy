@@ -1,0 +1,2558 @@
+//! Durable acceptance and transitions. Observation has no lifecycle side effects.
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::{
+    fs, io,
+    path::Path,
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+// Status observation cursor allocation, not a duration or liveness policy.
+const REVISION_WINDOW: u64 = 1 << 32;
+/// A root run's log keeps package log lines while it holds fewer lines than this and its
+/// records fit in the bytes (`Journal::append_package_log`).
+pub const PACKAGE_LOG_LINES: u64 = 512;
+pub const PACKAGE_LOG_BYTES: u64 = 256 << 10;
+const PACKAGE_LOG_DROPPED: &[u8] = br#"{"level":"warning","text":"later package log lines were dropped: a run's log keeps 512 lines and 256 KiB"}"#;
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct Invocation {
+    pub package: String,
+    pub generation: String,
+    pub module: String,
+    pub entrypoint: String,
+    pub input: Value,
+    /// The caller's attention-kernel pin, passed to the executor verbatim.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub attention_kernel: String,
+    /// An explicit run GPU group; zero selects the package's widest supported group.
+    #[serde(default)]
+    pub gpus: u32,
+    /// The request's weight precision (16, 8 or 4), passed to the executor; zero: the rules'.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub bits: u32,
+    /// File inputs the caller imported, verified at acceptance.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inputs: Vec<InputFile>,
+    /// GPUs its plan runs on: 0 for a deviceless one (`accelerator=False`, or a machine
+    /// without GPUs). Stamped once prepared; it schedules and fences restarts.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub degree: u32,
+    /// A child run's parent (its execution id): children end with it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub parent: String,
+    /// A child run's root: its outermost ancestor, whose acceptance orders its GPU work.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub root: String,
+    /// A child run's outermost ancestor on a GPU, whose GPU its calls share.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub family: String,
+}
+
+/// One file input: the declared field path, its exact bytes (sha256 and length, held in the
+/// store by the caller's retention) and media type, in the caller's order.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct InputFile {
+    pub input_id: String,
+    pub digest: String,
+    pub length: u64,
+    pub media_type: String,
+    pub order: u32,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct SubmissionContext {
+    pub actor: String,
+    pub request_id: String,
+    pub submission_id: String,
+    pub expected_workspace_id: String,
+    pub capture_digest: String,
+    pub invocation_digest: String,
+    pub payload_digest: String,
+    pub preparation_id: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Preparation {
+    pub actor: String,
+    pub id: String,
+    pub installation: String,
+    pub document: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Installation {
+    pub actor: String,
+    pub alias: String,
+    pub generation: String,
+    pub package: String,
+    pub release: String,
+    pub interface: Vec<u8>,
+    /// The Hub origin a published release came from; empty for local code.
+    #[serde(default)]
+    pub hub: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct PublicTerminal {
+    pub outcome: Vec<u8>,
+    pub events: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AdmissionError {
+    WorkspaceMismatch,
+    BindingConflict,
+}
+impl std::fmt::Display for AdmissionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::WorkspaceMismatch => {
+                "expected workspace differs from this durable machine workspace"
+            }
+            Self::BindingConflict => {
+                "request or submission is already bound to different authored semantics"
+            }
+        })
+    }
+}
+impl std::error::Error for AdmissionError {}
+
+fn admission(error: AdmissionError) -> io::Error {
+    let kind = match error {
+        AdmissionError::WorkspaceMismatch => io::ErrorKind::InvalidInput,
+        AdmissionError::BindingConflict => io::ErrorKind::AlreadyExists,
+    };
+    io::Error::new(kind, error)
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum State {
+    Queued,
+    Starting,
+    Running,
+    Completed,
+    Failed,
+    Canceled,
+    /// Written by a newer machine: listed, never dispatched, settled or overwritten.
+    #[serde(other)]
+    Unknown,
+}
+
+impl State {
+    pub fn terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Failed | Self::Canceled)
+    }
+    fn name(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Starting => "starting",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Canceled => "canceled",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ExecutorFacts {
+    pub pid: u32,
+    pub runtime_version: String,
+    pub tensorfs_version: String,
+    #[serde(default)]
+    pub tensord_version: String,
+    #[serde(default)]
+    pub tensord_commit: Option<String>,
+}
+
+/// The software that actually served one attempt, not the machine's current installation.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct SoftwareFacts {
+    pub attempt_ordinal: u32,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub tensord: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tensord_commit: Option<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub runtime: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub tensorfs: String,
+}
+
+impl ExecutorFacts {
+    pub fn observed(pid: u32, runtime_version: String, tensorfs_version: String) -> Self {
+        Self {
+            pid, runtime_version, tensorfs_version,
+            tensord_version: env!("CARGO_PKG_VERSION").into(),
+            tensord_commit: option_env!("TENSORD_COMMIT").map(str::to_owned),
+        }
+    }
+
+    pub fn software(&self, attempt_ordinal: u32) -> SoftwareFacts {
+        SoftwareFacts {
+            attempt_ordinal, tensord: self.tensord_version.clone(),
+            tensord_commit: self.tensord_commit.clone(),
+            runtime: self.runtime_version.clone(), tensorfs: self.tensorfs_version.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ProcessBirth {
+    pub pid: u32,
+    pub boot_id: String,
+    pub start_ticks: u64,
+}
+
+/// Memoized results each signer keeps, its most recently used first.
+pub const MAX_HELD_MEMOS: i64 = 4096;
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct Artifact {
+    pub name: String,
+    pub path: String,
+    pub sha256: String,
+    pub length: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct ResultRecord {
+    pub value: Value,
+    pub artifacts: Vec<Artifact>,
+    #[serde(default)]
+    pub asset_bindings: Vec<AssetBinding>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct AssetBinding {
+    pub relative_path: String,
+    pub asset_ref: String,
+    pub media_type: String,
+    pub length: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Execution {
+    pub id: String,
+    pub idempotency_key: String,
+    pub invocation: Invocation,
+    #[serde(default)]
+    pub submission: Option<SubmissionContext>,
+    pub state: State,
+    pub revision: u64,
+    #[serde(default)]
+    pub accepted_at_ms: u64,
+    #[serde(default)]
+    pub finished_at_ms: u64,
+    #[serde(default)]
+    pub acceptance_boot_id: String,
+    #[serde(default)]
+    pub collected: bool,
+    /// Reserved observation cursor ceiling. Older stored records default to no reservation.
+    #[serde(default)]
+    pub revision_ceiling: u64,
+    #[serde(default)]
+    pub attempt: u32,
+    #[serde(default)]
+    pub waiting_reason: Option<String>,
+    pub process: Option<ProcessBirth>,
+    pub cancel_actor: Option<String>,
+    /// Explicit cancellation reserved this actor/ID before any Run spec was accepted.
+    #[serde(default)]
+    pub canceled_before_acceptance: bool,
+    pub completed_units: u64,
+    pub progress: Option<String>,
+    /// The cursor at which the attempt started running: its `running` event.
+    #[serde(default)]
+    pub running_revision: u64,
+    /// When the attempt started running (wall clock), and on which executor.
+    #[serde(default)]
+    pub started_at_ms: u64,
+    /// The run's own time running its callable, every ended attempt summed.
+    #[serde(default)]
+    pub executed_ms: u64,
+    #[serde(default)]
+    pub executor: Option<ExecutorFacts>,
+    pub result: Option<ResultRecord>,
+    pub failure: Option<String>,
+    #[serde(default, skip_serializing_if = "CallMemo::is_empty")]
+    pub memo: CallMemo,
+}
+
+/// How the machine memo (`call_memo`) met a memoizable call.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct CallMemo {
+    /// `sha256:<hex>`: what answered it, or what its success is held under.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub computation: String,
+    /// Answered from a result this machine held: nothing ran.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub memoized: bool,
+    /// Why it was neither looked up nor held: its author's condition unmet ("seed not given").
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub unmemoized: String,
+}
+impl CallMemo {
+    pub fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+impl Execution {
+    /// Its root run's acceptance order: GPU work queues by it.
+    pub fn root_seq(&self) -> u64 {
+        let root = if self.invocation.root.is_empty() { &self.id } else { &self.invocation.root };
+        root.parse().unwrap_or(u64::MAX)
+    }
+    /// The run whose GPU its calls share: its outermost ancestor on a GPU, itself included.
+    pub fn family(&self) -> Option<&str> {
+        match (self.invocation.family.as_str(), self.invocation.degree > 0) {
+            ("", true) => Some(&self.id),
+            ("", false) => None,
+            (family, _) => Some(family),
+        }
+    }
+    /// Its progress is observed: an attempt running, or a run preparing inside itself.
+    pub fn observed(&self) -> bool {
+        self.state == State::Running
+            || (self.state == State::Queued && self.waiting_reason.as_deref() == Some(PREPARING))
+    }
+}
+
+/// One journaled product of an execution's output log (`api::domain::RunProduct` bytes).
+#[derive(Clone, Debug)]
+pub struct StoredProduct {
+    pub sequence: u64,
+    pub at_ms: u64,
+    pub product: Vec<u8>,
+}
+
+/// Ownership association only; TensorFS remains the transaction/progress/custody journal.
+#[derive(Clone, Debug)]
+pub struct DerivedOutputBinding {
+    pub execution: String,
+    pub transaction: String,
+    pub slot: String,
+}
+
+/// Coalesced observation; persisted only as part of an authoritative transition.
+#[derive(Clone, Debug)]
+pub struct ProgressSnapshot {
+    pub completed_units: u64,
+    pub detail: String,
+    pub revision: u64,
+}
+
+impl ProgressSnapshot {
+    pub fn overlay(&self, record: &mut Execution) -> bool {
+        if self.revision <= record.revision || self.completed_units < record.completed_units {
+            return false;
+        }
+        record.completed_units = self.completed_units;
+        record.progress = Some(self.detail.clone());
+        record.revision = record.revision.max(self.revision);
+        true
+    }
+}
+
+pub struct Journal {
+    connection: Connection,
+    workspace_id: String,
+}
+
+/// The record layout this machine writes. A newer journal still opens: unknown fields are
+/// ignored and rows it cannot read are skipped, never a refusal of the whole journal.
+pub const JOURNAL_FORMAT: u32 = 1;
+
+/// One unreadable row (written by a newer machine, or damaged) must not hide every other run.
+fn readable(rows: Vec<String>) -> Vec<Execution> {
+    rows.into_iter()
+        .filter_map(|row| match serde_json::from_str(&row) {
+            Ok(record) => Some(record),
+            Err(error) => {
+                eprintln!("journal: skipping an unreadable execution row: {error}");
+                None
+            }
+        })
+        .collect()
+}
+
+fn db_error(error: impl std::fmt::Display) -> io::Error {
+    io::Error::other(error.to_string())
+}
+fn encoded(value: &impl Serialize) -> io::Result<String> {
+    serde_json::to_string(value).map_err(db_error)
+}
+fn timestamp() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64
+}
+
+impl Journal {
+    pub fn open(root: &Path) -> io::Result<Self> {
+        fs::create_dir_all(root)?;
+        let mut connection = Connection::open(root.join("executions.sqlite3")).map_err(db_error)?;
+        connection
+            .execute_batch(
+                "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;
+            CREATE TABLE IF NOT EXISTS executions (
+              id INTEGER PRIMARY KEY AUTOINCREMENT, idempotency_key TEXT NOT NULL UNIQUE,
+              invocation TEXT NOT NULL, record TEXT NOT NULL, state TEXT NOT NULL,
+              updated_ms INTEGER NOT NULL);
+            CREATE INDEX IF NOT EXISTS executions_nonterminal ON executions(id)
+              WHERE state IN ('queued','starting','running');
+            CREATE INDEX IF NOT EXISTS executions_active ON executions(id)
+              WHERE state IN ('starting','running');
+            CREATE INDEX IF NOT EXISTS executions_ready ON executions(id)
+              WHERE state='queued' AND json_extract(record,'$.waiting_reason') IS NULL;
+            CREATE INDEX IF NOT EXISTS executions_updated ON executions(updated_ms);",
+            )
+            .map_err(db_error)?;
+        // Add consumed index columns without rewriting any older private records.
+        let columns: Vec<String> = {
+            let mut statement = connection
+                .prepare("PRAGMA table_info(executions)")
+                .map_err(db_error)?;
+            let rows = statement
+                .query_map([], |row| row.get(1))
+                .map_err(db_error)?;
+            rows.collect::<Result<_, _>>().map_err(db_error)?
+        };
+        for column in ["actor", "request_id", "submission_id"] {
+            if !columns.iter().any(|existing| existing == column) {
+                connection
+                    .execute(
+                        &format!("ALTER TABLE executions ADD COLUMN {column} TEXT"),
+                        [],
+                    )
+                    .map_err(db_error)?;
+            }
+        }
+        connection.execute_batch("BEGIN; CREATE TABLE IF NOT EXISTS machine_metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS update_run_ids(actor TEXT NOT NULL,id TEXT NOT NULL,PRIMARY KEY(actor,id));
+            CREATE TABLE IF NOT EXISTS installations(actor TEXT NOT NULL,alias TEXT NOT NULL,record TEXT NOT NULL,PRIMARY KEY(actor,alias));
+            CREATE TABLE IF NOT EXISTS preparations(actor TEXT NOT NULL,id TEXT NOT NULL,record TEXT NOT NULL,PRIMARY KEY(actor,id));
+            CREATE TABLE IF NOT EXISTS warm_sets(actor TEXT NOT NULL,position INTEGER NOT NULL,record TEXT NOT NULL,PRIMARY KEY(actor,position));
+            CREATE TABLE IF NOT EXISTS public_terminals(execution INTEGER PRIMARY KEY REFERENCES executions(id),outcome BLOB NOT NULL,events BLOB NOT NULL);
+            CREATE TABLE IF NOT EXISTS run_products(execution INTEGER NOT NULL REFERENCES executions(id),sequence INTEGER NOT NULL,at_ms INTEGER NOT NULL,product BLOB NOT NULL,PRIMARY KEY(execution,sequence));
+            CREATE TABLE IF NOT EXISTS run_measurements(execution INTEGER PRIMARY KEY REFERENCES executions(id),measurements BLOB NOT NULL);
+            CREATE TABLE IF NOT EXISTS run_logs(execution INTEGER NOT NULL REFERENCES executions(id),sequence INTEGER NOT NULL,at_ms INTEGER NOT NULL,record BLOB NOT NULL,PRIMARY KEY(execution,sequence));
+            CREATE TABLE IF NOT EXISTS attention_applied(execution INTEGER PRIMARY KEY REFERENCES executions(id));
+            CREATE TABLE IF NOT EXISTS run_calls(execution INTEGER NOT NULL REFERENCES executions(id),sequence INTEGER NOT NULL,at_ms INTEGER NOT NULL,call TEXT NOT NULL,record BLOB NOT NULL,PRIMARY KEY(execution,sequence),UNIQUE(execution,call));
+            CREATE TABLE IF NOT EXISTS native_outputs(actor TEXT NOT NULL,owner TEXT NOT NULL,source BLOB NOT NULL,PRIMARY KEY(actor,owner));
+            CREATE TABLE IF NOT EXISTS input_intakes(actor TEXT NOT NULL,retention TEXT NOT NULL,record TEXT NOT NULL,PRIMARY KEY(actor,retention));
+            CREATE TABLE IF NOT EXISTS triage(execution INTEGER PRIMARY KEY REFERENCES executions(id),record TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS resolutions(actor TEXT NOT NULL,key TEXT NOT NULL,package TEXT NOT NULL,preparation TEXT NOT NULL,PRIMARY KEY(actor,key));
+            CREATE TABLE IF NOT EXISTS names(name TEXT PRIMARY KEY,revision TEXT NOT NULL,named TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS objects(actor TEXT NOT NULL,sha256 TEXT NOT NULL,length INTEGER NOT NULL,PRIMARY KEY(actor,sha256));
+            CREATE TABLE IF NOT EXISTS object_uses(sha256 TEXT PRIMARY KEY,length INTEGER NOT NULL,used_ms INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS run_objects(execution INTEGER NOT NULL REFERENCES executions(id),sha256 TEXT NOT NULL,length INTEGER NOT NULL,PRIMARY KEY(execution,sha256));
+            CREATE INDEX IF NOT EXISTS run_objects_digest ON run_objects(sha256);
+            DROP TABLE IF EXISTS job_contexts;
+            CREATE TABLE IF NOT EXISTS held_memos(actor TEXT NOT NULL,computation TEXT NOT NULL,record BLOB NOT NULL,used_ms INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(actor,computation));
+            CREATE TABLE IF NOT EXISTS held_memo_objects(actor TEXT NOT NULL,computation TEXT NOT NULL,sha256 TEXT NOT NULL,PRIMARY KEY(actor,computation,sha256));
+            CREATE INDEX IF NOT EXISTS held_memo_objects_digest ON held_memo_objects(sha256);
+            DROP TABLE IF EXISTS checkpoints;
+            CREATE TABLE IF NOT EXISTS derived_output_bindings(transaction_id TEXT PRIMARY KEY,execution INTEGER NOT NULL REFERENCES executions(id),slot TEXT NOT NULL);
+            CREATE INDEX IF NOT EXISTS derived_output_execution ON derived_output_bindings(execution);
+            CREATE UNIQUE INDEX IF NOT EXISTS executions_actor_request ON executions(actor,request_id) WHERE actor IS NOT NULL;
+            CREATE UNIQUE INDEX IF NOT EXISTS executions_actor_submission ON executions(actor,submission_id) WHERE actor IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS executions_actor_order ON executions(actor,id) WHERE actor IS NOT NULL; COMMIT;").map_err(db_error)?;
+        crate::failure_upgrade::upgrade(&mut connection)?;
+        // A journal from before held memos kept their use (#148's builds) gains the column.
+        let used: bool = connection
+            .query_row("SELECT COUNT(*) FROM pragma_table_info('held_memos') WHERE name='used_ms'", [], |r| r.get(0))
+            .map_err(db_error)?;
+        if !used {
+            connection
+                .execute("ALTER TABLE held_memos ADD COLUMN used_ms INTEGER NOT NULL DEFAULT 0", [])
+                .map_err(db_error)?;
+        }
+        let existing: Option<String> = connection
+            .query_row(
+                "SELECT value FROM machine_metadata WHERE key='workspace_id'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(db_error)?;
+        if existing.is_none() {
+            connection
+                .execute(
+                    "INSERT OR IGNORE INTO machine_metadata(key,value) VALUES('workspace_id',?1)",
+                    [uuid::Uuid::new_v4().to_string()],
+                )
+                .map_err(db_error)?;
+        }
+        connection
+            .execute(
+                "INSERT OR IGNORE INTO machine_metadata(key,value) VALUES('journal_format',?1)",
+                [JOURNAL_FORMAT.to_string()],
+            )
+            .map_err(db_error)?;
+        let format: String = connection
+            .query_row(
+                "SELECT value FROM machine_metadata WHERE key='journal_format'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(db_error)?;
+        if format
+            .parse::<u32>()
+            .map_or(true, |format| format > JOURNAL_FORMAT)
+        {
+            eprintln!(
+                "journal: format {format} is newer than {JOURNAL_FORMAT}; reading what it can"
+            );
+        }
+        let workspace_id = connection
+            .query_row(
+                "SELECT value FROM machine_metadata WHERE key='workspace_id'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(db_error)?;
+        fs::File::open(root)?.sync_all()?;
+        Ok(Self {
+            connection,
+            workspace_id,
+        })
+    }
+
+    pub fn workspace_id(&self) -> &str {
+        &self.workspace_id
+    }
+    pub fn begin_intake(
+        &mut self,
+        spec: crate::native_inputs::IntakeSpec,
+    ) -> io::Result<crate::native_inputs::IntakeState> {
+        use crate::native_inputs::IntakeState;
+        if self
+            .native_owner(&spec.retention_id)?
+            .is_some_and(|held| held != spec.actor)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "intake retention belongs to another actor",
+            ));
+        }
+        let prior: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT record FROM input_intakes WHERE actor=?1 AND retention=?2",
+                params![spec.actor, spec.retention_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(db_error)?;
+        if let Some(prior) = prior {
+            let state: IntakeState = serde_json::from_str(&prior).map_err(db_error)?;
+            if encoded(&state.spec)? != encoded(&spec)? {
+                return Err(admission(AdmissionError::BindingConflict));
+            }
+            return Ok(state);
+        }
+        let state = IntakeState {
+            spec,
+            released: false,
+            receipt: None,
+        };
+        self.connection
+            .execute(
+                "INSERT INTO input_intakes(actor,retention,record) VALUES(?1,?2,?3)",
+                params![state.spec.actor, state.spec.retention_id, encoded(&state)?],
+            )
+            .map_err(db_error)?;
+        Ok(state)
+    }
+    pub fn intake(
+        &self,
+        actor: &str,
+        retention: &str,
+    ) -> io::Result<Option<crate::native_inputs::IntakeState>> {
+        self.connection
+            .query_row(
+                "SELECT record FROM input_intakes WHERE actor=?1 AND retention=?2",
+                params![actor, retention],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(db_error)?
+            .map(|record| serde_json::from_str(&record).map_err(db_error))
+            .transpose()
+    }
+    pub fn settle_intake(
+        &mut self,
+        actor: &str,
+        retention: &str,
+        receipt: Option<Vec<u8>>,
+        abort: bool,
+    ) -> io::Result<crate::native_inputs::IntakeState> {
+        use crate::{api::domain, native_inputs::IntakeState};
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(db_error)?;
+        let raw: Option<String> = tx
+            .query_row(
+                "SELECT record FROM input_intakes WHERE actor=?1 AND retention=?2",
+                params![actor, retention],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(db_error)?;
+        let mut state: IntakeState =
+            serde_json::from_str(&raw.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "input intake not bound")
+            })?)
+            .map_err(db_error)?;
+        if let Some(receipt) = receipt {
+            let result =
+                crate::archive::decode_native_byte_retention_result(receipt.as_slice()).map_err(db_error)?;
+            if result.retention_id != retention || result.source.is_none() {
+                return Err(db_error("native input receipt differs from bound intake"));
+            }
+            if let Some(prior) = &state.receipt {
+                if prior != &receipt {
+                    return Err(admission(AdmissionError::BindingConflict));
+                }
+            }
+            state.receipt = Some(receipt);
+            if !state.released && !abort {
+                let source = crate::archive::encode_native_byte_retention_request(&domain::NativeByteRetentionRequest {
+                    source: result.source,
+                    retention_id: retention.into(),
+                });
+                let owner: Option<String> = tx
+                    .query_row(
+                        "SELECT actor FROM native_outputs WHERE owner=?1 LIMIT 1",
+                        [retention],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                    .map_err(db_error)?;
+                if owner.is_some_and(|held| held != actor) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "native intake owner belongs to another actor",
+                    ));
+                }
+                let prior: Option<Vec<u8>> = tx
+                    .query_row(
+                        "SELECT source FROM native_outputs WHERE actor=?1 AND owner=?2",
+                        params![actor, retention],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                    .map_err(db_error)?;
+                if prior.as_ref().is_some_and(|held| held != &source) {
+                    return Err(admission(AdmissionError::BindingConflict));
+                }
+                tx.execute(
+                    "INSERT OR IGNORE INTO native_outputs(actor,owner,source) VALUES(?1,?2,?3)",
+                    params![actor, retention, source],
+                )
+                .map_err(db_error)?;
+            }
+        }
+        state.released |= abort;
+        tx.execute(
+            "UPDATE input_intakes SET record=?1 WHERE actor=?2 AND retention=?3",
+            params![encoded(&state)?, actor, retention],
+        )
+        .map_err(db_error)?;
+        tx.commit().map_err(db_error)?;
+        Ok(state)
+    }
+
+    pub fn installation(&self, actor: &str, alias: &str) -> io::Result<Option<Installation>> {
+        let record: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT record FROM installations WHERE actor=?1 AND alias=?2",
+                params![actor, alias],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(db_error)?;
+        record
+            .map(|record| serde_json::from_str(&record).map_err(db_error))
+            .transpose()
+    }
+    pub fn installation_for_generation(
+        &self,
+        actor: &str,
+        generation: &str,
+    ) -> io::Result<Option<Installation>> {
+        let record: Option<String> = self.connection.query_row("SELECT record FROM installations WHERE actor=?1 AND json_extract(record,'$.generation')=?2 LIMIT 1", params![actor,generation], |r| r.get(0)).optional().map_err(db_error)?;
+        record
+            .map(|record| serde_json::from_str(&record).map_err(db_error))
+            .transpose()
+    }
+    /// Every generation an installation or an unfinished run names: never evicted meanwhile.
+    pub fn bound_generations(&self) -> io::Result<std::collections::HashSet<String>> {
+        let mut bound = self.running_generations()?;
+        bound.extend(self.generations("SELECT json_extract(record,'$.generation') FROM installations")?);
+        Ok(bound)
+    }
+    /// Every generation an unfinished run names.
+    pub fn running_generations(&self) -> io::Result<std::collections::HashSet<String>> {
+        self.generations(
+            "SELECT json_extract(invocation,'$.generation') FROM executions
+             WHERE state NOT IN ('completed','failed','canceled')",
+        )
+    }
+    fn generations(&self, query: &str) -> io::Result<std::collections::HashSet<String>> {
+        let mut statement = self.connection.prepare(query).map_err(db_error)?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, Option<String>>(0))
+            .map_err(db_error)?;
+        rows.filter_map(|row| row.map_err(db_error).transpose())
+            .collect()
+    }
+
+    pub fn installations(&self, actor: &str) -> io::Result<Vec<Installation>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT record FROM installations WHERE actor=?1 ORDER BY alias")
+            .map_err(db_error)?;
+        let rows = statement
+            .query_map([actor], |r| r.get::<_, String>(0))
+            .map_err(db_error)?;
+        rows.map(|r| serde_json::from_str(&r.map_err(db_error)?).map_err(db_error))
+            .collect()
+    }
+    pub fn bind_installation(&mut self, record: Installation) -> io::Result<Installation> {
+        validate_scope(&record.actor, &record.alias, &record.generation)?;
+        if let Some(prior) = self.installation(&record.actor, &record.alias)? {
+            if prior == record {
+                return Ok(prior);
+            }
+            // A record from before installations named their Hub is the same installation.
+            if !prior.hub.is_empty() || (Installation { hub: record.hub.clone(), ..prior }) != record {
+                return Err(admission(AdmissionError::BindingConflict));
+            }
+            self.connection
+                .execute(
+                    "UPDATE installations SET record=?3 WHERE actor=?1 AND alias=?2",
+                    params![record.actor, record.alias, encoded(&record)?],
+                )
+                .map_err(db_error)?;
+            return Ok(record);
+        }
+        self.connection
+            .execute(
+                "INSERT INTO installations(actor,alias,record) VALUES(?1,?2,?3)",
+                params![record.actor, record.alias, encoded(&record)?],
+            )
+            .map_err(db_error)?;
+        Ok(record)
+    }
+
+    /// Drop `actor`'s installation `alias` with its preparations, the resolutions naming them
+    /// and its warm set members. Answers the installation removed, if there was one.
+    pub fn remove_installation(&mut self, actor: &str, alias: &str) -> io::Result<Option<Installation>> {
+        let Some(installed) = self.installation(actor, alias)? else {
+            return Ok(None);
+        };
+        let tx = self.connection.transaction().map_err(db_error)?;
+        for statement in [
+            "DELETE FROM resolutions WHERE actor=?1 AND preparation IN
+                (SELECT id FROM preparations WHERE actor=?1 AND json_extract(record,'$.installation')=?2)",
+            "DELETE FROM preparations WHERE actor=?1 AND json_extract(record,'$.installation')=?2",
+            "DELETE FROM warm_sets WHERE actor=?1 AND json_extract(record,'$.installation')=?2",
+            "DELETE FROM installations WHERE actor=?1 AND alias=?2",
+        ] {
+            tx.execute(statement, params![actor, alias]).map_err(db_error)?;
+        }
+        tx.commit().map_err(db_error)?;
+        Ok(Some(installed))
+    }
+
+    pub fn resolution(&self, actor: &str, key: &str) -> io::Result<Option<String>> {
+        self.connection
+            .query_row(
+                "SELECT preparation FROM resolutions WHERE actor=?1 AND key=?2",
+                params![actor, key],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(db_error)
+    }
+    pub fn bind_resolution(
+        &mut self,
+        actor: &str,
+        key: &str,
+        package: &str,
+        preparation: &str,
+    ) -> io::Result<()> {
+        self.connection
+            .execute("INSERT OR REPLACE INTO resolutions(actor,key,package,preparation) VALUES(?1,?2,?3,?4)", params![actor, key, package, preparation])
+            .map_err(db_error)?;
+        Ok(())
+    }
+    /// What a Hub named `name` (its origin, a repository, release and lane) under the caller's
+    /// catalog `revision` (th-245), or None. One row per name: a moved revision replaces it.
+    pub fn named(&self, name: &str, revision: &str) -> io::Result<Option<String>> {
+        self.connection
+            .query_row("SELECT named FROM names WHERE name=?1 AND revision=?2", params![name, revision], |r| r.get(0))
+            .optional()
+            .map_err(db_error)
+    }
+    pub fn bind_named(&mut self, name: &str, revision: &str, named: &str) -> io::Result<()> {
+        self.connection
+            .execute("INSERT OR REPLACE INTO names(name,revision,named) VALUES(?1,?2,?3)", params![name, revision, named])
+            .map_err(db_error)?;
+        Ok(())
+    }
+    pub fn hold_memo(&mut self, held: &HeldMemo) -> io::Result<()> {
+        let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(db_error)?;
+        hold_memo(&tx, held)?;
+        tx.commit().map_err(db_error)
+    }
+    pub fn held_memo(&self, actor: &str, computation: &str) -> io::Result<Option<Vec<u8>>> {
+        let record = self.connection
+            .query_row("SELECT record FROM held_memos WHERE actor=?1 AND computation=?2",
+                params![actor, computation], |r| r.get(0))
+            .optional()
+            .map_err(db_error)?;
+        if record.is_some() {
+            self.connection.execute("UPDATE held_memos SET used_ms=?3 WHERE actor=?1 AND computation=?2",
+                params![actor, computation, timestamp()]).map_err(db_error)?;
+        }
+        Ok(record)
+    }
+    /// Every held memo naming `sha256` goes with it (its file is no longer this machine's).
+    pub fn drop_held_memos(&mut self, sha256: &str) -> io::Result<usize> {
+        let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(db_error)?;
+        let dropped = tx.execute("DELETE FROM held_memos WHERE (actor,computation) IN
+            (SELECT actor,computation FROM held_memo_objects WHERE sha256=?1)", params![sha256]).map_err(db_error)?;
+        tx.execute("DELETE FROM held_memo_objects WHERE (actor,computation) NOT IN
+            (SELECT actor,computation FROM held_memos)", []).map_err(db_error)?;
+        tx.commit().map_err(db_error)?;
+        Ok(dropped)
+    }
+    pub fn object(&self, actor: &str, sha256: &str) -> io::Result<Option<u64>> {
+        self.connection
+            .query_row(
+                "SELECT length FROM objects WHERE actor=?1 AND sha256=?2",
+                params![actor, sha256],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(db_error)
+    }
+    pub fn bind_object(
+        &mut self,
+        actor: &str,
+        object: &tensorfs_core::ids::ObjectRef,
+    ) -> io::Result<()> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(db_error)?;
+        tx.execute(
+            "INSERT OR REPLACE INTO objects(actor,sha256,length) VALUES(?1,?2,?3)",
+            params![actor, object.sha256, object.length],
+        )
+        .map_err(db_error)?;
+        touch_object(&tx, object)?;
+        tx.commit().map_err(db_error)?;
+        Ok(())
+    }
+
+    /// A child's result becomes its parent's dependency before the parent is handed it.
+    pub fn adopt_object(
+        &mut self,
+        actor: &str,
+        parent: &str,
+        object: &tensorfs_core::ids::ObjectRef,
+    ) -> io::Result<()> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(db_error)?;
+        tx.execute(
+            "INSERT OR REPLACE INTO objects(actor,sha256,length) VALUES(?1,?2,?3)",
+            params![actor, object.sha256, object.length],
+        )
+        .map_err(db_error)?;
+        reference_objects(&tx, parent, std::slice::from_ref(object))?;
+        tx.commit().map_err(db_error)
+    }
+
+    /// Whether nothing needs this object's root: no use (a Write, a new run) since
+    /// `before_ms`, and no run naming it that is unfinished (any state but the three
+    /// terminal ones) or ended since then.
+    pub fn object_releasable(&self, sha256: &str, before_ms: i64) -> io::Result<bool> {
+        self.connection
+            .query_row(
+                "SELECT NOT EXISTS(SELECT 1 FROM object_uses WHERE sha256=?1 AND used_ms>=?2)
+                 AND NOT EXISTS(SELECT 1 FROM run_objects r JOIN executions e ON e.id=r.execution
+                     WHERE r.sha256=?1 AND (e.updated_ms>=?2
+                         OR e.state NOT IN ('completed','failed','canceled')))",
+                params![sha256, before_ms],
+                |row| row.get(0),
+            )
+            .map_err(db_error)
+    }
+    /// The failed attempt's triage bundle reference; written before the run settles.
+    pub fn bind_triage(&mut self, id: &str, triage: &crate::triage::TriageRef) -> io::Result<()> {
+        self.connection
+            .execute(
+                "INSERT OR REPLACE INTO triage(execution,record) VALUES(?1,?2)",
+                params![id, encoded(triage)?],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+    pub fn triage(&self, id: &str) -> io::Result<Option<crate::triage::TriageRef>> {
+        let record: Option<String> = self
+            .connection
+            .query_row("SELECT record FROM triage WHERE execution=?1", [id], |r| {
+                r.get(0)
+            })
+            .optional()
+            .map_err(db_error)?;
+        record
+            .map(|record| serde_json::from_str(&record).map_err(db_error))
+            .transpose()
+    }
+    /// The accepted public execution a submission or request already names, if any.
+    pub fn accepted_public(
+        &self,
+        actor: &str,
+        request_id: &str,
+        submission_id: &str,
+    ) -> io::Result<Option<Execution>> {
+        let record: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT record FROM executions WHERE actor=?1 AND (request_id=?2 OR submission_id=?3) LIMIT 1",
+                params![actor, request_id, submission_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(db_error)?;
+        record
+            .map(|r| serde_json::from_str(&r).map_err(db_error))
+            .transpose()
+    }
+    pub fn preparation(&self, actor: &str, id: &str) -> io::Result<Option<Preparation>> {
+        self.connection
+            .query_row(
+                "SELECT record FROM preparations WHERE actor=?1 AND id=?2",
+                params![actor, id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(db_error)?
+            .map(|record| serde_json::from_str(&record).map_err(db_error))
+            .transpose()
+    }
+
+    /// Replace `actor`'s warm set with `members` (each one's record, in its order).
+    pub fn replace_warm_set(&mut self, actor: &str, members: &[String]) -> io::Result<()> {
+        let transaction = self.connection.transaction().map_err(db_error)?;
+        transaction
+            .execute("DELETE FROM warm_sets WHERE actor=?1", [actor])
+            .map_err(db_error)?;
+        for (position, record) in members.iter().enumerate() {
+            transaction
+                .execute(
+                    "INSERT INTO warm_sets(actor,position,record) VALUES(?1,?2,?3)",
+                    params![actor, position as i64, record],
+                )
+                .map_err(db_error)?;
+        }
+        transaction.commit().map_err(db_error)
+    }
+    /// Every warm set member's record as (actor, record), each actor's in its order.
+    pub fn warm_sets(&self) -> io::Result<Vec<(String, String)>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT actor,record FROM warm_sets ORDER BY actor,position")
+            .map_err(db_error)?;
+        let rows = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(db_error)?;
+        rows.map(|row| row.map_err(db_error)).collect()
+    }
+    /// Every preparation `actor` bound to `installation`.
+    pub fn preparations_of(&self, actor: &str, installation: &str) -> io::Result<Vec<Preparation>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT record FROM preparations WHERE actor=?1 AND json_extract(record,'$.installation')=?2")
+            .map_err(db_error)?;
+        let rows = statement
+            .query_map(params![actor, installation], |row| row.get::<_, String>(0))
+            .map_err(db_error)?;
+        rows.map(|row| serde_json::from_str(&row.map_err(db_error)?).map_err(db_error))
+            .collect()
+    }
+
+    pub fn bind_preparation(&mut self, record: Preparation) -> io::Result<Preparation> {
+        validate_scope(&record.actor, &record.id, &record.installation)?;
+        if self
+            .installation(&record.actor, &record.installation)?
+            .is_none()
+        {
+            return Err(admission(AdmissionError::BindingConflict));
+        }
+        if let Some(prior) = self.preparation(&record.actor, &record.id)? {
+            if prior != record {
+                return Err(admission(AdmissionError::BindingConflict));
+            }
+            return Ok(prior);
+        }
+        self.connection
+            .execute(
+                "INSERT INTO preparations(actor,id,record) VALUES(?1,?2,?3)",
+                params![record.actor, record.id, encoded(&record)?],
+            )
+            .map_err(db_error)?;
+        Ok(record)
+    }
+    pub fn public_terminal(&self, id: &str) -> io::Result<Option<PublicTerminal>> {
+        self.connection
+            .query_row(
+                "SELECT outcome,events FROM public_terminals WHERE execution=?1",
+                [id],
+                |row| {
+                    Ok(PublicTerminal {
+                        outcome: row.get(0)?,
+                        events: row.get(1)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(db_error)
+    }
+    pub fn acknowledge_collection(&mut self, id: &str) -> io::Result<Execution> {
+        self.acknowledge_collection_events(id, None)
+    }
+    pub fn acknowledge_collection_events(
+        &mut self,
+        id: &str,
+        events: Option<&[u8]>,
+    ) -> io::Result<Execution> {
+        let mut record = self.get(id)?;
+        if !record.state.terminal() {
+            return Err(db_error(
+                "collection acknowledgement requires a terminal result",
+            ));
+        }
+        let transaction = self.connection.transaction().map_err(db_error)?;
+        if let Some(events) = events {
+            if transaction
+                .execute(
+                    "UPDATE public_terminals SET events=?1 WHERE execution=?2",
+                    params![events, id],
+                )
+                .map_err(db_error)?
+                != 1
+            {
+                return Err(db_error("terminal projection absent during collection"));
+            }
+        }
+        if !record.collected {
+            record.collected = true;
+            transaction
+                .execute(
+                    "UPDATE executions SET record=?1 WHERE id=?2",
+                    params![encoded(&record)?, id],
+                )
+                .map_err(db_error)?;
+        }
+        transaction.commit().map_err(db_error)?;
+        Ok(record)
+    }
+    pub fn native_output(&self, actor: &str, owner: &str) -> io::Result<Option<Vec<u8>>> {
+        self.connection
+            .query_row(
+                "SELECT source FROM native_outputs WHERE actor=?1 AND owner=?2",
+                params![actor, owner],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(db_error)
+    }
+    pub fn native_owner(&self, owner: &str) -> io::Result<Option<String>> {
+        self.connection
+            .query_row(
+                "SELECT actor FROM native_outputs WHERE owner=?1 LIMIT 1",
+                [owner],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(db_error)
+    }
+    pub fn bind_native_output(
+        &mut self,
+        actor: &str,
+        owner: &str,
+        source: &[u8],
+    ) -> io::Result<()> {
+        if self.native_owner(owner)?.is_some_and(|held| held != actor) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "native retention is already owned by another actor",
+            ));
+        }
+        if let Some(prior) = self.native_output(actor, owner)? {
+            if prior != source {
+                return Err(admission(AdmissionError::BindingConflict));
+            }
+            return Ok(());
+        }
+        self.connection
+            .execute(
+                "INSERT INTO native_outputs(actor,owner,source) VALUES(?1,?2,?3)",
+                params![actor, owner, source],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+    pub fn commit_public_terminal(
+        &mut self,
+        id: &str,
+        projection: PublicTerminal,
+    ) -> io::Result<PublicTerminal> {
+        if !self.get(id)?.state.terminal() {
+            return Err(db_error(
+                "terminal projection requires durable terminal custody",
+            ));
+        }
+        if let Some(prior) = self.public_terminal(id)? {
+            return Ok(prior);
+        }
+        self.connection
+            .execute(
+                "INSERT INTO public_terminals(execution,outcome,events) VALUES(?1,?2,?3)",
+                params![id, projection.outcome, projection.events],
+            )
+            .map_err(db_error)?;
+        Ok(projection)
+    }
+
+    pub fn accept_public(
+        &mut self,
+        context: SubmissionContext,
+        invocation: Invocation,
+    ) -> io::Result<Execution> {
+        self.accept_public_on_boot(context, invocation, "")
+    }
+    pub fn accept_public_on_boot(
+        &mut self,
+        context: SubmissionContext,
+        invocation: Invocation,
+        boot: &str,
+    ) -> io::Result<Execution> {
+        self.validate_workspace(&context.expected_workspace_id)?;
+        validate_scope(&context.actor, &context.request_id, &context.submission_id)?;
+        if !context.preparation_id.is_empty() {
+            let preparation = self
+                .preparation(&context.actor, &context.preparation_id)?
+                .ok_or_else(|| admission(AdmissionError::BindingConflict))?;
+            let installation = self
+                .installation(&context.actor, &preparation.installation)?
+                .ok_or_else(|| admission(AdmissionError::BindingConflict))?;
+            if installation.generation != invocation.generation {
+                return Err(admission(AdmissionError::BindingConflict));
+            }
+        }
+        // An escaped tuple is an unambiguous selector encoding, not a version/fingerprint gate.
+        let key = format!(
+            "public:{}",
+            encoded(&(context.actor.as_str(), context.submission_id.as_str()))?
+        );
+        self.accept_bound(&key, invocation, Some(context), boot)
+    }
+
+    /// A successful return is an acceptance receipt: FULL WAL commit precedes it.
+    /// Reusing a key with different semantics fails rather than silently replacing work.
+    pub fn accept(&mut self, key: &str, invocation: Invocation) -> io::Result<Execution> {
+        if key.is_empty() || key.len() > 512 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "idempotency key must contain 1..512 bytes",
+            ));
+        }
+        self.accept_bound(key, invocation, None, "")
+    }
+
+    fn accept_bound(
+        &mut self,
+        key: &str,
+        invocation: Invocation,
+        context: Option<SubmissionContext>,
+        boot: &str,
+    ) -> io::Result<Execution> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(db_error)?;
+        let mut prior: Option<String> = tx
+            .query_row(
+                "SELECT record FROM executions WHERE idempotency_key=?1",
+                [key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(db_error)?;
+        if let Some(context) = &context {
+            if prior.is_none() {
+                prior = public_prior(
+                    &tx,
+                    &context.actor,
+                    &context.request_id,
+                    &context.submission_id,
+                )?;
+            }
+        }
+        if let Some(prior) = prior {
+            let execution: Execution = serde_json::from_str(&prior).map_err(db_error)?;
+            if execution.invocation != invocation || execution.submission != context {
+                if context.is_some() {
+                    return Err(admission(AdmissionError::BindingConflict));
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "idempotency key already identifies a different invocation",
+                ));
+            }
+            return Ok(execution);
+        }
+        let execution = insert(&tx, key, invocation, context, boot, None)?;
+        tx.commit().map_err(db_error)?;
+        Ok(execution)
+    }
+
+    /// A run (`cozy.machine.v1` Run) accepted before its preparation: queued and waiting on
+    /// `PREPARING`, idempotent on (actor, id) by its spec digest. True when newly accepted.
+    pub fn accept_run(
+        &mut self,
+        actor: &str,
+        id: &str,
+        digest: &str,
+        invocation: Invocation,
+    ) -> io::Result<(Execution, bool)> {
+        self.accept_run_objects(actor, id, digest, invocation, &[])
+    }
+
+    /// `accept_run`, also referencing `objects` (tree members, a local source) the run needs.
+    pub fn accept_run_objects(
+        &mut self,
+        actor: &str,
+        id: &str,
+        digest: &str,
+        invocation: Invocation,
+        objects: &[tensorfs_core::ids::ObjectRef],
+    ) -> io::Result<(Execution, bool)> {
+        validate_scope(actor, id, id)?;
+        let key = format!("run:{}", encoded(&(actor, id))?);
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(db_error)?;
+        if update_run_reserved(&tx, actor, id)? {
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, "this run id names a software update"));
+        }
+        let prior: Option<String> = tx
+            .query_row(
+                "SELECT record FROM executions WHERE idempotency_key=?1",
+                [&key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(db_error)?;
+        if let Some(prior) = prior {
+            let execution: Execution = serde_json::from_str(&prior).map_err(db_error)?;
+            if execution.canceled_before_acceptance && execution.state == State::Canceled {
+                return Ok((execution, false));
+            }
+            if execution
+                .submission
+                .as_ref()
+                .map(|s| s.invocation_digest.as_str())
+                != Some(digest)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "this run id already names another run spec",
+                ));
+            }
+            return Ok((execution, false));
+        }
+        let context = SubmissionContext {
+            actor: actor.into(),
+            request_id: id.into(),
+            submission_id: id.into(),
+            expected_workspace_id: String::new(),
+            capture_digest: String::new(),
+            invocation_digest: digest.into(),
+            payload_digest: String::new(),
+            preparation_id: String::new(),
+        };
+        let execution = insert(&tx, &key, invocation, Some(context), "", Some(PREPARING))?;
+        reference_objects(&tx, &execution.id, objects)?;
+        tx.commit().map_err(db_error)?;
+        Ok((execution, true))
+    }
+
+    /// Reserves an absent run as canceled in the same transaction namespace as acceptance.
+    /// An accepted run is returned for normal cancellation; its spec/outcome is never replaced.
+    pub fn reserve_run_cancellation(&mut self, actor: &str, id: &str) -> io::Result<Execution> {
+        validate_scope(actor, id, id)?;
+        let key = format!("run:{}", encoded(&(actor, id))?);
+        let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(db_error)?;
+        if update_run_reserved(&tx, actor, id)? {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "software update runs do not support Control"));
+        }
+        if let Some(prior) = public_prior(&tx, actor, id, id)? {
+            return serde_json::from_str(&prior).map_err(db_error);
+        }
+        let context = SubmissionContext {
+            actor: actor.into(), request_id: id.into(), submission_id: id.into(),
+            ..Default::default()
+        };
+        let mut record = insert(&tx, &key, Invocation::default(), Some(context), "", None)?;
+        record.state = State::Canceled;
+        record.cancel_actor = Some(actor.into());
+        record.canceled_before_acceptance = true;
+        record.finished_at_ms = timestamp().max(0) as u64;
+        tx.execute("UPDATE executions SET record=?1,state='canceled',updated_ms=?2 WHERE id=?3",
+            params![encoded(&record)?, timestamp(), record.id]).map_err(db_error)?;
+        tx.commit().map_err(db_error)?;
+        Ok(record)
+    }
+
+    /// Updates keep their payload journal, but share actor/ID ownership with Run and CANCEL.
+    pub fn reserve_update_run(&mut self, actor: &str, id: &str) -> io::Result<()> {
+        validate_scope(actor, id, id)?;
+        let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(db_error)?;
+        if public_prior(&tx, actor, id, id)?.is_some() {
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, "this run id already names an ordinary run"));
+        }
+        tx.execute("INSERT OR IGNORE INTO update_run_ids(actor,id) VALUES(?1,?2)", params![actor, id])
+            .map_err(db_error)?;
+        tx.commit().map_err(db_error)
+    }
+
+    pub fn update_run_reserved(&self, actor: &str, id: &str) -> io::Result<bool> {
+        update_run_reserved(&self.connection, actor, id)
+    }
+
+    /// A preparing run's code and models are ready: it names them and becomes dispatchable.
+    /// The prepared run names its call; a memoized one answered (`answer`) completes with it.
+    pub fn bind_prepared(
+        &mut self,
+        id: &str,
+        invocation: Invocation,
+        preparation: &str,
+        memo: CallMemo,
+        answer: Option<ResultRecord>,
+    ) -> io::Result<Execution> {
+        self.update_with(
+            id,
+            None,
+            |record| {
+                if record.state != State::Queued
+                    || record.waiting_reason.as_deref() != Some(PREPARING)
+                {
+                    return Ok(false);
+                }
+                let (root, family) = (std::mem::take(&mut record.invocation.root), std::mem::take(&mut record.invocation.family));
+                record.invocation = Invocation { root, family, ..invocation };
+                if let Some(submission) = record.submission.as_mut() {
+                    submission.preparation_id = preparation.into();
+                }
+                record.waiting_reason = None;
+                record.memo = memo;
+                if let Some(result) = answer {
+                    record.state = State::Completed;
+                    record.result = Some(result);
+                }
+                Ok(true)
+            },
+            |tx, record| {
+                tx.execute(
+                    "UPDATE executions SET invocation=?1 WHERE id=?2",
+                    params![encoded(&record.invocation)?, record.id],
+                )
+                .map_err(db_error)?;
+                Ok(())
+            },
+        )
+    }
+
+    /// A preparing run ends without dispatch: a warm run's success or a preparation failure.
+    pub fn end_preparation(&mut self, id: &str, outcome: Outcome) -> io::Result<Execution> {
+        self.update(id, |record| {
+            if record.state != State::Queued || record.waiting_reason.as_deref() != Some(PREPARING)
+            {
+                return Ok(false);
+            }
+            match outcome {
+                Outcome::Completed(result) => {
+                    record.state = State::Completed;
+                    record.result = Some(result);
+                }
+                Outcome::Failed(reason) => {
+                    record.state = State::Failed;
+                    record.failure = Some(reason.encode());
+                }
+                Outcome::Canceled => record.state = State::Canceled,
+            }
+            record.waiting_reason = None;
+            Ok(true)
+        })
+    }
+
+    /// A restarted machine holds no preparation and no run's Hub token: each preparing run
+    /// ends FAILED (nothing of it was started). A job an older machine parked to wait ends
+    /// FAILED with the reason it waited on.
+    pub(crate) fn interrupt_preparations(&mut self) -> io::Result<()> {
+        let waiting: Vec<(String, String)> = {
+            let mut statement = self
+                .connection
+                .prepare("SELECT id, json_extract(record,'$.waiting_reason') FROM executions WHERE state='queued' AND json_extract(record,'$.waiting_reason') IS NOT NULL")
+                .map_err(db_error)?;
+            let rows = statement
+                .query_map([], |row| Ok((row.get::<_, i64>(0)?.to_string(), row.get::<_, String>(1)?)))
+                .map_err(db_error)?;
+            rows.collect::<Result<_, _>>().map_err(db_error)?
+        };
+        let (preparing, parked): (Vec<_>, Vec<_>) = waiting.into_iter().partition(|(_, reason)| reason == PREPARING);
+        for (id, reason) in parked {
+            self.fail_unstarted(&id, Failure::machine("environment_unavailable", reason))?;
+        }
+        for (id, _) in preparing {
+            let failure = Failure {
+                status: 3,
+                cause: 7,
+                origin: 3,
+                code: "preparation_interrupted".into(),
+                message: "the machine restarted while this run was preparing; run it again".into(),
+            };
+            self.end_preparation(&id, Outcome::Failed(failure))?;
+        }
+        Ok(())
+    }
+}
+
+/// A memoized call's success, reusable while this machine holds every file it names: its
+/// result record, keyed by its signer and computation. Each signer keeps its `MAX_HELD_MEMOS`
+/// most recently used.
+#[derive(Clone, Debug)]
+pub struct HeldMemo {
+    pub actor: String,
+    pub computation: String,
+    pub record: Vec<u8>,
+    pub objects: Vec<String>,
+}
+fn hold_memo(tx: &rusqlite::Transaction<'_>, held: &HeldMemo) -> io::Result<()> {
+    let HeldMemo { actor, computation, record, objects } = held;
+    tx.execute("INSERT OR REPLACE INTO held_memos(actor,computation,record,used_ms) VALUES(?1,?2,?3,?4)",
+        params![actor, computation, record, timestamp()]).map_err(db_error)?;
+    tx.execute("DELETE FROM held_memos WHERE actor=?1 AND computation NOT IN
+        (SELECT computation FROM held_memos WHERE actor=?1 ORDER BY used_ms DESC LIMIT ?2)",
+        params![actor, MAX_HELD_MEMOS]).map_err(db_error)?;
+    tx.execute("DELETE FROM held_memo_objects WHERE actor=?1 AND computation NOT IN
+        (SELECT computation FROM held_memos WHERE actor=?1)", params![actor]).map_err(db_error)?;
+    tx.execute("DELETE FROM held_memo_objects WHERE actor=?1 AND computation=?2", params![actor, computation])
+        .map_err(db_error)?;
+    for sha256 in objects {
+        tx.execute("INSERT OR IGNORE INTO held_memo_objects(actor,computation,sha256) VALUES(?1,?2,?3)",
+            params![actor, computation, sha256]).map_err(db_error)?;
+    }
+    Ok(())
+}
+
+fn touch_object(
+    tx: &rusqlite::Transaction<'_>,
+    object: &tensorfs_core::ids::ObjectRef,
+) -> io::Result<()> {
+    tensorfs_core::ids::hex64("run object", &object.sha256).map_err(db_error)?;
+    tx.execute(
+        "INSERT INTO object_uses(sha256,length,used_ms) VALUES(?1,?2,?3)
+        ON CONFLICT(sha256) DO UPDATE SET used_ms=excluded.used_ms",
+        params![object.sha256, object.length, timestamp()],
+    )
+    .map_err(db_error)?;
+    Ok(())
+}
+fn reference_objects(
+    tx: &rusqlite::Transaction<'_>,
+    execution: &str,
+    objects: &[tensorfs_core::ids::ObjectRef],
+) -> io::Result<()> {
+    for object in objects {
+        touch_object(tx, object)?;
+        tx.execute(
+            "INSERT OR IGNORE INTO run_objects(execution,sha256,length) VALUES(?1,?2,?3)",
+            params![execution, object.sha256, object.length],
+        )
+        .map_err(db_error)?;
+    }
+    Ok(())
+}
+
+/// The waiting reason of a run accepted before its preparation completes.
+pub const PREPARING: &str = "preparing";
+
+fn insert(
+    tx: &rusqlite::Transaction<'_>,
+    key: &str,
+    mut invocation: Invocation,
+    context: Option<SubmissionContext>,
+    boot: &str,
+    waiting: Option<&str>,
+) -> io::Result<Execution> {
+    if !invocation.parent.is_empty() {
+        let parent: String = tx
+            .query_row("SELECT record FROM executions WHERE id=?1", [&invocation.parent], |row| row.get(0))
+            .map_err(db_error)?;
+        let parent: Execution = serde_json::from_str(&parent).map_err(db_error)?;
+        invocation.root = parent.root_seq().to_string();
+        invocation.family = parent.family().unwrap_or_default().into();
+    }
+    let objects: Vec<_> = invocation
+        .inputs
+        .iter()
+        .filter_map(|input| {
+            Some(tensorfs_core::ids::ObjectRef {
+                sha256: input.digest.strip_prefix("sha256:")?.into(),
+                length: input.length,
+            })
+        })
+        .collect();
+    tx.execute("INSERT INTO executions(idempotency_key,invocation,record,state,updated_ms,actor,request_id,submission_id) VALUES(?1,?2,'{}','queued',?3,?4,?5,?6)", params![key, encoded(&invocation)?, timestamp(),context.as_ref().map(|context|context.actor.as_str()),context.as_ref().map(|context|context.request_id.as_str()),context.as_ref().map(|context|context.submission_id.as_str())]).map_err(db_error)?;
+    let execution = Execution {
+        id: tx.last_insert_rowid().to_string(),
+        idempotency_key: key.into(),
+        invocation,
+        submission: context,
+        state: State::Queued,
+        revision: 1,
+        accepted_at_ms: timestamp().max(0) as u64,
+        finished_at_ms: 0,
+        acceptance_boot_id: boot.into(),
+        collected: false,
+        revision_ceiling: 1,
+        attempt: 0,
+        waiting_reason: waiting.map(String::from),
+        process: None,
+        cancel_actor: None,
+        canceled_before_acceptance: false,
+        completed_units: 0,
+        progress: None,
+        running_revision: 0,
+        started_at_ms: 0,
+        executed_ms: 0,
+        executor: None,
+        result: None,
+        failure: None,
+        memo: CallMemo::default(),
+    };
+    tx.execute(
+        "UPDATE executions SET record=?1 WHERE id=?2",
+        params![encoded(&execution)?, execution.id],
+    )
+    .map_err(db_error)?;
+    reference_objects(tx, &execution.id, &objects)?;
+    Ok(execution)
+}
+
+impl Journal {
+    pub fn get(&self, id: &str) -> io::Result<Execution> {
+        let value: Option<String> = self
+            .connection
+            .query_row("SELECT record FROM executions WHERE id=?1", [id], |row| {
+                row.get(0)
+            })
+            .optional()
+            .map_err(db_error)?;
+        let value = value
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "execution does not exist"))?;
+        serde_json::from_str(&value).map_err(db_error)
+    }
+
+    pub fn get_public(&self, actor: &str, request_id: &str) -> io::Result<Execution> {
+        let value: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT record FROM executions WHERE actor=?1 AND request_id=?2",
+                params![actor, request_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(db_error)?;
+        serde_json::from_str(&value.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "public execution does not exist for this actor",
+            )
+        })?)
+        .map_err(db_error)
+    }
+
+    pub fn list_actor(&self, actor: &str, limit: usize) -> io::Result<Vec<Execution>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT record FROM executions WHERE actor=?1 ORDER BY id LIMIT ?2")
+            .map_err(db_error)?;
+        let records = statement
+            .query_map(params![actor, limit.min(i64::MAX as usize) as i64], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(db_error)?;
+        records
+            .map(|record| record.map_err(db_error))
+            .collect::<io::Result<Vec<_>>>()
+            .map(readable)
+    }
+
+    /// Closure is a durable acceptance tombstone, never implicit execution cancellation.
+    pub fn actor_page(
+        &self,
+        actor: &str,
+        after: u64,
+        before: u64,
+        newest: bool,
+        states: &[String],
+        limit: usize,
+    ) -> io::Result<Vec<Execution>> {
+        let states: Vec<&str> = states
+            .iter()
+            .map(|s| {
+                if s == "succeeded" {
+                    "completed"
+                } else {
+                    s.as_str()
+                }
+            })
+            .collect();
+        let sql=format!("SELECT record FROM executions WHERE actor=?1 AND id>?2 AND (?3=0 OR id<?3) AND (?4='[]' OR state IN (SELECT value FROM json_each(?4))) ORDER BY id {} LIMIT ?5",if newest{"DESC"}else{"ASC"});
+        let mut statement = self.connection.prepare(&sql).map_err(db_error)?;
+        let records = statement
+            .query_map(
+                params![
+                    actor,
+                    after.min(i64::MAX as u64) as i64,
+                    before.min(i64::MAX as u64) as i64,
+                    encoded(&states)?,
+                    limit.min(256) as i64
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(db_error)?;
+        records
+            .map(|record| record.map_err(db_error))
+            .collect::<io::Result<Vec<_>>>()
+            .map(readable)
+    }
+    pub fn actor_head(&self, actor: &str) -> io::Result<u64> {
+        self.connection
+            .query_row(
+                "SELECT COALESCE(MAX(id),0) FROM executions WHERE actor=?1",
+                [actor],
+                |r| r.get(0),
+            )
+            .map_err(db_error)
+    }
+    fn validate_workspace(&self, expected: &str) -> io::Result<()> {
+        if expected != self.workspace_id {
+            return Err(admission(AdmissionError::WorkspaceMismatch));
+        }
+        Ok(())
+    }
+
+    pub fn list(&self) -> io::Result<Vec<Execution>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT record FROM executions ORDER BY id")
+            .map_err(db_error)?;
+        let records = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(db_error)?;
+        records
+            .map(|record| record.map_err(db_error))
+            .collect::<io::Result<Vec<_>>>()
+            .map(readable)
+    }
+
+    /// Accepted history remains evidence of use even after every execution is terminal.
+    /// Whether a job (any run asked of this machine: a call, a warm-up, an upload) is queued or
+    /// running, and when the last one ended: `since` or later.
+    /// A record changed since `since` is the only one that can have stopped after it, so each
+    /// sample reads only what changed.
+    pub fn jobs(&self, since: i64) -> io::Result<(bool, i64)> {
+        self.connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM executions WHERE state IN ('queued','starting','running')),
+                 (SELECT MAX(json_extract(record,'$.finished_at_ms')) FROM executions
+                   WHERE updated_ms>=?1 AND state IN ('completed','failed','canceled'))",
+                [since],
+                |row| Ok((row.get(0)?, row.get::<_, Option<i64>>(1)?.unwrap_or(0).max(since))),
+            )
+            .map_err(db_error)
+    }
+
+    /// Record ownership before native begin, serialized with cancellation/attempt changes.
+    pub fn bind_derived_output(
+        &mut self,
+        execution: &str,
+        attempt: u32,
+        transaction: &str,
+        slot: &str,
+    ) -> io::Result<()> {
+        tensorfs_core::ids::prefixed("derived transaction", transaction).map_err(db_error)?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(db_error)?;
+        let raw: String = tx
+            .query_row(
+                "SELECT record FROM executions WHERE id=?1",
+                [execution],
+                |row| row.get(0),
+            )
+            .map_err(db_error)?;
+        let record: Execution = serde_json::from_str(&raw).map_err(db_error)?;
+        if record.state != State::Running
+            || record.attempt != attempt
+            || record.cancel_actor.is_some()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "native output attempt is no longer current",
+            ));
+        }
+        // A derivation replays for any run of the same code and inputs: an ended run's
+        // transaction passes to this one; a running one's stays its own.
+        let previous: Option<(String, String, String)> = tx.query_row("SELECT CAST(b.execution AS TEXT),b.slot,e.state FROM derived_output_bindings b JOIN executions e ON e.id=b.execution WHERE b.transaction_id=?1",[transaction],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).optional().map_err(db_error)?;
+        if previous.as_ref().is_some_and(|(run, output, state)| {
+            (run != execution || output != slot) && !matches!(state.as_str(), "completed" | "failed" | "canceled")
+        }) {
+            return Err(db_error(
+                "native output belongs to another unfinished execution or slot",
+            ));
+        }
+        tx.execute("INSERT INTO derived_output_bindings(transaction_id,execution,slot) VALUES(?1,?2,?3) ON CONFLICT(transaction_id) DO UPDATE SET execution=excluded.execution,slot=excluded.slot",params![transaction,execution,slot]).map_err(db_error)?;
+        tx.commit().map_err(db_error)
+    }
+
+    /// Explicitly canceled runs retain bindings until native cleanup has completed.
+    pub fn canceled_derived_outputs(&self) -> io::Result<Vec<DerivedOutputBinding>> {
+        let mut statement = self.connection.prepare("SELECT CAST(b.execution AS TEXT),b.transaction_id,b.slot FROM derived_output_bindings b JOIN executions e ON e.id=b.execution WHERE json_extract(e.record,'$.cancel_actor') IS NOT NULL ORDER BY b.execution,b.transaction_id").map_err(db_error)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(DerivedOutputBinding {
+                    execution: row.get(0)?,
+                    transaction: row.get(1)?,
+                    slot: row.get(2)?,
+                })
+            })
+            .map_err(db_error)?;
+        rows.map(|row| row.map_err(db_error)).collect()
+    }
+
+    pub fn derived_outputs(&self, execution: &str) -> io::Result<Vec<DerivedOutputBinding>> {
+        let mut statement=self.connection.prepare("SELECT CAST(execution AS TEXT),transaction_id,slot FROM derived_output_bindings WHERE execution=?1 ORDER BY transaction_id").map_err(db_error)?;
+        let rows = statement
+            .query_map([execution], |row| {
+                Ok(DerivedOutputBinding {
+                    execution: row.get(0)?,
+                    transaction: row.get(1)?,
+                    slot: row.get(2)?,
+                })
+            })
+            .map_err(db_error)?;
+        rows.map(|row| row.map_err(db_error)).collect()
+    }
+
+    pub fn release_derived_output_binding(&self, binding: &DerivedOutputBinding) -> io::Result<()> {
+        self.connection.execute("DELETE FROM derived_output_bindings WHERE execution=?1 AND transaction_id=?2 AND slot=?3",params![binding.execution,binding.transaction,binding.slot]).map_err(db_error)?;
+        Ok(())
+    }
+    /// Every run not completed, failed or canceled: unknown states too. A row
+    /// that does not decode is an error here, where a missed run is a model evicted.
+    pub fn unfinished(&self) -> io::Result<Vec<Execution>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT record FROM executions WHERE state NOT IN ('completed','failed','canceled') ORDER BY id")
+            .map_err(db_error)?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(db_error)?;
+        rows.map(|row| serde_json::from_str(&row.map_err(db_error)?).map_err(db_error))
+            .collect()
+    }
+
+    pub fn nonterminal(&self, limit: usize) -> io::Result<Vec<Execution>> {
+        self.selected("SELECT record FROM executions WHERE state IN ('queued','starting','running') ORDER BY id LIMIT ?1", limit)
+    }
+
+    pub fn active(&self, limit: usize) -> io::Result<Vec<Execution>> {
+        self.selected("SELECT record FROM executions WHERE state IN ('starting','running') ORDER BY id LIMIT ?1", limit)
+    }
+
+    /// Every run ready to dispatch, by its root's acceptance, then its own.
+    pub fn ready(&self) -> io::Result<Vec<Execution>> {
+        let mut statement = self.connection.prepare("SELECT record FROM executions WHERE state='queued' AND json_extract(record,'$.waiting_reason') IS NULL ORDER BY CAST(COALESCE(NULLIF(json_extract(record,'$.invocation.root'),''),id) AS INTEGER), id").map_err(db_error)?;
+        let records = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(db_error)?;
+        records
+            .map(|record| record.map_err(db_error))
+            .collect::<io::Result<Vec<_>>>()
+            .map(readable)
+    }
+
+    /// Includes terminal requests: their retained executor may still own a context.
+    /// Read only birth metadata in bounded pages, never materialize old results.
+    pub fn gpu_births_after(
+        &self,
+        after: u64,
+        limit: usize,
+    ) -> io::Result<Vec<(u64, ProcessBirth)>> {
+        let mut statement = self.connection.prepare("SELECT id,json_extract(record,'$.process') FROM executions WHERE id>?1 AND (json_extract(record,'$.invocation.degree')>0) AND json_extract(record,'$.process') IS NOT NULL ORDER BY id LIMIT ?2").map_err(db_error)?;
+        let rows = statement
+            .query_map(
+                params![
+                    after.min(i64::MAX as u64) as i64,
+                    limit.min(i64::MAX as usize) as i64
+                ],
+                |row| Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .map_err(db_error)?;
+        rows.map(|row| {
+            let (id, birth) = row.map_err(db_error)?;
+            Ok((id, serde_json::from_str(&birth).map_err(db_error)?))
+        })
+        .collect()
+    }
+
+    fn selected(&self, query: &str, limit: usize) -> io::Result<Vec<Execution>> {
+        let mut statement = self.connection.prepare(query).map_err(db_error)?;
+        let records = statement
+            .query_map([limit.min(i64::MAX as usize) as i64], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(db_error)?;
+        records
+            .map(|record| record.map_err(db_error))
+            .collect::<io::Result<Vec<_>>>()
+            .map(readable)
+    }
+
+    fn update(
+        &mut self,
+        id: &str,
+        change: impl FnOnce(&mut Execution) -> io::Result<bool>,
+    ) -> io::Result<Execution> {
+        self.update_observed(id, None, change)
+    }
+
+    fn update_observed(
+        &mut self,
+        id: &str,
+        progress: Option<&ProgressSnapshot>,
+        change: impl FnOnce(&mut Execution) -> io::Result<bool>,
+    ) -> io::Result<Execution> {
+        self.update_with(id, progress, change, |_, _| Ok(()))
+    }
+
+    /// One durable transition; `also` writes in the same transaction, after the record has
+    /// its new revision, only when the transition changed it.
+    fn update_with(
+        &mut self,
+        id: &str,
+        progress: Option<&ProgressSnapshot>,
+        change: impl FnOnce(&mut Execution) -> io::Result<bool>,
+        also: impl FnOnce(&rusqlite::Transaction<'_>, &Execution) -> io::Result<()>,
+    ) -> io::Result<Execution> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(db_error)?;
+        let record: Option<String> = tx
+            .query_row("SELECT record FROM executions WHERE id=?1", [id], |row| {
+                row.get(0)
+            })
+            .optional()
+            .map_err(db_error)?;
+        let mut record: Execution =
+            serde_json::from_str(&record.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "execution does not exist")
+            })?)
+            .map_err(db_error)?;
+        if record.state == State::Unknown {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "execution state was written by a newer machine",
+            ));
+        }
+        let was_terminal = record.state.terminal();
+        let running_since = (record.state == State::Running).then_some(record.started_at_ms);
+        let changed = change(&mut record)?;
+        if let Some(since) = running_since.filter(|&s| s > 0 && record.state != State::Running) {
+            let now = timestamp().max(0) as u64;
+            record.executed_ms += now.saturating_sub(since);
+        }
+        let observed =
+            !was_terminal && progress.is_some_and(|progress| progress.overlay(&mut record));
+        if changed || observed {
+            if record.state.terminal() && record.finished_at_ms == 0 {
+                record.finished_at_ms = timestamp().max(0) as u64;
+            }
+            // Every durable mutation jumps past all volatile cursors the former owner
+            // could have published, even when its progress snapshot was lost.
+            record.revision = record
+                .revision
+                .max(record.revision_ceiling)
+                .checked_add(1)
+                .ok_or_else(|| db_error("execution observation cursor exhausted"))?;
+            record.revision_ceiling = if record.observed() {
+                record
+                    .revision
+                    .checked_add(REVISION_WINDOW)
+                    .ok_or_else(|| db_error("execution observation cursor exhausted"))?
+            } else {
+                record.revision
+            };
+            tx.execute(
+                "UPDATE executions SET record=?1,state=?2,updated_ms=?3 WHERE id=?4",
+                params![encoded(&record)?, record.state.name(), timestamp(), id],
+            )
+            .map_err(db_error)?;
+            also(&tx, &record)?;
+        }
+        tx.commit().map_err(db_error)?;
+        Ok(record)
+    }
+
+    /// Journal one product on a started execution's output log. Its event sequence is the
+    /// transition's revision, so products interleave with every other observed change.
+    pub fn append_product(
+        &mut self,
+        id: &str,
+        progress: Option<&ProgressSnapshot>,
+        product: &[u8],
+    ) -> io::Result<u64> {
+        let record = self.update_with(
+            id,
+            progress,
+            |record| {
+                if record.state.terminal() || record.state == State::Queued {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "only a running execution publishes products",
+                    ));
+                }
+                Ok(true)
+            },
+            |tx, record| {
+                tx.execute(
+                    "INSERT INTO run_products(execution,sequence,at_ms,product) VALUES(?1,?2,?3,?4)",
+                    params![id, record.revision as i64, timestamp(), product],
+                )
+                .map_err(db_error)?;
+                Ok(())
+            },
+        )?;
+        Ok(record.revision)
+    }
+
+    /// One line of the run's log the machine itself writes (a `log` event: a warning about
+    /// its request), at the next sequence.
+    pub fn append_log(
+        &mut self,
+        id: &str,
+        progress: Option<&ProgressSnapshot>,
+        line: &[u8],
+    ) -> io::Result<u64> {
+        self.append_entry("INSERT INTO run_logs(execution,sequence,at_ms,record) VALUES(?1,?2,?3,?4)", id, progress, line)
+    }
+    /// A package's log line on a root run's log while the log holds fewer than
+    /// `PACKAGE_LOG_LINES` lines and the line fits in `PACKAGE_LOG_BYTES`; past that, one
+    /// `PACKAGE_LOG_DROPPED` notice and nothing more. True when a line was written.
+    pub fn append_package_log(
+        &mut self,
+        root: &str,
+        progress: Option<&ProgressSnapshot>,
+        line: &[u8],
+    ) -> io::Result<bool> {
+        let (lines, bytes): (u64, u64) = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*),COALESCE(SUM(LENGTH(record)),0) FROM run_logs WHERE execution=?1",
+                [root],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(db_error)?;
+        if lines < PACKAGE_LOG_LINES && bytes + line.len() as u64 <= PACKAGE_LOG_BYTES {
+            self.append_log(root, progress, line)?;
+            return Ok(true);
+        }
+        let noticed: bool = self
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM run_logs WHERE execution=?1 AND record=?2)",
+                params![root, PACKAGE_LOG_DROPPED],
+                |row| row.get(0),
+            )
+            .map_err(db_error)?;
+        if noticed {
+            return Ok(false);
+        }
+        self.append_log(root, progress, PACKAGE_LOG_DROPPED)?;
+        Ok(true)
+    }
+    /// A call of the run applied its attention pin: the pin is the root run's, whichever call
+    /// holds the attention sites.
+    pub fn apply_attention(&mut self, id: &str) -> io::Result<()> {
+        let root = self.get(id)?.root_seq().to_string();
+        self.connection
+            .execute(
+                "INSERT OR IGNORE INTO attention_applied(execution) VALUES(?1)",
+                [&root],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+    /// A root run completing with a pin none of its calls applied says so in its log: an
+    /// unused request field warns, never fails.
+    pub fn warn_unapplied_attention(
+        &mut self,
+        id: &str,
+        progress: Option<&ProgressSnapshot>,
+    ) -> io::Result<()> {
+        let record = self.get(id)?;
+        let pin = &record.invocation.attention_kernel;
+        if pin.is_empty() || !record.invocation.parent.is_empty() || record.state.terminal() {
+            return Ok(());
+        }
+        let applied: bool = self
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM attention_applied WHERE execution=?1)",
+                [id],
+                |row| row.get(0),
+            )
+            .map_err(db_error)?;
+        if applied {
+            return Ok(());
+        }
+        let text = format!("attention pin {pin} was never applied");
+        let line = serde_json::to_vec(&serde_json::json!({"level": "warning", "text": text}))?;
+        self.append_log(id, progress, &line).map(drop)
+    }
+    fn append_entry(
+        &mut self,
+        insert: &str,
+        id: &str,
+        progress: Option<&ProgressSnapshot>,
+        entry: &[u8],
+    ) -> io::Result<u64> {
+        let record = self.update_with(
+            id,
+            progress,
+            |record| Ok(!record.state.terminal()),
+            |tx, record| {
+                tx.execute(insert, params![id, record.revision as i64, timestamp(), entry])
+                    .map_err(db_error)?;
+                Ok(())
+            },
+        )?;
+        Ok(record.revision)
+    }
+    /// One settled call of the run (a `call` event: a child run, or an effect such as its
+    /// weights publication) at the next sequence, once per `call`; None when it is already
+    /// in the log or the run has ended.
+    pub fn append_call(
+        &mut self,
+        id: &str,
+        progress: Option<&ProgressSnapshot>,
+        call: &str,
+        body: &[u8],
+    ) -> io::Result<Option<u64>> {
+        let known: bool = self
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM run_calls WHERE execution=?1 AND call=?2)",
+                params![id, call],
+                |row| row.get(0),
+            )
+            .map_err(db_error)?;
+        if known {
+            return Ok(None);
+        }
+        let mut appended = false;
+        let record = self.update_with(
+            id,
+            progress,
+            |record| Ok(!record.state.terminal()),
+            |tx, record| {
+                appended = true;
+                tx.execute(
+                    "INSERT INTO run_calls(execution,sequence,at_ms,call,record) VALUES(?1,?2,?3,?4,?5)",
+                    params![id, record.revision as i64, timestamp(), call, body],
+                )
+                .map_err(db_error)?;
+                Ok(())
+            },
+        )?;
+        Ok(appended.then_some(record.revision))
+    }
+    pub fn calls(&self, id: &str) -> io::Result<Vec<StoredProduct>> {
+        self.stored(
+            "SELECT sequence,at_ms,record FROM run_calls WHERE execution=?1 ORDER BY sequence",
+            id,
+        )
+    }
+    pub fn logs(&self, id: &str) -> io::Result<Vec<StoredProduct>> {
+        self.stored(
+            "SELECT sequence,at_ms,record FROM run_logs WHERE execution=?1 ORDER BY sequence",
+            id,
+        )
+    }
+
+    /// What the execution's executor measured of its latest attempt (`run show`).
+    pub fn record_measurements(&mut self, id: &str, measurements: &[u8]) -> io::Result<()> {
+        self.connection
+            .execute(
+                "INSERT INTO run_measurements(execution,measurements) VALUES(?1,?2)
+                 ON CONFLICT(execution) DO UPDATE SET measurements=excluded.measurements",
+                params![id, measurements],
+            )
+            .map(drop)
+            .map_err(db_error)
+    }
+    pub fn measurements(&self, id: &str) -> io::Result<Option<Vec<u8>>> {
+        self.connection
+            .query_row(
+                "SELECT measurements FROM run_measurements WHERE execution=?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(db_error)
+    }
+
+    /// The execution's output log, oldest first.
+    pub fn products(&self, id: &str) -> io::Result<Vec<StoredProduct>> {
+        self.stored(
+            "SELECT sequence,at_ms,product FROM run_products WHERE execution=?1 ORDER BY sequence",
+            id,
+        )
+    }
+    fn stored(&self, query: &str, id: &str) -> io::Result<Vec<StoredProduct>> {
+        let mut statement = self.connection.prepare(query).map_err(db_error)?;
+        let rows = statement
+            .query_map([id], |row| {
+                Ok(StoredProduct {
+                    sequence: row.get::<_, i64>(0)? as u64,
+                    at_ms: row.get::<_, i64>(1)? as u64,
+                    product: row.get(2)?,
+                })
+            })
+            .map_err(db_error)?;
+        rows.collect::<Result<_, _>>().map_err(db_error)
+    }
+
+    /// Only one dispatcher can claim a never-started attempt.
+    pub fn claim(&mut self, id: &str) -> io::Result<bool> {
+        let mut claimed = false;
+        self.update(id, |record| {
+            if record.state != State::Queued {
+                return Ok(false);
+            }
+            record.state = State::Starting;
+            record.attempt += 1;
+            record.waiting_reason = None;
+            claimed = true;
+            Ok(true)
+        })?;
+        Ok(claimed)
+    }
+
+    /// A never-authorized attempt the machine's own restart interrupted is dispatched again at
+    /// once: nothing of it ran, and the restart was not its failure. Called after exact
+    /// termination.
+    pub fn requeue_unstarted(&mut self, id: &str) -> io::Result<Execution> {
+        self.update(id, |record| {
+            if record.state != State::Starting {
+                return Err(db_error(
+                    "only a never-authorized attempt may return to queued",
+                ));
+            }
+            record.process = None;
+            record.waiting_reason = None;
+            record.state = if record.cancel_actor.is_some() {
+                State::Canceled
+            } else {
+                State::Queued
+            };
+            Ok(true)
+        })
+    }
+
+    /// A job that cannot start ends FAILED with its reason, never parked to wait or queued to
+    /// fail again: every job ends completed or failed, and the user resubmits.
+    pub fn fail_unstarted(&mut self, id: &str, failure: Failure) -> io::Result<Execution> {
+        self.update(id, |record| {
+            if !matches!(record.state, State::Queued | State::Starting) {
+                return Ok(false);
+            }
+            record.process = None;
+            record.waiting_reason = None;
+            record.state = if record.cancel_actor.is_some() {
+                State::Canceled
+            } else {
+                record.failure = Some(failure.clone().encode());
+                State::Failed
+            };
+            Ok(true)
+        })
+    }
+
+    /// Authorized, but the request never reached a handler: a retained executor's channel was
+    /// gone before Invoke (PrepareRequest enters none). After its exact termination the attempt
+    /// stays claimed, back to awaiting its first executor.
+    pub fn redeliver(&mut self, id: &str) -> io::Result<Execution> {
+        self.update(id, |record| {
+            if !matches!(record.state, State::Starting | State::Running) {
+                return Err(db_error("only an active attempt is redelivered"));
+            }
+            record.process = None;
+            record.executor = None;
+            record.started_at_ms = 0;
+            record.state = if record.cancel_actor.is_some() {
+                State::Canceled
+            } else {
+                State::Starting
+            };
+            Ok(true)
+        })
+    }
+
+    /// Called once the attempt's executor exists, before its Invoke.
+    pub fn register_process(&mut self, id: &str, process: ProcessBirth) -> io::Result<Execution> {
+        self.update(id, |record| {
+            if record.state != State::Starting || record.process.is_some() {
+                return Err(db_error("attempt is not awaiting its first executor"));
+            }
+            record.process = Some(process);
+            Ok(true)
+        })
+    }
+
+    pub fn running(&mut self, id: &str, executor: Option<ExecutorFacts>) -> io::Result<Execution> {
+        self.update(id, |record| {
+            if record.state != State::Starting || record.process.is_none() {
+                return Err(db_error("attempt has no registered executor"));
+            }
+            if record.cancel_actor.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "stopped before package start authorization",
+                ));
+            }
+            record.state = State::Running;
+            record.running_revision = record.revision.max(record.revision_ceiling) + 1;
+            record.started_at_ms = timestamp().max(0) as u64;
+            record.executor = executor;
+            Ok(true)
+        })
+    }
+
+    /// Reserve another cursor window only when the previous one is exhausted.
+    /// This rare allocation commit is not a per-event telemetry write.
+    pub fn reserve_observations(
+        &mut self,
+        id: &str,
+        progress: Option<&ProgressSnapshot>,
+    ) -> io::Result<Execution> {
+        self.update_observed(id, progress, |record| {
+            if !record.observed() {
+                return Err(db_error(
+                    "only running or preparing executions reserve observation cursors",
+                ));
+            }
+            Ok(true)
+        })
+    }
+
+    pub fn cancel(&mut self, id: &str, actor: &str) -> io::Result<Execution> {
+        self.cancel_observed(id, actor, None)
+    }
+
+    pub fn cancel_observed(
+        &mut self,
+        id: &str,
+        actor: &str,
+        progress: Option<&ProgressSnapshot>,
+    ) -> io::Result<Execution> {
+        if actor.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cancellation requires an actor",
+            ));
+        }
+        self.update_observed(id, progress, |record| {
+            if record.state.terminal() || record.cancel_actor.is_some() {
+                return Ok(false);
+            }
+            record.cancel_actor = Some(actor.into());
+            if record.state == State::Queued {
+                record.state = State::Canceled;
+                record.finished_at_ms = timestamp().max(0) as u64;
+            }
+            Ok(true)
+        })
+    }
+
+    /// A run's children that have not finished.
+    pub fn children(&self, parent: &str) -> io::Result<Vec<Execution>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT record FROM executions WHERE state IN ('queued','starting','running') AND json_extract(invocation,'$.parent')=?1 ORDER BY id")
+            .map_err(db_error)?;
+        let records = statement
+            .query_map([parent], |row| row.get::<_, String>(0))
+            .map_err(db_error)?;
+        records
+            .map(|record| record.map_err(db_error))
+            .collect::<io::Result<Vec<_>>>()
+            .map(readable)
+    }
+
+    /// Caller must prove process termination and durable artifact custody first.
+    pub fn finish(&mut self, id: &str, outcome: Outcome) -> io::Result<Execution> {
+        self.finish_observed(id, outcome, None, None)
+    }
+
+    /// The run ends; a memoizable success's `held` memo is held in the same transaction.
+    pub fn finish_observed(
+        &mut self,
+        id: &str,
+        outcome: Outcome,
+        progress: Option<&ProgressSnapshot>,
+        held: Option<HeldMemo>,
+    ) -> io::Result<Execution> {
+        let hold = |tx: &rusqlite::Transaction<'_>, record: &Execution| match held {
+            Some(held) if record.state == State::Completed => hold_memo(tx, &held),
+            _ => Ok(()),
+        };
+        self.update_with(id, progress, |record| {
+            if record.state.terminal() {
+                return Ok(false);
+            }
+            if record.state == State::Queued {
+                return Err(db_error("unstarted attempt cannot finish"));
+            }
+            match outcome {
+                Outcome::Completed(result) => {
+                    record.state = State::Completed;
+                    record.result = Some(result);
+                }
+                Outcome::Failed(reason) => {
+                    record.state = State::Failed;
+                    record.failure = Some(reason.encode());
+                }
+                Outcome::Canceled => {
+                    if record.cancel_actor.is_none() {
+                        return Err(db_error("an attempt cannot cancel without durable authority"));
+                    }
+                    record.state = State::Canceled;
+                }
+            }
+            record.finished_at_ms = timestamp().max(0) as u64;
+            Ok(true)
+        }, hold)
+    }
+}
+
+/// A retained failure carries its stable code separately from its plain detail.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct Failure {
+    pub status: u8,
+    pub cause: u8,
+    pub origin: u8,
+    pub code: String,
+    pub message: String,
+}
+impl Failure {
+    pub fn executor(terminal: &str, origin: &str, code: &str, message: &str) -> Self {
+        let (status, cause, origin) = match (terminal, origin, code) {
+            ("refused", ..) | (_, "request", _) => (2, 1, 6),
+            (_, "runtime", _) | (_, _, "device_out_of_memory") => (3, 7, 2),
+            (_, "author", _) => (3, 6, 1),
+            _ => (3, 7, 3),
+        };
+        let (code, message) = if code == "device_out_of_memory" && status != 2 {
+            (
+                "accepted_envelope_breach".to_string(),
+                format!("device_out_of_memory: {message}"),
+            )
+        } else {
+            (code.to_string(), message.to_string())
+        };
+        Self {
+            status,
+            cause,
+            origin,
+            code,
+            message,
+        }
+    }
+    pub fn machine(code: &str, message: impl Into<String>) -> Self {
+        Self {
+            status: 3,
+            cause: 7,
+            origin: 3,
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+    pub fn abandoned(why: &str) -> Self {
+        Self {
+            status: 5,
+            cause: 16,
+            origin: 3,
+            code: "executor_invalidated".into(),
+            message: why.into(),
+        }
+    }
+    pub fn custody(why: &str) -> Self {
+        Self {
+            status: 3,
+            cause: 10,
+            origin: 4,
+            code: "result_custody_failed".into(),
+            message: why.into(),
+        }
+    }
+    pub fn encode(&self) -> String {
+        serde_json::to_string(self).expect("failure fields are JSON strings and integers")
+    }
+    pub fn decode(text: &str) -> io::Result<Self> {
+        serde_json::from_str(text).map_err(db_error)
+    }
+}
+impl std::fmt::Display for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code, self.message)
+    }
+}
+
+pub enum Outcome {
+    Completed(ResultRecord),
+    Failed(Failure),
+    Canceled,
+}
+
+fn validate_scope(actor: &str, request_id: &str, submission_id: &str) -> io::Result<()> {
+    if [actor, request_id, submission_id]
+        .iter()
+        .any(|value| value.is_empty() || value.len() > 512)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "actor, request and submission identities must contain 1..512 bytes",
+        ));
+    }
+    Ok(())
+}
+
+fn public_prior(
+    tx: &rusqlite::Transaction<'_>,
+    actor: &str,
+    request_id: &str,
+    submission_id: &str,
+) -> io::Result<Option<String>> {
+    let request: Option<String> = tx
+        .query_row(
+            "SELECT record FROM executions WHERE actor=?1 AND request_id=?2",
+            params![actor, request_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(db_error)?;
+    if request.is_some() {
+        return Ok(request);
+    }
+    tx.query_row(
+        "SELECT record FROM executions WHERE actor=?1 AND submission_id=?2",
+        params![actor, submission_id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(db_error)
+}
+
+fn update_run_reserved(connection: &Connection, actor: &str, id: &str) -> io::Result<bool> {
+    connection.query_row("SELECT EXISTS(SELECT 1 FROM update_run_ids WHERE actor=?1 AND id=?2)",
+        params![actor, id], |row| row.get(0)).map_err(db_error)
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
+}
+
+#[cfg(test)]
+mod failure_message_tests {
+    use super::*;
+
+    #[test]
+    fn nested_typed_failures_preserve_plain_details() {
+        let code = "model_choice_absent";
+        let detail = "the run names no model for generate_image.models.model";
+        let mut failure = Failure::executor("failed", "author", code, detail);
+        for _ in 0..3 {
+            failure = Failure::decode(&failure.encode()).unwrap();
+            assert_eq!(failure.code, code);
+            assert_eq!(failure.message, detail);
+            failure = Failure::executor("failed", "author", &failure.code, &failure.message);
+        }
+        assert_eq!(failure.to_string(), format!("{code}: {detail}"));
+    }
+
+    #[test]
+    fn current_decoder_rejects_unstructured_formats_and_preserves_literal_details() {
+        assert!(Failure::decode("model_choice_absent: detail").is_err());
+        assert!(Failure::decode(
+            r#"{"status":3,"cause":7,"origin":3,"message":"model_choice_absent: detail"}"#
+        )
+        .is_err());
+        let detail = "the field literally contains model_choice_absent: keep this";
+        let failure = Failure::machine("model_choice_absent", detail);
+        assert_eq!(Failure::decode(&failure.encode()).unwrap().message, detail);
+    }
+
+    #[test]
+    fn refused_oom_keeps_its_request_code_without_an_accepted_breach() {
+        for (terminal, origin) in [("refused", "runtime"), ("failed", "request")] {
+            let failure = Failure::executor(terminal, origin, "device_out_of_memory", "too large");
+            assert_eq!((failure.status, failure.cause, failure.origin), (2, 1, 6));
+            assert_eq!(failure.code, "device_out_of_memory");
+            assert_eq!(failure.message, "too large");
+        }
+        let accepted = Failure::executor("failed", "runtime", "device_out_of_memory", "GPU full");
+        assert_eq!(accepted.code, "accepted_envelope_breach");
+        assert_eq!(accepted.message, "device_out_of_memory: GPU full");
+    }
+}
