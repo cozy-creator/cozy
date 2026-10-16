@@ -1,0 +1,32 @@
+name: release-gate
+# dist local-artifacts job (dist-workspace.toml): a release needs a green platforms.yaml run on its own
+# commit that covered every release runner. A dry run reports the verdict without refusing.
+on:
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
+
+jobs:
+  platforms:
+    runs-on: ubuntu-24.04
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.sha }}
+          REF: ${{ github.ref_name }}
+          TAG: ${{ github.event.inputs.tag }}
+          RUNNERS: ubuntu-24.04 ubuntu-24.04-arm macos-15 windows-2025 windows-11-arm
+        run: |
+          for id in $(gh run list -R "$GITHUB_REPOSITORY" -w platforms.yaml --commit "$SHA" --status success -L 50 --json databaseId -q '.[].databaseId'); do
+            green=" $(gh run view "$id" -R "$GITHUB_REPOSITORY" --json jobs -q '[.jobs[] | select(.conclusion == "success") | .name] | join(" ")') "
+            missing=$(for r in $RUNNERS; do case $green in *" $r "*) ;; *) printf '%s ' "$r" ;; esac; done)
+            if [ -z "$missing" ]; then
+              echo "platforms: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$id" | tee -a "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+          done
+          msg="no green platforms.yaml run on $SHA covers $RUNNERS; run: gh workflow run platforms.yaml --ref $REF"
+          if [ -n "$TAG" ] && [ "$TAG" != dry-run ]; then echo "::error::$msg"; exit 1; fi
+          echo "::warning::$msg"
