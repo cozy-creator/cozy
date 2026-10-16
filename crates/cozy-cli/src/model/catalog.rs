@@ -9,7 +9,6 @@ use serde::Serialize;
 use super::refs::{Repo, label};
 use super::{Family, Info, Search};
 use crate::Context;
-use crate::context::hub;
 use crate::output::{self, Record, Table};
 
 /// One search row: the model's first available release in the Hub's order, and its lanes.
@@ -47,36 +46,29 @@ fn found(card: &ModelCard) -> Found {
 }
 
 pub(crate) async fn search(ctx: &Context, args: Search) -> Result<ExitCode, Error> {
-    let at = ctx.hub()?;
-    let client = ctx.hub_anonymous(&at)?;
+    let client = ctx.hub_anonymous(&ctx.hub()?)?;
     let exact = match (&args.family, args.query.as_slice()) {
         (None, [one]) => Repo::parse(one).ok(),
         _ => None,
     };
     let (cards, total) = match exact {
-        Some(repo) => (vec![hub(client.get_model(&repo.org, &repo.name).await)?], 1),
+        Some(repo) => (vec![ctx.hub_answer(client.get_model(&repo.org, &repo.name).await)?], 1),
         None => {
             let query = args.query.join(" ");
-            let answer = hub(
-                client
-                    .search_models(
-                        args.family.as_deref(),
-                        Some(args.limit.into()),
-                        Some(query.as_str()).filter(|q| !q.is_empty()),
-                    )
-                    .await,
-            )?;
-            let mut cards = tokio::task::JoinSet::new();
+            let q = Some(query.as_str()).filter(|q| !q.is_empty());
+            let answer = ctx.hub_answer(client.search_models(args.family.as_deref(), Some(args.limit.into()), q).await)?;
+            // One card read per model, all at once.
+            let mut reads = tokio::task::JoinSet::new();
             for (i, model) in answer.models.into_iter().take(args.limit as usize).enumerate() {
                 let client = client.clone();
-                cards.spawn(async move { (i, hub(client.get_model(&model.org, &model.name).await)) });
+                reads.spawn(async move { (i, client.get_model(&model.org, &model.name).await) });
             }
-            let mut ordered = BTreeMap::new();
-            while let Some(joined) = cards.join_next().await {
-                let (i, card) = joined.map_err(|e| Error::new(Kind::Internal, "join", e.to_string()))?;
-                ordered.insert(i, card?);
+            let mut cards = BTreeMap::new();
+            while let Some(read) = reads.join_next().await {
+                let (i, card) = read.map_err(|e| Error::new(Kind::Internal, "card_read", e.to_string()))?;
+                cards.insert(i, ctx.hub_answer(card)?);
             }
-            (ordered.into_values().collect(), answer.search.total)
+            (cards.into_values().collect(), answer.search.total)
         }
     };
     let view = Searched {
@@ -84,25 +76,23 @@ pub(crate) async fn search(ctx: &Context, args: Search) -> Result<ExitCode, Erro
         total,
     };
     if ctx.json {
-        return output::json(&view);
+        output::json(&view);
+        return Ok(ExitCode::SUCCESS);
     }
-    let mut table = Table::new(ctx, &["model", "family", "release", "lanes"]);
+    let mut table = Table::new(ctx, ["model", "family", "release", "lanes"]);
     for row in &view.models {
-        table = table.row(vec![
-            row.model.clone(),
-            row.family.clone().unwrap_or_default(),
-            row.release.clone().unwrap_or_default(),
-            row.lanes.join(", "),
-        ]);
+        let lanes = row.lanes.join(", ");
+        let family = row.family.as_deref().unwrap_or("-");
+        table = table.row([row.model.as_str(), family, row.release.as_deref().unwrap_or("-"), &lanes]);
     }
-    table.print();
     let shown = view.models.len() as i64;
     if total > shown {
-        output::note(ctx, &format!("{shown} of {total} matching models; raise --limit or narrow the search"));
+        table = table.note(format!("{shown} of {total} matching models: raise --limit or narrow the search"));
     }
+    table.print();
     match view.models.first() {
-        Some(first) => output::next(ctx, &[format!("cozy model info {}", first.model)]),
-        None => output::next(ctx, &["cozy model search".to_owned()]),
+        Some(first) => output::next(ctx, &[&format!("cozy model info {}", first.model)]),
+        None => output::next(ctx, &["cozy model search"]),
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -139,8 +129,8 @@ pub(crate) async fn info(ctx: &Context, args: Info) -> Result<ExitCode, Error> {
         None => (args.model.as_str(), None),
     };
     let repo = Repo::parse(name)?;
-    let at = ctx.hub()?;
-    let card = hub(ctx.hub_anonymous(&at)?.get_model(&repo.org, &repo.name).await)?;
+    let client = ctx.hub_anonymous(&ctx.hub()?)?;
+    let card = ctx.hub_answer(client.get_model(&repo.org, &repo.name).await)?;
     let releases: Vec<Release> = card
         .releases
         .iter()
@@ -164,12 +154,8 @@ pub(crate) async fn info(ctx: &Context, args: Info) -> Result<ExitCode, Error> {
         })
         .collect();
     if let Some(release) = selected.filter(|_| releases.is_empty()) {
-        return Err(Error::new(
-            Kind::NotFound,
-            "model_release_not_found",
-            format!("{repo} has no release {release:?}"),
-        )
-        .next(format!("cozy model info {repo}")));
+        return Err(Error::new(Kind::NotFound, "model_release_not_found", format!("{repo} has no release {release:?}"))
+            .next(format!("cozy model info {repo}")));
     }
     let view = Detail {
         model: repo.to_string(),
@@ -178,20 +164,20 @@ pub(crate) async fn info(ctx: &Context, args: Info) -> Result<ExitCode, Error> {
         releases,
     };
     if ctx.json {
-        return output::json(&view);
+        output::json(&view);
+        return Ok(ExitCode::SUCCESS);
     }
-    Record::new()
-        .field("model", &view.model)
-        .field("family", view.family.as_deref().unwrap_or(""))
-        .field("created", &view.created_at)
-        .print(ctx);
+    let mut record = Record::new().field("model", &view.model).field("family", view.family.as_deref().unwrap_or("-"));
+    record = record.field("created", &view.created_at);
+    record.print(ctx);
     for release in &view.releases {
-        let mut table = Table::new(ctx, &["lane", "bytes", "checkpoint"]);
+        let yanked = if release.yanked { ", yanked" } else { "" };
+        let revision = release.revision.map(|r| format!("revision {r}")).unwrap_or_default();
+        anstream::println!("\n{repo}@{} ({revision}{yanked})", release.release);
+        let mut table = Table::new(ctx, ["lane", "bytes", "checkpoint"]);
         for lane in &release.lanes {
-            table = table.row(vec![lane.lane.clone(), output::bytes(lane.bytes as u64), lane.checkpoint.clone()]);
+            table = table.row([lane.lane.clone(), output::bytes(lane.bytes as u64), lane.checkpoint.clone()]);
         }
-        let state = if release.yanked { " (yanked)" } else { "" };
-        output::note(ctx, &format!("{repo}@{}{state}", release.release));
         table.print();
     }
     Ok(ExitCode::SUCCESS)
@@ -206,22 +192,16 @@ struct FamilySet {
 pub(crate) async fn family(ctx: &Context, args: Family) -> Result<ExitCode, Error> {
     let repo = Repo::hub(&args.model)?;
     let family = if args.clear { String::new() } else { args.family.unwrap_or_default() };
-    let at = ctx.hub()?;
-    let answer = hub(
-        ctx.hub_signed_in(&at)?
-            .set_model_family(&repo.org, &repo.name, &ModelFamilyUpdate { family })
-            .await,
-    )?;
+    let client = ctx.hub_signed_in(&ctx.hub()?)?;
+    let answer = ctx.hub_answer(client.set_model_family(&repo.org, &repo.name, &ModelFamilyUpdate { family }).await)?;
     let view = FamilySet {
         model: repo.to_string(),
         family: answer.model.family.filter(|f| !f.is_empty()),
     };
     if ctx.json {
-        return output::json(&view);
+        output::json(&view);
+    } else {
+        Record::of(&view).print(ctx);
     }
-    Record::new()
-        .field("model", &view.model)
-        .field("family", view.family.as_deref().unwrap_or("(none)"))
-        .print(ctx);
     Ok(ExitCode::SUCCESS)
 }
