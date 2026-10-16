@@ -180,7 +180,7 @@ impl Weights {
                     channel::serve_source(&store, &meta, &source, server, &check, fetching)
                 });
                 if let Err(refusal) = served {
-                    eprintln!("weights source {}: {}", source.id(), refusal.detail);
+                    tracing::warn!("weights source {}: {}", source.id(), refusal.detail);
                 }
             })
             .map_err(io_refusal)?;
@@ -273,7 +273,7 @@ impl Weights {
                     None => serve(None),
                 };
                 if let Err(refusal) = served {
-                    eprintln!("weights output {output}: {}", refusal.detail);
+                    tracing::warn!("weights output {output}: {}", refusal.detail);
                 }
             })
             .map_err(io_refusal)?;

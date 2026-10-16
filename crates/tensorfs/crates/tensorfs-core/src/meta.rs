@@ -654,7 +654,7 @@ impl Hold {
 impl Drop for Hold {
     fn drop(&mut self) {
         if !self.released {
-            eprintln!(
+            tracing::warn!(
                 "DEGRADED lease-dropped-unreleased hold={} kind={} — row retained until owner-death reap",
                 self.id, self.kind
             );

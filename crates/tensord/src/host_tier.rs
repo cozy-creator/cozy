@@ -406,7 +406,7 @@ impl HostTier {
         std::thread::spawn(move || {
             for (manifest, header, component) in unplanned {
                 if let Err(error) = tier.reserve(&manifest, &header, &component) {
-                    eprintln!("host tier reservation skipped: {error}");
+                    tracing::warn!("host tier reservation skipped: {error}");
                 }
             }
             for body in bodies {
@@ -414,7 +414,7 @@ impl HostTier {
                     .map_err(failure)
                     .and_then(|plan| tier.ensure(&plan, &grants, &body, true, None, None).map(|_| ()));
                 if let Err(error) = filled {
-                    eprintln!("host tier prefill skipped: {error}");
+                    tracing::warn!("host tier prefill skipped: {error}");
                 }
             }
         });
@@ -775,7 +775,7 @@ impl HostTier {
                 &store, &meta, &manifest, &read_plan, &layout, open, threads, &tally, &stop,
             ) {
                 // Dropping the window failed every region: its readers get the error.
-                eprintln!("host tier window stopped: {error}");
+                tracing::warn!("host tier window stopped: {error}");
             }
         });
         Ok(key)
@@ -806,11 +806,11 @@ impl HostTier {
                 state.ledger.prefills += u64::from(prefill);
                 drop(state);
                 if let Err(error) = self.remember(&plan, &body) {
-                    eprintln!("host tier plan not remembered: {error}");
+                    tracing::warn!("host tier plan not remembered: {error}");
                 }
             }
             Err(error) => {
-                eprintln!("host tier fill of {} failed: {error}", plan.name);
+                tracing::warn!("host tier fill of {} failed: {error}", plan.name);
                 state.slots.remove(&key);
                 state.ledger.failed += 1;
             }
@@ -925,7 +925,7 @@ impl HostTier {
         }
         if let Err((error, rest)) = staged {
             // Its adopters see the regions failed; the next ask opens the layout afresh.
-            eprintln!("host tier staging of {regions:?} failed: {error}");
+            tracing::warn!("host tier staging of {regions:?} failed: {error}");
             fail(&open, &layout, &rest);
             state.slots.remove(key);
             state.ledger.failed += 1;

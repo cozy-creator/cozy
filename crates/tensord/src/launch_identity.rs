@@ -373,7 +373,7 @@ pub fn remove_stale_jit(root: &Path, incarnation: &str) {
     for entry in entries.flatten() {
         if entry.file_name() != incarnation {
             if let Err(error) = fs::remove_dir_all(entry.path()) {
-                eprintln!("stale JIT scope {}: {error}", entry.path().display());
+                tracing::warn!("stale JIT scope {}: {error}", entry.path().display());
             }
         }
     }

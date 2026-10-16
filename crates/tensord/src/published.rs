@@ -913,7 +913,7 @@ impl Publisher {
             job.stage("installing the machine's Runtime and TensorFS".into());
             (sdk_choice, sdk_fallback) = self.install_sdk(&py, &dir, &split.sdk, compile(!client), job.stop.as_ref())?;
             if !sdk_fallback.is_empty() {
-                eprintln!("package {} {release}: {sdk_fallback}", split.distribution);
+                tracing::warn!("package {} {release}: {sdk_fallback}", split.distribution);
                 job.stage(format!("warning: {sdk_fallback}"));
             }
         }
@@ -1531,7 +1531,7 @@ fn keep_card(generation: &Path, card: &Card) {
         .and_then(|bytes| fs::write(&staged, bytes))
         .and_then(|()| fs::rename(&staged, generation.join(CARD)));
     if let Err(error) = kept {
-        eprintln!("release card {}: {error}", generation.display());
+        tracing::warn!("release card {}: {error}", generation.display());
     }
 }
 

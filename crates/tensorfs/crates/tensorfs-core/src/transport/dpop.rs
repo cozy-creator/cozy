@@ -9,8 +9,8 @@
 use crate::err::{refuse, Code, Result};
 use crate::transport::credential::{Answer, Ask, CredentialProvider};
 use base64::{engine::general_purpose::STANDARD, engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use ring::rand::{SecureRandom, SystemRandom};
-use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
+use aws_lc_rs::rand::{SecureRandom, SystemRandom};
+use aws_lc_rs::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -27,7 +27,7 @@ impl DpopKey {
     /// An unencrypted PKCS#8 P-256 key (DER).
     pub fn from_pkcs8(der: &[u8]) -> Result<DpopKey> {
         let rng = SystemRandom::new();
-        let pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, der, &rng)
+        let pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, der)
             .map_err(|_| unusable("not an unencrypted PKCS#8 P-256 key"))?;
         let point = pair.public_key().as_ref();
         if point.len() != 65 || point[0] != 4 {
