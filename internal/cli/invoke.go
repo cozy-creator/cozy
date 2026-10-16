@@ -1154,13 +1154,13 @@ func runListRows(rows []api.Lifecycle) output.List {
 			"position", "total", "queued", "execution", "attempt_wall", "attempts", "created", "reason", "hub"},
 		TypedFields: []string{"number", "kind", "target", "machine", "rental_id", "requested_rental", "requested_machine", "status",
 			"phase", "gpu_allocation", "progress_stage", "stage_fraction", "overall_fraction", "position", "total",
-			"stage_remaining_ms", "observation_lost", "execution_ms", "execution_known", "error_type", "error_code", "error", "retaining"},
+			"stage_remaining_ms", "observation_lost", "execution_ms", "execution_known", "error_type", "error_code", "error", "warnings", "retaining"},
 		TypedAllFields: []string{"number", "id", "kind", "target", "machine", "rental_id", "requested_rental", "requested_machine",
 			"status", "canceled_by", "phase", "phase_machine", "waiting_for", "gpu_allocation", "rental_boot", "wait_reason", "phase_elapsed_ms",
 			"phase_moved_bytes", "phase_total_bytes", "phase_rate_bytes_per_second",
 			"phase_remaining_ms", "phase_sample_age_ms", "progress_stage", "stage_fraction", "overall_fraction",
 			"position", "total", "progress_unit", "progress_rate", "stage_remaining_ms", "observation_lost", "queued_ms", "execution_ms", "execution_known", "attempt_wall_ms", "attempts",
-			"created_at", "error_type", "error_code", "error", "triage", "retaining", "hub"},
+			"created_at", "error_type", "error_code", "error", "warnings", "triage", "retaining", "hub"},
 		TypedRows: make([]map[string]any, 0, len(rows)),
 		// The raw rental id is a machine fact: JSON always carries it, the compact
 		// human table never does — the human word is the MACHINE column (cl-107).
@@ -1178,6 +1178,10 @@ func runListRows(rows []api.Lifecycle) output.List {
 			status = humanCancellationStatus(life.CanceledBy)
 		} else if life.Status == "canceled" {
 			status = "cancelled"
+		}
+		// A run that recorded warnings is marked; `cozy run show` says what they are.
+		if life.Warnings > 0 {
+			status += " ⚠"
 		}
 		machine := life.Machine
 		if machine == "" {
@@ -1216,6 +1220,9 @@ func runListRows(rows []api.Lifecycle) output.List {
 		}
 		if life.Retaining {
 			typed["retaining"] = true
+		}
+		if life.Warnings > 0 {
+			typed["warnings"] = life.Warnings
 		}
 		if life.RentalID != "" {
 			typed["rental_id"] = life.RentalID

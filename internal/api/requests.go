@@ -946,6 +946,9 @@ type Lifecycle struct {
 	// `insufficient_storage`) when the failure did not originate in Creator.
 	ErrorCode string `json:"error_code,omitempty"`
 	Error     string `json:"error,omitempty"`
+	// Warnings is how many warnings the run recorded (`cozy run show` lists them); run
+	// listings carry it.
+	Warnings int `json:"warnings,omitempty"`
 	// Retaining: its machine still holds work for this run.
 	Retaining      bool  `json:"retaining,omitempty"`
 	StoppedEventID int64 `json:"stopped_event_id,omitempty"` // an older Calcifer's blocked stop
@@ -1265,9 +1268,20 @@ func (s *Server) listRequests(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	ids := make([]string, len(rows))
+	for i, row := range rows {
+		ids[i] = row.ID
+	}
+	warnings, e := s.store.Warnings(ids)
+	if e != nil {
+		s.refuseTyped(w, r, e)
+		return
+	}
 	out := make([]Lifecycle, 0, len(rows))
 	for _, row := range rows {
-		out = append(out, s.lifecycleOf(row))
+		life := s.lifecycleOf(row)
+		life.Warnings = warnings[row.ID]
+		out = append(out, life)
 	}
 	s.ok(w, r, http.StatusOK, map[string]any{"requests": out, "count": len(out), "older": older})
 }
