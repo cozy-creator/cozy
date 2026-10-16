@@ -2,7 +2,7 @@
 //! makes and publishes the bytes itself, so no weight passes through this computer; a local file
 //! goes to the machine as the run's input.
 use std::io::Read as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::ExitCode;
 
 use cozy_proto::calcifer::{Kind as RunKind, Run, StagedInput, Status, SubmitRun};
