@@ -69,15 +69,18 @@ pub(super) fn kill(handle: &Handle, birth: &Birth) -> io::Result<()> {
     let leads_group = stat(birth.pid)
         .is_ok_and(|stat| stat.start_ticks == birth.start_ticks && stat.pgrp as u32 == birth.pid);
     // SAFETY: a live pidfd, a signal number and no siginfo.
-    unix::gone_is_done(unsafe {
-        libc::syscall(
-            libc::SYS_pidfd_send_signal,
-            handle.0.as_raw_fd(),
-            libc::SIGKILL,
-            std::ptr::null::<libc::siginfo_t>(),
-            0,
-        )
-    } as libc::c_int)?;
+    unix::signaled(
+        unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                handle.0.as_raw_fd(),
+                libc::SIGKILL,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        } as libc::c_int,
+        birth.pid,
+    )?;
     if leads_group {
         unix::signal_group(birth.pid)?;
     }
@@ -86,6 +89,27 @@ pub(super) fn kill(handle: &Handle, birth: &Birth) -> io::Result<()> {
 
 pub(super) fn wait(handle: &Handle, period: Option<Duration>) -> io::Result<bool> {
     unix::readable(handle.0.as_fd(), period)
+}
+
+pub(super) fn set_name(name: &str) -> crate::Result<()> {
+    let failed = crate::Error::os("name this process");
+    let name = std::ffi::CString::new(name)
+        .map_err(|error| failed(io::Error::new(io::ErrorKind::InvalidInput, error)))?;
+    // SAFETY: a NUL-terminated name, of which the kernel copies at most 16 bytes.
+    if unsafe { libc::prctl(libc::PR_SET_NAME, name.as_ptr()) } < 0 {
+        return Err(crate::Error::os("name this process")(
+            io::Error::last_os_error(),
+        ));
+    }
+    Ok(())
+}
+
+/// Exited, a zombie included, or gone altogether.
+pub(super) fn exited(pid: u32) -> bool {
+    match stat(pid) {
+        Ok(stat) => matches!(stat.state, 'Z' | 'X'),
+        Err(error) => gone(&error),
+    }
 }
 
 fn boot_id() -> io::Result<String> {
