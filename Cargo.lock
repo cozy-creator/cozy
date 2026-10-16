@@ -483,6 +483,8 @@ dependencies = [
  "comfy-table",
  "cozy-platform",
  "cozy-proto",
+ "hub-client",
+ "reqwest",
  "serde",
  "serde_json",
  "supports-hyperlinks",
