@@ -84,5 +84,5 @@ jobs:
             --uid="$(id -u)" --gid="$(id -g)" --property=Delegate=yes --working-directory="$PWD" \
             --setenv="PATH=$PATH" --setenv="HOME=$HOME" --setenv=CGO_ENABLED=0 --setenv=UV_TORCH_BACKEND=cpu \
             --setenv="GOCACHE=$(go env GOCACHE)" --setenv="GOMODCACHE=$(go env GOMODCACHE)" \
-            --setenv=CARGO_TERM_COLOR=never \
+            --setenv=CARGO_TERM_COLOR=never --setenv=GITHUB_ACTIONS=true \
             bash -euo pipefail -c "$TEST"
