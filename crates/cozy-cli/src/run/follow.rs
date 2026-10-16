@@ -102,6 +102,12 @@ pub(crate) fn record(ctx: &Context, run: &Run) {
         output::json(run);
         return;
     }
+    fields(ctx, run).print(ctx);
+    next(ctx, run);
+}
+
+/// The record's fields, for a person.
+pub(super) fn fields(ctx: &Context, run: &Run) -> output::Record {
     let mut record = output::Record::new()
         .field("run", run.number)
         .field("target", &run.target)
@@ -141,7 +147,11 @@ pub(crate) fn record(ctx: &Context, run: &Run) {
     for warning in &run.warnings {
         record = record.note(format!("warning: {}", warning.message));
     }
-    record.print(ctx);
+    record
+}
+
+/// What to do next with `run`: watch it while it goes on, show it when it did not succeed.
+pub(super) fn next(ctx: &Context, run: &Run) {
     let watch = format!("cozy run watch {}", run.number);
     let show = format!("cozy run show {}", run.number);
     match run.status {
@@ -152,7 +162,7 @@ pub(crate) fn record(ctx: &Context, run: &Run) {
 }
 
 /// The status as people read it: `canceling` once a cancel is asked, `⚠` when warned.
-fn status(run: &Run) -> String {
+pub(super) fn status(run: &Run) -> String {
     let mut status = match run.status {
         Status::Queued => "queued",
         Status::InProgress => "in_progress",

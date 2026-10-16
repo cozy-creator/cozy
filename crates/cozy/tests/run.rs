@@ -150,7 +150,7 @@ fn the_grammar_refuses_what_it_cannot_run() {
             "usage",
             2,
         ),
-        (&["run", "list", "--json"], "not_ported", 2),
+        (&["run", "play", "1", "--json"], "not_ported", 2),
     ] {
         let out = home.cozy(args);
         assert_eq!(
@@ -335,4 +335,77 @@ fn ctrl_c_detaches_and_never_cancels() {
     );
     home.json(["run", "cancel", &number, "--json"]);
     assert_eq!(watcher.wait().unwrap().code(), Some(1));
+}
+
+/// Runs list newest first with their state, filter by state, say how many older runs a limit
+/// left out, and show one run whole; a live board needs a terminal.
+#[test]
+fn runs_list_filter_and_show() {
+    let Some(home) = Home::new() else { return };
+    kept(&home, "sdxl-2.10.0", "fidika/sdxl");
+    let submit = |prompt: &str| {
+        let run = home.json([
+            "run",
+            "fidika/sdxl/generate",
+            prompt,
+            "mood=calm",
+            "--on",
+            "any",
+            "--detach",
+            "--json",
+        ]);
+        run["number"].as_u64().unwrap()
+    };
+    let first = submit("a cat");
+    let second = submit("a dog");
+    home.json(["run", "cancel", &first.to_string(), "--json"]);
+
+    let listed = home.json(["run", "list", "--json"]);
+    let numbers: Vec<u64> = listed["runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["number"].as_u64().unwrap())
+        .collect();
+    assert_eq!(numbers, [second, first]);
+    let canceled = home.json(["run", "list", "--state", "canceled", "--json"]);
+    assert_eq!(canceled["runs"].as_array().unwrap().len(), 1, "{canceled}");
+    assert_eq!(canceled["runs"][0]["number"], first);
+    let newest = home.json(["run", "list", "--limit", "1", "--json"]);
+    assert_eq!(
+        (
+            newest["runs"].as_array().unwrap().len(),
+            newest["older"].as_u64()
+        ),
+        (1, Some(1)),
+        "{newest}"
+    );
+
+    let table = home.cozy(["run", "list", "--limit", "1"]);
+    assert!(
+        table.stdout.contains("queued ⚠") && table.stdout.contains("1 older runs"),
+        "{table:?}"
+    );
+
+    let shown = home.json(["run", "show", &first.to_string(), "--json"]);
+    assert_eq!(
+        (
+            shown["status"].as_str(),
+            shown["warnings"][0]["code"].as_str()
+        ),
+        (Some("canceled"), Some("request_fields_ignored"))
+    );
+    let human = home.cozy(["run", "show", &first.to_string()]);
+    assert!(
+        human.stdout.contains("warning: ignored unknown field mood"),
+        "{human:?}"
+    );
+    assert!(!human.stdout.contains("next:"), "{human:?}");
+
+    let board = home.cozy(["run", "list", "--watch"]);
+    assert!(
+        board.code == 2 && board.stdout.contains("watch_needs_terminal"),
+        "{board:?}"
+    );
+    home.json(["run", "cancel", &second.to_string(), "--json"]);
 }

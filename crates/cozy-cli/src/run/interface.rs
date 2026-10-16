@@ -16,21 +16,21 @@ pub struct Interface {
 #[derive(Debug, Deserialize)]
 pub struct Callable {
     pub name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "or_default")]
     pub internal: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "or_default")]
     pub models: Vec<Slot>,
     pub request: Struct,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "or_default")]
     pub result: Struct,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "or_default")]
     pub weights_outputs: Vec<WeightsOutput>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "or_default")]
     pub assets: Option<AssetsSlot>,
     /// Written only as false: the function never opens a GPU.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "or_default")]
     pub accelerator: Option<bool>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "or_default")]
     pub invocable: Invocable,
 }
 
@@ -40,18 +40,18 @@ pub struct Slot {
     pub path: String,
     #[serde(skip)]
     pub param: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "or_default")]
     pub class: String,
     /// A `Weights[M]` argument: the raw checkpoint, read and never constructed.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "or_default")]
     pub weights: bool,
     /// The release a run that names none loads: `[org/]model@release`.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "or_default")]
     pub default: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "or_default")]
     pub min_bits: Option<u32>,
     /// `decode` for an LM token loop; absent is compute.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "or_default")]
     pub phase: Option<String>,
 }
 
@@ -64,38 +64,38 @@ pub struct WeightsOutput {
 #[derive(Debug, Deserialize)]
 pub struct AssetsSlot {
     pub parameter: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "or_default")]
     pub kinds: Vec<AssetsKind>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct AssetsKind {
     pub kind: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "or_default")]
     pub media_types: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "or_default")]
     pub max_bytes: Option<u64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "or_default")]
     pub max_count: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 pub struct Invocable {
     /// `request/<field>` → the author's default, for people.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "or_default")]
     pub defaults: BTreeMap<String, Value>,
 }
 
 /// A rendered msgspec struct; a result may instead be one model (`{"input": "model"}`).
 #[derive(Debug, Default, Clone, Deserialize)]
 pub struct Struct {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "or_default")]
     pub fields: Vec<Field>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "or_default")]
     pub input: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "or_default")]
     pub tag_field: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "or_default")]
     pub tag: Option<Value>,
 }
 
@@ -104,14 +104,14 @@ pub struct Field {
     pub name: String,
     #[serde(rename = "type")]
     pub ty: Type,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "or_default")]
     pub wire: Wire,
     /// Present (even as null) only when the author wrote one.
     #[serde(default, deserialize_with = "present")]
     pub default: Option<Value>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "or_default")]
     pub constraints: Constraints,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "or_default")]
     pub asset_bound: AssetBound,
 }
 
@@ -141,7 +141,7 @@ pub struct Constraints {
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct AssetBound {
     pub max_bytes: Option<u64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "or_default")]
     pub media_types: Vec<String>,
 }
 
@@ -337,6 +337,13 @@ fn present<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Value>, D::Error> {
     Value::deserialize(d).map(Some)
 }
 
+/// A member written as `null` reads as absent: a Go writer spells an empty list that way.
+fn or_default<'de, D: Deserializer<'de>, T: Default + Deserialize<'de>>(
+    d: D,
+) -> Result<T, D::Error> {
+    Option::<T>::deserialize(d).map(Option::unwrap_or_default)
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -418,6 +425,27 @@ pub(crate) mod tests {
         let int8 = sdxl.callables.iter().find(|c| c.name == "int8").unwrap();
         assert!(int8.is_conversion() && int8.models[0].weights);
         assert_eq!(int8.result.input.as_deref(), Some("model"));
+    }
+
+    #[test]
+    fn a_model_free_callable_reads_with_its_lists_absent_or_null() {
+        let described = serde_json::json!({"application": "tiny:app", "format": "cozy.package.interface/1", "entrypoints": [
+            {"accelerator": false, "name": "echo",
+             "invocable": {"capabilities": [], "context": "", "defaults": {"request/text": "hello"}, "enum_members": {},
+                           "export": "echo", "memoize": false, "module": "tiny", "parameters": ["text"],
+                           "type_names": {"request": "EchoInput", "result": "EchoOutput"}},
+             "request": {"fields": [{"default": "hello", "name": "text", "type": "str", "wire": "optional"}]},
+             "result": {"fields": [{"name": "text", "type": "str"}]}},
+            {"name": "nulls", "models": null, "weights_outputs": null, "assets": null, "invocable": null,
+             "request": {"fields": [{"name": "n", "type": "int", "constraints": null, "asset_bound": null}]},
+             "result": null}
+        ]});
+        let read = Interface::parse(&described).unwrap();
+        assert!(read.unavailable.is_empty(), "{:?}", read.unavailable);
+        assert_eq!(read.public(), ["echo", "nulls"]);
+        let echo = &read.callables[0];
+        assert!(echo.models.is_empty() && echo.weights_outputs.is_empty() && !echo.is_conversion());
+        assert_eq!(echo.field("text").unwrap().wire, Wire::Optional);
     }
 
     #[test]
