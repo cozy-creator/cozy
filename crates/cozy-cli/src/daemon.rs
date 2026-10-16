@@ -138,7 +138,7 @@ enum Which {
 pub async fn logs(ctx: &Context, args: Logs) -> Result<ExitCode, Error> {
     match args.which {
         Which::Calcifer => calcifer_log(ctx, args.follow).await,
-        Which::Machine => Err(crate::not_ported("logs machine")),
+        Which::Machine => crate::machine::logs(ctx, "local", None, args.follow).await,
     }
 }
 

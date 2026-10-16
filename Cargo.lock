@@ -554,10 +554,12 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 name = "cozy"
 version = "0.9.0"
 dependencies = [
+ "base64 0.22.1",
  "calcifer",
  "cozy-cli",
  "cozy-platform",
  "cozy-proto",
+ "ed25519-dalek",
  "hex",
  "hub-client",
  "migrate",

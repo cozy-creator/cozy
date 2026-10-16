@@ -3,6 +3,9 @@
 //! `None` and the test skips, so `cargo test` there never reaches the user's `~/.cozy`, their
 //! services or their Calcifer.
 #![allow(dead_code)]
+#[cfg(unix)]
+pub mod tensord;
+
 use std::{
     ffi::OsStr,
     io::Write as _,

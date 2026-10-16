@@ -57,7 +57,10 @@ async fn admit(ctx: &Context, hub: &Hub, sku: &str, gpus: u32) -> Result<(), Err
 fn sku_refusal(sku: &str, gpus: u32, status: &RentalSkuStatus) -> Error {
     let (ask, retry) = match gpus {
         1 => (sku.to_string(), format!("cozy machine rent {sku}")),
-        _ => (format!("{sku} ×{gpus}"), format!("cozy machine rent {sku} --gpus {gpus}")),
+        _ => (
+            format!("{sku} ×{gpus}"),
+            format!("cozy machine rent {sku} --gpus {gpus}"),
+        ),
     };
     if !status.known {
         return Error::new(
@@ -71,20 +74,29 @@ fn sku_refusal(sku: &str, gpus: u32, status: &RentalSkuStatus) -> Error {
         Some("cooldown") => Some((
             "sku_cooldown",
             match &status.retry_after {
-                Some(at) => format!("{ask} is held back after a recent boot failure; try again after {at}"),
-                None => format!("{ask} is held back after a recent boot failure; try again shortly"),
+                Some(at) => {
+                    format!("{ask} is held back after a recent boot failure; try again after {at}")
+                }
+                None => {
+                    format!("{ask} is held back after a recent boot failure; try again shortly")
+                }
             },
         )),
         Some("retry_in_progress") => Some((
             "sku_retry_in_progress",
-            format!("{ask} is held back while a retry after a recent boot failure runs; try again once it ends"),
+            format!(
+                "{ask} is held back while a retry after a recent boot failure runs; try again once it ends"
+            ),
         )),
         _ => None,
     };
     if let Some((code, message)) = held {
-        return Error::new(Kind::Capacity, code, message).next(retry).next("cozy machine rent");
+        return Error::new(Kind::Capacity, code, message)
+            .next(retry)
+            .next("cozy machine rent");
     }
-    let mut message = format!("no provider has {ask} right now; nothing else was rented in its place.");
+    let mut message =
+        format!("no provider has {ask} right now; nothing else was rented in its place.");
     if let Some(at) = &status.last_seen_at {
         message += &format!(" It was last offered at {at}.");
     }
@@ -97,7 +109,8 @@ fn sku_refusal(sku: &str, gpus: u32, status: &RentalSkuStatus) -> Error {
     let error = match offered.first() {
         Some(first) => {
             message += &format!(" {sku} is offered now with {} GPU(s).", offered.join(", "));
-            Error::new(Kind::Capacity, "sku_out_of_stock", message).next(format!("cozy machine rent {sku} --gpus {first}"))
+            Error::new(Kind::Capacity, "sku_out_of_stock", message)
+                .next(format!("cozy machine rent {sku} --gpus {first}"))
         }
         None => Error::new(Kind::Capacity, "sku_out_of_stock", message).next(retry),
     };
@@ -107,7 +120,8 @@ fn sku_refusal(sku: &str, gpus: u32, status: &RentalSkuStatus) -> Error {
 /// The catalog, cheapest expected total first: GPU, disk and traffic for the Hub's assumed hours and
 /// download.
 async fn catalog(ctx: &Context, hub: &Hub) -> Result<ExitCode, Error> {
-    let mut skus: Vec<RentalSku> = hub_answer(ctx.hub_anonymous(hub).list_rental_skus(None).await)?.0;
+    let mut skus: Vec<RentalSku> =
+        hub_answer(ctx.hub_anonymous(hub).list_rental_skus(None).await)?.0;
     skus.retain(|sku| !sku.widths.is_empty());
     let total = |sku: &RentalSku| sku.widths[0].expected_price.total_usd_micros;
     skus.sort_by(|a, b| total(a).cmp(&total(b)).then_with(|| a.name.cmp(&b.name)));
@@ -115,10 +129,19 @@ async fn catalog(ctx: &Context, hub: &Hub) -> Result<ExitCode, Error> {
         output::json(&skus);
         return Ok(ExitCode::SUCCESS);
     }
-    let mut table = output::Table::new(ctx, ["NAME", "GPU", "GPUS", "COMPUTE", "VRAM", "$/HOUR", "EXPECTED"]);
+    let mut table = output::Table::new(
+        ctx,
+        [
+            "NAME", "GPU", "GPUS", "COMPUTE", "VRAM", "$/HOUR", "EXPECTED",
+        ],
+    );
     for sku in &skus {
         let width = &sku.widths[0];
-        let counts: Vec<String> = sku.widths.iter().map(|w| w.accelerator_count.to_string()).collect();
+        let counts: Vec<String> = sku
+            .widths
+            .iter()
+            .map(|w| w.accelerator_count.to_string())
+            .collect();
         let compute = match sku.compute_capability.as_str() {
             "" => "—".into(),
             cc => format!("sm_{}", cc.replace('.', "")),
@@ -128,7 +151,11 @@ async fn catalog(ctx: &Context, hub: &Hub) -> Result<ExitCode, Error> {
             sku.accelerator_model.clone(),
             counts.join(", "),
             compute,
-            if sku.vram_gb > 0 { format!("{} GB", sku.vram_gb) } else { "—".into() },
+            if sku.vram_gb > 0 {
+                format!("{} GB", sku.vram_gb)
+            } else {
+                "—".into()
+            },
             usd(width.price_usd_micros_per_hour + width.storage_usd_micros_per_hour),
             usd(width.expected_price.total_usd_micros),
         ]);
