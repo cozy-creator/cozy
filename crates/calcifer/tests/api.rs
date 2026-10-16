@@ -456,12 +456,14 @@ async fn a_killed_calcifer_leaves_a_record_the_next_one_replaces() {
     let lock = LockFile::new(Home::at(home.path()).calcifer_lock());
     let left: Holder = serde_json::from_slice(&lock.holder().unwrap().unwrap()).unwrap();
     assert_eq!(left, stale, "SIGKILL leaves the record behind");
-    let free = lock.try_lock(LockKind::Exclusive).unwrap();
+    // Shared, so the check leaves the stale record (an exclusive taker erases it).
+    let free = lock.try_lock(LockKind::Shared).unwrap();
     assert!(
         free.is_some(),
         "the kernel let go of the dead holder's lock"
     );
     drop(free);
+    assert!(lock.holder().unwrap().is_some());
 
     let calcifer = Calcifer::start(home.path()).await;
     assert_ne!(
