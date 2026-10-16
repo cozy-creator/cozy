@@ -23,6 +23,7 @@ mod list;
 mod show;
 mod spec;
 mod target;
+mod upload;
 
 #[derive(clap::Args, Debug)]
 #[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
@@ -188,7 +189,7 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
             Ok(ExitCode::SUCCESS)
         }
         Some(Verb::Play { .. }) => Err(crate::not_ported("run play")),
-        Some(Verb::Upload { .. }) => Err(crate::not_ported("run upload")),
+        Some(Verb::Upload { run, model, detach }) => upload::exec(ctx, &run, &model, detach).await,
         None => run(ctx, *args.run).await,
     }
 }
