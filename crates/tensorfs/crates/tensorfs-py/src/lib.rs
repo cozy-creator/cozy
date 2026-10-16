@@ -73,6 +73,9 @@ fn _ext(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // A plane-only build (no `store` feature) carries documents, headers, read plans, the fit
     // function and the weight plane: it cannot open, read or write a store.
     m.add("STORE", cfg!(feature = "store"))?;
+    // The Store contract this extension shares with the `cozy` binary's TensorD.
+    m.add("STORE_FORMAT", tensorfs_core::STORE_FORMAT)?;
+    m.add("CLAIM_PROTOCOL", tensorfs_core::CLAIM_PROTOCOL)?;
 
     m.add_function(wrap_pyfunction!(docs::object_id, m)?)?;
     m.add_function(wrap_pyfunction!(docs::parse_header, m)?)?;

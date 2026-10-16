@@ -414,6 +414,9 @@ def gc(root: StrPath) -> GCResult: ...
 
 #: The store, derived-writer and GC bindings are present (False: a plane-only build).
 STORE: bool
+#: The Store contract shared with the `cozy` binary's TensorD (tensorfs-core `contract`).
+STORE_FORMAT: int
+CLAIM_PROTOCOL: int
 
 def serve_fetch(store: Store, fd: int, *, origins: Sequence[Mapping[str, object]], run: int = 0) -> None: ...
 def serve_source(

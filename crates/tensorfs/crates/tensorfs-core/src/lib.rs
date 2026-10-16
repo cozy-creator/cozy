@@ -9,6 +9,8 @@ mod cache_roots;
 pub mod canon;
 pub mod capability;
 #[cfg(feature = "store")]
+pub mod contract;
+#[cfg(feature = "store")]
 pub mod catalog;
 mod cbor;
 #[cfg(feature = "store")]
@@ -87,3 +89,12 @@ pub mod vectors;
 
 /// This TensorFS's release version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The on-disk Store this build reads and writes: layout, catalog and object encoding. The
+/// `cozy` binary and the `tensorfs` wheel share every Store ([`contract`]); a change an older
+/// build would misread bumps it, and the wheel's minor.
+pub const STORE_FORMAT: u32 = 1;
+
+/// The cross-process protocol over one Store: owner claim, writer guards, read leases and
+/// holds. Bumped like [`STORE_FORMAT`] by a change a process speaking the old one would break.
+pub const CLAIM_PROTOCOL: u32 = 1;

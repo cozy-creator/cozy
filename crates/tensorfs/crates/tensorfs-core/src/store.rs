@@ -537,6 +537,7 @@ impl Store {
             fs::create_dir_all(root.join(d)).map_err(|e| io(format!("mkdir {d}"), e))?;
         }
         crate::catalog::Catalog::initialize(root)?;
+        crate::contract::judge(root, false)?;
         Ok(Store {
             root: root.to_path_buf(),
             progress: None,
@@ -1884,6 +1885,8 @@ fn creation_lock(root: &Path) -> Result<File> {
 /// No handle is returned while an unclean shutdown's unsynced admissions are unverified.
 fn open_validated(root: &Path) -> Result<Store> {
     fs::create_dir_all(root.join("tmp")).map_err(|error| io("mkdir tmp", error))?;
+    let owner = crate::meta::owner(root);
+    crate::contract::judge(root, owner.is_some())?;
     let store = Store {
         root: root.to_path_buf(),
         progress: None,
@@ -1891,7 +1894,7 @@ fn open_validated(root: &Path) -> Result<Store> {
         trust: crate::catalog::Trust::of(root),
         disk: crate::disk::filesystem(root),
         epoch: None,
-        owner: crate::meta::owner(root),
+        owner,
     };
     crate::unsynced::recover(&store)?;
     Ok(store)
