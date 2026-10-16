@@ -1,5 +1,5 @@
 //! `cozy up|down|status|logs`.
-use std::process::ExitCode;
+use std::{path::Path, process::ExitCode};
 
 use cozy_proto::error::Error;
 
@@ -31,4 +31,10 @@ pub struct Logs {}
 
 pub async fn logs(_ctx: &Context, _args: Logs) -> Result<ExitCode, Error> {
     Err(crate::not_ported("logs"))
+}
+
+/// Stops a running Calcifer and starts `program calcifer` in its place; false when none ran, and then
+/// none is started. `cozy update` calls it with the binary it just put in place.
+pub(crate) async fn restart(_ctx: &Context, _program: &Path) -> Result<bool, Error> {
+    Err(crate::not_ported("up"))
 }

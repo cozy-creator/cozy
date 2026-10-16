@@ -16,9 +16,11 @@ cozy-cli.workspace = true
 [dev-dependencies]
 cozy-platform.workspace = true
 cozy-proto.workspace = true
+hex.workspace = true
 hub-client = { workspace = true, features = ["testing"] }
 reqwest.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
 
