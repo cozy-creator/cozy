@@ -51,23 +51,17 @@ pub struct Execution {
 }
 
 /// One revision of an output item (`output_item.delta`).
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Default, Deserialize)]
+#[serde(default)]
 pub struct Product {
     pub output: String,
-    #[serde(default)]
     pub index: u32,
     pub rev: u64,
-    #[serde(default)]
     pub length: u64,
-    #[serde(default)]
     pub digest: String,
-    #[serde(default)]
     pub media_type: String,
-    #[serde(default)]
     pub label: Option<String>,
-    #[serde(default)]
     pub duration_us: u64,
-    #[serde(default)]
     pub path: Option<String>,
 }
 

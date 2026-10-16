@@ -512,71 +512,56 @@ fn runs(into: &Home, records: Records, live: &HashMap<String, String>, plan: &mu
     plan.machines.extend(ended.into_values());
 }
 
-/// A settled Go request's status, and the reason one that did not complete gives.
+/// A settled Go request's status, and why one that did not complete ended.
 fn ending(
     request: &Request,
     settled: bool,
     live: &HashMap<String, String>,
 ) -> (Status, Option<Reason>) {
     #[derive(Default, Deserialize)]
+    #[serde(default)]
     struct Payload {
-        #[serde(default)]
         error: String,
-        #[serde(default)]
         error_code: String,
-        #[serde(default)]
         error_type: String,
     }
-    let payload: Payload = request
+    let p: Payload = request
         .ending
         .as_deref()
         .and_then(|p| serde_json::from_str(p).ok())
         .unwrap_or_default();
-    let reason = |code: &str, message: &str| Reason {
-        code: [
-            payload.error_code.as_str(),
-            payload.error_type.as_str(),
-            code,
-        ]
+    let status = match request.state.as_str() {
+        "succeeded" => return (Status::Completed, None),
+        "canceled" => Status::Canceled,
+        _ => Status::Failed,
+    };
+    let (code, message) = match &request.execution {
+        _ if settled => (request.state.clone(), request.state.clone()),
+        Some(e) if e.dropped => (
+            "not_migrated".into(),
+            "the Go CLI had stopped following it".into(),
+        ),
+        Some(e) if e.sent && !live.contains_key(&e.machine) => (
+            "not_migrated".into(),
+            format!(
+                "its machine {} had ended before the move from the Go CLI",
+                e.machine
+            ),
+        ),
+        _ => (
+            "not_migrated".into(),
+            "it was not sent before the move from the Go CLI; run it again".into(),
+        ),
+    };
+    if !settled {
+        return (Status::Failed, Some(Reason { code, message }));
+    }
+    let code = [p.error_code, p.error_type, code]
         .into_iter()
         .find(|c| !c.is_empty())
-        .unwrap_or(code)
-        .to_owned(),
-        message: if payload.error.is_empty() {
-            message.to_owned()
-        } else {
-            payload.error.clone()
-        },
-    };
-    match request.state.as_str() {
-        "succeeded" => (Status::Completed, None),
-        "canceled" => (Status::Canceled, Some(reason("canceled", "canceled"))),
-        "abandoned" => (
-            Status::Failed,
-            Some(reason("abandoned", "the Go CLI stopped following it")),
-        ),
-        "refused" => (Status::Failed, Some(reason("refused", "refused"))),
-        _ if settled => (Status::Failed, Some(reason("failed", "failed"))),
-        _ => {
-            let message = match &request.execution {
-                Some(e) if e.dropped => "the Go CLI had stopped following it".to_owned(),
-                Some(e) if e.sent && !live.contains_key(&e.machine) => {
-                    format!(
-                        "its machine {} had ended before the move from the Go CLI",
-                        e.machine
-                    )
-                }
-                _ => "it was not sent before the move from the Go CLI; run it again".to_owned(),
-            };
-            (
-                Status::Failed,
-                Some(Reason {
-                    code: "not_migrated".into(),
-                    message,
-                }),
-            )
-        }
-    }
+        .unwrap_or_default();
+    let message = if p.error.is_empty() { message } else { p.error };
+    (status, Some(Reason { code, message }))
 }
 
 /// The machine word a history run names: its rental's human name, else its machine id.
@@ -689,13 +674,13 @@ fn kind(go: &str) -> Kind {
 /// What the run ran, as `cozy run list` showed it.
 fn target(request: &Request) -> String {
     #[derive(Default, Deserialize)]
+    #[serde(default)]
     struct Operation {
-        #[serde(default)]
         models: Vec<Model>,
     }
-    #[derive(Deserialize)]
+    #[derive(Default, Deserialize)]
+    #[serde(default)]
     struct Model {
-        #[serde(default)]
         model: String,
     }
     let at = |name: String| match request.release.as_str() {
