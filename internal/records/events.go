@@ -452,6 +452,30 @@ func (s *Store) SettledFailure(requestID string) (errType, errCode, errText stri
 	return errType, errCode, errText, nil
 }
 
+// Warnings counts each request's recorded warnings, the ones `cozy run show` lists: its
+// admission's, its machine's, and its machine's warning and error log lines.
+func (s *Store) Warnings(ids []string) (map[string]int, *exit.Error) {
+	list, _ := json.Marshal(ids)
+	rows, err := s.db.Query(`SELECT request_id,COUNT(*) FROM request_events
+		WHERE request_id IN (SELECT value FROM json_each(?)) AND (type IN ('request.warning','machine.warning')
+		OR type='request.log' AND json_extract(payload,'$.level') IN ('warning','error') AND COALESCE(json_extract(payload,'$.name'),'')='')
+		GROUP BY request_id`, string(list))
+	if err != nil {
+		return nil, exit.Internalf("cannot count run warnings: %s", err)
+	}
+	defer rows.Close()
+	counts := map[string]int{}
+	for rows.Next() {
+		var id string
+		var count int
+		if err := rows.Scan(&id, &count); err != nil {
+			return nil, exit.Internalf("cannot count run warnings: %s", err)
+		}
+		counts[id] = count
+	}
+	return counts, nil
+}
+
 // LastEventSeq is the current head of the stream. A client that wants only what happens
 // NEXT opens at the head instead of replaying history.
 func (s *Store) LastEventSeq() (int64, *exit.Error) {
