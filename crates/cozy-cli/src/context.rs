@@ -13,7 +13,7 @@ use cozy_proto::{
 };
 use hub_client::{Credential, DeviceKey, ResponseValue, UserSession};
 
-use crate::output::Term;
+use crate::{calcifer_client::Client, output::Term};
 
 #[derive(Debug)]
 pub struct Context {
@@ -46,6 +46,11 @@ impl Context {
     /// `--tensorhub`'s Hub, which a list narrows to; without it lists span every Hub.
     pub fn narrowed(&self) -> Result<Option<Hub>, Error> {
         self.config.narrowed()
+    }
+
+    /// Calcifer, started if none runs.
+    pub async fn calcifer(&self) -> Result<Client, Error> {
+        Client::connect(self).await
     }
 
     /// Whether this computer holds a device key for `hub`: signed in, as far as the files say.
