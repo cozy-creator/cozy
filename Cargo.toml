@@ -102,6 +102,7 @@ tower = { version = "0.5", default-features = false, features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std"] }
 url = { version = "2.5.8", features = ["serde"] }
+webpki-roots = "1"
 windows-sys = "0.61"
 zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 

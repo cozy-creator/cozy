@@ -89,7 +89,7 @@ impl Memo {
                 Ok(Some((local, cost_ms))) => (answer.local, answer.cost_ms) = (local, cost_ms),
                 Ok(None) => answer.disputed = self.disputed(frame),
                 // An unreadable tier is a miss the run computes through.
-                Err(error) => eprintln!("stage memo {}: {error}", &frame.key[..16]),
+                Err(error) => tracing::warn!("stage memo {}: {error}", &frame.key[..16]),
             },
             _ => {
                 let stored = self.store(spool, frame);

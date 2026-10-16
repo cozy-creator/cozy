@@ -81,19 +81,19 @@ impl ProviderSelf {
         let own = Self::from_env(&env);
         for copy in copies(root) {
             match scrub(&copy, &secrets) {
-                Ok(true) => eprintln!(
-                    "tensord: removed the provider key from {}",
+                Ok(true) => tracing::info!(
+                    "removed the provider key from {}",
                     copy.display()
                 ),
                 Ok(false) => (),
-                Err(error) => eprintln!(
-                    "tensord: cannot remove the provider key from {}: {error}",
+                Err(error) => tracing::warn!(
+                    "cannot remove the provider key from {}: {error}",
                     copy.display()
                 ),
             }
         }
         let error = reexec(own.as_ref());
-        eprintln!("tensord: cannot restart without the provider key in the environment ({error}); children still never inherit it");
+        tracing::warn!("cannot restart without the provider key in the environment ({error}); children still never inherit it");
         for name in KEYS {
             std::env::remove_var(name);
         }
@@ -319,7 +319,7 @@ async fn call(
             roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
         };
         let config = rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
+            rustls::crypto::aws_lc_rs::default_provider(),
         ))
         .with_safe_default_protocol_versions()
         .map_err(io::Error::other)?

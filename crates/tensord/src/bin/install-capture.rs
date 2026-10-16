@@ -9,6 +9,7 @@ use std::{fs, io::Read, path::PathBuf, sync::Arc};
 use tensorfs_core::store::Store;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt().with_writer(std::io::stderr).init();
     let mut archive = None;
     let mut output = None;
     let mut helper = None;

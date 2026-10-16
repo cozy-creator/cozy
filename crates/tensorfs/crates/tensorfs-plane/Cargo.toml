@@ -11,6 +11,7 @@ libc.workspace = true
 # libcuda is dlopen'd at first use: the workspace builds and tests with no CUDA toolkit.
 libloading = "0.9"
 thiserror.workspace = true
+tracing.workspace = true
 
 [features]
 # Store-backed sources (fills from a TensorFS store). Without it: sealed layouts only (a

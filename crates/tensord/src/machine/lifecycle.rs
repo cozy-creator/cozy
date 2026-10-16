@@ -250,8 +250,8 @@ pub async fn keep_authority(hub: Arc<Hub>, keys: Keys) {
                 lease / 2
             }
             Err(Refusal::Denied) => {
-                eprintln!(
-                    "tensord: the Hub denied rental authority; no new control is admitted"
+                tracing::error!(
+                    "the Hub denied rental authority; no new control is admitted"
                 );
                 keys.revoke();
                 Duration::from_secs(1)
@@ -282,7 +282,7 @@ pub async fn release_when_idle(
         match jobs(lifecycle.ended_ms()) {
             Ok(read) => lifecycle.observe(read, epoch),
             Err(error) => {
-                eprintln!("tensord: cannot read this rental's jobs: {error}");
+                tracing::warn!("cannot read this rental's jobs: {error}");
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 continue;
             }
@@ -292,11 +292,11 @@ pub async fn release_when_idle(
             match lifecycle.claim() {
                 Ok(true) => match hub.release().await {
                     Ok(()) => {
-                        eprintln!("tensord: 15 minutes without a job; Tensorhub accepted the release");
+                        tracing::info!("15 minutes without a job; Tensorhub accepted the release");
                         return;
                     }
                     Err(error) => {
-                        eprintln!("tensord: idle release not accepted; retrying without extending the deadline: {error}");
+                        tracing::warn!("idle release not accepted; retrying without extending the deadline: {error}");
                         next_ask = now + 5_000;
                         if unheard(hub.contact_ms(), lifecycle.deadline_ms(), lifecycle.grace) {
                             end_without_hub(provider.as_ref()).await;
@@ -306,7 +306,7 @@ pub async fn release_when_idle(
                 },
                 Ok(false) => (),
                 Err(error) => {
-                    eprintln!("tensord: idle release could not be recorded: {error}")
+                    tracing::warn!("idle release could not be recorded: {error}")
                 }
             }
         }
@@ -320,15 +320,15 @@ fn unheard(contact_ms: i64, deadline_ms: i64, grace: i64) -> bool {
 }
 
 async fn end_without_hub(provider: Option<&super::provider::ProviderSelf>) {
-    eprintln!("tensord: idle past the deadline with no answer from Tensorhub through the whole idle window; ending this rental itself");
+    tracing::warn!("idle past the deadline with no answer from Tensorhub through the whole idle window; ending this rental itself");
     match provider {
         Some(provider) => match provider.end().await {
-            Ok(()) => eprintln!("tensord: the provider accepted this pod's end"),
+            Ok(()) => tracing::info!("the provider accepted this pod's end"),
             Err(error) => {
-                eprintln!("tensord: the provider did not end this pod ({error}); stopping")
+                tracing::error!("the provider did not end this pod ({error}); stopping")
             }
         },
-        None => eprintln!("tensord: no provider credential; stopping"),
+        None => tracing::error!("no provider credential; stopping"),
     }
 }
 
@@ -470,7 +470,7 @@ mod hub_tests {
             .unwrap();
         let der = cert.der().to_vec();
         let config = rustls::ServerConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
+            rustls::crypto::aws_lc_rs::default_provider(),
         ))
         .with_safe_default_protocol_versions()
         .unwrap()

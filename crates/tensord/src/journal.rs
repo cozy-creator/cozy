@@ -376,7 +376,7 @@ fn readable(rows: Vec<String>) -> Vec<Execution> {
         .filter_map(|row| match serde_json::from_str(&row) {
             Ok(record) => Some(record),
             Err(error) => {
-                eprintln!("journal: skipping an unreadable execution row: {error}");
+                tracing::warn!("journal: skipping an unreadable execution row: {error}");
                 None
             }
         })
@@ -510,7 +510,7 @@ impl Journal {
             .parse::<u32>()
             .map_or(true, |format| format > JOURNAL_FORMAT)
         {
-            eprintln!(
+            tracing::warn!(
                 "journal: format {format} is newer than {JOURNAL_FORMAT}; reading what it can"
             );
         }

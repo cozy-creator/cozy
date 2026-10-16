@@ -173,7 +173,7 @@ impl Calls {
             fetches: Mutex::default(),
         });
         if let Err(error) = calls.sweep_canceled_outputs(&service.engine) {
-            eprintln!("startup canceled native outputs: {error}");
+            tracing::warn!("startup canceled native outputs: {error}");
         }
         let (watching, engine) = (Arc::downgrade(&calls), service.engine.clone());
         std::thread::Builder::new()
@@ -358,7 +358,7 @@ impl Calls {
             return;
         };
         if let Err(error) = self.sweep_canceled_outputs(&service.engine) {
-            eprintln!("canceled native outputs: {error}");
+            tracing::warn!("canceled native outputs: {error}");
         }
         if service.engine.get(id).is_ok_and(|r| r.state == State::Queued) {
             return;
@@ -378,7 +378,7 @@ impl Calls {
         }
         if let Some(service) = self.service.upgrade() {
             if let Err(error) = self.sweep_canceled_outputs(&service.engine) {
-                eprintln!("canceled native outputs: {error}");
+                tracing::warn!("canceled native outputs: {error}");
             }
         }
         for fetch in self.fetches.lock().unwrap().remove(&record.id).into_iter().flatten() {
@@ -634,7 +634,7 @@ impl Calls {
 fn cancel(engine: &Engine, child: &Execution) {
     let actor = child.submission.as_ref().map(|s| s.actor.as_str()).unwrap_or_default();
     if let Err(error) = engine.cancel(&child.id, actor) {
-        eprintln!("child run {} of {} remains: {error}", child.id, child.invocation.parent);
+        tracing::warn!("child run {} of {} remains: {error}", child.id, child.invocation.parent);
     }
 }
 
@@ -1038,7 +1038,7 @@ pub(crate) fn record_upload(engine: &Engine, id: &str, upload: &crate::weights::
     });
     let key = format!("weights:{}/{}", upload.output, upload.transaction);
     if let Err(error) = engine.append_call(id, &key, &crate::boundary_json::exact(&body)) {
-        eprintln!("run {id}: upload call: {error}");
+        tracing::warn!("run {id}: upload call: {error}");
     }
 }
 
@@ -1058,7 +1058,7 @@ fn record_call(
         _ => match Failure::decode(record.failure.as_deref().unwrap_or_default()) {
             Ok(failure) => ("failed", failure.code, failure.message),
             Err(error) => {
-                eprintln!("run {}: invalid child failure record: {error}", parent.id);
+                tracing::warn!("run {}: invalid child failure record: {error}", parent.id);
                 return false;
             }
         },
@@ -1080,7 +1080,7 @@ fn record_call(
     match engine.append_call(&parent.id, &record.id, &crate::boundary_json::exact(&body)) {
         Ok(_) => true,
         Err(error) => {
-            eprintln!("run {}: call {index}: {error}", parent.id);
+            tracing::warn!("run {}: call {index}: {error}", parent.id);
             false
         }
     }

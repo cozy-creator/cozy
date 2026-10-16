@@ -130,7 +130,7 @@ impl MachineIdentity {
         rustls::sign::CertifiedKey::from_der(
             certificates.clone(),
             private_key,
-            &rustls::crypto::ring::default_provider(),
+            &rustls::crypto::aws_lc_rs::default_provider(),
         )
         .map_err(other)?;
         let cert_der = certificates[0].as_ref().to_vec();

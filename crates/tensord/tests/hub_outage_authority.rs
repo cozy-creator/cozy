@@ -55,7 +55,7 @@ async fn serve_hub(hub: Arc<Hub>) -> (u16, Vec<u8>) {
         .unwrap();
     let der = cert.der().to_vec();
     let config = rustls::ServerConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
+        rustls::crypto::aws_lc_rs::default_provider(),
     ))
     .with_safe_default_protocol_versions()
     .unwrap()

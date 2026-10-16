@@ -86,7 +86,7 @@ pub fn supervise(
             std::process::exit(code);
         }
         if code == super::update::REPLACE_EXIT {
-            eprintln!("tensord: starting the service on its updated software");
+            tracing::info!("starting the service on its updated software");
             failures_before_ready = 0;
             continue;
         }
@@ -94,14 +94,14 @@ pub fn supervise(
         if failures_before_ready >= 2 {
             let cause = format!("the service exited twice before readiness ({code})");
             if super::update::rollback_pending(paths, &cause)? {
-                eprintln!("tensord: {cause}; Runtime update rolled back");
+                tracing::warn!("{cause}; Runtime update rolled back");
                 failures_before_ready = 0;
                 continue;
             }
-            eprintln!("tensord: {cause}; stopping");
+            tracing::error!("{cause}; stopping");
             std::process::exit(code);
         }
-        eprintln!("tensord: the service exited ({code}); starting it again");
+        tracing::warn!("the service exited ({code}); starting it again");
     }
 }
 
@@ -141,7 +141,7 @@ fn exec_service(
         },
     }
     let error = std::process::Command::new(binary).arg("service").exec();
-    eprintln!("tensord: cannot run {}: {error}", binary.display());
+    tracing::error!("cannot run {}: {error}", binary.display());
     std::process::exit(1)
 }
 

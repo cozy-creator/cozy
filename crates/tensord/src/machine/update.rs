@@ -464,7 +464,7 @@ impl Updates {
                     // A canceled update's status already says so.
                     match failed {
                         Err(persist) if persist.kind() != io::ErrorKind::Interrupted => {
-                            eprintln!("tensord: Runtime update failed: {error}; status: {persist}")
+                            tracing::warn!("Runtime update failed: {error}; status: {persist}")
                         }
                         _ => {}
                     }
@@ -546,7 +546,7 @@ impl Updates {
                 }
                 Ok(false) => {}
                 Err(rollback) => {
-                    eprintln!("tensord: update publication: {error}; rollback: {rollback}");
+                    tracing::error!("update publication: {error}; rollback: {rollback}");
                     // The links cannot be trusted. Restart while admission remains closed;
                     // startup recovers before selecting software, or refuses this launch.
                     exit(REPLACE_EXIT);
@@ -554,8 +554,8 @@ impl Updates {
             }
             return Err(error);
         }
-        eprintln!(
-            "tensord: Runtime update {}: restarting on {} / {}",
+        tracing::info!(
+            "Runtime update {}: restarting on {} / {}",
             request.operation, to.runtime, to.tensorfs
         );
         exit(REPLACE_EXIT);

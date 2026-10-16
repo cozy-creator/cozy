@@ -16,11 +16,11 @@ const ENVELOPE: &str =
 fn private_hub(alerts: usize) -> (u16, String, mpsc::Receiver<SocketAddr>) {
     let key = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
     let cert = rustls::pki_types::CertificateDer::from(key.cert.der().to_vec());
-    let private = rustls::pki_types::PrivateKeyDer::try_from(key.key_pair.serialize_der())
+    let private = rustls::pki_types::PrivateKeyDer::try_from(key.signing_key.serialize_der())
         .unwrap()
         .clone_key();
     let config = rustls::ServerConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
+        rustls::crypto::aws_lc_rs::default_provider(),
     ))
     .with_safe_default_protocol_versions()
     .unwrap()

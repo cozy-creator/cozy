@@ -360,7 +360,7 @@ fn tls_config(extra_roots: &[CertificateDer<'static>]) -> Arc<rustls::ClientConf
     }
     Arc::new(
         rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
+            rustls::crypto::aws_lc_rs::default_provider(),
         ))
         .with_safe_default_protocol_versions()
         .expect("rustls ships its own default protocol versions")

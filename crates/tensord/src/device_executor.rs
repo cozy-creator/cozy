@@ -1563,7 +1563,7 @@ impl DeviceExecutor {
                 fs::remove_file(&config.socket)?;
                 // A child the parent made before its channel failed carries the token too.
                 if let Err(error) = scope.as_deref().map_or(Ok(0), crate::scope::Scope::end) {
-                    eprintln!("refused fork's scope not ended: {error}");
+                    tracing::warn!("refused fork's scope not ended: {error}");
                 }
                 return Ok(match refused {
                     Ok(reply) => Forked::Refused(
@@ -2138,7 +2138,7 @@ impl Drop for DeviceExecutor {
             return;
         }
         if let Err(error) = self.parts().end() {
-            eprintln!("executor teardown: {error}");
+            tracing::warn!("executor teardown: {error}");
         }
     }
 }

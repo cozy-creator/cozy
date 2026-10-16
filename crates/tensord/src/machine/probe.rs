@@ -14,7 +14,7 @@ use tonic::transport::{Certificate, ClientTlsConfig, Endpoint};
 
 /// True when a TLS handshake on the listener presents exactly `leaf`.
 pub async fn presents_leaf(port: u16, leaf: &[u8]) -> bool {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let Ok(config) = rustls::ClientConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()
     else {

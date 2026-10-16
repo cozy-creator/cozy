@@ -83,6 +83,7 @@ fn accept_printed_ids(args: Vec<String>) -> Vec<String> {
 }
 
 fn main() -> ExitCode {
+    tracing_subscriber::fmt().with_writer(std::io::stderr).init();
     let (args, flags) = split_flags(std::env::args().skip(1).collect());
     if let Some(path) = flag(&flags, "ca-file") {
         let trusted = fs::read(path)

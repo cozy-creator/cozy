@@ -371,6 +371,7 @@ fn kill(exec: Exec) -> io::Result<()> {
 }
 
 fn main() {
+    tracing_subscriber::fmt().with_writer(std::io::stderr).init();
     if let Err(error) = run() {
         eprintln!("degree2-pilot: {error}");
         std::process::exit(1);

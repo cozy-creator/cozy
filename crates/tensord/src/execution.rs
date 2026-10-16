@@ -617,7 +617,7 @@ impl Engine {
             .name(format!("execution-{id}"))
             .spawn(move || {
                 if let Err(error) = run(engine.clone(), thread_id.clone()) {
-                    eprintln!("execution {thread_id}: {error}");
+                    tracing::warn!("execution {thread_id}: {error}");
                 }
                 if engine
                     .get(&thread_id)
@@ -759,7 +759,7 @@ impl Engine {
         if matches!(outcome, Outcome::Completed(_)) {
             // A warning never stands between a run and its result.
             if let Err(error) = journal.warn_unapplied_attention(id, progress.get(id)) {
-                eprintln!("run {id}: attention pin warning not logged: {error}");
+                tracing::warn!("run {id}: attention pin warning not logged: {error}");
             }
         }
         let record = journal.finish_observed(id, outcome, progress.get(id), held)?;
@@ -780,7 +780,7 @@ impl Engine {
         };
         let record = self.get(id).ok().filter(|r| !r.memo.computation.is_empty() && !r.memo.memoized)?;
         objects.keep(&record, result).unwrap_or_else(|error| {
-            eprintln!("run {id}: its success is not held for the memo: {error}");
+            tracing::warn!("run {id}: its success is not held for the memo: {error}");
             None
         })
     }
@@ -830,7 +830,7 @@ impl Engine {
                     }
                     let error = io::Error::last_os_error();
                     if error.kind() != io::ErrorKind::Interrupted {
-                        eprintln!("orphan kernel observation: {error}");
+                        tracing::warn!("orphan kernel observation: {error}");
                         return;
                     }
                 }
@@ -906,7 +906,7 @@ impl Engine {
         let result = crate::triage::write(&self.root, facts, executor.as_ref())
             .and_then(|triage| self.journal.lock().unwrap().bind_triage(id, &triage));
         if let Err(error) = result {
-            eprintln!("execution {id}: triage bundle not kept: {error}");
+            tracing::warn!("execution {id}: triage bundle not kept: {error}");
         }
     }
     /// The run's triage bundle bytes and their reference, if it kept one.
@@ -958,7 +958,7 @@ impl Engine {
                 Some(birth) => match process_ended(birth) {
                     Ok(ended) => ended,
                     Err(error) => {
-                        eprintln!(
+                        tracing::warn!(
                             "execution {}: cannot prove executor termination: {error}",
                             record.id
                         );
@@ -1121,7 +1121,7 @@ impl Drop for Spool {
         // remove_dir_all never follows a symlink the package planted inside.
         if let Err(error) = fs::remove_dir_all(&self.0) {
             if error.kind() != io::ErrorKind::NotFound {
-                eprintln!("spool {}: {error}", self.0.display());
+                tracing::warn!("spool {}: {error}", self.0.display());
             }
         }
     }
