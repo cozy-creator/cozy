@@ -473,6 +473,7 @@ struct Flight<'a> {
 }
 
 /// A request as the others see it: ended, or still running (`open`) as of the watch's tick.
+#[derive(Clone, Copy)]
 struct Peer {
     began: Instant,
     first: Option<Instant>,
@@ -567,6 +568,8 @@ struct Run<'r, 'a> {
     landed: AtomicU64,
     /// Disk work under way: commits, admissions and writes.
     local: AtomicUsize,
+    /// Requests that came to an end, landed or not.
+    ended: AtomicU64,
     /// Bytes home in every download into this Store (`moved`).
     everywhere: Arc<AtomicU64>,
 }
@@ -607,6 +610,7 @@ impl<'a> Download<'a> {
             minted: AtomicU64::new(0),
             landed: AtomicU64::new(0),
             local: AtomicUsize::new(0),
+            ended: AtomicU64::new(0),
             everywhere: moved(self.store),
         };
         let writers = std::thread::scope(|scope| {
@@ -614,6 +618,11 @@ impl<'a> Download<'a> {
                 writes: Offload::start(scope, WRITERS, "tensorfs-write"),
                 control: Offload::start(scope, CONTROL, "tensorfs-work"),
             };
+            // The watch is a supervisor with its own thread: judging hundreds of requests must
+            // never hold up the one that polls them.
+            let watched = std::thread::Builder::new()
+                .name("tensorfs-watch".into())
+                .spawn_scoped(scope, || net::block_on(run.watch()));
             let ran = net::block_on(async {
                 // A stream that panics ends the walk: its chunk would keep its peers waiting.
                 let streams = (0..streams).map(|slot| {
@@ -624,8 +633,21 @@ impl<'a> Download<'a> {
                         }
                     })
                 });
-                futures::future::join(futures::future::join_all(streams), run.watch(&mut observer)).await;
+                let streams = futures::future::join_all(streams);
+                match &watched {
+                    Ok(_) => drop(futures::future::join(streams, run.observe(&mut observer)).await),
+                    // No thread for it: the watch shares this one.
+                    Err(_) => drop(futures::future::join3(streams, run.observe(&mut observer), run.watch()).await),
+                }
             });
+            if let Ok(watched) = watched {
+                if let Ok(Err(refusal)) | Err(refusal) = watched.join().map_err(|_| Refusal {
+                    code: Code::IO_FAILED,
+                    detail: "the watch panicked".into(),
+                }) {
+                    run.fail(&mut run.state.lock().unwrap_or_else(PoisonError::into_inner), refusal);
+                }
+            }
             if let Err(refusal) = ran {
                 run.fail(&mut run.state.lock().unwrap(), refusal);
             }
@@ -1150,6 +1172,7 @@ impl<'a> Run<'_, 'a> {
         let ended = self.stream(pools, &mut chunk, &url, delivery.is_some(), &ledger, &reach).await;
         let preempted = (self.flights[slot].lock().unwrap().take()).is_some_and(|f| f.preempted);
         self.show(&attempt, began, asked);
+        self.ended.fetch_add(1, Ordering::Relaxed);
         // Nothing wants it any more: what landed goes with its temp file.
         if object.cell.gone() {
             return Outcome::Home;
@@ -1562,7 +1585,26 @@ impl<'a> Run<'_, 'a> {
     /// since its window began, never history, so a pod whose every request is slow drops
     /// none. And the pull's own end: nothing new has landed for twice its measured patience.
     /// Between those, every beat gives waiting work its way ([`Run::preempt`]).
-    async fn watch(&self, observer: &mut Option<&mut dyn FetchObserver>) {
+    /// `observer` hears the bytes home, a tick apart, until the run ends.
+    async fn observe(&self, observer: &mut Option<&mut dyn FetchObserver>) {
+        let Some(observer) = observer.as_mut() else {
+            return;
+        };
+        let pulse = self.job.feed.pulse();
+        loop {
+            let seen = pulse.seen();
+            {
+                let state = self.state.lock().unwrap();
+                if state.done || state.failure.is_some() {
+                    return;
+                }
+            }
+            observer.moved(self.landed.load(Ordering::Relaxed));
+            pulse.changed(seen, self.tick()).await;
+        }
+    }
+
+    async fn watch(&self) {
         let job = self.job;
         let pulse = job.feed.pulse();
         let sample = self.tick();
@@ -1570,7 +1612,7 @@ impl<'a> Run<'_, 'a> {
         // what the process and this run then had home, and whether this run has since asked
         // again with fresh URLs.
         let (mut most, mut grew) = (0, Instant::now());
-        let (mut since, mut reasked) = ((self.everywhere.load(Ordering::Relaxed), 0), false);
+        let (mut since, mut reasked) = ((self.everywhere.load(Ordering::Relaxed), 0, 0), false);
         let mut judge = Instant::now() + sample;
         loop {
             let seen = pulse.seen();
@@ -1587,18 +1629,17 @@ impl<'a> Run<'_, 'a> {
                 continue;
             }
             judge = Instant::now() + sample;
-            if let Some(observer) = observer.as_mut() {
-                // Told outside the lock: an observer may be slow, and workers must not wait.
-                observer.moved(self.landed.load(Ordering::Relaxed));
-            }
-            let mut state = self.state.lock().unwrap();
-            if state.done || state.failure.is_some() {
-                return;
-            }
-            if let Some(refusal) = self.stopped() {
-                self.fail(&mut state, refusal);
-                return;
-            }
+            let shown: Vec<Peer> = {
+                let mut state = self.state.lock().unwrap();
+                if state.done || state.failure.is_some() {
+                    return;
+                }
+                if let Some(refusal) = self.stopped() {
+                    self.fail(&mut state, refusal);
+                    return;
+                }
+                state.shown.iter().copied().collect()
+            };
             let floor = sample.as_secs_f64() * 2.0;
             let now = Instant::now();
             let live: Vec<(usize, Peer)> = (self.flights.iter().enumerate())
@@ -1637,19 +1678,28 @@ impl<'a> Run<'_, 'a> {
                 (peer.bytes >= PIECE_BYTES || body >= sample.as_secs_f64())
                     .then(|| (peer.bytes as f64 / body.max(1e-6), false))
             };
-            // The middle of the others running now and those ended since `since`. A floor
+            // Each figure of every peer, once a tick: those running now by slot, those ended by
+            // when. The middle of the others running now and those ended since `since`; a floor
             // under `least` says nothing yet, and is left out.
-            let shown = &state.shown;
-            let peers = |slot: usize, since: Instant, least: f64, figure: &Figure| {
-                let ended = shown.range(shown.partition_point(|peer| peer.ended < since)..);
-                let values = (live.iter())
-                    .filter(|(other, _)| *other != slot)
-                    .map(|(_, peer)| peer)
-                    .chain(ended)
-                    .filter_map(figure)
-                    .filter_map(|(value, floor)| (!floor || value >= least).then_some(value))
-                    .collect();
-                median(values).filter(|value| *value > 0.0)
+            let figures: [&Figure; 3] = [&wait, &took, &rate];
+            let running: Vec<Vec<(usize, f64, bool)>> = (figures.iter())
+                .map(|figure| live.iter().filter_map(|(slot, peer)| figure(peer).map(|(v, f)| (*slot, v, f))).collect())
+                .collect();
+            let ended: Vec<Vec<(Instant, f64, bool)>> = (figures.iter())
+                .map(|figure| shown.iter().filter_map(|peer| figure(peer).map(|(v, f)| (peer.ended, v, f))).collect())
+                .collect();
+            let mut values = Vec::with_capacity(live.len() + shown.len());
+            let mut peers = |slot: usize, since: Instant, least: f64, figure: usize| {
+                values.clear();
+                let counted = |value: f64, floor: bool| !floor || value >= least;
+                values.extend(
+                    (running[figure].iter())
+                        .filter(|(other, value, floor)| *other != slot && counted(*value, *floor))
+                        .map(|(_, value, _)| *value),
+                );
+                let after = ended[figure].partition_point(|(when, _, _)| *when < since);
+                values.extend(ended[figure][after..].iter().filter(|(_, value, floor)| counted(*value, *floor)).map(|(_, value, _)| *value));
+                median(&mut values).filter(|value| *value > 0.0)
             };
             let mut flying = false;
             for (slot, flight) in self.flights.iter().enumerate() {
@@ -1664,26 +1714,27 @@ impl<'a> Run<'_, 'a> {
                 let bytes = flight.attempt.bytes.load(Ordering::Relaxed);
                 let (began, waited) = (flight.began, flight.began.elapsed().as_secs_f64());
                 let patience = flight.patience as f64;
-                // Far longer at it than its peers took: for its first byte, or in all.
-                let longer = |figure: &Figure| {
-                    let least = waited / (STALL_FACTOR * patience);
+                // Far longer at it than its peers took: for its first byte (figure 0), or in all
+                // (figure 1).
+                let least = waited / (STALL_FACTOR * patience);
+                let mut longer = |figure: usize| {
                     (waited > floor * patience)
                         .then(|| peers(slot, began, least, figure))
                         .flatten()
                         .filter(|typical| waited > (typical * STALL_FACTOR).max(floor) * patience)
                 };
+                let small = flight.range.1 - flight.range.0 < PIECE_BYTES;
                 let slow = match flight.attempt.first.get() {
                     // Less than a piece to fetch, against its small peers' time in all.
-                    _ if flight.range.1 - flight.range.0 < PIECE_BYTES => longer(&took)
-                        .map(|took| (bytes as f64 / waited, format!("peers_small_s={took:.2}"))),
-                    None => longer(&wait).map(|wait| (0.0, format!("peers_wait_s={wait:.2}"))),
+                    _ if small => longer(1).map(|took| (bytes as f64 / waited, format!("peers_small_s={took:.2}"))),
+                    None => longer(0).map(|wait| (0.0, format!("peers_wait_s={wait:.2}"))),
                     // A body is judged once its peers' pace would have brought a piece of it
                     // home, and over no less than two ticks: then far slower than theirs.
                     Some(first) => {
                         let since = flight.judged.unwrap_or(began);
                         let window = flight.judged.unwrap_or(*first).elapsed().as_secs_f64();
                         (window >= floor * patience)
-                            .then(|| peers(slot, since, 0.0, &rate))
+                            .then(|| peers(slot, since, 0.0, 2))
                             .flatten()
                             .filter(|typical| window >= (PIECE_BYTES as f64 / typical) * patience)
                             .and_then(|typical| {
@@ -1715,6 +1766,10 @@ impl<'a> Run<'_, 'a> {
             // The pull's own end: requests are being asked and nothing new has landed for
             // twice its patience, so every silent one was asked again and that came to
             // nothing too. A wait the hub or the origin asked for is theirs, not judged here.
+            let mut state = self.state.lock().unwrap();
+            if state.done || state.failure.is_some() {
+                return;
+            }
             let now = Instant::now();
             let asking = flying
                 || state
@@ -1729,12 +1784,18 @@ impl<'a> Run<'_, 'a> {
             });
             if landed > most || !asking || on_hub {
                 reasked &= landed <= most;
-                (most, grew, since) = (most.max(landed), now, (self.everywhere.load(Ordering::Relaxed), landed));
+                (most, grew, since) = (most.max(landed), now, (self.everywhere.load(Ordering::Relaxed), landed, self.ended.load(Ordering::Relaxed)));
                 continue;
             }
             // This run's own disk work (a commit's hash and fsync, an admission, a write) is
             // not the origin standing still: the verdict waits for it, and still counts.
             if self.local.load(Ordering::Acquire) > 0 {
+                continue;
+            }
+            // Nor is a run whose requests are all still out: until one has ended, landed or
+            // judged silent by its own rule, nothing has been asked again (a slow host's first
+            // wave of hundreds).
+            if self.ended.load(Ordering::Relaxed) == since.2 {
                 continue;
             }
             let minted = self.began + Duration::from_millis(self.minted.load(Ordering::Acquire));
@@ -1808,7 +1869,7 @@ impl<'a> Run<'_, 'a> {
                 }
                 drop(state);
                 pulse.beat();
-                (most, grew, since) = (landed, Instant::now(), (self.everywhere.load(Ordering::Relaxed), landed));
+                (most, grew, since) = (landed, Instant::now(), (self.everywhere.load(Ordering::Relaxed), landed, self.ended.load(Ordering::Relaxed)));
             }
         }
     }
@@ -1949,7 +2010,7 @@ async fn open_object<'l, 's, 'a: 's>(
 type Figure<'a> = dyn Fn(&Peer) -> Option<(f64, bool)> + 'a;
 
 /// The middle of what peers showed; none with no peer to compare with.
-fn median(mut values: Vec<f64>) -> Option<f64> {
+fn median(values: &mut [f64]) -> Option<f64> {
     let middle = values.len() / 2;
     (!values.is_empty()).then(|| *values.select_nth_unstable_by(middle, f64::total_cmp).1)
 }

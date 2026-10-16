@@ -447,7 +447,10 @@ fn an_ensure_whose_stream_threads_the_container_refuses_lands() {
     // 251 objects: the pull asks for a stream for each.
     let checkpoint = Arc::new(checkpoint(251, 4096, 9));
     let hub = hub(vec![Arc::clone(&checkpoint)], None, Duration::ZERO, serve_all());
-    let inner = ensure(&root, &hub.base, &[]);
+    // The product's own sample: a 50 ms one judges a slow host's first wave of hundreds of
+    // requests by a third of a second.
+    let mut inner = Command::new(TFS);
+    inner.args(["ensure", root.to_str().unwrap(), "acme/model@r1", "--hub", &hub.base, "--lane", "public"]);
     let out = dir.join("stdout");
     let mut child = Command::new(scope[0])
         .args(&scope[1..])
