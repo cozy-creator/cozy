@@ -1,6 +1,5 @@
 [package]
 name = "tensorfs-plane"
-# TensorFS keeps its own version and tag line (`tensorfs-vX.Y.Z`): the wheel is released on its own.
 version = "0.10.0"
 edition = "2021"
 publish.workspace = true
