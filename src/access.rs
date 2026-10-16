@@ -259,8 +259,9 @@ impl Fetch {
         Ok(())
     }
 
-    /// `keep`, then wait until it is all here, reporting its bytes (a warm run of a function).
-    pub fn download(&self, selected: &[(String, Vec<String>)], stop: &PullCancellation, progress: &(dyn Fn(u64, u64) + Sync)) -> io::Result<()> {
+    /// `keep`, then wait until it is all here, reporting its bytes (a warm run of a function):
+    /// the bytes that came from the Hub and from the datacenter volume.
+    pub fn download(&self, selected: &[(String, Vec<String>)], stop: &PullCancellation, progress: &(dyn Fn(u64, u64) + Sync)) -> io::Result<(u64, u64)> {
         self.keep(selected)?;
         let kept = self.kept.lock().unwrap();
         std::thread::scope(|scope| {
@@ -276,7 +277,7 @@ impl Fetch {
             for wait in waits {
                 wait.join().map_err(|_| io::Error::other("a download wait panicked"))?.map_err(failed)?;
             }
-            Ok(())
+            Ok(kept.iter().map(Ticket::landed).fold((0, 0), |(h, v), (hh, vv)| (h + hh, v + vv)))
         })
     }
 

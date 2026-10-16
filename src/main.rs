@@ -1,3 +1,4 @@
+use tensorfs_core::fetch::{Fetcher, Volume};
 use tensord::{
     owner::{Owner, Shared},
     protocol::{self, Body, Command, Reply, CAPS},
@@ -185,6 +186,12 @@ fn run_machine(
     identity.store = Some(layout.store.clone());
     let generations = engine.join("generations");
     let owner = Owner::new(&engine, &layout.store, 16 * 1024 * 1024, Duration::from_secs(300))?;
+    // The machine's one Fetcher, held for its life: it reads the datacenter volume before the Hub
+    // and fills it. A variable naming no mount point (the volume was not delivered) is no volume.
+    let _fetcher = match layout.cache.as_ref().and_then(|cache| Volume::mounted(cache, tensord::reclaim::TTL)) {
+        Some(volume) => Some(Fetcher::of(&owner.lock().unwrap().store()).map_err(io::Error::other)?.with_volume(volume)),
+        None => None,
+    };
     let service = tensord::service::Service::open(&engine, &generations, 1)?;
     // The jobs this root held (a preparation the restart ended counts as ended now): Status
     // reports the true deadline from the first frame.

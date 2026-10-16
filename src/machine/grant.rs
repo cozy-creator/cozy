@@ -16,6 +16,7 @@ const NAMES: &[&str] = &[
     "COZY_MACHINE_LIFETIME",
     "COZY_MACHINE_ROOT",
     "COZY_TENSORFS_ROOT",
+    "COZY_TENSORFS_CACHE",
     "COZY_LISTEN_HOST",
     "COZY_WORKER_ID",
     "COZY_WORKER_AUTH_TOKEN",
@@ -88,6 +89,9 @@ pub struct Layout {
     /// owned computer's box store; a worker image sets it), else the root's standard
     /// `var/lib/tensorfs`.
     pub store: PathBuf,
+    /// The datacenter volume the Hub mounted (`COZY_TENSORFS_CACHE`): the machine's one Fetcher
+    /// reads it before the Hub when it is a mount point.
+    pub cache: Option<PathBuf>,
 }
 impl Layout {
     pub fn new(root: &Path, store: Option<PathBuf>) -> Self {
@@ -96,6 +100,7 @@ impl Layout {
             bootstrap: root.join("run/cozy/bootstrap"),
             state: root.join("var/lib/cozy/machine"),
             store: store.unwrap_or_else(|| root.join("var/lib/tensorfs")),
+            cache: None,
         }
     }
     /// This service's execution journal and package generations.
@@ -126,6 +131,10 @@ impl Grant {
         let store = get("COZY_TENSORFS_ROOT").map(PathBuf::from);
         if let Some(store) = &store {
             clean_absolute(store, "COZY_TENSORFS_ROOT")?;
+        }
+        let cache = get("COZY_TENSORFS_CACHE").map(PathBuf::from);
+        if let Some(cache) = &cache {
+            clean_absolute(cache, "COZY_TENSORFS_CACHE")?;
         }
         let listen_host: IpAddr = match get("COZY_LISTEN_HOST").unwrap_or("0.0.0.0") {
             host @ ("0.0.0.0" | "127.0.0.1") => host.parse().expect("literal address"),
@@ -225,7 +234,7 @@ impl Grant {
             .flatten();
         Ok(Self {
             lifetime,
-            layout: Layout::new(&root, store),
+            layout: Layout { cache, ..Layout::new(&root, store) },
             listen_host,
             worker_id,
             worker_port,
@@ -350,9 +359,11 @@ mod tests {
             ("COZY_FUTURE_SETTING", "x"),
             ("WORKER_MODE", "development"),
             ("PUBLIC_KEY", "ssh-ed25519 AAAA"),
+            ("COZY_TENSORFS_CACHE", "/cache"),
         ]))
         .unwrap();
         assert_eq!(grant.lifetime, Lifetime::Rental);
+        assert_eq!(grant.layout.cache.as_deref(), Some(Path::new("/cache")));
         assert_eq!(grant.layout.state, Path::new("/var/lib/cozy/machine"));
         assert_eq!((grant.worker_port, grant.webrtc_port), (8443, Some(8445)));
         assert_eq!(grant.receipt_key.as_deref(), Some(&[0u8; 32][..]));
@@ -376,6 +387,7 @@ mod tests {
         .unwrap();
         assert_eq!(grant.developer_key.as_deref(), Some("ssh-ed25519 RENTER"));
         assert!(grant.ignored.is_empty());
+        assert_eq!(grant.layout.cache, None);
     }
 
     #[test]
@@ -390,6 +402,7 @@ mod tests {
         for (name, value) in [
             ("COZY_WORKER_INTERNAL_PORT", "08443"),
             ("COZY_MACHINE_ROOT", "relative"),
+            ("COZY_TENSORFS_CACHE", "cache"),
             ("COZY_LISTEN_HOST", "::"),
             ("COZY_AUTHORIZED_KEYS", "short"),
         ] {

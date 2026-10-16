@@ -213,9 +213,10 @@ async fn answer(State(served): State<Arc<Served>>, method: Method, uri: Uri, hea
                 true => ("", ""),
                 false => (model.release.as_str(), model.lane.as_str()),
             };
+            // A release lane is public; a hash alone is the owner's.
             json(json!({"complete": true, "lane": lane, "manifest": {"length": model.manifest.length,
                 "sha256": model.manifest.sha256}, "model": model.repository, "objects": rows,
-                "presign_max_digests": 64, "release": release, "scope": "runtime"}))
+                "presign_max_digests": 64, "public": !release.is_empty(), "release": release, "scope": "runtime"}))
         }
         (Method::POST, "/v1/tensorfs/presign") => {
             let mut urls = serde_json::Map::new();

@@ -417,7 +417,7 @@ impl Publisher {
     /// beside what no store GC may evict (`protected`): what a caller asked for whole (`cozy
     /// model download`, an adapter).
     fn ensure(&self, service: &Service, source: &hub::Source, named: &Named, stop: Option<&PullCancellation>,
-        bytes: &(dyn Fn(u64, u64) + Sync)) -> Result<(), Failure> {
+        bytes: &(dyn Fn(u64, u64) + Sync)) -> Result<(u64, u64), Failure> {
         let mut keep = self.protected(service).map_err(io_failure)?;
         keep.push(named.manifest.clone());
         let refspec = named.refspec();
@@ -426,7 +426,7 @@ impl Publisher {
         let mut request = tensorfs_core::ensure::Request::new(&self.store, &source.origin, &refspec, catalog.clone());
         (request.lane, request.keep, request.cancellation) = (&named.lane, &keep, stop.cloned());
         request.on_event = Some(&on_event);
-        tensorfs_core::ensure::ensure(&request).map(drop).map_err(|e| match stop.is_some_and(PullCancellation::is_cancelled) {
+        tensorfs_core::ensure::ensure(&request).map(|e| (e.bytes_fetched, e.bytes_cached)).map_err(|e| match stop.is_some_and(PullCancellation::is_cancelled) {
             true => canceled(),
             false => {
                 let (code, message) = refused("model_download_failed", e);
@@ -506,7 +506,8 @@ impl Publisher {
     }
 
     /// A Hub checkpoint resolved and downloaded whole into the store (a warm run's model
-    /// choice: `cozy model download`); answers what the Hub named.
+    /// choice: `cozy model download`); answers what the Hub named and the bytes that came from
+    /// the Hub and from the datacenter volume.
     pub(crate) fn download(
         &self,
         service: &Service,
@@ -515,14 +516,15 @@ impl Publisher {
         revision: &str,
         stop: Option<&PullCancellation>,
         bytes: &(dyn Fn(u64, u64) + Sync),
-    ) -> Result<Named, Refused> {
+    ) -> Result<(Named, (u64, u64)), Refused> {
         let failed = |(code, message)| Refused { code, message };
         let named = self.resolve(service, source, named, revision).map_err(failed)?;
         // A checkpoint this store already holds whole, in that repository, moves nothing.
+        let mut moved = (0, 0);
         if tensorfs_core::checkpoint_root::check_source(&self.store, &named.repository, &named.object()).is_err() {
-            self.ensure(service, source, &named, stop, bytes).map_err(failed)?;
+            moved = self.ensure(service, source, &named, stop, bytes).map_err(failed)?;
         }
-        Ok(named)
+        Ok((named, moved))
     }
 
     /// The store's share of the machine's self-managing caches (`reclaim`), with what it

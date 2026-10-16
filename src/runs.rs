@@ -373,13 +373,14 @@ impl Runs {
                 let named = crate::published::choose(choice, &choice.parameter, (&gpu, width))
                     .map_err(|(code, message)| refused(code, message))?;
                 let stage = format!("downloading {}", choice.repository);
-                let named = publisher.download(&self.service, hub_access()?, named, &spec.catalog_revision, stop, &|done, total| {
+                let (named, (hub, volume)) = publisher.download(&self.service, hub_access()?, named, &spec.catalog_revision, stop, &|done, total| {
                     observe(&stage, done, total)
                 })?;
                 let sha256 = named.manifest.trim_start_matches("sha256:").to_string();
                 let length = std::fs::metadata(publisher.store().manifest_path(&sha256))?.len();
                 let row = json!({"parameter": choice.parameter, "repository": named.repository,
-                    "release": named.release, "lane": named.lane, "manifest": named.manifest});
+                    "release": named.release, "lane": named.lane, "manifest": named.manifest,
+                    "bytes": {"hub": hub, "volume": volume}});
                 (ObjectRef { sha256, length }, row)
             };
             if let Some(name) = destination.strip_prefix("local/") {
@@ -595,11 +596,12 @@ impl Runs {
                 false => vec![],
             };
             // A function's warm run ends holding what its constructions read (`downloaded`).
+            let mut moved = (0, 0);
             if let (Some(plan), Some(publisher)) = (&plan, &self.publisher) {
                 let fetch = crate::access::Fetch::new(publisher.store().clone(), hub.clone(), plan.manifests(), u64::MAX);
                 let selected: Vec<_> = plan.selections().into_iter().map(|s| (s.manifest, s.components)).collect();
                 let report = |done, total| observe("downloading its weights", done, total);
-                fetch.download(&selected, &stoppable.stop, &report).map_err(|e| match stoppable.stop.is_cancelled() {
+                moved = fetch.download(&selected, &stoppable.stop, &report).map_err(|e| match stoppable.stop.is_cancelled() {
                     true => refused(crate::published::CANCELED, "the run was canceled while it downloaded"),
                     false => {
                         let text = e.to_string();
@@ -609,7 +611,7 @@ impl Runs {
             }
             // The installed release and its interface, in the warm run's result.
             let installed = json!({"package": installation.package, "release": installation.release,
-                "interface": interface});
+                "interface": interface, "bytes": {"hub": moved.0, "volume": moved.1}});
             return warm_result(installed, models);
         }
         let entry = declared.expect("checked above");
