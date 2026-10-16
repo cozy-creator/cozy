@@ -14,14 +14,16 @@ use cozy_platform::paths::Home;
 use cozy_proto::{
     calcifer::{
         Ended, HubListing, HubProblem, Machine, MachineKind, MachineState, Quote, Reason, Rental,
-        Rented,
+        Rented, Warning,
     },
     config,
     error::{Error, Kind},
     ids::RunId,
+    machine as v1,
 };
 use ed25519_dalek::SigningKey;
 use hub_client::{Client, Credential, DeviceKey, UserSession, types};
+use prost::Message as _;
 use sha2::{Digest as _, Sha256};
 use tracing::warn;
 
@@ -420,28 +422,30 @@ impl Machines {
         }
     }
 
-    /// Rents a machine for an unplaced run (`--on new:<sku>`) under a key the run names, so a
-    /// Calcifer that stops mid-ask asks again for the same rental.
-    pub(crate) fn rent_for(self: &Arc<Self>, run: &RunRow, sku: &str, gpus: u32) {
+    /// Rents a machine for an unplaced run (`--on new[:<sku>]`) under a key the run names, so a
+    /// Calcifer that stops mid-ask asks again for the same rental. Without a product, the Hub
+    /// places the run: the cheapest expected rental that holds it, named on the run.
+    pub(crate) fn rent_for(self: &Arc<Self>, run: &RunRow, sku: Option<&str>, gpus: u32) {
         if !lock(&self.renting).insert(run.id.clone()) {
             return;
         }
-        let (me, run, sku) = (self.clone(), run.clone(), sku.to_owned());
+        let (me, run, sku) = (self.clone(), run.clone(), sku.map(str::to_owned));
         self.spawn(async move {
-            let gpus = (gpus > 0).then_some(gpus);
-            let asked = me
-                .ask_rent(
-                    &format!("run-{}", run.id),
-                    &run.hub,
-                    &sku,
-                    gpus,
-                    None,
-                    Some(run.id.clone()),
-                )
-                .await;
-            let rented = match asked {
-                Ok((ask, _)) => match ask.state {
-                    AskState::Pending => me.ask_hub(&ask, None).await.map(|_| ()),
+            let key = format!("run-{}", run.id);
+            let asked = async {
+                if let Some(ask) = me.store().ask(&key).map_err(internal)? {
+                    return Ok(ask);
+                }
+                let (sku, gpus) = match sku {
+                    Some(sku) => (sku, (gpus > 0).then_some(gpus)),
+                    None => me.placed(&run).await?,
+                };
+                let asked = me.ask_rent(&key, &run.hub, &sku, gpus, None, Some(run.id.clone()));
+                Ok(asked.await?.0)
+            };
+            let rented = match asked.await {
+                Ok(ask) => match ask.state {
+                    AskState::Pending => me.ask_hub(&ask, None).await.map(drop),
                     AskState::Done => {
                         let name = ask.machine.unwrap_or_default();
                         me.calcifer
@@ -449,33 +453,92 @@ impl Machines {
                             .map(drop)
                             .map_err(internal)
                     }
-                    AskState::Failed => me
-                        .calcifer
-                        .fail(
-                            &run.id,
-                            Reason {
-                                code: "rental_refused".into(),
-                                message: ask.reason.unwrap_or_default(),
-                            },
-                        )
-                        .map_err(internal),
+                    AskState::Failed => Err(Error::new(
+                        Kind::Conflict,
+                        "rental_refused",
+                        ask.reason.unwrap_or_default(),
+                    )),
                 },
-                Err(error) => me
-                    .calcifer
-                    .fail(
-                        &run.id,
-                        Reason {
-                            code: error.code,
-                            message: error.message,
-                        },
-                    )
-                    .map_err(internal),
+                Err(error) => Err(error),
             };
-            if let Err(e) = rented {
-                warn!(run = %run.id, "renting for it: {e}");
+            if let Err(error) = rented {
+                let reason = Reason {
+                    code: error.code,
+                    message: error.message,
+                };
+                if let Err(e) = me.calcifer.fail(&run.id, reason) {
+                    warn!(run = %run.id, "failing it: {e}");
+                }
             }
             lock(&me.renting).remove(&run.id);
         });
+    }
+
+    /// Asks the run's Hub where to run it: the product to rent and its GPU count. The answer is
+    /// kept on the run as a warning naming the product, its price and why.
+    async fn placed(&self, run: &RunRow) -> Result<(String, Option<u32>), Error> {
+        let spec = v1::RunSpec::decode(run.spec.as_slice()).map_err(internal)?;
+        let Some(v1::run_spec::Source::Release(release)) = &spec.source else {
+            return Err(Error::new(
+                Kind::Usage,
+                "placement_needs_release",
+                "the Hub places a published release: run local code with --on <machine> or \
+                 --on new:<sku>",
+            ));
+        };
+        let request = types::RentalPlacementRequest {
+            package: release.package.clone(),
+            release: Some(release.release.clone()).filter(|r| !r.is_empty()),
+            function: spec.entrypoint.clone(),
+            bits: (spec.bits > 0)
+                .then(|| types::RentalPlacementRequestBits::try_from(i64::from(spec.bits)))
+                .transpose()
+                .map_err(|e| Error::new(Kind::Validation, "bits_invalid", e.to_string()))?,
+            gpus: std::num::NonZeroU64::new(spec.gpus.into()),
+        };
+        let client = self.hubs.client(&run.hub)?;
+        let placement = match client.place_rental(&request).await {
+            Ok(placement) => placement.into_inner(),
+            Err(e) => {
+                return Err(match asked(&run.hub, e.into()) {
+                    Asked::Refused(e) | Asked::Unanswered(e) => e,
+                });
+            }
+        };
+        let Some(top) = placement.machines.first() else {
+            let why: Vec<String> = placement
+                .excluded
+                .iter()
+                .map(|e| format!("{} ×{}: {}", e.name, e.accelerator_count, e.reason))
+                .collect();
+            return Err(Error::new(
+                Kind::Capacity,
+                "placement_none_fits",
+                format!(
+                    "no product the Hub sells now holds this run: {}",
+                    why.join("; ")
+                ),
+            ));
+        };
+        let message = format!(
+            "the Hub placed it on {} ({}× {}, {} GB): ${:.2}/h, about ${:.2} expected, the \
+             cheapest of {} products holding {} GB of {}-bit weights",
+            top.name,
+            top.accelerator_count,
+            top.accelerator_model,
+            top.vram_gb,
+            (top.price_usd_micros_per_hour + top.storage_usd_micros_per_hour) as f64 / 1e6,
+            top.expected_price.total_usd_micros as f64 / 1e6,
+            placement.machines.len(),
+            placement.weight_bytes / 1_000_000_000,
+            placement.bits,
+        );
+        let warning = Warning {
+            code: "placement".into(),
+            message,
+        };
+        self.calcifer.warn(&run.id, &warning).map_err(internal)?;
+        Ok((top.name.clone(), u32::try_from(top.accelerator_count).ok()))
     }
 
     /// Asks again what a Calcifer that stopped had asked a Hub and not heard back. A run asked

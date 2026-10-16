@@ -248,8 +248,9 @@ async fn an_any_run_waits_for_a_rental_that_fits_and_goes_to_it() {
         .unwrap()
         .run
         .id;
+    // A bare `new` asks its Hub where to run it, and this computer is signed in to none.
     let end = until(&mut events, &bare, Event::is_terminal).await;
-    assert_eq!(reason(&end), "sku_required");
+    assert_eq!(reason(&end), "signed_out");
     machines.close();
 
     // A rental its Hub answered for, recorded before this Calcifer started: the waiting run

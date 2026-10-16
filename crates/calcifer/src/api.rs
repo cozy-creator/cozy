@@ -21,7 +21,7 @@ use axum::{
 };
 use cozy_platform::lock::{Kind as LockKind, LockFile};
 use cozy_proto::{
-    calcifer::{Down, Event, On, Run, RunList, Status, SubmitRun, Submitted},
+    calcifer::{Down, Event, Run, RunList, Status, SubmitRun, Submitted},
     error::{Envelope, Error, Kind},
     ids::RunId,
 };
@@ -383,14 +383,6 @@ async fn submit(
     body: Result<Bytes, BytesRejection>,
 ) -> Result<(StatusCode, Json<Submitted>), Refusal> {
     let submit: SubmitRun = parse(&body?)?;
-    if submit.on == On::New(None) {
-        return Err(refuse(
-            Kind::Unavailable,
-            "placement_unavailable",
-            "`--on new` needs the Hub's placement, which this Calcifer cannot ask yet",
-        )
-        .remedy("name a machine with `--on <machine>`, or queue for one with `--on any`"));
-    }
     let submitted = api.calcifer.submit(&key, submit).await?;
     let status = if submitted.replay {
         StatusCode::OK

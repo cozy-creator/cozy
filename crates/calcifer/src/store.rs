@@ -791,6 +791,22 @@ impl Store {
         })
     }
 
+    /// Adds a warning to an unsettled run, answered as its lifecycle event.
+    pub fn warn(&self, id: &str, warning: &Warning) -> Result<Vec<Event>> {
+        self.write(|tx| {
+            let Some(mut row) = run_in(tx, id)?.filter(|row| row.state != State::Settled) else {
+                return Ok(vec![]);
+            };
+            row.warnings.push(warning.clone());
+            let warnings = serde_json::to_string(&row.warnings).expect("serializes");
+            tx.execute(
+                "UPDATE runs SET warnings = ?2 WHERE id = ?1",
+                params![id, warnings],
+            )?;
+            Ok(vec![lifecycle(tx, id)?])
+        })
+    }
+
     /// Records the intent to cancel. Unsent work ends canceled here, in the transaction that the
     /// send boundary races; sent work keeps the intent until its machine's outcome arrives.
     pub fn request_cancel(&self, id: &str) -> Result<Vec<Event>> {

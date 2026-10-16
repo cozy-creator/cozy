@@ -318,6 +318,13 @@ impl Calcifer {
         Ok(renamed)
     }
 
+    /// Adds a warning to an unsettled run.
+    pub fn warn(&self, id: &RunId, warning: &cozy_proto::calcifer::Warning) -> Result<(), Error> {
+        let events = self.store.warn(id.as_str(), warning)?;
+        self.publish(id, events);
+        Ok(())
+    }
+
     /// Ends a run no machine took, with `reason`.
     pub fn fail(&self, id: &RunId, reason: Reason) -> Result<(), Error> {
         let events = self.store.fail(id.as_str(), reason)?;

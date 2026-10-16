@@ -5,8 +5,12 @@ use std::{path::Path, sync::Arc};
 
 use calcifer::{Calcifer, machines::Machines};
 use cozy_platform::paths::Home;
-use cozy_proto::config;
+use cozy_proto::{
+    calcifer::{Kind, On, SubmitRun},
+    config, machine as v1,
+};
 use hub_client::{Client, Credential, DeviceKey, UserSession, testing, types};
+use prost::Message as _;
 use sha2::{Digest as _, Sha256};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -75,6 +79,59 @@ async fn a_hub_is_listed_signed_in_and_a_rent_it_will_not_price_records_nothing(
             .all(|key| !key.file_name().to_string_lossy().starts_with("rental-")),
         "no rental key was kept"
     );
+
+    // A bare `--on new` asks the Hub's placement; nothing holds this run on a Hub with no
+    // provider, so the run fails typed and nothing is rented.
+    let run = calcifer
+        .submit(
+            "calcifer-run-1",
+            SubmitRun {
+                on: On::New(None),
+                hub: origin.clone(),
+                kind: Kind::Call,
+                target: "cozy-test/held/generate".into(),
+                spec: v1::RunSpec {
+                    source: Some(v1::run_spec::Source::Release(v1::Release {
+                        package: "cozy-test/held".into(),
+                        release: String::new(),
+                    })),
+                    entrypoint: "generate".into(),
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+                inputs: vec![],
+                out: None,
+                warnings: vec![],
+            },
+        )
+        .await
+        .unwrap()
+        .run
+        .id;
+    // A hang bound only; the product waits without one.
+    let mut failed = None;
+    for _ in 0..1200 {
+        let row = calcifer.store().run(run.as_str()).unwrap().unwrap();
+        if row.status.is_some() {
+            failed = Some(row);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let failed = failed.expect("the run ended");
+    let reason = failed.reason.unwrap();
+    assert!(
+        ["hub_refused", "placement_none_fits"].contains(&reason.code.as_str()),
+        "{reason:?}"
+    );
+    assert!(
+        calcifer
+            .store()
+            .ask(&format!("run-{run}"))
+            .unwrap()
+            .is_none()
+    );
+    assert!(calcifer.store().machines().unwrap().is_empty());
     assert_eq!(
         machines.end("kiyui").await.unwrap_err().code,
         "machine_not_found"

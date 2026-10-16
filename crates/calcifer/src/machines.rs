@@ -24,7 +24,7 @@ use cozy_platform::{durable, paths::Home};
 use cozy_proto::{
     calcifer::{
         self as wire, Ended, Event, Keepalive, Machine, MachineKind, MachineList, MachineLog,
-        MachineState, MachineStatus, NewMachine, Reason,
+        MachineState, MachineStatus, NewMachine,
     },
     config,
     error::{Error, Kind},
@@ -518,18 +518,9 @@ impl Machines {
                     Ok(None) => Ok(()),
                     Err(e) => Err(crate::Error::Invalid(e.message)),
                 },
-                "new" => self.calcifer.fail(
-                    &run.id,
-                    Reason {
-                        code: "sku_required".into(),
-                        message: "--on new names the product to rent: --on new:<sku> \
-                                  (cozy machine rent lists them)"
-                            .into(),
-                    },
-                ),
+                // `new` rents what the Hub places it on; `new:<sku>` that product.
                 wants => {
-                    let sku = wants.strip_prefix("new:").unwrap_or(wants);
-                    self.rent_for(&run, sku, gpus);
+                    self.rent_for(&run, wants.strip_prefix("new:"), gpus);
                     Ok(())
                 }
             };
