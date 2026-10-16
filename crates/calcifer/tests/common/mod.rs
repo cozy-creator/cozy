@@ -2,7 +2,6 @@
 //! carries) on a temp root that admits the test's key, and run specs it accepts with no Runtime.
 #![allow(dead_code)]
 use std::{
-    os::unix::fs::PermissionsExt as _,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
@@ -10,6 +9,7 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use calcifer::store::{Endpoint, MachineRow};
+use cozy_platform::durable;
 use cozy_proto::{
     calcifer::{Event, MachineKind, MachineState},
     ids::{Digest, RunId},
@@ -46,13 +46,12 @@ impl Tensord {
             .expect("COZY_TEST_TENSORD names the tensord binary these tests run against");
         let root = tempfile::tempdir().unwrap();
         let config = root.path().join("config");
-        std::fs::create_dir_all(&config).unwrap();
         // TensorD refuses configuration others may read.
-        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        durable::private_dir(root.path()).unwrap();
+        std::fs::create_dir_all(&config).unwrap();
         let write = |name: &str, value: serde_json::Value| {
-            let path = config.join(name);
-            std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let bytes = serde_json::to_vec(&value).unwrap();
+            durable::replace(&config.join(name), &bytes, 0o600).unwrap();
         };
         let public = URL_SAFE_NO_PAD.encode(key().verifying_key().to_bytes());
         write("keys.json", serde_json::json!({ "keys": [public] }));
