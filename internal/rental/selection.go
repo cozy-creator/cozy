@@ -36,9 +36,9 @@ type Constraints struct {
 }
 
 // Purchases is every product of the request's class as a placement candidate (cl-165),
-// pinned to the rung its accelerator fits and carrying the verdict that keeps it out —
-// no rung, a device the selection outweighs (cl-168, cl-170), a base image the release
-// contradicts — or none, when it may be bought. The rate is what the renter pays: price
+// sized by the request's lane bytes and carrying the verdict that keeps it out — a device
+// the selection outweighs (cl-168), a base image the release contradicts — or none, when
+// it may be bought. The rate is what the renter pays: price
 // plus storage. A CPU-class request skips the device check: there is no device. `composes`
 // says the request constructs no model of its own, so its callees decide the width.
 func Purchases(skus []hub.RentalSKU, models []records.ModelRef, needsAccelerator, composes bool,
@@ -65,7 +65,29 @@ func Purchases(skus []hub.RentalSKU, models []records.ModelRef, needsAccelerator
 		}
 		out = append(out, c)
 	}
+	if !composes && constraints.GPUs == 0 {
+		fewest(out)
+	}
 	return out
+}
+
+// fewest keeps the fewest cards of each product that hold the run (xs-042): every card of a
+// sequence-parallel group holds the whole weights, so a wider buy holds no more. A wider
+// product stays only where the narrower ones cannot hold it (a working peak measured at a
+// wider degree is smaller), at a degree the package declares.
+func fewest(candidates []orchestrator.PlacementCandidate) {
+	narrowest := map[string]int{}
+	for _, c := range candidates {
+		if c.Verdict == "" && (narrowest[c.SKU] == 0 || c.GPUs < narrowest[c.SKU]) {
+			narrowest[c.SKU] = c.GPUs
+		}
+	}
+	for i := range candidates {
+		if c := &candidates[i]; c.Verdict == "" && c.GPUs > narrowest[c.SKU] {
+			c.Verdict = fmt.Sprintf("%s%s: %s holds the run", orchestrator.VerdictExcluded,
+				orchestrator.ExcludedWidthUnneeded, orchestrator.MachineLabel(c.SKU, narrowest[c.SKU]))
+		}
+	}
 }
 
 // PurchaseWidthUnusable uses package-code capability only. A CPU composition may
@@ -135,33 +157,26 @@ func GPUCountUnusable(available int, requested uint32) string {
 	return ""
 }
 
+// size holds every machine to the same VRAM check: the components the selection stages, or
+// its whole lanes' bytes (xs-042).
 func size(c *orchestrator.PlacementCandidate, models []records.ModelRef, accelerator string,
 	vramGB int64, device bool, working records.WorkingPeaks, count int) {
 	c.RunGPUs = count
 	if accelerator == "CPU" {
 		c.RunGPUs = 0
 	}
-	var ok bool
-	if c.Models, c.Rung, ok = pin(models, accelerator, count); !ok {
-		c.Verdict = orchestrator.VerdictNoRung
-		return
-	}
-	c.Lane = records.Lanes(c.Models)
+	c.Models, c.Lane = models, records.Lanes(models)
 	if !device {
 		return
 	}
-	need := WithWorking(records.Resident(c.Models, accelerator),
-		working.For(c.Models, c.SKU, count))
+	need := WithWorking(records.Resident(models), working.For(models, c.SKU, count))
 	c.Fit, c.Verdict = FitNote(need, vramGB), Fit(need, vramGB, c.SKU)
 }
 
 // WithWorking applies exact total evidence only to component-staged selections.
-// Other selections retain weights-plus-working; rung-asserted fits stay the owner's word.
+// Other selections retain weights-plus-working.
 func WithWorking(need records.Residency, peak records.WorkingPeak) records.Residency {
 	need.Weights = need.Bytes
-	if need.Fit == records.FitRungAsserted {
-		return need
-	}
 	// A total allocator peak already includes the weights resident in its scope.
 	// Adding the largest unrelated scope's weights would invent co-residency.
 	if need.Fit == records.FitComponents {
@@ -185,32 +200,9 @@ func WithWorking(need records.Residency, peak records.WorkingPeak) records.Resid
 	return need
 }
 
-// Pin chooses weight lanes for a machine or requested GPU subset. Rung counts select
-// compatible weight data; only package-code declarations select execution parallelism.
-func Pin(models []records.ModelRef, accelerator string, count int) ([]records.ModelRef, int, bool) {
-	return pin(models, accelerator, count)
-}
-
-func pin(models []records.ModelRef, accelerator string, count int) ([]records.ModelRef, int, bool) {
-	rung := 0
-	pinned := make([]records.ModelRef, 0, len(models))
-	for _, model := range models {
-		fitted, index, ok := model.PurchaseRung(accelerator, count)
-		if !ok {
-			return nil, 0, false
-		}
-		if !model.Pinned() && index+1 > rung {
-			rung = index + 1
-		}
-		pinned = append(pinned, model.Pin(fitted))
-	}
-	return pinned, rung, true
-}
-
 // Fit is the one VRAM sanity floor a buy, a reuse and an explicit override are held to
 // (cl-168): a device is short only when what the selection measurably needs outweighs it.
-// A rung-asserted slot needs no figure — the owner's word stands. VRAMGB is read as GiB,
-// the unit GPU memory is built in (an "80 GB" H100 carries 81920 MiB).
+// VRAMGB is read as GiB, the unit GPU memory is built in (an "80 GB" H100 carries 81920 MiB).
 //
 // ONE CARD, AT EVERY WIDTH, DELIBERATELY (cl-179). VRAMGB is the per-card figure for a
 // wide product as much as a narrow one, and that is the correct test: nothing here is
@@ -322,34 +314,12 @@ func baseMismatch(sku hub.RentalSKU, constraints Constraints) string {
 	return orchestrator.VerdictExcluded + orchestrator.ExcludedBaseMismatch + ": " + reason
 }
 
-// Ladder renders the owner's fit map the candidates were sized by: the lone slot's
-// ladder, or one `slot: …` line per slot when the request binds several; nothing for a
-// slot bound to none.
-func Ladder(models []records.ModelRef) []string {
-	var out []string
-	for _, model := range models {
-		if len(model.Ladder) == 0 {
-			continue
-		}
-		parts := make([]string, 0, len(model.Ladder))
-		for _, rung := range model.Ladder {
-			parts = append(parts, rung.String())
-		}
-		rungs := strings.Join(parts, " > ")
-		if len(models) == 1 {
-			return []string{rungs}
-		}
-		out = append(out, model.BindingSlot()+": "+rungs)
-	}
-	return out
-}
-
 // Override renders the lane(s) the request pinned before any machine existed — an explicit
 // `model.<param>=org/model@release/lane` — the lone slot's lane, or `slot=lane` pairs.
 func Override(models []records.ModelRef) string {
 	var parts []string
 	for _, model := range models {
-		if !model.Pinned() {
+		if !model.Choice || model.Lane == "" {
 			continue
 		}
 		if len(models) == 1 {
@@ -379,9 +349,8 @@ func Attaching(candidates []orchestrator.PlacementCandidate) int {
 // permanent verdict (cl-185):
 //
 //  1. CLASS — a CPU pod cannot serve an accelerator request, ever.
-//  2. GEOMETRY — no rung names this accelerator, or what the pinned lanes need outweighs
-//     its memory. Both are facts about the machine and the binding, so they hold whatever
-//     the pod is doing this second.
+//  2. GEOMETRY — what the sized lanes need outweighs its memory. That is a fact about the
+//     machine and the selection, so it holds whatever the pod is doing this second.
 //  3. LIFECYCLE — and only now. A hub state this build knows to be FINISHED excludes the
 //     machine, naming the state. Every other state, including the whole pre-ready
 //     lifecycle, is a machine on its way: VerdictAttaching, waited for (cl-170), never
@@ -414,8 +383,8 @@ func Standing(c *orchestrator.PlacementCandidate, models []records.ModelRef,
 	// A machine the user already has up is held to the same memory floor as a buy; the
 	// catalog's figure for its product is the fact (a product gone from the catalog this
 	// minute decides nothing). Its GPU count is not held to the package's degrees: the
-	// pod is already paid for, and the selection takes the widest authored group that
-	// fits it (Pin). Cards beyond that group idle; nothing refuses.
+	// pod is already paid for, and the run takes the widest declared group that fits it.
+	// Cards beyond that group idle; nothing refuses.
 	count, verdict := runWidth(c.GPUs, models, composes, constraints)
 	if c.Verdict = verdict; c.Verdict != "" {
 		return false
@@ -505,7 +474,7 @@ func Refusal(req records.Request, d orchestrator.PlacementDecision, needsAcceler
 		return exit.Named(exit.Unavailable, "rental.no_inventory",
 			"every rental SKU fitting %s is out of stock right now (%s) — NOTHING was rented",
 			req.Package, strings.Join(noStock, ", ")).
-			WithRemedy("this is a stock-out, not a bad ladder: a run that meets it twice fails; run it again once stock returns")
+			WithRemedy("this is a stock-out: a run that meets it twice fails; run it again once stock returns")
 	case capped != nil:
 		// The one refusal that names an OPERATOR action rather than weather. Parking on
 		// it would hide a misconfigured cap behind a queue that never drains.
@@ -518,17 +487,16 @@ func Refusal(req records.Request, d orchestrator.PlacementDecision, needsAcceler
 			WithRemedy("publish a release whose requirements one of Tensorhub's offered base images satisfies")
 	case offered == 0:
 		// Nothing on offer to fit. Saying "no SKU fits" over an empty market is the
-		// conflation this branch exists to refuse: it sends the reader to the ladder for
+		// conflation this branch exists to refuse: it sends the reader to the model for
 		// a fact about Tensorhub's inventory.
 		return exit.Named(exit.Unavailable, "rental.catalog_empty",
 			"Tensorhub offered no %s product when %s was placed; %s",
 			class, req.Package, heldOrNothing(verdicts)).
-			WithRemedy("this is an empty catalog, not a bad ladder: a run that meets it twice fails; run it again once Tensorhub offers one")
+			WithRemedy("this is an empty catalog: a run that meets it twice fails; run it again once Tensorhub offers one")
 	}
 	return exit.Named(exit.Capacity, "rental.no_fitting_sku",
 		"no rental SKU on offer fits %s: %s", req.Package, strings.Join(verdicts, "; ")).
-		WithRemedy("bind a lane that fits an offered machine (cozy package bind … --gpu <GPU>=<lane>), " +
-			"or override with model.<param>=org/model@release/lane")
+		WithRemedy("run at fewer bits (--bits=4), or choose a smaller model: model.<param>=org/model@release[/lane]")
 }
 
 // heldOrNothing renders what the fleet DID hold beside an empty catalog, so the reader
@@ -629,38 +597,11 @@ func contains(rows []hub.ModelThroughput, row hub.ModelThroughput) bool {
 // Place is the tier's choice among the open candidates and returns its index, or -1
 // when none is open: `fast` the least time, `cheap` the least cost, `balanced` the least
 // (time / best time) × (cost / best cost) — a candidate worse on both axes cannot win
-// any tier among the first available authored counted purchase rung. Later counted
-// purchase rungs are reconsidered after that rung is refused. Existing rentals and
-// uncounted ladders retain their scoring. Ties break by rung, attachment, queue, rate, name.
-// Unmeasured candidates count only when nothing is measured, attached first and then by
-// rung, the fewest attempts ahead and rate — the ladder's own order, an idle machine
-// before a busy one (cl-174). Every measured candidate's score is written.
-// countedPurchase carries an authored count anywhere in its retained ladder,
-// including a later wildcard fallback whose own count is omitted.
-func countedPurchase(candidate orchestrator.PlacementCandidate) bool {
-	if candidate.Attached() || candidate.Rung == 0 {
-		return false
-	}
-	for _, model := range candidate.Models {
-		for _, rung := range model.Ladder {
-			if rung.GPUs > 0 {
-				return true
-			}
-		}
-	}
-	return false
-}
-
+// any tier. Ties break by attachment, queue, rate, name. Unmeasured candidates count only
+// when nothing is measured, attached first and then by the fewest attempts ahead and rate,
+// an idle machine before a busy one (cl-174). Every measured candidate's score is written.
 func Place(tier string, candidates []orchestrator.PlacementCandidate) int {
-	preferred := 0
-	for _, candidate := range candidates {
-		if candidate.Verdict == "" && countedPurchase(candidate) && (preferred == 0 || candidate.Rung < preferred) {
-			preferred = candidate.Rung
-		}
-	}
-	eligible := func(candidate orchestrator.PlacementCandidate) bool {
-		return candidate.Verdict == "" && (!countedPurchase(candidate) || candidate.Rung == preferred)
-	}
+	eligible := func(candidate orchestrator.PlacementCandidate) bool { return candidate.Verdict == "" }
 	bestTime, bestCost := math.Inf(1), math.Inf(1)
 	for _, c := range candidates {
 		if eligible(c) && c.Measured {
@@ -694,9 +635,6 @@ func prefers(tier string, a, b orchestrator.PlacementCandidate) bool {
 		}
 	} else if a.Attached() != b.Attached() {
 		return a.Attached()
-	}
-	if a.Rung != b.Rung {
-		return a.Rung < b.Rung
 	}
 	if a.Attached() != b.Attached() {
 		return a.Attached()
@@ -733,8 +671,6 @@ func Conclude(candidates []orchestrator.PlacementCandidate, winner int) {
 			continue
 		}
 		switch {
-		case countedPurchase(*chosen) && countedPurchase(*c) && c.Rung > chosen.Rung:
-			c.Verdict = "later_preference"
 		case !c.Measured:
 			c.Verdict = orchestrator.VerdictUnmeasured
 		case c.TimeS > chosen.TimeS:

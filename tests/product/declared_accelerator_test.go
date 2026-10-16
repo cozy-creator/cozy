@@ -18,8 +18,7 @@ import (
 // shape; each is sent to the owner's named CPU rental through the real binary and Calcifer
 // against the stand-in hub, which buys nothing.
 func TestDeclaredAcceleratorDecidesTheRentalClass(t *testing.T) {
-	h := newLadderHub(t)
-	h.bind(goodLadder())
+	h := newStandInHub(t, h3Default)
 	var doc map[string]any
 	must(t, json.Unmarshal(h.iface, &doc))
 	// As sdxl's `generate`: invocable, so a CPU workflow could call it and reserve its slot.
@@ -43,17 +42,17 @@ func TestDeclaredAcceleratorDecidesTheRentalClass(t *testing.T) {
 	h.mux.HandleFunc("POST /v1/packages/proof/h3/download", func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(declaredInstallPlan("h3", r.URL.Query().Get("release"), declared))
 	})
-	root := ladderRoot(t, h)
+	root := standInRoot(t, h)
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()
 	plantAttached(t, root, h, store, records.Rental{AcceleratorCount: 1, ID: "pr-karam", MachineName: "karam", SKU: "cpu",
 		AcceleratorModel: "CPU", HourlyRateUSDMicros: 70_000, State: "ready", Hub: h.server.URL}, true)
 	startCalciferProcess(t, root)
-	source := "--model.pruned=" + ladderModel + "@" + ladderRelease + "/" + ladderLane
+	source := "--model.pruned=" + h3Model + "@" + h3Release + "/" + h3Lane
 	run := func(function, key string) *records.Request {
 		t.Helper()
-		_, out := runCozy(t, root, "run", ladderPackage+"/"+function, source, "--rental=karam", "--json", "--idempotency-key", key)
+		_, out := runCozy(t, root, "run", h3Package+"/"+function, source, "--rental=karam", "--json", "--idempotency-key", key)
 		row, problem := store.RequestByIdempotencyKey(key)
 		fatal(t, problem)
 		if row == nil {

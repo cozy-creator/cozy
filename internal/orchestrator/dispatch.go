@@ -89,6 +89,8 @@ type Submission struct {
 	AttentionKernel string
 	// GPUs is zero for automatic package-supported parallelism or an exact user count.
 	GPUs uint32
+	// Bits is the run's weight precision (16, 8 or 4); zero lets the machine's rules choose.
+	Bits uint32
 	// OutputExport is the derived publication obligation: the directory (explicit or
 	// default) and the result-file contract. It changes no execution fact and is settled
 	// independently after the terminal mirror.
@@ -198,6 +200,16 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 			return records.Request{}, nil, exit.Internalf("cannot digest GPU count identity: %s", err)
 		}
 	}
+	if s.Bits > 0 {
+		identity, err := canonical.Write(map[string]canonical.Value{"body_digest": bodyDigest, "bits": int64(s.Bits)})
+		if err != nil {
+			return records.Request{}, nil, exit.Internalf("cannot encode precision identity: %s", err)
+		}
+		bodyDigest, err = canonical.Spell(canonical.Digest(identity))
+		if err != nil {
+			return records.Request{}, nil, exit.Internalf("cannot digest precision identity: %s", err)
+		}
+	}
 	if s.AttentionKernel != "" {
 		identity, err := canonical.Write(map[string]canonical.Value{
 			"body_digest":      bodyDigest,
@@ -247,7 +259,7 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 		Assets:              s.Assets,
 		Kind:                s.Kind, NeedsAccelerator: s.NeedsAccelerator, WritesWeights: s.WritesWeights,
 		RequestedRental: s.RequestedRental,
-		AttentionKernel: s.AttentionKernel, GPUs: s.GPUs,
+		AttentionKernel: s.AttentionKernel, GPUs: s.GPUs, Bits: s.Bits,
 		Worker: s.Worker, InstallID: s.InstallID, Rental: s.Rental,
 		RentalRequired: s.RentalRequired, RentNew: s.RentNew, Models: s.Models,
 		OutputExport: s.OutputExport, ModelTransfer: s.ModelTransfer, PlannedSourceBytes: s.PlannedSourceBytes,
@@ -269,6 +281,9 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 	}
 	if s.GPUs > 0 {
 		event["gpus"] = s.GPUs
+	}
+	if s.Bits > 0 {
+		event["bits"] = s.Bits
 	}
 	if s.AttentionKernel != "" {
 		event["attention_kernel"] = s.AttentionKernel

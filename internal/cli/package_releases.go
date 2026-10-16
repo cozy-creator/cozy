@@ -15,10 +15,12 @@ import (
 
 	pep440 "github.com/aquasecurity/go-pep440-version"
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/output"
 	"github.com/cozy-creator/cozy/internal/packagepublish"
+	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/transfer"
 )
 
@@ -155,7 +157,7 @@ func handlePackagePublish(ctx *Context) *exit.Error {
 	for _, dependency := range pack.Vendored {
 		record.Notes = append(record.Notes, packagepublish.VendoredNote(account.Name, dependency))
 	}
-	record.Notes = append(record.Notes, packageChanged(ctx, ref)...)
+	record.Notes = append(record.Notes, changed(ctx, ref)...)
 	return emit(ctx, record)
 }
 
@@ -201,8 +203,22 @@ func handlePackageYank(ctx *Context) *exit.Error {
 		{K: "status", V: "yanked"}, {K: "changed", V: yanked.Changed},
 		{K: "yanked_at", V: yanked.YankedAt},
 	}, "package", "release", "status")
-	record.Notes = packageChanged(ctx, ref)
+	record.Notes = changed(ctx, ref)
 	return emit(ctx, record)
+}
+
+// changed records that this command changed ref's releases: every later run carries the new
+// catalog revision, and a machine holding what it resolved before re-resolves.
+func changed(ctx *Context, ref hub.Ref) []string {
+	store, problem := records.Open(home.Paths(ctx.Cfg.Home).DB)
+	if problem == nil {
+		defer store.Close()
+		_, problem = store.ChangeBindingRevision()
+	}
+	if problem != nil {
+		return []string{"machines keep what they resolved of " + ref.String() + ": " + problem.Message}
+	}
+	return nil
 }
 
 // packageFiles measures the PyPI-shaped release: one or more project wheels, one source

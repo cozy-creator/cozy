@@ -18,6 +18,7 @@ use cozy_platform::{
     durable,
     lock::{Kind as LockKind, LockFile},
     paths::Home,
+    process,
     service::Services,
 };
 use cozy_proto::{
@@ -51,6 +52,12 @@ pub enum Stopped {
 /// Its log is its stdout (the service's `calcifer.log`).
 pub fn main() -> ExitCode {
     tracing_subscriber::fmt().init();
+    // Before the runtime's workers start: Linux names the calling thread.
+    if let Err(e) = process::set_name("calcifer")
+        && !e.is_unsupported()
+    {
+        warn!("{e}");
+    }
     let served = match config::load(Flags::default()) {
         Ok(loaded) => match tokio::runtime::Runtime::new() {
             Ok(runtime) => runtime.block_on(serve(&loaded)),
@@ -114,10 +121,6 @@ pub async fn serve(loaded: &Loaded) -> Result<Stopped, Error> {
     for warning in &loaded.warnings {
         warn!("{warning}");
     }
-    // A killed predecessor's record (`Held` keeps it beside the lock) names nobody now.
-    let mut stale = lock.path().as_os_str().to_owned();
-    stale.push(".holder");
-    let _ = std::fs::remove_file(stale);
 
     let calcifer = Calcifer::open(&home.calcifer(), &home.outputs())
         .map_err(|e| failed(Error::new(Kind::Internal, "calcifer_store", e.to_string())))?;

@@ -19,8 +19,8 @@ import (
 
 // `cozy model download` names the model (th-245): this computer's machine resolves its release
 // lane with the Hub's closure, anonymously, and downloads the checkpoint the closure names, by
-// release and lane, and by the name alone, which reads the release's default lane once its
-// owner names one. No hash travels and no capability is traded.
+// release and lane, or by lane alone (the newest release publishing it). No hash travels and
+// no capability is traded.
 func TestAModelDownloadNamesItsReleaseAndLane(t *testing.T) {
 	if *machineHostBinary == "" {
 		t.Skip("requires -machine-host: this computer's machine downloads the model")
@@ -73,29 +73,19 @@ func TestAModelDownloadNamesItsReleaseAndLane(t *testing.T) {
 			doors.ServeHTTP(w, r)
 		}
 	})
-	// Two lanes of one checkpoint; the release's default lane (th-245) is what a ref with no
-	// lane reads, and the owner sets it with `model publish --default-lane`.
-	defaultLane, published := "", ""
+	// Two lanes of one checkpoint: a download names the lane it moves, or the release must
+	// publish only one.
 	account := h.server.Config.Handler
 	h.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		lane := func(name string) map[string]any {
 			return map[string]any{"lane": name, "manifest_id": "sha256:" + digest, "components": []string{}, "bytes": len(closure)}
 		}
-		release := map[string]any{"release": "1.0.0", "revision": 1, "default_lane": defaultLane, "lanes": []any{lane("bf16"), lane("fp8-pruned")}}
-		switch {
-		case r.Method == http.MethodGet && r.URL.Path == "/v1/models/proof/probe":
+		release := map[string]any{"release": "1.0.0", "revision": 1, "lanes": []any{lane("bf16"), lane("fp8-pruned")}}
+		if r.Method == http.MethodGet && r.URL.Path == "/v1/models/proof/probe" {
 			_ = json.NewEncoder(w).Encode(map[string]any{"model": map[string]string{"org": "proof", "name": "probe"}, "releases": []any{release}})
-		case r.Method == http.MethodPost && r.URL.Path == "/v1/models/proof/probe/releases/1.0.0":
-			var body struct {
-				DefaultLane string `json:"default_lane"`
-			}
-			_ = json.NewDecoder(r.Body).Decode(&body)
-			published, defaultLane = body.DefaultLane, body.DefaultLane
-			_ = json.NewEncoder(w).Encode(map[string]any{"release": "1.0.0", "revision": 1, "changed": true, "default_lane": defaultLane,
-				"lanes": []any{map[string]string{"lane": "bf16", "checkpoint_id": "sha256:" + digest}, map[string]string{"lane": "fp8-pruned", "checkpoint_id": "sha256:" + digest}}})
-		default:
-			account.ServeHTTP(w, r)
+			return
 		}
+		account.ServeHTTP(w, r)
 	})
 	root, err := os.MkdirTemp("", "czn")
 	must(t, err)
@@ -123,18 +113,17 @@ func TestAModelDownloadNamesItsReleaseAndLane(t *testing.T) {
 		}
 	}
 	download("proof/probe@1.0.0/bf16")
-	if code, out := runCozy(t, root, "model", "publish", "proof/probe", "--release", "1.0.0", "--default-lane", "fp8-pruned", "--json"); code != 0 || published != "fp8-pruned" || !strings.Contains(out, `"default_lane":"fp8-pruned"`) {
-		t.Fatalf("model publish --default-lane [exit %d] sent %q\n%s", code, published, out)
+	if code, out := runCozy(t, root, "model", "download", "proof/probe", "--json"); code == 0 || !strings.Contains(out, "has 2 lanes") {
+		t.Fatalf("a download naming no lane of a two-lane release was not refused [exit %d]\n%s", code, out)
 	}
-	download("proof/probe")
-	download("proof/probe@1.0.0")
+	download("proof/probe#fp8-pruned")
 	mu.Lock()
 	defer mu.Unlock()
 	t.Logf("the machine asked the closure for: %q", asked)
 	if len(asked) < 2 || asked[0] != "proof/probe@1.0.0 bf16" || !slices.Contains(asked, "proof/probe@1.0.0 fp8-pruned") || slices.ContainsFunc(asked, func(ask string) bool {
 		return strings.HasPrefix(ask, "proof/probe@sha256:") || strings.Contains(ask, "DPoP")
 	}) {
-		t.Fatalf("the machine did not resolve the model by name and default lane, anonymously: %q", asked)
+		t.Fatalf("the machine did not resolve the model by name and lane, anonymously: %q", asked)
 	}
 	if trades := h.hubAccess.trades(); len(trades) != 0 {
 		t.Fatalf("a public model download traded a capability: %d", len(trades))

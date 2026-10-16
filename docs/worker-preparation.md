@@ -84,12 +84,13 @@ client kept under its current catalog revision, else the selected Hub's newest. 
 rental it is the newest release that machine holds from the selected Hub (`cozy package
 install|update --rental` change it), else the Hub's newest; a run the fleet places names the
 Hub's newest. The CLI checks the payload against that release's interface, and both the
-submission and `cozy run show` name it. The run names that release and each model as
-`org/name@release` with a lane or the binding's GPU rungs, never a hash (th-245): a machine
-that does not hold them reads the release's card and lock, and resolves each release lane
-with the Hub's closure, by name and anonymously. Only the owner's own checkpoint travels by
-hash, read under the run's capability. The run also carries the catalog revision, so a
-warm run reads nothing at any Hub, and a publish, yank or bind moves the revision: the
+submission and `cozy run show` name it. The run names that release, its `--bits`, and only the
+models the caller chose, as `org/name@release[/lane]`, never a hash (th-245); every other slot
+takes its declared default release on the machine (xs-042). A machine that does not hold them
+reads the release's card and lock, picks each slot's lane from its GPUs' family unless one is
+named, and resolves it with the Hub's closure, by name and anonymously. Only the owner's own
+checkpoint travels by hash, read under the run's capability. The run also carries the catalog
+revision, so a warm run reads nothing at any Hub, and a publish or yank moves the revision: the
 next run asks again. A package missing from the selected Hub fails even when this computer or the
 worker holds it from another Hub.
 Only an explicit local source path takes the local-code upload path.

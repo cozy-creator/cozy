@@ -197,7 +197,7 @@ func TestAccountIndexDependencyTravelsWithItsCapture(t *testing.T) {
 }
 
 // A local package calls a function of another package it takes from its author's account index.
-// That function's Weights slot declares a default ladder and nobody bound or chose a model for it. Each
+// That function's Weights slot declares a default release and nobody chose a model for it. Each
 // machine gives the slot its declared default: no binding is read at any Hub and the caller
 // names nothing (run 5327 failed `model_choice_absent` on exactly this).
 func TestAnIndexCalleesUnchosenSlotTakesItsDeclaredDefault(t *testing.T) {
@@ -221,7 +221,7 @@ class Touched(msgspec.Struct, frozen=True):
     value: int
 
 
-@invocable(defaults={"source": [{"gpu": "*", "lane": "proof/probe@1.0.0/bf16"}]})
+@invocable(defaults={"source": "proof/probe@1.0.0"})
 async def touch(ctx: Context, *, value: int, source: Weights[Probe]) -> Touched:
     return Touched(value + 7)
 

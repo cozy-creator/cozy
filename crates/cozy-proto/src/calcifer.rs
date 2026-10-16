@@ -4,8 +4,14 @@
 //! Durable events carry a `sequence_number`, per run and monotonic; a reconnect with
 //! `starting_after=N` gets the run's current lifecycle event, each output item changed after N at
 //! its newest revision, and every log line after N. Live events (`run.progress`, `run.waiting`)
-//! carry none and are never replayed, but the latest of each is sent on connect. The terminal
-//! events `run.completed`, `run.failed` and `run.canceled` end the stream.
+//! carry none and are never replayed, but the latest of each is sent on connect.
+//!
+//! An output's bytes land on this computer after its revision is recorded: `output_item.landed`
+//! carries the item with its `path` once its file holds the item's current revision (an item
+//! that will not land is `output_item.done` again, carrying `export_error`). A reconnect replays
+//! a landed item as `output_item.landed`, the whole item. The terminal events `run.completed`,
+//! `run.failed` and `run.canceled` end the run; its stream ends after the terminal once each of
+//! its outputs has landed or carries an `export_error`.
 use std::{fmt, net::SocketAddr, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -184,9 +190,12 @@ pub struct OutputItem {
     /// The final bytes' digest, once done.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha256: Option<Digest>,
-    /// Where its bytes land on this computer.
+    /// The file on this computer that holds this revision's bytes, once they landed there.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<PathBuf>,
+    /// Why this revision's bytes will not land (its machine ended, or holds them no more).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub export_error: Option<String>,
 }
 
 /// The machine's progress report, as it last sent it.
@@ -241,6 +250,13 @@ pub enum Event {
     },
     #[serde(rename = "output_item.done")]
     OutputDone {
+        sequence_number: u64,
+        output_index: u32,
+        item: OutputItem,
+    },
+    /// The item's file on this computer holds its current revision (`item.path`).
+    #[serde(rename = "output_item.landed")]
+    OutputLanded {
         sequence_number: u64,
         output_index: u32,
         item: OutputItem,
@@ -322,6 +338,9 @@ impl Event {
             | Event::OutputDone {
                 sequence_number, ..
             }
+            | Event::OutputLanded {
+                sequence_number, ..
+            }
             | Event::Log {
                 sequence_number, ..
             }
@@ -332,7 +351,7 @@ impl Event {
         }
     }
 
-    /// Whether the run ends here: the stream closes after it.
+    /// Whether the run ends here: nothing about it changes after it but its outputs landing.
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,

@@ -57,19 +57,14 @@ type ModelRef = records.ModelRef
 type PlacementDecision struct {
 	Tier         string `json:"tier"`
 	ConfigDigest string `json:"config_digest"`
-	// Ladder is the owner's fit map the candidates were sized by (`H100=fp8 > *=bf16`),
-	// one entry per slot when slots differ; none when the request binds no ladder.
-	// Override is the lane the request pinned itself — an explicit `model.<param>=…/lane`
-	// (cl-170) — which is not a rung and asserts no fit.
-	Ladder     []string              `json:"ladder,omitempty"`
+	// Override is the lane the request pinned itself: an explicit `model.<param>=…/lane`.
 	Override   string                `json:"override,omitempty"`
 	Throughput []hub.ModelThroughput `json:"throughput"`
 	Candidates []PlacementCandidate  `json:"candidates"`
 	// RentalID is the machine chosen; empty on a decision to wait for one attaching.
 	RentalID string `json:"rental,omitempty"`
 	Bought   bool   `json:"bought"`
-	// Models is the request's selection pinned to the chosen machine's rung; nil when
-	// the request was already exact.
+	// Models is the selection the chosen machine was sized by.
 	Models []ModelRef `json:"-"`
 }
 
@@ -85,10 +80,8 @@ type PlacementCandidate struct {
 	// GPUs is the machine's GPU count: the product width a buy asks for, or an attached
 	// rental's own.
 	GPUs int `json:"gpus"`
-	// Rung is the 1-based ladder rung the machine fell under — 0 under an explicit lane,
-	// which is not a rung — and Lane the lane it pins; Fit says how the device was sized
-	// against that lane (cl-168, cl-170).
-	Rung int    `json:"rung,omitempty"`
+	// Lane is the lane the machine was sized by; Fit says how the device was sized against
+	// it (cl-168).
 	Lane string `json:"lane,omitempty"`
 	Fit  string `json:"fit,omitempty"`
 	// Ahead is the attempts a new request waits behind on an attached rental.
@@ -120,8 +113,6 @@ const (
 	// `ready` pod whose worker has not attached. The request waits for it (cl-170) and
 	// is never failed on it (cl-185).
 	VerdictAttaching = "attaching"
-	// VerdictNoRung: no rung of the binding ladder names this machine's accelerator.
-	VerdictNoRung = "no_rung"
 	// VerdictNoStock: the hub refused the buy for want of inventory, and the choice repeated.
 	VerdictNoStock = "no_stock"
 	// VerdictExcluded is a prefix; the reason follows (`excluded:vram_short: …`).
@@ -195,11 +186,8 @@ func (d PlacementDecision) Line() string {
 	if c.Attached() {
 		line = "placement: reuse " + c.describe()
 	}
-	switch {
-	case c.Measured:
+	if c.Measured {
 		return fmt.Sprintf("%s — %s, %.0f s, $%.2f", line, d.Tier, c.TimeS, float64(c.CostUSDMicros)/1e6)
-	case c.Rung > 0:
-		return fmt.Sprintf("%s — %s, unmeasured (rung %d)", line, d.Tier, c.Rung)
 	}
 	return fmt.Sprintf("%s — %s, unmeasured", line, d.Tier)
 }
@@ -272,6 +260,9 @@ const (
 	// across it. The worker would refuse `device_group_unsupported` on arrival, so the
 	// exclusion belongs here, before the pod is paid for (cl-179).
 	ExcludedWidthUndeclared = "width_undeclared"
+	// ExcludedWidthUnneeded: fewer cards of the same product hold the run, and every card of
+	// a group holds the whole weights, so the wider buy would idle its extra cards (xs-042).
+	ExcludedWidthUnneeded = "width_unneeded"
 	// ExcludedDiskShort is spelled with the rental's disk and the need appended: the
 	// container disk the Hub bought cannot hold the request's ingest.
 	ExcludedDiskShort = "disk_short"

@@ -10,11 +10,15 @@ import (
 	v1 "github.com/cozy-creator/cozy/protocol/cozy/machine/v1"
 )
 
-// ModelChoices is shared by release roots, frozen captures and private serving
-// preparation. Explicit child targets keep the complete package/slot identity.
+// ModelChoices are the caller's own choices, as a machine is sent them (xs-042 C6): a slot
+// with none takes its declared default there, and a fact a rental was sized by is never
+// sent. Explicit child targets keep the complete package/slot identity.
 func ModelChoices(request records.Request, models []ModelRef) ([]*v1.ModelChoice, *exit.Error) {
 	var out []*v1.ModelChoice
 	for _, model := range models {
+		if !model.Choice {
+			continue
+		}
 		path := model.BindingSlot()
 		entrypoint, parameter, attributed := strings.Cut(path, ".models.")
 		if !attributed {
@@ -30,8 +34,9 @@ func ModelChoices(request records.Request, models []ModelRef) ([]*v1.ModelChoice
 		choice := &v1.ModelChoice{Parameter: parameter, Repository: model.Model,
 			Release: model.Release, Lane: model.Lane, Source: model.Source,
 			Profiles: model.Profiles, Adapters: downloadAdapters(model.Adapters)}
-		// Names for the machine (th-245): it resolves the release and lane at the Hub. A hash
-		// travels only for a checkpoint by hash: the owner's at the Hub, or one the machine holds.
+		// Names for the machine (th-245): it resolves the release, and the lane its rules pick
+		// when none is named, at the Hub. A hash travels only for a checkpoint by hash: the
+		// owner's at the Hub, or one the machine holds.
 		switch {
 		case model.Source != "":
 		case model.Release == "" && model.Manifest != "":
@@ -41,12 +46,8 @@ func ModelChoices(request records.Request, models []ModelRef) ([]*v1.ModelChoice
 			}
 			choice.Manifest, _ = canonical.Spell(digest)
 			choice.ManifestLength = uint64(max(model.ManifestLength, 0))
-		case model.Model == "":
+		case model.Model == "" && len(model.Adapters) == 0:
 			return nil, exit.Named(exit.Internal, "model.choice_unresolved", "%s reached its machine with no model", path)
-		case model.Lane == "":
-			for _, rung := range model.Ladder {
-				choice.Rungs = append(choice.Rungs, &v1.ModelRung{Gpu: rung.GPU, Gpus: uint32(max(rung.GPUs, 0)), Lane: rung.Lane})
-			}
 		}
 		out = append(out, choice)
 	}

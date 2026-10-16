@@ -90,8 +90,7 @@ func exactMemoryDigest(digest string) bool {
 }
 
 // exactModelsDigest includes manifests and ordered adapter semantics. Catalog names
-// alone are insufficient for private checkpoints. Sizing and ladder observations
-// are excluded so pinning a candidate produces the same execution identity.
+// alone are insufficient for private checkpoints. Sizing observations are excluded.
 func exactModelsDigest(models []ModelRef) string {
 	rows := make([]string, 0, len(models))
 	for _, model := range models {
@@ -142,14 +141,15 @@ func exactMemoryRequest(req Request) string {
 	return measurementDigest(struct {
 		Package, Release, Entrypoint, Kind, Plan, Kernel string
 		GPUs                                             uint32 `json:",omitempty"`
+		Bits                                             uint32 `json:",omitempty"`
 		Payload                                          json.RawMessage
 		Assets                                           []AssetBinding
 	}{req.Package, req.Release, req.Entrypoint, req.Kind, req.PlanID,
-		req.AttentionKernel, req.GPUs, payload, assets})
+		req.AttentionKernel, req.GPUs, req.Bits, payload, assets})
 }
 
 // ModelsDigest names a pinned model selection: every slot's model, release and
-// lane, and its adapters, independent of order. Sizing facts (bytes, ladders) are
+// lane, and its adapters, independent of order. Sizing facts (bytes) are
 // excluded, so the recorded and the sized selection agree whenever they execute
 // the same weights.
 func ModelsDigest(models []ModelRef) string {
@@ -265,8 +265,8 @@ func recordDeviceMemoryTx(tx *sql.Tx, t Terminal) *exit.Error {
 			return exit.Internalf("cannot read rental %s for its measurement: %s", req.Worker, err)
 		}
 	}
-	// This archived outcome has no attested execution degree. Neither a weight-fit
-	// rung nor the rental's physical count proves how many GPUs served it. Keep
+	// This archived outcome has no attested execution degree. The rental's physical
+	// count does not prove how many GPUs served it. Keep
 	// working-memory evidence, but leave its width unknown for exact-total matching.
 	pkg, release, entrypoint := measurementSubject(req)
 	if _, err := tx.Exec(`INSERT INTO device_memory_measurements(request_id,attempt,package,release,

@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/launch"
@@ -10,58 +9,17 @@ import (
 )
 
 // A child's model slot is chosen by the machine that runs it: a retained ModelArtifact in the
-// child's payload, else a choice the caller named, else the callee's authored default ladder,
-// with the rung for that machine's GPUs. Before any machine exists, a composition's rental is
-// sized by those same defaults.
+// child's payload, else a choice the caller named, else the callee's authored default, at the
+// lane the machine's rules pick for its GPUs. Before any machine exists, a composition's rental
+// is sized by those defaults' lane bytes.
 
-// childModelLadder is a callee slot's authored default with its rung still open, every rung
-// resolved against the model card. The machine decision reads it to keep a composition off a
-// card no shot of it declares a lane for.
-func (r *Resolver) childModelLadder(cards cardReader, pkg, entrypoint string, slot launch.Slot) (orchestrator.ModelRef, *exit.Error) {
-	var empty orchestrator.ModelRef
-	binding := slot.Default(packageOwner(pkg, []launch.Slot{slot}, r.namespace))
-	if binding == nil || len(binding.Ladder) == 0 {
-		return empty, exit.Named(exit.NotFound, "child.model_unbound",
-			"%s declares no default for %s model slot %s", pkg, entrypoint, slot.Path)
-	}
-	model, release, _, _, problem := hub.ParseModelRef(binding.Ref())
-	if problem != nil {
-		return empty, problem
-	}
-	ref, problem := hub.ParseRef(model)
-	if problem != nil {
-		return empty, problem
-	}
-	if ref.Org == "local" {
-		return empty, exit.Named(exit.Unavailable, "child.model_local_selection",
-			"%s selects the private local model %s for %s, which cannot be granted to a captured child",
-			pkg, ref.String(), slot.Path)
-	}
+// childSizedDefault is a callee slot's default at the lane a rental is sized by.
+func (r *Resolver) childSizedDefault(cards cardReader, pkg, entrypoint string, slot launch.Slot, bits uint32) (orchestrator.ModelRef, *exit.Error) {
 	hctx, cancel := hub.Context()
 	defer cancel()
-	_, selected, problem := modelReleaseCard(hctx, cards, ref, release)
-	if problem != nil {
-		return empty, problem
-	}
-	rungs := make([]records.ModelRung, 0, len(binding.Ladder))
-	for _, rung := range binding.Ladder {
-		lane, problem := laneOf(ref, selected, rung.Lane)
-		if problem != nil {
-			return empty, problem
-		}
-		if problem := requireCheckpointComponents(ref.String()+"@"+selected.Release+"/"+rung.Lane, slot, lane.Components); problem != nil {
-			return empty, problem
-		}
-		if _, err := canonical.Raw(lane.ManifestID); err != nil {
-			return empty, exit.Named(exit.Conflict, "child.model_manifest_invalid",
-				"Tensorhub returned an invalid manifest for %s@%s/%s", ref.String(), selected.Release, rung.Lane)
-		}
-		rungs = append(rungs, records.ModelRung{GPU: rung.GPU, GPUs: rung.GPUs, Lane: rung.Lane,
-			Manifest: lane.ManifestID, Bytes: lane.Bytes, ComponentBytes: lane.ComponentBytes})
-	}
-	return orchestrator.ModelRef{Package: pkg, Slot: slot.Param, BindingPath: slot.Path,
-		Model: ref.String(), CatalogRepository: ref.String(), Release: selected.Release, ComponentUse: slot.ComponentUse,
-		SupportedGPUs: slot.SupportedGPUCounts(), Ladder: rungs}, nil
+	model, problem := sizedDefault(hctx, cards, pkg, packageOwner(pkg, []launch.Slot{slot}, r.namespace), slot, int(bits))
+	model.Callable = pkg + "/" + entrypoint
+	return model, problem
 }
 
 // UnpublishedChildModels supplies captured defaults for a CPU request's rental choice.
@@ -106,7 +64,7 @@ func (r *Resolver) UnpublishedChildModels(request records.Request) ([]records.Mo
 				return nil, problem
 			}
 			for _, slot := range fn.Models {
-				selected, problem := r.childModelLadder(r.catalog(request.Hub), child.Package, binding.Entrypoint, slot)
+				selected, problem := r.childSizedDefault(r.catalog(request.Hub), child.Package, binding.Entrypoint, slot, request.Bits)
 				if problem != nil {
 					// This is advisory sizing for an unknown future call. An
 					// inaccessible default may be unused or explicitly overridden;
@@ -114,8 +72,6 @@ func (r *Resolver) UnpublishedChildModels(request records.Request) ([]records.Mo
 					// an actual omitted argument requires that source.
 					continue
 				}
-				selected.Slot = slot.Path
-				selected.Callable = child.Package + "/" + binding.Entrypoint
 				out = append(out, selected)
 			}
 			queue = append(queue, binding.ChildInstallID)

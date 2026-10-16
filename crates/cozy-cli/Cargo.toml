@@ -18,8 +18,11 @@ cozy-proto.workspace = true
 getrandom.workspace = true
 hex.workspace = true
 hub-client.workspace = true
+indicatif.workspace = true
 infer.workspace = true
 progenitor-client.workspace = true
+prost.workspace = true
+ratatui.workspace = true
 reqwest.workspace = true
 self-replace.workspace = true
 semver.workspace = true
@@ -30,7 +33,7 @@ sha2.workspace = true
 sigstore-verify.workspace = true
 supports-hyperlinks.workspace = true
 tempfile.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["signal"] }
 toml_edit.workspace = true
 url.workspace = true
 

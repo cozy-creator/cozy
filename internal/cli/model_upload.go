@@ -12,7 +12,6 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
-	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/machines"
 	"github.com/cozy-creator/cozy/internal/modelsource"
 	"github.com/cozy-creator/cozy/internal/modeltransfer"
@@ -149,7 +148,7 @@ func transferSource(ctx *Context, raw string, upload bool) (records.ModelRef, st
 		source, problem := pinnedProviderSource(ctx, parsed.Canonical)
 		return records.ModelRef{Slot: "model", Source: source}, "", problem
 	}
-	model, problem := resolveRemoteModel(ctx, client(ctx), "", launch.Slot{}, raw, lane, nil)
+	model, problem := exactModel(ctx, raw, lane)
 	model.Slot = "model"
 	return model, "", problem
 }

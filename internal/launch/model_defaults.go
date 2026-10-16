@@ -8,67 +8,56 @@ import (
 	"github.com/cozy-creator/cozy/internal/hub"
 )
 
-var authoredLanePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._+!-]{0,127}$`)
 var digestShapedRelease = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
-// relativeOwner stands in for the package's own account while an org-relative lane is
-// parsed; it never leaves this file.
-const relativeOwner = "owner"
-
-// defaultModelBinding validates and lowers immutable metadata once at descriptor
-// admission. Resolution reuses this value; it never invents a persisted Hub row. An
-// org-relative lane (`model@release/lane`) lowers to a model with no org, which
-// Slot.Default qualifies with the package's owner.
-func defaultModelBinding(slot Slot) (*hub.PackageBindingRow, *exit.Error) {
-	if len(slot.DefaultLadder) == 0 {
-		return nil, nil
+// validateDefault admits a slot's authored default once, at descriptor admission (xs-042 C1):
+// `[org/]model@release`, an explicit release and never a digest or a lane.
+func validateDefault(slot Slot) *exit.Error {
+	if slot.Default == "" {
+		return nil
 	}
-	row := &hub.PackageBindingRow{Slot: slot.Path}
-	for _, rung := range slot.DefaultLadder {
-		if rung.GPUs > 1 && !slot.sequenceParallelDegrees()[rung.GPUs] {
-			return nil, exit.Named(exit.Validation, "package_model_default_invalid", "%s default count %d is not a declared sequence-parallel degree", slot.Path, rung.GPUs)
-		}
-		spelled := rung.Lane
-		name, _, _ := strings.Cut(spelled, "@")
-		relative := !strings.Contains(name, "/")
-		if relative {
-			spelled = relativeOwner + "/" + spelled
-		}
-		model, release, lane, manifest, problem := hub.ParseModelRef(spelled)
-		if problem != nil || manifest != "" || strings.TrimSpace(rung.Lane) != rung.Lane || !hub.ValidModelLabel(release) || digestShapedRelease.MatchString(release) || !authoredLanePattern.MatchString(lane) {
-			return nil, exit.Named(exit.Validation, "package_model_default_invalid", "%s default lane %q must be [org/]model@release/lane", slot.Path, rung.Lane)
-		}
-		if relative {
-			model = strings.TrimPrefix(model, relativeOwner+"/")
-		}
-		if row.Model != "" && (row.Model != model || row.Release != release) {
-			return nil, exit.Named(exit.Validation, "package_model_default_invalid", "%s default ladder must use the same model and release in every rung", slot.Path)
-		}
-		row.Model, row.Release = model, release
-		row.Ladder = append(row.Ladder, hub.BindingRung{GPU: rung.GPU, GPUs: rung.GPUs, Lane: lane})
+	spelled := slot.Default
+	if slot.RelativeDefault() {
+		spelled = "owner/" + spelled
 	}
-	if problem := hub.ValidateLadder(row.Ladder); problem != nil {
-		return nil, exit.Named(exit.Validation, "package_model_default_invalid", "%s default ladder: %s", slot.Path, problem.Message)
+	_, release, lane, manifest, problem := hub.ParseModelRef(spelled)
+	if problem != nil || lane != "" || manifest != "" || strings.TrimSpace(slot.Default) != slot.Default ||
+		!hub.ValidModelLabel(release) || digestShapedRelease.MatchString(release) {
+		return exit.Named(exit.Validation, "package_model_default_invalid",
+			"%s default %q must be [org/]model@release", slot.Path, slot.Default)
 	}
-	return row, nil
+	return nil
 }
 
 // RelativeDefault reports whether the slot's authored default names a model of the
 // package's own account instead of an explicit org.
 func (s Slot) RelativeDefault() bool {
-	return s.DefaultBinding != nil && !strings.Contains(s.DefaultBinding.Model, "/")
+	name, _, _ := strings.Cut(s.Default, "@")
+	return s.Default != "" && !strings.Contains(name, "/")
 }
 
-// Default is the slot's authored default with an org-relative model resolved to owner,
-// the account that owns the package. It is nil when the slot has no default, or when the
-// default is org-relative and the owner is unknown.
-func (s Slot) Default(owner string) *hub.PackageBindingRow {
-	if s.DefaultBinding == nil || s.RelativeDefault() && owner == "" {
-		return nil
+// DefaultRef is the slot's authored default, `org/model@release`, an org-relative model
+// qualified by owner, the account that owns the package. It is "" when the slot has no
+// default, or when the default is org-relative and the owner is unknown.
+func (s Slot) DefaultRef(owner string) string {
+	if !s.RelativeDefault() {
+		return s.Default
 	}
-	row := *s.DefaultBinding
-	if s.RelativeDefault() {
-		row.Model = owner + "/" + row.Model
+	if owner == "" {
+		return ""
 	}
-	return &row
+	return owner + "/" + s.Default
+}
+
+// Bits is the weight precision the machine's rules give the slot when a run names none,
+// before any memory budget (xs-042 §2.2): 16 for a slot that allows no less, 4 for a decode
+// slot that allows 4, else 8.
+func (s Slot) Bits() int {
+	switch {
+	case s.MinBits == 16:
+		return 16
+	case s.MinBits == 4 && s.Phase == "decode":
+		return 4
+	}
+	return 8
 }

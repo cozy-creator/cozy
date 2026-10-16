@@ -37,7 +37,7 @@ import (
 // run's one warning (owner, 2026-09-28): an unknown field never refuses a run.
 
 // RunKeys are the RESERVED dotted namespace a run term may claim before the payload grammar
-// sees it: `model.<param>=<ref>` picks the WEIGHTS off the owner's ladder (cl-109). It cannot
+// sees it: `model.<param>=<ref>` picks the WEIGHTS for a slot (cl-109). It cannot
 // reach a payload field, because a wire name carries no dot.
 type RunKeys struct {
 	// Models is the declared slot path -> ref the caller pinned.
@@ -397,6 +397,14 @@ func ValidateAttentionOverride(pin string) *exit.Error {
 		return exit.Named(exit.Usage, "attention_override_invalid",
 			"invalid attention override %q", pin).
 			WithRemedy("use --attention-kernel=backend or --attention-kernel=[model/]component=backend; no whitespace")
+	}
+	return nil
+}
+
+// ValidateBits accepts a run's weight precision: 16, 8 or 4, or 0 for the machine's rules.
+func ValidateBits(bits uint32) *exit.Error {
+	if bits != 0 && bits != 4 && bits != 8 && bits != 16 {
+		return exit.Named(exit.Usage, "bits_invalid", "--bits=%d is not 16, 8 or 4", bits)
 	}
 	return nil
 }

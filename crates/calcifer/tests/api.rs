@@ -14,14 +14,13 @@ use calcifer::{
     serve::{Stopped, serve},
     store::{MachineRow, Store},
 };
-use common::{SilentHub, Tensord};
+use common::{SilentHub, Tensord, want};
 use cozy_platform::{
-    durable,
-    lock::{Held, Kind as LockKind, LockFile},
+    lock::{Kind as LockKind, LockFile},
     paths::Home,
 };
 use cozy_proto::{
-    calcifer::{Down, Event, Holder, Run, RunList, Status, Submitted, WANTED},
+    calcifer::{Down, Event, Holder, Run, RunList, Status, Submitted},
     config::{Config, Loaded},
     error::Envelope,
 };
@@ -116,14 +115,6 @@ impl Calcifer {
             .unwrap()
             .unwrap()
     }
-}
-
-/// A client's claim that it is starting Calcifer on `home`.
-fn want(home: &Path) -> Held {
-    let dir = Home::at(home).calcifer();
-    durable::private_dir(&dir).unwrap();
-    let wanted = LockFile::new(dir.join(WANTED)).try_lock(LockKind::Shared);
-    wanted.unwrap().expect("a shared lock")
 }
 
 /// A home's load, as `cozy calcifer` reads it, with the defaults (any free port).
@@ -456,12 +447,14 @@ async fn a_killed_calcifer_leaves_a_record_the_next_one_replaces() {
     let lock = LockFile::new(Home::at(home.path()).calcifer_lock());
     let left: Holder = serde_json::from_slice(&lock.holder().unwrap().unwrap()).unwrap();
     assert_eq!(left, stale, "SIGKILL leaves the record behind");
-    let free = lock.try_lock(LockKind::Exclusive).unwrap();
+    // Shared, so the check leaves the stale record (an exclusive taker erases it).
+    let free = lock.try_lock(LockKind::Shared).unwrap();
     assert!(
         free.is_some(),
         "the kernel let go of the dead holder's lock"
     );
     drop(free);
+    assert!(lock.holder().unwrap().is_some());
 
     let calcifer = Calcifer::start(home.path()).await;
     assert_ne!(

@@ -63,10 +63,6 @@ type Context struct {
 	namespace        packagepublish.NamespaceSource // the caller on Cfg's Tensorhub, asked once
 	warnings         *[]records.Warning             // this command's, shared by its scoped copies
 	rentalSelections map[string]string              // --rental names this command resolved, to rental IDs
-	// provisional says this command chose a model from something other than its owner's word
-	// at the current catalog revision (bindings read before it, or declared defaults while the
-	// Hub was out of reach): such a resolution is used, never kept.
-	provisional bool
 }
 
 // warn says one warning now on stderr for a person and in the command's JSON document for a

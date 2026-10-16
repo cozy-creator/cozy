@@ -10,6 +10,7 @@ members = [
     "crates/cozy-platform",
     "crates/cozy-proto",
     "crates/hub-client",
+    "crates/migrate",
     "crates/tensord",
     "crates/tensorfs/crates/tensorfs-core",
     "crates/tensorfs/crates/tensorfs-plane",
@@ -31,6 +32,7 @@ cozy-cli = { path = "crates/cozy-cli" }
 cozy-platform = { path = "crates/cozy-platform" }
 cozy-proto = { path = "crates/cozy-proto" }
 hub-client = { path = "crates/hub-client" }
+migrate = { path = "crates/migrate" }
 tensord = { path = "crates/tensord" }
 tensorfs-core = { path = "crates/tensorfs/crates/tensorfs-core", default-features = false }
 tensorfs-plane = { path = "crates/tensorfs/crates/tensorfs-plane", default-features = false }
@@ -54,7 +56,9 @@ hex = "0.4"
 http-body-util = "0.1.5"
 hyper = { version = "1.11", default-features = false }
 hyper-util = { version = "0.1.21", default-features = false, features = ["tokio"] }
+indicatif = "0.18"
 infer = { version = "0.22", default-features = false }
+jiff = { version = "0.2.38", default-features = false, features = ["std"] }
 libc = "0.2"
 nix = { version = "0.31.3", default-features = false }
 nvml-wrapper = "0.13"
@@ -65,6 +69,7 @@ progenitor-client = "0.15.1"
 prost = "0.14"
 protoc-bin-vendored = "3"
 quote = "1"
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 reqwest = { version = "0.13", default-features = false, features = ["form", "http2", "json", "query", "rustls", "stream"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
@@ -87,6 +92,7 @@ thiserror = "2"
 tokio = { version = "1.53", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["aws_lc_rs", "tls12"] }
 tokio-stream = "0.1.19"
+tokio-util = { version = "0.7", features = ["io"] }
 # figment's toml 0.8 already builds this one.
 toml_edit = "0.22.27"
 tonic = { version = "0.14.6", default-features = false, features = ["codegen"] }

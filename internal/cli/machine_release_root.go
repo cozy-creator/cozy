@@ -13,7 +13,7 @@ import (
 // A published root reaches its machine as one message: the release, the callable, the
 // payload, the caller's Model choices and its inputs. The machine installs what it lacks from
 // its own Hub, resolves every open slot for its own devices, prepares and mints the offer;
-// nothing here reads the Hub, a ladder or a package.
+// nothing here reads the Hub or a package.
 
 // localSourceV1 writes the unpublished code of install to machine and answers its manifest's
 // digest, and whether any byte moved. This computer's machine reads the project where it is;

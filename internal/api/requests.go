@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -64,6 +65,8 @@ type Submission struct {
 	AttentionKernel string `json:"attention_kernel,omitempty"`
 	// GPUs is an exact request count; zero lets the machine choose supported parallelism.
 	GPUs uint32 `json:"gpus,omitempty"`
+	// Bits is the run's weight precision (16, 8 or 4); zero lets the machine's rules choose.
+	Bits uint32 `json:"bits,omitempty"`
 	// Ignored names the undeclared fields the client dropped from Input; the run records
 	// them as its warning.
 	Ignored []string `json:"ignored_fields,omitempty"`
@@ -140,6 +143,10 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if problem := launch.ValidateAttentionOverride(sub.AttentionKernel); problem != nil {
+		s.refuseTyped(w, r, problem)
+		return
+	}
+	if problem := launch.ValidateBits(sub.Bits); problem != nil {
 		s.refuseTyped(w, r, problem)
 		return
 	}
@@ -378,7 +385,7 @@ func replaySubmission(sub Submission, recorded records.Request) orchestrator.Sub
 		Models: models, NeedsAccelerator: recorded.NeedsAccelerator, WritesWeights: recorded.WritesWeights,
 		OutputDirectory: sub.OutputDirectory,
 		// Replays compare the caller's requested execution path with the original.
-		AttentionKernel: sub.AttentionKernel, GPUs: sub.GPUs,
+		AttentionKernel: sub.AttentionKernel, GPUs: sub.GPUs, Bits: sub.Bits,
 	}
 }
 
@@ -430,6 +437,9 @@ func submissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
 	if spec.GPUs > 0 {
 		doc["gpus"] = int64(spec.GPUs)
 	}
+	if spec.Bits > 0 {
+		doc["bits"] = int64(spec.Bits)
+	}
 	if spec.AttentionKernel != "" {
 		doc["attention_kernel"] = spec.AttentionKernel
 	}
@@ -442,8 +452,9 @@ func submissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
 	if spec.TimeoutMS > 0 {
 		doc["timeout_ms"] = spec.TimeoutMS
 	}
-	if len(spec.Models) > 0 {
-		refs := append([]orchestrator.ModelRef(nil), spec.Models...)
+	// The caller's choices name the request; the facts a rental is sized by do not.
+	refs := slices.DeleteFunc(slices.Clone(spec.Models), func(model orchestrator.ModelRef) bool { return !model.Choice })
+	if len(refs) > 0 {
 		sort.Slice(refs, func(i, j int) bool { return refs[i].Slot < refs[j].Slot })
 		models := make([]canonical.Value, 0, len(refs))
 		for _, model := range refs {
@@ -510,7 +521,7 @@ func (s *Server) resolvePlan(ctx context.Context, hub string, sub Submission, le
 		Rental:  sub.Rental || sub.RentalRequired || sub.RentNew || sub.RequestedRental != "", RentalRequired: sub.RentalRequired || sub.RentNew || sub.RequestedRental != "",
 		RequestedRental: sub.RequestedRental, RentNew: sub.RentNew,
 		Models:          append([]orchestrator.ModelRef(nil), sub.Models...),
-		AttentionKernel: sub.AttentionKernel, GPUs: sub.GPUs,
+		AttentionKernel: sub.AttentionKernel, GPUs: sub.GPUs, Bits: sub.Bits,
 		OutputDirectory: sub.OutputDirectory, Trees: sub.Trees, PlannedSourceBytes: sub.PlannedSourceBytes,
 	}
 	if problem := s.validateRequestedRental(out.RequestedRental); problem != nil {

@@ -32,6 +32,8 @@ type Operation struct {
 	// this level (WarmLevels); "off" takes it out. Models are then its `model.<param>=` choices.
 	Entrypoint string `json:"entrypoint,omitempty"`
 	Warm       string `json:"warm,omitempty"`
+	// Bits is a warm member's weight precision (16, 8 or 4), as a run's; zero: the rules.
+	Bits uint32 `json:"bits,omitempty"`
 	// Local is this computer's installation of local/<name> code, written to the machine
 	// and installed there (`cozy package install ./dir --rental`).
 	Local string `json:"local,omitempty"`

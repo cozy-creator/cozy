@@ -181,6 +181,21 @@ pub fn bytes(n: u64) -> String {
     }
 }
 
+/// How long ago a Unix-milliseconds instant was, in its two largest units: `42s`, `3m12s`,
+/// `5h3m`, `2d4h`.
+pub fn age(at_ms: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64);
+    let s = (now - at_ms).max(0) / 1000;
+    match s {
+        0..60 => format!("{s}s"),
+        60..3600 => format!("{}m{}s", s / 60, s % 60),
+        3600..86400 => format!("{}h{}m", s / 3600, s % 3600 / 60),
+        _ => format!("{}d{}h", s / 86400, s % 86400 / 3600),
+    }
+}
+
 /// Columns without borders. On a terminal rows wrap to its width; elsewhere each row is one
 /// whole line, for grep and awk.
 pub struct Table {

@@ -17,16 +17,17 @@ import (
 )
 
 // PublishedChildModels size a rental for a published composition before any machine is known:
-// each callee slot's authored default, as its machine will choose it. A run never reads them.
-// Everything they read is fixed by the exact release, so they are kept under it and read once;
-// an answer that missed a card or lane is read again next time.
+// each callee slot's authored default at the lane its machine's rules would serve. A run never
+// reads them. Everything they read is fixed by the exact release and the run's bits, so they
+// are kept under them and read once; an answer that missed a card or lane is read again next
+// time.
 func (r *Resolver) PublishedChildModels(command *Context, request records.Request) ([]records.ModelRef, *exit.Error) {
 	if !request.ComposesChildren() || request.Release == "" {
 		return nil, nil
 	}
 	kept := ""
-	if identity, err := json.Marshal([]any{"child-models/2", command.Cfg.HubURL, request.Package, request.Release,
-		request.Entrypoint, client(command).CredentialIdentity()}); err == nil {
+	if identity, err := json.Marshal([]any{"child-models/3", command.Cfg.HubURL, request.Package, request.Release,
+		request.Entrypoint, request.Bits, client(command).CredentialIdentity()}); err == nil {
 		name := sha256.Sum256(identity)
 		kept = filepath.Join(home.Paths(command.Cfg.Home).Root, "releases", "children", hex.EncodeToString(name[:16])+".json")
 	}
@@ -40,20 +41,18 @@ func (r *Resolver) PublishedChildModels(command *Context, request records.Reques
 	}
 	var refs []string
 	for _, slot := range slots {
-		if binding := slot.slot.Default(packageOwner(slot.pkg, []launch.Slot{slot.slot}, r.namespace)); binding != nil {
-			refs = append(refs, binding.Ref())
+		if ref := slot.slot.DefaultRef(packageOwner(slot.pkg, []launch.Slot{slot.slot}, r.namespace)); ref != "" {
+			refs = append(refs, ref)
 		}
 	}
 	cards, complete := readCards(command, refs), true
 	for _, slot := range slots {
-		model, problem := r.childModelLadder(cards, slot.pkg, slot.entry, slot.slot)
+		model, problem := r.childSizedDefault(cards, slot.pkg, slot.entry, slot.slot, request.Bits)
 		if problem != nil {
 			// A slot with no default stays optional; a card or lane the Hub lacked is asked again.
-			complete = complete && problem.ErrName() == "child.model_unbound"
+			complete = complete && problem.ErrName() == "model.default_absent"
 			continue
 		}
-		model.Slot = slot.slot.Path
-		model.Callable = slot.pkg + "/" + slot.entry
 		models = append(models, model)
 	}
 	if raw, err := json.Marshal(models); complete && kept != "" && err == nil &&

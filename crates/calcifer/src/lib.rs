@@ -9,6 +9,7 @@
 //! cursor.
 pub mod api;
 pub mod link;
+pub mod outputs;
 pub mod serve;
 pub mod store;
 
@@ -63,6 +64,7 @@ pub struct Calcifer {
     staging: Mutex<()>,
     /// Told each time a run is settled: what Calcifer owes may now be nothing.
     owed: watch::Sender<()>,
+    exports: outputs::Exports,
 }
 
 /// What a run is doing now, never stored: the latest of each live event.
@@ -125,11 +127,13 @@ impl Calcifer {
             tasks: Mutex::default(),
             staging: Mutex::default(),
             owed: watch::channel(()).0,
+            exports: outputs::Exports::default(),
         });
         calcifer.sweep_inputs()?;
         for id in calcifer.store.unsettled()? {
             calcifer.drive(id);
         }
+        calcifer.export_outputs()?;
         Ok(calcifer)
     }
 
@@ -142,16 +146,18 @@ impl Calcifer {
         &self.store
     }
 
-    /// What Calcifer still owes, which a next Calcifer would resume: every unsettled run's id. A
-    /// store it cannot read owes its error.
+    /// What Calcifer still owes, which a next Calcifer would resume: every unsettled run's id, and
+    /// each run with an output still to land. A store it cannot read owes its error.
     pub fn owed(&self) -> Vec<String> {
-        match self.store.unsettled() {
-            Ok(ids) => ids.into_iter().map(String::from).collect(),
-            Err(e) => vec![e.to_string()],
-        }
+        let owed = self.store.unsettled().and_then(|ids| {
+            let outputs = self.store.exports_owed()?.into_iter();
+            let outputs = outputs.map(|(_, number)| format!("outputs of run {number}"));
+            Ok(ids.into_iter().map(String::from).chain(outputs).collect())
+        });
+        owed.unwrap_or_else(|e| vec![e.to_string()])
     }
 
-    /// Changes each time a run is settled.
+    /// Changes each time a run is settled, or its outputs have all landed.
     pub fn owed_changed(&self) -> watch::Receiver<()> {
         self.owed.subscribe()
     }
@@ -503,6 +509,15 @@ impl Calcifer {
                 }
                 // It may be there: attach first, and send again only to a machine that never got it.
                 match link.run(id, run.cursor, None).await {
+                    // Imported from the Go CLI, which did not keep what it sent.
+                    Err(LinkError::NotFound) if run.state == State::Sent && run.spec.is_empty() => {
+                        return Err(Stop::Refused(Reason {
+                            code: "spec_not_kept".into(),
+                            message: "its machine never confirmed the run, and its spec was not kept across \
+                                      the move from the Go CLI; run it again"
+                                .into(),
+                        }));
+                    }
                     Err(LinkError::NotFound) if run.state == State::Sent => {
                         self.write_inputs(link, run).await?;
                         let _turn = sending.lock().await;

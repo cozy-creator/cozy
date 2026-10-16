@@ -221,39 +221,6 @@ type PackageCmd struct {
 	Lock    PackageLockCmd    `cmd:"" help:"Lock this package's dependencies for the current Tensorhub and account."`
 	Publish PackagePublishCmd `cmd:"" help:"Publish a package release."`
 	Yank    PackageYankCmd    `cmd:"" help:"Permanently yank a package release."`
-
-	Bind     PackageBindCmd     `cmd:"" help:"Set an owner model override for one package slot."`
-	Unbind   PackageUnbindCmd   `cmd:"" help:"Remove an owner override and use the package default."`
-	Bindings PackageBindingsCmd `cmd:"" help:"Show each model slot's default ladder, owner override, and which one runs."`
-}
-
-type PackageBindCmd struct {
-	Ref  string   `arg:"" name:"package" help:"Published package name (org/name)."`
-	Slot string   `arg:"" name:"slot-path" help:"Declared slot path, e.g. generate.models.model."`
-	To   string   `arg:"" name:"model" help:"org/model@release — the model release the slot loads."`
-	GPU  []string `name:"gpu" help:"<GPU>=<lane>: the lane that fits that GPU class; repeat in order of preference, '*'=<lane> last as the catch-all."`
-}
-
-func (c *PackageBindCmd) Run(r *Runtime) error {
-	return r.call(handlePackageBind, []string{c.Ref, c.Slot, c.To}, nil, values("--gpu", c.GPU), false)
-}
-
-type PackageUnbindCmd struct {
-	Ref  string `arg:"" name:"package" help:"Published package name (org/name)."`
-	Slot string `arg:"" name:"slot-path" help:"Model slot whose owner override to remove."`
-}
-
-func (c *PackageUnbindCmd) Run(r *Runtime) error {
-	return r.call(handlePackageUnbind, []string{c.Ref, c.Slot}, nil, nil, false)
-}
-
-type PackageBindingsCmd struct {
-	Ref     string `arg:"" name:"package" help:"Published package name (org/name)."`
-	Version string `help:"Package release whose authored defaults to show instead of the newest, e.g. 1.2.3."`
-}
-
-func (c *PackageBindingsCmd) Run(r *Runtime) error {
-	return r.call(handlePackageBindings, []string{c.Ref}, nil, values("--version", c.Version), false)
 }
 
 type PackageSearchCmd struct {
@@ -454,16 +421,15 @@ func (c *ModelQuantizeCmd) Run(r *Runtime) error {
 }
 
 type ModelPublishCmd struct {
-	Ref         string   `arg:"" name:"model" help:"Tensorhub model repository (org/name)."`
-	Release     string   `help:"Mutable release label." required:""`
-	Lanes       []string `name:"lane" help:"Set a lane pointer as name=checkpoint-id."`
-	RemoveLane  []string `help:"Remove a lane pointer by name; yank the release instead of removing its last lane."`
-	DefaultLane string   `help:"The lane a ref naming this release and no lane reads, e.g. fp8-pruned."`
+	Ref        string   `arg:"" name:"model" help:"Tensorhub model repository (org/name)."`
+	Release    string   `help:"Mutable release label." required:""`
+	Lanes      []string `name:"lane" help:"Set a lane pointer as name=checkpoint-id."`
+	RemoveLane []string `help:"Remove a lane pointer by name; yank the release instead of removing its last lane."`
 }
 
 func (c *ModelPublishCmd) Run(r *Runtime) error {
 	return r.call(handleModelPublish, []string{c.Ref}, nil,
-		values("--release", c.Release, "--lane", c.Lanes, "--remove-lane", c.RemoveLane, "--default-lane", c.DefaultLane), false)
+		values("--release", c.Release, "--lane", c.Lanes, "--remove-lane", c.RemoveLane), false)
 }
 
 type ModelRetargetCmd struct {
@@ -508,6 +474,7 @@ type RunCmd struct {
 
 type RunExecuteCmd struct {
 	GPUs                *uint32  `name:"gpus" help:"Cap each GPU call at this many GPUs: each uses what it declares, up to this count; omit to cap at the machine's GPUs."`
+	Bits                uint32   `name:"bits" help:"Weight precision for every model the run loads, its calls' included: 16, 8 or 4 bits. Omit to let the machine pick each model's lane from its GPUs and the model's declared tolerances; a model.<param>=…/lane pin still wins."`
 	MachineEndpointFile string   `name:"machine-endpoint-file" predictor:"file" help:"Run on this explicitly pinned owned machine using the controller's existing signing identity; never register or rent a machine."`
 	Target              string   `arg:"" name:"target" predictor:"callable" help:"Package callable org/package[/function], explicit ./project[/function], or a Python script."`
 	Input               []string `arg:"" optional:"" name:"input" help:"Primary value (a function writing weights takes <input-model> [<org/model> destination]), field=value payload and model.<param>=reference overrides (Tensorhub, hf://, or civitai://)."`
@@ -542,12 +509,16 @@ func (c *RunExecuteCmd) Run(r *Runtime) error {
 		return problem
 	}
 	args := append([]string{c.Target}, c.Input...)
+	bits := ""
+	if c.Bits != 0 {
+		bits = strconv.FormatUint(uint64(c.Bits), 10)
+	}
 	return r.call(handleRunExecute, args, bools(
 		"--await", c.Await,
 		"--rental-only", c.RentalOnly, "--rent-new", c.RentNew, "--describe", c.Describe), values(
 		"--rental", rentalName, "--out", c.Out, "--timeout", c.Timeout,
 		"--machine-endpoint-file", c.MachineEndpointFile,
-		"--attention-kernel", c.AttentionKernel, "--lora", c.LoRAs, "--gpus", gpus,
+		"--attention-kernel", c.AttentionKernel, "--lora", c.LoRAs, "--gpus", gpus, "--bits", bits,
 		"--in", c.PayloadFile, "--asset", c.Assets, "--asset-fidelity", c.AssetFidelity,
 		"--idempotency-key", c.IdempotencyKey, "--upload-to", c.UploadTo, "--source-profile", c.SourceProfiles,
 		"--warm", c.Warm), !c.Describe)

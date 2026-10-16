@@ -180,12 +180,11 @@ func TestAnExportToAnInvalidDestinationFailsOnce(t *testing.T) {
 
 // A run no machine on the market can take fails with the reason instead of queuing on stock.
 func TestARunTheMarketCannotServeFails(t *testing.T) {
-	h := newLadderHub(t)
-	h.bind(goodLadder())
+	h := newStandInHub(t, h3Default)
 	for _, sku := range h.market {
 		h.soldOut[sku.Name] = true
 	}
-	root := ladderRoot(t, h)
+	root := standInRoot(t, h)
 	startCalciferProcess(t, root)
 	_, out := runCozy(t, root, "run", "proof/h3/generate", "steps=1", "--rental-only", "--json", "--idempotency-key", "sold-out")
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))

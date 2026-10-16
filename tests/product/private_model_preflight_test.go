@@ -19,7 +19,7 @@ import (
 func TestPrivateModelPreflightDefersAbsentCapturedInputs(t *testing.T) {
 	for _, mode := range []string{"weights-unbound", "entrypoint-unbound", "weights-default"} {
 		t.Run(mode, func(t *testing.T) {
-			catalog := newLadderHub(t)
+			catalog := newStandInHub(t)
 			layout, problem := home.Open(t.TempDir())
 			fatal(t, problem)
 			store, problem := records.Open(layout.DB)
@@ -33,7 +33,7 @@ func TestPrivateModelPreflightDefersAbsentCapturedInputs(t *testing.T) {
 				slot["weights"] = true
 			}
 			if mode == "weights-default" {
-				slot["default_ladder"] = authoredH3(ladderLane)
+				slot["default"] = h3Default
 			}
 			call := map[string]any{"name": "compute", "models": []any{slot},
 				"request": map[string]any{"fields": []any{}}, "result": map[string]any{"fields": []any{}},
@@ -61,8 +61,8 @@ func TestPrivateModelPreflightDefersAbsentCapturedInputs(t *testing.T) {
 				}
 			case "weights-default":
 				fatal(t, problem)
-				if len(models) != 1 || models[0].Model != ladderModel || len(models[0].Ladder) != 1 || models[0].Ladder[0].Lane != ladderLane {
-					t.Fatal("deferral discarded an authored model ladder")
+				if len(models) != 1 || models[0].Model != h3Model || models[0].Lane != h3Lane || models[0].Choice {
+					t.Fatalf("deferral discarded the authored default at its 8-bit lane: %+v", models)
 				}
 			}
 		})

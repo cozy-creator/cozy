@@ -88,15 +88,10 @@ func TestAWarmRunWaitsOnFewDiskWrites(t *testing.T) {
 	}
 	h, root, _, _ := parityMachines(t)
 	resolved := seedProbe(t, h, root, machines.Local, "tessa")
-	publishParityRelease(t, h, root, probeProject(t, "proof/probe@1.0.0/bf16"))
-	binding := `{"bindings":[{"slot":"touch.models.source","model":"proof/probe","release":"1.0.0","revision":1,"ladder":[{"gpu":"*","lane":"bf16"}]}]}`
+	publishParityRelease(t, h, root, probeProject(t, "proof/probe@1.0.0"))
 	account, probe := h.server.Config.Handler, probeModel(t, resolved)
 	h.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.URL.Path == "/v1/packages/"+parityPublished+"/bindings":
-			_, _ = w.Write([]byte(binding))
-		case probe(w, r):
-		default:
+		if !probe(w, r) {
 			account.ServeHTTP(w, r)
 		}
 	})

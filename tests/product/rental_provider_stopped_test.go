@@ -82,7 +82,7 @@ func TestRentalStoppedByProviderIsShownAndBoughtAround(t *testing.T) {
 		candidate := orchestrator.PlacementCandidate{GPUs: 1}
 		row := records.Rental{AcceleratorModel: "NVIDIA H100", AcceleratorCount: 1, State: tc.state,
 			Failure: records.RentalFailure{Code: tc.code}}
-		rental.Standing(&candidate, []records.ModelRef{{Manifest: "weights", GPUs: 1}}, row,
+		rental.Standing(&candidate, []records.ModelRef{{Manifest: "weights"}}, row,
 			80, true, true, false, rental.Constraints{}, rental.Disk{})
 		if bought := strings.HasPrefix(candidate.Verdict, orchestrator.VerdictExcluded); bought != tc.buy {
 			t.Fatalf("%s %s: verdict %q, want buy-around=%t", tc.state, tc.code, candidate.Verdict, tc.buy)

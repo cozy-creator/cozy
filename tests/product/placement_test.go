@@ -23,7 +23,7 @@ import (
 // `placement.prefer` picks among them. These arms are the design's worked example on the
 // real chooser, then the real Calcifer against a stand-in hub serving the rows.
 
-const fp8Lane = "fp8-adaln-pruned"
+const fp8Lane = "fp8"
 
 // exampleMarket is the worked example's two cards at today's rates including storage:
 // H100 SXM $3.52/h, RTX 5090 $0.99/h.
@@ -38,13 +38,10 @@ func exampleMarket() []hub.RentalSKU {
 	}
 }
 
-// exampleLadder runs the fp8 lane on the H100 rung and, staged, on anything else; the card
-// sizes no components, so the owner's rung is the fit.
-func exampleLadder() []records.ModelRef {
+// exampleModels is the fp8 lane the run is sized by: whole-lane bytes both cards hold.
+func exampleModels() []records.ModelRef {
 	return []records.ModelRef{{Package: "paul/minimax-h3", Slot: "generate.models.model",
-		Model: "paul/minimax-h3", Release: "1.0.0-rc.1", Ladder: []records.ModelRung{
-			{GPU: "H100", Lane: fp8Lane, Manifest: fp8Manifest, Bytes: 103 * gib},
-			{GPU: "*", Lane: fp8Lane, Manifest: fp8Manifest, Bytes: 103 * gib}}}}
+		Model: "paul/minimax-h3", Release: "1.0.0-rc.1", Lane: fp8Lane, Manifest: fp8Manifest, Bytes: 30 * gib}}
 }
 
 // exampleRows is the measured H100 (33 s/step × 29 + 40 s ≈ 1016 s) and the illustrative
@@ -60,15 +57,11 @@ func exampleRows() []hub.ModelThroughput {
 // the attached H100 `morgiana` with `ahead` attempts queued before this one.
 func exampleCandidates(t *testing.T, ahead int) []orchestrator.PlacementCandidate {
 	t.Helper()
-	pinned, rung, ok := rental.Pin(exampleLadder(), "NVIDIA H100 80GB HBM3", 1)
-	if !ok || rung != 1 {
-		t.Fatalf("the H100 does not fit rung 1: %v %d", pinned, rung)
-	}
 	attached := orchestrator.PlacementCandidate{Rental: "pr-morgiana", Machine: "morgiana", SKU: "h100-sxm5-80gb",
-		GPUs: 1, RunGPUs: 1, Rung: rung, Lane: fp8Lane, Ahead: ahead, RateUSDMicrosPerHour: 3_520_000, Models: pinned}
+		GPUs: 1, RunGPUs: 1, Lane: fp8Lane, Ahead: ahead, RateUSDMicrosPerHour: 3_520_000, Models: exampleModels()}
 	candidates := append([]orchestrator.PlacementCandidate{attached},
-		rental.Purchases(exampleMarket(), exampleLadder(), true, false, rental.Constraints{})...)
-	if used := rental.Measure(candidates, exampleRows(), exampleLadder()); len(used) != 2 {
+		rental.Purchases(exampleMarket(), exampleModels(), true, false, rental.Constraints{})...)
+	if used := rental.Measure(candidates, exampleRows(), exampleModels()); len(used) != 2 {
 		t.Fatalf("the two rows were not both used: %+v", used)
 	}
 	return candidates
@@ -112,8 +105,8 @@ func TestPlacementWorkedExample(t *testing.T) {
 		if find(t, rows, loser).Verdict != verdict {
 			t.Fatalf("%s recorded %s as %q; want %s", tier, loser, find(t, rows, loser).Verdict, verdict)
 		}
-		if line := record.Line(); tier == "cheap" && line != "placement: reuse morgiana (h100-sxm5-80gb, fp8-adaln-pruned) — cheap, 2032 s, $0.99" ||
-			tier == "balanced" && line != "placement: buy h100-sxm5-80gb (fp8-adaln-pruned) — balanced, 1406 s, $1.37" {
+		if line := record.Line(); tier == "cheap" && line != "placement: reuse morgiana (h100-sxm5-80gb, fp8) — cheap, 2032 s, $0.99" ||
+			tier == "balanced" && line != "placement: buy h100-sxm5-80gb (fp8) — balanced, 1406 s, $1.37" {
 			t.Fatalf("%s line %q", tier, line)
 		}
 	}
@@ -128,16 +121,15 @@ func TestPlacementWorkedExample(t *testing.T) {
 	}
 }
 
-func TestPlacementUnmeasuredFallsToTheLadder(t *testing.T) {
-	// No row anywhere: an attached rental on a LATER rung still beats every buy — today's
-	// reuse-first behaviour — and the buys fall to rung order, cheapest within a rung.
+func TestPlacementUnmeasuredPrefersTheAttachedRental(t *testing.T) {
+	// No row anywhere: a busy attached rental still beats every buy — reuse-first — and the
+	// buys fall to rate order.
 	candidates := exampleCandidates(t, 3)
 	for i := range candidates {
 		candidates[i].Measured, candidates[i].TimeS, candidates[i].CostUSDMicros = false, 0, 0
 	}
-	candidates[0].Rung = 2
-	if got := walk(candidates); strings.Join(got, " ") != "morgiana h100-sxm5-80gb rtx-5090" {
-		t.Fatalf("unmeasured order %v; want the attached rental first, then rung order", got)
+	if got := walk(candidates); strings.Join(got, " ") != "morgiana rtx-5090 h100-sxm5-80gb" {
+		t.Fatalf("unmeasured order %v; want the attached rental first, then the cheaper buy", got)
 	}
 	// One measured buy beside an unmeasured attached rental: measured wins.
 	candidates = exampleCandidates(t, 0)
@@ -147,8 +139,8 @@ func TestPlacementUnmeasuredFallsToTheLadder(t *testing.T) {
 	}
 }
 
-// placementRoot is ladderRoot with the tier set, returning the config's sha256 too.
-func placementRoot(t *testing.T, h *ladderHub, prefer string) (string, string) {
+// placementRoot is standInRoot with the tier set, returning the config's sha256 too.
+func placementRoot(t *testing.T, h *standInHub, prefer string) (string, string) {
 	t.Helper()
 	root := t.TempDir()
 	body := []byte("tensorhub_url: " + h.server.URL + "\ntensorhub_token: ladder-test\n" +
@@ -158,18 +150,17 @@ func placementRoot(t *testing.T, h *ladderHub, prefer string) (string, string) {
 	return root, hex.EncodeToString(sum[:])
 }
 
-// proofRows measures the fp8 lane on both H100 products and the bf16 lane on the H200.
+// proofRows measures the fp8 lane on both H100 products and the H200.
 func proofRows() []hub.ModelThroughput {
 	row := func(lane, sku string, median float64) hub.ModelThroughput {
-		return hub.ModelThroughput{Model: ladderModel, Release: "1.0.0-rc.1", Lane: lane, SKU: sku,
+		return hub.ModelThroughput{Model: h3Model, Release: "1.0.0-rc.1", Lane: lane, SKU: sku,
 			Runs: 3, MedianS: median, MinS: median, MaxS: median, PrepareS: 390}
 	}
-	return []hub.ModelThroughput{row(fp8Lane, "h100-80", 1016), row(fp8Lane, "h100-nvl", 1016), row("bf16-full", "h200", 2000)}
+	return []hub.ModelThroughput{row(fp8Lane, "h100-80", 1016), row(fp8Lane, "h100-nvl", 1016), row(fp8Lane, "h200", 2000)}
 }
 
 func TestPlacementReusesTheMeasuredCard(t *testing.T) {
-	h := newLadderHub(t)
-	h.bind(goodLadder())
+	h := newStandInHub(t, h3Default)
 	h.throughput = proofRows()
 	root, digest := placementRoot(t, h, "balanced")
 	cert := filepath.Join(root, "morgiana.pem")
@@ -193,7 +184,7 @@ func TestPlacementReusesTheMeasuredCard(t *testing.T) {
 	if row == nil || row.Worker != "pr-morgiana" || row.Models[0].Lane != fp8Lane {
 		t.Fatalf("the run was not placed on morgiana: %+v\n%s", row, out)
 	}
-	const line = "placement: reuse morgiana (h100-80, fp8-adaln-pruned) — balanced, 1016 s, $0.76"
+	const line = "placement: reuse morgiana (h100-80, fp8) — balanced, 1016 s, $0.76"
 	if !strings.Contains(out, line) {
 		t.Fatalf("cozy run did not print %q:\n%s\nCalcifer log:\n%s", line, out, tail(filepath.Join(root, "calcifer.log")))
 	}
@@ -229,8 +220,7 @@ func TestPlacementReusesTheMeasuredCard(t *testing.T) {
 }
 
 func TestPlacementBuysAroundAStockOut(t *testing.T) {
-	h := newLadderHub(t)
-	h.bind(goodLadder())
+	h := newStandInHub(t, h3Default)
 	h.throughput = proofRows()
 	h.provisions = true
 	h.soldOut["h100-80"] = true
@@ -247,10 +237,10 @@ func TestPlacementBuysAroundAStockOut(t *testing.T) {
 	if row == nil || row.Worker != "pr-ladder-h100-nvl" || row.Models[0].Lane != fp8Lane {
 		t.Fatalf("the run was not placed on the bought H100 NVL: %+v\n%s", row, out)
 	}
-	if got := strings.Join(h.postedSKUs(), " "); got != "h100-80/fp8-adaln-pruned h100-nvl/fp8-adaln-pruned" {
+	if got := strings.Join(h.postedSKUs(), " "); got != "h100-80/fp8 h100-nvl/fp8" {
 		t.Fatalf("paid asks %q; want the cheaper H100 refused, then the NVL", got)
 	}
-	const line = "placement: buy h100-nvl (fp8-adaln-pruned) — fast, 1406 s, $1.17"
+	const line = "placement: buy h100-nvl (fp8) — fast, 1406 s, $1.17"
 	if !strings.Contains(out, line) {
 		t.Fatalf("cozy run did not print %q:\n%s", line, out)
 	}
@@ -264,8 +254,7 @@ func TestPlacementBuysAroundAStockOut(t *testing.T) {
 
 // An unusable tier is named once and the balanced default places the run.
 func TestUnusablePlacementPreferPlacesBalanced(t *testing.T) {
-	h := newLadderHub(t)
-	h.bind(goodLadder())
+	h := newStandInHub(t, h3Default)
 	h.throughput = proofRows()
 	root, _ := placementRoot(t, h, "fastest")
 	cert := filepath.Join(root, "morgiana.pem")
