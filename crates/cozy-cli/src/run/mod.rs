@@ -1,18 +1,24 @@
 //! `cozy run`: run a function on a machine, and the verbs over runs.
 use std::{path::PathBuf, process::ExitCode};
 
-use cozy_proto::error::{Error, Kind};
+use cozy_proto::{
+    calcifer::{On, SubmitRun},
+    error::{Error, Kind},
+};
 
 use crate::{Context, output};
 use bind::Terms;
 use catalog::Card;
+pub(crate) use follow::{exit_code, follow, submit};
 use interface::{Callable, Interface};
 use target::Target;
 
 mod bind;
 mod catalog;
 mod describe;
+mod follow;
 pub(crate) mod interface;
+mod spec;
 mod target;
 
 #[derive(clap::Args, Debug)]
@@ -35,7 +41,7 @@ struct RunArgs {
     #[command(flatten)]
     placement: Placement,
     /// Use at most N GPUs for the run and its calls.
-    #[arg(long, value_name = "N")]
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
     gpus: Option<u32>,
     /// Weight precision for every model; absent, the machine's rules choose per GPU.
     #[arg(long, value_parser = ["16", "8", "4"])]
@@ -72,6 +78,12 @@ pub struct Placement {
     /// `local`, a machine's name, `any`, or `new[:sku]` to rent one.
     #[arg(long = "on", value_name = "MACHINE", default_value = "local")]
     on: String,
+}
+
+impl Placement {
+    pub fn on(&self) -> On {
+        On::from(self.on.clone())
+    }
 }
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -146,8 +158,19 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
     match args.verb {
         Some(Verb::List { .. }) => Err(crate::not_ported("run list")),
         Some(Verb::Show { .. }) => Err(crate::not_ported("run show")),
-        Some(Verb::Watch { .. }) => Err(crate::not_ported("run watch")),
-        Some(Verb::Cancel { .. }) => Err(crate::not_ported("run cancel")),
+        Some(Verb::Watch { run }) => {
+            let run = ctx.calcifer().await?.run(&run).await?;
+            Ok(exit_code(&follow(ctx, run, false).await?))
+        }
+        Some(Verb::Cancel { run }) => {
+            let calcifer = ctx.calcifer().await?;
+            let mut run = calcifer.run(&run).await?;
+            if !follow::settled(&run) {
+                run = calcifer.cancel(run.id.as_str()).await?;
+            }
+            follow::record(ctx, &run);
+            Ok(ExitCode::SUCCESS)
+        }
         Some(Verb::Play { .. }) => Err(crate::not_ported("run play")),
         Some(Verb::Upload { .. }) => Err(crate::not_ported("run upload")),
         None => run(ctx, *args.run).await,
@@ -192,10 +215,34 @@ async fn run(ctx: &Context, args: RunArgs) -> Result<ExitCode, Error> {
         input_file: args.input_file,
         assets: args.assets,
         loras: args.loras,
-        key: args.idempotency_key.unwrap_or_else(mint_key),
+        key: args.idempotency_key.unwrap_or_else(follow::mint_key),
         cwd,
         user_home: ctx.user_home.clone(),
     };
+    let bits = args
+        .bits
+        .map_or(0, |b| b.parse().expect("clap admits 16, 8 or 4"));
+    let on = args.placement.on();
+    if let Some(level) = args.warm {
+        if args.gpus.is_some() {
+            return Err(Error::new(
+                Kind::Usage,
+                "warm_gpus",
+                "--gpus applies to a run, not to --warm",
+            ));
+        }
+        let callable = callable(&package, &card.interface, &function)?;
+        let models = bind::warm_choices(callable, &terms)?;
+        let call = spec::Call {
+            package: &package,
+            release: release.as_deref(),
+            callable,
+            gpus: 0,
+            bits,
+        };
+        let submission = call.submission(on, &hub.origin, &call.warm(level, &models)?, None, None);
+        return send(ctx, submission, &terms.key, args.detach).await;
+    }
     let mut bound = bind(ctx, &package, &card, &function, &terms)?;
     // A kept card that lacks a field the run names may be older than the release the machine
     // runs: read the newest once, and bind again.
@@ -212,7 +259,29 @@ async fn run(ctx: &Context, args: RunArgs) -> Result<ExitCode, Error> {
     if let Some(warning) = bound.warning(&target) {
         output::warn(ctx, &warning);
     }
-    Err(crate::not_ported("run (submitting to Calcifer)"))
+    let callable = callable(&package, &card.interface, &function)?;
+    let gpus = args.gpus.unwrap_or(0);
+    let call = spec::Call {
+        package: &package,
+        release: release.as_deref(),
+        callable,
+        gpus,
+        bits,
+    };
+    let out = args.out.map(|dir| terms.cwd.join(dir));
+    let submission = call.submission(on, &hub.origin, &call.spec(&bound)?, Some(&bound), out);
+    send(ctx, submission, &terms.key, args.detach).await
+}
+
+/// Submits, then follows the run (or prints it at once with `detach`).
+async fn send(
+    ctx: &Context,
+    submission: SubmitRun,
+    key: &str,
+    detach: bool,
+) -> Result<ExitCode, Error> {
+    let submitted = submit(ctx, submission, Some(key)).await?;
+    Ok(exit_code(&follow(ctx, submitted.run, detach).await?))
 }
 
 /// Binds `terms` to `function` of `card`; a person's refusal lists the arguments.
@@ -324,11 +393,4 @@ fn functions(ctx: &Context, package: &str, card: &Card) {
         .map(|name| format!("cozy run {package}/{name} --describe"))
         .collect();
     output::next(ctx, &next.iter().map(String::as_str).collect::<Vec<_>>());
-}
-
-/// A fresh idempotency key: one key names one submission forever.
-fn mint_key() -> String {
-    let mut bytes = [0u8; 16];
-    getrandom::fill(&mut bytes).expect("the OS has randomness");
-    format!("idem-{}", hex::encode(bytes))
 }

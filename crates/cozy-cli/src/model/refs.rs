@@ -165,7 +165,6 @@ impl ModelRef {
     }
 
     /// The machine's choice for `parameter`.
-    #[cfg_attr(not(test), expect(dead_code, reason = "run's model.<slot>= and model download/upload call it next"))]
     pub(crate) fn choice(&self, parameter: &str) -> ModelChoice {
         let mut choice = ModelChoice {
             parameter: parameter.to_owned(),
