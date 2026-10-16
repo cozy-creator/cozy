@@ -10,7 +10,7 @@ use cozy_proto::{
 
 mod account;
 mod completion;
-mod context;
+pub mod context;
 mod credits;
 mod daemon;
 mod doctor;
