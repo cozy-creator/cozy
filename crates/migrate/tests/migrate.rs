@@ -279,28 +279,27 @@ fn an_import_in_place_records_the_go_home_and_archives_its_state() {
     assert!(!root.join("installs").exists() && outputs.iter().all(|o| o.is_file()));
 }
 
+/// An import elsewhere (a copy's) records the same, and leaves user content and its paths alone.
 #[test]
-fn an_import_into_another_home_takes_user_content_with_it() {
+fn an_import_into_another_home_leaves_user_content_in_place() {
     let dir = tempfile::tempdir().unwrap();
     let (from, into) = (dir.path().join("go"), dir.path().join("new"));
     let outputs = testing::build(&from);
-    migrate::run(&args(&from, &into)).unwrap();
+    let report = migrate::run(&args(&from, &into)).unwrap();
+    assert!(
+        report
+            .archive
+            .unwrap()
+            .starts_with(Home::at(&into).backups())
+    );
     let store = Store::open(&Home::at(&into).calcifer_db()).unwrap();
     let done = store
         .record(&store.run("req-done").unwrap().unwrap())
         .unwrap();
-    let moved = into.join(outputs[0].strip_prefix(&from).unwrap());
-    assert_eq!(done.output[0].path.as_deref(), Some(moved.as_path()));
-    assert!(moved.is_file() && !outputs[0].exists());
-    let legacy = store.run("req-legacy").unwrap().unwrap();
+    assert_eq!(done.output[0].path.as_deref(), Some(outputs[0].as_path()));
+    assert!(outputs.iter().all(|o| o.is_file()));
+    assert!(from.join("scripts/s/main.py").is_file() && from.join("installs").is_dir());
     assert!(
-        legacy.out_dir.starts_with(&into),
-        "{}",
-        legacy.out_dir.display()
-    );
-    assert!(into.join("scripts/s/main.py").is_file() && into.join("backups/old.tar").is_file());
-    assert!(
-        from.join("installs").is_dir() && from.join("machine").is_dir(),
-        "caches and the machine stay"
+        !from.join("creator.sqlite").exists() && from.join("calcifer").symlink_metadata().is_err()
     );
 }

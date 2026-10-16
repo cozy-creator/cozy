@@ -3,8 +3,8 @@
 //!
 //! It records the Go home's Hubs, keys, live rentals, owed runs and history here, then archives the
 //! old state once under `backups/`. User content (`outputs`, `backups`, `scripts`) and the local
-//! machine's `machine/` stay where this layout keeps them. Regenerable caches are listed with their
-//! size and deleted only by a later `--delete-caches`.
+//! machine's `machine/` stay where they are, which is where this layout keeps them. Regenerable
+//! caches are listed with their size and deleted only by a later `--delete-caches`.
 mod go;
 mod plan;
 #[cfg(feature = "testing")]
@@ -172,21 +172,13 @@ pub fn run(args: &Args) -> Result<Report, Error> {
         ));
     }
     let records = go::records(&from).map_err(|e| invalid("go_home_unreadable", e))?;
-    let rebase = plan::Rebase {
-        from: &from,
-        into: into.root(),
-    };
-    let plan =
-        plan::plan(&from, &into, records, &rebase).map_err(|e| invalid("go_home_unreadable", e))?;
+    let plan = plan::plan(&from, &into, records).map_err(|e| invalid("go_home_unreadable", e))?;
     report.counts = plan.counts;
     report.skipped = plan.skipped;
     if args.dry_run {
         return Ok(report);
     }
     let failed = |e: String| Error::new(Kind::Internal, "migrate_failed", e);
-    if !same {
-        move_kept(&from, into.root(), &report.entries).map_err(failed)?;
-    }
     let archive = archive(&from, &into, &report.entries).map_err(failed)?;
     let calcifer = from.join("calcifer");
     if same && calcifer.symlink_metadata().is_ok_and(|m| !m.is_dir()) {
@@ -283,30 +275,6 @@ fn imported(into: &Home) -> Result<bool, Error> {
     }
 }
 
-/// An import into another directory takes user content with it, file for file.
-fn move_kept(from: &Path, into: &Path, entries: &[Entry]) -> Result<(), String> {
-    durable::private_dir(into).map_err(|e| e.to_string())?;
-    for entry in entries.iter().filter(|e| e.fate == Fate::Kept) {
-        let to = into.join(&entry.name);
-        if to.exists() {
-            return Err(format!(
-                "{} exists already; user content is never merged over",
-                to.display()
-            ));
-        }
-        std::fs::rename(from.join(&entry.name), &to)
-            .map_err(|e| format!("{}: {e}", to.display()))?;
-        if tally(&to) != (entry.files, entry.bytes) {
-            return Err(format!(
-                "{} does not hold what {} held",
-                to.display(),
-                entry.name
-            ));
-        }
-    }
-    Ok(())
-}
-
 /// The old state, once, as a private tar under `backups/`, read back before anything is removed.
 fn archive(from: &Path, into: &Home, entries: &[Entry]) -> Result<PathBuf, String> {
     let fail = |e: std::io::Error| e.to_string();
@@ -369,42 +337,15 @@ fn archive(from: &Path, into: &Home, entries: &[Entry]) -> Result<PathBuf, Strin
     Ok(path)
 }
 
-/// Keys, sessions and the config, owner-only. A config already here keeps its own settings.
+/// Keys, sessions and the config, owner-only.
 fn write_files(into: &Home, files: &[plan::File]) -> Result<(), String> {
     into.open().map_err(|e| e.to_string())?;
     durable::private_dir(&into.keys()).map_err(|e| e.to_string())?;
     for file in files {
-        let mut bytes = file.bytes.clone();
-        if file.path == into.config()
-            && let Ok(text) = std::fs::read_to_string(&file.path)
-        {
-            bytes = merged(&text, &String::from_utf8_lossy(&file.bytes))?.into_bytes();
-        }
-        durable::replace(&file.path, &bytes, 0o600)
+        durable::replace(&file.path, &file.bytes, 0o600)
             .map_err(|e| format!("{}: {e}", file.path.display()))?;
     }
     Ok(())
-}
-
-/// `ours` with every setting `imported` adds and it lacks, named Hubs one by one.
-fn merged(ours: &str, imported: &str) -> Result<String, String> {
-    let mut doc: toml_edit::DocumentMut = ours.parse().map_err(|e| format!("config.toml: {e}"))?;
-    let imported: toml_edit::DocumentMut = imported.parse().expect("written here");
-    for (key, item) in imported.iter() {
-        if !doc.contains_key(key) {
-            doc.insert(key, item.clone());
-        } else if let (Some(table), Some(adds)) = (
-            doc.get_mut(key).and_then(|i| i.as_table_mut()),
-            item.as_table(),
-        ) {
-            for (name, value) in adds.iter() {
-                if !table.contains_key(name) {
-                    table.insert(name, value.clone());
-                }
-            }
-        }
-    }
-    Ok(doc.to_string())
 }
 
 fn remove(path: &Path) -> Result<(), String> {

@@ -75,28 +75,12 @@ impl Plan {
     }
 }
 
-/// Moves user content's recorded paths from `from` to `into` when the import is a copy.
-pub struct Rebase<'a> {
-    pub from: &'a Path,
-    pub into: &'a Path,
-}
-
-impl Rebase<'_> {
-    pub fn path(&self, text: &str) -> PathBuf {
-        let path = Path::new(text);
-        match path.strip_prefix(self.from) {
-            Ok(rest) if self.from != self.into => self.into.join(rest),
-            _ => path.to_owned(),
-        }
-    }
-}
-
-pub fn plan(from: &Path, into: &Home, records: Records, rebase: &Rebase) -> Result<Plan, String> {
+pub fn plan(from: &Path, into: &Home, records: Records) -> Result<Plan, String> {
     let mut plan = Plan::default();
     config(from, into, &mut plan)?;
     keys(from, into, &mut plan)?;
     let live = machines(from, into, &records, &mut plan)?;
-    runs(into, records, &live, rebase, &mut plan);
+    runs(into, records, &live, &mut plan);
     Ok(plan)
 }
 
@@ -116,6 +100,13 @@ struct GoConfig {
 /// The current Hub, the named Hubs, the model-source tokens and Calcifer's port.
 fn config(from: &Path, into: &Home, plan: &mut Plan) -> Result<(), String> {
     let path = from.join("config.yaml");
+    if into.config().exists() && path.exists() {
+        plan.skip(
+            "config.yaml",
+            format!("{} exists and is kept", into.config().display()),
+        );
+        return Ok(());
+    }
     let go: GoConfig = match std::fs::read_to_string(&path) {
         Ok(text) => serde_yaml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -398,13 +389,7 @@ fn machine_name(text: &str) -> String {
 }
 
 /// Settled history, and the runs still owed on a live machine: sent or accepted, by id and cursor.
-fn runs(
-    into: &Home,
-    records: Records,
-    live: &HashMap<String, String>,
-    rebase: &Rebase,
-    plan: &mut Plan,
-) {
+fn runs(into: &Home, records: Records, live: &HashMap<String, String>, plan: &mut Plan) {
     let Records {
         requests,
         mut products,
@@ -439,7 +424,7 @@ fn runs(
             out_dir: request
                 .out_dir
                 .as_deref()
-                .map_or_else(|| into.outputs(), |dir| rebase.path(dir)),
+                .map_or_else(|| into.outputs(), PathBuf::from),
             state: State::Settled,
             cancel_requested: false,
             cursor: 0,
@@ -513,7 +498,7 @@ fn runs(
             run.machine = Some(name);
             plan.counts.history += 1;
         }
-        run.outputs = outputs(&request, items, run.state == State::Settled, rebase);
+        run.outputs = outputs(&request, items, run.state == State::Settled);
         plan.counts.outputs += run.outputs.len();
         plan.counts.outputs_without_path += run.outputs.iter().filter(|o| o.path.is_none()).count();
         plan.runs.push(run);
@@ -639,12 +624,7 @@ fn ended_row(into: &Home, name: &str, hub: &str) -> MachineRow {
 }
 
 /// Output items at their newest revision, or, for a run from before items, its exported files.
-fn outputs(
-    request: &Request,
-    items: Vec<go::Product>,
-    settled: bool,
-    rebase: &Rebase,
-) -> Vec<ImportedOutput> {
+fn outputs(request: &Request, items: Vec<go::Product>, settled: bool) -> Vec<ImportedOutput> {
     if !items.is_empty() {
         return items
             .into_iter()
@@ -653,7 +633,7 @@ fn outputs(
                     .path
                     .as_deref()
                     .filter(|p| !p.is_empty())
-                    .map(|p| rebase.path(p)),
+                    .map(PathBuf::from),
                 name: p.output,
                 index: p.index,
                 rev: p.rev.max(1),
@@ -671,7 +651,7 @@ fn outputs(
         .published
         .iter()
         .map(|path| {
-            let path = rebase.path(path);
+            let path = PathBuf::from(path);
             let name = path
                 .file_stem()
                 .map(|s| s.to_string_lossy().into_owned())
