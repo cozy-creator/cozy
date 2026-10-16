@@ -22,6 +22,7 @@ fn new_run(n: u8, machine: Option<&str>, pinned: bool) -> NewRun {
         out_dir: "/tmp/outputs".into(),
         warnings: vec![],
         inputs: vec![],
+        wants: None,
     }
 }
 

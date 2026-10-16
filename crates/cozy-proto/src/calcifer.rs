@@ -386,10 +386,12 @@ pub enum MachineState {
     /// No address yet: runs to it wait in the outbox.
     Booting,
     Ready,
+    /// Its end is asked of its Hub, which has not yet affirmed it.
+    Ending,
     Ended,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Machine {
     pub name: String,
     pub kind: MachineKind,
@@ -398,17 +400,228 @@ pub struct Machine {
     pub hub: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rental_id: Option<String>,
+    /// The name it had before its Hub named it; it keeps resolving.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub address: Option<String>,
     /// Why it ended.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// The Hub's word, for a rental.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rental: Option<Rental>,
+    /// The machine's own latest Status, once it answered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<MachineStatus>,
+    /// Why its Status cannot be read now (`status` is then the last it read).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unreachable: Option<String>,
+    /// A booting rental's phase, as its Hub says it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot: Option<String>,
+    /// Calcifer's runs on it.
+    #[serde(default)]
+    pub running: u32,
+    #[serde(default)]
+    pub queued: u32,
+    /// False: a live rental of this account that this controller did not rent.
+    #[serde(default = "yes")]
+    pub recorded: bool,
+    /// Its Hub did not answer the last listing.
+    #[serde(default)]
+    pub unverified: bool,
 }
 
-/// `GET /v1/machines`.
+fn yes() -> bool {
+    true
+}
+
+/// A rental as its Hub says it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Rental {
+    /// The product asked for, or the card when another client rented it.
+    pub sku: String,
+    pub accelerator: String,
+    pub gpus: u32,
+    pub usd_micros_per_hour: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spend_usd_micros: Option<i64>,
+    /// `charged`, `unmetered` or `estimate`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spend_basis: Option<String>,
+    pub rented_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at_ms: Option<i64>,
+    pub disk_gb: u32,
+    /// The Hub's failure code, for a rental that failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<String>,
+}
+
+/// A machine's `Status`, as it last sent it.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct MachineStatus {
+    pub worker_id: String,
+    pub version: String,
+    pub platform: String,
+    /// `booting`, `ready` or `releasing`.
+    pub phase: String,
+    #[serde(default)]
+    pub runtime: String,
+    #[serde(default)]
+    pub tensorfs: String,
+    pub started_at_ms: i64,
+    /// When a rental releases itself if it stays idle; none while it works or for a machine
+    /// that never releases.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_deadline_ms: Option<i64>,
+    #[serde(default)]
+    pub gpus: Vec<Gpu>,
+    #[serde(default)]
+    pub disk_total_bytes: u64,
+    #[serde(default)]
+    pub disk_free_bytes: u64,
+    /// This controller's queued, preparing or running runs there.
+    #[serde(default)]
+    pub live_runs: u32,
+    #[serde(default)]
+    pub models: Vec<Model>,
+    #[serde(default)]
+    pub models_bytes: u64,
+    #[serde(default)]
+    pub environments: Vec<Environment>,
+    #[serde(default)]
+    pub warm: Vec<WarmItem>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Gpu {
+    pub index: u32,
+    pub name: String,
+    pub memory_bytes: u64,
+    #[serde(default)]
+    pub driver: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub family: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_class: Option<String>,
+}
+
+/// A model repository the machine holds.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Model {
+    pub repository: String,
+    pub total_bytes: u64,
+    pub unique_bytes: u64,
+    #[serde(default)]
+    pub checkpoints: Vec<Checkpoint>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Checkpoint {
+    #[serde(default)]
+    pub release: String,
+    pub lane: String,
+    pub manifest: String,
+    #[serde(default)]
+    pub yanked: bool,
+}
+
+/// A package environment the machine holds for this controller.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Environment {
+    pub installation: String,
+    pub package: String,
+    #[serde(default)]
+    pub release: String,
+    #[serde(default)]
+    pub hub: String,
+    /// What it holds now: `installed`, `downloaded`, `imported`, `host` or `gpu`.
+    #[serde(default)]
+    pub level: String,
+}
+
+/// One member of this controller's warm set on the machine.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WarmItem {
+    /// `org/name[@release]`, or an installation id.
+    pub source: String,
+    #[serde(default)]
+    pub entrypoint: String,
+    /// The level asked for, and the one it holds now.
+    pub level: String,
+    #[serde(default)]
+    pub holds: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub held_back: String,
+}
+
+/// `GET /v1/machines` (`?refresh=true` lists every Hub again first).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MachineList {
     pub machines: Vec<Machine>,
+    /// When each Hub last answered a listing.
+    #[serde(default)]
+    pub hubs: Vec<HubListing>,
+    /// Hubs whose last listing failed: their rows are `unverified`.
+    #[serde(default)]
+    pub unanswered: Vec<HubProblem>,
+    /// Hubs this computer holds no login for.
+    #[serde(default)]
+    pub signed_out: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HubListing {
+    pub hub: String,
+    pub listed_at_ms: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HubProblem {
+    pub hub: String,
+    pub code: String,
+    pub message: String,
+}
+
+/// `POST /v1/machines` with `Rent`: 202, or 200 when the key had asked already (`replay`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Rented {
+    pub machine: Machine,
+    /// The price the rental was asked at: an acceptance above it is released.
+    pub quote: Quote,
+    pub replay: bool,
+}
+
+/// The Hub's price for the exact rental asked: the machine and its disk an hour, traffic a GB, and
+/// what an hour plus its download is expected to cost.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Quote {
+    pub gpu_usd_micros_per_hour: i64,
+    pub storage_usd_micros_per_hour: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bandwidth_usd_micros_per_gb: Option<i64>,
+    pub disk_gb: u32,
+    pub expected_hours: f64,
+    pub expected_download_gb: u32,
+    pub expected_total_usd_micros: i64,
+}
+
+/// `DELETE /v1/machines/{name}`: `changed` is false when it had ended already.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Ended {
+    pub machine: Machine,
+    pub changed: bool,
+}
+
+/// `POST /v1/machines/{name}/keepalive`, once the machine acknowledged it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Keepalive {
+    pub acknowledged_at_ms: i64,
+    /// None while a job is queued or running there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_deadline_ms: Option<i64>,
 }
 
 /// `POST /v1/machines`: rent one (with an `Idempotency-Key`) or add another computer's.
@@ -429,6 +642,14 @@ pub enum NewMachine {
         /// `sha256:<hex>` of the machine's TLS leaf.
         fingerprint: Digest,
     },
+}
+
+/// `GET /v1/machines/{name}/logs/{log}`: the logs a machine keeps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MachineLog {
+    Tensorfs,
+    Memory,
 }
 
 /// `POST /v1/down`: Calcifer stops; machines keep running what they accepted.

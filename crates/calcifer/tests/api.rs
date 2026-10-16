@@ -596,7 +596,7 @@ async fn a_calcifer_owing_nothing_stops_at_once_unless_a_client_wants_it() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_run_for_a_disabled_local_machine_an_unknown_one_or_bare_new_is_refused_unrecorded() {
+async fn a_run_for_a_disabled_local_machine_or_an_unknown_one_is_refused_unrecorded() {
     let home = tempfile::tempdir().unwrap();
     let calcifer = Calcifer::start(home.path()).await;
     let spec = common::warm_spec("http://127.0.0.1:9", vec![]);
@@ -619,12 +619,6 @@ async fn a_run_for_a_disabled_local_machine_an_unknown_one_or_bare_new_is_refuse
     assert_eq!(local.next, ["cozy run … --on any", "cozy machine list"]);
     let other = submit("kiyui").await.unwrap().json::<Envelope>().await;
     assert_eq!(other.unwrap().error.message, r#"no machine named "kiyui""#);
-    let new = submit("new").await.unwrap();
-    assert_eq!(new.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(
-        new.json::<Envelope>().await.unwrap().error.code,
-        "placement_unavailable"
-    );
     let listed: RunList = calcifer
         .request(Method::GET, "/v1/runs")
         .send()

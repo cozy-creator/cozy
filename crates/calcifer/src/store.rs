@@ -111,6 +111,15 @@ const MIGRATIONS: &[M] = &[
         "ALTER TABLE outputs ADD COLUMN failed_rev INTEGER;
         ALTER TABLE outputs ADD COLUMN export_error TEXT;",
     ),
+    // Machines and rentals: a renamed machine's old name, where an unpinned run may go, and
+    // which run an ask was made for.
+    M::up(
+        "ALTER TABLE machines ADD COLUMN alias TEXT;
+        CREATE UNIQUE INDEX machines_alias ON machines (alias) WHERE alias IS NOT NULL;
+        ALTER TABLE runs ADD COLUMN wants TEXT;
+        ALTER TABLE asks ADD COLUMN kind TEXT NOT NULL DEFAULT 'rent' CHECK (kind IN ('rent', 'end'));
+        ALTER TABLE asks ADD COLUMN run TEXT REFERENCES runs (id);",
+    ),
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -197,6 +206,8 @@ pub struct NewRun {
     pub out_dir: PathBuf,
     pub warnings: Vec<Warning>,
     pub inputs: Vec<(Digest, u64)>,
+    /// Where an unpinned run may go: `any`, `new` or `new:<sku>`.
+    pub wants: Option<String>,
 }
 
 /// How to reach a machine: the id its caps name, its address and its TLS leaf's sha256.
@@ -329,6 +340,187 @@ impl Store {
         })
     }
 
+    /// The machine a name, a former name (alias) or a rental id names.
+    pub fn find_machine(&self, text: &str) -> Result<Option<MachineRow>> {
+        self.read(|conn| {
+            conn.query_row(
+                &format!(
+                    "SELECT {MACHINE_COLUMNS} FROM machines WHERE name = ?1 OR alias = ?1 OR rental_id = ?1
+                     ORDER BY name = ?1 DESC LIMIT 1"
+                ),
+                [text],
+                machine_row,
+            )
+            .optional()?
+            .transpose()
+        })
+    }
+
+    /// The name a renamed machine had before.
+    pub fn alias(&self, name: &str) -> Result<Option<String>> {
+        self.read(|conn| {
+            Ok(conn
+                .query_row("SELECT alias FROM machines WHERE name = ?1", [name], |r| {
+                    r.get(0)
+                })
+                .optional()?
+                .flatten())
+        })
+    }
+
+    /// Renames a machine that has not served (its Hub named it): its runs move with it, and the
+    /// old name stays its alias. An ended machine that held the name gives it up: its history
+    /// keeps it as `<name>@<when it was recorded>`.
+    pub fn rename_machine(&self, old: &str, new: &str) -> Result<bool> {
+        self.write(|tx| {
+            let renamable: bool = tx.query_row(
+                "SELECT EXISTS (SELECT 1 FROM machines WHERE name = ?1 AND served = 0 AND state <> 'ended')
+                     AND NOT EXISTS (SELECT 1 FROM machines WHERE alias = ?2 AND name <> ?1)",
+                params![old, new],
+                |r| r.get(0),
+            )?;
+            let holder: Option<(String, i64)> = tx
+                .query_row("SELECT state, created_at FROM machines WHERE name = ?1", [new], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .optional()?;
+            match holder {
+                _ if !renamable => return Ok(false),
+                Some((state, _)) if state != "ended" => return Ok(false),
+                Some((_, at)) => move_machine(tx, new, &format!("{new}@{at}"), None)?,
+                None => {}
+            }
+            move_machine(tx, old, new, Some(old))?;
+            Ok(true)
+        })
+    }
+
+    /// Unsettled runs by machine: how many it accepted, and how many wait to be sent or accepted.
+    pub fn machine_load(&self) -> Result<std::collections::HashMap<String, (u32, u32)>> {
+        self.read(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT machine, SUM(state = 'accepted'), SUM(state <> 'accepted') FROM runs
+                 WHERE state <> 'settled' AND machine IS NOT NULL GROUP BY machine",
+            )?;
+            let rows = statement.query_map([], |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?))))?;
+            Ok(rows.collect::<rusqlite::Result<_>>()?)
+        })
+    }
+
+    /// Unsettled runs no machine was chosen for, oldest first, with where each may go.
+    pub fn unplaced(&self) -> Result<Vec<(RunRow, String)>> {
+        self.read(|conn| {
+            let mut statement = conn.prepare(&format!(
+                "SELECT {RUN_COLUMNS}, COALESCE(wants, 'any') FROM runs
+                 WHERE state = 'queued' AND machine IS NULL ORDER BY number"
+            ))?;
+            let rows = statement
+                .query_map([], |r| {
+                    Ok((
+                        run_row(r)?,
+                        r.get::<_, String>(RUN_COLUMNS.split(',').count())?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows.into_iter()
+                .map(|(row, wants)| Ok((row?, wants)))
+                .collect()
+        })
+    }
+
+    /// Records an ask of a Hub under its key before it is made; the same key again answers the
+    /// recorded ask (`false`), and with another intent (`digest`) is a conflict.
+    pub fn begin_ask(&self, ask: &Ask) -> Result<(Ask, bool)> {
+        self.write(|tx| {
+            if let Some(recorded) = ask_in(tx, &ask.key)? {
+                return if recorded.digest == ask.digest {
+                    Ok((recorded, false))
+                } else {
+                    Err(StoreError::Conflict(ask.key.clone()))
+                };
+            }
+            tx.execute(
+                "INSERT INTO asks (key, hub, digest, body, machine, state, reason, created_at, kind, run)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'pending', NULL, ?6, ?7, ?8)",
+                params![
+                    ask.key,
+                    ask.hub,
+                    ask.digest,
+                    ask.body,
+                    ask.machine,
+                    now_ms(),
+                    ask.kind.as_str(),
+                    ask.run.as_ref().map(RunId::as_str),
+                ],
+            )?;
+            Ok((ask.clone(), true))
+        })
+    }
+
+    /// The rent ask that made the machine.
+    pub fn rent_ask(&self, machine: &str) -> Result<Option<Ask>> {
+        self.read(|conn| {
+            conn.query_row(
+                &format!("SELECT {ASK_COLUMNS} FROM asks WHERE machine = ?1 AND kind = 'rent' AND state = 'done'"),
+                [machine],
+                ask_row,
+            )
+            .optional()?
+            .transpose()
+        })
+    }
+
+    /// Asks a failed ask again.
+    pub fn reopen_ask(&self, key: &str) -> Result<()> {
+        self.write(|tx| {
+            tx.execute("UPDATE asks SET state = 'pending', reason = NULL WHERE key = ?1 AND state = 'failed'", [key])?;
+            Ok(())
+        })
+    }
+
+    pub fn ask(&self, key: &str) -> Result<Option<Ask>> {
+        self.read(|conn| ask_in(conn, key))
+    }
+
+    /// Asks not yet answered: what a starting Calcifer asks again.
+    pub fn pending_asks(&self) -> Result<Vec<Ask>> {
+        self.read(|conn| {
+            let mut statement = conn.prepare(&format!(
+                "SELECT {ASK_COLUMNS} FROM asks WHERE state = 'pending' ORDER BY created_at"
+            ))?;
+            let rows = statement
+                .query_map([], ask_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows.into_iter().collect()
+        })
+    }
+
+    /// Ends an ask: `done` with the machine it made, or `failed` with why. A rent ask that is
+    /// done records its machine in the same transaction.
+    pub fn settle_ask(
+        &self,
+        key: &str,
+        outcome: std::result::Result<Option<&MachineRow>, &str>,
+    ) -> Result<()> {
+        self.write(|tx| {
+            match outcome {
+                Ok(machine) => {
+                    if let Some(machine) = machine {
+                        put_machine_in(tx, machine)?;
+                    }
+                    tx.execute(
+                        "UPDATE asks SET state = 'done', machine = COALESCE(?2, machine) WHERE key = ?1",
+                        params![key, machine.map(|m| &m.name)],
+                    )?;
+                }
+                Err(reason) => {
+                    tx.execute("UPDATE asks SET state = 'failed', reason = ?2 WHERE key = ?1", params![key, reason])?;
+                }
+            }
+            Ok(())
+        })
+    }
+
     /// Records `new` under `key`, once: the same key again answers the recorded run (`false`), and
     /// with another submission (`digest`) is a conflict.
     pub fn submit(&self, key: &str, digest: &str, new: NewRun) -> Result<(RunRow, bool)> {
@@ -341,18 +533,25 @@ impl Store {
             if let Some((id, recorded)) = recorded {
                 return if recorded == digest { Ok((id, false)) } else { Err(StoreError::Conflict(key.into())) };
             }
-            if let Some(machine) = &new.machine {
-                let known: bool =
-                    tx.query_row("SELECT EXISTS (SELECT 1 FROM machines WHERE name = ?1)", [machine], |r| r.get(0))?;
-                if !known {
-                    return Err(StoreError::UnknownMachine(machine.clone()));
-                }
-            }
+            // A machine is named by its name, the name it had before its Hub named it, or its rental id.
+            let machine = match &new.machine {
+                None => None,
+                Some(text) => Some(
+                    tx.query_row(
+                        "SELECT name FROM machines WHERE name = ?1 OR alias = ?1 OR rental_id = ?1
+                         ORDER BY name = ?1 DESC LIMIT 1",
+                        [text],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .optional()?
+                    .ok_or_else(|| StoreError::UnknownMachine(text.clone()))?,
+                ),
+            };
             tx.execute(
                 "INSERT INTO runs (id, number, idempotency_key, digest, hub, kind, target, machine, pinned, spec,
-                     out_dir, state, created_at, warnings, inputs)
+                     out_dir, state, created_at, warnings, inputs, wants)
                  VALUES (?1, (SELECT COALESCE(MAX(number), 0) + 1 FROM runs), ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
-                     ?10, 'queued', ?11, ?12, ?13)",
+                     ?10, 'queued', ?11, ?12, ?13, ?14)",
                 params![
                     new.id.as_str(),
                     key,
@@ -360,13 +559,14 @@ impl Store {
                     new.hub,
                     new.kind.as_str(),
                     new.target,
-                    new.machine,
+                    machine,
                     new.pinned,
                     new.spec,
                     new.out_dir.to_string_lossy(),
                     now_ms(),
                     serde_json::to_string(&new.warnings).expect("serializes"),
                     serde_json::to_string(&new.inputs).expect("serializes"),
+                    new.wants,
                 ],
             )?;
             Ok((new.id.to_string(), true))
@@ -588,6 +788,22 @@ impl Store {
                 end(tx, id, Status::Failed, Some(reason))
             }
             _ => Ok(vec![]),
+        })
+    }
+
+    /// Adds a warning to an unsettled run, answered as its lifecycle event.
+    pub fn warn(&self, id: &str, warning: &Warning) -> Result<Vec<Event>> {
+        self.write(|tx| {
+            let Some(mut row) = run_in(tx, id)?.filter(|row| row.state != State::Settled) else {
+                return Ok(vec![]);
+            };
+            row.warnings.push(warning.clone());
+            let warnings = serde_json::to_string(&row.warnings).expect("serializes");
+            tx.execute(
+                "UPDATE runs SET warnings = ?2 WHERE id = ?1",
+                params![id, warnings],
+            )?;
+            Ok(vec![lifecycle(tx, id)?])
         })
     }
 
@@ -1003,6 +1219,118 @@ fn machine_row(r: &Row) -> rusqlite::Result<Result<MachineRow>> {
     }))
 }
 
+/// Moves a machine to another name, with its runs and asks; `alias` is its former name.
+fn move_machine(tx: &Transaction, from: &str, to: &str, alias: Option<&str>) -> Result<()> {
+    // Its unique rental id and alias move with it.
+    let (rental, held): (Option<String>, Option<String>) = tx.query_row(
+        "SELECT rental_id, alias FROM machines WHERE name = ?1",
+        [from],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    tx.execute(
+        "UPDATE machines SET rental_id = NULL, alias = NULL WHERE name = ?1",
+        [from],
+    )?;
+    tx.execute(
+        "INSERT INTO machines (name, kind, hub, rental_id, worker_id, address, pin, key, state, served,
+             reason, created_at, alias)
+         SELECT ?2, kind, hub, ?3, worker_id, address, pin, key, state, served, reason, created_at, ?4
+         FROM machines WHERE name = ?1",
+        params![from, to, rental, held.as_deref().or(alias)],
+    )?;
+    tx.execute(
+        "UPDATE runs SET machine = ?2 WHERE machine = ?1",
+        params![from, to],
+    )?;
+    tx.execute(
+        "UPDATE asks SET machine = ?2 WHERE machine = ?1",
+        params![from, to],
+    )?;
+    tx.execute("DELETE FROM machines WHERE name = ?1", [from])?;
+    Ok(())
+}
+
+/// What a Hub is asked to do, recorded before it is asked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AskKind {
+    Rent,
+    End,
+}
+
+impl AskKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            AskKind::Rent => "rent",
+            AskKind::End => "end",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AskState {
+    Pending,
+    Done,
+    Failed,
+}
+
+/// One ask of a Hub: its key is the idempotency key the Hub gets, and `body` the exact bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Ask {
+    pub key: String,
+    pub kind: AskKind,
+    pub hub: String,
+    /// What was asked for, which the same key must ask again.
+    pub digest: String,
+    pub body: Vec<u8>,
+    pub machine: Option<String>,
+    /// The run it was made for.
+    pub run: Option<RunId>,
+    pub state: AskState,
+    pub reason: Option<String>,
+}
+
+const ASK_COLUMNS: &str = "key, kind, hub, digest, body, machine, run, state, reason";
+
+fn ask_row(r: &Row) -> rusqlite::Result<Result<Ask>> {
+    let kind: String = r.get(1)?;
+    let run: Option<String> = r.get(6)?;
+    let state: String = r.get(7)?;
+    Ok((|| {
+        Ok(Ask {
+            key: r.get(0)?,
+            kind: if kind == "end" {
+                AskKind::End
+            } else {
+                AskKind::Rent
+            },
+            hub: r.get(2)?,
+            digest: r.get(3)?,
+            body: r.get(4)?,
+            machine: r.get(5)?,
+            run: run
+                .map(RunId::try_from)
+                .transpose()
+                .map_err(|_| StoreError::Corrupt("an ask's run".into()))?,
+            state: match state.as_str() {
+                "pending" => AskState::Pending,
+                "done" => AskState::Done,
+                _ => AskState::Failed,
+            },
+            reason: r.get(8)?,
+        })
+    })())
+}
+
+fn ask_in(conn: &Connection, key: &str) -> Result<Option<Ask>> {
+    conn.query_row(
+        &format!("SELECT {ASK_COLUMNS} FROM asks WHERE key = ?1"),
+        [key],
+        ask_row,
+    )
+    .optional()?
+    .transpose()
+}
+
 fn machine_kind(kind: MachineKind) -> &'static str {
     match kind {
         MachineKind::Local => "local",
@@ -1014,7 +1342,8 @@ fn machine_kind(kind: MachineKind) -> &'static str {
 fn machine_state(state: MachineState) -> &'static str {
     match state {
         MachineState::Booting => "booting",
-        MachineState::Ready => "ready",
+        // Ending is the API's word for a machine whose end its Hub has not affirmed.
+        MachineState::Ready | MachineState::Ending => "ready",
         MachineState::Ended => "ended",
     }
 }
@@ -1027,8 +1356,17 @@ impl From<&MachineRow> for Machine {
             state: row.state,
             hub: row.hub.clone(),
             rental_id: row.rental_id.clone(),
+            alias: None,
             address: row.endpoint.as_ref().map(|e| e.address.clone()),
             reason: row.reason.clone(),
+            rental: None,
+            status: None,
+            unreachable: None,
+            boot: None,
+            running: 0,
+            queued: 0,
+            recorded: true,
+            unverified: false,
         }
     }
 }
