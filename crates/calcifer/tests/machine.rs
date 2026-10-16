@@ -362,3 +362,72 @@ async fn a_run_lost_after_acceptance_fails_and_is_not_run_again() {
     );
     calcifer.close();
 }
+
+/// Runs imported from the Go CLI keep no spec: one its machine holds is followed from its cursor
+/// and ends with the machine's own outcome; one its machine never got settles failed, never sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn imported_runs_are_followed_and_never_sent() {
+    use calcifer::store::{ImportedRun, Store};
+    let home = tempfile::tempdir().unwrap();
+    let key = common::key_file(home.path());
+    let machine = Tensord::start();
+    let hub = SilentHub::new();
+    let held = RunId::try_from("req-held".to_owned()).unwrap();
+    let never = RunId::try_from("req-never".to_owned()).unwrap();
+    // The Go CLI sent this one and its machine accepted it.
+    let spec = v1::RunSpec::decode(common::warm_spec(&hub.origin(), vec![]).as_slice()).unwrap();
+    let link = Link::new(&machine.endpoint, common::key()).unwrap();
+    link.run(held.as_str(), 0, Some(spec)).await.unwrap();
+    let imported = |id: &RunId, number: u64, state: State| ImportedRun {
+        id: id.clone(),
+        number,
+        kind: Kind::Warm,
+        target: "cozy-test/held".into(),
+        hub: hub.origin(),
+        machine: Some("m".into()),
+        out_dir: home.path().join("outputs"),
+        state,
+        cancel_requested: false,
+        cursor: 0,
+        machine_number: None,
+        machine_state: None,
+        status: None,
+        reason: None,
+        outcome: None,
+        created_at_ms: 1,
+        accepted_at_ms: None,
+        settled_at_ms: None,
+        outputs: vec![],
+    };
+    Store::open(&home.path().join("calcifer/state.db"))
+        .unwrap()
+        .import(
+            &[machine.row("m", &key)],
+            &[
+                imported(&held, 41, State::Accepted),
+                imported(&never, 42, State::Sent),
+            ],
+        )
+        .unwrap();
+    let calcifer = open(home.path());
+    let mut events = calcifer.subscribe();
+    settled(&calcifer, &never).await;
+    let row = calcifer.store().run(never.as_str()).unwrap().unwrap();
+    assert_eq!(row.reason.unwrap().code, "spec_not_kept");
+    assert!(
+        matches!(on_machine(&machine, &never).await, Err(LinkError::NotFound)),
+        "never sent"
+    );
+    calcifer.cancel(&held).unwrap();
+    let end = until(&mut events, &held, |e| e.is_terminal()).await;
+    assert_eq!(
+        reason_of(&end),
+        "canceled",
+        "the machine's own outcome: {end:?}"
+    );
+    assert_eq!(
+        calcifer.store().run(held.as_str()).unwrap().unwrap().number,
+        41
+    );
+    calcifer.close();
+}

@@ -74,9 +74,9 @@ impl Home {
         self.root.join("services")
     }
 
-    /// Where the one-shot importer moves the Go CLI's files.
-    pub fn go_legacy(&self) -> PathBuf {
-        self.root.join("go-legacy")
+    /// The owner's backups, and the one-shot importer's archive of the Go CLI's state.
+    pub fn backups(&self) -> PathBuf {
+        self.root.join("backups")
     }
 }
 

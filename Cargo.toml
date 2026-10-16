@@ -18,6 +18,7 @@ cozy-cli = { path = "crates/cozy-cli" }
 cozy-platform = { path = "crates/cozy-platform" }
 cozy-proto = { path = "crates/cozy-proto" }
 hub-client = { path = "crates/hub-client" }
+migrate = { path = "crates/migrate" }
 
 anstream = "1.0.0"
 anstyle = "1.0.14"

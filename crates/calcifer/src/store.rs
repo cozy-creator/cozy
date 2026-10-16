@@ -125,6 +125,8 @@ pub enum StoreError {
     UnknownMachine(String),
     #[error("Calcifer's store holds a row it cannot read: {0}")]
     Corrupt(String),
+    #[error("Calcifer's store already holds runs or machines; an import needs an empty one")]
+    NotEmpty,
 }
 
 type Result<T> = std::result::Result<T, StoreError>;
@@ -300,34 +302,7 @@ impl Store {
     }
 
     pub fn put_machine(&self, machine: &MachineRow) -> Result<()> {
-        self.write(|tx| {
-            let (worker, address, pin) = match &machine.endpoint {
-                Some(e) => (Some(&e.worker_id), Some(&e.address), Some(e.pin.to_vec())),
-                None => (None, None, None),
-            };
-            tx.execute(
-                "INSERT INTO machines (name, kind, hub, rental_id, worker_id, address, pin, key, state,
-                     served, reason, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
-                 ON CONFLICT (name) DO UPDATE SET kind = ?2, hub = ?3, rental_id = ?4, worker_id = ?5,
-                     address = ?6, pin = ?7, key = ?8, state = ?9, served = served OR ?10, reason = ?11",
-                params![
-                    machine.name,
-                    machine_kind(machine.kind),
-                    machine.hub,
-                    machine.rental_id,
-                    worker,
-                    address,
-                    pin,
-                    machine.key.to_string_lossy(),
-                    machine_state(machine.state),
-                    machine.served || machine.endpoint.is_some(),
-                    machine.reason,
-                    now_ms(),
-                ],
-            )?;
-            Ok(())
-        })
+        self.write(|tx| put_machine_in(tx, machine))
     }
 
     pub fn machine(&self, name: &str) -> Result<Option<MachineRow>> {
@@ -886,6 +861,35 @@ fn output_row(r: &Row) -> rusqlite::Result<OutputRow> {
     })
 }
 
+fn put_machine_in(tx: &Transaction, machine: &MachineRow) -> Result<()> {
+    let (worker, address, pin) = match &machine.endpoint {
+        Some(e) => (Some(&e.worker_id), Some(&e.address), Some(e.pin.to_vec())),
+        None => (None, None, None),
+    };
+    tx.execute(
+        "INSERT INTO machines (name, kind, hub, rental_id, worker_id, address, pin, key, state,
+             served, reason, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+         ON CONFLICT (name) DO UPDATE SET kind = ?2, hub = ?3, rental_id = ?4, worker_id = ?5,
+             address = ?6, pin = ?7, key = ?8, state = ?9, served = served OR ?10, reason = ?11",
+        params![
+            machine.name,
+            machine_kind(machine.kind),
+            machine.hub,
+            machine.rental_id,
+            worker,
+            address,
+            pin,
+            machine.key.to_string_lossy(),
+            machine_state(machine.state),
+            machine.served || machine.endpoint.is_some(),
+            machine.reason,
+            now_ms(),
+        ],
+    )?;
+    Ok(())
+}
+
 const RUN_COLUMNS: &str = "id, number, kind, target, hub, machine, pinned, spec, out_dir, state, cancel_requested,
     cursor, machine_state, status, reason_code, reason, state_seq, created_at, accepted_at, settled_at, warnings,
     inputs, outcome";
@@ -1254,4 +1258,138 @@ pub(crate) fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as i64)
+}
+
+/// A run another controller recorded, as `cozy migrate` imports it: never sent again (its spec is
+/// not kept), so it is never queued.
+#[derive(Clone, Debug)]
+pub struct ImportedRun {
+    pub id: RunId,
+    pub number: u64,
+    pub kind: Kind,
+    pub target: String,
+    pub hub: String,
+    pub machine: Option<String>,
+    pub out_dir: PathBuf,
+    pub state: State,
+    pub cancel_requested: bool,
+    pub cursor: u64,
+    pub machine_number: Option<u64>,
+    pub machine_state: Option<String>,
+    pub status: Option<Status>,
+    pub reason: Option<Reason>,
+    pub outcome: Option<v1::Outcome>,
+    pub created_at_ms: i64,
+    pub accepted_at_ms: Option<i64>,
+    pub settled_at_ms: Option<i64>,
+    pub outputs: Vec<ImportedOutput>,
+}
+
+/// One output item at its newest revision; with a path, that revision is already exported there.
+#[derive(Clone, Debug)]
+pub struct ImportedOutput {
+    pub name: String,
+    pub index: u32,
+    pub rev: u64,
+    pub length: u64,
+    pub digest: String,
+    pub media_type: String,
+    pub label: String,
+    pub duration_us: u64,
+    pub done: bool,
+    pub path: Option<PathBuf>,
+}
+
+impl Store {
+    /// Records `machines` and `runs` in one transaction, into a store that holds neither.
+    pub fn import(&self, machines: &[MachineRow], runs: &[ImportedRun]) -> Result<()> {
+        self.write(|tx| {
+            let held: bool = tx.query_row(
+                "SELECT EXISTS (SELECT 1 FROM runs) OR EXISTS (SELECT 1 FROM machines)",
+                [],
+                |r| r.get(0),
+            )?;
+            if held {
+                return Err(StoreError::NotEmpty);
+            }
+            for machine in machines {
+                put_machine_in(tx, machine)?;
+            }
+            for run in runs {
+                import_run(tx, run)?;
+            }
+            Ok(())
+        })
+    }
+}
+
+fn import_run(tx: &Transaction, run: &ImportedRun) -> Result<()> {
+    let id = run.id.as_str();
+    let state = match run.state {
+        State::Queued => return Err(StoreError::Corrupt(format!("imported run {id} is queued"))),
+        State::Sent => "sent",
+        State::Accepted => "accepted",
+        State::Settled => "settled",
+    };
+    let status = run.status.map(|status| match status {
+        Status::Completed => "completed",
+        Status::Canceled => "canceled",
+        _ => "failed",
+    });
+    // Sequence 1 is the run's creation, then one per output item, then its current state.
+    let state_seq = run.outputs.len() as i64 + 2;
+    tx.execute(
+        "INSERT INTO runs (id, number, idempotency_key, digest, hub, kind, target, machine, pinned, spec, out_dir,
+             state, cancel_requested, cursor, machine_number, machine_state, status, reason_code, reason, outcome,
+             seq, state_seq, created_at, accepted_at, settled_at)
+         VALUES (?1, ?2, ?3, '', ?4, ?5, ?6, ?7, 1, x'', ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?18,
+             ?19, ?20, ?21)",
+        params![
+            id,
+            run.number as i64,
+            format!("import:{id}"),
+            run.hub,
+            run.kind.as_str(),
+            run.target,
+            run.machine,
+            run.out_dir.to_string_lossy(),
+            state,
+            run.cancel_requested,
+            run.cursor as i64,
+            run.machine_number.map(|n| n as i64),
+            run.machine_state,
+            status,
+            run.reason.as_ref().map(|r| &r.code),
+            run.reason.as_ref().map(|r| &r.message),
+            run.outcome.as_ref().map(|o| prost::Message::encode_to_vec(o)),
+            state_seq,
+            run.created_at_ms,
+            run.accepted_at_ms,
+            run.settled_at_ms,
+        ],
+    )?;
+    for (seq, output) in (2_i64..).zip(&run.outputs) {
+        let path = output.path.as_ref().map(|p| p.to_string_lossy());
+        tx.execute(
+            "INSERT INTO outputs (run, name, idx, rev, length, digest, media_type, label, duration_us, done, path,
+                 exported_rev, created_seq, seq)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13)",
+            params![
+                id,
+                output.name,
+                i64::from(output.index),
+                output.rev as i64,
+                output.length as i64,
+                output.digest,
+                output.media_type,
+                output.label,
+                output.duration_us as i64,
+                output.done,
+                path,
+                path.is_some().then_some(output.rev as i64),
+                seq,
+            ],
+        )?;
+    }
+    Ok(())
 }
