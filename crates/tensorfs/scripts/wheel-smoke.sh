@@ -30,9 +30,10 @@ if [ -z "$skip_build" ]; then
     scripts/build-wheel.sh --out "$wheels" >"$work/build.log" 2>&1 || {
         tail -20 "$work/build.log"; exit 1; }
 fi
-cargo build --quiet --release --bin tfs
+cargo build --quiet --release --locked -p tensorfs-core --bin tfs
+target=$(cargo metadata --format-version 1 --no-deps | "$py" -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')
 fixture=$work/store
-write=$(target/release/tfs checkpoint write "$fixture" --blocks 1 --plain)
+write=$("$target"/release/tfs checkpoint write "$fixture" --blocks 1 --plain)
 SNAP=$(sed -n 's/.*manifest_id     sha256:\([0-9a-f]\{64\}\).*/\1/p' <<<"$write")
 test -n "$SNAP"
 wheel=$(ls "$wheels"/tensorfs-*.whl | head -1)

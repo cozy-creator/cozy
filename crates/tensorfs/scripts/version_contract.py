@@ -45,18 +45,18 @@ def _python_version_from_cargo(version: str) -> str:
 def source_versions() -> tuple[str, str]:
     pyproject = _toml(ROOT / "pyproject.toml")
     conformance = _toml(ROOT / "conformance/cbor/python/pyproject.toml")
-    cargo = _toml(ROOT / "Cargo.toml")
+    cargo = _toml(ROOT / "crates/tensorfs-py/Cargo.toml")
     python_version = pyproject["project"]["version"]  # type: ignore[index]
-    cargo_version = cargo["workspace"]["package"]["version"]  # type: ignore[index]
+    cargo_version = cargo["package"]["version"]  # type: ignore[index]
     for name, project in (("pyproject.toml", pyproject), ("conformance CBOR", conformance)):
         requires_python = project["project"]["requires-python"]  # type: ignore[index]
         if requires_python != PYTHON_SPEC:
             raise ValueError(f"{name} requires-python {requires_python!r} != {PYTHON_SPEC!r}")
     if not isinstance(python_version, str) or not isinstance(cargo_version, str):
-        raise ValueError("pyproject and Cargo workspace versions must be strings")
+        raise ValueError("pyproject and Cargo versions must be strings")
     if cargo_version != CURRENT_CARGO_VERSION:
         raise ValueError(
-            f"Cargo workspace version {cargo_version!r} != current release identity "
+            f"Cargo version {cargo_version!r} != current release identity "
             f"{CURRENT_CARGO_VERSION!r}"
         )
     if python_version != CURRENT_PYTHON_VERSION:
@@ -73,8 +73,8 @@ def source_versions() -> tuple[str, str]:
     for manifest in sorted((ROOT / "crates").glob("*/Cargo.toml")):
         package = _toml(manifest).get("package")
         version = package.get("version") if isinstance(package, dict) else None
-        if version != {"workspace": True}:
-            raise ValueError(f"{manifest.relative_to(ROOT)} must inherit version.workspace")
+        if version != cargo_version:
+            raise ValueError(f"{manifest.relative_to(ROOT)} version {version!r} != {cargo_version!r}")
     return cargo_version, python_version
 
 

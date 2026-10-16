@@ -1,7 +1,20 @@
 # One workspace for the `cozy` binary (xs-043). The Go tree stays at the root until the cutover.
 [workspace]
 resolver = "3"
-members = ["crates/*"]
+# Listed, not globbed: crates/tensorfs is TensorFS's own tree (its wheel's pyproject.toml,
+# python/, conformance/) holding its three crates, and has no manifest of its own.
+members = [
+    "crates/calcifer",
+    "crates/cozy",
+    "crates/cozy-cli",
+    "crates/cozy-platform",
+    "crates/cozy-proto",
+    "crates/hub-client",
+    "crates/tensord",
+    "crates/tensorfs/crates/tensorfs-core",
+    "crates/tensorfs/crates/tensorfs-plane",
+    "crates/tensorfs/crates/tensorfs-py",
+]
 
 [workspace.package]
 version = "0.9.0"
@@ -18,23 +31,31 @@ cozy-cli = { path = "crates/cozy-cli" }
 cozy-platform = { path = "crates/cozy-platform" }
 cozy-proto = { path = "crates/cozy-proto" }
 hub-client = { path = "crates/hub-client" }
+tensord = { path = "crates/tensord" }
+tensorfs-core = { path = "crates/tensorfs/crates/tensorfs-core", default-features = false }
+tensorfs-plane = { path = "crates/tensorfs/crates/tensorfs-plane", default-features = false }
 
 anstream = "1.0.0"
 anstyle = "1.0.14"
 aws-lc-rs = "1.18"
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "tokio", "tracing"] }
 base64 = "0.22"
+bytes = "1.12"
 chrono = { version = "0.4", default-features = false, features = ["serde", "std"] }
 clap = { version = "4.6", features = ["derive"] }
 clap_complete = { version = "4.6.11", features = ["unstable-dynamic"] }
 comfy-table = "8.0.1"
 ed25519-dalek = "2"
 figment = { version = "0.10.19", features = ["env", "toml"] }
+fs2 = "0.4"
 futures-util = { version = "0.3.34", default-features = false }
 getrandom = "0.3"
 hex = "0.4"
+http-body-util = "0.1.5"
+hyper = { version = "1.11", default-features = false }
 hyper-util = { version = "0.1.21", default-features = false, features = ["tokio"] }
 libc = "0.2"
+nix = { version = "0.31.3", default-features = false }
 nvml-wrapper = "0.13"
 openapiv3 = "2"
 prettyplease = "0.2"
@@ -51,6 +72,7 @@ rustls = { version = "0.23.46", default-features = false, features = ["aws_lc_rs
 serde = { version = "1", features = ["derive"] }
 serde_ignored = "0.1.14"
 serde_json = "1"
+serde_json_canonicalizer = "0.3"
 serde_yaml = "0.9"
 sha2 = "0.10"
 supports-hyperlinks = "3.2.0"

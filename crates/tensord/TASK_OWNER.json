@@ -1,1 +1,0 @@
-{"owner":"/root (Claude Opus root-fifo-allocations agent)","purpose":"Slurm-FIFO root GPU allocations: one allocation table, root-ordered dispatch, grant/wait/release run events","branch":"feat/root-fifo-allocations-20261013","base_sha":"8462747"}

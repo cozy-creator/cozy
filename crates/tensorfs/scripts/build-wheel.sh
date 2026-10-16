@@ -31,16 +31,18 @@ done
 
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
 nice -n 19 cargo build --release --locked -p tensorfs-core --bin tfs
+# The cozy workspace's target directory, not this tree's.
+target=$(cargo metadata --format-version 1 --no-deps | "$py" -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')
 
-version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
-said=$(target/release/tfs version)
+version=$(sed -n 's/^version = "\(.*\)"$/\1/p' crates/tensorfs-py/Cargo.toml | head -1)
+said=$("$target"/release/tfs version)
 case "$said" in
     "tfs $version sha256:"*) ;;
     *) echo "built tfs says \"$said\", not version $version — refusing to stage" >&2; exit 1 ;;
 esac
 
 mkdir -p wheel-data/scripts
-install -m 755 target/release/tfs wheel-data/scripts/tfs
+install -m 755 "$target"/release/tfs wheel-data/scripts/tfs
 
 nice -n 19 maturin build --release --locked --out "$out" ${args[@]+"${args[@]}"}
 

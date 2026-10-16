@@ -108,7 +108,7 @@ impl<B: MachineBackend> MachineV1<B> {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |since| since.as_secs() as i64);
         let authority = &self.identity.authority;
-        let (grant, signer) = capability::verify_signer(
+        let (grant, signer) = capability::verify(
             token,
             &authority.worker_id,
             &authority.keys.admitted(),

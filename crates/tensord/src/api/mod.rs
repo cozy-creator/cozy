@@ -1,7 +1,6 @@
 pub mod auth;
 pub mod backend;
 pub mod domain;
-pub mod capability;
 mod cozy1;
 pub mod identity;
 pub mod install;
@@ -12,11 +11,8 @@ pub mod retired;
 mod server;
 pub mod workspaces;
 
-
-/// `cozy.machine.v1`, the machine's API (G/API.md).
-pub mod v1 {
-    tonic::include_proto!("cozy.machine.v1");
-}
+/// `cozy.machine.v1` and Cozy-Cap live in `cozy-proto`, shared with Calcifer and the CLI.
+pub use cozy_proto::{capability, machine as v1};
 
 pub use backend::MachineBackend;
 pub use machine_status::CAPABILITIES;

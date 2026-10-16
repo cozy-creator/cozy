@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """A released version number names ONE tree, forever.
 
-Publication IS the tag push here: `.github/workflows/publish.yaml` triggers on `v*` and
-there is no local publish path, so the `v*` tags ARE the released set. Checked
+Publication IS the tag push: the `tensorfs-v*` tags of the cozy repository (`v*` in the
+TensorFS repository before it moved there) and there is no local publish path, so the tags ARE
+the released set. Checked
 2026-09-03 in both this repository and its sibling: the PyPI release list and the `v*`
 tags agree exactly, with no version on one side only. That is why this guard reads git
 refs and never the network.
@@ -12,7 +13,7 @@ released number. Nothing rejected that, so a pin resolved to different bytes dep
 when the wheel was built, and the divergence surfaced hours later inside a baked image on
 a rented pod. Four paid failures on 2026-09-03 were this one defect.
 
-    if `v<declared version>` exists, HEAD's tree must be the tree that tag names.
+    if `tensorfs-v<declared version>` exists, HEAD's TensorFS tree must be the tree that tag names.
 
 Consequences, all deliberate:
 
@@ -23,7 +24,7 @@ Consequences, all deliberate:
   * A tag whose publish failed still counts. A tag is a public immutable name that a pin,
     a bake, or `pip install git+...@v0.3.4` may already resolve; re-pointing it over
     changed content is exactly the defect. Tagged is released.
-  * The comparison is the WHOLE tree, not the packaged subset: `v0.2.15` names a
+  * The comparison is TensorFS's whole tree (`crates/tensorfs`), not the packaged subset: `v0.2.15` names a
     checkout, and a README fixed under that number makes the name ambiguous. The remedy
     is one line in the manifest.
 
@@ -64,7 +65,7 @@ def red(message: str) -> int:
 
 def main() -> int:
     version = declared_version()
-    tag = f"v{version}"
+    tag = f"tensorfs-v{version}"
 
     # A guard that cannot see the released tags must refuse, not pass: a shallow or
     # tagless checkout is otherwise indistinguishable from a repository that has never
@@ -75,7 +76,7 @@ def main() -> int:
             "  compared. Check the repository out with `fetch-depth: 0`."
         )
 
-    released = git("tag", "--list", "--sort=v:refname", "v*").split()
+    released = git("tag", "--list", "--sort=v:refname", "tensorfs-v*").split()
     if not released:
         print(f"released version guard green: nothing is released yet, so {version} names no tree")
         return 0
@@ -86,13 +87,13 @@ def main() -> int:
         )
         return 0
 
-    head_tree = git("rev-parse", "HEAD^{tree}")
-    tag_tree = git("rev-parse", f"{tag}^{{tree}}")
+    head_tree = git("rev-parse", "HEAD:./")
+    tag_tree = git("rev-parse", f"{tag}:./")
     if head_tree == tag_tree:
         print(f"released version guard green: HEAD is exactly the tree {tag} names")
         return 0
 
-    changed = git("diff", "--stat", tag, "HEAD", strip=False).splitlines()
+    changed = git("diff", "--stat", tag, "HEAD", "--", ".", strip=False).splitlines()
     if len(changed) > DIFF_LINES:
         changed = [*changed[: DIFF_LINES - 1], f"  ... {len(changed) - DIFF_LINES + 1} more lines"]
     detail = "\n".join(f"    {line}" for line in changed)
@@ -101,7 +102,7 @@ def main() -> int:
         f"  {tag:<12} commit {git('rev-parse', '--short', tag + '^{commit}')}  tree {tag_tree}\n"
         f"  {'HEAD':<12} commit {git('rev-parse', '--short', 'HEAD')}  tree {head_tree}\n"
         f"  changed under the released number:\n{detail}\n"
-        f"  Fix: bump the release identity together — pyproject.toml, Cargo.toml's workspace\n"
+        f"  Fix: bump the release identity together — pyproject.toml, every crates/*/Cargo.toml\n"
         f"  version, and scripts/version_contract.py's CURRENT_* constants, which refuse any\n"
         f"  disagreement between them.\n"
         f"  Never re-point {tag} — a released version number names one tree, forever."

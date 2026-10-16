@@ -8,29 +8,25 @@ weight plane for GPU transfers and mappings. TensorFS is a library on both sides
 separate daemon.
 
 - Architecture and module owners: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
-- Links TensorFS by git revision (`Cargo.toml`); a release pins a TensorFS tag.
+- Links TensorFS from this workspace (`crates/tensorfs`).
 - Linux 6.5+ (`SO_PEERPIDFD`). TensorD has no CUDA context. It can retain GPU allocation
   handles exported by executors; Runtime performs the device operations. The CPU service
   does not load NVML; a configured GPU pool samples it on its GPU sampler threads.
 
 ## Build and test
 
-Cargo needs read access to the private TensorFS repository.
-
 ```sh
-cargo build --locked
-cargo clippy --all-targets -- -D warnings
-cargo test --locked -- --test-threads=2
+cargo build -p tensord --locked
+cargo clippy -p tensord --all-targets -- -D warnings
+cargo test -p tensord --locked -- --test-threads=2
 uv run --locked --extra test pytest -q
 ```
 
 ## Release
 
-The version is `Cargo.toml`'s; a release is the tag `v<version>`, cut on the commit the gates ran
-on. This repository publishes nothing: cozy-runtime's `tensord.pin` names that commit for
-candidates and the tag at publish. The Runtime build runs `task release` (manylinux_2_28
-container: glibc 2.28 floor, `version --json` names the commit) and bundles the binary into its
-Linux x86_64 wheel as `tensord`. Worker images and `cozy machine install` take it from there.
+TensorD releases nothing on its own while it moves into the `cozy` binary as `cozy machine serve`
+(xs-043 T). Until then cozy-runtime's Linux wheel bundles the TensorD of `cozy-creator/tensord`
+at its `tensord.pin`.
 
 ## Run
 

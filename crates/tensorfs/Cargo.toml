@@ -1,7 +1,0 @@
-[workspace]
-resolver = "2"
-members = ["crates/tensorfs-core", "crates/tensorfs-plane", "crates/tensorfs-py"]
-
-[workspace.package]
-version = "0.10.0"
-edition = "2021"

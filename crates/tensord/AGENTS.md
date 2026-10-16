@@ -2,12 +2,7 @@
 
 Module map and owners: `docs/ARCHITECTURE.md`.
 
-Keep implementation in this repository; the existing Runtime, TensorFS, Creator and Hub
-checkouts are concurrently owned. Use released TensorFS dependencies, not local path overrides
-or copied storage/model implementations.
-
-Primary checkout is a mirror of origin/master. Work in a named owned worktree; preserve all
-unrelated work. Use Paul Fidika <paul@fidika.com> as author and committer, without agent trailers.
+TensorFS is this workspace's `crates/tensorfs`; never copy storage or model implementations.
 Use uv for Python. Use CodeGraph first if an index exists; do not create one implicitly.
 
 The CPU service never loads CUDA/NVML. GPU work or rentals require explicit session authority.

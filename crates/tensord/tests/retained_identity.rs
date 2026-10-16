@@ -61,7 +61,7 @@ fn capability(identity: &MachineIdentity, key: &SigningKey) -> String {
     )
 }
 fn allowed(identity: &MachineIdentity, token: &str) -> bool {
-    capability::verify_signer(
+    capability::verify(
         token,
         &identity.authority.worker_id,
         &identity.authority.keys.admitted(),

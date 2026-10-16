@@ -604,7 +604,7 @@ impl<B: MachineBackend> Cozy<B> {
             .map(spelled)
             .unwrap_or_default();
         let authority = &self.media.identity.authority;
-        let verified = capability::verify_signer(
+        let verified = capability::verify(
             token,
             &authority.worker_id,
             &authority.keys.admitted(),
