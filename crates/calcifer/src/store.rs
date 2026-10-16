@@ -9,8 +9,8 @@ use std::{
 
 use cozy_proto::{
     calcifer::{
-        Event, ItemStatus, Kind, Machine, MachineKind, MachineState, OutputItem, Reason, Run,
-        Status,
+        Call, Event, ItemStatus, Kind, Machine, MachineKind, MachineState, OutputItem, Reason, Run,
+        Status, Warning,
     },
     ids::{Digest, RunId},
     machine as v1,
@@ -19,8 +19,9 @@ use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehav
 use rusqlite_migration::{M, Migrations};
 
 /// The schema; its version is `PRAGMA user_version`.
-const MIGRATIONS: &[M] = &[M::up(
-    "CREATE TABLE machines (
+const MIGRATIONS: &[M] = &[
+    M::up(
+        "CREATE TABLE machines (
         name TEXT PRIMARY KEY,
         kind TEXT NOT NULL CHECK (kind IN ('local', 'rental', 'added')),
         hub TEXT NOT NULL DEFAULT '',
@@ -99,7 +100,13 @@ const MIGRATIONS: &[M] = &[M::up(
         reason TEXT,
         created_at INTEGER NOT NULL
     ) STRICT;",
-)];
+    ),
+    // What the CLI noticed when binding the run, and the objects the run's machine is written.
+    M::up(
+        "ALTER TABLE runs ADD COLUMN warnings TEXT NOT NULL DEFAULT '[]';
+        ALTER TABLE runs ADD COLUMN inputs TEXT NOT NULL DEFAULT '[]';",
+    ),
+];
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -152,6 +159,23 @@ pub struct RunRow {
     pub created_at_ms: i64,
     pub accepted_at_ms: Option<i64>,
     pub settled_at_ms: Option<i64>,
+    pub warnings: Vec<Warning>,
+    /// The staged objects its machine is written before the send.
+    pub inputs: Vec<(Digest, u64)>,
+    /// Its machine's outcome, once settled by one.
+    pub outcome: Option<v1::Outcome>,
+}
+
+/// Which runs a listing answers, newest first.
+#[derive(Debug, Default)]
+pub struct RunFilter {
+    pub status: Option<Status>,
+    /// A prefix of the run's target (`org/pkg`).
+    pub target: Option<String>,
+    pub machine: Option<String>,
+    /// Only runs numbered below this.
+    pub before: Option<u64>,
+    pub limit: u64,
 }
 
 /// A new run, recorded under its idempotency key.
@@ -164,6 +188,8 @@ pub struct NewRun {
     pub pinned: bool,
     pub spec: Vec<u8>,
     pub out_dir: PathBuf,
+    pub warnings: Vec<Warning>,
+    pub inputs: Vec<(Digest, u64)>,
 }
 
 /// How to reach a machine: the id its caps name, its address and its TLS leaf's sha256.
@@ -326,9 +352,9 @@ impl Store {
             }
             tx.execute(
                 "INSERT INTO runs (id, number, idempotency_key, digest, hub, kind, target, machine, pinned, spec,
-                     out_dir, state, created_at)
+                     out_dir, state, created_at, warnings, inputs)
                  VALUES (?1, (SELECT COALESCE(MAX(number), 0) + 1 FROM runs), ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
-                     ?10, 'queued', ?11)",
+                     ?10, 'queued', ?11, ?12, ?13)",
                 params![
                     new.id.as_str(),
                     key,
@@ -341,6 +367,8 @@ impl Store {
                     new.spec,
                     new.out_dir.to_string_lossy(),
                     now_ms(),
+                    serde_json::to_string(&new.warnings).expect("serializes"),
+                    serde_json::to_string(&new.inputs).expect("serializes"),
                 ],
             )?;
             Ok((new.id.to_string(), true))
@@ -367,17 +395,46 @@ impl Store {
         })
     }
 
-    /// Runs newest first: before `before` (a number) when given, at most `limit`.
-    pub fn runs(&self, before: Option<u64>, limit: u64) -> Result<Vec<RunRow>> {
+    /// The runs `filter` names, newest first, and how many more match beyond its limit.
+    pub fn runs(&self, filter: &RunFilter) -> Result<(Vec<RunRow>, u64)> {
+        const MATCHING: &str = "FROM runs WHERE number < ?1
+            AND (?2 IS NULL OR CASE state WHEN 'accepted' THEN 'in_progress' WHEN 'settled' THEN status
+                ELSE 'queued' END = ?2)
+            AND (?3 IS NULL OR substr(target, 1, length(?3)) = ?3)
+            AND (?4 IS NULL OR machine = ?4)";
         self.read(|conn| {
+            let status = filter.status.map(|status| match status {
+                Status::Queued => "queued",
+                Status::InProgress => "in_progress",
+                Status::Completed => "completed",
+                Status::Failed => "failed",
+                Status::Canceled => "canceled",
+            });
+            let before = filter.before.map_or(i64::MAX, |n| n as i64);
+            let matching = params![before, status, filter.target, filter.machine];
+            let total: i64 =
+                conn.query_row(&format!("SELECT COUNT(*) {MATCHING}"), matching, |r| {
+                    r.get(0)
+                })?;
             let mut statement = conn.prepare(&format!(
-                "SELECT {RUN_COLUMNS} FROM runs WHERE number < ?1 ORDER BY number DESC LIMIT ?2"
+                "SELECT {RUN_COLUMNS} {MATCHING} ORDER BY number DESC LIMIT ?5"
             ))?;
-            let before = before.map_or(i64::MAX, |n| n as i64);
             let rows = statement
-                .query_map(params![before, limit as i64], run_row)?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            rows.into_iter().collect()
+                .query_map(
+                    params![
+                        before,
+                        status,
+                        filter.target,
+                        filter.machine,
+                        filter.limit as i64
+                    ],
+                    run_row,
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+                .into_iter()
+                .collect::<Result<Vec<_>>>()?;
+            let older = (total as u64).saturating_sub(rows.len() as u64);
+            Ok((rows, older))
         })
     }
 
@@ -395,19 +452,34 @@ impl Store {
         })
     }
 
-    /// Whether any unsettled run's spec names the input `digest`.
+    /// Whether any unsettled run is written the staged object `digest`.
     pub fn input_in_use(&self, digest: &Digest) -> Result<bool> {
         self.read(|conn| {
-            let mut statement = conn.prepare("SELECT spec FROM runs WHERE state <> 'settled'")?;
-            let specs = statement
-                .query_map([], |r| r.get::<_, Vec<u8>>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            let wanted = digest.to_string();
-            Ok(specs.iter().any(|spec| {
-                prost::Message::decode(spec.as_slice()).is_ok_and(|spec: v1::RunSpec| {
-                    spec.inputs.iter().any(|input| input.digest == wanted)
-                })
-            }))
+            Ok(conn.query_row(
+                "SELECT EXISTS (SELECT 1 FROM runs, json_each(runs.inputs)
+                 WHERE runs.state <> 'settled' AND json_extract(json_each.value, '$[0]') = ?1)",
+                [digest.to_string()],
+                |r| r.get(0),
+            )?)
+        })
+    }
+
+    /// The run with what `?detail=full` adds: its measurements and its settled calls.
+    pub fn detail(&self, row: &RunRow) -> Result<Run> {
+        self.read(|conn| {
+            let mut run = record(conn, row)?;
+            run.measurements = row
+                .outcome
+                .as_ref()
+                .and_then(|outcome| serde_json::from_slice(&outcome.measurements).ok());
+            let mut statement = conn.prepare(
+                "SELECT text FROM run_logs WHERE run = ?1 AND level = 'call' ORDER BY seq",
+            )?;
+            let calls = statement.query_map([row.id.as_str()], |r| r.get::<_, String>(0))?;
+            for call in calls {
+                run.calls.extend(serde_json::from_str::<Call>(&call?).ok());
+            }
+            Ok(run)
         })
     }
 
@@ -464,7 +536,7 @@ impl Store {
                     "INSERT INTO run_logs (run, seq, at_ms, level, text) VALUES (?1, ?2, ?3, ?4, ?5)",
                     params![id, seq as i64, at_ms, level, text],
                 )?;
-                events.push(Event::Log { sequence_number: seq, at_ms, level, text });
+                events.push(log_event(seq, at_ms, level, text));
             }
             for product in &batch.products {
                 events.extend(put_output(tx, &row, product)?);
@@ -629,12 +701,7 @@ impl Store {
             let mut statement =
                 conn.prepare("SELECT seq, at_ms, level, text FROM run_logs WHERE run = ?1 AND seq > ?2 ORDER BY seq")?;
             let logs = statement.query_map(params![id, after as i64], |r| {
-                Ok(Event::Log {
-                    sequence_number: r.get::<_, i64>(0)? as u64,
-                    at_ms: r.get(1)?,
-                    level: r.get(2)?,
-                    text: r.get(3)?,
-                })
+                Ok(log_event(r.get::<_, i64>(0)? as u64, r.get(1)?, r.get(2)?, r.get(3)?))
             })?;
             for log in logs {
                 events.push(log?);
@@ -649,7 +716,8 @@ impl Store {
 }
 
 const RUN_COLUMNS: &str = "id, number, kind, target, hub, machine, pinned, spec, out_dir, state, cancel_requested,
-    cursor, machine_state, status, reason_code, reason, state_seq, created_at, accepted_at, settled_at";
+    cursor, machine_state, status, reason_code, reason, state_seq, created_at, accepted_at, settled_at, warnings,
+    inputs, outcome";
 
 fn run_row(r: &Row) -> rusqlite::Result<Result<RunRow>> {
     let corrupt = |what: &str| StoreError::Corrupt(what.into());
@@ -660,6 +728,9 @@ fn run_row(r: &Row) -> rusqlite::Result<Result<RunRow>> {
     let reason_code: Option<String> = r.get(14)?;
     let reason: Option<String> = r.get(15)?;
     let out_dir: String = r.get(8)?;
+    let warnings: String = r.get(20)?;
+    let inputs: String = r.get(21)?;
+    let outcome: Option<Vec<u8>> = r.get(22)?;
     Ok((|| {
         Ok(RunRow {
             id: RunId::try_from(id).map_err(|_| corrupt("a run id"))?,
@@ -695,6 +766,14 @@ fn run_row(r: &Row) -> rusqlite::Result<Result<RunRow>> {
             created_at_ms: r.get(17)?,
             accepted_at_ms: r.get(18)?,
             settled_at_ms: r.get(19)?,
+            warnings: serde_json::from_str(&warnings).map_err(|_| corrupt("a run's warnings"))?,
+            inputs: serde_json::from_str(&inputs).map_err(|_| corrupt("a run's inputs"))?,
+            outcome: match outcome {
+                Some(bytes) => Some(
+                    prost::Message::decode(bytes.as_slice()).map_err(|_| corrupt("an outcome"))?,
+                ),
+                None => None,
+            },
         })
     })())
 }
@@ -776,6 +855,22 @@ impl From<&MachineRow> for Machine {
             address: row.endpoint.as_ref().map(|e| e.address.clone()),
             reason: row.reason.clone(),
         }
+    }
+}
+
+/// A recorded log line as its event: a settled call is `run.call`, the rest `run.log`.
+fn log_event(sequence_number: u64, at_ms: i64, level: String, text: String) -> Event {
+    match serde_json::from_str::<Call>(&text) {
+        Ok(call) if level == "call" => Event::Call {
+            sequence_number,
+            call,
+        },
+        _ => Event::Log {
+            sequence_number,
+            at_ms,
+            level,
+            text,
+        },
     }
 }
 
@@ -967,6 +1062,18 @@ fn record(conn: &Connection, row: &RunRow) -> Result<Run> {
         settled_at_ms: row.settled_at_ms,
         waiting: None,
         progress: None,
+        warnings: row.warnings.clone(),
+        result: row
+            .outcome
+            .as_ref()
+            .and_then(|outcome| serde_json::from_slice(&outcome.result).ok()),
+        execution_ms: row
+            .outcome
+            .as_ref()
+            .map(|outcome| outcome.execution_ms)
+            .filter(|ms| *ms > 0),
+        measurements: None,
+        calls: vec![],
     })
 }
 

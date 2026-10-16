@@ -43,15 +43,26 @@ pub struct SubmitRun {
     /// The machine's `RunSpec`, protobuf-encoded: the spec as it is sent, frozen at submit.
     #[serde(with = "base64_bytes")]
     pub spec: Vec<u8>,
-    /// The files `spec.inputs` names, read once at submit.
+    /// Local files the run reads, copied once at submit and written to its machine before the
+    /// send: what `spec.inputs` names and any other object the spec refers to
+    /// (`object://sha256:<hex>/<file>`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inputs: Vec<StagedInput>,
     /// Where outputs land; absent: `~/.cozy/outputs`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub out: Option<PathBuf>,
+    /// What the CLI noticed while binding the run (fields it dropped, …), kept with the run.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<Warning>,
 }
 
-/// A local file a run's spec names as an input.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Warning {
+    pub code: String,
+    pub message: String,
+}
+
+/// A local file a run reads.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StagedInput {
     pub path: PathBuf,
@@ -108,6 +119,38 @@ pub struct Run {
     /// Live: the machine's latest progress.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub progress: Option<Progress>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<Warning>,
+    /// The result's canonical JSON, once settled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_ms: Option<u64>,
+    /// With `?detail=full`: what the machine measured (stages, steps, GPUs, attention).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measurements: Option<serde_json::Value>,
+    /// With `?detail=full`: the run's settled calls, in the order they ended.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub calls: Vec<Call>,
+}
+
+/// One settled call of a run (the run's own function or a child call).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Call {
+    pub run: String,
+    pub index: u32,
+    pub function: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub label: String,
+    pub status: String,
+    pub called_at_ms: i64,
+    pub finished_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measurements: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<Reason>,
+    #[serde(default)]
+    pub memoized: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -209,6 +252,9 @@ pub enum Event {
         level: String,
         text: String,
     },
+    /// A settled call of the run (its own function's or a child's).
+    #[serde(rename = "run.call")]
+    Call { sequence_number: u64, call: Call },
     #[serde(rename = "run.progress")]
     Progress { progress: Progress },
     #[serde(rename = "run.waiting")]
@@ -278,6 +324,9 @@ impl Event {
             }
             | Event::Log {
                 sequence_number, ..
+            }
+            | Event::Call {
+                sequence_number, ..
             } => Some(*sequence_number),
             Event::Progress { .. } | Event::Waiting { .. } => None,
         }
@@ -296,6 +345,9 @@ impl Event {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RunList {
     pub runs: Vec<Run>,
+    /// How many more runs match beyond the limit.
+    #[serde(default)]
+    pub older: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -452,6 +504,11 @@ mod tests {
             settled_at_ms: None,
             waiting: None,
             progress: None,
+            warnings: vec![],
+            result: None,
+            execution_ms: None,
+            measurements: None,
+            calls: vec![],
         }
     }
 
@@ -485,6 +542,7 @@ mod tests {
             spec: vec![8, 2],
             inputs: vec![],
             out: None,
+            warnings: vec![],
         };
         let mut json = serde_json::to_value(&submit).unwrap();
         assert_eq!(json["on"], "new:rtx-4090");

@@ -160,23 +160,25 @@ impl Link {
     }
 
     /// Uploads one object from `file`, continuing from what the machine already holds.
+    /// How many bytes of the object the machine holds for this signer.
+    pub async fn held(&self, digest: &Digest, length: u64) -> Result<u64, LinkError> {
+        let header = v1::WriteFrame {
+            digest: digest.to_string(),
+            length,
+            ..Default::default()
+        };
+        let request = self.request(tokio_stream::once(header));
+        let asked = self.client.clone().write(request).await;
+        Ok(asked.map_err(classify)?.into_inner().held)
+    }
+
     pub async fn write(
         &self,
         digest: &Digest,
         length: u64,
         mut file: tokio::fs::File,
     ) -> Result<(), LinkError> {
-        let header = v1::WriteFrame {
-            digest: digest.to_string(),
-            length,
-            ..Default::default()
-        };
-        let asked = self
-            .client
-            .clone()
-            .write(self.request(tokio_stream::once(header)))
-            .await;
-        let held = asked.map_err(classify)?.into_inner().held;
+        let held = self.held(digest, length).await?;
         if held >= length {
             return Ok(());
         }
