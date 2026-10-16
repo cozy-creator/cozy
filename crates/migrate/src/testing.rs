@@ -156,6 +156,8 @@ pub fn build(root: &Path) -> Vec<PathBuf> {
     write(&root.join("calcifer"), "the Go binary");
 
     let db = Connection::open(root.join("creator.sqlite")).unwrap();
+    // Go's tables reference others the importer never reads (`installs`, `attempts`).
+    db.pragma_update(None, "foreign_keys", "OFF").unwrap();
     db.execute_batch(include_str!("testing/go_schema.sql"))
         .unwrap();
     let rental = |id: &str,
