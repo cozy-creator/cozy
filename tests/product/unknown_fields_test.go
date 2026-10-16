@@ -87,6 +87,30 @@ func TestUnknownFieldsWarnAndRun(t *testing.T) {
 		t.Fatalf("run show --json did not carry the warning [exit %d]\n%s", code, out)
 	}
 
+	// The listing marks both runs that warned; --json counts each one's warnings.
+	if code, out := runCozy(t, root, "run", "list", "--no-watch"); code != 0 || strings.Count(out, "completed ⚠") != 2 {
+		t.Fatalf("run list did not mark the warned runs [exit %d]\n%s", code, out)
+	}
+	code, out = runCozy(t, root, "--json", "run", "list", "--no-watch")
+	var listed struct {
+		Invocations []struct {
+			Kind     string `json:"kind"`
+			Warnings int    `json:"warnings"`
+		} `json:"invocations"`
+	}
+	warned := 0
+	if code != 0 || json.Unmarshal([]byte(out), &listed) != nil {
+		t.Fatalf("run list --json [exit %d]\n%s", code, out)
+	}
+	for _, row := range listed.Invocations {
+		if row.Kind == "run" && row.Warnings == 1 {
+			warned++
+		}
+	}
+	if warned != 2 {
+		t.Fatalf("run list --json did not count each run's warning\n%s", out)
+	}
+
 	// A missing required field still refuses, and still names what it would have dropped.
 	code, out = runCozy(t, root, "--json", "run", target, "style=noir")
 	var refused struct {

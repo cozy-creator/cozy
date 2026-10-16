@@ -845,11 +845,14 @@ type Lifecycle struct {
 	ErrorType        string         `json:"error_type,omitempty"`
 	// ErrorCode is the originating component's stable code (for example a pod's
 	// `insufficient_storage`) when the failure did not originate in Creator.
-	ErrorCode      string `json:"error_code,omitempty"`
-	Error          string `json:"error,omitempty"`
-	Retaining      bool   `json:"retaining,omitempty"`
-	RetryAvailable bool   `json:"retry_available,omitempty"`
-	StoppedEventID int64  `json:"stopped_event_id,omitempty"` // an older Calcifer's blocked stop
+	ErrorCode string `json:"error_code,omitempty"`
+	Error     string `json:"error,omitempty"`
+	// Warnings is how many warnings the run recorded (`cozy run show` lists them); run
+	// listings carry it.
+	Warnings       int   `json:"warnings,omitempty"`
+	Retaining      bool  `json:"retaining,omitempty"`
+	RetryAvailable bool  `json:"retry_available,omitempty"`
+	StoppedEventID int64 `json:"stopped_event_id,omitempty"` // an older Calcifer's blocked stop
 	// CanceledBy is the recorded actor behind a canceled run (cl-108): the explicit
 	// `cozy run cancel`, a caller-authored --timeout, `cozy down --all` — never blank
 	// for a run this Calcifer canceled on request.
@@ -1182,9 +1185,20 @@ func (s *Server) listRequests(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	ids := make([]string, len(rows))
+	for i, row := range rows {
+		ids[i] = row.ID
+	}
+	warnings, e := s.store.Warnings(ids)
+	if e != nil {
+		s.refuseTyped(w, r, e)
+		return
+	}
 	out := make([]Lifecycle, 0, len(rows))
 	for _, row := range rows {
-		out = append(out, s.lifecycleOf(row))
+		life := s.lifecycleOf(row)
+		life.Warnings = warnings[row.ID]
+		out = append(out, life)
 	}
 	s.ok(w, r, http.StatusOK, map[string]any{"requests": out, "count": len(out), "older": older})
 }
