@@ -1,0 +1,3 @@
+doc: machine_capability
+expect: mutant
+note: one byte flipped at offset 181 of sha256:673d2502d1b53980c367973db6a1bc687370adc8f5c66372a816b74f0d34c46e

@@ -1,0 +1,5 @@
+doc: header
+expect: ok
+id: sha256:cb3fcffc322f4f56b8def72d40caae48de5153d8b2c52fa8539e9fdf95e0887c
+tensor_schema: sha256:5eb10903ccfdc6f600d9534a7e8bb85a622fdbcd96759da983aa9740c64f1c1c
+note: a pin-absent spec object validates as data

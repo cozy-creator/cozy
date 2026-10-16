@@ -1,0 +1,4 @@
+doc: header
+expect: refuse
+code: ZERO_ELEMENT
+note: zero-element tensor

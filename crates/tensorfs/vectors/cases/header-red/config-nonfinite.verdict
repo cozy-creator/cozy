@@ -1,0 +1,4 @@
+doc: header
+expect: refuse
+code: MALFORMED_JSON
+note: non-finite values are outside JSON and JCS

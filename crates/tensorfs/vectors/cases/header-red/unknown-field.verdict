@@ -1,0 +1,4 @@
+doc: header
+expect: refuse
+code: WRONG_TYPE
+note: the fixed root has no sixth field

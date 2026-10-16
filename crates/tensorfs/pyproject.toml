@@ -1,0 +1,29 @@
+[build-system]
+requires = ["maturin>=1.15,<2"]
+build-backend = "maturin"
+
+[project]
+name = "tensorfs"
+version = "0.10.0"
+description = "TensorFS — canonical tensor artifact substrate"
+requires-python = ">=3.12"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Rust",
+]
+
+[tool.maturin]
+manifest-path = "crates/tensorfs-py/Cargo.toml"
+module-name = "tensorfs._ext"
+python-source = "python"
+features = ["extension-module", "store"]
+# One artifact, one version (tfs-051): the wheel carries the `tfs` binary at
+# .data/scripts/, so `pip install tensorfs==<v>` yields module AND CLI everywhere.
+# maturin cannot build a bin target beside a pyo3 extension, so the binary is staged
+# here by scripts/build-wheel.sh before maturin runs. The wheel contract checks both
+# the executable and full installed extension; use that script for local builds.
+data = "wheel-data"
+# Git tracks the empty data dir through this placeholder, so a plain source build (a git
+# dependency) works; it never ships.
+exclude = [{ path = "wheel-data/scripts/.gitkeep", format = "wheel" }]

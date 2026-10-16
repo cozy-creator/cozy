@@ -1,0 +1,16 @@
+[
+  {
+    "member": "MiniMax-H3-FL2VA-Acc-8Step.safetensors",
+    "header_bytes": 85880,
+    "full_length": 1372450680,
+    "logical_keys": 728,
+    "source": "alibaba-pai/MiniMax-H3-Acc-LoRAs@335001fb9e5455d68a0caa18ec2e319072150328"
+  },
+  {
+    "member": "MiniMax-H3-Ref2VA-Acc-8Step.safetensors",
+    "header_bytes": 85880,
+    "full_length": 1372450680,
+    "logical_keys": 728,
+    "source": "alibaba-pai/MiniMax-H3-Acc-LoRAs@335001fb9e5455d68a0caa18ec2e319072150328"
+  }
+]

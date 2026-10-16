@@ -1,0 +1,5 @@
+doc: header
+expect: ok
+id: sha256:50d429f009ce0675504bb23a7dc6ab9f32a4190e085128f93aaf1128728cb9da
+tensor_schema: sha256:782069e32121589acfc3ec8b191e98cf1ff93029da947100ec5b5536fa67e15b
+note: same tensor schema and objects, opposite identity-bearing tensor order

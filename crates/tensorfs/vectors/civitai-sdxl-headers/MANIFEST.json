@@ -1,0 +1,29 @@
+{
+  "source": "civitai://128078",
+  "member": "civitai/files/92696",
+  "full_bytes": 6938078334,
+  "full_sha256": "e6bb9ea85bbf7bf6478a7c6d18b71246f22e95d41bcdd80ed40aa212c33cfeff",
+  "header_bytes": 402444,
+  "header_sha256": "589687d06e1891c440d7c73aa793acfafb1ec21f7ed17293b1a77913a210f78c",
+  "tensors": 2515,
+  "dtypes": [
+    "F16"
+  ],
+  "metadata_keys": [
+    "modelspec.architecture",
+    "modelspec.author",
+    "modelspec.date",
+    "modelspec.description",
+    "modelspec.hash_sha256",
+    "modelspec.implementation",
+    "modelspec.license",
+    "modelspec.prediction_type",
+    "modelspec.resolution",
+    "modelspec.sai_model_spec",
+    "modelspec.thumbnail",
+    "modelspec.title"
+  ],
+  "file": "128078-92696.safetensors.header",
+  "source_name": "civitai-model-101055-version-128078",
+  "profile": "civitai/sdxl/single-file/1"
+}

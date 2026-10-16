@@ -1,0 +1,4 @@
+doc: machine_capability
+expect: ok
+id: sha256:8b2353557c2770edb3c728fa9293fcd3e630322e05c59040197f452171309beb
+note: qualified encoding/device pair

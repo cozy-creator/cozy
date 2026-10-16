@@ -1,0 +1,4 @@
+doc: header
+expect: refuse
+code: MALFORMED_DIGEST
+note: a digest is exactly 32 native bytes

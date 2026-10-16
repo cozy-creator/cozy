@@ -1,0 +1,4 @@
+doc: header
+expect: refuse
+code: ROLE_SET_MISMATCH
+note: an extra role is a different spec digest

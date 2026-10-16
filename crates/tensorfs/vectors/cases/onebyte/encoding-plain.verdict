@@ -1,0 +1,3 @@
+doc: encoding
+expect: mutant
+note: one byte flipped at offset 22 of sha256:1fb882a7e46d0aff520f9d8a28cefd643954c19371737443101ba3c5fcc3613f

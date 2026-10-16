@@ -1,0 +1,51 @@
+{
+ "source": "civitai://2945208",
+ "source_name": "civitai-model-2458426-version-2945208",
+ "profile": "civitai/anima/single-file/1",
+ "members": [
+  {
+   "member": "civitai/files/2824391",
+   "name": "anima_baseV10.safetensors",
+   "file": "2945208-2824391.safetensors.header",
+   "full_bytes": 4182218328,
+   "declared_sha256": "bd43b7cffe1ed1153d9c41e7beb2f18cb1273eafbaa3af3edd6a173dc90a006e",
+   "header_bytes": 80472,
+   "header_sha256": "962efc8ea29a29ca024f750554d0ec9f86978c1eb292394556817b0ba7696b6f",
+   "tensors": 685,
+   "dtypes": [
+    "BF16"
+   ],
+   "metadata_keys": []
+  },
+  {
+   "member": "civitai/files/2824387",
+   "name": "anima_baseV10_txt.safetensors",
+   "file": "2945208-2824387.safetensors.header",
+   "full_bytes": 1192135096,
+   "declared_sha256": "cd2a512003e2f9f3cd3c32a9c3573f820bb28c940f73c57b1ddaa983d9223eba",
+   "header_bytes": 35256,
+   "header_sha256": "da8f2268dd6a09cb578dcc4a8dad1c0b41e7d323499625fb219757dfca29f6c8",
+   "tensors": 310,
+   "dtypes": [
+    "BF16"
+   ],
+   "metadata_keys": [
+    "format"
+   ]
+  },
+  {
+   "member": "civitai/files/2004692",
+   "name": "qwen_image_vae_2004692.safetensors",
+   "file": "2945208-2004692.safetensors.header",
+   "full_bytes": 253806246,
+   "declared_sha256": "a70580f0213e67967ee9c95f05bb400e8fb08307e017a924bf3441223e023d1f",
+   "header_bytes": 21184,
+   "header_sha256": "61e2b5acc01f7af302059d5732a128214d1067bf7702c4305831844059bea74d",
+   "tensors": 194,
+   "dtypes": [
+    "BF16"
+   ],
+   "metadata_keys": []
+  }
+ ]
+}

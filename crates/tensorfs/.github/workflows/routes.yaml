@@ -1,0 +1,27 @@
+name: routes
+# Regenerate every single-file route table from diffusers and compare, only when a generator,
+# family spec, table or reviewed header changes. Locally: uv run scripts/single-file-routes.py
+on:
+  pull_request:
+    paths:
+      - "scripts/single-file-routes.py"
+      - "crates/tensorfs-core/src/ingest/routes/**"
+      - "vectors/civitai-sdxl-headers/**"
+      - "vectors/anima-civitai-headers/**"
+      - ".github/workflows/routes.yaml"
+  push:
+    branches: [master]
+    paths:
+      - "scripts/single-file-routes.py"
+      - "crates/tensorfs-core/src/ingest/routes/**"
+      - "vectors/civitai-sdxl-headers/**"
+      - "vectors/anima-civitai-headers/**"
+      - ".github/workflows/routes.yaml"
+jobs:
+  regenerate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v7
+      - run: uv run scripts/single-file-routes.py

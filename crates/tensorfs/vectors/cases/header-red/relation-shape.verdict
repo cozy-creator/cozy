@@ -1,0 +1,4 @@
+doc: header
+expect: refuse
+code: SHAPE_MISMATCH
+note: scale shape != relation result

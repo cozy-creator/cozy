@@ -1,0 +1,159 @@
+name: Publish to PyPI
+
+# A tag push publishes nothing. Two manual runs, each through the same trusted publisher:
+#   build and publish an existing tag's tree (the tag's tree must carry this trigger):
+#     gh workflow run publish.yaml -R cozy-creator/tensorfs --ref vX.Y.Z
+#   publish exactly the gated files attached to an existing GitHub release, building nothing:
+#     gh workflow run publish.yaml -R cozy-creator/tensorfs -f release_tag=vX.Y.Z -f gated_sha256sums='<sum> <file> ...'
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Release whose attached files are published as they are (with gated_sha256sums)
+        type: string
+        default: ''
+      gated_sha256sums:
+        description: '"<sha256> <filename>" pairs, space separated; the release must hold exactly these files'
+        type: string
+        default: ''
+
+# Never cancel a publication midway.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # The tag must name the version the tree declares before anything is built.
+  gate:
+    if: ${{ !inputs.gated_sha256sums }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # ci.yaml owns the Rust suite, the frozen vectors, and the deep wheel smoke on
+      # every push; the publish gate re-runs the version contract against the exact
+      # tagged tree rather than trusting that the tag points at a commit CI already saw.
+      - run: python3 scripts/version_contract.py source
+      - name: Version matches tag
+        run: |
+          [ "$GITHUB_REF_TYPE" = tag ] || { echo "publish runs on a v* tag, not $GITHUB_REF"; exit 1; }
+          TAG="${GITHUB_REF_NAME#v}"
+          VER="$(python3 -c 'import tomllib;print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])')"
+          if [ "$TAG" != "$VER" ]; then
+            echo "tag v$TAG != pyproject version $VER"; exit 1
+          fi
+
+  # Release gate (2026-10-01): model weights fetched through `ensure`, the Runtime's path,
+  # against a real loopback hub and object store injecting resets, stalls, truncation,
+  # 5xx/429/Retry-After, expired URLs, wrong bytes, hub weather and verdicts. Each must
+  # land the exact bytes or end in its typed refusal.
+  fetch-faults:
+    needs: gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.91.1
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p tensorfs-core --test fetch_faults -- --test-threads=2
+
+  # Release gate (run 2322): a real-HTTP hub pull from an R2-like store, where some MiBs
+  # crawl for their first ask, must finish at body throughput.
+  download-tail:
+    needs: gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.91.1
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p tensorfs-core --lib transport::tests::tail -- --nocapture
+
+  # Every platform's wheel, each built and proven on its own runner.
+  wheels:
+    needs: [gate, download-tail, fetch-faults]
+    uses: ./.github/workflows/wheels.yaml
+
+  publish:
+    needs: wheels
+    runs-on: ubuntu-latest
+    environment: pypi
+    # Hang bound, not a work budget.
+    timeout-minutes: 30
+    permissions:
+      contents: read   # checkout on a private/org repo
+      id-token: write  # PyPI trusted publishing (OIDC)
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-*
+          merge-multiple: true
+          path: dist
+      # The sdist carries sources only, never the staged binary; pyproject's `data`
+      # option needs the directory to exist even for an sdist.
+      - run: mkdir -p wheel-data/scripts
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          maturin-version: v1.15.0
+          command: sdist
+          args: --out dist
+      # `needs: wheels` fails the release if any platform failed: every platform or none.
+      - run: ls -l dist
+      - name: Publish (trusted publishing)
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+  # The gated files a release candidate was proven with, published byte for byte: no build,
+  # no project code, only the release's assets checked against the sums the release owner
+  # recorded, then the same trusted publisher.
+  publish-gated:
+    if: ${{ inputs.gated_sha256sums != '' }}
+    runs-on: ubuntu-latest
+    environment: pypi
+    # Hang bound, not a work budget.
+    timeout-minutes: 20
+    permissions:
+      contents: read   # the release's assets
+      id-token: write  # PyPI trusted publishing (OIDC)
+    steps:
+      - name: The release holds exactly the gated files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.release_tag }}
+          SUMS: ${{ inputs.gated_sha256sums }}
+        run: |
+          set -eu
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -D dist
+          printf '%s\n' $SUMS | paste -d' ' - - | sed 's/ /  /' > sums
+          (cd dist && sha256sum --check --strict ../sums)
+          [ "$(ls dist | sort)" = "$(awk '{print $2}' sums | sort)" ]
+      - name: Publish (trusted publishing)
+        uses: pypa/gh-action-pypi-publish@release/v1
+      - name: PyPI serves exactly the gated files
+        env:
+          TAG: ${{ inputs.release_tag }}
+        run: |
+          python3 - <<'PY'
+          import json, os, time, urllib.request
+          version = os.environ["TAG"].removeprefix("v")
+          want = {name: digest for digest, name in (line.split() for line in open("sums"))}
+          url = f"https://pypi.org/pypi/tensorfs/{version}/json"
+          while True:
+              request = urllib.request.Request(url, headers={"Cache-Control": "no-cache"})
+              try:
+                  files = {f["filename"]: f["digests"]["sha256"] for f in json.load(urllib.request.urlopen(request))["urls"]}
+              except OSError:
+                  files = {}
+              extra = set(files) - set(want)
+              if extra or any(files.get(n, d) != d for n, d in want.items()):
+                  raise SystemExit(f"PyPI holds files this run did not publish or different bytes: {sorted(extra)}")
+              if files == want:
+                  print("\n".join(f"{d}  {n}" for n, d in sorted(want.items())))
+                  break
+              time.sleep(10)
+          PY
+

@@ -1,0 +1,5 @@
+doc: manifest
+expect: ok
+id: sha256:59ab45e3428131f42d92d597dab4ffd64866827cd4e3361b799d15243c242b30
+manifest: sha256:59ab45e3428131f42d92d597dab4ffd64866827cd4e3361b799d15243c242b30
+note: an entry kind from a newer TensorFS is carried opaquely

@@ -1,0 +1,3 @@
+doc: session
+expect: mutant
+note: one byte flipped at offset 50 of sha256:9193ab3a825016064a5981e996d9e7269f44ad37fea8d0b3a0e77a1b7dd8cb87

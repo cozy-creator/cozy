@@ -1,0 +1,4 @@
+doc: manifest
+expect: refuse
+code: ATTACHMENT_CARDINALITY
+note: one manifest carries at most one CozyTensors header

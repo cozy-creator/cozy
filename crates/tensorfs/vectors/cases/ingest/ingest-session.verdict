@@ -1,0 +1,4 @@
+doc: session
+expect: ok
+id: sha256:9193ab3a825016064a5981e996d9e7269f44ad37fea8d0b3a0e77a1b7dd8cb87
+note: a temporary session: a candidate is never a release

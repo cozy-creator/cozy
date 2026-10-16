@@ -1,0 +1,1 @@
+{"entries":[{"blob":{"length":13,"sha256":"b54478087b7d2f0670d0645141a0541f2a6f98807553254d1bfd1e3200c1edd5"},"kind":"file","path":"README.txt"},{"blob":{"length":968,"sha256":"ff1d40b9d60e9cf6a89cf56556e51ccbdfb274d152d885dac4a534ab12c937a7"},"kind":"cozytensors","path":"model.cozytensors"}]}

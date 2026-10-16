@@ -1,0 +1,94 @@
+[
+  {
+    "member": "wushu_spatial_physics_clean_3000_pruned.safetensors",
+    "source": "Jojocodex/minimax-h3-spatial-physics-lora@476b24df28b9b7cc5481b750469698f5cc4b0558",
+    "full_length": 155109672,
+    "source_sha256": "7d14f3701560068e7004159c8b2a7278bd2dbfc9e5e3b60d0bc9aef6c049919d",
+    "header_sha256": "06ec4724938de9bd04170180aee6391150aecfd925fc57a70a5ef30c7d9edea5",
+    "header_bytes": 51496,
+    "logical_keys": 416,
+    "profile": "h3/native-lora-a-b/2",
+    "constructs": 624,
+    "session": "e240af8d564c377b"
+  },
+  {
+    "member": "wushu_spatial_physics_v2_1000_pruned.safetensors",
+    "source": "Jojocodex/minimax-h3-spatial-physics-lora@476b24df28b9b7cc5481b750469698f5cc4b0558",
+    "full_length": 155109488,
+    "source_sha256": "c38b8f9c43614c91a2847d290d9c5b3341536acb4d6d8ce2d825d4caf7eaee6b",
+    "header_sha256": "726dd043f2b4e410d95f1e9b57fcb7bcb0dc0f367e8b96210bbb70a4b5ad95e6",
+    "header_bytes": 51312,
+    "logical_keys": 416,
+    "profile": "h3/native-lora-a-b/2",
+    "constructs": 624,
+    "session": "c415dc7d8bb48f5c"
+  },
+  {
+    "member": "wushu_action_v7_fl2va_aitoolkit_adaln_full-int8convrot_bf16te_1000step.safetensors",
+    "source": "Jojocodex/wushu-action-v7-minimax-h3-fl2va-ref2va-lora@9598ef0b02f4590e202e956b4e6328dc71ae2bf5",
+    "full_length": 596451088,
+    "source_sha256": "93ba294b7d6068a3bd930606bc853554973cb56664b5ff1392008ededf7f5efe",
+    "header_sha256": "d6ce84a73fe5271bf097b90cc6e2f8dea1837ce5a3a2bd0c3897cc8e79e6ce33",
+    "header_bytes": 72688,
+    "logical_keys": 600,
+    "profile": "h3/native-lora-kohya/2",
+    "constructs": 900,
+    "session": "16b3bc27d277ea91"
+  },
+  {
+    "member": "wushu_action_v7_fl2va_aitoolkit_adaln_full-int8convrot_bf16te_2000step.safetensors",
+    "source": "Jojocodex/wushu-action-v7-minimax-h3-fl2va-ref2va-lora@9598ef0b02f4590e202e956b4e6328dc71ae2bf5",
+    "full_length": 596451088,
+    "source_sha256": "2fdc4a990591abfeb6fa4bc83b7c1974dcac0a6132c982ef386cd6243790be64",
+    "header_sha256": "6984d8434284c7114cef9420b215150af23938a456ecf62f80dc33d6a539f8b3",
+    "header_bytes": 72688,
+    "logical_keys": 600,
+    "profile": "h3/native-lora-kohya/2",
+    "constructs": 900,
+    "session": "a476de822074dde1"
+  },
+  {
+    "member": "h3-realism-people-t2v-i2v-r2v.safetensors",
+    "source": "fal/MiniMax-H3-Realism-People-LoRA@039cc8579d7aa357a882d7f4111b25da4f72dccc",
+    "full_length": 131229656,
+    "source_sha256": "acc529601d2da117fb81179e76c56e488a3beab1171659d305f04fa3655b787e",
+    "header_sha256": "301341598d7bd9f71601eaeafaeae5027765057604dca0d20bbe3cd0e15a9e87",
+    "header_bytes": 26584,
+    "logical_keys": 208,
+    "profile": "h3/native-lora-a-b/2",
+    "constructs": 416
+  },
+  {
+    "member": "vh5tape-comfyui.safetensors",
+    "source": "KennethFal/vh5tape-vhs-lora-minimax-h3@d25a4ab75aba899aa508220321525c8465ac11af",
+    "full_length": 131242912,
+    "source_sha256": "2966503f53d6448c53ac492f5d1055feba410f094abc739592cef5dc0961da7d",
+    "header_sha256": "a822c141c84562faf6de7c956bf4b38599552d79149e37970c47302256b753db",
+    "header_bytes": 39424,
+    "logical_keys": 312,
+    "profile": "h3/native-lora-a-b/2",
+    "constructs": 624
+  },
+  {
+    "member": "studio1939-strong.safetensors",
+    "source": "lovis93/studio-1939-old-animation-lora-minimax-h3@19214d4c3989de6caca673d534d0d4b16b73b0f7",
+    "full_length": 262433016,
+    "source_sha256": "aea0d9626f68ca06181f9396c664b8020e8be9cc55e343bbe636bfd7aec2f174",
+    "header_sha256": "368ebc3dd4c6cc5bf2ac3735649b25a5f11b1b2f7654ae27ca249bd42646058e",
+    "header_bytes": 26872,
+    "logical_keys": 208,
+    "profile": "h3/native-lora-a-b/2",
+    "constructs": 416
+  },
+  {
+    "member": "minimax_h3_turbo_v4_step600_ema.safetensors",
+    "source": "larryvrh/MiniMax-H3-Turbo-Lora@43a74557ac3f6539db8e0f2a959d03feb7a81480",
+    "full_length": 779849816,
+    "source_sha256": "5f3a626cd72c93a8b9318d6760c510bc5092d2ab13aaba1f932c5bab07a416d3",
+    "header_sha256": "60df26ece2955e13037762a2a6eb0e409e49b2fe473de1d1a1d8f7a4b8079cff",
+    "header_bytes": 57432,
+    "logical_keys": 518,
+    "profile": "h3/native-lora-a-b/2",
+    "refusal": "ADAPTER_TARGET_UNSUPPORTED"
+  }
+]

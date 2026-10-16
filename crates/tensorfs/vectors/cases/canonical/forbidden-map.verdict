@@ -1,0 +1,4 @@
+doc: header
+expect: refuse
+code: MALFORMED_CBOR
+note: maps are outside the all-array profile

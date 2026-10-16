@@ -1,0 +1,45 @@
+{
+ "source": "circlestone-labs/Anima-Base-v1.0-Diffusers@073c3a9db359c31ad0e8aa268d15775473c2176c",
+ "profile": "hf/circlestone-labs/anima-base-v1.0-diffusers/bf16/1",
+ "components": {
+  "transformer": 567,
+  "text_encoder": 310,
+  "text_conditioner": 118,
+  "vae": 194
+ },
+ "constructor_provenance": "source data order: each component's tensors in data_offsets order, so ingest reads every carrier sequentially; Runtime supplies its own fill traversal",
+ "members": [
+  {
+   "member": "text_conditioner/diffusion_pytorch_model.safetensors",
+   "header_file": "text_conditioner/diffusion_pytorch_model.safetensors.header",
+   "header_sha256": "97e037db011df728062cdfb06dad0c70cf06ebc365ce94bca6b8ebb7c25e51c1",
+   "header_bytes": 12040,
+   "full_length": 269339400,
+   "declared_source_sha256": "fdcf606524892e35b270b96fc8bbd8d77e615ab882675a049f6e7c2ff6b71da3"
+  },
+  {
+   "member": "text_encoder/model.safetensors",
+   "header_file": "text_encoder/model.safetensors.header",
+   "header_sha256": "d0ace2ff9029cc7b333eefe8192b6e4496e1a2fb03c6227984e823c0d9645b1b",
+   "header_bytes": 33392,
+   "full_length": 1192133232,
+   "declared_source_sha256": "75e8db94adb374b61baca3d898fc2c0d5086d20689a96d4e74576546433a0526"
+  },
+  {
+   "member": "transformer/diffusion_pytorch_model.safetensors",
+   "header_file": "transformer/diffusion_pytorch_model.safetensors.header",
+   "header_sha256": "761709e3ffcf61418a046fa67521208f503a9843098aab46d7da23f392be2365",
+   "header_bytes": 66608,
+   "full_length": 3912877104,
+   "declared_source_sha256": "81dc5915fc3c3b170684534ca11ed6c535ddea5658793a801fac53b8d5281065"
+  },
+  {
+   "member": "vae/diffusion_pytorch_model.safetensors",
+   "header_file": "vae/diffusion_pytorch_model.safetensors.header",
+   "header_sha256": "8e1c408b94ff8adaf22ece90a9d753dcb7d2804daebba4ed4ae4d4e90db3ebba",
+   "header_bytes": 21904,
+   "full_length": 253806966,
+   "declared_source_sha256": "0c8bc8b758c649abef9ea407b95408389a3b2f610d0d10fcb054fe171d0a8344"
+  }
+ ]
+}

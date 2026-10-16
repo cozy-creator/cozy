@@ -1,0 +1,3 @@
+doc: stamp
+expect: mutant
+note: one byte flipped at offset 332 of sha256:f3cad72ec75358169122db88a08d9b02bfa6bb2e38476e48da8fe4f73be72ae1

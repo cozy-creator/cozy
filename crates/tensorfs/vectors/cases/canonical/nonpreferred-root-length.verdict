@@ -1,0 +1,4 @@
+doc: header
+expect: refuse
+code: NONCANONICAL_ENCODING
+note: root arity five encoded with an unnecessary width byte

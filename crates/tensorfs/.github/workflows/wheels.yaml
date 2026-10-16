@@ -1,0 +1,60 @@
+name: wheels
+# Every wheel the release publishes, each built and proven on a runner of its own platform.
+# Release-only: publish.yaml calls this and uploads exactly these artifacts. macOS bills at
+# 10x, so pull requests never run it; ci.yaml keeps the deep Linux x86_64 wheel proof on
+# every change. Manual build of every wheel for a branch or tag:
+#   gh workflow run wheels.yaml -R cozy-creator/tensorfs --ref <branch-or-tag>
+# No Windows wheel: the Store's POSIX model (owner uid/gid, modes, O_NOFOLLOW, *at
+# publication, positional I/O) has no Windows implementation yet.
+on:
+  workflow_call:
+  workflow_dispatch:
+# A literal prefix: a called workflow sees the caller's github.workflow.
+concurrency:
+  group: wheels-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  wheel:
+    name: wheel ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    # Hang bound, not a work budget.
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macOS and aarch64 wheels are off until the owner decides (2026-09-28).
+          - { name: linux-x86_64, os: ubuntu-latest, target: x86_64 }
+    env:
+      CARGO_BUILD_JOBS: "4"
+      PYTHON: python
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v6
+      # Linux: the binary is built INSIDE the manylinux container so its glibc floor
+      # matches the extension module it ships beside (tfs-051).
+      - if: runner.os == 'Linux'
+        uses: PyO3/maturin-action@v1
+        with:
+          maturin-version: v1.15.0
+          target: ${{ matrix.target }}
+          args: --release --locked --out dist
+          manylinux: auto
+          before-script-linux: |
+            cargo build --release --locked -p tensorfs-core --bin tfs
+            install -D -m 755 target/release/tfs wheel-data/scripts/tfs
+      # No wheel proofs (owner, 2026-09-28: no CI).
+      # Consumed by publish.yaml in the same run.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.name }}
+          path: dist/*.whl
+          if-no-files-found: error
+          retention-days: 3
