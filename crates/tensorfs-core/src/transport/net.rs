@@ -282,11 +282,12 @@ async fn exchange<'l>(
     let since = Instant::now();
     let answer = judged(held.sender.send_request(request), ledger, judge, since, "response head", fail).await?;
     let answer = answer.map_err(|error| Refusal { code: fail, detail: format!("the connection failed: {error}") })?;
-    if judge == Judge::Stream {
-        ledger.taught(opened.elapsed());
+    // A head that arrived is progress for a call; an object's progress is its bytes, and a
+    // head that brings none must not teach the pull to be patient.
+    match judge {
+        Judge::Stream => ledger.taught(opened.elapsed()),
+        _ => ledger.answered(),
     }
-    // A head that arrived is progress.
-    ledger.answered();
     let (parts, incoming) = answer.into_parts();
     let headers: Vec<(String, String)> = (parts.headers.iter())
         .filter_map(|(name, value)| Some((name.as_str().to_string(), value.to_str().ok()?.to_string())))
