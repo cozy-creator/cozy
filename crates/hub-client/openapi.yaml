@@ -933,6 +933,28 @@ paths:
         4XX: {$ref: '#/components/responses/Error'}
         5XX: {$ref: '#/components/responses/Error'}
 
+  /v1/rental-placements:
+    post:
+      operationId: place_rental
+      tags: [rentals]
+      summary: The products that hold one run of a package function, cheapest expected rental first.
+      description: |
+        Sizes the function's model slots as the machine loads them at the run's bits (each slot's default
+        release, its first published lane in the bit order) and keeps the products whose card holds the
+        weights in three quarters of its memory, at the asked GPU count (one by default). Nothing is bought.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json: {schema: {$ref: '#/components/schemas/RentalPlacementRequest'}}
+      responses:
+        '200':
+          description: The ranked products and the excluded ones.
+          content:
+            application/json: {schema: {$ref: '#/components/schemas/RentalPlacement'}}
+        4XX: {$ref: '#/components/responses/Error'}
+        5XX: {$ref: '#/components/responses/Error'}
+
   /v1/rental-quotes:
     post:
       operationId: quote_rental
@@ -2477,6 +2499,85 @@ components:
           description: Null for an unmetered account, or when billing cannot be read now.
           nullable: true
           allOf: [{$ref: '#/components/schemas/CreditStatus'}]
+    RentalPlacement:
+      type: object
+      required:
+      - package
+      - release
+      - function
+      - bits
+      - gpus
+      - accelerator
+      - weights
+      - weight_bytes
+      - machines
+      - excluded
+      properties:
+        package: {type: string}
+        release: {type: string}
+        function: {type: string}
+        bits: {type: integer, format: int64}
+        gpus: {type: integer, format: int64}
+        accelerator:
+          type: boolean
+          description: False for a function its package runs on a CPU machine.
+        weights: {type: array, items: {$ref: '#/components/schemas/RentalPlacementWeights'}}
+        weight_bytes: {type: integer, format: int64}
+        machines: {type: array, items: {$ref: '#/components/schemas/RentalPlacementMachine'}}
+        excluded:
+          type: array
+          items: {$ref: '#/components/schemas/RentalPlacementExclusion'}
+    RentalPlacementExclusion:
+      type: object
+      required: [name, accelerator_count, code, reason]
+      properties:
+        name: {type: string}
+        accelerator_count: {type: integer, format: int64}
+        code:
+          type: string
+          description: placement.vram_short, placement.width_unavailable or placement.python_unsupported.
+        reason: {type: string}
+    RentalPlacementMachine:
+      type: object
+      required:
+      - name
+      - accelerator_model
+      - compute_capability
+      - vram_gb
+      - accelerator_count
+      - price_usd_micros_per_hour
+      - storage_usd_micros_per_hour
+      - container_disk_gb
+      - expected_price
+      properties:
+        name: {type: string}
+        accelerator_model: {type: string}
+        compute_capability: {type: string}
+        vram_gb: {type: integer, format: int64}
+        accelerator_count: {type: integer, format: int64}
+        price_usd_micros_per_hour: {type: integer, format: int64}
+        storage_usd_micros_per_hour: {type: integer, format: int64}
+        container_disk_gb: {type: integer, format: int64}
+        expected_price: {$ref: '#/components/schemas/RentalPriceEstimate'}
+    RentalPlacementRequest:
+      type: object
+      required: [package, function]
+      properties:
+        package: {type: string, description: org/name}
+        release: {type: string, description: Absent reads the newest release.}
+        function: {type: string}
+        bits: {type: integer, format: int64, enum: [16, 8, 4], description: Absent runs at 8.}
+        gpus: {type: integer, format: int64, minimum: 1, description: Absent asks for one.}
+    RentalPlacementWeights:
+      type: object
+      required: [slot, bytes]
+      properties:
+        slot: {type: string}
+        model: {type: string}
+        release: {type: string}
+        lane: {type: string}
+        bytes: {type: integer, format: int64}
+        unsized: {type: string, description: Why the slot adds no bytes.}
     RentalPriceEstimate:
       type: object
       description: What a rental is expected to cost at its prices, for the expected hours plus its download.
