@@ -1,0 +1,2821 @@
+openapi: 3.0.3
+
+info:
+  title: Tensorhub
+  version: v1
+  description: |
+    The routes Tensorhub's clients call: the cozy CLI and Calcifer, machines (TensorD, its
+    TensorFS transport, and uv against the package index), and the device-key and token
+    routes of the AuthKit and OpenRails surfaces the Hub embeds. Admin routes and the
+    browser pages are not here.
+
+    Every refusal is the Error envelope with a 4xx or 5xx status. Operations marked
+    `x-raw-body: true` answer bytes that are not JSON (an HTML index, a wheel, plain
+    text): a client generator may skip them, and callers read the body themselves.
+
+servers: [{url: 'https://tensorhub.com'}]
+
+tags:
+- {name: accounts}
+- {name: auth}
+- {name: billing}
+- {name: machine}
+- {name: models}
+- {name: packages}
+- {name: rentals}
+- {name: tensorfs}
+
+paths:
+  /.well-known/oauth-protected-resource:
+    get:
+      operationId: get_protected_resource_metadata
+      tags: [auth]
+      summary: Reads where this hub's run tokens are issued (RFC 9728).
+      security: []
+      responses:
+        '200':
+          description: The protected resource metadata.
+          content:
+            application/json: {schema: {$ref: '#/components/schemas/AuthProtectedResourceMetadata'}}
+        4XX: {$ref: '#/components/responses/Error'}
+        5XX: {$ref: '#/components/responses/Error'}
+
+  /billing/v1/me:
+    get:
+      operationId: get_billing_account
+      tags: [billing]
+      summary: Reads the caller's billing account, with a balance per currency held.
+      security: [{bearer: []}]
+      responses:
+        '200':
+          description: The caller's billing account.
+          content:
+            application/json: {schema: {$ref: '#/components/schemas/BillingCustomerAccount'}}
+        4XX: {$ref: '#/components/responses/BillingError'}
+        5XX: {$ref: '#/components/responses/BillingError'}
+
+  /billing/v1/me/balance/transactions:
+    get:
+      operationId: list_balance_transactions
+      tags: [billing]
+      summary: Lists the caller's credit movements, newest first, one page at a time.
+      security: [{bearer: []}]
+      parameters:
+      - {name: currency, in: query, required: false, schema: {type: string}}
+      - name: cursor
+        in: query
+        required: false
+        description: The previous page's next_cursor.
+        schema: {type: string}
+      - name: limit
+        in: query
+        required: false
+        schema: {type: integer, format: int64}
+      responses:
+        '200':
+          description: One page of movements.
+          content:
+            application/json: {schema: {$ref: '#/components/schemas/BillingBalanceTransactionPage'}}
+        4XX: {$ref: '#/components/responses/BillingError'}
+        5XX: {$ref: '#/components/responses/BillingError'}
+
+  /billing/v1/me/orders:
+    post:
+      operationId: create_order
+      tags: [billing]
+      summary: Opens an order (the caller's open order of the same lines when one exists).
+      security: [{bearer: []}]
+      parameters:
+      - name: Idempotency-Key
+        in: header
+        required: false
+        description: Required with a payment; names its payment attempt.
+        schema: {type: string, minLength: 1, maxLength: 255}
+      requestBody:
+        required: true
+        content:
+          application/json: {schema: {$ref: '#/components/schemas/BillingCreateOrderRequest'}}
+      responses:
+        '200':
+          description: The caller's existing open order of the same lines.
+          content:
+            application/json: {schema: {$ref: '#/components/schemas/BillingOrder'}}
+        '201':
+          description: A new order.
+          content:
+            application/json: {schema: {$ref: '#/components/schemas/BillingOrder'}}
+        4XX: {$ref: '#/components/responses/BillingError'}
+        5XX: {$ref: '#/components/responses/BillingError'}
+
+  /billing/v1/me/orders/{id}:
+    get:
+      operationId: get_order
+      tags: [billing]
+      summary: Reads one of the caller's orders.
+      security: [{bearer: []}]
+      parameters:
+      - {name: id, in: path, required: true, schema: {type: string}}
+      responses:
+        '200':
+          description: The order.
+          content:
+            application/json: {schema: {$ref: '#/components/schemas/BillingOrder'}}
+        4XX: {$ref: '#/components/responses/BillingError'}
+        5XX: {$ref: '#/components/responses/BillingError'}
+
+  /billing/v1/me/orders/{id}/pay:
+    post:
+      operationId: pay_order
+      tags: [billing]
+      summary: Pays an open order; a hosted page answers with a redirect next action.
+      security: [{bearer: []}]
+      parameters:
+      - {name: id, in: path, required: true, schema: {type: string}}
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema: {type: string, minLength: 1, maxLength: 255}
+      requestBody:
+        required: true
+        content:
+          application/json: {schema: {$ref: '#/components/schemas/BillingPayOrderRequest'}}
+      responses:
+        '200':
+          description: The order with its payment's state.
+          content:
+            application/json: {schema: {$ref: '#/components/schemas/BillingOrder'}}
+        4XX: {$ref: '#/components/responses/BillingError'}
+        5XX: {$ref: '#/components/responses/BillingError'}
+
+  /v1/accounts/current:
+    get:
+      operationId: get_current_account
+      tags: [accounts]
+      summary: The signed-in user's account name.
+      security: [{bearer: []}]
+      responses:
+        '200':
+          description: The account.
+          content: {application/json: {schema: {$ref: '#/components/schemas/Account'}}}
+        4XX: {$ref: '#/components/responses/Error'}
+        5XX: {$ref: '#/components/responses/Error'}
+
+  /v1/accounts/{account}:
+    put:
+      operationId: register_account
+      tags: [accounts]
+      summary: Claims the signed-in user's account name.
+      security: [{bearer: []}]
+      parameters:
+      - {name: account, in: path, required: true, schema: {type: string}}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/Empty'}}}
+      responses:
+        '200':
+          description: The account.
+          content: {application/json: {schema: {$ref: '#/components/schemas/Account'}}}
+        4XX: {$ref: '#/components/responses/Error'}
+        5XX: {$ref: '#/components/responses/Error'}
+
+  /v1/auth/.well-known/openid-configuration:
+    get:
+      operationId: get_openid_configuration
+      tags: [auth]
+      summary: Reads the authorization server's metadata, including its token endpoint.
+      security: []
+      responses:
+        '200':
+          description: The authorization server metadata.
+          content:
+            application/json: {schema: {$ref: '#/components/schemas/AuthServerMetadata'}}
+        4XX: {$ref: '#/components/responses/AuthKitError'}
+        5XX: {$ref: '#/components/responses/AuthKitError'}
+
+  /v1/auth/oauth2/token:
+    post:
+      operationId: exchange_token
+      tags: [auth]
+      summary: Trades a machine's run capability (a JWT-bearer assertion) for a DPoP-bound run token.
+      security: []
+      parameters:
+      - name: DPoP
+        in: header
+        required: true
+        description: The DPoP proof (RFC 9449) of the key the token binds to.
+        schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded: {schema: {$ref: '#/components/schemas/AuthTokenRequest'}}
+      responses:
+        '200':
+          description: The run token.
+          content:
+            application/json: {schema: {$ref: '#/components/schemas/AuthTokenResponse'}}
+        4XX: {$ref: '#/components/responses/TokenRefusal'}
+        5XX: {$ref: '#/components/responses/TokenRefusal'}
+
+  /v1/auth/v1/device-keys:
+    delete:
+      operationId: revoke_other_device_keys
+      tags: [auth]
+      summary: Revokes every device key of the account but the caller's; needs an email-proven enrollment token.
+      security: [{bearer: []}]
+      responses:
+        '204': {description: The other keys are revoked.}
+        4XX: {$ref: '#/components/responses/AuthKitError'}
+        5XX: {$ref: '#/components/responses/AuthKitError'}
+
+  /v1/auth/v1/device-keys/enroll/begin:
+    post:
+      operationId: begin_device_key_enrollment
+      tags: [auth]
+      summary: Starts enrolling a device key; a code is emailed to the account.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/AuthDeviceKeyEnrollBeginRequest'}
+      responses:
+        '200':
+          description: The enrollment and the challenge the key signs.
+          content:
+            application/json: {schema: {$ref: '#/components/schemas/AuthDeviceKeyEnrollment'}}
+        4XX: {$ref: '#/components/responses/AuthKitError'}
+        5XX: {$ref: '#/components/responses/AuthKitError'}
+
+  /v1/auth/v1/device-keys/enroll/finish:
+    post:
+      operationId: finish_device_key_enrollment
+      tags: [auth]
+      summary: Finishes an enrollment with the emailed code and the key's signature, and signs in.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/AuthDeviceKeyEnrollFinishRequest'}
+      responses:
+        '200':
+          description: The sign-in, or the step it waits on.
+          content:
+            application/json: {schema: {$ref: '#/components/schemas/AuthResult'}}
+        4XX: {$ref: '#/components/responses/AuthKitError'}
+        5XX: {$ref: '#/components/responses/AuthKitError'}
+
+  /v1/auth/v1/device-keys/login/begin:
+    post:
+      operationId: begin_device_key_login
+      tags: [auth]
+      summary: Starts a device-key sign-in; answers the challenge the key signs.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json: {schema: {$ref: '#/components/schemas/AuthDeviceKeyLoginBeginRequest'}}
+      responses:
+        '200':
+          description: The sign-in challenge.
+          content:
+            application/json: {schema: {$ref: '#/components/schemas/AuthDeviceKeyLoginChallenge'}}
+        4XX: {$ref: '#/components/responses/AuthKitError'}
+        5XX: {$ref: '#/components/responses/AuthKitError'}
+
+  /v1/auth/v1/device-keys/login/finish:
+    post:
+      operationId: finish_device_key_login
+      tags: [auth]
+      summary: Finishes a device-key sign-in with the challenge's signature.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/AuthDeviceKeyLoginFinishRequest'}
+      responses:
+        '200':
+          description: The sign-in, or the step it waits on.
+          content:
+            application/json: {schema: {$ref: '#/components/schemas/AuthResult'}}
+        4XX: {$ref: '#/components/responses/AuthKitError'}
+        5XX: {$ref: '#/components/responses/AuthKitError'}
+
+  /v1/auth/v1/me/sign-in-keys/{id}:
+    delete:
+      operationId: revoke_sign_in_key
+      tags: [auth]
+      summary: Revokes one of the caller's sign-in keys (a device key or a passkey); needs a recent sign-in.
+      security: [{bearer: []}]
+      parameters:
+      - {name: id, in: path, required: true, schema: {type: string}}
+      responses:
+        '204': {description: The key is revoked.}
+        4XX: {$ref: '#/components/responses/AuthKitError'}
+        5XX: {$ref: '#/components/responses/AuthKitError'}
+
+  /v1/credit:
+    get:
+      operationId: get_credit
+      tags: [billing]
+      summary: Reads the caller's net credit against the warning and the overdraft floor.
+      security: [{bearer: []}]
+      responses:
+        '200':
+          description: The caller's credit; null for an account whose rentals never touch credit.
+          content:
+            application/json: {schema: {$ref: '#/components/schemas/CreditResponse'}}
+        4XX: {$ref: '#/components/responses/Error'}
+        5XX: {$ref: '#/components/responses/Error'}
+
+  /v1/credit/deposit:
+    get:
+      operationId: get_credit_deposit
+      tags: [billing]
+      summary: Reads the credit deposit on sale, its price and what one purchase may be.
+      security: []
+      responses:
+        '200':
+          description: The credit deposit.
+          content:
+            application/json: {schema: {$ref: '#/components/schemas/CreditDeposit'}}
+        4XX: {$ref: '#/components/responses/Error'}
+        5XX: {$ref: '#/components/responses/Error'}
+
+  /v1/execution-environment:
+    get:
+      operationId: get_execution_environment
+      tags: [machine]
+      summary: Where a machine reaches this Hub and its object storage.
+      security: [{bearer: []}]
+      responses:
+        '200':
+          description: The environment a run's machine receives.
+          content:
+            application/json: {schema: {$ref: '#/components/schemas/ExecutionEnvironment'}}
+        4XX: {$ref: '#/components/responses/Error'}
+        5XX: {$ref: '#/components/responses/Error'}
+
+  /v1/index/{org}/simple:
+    get:
+      operationId: redirect_package_index
+      tags: [packages]
+      summary: Redirects to the index with its trailing slash.
+      security: []
+      x-raw-body: true
+      parameters: [{$ref: '#/components/parameters/Org'}]
+      responses:
+        '301': {description: Moved to the slash form.}
+        4XX: {$ref: '#/components/responses/Error'}
+        5XX: {$ref: '#/components/responses/Error'}
+
+  /v1/index/{org}/simple/:
+    get:
+      operationId: get_package_index
+      tags: [packages]
+      summary: The org's PEP 503 simple index (HTML), for uv.
+      security: []
+      x-raw-body: true
+      parameters: [{$ref: '#/components/parameters/Org'}]
+      responses:
+        '200':
+          description: HTML links to each distribution.
+          content: {text/html: {schema: {type: string}}}
+        4XX: {$ref: '#/components/responses/Error'}
+        5XX: {$ref: '#/components/responses/Error'}
+
+  /v1/index/{org}/simple/{distribution}:
+    get:
+      operationId: redirect_package_index_project
+      tags: [packages]
+      summary: Redirects to the distribution page with its trailing slash.
+      security: []
+      x-raw-body: true
+      parameters:
+      - {$ref: '#/components/parameters/Org'}
+      - {name: distribution, in: path, required: true, schema: {type: string}}
+      responses:
+        '301': {description: Moved to the slash form.}
+        4XX: {$ref: '#/components/responses/Error'}
+        5XX: {$ref: '#/components/responses/Error'}
+
+  /v1/index/{org}/simple/{distribution}/:
+    get:
+      operationId: get_package_index_project
+      tags: [packages]
+      summary: One distribution's files (HTML), or a redirect to its normalized name.
+      security: []
+      x-raw-body: true
+      parameters:
+      - {$ref: '#/components/parameters/Org'}
+      - {name: distribution, in: path, required: true, schema: {type: string}}
+      responses:
+        '200':
+          description: HTML links to each file, with its sha256.
+          content: {text/html: {schema: {type: string}}}
+        '301': {description: Moved to the normalized distribution name.}
+        4XX: {$ref: '#/components/responses/Error'}
+        5XX: {$ref: '#/components/responses/Error'}
+
+  /v1/index/{org}/{name}/{release}/{filename}:
+    get:
+      operationId: get_package_index_file
+      tags: [packages]
+      summary: Redirects to a presigned URL of one wheel.
+      security: []
+      x-raw-body: true
+      parameters:
+      - {$ref: '#/components/parameters/Org'}
+      - {$ref: '#/components/parameters/Name'}
+      - {$ref: '#/components/parameters/Release'}
+      - {name: filename, in: path, required: true, schema: {type: string}}
+      responses:
+        '302': {description: Found at the Location header.}
+        4XX: {$ref: '#/components/responses/Error'}
+        5XX: {$ref: '#/components/responses/Error'}
+
+  /v1/models:
+    get:
+      operationId: search_models
+      tags: [models]
+      summary: Searches published models.
+      security: []
+      parameters:
+      - {name: q, in: query, schema: {type: string}}
+      - name: family
+        in: query
+        schema: {type: string}
+        description: A discovery family label.
+      - name: limit
+        in: query
+        schema: {type: integer, format: int64}
+        description: At most the Hub's own search limit.
+      responses:
+        '200':
+          description: Matching models.
+          content:
+            application/json: {schema: {$ref: '#/components/schemas/ModelSearch'}}
+        4XX: {$ref: '#/components/responses/Error'}
+        5XX: {$ref: '#/components/responses/Error'}
+
+  /v1/models/resolve:
+    get:
+      operationId: resolve_model
+      tags: [models]
+      summary: Turns a model ref and a lane into one exact checkpoint.
+      security: [{}, {bearer: []}, {dpop: []}]
+      parameters:
+      - name: ref
+        in: query
+        required: true
+        schema: {type: string}
+        description: org/name[@release|@sha256:...]
+      - {name: lane, in: query, schema: {type: string}}
+      responses:
+        '200':
+          description: The resolved checkpoint.
+          content:
+            application/json: {schema: {$ref: '#/components/schemas/ModelResolution'}}
+        4XX: {$ref: '#/components/responses/Error'}
+        5XX: {$ref: '#/components/responses/Error'}
+
+  /v1/models/{org}/{name}:
+    get:
+      operationId: get_model
+      tags: [models]
+      summary: A model, its releases with their lanes, and its measured throughput.
+      security: []
+      parameters:
+      - {$ref: '#/components/parameters/Org'}
+      - {$ref: '#/components/parameters/Name'}
+      responses:
+        '200':
+          description: The model card.
+          content:
+            application/json: {schema: {$ref: '#/components/schemas/ModelCard'}}
+        4XX: {$ref: '#/components/responses/Error'}
+        5XX: {$ref: '#/components/responses/Error'}
+    patch:
+      operationId: set_model_family
+      tags: [models]
+      summary: Sets a model's discovery family.
+      security: [{bearer: []}]
+      parameters:
+      - {$ref: '#/components/parameters/Org'}
+      - {$ref: '#/components/parameters/Name'}
+      requestBody:
+        required: true
+        content:
+          application/json: {schema: {$ref: '#/components/schemas/ModelFamilyUpdate'}}
+      responses:
+        '200':
+          description: The model.
+          content:
+            application/json: {schema: {$ref: '#/components/schemas/ModelSummaryAnswer'}}
+        4XX: {$ref: '#/components/responses/Error'}
+        5XX: {$ref: '#/components/responses/Error'}
+    delete:
+      operationId: delete_model
+      tags: [models]
+      summary: Deletes a model whose releases are all yanked.
+      security: [{bearer: []}]
+      parameters:
+      - {$ref: '#/components/parameters/Org'}
+      - {$ref: '#/components/parameters/Name'}
+      responses:
+        '200':
+          description: What the deletion removed.
+          content:
+            application/json: {schema: {$ref: '#/components/schemas/ModelDeletion'}}
+        4XX: {$ref: '#/components/responses/Error'}
+        5XX: {$ref: '#/components/responses/Error'}
+
+  /v1/models/{org}/{name}/checkpoints/{manifest}:
+    get:
+      operationId: get_model_checkpoint
+      tags: [models]
+      summary: 'A checkpoint''s manifest document, to its owner or a run reading it; to a run publishing to the
+        model, only whether the model holds it ({"held": true}).'
+      security: [{bearer: []}, {dpop: []}]
+      parameters:
+      - {$ref: '#/components/parameters/Org'}
+      - {$ref: '#/components/parameters/Name'}
+      - {$ref: '#/components/parameters/Manifest'}
+      responses:
+        '200':
+          description: The manifest document, or {"held":true}.
+          content:
+            application/json: {schema: {$ref: '#/components/schemas/CheckpointDocument'}}
+        4XX: {$ref: '#/components/responses/Error'}
+        5XX: {$ref: '#/components/responses/Error'}
+    delete:
+      operationId: remove_model_checkpoint
+      tags: [models]
+      summary: Removes a checkpoint no release lane names.
+      security: [{bearer: []}]
+      parameters:
+      - {$ref: '#/components/parameters/Org'}
+      - {$ref: '#/components/parameters/Name'}
+      - {$ref: '#/components/parameters/Manifest'}
+      responses:
+        '200':
+          description: The removal.
+          content:
+            application/json: {schema: {$ref: '#/components/schemas/CheckpointRemoval'}}
+        4XX: {$ref: '#/components/responses/Error'}
+        5XX: {$ref: '#/components/responses/Error'}
+
+  /v1/models/{org}/{name}/publications/{operation}:
+    put:
+      operationId: open_model_publication
+      tags: [models]
+      summary: Opens (or resumes) a checkpoint publication and declares its objects.
+      security: [{bearer: []}, {dpop: []}]
+      parameters:
+      - {$ref: '#/components/parameters/Org'}
+      - {$ref: '#/components/parameters/Name'}
+      - {$ref: '#/components/parameters/Operation'}
+      requestBody:
+        required: true
+        content:
+          application/json: {schema: {$ref: '#/components/schemas/PublicationDeclaration'}}
+      responses:
+        '200':
+          description: The publication and each object's state.
+          content:
+            application/json: {schema: {$ref: '#/components/schemas/PublicationOpened'}}
+        4XX: {$ref: '#/components/responses/Error'}
+        5XX: {$ref: '#/components/responses/Error'}
+
+  /v1/models/{org}/{name}/publications/{operation}/finalization:
+    get:
+      operationId: get_model_finalization
+      tags: [models]
+      summary: A checkpoint finalization's state.
+      security: [{bearer: []}, {dpop: []}]
+      parameters:
+      - {$ref: '#/components/parameters/Org'}
+      - {$ref: '#/components/parameters/Name'}
+      - {$ref: '#/components/parameters/Operation'}
+      responses:
+        '200':
+          description: The finalization.
+          content:
+            application/json: {schema: {$ref: '#/components/schemas/ModelFinalization'}}
+        4XX: {$ref: '#/components/responses/Error'}
+        5XX: {$ref: '#/components/responses/Error'}
+
+  /v1/models/{org}/{name}/publications/{operation}/finalize:
+    post:
+      operationId: finalize_model_publication
+      tags: [models]
+      summary: Queues the checkpoint's finalization; poll status_url.
+      security: [{bearer: []}, {dpop: []}]
+      parameters:
+      - {$ref: '#/components/parameters/Org'}
+      - {$ref: '#/components/parameters/Name'}
+      - {$ref: '#/components/parameters/Operation'}
+      requestBody:
+        required: true
+        content:
+          application/json: {schema: {$ref: '#/components/schemas/PublicationFinalize'}}
+      responses:
+        '202':
+          description: Queued (Location and Retry-After headers).
+          content:
+            application/json: {schema: {$ref: '#/components/schemas/ModelFinalization'}}
+        4XX: {$ref: '#/components/responses/Error'}
+        5XX: {$ref: '#/components/responses/Error'}
+
+  /v1/models/{org}/{name}/publications/{operation}/grants:
+    post:
+      operationId: grant_publication_objects
+      tags: [models]
+      summary: Presigned PUTs for the named objects the Hub does not hold yet.
+      security: [{bearer: []}, {dpop: []}]
+      parameters:
+      - {$ref: '#/components/parameters/Org'}
+      - {$ref: '#/components/parameters/Name'}
+      - {$ref: '#/components/parameters/Operation'}
+      requestBody:
+        required: true
+        content:
+          application/json: {schema: {$ref: '#/components/schemas/PublicationObjectIds'}}
+      responses:
+        '200':
+          description: Grants for absent objects; the held ones.
+          content:
+            application/json: {schema: {$ref: '#/components/schemas/PublicationGrants'}}
+        4XX: {$ref: '#/components/responses/Error'}
+        5XX: {$ref: '#/components/responses/Error'}
+
+  /v1/models/{org}/{name}/publications/{operation}/verify:
+    post:
+      operationId: verify_publication_objects
+      tags: [models]
+      summary: Verifies uploaded objects.
+      security: [{bearer: []}, {dpop: []}]
+      parameters:
+      - {$ref: '#/components/parameters/Org'}
+      - {$ref: '#/components/parameters/Name'}
+      - {$ref: '#/components/parameters/Operation'}
+      requestBody:
+        required: true
+        content:
+          application/json: {schema: {$ref: '#/components/schemas/PublicationObjectIds'}}
+      responses:
+        '200':
+          description: The publication with the verified objects' states.
+          content:
+            application/json: {schema: {$ref: '#/components/schemas/PublicationAnswer'}}
+        4XX: {$ref: '#/components/responses/Error'}
+        5XX: {$ref: '#/components/responses/Error'}
+
+  /v1/models/{org}/{name}/releases/{release}:
+    post:
+      operationId: update_model_release
+      tags: [models]
+      summary: Sets or removes release lanes at an expected revision.
+      security: [{bearer: []}]
+      parameters:
+      - {$ref: '#/components/parameters/Org'}
+      - {$ref: '#/components/parameters/Name'}
+      - {$ref: '#/components/parameters/Release'}
+      requestBody:
+        required: true
+        content:
+          application/json: {schema: {$ref: '#/components/schemas/ModelReleaseUpdate'}}
+      responses:
+        '200':
+          description: The release.
+          content:
+            application/json: {schema: {$ref: '#/components/schemas/ModelRelease'}}
+        4XX: {$ref: '#/components/responses/Error'}
+        5XX: {$ref: '#/components/responses/Error'}
+    delete:
+      operationId: yank_model_release
+      tags: [models]
+      summary: Yanks a release.
+      security: [{bearer: []}]
+      parameters:
+      - {$ref: '#/components/parameters/Org'}
+      - {$ref: '#/components/parameters/Name'}
+      - {$ref: '#/components/parameters/Release'}
+      responses:
+        '200':
+          description: The yanked release.
+          content:
+            application/json: {schema: {$ref: '#/components/schemas/ModelRelease'}}
+        4XX: {$ref: '#/components/responses/Error'}
+        5XX: {$ref: '#/components/responses/Error'}
+
+  /v1/models/{org}/{name}/releases/{release}/lanes/{lane}:
+    put:
+      operationId: retarget_model_lane
+      tags: [models]
+      summary: Points one existing release lane at another retained checkpoint.
+      security: [{bearer: []}]
+      parameters:
+      - {$ref: '#/components/parameters/Org'}
+      - {$ref: '#/components/parameters/Name'}
+      - {$ref: '#/components/parameters/Release'}
+      - {$ref: '#/components/parameters/Lane'}
+      requestBody:
+        required: true
+        content:
+          application/json: {schema: {$ref: '#/components/schemas/ModelLaneRetarget'}}
+      responses:
+        '200':
+          description: The release.
+          content:
+            application/json: {schema: {$ref: '#/components/schemas/ModelRelease'}}
+        4XX: {$ref: '#/components/responses/Error'}
+        5XX: {$ref: '#/components/responses/Error'}
+
+  /v1/models/{org}/{name}/throughput:
+    get:
+      operationId: get_model_throughput
+      tags: [models]
+      summary: The newest throughput measurement per release, lane and SKU.
+      security: []
+      parameters:
+      - {$ref: '#/components/parameters/Org'}
+      - {$ref: '#/components/parameters/Name'}
+      responses:
+        '200':
+          description: Measurements.
+          content:
+            application/json: {schema: {$ref: '#/components/schemas/ModelThroughputs'}}
+        4XX: {$ref: '#/components/responses/Error'}
+        5XX: {$ref: '#/components/responses/Error'}
+
+  /v1/packages:
+    get:
+      operationId: search_packages
+      tags: [packages]
+      summary: Searches published packages.
+      security: []
+      parameters:
+      - {name: q, in: query, schema: {type: string}}
+      - name: limit
+        in: query
+        schema: {type: integer, format: int64}
+        description: At most the Hub's own search limit.
+      responses:
+        '200':
+          description: Matching packages.
+          content:
+            application/json: {schema: {$ref: '#/components/schemas/PackageSearch'}}
+        4XX: {$ref: '#/components/responses/Error'}
+        5XX: {$ref: '#/components/responses/Error'}
+
+  /v1/packages/{org}/{name}:
+    get:
+      operationId: get_package
+      tags: [packages]
+      summary: A package and its releases.
+      security: []
+      parameters:
+      - {$ref: '#/components/parameters/Org'}
+      - {$ref: '#/components/parameters/Name'}
+      responses:
+        '200':
+          description: The package card.
+          content:
+            application/json: {schema: {$ref: '#/components/schemas/PackageCard'}}
+        4XX: {$ref: '#/components/responses/Error'}
+        5XX: {$ref: '#/components/responses/Error'}
+
+  /v1/packages/{org}/{name}/download:
+    post:
+      operationId: get_package_download_plan
+      tags: [packages]
+      summary: The exact files of one committed release, with presigned URLs.
+      security: []
+      parameters:
+      - {$ref: '#/components/parameters/Org'}
+      - {$ref: '#/components/parameters/Name'}
+      - name: release
+        in: query
+        schema: {type: string}
+        description: Absent reads the newest release.
+      - {name: python_version, in: query, schema: {type: string}}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/Empty'}}}
+      responses:
+        '200':
+          description: The install plan.
+          content:
+            application/json: {schema: {$ref: '#/components/schemas/PackageInstallPlan'}}
+        4XX: {$ref: '#/components/responses/Error'}
+        5XX: {$ref: '#/components/responses/Error'}
+
+  /v1/packages/{org}/{name}/publish/{release}:
+    post:
+      operationId: begin_package_release
+      tags: [packages]
+      summary: Declares a release's files and returns upload grants for the absent ones.
+      security: [{bearer: []}]
+      parameters:
+      - {$ref: '#/components/parameters/Org'}
+      - {$ref: '#/components/parameters/Name'}
+      - {$ref: '#/components/parameters/Release'}
+      requestBody:
+        required: true
+        content:
+          application/json: {schema: {$ref: '#/components/schemas/PackageReleaseDeclaration'}}
+      responses:
+        '200':
+          description: One grant per declared file.
+          content:
+            application/json: {schema: {$ref: '#/components/schemas/PackageReleaseGrants'}}
+        4XX: {$ref: '#/components/responses/Error'}
+        5XX: {$ref: '#/components/responses/Error'}
+
+  /v1/packages/{org}/{name}/publish/{release}/finalize:
+    post:
+      operationId: finalize_package_release
+      tags: [packages]
+      summary: Queues the release's finalization (202), or answers a committed one (200).
+      security: [{bearer: []}]
+      parameters:
+      - {$ref: '#/components/parameters/Org'}
+      - {$ref: '#/components/parameters/Name'}
+      - {$ref: '#/components/parameters/Release'}
+      requestBody:
+        required: true
+        content:
+          application/json: {schema: {$ref: '#/components/schemas/PackageReleaseFinalize'}}
+      responses:
+        '200':
+          description: Committed.
+          content:
+            application/json: {schema: {$ref: '#/components/schemas/PackageFinalization'}}
+        '202':
+          description: Queued; poll status_url (also the Location header).
+          content:
+            application/json: {schema: {$ref: '#/components/schemas/PackageFinalization'}}
+        4XX: {$ref: '#/components/responses/Error'}
+        5XX: {$ref: '#/components/responses/Error'}
+
+  /v1/packages/{org}/{name}/publish/{release}/status:
+    get:
+      operationId: get_package_finalization
+      tags: [packages]
+      summary: A release's finalization state.
+      security: [{bearer: []}]
+      parameters:
+      - {$ref: '#/components/parameters/Org'}
+      - {$ref: '#/components/parameters/Name'}
+      - {$ref: '#/components/parameters/Release'}
+      responses:
+        '200':
+          description: The finalization.
+          content:
+            application/json: {schema: {$ref: '#/components/schemas/PackageFinalization'}}
+        4XX: {$ref: '#/components/responses/Error'}
+        5XX: {$ref: '#/components/responses/Error'}
+
+  /v1/packages/{org}/{name}/releases/{release}:
+    get:
+      operationId: get_package_release
+      tags: [packages]
+      summary: One committed release, its interface and its Python environment.
+      security: []
+      parameters:
+      - {$ref: '#/components/parameters/Org'}
+      - {$ref: '#/components/parameters/Name'}
+      - {$ref: '#/components/parameters/Release'}
+      responses:
+        '200':
+          description: The release.
+          content:
+            application/json: {schema: {$ref: '#/components/schemas/PackageRelease'}}
+        4XX: {$ref: '#/components/responses/Error'}
+        5XX: {$ref: '#/components/responses/Error'}
+    delete:
+      operationId: yank_package_release
+      tags: [packages]
+      summary: Yanks a release.
+      security: [{bearer: []}]
+      parameters:
+      - {$ref: '#/components/parameters/Org'}
+      - {$ref: '#/components/parameters/Name'}
+      - {$ref: '#/components/parameters/Release'}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/Empty'}}}
+      responses:
+        '200':
+          description: The yanked release.
+          content:
+            application/json: {schema: {$ref: '#/components/schemas/PackageYank'}}
+        4XX: {$ref: '#/components/responses/Error'}
+        5XX: {$ref: '#/components/responses/Error'}
+
+  /v1/packages/{org}/{name}/releases/{release}/locked-requirements:
+    get:
+      operationId: get_package_locked_requirements
+      tags: [packages]
+      summary: The release's hash-pinned requirements, as uv installs them.
+      security: []
+      x-raw-body: true
+      parameters:
+      - {$ref: '#/components/parameters/Org'}
+      - {$ref: '#/components/parameters/Name'}
+      - {$ref: '#/components/parameters/Release'}
+      responses:
+        '200':
+          description: A requirements file.
+          content: {text/plain: {schema: {type: string}}}
+        4XX: {$ref: '#/components/responses/Error'}
+        5XX: {$ref: '#/components/responses/Error'}
+
+  /v1/rental-quotes:
+    post:
+      operationId: quote_rental
+      tags: [rentals]
+      summary: Prices the exact body a POST /v1/rentals would send, at the offer it would buy.
+      security: [{}, {bearer: []}, {dpop: []}]
+      requestBody:
+        required: true
+        content:
+          application/json: {schema: {$ref: '#/components/schemas/RentalRequest'}}
+      responses:
+        '200':
+          description: The product and width the request would lock, and its prices.
+          content:
+            application/json: {schema: {$ref: '#/components/schemas/RentalQuote'}}
+        4XX: {$ref: '#/components/responses/Error'}
+        5XX: {$ref: '#/components/responses/Error'}
+
+  /v1/rental-skus:
+    get:
+      operationId: list_rental_skus
+      tags: [rentals]
+      summary: Lists the products buyable now, each with its buyable GPU counts and prices.
+      security: [{}, {bearer: []}]
+      parameters:
+      - name: provider
+        in: query
+        required: false
+        description: Narrow to one provider (runpod or vast); an admin's sign-in only.
+        schema: {type: string}
+      responses:
+        '200':
+          description: The buyable catalog, sorted by name.
+          content:
+            application/json: {schema: {$ref: '#/components/schemas/RentalSkuList'}}
+        4XX: {$ref: '#/components/responses/Error'}
+        5XX: {$ref: '#/components/responses/Error'}
+
+  /v1/rental-skus/{name}:
+    get:
+      operationId: get_rental_sku_status
+      tags: [rentals]
+      summary: Says whether one product at one GPU count is buyable, out of stock, cooling down or unknown.
+      security: [{}, {bearer: []}]
+      parameters:
+      - {name: name, in: path, required: true, schema: {type: string}}
+      - name: accelerator_count
+        in: query
+        required: false
+        description: GPU count; 1 when omitted.
+        schema: {type: integer, format: int64, minimum: 1}
+      - name: provider
+        in: query
+        required: false
+        description: Narrow to one provider (runpod or vast); an admin's sign-in only.
+        schema: {type: string}
+      responses:
+        '200':
+          description: The product's standing at that count.
+          content:
+            application/json: {schema: {$ref: '#/components/schemas/RentalSkuStatus'}}
+        4XX: {$ref: '#/components/responses/Error'}
+        5XX: {$ref: '#/components/responses/Error'}
+
+  /v1/rentals:
+    post:
+      operationId: create_rental
+      tags: [rentals]
+      summary: Accepts a rental; the pod is bought and booted afterwards.
+      security: [{bearer: []}]
+      parameters:
+      - name: Idempotency-Key
+        in: header
+        required: true
+        description: Persisted before the POST; a replay with the same body answers the same rental.
+        schema: {type: string, minLength: 1, maxLength: 200}
+      requestBody:
+        required: true
+        content:
+          application/json: {schema: {$ref: '#/components/schemas/RentalRequest'}}
+      responses:
+        '202':
+          description: The accepted rental.
+          content: {application/json: {schema: {$ref: '#/components/schemas/Rental'}}}
+        4XX: {$ref: '#/components/responses/Error'}
+        5XX: {$ref: '#/components/responses/Error'}
+    get:
+      operationId: list_rentals
+      tags: [rentals]
+      summary: Lists the caller's rentals, with its bindings revision and credit.
+      security: [{bearer: []}]
+      parameters:
+      - name: state
+        in: query
+        required: false
+        description: Omitted or live lists the rentals that may be billing; all adds released and failed ones.
+        schema: {type: string, enum: [all, live]}
+      - name: name
+        in: query
+        required: false
+        description: Keep the rentals that bore this rental or machine name, case-insensitively.
+        schema: {type: string}
+      responses:
+        '200':
+          description: The caller's rentals.
+          content:
+            application/json: {schema: {$ref: '#/components/schemas/RentalListing'}}
+        4XX: {$ref: '#/components/responses/Error'}
+        5XX: {$ref: '#/components/responses/Error'}
+
+  /v1/rentals/{id}:
+    get:
+      operationId: get_rental
+      tags: [rentals]
+      summary: Reads one rental the caller owns (or any, for an admin).
+      security: [{bearer: []}]
+      parameters:
+      - {name: id, in: path, required: true, schema: {type: string}}
+      responses:
+        '200':
+          description: The rental.
+          content: {application/json: {schema: {$ref: '#/components/schemas/Rental'}}}
+        4XX: {$ref: '#/components/responses/Error'}
+        5XX: {$ref: '#/components/responses/Error'}
+    delete:
+      operationId: release_rental
+      tags: [rentals]
+      summary: Releases a rental; its pod is torn down.
+      security: [{bearer: []}]
+      parameters:
+      - {name: id, in: path, required: true, schema: {type: string}}
+      responses:
+        '204': {description: The release is requested.}
+        4XX: {$ref: '#/components/responses/Error'}
+        5XX: {$ref: '#/components/responses/Error'}
+
+  /v1/software:
+    get:
+      operationId: get_software
+      tags: [machine]
+      summary: The Runtime and TensorFS versions machines run.
+      security: []
+      responses:
+        '200':
+          description: The software target.
+          content: {application/json: {schema: {$ref: '#/components/schemas/Software'}}}
+        4XX: {$ref: '#/components/responses/Error'}
+        5XX: {$ref: '#/components/responses/Error'}
+
+  /v1/tensorfs/closure:
+    post:
+      operationId: resolve_tensorfs_closure
+      tags: [tensorfs]
+      summary: Reads one page of what a readable checkpoint contains, digests and lengths only.
+      security: [{}, {bearer: []}, {dpop: []}]
+      requestBody:
+        required: true
+        content:
+          application/json: {schema: {$ref: '#/components/schemas/TensorfsClosureRequest'}}
+      responses:
+        '200':
+          description: One page of the closure.
+          content:
+            application/json: {schema: {$ref: '#/components/schemas/TensorfsClosure'}}
+        4XX: {$ref: '#/components/responses/TensorfsError'}
+        5XX: {$ref: '#/components/responses/TensorfsError'}
+
+  /v1/tensorfs/presign:
+    post:
+      operationId: presign_tensorfs_objects
+      tags: [tensorfs]
+      summary: Mints download URLs for exactly the asked objects of checkpoints the caller may read.
+      security: [{}, {bearer: []}, {dpop: []}]
+      requestBody:
+        required: true
+        content:
+          application/json: {schema: {$ref: '#/components/schemas/TensorfsPresignRequest'}}
+      responses:
+        '200':
+          description: A URL for every asked digest.
+          content:
+            application/json: {schema: {$ref: '#/components/schemas/TensorfsPresign'}}
+        4XX: {$ref: '#/components/responses/TensorfsError'}
+        5XX: {$ref: '#/components/responses/TensorfsError'}
+
+  /v1/worker/rental/authorized-keys:
+    get:
+      operationId: get_worker_authorized_keys
+      tags: [machine]
+      summary: Reads the device keys a ready rental's machine admits, and how long they hold.
+      security: [{worker: []}]
+      parameters:
+      - {name: X-Cozy-Worker-ID, in: header, required: true, schema: {type: string}}
+      responses:
+        '200':
+          description: The rental's current authorized keys.
+          content:
+            application/json: {schema: {$ref: '#/components/schemas/WorkerAuthorizedKeys'}}
+        4XX: {$ref: '#/components/responses/Error'}
+        5XX: {$ref: '#/components/responses/Error'}
+
+  /v1/worker/rental/endpoint:
+    post:
+      operationId: report_worker_endpoint
+      tags: [machine]
+      summary: Tells the hub where a booting machine listens, as its provider mapped the ports.
+      security: [{worker: []}]
+      parameters:
+      - {name: X-Cozy-Worker-ID, in: header, required: true, schema: {type: string}}
+      requestBody:
+        required: true
+        content:
+          application/json: {schema: {$ref: '#/components/schemas/WorkerEndpointReport'}}
+      responses:
+        '204': {description: The endpoint is recorded.}
+        4XX: {$ref: '#/components/responses/Error'}
+        5XX: {$ref: '#/components/responses/Error'}
+
+  /v1/worker/rental/release:
+    post:
+      operationId: release_worker_rental
+      tags: [machine]
+      summary: Releases the machine's own rental (an idle release); repeats are accepted.
+      security: [{worker: []}]
+      parameters:
+      - {name: X-Cozy-Worker-ID, in: header, required: true, schema: {type: string}}
+      requestBody:
+        required: true
+        content:
+          application/json: {schema: {$ref: '#/components/schemas/WorkerReleaseRequest'}}
+      responses:
+        '204': {description: The release is requested.}
+        4XX: {$ref: '#/components/responses/Error'}
+        5XX: {$ref: '#/components/responses/Error'}
+
+components:
+  securitySchemes:
+    bearer:
+      type: http
+      scheme: bearer
+      description: An AuthKit access token, from a device-key login.
+    dpop:
+      type: http
+      scheme: dpop
+      description: |
+        A machine's sender-constrained run token (RFC 9449): `Authorization: DPoP <token>`
+        beside a `DPoP` proof header, from the JWT-bearer trade of a run capability.
+    worker:
+      type: apiKey
+      in: header
+      name: X-Cozy-Worker-Token
+      description: A rental pod's worker capability, beside its X-Cozy-Worker-ID.
+  responses:
+    Error:
+      description: A typed refusal.
+      content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+    BillingError:
+      description: An OpenRails refusal.
+      content:
+        application/json: {schema: {$ref: '#/components/schemas/BillingError'}}
+    AuthKitError:
+      description: An AuthKit refusal.
+      content:
+        application/json: {schema: {$ref: '#/components/schemas/AuthKitError'}}
+    TokenRefusal:
+      description: An OAuth error, or AuthKit's envelope for a rate limit.
+      content:
+        application/json: {schema: {$ref: '#/components/schemas/AuthTokenRefusal'}}
+    TensorfsError:
+      description: A TensorFS refusal.
+      content:
+        application/json: {schema: {$ref: '#/components/schemas/TensorfsError'}}
+  schemas:
+    Account:
+      type: object
+      required: [name, user_id]
+      properties: {name: {type: string}, user_id: {type: string}}
+    AuthAccountRecoveryConfirmation:
+      type: object
+      required: [token, expires_at, purge_at]
+      properties:
+        token: {type: string}
+        expires_at: {type: string, format: date-time}
+        purge_at: {type: string, format: date-time}
+    AuthAgreement:
+      type: object
+      required: [key, version, url]
+      properties: {key: {type: string}, version: {type: string}, url: {type: string}}
+    AuthBanState:
+      type: object
+      required: [at, until, reason, by]
+      properties:
+        at: {type: string, format: date-time}
+        until: {type: string, format: date-time, nullable: true}
+        reason: {type: string, nullable: true}
+        by: {type: string, nullable: true}
+    AuthDeviceKey:
+      type: object
+      required: [id, label, public_key, created_at, last_used_at, revoked_at, current]
+      properties:
+        id: {type: string}
+        label: {type: string, nullable: true}
+        public_key:
+          type: string
+          format: byte
+          description: The Ed25519 public key, standard base64.
+        created_at: {type: string, format: date-time}
+        last_used_at: {type: string, format: date-time, nullable: true}
+        revoked_at: {type: string, format: date-time, nullable: true}
+        current: {type: boolean}
+    AuthDeviceKeyEnrollBeginRequest:
+      type: object
+      required: [email, public_key]
+      properties:
+        email: {type: string}
+        public_key:
+          type: string
+          description: The Ed25519 public key, unpadded base64url (43 characters).
+        label: {type: string, maxLength: 128}
+    AuthDeviceKeyEnrollFinishRequest:
+      type: object
+      required: [enrollment_id, code, signature]
+      properties:
+        enrollment_id: {type: string}
+        code: {type: string, description: The emailed six-digit code.}
+        signature:
+          type: string
+          description: The key's signature of the challenge, unpadded base64url.
+        code_2fa:
+          type: string
+          description: A second factor's code, when the account requires one.
+    AuthDeviceKeyEnrollment:
+      type: object
+      required: [enrollment_id, challenge, expires_at]
+      properties:
+        enrollment_id: {type: string}
+        challenge: {type: string}
+        expires_at: {type: string, format: date-time}
+    AuthDeviceKeyLoginBeginRequest:
+      type: object
+      required: [device_key_id]
+      properties: {device_key_id: {type: string}}
+    AuthDeviceKeyLoginChallenge:
+      type: object
+      required: [challenge_id, challenge, expires_at]
+      properties:
+        challenge_id: {type: string}
+        challenge: {type: string}
+        expires_at: {type: string, format: date-time}
+    AuthDeviceKeyLoginFinishRequest:
+      type: object
+      required: [challenge_id, signature]
+      properties: {challenge_id: {type: string}, signature: {type: string}}
+    AuthDeviceVerificationStep:
+      type: object
+      required: [user_id, challenge, channel, destination, channels]
+      properties:
+        user_id: {type: string}
+        challenge: {type: string}
+        channel: {type: string}
+        destination: {type: string}
+        channels: {type: array, items: {type: string}}
+    AuthEnrollmentStep:
+      type: object
+      required: [token_set, allowed_methods]
+      properties:
+        token_set: {$ref: '#/components/schemas/AuthTokenSet'}
+        allowed_methods: {type: array, items: {type: string}}
+    AuthFreshAuth:
+      type: object
+      required:
+      - last_authenticated_at
+      - step_up_required_for_sensitive_actions
+      - step_up_required_in_seconds
+      - auth_methods
+      properties:
+        last_authenticated_at: {type: string, format: date-time, nullable: true}
+        step_up_required_for_sensitive_actions: {type: boolean}
+        step_up_required_in_seconds: {type: integer, format: int64}
+        auth_methods: {type: array, items: {type: string}}
+    AuthKitError:
+      type: object
+      description: AuthKit's refusal envelope.
+      required: [error]
+      properties: {error: {$ref: '#/components/schemas/AuthKitErrorDetail'}}
+    AuthKitErrorDetail:
+      type: object
+      required: [type, code, message, param, metadata]
+      properties:
+        type: {type: string}
+        code: {type: string}
+        message: {type: string}
+        param: {type: string, nullable: true}
+        metadata: {type: object, nullable: true, additionalProperties: {}}
+    AuthProtectedResourceMetadata:
+      type: object
+      required:
+      - resource
+      - authorization_servers
+      - bearer_methods_supported
+      - dpop_bound_access_tokens_required
+      properties:
+        resource: {type: string}
+        authorization_servers: {type: array, items: {type: string}}
+        bearer_methods_supported: {type: array, items: {type: string}}
+        dpop_bound_access_tokens_required: {type: boolean}
+    AuthResult:
+      type: object
+      description: A sign-in; status says whether it is complete or which step it waits on.
+      required:
+      - status
+      - token_set
+      - user
+      - created
+      - return_to
+      - fresh_auth
+      - device_key
+      - second_factor
+      - enrollment
+      - verification
+      - recovery
+      - device_verification
+      - agreements_due
+      properties:
+        status: {type: string}
+        token_set: {nullable: true, allOf: [{$ref: '#/components/schemas/AuthTokenSet'}]}
+        user: {nullable: true, allOf: [{$ref: '#/components/schemas/AuthUser'}]}
+        created: {type: boolean}
+        return_to: {type: string, nullable: true}
+        fresh_auth: {nullable: true, allOf: [{$ref: '#/components/schemas/AuthFreshAuth'}]}
+        device_key: {nullable: true, allOf: [{$ref: '#/components/schemas/AuthDeviceKey'}]}
+        second_factor:
+          nullable: true
+          allOf: [{$ref: '#/components/schemas/AuthSecondFactorStep'}]
+        enrollment:
+          nullable: true
+          allOf: [{$ref: '#/components/schemas/AuthEnrollmentStep'}]
+        verification:
+          nullable: true
+          allOf: [{$ref: '#/components/schemas/AuthVerificationStep'}]
+        recovery:
+          nullable: true
+          allOf: [{$ref: '#/components/schemas/AuthAccountRecoveryConfirmation'}]
+        device_verification:
+          nullable: true
+          allOf: [{$ref: '#/components/schemas/AuthDeviceVerificationStep'}]
+        agreements_due: {type: array, items: {$ref: '#/components/schemas/AuthAgreement'}}
+    AuthSecondFactorStep:
+      type: object
+      required: [user_id, challenge, factor, factors]
+      properties:
+        user_id: {type: string}
+        challenge: {type: string}
+        factor: {$ref: '#/components/schemas/AuthTwoFactorFactor'}
+        factors: {type: array, items: {$ref: '#/components/schemas/AuthTwoFactorFactor'}}
+    AuthServerMetadata:
+      type: object
+      required:
+      - issuer
+      - authorization_endpoint
+      - token_endpoint
+      - userinfo_endpoint
+      - end_session_endpoint
+      - jwks_uri
+      - scopes_supported
+      - response_types_supported
+      - response_modes_supported
+      - grant_types_supported
+      - subject_types_supported
+      - id_token_signing_alg_values_supported
+      - token_endpoint_auth_methods_supported
+      - code_challenge_methods_supported
+      - claims_supported
+      - prompt_values_supported
+      - authorization_response_iss_parameter_supported
+      - request_parameter_supported
+      - request_uri_parameter_supported
+      - backchannel_logout_supported
+      properties:
+        issuer: {type: string}
+        authorization_endpoint: {type: string}
+        token_endpoint: {type: string}
+        userinfo_endpoint: {type: string}
+        revocation_endpoint: {type: string}
+        end_session_endpoint: {type: string}
+        jwks_uri: {type: string}
+        scopes_supported: {type: array, items: {type: string}}
+        response_types_supported: {type: array, items: {type: string}}
+        response_modes_supported: {type: array, items: {type: string}}
+        grant_types_supported: {type: array, items: {type: string}}
+        subject_types_supported: {type: array, items: {type: string}}
+        id_token_signing_alg_values_supported: {type: array, items: {type: string}}
+        token_endpoint_auth_methods_supported: {type: array, items: {type: string}}
+        code_challenge_methods_supported: {type: array, items: {type: string}}
+        claims_supported: {type: array, items: {type: string}}
+        prompt_values_supported: {type: array, items: {type: string}}
+        dpop_signing_alg_values_supported: {type: array, items: {type: string}}
+        authorization_response_iss_parameter_supported: {type: boolean}
+        request_parameter_supported: {type: boolean}
+        request_uri_parameter_supported: {type: boolean}
+        authorization_details_types_supported: {type: array, items: {type: string}}
+        token_endpoint_auth_signing_alg_values_supported: {type: array, items: {type: string}}
+        backchannel_logout_supported: {type: boolean}
+    AuthTokenRefusal:
+      description: The token endpoint's refusal; AuthKit's envelope only for a rate limit.
+      oneOf:
+      - {$ref: '#/components/schemas/OAuthError'}
+      - {$ref: '#/components/schemas/AuthKitError'}
+    AuthTokenRequest:
+      type: object
+      description: The JWT-bearer grant (RFC 7523), the one grant this hub's authorization server issues.
+      required: [grant_type, assertion, client_id]
+      properties:
+        grant_type: {type: string, enum: ['urn:ietf:params:oauth:grant-type:jwt-bearer']}
+        assertion:
+          type: string
+          description: A JWT the machine's key signs, carrying the run capability.
+        client_id: {type: string, description: tensord}
+        resource:
+          type: string
+          description: The hub's origin, the token's audience; one per request.
+        scope: {type: string}
+    AuthTokenResponse:
+      type: object
+      required: [access_token, token_type, expires_in]
+      properties:
+        access_token: {type: string}
+        token_type: {type: string, description: DPoP for a run token.}
+        expires_in: {type: integer, format: int64}
+        scope: {type: string}
+        id_token: {type: string}
+        refresh_token: {type: string}
+        issued_token_type: {type: string}
+        authorization_details: {description: The RFC 9396 operations the token was granted.}
+    AuthTokenSet:
+      type: object
+      required: [access_token, token_type, expires_in, refresh_token]
+      properties:
+        access_token: {type: string}
+        token_type: {type: string}
+        expires_in: {type: integer, format: int64}
+        refresh_token: {type: string, nullable: true}
+    AuthTwoFactorFactor:
+      type: object
+      required: [id, method, is_default, destination]
+      properties:
+        id: {type: string}
+        method: {type: string}
+        is_default: {type: boolean}
+        destination: {type: string, nullable: true}
+    AuthUser:
+      type: object
+      required:
+      - id
+      - email
+      - phone_number
+      - username
+      - email_verified
+      - phone_verified
+      - preferred_language
+      - created_at
+      - updated_at
+      - last_login
+      - deleted_at
+      - ban
+      - expired_ban
+      - public_metadata
+      properties:
+        id: {type: string}
+        email: {type: string, nullable: true}
+        phone_number: {type: string, nullable: true}
+        username: {type: string}
+        email_verified: {type: boolean}
+        phone_verified: {type: boolean}
+        preferred_language: {type: string, nullable: true}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+        last_login: {type: string, format: date-time, nullable: true}
+        deleted_at: {type: string, format: date-time, nullable: true}
+        ban: {nullable: true, allOf: [{$ref: '#/components/schemas/AuthBanState'}]}
+        expired_ban: {nullable: true, allOf: [{$ref: '#/components/schemas/AuthBanState'}]}
+        public_metadata: {type: object, additionalProperties: {}}
+    AuthVerificationStep:
+      type: object
+      required: [identifier, channel, password_proof]
+      properties:
+        identifier: {type: string}
+        channel: {type: string}
+        password_proof: {type: string, nullable: true}
+    BillingAddress:
+      type: object
+      required: [line1, line2, city, state, postal_code, country]
+      properties:
+        line1: {type: string, nullable: true}
+        line2: {type: string, nullable: true}
+        city: {type: string, nullable: true}
+        state: {type: string, nullable: true}
+        postal_code: {type: string, nullable: true}
+        country: {type: string, nullable: true}
+    BillingBalance:
+      type: object
+      description: One currency's balance; amounts are decimal strings in the currency's minor units.
+      required:
+      - customer_id
+      - currency
+      - billing_mode
+      - balance_amount
+      - held_amount
+      - accrued_amount
+      - available_amount
+      - owed_amount
+      - accrual_rate_per_hour
+      - as_of
+      - depletes_at
+      properties:
+        customer_id: {type: string}
+        currency: {type: string}
+        billing_mode: {type: string}
+        balance_amount: {type: string}
+        held_amount: {type: string}
+        accrued_amount: {type: string}
+        available_amount: {type: string}
+        owed_amount: {type: string}
+        accrual_rate_per_hour: {type: string}
+        as_of: {type: string, format: date-time}
+        depletes_at: {type: string, format: date-time, nullable: true}
+    BillingBalanceTransaction:
+      type: object
+      required:
+      - id
+      - customer_id
+      - currency
+      - type
+      - amount
+      - credit_grant_id
+      - invoker
+      - resource
+      - source
+      - source_id
+      - created_at
+      properties:
+        id: {type: string}
+        customer_id: {type: string}
+        currency: {type: string}
+        type: {type: string}
+        amount: {type: string}
+        credit_grant_id: {type: string, nullable: true}
+        invoker: {type: string, nullable: true}
+        resource: {type: string, nullable: true}
+        source: {type: string}
+        source_id: {type: string}
+        created_at: {type: string, format: date-time}
+    BillingBalanceTransactionPage:
+      type: object
+      required: [data, next_cursor]
+      properties:
+        data:
+          type: array
+          items: {$ref: '#/components/schemas/BillingBalanceTransaction'}
+        next_cursor:
+          type: string
+          nullable: true
+          description: The next page's cursor; null on the last page.
+    BillingCreateOrderRequest:
+      type: object
+      properties:
+        lines: {type: array, items: {$ref: '#/components/schemas/BillingOrderLineParams'}}
+        cart: {type: boolean}
+        expected_total: {type: string, description: A decimal string.}
+        payment: {$ref: '#/components/schemas/BillingOrderPaymentParams'}
+        reusable: {type: boolean}
+        pay_url: {$ref: '#/components/schemas/BillingOrderPayUrlParams'}
+    BillingCustomerAccount:
+      type: object
+      required: [id, balances, default_payment_methods, low_balance_lines]
+      properties:
+        id: {type: string}
+        balances: {type: array, items: {$ref: '#/components/schemas/BillingBalance'}}
+        default_payment_methods:
+          type: array
+          items: {$ref: '#/components/schemas/BillingDefaultPaymentMethod'}
+        low_balance_lines: {type: array, items: {$ref: '#/components/schemas/BillingLowBalanceLine'}}
+    BillingDefaultPaymentMethod:
+      type: object
+      required: [currency, payment_method_id]
+      properties: {currency: {type: string}, payment_method_id: {type: string}}
+    BillingDetails:
+      type: object
+      required: [name, email, phone, address]
+      properties:
+        name: {type: string, nullable: true}
+        email: {type: string, nullable: true}
+        phone: {type: string, nullable: true}
+        address: {nullable: true, allOf: [{$ref: '#/components/schemas/BillingAddress'}]}
+    BillingError:
+      type: object
+      description: OpenRails' refusal envelope.
+      required: [error]
+      properties: {error: {$ref: '#/components/schemas/BillingErrorDetail'}}
+    BillingErrorDetail:
+      type: object
+      required: [type, code, message]
+      properties:
+        type: {type: string}
+        code: {type: string}
+        message: {type: string}
+        request_id: {type: string}
+        param: {type: string}
+        metadata: {type: object, additionalProperties: {}}
+        order: {$ref: '#/components/schemas/BillingOrder'}
+    BillingInvoiceContact:
+      type: object
+      required: [name, email]
+      properties: {name: {type: string}, email: {type: string}}
+    BillingLowBalanceLine:
+      type: object
+      required: [currency, amount, runway_hours, source]
+      properties:
+        currency: {type: string}
+        amount: {type: string}
+        runway_hours: {type: integer, format: int64}
+        source: {type: string}
+    BillingNextAction:
+      type: object
+      description: What the customer does next; redirect_to_url carries the hosted page in url.
+      required: [type, url, transactions, psp_id, payload]
+      properties:
+        type: {type: string}
+        url: {type: string, nullable: true}
+        transactions: {type: array, items: {type: string}}
+        psp_id: {type: string, nullable: true}
+        payload: {type: object, nullable: true, additionalProperties: {type: string}}
+    BillingOrder:
+      type: object
+      description: An order; amounts are decimal strings in the currency's minor units.
+      required:
+      - id
+      - customer_id
+      - origin
+      - status
+      - collection_owner
+      - collection_psp_id
+      - provider_bills
+      - number
+      - currency
+      - total
+      - lines
+      - payment
+      - payment_options
+      - pay_url
+      - pay_url_expires_at
+      - embedded
+      - success_url
+      - cancel_url
+      - saved_payment_methods
+      - renewal
+      - usage
+      - expires_at
+      - completed_at
+      - canceled_at
+      - expired_at
+      - voided_at
+      - uncollectible_at
+      - created_at
+      properties:
+        id: {type: string}
+        customer_id: {type: string}
+        origin: {type: string}
+        status: {type: string}
+        collection_owner: {type: string}
+        collection_psp_id: {type: string, nullable: true}
+        provider_bills:
+          type: array
+          items: {$ref: '#/components/schemas/BillingOrderProviderBill'}
+        number: {type: integer, format: int64, nullable: true}
+        currency: {type: string}
+        total: {type: string}
+        lines: {type: array, items: {$ref: '#/components/schemas/BillingOrderLine'}}
+        payment: {$ref: '#/components/schemas/BillingOrderPayment'}
+        payment_options:
+          type: array
+          items: {$ref: '#/components/schemas/BillingOrderPaymentOption'}
+        pay_url: {type: string, nullable: true}
+        pay_url_expires_at: {type: string, format: date-time, nullable: true}
+        embedded: {type: boolean}
+        success_url: {type: string, nullable: true}
+        cancel_url: {type: string, nullable: true}
+        saved_payment_methods: {type: boolean}
+        renewal:
+          nullable: true
+          allOf: [{$ref: '#/components/schemas/BillingOrderRenewal'}]
+        usage: {nullable: true, allOf: [{$ref: '#/components/schemas/BillingOrderUsage'}]}
+        expires_at: {type: string, format: date-time, nullable: true}
+        completed_at: {type: string, format: date-time, nullable: true}
+        canceled_at: {type: string, format: date-time, nullable: true}
+        expired_at: {type: string, format: date-time, nullable: true}
+        voided_at: {type: string, format: date-time, nullable: true}
+        uncollectible_at: {type: string, format: date-time, nullable: true}
+        created_at: {type: string, format: date-time}
+    BillingOrderLine:
+      type: object
+      required:
+      - id
+      - price_id
+      - product_id
+      - source
+      - description
+      - quantity
+      - unit_amount
+      - amount
+      - ownership
+      - billing_interval_hours
+      - access_duration_hours
+      - subscription_id
+      - product_access_id
+      properties:
+        id: {type: string}
+        price_id: {type: string, nullable: true}
+        product_id: {type: string, nullable: true}
+        source: {type: string, nullable: true}
+        description: {type: string}
+        quantity: {type: integer, format: int64, nullable: true}
+        unit_amount: {type: string}
+        amount: {type: string}
+        ownership: {type: string, nullable: true}
+        billing_interval_hours: {type: integer, format: int64, nullable: true}
+        access_duration_hours: {type: integer, format: int64, nullable: true}
+        subscription_id: {type: string, nullable: true}
+        product_access_id: {type: string, nullable: true}
+    BillingOrderLineParams:
+      type: object
+      properties:
+        price_id: {type: string}
+        quantity: {type: integer, format: int64}
+        amount:
+          type: string
+          description: A decimal string; the amount of a customer-priced line.
+    BillingOrderPayUrlParams: {type: object, properties: {embedded: {type: boolean}}}
+    BillingOrderPayment:
+      type: object
+      required: [status, next_action, last_payment_error, payment_method_id, payment_id]
+      properties:
+        status: {type: string}
+        next_action: {nullable: true, allOf: [{$ref: '#/components/schemas/BillingNextAction'}]}
+        last_payment_error:
+          nullable: true
+          allOf: [{$ref: '#/components/schemas/BillingPaymentFailure'}]
+        payment_method_id: {type: string, nullable: true}
+        payment_id: {type: string, nullable: true}
+    BillingOrderPaymentOption:
+      type: object
+      required: [psp_id, rail, accepts, failed_attempts]
+      properties:
+        saved_payment_method_ids: {type: array, items: {type: string}}
+        psp_id: {type: string}
+        rail: {type: string}
+        accepts: {type: array, items: {type: string}}
+        failed_attempts: {type: integer, format: int64}
+    BillingOrderPaymentParams:
+      type: object
+      description: Exactly one of a saved card, a new card token, a wallet token symbol or a hosted page's return_url.
+      properties:
+        payment_method_id: {type: string}
+        token: {type: string}
+        psp_id: {type: string}
+        billing_details: {$ref: '#/components/schemas/BillingDetails'}
+        token_symbol: {type: string}
+        return_url: {type: string}
+    BillingOrderProviderBill:
+      type: object
+      required: [psp_id, kind, reference, settlement_source, non_cash_amount, settled_at]
+      properties:
+        psp_id: {type: string}
+        kind: {type: string}
+        reference: {type: string}
+        settlement_source: {type: string, nullable: true}
+        non_cash_amount: {type: string}
+        settled_at: {type: string, format: date-time, nullable: true}
+    BillingOrderRenewal:
+      type: object
+      required: [subscription_id, period_starts_at, period_ends_at, due_at]
+      properties:
+        subscription_id: {type: string}
+        period_starts_at: {type: string, format: date-time}
+        period_ends_at: {type: string, format: date-time}
+        due_at: {type: string, format: date-time}
+    BillingOrderUsage:
+      type: object
+      required:
+      - period_starts_at
+      - period_ends_at
+      - due_at
+      - amount_paid
+      - amount_due
+      - collection_method
+      - next_collection_attempt_at
+      - po_number
+      - memo
+      - tax
+      - billing_contacts
+      - delinquent
+      properties:
+        period_starts_at: {type: string, format: date-time}
+        period_ends_at: {type: string, format: date-time}
+        due_at: {type: string, format: date-time}
+        amount_paid: {type: string}
+        amount_due: {type: string}
+        collection_method: {type: string}
+        next_collection_attempt_at: {type: string, format: date-time, nullable: true}
+        po_number: {type: string, nullable: true}
+        memo: {type: string, nullable: true}
+        tax: {type: object, nullable: true, additionalProperties: {}}
+        billing_contacts: {type: array, items: {$ref: '#/components/schemas/BillingInvoiceContact'}}
+        delinquent: {type: boolean}
+    BillingPayOrderRequest:
+      type: object
+      properties:
+        payment: {$ref: '#/components/schemas/BillingOrderPaymentParams'}
+        expected_total:
+          type: string
+          description: The order's total as the caller read it, a decimal string.
+        reusable: {type: boolean}
+    BillingPaymentFailure:
+      type: object
+      required: [reason, message]
+      properties:
+        reason: {type: string}
+        message: {type: string}
+        field: {type: string}
+    CatalogRelease:
+      type: object
+      required: [release]
+      properties:
+        release: {type: string}
+        cut_at: {type: string, format: date-time}
+        revision:
+          type: integer
+          format: int64
+          description: Absent before the release's first revision.
+        yanked: {type: boolean}
+        yanked_at: {type: string, format: date-time}
+    CheckpointAssessment:
+      type: object
+      required: [report_digest, created_at]
+      properties:
+        report_digest: {type: string}
+        created_at: {type: string, format: date-time}
+        categories: {type: object, additionalProperties: {type: string}}
+        kernel_symbol: {type: string}
+    CheckpointDocument:
+      type: object
+      description: A CozyTensors manifest document, or {"held":true} to a publishing run.
+    CheckpointRemoval:
+      type: object
+      required: [checkpoint_id, repository_sha256, removed]
+      properties:
+        checkpoint_id: {type: string}
+        repository_sha256: {type: string}
+        removed: {type: boolean}
+    CreditDeposit:
+      type: object
+      description: The credit deposit as the catalog sells it; amounts are micros of USD as decimal strings.
+      required: [price_id, min_amount, max_amount]
+      properties:
+        price_id: {type: string}
+        min_amount: {type: string}
+        max_amount: {type: string}
+    CreditResponse:
+      type: object
+      required: [credit]
+      properties:
+        credit: {nullable: true, allOf: [{$ref: '#/components/schemas/CreditStatus'}]}
+    CreditStatus:
+      type: object
+      description: Net balance (balance less holds and debt) against the warning and the overdraft floor, in micros
+        of USD.
+      required:
+      - available_usd_micros
+      - warning_usd_micros
+      - floor_usd_micros
+      - burn_usd_micros_per_hour
+      - as_of
+      - depletes_at
+      properties:
+        available_usd_micros: {type: integer, format: int64}
+        warning_usd_micros: {type: integer, format: int64}
+        floor_usd_micros: {type: integer, format: int64}
+        burn_usd_micros_per_hour:
+          type: integer
+          format: int64
+          description: What running rentals charge an hour together.
+        as_of: {type: string, format: date-time}
+        depletes_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: When the burn reaches the floor; null with nothing charging.
+    DeclaredObject:
+      type: object
+      required: [object_id, length]
+      properties:
+        object_id: {type: string}
+        length: {type: integer, format: int64}
+    Empty: {type: object, description: An empty JSON object.}
+    Error:
+      type: object
+      required: [error]
+      properties: {error: {$ref: '#/components/schemas/ErrorDetail'}}
+    ErrorDetail:
+      type: object
+      required: [code, message, remedy]
+      properties:
+        code: {type: string}
+        message: {type: string}
+        remedy: {type: string}
+    ExactDocument:
+      type: object
+      required: [canonical_bytes, digest, length]
+      properties:
+        canonical_bytes: {type: string, format: byte}
+        digest: {type: string}
+        length: {type: integer, format: int64}
+    ExecutionEnvironment:
+      type: object
+      required: [environment]
+      properties:
+        environment:
+          type: object
+          required: [TENSORHUB_ORIGIN, TENSORHUB_PUBLIC_ORIGIN]
+          properties:
+            TENSORHUB_ORIGIN: {type: string}
+            TENSORHUB_PUBLIC_ORIGIN: {type: string}
+            TENSORHUB_OBJECT_STORAGE_HOSTS:
+              type: string
+              description: Comma-separated object storage hosts presigned URLs name.
+    ModelCard:
+      type: object
+      required: [model, releases, throughput]
+      properties:
+        model: {$ref: '#/components/schemas/ModelSummary'}
+        releases: {type: array, items: {$ref: '#/components/schemas/ModelCatalogRelease'}}
+        throughput: {type: array, items: {$ref: '#/components/schemas/ModelThroughput'}}
+    ModelCatalogRelease:
+      type: object
+      required: [release, lanes]
+      properties:
+        release: {type: string}
+        cut_at: {type: string, format: date-time}
+        revision: {type: integer, format: int64}
+        yanked: {type: boolean}
+        yanked_at: {type: string, format: date-time}
+        lanes: {type: array, items: {$ref: '#/components/schemas/ModelLane'}}
+    ModelDeletion:
+      type: object
+      required: [model, checkpoints, reclaimable_objects, reclaimable_bytes]
+      properties:
+        model: {type: string}
+        checkpoints: {type: integer, format: int64}
+        reclaimable_objects: {type: integer, format: int64}
+        reclaimable_bytes: {type: integer, format: int64}
+    ModelFamilyUpdate:
+      type: object
+      required: [family]
+      properties:
+        family: {type: string, description: A discovery family label; empty clears it.}
+    ModelFinalization:
+      type: object
+      required: [operation, state, status_url]
+      properties:
+        operation: {type: string}
+        state: {type: string}
+        status_url: {type: string}
+        result: {description: 'The finalized checkpoint, once committed.'}
+        error: {description: Why the finalization failed.}
+    ModelLane:
+      type: object
+      required: [lane, manifest_id, manifest_length, components, objects, bytes]
+      properties:
+        lane: {type: string}
+        manifest_id: {type: string}
+        manifest_length: {type: integer, format: int64}
+        components: {type: array, nullable: true, items: {type: string}}
+        component_bytes: {type: object, additionalProperties: {type: integer, format: int64}}
+        assessment: {$ref: '#/components/schemas/CheckpointAssessment'}
+        objects: {type: integer, format: int64}
+        bytes: {type: integer, format: int64}
+    ModelLaneRetarget:
+      type: object
+      required: [checkpoint_id]
+      properties: {checkpoint_id: {type: string}}
+    ModelRelease:
+      type: object
+      required: [release, revision, yanked, lanes, changed, repository_sha256]
+      properties:
+        release: {type: string}
+        revision: {type: integer, format: int64}
+        yanked: {type: boolean}
+        lanes:
+          type: array
+          nullable: true
+          items: {$ref: '#/components/schemas/ModelReleaseLane'}
+        changed: {type: boolean}
+        repository_sha256: {type: string}
+    ModelReleaseLane:
+      type: object
+      required: [lane, checkpoint_id, objects, bytes]
+      properties:
+        lane: {type: string}
+        checkpoint_id: {type: string}
+        objects: {type: integer, format: int64}
+        bytes: {type: integer, format: int64}
+    ModelReleaseUpdate:
+      type: object
+      required: [expected_revision]
+      properties:
+        expected_revision: {type: integer, format: int64, minimum: 0}
+        set_lanes:
+          type: object
+          description: Lane name to checkpoint id.
+          additionalProperties: {type: string}
+        remove_lanes: {type: array, items: {type: string}}
+    ModelResolution:
+      type: object
+      required: [model, manifest_id, header_digest, encodings, components, objects, bytes]
+      properties:
+        model: {type: string}
+        release: {type: string}
+        lane: {type: string}
+        manifest_id: {type: string}
+        manifest_length: {type: integer, format: int64}
+        header_digest: {type: string}
+        encodings: {type: array, nullable: true, items: {type: string}}
+        components: {type: array, nullable: true, items: {type: string}}
+        component_bytes: {type: object, additionalProperties: {type: integer, format: int64}}
+        assessment: {$ref: '#/components/schemas/CheckpointAssessment'}
+        objects: {type: integer, format: int64}
+        bytes: {type: integer, format: int64}
+    ModelSearch:
+      type: object
+      required: [models, search]
+      properties:
+        models: {type: array, items: {$ref: '#/components/schemas/ModelSummary'}}
+        search: {$ref: '#/components/schemas/SearchMeta'}
+    ModelSummary:
+      type: object
+      required: [org, name, created_at]
+      properties:
+        org: {type: string}
+        name: {type: string}
+        family: {type: string}
+        created_at: {type: string, format: date-time}
+    ModelSummaryAnswer:
+      type: object
+      required: [model]
+      properties: {model: {$ref: '#/components/schemas/ModelSummary'}}
+    ModelThroughput:
+      type: object
+      required:
+      - model
+      - release
+      - lane
+      - sku
+      - accelerator_count
+      - workload
+      - payload_sha256
+      - runs
+      - median_s
+      - min_s
+      - max_s
+      - prepare_s
+      - runtime_version
+      - worker_image_digest
+      - measured_at
+      - operator
+      properties:
+        model: {type: string}
+        release: {type: string}
+        lane: {type: string}
+        sku: {type: string}
+        accelerator_count: {type: integer, format: int64}
+        workload: {type: string}
+        payload_sha256: {type: string}
+        runs: {type: integer, format: int64}
+        median_s: {type: number, format: double}
+        min_s: {type: number, format: double}
+        max_s: {type: number, format: double}
+        prepare_s: {type: number, format: double}
+        runtime_version: {type: string}
+        worker_image_digest: {type: string}
+        measured_at: {type: string, format: date-time}
+        operator: {type: string}
+    ModelThroughputs:
+      type: object
+      required: [model, throughput]
+      properties:
+        model: {type: string}
+        throughput: {type: array, items: {$ref: '#/components/schemas/ModelThroughput'}}
+    OAuthError:
+      type: object
+      description: The authorization server's OAuth error (RFC 6749 section 5.2).
+      required: [error, error_description]
+      properties:
+        error: {type: string}
+        error_description: {type: string}
+        reason:
+          type: string
+          description: A stable cause beside the code, when one is known.
+    PackageCard:
+      type: object
+      required: [package, releases]
+      properties:
+        package: {$ref: '#/components/schemas/PackageSummary'}
+        releases: {type: array, items: {$ref: '#/components/schemas/CatalogRelease'}}
+    PackageDeclaredFile:
+      type: object
+      required: [digest, length, path]
+      properties:
+        digest: {type: string}
+        length: {type: integer, format: int64}
+        path: {type: string}
+    PackageFileGrant:
+      type: object
+      required: [digest, length, path, present]
+      properties:
+        digest: {type: string}
+        length: {type: integer, format: int64}
+        path: {type: string}
+        present: {type: boolean, description: The Hub already holds these bytes.}
+        upload: {$ref: '#/components/schemas/PresignedUpload'}
+    PackageFinalization:
+      type: object
+      required: [publication_id, state, status_url]
+      properties:
+        publication_id: {type: string}
+        state: {type: string, description: 'queued, running, committed or failed.'}
+        status_url: {type: string}
+        error: {description: Why the finalization failed.}
+        warnings: {type: array, items: {type: string}}
+    PackageInstallFile:
+      type: object
+      required: [digest, distribution, import_roots, kind, length, path, tags, url, version]
+      properties:
+        digest: {type: string}
+        distribution: {type: string}
+        import_roots: {type: array, nullable: true, items: {type: string}}
+        kind: {type: string}
+        length: {type: integer, format: int64}
+        path: {type: string}
+        tags: {type: array, nullable: true, items: {type: string}}
+        url: {type: string}
+        version: {type: string}
+    PackageInstallPlan:
+      type: object
+      required: [downloads, package_config, package_interface, pyproject, release, uv_lock]
+      properties:
+        python_version: {type: string}
+        downloads: {type: array, items: {$ref: '#/components/schemas/PackageInstallFile'}}
+        package_config: {$ref: '#/components/schemas/ExactDocument'}
+        package_interface: {$ref: '#/components/schemas/ExactDocument'}
+        pyproject: {$ref: '#/components/schemas/ExactDocument'}
+        release: {type: string}
+        uv_lock: {$ref: '#/components/schemas/ExactDocument'}
+    PackageRegistryPin:
+      type: object
+      required: [name, sha256, size, url, version]
+      properties:
+        name: {type: string}
+        sha256: {type: string}
+        size: {type: integer, format: int64}
+        url: {type: string}
+        version: {type: string}
+    PackageRelease:
+      type: object
+      required: [release, package_interface, requirements, requires_python, python_version]
+      properties:
+        release: {$ref: '#/components/schemas/PackageReleaseSummary'}
+        package_interface: {description: The release's package interface document.}
+        requirements: {type: array, items: {type: string}}
+        requires_python: {type: string}
+        python_version: {type: string}
+    PackageReleaseDeclaration:
+      type: object
+      required: [files]
+      properties:
+        files: {type: array, items: {$ref: '#/components/schemas/PackageDeclaredFile'}}
+    PackageReleaseFinalize:
+      type: object
+      required: [publication_id]
+      properties:
+        publication_id: {type: string}
+        python_version: {type: string}
+        registry:
+          type: array
+          nullable: true
+          items: {$ref: '#/components/schemas/PackageRegistryPin'}
+    PackageReleaseGrants:
+      type: object
+      required: [files, publication_id]
+      properties:
+        files: {type: array, items: {$ref: '#/components/schemas/PackageFileGrant'}}
+        publication_id: {type: string}
+    PackageReleaseSummary:
+      type: object
+      required: [release, package_interface_digest, package_interface_length, created_at]
+      properties:
+        release: {type: string}
+        package_interface_digest: {type: string}
+        package_interface_length: {type: integer, format: int64}
+        created_at: {type: string, format: date-time}
+        committed_at: {type: string, format: date-time}
+        yanked: {type: boolean}
+        yanked_at: {type: string, format: date-time}
+    PackageSearch:
+      type: object
+      required: [packages, search]
+      properties:
+        packages: {type: array, items: {$ref: '#/components/schemas/PackageSummary'}}
+        search: {$ref: '#/components/schemas/SearchMeta'}
+    PackageSummary:
+      type: object
+      required: [org, name, created_at]
+      properties:
+        org: {type: string}
+        name: {type: string}
+        created_at: {type: string, format: date-time}
+        latest_release: {type: string, description: The newest committed release that is not yanked.}
+    PackageYank:
+      type: object
+      required: [changed, release, state, yanked_at]
+      properties:
+        changed: {type: boolean}
+        release: {type: string}
+        state: {type: string}
+        yanked_at: {type: string, format: date-time}
+    PresignedUpload:
+      type: object
+      required: [url, required_headers]
+      properties:
+        url: {type: string}
+        required_headers: {type: object, additionalProperties: {type: string}}
+    Publication:
+      type: object
+      required: [operation, state, objects]
+      properties:
+        operation: {type: string}
+        state: {type: string}
+        objects: {type: array, items: {$ref: '#/components/schemas/PublicationObject'}}
+    PublicationAnswer:
+      type: object
+      required: [publication]
+      properties: {publication: {$ref: '#/components/schemas/Publication'}}
+    PublicationDeclaration:
+      type: object
+      required: [objects]
+      properties:
+        objects: {type: array, items: {$ref: '#/components/schemas/DeclaredObject'}}
+    PublicationFinalize:
+      type: object
+      required: [manifest_id, manifest_length]
+      properties:
+        manifest_id: {type: string}
+        manifest_length: {type: integer, format: int64}
+    PublicationGrant:
+      type: object
+      required: [object_id, length, url, expires_at_unix]
+      properties:
+        object_id: {type: string}
+        length: {type: integer, format: int64}
+        url: {type: string}
+        required_headers: {type: object, additionalProperties: {type: string}}
+        expires_at_unix:
+          type: integer
+          format: int64
+          description: On the Hub's clock; compare to server_time_unix.
+    PublicationGrants:
+      type: object
+      required: [grants, held, server_time_unix]
+      properties:
+        grants:
+          type: array
+          nullable: true
+          items: {$ref: '#/components/schemas/PublicationGrant'}
+        held:
+          type: array
+          nullable: true
+          items: {$ref: '#/components/schemas/PublicationHeldObject'}
+        server_time_unix: {type: integer, format: int64}
+    PublicationHeldObject:
+      type: object
+      required: [transfer_id, object_id, length, state]
+      properties:
+        transfer_id: {type: string}
+        object_id: {type: string}
+        length: {type: integer, format: int64}
+        state: {type: string}
+        refusal_code: {type: string}
+        refusal_detail: {type: string}
+    PublicationObject:
+      type: object
+      required: [object_id, length, state]
+      properties:
+        object_id: {type: string}
+        length: {type: integer, format: int64}
+        state: {type: string, description: 'pending, verifying, accepted or refused.'}
+    PublicationObjectIds:
+      type: object
+      required: [object_ids]
+      properties: {object_ids: {type: array, items: {type: string}}}
+    PublicationOpened:
+      type: object
+      required: [created, publication]
+      properties:
+        created: {type: boolean}
+        publication: {$ref: '#/components/schemas/Publication'}
+    Rental:
+      type: object
+      description: One rental. Provider facts are present for an admin only.
+      required:
+      - rental_id
+      - name
+      - state
+      - requested_accelerator_model
+      - accelerator_count
+      - creator_public_key
+      - base_worker_image_digest
+      - hourly_rate_usd_micros
+      - spend_usd_micros
+      - spend_basis
+      - container_disk_gb
+      - created_at
+      properties:
+        development: {type: boolean}
+        ssh_address: {type: string}
+        rental_id: {type: string}
+        name: {type: string}
+        state: {type: string}
+        requested_accelerator_model: {type: string}
+        provider: {type: string}
+        provider_machine_id: {type: string}
+        machine_name: {type: string}
+        provider_resource_id: {type: string}
+        accelerator_count: {type: integer, format: int64}
+        worker_address: {type: string}
+        worker_id: {type: string}
+        worker_boot_id: {type: string}
+        media_address: {type: string}
+        cert_pem: {type: string}
+        media_token_sha256: {type: array, items: {type: string}}
+        creator_public_key: {type: string}
+        base_worker_image_digest: {type: string}
+        base_worker_image_tag: {type: string}
+        base_worker_profile: {type: string}
+        hourly_rate_usd_micros: {type: integer, format: int64}
+        compute_usd_micros_per_hour: {type: integer, format: int64}
+        storage_usd_micros_per_hour: {type: integer, format: int64}
+        bandwidth_usd_micros_per_gb: {type: integer, format: int64}
+        placement_price: {$ref: '#/components/schemas/RentalPriceEstimate'}
+        vcpu_count: {type: integer, format: int64}
+        memory_gb: {type: integer, format: int64}
+        spend_usd_micros: {type: integer, format: int64}
+        spend_basis: {type: string}
+        provider_cost_usd_micros: {type: integer, format: int64}
+        provider_cost_basis: {type: string}
+        container_disk_gb: {type: integer, format: int64}
+        created_at: {type: string, format: date-time}
+        ended_at: {type: string, format: date-time}
+        release_cause: {type: string}
+        detail: {type: string}
+        failure: {$ref: '#/components/schemas/RentalFailure'}
+        provider_refusal: {type: string}
+        boot: {$ref: '#/components/schemas/RentalBoot'}
+        unreachable_since: {type: string, format: date-time}
+        webrtc: {$ref: '#/components/schemas/RentalWebRtc'}
+    RentalBoot:
+      type: object
+      description: The current attempt's boot, while it is acquired.
+      required: [attempt, state, runtime_observed, observed_at]
+      properties:
+        pull: {$ref: '#/components/schemas/RentalImagePull'}
+        attempt: {type: integer, format: int64}
+        state: {type: string}
+        datacenter: {type: string}
+        container: {type: string}
+        runtime_observed: {type: boolean}
+        phase: {type: string}
+        phase_started_at: {type: string, format: date-time}
+        activity: {type: string}
+        started_at: {type: string, format: date-time}
+        last_progress_at: {type: string, format: date-time}
+        boot_log_at: {type: string, format: date-time}
+        observed_at: {type: string, format: date-time}
+        replanned_from: {$ref: '#/components/schemas/RentalReplannedBoot'}
+    RentalDevelopment:
+      type: object
+      required: [ssh_public_key]
+      properties: {ssh_public_key: {type: string, maxLength: 8192}}
+    RentalFailure:
+      type: object
+      required: [code, base_worker_image_digest]
+      properties:
+        code: {type: string}
+        base_worker_image_digest: {type: string}
+        provider: {type: string}
+        provider_resource_id: {type: string}
+        provider_host_id: {type: string}
+        provider_state: {type: string}
+        container_state: {type: string}
+    RentalImagePull:
+      type: object
+      description: The image pull as the provider's boot log measured it.
+      required:
+      - observable
+      - layers_observed
+      - layers_complete
+      - layers_failing
+      - download_bytes
+      - download_total_bytes
+      - extract_bytes
+      - extract_total_bytes
+      - estimate_scope
+      properties:
+        observable: {type: boolean}
+        layers_observed: {type: integer, format: int64}
+        layers_complete: {type: integer, format: int64}
+        layers_failing: {type: integer, format: int64}
+        download_bytes: {type: integer, format: int64}
+        download_total_bytes: {type: integer, format: int64}
+        download_bytes_per_second: {type: number, format: double}
+        extract_bytes: {type: integer, format: int64}
+        extract_total_bytes: {type: integer, format: int64}
+        extract_bytes_per_second: {type: number, format: double}
+        remaining_seconds: {type: number, format: double}
+        estimate_scope: {type: string}
+        last_measured_at: {type: string, format: date-time}
+    RentalListing:
+      type: object
+      required: [rentals, bindings_revision, credit]
+      properties:
+        rentals: {type: array, items: {$ref: '#/components/schemas/Rental'}}
+        bindings_revision: {type: integer, format: int64}
+        credit:
+          description: Null for an unmetered account, or when billing cannot be read now.
+          nullable: true
+          allOf: [{$ref: '#/components/schemas/CreditStatus'}]
+    RentalPriceEstimate:
+      type: object
+      description: What a rental is expected to cost at its prices, for the expected hours plus its download.
+      required:
+      - hours
+      - download_gb
+      - download_hours
+      - gpu_usd_micros
+      - disk_usd_micros
+      - download_usd_micros
+      - total_usd_micros
+      properties:
+        hours: {type: number, format: double}
+        download_gb: {type: integer, format: int64}
+        download_mbps: {type: integer, format: int64}
+        download_hours: {type: number, format: double}
+        gpu_usd_micros: {type: integer, format: int64}
+        disk_usd_micros: {type: integer, format: int64}
+        download_usd_micros: {type: integer, format: int64}
+        total_usd_micros: {type: integer, format: int64}
+    RentalPythonInterpreter:
+      type: object
+      required: [version, abi]
+      properties: {version: {type: string}, abi: {type: string}}
+    RentalQuote:
+      type: object
+      description: The product (with every width buyable now) and the one width the request would lock.
+      required:
+      - name
+      - accelerator_model
+      - base_worker_profile
+      - compute_capability
+      - vram_gb
+      - widths
+      - accelerator_count
+      - price_usd_micros_per_hour
+      - storage_usd_micros_per_hour
+      - container_disk_gb
+      - expected_price
+      properties:
+        excluded_provider_machines:
+          type: array
+          description: Echoed for an admin's ask only.
+          items: {type: string}
+        python_provisionable_minors: {type: array, items: {type: string}}
+        python_interpreters:
+          type: array
+          items: {$ref: '#/components/schemas/RentalPythonInterpreter'}
+        name: {type: string}
+        accelerator_model: {type: string}
+        base_worker_profile: {type: string}
+        compute_capability: {type: string}
+        vram_gb: {type: integer, format: int64}
+        widths: {type: array, items: {$ref: '#/components/schemas/RentalSkuWidth'}}
+        accelerator_count: {type: integer, format: int64}
+        price_usd_micros_per_hour: {type: integer, format: int64}
+        storage_usd_micros_per_hour: {type: integer, format: int64}
+        bandwidth_usd_micros_per_gb: {type: integer, format: int64}
+        container_disk_gb: {type: integer, format: int64}
+        vcpu_count: {type: integer, format: int64}
+        memory_gb: {type: integer, format: int64}
+        expected_price: {$ref: '#/components/schemas/RentalPriceEstimate'}
+    RentalReplannedBoot:
+      type: object
+      description: The failed attempt the current one replaced.
+      required: [attempt, started_at, ended_at, failure_code]
+      properties:
+        attempt: {type: integer, format: int64}
+        datacenter: {type: string}
+        started_at: {type: string, format: date-time}
+        ended_at: {type: string, format: date-time}
+        failure_code: {type: string}
+        limit_ms: {type: integer, format: int64}
+        observed_max_ms: {type: integer, format: int64}
+    RentalRequest:
+      type: object
+      description: A rental's product intent; a quote takes the same body.
+      required: [name, sku, media_token_sha256, creator_public_key]
+      properties:
+        development: {$ref: '#/components/schemas/RentalDevelopment'}
+        name:
+          type: string
+          description: 1-32 lowercase letters, digits and hyphens, beginning with a letter.
+        sku: {type: string, description: A product name from GET /v1/rental-skus.}
+        provider:
+          type: string
+          description: An admin's provider choice; refused from anyone else.
+        excluded_provider_machines:
+          type: array
+          description: An admin's excluded provider machines; refused from anyone else.
+          items: {type: string}
+        image:
+          type: string
+          maxLength: 512
+          description: A registered worker image (digest, tag, reference or kind) in place of the default.
+        accelerator_count:
+          type: integer
+          format: int64
+          minimum: 0
+          description: GPU count; 0 or omitted is 1.
+        media_token_sha256:
+          type: string
+          description: SHA-256 of the Creator-minted media token, 64 lowercase hex.
+        creator_public_key:
+          type: string
+          description: The rental's Ed25519 public key, unpadded base64url.
+        planned_source_bytes: {type: integer, format: int64, minimum: 0}
+        serving_models:
+          type: array
+          maxItems: 32
+          items: {$ref: '#/components/schemas/RentalServingModel'}
+        container_disk_gb: {type: integer, format: int64, minimum: 0, maximum: 4096}
+    RentalServingModel:
+      type: object
+      required: [model]
+      properties:
+        lane: {type: string}
+        manifest: {type: string}
+        model: {type: string}
+        release: {type: string}
+    RentalSku:
+      type: object
+      description: One product (a GPU card, or the CPU machine) with the widths buyable now.
+      required:
+      - name
+      - accelerator_model
+      - base_worker_profile
+      - compute_capability
+      - vram_gb
+      - widths
+      properties:
+        python_provisionable_minors: {type: array, items: {type: string}}
+        python_interpreters:
+          type: array
+          items: {$ref: '#/components/schemas/RentalPythonInterpreter'}
+        name: {type: string}
+        accelerator_model: {type: string, description: 'The GPU model, or CPU.'}
+        base_worker_profile: {type: string}
+        compute_capability: {type: string, description: major.minor; empty for the CPU product.}
+        vram_gb: {type: integer, format: int64}
+        widths:
+          type: array
+          description: The GPU counts buyable now, ascending.
+          items: {$ref: '#/components/schemas/RentalSkuWidth'}
+    RentalSkuList: {type: array, items: {$ref: '#/components/schemas/RentalSku'}}
+    RentalSkuStatus:
+      type: object
+      description: One (product, GPU count)'s standing.
+      required: [name, accelerator_count, known, offered]
+      properties:
+        name: {type: string}
+        accelerator_count: {type: integer, format: int64}
+        known: {type: boolean, description: This hub sells a product of that name.}
+        offered: {type: boolean, description: Buyable now at that count.}
+        sku: {$ref: '#/components/schemas/RentalSku'}
+        last_seen_at:
+          type: string
+          format: date-time
+          description: When that count was last buyable; absent when offered now or never seen.
+        unavailable_reason:
+          type: string
+          description: Why compatible stock is held back (cooldown, retry_in_progress).
+        retry_after: {type: string, format: date-time}
+    RentalSkuWidth:
+      type: object
+      description: One buyable GPU count of a product and its per-machine prices.
+      required:
+      - accelerator_count
+      - price_usd_micros_per_hour
+      - storage_usd_micros_per_hour
+      - container_disk_gb
+      - expected_price
+      properties:
+        accelerator_count: {type: integer, format: int64}
+        price_usd_micros_per_hour: {type: integer, format: int64}
+        storage_usd_micros_per_hour: {type: integer, format: int64}
+        bandwidth_usd_micros_per_gb:
+          type: integer
+          format: int64
+          description: The most a GB of traffic costs, where the provider bills traffic.
+        container_disk_gb: {type: integer, format: int64}
+        vcpu_count: {type: integer, format: int64}
+        memory_gb: {type: integer, format: int64}
+        expected_price: {$ref: '#/components/schemas/RentalPriceEstimate'}
+    RentalWebRtc:
+      type: object
+      description: A ready machine rental's browser-media listener.
+      required: [address, fingerprint]
+      properties: {address: {type: string}, fingerprint: {type: string}}
+    SearchMeta:
+      type: object
+      required: [total, limit, capped]
+      properties:
+        total: {type: integer, format: int64}
+        limit: {type: integer, format: int64}
+        capped: {type: boolean, description: More matched than the answer holds.}
+    Software:
+      type: object
+      required: [runtime, tensorfs, pinned]
+      properties:
+        runtime: {type: string}
+        tensorfs: {type: string}
+        pinned:
+          type: boolean
+          description: The version is the operator's pin, not the current worker image's.
+    TensorfsClosure:
+      type: object
+      required:
+      - bytes
+      - complete
+      - lane
+      - manifest
+      - model
+      - objects
+      - presign_max_digests
+      - public
+      - release
+      - scope
+      - server_time_unix
+      properties:
+        bytes:
+          type: integer
+          format: int64
+          description: The whole closure's length, manifest included.
+        complete:
+          type: boolean
+          description: False when more object rows follow; ask again with after.
+        lane: {type: string}
+        manifest: {$ref: '#/components/schemas/TensorfsObject'}
+        model: {type: string}
+        objects:
+          type: array
+          description: This page's objects, sorted by digest, the manifest excluded.
+          items: {$ref: '#/components/schemas/TensorfsObject'}
+        presign_max_digests:
+          type: integer
+          format: int64
+          description: The most digests one presign call may ask for.
+        public: {type: boolean, description: Every object is a live release's.}
+        release: {type: string}
+        scope: {type: string}
+        server_time_unix: {type: integer, format: int64}
+    TensorfsClosureRequest:
+      type: object
+      required: [ref]
+      properties:
+        ref:
+          type: string
+          description: org/name[@release][@sha256:<hex>]; a bare checkpoint hash is its owner's only.
+        lane: {type: string}
+        lanes:
+          type: array
+          maxItems: 8
+          description: Lanes in order of preference; not beside lane.
+          items: {type: string}
+        after:
+          type: string
+          description: The previous page's last object digest, bare hex; omitted on the first page.
+        limit:
+          type: integer
+          format: int64
+          minimum: 0
+          description: At most this many objects; the hub's page size when omitted or larger.
+    TensorfsError:
+      type: object
+      description: The TensorFS routes' refusal envelope, on the hub's clock.
+      required: [error, server_time_unix]
+      properties:
+        error: {$ref: '#/components/schemas/TensorfsErrorDetail'}
+        retry_after_unix:
+          type: integer
+          format: int64
+          description: When to send the same request again, where waiting is the remedy.
+        server_time_unix: {type: integer, format: int64}
+    TensorfsErrorDetail:
+      type: object
+      required: [code, message]
+      properties:
+        code: {type: string}
+        message: {type: string}
+        remedy: {type: string}
+    TensorfsObject:
+      type: object
+      required: [length, sha256]
+      properties:
+        length: {type: integer, format: int64}
+        sha256: {type: string, description: Bare lowercase hex.}
+    TensorfsPresign:
+      type: object
+      required: [expires_at_unix, server_time_unix, urls]
+      properties:
+        expires_at_unix: {type: integer, format: int64}
+        server_time_unix: {type: integer, format: int64}
+        urls:
+          type: object
+          description: Bare hex digest to its presigned URL.
+          additionalProperties: {type: string}
+    TensorfsPresignRequest:
+      type: object
+      required: [digests]
+      properties:
+        digests:
+          type: array
+          minItems: 1
+          description: SHA-256 digests (bare hex, any case or order, sha256 prefix allowed); at most presign_max_digests.
+          items: {type: string}
+    WorkerAuthorizedKeys:
+      type: object
+      required: [worker_id, authorized_keys, lease_seconds]
+      properties:
+        worker_id: {type: string}
+        authorized_keys:
+          type: array
+          description: Ed25519 public keys, unpadded base64url, sorted.
+          items: {type: string}
+        lease_seconds:
+          type: integer
+          format: int64
+          description: How long the keys may be trusted before asking again.
+    WorkerEndpointReport:
+      type: object
+      required: [public_host, ports]
+      properties:
+        public_host: {type: string, description: The machine's public IP.}
+        ports:
+          type: object
+          description: Private TCP port (a decimal string) to its public port.
+          minProperties: 1
+          maxProperties: 16
+          additionalProperties: {type: integer, format: int64, minimum: 1, maximum: 65535}
+    WorkerReleaseRequest:
+      type: object
+      required: [worker_id]
+      properties:
+        worker_id: {type: string, description: Equal to the X-Cozy-Worker-ID header.}
+  parameters:
+    Org: {name: org, in: path, required: true, schema: {type: string}}
+    Name: {name: name, in: path, required: true, schema: {type: string}}
+    Release: {name: release, in: path, required: true, schema: {type: string}}
+    Lane: {name: lane, in: path, required: true, schema: {type: string}}
+    Operation: {name: operation, in: path, required: true, schema: {type: string}}
+    Manifest: {name: manifest, in: path, required: true, schema: {type: string}}

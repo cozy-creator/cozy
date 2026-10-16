@@ -17,10 +17,13 @@ calcifer = { path = "crates/calcifer" }
 cozy-cli = { path = "crates/cozy-cli" }
 cozy-platform = { path = "crates/cozy-platform" }
 cozy-proto = { path = "crates/cozy-proto" }
+hub-client = { path = "crates/hub-client" }
 
 anstream = "1.0.0"
 anstyle = "1.0.14"
+aws-lc-rs = "1.18"
 base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["serde", "std"] }
 clap = { version = "4.6", features = ["derive"] }
 clap_complete = { version = "4.6.11", features = ["unstable-dynamic"] }
 comfy-table = "8.0.1"
@@ -31,16 +34,25 @@ hex = "0.4"
 hyper-util = { version = "0.1.21", default-features = false, features = ["tokio"] }
 libc = "0.2"
 nvml-wrapper = "0.13"
+openapiv3 = "2"
+prettyplease = "0.2"
+progenitor = { version = "0.15.1", default-features = false }
+progenitor-client = "0.15.1"
 prost = "0.14"
 protoc-bin-vendored = "3"
+quote = "1"
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
+reqwest = { version = "0.13", default-features = false, features = ["form", "http2", "json", "query", "rustls", "stream"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 rusqlite_migration = "2.6"
 rustls = { version = "0.23.46", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 serde = { version = "1", features = ["derive"] }
 serde_ignored = "0.1.14"
 serde_json = "1"
+serde_yaml = "0.9"
 sha2 = "0.10"
 supports-hyperlinks = "3.2.0"
+syn = "2"
 tempfile = "3"
 thiserror = "2"
 tokio = { version = "1.53", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
