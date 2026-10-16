@@ -1,922 +1,212 @@
-# Cozy
+# cozy
 
-Cozy is a local-first command-line application for generative media. It installs
-package code, downloads models, runs package callables on your machine or a private rented
-worker, and keeps your local execution records and outputs under your control.
+Run generative-media models on your own GPU, on a rented one, or on another computer you
+control. One binary: the `cozy` command, its background controller (Calcifer) and the machine
+agent (TensorD).
 
-The command is `cozy`.
+> **This build:** verbs marked *coming* are in the grammar but answer `not_ported`. Every
+> example here is from `cozy <verb> --help`.
 
 ## Install
 
-Linux and macOS, amd64 and arm64. Requires [uv](https://docs.astral.sh/uv/getting-started/installation/).
+```sh
+curl -LsSf https://github.com/cozy-creator/cozy/releases/latest/download/cozy-installer.sh | sh
+```
+
+```powershell
+irm https://github.com/cozy-creator/cozy/releases/latest/download/cozy-installer.ps1 | iex
+```
+
+Both put `cozy` in `~/.cozy/bin` (`%USERPROFILE%\.cozy\bin`) and on your PATH. No Python is
+needed to drive machines. Tab completion: `cozy completion bash|zsh|fish|powershell`, for
+example `source <(cozy completion zsh)` in `~/.zshrc`.
+
+`cozy update` replaces the binary with the newest release (`cozy update 0.9.1` picks one),
+after checking its checksum and GitHub attestation, then restarts Calcifer. Restarting Calcifer
+never stops work that a machine has accepted.
+
+## Sign in
 
 ```sh
-curl -fsSL https://github.com/cozy-creator/cozy/releases/latest/download/install.sh | sh
+cozy login you@example.com     # a code is emailed; type it when asked
+cozy whoami
+cozy logout                    # --everywhere also signs out your other computers
 ```
 
-The installer checks the release against its `SHA256SUMS`, puts `cozy` in `~/.local/bin` and, in
-its own uv tool environment, the host tool Cozy drives: `cozy-runtime`.
-`COZY_VERSION=v0.1.0` picks a release. Rerun it to upgrade: the new binary replaces the old by
-rename, so a running Calcifer keeps its binary and its work; the new one starts after the next
-`cozy down`; work in flight continues and the next command reattaches. From source: `go build -o ~/.local/bin/cozy .`
-(Go 1.26+; Windows: `scripts\install.ps1 -Binary .\cozy.exe`). Tab completion is installed
-automatically for bash and fish, and for zsh when `~/.local/share/zsh/site-functions` is on
-`fpath`; otherwise add `source <(cozy completion zsh)` to `~/.zshrc` after `compinit`.
-The host-tool step alone is:
-
-```sh
-uv tool install --force --refresh-package cozy-runtime --python 3.12 'cozy-runtime[media,model-execution]>=0.19.0'
-```
-
-Keep `--python 3.12`: uv
-[ignores dependency Python upper bounds](https://docs.astral.sh/uv/pip/compatibility/#requires-python-upper-bounds),
-so an unqualified install can select an interpreter Runtime cannot use. An older tool is never
-refused: Cozy installs its own matching one (uv) and describes with it. Runtime 0.18.67 is the
-controller minimum: the first release with the worker wire this Cozy speaks, org-relative
-defaults, and native model ingestion. Existing
-captured package environments keep their declared SDK ranges; new caller-capable
-publications require Runtime 0.18.21 in both the declaration and lock.
-
-Packages use Runtime's explicit rolling window of CPython 3.12, 3.13, and 3.14.
-Creator asks Runtime to select or install an interpreter satisfying `Requires-Python`
-and an explicit project `.python-version`, when present. Local execution and rented
-workers use the same Runtime provisioning policy. Production images preseed Python
-3.12; other supported interpreters are installed on demand when the image explicitly
-advertises that capability. The worker's control interpreter is independent of package
-executors; one worker can execute packages using different supported minors.
-Captured environments retain their exact Python patch, native wheel ABI, and dependency
-closure, including Torch. Provisioning capability is reported separately from installed
-interpreters; it does not substitute a different captured patch or dependency version.
-`cozy package list --full` distinguishes supported installed Python from Python that can be
-provisioned on demand. A package outside the active window
-is unusable until upgraded; advancing the window is an explicit Runtime release change.
-
-## Discover commands
-
-Running Cozy without arguments shows its complete launch surface. Help and version never load
-configuration or start a background process.
-
-```sh
-cozy
-cozy package
-cozy help package install
-cozy help run
-cozy -v
-```
-
-There is no container “stack.” Start the persistent local product explicitly when you want its
-localhost UI available:
-
-```sh
-cozy up
-# open http://127.0.0.1:8818/ (or the returned fallback URL when 8818 is occupied)
-```
-
-`up` backgrounds Calcifer, the one lightweight per-user process behind `cozy`: web UI, local API, submission
-records, output following, and private-rental sessions. It does not attach a log stream or load a package or
-model. Repeating `up` returns the same healthy URL with `changed: false`; concurrent callers
-converge on one Calcifer. A startup failure is returned directly as a bounded diagnostic and does
-not create a persistent log. Commands that require Calcifer may ensure the same process is
-running automatically.
-
-The machine server is TensorD, the separate `tensord` executable that Linux Runtime wheels
-bundle. `cozy machine install` bootstraps a new machine
-or asks an existing current machine to update its Runtime, TensorFS and bundled agent
-through one durable transaction. The same machine API runs on a laptop and a rented pod;
-restarting the personal controller leaves accepted machine work running. `cozy machine stop`
-explicitly stops the local machine (its systemd user unit, record or not); it stays stopped
-until `cozy machine start` or the next local run, and Calcifer never starts it to observe or
-collect accepted work. Optional `machine.webrtc_port` in the Cozy config
-enables its WebRTC media listener; Hub grants cannot change machine listening ports.
-
-Every long-running command on a machine is a run with its own number: package installs,
-updates and removals, model downloads and uploads, and warm-set changes, beside function runs.
-`cozy run list` shows each one's KIND; `cozy run show|watch <n>` follow its progress and
-`cozy run cancel <n>` stops it: before dispatch it never starts; on its machine its downloads
-and installs stop, keeping the bytes already landed, so asking again resumes. An upload that has
-begun pushing to its Hub ends on its own and refuses the cancel. Ctrl-C only detaches.
-
-For development on an explicitly pinned owned worker, `cozy machine show
---machine-endpoint-file <file>` reads its live status. `cozy machine update
---machine-endpoint-file <file> --runtime-wheel <wheel> --idempotency-key <id>`
-uploads the wheel and follows the machine's durable update. Omitted Runtime or
-TensorFS members keep their installed wheels; `--keep-agent` also keeps the machine
-executable. To resume observation after disconnecting, repeat the endpoint and key
-with `--observe`, without wheel or version flags. This uses the existing owner key
-and pinned TLS identity, creates no rental record, and does not start the local
-machine or change the configured Hub.
-
-Software replacement waits for confirmed idle state and retains the machine identity,
-execution journal, installed packages, and outputs. A stable bootstrap process owns
-Runtime lifetime while the public agent changes; losing an observer does not cancel
-the update. Candidate failure restores the previous pair and application.
-
-An owned machine boots offline and is never registered with Tensorhub. Tensorhub allocates
-and releases rentals. Catalog, storage, and explicitly authorized publication access use
-account grants bound to the machine certificate; these grants do not give Tensorhub a
-lifecycle role on the laptop. Local code and observation of existing work do not need a
-Hub grant. The agent is selected from the Runtime wheel. There is no separate agent
-release lookup. Ordinary Cozy releases and their CLI installer remain separate.
-
-The machine owns `etc/cozy/software-policy.json`, with required `startup_update`
-(`auto` or `off`) and `agent` (`bundled` or `explicit`) fields. Unpinned machines check
-for updates on startup. Rentals do this only before their first accepted work, then
-retain that software. An explicit wheel installation pins the pair. Installing the
-published pair without wheel overrides restores automatic updates. On an existing
-machine, `--host` can retain the running agent; a different agent must be bundled in
-the selected Runtime wheel. The stable bootstrap itself changes with the image or
-service bootstrap, and its identity is reported separately from the running agent.
-
-A machine reads public packages and models with no credential. A run that reads your
-unpublished checkpoints or publishes to your repositories carries a capability this CLI signs
-offline with its device key, for that machine's TLS key and exactly those operations, until
-the run's deadline (at most 24 hours). The machine trades it once for a Hub token; revoking
-the device key ends it. Updates require their advertised capabilities. Retired Hosts and
-agents lacking transactional replacement are refused before new work or updates;
-they require a current image or service bootstrap. Existing accepted work and its
-authority are preserved. There is no legacy submission or credential fallback.
-
-## Packages
-
-Search the Tensorhub catalog, install a package, and inspect local installations:
-
-```sh
-cozy package search video
-cozy package search org/name
-cozy package info org/name        # releases, newest first, with publication time and yanked state
-cozy package install org/name
-cozy package install org/name --version 1.2.3
-cozy package install org/name --rental=kirukiru
-cozy package install ./project
-cozy package install . --rental=kirukiru
-cozy package list
-cozy package list --rental=kirukiru
-cozy package update                      # every package; or name some
-cozy package update org/name --rental=kirukiru
-cozy package remove org/name --rental=kirukiru
-```
-
-Package names resolve at the current hub, or at `--tensorhub=<hub>` for one command;
-the same org/name at two hubs is two packages, installed side by side. `cozy package list`
-shows every hub's installations with a HUB column, published ones before local ones;
-`--tensorhub` narrows it. `remove` and `update` act on each hub's installation
-through that hub unless `--tensorhub` narrows them. A name the hub lacks is answered with that hub and,
-from this computer's records alone, the other hub it was installed or run from and the
-same name under another org at this hub, each with the command that works.
-
-`--rental` installs published code and Python dependencies on that existing rental,
-without downloading model weights or changing the local package installation; the rental
-reads the release at its hub itself, so an installation it holds asks no hub anything.
-Omit `--version` to select the newest published release. A directory with `--rental` is
-installed here (as below) and its files written to the rental, only those the rental lacks. `update --rental` moves each published package the rental holds to its hub's
-newest release and removes its older ones; `remove --rental` deletes installations and their
-environments from the rental. Rental installs are queued
-durably while the worker boots and delivered automatically once it is ready; the command
-waits for the outcome (Ctrl-C detaches, `--no-wait` returns once queued), and
-`cozy package list --rental=NAME` lists what that machine holds. See
-[package and model preparation](docs/worker-preparation.md) for explicit model prewarming.
-
-An explicit directory (`.`, `..`, `./project`, `../project`, or an absolute path) is installed
-as an editable Python install is: the directory is the package. Nothing is copied and no
-environment is built here; only its interface is read from source. This computer's machine
-installs it in place, building its environment only when `uv.lock` changes, and a rental keeps
-one copy updated with the files that changed. While Calcifer runs it watches the tree, and
-every invocation checks it too; installing it again unchanged does nothing. A failed rebuild (a syntax error mid-edit) keeps the last good
-install pinned, is logged typed in `cozy calcifer log`, and refuses an invocation only if the tree
-is still broken. `cozy package list --full` shows `synced` or `stale <error>` for the tree.
-Editable installs are not published releases. Their slot defaults name releases at the Hub, as a
-published package's do; they never synthesize Hub release records.
-
-Remove local package installs with:
-
-```sh
-cozy package remove org/name
-```
-
-Package authors may permanently yank an immutable release without freeing its package/version
-coordinate for reuse:
-
-```sh
-cozy package yank org/name --version 1.2.3
-```
-
-Publishing builds the current working tree with `uv build --wheel`; Git, commits, and a clean tree
-are not publication inputs. Standard `[project].dependencies` remain the runtime authority. Cozy
-adds the freshly described interface to source-built project wheels so installation can read
-their callables without importing the package. Backend-provided interfaces, signed wheels,
-and explicit `--wheel` artifacts keep their original bytes. Wheel tags and implementation
-members are preserved; added metadata participates in the standard wheel `RECORD` and hash.
-Cozy
-recursively builds referenced local `[tool.uv.sources]` paths/workspace members as separate exact
-wheels in the same publication, including local dependencies activated through requested extras.
-It first asks Tensorhub whether the release is already committed, so a replay skips all wheel
-builds and uploads. Builds and uploads stop when they repeatedly make no byte progress; uploads run
-at no more than 16 files concurrently.
-Creator omits only Python/Torch/Runtime/TensorFS platform families and their small declared native
-closure from its registry-wheel export; it has no worker-image inventory. It uploads exact
-pure-Python registry and local dependency wheels, and the actual worker compares platform
-requirements with its selected base before importing the package. Development dependency groups
-are not published. The package name and release come from `[project]`; the owner is the
-authenticated user's Tensorhub account:
-
-```toml
-[project]
-name = "marco-polo-package"
-version = "1.0.0"
-```
-
-From that project directory, publishing is simply:
-
-```sh
-cozy package publish
-```
-
-Declare dependencies as compatibility ranges, for example `pydantic-core>=2.46.4`
-or `pydantic-core>=2.46.4,<3`. Major and minor ranges such as `==2.*`, `==2.46.*`
-and `~=2.46.4` are supported. Package capture and publication reject exact versions
-and patch upper bounds in project dependencies, optional dependencies, and the
-project wheel's `Requires-Dist`. Script dependencies follow the same rule. Keep
-exact resolved versions and artifact hashes in `uv.lock`; third-party dependency
-metadata and explicit local wheel sources retain their normal behavior.
-
-If the logged-in account is `paul`, this publishes `paul/marco-polo-package@1.0.0`; Cozy never
-invents a `v` prefix. The destination comes from `tensorhub_url`, and an enrolled machine
-authenticates automatically.
-
-Publication succeeds even when no base worker image is active. The package appears in the catalog
-immediately. On invocation, the selected worker verifies the immutable wheels against its actual
-pinned base before installing them; Tensorhub does not prequalify packages against image profiles.
-
-A pending retry preserves every file already accepted by Tensorhub and uploads only missing slots
-from the current tree. If the tree changed after a partial publication, use a new project version
-instead of relying on a retry to replace already accepted bytes.
-
-Tensorhub owns serving promotion; publication does not move traffic implicitly.
-See [package publication](docs/package-publication.md) for the release contract.
-
-## Models
-
-Search lists `MODEL`, `FAMILY`, `RELEASE`, and `LANES`, with one row per model at its
-latest available release in Tensorhub's catalog order. Long columns are shortened
-in the compact human table; `--full` and JSON retain complete values and lane lists
-for that release.
-`cozy model info org/name` shows all available releases, while `@release` selects
-one exact tag. Info shows every lane's full stored byte size and immutable checkpoint
-ref; JSON also includes components and their sizes when available. Stored size is
-not a VRAM requirement or a measurement of bytes missing from the local cache. Unavailable
-Hub timestamps remain unavailable; model creation is distinct from release creation.
-
-Model releases live in the local TensorFS store:
-
-```sh
-cozy model search flux
-cozy model info org/model
-cozy model info org/model@release
-cozy model download org/model@release local/flux --lane task=text-to-image
-cozy model list
-```
-
-A machine's models are a cache it manages itself: unused ones expire, and a machine low on disk
-evicts them. There is no remove or gc verb, and nothing but the machine deletes from its store.
-
-Upload an already canonical local alias, or ingest a provider source with `model download`.
-Run quantization and other weight-producing functions through the ordinary package command.
-The function receives its model inputs and typed payload; TensorFS owns provider
-conversion. The destination owner must match the account shown by `cozy auth`:
-
-```sh
-cozy model upload local/model org/model
-
-cozy model upload hf://Qwen/Qwen-Image-2.1@790c92633540aa0cb11d9abf19eb46d861714758 \
-  org/model --rental=otter --await
-
-cozy run paul/minimax-h3-tools/four-lane \
-  --model.dits=hf://MiniMaxAI/MiniMax-H3@<full-commit> \
-  --model.shared=hf://MiniMaxAI/MiniMax-H3@<full-commit> \
-  --source-profile dits=hf/minimax-h3/native-dual-bf16/1 \
-  --source-profile shared=hf/minimax-h3/shared-bf16/1 \
-  --upload-to paul/minimax-h3 --rental-only --await
-
-cozy run org/quantize/convert org/model@release/bf16 org/quantized --rental=otter
-```
-
-Upload, quantize, publish: `cozy model quantize <model> --int8` (or `--fp8`) writes that lane
-as a new owner-only checkpoint in the model's repository, on this computer or `--rental=<name>`.
-The machine fetches the checkpoint if it does not hold it; on the rental that ingested it,
-nothing is downloaded again.
-
-```sh
-cozy model upload civitai://2883731 org/model --rental=otter --await
-cozy model quantize org/model#sha256:<checkpoint> --fp8 --rental=otter --await
-cozy model publish org/model --release 1.0.0 --lane fp16=sha256:<checkpoint> --lane fp8=sha256:<fp8 checkpoint>
-```
-
-The package that serves the model owns the recipe (which components and layers). Its quantizer
-is a function that takes the model as a `Weights[M]` argument and declares one weights output
-named for the lane (`int8`, `fp8`); `cozy_runtime.derive` supplies the encodings. The verb runs
-that function as the conversion below, choosing the installed package whose quantizer the
-checkpoint's components satisfy, or `--package org/name`. A model no package quantizes is
-refused, naming the function a package would need.
-
-A conversion — a function with model inputs and at least one declared weights output — reads
-`cozy run <fn> <input> [<org/model>]`: the first positional binds its first model input, the
-second is the `--upload-to` destination (it may be the input's own repository), and any
-further input is `model.<param>=<ref>`. Each output
-is uploaded as a private checkpoint named by its output slot; publish a release with `cozy model publish`.
-
-`cozy model upload <hf or civitai source> <org/model> --rental=<name>` ingests on the rental:
-the pod downloads the source, converts it to CozyTensors with reviewed TensorFS profiles and
-uploads one checkpoint. The owner-side header preflight picks the one profile the source
-matches; a source matching several names them, and `--source-profile` (repeatable) selects
-them — profiles over different files compose one model (Runtime 0.18.40). A Runtime recipe
-(Qwen Image 2.1) adds its model-owned configuration and tokenizer. The conversion is
-checked from headers before any transfer or allocation. Re-running the same ingest returns
-its completed checkpoint from any rental without downloading again, reattaches to a live run,
-or retries a stopped one on the same rental so the pod resumes from its journals. The checkpoint has no release label; publish one with `cozy model publish`.
-
-`cozy package update [org/name …]` upgrades the named packages, or every one, to newer
-published releases, without downloading model weights; naming one that is not installed is
-refused. Its list includes the selected
-Hub's packages and local sources; known installations from other Hubs are excluded.
-Legacy installs without a recorded source are resolved again at the
-selected Tensorhub. It keeps local/editable packages, development versions, and known-source
-versions newer than the registry unchanged. Each package
-is reported as updated, current, failed, or skipped; a failure leaves its previous
-install active and does not stop other packages.
-
-`--input=request.json` or `--input=~/request.yaml` reads the whole payload, including
-nested lists such as `segments`, from a JSON or YAML file (`.yaml`/`.yml`; YAML 1.2, so
-`yes` stays a string). Inline arguments override file values; use `field:=<json>` for a
-nested inline value. `--asset <field>=<directory>` binds a Tree input.
-
-A field the function does not declare, at any depth, is dropped with one warning naming it
-(`--json` and `cozy run show` carry it as `warnings`). Types, required fields and bounds are
-still checked.
-
-Schema-declared media fields in a request file can contain local filenames, for example
-`"image": "./characters/hero.png"` inside `references`. Relative paths resolve beside
-the file; absolute paths and `~/` also work. Creator verifies and transfers them
-through the same asset bindings as `--asset references.0.image=/path/to/hero.png`.
-Ordinary description/prompt strings are never interpreted as files. Supplying the same
-field in the file and with `--asset` is an error. These inputs accept local files, not URLs.
-
-`--upload-to` uploads each declared weights output, from any function that declares one, as an
-owner-only immutable checkpoint; it publishes no release. A rented run without it keeps those
-outputs retained on its
-rental until `cozy rental end`; `cozy run upload <run>[#<output>] <org/model>` uploads one
-later, straight from the rental and without running again, and a repeat resumes or returns
-the same checkpoint. `--source-profile slot=profile` narrows each foreign
-input to a reviewed TensorFS profile. A provider source runs on a named machine, or on a fresh
-rental when every model input names the same source, which sizes the rental. Tensorhub inputs
-use the ordinary exact model resolver.
-The Hub measures their shared closure when sizing a rental; a manifest's small metadata
-length is never a disk-size estimate.
-
-Every function's run is an ordinary request: `--await` watches it and `cozy run watch <run>`
-attaches later; `cozy run cancel <run>` is its only control. `--timeout` cancels it on its
-machine when it passes, whether or not a client waits. A canceled or failed run submitted again
-is a new run whose memoized steps the machine answers from its memo. Use `--idempotency-key` to
-replay the same request.
-
-Publish, repoint, add, or remove release lanes separately. Omitted lanes stay unchanged:
-
-```sh
-cozy model publish org/model --release 1.0.0 \
-  --lane bf16=sha256:<checkpoint> \
-  --lane fp8=sha256:<checkpoint>
-cozy model publish org/model --release 1.0.0 --remove-lane defective
-cozy model yank org/model --release 1.0.0
-cozy model delete org/model#sha256:<checkpoint> --yes   # one unreleased checkpoint
-cozy model delete org/model --yes                       # the model, once every release is yanked
-```
-
-Deletion drops Tensorhub's references only; its GC reclaims objects no other model shares.
-
-Checkpoint IDs are immutable. Release labels and their lane maps are mutable owner pointers. Ordinary
-consumers follow a release lane so fixes take effect; accepted runs freeze the checkpoint they resolved.
-
-With `--rental-only` or a named `--rental`, published packages resolve directly to their latest non-yanked immutable
-Tensorhub releases. The transfer intent pins `(package, release)`; downloaded execution files carry
-their own exact refs, including `metadata/package-interface.json`.
-They do not need to be installable in the laptop's local Python environment. Local production still
-uses the ordinary installed package. `--rental-only` skips local capacity and requires an
-external attempt. Downloads that could rent currently refuse until Creator wires the negotiated
-weights-read return plane; local-only sources under `--rental` remain local.
-
-## Run packages
-
-Inspect a function with `cozy run org/package/function --describe`; its request,
-models and output have separate sections. A call missing required arguments
-prints their names and the argument list before resolving or downloading a model.
-Functions whose arguments all have defaults may be invoked without values.
-Payload arguments and flags may be interleaved, including repeated `--asset` flags.
-A positional local file fills the one input that declares its media kind
-(`cozy run org/seedvr2/upscale clip.mp4` binds `video`); a file two inputs accept, or none,
-is refused with those inputs named. One positional text value fills the first non-media field.
-
-The machine that runs a call picks every model's lane from its GPUs' family: 8 bits (`int8`,
-else `fp8`) by default, `nvfp4` for a decode slot that allows 4 bits, 16 where a slot allows no
-less. `--bits=16|8|4` (on `cozy run` and `--warm`) holds every model the run loads, its calls'
-included, to that width; a release without the wanted lane steps to the next and the run says so.
-An explicit `model.<param>=org/model@release/lane` pins the lane. A rental the fleet buys is sized
-by the lane bytes the machine would serve, on the fewest GPUs that hold them.
-
-A local script is a single-file unpublished package: an ordinary `main()` or `main(ctx)`,
-synchronous or asynchronous, with no App, request/result class, publication or install command.
-Its PEP 723 block is its `pyproject.toml` (Python, dependencies, `[tool.uv.sources]`), and
-`[tool.cozy]` is its `package.toml`: model defaults, weights outputs and `accelerator`.
-
-```python
-# /// script
-# requires-python = ">=3.12,<3.13"
-# dependencies = ["cozy-runtime[media]>=0.23.32", "seedvr2"]
-# [tool.cozy.models]
-# model = "seedvr2@0.1.0"   # the default release; the machine picks its lane
-# ///
-from seedvr2.model import RestorationModel
-
-async def main(ctx, *, model: RestorationModel) -> int:
-    ctx.log("Starting my experiment")
-    frames = model.restore(...)   # a constructed model, as a package entrypoint receives it
-    # Call package functions as children with ordinary Python control flow here.
-    return len(frames)
-```
-
-`main` takes what a package function takes: Model slots, `Weights[M]` sources, services such as
-`Outputs` and `Telemetry`, and typed assets. Runtime constructs Model slots through the weight
-plane and memory manager; a `Weights[M]` argument is read raw and never constructed. A script
-runs on the machine's GPU (CPU on a machine without one) unless it declares
-`accelerator = false` under `[tool.cozy]`, as a package function declares
-`app.entrypoint(accelerator=False)`; nothing infers it.
-`[tool.cozy.models]` entries are the slot's default release, exactly as `defaults=` declares
-it; `model.<slot>=org/model@release[/lane]` overrides it per run. The optional context supplies
-cancellation, logs, progress and metrics. Discovery checks the script's syntax without
-importing it on the client; its captured code executes on the worker.
-Any target ending in `.py` is a script path, relative (with or without `./`) or absolute; a
-two-part `org/name.py` runs the file when it exists.
-Generator entrypoints are refused rather than reported as completed without running their body.
-
-```sh
-cozy run ./experiment.py --rental-only --await
-# Edit the script or its declared local libraries, then start a fresh run:
-cozy run ./experiment.py --rental-only --await
-```
-
-A local package runs from its directory, as an editable Python install does: nothing is
-copied on this computer, and only its interface is read here, from source. This computer's
-machine installs it in place; a rental keeps one copy, sent only the files that changed. Each
-machine builds the package's environment once and again only when its lock, its project
-metadata or a local path dependency changes; an ordinary edit costs no install. A run of edited
-code is a new run; it never rewrites an earlier run's result. Code goes directly to the authenticated machine, without a Tensorhub package
-publication or intermediate upload; published dependencies still come from their package
-indexes.
-
-An **unpublished package** runs from its directory without a Tensorhub package release.
-A **local script** is its single-file form; **editable** describes a dependency's installation
-mode. These terms say where code comes from, never what the code may do.
-
-The existing worker protocol still uses `PreparePrivatePlacement` and related `Private*`
-messages. Persisted `private-revision` markers, historical SQLite column names, and stable
-`private_*` error codes also keep their serialized spellings so existing captures and workers
-remain readable. They are compatibility identifiers, not another package mode. Private rentals
-and access controls retain their security meaning.
-
-`cozy run cancel <id>` stops a run. Submitting the same function again is a new run whose
-finished memoized steps are answered from the machine's memo.
-Cancellation records intent and returns the observed state. If a sent submission's
-acceptance is unknown, it remains `canceling` until the machine closes its key or
-confirms the execution outcome. Use `cozy run cancel <id> --await` to wait for that
-confirmation. Work never submitted cancels immediately.
-If the machine cannot be reconciled, `cozy run cancel <id> --abandon` permanently
-ends local tracking while retaining the original submission and any real receipts
-or outcomes. This does **not** confirm remote work stopped or end any rental.
-Late real facts about an abandoned run remain history without reopening it. `--abandon` cannot
-be combined with `--await`. A failure is not automatically retried.
-
-An invocable dependency exposes an ordinary typed Python call. Its implementation is its own
-package in the caller's environment. Calling one creates an ordinary managed child run. A reusable computation
-opts in with `@invocable(memoize=True)`.
-Arbitrary helper functions and external effects do not become cached operations.
-An editable source library declares its App in `package.toml` (`[application] object =
-"my_algorithm:app"`) and the matching `pyproject.toml` entry point
-(`[project.entry-points."cozy.application"] default = "my_algorithm:app"`).
-A local or PyPI wheel needs the single `cozy.application` entry point in its wheel
-metadata; no `package.toml` is required inside the wheel. Declare it in the script's
-ordinary Python dependencies, using `[tool.uv.sources]` for a local wheel path.
-The calling single-file script needs neither App declaration.
-
-Installed callable wheels require Runtime 0.12 or newer. The machine installs them from the
-caller's lock like any other dependency.
-
-On either a local or rented worker, a memoized function, run directly or called by another, can acquire
-an earlier successful result when its
-exact implementation closure, entrypoint, canonical inputs, resolved model checkpoints,
-and measured numerical environment match. A fresh script can reuse this work without a retry
-ID. Run IDs, the parent's script digest and call position are not computation cache keys.
-`cozy run show` says when a run or call was served from the machine's memo, or why it was not
-memoized (its author's condition unmet, e.g. `seed not given`).
-Native model results travel as `ModelArtifact`
-references; reuse acquires independent native custody before the new result is visible.
-The reference names its original producer and receipt without copying tensor bytes.
-
-The script starts at `main()` on every run; Python lines and call stacks are not replayed.
-Completed operations return their retained results. An interrupted operation can also
-adopt compatible progress that its implementation checkpointed: download prefixes,
-conversion groups, or complete quantized tensor data/scale groups. Only completed,
-verified units can be reused; an unfinished group runs again. Changed operation code,
-inputs or encoding starts new work while independently retained preparation remains
-available. Ordinary inference starts again after interruption.
-
-The implementation boundary is a package and its dependencies, not an individual Python
-function body. Editing B inside a package that also implements A invalidates that package's
-reusable calls. Keep expensive independent operations in independently captured packages.
-Source ingestion already has its own exact source/profile identity, so changing an H3
-producer does not invalidate its retained source conversion. No system can infer that
-arbitrary Python side effects are reversible or safe to repeat.
-
-Scalar and tensor compositions use the same Runtime workspace journal locally and on a
-private rental. The journal belongs to the configured TensorFS store and survives package
-worker and Calcifer restarts. The remote Host authenticates access to that same service.
-A completed result stored only on a rented machine continues holding the rental until its
-owner releases it; completion alone does not make those bytes remotely durable.
-Parent and child attempts retain separate history.
-The worker may retain reusable results under an independent cache hold. Canceling a producing
-run releases its own holds; cache or other consumer holds may keep those bytes available.
-Cache holds alone do not keep paid capacity alive, and evicted or missing results compute again.
-The cache records original result provenance without inventing another compute attempt.
-The cache manages itself (expiry, and eviction when disk runs low); there is no prune verb.
-
-For editable libraries, declare paths explicitly in the same script metadata:
-
-```python
-# /// script
-# dependencies = ["my-algorithm"]
-# [tool.uv.sources]
-# my-algorithm = {path = "./my-algorithm", editable = true}
-# ///
-```
-
-A run uses the library as it is on disk, including edits made without a version bump: an
-edit of a path dependency rebuilds the machine's environment for the next run. An ordinary
-library call runs inside its caller; only operations participating in the managed memoization
-contract reuse completed computation.
-
-Every function is called the same way. Cozy reads the installed package interface for its
-arguments, machine class and outputs:
-
-```sh
-cozy run org/package/generate \
-  prompt="a watercolor lighthouse at dusk" \
-  --out ./outputs \
-  --await
-
-cozy run org/package/train epochs=3
-cozy run list
-cozy run watch <run-id>
-cozy run cancel <run-id>
-```
-
-Every run is durable. Cozy observes its first three seconds so a warm, weightless function can still
-return its result directly; otherwise it prints the run id, live status, and authoritative queue
-position, then returns while Calcifer continues. `--await` stays attached through the terminal and
-shows named pipeline stages, measured step speed, elapsed time, and a whole-run estimate only when
-the package reports `overall_fraction`; stage-local fractions are labeled as stage progress.
-`--await --json` writes typed JSONL progress events to stderr and one final JSON result to stdout.
-Human progress is automatic with `--await`; no separate progress flag is needed. On a terminal it
-redraws in place (the run, finished stages with their durations, each active stage's bar) and
-settles to one record; piped or with `TERM=dumb` it appends plain lines. `NO_COLOR` drops color.
-A model download is its own line with its bytes, rate and time, and a step held for weights is
-timed without the wait; `cozy run show` lists every download, prefetches included, and each
-run's and call's device memory: torch's peaks (whole and per stage), the executor process at the
-end (context, torch, weights, budget, cap), weights paged in and given back, allocator cache drops
-and OOMs, and a refused stage's shortfall (`--json`: `memory`).
-Model overrides accept `--model.<param>=org/model@release/lane` after the target;
-the existing `model.<param>=...` payload spelling has the same meaning.
-Without an override, the machine loads the slot's published default release, declared with
-`@invocable(defaults={"model": "org/model@release"})`; an org-less default names the publishing
-account. To change a default, publish a new release.
-`cozy run watch <run-id>` attaches to that same progress stream later; interrupting a watcher
-detaches without canceling the durable run.
-
-`cozy run play <run> [--output video] [--expires 24h]` prints a link that plays a run's output
-in any browser, live as it grows, straight from its machine (this computer's or a rental's) over WebRTC.
-The address and certificate pin come from the machine's own Status, with no Hub lookup; the link carries
-them and a capability for that output, signed by the key the machine authorizes, in its fragment, which
-never leaves the browser. A machine behind NAT with no mapped address is an error: there is no relay. Anyone holding the link can watch that output until it
-expires. The page is [web/player](web/player), served at `player_url` (default
-`https://cozy-creator.github.io/cozy/play/`).
-
-If the package is missing, Cozy installs the newest compatible release from Tensorhub before
-starting; the download is visible progress, not an interactive prompt. Reusing an explicit
-`--idempotency-key` safely returns the same recorded work. Before submission, Cozy materializes an
-omitted integer `seed`, so an unseeded run draws fresh entropy.
-
-Every run says where its files are. Result files land in the package's own store,
-`~/.cozy/outputs/<org>-<package>/`, or under `--out DIR`; either way each file is named by its own
-content digest, `<sha256>.<ext>`, so regenerating the same bytes lands on the same file and two
-different results never collide. Child artifacts and native checkpoints stay internal. Text-only results create no output directory. Input assets are read from
-the original input paths without copying them. Keep those files available and unchanged until the
-request finishes; missing or modified inputs are refused before execution. Downloaded or resized
-media lives in the system temporary directory under `cozy/`, named by its content hash.
-`saved:` lists the absolute paths (`saved[].path` under `--json`).
-Calcifer probes the destination writable at submit and refuses typed (`output_destination_unwritable`)
-before any execution, and records the destination with the request, so closing the command or
-restarting Cozy does not lose where the files are.
-
-Local Runtime workers start on demand and may remain resident for warm reuse.
-
-## Private rentals
-
-With Tensorhub configured, rent generic private capacity:
-
-`cozy rent` is an alias for `cozy rental`. An odd `--gpus` above 1 is allowed; the worker
-runs at the largest parallel degree the package supports and leaves the rest idle.
-
-```sh
-cozy rental new                   # Cozy GPUs, their GPU counts, VRAM, and hourly prices
-cozy rental new h100-sxm5-80gb     # prints e.g. otter
-cozy rental new h100-sxm5-80gb --gpus 2   # one machine with 2 GPUs; keep counts even
-cozy rental new h100-sxm5-80gb --model paul/minimax-h3@1.0.0/bf16   # size disk for a Hub model
-cozy rental new h100-sxm5-80gb --model hf://org/repo@<commit>        # or for a source to ingest
-cozy rental new h100-sxm5-80gb --disk-gb=600                         # rent at least a 600 GB disk
-cozy rental new h100-sxm5-80gb \
-  --idempotency-key <unique-key>
-cozy rental new h100-sxm5-80gb --image <tag|digest>   # boot a registered candidate image
-
-cozy rental list                   # current rented machines, live on a terminal
-cozy rental list --all             # every rental, live and ended: lifetime, runs from this computer, cost, end cause
-cozy rental list --ended           # the ended ones only
-cozy rental show otter             # one rental's facts, including accrued spend, ended or not
-cozy rental logs otter -f          # operators (Tensorhub admins): the boot log, followed while it boots
-cozy rental logs otter --tensorfs  # TensorFS's transport decisions: hedges, lane grants, wins, pull walks
-cozy rental logs otter --memory    # TensorD's GPU memory decisions: caps, floors, placements, sheds
-cozy run org/package/generate --rental=otter prompt="moonlit lake"
-cozy rental end otter
-```
-
-`--model` sizes the pod's disk. A Hub model is declared by identity. A provider source
-(`hf://`, `civitai://`) is planned the way `cozy model upload --rental` plans it, with
-`--source-profile` for a multi-profile source, and its bytes are declared.
-
-A GPU machine boots the hub's current `cuda` image and the `cpu` machine its current `cpu-torch`
-image. `--image` boots one other image registered with the hub instead (tag, digest, or kind), for
-testing a candidate without changing any default; `cozy rental list --json` shows each rental's image.
-GPU names and prices come from Tensorhub's Cozy-owned rental catalog. Creator never exposes or
-reads RunPod SKU names or provider prices. `cozy run` is local-only by default, while
-`--rental=<name-or-id>` uses only the selected existing rental. It does not permit a
-purchase or fallback onto another machine. `--rental-only` automatically reuses or acquires
-remote capacity under Tensorhub's owner spend cap. Creator names every private rental
-with one memorable word, unique among this host's live rentals (a released word is drawn again);
-Tensorhub's identity for it is its `pr-…` id. The name carries no workload facts.
-
-Use `--model org/model@release/lane` to size a manual rental for known checkpoints; repeat
-`--model` for several models. Creator resolves and pins each manifest, and Tensorhub measures
-their shared object closure and required disk headroom. This declares capacity needs; packages
-and models are prepared when requests run. Retrying the same idempotency key reuses the pinned
-set, including when `--model` is omitted on the retry.
-
-Rentals end themselves after 15 minutes idle: no run queued for or running on the
-machine. The machine enforces this, with or without Creator. Warm-ups, uploads and
-conversions are runs too; updates, an open connection and status polling are idle time. `cozy rental end <name>` ends one now.
-
-`cozy rental keepalive <name>` resets that 15-minute clock once and prints the
-deadline the machine answered. It authenticates directly to the pinned rental Host,
-so it also works while Runtime is unavailable, and admits no execution.
-
-`cozy rental list` shows each known machine's queued and running work, when it ends
-itself (ENDS, from the machine's live Status, the only rental clock; blank if it cannot
-answer or names no deadline) and accrued spend at Tensorhub's hourly price (`unmetered` on an account
-Tensorhub does not charge, `est.` for a rental from before running charges, `-` from a Hub that does not say). A release Tensorhub does not confirm is retried.
-Activity is unknown for machines absent from this controller's history.
-
-Rental creation sends only that private machine name, the SKU, and introduction credential material—never a package, model,
-request, profile, image, or placement. Tensorhub readiness means the worker location and TLS identity
-are attachable. Creator then claims that worker directly and sends signed exact package and model
-release refs; no WorkerControl frame is relayed through Tensorhub. Creator learns the derived
-placement/binding and exact environment identities from the worker's existing
-observed-state stream before dispatch. Tensorhub's exact PackageInterface validates request/result
-shape; Creator never supplies a remote profile, CUDA choice, or precomputed PlacementSet.
-
-Each rental has one local Ed25519 Creator key and one separate media bearer. Both credentials are
-removed when the rental ends, and a lost Creator key requires a new rental.
-
-Rentals continue billing until Tensorhub confirms their termination. `cozy rental end`
-and `cozy down --all` request termination; a plain `cozy down` does not.
-
-## Credits
-
-Tensorhub sells prepaid USD credit: $1 buys $1 of usage at Tensorhub's quoted hourly prices.
-
-```bash
-cozy credits                       # balance, what running work holds, what is available
-cozy credits history               # deposits, spend, refunds and expiries, newest first
-cozy credits buy 25                # pay $25 by card in Stripe Checkout; waits until it lands
-cozy credits buy 25 --no-wait      # print the Checkout URL and return
-```
-
-One purchase is $10 to $500 (the hub's bounds; others are refused before any checkout). The
-browser opens Stripe's hosted page; `--no-browser` only prints its URL. Each purchase expires
-365 days after it lands. Refunds are made by the Tensorhub operator.
-
-A new account starts with a small credit. Rentals may run your balance a little below zero (the
-hub's overdraft floor, about -$2); past it they are shut off, even mid-run, and what was spent past
-zero is repaid from your next purchase. Below the hub's warning, `cozy credits` and run and rental
-commands warn you, and Tensorhub emails you once.
-
-## Release GPU memory or stop Cozy
-
-These commands have deliberately different scopes:
-
-```sh
-cozy machine stop # stop this computer's machine and free its GPU; `cozy machine start` or the next run starts it
-cozy machine logs --tensorfs # this computer's TensorFS transport decisions
-cozy machine logs --memory   # this computer's GPU memory decisions
-cozy down         # stop Calcifer; runs, uploads and rentals continue
-cozy down --all   # cancel all work, end all rentals, then stop Calcifer
-```
-
-None deletes installed package or model bytes. `cozy down` never refuses over work: it
-names what is in flight, and this computer's machine and every rental keep running it.
-The next command starts Calcifer, which resumes each submission, upload, control and
-output collection from its records. Idle rented machines still end themselves after 15
-minutes; `cozy rental keepalive <name>` resets that clock once. `--all`
-remains explicit cancellation and rental teardown. See
-[Calcifer shutdown](docs/calcifer-shutdown.md).
-
-Calcifer's own words — the orchestrator's frame-by-frame account — are in
-`$COZY_HOME/calcifer.log`, rotated once at 32 MiB (`calcifer.log.1`). `cozy calcifer log` prints it;
-`cozy calcifer log -f` follows it.
-
-Calcifer also leaves on its own once it has had nothing to manage for `calcifer.idle_shutdown_s`
-(default 900): no rental it owns, no request or attempt it owes, no transfer, export, launch or
-teardown in flight, no event stream attached. User interaction is not the signal. A rental holds
-Calcifer until its idle release, or `cozy rental end`, has confirmed the pod gone. Set
-`idle_shutdown_s: 0` to keep Calcifer up until `cozy down`. The next command that needs
-Calcifer starts it again.
-
-The launch web UI is currently a stub rooted in [`web/`](web/). Calcifer already serves
-opaque output media and a bounded authenticated content-addressed upload API; full browser
-authentication, upload-to-invocation binding, and media-history UX come with the real frontend.
-
-## Configuration
-
-The default local root is `~/.cozy`. The TensorFS store is its own independent home —
-`~/.tensorfs` by default, moved with `TENSORFS_HOME` or `tensorfs_root` — written only by
-`tfs`. What lives under `~/.cozy`:
-
-| path | what it is |
-|---|---|
-| `installs/` | one immutable environment per installed package, plus the writer's `.lock` |
-| `outputs/<org>-<package>/` | result files, named by their own content digest; never removed automatically |
-| `inputs/` | uploaded/streamed request bodies only, created on demand; a local CLI file input stays at its caller path |
-| `machine/` | this computer's machine: the same Host a rental runs, with its grant |
-| `tmp/<request-id>/` | bytes in flight for a model transfer; removed when the request settles |
-| `creator.sqlite`, `calcifer.log` | the one local lifecycle database (mode 0600) and Calcifer's own log |
-| `calcifer.lock` | Calcifer's lifetime ownership record: address, pid, and the per-launch CLI token (mode 0600) |
-
-Nothing is kept on disk without a live reason; Calcifer's start-time sweeps (`cozy up` prints
-them) are only the backstop for a process that crashed and report `reclaimed 0` on a healthy box.
-
-Configuration is read once from `~/.cozy/config.yaml`, then credential/location environment
-variables override it. `--tensorhub=<hub>` overrides both for one command:
-
-```yaml
-tensorhub_url: local        # the current hub: a name from `hubs` or a URL
-hubs:
-  local: http://127.0.0.1:8819
-tensorhub_token: replace-with-your-token
-tensorhub_liveness_s: 40    # a Hub connection silent this long, probes unanswered, is dead
-huggingface_token: hf_replace-with-your-token
-civitai_token: replace-with-your-token
-tfs: /usr/local/bin/tfs
-port: 8818
-player_url: https://cozy-creator.github.io/cozy/play/   # the page `cozy run play` links open
-local_rate_micro_usd_per_hour: 250000
-calcifer:
-  idle_shutdown_s: 900
-```
-
-Without a configured `port`, Cozy prefers `127.0.0.1:8818` and falls back to an available
-loopback port when another process owns 8818. A configured nonzero port is strict; `port: 0`
-explicitly asks the OS to select any available port.
-
-No clock bounds a Hub call: a slow Hub is waited on and says so (`waiting on Tensorhub at …
-(10s)`). Only a refused or unreachable dial, a TLS failure, a reset, or a connection silent for
-`tensorhub_liveness_s` with its probes (HTTP/2 PING, TCP keepalive) unanswered fails it.
-
-Hubs work like kubectl contexts. Without `tensorhub_url`, Cozy uses `tensorhub`
-(`https://tensorhub.com`). Local development names its own hub and switches to it:
+Login keeps one device key per Hub in `~/.cozy/keys`. The default Hub is `tensorhub`
+(https://tensorhub.com). More Hubs work like kubectl contexts:
 
 ```sh
 cozy hub add local http://127.0.0.1:8819
-cozy hub use local                      # later commands use local
-cozy hub list                           # names, URLs, logins, live rentals
-cozy --tensorhub=tensorhub model search minimax   # one command, any hub
+cozy hub use local             # where new work goes
+cozy hub list
+cozy package search sdxl --tensorhub tensorhub   # one command on another Hub
 ```
 
-Every new operation uses this one selected Hub: package lookup and installation, model
-transfers, rental purchases, and run preparation. `--tensorhub=<hub>` selects
-another Hub for that command only. A cached package from another Hub never changes the
-selection, and matching package names and version numbers at different Hubs are separate
-identities.
+Lists show every Hub; `--tensorhub` narrows them to one.
 
-An existing rental name selects its recorded machine directly. Its ownership, billing,
-keepalive and termination stay with the Hub that rented it; they do not change the Hub a
-new run reads packages and models from. If that source differs, the CLI delegates the
-selected Hub's execution access to the rental's pinned certificate. The rental's lifecycle
-credential stays at its owning Hub. Each Hub uses its own `cozy auth login --tensorhub=<hub>`.
-
-One Calcifer can retain runs and rentals created under earlier selections without restarting.
-`cozy rental list` shows rentals across every known Hub, including signed-in Hubs
-whose rentals were created by another client. A name alone adds no Hub, so `cozy hub remove`
-takes effect in a running Calcifer at once; rentals on a removed name are listed under its URL.
-A Hub that cannot answer leaves its
-last observed rentals visible as unverified. `--tensorhub=<hub>` selects the source
-for new work; it does not narrow the rental inventory. `cozy run list` shows every
-Hub by default and can be narrowed with `--tensorhub=<hub>`.
-A Hub that cannot be read is named on its own line, with its rentals shown unverified.
-`tensorhub_token` belongs to the configured Hub only, and `cozy hub use` refuses to move it
-until it is removed.
-
-The YAML schema is strict: unknown keys, duplicate keys, undeclared nested structures, and multiple
-documents are refused. Cozy does not load a working-directory `.env` file.
-When either provider token is present, `config.yaml` must be an owner-owned regular file with mode
-`0600`; symlinks are refused.
-
-Supported environment variables are limited to:
-
-- `COZY_HOME`
-- `COZY_TFS`
-- `HF_TOKEN`
-- `CIVITAI_TOKEN`
-- `TENSORHUB_URL`
-- `TENSORHUB_TOKEN`
-
-Calcifer's launcher also uses a private per-process bootstrap credential. Secrets are never
-accepted as command-line values.
-
-## Authentication
-
-Register or recover this Creator installation directly from the CLI:
+## Run
 
 ```sh
-cozy auth login person@example.com
-cozy auth
-cozy auth revoke-other-machines
-cozy auth logout
+cozy run fidika/sdxl                                      # the package's functions
+cozy run fidika/sdxl/generate --describe                  # its inputs
+cozy run fidika/sdxl/generate prompt="a red fox in snow" seed=7
 ```
 
-Tensorhub emails a one-time code. After it is entered, Cozy stores only this installation's
-Ed25519 machine key under its mode-0700 home and mode-0600 credential file. Short AuthKit access
-tokens stay in memory. A new user also chooses one immutable Tensorhub account name during this
-login; existing accounts skip that prompt. Later authenticated commands sign a one-time challenge
-automatically; there is no refresh token or repeated login command. `cozy auth` verifies the stored
-key, shows the email and Tensorhub account name, or reports `not logged in` when this installation
-has no usable key. Revoking other machines asks for a fresh email code. Logout revokes this
-machine before erasing its local key. Once enrolled, the machine key takes precedence over a stale
-configured `tensorhub_token`; that operator token remains a fallback only for unenrolled automation.
+- **Target:** `org/pkg[/fn][@release]`. Local code (`./dir[/fn]`, `./script.py`) is *coming*.
+- **Inputs:** `key=value`, `key:=json`, `model.<slot>=<ref>`, one positional value, or files.
+  `--input FILE` takes the whole payload from JSON or YAML (inline inputs override it).
+  `--asset [NAME=]FILE` attaches a file. `--lora slot:component=ref[,strength]` applies a LoRA.
+- **Options:** `--bits 16|8|4` sets weight precision (by default the machine picks per GPU).
+  `--gpus N` caps the GPUs. `--out DIR` changes where outputs land (default
+  `~/.cozy/outputs`).
+- **Following:** a run streams its progress until it ends; Ctrl-C stops watching, never the
+  run. `--detach` prints the run's record at once. Resume watching with `cozy run watch <run>`.
+  Stop a run with `cozy run cancel <run>`.
+- **Warm:** `--warm installed|downloaded|imported|host|gpu` keeps a function ready instead of
+  running it; `--warm off` takes it out.
+- **Retries:** `--idempotency-key K` names one submission forever, so a retry never runs it
+  twice.
+- *Coming:* `cozy run list`, `run show`, `run play` (plays an output in the browser, straight
+  from its machine) and `run upload`.
 
-## Output and automation
+`--json` prints JSON instead of tables; while following, it prints NDJSON events
+(`run.created`, `run.in_progress`, `output_item.done`, `run.completed`, …).
 
-Commands print concise human-readable results by default. `--json` emits stable structured output
-for scripts and other software integrations. Interactive terminals add restrained color to errors;
-redirected and JSON output never contain ANSI escapes. Progress goes to stderr.
+## Machines
+
+A run goes where `--on` says:
+
+| `--on` | Where |
+|---|---|
+| `local` (default) | this computer's machine |
+| a name | a rented or added machine |
+| `any` | any ready machine |
+| `new[:sku]` | a new rental: the Hub places it, or rents that SKU |
 
 ```sh
-cozy package search
-# - cozy/marco-polo-derived
-# - cozy/marco-polo-cu130
-# - cozy/marco-polo-launch1
-
-cozy package list --fields package,version,size
-cozy run list --json
-cozy model search flux --full
+cozy machine rent              # what is for rent, with prices
+cozy machine rent <sku>        # coming: --gpus N --disk-gb N, --detach
+cozy machine list              # coming: this computer's, rentals on every Hub, added ones
+cozy machine end <name>        # coming: billing stops once its Hub confirms
 ```
 
-A one-field list uses `- value` bullets; multiple selected fields become a compact table. The
-collection length is already its count. Compact lists show at most 20 rows; `--full` shows
-all fetched rows. For `run list` and searches, `--limit` controls how many rows are fetched
-(`run list`: 50 by default, 0 for all). A list that leaves rows out says how many and how to see
-them; `omitted` reports the count, and
-diagnostic fields appear only under `--full` or an explicit `--fields` selection. Human errors
-state the problem and repair directly; `--json` retains the stable class, code, message, remedy,
-and contextual next action.
+- *Coming:* `machine show`, `machine logs`, `machine keepalive` (resets a rental's 15-minute
+  idle clock) and `machine update`.
+- *Coming:* `machine enable` and `disable` (makes this computer a machine).
+- *Coming:* `machine add <name> <host:port> --fingerprint sha256:…` and, on that other
+  computer, `machine authorize <public-key>`.
+- *Coming:* `cozy doctor [--on M]` (driver, GPUs, toolchain and kernels).
 
-Completed run `wall_ms` is the recorded request duration from creation to its durable
-terminal event. It excludes pre-submission capture and later result collection, export or
-viewing, and stays the same when `run watch` is repeated. Missing or invalid timestamps
-leave it absent. Queue and execution durations remain separate measurements.
+A rental is released after 15 minutes with nothing queued or running.
 
-Shell exits are intentionally small: `0` success or idempotent no-op, `2` invocation/configuration
-error, and `1` operational failure.
+## Packages
 
-Billing management, datasets, passkey recovery, and the full web UI are planned later; Cozy does
-not advertise placeholder commands for features that do not exist yet.
+```sh
+cozy package search sdxl
+cozy package info fidika/sdxl
+```
 
+*Coming:* `package install|update|remove|list [--on M]`, which act on a machine, and
+`package lock|publish|yank` for authors.
 
-Choose existing capacity explicitly with `cozy run org/package/function --rental=name`
-(or its rental ID). This constraint survives retries and Calcifer restarts. If that
-rental becomes unavailable, the run fails or retains its work; it never buys a
-replacement or moves onto another machine. `--rental-only` retains automatic remote
-allocation. Create capacity with `cozy rental new <machine-slug>`, such as `cozy rental new h100-sxm5-80gb --gpus 2`;
-`cozy rental new` alone lists the current catalog.
+## Models
+
+```sh
+cozy model search sdxl
+cozy model info org/name                  # releases, lanes, sizes, checkpoints
+cozy model publish org/name --release 1.0 --lane bf16=sha256:…
+```
+
+- `family`, `retarget`, `yank` and `delete` manage your own models.
+- *Coming:* `model list` and `model download <model> [local/alias]`, which act on a machine.
+- *Coming:* `model upload <source> <org/name>`, where the source can be `hf://…`,
+  `civitai://…`, `https://…` or `./file.safetensors`.
+- *Coming:* `model quantize --int8|--fp8|--nvfp4 <model>`.
+
+Model references: `org/name[@release[/lane]]`, `org/name#sha256:…`, `hf://…`, `civitai://…`,
+`https://…`.
+
+## Credits
+
+```sh
+cozy credits                   # balance, held, available, burn per hour
+cozy credits history
+cozy credits buy 25            # opens a payment page; --no-browser, --no-wait
+```
+
+## Calcifer
+
+Calcifer is the controller in the background. Any command starts it. It stops by itself
+once it owes nothing.
+
+```sh
+cozy status                    # Calcifer and unfinished runs; never starts it
+cozy up                        # start it now
+cozy down                      # stop it; runs on machines continue, the next one resumes
+cozy logs -f                   # its log; `cozy logs machine` is coming
+```
+
+## Where things live
+
+```
+~/.cozy/
+  bin/cozy          the binary
+  config.toml       Hubs, the current Hub, settings
+  keys/             device key per Hub (0600)
+  calcifer/         Calcifer's state.db, calcifer.log, lock and record
+  machine/          this computer's machine: state, identity, logs
+  outputs/          what runs made
+~/.tensorfs/        model weights (TensorFS store)
+```
+
+`config.toml`:
+
+```toml
+hub = "local"                      # the current Hub: a name below, or a URL
+
+[hubs]                             # tensorhub = https://tensorhub.com is built in
+local = "http://127.0.0.1:8819"
+
+[calcifer]
+port = 0                           # loopback port; 0 takes any free one
+```
+
+Keys this build does not read are named once and ignored. The environment carries only
+credentials and locations:
+
+| Variable | What it is |
+|---|---|
+| `HF_TOKEN` | Hugging Face credential |
+| `CIVITAI_TOKEN` | Civitai credential |
+| `COZY_DOWNLOAD_URL` | where `cozy update` and the installers fetch releases |
+
+## Platforms
+
+| | Linux x86_64 | Linux arm64 | Windows x86_64 | macOS arm64 |
+|---|---|---|---|---|
+| Controller (drive local, rented and added machines) | yes | yes | yes | yes |
+| NVIDIA machine role | yes¹ | coming (GH200, GB10, GB300) | coming (single GPU) | — |
+| Apple machine role (MPS) | — | — | — | coming |
+
+¹ On rented machines. `machine enable`, which makes this computer a machine, is *coming*.
+
+## Scripting
+
+- **Exit codes:** 0 success, 1 a refusal or a run that did not succeed, 2 a usage error.
+- **Errors:** with `--json`, every error is one envelope on stdout,
+  `{"error": {"kind", "code", "message", "remedy", "next"}}`, with at most two next steps.
+- **Columns:** human tables never truncate when stdout is not a terminal.
+
+## Coming from the Go cozy
+
+Run the Go `cozy down` first; accepted runs continue on their machines. Install this binary.
+Then:
+
+```sh
+cozy migrate --from ~/.cozy --dry-run     # what would be imported, archived and kept
+cozy migrate --from ~/.cozy
+```
+
+The import carries over your Hubs, keys, live rentals, owed runs and run history. Outputs stay
+in place.
