@@ -152,13 +152,10 @@ impl ModelRef {
                 )),
             };
         }
-        let (release, lane) = match pin.map(|p| p.split_once('/').unwrap_or((p, ""))) {
+        let (release, lane) = match pin.map(|p| p.split_once('/').ok_or(p)) {
             None => (None, None),
-            Some((release, "")) => (Some(label("release", release)?), None),
-            Some((release, lane)) => (
-                Some(label("release", release)?),
-                Some(label("lane", lane)?),
-            ),
+            Some(Err(release)) => (Some(label("release", release)?), None),
+            Some(Ok((release, lane))) => (Some(label("release", release)?), Some(label("lane", lane)?)),
         };
         Ok(ModelRef::Hub {
             repo,
