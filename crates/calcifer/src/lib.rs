@@ -509,6 +509,15 @@ impl Calcifer {
                 }
                 // It may be there: attach first, and send again only to a machine that never got it.
                 match link.run(id, run.cursor, None).await {
+                    // Imported from the Go CLI, which did not keep what it sent.
+                    Err(LinkError::NotFound) if run.state == State::Sent && run.spec.is_empty() => {
+                        return Err(Stop::Refused(Reason {
+                            code: "spec_not_kept".into(),
+                            message: "its machine never confirmed the run, and its spec was not kept across \
+                                      the move from the Go CLI; run it again"
+                                .into(),
+                        }));
+                    }
                     Err(LinkError::NotFound) if run.state == State::Sent => {
                         self.write_inputs(link, run).await?;
                         let _turn = sending.lock().await;

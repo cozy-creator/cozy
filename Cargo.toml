@@ -18,6 +18,7 @@ cozy-cli = { path = "crates/cozy-cli" }
 cozy-platform = { path = "crates/cozy-platform" }
 cozy-proto = { path = "crates/cozy-proto" }
 hub-client = { path = "crates/hub-client" }
+migrate = { path = "crates/migrate" }
 
 anstream = "1.0.0"
 anstyle = "1.0.14"
@@ -36,6 +37,7 @@ hex = "0.4"
 hyper-util = { version = "0.1.21", default-features = false, features = ["tokio"] }
 indicatif = "0.18"
 infer = { version = "0.22", default-features = false }
+jiff = { version = "0.2.38", default-features = false, features = ["std"] }
 libc = "0.2"
 nvml-wrapper = "0.13"
 openapiv3 = "2"
