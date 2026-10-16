@@ -190,8 +190,11 @@ pub fn run(args: &Args) -> Result<Report, Error> {
     store
         .import(&plan.machines, &plan.runs)
         .map_err(|e| failed(e.to_string()))?;
+    // Go's `calcifer` link went before the import: that name is this layout's directory now.
     for entry in report.entries.iter().filter(|e| e.fate == Fate::Archived) {
-        remove(&from.join(&entry.name)).map_err(failed)?;
+        if !(same && entry.name == "calcifer") {
+            remove(&from.join(&entry.name)).map_err(failed)?;
+        }
     }
     report.archive = Some(archive);
     Ok(report)
