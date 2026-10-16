@@ -25,8 +25,10 @@ uv run --locked --extra test pytest -q
 ## Release
 
 TensorD releases nothing on its own while it moves into the `cozy` binary as `cozy machine serve`
-(xs-043 T). Until then cozy-runtime's Linux wheel bundles the TensorD of `cozy-creator/tensord`
-at its `tensord.pin`.
+(xs-043 T). Until then cozy-runtime's Linux wheel bundles the output of `task release`
+(manylinux_2_28 container: glibc 2.28 floor, `version --json` names the commit) at its `tensord.pin`,
+which names a `cozy-creator/tensord` commit until Runtime fetches this tree instead. cozy's dev-build
+makes the same binary with `build=tensord`.
 
 ## Run
 
