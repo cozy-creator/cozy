@@ -45,7 +45,7 @@ impl LockFile {
             Kind::Shared => file.try_lock_shared(),
         };
         match taken {
-            Ok(()) => Ok(Some(self.held(file))),
+            Ok(()) => self.held(file, kind).map(Some),
             Err(TryLockError::WouldBlock) => Ok(None),
             Err(TryLockError::Error(error)) => Err(Error::io("lock", &self.path)(error)),
         }
@@ -59,11 +59,12 @@ impl LockFile {
             Kind::Shared => file.lock_shared(),
         }
         .map_err(Error::io("lock", &self.path))?;
-        Ok(self.held(file))
+        self.held(file, kind)
     }
 
     /// The record the holder published, read after a failed `try_lock`. A holder killed before it
-    /// released leaves its record behind, so the record of a free lock names nobody.
+    /// released leaves its record behind until the next exclusive taker erases it, so the record of
+    /// a free lock names nobody.
     pub fn holder(&self) -> Result<Option<Vec<u8>>> {
         let path = self.holder_path();
         match fs::read(&path) {
@@ -89,12 +90,20 @@ impl LockFile {
             .map_err(Error::io("open lock", &self.path))
     }
 
-    fn held(&self, file: File) -> Held {
-        Held {
-            holder: self.holder_path(),
+    /// An exclusive taker erases a killed predecessor's record: it names nobody now.
+    fn held(&self, file: File, kind: Kind) -> Result<Held> {
+        let holder = self.holder_path();
+        if kind == Kind::Exclusive
+            && let Err(error) = fs::remove_file(&holder)
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            return Err(Error::io("remove a stale lock holder", holder)(error));
+        }
+        Ok(Held {
+            holder,
             published: AtomicBool::new(false),
             _file: file,
-        }
+        })
     }
 }
 

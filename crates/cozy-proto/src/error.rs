@@ -14,6 +14,8 @@ pub enum Kind {
     NotFound,
     /// A missing or refused credential; the remedy names it.
     Credential,
+    /// The caller may not do this here (a foreign Host/Origin or a non-loopback peer).
+    Forbidden,
     /// A concurrent writer, an existing target, an idempotency key reused for another ask.
     Conflict,
     /// Not enough memory, disk or GPUs anywhere the ask may go.
@@ -86,6 +88,7 @@ impl Kind {
         match self {
             Kind::Usage | Kind::Validation => 400,
             Kind::Credential => 401,
+            Kind::Forbidden => 403,
             Kind::NotFound => 404,
             Kind::Conflict => 409,
             Kind::Capacity => 507,
@@ -120,5 +123,11 @@ mod tests {
         );
         assert_eq!(error.exit_code(), 1);
         assert_eq!(Error::new(Kind::Usage, "usage", "bad flag").exit_code(), 2);
+        let forbidden = Error::new(Kind::Forbidden, "origin_not_allowed", "foreign page");
+        let json = serde_json::to_value(&forbidden).unwrap();
+        assert_eq!(json["kind"], "forbidden");
+        assert_eq!(serde_json::from_value::<Error>(json).unwrap(), forbidden);
+        assert_eq!(forbidden.kind.http_status(), 403);
+        assert_eq!(forbidden.exit_code(), 1);
     }
 }

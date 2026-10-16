@@ -14,8 +14,13 @@ calcifer.workspace = true
 cozy-cli.workspace = true
 
 [dev-dependencies]
+cozy-platform.workspace = true
+cozy-proto.workspace = true
+hub-client = { workspace = true, features = ["testing"] }
+reqwest.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
+tokio.workspace = true
 
 [lints]
 workspace = true

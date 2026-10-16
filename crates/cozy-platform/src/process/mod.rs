@@ -55,6 +55,13 @@ impl Birth {
     }
 }
 
+/// Names this process for `ps` and `top` by its role (`calcifer`, `tensord`). It names the calling
+/// thread, so call it from the main thread before others start; Linux keeps 15 bytes. macOS and
+/// Windows can rename only threads, not a process: `Unsupported`.
+pub fn set_name(name: &str) -> Result<()> {
+    sys::set_name(name)
+}
+
 /// A handle naming exactly one birth (a pidfd, a kqueue on its exit, a process HANDLE): its kill
 /// and its exit never reach a process that reused the PID.
 #[derive(Debug)]

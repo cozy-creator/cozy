@@ -37,17 +37,24 @@ pub(super) fn kill_group(_: &Group, leader: &Child) -> io::Result<()> {
 
 pub(super) fn signal_group(group: u32) -> io::Result<()> {
     // SAFETY: plain syscall on a scalar.
-    gone_is_done(unsafe { libc::killpg(group as libc::pid_t, libc::SIGKILL) })
+    signaled(
+        unsafe { libc::killpg(group as libc::pid_t, libc::SIGKILL) },
+        group,
+    )
 }
 
-pub(super) fn gone_is_done(result: libc::c_int) -> io::Result<()> {
-    if result < 0 {
-        let error = io::Error::last_os_error();
-        if error.raw_os_error() != Some(libc::ESRCH) {
-            return Err(error);
-        }
+/// A signal's result, where a target already gone is done. macOS answers EPERM, not ESRCH, for
+/// a process (or a group led by one) that has exited and is not yet reaped.
+pub(super) fn signaled(result: libc::c_int, pid: u32) -> io::Result<()> {
+    if result >= 0 {
+        return Ok(());
     }
-    Ok(())
+    let error = io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::ESRCH) => Ok(()),
+        Some(libc::EPERM) if super::sys::exited(pid) => Ok(()),
+        _ => Err(error),
+    }
 }
 
 /// Whether `fd` turned readable within `period` (`None`: wait for it).

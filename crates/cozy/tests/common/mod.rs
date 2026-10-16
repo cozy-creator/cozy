@@ -36,6 +36,57 @@ impl Home {
         })
     }
 
+    /// A fresh home whose current Hub is the job's Tensorhub (`TENSORHUB_URL`, Tensorhub's
+    /// dev-build `cozy_ref` job); `None` without one.
+    pub fn with_hub() -> Option<Self> {
+        let Some(url) = std::env::var_os("TENSORHUB_URL") else {
+            let _ = writeln!(
+                std::io::stderr(),
+                "skipped: no Tensorhub (TENSORHUB_URL is unset)"
+            );
+            return None;
+        };
+        let home = Self::new()?;
+        home.write_config(&format!(
+            "hub = \"ci\"\n[hubs]\nci = \"{}\"\n",
+            url.to_string_lossy()
+        ));
+        Some(home)
+    }
+
+    /// Signs `email` up at the home's Hub and keeps its device key where `cozy` reads it, as
+    /// `cozy login` would; registers the account name before the `@`. Answers that name.
+    pub fn sign_in(&self, email: &str) -> String {
+        let url = std::env::var("TENSORHUB_URL").expect("a Tensorhub");
+        let log = std::env::var("TENSORHUB_LOG").expect("the Tensorhub's log");
+        let hub = cozy_proto::config::Hub {
+            name: Some("ci".into()),
+            origin: cozy_proto::config::origin(&url).unwrap(),
+        };
+        let home = cozy_platform::paths::Home::at(self.root());
+        let name = email.split('@').next().unwrap().to_owned();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let http = reqwest::Client::new();
+            let anonymous =
+                hub_client::Client::connect(&url, http.clone(), hub_client::Credential::Anonymous);
+            let (key, bearer) = hub_client::testing::sign_up(&anonymous, email, log.as_ref())
+                .await
+                .expect("sign up");
+            std::fs::create_dir_all(home.keys()).unwrap();
+            key.save(&hub.device_key(&home)).unwrap();
+            let user = hub_client::Client::connect(
+                &url,
+                http,
+                hub_client::Credential::Bearer(bearer.token),
+            );
+            user.register_account(&name, &hub_client::types::Empty(Default::default()))
+                .await
+                .expect("an account name");
+        });
+        name
+    }
+
     /// The cozy home: `~/.cozy` under the child's `HOME`.
     pub fn root(&self) -> PathBuf {
         self.dir.path().join(".cozy")
