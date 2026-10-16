@@ -557,6 +557,8 @@ struct Run<'r, 'a> {
     restarts: AtomicU64,
     opened: AtomicU64,
     opened_bytes: AtomicU64,
+    /// The chunks of every object opened: what bounds the requests a run keeps out.
+    chunks: AtomicUsize,
     began: Instant,
     /// When each worker began waiting on the hub for a URL, in ms since `began` plus one.
     /// A wait of a sample or more is the hub's to judge, and is not the pull standing still.
@@ -605,6 +607,7 @@ impl<'a> Download<'a> {
             restarts: AtomicU64::new(0),
             opened: AtomicU64::new(0),
             opened_bytes: AtomicU64::new(0),
+            chunks: AtomicUsize::new(0),
             began,
             minting: (0..streams).map(|_| AtomicU64::new(0)).collect(),
             minted: AtomicU64::new(0),
@@ -822,9 +825,12 @@ impl<'a> Run<'_, 'a> {
             state.busy += 1;
             return Next::Open(state.again.pop_front(), before);
         }
-        if let (None, false, Some(stolen)) = (due, held, self.steal()) {
-            state.busy += 1;
-            return Next::Take(Some(stolen));
+        // Steal only to take: a stolen range dropped here would never be asked for.
+        if due.is_none() && !held && state.busy < self.chunks.load(Ordering::Relaxed) {
+            if let Some(stolen) = self.steal() {
+                state.busy += 1;
+                return Next::Take(Some(stolen));
+            }
         }
         if state.queue.is_empty() && state.busy == 0 && feed.waiting().is_none() {
             state.done = true;
@@ -841,8 +847,11 @@ impl<'a> Run<'_, 'a> {
     }
 
     /// With nothing else to do, the back half of the running request with the most still to
-    /// come: two requests then bring it side by side. A request with under two pieces left, an
-    /// origin not yet known to range, and an object nothing wants are left alone.
+    /// come: two requests then bring it side by side. Requests out stay within the chunks of
+    /// the objects opened, as a batch's workers do ([`Batch::streams`]): 48 chunks cut into
+    /// 384 MiB-sized requests leave each so slow that no crawling one stands out to be
+    /// restarted. A request with under two pieces left, an origin not yet known to range, and
+    /// an object nothing wants are left alone.
     fn steal(&self) -> Option<Chunk<'a>> {
         let (mut best, mut most) = (None, 2 * PIECE_BYTES);
         for (slot, flight) in self.flights.iter().enumerate() {
@@ -937,6 +946,7 @@ impl<'a> Run<'_, 'a> {
         let grant = opening.grant.clone();
         self.opened.fetch_add(1, Ordering::Relaxed);
         self.opened_bytes.fetch_add(wanted.length, Ordering::Relaxed);
+        self.chunks.fetch_add(wanted.length.div_ceil(job.chunk).max(1) as usize, Ordering::Relaxed);
         let length = wanted.length;
         let (path, file, part, chunks) = match job.keep {
             Some(keep) => {
@@ -1709,7 +1719,8 @@ impl<'a> Run<'_, 'a> {
                     continue;
                 };
                 flying = true;
-                if flight.preempted {
+                // Stopped already, for more urgent work or as slow: it is ending, judged once.
+                if flight.preempted || flight.attempt.stopped.load(Ordering::Acquire) {
                     continue;
                 }
                 let bytes = flight.attempt.bytes.load(Ordering::Relaxed);
