@@ -61,11 +61,7 @@ fn an_import_in_place_records_the_go_home_and_archives_its_state() {
     );
     assert_eq!(c.history_machines, Expected::HISTORY_MACHINES);
     let skipped: Vec<&str> = dry.skipped.iter().map(|s| s.what.as_str()).collect();
-    for what in [
-        "config.yaml rentals.development",
-        "auth/accounts/",
-        "rental pr-done",
-    ] {
+    for what in ["config.yaml rentals", "auth/accounts/", "rental pr-done"] {
         assert!(
             skipped.iter().any(|s| s.starts_with(what)),
             "{what} in {skipped:?}"

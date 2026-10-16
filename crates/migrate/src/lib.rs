@@ -150,16 +150,6 @@ pub fn run(args: &Args) -> Result<Report, Error> {
         delete_caches(&from, &into, &mut report)?;
         return Ok(report);
     }
-    if !from.join("creator.sqlite").is_file() {
-        return Err(Error::new(
-            Kind::NotFound,
-            "no_go_home",
-            format!(
-                "{} holds no creator.sqlite: it is not the Go CLI's home",
-                from.display()
-            ),
-        ));
-    }
     if !args.dry_run && imported(&into)? {
         return Err(Error::new(
             Kind::Conflict,
@@ -170,6 +160,16 @@ pub fn run(args: &Args) -> Result<Report, Error> {
             ),
         )
         .remedy("the import runs once"));
+    }
+    if !from.join("creator.sqlite").is_file() {
+        return Err(Error::new(
+            Kind::NotFound,
+            "no_go_home",
+            format!(
+                "{} holds no creator.sqlite: it is not the Go CLI's home",
+                from.display()
+            ),
+        ));
     }
     let records = go::records(&from).map_err(|e| invalid("go_home_unreadable", e))?;
     let rebase = plan::Rebase {
@@ -484,7 +484,7 @@ fn print(report: &Report, json: bool) {
         "  keys      {} device, {} sessions, owner {}, {} rental",
         c.device_keys,
         c.sessions,
-        if c.owner_key { 1 } else { 0 },
+        u8::from(c.owner_key),
         c.rental_keys
     );
     println!(

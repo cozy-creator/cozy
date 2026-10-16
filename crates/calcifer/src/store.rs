@@ -1361,7 +1361,7 @@ fn import_run(tx: &Transaction, run: &ImportedRun) -> Result<()> {
             status,
             run.reason.as_ref().map(|r| &r.code),
             run.reason.as_ref().map(|r| &r.message),
-            run.outcome.as_ref().map(|o| prost::Message::encode_to_vec(o)),
+            run.outcome.as_ref().map(prost::Message::encode_to_vec),
             state_seq,
             run.created_at_ms,
             run.accepted_at_ms,
