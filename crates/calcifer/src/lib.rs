@@ -7,7 +7,9 @@
 //! its acceptance. From then on, the task follows the run from the durable cursor to its outcome.
 //! A Calcifer that stops leaves accepted work running; the next one resumes each run from the
 //! cursor.
+pub mod api;
 pub mod link;
+pub mod serve;
 pub mod store;
 
 use std::{
@@ -59,6 +61,8 @@ pub struct Calcifer {
     tasks: Mutex<JoinSet<()>>,
     /// Orders staging a run's inputs against deleting a settled run's.
     staging: Mutex<()>,
+    /// Told each time a run is settled: what Calcifer owes may now be nothing.
+    owed: watch::Sender<()>,
 }
 
 /// What a run is doing now, never stored: the latest of each live event.
@@ -120,6 +124,7 @@ impl Calcifer {
             machines: Mutex::default(),
             tasks: Mutex::default(),
             staging: Mutex::default(),
+            owed: watch::channel(()).0,
         });
         calcifer.sweep_inputs()?;
         for id in calcifer.store.unsettled()? {
@@ -135,6 +140,20 @@ impl Calcifer {
 
     pub fn store(&self) -> &Store {
         &self.store
+    }
+
+    /// What Calcifer still owes, which a next Calcifer would resume: every unsettled run's id. A
+    /// store it cannot read owes its error.
+    pub fn owed(&self) -> Vec<String> {
+        match self.store.unsettled() {
+            Ok(ids) => ids.into_iter().map(String::from).collect(),
+            Err(e) => vec![e.to_string()],
+        }
+    }
+
+    /// Changes each time a run is settled.
+    pub fn owed_changed(&self) -> watch::Receiver<()> {
+        self.owed.subscribe()
     }
 
     /// Every event of every run, as it happens.
@@ -314,6 +333,7 @@ impl Calcifer {
             me.follow_to_end(&id, &wake).await;
             lock(&me.drivers).remove(&id);
             lock(&me.live).remove(&id);
+            me.owed.send_replace(());
         });
     }
 
