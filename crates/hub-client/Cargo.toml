@@ -1,0 +1,42 @@
+[package]
+name = "hub-client"
+description = "Tensorhub's client: generated from its API document, with device-key login, Bearer, DPoP and the run-capability trade"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+aws-lc-rs.workspace = true
+base64.workspace = true
+chrono.workspace = true
+ed25519-dalek.workspace = true
+progenitor-client.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+tracing.workspace = true
+# testing
+rcgen = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+tokio-rustls = { workspace = true, optional = true }
+
+[features]
+# Helpers for tests against a real Tensorhub (hub_client::testing).
+testing = ["dep:rcgen", "dep:rustls", "dep:tokio-rustls", "tokio/io-util", "tokio/net", "tokio/rt"]
+
+[build-dependencies]
+openapiv3.workspace = true
+prettyplease.workspace = true
+progenitor.workspace = true
+quote.workspace = true
+serde_yaml.workspace = true
+syn.workspace = true
+
+[dev-dependencies]
+hub-client = { path = ".", features = ["testing"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
