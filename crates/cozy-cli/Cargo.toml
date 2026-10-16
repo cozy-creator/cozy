@@ -15,15 +15,31 @@ clap_complete.workspace = true
 comfy-table.workspace = true
 cozy-platform.workspace = true
 cozy-proto.workspace = true
+getrandom.workspace = true
+hex.workspace = true
 hub-client.workspace = true
+infer.workspace = true
 progenitor-client.workspace = true
 reqwest.workspace = true
+self-replace.workspace = true
+semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_yaml.workspace = true
+sha2.workspace = true
+sigstore-verify.workspace = true
 supports-hyperlinks.workspace = true
-tokio.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["signal"] }
 toml_edit.workspace = true
 url.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+flate2.workspace = true
+tar.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+zip.workspace = true
 
 [lints]
 workspace = true

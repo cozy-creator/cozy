@@ -88,7 +88,8 @@ jobs:
             echo "## ${{ matrix.os }}"
             echo "rust=${{ steps.rust.outcome }} seams=${{ steps.seams.outcome }} test=${{ steps.test.outcome }} go: build=${{ steps.build.outcome }} vet=${{ steps.vet.outcome }} run=${{ steps.run.outcome }}"
             echo '```'
-            cat rust.txt seams.txt build.txt vet.txt 2>/dev/null | head -200
+            # The tail of each: where errors are. `head` would end the pipe early (SIGPIPE under pipefail).
+            for f in rust.txt seams.txt build.txt vet.txt; do [ ! -f "$f" ] || tail -n 50 "$f"; done
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
 

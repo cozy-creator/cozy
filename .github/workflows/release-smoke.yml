@@ -1,5 +1,6 @@
 name: release-smoke
 # dist global-artifacts job (dist-workspace.toml): a failure here stops the release before it is hosted.
+# It also adds each archive's attestation bundles to the release (<archive>.sigstore.jsonl).
 # The CPU smoke of design §6.4 on every release runner, against this run's own artifacts served from a local
 # mirror (COZY_DOWNLOAD_URL is the release location for the installers and `cozy update` alike): install
 # script, --version, PATH, up, hub list, package search (tensorhub.com, anonymous), update to this release,
@@ -62,13 +63,24 @@ jobs:
             done
             rm bin
           } | tee -a "$GITHUB_STEP_SUMMARY"
+      # Each archive's bundles ride in the release as <archive>.sigstore.jsonl (one Sigstore bundle per
+      # line): `cozy update` verifies those, never GitHub's rate-limited attestations API.
       - name: Every archive carries this workflow's attestation
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          mkdir attestations
           for f in mirror/cozy-*.tar.gz mirror/cozy-*.zip; do
             gh attestation verify "$f" -R "$GITHUB_REPOSITORY" --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml"
+            gh api "repos/$GITHUB_REPOSITORY/attestations/sha256:$(sha256sum "$f" | cut -d' ' -f1)" \
+              | jq -c '.attestations[].bundle | select(. != null)' > "attestations/${f#mirror/}.sigstore.jsonl"
           done
+          cp attestations/* mirror/
+      # host releases every artifacts-* upload.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: artifacts-attestations
+          path: attestations/
       - uses: actions/upload-artifact@v7
         with:
           name: smoke-mirror
@@ -134,7 +146,7 @@ jobs:
               return
             fi
             out=$("$cozy" --json "$@") || code=$?
-            if [ "$code" = 2 ] && printf '%s' "$out" | grep -q '"code":"not_ported"'; then
+            if [ "$code" = 2 ] && printf '%s' "$out" | grep -Eq '"code": *"not_ported"'; then
               echo "skipped, not ported: cozy $*"
               return
             fi
@@ -144,10 +156,10 @@ jobs:
           step up
           step hub list
           step package search sdxl
-          touch before-update
+          before=$(ls -i "$cozy")
           step update "$VERSION"
           if [ "$ran" = 1 ]; then
-            [ "$cozy" -nt before-update ] || { echo "::error::cozy update $VERSION left the binary in place"; fail=1; }
+            [ "$(ls -i "$cozy")" != "$before" ] || { echo "::error::cozy update $VERSION left the binary in place"; fail=1; }
             [ "$("$cozy" --version)" = "cozy $VERSION" ] || { echo "::error::the updated binary is not cozy $VERSION"; fail=1; }
           fi
           step down
