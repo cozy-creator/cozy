@@ -1,5 +1,6 @@
 //! The wire types every cozy process shares.
 
+pub mod calcifer;
 pub mod capability;
 pub mod error;
 pub mod ids;
