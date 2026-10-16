@@ -82,7 +82,7 @@ func TestH3ServingRentalIgnoresCapturedSiblingResidency(t *testing.T) {
 	if candidate.Verdict != "" || len(children) != 0 {
 		t.Fatalf("one H3 serving slot acquired %d unrelated captured slots: %s", len(children), candidate.Verdict)
 	}
-	if need := records.Resident(candidate.Models, h100SXM); need.Bytes != textBytes {
+	if need := records.Resident(candidate.Models); need.Bytes != textBytes {
 		t.Fatalf("actual one-slot H3 need = %+v", need)
 	}
 
@@ -91,7 +91,7 @@ func TestH3ServingRentalIgnoresCapturedSiblingResidency(t *testing.T) {
 	independent := model
 	independent.Slot = "fl2va.models.independent_model"
 	models = []records.ModelRef{model, independent}
-	if need := records.Resident(models, h100SXM); need.Bytes != 2*textBytes {
+	if need := records.Resident(models); need.Bytes != 2*textBytes {
 		t.Fatalf("independent resident slots were collapsed: %+v", need)
 	}
 	candidate = rental.Purchases([]hub.RentalSKU{sku}, models, true, false, constraints)[0]
@@ -99,13 +99,14 @@ func TestH3ServingRentalIgnoresCapturedSiblingResidency(t *testing.T) {
 		t.Fatalf("two actual slots bypassed the per-card floor: %+v", candidate)
 	}
 
-	// The same captured segment remains available to the CPU long_form parent;
-	// its model defaults still participate in choosing a suitable rental.
+	// The same captured segment remains available to the CPU long_form parent; its model
+	// default, at the lane the machine would serve, still sizes a suitable rental.
 	request.Entrypoint = "long_form"
 	request.NeedsAccelerator, request.Models = false, nil
 	children, problem = resolver.UnpublishedChildModels(request)
 	fatal(t, problem)
-	if len(children) != 1 || children[0].BindingSlot() != "segment.models.model" || len(children[0].Ladder) != 3 {
+	if len(children) != 1 || children[0].BindingSlot() != "segment.models.model" ||
+		children[0].Lane != "fp8-pruned" || children[0].ComponentBytes["text_encoder"] != textBytes {
 		t.Fatalf("CPU composition lost its captured model defaults: %+v", children)
 	}
 }

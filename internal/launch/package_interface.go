@@ -10,8 +10,8 @@
 //     metadata is read without a content fingerprint admission gate.
 //   - THE PLACEMENT FACTS come from the exact PlacementSet retained at install. Runtime owns
 //     no local model-ref index, and cozy-creator never composes a TensorFS store path.
-//   - THE SELECTION is the request's own: the hub binding's rung for the machine, or a
-//     `model.<param>=` run key, with immutable authored defaults when no owner override exists.
+//   - THE SELECTION is the request's own `model.<param>=` run key; every other slot takes its
+//     authored default release on the machine, which picks the lane (xs-042).
 //
 // For a wholly weightless package the installed runtime is the sole canonical plan writer:
 // `bindings --json` reports exact WeightsSubjects before spawn and
@@ -31,7 +31,6 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
-	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 )
 
@@ -93,11 +92,11 @@ type WeightsOutput struct {
 	MaxBytes uint64 `json:"max_bytes"`
 }
 
-// Slot is one declared model binding path with optional authored selection defaults. Its members
-// mirror cozy-runtime's `internal/package_interface.py` slot (cr-078a): `{class, component_use,
-// path}` plus the class's two closed consents `encoded_leaves` and `fusion` (h3a-015) and an
-// optional `sequence_parallel` document. `stamps` is a RETIRED member: every release published before the cut ships an
-// empty map, which reads as nothing declared, and a value in it refuses by name below.
+// Slot is one declared model binding path. Its members mirror cozy-runtime's
+// `internal/package_interface.py` slot (cr-078a): `{class, component_use, path}` plus the
+// class's two closed consents `encoded_leaves` and `fusion` (h3a-015), an optional
+// `sequence_parallel` document, and the slot's default release and precision tolerances
+// (xs-042 C1).
 type Slot struct {
 	Class            string              `json:"class"`
 	Path             string              `json:"path"`
@@ -106,18 +105,14 @@ type Slot struct {
 	EncodedLeaves    string              `json:"encoded_leaves,omitempty"`
 	Fusion           string              `json:"fusion,omitempty"`
 	SequenceParallel json.RawMessage     `json:"sequence_parallel,omitempty"`
-	DefaultLadder    []ModelDefaultRung  `json:"default_ladder,omitempty"`
+	// Default is the model release a run that names none loads: `[org/]model@release`.
+	Default string `json:"default,omitempty"`
+	// MinBits is the lowest weight precision the rules may pick by themselves (16, 8 or 4;
+	// absent is 8), and Phase is "decode" for an LM token loop (absent is compute).
+	MinBits int    `json:"min_bits,omitempty"`
+	Phase   string `json:"phase,omitempty"`
 	// Weights is a `Weights[M]` argument: the raw checkpoint, read and never constructed.
-	Weights        bool                   `json:"weights,omitempty"`
-	DefaultBinding *hub.PackageBindingRow `json:"-"`
-}
-
-// ModelDefaultRung binds a GPU pattern to a full org/model@release/lane reference.
-// This immutable metadata is a fallback; it is never a mutable Hub binding row.
-type ModelDefaultRung struct {
-	GPU  string `json:"gpu"`
-	GPUs int    `json:"gpus,omitempty"`
-	Lane string `json:"lane"`
+	Weights bool `json:"weights,omitempty"`
 }
 
 // SequenceParallelDegrees intersects the selected entrypoint's model slots. Other
@@ -257,9 +252,7 @@ func validateEntrypoint(ep *Entrypoint) *exit.Error {
 				"%s has invalid model path %q; it must be %s<parameter>", ep.Name, slot.Path, prefix)
 		}
 		slot.Param = param
-		var problem *exit.Error
-		slot.DefaultBinding, problem = defaultModelBinding(*slot)
-		if problem != nil {
+		if problem := validateDefault(*slot); problem != nil {
 			return problem
 		}
 	}

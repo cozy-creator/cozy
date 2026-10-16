@@ -48,7 +48,7 @@ func TestAssetBundleHelpMatchesAutomaticEmptyInputs(t *testing.T) {
 			fatal(t, problem)
 			entrypoint := &parsed.Entrypoints[0]
 			for _, out := range []string{
-				launch.DescribeContract("proof/generic/generate", entrypoint, nil),
+				launch.DescribeContract("proof/generic/generate", entrypoint, ""),
 				launch.DescribeArguments(entrypoint) + launch.UsageLine("proof/generic/generate", entrypoint),
 			} {
 				request := strings.Split(out, "  output:")[0]

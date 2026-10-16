@@ -35,18 +35,18 @@ func TestRunAcceptsInterfaceMembersFromANewerRuntime(t *testing.T) {
 	must(t, err)
 	root, path, _, _ := admissionRoot(t, raw, "NVIDIA B200", false)
 
-	code, out := runAdmissionCLI(t, root, path, "run", ladderPackage+"/generate", "--json",
+	code, out := runAdmissionCLI(t, root, path, "run", h3Package+"/generate", "--json",
 		"--idempotency-key", "evolved-short", "prompt=", `mask:={"shape":[1]}`)
 	if code == 0 || !strings.Contains(out, "prompt") || strings.Contains(out, "proof stopped before model acquisition") {
 		t.Fatalf("the readable min_length bound was not enforced before acquisition [exit %d]: %s", code, out)
 	}
 	assertAdmissionDidNotSubmit(t, root, "evolved-short")
-	code, out = runAdmissionCLI(t, root, path, "run", ladderPackage+"/generate", "--json",
+	code, out = runAdmissionCLI(t, root, path, "run", h3Package+"/generate", "--json",
 		"--idempotency-key", "evolved", "prompt=hello", `mask:={"shape":[1]}`)
 	if code == 0 || !strings.Contains(out, `"machine":"local"`) {
 		t.Fatalf("a newer Runtime's interface members refused the run before it reached the machine [exit %d]: %s", code, out)
 	}
-	code, out = runAdmissionCLI(t, root, path, "run", ladderPackage+"/tune", "--json", "--idempotency-key", "evolved-tune")
+	code, out = runAdmissionCLI(t, root, path, "run", h3Package+"/tune", "--json", "--idempotency-key", "evolved-tune")
 	if code == 0 || !strings.Contains(out, `tune has invalid model path \"tune.weights.model\"`) {
 		t.Fatalf("the callable this CLI cannot read did not refuse with its reason [exit %d]: %s", code, out)
 	}

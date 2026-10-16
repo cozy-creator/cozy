@@ -19,10 +19,10 @@ import (
 // TestWideProductsAreOnlyBoughtForAPackageThatDeclaresTheDegree is the PRE-SPEND half.
 // Width is not capacity — every GPU of a group holds the full weights — so the only thing
 // that uses a second card is a group of that degree, and only the package's author can say
-// the construction can be built at one. A wide product is therefore excluded from the
-// ladder unless the degree is declared, which keeps a typed worker refusal from costing an
-// hour's rent. A REUSE is not held to it: the pod is paid for, and the worker runs it at
-// the largest declared degree that fits.
+// the construction can be built at one. A wide product is therefore excluded unless the
+// degree is declared, which keeps a typed worker refusal from costing an hour's rent, and
+// bought only where fewer cards of it cannot hold the run (xs-042). A REUSE is not held to
+// it: the pod is paid for, and the worker runs it at the largest declared degree that fits.
 func TestWideProductsAreOnlyBoughtForAPackageThatDeclaresTheDegree(t *testing.T) {
 	skus := []hub.RentalSKU{
 		{Name: "h100", AcceleratorModel: "NVIDIA H100 80GB HBM3", AcceleratorCount: 1,
@@ -32,14 +32,17 @@ func TestWideProductsAreOnlyBoughtForAPackageThatDeclaresTheDegree(t *testing.T)
 		{Name: "h100", AcceleratorModel: "NVIDIA H100 80GB HBM3", AcceleratorCount: 4,
 			VRAMGB: 80, PriceUSDMicrosPerHour: 13_960_000},
 	}
-	verdicts := func(constraints rental.Constraints, composes bool) map[string]string {
+	verdicts := func(constraints rental.Constraints, composes bool, offered ...hub.RentalSKU) map[string]string {
 		out := map[string]string{}
-		for _, c := range rental.Purchases(skus, nil, true, composes, constraints) {
+		if offered == nil {
+			offered = skus
+		}
+		for _, c := range rental.Purchases(offered, nil, true, composes, constraints) {
 			out[orchestrator.MachineLabel(c.SKU, c.GPUs)] = c.Verdict
 		}
 		return out
 	}
-	// Nothing declared: the ladder is one-card products, which is every package today.
+	// Nothing declared: only one-card products, which is every package today.
 	undeclared := verdicts(rental.Constraints{}, false)
 	if undeclared["h100"] != "" {
 		t.Fatalf("the one-card product was excluded: %q", undeclared["h100"])
@@ -51,21 +54,25 @@ func TestWideProductsAreOnlyBoughtForAPackageThatDeclaresTheDegree(t *testing.T)
 				name, undeclared[name])
 		}
 	}
-	// `@sequence_parallel(degrees=(2, 4))`: both widths become buyable, and the one-card
-	// product stays buyable beside them — a declared degree is a capability, not a demand.
+	// `@sequence_parallel(degrees=(2, 4))`: a declared degree is a capability, not a demand.
+	// Every card holds the whole weights, so the fewest cards that hold the run are bought.
 	declared := verdicts(rental.Constraints{Degrees: []int{2, 4}}, false)
-	for _, name := range []string{"h100", "2x h100", "4x h100"} {
-		if declared[name] != "" {
-			t.Fatalf("%s was excluded from a package declaring degrees 2 and 4: %q",
-				name, declared[name])
+	if declared["h100"] != "" {
+		t.Fatalf("the one-card product was excluded from a package declaring degrees 2 and 4: %q", declared["h100"])
+	}
+	for _, name := range []string{"2x h100", "4x h100"} {
+		if declared[name] != "excluded:width_unneeded: h100 holds the run" {
+			t.Fatalf("%s verdict = %q; one card holds the run", name, declared[name])
 		}
 	}
-	// A wider offer may run the largest package-supported subset, which is two here.
-	partial := verdicts(rental.Constraints{Degrees: []int{2}}, false)
-	for _, name := range []string{"2x h100", "4x h100"} {
-		if partial[name] != "" {
-			t.Fatalf("supported subset was excluded on %s: %q", name, partial[name])
-		}
+	// With no one-card offer the narrowest declared width is bought; a wider offer may run
+	// the largest package-supported subset, which is two here.
+	wide := verdicts(rental.Constraints{Degrees: []int{2}}, false, skus[1:]...)
+	if wide["2x h100"] != "" || wide["4x h100"] != "excluded:width_unneeded: 2x h100 holds the run" {
+		t.Fatalf("wide offers: %v", wide)
+	}
+	if subset := verdicts(rental.Constraints{Degrees: []int{2}}, false, skus[2]); subset["4x h100"] != "" {
+		t.Fatalf("supported subset was excluded on 4x h100: %q", subset["4x h100"])
 	}
 	// A composition shards nothing itself: a wide pod idles every card but one for the
 	// whole hour, whatever the package declares.

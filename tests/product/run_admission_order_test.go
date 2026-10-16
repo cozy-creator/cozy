@@ -34,7 +34,7 @@ func admissionInterface(t *testing.T, optionalPrompt, requiredImages bool) []byt
 	must(t, json.Unmarshal([]byte(declaredAssetsInterface), &doc))
 	ep := doc["entrypoints"].([]any)[0].(map[string]any)
 	ep["name"] = "generate"
-	ep["models"] = []any{map[string]any{"class": "H3", "path": ladderSlot, "component_use": map[string]any{}}}
+	ep["models"] = []any{map[string]any{"class": "H3", "path": h3Slot, "component_use": map[string]any{}, "default": h3Default}}
 	fields := ep["request"].(map[string]any)["fields"].([]any)
 	prompt := fields[0].(map[string]any)
 	prompt["constraints"] = map[string]any{"min_length": 1}
@@ -54,10 +54,7 @@ func admissionInterface(t *testing.T, optionalPrompt, requiredImages bool) []byt
 
 func admissionRoot(t *testing.T, iface []byte, gpu string, offline bool) (root, path, activity string, probe *admissionProbe) {
 	t.Helper()
-	h := newLadderHub(t)
-	row := goodLadder()
-	row.Ladder = row.Ladder[:2] // H100 and B200, deliberately no catch-all.
-	h.bind(row)
+	h := newStandInHub(t)
 	probe = &admissionProbe{}
 	parsed, problem := launch.DecodePackageInterface(iface)
 	fatal(t, problem)
@@ -109,7 +106,7 @@ func admissionRoot(t *testing.T, iface []byte, gpu string, offline bool) (root, 
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()
-	_, problem = store.Activate(records.PackageInstall{ID: "inst-admission", Package: ladderPackage,
+	_, problem = store.Activate(records.PackageInstall{ID: "inst-admission", Package: h3Package,
 		Major: 1, Version: "1.0.0", SourceKind: "tensorhub", Dir: installDir,
 		Platform: "linux-x86", Hub: server.URL})
 	fatal(t, problem)
@@ -179,7 +176,7 @@ func TestRunValidatesArgumentsBeforeModelResolution(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			root, path, activity, probe := admissionRoot(t, admissionInterface(t, false, test.images),
 				"NVIDIA GeForce RTX 4070 Laptop GPU", test.offline)
-			args := append([]string{"run", ladderPackage + "/generate", "--json", "--idempotency-key", "invalid-arguments"}, test.args...)
+			args := append([]string{"run", h3Package + "/generate", "--json", "--idempotency-key", "invalid-arguments"}, test.args...)
 			code, out := runAdmissionCLI(t, root, path, args...)
 			if code != 1 || !strings.Contains(out, `"code":"request_payload_invalid"`) || !strings.Contains(out, test.field) {
 				t.Errorf("argument refusal lost to model resolution [exit %d]: %s", code, out)
@@ -204,7 +201,7 @@ func TestRunValidatesArgumentsBeforeModelResolution(t *testing.T) {
 
 func TestBareRunReportsRequiredArgumentsAndFullInterface(t *testing.T) {
 	root, path, activity, probe := admissionRoot(t, admissionInterface(t, false, false), "unmatched GPU", true)
-	code, out := runAdmissionCLI(t, root, path, "run", ladderPackage+"/generate")
+	code, out := runAdmissionCLI(t, root, path, "run", h3Package+"/generate")
 	for _, want := range []string{"Error: provide required arguments:", "prompt", "prompt: str", "assets:", "steps: int", "(optional)"} {
 		if code != 1 || !strings.Contains(out, want) {
 			t.Errorf("bare run omitted %q [exit %d]: %s", want, code, out)

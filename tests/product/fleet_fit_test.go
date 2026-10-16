@@ -18,45 +18,41 @@ import (
 
 // cl-174, the runs that filed it (2026-09-08 00:06–00:25Z, req-829410d83cf9a3d7996184dc,
 // req-2e366a367e2050667b25ad35 and siblings). An explicit
-// `model.model=paul/minimax-h3@1.0.0-rc.1/fp8-adaln-pruned` under a package whose ladder binds
-// rc.2 carried no ladder, so the unsized rc.1 lane was held to whole-lane bytes (96.2 GiB) and
-// BOTH attached H100s — one running that very lane, one idle — read excluded:vram_short; the
+// `model.model=paul/minimax-h3@1.0.0-rc.1/fp8-adaln-pruned` under a package defaulting to rc.2
+// read BOTH attached H100s — one running that very lane, one idle — as excluded:vram_short; the
 // H200 and B200 fit and the spend cap refused them; the refusal FAILED the request with no
 // request.placement record. At 00:05:40Z a bare run had also taken the busy H100 over the idle
-// one on the name tie. These arms drive the real binary and Calcifer against the stand-in hub
-// with the card as it stood: rc.1 unsized, rc.2 sized and bound.
+// one on the name tie. These arms drive the real binary and Calcifer against the stand-in hub:
+// the explicit rc.1 lane is held to the components it stages, whatever the default names.
 
 const fleetCapVerdict = "excluded:rental.fleet_spend_cap"
 
-// fleetHub is the card and binding of 2026-09-08: the package's ladder names rc.2.
-func fleetHub(t *testing.T) *ladderHub {
-	h := newLadderHub(t)
-	h.unsized, h.later = true, true
-	ladder := goodLadder()
-	ladder.Release = "1.0.0-rc.2"
-	h.bind(ladder)
+// fleetHub is the card of 2026-09-08: the package's default names rc.2.
+func fleetHub(t *testing.T) *standInHub {
+	h := newStandInHub(t, h3Model+"@1.0.0-rc.2")
+	h.later = true
 	return h
 }
 
-// fleetRoot is ladderRoot with the stand-in hub's owner spend cap at `capUSD` per hour.
-func fleetRoot(t *testing.T, h *ladderHub, capUSD float64) string {
+// fleetRoot is standInRoot with the stand-in hub's owner spend cap at `capUSD` per hour.
+func fleetRoot(t *testing.T, h *standInHub, capUSD float64) string {
 	t.Helper()
 	h.mu.Lock()
 	h.spendCap = int64(capUSD * 1_000_000)
 	h.mu.Unlock()
-	return ladderRoot(t, h)
+	return standInRoot(t, h)
 }
 
 // plantH100 records one H100 rental the fleet holds, with the media bearer and creator key
 // an attached one carries; `attached` gives it its worker address and certificate.
-func plantH100(t *testing.T, root string, h *ladderHub, store *records.Store, id, machine string, attached bool) records.Rental {
+func plantH100(t *testing.T, root string, h *standInHub, store *records.Store, id, machine string, attached bool) records.Rental {
 	t.Helper()
 	return plantAttached(t, root, h, store, records.Rental{AcceleratorCount: 1, ID: id, MachineName: machine, SKU: "h100-80",
 		AcceleratorModel: h100SXM, HourlyRateUSDMicros: 2_490_000, State: "ready", Hub: h.server.URL}, attached)
 }
 
 // plantAttached records one ready rental of any class the fleet holds.
-func plantAttached(t *testing.T, root string, h *ladderHub, store *records.Store, row records.Rental, attached bool) records.Rental {
+func plantAttached(t *testing.T, root string, h *standInHub, store *records.Store, row records.Rental, attached bool) records.Rental {
 	t.Helper()
 	id := row.ID
 	rentals := filepath.Join(root, "rentals")
@@ -86,7 +82,7 @@ func plantAttached(t *testing.T, root string, h *ladderHub, store *records.Store
 func holdQueued(t *testing.T, store *records.Store, requestID, rentalID string) {
 	t.Helper()
 	if _, _, problem := store.Submit(records.Request{ID: requestID, IdemKey: "idem-" + requestID,
-		BodyDigest: "sha256:" + strings.Repeat("ab", 32), Package: ladderPackage, Entrypoint: "generate",
+		BodyDigest: "sha256:" + strings.Repeat("ab", 32), Package: h3Package, Entrypoint: "generate",
 		Payload: []byte("{}"), Rental: true, Worker: rentalID, MachineExecutionObserver: true}); problem != nil {
 		t.Fatal(problem.Message)
 	}
@@ -138,8 +134,8 @@ func lastPlacement(t *testing.T, store *records.Store, requestID string) map[str
 }
 
 // The 00:25:31Z arm: two attached idle H100s, the explicit rc.1 lane, every purchase over
-// the hub's cap (never asked: an attached machine fits). The owner's rung names the card and the lane, so the lane fits; the cheaper-named
-// idle machine is reused, the record is written, nothing is bought.
+// the hub's cap (never asked: an attached machine fits). The lane's components fit; the
+// cheaper-named idle machine is reused, the record is written, nothing is bought.
 func TestExplicitLaneOfAnotherReleaseReusesTheIdleAttachedRental(t *testing.T) {
 	h := fleetHub(t)
 	root := fleetRoot(t, h, 5)
@@ -155,7 +151,7 @@ func TestExplicitLaneOfAnotherReleaseReusesTheIdleAttachedRental(t *testing.T) {
 		row, problem = store.RequestByIdempotencyKey("fleet-reuse")
 		return problem == nil && row != nil && row.Worker != "" && len(placementEvents(t, store, row.ID)) > 0
 	})
-	if row.Worker != "pr-guchuko" || row.Models[0].Lane != "fp8-adaln-pruned" || row.Models[0].Manifest != fp8Manifest {
+	if row.Worker != "pr-guchuko" || row.Models[0].Lane != "fp8" || row.Models[0].Manifest != fp8Manifest {
 		t.Fatalf("pinned to %q with %+v; want pr-guchuko on the explicit rc.1 fp8 lane", row.Worker, row.Models[0])
 	}
 	placement := lastPlacement(t, store, row.ID)
@@ -164,12 +160,11 @@ func TestExplicitLaneOfAnotherReleaseReusesTheIdleAttachedRental(t *testing.T) {
 		verdicts["h200"] == "chosen" || verdicts["rtx-4090"] != fourKShort {
 		t.Fatalf("verdicts %v", verdicts)
 	}
-	if fits["guchuko"] != "rung_asserted" || fits["lumachina"] != "rung_asserted" || fits["h100-80"] != "rung_asserted" ||
-		fits["h200"] != "lane_bytes 103.0 GiB (working memory unmeasured) of 141 GB" {
+	if fits["guchuko"] != h100Fit || fits["lumachina"] != h100Fit || fits["h100-80"] != h100Fit ||
+		fits["h200"] != "components 51.5 GiB (total memory unmeasured for this exact workload/SKU) of 141 GB" {
 		t.Fatalf("fits %v", fits)
 	}
-	if ladder, _ := placement["ladder"].([]any); len(ladder) != 1 || ladder[0] != "H100=fp8-adaln-pruned > B200=mxfp8-adaln-pruned > *=bf16-full" ||
-		placement["override"] != "fp8-adaln-pruned" || placement["bought"] != false {
+	if placement["override"] != "fp8" || placement["bought"] != false {
 		t.Fatalf("the record: %v", placement)
 	}
 	if asks := h.postedSKUs(); len(asks) != 0 {

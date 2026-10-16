@@ -36,8 +36,8 @@ func TestSelectedHubScopesInstalledAndCachedPackageMetadata(t *testing.T) {
 			const pkg = "proof/shared"
 			surface := func(name, model string) []byte {
 				return []byte(`{"format":"cozy.package.interface/1","application":"shared:app","entrypoints":[{"name":"` + name +
-					`","models":[{"class":"Model","path":"` + name + `.models.model","component_use":{},"default_ladder":[{"gpu":"*","lane":"proof/` + model +
-					`@1.0.0/bf16"}]}],"request":{"fields":[]},"result":{"fields":[]}}]}`)
+					`","models":[{"class":"Model","path":"` + name + `.models.model","component_use":{},"default":"proof/` + model +
+					`@1.0.0"}],"request":{"fields":[]},"result":{"fields":[]}}]}`)
 			}
 			a, b := surface("from_a", "model-a"), surface("from_b", "model-b")
 			var served atomic.Int32
@@ -72,7 +72,7 @@ func TestSelectedHubScopesInstalledAndCachedPackageMetadata(t *testing.T) {
 				t.Fatal(problem)
 			}
 			entry, problem := selected.Function("from_b")
-			if problem != nil || entry.Models[0].Default("proof").Model != "proof/model-b" || served.Load() != 1 {
+			if problem != nil || entry.Models[0].DefaultRef("proof") != "proof/model-b@1.0.0" || served.Load() != 1 {
 				t.Fatalf("selected Hub reused foreign installed metadata: entry=%+v error=%v reads=%d", entry, problem, served.Load())
 			}
 			keepReleaseInterface(root, first, pkg, "1.0.0", a, nil)
@@ -94,7 +94,7 @@ func TestSelectedHubScopesInstalledAndCachedPackageMetadata(t *testing.T) {
 					target.lease.Release()
 				}
 				entry, problem := metadata.Function(scope.function)
-				if problem != nil || target.Release != scope.release || entry.Models[0].Default("proof").Model != scope.model || ctx.Cfg.HubURL != scope.origin {
+				if problem != nil || target.Release != scope.release || entry.Models[0].DefaultRef("proof") != scope.model+"@1.0.0" || ctx.Cfg.HubURL != scope.origin {
 					t.Fatalf("source %s mixed release, interface or model defaults: target=%+v entry=%+v error=%v", scope.origin, target, entry, problem)
 				}
 			}

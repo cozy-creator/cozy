@@ -2,6 +2,7 @@ package records
 
 import (
 	"bytes"
+	"cmp"
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
@@ -63,6 +64,7 @@ CREATE TABLE IF NOT EXISTS requests (
   capture      TEXT    NOT NULL DEFAULT '',
   attention_kernel TEXT NOT NULL DEFAULT '',
   gpus INTEGER NOT NULL DEFAULT 0,
+  bits INTEGER NOT NULL DEFAULT 0,
   models       TEXT    NOT NULL DEFAULT '[]',
   writes_weights INTEGER NOT NULL DEFAULT 0,
   control_revision INTEGER NOT NULL DEFAULT 0 CHECK(control_revision>=0),
@@ -394,6 +396,8 @@ type Request struct {
 	AttentionKernel string
 	// GPUs is zero for automatic package-supported parallelism or an exact user count.
 	GPUs uint32
+	// Bits is the run's weight precision (16, 8 or 4); zero lets the machine's rules choose.
+	Bits uint32
 	// Number is this host's short user-facing request reference. The globally unique ID
 	// remains the durable internal/Hub identity; Number is derived from the retained local
 	// request chronology and is never sent across the worker protocol.
@@ -464,8 +468,8 @@ type Request struct {
 	// Assets are durable identity claims and borrowed source paths. Requeues reverify
 	// those files; callers must keep their bytes available and unchanged.
 	Assets []AssetBinding
-	// Models are exact package-slot-to-model bindings resolved before rental creation.
-	// They are local request state and are disclosed only after worker attachment.
+	// Models are the caller's choices (Choice), which its machine is sent, beside the facts a
+	// rental for it is sized by, which no machine is sent.
 	Models []ModelRef
 	// OutputExport is a CLI-authenticated, PackageInterface-derived local publication intent.
 	// It is recorded in its own durable row in the same transaction as this request.
@@ -507,19 +511,17 @@ type AssetBinding struct {
 	ModTime int64 `json:"mtime_ns,omitempty"`
 }
 
-// ModelRef is one exact user-selected model binding. Creator resolves the human
-// spelling before it rents anything, records this row with the request, and sends it
-// only to the attached worker in the desired download set.
+// ModelRef is one model slot's selection: the caller's choice, sent to its machine by name,
+// or the lane a rental for the request is sized by (xs-042), which no machine is sent.
 type ModelRef struct {
-	// Choice identifies the caller's own `model.<param>=` selection, distinct from advisory
-	// default/sizing facts, even when the client also read its selected checkpoint metadata.
+	// Choice identifies the caller's own `model.<param>=` selection, distinct from sizing
+	// facts, even when the client also read its selected checkpoint metadata.
 	Choice bool `json:"choice,omitempty"`
 	// Source is a Choice naming a provider checkpoint (hf://org/repo@commit, civitai://id)
 	// that the machine resolves, narrows to Profiles (or the one it selects) and converts.
 	Source   string   `json:"source,omitempty"`
 	Profiles []string `json:"profiles,omitempty"`
 	Callable string   `json:"callable,omitempty"` // independently scheduled captured callable, qualified by package
-	GPUs     int      `json:"gpus,omitempty"`     // advisory weight-ladder selector; never execution width
 	// SupportedGPUs comes only from this slot's package-code interface, never a model card.
 	SupportedGPUs []int             `json:"supported_gpus,omitempty"`
 	Adapters      []ModelAdapterRef `json:"adapters,omitempty"`
@@ -553,21 +555,6 @@ type ModelRef struct {
 	// interface. Together they size what one entrypoint holds resident (cl-168).
 	ComponentBytes map[string]int64    `json:"component_bytes,omitempty"`
 	ComponentUse   map[string][]string `json:"component_use,omitempty"`
-	// Ladder is the hub binding's FIT MAP (cl-166): which lane belongs on which GPU
-	// class, in the owner's order, each rung resolved to the exact manifest the model
-	// card publishes for that lane. A ref carrying a Ladder and no Manifest is UNPINNED:
-	// the machine decision picks the rung whose gpu pattern matches the winning
-	// accelerator and pins Lane/Manifest/Bytes from it. A pinned ref keeps the ladder as
-	// the owner's word on where its lane fits (cl-170): an explicit override is not a rung.
-	Ladder []ModelRung `json:"ladder,omitempty"`
-	// SharedSlots are the OTHER interface slots this selection also binds, under the same
-	// bytes (h3a-018): sibling entrypoints whose slot declares the same model class and
-	// whose hub default names the same model release and ladder. The download set selects
-	// the model under every one of them, so the pod prepares ONE placement carrying every
-	// entrypoint of the construction and a switch between them is a dispatch, not a
-	// prepare. Sizing reads Slot alone: the siblings share the construction, they do not
-	// add to it.
-	SharedSlots []string `json:"shared_slots,omitempty"`
 }
 
 // ModelAdapterRef is an ordered adapter selection for one base component. A
@@ -609,9 +596,8 @@ func (r Request) RequiresModelOverrides() bool {
 }
 
 // OneSelectionPerSlot joins selections in precedence order and keeps the first for each
-// package slot, counting the slots a selection shares. The request's own selection, made
-// once as an explicit override or its resolved default, therefore supersedes a callee
-// default for the same slot, and a repeated contribution adds nothing.
+// package slot. The request's own selection therefore supersedes a callee default for the
+// same slot, and a repeated contribution adds nothing.
 func OneSelectionPerSlot(groups ...[]ModelRef) []ModelRef {
 	var out []ModelRef
 	held := map[string]bool{}
@@ -620,102 +606,11 @@ func OneSelectionPerSlot(groups ...[]ModelRef) []ModelRef {
 			if held[model.Package+"\x00"+model.BindingSlot()] {
 				continue
 			}
-			for _, slot := range append([]string{model.BindingSlot()}, model.SharedSlots...) {
-				held[model.Package+"\x00"+slot] = true
-			}
+			held[model.Package+"\x00"+model.BindingSlot()] = true
 			out = append(out, model)
 		}
 	}
 	return out
-}
-
-// ModelRung is one GPU class, advisory count selector and weight lane resolved against the model card.
-type ModelRung struct {
-	GPUs           int              `json:"gpus,omitempty"`
-	GPU            string           `json:"gpu"`
-	Lane           string           `json:"lane"`
-	Manifest       string           `json:"manifest"`
-	Bytes          int64            `json:"bytes"`
-	ComponentBytes map[string]int64 `json:"component_bytes,omitempty"`
-}
-
-func (r ModelRung) String() string {
-	if r.GPUs > 0 {
-		return fmt.Sprintf("%dx%s=%s", r.GPUs, r.GPU, r.Lane)
-	}
-	return r.GPU + "=" + r.Lane
-}
-
-// Pinned says the ref names one exact manifest; an unpinned ref still carries its ladder.
-func (m ModelRef) Pinned() bool { return m.Manifest != "" }
-
-// RungAt is the ref's rung, and its index, in a group `width` cards wide on `accelerator`:
-// its first rung of exactly that width, else its first uncounted rung, which serves any
-// width. A pinned ref is its own rung (index 0): at any width when uncounted, else only at
-// its exact group, which its ladder, if any, must author on this accelerator. An empty
-// accelerator — a host without an NVIDIA device — matches only a "*" rung.
-func (m ModelRef) RungAt(accelerator string, width int) (ModelRung, int, bool) {
-	if m.Source != "" {
-		return m.sourceRung()
-	}
-	if m.Pinned() {
-		authored := m.GPUs == 0 || len(m.Ladder) == 0
-		for _, rung := range m.Ladder {
-			authored = authored || rung.GPUs == m.GPUs && rung.Lane == m.Lane && RungMatches(rung.GPU, accelerator)
-		}
-		return ModelRung{GPU: "*", GPUs: m.GPUs, Lane: m.Lane, Manifest: m.Manifest, Bytes: m.Bytes,
-			ComponentBytes: m.ComponentBytes}, 0, authored && (m.GPUs == 0 || m.GPUs == width)
-	}
-	uncounted := -1
-	for i, rung := range m.Ladder {
-		switch {
-		case !RungMatches(rung.GPU, accelerator):
-		case width > 0 && rung.GPUs == width:
-			return rung, i, true
-		case rung.GPUs == 0 && uncounted < 0:
-			uncounted = i
-		}
-	}
-	if uncounted < 0 {
-		return ModelRung{}, -1, false
-	}
-	return m.Ladder[uncounted], uncounted, true
-}
-
-// PurchaseRung chooses weight data for the available group. The rung count is a
-// selector, not a requirement to rent or execute with that count.
-func (m ModelRef) PurchaseRung(accelerator string, count int) (ModelRung, int, bool) {
-	if m.Source != "" {
-		return m.sourceRung()
-	}
-	if m.Pinned() {
-		rung, index, ok := m.RungAt(accelerator, m.GPUs)
-		return rung, index, ok
-	}
-	chosen := -1
-	for i, rung := range m.Ladder {
-		if rung.GPUs <= count && RungMatches(rung.GPU, accelerator) &&
-			(chosen < 0 || rung.GPUs > m.Ladder[chosen].GPUs) {
-			chosen = i
-		}
-	}
-	if chosen >= 0 {
-		return m.Ladder[chosen], chosen, true
-	}
-	return ModelRung{}, -1, false
-}
-
-// sourceRung is a provider source's only rung: it has no ladder, and the machine that makes
-// it sizes it, so it fits any accelerator at its authored width.
-func (m ModelRef) sourceRung() (ModelRung, int, bool) {
-	return ModelRung{GPU: "*", GPUs: m.GPUs}, 0, true
-}
-
-// Pin returns the ref bound to one rung, its ladder kept.
-func (m ModelRef) Pin(rung ModelRung) ModelRef {
-	m.GPUs = rung.GPUs
-	m.Lane, m.Manifest, m.Bytes, m.ComponentBytes = rung.Lane, rung.Manifest, rung.Bytes, rung.ComponentBytes
-	return m
 }
 
 // How a machine-class decision sized the device against one slot (cl-168, cl-170).
@@ -723,19 +618,14 @@ const (
 	// FitComponents: the card published every component's bytes, so the need is the
 	// entrypoint's largest resident group and the device is held to it.
 	FitComponents = "components"
-	// FitRungAsserted: no component bytes, but a rung of the owner's ladder names this
-	// accelerator AND this lane. That rung asserts the lane fits; no figure is compared.
-	FitRungAsserted = "rung_asserted"
-	// FitLaneBytes: no component bytes and no rung asserting this lane on this
-	// accelerator — an explicit override off the ladder, or bound to none — so the whole
-	// lane's bytes are the need, conservatively.
+	// FitLaneBytes: no component bytes, so the whole lane's bytes are the need, conservatively.
 	FitLaneBytes = "lane_bytes"
 	// FitWeights: a `Weights[M]` argument, read raw and never constructed, so no component
 	// of it is ever on the device and no figure is compared.
 	FitWeights = "weights"
 )
 
-// Residency is what a pinned selection must hold on one device at once, and the rule that
+// Residency is what a selection must hold on one device at once, and the rule that
 // sized it — per slot, distinct rules joined by "+".
 type Residency struct {
 	Bytes int64
@@ -753,7 +643,7 @@ type Residency struct {
 	ObservedTotalRuns int
 }
 
-// Resident sizes the pinned selection against ONE accelerator, at every rental width
+// Resident sizes the selection against ONE accelerator, at every rental width
 // (cl-179): nothing here is tensor- or pipeline-parallel, so under a sequence-parallel
 // group every GPU holds the whole selection and a K-card pod holds exactly what one of
 // its cards holds. A width is latency and activation headroom, never capacity.
@@ -761,12 +651,11 @@ type Residency struct {
 // It sizes that one accelerator the way cozy-runtime loads it: per slot, the largest sum
 // over the slot's component_use groups (a method stages only
 // the components it names), or the largest single component when the slot declares none;
-// with no component bytes, the owner's rung for this accelerator and lane asserts the fit
-// with no figure, and failing that the lane's whole bytes stand in. Summed over slots,
+// with no component bytes, the lane's whole bytes stand in. Summed over slots,
 // because one callable holds its slots at once. Independently scheduled captured
 // callables use their maximum resident group, not the sum across the workflow. A
 // `Weights[M]` argument is read raw and never reaches the device.
-func Resident(models []ModelRef, accelerator string) Residency {
+func Resident(models []ModelRef) Residency {
 	groups := map[string][]ModelRef{}
 	for _, model := range models {
 		groups[model.Callable] = append(groups[model.Callable], model)
@@ -775,21 +664,21 @@ func Resident(models []ModelRef, accelerator string) Residency {
 		var peak Residency
 		// Callable groups execute independently; slots inside each group are simultaneous.
 		for _, key := range slices.Sorted(maps.Keys(groups)) {
-			current := residentTogether(groups[key], accelerator)
+			current := residentTogether(groups[key])
 			if current.Bytes > peak.Bytes || peak.Fit == "" {
 				peak = current
 			}
 		}
 		return peak
 	}
-	return residentTogether(models, accelerator)
+	return residentTogether(models)
 }
 
-func residentTogether(models []ModelRef, accelerator string) Residency {
+func residentTogether(models []ModelRef) Residency {
 	var out Residency
 	var fits, needs []string
 	for _, model := range models {
-		bytes, need, fit := model.resident(accelerator)
+		bytes, need, fit := model.resident()
 		if !model.Weights {
 			for _, adapter := range model.Adapters {
 				bytes = addResidencyBytes(bytes, adapter.Bytes)
@@ -814,7 +703,7 @@ func addResidencyBytes(current, additional int64) int64 {
 	return current + additional
 }
 
-func (m ModelRef) resident(accelerator string) (int64, string, string) {
+func (m ModelRef) resident() (int64, string, string) {
 	if m.Weights {
 		return 0, "", FitWeights
 	}
@@ -822,12 +711,7 @@ func (m ModelRef) resident(accelerator string) (int64, string, string) {
 		bytes, need := m.largestGroup()
 		return bytes, need, FitComponents
 	}
-	for _, rung := range m.Ladder {
-		if rung.Lane == m.Lane && RungMatches(rung.GPU, accelerator) {
-			return 0, "", FitRungAsserted
-		}
-	}
-	return m.Bytes, "lane " + m.Lane, FitLaneBytes
+	return m.Bytes, "lane " + cmp.Or(m.Lane, m.Release), FitLaneBytes
 }
 
 func (m ModelRef) largestGroup() (int64, string) {
@@ -857,7 +741,7 @@ func (m ModelRef) largestGroup() (int64, string) {
 	return best, need
 }
 
-// Lanes renders the pinned selection for a log line or audit row: the lane alone for one
+// Lanes renders the selection for a log line or audit row: the lane alone for one
 // slot, `slot=lane` pairs for several.
 func Lanes(models []ModelRef) string {
 	if len(models) == 1 {
@@ -875,7 +759,7 @@ const requestCols = `id,idem_key,body_digest,package,entrypoint,plan_id,package_
 	installation_id,payload,outputs,
 	state,ordinal,created_at,kind,needs_accelerator,worker,machine,rental,rental_required,
 	COALESCE(install_id,''),assets,capture,attention_kernel,models,control_revision,
-	parent_request_id,parent_call_index,child_intent_digest,child_target_digest,child_reusable,reused_from,orchestration_directive,child_artifacts,requested_rental,rent_new,hub,gpus,writes_weights`
+	parent_request_id,parent_call_index,child_intent_digest,child_target_digest,child_reusable,reused_from,orchestration_directive,child_artifacts,requested_rental,rent_new,hub,gpus,bits,writes_weights`
 
 func requestScanTargets(r *Request, assets, models *string) []any {
 	return []any{&r.ID, &r.IdemKey, &r.BodyDigest, &r.Package, &r.Entrypoint, &r.PlanID,
@@ -884,7 +768,7 @@ func requestScanTargets(r *Request, assets, models *string) []any {
 		&r.State, &r.Ordinal, &r.CreatedAt,
 		&r.Kind, &r.NeedsAccelerator, &r.Worker, &r.Machine, &r.Rental, &r.RentalRequired,
 		&r.InstallID, assets, &r.Capture, &r.AttentionKernel, models, &r.ControlRevision,
-		&r.ParentRequestID, &r.ParentCallIndex, &r.ChildIntentDigest, &r.ChildTargetDigest, &r.ChildReusable, &r.ReusedFrom, &r.OrchestrationDirective, &r.ChildArtifacts, &r.RequestedRental, &r.RentNew, &r.Hub, &r.GPUs, &r.WritesWeights}
+		&r.ParentRequestID, &r.ParentCallIndex, &r.ChildIntentDigest, &r.ChildTargetDigest, &r.ChildReusable, &r.ReusedFrom, &r.OrchestrationDirective, &r.ChildArtifacts, &r.RequestedRental, &r.RentNew, &r.Hub, &r.GPUs, &r.Bits, &r.WritesWeights}
 }
 
 func finishRequestScan(r Request, assets, models string, err error) (Request, error) {
@@ -928,13 +812,8 @@ func (r Request) OwnModels() []ModelRef {
 }
 
 func (r Request) bindsOwnSlot(model ModelRef) bool {
-	for _, slot := range append([]string{model.BindingSlot()}, model.SharedSlots...) {
-		entrypoint, _, attributed := strings.Cut(slot, ".models.")
-		if !attributed || r.Entrypoint == "" || entrypoint == r.Entrypoint {
-			return true
-		}
-	}
-	return false
+	entrypoint, _, attributed := strings.Cut(model.BindingSlot(), ".models.")
+	return !attributed || r.Entrypoint == "" || entrypoint == r.Entrypoint
 }
 
 // SizedByOwnModels says the request's own execution constructs model slots on a GPU, so its
@@ -1053,9 +932,8 @@ func (s *Store) BindRequestPlan(id, planID string) *exit.Error {
 // word on the request (cl-107): the word is history the run keeps after the rental row
 // is gone, never a read-time join.
 func (s *Store) PinRental(id, rentalID string, models []ModelRef) (bool, *exit.Error) {
-	// The pin and the lane are ONE decision (cl-166): the machine decides the rung, so
-	// the pinned selection lands in the same statement as the worker. Nil models keep
-	// the row's selection (a request that was already exact).
+	// The selection the rental was sized by, its callees' included, lands in the same
+	// statement as the worker. Nil models keep the row's selection.
 	set := ""
 	args := []any{rentalID, rentalID}
 	if models != nil {
@@ -1090,9 +968,8 @@ func (s *Store) PinRental(id, rentalID string, models []ModelRef) (bool, *exit.E
 		!settledRequestState(row.State), nil
 }
 
-// PinRequestModels writes an unassigned --rental request's selection before the paid ask,
-// so the rental POST declares the lane the machine decision chose (th-155). A later
-// rung — the hub refused the first for inventory — overwrites it.
+// PinRequestModels writes an unassigned --rental request's sized selection before the paid
+// ask, so the rental POST declares the models the pod is bought to hold (th-155).
 func (s *Store) PinRequestModels(id string, models []ModelRef) *exit.Error {
 	encoded, err := json.Marshal(models)
 	if err != nil {
@@ -1504,9 +1381,9 @@ func submitRequestTx(tx *sql.Tx, r Request, assets, models, exportOutputs string
 		plan_id,package_release,local_installation_id,
 		local_package_uploaded_boot_id,installation_id,
 		payload,outputs,state,ordinal,created_at,kind,needs_accelerator,worker,machine,rental,rental_required,install_id,assets,attention_kernel,models,
-		control_revision,parent_request_id,parent_call_index,child_intent_digest,child_target_digest,child_reusable,reused_from,orchestration_directive,child_artifacts,requested_rental,rent_new,hub,gpus,writes_weights)
+		control_revision,parent_request_id,parent_call_index,child_intent_digest,child_target_digest,child_reusable,reused_from,orchestration_directive,child_artifacts,requested_rental,rent_new,hub,gpus,bits,writes_weights)
 		VALUES(?,?,?,?,?,?,?,?,?,?,?,?, ?,0,?,?,?,?,
-		COALESCE((SELECT COALESCE(NULLIF(stable_machine_name,''),machine_name) FROM rentals WHERE id=?),''),?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		COALESCE((SELECT COALESCE(NULLIF(stable_machine_name,''),machine_name) FROM rentals WHERE id=?),''),?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		r.ID, r.IdemKey, r.BodyDigest, r.Package, r.Entrypoint, r.PlanID,
 		r.Release, r.LocalInstallationID,
 		r.LocalPackageUploadedBootID, r.InstallationID, r.Payload,
@@ -1515,7 +1392,7 @@ func submitRequestTx(tx *sql.Tx, r Request, assets, models, exportOutputs string
 		r.RentalRequired,
 		nullable(r.InstallID),
 		assets, r.AttentionKernel, models, r.ControlRevision,
-		r.ParentRequestID, r.ParentCallIndex, r.ChildIntentDigest, r.ChildTargetDigest, r.ChildReusable, r.ReusedFrom, blobOrEmpty(r.OrchestrationDirective), r.ChildArtifacts, r.RequestedRental, r.RentNew, r.Hub, r.GPUs, r.WritesWeights); err != nil {
+		r.ParentRequestID, r.ParentCallIndex, r.ChildIntentDigest, r.ChildTargetDigest, r.ChildReusable, r.ReusedFrom, blobOrEmpty(r.OrchestrationDirective), r.ChildArtifacts, r.RequestedRental, r.RentNew, r.Hub, r.GPUs, r.Bits, r.WritesWeights); err != nil {
 		return Request{}, false, exit.Internalf("cannot record request %s: %s", r.ID, err)
 	}
 	if r.MachineExecutionObserver {

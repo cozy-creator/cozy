@@ -17,8 +17,7 @@ func servingAvailabilityInterface(t *testing.T) []byte {
 	must(t, json.Unmarshal(raw, &variant))
 	variant["name"] = "variant"
 	variant["models"] = []any{
-		map[string]any{"class": "H3", "component_use": map[string]any{}, "path": "variant.models.model",
-			"default_ladder": []any{map[string]any{"gpu": "*", "lane": ladderModel + "@" + ladderRelease + "/" + ladderLane}}},
+		map[string]any{"class": "H3", "component_use": map[string]any{}, "path": "variant.models.model", "default": h3Default},
 		map[string]any{"class": "Adapter", "component_use": map[string]any{}, "path": "variant.models.adapter"},
 	}
 	// A Weights[M] argument is the caller's raw input: no default needed to be available.
@@ -36,7 +35,7 @@ func servingAvailabilityInterface(t *testing.T) []byte {
 
 func TestServingListDistinguishesUnboundDeploymentFromRawInputs(t *testing.T) {
 	root, path, _, _ := admissionRoot(t, servingAvailabilityInterface(t), "H100", false)
-	code, out := runAdmissionCLI(t, root, path, "run", ladderPackage, "--json")
+	code, out := runAdmissionCLI(t, root, path, "run", h3Package, "--json")
 	if code != 0 {
 		t.Fatalf("function listing failed [exit %d]: %s", code, out)
 	}
@@ -65,22 +64,22 @@ func TestServingListDistinguishesUnboundDeploymentFromRawInputs(t *testing.T) {
 
 func TestUnboundServingDefaultRefusesBeforeAcquisitionButExplicitModelsProceed(t *testing.T) {
 	root, path, activity, probe := admissionRoot(t, servingAvailabilityInterface(t), "H100", false)
-	args := []string{"run", ladderPackage + "/variant", "prompt=hello", "assets:=[]", "--rental-only", "--json"}
+	args := []string{"run", h3Package + "/variant", "prompt=hello", "assets:=[]", "--rental-only", "--json"}
 	code, out := runAdmissionCLI(t, root, path, args...)
-	if code == 0 || !strings.Contains(out, "disabled in this deployment") || !strings.Contains(out, "adapter") {
+	if code == 0 || !strings.Contains(out, "declares no default") || !strings.Contains(out, "adapter") {
 		t.Fatalf("unbound serving default was not refused before acquisition: %s", out)
 	}
 	requests, _ := probe.snapshot()
 	for _, request := range requests {
 		if request != "GET /v1/packages/proof/h3" && request != "GET /v1/packages/proof/h3/releases/1.0.0" &&
-			request != "GET /v1/packages/proof/h3/bindings" && !calciferFleetHousekeeping(request) {
+			!calciferFleetHousekeeping(request) {
 			t.Errorf("unbound function reached %s (activity %s)", request, tail(activity))
 		}
 	}
-	model := ladderModel + "@" + ladderRelease + "/" + ladderLane
+	model := h3Model + "@" + h3Release + "/" + h3Lane
 	args = append(args, "model.model="+model, "model.adapter="+model)
 	code, out = runAdmissionCLI(t, root, path, args...)
-	if code == 0 || !strings.Contains(out, "fixture_finished") || strings.Contains(out, "disabled in this deployment") {
+	if code == 0 || !strings.Contains(out, "fixture_finished") || strings.Contains(out, "declares no default") {
 		t.Fatalf("explicit private model inputs failed default availability instead of reaching the fixture's capacity refusal: %s", out)
 	}
 	localArgs := make([]string, 0, len(args))
@@ -91,7 +90,7 @@ func TestUnboundServingDefaultRefusesBeforeAcquisitionButExplicitModelsProceed(t
 	}
 	// Accepted for this computer's machine, which describes nothing first (th-241).
 	_, out = runAdmissionCLI(t, root, path, localArgs...)
-	if !strings.Contains(out, `"machine":"local"`) || strings.Contains(out, "disabled in this deployment") {
+	if !strings.Contains(out, `"machine":"local"`) || strings.Contains(out, "declares no default") {
 		t.Fatalf("explicit local model inputs failed default availability instead of reaching this computer's machine: %s", out)
 	}
 }

@@ -163,8 +163,7 @@ func TestRentalNewIsTheOnlyCreationCommand(t *testing.T) {
 }
 
 func TestAutomaticAndNamedRentalChoicesAllowPrivateSDKVersions(t *testing.T) {
-	h := newLadderHub(t)
-	h.bind(goodLadder())
+	h := newStandInHub(t, h3Default)
 	h.runtimeVersions = map[string]string{"pr-oldruntime": "0.1.0"}
 	root, _ := placementRoot(t, h, "balanced")
 	cert := filepath.Join(root, "fixture.pem")
@@ -177,10 +176,10 @@ func TestAutomaticAndNamedRentalChoicesAllowPrivateSDKVersions(t *testing.T) {
 		h.addReady(id, name, h100SXM, row.HourlyRateUSDMicros)
 	}
 	st.Close()
-	installedHere(t, root, h.server.URL, ladderPackage, "1.0.0")
+	installedHere(t, root, h.server.URL, h3Package, "1.0.0")
 	startCalciferProcess(t, root)
 	for _, arm := range []struct{ key, flag string }{{"automatic-runtime", "--rental-only"}, {"named-runtime", "--rental=giriko"}} {
-		_, out := runCozy(t, root, "run", ladderPackage+"/generate", "steps=1", arm.flag, "--json", "--idempotency-key", arm.key)
+		_, out := runCozy(t, root, "run", h3Package+"/generate", "steps=1", arm.flag, "--json", "--idempotency-key", arm.key)
 		st, problem = records.Open(filepath.Join(root, "creator.sqlite"))
 		fatal(t, problem)
 		row, problem := st.RequestByIdempotencyKey(arm.key)
@@ -222,8 +221,7 @@ func TestRequestedRentalIsSubmissionIdentity(t *testing.T) {
 func TestNamedRentalReplayAfterEndUsesExistingCalciferRequest(t *testing.T) {
 	for _, kind := range []string{"serving", "lane"} {
 		t.Run(kind, func(t *testing.T) {
-			h := newLadderHub(t)
-			h.bind(goodLadder())
+			h := newStandInHub(t, h3Default)
 			root, _ := placementRoot(t, h, "balanced")
 			cert := filepath.Join(root, "fixture.pem")
 			must(t, os.WriteFile(cert, []byte("fixture"), 0600))
@@ -233,11 +231,11 @@ func TestNamedRentalReplayAfterEndUsesExistingCalciferRequest(t *testing.T) {
 			fatal(t, st.RecordRental(records.Rental{ID: id, MachineName: "isao", SKU: "h100-80", AcceleratorModel: h100SXM, AcceleratorCount: 1, HourlyRateUSDMicros: 2490000, State: "ready", Address: "127.0.0.1:1", CertPath: cert, Hub: h.server.URL}))
 			h.addReady(id, "isao", h100SXM, 2490000)
 			st.Close()
-			installedHere(t, root, h.server.URL, ladderPackage, "1.0.0")
+			installedHere(t, root, h.server.URL, h3Package, "1.0.0")
 			startCalciferProcess(t, root)
-			args := []string{"run", ladderPackage + "/generate", "steps=1", "--rental=isao", "--json", "--idempotency-key=ended-replay"}
+			args := []string{"run", h3Package + "/generate", "steps=1", "--rental=isao", "--json", "--idempotency-key=ended-replay"}
 			if kind == "lane" {
-				args = []string{"run", ladderPackage + "/lane", "--model.pruned=proof/minimax@1.0.0-rc.1/fp8-adaln-pruned", "--rental=isao", "--json", "--idempotency-key=ended-replay"}
+				args = []string{"run", h3Package + "/lane", "--model.pruned=proof/minimax@1.0.0-rc.1/fp8", "--rental=isao", "--json", "--idempotency-key=ended-replay"}
 			}
 			_, firstOut := runCozy(t, root, args...)
 			st, problem = records.Open(filepath.Join(root, "creator.sqlite"))

@@ -57,15 +57,15 @@ class H3(Model):
 app = App()
 
 
-@app.entrypoint(defaults={"model": [{"gpu": "*", "lane": "minimax@1.0.0-rc.1/fp8-adaln-pruned"}]})
+@app.entrypoint(defaults={"model": "minimax@1.0.0-rc.1"})
 def generate(payload: Request, model: H3) -> Result:
     return Result(payload.steps)
 `
 
-// publishingHub is one account's Tensorhub: the ladder stand-in's h3/minimax catalog under that
+// publishingHub is one account's Tensorhub: the stand-in's h3/minimax catalog under that
 // org, plus publication and the account's package index serving its own dependency wheel.
 type publishingHub struct {
-	*ladderHub
+	*standInHub
 	account  string
 	versions map[string][]byte // dependency version -> wheel bytes on this Hub
 	mu       sync.Mutex
@@ -76,11 +76,11 @@ type publishingHub struct {
 
 func newPublishingHub(t *testing.T, account string, versions map[string][]byte) *publishingHub {
 	t.Helper()
-	h := &publishingHub{ladderHub: newOrgLadderHub(t, account), account: account, versions: versions,
+	h := &publishingHub{standInHub: newOrgStandInHub(t, account), account: account, versions: versions,
 		declared: map[string]hub.PackageDeclaredFile{}, uploaded: map[string][]byte{}}
-	h.ladderHub.mu.Lock()
-	h.ladderHub.iface = nil
-	h.ladderHub.mu.Unlock()
+	h.standInHub.mu.Lock()
+	h.standInHub.iface = nil
+	h.standInHub.mu.Unlock()
 	mux := h.mux
 	mux.HandleFunc("GET /v1/accounts/current", func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(hub.Account{Name: account})
@@ -152,9 +152,9 @@ func newPublishingHub(t *testing.T, account string, versions map[string][]byte) 
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
-		h.ladderHub.mu.Lock()
-		h.ladderHub.iface = iface
-		h.ladderHub.mu.Unlock()
+		h.standInHub.mu.Lock()
+		h.standInHub.iface = iface
+		h.standInHub.mu.Unlock()
 		_ = json.NewEncoder(w).Encode(hub.PackageReleaseCommit{PublicationID: account + "-publication", State: "committed"})
 	})
 	return h
@@ -270,8 +270,8 @@ org-relative-dep = { index = "tensorhub" }
 		}
 		t.Fatalf("describe the org-relative source: %v", err)
 	}
-	if !bytes.Contains(raw, []byte(`"lane":"minimax@1.0.0-rc.1/fp8-adaln-pruned"`)) {
-		t.Fatalf("the Runtime did not record the org-relative lane as written:\n%s", raw)
+	if !bytes.Contains(raw, []byte(`"default":"minimax@1.0.0-rc.1"`)) {
+		t.Fatalf("the Runtime did not record the org-relative default as written:\n%s", raw)
 	}
 	must(t, os.WriteFile(filepath.Join(source, packagepublish.CommittedInterfacePath), raw, 0o644))
 	return source
@@ -303,7 +303,7 @@ func TestOneSourcePublishesToEachHubAsItsAccount(t *testing.T) {
 		newPublishingHub(t, "paul", map[string][]byte{"1.0.0": orgRelativeWheel(t, "1.0.0", "HUB = 'paul'\n")}),
 		newPublishingHub(t, "fidika", map[string][]byte{"1.0.0": orgRelativeWheel(t, "1.0.0", "HUB = 'fidika'\n")}),
 	}
-	roots := []string{ladderRoot(t, hubs[0].ladderHub), ladderRoot(t, hubs[1].ladderHub)}
+	roots := []string{standInRoot(t, hubs[0].standInHub), standInRoot(t, hubs[1].standInHub)}
 	for _, root := range roots {
 		t.Cleanup(func() { _, _ = runCozy(t, root, "down", "--all") })
 	}
@@ -329,9 +329,9 @@ func TestOneSourcePublishesToEachHubAsItsAccount(t *testing.T) {
 		// The interface names this account's model; nothing org-relative reaches the Hub.
 		iface, problem := launch.DecodePackageInterface(h.file(t, "metadata/package-interface.json"))
 		fatal(t, problem)
-		lane := iface.Entrypoints[0].Models[0].DefaultLadder[0].Lane
-		if lane != h.account+"/minimax@1.0.0-rc.1/fp8-adaln-pruned" {
-			t.Fatalf("%s published default lane %q", h.account, lane)
+		lane := iface.Entrypoints[0].Models[0].Default
+		if lane != h.account+"/minimax@1.0.0-rc.1" {
+			t.Fatalf("%s published default %q", h.account, lane)
 		}
 		// pyproject and lock are the bound copy for this Hub and account.
 		pyproject := string(h.file(t, "pyproject.toml"))
@@ -404,7 +404,7 @@ func TestOneSourcePublishesToEachHubAsItsAccount(t *testing.T) {
 
 	// A Hub whose account lacks the locked version refuses rather than resolving another.
 	bob := newPublishingHub(t, "bob", map[string][]byte{"1.1.0": orgRelativeWheel(t, "1.1.0", "HUB = 'bob'\n")})
-	bobRoot := ladderRoot(t, bob.ladderHub)
+	bobRoot := standInRoot(t, bob.standInHub)
 	t.Cleanup(func() { _, _ = runCozy(t, bobRoot, "down", "--all") })
 	code, out := runCozyIn(t, source, bobRoot, path, "package", "publish", "--json")
 	if code == 0 || !strings.Contains(out, "account_index_lock_drift") || !strings.Contains(out, "org-relative-dep 1.0.0") {

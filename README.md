@@ -33,7 +33,7 @@ Keep `--python 3.12`: uv
 so an unqualified install can select an interpreter Runtime cannot use. An older tool is never
 refused: Cozy installs its own matching one (uv) and describes with it. Runtime 0.18.67 is the
 controller minimum: the first release with the worker wire this Cozy speaks, org-relative
-default lanes, and native model ingestion. Existing
+defaults, and native model ingestion. Existing
 captured package environments keep their declared SDK ranges; new caller-capable
 publications require Runtime 0.18.21 in both the declaration and lock.
 
@@ -184,8 +184,8 @@ one copy updated with the files that changed. While Calcifer runs it watches the
 every invocation checks it too; installing it again unchanged does nothing. A failed rebuild (a syntax error mid-edit) keeps the last good
 install pinned, is logged typed in `cozy calcifer log`, and refuses an invocation only if the tree
 is still broken. `cozy package list --full` shows `synced` or `stale <error>` for the tree.
-Editable installs are not published releases. Model bindings resolve the exact release and lane
-declared in `package.toml` from the local TensorFS store; they never synthesize Hub release records.
+Editable installs are not published releases. Their slot defaults name releases at the Hub, as a
+published package's do; they never synthesize Hub release records.
 
 Remove local package installs with:
 
@@ -414,11 +414,12 @@ A positional local file fills the one input that declares its media kind
 (`cozy run org/seedvr2/upscale clip.mp4` binds `video`); a file two inputs accept, or none,
 is refused with those inputs named. One positional text value fills the first non-media field.
 
-For local execution, a matching GPU ladder rung selects the preferred lane. If
-the local GPU is not listed, Cozy uses the first declared lane instead. The ladder
-does not prohibit local execution; actual encoding support, model compatibility
-and memory capacity are still checked by Runtime. An explicit model/lane override
-takes precedence. Rental placement retains its existing capacity rules.
+The machine that runs a call picks every model's lane from its GPUs' family: 8 bits (`int8`,
+else `fp8`) by default, `nvfp4` for a decode slot that allows 4 bits, 16 where a slot allows no
+less. `--bits=16|8|4` (on `cozy run` and `--warm`) holds every model the run loads, its calls'
+included, to that width; a release without the wanted lane steps to the next and the run says so.
+An explicit `model.<param>=org/model@release/lane` pins the lane. A rental the fleet buys is sized
+by the lane bytes the machine would serve, on the fewest GPUs that hold them.
 
 A local script is a single-file unpublished package: an ordinary `main()` or `main(ctx)`,
 synchronous or asynchronous, with no App, request/result class, publication or install command.
@@ -430,7 +431,7 @@ Its PEP 723 block is its `pyproject.toml` (Python, dependencies, `[tool.uv.sourc
 # requires-python = ">=3.12,<3.13"
 # dependencies = ["cozy-runtime[media]>=0.23.32", "seedvr2"]
 # [tool.cozy.models]
-# model = "seedvr2@0.1.0/original"   # or a ladder: [{gpu = "H100", lane = "..."}, ...]
+# model = "seedvr2@0.1.0"   # the default release; the machine picks its lane
 # ///
 from seedvr2.model import RestorationModel
 
@@ -447,8 +448,8 @@ plane and memory manager; a `Weights[M]` argument is read raw and never construc
 runs on the machine's GPU (CPU on a machine without one) unless it declares
 `accelerator = false` under `[tool.cozy]`, as a package function declares
 `app.entrypoint(accelerator=False)`; nothing infers it.
-`[tool.cozy.models]` entries are the slot's default ladder, exactly as `defaults=` declares
-it; `model.<slot>=org/model@release/lane` overrides it per run. The optional context supplies
+`[tool.cozy.models]` entries are the slot's default release, exactly as `defaults=` declares
+it; `model.<slot>=org/model@release[/lane]` overrides it per run. The optional context supplies
 cancellation, logs, progress and metrics. Discovery checks the script's syntax without
 importing it on the client; its captured code executes on the worker.
 Any target ending in `.py` is a script path, relative (with or without `./`) or absolute; a
@@ -591,13 +592,9 @@ end (context, torch, weights, budget, cap), weights paged in and given back, all
 and OOMs, and a refused stage's shortfall (`--json`: `memory`).
 Model overrides accept `--model.<param>=org/model@release/lane` after the target;
 the existing `model.<param>=...` payload spelling has the same meaning.
-Without an override, Cozy uses the owner's Tensorhub binding, then the selected function's
-published model default ladder. Authors can declare that ladder with
-`@invocable(defaults={"model": [{"gpu": "H100", "lane": "org/model@release/fp8"}]})`.
-Each slot's rungs must use the same model and release; the GPU patterns select its lanes.
-These authored defaults stay in the package interface and are never copied into Hub bindings.
-Use `cozy package unbind org/package generate.models.model` to remove an owner override
-and return that slot to its authored default.
+Without an override, the machine loads the slot's published default release, declared with
+`@invocable(defaults={"model": "org/model@release"})`; an org-less default names the publishing
+account. To change a default, publish a new release.
 `cozy run watch <run-id>` attaches to that same progress stream later; interrupting a watcher
 detaches without canceling the durable run.
 
@@ -818,7 +815,7 @@ cozy --tensorhub=tensorhub model search minimax   # one command, any hub
 ```
 
 Every new operation uses this one selected Hub: package lookup and installation, model
-bindings and transfers, rental purchases, and run preparation. `--tensorhub=<hub>` selects
+transfers, rental purchases, and run preparation. `--tensorhub=<hub>` selects
 another Hub for that command only. A cached package from another Hub never changes the
 selection, and matching package names and version numbers at different Hubs are separate
 identities.

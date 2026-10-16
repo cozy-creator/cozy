@@ -117,8 +117,7 @@ func seedProbe(t *testing.T, h *machineHub, root string, venues ...string) map[s
 }
 
 // probeModel answers proof/probe's model card and its bf16 lane's manifest, as the CLI reads
-// them to bind each rung of a ladder to its exact checkpoint and size the run (th-241). It
-// answers false for any other request.
+// them to size a rental it is about to buy (xs-042). It answers false for any other request.
 func probeModel(t *testing.T, resolved map[string]any) func(http.ResponseWriter, *http.Request) bool {
 	t.Helper()
 	manifest, _ := probeCheckpoint(t)
@@ -140,14 +139,14 @@ func probeModel(t *testing.T, resolved map[string]any) func(http.ResponseWriter,
 }
 
 // probeProject is the parity package with a CPU function taking one Weights[M] argument by its
-// authored default lane: the raw checkpoint, never constructed, so the function never loads it.
-func probeProject(t *testing.T, lane string) string {
+// authored default release: the raw checkpoint, never constructed, so the function never loads it.
+func probeProject(t *testing.T, release string) string {
 	t.Helper()
-	return probeProjectOn(t, machines.Source{RuntimeWheel: *machineRuntimeWheel, TensorFSWheel: *machineTensorFSWheel}, lane)
+	return probeProjectOn(t, machines.Source{RuntimeWheel: *machineRuntimeWheel, TensorFSWheel: *machineTensorFSWheel}, release)
 }
 
 // probeProjectOn is probeProject locked against source's wheels, or the published Runtime.
-func probeProjectOn(t *testing.T, source machines.Source, lane string) string {
+func probeProjectOn(t *testing.T, source machines.Source, release string) string {
 	t.Helper()
 	project := parityProjectOn(t, source)
 	must(t, os.WriteFile(filepath.Join(project, "machine_parity.py"), []byte(`import msgspec
@@ -174,7 +173,7 @@ class TouchResult(msgspec.Struct):
 app = App()
 
 
-@app.entrypoint(defaults={"source": [{"gpu": "*", "lane": "`+lane+`"}]}, accelerator=False)
+@app.entrypoint(defaults={"source": "`+release+`"}, accelerator=False)
 def touch(payload: TouchRequest, source: Weights[Probe]) -> TouchResult:
     return TouchResult(value=payload.value + 1)
 `), 0o600))
@@ -182,10 +181,10 @@ def touch(payload: TouchRequest, source: Weights[Probe]) -> TouchResult:
 }
 
 // A warm run of a published release makes no Hub request, from the CLI or machine. The cold
-// run names the release and the model (th-245): the CLI reads the owner's binding once per
-// catalog revision, and each machine installs the release by name and resolves the model's
-// release lane with the Hub's closure, never by hash and never reading a binding or model
-// card. Rental authority still refreshes independently of content reuse.
+// run names the release (th-245) and no model: each machine installs the release by name and
+// resolves the slot's default release lane with the Hub's closure, never by hash and never
+// reading a model card (xs-042). Rental authority still refreshes independently of content
+// reuse.
 func TestAWarmRunReadsNothingAtAnyHub(t *testing.T) {
 	h, root, _, _ := parityMachines(t)
 	resolved := seedProbe(t, h, root, machines.Local, "tessa")
@@ -212,22 +211,15 @@ func TestAWarmRunReadsNothingAtAnyHub(t *testing.T) {
 			handler.ServeHTTP(w, r)
 		})
 	}
-	publishParityRelease(t, h, root, probeProject(t, "proof/probe@1.0.0/bf16"))
-	binding := `{"bindings":[{"slot":"touch.models.source","model":"proof/probe","release":"1.0.0","revision":1,"ladder":[{"gpu":"*","lane":"bf16"}]}]}`
+	publishParityRelease(t, h, root, probeProject(t, "proof/probe@1.0.0"))
 	h.worker.Config.Handler = count("machine", h.worker.Config.Handler)
 	account, probe := h.server.Config.Handler, probeModel(t, resolved)
 	h.server.Config.Handler = count("account", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.URL.Path == "/v1/packages/"+parityPublished+"/bindings":
-			_, _ = w.Write([]byte(binding))
-		case probe(w, r):
-		default:
+		if !probe(w, r) {
 			account.ServeHTTP(w, r)
 		}
 	}))
-	catalog := func(calls string) bool {
-		return strings.Contains(calls, "machine GET /v1/models/") || strings.Contains(calls, "machine GET /v1/packages/"+parityPublished+"/bindings")
-	}
+	catalog := func(calls string) bool { return strings.Contains(calls, "GET /v1/models/") }
 	installs := func(calls string) bool {
 		return strings.Contains(calls, "machine GET /v1/packages/"+parityPublished+"/releases/")
 	}
@@ -298,16 +290,14 @@ func TestAWarmRunReadsNothingAtAnyHub(t *testing.T) {
 		}
 	}
 
-	// The owner's change to the package moves the catalog revision: the CLI reads the binding
-	// once more for whichever machine runs next, then nothing again; no machine reads it, and
-	// each resolves its model once more by name.
+	// The owner's change to the package moves the catalog revision: each machine resolves its
+	// model once more by name, then nothing again, and no model card is read.
 	h.mux.HandleFunc("DELETE /v1/packages/"+parityPublished+"/releases/"+parityVersion, func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(`{"release":"` + parityVersion + `","state":"yanked","changed":true}`))
 	})
 	if code, out := runCozy(t, root, "package", "yank", parityPublished, "--version", parityVersion); code != 0 || strings.Contains(out, "keeps what it read") || strings.Contains(out, "no machine was told") {
 		t.Fatalf("yank did not reach every machine [exit %d]\n%s", code, out)
 	}
-	changed := true
 	for venue, args := range map[string][]string{"local": nil, "tessa": {"--rental=tessa"}} {
 		for _, key := range []string{"changed", "warm again"} {
 			mu.Lock()
@@ -319,17 +309,15 @@ func TestAWarmRunReadsNothingAtAnyHub(t *testing.T) {
 			mu.Lock()
 			calls := strings.Join(seen, "\n")
 			mu.Unlock()
-			read := strings.Contains(calls, "account GET /v1/packages/"+parityPublished+"/bindings")
-			if changed != read || catalog(calls) || installs(calls) || !strings.Contains(calls, "machine POST /v1/tensorfs/closure") && key == "changed" || key == "warm again" && calls != "" {
+			if catalog(calls) || installs(calls) || !strings.Contains(calls, "machine POST /v1/tensorfs/closure") && key == "changed" || key == "warm again" && calls != "" {
 				t.Fatalf("the %s run on %s read: %q", key, venue, calls)
 			}
-			changed = false
 		}
 	}
 
 	// Unpublished code is no different. Its org-relative default names the caller's account,
-	// read once and kept; the CLI binds the default's rungs and the machine reads no model.
-	if code, out := runCozy(t, root, "package", "install", probeProject(t, "probe@1.0.0/bf16")); code != 0 {
+	// which the run names as its owner; the machine reads no model card.
+	if code, out := runCozy(t, root, "package", "install", probeProject(t, "probe@1.0.0")); code != 0 {
 		t.Fatalf("editable install [exit %d]\n%s", code, out)
 	}
 	for venue, args := range map[string][]string{"local": nil, "tessa": {"--rental=tessa"}} {

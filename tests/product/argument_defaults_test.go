@@ -51,7 +51,7 @@ func TestArgumentHelpShowsDeclaredDefaults(t *testing.T) {
 		{name: "invalid value", args: []string{"prompt=hello", "duration_s=16"}, code: 1},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			args := append([]string{"run", ladderPackage + "/generate"}, test.args...)
+			args := append([]string{"run", h3Package + "/generate"}, test.args...)
 			code, out := runAdmissionCLI(t, root, path, args...)
 			for _, want := range []string{
 				"prompt: str (min length 1)",
@@ -77,7 +77,7 @@ func TestArgumentHelpShowsDeclaredDefaults(t *testing.T) {
 	}
 	// The refusal itself names each missing field's type and bounds, for --json and API
 	// callers that never see the Arguments listing.
-	code, out := runAdmissionCLI(t, root, path, "--json", "run", ladderPackage+"/generate", "prompt=hello")
+	code, out := runAdmissionCLI(t, root, path, "--json", "run", h3Package+"/generate", "prompt=hello")
 	if code != 1 || !strings.Contains(out, "provide required arguments: [frames: int (>=1, <=8)]") {
 		t.Errorf("the --json refusal omitted the missing field's bounds [exit %d]: %s", code, out)
 	}

@@ -93,13 +93,3 @@ func applyModelAdapters(ctx *Context, target Target, ep *launch.Entrypoint,
 	}
 	return models, nil
 }
-
-func capturedModelChoices(models []orchestrator.ModelRef) []orchestrator.ModelRef {
-	var out []orchestrator.ModelRef
-	for _, model := range models {
-		if model.Choice && model.Callable != "" {
-			out = append(out, model)
-		}
-	}
-	return out
-}

@@ -12,11 +12,12 @@ import (
 	"github.com/cozy-creator/cozy/internal/machines"
 )
 
-// A captured root naming its Model's repository without a lane has the CLI read that Model once
-// and the machine resolve its release lane by name once (th-245): the warm run reads nothing at
-// any Hub, nor does a new machine lifetime. The model's owner changing it from this computer
-// moves the catalog revision, so the next run reads it again, even when the machine was stopped then.
-func TestACapturedRootReadsItsModelOncePerBindingRevision(t *testing.T) {
+// A captured root naming its Model's repository without a lane sends that name alone: the CLI
+// reads no model, and the machine resolves its release and lane once (th-245, xs-042): the warm
+// run reads nothing at any Hub, nor does a new machine lifetime. The model's owner changing it
+// from this computer moves the catalog revision, so the next run resolves it again, even when
+// the machine was stopped then.
+func TestACapturedRootResolvesItsModelOncePerCatalogRevision(t *testing.T) {
 	if *machineHostBinary == "" {
 		t.Skip("requires -machine-host: this computer's machine runs the call")
 	}
@@ -58,7 +59,7 @@ func TestACapturedRootReadsItsModelOncePerBindingRevision(t *testing.T) {
 		}
 	}))
 
-	if code, out := runCozy(t, root, "package", "install", probeProject(t, "proof/probe@1.0.0/bf16")); code != 0 {
+	if code, out := runCozy(t, root, "package", "install", probeProject(t, "proof/probe@1.0.0")); code != 0 {
 		t.Fatalf("editable install [exit %d]\n%s", code, out)
 	}
 	run := func(key string) string {
@@ -76,19 +77,19 @@ func TestACapturedRootReadsItsModelOncePerBindingRevision(t *testing.T) {
 		return strings.Join(seen, "\n")
 	}
 	model := func(calls string) bool {
-		if strings.Contains(calls, "machine GET /v1/models/") {
-			t.Fatalf("the machine read a model at its Hub: %q", calls)
+		if strings.Contains(calls, "GET /v1/models/") {
+			t.Fatalf("a model card was read for a run: %q", calls)
 		}
-		return strings.Contains(calls, "account GET /v1/models/proof/probe")
+		return strings.Contains(calls, "machine POST /v1/tensorfs/closure")
 	}
 	if !model(run("cold")) {
-		t.Fatal("the cold run did not read its Model")
+		t.Fatal("the cold run's machine did not resolve its Model")
 	}
 	if calls := run("warm"); calls != "" {
 		t.Fatalf("the warm run read: %q", calls)
 	}
 
-	// The model's owner changes it from this computer: the machine is told, reads the model
+	// The model's owner changes it from this computer: the machine is told, resolves the model
 	// once more, then nothing again.
 	h.mux.HandleFunc("DELETE /v1/models/proof/probe/releases/1.0.0", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(`{"release":"1.0.0","revision":2,"yanked":true,"changed":true}`))
@@ -97,7 +98,7 @@ func TestACapturedRootReadsItsModelOncePerBindingRevision(t *testing.T) {
 		t.Fatalf("yank did not reach the machine [exit %d]\n%s", code, out)
 	}
 	if !model(run("changed")) {
-		t.Fatal("the run after its model changed did not read it again")
+		t.Fatal("the run after its model changed did not resolve it again")
 	}
 	if calls := run("warm again"); calls != "" {
 		t.Fatalf("the warm run after the change read: %q", calls)
@@ -117,6 +118,6 @@ func TestACapturedRootReadsItsModelOncePerBindingRevision(t *testing.T) {
 		t.Fatalf("yank while the machine is stopped [exit %d]\n%s", code, out)
 	}
 	if !model(run("changed while stopped")) {
-		t.Fatal("the run after a change made while its machine was stopped did not read its Model again")
+		t.Fatal("the run after a change made while its machine was stopped did not resolve its Model again")
 	}
 }

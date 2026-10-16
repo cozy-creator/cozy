@@ -35,7 +35,7 @@ type describedInterface struct {
 // that reading. For a publication (a nonempty account), a committed copy that contradicts it —
 // something the copy names that the source no longer declares, or declares differently — is
 // returned as a notice; ordering and members only the fresh reading carries are not
-// contradictions. The staged publication names the account in every org-relative lane.
+// contradictions. The staged publication names the account in every org-relative default.
 func describe(ctx context.Context, tree, root, account string) (describedInterface, *exit.Error) {
 	publish := account != ""
 	raw, problem := hostruntime.Describe(ctx, config.Frozen().Tool(), tree)
@@ -150,9 +150,9 @@ func spell(value any) string {
 	return string(raw)
 }
 
-// QualifyInterface writes account into every org-relative default lane
-// (`model@release/lane` becomes `account/model@release/lane`). Explicit orgs are kept, so the
-// published interface names only absolute references.
+// QualifyInterface writes account into every org-relative slot default (`model@release`
+// becomes `account/model@release`). Explicit orgs are kept, so the published interface names
+// only absolute references.
 func QualifyInterface(raw []byte, account string) ([]byte, *exit.Error) {
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.UseNumber()
@@ -167,13 +167,9 @@ func QualifyInterface(raw []byte, account string) ([]byte, *exit.Error) {
 		models, _ := row["models"].([]any)
 		for _, model := range models {
 			slot, _ := model.(map[string]any)
-			ladder, _ := slot["default_ladder"].([]any)
-			for _, rung := range ladder {
-				fields, _ := rung.(map[string]any)
-				lane, _ := fields["lane"].(string)
-				if name, _, found := strings.Cut(lane, "@"); found && !strings.Contains(name, "/") {
-					fields["lane"], changed = account+"/"+lane, true
-				}
+			def, _ := slot["default"].(string)
+			if name, _, found := strings.Cut(def, "@"); found && !strings.Contains(name, "/") {
+				slot["default"], changed = account+"/"+def, true
 			}
 		}
 	}
