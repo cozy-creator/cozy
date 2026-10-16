@@ -1,0 +1,128 @@
+//! macOS: births from `proc_pidinfo`, exact handles as a kqueue watching the process's exit.
+use super::{Birth, State, unix};
+use std::{
+    io, mem,
+    os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd},
+    ptr,
+    time::Duration,
+};
+
+/// `proc_bsdinfo.pbi_flags`: the process is exiting.
+const PROC_FLAG_INEXIT: u32 = 4;
+
+#[derive(Debug)]
+pub(super) struct Handle(pub(super) OwnedFd);
+
+pub(super) fn birth(pid: u32) -> io::Result<Birth> {
+    Ok(Birth {
+        pid,
+        boot_id: String::new(),
+        start_ticks: start(&info(pid)?),
+    })
+}
+
+pub(super) fn state(birth: &Birth) -> io::Result<State> {
+    let info = match info(birth.pid) {
+        Ok(info) => info,
+        Err(error) if gone(&error) => return Ok(State::Gone),
+        Err(error) => return Err(error),
+    };
+    Ok(
+        if start(&info) != birth.start_ticks || info.pbi_status == libc::SZOMB {
+            State::Gone
+        } else if info.pbi_flags & PROC_FLAG_INEXIT != 0 {
+            State::Dying
+        } else if info.pbi_status == libc::SSTOP {
+            State::Stopped
+        } else {
+            State::Live
+        },
+    )
+}
+
+pub(super) fn open(birth: &Birth) -> io::Result<Option<Handle>> {
+    // SAFETY: kqueue takes nothing and returns a new descriptor or -1.
+    let raw = unsafe { libc::kqueue() };
+    if raw < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a new descriptor that is now ours.
+    let queue = unsafe { OwnedFd::from_raw_fd(raw) };
+    let exit = libc::kevent {
+        ident: birth.pid as usize,
+        filter: libc::EVFILT_PROC,
+        flags: libc::EV_ADD | libc::EV_ONESHOT,
+        fflags: libc::NOTE_EXIT,
+        data: 0,
+        udata: ptr::null_mut(),
+    };
+    // SAFETY: one change, no event buffer, no timeout.
+    if unsafe { libc::kevent(queue.as_raw_fd(), &exit, 1, ptr::null_mut(), 0, ptr::null()) } < 0 {
+        let error = io::Error::last_os_error();
+        return match error.raw_os_error() {
+            Some(libc::ESRCH) => Ok(None),
+            _ => Err(error),
+        };
+    }
+    // Read after registering: the queue now watches whichever process holds the PID.
+    match info(birth.pid) {
+        Ok(info) if start(&info) == birth.start_ticks => Ok(Some(Handle(queue))),
+        Ok(_) => Ok(None),
+        Err(error) if gone(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+pub(super) fn kill(_: &Handle, birth: &Birth) -> io::Result<()> {
+    // No pidfd_send_signal here: the birth is re-read, then the PID signalled. A reuse of the PID
+    // inside that window is accepted.
+    let info = match info(birth.pid) {
+        Ok(info) if start(&info) == birth.start_ticks => info,
+        Ok(_) => return Ok(()),
+        Err(error) if gone(&error) => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    // SAFETY: plain syscall on scalars.
+    unix::gone_is_done(unsafe { libc::kill(birth.pid as libc::pid_t, libc::SIGKILL) })?;
+    if info.pbi_pgid == birth.pid {
+        unix::signal_group(birth.pid)?;
+    }
+    Ok(())
+}
+
+pub(super) fn wait(handle: &Handle, period: Option<Duration>) -> io::Result<bool> {
+    // The queue stays readable once the exit event is pending; it is never drained.
+    unix::readable(handle.0.as_fd(), period)
+}
+
+fn info(pid: u32) -> io::Result<libc::proc_bsdinfo> {
+    // SAFETY: plain-old-data the call fills.
+    let mut info: libc::proc_bsdinfo = unsafe { mem::zeroed() };
+    let size = mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: a writable buffer of exactly `size` bytes.
+    let filled = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        )
+    };
+    if filled == size {
+        return Ok(info);
+    }
+    let error = io::Error::last_os_error();
+    Err(match error.raw_os_error() {
+        Some(0) | None => io::ErrorKind::NotFound.into(),
+        _ => error,
+    })
+}
+
+fn start(info: &libc::proc_bsdinfo) -> u64 {
+    info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec
+}
+
+fn gone(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
+}
