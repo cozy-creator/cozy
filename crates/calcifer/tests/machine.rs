@@ -5,7 +5,10 @@ mod common;
 
 use std::{path::Path, sync::Arc, time::Duration};
 
-use calcifer::{Calcifer, Link, LinkError, store::State};
+use calcifer::{
+    Calcifer, Link, LinkError,
+    store::{ImportedRun, State, Store},
+};
 use common::{SilentHub, Tensord, until};
 use cozy_proto::{
     calcifer::{Event, Kind, On, Status, SubmitRun},
@@ -367,7 +370,6 @@ async fn a_run_lost_after_acceptance_fails_and_is_not_run_again() {
 /// and ends with the machine's own outcome; one its machine never got settles failed, never sent.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn imported_runs_are_followed_and_never_sent() {
-    use calcifer::store::{ImportedRun, Store};
     let home = tempfile::tempdir().unwrap();
     let key = common::key_file(home.path());
     let machine = Tensord::start();
