@@ -19,10 +19,10 @@ libc.workspace = true
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_System_Console",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_JobObjects",
     "Win32_System_Registry",
-    "Win32_System_SystemInformation",
     "Win32_System_Threading",
 ] }
 
@@ -30,7 +30,7 @@ windows-sys = { workspace = true, features = [
 serde_json.workspace = true
 
 [target.'cfg(windows)'.dev-dependencies]
-windows-sys = { workspace = true, features = ["Win32_System_Console", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { workspace = true, features = ["Win32_UI_WindowsAndMessaging"] }
 
 # Its own harness: a test's child processes are this binary (`seams child …`), so roles travel in argv.
 [[test]]

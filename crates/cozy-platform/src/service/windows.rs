@@ -1,7 +1,8 @@
-//! The HKCU `Run` key: started at logon with no admin, through a headless console host so a
-//! console program opens no window (`conhost --headless`, Windows 10 1809+, what ConPTY uses).
-//! With no manager to ask, the service's birth is kept beside the home (`start` records it, and
-//! so does the service's own `announce`), and `stop` ends exactly that birth.
+//! The HKCU `Run` key: started at logon with no admin. Logon gives a console program a console
+//! window; `announce` leaves it at once (a brief flash). `conhost --headless` was measured
+//! unusable: it ends at its stdin's end, so a service started that way never runs. With no
+//! manager to ask, the service's birth is kept beside the home (`start` records it, and so does
+//! the service's own `announce`), and `stop` ends exactly that birth.
 use super::ServiceSpec;
 use crate::{
     Error, Result,
@@ -17,8 +18,8 @@ use std::{
 use windows_sys::Win32::{
     Foundation::ERROR_FILE_NOT_FOUND,
     System::{
+        Console::{FreeConsole, GetConsoleProcessList},
         Registry::{HKEY_CURRENT_USER, REG_SZ, RegDeleteKeyValueW, RegSetKeyValueW},
-        SystemInformation::GetSystemDirectoryW,
     },
 };
 
@@ -34,12 +35,7 @@ pub(super) fn available() -> bool {
 }
 
 pub(super) fn install(_: &Path, spec: &ServiceSpec) -> Result<()> {
-    let conhost = system_directory()?.join("conhost.exe");
-    let data = wide(&format!(
-        "{} --headless {}",
-        quote(&conhost.to_string_lossy()),
-        command_line(spec)
-    ));
+    let data = wide(&command_line(spec));
     // SAFETY: NUL-terminated wide strings and the data's exact byte length.
     let status = unsafe {
         RegSetKeyValueW(
@@ -81,6 +77,14 @@ pub(super) fn start(dir: &Path, spec: &ServiceSpec) -> Result<()> {
 }
 
 pub(super) fn announce(dir: &Path, name: &str) -> Result<()> {
+    // A console with no other process on it was opened for this service (a logon start): leave it
+    // so its window closes. A terminal's console has the shell on it too, and stays.
+    let mut processes = [0u32; 2];
+    // SAFETY: a writable array of the stated length.
+    if unsafe { GetConsoleProcessList(processes.as_mut_ptr(), processes.len() as u32) } == 1 {
+        // SAFETY: detaching this process from its console; nothing here writes to it afterwards.
+        unsafe { FreeConsole() };
+    }
     record(dir, name, &Birth::own()?)
 }
 
@@ -155,19 +159,6 @@ fn registry(op: &'static str, status: u32) -> Result<()> {
             detail: format!("{op}: {}", io::Error::from_raw_os_error(status as i32)),
         }),
     }
-}
-
-/// `C:\Windows\System32`, from the OS rather than an environment variable.
-fn system_directory() -> Result<PathBuf> {
-    let mut buffer = [0u16; 260];
-    // SAFETY: a writable buffer of the stated length.
-    let length = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) } as usize;
-    if length == 0 || length > buffer.len() {
-        return Err(Error::os("find the system directory")(
-            io::Error::last_os_error(),
-        ));
-    }
-    Ok(PathBuf::from(String::from_utf16_lossy(&buffer[..length])))
 }
 
 fn wide(text: &str) -> Vec<u16> {

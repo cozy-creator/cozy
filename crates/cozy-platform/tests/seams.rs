@@ -432,41 +432,38 @@ fn a_user_service_starts_and_stops() {
     running.wait().unwrap();
     #[cfg(windows)]
     {
-        // Logon runs the Run value with no `start`: `stop` finds it through its own announce.
+        // Logon runs the Run value in a new console with no `start`: the service leaves that console
+        // in its announce, and `stop` finds it through the birth the announce recorded.
         use std::os::windows::process::CommandExt;
+        use windows_sys::Win32::System::Threading::CREATE_NEW_CONSOLE;
         fs::remove_file(&file).unwrap();
         let value = run_value(&spec.name);
         let (program, rest) = match value.strip_prefix('"') {
             Some(quoted) => quoted.split_once("\" ").unwrap(),
             None => value.split_once(' ').unwrap(),
         };
-        assert!(rest.starts_with("--headless "), "{value}");
         let mut logon = Command::new(program);
-        logon
-            .raw_arg(rest)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        let mut host = logon.spawn().unwrap();
-        let running = started(&file, Some(&mut host));
+        logon.raw_arg(rest).creation_flags(CREATE_NEW_CONSOLE);
+        let mut service = logon.spawn().unwrap();
+        let running = started(&file, Some(&mut service));
         services.stop(&spec.name).unwrap();
         running.wait().unwrap();
-        host.wait().unwrap();
+        service.wait().unwrap();
     }
     services.uninstall(&spec.name).unwrap();
 }
 
 /// The service's report, once it runs: it has no visible console window, and it is alive.
-fn started(file: &Path, mut host: Option<&mut std::process::Child>) -> Exact {
+fn started(file: &Path, mut spawned: Option<&mut std::process::Child>) -> Exact {
     let report: serde_json::Value = loop {
         if let Ok(bytes) = fs::read(file) {
             break serde_json::from_slice(&bytes).unwrap();
         }
-        if let Some(host) = host.as_mut() {
+        if let Some(spawned) = spawned.as_mut() {
             assert_eq!(
-                host.try_wait().unwrap(),
+                spawned.try_wait().unwrap(),
                 None,
-                "the console host ended before the service ran"
+                "the service ended before it reported"
             );
         }
         thread::sleep(Duration::from_millis(50));
