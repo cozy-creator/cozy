@@ -38,6 +38,10 @@ pub(super) fn start(_: &Path, spec: &ServiceSpec) -> Result<()> {
     run(MANAGER, systemctl().args(["start", &unit(&spec.name)]))
 }
 
+pub(super) fn announce(_: &Path, _: &str) -> Result<()> {
+    Ok(())
+}
+
 pub(super) fn stop(dir: &Path, name: &str) -> Result<()> {
     if !dir.join(unit(name)).exists() {
         return Ok(());

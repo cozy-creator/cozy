@@ -138,9 +138,15 @@ fn child(args: &[String]) {
             let birth = serde_json::to_vec(&Birth::of(tree.pid()).unwrap()).unwrap();
             durable::replace(Path::new(file), &birth, 0o600).unwrap();
         }
-        ["service", file] => {
-            let birth = serde_json::to_vec(&Birth::own().unwrap()).unwrap();
-            durable::replace(Path::new(file), &birth, 0o600).unwrap();
+        ["service", file, home, name] => {
+            Services::new(&Home::at(home), Path::new(home))
+                .announce(name)
+                .unwrap();
+            let report = serde_json::json!({
+                "birth": Birth::own().unwrap(),
+                "console_visible": console_visible(),
+            });
+            durable::replace(Path::new(file), report.to_string().as_bytes(), 0o600).unwrap();
             loop {
                 thread::park();
             }
@@ -401,22 +407,22 @@ fn a_user_service_starts_and_stops() {
         println!("no user service manager in this session: nothing installed");
         return;
     }
-    let file = odd.join("birth.json");
+    let file = odd.join("report.json");
+    let name = format!("platform-test-{}", std::process::id());
     let spec = ServiceSpec {
-        name: format!("platform-test-{}", std::process::id()),
+        name: name.clone(),
         program: env::current_exe().unwrap(),
-        args: vec!["child".into(), "service".into(), file.clone().into()],
+        args: vec![
+            "child".into(),
+            "service".into(),
+            file.clone().into(),
+            home.root().into(),
+            name.into(),
+        ],
         log: Some(odd.join("service.log")),
     };
     services.start(&spec).unwrap();
-    // The service writes its own birth once it runs; this samples for it.
-    let birth: Birth = loop {
-        if let Ok(bytes) = fs::read(&file) {
-            break serde_json::from_slice(&bytes).unwrap();
-        }
-        thread::sleep(Duration::from_millis(50));
-    };
-    let running = Exact::open(&birth).unwrap().expect("the service runs");
+    let running = started(&file, None);
     services.start(&spec).unwrap();
     assert!(
         !running.ended(),
@@ -424,5 +430,97 @@ fn a_user_service_starts_and_stops() {
     );
     services.stop(&spec.name).unwrap();
     running.wait().unwrap();
+    #[cfg(windows)]
+    {
+        // Logon runs the Run value with no `start`: `stop` finds it through its own announce.
+        use std::os::windows::process::CommandExt;
+        fs::remove_file(&file).unwrap();
+        let value = run_value(&spec.name);
+        let (program, rest) = match value.strip_prefix('"') {
+            Some(quoted) => quoted.split_once("\" ").unwrap(),
+            None => value.split_once(' ').unwrap(),
+        };
+        assert!(rest.starts_with("--headless "), "{value}");
+        let mut logon = Command::new(program);
+        logon
+            .raw_arg(rest)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut host = logon.spawn().unwrap();
+        let running = started(&file, Some(&mut host));
+        services.stop(&spec.name).unwrap();
+        running.wait().unwrap();
+        host.wait().unwrap();
+    }
     services.uninstall(&spec.name).unwrap();
+}
+
+/// The service's report, once it runs: it has no visible console window, and it is alive.
+fn started(file: &Path, mut host: Option<&mut std::process::Child>) -> Exact {
+    let report: serde_json::Value = loop {
+        if let Ok(bytes) = fs::read(file) {
+            break serde_json::from_slice(&bytes).unwrap();
+        }
+        if let Some(host) = host.as_mut() {
+            assert_eq!(
+                host.try_wait().unwrap(),
+                None,
+                "the console host ended before the service ran"
+            );
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(
+        report["console_visible"], false,
+        "the service opened a console window"
+    );
+    let birth: Birth = serde_json::from_value(report["birth"].clone()).unwrap();
+    Exact::open(&birth).unwrap().expect("the service runs")
+}
+
+fn console_visible() -> bool {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::{
+            System::Console::GetConsoleWindow, UI::WindowsAndMessaging::IsWindowVisible,
+        };
+        // SAFETY: plain queries about this process's own console.
+        unsafe {
+            let window = GetConsoleWindow();
+            !window.is_null() && IsWindowVisible(window) != 0
+        }
+    }
+    #[cfg(unix)]
+    {
+        false
+    }
+}
+
+/// What logon runs for `name`, read back from HKCU's Run key.
+#[cfg(windows)]
+fn run_value(name: &str) -> String {
+    use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_SZ, RegGetValueW};
+    let wide = |text: &str| {
+        text.encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<u16>>()
+    };
+    let mut data = vec![0u16; 4096];
+    let mut size = (data.len() * 2) as u32;
+    // SAFETY: NUL-terminated names and a writable buffer of `size` bytes.
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            wide(r"Software\Microsoft\Windows\CurrentVersion\Run").as_ptr(),
+            wide(&format!("cozy-{name}")).as_ptr(),
+            RRF_RT_REG_SZ,
+            std::ptr::null_mut(),
+            data.as_mut_ptr().cast(),
+            &mut size,
+        )
+    };
+    assert_eq!(status, 0, "the Run value of {name}");
+    data.truncate(size as usize / 2 - 1);
+    String::from_utf16(&data).unwrap()
 }

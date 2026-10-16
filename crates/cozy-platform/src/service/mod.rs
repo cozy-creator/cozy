@@ -1,7 +1,8 @@
 //! A user service per OS, started at login and on demand: a systemd `--user` unit, a launchd
 //! LaunchAgent, or the HKCU `Run` key (no admin; Calcifer is also started by any CLI call and
 //! TensorD's stable parent supervises it, so Windows needs no restart policy). Whether a service
-//! is alive is its own lock's answer, never the manager's.
+//! is alive is its own lock's answer, never the manager's. A service calls `announce` when it
+//! starts, so `stop` finds it however it was started.
 use crate::{Result, paths::Home};
 use std::{
     ffi::OsString,
@@ -51,6 +52,12 @@ impl Services {
     pub fn start(&self, spec: &ServiceSpec) -> Result<()> {
         sys::install(&self.dir, spec)?;
         sys::start(&self.dir, spec)
+    }
+
+    /// Called by the running service itself, first thing: records its birth where `stop` looks
+    /// for it. Windows' `Run` key has no manager to ask; systemd and launchd track it themselves.
+    pub fn announce(&self, name: &str) -> Result<()> {
+        sys::announce(&self.dir, name)
     }
 
     /// Ends it; nothing starts it again before `start` or the next login.

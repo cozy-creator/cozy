@@ -1,5 +1,7 @@
-//! The HKCU `Run` key: started at logon with no admin. With no manager to ask, `start` spawns the
-//! service detached and keeps its birth beside the home, and `stop` ends exactly that birth.
+//! The HKCU `Run` key: started at logon with no admin, through a headless console host so a
+//! console program opens no window (`conhost --headless`, Windows 10 1809+, what ConPTY uses).
+//! With no manager to ask, the service's birth is kept beside the home (`start` records it, and
+//! so does the service's own `announce`), and `stop` ends exactly that birth.
 use super::ServiceSpec;
 use crate::{
     Error, Result,
@@ -14,7 +16,10 @@ use std::{
 };
 use windows_sys::Win32::{
     Foundation::ERROR_FILE_NOT_FOUND,
-    System::Registry::{HKEY_CURRENT_USER, REG_SZ, RegDeleteKeyValueW, RegSetKeyValueW},
+    System::{
+        Registry::{HKEY_CURRENT_USER, REG_SZ, RegDeleteKeyValueW, RegSetKeyValueW},
+        SystemInformation::GetSystemDirectoryW,
+    },
 };
 
 const RUN: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
@@ -29,7 +34,12 @@ pub(super) fn available() -> bool {
 }
 
 pub(super) fn install(_: &Path, spec: &ServiceSpec) -> Result<()> {
-    let data = wide(&command_line(spec));
+    let conhost = system_directory()?.join("conhost.exe");
+    let data = wide(&format!(
+        "{} --headless {}",
+        quote(&conhost.to_string_lossy()),
+        command_line(spec)
+    ));
     // SAFETY: NUL-terminated wide strings and the data's exact byte length.
     let status = unsafe {
         RegSetKeyValueW(
@@ -67,10 +77,11 @@ pub(super) fn start(dir: &Path, spec: &ServiceSpec) -> Result<()> {
         .stdout(stdout)
         .stderr(stderr);
     let tree = process::spawn(command, Lifetime::Detached)?;
-    let birth = Birth::of(tree.pid())?;
-    fs::create_dir_all(dir).map_err(Error::io("create directory", dir))?;
-    let record = format!("{} {}", birth.pid, birth.start_ticks);
-    crate::durable::replace(&birth_path(dir, &spec.name), record.as_bytes(), 0o600)
+    record(dir, &spec.name, &Birth::of(tree.pid())?)
+}
+
+pub(super) fn announce(dir: &Path, name: &str) -> Result<()> {
+    record(dir, name, &Birth::own()?)
 }
 
 pub(super) fn stop(dir: &Path, name: &str) -> Result<()> {
@@ -102,7 +113,13 @@ pub(super) fn uninstall(_: &Path, name: &str) -> Result<()> {
     registry("delete", status)
 }
 
-/// The birth `start` recorded, while it still runs.
+fn record(dir: &Path, name: &str, birth: &Birth) -> Result<()> {
+    fs::create_dir_all(dir).map_err(Error::io("create directory", dir))?;
+    let record = format!("{} {}", birth.pid, birth.start_ticks);
+    crate::durable::replace(&birth_path(dir, name), record.as_bytes(), 0o600)
+}
+
+/// The recorded birth, while it still runs.
 fn running(dir: &Path, name: &str) -> Result<Option<Exact>> {
     let path = birth_path(dir, name);
     let record = match fs::read_to_string(&path) {
@@ -138,6 +155,19 @@ fn registry(op: &'static str, status: u32) -> Result<()> {
             detail: format!("{op}: {}", io::Error::from_raw_os_error(status as i32)),
         }),
     }
+}
+
+/// `C:\Windows\System32`, from the OS rather than an environment variable.
+fn system_directory() -> Result<PathBuf> {
+    let mut buffer = [0u16; 260];
+    // SAFETY: a writable buffer of the stated length.
+    let length = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) } as usize;
+    if length == 0 || length > buffer.len() {
+        return Err(Error::os("find the system directory")(
+            io::Error::last_os_error(),
+        ));
+    }
+    Ok(PathBuf::from(String::from_utf16_lossy(&buffer[..length])))
 }
 
 fn wide(text: &str) -> Vec<u16> {

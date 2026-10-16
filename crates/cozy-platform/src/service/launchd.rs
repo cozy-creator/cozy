@@ -35,6 +35,10 @@ pub(super) fn start(dir: &Path, spec: &ServiceSpec) -> Result<()> {
     run(MANAGER, &mut launchctl(&["kickstart", &target(&spec.name)]))
 }
 
+pub(super) fn announce(_: &Path, _: &str) -> Result<()> {
+    Ok(())
+}
+
 pub(super) fn stop(_: &Path, name: &str) -> Result<()> {
     let stopped = run(MANAGER, &mut launchctl(&["bootout", &target(name)]));
     let loaded = launchctl(&["print", &target(name)])
