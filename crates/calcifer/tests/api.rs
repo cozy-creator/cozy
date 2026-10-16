@@ -14,14 +14,13 @@ use calcifer::{
     serve::{Stopped, serve},
     store::{MachineRow, Store},
 };
-use common::{SilentHub, Tensord};
+use common::{SilentHub, Tensord, want};
 use cozy_platform::{
-    durable,
-    lock::{Held, Kind as LockKind, LockFile},
+    lock::{Kind as LockKind, LockFile},
     paths::Home,
 };
 use cozy_proto::{
-    calcifer::{Down, Event, Holder, Run, RunList, Status, Submitted, WANTED},
+    calcifer::{Down, Event, Holder, Run, RunList, Status, Submitted},
     config::{Config, Loaded},
     error::Envelope,
 };
@@ -116,14 +115,6 @@ impl Calcifer {
             .unwrap()
             .unwrap()
     }
-}
-
-/// A client's claim that it is starting Calcifer on `home`.
-fn want(home: &Path) -> Held {
-    let dir = Home::at(home).calcifer();
-    durable::private_dir(&dir).unwrap();
-    let wanted = LockFile::new(dir.join(WANTED)).try_lock(LockKind::Shared);
-    wanted.unwrap().expect("a shared lock")
 }
 
 /// A home's load, as `cozy calcifer` reads it, with the defaults (any free port).

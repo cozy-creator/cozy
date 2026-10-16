@@ -45,7 +45,9 @@ struct Served {
 }
 
 impl Served {
+    /// Starts `serve` as the CLI does: wanting it (`wanted.lock`) until its first answer.
     async fn start(home: &Path) -> Self {
+        let wanted = common::want(home);
         let loaded = Loaded {
             config: Config::default(),
             home: Home::at(home),
@@ -54,22 +56,34 @@ impl Served {
         };
         let lock = LockFile::new(loaded.home.calcifer_lock());
         let task = tokio::spawn(async move { serve(&loaded).await });
-        let holder = tokio::time::timeout(PATIENCE, async {
-            loop {
-                let held = lock.holder().unwrap();
-                let held = held.and_then(|bytes| serde_json::from_slice::<Holder>(&bytes).ok());
-                if let Some(holder) = held.filter(|h| h.pid == std::process::id()) {
-                    return holder;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
+        let until = Instant::now() + PATIENCE;
+        let holder = loop {
+            let held = lock.holder().unwrap();
+            let held = held.and_then(|bytes| serde_json::from_slice::<Holder>(&bytes).ok());
+            if let Some(holder) = held.filter(|h| h.pid == std::process::id()) {
+                break holder;
             }
-        });
-        let holder = holder.await.expect("Calcifer never published its record");
-        Self {
+            if task.is_finished() {
+                panic!(
+                    "Calcifer stopped before it published its record: {:?}",
+                    task.await
+                );
+            }
+            assert!(
+                Instant::now() < until,
+                "Calcifer never published its record"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        let served = Self {
             task,
             holder,
             client: Client::new(),
-        }
+        };
+        let first = served.get("/v1/runs").send().await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        drop(wanted);
+        served
     }
 
     fn get(&self, path: &str) -> RequestBuilder {
