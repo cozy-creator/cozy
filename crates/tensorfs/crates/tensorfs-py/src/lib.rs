@@ -56,6 +56,8 @@ fn platform_gate(platform: &str) -> TResult<()> {
 #[pymodule]
 fn _ext(m: &Bound<'_, PyModule>) -> PyResult<()> {
     let py = m.py();
+    // The store's warnings reach the executor's stderr, which its machine keeps.
+    let _ = tracing_subscriber::fmt().with_writer(std::io::stderr).try_init();
     errors::install(m)?;
 
     // The gate runs at import, against the real platform.

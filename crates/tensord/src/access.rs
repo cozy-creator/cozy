@@ -201,7 +201,7 @@ impl Fetch {
         let replaced = self.replaced.lock().unwrap().take();
         std::thread::Builder::new().name("fetch-channel".into()).spawn(move || {
             if let Err(refusal) = fetch::serve(&fetcher, grant, server) {
-                eprintln!("fetch channel: {refusal}");
+                tracing::warn!("fetch channel: {refusal}");
             }
             if let Some(replaced) = replaced {
                 replaced.end();

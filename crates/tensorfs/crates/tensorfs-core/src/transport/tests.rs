@@ -2494,11 +2494,11 @@ fn a_grant_document_is_refused_for_the_first_disagreeing_thing() {
 fn the_tls_pump_carries_a_real_exchange() {
     let key = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let cert_der = rustls::pki_types::CertificateDer::from(key.cert.der().to_vec());
-    let key_der = rustls::pki_types::PrivateKeyDer::try_from(key.key_pair.serialize_der())
+    let key_der = rustls::pki_types::PrivateKeyDer::try_from(key.signing_key.serialize_der())
         .unwrap()
         .clone_key();
     let server_config = rustls::ServerConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
+        rustls::crypto::aws_lc_rs::default_provider(),
     ))
     .with_safe_default_protocol_versions()
     .unwrap()
@@ -2570,11 +2570,11 @@ fn a_certificate_refused_by_an_origin_verified_before_is_asked_again() {
     let identity = || {
         let key = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let cert = rustls::pki_types::CertificateDer::from(key.cert.der().to_vec());
-        let private = rustls::pki_types::PrivateKeyDer::try_from(key.key_pair.serialize_der())
+        let private = rustls::pki_types::PrivateKeyDer::try_from(key.signing_key.serialize_der())
             .unwrap()
             .clone_key();
         let config = rustls::ServerConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
+            rustls::crypto::aws_lc_rs::default_provider(),
         ))
         .with_safe_default_protocol_versions()
         .unwrap()
@@ -4196,9 +4196,9 @@ fn pull_cancellation_interrupts_a_pending_tcp_connection() {
 fn attempt_cancellation_interrupts_a_partial_tls_record() {
     let key = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let cert = rustls::pki_types::CertificateDer::from(key.cert.der().to_vec());
-    let private = rustls::pki_types::PrivateKeyDer::try_from(key.key_pair.serialize_der()).unwrap();
+    let private = rustls::pki_types::PrivateKeyDer::try_from(key.signing_key.serialize_der()).unwrap();
     let config = rustls::ServerConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
+        rustls::crypto::aws_lc_rs::default_provider(),
     ))
     .with_safe_default_protocol_versions()
     .unwrap()

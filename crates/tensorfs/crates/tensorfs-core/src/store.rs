@@ -280,7 +280,7 @@ impl Fault {
         if let Some(p) = &self.ready {
             let _ = fs::write(p, format!("{stage} {}\n", std::process::id()));
         }
-        eprintln!("FAULT-READY {stage} pid={}", std::process::id());
+        tracing::warn!("FAULT-READY {stage} pid={}", std::process::id());
         loop {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }

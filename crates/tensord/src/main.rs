@@ -19,8 +19,9 @@ use std::{
 };
 
 fn main() {
+    tracing_subscriber::fmt().with_writer(std::io::stderr).init();
     if let Err(error) = run() {
-        eprintln!("tensord: {error}");
+        tracing::error!("{error}");
         std::process::exit(1);
     }
 }
@@ -150,7 +151,7 @@ fn run_machine(
         std::process::exit(tensord::machine::update::REPLACE_EXIT);
     }
     for name in &grant.ignored {
-        eprintln!("tensord: ignoring {name}, which this machine does not read");
+        tracing::warn!("ignoring {name}, which this machine does not read");
     }
     let layout = grant.layout.clone();
     let lifetime = identity::open(&layout)?;
@@ -216,7 +217,7 @@ fn run_machine(
             readiness.wait_proved();
             // A Runtime update this process started on is now committed.
             if let Err(error) = updates.commit() {
-                eprintln!("tensord: Runtime update commit: {error}");
+                tracing::warn!("Runtime update commit: {error}");
             }
             ready.report();
         })?;
@@ -290,8 +291,8 @@ fn run_machine(
     let helper = match tensord::machine::client::helper(&engine, &uv, &wheel) {
         Ok(python) => Some(python),
         Err(error) => {
-            eprintln!(
-                "tensord: no installer helper, so local packages cannot install: {error}"
+            tracing::warn!(
+                "no installer helper, so local packages cannot install: {error}"
             );
             None
         }
@@ -442,7 +443,7 @@ fn start_api(
                 .await
             });
             if let Err(error) = result {
-                eprintln!("machine API stopped: {error}");
+                tracing::error!("machine API stopped: {error}");
             }
         })?;
     Ok(())
@@ -522,7 +523,7 @@ fn serve(
                     std::thread::spawn(move || {
                         if let Err(error) = client(stream, None, &owner, &stopped, &paths, &service)
                         {
-                            eprintln!("admin peer: {error}");
+                            tracing::warn!("admin peer: {error}");
                         }
                     });
                 }
@@ -564,7 +565,7 @@ fn serve(
             let result = client(stream, Some(peer), &owner, &stopped, &paths, &service);
             owner.lock().unwrap().disconnect(peer);
             if let Err(error) = result {
-                eprintln!("peer {peer}: {error}");
+                tracing::warn!("peer {peer}: {error}");
             }
         });
     }
@@ -821,20 +822,20 @@ fn report_endpoint(grant: tensord::machine::grant::HubGrant, endpoint: tensord::
     use tensord::machine::hub::{Hub, Refusal};
     let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
         Ok(runtime) => runtime,
-        Err(error) => return eprintln!("tensord: endpoint report: {error}"),
+        Err(error) => return tracing::warn!("endpoint report: {error}"),
     };
     let hub = match Hub::new(grant) {
         Ok(hub) => hub,
-        Err(error) => return eprintln!("tensord: endpoint report: {error}"),
+        Err(error) => return tracing::warn!("endpoint report: {error}"),
     };
     runtime.block_on(async {
         for attempt in 0..5u32 {
             match hub.report_endpoint(&endpoint).await {
-                Ok(true) => return eprintln!("tensord: reported endpoint {}", endpoint.public_host),
-                Ok(false) => return eprintln!("tensord: the Hub takes no endpoint reports"),
-                Err(Refusal::Denied) => return eprintln!("tensord: the Hub refused the endpoint report"),
+                Ok(true) => return tracing::info!("reported endpoint {}", endpoint.public_host),
+                Ok(false) => return tracing::info!("the Hub takes no endpoint reports"),
+                Err(Refusal::Denied) => return tracing::warn!("the Hub refused the endpoint report"),
                 Err(Refusal::Transport(error)) => {
-                    eprintln!("tensord: endpoint report: {error}");
+                    tracing::warn!("endpoint report: {error}");
                     tokio::time::sleep(std::time::Duration::from_secs(1 << attempt)).await;
                 }
             }

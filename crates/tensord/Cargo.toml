@@ -19,29 +19,31 @@ uuid = { version = "1", features = ["v4"] }
 nix = { workspace = true, features = ["fs", "socket", "uio", "user", "signal", "process", "net"] }
 tokio.workspace = true
 tokio-stream = { workspace = true, features = ["net"] }
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+tokio-rustls.workspace = true
 hyper = { workspace = true, features = ["client", "http1"] }
 hyper-util.workspace = true
 http-body-util.workspace = true
 bytes.workspace = true
-webpki-roots = "1"
+webpki-roots.workspace = true
 zip = { version = "7", default-features = false, features = ["deflate-flate2"] }
-tonic = { version = "0.14.6", features = ["tls-ring"] }
+tonic = { workspace = true, features = ["router", "transport", "tls-aws-lc"] }
 tonic-prost.workspace = true
 prost.workspace = true
 axum.workspace = true
 ed25519-dalek.workspace = true
-rcgen = { version = "0.14", features = ["pem", "ring"] }
+rcgen.workspace = true
 base64.workspace = true
 hmac = "0.12"
 sha2.workspace = true
 png = "0.17"
 image-webp = "0.2"
 tar.workspace = true
-rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
+rustls.workspace = true
 rustls-pemfile = "2"
-ring = "0.17"
+aws-lc-rs.workspace = true
 time = "0.3"
+tracing.workspace = true
+tracing-subscriber.workspace = true
 
 [dev-dependencies]
 x509-parser = "0.18"

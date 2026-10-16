@@ -1056,7 +1056,7 @@ impl Shared {
                 Ok(Err(refusal)) => refusal,
                 Err(_) => Refusal { code: Code::IO_FAILED, detail: "the downloader panicked".into() },
             };
-            eprintln!("tensorfs fetch: {refusal}");
+            tracing::warn!("tensorfs fetch: {refusal}");
             self.state.lock().unwrap_or_else(PoisonError::into_inner).refuse_unlanded(&refusal);
             self.changed.notify_all();
             self.pulse.beat();
