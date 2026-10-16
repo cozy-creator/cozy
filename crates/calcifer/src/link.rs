@@ -2,7 +2,7 @@
 //! leaf, every call carrying a short machine-scope Cozy-Cap signed by the key the machine scopes
 //! its runs to.
 use std::{
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -42,6 +42,9 @@ pub enum LinkError {
     /// The machine released itself (a rental's idle end): it is gone.
     #[error("the machine released itself: {0}")]
     Released(String),
+    /// The machine does not admit the key (yet).
+    #[error("the machine does not admit this key: {0}")]
+    Unauthorized(String),
     /// Unreachable, starting, updating, or not admitting the key yet: try again.
     #[error("{0}")]
     Unreachable(String),
@@ -57,7 +60,7 @@ pub struct Link {
 impl Link {
     /// A connection to `endpoint`, opened on first use and again whenever it breaks.
     pub fn new(endpoint: &store::Endpoint, key: SigningKey) -> Result<Self, LinkError> {
-        let tls = Arc::new(tls(endpoint.pin));
+        let tls = Arc::new(tls(Arc::new(Pinned::new(endpoint.pin))));
         let address = endpoint.address.clone();
         let connector = tower::service_fn(move |_: Uri| {
             let (tls, address) = (tls.clone(), address.clone());
@@ -169,6 +172,64 @@ impl Link {
         }
     }
 
+    /// The machine's Status: its whole picture, then again whenever it changes. With `keepalive`,
+    /// a rental's idle clock starts over first.
+    pub async fn status(&self, keepalive: bool) -> Result<Streaming<v1::StatusFrame>, LinkError> {
+        let request = self.request(v1::StatusRequest { keepalive });
+        Ok(self
+            .client
+            .clone()
+            .status(request)
+            .await
+            .map_err(classify)?
+            .into_inner())
+    }
+
+    /// The identity frame the machine at `address` gives anyone who reaches it: its worker id,
+    /// boot and version.
+    pub async fn identity(address: &str, pin: [u8; 32]) -> Result<v1::StatusFrame, LinkError> {
+        let endpoint = store::Endpoint {
+            worker_id: String::new(),
+            address: address.into(),
+            pin,
+        };
+        let link = Self::new(&endpoint, SigningKey::from_bytes(&[0; 32]))?;
+        let request = tonic::Request::new(v1::StatusRequest::default());
+        let mut frames = link
+            .client
+            .clone()
+            .status(request)
+            .await
+            .map_err(classify)?
+            .into_inner();
+        frames
+            .message()
+            .await
+            .map_err(classify)?
+            .ok_or_else(|| LinkError::Unreachable("the machine sent no identity".into()))
+    }
+
+    /// The last `tail` bytes (0: all) of a log the machine keeps.
+    pub async fn read_log(&self, log: &str, tail: u64) -> Result<Vec<u8>, LinkError> {
+        let request = self.request(v1::ReadRequest {
+            target: Some(v1::read_request::Target::Log(log.into())),
+            tail,
+            ..Default::default()
+        });
+        let mut frames = self
+            .client
+            .clone()
+            .read(request)
+            .await
+            .map_err(classify)?
+            .into_inner();
+        let mut bytes = vec![];
+        while let Some(frame) = frames.message().await.map_err(classify)? {
+            bytes.extend(frame.data);
+        }
+        Ok(bytes)
+    }
+
     /// Asks the machine to cancel the run. A machine that never received it records it canceled,
     /// so a late send of it is answered with that.
     pub async fn cancel(&self, id: &str) -> Result<v1::RunState, LinkError> {
@@ -266,6 +327,7 @@ pub fn classify(status: Status) -> LinkError {
         Code::Unavailable if message.starts_with("machine_released") => {
             LinkError::Released(message)
         }
+        Code::Unauthenticated => LinkError::Unauthorized(message),
         Code::InvalidArgument
         | Code::AlreadyExists
         | Code::PermissionDenied
@@ -279,14 +341,35 @@ pub fn classify(status: Status) -> LinkError {
     }
 }
 
-/// TLS that admits exactly the leaf whose sha256 is `pin`, whatever its name or dates say.
-fn tls(pin: [u8; 32]) -> rustls::ClientConfig {
-    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-    let mut config = rustls::ClientConfig::builder_with_provider(provider.clone())
+/// The sha256 of the TLS leaf the machine at `address` presents, whatever it is. Nothing is
+/// sent: the handshake is refused once the leaf is seen.
+pub async fn presented_leaf(address: &str) -> Result<[u8; 32], LinkError> {
+    let unreachable = |e: std::io::Error| LinkError::Unreachable(format!("{address}: {e}"));
+    let pinned = Arc::new(Pinned::new([0; 32]));
+    let tcp = tokio::net::TcpStream::connect(address)
+        .await
+        .map_err(unreachable)?;
+    let name = ServerName::try_from(SERVER_NAME).expect("a DNS name");
+    let refused = tokio_rustls::TlsConnector::from(Arc::new(tls(pinned.clone())))
+        .connect(name, tcp)
+        .await;
+    let seen = *pinned.seen.lock().unwrap_or_else(|e| e.into_inner());
+    match (seen, refused) {
+        (Some(leaf), _) => Ok(leaf),
+        (None, Err(e)) => Err(unreachable(e)),
+        (None, Ok(_)) => Err(LinkError::Unreachable(format!(
+            "{address} presented no TLS leaf"
+        ))),
+    }
+}
+
+/// TLS that admits exactly the leaf whose sha256 is the pin, whatever its name or dates say.
+fn tls(pinned: Arc<Pinned>) -> rustls::ClientConfig {
+    let mut config = rustls::ClientConfig::builder_with_provider(pinned.provider.clone())
         .with_safe_default_protocol_versions()
         .expect("aws-lc-rs offers the default protocol versions")
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(Pinned { pin, provider }))
+        .with_custom_certificate_verifier(pinned)
         .with_no_client_auth();
     config.alpn_protocols = vec![b"h2".to_vec()];
     config
@@ -296,6 +379,18 @@ fn tls(pin: [u8; 32]) -> rustls::ClientConfig {
 struct Pinned {
     pin: [u8; 32],
     provider: Arc<CryptoProvider>,
+    /// The leaf the peer presented last.
+    seen: Mutex<Option<[u8; 32]>>,
+}
+
+impl Pinned {
+    fn new(pin: [u8; 32]) -> Self {
+        Self {
+            pin,
+            provider: Arc::new(rustls::crypto::aws_lc_rs::default_provider()),
+            seen: Mutex::default(),
+        }
+    }
 }
 
 impl ServerCertVerifier for Pinned {
@@ -307,7 +402,9 @@ impl ServerCertVerifier for Pinned {
         _: &[u8],
         _: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
-        if Sha256::digest(end_entity.as_ref()).as_slice() == self.pin {
+        let leaf: [u8; 32] = Sha256::digest(end_entity.as_ref()).into();
+        *self.seen.lock().unwrap_or_else(|e| e.into_inner()) = Some(leaf);
+        if leaf == self.pin {
             Ok(ServerCertVerified::assertion())
         } else {
             Err(rustls::Error::General(

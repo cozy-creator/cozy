@@ -16,6 +16,7 @@ use std::{
 use calcifer::{
     Calcifer, Link,
     api::Api,
+    machines::Machines,
     serve::{Stopped, serve},
     store::{Batch, NewRun, Store},
 };
@@ -438,6 +439,7 @@ async fn the_route_serves_a_landed_output_and_says_why_another_has_not_landed() 
         out_dir: out.clone(),
         warnings: vec![],
         inputs: vec![],
+        wants: None,
     };
     store.submit("k", "sha256:k", new).unwrap();
     assert!(store.mark_sent(id.as_str(), "m").unwrap());
@@ -474,7 +476,12 @@ async fn the_route_serves_a_landed_output_and_says_why_another_has_not_landed() 
             "/v1/runs/{id}/outputs/{name}",
             axum::routing::get(calcifer::outputs::serve),
         )
-        .with_state(Api::new(calcifer.clone(), address.port(), "token"));
+        .with_state(Api::new(
+            calcifer.clone(),
+            Machines::start(calcifer.clone(), Home::at(home.path()), vec![]),
+            address.port(),
+            "token",
+        ));
     tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
     let client = Client::new();
     let get = |path: &str, range: Option<&str>| {

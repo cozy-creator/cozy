@@ -66,6 +66,7 @@ syn = "2"
 tar = "0.4"
 tempfile = "3"
 thiserror = "2"
+time = { version = "0.3.55", features = ["parsing"] }
 tokio = { version = "1.53", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["aws_lc_rs", "tls12"] }
 tokio-stream = "0.1.19"

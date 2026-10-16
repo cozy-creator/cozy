@@ -51,6 +51,8 @@ pub struct Tensord {
     child: Child,
     pub root: tempfile::TempDir,
     pub endpoint: Endpoint,
+    /// More `serve` arguments, kept for a restart.
+    extra: Vec<std::ffi::OsString>,
 }
 
 impl Tensord {
@@ -60,8 +62,6 @@ impl Tensord {
 
     /// As `start`, with more `serve` arguments.
     pub fn start_args(extra: &[&std::ffi::OsStr]) -> Self {
-        let binary = std::env::var_os("COZY_TEST_TENSORD")
-            .expect("COZY_TEST_TENSORD names the tensord binary these tests run against");
         let root = tempfile::tempdir().unwrap();
         let config = root.path().join("config");
         // TensorD refuses configuration others may read.
@@ -82,50 +82,24 @@ impl Tensord {
             serde_json::json!({"worker_id": WORKER, "identity_directory": "identity",
                 "authorized_keys_file": "keys.json", "readiness_hmac_key_file": "readiness.json"}),
         );
-        let state = root.path().join("state");
-        let mut child = Command::new(binary)
-            .args(["serve", "--state"])
-            .arg(&state)
-            .arg("--machine-config")
-            .arg(config.join("machine.json"))
-            .args(["--listen", "127.0.0.1:0", "--host-bytes", "0"])
-            .args(extra)
-            .stdout(Stdio::null())
-            .spawn()
-            .unwrap();
-        // A hang bound for a machine that never starts; the product waits without one.
-        let until = Instant::now() + Duration::from_secs(120);
-        let ready: serde_json::Value = loop {
-            if let Ok(bytes) = std::fs::read(state.join("api-ready.json")) {
-                break serde_json::from_slice(&bytes).unwrap();
-            }
-            if let Ok(Some(status)) = child.try_wait() {
-                panic!("tensord exited before it served: {status}");
-            }
-            if Instant::now() >= until {
-                let _ = child.kill();
-                panic!("tensord did not publish api-ready.json");
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        };
-        let pem = ready["cert_pem"].as_str().unwrap();
-        let body: String = pem
-            .lines()
-            .filter(|line| !line.starts_with("-----"))
-            .collect();
-        let der = base64::engine::general_purpose::STANDARD
-            .decode(body)
-            .unwrap();
-        let endpoint = Endpoint {
-            worker_id: WORKER.into(),
-            address: ready["address"].as_str().unwrap().into(),
-            pin: Sha256::digest(&der).into(),
-        };
+        let extra: Vec<_> = extra.iter().map(|arg| arg.to_os_string()).collect();
+        let (child, endpoint) = serve(root.path(), "127.0.0.1:0", &extra);
         Self {
             child,
             root,
             endpoint,
+            extra,
         }
+    }
+
+    /// Stops the process and starts another on the same root and address: the same machine,
+    /// restarted.
+    pub fn restart(&mut self) {
+        self.stop();
+        let _ = std::fs::remove_file(self.root.path().join("state/api-ready.json"));
+        let (child, endpoint) = serve(self.root.path(), &self.endpoint.address, &self.extra);
+        assert_eq!(endpoint, self.endpoint, "the same machine");
+        self.child = child;
     }
 
     /// Ends the exact process this test started.
@@ -137,6 +111,52 @@ impl Tensord {
     pub fn row(&self, name: &str, key: &Path) -> MachineRow {
         machine(name, Some(self.endpoint.clone()), key)
     }
+}
+
+/// Serves TensorD on `root` at `listen`, and answers it once it published its endpoint.
+fn serve(root: &Path, listen: &str, extra: &[std::ffi::OsString]) -> (Child, Endpoint) {
+    let binary = std::env::var_os("COZY_TEST_TENSORD")
+        .expect("COZY_TEST_TENSORD names the tensord binary these tests run against");
+    let state = root.join("state");
+    let mut child = Command::new(binary)
+        .args(["serve", "--state"])
+        .arg(&state)
+        .arg("--machine-config")
+        .arg(root.join("config").join("machine.json"))
+        .args(["--listen", listen, "--host-bytes", "0"])
+        .args(extra)
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    // A hang bound for a machine that never starts; the product waits without one.
+    let until = Instant::now() + Duration::from_secs(120);
+    let ready: serde_json::Value = loop {
+        if let Ok(bytes) = std::fs::read(state.join("api-ready.json")) {
+            break serde_json::from_slice(&bytes).unwrap();
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            panic!("tensord exited before it served: {status}");
+        }
+        if Instant::now() >= until {
+            let _ = child.kill();
+            panic!("tensord did not publish api-ready.json");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let pem = ready["cert_pem"].as_str().unwrap();
+    let body: String = pem
+        .lines()
+        .filter(|line| !line.starts_with("-----"))
+        .collect();
+    let der = base64::engine::general_purpose::STANDARD
+        .decode(body)
+        .unwrap();
+    let endpoint = Endpoint {
+        worker_id: WORKER.into(),
+        address: ready["address"].as_str().unwrap().into(),
+        pin: Sha256::digest(&der).into(),
+    };
+    (child, endpoint)
 }
 
 impl Drop for Tensord {
