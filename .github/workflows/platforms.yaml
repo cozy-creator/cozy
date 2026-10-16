@@ -2,6 +2,7 @@ name: platforms
 # Native build and vet on every desktop platform, Linux x86_64 as the control. Manual only:
 # macOS bills 10x and Windows 2x, so run it per question, never per push.
 #   gh workflow run platforms.yaml -R cozy-creator/cozy --ref <branch> [-f os='["windows-2025"]'] [-f test='go test ./internal/flock/...']
+# The Rust workspace builds and lints on every runner; `test` may name `cargo test -p <crate>`.
 on:
   workflow_dispatch:
     inputs:
@@ -56,6 +57,13 @@ jobs:
         continue-on-error: true
         run: go build -o cozy-bin . && ./cozy-bin --help 2>&1 | head -40 | tee run.txt
 
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Rust build and lint (compiles tests too)
+        id: rust
+        continue-on-error: true
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings 2>&1 | tee rust.txt; exit "${PIPESTATUS[0]}"
+
       - name: Test
         if: inputs.test != ''
         id: test
@@ -69,9 +77,9 @@ jobs:
         run: |
           {
             echo "## ${{ matrix.os }}"
-            echo "build=${{ steps.build.outcome }} vet=${{ steps.vet.outcome }} run=${{ steps.run.outcome }} test=${{ steps.test.outcome }}"
+            echo "build=${{ steps.build.outcome }} vet=${{ steps.vet.outcome }} run=${{ steps.run.outcome }} rust=${{ steps.rust.outcome }} test=${{ steps.test.outcome }}"
             echo '```'
-            cat build.txt vet.txt 2>/dev/null | head -200
+            cat build.txt vet.txt rust.txt 2>/dev/null | head -200
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
@@ -83,10 +91,11 @@ jobs:
             build.txt
             vet.txt
             run.txt
+            rust.txt
             test.txt
           if-no-files-found: ignore
           retention-days: 30
 
       - name: Verdict
         if: always()
-        run: test "${{ steps.build.outcome }}/${{ steps.run.outcome }}" = success/success
+        run: test "${{ steps.build.outcome }}/${{ steps.run.outcome }}/${{ steps.rust.outcome }}" = success/success/success

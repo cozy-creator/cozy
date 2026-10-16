@@ -1,0 +1,33 @@
+# One workspace for the `cozy` binary (xs-043). The Go tree stays at the root until the cutover.
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.8.0"
+edition = "2024"
+rust-version = "1.99"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+cozy-proto = { path = "crates/cozy-proto" }
+
+base64 = "0.22"
+clap = { version = "4.6", features = ["derive"] }
+ed25519-dalek = "2"
+hex = "0.4"
+prost = "0.14"
+protoc-bin-vendored = "3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tonic = { version = "0.14.6", default-features = false, features = ["codegen"] }
+tonic-prost = "0.14.6"
+tonic-prost-build = "0.14.6"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true
