@@ -7,6 +7,7 @@ mod fuse;
 
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -128,7 +129,10 @@ fn a_second_machine_gets_every_object_from_the_volume() {
         .keys()
         .all(|hex| b.contains(hex) || b.manifest_path(hex).is_file()));
     let log = fs::read_to_string(b.root().join("logs/transport.log")).unwrap();
-    let line = format!("fetched acme/model@r1 public hub 0 B volume {} B", checkpoint.total());
+    let line = format!(
+        "fetched acme/model@r1 public hub 0 B volume {} B",
+        checkpoint.total()
+    );
     assert!(log.contains(&line), "{log}");
     assert_eq!(hub.total_gets(), gets, "B asked the hub for an object");
     assert_eq!(hub.gets("presign"), presigns, "B presigned");
@@ -292,6 +296,62 @@ fn a_short_volume_evicts_the_least_recently_used_then_skips() {
         old[2].exists(),
         "the youngest stayed: two evictions made the room"
     );
+
+    let skipped = tensorfs_core::stats::snapshot().volume_skipped_bytes;
+    fetch(&fetcher, &hub, &big);
+    until("the big write skipped", || {
+        tensorfs_core::stats::snapshot().volume_skipped_bytes >= skipped + (4 << 20)
+    });
+    assert!(on_volume(&mounted.at, &big.blobs[0].sha256).is_none());
+    assert!(
+        filled(&mounted.at, &checkpoint) && old[2].exists(),
+        "a hopeless write evicts nothing"
+    );
+    assert!(a.contains(&big.blobs[0].sha256));
+    drop(mounted);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A network volume's quota, which `statfs` does not show (RunPod's report the whole cluster):
+/// a write refused for space evicts the least recently used objects and is written; one that
+/// even an emptied volume could not take is skipped and counted, and the fetch is unaffected.
+#[test]
+fn a_quota_statfs_does_not_show_evicts_on_a_refused_write() {
+    let dir = temporary("volume-quota");
+    const J: u64 = 256 << 10;
+    let mounted = fuse::mount(&dir.join("backing"), &dir.join("volume"), 1 << 50);
+    mounted
+        .control
+        .quota
+        .store(3 * J + (64 << 10), Ordering::Release);
+    let hour = Duration::from_secs(3600);
+    let old: Vec<_> = (0..3)
+        .map(|n| {
+            place(
+                &mounted.backing,
+                &junk(J as usize, n),
+                hour * (3 - n as u32) / 4,
+            )
+        })
+        .collect();
+    let checkpoint = Arc::new(components("acme/model", &[2], J as usize, 6, &[]));
+    let big = Arc::new(components("acme/big", &[1], 4 << 20, 7, &[]));
+    let hub = hub(
+        vec![Arc::clone(&checkpoint), Arc::clone(&big)],
+        None,
+        Duration::ZERO,
+        serve_all(),
+    );
+    let a = Store::open(&store(&dir.join("a"))).unwrap();
+    let fetcher = fetcher(&a, &mounted.at);
+    fetch(&fetcher, &hub, &checkpoint);
+    until("the write-back", || filled(&mounted.at, &checkpoint));
+    assert!(!old[0].exists() && !old[1].exists(), "the two oldest went");
+    assert!(
+        old[2].exists(),
+        "the youngest stayed: two evictions made the room"
+    );
+    assert_eq!(temps(&mounted.at), 0);
 
     let skipped = tensorfs_core::stats::snapshot().volume_skipped_bytes;
     fetch(&fetcher, &hub, &big);

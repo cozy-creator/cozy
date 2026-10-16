@@ -6,8 +6,9 @@
 //! - **Trust.** None: every byte read goes through the Store's door, which hashes it.
 //! - **Writes.** Copied from the verified local object: temp, fsync, rename, so writers of
 //!   one object converge and no reader sees part of one.
-//! - **Room.** A write that finds the volume short removes temps and objects unused for the
-//!   TTL, then the least recently used, and is skipped when still short.
+//! - **Room.** A write that finds the volume short, or that the volume refuses for space (a
+//!   network volume's quota, which `statvfs` does not show), removes temps and objects unused
+//!   for the TTL, then the least recently used, and is skipped when still short.
 //! - **Liveness.** An operation beats after every call into the volume; the fetcher abandons
 //!   one silent beyond the transport's stall rule. A hard mount's call cannot be cancelled,
 //!   so its thread waits on the kernel.
@@ -135,6 +136,32 @@ impl Volume {
             crate::stats::volume_skipped(object.length);
             return Wrote::Skipped;
         }
+        let mut written = self.copy(store, object, manifest, &path, op);
+        if written.as_ref().is_err_and(full) && self.make_room(object.length, op) >= object.length {
+            written = self.copy(store, object, manifest, &path, op);
+        }
+        match written {
+            Ok(()) => {
+                crate::stats::volume_written(object.length);
+                Wrote::Written
+            }
+            Err(error) if full(&error) => {
+                crate::stats::volume_skipped(object.length);
+                Wrote::Skipped
+            }
+            Err(_) => Wrote::Failed,
+        }
+    }
+
+    /// One copy of the verified local object onto the volume: temp, fsync, rename.
+    fn copy(
+        &self,
+        store: &Store,
+        object: &ObjectRef,
+        manifest: bool,
+        path: &Path,
+        op: &Op,
+    ) -> std::io::Result<()> {
         let source: Option<Box<dyn Read>> = match manifest {
             true => (store.read_manifest(object).ok())
                 .map(|m| m.canonical_bytes())
@@ -145,7 +172,7 @@ impl Volume {
             }
         };
         let Some(mut source) = source else {
-            return Wrote::Failed;
+            return Err(std::io::Error::other("the local object is not readable"));
         };
         let temp = self.root.join("tmp").join(format!(
             "{}.{}.{}",
@@ -174,16 +201,14 @@ impl Volume {
             }
             file.sync_all()?;
             op.beat();
-            fs::rename(&temp, &path)?;
+            fs::rename(&temp, path)?;
             op.beat();
             Ok(())
         })();
         if written.is_err() {
             let _ = fs::remove_file(&temp);
-            return Wrote::Failed;
         }
-        crate::stats::volume_written(object.length);
-        Wrote::Written
+        written
     }
 
     /// Whether `bytes` more fit beside the volume's reserve, making room when they do not.
@@ -296,4 +321,12 @@ impl Op {
     pub fn abandon(&self) {
         self.abandoned.store(true, Ordering::Release);
     }
+}
+
+/// A write refused for space: the disk is full, or the volume's quota is.
+fn full(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded
+    )
 }

@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 //! A FUSE filesystem over a backing directory, as a volume: a stated capacity (`statfs` says
-//! how full it is) and reads that block on demand, through the real kernel path.
+//! how full it is), a quota `statfs` does not show (writes past it fail `EDQUOT`, as a network
+//! volume's do) and reads that block on demand, through the real kernel path.
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -20,6 +21,8 @@ use fuser::{
 #[derive(Default)]
 pub struct Control {
     pub capacity: AtomicU64,
+    /// Bytes past which writes fail `EDQUOT`; 0 is none.
+    pub quota: AtomicU64,
     blocked: Mutex<bool>,
     unblocked: Condvar,
     /// Reads that reached the filesystem.
@@ -336,6 +339,10 @@ impl Filesystem for Volume {
         _: Option<u64>,
         reply: ReplyWrite,
     ) {
+        let quota = self.control.quota.load(Ordering::Acquire);
+        if quota > 0 && used(&self.root) + data.len() as u64 > quota {
+            return reply.error(libc::EDQUOT);
+        }
         match self.files[&fh].write_all_at(data, offset as u64) {
             Ok(()) => reply.written(data.len() as u32),
             Err(e) => reply.error(errno(e)),
