@@ -503,3 +503,64 @@ fn a_transformers_repository_is_its_root_model_and_nothing_else() {
     }
     let _ = std::fs::remove_dir_all(root);
 }
+
+/// SDXL's Diffusers text encoder plans into the Transformers 5 spelling Runtime constructs
+/// (`CLIPTextModel` without `text_model.`), while `CLIPTextModelWithProjection` keeps it:
+/// the sdxl package refused uploads 8077/8079 for `text_encoder.embeddings.position_embedding.weight`.
+/// Real headers only (ranged reads), no bodies.
+#[test]
+#[ignore = "real network: huggingface.co"]
+fn sdxl_diffusers_text_encoders_plan_into_the_spelling_runtime_constructs() {
+    use tensorfs_core::ingest::{preflight, source};
+    use tensorfs_core::providers::{self, Endpoints, SourceUri};
+    use tensorfs_core::transport::{Anonymous, Deadline};
+    let uri =
+        SourceUri::parse("hf://stabilityai/sdxl-turbo@71153311d3dbb46851df1931d3ca6e939de83304")
+            .unwrap();
+    let endpoints = Endpoints::default();
+    let resolution = providers::resolve(&uri, &endpoints, &Anonymous, Deadline::none()).unwrap();
+    let members: Vec<String> = [
+        "text_encoder/model.fp16.safetensors",
+        "text_encoder_2/model.fp16.safetensors",
+        "unet/diffusion_pytorch_model.fp16.safetensors",
+        "vae/diffusion_pytorch_model.fp16.safetensors",
+    ]
+    .map(String::from)
+    .to_vec();
+    let selected = resolution.select(&members).unwrap();
+    let heads = providers::read_heads(&selected, &uri, &endpoints, &Anonymous, Deadline::none())
+        .unwrap()
+        .heads;
+    let root = temporary("sdxl-plan");
+    let staged = preflight::stage(&root, &heads).unwrap();
+    let plan = source::plan_source(
+        source::BUILTIN_REGISTRY,
+        source::BUILTIN_REGISTRY_BYTES,
+        staged.carriers(),
+        Some("hf/stabilityai/stable-diffusion-xl-base-1.0/diffusers-fp16"),
+        None,
+    )
+    .unwrap();
+    let keys = |component: &str| -> Vec<&str> {
+        plan.construction_order
+            .iter()
+            .filter(|(c, _)| c == component)
+            .map(|(_, k)| k.as_str())
+            .collect()
+    };
+    let clip = keys("text_encoder");
+    assert!(
+        clip.contains(&"embeddings.position_embedding.weight"),
+        "{clip:?}"
+    );
+    assert!(
+        !clip.iter().any(|k| k.starts_with("text_model.")),
+        "{clip:?}"
+    );
+    let big_g = keys("text_encoder_2");
+    assert!(
+        big_g.contains(&"text_model.embeddings.position_embedding.weight"),
+        "{big_g:?}"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}

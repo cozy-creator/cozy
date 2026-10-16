@@ -64,10 +64,12 @@ pub struct Converter {
 
 /// The header config an output's [`Converter::normalization`] is recorded under.
 pub const NORMALIZATION: &str = "normalization";
+/// A Transformers 4 `CLIPTextModel` carrier in its Transformers 5 spelling.
+pub const CLIP_TEXT: &str = "transformers5.clip_text/1";
 /// The converter for a source no reviewed profile recognizes: its keys, stored as they are.
 pub const IDENTITY: &str = "identity/1";
 
-pub const CONVERTERS: [Converter; 7] = [
+pub const CONVERTERS: [Converter; 8] = [
     Converter {
         name: "diffusers.identity/1",
         dialect: "safetensors.diffusers",
@@ -75,6 +77,19 @@ pub const CONVERTERS: [Converter; 7] = [
         doc: "Diffusers component spelling IS the canonical logical key spelling. Each key \
               becomes one logical tensor; `.weight_scale` siblings fold into their base as \
               encoding ROLES; marker tensors are dropped. Bytes stream through untouched.",
+        validated_on_real_bytes: true,
+        normalization: None,
+        lane: None,
+        reference: None,
+    },
+    Converter {
+        name: CLIP_TEXT,
+        dialect: "safetensors.diffusers",
+        class: Class::Identity,
+        doc: "A Diffusers repository's CLIP text encoder (`CLIPTextModel`, saved by Transformers \
+              4 under `text_model.`) in the Transformers 5 spelling Runtime constructs: the \
+              `text_model.` prefix is removed, as Transformers' own CLIPTextModel conversion \
+              does. Bytes stream through untouched.",
         validated_on_real_bytes: true,
         normalization: None,
         lane: None,
@@ -1495,6 +1510,7 @@ fn rekey(conv: &Converter, key: &str) -> String {
                 .map(|(from, to)| format!("{to}{}", &leafed[from.len()..]))
                 .unwrap_or(leafed)
         }
+        CLIP_TEXT => key.strip_prefix("text_model.").unwrap_or(key).to_string(),
         _ => key.to_string(),
     }
 }
