@@ -5,6 +5,7 @@
 #![allow(dead_code)]
 use std::{
     ffi::OsStr,
+    io::Write as _,
     path::{Path, PathBuf},
     process::{Command, Output},
 };
@@ -24,10 +25,10 @@ pub struct Out {
 impl Home {
     /// A fresh home on a hosted runner; `None` anywhere else.
     pub fn new() -> Option<Self> {
-        if std::env::var_os("GITHUB_ACTIONS").is_none() {
-            eprintln!(
-                "skipped: product tests run only on hosted runners (GITHUB_ACTIONS is unset)"
-            );
+        let hosted = std::env::var_os("GITHUB_ACTIONS").is_some();
+        if !hosted {
+            // Past libtest's capture, so a skip shows in every log.
+            let _ = writeln!(std::io::stderr(), "skipped: not on a hosted runner");
             return None;
         }
         Some(Self {
