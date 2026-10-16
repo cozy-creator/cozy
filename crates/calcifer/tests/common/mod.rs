@@ -42,6 +42,11 @@ pub struct Tensord {
 
 impl Tensord {
     pub fn start() -> Self {
+        Self::start_args(&[])
+    }
+
+    /// As `start`, with more `serve` arguments.
+    pub fn start_args(extra: &[&std::ffi::OsStr]) -> Self {
         let binary = std::env::var_os("COZY_TEST_TENSORD")
             .expect("COZY_TEST_TENSORD names the tensord binary these tests run against");
         let root = tempfile::tempdir().unwrap();
@@ -71,6 +76,7 @@ impl Tensord {
             .arg("--machine-config")
             .arg(config.join("machine.json"))
             .args(["--listen", "127.0.0.1:0", "--host-bytes", "0"])
+            .args(extra)
             .stdout(Stdio::null())
             .spawn()
             .unwrap();

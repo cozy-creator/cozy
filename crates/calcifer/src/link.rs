@@ -143,6 +143,32 @@ impl Link {
         }
     }
 
+    /// Reads `length` bytes (0: to its end) of an output from `offset`, at revision `if_rev` (0:
+    /// its newest). Answers the first frame (the output's revision, length and where this read
+    /// ends) and the stream of its data frames. The machine's answer is the caller's to judge.
+    pub async fn read(
+        &self,
+        target: v1::OutputTarget,
+        offset: u64,
+        length: u64,
+        if_rev: u64,
+    ) -> Result<(v1::ReadFrame, Streaming<v1::ReadFrame>), Status> {
+        let request = self.request(v1::ReadRequest {
+            target: Some(v1::read_request::Target::Output(target)),
+            offset,
+            length,
+            if_rev,
+            tail: 0,
+        });
+        let mut frames = self.client.clone().read(request).await?.into_inner();
+        match frames.message().await? {
+            Some(first) => Ok((first, frames)),
+            None => Err(Status::unavailable(
+                "the machine ended the read before its first frame",
+            )),
+        }
+    }
+
     /// Asks the machine to cancel the run. A machine that never received it records it canceled,
     /// so a late send of it is answered with that.
     pub async fn cancel(&self, id: &str) -> Result<v1::RunState, LinkError> {

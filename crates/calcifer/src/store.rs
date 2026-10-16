@@ -106,6 +106,11 @@ const MIGRATIONS: &[M] = &[
         "ALTER TABLE runs ADD COLUMN warnings TEXT NOT NULL DEFAULT '[]';
         ALTER TABLE runs ADD COLUMN inputs TEXT NOT NULL DEFAULT '[]';",
     ),
+    // The output revision Calcifer gave up exporting, and why.
+    M::up(
+        "ALTER TABLE outputs ADD COLUMN failed_rev INTEGER;
+        ALTER TABLE outputs ADD COLUMN export_error TEXT;",
+    ),
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -243,6 +248,24 @@ pub enum Acceptance {
     Again,
     /// The run has moved on from this machine (or ended): the machine must not run it.
     Stale,
+}
+
+/// One output item at its newest revision, as its export sees it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutputRow {
+    pub name: String,
+    pub index: u32,
+    pub rev: u64,
+    pub length: u64,
+    /// `sha256:<hex>` of this revision's bytes.
+    pub digest: String,
+    pub media_type: String,
+    pub done: bool,
+    /// Its file, holding revision `exported_rev`.
+    pub path: Option<PathBuf>,
+    pub exported_rev: Option<u64>,
+    /// Why this revision will not be exported.
+    pub export_error: Option<String>,
 }
 
 pub struct Store {
@@ -683,7 +706,9 @@ impl Store {
                 if seq <= after {
                     continue;
                 }
-                events.push(if item.status != ItemStatus::InProgress {
+                events.push(if item.path.is_some() {
+                    Event::OutputLanded { sequence_number: seq, output_index, item: item.clone() }
+                } else if item.status != ItemStatus::InProgress {
                     Event::OutputDone { sequence_number: seq, output_index, item: item.clone() }
                 } else if created > after {
                     Event::OutputAdded { sequence_number: seq, output_index, item: item.clone() }
@@ -713,6 +738,152 @@ impl Store {
             Ok(events)
         })
     }
+
+    /// The runs, by id and number, with an output whose file lacks its newest revision that
+    /// Calcifer has not given up.
+    pub fn exports_owed(&self) -> Result<Vec<(RunId, u64)>> {
+        self.read(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT DISTINCT runs.id, runs.number FROM outputs JOIN runs ON runs.id = outputs.run
+                 WHERE outputs.exported_rev IS NOT outputs.rev AND outputs.failed_rev IS NOT outputs.rev
+                 ORDER BY runs.number",
+            )?;
+            let rows = statement
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows.into_iter()
+                .map(|(id, number)| Ok((RunId::try_from(id).map_err(|e| StoreError::Corrupt(e.into()))?, number)))
+                .collect()
+        })
+    }
+
+    /// The run's outputs to export, in the order they first appeared.
+    pub fn outputs_to_export(&self, run: &str) -> Result<Vec<OutputRow>> {
+        self.read(|conn| {
+            let mut statement = conn.prepare(&format!(
+                "SELECT {OUTPUT_COLUMNS} FROM outputs WHERE run = ?1 AND exported_rev IS NOT rev
+                 AND failed_rev IS NOT rev ORDER BY created_seq"
+            ))?;
+            Ok(statement
+                .query_map([run], output_row)?
+                .collect::<rusqlite::Result<_>>()?)
+        })
+    }
+
+    pub fn output(&self, run: &str, name: &str, index: u32) -> Result<Option<OutputRow>> {
+        self.read(|conn| {
+            Ok(conn
+                .query_row(
+                    &format!("SELECT {OUTPUT_COLUMNS} FROM outputs WHERE run = ?1 AND name = ?2 AND idx = ?3"),
+                    params![run, name, index],
+                    output_row,
+                )
+                .optional()?)
+        })
+    }
+
+    /// Records the output's file at `path` as holding revision `rev`; while that is its current
+    /// revision, the run's next event says it landed.
+    pub fn exported(
+        &self,
+        run: &str,
+        name: &str,
+        index: u32,
+        rev: u64,
+        path: &Path,
+    ) -> Result<Vec<Event>> {
+        self.write(|tx| {
+            tx.execute(
+                "UPDATE outputs SET exported_rev = ?4, path = ?5 WHERE run = ?1 AND name = ?2 AND idx = ?3",
+                params![run, name, index, rev as i64, path.to_string_lossy()],
+            )?;
+            export_settled(tx, run, name, index, rev, true)
+        })
+    }
+
+    /// Records why revision `rev` of the output will not be exported; while that is its current
+    /// revision, the run's next event is the item done again, carrying why.
+    pub fn export_failed(
+        &self,
+        run: &str,
+        name: &str,
+        index: u32,
+        rev: u64,
+        reason: &str,
+    ) -> Result<Vec<Event>> {
+        self.write(|tx| {
+            tx.execute(
+                "UPDATE outputs SET failed_rev = ?4, export_error = ?5 WHERE run = ?1 AND name = ?2 AND idx = ?3",
+                params![run, name, index, rev as i64, reason],
+            )?;
+            export_settled(tx, run, name, index, rev, false)
+        })
+    }
+}
+
+/// The event of an output's export at `rev` settling, if that is its current revision.
+fn export_settled(
+    tx: &Transaction,
+    run: &str,
+    name: &str,
+    index: u32,
+    rev: u64,
+    landed: bool,
+) -> Result<Vec<Event>> {
+    let current: Option<i64> = tx
+        .query_row(
+            "SELECT rev FROM outputs WHERE run = ?1 AND name = ?2 AND idx = ?3",
+            params![run, name, index],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if current != Some(rev as i64) {
+        return Ok(vec![]);
+    }
+    let seq = next_seq(tx, run)?;
+    tx.execute(
+        "UPDATE outputs SET seq = ?4 WHERE run = ?1 AND name = ?2 AND idx = ?3",
+        params![run, name, index, seq as i64],
+    )?;
+    let row = run_in(tx, run)?.ok_or_else(|| StoreError::Corrupt(format!("no run {run}")))?;
+    let items = record(tx, &row)?.output.into_iter().enumerate();
+    let Some((output_index, item)) = items
+        .into_iter()
+        .find(|(_, i)| i.name == name && i.index == index)
+    else {
+        return Ok(vec![]);
+    };
+    let (sequence_number, output_index) = (seq, output_index as u32);
+    Ok(vec![match landed {
+        true => Event::OutputLanded {
+            sequence_number,
+            output_index,
+            item,
+        },
+        false => Event::OutputDone {
+            sequence_number,
+            output_index,
+            item,
+        },
+    }])
+}
+
+const OUTPUT_COLUMNS: &str = "name, idx, rev, length, digest, media_type, done, path, exported_rev,
+    CASE WHEN failed_rev = rev THEN export_error END";
+
+fn output_row(r: &Row) -> rusqlite::Result<OutputRow> {
+    Ok(OutputRow {
+        name: r.get(0)?,
+        index: r.get::<_, i64>(1)? as u32,
+        rev: r.get::<_, i64>(2)? as u64,
+        length: r.get::<_, i64>(3)? as u64,
+        digest: r.get(4)?,
+        media_type: r.get(5)?,
+        done: r.get(6)?,
+        path: r.get::<_, Option<String>>(7)?.map(PathBuf::from),
+        exported_rev: r.get::<_, Option<i64>>(8)?.map(|rev| rev as u64),
+        export_error: r.get(9)?,
+    })
 }
 
 const RUN_COLUMNS: &str = "id, number, kind, target, hub, machine, pinned, spec, out_dir, state, cancel_requested,
@@ -1007,8 +1178,9 @@ fn put_output(tx: &Transaction, row: &RunRow, product: &v1::Product) -> Result<V
 /// A run row as the API answers it, with its output items in the order they first appeared.
 fn record(conn: &Connection, row: &RunRow) -> Result<Run> {
     let mut statement = conn.prepare(
-        "SELECT name, idx, rev, length, digest, media_type, label, done, path FROM outputs WHERE run = ?1
-         ORDER BY created_seq",
+        "SELECT name, idx, rev, length, digest, media_type, label, done,
+             CASE WHEN exported_rev = rev THEN path END, CASE WHEN failed_rev = rev THEN export_error END
+         FROM outputs WHERE run = ?1 ORDER BY created_seq",
     )?;
     let settled_ok = row.status == Some(Status::Completed);
     let items = statement.query_map([row.id.as_str()], |r| {
@@ -1039,6 +1211,7 @@ fn record(conn: &Connection, row: &RunRow) -> Result<Run> {
                 .flatten(),
             status,
             path: path.map(PathBuf::from),
+            export_error: r.get(9)?,
         })
     })?;
     Ok(Run {

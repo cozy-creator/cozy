@@ -107,6 +107,7 @@ pub fn router(api: Arc<Api>) -> Router {
         .route("/v1/runs/{id}", get(show))
         .route("/v1/runs/{id}/cancel", post(cancel))
         .route("/v1/runs/{id}/events", get(events))
+        .route("/v1/runs/{id}/outputs/{name}", get(crate::outputs::serve))
         .route("/v1/down", post(down))
         // Routes go above this line: the bearer and the admission gate guard only those.
         .route_layer(middleware::from_fn_with_state(api.clone(), admit))
@@ -136,7 +137,7 @@ impl IntoResponse for Refusal {
     }
 }
 
-fn refuse(kind: Kind, code: &str, message: impl Into<String>) -> Refusal {
+pub(crate) fn refuse(kind: Kind, code: &str, message: impl Into<String>) -> Refusal {
     Refusal(Error::new(kind, code, message))
 }
 
@@ -331,7 +332,7 @@ pub fn parse<T: DeserializeOwned>(body: &[u8]) -> Result<T, Refusal> {
 }
 
 /// A run by its id or its number.
-fn find(api: &Api, key: &str) -> Result<RunRow, Refusal> {
+pub(crate) fn find(api: &Api, key: &str) -> Result<RunRow, Refusal> {
     let store = api.calcifer.store();
     let row = match store.run(key)? {
         Some(row) => Some(row),
@@ -463,8 +464,9 @@ struct Resume {
 }
 
 /// The run's events from `starting_after`: what the store holds after it, the latest live
-/// events, then the broadcast as it happens. A terminal event ends the stream; Calcifer stopping
-/// ends it without one (reconnect from the last `id:`).
+/// events, then the broadcast as it happens. The stream ends after the run's terminal event once
+/// each of its outputs has landed or carries an `export_error`; Calcifer stopping ends it without
+/// one (reconnect from the last `id:`).
 async fn events(
     State(api): State<Arc<Api>>,
     Path(key): Path<String>,
@@ -484,8 +486,7 @@ async fn events(
         id: row.id,
         pending,
         last: starting_after,
-        done: false,
-        settled: row.state == RunState::Settled,
+        ended: row.state == RunState::Settled,
         tail,
         stop: api.stop.subscribe(),
         calcifer: api.calcifer.clone(),
@@ -500,9 +501,8 @@ struct Follow {
     pending: VecDeque<Event>,
     /// The highest sequence number sent; a durable event at or below it is already known.
     last: u64,
-    done: bool,
-    /// The run had ended when the stream opened: nothing follows the replay.
-    settled: bool,
+    /// The run has ended (its terminal event was sent, or it had ended when the stream opened).
+    ended: bool,
     tail: broadcast::Receiver<(RunId, Event)>,
     stop: watch::Receiver<bool>,
     calcifer: Arc<Calcifer>,
@@ -511,11 +511,8 @@ struct Follow {
 impl Follow {
     async fn next(mut self) -> Option<(Result<sse::Event, Infallible>, Self)> {
         loop {
-            if self.done {
-                return None;
-            }
             if let Some(event) = self.pending.pop_front() {
-                self.done = event.is_terminal();
+                self.ended |= event.is_terminal();
                 let mut sent = sse::Event::default();
                 if let Some(sequence) = event.sequence_number() {
                     if sequence <= self.last {
@@ -527,7 +524,9 @@ impl Follow {
                 let data = serde_json::to_string(&event).expect("an event serializes");
                 return Some((Ok(sent.data(data)), self));
             }
-            if self.settled {
+            // An ended run's stream waits only for its outputs to land (or a store it cannot read).
+            let owed = self.calcifer.store().outputs_to_export(self.id.as_str());
+            if self.ended && !owed.is_ok_and(|outputs| !outputs.is_empty()) {
                 return None;
             }
             tokio::select! {
