@@ -1396,15 +1396,18 @@ mod v1_api {
         let _ = fs::remove_dir_all(tools);
     }
 
-    /// An update supersedes: the release a caller installs replaces its other releases of the
-    /// package at that Hub, whose idle executor ends and whose GPU weights leave at the install,
-    /// so the new release's request gets the whole budget. Klein bench (runs 7772, 7779): 0.1.0's
-    /// idle executor kept its VRAM after 0.2.0 installed beside it, whose executor got a 0.4 GiB
-    /// budget and paged 18.6 GiB on every request.
+    /// An idle tenant gives its GPU to a request that needs it: an older release kept warm
+    /// beside a newer one (both installed) is evicted on demand, and the newer release's
+    /// request gets a budget for all its weights, its next one paging nothing. Klein bench
+    /// (runs 7772, 7779): 0.1.0's idle executor kept its VRAM, and 0.2.0's executor got a
+    /// 0.4 GiB budget and paged 18.6 GiB on every request. The weights take 45% of the card:
+    /// one release's fit, two do not.
     #[tokio::test]
     #[ignore = "GPU: one card (a rental)"]
-    async fn an_installed_release_supersedes_the_older_ones_gpu_and_all() {
-        const WEIGHT_MIB: u64 = 256;
+    async fn an_idle_older_release_gives_its_gpu_to_the_newer_ones_request() {
+        let total: u64 = String::from_utf8(Command::new("nvidia-smi").args(["--query-gpu=memory.total",
+            "--format=csv,noheader,nounits", "-i", "0"]).output().unwrap().stdout).unwrap().trim().parse().unwrap();
+        let weight_mib = total * 45 / 100;
         const FIXTURE: (&str, &str) = ("gpu_calls", "tensord-gpu-calls");
         let tools = std::env::temp_dir().join(format!("cm-tools-{}", uuid::Uuid::new_v4()));
         assert!(Command::new("uv").current_dir(env!("CARGO_MANIFEST_DIR")).args(["build", "--wheel", "--out-dir"]).arg(&tools)
@@ -1444,7 +1447,7 @@ mod v1_api {
         let source = std::env::temp_dir().join(format!("cm-update-{}", uuid::Uuid::new_v4()));
         let store = tensorfs_core::store::Store::ensure(&source).unwrap();
         let model = names_hub::Model { repository: "acme/weight".into(), release: "1".into(), lane: "f32".into(),
-            manifest: constructible(&store, (WEIGHT_MIB << 18) as usize) };
+            manifest: constructible(&store, (weight_mib << 18) as usize) };
         let release = |release: &str| names_hub::Package {
             name: format!("acme/{}", FIXTURE.1), release: release.into(), interface: interface.clone(),
             wheel: wheel.file_name().unwrap().to_str().unwrap().into(), bytes: fs::read(&wheel).unwrap(), callees: vec![],
@@ -1460,33 +1463,32 @@ mod v1_api {
             catalog_revision: "r1".into(),
             ..Default::default()
         };
-        let (pid, idle_fds) = (machine.child.id(), driver_fds(machine.child.id()));
+        let memory = |done: &v1::Outcome| serde_json::from_slice::<serde_json::Value>(&done.measurements).unwrap()["memory"].clone();
 
-        // 0.1.0 warm: its executor maps the weights, and custody keeps them once measured.
-        let mut old = 0;
+        // 0.1.0 warm and idle: its executor keeps the weights on the GPU.
         for id in ["old-1", "old-2"] {
             let done = settle(&mut client, &all, id, spec(v1::RunKind::Call, "0.1.0", "resident")).await;
             assert_eq!(done.status, "succeeded", "{done:?}");
-            old = serde_json::from_slice::<serde_json::Value>(&done.result).unwrap()["pid"].as_u64().unwrap();
         }
-        assert!(driver_fds(pid) > idle_fds, "custody kept none of 0.1.0's weights");
-
-        // Installing 0.2.0 supersedes 0.1.0: its executor and GPU weights go before 0.2.0 runs.
+        // 0.2.0 installs beside it; both stay installed.
         let done = settle(&mut client, &all, "update", spec(v1::RunKind::Warm, "0.2.0", "")).await;
         assert_eq!(done.status, "succeeded", "{done:?}");
-        assert!(!Path::new(&format!("/proc/{old}")).exists(), "0.1.0's idle executor outlived the update");
-        assert_eq!(driver_fds(pid), idle_fds, "custody still holds 0.1.0's weights");
         let releases: Vec<String> = status_frame(&mut client, &all).await.environments.into_iter()
             .filter(|e| e.package == format!("acme/{}", FIXTURE.1)).map(|e| e.release).collect();
-        assert_eq!(releases, ["0.2.0"]);
+        assert_eq!(releases, ["0.1.0", "0.2.0"]);
 
-        // Its request gets the whole budget: every weight resident, nothing paged out.
-        let done = settle(&mut client, &all, "new", spec(v1::RunKind::Call, "0.2.0", "resident")).await;
-        assert_eq!(done.status, "succeeded", "{done:?}");
-        let measured: serde_json::Value = serde_json::from_slice(&done.measurements).unwrap();
-        let memory = &measured["memory"];
-        assert!(memory["budget_bytes"].as_u64() >= memory["weights_bytes"].as_u64(), "{memory}");
-        assert_eq!((memory["paged_out_bytes"].as_u64().unwrap_or(0), memory["evictions"].as_u64().unwrap_or(0)), (0, 0), "{memory}");
+        // 0.2.0's request takes the idle tenant's room: every weight resident, nothing paged
+        // out; its next request pages nothing in.
+        for (id, first) in [("new-1", true), ("new-2", false)] {
+            let done = settle(&mut client, &all, id, spec(v1::RunKind::Call, "0.2.0", "resident")).await;
+            assert_eq!(done.status, "succeeded", "{done:?}");
+            let memory = memory(&done);
+            assert!(memory["budget_bytes"].as_u64() >= memory["weights_bytes"].as_u64(), "{id}: {memory}");
+            assert_eq!(memory["paged_out_bytes"].as_u64().unwrap_or(0), 0, "{id}: {memory}");
+            if !first {
+                assert_eq!(memory["paged_in_bytes"].as_u64().unwrap_or(0), 0, "{id}: {memory}");
+            }
+        }
         let _ = fs::remove_dir_all(source);
         let _ = fs::remove_dir_all(tools);
     }
