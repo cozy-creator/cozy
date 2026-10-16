@@ -1,9 +1,13 @@
 name: dev-build
-# Builds release.yaml's archives for any ref and runs one targeted test command, off the dev box:
+# Builds release artifacts for any ref and runs one targeted test command, off the dev box:
 #   gh workflow run dev-build.yaml -R cozy-creator/cozy -f ref=<sha> [-f build=none] [-f test='go test ./internal/run/...']
 #   Rust: -f build=none -f test='cargo test -p cozy-proto'
-# The artifact is cozy-cli-<sha>: cozy-<os>-<arch>.tar.gz for every release platform, the player
-# and SHA256SUMS, stamped dev-<sha>. No whole-suite default: `test` is empty unless given.
+#   TensorFS: -f build=tensorfs -f test='cargo test -p tensorfs-core --test store_contract'
+# Artifacts: cozy-cli-<sha> (cozy-<os>-<arch>.tar.gz for every release platform, the player and
+# SHA256SUMS, stamped dev-<sha>) and tensorfs-wheel-<sha> (the manylinux x86_64 wheel). Tests get
+# PostgreSQL (AUTHKIT_TEST_DATABASE_URL), the TensorFS wheel installed in a venv
+# (TENSORFS_TEST_PYTHON) when it was built, and a dev Runtime wheel (COZY_TEST_RUNTIME_WHEEL) with
+# runtime_ref. No whole-suite default: `test` is empty unless given.
 on:
   workflow_dispatch:
     inputs:
@@ -12,11 +16,15 @@ on:
         type: string
         default: master
       build:
-        description: "cli: the release archives; none: tests only"
+        description: "cli: the release archives; tensorfs: the TensorFS wheel; none: tests only (cli,tensorfs: both)"
         type: string
         default: cli
       test:
         description: Targeted test command, run with bash at the ref in a delegated cgroup; empty runs none
+        type: string
+        default: ''
+      runtime_ref:
+        description: cozy-runtime branch, tag or SHA whose wheel tests get as COZY_TEST_RUNTIME_WHEEL; empty for none
         type: string
         default: ''
       runner:
@@ -27,7 +35,7 @@ on:
         description: Caller's id, shown in the run name so the caller can find its run
         type: string
         default: ''
-run-name: dev-build ${{ inputs.ref }} ${{ inputs.build }} ${{ inputs.nonce }}
+run-name: dev-build ${{ inputs.ref }} ${{ inputs.build }} ${{ inputs.runtime_ref }} ${{ inputs.nonce }}
 
 permissions:
   contents: read
@@ -36,7 +44,16 @@ jobs:
   dev:
     runs-on: ${{ inputs.runner }}
     # Hang bound, not a work budget.
-    timeout-minutes: 45
+    timeout-minutes: 60
+    services:
+      # Started only for tests (TensorD's tests/hub_oauth.rs reads AUTHKIT_TEST_DATABASE_URL).
+      postgres:
+        image: ${{ inputs.test != '' && 'postgres:18-alpine' || '' }}
+        env:
+          POSTGRES_PASSWORD: ci-only
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 2s --health-timeout 5s --health-retries 30
     steps:
       - uses: actions/checkout@v5
         with:
@@ -49,15 +66,20 @@ jobs:
           go-version: '1.26.0'
           check-latest: false
       - uses: astral-sh/setup-uv@v6
-        if: inputs.test != ''
-      # The Rust workspace: rust-toolchain.toml's toolchain installs on first use.
+        if: inputs.test != '' || inputs.runtime_ref != ''
+      # The Rust workspace: rust-toolchain.toml's toolchain installs on first use. target/manylinux
+      # is the TensorFS wheel's container build.
       - uses: Swatinem/rust-cache@v2
-        if: inputs.test != ''
+        if: inputs.test != '' || contains(inputs.build, 'tensorfs')
         with:
-          version: '0.12.11'
+          key: ${{ contains(inputs.build, 'tensorfs') }}-${{ inputs.test != '' }}
+          cache-on-failure: true
+          workspaces: |
+            . -> target
+            . -> target/manylinux
       # The release recipe (release.yaml): umask 0002, -buildvcs=false, scripts/release.sh.
       - name: Build the release archives
-        if: inputs.build == 'cli'
+        if: contains(inputs.build, 'cli')
         env:
           GOFLAGS: -buildvcs=false
           GOTOOLCHAIN: local
@@ -67,22 +89,67 @@ jobs:
           find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
           git checkout -- .
           scripts/release.sh "dev-$SHA"
-      - if: inputs.build == 'cli'
+      - if: contains(inputs.build, 'cli')
         uses: actions/upload-artifact@v4
         with:
           name: cozy-cli-${{ steps.sha.outputs.sha }}
           path: dist/dev-${{ steps.sha.outputs.sha }}/
           if-no-files-found: error
           retention-days: 7
+      # TensorFS's release wheel: the extension and the `tfs` it carries, both built in the
+      # manylinux container so their glibc floor is the wheel's tag.
+      - name: Build the TensorFS wheel
+        if: contains(inputs.build, 'tensorfs')
+        uses: PyO3/maturin-action@v1
+        with:
+          maturin-version: v1.15.0
+          target: x86_64
+          manylinux: auto
+          working-directory: crates/tensorfs
+          args: --release --locked --target-dir ../../target/manylinux --out dist
+          before-script-linux: |
+            cargo build --release --locked --target-dir ../../target/manylinux -p tensorfs-core --bin tfs
+            install -D -m 755 ../../target/manylinux/release/tfs wheel-data/scripts/tfs
+      # The container leaves root-owned files the tests and the cache post-step write.
+      - if: always() && contains(inputs.build, 'tensorfs')
+        run: sudo chown -R "$(id -u):$(id -g)" target crates/tensorfs
+      - if: contains(inputs.build, 'tensorfs')
+        uses: actions/upload-artifact@v4
+        with:
+          name: tensorfs-wheel-${{ steps.sha.outputs.sha }}
+          path: crates/tensorfs/dist/*.whl
+          if-no-files-found: error
+          retention-days: 7
+      - if: contains(inputs.build, 'tensorfs') && inputs.test != ''
+        run: |
+          uv venv --python 3.12 "$RUNNER_TEMP/tensorfs"
+          uv pip install --python "$RUNNER_TEMP/tensorfs/bin/python" crates/tensorfs/dist/*.whl
+          echo "TENSORFS_TEST_PYTHON=$RUNNER_TEMP/tensorfs/bin/python" >> "$GITHUB_ENV"
+      - if: inputs.runtime_ref != ''
+        uses: actions/checkout@v5
+        with:
+          repository: cozy-creator/cozy-runtime
+          ref: ${{ inputs.runtime_ref }}
+          ssh-key: ${{ secrets.COZY_RUNTIME_READ_KEY }}
+          path: .runtime
+      - if: inputs.runtime_ref != ''
+        run: |
+          uv build --wheel --out-dir "$RUNNER_TEMP/runtime" .runtime
+          echo "COZY_TEST_RUNTIME_WHEEL=$(ls "$RUNNER_TEMP"/runtime/cozy_runtime-*.whl)" >> "$GITHUB_ENV"
       # ci.yaml's isolation: the product tests' executor containment needs a delegated cgroup subtree.
       - if: inputs.test != ''
         env:
           TEST: ${{ inputs.test }}
+          AUTHKIT_TEST_DATABASE_URL: postgres://postgres:ci-only@127.0.0.1:5432/postgres?sslmode=disable
         run: |
+          locations=()
+          for name in AUTHKIT_TEST_DATABASE_URL TENSORFS_TEST_PYTHON COZY_TEST_RUNTIME_WHEEL; do
+            [ -z "${!name:-}" ] || locations+=("--setenv=$name=${!name}")
+          done
           sudo systemd-run --wait --pipe --collect \
             --unit="cozy-dev-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
             --uid="$(id -u)" --gid="$(id -g)" --property=Delegate=yes --working-directory="$PWD" \
             --setenv="PATH=$PATH" --setenv="HOME=$HOME" --setenv=CGO_ENABLED=0 --setenv=UV_TORCH_BACKEND=cpu \
             --setenv="GOCACHE=$(go env GOCACHE)" --setenv="GOMODCACHE=$(go env GOMODCACHE)" \
-            --setenv=CARGO_TERM_COLOR=never --setenv=GITHUB_ACTIONS=true \
+            --setenv=CARGO_TERM_COLOR=never --setenv=GITHUB_ACTIONS=true "${locations[@]}" \
             bash -euo pipefail -c "$TEST"
