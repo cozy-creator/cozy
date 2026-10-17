@@ -1,12 +1,14 @@
 //! What Linux and macOS share: process groups, sessions, signals and readiness.
-use super::Lifetime;
 use std::{
+    ffi::OsString,
+    fs::File,
     io,
     os::{
         fd::{AsRawFd, BorrowedFd},
         unix::process::CommandExt,
     },
-    process::{Child, Command},
+    path::Path,
+    process::{Child, Command, ExitStatus, Stdio},
     time::Duration,
 };
 
@@ -58,21 +60,43 @@ pub fn inherit_nothing(command: &mut Command) {
 #[derive(Debug)]
 pub(super) struct Group;
 
-pub(super) fn spawn(command: &mut Command, lifetime: Lifetime) -> io::Result<(Child, Group)> {
-    match lifetime {
-        Lifetime::Owned => {
-            command.process_group(0);
-        }
-        // A session of its own: no terminal's hangup reaches it, and it leads its own group.
-        // SAFETY: setsid is async-signal-safe and touches no memory.
-        Lifetime::Detached => unsafe {
-            command.pre_exec(|| match libc::setsid() {
+pub(super) fn spawn(command: &mut Command) -> io::Result<(Child, Group)> {
+    command.process_group(0);
+    Ok((command.spawn()?, Group))
+}
+
+#[derive(Debug)]
+pub(super) struct Detached(Child);
+
+impl Detached {
+    pub(super) fn pid(&self) -> u32 {
+        self.0.id()
+    }
+
+    pub(super) fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        self.0.try_wait()
+    }
+}
+
+/// A session of its own: no terminal's hangup reaches it, and it leads its own group.
+pub(super) fn detach(program: &Path, args: &[OsString], log: Option<File>) -> io::Result<Detached> {
+    let mut command = Command::new(program);
+    command.args(args).stdin(Stdio::null());
+    match log {
+        Some(log) => command.stdout(log.try_clone()?).stderr(log),
+        None => command.stdout(Stdio::null()).stderr(Stdio::null()),
+    };
+    // SAFETY: cloexec_from and setsid are async-signal-safe and touch no memory.
+    unsafe {
+        command.pre_exec(|| {
+            cloexec_from(3);
+            match libc::setsid() {
                 -1 => Err(io::Error::last_os_error()),
                 _ => Ok(()),
-            });
-        },
+            }
+        });
     }
-    Ok((command.spawn()?, Group))
+    command.spawn().map(Detached)
 }
 
 pub(super) fn kill_group(_: &Group, leader: &Child) -> io::Result<()> {

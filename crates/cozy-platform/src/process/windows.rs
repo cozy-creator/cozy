@@ -1,20 +1,24 @@
 //! Windows: births from creation times, exact handles as process HANDLEs (an open handle keeps the
 //! PID from being reused), trees as Job Objects.
-use super::{Birth, Lifetime, State};
+use super::{Birth, State};
 use std::{
-    io, mem,
+    ffi::OsString,
+    fs::File,
+    io, iter, mem,
     os::windows::{
         io::{AsRawHandle, FromRawHandle, OwnedHandle},
-        process::CommandExt,
+        process::{CommandExt, ExitStatusExt},
     },
-    process::{Child, Command},
+    path::Path,
+    process::{Child, Command, ExitStatus},
     ptr,
     time::Duration,
 };
 use windows_sys::Win32::{
     Foundation::{
-        ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, FILETIME, HANDLE, INVALID_HANDLE_VALUE,
-        WAIT_OBJECT_0, WAIT_TIMEOUT,
+        CloseHandle, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, FILETIME, HANDLE,
+        HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation, WAIT_OBJECT_0,
+        WAIT_TIMEOUT,
     },
     System::{
         Diagnostics::ToolHelp::{
@@ -26,10 +30,13 @@ use windows_sys::Win32::{
             SetInformationJobObject, TerminateJobObject,
         },
         Threading::{
-            CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED,
-            DETACHED_PROCESS, GetProcessTimes, INFINITE, OpenProcess, OpenThread,
+            CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED, CreateProcessW,
+            DETACHED_PROCESS, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
+            GetExitCodeProcess, GetProcessTimes, INFINITE, InitializeProcThreadAttributeList,
+            OpenProcess, OpenThread, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION,
             PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
-            ResumeThread, THREAD_SUSPEND_RESUME, TerminateProcess, WaitForSingleObject,
+            ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, THREAD_SUSPEND_RESUME,
+            TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
         },
     },
 };
@@ -135,24 +142,10 @@ pub(super) fn wait(handle: &Handle, period: Option<Duration>) -> io::Result<bool
     signaled(&handle.0, period)
 }
 
-pub(super) fn spawn(command: &mut Command, lifetime: Lifetime) -> io::Result<(Child, Group)> {
-    let job = job(lifetime)?;
-    let mut flags = CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP;
-    if lifetime == Lifetime::Detached {
-        flags |= DETACHED_PROCESS | CREATE_BREAKAWAY_FROM_JOB;
-    }
-    command.creation_flags(flags);
-    let mut child = match command.spawn() {
-        // The spawner's job forbids breakaway: the tree stays inside it, in its own job as well.
-        Err(error)
-            if flags & CREATE_BREAKAWAY_FROM_JOB != 0
-                && error.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) =>
-        {
-            command.creation_flags(flags & !CREATE_BREAKAWAY_FROM_JOB);
-            command.spawn()?
-        }
-        spawned => spawned?,
-    };
+pub(super) fn spawn(command: &mut Command) -> io::Result<(Child, Group)> {
+    let job = job()?;
+    command.creation_flags(CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP);
+    let mut child = command.spawn()?;
     // Fails closed: a child the job cannot take is ended before it ran one instruction.
     // SAFETY: a live job and a live, suspended process.
     let adopted = match unsafe { AssignProcessToJobObject(raw(&job), child.as_raw_handle()) } {
@@ -175,27 +168,197 @@ pub(super) fn kill_group(group: &Group, _: &Child) -> io::Result<()> {
     }
 }
 
-/// An owned tree's job ends every member when its last handle closes, the spawner's death included.
-fn job(lifetime: Lifetime) -> io::Result<OwnedHandle> {
+/// The tree's job ends every member when its last handle closes, the spawner's death included.
+fn job() -> io::Result<OwnedHandle> {
     // SAFETY: default security, unnamed.
     let job = owned(unsafe { CreateJobObjectW(ptr::null(), ptr::null()) })?;
-    if lifetime == Lifetime::Owned {
-        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        // SAFETY: a live job and a correctly sized limit structure.
-        let set = unsafe {
-            SetInformationJobObject(
-                raw(&job),
-                JobObjectExtendedLimitInformation,
-                (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
-                mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            )
-        };
-        if set == 0 {
+    let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    // SAFETY: a live job and a correctly sized limit structure.
+    let set = unsafe {
+        SetInformationJobObject(
+            raw(&job),
+            JobObjectExtendedLimitInformation,
+            (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+            mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+    };
+    if set == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(job)
+}
+
+#[derive(Debug)]
+pub(super) struct Detached {
+    process: OwnedHandle,
+    pid: u32,
+}
+
+impl Detached {
+    pub(super) fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    pub(super) fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        if !signaled(&self.process, Some(Duration::ZERO))? {
+            return Ok(None);
+        }
+        let mut code = 0;
+        // SAFETY: a live process handle and a writable exit code.
+        if unsafe { GetExitCodeProcess(raw(&self.process), &mut code) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Some(ExitStatus::from_raw(code)))
+    }
+}
+
+/// std's spawn hands a child every inheritable handle this process holds, a pipe its caller reads
+/// to the end among them (`out=$(cozy up)`): a child that outlives this process would hold that
+/// end open forever. So CreateProcessW here, with a handle list of exactly the child's own.
+pub(super) fn detach(program: &Path, args: &[OsString], log: Option<File>) -> io::Result<Detached> {
+    let null = File::options().read(true).write(true).open("NUL")?;
+    let out = log.as_ref().unwrap_or(&null);
+    let mut handles = vec![null.as_raw_handle(), out.as_raw_handle()];
+    handles.dedup();
+    for &handle in &handles {
+        // SAFETY: handles this function owns, closed once the child has its own.
+        if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) } == 0 {
             return Err(io::Error::last_os_error());
         }
     }
-    Ok(job)
+    let attributes = Attributes::handles(&handles)?;
+    let mut info = STARTUPINFOEXW::default();
+    info.StartupInfo.cb = mem::size_of::<STARTUPINFOEXW>() as u32;
+    info.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    info.StartupInfo.hStdInput = null.as_raw_handle();
+    info.StartupInfo.hStdOutput = out.as_raw_handle();
+    info.StartupInfo.hStdError = out.as_raw_handle();
+    info.lpAttributeList = attributes.0.as_ptr().cast_mut().cast();
+    let mut line: Vec<u16> = command_line(program, args)
+        .encode_utf16()
+        .chain(iter::once(0))
+        .collect();
+    let mut flags = CREATE_NEW_PROCESS_GROUP
+        | DETACHED_PROCESS
+        | CREATE_BREAKAWAY_FROM_JOB
+        | EXTENDED_STARTUPINFO_PRESENT;
+    loop {
+        let mut process = PROCESS_INFORMATION::default();
+        // SAFETY: a writable, nul-terminated command line; the startup information and its
+        // attribute list outlive the call.
+        let created = unsafe {
+            CreateProcessW(
+                ptr::null(),
+                line.as_mut_ptr(),
+                ptr::null(),
+                ptr::null(),
+                1,
+                flags,
+                ptr::null(),
+                ptr::null(),
+                &info.StartupInfo,
+                &mut process,
+            )
+        };
+        if created != 0 {
+            // SAFETY: the new thread's handle, not needed; the process's is now ours.
+            unsafe { CloseHandle(process.hThread) };
+            return Ok(Detached {
+                process: unsafe { OwnedHandle::from_raw_handle(process.hProcess) },
+                pid: process.dwProcessId,
+            });
+        }
+        let error = io::Error::last_os_error();
+        // The spawner's job forbids breakaway: the child stays inside it.
+        if flags & CREATE_BREAKAWAY_FROM_JOB != 0
+            && error.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32)
+        {
+            flags &= !CREATE_BREAKAWAY_FROM_JOB;
+            continue;
+        }
+        return Err(error);
+    }
+}
+
+/// A PROC_THREAD_ATTRIBUTE_LIST holding one handle list, which must outlive it.
+struct Attributes(Vec<usize>);
+
+impl Attributes {
+    fn handles(handles: &[HANDLE]) -> io::Result<Self> {
+        let mut size = 0;
+        // SAFETY: asks only for the size one attribute needs; fails with that size.
+        unsafe { InitializeProcThreadAttributeList(ptr::null_mut(), 1, 0, &mut size) };
+        let mut list = Attributes(vec![0; size.div_ceil(mem::size_of::<usize>())]);
+        let start = list.0.as_mut_ptr().cast();
+        // SAFETY: a pointer-aligned buffer of the size asked for.
+        if unsafe { InitializeProcThreadAttributeList(start, 1, 0, &mut size) } == 0 {
+            list.0 = Vec::new();
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: an initialized list and a handle array that outlives it.
+        let updated = unsafe {
+            UpdateProcThreadAttribute(
+                start,
+                0,
+                PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+                handles.as_ptr().cast(),
+                mem::size_of_val(handles),
+                ptr::null_mut(),
+                ptr::null(),
+            )
+        };
+        if updated == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(list)
+    }
+}
+
+impl Drop for Attributes {
+    fn drop(&mut self) {
+        if !self.0.is_empty() {
+            // SAFETY: a list InitializeProcThreadAttributeList initialized.
+            unsafe { DeleteProcThreadAttributeList(self.0.as_mut_ptr().cast()) };
+        }
+    }
+}
+
+/// The program and its arguments as one command line, which `CommandLineToArgvW` splits back.
+pub(crate) fn command_line(program: &Path, args: &[OsString]) -> String {
+    iter::once(program.as_os_str())
+        .chain(args.iter().map(|arg| arg.as_os_str()))
+        .map(|word| quote(&word.to_string_lossy()))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// One argument as `CommandLineToArgvW` reads it back: quoted when it must be, a quote escaped,
+/// and the backslashes before a quote doubled.
+fn quote(word: &str) -> String {
+    if !word.is_empty() && !word.contains([' ', '\t', '"']) {
+        return word.into();
+    }
+    let mut quoted = String::from('"');
+    let mut backslashes = 0;
+    for c in word.chars() {
+        match c {
+            '\\' => backslashes += 1,
+            '"' => {
+                quoted.extend(iter::repeat_n('\\', backslashes * 2 + 1));
+                quoted.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                quoted.extend(iter::repeat_n('\\', backslashes));
+                quoted.push(c);
+                backslashes = 0;
+            }
+        }
+    }
+    quoted.extend(iter::repeat_n('\\', backslashes * 2));
+    quoted.push('"');
+    quoted
 }
 
 /// Resumes the one thread of a child created suspended (std keeps no thread handle).
@@ -339,4 +502,25 @@ fn owned(handle: HANDLE) -> io::Result<OwnedHandle> {
 
 fn raw(handle: &OwnedHandle) -> HANDLE {
     handle.as_raw_handle()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_command_line_reads_back_as_its_arguments() {
+        assert_eq!(
+            super::quote(r"C:\Users\a\.cozy\bin\cozy.exe"),
+            r"C:\Users\a\.cozy\bin\cozy.exe"
+        );
+        assert_eq!(
+            super::quote(r"C:\Users\a b\cozy.exe"),
+            r#""C:\Users\a b\cozy.exe""#
+        );
+        assert_eq!(super::quote(r#"say "hi""#), r#""say \"hi\"""#);
+        assert_eq!(
+            super::quote(r"C:\dir with space\"),
+            r#""C:\dir with space\\""#
+        );
+        assert_eq!(super::quote(""), r#""""#);
+    }
 }

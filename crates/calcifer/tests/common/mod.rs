@@ -317,8 +317,7 @@ impl Machine {
             .env("COZY_BOOTSTRAP_RECEIPT_HMAC_KEY_FILE", &receipt)
             .env("CUDA_VISIBLE_DEVICES", "")
             .stdout(Stdio::null());
-        let process = cozy_platform::process::Lifetime::Owned;
-        let mut tree = cozy_platform::process::spawn(command, process).unwrap();
+        let mut tree = cozy_platform::process::spawn(command).unwrap();
         let leaf = machine.join("run/cozy/bootstrap/tls.crt");
         // A hang bound for a machine that never starts; the product waits without one.
         let until = Instant::now() + Duration::from_secs(120);

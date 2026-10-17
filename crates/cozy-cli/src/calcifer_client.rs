@@ -7,7 +7,6 @@ use std::{
     fs::OpenOptions,
     io::{self, Write as _},
     path::{Path, PathBuf},
-    process::Stdio,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -15,7 +14,7 @@ use std::{
 use cozy_platform::{
     lock::{Kind as LockKind, LockFile},
     paths::Home,
-    process::{self, Lifetime, Tree},
+    process::{self, Detached},
     service::{ServiceSpec, Services},
 };
 use cozy_proto::{
@@ -349,25 +348,9 @@ impl Client {
     }
 
     /// `cozy calcifer`, detached, saying anything before its own log opens into that log.
-    fn spawn(&self) -> cozy_platform::Result<Tree> {
-        let path = self.0.home.calcifer_log();
-        let open = |e| cozy_platform::Error::Io {
-            op: "open log",
-            path: path.clone(),
-            source: e,
-        };
-        let log = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .map_err(open)?;
-        let mut command = std::process::Command::new(&self.0.program);
-        command
-            .arg("calcifer")
-            .stdin(Stdio::null())
-            .stdout(log.try_clone().map_err(open)?)
-            .stderr(log);
-        process::spawn(command, Lifetime::Detached)
+    fn spawn(&self) -> cozy_platform::Result<Detached> {
+        let spec = self.spec();
+        process::detach(&spec.program, &spec.args, spec.log.as_deref())
     }
 
     /// Sends one request, starting Calcifer when it is gone, reading its record again when a

@@ -7,13 +7,11 @@ use super::ServiceSpec;
 use crate::{
     Error, Result,
     paths::Home,
-    process::{self, Birth, Exact, Lifetime},
+    process::{self, Birth, Exact},
 };
 use std::{
-    fs::{self, OpenOptions},
-    io, iter,
+    fs, io, iter,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
 };
 use windows_sys::Win32::{
     Foundation::ERROR_FILE_NOT_FOUND,
@@ -35,7 +33,7 @@ pub(super) fn available() -> bool {
 }
 
 pub(super) fn install(_: &Path, spec: &ServiceSpec) -> Result<()> {
-    let data = wide(&command_line(spec));
+    let data = wide(&process::command_line(&spec.program, &spec.args));
     // SAFETY: NUL-terminated wide strings and the data's exact byte length.
     let status = unsafe {
         RegSetKeyValueW(
@@ -59,26 +57,8 @@ pub(super) fn start(dir: &Path, spec: &ServiceSpec) -> Result<()> {
     if running(dir, &spec.name)?.is_some() {
         return Ok(());
     }
-    let (stdout, stderr) = match &spec.log {
-        Some(log) => {
-            let file = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(log)
-                .map_err(Error::io("open log", log))?;
-            let copy = file.try_clone().map_err(Error::io("open log", log))?;
-            (Stdio::from(file), Stdio::from(copy))
-        }
-        None => (Stdio::null(), Stdio::null()),
-    };
-    let mut command = Command::new(&spec.program);
-    command
-        .args(&spec.args)
-        .stdin(Stdio::null())
-        .stdout(stdout)
-        .stderr(stderr);
-    let tree = process::spawn(command, Lifetime::Detached)?;
-    record(dir, &spec.name, &Birth::of(tree.pid())?)
+    let child = process::detach(&spec.program, &spec.args, spec.log.as_deref())?;
+    record(dir, &spec.name, &Birth::of(child.pid())?)
 }
 
 pub(super) fn announce(dir: &Path, name: &str) -> Result<()> {
@@ -168,61 +148,4 @@ fn registry(op: &'static str, status: u32) -> Result<()> {
 
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(iter::once(0)).collect()
-}
-
-fn command_line(spec: &ServiceSpec) -> String {
-    iter::once(spec.program.as_os_str())
-        .chain(spec.args.iter().map(|arg| arg.as_os_str()))
-        .map(|word| quote(&word.to_string_lossy()))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-/// One argument as `CommandLineToArgvW` reads it back: quoted when it must be, a quote escaped,
-/// and the backslashes before a quote doubled.
-fn quote(word: &str) -> String {
-    if !word.is_empty() && !word.contains([' ', '\t', '"']) {
-        return word.into();
-    }
-    let mut quoted = String::from('"');
-    let mut backslashes = 0;
-    for c in word.chars() {
-        match c {
-            '\\' => backslashes += 1,
-            '"' => {
-                quoted.extend(iter::repeat_n('\\', backslashes * 2 + 1));
-                quoted.push('"');
-                backslashes = 0;
-            }
-            _ => {
-                quoted.extend(iter::repeat_n('\\', backslashes));
-                quoted.push(c);
-                backslashes = 0;
-            }
-        }
-    }
-    quoted.extend(iter::repeat_n('\\', backslashes * 2));
-    quoted.push('"');
-    quoted
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn a_command_line_reads_back_as_its_arguments() {
-        assert_eq!(
-            super::quote(r"C:\Users\a\.cozy\bin\cozy.exe"),
-            r"C:\Users\a\.cozy\bin\cozy.exe"
-        );
-        assert_eq!(
-            super::quote(r"C:\Users\a b\cozy.exe"),
-            r#""C:\Users\a b\cozy.exe""#
-        );
-        assert_eq!(super::quote(r#"say "hi""#), r#""say \"hi\"""#);
-        assert_eq!(
-            super::quote(r"C:\dir with space\"),
-            r#""C:\dir with space\\""#
-        );
-        assert_eq!(super::quote(""), r#""""#);
-    }
 }

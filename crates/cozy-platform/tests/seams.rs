@@ -5,7 +5,7 @@ use cozy_platform::{
     durable, gpu,
     lock::{Kind, LockFile},
     paths::Home,
-    process::{self, Birth, Exact, Lifetime, State},
+    process::{self, Birth, Exact, State},
     service::{ServiceSpec, Services},
 };
 use std::{
@@ -146,10 +146,9 @@ fn child(args: &[String]) {
             ready_and_wait();
         }
         ["detach", file] => {
-            let mut command = child_command(&["sleep"]);
-            command.stdout(Stdio::null());
-            let tree = process::spawn(command, Lifetime::Detached).unwrap();
-            let birth = serde_json::to_vec(&Birth::of(tree.pid()).unwrap()).unwrap();
+            let args = ["child".into(), "sleep".into()];
+            let detached = process::detach(&env::current_exe().unwrap(), &args, None).unwrap();
+            let birth = serde_json::to_vec(&Birth::of(detached.pid()).unwrap()).unwrap();
             durable::replace(Path::new(file), &birth, 0o600).unwrap();
         }
         ["service", file, home, name] => {
@@ -301,11 +300,7 @@ fn a_replaced_file_is_whole_under_a_reader() {
 
 fn a_tree_dies_whole() {
     let file = scratch("tree").join("grandchild");
-    let mut tree = process::spawn(
-        child_command(&["tree", file.to_str().unwrap()]),
-        Lifetime::Owned,
-    )
-    .unwrap();
+    let mut tree = process::spawn(child_command(&["tree", file.to_str().unwrap()])).unwrap();
     ready(tree.stdout().unwrap());
     let pid: u32 = fs::read_to_string(&file).unwrap().parse().unwrap();
     let grandchild = Exact::open(&Birth::of(pid).unwrap())
@@ -321,7 +316,7 @@ fn a_tree_dies_whole() {
 }
 
 fn an_owned_tree_ends_with_its_handle() {
-    let mut tree = process::spawn(child_command(&["sleep"]), Lifetime::Owned).unwrap();
+    let mut tree = process::spawn(child_command(&["sleep"])).unwrap();
     ready(tree.stdout().unwrap());
     let leader = Exact::open(&Birth::of(tree.pid()).unwrap())
         .unwrap()
@@ -376,17 +371,31 @@ fn a_stopped_process_reads_stopped() {
     child.wait().unwrap();
 }
 
+/// Its spawner's stdout is a pipe read to its end, as `out=$(cozy up)` reads: the end comes when
+/// the spawner exits, though the detached child lives on.
 fn a_detached_process_outlives_its_spawner() {
     let file = scratch("detach").join("birth.json");
-    let mut spawner = child_command(&["detach", file.to_str().unwrap()]);
-    assert!(spawner.stdout(Stdio::null()).status().unwrap().success());
+    let mut spawner = child_command(&["detach", file.to_str().unwrap()])
+        .spawn()
+        .unwrap();
+    let mut out = spawner.stdout.take().unwrap();
+    let (sent, read) = mpsc::channel();
+    thread::spawn(move || sent.send(out.read_to_end(&mut vec![]).is_ok()));
+    assert!(spawner.wait().unwrap().success());
     let birth: Birth = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
     let detached = Exact::open(&birth)
         .unwrap()
         .expect("the detached child outlived its spawner");
+    // Only a pipe end the detached child kept holds the read open now; it never lets go.
+    let ended = read.recv_timeout(Duration::from_secs(30));
     assert_eq!(birth.state().unwrap(), State::Live);
     detached.kill().unwrap();
     detached.wait().unwrap();
+    assert_eq!(
+        ended,
+        Ok(true),
+        "the detached child kept its spawner's stdout open"
+    );
 }
 
 /// macOS answers EPERM, not ESRCH, when it signals an exited, unreaped process or its group.
@@ -394,7 +403,7 @@ fn a_tree_whose_leader_exited_is_killed_quietly() {
     if cfg!(windows) {
         return println!("Windows ends a tree through its job");
     }
-    let mut tree = process::spawn(child_command(&["sleep"]), Lifetime::Owned).unwrap();
+    let mut tree = process::spawn(child_command(&["sleep"])).unwrap();
     ready(tree.stdout().unwrap());
     let leader = Birth::of(tree.pid()).unwrap();
     let status = Command::new("kill")
@@ -454,7 +463,10 @@ fn the_gpu_probe_answers_without_a_driver() {
             gpu.compute_capability.is_some() && gpu.memory_class.is_some(),
             "{gpu:?}"
         );
-        let probed = gpu::Gpu { memory_class: None, ..gpu.clone() };
+        let probed = gpu::Gpu {
+            memory_class: None,
+            ..gpu.clone()
+        };
         assert_eq!(gpu::probe(Some(&gpu.uuid)).unwrap(), vec![probed]);
         let device = gpu::Device::open(&gpu.uuid).unwrap();
         assert!(device.key().starts_with(&gpu.uuid));
