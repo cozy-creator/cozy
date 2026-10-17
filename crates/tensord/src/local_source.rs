@@ -293,6 +293,7 @@ impl LocalSources {
     }
 
     /// Install editable against this manifest's remote tree, or the explicit direct path.
+    #[allow(clippy::too_many_arguments)]
     fn install_live(
         &self,
         service: &Service,
