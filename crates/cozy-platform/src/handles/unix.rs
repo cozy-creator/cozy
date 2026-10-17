@@ -12,6 +12,7 @@ use std::{
     },
 };
 
+/// The peer, always this user (another is refused).
 pub fn peer_credentials(stream: &UnixStream) -> Result<Peer> {
     let peer = peer(stream)?;
     // SAFETY: geteuid has no memory arguments.
@@ -21,8 +22,9 @@ pub fn peer_credentials(stream: &UnixStream) -> Result<Peer> {
     Ok(peer)
 }
 
+/// The peer as the kernel names it, whoever it runs as.
 #[cfg(target_os = "linux")]
-fn peer(stream: &UnixStream) -> io::Result<Peer> {
+pub fn peer(stream: &UnixStream) -> io::Result<Peer> {
     let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
     let mut size = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
     // SAFETY: correctly sized writable credential structure and size pointer.
@@ -41,11 +43,13 @@ fn peer(stream: &UnixStream) -> io::Result<Peer> {
     Ok(Peer {
         pid: cred.pid as u32,
         uid: cred.uid,
+        gid: cred.gid,
     })
 }
 
+/// The peer as the kernel names it, whoever it runs as.
 #[cfg(target_os = "macos")]
-fn peer(stream: &UnixStream) -> io::Result<Peer> {
+pub fn peer(stream: &UnixStream) -> io::Result<Peer> {
     let (mut uid, mut gid) = (0, 0);
     // SAFETY: a live socket and two writable ids.
     if unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) } < 0 {
@@ -69,6 +73,7 @@ fn peer(stream: &UnixStream) -> io::Result<Peer> {
     Ok(Peer {
         pid: pid as u32,
         uid,
+        gid,
     })
 }
 
