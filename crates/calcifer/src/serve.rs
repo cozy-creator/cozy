@@ -29,7 +29,6 @@ use crate::{
     Calcifer,
     api::{self, Api},
     machines::Machines,
-    store::StoreError,
 };
 
 /// Why `serve` returned.
@@ -117,16 +116,8 @@ pub async fn serve(loaded: &Loaded) -> Result<Stopped, Error> {
     }
     steps.done("home");
 
-    let calcifer = Calcifer::open(&home.calcifer(), &home.outputs()).map_err(|e| {
-        failed(match e {
-            crate::Error::Store(e @ StoreError::Conversion { .. }) => {
-                Error::new(Kind::Internal, "calcifer_store_conversion", e.to_string())
-                    .remedy("nothing was changed: the cozy you had before still reads this store")
-                    .next("cozy logs calcifer")
-            }
-            e => Error::new(Kind::Internal, "calcifer_store", e.to_string()),
-        })
-    })?;
+    let calcifer = Calcifer::open(&home.calcifer(), &home.outputs())
+        .map_err(|e| failed(Error::new(Kind::Internal, "calcifer_store", e.to_string())))?;
     steps.done("store");
     let listener = match TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await {
         Ok(listener) => listener,

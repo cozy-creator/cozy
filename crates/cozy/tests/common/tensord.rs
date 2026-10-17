@@ -64,6 +64,11 @@ impl Tensord {
         machine
     }
 
+    /// Its machine root (`COZY_MACHINE_ROOT`).
+    pub fn root(&self) -> std::path::PathBuf {
+        self.root.path().join("machine")
+    }
+
     /// Restarts it admitting `keys`: same identity and leaf, a new port.
     pub fn restart(&mut self, keys: &[String]) {
         self.stop();

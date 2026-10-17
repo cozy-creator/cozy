@@ -95,8 +95,9 @@ impl Bound {
 
 impl Bound {
     /// The payload's canonical JSON: sorted keys, no whitespace, exact integers.
-    pub fn canonical_payload(&self) -> Vec<u8> {
-        canonical(&Value::Object(self.payload.clone())).into_bytes()
+    pub fn canonical_payload(&self) -> cozy_proto::machine::Json {
+        let text = canonical(&Value::Object(self.payload.clone()));
+        cozy_proto::machine::Json::parse(text).expect("canonical JSON is JSON")
     }
 }
 

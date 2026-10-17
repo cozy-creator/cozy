@@ -46,9 +46,8 @@ pub struct SubmitRun {
     pub kind: Kind,
     /// What it runs, for people (`org/pkg/fn@release`).
     pub target: String,
-    /// The machine's `RunSpec`, protobuf-encoded: the spec as it is sent, frozen at submit.
-    #[serde(with = "base64_bytes")]
-    pub spec: Vec<u8>,
+    /// The spec as it is sent to the machine, frozen at submit.
+    pub spec: crate::machine::RunSpec,
     /// Local files the run reads, copied once at submit and written to its machine before the
     /// send: what `spec.inputs` names and any other object the spec refers to
     /// (`object://sha256:<hex>/<file>`).
@@ -144,7 +143,7 @@ pub struct Run {
 }
 
 /// One request field a run's executor served other than as sent (`Outcome.adjustments`).
-pub use crate::machine_json::Adjustment;
+pub use crate::machine::Adjustment;
 
 /// One settled call of a run (the run's own function or a child call).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -794,21 +793,6 @@ impl fmt::Display for On {
     }
 }
 
-mod base64_bytes {
-    use base64::{Engine as _, engine::general_purpose::STANDARD};
-    use serde::{Deserialize, Deserializer, Serializer, de::Error as _};
-
-    pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&STANDARD.encode(bytes))
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
-        STANDARD
-            .decode(String::deserialize(deserializer)?)
-            .map_err(D::Error::custom)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -861,20 +845,23 @@ mod tests {
     }
 
     #[test]
-    fn a_submission_round_trips_with_its_spec_in_base64_and_unknown_fields_ignored() {
+    fn a_submission_round_trips_with_its_spec_and_unknown_fields_ignored() {
         let submit = SubmitRun {
             on: On::New(Some("rtx-4090".into())),
             hub: "https://tensorhub.com".into(),
             kind: Kind::Warm,
             target: "fidika/sdxl".into(),
-            spec: vec![8, 2],
+            spec: crate::machine::RunSpec {
+                kind: crate::machine::RunKind::Warm,
+                ..Default::default()
+            },
             inputs: vec![],
             out: None,
             warnings: vec![],
         };
         let mut json = serde_json::to_value(&submit).unwrap();
         assert_eq!(json["on"], "new:rtx-4090");
-        assert_eq!(json["spec"], "CAI=");
+        assert_eq!(json["spec"]["kind"], "warm");
         json["from_a_newer_cli"] = serde_json::json!(true);
         assert_eq!(serde_json::from_value::<SubmitRun>(json).unwrap(), submit);
         for on in ["local", "any", "new", "new:h100", "kiyui"] {
