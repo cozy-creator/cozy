@@ -57,7 +57,7 @@ fn prepared(version: &str, generation_path: &str) -> (DeviceExecutor, PathBuf) {
         identity: None,
         cgroup_namespace: None,
     };
-    let mut executor = DeviceExecutor::spawn(config).unwrap();
+    let executor = DeviceExecutor::spawn(config).unwrap();
     assert_eq!(executor.hello.runtime_version, version); // fixture provenance, not admission
     assert!(!executor.hello.torch_loaded);
     assert!(!executor.hello.tensorfs_version.is_empty());
@@ -124,7 +124,7 @@ fn prepared(version: &str, generation_path: &str) -> (DeviceExecutor, PathBuf) {
 }
 
 fn invoke(
-    executor: &mut DeviceExecutor,
+    executor: &DeviceExecutor,
     root: &std::path::Path,
     id: &str,
     iterations: u64,
@@ -164,9 +164,9 @@ fn stock_executor_reuses_actual_classifier_and_spooled_result() {
         "0.18.99",
         "current-generations/72c4d77b275a474b8c828de950020e18/generation.json",
     )] {
-        let (mut executor, root) = prepared(version, generation);
+        let (executor, root) = prepared(version, generation);
         for (index, id) in ["first", "second", "third"].iter().enumerate() {
-            let reply = invoke(&mut executor, &root, id, 2, &mut Baseline);
+            let reply = invoke(&executor, &root, id, 2, &mut Baseline);
             let result = read_result(&root.join(id), &reply).unwrap();
             assert_eq!(result["predictions"], json!([0, 2, 1]));
             assert_eq!(result["call_sequence"], index + 1);
@@ -209,7 +209,7 @@ fn stock_executor_reuses_actual_classifier_and_spooled_result() {
 #[test]
 #[ignore = "actual SDK gate needs explicitly installed generation fixture"]
 fn credential_refusal_and_result_mutation_are_operation_local() {
-    let (mut executor, root) = prepared(
+    let (executor, root) = prepared(
         "0.18.99",
         "current-generations/72c4d77b275a474b8c828de950020e18/generation.json",
     );
@@ -228,7 +228,7 @@ fn credential_refusal_and_result_mutation_are_operation_local() {
         )
         .unwrap_err();
     assert_eq!(secret.kind(), std::io::ErrorKind::PermissionDenied);
-    let reply = invoke(&mut executor, &root, "valid", 2, &mut Baseline);
+    let reply = invoke(&executor, &root, "valid", 2, &mut Baseline);
     assert!(read_result(&root.join("valid"), &reply).is_ok());
     fs::write(root.join("valid/result.canonical"), b"mutated").unwrap();
     assert_eq!(
@@ -241,7 +241,7 @@ fn credential_refusal_and_result_mutation_are_operation_local() {
 #[test]
 #[ignore = "actual SDK image gate needs explicitly installed cpu_image generation"]
 fn stock_executor_deferred_webp_reuses_sdk_encoder_and_exact_asset_binding() {
-    let (mut executor,root)=prepared("0.18.99","/home/fidika/cozy_v2/outputs/cm-device-20261002/image-generations/43a2a90811c34ec09434644f3b977414/generation.json");
+    let (executor,root)=prepared("0.18.99","/home/fidika/cozy_v2/outputs/cm-device-20261002/image-generations/43a2a90811c34ec09434644f3b977414/generation.json");
     let spool = root.join("image");
     fs::create_dir(&spool).unwrap();
     let prepared = executor

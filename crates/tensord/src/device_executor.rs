@@ -322,6 +322,13 @@ pub struct CallInterface {
     pub builtin: Option<String>,
 }
 impl DeviceCommand {
+    /// The call a command belongs to; "" for a process-wide one.
+    fn request_id(&self) -> &str {
+        match self {
+            Self::PrepareRequest { request_id, .. } | Self::Invoke { request_id, .. } => request_id,
+            _ => "",
+        }
+    }
     /// The run a command executes and the spool its executor reads and writes.
     fn spool(&self) -> Option<(&str, &Path)> {
         match self {
@@ -882,6 +889,11 @@ impl Answer {
 
 pub trait Services {
     fn progress(&mut self, _: &Frame) {}
+    /// While this answers true, stillness is not the executor's: it waits on runs watched by
+    /// their own executors (a job's unfinished children).
+    fn waits(&self) -> Option<crate::process::Waits> {
+        None
+    }
     fn request(
         &mut self,
         frame: &Frame,
@@ -920,61 +932,239 @@ pub struct DeviceExecutor {
     /// Forked from an import-only executor (`fork/1`), which is its parent and reaps it.
     forked: bool,
     exact: Exact,
+    /// Its channel, shut down to end every exchange on it.
     stream: UnixStream,
+    link: Arc<Link>,
     pub birth: Birth,
     pub hello: Hello,
     /// Sampling resolution of the wedge rule. Tests shorten it; nothing else changes it.
     pub liveness: Liveness,
-    /// Stillness while this answers true is not this executor's: it waits on runs watched
-    /// by their own executors (a job's unfinished children).
-    pub waits: Option<crate::process::Waits>,
     root: PathBuf,
     socket: PathBuf,
     _generation_hold: Option<Arc<File>>,
     codec: Arc<Codec>,
-    retained: Vec<Box<dyn Send>>,
-    identity: Option<LaunchIdentity>,
-    watched: Watched,
+    retained: Mutex<Vec<Box<dyn Send>>>,
     /// Longest gap between frames this executor has shown during invocations.
-    worst_gap: Duration,
-    /// Where its stderr stood when the request it serves began.
-    log_from: u64,
+    worst_gap: Mutex<Duration>,
     memo: Option<Arc<crate::memo::Memo>>,
 }
 
-/// Cooperative first: the executor stops at its next safe point. The running invocation's
-/// frame meter then decides whether it stopped moving and must be killed.
+/// Cooperative first: the executor stops the call at its next safe point. The call's frame
+/// meter then decides whether the executor stopped moving and must be killed.
 #[derive(Clone)]
-pub struct Cancellation {
-    root: PathBuf,
-    identity: Option<LaunchIdentity>,
-    watched: Watched,
-}
+pub struct Cancellation(Arc<Link>);
 impl Cancellation {
     pub fn cancel(&self, request_id: &str) -> io::Result<()> {
-        let temporary = self
-            .root
-            .join(format!("executor.cancel.{}.pending", uuid::Uuid::new_v4()));
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&temporary)?;
-        file.write_all(request_id.as_bytes())?;
-        file.sync_all()?;
-        if let Some(identity) = self.identity {
-            identity.readable(&temporary)?;
-        }
-        fs::rename(temporary, self.root.join("executor.cancel"))?;
-        File::open(&self.root)?.sync_all()?;
-        if let Some(watch) = self.watched.lock().unwrap().as_ref() {
-            watch.canceled();
-        }
-        Ok(())
+        self.0.cancel(request_id)
     }
 }
 
-type Watched = Arc<Mutex<Option<Arc<Watch>>>>;
+/// The executor channel, shared by the calls in flight on it (design: lm-continuous-batching,
+/// "Wire contract"). One reader thread hands each frame to the exchange it belongs to; writers
+/// take turns, a frame and its descriptors together.
+#[derive(Default)]
+struct Link {
+    writer: Mutex<Option<UnixStream>>,
+    routes: Mutex<Routes>,
+    /// Process-wide commands go one at a time.
+    control: Mutex<()>,
+}
+#[derive(Default)]
+struct Routes {
+    /// Exchanges waiting for frames: a call's by its request id, a process-wide one by "".
+    waiting: BTreeMap<String, Waiter>,
+    /// Answers this machine is working on: the executor waits on it, not still.
+    serving: usize,
+    /// Calls canceled: told again after each command they send, until their invoke ends.
+    canceled: std::collections::BTreeSet<String>,
+    /// Why the channel ended.
+    closed: Option<String>,
+}
+struct Waiter {
+    inbox: std::sync::mpsc::Sender<Inbound>,
+    watch: Arc<Watch>,
+}
+/// A frame and the descriptors that followed it.
+type Inbound = (Frame, Vec<std::os::fd::OwnedFd>);
+
+impl Link {
+    /// Write on `stream`, and read it on a thread of its own.
+    fn attach(self: &Arc<Self>, stream: &UnixStream) -> io::Result<()> {
+        *self.writer.lock().unwrap() = Some(stream.try_clone()?);
+        let (link, reading) = (self.clone(), stream.try_clone()?);
+        std::thread::Builder::new().name("executor-reader".into()).spawn(move || link.read(reading))?;
+        Ok(())
+    }
+    /// Read frames until the channel ends, then end every exchange.
+    fn read(self: Arc<Self>, mut stream: UnixStream) {
+        let why = loop {
+            let inbound = read_frame(&mut stream).and_then(|frame| {
+                let frame = frame.ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::UnexpectedEof, "stock executor EOF before reply")
+                })?;
+                let count = match frame.event {
+                    Some(Event::Request) => u32::from(frame.descriptor).saturating_add(frame.descriptors),
+                    _ => 0,
+                };
+                if count > MAX_SHARED_FDS {
+                    return Err(io::Error::other("a request names too many descriptors"));
+                }
+                let fds = (0..count)
+                    .map(|_| cozy_platform::handles::recv_fd(&stream).map_err(io::Error::from))
+                    .collect::<io::Result<Vec<_>>>()?;
+                Ok((frame, fds))
+            });
+            if let Err(error) = inbound.and_then(|inbound| self.route(inbound)) {
+                break error;
+            }
+        };
+        self.close(&why.to_string());
+    }
+
+    /// A frame goes to the call it names. One naming none goes to the outstanding process-wide
+    /// command, else to the only exchange outstanding; otherwise a progress frame shows on
+    /// every call and a request is refused alone. Any frame shows the executor moving.
+    fn route(&self, (frame, fds): Inbound) -> io::Result<()> {
+        let routes = self.routes.lock().unwrap();
+        routes.waiting.values().for_each(|waiter| waiter.watch.frame());
+        let refusal = match frame.event {
+            Some(Event::Unknown) => return Ok(()),
+            Some(_) if !frame.malformed.is_empty() => match frame.event {
+                Some(Event::Request) => Answer::refused(frame.seq, "malformed_request", frame.malformed.clone()),
+                _ => return Ok(()),
+            },
+            _ => {
+                let waiter = match frame.request_id.as_str() {
+                    "" => routes.waiting.get("").or_else(|| {
+                        let mut all = routes.waiting.values();
+                        all.next().filter(|_| all.next().is_none())
+                    }),
+                    id => routes.waiting.get(id),
+                };
+                match (waiter, frame.event) {
+                    (Some(waiter), event) => match waiter.inbox.send((frame, fds)) {
+                        Ok(()) => return Ok(()),
+                        Err(std::sync::mpsc::SendError((frame, _))) if event == Some(Event::Request) => {
+                            Answer::refused(frame.seq, "request_unrouted", "its call ended")
+                        }
+                        Err(_) => return Ok(()),
+                    },
+                    (None, Some(Event::Progress)) if frame.request_id.is_empty() => {
+                        for waiter in routes.waiting.values() {
+                            let _ = waiter.inbox.send((frame.clone(), vec![]));
+                        }
+                        return Ok(());
+                    }
+                    (None, Some(Event::Progress)) => return Ok(()),
+                    (None, Some(Event::Request)) => Answer::refused(
+                        frame.seq,
+                        "request_unrouted",
+                        format!("no call {:?} in flight", frame.request_id),
+                    ),
+                    (None, _) => {
+                        return Err(io::Error::other(format!(
+                            "a {:?} reply for no exchange in flight ({:?})",
+                            frame.reply, frame.request_id
+                        )))
+                    }
+                }
+            }
+        };
+        drop(routes);
+        self.write(&refusal, &[] as &[File])
+    }
+
+    /// Wait for frames under `id` ("" for a process-wide command).
+    fn enter(&self, id: &str, watch: Arc<Watch>) -> io::Result<std::sync::mpsc::Receiver<Inbound>> {
+        let mut routes = self.routes.lock().unwrap();
+        if let Some(why) = &routes.closed {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, format!("executor channel closed: {why}")));
+        }
+        if routes.waiting.contains_key(id) {
+            return Err(io::Error::other(format!("call {id:?} already has a command outstanding")));
+        }
+        watch.serving(routes.serving > 0);
+        let (inbox, frames) = std::sync::mpsc::channel();
+        routes.waiting.insert(id.into(), Waiter { inbox, watch });
+        Ok(frames)
+    }
+    fn leave(&self, id: &str, ended: bool) {
+        let mut routes = self.routes.lock().unwrap();
+        routes.waiting.remove(id);
+        if ended {
+            routes.canceled.remove(id);
+        }
+    }
+    /// Why an exchange's frames stopped.
+    fn lost(&self) -> io::Error {
+        let why = self.routes.lock().unwrap().closed.clone().unwrap_or_default();
+        io::Error::new(io::ErrorKind::UnexpectedEof, format!("executor channel closed: {why}"))
+    }
+
+    /// A command, then any cancel its call has had.
+    fn send(&self, id: &str, command: &Value) -> io::Result<()> {
+        let mut writer = self.writer.lock().unwrap();
+        let stream = writer.as_mut().ok_or_else(|| io::Error::from(io::ErrorKind::NotConnected))?;
+        write_frame(stream, command)?;
+        if !id.is_empty() && self.routes.lock().unwrap().canceled.contains(id) {
+            write_frame(stream, &cancel_command(id))?;
+        }
+        Ok(())
+    }
+    /// An answer and the descriptors that follow it, with no other frame between them.
+    fn write(&self, answer: &Answer, fds: &[impl std::os::fd::AsRawFd]) -> io::Result<()> {
+        let mut writer = self.writer.lock().unwrap();
+        let stream = writer.as_mut().ok_or_else(|| io::Error::from(io::ErrorKind::NotConnected))?;
+        write_frame(stream, answer)?;
+        for fd in fds {
+            cozy_platform::handles::send_fd(stream, fd)?;
+        }
+        Ok(())
+    }
+
+    /// Told now when the call has a command outstanding, else after its next one.
+    fn cancel(&self, id: &str) -> io::Result<()> {
+        let watch = {
+            let mut routes = self.routes.lock().unwrap();
+            routes.canceled.insert(id.into());
+            routes.waiting.get(id).map(|waiter| waiter.watch.clone())
+        };
+        let Some(watch) = watch else { return Ok(()) };
+        watch.canceled();
+        match self.writer.lock().unwrap().as_mut() {
+            Some(stream) => write_frame(stream, &cancel_command(id)),
+            None => Ok(()),
+        }
+    }
+
+    /// While a guard lives, every exchange's stillness is excused: this machine is answering.
+    fn serving(&self) -> ServingGuard<'_> {
+        let mut routes = self.routes.lock().unwrap();
+        routes.serving += 1;
+        routes.waiting.values().for_each(|waiter| waiter.watch.serving(true));
+        ServingGuard(self)
+    }
+
+    /// Every exchange returns with `why`; none starts again.
+    fn close(&self, why: &str) {
+        let mut routes = self.routes.lock().unwrap();
+        routes.closed.get_or_insert_with(|| why.to_string());
+        routes.waiting.clear();
+    }
+}
+struct ServingGuard<'a>(&'a Link);
+impl Drop for ServingGuard<'_> {
+    fn drop(&mut self) {
+        let mut routes = self.0.routes.lock().unwrap();
+        routes.serving -= 1;
+        let serving = routes.serving > 0;
+        routes.waiting.values().for_each(|waiter| waiter.watch.serving(serving));
+    }
+}
+/// `cancel` (no reply): the call stops at its next safe point.
+fn cancel_command(request_id: &str) -> Value {
+    serde_json::json!({"cmd": "cancel", "request_id": request_id})
+}
 
 pub enum Forked {
     Ready(Box<DeviceExecutor>),
@@ -1537,7 +1727,7 @@ impl DeviceExecutor {
     /// its own seam and is checked exactly as a spawned one is, with this process as its
     /// parent. Refused (no process exists) gives the configuration back for a spawn.
     pub fn fork(
-        &mut self,
+        &self,
         config: ExecutorConfig,
         on_birth: impl FnOnce(&Birth, &Cancellation) -> io::Result<()>,
     ) -> io::Result<Forked> {
@@ -1624,15 +1814,8 @@ impl DeviceExecutor {
                 "forked executor is not a child of the process it was forked from",
             ));
         }
-        let watched: Watched = Arc::default();
-        on_birth(
-            &birth,
-            &Cancellation {
-                root: config.root.clone(),
-                identity: config.identity,
-                watched: watched.clone(),
-            },
-        )?;
+        let link = Arc::new(Link::default());
+        on_birth(&birth, &Cancellation(link.clone()))?;
         // Wait for connection OR observed process death. No elapsed-time startup kill.
         let mut poll = [
             libc::pollfd {
@@ -1697,24 +1880,22 @@ impl DeviceExecutor {
             ));
         }
         let parent = unready.parent;
+        link.attach(&stream)?;
         let mut executor = Self {
             child: None,
             forked: unready.child.is_none(),
             exact,
             stream,
+            link,
             birth,
             hello: Hello::default(),
             liveness: Liveness::default(),
-            waits: None,
             root: config.root,
             socket: config.socket,
             _generation_hold: config.generation_hold,
             codec,
-            retained: Vec::new(),
-            identity: config.identity,
-            watched,
-            worst_gap: Duration::ZERO,
-            log_from: 0,
+            retained: Mutex::default(),
+            worst_gap: Mutex::default(),
             memo: None,
         };
         let hello = executor.command(&DeviceCommand::Hello, &mut Baseline)?;
@@ -1754,22 +1935,17 @@ impl DeviceExecutor {
     pub fn root_path(&self) -> &Path {
         &self.root
     }
-    /// A request begins: an executor serves many submitters, so a failure quotes only the
-    /// stderr written from here on.
-    pub fn begin_request(&mut self) {
-        self.log_from = fs::metadata(self.root.join("stderr.log")).map_or(0, |m| m.len());
+    /// Where its stderr stands as a request begins: an executor serves many submitters, so a
+    /// failure quotes only the stderr written from there on (0: its whole life).
+    pub fn begin_request(&self) -> u64 {
+        fs::metadata(self.root.join("stderr.log")).map_or(0, |m| m.len())
     }
-    /// The end of the stderr of the request it serves (its whole life before the first), as
-    /// much as its triage bundle keeps.
-    pub fn stderr_tail(&self) -> String {
-        crate::process::tail_from(&self.root.join("stderr.log"), self.log_from, crate::triage::MAX_STDERR)
+    /// The end of its stderr from `from`, as much as a triage bundle keeps.
+    pub fn stderr_tail(&self, from: u64) -> String {
+        crate::process::tail_from(&self.root.join("stderr.log"), from, crate::triage::MAX_STDERR)
     }
     pub fn cancellation(&self) -> Cancellation {
-        Cancellation {
-            root: self.root.clone(),
-            identity: self.identity,
-            watched: self.watched.clone(),
-        }
+        Cancellation(self.link.clone())
     }
 
     pub fn observer_pidfd(&self) -> io::Result<File> {
@@ -1779,48 +1955,45 @@ impl DeviceExecutor {
     /// Retain a source/resource until this exact receiver exits, including owner-handle loss.
     /// Observer lifetimes must never own the DeviceExecutor handle.
     pub fn retain_until_exit(&mut self, resource: impl Send + 'static) {
-        self.retained.push(Box::new(resource));
+        self.retained.get_mut().unwrap().push(Box::new(resource));
     }
 
     /// One command, observed: a wedged executor is killed on its measured lack of progress,
-    /// which closes the channel and returns this call with the measurement.
-    pub fn command(
-        &mut self,
-        command: &DeviceCommand,
-        services: &mut impl Services,
-    ) -> io::Result<Frame> {
+    /// which closes the channel and returns this call with the measurement. Calls' commands
+    /// (`prepare_request`, `invoke`) run beside each other; process-wide ones one at a time.
+    pub fn command(&self, command: &DeviceCommand, services: &mut impl Services) -> io::Result<Frame> {
         self.command_with(command, &Group::default(), services)
     }
 
     /// `command` with a group's per-rank fields.
     pub fn command_with(
-        &mut self,
+        &self,
         command: &DeviceCommand,
         group: &Group,
         services: &mut impl Services,
     ) -> io::Result<Frame> {
+        let id = command.request_id();
+        let _turn = id.is_empty().then(|| self.link.control.lock().unwrap());
         let meter = match command {
             DeviceCommand::Invoke { .. } => Meter::Frames,
             _ => Meter::Burn,
         };
-        let watching = Watching::start(
-            self.exact.try_clone()?,
-            meter,
-            self.liveness,
-            self.worst_gap,
-            self.waits.clone(),
-            command.name(),
-        )?;
-        *self.watched.lock().unwrap() = Some(watching.watch());
-        let result = self.exchange(command, group, services, &watching.watch());
-        *self.watched.lock().unwrap() = None;
+        let worst_gap = *self.worst_gap.lock().unwrap();
+        let watching =
+            Watching::start(self.exact.try_clone()?, meter, self.liveness, worst_gap, services.waits(), command.name())?;
+        let result = self
+            .link
+            .enter(id, watching.watch())
+            .and_then(|frames| self.exchange(command, group, services, &frames));
+        self.link.leave(id, matches!(command, DeviceCommand::Invoke { .. }));
         // Whatever the run was computing when its exchange ended, its waiters compute themselves.
         if let (Some(memo), Some((run, _))) = (&self.memo, command.spool()) {
             memo.release(run);
         }
         let (killed, worst_gap) = watching.finish();
         if meter == Meter::Frames {
-            self.worst_gap = self.worst_gap.max(worst_gap);
+            let mut worst = self.worst_gap.lock().unwrap();
+            *worst = (*worst).max(worst_gap);
         }
         match killed {
             Some(verdict) => Err(io::Error::other(verdict)),
@@ -1829,11 +2002,11 @@ impl DeviceExecutor {
     }
 
     fn exchange(
-        &mut self,
+        &self,
         command: &DeviceCommand,
         group: &Group,
         services: &mut impl Services,
-        watch: &Watch,
+        frames: &std::sync::mpsc::Receiver<Inbound>,
     ) -> io::Result<Frame> {
         let mut value = serde_json::to_value(command)?;
         if let (false, Some(object), Value::Object(extra)) = (
@@ -1848,75 +2021,15 @@ impl DeviceExecutor {
             value["memo"] =
                 serde_json::json!({"process_bytes": -1, "entry_bytes": crate::memo::ENTRY_BYTES});
         }
-        write_frame(&mut self.stream, &value)?;
+        self.link.send(command.request_id(), &value)?;
         loop {
-            let frame = read_frame(&mut self.stream)?
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::UnexpectedEof, "stock executor EOF before reply")
-                })?;
-            watch.frame();
+            let (frame, fds) = frames.recv().map_err(|_| self.link.lost())?;
             match frame.event {
-                Some(Event::Request) if !frame.malformed.is_empty() => {
-                    refuse_malformed(&mut self.stream, &frame)?
-                }
-                Some(Event::Progress) if !frame.malformed.is_empty() => (),
                 Some(Event::Progress) => services.progress(&frame),
-                Some(Event::Request) if frame.kind == Kind::DeviceTier => {
-                    if frame.descriptors > MAX_SHARED_FDS {
-                        return Err(io::Error::other("device tier names too many descriptors"));
-                    }
-                    let mut fds = Vec::with_capacity(frame.descriptors as usize);
-                    for _ in 0..frame.descriptors {
-                        fds.push(cozy_platform::handles::recv_fd(&self.stream)?);
-                    }
-                    let (mut answer, out) = services.device_tier(&frame, fds)?;
-                    answer.event = "answer";
-                    answer.seq = frame.seq;
-                    answer.descriptor = false;
-                    // Chunk fds, then the lease socket when there is one.
-                    answer.descriptors = out.len().saturating_sub(usize::from(answer.lease)) as u64;
-                    write_frame(&mut self.stream, &answer)?;
-                    for fd in &out {
-                        cozy_platform::handles::send_fd(&self.stream, fd)?;
-                    }
-                }
-                Some(Event::Request)
-                    if matches!(frame.kind, Kind::StageMemoLookup | Kind::StageMemoStore) =>
-                {
-                    // A lookup may wait on the run computing its key: not this executor's stillness.
-                    watch.serving(true);
-                    let answer = match (&self.memo, command.spool()) {
-                        (Some(memo), Some((run, spool))) => memo.answer(run, spool, &frame),
-                        _ => Answer::unavailable(frame.seq),
-                    };
-                    watch.serving(false);
-                    write_frame(&mut self.stream, &answer)?;
-                }
-                Some(Event::Request) if frame.kind == Kind::ObjectFiles => {
-                    let plan = if frame.descriptor {
-                        Some(File::from(cozy_platform::handles::recv_fd(&self.stream)?))
-                    } else {
-                        None
-                    };
-                    watch.serving(true);
-                    let answered = services.object_files(&frame, plan);
-                    watch.serving(false);
-                    let (mut answer, out) = answered?;
-                    answer.event = "answer";
-                    answer.seq = frame.seq;
-                    answer.descriptor = false;
-                    answer.descriptors = out.len() as u64;
-                    write_frame(&mut self.stream, &answer)?;
-                    for file in &out {
-                        cozy_platform::handles::send_fd(&self.stream, file)?;
-                    }
-                }
                 Some(Event::Request) => {
                     // The machine's own answer time is not the executor's stillness.
-                    watch.serving(true);
-                    let answered = self.answer(&frame, services);
-                    watch.serving(false);
-                    answered?;
+                    let _serving = self.link.serving();
+                    self.answer(&frame, fds, command, services)?;
                 }
                 Some(Event::Unknown) => (),
                 None if frame.reply == command.name() => return Ok(frame),
@@ -1925,30 +2038,57 @@ impl DeviceExecutor {
         }
     }
 
-    fn answer(&mut self, frame: &Frame, services: &mut impl Services) -> io::Result<()> {
-        let descriptor = if frame.descriptor {
-            Some(File::from(cozy_platform::handles::recv_fd(&self.stream)?))
-        } else {
-            None
+    fn answer(
+        &self,
+        frame: &Frame,
+        mut fds: Vec<std::os::fd::OwnedFd>,
+        command: &DeviceCommand,
+        services: &mut impl Services,
+    ) -> io::Result<()> {
+        let (mut answer, out) = match frame.kind {
+            Kind::DeviceTier => {
+                let (mut answer, out) = services.device_tier(frame, fds)?;
+                // Chunk fds, then the lease socket when there is one.
+                answer.descriptors = out.len().saturating_sub(usize::from(answer.lease)) as u64;
+                (answer, out)
+            }
+            Kind::StageMemoLookup | Kind::StageMemoStore => match (&self.memo, command.spool()) {
+                (Some(memo), Some((run, spool))) => (memo.answer(run, spool, frame), vec![]),
+                _ => (Answer::unavailable(frame.seq), vec![]),
+            },
+            Kind::ObjectFiles => {
+                let plan = fds.pop().filter(|_| frame.descriptor).map(File::from);
+                let (mut answer, files) = services.object_files(frame, plan)?;
+                answer.descriptors = files.len() as u64;
+                (answer, files.into_iter().map(std::os::fd::OwnedFd::from).collect())
+            }
+            _ => {
+                let descriptor = fds.pop().filter(|_| frame.descriptor).map(File::from);
+                let (mut answer, descriptor) = services.request(frame, descriptor)?;
+                answer.descriptor = descriptor.is_some();
+                (answer, descriptor.into_iter().map(std::os::fd::OwnedFd::from).collect())
+            }
         };
-        let (mut answer, descriptor) = services.request(frame, descriptor)?;
         answer.event = "answer";
         answer.seq = frame.seq;
-        answer.descriptor = descriptor.is_some();
-        write_frame(&mut self.stream, &answer)?;
-        if let Some(descriptor) = descriptor {
-            cozy_platform::handles::send_fd(&self.stream, &descriptor)?;
-        }
-        Ok(())
+        answer.descriptor &= !matches!(frame.kind, Kind::DeviceTier | Kind::ObjectFiles);
+        self.link.write(&answer, &out)
     }
 
     /// Attempt-keyed cooperative cancellation; observer teardown never calls this.
     pub fn cancel(&self, request_id: &str) -> io::Result<()> {
-        self.cancellation().cancel(request_id)
+        self.link.cancel(request_id)
+    }
+
+    /// End the channel now: every exchange on it returns, naming `why`, and the executor
+    /// stops at its next one.
+    pub fn close(&self, why: &str) {
+        self.link.close(why);
+        let _ = self.stream.shutdown(std::net::Shutdown::Both);
     }
 
     /// Ask the executor to exit, then observe that exact exit (killing only a wedge).
-    pub fn shutdown(mut self) -> io::Result<()> {
+    pub fn shutdown(self) -> io::Result<()> {
         let asked = self.command(&DeviceCommand::Shutdown, &mut Baseline);
         let ended = self.terminate()?;
         asked?;
@@ -1974,7 +2114,7 @@ impl DeviceExecutor {
             exact: self.exact.try_clone().map_err(io::Error::from),
             child: self.child.take(),
             forked: std::mem::take(&mut self.forked),
-            retained: std::mem::take(&mut self.retained),
+            retained: std::mem::take(self.retained.get_mut().unwrap()),
             socket: std::mem::take(&mut self.socket),
             liveness: self.liveness,
         }
@@ -2074,7 +2214,7 @@ impl Ending {
 /// reservation next does so after its exit, on every path including early returns.
 impl Drop for DeviceExecutor {
     fn drop(&mut self) {
-        if self.child.is_none() && !self.forked && self.retained.is_empty() {
+        if self.child.is_none() && !self.forked && self.retained.get_mut().unwrap().is_empty() {
             return;
         }
         if let Err(error) = self.parts().end() {
@@ -2167,21 +2307,6 @@ fn decode_frame(bytes: &[u8]) -> io::Result<Frame> {
     })
 }
 
-/// A request this machine cannot decode is refused alone, under its own sequence number,
-/// after the fds it announced are taken off the socket: the executor's call goes on.
-fn refuse_malformed(
-    stream: &mut std::os::unix::net::UnixStream,
-    frame: &Frame,
-) -> io::Result<()> {
-    if frame.descriptors > MAX_SHARED_FDS {
-        return Err(io::Error::other("a malformed request names too many descriptors"));
-    }
-    for _ in 0..u32::from(frame.descriptor) + frame.descriptors {
-        drop(cozy_platform::handles::recv_fd(stream)?);
-    }
-    let answer = Answer::refused(frame.seq, "malformed_request", frame.malformed.clone());
-    write_frame(stream, &answer)
-}
 pub fn write_answer(
     stream: &mut std::os::unix::net::UnixStream,
     answer: &Answer,
@@ -2288,34 +2413,6 @@ mod codec_tests {
         assert_eq!(refused.kind(), io::ErrorKind::InvalidData, "{refused}");
     }
 
-    /// A request whose fields do not decode (a negative byte count, run 10078) is refused alone
-    /// under its sequence number with the fd it announced taken off the socket; an undecodable
-    /// progress frame is dropped; the next frame reads as before.
-    #[test]
-    fn a_request_that_does_not_decode_is_refused_alone() {
-        let (mut runtime, mut machine) = std::os::unix::net::UnixStream::pair().unwrap();
-        let malformed = serde_json::json!({"event": "request", "kind": "device_room", "seq": 9,
-            "free_bytes": -23068672, "holding_bytes": 1, "descriptor": true});
-        write_frame(&mut runtime, &malformed).unwrap();
-        cozy_platform::handles::send_fd(&runtime, &File::open("/dev/null").unwrap()).unwrap();
-        let frame = read_frame(&mut machine).unwrap().unwrap();
-        assert_eq!((frame.event, frame.seq), (Some(Event::Request), 9));
-        assert!(frame.malformed.contains("expected u64"), "{}", frame.malformed);
-        refuse_malformed(&mut machine, &frame).unwrap();
-        let answer = read_frame(&mut runtime).unwrap().unwrap();
-        assert_eq!((answer.seq, answer.ok, answer.code.as_str()), (9, false, "malformed_request"));
-        let progress = serde_json::json!({"event": "progress", "stage": "x", "position": -1});
-        write_frame(&mut runtime, &progress).unwrap();
-        let dropped = read_frame(&mut machine).unwrap().unwrap();
-        assert!(dropped.event == Some(Event::Progress) && !dropped.malformed.is_empty());
-        let fine = serde_json::json!({"event": "request", "kind": "device_room", "seq": 10,
-            "free_bytes": 5});
-        write_frame(&mut runtime, &fine).unwrap();
-        let next = read_frame(&mut machine).unwrap().unwrap();
-        assert!(next.malformed.is_empty());
-        assert_eq!((next.kind, next.seq, next.free_bytes), (Kind::DeviceRoom, 10, 5));
-    }
-
     #[test]
     fn plane_facts_this_machine_does_not_read_reach_its_records() {
         let facts: PlaneFacts = serde_json::from_value(serde_json::json!({
@@ -2397,5 +2494,202 @@ mod codec_tests {
         codec.encode(&spool, &reply(4, 24)).unwrap();
         drop(codec);
         fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod link_tests {
+    use super::*;
+    use serde_json::json;
+    use std::thread::JoinHandle;
+
+    /// An executor whose channel's other end the test speaks as the Runtime, and whose process
+    /// (what its watches observe) is a `sleep`.
+    fn executor() -> (Arc<DeviceExecutor>, UnixStream, Child) {
+        let process = Command::new("sleep").arg("600").spawn().unwrap();
+        let birth = Birth::of(process.id()).unwrap();
+        let (machine, runtime) = UnixStream::pair().unwrap();
+        let link = Arc::new(Link::default());
+        link.attach(&machine).unwrap();
+        let root = std::env::temp_dir();
+        let codec = CodecConfig { python: PathBuf::new(), environment: BTreeMap::new(), generation_hold: None };
+        let executor = DeviceExecutor {
+            child: None,
+            forked: false,
+            exact: Exact::open(&birth).unwrap().unwrap(),
+            stream: machine,
+            link,
+            birth,
+            hello: Hello::default(),
+            liveness: Liveness::default(),
+            socket: PathBuf::new(),
+            _generation_hold: None,
+            codec: Arc::new(Codec::new(codec, root.join("codec.log"))),
+            root,
+            retained: Mutex::default(),
+            worst_gap: Mutex::default(),
+            memo: None,
+        };
+        (Arc::new(executor), runtime, process)
+    }
+    fn prepare(id: &str) -> DeviceCommand {
+        DeviceCommand::PrepareRequest {
+            request_id: id.into(),
+            construction: "c".into(),
+            entrypoint: "e".into(),
+            payload: Value::Null,
+            attention_kernel: String::new(),
+            bits: 0,
+            input_metadata: BTreeMap::new(),
+        }
+    }
+    /// One call's machine side: the stages it saw, and the cap its room answers carry.
+    #[derive(Default)]
+    struct Call {
+        stages: Vec<String>,
+        cap: i64,
+    }
+    impl Services for Call {
+        fn progress(&mut self, frame: &Frame) {
+            self.stages.push(frame.stage.clone());
+        }
+        fn request(&mut self, frame: &Frame, _: Option<File>) -> io::Result<(Answer, Option<File>)> {
+            Ok((Answer { cap_bytes: self.cap, ..Answer::ok(frame.seq) }, None))
+        }
+    }
+    fn call(executor: &Arc<DeviceExecutor>, id: &'static str, cap: i64) -> JoinHandle<io::Result<(Frame, Call)>> {
+        let executor = executor.clone();
+        std::thread::spawn(move || {
+            let mut call = Call { cap, ..Call::default() };
+            executor.command(&prepare(id), &mut call).map(|reply| (reply, call))
+        })
+    }
+    fn read(runtime: &mut UnixStream) -> Value {
+        serde_json::from_slice(&protocol::read_body(runtime).unwrap().unwrap()).unwrap()
+    }
+    fn send(runtime: &mut UnixStream, frame: Value) {
+        protocol::write_body(runtime, &serde_json::to_vec(&frame).unwrap()).unwrap();
+    }
+    /// The calls' commands, by request id.
+    fn commands(runtime: &mut UnixStream, n: usize) -> Vec<(String, String)> {
+        let mut seen: Vec<_> = (0..n)
+            .map(|_| read(runtime))
+            .map(|c| (c["cmd"].as_str().unwrap().to_string(), c["request_id"].as_str().unwrap_or("").to_string()))
+            .collect();
+        seen.sort();
+        seen
+    }
+
+    /// Two calls in flight on one executor each get their own replies, progress and answers,
+    /// in whatever order the executor sends them. A process-wide command runs beside them and
+    /// takes the reply that names no call; progress naming none shows on every call.
+    #[test]
+    fn calls_in_flight_get_their_own_frames() {
+        let (executor, mut runtime, mut process) = executor();
+        let (a, b) = (call(&executor, "a", 7), call(&executor, "b", 9));
+        let prepare = |id: &str| ("prepare_request".to_string(), id.to_string());
+        assert_eq!(commands(&mut runtime, 2), [prepare("a"), prepare("b")]);
+        send(&mut runtime, json!({"event": "progress", "request_id": "b", "stage": "b1"}));
+        send(&mut runtime, json!({"event": "request", "request_id": "a", "seq": 1, "kind": "device_room"}));
+        send(&mut runtime, json!({"event": "request", "request_id": "b", "seq": 2, "kind": "device_room"}));
+        let answers: BTreeMap<_, _> = (0..2)
+            .map(|_| read(&mut runtime))
+            .map(|answer| (answer["seq"].as_u64().unwrap(), answer["cap_bytes"].as_i64().unwrap()))
+            .collect();
+        assert_eq!(answers, BTreeMap::from([(1, 7), (2, 9)]));
+        let probe = {
+            let executor = executor.clone();
+            std::thread::spawn(move || executor.command(&DeviceCommand::Probe { collect: false }, &mut Baseline))
+        };
+        assert_eq!(read(&mut runtime)["cmd"], "probe");
+        send(&mut runtime, json!({"reply": "probe", "ok": true}));
+        assert!(probe.join().unwrap().unwrap().ok);
+        send(&mut runtime, json!({"event": "progress", "request_id": "", "stage": "compiling"}));
+        send(&mut runtime, json!({"reply": "prepare_request", "request_id": "b", "ok": true}));
+        send(&mut runtime, json!({"event": "progress", "request_id": "a", "stage": "a1"}));
+        send(&mut runtime, json!({"reply": "prepare_request", "request_id": "a", "ok": true}));
+        let (a, b) = (a.join().unwrap().unwrap(), b.join().unwrap().unwrap());
+        assert!(a.0.ok && b.0.ok);
+        assert_eq!((a.1.stages, b.1.stages), (vec!["compiling".into(), "a1".into()], vec!["b1".into(), "compiling".into()]));
+        process.kill().unwrap();
+        process.wait().unwrap();
+    }
+
+    /// A cancel reaches its own call now while it has a command outstanding, else right after
+    /// its next one; never another call.
+    #[test]
+    fn a_cancel_reaches_only_its_own_call() {
+        let (executor, mut runtime, mut process) = executor();
+        let a = call(&executor, "a", 0);
+        assert_eq!(read(&mut runtime)["request_id"], "a");
+        executor.cancel("a").unwrap();
+        assert_eq!(read(&mut runtime), json!({"cmd": "cancel", "request_id": "a"}));
+        executor.cancel("c").unwrap();
+        let c = call(&executor, "c", 0);
+        assert_eq!(read(&mut runtime)["request_id"], "c");
+        assert_eq!(read(&mut runtime), json!({"cmd": "cancel", "request_id": "c"}));
+        for id in ["a", "c"] {
+            send(&mut runtime, json!({"reply": "prepare_request", "request_id": id, "ok": false, "terminal": "canceled"}));
+        }
+        assert_eq!(a.join().unwrap().unwrap().0.terminal, "canceled");
+        assert_eq!(c.join().unwrap().unwrap().0.terminal, "canceled");
+        process.kill().unwrap();
+        process.wait().unwrap();
+    }
+
+    /// A request naming no call in flight, or one that does not decode (a negative byte count,
+    /// run 10078), is refused alone under its sequence number with the fd it announced taken
+    /// off the socket; progress of a call that ended is dropped. The calls in flight go on.
+    #[test]
+    fn a_frame_for_no_call_in_flight_is_refused_alone() {
+        let (executor, mut runtime, mut process) = executor();
+        let (a, b) = (call(&executor, "a", 0), call(&executor, "b", 0));
+        commands(&mut runtime, 2);
+        send(&mut runtime, json!({"event": "request", "request_id": "gone", "seq": 5, "kind": "device_room"}));
+        let refused = read(&mut runtime);
+        assert_eq!((refused["seq"].as_u64(), refused["code"].as_str()), (Some(5), Some("request_unrouted")));
+        send(&mut runtime, json!({"event": "request", "request_id": "a", "seq": 6, "kind": "device_room",
+            "free_bytes": -23068672, "descriptor": true}));
+        cozy_platform::handles::send_fd(&runtime, &File::open("/dev/null").unwrap()).unwrap();
+        let refused = read(&mut runtime);
+        assert_eq!((refused["seq"].as_u64(), refused["code"].as_str()), (Some(6), Some("malformed_request")));
+        send(&mut runtime, json!({"event": "progress", "request_id": "gone", "stage": "x"}));
+        for id in ["a", "b"] {
+            send(&mut runtime, json!({"reply": "prepare_request", "request_id": id, "ok": true}));
+        }
+        for call in [a, b] {
+            assert!(call.join().unwrap().unwrap().1.stages.is_empty());
+        }
+        process.kill().unwrap();
+        process.wait().unwrap();
+    }
+
+    /// Ending the executor for one call's failure returns every call in flight with its reason,
+    /// as a lost channel; so does a reply no exchange waits for. No command starts after.
+    #[test]
+    fn a_closed_channel_ends_every_call_in_flight() {
+        let (executor, mut runtime, mut process) = executor();
+        let (a, b) = (call(&executor, "a", 0), call(&executor, "b", 0));
+        commands(&mut runtime, 2);
+        executor.close("b: the executor did not settle quiescent");
+        for call in [a, b] {
+            let error = call.join().unwrap().err().unwrap();
+            assert!(channel_lost(&error) && error.to_string().contains("did not settle"), "{error}");
+        }
+        assert!(executor.command(&prepare("c"), &mut Baseline).is_err());
+        drop((executor, runtime));
+
+        let (executor, mut runtime, mut other) = self::executor();
+        let (a, b) = (call(&executor, "a", 0), call(&executor, "b", 0));
+        commands(&mut runtime, 2);
+        send(&mut runtime, json!({"reply": "invoke", "request_id": "z", "ok": true}));
+        for call in [a, b] {
+            let error = call.join().unwrap().err().unwrap();
+            assert!(error.to_string().contains("no exchange in flight"), "{error}");
+        }
+        for process in [&mut process, &mut other] {
+            process.kill().unwrap();
+            process.wait().unwrap();
+        }
     }
 }

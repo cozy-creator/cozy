@@ -1466,7 +1466,7 @@ print(json.dumps({"identity": generation.identity}))
                     if let Some(outcome) =
                         reply.outcome.as_ref().filter(|o| o.terminal != "succeeded")
                     {
-                        crate::gpu_service::keep_triage(&engine, &id, &executor, outcome);
+                        crate::gpu_service::keep_triage(&engine, &id, &executor, 0, outcome);
                         let failure = crate::journal::Failure::executor(
                             &outcome.terminal,
                             &outcome.origin,

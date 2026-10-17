@@ -1244,7 +1244,7 @@ mod tests {
         let run = |name: &str, model: &str| {
             let plan = crate::gpu_service::Plan {
                 id: format!("plan-{model}"), construction: "c".into(), installation: "installed".into(),
-                generation: "g".into(), entrypoint: "derive".into(), slots: vec![], degree: 0,
+                generation: "g".into(), entrypoint: "derive".into(), slots: vec![], degree: 0, batchable: false,
                 sources: vec![crate::gpu_service::PlanSource { parameter: "source".into(), manifest: kept(model),
                     length: 1, repository: String::new(), release: String::new(), lane: String::new() }],
             };

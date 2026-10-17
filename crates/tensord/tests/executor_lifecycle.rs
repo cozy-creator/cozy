@@ -113,7 +113,7 @@ fn launch(generation: &Generation, hold: &File) -> (DeviceExecutor, PathBuf, Sea
 }
 
 fn invoke(
-    executor: &mut DeviceExecutor,
+    executor: &DeviceExecutor,
     root: &std::path::Path,
     id: &str,
     entrypoint: &str,
@@ -189,14 +189,14 @@ fn launch_is_sealed_grouped_and_reaped_after_cooperative_shutdown() {
 #[ignore = "needs installed cpu_lifecycle generations"]
 fn cooperative_cancel_stops_at_a_safe_point_and_keeps_the_executor() {
     for (generation, hold) in generations() {
-        let (mut executor, root, _) = launch(&generation, &hold);
+        let (executor, root, _) = launch(&generation, &hold);
         let cancel = executor.cancellation();
         let canceller = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(300)); // let a few steps run
             cancel.cancel("long").unwrap();
         });
         let reply = invoke(
-            &mut executor,
+            &executor,
             &root,
             "long",
             "steps",
@@ -205,7 +205,7 @@ fn cooperative_cancel_stops_at_a_safe_point_and_keeps_the_executor() {
         .unwrap();
         canceller.join().unwrap();
         assert_eq!(terminal(&reply), "canceled", "{reply:?}");
-        let next = invoke(&mut executor, &root, "next", "steps", json!({"steps": 2})).unwrap();
+        let next = invoke(&executor, &root, "next", "steps", json!({"steps": 2})).unwrap();
         assert_eq!(terminal(&next), "succeeded", "{next:?}");
         executor.shutdown().unwrap();
         fs::remove_dir_all(root).unwrap();
@@ -216,16 +216,16 @@ fn cooperative_cancel_stops_at_a_safe_point_and_keeps_the_executor() {
 #[ignore = "needs installed cpu_lifecycle generations"]
 fn a_failure_quotes_only_its_own_requests_stderr() {
     let (generation, hold) = generations().remove(0);
-    let (mut executor, root, _) = launch(&generation, &hold);
+    let (executor, root, _) = launch(&generation, &hold);
     // One submitter's request, then another's on the same executor.
     let first = json!({"text": "first submitter's words"});
-    let reply = invoke(&mut executor, &root, "first", "note", first).unwrap();
+    let reply = invoke(&executor, &root, "first", "note", first).unwrap();
     assert_eq!(terminal(&reply), "succeeded", "{reply:?}");
-    executor.begin_request();
+    let from = executor.begin_request();
     let second = json!({"text": "second submitter's words", "fail": true});
-    let reply = invoke(&mut executor, &root, "second", "note", second).unwrap();
+    let reply = invoke(&executor, &root, "second", "note", second).unwrap();
     assert_eq!(terminal(&reply), "failed", "{reply:?}");
-    let quoted = executor.stderr_tail();
+    let quoted = executor.stderr_tail(from);
     assert!(quoted.contains("second submitter's words"), "{quoted}");
     assert!(!quoted.contains("first submitter's words"), "{quoted}");
     // The log itself holds both: only the quote is bounded.
@@ -239,10 +239,10 @@ fn a_failure_quotes_only_its_own_requests_stderr() {
 #[ignore = "needs installed cpu_lifecycle generations"]
 fn slow_steady_work_is_never_killed_without_a_cancel() {
     let (generation, hold) = generations().remove(0);
-    let (mut executor, root, _) = launch(&generation, &hold);
+    let (executor, root, _) = launch(&generation, &hold);
     // Each step is longer than the noise floor (0.6 s here); no cancel, so nothing judges.
     let reply = invoke(
-        &mut executor,
+        &executor,
         &root,
         "slow",
         "steps",
@@ -258,7 +258,7 @@ fn slow_steady_work_is_never_killed_without_a_cancel() {
 #[ignore = "needs installed cpu_lifecycle generations"]
 fn canceled_wedge_is_killed_on_measured_stillness_and_reaped() {
     for (generation, hold) in generations() {
-        let (mut executor, root, _) = launch(&generation, &hold);
+        let (executor, root, _) = launch(&generation, &hold);
         let birth = executor.birth.clone();
         let cancel = executor.cancellation();
         let canceled_at = Arc::new(std::sync::Mutex::new(None));
@@ -268,7 +268,7 @@ fn canceled_wedge_is_killed_on_measured_stillness_and_reaped() {
             *mark.lock().unwrap() = Some(Instant::now());
             cancel.cancel("stuck").unwrap();
         });
-        let error = invoke(&mut executor, &root, "stuck", "wedge", json!({})).unwrap_err();
+        let error = invoke(&executor, &root, "stuck", "wedge", json!({})).unwrap_err();
         let returned = Instant::now();
         canceller.join().unwrap();
         let message = error.to_string();
@@ -291,7 +291,7 @@ fn canceled_wedge_is_killed_on_measured_stillness_and_reaped() {
 #[ignore = "needs installed cpu_lifecycle generations"]
 fn executor_killed_mid_request_returns_and_is_reaped() {
     for (generation, hold) in generations() {
-        let (mut executor, root, _) = launch(&generation, &hold);
+        let (executor, root, _) = launch(&generation, &hold);
         let birth = executor.birth.clone();
         let exact = Exact::open(&birth).unwrap().unwrap();
         let killer = std::thread::spawn(move || {
@@ -299,7 +299,7 @@ fn executor_killed_mid_request_returns_and_is_reaped() {
             exact.kill().unwrap(); // an outside SIGKILL (OOM killer, operator)
         });
         let error = invoke(
-            &mut executor,
+            &executor,
             &root,
             "killed",
             "steps",
@@ -314,8 +314,8 @@ fn executor_killed_mid_request_returns_and_is_reaped() {
         assert!(birth.ended().unwrap());
 
         // The package ends its own process mid-request: same contract.
-        let (mut executor, root, _) = launch(&generation, &hold);
-        let error = invoke(&mut executor, &root, "exit", "exit_now", json!({})).unwrap_err();
+        let (executor, root, _) = launch(&generation, &hold);
+        let error = invoke(&executor, &root, "exit", "exit_now", json!({})).unwrap_err();
         assert!(error.to_string().contains("EOF"), "{error}");
         assert_eq!(executor.terminate().unwrap().status.code(), Some(17));
         fs::remove_dir_all(root).unwrap();
@@ -330,12 +330,12 @@ fn retained_executors_killed_while_idle_lose_their_channel_before_any_handler() 
     for (generation, hold) in generations() {
         let steps = json!({"steps": 1, "seconds": 0.01});
         for cycle in 0..20 {
-            let (mut executor, root, _) = launch(&generation, &hold);
-            let reply = invoke(&mut executor, &root, "first", "steps", steps.clone()).unwrap();
+            let (executor, root, _) = launch(&generation, &hold);
+            let reply = invoke(&executor, &root, "first", "steps", steps.clone()).unwrap();
             assert_eq!(terminal(&reply), "succeeded", "cycle {cycle}: {reply:?}");
             Exact::open(&executor.birth).unwrap().unwrap().kill().unwrap();
             std::thread::sleep(Duration::from_secs(1));
-            let error = invoke(&mut executor, &root, "next", "steps", steps.clone()).unwrap_err();
+            let error = invoke(&executor, &root, "next", "steps", steps.clone()).unwrap_err();
             assert!(tensord::device_executor::channel_lost(&error), "cycle {cycle}: {error}");
             eprintln!("cycle {cycle}: {:?}: {error}", error.kind());
             assert_eq!(executor.terminate().unwrap().status.signal(), Some(libc::SIGKILL));
@@ -348,7 +348,7 @@ fn retained_executors_killed_while_idle_lose_their_channel_before_any_handler() 
 #[ignore = "needs installed cpu_lifecycle generations"]
 fn a_setsid_descendant_is_killed_with_its_executor_scope() {
     for (generation, hold) in generations() {
-        let (mut executor, root, _) = launch(&generation, &hold);
+        let (executor, root, _) = launch(&generation, &hold);
         let member = fs::read_to_string(format!("/proc/{}/cgroup", executor.birth.pid)).unwrap();
         let environ = fs::read(format!("/proc/{}/environ", executor.birth.pid)).unwrap();
         let token = environ
@@ -357,7 +357,7 @@ fn a_setsid_descendant_is_killed_with_its_executor_scope() {
         // A delegated cgroup where the host has one, else the token its descendants inherit.
         assert!(member.contains("cozy-executor-lifecycle-") != token, "{member}");
         eprintln!("scope: {}", if token { "token" } else { "cgroup" });
-        let reply = invoke(&mut executor, &root, "daemon", "daemon", json!({})).unwrap();
+        let reply = invoke(&executor, &root, "daemon", "daemon", json!({})).unwrap();
         assert_eq!(terminal(&reply), "succeeded", "{reply:?}");
         let spool = root.join("daemon");
         let pid = tensord::device_executor::read_result(&spool, &reply).unwrap()["pid"]
@@ -448,7 +448,7 @@ fn foreign_identity_executor_is_contained_and_keeps_its_hold_and_caches() {
         "",
     )
     .unwrap();
-    let mut executor = DeviceExecutor::spawn(ExecutorConfig {
+    let executor = DeviceExecutor::spawn(ExecutorConfig {
         python: generation.python.clone(),
         root: root.join("executor"),
         socket: root.join("e.sock"),

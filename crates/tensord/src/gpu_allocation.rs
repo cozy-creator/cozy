@@ -8,7 +8,9 @@
 //! flight and their families finish (nothing is preempted), then its lane ends and it queues
 //! again at its own place. A root that released (or yielded) its lane comes back at its place
 //! among the waiting ones and never displaces a holder. A call's family may call where it
-//! calls: a call waiting on its child shares its GPU with it.
+//! calls: a call waiting on its child shares its GPU with it. A call of a batchable
+//! construction rides the GPU where its executor serves calls (up to `BATCH`), whichever run
+//! they come from: the GPU is free when its last rider ends.
 use std::{
     collections::BTreeMap,
     ops::Range,
@@ -30,11 +32,13 @@ struct Table {
 struct Gpu {
     /// The root whose lane this GPU is.
     root: Option<u64>,
-    /// Calls running there, all of one family.
+    /// Calls running there.
     calling: usize,
-    /// The family of the calls running there, if any, and their root.
-    caller: Option<String>,
-    running: Option<u64>,
+    /// The families and roots of the calls running there, and the batchable constructions
+    /// they ride, each counted.
+    callers: BTreeMap<String, usize>,
+    running: BTreeMap<u64, usize>,
+    rides: BTreeMap<String, usize>,
 }
 struct Root {
     width: usize,
@@ -59,6 +63,22 @@ pub(crate) struct Hold {
 pub(crate) struct Permit {
     table: Arc<Allocations>,
     devices: Range<usize>,
+    root: Option<u64>,
+    family: Option<String>,
+    ride: Option<String>,
+}
+
+/// Calls of a batchable construction one executor serves at once: the Runtime merges their
+/// decode loops (design: lm-continuous-batching), up to its largest graph bucket.
+pub(crate) const BATCH: usize = 16;
+
+fn count<K: Ord + Clone>(counts: &mut BTreeMap<K, usize>, key: Option<&K>, up: bool) {
+    let Some(key) = key else { return };
+    let n = counts.entry(key.clone()).or_default();
+    *n = if up { *n + 1 } else { *n - 1 };
+    if *n == 0 {
+        counts.remove(key);
+    }
 }
 
 impl Table {
@@ -76,8 +96,12 @@ impl Table {
     /// The oldest request besides `root` that claims, holds or still calls on a GPU of `lane`;
     /// `root`'s own claim from an earlier step this pass hides none of them.
     fn other(&self, lane: Range<usize>, root: u64, claims: &Claims) -> Option<u64> {
-        lane.flat_map(|d| [claims.get(d).copied().flatten(), self.gpus[d].root, self.gpus[d].running])
-            .flatten().filter(|other| *other != root).min()
+        lane.flat_map(|d| {
+            let gpu = &self.gpus[d];
+            let held = [claims.get(d).copied().flatten(), gpu.root].into_iter().flatten();
+            held.chain(gpu.running.keys().copied()).collect::<Vec<_>>()
+        })
+        .filter(|other| *other != root).min()
     }
     /// No call runs on `root`'s lane.
     fn between_steps(&self, root: u64) -> bool {
@@ -91,7 +115,7 @@ impl Table {
     }
     /// A call of `family` continues a step in flight: its family calls on a GPU.
     fn continuing(&self, family: Option<&str>) -> bool {
-        family.is_some_and(|family| self.gpus.iter().any(|gpu| gpu.caller.as_deref() == Some(family)))
+        family.is_some_and(|family| self.gpus.iter().any(|gpu| gpu.callers.contains_key(family)))
     }
     fn bind(&mut self, root: u64, lane: Range<usize>) {
         lane.clone().for_each(|d| self.gpus[d].root = Some(root));
@@ -222,28 +246,47 @@ impl Allocations {
     }
     /// A call on `devices`: inside `root`'s lane when it is registered, else on GPUs no root
     /// holds or older request claims (a standalone call: its own root; `None`: machine
-    /// warming). No GPU may be calling outside `family`. A yielding root's call runs only when
-    /// it continues a step in flight.
-    pub(crate) fn call(self: &Arc<Self>, root: Option<u64>, family: Option<&str>, devices: Range<usize>, claims: &Claims) -> Option<Permit> {
+    /// warming). No GPU may be calling outside `family`, but a call of batchable construction
+    /// `ride` rides a GPU whose calls of it number 1 to `BATCH - 1` when no other request
+    /// claims it. A yielding root's call runs only when it continues a step in flight.
+    pub(crate) fn call(
+        self: &Arc<Self>,
+        root: Option<u64>,
+        family: Option<&str>,
+        ride: Option<&str>,
+        devices: Range<usize>,
+        claims: &Claims,
+    ) -> Option<Permit> {
         let mut table = self.table.lock().unwrap();
         let registered = root.is_some_and(|root| table.roots.contains_key(&root));
         let usable = !devices.is_empty() && devices.end <= table.gpus.len() && devices.clone().all(|d| {
             let gpu = &table.gpus[d];
+            let claim = claims.get(d).copied().flatten().is_none_or(|c| Some(c) == root);
             let placed = match registered {
                 true => gpu.root == root,
-                false => gpu.root.is_none() && claims.get(d).copied().flatten().is_none_or(|c| Some(c) == root),
+                false => gpu.root.is_none() && claim,
             };
-            let shared = family.is_some() && gpu.caller.as_deref() == family;
-            placed && (gpu.calling == 0 || shared)
+            let shared = family.is_some_and(|family| gpu.callers.contains_key(family));
+            let riding = ride.and_then(|ride| gpu.rides.get(ride)).is_some_and(|n| *n < BATCH) && claim;
+            placed && (gpu.calling == 0 || shared || riding)
         }) && !(registered && root.is_some_and(|root| table.yielding(root, claims)) && !table.continuing(family));
         if !usable {
             return None;
         }
+        let (family, ride) = (family.map(String::from), ride.map(String::from));
         for d in devices.clone() {
             let gpu = &mut table.gpus[d];
-            (gpu.calling, gpu.caller, gpu.running) = (gpu.calling + 1, family.map(String::from), root);
+            gpu.calling += 1;
+            count(&mut gpu.callers, family.as_ref(), true);
+            count(&mut gpu.running, root.as_ref(), true);
+            count(&mut gpu.rides, ride.as_ref(), true);
         }
-        Some(Permit { table: self.clone(), devices })
+        Some(Permit { table: self.clone(), devices, root, family, ride })
+    }
+    /// Per GPU, the calls of batchable construction `ride` running there.
+    pub(crate) fn rides(&self, ride: &str) -> Vec<usize> {
+        let table = self.table.lock().unwrap();
+        table.gpus.iter().map(|gpu| gpu.rides.get(ride).copied().unwrap_or(0)).collect()
     }
     /// Machine upkeep on `devices` (ending idle executors): no call there.
     pub(crate) fn upkeep(self: &Arc<Self>, devices: Range<usize>) -> Option<Permit> {
@@ -252,7 +295,7 @@ impl Allocations {
             return None;
         }
         devices.clone().for_each(|d| table.gpus[d].calling += 1);
-        Some(Permit { table: self.clone(), devices })
+        Some(Permit { table: self.clone(), devices, root: None, family: None, ride: None })
     }
 }
 impl Drop for Permit {
@@ -260,9 +303,9 @@ impl Drop for Permit {
         let mut table = self.table.table.lock().unwrap();
         for gpu in &mut table.gpus[self.devices.clone()] {
             gpu.calling -= 1;
-            if gpu.calling == 0 {
-                (gpu.caller, gpu.running) = (None, None);
-            }
+            count(&mut gpu.callers, self.family.as_ref(), false);
+            count(&mut gpu.running, self.root.as_ref(), false);
+            count(&mut gpu.rides, self.ride.as_ref(), false);
         }
         drop(table);
         self.table.freed.notify_all();
@@ -305,7 +348,7 @@ mod tests {
         let (_x, _a, _y) = (gpus.register(1, 2), gpus.register(2, 4), gpus.register(3, 2));
         assert_eq!(held(gpus.lane(1, &mut [None; 4])), 0..2);
         assert_eq!(held(gpus.lane(3, &mut [None; 4])), 2..4, "A is not ready: Y takes the free half");
-        let segment = gpus.call(Some(3), Some("y-segment"), 2..4, &[None; 4]).unwrap();
+        let segment = gpus.call(Some(3), Some("y-segment"), None, 2..4, &[None; 4]).unwrap();
         // A is ready but older X holds half its lane: A waits behind X, claiming only the GPUs
         // younger work cannot keep from it, and Y goes on between its steps.
         let mut claims = [None; 4];
@@ -314,8 +357,8 @@ mod tests {
         assert!(yielded.is_empty());
         assert_eq!(claims, [Some(2), Some(2), None, None]);
         drop(segment);
-        assert!(gpus.call(Some(3), None, 2..3, &claims).is_some(), "no yield to a root that cannot bind");
-        assert!(gpus.call(Some(4), None, 0..1, &claims).is_none(), "a younger standalone call waits");
+        assert!(gpus.call(Some(3), None, None, 2..3, &claims).is_some(), "no yield to a root that cannot bind");
+        assert!(gpus.call(Some(4), None, None, 0..1, &claims).is_none(), "a younger standalone call waits");
     }
 
     #[test]
@@ -333,25 +376,65 @@ mod tests {
         let (lane, yielded) = gpus.lane(2, &mut claims);
         assert!(matches!(lane, Lane::Waiting { behind: Some(1), new: true }) && yielded.is_empty());
         assert!(matches!(gpus.lane(2, &mut claims).0, Lane::Waiting { behind: Some(1), new: false }), "its next step this pass");
-        assert!(gpus.call(Some(3), None, 1..2, &claims).is_some());
+        assert!(gpus.call(Some(3), None, None, 1..2, &claims).is_some());
         // Nor does A after its release.
         gpus.release(1);
         assert_eq!(held(gpus.lane(2, &mut [None; 2])), 0..1);
         let mut claims = [None; 2];
         assert!(matches!(gpus.lane(1, &mut claims).0, Lane::Waiting { behind: Some(2), .. }));
-        assert!(gpus.call(Some(2), None, 0..1, &claims).is_some());
+        assert!(gpus.call(Some(2), None, None, 0..1, &claims).is_some());
     }
 
     #[test]
     fn a_served_calls_family_shares_its_gpu_and_a_stranger_waits() {
         let gpus = Allocations::new(1);
-        let parent = gpus.call(Some(7), Some("7"), 0..1, &[None]).unwrap();
-        assert!(gpus.call(Some(8), Some("8"), 0..1, &[None]).is_none(), "another root waits");
-        assert!(gpus.call(Some(7), None, 0..1, &[None]).is_none(), "an unrelated call waits");
-        let child = gpus.call(Some(7), Some("7"), 0..1, &[None]).unwrap();
+        let parent = gpus.call(Some(7), Some("7"), None, 0..1, &[None]).unwrap();
+        assert!(gpus.call(Some(8), Some("8"), None, 0..1, &[None]).is_none(), "another root waits");
+        assert!(gpus.call(Some(7), None, None, 0..1, &[None]).is_none(), "an unrelated call waits");
+        let child = gpus.call(Some(7), Some("7"), None, 0..1, &[None]).unwrap();
         drop(parent);
         assert!(gpus.upkeep(0..1).is_none(), "the child still calls there");
         drop(child);
-        assert!(gpus.call(Some(8), Some("8"), 0..1, &[None]).is_some());
+        assert!(gpus.call(Some(8), Some("8"), None, 0..1, &[None]).is_some());
+    }
+
+    /// Calls of a batchable construction ride the GPU its executor serves them on, whichever
+    /// run they come from, up to `BATCH`; a call of any other construction, batchable or not,
+    /// takes its turn. The GPU is free when its last rider ends.
+    #[test]
+    fn calls_of_a_batchable_construction_ride_its_gpu_up_to_batch() {
+        let gpus = Allocations::new(1);
+        let call = |run: u64, ride| gpus.call(Some(run), Some(&run.to_string()), ride, 0..1, &[None]);
+        let only = call(1, None).unwrap();
+        assert!(call(2, None).is_none() && call(2, Some("lm")).is_none());
+        drop(only);
+        let riders: Vec<_> = (1..=BATCH as u64).map(|run| call(run, Some("lm")).unwrap()).collect();
+        assert_eq!(gpus.rides("lm"), [BATCH]);
+        assert!(call(99, Some("lm")).is_none(), "its executor serves BATCH calls");
+        assert!(call(99, Some("other")).is_none() && call(99, None).is_none());
+        let mut riders = riders.into_iter();
+        drop(riders.next());
+        assert!(gpus.upkeep(0..1).is_none());
+        let rider = call(99, Some("lm")).unwrap();
+        drop((riders, rider));
+        assert!(gpus.upkeep(0..1).is_some());
+    }
+
+    /// One run's `release_gpus` never ends another run's ride: once a job lets its lane go, a
+    /// standalone call rides the executor its child runs there, and the GPU stays busy until
+    /// that ride ends. An older request waiting for the GPU stops new riders.
+    #[test]
+    fn a_release_never_ends_another_runs_ride() {
+        let gpus = Allocations::new(1);
+        let _job = gpus.register(1, 1);
+        let child = gpus.call(Some(1), Some("1"), Some("lm"), held(gpus.lane(1, &mut [None])), &[None]).unwrap();
+        assert!(gpus.call(Some(2), Some("2"), Some("lm"), 0..1, &[None]).is_none(), "a held lane is its root's");
+        gpus.release(1);
+        let rider = gpus.call(Some(2), Some("2"), Some("lm"), 0..1, &[None]).unwrap();
+        drop(child);
+        assert!(gpus.call(Some(3), Some("3"), None, 0..1, &[None]).is_none());
+        assert!(gpus.call(Some(4), Some("4"), Some("lm"), 0..1, &[Some(3)]).is_none(), "request 3 waits for it");
+        drop(rider);
+        assert!(gpus.call(Some(3), Some("3"), None, 0..1, &[Some(3)]).is_some());
     }
 }

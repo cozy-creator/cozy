@@ -171,7 +171,6 @@ fn exec(
         cgroup_namespace: None,
     })?;
     let spawn_ms = began.elapsed().as_secs_f64() * 1000.;
-    let mut executor = executor;
     let exit = executor.observer_pidfd()?;
     let mut pilot = Pilot {
         custody: custody.clone(),

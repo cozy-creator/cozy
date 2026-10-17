@@ -81,7 +81,7 @@ fn parent(generation: &Generation, hold: &File) -> (DeviceExecutor, PathBuf, Pat
         serde_json::to_vec(&generation.interface).unwrap(),
     )
     .unwrap();
-    let mut parent = DeviceExecutor::spawn(config(generation, hold, &root, "parent")).unwrap();
+    let parent = DeviceExecutor::spawn(config(generation, hold, &root, "parent")).unwrap();
     let started = parent
         .command(&start(generation, &interface, true), &mut Baseline)
         .unwrap();
@@ -89,7 +89,7 @@ fn parent(generation: &Generation, hold: &File) -> (DeviceExecutor, PathBuf, Pat
     (parent, root, interface)
 }
 
-fn fork(parent: &mut DeviceExecutor, config: ExecutorConfig) -> DeviceExecutor {
+fn fork(parent: &DeviceExecutor, config: ExecutorConfig) -> DeviceExecutor {
     match parent.fork(config, |_, _| Ok(())).unwrap() {
         Forked::Ready(executor) => *executor,
         Forked::Refused(_, reason) | Forked::Lost(_, reason) => panic!("fork refused: {reason}"),
@@ -100,9 +100,9 @@ fn fork(parent: &mut DeviceExecutor, config: ExecutorConfig) -> DeviceExecutor {
 #[ignore = "needs installed cpu_lifecycle generations offering fork/1"]
 fn a_forked_executor_is_sealed_serves_and_is_reaped_with_its_status() {
     for (generation, hold) in generations() {
-        let (mut parent, root, interface) = parent(&generation, &hold);
+        let (parent, root, interface) = parent(&generation, &hold);
         let began = Instant::now();
-        let mut child = fork(&mut parent, config(&generation, &hold, &root, "child"));
+        let child = fork(&parent, config(&generation, &hold, &root, "child"));
         let ready = began.elapsed();
         assert!(
             ready < Duration::from_secs(5),
@@ -188,7 +188,7 @@ fn a_forked_executor_is_sealed_serves_and_is_reaped_with_its_status() {
         assert_eq!(ended.status.signal(), Some(libc::SIGKILL));
 
         // A second child; the parent reaps the first at this fork.
-        let second = fork(&mut parent, config(&generation, &hold, &root, "second"));
+        let second = fork(&parent, config(&generation, &hold, &root, "second"));
         assert!(birth.ended().unwrap());
         assert!(!Path::new(&format!("/proc/{}", birth.pid)).exists());
         second.shutdown().unwrap();
@@ -203,7 +203,7 @@ fn a_parent_refuses_before_its_imports_and_its_children_die_with_it() {
     for (generation, hold) in generations() {
         let root = std::env::temp_dir().join(format!("machine-fork-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&root).unwrap();
-        let mut early = DeviceExecutor::spawn(config(&generation, &hold, &root, "early")).unwrap();
+        let early = DeviceExecutor::spawn(config(&generation, &hold, &root, "early")).unwrap();
         let config_back = match early
             .fork(config(&generation, &hold, &root, "refused"), |_, _| Ok(()))
             .unwrap()
@@ -222,8 +222,8 @@ fn a_parent_refuses_before_its_imports_and_its_children_die_with_it() {
         early.shutdown().unwrap();
         fs::remove_dir_all(&root).unwrap();
 
-        let (mut parent, root, _) = parent(&generation, &hold);
-        let child = fork(&mut parent, config(&generation, &hold, &root, "orphan"));
+        let (parent, root, _) = parent(&generation, &hold);
+        let child = fork(&parent, config(&generation, &hold, &root, "orphan"));
         let birth = child.birth.clone();
         let exact = Exact::open(&birth).unwrap().unwrap();
         Exact::open(&parent.birth).unwrap().unwrap().kill().unwrap();
@@ -238,7 +238,7 @@ fn a_parent_refuses_before_its_imports_and_its_children_die_with_it() {
 #[ignore = "needs installed cpu_lifecycle generations offering fork/1"]
 fn a_dead_parent_is_lost_and_its_configuration_spawns() {
     for (generation, hold) in generations() {
-        let (mut parent, root, _) = parent(&generation, &hold);
+        let (parent, root, _) = parent(&generation, &hold);
         // Killed (as the gate kills every executor): its channel fails, no process is made.
         Exact::open(&parent.birth).unwrap().unwrap().kill().unwrap();
         Exact::open(&parent.birth).unwrap().unwrap().wait().unwrap();

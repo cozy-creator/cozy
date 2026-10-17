@@ -105,7 +105,7 @@ fn environ(pid: u32) -> BTreeMap<String, String> {
 #[test]
 #[ignore = "needs installed cpu_group generations"]
 fn a_group_start_spawns_sealed_followers_and_teardown_leaves_none() {
-    let (mut executor, root, generation) = launch("0,1", true);
+    let (executor, root, generation) = launch("0,1", true);
     let sealed = &executor.hello.sealed;
     assert_eq!(
         sealed.get("CUDA_VISIBLE_DEVICES").map(String::as_str),
@@ -174,7 +174,7 @@ fn a_group_start_spawns_sealed_followers_and_teardown_leaves_none() {
 #[test]
 #[ignore = "needs installed cpu_group generations"]
 fn a_degree_the_seal_does_not_name_is_refused_before_any_follower() {
-    let (mut executor, root, generation) = launch("0,1", true);
+    let (executor, root, generation) = launch("0,1", true);
     let reply = executor
         .command(&start(3, "0,1", &root, &generation), &mut Baseline)
         .unwrap();
@@ -229,7 +229,7 @@ fn a_forked_rank_zero_takes_the_group_seal_and_spawns_its_follower() {
             cgroup_namespace: Some("groupfork".into()),
         }
     };
-    let mut parent = DeviceExecutor::spawn(config("parent", "0", false)).unwrap();
+    let parent = DeviceExecutor::spawn(config("parent", "0", false)).unwrap();
     let imported = parent
         .command(
             &DeviceCommand::Start {
@@ -245,7 +245,7 @@ fn a_forked_rank_zero_takes_the_group_seal_and_spawns_its_follower() {
         )
         .unwrap();
     assert!(imported.ok, "{imported:?}");
-    let mut child = match parent
+    let child = match parent
         .fork(config("rank0", "0,1", true), |_, _| Ok(()))
         .unwrap()
     {
