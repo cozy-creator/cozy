@@ -3,12 +3,13 @@ to fp8, every other tensor at its source bytes. Installs in seconds on a CPU mac
 
 from typing import Any
 
-from cozy_runtime.author import App, Context, ModelArtifact, Telemetry, Weights, WeightsOutput
+from cozy_runtime.author import App, Context, ModelArtifact, Telemetry, Weights, WeightsOutput, invocable
 from cozy_runtime.derive.operations import QuantizationPlan, quantize_into
 
 app = App()
 
 
+@invocable(memo_version="tiny-quantizer-fp8/1")
 async def fp8(ctx: Context, *, source: Weights[Any], tel: Telemetry) -> ModelArtifact:
     """The fp8 lane (`fp8-rowwise/1`)."""
     plan = QuantizationPlan(
