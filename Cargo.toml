@@ -61,6 +61,7 @@ indicatif = "0.18"
 infer = { version = "0.22", default-features = false }
 jiff = { version = "0.2.38", default-features = false, features = ["std"] }
 libc = "0.2"
+libloading = "0.9"
 nix = { version = "0.31.3", default-features = false }
 nvml-wrapper = "0.13"
 openapiv3 = "2"

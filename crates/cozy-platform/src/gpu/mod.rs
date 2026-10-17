@@ -1,5 +1,9 @@
 //! The NVIDIA GPUs a machine reports in `StatusFrame.gpus[]`, read through NVML, which is opened
 //! at run time (`libnvidia-ml.so.1`, `nvml.dll`). No driver is "no NVIDIA GPU", never an error.
+mod cuda;
+
+pub use cuda::memory_classes;
+
 use crate::{Error, Result};
 use nvml_wrapper::{Nvml, enums::device::UsedGpuMemory, error::NvmlError};
 use std::collections::BTreeMap;
@@ -13,8 +17,9 @@ pub struct Gpu {
     pub pci_bus_id: String,
     pub memory_bytes: u64,
     pub driver: String,
-    /// Unit T fills it from CUDA's `INTEGRATED` and `PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES`
-    /// device attributes; the probe leaves it `None`.
+    /// (major, minor), `(9, 0)` on a Hopper; `None` when the driver does not say.
+    pub compute_capability: Option<(u32, u32)>,
+    /// [`memory_classes`] fills it from CUDA's device attributes; the probe leaves it `None`.
     pub memory_class: Option<MemoryClass>,
 }
 
@@ -57,6 +62,10 @@ pub fn probe(visible: Option<&str>) -> Result<Vec<Gpu>> {
             pci_bus_id: device.pci_info().map_err(failed("PCI info"))?.bus_id,
             memory_bytes: device.memory_info().map_err(failed("memory info"))?.total,
             driver: driver.clone(),
+            compute_capability: device
+                .cuda_compute_capability()
+                .ok()
+                .map(|cc| (cc.major as u32, cc.minor as u32)),
             memory_class: None,
         });
     }
