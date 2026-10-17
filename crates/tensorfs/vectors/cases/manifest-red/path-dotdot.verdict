@@ -1,0 +1,4 @@
+doc: manifest
+expect: refuse
+code: PATH_ILLEGAL
+note: dot components are unrepresentable

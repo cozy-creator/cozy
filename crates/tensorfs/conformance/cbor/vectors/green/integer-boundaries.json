@@ -1,0 +1,22 @@
+{
+  "assets": [],
+  "components": [
+    [
+      "transformer",
+      [
+        ["scalar", "bf16", [], 0, [["value", "bf16", [], {"inline_hex": "0000"}]]]
+      ]
+    ]
+  ],
+  "configs": [
+    ["n0000000023", "{\"value\":23}"],
+    ["n0000000024", "{\"value\":24}"],
+    ["n0000000255", "{\"value\":255}"],
+    ["n0000000256", "{\"value\":256}"],
+    ["n0000065535", "{\"value\":65535}"],
+    ["n0000065536", "{\"value\":65536}"],
+    ["n4294967296", "{\"value\":4294967296}"]
+  ],
+  "encodings": [{"logical_dtypes":["bf16"],"roles":{"value":{"carrier":{"t":"same_as_logical"},"shape":{"t":"same"}}}}],
+  "format": "cozytensors/1"
+}

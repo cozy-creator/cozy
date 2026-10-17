@@ -1,0 +1,1 @@
+{"checkpoints":[{"manifest":{"length":160,"sha256":"d72851fe6fea1d21cd214e6269db10f3c42be6985d8840b847929ad944183334"},"published":true}],"releases":[{"lanes":[{"lane":"cpu","manifest":{"length":160,"sha256":"d72851fe6fea1d21cd214e6269db10f3c42be6985d8840b847929ad944183334"}}],"revision":1,"version":"1.0.0","yanked":false}],"repo":{"name":"marco-polo","org":"tensorhub"}}

@@ -1,0 +1,21 @@
+[package]
+name = "tensorfs-py"
+version = "0.10.0"
+edition = "2021"
+publish.workspace = true
+
+[lib]
+name = "_ext"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+tensorfs-core.workspace = true
+tensorfs-plane.workspace = true
+pyo3 = { version = "0.29.2", features = ["abi3-py312"] }
+
+[features]
+# Native feature isolation remains available to Rust builds. The published Python
+# distribution always enables store; managed executor authority comes from its owner.
+default = ["store"]
+store = ["tensorfs-core/store", "tensorfs-plane/store"]
+extension-module = ["pyo3/extension-module"]

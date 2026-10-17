@@ -1,0 +1,4 @@
+doc: header
+expect: refuse
+code: MALFORMED_CBOR
+note: null is not admitted

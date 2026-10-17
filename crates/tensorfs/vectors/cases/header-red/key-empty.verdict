@@ -1,0 +1,4 @@
+doc: header
+expect: refuse
+code: NON_ASCII_FIELD
+note: the empty key

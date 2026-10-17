@@ -1,7 +1,8 @@
 name: platforms
 # The Rust workspace builds, lints and passes the cozy-platform seams on every release runner, Linux x86_64
 # as the control; the job's verdict is that. The Go tree's build and vet are reported, not judged (it is
-# deleted at xs-043 G). Nightly on master, and per question:
+# deleted at xs-043 G), and so are TensorD and TensorFS until they are ported (xs-043 T, X, WM, AP).
+# Nightly on master, and per question:
 #   gh workflow run platforms.yaml -R cozy-creator/cozy --ref <branch> [-f os='["windows-2025"]'] [-f test='cargo test -p <crate>']
 # A release (release.yml) needs a green run on its commit covering every release runner (release-gate.yml).
 on:
@@ -23,6 +24,8 @@ permissions:
 
 env:
   CGO_ENABLED: '0'
+  # Not yet in the `cozy` binary, and Linux-only until ported: reported, not judged.
+  IMPORTED: --exclude tensord --exclude tensorfs-core --exclude tensorfs-plane --exclude tensorfs-py
 
 jobs:
   build:
@@ -65,7 +68,12 @@ jobs:
       - name: Rust build and lint (compiles tests too)
         id: rust
         continue-on-error: true
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings 2>&1 | tee rust.txt; exit "${PIPESTATUS[0]}"
+        run: cargo clippy --workspace --all-targets --locked $IMPORTED -- -D warnings 2>&1 | tee rust.txt; exit "${PIPESTATUS[0]}"
+
+      - name: TensorD and TensorFS (reported)
+        id: imported
+        continue-on-error: true
+        run: cargo check ${IMPORTED//--exclude/-p} --all-targets --locked --message-format=short 2>&1 | tee imported.txt; exit "${PIPESTATUS[0]}"
 
       # --include-ignored installs a real user service: hosted runners only.
       - name: Seams
@@ -86,10 +94,10 @@ jobs:
         run: |
           {
             echo "## ${{ matrix.os }}"
-            echo "rust=${{ steps.rust.outcome }} seams=${{ steps.seams.outcome }} test=${{ steps.test.outcome }} go: build=${{ steps.build.outcome }} vet=${{ steps.vet.outcome }} run=${{ steps.run.outcome }}"
+            echo "rust=${{ steps.rust.outcome }} seams=${{ steps.seams.outcome }} test=${{ steps.test.outcome }} imported=${{ steps.imported.outcome }} go: build=${{ steps.build.outcome }} vet=${{ steps.vet.outcome }} run=${{ steps.run.outcome }}"
             echo '```'
             # The tail of each: where errors are. `head` would end the pipe early (SIGPIPE under pipefail).
-            for f in rust.txt seams.txt build.txt vet.txt; do [ ! -f "$f" ] || tail -n 50 "$f"; done
+            for f in rust.txt imported.txt seams.txt build.txt vet.txt; do [ ! -f "$f" ] || tail -n 50 "$f"; done
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
@@ -102,6 +110,7 @@ jobs:
             vet.txt
             run.txt
             rust.txt
+            imported.txt
             seams.txt
             test.txt
           if-no-files-found: ignore

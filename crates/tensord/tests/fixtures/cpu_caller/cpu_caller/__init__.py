@@ -1,0 +1,128 @@
+"""A caller of another package's invocable (`cpu_memo.measure`), installed in its
+environment as a dependency, as a published package's callee is."""
+from __future__ import annotations
+
+import msgspec
+
+from cozy_runtime.author import App, Context, FileAsset, ImageAsset, Outputs, Telemetry
+from cozy_runtime.derive.operations import QuantizationPlan, quantize
+from cpu_memo import Probe, Weigh, greet, measure, nested, note, paint, produce, restricted, weigh
+
+app = App()
+
+
+class Relay(msgspec.Struct):
+    values: list[int]
+    counter: str
+
+
+class Relayed(msgspec.Struct):
+    squares: list[int]
+    greeting: str = ""
+
+
+async def relay(ctx: Context, payload: Relay, tel: Telemetry) -> Relayed:
+    squares = []
+    for value in payload.values:
+        squares.append((await measure(payload=Probe(value, payload.counter))).square)
+    # Another package's serving entrypoint, called with its request's fields (H3 -> qwen).
+    greeted = await greet(text="squared", times=len(squares))
+    tel.log("relayed", squares=len(squares), greeting=greeted.text)
+    return Relayed(squares=squares, greeting=greeted.text)
+
+
+app.entrypoint(relay, accelerator=False)
+
+
+async def relay_served(ctx: Context, payload: Relay) -> Relayed:
+    """A served entrypoint calls another package as any function does."""
+    return Relayed([(await measure(payload=Probe(value, payload.counter))).square for value in payload.values])
+
+
+app.entrypoint(relay_served)
+
+
+async def relay_nested(ctx: Context, payload: Relay) -> Relayed:
+    squares = []
+    for value in payload.values:
+        squares.append((await nested(payload=Probe(value, payload.counter))).square)
+    return Relayed(squares=squares)
+
+
+app.entrypoint(relay_nested, accelerator=False)
+
+
+async def relay_restricted(ctx: Context, payload: Relay) -> Relayed:
+    result = await restricted(payload=Probe(payload.values[0], payload.counter))
+    return Relayed(squares=[result.square])
+
+
+app.entrypoint(relay_restricted, accelerator=False)
+
+
+class Sitting(msgspec.Struct):
+    names: list[str]
+
+
+class Portraits(msgspec.Struct):
+    references: list[ImageAsset]
+
+
+async def portrait(ctx: Context, payload: Sitting, out: Outputs) -> Portraits:
+    """H3's long_form references: each image another package's entrypoint returns is shown as
+    this function's own output the moment it exists, and returned at the end."""
+    references = []
+    for index, name in enumerate(payload.names):
+        result = await paint(prompt=name, shade=40 * (index + 1))
+        out.publish("references", result.image, label=f"Reference: {name}")
+        references.append(result.image)
+    return Portraits(references)
+
+
+app.entrypoint(portrait, emits_media=True, accelerator=False)
+
+
+class Requantize(msgspec.Struct):
+    encoding: str = "fp8-rowwise/1"
+
+
+class Requantized(msgspec.Struct):
+    source: str
+    result: str
+
+
+async def requantize(ctx: Context, payload: Requantize) -> Requantized:
+    """The Runtime's own quantize operation, called on another package's model."""
+    source = await produce()
+    result = await quantize(source=source, plan=QuantizationPlan(components=("body",)), encoding=payload.encoding)
+    return Requantized(source.manifest.digest, result.manifest.digest)
+
+
+app.entrypoint(requantize, accelerator=False)
+
+
+class Notes(msgspec.Struct):
+    files: list[FileAsset]
+
+
+async def annotate(ctx: Context, payload: Relay) -> Notes:
+    """Each value's note file, from another package's memoized call."""
+    return Notes([(await note(payload=Probe(value, payload.counter))).file for value in payload.values])
+
+
+app.entrypoint(annotate, accelerator=False)
+
+
+class Derived(msgspec.Struct):
+    producer: str
+    length: int
+
+
+async def derive_and_weigh(ctx: Context, payload: Relay) -> Derived:
+    """A writer's checkpoint handed to a memoized consumer: each run writes it again (as a new
+    producer), and the consumer is keyed on the checkpoint, not on the run that wrote it."""
+    source = await produce()
+    return Derived(source.producer_request_id, (await weigh(payload=Weigh(source, payload.counter))).length)
+
+
+app.entrypoint(derive_and_weigh, accelerator=False)

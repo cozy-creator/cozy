@@ -1,0 +1,337 @@
+//! `Run kind: update` (G/API.md, D2): the payload names the software cohort, `{"runtime": …,
+//! "tensorfs": …, "agent": "bundled" | "explicit"}`. A member is a published version (fetched
+//! from PyPI, digest checked) or, when an input binds that field to an object sent with Write,
+//! that wheel's file name. The update stages and verifies the pair, waits for measured idleness,
+//! restarts the service on it in place and commits once the new service proves readiness, or
+//! rolls back. Its log is the update's state history, so a client that lost the stream across
+//! the restart attaches again with `Run{id, after}` and reads the outcome.
+use super::{auth::VerifiedActor, backend::MachineBackend, v1, MachineIdentity};
+use crate::machine::update::{Choice, Request, Status as Update, Updates};
+use std::{collections::BTreeMap, pin::Pin, sync::Arc, time::Duration};
+use tokio_stream::Stream;
+use tonic::Status;
+
+pub(super) type Events = Pin<Box<dyn Stream<Item = Result<v1::RunEvent, Status>> + Send>>;
+
+/// The update `request` submits or attaches to, if it is one.
+pub(super) fn owns(
+    identity: &MachineIdentity,
+    backend: &impl MachineBackend,
+    actor: VerifiedActor,
+    request: &v1::RunRequest,
+) -> Result<bool, Status> {
+    match &request.spec {
+        Some(spec) => Ok(spec.kind == v1::RunKind::Update as i32),
+        None => {
+            if let Some(runs) = backend.runs() {
+                let actor = crate::machine_api::actor_id(actor);
+                // Another signer's machine-wide update never shadows this actor's own run.
+                match runs.service.engine.get_public(&actor, &request.id) {
+                    Ok(_) => return Ok(false),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+                    Err(error) => return Err(Status::internal(error.to_string())),
+                }
+                if runs
+                    .service
+                    .engine
+                    .with_journal(|journal| journal.update_run_reserved(&actor, &request.id))
+                    .map_err(|error| Status::internal(error.to_string()))?
+                {
+                    return Ok(true);
+                }
+            }
+            Ok(identity
+                .updates
+                .as_ref()
+                .is_some_and(|u| u.update(&request.id).is_some()))
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct Cohort {
+    runtime: Option<String>,
+    tensorfs: Option<String>,
+    #[serde(default)]
+    agent: String,
+    #[serde(flatten)]
+    unknown: BTreeMap<String, serde_json::Value>,
+}
+
+static SUBMITTING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+pub(super) async fn run<B: MachineBackend>(
+    identity: Arc<MachineIdentity>,
+    backend: Arc<B>,
+    actor: VerifiedActor,
+    request: v1::RunRequest,
+) -> Result<Events, Status> {
+    let updates = identity
+        .updates
+        .clone()
+        .ok_or_else(|| Status::failed_precondition("this machine does not update in place"))?;
+    let id = request.id.clone();
+    // SQLite serializes this ID's ownership with ordinary acceptance and cancellation.
+    let runs = backend
+        .runs()
+        .ok_or_else(|| Status::unimplemented("this machine reserves no update run ids"))?;
+    let owner = crate::machine_api::actor_id(actor);
+    let reserved_id = id.clone();
+    tokio::task::spawn_blocking(move || {
+        runs.service
+            .engine
+            .with_journal(|journal| journal.reserve_update_run(&owner, &reserved_id))
+    })
+    .await
+    .map_err(|_| Status::internal("machine operation stopped"))?
+    .map_err(|error| match error.kind() {
+        std::io::ErrorKind::AlreadyExists => Status::failed_precondition(error.to_string()),
+        _ => Status::internal(error.to_string()),
+    })?;
+    if let Some(spec) = request.spec {
+        let (updates, id, identity) = (updates.clone(), id.clone(), identity.clone());
+        tokio::task::spawn_blocking(move || {
+            // One submission at a time, its check and its staging together: a client resending
+            // an update it lost attaches to the first, even while that one is still staging
+            // and after its own client has gone.
+            let _one = SUBMITTING.lock().unwrap_or_else(|e| e.into_inner());
+            if updates.update(&id).is_some() {
+                return Ok(());
+            }
+            if !identity.readiness.proved() {
+                return Err(Status::unavailable(
+                    "the machine is starting; update it once it is ready",
+                ));
+            }
+            submit(&updates, &*backend, actor, &id, spec)
+        })
+        .await
+        .map_err(|_| Status::internal("machine operation stopped"))??;
+    }
+    let (sender, receiver) = tokio::sync::mpsc::channel(16);
+    tokio::spawn(async move {
+        let mut sent = request.after;
+        let mut first = true;
+        loop {
+            let Some(update) = updates.update(&id) else {
+                let _ = sender
+                    .send(Err(Status::not_found("this machine has no such run")))
+                    .await;
+                return;
+            };
+            let mut events = vec![];
+            if first {
+                events.push(event(
+                    0,
+                    0,
+                    v1::run_event::Event::State(state(&id, &update)),
+                ));
+                first = false;
+            }
+            for (index, step) in update.history.iter().enumerate().skip(sent as usize) {
+                events.push(event(
+                    index as u64 + 1,
+                    step.at_ms,
+                    step_event(&update, step),
+                ));
+            }
+            sent = sent.max(update.history.len() as u64);
+            for event in events {
+                if sender.send(Ok(event)).await.is_err() {
+                    return;
+                }
+            }
+            if update.terminal() {
+                return;
+            }
+            if let Some(error) = observation_error(&update) {
+                let _ = sender.send(Err(error)).await;
+                return;
+            }
+            tokio::select! {
+                _ = sender.closed() => return,
+                _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+            }
+        }
+    });
+    Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(
+        receiver,
+    )))
+}
+
+fn submit(
+    updates: &Arc<Updates>,
+    backend: &impl MachineBackend,
+    actor: VerifiedActor,
+    id: &str,
+    spec: v1::RunSpec,
+) -> Result<(), Status> {
+    let cohort: Cohort = serde_json::from_slice(&spec.payload).map_err(|e| {
+        Status::invalid_argument(format!("an update payload is a JSON object: {e}"))
+    })?;
+    for name in cohort.unknown.keys() {
+        eprintln!("tensord: update {id}: ignoring unknown payload field {name:?}");
+    }
+    let choose = |member: &str, value: Option<String>| -> Result<Option<Choice>, Status> {
+        let Some(value) = value else {
+            return Ok(None);
+        };
+        let Some(input) = spec.inputs.iter().find(|i| i.field == member) else {
+            return Ok(Some(Choice {
+                version: value,
+                ..Default::default()
+            }));
+        };
+        let sha256 = input
+            .digest
+            .strip_prefix("sha256:")
+            .filter(|h| h.len() == 64)
+            .ok_or_else(|| Status::invalid_argument("an input digest is sha256:<64 hex>"))?;
+        let mut object = backend.object(actor, sha256).map_err(|e| {
+            Status::failed_precondition(format!(
+                "the {member} wheel {} is not held here; Write it first: {}",
+                input.digest,
+                e.message()
+            ))
+        })?;
+        let (staged, _) = updates
+            .stage(&value, &mut object)
+            .map_err(|(code, message)| refusal(code, message))?;
+        if staged != sha256 {
+            return Err(Status::data_loss(
+                "the staged wheel differs from its object",
+            ));
+        }
+        Ok(Some(Choice {
+            file: value,
+            sha256: staged,
+            ..Default::default()
+        }))
+    };
+    let request = Request {
+        operation: id.into(),
+        agent: cohort.agent,
+        pin: None,
+        runtime: choose("runtime", cohort.runtime)?,
+        tensorfs: choose("tensorfs", cohort.tensorfs)?,
+    };
+    updates
+        .request(request, |code| std::process::exit(code))
+        .map(|_| ())
+        .map_err(|(code, message)| refusal(code, message))
+}
+
+/// Cancels update `id` before it activates; one activating refuses (`cancel_unavailable`).
+pub(super) async fn cancel(identity: &MachineIdentity, id: &str) -> Result<v1::RunState, Status> {
+    let updates = identity
+        .updates
+        .clone()
+        .ok_or_else(|| Status::failed_precondition("this machine does not update in place"))?;
+    let operation = id.to_string();
+    let canceled = tokio::task::spawn_blocking(move || updates.cancel(&operation))
+        .await
+        .map_err(|_| Status::internal("machine operation stopped"))?;
+    match canceled {
+        Ok(update) => Ok(state(id, &update)),
+        Err(error) => Err(match error.kind() {
+            std::io::ErrorKind::NotFound => Status::not_found(error.to_string()),
+            std::io::ErrorKind::ResourceBusy => super::machine_v1::refused("cancel_unavailable", &error.to_string()),
+            _ => Status::internal(error.to_string()),
+        }),
+    }
+}
+
+fn refusal(code: u16, message: String) -> Status {
+    match code {
+        400 => Status::invalid_argument(message),
+        409 => Status::failed_precondition(message),
+        503 => Status::unavailable(message),
+        _ => Status::internal(message),
+    }
+}
+
+fn event(sequence: u64, at_ms: i64, event: v1::run_event::Event) -> v1::RunEvent {
+    v1::RunEvent {
+        sequence,
+        at_ms,
+        event: Some(event),
+    }
+}
+
+fn state(id: &str, update: &Update) -> v1::RunState {
+    v1::RunState {
+        id: id.into(),
+        number: 0,
+        state: match update.state.as_str() {
+            "waiting" => "queued",
+            "succeeded" => "succeeded",
+            "canceled" => "canceled",
+            "rolled_back" | "failed" => "failed",
+            _ => "running",
+        }
+        .into(),
+        sequence: update.history.len() as u64,
+        attempt: 1,
+        waiting: if observation_error(update).is_some() {
+            update.error.clone()
+        } else if update.state == "waiting_activation" {
+            "waiting for the machine to be idle".into()
+        } else {
+            String::new()
+        },
+    }
+}
+
+/// A persistence blockage is an observation error, not a terminal run outcome. Unlike
+/// Unavailable, FailedPrecondition lets an update observer stop retrying and report it.
+fn observation_error(update: &Update) -> Option<Status> {
+    (!update.terminal() && update.error.starts_with("update_commit_blocked:"))
+        .then(|| Status::failed_precondition(&update.error))
+}
+
+fn step_event(update: &Update, step: &crate::machine::update::Step) -> v1::run_event::Event {
+    let outcome = |status: &str, code: &str| {
+        let result = serde_json::json!({"from": update.from, "to": update.to});
+        v1::run_event::Event::Outcome(v1::Outcome {
+            status: status.into(),
+            reason: (!code.is_empty()).then(|| v1::Reason {
+                code: code.into(),
+                message: update.error.clone(),
+                origin: "machine".into(),
+            }),
+            result: serde_json::to_vec(&result).unwrap_or_default(),
+            ..Default::default()
+        })
+    };
+    match step.state.as_str() {
+        "succeeded" => outcome("succeeded", ""),
+        "canceled" => outcome("canceled", "canceled"),
+        "rolled_back" => outcome("failed", "update_rolled_back"),
+        "failed" => outcome("failed", "update_failed"),
+        stage => v1::run_event::Event::Progress(v1::Progress {
+            stage: stage.into(),
+            fraction: -1.0,
+            ..Default::default()
+        }),
+    }
+}
+
+
+#[cfg(test)]
+mod commit_observation_tests {
+    use super::*;
+
+    #[test]
+    fn a_blocked_commit_stops_observation_without_reporting_a_failed_run() {
+        let mut update = Update {
+            operation: "blocked".into(), state: "starting".into(),
+            error: "update_commit_blocked: no space left".into(), ..Default::default()
+        };
+        let error = observation_error(&update).unwrap();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(state("blocked", &update).state, "running");
+        assert_eq!(state("blocked", &update).waiting, update.error);
+        update.state = "succeeded".into();
+        assert!(observation_error(&update).is_none(), "cleanup cannot undo committed success");
+    }
+}

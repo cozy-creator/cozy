@@ -1,0 +1,4 @@
+doc: header
+expect: refuse
+code: SORT_ORDER
+note: configs are a sorted set, not construction order

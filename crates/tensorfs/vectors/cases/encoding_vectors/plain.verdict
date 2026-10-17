@@ -1,0 +1,4 @@
+doc: vectors
+expect: ok
+id: sha256:4766f931bbb70ed431e34b34e4f9fc5dda8174e96f43a8acd79d8799efcd43d2
+note: raw bit patterns: signed zero, NaN payload, infinity, rank-0

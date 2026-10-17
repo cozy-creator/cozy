@@ -1,0 +1,4 @@
+doc: header
+expect: refuse
+code: NONCANONICAL_ENCODING
+note: indefinite containers are outside the profile

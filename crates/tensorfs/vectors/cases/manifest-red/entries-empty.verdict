@@ -1,0 +1,4 @@
+doc: manifest
+expect: refuse
+code: MISSING_FIELD
+note: a manifest lists at least one path

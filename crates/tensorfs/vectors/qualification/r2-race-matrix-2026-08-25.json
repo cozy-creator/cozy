@@ -1,0 +1,84 @@
+{
+ "bucket": "dataset-cas",
+ "prefix": "qualification/e9b7456d14ab",
+ "arms": [
+  {
+   "arm": "every declared object is resident and has a FACT",
+   "ok": true,
+   "observed": 15,
+   "detail": "174310 B moved"
+  },
+  {
+   "arm": "a root over complete facts publishes",
+   "ok": true,
+   "observed": 0,
+   "detail": ""
+  },
+  {
+   "arm": "the second publisher of the SAME bytes gets 412",
+   "ok": true,
+   "observed": 412,
+   "detail": ""
+  },
+  {
+   "arm": "verify-resident-on-conflict says HONEST DUPLICATE",
+   "ok": true,
+   "observed": 0,
+   "detail": "conflict     HONEST DUPLICATE \u2014 the resident bytes are ours\n             zero by"
+  },
+  {
+   "arm": "wrong body under the grant's own signed digest",
+   "ok": true,
+   "observed": 412,
+   "detail": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>PreconditionFailed</Code><Message>At le"
+  },
+  {
+   "arm": "the previously verified bytes are still readable",
+   "ok": true,
+   "observed": true,
+   "detail": "under their identity, unchanged"
+  },
+  {
+   "arm": "a resident that is NOT ours is removed",
+   "ok": true,
+   "observed": 1,
+   "detail": "REFUSED OBJECT_CORRUPT: final-key mismatch at objects/sha256/21/48/2148c93613ec8e563732936"
+  },
+  {
+   "arm": "no catalog root over an incomplete fact set",
+   "ok": true,
+   "observed": 1,
+   "detail": "REFUSED DURABILITY_UNPROVEN: sha256:f8fde41e13a62027ab538c4bec03efb83e8258c23fa0844b71abd7f2aba1d3bd: no Verif"
+  },
+  {
+   "arm": "and the bytes verified BEFORE the crash still read",
+   "ok": true,
+   "observed": true,
+   "detail": ""
+  },
+  {
+   "arm": "the local mark keeps every object the closure declared",
+   "ok": true,
+   "observed": 0,
+   "detail": "store holds 16 objects total"
+  },
+  {
+   "arm": "every published object is still local and readable",
+   "ok": true,
+   "observed": true,
+   "detail": ""
+  },
+  {
+   "arm": "a grant outside the declared closure",
+   "ok": true,
+   "observed": 1,
+   "detail": "REFUSED NOT_CONTAINED: sha256:0000000000000000000000000000000000000000000000000000000000000000: not "
+  },
+  {
+   "arm": "a final-key checksum mismatch is removed",
+   "ok": true,
+   "observed": 1,
+   "detail": "REFUSED OBJECT_CORRUPT: sha256:2148c93613ec8e563732936e74a585f5623953f3d053dfc12bd72780f37d4f09: the"
+  }
+ ]
+}

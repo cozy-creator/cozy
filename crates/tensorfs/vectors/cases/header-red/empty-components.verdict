@@ -1,0 +1,4 @@
+doc: header
+expect: refuse
+code: EMPTY_COMPONENTS
+note: no components

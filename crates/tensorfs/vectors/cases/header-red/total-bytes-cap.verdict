@@ -1,0 +1,4 @@
+doc: header
+expect: refuse
+code: TOTAL_BYTES_CAP
+note: one legal tensor over the whole-document byte total

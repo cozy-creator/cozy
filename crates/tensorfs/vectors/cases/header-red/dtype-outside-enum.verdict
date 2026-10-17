@@ -1,0 +1,4 @@
+doc: header
+expect: refuse
+code: DTYPE_UNKNOWN
+note: carrier dtype outside the closed enum

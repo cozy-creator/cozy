@@ -1,0 +1,4 @@
+{
+  "expect": "refuse",
+  "why": "inline bool bytes are only zero or one"
+}

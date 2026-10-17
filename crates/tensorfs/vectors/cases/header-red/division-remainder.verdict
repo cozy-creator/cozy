@@ -1,0 +1,4 @@
+doc: header
+expect: refuse
+code: DIVISION_REMAINDER
+note: in/2 with an odd in

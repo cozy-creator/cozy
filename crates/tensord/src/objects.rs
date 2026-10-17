@@ -1,0 +1,525 @@
+//! Write: content-addressed objects a signer uploads (run inputs, local package sources),
+//! resumable from the length already held. Bytes stage per signer and enter the TensorFS
+//! store only once their digest verifies. A run names only objects its own signer wrote, so
+//! another signer's object is neither readable nor reported as held.
+use crate::{
+    execution::Engine,
+    journal::{Artifact, Execution, HeldMemo, ResultRecord},
+};
+use fs2::FileExt;
+use std::{
+    fs::{self, File, OpenOptions},
+    io::{self, Seek, SeekFrom, Write},
+    os::unix::fs::MetadataExt,
+    path::{Path, PathBuf},
+    sync::{Arc, MutexGuard},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+use tensorfs_core::{
+    catalog::WriterGuard, ids::ObjectRef, object_roots, sha256, store::Fault, store::Store,
+};
+
+/// The largest memoized result record this machine holds for reuse.
+const MEMO_RESULT_BYTES: usize = 48 << 10;
+
+pub struct Objects {
+    root: PathBuf,
+    store: Arc<Store>,
+    engine: Arc<Engine>,
+}
+
+/// Why a write was refused, as the API's typed reason.
+#[derive(Debug)]
+pub struct Refused {
+    pub code: &'static str,
+    pub message: String,
+}
+fn refused(code: &'static str, message: impl Into<String>) -> Refused {
+    Refused {
+        code,
+        message: message.into(),
+    }
+}
+impl From<io::Error> for Refused {
+    fn from(error: io::Error) -> Self {
+        refused("object_storage_failed", error.to_string())
+    }
+}
+
+/// One object's upload in progress: bytes append from the held length.
+pub struct Writer<'a> {
+    objects: &'a Objects,
+    actor: String,
+    object: ObjectRef,
+    part: PathBuf,
+    file: Option<File>,
+    held: u64,
+    skip: u64,
+}
+
+impl Objects {
+    pub fn new(root: &Path, store: Arc<Store>, engine: Arc<Engine>) -> io::Result<Self> {
+        fs::create_dir_all(root)?;
+        Ok(Self {
+            root: root.to_path_buf(),
+            store,
+            engine,
+        })
+    }
+
+    /// Excludes root release while a Write or an acceptance takes references.
+    pub(crate) fn guard(&self) -> MutexGuard<'_, ()> {
+        self.engine.object_custody.lock().unwrap()
+    }
+    /// Excludes the store's GC between an object's put and its root.
+    pub(crate) fn writer_guard(&self) -> io::Result<WriterGuard> {
+        WriterGuard::acquire(self.store.root()).map_err(io::Error::other)
+    }
+    /// Roots `objects` in the store; called with `guard` and `writer_guard` held.
+    pub(crate) fn retain(&self, objects: &[ObjectRef]) -> io::Result<()> {
+        for object in objects {
+            object_roots::retain(&self.store, object).map_err(io::Error::other)?;
+        }
+        Ok(())
+    }
+
+    /// Releases the roots of objects no unfinished run names and nothing used for the TTL,
+    /// or for `IDLE` while the store's disk is low. Their bytes are then the store GC's.
+    pub fn sweep(&self) -> io::Result<usize> {
+        let disk =
+            tensorfs_core::admission::Disk::measure(self.store.root()).map_err(io::Error::other)?;
+        self.release(match disk.short() {
+            Some(_) => crate::reclaim::IDLE,
+            None => crate::reclaim::TTL,
+        })
+    }
+
+    /// `sweep` over roots unused for `unused`. A root written just before a crash has no
+    /// journal row yet: it ages from its own mtime.
+    pub fn release(&self, unused: Duration) -> io::Result<usize> {
+        let _custody = self.guard();
+        let before = SystemTime::now().checked_sub(unused).unwrap_or(UNIX_EPOCH);
+        let before_ms = before
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        let mut released = 0;
+        for object in object_roots::list(&self.store).map_err(io::Error::other)? {
+            let root = self
+                .store
+                .root()
+                .join("roots/objects")
+                .join(format!("{}.json", object.sha256));
+            if fs::metadata(root)?.modified()? >= before {
+                continue;
+            }
+            if self
+                .engine
+                .with_journal(|j| j.object_releasable(&object.sha256, before_ms))?
+                && object_roots::remove(&self.store, &object.sha256).map_err(io::Error::other)?
+            {
+                // A memo answered from this file cannot be answered any more.
+                self.engine.with_journal(|j| j.drop_held_memos(&object.sha256))?;
+                released += 1;
+            }
+        }
+        Ok(released)
+    }
+
+    /// The stored object this signer wrote, or None.
+    pub fn path(&self, actor: &str, digest: &str) -> io::Result<Option<(PathBuf, u64)>> {
+        let Some(hex) = hex(digest) else {
+            return Ok(None);
+        };
+        let Some(length) = self.engine.with_journal(|j| j.object(actor, &hex))? else {
+            return Ok(None);
+        };
+        let path = self.store.object_path(&hex);
+        Ok(path.is_file().then_some((path, length)))
+    }
+
+    /// The success a memoized computation left for this signer, its files linked into `run`'s
+    /// custody as that run's own result; None when there is none or a file is gone (the memo
+    /// goes with it).
+    pub fn recall(&self, actor: &str, computation: &str, run: &str) -> io::Result<Option<ResultRecord>> {
+        let _custody = self.guard();
+        let Some(raw) = self.engine.with_journal(|j| j.held_memo(actor, computation))? else {
+            return Ok(None);
+        };
+        let Ok(mut record) = serde_json::from_slice::<ResultRecord>(&raw) else {
+            return Ok(None);
+        };
+        let custody = self.engine.root.join("results").join(run);
+        for (index, artifact) in record.artifacts.iter_mut().enumerate() {
+            let Some((held, _)) = self
+                .path(actor, &format!("sha256:{}", artifact.sha256))?
+                .filter(|(_, length)| *length == artifact.length)
+            else {
+                self.engine.with_journal(|j| j.drop_held_memos(&artifact.sha256))?;
+                return Ok(None);
+            };
+            fs::create_dir_all(&custody)?;
+            let name = format!("{index}-{}", artifact.sha256);
+            if let Err(error) = fs::hard_link(&held, custody.join(&name)) {
+                if error.kind() != io::ErrorKind::AlreadyExists {
+                    fs::copy(&held, custody.join(&name))?;
+                }
+            }
+            artifact.path = format!("results/{run}/{name}");
+        }
+        Ok(Some(record))
+    }
+
+    /// A memoizable run's success `result`, its files kept for its signer, to hold under its
+    /// computation while this machine holds every file it names. A tree's members are not held
+    /// as one result, nor is a record over `MEMO_RESULT_BYTES`.
+    pub fn keep(&self, record: &Execution, result: &ResultRecord) -> io::Result<Option<HeldMemo>> {
+        let Some(submission) = &record.submission else {
+            return Ok(None);
+        };
+        if result.asset_bindings.iter().any(|b| b.media_type == crate::gpu_service::TREE_MEDIA) {
+            return Ok(None);
+        }
+        let bound: Vec<_> = result
+            .artifacts
+            .iter()
+            .filter(|a| result.asset_bindings.iter().any(|b| b.relative_path == a.name))
+            .collect();
+        let held = ResultRecord {
+            value: result.value.clone(),
+            artifacts: bound.iter().map(|a| Artifact { path: String::new(), ..(*a).clone() }).collect(),
+            asset_bindings: result.asset_bindings.clone(),
+        };
+        let raw = serde_json::to_vec(&held)?;
+        if raw.len() > MEMO_RESULT_BYTES {
+            return Ok(None);
+        }
+        for artifact in &bound {
+            let object = ObjectRef { sha256: artifact.sha256.clone(), length: artifact.length };
+            self.adopt(&submission.actor, &record.id, &self.engine.root.join(&artifact.path), &object)?;
+        }
+        Ok(Some(HeldMemo {
+            actor: submission.actor.clone(),
+            computation: record.memo.computation.clone(),
+            record: raw,
+            objects: bound.iter().map(|a| a.sha256.clone()).collect(),
+        }))
+    }
+
+    /// A file this machine produced for the signer (a child run's result) as its object, so a
+    /// later run of that signer may be handed it.
+    pub fn adopt(&self, actor: &str, parent: &str, file: &Path, object: &ObjectRef) -> io::Result<()> {
+        let _custody = self.guard();
+        let _writer = self.writer_guard()?;
+        if !crate::products::held(&self.store, object) {
+            self.store
+                .put_file(file, Some(object), &Fault::default())
+                .map_err(io::Error::other)?;
+        }
+        self.retain(std::slice::from_ref(object))?;
+        self.engine
+            .with_journal(|j| j.adopt_object(actor, parent, object))?;
+        Ok(())
+    }
+
+    /// Opens `digest` (`sha256:<hex>`) of `length` for this signer, its bytes continuing at
+    /// `offset`. Bytes before the held length are skipped; a gap beyond it is refused.
+    pub fn begin(
+        &self,
+        actor: &str,
+        digest: &str,
+        length: u64,
+        offset: u64,
+    ) -> Result<Writer<'_>, Refused> {
+        let hex = hex(digest).ok_or_else(|| {
+            refused(
+                "invalid_request",
+                "an object is named by sha256:<64 lowercase hex>",
+            )
+        })?;
+        let object = ObjectRef {
+            sha256: hex.clone(),
+            length,
+        };
+        let dir = self.root.join(&sha256::hex_digest(actor.as_bytes())[..32]);
+        let part = dir.join(format!("{hex}.part"));
+        let mut writer = Writer {
+            objects: self,
+            actor: actor.to_string(),
+            object,
+            part,
+            file: None,
+            held: 0,
+            skip: 0,
+        };
+        if self.path(actor, digest)?.is_some_and(|(_, l)| l == length) {
+            writer.held = length;
+            return Ok(writer);
+        }
+        fs::create_dir_all(&dir)?;
+        // Writes of one object take turns (a client's concurrent first calls each send the
+        // package source): the next continues from what the last left, or finds it stored.
+        let file = loop {
+            let file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&writer.part)?;
+            file.lock_exclusive()?;
+            if self.path(actor, digest)?.is_some_and(|(_, l)| l == length) {
+                writer.held = length;
+                return Ok(writer);
+            }
+            // The last write may have stored or dropped the part this handle opened.
+            let held = file.metadata()?;
+            match fs::metadata(&writer.part) {
+                Ok(at) if (at.dev(), at.ino()) == (held.dev(), held.ino()) => break file,
+                Ok(_) => continue,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e.into()),
+            }
+        };
+        writer.held = file.metadata()?.len();
+        if writer.held > length {
+            file.set_len(0)?;
+            writer.held = 0;
+        }
+        if offset > writer.held {
+            return Err(refused(
+                "object_offset_ahead",
+                format!("this machine holds {} bytes of the object", writer.held),
+            ));
+        }
+        self.store
+            .admits(length - writer.held)
+            .map_err(|e| refused("machine_disk_full", format!("no room for the object: {e}")))?;
+        writer.file = Some(file);
+        writer.skip = writer.held - offset;
+        Ok(writer)
+    }
+}
+
+impl Writer<'_> {
+    pub fn held(&self) -> u64 {
+        self.held
+    }
+
+    /// The next bytes of the stream, in order from the frame's offset.
+    pub fn append(&mut self, mut data: &[u8]) -> Result<(), Refused> {
+        let skip = (self.skip as usize).min(data.len());
+        self.skip -= skip as u64;
+        data = &data[skip..];
+        if data.is_empty() {
+            return Ok(());
+        }
+        let Some(file) = self.file.as_mut() else {
+            return Ok(()); // already written: the bytes are known
+        };
+        if self.held + data.len() as u64 > self.object.length {
+            return Err(refused(
+                "object_length_exceeded",
+                "more bytes than the object's declared length",
+            ));
+        }
+        file.seek(SeekFrom::End(0))?;
+        file.write_all(data)?;
+        self.held += data.len() as u64;
+        Ok(())
+    }
+
+    /// Ends this attempt: a complete object is verified and stored for this signer; a
+    /// partial one stays staged for the next attempt. Answers the bytes held.
+    pub fn finish(mut self) -> Result<u64, Refused> {
+        let Some(file) = self.file.take() else {
+            let _custody = self.objects.guard();
+            let _writer = self.objects.writer_guard()?;
+            self.objects.retain(std::slice::from_ref(&self.object))?;
+            self.objects
+                .engine
+                .with_journal(|j| j.bind_object(&self.actor, &self.object))?;
+            return Ok(self.held);
+        };
+        file.sync_data()?;
+        if self.held < self.object.length {
+            return Ok(self.held);
+        }
+        let _custody = self.objects.guard();
+        let _writer = self.objects.writer_guard()?;
+        let stored = self
+            .objects
+            .store
+            .put_file(&self.part, Some(&self.object), &Fault::default());
+        let _ = fs::remove_file(&self.part);
+        stored.map_err(|e| {
+            refused(
+                match e.code {
+                    tensorfs_core::err::Code::CAPACITY_EXHAUSTED => "machine_disk_full",
+                    tensorfs_core::err::Code::OBJECT_ID_MISMATCH
+                    | tensorfs_core::err::Code::LENGTH_MISMATCH => "object_digest_mismatch",
+                    _ => "object_storage_failed",
+                },
+                e.to_string(),
+            )
+        })?;
+        self.objects.retain(std::slice::from_ref(&self.object))?;
+        let (actor, object) = (self.actor.clone(), self.object.clone());
+        self.objects
+            .engine
+            .with_journal(|j| j.bind_object(&actor, &object))?;
+        Ok(self.held)
+    }
+}
+
+fn hex(digest: &str) -> Option<String> {
+    digest
+        .strip_prefix("sha256:")
+        .filter(|h| h.len() == 64 && h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+        .map(String::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_write_resumes_verifies_and_belongs_to_its_signer() {
+        let root = std::env::temp_dir().join(format!("cm-objects-{}", uuid::Uuid::new_v4()));
+        let service =
+            crate::service::Service::open(&root.join("state"), &root.join("g"), 1).unwrap();
+        let store = Arc::new(Store::ensure(&root.join("tensorfs")).unwrap());
+        let objects = Objects::new(&root.join("writes"), store, service.engine.clone()).unwrap();
+        let bytes: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+        let digest = format!("sha256:{}", sha256::hex_digest(&bytes));
+        let length = bytes.len() as u64;
+
+        // A first attempt stops partway; a probe then reports what is held.
+        let mut first = objects.begin("alice", &digest, length, 0).unwrap();
+        first.append(&bytes[..100_000]).unwrap();
+        assert_eq!(first.finish().unwrap(), 100_000);
+        assert_eq!(
+            objects
+                .begin("alice", &digest, length, 0)
+                .unwrap()
+                .finish()
+                .unwrap(),
+            100_000
+        );
+        assert!(objects.path("alice", &digest).unwrap().is_none());
+        assert_eq!(
+            objects
+                .begin("alice", &digest, length, 200_000)
+                .err()
+                .unwrap()
+                .code,
+            "object_offset_ahead"
+        );
+        // A resend overlapping the held prefix skips it; the rest completes the object.
+        let mut second = objects.begin("alice", &digest, length, 50_000).unwrap();
+        second.append(&bytes[50_000..]).unwrap();
+        assert_eq!(second.finish().unwrap(), length);
+        let (path, held) = objects.path("alice", &digest).unwrap().unwrap();
+        assert_eq!((fs::read(path).unwrap(), held), (bytes.clone(), length));
+        assert_eq!(
+            objects.begin("alice", &digest, length, 0).unwrap().held(),
+            length
+        );
+
+        // Another signer learns nothing of it and must send the bytes itself.
+        assert!(objects.path("bob", &digest).unwrap().is_none());
+        assert_eq!(objects.begin("bob", &digest, length, 0).unwrap().held(), 0);
+
+        // Bytes that differ from their digest are dropped, not stored.
+        let wrong = format!("sha256:{}", "0".repeat(64));
+        let mut bad = objects.begin("alice", &wrong, 3, 0).unwrap();
+        bad.append(b"abc").unwrap();
+        assert_eq!(bad.finish().err().unwrap().code, "object_digest_mismatch");
+        assert_eq!(objects.begin("alice", &wrong, 3, 0).unwrap().held(), 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A held memo answers with its file in the answered run's custody while its signer holds
+    /// the file; when reclaim releases the file, the memo goes with it.
+    #[test]
+    fn a_held_memo_answers_while_its_file_is_held_and_goes_with_it() {
+        let root = std::env::temp_dir().join(format!("cm-objects-{}", uuid::Uuid::new_v4()));
+        let service =
+            crate::service::Service::open(&root.join("state"), &root.join("g"), 1).unwrap();
+        let store = Arc::new(Store::ensure(&root.join("tensorfs")).unwrap());
+        let objects = Objects::new(&root.join("writes"), store, service.engine.clone()).unwrap();
+        let bytes = b"note 5".to_vec();
+        let hex = sha256::hex_digest(&bytes);
+        let mut writer = objects.begin("alice", &format!("sha256:{hex}"), 6, 0).unwrap();
+        writer.append(&bytes).unwrap();
+        writer.finish().unwrap();
+        let record = crate::journal::ResultRecord {
+            value: serde_json::json!({"file": {"asset_ref": "attempt:1/file/0001"}}),
+            artifacts: vec![crate::journal::Artifact { name: "file-0001".into(), path: String::new(), sha256: hex.clone(), length: 6 }],
+            asset_bindings: vec![crate::journal::AssetBinding {
+                relative_path: "file-0001".into(), asset_ref: "attempt:1/file/0001".into(), media_type: "text/plain".into(),
+                length: 6,
+            }],
+        };
+        let engine = service.engine.clone();
+        let held = crate::journal::HeldMemo { actor: "alice".into(), computation: "sha256:c".into(),
+            record: serde_json::to_vec(&record).unwrap(), objects: vec![hex.clone()] };
+        engine.with_journal(|j| j.hold_memo(&held)).unwrap();
+        let held = objects.recall("alice", "sha256:c", "7").unwrap().unwrap();
+        assert_eq!(held.artifacts[0].path, format!("results/7/0-{hex}"));
+        assert_eq!(fs::read(engine.root.join(&held.artifacts[0].path)).unwrap(), bytes);
+        assert_eq!(held.value, record.value);
+        assert!(objects.recall("bob", "sha256:c", "8").unwrap().is_none(), "a memo is its signer's");
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(objects.release(Duration::ZERO).unwrap(), 1);
+        assert!(engine.with_journal(|j| j.held_memo("alice", "sha256:c")).unwrap().is_none(), "reclaim dropped the memo");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A client's concurrent first calls each send the package source: the second write
+    /// waits for the first, then finds the object stored instead of being refused.
+    #[test]
+    fn a_second_write_of_an_object_waits_for_the_first() {
+        let root = std::env::temp_dir().join(format!("cm-objects-{}", uuid::Uuid::new_v4()));
+        let service =
+            crate::service::Service::open(&root.join("state"), &root.join("g"), 1).unwrap();
+        let store = Arc::new(Store::ensure(&root.join("tensorfs")).unwrap());
+        let objects = Objects::new(&root.join("writes"), store, service.engine.clone()).unwrap();
+        let bytes: Vec<u8> = (0..300_000u32).map(|i| (i % 241) as u8).collect();
+        let digest = format!("sha256:{}", sha256::hex_digest(&bytes));
+        let length = bytes.len() as u64;
+
+        let mut first = objects.begin("alice", &digest, length, 0).unwrap();
+        first.append(&bytes[..100_000]).unwrap();
+        let part = first.part.clone();
+        let waiting = format!(":{} ", fs::metadata(&part).unwrap().ino());
+        let (sent, answer) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let second = objects
+                    .begin("alice", &digest, length, 0)
+                    .map(|writer| writer.held());
+                sent.send(second.map_err(|refused| refused.code)).unwrap();
+            });
+            // The second write either answers or blocks on the first's lock.
+            let early = loop {
+                if let Ok(answer) = answer.try_recv() {
+                    break Some(answer);
+                }
+                let locks = fs::read_to_string("/proc/locks").unwrap();
+                if locks
+                    .lines()
+                    .any(|l| l.contains("->") && l.contains(&waiting))
+                {
+                    break None;
+                }
+                std::thread::yield_now();
+            };
+            assert_eq!(early, None, "the second write did not wait for the first");
+            first.append(&bytes[100_000..]).unwrap();
+            assert_eq!(first.finish().unwrap(), length);
+            assert_eq!(answer.recv().unwrap(), Ok(length));
+        });
+        assert!(!part.exists());
+        let (path, held) = objects.path("alice", &digest).unwrap().unwrap();
+        assert_eq!((fs::read(path).unwrap(), held), (bytes, length));
+        let _ = fs::remove_dir_all(root);
+    }
+}

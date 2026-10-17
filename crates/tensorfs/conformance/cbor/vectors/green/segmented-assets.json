@@ -1,0 +1,50 @@
+{
+  "assets": [
+    [
+      "processor/config.json",
+      "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+      9,
+      "application/json",
+      [["sha256:6666666666666666666666666666666666666666666666666666666666666666", 9]]
+    ],
+    [
+      "tokenizer/vocab.json",
+      "sha256:7777777777777777777777777777777777777777777777777777777777777777",
+      12,
+      "application/json",
+      [
+        ["sha256:8888888888888888888888888888888888888888888888888888888888888888", 5],
+        ["sha256:9999999999999999999999999999999999999999999999999999999999999999", 7]
+      ]
+    ]
+  ],
+  "components": [
+    [
+      "video_vae",
+      [
+        [
+          "decoder.weight",
+          "bf16",
+          [129],
+          0,
+          [
+            [
+              "value",
+              "bf16",
+              [129],
+              {
+                "segments": [
+                  ["sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 128],
+                  ["sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", 130]
+                ]
+              }
+            ]
+          ]
+        ]
+      ]
+    ]
+  ],
+  "configs": [["video_vae", "{\"channels\":4}"]],
+  "encodings": [{"logical_dtypes":["bf16"],"roles":{"value":{"carrier":{"t":"same_as_logical"},"shape":{"t":"same"}}}}],
+  "format": "cozytensors/1"
+}
