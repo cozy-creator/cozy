@@ -38,5 +38,5 @@ target/debug/tensord serve --state PATH [--generations PATH] [--host-bytes N] \
   [--cpu-parallelism N] [--gpu-config FILE] [--machine-config FILE --listen ADDR]
 ```
 
-`--machine-config` with `--listen` starts the authenticated TLS/gRPC API the Cozy CLI uses.
+`--machine-config` with `--listen` starts the authenticated HTTPS machine API Calcifer uses.
 `--gpu-config` adds the GPU pool ([GPU service](docs/GPU-SERVICE.md)).

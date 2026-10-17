@@ -35,7 +35,7 @@ Plan of record and workstream IDs (A–F):
 ## Process picture
 
 ```
-cozy CLI ──TLS/gRPC (Cozy-Cap)──> api::server ─> machine_api::NativeBackend
+Calcifer ──HTTPS (Cozy-Cap)──> api::http ─> machine_api::NativeBackend
                                                         │
 machine.sock (weight peers) / admin.sock ─> main.rs ▼
                                           service::Service (dispatch policy)
@@ -74,16 +74,17 @@ that descends from the machine. Same-UID package code is still not sandboxed.
 | Module | Owns | Main types | Owner |
 |---|---|---|---|
 | `main.rs` | `serve`/`version` commands, weight-peer socket and owner-only admin socket, wiring | — | E (admin socket split), D2 (rental config) |
-| `api/server.rs` | TLS listener: `cozy.machine.v1`, health, retired worker.v1 answers | `MachineIdentity`, `serve` | D1 |
+| `api/server.rs` | The pinned-TLS listener (h2 and http/1.1) and the readiness self-probe | `MachineIdentity`, `serve` | D1 |
+| `api/http.rs` | The machine API's Router (`MACHINE-API.md`): auth, refusals as the error envelope, SSE, ranged outputs, object parts | `router`, `Refusal` | H |
 | `api/auth.rs` | Admitted keys (a rental's Hub lease) and each open stream's authority | `Authority`, `Keys`, `StreamAuthority` | D1 |
 | `api/identity.rs` | Persistent P-256 TLS identity, typed machine config, readiness secret | `MachineConfig`, `AuthorizedKeys`, `ReadinessSecret` | D2 |
 | `api/domain.rs` | Current typed native execution/backend values; no RPC or version identity | Native queries, state, model and custody values | APIM |
 | `archive.rs` | Private stored model/product/intake/terminal codecs, preserving existing byte tags | Stored records and codec functions | APIM |
 | `api/backend.rs` | The one backend trait the server calls | `MachineBackend`, `InputTreeReceiver`, `Observation` | D1 |
 | `api/workspaces.rs` | Resumable package uploads, scoped by owner key | `WorkspaceUploads`, `UploadSession`, `UploadedPackage` | D1 |
-| `api/machine_v1.rs` | `cozy.machine.v1` (`proto/cozy/machine/v1/machine.proto`, `MACHINE-API.md`): Run, Control, Read under one `Cozy-Cap`; Write (D1) to come | `MachineV1` | G |
-| `api/machine_status.rs` | Status: identity and receipt to anyone, the whole machine to a machine cap as it changes, `keepalive` | `status` | D2 |
-| `api/machine_update.rs` | `Run kind: update`: a software cohort from versions or held wheel objects; its log is the update's state history | `run`, `owns` | D2 |
+| `api/machine_runs.rs` | Runs: submit (idempotent per signer), the engine's pages as a run's events | `submit`, `follow` | G |
+| `api/machine_status.rs` | Status: identity and receipt to anyone, the whole machine to a machine cap as it changes | `frame`, `watch` | D2 |
+| `api/machine_update.rs` | Runs of `kind: update`: a software cohort from versions or held wheel objects; its log is the update's state history | `submit`, `events`, `owns` | D2 |
 | `api/capability.rs` | `Cozy-Cap` grants (the Go agent's token) for run outputs and maintenance | `Grant`, `verify`, `mint` | G |
 | `api/install.rs` | Materialize uploaded packages, run the uv installer helper | `InstallerConfig`, `PreparedGeneration` | D1 |
 | `machine_api.rs` | `MachineBackend` implementation: submit, events, collect, list, inventory | `NativeBackend` | D1 |
@@ -96,7 +97,7 @@ that descends from the machine. Same-UID package code is still not sandboxed.
 | `adapter_views.rs` | Caller LoRA adapters as a zero-copy TensorFS derivation | — | D1 |
 | `runs.rs` | Run sources and preparation inside a run: accepted at once, install/download as its progress, the Hub capability in memory only. A warm run with no entrypoint installs and fetches its choices; one with no code makes provider sources and uploads to its weights destination | `Runs`, `Spec`, `Source` | D1 |
 | `weights.rs` | An attempt's weights: `weights_writer` sources and outputs over TensorFS's native channels; an adopted output kept in a local repository, recorded as a manifest product, published to the run's weights destination | `Weights`, `Grant` | D1 |
-| `objects.rs` | Write: resumable content-addressed objects into the store, recorded per signer | `Objects`, `Writer` | D1 |
+| `objects.rs` | Uploaded objects: byte ranges in any order, resumable, verified once whole into the store, per signer | `Objects`, `Upload` | D1 |
 | `local_source.rs` | A run's local source: each remote manifest owns its source tree and editable environment; explicit local paths read the directory in place | `LocalSources`, `Manifest` | D1 |
 | `machine/` | Launch grant, lifetime identity, readiness receipt, rental lifecycle, supervision, SSH, runtime update, the direct player endpoint (`player.rs`), the embedded Python client and installer helper (`client.rs`) | `Grant`, `Readiness`, `Lifecycle` | D2 |
 | `native_inputs.rs` | Native input custody into TensorFS + journal | `SourceIntake`, `IntakeJournal` | D1 |
