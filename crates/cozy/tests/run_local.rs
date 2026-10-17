@@ -116,3 +116,94 @@ fn local_code_runs_on_a_real_machine_and_runs_again_as_edited() {
     ));
     assert_eq!(echoed["result"]["text"], "from a directory", "{echoed}");
 }
+
+/// A wheel no index serves (an unpublished build, as cozy-kernels before its release), named by a
+/// path source: the machine installs it as a carried wheel, for a script (resolved on the machine)
+/// and for a locked project (`uv sync` leaves it to the carried file), and the code imports it.
+#[test]
+fn a_local_wheel_a_path_source_names_is_carried_to_the_machine() {
+    let Some(home) = Home::new() else { return };
+    if std::env::var_os("COZY_TEST_TENSORD").is_none() {
+        eprintln!("skipped: no TensorD (COZY_TEST_TENSORD is unset)");
+        return;
+    }
+    let _machine = common::tensord::added(&home, "m1");
+    let work = home.path().join("work");
+    let write = |path: &str, text: &str| {
+        let path = work.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    };
+    let uv = |dir: &Path, args: &[&str]| {
+        let out = std::process::Command::new("uv")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "uv {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    let backend = "[build-system]\nrequires = [\"uv_build>=0.9,<1\"]\nbuild-backend = \"uv_build\"\n\n\
+                   [tool.uv.build-backend]\nmodule-root = \"\"\n";
+    write(
+        "probe/pyproject.toml",
+        &format!(
+            "[project]\nname = \"probe-kernels\"\nversion = \"0.1.0\"\nrequires-python = \">=3.12\"\n\n{backend}"
+        ),
+    );
+    write(
+        "probe/probe_kernels/__init__.py",
+        "VALUE = \"from a carried wheel\"\n",
+    );
+    uv(&work, &["build", "--wheel", "--out-dir", "dist", "probe"]);
+    let wheel = "dist/probe_kernels-0.1.0-py3-none-any.whl";
+    assert!(work.join(wheel).is_file());
+
+    // A script, which nothing locks.
+    write(
+        "carried.py",
+        &format!(
+            "# /// script\n# requires-python = \">=3.12\"\n# dependencies = [\"cozy-runtime>=0.25.1\", \"probe-kernels\"]\n\
+         # [tool.uv.sources]\n# probe-kernels = {{ path = \"{wheel}\" }}\n# [tool.cozy]\n# accelerator = false\n# ///\n\
+         import probe_kernels\n\n\ndef main() -> str:\n    return probe_kernels.VALUE\n"
+        ),
+    );
+    let run = completed(&cozy(
+        &home,
+        &work,
+        &["--json", "run", "carried.py", "--on", "m1"],
+    ));
+    assert_eq!(run["result"]["value"], "from a carried wheel", "{run}");
+
+    // A locked project.
+    write(
+        "locked/pyproject.toml",
+        &format!(
+            "[project]\nname = \"locked-probe\"\nversion = \"0.1.0\"\nrequires-python = \">=3.12\"\n\
+         dependencies = [\"cozy-runtime>=0.25.1\", \"msgspec>=0.19\", \"probe-kernels\"]\n\n\
+         [project.entry-points.\"cozy.application\"]\ndefault = \"locked_probe:app\"\n\n\
+         [tool.uv.sources]\nprobe-kernels = {{ path = \"../{wheel}\" }}\n\n{backend}"
+        ),
+    );
+    write(
+        "locked/package.toml",
+        "[application]\nobject = \"locked_probe:app\"\n",
+    );
+    write(
+        "locked/locked_probe/__init__.py",
+        "import msgspec\nimport probe_kernels\nfrom cozy_runtime.author import App\n\n\
+        app = App()\n\n\nclass ProbeInput(msgspec.Struct):\n    text: str = \"\"\n\n\nclass ProbeOutput(msgspec.Struct):\n    text: str\n\n\n\
+        @app.entrypoint(accelerator=False)\ndef probe(payload: ProbeInput) -> ProbeOutput:\n    \
+        \"\"\"Answers the carried wheel's value.\"\"\"\n    return ProbeOutput(probe_kernels.VALUE)\n",
+    );
+    uv(&work.join("locked"), &["lock", "--quiet"]);
+    let run = completed(&cozy(
+        &home,
+        &work,
+        &["--json", "run", "./locked/probe", "x", "--on", "m1"],
+    ));
+    assert_eq!(run["result"]["text"], "from a carried wheel", "{run}");
+}
