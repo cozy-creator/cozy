@@ -41,13 +41,12 @@ tokio = { workspace = true, features = ["signal"] }
 toml.workspace = true
 toml_edit.workspace = true
 url.workspace = true
+zip.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 flate2.workspace = true
 tar.workspace = true
 
-[target.'cfg(windows)'.dependencies]
-zip.workspace = true
 
 [lints]
 workspace = true

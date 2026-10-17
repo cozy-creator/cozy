@@ -1,6 +1,8 @@
-//! `cozy doctor`: one machine's driver, GPUs, toolchain and kernels, as its Status reports them.
+//! `cozy doctor`: this computer's tools, then one machine's driver, GPUs, toolchain and kernels,
+//! as its Status reports them.
 use std::process::ExitCode;
 
+use cozy_platform::tools::Side;
 use cozy_proto::{
     calcifer::Machine,
     error::{Error, Kind},
@@ -14,23 +16,34 @@ use crate::{
 
 #[derive(clap::Args, Debug)]
 pub struct Args {
-    /// The machine to check.
-    #[arg(long, default_value = "local")]
-    on: String,
+    /// The machine to check; without it, this computer's machine when it is one.
+    #[arg(long)]
+    on: Option<String>,
 }
 
+/// `cozy doctor`: this computer's tools (found, or what each one's absence costs and what installs
+/// it), then a machine as its Status reports it: `--on`'s, else this computer's when enabled.
 pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
-    let m: Machine = match ctx.calcifer().await?.get(&route(&args.on)?).await {
-        Err(e) if e.kind == Kind::NotFound && args.on == "local" => {
-            return Err(Error::new(
-                Kind::NotFound,
-                "no_local_machine",
-                "this computer is not a machine; check another with --on",
-            )
-            .next("cozy doctor --on <machine>")
-            .next("cozy machine list"));
-        }
-        answer => answer?,
+    let tools = crate::tools::rows(ctx, Side::Computer);
+    let named = args.on.is_some();
+    let on = args.on.unwrap_or_else(|| "local".into());
+    let machine: Option<Machine> = match ctx.calcifer().await?.get(&route(&on)?).await {
+        Err(e) if e.kind == Kind::NotFound && !named => None,
+        answer => Some(answer?),
+    };
+    if ctx.json {
+        output::json(&serde_json::json!({ "tools": tools, "machine": machine }));
+        return Ok(ExitCode::SUCCESS);
+    }
+    let mut table = output::Table::new(ctx, ["THIS COMPUTER", "STATE", "PATH OR INSTALL"]);
+    for row in &tools {
+        table = table.row(crate::tools::cells(row));
+    }
+    table.print();
+    let Some(m) = machine else {
+        output::say(ctx, "this computer is not a machine");
+        output::next(ctx, &["cozy machine enable", "cozy doctor --on <machine>"]);
+        return Ok(ExitCode::SUCCESS);
     };
     let Some(status) = &m.status else {
         let why = m
@@ -44,10 +57,6 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
         )
         .next(format!("cozy machine show {}", m.name)));
     };
-    if ctx.json {
-        output::json(&m);
-        return Ok(ExitCode::SUCCESS);
-    }
     let mut record = output::Record::new().field("machine", &m.name);
     for (key, value) in status_fields(status) {
         record = record.field(&key, value);
