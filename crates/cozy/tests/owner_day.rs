@@ -277,7 +277,7 @@ fn an_h3_request_binds_its_references_from_a_yaml_and_its_video_lands_whole() {
     assert_eq!(std::fs::metadata(&video).unwrap().len(), 32 + (10 << 20));
     assert_eq!(
         files(&folder),
-        [video.clone()],
+        std::slice::from_ref(&video),
         "each revision rewrote the one file"
     );
 
