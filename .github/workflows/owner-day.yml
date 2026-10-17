@@ -1,8 +1,8 @@
 name: owner-day
 # The owner's day with cozy, end to end, as a release gate: the real binary, Calcifer and TensorD
 # against a CI Tensorhub that tensorhub's scripts/live-hub-client.sh brings up (MinIO, a TLS front,
-# docker-provider CPU rentals). Once per TensorD: the newest cozy-runtime wheel's (released) and
-# this commit's (workspace). One machine's port is shaped like the owner's uplink. Called by
+# docker-provider CPU rentals), on this commit's TensorD (a released 0.7.x is refused
+# `machine_outdated`). One machine's port is shaped like the owner's uplink. Called by
 # release.yml (dist's `plan` input), the tests run the release's own Linux x86_64 `cozy`; dispatched,
 # this commit's build.
 #   gh workflow run owner-day.yml -R cozy-creator/cozy --ref <branch> [-f tensorhub_ref=<ref>]
@@ -27,11 +27,7 @@ permissions:
 
 jobs:
   owner-day:
-    name: owner-day (${{ matrix.tensord }} TensorD)
-    strategy:
-      fail-fast: false
-      matrix:
-        tensord: [released, workspace]
+    name: owner-day
     runs-on: ubuntu-latest
     # Hang bound, not a work budget.
     timeout-minutes: 50
@@ -86,7 +82,8 @@ jobs:
           done
       - name: The owner's day
         env:
-          COZY_TENSORD: ${{ matrix.tensord == 'workspace' && 'workspace' || '' }}
+          # live-hub-client.sh builds the tests' TensorD from this checkout.
+          COZY_TENSORD: workspace
           COZY_TEST_SHAPED_PORT: '47123'
           COZY_TEST_SHAPED_BPS: '325000'
           COZY_TEST_TFS: ${{ github.workspace }}/tools/evaluator/.venv/bin/tfs
