@@ -617,6 +617,11 @@ impl Layout {
 #[serde(default)]
 pub struct Frame {
     pub event: Option<Event>,
+    /// A request or progress frame whose fields did not decode (a negative byte count, run
+    /// 10078): why. A request is refused alone under its own sequence number and a progress
+    /// frame is dropped; the executor and its other work go on.
+    #[serde(skip)]
+    pub malformed: String,
     pub reply: String,
     pub ok: bool,
     pub code: String,
@@ -1920,6 +1925,10 @@ impl DeviceExecutor {
                 })?;
             watch.frame();
             match frame.event {
+                Some(Event::Request) if !frame.malformed.is_empty() => {
+                    refuse_malformed(&mut self.stream, &frame)?
+                }
+                Some(Event::Progress) if !frame.malformed.is_empty() => (),
                 Some(Event::Progress) => services.progress(&frame),
                 Some(Event::Request) if frame.kind == Kind::DeviceTier => {
                     if frame.descriptors > MAX_SHARED_FDS {
@@ -2201,7 +2210,46 @@ fn decode_frame(bytes: &[u8]) -> io::Result<Frame> {
     let mut fields: serde_json::Map<String, Value> =
         serde_json::from_slice(bytes).map_err(io::Error::other)?;
     fields.retain(|_, value| !value.is_null());
-    serde_json::from_value(Value::Object(fields)).map_err(io::Error::other)
+    let event = match fields.get("event").and_then(Value::as_str) {
+        Some("request") => Some(Event::Request),
+        Some("progress") => Some(Event::Progress),
+        _ => None,
+    };
+    let seq = fields.get("seq").and_then(Value::as_u64);
+    let descriptor = fields.get("descriptor").and_then(Value::as_bool).unwrap_or(false);
+    let descriptors = fields.get("descriptors").and_then(Value::as_u64).unwrap_or(0);
+    serde_json::from_value(Value::Object(fields)).or_else(|error| match (event, seq) {
+        (Some(Event::Request), Some(seq)) => Ok(Frame {
+            event,
+            seq,
+            descriptor,
+            descriptors: u32::try_from(descriptors).unwrap_or(u32::MAX),
+            malformed: error.to_string(),
+            ..Frame::default()
+        }),
+        (Some(Event::Progress), _) => Ok(Frame {
+            event,
+            malformed: error.to_string(),
+            ..Frame::default()
+        }),
+        _ => Err(io::Error::other(error)),
+    })
+}
+
+/// A request this machine cannot decode is refused alone, under its own sequence number,
+/// after the fds it announced are taken off the socket: the executor's call goes on.
+fn refuse_malformed(
+    stream: &mut std::os::unix::net::UnixStream,
+    frame: &Frame,
+) -> io::Result<()> {
+    if frame.descriptors > MAX_SHARED_FDS {
+        return Err(io::Error::other("a malformed request names too many descriptors"));
+    }
+    for _ in 0..u32::from(frame.descriptor) + frame.descriptors {
+        drop(protocol::recv_fd(stream)?);
+    }
+    let answer = Answer::refused(frame.seq, "malformed_request", frame.malformed.clone());
+    write_frame(stream, &answer)
 }
 pub fn write_answer(
     stream: &mut std::os::unix::net::UnixStream,
@@ -2276,6 +2324,34 @@ mod codec_tests {
         runtime.write_all(&(protocol::MAX_FRAME as u32 + 1).to_be_bytes()).unwrap();
         let refused = read_frame(&mut machine).unwrap_err();
         assert_eq!(refused.kind(), io::ErrorKind::InvalidData, "{refused}");
+    }
+
+    /// A request whose fields do not decode (a negative byte count, run 10078) is refused alone
+    /// under its sequence number with the fd it announced taken off the socket; an undecodable
+    /// progress frame is dropped; the next frame reads as before.
+    #[test]
+    fn a_request_that_does_not_decode_is_refused_alone() {
+        let (mut runtime, mut machine) = std::os::unix::net::UnixStream::pair().unwrap();
+        let malformed = serde_json::json!({"event": "request", "kind": "device_room", "seq": 9,
+            "free_bytes": -23068672, "holding_bytes": 1, "descriptor": true});
+        write_frame(&mut runtime, &malformed).unwrap();
+        protocol::send_fd(&runtime, &File::open("/dev/null").unwrap()).unwrap();
+        let frame = read_frame(&mut machine).unwrap().unwrap();
+        assert_eq!((frame.event, frame.seq), (Some(Event::Request), 9));
+        assert!(frame.malformed.contains("expected u64"), "{}", frame.malformed);
+        refuse_malformed(&mut machine, &frame).unwrap();
+        let answer = read_frame(&mut runtime).unwrap().unwrap();
+        assert_eq!((answer.seq, answer.ok, answer.code.as_str()), (9, false, "malformed_request"));
+        let progress = serde_json::json!({"event": "progress", "stage": "x", "position": -1});
+        write_frame(&mut runtime, &progress).unwrap();
+        let dropped = read_frame(&mut machine).unwrap().unwrap();
+        assert!(dropped.event == Some(Event::Progress) && !dropped.malformed.is_empty());
+        let fine = serde_json::json!({"event": "request", "kind": "device_room", "seq": 10,
+            "free_bytes": 5});
+        write_frame(&mut runtime, &fine).unwrap();
+        let next = read_frame(&mut machine).unwrap().unwrap();
+        assert!(next.malformed.is_empty());
+        assert_eq!((next.kind, next.seq, next.free_bytes), (Kind::DeviceRoom, 10, 5));
     }
 
     #[test]
