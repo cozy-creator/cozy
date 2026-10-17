@@ -1,3 +1,6 @@
+// The machine API's error envelope is TensorD's error type; refusals are cold paths, so its size
+// costs nothing worth boxing it for.
+#![allow(clippy::result_large_err)]
 pub mod access;
 pub mod adapter_views;
 mod archive;
@@ -5,10 +8,10 @@ pub mod api;
 mod boundary_json;
 mod call_memo;
 pub mod catalog;
+pub mod config;
 pub mod child_launcher;
 pub mod device_executor;
 pub mod execution;
-mod failure_upgrade;
 mod gpu_allocation;
 pub mod gpu_service;
 pub mod held_models;
@@ -18,6 +21,7 @@ pub mod calls;
 pub mod journal;
 pub mod launch_identity;
 pub mod local_source;
+pub mod logs;
 pub mod machine;
 pub mod machine_api;
 pub mod memo;
@@ -36,5 +40,8 @@ pub mod reclaim;
 pub mod resident_custody;
 pub mod runs;
 pub mod weights;
+#[cfg(test)]
+mod sdk_selection_tests;
+pub mod serve;
 pub mod service;
 pub mod triage;

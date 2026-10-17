@@ -10,7 +10,6 @@ use crate::{
     service::Service,
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use prost::Message;
 use serde_json::{json, Value};
 use std::{
     collections::BTreeMap,
@@ -23,7 +22,7 @@ use tensorfs_core::{
     sha256,
     store::Store,
 };
-use tonic::Status;
+use cozy_proto::error::Error;
 
 pub struct NativeBackend {
     pub service: Arc<Service>,
@@ -33,6 +32,8 @@ pub struct NativeBackend {
     pub publisher: Option<Arc<crate::published::Publisher>>,
     /// `cozy.machine.v1` Run sources and Write.
     pub runs: Option<Arc<crate::runs::Runs>>,
+    /// Where TensorD's own log rolls; None on development front doors.
+    pub logs: Option<std::path::PathBuf>,
     // Serialize native projection, not inference or observation. Only one result
     // projection may establish a given immutable output's native custody at once.
     projection: Mutex<()>,
@@ -50,6 +51,7 @@ impl NativeBackend {
             installer: None,
             publisher: None,
             runs: None,
+            logs: None,
             projection: Mutex::new(()),
         }
     }
@@ -60,7 +62,7 @@ impl NativeBackend {
         &self,
         actor: VerifiedActor,
         query: domain::MachineExecutionQuery,
-    ) -> Result<Execution, Status> {
+    ) -> Result<Execution, Error> {
         if query.expected_execution_workspace_id != self.workspace_id() {
             return Err(refusal(
                 "execution_workspace_changed",
@@ -70,13 +72,16 @@ impl NativeBackend {
         self.service
             .engine
             .get_public(&actor_id(actor), &query.request_id)
-            .map_err(problem)
+            .map_err(|error| match error.kind() {
+                io::ErrorKind::NotFound => Error::not_found("run_not_found", "this machine has no such run"),
+                _ => problem(error),
+            })
     }
-    fn state(&self, record: &Execution) -> Result<domain::MachineExecutionState, Status> {
+    fn state(&self, record: &Execution) -> Result<domain::MachineExecutionState, Error> {
         let context = record
             .submission
             .as_ref()
-            .ok_or_else(|| Status::internal("public submission context absent"))?;
+            .ok_or_else(|| Error::internal("internal", "public submission context absent"))?;
         let sequence = self
             .service
             .engine
@@ -85,7 +90,7 @@ impl NativeBackend {
             .map(|held| {
                 crate::archive::decode_machine_execution_event_page(held.events.as_slice())
                     .map(|page| page.head_sequence)
-                    .map_err(|_| Status::data_loss("durable event projection corrupt"))
+                    .map_err(|_| Error::internal("custody_corrupt", "durable event projection corrupt"))
             })
             .transpose()?
             .unwrap_or(record.revision)
@@ -119,7 +124,7 @@ impl NativeBackend {
             number: record
                 .id
                 .parse()
-                .map_err(|_| Status::internal("invalid journal run number"))?,
+                .map_err(|_| Error::internal("internal", "invalid journal run number"))?,
             accepted_at_ms: record.accepted_at_ms,
             finished_at_ms: record.finished_at_ms,
             target: Some(domain::MachineExecutionTarget {
@@ -132,7 +137,7 @@ impl NativeBackend {
     }
     /// The run's journaled log: its published products, its memoized calls' results and its
     /// settled calls, as events with their journaled sequences.
-    fn product_events(&self, record: &Execution) -> Result<Vec<domain::MachineExecutionEvent>, Status> {
+    fn product_events(&self, record: &Execution) -> Result<Vec<domain::MachineExecutionEvent>, Error> {
         let attempt = record.attempt.max(1) as u64;
         let engine = &self.service.engine;
         let mut events = engine
@@ -151,7 +156,7 @@ impl NativeBackend {
                     ..Default::default()
                 })
             })
-            .collect::<Result<Vec<_>, Status>>()?;
+            .collect::<Result<Vec<_>, Error>>()?;
         let calls = engine.calls(&record.id).map_err(problem)?.into_iter().map(|c| ("call", c));
         let logs = engine.logs(&record.id).map_err(problem)?.into_iter().map(|l| ("log", l));
         for (kind, stored) in calls.chain(logs) {
@@ -167,7 +172,7 @@ impl NativeBackend {
         events.sort_by_key(|event| event.sequence);
         Ok(events)
     }
-    fn terminal(&self, record: &Execution) -> Result<domain::MachineExecutionEventPage, Status> {
+    fn terminal(&self, record: &Execution) -> Result<domain::MachineExecutionEventPage, Error> {
         let _guard = self.projection.lock().unwrap();
         if let Some(held) = self
             .service
@@ -176,15 +181,15 @@ impl NativeBackend {
             .map_err(problem)?
         {
             return crate::archive::decode_machine_execution_event_page(held.events.as_slice())
-                .map_err(|_| Status::data_loss("durable event projection is corrupt"));
+                .map_err(|_| Error::internal("custody_corrupt", "durable event projection is corrupt"));
         }
         if !record.state.terminal() {
-            return Err(Status::failed_precondition("execution is not terminal"));
+            return Err(Error::conflict("precondition_failed", "execution is not terminal"));
         }
         let context = record
             .submission
             .as_ref()
-            .ok_or_else(|| Status::internal("public submission context absent"))?;
+            .ok_or_else(|| Error::internal("internal", "public submission context absent"))?;
         let mut value = record.result.as_ref().map(|r| r.value.clone());
         let mut products = vec![];
         let mut schema_digest = None;
@@ -199,14 +204,14 @@ impl NativeBackend {
                 .engine
                 .installation_for_generation(&context.actor, &record.invocation.generation)
                 .map_err(problem)?
-                .ok_or_else(|| Status::data_loss("held installation interface absent"))?;
+                .ok_or_else(|| Error::internal("custody_corrupt", "held installation interface absent"))?;
             let interface: Value = serde_json::from_slice(&held.interface)
-                .map_err(|_| Status::data_loss("held installation interface corrupt"))?;
+                .map_err(|_| Error::internal("custody_corrupt", "held installation interface corrupt"))?;
             let declaration =
                 entrypoint(&interface, &record.invocation.entrypoint)?;
             schema_digest =
                 Some(identity(declaration.get("result").ok_or_else(|| {
-                    Status::failed_precondition("result schema absent")
+                    Error::conflict("precondition_failed", "result schema absent")
                 })?)?);
             let mut references = std::collections::HashMap::new();
             for binding in &result.asset_bindings {
@@ -214,7 +219,7 @@ impl NativeBackend {
                     .artifacts
                     .iter()
                     .position(|a| a.name == binding.relative_path)
-                    .ok_or_else(|| Status::data_loss("output binding artifact absent"))?;
+                    .ok_or_else(|| Error::internal("custody_corrupt", "output binding artifact absent"))?;
                 let artifact = &result.artifacts[index];
                 let object = ObjectRef {
                     sha256: artifact.sha256.clone(),
@@ -244,7 +249,7 @@ impl NativeBackend {
                         .read_to_end(&mut manifest).map_err(problem)?;
                     for (sha, length) in crate::execution::tree_members(&manifest).map_err(problem)? {
                         let member = result.artifacts.iter().position(|a| a.sha256 == sha && a.length == length)
-                            .ok_or_else(|| Status::data_loss("a tree member is not held"))?;
+                            .ok_or_else(|| Error::internal("custody_corrupt", "a tree member is not held"))?;
                         let owner = identity(&json!({"workspace":self.workspace_id(),"actor":context.actor,
                             "request":context.request_id,"asset":binding.asset_ref,"member":sha}))?;
                         crate::products::retain(&self.store, &self.service.engine, &context.actor, &owner,
@@ -262,7 +267,7 @@ impl NativeBackend {
                     value,
                     declaration
                         .get("result")
-                        .ok_or_else(|| Status::data_loss("result schema absent"))?,
+                        .ok_or_else(|| Error::internal("custody_corrupt", "result schema absent"))?,
                     "",
                     domain::RunProductOp::Set,
                     0,
@@ -291,7 +296,7 @@ impl NativeBackend {
         let first_sequence = record
             .revision
             .checked_add(1)
-            .ok_or_else(|| Status::resource_exhausted("event cursor exhausted"))?;
+            .ok_or_else(|| Error::capacity("exhausted", "event cursor exhausted"))?;
         let fresh = products
             .into_iter()
             .filter(|product| !crate::products::shown(&shown, product));
@@ -365,9 +370,12 @@ impl NativeBackend {
             body["error_code"] = json!(error_code);
         }
         // Observation only: the failed attempt's bundle, written before the run settled.
-        if let Some((triage, _)) = self.service.engine.triage(&record.id).map_err(problem)? {
+        if let Some((triage, bundle)) = self.service.engine.triage(&record.id).map_err(problem)? {
             body["triage_bundle"] = json!({"subject_id":triage.subject_id,
                 "write_receipt_digest":format!("sha256:{}", triage.sha256),"length":triage.length});
+            if let Some(detail) = crate::triage::detail(&bundle) {
+                body["failure_detail"] = json!(detail);
+            }
         }
         if !output_entries.is_empty() {
             body["output_manifest"] = json!({"outputs":output_entries});
@@ -428,7 +436,7 @@ impl NativeBackend {
             )
             .map_err(problem)?;
         crate::archive::decode_machine_execution_event_page(committed.events.as_slice())
-            .map_err(|_| Status::data_loss("durable event projection is corrupt"))
+            .map_err(|_| Error::internal("custody_corrupt", "durable event projection is corrupt"))
     }
 }
 /// Printable ASCII only, bounded to its head and tail: a reason is shown to the client verbatim.
@@ -454,8 +462,8 @@ impl MachineBackend for NativeBackend {
         run: u64,
         output: &str,
         index: Option<u32>,
-    ) -> Result<crate::api::backend::OutputSnapshot, Status> {
-        let absent = || Status::not_found("this machine has no such run or output");
+    ) -> Result<crate::api::backend::OutputSnapshot, Error> {
+        let absent = || Error::not_found("output_not_found", "this machine has no such run or output");
         let actor = actor_id(actor);
         let record = match self.service.engine.get(&run.to_string()) {
             Ok(record) if record.submission.as_ref().is_some_and(|s| s.actor == actor) => record,
@@ -485,7 +493,7 @@ impl MachineBackend for NativeBackend {
         let content = current
             .content
             .as_ref()
-            .ok_or_else(|| Status::data_loss("product content absent"))?;
+            .ok_or_else(|| Error::internal("custody_corrupt", "product content absent"))?;
         let refs: Vec<&domain::Ref> = if current.parts.is_empty() {
             vec![content]
         } else {
@@ -505,7 +513,7 @@ impl MachineBackend for NativeBackend {
                     .into_file();
                 Ok((file, r.length))
             })
-            .collect::<Result<Vec<_>, Status>>()?;
+            .collect::<Result<Vec<_>, Error>>()?;
         Ok(crate::api::backend::OutputSnapshot {
             parts,
             length: content.length,
@@ -521,25 +529,25 @@ impl MachineBackend for NativeBackend {
         output: &str,
         index: Option<u32>,
         member: &str,
-    ) -> Result<crate::api::backend::OutputSnapshot, Status> {
+    ) -> Result<crate::api::backend::OutputSnapshot, Error> {
         let tree = self.open_output(actor, run, output, index)?;
         if tree.media_type != crate::gpu_service::TREE_MEDIA {
-            return Err(Status::invalid_argument("only a tree output has members"));
+            return Err(Error::validation("invalid_request", "only a tree output has members"));
         }
         let mut manifest = Vec::new();
         for (file, length) in tree.parts {
             file.take(length).read_to_end(&mut manifest).map_err(problem)?;
         }
         let document: Value = serde_json::from_slice(&manifest)
-            .map_err(|_| Status::data_loss("tree manifest is not JSON"))?;
+            .map_err(|_| Error::internal("custody_corrupt", "tree manifest is not JSON"))?;
         let entry = document["entries"]
             .as_array()
             .into_iter()
             .flatten()
             .find(|entry| entry["path"] == member)
-            .ok_or_else(|| Status::not_found("the tree has no such member"))?;
+            .ok_or_else(|| Error::not_found("output_not_found", "the tree has no such member"))?;
         let (Some(sha), Some(length)) = (entry["blob"]["sha256"].as_str(), entry["blob"]["length"].as_u64()) else {
-            return Err(Status::data_loss("tree member names no blob"));
+            return Err(Error::internal("custody_corrupt", "tree member names no blob"));
         };
         let file = self.store.open_verified(sha).map_err(storage)?.into_file();
         Ok(crate::api::backend::OutputSnapshot {
@@ -554,23 +562,23 @@ impl MachineBackend for NativeBackend {
         &self,
         actor: VerifiedActor,
         request: domain::MachineExecutionTriageQuery,
-    ) -> Result<domain::MachineExecutionTriage, Status> {
+    ) -> Result<domain::MachineExecutionTriage, Error> {
         let record = self.query(
             actor,
             request
                 .execution
-                .ok_or_else(|| Status::invalid_argument("execution query absent"))?,
+                .ok_or_else(|| Error::validation("invalid_request", "execution query absent"))?,
         )?;
         if request.attempt_ordinal != 0 && request.attempt_ordinal != record.attempt.max(1) as u64
         {
-            return Err(Status::not_found("this machine keeps one attempt per run"));
+            return Err(Error::not_found("triage_not_found", "this machine keeps one attempt per run"));
         }
         let (triage, bytes) = self
             .service
             .engine
             .triage(&record.id)
             .map_err(problem)?
-            .ok_or_else(|| Status::not_found("this attempt kept no triage bundle"))?;
+            .ok_or_else(|| Error::not_found("triage_not_found", "this attempt kept no triage bundle"))?;
         Ok(domain::MachineExecutionTriage {
             bundle: Some(domain::TriageBundleRef {
                 subject_id: triage.subject_id,
@@ -580,36 +588,18 @@ impl MachineBackend for NativeBackend {
             bundle_canonical_bytes: bytes,
         })
     }
-    fn read_machine_log(
-        &self,
-        _: VerifiedActor,
-        request: domain::MachineLogQuery,
-    ) -> Result<Vec<u8>, Status> {
-        // TensorFS and TensorD's memory notes append here, each rotating to one older file.
-        let name = match domain::MachineLog::try_from(request.log) {
-            Ok(domain::MachineLog::TensorfsTransport) => "transport.log",
-            Ok(domain::MachineLog::Memory) => "memory.log",
-            _ => return Err(Status::not_found(format!("this machine keeps no log {}", request.log))),
-        };
-        let logs = self.store.root().join("logs");
-        let mut data = vec![];
-        for name in [format!("{name}.1"), name.into()] {
-            match std::fs::read(logs.join(&name)) {
-                Ok(kept) => data.extend(kept),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(Status::internal(format!("read {name}: {error}"))),
-            }
+    fn log(&self, name: &str) -> Result<crate::logs::Log, Error> {
+        // TensorFS and TensorD's memory notes append to the store's logs, each rotating to one
+        // older file; TensorD's own log rolls daily.
+        let store = self.store.root().join("logs");
+        match (name, &self.logs) {
+            ("tensorfs-transport", _) => Ok(crate::logs::Log::rotated(store, "transport.log")),
+            ("memory", _) => Ok(crate::logs::Log::rotated(store, "memory.log")),
+            ("tensord", Some(dir)) => Ok(crate::logs::Log::daily(dir.clone(), "tensord")),
+            _ => Err(Error::not_found("log_not_found", format!("this machine keeps no log {name}"))),
         }
-        let tail = request.tail_bytes as usize;
-        if tail > 0 && data.len() > tail {
-            data.drain(..data.len() - tail);
-            if let Some(line) = data.iter().position(|b| *b == b'\n') {
-                data.drain(..=line);
-            }
-        }
-        Ok(data)
     }
-    fn object(&self, actor: VerifiedActor, sha256: &str) -> Result<std::fs::File, Status> {
+    fn object(&self, actor: VerifiedActor, sha256: &str) -> Result<std::fs::File, Error> {
         // Only an object this signer wrote: another signer's reads as absent.
         let held = self
             .service
@@ -617,7 +607,7 @@ impl MachineBackend for NativeBackend {
             .with_journal(|j| j.object(&actor_id(actor), sha256))
             .map_err(problem)?;
         if held.is_none() {
-            return Err(Status::not_found("this signer wrote no such object"));
+            return Err(Error::not_found("object_not_found", "this signer wrote no such object"));
         }
         Ok(self.store.open_verified(sha256).map_err(storage)?.into_file())
     }
@@ -625,7 +615,7 @@ impl MachineBackend for NativeBackend {
         &self,
         actor: VerifiedActor,
         _: domain::PackageListQuery,
-    ) -> Result<domain::PackageList, Status> {
+    ) -> Result<domain::PackageList, Error> {
         let mut packages = vec![];
         for installed in self
             .service
@@ -650,7 +640,7 @@ impl MachineBackend for NativeBackend {
                 })
                 .collect();
             let interface: Value = serde_json::from_slice(&installed.interface)
-                .map_err(|_| Status::data_loss("held interface corrupt"))?;
+                .map_err(|_| Error::internal("custody_corrupt", "held interface corrupt"))?;
             let mut entrypoints = interface
                 .get("entrypoints")
                 .and_then(Value::as_array)
@@ -679,7 +669,7 @@ impl MachineBackend for NativeBackend {
         });
         Ok(domain::PackageList { packages })
     }
-    fn levels(&self, actor: VerifiedActor) -> Result<BTreeMap<String, &'static str>, Status> {
+    fn levels(&self, actor: VerifiedActor) -> Result<BTreeMap<String, &'static str>, Error> {
         let (actor, gpu) = (actor_id(actor), self.service.gpu());
         let held = gpu.as_ref().map(|gpu| gpu.levels()).unwrap_or_default();
         let mut levels = BTreeMap::new();
@@ -712,7 +702,7 @@ impl MachineBackend for NativeBackend {
         }
         Ok(levels)
     }
-    fn warm_set(&self, actor: VerifiedActor) -> Result<Vec<v1::WarmItem>, Status> {
+    fn warm_set(&self, actor: VerifiedActor) -> Result<Vec<v1::WarmItem>, Error> {
         let actor = actor_id(actor);
         let kept = self
             .service
@@ -721,13 +711,14 @@ impl MachineBackend for NativeBackend {
             .map_err(problem)?;
         let holds = self.service.gpu().map(|gpu| gpu.members(&actor));
         let mut items = vec![];
-        fn corrupt<E>(_: E) -> Status {
-            Status::data_loss("kept warm set corrupt")
+        fn corrupt<E>(_: E) -> Error {
+            Error::internal("custody_corrupt", "kept warm set corrupt")
         }
         for (position, (_, record)) in kept.iter().filter(|(of, _)| *of == actor).enumerate() {
             let kept: KeptMember = serde_json::from_str(record).map_err(corrupt)?;
             let sent = STANDARD.decode(&kept.item).map_err(corrupt)?;
-            let mut item = v1::WarmItem::decode(&sent[..]).map_err(corrupt)?;
+            // A member kept before the cohort (protobuf) is not reported; the next set replaces it.
+            let Ok(mut item) = serde_json::from_slice::<v1::WarmItem>(&sent) else { continue };
             // Before the pool has taken the set up (a restart in progress) it holds its code.
             let (level, held_back) = match &holds {
                 Some(holds) => holds.get(position).copied().unwrap_or((Level::Installed, "")),
@@ -742,7 +733,7 @@ impl MachineBackend for NativeBackend {
         &self,
         _: VerifiedActor,
         _: domain::MachineExecutionWorkspaceQuery,
-    ) -> Result<domain::MachineExecutionWorkspace, Status> {
+    ) -> Result<domain::MachineExecutionWorkspace, Error> {
         Ok(domain::MachineExecutionWorkspace {
             worker_id: self.authority.worker_id.clone(),
             worker_boot_id: self.authority.boot_id.clone(),
@@ -753,42 +744,42 @@ impl MachineBackend for NativeBackend {
         &self,
         actor: VerifiedActor,
         query: domain::MachineExecutionQuery,
-    ) -> Result<domain::MachineExecutionState, Status> {
+    ) -> Result<domain::MachineExecutionState, Error> {
         self.state(&self.query(actor, query)?)
     }
     fn execution_ms(
         &self,
         actor: VerifiedActor,
         query: domain::MachineExecutionQuery,
-    ) -> Result<u64, Status> {
+    ) -> Result<u64, Error> {
         Ok(self.query(actor, query)?.executed_ms)
     }
     fn memo(
         &self,
         actor: VerifiedActor,
         query: domain::MachineExecutionQuery,
-    ) -> Result<crate::journal::CallMemo, Status> {
+    ) -> Result<crate::journal::CallMemo, Error> {
         Ok(self.query(actor, query)?.memo)
     }
     fn measurements(
         &self,
         actor: VerifiedActor,
         query: domain::MachineExecutionQuery,
-    ) -> Result<Option<Vec<u8>>, Status> {
+    ) -> Result<Option<Vec<u8>>, Error> {
         let record = self.query(actor, query)?;
-        Ok(self
-            .service
+        self.service
             .engine
-            .with_journal(|journal| journal.measurements(&record.id))?)
+            .with_journal(|journal| journal.measurements(&record.id))
+            .map_err(problem)
     }
     fn events(
         &self,
         actor: VerifiedActor,
         request: domain::MachineExecutionEventsQuery,
-    ) -> Result<domain::MachineExecutionEventPage, Status> {
+    ) -> Result<domain::MachineExecutionEventPage, Error> {
         let query = request
             .execution
-            .ok_or_else(|| Status::invalid_argument("execution query absent"))?;
+            .ok_or_else(|| Error::validation("invalid_request", "execution query absent"))?;
         let mut record = self.query(actor, query.clone())?;
         if request.wait && !record.state.terminal() && record.revision <= request.after {
             let epoch = self.service.engine.activity_epoch();
@@ -820,7 +811,7 @@ impl MachineBackend for NativeBackend {
         let event = |sequence: u64,
                      kind: &str,
                      body: &Value|
-         -> Result<domain::MachineExecutionEvent, Status> {
+         -> Result<domain::MachineExecutionEvent, Error> {
             Ok(domain::MachineExecutionEvent {
                 sequence,
                 attempt_ordinal: attempt,
@@ -883,9 +874,9 @@ impl MachineBackend for NativeBackend {
         &self,
         actor: VerifiedActor,
         request: domain::MachineExecutionControl,
-    ) -> Result<domain::MachineExecutionState, Status> {
+    ) -> Result<domain::MachineExecutionState, Error> {
         let query = request.execution
-            .ok_or_else(|| Status::invalid_argument("execution query absent"))?;
+            .ok_or_else(|| Error::validation("invalid_request", "execution query absent"))?;
         if request.action == domain::MachineExecutionAction::Cancel as i32 {
             if query.expected_execution_workspace_id != self.workspace_id() {
                 return Err(refusal("execution_workspace_changed", "the requested execution journal is not this workspace"));
@@ -901,13 +892,13 @@ impl MachineBackend for NativeBackend {
             }
             return self.state(&canceled);
         }
-        Err(Status::invalid_argument("control names an action"))
+        Err(Error::validation("invalid_request", "control names an action"))
     }
     fn list(
         &self,
         actor: VerifiedActor,
         request: domain::MachineExecutionListQuery,
-    ) -> Result<domain::MachineExecutionList, Status> {
+    ) -> Result<domain::MachineExecutionList, Error> {
         let actor = actor_id(actor);
         let head_number = self.service.engine.actor_head(&actor).map_err(problem)?;
         let records = self
@@ -939,7 +930,7 @@ impl MachineBackend for NativeBackend {
             .map(|r| self.state(r))
             .collect::<Result<Vec<_>, _>>()?;
         if request.wait {
-            return Err(Status::unimplemented(
+            return Err(Error::not_found("capability_unavailable",
                 "list wait is not qualified by this build",
             ));
         }
@@ -953,32 +944,32 @@ impl MachineBackend for NativeBackend {
 pub fn actor_id(actor: VerifiedActor) -> String {
     sha256::hex(&actor.public_key)
 }
-fn canonical(value: &Value) -> Result<Vec<u8>, Status> {
+fn canonical(value: &Value) -> Result<Vec<u8>, Error> {
     serde_json_canonicalizer::to_vec(value)
-        .map_err(|_| Status::invalid_argument("JSON value is outside canonical profile"))
+        .map_err(|_| Error::validation("invalid_request", "JSON value is outside canonical profile"))
 }
-fn identity(value: &Value) -> Result<String, Status> {
+fn identity(value: &Value) -> Result<String, Error> {
     Ok(format!(
         "sha256:{}",
         sha256::hex(&sha256::digest(&canonical(value)?))
     ))
 }
-fn digest_bytes(value: &str) -> Result<Vec<u8>, Status> {
+fn digest_bytes(value: &str) -> Result<Vec<u8>, Error> {
     let value = value
         .strip_prefix("sha256:")
-        .ok_or_else(|| Status::data_loss("digest algorithm differs"))?;
+        .ok_or_else(|| Error::internal("custody_corrupt", "digest algorithm differs"))?;
     if value.len() != 64 {
-        return Err(Status::data_loss("digest length differs"));
+        return Err(Error::internal("custody_corrupt", "digest length differs"));
     }
     (0..32)
         .map(|i| {
             u8::from_str_radix(&value[2 * i..2 * i + 2], 16)
-                .map_err(|_| Status::data_loss("digest spelling differs"))
+                .map_err(|_| Error::internal("custody_corrupt", "digest spelling differs"))
         })
         .collect()
 }
 /// A callable's declaration.
-fn entrypoint<'a>(interface: &'a Value, name: &str) -> Result<&'a Value, Status> {
+fn entrypoint<'a>(interface: &'a Value, name: &str) -> Result<&'a Value, Error> {
     interface
         .get("entrypoints")
         .and_then(Value::as_array)
@@ -987,26 +978,22 @@ fn entrypoint<'a>(interface: &'a Value, name: &str) -> Result<&'a Value, Status>
                 .iter()
                 .find(|entry| entry.get("name").and_then(Value::as_str) == Some(name))
         })
-        .ok_or_else(|| Status::invalid_argument("entrypoint is not declared by this held package"))
+        .ok_or_else(|| Error::validation("invalid_request", "entrypoint is not declared by this held package"))
 }
-fn problem(error: io::Error) -> Status {
+fn problem(error: io::Error) -> Error {
     match error.kind() {
-        io::ErrorKind::NotFound => Status::not_found(error.to_string()),
-        io::ErrorKind::AlreadyExists => Status::already_exists(error.to_string()),
-        io::ErrorKind::InvalidInput => Status::invalid_argument(error.to_string()),
-        io::ErrorKind::PermissionDenied => Status::permission_denied(error.to_string()),
-        _ => Status::failed_precondition(error.to_string()),
+        io::ErrorKind::NotFound => Error::not_found("not_found", error.to_string()),
+        io::ErrorKind::AlreadyExists => Error::conflict("already_exists", error.to_string()),
+        io::ErrorKind::InvalidInput => Error::validation("invalid_request", error.to_string()),
+        io::ErrorKind::PermissionDenied => Error::forbidden("capability_scope", error.to_string()),
+        _ => Error::conflict("precondition_failed", error.to_string()),
     }
 }
-fn storage(error: impl std::fmt::Display) -> Status {
-    Status::failed_precondition(format!("native custody: {error}"))
+fn storage(error: impl std::fmt::Display) -> Error {
+    Error::conflict("precondition_failed", format!("native custody: {error}"))
 }
-fn refusal(code: &str, detail: &str) -> Status {
-    let mut status = Status::failed_precondition(detail.to_owned());
-    if let Ok(code) = code.parse() {
-        status.metadata_mut().insert("cozy-error-code", code);
-    }
-    status
+fn refusal(code: &str, detail: &str) -> Error {
+    crate::api::refused(code, detail)
 }
 type AssetSources = std::collections::HashMap<
     String,
@@ -1024,7 +1011,7 @@ fn rewrite_assets(
     index: u32,
     sources: &AssetSources,
     products: &mut Vec<domain::RunProduct>,
-) -> Result<(), Status> {
+) -> Result<(), Error> {
     if value.is_null() {
         return Ok(());
     }
@@ -1032,10 +1019,10 @@ fn rewrite_assets(
     if schema.get("asset").is_some() || schema["input"] == "tree" {
         let object = value
             .as_object_mut()
-            .ok_or_else(|| Status::data_loss("asset result differs from declared schema"))?;
+            .ok_or_else(|| Error::internal("custody_corrupt", "asset result differs from declared schema"))?;
         if let Some(reference) = object.get("asset_ref").and_then(Value::as_str) {
             let (artifact, mime, source) = sources.get(reference).ok_or_else(|| {
-                Status::failed_precondition(
+                Error::conflict("precondition_failed",
                     "executor did not provide native output binding for this asset",
                 )
             })?;
@@ -1056,17 +1043,17 @@ fn rewrite_assets(
                 ..Default::default()
             });
         } else {
-            return Err(Status::data_loss("declared asset has no reference"));
+            return Err(Error::internal("custody_corrupt", "declared asset has no reference"));
         }
     } else if let Some(fields) = schema.get("fields").and_then(Value::as_array) {
         let object = value
             .as_object_mut()
-            .ok_or_else(|| Status::data_loss("result record differs from declared schema"))?;
+            .ok_or_else(|| Error::internal("custody_corrupt", "result record differs from declared schema"))?;
         for field in fields {
             let name = field
                 .get("name")
                 .and_then(Value::as_str)
-                .ok_or_else(|| Status::data_loss("result field name absent"))?;
+                .ok_or_else(|| Error::internal("custody_corrupt", "result field name absent"))?;
             if let Some(child) = object.get_mut(name) {
                 let path = if path.is_empty() {
                     name.to_string()
@@ -1077,7 +1064,7 @@ fn rewrite_assets(
                     child,
                     field
                         .get("type")
-                        .ok_or_else(|| Status::data_loss("result field type absent"))?,
+                        .ok_or_else(|| Error::internal("custody_corrupt", "result field type absent"))?,
                     &path,
                     op,
                     index,
@@ -1089,7 +1076,7 @@ fn rewrite_assets(
     } else if let Some(element) = schema.get("list") {
         let items = value
             .as_array_mut()
-            .ok_or_else(|| Status::data_loss("result list differs from declared schema"))?;
+            .ok_or_else(|| Error::internal("custody_corrupt", "result list differs from declared schema"))?;
         for (position, child) in items.iter_mut().enumerate() {
             if element.get("asset").is_some() {
                 rewrite_assets(
@@ -1098,7 +1085,7 @@ fn rewrite_assets(
                     path,
                     domain::RunProductOp::Append,
                     position.try_into().map_err(|_| {
-                        Status::out_of_range("list output index is outside deployed protocol")
+                        Error::validation("out_of_range", "list output index is outside deployed protocol")
                     })?,
                     sources,
                     products,
@@ -1118,18 +1105,18 @@ fn rewrite_assets(
     }
     Ok(())
 }
-fn product_document(product: &domain::RunProduct) -> Result<Vec<u8>, Status> {
+fn product_document(product: &domain::RunProduct) -> Result<Vec<u8>, Error> {
     canonical(
         &crate::products::document(product)
-            .map_err(|_| Status::data_loss("product reference absent"))?,
+            .map_err(|_| Error::internal("custody_corrupt", "product reference absent"))?,
     )
 }
 
-fn output_entries(products: &[domain::RunProduct]) -> Result<Vec<Value>, Status> {
+fn output_entries(products: &[domain::RunProduct]) -> Result<Vec<Value>, Error> {
     let mut entries = std::collections::BTreeMap::new();
     for product in products {
         let document: Value = serde_json::from_slice(&product_document(product)?)
-            .map_err(|_| Status::internal("product document is invalid"))?;
+            .map_err(|_| Error::internal("internal", "product document is invalid"))?;
         let output_id = if product.op == domain::RunProductOp::Append as i32 {
             format!("{}[{}]", product.output, product.index)
         } else {
@@ -1143,7 +1130,7 @@ fn output_entries(products: &[domain::RunProduct]) -> Result<Vec<Value>, Status>
             "native_tree":document["source"]["source"]
         });
         if entries.insert(output_id, entry).is_some() {
-            return Err(Status::data_loss("output binding path is ambiguous"));
+            return Err(Error::internal("custody_corrupt", "output binding path is ambiguous"));
         }
     }
     Ok(entries.into_values().collect())
@@ -1673,7 +1660,7 @@ print(json.dumps({"identity": generation.identity}))
                 attempt_ordinal: 9,
             },
         );
-        assert_eq!(later.unwrap_err().code(), tonic::Code::NotFound);
+        assert_eq!(later.unwrap_err().code, "triage_not_found");
     }
 }
 

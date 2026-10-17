@@ -1,24 +1,24 @@
-//! Status on the real binary in machine mode: anyone gets identity and the sealed receipt (the
-//! bytes the Hub verifies); a machine cap gets the whole picture as it changes; an open stream is
-//! not activity and only `keepalive` moves the idle deadline.
+//! `GET /v1/status` on the real binary in machine mode: anyone gets identity and the sealed
+//! receipt (the bytes the Hub verifies); a machine cap gets the whole picture as it changes; an
+//! open stream is not activity and only `keepalive` moves the idle deadline.
 mod common;
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use tensord::api::{
-    capability::{self, Grant},
-    v1::{self, machine_client::MachineClient},
-};
 use ed25519_dalek::SigningKey;
 use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
+    sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tonic::{
-    metadata::MetadataValue,
-    transport::{Certificate, Channel, ClientTlsConfig, Endpoint},
-    Code, Request,
+use tensord::api::{
+    capability::{self, Grant},
+    v1::{
+        self,
+        client::Auth,
+    },
 };
+use tokio_stream::StreamExt;
 
 const WORKER: &str = "status-test";
 const OWNER: [u8; 32] = [33; 32];
@@ -38,6 +38,7 @@ fn boot(root: &Path, port: u16, lifetime: &str) -> Machine {
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
             .env("COZY_MACHINE_ROOT", root)
+            .env("HOME", root.join("home"))
             .env("COZY_WORKER_ID", WORKER)
             .env("COZY_WORKER_AUTH_TOKEN", URL_SAFE_NO_PAD.encode([1; 32]))
             .env("COZY_WORKER_INTERNAL_PORT", port.to_string())
@@ -52,7 +53,7 @@ fn boot(root: &Path, port: u16, lifetime: &str) -> Machine {
             )
             .env("TENSORHUB_ORIGIN", "https://hub.invalid")
             .env("CUDA_VISIBLE_DEVICES", "")
-            .env("COZY_MACHINE_LIFETIME", lifetime)
+            .arg(format!("--{lifetime}"))
             .envs(webrtc(lifetime))
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
@@ -109,15 +110,9 @@ fn cap(run: &str) -> String {
     capability::mint(&SigningKey::from_bytes(&OWNER), grant)
 }
 
-fn status(keepalive: bool, cap: Option<&str>) -> Request<v1::StatusRequest> {
-    let mut request = Request::new(v1::StatusRequest { keepalive });
-    if let Some(cap) = cap {
-        request.metadata_mut().insert(
-            "authorization",
-            MetadataValue::try_from(format!("Cozy-Cap {cap}")).unwrap(),
-        );
-    }
-    request
+/// The owner's client: a fresh machine cap on every request.
+fn owner() -> Auth {
+    Auth::Key { key: Arc::new(SigningKey::from_bytes(&OWNER)), worker: WORKER.into() }
 }
 
 /// The ledger's idle start plus the 15-minute window: the deadline of a rental that never ran a job.
@@ -145,23 +140,12 @@ async fn status_answers_identity_to_anyone_and_the_machine_to_its_owner() {
     tensord::held_models::fixture(&root.join("var/lib/tensorfs")).unwrap();
     let mut machine = boot(&root, port, "rental");
     let sealed = receipt(&mut machine, &root, port);
-    let pem = std::fs::read(root.join("run/cozy/bootstrap/tls.crt")).unwrap();
-    let channel: Channel = Endpoint::from_shared(format!("https://127.0.0.1:{port}"))
-        .unwrap()
-        .tls_config(
-            ClientTlsConfig::new()
-                .ca_certificate(Certificate::from_pem(&pem))
-                .domain_name("cozy-worker"),
-        )
-        .unwrap()
-        .connect()
-        .await
-        .unwrap();
-    let mut client = MachineClient::new(channel);
+    let client = common::client(&root, port, Auth::None);
     let boot_id = std::fs::read_to_string(root.join("var/lib/cozy/machine/boot-id")).unwrap();
 
     // The readiness proof's observation can fail: a key this machine admits is not refused.
-    let leaf = String::from_utf8(pem.clone()).unwrap();
+    let pem = std::fs::read(root.join("run/cozy/bootstrap/tls.crt")).unwrap();
+    let leaf = rustls_pemfile::certs(&mut &pem[..]).next().unwrap().unwrap();
     for (key, refused) in [(OWNER, false), ([9; 32], true)] {
         let key = SigningKey::from_bytes(&key);
         assert_eq!(
@@ -170,19 +154,9 @@ async fn status_answers_identity_to_anyone_and_the_machine_to_its_owner() {
         );
     }
 
-    // No cap (the Hub's readiness read) and a run-scope cap: one identity frame, then the end.
-    for cap in [None, Some(cap("some-run"))] {
-        let mut frames = client
-            .status(status(false, cap.as_deref()))
-            .await
-            .unwrap()
-            .into_inner();
-        let only = frames.message().await.unwrap().expect("an identity frame");
-        assert_eq!(
-            frames.message().await.unwrap(),
-            None,
-            "identity is one frame"
-        );
+    // No cap (the Hub's readiness read) and a run-scope cap: one identity frame.
+    for auth in [Auth::None, Auth::Token(cap("some-run"))] {
+        let only = client.with_auth(auth).status().await.unwrap();
         assert_eq!(
             (only.worker_id.as_str(), only.boot_id.as_str()),
             (WORKER, boot_id.as_str())
@@ -192,21 +166,15 @@ async fn status_answers_identity_to_anyone_and_the_machine_to_its_owner() {
         assert!(only.runs.is_empty() && only.gpus.is_empty() && only.idle_deadline_unix_ms == 0);
         assert!(only.models.is_empty() && only.models_bytes == 0);
     }
-    let refused = client.status(status(true, None)).await.unwrap_err();
-    assert_eq!(
-        refused.code(),
-        Code::PermissionDenied,
-        "keepalive needs a machine cap"
-    );
+    let refused = client.with_auth(Auth::Token(cap("some-run"))).keepalive().await.unwrap_err();
+    assert_eq!(refused.status(), Some(403), "keepalive needs a machine cap");
+    let refused = client.keepalive().await.unwrap_err();
+    assert_eq!(refused.status(), Some(401), "keepalive needs a cap");
 
     // A machine cap streams the machine.
-    let owner = cap("");
-    let mut held = client
-        .status(status(false, Some(&owner)))
-        .await
-        .unwrap()
-        .into_inner();
-    let first = held.message().await.unwrap().unwrap();
+    let client = client.with_auth(owner());
+    let mut held = Box::pin(client.watch().await.unwrap());
+    let first = held.next().await.unwrap().unwrap();
     assert_eq!(first.receipt, sealed);
     assert_eq!(first.phase, "ready");
     assert!(first.idle_deadline_unix_ms > 0);
@@ -235,33 +203,28 @@ async fn status_answers_identity_to_anyone_and_the_machine_to_its_owner() {
     // Holding the stream is not activity: no frame, and the ledger's deadline does not move.
     let before = deadline_on_disk(&root);
     assert_eq!(before, first.idle_deadline_unix_ms);
-    let quiet = tokio::time::timeout(Duration::from_millis(2500), held.message()).await;
+    let quiet = tokio::time::timeout(Duration::from_millis(2500), held.next()).await;
     assert!(
         quiet.is_err(),
         "nothing changed, so nothing is sent: {quiet:?}"
     );
     assert_eq!(deadline_on_disk(&root), before);
 
-    // One keepalive resets the deadline; its first frame carries it and the held stream sees it.
-    let mut renewed = client
-        .status(status(true, Some(&owner)))
-        .await
-        .unwrap()
-        .into_inner();
-    let reset = renewed.message().await.unwrap().unwrap();
+    // One keepalive resets the deadline; its frame carries it and the held stream sees it.
+    let reset = client.keepalive().await.unwrap();
     assert!(
         reset.idle_deadline_unix_ms > before,
         "{} > {before}",
         reset.idle_deadline_unix_ms
     );
     assert_eq!(deadline_on_disk(&root), reset.idle_deadline_unix_ms);
-    let changed = tokio::time::timeout(Duration::from_secs(5), held.message())
+    let changed = tokio::time::timeout(Duration::from_secs(5), held.next())
         .await
         .expect("the held stream sends the change")
         .unwrap()
         .unwrap();
     assert_eq!(changed.idle_deadline_unix_ms, reset.idle_deadline_unix_ms);
-    drop((held, renewed));
+    drop(held);
     drop(machine);
     std::fs::remove_dir_all(&root).unwrap();
 }
@@ -280,46 +243,12 @@ async fn a_persistent_machine_reports_no_idle_deadline() {
         .local_addr()
         .unwrap()
         .port();
-    // The root's own uv, as an image or a local install provides it: the machine makes its
-    // installer helper with it from the client it embeds.
-    let uv = std::env::split_paths(&std::env::var_os("PATH").unwrap())
-        .map(|dir| dir.join("uv"))
-        .find(|path| path.is_file())
-        .expect("uv is required");
-    std::fs::create_dir_all(root.join("usr/local/bin")).unwrap();
-    std::os::unix::fs::symlink(&uv, root.join("usr/local/bin/uv")).unwrap();
     let mut machine = boot(&root, port, "persistent");
     receipt(&mut machine, &root, port);
-    let helper = root.join("var/lib/cozy/tensord/helper/bin/python");
-    let imported = Command::new(&helper)
-        .args(["-c", "import tensord_client.packages, packaging"])
-        .status()
-        .unwrap();
-    assert!(
-        imported.success(),
-        "the installer helper holds the embedded client"
-    );
-    let pem = std::fs::read(root.join("run/cozy/bootstrap/tls.crt")).unwrap();
-    let channel = Endpoint::from_shared(format!("https://127.0.0.1:{port}"))
-        .unwrap()
-        .tls_config(
-            ClientTlsConfig::new()
-                .ca_certificate(Certificate::from_pem(pem))
-                .domain_name("cozy-worker"),
-        )
-        .unwrap()
-        .connect()
-        .await
-        .unwrap();
-    let mut client = MachineClient::new(channel);
-    let owner = cap("");
-    for keepalive in [false, true] {
-        let mut frames = client
-            .status(status(keepalive, Some(&owner)))
-            .await
-            .unwrap()
-            .into_inner();
-        let frame = frames.message().await.unwrap().unwrap();
+    // Its installer helper (and the uv it needs) is made at the first install, not at boot.
+    assert!(!root.join("var/lib/cozy/tensord/helper").exists());
+    let client = common::client(&root, port, owner());
+    for frame in [client.status().await.unwrap(), client.keepalive().await.unwrap()] {
         assert_eq!(
             (frame.phase.as_str(), frame.idle_deadline_unix_ms),
             ("ready", 0)
@@ -328,8 +257,7 @@ async fn a_persistent_machine_reports_no_idle_deadline() {
     // It plays to browsers directly: Status names its WebRTC listener, an address of it that
     // accepts connections, and the certificate its DTLS presents.
     let player = |frame: v1::StatusFrame| frame.webrtc.expect("a persistent machine listens for players");
-    let first = client.status(status(false, Some(&owner))).await.unwrap().into_inner().message().await;
-    let webrtc = player(first.unwrap().unwrap());
+    let webrtc = player(client.status().await.unwrap());
     let local = format!("127.0.0.1:{}", webrtc.port);
     assert!(webrtc.addresses.contains(&local), "{:?}", webrtc.addresses);
     std::net::TcpStream::connect(&local).unwrap();
@@ -340,11 +268,8 @@ async fn a_persistent_machine_reports_no_idle_deadline() {
     drop(machine);
     let mut machine = boot(&root, port, "persistent");
     receipt(&mut machine, &root, port);
-    let pem = std::fs::read(root.join("run/cozy/bootstrap/tls.crt")).unwrap();
-    let tls = ClientTlsConfig::new().ca_certificate(Certificate::from_pem(pem)).domain_name("cozy-worker");
-    let channel = Endpoint::from_shared(format!("https://127.0.0.1:{port}")).unwrap().tls_config(tls).unwrap().connect().await.unwrap();
-    let again = MachineClient::new(channel).status(status(false, Some(&owner))).await.unwrap().into_inner().message().await;
-    assert_eq!(player(again.unwrap().unwrap()).port, webrtc.port);
+    let again = common::client(&root, port, owner()).status().await.unwrap();
+    assert_eq!(player(again).port, webrtc.port);
     drop(machine);
     std::fs::remove_dir_all(&root).unwrap();
 }

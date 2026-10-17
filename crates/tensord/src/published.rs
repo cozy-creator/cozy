@@ -1155,11 +1155,12 @@ impl Publisher {
     /// past its measured patience (`process::supervise`).
     fn uv_observed(&self, args: &[&str], env: &[(&str, &std::ffi::OsStr)], stop: Option<&PullCancellation>,
         read: &(dyn Fn(u64) + Sync)) -> Result<(), Failure> {
+        crate::machine::client::ensure_uv(&self.sdk.uv).map_err(|e| ("uv_unavailable", e.to_string()))?;
         let mut command = Command::new(&self.sdk.uv);
         command.args(args).env_clear().envs(env.iter().copied()).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
         command.process_group(0);
         for name in ["PATH", "SSL_CERT_FILE", "SSL_CERT_DIR", "LANG"] {
-            if let Some(value) = std::env::var_os(name) {
+            if let Some(value) = cozy_proto::config::environment().get(name) {
                 command.env(name, value);
             }
         }
@@ -2338,7 +2339,7 @@ mod tests {
         let file = named.file_name().unwrap().to_string_lossy().to_string();
         let (digest, _) = updates.stage(&file, &mut File::open(&named).unwrap()).unwrap();
         let runtime = Some(Choice { file, sha256: digest.clone(), ..Default::default() });
-        let request = Request { operation: "dev".into(), agent: "explicit".into(), pin: None, runtime, tensorfs: None };
+        let request = Request { operation: "dev".into(), pin: None, runtime, tensorfs: None };
         updates.request(request, |_| ()).unwrap();
         loop {
             let status = updates.update("dev").unwrap();

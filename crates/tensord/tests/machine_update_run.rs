@@ -1,12 +1,10 @@
-//! `Run kind: update` on the real binary in machine mode: wheels the machine holds as objects are
-//! staged, verified and activated in place (same boot, same receipt, the stable parent runs the
-//! new service); the client attaches again across the restart and reads the outcome. A
+//! Runs of `kind: update` on the real binary in machine mode: wheels the machine holds as objects
+//! are staged, verified and activated in place (same boot, same receipt, the stable parent runs
+//! the new service); the client follows the events again across the restart and reads the outcome. A
 //! candidate whose service never proves readiness ends FAILED, rolled back.
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use tensord::api::{
-    capability::{self, Grant},
-    v1::{self, machine_client::MachineClient},
-};
+mod common;
+
 use ed25519_dalek::SigningKey;
 use std::{
     io::Write,
@@ -14,11 +12,14 @@ use std::{
     process::{Child, Command, Stdio},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tonic::{
-    metadata::MetadataValue,
-    transport::{Certificate, ClientTlsConfig, Endpoint},
-    Code, Request,
+use tensord::api::{
+    capability::{self, Grant},
+    v1::{
+        self,
+        client::{Auth, Machine as Client},
+    },
 };
+use tokio_stream::StreamExt;
 
 const WORKER: &str = "update-run-test";
 const OWNER: [u8; 32] = [5; 32];
@@ -32,6 +33,11 @@ impl Drop for Machine {
 }
 
 fn wheel(distribution: &str, version: &str, script: Option<&[u8]>) -> (String, Vec<u8>) {
+    requiring(distribution, version, script, "")
+}
+
+/// `wheel`, its METADATA requiring `requires` (`Requires-Dist:` lines).
+fn requiring(distribution: &str, version: &str, script: Option<&[u8]>, requires: &str) -> (String, Vec<u8>) {
     let name = format!("{distribution}-{version}-py3-none-any.whl");
     let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
     let options = zip::write::SimpleFileOptions::default();
@@ -41,7 +47,7 @@ fn wheel(distribution: &str, version: &str, script: Option<&[u8]>) -> (String, V
     )
     .unwrap();
     let metadata = format!(
-        "Name: {}\nVersion: {version}\n",
+        "Name: {}\nVersion: {version}\n{requires}",
         distribution.replace('_', "-")
     );
     zip.write_all(metadata.as_bytes()).unwrap();
@@ -56,7 +62,7 @@ fn wheel(distribution: &str, version: &str, script: Option<&[u8]>) -> (String, V
     (name, zip.finish().unwrap().into_inner())
 }
 
-/// Puts `bytes` into the machine's store and records them as the owner's, as Write leaves an
+/// Puts `bytes` into the machine's store and records them as the owner's, as an upload leaves an
 /// object; answers its digest.
 fn hold(root: &Path, bytes: &[u8]) -> String {
     let engine = root.join("var/lib/cozy/tensord");
@@ -97,42 +103,17 @@ fn cap(action: &str) -> String {
     capability::mint(&SigningKey::from_bytes(&OWNER), grant)
 }
 
-fn authorized<T>(message: T, cap: &str) -> Request<T> {
-    let mut request = Request::new(message);
-    request.metadata_mut().insert(
-        "authorization",
-        MetadataValue::try_from(format!("Cozy-Cap {cap}")).unwrap(),
-    );
-    request
-}
-
-/// A fresh connection, pinned to the machine's leaf, once the service answers Status.
-async fn client(root: &Path, port: u16) -> MachineClient<tonic::transport::Channel> {
+/// A client pinned to the machine's leaf, authorized by `cap`, once the service answers its
+/// owner's Status ready.
+async fn client(root: &Path, port: u16, cap: &str) -> Client {
     let start = Instant::now();
     loop {
-        if let Ok(pem) = std::fs::read(root.join("run/cozy/bootstrap/tls.crt")) {
-            let tls = ClientTlsConfig::new()
-                .ca_certificate(Certificate::from_pem(pem))
-                .domain_name("cozy-worker");
-            let endpoint = Endpoint::from_shared(format!("https://127.0.0.1:{port}"))
-                .unwrap()
-                .tls_config(tls)
-                .unwrap();
-            if let Ok(channel) = endpoint.connect().await {
-                let mut client = MachineClient::new(channel);
-                let ready = client
-                    .status(authorized(
-                        v1::StatusRequest::default(),
-                        &cap(capability::MACHINE),
-                    ))
-                    .await;
-                if let Ok(mut frames) = ready.map(|r| r.into_inner()) {
-                    if let Ok(Some(frame)) = frames.message().await {
-                        if frame.phase == "ready" {
-                            return client;
-                        }
-                    }
-                }
+        let owner = Auth::Token(self::cap(capability::MACHINE));
+        if let Some(client) = common::pin(root)
+            .and_then(|pin| Client::new(&format!("127.0.0.1:{port}"), pin, owner).ok())
+        {
+            if client.status().await.is_ok_and(|frame| frame.phase == "ready") {
+                return client.with_auth(Auth::Token(cap.into()));
             }
         }
         assert!(
@@ -144,10 +125,7 @@ async fn client(root: &Path, port: u16) -> MachineClient<tonic::transport::Chann
 }
 
 async fn status(root: &Path, port: u16) -> v1::StatusFrame {
-    let mut client = client(root, port).await;
-    let request = authorized(v1::StatusRequest::default(), &cap(capability::MACHINE));
-    let mut frames = client.status(request).await.unwrap().into_inner();
-    frames.message().await.unwrap().unwrap()
+    client(root, port, &cap(capability::MACHINE)).await.status().await.unwrap()
 }
 
 /// Submits (or attaches to) update `id` and follows its log across restarts to the outcome.
@@ -155,20 +133,15 @@ async fn update(root: &Path, port: u16, id: &str, spec: Option<v1::RunSpec>) -> 
     let (mut log, mut spec) = (Vec::<v1::RunEvent>::new(), spec);
     loop {
         let after = log.iter().map(|e| e.sequence).max().unwrap_or(0);
-        let mut client = client(root, port).await;
-        let request = v1::RunRequest {
-            id: id.into(),
-            after,
-            spec: spec.take(),
-        };
-        let mut events = client
-            .run(authorized(request, &cap(capability::MACHINE)))
-            .await
-            .unwrap()
-            .into_inner();
+        let client = client(root, port, &cap(capability::MACHINE)).await;
+        if let Some(spec) = spec.take() {
+            client.submit(&v1::RunRequest { id: id.into(), spec }).await.unwrap();
+        }
+        let Ok(events) = client.events(id, after).await else { continue };
+        let mut events = Box::pin(events);
         // The stream breaks when the service restarts onto the candidate; attach again.
-        while let Ok(Some(event)) = events.message().await {
-            let outcome = matches!(event.event, Some(v1::run_event::Event::Outcome(_)));
+        while let Some(Ok(event)) = events.next().await {
+            let outcome = matches!(event.event, v1::Event::Outcome(_));
             log.push(event);
             if outcome {
                 return log;
@@ -178,15 +151,15 @@ async fn update(root: &Path, port: u16, id: &str, spec: Option<v1::RunSpec>) -> 
 }
 
 fn outcome(log: &[v1::RunEvent]) -> v1::Outcome {
-    match log.last().and_then(|e| e.event.clone()) {
-        Some(v1::run_event::Event::Outcome(outcome)) => outcome,
+    match log.last().map(|e| e.event.clone()) {
+        Some(v1::Event::Outcome(outcome)) => outcome,
         other => panic!("no outcome: {other:?} in {log:?}"),
     }
 }
 
 fn spec(runtime: (&str, &str), tensorfs: (&str, &str)) -> v1::RunSpec {
     let payload = serde_json::json!({
-        "runtime": runtime.0, "tensorfs": tensorfs.0, "agent": "bundled", "note": "ignored",
+        "runtime": runtime.0, "tensorfs": tensorfs.0, "note": "ignored",
     });
     let input = |field: &str, digest: &str| v1::InputFile {
         field: field.into(),
@@ -194,8 +167,8 @@ fn spec(runtime: (&str, &str), tensorfs: (&str, &str)) -> v1::RunSpec {
         ..Default::default()
     };
     v1::RunSpec {
-        kind: v1::RunKind::Update as i32,
-        payload: serde_json::to_vec(&payload).unwrap(),
+        kind: v1::RunKind::Update,
+        payload: v1::Json::parse(payload.to_string()).ok(),
         inputs: vec![input("runtime", runtime.1), input("tensorfs", tensorfs.1)],
         ..Default::default()
     }
@@ -212,8 +185,11 @@ fn service_cmdline(parent: u32) -> String {
         .unwrap_or_default()
 }
 
+/// An update installs a Runtime/TensorFS pair and restarts the service on the machine's own
+/// binary: a `tensord` a Runtime wheel still bundles is never run (the binary moves only with the
+/// `cozy` release). A pair that does not resolve ends the update failed and changes nothing.
 #[tokio::test]
-async fn an_update_run_activates_in_place_and_a_failing_candidate_ends_failed() {
+async fn an_update_run_installs_its_pair_in_place_and_an_unresolvable_one_ends_failed() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("target/machine-update-run")
         .join(std::process::id().to_string());
@@ -226,14 +202,14 @@ async fn an_update_run_activates_in_place_and_a_failing_candidate_ends_failed() 
     ] {
         std::fs::write(image.join(name), bytes).unwrap();
     }
-    let this_machine = std::fs::read(env!("CARGO_BIN_EXE_tensord")).unwrap();
-    let (runtime, runtime_bytes) = wheel("cozy_runtime", "0.18.103", Some(&this_machine));
+    // A tensord this machine must never become: run, it would end the service.
+    let bundled = b"#!/bin/sh\n[ \"$1\" = version ] && echo '{\"name\":\"tensord\"}' && exit 0\nexit 3\n";
+    let (runtime, runtime_bytes) = wheel("cozy_runtime", "0.18.103", Some(bundled));
     let (tensorfs, tensorfs_bytes) = wheel("tensorfs", "0.3.94", None);
-    let broken = b"#!/bin/sh\n[ \"$1\" = version ] && echo '{\"name\":\"tensord\"}' && exit 0\nexit 3\n";
-    let (failing, failing_bytes) = wheel("cozy_runtime", "0.18.104", Some(broken));
-    // The running version rebuilt: other bytes (trailing data an ELF ignores), the same label.
-    let rebuilt_machine = [this_machine.as_slice(), b"\0rebuilt"].concat();
-    let (rebuilt, rebuilt_bytes) = wheel("cozy_runtime", "0.18.103", Some(&rebuilt_machine));
+    let (failing, failing_bytes) =
+        requiring("cozy_runtime", "0.18.104", None, "Requires-Dist: cozy-no-such-distribution==0\n");
+    // The running version rebuilt: other bytes, the same label.
+    let (rebuilt, rebuilt_bytes) = wheel("cozy_runtime", "0.18.103", Some(b"rebuilt"));
     let (runtime_digest, tensorfs_digest, failing_digest, rebuilt_digest) = (
         hold(&root, &runtime_bytes),
         hold(&root, &tensorfs_bytes),
@@ -254,20 +230,16 @@ async fn an_update_run_activates_in_place_and_a_failing_candidate_ends_failed() 
     assert!(before.capabilities.contains(&"update/1".to_string()));
 
     // A run-scope cap cannot update; a machine cap can.
-    let mut refused = client(&root, port).await;
+    let refused = client(&root, port, &cap("")).await;
     let request = v1::RunRequest {
         id: "up-1".into(),
-        after: 0,
-        spec: Some(spec(
+        spec: spec(
             (&runtime, &runtime_digest),
             (&tensorfs, &tensorfs_digest),
-        )),
+        ),
     };
-    let denied = refused
-        .run(authorized(request, &cap("")))
-        .await
-        .unwrap_err();
-    assert_eq!(denied.code(), Code::PermissionDenied);
+    let denied = refused.submit(&request).await.unwrap_err();
+    assert_eq!(denied.status(), Some(403));
 
     let log = update(
         &root,
@@ -281,13 +253,13 @@ async fn an_update_run_activates_in_place_and_a_failing_candidate_ends_failed() 
     .await;
     let done = outcome(&log);
     assert_eq!(done.status, "succeeded", "{log:?}");
-    let result: serde_json::Value = serde_json::from_slice(&done.result).unwrap();
+    let result: serde_json::Value = serde_json::from_str(done.result.as_ref().unwrap().get()).unwrap();
     assert_eq!((result["to"]["runtime"].as_str(), result["to"]["tensorfs"].as_str()), (Some("0.18.103"), Some("0.3.94")));
     assert_eq!(result["to"]["runtime_sha256"], runtime_digest.trim_start_matches("sha256:"));
     let stages: Vec<_> = log
         .iter()
         .filter_map(|e| match &e.event {
-            Some(v1::run_event::Event::Progress(p)) => Some(p.stage.as_str()),
+            v1::Event::Progress(p) => Some(p.stage.as_str()),
             _ => None,
         })
         .collect();
@@ -305,8 +277,8 @@ async fn an_update_run_activates_in_place_and_a_failing_candidate_ends_failed() 
         (before.boot_id.as_str(), before.receipt.as_slice())
     );
     assert!(
-        service_cmdline(machine.0.id()).contains("agent/current service"),
-        "the parent runs the activated binary"
+        !service_cmdline(machine.0.id()).contains("agent/current"),
+        "the service runs the machine's own binary, never the wheel's"
     );
 
     // The same id again attaches to the finished update; nothing runs twice.
@@ -322,7 +294,7 @@ async fn an_update_run_activates_in_place_and_a_failing_candidate_ends_failed() 
     .await;
     assert_eq!(outcome(&again), done);
 
-    // A candidate whose service never proves readiness: FAILED, rolled back, still serving.
+    // A pair that does not resolve together: FAILED before anything changes, still serving.
     let log = update(
         &root,
         port,
@@ -335,11 +307,11 @@ async fn an_update_run_activates_in_place_and_a_failing_candidate_ends_failed() 
     .await;
     let failed = outcome(&log);
     assert_eq!(failed.status, "failed", "{log:?}");
-    assert_eq!(failed.reason.unwrap().code, "update_rolled_back");
+    assert_eq!(failed.reason.unwrap().code, "update_failed");
     assert_eq!(status(&root, port).await.runtime, "0.18.103");
     assert!(
         machine.0.try_wait().unwrap().is_none(),
-        "the machine keeps running after a rollback"
+        "the machine keeps running after a failed update"
     );
 
     // A wheel rebuilt at the running version is installed: compared by bytes, never by label.
@@ -347,7 +319,7 @@ async fn an_update_run_activates_in_place_and_a_failing_candidate_ends_failed() 
     let stages = |log: &[v1::RunEvent]| -> Vec<String> {
         log.iter()
             .filter_map(|e| match &e.event {
-                Some(v1::run_event::Event::Progress(p)) => Some(p.stage.clone()),
+                v1::Event::Progress(p) => Some(p.stage.clone()),
                 _ => None,
             })
             .collect()
@@ -356,7 +328,7 @@ async fn an_update_run_activates_in_place_and_a_failing_candidate_ends_failed() 
         let log = update(&root, port, id, Some(spec((&rebuilt, &rebuilt_digest), (&tensorfs, &tensorfs_digest)))).await;
         let done = outcome(&log);
         assert_eq!(done.status, "succeeded", "{log:?}");
-        let result: serde_json::Value = serde_json::from_slice(&done.result).unwrap();
+        let result: serde_json::Value = serde_json::from_str(done.result.as_ref().unwrap().get()).unwrap();
         assert_eq!((result["from"]["runtime"].as_str(), result["to"]["runtime"].as_str()), (Some("0.18.103"), Some("0.18.103")));
         assert_eq!(result["to"]["runtime_sha256"], rebuilt_digest.trim_start_matches("sha256:"));
         assert_eq!(result["from"] != result["to"], installs, "{id}: {result}");
@@ -364,24 +336,22 @@ async fn an_update_run_activates_in_place_and_a_failing_candidate_ends_failed() 
     }
 
     // Stopped and launched again: `cozy machine disable` / `enable` on this computer (a persistent
-    // machine), then a rental's pod restarted. Each launch proves itself under a new key, which
-    // the parent hands to the updated service it runs.
+    // machine), then a rental's pod restarted. Each launch proves itself under a new key and keeps
+    // the installed pair.
     for (persistent, key) in [(true, [8; 32]), (true, [9; 32]), (false, [10; 32])] {
         stop(&mut machine);
         std::fs::remove_file(root.join("run/cozy/bootstrap/readiness-envelope.json")).unwrap();
         machine = launch(&root, port, Some(key), persistent);
         let frame = status(&root, port).await;
         assert_eq!(frame.runtime, "0.18.103");
-        assert!(
-            service_cmdline(machine.0.id()).contains("agent/current service"),
-            "the launch runs the activated binary"
-        );
+        assert!(!service_cmdline(machine.0.id()).contains("agent/current"), "the launch runs its own binary");
     }
 
-    // A launch that cannot prove its boot ends, with a status, instead of serving unready.
+    // A rental's launch that cannot prove its boot to its Hub ends, with a status, instead of
+    // serving unready. (This computer's machine seals its readiness unsigned.)
     stop(&mut machine);
     std::fs::remove_file(root.join("run/cozy/bootstrap/readiness-envelope.json")).unwrap();
-    let mut unprovable = launch(&root, port, None, true);
+    let mut unprovable = launch(&root, port, None, false);
     let ended = unprovable.0.wait().unwrap();
     assert!(!ended.success(), "an unprovable launch ended {ended}");
     std::fs::remove_dir_all(&root).unwrap();
@@ -403,6 +373,7 @@ fn launch(root: &Path, port: u16, key: Option<[u8; 32]>, persistent: bool) -> Ma
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
         .env("COZY_MACHINE_ROOT", root)
+            .env("HOME", root.join("home"))
         .env("COZY_WORKER_ID", WORKER)
         .env("COZY_WORKER_AUTH_TOKEN", URL_SAFE_NO_PAD.encode([1; 32]))
         .env("COZY_WORKER_INTERNAL_PORT", port.to_string())
@@ -416,7 +387,7 @@ fn launch(root: &Path, port: u16, key: Option<[u8; 32]>, persistent: bool) -> Ma
         .stdout(Stdio::null())
         .stderr(Stdio::inherit());
     if persistent {
-        command.env("COZY_MACHINE_LIFETIME", "persistent");
+        command.arg("--persistent");
     }
     if let Some(key) = key {
         command.env(

@@ -90,11 +90,11 @@ pub fn wheel_at(
     };
     // A private server's root as uv trusts it: each certificate of the bundle SSL_CERT_FILE
     // names. Only this fetch reads it; the Hub's clients trust their own CA alone.
-    if let Some(bundle) = std::env::var_os("SSL_CERT_FILE") {
-        let pem = fs::read_to_string(&bundle).unwrap_or_default();
+    if let Some(bundle) = cozy_proto::config::environment().get("SSL_CERT_FILE") {
+        let pem = fs::read_to_string(bundle).unwrap_or_default();
         let certificates = pem.split_inclusive("-----END CERTIFICATE-----");
         if certificates.filter(|c| transport::trust_roots(c.as_bytes()).is_ok()).count() == 0 {
-            tracing::warn!("SSL_CERT_FILE {} holds no certificate", bundle.to_string_lossy());
+            tracing::warn!("SSL_CERT_FILE {bundle} holds no certificate");
         }
     }
     let ledger = Ledger::new().with_cancellation(stop.clone());

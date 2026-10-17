@@ -1,5 +1,5 @@
-use tensord::published::PackageSdk;
-use tensord::machine::update::Paths;
+use crate::published::PackageSdk;
+use crate::machine::update::Paths;
 use std::{fs, os::unix::fs::symlink, path::Path};
 
 const RUNTIME: &str = "cozy_runtime-0.21.1-py3-none-any.whl";
@@ -91,7 +91,7 @@ fn image_sdk_selection_preserves_baked_and_absent_pair_behavior() {
 #[test]
 #[ignore = "requires COZY_SDK_TEST_RUNTIME_A/B, COZY_SDK_TEST_TENSORFS, COZY_SDK_TEST_REPORT and cached offline uv dependencies"]
 fn same_filename_activation_installs_new_runtime_and_retains_old_generation() {
-    use tensord::{
+    use crate::{
         api::install::InstallerConfig, local_source::LocalSources, machine::client,
         objects::Objects, service::Service,
     };
@@ -135,11 +135,7 @@ fn same_filename_activation_installs_new_runtime_and_retains_old_generation() {
     );
     let write = |bytes: &[u8]| {
         let digest = format!("sha256:{}", sha256::hex_digest(bytes));
-        let mut writer = objects
-            .begin("alice", &digest, bytes.len() as u64, 0)
-            .unwrap();
-        writer.append(bytes).unwrap();
-        writer.finish().unwrap();
+        objects.write("alice", &digest, bytes).unwrap();
         serde_json::json!({"digest":digest,"length":bytes.len()})
     };
     let mut archive = tar::Builder::new(Vec::new());
@@ -162,11 +158,12 @@ fn same_filename_activation_installs_new_runtime_and_retains_old_generation() {
     );
     let manifest = manifest["digest"].as_str().unwrap();
     let selected = || PackageSdk::selected(&paths.sdk(), &root, "uv".into());
-    let local = |sdk: &tensord::published::PackageSdk| {
+    let local = |sdk: &crate::published::PackageSdk| {
         LocalSources::new(
             objects.clone(),
             InstallerConfig {
                 helper_python: helper.clone(),
+                helper_engine: None,
                 python: "3.12".into(),
                 generations: generations.clone(),
                 client_wheel: client.clone(),
@@ -192,11 +189,11 @@ fn same_filename_activation_installs_new_runtime_and_retains_old_generation() {
     };
     let old_sdk = selected();
     let old_sources = local(&old_sdk);
-    let old = old_sources.install(&service, "alice", manifest, None).unwrap();
+    let old = old_sources.install(&service, "alice", manifest, None, &|_| ()).unwrap();
     let old_provenance = provenance(&old.generation);
     assert_eq!(
         old_sources
-            .install(&service, "alice", manifest, None)
+            .install(&service, "alice", manifest, None, &|_| ())
             .unwrap()
             .generation,
         old.generation
@@ -206,7 +203,7 @@ fn same_filename_activation_installs_new_runtime_and_retains_old_generation() {
     fs::rename(next, &link).unwrap();
     let new_sdk = selected();
     let new_sources = local(&new_sdk);
-    let new = new_sources.install(&service, "alice", manifest, None).unwrap();
+    let new = new_sources.install(&service, "alice", manifest, None, &|_| ()).unwrap();
     assert_ne!(
         old.alias, new.alias,
         "new SDK activation reopened the old local alias"
@@ -230,7 +227,7 @@ fn same_filename_activation_installs_new_runtime_and_retains_old_generation() {
     );
     assert_eq!(
         new_sources
-            .install(&service, "alice", manifest, None)
+            .install(&service, "alice", manifest, None, &|_| ())
             .unwrap()
             .generation,
         new.generation
