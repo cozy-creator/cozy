@@ -31,6 +31,8 @@ pub struct MachineIdentity {
     pub(crate) webrtc_port: Option<u16>,
     /// The store's directory; Status reports its filesystem. None on development front doors.
     pub store: Option<std::path::PathBuf>,
+    /// The GPUs this boot measured, which its readiness receipt names.
+    pub gpus: Vec<receipt::Gpu>,
 }
 
 impl MachineIdentity {
@@ -62,6 +64,7 @@ impl MachineIdentity {
             hubs: vec![],
             updates: None,
             store: None,
+            gpus: vec![],
             webrtc: None,
             player: Default::default(),
             webrtc_port: None,
@@ -142,6 +145,7 @@ struct MeasuredIdentity {
     cert_der: Vec<u8>,
     webrtc_port: Option<u16>,
     capabilities: Vec<String>,
+    gpus: Vec<receipt::Gpu>,
 }
 impl MeasuredIdentity {
     fn of(identity: &MachineIdentity) -> Self {
@@ -152,6 +156,7 @@ impl MeasuredIdentity {
             cert_der: identity.cert_der.clone(),
             webrtc_port: None,
             capabilities: super::machine_status::capabilities(identity),
+            gpus: identity.gpus.clone(),
         }
     }
 }
@@ -163,26 +168,22 @@ async fn prove_readiness(port: u16, readiness: Arc<Readiness>, id: MeasuredIdent
     let foreign_credential_refused =
         crate::machine::probe::refuses_foreign_capability(port, &id.cert_pem, &id.worker_id).await;
     let gpus = match readiness.measures_gpus() {
-        false => Ok(vec![]),
-        true => tokio::task::spawn_blocking(receipt::gpus)
-            .await
-            .unwrap_or_else(|e| Err(std::io::Error::other(e))),
+        false => vec![],
+        true => id.gpus,
     };
-    let result = gpus.and_then(|gpus| {
-        readiness.seal(
-            receipt::Measured {
-                boot_id: &id.boot_id,
-                worker_port: port,
-                cert_der: &id.cert_der,
-                gpus,
-                listener_bound,
-                foreign_credential_refused,
-                capabilities: id.capabilities,
-                webrtc_port: id.webrtc_port,
-            }
-            .payload(),
-        )
-    });
+    let result = readiness.seal(
+        receipt::Measured {
+            boot_id: &id.boot_id,
+            worker_port: port,
+            cert_der: &id.cert_der,
+            gpus,
+            listener_bound,
+            foreign_credential_refused,
+            capabilities: id.capabilities,
+            webrtc_port: id.webrtc_port,
+        }
+        .payload(),
+    );
     match result {
         Ok(true) => tracing::info!("readiness sealed (listener {listener_bound}, foreign capability refused {foreign_credential_refused})"),
         Ok(false) => tracing::info!("this boot's retained readiness still holds"),
