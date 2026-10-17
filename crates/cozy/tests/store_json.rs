@@ -103,12 +103,14 @@ fn a_released_homes_runs_read_back_the_same_once_its_rows_are_json() {
 
     // What a device would have measured, written into the released build's protobuf row.
     let db = home.root().join("calcifer/state.db");
-    let before = rows(&db);
-    assert_eq!(before.len(), 3, "{before:?}");
     let measured = br#"{"execution":{"degree":1,"ranks":[{"gpu":0,"attention":"sdpa"}]}}"#;
+    let measured_run = file["id"].as_str().unwrap().to_owned();
     {
         let conn = rusqlite::Connection::open(&db).unwrap();
-        let (id, _, outcome) = &before[1];
+        let (id, _, outcome) = rows(&db)
+            .into_iter()
+            .find(|(id, ..)| *id == measured_run)
+            .unwrap();
         let mut outcome = v1::Outcome::decode(outcome.as_deref().unwrap()).unwrap();
         outcome.measurements = measured.to_vec();
         conn.execute(
@@ -117,18 +119,21 @@ fn a_released_homes_runs_read_back_the_same_once_its_rows_are_json() {
         )
         .unwrap();
     }
+    // Every run the home holds: these three and the installs local code made.
     let before = rows(&db);
+    assert!(before.len() >= 3, "{before:?}");
     let ids: Vec<&str> = before.iter().map(|(id, ..)| id.as_str()).collect();
+    let measured_at = ids.iter().position(|id| *id == measured_run).unwrap();
     let shown = |ids: &[&str]| -> Vec<Value> {
         ids.iter()
             .map(|id| home.json(["run", "show", id, "--json"]))
             .collect()
     };
     let shown_before = shown(&ids);
+    let shown_measured = &shown_before[measured_at];
     assert_eq!(
-        shown_before[1]["measurements"]["execution"]["degree"], 1,
-        "{}",
-        shown_before[1]
+        shown_measured["measurements"]["execution"]["degree"], 1,
+        "{shown_measured}"
     );
     assert_eq!(home.cozy(["down"]).code, 0);
 
@@ -150,11 +155,16 @@ fn a_released_homes_runs_read_back_the_same_once_its_rows_are_json() {
         let spec = v1::RunSpec::decode(spec.as_slice()).unwrap();
         let read: json::RunSpec = serde_json::from_slice(&json_spec).unwrap();
         assert_eq!(v1::RunSpec::from(&read), spec, "run {id}'s spec");
-        let outcome = v1::Outcome::decode(outcome.as_deref().unwrap()).unwrap();
-        let read: json::Outcome = serde_json::from_slice(&json_outcome.unwrap()).unwrap();
-        assert_eq!(v1::Outcome::from(&read), outcome, "run {id}'s outcome");
+        let outcome = outcome.as_deref().map(|o| v1::Outcome::decode(o).unwrap());
+        let read = json_outcome.map(|o| serde_json::from_slice::<json::Outcome>(&o).unwrap());
+        assert_eq!(
+            read.as_ref().map(v1::Outcome::from),
+            outcome,
+            "run {id}'s outcome"
+        );
     }
-    let read: json::Outcome = serde_json::from_slice(rows(&db)[1].2.as_deref().unwrap()).unwrap();
+    let row = &rows(&db)[measured_at];
+    let read: json::Outcome = serde_json::from_slice(row.2.as_deref().unwrap()).unwrap();
     assert_eq!(read.measurements.unwrap().get().as_bytes(), measured);
     drop(conn);
 
