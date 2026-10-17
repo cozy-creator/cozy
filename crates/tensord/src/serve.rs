@@ -34,13 +34,12 @@ pub fn main(args: impl IntoIterator<Item = std::ffi::OsString>) -> ExitCode {
         flags: Flags,
     }
     let flags = <Serve as clap::Parser>::parse_from(args).flags;
-    machine(flags.lifetime().expect("clap requires one"), false)
+    machine(flags.lifetime().expect("clap requires one"))
 }
 
-/// The machine, as its stable parent (or, with `service`, as the service an activated binary
-/// runs under that parent). Exits the process on failure.
-pub fn machine(lifetime: Lifetime, service: bool) -> ExitCode {
-    if let Err(error) = run(lifetime, service) {
+/// The machine: its stable parent, then the service it forks. Exits the process on failure.
+pub fn machine(lifetime: Lifetime) -> ExitCode {
+    if let Err(error) = run(lifetime) {
         config::init_logs(None);
         tracing::error!("{error}");
         std::process::exit(1);
@@ -48,7 +47,7 @@ pub fn machine(lifetime: Lifetime, service: bool) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn run(lifetime: Lifetime, service: bool) -> io::Result<()> {
+fn run(lifetime: Lifetime) -> io::Result<()> {
     use crate::machine::{identity, provider::ProviderSelf, ssh, supervise, update};
     // Linux names the calling thread: this one, before any other starts.
     if let Err(error) = cozy_platform::process::set_name("tensord") {
@@ -56,8 +55,8 @@ fn run(lifetime: Lifetime, service: bool) -> io::Result<()> {
             return Err(io::Error::other(format!("cannot set TensorD process name: {error}")));
         }
     }
-    // Whatever this process inherited (a parent's readiness, key or credential pipe) reaches
-    // nothing it starts; descriptors it hands on are handed explicitly.
+    // Whatever this process inherited (its own re-execution's credential pipe) reaches nothing
+    // it starts; descriptors it hands on are handed explicitly.
     cozy_platform::process::cloexec_from(3);
     hold_handed_descriptors();
     let mut config = config::load(lifetime)?;
@@ -72,27 +71,20 @@ fn run(lifetime: Lifetime, service: bool) -> io::Result<()> {
         grant.provider = ProviderSelf::take(&grant.layout.root, &config.provider);
     }
     config::forget_receipt_key();
-    let ready = if service {
-        // The parent's key pipe is read and closed whether or not the grant has a key.
-        let inherited = supervise::inherited_key();
-        grant.receipt_key = grant.receipt_key.take().or(inherited);
-        supervise::inherited()
-    } else {
-        identity::hold(&grant.layout)?;
-        if let Some(key) = grant.developer_key.as_deref() {
-            if let Err(error) = ssh::start(key) {
-                tracing::warn!("{error}");
-            }
+    identity::hold(&grant.layout)?;
+    if let Some(key) = grant.developer_key.as_deref() {
+        if let Err(error) = ssh::start(key) {
+            tracing::warn!("{error}");
         }
-        let paths = update::Paths::new(&grant.layout.engine(), &grant.layout.root);
-        supervise::supervise(&paths, lifetime, grant.receipt_key.as_deref(), grant.provider.as_ref())?
-    };
+    }
+    let paths = update::Paths::new(&grant.layout.engine(), &grant.layout.root);
+    update::retire_agent(&paths);
+    let ready = supervise::supervise(&paths)?;
     run_machine(config, ready)
 }
 
-/// Descriptors 3, 4 and 5 carry a parent's readiness, key and credential pipes. Until they are
-/// read, nothing else may take those numbers: the log file there would be read as a pipe, or a
-/// forked service's log written into the readiness pipe.
+/// Descriptor 5 carries a re-executed machine's credential pipe. Until it is read, nothing else
+/// may take 3 to 5: a log file at 5 would be read as the pipe.
 fn hold_handed_descriptors() {
     for fd in 3..=5 {
         // SAFETY: plain syscalls on this process's own descriptor table, before any thread.
@@ -210,7 +202,6 @@ pub fn version() -> io::Result<()> {
     let capabilities = crate::api::CAPABILITIES
         .iter()
         .chain(CAPS)
-        .chain(&[crate::machine::provider::CREDENTIAL_CAPABILITY])
         .copied()
         .collect();
     let record = Version {

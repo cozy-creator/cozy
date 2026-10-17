@@ -3,8 +3,8 @@
 //! never answered through that whole idle window, so it ends itself at its provider and billing
 //! stops: the real binary, a stand-in provider API, and a Hub that cannot be reached. The
 //! provider key it ends itself with is the machine's alone: gone from every process environment
-//! and from the files the provider copies it into, and still handed to an activated Runtime
-//! update's service.
+//! and from the files the provider copies it into. A TensorD a pre-cohort update activated is
+//! retired, never run.
 mod common;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use ed25519_dalek::SigningKey;
@@ -187,11 +187,7 @@ fn a_rental_the_hub_cannot_hear_ends_itself_at_its_provider() {
     .unwrap();
     machine.0.wait().unwrap();
 
-    // The same boot after its idle deadline, the Hub silent the whole window, now serving an
-    // activated Runtime update: the parent hands the key to that service.
-    let agent = root.join("var/lib/cozy/tensord/agent");
-    std::fs::create_dir_all(&agent).unwrap();
-    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_tensord"), agent.join("current")).unwrap();
+    // The same boot after its idle deadline, the Hub silent the whole window.
     let ledger = root.join("var/lib/cozy/machine/idle.json");
     let mut idle: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&ledger).unwrap()).unwrap();
@@ -253,11 +249,10 @@ fn environments_holding(pid: u32, needle: &str) -> Vec<u32> {
     held
 }
 
-/// A Runtime update back to a machine that predates the credential hand-off (it does not declare
-/// `provider-credential/1`) is never handed the key: it would leave the pipe open for every
-/// executor it starts. It still gets this boot's readiness pipe and key.
+/// A machine root a pre-cohort update left an activated TensorD in (`agent/current`, the one its
+/// Runtime wheel bundled): the machine serves as itself, removes the activation and never runs it.
 #[test]
-fn an_older_service_is_never_handed_the_provider_key() {
+fn a_pre_cohort_activation_is_retired_never_run() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("target/machine-older-service")
         .join(std::process::id().to_string());
@@ -278,29 +273,10 @@ fn an_older_service_is_never_handed_the_provider_key() {
         .unwrap()
         .port();
     let (provider_port, _received) = provider();
-    let machine = launch(&root, port, provider_port);
-    let listing = root.join("service-fds");
-    let start = Instant::now();
-    while !listing.exists() {
-        assert!(
-            start.elapsed() < Duration::from_secs(60),
-            "the older service never started"
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    let fds: Vec<String> = std::fs::read_to_string(&listing)
-        .unwrap()
-        .split_whitespace()
-        .map(str::to_owned)
-        .collect();
-    assert!(
-        fds.contains(&"3".to_string()) && fds.contains(&"4".to_string()),
-        "{fds:?}"
-    );
-    assert!(
-        !fds.contains(&"5".to_string()),
-        "the older service holds fd 5: {fds:?}"
-    );
+    let mut machine = launch(&root, port, provider_port);
+    ready(&mut machine, &root, port);
+    assert!(!root.join("service-fds").exists(), "the activated TensorD ran");
+    assert!(!agent.exists(), "the activation was kept");
     drop(machine);
     std::fs::remove_dir_all(&root).unwrap();
 }
