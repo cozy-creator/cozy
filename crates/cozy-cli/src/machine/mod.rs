@@ -58,14 +58,16 @@ enum Verb {
     },
     /// Reset a rental's 15-minute idle clock once.
     Keepalive { name: String },
-    /// Update a machine to its Hub's target software, or to local wheels, as a run.
+    /// Update a machine to its Hub's target software, or to named wheels, as a run.
     Update {
         name: String,
-        /// Install this local cozy-runtime wheel instead of the Hub's target.
-        #[arg(long, value_name = "FILE")]
+        /// Install this cozy-runtime wheel instead of the Hub's target: a local file, or
+        /// https://…/<wheel>#sha256=<hex>, which the machine fetches itself.
+        #[arg(long, value_name = "FILE|URL")]
         runtime_wheel: Option<std::path::PathBuf>,
-        /// Install this local tensorfs wheel instead of the Hub's target.
-        #[arg(long, value_name = "FILE")]
+        /// Install this tensorfs wheel instead of the Hub's target: a local file, or
+        /// https://…/<wheel>#sha256=<hex>, which the machine fetches itself.
+        #[arg(long, value_name = "FILE|URL")]
         tensorfs_wheel: Option<std::path::PathBuf>,
     },
     /// Add another computer's machine by its address and TLS fingerprint.

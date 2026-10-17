@@ -1996,6 +1996,20 @@ fn the_policy_fails_closed() {
     assert!(!policy.allows_host("evilcdn.example.net"));
     assert!(policy.allows_host("bucket.example.com"));
     assert!(!policy.allows_host("sub.bucket.example.com"));
+    // A `*` entry is a host name like any other; `any_host` admits every host, and every
+    // address is still checked.
+    let star = SourcePolicy {
+        allowed_hosts: vec!["*".into()],
+        ..Default::default()
+    };
+    assert!(!star.allows_host("evil.example.org"));
+    let any = SourcePolicy {
+        any_host: true,
+        ..Default::default()
+    };
+    assert!(any.allows_host("evil.example.org"));
+    let refused = any.check("https://127.0.0.1/x").unwrap_err();
+    assert_eq!(refused.code, Code::SOURCE_NOT_ALLOWED);
     // Plaintext http without a declared-local deployment.
     assert_eq!(
         policy

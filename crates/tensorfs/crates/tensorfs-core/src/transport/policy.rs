@@ -172,8 +172,11 @@ impl CheckedUrl {
 pub struct SourcePolicy {
     /// Exact host names, case-insensitive, trailing dot trimmed. An entry starting with a
     /// dot (`.example.com`) admits any subdomain; a bare entry admits only itself. Empty
-    /// means NO egress at all.
+    /// means NO egress at all, unless `any_host`.
     pub allowed_hosts: Vec<String>,
+    /// Any host, set in code alone for bytes held to a digest the caller already has: no
+    /// host vouches for anything there. Addresses are still checked.
+    pub any_host: bool,
     /// Loopback/private addresses and plaintext http, for a deployment that DECLARED it
     /// is local (a loopback dev hub, a test origin). Never inferred here.
     pub allow_local: bool,
@@ -232,6 +235,9 @@ impl Resolved {
 
 impl SourcePolicy {
     pub fn allows_host(&self, host: &str) -> bool {
+        if self.any_host {
+            return true;
+        }
         let host = host.trim_end_matches('.').to_ascii_lowercase();
         self.allowed_hosts.iter().any(|entry| {
             let entry = entry.trim_end_matches('.').to_ascii_lowercase();

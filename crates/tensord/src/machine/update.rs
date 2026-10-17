@@ -45,6 +45,9 @@ pub struct Status {
     pub state: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub error: String,
+    /// A failure's own reason code (`wheel_digest_mismatch`); empty reads `update_failed`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub code: String,
     pub from: Pair,
     pub to: Pair,
     #[serde(default)]
@@ -81,7 +84,42 @@ pub struct Choice {
     pub sha256: String,
     #[serde(default)]
     pub version: String,
+    /// Where the machine fetches `file` itself, held to `sha256`.
+    #[serde(default)]
+    pub url: String,
 }
+
+impl Choice {
+    /// `distribution`'s wheel at an https `url`, held to `sha256`: the machine fetches it.
+    pub fn fetched(distribution: &str, url: &str, sha256: &str) -> Result<Choice, String> {
+        let path = url.strip_prefix("https://").map(|rest| rest.split(['?', '#']).next().unwrap_or_default());
+        let file = path.and_then(|p| p.split_once('/')).and_then(|(_, p)| p.rsplit('/').next()).unwrap_or_default();
+        if path.is_none() {
+            return Err(format!("{url} is not an https URL"));
+        }
+        if wheel_name(file).is_none_or(|(d, _)| d != distribution) {
+            return Err(format!("{url} names no {distribution} wheel ({distribution}-<version>-….whl)"));
+        }
+        let sha256 = sha256.to_ascii_lowercase();
+        if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(format!("{file}'s sha256 is 64 hex digits, not {sha256:?}"));
+        }
+        Ok(Choice { file: file.into(), sha256, url: url.into(), ..Default::default() })
+    }
+}
+
+/// An update failure with its own reason code.
+#[derive(Debug)]
+pub struct Coded {
+    pub code: &'static str,
+    pub message: String,
+}
+impl std::fmt::Display for Coded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+impl std::error::Error for Coded {}
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Request {
@@ -458,6 +496,7 @@ impl Updates {
                     let failed = updates.set(|s| {
                         if !s.terminal() {
                             s.error = format!("{error}; it keeps Runtime {} and TensorFS {}", s.from.runtime, s.from.tensorfs);
+                            s.code = error.get_ref().and_then(|e| e.downcast_ref::<Coded>()).map_or("", |c| c.code).into();
                             s.enter("failed");
                         }
                     });
@@ -651,8 +690,15 @@ impl Updates {
         }
     }
 
-    /// A staged {file, sha256} or a published {version} fetched from PyPI with its digest checked.
+    /// A {file, sha256} fetched from its url or staged, or a published {version} fetched from
+    /// PyPI, each with its digest checked.
     fn resolve(&self, distribution: &str, choice: &Choice) -> io::Result<PathBuf> {
+        if !choice.url.is_empty() {
+            let store = self.store.as_ref().ok_or_else(|| invalid("this machine fetches no wheels"))?;
+            let stop = self.stop.lock().unwrap().clone();
+            let dir = self.paths.update("downloads");
+            return super::pypi::wheel_at(&choice.url, &choice.sha256, &choice.file, &dir, store, &stop);
+        }
         if !choice.file.is_empty() {
             let path = self
                 .paths
