@@ -6,7 +6,7 @@ use cozy_proto::{
     error::Error,
 };
 
-use super::{clock, machine, now_ms, usd};
+use super::{Notices, clock, machine, now_ms, usd};
 use crate::{Context, output};
 
 /// A Hub failure code: the provider stopped the pod. The Hub keeps the rental and never replaces it.
@@ -74,8 +74,11 @@ pub async fn list(ctx: &Context, once: bool) -> Result<ExitCode, Error> {
         println!("{note}");
     }
     for m in live() {
-        if let Some(note) = m.rental.as_ref().and_then(|r| r.placement_note.as_ref()) {
+        for note in Notices::default().fresh(m) {
             println!("{}: {note}", m.name);
+        }
+        if unreachable_since(m).is_some() {
+            println!("{}: `cozy machine end {}` ends it", m.name, m.name);
         }
     }
     if !rentals.is_empty() {
@@ -158,6 +161,17 @@ pub async fn show(ctx: &Context, name: &str) -> Result<ExitCode, Error> {
         if let Some(note) = &r.placement_note {
             record = record.field("placement", note);
         }
+        if let Some(warning) = &r.provider_warning {
+            record = record.field("provider", warning);
+        }
+    }
+    if let Some(since) = unreachable_since(&m) {
+        record = record.note(format!(
+            "the Hub cannot reach it since {} ago, though its provider reports it running; \
+             `cozy machine end {}` ends it",
+            clock(now_ms() - since),
+            m.name
+        ));
     }
     if let Some(reason) = &m.reason {
         record = record.field("reason", reason);
@@ -252,14 +266,20 @@ pub fn state_cell(m: &Machine) -> String {
             Some(boot) => format!("booting · {boot}"),
             None => "booting".into(),
         },
-        MachineState::Ready => "ready".into(),
+        MachineState::Ready => match unreachable_since(m) {
+            Some(since) => format!(
+                "unreachable from the Hub since {} ago",
+                clock(now_ms() - since)
+            ),
+            None => "ready".into(),
+        },
         MachineState::Ending => "ending".into(),
         MachineState::Ended => "ended".into(),
     };
     if m.unverified {
         cell += " (unverified)";
     }
-    if m.unreachable.is_some() && m.state == MachineState::Ready {
+    if m.unreachable.is_some() && m.state == MachineState::Ready && unreachable_since(m).is_none() {
         cell += " (unreachable)";
     }
     cell
@@ -350,6 +370,12 @@ fn ends_cell(m: &Machine) -> String {
         (Some(None), MachineKind::Rental) => "after its jobs".into(),
         _ => "—".into(),
     }
+}
+
+/// Since when the Hub cannot reach a live rental its provider reports running.
+fn unreachable_since(m: &Machine) -> Option<i64> {
+    let since = m.rental.as_ref()?.unreachable_since_ms?;
+    (m.state == MachineState::Ready).then_some(since)
 }
 
 fn provider_stopped(m: &Machine) -> Option<String> {

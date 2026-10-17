@@ -60,9 +60,10 @@ pub async fn exec(ctx: &Context, rent: Rent) -> Result<ExitCode, Error> {
         answer => answer?,
     };
     output::say(ctx, &price(&sku, &rented.quote));
-    let noted = placement_note(&rented.machine)
-        .inspect(|note| output::say(ctx, note))
-        .is_some();
+    let mut notices = Notices::default();
+    for note in notices.fresh(&rented.machine) {
+        output::say(ctx, note);
+    }
     if let Some(asked) = rent.disk_gb.filter(|asked| rented.quote.disk_gb < *asked) {
         output::warn(&format!(
             "the Hub plans a {} GB disk, below the {asked} GB asked",
@@ -74,7 +75,7 @@ pub async fn exec(ctx: &Context, rent: Rent) -> Result<ExitCode, Error> {
     }
     let machine = match rent.detach {
         true => rented.machine.clone(),
-        false => match follow(ctx, rented.machine.clone(), noted).await? {
+        false => match follow(ctx, rented.machine.clone(), notices).await? {
             Some(machine) => machine,
             None => return Ok(ExitCode::SUCCESS),
         },
@@ -116,10 +117,26 @@ pub async fn exec(ctx: &Context, rent: Rent) -> Result<ExitCode, Error> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// Why the Hub placed a rental off the requester's continent, when it did. It decides after it
-/// accepts the order, so a follower says it once it appears.
-pub(crate) fn placement_note(machine: &Machine) -> Option<&str> {
-    machine.rental.as_ref()?.placement_note.as_deref()
+/// What the Hub says of a rental for a person to know: why it runs off the requester's continent,
+/// and, to an admin, that its prepaid provider account runs low. The Hub places a rental after it
+/// accepts the order, so a follower says each once it appears.
+#[derive(Default)]
+pub(crate) struct Notices(Vec<String>);
+
+impl Notices {
+    /// The rental's notices not said yet, now counted as said.
+    pub(crate) fn fresh<'a>(&mut self, machine: &'a Machine) -> Vec<&'a str> {
+        let rental = machine.rental.as_ref();
+        let notes = rental
+            .into_iter()
+            .flat_map(|r| [&r.placement_note, &r.provider_warning]);
+        let fresh: Vec<&str> = notes
+            .filter_map(|note| note.as_deref())
+            .filter(|note| !self.0.iter().any(|said| said == note))
+            .collect();
+        self.0.extend(fresh.iter().map(|note| note.to_string()));
+        fresh
+    }
 }
 
 /// The price the order is held to: per hour and for the Hub's assumed hours and download.
@@ -146,16 +163,15 @@ fn price(sku: &str, q: &Quote) -> String {
 async fn follow(
     ctx: &Context,
     booting: Machine,
-    mut noted: bool,
+    mut notices: Notices,
 ) -> Result<Option<Machine>, Error> {
     let calcifer = ctx.calcifer().await?;
     let id = booting.rental_id.as_deref().unwrap_or(&booting.name);
     let (mut following, mut machine) = Following::open(&calcifer, id).await?;
     let mut said = String::new();
     loop {
-        if !noted && let Some(note) = placement_note(&machine) {
+        for note in notices.fresh(&machine) {
             output::say(ctx, note);
-            noted = true;
         }
         match machine.state {
             MachineState::Ready => return Ok(Some(machine)),

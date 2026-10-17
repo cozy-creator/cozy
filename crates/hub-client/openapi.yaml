@@ -2564,6 +2564,11 @@ components:
         detail: {type: string}
         failure: {$ref: '#/components/schemas/RentalFailure'}
         provider_refusal: {type: string}
+        provider_warning:
+          type: string
+          description: >-
+            For an admin, while the rental lives: the prepaid provider account its machine runs on is
+            spent, or lasts less than a few hours at its current spend.
         boot: {$ref: '#/components/schemas/RentalBoot'}
         unreachable_since: {type: string, format: date-time}
         webrtc: {$ref: '#/components/schemas/RentalWebRtc'}
