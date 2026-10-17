@@ -1320,12 +1320,21 @@ mod v1_api {
                 ..Default::default()
             };
             let request = authorized(v1::RunRequest { id: id.into(), after: 0, spec: Some(spec) }, &all);
-            let done = outcome(&collect(client.run(request).await.unwrap().into_inner()).await.unwrap());
+            let events = collect(client.run(request).await.unwrap().into_inner()).await.unwrap();
+            let done = outcome(&events);
             assert_eq!(done.status, "succeeded", "{id}: {done:?}");
             let result: serde_json::Value = serde_json::from_slice(&done.result).unwrap();
             let children = result["children"].as_array().unwrap();
             assert_eq!(children.len(), 2, "{result}");
             assert!(children.iter().all(|c| c["device"].as_str().unwrap().starts_with("cuda")), "{result}");
+            // Each call names the model it ran as the machine resolved it (`run show`).
+            for event in &events {
+                if let Some(v1::run_event::Event::Call(call)) = &event.event {
+                    let measured: serde_json::Value = serde_json::from_slice(&call.measurements).unwrap();
+                    assert_eq!((&measured["models"][0]["repository"], &measured["models"][0]["lane"]),
+                        (&"local/tiny".into(), &"f32".into()), "{measured}");
+                }
+            }
         }
         let _ = fs::remove_dir_all(tools);
     }
@@ -3205,7 +3214,8 @@ mod v1_api {
             assert!(call.run.ends_with(&format!("/{}", call.index)), "{call:?}");
             assert!(call.finished_at_ms >= call.called_at_ms && call.called_at_ms > 0, "{call:?}");
             assert!(call.reason.is_none(), "{call:?}");
-            serde_json::from_slice::<serde_json::Value>(&call.measurements).unwrap();
+            let measured: serde_json::Value = serde_json::from_slice(&call.measurements).unwrap();
+            assert_eq!(measured["models"], serde_json::json!([]), "a call with no model slot ran none");
         }
         // The film after every segment is a product of the job's `video` output.
         let products: Vec<_> = events

@@ -118,7 +118,8 @@ pub(crate) async fn quantize(ctx: &Context, args: Quantize) -> Result<ExitCode, 
     let destination = destination.unwrap_or(repo);
     let (package, release, function) = quantizer(ctx, &hub, &args, lane, &components).await?;
     let inputs = vec![source, destination.to_string()];
-    crate::run::call(ctx, &package, Some(&release), &function, inputs, &args.placement, args.detach).await
+    let run = crate::run::call(ctx, &package, Some(&release), &function, inputs, &args.placement, args.detach).await?;
+    Ok(crate::run::exit_code(&run))
 }
 
 #[cfg(test)]

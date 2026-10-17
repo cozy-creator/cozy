@@ -167,6 +167,9 @@ impl GpuConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PlanSlot {
     pub binding: Binding,
+    /// The Hub lane its checkpoint was resolved in (`run show`); empty for one held here.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub lane: String,
     /// Native selected encoded source bytes; not a GPU-fit or full-memory charge.
     pub selected_encoded_bytes: u64,
     /// Built and fetched when the function first uses it (`on_demand`): nothing of it is
@@ -250,6 +253,18 @@ impl Plan {
     }
     pub fn selections(&self) -> Vec<SelectedManifest> {
         merged(&self.slots)
+    }
+    /// Each model it runs as the machine resolved it, constructed or raw (`run show`).
+    pub fn models(&self) -> Vec<serde_json::Value> {
+        let row = |slot: &str, model: (&str, &str), lane: &str, manifest: &str| {
+            serde_json::json!({"slot": slot, "repository": model.0, "release": model.1, "lane": lane, "manifest": manifest})
+        };
+        let constructed = self.slots.iter().map(|s| {
+            let model = s.binding.model.rsplit_once('@').unwrap_or_default();
+            row(&s.binding.model_parameter_name, model, &s.lane, &s.binding.snapshot)
+        });
+        let raw = self.sources.iter().map(|s| row(&s.parameter, (&s.repository, &s.release), &s.lane, &s.manifest));
+        constructed.chain(raw).collect()
     }
     /// What a call reads before its function runs: every slot's components but an on-demand
     /// one's, which Runtime fetches when a stage first uses it.
@@ -1592,6 +1607,7 @@ impl Pool {
             };
             planned.push(PlanSlot {
                 binding,
+                lane: grant.lane.clone(),
                 selected_encoded_bytes,
                 on_demand: model.get("on_demand").and_then(serde_json::Value::as_bool) == Some(true),
             });
@@ -3274,7 +3290,7 @@ impl Pool {
             .filter(|bytes| *bytes > 0);
         self.learn(&construction, gpus, &shape, &reply, session.executor.birth.pid, mapped);
         self.record_invoke(&construction, &lane, first, invoked.elapsed(), &reply);
-        record_measurements(engine, id, &reply, &session.counted);
+        record_measurements(engine, id, &plan, &reply, &session.counted);
         if let Some(plane) = &reply.plane {
             session.counted = plane.clone();
         }
@@ -4223,26 +4239,13 @@ fn refused(error: &io::Error) -> Option<&Refused> {
 }
 
 /// What the call's executor measured, kept as the run's (`run show`): its stage and step
-/// tracks, its ranks' execution records, and its attention observations (the kernels that
-/// served, Sol's dense and sparse calls).
+/// tracks, its ranks' execution records, its kernel observations (the attention and GEMM
+/// kernels that served, Sol's dense and sparse calls) and the models it ran, as resolved.
 /// `since`: the executor's plane counts at its previous call (its memory record counts from
 /// them).
-pub(crate) fn record_measurements(engine: &Engine, id: &str, reply: &Frame, since: &device_executor::PlaneFacts) {
-    let attention: Vec<&serde_json::Value> = reply
-        .observations
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|row| {
-            row["name"]
-                .as_str()
-                .is_some_and(|name| name.starts_with("attention."))
-        })
-        .collect();
+pub(crate) fn record_measurements(engine: &Engine, id: &str, plan: &Plan, reply: &Frame, since: &device_executor::PlaneFacts) {
     let software = engine.get(id).ok().and_then(|run| run.executor.map(|executor| executor.software(run.attempt)));
-    let measurements = serde_json::json!({"attribution": reply.attribution, "software": software,
-        "execution": reply.execution, "observations": attention,
-        "memory": crate::memory::call::CallMemory::of(reply, since)});
+    let measurements = measured(plan, reply, software, crate::memory::call::CallMemory::of(reply, since));
     let recorded = serde_json::to_vec(&measurements)
         .map_err(io::Error::other)
         .and_then(|bytes| engine.with_journal(|journal| journal.record_measurements(id, &bytes)));
@@ -4251,6 +4254,14 @@ pub(crate) fn record_measurements(engine: &Engine, id: &str, reply: &Frame, sinc
     }
 }
 
+
+fn measured<S: Serialize, M: Serialize>(plan: &Plan, reply: &Frame, software: S, memory: M) -> serde_json::Value {
+    let kernels: Vec<&serde_json::Value> = (reply.observations.as_array().into_iter().flatten())
+        .filter(|row| row["name"].as_str().is_some_and(|name| name.starts_with("attention.") || name.starts_with("gemm.")))
+        .collect();
+    serde_json::json!({"attribution": reply.attribution, "software": software, "execution": reply.execution,
+        "observations": kernels, "memory": memory, "models": plan.models()})
+}
 
 pub(crate) fn command_ok(frame: Frame) -> io::Result<Frame> {
     if frame.ok {
@@ -4603,6 +4614,51 @@ mod tests {
             "group_broken: GPU 1's process 7 ended during the call, first; then executor_poisoned: \
              the executor named no reason; the executor did not settle quiescent"
         );
+    }
+
+    /// What `run show` reads of a call: the models it ran as the machine resolved them (run
+    /// 10236's background removal: `paul/birefnet@0.1.0 fp16`), constructed or raw, and its
+    /// attention and GEMM kernels (the attention row is that run's segment call's); nothing
+    /// else it observed.
+    #[test]
+    fn a_calls_measurements_name_its_resolved_models_and_its_kernels() {
+        let binding = Binding {
+            model_parameter_name: "model".into(),
+            model: "paul/birefnet@0.1.0".into(),
+            snapshot: "sha256:aa".into(),
+            ..Default::default()
+        };
+        let source = PlanSource {
+            parameter: "lora".into(),
+            manifest: "sha256:bb".into(),
+            length: 9,
+            repository: "paul/wushu".into(),
+            release: "1.0.0".into(),
+            lane: "bf16".into(),
+        };
+        let plan = Plan {
+            id: "p".into(),
+            construction: "c".into(),
+            installation: "i".into(),
+            generation: "g".into(),
+            entrypoint: "remove_background".into(),
+            slots: vec![PlanSlot { binding, lane: "fp16".into(), selected_encoded_bytes: 0, on_demand: false }],
+            sources: vec![source],
+            degree: 1,
+        };
+        let reply: Frame = serde_json::from_value(json!({"reply": "invoke", "ok": true, "observations": [
+            {"kind": "confession", "name": "attention.selected", "value": "kitchen-sol-producer-fast-shared-qkv",
+                "fields": {"component": "base_model/ref2va_dit", "dense_reference": "kitchen-int8", "pin": "", "sites": 52}},
+            {"kind": "confession", "name": "gemm.selected", "value": "cutlass-sm80-int8",
+                "fields": {"component": "base_model/ref2va_dit", "format": "int8", "sites": 416}},
+            {"kind": "confession", "name": "weights.mode", "value": "resident", "fields": {"stage": "denoise"}}]}))
+        .unwrap();
+        let measured = measured(&plan, &reply, None::<()>, ());
+        assert_eq!(measured["models"], json!([
+            {"slot": "model", "repository": "paul/birefnet", "release": "0.1.0", "lane": "fp16", "manifest": "sha256:aa"},
+            {"slot": "lora", "repository": "paul/wushu", "release": "1.0.0", "lane": "bf16", "manifest": "sha256:bb"}]));
+        let kept: Vec<&str> = measured["observations"].as_array().unwrap().iter().map(|o| o["name"].as_str().unwrap()).collect();
+        assert_eq!(kept, ["attention.selected", "gemm.selected"]);
     }
 
     #[test]

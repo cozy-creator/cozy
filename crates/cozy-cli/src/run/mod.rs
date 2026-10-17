@@ -2,7 +2,7 @@
 use std::{path::PathBuf, process::ExitCode};
 
 use cozy_proto::{
-    calcifer::{On, SubmitRun},
+    calcifer::{On, Run, SubmitRun},
     config::Hub,
     error::{Error, Kind},
 };
@@ -229,12 +229,16 @@ async fn run(ctx: &Context, args: RunArgs) -> Result<ExitCode, Error> {
         } else {
             anstream::print!(
                 "{}",
-                describe::contract(&format!("{package}/{}", callable.name), callable)
+                describe::contract(
+                    &format!("{package}/{}", callable.name),
+                    &card.interface,
+                    callable
+                )
             );
         }
         return Ok(ExitCode::SUCCESS);
     }
-    invoke(
+    let run = invoke(
         ctx,
         &package,
         release.as_deref(),
@@ -242,11 +246,13 @@ async fn run(ctx: &Context, args: RunArgs) -> Result<ExitCode, Error> {
         (card, read),
         args,
     )
-    .await
+    .await?;
+    Ok(exit_code(&run))
 }
 
 /// `cozy run <package>/<function>[@release] <inputs…> --on …` for another verb: `model
-/// quantize` runs a package's conversion this way.
+/// quantize` runs a package's conversion this way. The run as it settled, or as sent with
+/// `detach`; its record is printed either way.
 pub(crate) async fn call(
     ctx: &Context,
     package: &str,
@@ -255,7 +261,7 @@ pub(crate) async fn call(
     inputs: Vec<String>,
     placement: &Placement,
     detach: bool,
-) -> Result<ExitCode, Error> {
+) -> Result<Run, Error> {
     let card = catalog::card(ctx, &ctx.hub()?, package, release, false).await?;
     let args = RunArgs {
         target: None,
@@ -293,7 +299,7 @@ async fn invoke(
     function: &str,
     (mut card, read): (Card, bool),
     args: RunArgs,
-) -> Result<ExitCode, Error> {
+) -> Result<Run, Error> {
     let hub = ctx.hub()?;
     let terms = terms(ctx, &args)?;
     let bits = bits(&args);
@@ -374,14 +380,9 @@ fn bits(args: &RunArgs) -> u32 {
 }
 
 /// Submits, then follows the run (or prints it at once with `detach`).
-async fn send(
-    ctx: &Context,
-    submission: SubmitRun,
-    key: &str,
-    detach: bool,
-) -> Result<ExitCode, Error> {
+async fn send(ctx: &Context, submission: SubmitRun, key: &str, detach: bool) -> Result<Run, Error> {
     let submitted = submit(ctx, submission, Some(key)).await?;
-    Ok(exit_code(&follow(ctx, submitted.run, detach).await?))
+    follow(ctx, submitted.run, detach).await
 }
 
 /// Binds `terms` to `function` of `card`; a person's refusal lists the arguments.

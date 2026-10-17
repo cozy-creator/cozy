@@ -1,0 +1,345 @@
+{
+ "accepted_at_ms": 1792215084910,
+ "created_at_ms": 1792214953804,
+ "execution_ms": 17435,
+ "measurements": {
+  "attribution": {
+   "folded_names": 0,
+   "method": "perf_counter deltas accumulated in place: count/total/min/max/first/last and wall bounds per named span; step tracks keep up to 512 [end_unix_ms, ms] points",
+   "stages": {
+    "decode": {
+     "count": 1,
+     "ended_unix_ms": 1792215119354,
+     "first_ms": 310.867,
+     "last_ms": 310.867,
+     "max_ms": 310.867,
+     "mean_ms": 310.867,
+     "min_ms": 310.867,
+     "started_unix_ms": 1792215119043,
+     "total_ms": 310.867
+    },
+    "denoise": {
+     "count": 1,
+     "ended_unix_ms": 1792215119011,
+     "first_ms": 4564.054,
+     "last_ms": 4564.054,
+     "max_ms": 4564.054,
+     "mean_ms": 4564.054,
+     "min_ms": 4564.054,
+     "started_unix_ms": 1792215114447,
+     "total_ms": 4564.054
+    },
+    "encode": {
+     "count": 1,
+     "ended_unix_ms": 1792215114059,
+     "first_ms": 434.162,
+     "last_ms": 434.162,
+     "max_ms": 434.162,
+     "mean_ms": 434.162,
+     "min_ms": 434.162,
+     "started_unix_ms": 1792215113625,
+     "total_ms": 434.162
+    },
+    "encode_webp": {
+     "count": 1,
+     "ended_unix_ms": 1792215119369,
+     "first_ms": 1.406,
+     "last_ms": 1.406,
+     "max_ms": 1.406,
+     "mean_ms": 1.406,
+     "min_ms": 1.406,
+     "started_unix_ms": 1792215119368,
+     "total_ms": 1.406
+    },
+    "loading weights": {
+     "count": 3,
+     "ended_unix_ms": 1792215119070,
+     "first_ms": 107.132,
+     "last_ms": 30.235,
+     "max_ms": 327.19,
+     "mean_ms": 154.852,
+     "min_ms": 30.235,
+     "started_unix_ms": 1792215113534,
+     "total_ms": 464.556
+    },
+    "tokenize": {
+     "count": 1,
+     "ended_unix_ms": 1792215113518,
+     "first_ms": 3.677,
+     "last_ms": 3.677,
+     "max_ms": 3.677,
+     "mean_ms": 3.677,
+     "min_ms": 3.677,
+     "started_unix_ms": 1792215113514,
+     "total_ms": 3.677
+    }
+   },
+   "steps": {
+    "denoise": {
+     "count": 20,
+     "ended_unix_ms": 1792215118924,
+     "first_ms": 522.19,
+     "last_ms": 211.133,
+     "max_ms": 522.19,
+     "mean_ms": 223.944,
+     "min_ms": 185.948,
+     "series": [
+      [
+       1792215114967,
+       522.19
+      ],
+      [
+       1792215115153,
+       185.948
+      ],
+      [
+       1792215115342,
+       188.367
+      ],
+      [
+       1792215115552,
+       210.233
+      ],
+      [
+       1792215115762,
+       209.74
+      ],
+      [
+       1792215115974,
+       212.494
+      ],
+      [
+       1792215116185,
+       210.355
+      ],
+      [
+       1792215116395,
+       210.806
+      ],
+      [
+       1792215116605,
+       210.012
+      ],
+      [
+       1792215116816,
+       211.046
+      ],
+      [
+       1792215117026,
+       209.781
+      ],
+      [
+       1792215117237,
+       211.225
+      ],
+      [
+       1792215117448,
+       210.514
+      ],
+      [
+       1792215117659,
+       210.69
+      ],
+      [
+       1792215117869,
+       210.272
+      ],
+      [
+       1792215118080,
+       210.885
+      ],
+      [
+       1792215118291,
+       211.127
+      ],
+      [
+       1792215118502,
+       211.081
+      ],
+      [
+       1792215118713,
+       210.986
+      ],
+      [
+       1792215118924,
+       211.133
+      ]
+     ],
+     "series_dropped": 0,
+     "started_unix_ms": 1792215114445,
+     "total_ms": 4478.884
+    }
+   }
+  },
+  "execution": {
+   "construction": {
+    "fill_ms": 0.0,
+    "legs_ms": {
+     "admission": 0.0,
+     "attention_pin": 21.6,
+     "backend_ctor": 241.2,
+     "checkpoint_headers": 33.6,
+     "construct.census": 69.0,
+     "construct.factory": 478.3,
+     "construct.fill": 1653.4,
+     "construct.fit": 15.5,
+     "construct_and_register": 2420.4,
+     "construction_config": 1.1,
+     "cuda_init": 0.0,
+     "execution_plan": 0.0,
+     "expect": 18.4,
+     "install": 106.7,
+     "measure_device": 72.3,
+     "package_import": 0.0,
+     "qualify": 7116.5,
+     "resolve": 351.5,
+     "runtime_imports": 0.2,
+     "torch_import": 0.1
+    },
+    "prepare_ms": 10394.04,
+    "prepared_unix_ms": 1792215113263,
+    "warm_ms": 0.0
+   },
+   "degree": 1,
+   "executor": {
+    "legs_ms": {
+     "cuda_init": 657.5,
+     "fork": 206.1,
+     "package_import": 10028.3,
+     "package_warmup": 0.1,
+     "runtime_imports": 0.0,
+     "torch_import": 0.0
+    },
+    "ms": 657.6,
+    "started_unix_ms": 1792215102204
+   },
+   "ranks": [
+    {
+     "arch": "sm_86",
+     "attention": {
+      "impl": "efficient+flash",
+      "kernels": [
+       {
+        "kernel": "sdpa",
+        "line": "ready",
+        "served": true,
+        "state": "ready"
+       }
+      ],
+      "observed": "sdpa",
+      "requested": ""
+     },
+     "end_us": 1792215119378748,
+     "ordinal": 0,
+     "pid": 4375,
+     "rank": 0,
+     "start_us": 1792215113487529,
+     "uuid": "GPU-ea37d0cf-5f82-f851-b28b-0eefa7e5acea"
+    }
+   ],
+   "spread": {}
+  },
+  "memory": {
+   "activation_peak_bytes": 2719030272,
+   "alloc_ooms": 0,
+   "alloc_retries": 0,
+   "bounce_bytes": 0,
+   "budget_bytes": 4255121408,
+   "cache_released_bytes": 0,
+   "cache_releases": 0,
+   "cap_bytes": 24710021120,
+   "context_bytes": null,
+   "disk_bytes": 4089383568,
+   "evictions": 0,
+   "modes": {
+    "text_encoder.graphs": "1 recorded in 0.05 s, 1 replays, pool 4 MiB",
+    "text_encoder_2.graphs": "1 recorded in 0.09 s, 1 replays, pool 56 MiB"
+   },
+   "oom_retries": 0,
+   "paged_in_bytes": 4089383568,
+   "paged_out": 0,
+   "paged_out_bytes": 0,
+   "peak_allocated_bytes": 2746757632,
+   "peak_reserved_bytes": 3512729600,
+   "process_bytes": 7767851008,
+   "register_failed": 0,
+   "reserved_bytes": 3512729600,
+   "shortfall": null,
+   "stage_peaks": {
+    "decode": 2719030272,
+    "denoise": 447222784,
+    "encode": 62914560
+   },
+   "weights_bytes": 4255121408
+  },
+  "observations": [
+   {
+    "at_unix_ms": 1792215119374,
+    "attempt_key": "1",
+    "fields": {
+     "component": "model/unet",
+     "dense_reference": "",
+     "pin": "",
+     "sites": 140
+    },
+    "kind": "confession",
+    "name": "attention.selected",
+    "seq": 21,
+    "value": "sdpa"
+   },
+   {
+    "at_unix_ms": 1792215119374,
+    "attempt_key": "1",
+    "fields": {
+     "component": "model/vae",
+     "dense_reference": "",
+     "pin": "",
+     "sites": 2
+    },
+    "kind": "confession",
+    "name": "attention.selected",
+    "seq": 22,
+    "value": "sdpa"
+   },
+   {
+    "at_unix_ms": 1792215119374,
+    "attempt_key": "1",
+    "fields": {
+     "component": "model/unet",
+     "dense_reference": "",
+     "pin": "",
+     "sites": 140
+    },
+    "kind": "confession",
+    "name": "attention.restored",
+    "seq": 23,
+    "value": "sdpa"
+   },
+   {
+    "at_unix_ms": 1792215119374,
+    "attempt_key": "1",
+    "fields": {
+     "component": "model/vae",
+     "dense_reference": "",
+     "pin": "",
+     "sites": 2
+    },
+    "kind": "confession",
+    "name": "attention.restored",
+    "seq": 24,
+    "value": "sdpa"
+   }
+  ],
+  "software": {
+   "attempt_ordinal": 1,
+   "runtime": "0.26.4",
+   "tensord": "0.7.3",
+   "tensord_commit": "b6a317076067112c536dd3429de1daa410c9b323",
+   "tensorfs": "0.10.0"
+  }
+ },
+ "number": 10264,
+ "settled_at_ms": 1792215119694,
+ "status": "completed",
+ "target": "fidika/sdxl/generate"
+}

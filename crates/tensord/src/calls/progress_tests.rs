@@ -130,3 +130,29 @@ fn package_log_lines_reach_the_root_log_and_stop_at_its_bound() {
     drop(service);
     let _ = std::fs::remove_dir_all(root);
 }
+
+/// The machine's warning for a call (run 10228's precision fallback) reaches the root run's log
+/// led by the call's function, as its package's lines do: the call's own log reaches no one.
+#[test]
+fn a_calls_machine_warning_reaches_the_root_log() {
+    let root = std::env::temp_dir().join(format!("cm-warn-{}", uuid::Uuid::new_v4()));
+    let service = Service::open(&root.join("state"), &root.join("generations"), 1).unwrap();
+    let engine = &service.engine;
+    let accept = |id: &str, entrypoint: &str, parent: &str| {
+        let invocation = Invocation { entrypoint: entrypoint.into(), parent: parent.into(), ..Default::default() };
+        engine.accept_run("alice", id, id, invocation).unwrap().0.id
+    };
+    let job = accept("job", "generate", "");
+    let child = accept("job/0", "upsample_prompt", &job);
+    let fallback = "precision 4: fidika/qwen3.5-9b-mtp@0.2.0 has no nvfp4, int8 or fp8 lane for sm120; served bf16";
+    engine.append_warning(&job, "precision 8: x@1 has no int8 or fp8 lane for sm90; served bf16").unwrap();
+    engine.append_warning(&child, fallback).unwrap();
+    let lines: Vec<Value> = engine.logs(&job).unwrap().iter().map(|l| serde_json::from_slice(&l.product).unwrap()).collect();
+    assert_eq!(lines, [
+        json!({"level": "warning", "text": "precision 8: x@1 has no int8 or fp8 lane for sm90; served bf16"}),
+        json!({"level": "warning", "text": format!("upsample_prompt: {fallback}")}),
+    ]);
+    assert!(engine.logs(&child).unwrap().is_empty());
+    drop(service);
+    let _ = std::fs::remove_dir_all(root);
+}
