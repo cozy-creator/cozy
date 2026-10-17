@@ -1,0 +1,82 @@
+name: owner-day
+# The owner's day with cozy, end to end, as a release gate: the real binary, Calcifer and TensorD
+# against a CI Tensorhub that tensorhub's scripts/live-hub-client.sh brings up (MinIO, a TLS front,
+# docker-provider CPU rentals). Once per TensorD: the newest cozy-runtime wheel's (released) and
+# this commit's (workspace). One machine's port is shaped like the owner's uplink.
+#   gh workflow run owner-day.yaml -R cozy-creator/cozy --ref <branch> [-f tensorhub_ref=<ref>]
+on:
+  workflow_dispatch:
+    inputs:
+      tensorhub_ref:
+        description: tensorhub-v2 ref whose Hub and harness the suite runs against
+        type: string
+        default: master
+  workflow_call:
+    inputs:
+      tensorhub_ref:
+        type: string
+        default: master
+
+permissions:
+  contents: read
+
+jobs:
+  owner-day:
+    name: owner-day (${{ matrix.tensord }} TensorD)
+    strategy:
+      fail-fast: false
+      matrix:
+        tensord: [released, workspace]
+    runs-on: ubuntu-latest
+    # Hang bound, not a work budget.
+    timeout-minutes: 50
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_PASSWORD: ci-only
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 2s --health-timeout 5s --health-retries 30
+    env:
+      PROOF_DATABASE_URL: postgres://postgres:ci-only@127.0.0.1:5432/postgres?sslmode=disable
+      CGO_ENABLED: '0'
+      GOFLAGS: -trimpath
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: cozy-creator/tensorhub-v2
+          ref: ${{ inputs.tensorhub_ref }}
+          ssh-key: ${{ secrets.TENSORHUB_READ_KEY }}
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - run: go build -ldflags "-X main.version=dev -X main.revision=$(git rev-parse HEAD)" -o dist/tensorhub .
+      # The Hub's TensorFS CLI and evaluator, which publish verifies with.
+      - uses: astral-sh/setup-uv@v7
+      - run: uv sync --project tools/evaluator --locked --no-dev --group proof
+      # The cozy workspace's test build fills most of the runner's disk.
+      - run: sudo rm -rf -- /usr/local/lib/android /usr/share/dotnet /opt/ghc && df -h /
+      # Port 47123 carries 2.6 Mbit/s with a 400 ms round trip (crates/calcifer/tests/shaped.rs).
+      - name: Shape the loopback
+        run: |
+          sudo modprobe sch_netem || { sudo apt-get update -qq && sudo apt-get install -y -qq "linux-modules-extra-$(uname -r)" && sudo modprobe sch_netem; }
+          sudo ip link set dev lo mtu 1500
+          sudo tc qdisc add dev lo root handle 1: prio bands 4 priomap 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+          sudo tc qdisc add dev lo parent 1:4 handle 40: netem delay 200ms rate 2600kbit limit 200
+          for side in dport sport; do
+            sudo tc filter add dev lo parent 1: protocol ip prio 1 u32 match ip $side 47123 0xffff flowid 1:4
+          done
+      - name: The owner's day
+        env:
+          COZY_TENSORD: ${{ matrix.tensord == 'workspace' && 'workspace' || '' }}
+          COZY_TEST_SHAPED_PORT: '47123'
+          COZY_TEST_SHAPED_BPS: '325000'
+          COZY_TEST_TFS: ${{ github.workspace }}/tools/evaluator/.venv/bin/tfs
+          COZY_TEST_EVAL: ${{ github.workspace }}/tools/evaluator/.venv/bin/cozy-eval
+          SHA: ${{ github.sha }}
+        run: >-
+          scripts/live-hub-client.sh "$SHA" -p cozy --no-fail-fast
+          --test owner_day --test run_hub --test run_release --test run_local --test package_publish
+          --test model_cycle --test machine_logs --test machine_rent --test tui
