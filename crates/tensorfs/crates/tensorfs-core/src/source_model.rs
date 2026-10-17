@@ -58,7 +58,8 @@ pub struct Access {
 }
 
 pub struct Request<'a> {
-    /// `hf://…@<revision>[/member]`, `civitai://<version>[/file]` or `object://sha256:<hex>/<file>`.
+    /// `hf://…@<revision>[/member]`, `civitai://<version>[/file]` or `object://sha256:<hex>/<file>`;
+    /// `pin` spells a pasted URL or a moving revision so.
     pub source: &'a str,
     /// Reviewed profiles to convert under; none: the one the headers select.
     pub profiles: &'a [String],
@@ -110,6 +111,81 @@ fn parse(source: &str) -> Result<(SourceUri, Option<String>)> {
         Code::SOURCE_NOT_ALLOWED,
         "a model source is hf://<org>/<repo>@<revision>[/member] or civitai://<version>[/file]",
     )
+}
+
+const SPELLINGS: &str = "a model source is hf://<org>/<repo>[@<revision>][/member], civitai://<version>[/file], \
+     or a huggingface.co or civitai.com URL";
+
+/// `raw` as `make` takes it: a pasted provider URL read as its source, and a HuggingFace
+/// branch, tag or short commit (`main` when none is named) pinned to the full commit it names
+/// now, with one metadata read under `huggingface`'s credential. A full commit, a Civitai
+/// version and a held object are exact already. A revision containing `/` is not spelled
+/// here: name its commit.
+pub fn pin(raw: &str, huggingface: &Access) -> Result<String> {
+    let source = canonical(raw.trim())?;
+    let Some(rest) = source.strip_prefix("hf://") else {
+        return Ok(source);
+    };
+    let (org, tail) = rest.split_once('/').ok_or(Refusal {
+        code: Code::SOURCE_NOT_ALLOWED,
+        detail: SPELLINGS.into(),
+    })?;
+    let (named, member) = match tail.find('/') {
+        Some(slash) => tail.split_at(slash),
+        None => (tail, ""),
+    };
+    let (repo, reference) = named.split_once('@').unwrap_or((named, "main"));
+    let full = reference.len() == 40 && reference.bytes().all(|b| b.is_ascii_hexdigit());
+    let commit = match full {
+        true => reference.to_ascii_lowercase(),
+        false => {
+            let uri = SourceUri::HuggingFace {
+                org: org.into(),
+                repo: repo.into(),
+                revision: String::new(),
+            };
+            let provider = Provider::new(uri, huggingface, &huggingface.credential)?;
+            providers::huggingface_commit(org, repo, reference, &provider.endpoints, &provider.credentials, Deadline::none())?
+        }
+    };
+    Ok(format!("hf://{org}/{repo}@{commit}{member}"))
+}
+
+/// A provider URL as its source spelling; a source spelling as it is.
+fn canonical(raw: &str) -> Result<String> {
+    if ["hf://", "civitai://", "object://"].iter().any(|p| raw.starts_with(p)) {
+        return Ok(raw.into());
+    }
+    let not = |why: &str| -> Result<String> { refuse(Code::SOURCE_NOT_ALLOWED, format!("{why}: {SPELLINGS}")) };
+    let Some(rest) = raw.strip_prefix("https://") else {
+        return not("not a provider source");
+    };
+    let (host, rest) = rest.split_once('/').unwrap_or((rest, ""));
+    let (path, query) = rest.split_once('?').unwrap_or((rest, ""));
+    let lower = query.to_ascii_lowercase();
+    if ["token", "key", "auth"].iter().any(|secret| lower.contains(secret)) || host.contains('@') {
+        return not("a provider credential never rides in a URL");
+    }
+    let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+    match host.to_ascii_lowercase().as_str() {
+        "huggingface.co" | "www.huggingface.co" | "hf.co" => match parts.as_slice() {
+            [org, repo] => Ok(format!("hf://{org}/{repo}")),
+            [org, repo, "tree", reference] => Ok(format!("hf://{org}/{repo}@{reference}")),
+            [org, repo, "blob" | "resolve", reference, member @ ..] if !member.is_empty() => {
+                Ok(format!("hf://{org}/{repo}@{reference}/{}", member.join("/")))
+            }
+            _ => not("a HuggingFace URL names a repository, its tree at a revision, or one file"),
+        },
+        "civitai.com" | "www.civitai.com" => {
+            let versions: Vec<&str> = query.split('&').filter_map(|pair| pair.strip_prefix("modelVersionId=")).collect();
+            match (parts.as_slice(), versions.as_slice()) {
+                (["api", "download", "models", version], _) => Ok(format!("civitai://{version}")),
+                (["models", ..], [version]) => Ok(format!("civitai://{version}")),
+                _ => not("a Civitai URL names one model version (modelVersionId)"),
+            }
+        }
+        _ => not("only huggingface.co and civitai.com URLs are provider sources"),
+    }
 }
 
 fn unquote(value: &str) -> String {
@@ -1047,6 +1123,48 @@ fn constructible(config: Vec<u8>) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pasted_provider_url_reads_as_its_source() {
+        for (url, source) in [
+            ("https://huggingface.co/org/repo", "hf://org/repo"),
+            ("https://huggingface.co/org/repo/tree/v1.0", "hf://org/repo@v1.0"),
+            ("https://hf.co/org/repo/blob/main/unet/a%20b.safetensors", "hf://org/repo@main/unet/a%20b.safetensors"),
+            ("https://huggingface.co/org/repo/resolve/main/model.safetensors?download=true", "hf://org/repo@main/model.safetensors"),
+            ("https://civitai.com/api/download/models/12345", "civitai://12345"),
+            ("https://civitai.com/models/99/some-name?modelVersionId=12345", "civitai://12345"),
+            ("hf://org/repo", "hf://org/repo"),
+        ] {
+            assert_eq!(canonical(url).unwrap(), source, "{url}");
+        }
+        for url in [
+            "http://huggingface.co/org/repo",
+            "https://example.com/org/repo",
+            "https://huggingface.co/org",
+            "https://huggingface.co/org/repo/tree/main/unet",
+            "https://huggingface.co/org/repo/resolve/main/x.safetensors?token=hf_x",
+            "https://civitai.com/models/99",
+            "s3://bucket/key",
+        ] {
+            assert_eq!(canonical(url).unwrap_err().code, Code::SOURCE_NOT_ALLOWED, "{url}");
+        }
+    }
+
+    #[test]
+    fn an_exact_source_pins_without_a_read() {
+        let commit = "AB".repeat(20);
+        // Endpoints nobody answers: a read would fail.
+        let access = Access {
+            credential: String::new(),
+            endpoints: Endpoints { huggingface: "http://127.0.0.1:9".into(), civitai: "http://127.0.0.1:9".into(), allow_local: true },
+        };
+        assert_eq!(
+            pin(&format!("hf://org/repo@{commit}/m.safetensors"), &access).unwrap(),
+            format!("hf://org/repo@{}/m.safetensors", commit.to_ascii_lowercase())
+        );
+        assert_eq!(pin("civitai://12345", &access).unwrap(), "civitai://12345");
+        assert_eq!(pin("https://civitai.com/api/download/models/7", &access).unwrap(), "civitai://7");
+    }
 
     #[test]
     fn a_source_names_its_provider_and_optional_carrier() {
