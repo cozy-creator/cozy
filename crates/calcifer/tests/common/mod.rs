@@ -278,7 +278,7 @@ pub fn local_spec(dir: &Path) -> (cozy_proto::calcifer::StagedInput, v1::RunSpec
 /// Whether the machine holds run `id` under exactly `spec`: the same id and spec answer the
 /// run, another spec is `run_id_conflict` (the machine's digest of what it was sent).
 pub async fn holds_as(link: &calcifer::Link, id: &RunId, spec: v1::RunSpec) -> bool {
-    match link.run(id.as_str(), 0, Some(spec)).await {
+    match link.submit(id.as_str(), spec).await {
         Ok(_) => true,
         Err(calcifer::LinkError::Refused { code, .. }) if code == "run_id_conflict" => false,
         Err(e) => panic!("run {id}: {e}"),

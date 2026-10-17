@@ -5,7 +5,10 @@
 use std::{
     path::Path,
     pin::Pin,
-    sync::{Arc, atomic::Ordering},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -25,8 +28,15 @@ use crate::{
     store,
 };
 
+/// The refusal of a machine from before this API (cozy v0.9's gRPC), which is never driven.
+pub const OUTDATED: &str = "machine_outdated";
+/// A machine's bulk lanes, each its own HTTP/1.1 connections: output reads use them all, an
+/// upload `UPLOAD_LANES` of them.
+pub(crate) const LANES: usize = 8;
 /// Parts of an upload in flight side by side, each on its own connection.
-const LANES: usize = 4;
+const UPLOAD_LANES: usize = 4;
+/// The most one upload part carries.
+const PART: u64 = 64 << 20;
 /// How often an upload asks the machine what it holds, which is its progress.
 const TELL_EVERY: Duration = Duration::from_secs(1);
 /// What an upload reads from its file at a time.
@@ -66,10 +76,9 @@ impl From<Error> for LinkError {
                 LinkError::Unreachable(format!("{}: {}", error.code, error.message))
             }
             Error::Transport(message) => LinkError::Unreachable(message),
-            // A machine from before this API (cozy v0.9's gRPC) is never driven: end it.
             Error::NotMachineApi(message) => LinkError::Refused {
-                code: "machine_outdated".into(),
-                message: format!("{message}; end it (`cozy machine end`) and use a new one"),
+                code: OUTDATED.into(),
+                message,
             },
         }
     }
@@ -81,6 +90,8 @@ pub type Live<T> = Pin<Box<dyn Stream<Item = Result<T, LinkError>> + Send>>;
 #[derive(Clone)]
 pub struct Link {
     machine: Machine,
+    /// The bulk lanes, kept across transfers: a project's many small files reuse connections.
+    lanes: Arc<Mutex<Vec<Option<Bulk>>>>,
 }
 
 impl Link {
@@ -92,6 +103,7 @@ impl Link {
         };
         Ok(Self {
             machine: Machine::new(&endpoint.address, endpoint.pin, auth)?,
+            lanes: Arc::new(Mutex::new(vec![None; LANES])),
         })
     }
 
@@ -100,22 +112,39 @@ impl Link {
         Ok(self.machine.bulk()?)
     }
 
-    /// Sends the run (with `spec`) or attaches to it, and answers its state with its events after
-    /// `after`. Closing them never cancels.
-    pub async fn run(
+    /// Bulk lane `i`, connected again when `fresh`.
+    pub(crate) fn lane(&self, i: usize, fresh: bool) -> Option<Bulk> {
+        let mut lanes = self.lanes.lock().unwrap_or_else(|e| e.into_inner());
+        if fresh || lanes[i].is_none() {
+            lanes[i] = self.machine.bulk().ok();
+        }
+        lanes[i].clone()
+    }
+
+    /// Sends the run: its state, the machine's acceptance. The same id and spec again answer the
+    /// run as it is; another spec is `run_id_conflict`.
+    pub async fn submit(&self, id: &str, spec: v1::RunSpec) -> Result<v1::RunState, LinkError> {
+        let request = v1::RunRequest {
+            id: id.into(),
+            spec,
+        };
+        Ok(self.machine.submit(&request).await?)
+    }
+
+    /// The run's log after `after`: its state first, then its events until its outcome. Closing
+    /// it never cancels.
+    pub async fn events(&self, id: &str, after: u64) -> Result<Live<v1::RunEvent>, LinkError> {
+        Ok(Box::pin(self.machine.events(id, after).await?.map_err(LinkError::from)))
+    }
+
+    /// Attaches to the run: its state, and its events after `after`. `NotFound` when the machine
+    /// never received it.
+    pub async fn attach(
         &self,
         id: &str,
         after: u64,
-        spec: Option<v1::RunSpec>,
     ) -> Result<(v1::RunState, Live<v1::RunEvent>), LinkError> {
-        if let Some(spec) = spec {
-            let request = v1::RunRequest {
-                id: id.into(),
-                spec,
-            };
-            self.machine.submit(&request).await?;
-        }
-        let mut events = Box::pin(self.machine.events(id, after).await?.map_err(LinkError::from));
+        let mut events = self.events(id, after).await?;
         match events.next().await {
             Some(Ok(v1::RunEvent {
                 event: v1::Event::State(state),
@@ -190,34 +219,38 @@ impl Link {
             Some(now.saturating_sub(from) as f64 / seconds)
         };
         progress(from, None);
-        let mut lanes: Vec<Option<Bulk>> = vec![None; LANES];
+        // The most the machine has said it holds, by a HEAD or a part's answer.
+        let landed = Arc::new(AtomicU64::new(from));
         loop {
             let before = v1::held_bytes(&held);
-            let parts = lanes::parts(&held, length, LANES);
-            let sent = lanes::transfer(parts, LANES, |leg| {
-                let lane = &mut lanes[leg.lane];
-                if leg.fresh || lane.is_none() {
-                    *lane = self.bulk().ok();
-                }
-                put(lane.clone(), name.clone(), path.to_owned(), length, leg)
+            let parts = lanes::parts(&held, length, UPLOAD_LANES, PART);
+            let sent = lanes::transfer(parts, UPLOAD_LANES, |leg| {
+                let lane = self.lane(leg.lane, leg.fresh);
+                put(lane, name.clone(), path.to_owned(), length, leg, landed.clone())
             });
             let tell = async {
                 let mut tick = tokio::time::interval(TELL_EVERY);
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 tick.tick().await;
                 loop {
                     tick.tick().await;
                     if let Ok(now) = self.machine.held(&name).await {
-                        let now = v1::held_bytes(&now);
-                        progress(now, rate(now));
+                        landed.fetch_max(v1::held_bytes(&now), Ordering::Relaxed);
                     }
+                    let now = landed.load(Ordering::Relaxed);
+                    progress(now, rate(now));
                 }
             };
             let sent = tokio::select! {
                 sent = sent => sent,
                 _ = tell => unreachable!("it tells until the parts end"),
             };
-            held = self.machine.held(&name).await?;
-            let now = v1::held_bytes(&held);
+            // A part answered with the whole object held: it is stored, with no HEAD to ask.
+            let mut now = landed.load(Ordering::Relaxed);
+            if now < length {
+                held = self.machine.held(&name).await?;
+                now = v1::held_bytes(&held);
+            }
             if now >= length {
                 progress(length, rate(length));
                 return Ok(());
@@ -238,13 +271,15 @@ impl Link {
     }
 }
 
-/// Lands one part from `path` on `lane`, moving `leg.at` past each byte handed to it.
+/// Lands one part from `path` on `lane`, moving `leg.at` past each byte handed to it and `landed`
+/// to what the machine answers it holds.
 async fn put(
     lane: Option<Bulk>,
     digest: String,
     path: std::path::PathBuf,
     total: u64,
     leg: Leg,
+    landed: Arc<AtomicU64>,
 ) -> Result<(), Ranged<LinkError>> {
     let lane = lane.ok_or_else(|| Ranged::Again("no connection to the machine".into()))?;
     let unreadable = |e: std::io::Error| {
@@ -267,7 +302,10 @@ async fn put(
         .put(&digest, (leg.first, length, total), reqwest::Body::wrap_stream(body))
         .await
     {
-        Ok(_) => Ok(()),
+        Ok(held) => {
+            landed.fetch_max(v1::held_bytes(&held), Ordering::Relaxed);
+            Ok(())
+        }
         Err(e) => match LinkError::from(e) {
             LinkError::Unreachable(message) => Err(Ranged::Again(message)),
             e => Err(Ranged::Stop(e)),

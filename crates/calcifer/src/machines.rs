@@ -47,7 +47,7 @@ use tracing::warn;
 use crate::{
     Calcifer,
     api::{Api, Refusal, parse},
-    link::{self, Link, LinkError},
+    link::{self, Link, LinkError, OUTDATED},
     rentals::Hubs,
     store::{AskKind, Endpoint, MachineRow, Store},
 };
@@ -203,12 +203,13 @@ impl Machines {
             )
             .next(format!("cozy machine show {name}")));
         }
-        let unreachable = |e: LinkError| {
-            Error::new(
+        let unreachable = |e: LinkError| match e {
+            LinkError::Refused { code, message } if code == OUTDATED => outdated(address, message),
+            e => Error::new(
                 Kind::Unavailable,
                 "machine_unreachable",
                 format!("{address}: {e}"),
-            )
+            ),
         };
         let leaf: [u8; 32] =
             Sha256::digest(link::presented_leaf(address).await.map_err(unreachable)?).into();
@@ -974,6 +975,7 @@ pub(crate) fn signer(path: &Path) -> Result<SigningKey, Error> {
 /// A machine's refusal, as the API answers it.
 fn refusal(name: &str, e: LinkError) -> Error {
     match e {
+        LinkError::Refused { code, message } if code == OUTDATED => outdated(name, message),
         LinkError::Refused { code, message } => Error::new(
             Kind::Conflict,
             "machine_refused",
@@ -1001,6 +1003,12 @@ fn refusal(name: &str, e: LinkError) -> Error {
             format!("{name}: {message}"),
         ),
     }
+}
+
+/// A machine from before the HTTP API, which this controller never drives.
+fn outdated(name: &str, message: String) -> Error {
+    Error::new(Kind::Conflict, OUTDATED, format!("{name}: {message}"))
+        .remedy(format!("end it: cozy machine end {name}"))
 }
 
 pub(crate) fn not_found(text: &str) -> Error {

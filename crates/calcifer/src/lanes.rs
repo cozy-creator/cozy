@@ -19,6 +19,10 @@ const SLOW: f64 = 8.0;
 /// How often ranges in flight are measured, and the shortest window a rate is judged over.
 const SAMPLE: Duration = Duration::from_secs(1);
 const WINDOW: Duration = Duration::from_secs(2);
+/// A rate is judged over at least this many round trips (a range's typical wait for its first
+/// byte), so TCP's own loss recovery, which holds bytes back a round trip or two, never reads as a
+/// slow range on a far link.
+const ROUND_TRIPS: u32 = 4;
 
 /// Why a range's transfer stopped.
 pub(crate) enum Ranged<E> {
@@ -139,10 +143,13 @@ where
 
 /// Measures the ranges in flight and drops the one whose first byte waits `SLOW` times longer
 /// than its peers' did, or whose bytes come `SLOW` times slower than its peers' (finished ranges
-/// included) over its latest window; its rest is asked again. A range whose bytes have all moved
-/// is waiting for its answer and is not judged.
+/// included) over its latest window of `ROUND_TRIPS` round trips; its rest is asked again. A
+/// range whose bytes have all moved is waiting for its answer and is not judged.
 fn judge(flights: &mut HashMap<Id, Flight>, finished: &[f64], waits: &mut Vec<Duration>) {
     let now = Instant::now();
+    waits.sort();
+    let wait = waits.get(waits.len() / 2).copied();
+    let window = wait.map_or(WINDOW, |wait| (wait * ROUND_TRIPS).max(WINDOW));
     let mut rates = finished.to_vec();
     let mut judged = vec![];
     for flight in flights.values_mut() {
@@ -154,11 +161,10 @@ fn judge(flights: &mut HashMap<Id, Flight>, finished: &[f64], waits: &mut Vec<Du
                 flight.window = Some((now, at));
             }
             None => {
-                waits.sort();
-                let typical = waits.get(waits.len() / 2).map(|wait| wait.mul_f64(SLOW));
+                let typical = wait.map(|wait| wait.mul_f64(SLOW));
                 flight.slow |= typical.is_some_and(|t| now - flight.began > t.max(WINDOW));
             }
-            Some((since, seen)) if now - since >= WINDOW => {
+            Some((since, seen)) if now - since >= window => {
                 let rate = (at - seen) as f64 / (now - since).as_secs_f64();
                 flight.window = Some((now, at));
                 rates.push(rate);
@@ -179,14 +185,12 @@ fn judge(flights: &mut HashMap<Id, Flight>, finished: &[f64], waits: &mut Vec<Du
     }
 }
 
-/// What `held` leaves of `[0, length)`, cut into parts of `clamp(missing / lanes, MIN, MAX)`
-/// bytes.
-pub(crate) fn parts(held: &[(u64, u64)], length: u64, lanes: usize) -> Vec<(u64, u64)> {
-    const MIN: u64 = 1 << 20;
-    const MAX: u64 = 64 << 20;
+/// What `held` leaves of `[0, length)`, cut into parts of `clamp(missing / lanes, 1 MiB, most)`
+/// bytes, so every lane ramps on its own connection.
+pub(crate) fn parts(held: &[(u64, u64)], length: u64, lanes: usize, most: u64) -> Vec<(u64, u64)> {
     let missing = cozy_proto::machine::missing(held, length);
     let total = cozy_proto::machine::held_bytes(&missing);
-    let size = (total / lanes as u64).clamp(MIN, MAX);
+    let size = (total / lanes as u64).clamp(1 << 20, most);
     missing
         .into_iter()
         .flat_map(|(a, b)| (a..b).step_by(size as usize).map(move |x| (x, (x + size).min(b))))
@@ -202,20 +206,16 @@ mod tests {
     #[test]
     fn missing_bytes_are_cut_into_parts_a_lane_each() {
         assert_eq!(
-            parts(&[], 20 * MIB, 4),
+            parts(&[], 20 * MIB, 4, 64 * MIB),
             (0..4).map(|i| (i * 5 * MIB, (i + 1) * 5 * MIB)).collect::<Vec<_>>()
         );
-        assert_eq!(parts(&[(0, 100)], 100, 4), vec![], "all held");
+        assert_eq!(parts(&[(0, 100)], 100, 4, 64 * MIB), vec![], "all held");
         assert_eq!(
-            parts(&[(0, 10), (20, 30)], 3 * MIB, 4),
+            parts(&[(0, 10), (20, 30)], 3 * MIB, 4, 64 * MIB),
             vec![(10, 20), (30, MIB + 30), (MIB + 30, 2 * MIB + 30), (2 * MIB + 30, 3 * MIB)],
             "gaps, then 1 MiB parts at least"
         );
-        assert_eq!(
-            parts(&[], 1024 * MIB, 4).len(),
-            16,
-            "64 MiB parts at most"
-        );
+        assert_eq!(parts(&[], 1024 * MIB, 4, 64 * MIB).len(), 16, "at most `most`");
     }
 
     /// A range that fails resumes from where its bytes stopped, its lane redialed; one that never

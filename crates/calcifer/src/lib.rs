@@ -587,7 +587,7 @@ impl Calcifer {
                 if !self.store.mark_sent(id, machine)? {
                     return Ok(());
                 }
-                link.run(id, 0, Some(spec)).await?
+                (link.submit(id, spec).await?, None)
             }
             State::Sent | State::Accepted => {
                 if run.cancel_requested {
@@ -595,16 +595,19 @@ impl Calcifer {
                     canceled = true;
                 }
                 // It may be there: attach first, and send again only to a machine that never got it.
-                match link.run(id, run.cursor, None).await {
+                match link.attach(id, run.cursor).await {
                     Err(LinkError::NotFound) if run.state == State::Sent => {
                         run.spec.as_ref().ok_or_else(not_kept)?;
                         self.write_inputs(link, run, machine).await?;
                         let _turn = sending.lock().await;
                         self.known_warm(run, machine, link).await?;
                         let spec = spec(self.access(run, machine).await?)?;
-                        link.run(id, 0, Some(spec)).await?
+                        (link.submit(id, spec).await?, None)
                     }
-                    attached => attached?,
+                    attached => {
+                        let (state, events) = attached?;
+                        (state, Some(events))
+                    }
                 }
             }
         };
@@ -620,6 +623,11 @@ impl Calcifer {
                 return Ok(());
             }
         }
+        // A run just sent is accepted by the machine's answer; its events follow from the start.
+        let stream = match stream {
+            Some(stream) => stream,
+            None => link.events(id, 0).await?,
+        };
         self.follow(&run.id, stream, link, wake, canceled).await
     }
 
