@@ -261,15 +261,20 @@ impl Client {
         let wanted = LockFile::new(home.calcifer().join(WANTED));
         let _wanted = wanted.lock(LockKind::Shared).map_err(failed)?;
         let services = Services::new(home, &self.0.user_home);
+        let managed = services.available();
         let mut child = None;
-        if services.available() {
-            services.start(&self.spec()).map_err(failed)?;
-        } else {
-            child = Some(self.spawn().map_err(failed)?);
-        }
         let began = Instant::now();
         let mut reported = began;
         loop {
+            // Nobody holds the home: start one. Again too when the last start lost to a
+            // Calcifer that was stopping, which held the lock until it went.
+            if child.is_none() && self.lock_free() {
+                match managed {
+                    true => services.start(&self.spec()).map_err(failed)?,
+                    false => child = Some(self.spawn().map_err(failed)?),
+                }
+            }
+            tokio::time::sleep(SAMPLE).await;
             if let Some(error) = refusal(&refused) {
                 return Err(error);
             }
@@ -289,12 +294,8 @@ impl Client {
                         .next("cozy logs calcifer")
                     }));
                 }
-                // Another Calcifer held the lock: wait for its record, or start again once it
-                // has let go without one.
+                // Another Calcifer held the lock: wait for its record, or for it to let go.
                 child = None;
-            }
-            if child.is_none() && !services.available() && self.lock_free() {
-                child = Some(self.spawn().map_err(failed)?);
             }
             if reported.elapsed() >= REPORT {
                 reported = Instant::now();
@@ -303,7 +304,6 @@ impl Client {
                     began.elapsed().as_secs()
                 ));
             }
-            tokio::time::sleep(SAMPLE).await;
         }
     }
 
@@ -352,8 +352,11 @@ impl Client {
                 .bearer_auth(&holder.token)
                 .send()
                 .await;
+            // Nothing answered: Calcifer is gone, or one that is stopping closed the connection
+            // under the request. Every request is safe to send again: reads, keyed asks, cancels.
+            // A 401: a restart minted a new token.
             let retry = match &sent {
-                Err(e) => e.is_connect(),
+                Err(_) => true,
                 Ok(answer) => answer.status() == StatusCode::UNAUTHORIZED,
             };
             if retry && again < AGAIN {
