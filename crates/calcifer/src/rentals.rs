@@ -396,6 +396,7 @@ impl Machines {
                     self.store()
                         .settle_ask(&ask.key, Ok(Some(&row)))
                         .map_err(internal)?;
+                    self.calcifer.machine_changed();
                     self.calcifer.owe_less();
                     if let Some(run) = &ask.run {
                         self.calcifer.place(run, &row.name).map_err(internal)?;
@@ -791,6 +792,8 @@ impl Machines {
         if ask.state == AskState::Failed {
             self.store().reopen_ask(&ask.key).map_err(internal)?;
         }
+        // A pending end shows the machine `ending`.
+        self.calcifer.machine_changed();
         let me = self.clone();
         self.spawn(async move { me.finish_end(ask).await });
         Ok(())
@@ -810,6 +813,7 @@ impl Machines {
             if let Err(e) = settled {
                 warn!(ask = ask.key, "{e}");
             }
+            self.calcifer.machine_changed();
             self.calcifer.owe_less();
         };
         let mut released = false;
