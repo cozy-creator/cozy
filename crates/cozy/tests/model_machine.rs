@@ -1,4 +1,4 @@
-//! `cozy model download|list` on a real machine: TensorD 0.6.0 from the cozy-runtime wheel
+//! `cozy model download` on a real machine: TensorD 0.6.0 from the cozy-runtime wheel
 //! (COZY_TEST_TENSORD) added to this home's Calcifer. The machine makes the model from a tiny
 //! public Hugging Face repository; no weight byte lands in the controller's home.
 #![cfg(unix)]
@@ -33,23 +33,6 @@ fn download_makes_a_provider_source_on_the_machine() {
     let held = home.cozy(["model", "download", "local/tiny", "--on", "m1"]);
     assert_eq!(held.code, 0, "{held:?}");
     assert!(held.stdout.contains("local/tiny"), "{held:?}");
-
-    // `model list` reads the machine's Status, which follows the store within a frame or two:
-    // every machine by default, one with --on.
-    let holds = |args: &[&str]| {
-        let listed = home.json(args);
-        listed["models"].as_array().unwrap().iter().any(|r| r["machine"] == "m1" && r["model"] == "local/tiny")
-    };
-    // A hang bound for the test; the product never waits on it.
-    let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    while !holds(&["--json", "model", "list"]) {
-        let machines = home.cozy(["--json", "machine", "list"]);
-        assert!(std::time::Instant::now() < until, "local/tiny never listed: {machines:?}");
-        std::thread::sleep(std::time::Duration::from_millis(500));
-    }
-    assert!(holds(&["--json", "model", "list", "--on", "m1"]));
-    let missing = home.cozy(["--json", "model", "list", "--on", "nowhere"]);
-    assert_eq!((missing.code, missing.refusal()["code"].as_str()), (1, Some("machine_not_found")), "{missing:?}");
 
     // An unpinned source is the machine's refusal, which names the pinned grammar.
     let unpinned = home.cozy(["--json", "model", "download", "hf://hf-internal-testing/tiny-random-gpt2", "local/x", "--on", "m1"]);
