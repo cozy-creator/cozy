@@ -1150,7 +1150,7 @@ mod tests {
         let pyproject = fs::read_to_string(fixture.join("pyproject.toml")).unwrap();
         fs::write(
             project.join("pyproject.toml"),
-            pyproject.replace("cozy-runtime>=0.18.99,<0.19", &format!("cozy-runtime=={dev}"))
+            pyproject.replace("cozy-runtime>=0.26,<0.27", &format!("cozy-runtime=={dev}"))
                 + &format!("\n[tool.uv.sources]\ncozy-runtime = {{ path = \"{vendored}\" }}\n"),
         )
         .unwrap();

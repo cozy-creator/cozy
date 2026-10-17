@@ -71,7 +71,7 @@ def test_real_older_sdk_package_installs_without_peer_version_floor(generation, 
     shutil.copytree(FIXTURE, source)
     project = source / "pyproject.toml"
     project.write_text(project.read_text().replace(
-        "cozy-runtime>=0.18.89,<0.18.101", "cozy-runtime==0.18.89"))
+        "cozy-runtime>=0.26,<0.27", "cozy-runtime==0.26.4"))
     client_wheel = next((Path(generation.python).parents[4] / "client").glob("*.whl"))
     older = install(source, tmp_path / "older-generations", client_wheel)
     versions = {dependency.name: dependency.version for dependency in older.dependencies}

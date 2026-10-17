@@ -123,39 +123,8 @@ wheels = [
 ]
 
 [[package]]
-name = "tensord-client"
-version = "0.1.0"
-source = { editable = "." }
-dependencies = [
-    { name = "msgspec" },
-]
-
-[package.optional-dependencies]
-installer = [
-    { name = "packaging" },
-]
-test = [
-    { name = "cozy-runtime", marker = "python_full_version >= '3.12'" },
-    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
-    { name = "numpy", version = "2.5.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
-    { name = "pytest" },
-    { name = "scikit-learn" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "cozy-runtime", marker = "python_full_version >= '3.12' and extra == 'test'", specifier = ">=0.19,<0.20" },
-    { name = "msgspec", specifier = ">=0.18,<1" },
-    { name = "numpy", marker = "extra == 'test'", specifier = ">=2,<3" },
-    { name = "packaging", marker = "extra == 'installer'", specifier = ">=24,<27" },
-    { name = "pytest", marker = "extra == 'test'", specifier = ">=8,<10" },
-    { name = "scikit-learn", marker = "extra == 'test'", specifier = ">=1.5,<2" },
-]
-provides-extras = ["installer", "test"]
-
-[[package]]
 name = "cozy-runtime"
-version = "0.19.0"
+version = "0.26.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "cryptography" },
@@ -165,10 +134,10 @@ dependencies = [
     { name = "pillow" },
     { name = "tensorfs" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/c6/5b/681b856b95e61a920a120c39e7c527c62e6b6d62ed8b16060fb2d266ded6/cozy_runtime-0.19.0.tar.gz", hash = "sha256:6ffe2d85c6126fdeabe6bb079f9374369a4b05ad60128780e276624f4e9d535b", size = 3508500, upload-time = "2026-10-06T19:58:09.309Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/6b/b3/c7a839798cb6a7cf978bdc8606fe9b7421ec2a340f1a9009cd37b83220af/cozy_runtime-0.26.4.tar.gz", hash = "sha256:ad3bf5afe33fa8778a79430c0b4284fced19f5f834578e4f92dee1d2dc67b3a4", size = 1935001, upload-time = "2026-10-17T02:30:35.85Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/d0/95/9b05d794ba752a3adb6c2fbcd1d34c8ed68c793d733e39f2bb9d82c3d1a4/cozy_runtime-0.19.0-cp312-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:6c83965446b768aa701b14e4369c697192a9f5fc5b3c9faa9b47055ffbfa00e6", size = 27458490, upload-time = "2026-10-06T19:58:04.618Z" },
-    { url = "https://files.pythonhosted.org/packages/36/b3/db10703ffb38d42929d3a1ee968dfa1fdb434a186e8c63e67c41bfb2479d/cozy_runtime-0.19.0-py3-none-any.whl", hash = "sha256:2164af5f318173774b12c869150870a89f317d4260aea04a1b5cc43b7acf0834", size = 2817664, upload-time = "2026-10-06T19:58:07.702Z" },
+    { url = "https://files.pythonhosted.org/packages/24/0c/5a451d1dd376fe4df3de99e60cb3a765f9e17bb7a0c5330a39667354a76e/cozy_runtime-0.26.4-cp312-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:ae21bcd33acf33237f53bc6bc5a2b6c65c22982771c285b79389e69e787366aa", size = 26153917, upload-time = "2026-10-17T02:30:31.625Z" },
+    { url = "https://files.pythonhosted.org/packages/c4/19/22528594cdf3b54db137d8001723a5aa28456a6517c005678092a0b22af3/cozy_runtime-0.26.4-py3-none-any.whl", hash = "sha256:7eb328f52dc6cfab18ba62bd3d84c1f9b8ea4e7f069498c6e95c02c851c7d9c7", size = 1022453, upload-time = "2026-10-17T02:30:34.385Z" },
 ]
 
 [[package]]
@@ -852,11 +821,43 @@ wheels = [
 ]
 
 [[package]]
+name = "tensord-client"
+version = "0.1.0"
+source = { editable = "." }
+dependencies = [
+    { name = "msgspec" },
+]
+
+[package.optional-dependencies]
+installer = [
+    { name = "packaging" },
+]
+test = [
+    { name = "cozy-runtime", marker = "python_full_version >= '3.12'" },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
+    { name = "numpy", version = "2.5.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "pytest" },
+    { name = "scikit-learn" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "cozy-runtime", marker = "python_full_version >= '3.12' and extra == 'test'", specifier = ">=0.26,<0.27" },
+    { name = "msgspec", specifier = ">=0.18,<1" },
+    { name = "numpy", marker = "extra == 'test'", specifier = ">=2,<3" },
+    { name = "packaging", marker = "extra == 'installer'", specifier = ">=24,<27" },
+    { name = "pytest", marker = "extra == 'test'", specifier = ">=8,<10" },
+    { name = "scikit-learn", marker = "extra == 'test'", specifier = ">=1.5,<2" },
+]
+provides-extras = ["installer", "test"]
+
+[[package]]
 name = "tensorfs"
-version = "0.4.0"
+version = "0.10.0"
 source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/0b/c2/2d7e9ad364099d1a3274941807523431ef53ccaaf125bed8a73a7c31c8e7/tensorfs-0.10.0.tar.gz", hash = "sha256:e1dcb0989e0ae7d365847abe079bec9818d80f6825e35a120e05216ccfbe09a2", size = 1015941, upload-time = "2026-10-16T07:12:21.191Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/b2/2a/807904f1bd6b6363fcca29d7af86bf8cb3f4c761fed340444deb0926e362/tensorfs-0.4.0-cp312-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:af27552ec216b04341fa23260de7ea8b2455055cf778efca0271394964292ba1", size = 1102282, upload-time = "2026-10-06T19:56:32.422Z" },
+    { url = "https://files.pythonhosted.org/packages/54/21/efb6e5ed5064d0681b2b501346c7884207e260c678064b3b08794844e77d/tensorfs-0.10.0-cp312-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:1b12912d66f3d177dc9e31917759f852fe4e769b8a26e09db6516904dcd80596", size = 8879660, upload-time = "2026-10-16T07:12:19.192Z" },
 ]
 
 [[package]]
