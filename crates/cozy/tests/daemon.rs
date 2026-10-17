@@ -76,15 +76,18 @@ fn calcifer_s_log_is_followed_across_rotations_without_a_line_missed_or_repeated
     let dir = home.root().join("calcifer");
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("calcifer.log");
-    let write = |n: usize| {
+    let open = || {
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).append(true).open(&path).unwrap()
+    };
+    // Written as Calcifer writes it: line by line through a handle it keeps open, which a
+    // rotation leaves on the renamed file.
+    let mut file = open();
+    let mut write = |n: usize| {
         if n > 0 && n.is_multiple_of(400) {
             std::fs::rename(&path, dir.join("calcifer.log.1")).unwrap();
+            file = open();
         }
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .unwrap();
         file.write_all(format!("line {n}\n").as_bytes()).unwrap();
     };
     write(0);
