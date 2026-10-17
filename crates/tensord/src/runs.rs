@@ -426,14 +426,11 @@ impl Runs {
                 );
                 let stage = format!("uploading to {destination}");
                 // A cancel stops the push; only finalizing, which publishes, cannot be taken back.
-                let published = tensorfs_core::transport::publish(&tensorfs_core::transport::Publication {
+                let published = publishing.publish(&hub::Publication {
                     store: publisher.store(),
-                    hub: publishing.origin(),
                     destination,
                     manifest: &manifest,
                     operation: &operation,
-                    credential: publishing.credential(),
-                    policy: publishing.policy(),
                     progress: &|done, total| observe(&stage, done, total),
                     streams: 8,
                     stop,

@@ -485,14 +485,11 @@ impl Weights {
             "output-{}",
             &sha256::hex_digest(format!("{}\0{}\0{slot}", grant.actor, grant.run).as_bytes())[..40]
         );
-        tensorfs_core::transport::publish(&tensorfs_core::transport::Publication {
+        publishing.publish(&hub::Publication {
             store: &self.store,
-            hub: publishing.origin(),
             destination: repository,
             manifest,
             operation: &operation,
-            credential: publishing.credential(),
-            policy: publishing.policy(),
             progress: &|_, _| (),
             streams: 8,
             stop: None,

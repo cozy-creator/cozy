@@ -166,7 +166,29 @@ async fn enveloped(response: reqwest::Response) -> reqwest::Result<reqwest::Resp
     let body = response.bytes().await?;
     let parsed = serde_json::from_slice::<serde_json::Value>(&body).ok();
     let body = match parsed {
-        Some(value) if value["error"].is_object() || value["error"].is_string() => body,
+        Some(value) if value["error"].is_string() => body,
+        // The Hub's envelope, its fields made whole: a refusal missing one still reads as typed.
+        Some(mut value) if value["error"].is_object() => {
+            let error = &mut value["error"];
+            let whole = ["code", "message", "remedy"]
+                .iter()
+                .all(|k| error[k].is_string());
+            if whole {
+                body
+            } else {
+                for (key, default) in [
+                    ("code", format!("http_{}", status.as_u16())),
+                    ("message", status.to_string()),
+                    ("remedy", String::new()),
+                ] {
+                    if !error[key].is_string() {
+                        error[key] = default.into();
+                    }
+                }
+                headers.remove(reqwest::header::CONTENT_LENGTH);
+                serde_json::to_vec(&value).expect("JSON").into()
+            }
+        }
         _ => {
             let said: String = String::from_utf8_lossy(&body)
                 .trim()

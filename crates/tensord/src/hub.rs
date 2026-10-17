@@ -17,6 +17,9 @@ use tensorfs_core::transport::{
 };
 
 pub use hub_client::{types, Op};
+pub use publication::{Publication, Published};
+
+mod publication;
 
 /// A run's reasons when its capability does not carry it (th-241's typed refusals).
 pub mod reason {
@@ -342,6 +345,8 @@ pub struct Catalog {
     origin: String,
     host: String,
     hub: hub_client::Client,
+    /// The Hub as the run's capability, for an operation it names.
+    run: Option<hub_client::Client>,
     credential: Option<Presenter>,
     policy: SourcePolicy,
 }
@@ -370,6 +375,7 @@ impl Catalog {
             origin,
             host,
             hub,
+            run: None,
             credential: None,
             policy,
         })
@@ -397,11 +403,13 @@ impl Catalog {
         let mut catalog = Self::new(source).map_err(|e| ("catalog_read_failed", e.0))?;
         match &source.capability {
             Some(capability) if capability.names(op) => {
+                let http = http(source.ca_der.as_deref()).map_err(|e| ("catalog_read_failed", e.0))?;
+                let credential = Credential::Run(capability.run.clone());
+                catalog.run = Some(hub_client::Client::connect(&source.origin, http.clone(), credential));
                 catalog.credential = Some(Presenter {
                     capability: capability.clone(),
                     host: catalog.host.clone(),
-                    http: http(source.ca_der.as_deref())
-                        .map_err(|e| ("catalog_read_failed", e.0))?,
+                    http,
                     forbidden: AtomicBool::new(false),
                 });
             }

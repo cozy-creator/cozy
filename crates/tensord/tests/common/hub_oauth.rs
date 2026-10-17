@@ -255,40 +255,47 @@ pub fn test_hub() -> (String, Arc<Mutex<Hub>>) {
                 }
                 (Method::GET, p) if p.starts_with("/v1/models/acme/tiny/checkpoints/") => (
                     StatusCode::NOT_FOUND,
-                    r#"{"error":{"code":"model.checkpoint_not_found","message":"absent"}}"#,
+                    r#"{"error":{"code":"model.checkpoint_not_found","message":"absent","remedy":""}}"#,
                 )
                     .into_response(),
+                // The Hub's own answers, as api/openapi.yaml spells them.
                 (Method::PUT, p) if p.starts_with(publication) => {
-                    held.declared = ids("objects");
-                    let rows: Vec<_> = held
-                        .declared
-                        .iter()
-                        .map(|id| serde_json::json!({"object_id": id, "state": "claimed"}))
+                    let declared: Value = serde_json::from_slice(&body).unwrap();
+                    let rows: Vec<Value> = declared["objects"].as_array().unwrap().iter()
+                        .map(|row| serde_json::json!({"object_id": row["object_id"], "length": row["length"], "state": "pending"}))
                         .collect();
-                    json(serde_json::json!({"publication": {"state": "open", "objects": rows}}))
+                    held.declared = ids("objects");
+                    let operation = &p[publication.len()..];
+                    json(serde_json::json!({"created": true,
+                        "publication": {"operation": operation, "state": "open", "objects": rows}}))
                 }
                 (Method::POST, p) if p.starts_with(publication) && p.ends_with("/grants") => {
                     let grants: Vec<_> = ids("object_ids")
                         .into_iter()
                         .map(|id| {
-                            serde_json::json!({"object_id": id,
-                            "url": format!("{base}/upload/{}", &id[7..]), "required_headers": {}})
+                            serde_json::json!({"object_id": id, "length": 0,
+                            "url": format!("{base}/upload/{}", &id[7..]), "required_headers": {},
+                            "expires_at_unix": 0})
                         })
                         .collect();
-                    json(serde_json::json!({ "grants": grants }))
+                    json(serde_json::json!({ "grants": grants, "held": [], "server_time_unix": 0 }))
                 }
                 (Method::POST, p) if p.starts_with(publication) && p.ends_with("/verify") => {
-                    json(serde_json::json!({}))
+                    json(serde_json::json!({"publication": {"operation": "op", "state": "open", "objects": []}}))
                 }
                 (Method::POST, p) if p.starts_with(publication) && p.ends_with("/finalize") => {
                     let body: Value = serde_json::from_slice(&body).unwrap();
                     held.finalized
                         .push(body["manifest_id"].as_str().unwrap().to_string());
-                    json(serde_json::json!({"state": "completed"}))
+                    // Queued, as the Hub answers a finalize (202).
+                    (StatusCode::ACCEPTED, [("content-type", "application/json")],
+                        serde_json::json!({"operation": "op", "state": "completed",
+                            "status_url": format!("{p}ation")}).to_string())
+                        .into_response()
                 }
                 _ => (
                     StatusCode::NOT_FOUND,
-                    r#"{"error":{"code":"route.absent","message":"no such route"}}"#,
+                    r#"{"error":{"code":"route.absent","message":"no such route","remedy":""}}"#,
                 )
                     .into_response(),
             }
