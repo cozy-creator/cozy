@@ -18,7 +18,7 @@ use base64::Engine as _;
 use fs2::FileExt;
 use serde_json::{json, Value};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
@@ -1060,8 +1060,17 @@ impl Publisher {
             args.extend(["--find-links", links]);
         }
         args.extend(self.sdk.requirements.iter().map(String::as_str));
-        // uv's failure names its step (`uv pip install` or `uv pip check`) and its output.
-        let own = self.uv(&args, stop).and_then(|()| self.uv(&["pip", "check", "--no-config", "--python", py], stop));
+        // What the release's own closure reports already stands (NVIDIA's aarch64 cusparseLt
+        // wheel is tagged `sbsa`, so uv flags it on every Linux arm64 machine): the pair is
+        // refused only for a finding it adds. uv's failure names its step and its output.
+        let before = self.check(py, stop)?;
+        let own = self.uv(&args, stop).and_then(|()| {
+            let added: Vec<String> = self.check(py, stop)?.difference(&before).cloned().collect();
+            match added.is_empty() {
+                true => Ok(()),
+                false => Err(("package_installation_uv_failed", format!("uv pip check:\n{}", added.join("\n")))),
+            }
+        });
         let Err((code, detail)) = own else {
             return Ok(("machine", String::new()));
         };
@@ -1080,9 +1089,11 @@ impl Publisher {
         if locked.is_empty() {
             return Err((code, detail));
         }
-        restore()?;
         let detail: Vec<&str> = detail.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
         let detail = detail[detail.len().saturating_sub(12)..].join(" | ");
+        // The locked pair failing too (TensorFS's sdist on aarch64) still names why the machine's did not.
+        restore().map_err(|(locked_code, why)| (locked_code, format!(
+            "{why}; this machine's own Runtime and TensorFS did not install first ({code}: {})", crate::triage::ends(&detail, 1000))))?;
         Ok(("locked", format!(
             "this machine's own Runtime and TensorFS did not install ({code}: {}); it runs the release's locked {}",
             crate::triage::ends(&detail, 2000),
@@ -1092,6 +1103,17 @@ impl Publisher {
 
     fn uv(&self, args: &[&str], stop: Option<&PullCancellation>) -> Result<(), Failure> {
         self.uv_observed(args, &[], stop, &|_| ())
+    }
+
+    /// `uv pip check`'s findings in an environment, one line each (`The package …`).
+    fn check(&self, py: &str, stop: Option<&PullCancellation>) -> Result<BTreeSet<String>, Failure> {
+        match self.uv(&["pip", "check", "--no-config", "--python", py], stop) {
+            Ok(()) => Ok(BTreeSet::new()),
+            Err((code, detail)) => {
+                let found: BTreeSet<String> = detail.lines().map(str::trim).filter(|l| l.starts_with("The package ")).map(String::from).collect();
+                if found.is_empty() { Err((code, detail)) } else { Ok(found) }
+            }
+        }
     }
 
     /// `uv` with `read` told, about once a second, how many bytes the process has read so far
@@ -1823,6 +1845,11 @@ mod tests {
 
     /// A wheel with nothing but its metadata: `name` `version`, requiring `requires`.
     fn tiny_wheel(dir: &Path, name: &str, version: &str, requires: &[&str]) -> PathBuf {
+        tagged_wheel(dir, name, version, requires, "py3-none-any")
+    }
+
+    /// A wheel whose WHEEL file claims `tag`, whatever its file name says.
+    fn tagged_wheel(dir: &Path, name: &str, version: &str, requires: &[&str], tag: &str) -> PathBuf {
         use std::io::Write;
         let module = name.replace('-', "_");
         let info = format!("{module}-{version}.dist-info");
@@ -1836,7 +1863,7 @@ mod tests {
         let files = [
             (format!("{module}/__init__.py"), String::new()),
             (format!("{info}/METADATA"), metadata),
-            (format!("{info}/WHEEL"), "Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\nTag: py3-none-any\n".into()),
+            (format!("{info}/WHEEL"), format!("Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\nTag: {tag}\n")),
         ];
         let mut record = String::new();
         for (name, body) in &files {
@@ -2118,6 +2145,34 @@ mod tests {
         assert!(why.ends_with("it runs the release's locked cozy-runtime"), "{why}");
         let held: Vec<_> = record.dependencies.iter().map(|d| (d.name.as_str(), d.version.as_str())).collect();
         assert_eq!(held, [("cozy-runtime", "1.0")]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A finding the release's own closure carries (NVIDIA's aarch64 cusparseLt wheel is tagged
+    /// `sbsa`, which uv's check flags) keeps the machine's pair: only a finding the pair adds
+    /// refuses it. Real uv and lock; no network.
+    #[test]
+    fn a_finding_the_lock_already_carries_keeps_the_machines_sdk() {
+        let root = std::env::temp_dir().join(format!("cm-sdk-sbsa-{}", uuid::Uuid::new_v4()));
+        let (wheels, own) = (root.join("wheels"), root.join("own"));
+        fs::create_dir_all(&wheels).unwrap();
+        fs::create_dir_all(&own).unwrap();
+        let machine = tiny_wheel(&own, "cozy-runtime", "9.0", &[]);
+        tiny_wheel(&wheels, "cozy-runtime", "1.0", &[]);
+        tagged_wheel(&wheels, "sbsa-tagged", "1.0", &["cozy-runtime"], "py3-none-manylinux2014_sbsa");
+        let sdk = PackageSdk {
+            uv: PathBuf::from("uv"),
+            python: "3.12".into(),
+            requirements: vec![machine.to_string_lossy().into()],
+            ..Default::default()
+        };
+        let store = Arc::new(Store::ensure(&root.join("tensorfs")).unwrap());
+        let publisher = Publisher::new(&root.join("published"), sdk, store).unwrap();
+        let (pyproject, lock) = locked(&root.join("sbsa"), &["sbsa-tagged"], &wheels, "");
+        let record = generate(&publisher, &root.join("generations"), "sbsa", &card(pyproject, lock)).unwrap();
+        assert_eq!(record.sdk_fallback, "");
+        let held: Vec<_> = record.dependencies.iter().map(|d| (d.name.as_str(), d.version.as_str())).collect();
+        assert_eq!(held, [("cozy-runtime", "9.0")]);
         let _ = fs::remove_dir_all(root);
     }
 
