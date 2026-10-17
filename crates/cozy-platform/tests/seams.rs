@@ -50,6 +50,12 @@ fn main() {
             false,
         ),
         ("a_tree_dies_whole", a_tree_dies_whole, false),
+        #[cfg(unix)]
+        (
+            "a_child_watching_its_parent_dies_with_it",
+            a_child_watching_its_parent_dies_with_it,
+            false,
+        ),
         (
             "an_owned_tree_ends_with_its_handle",
             an_owned_tree_ends_with_its_handle,
@@ -143,6 +149,21 @@ fn child(args: &[String]) {
                 0o600,
             )
             .unwrap();
+            ready_and_wait();
+        }
+        #[cfg(unix)]
+        ["watching-parent", file] => {
+            // Never waited for: it dies with this process.
+            #[allow(clippy::zombie_processes)]
+            let mut watcher = child_command(&["watch-parent"]).spawn().unwrap();
+            ready(watcher.stdout.take().unwrap());
+            let birth = serde_json::to_vec(&Birth::of(watcher.id()).unwrap()).unwrap();
+            durable::replace(Path::new(file), &birth, 0o600).unwrap();
+            ready_and_wait();
+        }
+        #[cfg(unix)]
+        ["watch-parent"] => {
+            assert!(process::die_with_parent(std::os::unix::process::parent_id()).unwrap());
             ready_and_wait();
         }
         ["detach", file] => {
@@ -600,4 +621,30 @@ fn run_value(name: &str) -> String {
     assert_eq!(status, 0, "the Run value of {name}");
     data.truncate(size as usize / 2 - 1);
     String::from_utf16(&data).unwrap()
+}
+
+/// A child that asked to die with its parent is gone soon after the parent is killed.
+#[cfg(unix)]
+fn a_child_watching_its_parent_dies_with_it() {
+    let dir = scratch("parent-watch");
+    let file = dir.join("watcher.json");
+    let mut parent = child_command(&["watching-parent", file.to_str().unwrap()])
+        .spawn()
+        .unwrap();
+    ready(parent.stdout.take().unwrap());
+    let watcher: Birth = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+    let watched = process::Exact::open(&watcher)
+        .unwrap()
+        .expect("the watcher lives");
+    parent.kill().unwrap();
+    parent.wait().unwrap();
+    // A hang bound for a watcher that never dies; the product waits without one.
+    let died = watched
+        .wait_for(std::time::Duration::from_secs(30))
+        .unwrap();
+    if !died {
+        watched.kill().unwrap();
+    }
+    assert!(died, "the watcher outlived its parent");
+    fs::remove_dir_all(dir).unwrap();
 }
