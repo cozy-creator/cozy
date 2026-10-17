@@ -37,8 +37,11 @@ fn a_machines_logs_read_and_follow_what_it_did() {
     );
     // Its own log, once its TensorD serves one; before, a refusal that names it and what to do.
     let own = home.cozy(["machine", "logs", "m1", "--json"]);
-    if own.code != 0 {
+    if common::tensord::serves_own_log() {
+        assert!(lines(&own).iter().all(|l| l["log"] == "tensord"), "{own:?}");
+    } else {
         let refusal = own.refusal();
+        assert_eq!(own.code, 1, "{own:?}");
         assert_eq!(refusal["code"], "machine_log_unsupported", "{own:?}");
         assert!(
             refusal["message"].as_str().unwrap().contains("m1"),
