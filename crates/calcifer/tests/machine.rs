@@ -485,7 +485,7 @@ async fn inputs_are_written_as_a_visible_stage_and_once_per_machine() {
     );
     let shown = writing.values().next().unwrap();
     assert_eq!(shown[0], "writing image: 0 B/24.0 MiB", "{shown:?}");
-    assert!(shown.len() >= 3, "it moved in steps: {shown:?}");
+    assert!(shown.len() >= 2, "from nothing to all of it: {shown:?}");
     assert!(
         shown
             .last()

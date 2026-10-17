@@ -8,6 +8,7 @@ use std::{fmt, io, path::PathBuf};
 pub mod durable;
 pub mod gpu;
 pub mod lock;
+pub mod net;
 pub mod paths;
 pub mod process;
 pub mod service;
@@ -77,6 +78,7 @@ pub enum Seam {
     Gpu,
     Service,
     Paths,
+    Network,
 }
 
 impl fmt::Display for Seam {
@@ -93,6 +95,7 @@ impl fmt::Display for Seam {
             Self::Gpu => "GPU probe",
             Self::Service => "user services",
             Self::Paths => "paths",
+            Self::Network => "socket options",
         })
     }
 }

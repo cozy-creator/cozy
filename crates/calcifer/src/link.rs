@@ -28,10 +28,12 @@ use crate::store;
 
 /// The name every machine's self-signed leaf carries.
 const SERVER_NAME: &str = "cozy-worker";
-/// The bounds of one Write call while an object uploads: small enough that a slow uplink shows
-/// progress, big enough that a fast one is not slowed by calls.
-const MIN_CHUNK: u64 = 64 << 10;
-const MAX_CHUNK: u64 = 64 << 20;
+/// An upload's frame: small, so what waits to be taken is little.
+const FRAME: usize = 64 << 10;
+/// The most a connection keeps unsent in the kernel.
+const UNSENT: u32 = 256 << 10;
+/// How often an upload's progress is told.
+const TELL_EVERY: Duration = Duration::from_millis(250);
 /// A cap is checked when a call opens; an open stream outlives it.
 const CAP_SECONDS: i64 = 300;
 
@@ -70,6 +72,13 @@ impl Link {
             async move {
                 let tcp = tokio::net::TcpStream::connect(&address).await?;
                 tcp.set_nodelay(true)?;
+                // Little waits unsent in the kernel, so an upload's count of what it handed over
+                // is close to what crossed (`Link::write`).
+                if let Err(e) = cozy_platform::net::bound_unsent(&tcp, UNSENT)
+                    && !e.is_unsupported()
+                {
+                    tracing::warn!("{e}");
+                }
                 let name = ServerName::try_from(SERVER_NAME).expect("a DNS name");
                 let stream = tokio_rustls::TlsConnector::from(tls)
                     .connect(name, tcp)
@@ -262,10 +271,12 @@ impl Link {
         Ok(asked.map_err(classify)?.into_inner().held)
     }
 
-    /// Uploads one object from `file` in successive calls, each continuing from what the machine
-    /// holds and sized to about a second at the rate measured so far. `progress` hears the bytes
-    /// the machine holds, with the rate, before the first call and after each; an object it
-    /// already holds is not written and `progress` hears nothing.
+    /// Uploads one object from `file` in one stream, from what the machine already holds, so a
+    /// long round trip costs one turn, not one per piece. `progress` hears the bytes handed over
+    /// (at most a few times a second) with the rate, then what the machine holds once it answers;
+    /// with the socket's unsent bytes bounded (`UNSENT`) and HTTP/2 buffering at most 1 MiB per
+    /// stream, what was handed over runs only that far ahead of what crossed. An object the
+    /// machine already holds is not written and `progress` hears nothing.
     pub async fn write(
         &self,
         digest: &Digest,
@@ -273,52 +284,61 @@ impl Link {
         mut file: tokio::fs::File,
         mut progress: impl FnMut(u64, Option<f64>),
     ) -> Result<(), LinkError> {
-        let mut held = self.held(digest, length).await?;
+        let held = self.held(digest, length).await?;
         if held >= length {
             return Ok(());
         }
         progress(held, None);
-        let (from, started, mut chunk) = (held, Instant::now(), MIN_CHUNK);
-        while held < length {
-            let size = chunk.min(length - held) as usize;
-            let mut bytes = vec![0; size];
-            let read = async {
-                file.seek(std::io::SeekFrom::Start(held)).await?;
-                file.read_exact(&mut bytes).await
-            };
-            read.await.map_err(|e| LinkError::Refused {
+        let (frames, receiver) = tokio::sync::mpsc::channel::<v1::WriteFrame>(1);
+        let started = Instant::now();
+        let rate =
+            move |offset: u64| (offset - held) as f64 / started.elapsed().as_secs_f64().max(1e-3);
+        // Owns the sender: when the object is read, the stream ends and the machine answers.
+        let tell = &mut progress;
+        let send = async move {
+            file.seek(std::io::SeekFrom::Start(held)).await?;
+            let (mut offset, mut told) = (held, Instant::now());
+            loop {
+                let mut data = vec![0; FRAME];
+                let read = file.read(&mut data).await?;
+                if read == 0 {
+                    return Ok::<_, std::io::Error>(());
+                }
+                data.truncate(read);
+                let frame = v1::WriteFrame {
+                    digest: digest.to_string(),
+                    length,
+                    offset,
+                    data,
+                };
+                if frames.send(frame).await.is_err() {
+                    return Ok(());
+                }
+                offset += read as u64;
+                if told.elapsed() >= TELL_EVERY {
+                    told = Instant::now();
+                    tell(offset, Some(rate(offset)));
+                }
+            }
+        };
+        let request = self.request(tokio_stream::wrappers::ReceiverStream::new(receiver));
+        let mut client = self.client.clone();
+        let (sent, answered) = tokio::join!(send, client.write(request));
+        if let Err(e) = sent {
+            return Err(LinkError::Refused {
                 code: "input_unreadable".into(),
                 message: e.to_string(),
-            })?;
-            let frames: Vec<_> = bytes
-                .chunks(1 << 20)
-                .scan(held, |offset, data| {
-                    let frame = v1::WriteFrame {
-                        digest: digest.to_string(),
-                        length,
-                        offset: *offset,
-                        data: data.to_vec(),
-                    };
-                    *offset += data.len() as u64;
-                    Some(frame)
-                })
-                .collect();
-            let call = Instant::now();
-            let request = self.request(tokio_stream::iter(frames));
-            let answered = self.client.clone().write(request).await;
-            let now = answered.map_err(classify)?.into_inner().held;
-            if now <= held {
-                return Err(LinkError::Unreachable(format!(
-                    "the machine took none of {digest} past {held} of its {length} bytes"
-                )));
-            }
-            let rate = (now - held) as f64 / call.elapsed().as_secs_f64().max(1e-3);
-            chunk = (rate as u64).clamp(MIN_CHUNK, MAX_CHUNK);
-            held = now;
-            let overall = (held - from) as f64 / started.elapsed().as_secs_f64().max(1e-3);
-            progress(held, Some(overall));
+            });
         }
-        Ok(())
+        match answered.map_err(classify)?.into_inner().held {
+            now if now == length => {
+                progress(now, Some(rate(now)));
+                Ok(())
+            }
+            now => Err(LinkError::Unreachable(format!(
+                "the machine holds {now} of the {length} bytes of {digest}"
+            ))),
+        }
     }
 }
 
