@@ -19,8 +19,9 @@ use super::{FOLLOW, clock, machine, now_ms, route, usd};
 use crate::context::hub_answer;
 use crate::{Context, output};
 
-/// Ends a rental, returning once its Hub affirms the pod gone, or removes an added machine.
-pub async fn end(ctx: &Context, name: &str) -> Result<ExitCode, Error> {
+/// Ends a rental, returning once its Hub affirms the pod gone, or removes an added machine. It
+/// waits first for its runs' outputs to land here, unless `force`.
+pub async fn end(ctx: &Context, name: &str, force: bool) -> Result<ExitCode, Error> {
     if name == "local" {
         return Err(Error::new(
             Kind::Validation,
@@ -31,10 +32,48 @@ pub async fn end(ctx: &Context, name: &str) -> Result<ExitCode, Error> {
     }
     let calcifer = ctx.calcifer().await?;
     let path = route(name)?;
+    let asked = if force {
+        format!("{path}?force=true")
+    } else {
+        path
+    };
+    let mut said = String::new();
     let Ended {
         mut machine,
         changed,
-    } = calcifer.delete(&path).await?;
+        abandoned,
+    } = loop {
+        match calcifer.delete(&asked).await {
+            Err(e) if e.code == "outputs_exporting" => {
+                if e.message != said {
+                    output::say(ctx, &format!("Waiting to end {name}: {}", e.message));
+                    said = e.message;
+                }
+                tokio::select! {
+                    () = tokio::time::sleep(FOLLOW) => {}
+                    _ = tokio::signal::ctrl_c() => {
+                        return Err(Error::new(
+                            Kind::Unavailable,
+                            "end_waiting",
+                            format!("stopped waiting; {name} was not ended and its outputs keep landing"),
+                        )
+                        .remedy("--force ends it now and gives up the outputs that have not landed")
+                        .next(format!("cozy machine end {name}")));
+                    }
+                }
+            }
+            ended => break ended?,
+        }
+    };
+    if !abandoned.is_empty() {
+        output::warn(
+            ctx,
+            &format!(
+                "Gave up outputs that had not landed: {}",
+                abandoned.join(", ")
+            ),
+        );
+    }
     // Follow the row by its rental id: the name is the Hub's and an alias may be what was typed.
     let path = route(machine.rental_id.as_deref().unwrap_or(&machine.name))?;
     if machine.state == MachineState::Ending {
@@ -67,7 +106,11 @@ pub async fn end(ctx: &Context, name: &str) -> Result<ExitCode, Error> {
         machine = calcifer.get(&path).await?;
     }
     if ctx.json {
-        output::json(&Ended { machine, changed });
+        output::json(&Ended {
+            machine,
+            changed,
+            abandoned,
+        });
         return Ok(ExitCode::SUCCESS);
     }
     let said = match (machine.kind, changed) {

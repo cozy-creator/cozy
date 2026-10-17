@@ -155,18 +155,18 @@ async fn a_machine_is_added_only_at_its_fingerprint_with_this_controllers_key_ad
         .await
         .unwrap();
 
-    let ended = machines.end("box").await.unwrap();
+    let ended = machines.end("box", false).await.unwrap();
     assert!(ended.changed);
     assert_eq!(ended.machine.state, MachineState::Ended);
     assert!(
-        !machines.end("box").await.unwrap().changed,
+        !machines.end("box", false).await.unwrap().changed,
         "an end is said once"
     );
     assert!(listed(&machines, "box").await.is_none());
 
     let local = machines.put_local(machine.endpoint.clone()).unwrap();
     assert_eq!(local.kind, MachineKind::Local);
-    let local_end = machines.end("local").await.unwrap_err();
+    let local_end = machines.end("local", false).await.unwrap_err();
     assert_eq!(
         (local_end.code.as_str(), local_end.next.as_slice()),
         ("machine_local", &["cozy machine disable".to_string()][..])

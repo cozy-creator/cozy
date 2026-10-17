@@ -31,7 +31,10 @@ use cozy_proto::{
 };
 use prost::Message as _;
 use reqwest::{Client, RequestBuilder, StatusCode, header};
-use tokio::task::JoinHandle;
+use tokio::{
+    io::{AsyncReadExt as _, AsyncWriteExt as _},
+    task::JoinHandle,
+};
 
 const BIG: u64 = 20 << 20;
 /// A hang bound for a test whose awaited state never comes (a package's first install included);
@@ -93,9 +96,13 @@ impl Served {
     }
 
     async fn submit(&self, submit: &SubmitRun) -> Run {
+        self.submit_as("k", submit).await
+    }
+
+    async fn submit_as(&self, key: &str, submit: &SubmitRun) -> Run {
         let url = format!("http://{}/v1/runs", self.holder.address);
         let request = self.client.post(url).bearer_auth(&self.holder.token);
-        let response = request.header("idempotency-key", "k").json(submit);
+        let response = request.header("idempotency-key", key).json(submit);
         let response = response.send().await.unwrap();
         assert_eq!(response.status(), StatusCode::ACCEPTED);
         let submitted: cozy_proto::calcifer::Submitted = response.json().await.unwrap();
@@ -115,6 +122,17 @@ impl Served {
             response,
             buffer: String::new(),
         }
+    }
+
+    /// `DELETE /v1/machines/{name}`, as `cozy machine end [--force]` asks it.
+    async fn end(&self, name: &str, force: bool) -> (StatusCode, serde_json::Value) {
+        let url = format!(
+            "http://{}/v1/machines/{name}?force={force}",
+            self.holder.address
+        );
+        let request = self.client.delete(url).bearer_auth(&self.holder.token);
+        let response = request.send().await.unwrap();
+        (response.status(), response.json().await.unwrap())
     }
 
     /// `POST /v1/down`; machines keep what they accepted.
@@ -262,8 +280,8 @@ fn client_wheel(tensord: &Path, dir: &Path) -> PathBuf {
 }
 
 /// The fixture package as `cozy run ./dir` sends it (its files in a tar and the manifest naming
-/// that, both staged with the run), calling its `make`.
-fn package_run(dir: &Path, gate: &Path) -> SubmitRun {
+/// that, both staged with the run), calling its `make` with a `big` output that many bytes long.
+fn package_run(dir: &Path, gate: &Path, big: u64) -> SubmitRun {
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cpu_outputs");
     let source = dir.join("source.tar");
     run_ok(
@@ -284,7 +302,7 @@ fn package_run(dir: &Path, gate: &Path) -> SubmitRun {
         digest: Digest::of(bytes),
         length: bytes.len() as u64,
     };
-    let payload = serde_json::json!({"revisions": 3, "big": BIG, "gate": gate});
+    let payload = serde_json::json!({"revisions": 3, "big": big, "gate": gate});
     let spec = v1::RunSpec {
         kind: v1::RunKind::Call as i32,
         source: Some(v1::run_spec::Source::Local(v1::LocalSource {
@@ -599,7 +617,7 @@ async fn a_runs_outputs_land_as_published_and_are_rewritten_in_place() {
     with_machine(home.path(), &machine);
     let served = Served::start(home.path()).await;
     let gate = machine.root.path().join("gate");
-    let run = served.submit(&package_run(home.path(), &gate)).await;
+    let run = served.submit(&package_run(home.path(), &gate, BIG)).await;
     let (id, n) = (run.id, run.number);
     let mut events = served.events(&id).await;
     let mut seen = events
@@ -673,7 +691,7 @@ async fn a_run_completes_and_its_outputs_land_once_across_a_calcifer_restart() {
     with_machine(home.path(), &machine);
     let first = Served::start(home.path()).await;
     let gate = machine.root.path().join("gate");
-    let id = first.submit(&package_run(home.path(), &gate)).await.id;
+    let id = first.submit(&package_run(home.path(), &gate, BIG)).await.id;
     let mut events = first.events(&id).await;
     events
         .until(|e| landed(e).is_some_and(|i| i.name == "video"))
@@ -697,7 +715,7 @@ async fn a_fresh_machine_read_shows_what_a_settled_warm_run_installed() {
     let mut machine = installing_machine();
     with_machine(home.path(), &machine);
     let served = Served::start(home.path()).await;
-    let mut warm = package_run(home.path(), &home.path().join("gate"));
+    let mut warm = package_run(home.path(), &home.path().join("gate"), BIG);
     let mut spec = v1::RunSpec::decode(warm.spec.as_slice()).unwrap();
     spec.kind = v1::RunKind::Warm as i32;
     spec.payload.clear();
@@ -735,6 +753,152 @@ async fn a_fresh_machine_read_shows_what_a_settled_warm_run_installed() {
             StatusCode::SERVICE_UNAVAILABLE,
             "machine_unavailable".into()
         )
+    );
+    served.down().await;
+}
+
+/// A TCP relay to `to` that carries each connection's bytes back at `rate` bytes a second: a
+/// slow link between Calcifer and its machine (TLS stays end to end).
+async fn throttled(to: String, rate: f64) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    tokio::spawn(async move {
+        while let Ok((inbound, _)) = listener.accept().await {
+            let to = to.clone();
+            tokio::spawn(async move {
+                let Ok(outbound) = tokio::net::TcpStream::connect(&to).await else {
+                    return;
+                };
+                let (mut from_calcifer, mut to_calcifer) = inbound.into_split();
+                let (mut from_machine, mut to_machine) = outbound.into_split();
+                let up = tokio::io::copy(&mut from_calcifer, &mut to_machine);
+                let down = async {
+                    let (began, mut sent, mut buffer) = (Instant::now(), 0f64, vec![0; 16 << 10]);
+                    while let Ok(n @ 1..) = from_machine.read(&mut buffer).await {
+                        if to_calcifer.write_all(&buffer[..n]).await.is_err() {
+                            return;
+                        }
+                        sent += n as f64;
+                        let due = began + Duration::from_secs_f64(sent / rate);
+                        tokio::time::sleep_until(due.into()).await;
+                    }
+                };
+                tokio::select! {
+                    _ = up => {}
+                    () = down => {}
+                }
+            });
+        }
+    });
+    address
+}
+
+/// `cozy machine end` waits while a run's outputs are still on their way over a slow link,
+/// saying how much is in place, and ends the machine once they landed; `--force` ends it at
+/// once, names what it gives up, and the export records it lost without leaving a part file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ending_a_machine_waits_for_its_runs_outputs_and_force_gives_them_up() {
+    let home = tempfile::tempdir().unwrap();
+    let machine = installing_machine();
+    let relay = throttled(machine.endpoint.address.clone(), f64::from(1u32 << 20)).await;
+    let key = common::key_file(home.path());
+    let store = Store::open(&Home::at(home.path()).calcifer_db()).unwrap();
+    for name in ["m", "n"] {
+        let mut row = machine.row(name, &key);
+        row.endpoint.as_mut().unwrap().address = relay.clone();
+        store.put_machine(&row).unwrap();
+    }
+    drop(store);
+    let served = Served::start(home.path()).await;
+    let gate = home.path().join("gate");
+    std::fs::write(&gate, b"").unwrap();
+
+    // Ending waits until the outputs landed, then ends.
+    let run = served
+        .submit(&package_run(home.path(), &gate, 12 << 20))
+        .await;
+    let mut events = served.events(&run.id).await;
+    events.until(Event::is_terminal).await;
+    let (status, refused) = served.end("m", false).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    assert_eq!(refused["error"]["code"], "outputs_exporting", "{refused}");
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("in place"),
+        "{refused}"
+    );
+    let until = Instant::now() + PATIENCE;
+    let ended = loop {
+        let (status, answer) = served.end("m", false).await;
+        if status == StatusCode::OK {
+            break answer;
+        }
+        assert_eq!(answer["error"]["code"], "outputs_exporting", "{answer}");
+        assert!(Instant::now() < until, "the outputs never landed");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    assert_eq!(ended["changed"], true, "{ended}");
+    assert!(ended.get("abandoned").is_none(), "{ended}");
+    let detail = served.run(&run.id).await;
+    let big = (detail.output.iter()).find(|o| o.name == "big");
+    let path = big.and_then(|big| big.path.clone());
+    let path = path.unwrap_or_else(|| panic!("{detail:?}"));
+    assert_eq!(std::fs::metadata(path).unwrap().len(), 12 << 20);
+
+    // `force` ends it mid-export: the output is given up, recorded lost, and no part remains.
+    let out = home.path().join("forced");
+    let mut forced = package_run(home.path(), &gate, 64 << 20);
+    forced.on = cozy_proto::calcifer::On::Machine("n".into());
+    forced.out = Some(out.clone());
+    let run = served.submit_as("forced", &forced).await;
+    let mut events = served.events(&run.id).await;
+    events.until(Event::is_terminal).await;
+    let until = Instant::now() + PATIENCE;
+    loop {
+        let (status, answer) = served.end("n", false).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{answer}");
+        let said = answer["error"]["message"].as_str().unwrap();
+        if !said.contains(": 0 B of") {
+            break;
+        }
+        assert!(Instant::now() < until, "the export never moved: {said}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let (status, ended) = served.end("n", true).await;
+    assert_eq!(status, StatusCode::OK, "{ended}");
+    let abandoned = ended["abandoned"].as_array().unwrap();
+    assert!(
+        abandoned
+            .iter()
+            .any(|a| a.as_str().unwrap().contains(" big ")),
+        "{ended}"
+    );
+    let until = Instant::now() + PATIENCE;
+    let lost = loop {
+        let detail = served.run(&run.id).await;
+        let big = (detail.output.into_iter())
+            .find(|o| o.name == "big")
+            .unwrap();
+        if big.export_error.is_some() || big.path.is_some() {
+            break big;
+        }
+        assert!(Instant::now() < until, "the forced export never settled");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    assert!(lost.path.is_none(), "{lost:?}");
+    let error = lost.export_error.as_deref().unwrap_or_default();
+    assert!(error.contains("its machine n ended"), "{lost:?}");
+    let left: Vec<_> = std::fs::read_dir(&out)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        !left
+            .iter()
+            .any(|name| name.ends_with(".part") || name.contains("big")),
+        "{left:?}"
     );
     served.down().await;
 }

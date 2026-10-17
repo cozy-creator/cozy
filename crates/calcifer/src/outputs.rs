@@ -57,6 +57,26 @@ const SLOW: f64 = 8.0;
 const SAMPLE: Duration = Duration::from_secs(1);
 const WINDOW: Duration = Duration::from_secs(2);
 
+/// An output Calcifer still owes this computer: its run's number, its name and index, its length
+/// and the bytes of it in place.
+pub(crate) struct Owed {
+    pub number: u64,
+    pub name: String,
+    pub index: u32,
+    pub length: u64,
+    pub moved: u64,
+}
+
+impl std::fmt::Display for Owed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let length = crate::bytes(self.length as f64);
+        match self.index {
+            0 => write!(f, "run {} {} ({length})", self.number, self.name),
+            i => write!(f, "run {} {}/{i} ({length})", self.number, self.name),
+        }
+    }
+}
+
 /// The exporters at work, and what they share.
 #[derive(Default)]
 pub(crate) struct Exports {
@@ -66,6 +86,8 @@ pub(crate) struct Exports {
     appended: Mutex<HashMap<(RunId, String, u64), u64>>,
     /// Orders replacing a file and recording it against `serve` reading both.
     placing: Mutex<()>,
+    /// The bytes in place of each export in flight, by run, output and index.
+    moving: Mutex<HashMap<(RunId, String, u32), Arc<AtomicU64>>>,
 }
 
 /// Why an export stopped short.
@@ -168,7 +190,7 @@ impl Calcifer {
             };
             let mut changed = None;
             let exported = match self.reach(&run, &mut lanes, &mut changed) {
-                Ok(()) => self.export_item(&run, &item, &mut lanes, wake).await,
+                Ok(()) => (self.export_item(&run, &item, &mut lanes, wake, changed.as_mut())).await,
                 Err(failure) => Err(failure),
             };
             match exported {
@@ -176,6 +198,14 @@ impl Calcifer {
                 Err(Failure::Superseded) => {}
                 Err(Failure::Lost(reason)) => {
                     warn!(run = %id, output = %item.name, rev = item.rev, "not exported: {reason}");
+                    let dest = (run.out_dir).join(file_name(
+                        run.number,
+                        &item.name,
+                        item.index,
+                        &item.media_type,
+                    ));
+                    remove(&suffixed(&dest, ".part"));
+                    remove(&suffixed(&dest, ".manifest.part"));
                     let (name, index, rev) = (&item.name, item.index, item.rev);
                     match self
                         .store
@@ -239,13 +269,14 @@ impl Calcifer {
     }
 
     /// Makes the item's file (a directory for a tree) this revision's bytes. A newer revision
-    /// stops it.
+    /// stops it; so does its machine's end, which loses it.
     async fn export_item(
         &self,
         run: &RunRow,
         item: &OutputRow,
         lanes: &mut Lanes,
         wake: &Notify,
+        mut changed: Option<&mut watch::Receiver<()>>,
     ) -> Result<(), Failure> {
         let name = file_name(run.number, &item.name, item.index, &item.media_type);
         let dest = run.out_dir.join(name);
@@ -255,31 +286,69 @@ impl Calcifer {
             index: item.index,
             member: String::new(),
         };
+        let moved = Arc::new(AtomicU64::new(0));
+        let key = (run.id.clone(), item.name.clone(), item.index);
+        lock(&self.exports.moving).insert(key.clone(), moved.clone());
         let work = async {
             tokio::fs::create_dir_all(&run.out_dir).await.map_err(|e| {
                 Failure::Again(format!("cannot create {}: {e}", run.out_dir.display()))
             })?;
             let staged = if item.media_type == TREE {
-                fetch_tree(lanes, &target, item, &dest).await?
+                fetch_tree(lanes, &target, item, &dest, &moved).await?
             } else {
                 let appended = (run.id.clone(), item_id(run.number, item), item.rev);
                 let appended = lock(&self.exports.appended).get(&appended).copied();
-                fetch_file(lanes, &target, item, &dest, appended).await?
+                fetch_file(lanes, &target, item, &dest, appended, &moved).await?
             };
             self.land(run, item, &staged, &dest)
         };
         tokio::pin!(work);
-        loop {
+        let done = loop {
             tokio::select! {
-                done = &mut work => return done,
+                done = &mut work => break done,
                 () = wake.notified() => {
-                    let now = self.store.output(run.id.as_str(), &item.name, item.index)?;
-                    if now.is_none_or(|now| now.rev != item.rev) {
-                        return Err(Failure::Superseded);
+                    let now = self.store.output(run.id.as_str(), &item.name, item.index);
+                    match now {
+                        Ok(now) if now.as_ref().is_none_or(|now| now.rev != item.rev) => {
+                            break Err(Failure::Superseded);
+                        }
+                        Ok(_) => {}
+                        Err(e) => break Err(e.into()),
+                    }
+                }
+                () = machine_changed(&mut changed) => {
+                    if let Some(name) = &run.machine
+                        && let Ok(Some(machine)) = self.store.machine(name)
+                        && machine.state == MachineState::Ended
+                    {
+                        let reason = machine.reason.as_deref().unwrap_or("no reason was given");
+                        break Err(Failure::Lost(format!("its machine {name} ended: {reason}")));
                     }
                 }
             }
-        }
+        };
+        lock(&self.exports.moving).remove(&key);
+        done
+    }
+
+    /// The outputs of runs on `machine` that have not landed and are not given up, each with the
+    /// bytes its export has in place.
+    pub(crate) fn owed_on(&self, machine: &str) -> Result<Vec<Owed>, StoreError> {
+        let owed = self.store.exports_owed_on(machine)?;
+        let moving = lock(&self.exports.moving);
+        let owed = owed.into_iter().map(|owed| {
+            let key = (owed.run, owed.name, owed.index);
+            let moved = (moving.get(&key)).map_or(0, |moved| moved.load(Ordering::Relaxed));
+            let (_, name, index) = key;
+            Owed {
+                number: owed.number,
+                name,
+                index,
+                length: owed.length,
+                moved,
+            }
+        });
+        Ok(owed.collect())
     }
 
     /// Puts the staged bytes in the item's place and records them, one step as `serve` sees it.
@@ -472,6 +541,17 @@ fn item_id(number: u64, item: &OutputRow) -> String {
     }
 }
 
+/// Resolves when the machine changes; never without a receiver or once its sender is gone.
+async fn machine_changed(changed: &mut Option<&mut watch::Receiver<()>>) {
+    let changed = match changed {
+        Some(changed) => changed.changed().await.is_ok(),
+        None => false,
+    };
+    if !changed {
+        std::future::pending::<()>().await;
+    }
+}
+
 fn suffixed(path: &Path, suffix: &str) -> PathBuf {
     let mut path = path.as_os_str().to_owned();
     path.push(suffix);
@@ -490,6 +570,7 @@ async fn fetch_file(
     item: &OutputRow,
     dest: &Path,
     appended: Option<u64>,
+    moved: &AtomicU64,
 ) -> Result<PathBuf, Failure> {
     let part = suffixed(dest, ".part");
     let follows = item.exported_rev.is_some_and(|held| held + 1 == item.rev);
@@ -510,7 +591,8 @@ async fn fetch_file(
             from = 0;
             continue;
         }
-        fetch(lanes, target, item.rev, from, item.length, &part).await?;
+        moved.store(from, Ordering::Relaxed);
+        fetch(lanes, target, item.rev, from, item.length, &part, moved).await?;
         match check(&part, item.length, &item.digest).await {
             Ok(()) => return Ok(part),
             // The file did not hold the revision this one extends.
@@ -527,6 +609,7 @@ async fn fetch_tree(
     target: &v1::OutputTarget,
     item: &OutputRow,
     dest: &Path,
+    moved: &AtomicU64,
 ) -> Result<PathBuf, Failure> {
     let (stage, manifest) = (suffixed(dest, ".part"), suffixed(dest, ".manifest.part"));
     let unwritable =
@@ -540,7 +623,7 @@ async fn fetch_tree(
         }
     });
     prepared.await.map_err(unwritable)?;
-    fetch(lanes, target, item.rev, 0, item.length, &manifest).await?;
+    fetch(lanes, target, item.rev, 0, item.length, &manifest, moved).await?;
     check(&manifest, item.length, &item.digest)
         .await
         .map_err(Failure::Again)?;
@@ -562,7 +645,7 @@ async fn fetch_tree(
             member: path,
             ..target.clone()
         };
-        fetch(lanes, &member, item.rev, 0, length, &file).await?;
+        fetch(lanes, &member, item.rev, 0, length, &file, moved).await?;
         check(&file, length, &digest)
             .await
             .map_err(Failure::Again)?;
@@ -748,6 +831,7 @@ async fn fetch(
     from: u64,
     length: u64,
     part: &Path,
+    moved: &AtomicU64,
 ) -> Result<(), Failure> {
     let mut queue: VecDeque<(u64, u64)> = (from..length)
         .step_by(RANGE as usize)
@@ -755,7 +839,7 @@ async fn fetch(
         .collect();
     let (mut reads, mut flights) = (JoinSet::new(), HashMap::<Id, Flight>::new());
     let (mut rates, mut waits) = (vec![], vec![]);
-    let (mut failures, mut landed, mut landed_then) = (0, 0, 0);
+    let (mut failures, mut landed, mut landed_then, mut told) = (0, 0, 0, 0);
     let mut sample = tokio::time::interval(SAMPLE);
     loop {
         while flights.len() < LANES
@@ -789,6 +873,13 @@ async fn fetch(
             };
             flights.insert(flight.task.id(), flight);
         }
+        // Only bytes written count: a range's `at` moves past its bytes once they are in place.
+        let now = landed
+            + (flights.values())
+                .map(|f| f.at.load(Ordering::Relaxed) - f.first)
+                .sum::<u64>();
+        moved.fetch_add(now - told, Ordering::Relaxed);
+        told = now;
         if flights.is_empty() {
             return Ok(());
         }

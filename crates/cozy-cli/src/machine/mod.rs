@@ -48,8 +48,14 @@ enum Verb {
     },
     /// Rent a machine; with no SKU, list what is for rent.
     Rent(rent::Rent),
-    /// End a rental (billing stops once its Hub confirms), or remove an added machine.
-    End { name: String },
+    /// End a rental (billing stops once its Hub confirms), or remove an added machine, once
+    /// its runs' outputs have landed here.
+    End {
+        name: String,
+        /// End it now, giving up outputs that have not landed.
+        #[arg(long)]
+        force: bool,
+    },
     /// Reset a rental's 15-minute idle clock once.
     Keepalive { name: String },
     /// Update a machine to its Hub's target software, or to local wheels, as a run.
@@ -91,7 +97,7 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
         Verb::Show { name } => list::show(ctx, &name).await,
         Verb::Logs { name, log, follow } => logs(ctx, &name, log, follow).await,
         Verb::Rent(rent) => rent::exec(ctx, rent).await,
-        Verb::End { name } => end::end(ctx, &name).await,
+        Verb::End { name, force } => end::end(ctx, &name, force).await,
         Verb::Keepalive { name } => end::keepalive(ctx, &name).await,
         Verb::Add {
             name,

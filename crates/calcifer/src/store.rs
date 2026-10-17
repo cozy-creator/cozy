@@ -263,6 +263,16 @@ pub enum Acceptance {
     Stale,
 }
 
+/// An output whose newest revision has not landed on this computer, which Calcifer still owes.
+#[derive(Clone, Debug)]
+pub struct OwedExport {
+    pub run: RunId,
+    pub number: u64,
+    pub name: String,
+    pub index: u32,
+    pub length: u64,
+}
+
 /// One output item at its newest revision, as its export sees it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OutputRow {
@@ -944,6 +954,43 @@ impl Store {
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             rows.into_iter()
                 .map(|(id, number)| Ok((RunId::try_from(id).map_err(|e| StoreError::Corrupt(e.into()))?, number)))
+                .collect()
+        })
+    }
+
+    /// The outputs of runs on `machine` whose file lacks its newest revision and that Calcifer has
+    /// not given up, by run and appearance.
+    pub fn exports_owed_on(&self, machine: &str) -> Result<Vec<OwedExport>> {
+        self.read(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT runs.id, runs.number, outputs.name, outputs.idx, outputs.length
+                 FROM outputs JOIN runs ON runs.id = outputs.run
+                 WHERE runs.machine = ?1 AND outputs.exported_rev IS NOT outputs.rev
+                   AND outputs.failed_rev IS NOT outputs.rev
+                 ORDER BY runs.number, outputs.created_seq",
+            )?;
+            let rows = statement
+                .query_map([machine], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)? as u64,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, i64>(3)? as u32,
+                        r.get::<_, i64>(4)? as u64,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows.into_iter()
+                .map(|(id, number, name, index, length)| {
+                    let run = RunId::try_from(id).map_err(|e| StoreError::Corrupt(e.into()))?;
+                    Ok(OwedExport {
+                        run,
+                        number,
+                        name,
+                        index,
+                        length,
+                    })
+                })
                 .collect()
         })
     }
