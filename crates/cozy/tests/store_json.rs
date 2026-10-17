@@ -1,7 +1,7 @@
 //! xs-044: a home that a released `cozy` (`COZY_TEST_OLD_COZY`, v0.9.3) filled with runs, their
 //! specs and outcomes kept as protobuf, opened by this build. The store is copied aside first, every
 //! row becomes the JSON v0.10 reads, every run reads back as it was, and the older build refuses the
-//! store it can no longer read.
+//! store it can no longer read. With `COZY_TEST_NEXT_COZY`, the cohort's build reads them the same too.
 #![cfg(unix)]
 mod common;
 
@@ -167,6 +167,14 @@ fn a_released_homes_runs_read_back_the_same_once_its_rows_are_json() {
         .filter(|name| name.starts_with("state.db.pre-json-"))
         .count();
     assert_eq!(again, 1);
+
+    // The cohort's build (`COZY_TEST_NEXT_COZY`, v0.10 on the HTTP API) reads the same runs.
+    if let Some(next) = std::env::var_os("COZY_TEST_NEXT_COZY") {
+        assert_eq!(home.cozy(["down"]).code, 0);
+        home.use_binary(&next);
+        assert_eq!(shown(&ids), shown_before);
+        assert_eq!(home.cozy(["down"]).code, 0);
+    }
     home.use_binary(&old);
     let refused = home.cozy(["run", "show", ids[0], "--json"]);
     assert_ne!(refused.code, 0, "{refused:?}");
