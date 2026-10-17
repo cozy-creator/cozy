@@ -227,7 +227,7 @@ fn a_followed_run_returns_only_once_its_outputs_landed() {
         .replace(
             "def main() -> str:\n    return \"hello from a script\"",
             "from cozy_runtime.author import FileAsset, Outputs\n\n\
-             def main(out: Outputs) -> FileAsset:\n    \
+             def main(*, out: Outputs) -> FileAsset:\n    \
              return out.save_bytes(bytes(range(256)) * (512 << 10), media_type=\"application/octet-stream\")",
         );
     std::fs::write(work.join("big.py"), script).unwrap();
