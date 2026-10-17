@@ -213,21 +213,6 @@ impl GpuMemory {
                     return Ok(self.with(|gpu| Some(gpu.room(plan, &sample))));
                 }
                 Decision::Step(step) => {
-                    if let Step::Shrink(other, cap) = &step {
-                        // The cell is cloned out: the watchdog takes the ledger, then this lock.
-                        let cell = self
-                            .running
-                            .lock()
-                            .unwrap()
-                            .get(other)
-                            .and_then(|cell| cell.as_ref().map(File::try_clone))
-                            .transpose()?;
-                        if let Some(cell) = cell {
-                            ask_cap(&cell, *cap)?;
-                            self.with(|gpu| gpu.set_cap(other, *cap));
-                        }
-                        continue;
-                    }
                     carry_out(&step)?;
                 }
             }

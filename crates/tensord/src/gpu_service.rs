@@ -2585,7 +2585,6 @@ impl Pool {
                 return Ok(true);
             }
             Step::Unmap(plan) | Step::End(plan) => plan,
-            Step::Shrink(..) => return Ok(false),
         };
         let mut sessions = self.sessions.lock().unwrap();
         let on_device = |s: &Session| s.plan == *plan && (s.start..s.start + s.degree as usize).contains(&device);
