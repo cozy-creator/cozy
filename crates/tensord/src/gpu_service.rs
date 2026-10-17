@@ -472,6 +472,8 @@ struct Busy {
     ending: bool,
     /// Its call pins an attention kernel, which may need another executor: none joins it.
     alone: bool,
+    /// The last call out is resting it: one that joins meanwhile leaves that to it.
+    resting: bool,
     /// Each call's fetch while any runs: the channel one of them asked for serves them all.
     fetches: Vec<Arc<crate::access::Fetch>>,
 }
@@ -2923,40 +2925,98 @@ impl Pool {
         let seat = Seat::of(&session, retained, log_from)?;
         session.invoked = true;
         let fetches = fetch.into_iter().collect();
-        self.busy.lock().unwrap().push(Busy { session, calls: 1, ending: false, alone, fetches });
+        self.busy.lock().unwrap().push(Busy { session, calls: 1, ending: false, alone, resting: false, fetches });
         Ok(seat)
     }
     /// A call on `seat` ended with `result`. A failure ends the executor: its channel closes,
-    /// so every call on it returns. The last call out rests a sound executor (`rest`) or ends
-    /// it; every other failed call waits for its exit, which settles its run.
+    /// so every call on it returns, and the last one out reaps it while the others wait for its
+    /// exit, which settles their runs. The last call out of a sound executor rests it (`rest`).
     fn leave(&self, engine: &Arc<Engine>, id: &str, seat: Seat, result: io::Result<()>) -> io::Result<()> {
         if let Err(error) = &result {
             seat.executor.close(&error.to_string());
         }
         let Seat { executor, counted, log_from, .. } = seat;
-        let last = {
-            let mut busy = self.busy.lock().unwrap();
-            let at = busy.iter().position(|busy| Arc::ptr_eq(&busy.session.executor, &executor));
-            at.and_then(|at| {
-                let entry = &mut busy[at];
-                entry.calls -= 1;
-                entry.ending |= result.is_err();
-                entry.session.counted = counted;
-                (entry.calls == 0).then(|| busy.swap_remove(at))
-            })
-        };
-        let Some(Busy { session, ending, .. }) = last else {
+        let mut busy = self.busy.lock().unwrap();
+        let Some(at) = busy.iter().position(|busy| Arc::ptr_eq(&busy.session.executor, &executor)) else {
+            drop(busy);
             return result.map_err(|error| ended_with(engine, id, error, executor, log_from));
         };
-        drop(executor);
-        match result {
-            Ok(()) if !ending => {
-                self.rest(engine, session);
-                Ok(())
+        let entry = &mut busy[at];
+        (entry.calls, entry.session.counted) = (entry.calls - 1, counted);
+        entry.ending |= result.is_err();
+        // A call that joined while another rests it leaves the rest to that one.
+        let last = entry.calls == 0 && !entry.resting;
+        let rest = (last && !entry.ending).then(|| Seat::of(&entry.session, true, 0).ok()).flatten();
+        if rest.is_some() {
+            (entry.resting, entry.alone) = (true, false);
+        }
+        let ended = (last && rest.is_none()).then(|| busy.swap_remove(at).session);
+        drop(busy);
+        match (ended, rest) {
+            (Some(session), _) => {
+                drop(executor);
+                match result {
+                    // Another call's failure closed it: this one's run stands.
+                    Ok(()) => session.terminate(),
+                    Err(error) => Err(ended_with(engine, id, error, session.executor, log_from)),
+                }
             }
-            // Another call's failure closed it: this one's run stands.
-            Ok(()) => session.terminate(),
-            Err(error) => Err(ended_with(engine, id, error, session.executor, log_from)),
+            (None, Some(seat)) => {
+                drop(executor);
+                self.rest(engine, seat);
+                result
+            }
+            (None, None) => result.map_err(|error| ended_with(engine, id, error, executor, log_from)),
+        }
+    }
+
+    /// The last call on `seat`'s executor ended: Degree 2 once a call measured that its
+    /// construction fits (an executor loaded without it offers everything it holds now), the
+    /// GPU regions it filled given to custody and revoked generations let go. Then it idles,
+    /// handed to the pool under `busy` so no call misses it, unless calls joined meanwhile:
+    /// the last of them rests it again.
+    fn rest(&self, engine: &Arc<Engine>, mut seat: Seat) {
+        let (plan, start, degree) = (seat.plan.clone(), seat.start, seat.degree);
+        let executor = seat.executor.clone();
+        let rested = (|| -> io::Result<()> {
+            seat.sharing = seat.sharing || self.degree2(&plan, start, degree)?;
+            let Some(custody) = self.custody.as_ref().filter(|_| seat.sharing) else {
+                return Ok(());
+            };
+            let shared = executor.command(&DeviceCommand::Share, &mut seat.callbacks(self, engine, "", &[], None)?);
+            if let Ok(reply) = &shared {
+                // What it exported is custody's to count now: its report says what it still
+                // holds. Its last one counted those bytes too, which hid that much external
+                // memory and raised its next cap by it (run 4391: 22.52 GB for 21.84 GB of room).
+                let facts = plane_facts(reply.plane.as_ref());
+                self.observe(&plan, start, degree, facts, &reply.rank_planes, None);
+            }
+            shared.and_then(|_| release_revoked(custody, &executor))
+        })();
+        let sharing = seat.sharing;
+        drop(seat);
+        if let Err(error) = &rested {
+            tracing::warn!("device weights share/revoke failed; replacing the executor: {error}");
+            executor.close(&error.to_string());
+        }
+        let mut busy = self.busy.lock().unwrap();
+        let Some(at) = busy.iter().position(|busy| Arc::ptr_eq(&busy.session.executor, &executor)) else {
+            return;
+        };
+        let entry = &mut busy[at];
+        (entry.resting, entry.session.sharing) = (false, sharing);
+        entry.ending |= rested.is_err();
+        if entry.calls > 0 {
+            return;
+        }
+        let Busy { session, ending, .. } = busy.swap_remove(at);
+        drop(executor);
+        if !ending {
+            return self.keep_idle(session);
+        }
+        drop(busy);
+        if let Err(error) = session.terminate() {
+            tracing::warn!("ending executor of {plan}: {error}");
         }
     }
 
@@ -3520,41 +3580,6 @@ impl Pool {
             }
         }
         Ok(())
-    }
-
-    /// The last call on `session`'s executor ended: Degree 2 once a call measured that its
-    /// construction fits (an executor loaded without it offers everything it holds now), the
-    /// GPU regions it filled given to custody and revoked generations let go, then it idles.
-    fn rest(&self, engine: &Arc<Engine>, mut session: Session) {
-        let (plan, start, degree) = (session.plan.clone(), session.start, session.degree);
-        let rested = (|| -> io::Result<()> {
-            if !session.sharing && self.degree2(&plan, start, degree)? {
-                session.sharing = true;
-            }
-            let Some(custody) = self.custody.as_ref().filter(|_| session.sharing) else {
-                return Ok(());
-            };
-            let mut seat = Seat::of(&session, true, 0)?;
-            let executor = seat.executor.clone();
-            let shared = executor.command(&DeviceCommand::Share, &mut seat.callbacks(self, engine, "", &[], None)?);
-            if let Ok(reply) = &shared {
-                // What it exported is custody's to count now: its report says what it still
-                // holds. Its last one counted those bytes too, which hid that much external
-                // memory and raised its next cap by it (run 4391: 22.52 GB for 21.84 GB of room).
-                let facts = plane_facts(reply.plane.as_ref());
-                self.observe(&plan, start, degree, facts, &reply.rank_planes, None);
-            }
-            shared.and_then(|_| release_revoked(custody, &executor))
-        })();
-        match rested {
-            Ok(()) => self.keep_idle(session),
-            Err(error) => {
-                tracing::warn!("device weights share/revoke failed; replacing the executor: {error}");
-                if let Err(error) = session.terminate() {
-                    tracing::warn!("ending executor of {plan}: {error}");
-                }
-            }
-        }
     }
 
     /// Degree 2 for `plan`'s executor: GPU weights the machine keeps across executors. It
