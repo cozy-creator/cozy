@@ -55,6 +55,9 @@ pub(crate) struct Local {
     pub package: String,
     pub source: v1::LocalSource,
     pub inputs: Vec<StagedInput>,
+    /// What the machine's environment is built from, apart from the project's own source: its
+    /// metadata and lock, its path dependencies, carried wheels and indexes.
+    pub environment: Digest,
     _manifest: tempfile::TempDir,
 }
 
@@ -154,6 +157,25 @@ pub(crate) async fn source(ctx: &Context, path: &Path, in_place: bool) -> Result
         indexes,
         wheels,
     };
+    let own = match manifest.project.is_empty() {
+        true => String::new(),
+        false => format!("{}/", manifest.project),
+    };
+    let builds = |m: &&Member| {
+        let beside = !m.name.starts_with(&own)
+            || manifest
+                .locals
+                .iter()
+                .any(|l| m.name == *l || m.name.starts_with(&format!("{l}/")));
+        beside || m.name == format!("{own}pyproject.toml") || m.name == format!("{own}uv.lock")
+    };
+    let built: Vec<(&str, &str)> = (manifest.files.iter().filter(builds))
+        .chain(&manifest.wheels)
+        .map(|m| (m.name.as_str(), m.digest.as_str()))
+        .collect();
+    let environment = serde_json::json!({"files": built, "indexes": manifest.indexes,
+        "python": manifest.python_requires});
+    let environment = Digest::of(environment.to_string().as_bytes());
     let document = serde_json::to_vec(&manifest).map_err(|e| refuse("local_source_invalid", e))?;
     let held = tempfile::tempdir().map_err(|e| refuse("stage_unavailable", e))?;
     let written = held.path().join("manifest.json");
@@ -170,6 +192,7 @@ pub(crate) async fn source(ctx: &Context, path: &Path, in_place: bool) -> Result
             manifest: digest.to_string(),
         },
         inputs,
+        environment,
         _manifest: held,
     })
 }

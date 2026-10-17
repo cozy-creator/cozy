@@ -309,3 +309,96 @@ fn outputs_land_in_their_packages_folder_unless_the_run_names_one() {
         work.join("mine")
     );
 }
+
+/// The targets of the home's warm runs, oldest first.
+fn warm_targets(home: &Home, dir: &Path) -> Vec<String> {
+    let listed = cozy(home, dir, &["--json", "run", "list"]);
+    let listed: Value = serde_json::from_str(&listed.stdout).unwrap();
+    let mut runs: Vec<&Value> = listed["runs"].as_array().unwrap().iter().collect();
+    runs.sort_by_key(|r| r["number"].as_u64());
+    runs.iter()
+        .filter(|r| r["kind"] == "warm")
+        .map(|r| r["target"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// Local code sent again unchanged is called at once: no install run, its call accepted within a
+/// second of its creation. Its source edited, it is synced, not installed; its
+/// lock changed, installed. Owner report: each run of unchanged local/minimax-h3 spent 20 s on
+/// an install run and on asking the machine for its 37 files one round trip at a time.
+#[test]
+fn unchanged_local_code_is_called_at_once_and_an_edit_only_syncs() {
+    let Some(home) = Home::new() else { return };
+    if std::env::var_os("COZY_TEST_TENSORD").is_none() {
+        eprintln!("skipped: no TensorD (COZY_TEST_TENSORD is unset)");
+        return;
+    }
+    let _machine = common::tensord::added(&home, "m1");
+    let work = home.path().join("work");
+    copy(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/package/tiny"),
+        &work.join("tiny"),
+    );
+    // As many files as minimax-h3 sends: each one a round trip to ask the machine whether it holds it.
+    let data = work.join("tiny/tiny/data");
+    std::fs::create_dir_all(&data).unwrap();
+    for i in 0..36 {
+        std::fs::write(data.join(format!("part{i}.txt")), format!("part {i}\n")).unwrap();
+    }
+    let call = |text: &str| {
+        let out = cozy(
+            &home,
+            &work,
+            &["--json", "run", "./tiny/echo", text, "--on", "m1"],
+        );
+        let run = completed(&out);
+        assert_eq!(run["result"]["text"], text, "{run}");
+        run
+    };
+    call("first");
+    assert_eq!(warm_targets(&home, &work), ["install local/tiny"]);
+
+    let began = std::time::Instant::now();
+    let run = call("again");
+    let started = run["accepted_at_ms"].as_i64().unwrap() - run["created_at_ms"].as_i64().unwrap();
+    eprintln!(
+        "unchanged resubmit: accepted {started} ms after creation, completed in {:?}",
+        began.elapsed()
+    );
+    assert_eq!(
+        warm_targets(&home, &work),
+        ["install local/tiny"],
+        "no install run"
+    );
+    assert!(started < 1000, "accepted {started} ms after creation");
+
+    let module = work.join("tiny/tiny/__init__.py");
+    let source = std::fs::read_to_string(&module).unwrap();
+    std::fs::write(
+        &module,
+        source.replace("Answers its input.", "Answers its input, edited."),
+    )
+    .unwrap();
+    call("edited");
+    assert_eq!(
+        warm_targets(&home, &work),
+        ["install local/tiny", "sync local/tiny (source changed)"]
+    );
+
+    let pyproject = work.join("tiny/pyproject.toml");
+    let metadata = std::fs::read_to_string(&pyproject).unwrap();
+    std::fs::write(
+        &pyproject,
+        metadata.replace("\"msgspec>=0.19\"", "\"msgspec>=0.19.0\""),
+    )
+    .unwrap();
+    call("relocked");
+    assert_eq!(
+        warm_targets(&home, &work),
+        [
+            "install local/tiny",
+            "sync local/tiny (source changed)",
+            "install local/tiny"
+        ]
+    );
+}
