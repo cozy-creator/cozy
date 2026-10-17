@@ -201,8 +201,10 @@ pub fn recv_fd(stream: &UnixStream) -> Result<OwnedFd> {
     let mut marker = [255u8];
     // usize storage satisfies cmsghdr alignment; every iteration is bounded by
     // the kernel-returned control length. Parse delivered fds even on CTRUNC,
-    // solely to close that prefix before rejecting the message.
-    let mut control = [0usize; 8];
+    // solely to close that prefix before rejecting the message. Room for a thousand
+    // descriptors: macOS installs a whole batch even when it reports it truncated, so a
+    // batch must fit to be closed.
+    let mut control = [0usize; 512];
     let mut iov = libc::iovec {
         iov_base: marker.as_mut_ptr().cast(),
         iov_len: 1,
@@ -231,12 +233,15 @@ pub fn recv_fd(stream: &UnixStream) -> Result<OwnedFd> {
         let mut header = libc::CMSG_FIRSTHDR(&msg);
         while !header.is_null() {
             let start = header as usize - msg.msg_control as usize;
-            let length = (*header).cmsg_len as usize;
             let base = libc::CMSG_LEN(0) as usize;
-            if length < base || start.saturating_add(length) > msg.msg_controllen as usize {
+            // macOS reports a truncated header's whole length: only what fits is read.
+            let fits = (msg.msg_controllen as usize).saturating_sub(start);
+            let length = ((*header).cmsg_len as usize).min(fits);
+            if length < base {
                 valid = false;
                 break;
             }
+            valid &= (*header).cmsg_len as usize == length;
             if (*header).cmsg_level == libc::SOL_SOCKET && (*header).cmsg_type == libc::SCM_RIGHTS {
                 let bytes = length - base;
                 valid &= bytes.is_multiple_of(std::mem::size_of::<i32>());
@@ -248,6 +253,9 @@ pub fn recv_fd(stream: &UnixStream) -> Result<OwnedFd> {
                 }
             } else {
                 valid = false;
+            }
+            if length < (*header).cmsg_len as usize {
+                break;
             }
             header = libc::CMSG_NXTHDR(&msg, header);
         }
@@ -383,7 +391,7 @@ mod tests {
     }
 
     #[test]
-    fn truncated_descriptor_batch_closes_delivered_prefix() {
+    fn a_batch_of_descriptors_is_refused_and_every_one_closed() {
         let (send, receive) = UnixStream::pair().unwrap();
         let file = tempfile::tempfile().unwrap();
         send_rights(&send, &[file.as_raw_fd(); 32]).unwrap();
