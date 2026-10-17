@@ -3,6 +3,10 @@ members = ["cargo:."]
 
 [dist]
 cargo-dist-version = "0.33.0"
+# release.yml is dist's output plus two hand edits, both marked HAND-EDITED there: the `must_contain`
+# dispatch input and the plan job's first step, which refuses a release missing any of those commits.
+# After `dist generate` (or a dist upgrade), put both back.
+allow-dirty = ["ci"]
 ci = "github"
 installers = ["shell", "powershell", "homebrew"]
 targets = [
