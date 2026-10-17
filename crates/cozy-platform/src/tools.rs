@@ -127,7 +127,7 @@ pub const TOOLS: &[Tool] = &[
         name: "nvcc",
         side: Side::Machine,
         class: Class::Optional,
-        cost: "cards without a prebuilt kernel use the slower SDPA path",
+        cost: "cards without a prebuilt kernel use the slower SDPA/kitchen path",
         install: Install::Note("the CUDA toolkit"),
         probe: looked_for!("nvcc"),
     },
