@@ -103,14 +103,21 @@ async fn an_input_uploads_near_the_link_rate_over_a_long_round_trip() {
     let ahead = (seen.iter())
         .map(|(at, done)| done - from - shaped * (*at - first).as_secs_f64())
         .fold(f64::MIN, f64::max);
+    // When the machine first held a byte more, and all of them, as progress said.
+    let at = |held: &dyn Fn(f64) -> bool| {
+        let at = seen.iter().find(|(_, done)| held(*done)).map(|(at, _)| *at);
+        at.map_or(f64::NAN, |at| (at - first).as_secs_f64())
+    };
     eprintln!(
-        "{} MiB written and the run accepted in {:.1} s over {} progress events: {:.0} B/s, {:.0}% of the shaped {shaped:.0} B/s; progress at most {:.0} KiB ahead of the link",
+        "{} MiB written and the run accepted in {:.1} s over {} progress events: {:.0} B/s, {:.0}% of the shaped {shaped:.0} B/s; progress at most {:.0} KiB ahead of the link; first bytes held at {:.1} s, all at {:.1} s",
         total >> 20,
         (accepted - first).as_secs_f64(),
         seen.len(),
         rate,
         100.0 * rate / shaped,
         ahead / 1024.0,
+        at(&|done| done > from),
+        at(&|done| done >= total as f64),
     );
     let link = calcifer::Link::new(&machine.endpoint, common::key()).unwrap();
     let digest = cozy_proto::ids::Digest::of(&bytes);
