@@ -30,6 +30,7 @@ fn boot(root: &Path, port: u16, key: Option<&[u8]>) -> Machine {
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
         .env("COZY_MACHINE_ROOT", root)
+            .env("HOME", root.join("home"))
         .env("COZY_WORKER_ID", "ra-readiness-test")
         .env("COZY_WORKER_AUTH_TOKEN", URL_SAFE_NO_PAD.encode([1; 32]))
         .env("COZY_WORKER_INTERNAL_PORT", port.to_string())

@@ -12,16 +12,9 @@ use ed25519_dalek::SigningKey;
 use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
-use tensord::api::{
-    capability::{self, Grant},
-    v1::{self, machine_client::MachineClient},
-};
-use tonic::{
-    metadata::MetadataValue,
-    transport::{Certificate, ClientTlsConfig, Endpoint},
-};
+use tensord::api::v1::{self, client::Machine as Client};
 
 const WORKER: &str = "volume-test";
 const OWNER: [u8; 32] = [33; 32];
@@ -41,6 +34,7 @@ fn boot(root: &Path, port: u16, cache: Option<&Path>) -> Machine {
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
         .env("COZY_MACHINE_ROOT", root)
+            .env("HOME", root.join("home"))
         .env("COZY_WORKER_ID", WORKER)
         .env("COZY_WORKER_AUTH_TOKEN", URL_SAFE_NO_PAD.encode([1; 32]))
         .env("COZY_WORKER_INTERNAL_PORT", port.to_string())
@@ -49,7 +43,7 @@ fn boot(root: &Path, port: u16, cache: Option<&Path>) -> Machine {
         .env("COZY_BOOTSTRAP_RECEIPT_HMAC_KEY_B64URL", URL_SAFE_NO_PAD.encode([7; 32]))
         .env("TENSORHUB_ORIGIN", "https://hub.invalid")
         .env("CUDA_VISIBLE_DEVICES", "")
-        .env("COZY_MACHINE_LIFETIME", "persistent")
+        .arg("--persistent")
         .stdout(Stdio::null())
         .stderr(Stdio::inherit());
     if let Some(cache) = cache {
@@ -59,7 +53,7 @@ fn boot(root: &Path, port: u16, cache: Option<&Path>) -> Machine {
 }
 
 /// A machine root, booted and answering, and a client of it under the owner's machine cap.
-async fn start(name: &str, cache: Option<&Path>) -> (Machine, MachineClient<tonic::transport::Channel>, PathBuf) {
+async fn start(name: &str, cache: Option<&Path>) -> (Machine, Client, PathBuf) {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("target/machine-volume")
         .join(format!("{name}-{}", uuid::Uuid::new_v4()));
@@ -72,22 +66,14 @@ async fn start(name: &str, cache: Option<&Path>) -> (Machine, MachineClient<toni
         assert!(began.elapsed() < Duration::from_secs(300), "no receipt");
         std::thread::sleep(Duration::from_millis(200));
     }
-    let pem = std::fs::read(root.join("run/cozy/bootstrap/tls.crt")).unwrap();
-    let tls = ClientTlsConfig::new().ca_certificate(Certificate::from_pem(pem)).domain_name("cozy-worker");
-    let endpoint = Endpoint::from_shared(format!("https://127.0.0.1:{port}")).unwrap().tls_config(tls).unwrap();
-    (machine, MachineClient::new(endpoint.connect().await.unwrap()), root)
-}
-
-fn cap() -> String {
-    let expires = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64 + 600;
-    let grant = Grant { machine: WORKER.into(), action: capability::MACHINE.into(), expires, ..Default::default() };
-    capability::mint(&SigningKey::from_bytes(&OWNER), grant)
+    let client = common::client(&root, port, common::signed(OWNER, WORKER));
+    (machine, client, root)
 }
 
 /// `cozy model download acme/model@1.0.0 bf16` on `client`: its model row.
-async fn download(client: &mut MachineClient<tonic::transport::Channel>, id: &str, hub: &str) -> serde_json::Value {
+async fn download(client: &Client, id: &str, hub: &str) -> serde_json::Value {
     let spec = v1::RunSpec {
-        kind: v1::RunKind::Warm as i32,
+        kind: v1::RunKind::Warm,
         models: vec![v1::ModelChoice {
             parameter: "model".into(),
             repository: "acme/model".into(),
@@ -100,17 +86,9 @@ async fn download(client: &mut MachineClient<tonic::transport::Channel>, id: &st
         owner: "alice".into(),
         ..Default::default()
     };
-    let mut request = tonic::Request::new(v1::RunRequest { id: id.into(), after: 0, spec: Some(spec) });
-    let header = MetadataValue::try_from(format!("Cozy-Cap {}", cap())).unwrap();
-    request.metadata_mut().insert("authorization", header);
-    let mut events = client.run(request).await.unwrap().into_inner();
-    let mut last = None;
-    while let Some(event) = events.message().await.unwrap() {
-        last = event.event;
-    }
-    let Some(v1::run_event::Event::Outcome(outcome)) = last else { panic!("no outcome: {last:?}") };
+    let outcome = common::outcome(&common::run(client, id, spec).await);
     assert_eq!(outcome.status, "succeeded", "{outcome:?}");
-    let result: serde_json::Value = serde_json::from_slice(&outcome.result).unwrap();
+    let result: serde_json::Value = serde_json::from_str(outcome.result.as_ref().unwrap().get()).unwrap();
     result["models"][0].clone()
 }
 
@@ -139,8 +117,8 @@ async fn a_second_machine_downloads_from_the_volume_the_first_filled() {
     let cache = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("target/volume-{}", uuid::Uuid::new_v4()));
     std::os::unix::fs::symlink(&tmpfs, &cache).unwrap();
 
-    let (a, mut client, a_root) = start("a", Some(&cache)).await;
-    let first = download(&mut client, "volume-a", &hub).await;
+    let (a, client, a_root) = start("a", Some(&cache)).await;
+    let first = download(&client, "volume-a", &hub).await;
     let total = first["bytes"]["hub"].as_u64().unwrap();
     assert!(total > 1 << 20 && first["bytes"]["volume"] == 0, "{first}");
     let began = Instant::now();
@@ -151,8 +129,8 @@ async fn a_second_machine_downloads_from_the_volume_the_first_filled() {
     drop(a);
     heard.lock().unwrap().clear();
 
-    let (b, mut client, b_root) = start("b", Some(&cache)).await;
-    let second = download(&mut client, "volume-b", &hub).await;
+    let (b, client, b_root) = start("b", Some(&cache)).await;
+    let second = download(&client, "volume-b", &hub).await;
     assert_eq!((&second["bytes"]["hub"], &second["bytes"]["volume"]), (&0.into(), &total.into()), "{second}");
     let asked = std::mem::take(&mut *heard.lock().unwrap());
     assert!(asked.iter().all(|heard| heard.starts_with("POST /v1/tensorfs/closure")), "{asked:?}");
@@ -161,8 +139,8 @@ async fn a_second_machine_downloads_from_the_volume_the_first_filled() {
     drop(b);
 
     // No variable, no volume: the Hub, as before.
-    let (c, mut client, c_root) = start("c", None).await;
-    let third = download(&mut client, "volume-c", &hub).await;
+    let (c, client, c_root) = start("c", None).await;
+    let third = download(&client, "volume-c", &hub).await;
     assert_eq!((&third["bytes"]["hub"], &third["bytes"]["volume"]), (&total.into(), &0.into()), "{third}");
     drop(c);
     for dir in [a_root, b_root, c_root, tmpfs, source] {

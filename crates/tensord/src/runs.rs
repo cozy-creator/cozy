@@ -505,11 +505,11 @@ impl Runs {
                     })?,
             ),
             Source::Local(digest) => {
-                observe("installing the local package", 0, 0);
                 let local = self.local.as_ref().ok_or_else(|| {
                     refused("capability_unavailable", "this machine installs no local packages")
                 })?;
-                let installed = local.install(&self.service, actor, digest, Some(&stoppable.stop))?;
+                let stage = |stage: &str| observe(stage, 0, 0);
+                let installed = local.install(&self.service, actor, digest, Some(&stoppable.stop), &stage)?;
                 self.supersede(actor, &installed)?;
                 local.collect(actor, &installed.package);
                 // A call's imports start as soon as its code is installed, as a release's do.
@@ -1214,9 +1214,7 @@ mod tests {
 
     fn write(objects: &Objects, actor: &str, bytes: &[u8]) -> (String, u64) {
         let digest = format!("sha256:{}", sha256::hex_digest(bytes));
-        let mut writer = objects.begin(actor, &digest, bytes.len() as u64, 0).unwrap();
-        writer.append(bytes).unwrap();
-        writer.finish().unwrap();
+        objects.write(actor, &digest, bytes).unwrap();
         (digest, bytes.len() as u64)
     }
 
@@ -1453,6 +1451,7 @@ mod tests {
             objects.clone(),
             InstallerConfig {
                 helper_python: String::from_utf8(helper.stdout).unwrap().trim().into(),
+                helper_engine: None,
                 python: "3.12".into(),
                 generations: root.join("generations"),
                 client_wheel: client,

@@ -9,9 +9,10 @@ use super::{
     auth::{Lapse, StreamAuthority, VerifiedActor},
     backend::{MachineBackend, OutputSnapshot},
     capability::{self, Grant},
-    machine_v1::{query, stream_run},
+    machine_runs::{follow, query},
     v1, MachineIdentity,
 };
+use cozy_proto::error::{Error, Kind};
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, VecDeque},
@@ -604,13 +605,9 @@ impl<B: MachineBackend> Cozy<B> {
             .map(spelled)
             .unwrap_or_default();
         let authority = &self.media.identity.authority;
-        let verified = capability::verify(
-            token,
-            &authority.worker_id,
-            &authority.keys.admitted(),
-            unix_now(),
-            &binding,
-        );
+        let verified = authority
+            .keys
+            .check(|keys| capability::verify(token, &authority.worker_id, keys, unix_now(), &binding));
         match verified {
             Ok((grant, signer)) => {
                 let mut welcome = json!({"t": "welcome", "v": 1, "machine": grant.machine,
@@ -879,28 +876,27 @@ struct Target {
     etag: String,
 }
 
-fn source_error(id: &Value, status: &tonic::Status) -> Value {
-    let code = match status.code() {
-        tonic::Code::NotFound => "not_found",
-        tonic::Code::PermissionDenied | tonic::Code::Unauthenticated => "scope",
+fn source_error(id: &Value, refusal: &Error) -> Value {
+    let code = match refusal.kind {
+        Kind::NotFound => "not_found",
+        Kind::Forbidden | Kind::Credential => "scope",
         _ => "unavailable",
     };
-    error(Some(id), code, status.message())
+    error(Some(id), code, &refusal.message)
 }
 
 async fn open_snapshot<B: MachineBackend>(
     backend: &Arc<B>,
     actor: VerifiedActor,
     target: &Target,
-) -> Result<OutputSnapshot, tonic::Status> {
-    let (backend, run, output) = (backend.clone(), target.run.clone(), target.output.clone());
+) -> Result<OutputSnapshot, Error> {
+    let (run, output) = (target.run.clone(), target.output.clone());
     let index = (target.index > 0).then_some(target.index);
-    tokio::task::spawn_blocking(move || {
-        let record = backend.get(actor, query(&*backend, actor, &run)?)?;
+    super::http::blocking(backend, move |backend| {
+        let record = backend.get(actor, query(backend, actor, &run)?)?;
         backend.open_output(actor, record.number, &output, index)
     })
     .await
-    .map_err(|_| tonic::Status::internal("machine operation stopped"))?
 }
 
 /// The `end` of a stream over `snapshot`'s output.
@@ -982,29 +978,31 @@ async fn serve_follow<B: MachineBackend>(
     let stop = |message| {
         let _ = work.send(Work::Stop { number, message });
     };
-    let (events_tx, mut events) = mpsc::channel(256);
-    let log = tokio::spawn(stream_run(backend.clone(), actor, target.run.clone(), 0, None, events_tx));
+    let mut events = match follow(backend.clone(), actor, target.run.clone(), 0, None).await {
+        Ok(events) => events,
+        Err(refusal) => return stop(source_error(&target.id, &refusal)),
+    };
     let mut held = target.offset;
     let mut pending: Vec<(u64, v1::Product)> = vec![];
     let mut terminal = None;
     while terminal.is_none() {
-        let Some(event) = events.recv().await else {
-            let status = match log.await {
-                Ok(Err(status)) => status,
-                _ => tonic::Status::unavailable("the run's log ended before its outcome"),
-            };
-            return stop(source_error(&target.id, &status));
+        let event = match events.recv().await {
+            Some(Ok(event)) => event,
+            Some(Err(refusal)) => return stop(source_error(&target.id, &refusal)),
+            None => {
+                let ended = Error::unavailable("run_log_ended", "the run's log ended before its outcome");
+                return stop(source_error(&target.id, &ended));
+            }
         };
-        let Ok(event) = event else { continue };
         match event.event {
-            Some(v1::run_event::Event::Product(product))
+            v1::Event::Product(product)
                 if product.output == target.output
                     && product.index == target.index
                     && event.sequence > target.after =>
             {
                 pending.push((event.sequence, product))
             }
-            Some(v1::run_event::Event::Outcome(outcome)) => terminal = Some(outcome.status),
+            v1::Event::Outcome(outcome) => terminal = Some(outcome.status),
             _ => {}
         }
         // A burst of revisions is emitted once it settles: the next event is not yet here.
@@ -1124,7 +1122,7 @@ mod tests {
             &self,
             _: VerifiedActor,
             _: super::super::domain::MachineExecutionWorkspaceQuery,
-        ) -> Result<super::super::domain::MachineExecutionWorkspace, tonic::Status> {
+        ) -> Result<super::super::domain::MachineExecutionWorkspace, Error> {
             Ok(Default::default())
         }
     }

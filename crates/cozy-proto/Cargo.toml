@@ -1,6 +1,6 @@
 [package]
 name = "cozy-proto"
-description = "The wire types every cozy process shares: cozy.machine.v1, Cozy-Cap, the error envelope, ids and config.toml"
+description = "The wire types every cozy process shares: the machine API and its client, Cozy-Cap, the error envelope, ids and config.toml"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,23 +9,30 @@ publish.workspace = true
 
 [dependencies]
 base64.workspace = true
+bytes.workspace = true
 cozy-platform.workspace = true
 ed25519-dalek.workspace = true
+eventsource-stream.workspace = true
 figment.workspace = true
+futures-util.workspace = true
 hex.workspace = true
-prost.workspace = true
+reqwest.workspace = true
+rustls.workspace = true
 serde.workspace = true
 serde_ignored.workspace = true
 serde_json = { workspace = true, features = ["raw_value"] }
 sha2.workspace = true
 thiserror.workspace = true
-tonic.workspace = true
-tonic-prost.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
 url.workspace = true
+utoipa.workspace = true
 
-[build-dependencies]
-protoc-bin-vendored.workspace = true
-tonic-prost-build.workspace = true
+[dev-dependencies]
+axum = { workspace = true, features = ["http2"] }
+hyper-util = { workspace = true, features = ["server-auto", "service", "http1", "http2"] }
+rcgen.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true

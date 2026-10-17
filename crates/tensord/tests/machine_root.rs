@@ -4,24 +4,17 @@
 mod common;
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use tensord::api::{
-    capability::{self, Grant},
-    v1::{self, machine_client::MachineClient},
-};
 use ed25519_dalek::SigningKey;
 use fs2::FileExt;
 use std::{
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    sync::Arc,
+    time::{Duration, Instant},
 };
+use tensord::api::v1::client::Auth;
 use tensorfs_core::{ids::ObjectRef, sha256, store::Store};
-use tonic::{
-    metadata::MetadataValue,
-    transport::{Certificate, ClientTlsConfig, Endpoint},
-    Request,
-};
 
 const WORKER: &str = "root-test";
 const OWNER: [u8; 32] = [44; 32];
@@ -59,7 +52,8 @@ fn spawn(root: &Path, port: u16, store: Option<&Path>, stderr: Stdio) -> Child {
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
         .env("COZY_MACHINE_ROOT", root)
-        .env("COZY_MACHINE_LIFETIME", "persistent")
+            .env("HOME", root.join("home"))
+        .arg("--persistent")
         .env("COZY_WORKER_ID", WORKER)
         .env("COZY_WORKER_INTERNAL_PORT", port.to_string())
         .env("COZY_LISTEN_HOST", "127.0.0.1")
@@ -180,23 +174,6 @@ fn one_store_runs_one_machine() {
     std::fs::remove_dir_all(&scratch).unwrap();
 }
 
-fn cap() -> String {
-    let expires = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64
-        + 3600;
-    capability::mint(
-        &SigningKey::from_bytes(&OWNER),
-        Grant {
-            machine: WORKER.into(),
-            action: capability::MACHINE.into(),
-            expires,
-            ..Default::default()
-        },
-    )
-}
-
 #[tokio::test]
 async fn the_named_store_is_the_machines_store() {
     let root = scratch("machine-root-store");
@@ -224,39 +201,13 @@ async fn the_named_store_is_the_machines_store() {
     ready(&mut machine, &machine_root, port);
 
     // What the owner writes lands in the named store, beside what it held.
-    let pem = std::fs::read(machine_root.join("run/cozy/bootstrap/tls.crt")).unwrap();
-    let channel = Endpoint::from_shared(format!("https://127.0.0.1:{port}"))
-        .unwrap()
-        .tls_config(
-            ClientTlsConfig::new()
-                .ca_certificate(Certificate::from_pem(pem))
-                .domain_name("cozy-worker"),
-        )
-        .unwrap()
-        .connect()
-        .await
-        .unwrap();
-    let mut client = MachineClient::new(channel);
+    let owner = Auth::Key { key: Arc::new(SigningKey::from_bytes(&OWNER)), worker: WORKER.into() };
+    let client = common::client(&machine_root, port, owner);
     let written = b"an input this run uploads".to_vec();
     let written_hex = sha256::hex(&sha256::digest(&written));
-    let frames = vec![
-        v1::WriteFrame {
-            digest: format!("sha256:{written_hex}"),
-            length: written.len() as u64,
-            ..Default::default()
-        },
-        v1::WriteFrame {
-            data: written.clone(),
-            ..Default::default()
-        },
-    ];
-    let mut request = Request::new(tokio_stream::iter(frames));
-    request.metadata_mut().insert(
-        "authorization",
-        MetadataValue::try_from(format!("Cozy-Cap {}", cap())).unwrap(),
-    );
-    let held = client.write(request).await.unwrap().into_inner().held;
-    assert_eq!(held, written.len() as u64);
+    let length = written.len() as u64;
+    let held = client.bulk().unwrap().put(&format!("sha256:{written_hex}"), (0, length, length), written).await.unwrap();
+    assert_eq!(held, [(0, length)]);
 
     let store = Store::open(&named).unwrap();
     assert!(store.contains(&written_hex), "the write went elsewhere");
