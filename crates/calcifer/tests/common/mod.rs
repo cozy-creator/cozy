@@ -62,6 +62,11 @@ impl Tensord {
 
     /// As `start`, with more `serve` arguments.
     pub fn start_args(extra: &[&std::ffi::OsStr]) -> Self {
+        Self::start_at("127.0.0.1:0", extra)
+    }
+
+    /// As `start_args`, listening on `listen` (a port a test's network shaping names).
+    pub fn start_at(listen: &str, extra: &[&std::ffi::OsStr]) -> Self {
         let root = tempfile::tempdir().unwrap();
         let config = root.path().join("config");
         // TensorD refuses configuration others may read.
@@ -83,7 +88,7 @@ impl Tensord {
                 "authorized_keys_file": "keys.json", "readiness_hmac_key_file": "readiness.json"}),
         );
         let extra: Vec<_> = extra.iter().map(|arg| arg.to_os_string()).collect();
-        let (child, endpoint) = serve(root.path(), "127.0.0.1:0", &extra);
+        let (child, endpoint) = serve(root.path(), listen, &extra);
         Self {
             child,
             root,
