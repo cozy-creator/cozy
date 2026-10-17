@@ -1,7 +1,8 @@
 //! Acceptance, attempt supervision, cancellation, progress coalescing, output custody and
 //! reconcile. Scheduling policy remains with the machine owner (`service`).
+use cozy_platform::process::Birth;
 use crate::journal::{
-    Artifact, CallMemo, Execution, Invocation, Journal, Outcome, ProcessBirth, ProgressSnapshot,
+    Artifact, CallMemo, Execution, Invocation, Journal, Outcome, ProgressSnapshot,
     ResultRecord, State, SubmissionContext,
 };
 use serde_json::Value;
@@ -544,7 +545,7 @@ impl Engine {
         &self,
         after: u64,
         limit: usize,
-    ) -> io::Result<Vec<(u64, ProcessBirth)>> {
+    ) -> io::Result<Vec<(u64, Birth)>> {
         self.journal.lock().unwrap().gpu_births_after(after, limit)
     }
     pub fn nonterminal(&self, limit: usize) -> io::Result<Vec<Execution>> {
@@ -787,9 +788,9 @@ impl Engine {
 
     pub(crate) fn watch_process(
         self: &Arc<Self>,
-        birth: crate::journal::ProcessBirth,
+        birth: cozy_platform::process::Birth,
     ) -> io::Result<()> {
-        if process_ended(&birth)? {
+        if birth.ended()? {
             return Ok(());
         }
         // Read birth on both sides of pidfd_open so PID reuse cannot watch or
@@ -809,7 +810,7 @@ impl Engine {
             };
         }
         let pidfd = unsafe { File::from_raw_fd(raw) };
-        if process_ended(&birth)? {
+        if birth.ended()? {
             self.notify_activity();
             return Ok(());
         }
@@ -838,13 +839,13 @@ impl Engine {
         Ok(())
     }
 
-    fn watch_by_sampling(self: &Arc<Self>, birth: ProcessBirth) -> io::Result<()> {
+    fn watch_by_sampling(self: &Arc<Self>, birth: Birth) -> io::Result<()> {
         let engine = self.clone();
         std::thread::Builder::new()
             .name(format!("exiting-{}", birth.pid))
             .spawn(move || {
                 // The sample period is how often the exit is looked for, never a deadline.
-                while !process_ended(&birth).unwrap_or(true) {
+                while !birth.ended().unwrap_or(true) {
                     std::thread::sleep(Duration::from_secs(1));
                 }
                 engine.notify_activity();
@@ -854,8 +855,8 @@ impl Engine {
 
     /// A previous machine's process has no owner channel and is never adopted: kill that
     /// exact birth (and its group) and wake dispatch when its exit is observed.
-    pub(crate) fn end_orphan(self: &Arc<Self>, birth: ProcessBirth) -> io::Result<()> {
-        if let Some(exact) = crate::process::Exact::open(&birth)? {
+    pub(crate) fn end_orphan(self: &Arc<Self>, birth: Birth) -> io::Result<()> {
+        if let Some(exact) = cozy_platform::process::Exact::open(&birth)? {
             exact.kill()?;
         }
         self.watch_process(birth)
@@ -864,7 +865,7 @@ impl Engine {
     pub(crate) fn register_managed(
         self: &Arc<Self>,
         id: &str,
-        birth: ProcessBirth,
+        birth: Birth,
         cancel: Stop,
     ) -> io::Result<()> {
         self.journal
@@ -955,7 +956,7 @@ impl Engine {
                 continue;
             }
             let ended = match &record.process {
-                Some(birth) => match process_ended(birth) {
+                Some(birth) => match birth.ended() {
                     Ok(ended) => ended,
                     Err(error) => {
                         tracing::warn!(
@@ -1111,7 +1112,6 @@ fn overlay_observation(
     }
 }
 
-pub use crate::process::{process_birth, process_ended};
 
 /// A run's spool: removed once the run is settled, whatever the outcome. Its outputs are in
 /// custody by then (results and the store), so the spool would be a third copy.
@@ -1230,7 +1230,7 @@ mod tests {
             let mut process = std::process::Command::new("/bin/cat")
                 .stdin(std::process::Stdio::piped())
                 .spawn()?;
-            engine.register_managed(&id, process_birth(process.id())?, Arc::new(|| Ok(())))?;
+            engine.register_managed(&id, Birth::of(process.id())?, Arc::new(|| Ok(())))?;
             assert!(engine.authorize_managed(&id, None)?);
             settle(&engine, &id);
             drop(process.stdin.take());

@@ -115,10 +115,10 @@ impl LaunchIdentity {
 pub fn trampoline(
     python: &Path,
     identity: Option<LaunchIdentity>,
-    scope: Option<&crate::scope::Scope>,
+    scope: Option<&cozy_platform::contain::Scope>,
 ) -> io::Result<Command> {
     let mut command = Command::new(python);
-    crate::process::inherit_nothing(&mut command);
+    cozy_platform::process::inherit_nothing(&mut command);
     command
         .args([
             "-I",

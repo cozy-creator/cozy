@@ -31,7 +31,7 @@ fn run() -> io::Result<()> {
         .map_err(|error| io::Error::other(format!("cannot set TensorD process name: {error}")))?;
     // Whatever this process inherited (a parent's readiness, key or credential pipe) reaches
     // nothing it starts; descriptors it hands on are handed explicitly.
-    tensord::process::cloexec_from(3);
+    cozy_platform::process::cloexec_from(3);
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         // The image entrypoint and the CLI's machine launcher: no arguments, a grant in the
@@ -74,7 +74,7 @@ fn run() -> io::Result<()> {
             println!("{}", serde_json::to_string(&record)?); Ok(())
         }
         Some("host-memory") => {
-            println!("{}", serde_json::to_string(&tensord::host_memory::read())?);
+            println!("{}", serde_json::to_string(&cozy_platform::contain::host_memory::read())?);
             Ok(())
         }
         Some("serve") => {

@@ -1,4 +1,5 @@
 //! The production owner and TensorFS native socket protocol on real private stores.
+use cozy_platform::process::Birth;
 use super::*;
 use serde_json::{json, Value};
 use std::{
@@ -427,7 +428,7 @@ fn durable_writer_epoch_survives_clock_rollback_and_a_stale_channel_close() {
 #[test]
 fn cancel_between_durable_binding_and_native_begin_cannot_resurrect_the_transaction() {
     use crate::{
-        execution::{process_birth, Engine},
+        execution::Engine,
         journal::{Invocation, Journal},
     };
     use std::process::{Command, Stdio};
@@ -448,7 +449,7 @@ fn cancel_between_durable_binding_and_native_begin_cannot_resurrect_the_transact
     let running = engine
         .with_journal(|journal| {
             assert!(journal.claim(&record.id)?);
-            journal.register_process(&record.id, process_birth(child.id())?)?;
+            journal.register_process(&record.id, Birth::of(child.id())?)?;
             journal.running(&record.id, None)
         })
         .unwrap();
@@ -525,7 +526,7 @@ fn changed_declaration_in_one_slot_keeps_both_acknowledged_results() {
 
 #[test]
 fn cancellation_retries_released_root_cleanup_before_acknowledging_the_binding() {
-    use crate::{calls::Calls, execution::process_birth, journal::Invocation, service::Service};
+    use crate::{calls::Calls, journal::Invocation, service::Service};
     use std::process::{Command, Stdio};
     let mut f = Fixture::new();
     let service = Service::open(&f.root.join("state"), &f.root.join("generations"), 1).unwrap();
@@ -542,7 +543,7 @@ fn cancellation_retries_released_root_cleanup_before_acknowledging_the_binding()
             // atomically so Service cannot dispatch the empty-generation record first.
             let record = j.accept("cleanup-retry", Invocation::default())?;
             assert!(j.claim(&record.id)?);
-            j.register_process(&record.id, process_birth(child.id())?)?;
+            j.register_process(&record.id, Birth::of(child.id())?)?;
             j.running(&record.id, None)
         })
         .unwrap();

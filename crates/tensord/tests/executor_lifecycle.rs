@@ -1,13 +1,14 @@
 //! Executor lifecycle on real Runtime executors (the shipped SDK's generations of
 //! `tests/fixtures/cpu_lifecycle`), no doubles. CUDA is hidden by the seal; no torch.
 //! `TENSORD_LIFECYCLE_GENERATIONS` names the installed generations directory.
+use cozy_platform::process::Exact;
 use tensord::{
     device_executor::{
         Baseline, Binding, Budgets, DeviceCommand, DeviceExecutor, EndedBeforeStart,
         ExecutorConfig, Frame,
     },
     launch_identity::Seal,
-    process::{process_ended, Exact, Liveness},
+    process::Liveness,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -184,7 +185,7 @@ fn launch_is_sealed_grouped_and_reaped_after_cooperative_shutdown() {
         assert!(death.contains("NoNewPrivs:\t1"));
         let birth = executor.birth.clone();
         executor.shutdown().unwrap();
-        assert!(process_ended(&birth).unwrap());
+        assert!(birth.ended().unwrap());
         fs::remove_dir_all(root).unwrap();
     }
 }
@@ -286,7 +287,7 @@ fn canceled_wedge_is_killed_on_measured_stillness_and_reaped() {
         );
         let ended = executor.terminate().unwrap();
         assert_eq!(ended.status.signal(), Some(libc::SIGKILL));
-        assert!(process_ended(&birth).unwrap());
+        assert!(birth.ended().unwrap());
         fs::remove_dir_all(root).unwrap();
     }
 }
@@ -315,7 +316,7 @@ fn executor_killed_mid_request_returns_and_is_reaped() {
         let ended = executor.terminate().unwrap();
         assert_eq!(ended.status.signal(), Some(libc::SIGKILL));
         assert!(ended.killed.is_none());
-        assert!(process_ended(&birth).unwrap());
+        assert!(birth.ended().unwrap());
 
         // The package ends its own process mid-request: same contract.
         let (mut executor, root, _) = launch(&generation, &hold);
@@ -367,7 +368,7 @@ fn a_setsid_descendant_is_killed_with_its_executor_scope() {
         let pid = tensord::device_executor::read_result(&spool, &reply).unwrap()["pid"]
             .as_u64()
             .unwrap() as u32;
-        let daemon = tensord::process::process_birth(pid).unwrap();
+        let daemon = cozy_platform::process::Birth::of(pid).unwrap();
         // Its own session: a process-group kill would miss it.
         let session = |pid: u32| {
             fs::read_to_string(format!("/proc/{pid}/stat")).unwrap().rsplit_once(") ").unwrap().1
@@ -376,7 +377,7 @@ fn a_setsid_descendant_is_killed_with_its_executor_scope() {
         assert_ne!(session(pid), session(executor.birth.pid));
         let ended = executor.terminate().unwrap();
         assert_eq!(ended.stragglers, 1);
-        assert!(process_ended(&daemon).unwrap());
+        assert!(daemon.ended().unwrap());
         fs::remove_dir_all(root).unwrap();
     }
 }
@@ -584,6 +585,6 @@ fn foreign_identity_executor_is_contained_and_keeps_its_hold_and_caches() {
     );
     let birth = executor.birth.clone();
     executor.shutdown().unwrap();
-    assert!(process_ended(&birth).unwrap());
+    assert!(birth.ended().unwrap());
     fs::remove_dir_all(root).unwrap();
 }

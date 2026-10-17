@@ -1705,7 +1705,7 @@ mod terminal_tests {
             let invocation = Invocation { package: "org/pkg".into(), entrypoint: "run".into(), input: json!({}), ..Default::default() };
             let queued = journal.accept_public(context, invocation)?;
             assert!(journal.claim(&queued.id)?);
-            journal.register_process(&queued.id, crate::execution::process_birth(std::process::id())?)?;
+            journal.register_process(&queued.id, cozy_platform::process::Birth::of(std::process::id())?)?;
             let started = journal.running(&queued.id, None)?;
             journal.finish(&queued.id, Outcome::Failed(crate::journal::Failure::executor("failed", "author", "author_failed", message)))?;
             Ok((queued, started))

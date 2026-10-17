@@ -1,10 +1,8 @@
 //! The machine's sealed host tier on the real path: a real TensorFS store, TensorFS's verified
 //! fill, real executor stand-in processes (their pidfds hold layouts), and TensorFS's own
 //! read-only adoption (`Plane::register_sealed`) checking every byte.
-use tensord::{
-    host_memory::HostMemory,
-    host_tier::{HostGrant, HostTier, HostTierConfig, SealedRequest, TierLimit},
-};
+use cozy_platform::contain::host_memory::HostMemory;
+use tensord::host_tier::{HostGrant, HostTier, HostTierConfig, SealedRequest, TierLimit};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeSet,
@@ -622,7 +620,7 @@ fn in_scope(memory: &[&str], name: &str) {
 #[test]
 #[ignore = "run inside a memory-limited scope by the test above"]
 fn inside_a_256_mib_scope() {
-    let host = tensord::host_memory::read();
+    let host = cozy_platform::contain::host_memory::read();
     assert!(
         host.available > 0 && host.available <= 256 << 20,
         "{host:?}"
@@ -891,7 +889,7 @@ fn a_model_larger_than_its_cgroup_streams_and_checks() {
 #[test]
 #[ignore = "run inside a memory-limited scope by the test above"]
 fn inside_a_192_mib_scope() {
-    let host = tensord::host_memory::read();
+    let host = cozy_platform::contain::host_memory::read();
     assert!(
         host.available > 0 && host.available <= 192 << 20,
         "{host:?}"

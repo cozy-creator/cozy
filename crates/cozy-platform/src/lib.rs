@@ -1,10 +1,11 @@
 //! Every OS-specific seam of the `cozy` binary (design §6.2). Callers never write `cfg(target_os)`:
 //! an OS without an implementation answers [`Error::Unsupported`], never a panic.
 //!
-//! Containment, shared memory, handle passing and local IPC arrive with TensorD's and TensorFS's
-//! move into the workspace (xs-043 unit W), together with their call sites.
+//! Moved code keeps `io::Result` inside; the two conversions below let a moved body's `?` and a
+//! caller's `?` work across the boundary, an `io::Error` keeping its errno both ways.
 use std::{fmt, io, path::PathBuf};
 
+pub mod contain;
 pub mod durable;
 pub mod gpu;
 pub mod lock;
@@ -61,6 +62,27 @@ impl Error {
 
     pub(crate) fn os(op: &'static str) -> impl FnOnce(io::Error) -> Self {
         move |source| Self::Os { op, source }
+    }
+}
+
+impl From<io::Error> for Error {
+    fn from(source: io::Error) -> Self {
+        Self::Os {
+            op: "system call",
+            source,
+        }
+    }
+}
+
+impl From<Error> for io::Error {
+    /// An `Io`/`Os` error gives back the `io::Error` it carried, errno intact; `Unsupported` is
+    /// `ErrorKind::Unsupported` carrying the typed error.
+    fn from(error: Error) -> Self {
+        match error {
+            Error::Io { source, .. } | Error::Os { source, .. } => source,
+            Error::Unsupported { .. } => io::Error::new(io::ErrorKind::Unsupported, error),
+            other => io::Error::other(other),
+        }
     }
 }
 

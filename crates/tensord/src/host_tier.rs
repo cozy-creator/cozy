@@ -9,7 +9,8 @@
 //! A layout can instead expose unstaged regions through granted object descriptors, or use
 //! a sealed streaming window that TensorD refills as Runtime claims regions. These are data
 //! paths for a granted weight set, not permission for the executor to open the managed Store.
-use crate::{access::Fetch, host_memory::HostMemory, os};
+use crate::{access::Fetch, os};
+use cozy_platform::contain::host_memory::HostMemory;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -433,7 +434,7 @@ impl HostTier {
                 return Ok(());
             }
             loop {
-                let host = crate::host_memory::read();
+                let host = cozy_platform::contain::host_memory::read();
                 let charged = state.charged();
                 if charged + bytes <= self.limit.limit(&host, charged) {
                     break;
@@ -620,7 +621,7 @@ impl HostTier {
         };
         let mut need = stage.as_deref().map_or(layout.nbytes, spans);
         loop {
-            let host = crate::host_memory::read();
+            let host = cozy_platform::contain::host_memory::read();
             let charged = state.charged();
             if charged + need <= self.limit.limit(&host, charged) {
                 break;
@@ -727,7 +728,7 @@ impl HostTier {
                 None => break,
             }
         }
-        let room = self.limit.staging(&crate::host_memory::read(), state.charged());
+        let room = self.limit.staging(&cozy_platform::contain::host_memory::read(), state.charged());
         let slots = ((room / span) as usize).clamp(1, layout.regions.len().max(1));
         state.slots.insert(key.clone(), Slot::Opening(slots as u64 * span));
         drop(state);
@@ -824,7 +825,7 @@ impl HostTier {
     fn stage_regions(&self, key: &str, regions: &[u32], fetch: Option<&Arc<Fetch>>) -> Vec<u32> {
         let mut state = self.state.lock().unwrap();
         let limit = |state: &State| {
-            let host = crate::host_memory::read();
+            let host = cozy_platform::contain::host_memory::read();
             let charged = state.charged();
             (charged, self.limit.limit(&host, charged))
         };
@@ -891,7 +892,7 @@ impl HostTier {
                 .map(|&r| staging.layout.regions[r as usize].span)
                 .sum();
             let charged = state.charged();
-            if charged + need > self.limit.limit(&crate::host_memory::read(), charged) {
+            if charged + need > self.limit.limit(&cozy_platform::contain::host_memory::read(), charged) {
                 return false;
             }
             rest
@@ -1051,7 +1052,7 @@ impl HostTier {
     pub fn facts(&self) -> HostTierFacts {
         let mut state = self.state.lock().unwrap();
         self.reap(&mut state);
-        let host = crate::host_memory::read();
+        let host = cozy_platform::contain::host_memory::read();
         let charged = state.charged();
         let (mut held, mut filling) = (0, 0);
         let (mut windows, mut window_bytes, mut window_read_bytes) = (0, 0, 0);

@@ -3,11 +3,11 @@
 //! (no torch is installed, so no device is touched) in the executor's own words, and teardown
 //! leaves no member of the group. `TENSORD_GROUP_GENERATIONS` names the installed
 //! generations directory.
+use cozy_platform::process::{Birth, group_members};
 use tensord::{
     device_executor::{Baseline, DeviceCommand, DeviceExecutor, ExecutorConfig},
-    journal::ProcessBirth,
     launch_identity::Seal,
-    process::{group_members, process_ended, Liveness},
+    process::Liveness,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -23,7 +23,7 @@ use std::{
 };
 
 /// Every group member seen while it formed: its birth and its environment.
-type Seen = BTreeMap<u32, (ProcessBirth, BTreeMap<String, String>)>;
+type Seen = BTreeMap<u32, (Birth, BTreeMap<String, String>)>;
 
 #[derive(Deserialize)]
 struct Generation {
@@ -156,7 +156,7 @@ fn a_group_start_spawns_sealed_followers_and_teardown_leaves_none() {
         assert_eq!(env.get("NCCL_P2P_LEVEL"), None);
     }
     let leader = executor.birth.clone();
-    let followers: Vec<ProcessBirth> = seen.values().map(|(birth, _)| birth.clone()).collect();
+    let followers: Vec<Birth> = seen.values().map(|(birth, _)| birth.clone()).collect();
     executor.terminate().unwrap();
     assert!(
         group_members(&leader).is_empty(),
@@ -164,7 +164,7 @@ fn a_group_start_spawns_sealed_followers_and_teardown_leaves_none() {
     );
     for follower in followers {
         assert!(
-            process_ended(&follower).unwrap(),
+            follower.ended().unwrap(),
             "{follower:?} outlived teardown"
         );
     }
@@ -312,7 +312,7 @@ fn a_forked_rank_zero_takes_the_group_seal_and_spawns_its_follower() {
         );
         assert_eq!(env.get("NCCL_NVLS_ENABLE").map(String::as_str), Some("0"));
     }
-    let followers: Vec<ProcessBirth> = seen.values().map(|(birth, _)| birth.clone()).collect();
+    let followers: Vec<Birth> = seen.values().map(|(birth, _)| birth.clone()).collect();
     child.terminate().unwrap();
     assert!(
         group_members(&leader).is_empty(),
@@ -320,7 +320,7 @@ fn a_forked_rank_zero_takes_the_group_seal_and_spawns_its_follower() {
     );
     for follower in followers {
         assert!(
-            process_ended(&follower).unwrap(),
+            follower.ended().unwrap(),
             "{follower:?} outlived teardown"
         );
     }

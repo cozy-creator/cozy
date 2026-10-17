@@ -6,8 +6,7 @@
 //! close (release, or the kernel at process death) ends it. Bytes are counted once per GPU, until
 //! every lease ended and the fds here are closed. A holding lives while a package environment
 //! installed here has read it: the last one's removal revokes it.
-use crate::execution::process_ended;
-use crate::journal::ProcessBirth;
+use cozy_platform::process::Birth;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
@@ -57,7 +56,7 @@ pub struct HoldingFacts {
     pub generation: u64,
     pub bytes: u64,
     pub phase: Phase,
-    pub readers: Vec<ProcessBirth>,
+    pub readers: Vec<Birth>,
     pub idle_ms: u64,
 }
 
@@ -82,7 +81,7 @@ pub enum Offered {
 /// process dies, ends the lease with no message (as GMS ties a lease to its connection). The
 /// pidfd and exact birth are the machine's own observation of that death, as everywhere else.
 pub struct Reader {
-    pub birth: ProcessBirth,
+    pub birth: Birth,
     pub exit: File,
     /// The package environment (generation identity) the executor runs.
     pub environment: String,
@@ -91,7 +90,7 @@ pub struct Reader {
 
 impl Reader {
     /// A new lease and the end the executor keeps (close-on-exec until it is sent).
-    pub fn lease(birth: ProcessBirth, exit: File, environment: &str) -> io::Result<(Reader, OwnedFd)> {
+    pub fn lease(birth: Birth, exit: File, environment: &str) -> io::Result<(Reader, OwnedFd)> {
         let (ours, theirs) = UnixStream::pair()?;
         ours.set_nonblocking(true)?;
         Ok((
@@ -107,7 +106,7 @@ impl Reader {
 
     fn ended(&self) -> bool {
         hung_up(&self.lease)
-            || (crate::os::ended(&self.exit) && process_ended(&self.birth).unwrap_or(false))
+            || (crate::os::ended(&self.exit) && self.birth.ended().unwrap_or(false))
     }
 }
 
@@ -227,7 +226,7 @@ impl ResidentCustody {
         &mut self,
         key: &HoldingKey,
         generation: u64,
-    ) -> io::Result<Vec<ProcessBirth>> {
+    ) -> io::Result<Vec<Birth>> {
         let held = self
             .holdings
             .get_mut(key)
@@ -285,7 +284,7 @@ impl ResidentCustody {
 
     /// A reader answered `revoke`: it unmapped and released the generation after its queued
     /// work. A reader that could not stays charged until its process ends.
-    pub fn released(&mut self, key: &HoldingKey, generation: u64, birth: &ProcessBirth) {
+    pub fn released(&mut self, key: &HoldingKey, generation: u64, birth: &Birth) {
         if let Some(held) = self
             .holdings
             .get_mut(key)
@@ -327,7 +326,7 @@ impl ResidentCustody {
     }
 
     /// Holdings `birth` maps: (key, generation).
-    pub fn read_by(&self, birth: &ProcessBirth) -> Vec<(HoldingKey, u64)> {
+    pub fn read_by(&self, birth: &Birth) -> Vec<(HoldingKey, u64)> {
         self.holdings
             .iter()
             .filter(|(_, h)| h.readers.iter().any(|r| r.birth == *birth))
@@ -424,7 +423,7 @@ fn validate(key: &HoldingKey, regions: &[SharedRegion], fds: &[OwnedFd]) -> io::
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::execution::process_birth;
+    use cozy_platform::process::Birth;
     use std::os::fd::FromRawFd;
     use std::process::{Child, Command, Stdio};
 
@@ -440,7 +439,7 @@ mod tests {
     /// A lease whose executor end this test process keeps.
     fn mine() -> (Reader, OwnedFd) {
         let me = std::process::id();
-        Reader::lease(process_birth(me).unwrap(), pidfd(me), "mine").unwrap()
+        Reader::lease(Birth::of(me).unwrap(), pidfd(me), "mine").unwrap()
     }
     /// A real executor stand-in: a child process holding its lease end as stdin. The reader's
     /// birth is this test process, which stays alive: only the connection can end the lease.
@@ -457,7 +456,7 @@ mod tests {
     fn executor(environment: &str) -> (Reader, OwnedFd, Child) {
         let child = Command::new("sleep").arg("60").spawn().unwrap();
         let (reader, end) =
-            Reader::lease(process_birth(child.id()).unwrap(), pidfd(child.id()), environment).unwrap();
+            Reader::lease(Birth::of(child.id()).unwrap(), pidfd(child.id()), environment).unwrap();
         (reader, end, child)
     }
     /// The layout whose digest repeats `digit`, on GPU-1.

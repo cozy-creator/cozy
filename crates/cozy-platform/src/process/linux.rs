@@ -104,6 +104,83 @@ pub(super) fn set_name(name: &str) -> crate::Result<()> {
     Ok(())
 }
 
+pub(super) fn group_members(leader: &Birth) -> Vec<Birth> {
+    let Ok(boot) = boot_id() else {
+        return vec![];
+    };
+    if boot != leader.boot_id {
+        return vec![];
+    }
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return vec![];
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| *pid != leader.pid)
+        .filter_map(|pid| {
+            let stat = stat(pid).ok()?;
+            (stat.pgrp as u32 == leader.pid && stat.start_ticks >= leader.start_ticks).then(|| {
+                Birth {
+                    pid,
+                    boot_id: boot.clone(),
+                    start_ticks: stat.start_ticks,
+                }
+            })
+        })
+        .collect()
+}
+
+/// Owed is the time its live threads waited runnable for a CPU (`schedstat` run delay): busy
+/// cores or a container's spent CPU quota slow a working process, never still it.
+pub(super) fn meter(pid: u32) -> Option<(u64, u64)> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let fields: Vec<_> = stat.rsplit_once(") ")?.1.split_whitespace().collect();
+    let ticks = fields.get(11)?.parse::<u64>().ok()? + fields.get(12)?.parse::<u64>().ok()?;
+    // SAFETY: sysconf takes a scalar key.
+    let hertz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as u64;
+    let waited: u64 = fs::read_dir(format!("/proc/{pid}/task"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|task| fs::read_to_string(task.path().join("schedstat")).ok())
+        .filter_map(|line| line.split_whitespace().nth(1)?.parse::<u64>().ok())
+        .sum();
+    let cpu = ticks
+        .saturating_mul(1_000_000_000 / hertz)
+        .saturating_add(waited);
+    let moved = fs::read_to_string(format!("/proc/{pid}/io"))
+        .ok()
+        .and_then(|io| {
+            io.lines()
+                .filter_map(|line| line.split_once(": "))
+                .filter(|(name, _)| {
+                    matches!(*name, "rchar" | "wchar" | "read_bytes" | "write_bytes")
+                })
+                .map(|(_, value)| value.trim().parse::<u64>().ok())
+                .sum::<Option<u64>>()
+        });
+    Some((cpu, moved.unwrap_or(0)))
+}
+
+/// `rchar`.
+pub(super) fn read_bytes(pid: u32) -> Option<u64> {
+    fs::read_to_string(format!("/proc/{pid}/io"))
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("rchar: "))?
+        .trim()
+        .parse()
+        .ok()
+}
+
+pub(super) fn transient(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::EAGAIN | libc::ENOMEM | libc::EMFILE | libc::ENFILE | libc::EINTR)
+    )
+}
+
 /// Exited, a zombie included, or gone altogether.
 pub(super) fn exited(pid: u32) -> bool {
     match stat(pid) {
@@ -119,7 +196,7 @@ fn boot_id() -> io::Result<String> {
 }
 
 /// `/proc/<pid>` vanished: ENOENT, or ESRCH when the process was reaped mid-read.
-fn gone(error: &io::Error) -> bool {
+pub(super) fn gone(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
 }
 
@@ -166,4 +243,50 @@ fn sigkill_pending(pid: u32) -> io::Result<bool> {
         })
         .filter_map(|mask| u64::from_str_radix(mask.trim(), 16).ok())
         .any(|mask| mask & kill != 0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    #[test]
+    fn exact_kill_takes_the_group_and_never_a_reused_birth() {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "sleep 1000 & wait"])
+            .process_group(0)
+            .stdin(Stdio::null())
+            .spawn()
+            .unwrap();
+        let birth = Birth::of(child.id()).unwrap();
+        let mut stale = birth.clone();
+        stale.start_ticks += 1;
+        assert!(crate::process::Exact::open(&stale).unwrap().is_none());
+        let exact = crate::process::Exact::open(&birth).unwrap().unwrap();
+        // The grandchild is in the leader's group: wait until it exists.
+        let grandchild = loop {
+            let children =
+                fs::read_to_string(format!("/proc/{0}/task/{0}/children", child.id())).unwrap();
+            if let Some(pid) = children.split_whitespace().next() {
+                break pid.parse::<u32>().unwrap();
+            }
+            std::thread::yield_now();
+        };
+        let grandchild = crate::process::Exact::open(&Birth::of(grandchild).unwrap())
+            .unwrap()
+            .unwrap();
+        exact.kill().unwrap();
+        exact.wait().unwrap();
+        grandchild.wait().unwrap();
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGKILL));
+        assert!((birth.state().unwrap() == State::Gone));
+    }
+
+    #[test]
+    fn burn_reads_this_process() {
+        assert!(crate::process::burn(std::process::id()).is_some_and(|value| value > 0));
+        assert!(crate::process::burn(u32::MAX).is_none());
+    }
 }

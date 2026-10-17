@@ -191,7 +191,11 @@ pub fn tree_private(pid: u32) -> u64 {
     let mut parents: Vec<(u32, u32)> = vec![];
     if let Ok(entries) = fs::read_dir("/proc") {
         for entry in entries.flatten() {
-            let Some(child) = entry.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else {
+            let Some(child) = entry
+                .file_name()
+                .to_str()
+                .and_then(|n| n.parse::<u32>().ok())
+            else {
                 continue;
             };
             let Ok(stat) = fs::read_to_string(format!("/proc/{child}/stat")) else {
@@ -211,7 +215,12 @@ pub fn tree_private(pid: u32) -> u64 {
     let mut at = 0;
     while at < tree.len() {
         let parent = tree[at];
-        tree.extend(parents.iter().filter(|(_, p)| *p == parent).map(|(c, _)| *c));
+        tree.extend(
+            parents
+                .iter()
+                .filter(|(_, p)| *p == parent)
+                .map(|(c, _)| *c),
+        );
         at += 1;
     }
     tree.iter()
@@ -240,19 +249,36 @@ mod tests {
             .spawn()
             .unwrap();
         let mut pid = String::new();
-        std::io::BufRead::read_line(&mut std::io::BufReader::new(shell.stdout.take().unwrap()), &mut pid).unwrap();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(shell.stdout.take().unwrap()),
+            &mut pid,
+        )
+        .unwrap();
         let sleeper: u32 = pid.trim().parse().unwrap();
         // Until the child has become `sleep`, it shares the shell's pages and their sizes move.
-        while std::fs::read_to_string(format!("/proc/{sleeper}/comm")).is_ok_and(|c| c.trim() != "sleep") {
+        while std::fs::read_to_string(format!("/proc/{sleeper}/comm"))
+            .is_ok_and(|c| c.trim() != "sleep")
+        {
             std::thread::yield_now();
         }
-        let private = |pid: u32| super::process(pid).map(|m| m.pss.saturating_sub(m.pss_shmem)).unwrap();
+        let private = |pid: u32| {
+            super::process(pid)
+                .map(|m| m.pss.saturating_sub(m.pss_shmem))
+                .unwrap()
+        };
         let (alone, child) = (private(shell.id()), private(sleeper));
         let tree = super::tree_private(shell.id());
-        let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(sleeper as i32), nix::sys::signal::Signal::SIGKILL);
+        if let Ok(Some(sleeping)) =
+            crate::process::Birth::of(sleeper).and_then(|birth| crate::process::Exact::open(&birth))
+        {
+            let _ = sleeping.kill();
+        }
         shell.wait().unwrap();
         // Shared library pages split their size among every process mapping them, so a quiet
         // process still moves by a few hundred bytes; the child's own pages are far more.
-        assert!(child > 0 && tree > alone, "a child counts too: {tree} vs {alone} alone, {child} child");
+        assert!(
+            child > 0 && tree > alone,
+            "a child counts too: {tree} vs {alone} alone, {child} child"
+        );
     }
 }
