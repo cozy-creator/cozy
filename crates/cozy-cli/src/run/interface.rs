@@ -53,6 +53,9 @@ pub struct Slot {
     /// `decode` for an LM token loop; absent is compute.
     #[serde(default, deserialize_with = "or_default")]
     pub phase: Option<String>,
+    /// The checkpoint components each of its stages reads: what a checkpoint must carry for it.
+    #[serde(default, deserialize_with = "or_default")]
+    pub component_use: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]

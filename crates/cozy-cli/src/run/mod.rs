@@ -242,7 +242,6 @@ async fn run(ctx: &Context, args: RunArgs) -> Result<ExitCode, Error> {
 
 /// `cozy run <package>/<function>[@release] <inputs…> --on …` for another verb: `model
 /// quantize` runs a package's conversion this way.
-#[expect(dead_code, reason = "model quantize calls it next")]
 pub(crate) async fn call(
     ctx: &Context,
     package: &str,
@@ -274,7 +273,6 @@ pub(crate) async fn call(
 }
 
 /// A release's card: the kept one, else the Hub's, kept from then on.
-#[expect(dead_code, reason = "model quantize calls it next")]
 pub(crate) async fn card(
     ctx: &Context,
     hub: &Hub,
