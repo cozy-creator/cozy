@@ -1,10 +1,10 @@
-name: tensorfs-release
+name: publish-tensorfs
 # TensorFS's Python package (design §2): one abi3 wheel per platform, each built and smoke-installed on a
 # runner of its own platform, and the sdist, proven by a source install. Moved losslessly from the
 # tensorfs repo's wheels.yaml and publish.yaml. Dispatch only; a release is its tensorfs-vX.Y.Z tag:
-#   gh workflow run tensorfs-release.yaml -R cozy-creator/cozy --ref <branch>                         # build and prove
-#   gh workflow run tensorfs-release.yaml -R cozy-creator/cozy --ref tensorfs-vX.Y.Z -f publish=true  # PyPI
-#   gh workflow run tensorfs-release.yaml -R cozy-creator/cozy --ref <branch> -f dev=true             # <version>+dev.g<sha>
+#   gh workflow run publish-tensorfs.yaml -R cozy-creator/cozy-creator --ref <branch>                         # build and prove
+#   gh workflow run publish-tensorfs.yaml -R cozy-creator/cozy-creator --ref tensorfs-vX.Y.Z -f publish=true  # PyPI
+#   gh workflow run publish-tensorfs.yaml -R cozy-creator/cozy-creator --ref <branch> -f dev=true             # <version>+dev.g<sha>
 on:
   workflow_dispatch:
     inputs:
@@ -18,7 +18,7 @@ on:
         default: false
 
 concurrency:
-  group: tensorfs-release-${{ github.ref }}
+  group: publish-tensorfs-${{ github.ref }}
   cancel-in-progress: false
 
 permissions:

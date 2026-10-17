@@ -20,10 +20,13 @@ use sigstore_verify::{
 
 use crate::Context;
 
-const RELEASES: &str = "https://github.com/cozy-creator/cozy/releases";
+const RELEASES: &str = "https://github.com/cozy-creator/cozy-creator/releases";
 const ISSUER: &str = "https://token.actions.githubusercontent.com";
-/// The release workflow of this repo, on any ref.
-const SIGNER: &str = "https://github.com/cozy-creator/cozy/.github/workflows/release.yml@";
+/// The release workflow of this repo, on any ref; releases through v0.9.6 were signed before the repo's rename.
+const SIGNERS: [&str; 2] = [
+    "https://github.com/cozy-creator/cozy-creator/.github/workflows/release.yml@",
+    "https://github.com/cozy-creator/cozy/.github/workflows/release.yml@",
+];
 
 /// The dist target whose archive replaces this binary.
 const TARGET: &str = if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
@@ -244,7 +247,7 @@ async fn attested(http: &reqwest::Client, url: &str, archive: &[u8]) -> Result<S
             });
         match verified {
             Ok(result) => match result.identity().map(|id| id.as_str().to_owned()) {
-                Some(id) if id.starts_with(SIGNER) => return Ok(id),
+                Some(id) if SIGNERS.iter().any(|s| id.starts_with(s)) => return Ok(id),
                 id => seen.push(format!("signed by {}", id.unwrap_or_default())),
             },
             Err(e) => seen.push(e),
@@ -254,7 +257,8 @@ async fn attested(http: &reqwest::Client, url: &str, archive: &[u8]) -> Result<S
         Kind::Validation,
         "unattested",
         format!(
-            "no bundle in {bundles} verifies as {SIGNER}…: [{}]",
+            "no bundle in {bundles} verifies as {}…: [{}]",
+            SIGNERS[0],
             seen.join("; ")
         ),
     ))

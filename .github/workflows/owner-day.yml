@@ -5,7 +5,7 @@ name: owner-day
 # this commit's (workspace). One machine's port is shaped like the owner's uplink. Called by
 # release.yml (dist's `plan` input), the tests run the release's own Linux x86_64 `cozy`; dispatched,
 # this commit's build.
-#   gh workflow run owner-day.yml -R cozy-creator/cozy --ref <branch> [-f tensorhub_ref=<ref>]
+#   gh workflow run owner-day.yml -R cozy-creator/cozy-creator --ref <branch> [-f tensorhub_ref=<ref>]
 on:
   workflow_dispatch:
     inputs:

@@ -65,7 +65,7 @@ def main() -> int:
         if theirs != ours:
             which = f"the wheel {wheel}" if wheel else "the newest on PyPI"
             print(f"this tree speaks {said(ours)}; tensorfs {version}, {which}, speaks {said(theirs)}:"
-                  " publish its wheel first (tensorfs-release.yaml)", file=sys.stderr)
+                  " publish its wheel first (publish-tensorfs.yaml)", file=sys.stderr)
             return 1
         print(version)
         return 0
