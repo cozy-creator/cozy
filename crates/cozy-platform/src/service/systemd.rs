@@ -1,5 +1,5 @@
 //! A systemd `--user` unit kept in the home and linked into the user's manager, so no XDG path is
-//! looked up. `Restart=on-failure`: a clean exit (Calcifer owing nothing) is not restarted.
+//! looked up. `Restart=on-failure`: a clean exit (`cozy down`, an update) is not restarted.
 use super::{ServiceSpec, run};
 use crate::{Error, Result, durable, paths::Home};
 use std::{
@@ -32,6 +32,11 @@ pub(super) fn install(dir: &Path, spec: &ServiceSpec) -> Result<()> {
     // changed definition of a unit that was already linked.
     run(MANAGER, systemctl().arg("enable").arg(&path))?;
     run(MANAGER, systemctl().arg("daemon-reload"))
+}
+
+/// Whether the unit kept here is `spec`'s, as `install` wrote it (and linked it).
+pub(super) fn current(dir: &Path, spec: &ServiceSpec) -> bool {
+    fs::read(dir.join(unit(&spec.name))).is_ok_and(|kept| kept == render(spec).as_bytes())
 }
 
 pub(super) fn start(_: &Path, spec: &ServiceSpec) -> Result<()> {

@@ -115,9 +115,11 @@ impl LockFile {
 
 impl Held {
     /// Publishes what a caller whose `try_lock` failed may read: an address, a token, a birth. It
-    /// lives beside the lock, not in it, because a Windows lock blocks other handles' reads.
+    /// lives beside the lock, not in it, because a Windows lock blocks other handles' reads. It
+    /// describes a live holder, which a crash makes stale anyway, so it is never flushed: a
+    /// holder's readiness never waits on the disk.
     pub fn publish(&self, record: &[u8]) -> Result<()> {
-        durable::replace(&self.holder, record, 0o600)?;
+        durable::swap(&self.holder, record, 0o600)?;
         self.published.store(true, Ordering::Relaxed);
         Ok(())
     }

@@ -307,8 +307,11 @@ pub struct OutputRow {
     pub export_error: Option<String>,
 }
 
+/// The store: writes on one connection, one at a time, each commit durable; reads on their own,
+/// which WAL lets go on while a commit waits on the disk, so a slow flush never holds up a read.
 pub struct Store {
-    conn: Mutex<Connection>,
+    writer: Mutex<Connection>,
+    reader: Mutex<Connection>,
 }
 
 impl Store {
@@ -316,18 +319,18 @@ impl Store {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| StoreError::Corrupt(e.to_string()))?;
         }
-        let mut conn = Connection::open(path)?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "synchronous", "FULL")?;
-        conn.pragma_update(None, "foreign_keys", "ON")?;
+        let mut writer = Connection::open(path)?;
+        writer.pragma_update(None, "journal_mode", "WAL")?;
+        writer.pragma_update(None, "synchronous", "FULL")?;
+        writer.pragma_update(None, "foreign_keys", "ON")?;
         let migrations = migrations();
-        let version: usize = migrations.current_version(&conn)?.into();
+        let version: usize = migrations.current_version(&writer)?.into();
         if version < JSON_ROWS && version > 0 {
             // A copy of the store as it was, beside it, before its rows are rewritten.
             let backup = path.with_extension(format!("db.pre-json-{}", now_ms()));
-            conn.backup(rusqlite::MAIN_DB, &backup, None)?;
+            writer.backup(rusqlite::MAIN_DB, &backup, None)?;
             migrations
-                .to_latest(&mut conn)
+                .to_latest(&mut writer)
                 .map_err(|e| StoreError::Conversion {
                     backup,
                     reason: match e {
@@ -336,22 +339,33 @@ impl Store {
                     },
                 })?;
         }
-        migrations.to_latest(&mut conn)?;
+        migrations.to_latest(&mut writer)?;
+        let reader = Connection::open(path)?;
+        reader.pragma_update(None, "query_only", "ON")?;
         Ok(Self {
-            conn: Mutex::new(conn),
+            writer: Mutex::new(writer),
+            reader: Mutex::new(reader),
         })
     }
 
     fn read<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
-        f(&self.conn.lock().unwrap_or_else(|e| e.into_inner()))
+        f(&self.reader.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
+    /// One transaction. A commit can wait seconds on a busy disk's write-back: on a multi-thread
+    /// runtime the worker says so first, so its other tasks (the API's among them) move on.
     fn write<T>(&self, f: impl FnOnce(&Transaction) -> Result<T>) -> Result<T> {
-        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let value = f(&tx)?;
-        tx.commit()?;
-        Ok(value)
+        let commit = || {
+            let mut conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let value = f(&tx)?;
+            tx.commit()?;
+            Ok(value)
+        };
+        match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
+            Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(commit),
+            _ => commit(),
+        }
     }
 
     pub fn put_machine(&self, machine: &MachineRow) -> Result<()> {

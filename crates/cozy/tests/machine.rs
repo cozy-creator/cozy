@@ -28,7 +28,6 @@ fn listed(home: &Home, name: &str) -> Option<Value> {
 #[test]
 fn an_added_machine_is_checked_before_it_is_recorded_then_listed_shown_checked_and_removed() {
     let Some(home) = Home::new() else { return };
-    let _calcifer = home.want_calcifer();
     // A machine that admits some other controller.
     let mut machine = Tensord::start(&[tensord::stranger()]);
     let add = |fingerprint: &str| {
@@ -194,7 +193,6 @@ fn machine_refusals_say_what_to_do_instead() {
 #[test]
 fn an_update_installs_the_hubs_target_and_then_has_nothing_to_do() {
     let Some(home) = Home::new() else { return };
-    let _calcifer = home.want_calcifer();
     let _machine = tensord::added(&home, "upd");
     let out = home.cozy(["machine", "update", "upd", "--json"]);
     let last: serde_json::Value =
@@ -265,7 +263,6 @@ fn downloaded(dir: &Path) -> (PathBuf, PathBuf) {
 #[test]
 fn an_update_installs_local_wheels() {
     let Some(home) = Home::new() else { return };
-    let _calcifer = home.want_calcifer();
     let _machine = tensord::added(&home, "wheels");
     let dir = tempfile::tempdir().unwrap();
     let (runtime, tensorfs) = downloaded(dir.path());
@@ -316,7 +313,6 @@ fn an_update_installs_local_wheels() {
 #[test]
 fn an_update_fetches_wheels_by_url_held_to_their_digests() {
     let Some(home) = Home::new() else { return };
-    let _calcifer = home.want_calcifer();
     let (dir, trust) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let (runtime, tensorfs) = downloaded(dir.path());
     let server = Https::serve(dir.path());

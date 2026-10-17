@@ -52,9 +52,8 @@ struct Served {
 }
 
 impl Served {
-    /// Starts `serve` as the CLI does: wanting it (`wanted.lock`) until its first answer.
+    /// Starts `serve` as the CLI does, and waits for its first answer.
     async fn start(home: &Path) -> Self {
-        let wanted = common::want(home);
         let loaded = Loaded {
             config: Config::default(),
             home: Home::at(home),
@@ -89,7 +88,6 @@ impl Served {
         };
         let first = served.get("/v1/runs").send().await.unwrap();
         assert_eq!(first.status(), StatusCode::OK);
-        drop(wanted);
         served
     }
 
@@ -503,6 +501,7 @@ async fn the_route_serves_a_landed_output_and_says_why_another_has_not_landed() 
     drop(store);
 
     let calcifer = Calcifer::open(&home.path().join("calcifer"), &out).unwrap();
+    calcifer.resume().unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let router = axum::Router::new()
@@ -610,6 +609,7 @@ async fn the_route_serves_a_landed_output_and_says_why_another_has_not_landed() 
     drop(calcifer);
 
     let reopened = Calcifer::open(&home.path().join("calcifer"), &out).unwrap();
+    reopened.resume().unwrap();
     assert!(reopened.owed().is_empty());
     let replay = reopened.store().events_after(id.as_str(), 0).unwrap();
     let video = replay.iter().filter_map(landed).find(|i| i.name == "video");

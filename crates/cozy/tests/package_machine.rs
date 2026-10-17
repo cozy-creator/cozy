@@ -62,7 +62,6 @@ fn held(home: &Home, dir: &Path, package: &str) -> Vec<String> {
 fn packages_install_update_and_remove_on_a_machine() {
     let Some(home) = Home::with_hub() else { return };
     let account = home.sign_in("installer@cozy.test");
-    let _calcifer = home.want_calcifer();
     let _machine = tensord::added(&home, "t1");
     let package = package::publish(&home, "tiny", "0.1.0");
     assert_eq!(package, format!("{account}/tiny"));

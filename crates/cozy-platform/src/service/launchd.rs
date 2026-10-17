@@ -27,6 +27,11 @@ pub(super) fn install(dir: &Path, spec: &ServiceSpec) -> Result<()> {
     durable::replace(&plist(dir, &spec.name), render(spec).as_bytes(), 0o644)
 }
 
+/// Whether the agent kept here is `spec`'s, as `install` wrote it.
+pub(super) fn current(dir: &Path, spec: &ServiceSpec) -> bool {
+    fs::read(plist(dir, &spec.name)).is_ok_and(|kept| kept == render(spec).as_bytes())
+}
+
 pub(super) fn start(dir: &Path, spec: &ServiceSpec) -> Result<()> {
     // Already bootstrapped is the one expected refusal; kickstart then says whether it runs.
     let _ = launchctl(&["bootstrap", &domain()])

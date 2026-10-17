@@ -18,7 +18,6 @@ fn end(out: &common::Out) -> Value {
 #[test]
 fn download_makes_a_provider_source_on_the_machine() {
     let Some(home) = Home::new() else { return };
-    let _calcifer = home.want_calcifer();
     let _machine = common::tensord::added(&home, "m1");
 
     let out = home.cozy(["--json", "model", "download", TINY, "local/tiny", "--on", "m1"]);

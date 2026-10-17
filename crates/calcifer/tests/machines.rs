@@ -28,7 +28,9 @@ use prost::Message as _;
 const NO_HUB: &str = "http://127.0.0.1:9";
 
 fn calcifer(home: &Path) -> Arc<Calcifer> {
-    Calcifer::open(&home.join("calcifer"), &home.join("outputs")).unwrap()
+    let calcifer = Calcifer::open(&home.join("calcifer"), &home.join("outputs")).unwrap();
+    calcifer.resume().unwrap();
+    calcifer
 }
 
 fn machines(calcifer: &Arc<Calcifer>, home: &Path) -> Arc<Machines> {
@@ -505,8 +507,6 @@ async fn the_machine_routes_answer_over_loopback() {
         user_home: home.path().to_owned(),
         warnings: vec![],
     };
-    // Wanted, as the CLI wants the Calcifer it starts: it does not stop for owing nothing.
-    let _wanted = common::want(home.path());
     let served = tokio::spawn(async move { calcifer::serve::serve(&loaded).await });
     let lock = LockFile::new(Home::at(home.path()).calcifer_lock());
     let holder: Holder = eventually("Calcifer's record", async || {

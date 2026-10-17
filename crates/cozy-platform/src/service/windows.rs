@@ -50,6 +50,11 @@ pub(super) fn install(_: &Path, spec: &ServiceSpec) -> Result<()> {
     registry("set", status)
 }
 
+/// The `Run` value is set on every install: one registry write, which flushes nothing.
+pub(super) fn current(_: &Path, _: &ServiceSpec) -> bool {
+    false
+}
+
 pub(super) fn start(dir: &Path, spec: &ServiceSpec) -> Result<()> {
     if running(dir, &spec.name)?.is_some() {
         return Ok(());

@@ -329,7 +329,6 @@ impl Machines {
                     self.store()
                         .settle_ask(&ask.key, Err(&reason))
                         .map_err(internal)?;
-                    self.calcifer.owe_less();
                     if let Some(run) = &ask.run {
                         let reason = Reason {
                             code: "rental_refused".into(),
@@ -397,7 +396,6 @@ impl Machines {
                         .settle_ask(&ask.key, Ok(Some(&row)))
                         .map_err(internal)?;
                     self.calcifer.machine_changed();
-                    self.calcifer.owe_less();
                     if let Some(run) = &ask.run {
                         self.calcifer.place(run, &row.name).map_err(internal)?;
                     }
@@ -814,7 +812,6 @@ impl Machines {
                 warn!(ask = ask.key, "{e}");
             }
             self.calcifer.machine_changed();
-            self.calcifer.owe_less();
         };
         let mut released = false;
         loop {

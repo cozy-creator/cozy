@@ -654,6 +654,7 @@ dependencies = [
  "hub-client",
  "indicatif",
  "infer",
+ "jiff",
  "pep508_rs",
  "progenitor-client",
  "prost",

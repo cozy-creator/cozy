@@ -21,6 +21,22 @@ static TEMPS: AtomicU64 = AtomicU64::new(0);
 /// profile's ACL, renames with POSIX semantics (a reader holding the old file does not block it),
 /// and has no directory to sync: the rename is atomic in NTFS's journal.
 pub fn replace(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
+    renamed(path, bytes, mode, true)?;
+    sync_dir(
+        path.parent()
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .unwrap_or(Path::new(".")),
+    )
+}
+
+/// As `replace`, but nothing is made to survive a crash: for a record of a live process, which a
+/// crash makes stale anyway. It never waits on the disk's write-back.
+pub fn swap(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
+    renamed(path, bytes, mode, false)
+}
+
+/// Writes `bytes` beside `path` and renames them over it, flushed first when `durable`.
+fn renamed(path: &Path, bytes: &[u8], mode: u32, durable: bool) -> Result<()> {
     let dir = match path.parent() {
         Some(dir) if !dir.as_os_str().is_empty() => dir,
         _ => Path::new("."),
@@ -46,15 +62,14 @@ pub fn replace(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
     let written = file
         .write_all(bytes)
         .and_then(|()| set_file_mode(&file, mode).map_err(io::Error::from))
-        .and_then(|()| file.sync_all())
+        .and_then(|()| if durable { file.sync_all() } else { Ok(()) })
         .map_err(Error::io("write", &temp));
     drop(file);
     let renamed = written.and_then(|()| fs::rename(&temp, path).map_err(Error::io("rename", path)));
     if renamed.is_err() {
         let _ = fs::remove_file(&temp);
     }
-    renamed?;
-    sync_dir(dir)
+    renamed
 }
 
 /// Makes the entries of `dir` (a create, rename or unlink in it) survive a crash.

@@ -5,7 +5,7 @@
 //! Calcifer publishes its record or its refusal, and a long wait is reported as it goes.
 use std::{
     fs::OpenOptions,
-    io,
+    io::{self, Write as _},
     path::{Path, PathBuf},
     process::Stdio,
     sync::{Arc, Mutex},
@@ -19,9 +19,7 @@ use cozy_platform::{
     service::{ServiceSpec, Services},
 };
 use cozy_proto::{
-    calcifer::{
-        Down, Event, Holder, MachineList, REFUSED, Run, RunList, SubmitRun, Submitted, WANTED,
-    },
+    calcifer::{Down, Event, Holder, MachineList, REFUSED, Run, RunList, SubmitRun, Submitted},
     error::{Envelope, Error, Kind},
 };
 use reqwest::{RequestBuilder, Response, StatusCode, header};
@@ -267,13 +265,17 @@ impl Client {
                 source: e,
             }));
         }
-        // Held until Calcifer answers: a Calcifer owing nothing stops at once unless a client
-        // wants it.
-        let wanted = LockFile::new(home.calcifer().join(WANTED));
-        let _wanted = wanted.lock(LockKind::Shared).map_err(failed)?;
         let services = Services::new(home, &self.0.user_home);
+        let mut steps = Steps::new(home.calcifer_log());
         let managed = services.available();
-        let mut child = None;
+        if managed {
+            let wrote = services.ensure(&self.spec()).map_err(failed)?;
+            steps.done(match wrote {
+                true => "wrote Calcifer's service and reloaded its manager",
+                false => "found Calcifer's service current",
+            });
+        }
+        let (mut child, mut asked) = (None, false);
         let began = Instant::now();
         let mut reported = began;
         loop {
@@ -284,12 +286,16 @@ impl Client {
                     true => services.start(&self.spec()).map_err(failed)?,
                     false => child = Some(self.spawn().map_err(failed)?),
                 }
+                if !std::mem::replace(&mut asked, true) {
+                    steps.done("started Calcifer");
+                }
             }
             tokio::time::sleep(SAMPLE).await;
             if let Some(error) = refusal(&refused) {
                 return Err(error);
             }
             if let Some(holder) = self.live().await {
+                steps.done("Calcifer answered");
                 return Ok(holder);
             }
             if let Some(tree) = child.as_mut()
@@ -619,6 +625,32 @@ async fn envelope(answer: Response) -> Error {
                 ),
             )
         }
+    }
+}
+
+/// The steps of a start, each with its time, appended to Calcifer's log (`cozy logs calcifer`)
+/// beside Calcifer's own: a slow start names its slow step.
+struct Steps {
+    log: PathBuf,
+    since: Instant,
+}
+
+impl Steps {
+    fn new(log: PathBuf) -> Self {
+        Self {
+            log,
+            since: Instant::now(),
+        }
+    }
+
+    fn done(&mut self, step: &str) {
+        let ms = self.since.elapsed().as_millis();
+        let line = format!("{}  INFO cozy: {step} in {ms} ms\n", jiff::Timestamp::now());
+        let log = OpenOptions::new().create(true).append(true).open(&self.log);
+        if let Ok(mut log) = log {
+            let _ = log.write_all(line.as_bytes());
+        }
+        self.since = Instant::now();
     }
 }
 

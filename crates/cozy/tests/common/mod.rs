@@ -166,17 +166,6 @@ impl Home {
     }
 }
 
-impl Home {
-    /// Holds Calcifer up as a client that wants it would, until dropped.
-    pub fn want_calcifer(&self) -> cozy_platform::lock::Held {
-        let dir = self.root().join("calcifer");
-        std::fs::create_dir_all(&dir).unwrap();
-        cozy_platform::lock::LockFile::new(dir.join("wanted.lock"))
-            .lock(cozy_platform::lock::Kind::Shared)
-            .unwrap()
-    }
-}
-
 impl Drop for Home {
     /// No Calcifer outlives its test.
     fn drop(&mut self) {
