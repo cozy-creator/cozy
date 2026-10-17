@@ -540,6 +540,9 @@ pub struct Environment {
     /// What it holds now: `installed`, `downloaded`, `imported`, `host` or `gpu`.
     #[serde(default)]
     pub level: String,
+    /// Why it does not run the machine's own Runtime; empty when it does.
+    #[serde(default)]
+    pub warning: String,
 }
 
 /// One member of this controller's warm set on the machine.
@@ -613,6 +616,18 @@ pub struct Quote {
 pub struct Ended {
     pub machine: Machine,
     pub changed: bool,
+}
+
+/// `GET /v1/runs/{id}/play?output=<name[/i]>&expires_s=N`: how a browser plays one run output
+/// straight from its machine over WebRTC.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Play {
+    /// `host:port` the browser dials.
+    pub address: String,
+    /// SHA-256 hex of the certificate the machine's DTLS presents.
+    pub fingerprint: String,
+    /// A Cozy-Cap for that run output alone.
+    pub token: String,
 }
 
 /// `POST /v1/machines/{name}/keepalive`, once the machine acknowledged it.
