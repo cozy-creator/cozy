@@ -32,6 +32,13 @@ pub async fn run(
     function: Option<String>,
     args: RunArgs,
 ) -> Result<ExitCode, Error> {
+    if !path.exists() {
+        return Err(Error::new(
+            Kind::NotFound,
+            "target_not_found",
+            format!("{} does not exist", path.display()),
+        ));
+    }
     let hub = ctx.hub()?;
     let on = args.placement.on();
     // This computer's machine reads the files in place; any other is sent them.
