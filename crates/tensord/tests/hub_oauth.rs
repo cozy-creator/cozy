@@ -9,7 +9,7 @@ mod hub_oauth;
 use tensord::hub::{reason, Capability, Catalog, Leaf, Op, Source};
 use serde_json::json;
 use std::{sync::Arc, thread::sleep, time::Duration};
-use tensorfs_core::transport::{AccessToken, DpopCredential, DpopKey, Publication};
+use tensorfs_core::transport::{Ask, CredentialProvider, Publication};
 
 /// A key as the machine's identity holds it: a P-256 PKCS#8 PEM.
 fn leaf() -> Arc<Leaf> {
@@ -111,18 +111,21 @@ fn a_run_capability_trades_once_for_exactly_what_it_names() {
     assert_eq!(read.reason("catalog_read_failed", &refused).0, reason::EXCEEDED, "{refused:?}");
 
     // The token is bound to the leaf: presented with another key's proof, it reads nothing.
-    struct Fixed(String);
-    impl AccessToken for Fixed {
-        fn current(&self) -> Option<String> {
-            Some(self.0.clone())
+    struct Thief {
+        key: hub_client::P256Key,
+        token: String,
+        origin: String,
+    }
+    impl CredentialProvider for Thief {
+        fn headers(&self, ask: &Ask) -> Vec<(String, String)> {
+            let htu = ask.htu();
+            let path = &htu[htu.find("://").map_or(0, |at| at + 3)..];
+            let htu = format!("{}{}", self.origin, &path[path.find('/').unwrap_or(path.len())..]);
+            let proof = self.key.proof(ask.method, &htu, Some(&self.token), None);
+            vec![("authorization".into(), format!("DPoP {}", self.token)), ("dpop".into(), proof)]
         }
     }
-    let thief = DpopCredential::new(
-        Arc::new(DpopKey::generate().unwrap()),
-        Fixed(authkit.last_token()),
-        vec!["127.0.0.1".into()],
-    )
-    .proving_origin(&authkit.resource);
+    let thief = Thief { key: hub_client::P256Key::generate(), token: authkit.last_token(), origin: authkit.resource.clone() };
     let finalized = hub.lock().unwrap().finalized.len();
     let stolen = publish_with(&thief, &authkit.hub, tiny.policy(), &store, &manifest);
     assert!(stolen.is_err(), "a stolen token without the key is refused");

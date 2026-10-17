@@ -179,12 +179,15 @@ async fn answer(State(served): State<Arc<Served>>, method: Method, uri: Uri, hea
         (Method::GET, p) if first.is_some_and(|package| p == format!("/v1/packages/{}", package.name)) => {
             let mut releases: Vec<Value> = served.packages.iter().map(|p| json!({"release": p.release})).collect();
             releases.extend([json!({"release": "0.9.0"}), json!({"release": "9.0.0", "yanked": true})]);
-            json(json!({"package": first.unwrap().name, "releases": releases}))
+            let (org, name) = first.unwrap().name.split_once('/').unwrap();
+            json(json!({"package": {"org": org, "name": name, "created_at": "2026-01-01T00:00:00Z"}, "releases": releases}))
         }
         (Method::GET, _) if release.is_some() => {
             let package = release.unwrap();
-            json(json!({"release": {"release": package.release}, "package_interface": package.interface,
-                "python_version": "3.12"}))
+            let summary = json!({"release": package.release, "package_interface_digest": "sha256:00",
+                "package_interface_length": 0, "created_at": "2026-01-01T00:00:00Z"});
+            json(json!({"release": summary, "package_interface": package.interface, "requirements": [],
+                "requires_python": ">=3.12", "python_version": "3.12"}))
         }
         (Method::GET, _) if locked.is_some() => {
             let package = locked.unwrap();

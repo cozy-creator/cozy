@@ -155,7 +155,7 @@ impl<A: CredentialProvider, B: CredentialProvider> CredentialProvider for Both<A
 /// - empty                 → anonymous: published checkpoints only.
 ///
 /// A sender-constrained (DPoP) token has no spelling: its key never leaves the process
-/// that holds it, which builds a `DpopCredential` instead.
+/// that holds it, which presents it through its own provider (TensorD's, over hub-client).
 pub fn credential_from_spec(spec: &str, hosts: Vec<String>) -> Result<ScopedHeaders> {
     let spec = spec.trim();
     if spec.is_empty() {

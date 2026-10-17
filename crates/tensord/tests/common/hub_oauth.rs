@@ -96,16 +96,20 @@ impl AuthKit {
         }
     }
 
+    /// One form to the harness's control door, from any thread (a test's runtime included).
     fn post(&self, path: &str, form: &[(&str, &str)]) -> (u16, Vec<u8>) {
-        transport::form_post(
-            &format!("{}{path}", self.control),
-            form,
-            &local(),
-            &Anonymous,
-            1 << 20,
-            Deadline::after_seconds(Some(60.0)),
-        )
-        .unwrap()
+        let url = format!("{}{path}", self.control);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+                runtime.block_on(async {
+                    let answer = reqwest::Client::new().post(&url).form(form).send().await.unwrap();
+                    (answer.status().as_u16(), answer.bytes().await.unwrap().to_vec())
+                })
+            })
+            .join()
+            .unwrap()
+        })
     }
 
     /// A capability the owner's device key signs for the machine key `jkt`: `ops` are its

@@ -1524,6 +1524,7 @@ dependencies = [
  "aws-lc-rs",
  "base64 0.22.1",
  "ed25519-dalek",
+ "http",
  "hub-client",
  "openapiv3",
  "prettyplease",
@@ -4105,6 +4106,7 @@ dependencies = [
  "fs2",
  "hmac",
  "http-body-util",
+ "hub-client",
  "hyper",
  "hyper-util",
  "image-webp",
@@ -4113,6 +4115,7 @@ dependencies = [
  "png",
  "prost",
  "rcgen",
+ "reqwest",
  "rusqlite",
  "rustls",
  "rustls-pemfile",
@@ -4142,7 +4145,6 @@ dependencies = [
 name = "tensorfs-core"
 version = "0.10.0"
 dependencies = [
- "aws-lc-rs",
  "base64 0.22.1",
  "bytes",
  "fuser",

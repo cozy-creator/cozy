@@ -108,6 +108,11 @@ impl RunToken {
         })
     }
 
+    /// The Hub's public origin the capability names: the token's audience.
+    pub fn resource(&self) -> &str {
+        &self.resource
+    }
+
     /// Whether the capability names `op`.
     pub fn names(&self, op: Op) -> bool {
         self.operations.iter().any(|named| match op {
@@ -127,9 +132,9 @@ impl RunToken {
         self.state.lock().unwrap().ended.clone()
     }
 
-    /// The token, traded on first need; None once the capability ended or while a failed trade
-    /// rests.
-    pub(crate) async fn token(&self, http: &reqwest::Client) -> Result<String, Error> {
+    /// The token, traded over `http` on first need; an error once the capability ended or while
+    /// a trade nobody answered rests.
+    pub async fn token(&self, http: &reqwest::Client) -> Result<String, Error> {
         {
             let mut state = self.state.lock().unwrap();
             if now() >= self.expires {
@@ -256,49 +261,52 @@ impl RunToken {
         Err(unanswered("the DPoP nonce changed twice".into()))
     }
 
-    /// The `Authorization` and `DPoP` headers for one request to the Hub.
-    pub(crate) fn present(
+    /// The `Authorization` and `DPoP` headers for one request to the Hub: `path` is the
+    /// request's path, which the proof names under the Hub's public origin.
+    pub fn present(
         &self,
         token: &str,
         method: &str,
-        url: &reqwest::Url,
+        host: &str,
+        path: &str,
     ) -> [(&'static str, String); 2] {
-        let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
-        let nonce = self.state.lock().unwrap().nonces.get(&host).cloned();
+        let nonce = self
+            .state
+            .lock()
+            .unwrap()
+            .nonces
+            .get(&host.to_ascii_lowercase())
+            .cloned();
         let proof = self.leaf.proof(
             method,
-            &format!("{}{}", self.resource, url.path()),
+            &format!("{}{}", self.resource, path),
             Some(token),
             nonce.as_deref(),
         );
         [("authorization", format!("DPoP {token}")), ("dpop", proof)]
     }
 
-    /// What the Hub answered a token-bearing request: keeps its nonce; true when the request
-    /// should go again with a fresh proof.
-    pub(crate) fn answered(
+    /// What `host` answered a request that presented `token`: its DPoP nonce (`nonce`), and
+    /// whether `www-authenticate` asked for one (`challenged`). Keeps the nonce; a refused
+    /// token ends the capability. True when the request should go again with a fresh proof.
+    pub fn observe(
         &self,
-        url: &reqwest::Url,
+        host: &str,
         token: &str,
-        response: &reqwest::Response,
+        status: u16,
+        nonce: Option<&str>,
+        challenged: bool,
     ) -> bool {
-        let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
-        let fresh = response
-            .headers()
-            .get("dpop-nonce")
-            .and_then(|v| v.to_str().ok())
-            .map(str::trim)
-            .filter(|n| !n.is_empty());
-        let challenged = response
-            .headers()
-            .get("www-authenticate")
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| v.contains("use_dpop_nonce"));
+        let fresh = nonce.map(str::trim).filter(|n| !n.is_empty());
         let mut state = self.state.lock().unwrap();
         let changed = fresh.is_some_and(|fresh| {
-            state.nonces.insert(host, fresh.to_string()).as_deref() != Some(fresh)
+            state
+                .nonces
+                .insert(host.to_ascii_lowercase(), fresh.to_string())
+                .as_deref()
+                != Some(fresh)
         });
-        match response.status().as_u16() {
+        match status {
             401 if challenged => changed,
             401 => {
                 if state.token.as_ref().is_some_and(|(held, _)| held == token) {
@@ -314,6 +322,24 @@ impl RunToken {
             400 => changed,
             _ => false,
         }
+    }
+
+    pub(crate) fn answered(
+        &self,
+        url: &reqwest::Url,
+        token: &str,
+        response: &reqwest::Response,
+    ) -> bool {
+        let header = |name: &str| response.headers().get(name).and_then(|v| v.to_str().ok());
+        let challenged = header("www-authenticate").is_some_and(|v| v.contains("use_dpop_nonce"));
+        let host = url.host_str().unwrap_or_default();
+        self.observe(
+            host,
+            token,
+            response.status().as_u16(),
+            header("dpop-nonce"),
+            challenged,
+        )
     }
 }
 

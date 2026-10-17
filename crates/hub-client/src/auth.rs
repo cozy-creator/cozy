@@ -71,7 +71,14 @@ impl Client {
             Credential::Run(run) => {
                 let token = run.token(self.client()).await?;
                 let method = request.method().as_str().to_string();
-                run.present(&token, &method, request.url()).into()
+                let url = request.url();
+                run.present(
+                    &token,
+                    &method,
+                    url.host_str().unwrap_or_default(),
+                    url.path(),
+                )
+                .into()
             }
             Credential::Bearer(token) => vec![("authorization", format!("Bearer {token}"))],
             Credential::Worker { id, token } => {
@@ -104,8 +111,19 @@ impl ClientHooks<Auth> for Client {
     }
 
     /// Sends the request; a refused Bearer logs in again and a new DPoP nonce re-proves, each
-    /// once. The first answer stands when the second credential cannot be had.
+    /// once. The first answer stands when the second credential cannot be had. A refusal
+    /// without the Hub's envelope (a proxy's page, an empty body) keeps its status.
     async fn exec(
+        &self,
+        request: reqwest::Request,
+        info: &OperationInfo,
+    ) -> reqwest::Result<reqwest::Response> {
+        enveloped(self.execute(request, info).await?).await
+    }
+}
+
+impl Client {
+    async fn execute(
         &self,
         request: reqwest::Request,
         _: &OperationInfo,
@@ -135,6 +153,46 @@ impl ClientHooks<Auth> for Client {
             }
         }
     }
+}
+
+/// An error answer as the Hub's typed envelope: its own when it carries one (or OAuth's
+/// `error`), else `http_<status>` with the start of whatever came back.
+async fn enveloped(response: reqwest::Response) -> reqwest::Result<reqwest::Response> {
+    let status = response.status();
+    if !status.is_client_error() && !status.is_server_error() {
+        return Ok(response);
+    }
+    let mut headers = response.headers().clone();
+    let body = response.bytes().await?;
+    let parsed = serde_json::from_slice::<serde_json::Value>(&body).ok();
+    let body = match parsed {
+        Some(value) if value["error"].is_object() || value["error"].is_string() => body,
+        _ => {
+            let said: String = String::from_utf8_lossy(&body)
+                .trim()
+                .chars()
+                .take(256)
+                .collect();
+            let message = if said.is_empty() {
+                status.to_string()
+            } else {
+                said
+            };
+            let code = format!("http_{}", status.as_u16());
+            headers.insert(
+                reqwest::header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            );
+            headers.remove(reqwest::header::CONTENT_LENGTH);
+            let envelope =
+                serde_json::json!({"error": {"code": code, "message": message, "remedy": ""}});
+            serde_json::to_vec(&envelope).expect("JSON").into()
+        }
+    };
+    let mut rebuilt = http::Response::new(body);
+    *rebuilt.status_mut() = status;
+    *rebuilt.headers_mut() = headers;
+    Ok(rebuilt.into())
 }
 
 /// The token a request carries, Bearer or DPoP.
