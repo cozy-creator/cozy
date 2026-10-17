@@ -6,7 +6,6 @@ mod common;
 
 use std::{path::Path, sync::Arc};
 
-use base64::Engine as _;
 use calcifer::{Calcifer, machines::Machines};
 use cozy_platform::paths::Home;
 use cozy_proto::{
@@ -189,11 +188,11 @@ async fn a_runs_capability_is_bound_to_its_machine_and_traded_at_its_hub() {
     .unwrap();
 
     // The machine: a real TensorD, whose leaf key the test reads to act as it at the Hub.
-    let machine = common::Tensord::start();
+    let tensord = common::Machine::start();
     let calcifer =
         Calcifer::open(&home.path().join("calcifer"), &home.path().join("outputs")).unwrap();
     let key = common::key_file(home.path());
-    calcifer.put_machine(&machine.row("m", &key)).unwrap();
+    calcifer.put_machine(&tensord.row("m", &key)).unwrap();
     let machines = Machines::start(calcifer.clone(), Home::at(home.path()), &Default::default());
     let submit = |key: &'static str, destination: String| {
         let spec = v1::RunSpec {
@@ -236,16 +235,7 @@ async fn a_runs_capability_is_bound_to_its_machine_and_traded_at_its_hub() {
     assert!(public_access.capability.is_empty() && public_access.token_endpoint.is_empty());
 
     // As the machine: trade it with the leaf's key, then publish where it names, and only there.
-    let identity: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(machine.root.path().join("config/identity/identity.json")).unwrap(),
-    )
-    .unwrap();
-    let pem = identity["private_key_pem"].as_str().unwrap();
-    let body: String = pem.lines().filter(|l| !l.starts_with("-----")).collect();
-    let der = base64::engine::general_purpose::STANDARD
-        .decode(body)
-        .unwrap();
-    let leaf = Arc::new(P256Key::from_pkcs8(&der).unwrap());
+    let leaf = Arc::new(P256Key::from_pkcs8(&tensord.leaf_key()).unwrap());
     let token = RunToken::new(&access.capability, &access.token_endpoint, leaf).unwrap();
     let machine = Client::connect(
         &origin,
@@ -270,6 +260,37 @@ async fn a_runs_capability_is_bound_to_its_machine_and_traded_at_its_hub() {
         matches!(elsewhere, Err(hub_client::Error::Hub { status: 403, .. })),
         "{elsewhere:?}"
     );
+    // Local code's org-relative references name this account: the machine got the run so.
+    let (staged, local) = common::local_spec(home.path());
+    let run = SubmitRun {
+        on: On::Machine("m".into()),
+        hub: origin.clone(),
+        kind: Kind::Warm,
+        target: "local/hello".into(),
+        spec: local.encode_to_vec(),
+        inputs: vec![staged],
+        out: None,
+        warnings: vec![],
+    };
+    let id = calcifer.submit("k-local", run).await.unwrap().run.id;
+    for _ in 0..1200 {
+        let row = calcifer.store().run(id.as_str()).unwrap().unwrap();
+        if row.accepted_at_ms.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let sent = |owner: &str| v1::RunSpec {
+        owner: owner.into(),
+        hub: Some(v1::HubAccess {
+            origin: access.origin.clone(),
+            ..Default::default()
+        }),
+        ..local.clone()
+    };
+    let link = calcifer::Link::new(&tensord.endpoint, common::key()).unwrap();
+    assert!(common::holds_as(&link, &id, sent(&account)).await);
+    assert!(!common::holds_as(&link, &id, sent("")).await);
     machines.close();
     calcifer.close();
 }

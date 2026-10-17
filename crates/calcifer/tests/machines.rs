@@ -610,3 +610,37 @@ async fn a_publishing_run_without_its_hub_sign_in_fails_unsent() {
     machines.close();
     calcifer.close();
 }
+
+/// Local code's org-relative references name the run Hub's account, which a computer signed out
+/// there does not have: the run reaches its machine with no owner.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_signed_out_local_run_reaches_its_machine_with_no_owner() {
+    let home = tempfile::tempdir().unwrap();
+    let key = common::key_file(home.path());
+    let machine = common::Machine::start();
+    let calcifer = calcifer(home.path());
+    calcifer.put_machine(&machine.row("m", &key)).unwrap();
+    let machines = machines(&calcifer, home.path());
+    let (staged, spec) = common::local_spec(home.path());
+    let mut run = submit("m", spec.encode_to_vec());
+    run.inputs = vec![staged];
+    let id = calcifer.submit("k", run).await.unwrap().run.id;
+    eventually("the run accepted", async || {
+        let row = calcifer.store().run(id.as_str()).unwrap().unwrap();
+        row.accepted_at_ms.map(drop)
+    })
+    .await;
+    let sent = |owner: &str| v1::RunSpec {
+        owner: owner.into(),
+        hub: Some(v1::HubAccess {
+            origin: "https://tensorhub.com".into(),
+            ..Default::default()
+        }),
+        ..spec.clone()
+    };
+    let link = calcifer::Link::new(&machine.endpoint, common::key()).unwrap();
+    assert!(common::holds_as(&link, &id, sent("")).await);
+    assert!(!common::holds_as(&link, &id, sent("someone")).await);
+    machines.close();
+    calcifer.close();
+}
