@@ -441,7 +441,10 @@ mod tests {
     use super::*;
     use crate::transport::SourcePolicy;
     use std::io::{Read, Write};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
 
     /// A loopback HTTP/1.1 origin answering every GET with six bytes on a kept-alive connection,
     /// counting the connections it accepts; with `close_first` it shuts its first one unanswered.
