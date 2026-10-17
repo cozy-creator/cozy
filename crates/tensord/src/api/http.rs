@@ -7,7 +7,7 @@ use super::{
     capability::{self, Grant},
     domain, v1, MachineIdentity,
 };
-use crate::logs;
+use cozy_platform::tail as logs;
 use axum::{
     body::{Body, Bytes},
     extract::{rejection::QueryRejection, DefaultBodyLimit, Path, Query, State},
@@ -529,7 +529,12 @@ async fn log<B: MachineBackend>(
         })
         .await?;
     let (sender, lines) = tokio::sync::mpsc::channel(16);
-    tokio::task::spawn_blocking(move || follow.run(sender));
+    tokio::task::spawn_blocking(move || {
+        let read = follow.run(|lines| sender.blocking_send(Ok(lines)).is_ok(), || !sender.is_closed());
+        if let Err(e) = read {
+            let _ = sender.blocking_send(Err(e));
+        }
+    });
     let lines = tokio_stream::wrappers::ReceiverStream::new(lines).map(move |lines| match lines {
         Ok(lines) => {
             let after = lines.after.to_string();

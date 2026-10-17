@@ -1,11 +1,6 @@
 //! `cozy up|down|status|logs`: Calcifer's lifecycle. Stopping Calcifer never stops work: machines
 //! run what they accepted, and the next Calcifer resumes what it owed.
-use std::{
-    io::{self, Read as _, Seek as _, SeekFrom},
-    path::Path,
-    process::ExitCode,
-    time::Duration,
-};
+use std::{path::Path, process::ExitCode};
 
 use clap::ValueEnum;
 use cozy_proto::{
@@ -15,10 +10,9 @@ use cozy_proto::{
 use jiff::{SignedDuration, Timestamp};
 use serde_json::json;
 
-use crate::{Context, calcifer_client::Client, output};
+use cozy_platform::tail::{Log, Start};
 
-/// How often a followed log is read again: a sampling period.
-const FOLLOW: Duration = Duration::from_millis(250);
+use crate::{Context, calcifer_client::Client, output};
 
 #[derive(clap::Args, Debug)]
 pub struct Up {}
@@ -240,9 +234,7 @@ pub(crate) async fn machine_log(
         any: false,
     };
     if !q.follow {
-        let text = calcifer
-            .text(&format!("{path}?lines={}", q.lines))
-            .await?;
+        let text = calcifer.text(&format!("{path}?lines={}", q.lines)).await?;
         shown.print(ctx, name, q.log, &text);
         if !shown.any {
             output::say(
@@ -300,59 +292,60 @@ fn print_log_line(ctx: &Context, machine: &str, log: LogName, line: &str) {
     }
 }
 
-/// Calcifer's log, read from its file: there whether or not Calcifer is.
+/// Calcifer's log, read from its file: there whether or not Calcifer is. Followed, each line as
+/// it is written, woken by a watch on its directory (`tail -F`, across a rotation to
+/// `calcifer.log.1`).
 async fn calcifer_log(ctx: &Context, follow: bool) -> Result<ExitCode, Error> {
     let path = ctx.home.calcifer_log();
-    let unreadable = |e: io::Error| {
+    if !path.exists() {
+        return Err(Error::new(
+            Kind::NotFound,
+            "log_not_found",
+            format!(
+                "no Calcifer has run here: {} does not exist",
+                path.display()
+            ),
+        )
+        .next("cozy up"));
+    }
+    let unreadable = |e: &dyn std::fmt::Display| {
         Error::new(
             Kind::Internal,
             "log_unreadable",
             format!("{}: {e}", path.display()),
         )
     };
-    let mut file = match std::fs::File::open(&path) {
-        Ok(file) => file,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            return Err(Error::new(
-                Kind::NotFound,
-                "log_not_found",
-                format!(
-                    "no Calcifer has run here: {} does not exist",
-                    path.display()
-                ),
-            )
-            .next("cozy up"));
-        }
-        Err(e) => return Err(unreadable(e)),
-    };
-    let mut pending = String::new();
+    let log = Log::rotated(ctx.home.calcifer(), "calcifer.log");
+    if !follow {
+        let text = log.read(Start::Last(0)).map_err(|e| unreadable(&e))?;
+        text.lines().for_each(|line| print_line(ctx, line));
+        return Ok(ExitCode::SUCCESS);
+    }
+    let follow = log
+        .follow(Start::Last(0))
+        .map_err(|e| match e.is_unsupported() {
+            true => Error::new(Kind::Unavailable, "log_follow_unsupported", e.to_string()),
+            false => unreadable(&e),
+        })?;
+    let (sender, mut batches) = tokio::sync::mpsc::channel(16);
+    let reading = tokio::task::spawn_blocking(move || {
+        follow.run(
+            |batch| sender.blocking_send(batch).is_ok(),
+            || !sender.is_closed(),
+        )
+    });
     loop {
-        let mut chunk = vec![];
-        file.read_to_end(&mut chunk).map_err(unreadable)?;
-        pending.push_str(&String::from_utf8_lossy(&chunk));
-        // Whole lines only: a line still being written waits for its end.
-        while let Some(end) = pending.find('\n') {
-            let line: String = pending.drain(..=end).collect();
-            print_line(ctx, line.trim_end_matches(['\n', '\r']));
-        }
-        if !follow {
-            if !pending.is_empty() {
-                print_line(ctx, &pending);
-            }
-            return Ok(ExitCode::SUCCESS);
-        }
         tokio::select! {
             _ = tokio::signal::ctrl_c() => return Ok(ExitCode::SUCCESS),
-            () = tokio::time::sleep(FOLLOW) => {}
-        }
-        // A rotation replaces the file under the same name: carry on from the new one's start.
-        let position = file.stream_position().map_err(unreadable)?;
-        let length = std::fs::metadata(&path)
-            .map(|m| m.len())
-            .unwrap_or(position);
-        if length < position {
-            file = std::fs::File::open(&path).map_err(unreadable)?;
-            file.seek(SeekFrom::Start(0)).map_err(unreadable)?;
+            batch = batches.recv() => match batch {
+                Some(batch) => batch.text.lines().for_each(|line| print_line(ctx, line)),
+                None => {
+                    return match reading.await {
+                        Ok(Err(e)) => Err(unreadable(&e)),
+                        _ => Ok(ExitCode::SUCCESS),
+                    };
+                }
+            },
         }
     }
 }
