@@ -21,10 +21,6 @@ use std::{
 /// Past this the memory log rotates to `memory.log.1`, so it holds at most twice this.
 const ROTATE_BYTES: u64 = 4 << 20;
 
-/// The directory `note` appends `memory.log` in: the store's `logs`, beside TensorFS's
-/// transport log, read by `cozy machine logs --memory` and `cozy rental logs --memory`.
-static LOG: Mutex<Option<PathBuf>> = Mutex::new(None);
-
 /// Budget-cell `wanted` at or below this asks for a process cap of `CAP - wanted` bytes
 /// (Runtime `budget_cell.CAP`, `process_cap/1`).
 const CELL_CAP: i64 = -2;
@@ -59,26 +55,33 @@ fn now_ms() -> u128 {
         .unwrap_or(0)
 }
 
-pub fn log_into(dir: PathBuf) {
-    *LOG.lock().unwrap() = Some(dir);
-}
+/// Where one machine's memory decisions go: `memory.log` in its store's `logs`, beside
+/// TensorFS's transport log, read by `cozy machine logs --memory`. Each GPU pool owns its own,
+/// so two machines in one process never write into each other's store. None logs to tracing.
+#[derive(Clone, Debug, Default)]
+pub struct MemoryLog(Option<Arc<PathBuf>>);
 
-/// One memory decision, a line of the machine's memory log; stderr before `log_into`.
-pub(crate) fn note(event: serde_json::Value) {
-    let dir = LOG.lock().unwrap();
-    let Some(dir) = dir.as_ref() else {
-        return tracing::info!("memory: {event}");
-    };
-    let path = dir.join("memory.log");
-    if fs::metadata(&path).is_ok_and(|meta| meta.len() > ROTATE_BYTES) {
-        let _ = fs::rename(&path, dir.join("memory.log.1"));
+impl MemoryLog {
+    pub fn at(dir: PathBuf) -> Self {
+        Self(Some(Arc::new(dir)))
     }
-    let line = format!("{:.3} {event}\n", now_ms() as f64 / 1e3);
-    let written = fs::create_dir_all(dir)
-        .and_then(|_| OpenOptions::new().create(true).append(true).open(&path))
-        .and_then(|mut file| file.write_all(line.as_bytes()));
-    if let Err(error) = written {
-        tracing::warn!("memory: {event} ({}: {error})", path.display());
+
+    /// One memory decision, a line of the machine's memory log.
+    pub(crate) fn note(&self, event: serde_json::Value) {
+        let Some(dir) = self.0.as_deref() else {
+            return tracing::info!("memory: {event}");
+        };
+        let path = dir.join("memory.log");
+        if fs::metadata(&path).is_ok_and(|meta| meta.len() > ROTATE_BYTES) {
+            let _ = fs::rename(&path, dir.join("memory.log.1"));
+        }
+        let line = format!("{:.3} {event}\n", now_ms() as f64 / 1e3);
+        let written = fs::create_dir_all(dir)
+            .and_then(|_| OpenOptions::new().create(true).append(true).open(&path))
+            .and_then(|mut file| file.write_all(line.as_bytes()));
+        if let Err(error) = written {
+            tracing::warn!("memory: {event} ({}: {error})", path.display());
+        }
     }
 }
 
@@ -88,11 +91,12 @@ pub struct GpuMemory {
     ledger: Arc<Mutex<Gpu>>,
     running: Arc<Mutex<Running>>,
     sampler: Option<nvml::Sampler>,
+    log: MemoryLog,
 }
 
 impl GpuMemory {
     /// `root` keeps what executors measured across runs (`memory-learned.json`).
-    pub fn start(device: &str, config: &MemoryConfig, root: &std::path::Path) -> Self {
+    pub fn start(device: &str, config: &MemoryConfig, root: &std::path::Path, notes: MemoryLog) -> Self {
         let mut gpu = Gpu::with_floor(config.floor_bytes);
         gpu.learned = learned::Learned::open(&root.join("memory-learned.json"));
         gpu.device = device.into();
@@ -109,7 +113,7 @@ impl GpuMemory {
         let sampler = match cozy_platform::gpu::Device::open(device) {
             Ok(opened) => {
                 ledger.lock().unwrap().device = opened.key().to_string();
-                let (watched, cells) = (ledger.clone(), running.clone());
+                let (watched, cells, notes) = (ledger.clone(), running.clone(), notes.clone());
                 let log = Mutex::new(log);
                 nvml::Sampler::start(opened, move |sample| {
                     let mut ledger = watched.lock().unwrap();
@@ -132,10 +136,10 @@ impl GpuMemory {
                     match ask_cap(cell, cap) {
                         Ok(_) => {
                             ledger.set_cap(&plan, cap);
-                            note(serde_json::json!({"event":"floor","plan":plan,"cap":cap,
+                            notes.note(serde_json::json!({"event":"floor","plan":plan,"cap":cap,
                                 "gpu":ledger.device,"free":sample.free,"floor":ledger.floor(sample)}));
                         }
-                        Err(error) => note(serde_json::json!({"event":"floor_cell_failed",
+                        Err(error) => notes.note(serde_json::json!({"event":"floor_cell_failed",
                             "plan":plan,"error":error.to_string()})),
                     }
                 })
@@ -151,6 +155,7 @@ impl GpuMemory {
             ledger,
             running,
             sampler,
+            log: notes,
         }
     }
 
@@ -192,7 +197,7 @@ impl GpuMemory {
                     (gpu.grant_want(plan), gpu.need(plan))
                 };
                 let decision = gpu.decide(plan, want, need, &sample, &mut round);
-                note(
+                self.log.note(
                     serde_json::json!({"event": if spawn {"admit"} else {"grant"}, "plan": plan,
                     "gpu": gpu.device, "free": sample.free, "external": gpu.external(&sample),
                     "room": gpu.room(plan, &sample), "want": want, "need": need,
@@ -239,7 +244,7 @@ impl GpuMemory {
             gpu.holdings = held;
             (gpu.fits_resident(plan, &sample), gpu.want(plan))
         });
-        note(serde_json::json!({"event": "degree2", "plan": plan, "fits": fits, "want": want}));
+        self.log.note(serde_json::json!({"event": "degree2", "plan": plan, "fits": fits, "want": want}));
         fits
     }
 
@@ -249,7 +254,7 @@ impl GpuMemory {
         self.with(|gpu| {
             if gpu.learned.holding(plan, policy::holding_name(id)) {
                 if let Err(error) = gpu.learned.save() {
-                    note(
+                    self.log.note(
                         serde_json::json!({"event": "learned_unsaved", "error": error.to_string()}),
                     );
                 }
@@ -282,7 +287,7 @@ impl GpuMemory {
                 let decision = need.map_or(Decision::Wait, |need| {
                     gpu.admit_member(plan, need, &sample, &mut round)
                 });
-                note(serde_json::json!({"event": "member", "plan": plan, "mapped": mapped,
+                self.log.note(serde_json::json!({"event": "member", "plan": plan, "mapped": mapped,
                     "free": sample.free, "room": gpu.room(plan, &sample), "need": need,
                     "decision": format!("{decision:?}")}));
                 decision
@@ -354,7 +359,7 @@ impl GpuMemory {
                     }
                 })
             });
-            note(
+            self.log.note(
                 serde_json::json!({"event":"room","plan":plan,"free_bytes":free_bytes,
                 "free":sample.free,"step":format!("{step:?}")}),
             );
@@ -409,7 +414,7 @@ impl GpuMemory {
                 gpu.learned.context(&device, context);
             }
             if let Err(error) = gpu.learned.save() {
-                note(serde_json::json!({"event": "learned_unsaved", "error": error.to_string()}));
+                self.log.note(serde_json::json!({"event": "learned_unsaved", "error": error.to_string()}));
             }
         });
     }
@@ -427,9 +432,9 @@ impl GpuMemory {
         self.with(|gpu| {
             gpu.learned.squeezed(plan, shape, rooms);
             let shape = serde_json::json!({"plan": plan, "shape": shape, "rooms": rooms});
-            note(serde_json::json!({"event": "squeezed", "learned": shape}));
+            self.log.note(serde_json::json!({"event": "squeezed", "learned": shape}));
             if let Err(error) = gpu.learned.save() {
-                note(serde_json::json!({"event": "learned_unsaved", "error": error.to_string()}));
+                self.log.note(serde_json::json!({"event": "learned_unsaved", "error": error.to_string()}));
             }
         });
     }
@@ -442,7 +447,7 @@ impl GpuMemory {
         self.with(|gpu| {
             gpu.learned.load(plan, weights, floor.unwrap_or(0));
             if let Err(error) = gpu.learned.save() {
-                note(serde_json::json!({"event": "learned_unsaved", "error": error.to_string()}));
+                self.log.note(serde_json::json!({"event": "learned_unsaved", "error": error.to_string()}));
             }
         });
     }
@@ -452,7 +457,7 @@ impl GpuMemory {
         self.with(|gpu| {
             gpu.learned.host(plan, bytes);
             if let Err(error) = gpu.learned.save() {
-                note(serde_json::json!({"event": "learned_unsaved", "error": error.to_string()}));
+                self.log.note(serde_json::json!({"event": "learned_unsaved", "error": error.to_string()}));
             }
         });
     }
@@ -487,6 +492,7 @@ mod tests {
             ledger: Arc::new(Mutex::new(gpu)),
             running: Arc::default(),
             sampler: None,
+            log: MemoryLog::default(),
         }
     }
 

@@ -587,6 +587,8 @@ pub struct Pool {
     incarnation: String,
     config: GpuConfig,
     store: Arc<Store>,
+    /// This machine's memory log, in its store's `logs`.
+    notes: crate::memory::MemoryLog,
     /// Each root's lane and each GPU's call (`gpu_allocation`).
     allocations: Arc<crate::gpu_allocation::Allocations>,
     /// Idle GPU executors by `session_key`: a call takes its own out for its run. One per
@@ -683,7 +685,7 @@ fn gpu_request_queued(engine: &Engine, root: Option<u64>) -> bool {
 impl Pool {
     pub fn new(root: &Path, config: GpuConfig, store: Arc<Store>) -> io::Result<Arc<Self>> {
         fs::create_dir_all(root)?;
-        crate::memory::log_into(store.root().join("logs"));
+        let notes = crate::memory::MemoryLog::at(store.root().join("logs"));
         if let Some(identity) = config.identity {
             identity.traverse(root)?;
             identity.traverse(
@@ -732,7 +734,7 @@ impl Pool {
             }
             devices.push(Device {
                 entry: entry.clone(),
-                memory: GpuMemory::start(entry, &memory, &learned),
+                memory: GpuMemory::start(entry, &memory, &learned, notes.clone()),
             });
         }
         let pool = Arc::new(Self {
@@ -743,6 +745,7 @@ impl Pool {
             incarnation,
             config,
             store,
+            notes,
             allocations: crate::gpu_allocation::Allocations::new(envelope.len()),
             sessions: Mutex::new(BTreeMap::new()),
             deviceless: Mutex::new(Vec::new()),
@@ -794,7 +797,7 @@ impl Pool {
                     if give && !gave {
                         feedback.exhausted();
                     }
-                    crate::memory::note(serde_json::json!({"event": "host_pressure",
+                    pool.notes.note(serde_json::json!({"event": "host_pressure",
                         "mode": format!("{mode:?}"), "stalled_us": sample.stalled_us(),
                         "limit_hits": sample.limit_hits(), "gave": gave,
                         "stopped_at": feedback.stopped_at()}));
@@ -1328,7 +1331,7 @@ impl Pool {
     pub fn resident(&self) -> Vec<HoldingFacts> {
         self.custody.as_ref().map_or_else(Vec::new, |c| {
             let mut custody = c.lock().unwrap();
-            log_released(custody.collect());
+            log_released(custody.collect(), &self.notes);
             custody.holdings()
         })
     }
@@ -1345,7 +1348,7 @@ impl Pool {
                 tracing::warn!("resident revoke left a lease charged: {error}");
             }
         }
-        log_released(custody.lock().unwrap().collect());
+        log_released(custody.lock().unwrap().collect(), &self.notes);
         Ok(())
     }
     pub fn source_facts(&self, selections: &[SelectedManifest]) -> io::Result<ModelSources> {
@@ -1781,7 +1784,7 @@ impl Pool {
             None if hosts.is_empty() => claims.iter_mut().for_each(|claim| { claim.get_or_insert(root); }),
             None => hosts.iter().for_each(|device| { claims[*device].get_or_insert(root); }),
             Some((device, _)) if !hosts.contains(device) => {
-                crate::memory::note(serde_json::json!({"event": "place", "plan": plan.construction,
+                self.notes.note(serde_json::json!({"event": "place", "plan": plan.construction,
                     "gpu": self.devices[*device].entry, "running_on": hosts.iter()
                         .map(|d| &self.devices[*d].entry).collect::<Vec<_>>()}));
             }
@@ -2634,7 +2637,7 @@ impl Pool {
             })
         };
         if let Some(custody) = &self.custody {
-            log_released(custody.lock().unwrap().collect());
+            log_released(custody.lock().unwrap().collect(), &self.notes);
         }
         let (key, degree) = (session_key(&plan.construction, start), plan.degree);
         let retained = match degree {
@@ -3182,7 +3185,7 @@ impl Pool {
             .and_then(|gpu| gpu.with(|gpu| gpu.shape(&construction)))
             .and_then(|learned| learned.estimated_from)
         {
-            crate::memory::note(serde_json::json!({"event": "estimate", "plan": construction,
+            self.notes.note(serde_json::json!({"event": "estimate", "plan": construction,
                 "run": id, "shape": shape, "from": from, "ratio": ratio}));
         }
         let spool = if let Some(identity) = self.config.identity {
@@ -3209,7 +3212,7 @@ impl Pool {
         let share = self.degree2(&construction, start, degree, &session.executor)?;
         if session.sharing && !share {
             if let Some(custody) = &self.custody {
-                detach(custody, &mut session.executor)?;
+                detach(custody, &mut session.executor, &self.notes)?;
             }
         }
         session.sharing = share;
@@ -3443,7 +3446,7 @@ impl Pool {
             let own = start..start + degree as usize;
             let ended = released == 0
                 && (self.end_idle_parent(spare) > 0 || self.end_lru_idle(plan, spare, own));
-            crate::memory::note(serde_json::json!({"event": "host_room", "plan": plan,
+            self.notes.note(serde_json::json!({"event": "host_room", "plan": plan,
                 "need": need, "available": available, "released": released, "ended": ended}));
             if released == 0 && !ended {
                 if !spare {
@@ -3523,10 +3526,10 @@ impl Pool {
                 Ok(reply) if reply.ok => {
                     let facts = plane_facts(reply.plane.as_ref());
                     self.observe(other, session.start, session.degree, facts, &reply.rank_planes, None);
-                    crate::memory::note(serde_json::json!({"event": "shed", "plan": other,
+                    self.notes.note(serde_json::json!({"event": "shed", "plan": other,
                         "pinned_budget": share, "for": plan}));
                 }
-                other_reply => crate::memory::note(serde_json::json!({"event": "shed_failed",
+                other_reply => self.notes.note(serde_json::json!({"event": "shed_failed",
                     "plan": other, "detail": format!("{:?}", other_reply.map(|r| r.code))})),
             }
         }
@@ -3713,7 +3716,7 @@ fn load_facts(facts: Option<&device_executor::LoadFacts>) -> Facts {
 /// Ask the executor to release every revoked generation it reads (it is idle here).
 /// `executor` lets go of every holding it maps (queued work first): its weights become its
 /// own again. Holdings others still read stay; the rest are unread, for the ladder to reclaim.
-fn detach(custody: &Mutex<ResidentCustody>, executor: &mut DeviceExecutor) -> io::Result<()> {
+fn detach(custody: &Mutex<ResidentCustody>, executor: &mut DeviceExecutor, notes: &crate::memory::MemoryLog) -> io::Result<()> {
     let read = custody.lock().unwrap().read_by(&executor.birth);
     for (key, generation) in read {
         let reply = executor.command(
@@ -3730,7 +3733,7 @@ fn detach(custody: &Mutex<ResidentCustody>, executor: &mut DeviceExecutor) -> io
                 .unwrap()
                 .released(&key, generation, &executor.birth);
         }
-        crate::memory::note(serde_json::json!({"event": "detach", "layout": key.layout,
+        notes.note(serde_json::json!({"event": "detach", "layout": key.layout,
             "ok": reply.ok}));
     }
     Ok(())
@@ -3779,9 +3782,9 @@ fn release_revoked(
     Ok(())
 }
 
-fn log_released(released: Vec<(HoldingKey, u64)>) {
+fn log_released(released: Vec<(HoldingKey, u64)>, notes: &crate::memory::MemoryLog) {
     for (key, bytes) in released {
-        crate::memory::note(serde_json::json!({"event": "released", "layout": key.layout,
+        notes.note(serde_json::json!({"event": "released", "layout": key.layout,
             "device": key.device, "bytes": bytes}));
     }
 }
