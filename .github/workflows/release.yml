@@ -46,9 +46,14 @@ on:
         required: true
         default: dry-run
         type: string
-      # HAND-EDITED (dist-workspace.toml allow-dirty): this input and the plan job's first step.
+      # HAND-EDITED (dist-workspace.toml allow-dirty): these two inputs and the plan job's first step.
       must_contain:
         description: Comma-separated commits the release must contain
+        required: false
+        default: ''
+        type: string
+      tensorfs_run:
+        description: A tensorfs-release run whose unpublished wheel stands in for PyPI's (dry runs and prereleases)
         required: false
         default: ''
         type: string
@@ -204,6 +209,9 @@ jobs:
     with:
       plan: ${{ needs.plan.outputs.val }}
     secrets: inherit
+    permissions:
+      "actions": "read"
+      "contents": "read"
 
   # Build and package all the platform-agnostic(ish) things
   build-global-artifacts:
