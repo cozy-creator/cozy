@@ -79,8 +79,10 @@ fn run(lifetime: Lifetime, service: bool) -> io::Result<()> {
         supervise::inherited()
     } else {
         identity::hold(&grant.layout)?;
-        if let Some(key) = grant.developer_key.as_deref().filter(|_| nix::unistd::geteuid().is_root()) {
-            ssh::start(key)?;
+        if let Some(key) = grant.developer_key.as_deref() {
+            if let Err(error) = ssh::start(key) {
+                tracing::warn!("{error}");
+            }
         }
         let paths = update::Paths::new(&grant.layout.engine(), &grant.layout.root);
         supervise::supervise(&paths, lifetime, grant.receipt_key.as_deref(), grant.provider.as_ref())?
