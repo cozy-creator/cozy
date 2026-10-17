@@ -28,12 +28,13 @@ github-attestations = true
 tap = "cozy-creator/homebrew-tap"
 # Homebrew's formula is built with every release and pushed nowhere until the owner opens the tap.
 publish-jobs = []
-# A release needs a green platforms.yaml run on its commit, and its own artifacts must pass the smoke.
+# A release needs a green platforms.yaml run on its commit, and its own artifacts must pass the smoke and
+# the owner-day suite (owner-day.yml, the product tests on the release's linux x86_64 binary).
 # Both gate `host` by their result (a failed plan-job would skip the builds, which `host` accepts).
 local-artifacts-jobs = ["./release-gate"]
 # release-gate reads an unpublished tensorfs wheel from a tensorfs-release run (dry runs and prereleases).
 github-custom-job-permissions = { "release-gate" = { contents = "read", actions = "read" } }
-global-artifacts-jobs = ["./release-smoke"]
+global-artifacts-jobs = ["./release-smoke", "./owner-day"]
 unix-archive = ".tar.gz"
 
 [dist.github-custom-runners]
