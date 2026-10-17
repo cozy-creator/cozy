@@ -288,6 +288,10 @@ pub struct Execution {
     pub attempt: u32,
     #[serde(default)]
     pub waiting_reason: Option<String>,
+    /// Why a queued run waits, for people (another run's install, an executor slot): an
+    /// observation the engine overlays, never journaled.
+    #[serde(skip)]
+    pub waiting: Option<String>,
     pub process: Option<Birth>,
     pub cancel_actor: Option<String>,
     /// Explicit cancellation reserved this actor/ID before any Run spec was accepted.
@@ -347,9 +351,9 @@ impl Execution {
         }
     }
     /// Its progress is observed: an attempt running, or a run preparing inside itself.
+    /// A running or queued run carries volatile observations (progress, what it waits for).
     pub fn observed(&self) -> bool {
-        self.state == State::Running
-            || (self.state == State::Queued && self.waiting_reason.as_deref() == Some(PREPARING))
+        matches!(self.state, State::Running | State::Queued)
     }
 }
 
@@ -374,6 +378,8 @@ pub struct DerivedOutputBinding {
 pub struct ProgressSnapshot {
     pub completed_units: u64,
     pub detail: String,
+    /// What the run waits for, while it waits (`Execution::waiting`).
+    pub waiting: Option<String>,
     pub revision: u64,
 }
 
@@ -383,7 +389,10 @@ impl ProgressSnapshot {
             return false;
         }
         record.completed_units = self.completed_units;
-        record.progress = Some(self.detail.clone());
+        if !self.detail.is_empty() {
+            record.progress = Some(self.detail.clone());
+        }
+        record.waiting = self.waiting.clone();
         record.revision = record.revision.max(self.revision);
         true
     }
@@ -1673,6 +1682,7 @@ fn insert(
         revision_ceiling: 1,
         attempt: 0,
         waiting_reason: waiting.map(String::from),
+        waiting: None,
         process: None,
         cancel_actor: None,
         canceled_before_acceptance: false,
@@ -2409,7 +2419,7 @@ impl Journal {
         self.update_observed(id, progress, |record| {
             if !record.observed() {
                 return Err(db_error(
-                    "only running or preparing executions reserve observation cursors",
+                    "only running or queued executions reserve observation cursors",
                 ));
             }
             Ok(true)

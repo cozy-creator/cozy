@@ -189,11 +189,11 @@ fn same_filename_activation_installs_new_runtime_and_retains_old_generation() {
     };
     let old_sdk = selected();
     let old_sources = local(&old_sdk);
-    let old = old_sources.install(&service, "alice", manifest, None, &|_| ()).unwrap();
+    let old = old_sources.install(&service, "alice", manifest, None, "", &|_| ()).unwrap();
     let old_provenance = provenance(&old.generation);
     assert_eq!(
         old_sources
-            .install(&service, "alice", manifest, None, &|_| ())
+            .install(&service, "alice", manifest, None, "", &|_| ())
             .unwrap()
             .generation,
         old.generation
@@ -203,7 +203,7 @@ fn same_filename_activation_installs_new_runtime_and_retains_old_generation() {
     fs::rename(next, &link).unwrap();
     let new_sdk = selected();
     let new_sources = local(&new_sdk);
-    let new = new_sources.install(&service, "alice", manifest, None, &|_| ()).unwrap();
+    let new = new_sources.install(&service, "alice", manifest, None, "", &|_| ()).unwrap();
     assert_ne!(
         old.alias, new.alias,
         "new SDK activation reopened the old local alias"
@@ -227,7 +227,7 @@ fn same_filename_activation_installs_new_runtime_and_retains_old_generation() {
     );
     assert_eq!(
         new_sources
-            .install(&service, "alice", manifest, None, &|_| ())
+            .install(&service, "alice", manifest, None, "", &|_| ())
             .unwrap()
             .generation,
         new.generation
