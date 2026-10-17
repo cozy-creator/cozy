@@ -19,13 +19,11 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use crate::platform::durable::Mode;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-
-use fs2::FileExt;
 
 use crate::disk::{self, DiskClass};
 use crate::err::{Refusal, Result};
@@ -44,7 +42,7 @@ const SYNC_THREADS: usize = 16;
 /// with a marker's time only after this much is subtracted from the marker's.
 const SLACK_NANOS: i64 = 60_000_000_000;
 
-fn io(what: impl AsRef<str>, error: std::io::Error) -> Refusal {
+fn io(what: impl AsRef<str>, error: impl Into<std::io::Error>) -> Refusal {
     crate::store::classify_io(what, error)
 }
 
@@ -101,7 +99,7 @@ impl Marker {
             .mode(0o644)
             .open(&path)
             .map_err(|error| io("create an unsynced-admission marker", error))?;
-        file.try_lock_exclusive()
+        file.try_lock()
             .map_err(|error| io("lock an unsynced-admission marker", error))?;
         file.write_all(format!("since {since}\n").as_bytes())
             .and_then(|()| file.sync_all())
@@ -138,26 +136,28 @@ fn found(root: &Path) -> Result<Vec<Found>> {
             continue;
         };
         let boot = stem.split('.').next().unwrap_or("").to_string();
-        let mut text = String::new();
-        let since = File::open(&path)
-            .and_then(|file| file.take(64).read_to_string(&mut text))
-            .ok()
-            .and_then(|_| text.strip_prefix("since "))
-            .and_then(|rest| rest.strip_suffix('\n'))
-            .and_then(|digits| digits.parse::<i64>().ok());
-        out.push(Found { path, boot, since });
+        out.push(Found { path, boot, since: None });
     }
     Ok(out)
 }
 
 /// Markers whose writer is gone, locked so none can be claimed twice. The lock also
-/// proves the writer is gone: a live pull holds its marker's lock.
+/// proves the writer is gone: a live pull holds its marker's lock. Each is read through its
+/// claim (a Windows lock bars other handles from a locked file's bytes).
 fn dead(markers: Vec<Found>) -> Vec<(Found, File)> {
     markers
         .into_iter()
-        .filter_map(|marker| {
-            let file = File::open(&marker.path).ok()?;
-            file.try_lock_exclusive().ok()?;
+        .filter_map(|mut marker| {
+            let mut file = File::open(&marker.path).ok()?;
+            file.try_lock().ok()?;
+            let mut text = String::new();
+            marker.since = (&mut file)
+                .take(64)
+                .read_to_string(&mut text)
+                .ok()
+                .and_then(|_| text.strip_prefix("since "))
+                .and_then(|rest| rest.strip_suffix('\n'))
+                .and_then(|digits| digits.parse::<i64>().ok());
             Some((marker, file))
         })
         .collect()
@@ -171,7 +171,7 @@ fn sync_files(paths: &[PathBuf]) -> Result<()> {
         for _ in 0..SYNC_THREADS.min(paths.len()) {
             scope.spawn(|| {
                 while let Some(path) = paths.get(next.fetch_add(1, Ordering::Relaxed)) {
-                    match File::open(path).and_then(|file| file.sync_data()) {
+                    match crate::platform::durable::sync_file(path).map_err(std::io::Error::from) {
                         Ok(()) => {}
                         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                         Err(error) => {
@@ -375,9 +375,7 @@ pub(crate) fn recover(store: &Store) -> Result<Option<Recovery>> {
         return Ok(None);
     }
     let _writer = crate::catalog::WriterGuard::acquire(store.root())?;
-    let dir = File::open(store.root().join(DIR))
-        .map_err(|error| io("open the unsynced-admission markers", error))?;
-    dir.lock_exclusive()
+    let _dir = crate::platform::lock::dir(&store.root().join(DIR))
         .map_err(|error| io("lock the unsynced-admission markers", error))?;
     // Another process may have recovered while this one waited for the lock.
     let claimed = dead(found(store.root())?.into_iter().filter(earlier).collect());
@@ -467,9 +465,10 @@ fn suspects(root: &Path, cutoff: i64) -> Result<Vec<(String, PathBuf, bool)>> {
                         Err(error) => return Err(io("stat an object", error)),
                     };
                     let mtime = metadata
-                        .mtime()
-                        .saturating_mul(1_000_000_000)
-                        .saturating_add(metadata.mtime_nsec());
+                        .modified()
+                        .ok()
+                        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                        .map_or(0, |since| i64::try_from(since.as_nanos()).unwrap_or(i64::MAX));
                     if metadata.is_file() && mtime >= cutoff {
                         out.push((hex, path, !suffix.is_empty()));
                     }
@@ -482,7 +481,7 @@ fn suspects(root: &Path, cutoff: i64) -> Result<Vec<(String, PathBuf, bool)>> {
 
 #[cfg(test)]
 pub(crate) mod testing {
-    use std::os::unix::fs::{FileExt, PermissionsExt};
+    use crate::platform::durable;
     use std::path::{Path, PathBuf};
 
     /// A fresh root beside the test binary: the build directory, a persistent disk.
@@ -505,13 +504,12 @@ pub(crate) mod testing {
     pub(crate) fn tear(path: &Path) {
         let metadata = std::fs::metadata(path).unwrap();
         let modified = metadata.modified().unwrap();
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        durable::set_mode(path, 0o644).unwrap();
         let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
-        file.write_all_at(&vec![0u8; metadata.len() as usize], 0)
-            .unwrap();
+        durable::FileAt::write_all_at(&file, &vec![0u8; metadata.len() as usize], 0).unwrap();
         file.set_modified(modified).unwrap();
         drop(file);
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        durable::set_mode(path, 0o444).unwrap();
     }
 
     pub(crate) fn markers(root: &Path) -> Vec<PathBuf> {

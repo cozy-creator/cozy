@@ -6,7 +6,7 @@
 use super::credential::{credential_from_spec, Anonymous, ScopedHeaders};
 use super::download::{fetch_ranged, Ranged};
 use super::ledger::{Deadline, Ledger};
-use super::policy::{self, blocked, CheckedUrl, SourcePolicy};
+use super::policy::{self, blocked, SourcePolicy};
 use super::pull::{absolute_location, Fetched};
 use super::push::{push_object, UploadGrant};
 use crate::canon::Value;
@@ -921,7 +921,7 @@ fn a_warm_fetch_opens_no_catalog() {
         0,
         "trust checks must not open the catalog per object"
     );
-    std::fs::remove_dir_all(root).unwrap();
+    let _ = std::fs::remove_dir_all(root);
 }
 
 /// A pull leaves a Store that can ANSWER for what it holds, and whose contents are not
@@ -1020,9 +1020,7 @@ fn corrupt_object_heals_into_wanted_and_refetches() {
     // Rot one blob on disk, same length.
     let victim = &checkpoint.objects[0];
     let path = store.blob_path(&victim.sha256);
-    let mut permissions = std::fs::metadata(&path).unwrap().permissions();
-    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o644);
-    std::fs::set_permissions(&path, permissions).unwrap();
+    crate::platform::durable::set_mode(&path, 0o644).unwrap();
     std::fs::write(&path, vec![b'x'; victim.length as usize]).unwrap();
 
     let healed = pull(&request_for(&store, &origin.base, &policy)).unwrap();
@@ -1145,10 +1143,12 @@ fn fragmented_headers_can_progress_across_multiple_stream_windows() {
     let port = listener.local_addr().unwrap().port();
     std::thread::spawn(move || {
         let (mut socket, _) = listener.accept().unwrap();
+        // Each line its own segment: Nagle would hold them behind a delayed ACK (macOS).
+        socket.set_nodelay(true).unwrap();
         read_request(&mut socket).unwrap();
         socket.write_all(b"HTTP/1.1 200 OK\r\n").unwrap();
         for _ in 0..10 {
-            std::thread::sleep(Duration::from_millis(50));
+            std::thread::sleep(Duration::from_millis(200));
             socket.write_all(b"X-Progress: yes\r\n").unwrap();
         }
         socket.write_all(b"Content-Length: 3\r\n\r\nabc").unwrap();
@@ -1156,7 +1156,8 @@ fn fragmented_headers_can_progress_across_multiple_stream_windows() {
     let checked = local_policy()
         .check(&format!("http://127.0.0.1:{port}/object"))
         .unwrap();
-    let ledger = Ledger::with_resolution(Duration::from_millis(25));
+    // Lines 200 ms apart against a 600 ms floor: a loaded runner's late wakeups are not stalls.
+    let ledger = Ledger::with_resolution(Duration::from_millis(100));
     let started = std::time::Instant::now();
     let response = super::http::request(
         &super::http::Client::new(),
@@ -1179,6 +1180,9 @@ fn fragmented_headers_can_progress_across_multiple_stream_windows() {
 /// while IPv4 works; here a listener whose accept queue is full, so the kernel drops every
 /// SYN) is that address's verdict, not the URL's: the next checked address is asked a tick
 /// later, not after the silent one's whole patience.
+/// Only Linux drops the handshakes past a full accept queue in silence (macOS may still
+/// complete them, Windows resets them).
+#[cfg(target_os = "linux")]
 #[test]
 fn a_silent_first_address_gives_way_to_the_next() {
     let hole = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1197,7 +1201,7 @@ fn a_silent_first_address_gives_way_to_the_next() {
             .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc")
             .unwrap();
     });
-    let checked = CheckedUrl {
+    let checked = policy::CheckedUrl {
         https: false,
         host: "127.0.0.1".into(),
         port: live_addr.port(),
@@ -1493,6 +1497,8 @@ fn a_stopped_download_keeps_what_landed_and_the_next_asks_for_the_rest() {
     };
     let mut rushed = request_for(&store, &origin.base, &policy);
     rushed.streams = 1;
+    // A 120 ms first byte is pace, not a stall, even on a slow runner: the stop is the verdict.
+    rushed.sample_seconds = 0.1;
     rushed.cancellation = Some(stop.clone());
     rushed.on_progress = Some(&stopping);
     let refusal = pull(&rushed).unwrap_err();
@@ -1689,8 +1695,9 @@ fn retryable_status_buys_a_reask_and_authorization_answers_do_not() {
     });
     let policy = SourcePolicy::default();
     let mut request = request_for(&store, &origin.base, &policy);
-    // An unstated 503 waits the ledger's patience; sample in milliseconds.
-    request.sample_seconds = 0.02;
+    // An unstated 503 waits the ledger's patience; sample in tens of milliseconds, wide enough
+    // that a slow runner's answer is not also a stall to restart.
+    request.sample_seconds = 0.05;
     let report = pull(&request).unwrap();
     assert_eq!(report.fetched, 4);
     assert_eq!(origin.hits(&format!("/obj/{flaky}")), 2);
@@ -3860,6 +3867,8 @@ fn a_store_with_no_budget_admits_everything() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// `/dev/full` is Linux's.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_real_enospc_from_the_kernel_is_a_capacity_verdict_not_an_io_failure() {
     // The error here is not constructed and not simulated: `/dev/full` is a real device
@@ -3893,6 +3902,7 @@ fn a_real_enospc_from_the_kernel_is_a_capacity_verdict_not_an_io_failure() {
 
 /// The same kernel ENOSPC met by a module that wraps its own I/O errors (here, writing a
 /// checkpoint part out) is the same verdict: every I/O error goes through one classifier.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_full_disk_met_outside_the_store_is_still_a_capacity_verdict() {
     let root = temporary("full-outside-store");

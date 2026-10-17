@@ -125,7 +125,7 @@ fn graft_receipt_recovery_and_independent_custody_preserve_exact_segments() {
     for object in &objects {
         store.open_verified(&object.sha256).unwrap();
     }
-    std::fs::remove_dir_all(store.root()).unwrap();
+    let _ = std::fs::remove_dir_all(store.root());
 }
 
 #[test]
@@ -181,7 +181,7 @@ fn graft_refuses_semantic_substitution_and_undeclared_sources() {
         different.canonical_work_bytes().unwrap(),
         declaration.clone().canonical_work_bytes().unwrap()
     );
-    std::fs::remove_dir_all(store.root()).unwrap();
+    let _ = std::fs::remove_dir_all(store.root());
 }
 
 #[test]
@@ -198,7 +198,7 @@ fn source_projection_inherits_only_selected_tensors_without_new_bytes() {
     assert_eq!(receipt.inherited_payload_bytes, 2048);
     assert_eq!(receipt.sources[0].manifest, bank.manifest);
     release_guards(&meta, Some(writer.writer_hold), writer.source_leases);
-    std::fs::remove_dir_all(store.root()).unwrap();
+    let _ = std::fs::remove_dir_all(store.root());
 }
 
 #[test]
@@ -245,5 +245,5 @@ fn pressure_keeps_cached_inputs_of_a_paused_derive_until_explicit_abandon() {
     assert!(repos
         .iter()
         .any(|repo| !store.repository_path(repo).exists()));
-    std::fs::remove_dir_all(store.root()).unwrap();
+    let _ = std::fs::remove_dir_all(store.root());
 }

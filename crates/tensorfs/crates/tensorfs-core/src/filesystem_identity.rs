@@ -203,7 +203,7 @@ mod linux {
             assert!(panic.is_err());
             assert_eq!(filesystem_ids(), original);
             drop(store);
-            fs::remove_dir_all(root).unwrap();
+            let _ = fs::remove_dir_all(root);
         }
     }
 }

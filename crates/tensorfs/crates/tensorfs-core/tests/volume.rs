@@ -1,7 +1,11 @@
 //! The datacenter volume as the fetcher's second source: real Stores, a real loopback hub, and
 //! a shared directory (or a FUSE mount with a stated capacity) as the volume.
 
+// Helpers the Linux-only FUSE tests share go unused elsewhere.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code, unused_imports))]
+
 mod common;
+#[cfg(target_os = "linux")]
 #[path = "common/fuse.rs"]
 mod fuse;
 
@@ -261,6 +265,7 @@ fn a_private_origin_writes_nothing() {
 /// only as many as it needs. When even an empty volume could not take an object, nothing is
 /// evicted, the write is skipped and counted, and the fetch is unaffected.
 #[test]
+#[cfg(target_os = "linux")]
 fn a_short_volume_evicts_the_least_recently_used_then_skips() {
     let dir = temporary("volume-short");
     const J: u64 = 256 << 10;
@@ -316,6 +321,7 @@ fn a_short_volume_evicts_the_least_recently_used_then_skips() {
 /// a write refused for space evicts the least recently used objects and is written; one that
 /// even an emptied volume could not take is skipped and counted, and the fetch is unaffected.
 #[test]
+#[cfg(target_os = "linux")]
 fn a_quota_statfs_does_not_show_evicts_on_a_refused_write() {
     let dir = temporary("volume-quota");
     const J: u64 = 256 << 10;
@@ -370,6 +376,7 @@ fn a_quota_statfs_does_not_show_evicts_on_a_refused_write() {
 
 /// Temps and objects unused for the TTL go on the next short write, before anything in use.
 #[test]
+#[cfg(target_os = "linux")]
 fn temps_and_objects_past_the_ttl_go_on_the_next_short_write() {
     let dir = temporary("volume-ttl");
     const J: u64 = 256 << 10;

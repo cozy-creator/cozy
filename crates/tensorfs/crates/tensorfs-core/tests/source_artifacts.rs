@@ -80,7 +80,7 @@ fn retained_tree_distinguishes_missing_corrupt_and_stale_verified_members() {
     let error = source_artifact::retain(&store, &producer, &recipient).unwrap_err();
     assert_eq!(error.code, Code::OBJECT_CORRUPT, "{error}");
     assert!(!blob.exists());
-    fs::remove_dir_all(dir).unwrap();
+    let _ = fs::remove_dir_all(dir);
 }
 
 #[test]
@@ -106,7 +106,7 @@ fn retained_tree_rejects_nonregular_members_and_false_lengths() {
     fs::create_dir(&blob).unwrap();
     let error = source_artifact::retain(&store, &producer, &owner("nonregular")).unwrap_err();
     assert_eq!(error.code, Code::NOT_REGULAR_FILE, "{error}");
-    fs::remove_dir_all(dir).unwrap();
+    let _ = fs::remove_dir_all(dir);
 }
 fn resolution(base: &str, name: &str, bytes: &[u8]) -> Resolution {
     Resolution {
@@ -214,7 +214,7 @@ fn accepted_selection_moves_only_its_objects_and_replays_without_network() {
     gc::collect(&dir, false).unwrap();
     assert!(!store.contains(&selected.members[0].object.sha256));
     assert!(source_artifact::retain(&store, &owner("producer"), &owner("late")).is_err());
-    fs::remove_dir_all(dir).unwrap();
+    let _ = fs::remove_dir_all(dir);
 }
 #[test]
 fn owned_partial_objects_survive_gc_and_live_writer_is_fenced() {
@@ -233,7 +233,7 @@ fn owned_partial_objects_survive_gc_and_live_writer_is_fenced() {
     source_artifact::create(&store, &id, &tree).unwrap();
     source_artifact::release(&store, &id).unwrap();
     assert!(source_artifact::create(&store, &id, &tree).is_err());
-    fs::remove_dir_all(dir).unwrap();
+    let _ = fs::remove_dir_all(dir);
 }
 #[test]
 fn committed_child() {
@@ -280,7 +280,7 @@ fn killed_after_commit_before_reply_replays_and_adopts() {
     gc::collect(&dir, false).unwrap();
     let tree = store.read_manifest(&adopted.manifest).unwrap();
     assert!(store.contains(&tree.entries()[0].1.blob().sha256));
-    fs::remove_dir_all(dir).unwrap();
+    let _ = fs::remove_dir_all(dir);
 }
 
 #[test]
@@ -312,7 +312,7 @@ fn recipient_adoption_and_producer_release_have_one_serializable_outcome() {
             store.contains(&tree.entries()[0].1.blob().sha256),
             acquired.is_ok()
         );
-        fs::remove_dir_all(dir).unwrap();
+        let _ = fs::remove_dir_all(dir);
     }
 }
 
@@ -327,7 +327,7 @@ fn receipt_replay_refuses_another_producer_of_identical_bytes() {
     let refusal =
         source_artifact::retain(&store, &owner("second"), &owner("recipient")).unwrap_err();
     assert_eq!(refusal.code, tensorfs_core::err::Code::CROSS_SUBJECT_REPLAY);
-    fs::remove_dir_all(dir).unwrap();
+    let _ = fs::remove_dir_all(dir);
 }
 
 #[test]
@@ -347,5 +347,5 @@ fn recipient_cancel_before_adoption_leaves_a_permanent_exact_receipt_tombstone()
         .unwrap();
     gc::collect(&dir, false).unwrap();
     assert!(!store.contains(&tree.entries()[0].1.blob().sha256));
-    fs::remove_dir_all(dir).unwrap();
+    let _ = fs::remove_dir_all(dir);
 }

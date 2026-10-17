@@ -1,7 +1,6 @@
 //! proto-061: landed bytes are hashed once and trusted from one per-process catalog load.
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -47,7 +46,7 @@ fn body(index: usize) -> Vec<u8> {
 
 fn rewrite_in_place(path: &Path, keep_mtime: bool) {
     let before = fs::metadata(path).unwrap().modified().unwrap();
-    fs::set_permissions(path, fs::Permissions::from_mode(0o644)).unwrap();
+    tensorfs_core::platform::durable::set_mode(path, 0o644).unwrap();
     let length = fs::metadata(path).unwrap().len() as usize;
     fs::write(path, vec![0xA5; length]).unwrap();
     if keep_mtime {
@@ -120,8 +119,8 @@ fn trust_checks_load_the_catalog_once_and_bad_bytes_are_still_caught() {
     assert_eq!(refused.code, Code::OBJECT_ID_MISMATCH);
     assert!(!store.contains(&declared.sha256));
 
-    fs::remove_dir_all(root).unwrap();
-    fs::remove_dir_all(scratch).unwrap();
+    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(scratch);
 }
 
 #[test]
@@ -141,8 +140,8 @@ fn a_new_handle_validates_and_trusts_on_one_connection() {
     }
     assert_eq!(connections_opened(&root) - opened, 1);
 
-    fs::remove_dir_all(root).unwrap();
-    fs::remove_dir_all(scratch).unwrap();
+    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(scratch);
 }
 
 /// Many writers in one process mint temp names at once; every object lands (a temp-name
@@ -175,5 +174,5 @@ fn concurrent_writers_in_one_process_never_share_a_temp_name() {
     for object in &written {
         assert_eq!(fs::read(store.object_path(&object.sha256)).unwrap().len() as u64, object.length);
     }
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }

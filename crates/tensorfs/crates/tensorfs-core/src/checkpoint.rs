@@ -17,7 +17,7 @@ use crate::manifest::Manifest;
 use crate::sha256::{self, Sha256};
 use crate::store::{Fault, Store};
 
-fn io(what: impl AsRef<str>, e: std::io::Error) -> Refusal {
+fn io(what: impl AsRef<str>, e: impl Into<std::io::Error>) -> Refusal {
     crate::store::classify_io(what, e)
 }
 

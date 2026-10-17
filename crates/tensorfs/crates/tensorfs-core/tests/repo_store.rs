@@ -36,9 +36,7 @@ fn one_tmp_tree_is_recreatable_and_corruption_is_not_retained() {
         .put_stream(&mut bytes.as_slice(), Some(&object), &Fault::default())
         .unwrap();
     let path = store.blob_path(&object.sha256);
-    let mut permissions = fs::metadata(&path).unwrap().permissions();
-    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o644);
-    fs::set_permissions(&path, permissions).unwrap();
+    tensorfs_core::platform::durable::set_mode(&path, 0o644).unwrap();
     fs::write(&path, b"corruption").unwrap();
     assert!(matches!(
         store.verify(&object.sha256).unwrap(),
@@ -46,7 +44,7 @@ fn one_tmp_tree_is_recreatable_and_corruption_is_not_retained() {
     ));
     assert!(!path.exists());
 
-    fs::remove_dir_all(root.join("tmp")).unwrap();
+    let _ = fs::remove_dir_all(root.join("tmp"));
     Store::open(&root).unwrap();
     assert!(root.join("tmp").is_dir());
     let _ = fs::remove_dir_all(root);

@@ -249,7 +249,7 @@ fn one_pass_splits_transposes_squeezes_and_narrows_to_the_canonical_keys() {
     assert_eq!((again.resumed_roles, again.written), (7, 0));
     assert_eq!(replay.unwrap().manifest_ref, outcome.manifest_ref);
     drop((_writer, catalog, store));
-    fs::remove_dir_all(dir).unwrap();
+    let _ = fs::remove_dir_all(dir);
 }
 
 #[test]
@@ -286,8 +286,8 @@ fn a_value_f16_cannot_hold_refuses_and_an_unreviewed_layout_never_plans() {
     let missing = carrier_file(&other, &missing);
     assert_eq!(plan_code(&missing), Code::MISSING_TENSOR);
     drop((_writer, catalog, store));
-    fs::remove_dir_all(dir).unwrap();
-    fs::remove_dir_all(other).unwrap();
+    let _ = fs::remove_dir_all(dir);
+    let _ = fs::remove_dir_all(other);
 }
 
 fn plan_code(file: &transaction::SourceFile) -> Code {

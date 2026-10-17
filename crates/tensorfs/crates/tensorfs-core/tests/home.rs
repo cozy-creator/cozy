@@ -44,7 +44,7 @@ fn refuse_without_a_named_root(name: &str, args: &[&str]) {
         !home.join(".tensorfs").exists(),
         "tfs {args:?} conjured a home Store"
     );
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 /// A store verb without a root is a usage error that writes nothing (tfs-053).
@@ -66,7 +66,7 @@ fn store_verbs_name_their_root_and_write_nothing_without_one() {
         assert_eq!(output.status.code(), Some(2), "tfs {args:?}");
         assert_eq!(fs::read_dir(&cwd).unwrap().count(), 0, "tfs {args:?} wrote into its working directory");
         assert!(!home.join(".tensorfs").exists() && !root.join("environment").exists());
-        fs::remove_dir_all(root).unwrap();
+        let _ = fs::remove_dir_all(root);
     }
 }
 
@@ -87,7 +87,7 @@ fn a_named_root_is_created_and_a_second_init_refuses() {
     assert!(first.status.success(), "{}", String::from_utf8_lossy(&first.stderr));
     assert!(named.join("blobs").is_dir());
     assert!(String::from_utf8_lossy(&init().stderr).contains("STORE_ERA"));
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 /// A switch never takes the positional after it, an unknown flag warns without moving any
@@ -112,5 +112,5 @@ fn switches_keep_their_positionals_and_unknown_flags_warn() {
     let written = tfs(&["checkpoint", "write", named.to_str().unwrap(), "--blocks", "two"]);
     assert_eq!(written.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&written.stderr).contains("--blocks \"two\" is not a number"));
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }

@@ -83,7 +83,7 @@ fn store_role<R: Read>(
     }
 }
 
-fn io(what: impl AsRef<str>, e: std::io::Error) -> Refusal {
+fn io(what: impl AsRef<str>, e: impl Into<std::io::Error>) -> Refusal {
     crate::store::classify_io(what, e)
 }
 
@@ -226,7 +226,11 @@ pub fn write_session(store_root: &Path, root: &IngestSession) -> Result<()> {
 
 pub fn read_session(store_root: &Path, session: &str) -> Result<IngestSession> {
     let p = candidate_dir(store_root, session).join("session.json");
-    match fs::read(&p) {
+    let read = crate::platform::durable::open_racing(&p).and_then(|mut file| {
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    match read {
         Ok(b) => IngestSession::parse(&b),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => refuse(
             Code::ROOT_ABSENT,

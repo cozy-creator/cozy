@@ -9,6 +9,9 @@
 //!
 //! Row 21 — `tfs reap` unlinked admission temps by mtime, so a slow live writer's temp could
 //! be reaped from under it. Liveness is now the lock the writer holds on the temp.
+//!
+//! Unix only: the fences and stalls here are `ulimit` and SIGSTOP.
+#![cfg(unix)]
 
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};

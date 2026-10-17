@@ -24,25 +24,17 @@
 //! is held the machine refills no slot holding `r`.
 
 use std::collections::HashMap;
-use std::ffi::CString;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::sync::atomic::{fence, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use tensorfs_core::ids::ObjectRef;
+use tensorfs_core::platform::shm::{self, Region, RESIZE_SEALS, WRITE_SEALS};
 
 use crate::cuda;
 use crate::io::{IoTally, Mode, Source};
 use crate::layout::{ItemSource, Layout, PART_ALIGN};
 use crate::{Error, Result};
-
-/// What makes a layout immutable: no write, resize, punch or unsealing, by anyone.
-/// F_SEAL_FUTURE_WRITE (Linux 5.1): no new writable mapping or write; the filler's own mapping,
-/// done writing, may still be going away.
-const F_SEAL_FUTURE_WRITE: libc::c_int = 0x10;
-pub(crate) const SEALS: libc::c_int = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | F_SEAL_FUTURE_WRITE;
-/// What an adopter accepts: resize and sealing sealed, and every write path closed.
-const RESIZE_SEALS: libc::c_int = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW;
 
 const MAGIC: u64 = u64::from_le_bytes(*b"TFSPLN02");
 const MAGIC_WINDOW: u64 = u64::from_le_bytes(*b"TFSWIN01");
@@ -94,35 +86,20 @@ pub struct Window {
 }
 
 /// An OFD byte-range lock on `fd`; Ok(false) when a non-waiting request conflicts.
-fn ofd_lock(fd: RawFd, start: usize, len: usize, kind: libc::c_short, wait: bool) -> Result<bool> {
-    let fl = libc::flock {
-        l_type: kind,
-        l_whence: libc::SEEK_SET as libc::c_short,
-        l_start: start as libc::off_t,
-        l_len: len as libc::off_t,
-        l_pid: 0,
-    };
-    let cmd = if wait { libc::F_OFD_SETLKW } else { libc::F_OFD_SETLK };
-    // SAFETY: OFD byte-range lock on a descriptor the caller holds.
-    if unsafe { libc::fcntl(fd, cmd, &fl) } == 0 {
-        return Ok(true);
-    }
-    let e = std::io::Error::last_os_error();
-    match e.raw_os_error() {
-        Some(libc::EAGAIN) | Some(libc::EACCES) if !wait => Ok(false),
-        _ => Err(Error::Io(format!("OFD lock at {start}: {e}"))),
-    }
+fn ofd_lock(fd: BorrowedFd<'_>, start: usize, len: usize, region: Region, wait: bool) -> Result<bool> {
+    shm::region_lock(fd, start, len, region, wait).map_err(crate::os("OFD lock"))
 }
 
-fn punch(fd: RawFd, off: u64, span: u64) -> Result<()> {
-    // SAFETY: punching a hole in a memfd the caller holds.
-    let rc = unsafe {
-        libc::fallocate(fd, libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE, off as libc::off_t, span as libc::off_t)
-    };
-    if rc != 0 {
-        return Err(os("punch host region"));
+fn punch(fd: BorrowedFd<'_>, off: u64, span: u64) -> Result<()> {
+    shm::punch(fd, off, span).map_err(crate::os("punch host region"))
+}
+
+/// A new memfd named for what it holds; the name may not carry a NUL.
+fn memfd(name: String) -> Result<OwnedFd> {
+    if name.contains('\0') {
+        return Err(Error::Invalid("weight set name contains NUL".into()));
     }
-    Ok(())
+    shm::memfd_named(&name).map_err(crate::os("memfd_create"))
 }
 
 fn os(what: &str) -> Error {
@@ -154,18 +131,12 @@ fn file_size(fd: RawFd) -> Result<usize> {
 /// A new open file description of the file behind `fd` (a dup would share `fd`'s, and with it
 /// its OFD locks).
 pub(crate) fn reopen(fd: RawFd) -> Result<OwnedFd> {
-    reopen_as(fd, libc::O_RDWR)
+    reopen_as(fd, true)
 }
 
-fn reopen_as(fd: RawFd, access: libc::c_int) -> Result<OwnedFd> {
-    let path = CString::new(format!("/proc/self/fd/{fd}")).expect("no NUL");
-    // SAFETY: plain open of a magic link to a descriptor the caller holds.
-    let own = unsafe { libc::open(path.as_ptr(), access | libc::O_CLOEXEC) };
-    if own < 0 {
-        return Err(os("reopen host fd"));
-    }
-    // SAFETY: fresh descriptor from the kernel.
-    Ok(unsafe { OwnedFd::from_raw_fd(own) })
+fn reopen_as(fd: RawFd, write: bool) -> Result<OwnedFd> {
+    // SAFETY: the caller holds `fd` open for the call.
+    shm::reopen(unsafe { BorrowedFd::borrow_raw(fd) }, write).map_err(crate::os("reopen host fd"))
 }
 
 /// A claim on every region of the memfd behind `fd` for a process that keeps a tier without
@@ -176,7 +147,7 @@ fn reopen_as(fd: RawFd, access: libc::c_int) -> Result<OwnedFd> {
 /// Waits only while a punch is in progress.
 pub fn hold(fd: RawFd) -> Result<OwnedFd> {
     let own = reopen(fd)?;
-    ofd_lock(own.as_raw_fd(), 0, 0, libc::F_RDLCK as _, true)?;
+    ofd_lock(own.as_fd(), 0, 0, Region::Read, true)?;
     Ok(own)
 }
 
@@ -185,6 +156,7 @@ pub fn hold(fd: RawFd) -> Result<OwnedFd> {
 /// state-page format is only let go.
 pub fn release_hold(hold: OwnedFd) -> Result<u64> {
     let fd = hold.as_raw_fd();
+    let locks = hold.as_fd();
     // SAFETY: fstat into a zeroed struct.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     if unsafe { libc::fstat(fd, &mut st) } != 0 {
@@ -216,7 +188,7 @@ pub fn release_hold(hold: OwnedFd) -> Result<u64> {
         let w = u32::from_le_bytes(words[4 * r..4 * r + 4].try_into().unwrap());
         let at = data + WORDS_OFF + 4 * r;
         // Exclusive over our own shared hold: granted only when no plane claims the region.
-        if w & READY == 0 || !ofd_lock(fd, at, 4, libc::F_WRLCK as _, false)? {
+        if w & READY == 0 || !ofd_lock(locks, at, 4, Region::Write, false)? {
             continue;
         }
         let cleared = (w & !READY).to_le_bytes();
@@ -226,7 +198,7 @@ pub fn release_hold(hold: OwnedFd) -> Result<u64> {
         }
         let off = u64::from_le_bytes(ext[16 * r..16 * r + 8].try_into().unwrap());
         let span = u64::from_le_bytes(ext[16 * r + 8..16 * r + 16].try_into().unwrap());
-        punch(fd, off, span)?;
+        punch(locks, off, span)?;
         punched += span;
     }
     Ok(punched)
@@ -266,15 +238,7 @@ unsafe impl Sync for HostMem {}
 impl HostMem {
     /// A fresh memfd for `layout`.
     pub fn create(name: &str, layout: &Layout) -> Result<HostMem> {
-        let cname = CString::new(format!("tfs-plane:{name}"))
-            .map_err(|_| Error::Invalid("weight set name contains NUL".into()))?;
-        // SAFETY: plain syscall; the name is NUL-terminated.
-        let fd = unsafe { libc::memfd_create(cname.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING) };
-        if fd < 0 {
-            return Err(os("memfd_create"));
-        }
-        // SAFETY: we own the fresh descriptor.
-        Self::adopt_owned(unsafe { OwnedFd::from_raw_fd(fd) }, layout, false, true)
+        Self::adopt_owned(memfd(format!("tfs-plane:{name}"))?, layout, false, true)
     }
 
     /// A layout's memory in a memfd `reserve` made: sized to the layout now (pages past it are
@@ -293,12 +257,12 @@ impl HostMem {
     /// Adopt a sealed layout (`fill_sealed`, `open_sealed`) read-only: its seals are the proof
     /// nobody else can change a byte; a region is used only once its filler marks it Ready.
     pub fn adopt_sealed(fd: RawFd, layout: &Layout) -> Result<HostMem> {
-        // SAFETY: a scalar query of a descriptor the caller holds.
-        let seals = unsafe { libc::fcntl(fd, libc::F_GET_SEALS) };
-        if seals < 0 || seals & RESIZE_SEALS != RESIZE_SEALS || seals & (libc::F_SEAL_WRITE | F_SEAL_FUTURE_WRITE) == 0 {
+        // SAFETY: the caller holds `fd` open for the call.
+        let seals = shm::seals(unsafe { BorrowedFd::borrow_raw(fd) }).map_err(crate::os("read seals"))?;
+        if seals & RESIZE_SEALS != RESIZE_SEALS || seals & WRITE_SEALS == 0 {
             return Err(Error::Invalid("a sealed host layout must carry write, resize and seal seals".into()));
         }
-        let own = reopen_as(fd, libc::O_RDONLY)?;
+        let own = reopen_as(fd, false)?;
         // The state page's magic says which (a size can match both: one region, one slot).
         let host = if state_magic(own.as_raw_fd())? == MAGIC_WINDOW {
             Self::adopt_window(own, layout)?
@@ -357,21 +321,11 @@ impl HostMem {
         let slots = slots.max(1);
         let data = slots * slot_span as usize;
         let map_len = data + meta_len_window(n, slots);
-        let cname = CString::new(format!("tfs-window:{name}"))
-            .map_err(|_| Error::Invalid("weight set name contains NUL".into()))?;
-        // SAFETY: plain syscalls on a descriptor we create and own; a sparse file costs no RAM
-        // until written.
-        let fd = unsafe {
-            let fd = libc::memfd_create(cname.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING);
-            if fd < 0 {
-                return Err(os("memfd_create"));
-            }
-            let fd = OwnedFd::from_raw_fd(fd);
-            if libc::ftruncate(fd.as_raw_fd(), map_len as libc::off_t) != 0 {
-                return Err(os("ftruncate window"));
-            }
-            fd
-        };
+        let fd = memfd(format!("tfs-window:{name}"))?;
+        // SAFETY: sizing a descriptor we own; a sparse file costs no RAM until written.
+        if unsafe { libc::ftruncate(fd.as_raw_fd(), map_len as libc::off_t) } != 0 {
+            return Err(os("ftruncate window"));
+        }
         let h = Self::map(fd, data, map_len, n, false, Some(Window { slots, slot_span }))?;
         // SAFETY: every write lies inside the state page of our writable mapping.
         unsafe {
@@ -444,7 +398,7 @@ impl HostMem {
         if ptr == libc::MAP_FAILED {
             return Err(os("mmap host fd"));
         }
-        let share = reopen_as(fd.as_raw_fd(), if sealed { libc::O_RDONLY } else { libc::O_RDWR })?;
+        let share = reopen_as(fd.as_raw_fd(), !sealed)?;
         Ok(HostMem {
             fd,
             share,
@@ -523,7 +477,7 @@ impl HostMem {
         let mut readers = self.readers.lock().unwrap();
         let n = readers.entry(r).or_insert(0);
         if *n == 0 {
-            self.lock(r, libc::F_RDLCK as _, true)?;
+            self.lock(r, Region::Read, true)?;
         }
         *n += 1;
         Ok(())
@@ -551,22 +505,11 @@ impl HostMem {
             if a >= b {
                 continue;
             }
-            let mut fl = libc::flock {
-                l_type: libc::F_WRLCK as _,
-                l_whence: libc::SEEK_SET as libc::c_short,
-                l_start: a as libc::off_t,
-                l_len: (b - a) as libc::off_t,
-                l_pid: 0,
-            };
-            // SAFETY: a lock query on a descriptor we hold.
-            if unsafe { libc::fcntl(self.fd.as_raw_fd(), libc::F_OFD_GETLK, &mut fl) } != 0 {
-                return Err(os("query region claims"));
-            }
-            if fl.l_type == libc::F_UNLCK as libc::c_short {
+            let Some((start, len)) = shm::region_holder(self.fd.as_fd(), a, b - a).map_err(crate::os("query region claims"))? else {
                 continue;
-            }
-            let s = (fl.l_start as usize).clamp(a, b);
-            let e = if fl.l_len == 0 { b } else { (fl.l_start + fl.l_len) as usize }.clamp(s, b);
+            };
+            let s = start.clamp(a, b);
+            let e = if len == 0 { b } else { start + len }.clamp(s, b);
             out.extend(((s - lo) / 4..(e - lo).div_ceil(4)).map(|r| r as u32));
             ranges.push((a, s));
             ranges.push((e.max(s + 1), b));
@@ -615,9 +558,8 @@ impl HostMem {
             return Err(os("mmap host fd"));
         }
         // Huge pages cut registration and TLB cost where shmem THP is enabled; advisory.
-        // SAFETY: advice on our own mapping.
-        unsafe { libc::madvise(ptr, data, libc::MADV_HUGEPAGE) };
-        let share = reopen_as(fd.as_raw_fd(), if sealed { libc::O_RDONLY } else { libc::O_RDWR })?;
+        shm::advise_huge(ptr as *mut u8, data);
+        let share = reopen_as(fd.as_raw_fd(), !sealed)?;
         let h = HostMem {
             fd,
             share,
@@ -712,15 +654,15 @@ impl HostMem {
         st.st_blocks as u64 * 512
     }
 
-    fn lock(&self, r: u32, kind: libc::c_short, wait: bool) -> Result<bool> {
+    fn lock(&self, r: u32, region: Region, wait: bool) -> Result<bool> {
         assert!((r as usize) < self.regions);
-        ofd_lock(self.fd.as_raw_fd(), self.data + WORDS_OFF + 4 * r as usize, 4, kind, wait)
+        ofd_lock(self.fd.as_fd(), self.data + WORDS_OFF + 4 * r as usize, 4, region, wait)
     }
 
     /// Claim region `r` (shared): held while this description has it filling or ready. Waits
     /// only while another description is punching it (microseconds).
     pub fn claim(&self, r: u32) -> Result<()> {
-        self.lock(r, libc::F_RDLCK as _, true).map(|_| ())
+        self.lock(r, Region::Read, true).map(|_| ())
     }
 
     /// Let region `r` go. The last claimant clears Ready and punches the region's RAM (true);
@@ -730,10 +672,10 @@ impl HostMem {
             self.unlock(r);
             return Ok(false);
         }
-        let last = self.lock(r, libc::F_WRLCK as _, false)?;
+        let last = self.lock(r, Region::Write, false)?;
         let punched = if last {
             self.set_ready(r, false);
-            punch(self.fd.as_raw_fd(), off, span).inspect_err(|_| self.unlock(r))?;
+            punch(self.fd.as_fd(), off, span).inspect_err(|_| self.unlock(r))?;
             true
         } else {
             false
@@ -743,7 +685,7 @@ impl HostMem {
     }
 
     fn unlock(&self, r: u32) {
-        let _ = self.lock(r, libc::F_UNLCK as _, false);
+        let _ = self.lock(r, Region::Unlock, false);
     }
 
     /// Page-lock `[off, off+len)` for DMA from every context (PORTABLE). The caller binds a
@@ -853,16 +795,11 @@ impl Drop for HostMem {
 /// pages are usually off) is most of a fill from the page cache; `fill_sealed` into the result
 /// then mostly copies. Pages past the layout it receives are freed then.
 pub fn reserve(name: &str, bytes: u64, threads: usize) -> Result<OwnedFd> {
-    let cname = CString::new(format!("tfs-reserve:{name}")).map_err(|_| Error::Invalid("reservation name contains NUL".into()))?;
     let len = crate::layout::align_up(bytes.max(1), PART_ALIGN) as usize;
-    // SAFETY: plain syscalls on a descriptor we create and own; the mapping is ours and is
-    // unmapped before returning (the pages stay in the memfd).
+    let fd = memfd(format!("tfs-reserve:{name}"))?;
+    // SAFETY: plain syscalls on a descriptor we own; the mapping is ours and is unmapped
+    // before returning (the pages stay in the memfd).
     unsafe {
-        let fd = libc::memfd_create(cname.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING);
-        if fd < 0 {
-            return Err(os("memfd_create"));
-        }
-        let fd = OwnedFd::from_raw_fd(fd);
         if libc::ftruncate(fd.as_raw_fd(), len as libc::off_t) != 0 {
             return Err(os("size reservation"));
         }
@@ -870,41 +807,11 @@ pub fn reserve(name: &str, bytes: u64, threads: usize) -> Result<OwnedFd> {
         if ptr == libc::MAP_FAILED {
             return Err(os("map reservation"));
         }
-        libc::madvise(ptr, len, libc::MADV_HUGEPAGE);
-        populate(ptr as *mut u8, len, threads);
+        shm::advise_huge(ptr as *mut u8, len);
+        shm::populate(ptr as *mut u8, len, threads);
         libc::munmap(ptr, len);
-        Ok(fd)
     }
-}
-
-/// Fault in every page of `[base, base+len)` for writing, in `threads` slices. Pages a memfd
-/// lacks are allocated; pages it has are only mapped. Kernels before 5.14 lack
-/// MADV_POPULATE_WRITE: each page is touched instead (writing the zero it already reads as).
-fn populate(base: *mut u8, len: usize, threads: usize) {
-    const MADV_POPULATE_WRITE: libc::c_int = 23;
-    let page = 4096usize;
-    let threads = threads.max(1);
-    let step = len.div_ceil(threads).next_multiple_of(page);
-    let base = base as usize;
-    std::thread::scope(|s| {
-        for k in 0..threads {
-            let (lo, hi) = ((k * step).min(len), ((k + 1) * step).min(len));
-            if lo == hi {
-                continue;
-            }
-            s.spawn(move || {
-                // SAFETY: a page-aligned slice of the caller's live, writable shared mapping.
-                unsafe {
-                    let at = (base + lo) as *mut libc::c_void;
-                    if libc::madvise(at, hi - lo, MADV_POPULATE_WRITE) != 0 {
-                        for p in (lo..hi).step_by(page) {
-                            std::ptr::write_volatile((base + p) as *mut u8, 0);
-                        }
-                    }
-                }
-            });
-        }
-    });
+    Ok(fd)
 }
 
 /// A sealed layout handed out before its bytes: sealed against resize, sealing and every new
@@ -931,10 +838,8 @@ pub fn open_sealed(name: &str, layout: &Layout, reserved: Option<OwnedFd>, stage
         }
     }
     let fd = reopen(host.fd.as_raw_fd())?;
-    // SAFETY: a scalar fcntl on our own descriptor. Future-write leaves this mapping writable.
-    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_ADD_SEALS, SEALS) } != 0 {
-        return Err(os("seal host layout"));
-    }
+    // Future-write leaves this mapping writable.
+    shm::seal(fd.as_fd()).map_err(crate::os("seal host layout"))?;
     Ok((fd, OpenFill { host }))
 }
 

@@ -37,6 +37,7 @@ create_exception!(tensorfs.plane, CudaUnavailable, PlaneError);
 create_exception!(tensorfs.plane, Invalid, PlaneError);
 create_exception!(tensorfs.plane, IoError, PlaneError);
 create_exception!(tensorfs.plane, Closed, PlaneError);
+create_exception!(tensorfs.plane, Unsupported, PlaneError);
 
 /// The one conversion. Source refusals cross as the usual `tensorfs.errors` classes.
 fn err(py: Python<'_>, e: Error) -> PyErr {
@@ -53,6 +54,7 @@ fn err(py: Python<'_>, e: Error) -> PyErr {
         Error::Invalid(_) => Invalid::new_err(msg),
         Error::Io(_) => IoError::new_err(msg),
         Error::Closed(_) => Closed::new_err(msg),
+        Error::Unsupported(_) => Unsupported::new_err(msg),
     };
     let v = x.value(py);
     let _ = v.setattr("code", e.code());
@@ -934,7 +936,7 @@ pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     // `register_sealed(files=)`: regions the machine did not stage copy from object files.
     m.add("SEALED_HOLES", true)?;
     add_errors!(m; PlaneError, BudgetExceeded, Shortfall, BelowFloor, LeaseViolation, Poisoned, CudaError,
-        CudaUnavailable, Invalid, IoError, Closed);
+        CudaUnavailable, Invalid, IoError, Closed, Unsupported);
     parent.add_submodule(&m)?;
     py.import("sys")?.getattr("modules")?.set_item("tensorfs._ext.plane", &m)
 }

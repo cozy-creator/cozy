@@ -2,13 +2,12 @@
 
 use std::fs::OpenOptions;
 use std::io::Read;
-use std::os::unix::fs::OpenOptionsExt;
 
 use crate::catalog::WriterGuard;
 use crate::err::{refuse, Code, Refusal, Result};
 use crate::ids::{Doc, ObjectRef};
 use crate::repository::{Repository, RepositoryName};
-use crate::store::{Store, O_NOFOLLOW};
+use crate::store::Store;
 
 pub fn repository(value: &str) -> Result<RepositoryName> {
     let (org, name) = value.split_once('/').ok_or_else(|| Refusal {
@@ -49,10 +48,8 @@ pub fn check_source(store: &Store, source: &str, manifest: &ObjectRef) -> Result
 }
 
 fn verify_source(store: &Store, repository: &RepositoryName, manifest: &ObjectRef) -> Result<()> {
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(O_NOFOLLOW)
-        .open(store.repository_path(repository))
+    let file = crate::platform::durable::open_nofollow(&store.repository_path(repository), OpenOptions::new().read(true))
+        .map_err(std::io::Error::from)
         .map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
                 Refusal {

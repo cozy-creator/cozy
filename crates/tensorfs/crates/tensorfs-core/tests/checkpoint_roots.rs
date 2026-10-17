@@ -1,5 +1,4 @@
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 use tensorfs_core::checkpoint_root;
@@ -179,7 +178,7 @@ fn a_full_snapshot_hold_wins_over_a_runtime_only_hold() {
 fn a_corrupt_payload_is_not_a_valid_input() {
     let fixture = Fixture::new();
     let path = fixture.store.blob_path(&fixture.data.sha256);
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    tensorfs_core::platform::durable::set_mode(&path, 0o644).unwrap();
     fs::write(path, vec![0x32; 2048]).unwrap();
     assert_eq!(
         checkpoint_root::check_source(&fixture.store, REPOSITORY, &fixture.manifest)

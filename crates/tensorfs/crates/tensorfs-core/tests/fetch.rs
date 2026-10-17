@@ -3,7 +3,7 @@
 
 mod common;
 
-use std::os::unix::net::UnixStream;
+use tensorfs_core::platform::ipc::{self, LocalStream};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -342,7 +342,7 @@ fn the_executor_channel_schedules_waits_and_answers_presence() {
         origins: vec![(origin(&hub, &checkpoint), access())],
         stop: never(),
     };
-    let (client, server) = UnixStream::pair().unwrap();
+    let (client, server) = ipc::pair().unwrap();
     let rows = |objects: &[ObjectRef]| {
         objects
             .iter()
@@ -519,7 +519,7 @@ fn a_panicking_download_ends_its_waits_and_the_fetcher_goes_on() {
 }
 
 /// The executor's side of the framing: a kind byte, a big-endian length, JSON.
-struct Peer(UnixStream);
+struct Peer(LocalStream);
 
 impl Peer {
     fn send(&mut self, body: &str) {

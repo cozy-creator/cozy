@@ -44,14 +44,7 @@ impl Read for Pattern {
 }
 
 fn peak_rss_bytes() -> u64 {
-    let status = std::fs::read_to_string("/proc/self/status").unwrap();
-    let line = status.lines().find(|l| l.starts_with("VmHWM:")).unwrap();
-    line.split_whitespace()
-        .nth(1)
-        .unwrap()
-        .parse::<u64>()
-        .unwrap()
-        * 1024
+    tensorfs_core::platform::process::peak_resident().unwrap()
 }
 
 /// A minimal object store: PUT hashes the body it receives, GET streams `serve` back.

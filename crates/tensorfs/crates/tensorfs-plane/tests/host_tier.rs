@@ -1,5 +1,6 @@
 //! The pinned host tier on the real code path: a real TensorFS store in a temp dir, a real
 //! read lease and plan, a host-only plane (no GPU). Every check reads bytes back.
+#![cfg(target_os = "linux")] // The host tier (memfd, seals, OFD locks) is Linux-only.
 
 mod common;
 

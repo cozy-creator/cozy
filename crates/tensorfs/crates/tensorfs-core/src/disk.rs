@@ -104,24 +104,14 @@ fn classify(magic: u64) -> Filesystem {
 /// boot: bytes written under this boot and not yet on disk are still readable until it ends.
 /// A container sees its host's boot, which is the one that owns the page cache.
 pub(crate) fn boot_id() -> Option<String> {
-    #[cfg(target_os = "linux")]
-    {
-        let id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
-        let id = id.trim();
-        (id.len() == 36 && id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-'))
-            .then(|| id.to_string())
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        None
-    }
+    crate::platform::process::boot_id().ok()
 }
 
-#[cfg(test)]
+/// Statfs magics are Linux's.
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn magics_name_their_class() {
         assert_eq!(classify(0x794c_7630).class, DiskClass::Ephemeral);
@@ -132,7 +122,6 @@ mod tests {
         assert_eq!(classify(0x1234_5678).class, DiskClass::Persistent);
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn real_mounts_classify() {
         if Path::new("/dev/shm").is_dir() {

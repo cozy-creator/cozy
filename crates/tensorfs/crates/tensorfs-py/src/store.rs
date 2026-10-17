@@ -1578,6 +1578,7 @@ fn released(py: Python<'_>) -> PyErr {
 
 impl PyLease {
     /// Hand the core lease to the weight plane, which ends it; `live` becomes False.
+    #[cfg(unix)] // The plane is Unix's.
     pub(crate) fn take_for_plane(&self, py: Python<'_>) -> PyResult<CoreLease> {
         let taken = self.lease.lock_py_attached(py).unwrap().take();
         taken.ok_or_else(|| released(py))

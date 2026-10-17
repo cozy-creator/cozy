@@ -410,7 +410,7 @@ fn members_download_concurrently_once_each_and_report_progress() {
     assert_eq!(reports.first(), Some(&(0, total)));
     assert_eq!(reports.last(), Some(&(total, total)));
     assert!(reports.windows(2).all(|pair| pair[0].0 <= pair[1].0));
-    fs::remove_dir_all(dir).unwrap();
+    let _ = fs::remove_dir_all(dir);
 }
 
 #[test]
@@ -452,7 +452,7 @@ fn one_large_member_is_asked_in_chunks_across_streams_and_every_byte_lands_once(
     // Every chunk asks the delivery URL the source resolved to; the source is walked once.
     let resolves = origin.asks.load(Ordering::Relaxed) - origin.asked.lock().unwrap().len();
     assert_eq!(resolves, 1, "the redirect was re-walked per ask");
-    fs::remove_dir_all(dir).unwrap();
+    let _ = fs::remove_dir_all(dir);
 }
 
 #[test]
@@ -481,7 +481,7 @@ fn a_connection_cut_mid_body_resumes_at_the_byte_it_reached() {
     let asked = origin.asked.lock().unwrap().clone();
     assert_eq!(asked.len(), 2, "{asked:?}");
     assert_eq!(asked[1].1, 5 * MIB as u64 / 2);
-    fs::remove_dir_all(dir).unwrap();
+    let _ = fs::remove_dir_all(dir);
 }
 
 #[test]
@@ -595,11 +595,18 @@ fn a_killed_download_fetches_only_what_it_had_not_retained() {
         if store.record_valid(&object.sha256).is_ok() {
             continue;
         }
-        let held: u64 = runs
+        // A range asked again (a restarted request) is recorded again: held once.
+        let mut ranges: Vec<(u64, u64)> = runs
             .iter()
             .filter(|(sha, _, _)| *sha == object.sha256)
-            .map(|(_, _, extent)| extent)
-            .sum();
+            .map(|(_, first, extent)| (*first, first + extent))
+            .collect();
+        ranges.sort();
+        let (mut held, mut reached) = (0, 0);
+        for (first, end) in ranges {
+            held += end.saturating_sub(first.max(reached));
+            reached = reached.max(end);
+        }
         kept += held;
         owed += object.length - held;
     }
@@ -616,9 +623,18 @@ fn a_killed_download_fetches_only_what_it_had_not_retained() {
     )
     .unwrap();
     verify(&store, &resumed, &names);
-    assert_eq!(resumed.requested(), owed);
+    // A slow ask's tail may be asked again (a restart): count each byte asked once.
+    let mut asked = resumed.asked.lock().unwrap().clone();
+    asked.sort();
+    let (mut requested, mut reached) = (0, None::<(String, u64)>);
+    for (name, first, last) in asked {
+        let before = reached.as_ref().filter(|(seen, _)| *seen == name).map_or(0, |(_, end)| *end);
+        requested += (last + 1).saturating_sub(first.max(before));
+        reached = Some((name, before.max(last + 1)));
+    }
+    assert_eq!(requested, owed, "retained {runs:?}; asked {:?}", resumed.asked.lock().unwrap());
     assert_eq!(rows.iter().map(|row| row.transferred).sum::<u64>(), owed);
-    fs::remove_dir_all(dir).unwrap();
+    let _ = fs::remove_dir_all(dir);
 }
 
 /// Run 2322's shape at a source: the first ask that reaches one MiB of a member crawls at
@@ -661,7 +677,7 @@ fn a_crawling_request_is_restarted_and_does_not_hold_the_ingest() {
     );
     let log = fs::read_to_string(dir.join("logs/transport.log")).unwrap();
     assert!(log.contains(" restart "), "{log}");
-    fs::remove_dir_all(dir).unwrap();
+    let _ = fs::remove_dir_all(dir);
 }
 
 #[test]
@@ -696,7 +712,7 @@ fn a_stated_retry_after_is_waited_out_and_spends_no_attempt() {
         started.elapsed()
     );
     assert_eq!(refusals.load(Ordering::SeqCst), 5);
-    fs::remove_dir_all(dir).unwrap();
+    let _ = fs::remove_dir_all(dir);
 }
 
 #[test]
@@ -741,7 +757,7 @@ fn a_caller_cancellation_stops_the_download_and_keeps_retained_bytes() {
         "retained bytes were fetched again"
     );
     assert!(origin.requested() > asked);
-    fs::remove_dir_all(dir).unwrap();
+    let _ = fs::remove_dir_all(dir);
 }
 
 fn pushed_store(name: &str) -> (std::path::PathBuf, Store, ObjectRef) {
@@ -791,7 +807,7 @@ fn a_push_whose_store_goes_silent_after_the_body_is_judged_not_waited_on() {
         "{:?}",
         started.elapsed()
     );
-    fs::remove_dir_all(dir).unwrap();
+    let _ = fs::remove_dir_all(dir);
 }
 
 #[test]
@@ -820,7 +836,7 @@ fn a_push_told_to_wait_waits_and_then_lands() {
     assert_eq!(pushed.http_status, 200);
     assert_eq!(origin.puts.load(Ordering::Relaxed), 5);
     assert!(started.elapsed() >= Duration::from_secs(4));
-    fs::remove_dir_all(dir).unwrap();
+    let _ = fs::remove_dir_all(dir);
 }
 
 #[test]
@@ -842,23 +858,9 @@ fn concurrent_admissions_queue_instead_of_refusing() {
             });
         }
     });
-    fs::remove_dir_all(dir).unwrap();
+    let _ = fs::remove_dir_all(dir);
 }
 
-/// Peak resident memory since `/proc/self/clear_refs` was last reset, in bytes.
-fn peak_resident() -> u64 {
-    let status = fs::read_to_string("/proc/self/status").unwrap();
-    let kib: u64 = status
-        .lines()
-        .find_map(|line| line.strip_prefix("VmHWM:"))
-        .unwrap()
-        .trim()
-        .trim_end_matches("kB")
-        .trim()
-        .parse()
-        .unwrap();
-    kib * 1024
-}
 
 /// Run one `*_child` test of this binary in its own process, optionally inside `scope`.
 fn run_child(test: &str, dir: &std::path::Path, scope: &[&str]) -> std::process::Output {
@@ -883,20 +885,15 @@ fn push_memory_child() {
     let Some(dir) = std::env::var_os("TFS_DOWNLOAD_CHILD") else {
         return;
     };
-    let store = Store::init(std::path::Path::new(&dir)).unwrap();
-    let objects: Vec<ObjectRef> = (0..16u64)
-        .map(|seed| {
-            let bytes = body(300 + seed, 16 * MIB);
-            let object = ObjectRef::of(&bytes);
-            store
-                .put_stream(&mut bytes.as_slice(), Some(&object), &Fault::default())
-                .unwrap();
-            object
-        })
+    // The objects were made by the parent: this process's peak is the pushes' alone.
+    let store = Store::open(std::path::Path::new(&dir)).unwrap();
+    let objects: Vec<ObjectRef> = fs::read_to_string(std::path::Path::new(&dir).with_extension("objects"))
+        .unwrap()
+        .lines()
+        .map(|hex| ObjectRef { sha256: hex.into(), length: 16 * MIB as u64 })
         .collect();
     let origin = Origin::start(vec![], 0, |_, _| Act::Serve);
-    // Forget the objects' construction; measure only the pushes.
-    fs::write("/proc/self/clear_refs", "5").unwrap();
+    let peak_resident = || tensorfs_core::platform::process::peak_resident().unwrap();
     let before = peak_resident();
     thread::scope(|scope| {
         for object in &objects {
@@ -928,6 +925,19 @@ fn push_memory_child() {
 #[test]
 fn sixteen_concurrent_pushes_hold_stream_buffers_not_objects() {
     let dir = root("push-memory");
+    let store = Store::init(&dir).unwrap();
+    let objects: Vec<String> = (0..16u64)
+        .map(|seed| {
+            let bytes = body(300 + seed, 16 * MIB);
+            let object = ObjectRef::of(&bytes);
+            store
+                .put_stream(&mut bytes.as_slice(), Some(&object), &Fault::default())
+                .unwrap();
+            object.sha256
+        })
+        .collect();
+    drop(store);
+    fs::write(dir.with_extension("objects"), objects.join("\n")).unwrap();
     let output = run_child("push_memory_child", &dir, &[]);
     let text = String::from_utf8_lossy(&output.stdout).to_string()
         + &String::from_utf8_lossy(&output.stderr);
@@ -936,7 +946,8 @@ fn sixteen_concurrent_pushes_hold_stream_buffers_not_objects() {
         "{}",
         text.lines().find(|line| line.contains("PUSHED")).unwrap()
     );
-    fs::remove_dir_all(dir).unwrap();
+    fs::remove_file(dir.with_extension("objects")).unwrap();
+    let _ = fs::remove_dir_all(dir);
 }
 
 #[test]
@@ -1037,6 +1048,6 @@ fn throughput() {
             origin.asks.load(Ordering::Relaxed),
             origin.connections.load(Ordering::Relaxed),
         );
-        fs::remove_dir_all(dir).unwrap();
+        let _ = fs::remove_dir_all(dir);
     }
 }

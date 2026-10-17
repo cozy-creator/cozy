@@ -222,7 +222,7 @@ fn role_interruption_epoch_fence_gc_and_empty_store_recovery_match_clean_commit(
     dispose(&store, &meta, &id).unwrap();
     crate::gc::collect(store.root(), false).unwrap();
     assert!(!store.contains(&payload.sha256) && !store.contains(&head.sha256));
-    std::fs::remove_dir_all(store.root()).unwrap();
+    let _ = std::fs::remove_dir_all(store.root());
 }
 
 #[test]
@@ -289,7 +289,7 @@ fn checkpoint_cursor_extends_without_ack_and_refuses_forks_or_other_slots() {
     abandon(&store, &meta, &id).unwrap();
     crate::gc::collect(store.root(), false).unwrap();
     assert!(!store.contains(&second.head.unwrap().sha256));
-    std::fs::remove_dir_all(store.root()).unwrap();
+    let _ = std::fs::remove_dir_all(store.root());
 }
 
 #[test]
@@ -346,7 +346,7 @@ fn missing_corrupt_and_changed_work_cannot_be_reused() {
         fence(&meta, &id, 2).unwrap();
         release(&meta, resumed);
         abandon(&store, &meta, &id).unwrap();
-        std::fs::remove_dir_all(store.root()).unwrap();
+        let _ = std::fs::remove_dir_all(store.root());
     }
 }
 
@@ -394,7 +394,7 @@ fn recovery_discards_old_writer_authority_and_malformed_part_geometry() {
         release(&meta, writer);
     }
     abandon(&store, &meta, &id).unwrap();
-    std::fs::remove_dir_all(store.root()).unwrap();
+    let _ = std::fs::remove_dir_all(store.root());
 }
 
 #[test]
@@ -495,7 +495,7 @@ fn source_identity_is_locked_and_source_closure_stays_rooted_after_writer_death(
     abandon(&store, &meta, &id).unwrap();
     crate::gc::collect(store.root(), false).unwrap();
     assert!(!store.contains(&payload.sha256));
-    std::fs::remove_dir_all(store.root()).unwrap();
+    let _ = std::fs::remove_dir_all(store.root());
 }
 
 #[test]
@@ -546,7 +546,7 @@ fn wrong_document_lengths_refuse_to_validate_and_are_discarded_on_resume() {
     release(&meta, writer);
     release(&meta, next);
     abandon(&store, &meta, &id).unwrap();
-    std::fs::remove_dir_all(store.root()).unwrap();
+    let _ = std::fs::remove_dir_all(store.root());
 }
 
 #[test]
@@ -739,8 +739,8 @@ fn restored_inherited_source_custody_survives_origin_release_and_writer_restart(
     assert!(!restored.contains(&added.sha256));
     assert!(!restored.contains(&source_part.part.segments()[0].sha256));
     abandon(&store, &meta, &id).unwrap();
-    std::fs::remove_dir_all(store.root()).unwrap();
-    std::fs::remove_dir_all(restored.root()).unwrap();
+    let _ = std::fs::remove_dir_all(store.root());
+    let _ = std::fs::remove_dir_all(restored.root());
 }
 
 #[test]
@@ -830,7 +830,7 @@ fn per_tensor_checkpoints_retain_linear_metadata() {
     fence(&meta, &id, 1).unwrap();
     release(&meta, writer);
     abandon(&store, &meta, &id).unwrap();
-    std::fs::remove_dir_all(store.root()).unwrap();
+    let _ = std::fs::remove_dir_all(store.root());
 }
 
 #[test]
@@ -924,7 +924,7 @@ fn source_free_restore_holds_survive_gc_until_begin_or_explicit_abandon() {
     assert!(!target.contains(&late.sha256));
     fence(&source_meta, &id, 1).unwrap();
     release(&source_meta, writer);
-    std::fs::remove_dir_all(source.root()).unwrap();
+    let _ = std::fs::remove_dir_all(source.root());
 }
 
 /// Opt-in generated-data profile. Payloads are tiny so metadata scaling is visible.
@@ -1015,7 +1015,7 @@ fn profile_derived_transaction_scaling() {
         eprintln!("PROFILE {{\"keys\":{keys},\"histories\":{histories},\"writes\":{writes},\"row_bytes\":{row_bytes},\"fence20_ms\":{fence_ms:.3},\"add_ms\":{part_ms:.3},\"checkpoint_ms\":{checkpoint_ms:.3}}}");
         fence(&meta, &id, 1).unwrap();
         release(&meta, writer);
-        std::fs::remove_dir_all(store.root()).unwrap();
+        let _ = std::fs::remove_dir_all(store.root());
     }
 }
 
@@ -1085,5 +1085,5 @@ fn named_writer_operations_leave_other_rows_and_writer_lock_alone() {
     fence(&meta, &second_id, 1).unwrap();
     release(&meta, resumed);
     release(&meta, second);
-    std::fs::remove_dir_all(store.root()).unwrap();
+    let _ = std::fs::remove_dir_all(store.root());
 }

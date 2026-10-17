@@ -4,8 +4,8 @@
 //! ~114 MB/s, so that was a 400 GB ceiling on any input, SIGKILL mid-write, and the retry
 //! hit the same wall (xs-007 row 4). No duration here is a verdict. The worker announces
 //! every chunk the store moves on its stdout (`progress\t<moved>\t<admitted>`, see
-//! `ingest::Reporter`), and on Linux its CPU clock and scheduler state are readable in
-//! `/proc/<pid>/stat`; the two windows below are derived from those observations.
+//! `ingest::Reporter`), and its CPU clock and scheduler state are readable through
+//! `platform::process::usage`; the two windows below are derived from those observations.
 //!
 //! **patience** — how long the progress channel may be silent before the parent looks
 //! harder: `PATIENCE_FACTOR` × the longest silence between two records this run has itself
@@ -73,23 +73,17 @@ enum Event {
     Line(String),
 }
 
-/// One look at `/proc/<pid>/stat`: CPU ticks consumed and the scheduler state letter.
+/// One look at the worker: CPU it has used and whether it is running or in I/O now.
 struct Reading {
     ticks: u64,
     state: char,
 }
 
 fn read_proc(pid: u32) -> Option<Reading> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    // Everything after the parenthesised comm, which may itself hold spaces.
-    let rest = &stat[stat.rfind(')')? + 1..];
-    let fields: Vec<&str> = rest.split_whitespace().collect();
-    let state = fields.first()?.chars().next()?;
-    let utime: u64 = fields.get(11)?.parse().ok()?;
-    let stime: u64 = fields.get(12)?.parse().ok()?;
+    let usage = tensorfs_core::platform::process::usage(pid).ok()?;
     Some(Reading {
-        ticks: utime + stime,
-        state,
+        ticks: usage.cpu,
+        state: if usage.running { 'R' } else { 'S' },
     })
 }
 

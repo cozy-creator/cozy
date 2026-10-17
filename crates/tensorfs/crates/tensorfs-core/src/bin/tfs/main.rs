@@ -428,14 +428,8 @@ fn cmd_reap(root: &Path) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn rss_kb(field: &str) -> u64 {
-    fs::read_to_string("/proc/self/status")
-        .unwrap_or_default()
-        .lines()
-        .find(|line| line.starts_with(field))
-        .and_then(|line| line.split_whitespace().nth(1))
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(0)
+fn peak_rss_kb() -> u64 {
+    tensorfs_core::platform::process::peak_resident().map_or(0, |bytes| bytes / 1024)
 }
 
 

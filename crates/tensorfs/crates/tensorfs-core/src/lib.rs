@@ -1,7 +1,8 @@
 //! tensorfs-core — canonical documents, tensor rules, the fit function, and the encoding
 //! registry (tfs-013). See tracker-v2/cozytensors.md and tensorfs.md.
 
-#![forbid(unsafe_code)]
+// Unsafe code lives only in `platform`, the OS seam.
+#![deny(unsafe_code)]
 
 pub mod b64;
 #[cfg(feature = "store")]
@@ -50,6 +51,8 @@ pub mod jcs;
 pub mod limits;
 pub mod machine;
 pub mod manifest;
+#[allow(unsafe_code)]
+pub mod platform;
 #[cfg(feature = "store")]
 pub mod meta;
 #[cfg(feature = "store")]

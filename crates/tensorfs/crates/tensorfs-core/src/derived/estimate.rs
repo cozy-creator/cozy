@@ -155,7 +155,7 @@ mod tests {
         let writer = begin(&store, &meta, &id, 1, declaration, None).unwrap();
         fence(&meta, &id, 1).unwrap();
         release(&meta, writer);
-        std::fs::remove_dir_all(store.root()).unwrap();
+        let _ = std::fs::remove_dir_all(store.root());
     }
 
     #[test]
@@ -239,7 +239,7 @@ mod tests {
         .unwrap();
         commit(&store, &meta, &id, 2).unwrap();
         release(&meta, resumed);
-        std::fs::remove_dir_all(store.root()).unwrap();
+        let _ = std::fs::remove_dir_all(store.root());
     }
 
     #[test]
@@ -282,7 +282,7 @@ mod tests {
             original.manifest
         );
         release(&meta, target_writer);
-        std::fs::remove_dir_all(store.root()).unwrap();
+        let _ = std::fs::remove_dir_all(store.root());
     }
 
     #[test]
@@ -304,6 +304,6 @@ mod tests {
         assert!(estimate_write(&store, &meta, &id, 2, declaration, Some(&absent)).is_err());
         assert_eq!(meta.derived_rows().unwrap(), before);
         crate::gc::collect(store.root(), false).unwrap();
-        std::fs::remove_dir_all(store.root()).unwrap();
+        let _ = std::fs::remove_dir_all(store.root());
     }
 }

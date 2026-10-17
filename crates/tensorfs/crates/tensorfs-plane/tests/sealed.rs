@@ -1,6 +1,7 @@
 //! Sealed host layouts on the real code path: the owner (the machine) fills one through the
 //! verified read path and seals it; host-only planes (executors, no GPU) adopt it read-only.
 //! Every check reads bytes back or asks the kernel.
+#![cfg(target_os = "linux")] // The host tier (memfd, seals, OFD locks) is Linux-only.
 
 mod common;
 

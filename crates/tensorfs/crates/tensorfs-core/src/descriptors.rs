@@ -22,29 +22,15 @@ static EXHAUSTED: AtomicU64 = AtomicU64::new(0);
 /// Raise the soft RLIMIT_NOFILE to the hard limit, once per process. Idempotent; a refused
 /// raise leaves the limit where it was and the budget below measures that.
 pub fn raise() {
-    RAISE.call_once(|| {
-        use rustix::process::{getrlimit, setrlimit, Resource, Rlimit};
-        let limit = getrlimit(Resource::Nofile);
-        if let (Some(soft), Some(hard)) = (limit.current, limit.maximum) {
-            if soft < hard {
-                let _ = setrlimit(
-                    Resource::Nofile,
-                    Rlimit {
-                        current: Some(hard),
-                        maximum: Some(hard),
-                    },
-                );
-            }
-        }
-    });
+    RAISE.call_once(crate::platform::process::raise_fd_limit);
 }
 
 /// Descriptors this process can still open now: soft limit less those open and `MARGIN`.
-/// `None` when the platform cannot say (no `/proc`, or no soft limit).
+/// `None` when the platform cannot say (no descriptor table to count, or no soft limit).
 pub fn available() -> Option<u64> {
-    let soft = rustix::process::getrlimit(rustix::process::Resource::Nofile).current?;
-    let open = match std::fs::read_dir("/proc/self/fd") {
-        Ok(open) => open.count() as u64,
+    let soft = crate::platform::process::fd_limit()?;
+    let open = match crate::platform::process::open_fds().map_err(std::io::Error::from) {
+        Ok(open) => open,
         // Counting takes a descriptor too: a table too full to count is full.
         Err(error) if full(&error) => return Some(0),
         Err(_) => return None,
@@ -53,19 +39,14 @@ pub fn available() -> Option<u64> {
 }
 
 fn full(error: &std::io::Error) -> bool {
-    matches!(
-        error.raw_os_error(),
-        Some(code) if code == rustix::io::Errno::MFILE.raw_os_error()
-            || code == rustix::io::Errno::NFILE.raw_os_error()
-    )
+    crate::platform::process::fd_table_full(error)
 }
 
 /// Requests in flight the raised descriptor limit holds, at most `wanted`: a budget sized once
 /// from the limit, not from what happens to be free.
 pub fn requests(wanted: usize) -> usize {
     raise();
-    let soft = rustix::process::getrlimit(rustix::process::Resource::Nofile).current;
-    soft.map_or(wanted, |soft| {
+    crate::platform::process::fd_limit().map_or(wanted, |soft| {
         usize::try_from(soft.saturating_sub(MARGIN) / PER_REQUEST).unwrap_or(usize::MAX)
     })
     .clamp(1, wanted)
@@ -81,25 +62,13 @@ pub fn exhausted(error: &std::io::Error) -> bool {
     full
 }
 
+/// Count a full table a caller learnt of without an error to hand (SQLite's "unable to open").
+pub fn exhaustion() {
+    EXHAUSTED.fetch_add(1, Ordering::Relaxed);
+}
+
 /// How many times this process has found its descriptor table full. A caller diffs two
 /// reads around its own work.
 pub fn exhaustions() -> u64 {
     EXHAUSTED.load(Ordering::Relaxed)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn only_a_full_table_counts_as_exhaustion() {
-        let before = exhaustions();
-        assert!(exhausted(&std::io::Error::from_raw_os_error(
-            rustix::io::Errno::MFILE.raw_os_error()
-        )));
-        assert!(!exhausted(&std::io::Error::from_raw_os_error(
-            rustix::io::Errno::CONNREFUSED.raw_os_error()
-        )));
-        assert!(exhaustions() > before);
-    }
 }

@@ -1,5 +1,5 @@
 use std::fs;
-use std::os::unix::fs::symlink;
+use tensorfs_core::platform::durable::symlink;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -78,7 +78,7 @@ fn ensure_initializes_only_absent_or_empty_real_roots() {
 
     let corrupt_catalog = root.join("corrupt-catalog");
     Store::init(&corrupt_catalog).unwrap();
-    fs::remove_dir_all(corrupt_catalog.join("tmp")).unwrap();
+    let _ = fs::remove_dir_all(corrupt_catalog.join("tmp"));
     let connection = rusqlite::Connection::open(corrupt_catalog.join("tensorfs.sqlite")).unwrap();
     connection
         .execute_batch("ALTER TABLE tensorfs_verified_blobs DROP COLUMN mtime_ns")
@@ -110,14 +110,14 @@ fn ensure_initializes_only_absent_or_empty_real_roots() {
         let outside = root.join(format!("outside-{namespace}"));
         fs::create_dir(&outside).unwrap();
         fs::remove_dir(store_root.join(namespace)).unwrap();
-        symlink(&outside, store_root.join(namespace)).unwrap();
+        symlink(&outside, &store_root.join(namespace)).unwrap();
         assert_eq!(
             Store::ensure(&store_root).unwrap_err().code,
             Code::STORE_ERA
         );
         assert_eq!(Store::open(&store_root).unwrap_err().code, Code::STORE_ERA);
     }
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 // Run this arm as root as well as in the ordinary suite. Separate CLI processes

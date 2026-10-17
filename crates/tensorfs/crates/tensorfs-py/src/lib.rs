@@ -10,6 +10,7 @@
 
 mod docs;
 mod errors;
+#[cfg_attr(windows, path = "plane_windows.rs")]
 mod plane;
 mod readplan;
 #[cfg(feature = "store")]
@@ -18,7 +19,6 @@ mod serve;
 mod store;
 
 use pyo3::prelude::*;
-use tensorfs_core::err::{refuse, Code, Result as TResult};
 
 fn python_distribution_version() -> String {
     let cargo_version = env!("CARGO_PKG_VERSION");
@@ -28,46 +28,9 @@ fn python_distribution_version() -> String {
     format!("{release}.dev{development}")
 }
 
-/// The supported platforms, checked against the platform the interpreter reports.
-///
-/// Windows has no `fcntl`, and this store's hold liveness IS an OS fact — an exclusive lock
-/// the kernel drops when the owner dies, SIGKILL included (tfs-006). A Windows build without
-/// that replacement would have to fall back to a wall clock, which is exactly the v1 defect
-/// that stranded roots forever. So the import refuses and names the supported set, rather
-/// than importing into a store whose `Taken | Absent | Deferred` contract it cannot honour.
-///
-/// It is a FUNCTION taking the platform name so the refusal is observable from any platform
-/// (the test below): a gate nobody can fire is a gate nobody has checked.
-fn platform_gate(platform: &str) -> TResult<()> {
-    const SUPPORTED: &[&str] = &["linux", "darwin", "freebsd"];
-    if SUPPORTED.contains(&platform) {
-        return Ok(());
-    }
-    refuse(
-        Code::PLATFORM_UNSUPPORTED,
-        format!(
-            "{platform:?} is not supported: hold liveness is an advisory-lock fact the kernel \
-             releases on process death, and the POSIX-lock replacement has not landed. \
-             Supported: {SUPPORTED:?}"
-        ),
-    )
-}
-
 #[pymodule]
 fn _ext(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    let py = m.py();
     errors::install(m)?;
-
-    // The gate runs at import, against the real platform.
-    let plat: String = py
-        .import("sys")?
-        .getattr("platform")?
-        .extract()
-        .unwrap_or_else(|_| "unknown".to_string());
-    let plat = plat
-        .trim_end_matches(|c: char| c.is_ascii_digit())
-        .to_string();
-    platform_gate(&plat).map_err(|e| errors::to_py(py, &e))?;
 
     m.add("__version__", python_distribution_version())?;
     // A plane-only build (no `store` feature) carries documents, headers, read plans, the fit
@@ -103,15 +66,4 @@ fn store_api(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<store::PyDerivedWriter>()?;
     m.add_class::<store::PyLease>()?;
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn the_platform_gate_refuses_an_unsupported_platform_by_name() {
-        assert!(super::platform_gate("linux").is_ok());
-        let refusal = super::platform_gate("win32").unwrap_err();
-        assert_eq!(refusal.code, tensorfs_core::err::Code::PLATFORM_UNSUPPORTED);
-        assert!(refusal.detail.contains("\"win32\""), "{}", refusal.detail);
-    }
 }

@@ -98,6 +98,8 @@ impl Origin {
                     }
                     Err(error) => panic!("accept: {error}"),
                 };
+                // BSD and Windows hand an accepted socket its listener's non-blocking mode.
+                socket.set_nonblocking(false).unwrap();
                 socket
                     .set_read_timeout(Some(Duration::from_secs(5)))
                     .unwrap();
@@ -229,7 +231,12 @@ fn ranged() -> Vec<(String, String)> {
     vec![("range".into(), "bytes=0-31".into())]
 }
 fn ask(client: &Client, checked: &CheckedUrl, headers: &[(String, String)]) -> Result<Vec<u8>> {
-    let ledger = Ledger::with_resolution(Duration::from_millis(10));
+    // Silence is no reuse test's subject: a slow runner's late answer is not a stall.
+    ask_at(client, checked, headers, Duration::from_millis(50))
+}
+
+fn ask_at(client: &Client, checked: &CheckedUrl, headers: &[(String, String)], resolution: Duration) -> Result<Vec<u8>> {
+    let ledger = Ledger::with_resolution(resolution);
     let response = request(
         client,
         checked,
@@ -516,10 +523,10 @@ fn tls_range_fixture_measures_setup_reuse_with_identical_bytes_and_requests() {
         let start = Instant::now();
         for index in 0..8 {
             headers[0].1 = format!("bytes={}-{}", index << 20, ((index + 1) << 20) - 1);
-            assert_eq!(
-                crate::sha256::digest(&ask(&client, &origin.checked("/object"), &headers).unwrap()),
-                digest
-            );
+            // Measures setup and reuse, not silence: a slow runner's debug-build handshake
+            // may not be judged stalled.
+            let body = ask_at(&client, &origin.checked("/object"), &headers, Duration::from_millis(100));
+            assert_eq!(crate::sha256::digest(&body.unwrap()), digest);
         }
         timings.push((close, start.elapsed().as_secs_f64(), origin.count()));
         assert_eq!(origin.count(), if close { 8 } else { 1 });
@@ -624,7 +631,7 @@ fn source_chunks_ask_the_redirect_target_on_one_connection() {
         assert_eq!(origin.count(), if close { 9 } else { 1 });
         timings.push((close, elapsed.as_secs_f64(), origin.count()));
         drop(store);
-        std::fs::remove_dir_all(root).unwrap();
+        let _ = std::fs::remove_dir_all(root);
     }
     println!("source 8 MiB, one redirect, eight 1 MiB chunks, 30 ms connection setup: {timings:?}");
 }

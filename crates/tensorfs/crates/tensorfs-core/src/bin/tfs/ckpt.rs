@@ -21,7 +21,7 @@ use tensorfs_core::sha256;
 use tensorfs_core::spec::EncodingSpec;
 use tensorfs_core::store::Store;
 
-use crate::{bail, flag_num, flag_on, rss_kb, Flags};
+use crate::{bail, flag_num, flag_on, peak_rss_kb, Flags};
 
 // ------------------------------------------------------------------ tensor bytes
 
@@ -381,7 +381,7 @@ pub fn cmd_write(root: &Path, f: &Flags) -> ExitCode {
         "  byte-identical dedup: {deduped} B ({:.1} MiB) already installed",
         deduped as f64 / (1024.0 * 1024.0)
     );
-    println!("  peak RSS {:.1} MiB", rss_kb("VmHWM") as f64 / 1024.0);
+    println!("  peak RSS {:.1} MiB", peak_rss_kb() as f64 / 1024.0);
     ExitCode::SUCCESS
 }
 

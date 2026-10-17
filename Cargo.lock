@@ -4167,7 +4167,6 @@ version = "0.10.0"
 dependencies = [
  "base64 0.22.1",
  "bytes",
- "fs2",
  "fuser",
  "futures",
  "http-body-util",
@@ -4185,9 +4184,11 @@ dependencies = [
  "serde_json",
  "serde_json_canonicalizer 0.3.2",
  "sha2",
+ "thiserror 2.0.21",
  "tokio",
  "tokio-rustls",
  "webpki-roots 0.26.11",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

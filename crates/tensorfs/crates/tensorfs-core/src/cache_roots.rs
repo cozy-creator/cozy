@@ -4,7 +4,7 @@
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
+use crate::platform::durable::Mode;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
@@ -244,7 +244,10 @@ mod tests {
         assert!(!held(&cold) && held(&warm));
         // Using a root moves it behind the others.
         let (fresh, fresh_manifest) = f.model("fresh", b"pulled last, used first", true);
+        // Last used two days ago, by its receipt and its repository alike (a tie in seconds
+        // with the fresh root's use would leave the order to chance).
         age(&path(&f.store, &warm), 2);
+        age(&f.store.repository_path(&warm), 2);
         age(&path(&f.store, &fresh), 5);
         age(&f.store.repository_path(&fresh), 5);
         crate::gc::used(root, &[format!("sha256:{}", fresh_manifest.sha256)]).unwrap();

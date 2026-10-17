@@ -13,18 +13,18 @@ required-features = ["store"]
 # The store, downloader, ingest, GC and everything that opens one. Without it: documents,
 # headers, read plans and the fit function only (what a plane-only executor links).
 default = ["store"]
-store = ["dep:fs2", "dep:rusqlite", "dep:rustix", "dep:rustls", "dep:webpki-roots", "dep:nix", "dep:ring", "dep:tokio", "dep:tokio-rustls", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:bytes", "dep:futures"]
+store = ["dep:rusqlite", "dep:rustix", "dep:rustls", "dep:webpki-roots", "dep:nix", "dep:ring", "dep:tokio", "dep:tokio-rustls", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:bytes", "dep:futures"]
 
 [dependencies]
 base64.workspace = true
-fs2 = { workspace = true, optional = true }
 minicbor = { version = "2.3.0", default-features = false, features = ["alloc"] }
 rusqlite = { workspace = true, features = ["fallible_uint"], optional = true }
 serde.workspace = true
 serde_json = { workspace = true, features = ["float_roundtrip"] }
 serde_json_canonicalizer.workspace = true
 sha2.workspace = true
-rustix = { version = "1.1.4", default-features = false, features = ["fs", "std", "net", "event", "process"], optional = true }
+thiserror.workspace = true
+rustix = { version = "1.1.4", default-features = false, features = ["std", "net", "event"], optional = true }
 # tfs-049: the ONE transport (src/transport/). rustls is the one TLS stack, used only
 # there; scripts/fence.py refuses it anywhere else so a second mover cannot grow.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
@@ -41,8 +41,15 @@ http-body-util = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
 futures = { version = "0.3.31", default-features = false, features = ["std", "executor"], optional = true }
 
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+rustix = { version = "1.1.4", default-features = false, features = ["fs", "process"], optional = true }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { workspace = true, features = ["fs", "user"], optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Wdk_System_SystemInformation", "Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_ProcessStatus", "Win32_System_Threading"] }
 
 [dev-dependencies]
 libc.workspace = true

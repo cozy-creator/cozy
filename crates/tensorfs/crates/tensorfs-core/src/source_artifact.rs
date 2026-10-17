@@ -10,12 +10,10 @@ use crate::{
     storage::HeldKey,
     store::{Fault, Store},
 };
-use fs2::FileExt;
 use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
     io::{Read, Write},
-    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
 };
 
@@ -114,7 +112,7 @@ fn lock(store: &Store) -> Result<File> {
         .truncate(false)
         .open(directory(store).join("lock"))
         .map_err(io)?;
-    file.lock_exclusive().map_err(io)?;
+    file.lock().map_err(io)?;
     Ok(file)
 }
 pub fn read(store: &Store, owner: &str) -> Result<Option<TreeRoot>> {
@@ -196,7 +194,7 @@ impl<'a> Writer<'a> {
             .truncate(false)
             .open(path(store, owner)?.with_extension("lock"))
             .map_err(io)?;
-        owner_lock.try_lock_exclusive().map_err(|_| Refusal {
+        owner_lock.try_lock().map_err(|_| Refusal {
             code: Code::STORE_BUSY,
             detail: "source owner already has a live writer".into(),
         })?;
@@ -344,10 +342,8 @@ pub(crate) fn import_member(
     if !fs::symlink_metadata(path).map_err(io)?.is_file() {
         return refuse(Code::WRONG_TYPE, "import member must be a regular file");
     }
-    let mut file = OpenOptions::new()
-        .read(true)
-        .custom_flags(crate::store::O_NOFOLLOW)
-        .open(path)
+    let mut file = crate::platform::durable::open_nofollow(&path, OpenOptions::new().read(true))
+        .map_err(std::io::Error::from)
         .map_err(io)?;
     if !file.metadata().map_err(io)?.is_file() {
         return refuse(Code::WRONG_TYPE, "import member must be a regular file");
@@ -411,7 +407,7 @@ pub fn release(store: &Store, owner: &str) -> Result<()> {
         .truncate(false)
         .open(path(store, owner)?.with_extension("lock"))
         .map_err(io)?;
-    file.try_lock_exclusive().map_err(|_| Refusal {
+    file.try_lock().map_err(|_| Refusal {
         code: Code::STORE_BUSY,
         detail: "source writer must stop before release".into(),
     })?;
@@ -642,7 +638,7 @@ pub fn release_retention(
         .truncate(false)
         .open(path(store, owner)?.with_extension("lock"))
         .map_err(io)?;
-    file.try_lock_exclusive().map_err(|_| Refusal {
+    file.try_lock().map_err(|_| Refusal {
         code: Code::STORE_BUSY,
         detail: "source writer must stop before recipient release".into(),
     })?;

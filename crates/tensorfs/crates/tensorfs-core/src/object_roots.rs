@@ -2,14 +2,13 @@
 //! survive process death and retain bytes through every store GC tier.
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 
 use crate::catalog::WriterGuard;
 use crate::err::{refuse, Code, Refusal, Result};
 use crate::ids::{hex64, ObjectRef};
 use crate::storage::HeldKey;
-use crate::store::{Store, O_NOFOLLOW};
+use crate::store::Store;
 
 fn io(error: std::io::Error) -> Refusal {
     crate::store::classify_io("object root", error)
@@ -64,10 +63,8 @@ pub fn retain(store: &Store, object: &ObjectRef) -> Result<()> {
 }
 
 pub fn get(store: &Store, sha256: &str) -> Result<Option<ObjectRef>> {
-    let file = match OpenOptions::new()
-        .read(true)
-        .custom_flags(O_NOFOLLOW)
-        .open(path(store, sha256)?)
+    let file = match crate::platform::durable::open_nofollow(&path(store, sha256)?, OpenOptions::new().read(true))
+        .map_err(std::io::Error::from)
     {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -158,7 +155,7 @@ mod tests {
         assert!(remove(&store, &object.sha256).unwrap());
         crate::gc::collect(&root, false).unwrap();
         assert!(!store.object_path(&object.sha256).exists());
-        fs::remove_dir_all(root).unwrap();
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -193,7 +190,7 @@ mod tests {
             retain(&store, &wrong).unwrap_err().code,
             Code::LENGTH_MISMATCH
         );
-        fs::remove_dir_all(root).unwrap();
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -233,6 +230,6 @@ mod tests {
         let object = ObjectRef::of(b"rooted before journal acknowledgment");
         assert!(store.object_path(&object.sha256).is_file());
         assert_eq!(get(&store, &object.sha256).unwrap(), Some(object));
-        fs::remove_dir_all(root).unwrap();
+        let _ = fs::remove_dir_all(root);
     }
 }

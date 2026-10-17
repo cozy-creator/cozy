@@ -22,7 +22,7 @@ use crate::fetch::{Access, Fetcher, Priority, Ticket};
 use crate::store::Store;
 use crate::transport::PullCancellation;
 use std::io::{self, Read, Write};
-use std::os::unix::net::UnixStream;
+use crate::platform::ipc::LocalStream;
 use std::sync::{Arc, Mutex};
 
 const JSON: u8 = 0;
@@ -320,7 +320,7 @@ pub struct Hooks<'a> {
 /// Serve one prebound writer until its commit, fence or peer loss, then fence what is live.
 pub fn serve_derived(
     writer: &Writer,
-    stream: UnixStream,
+    stream: LocalStream,
     operation: &str,
     slot: &str,
     mut checkpoint: Option<ObjectRef>,
@@ -455,7 +455,7 @@ pub fn serve_derived(
 }
 
 /// A completed output's receipt for an executor that reopens it (a resumed attempt).
-pub fn serve_derived_replay(receipt: &ReceiptFacts, stream: UnixStream, hooks: &Hooks) -> Result<()> {
+pub fn serve_derived_replay(receipt: &ReceiptFacts, stream: LocalStream, hooks: &Hooks) -> Result<()> {
     let mut channel = Channel(stream);
     let served = (|| -> Result<()> {
         let Some(Frame::Json(request)) = channel.receive()? else {
@@ -483,7 +483,7 @@ pub fn serve_source(
     store: &Store,
     meta: &Meta,
     source: &ObjectRef,
-    stream: UnixStream,
+    stream: LocalStream,
     check_current: &(dyn Fn() -> Result<()> + Sync),
     fetch: Option<&Fetching>,
 ) -> Result<()> {
@@ -731,7 +731,7 @@ pub(crate) enum Frame {
     Bytes(Vec<u8>),
 }
 
-pub(crate) struct Channel(pub(crate) UnixStream);
+pub(crate) struct Channel(pub(crate) LocalStream);
 
 impl Channel {
     fn write(&mut self, kind: u8, body: &[u8]) -> Result<()> {
@@ -944,7 +944,7 @@ mod source_channel_tests {
         .unwrap();
         let receipt = super::super::commit(&store, &meta, &transaction, 1).unwrap();
         drop(begun);
-        let (client, server) = UnixStream::pair().unwrap();
+        let (client, server) = crate::platform::ipc::pair().unwrap();
         std::thread::scope(|scope| {
             let held =
                 scope.spawn(|| serve_source(&store, &meta, &receipt.manifest, server, &|| Ok(()), None));
@@ -1084,7 +1084,7 @@ mod source_channel_tests {
         assert_eq!(gets(), 1);
         drop(writer);
         std::fs::remove_file(store.object_path(&absent.sha256)).unwrap();
-        let (client, server) = UnixStream::pair().unwrap();
+        let (client, server) = crate::platform::ipc::pair().unwrap();
         std::thread::scope(|scope| {
             let served = scope.spawn(|| serve_source(&store, &meta, &output, server, &|| Ok(()), Some(&fetch)));
             let mut client = Channel(client);

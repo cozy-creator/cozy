@@ -14,11 +14,10 @@ use crate::fetch::{DeliveryGrant, FetchPlan};
 use crate::ids::{prefixed, ObjectRef};
 use crate::sha256::{hex, Sha256};
 use crate::store::{Fault, Store};
-use fs2::FileExt;
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::unix::fs::{FileExt as _, MetadataExt};
+use crate::platform::durable::FileAt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -53,7 +52,7 @@ pub(crate) struct SourceJob {
     pub url: String,
 }
 
-fn io(error: std::io::Error) -> Refusal {
+fn io(error: impl Into<std::io::Error>) -> Refusal {
     crate::store::classify_io("source download", error)
 }
 
@@ -143,7 +142,7 @@ impl Part {
             .truncate(false)
             .open(dir.join("lock"))
             .map_err(io)?;
-        lock.try_lock_exclusive().map_err(|_| Refusal {
+        lock.try_lock().map_err(|_| Refusal {
             code: Code::STORE_BUSY,
             detail: "this source object has a live writer".into(),
         })?;
@@ -202,7 +201,7 @@ impl Part {
         if created && writable {
             // Newly created ancestors are durable before any progress is acknowledged.
             for dir in dir.ancestors().take(4) {
-                File::open(dir).and_then(|f| f.sync_all()).map_err(io)?;
+                crate::platform::durable::sync_dir(dir).map_err(io)?;
             }
         }
         let part = Part {
@@ -268,10 +267,11 @@ impl Part {
         let mut record = self.record.lock().unwrap();
         let forgot = covered(&record.1);
         record.1.clear();
-        record
-            .0
-            .set_len(self.identity.len() as u64 + 1)
-            .and_then(|()| record.0.sync_data())
+        // Through a writing handle: Windows grants the appending record no truncation.
+        OpenOptions::new()
+            .write(true)
+            .open(self.dir.join("chunks"))
+            .and_then(|chunks| chunks.set_len(self.identity.len() as u64 + 1).and_then(|()| chunks.sync_data()))
             .and_then(|()| self.file.set_len(0))
             .map_err(io)?;
         Ok(forgot)
@@ -287,7 +287,7 @@ impl Part {
         }
         let temp = self.dir.join("chunks.tmp");
         fs::write(&temp, text)
-            .and_then(|()| File::open(&temp)?.sync_all())
+            .and_then(|()| Ok(crate::platform::durable::sync_file(&temp)?))
             .and_then(|()| fs::rename(&temp, self.dir.join("chunks")))
             .map_err(io)?;
         record.0 = OpenOptions::new()
@@ -391,7 +391,7 @@ pub(crate) fn fetch_sources(
 
 /// Allocated bytes: a sparse part holds only what its chunks wrote.
 fn allocated(md: &fs::Metadata) -> u64 {
-    md.len().min(md.blocks().saturating_mul(512))
+    crate::platform::durable::allocated(md)
 }
 
 pub(crate) fn discard_owner(store: &Store, owner: &str) -> Result<()> {
@@ -550,6 +550,6 @@ mod tests {
         assert_eq!(part.record(0, chunk, &Fault::default()).unwrap(), 0);
         assert_eq!(part.reset().unwrap(), object.length);
         assert_eq!(part.covered(), 0);
-        fs::remove_dir_all(dir).unwrap();
+        let _ = fs::remove_dir_all(dir);
     }
 }

@@ -2,7 +2,6 @@ use std::{
     fs,
     io::{Read, Write},
     net::{TcpListener, TcpStream},
-    os::unix::fs::MetadataExt,
     process::{Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -12,7 +11,7 @@ use std::{
     time::Duration,
 };
 use tensorfs_core::{
-    catalog::WriterGuard,
+    platform::durable::{self, FileId},
     gc,
     ids::{Doc, ObjectRef},
     providers::{self, Provenance, Resolution, ResolvedMember},
@@ -280,7 +279,7 @@ fn sigkill_resumes_only_verified_prefix_and_never_downloads_completed_objects() 
         let before = origin.asks.lock().unwrap().len();
         run(&store, &origin.url, &owner("producer"), Fault::default()).unwrap();
         assert_eq!(origin.asks.lock().unwrap().len(), before);
-        fs::remove_dir_all(dir).unwrap();
+        let _ = fs::remove_dir_all(dir);
     }
 }
 #[test]
@@ -321,7 +320,7 @@ fn tampered_chunks_restart_the_object_and_an_ignored_range_takes_it_whole() {
                 .unwrap(),
             bytes()
         );
-        fs::remove_dir_all(dir).unwrap();
+        let _ = fs::remove_dir_all(dir);
     }
 }
 #[test]
@@ -366,7 +365,7 @@ fn partial_adoption_survives_source_release_and_gc_and_disk_budget_counts_prefix
         store.occupancy().unwrap(),
         3 * BLOCK + 19 + tree.canonical_bytes().len() as u64
     );
-    fs::remove_dir_all(dir).unwrap();
+    let _ = fs::remove_dir_all(dir);
 }
 
 #[test]
@@ -410,7 +409,7 @@ fn expired_authority_and_transformed_responses_preserve_verified_identity_prefix
         let expected = BLOCK;
         assert_eq!(replacement.asks.lock().unwrap()[0], expected);
         assert_eq!(rows[0].transferred, 3 * BLOCK + 19 - expected);
-        fs::remove_dir_all(dir).unwrap();
+        let _ = fs::remove_dir_all(dir);
     }
 }
 
@@ -425,15 +424,13 @@ fn fresh_owner_after_admission(stage: &str, remove_cas: bool) {
         .join(&owner("producer")[7..])
         .join(&object.sha256);
     let before_state = fs::read(prefix.join("chunks")).unwrap();
-    let before_bytes = fs::metadata(prefix.join("bytes.part")).ok();
+    let part = prefix.join("bytes.part");
+    let facts = |metadata: fs::Metadata| (FileId::at(&part).unwrap(), metadata.len(), durable::mode(&metadata));
+    let before_bytes = fs::metadata(&part).ok().map(facts);
     if stage == "linked" {
-        assert_eq!(
-            before_bytes.as_ref().unwrap().ino(),
-            fs::metadata(store.object_path(&object.sha256))
-                .unwrap()
-                .ino()
-        );
-        assert_eq!(before_bytes.as_ref().unwrap().mode() & 0o222, 0);
+        let (id, _, mode) = before_bytes.unwrap();
+        assert_eq!(id, FileId::at(&store.object_path(&object.sha256)).unwrap());
+        assert!(mode.is_none_or(|mode| mode & 0o222 == 0));
     }
     if remove_cas {
         // The link existed before its directory fsync; simulate the surviving
@@ -456,11 +453,7 @@ fn fresh_owner_after_admission(stage: &str, remove_cas: bool) {
     );
     assert_eq!(fs::read(prefix.join("chunks")).unwrap(), before_state);
     if let Some(before) = before_bytes {
-        let after = fs::metadata(prefix.join("bytes.part")).unwrap();
-        assert_eq!(
-            (after.ino(), after.len(), after.mode()),
-            (before.ino(), before.len(), before.mode())
-        );
+        assert_eq!(facts(fs::metadata(&part).unwrap()), before);
         assert_eq!(fs::read(prefix.join("bytes.part")).unwrap(), bytes());
     } else {
         assert!(
@@ -484,7 +477,7 @@ fn fresh_owner_after_admission(stage: &str, remove_cas: bool) {
         store.read_range(&object.sha256, 0, object.length).unwrap(),
         bytes()
     );
-    fs::remove_dir_all(dir).unwrap();
+    let _ = fs::remove_dir_all(dir);
 }
 
 #[test]
@@ -510,15 +503,18 @@ fn fresh_owner_admits_readonly_prefix_without_cas_link() {
     fresh_owner_after_admission("linked", true);
 }
 
+/// fork(2) is Unix's.
+#[cfg(unix)]
 #[test]
 fn forked_descriptor_keeps_recovery_excluded_after_parent_guard_drop() {
+    use tensorfs_core::catalog::WriterGuard;
     let _process_fixture = PROCESS_FIXTURE.lock().unwrap();
     let dir = root();
     let _store = Store::init(&dir).unwrap();
     let writer = WriterGuard::acquire(&dir).unwrap();
     let mut signal = [0; 2];
     assert_eq!(
-        unsafe { libc::pipe2(signal.as_mut_ptr(), libc::O_CLOEXEC) },
+        unsafe { libc::pipe(signal.as_mut_ptr()) },
         0
     );
     let child = unsafe { libc::fork() };
@@ -549,5 +545,5 @@ fn forked_descriptor_keeps_recovery_excluded_after_parent_guard_drop() {
     assert_eq!(refused.code, tensorfs_core::err::Code::STORE_BUSY);
     assert!(refused.detail.contains("recovery lock shared"));
     gc::collect(&dir, false).unwrap();
-    fs::remove_dir_all(dir).unwrap();
+    let _ = fs::remove_dir_all(dir);
 }

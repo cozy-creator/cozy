@@ -5,12 +5,9 @@
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
-
-use fs2::FileExt;
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::err::{refuse, Code, Refusal, Result};
@@ -22,7 +19,7 @@ fn sql(what: impl AsRef<str>, error: rusqlite::Error) -> Refusal {
     crate::store::classify_sql(what, error)
 }
 
-fn io(what: impl AsRef<str>, error: std::io::Error) -> Refusal {
+fn io(what: impl AsRef<str>, error: impl Into<std::io::Error>) -> Refusal {
     crate::store::classify_io(what, error)
 }
 
@@ -73,14 +70,11 @@ fn canonical(root: &Path) -> PathBuf {
 }
 
 fn owner_file(root: &Path) -> Result<File> {
-    let lock = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .custom_flags(crate::store::O_NOFOLLOW | rustix::fs::OFlags::NONBLOCK.bits() as i32)
-        .open(root.join("owner.lock"))
-        .map_err(|error| io("open Store owner lock", error))?;
+    let lock = crate::platform::durable::open_nofollow(
+        &root.join("owner.lock"),
+        OpenOptions::new().read(true).write(true).create(true).truncate(false),
+    )
+    .map_err(|error| io("open Store owner lock", error))?;
     if !lock
         .metadata()
         .map_err(|error| io("stat Store owner lock", error))?
@@ -94,8 +88,8 @@ fn owner_file(root: &Path) -> Result<File> {
     Ok(lock)
 }
 
-fn owner_lock_error(error: std::io::Error) -> Refusal {
-    if error.kind() == std::io::ErrorKind::WouldBlock {
+fn owner_lock_error(error: std::fs::TryLockError) -> Refusal {
+    if matches!(error, std::fs::TryLockError::WouldBlock) {
         Refusal {
             code: Code::STORE_BUSY,
             detail: "this TensorFS store already has an owner or active collection".into(),
@@ -109,7 +103,7 @@ fn owner_lock_error(error: std::io::Error) -> Refusal {
 /// lock and has established a valid layout, so adding owner.lock cannot poison a new root.
 pub(crate) fn claim(root: &Path) -> Result<Arc<Owner>> {
     let lock = owner_file(root)?;
-    lock.try_lock_exclusive().map_err(owner_lock_error)?;
+    lock.try_lock().map_err(owner_lock_error)?;
     let owner = Arc::new(Owner {
         _lock: lock,
         gate: RwLock::default(),
@@ -146,7 +140,7 @@ impl OwnerGuard {
             return Ok(Self::Local { _owner: owner });
         }
         let file = owner_file(root)?;
-        FileExt::try_lock_shared(&file).map_err(owner_lock_error)?;
+        file.try_lock_shared().map_err(owner_lock_error)?;
         Ok(Self::Shared { _file: file })
     }
 }
@@ -380,7 +374,7 @@ impl Meta {
             .write(true)
             .open(&path)
             .map_err(|error| io("create lease marker", error))?;
-        file.try_lock_exclusive()
+        file.try_lock()
             .map_err(|error| io("lock lease marker", error))?;
         let recovery = File::options()
             .create(true)
@@ -389,7 +383,7 @@ impl Meta {
             .write(true)
             .open(&self.recovery_lock)
             .map_err(|error| io("open recovery lock", error))?;
-        FileExt::lock_shared(&recovery).map_err(|error| io("share recovery lock", error))?;
+        recovery.lock_shared().map_err(|error| io("share recovery lock", error))?;
 
         Ok(Hold {
             id,
@@ -439,7 +433,7 @@ impl Meta {
                 continue;
             };
             let dead = match File::options().read(true).write(true).open(&path) {
-                Ok(file) => file.try_lock_exclusive().is_ok(),
+                Ok(file) => file.try_lock().is_ok(),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
                 Err(error) => return Err(io("open lease marker", error)),
             };
@@ -730,7 +724,7 @@ mod setup_tests {
         Meta::open(&store).unwrap();
         assert_eq!(crate::catalog::connections_opened(&root) - opened, 1);
         drop(store);
-        fs::remove_dir_all(root).unwrap();
+        let _ = fs::remove_dir_all(root);
     }
 
     /// Opening Meta once its catalog has the part rows asks nothing of the writer lock: a
@@ -755,6 +749,6 @@ mod setup_tests {
             .unwrap();
         writer.execute_batch("ROLLBACK").unwrap();
         drop(store);
-        fs::remove_dir_all(root).unwrap();
+        let _ = fs::remove_dir_all(root);
     }
 }

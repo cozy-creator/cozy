@@ -664,7 +664,7 @@ mod tests {
         assert!(store.record_valid(&header.sha256).is_ok());
         let (plan, _) = FetchPlan::of(&store, "still-valid", &manifest, &[header]).unwrap();
         assert!(plan.wanted.is_empty());
-        fs::remove_dir_all(root).unwrap();
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -672,9 +672,7 @@ mod tests {
         let root = temporary("repair");
         let (store, manifest, header, manifest_bytes) = fixture(&root);
         let path = store.manifest_path(&manifest.sha256);
-        let mut permissions = fs::metadata(&path).unwrap().permissions();
-        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o644);
-        fs::set_permissions(&path, permissions).unwrap();
+        crate::platform::durable::set_mode(&path, 0o644).unwrap();
         fs::write(&path, vec![b'x'; manifest.length as usize]).unwrap();
 
         let (plan, why) =
@@ -937,9 +935,7 @@ mod object_set_tests {
             .put_stream(&mut bytes.as_slice(), Some(&object), &Fault::default())
             .unwrap();
         let path = store.blob_path(&object.sha256);
-        let mut permissions = fs::metadata(&path).unwrap().permissions();
-        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o644);
-        fs::set_permissions(&path, permissions).unwrap();
+        crate::platform::durable::set_mode(&path, 0o644).unwrap();
         fs::write(&path, vec![b'x'; bytes.len()]).unwrap();
 
         let (plan, why) =

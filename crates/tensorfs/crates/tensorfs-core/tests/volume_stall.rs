@@ -1,5 +1,6 @@
 //! A volume whose reads stop answering, through the real kernel path (FUSE): its own binary, so
-//! the threads counted are this test's alone.
+//! the threads counted are this test's alone. FUSE is Linux-only.
+#![cfg(target_os = "linux")]
 
 mod common;
 #[path = "common/fuse.rs"]

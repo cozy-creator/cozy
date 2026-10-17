@@ -109,7 +109,7 @@ fn companion_intent_resumes_and_published_checkpoint_checks_out_real_files() {
     crate::project::checkout(&store, &manifest, &out, true).unwrap();
     assert_eq!(std::fs::read(out.join("LICENSE")).unwrap(), d.files[0].1);
     assert_eq!(std::fs::read(out.join("Notice")).unwrap(), d.files[1].1);
-    std::fs::remove_dir_all(store.root()).unwrap();
+    let _ = std::fs::remove_dir_all(store.root());
 }
 
 #[test]
@@ -193,7 +193,7 @@ fn ordinary_companions_survive_derivation_without_copying_tensor_backing_files()
         companion_files(&d, &sources).unwrap()["LICENSE"],
         Entry::File(ObjectRef::of(b"explicit licence"))
     );
-    std::fs::remove_dir_all(store.root()).unwrap();
+    let _ = std::fs::remove_dir_all(store.root());
 }
 
 #[test]
@@ -237,7 +237,7 @@ fn a_verified_store_object_is_a_companion_by_reference_and_never_a_new_byte() {
     write_weight(&store, &meta, &next);
     assert!(commit(&store, &meta, &next, 1).is_err());
     release(&meta, writer);
-    std::fs::remove_dir_all(store.root()).unwrap();
+    let _ = std::fs::remove_dir_all(store.root());
 }
 
 #[test]
@@ -467,7 +467,7 @@ fn header_only_segmented_assets_survive_commit_adoption_and_gc_by_reference() {
             assert!(store.record_valid(&segment.sha256).is_err());
         }
     }
-    std::fs::remove_dir_all(store.root()).unwrap();
+    let _ = std::fs::remove_dir_all(store.root());
 }
 
 #[test]
@@ -562,7 +562,7 @@ fn inherited_assets_conflict_on_content_metadata_or_segments_and_allow_explicit_
         );
         assert_eq!(replaced.assets[1..], header.assets[1..]);
     }
-    std::fs::remove_dir_all(store.root()).unwrap();
+    let _ = std::fs::remove_dir_all(store.root());
 }
 
 #[test]
@@ -625,7 +625,7 @@ fn matching_manifest_companion_keeps_header_asset_metadata_and_empty_replacement
         .iter()
         .any(|(path, entry)| path == "tokenizer/merges.txt"
             && *entry == Entry::File(ObjectRef::of(&[]))));
-    std::fs::remove_dir_all(store.root()).unwrap();
+    let _ = std::fs::remove_dir_all(store.root());
 }
 
 #[test]
@@ -655,5 +655,5 @@ fn header_only_assets_share_companion_path_collision_rules() {
             "path {path}"
         );
     }
-    std::fs::remove_dir_all(store.root()).unwrap();
+    let _ = std::fs::remove_dir_all(store.root());
 }

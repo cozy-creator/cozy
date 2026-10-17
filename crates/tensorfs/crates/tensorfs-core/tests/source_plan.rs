@@ -3,6 +3,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// A carrier as the plan spells it: its canonical path, a JSON string (macOS's temp dir is
+/// behind the /var symlink, and Windows' paths escape their separators).
+fn quoted(path: &std::path::Path) -> String {
+    format!("{:?}", tensorfs_core::platform::durable::canonical(path).unwrap().display().to_string())
+}
+
 fn temporary(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
         "tensorfs-source-plan-{name}-{}-{}",
@@ -170,14 +176,9 @@ fn source_plan_maps_reviewed_multi_file_headers_independent_of_argument_order() 
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(text.contains(&format!(
-        r#""component":"encoder","path":{:?}"#,
-        first.display().to_string()
-    )));
-    assert!(text.contains(&format!(
-        r#""component":"decoder","path":{:?}"#,
-        second.display().to_string()
-    )));
+    // The plan names canonical paths (macOS's temp dir is behind the /var symlink).
+    assert!(text.contains(&format!(r#""component":"encoder","path":{}"#, quoted(&first))));
+    assert!(text.contains(&format!(r#""component":"decoder","path":{}"#, quoted(&second))));
     assert_eq!(text.matches(r#""projected":false"#).count(), 2);
     write_source_plan(&registry, &[&second, &first], &plan_path);
     assert!(Command::new(env!("CARGO_BIN_EXE_tfs"))
@@ -255,9 +256,9 @@ fn source_plan_selects_a_unique_reviewed_subset_from_provider_candidates() {
         String::from_utf8_lossy(&output.stderr)
     );
     let text = String::from_utf8(output.stdout).unwrap();
-    assert_eq!(text.matches(first.to_str().unwrap()).count(), 2);
-    assert_eq!(text.matches(second.to_str().unwrap()).count(), 2);
-    assert_eq!(text.matches(unrelated.to_str().unwrap()).count(), 1);
+    assert_eq!(text.matches(&quoted(&first)).count(), 2);
+    assert_eq!(text.matches(&quoted(&second)).count(), 2);
+    assert_eq!(text.matches(&quoted(&unrelated)).count(), 1);
     let _ = fs::remove_dir_all(root);
 }
 
@@ -312,7 +313,7 @@ fn reviewed_production_selects_one_named_profile_from_a_shared_source() {
     );
     let text = String::from_utf8(selected.stdout).unwrap();
     assert!(text.contains(r#""profile":"profile-b""#));
-    assert!(text.contains(second.to_str().unwrap()));
+    assert!(text.contains(&quoted(&second)));
     assert!(!text.contains(r#""component":"first""#));
 
     let absent = Command::new(env!("CARGO_BIN_EXE_tfs"))

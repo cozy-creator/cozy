@@ -1,7 +1,8 @@
 //! Run 1297 (2026-09-27): a pull growing toward 128 streams under a 1,024 soft
 //! RLIMIT_NOFILE ran out of descriptors mid-pull. This binary sets the limit itself and
 //! downloads whole checkpoints on the Store's Fetcher with as many requests as the table
-//! allows. Its own binary, because RLIMIT_NOFILE is process-wide.
+//! allows. Its own binary, because RLIMIT_NOFILE is process-wide. Windows has no such limit.
+#![cfg(unix)]
 mod common;
 
 use std::io::Read;
@@ -70,7 +71,8 @@ fn a_low_descriptor_limit_is_raised_and_a_full_table_is_backpressure() {
     set_limit(256, original.maximum);
     let before = tensorfs_core::descriptors::exhaustions();
     walk(&hub, &checkpoints[0]);
-    assert!(getrlimit(Resource::Nofile).current.unwrap() > 256, "the soft limit was not raised");
+    let raised = getrlimit(Resource::Nofile).current.unwrap();
+    assert!(raised > 256, "the soft limit was not raised");
     assert_eq!(tensorfs_core::descriptors::exhaustions(), before, "EMFILE after the raise");
 
     // The table shrinks under a running walk. The squeeze is driven by the walk's own
@@ -86,13 +88,13 @@ fn a_low_descriptor_limit_is_raised_and_a_full_table_is_backpressure() {
             while served() < start + 16 && !done.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(1));
             }
-            let open = std::fs::read_dir("/proc/self/fd").unwrap().count() as u64;
+            let open = tensorfs_core::platform::process::open_fds().unwrap();
             let pressed = tensorfs_core::descriptors::exhaustions();
             set_limit(open.saturating_sub(4), original.maximum);
             while tensorfs_core::descriptors::exhaustions() < pressed + 3 && !done.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(1));
             }
-            set_limit(hard, original.maximum);
+            set_limit(raised, original.maximum);
         }
     });
     walk(&hub, &checkpoints[1]);
