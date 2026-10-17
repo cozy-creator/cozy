@@ -1164,7 +1164,14 @@ fn relative_files(ty: &Type, value: &mut Value, base: &Path) {
         {
             *source = base.join(&*source).to_string_lossy().into_owned();
         }
-        (Type::Union { branches, .. }, value) if !value.is_string() => {
+        // A string is a file only where it is no other scalar, as `embedded_files` reads it.
+        (Type::Union { branches, .. }, value)
+            if !value.as_str().is_some_and(|s| {
+                branches
+                    .iter()
+                    .any(|b| *b == Type::Str || scalar(b, s).is_some())
+            }) =>
+        {
             for branch in branches {
                 relative_files(branch, value, base);
             }
