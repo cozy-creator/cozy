@@ -175,6 +175,7 @@ fn the_selection_serves_its_header_and_assets_sealed_and_nothing_else() {
                 libc::fcntl(file.as_raw_fd(), libc::F_GETFL) & libc::O_ACCMODE,
                 libc::O_RDONLY
             );
+            #[cfg(target_os = "linux")]
             assert_eq!(
                 libc::fcntl(file.as_raw_fd(), libc::F_GET_SEALS) & 0x8,
                 0x8,

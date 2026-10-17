@@ -9,8 +9,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File},
-    io::{self, Read, Write},
-    os::fd::AsRawFd,
+    io::{self, Read},
     path::Path,
     sync::Arc,
 };
@@ -195,13 +194,10 @@ impl ModelSources {
         bytes.map_err(failure)
     }
 
-    /// Answer a `model_source` request: the bytes in a sealed memfd, with their digest.
+    /// Answer a `model_source` request: the bytes in a file nobody can write, with their digest.
     pub fn serve(&self, frame: &Frame) -> io::Result<(Answer, File)> {
         let bytes = self.source(&frame.manifest, &frame.name)?;
-        let mut file = cozy_platform::shm::memfd_named("tensord-weights").map(std::fs::File::from)?;
-        file.write_all(&bytes)?;
-        cozy_platform::shm::seal_with(std::os::fd::AsFd::as_fd(&file), cozy_platform::shm::NO_WRITE_SEALS)?;
-        let file = File::open(format!("/proc/self/fd/{}", file.as_raw_fd()))?;
+        let file = cozy_platform::shm::frozen("tensord-weights", &bytes)?;
         let mut answer = Answer::unavailable(frame.seq);
         (answer.ok, answer.held) = (true, true);
         answer.code.clear();

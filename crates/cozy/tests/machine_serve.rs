@@ -2,7 +2,7 @@
 //! CLI and Calcifer use. It answers Status over `cozy.machine.v1` to a Cozy-Cap its home admits, and
 //! Calcifer reaches it through `cozy machine add` with nothing authorized by hand: Calcifer's owner
 //! key is in the home, and the machine reads the home's keys again when a signer is new to it.
-#![cfg(target_os = "linux")]
+#![cfg(unix)]
 mod common;
 
 use std::{
@@ -55,8 +55,9 @@ fn this_computers_machine_serves_status_and_calcifer_adds_it() {
         assert!(Instant::now() < until, "no {}", ready_file.display());
         std::thread::sleep(Duration::from_millis(100));
     }
-    let comm = std::fs::read_to_string(format!("/proc/{}/comm", machine.0.id())).unwrap();
-    assert_eq!(comm.trim(), "tensord");
+    // It names itself for ps where the OS lets a process be renamed.
+    #[cfg(target_os = "linux")]
+    assert_eq!(std::fs::read_to_string(format!("/proc/{}/comm", machine.0.id())).unwrap().trim(), "tensord");
     let ready: serde_json::Value = serde_json::from_slice(&std::fs::read(&ready_file).unwrap()).unwrap();
     let address = ready["address"].as_str().unwrap().to_owned();
     let body: String = ready["cert_pem"].as_str().unwrap().lines().filter(|l| !l.starts_with("-----")).collect();
