@@ -1,6 +1,6 @@
 //! Release cards this computer keeps. A release never changes, so its card is read from the Hub
-//! once and kept forever; a warm run reads no Hub. Machines resolve which release runs: the card
-//! here only binds terms.
+//! once and kept forever, by release; which release a run binds and runs is resolved before
+//! (`super::resolve`), never guessed from what was read last.
 use std::path::{Path, PathBuf};
 
 use cozy_platform::{durable, paths::Home};
@@ -39,7 +39,7 @@ impl Card {
     }
 }
 
-/// Where `(hub, package)`'s cards live: one file per release and `newest`, the newest one read.
+/// Where `(hub, package)`'s cards live: one file per release.
 fn dir(home: &Home, hub: &str, package: &str) -> PathBuf {
     let host = hub.split_once("://").map_or(hub, |(_, rest)| rest);
     let host: String = host
@@ -58,46 +58,37 @@ fn dir(home: &Home, hub: &str, package: &str) -> PathBuf {
     dir
 }
 
-/// The card of `release`, else of the newest release: the kept one, else the Hub's, which is then
-/// kept. `fresh` reads the Hub's newest release even when one is kept. Answers whether it read
-/// the Hub.
-pub async fn card(
-    ctx: &Context,
-    hub: &Hub,
-    package: &str,
-    release: Option<&str>,
-    fresh: bool,
-) -> Result<(Card, bool), Error> {
-    if !(fresh && release.is_none())
-        && let Some(card) = kept(&ctx.home, &hub.origin, package, release)
-    {
-        return Ok((card, false));
+/// The card of `release`: the kept one, else the Hub's, which is then kept.
+pub async fn card(ctx: &Context, hub: &Hub, package: &str, release: &str) -> Result<Card, Error> {
+    if let Some(card) = kept(&ctx.home, &hub.origin, package, release) {
+        return Ok(card);
     }
     let (org, name) = package.split_once('/').expect("a package is org/name");
-    let client = ctx.hub_client(hub)?;
-    let newest = release.is_none();
-    let release = match release {
-        Some(release) => release.to_owned(),
-        None => hub_answer(client.get_package(org, name).await)
-            .map_err(|e| absent(e, package))?
-            .package
-            .latest_release
-            .ok_or_else(|| {
-                Error::new(
-                    Kind::NotFound,
-                    "package_unreleased",
-                    format!("{package} has no release to run"),
-                )
-                .remedy("its owner publishes one with `cozy package publish`")
-            })?,
-    };
-    let document = hub_answer(client.get_package_release(org, name, &release).await)
-        .map_err(|e| absent(e, &format!("{package}@{release}")))?;
+    let answer = ctx
+        .hub_client(hub)?
+        .get_package_release(org, name, release)
+        .await;
+    let document = hub_answer(answer).map_err(|e| absent(e, &format!("{package}@{release}")))?;
     let document = serde_json::to_value(&document).expect("a card serializes");
-    Ok((
-        keep(&ctx.home, &hub.origin, package, &document, newest)?,
-        true,
-    ))
+    keep(&ctx.home, &hub.origin, package, &document)
+}
+
+/// The Hub's latest release of `package`: one package read.
+pub async fn latest(ctx: &Context, hub: &Hub, package: &str) -> Result<String, Error> {
+    let (org, name) = package.split_once('/').expect("a package is org/name");
+    let answer = ctx.hub_client(hub)?.get_package(org, name).await;
+    hub_answer(answer)
+        .map_err(|e| absent(e, package))?
+        .package
+        .latest_release
+        .ok_or_else(|| {
+            Error::new(
+                Kind::NotFound,
+                "package_unreleased",
+                format!("{package} has no release to run"),
+            )
+            .remedy("its owner publishes one with `cozy package publish`")
+        })
 }
 
 /// The Hub's 404 names what it lacks, and where to look.
@@ -118,43 +109,24 @@ fn absent(error: Error, what: &str) -> Error {
     ))
 }
 
-/// The kept card of `release`, else of the newest release read.
-pub fn kept(home: &Home, hub: &str, package: &str, release: Option<&str>) -> Option<Card> {
-    let dir = dir(home, hub, package);
-    let release = match release {
-        Some(release) => release.to_owned(),
-        None => std::fs::read_to_string(dir.join("newest"))
-            .ok()?
-            .trim()
-            .to_owned(),
-    };
-    let document: Value =
-        serde_json::from_slice(&std::fs::read(file(&dir, &release)).ok()?).ok()?;
+/// The kept card of `release`.
+pub fn kept(home: &Home, hub: &str, package: &str, release: &str) -> Option<Card> {
+    let path = file(&dir(home, hub, package), release);
+    let document: Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
     read(&document).ok()
 }
 
-/// Keeps a release card as the Hub answered it; `newest` marks it the newest release read.
-pub fn keep(
-    home: &Home,
-    hub: &str,
-    package: &str,
-    document: &Value,
-    newest: bool,
-) -> Result<Card, Error> {
+/// Keeps a release card as the Hub answered it.
+pub fn keep(home: &Home, hub: &str, package: &str, document: &Value) -> Result<Card, Error> {
     let card = read(document)?;
     let dir = dir(home, hub, package);
-    let kept = durable::private_dir(&dir)
-        .and_then(|()| {
-            durable::replace(
-                &file(&dir, &card.release),
-                document.to_string().as_bytes(),
-                0o600,
-            )
-        })
-        .and_then(|()| match newest {
-            true => durable::replace(&dir.join("newest"), card.release.as_bytes(), 0o600),
-            false => Ok(()),
-        });
+    let kept = durable::private_dir(&dir).and_then(|()| {
+        durable::replace(
+            &file(&dir, &card.release),
+            document.to_string().as_bytes(),
+            0o600,
+        )
+    });
     // A card that cannot be kept is read again next time; the run goes on.
     drop(kept);
     Ok(card)
@@ -194,24 +166,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_kept_card_answers_by_release_and_as_the_newest() {
+    fn a_kept_card_answers_by_its_release_only() {
         let home = tempfile::tempdir().unwrap();
         let home = Home::at(home.path());
         let hub = "http://127.0.0.1:8819";
-        assert!(kept(&home, hub, "fidika/sdxl", None).is_none());
-        keep(&home, hub, "fidika/sdxl", &card("sdxl-2.10.0"), true).unwrap();
-        assert_eq!(
-            kept(&home, hub, "fidika/sdxl", None).unwrap().release,
-            "2.10.0"
-        );
-        assert_eq!(
-            kept(&home, hub, "fidika/sdxl", Some("2.10.0"))
-                .unwrap()
-                .release,
-            "2.10.0"
-        );
-        assert!(kept(&home, hub, "fidika/sdxl", Some("2.9.0")).is_none());
-        assert!(kept(&home, "https://tensorhub.com", "fidika/sdxl", None).is_none());
+        assert!(kept(&home, hub, "fidika/sdxl", "2.10.0").is_none());
+        keep(&home, hub, "fidika/sdxl", &card("sdxl-2.10.0")).unwrap();
+        let kept_card = kept(&home, hub, "fidika/sdxl", "2.10.0").unwrap();
+        assert_eq!(kept_card.release, "2.10.0");
+        assert!(kept(&home, hub, "fidika/sdxl", "2.9.0").is_none());
+        assert!(kept(&home, "https://tensorhub.com", "fidika/sdxl", "2.10.0").is_none());
         assert!(
             home.root()
                 .join("packages/127.0.0.1_8819/fidika/sdxl/2.10.0.json")

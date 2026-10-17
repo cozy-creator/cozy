@@ -217,37 +217,109 @@ async fn run(ctx: &Context, args: RunArgs) -> Result<ExitCode, Error> {
         Target::Script(path) => return local::run(ctx, &cwd.join(path), None, args).await,
     };
     let hub = ctx.hub()?;
-    let (card, read) = catalog::card(ctx, &hub, &package, release.as_deref(), false).await?;
+    let resolved = resolve(
+        ctx,
+        &hub,
+        &package,
+        release.as_deref(),
+        &args.placement.on(),
+    )
+    .await?;
     let Some(function) = function else {
-        functions(ctx, &package, &card);
+        functions(ctx, &package, &resolved);
         return Ok(ExitCode::SUCCESS);
     };
     if args.describe {
+        let card = &resolved.card;
         let callable = callable(&package, &card.interface, &function)?;
         if ctx.json {
-            output::json(&card.request(&callable.name));
+            let mut request = card.request(&callable.name);
+            request["release"] = card.release.clone().into();
+            request["release_from"] = resolved.from.to_string().into();
+            output::json(&request);
         } else {
-            anstream::print!(
-                "{}",
-                describe::contract(
-                    &format!("{package}/{}", callable.name),
-                    &card.interface,
-                    callable
-                )
+            let title = format!(
+                "{package}/{}@{} ({})",
+                callable.name, card.release, resolved.from
             );
+            anstream::print!("{}", describe::contract(&title, &card.interface, callable));
         }
         return Ok(ExitCode::SUCCESS);
     }
-    let run = invoke(
-        ctx,
-        &package,
-        release.as_deref(),
-        &function,
-        (card, read),
-        args,
-    )
-    .await?;
+    let run = invoke(ctx, &package, &function, &resolved.card, args).await?;
     Ok(exit_code(&run))
+}
+
+/// Which release a run binds against and runs, and why that one.
+pub(crate) struct Resolved {
+    pub card: Card,
+    pub from: From,
+}
+
+pub(crate) enum From {
+    /// The run named it.
+    Asked,
+    /// The machine the run goes to holds it.
+    Installed(String),
+    /// The Hub's latest: the machine holds none, or is not named.
+    Latest,
+}
+
+impl std::fmt::Display for From {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            From::Asked => f.write_str("asked"),
+            From::Installed(machine) => write!(f, "installed on {machine}"),
+            From::Latest => f.write_str("the Hub's latest"),
+        }
+    }
+}
+
+/// Resolves a run's release once, before binding: the one asked; else the newest release of the
+/// package that the machine `on` names holds, asked of the machine through Calcifer (no Hub
+/// read); else the Hub's latest. The run is then pinned to it, so the machine runs exactly the
+/// release its inputs were bound against.
+pub(crate) async fn resolve(
+    ctx: &Context,
+    hub: &Hub,
+    package: &str,
+    release: Option<&str>,
+    on: &On,
+) -> Result<Resolved, Error> {
+    let (release, from) = match release {
+        Some(release) => (release.to_owned(), From::Asked),
+        None => match installed(ctx, hub, package, on).await {
+            Some((machine, release)) => (release, From::Installed(machine)),
+            None => (catalog::latest(ctx, hub, package).await?, From::Latest),
+        },
+    };
+    let card = catalog::card(ctx, hub, package, &release).await?;
+    Ok(Resolved { card, from })
+}
+
+/// The newest release of `package` from `hub` that the machine `on` names holds, as it says now.
+/// A machine that is not there or does not answer holds nothing this run can rely on.
+async fn installed(ctx: &Context, hub: &Hub, package: &str, on: &On) -> Option<(String, String)> {
+    let On::Machine(name) = on else {
+        return None;
+    };
+    let path = format!("/v1/machines/{}", name.to_ascii_lowercase());
+    let calcifer = ctx.calcifer().await.ok()?;
+    let machine: cozy_proto::calcifer::Machine =
+        calcifer.get_query(&path, &[("fresh", "true")]).await.ok()?;
+    let same = |a: &str, b: &str| {
+        a.trim_end_matches('/')
+            .eq_ignore_ascii_case(b.trim_end_matches('/'))
+    };
+    let release = machine
+        .status?
+        .environments
+        .into_iter()
+        .filter(|e| e.package.eq_ignore_ascii_case(package) && same(&e.hub, &hub.origin))
+        .map(|e| e.release)
+        .filter(|r| !r.is_empty())
+        .max_by_key(|r| crate::package::release_order(r))?;
+    Some((machine.name, release))
 }
 
 /// `cozy run <package>/<function>[@release] <inputs…> --on …` for another verb: `model
@@ -262,7 +334,8 @@ pub(crate) async fn call(
     placement: &Placement,
     detach: bool,
 ) -> Result<Run, Error> {
-    let card = catalog::card(ctx, &ctx.hub()?, package, release, false).await?;
+    let hub = ctx.hub()?;
+    let resolved = resolve(ctx, &hub, package, release, &placement.on()).await?;
     let args = RunArgs {
         target: None,
         inputs,
@@ -278,32 +351,22 @@ pub(crate) async fn call(
         describe: false,
         idempotency_key: None,
     };
-    invoke(ctx, package, release, function, card, args).await
+    invoke(ctx, package, function, &resolved.card, args).await
 }
 
-/// A release's card: the kept one, else the Hub's, kept from then on.
-pub(crate) async fn card(
-    ctx: &Context,
-    hub: &Hub,
-    package: &str,
-    release: Option<&str>,
-) -> Result<Card, Error> {
-    Ok(catalog::card(ctx, hub, package, release, false).await?.0)
-}
-
-/// Binds the run's inputs, submits it and follows it.
+/// Binds the run's inputs to `card`, submits it pinned to `card`'s release, and follows it.
 async fn invoke(
     ctx: &Context,
     package: &str,
-    release: Option<&str>,
     function: &str,
-    (mut card, read): (Card, bool),
+    card: &Card,
     args: RunArgs,
 ) -> Result<Run, Error> {
     let hub = ctx.hub()?;
     let terms = terms(ctx, &args)?;
     let bits = bits(&args);
     let on = args.placement.on();
+    let source = spec::Source::Release(Some(&card.release));
     if let Some(level) = args.warm {
         if args.gpus.is_some() {
             return Err(Error::new(
@@ -316,7 +379,7 @@ async fn invoke(
         let models = bind::warm_choices(callable, &terms)?;
         let call = spec::Call {
             package,
-            source: spec::Source::Release(release),
+            source,
             callable,
             gpus: 0,
             bits,
@@ -324,19 +387,7 @@ async fn invoke(
         let submission = call.submission(on, &hub.origin, &call.warm(level, &models)?, None, None);
         return send(ctx, submission, &terms.key, args.detach).await;
     }
-    let mut bound = bind(ctx, package, &card, function, &terms)?;
-    // A kept card that lacks a field the run names may be older than the release the machine
-    // runs: read the newest once, and bind again.
-    if release.is_none()
-        && !read
-        && !bound.1.ignored.is_empty()
-        && let Ok((newer, _)) = catalog::card(ctx, &hub, package, None, true).await
-        && newer.release != card.release
-    {
-        card = newer;
-        bound = bind(ctx, package, &card, function, &terms)?;
-    }
-    let (target, bound) = bound;
+    let (target, bound) = bind(ctx, package, card, function, &terms)?;
     if let Some(warning) = bound.warning(&target) {
         output::warn(ctx, &warning);
     }
@@ -344,7 +395,7 @@ async fn invoke(
     let gpus = args.gpus.unwrap_or(0);
     let call = spec::Call {
         package,
-        source: spec::Source::Release(release),
+        source,
         callable,
         gpus,
         bits,
@@ -475,12 +526,20 @@ fn callable<'a>(
 }
 
 /// `cozy run org/pkg`: the package's public functions.
-fn functions(ctx: &Context, package: &str, card: &Card) {
-    functions_of(ctx, package, &card.release, &card.interface);
+fn functions(ctx: &Context, package: &str, resolved: &Resolved) {
+    let from = resolved.from.to_string();
+    let card = &resolved.card;
+    functions_of(ctx, package, &card.release, Some(&from), &card.interface);
 }
 
 /// A package's public functions, and where each runs.
-fn functions_of(ctx: &Context, package: &str, release: &str, interface: &Interface) {
+fn functions_of(
+    ctx: &Context,
+    package: &str,
+    release: &str,
+    from: Option<&str>,
+    interface: &Interface,
+) {
     let public = interface.public();
     let runs_on = |name: &str| {
         let cpu = interface
@@ -494,16 +553,17 @@ fn functions_of(ctx: &Context, package: &str, release: &str, interface: &Interfa
             .iter()
             .map(|name| serde_json::json!({"function": name, "runs_on": runs_on(name)}))
             .collect();
-        output::json(
-            &serde_json::json!({"package": package, "release": release, "functions": rows}),
-        );
+        output::json(&serde_json::json!({
+            "package": package, "release": release, "release_from": from, "functions": rows,
+        }));
         return;
     }
     let mut table = output::Table::new(ctx, ["FUNCTION", "RUNS ON"]);
     for name in &public {
         table = table.row([*name, runs_on(name)]);
     }
-    table.note(format!("{package} {release}")).print();
+    let from = from.map(|from| format!(" ({from})")).unwrap_or_default();
+    table.note(format!("{package} {release}{from}")).print();
     let next: Vec<String> = public
         .iter()
         .take(2)
