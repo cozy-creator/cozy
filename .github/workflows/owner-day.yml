@@ -2,8 +2,10 @@ name: owner-day
 # The owner's day with cozy, end to end, as a release gate: the real binary, Calcifer and TensorD
 # against a CI Tensorhub that tensorhub's scripts/live-hub-client.sh brings up (MinIO, a TLS front,
 # docker-provider CPU rentals). Once per TensorD: the newest cozy-runtime wheel's (released) and
-# this commit's (workspace). One machine's port is shaped like the owner's uplink.
-#   gh workflow run owner-day.yaml -R cozy-creator/cozy --ref <branch> [-f tensorhub_ref=<ref>]
+# this commit's (workspace). One machine's port is shaped like the owner's uplink. Called by
+# release.yml (dist's `plan` input), the tests run the release's own Linux x86_64 `cozy`; dispatched,
+# this commit's build.
+#   gh workflow run owner-day.yml -R cozy-creator/cozy --ref <branch> [-f tensorhub_ref=<ref>]
 on:
   workflow_dispatch:
     inputs:
@@ -13,6 +15,9 @@ on:
         default: master
   workflow_call:
     inputs:
+      plan:
+        type: string
+        required: false
       tensorhub_ref:
         type: string
         default: master
@@ -58,6 +63,17 @@ jobs:
       - run: uv sync --project tools/evaluator --locked --no-dev --group proof
       # The cozy workspace's test build fills most of the runner's disk.
       - run: sudo rm -rf -- /usr/local/lib/android /usr/share/dotnet /opt/ghc && df -h /
+      - if: inputs.plan != ''
+        uses: actions/download-artifact@v8
+        with:
+          name: artifacts-build-local-x86_64-unknown-linux-gnu
+          path: ${{ runner.temp }}/release
+      - if: inputs.plan != ''
+        working-directory: ${{ runner.temp }}/release
+        run: |
+          tar -xzf cozy-x86_64-unknown-linux-gnu.tar.gz
+          ./cozy-x86_64-unknown-linux-gnu/cozy --version
+          echo "COZY_TEST_BINARY=$PWD/cozy-x86_64-unknown-linux-gnu/cozy" >> "$GITHUB_ENV"
       # Port 47123 carries 2.6 Mbit/s with a 400 ms round trip (crates/calcifer/tests/shaped.rs).
       - name: Shape the loopback
         run: |
