@@ -62,6 +62,9 @@ pub fn whole(
     let session = format!("whole-{}", &closure.manifest.sha256[..12]);
     let (plan, _) = FetchPlan::of(store, &session, &closure.manifest, &closure.objects)?;
     let total = plan.declared_bytes();
+    if !plan.wanted.is_empty() {
+        fetcher.admit_whole(origin, &plan.held, plan.wanted_bytes(), plan.wanted.len() as u64)?;
+    }
     // What is here too: held from GC until the end, and its bytes in the progress.
     let every: Vec<_> = plan.held.iter().chain(&plan.wanted).cloned().collect();
     let ticket = fetcher.want(origin, access, &every, at);
