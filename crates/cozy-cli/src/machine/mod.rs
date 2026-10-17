@@ -1,6 +1,6 @@
 //! `cozy machine`: this computer's machine, machines rented on any Hub, and other computers' machines
 //! added by address. Every machine is reached through Calcifer.
-use std::{process::ExitCode, time::Duration};
+use std::process::ExitCode;
 
 use clap::Subcommand;
 use cozy_proto::{
@@ -113,9 +113,6 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
         Verb::Authorize { .. } => Err(crate::not_ported("machine authorize")),
     }
 }
-
-/// How often a command following a machine re-reads Calcifer, which answers from memory.
-const FOLLOW: Duration = Duration::from_secs(1);
 
 /// The route of one machine, by name, alias or rental id: `[A-Za-z0-9][A-Za-z0-9._-]{0,127}`.
 pub(crate) fn route(name: &str) -> Result<String, Error> {
