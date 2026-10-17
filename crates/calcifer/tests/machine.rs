@@ -74,7 +74,7 @@ async fn settled(calcifer: &Calcifer, id: &RunId) {
 /// The machine's own answer about the run, with a link of the test's.
 async fn on_machine(machine: &Tensord, id: &RunId) -> Result<String, LinkError> {
     let link = Link::new(&machine.endpoint, common::key())?;
-    link.run(id.as_str(), 0, None)
+    link.attach(id.as_str(), 0)
         .await
         .map(|(state, _)| state.state)
 }

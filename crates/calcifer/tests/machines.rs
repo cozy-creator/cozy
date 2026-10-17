@@ -599,7 +599,7 @@ async fn a_publishing_run_without_its_hub_sign_in_fails_unsent() {
     let link = calcifer::Link::new(&machine.endpoint, common::key()).unwrap();
     assert!(
         matches!(
-            link.run(id.as_str(), 0, None).await,
+            link.attach(id.as_str(), 0).await,
             Err(calcifer::LinkError::NotFound)
         ),
         "never sent"

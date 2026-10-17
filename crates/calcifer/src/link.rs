@@ -5,7 +5,10 @@
 use std::{
     path::Path,
     pin::Pin,
-    sync::{Arc, Mutex, atomic::Ordering},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -113,22 +116,30 @@ impl Link {
         lanes[i].clone()
     }
 
-    /// Sends the run (with `spec`) or attaches to it, and answers its state with its events after
-    /// `after`. Closing them never cancels.
-    pub async fn run(
+    /// Sends the run: its state, the machine's acceptance. The same id and spec again answer the
+    /// run as it is; another spec is `run_id_conflict`.
+    pub async fn submit(&self, id: &str, spec: v1::RunSpec) -> Result<v1::RunState, LinkError> {
+        let request = v1::RunRequest {
+            id: id.into(),
+            spec,
+        };
+        Ok(self.machine.submit(&request).await?)
+    }
+
+    /// The run's log after `after`: its state first, then its events until its outcome. Closing
+    /// it never cancels.
+    pub async fn events(&self, id: &str, after: u64) -> Result<Live<v1::RunEvent>, LinkError> {
+        Ok(Box::pin(self.machine.events(id, after).await?.map_err(LinkError::from)))
+    }
+
+    /// Attaches to the run: its state, and its events after `after`. `NotFound` when the machine
+    /// never received it.
+    pub async fn attach(
         &self,
         id: &str,
         after: u64,
-        spec: Option<v1::RunSpec>,
     ) -> Result<(v1::RunState, Live<v1::RunEvent>), LinkError> {
-        if let Some(spec) = spec {
-            let request = v1::RunRequest {
-                id: id.into(),
-                spec,
-            };
-            self.machine.submit(&request).await?;
-        }
-        let mut events = Box::pin(self.machine.events(id, after).await?.map_err(LinkError::from));
+        let mut events = self.events(id, after).await?;
         match events.next().await {
             Some(Ok(v1::RunEvent {
                 event: v1::Event::State(state),
@@ -203,12 +214,14 @@ impl Link {
             Some(now.saturating_sub(from) as f64 / seconds)
         };
         progress(from, None);
+        // The most the machine has said it holds, by a HEAD or a part's answer.
+        let landed = Arc::new(AtomicU64::new(from));
         loop {
             let before = v1::held_bytes(&held);
             let parts = lanes::parts(&held, length, LANES);
             let sent = lanes::transfer(parts, LANES, |leg| {
                 let lane = self.lane(leg.lane, leg.fresh);
-                put(lane, name.clone(), path.to_owned(), length, leg)
+                put(lane, name.clone(), path.to_owned(), length, leg, landed.clone())
             });
             let tell = async {
                 let mut tick = tokio::time::interval(TELL_EVERY);
@@ -217,17 +230,22 @@ impl Link {
                 loop {
                     tick.tick().await;
                     if let Ok(now) = self.machine.held(&name).await {
-                        let now = v1::held_bytes(&now);
-                        progress(now, rate(now));
+                        landed.fetch_max(v1::held_bytes(&now), Ordering::Relaxed);
                     }
+                    let now = landed.load(Ordering::Relaxed);
+                    progress(now, rate(now));
                 }
             };
             let sent = tokio::select! {
                 sent = sent => sent,
                 _ = tell => unreachable!("it tells until the parts end"),
             };
-            held = self.machine.held(&name).await?;
-            let now = v1::held_bytes(&held);
+            // A part answered with the whole object held: it is stored, with no HEAD to ask.
+            let mut now = landed.load(Ordering::Relaxed);
+            if now < length {
+                held = self.machine.held(&name).await?;
+                now = v1::held_bytes(&held);
+            }
             if now >= length {
                 progress(length, rate(length));
                 return Ok(());
@@ -248,13 +266,15 @@ impl Link {
     }
 }
 
-/// Lands one part from `path` on `lane`, moving `leg.at` past each byte handed to it.
+/// Lands one part from `path` on `lane`, moving `leg.at` past each byte handed to it and `landed`
+/// to what the machine answers it holds.
 async fn put(
     lane: Option<Bulk>,
     digest: String,
     path: std::path::PathBuf,
     total: u64,
     leg: Leg,
+    landed: Arc<AtomicU64>,
 ) -> Result<(), Ranged<LinkError>> {
     let lane = lane.ok_or_else(|| Ranged::Again("no connection to the machine".into()))?;
     let unreadable = |e: std::io::Error| {
@@ -277,7 +297,10 @@ async fn put(
         .put(&digest, (leg.first, length, total), reqwest::Body::wrap_stream(body))
         .await
     {
-        Ok(_) => Ok(()),
+        Ok(held) => {
+            landed.fetch_max(v1::held_bytes(&held), Ordering::Relaxed);
+            Ok(())
+        }
         Err(e) => match LinkError::from(e) {
             LinkError::Unreachable(message) => Err(Ranged::Again(message)),
             e => Err(Ranged::Stop(e)),

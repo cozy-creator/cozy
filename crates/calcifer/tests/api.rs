@@ -553,7 +553,7 @@ async fn down_names_what_is_owed_the_machine_keeps_running_it_and_the_next_calci
     );
     assert_eq!(calcifer.stopped().await, Stopped::Down);
     let link = Link::new(&machine.endpoint, common::key()).unwrap();
-    let (state, _) = link.run(&id, 0, None).await.unwrap();
+    let (state, _) = link.attach(&id, 0).await.unwrap();
     assert_eq!(state.state, "preparing", "the machine keeps the run");
 
     let calcifer = Calcifer::start(home.path()).await;
