@@ -1,9 +1,11 @@
 //! hub-client against a real Tensorhub (Tensorhub's dev-build `cozy_ref` job starts one):
 //! device-key enrollment and login, the account, model info and search, a rental quote, a
-//! closure read, and a run capability traded for a DPoP-bound token over real TLS.
+//! closure read, a run capability traded for a DPoP-bound token over real TLS, and (with the
+//! job's docker provider) a rental that boots to ready and ends.
 //!
 //! TENSORHUB_URL is where the hub listens (plain HTTP on loopback), TENSORHUB_ORIGIN its public
-//! https origin, TENSORHUB_LOG its log, where the development mail sender writes codes.
+//! https origin (SSL_CERT_FILE trusts its CA), TENSORHUB_LOG the hub's log, where the development
+//! mail sender writes codes.
 use hub_client::{
     Client, Credential, DeviceKey, Error, P256Key, RunCapability, RunToken, UserSession, testing,
     types,
@@ -179,16 +181,10 @@ async fn a_user_and_a_machine_at_a_real_hub() {
         ],
         lifetime: Duration::from_secs(300),
     });
-    let backend = hub
-        .url
-        .trim_start_matches("http://")
-        .parse()
-        .expect("TENSORHUB_URL is http://ip:port");
-    let front = testing::TlsFront::start(&hub.origin, backend).await;
     let run = Arc::new(RunToken::new(&capability, &endpoint, leaf).unwrap());
     let machine = Client::connect(
         &hub.origin,
-        front.http.clone(),
+        reqwest::Client::new(),
         Credential::Run(run.clone()),
     );
     let declared = types::PublicationDeclaration {
@@ -224,4 +220,84 @@ async fn a_user_and_a_machine_at_a_real_hub() {
         "a refused operation does not end the capability"
     );
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// With the docker provider (`hub_set=provider.kind=docker provider.docker.network=host`), the
+/// hub sells its CPU machine: a rental of it boots the registered worker image, which reaches the
+/// hub at its loopback origin through the CA the hub grants it, turns ready, and ends.
+#[tokio::test]
+async fn a_rental_boots_to_ready_and_ends() {
+    let Some(hub) = hub() else {
+        eprintln!("skipped: no hub");
+        return;
+    };
+    let http = reqwest::Client::new();
+    let anonymous = Client::connect(&hub.url, http.clone(), Credential::Anonymous);
+    let skus = anonymous.list_rental_skus(None).await.unwrap().into_inner();
+    if !skus.iter().any(|sku| sku.name == "cpu") {
+        eprintln!("skipped: the hub sells no cpu machine (hub_set provider.kind=docker)");
+        return;
+    }
+    let nonce = format!("{:x}", Sha256::digest(format!("{:?}", Instant::now())))[..10].to_string();
+    let email = format!("rental-{nonce}@example.test");
+    let (key, bearer) = testing::sign_up(&anonymous, &email, Path::new(&hub.log))
+        .await
+        .unwrap();
+    let user = Client::connect(&hub.url, http, Credential::Bearer(bearer.token));
+    user.register_account(&format!("rent{nonce}"), &types::Empty(Default::default()))
+        .await
+        .unwrap();
+    let ask = types::RentalRequest {
+        accelerator_count: None,
+        container_disk_gb: None,
+        creator_public_key: key.public_key(),
+        development: None,
+        excluded_provider_machines: vec![],
+        image: None,
+        media_token_sha256: format!("{:x}", Sha256::digest(nonce.as_bytes())),
+        name: format!("live-{nonce}"),
+        planned_source_bytes: None,
+        provider: None,
+        serving_models: vec![],
+        sku: "cpu".into(),
+    };
+    let idempotency = types::CreateRentalIdempotencyKey::try_from(format!("live-{nonce}")).unwrap();
+    let rental = user
+        .create_rental(&idempotency, &ask)
+        .await
+        .unwrap()
+        .into_inner();
+    let state = |want: &'static [&'static str]| {
+        let user = &user;
+        let id = rental.rental_id.clone();
+        async move {
+            // The image pull dominates; a rental that leaves the path fails at once.
+            let started = Instant::now();
+            loop {
+                let now = user.get_rental(&id).await.unwrap().into_inner();
+                if want.contains(&now.state.as_str()) {
+                    return now;
+                }
+                assert!(
+                    [
+                        "pending_acquisition",
+                        "acquiring",
+                        "booting",
+                        "release_requested"
+                    ]
+                    .contains(&now.state.as_str()),
+                    "rental {id} left the path: {now:?}"
+                );
+                assert!(
+                    started.elapsed() < Duration::from_secs(1200),
+                    "rental {id} stuck in {}",
+                    now.state
+                );
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        }
+    };
+    state(&["ready"]).await;
+    user.release_rental(&rental.rental_id).await.unwrap();
+    state(&["released"]).await;
 }

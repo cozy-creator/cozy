@@ -1990,6 +1990,9 @@ components:
             TENSORHUB_OBJECT_STORAGE_HOSTS:
               type: string
               description: Comma-separated object storage hosts presigned URLs name.
+            TENSORHUB_CA_DER_B64URL:
+              type: string
+              description: The CA a machine trusts for the origin when a private CA signs it (a test hub).
     ModelCard:
       type: object
       required: [model, releases, throughput]
