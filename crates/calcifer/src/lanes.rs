@@ -1,18 +1,21 @@
 //! Ranged transfers side by side, as an S3 client makes them: each range on its own lane (its own
-//! connection), judged by its measured bytes against its peers'. A range that fails, or whose
-//! bytes come `SLOW` times slower than its peers', goes again from where its bytes stopped on a
-//! fresh connection. A transfer gives up only when every lane has failed since a byte last moved.
-//! No flat timeouts: only lack of measured progress ends anything.
+//! connection), judged by its measured bytes against its peers' over the same window. A range that
+//! fails, or whose bytes come `SLOW` times slower than its peers', goes again from where its bytes
+//! stopped on a fresh connection. A transfer gives up only when every lane has failed since a byte
+//! last moved. No flat timeouts: only lack of measured progress ends anything.
 use std::{
     collections::{HashMap, VecDeque},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
-use tokio::task::{AbortHandle, Id, JoinSet};
+use tokio::{
+    task::{AbortHandle, Id, JoinSet},
+    time::Instant,
+};
 
 /// A range whose bytes come this many times slower than its peers' is asked again.
 const SLOW: f64 = 8.0;
@@ -49,8 +52,8 @@ struct Flight {
     end: u64,
     at: Arc<AtomicU64>,
     began: Instant,
-    /// Since its first byte: the start of the window its rate is measured over, and `at` then.
-    window: Option<(Instant, u64)>,
+    /// Since its first byte: `at` as each sample found it, back to one a window ago.
+    seen: VecDeque<(Instant, u64)>,
     slow: bool,
     task: AbortHandle,
 }
@@ -97,7 +100,7 @@ where
                 end,
                 at,
                 began: Instant::now(),
-                window: None,
+                seen: VecDeque::new(),
                 slow: false,
                 task,
             };
@@ -142,39 +145,56 @@ where
 }
 
 /// Measures the ranges in flight and drops the one whose first byte waits `SLOW` times longer
-/// than its peers' did, or whose bytes come `SLOW` times slower than its peers' (finished ranges
-/// included) over its latest window of `ROUND_TRIPS` round trips; its rest is asked again. A
-/// range whose bytes have all moved is waiting for its answer and is not judged.
+/// than its peers' did, or whose bytes come `SLOW` times slower than its peers' over the same
+/// window of `ROUND_TRIPS` round trips; its rest is asked again. Peers share the path, so one
+/// lane's smaller share is TCP's doing, not a bad connection: a range is held to ranges in flight
+/// beside it, and to finished ones only when it is alone, a straggler at the tail. A range whose
+/// bytes have all moved is waiting for its answer and is not judged.
 fn judge(flights: &mut HashMap<Id, Flight>, finished: &[f64], waits: &mut Vec<Duration>) {
     let now = Instant::now();
     waits.sort();
     let wait = waits.get(waits.len() / 2).copied();
     let window = wait.map_or(WINDOW, |wait| (wait * ROUND_TRIPS).max(WINDOW));
-    let mut rates = finished.to_vec();
+    let alone = flights.len() == 1;
     let mut judged = vec![];
     for flight in flights.values_mut() {
         let at = flight.at.load(Ordering::Relaxed);
-        match flight.window {
-            _ if at >= flight.end => {}
-            None if at > flight.first => {
+        if at >= flight.end {
+            continue;
+        }
+        if flight.seen.is_empty() {
+            if at > flight.first {
                 waits.push(now - flight.began);
-                flight.window = Some((now, at));
-            }
-            None => {
+                flight.seen.push_back((now, at));
+            } else {
                 let typical = wait.map(|wait| wait.mul_f64(SLOW));
                 flight.slow |= typical.is_some_and(|t| now - flight.began > t.max(WINDOW));
             }
-            Some((since, seen)) if now - since >= window => {
-                let rate = (at - seen) as f64 / (now - since).as_secs_f64();
-                flight.window = Some((now, at));
-                rates.push(rate);
-                judged.push((flight.task.id(), rate));
-            }
-            Some(_) => {}
+            continue;
+        }
+        flight.seen.push_back((now, at));
+        while flight
+            .seen
+            .get(1)
+            .is_some_and(|(then, _)| now - *then >= window)
+        {
+            flight.seen.pop_front();
+        }
+        let (then, from) = flight.seen[0];
+        if now - then >= window {
+            judged.push((
+                flight.task.id(),
+                (at - from) as f64 / (now - then).as_secs_f64(),
+            ));
         }
     }
+    let mut rates: Vec<f64> = match alone {
+        true => finished.to_vec(),
+        false => judged.iter().map(|(_, rate)| *rate).collect(),
+    };
     rates.sort_by(f64::total_cmp);
-    let typical = (rates.len() >= 2).then(|| rates[rates.len() / 2]);
+    let enough = if alone { 1 } else { 2 };
+    let typical = (rates.len() >= enough).then(|| rates[rates.len() / 2]);
     for (id, rate) in judged {
         if let (Some(typical), Some(flight)) = (typical, flights.get_mut(&id)) {
             flight.slow |= rate * SLOW < typical;
@@ -193,7 +213,11 @@ pub(crate) fn parts(held: &[(u64, u64)], length: u64, lanes: usize, most: u64) -
     let size = (total / lanes as u64).clamp(1 << 20, most);
     missing
         .into_iter()
-        .flat_map(|(a, b)| (a..b).step_by(size as usize).map(move |x| (x, (x + size).min(b))))
+        .flat_map(|(a, b)| {
+            (a..b)
+                .step_by(size as usize)
+                .map(move |x| (x, (x + size).min(b)))
+        })
         .collect()
 }
 
@@ -207,15 +231,26 @@ mod tests {
     fn missing_bytes_are_cut_into_parts_a_lane_each() {
         assert_eq!(
             parts(&[], 20 * MIB, 4, 64 * MIB),
-            (0..4).map(|i| (i * 5 * MIB, (i + 1) * 5 * MIB)).collect::<Vec<_>>()
+            (0..4)
+                .map(|i| (i * 5 * MIB, (i + 1) * 5 * MIB))
+                .collect::<Vec<_>>()
         );
         assert_eq!(parts(&[(0, 100)], 100, 4, 64 * MIB), vec![], "all held");
         assert_eq!(
             parts(&[(0, 10), (20, 30)], 3 * MIB, 4, 64 * MIB),
-            vec![(10, 20), (30, MIB + 30), (MIB + 30, 2 * MIB + 30), (2 * MIB + 30, 3 * MIB)],
+            vec![
+                (10, 20),
+                (30, MIB + 30),
+                (MIB + 30, 2 * MIB + 30),
+                (2 * MIB + 30, 3 * MIB)
+            ],
             "gaps, then 1 MiB parts at least"
         );
-        assert_eq!(parts(&[], 1024 * MIB, 4, 64 * MIB).len(), 16, "at most `most`");
+        assert_eq!(
+            parts(&[], 1024 * MIB, 4, 64 * MIB).len(),
+            16,
+            "at most `most`"
+        );
     }
 
     /// A range that fails resumes from where its bytes stopped, its lane redialed; one that never
@@ -249,7 +284,10 @@ mod tests {
         .await;
         assert!(done.is_ok());
         let legs = legs.lock().unwrap().clone();
-        assert!(legs.contains(&(50, 100, true)), "on its lane, redialed: {legs:?}");
+        assert!(
+            legs.contains(&(50, 100, true)),
+            "on its lane, redialed: {legs:?}"
+        );
         let stalled = legs.iter().filter(|(first, ..)| *first == 200).count();
         assert_eq!(stalled, 2, "asked again on a free lane: {legs:?}");
     }
@@ -271,5 +309,58 @@ mod tests {
         .await;
         assert!(matches!(done, Err(Ranged::Again(m)) if m == "try 3"));
         assert_eq!(tries.load(Ordering::Relaxed), 4);
+    }
+
+    /// A leg moving `per_second` bytes a second, a tenth of a second at a time.
+    async fn moving(leg: Leg, per_second: u64) -> Result<(), Ranged<()>> {
+        let mut at = leg.first;
+        while at < leg.end {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            at = (at + per_second / 10).min(leg.end);
+            leg.at.store(at, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    /// Lanes that won slow start finish fast and leave two that shared the path with them at a
+    /// tenth of their rate: neither is slower than the other, so neither is asked again (they
+    /// were, when finished ranges' rates stood in for peers'). A lone range at the tail that is
+    /// far slower than the finished ones is a straggler, and is.
+    #[tokio::test(start_paused = true)]
+    async fn ranges_are_judged_against_peers_in_flight_and_a_lone_straggler_against_finished_ones()
+    {
+        let legs = Arc::new(std::sync::Mutex::new(vec![]));
+        let seen = legs.clone();
+        let ranges = (0..4).map(|i| (i * 10_000, (i + 1) * 10_000));
+        let done = transfer::<(), _, _>(ranges, 4, move |leg| {
+            seen.lock().unwrap().push((leg.first, leg.fresh));
+            let per_second = if leg.first < 20_000 { 10_000 } else { 1_000 };
+            moving(leg, per_second)
+        })
+        .await;
+        assert!(done.is_ok());
+        let legs = legs.lock().unwrap().clone();
+        assert_eq!(legs.len(), 4, "no range asked again: {legs:?}");
+
+        let legs = Arc::new(std::sync::Mutex::new(vec![]));
+        let seen = legs.clone();
+        let done = transfer::<(), _, _>([(0, 10_000), (10_000, 20_000)], 2, move |leg| {
+            let mut seen = seen.lock().unwrap();
+            seen.push((leg.first, leg.fresh));
+            let per_second = match seen.len() {
+                // The straggler, until it is asked again.
+                2 => 500,
+                _ => 10_000,
+            };
+            moving(leg, per_second)
+        })
+        .await;
+        assert!(done.is_ok());
+        let legs = legs.lock().unwrap().clone();
+        let again = legs.iter().skip(2).find(|(first, _)| *first > 10_000);
+        assert!(
+            again.is_some(),
+            "the straggler was asked again from where it stopped: {legs:?}"
+        );
     }
 }
