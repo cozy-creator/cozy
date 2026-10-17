@@ -366,7 +366,7 @@ async fn output<B: MachineBackend>(
         return Err(Refusal(moved, Some(StatusCode::PRECONDITION_FAILED)));
     }
     let OutputSnapshot { parts, length, media_type, .. } = snapshot;
-    let mut response = ranged(&headers, parts, length, m.authority(&caller))?;
+    let mut response = ranged(&headers, parts, length, m.authority(&caller), m.identity.lifecycle.clone())?;
     let headers = response.headers_mut();
     headers.insert(header::ETAG, HeaderValue::from_str(&tag).expect("a revision is ASCII"));
     if let Ok(media_type) = HeaderValue::from_str(&media_type) {
@@ -403,7 +403,14 @@ fn range(headers: &HeaderMap, length: u64) -> Result<Option<(u64, u64)>, Refusal
 }
 
 /// `parts` as 200, or the range the request names as 206, streamed from the blocking pool.
-fn ranged(headers: &HeaderMap, parts: Parts, length: u64, authority: StreamAuthority) -> Answer {
+/// Each chunk the reader takes counts as the rental's use (`Lifecycle::transferred`).
+fn ranged(
+    headers: &HeaderMap,
+    parts: Parts,
+    length: u64,
+    authority: StreamAuthority,
+    lifecycle: Option<Arc<crate::machine::lifecycle::Lifecycle>>,
+) -> Answer {
     let range = range(headers, length)?;
     let (start, end) = range.unwrap_or((0, length));
     let reader = from_offset(parts, start)
@@ -428,7 +435,13 @@ fn ranged(headers: &HeaderMap, parts: Parts, length: u64, authority: StreamAutho
             }
         }
     });
-    let body = authority.wrap(Box::pin(tokio_stream::wrappers::ReceiverStream::new(receiver)));
+    let chunks = tokio_stream::wrappers::ReceiverStream::new(receiver).map(move |chunk| {
+        if let (Ok(_), Some(lifecycle)) = (&chunk, &lifecycle) {
+            lifecycle.transferred();
+        }
+        chunk
+    });
+    let body = authority.wrap(Box::pin(chunks));
     let mut response = Response::new(Body::from_stream(body));
     let headers = response.headers_mut();
     headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
