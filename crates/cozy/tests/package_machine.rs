@@ -1,6 +1,8 @@
 //! `cozy package install|list|update|remove --on` through the real binary: Calcifer, a real TensorD
 //! (COZY_TEST_TENSORD, the cozy-runtime wheel's) added as a machine, and a real Tensorhub (its
 //! dev-build `cozy_ref` job) holding a torch-free package this test publishes.
+// TensorD runs on Unix only for now, and so does its fixture (common::tensord).
+#![cfg(unix)]
 mod common;
 
 use std::path::Path;
