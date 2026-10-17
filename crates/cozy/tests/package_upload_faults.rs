@@ -17,9 +17,9 @@ use std::{
 use common::Home;
 use serde_json::Value;
 
-/// A forward proxy for plain-HTTP store URLs: its first PUT is cut after `cut` bytes of body,
-/// everything else passes through to the URL's host, absolute-form request lines and all.
-fn proxy(cut: usize) -> (String, Arc<AtomicUsize>) {
+/// A forward proxy for plain-HTTP store URLs: its first PUT is cut halfway through its body,
+/// everything else passes through to the URL's host, one request per connection.
+fn proxy() -> (String, Arc<AtomicUsize>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = format!("http://{}", listener.local_addr().unwrap());
     let puts = Arc::new(AtomicUsize::new(0));
@@ -27,13 +27,13 @@ fn proxy(cut: usize) -> (String, Arc<AtomicUsize>) {
     std::thread::spawn(move || {
         for client in listener.incoming().flatten() {
             let puts = counted.clone();
-            std::thread::spawn(move || carry(client, cut, &puts));
+            std::thread::spawn(move || carry(client, &puts));
         }
     });
     (address, puts)
 }
 
-fn carry(mut client: TcpStream, cut: usize, puts: &AtomicUsize) {
+fn carry(mut client: TcpStream, puts: &AtomicUsize) {
     let mut head = Vec::new();
     let mut byte = [0u8; 1];
     while !head.ends_with(b"\r\n\r\n") {
@@ -42,19 +42,29 @@ fn carry(mut client: TcpStream, cut: usize, puts: &AtomicUsize) {
         }
         head.push(byte[0]);
     }
-    let line = String::from_utf8_lossy(&head)
-        .lines()
-        .next()
+    let text = String::from_utf8_lossy(&head).into_owned();
+    let lines: Vec<&str> = text.split("\r\n").filter(|l| !l.is_empty()).collect();
+    let mut words = lines
+        .first()
+        .copied()
         .unwrap_or_default()
-        .to_owned();
-    let mut words = line.split_whitespace();
+        .split_whitespace();
     let (method, url) = (
         words.next().unwrap_or_default(),
         words.next().unwrap_or_default(),
     );
+    let header = |name: &str| {
+        lines.iter().find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.eq_ignore_ascii_case(name).then(|| value.trim())
+        })
+    };
+    let length: usize = header("content-length")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
     if method == "PUT" && puts.fetch_add(1, Ordering::SeqCst) == 0 {
-        let mut body = vec![0; cut];
-        let _ = client.read_exact(&mut body);
+        let mut half = vec![0; length / 2];
+        let _ = client.read_exact(&mut half);
         return;
     }
     let authority = url
@@ -64,13 +74,22 @@ fn carry(mut client: TcpStream, cut: usize, puts: &AtomicUsize) {
     let Ok(mut store) = TcpStream::connect(authority) else {
         return;
     };
-    if store.write_all(&head).is_err() {
+    // One request per connection: the store answers and closes, and so does the proxy.
+    let kept = lines.iter().filter(|line| {
+        let line = line.to_ascii_lowercase();
+        !line.starts_with("connection:") && !line.starts_with("proxy-connection:")
+    });
+    let head: Vec<&str> = kept.copied().chain(["Connection: close"]).collect();
+    if store
+        .write_all(format!("{}\r\n\r\n", head.join("\r\n")).as_bytes())
+        .is_err()
+    {
         return;
     }
     let (mut from_client, mut to_store) = (client.try_clone().unwrap(), store.try_clone().unwrap());
     std::thread::spawn(move || {
-        let _ = std::io::copy(&mut from_client, &mut to_store);
-        let _ = to_store.shutdown(std::net::Shutdown::Write);
+        let mut body = from_client.take(length as u64);
+        let _ = std::io::copy(&mut body, &mut to_store);
     });
     let _ = std::io::copy(&mut store, &mut client);
 }
@@ -87,7 +106,19 @@ fn a_publish_whose_upload_is_cut_sends_it_again_and_completes() {
             .unwrap(),
         std::process::id()
     );
-    std::fs::write(tiny.join("tiny/salt.txt"), salt.repeat(4096)).unwrap();
+    // Bytes no store holds and no compressor shrinks: the sdist's PUT is a real upload.
+    let mut state = salt.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+        (h ^ b as u64).wrapping_mul(0x0100_0000_01b3)
+    });
+    let noise: Vec<u8> = (0..256 << 10)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u8
+        })
+        .collect();
+    std::fs::write(tiny.join("tiny/salt.bin"), noise).unwrap();
     let cozy = |args: &[&str], proxy: Option<&str>| {
         let mut command = home.command();
         command
@@ -102,7 +133,7 @@ fn a_publish_whose_upload_is_cut_sends_it_again_and_completes() {
     };
     let locked = cozy(&["--json", "package", "lock"], None);
     assert_eq!(locked.code, 0, "{locked:?}");
-    let (address, puts) = proxy(64 << 10);
+    let (address, puts) = proxy();
     let published = cozy(&["--json", "package", "publish"], Some(&address));
     assert!(
         puts.load(Ordering::SeqCst) > 0,
