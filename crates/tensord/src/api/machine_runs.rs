@@ -261,11 +261,13 @@ fn reason(body: &Value) -> v1::Reason {
         Some(6) => "request",
         _ => "machine",
     };
-    message_reason(
+    let mut reason = message_reason(
         body["error_code"].as_str().unwrap_or_default(),
         body["safe_message"].as_str().unwrap_or_default(),
         origin,
-    )
+    );
+    reason.detail = body["failure_detail"].as_str().unwrap_or_default().into();
+    reason
 }
 
 fn message_reason(code: &str, message: &str, origin: &str) -> v1::Reason {
@@ -274,12 +276,14 @@ fn message_reason(code: &str, message: &str, origin: &str) -> v1::Reason {
             code: "failure_record_invalid".into(),
             message: "the recorded failure has no structured error code".into(),
             origin: "machine".into(),
+            ..Default::default()
         };
     }
     v1::Reason {
         code: code.into(),
         message: message.into(),
         origin: origin.into(),
+        ..Default::default()
     }
 }
 

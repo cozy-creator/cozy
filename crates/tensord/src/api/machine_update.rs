@@ -285,6 +285,7 @@ fn step_event(update: &Update, step: &crate::machine::update::Step) -> v1::Event
                 code: code.into(),
                 message: update.error.clone(),
                 origin: "machine".into(),
+                ..Default::default()
             }),
             result: v1::Json::parse(result.to_string()).ok(),
             ..Default::default()

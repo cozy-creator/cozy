@@ -919,6 +919,14 @@ impl Engine {
         if let Err(error) = result {
             tracing::warn!("execution {id}: triage bundle not kept: {error}");
         }
+        // Its traceback's end travels with the run, in its log.
+        let detail = self.triage(id).ok().flatten().and_then(|(_, bundle)| crate::triage::detail(&bundle));
+        for line in detail.iter().flat_map(|detail| detail.lines()) {
+            if let Err(error) = self.append_log(id, "error", line) {
+                tracing::warn!("execution {id}: its failure is not in its log: {error}");
+                break;
+            }
+        }
     }
     /// The run's triage bundle bytes and their reference, if it kept one.
     pub fn triage(&self, id: &str) -> io::Result<Option<(crate::triage::TriageRef, Vec<u8>)>> {
