@@ -42,9 +42,7 @@ impl MachineIdentity {
         if keys.is_empty() || receipt_key.len() < 32 {
             return Err("authorized owner keys and a >=32-byte readiness key are required".into());
         }
-        let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/uuid")?
-            .trim()
-            .to_owned();
+        let boot_id = uuid::Uuid::new_v4().to_string();
         let rcgen::CertifiedKey { cert, signing_key } =
             rcgen::generate_simple_self_signed(vec!["cozy.worker".into(), "localhost".into()])?;
         let cert_der = cert.der().to_vec();

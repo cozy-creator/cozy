@@ -713,6 +713,10 @@ fn a_first_load_fills_into_memory_reserved_at_admission() {
     let fx = Fixture::new("reserve", &[3 * MIB, 40 * MIB]);
     let tier = tier(&fx, 1 << 30);
     tier.prepare(vec![fx.grant()], false);
+    // prepare reserves on its own thread; the scenario asks once that allocation is under way.
+    while tier.facts().reserved_bytes == 0 {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
     let (_executor, a) = Executor::spawn(&tier);
     // The ask waits for an allocation under way rather than allocating again.
     let granted = ask(&tier, a, &fx).expect("room");

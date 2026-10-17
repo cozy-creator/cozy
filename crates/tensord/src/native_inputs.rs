@@ -172,9 +172,7 @@ impl SourceIntake {
         let writer = WriterGuard::acquire(store.root()).map_err(native)?;
         fs::create_dir_all(staging).map_err(database)?;
         let directory = staging.join(
-            fs::read_to_string("/proc/sys/kernel/random/uuid")
-                .map_err(database)?
-                .trim(),
+            uuid::Uuid::new_v4().to_string(),
         );
         fs::create_dir(&directory).map_err(database)?;
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).map_err(database)?;

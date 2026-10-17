@@ -164,7 +164,7 @@ impl Catalog {
         if record.identity != identity {
             return Err(invalid("generation identity differs from its installation"));
         }
-        let expected = directory.join("env/bin/python");
+        let expected = cozy_platform::paths::venv_python(&directory.join("env"));
         // The venv's interpreter may be a symlink into uv's immutable interpreter store.
         if record.python != expected || !record.python.is_file() {
             return Err(invalid(

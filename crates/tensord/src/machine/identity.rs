@@ -1,11 +1,14 @@
 //! The machine lifetime: its boot id and TLS leaf, persisted with the root so a restarted
 //! service is the same machine. Files and formats are the Go agent's (`layout.go`).
-use cozy_platform::process::{Birth, State};
+use cozy_platform::{
+    lock::{Kind, LockFile},
+    process::{Birth, State},
+};
 use super::grant::Layout;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use std::{
     fs::{self, File, OpenOptions},
-    io::{self, Read, Write},
+    io::{self, Write},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::Path,
 };
@@ -27,42 +30,24 @@ pub struct Lifetime {
 /// sleep, its descriptors already closed): a live holder refuses the root, and a lock only
 /// dying processes or none hold is waited out until the kernel releases it.
 pub fn hold(layout: &Layout) -> io::Result<()> {
-    use fs2::FileExt;
     fs::create_dir_all(&layout.state)?;
-    let lock = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .open(layout.state.join("agent.lock"))?;
-    if lock.try_lock_exclusive().is_err() {
-        let dying = |pid: &u32| Birth::of(*pid).and_then(|birth| birth.state()).map_or(true, |state| matches!(state, State::Gone | State::Dying));
-        if let Some(live) = holders(&lock)?.into_iter().find(|pid| !dying(pid)) {
-            let root = layout.root.display();
-            return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("another machine owns the root {root} (pid {live})")));
+    let lock = LockFile::new(layout.state.join("agent.lock"));
+    let held = match lock.try_lock(Kind::Exclusive)? {
+        Some(held) => held,
+        None => {
+            let holder = lock.holder()?.and_then(|record| serde_json::from_slice::<Birth>(&record).ok());
+            let live = holder.filter(|birth| birth.state().is_ok_and(|state| matches!(state, State::Live | State::Stopped)));
+            if let Some(live) = live {
+                let root = layout.root.display();
+                return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("another machine owns the root {root} (pid {})", live.pid)));
+            }
+            lock.lock(Kind::Exclusive)?
         }
-        lock.lock_exclusive()?;
-    }
+    };
+    held.publish(&serde_json::to_vec(&Birth::own()?)?)?;
     // Held by this parent and the service it forks; never by an executor (close-on-exec).
-    std::mem::forget(lock);
+    std::mem::forget(held);
     Ok(())
-}
-
-/// Every process with `file` open, but for this descriptor of it.
-fn holders(file: &File) -> io::Result<Vec<u32>> {
-    use std::os::{fd::AsRawFd, unix::fs::MetadataExt};
-    let (own, probe) = (file.metadata()?, (std::process::id(), file.as_raw_fd().to_string()));
-    let mut found = vec![];
-    for entry in fs::read_dir("/proc")? {
-        let Some(pid) = entry?.file_name().to_str().and_then(|name| name.parse::<u32>().ok()) else { continue };
-        let Ok(fds) = fs::read_dir(format!("/proc/{pid}/fd")) else { continue };
-        let open = fds.flatten().filter(|fd| (pid, fd.file_name().to_string_lossy().into_owned()) != probe);
-        if open.filter_map(|fd| fs::metadata(fd.path()).ok()).any(|meta| (meta.dev(), meta.ino()) == (own.dev(), own.ino())) {
-            found.push(pid);
-        }
-    }
-    Ok(found)
 }
 
 /// Mints or reopens this root's lifetime. A root booted by the Go agent keeps its boot id
@@ -148,7 +133,7 @@ fn mint_leaf() -> io::Result<(String, String)> {
 
 pub fn random<const N: usize>() -> io::Result<[u8; N]> {
     let mut out = [0; N];
-    File::open("/dev/urandom")?.read_exact(&mut out)?;
+    getrandom::fill(&mut out).map_err(|error| io::Error::other(error.to_string()))?;
     Ok(out)
 }
 
@@ -183,12 +168,18 @@ fn invalid(detail: &str) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
 
     /// A holder just killed is waited out, never refused; a live one is refused.
     #[test]
     fn a_killed_holder_is_waited_out_and_a_live_one_refused() {
-        const HOLD: &str = "import fcntl, sys, time; f = open(sys.argv[1], 'a'); \
-            fcntl.flock(f, fcntl.LOCK_EX); print('held', flush=True); time.sleep(600)";
+        const HOLD: &str = "import fcntl, json, os, sys, time; f = open(sys.argv[1], 'a'); \
+            fcntl.flock(f, fcntl.LOCK_EX); \
+            stat = open('/proc/self/stat').read().rsplit(') ', 1)[1].split(); \
+            boot = open('/proc/sys/kernel/random/boot_id').read().strip(); \
+            open(sys.argv[1] + '.holder', 'w').write(json.dumps( \
+            {'pid': os.getpid(), 'boot_id': boot, 'start_ticks': int(stat[19])})); \
+            print('held', flush=True); time.sleep(600)";
         let root = std::env::temp_dir().join(format!("tensord-hold-{}", URL_SAFE_NO_PAD.encode(random::<9>().unwrap())));
         let layout = Layout::new(&root, None);
         fs::create_dir_all(&layout.state).unwrap();

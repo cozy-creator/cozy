@@ -72,8 +72,7 @@ pub fn materialize_uploaded(
     staging: &Path,
 ) -> Result<MaterializedPackage, Status> {
     fs::create_dir_all(staging).map_err(storage)?;
-    let uuid = fs::read_to_string("/proc/sys/kernel/random/uuid").map_err(storage)?;
-    let root = staging.join(uuid.trim());
+    let root = staging.join(uuid::Uuid::new_v4().to_string());
     fs::create_dir(&root).map_err(storage)?;
     fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).map_err(storage)?;
     let hold = OpenOptions::new()
@@ -359,7 +358,7 @@ fn publish(config: &InstallerConfig, mut command: Command, stop: Option<&PullCan
     let record: GenerationRecord = serde_json::from_reader(file.take(8 << 20))
         .map_err(|_| Status::data_loss("published generation manifest is invalid"))?;
     if record.identity != returned.identity
-        || record.python != directory.join("env/bin/python")
+        || record.python != cozy_platform::paths::venv_python(&directory.join("env"))
         || !record.python.is_file()
     {
         return Err(Status::data_loss(
