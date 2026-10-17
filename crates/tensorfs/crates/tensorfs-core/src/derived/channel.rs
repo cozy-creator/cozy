@@ -22,7 +22,7 @@ use crate::fetch::{Access, Fetcher, Priority, Ticket};
 use crate::store::Store;
 use crate::transport::PullCancellation;
 use std::io::{self, Read, Write};
-use crate::platform::ipc::LocalStream;
+use cozy_platform::ipc::LocalStream;
 use std::sync::{Arc, Mutex};
 
 const JSON: u8 = 0;
@@ -944,7 +944,7 @@ mod source_channel_tests {
         .unwrap();
         let receipt = super::super::commit(&store, &meta, &transaction, 1).unwrap();
         drop(begun);
-        let (client, server) = crate::platform::ipc::pair().unwrap();
+        let (client, server) = cozy_platform::ipc::pair().unwrap();
         std::thread::scope(|scope| {
             let held =
                 scope.spawn(|| serve_source(&store, &meta, &receipt.manifest, server, &|| Ok(()), None));
@@ -1084,7 +1084,7 @@ mod source_channel_tests {
         assert_eq!(gets(), 1);
         drop(writer);
         std::fs::remove_file(store.object_path(&absent.sha256)).unwrap();
-        let (client, server) = crate::platform::ipc::pair().unwrap();
+        let (client, server) = cozy_platform::ipc::pair().unwrap();
         std::thread::scope(|scope| {
             let served = scope.spawn(|| serve_source(&store, &meta, &output, server, &|| Ok(()), Some(&fetch)));
             let mut client = Channel(client);

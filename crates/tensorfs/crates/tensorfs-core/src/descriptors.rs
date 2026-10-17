@@ -22,14 +22,14 @@ static EXHAUSTED: AtomicU64 = AtomicU64::new(0);
 /// Raise the soft RLIMIT_NOFILE to the hard limit, once per process. Idempotent; a refused
 /// raise leaves the limit where it was and the budget below measures that.
 pub fn raise() {
-    RAISE.call_once(crate::platform::process::raise_fd_limit);
+    RAISE.call_once(cozy_platform::process::raise_fd_limit);
 }
 
 /// Descriptors this process can still open now: soft limit less those open and `MARGIN`.
 /// `None` when the platform cannot say (no descriptor table to count, or no soft limit).
 pub fn available() -> Option<u64> {
-    let soft = crate::platform::process::fd_limit()?;
-    let open = match crate::platform::process::open_fds().map_err(std::io::Error::from) {
+    let soft = cozy_platform::process::fd_limit()?;
+    let open = match cozy_platform::process::open_fds().map_err(std::io::Error::from) {
         Ok(open) => open,
         // Counting takes a descriptor too: a table too full to count is full.
         Err(error) if full(&error) => return Some(0),
@@ -39,14 +39,14 @@ pub fn available() -> Option<u64> {
 }
 
 fn full(error: &std::io::Error) -> bool {
-    crate::platform::process::fd_table_full(error)
+    cozy_platform::process::fd_table_full(error)
 }
 
 /// Requests in flight the raised descriptor limit holds, at most `wanted`: a budget sized once
 /// from the limit, not from what happens to be free.
 pub fn requests(wanted: usize) -> usize {
     raise();
-    crate::platform::process::fd_limit().map_or(wanted, |soft| {
+    cozy_platform::process::fd_limit().map_or(wanted, |soft| {
         usize::try_from(soft.saturating_sub(MARGIN) / PER_REQUEST).unwrap_or(usize::MAX)
     })
     .clamp(1, wanted)

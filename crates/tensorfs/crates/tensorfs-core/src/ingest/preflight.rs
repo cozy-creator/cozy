@@ -203,7 +203,7 @@ pub fn stage(root: &Path, heads: &[MemberHead]) -> Result<Staged> {
             fs::OpenOptions::new()
                 .write(true)
                 .open(&path)
-                .and_then(|file| Ok(crate::platform::durable::set_sparse_len(&file, head.length)?))
+                .and_then(|file| Ok(cozy_platform::durable::set_sparse_len(&file, head.length)?))
                 .map_err(|error| io(format!("size {}", path.display()), error))?;
         }
         carriers.push(CarrierInput {

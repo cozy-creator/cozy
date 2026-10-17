@@ -19,13 +19,13 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use crate::platform::durable::Mode;
+use cozy_platform::durable::Mode;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use crate::disk::{self, DiskClass};
+use cozy_platform::durable::DiskClass;
 use crate::err::{Refusal, Result};
 use crate::store::{fsync_dir, Store};
 
@@ -171,7 +171,7 @@ fn sync_files(paths: &[PathBuf]) -> Result<()> {
         for _ in 0..SYNC_THREADS.min(paths.len()) {
             scope.spawn(|| {
                 while let Some(path) = paths.get(next.fetch_add(1, Ordering::Relaxed)) {
-                    match crate::platform::durable::sync_file(path).map_err(std::io::Error::from) {
+                    match cozy_platform::durable::sync_file(path).map_err(std::io::Error::from) {
                         Ok(()) => {}
                         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                         Err(error) => {
@@ -224,7 +224,7 @@ impl Epoch {
         if store.disk_class() != DiskClass::Persistent {
             return Ok(None);
         }
-        let Some(boot) = disk::boot_id() else {
+        let Some(boot) = cozy_platform::process::boot_id().ok() else {
             return Ok(None);
         };
         let since = now_nanos();
@@ -369,13 +369,13 @@ pub struct Recovery {
 /// the markers that named them. Nothing to do, and no lock taken, without a marker left by
 /// an earlier boot.
 pub(crate) fn recover(store: &Store) -> Result<Option<Recovery>> {
-    let boot = disk::boot_id();
+    let boot = cozy_platform::process::boot_id().ok();
     let earlier = |marker: &Found| boot.as_deref() != Some(marker.boot.as_str());
     if !found(store.root())?.iter().any(earlier) {
         return Ok(None);
     }
     let _writer = crate::catalog::WriterGuard::acquire(store.root())?;
-    let _dir = crate::platform::lock::dir(&store.root().join(DIR))
+    let _dir = cozy_platform::lock::dir(&store.root().join(DIR))
         .map_err(|error| io("lock the unsynced-admission markers", error))?;
     // Another process may have recovered while this one waited for the lock.
     let claimed = dead(found(store.root())?.into_iter().filter(earlier).collect());
@@ -481,7 +481,7 @@ fn suspects(root: &Path, cutoff: i64) -> Result<Vec<(String, PathBuf, bool)>> {
 
 #[cfg(test)]
 pub(crate) mod testing {
-    use crate::platform::durable;
+    use cozy_platform::durable;
     use std::path::{Path, PathBuf};
 
     /// A fresh root beside the test binary: the build directory, a persistent disk.

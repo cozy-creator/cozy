@@ -9,7 +9,7 @@
 //! Admission is `writing → verified-temp → installed`: temp in `tmp/`, hash while writing,
 //! fsync, 0444, then a no-clobber `link()` into place plus a parent-directory fsync. A
 //! crash at any stage leaves a temp, never a partial object under `objects/`. Which of those
-//! syncs an admission pays depends on the disk the Store lives on ([`crate::disk`]): none on
+//! syncs an admission pays depends on the disk the Store lives on ([`cozy_platform::durable::DiskClass`]): none on
 //! an ephemeral one, and on a persistent one none inside a pull, whose batch sync
 //! covers them ([`crate::unsynced`]).
 //!
@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 
 use crate::err::{refuse, Code, Refusal, Result};
 use crate::ids::{hex64, Doc, ObjectRef};
-use crate::platform::durable::{self, FileId, Mode, Owner};
+use cozy_platform::durable::{self, FileId, Mode, Owner};
 use crate::sha256::{self, Sha256};
 
 /// An addition already held by a cache repository needs no mutation. Authored local
@@ -313,7 +313,7 @@ pub struct Store {
     /// This process's verified-blob index for the catalog, shared with every other handle.
     trust: std::sync::Arc<crate::catalog::Trust>,
     /// The filesystem this Store lives on, and so what a crash can take from it.
-    disk: crate::disk::Filesystem,
+    disk: cozy_platform::durable::Filesystem,
     /// The pull whose batch sync covers this handle's admissions (persistent disk).
     epoch: Option<std::sync::Arc<crate::unsynced::Epoch>>,
     /// The embedding process's exclusive owner role, retained by clones and read pins.
@@ -540,7 +540,7 @@ impl Store {
             progress: None,
             budget: read_disk_budget(root),
             trust: crate::catalog::Trust::of(root),
-            disk: crate::disk::filesystem(root),
+            disk: cozy_platform::durable::filesystem(root),
             epoch: None,
             owner: None,
         })
@@ -581,12 +581,12 @@ impl Store {
         &self.root
     }
 
-    /// The filesystem this Store lives on. See [`crate::disk`].
-    pub fn disk(&self) -> crate::disk::Filesystem {
+    /// The filesystem this Store lives on. See [`cozy_platform::durable::DiskClass`].
+    pub fn disk(&self) -> cozy_platform::durable::Filesystem {
         self.disk
     }
 
-    pub fn disk_class(&self) -> crate::disk::DiskClass {
+    pub fn disk_class(&self) -> cozy_platform::durable::DiskClass {
         self.disk.class
     }
 
@@ -594,9 +594,9 @@ impl Store {
     /// an ephemeral disk, and not under a pull's epoch, whose batch sync covers them.
     pub(crate) fn flushes(&self) -> bool {
         match self.disk.class {
-            crate::disk::DiskClass::Ephemeral => false,
-            crate::disk::DiskClass::Network => true,
-            crate::disk::DiskClass::Persistent => self.epoch.is_none(),
+            cozy_platform::durable::DiskClass::Ephemeral => false,
+            cozy_platform::durable::DiskClass::Network => true,
+            cozy_platform::durable::DiskClass::Persistent => self.epoch.is_none(),
         }
     }
 
@@ -627,9 +627,9 @@ impl Store {
 
     /// The same Store as if it lived on a disk of `class`: benchmarks of one real disk.
     #[cfg(test)]
-    pub(crate) fn with_disk_class(self, class: crate::disk::DiskClass) -> Store {
+    pub(crate) fn with_disk_class(self, class: cozy_platform::durable::DiskClass) -> Store {
         Store {
-            disk: crate::disk::Filesystem {
+            disk: cozy_platform::durable::Filesystem {
                 class,
                 kind: "injected",
             },
@@ -816,7 +816,7 @@ impl Store {
             // This also prevents another writer from seeing a newly created directory
             // before its owner/mode are established. A crashed creator leaves a named,
             // explicitly refused owner mismatch rather than a blind repair permission.
-            let admission = crate::platform::lock::dir(&current)
+            let admission = cozy_platform::lock::dir(&current)
                 .map_err(|error| io("lock Store directory admission", error))?;
             current.push(part.as_os_str());
             let created = match fs::create_dir(&current) {
@@ -1279,7 +1279,7 @@ impl Store {
             let f = OpenOptions::new().write(true).create_new(true).mode(0o600)
                 .open(&tmp)
                 .map_err(|e| io(format!("create temp {}", tmp.display()), e))?;
-            match crate::platform::lock::try_claim(&f) {
+            match cozy_platform::lock::try_claim(&f) {
                 // A reaper that saw the temp before the lock landed may have unlinked it
                 // already: the name must still be this descriptor's.
                 Ok(true) if FileId::at(&tmp).ok() == FileId::of(&f).ok() => break (tmp, f),
@@ -1757,7 +1757,7 @@ impl Store {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(e) => return Err(io(format!("open temp {}", p.display()), e)),
             };
-            if !crate::platform::lock::try_claim(&f).unwrap_or(false) {
+            if !cozy_platform::lock::try_claim(&f).unwrap_or(false) {
                 kept += 1;
                 continue;
             }
@@ -1849,10 +1849,10 @@ fn read_disk_budget(root: &Path) -> Option<u64> {
 
 /// Serializes Store creation on one root across threads and processes. A lock on the root
 /// directory itself leaves nothing behind in it.
-fn creation_lock(root: &Path) -> Result<crate::platform::lock::DirLock> {
+fn creation_lock(root: &Path) -> Result<cozy_platform::lock::DirLock> {
     durable::open_nofollow(root, OpenOptions::new().read(true))
         .map_err(|error| io(format!("open Store root {}", root.display()), error))?;
-    crate::platform::lock::dir(root).map_err(|error| io(format!("lock Store root {}", root.display()), error))
+    cozy_platform::lock::dir(root).map_err(|error| io(format!("lock Store root {}", root.display()), error))
 }
 
 /// No handle is returned while an unclean shutdown's unsynced admissions are unverified.
@@ -1865,7 +1865,7 @@ fn open_validated(root: &Path) -> Result<Store> {
         progress: None,
         budget: read_disk_budget(root),
         trust: crate::catalog::Trust::of(root),
-        disk: crate::disk::filesystem(root),
+        disk: cozy_platform::durable::filesystem(root),
         epoch: None,
         owner,
     };

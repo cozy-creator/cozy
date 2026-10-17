@@ -4103,6 +4103,7 @@ version = "0.10.0"
 dependencies = [
  "base64 0.22.1",
  "bytes",
+ "cozy-platform",
  "fuser",
  "futures",
  "http-body-util",
@@ -4125,13 +4126,13 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "webpki-roots",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "tensorfs-plane"
 version = "0.10.0"
 dependencies = [
+ "cozy-platform",
  "libc",
  "libloading 0.9.0",
  "tensorfs-core",
@@ -4143,6 +4144,7 @@ dependencies = [
 name = "tensorfs-py"
 version = "0.10.0"
 dependencies = [
+ "cozy-platform",
  "pyo3",
  "tensorfs-core",
  "tensorfs-plane",

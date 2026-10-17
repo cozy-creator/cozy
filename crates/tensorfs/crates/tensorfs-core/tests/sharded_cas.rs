@@ -108,7 +108,7 @@ impl Staged {
                 // The declared payload, as a hole. `read_header` measures the file and
                 // checks every run against it; nothing in a header-only path reads it.
                 let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
-                tensorfs_core::platform::durable::set_sparse_len(&file, full_length).unwrap();
+                cozy_platform::durable::set_sparse_len(&file, full_length).unwrap();
             }
             by_member.insert(member, path);
         }
@@ -311,7 +311,7 @@ fn an_index_on_disk_still_resolves_its_shards_as_siblings() {
         )
         .unwrap();
         let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
-        tensorfs_core::platform::durable::set_sparse_len(&file, full_length).unwrap();
+        cozy_platform::durable::set_sparse_len(&file, full_length).unwrap();
         if name.ends_with(".index.json") {
             index = Some(path);
         }

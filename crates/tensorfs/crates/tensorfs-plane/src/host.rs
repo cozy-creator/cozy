@@ -29,7 +29,7 @@ use std::sync::atomic::{fence, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Orde
 use std::sync::{Mutex, OnceLock};
 
 use tensorfs_core::ids::ObjectRef;
-use tensorfs_core::platform::shm::{self, Region, RESIZE_SEALS, WRITE_SEALS};
+use cozy_platform::shm::{self, Region, RESIZE_SEALS, WRITE_SEALS};
 
 use crate::cuda;
 use crate::io::{IoTally, Mode, Source};

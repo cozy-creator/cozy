@@ -4,7 +4,7 @@
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use crate::platform::durable::Mode;
+use cozy_platform::durable::Mode;
 use std::path::PathBuf;
 use std::time::SystemTime;
 

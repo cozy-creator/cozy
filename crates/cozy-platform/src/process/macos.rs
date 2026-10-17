@@ -102,6 +102,61 @@ pub(super) fn wait(handle: &Handle, period: Option<Duration>) -> io::Result<bool
     unix::readable(handle.0.as_fd(), period)
 }
 
+pub(super) fn usage(pid: u32) -> io::Result<super::Usage> {
+    // SAFETY: plain-old-data the call fills.
+    let mut task: libc::proc_taskinfo = unsafe { mem::zeroed() };
+    let size = mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
+    // SAFETY: a writable buffer of exactly `size` bytes.
+    let filled = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTASKINFO,
+            0,
+            (&mut task as *mut libc::proc_taskinfo).cast(),
+            size,
+        )
+    };
+    if filled != size {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(super::Usage {
+        cpu: task.pti_total_user + task.pti_total_system,
+        running: task.pti_numrunning > 0,
+    })
+}
+
+/// `kern.bootsessionuuid`: a UUID the kernel draws at each boot.
+pub(super) fn boot_id() -> io::Result<String> {
+    let mut uuid = [0u8; 64];
+    let mut len = uuid.len();
+    // SAFETY: a NUL-terminated name and a writable buffer of `len` bytes.
+    if unsafe {
+        libc::sysctlbyname(
+            c"kern.bootsessionuuid".as_ptr(),
+            uuid.as_mut_ptr().cast(),
+            &mut len,
+            ptr::null_mut(),
+            0,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(String::from_utf8_lossy(&uuid[..len])
+        .trim_end_matches('\0')
+        .into())
+}
+
+/// `ru_maxrss`, in bytes on macOS.
+pub(super) fn peak_resident() -> io::Result<u64> {
+    // SAFETY: plain-old-data the call fills.
+    let mut usage: libc::rusage = unsafe { mem::zeroed() };
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(usage.ru_maxrss as u64)
+}
+
 fn info(pid: u32) -> io::Result<libc::proc_bsdinfo> {
     // SAFETY: plain-old-data the call fills.
     let mut info: libc::proc_bsdinfo = unsafe { mem::zeroed() };

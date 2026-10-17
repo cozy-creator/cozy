@@ -1,5 +1,5 @@
 use std::fs;
-use tensorfs_core::platform::durable::symlink;
+use cozy_platform::durable::symlink;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 

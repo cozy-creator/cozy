@@ -17,7 +17,7 @@ use crate::store::{Fault, Store};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use crate::platform::durable::FileAt as _;
+use cozy_platform::durable::FileAt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -201,7 +201,7 @@ impl Part {
         if created && writable {
             // Newly created ancestors are durable before any progress is acknowledged.
             for dir in dir.ancestors().take(4) {
-                crate::platform::durable::sync_dir(dir).map_err(io)?;
+                cozy_platform::durable::sync_dir(dir).map_err(io)?;
             }
         }
         let part = Part {
@@ -287,7 +287,7 @@ impl Part {
         }
         let temp = self.dir.join("chunks.tmp");
         fs::write(&temp, text)
-            .and_then(|()| Ok(crate::platform::durable::sync_file(&temp)?))
+            .and_then(|()| Ok(cozy_platform::durable::sync_file(&temp)?))
             .and_then(|()| fs::rename(&temp, self.dir.join("chunks")))
             .map_err(io)?;
         record.0 = OpenOptions::new()
@@ -391,7 +391,7 @@ pub(crate) fn fetch_sources(
 
 /// Allocated bytes: a sparse part holds only what its chunks wrote.
 fn allocated(md: &fs::Metadata) -> u64 {
-    crate::platform::durable::allocated(md)
+    cozy_platform::durable::allocated(md)
 }
 
 pub(crate) fn discard_owner(store: &Store, owner: &str) -> Result<()> {

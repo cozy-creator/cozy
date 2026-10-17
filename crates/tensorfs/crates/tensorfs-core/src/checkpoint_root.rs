@@ -48,7 +48,7 @@ pub fn check_source(store: &Store, source: &str, manifest: &ObjectRef) -> Result
 }
 
 fn verify_source(store: &Store, repository: &RepositoryName, manifest: &ObjectRef) -> Result<()> {
-    let file = crate::platform::durable::open_nofollow(&store.repository_path(repository), OpenOptions::new().read(true))
+    let file = cozy_platform::durable::open_nofollow(&store.repository_path(repository), OpenOptions::new().read(true))
         .map_err(std::io::Error::from)
         .map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {

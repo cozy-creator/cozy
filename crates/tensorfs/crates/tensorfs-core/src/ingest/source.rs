@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Read;
-use crate::platform::durable::FileId;
+use cozy_platform::durable::FileId;
 use std::path::{Path, PathBuf};
 
 use crate::canon::{self, Value};
@@ -387,7 +387,7 @@ pub fn bind_registry(store: &Store, bytes: Option<&[u8]>) -> Result<()> {
         crate::meta::now_nanos_unique()
     ));
     let written = fs::write(&temporary, bytes)
-        .and_then(|()| Ok(crate::platform::durable::sync_file(&temporary)?))
+        .and_then(|()| Ok(cozy_platform::durable::sync_file(&temporary)?))
         .and_then(|()| fs::rename(&temporary, &path));
     if let Err(error) = written {
         let _ = fs::remove_file(&temporary);
@@ -4595,7 +4595,7 @@ mod tests {
 
     #[test]
     fn verified_file_fence_refuses_symlinks_and_same_length_replacement() {
-        use crate::platform::durable::symlink;
+        use cozy_platform::durable::symlink;
 
         let root = temporary("file-fence");
         fs::create_dir_all(&root).unwrap();

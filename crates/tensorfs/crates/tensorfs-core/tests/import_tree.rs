@@ -169,7 +169,7 @@ fn symlink_member_is_refused_before_reading_its_target() {
     let dir = directory("symlink");
     let store = Store::init(&dir).unwrap();
     fs::write(dir.join("target"), b"first member").unwrap();
-    tensorfs_core::platform::durable::symlink(&dir.join("target"), &dir.join("a")).unwrap();
+    cozy_platform::durable::symlink(&dir.join("target"), &dir.join("a")).unwrap();
     assert_eq!(
         source_artifact::import_tree(&store, &owner(), &tree(), &files(&dir), &Fault::default())
             .unwrap_err()

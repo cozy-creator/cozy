@@ -409,7 +409,7 @@ impl Journal {
             .map_err(|error| io("sync local checkpoint cursor", error))?;
         fs::rename(&temporary, &path)
             .map_err(|error| io("replace local checkpoint cursor", error))?;
-        crate::platform::durable::sync_dir(path.parent().expect("journal has a parent"))
+        cozy_platform::durable::sync_dir(path.parent().expect("journal has a parent"))
             .map_err(|error| io("sync local checkpoint cursor directory", error))
     }
 

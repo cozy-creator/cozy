@@ -1,6 +1,6 @@
 [package]
 name = "cozy-platform"
-description = "Every OS-specific seam of the cozy binary: paths, locks, durability, processes, services, GPU probe"
+description = "Every OS-specific seam of the cozy binary: paths, locks, files, processes, containment, shared memory, IPC, services, GPU probe"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -21,11 +21,16 @@ libc.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [
+    "Wdk_System_SystemInformation",
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Storage_FileSystem",
     "Win32_System_Console",
     "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
     "Win32_System_JobObjects",
+    "Win32_System_ProcessStatus",
     "Win32_System_Registry",
     "Win32_System_Threading",
 ] }

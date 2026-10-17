@@ -10,8 +10,8 @@ use std::{
     thread,
     time::Duration,
 };
+use cozy_platform::durable::{self, FileId};
 use tensorfs_core::{
-    platform::durable::{self, FileId},
     gc,
     ids::{Doc, ObjectRef},
     providers::{self, Provenance, Resolution, ResolvedMember},

@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// A carrier as the plan spells it: its canonical path, a JSON string (macOS's temp dir is
 /// behind the /var symlink, and Windows' paths escape their separators).
 fn quoted(path: &std::path::Path) -> String {
-    format!("{:?}", tensorfs_core::platform::durable::canonical(path).unwrap().display().to_string())
+    format!("{:?}", cozy_platform::durable::canonical(path).unwrap().display().to_string())
 }
 
 fn temporary(name: &str) -> PathBuf {

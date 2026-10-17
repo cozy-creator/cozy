@@ -3,7 +3,7 @@
 
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
-use tensorfs_core::platform::durable::symlink;
+use cozy_platform::durable::symlink;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 

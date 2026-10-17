@@ -82,7 +82,7 @@ pub enum Error {
 }
 
 /// An OS seam's failure, named by what was attempted.
-pub(crate) fn os(what: &'static str) -> impl FnOnce(tensorfs_core::platform::Error) -> Error {
+pub(crate) fn os(what: &'static str) -> impl FnOnce(cozy_platform::Error) -> Error {
     move |error| {
         if error.is_unsupported() {
             Error::Unsupported(format!("{what}: {error}"))

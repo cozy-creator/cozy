@@ -1,7 +1,7 @@
 //! A connected local byte stream between an owner and its executor. Unix: a Unix socket. Windows,
-//! until its named-pipe arm: a loopback TCP connection made like CPython's `socketpair`, whose
-//! accepted end must be the connector itself.
-use super::Result;
+//! until its named-pipe arm (WM): a loopback TCP connection made like CPython's `socketpair`,
+//! whose accepted end must be the connector itself.
+use crate::Result;
 
 #[cfg(unix)]
 pub type LocalStream = std::os::unix::net::UnixStream;

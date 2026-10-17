@@ -5,7 +5,7 @@
 //! hit the same wall (xs-007 row 4). No duration here is a verdict. The worker announces
 //! every chunk the store moves on its stdout (`progress\t<moved>\t<admitted>`, see
 //! `ingest::Reporter`), and its CPU clock and scheduler state are readable through
-//! `platform::process::usage`; the two windows below are derived from those observations.
+//! `cozy_platform::process::usage`; the two windows below are derived from those observations.
 //!
 //! **patience** — how long the progress channel may be silent before the parent looks
 //! harder: `PATIENCE_FACTOR` × the longest silence between two records this run has itself
@@ -80,7 +80,7 @@ struct Reading {
 }
 
 fn read_proc(pid: u32) -> Option<Reading> {
-    let usage = tensorfs_core::platform::process::usage(pid).ok()?;
+    let usage = cozy_platform::process::usage(pid).ok()?;
     Some(Reading {
         ticks: usage.cpu,
         state: if usage.running { 'R' } else { 'S' },

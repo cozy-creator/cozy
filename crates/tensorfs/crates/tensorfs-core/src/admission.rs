@@ -68,7 +68,7 @@ pub struct Disk {
 
 impl Disk {
     pub fn measure(root: &Path) -> Result<Disk> {
-        let space = crate::platform::durable::space(root).map_err(|e| Refusal {
+        let space = cozy_platform::durable::space(root).map_err(|e| Refusal {
             code: Code::CAPACITY_EXHAUSTED,
             detail: format!(
                 "cannot measure the filesystem under {}: {e}; admission fails closed",

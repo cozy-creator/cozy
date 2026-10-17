@@ -706,7 +706,7 @@ impl Pool {
             Box::new(crate::memory::host::TierPolicy(host_ledger.clone())),
         )?;
         // Fill leases and GPU custody hold one descriptor per object or chunk.
-        raise_fd_limit();
+        cozy_platform::process::raise_fd_limit();
         let envelope = config.envelope();
         // Degree 2 is world-one, on the first device; off where it drives a display.
         let custody = envelope
@@ -3842,22 +3842,6 @@ fn display_active(device: &str) -> bool {
     cozy_platform::gpu::Device::open(device)
         .and_then(|device| device.display_active())
         .unwrap_or(true)
-}
-
-/// Each held chunk is one fd: let the soft descriptor limit reach the hard one.
-fn raise_fd_limit() {
-    let mut limit = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    // SAFETY: writable rlimit structure; a failure leaves the current limit.
-    unsafe {
-        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) == 0 && limit.rlim_cur < limit.rlim_max
-        {
-            limit.rlim_cur = limit.rlim_max;
-            libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
-        }
-    }
 }
 
 /// An error ends its executor; the exact exit is observed before the run settles, and a

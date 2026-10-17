@@ -226,7 +226,7 @@ pub fn write_session(store_root: &Path, root: &IngestSession) -> Result<()> {
 
 pub fn read_session(store_root: &Path, session: &str) -> Result<IngestSession> {
     let p = candidate_dir(store_root, session).join("session.json");
-    let read = crate::platform::durable::open_racing(&p).and_then(|mut file| {
+    let read = cozy_platform::durable::open_racing(&p).and_then(|mut file| {
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes).map(|_| bytes)
     });

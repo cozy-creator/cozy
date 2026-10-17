@@ -905,7 +905,7 @@ fn push_memory_child() {
         .map(|hex| ObjectRef { sha256: hex.into(), length: 16 * MIB as u64 })
         .collect();
     let origin = Origin::start(vec![], 0, |_, _| Act::Serve);
-    let peak_resident = || tensorfs_core::platform::process::peak_resident().unwrap();
+    let peak_resident = || cozy_platform::process::peak_resident().unwrap();
     let before = peak_resident();
     thread::scope(|scope| {
         for object in &objects {

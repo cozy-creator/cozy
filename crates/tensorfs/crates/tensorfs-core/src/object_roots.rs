@@ -63,7 +63,7 @@ pub fn retain(store: &Store, object: &ObjectRef) -> Result<()> {
 }
 
 pub fn get(store: &Store, sha256: &str) -> Result<Option<ObjectRef>> {
-    let file = match crate::platform::durable::open_nofollow(&path(store, sha256)?, OpenOptions::new().read(true))
+    let file = match cozy_platform::durable::open_nofollow(&path(store, sha256)?, OpenOptions::new().read(true))
         .map_err(std::io::Error::from)
     {
         Ok(file) => file,

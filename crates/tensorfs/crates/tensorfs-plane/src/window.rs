@@ -25,7 +25,7 @@ pub fn open_window(name: &str, layout: &Layout, slots: usize) -> Result<(OwnedFd
     let host = HostMem::create_window(name, layout, slots)?;
     let fd = host::reopen(host.raw_fd())?;
     // Future-write leaves our mapping writable.
-    tensorfs_core::platform::shm::seal(fd.as_fd()).map_err(crate::os("seal window"))?;
+    cozy_platform::shm::seal(fd.as_fd()).map_err(crate::os("seal window"))?;
     Ok((fd, OpenWindow { host }))
 }
 

@@ -342,7 +342,7 @@ pub(crate) fn import_member(
     if !fs::symlink_metadata(path).map_err(io)?.is_file() {
         return refuse(Code::WRONG_TYPE, "import member must be a regular file");
     }
-    let mut file = crate::platform::durable::open_nofollow(&path, OpenOptions::new().read(true))
+    let mut file = cozy_platform::durable::open_nofollow(&path, OpenOptions::new().read(true))
         .map_err(std::io::Error::from)
         .map_err(io)?;
     if !file.metadata().map_err(io)?.is_file() {

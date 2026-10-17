@@ -235,6 +235,54 @@ fn resume(pid: u32) -> io::Result<()> {
     }
 }
 
+pub(super) fn usage(pid: u32) -> io::Result<super::Usage> {
+    let process = open_process(pid, PROCESS_QUERY_LIMITED_INFORMATION)?;
+    let [_, _, kernel, user] = times(&process)?;
+    Ok(super::Usage {
+        cpu: ticks(kernel) + ticks(user),
+        running: false,
+    })
+}
+
+/// The kernel's boot time in seconds (100 ns ticks since 1601), which a clock step can move:
+/// then this boot reads as an earlier one, the safe side.
+pub(super) fn boot_id() -> io::Result<String> {
+    use windows_sys::Wdk::System::SystemInformation::{
+        NtQuerySystemInformation, SystemTimeOfDayInformation,
+    };
+    // SYSTEM_TIMEOFDAY_INFORMATION: BootTime first, 48 bytes in all.
+    let mut info = [0i64; 6];
+    // SAFETY: a writable buffer of the size passed.
+    let status = unsafe {
+        NtQuerySystemInformation(
+            SystemTimeOfDayInformation,
+            info.as_mut_ptr().cast(),
+            48,
+            ptr::null_mut(),
+        )
+    };
+    if status < 0 {
+        return Err(io::Error::other(format!(
+            "NtQuerySystemInformation: {status:#x}"
+        )));
+    }
+    Ok(format!("{}", info[0] / 10_000_000))
+}
+
+pub(super) fn peak_resident() -> io::Result<u64> {
+    use windows_sys::Win32::System::{
+        ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS},
+        Threading::GetCurrentProcess,
+    };
+    // SAFETY: plain-old-data the call fills, its size passed.
+    let mut counters: PROCESS_MEMORY_COUNTERS = unsafe { mem::zeroed() };
+    let size = mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+    if unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, size) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(counters.PeakWorkingSetSize as u64)
+}
+
 fn open_process(pid: u32, access: u32) -> io::Result<OwnedHandle> {
     // SAFETY: plain call; a null handle is the failure.
     let process = unsafe { OpenProcess(access, 0, pid) };
@@ -251,13 +299,22 @@ fn open_process(pid: u32, access: u32) -> io::Result<OwnedHandle> {
 }
 
 fn created(process: &OwnedHandle) -> io::Result<u64> {
+    Ok(ticks(times(process)?[0]))
+}
+
+/// Creation, exit, kernel and user times.
+fn times(process: &OwnedHandle) -> io::Result<[FILETIME; 4]> {
     let mut times = [FILETIME::default(); 4];
     let [creation, exit, kernel, user] = &mut times;
     // SAFETY: a live handle with query rights and four writable FILETIMEs.
     if unsafe { GetProcessTimes(raw(process), creation, exit, kernel, user) } == 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(u64::from(creation.dwHighDateTime) << 32 | u64::from(creation.dwLowDateTime))
+    Ok(times)
+}
+
+fn ticks(time: FILETIME) -> u64 {
+    u64::from(time.dwHighDateTime) << 32 | u64::from(time.dwLowDateTime)
 }
 
 fn signaled(handle: &OwnedHandle, period: Option<Duration>) -> io::Result<bool> {

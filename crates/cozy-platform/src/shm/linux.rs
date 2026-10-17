@@ -1,4 +1,4 @@
-use super::FULL_SEALS;
+use super::{FULL_SEALS, Region};
 use crate::Result;
 use std::{
     ffi::CString,
@@ -42,6 +42,104 @@ pub fn seal_with(fd: BorrowedFd<'_>, seals: i32) -> Result<()> {
         return Err(io::Error::last_os_error().into());
     }
     Ok(())
+}
+
+/// Ok(false) when a non-waiting request conflicts with another description's lock.
+pub fn region_lock(
+    fd: BorrowedFd<'_>,
+    start: usize,
+    len: usize,
+    region: Region,
+    wait: bool,
+) -> Result<bool> {
+    let mut fl = flock(start, len, region);
+    let cmd = if wait {
+        libc::F_OFD_SETLKW
+    } else {
+        libc::F_OFD_SETLK
+    };
+    // SAFETY: OFD byte-range lock on a descriptor the caller holds.
+    if unsafe { libc::fcntl(fd.as_raw_fd(), cmd, &mut fl) } == 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::EAGAIN) | Some(libc::EACCES) if !wait => Ok(false),
+        _ => Err(error.into()),
+    }
+}
+
+/// The span `(start, len)` of a lock another description holds over any byte of the range
+/// (`len` 0: to the end), or `None`. One query answers one lock, not necessarily the lowest.
+pub fn region_holder(
+    fd: BorrowedFd<'_>,
+    start: usize,
+    len: usize,
+) -> Result<Option<(usize, usize)>> {
+    let mut fl = flock(start, len, Region::Write);
+    // SAFETY: a lock query on a descriptor the caller holds.
+    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_OFD_GETLK, &mut fl) } != 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok((fl.l_type != libc::F_UNLCK as libc::c_short)
+        .then_some((fl.l_start as usize, fl.l_len as usize)))
+}
+
+fn flock(start: usize, len: usize, region: Region) -> libc::flock {
+    libc::flock {
+        l_type: match region {
+            Region::Read => libc::F_RDLCK,
+            Region::Write => libc::F_WRLCK,
+            Region::Unlock => libc::F_UNLCK,
+        } as libc::c_short,
+        l_whence: libc::SEEK_SET as libc::c_short,
+        l_start: start as libc::off_t,
+        l_len: len as libc::off_t,
+        l_pid: 0,
+    }
+}
+
+/// Frees `[off, off+span)`'s pages; the file keeps its size.
+pub fn punch(fd: BorrowedFd<'_>, off: u64, span: u64) -> Result<()> {
+    // SAFETY: punching a hole in a memfd the caller holds.
+    let rc = unsafe {
+        libc::fallocate(
+            fd.as_raw_fd(),
+            libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+            off as libc::off_t,
+            span as libc::off_t,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+/// A new open file description of the file behind `fd`: a dup would share `fd`'s, and with it
+/// its locks.
+pub fn reopen(fd: BorrowedFd<'_>, write: bool) -> Result<OwnedFd> {
+    let path = CString::new(format!("/proc/self/fd/{}", fd.as_raw_fd())).expect("no NUL");
+    let access = if write { libc::O_RDWR } else { libc::O_RDONLY };
+    // SAFETY: plain open of a magic link to a descriptor the caller holds.
+    let own = unsafe { libc::open(path.as_ptr(), access | libc::O_CLOEXEC) };
+    if own < 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    // SAFETY: fresh descriptor from the kernel.
+    Ok(unsafe { OwnedFd::from_raw_fd(own) })
+}
+
+/// Transparent huge pages for a shared mapping where shmem THP is enabled; advice only.
+pub fn advise_huge(base: *mut u8, len: usize) {
+    // SAFETY: advice on the caller's mapping.
+    unsafe { libc::madvise(base.cast(), len, libc::MADV_HUGEPAGE) };
+}
+
+pub(super) fn populate_write(base: *mut u8, len: usize) -> bool {
+    const MADV_POPULATE_WRITE: libc::c_int = 23;
+    // SAFETY: a page-aligned slice of the caller's live, writable shared mapping.
+    unsafe { libc::madvise(base.cast(), len, MADV_POPULATE_WRITE) == 0 }
 }
 
 /// Whether a process still holds the file `(dev, ino)`: an open descriptor of it or a mapping.
