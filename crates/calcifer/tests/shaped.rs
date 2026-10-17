@@ -99,13 +99,18 @@ async fn an_input_uploads_near_the_link_rate_over_a_long_round_trip() {
     .expect("the input was written and the run accepted");
     let (first, from) = seen[0];
     let rate = (total as f64 - from) / (accepted - first).as_secs_f64();
+    // How far progress ran ahead of what the link could have carried by then (negative: behind).
+    let ahead = (seen.iter())
+        .map(|(at, done)| done - from - shaped * (*at - first).as_secs_f64())
+        .fold(f64::MIN, f64::max);
     eprintln!(
-        "{} MiB written and the run accepted in {:.1} s over {} progress events: {:.0} B/s, {:.0}% of the shaped {shaped:.0} B/s",
+        "{} MiB written and the run accepted in {:.1} s over {} progress events: {:.0} B/s, {:.0}% of the shaped {shaped:.0} B/s; progress at most {:.0} KiB ahead of the link",
         total >> 20,
         (accepted - first).as_secs_f64(),
         seen.len(),
         rate,
         100.0 * rate / shaped,
+        ahead / 1024.0,
     );
     let link = calcifer::Link::new(&machine.endpoint, common::key()).unwrap();
     let digest = cozy_proto::ids::Digest::of(&bytes);
@@ -113,14 +118,10 @@ async fn an_input_uploads_near_the_link_rate_over_a_long_round_trip() {
         link.held(&digest, total as u64).await.unwrap(),
         total as u64
     );
-    for (at, done) in &seen {
-        let carried = shaped * (*at - first).as_secs_f64();
-        assert!(
-            done - from <= carried + AHEAD,
-            "progress said {done:.0} B after {:.1} s, more than the link carried",
-            (*at - first).as_secs_f64()
-        );
-    }
+    assert!(
+        ahead <= AHEAD,
+        "progress ran {ahead:.0} B ahead of what the link carried"
+    );
     assert!(
         seen.len() >= 10,
         "progress moved as the bytes did: {} events",
