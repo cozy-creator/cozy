@@ -41,10 +41,8 @@ impl Home {
             return None;
         }
         // COZY_TEST_BINARY: a release's own `cozy` (owner-day.yml, called by release.yml).
-        let binary = std::env::var_os("COZY_TEST_BINARY").map_or_else(
-            || PathBuf::from(env!("CARGO_BIN_EXE_cozy")),
-            PathBuf::from,
-        );
+        let binary = std::env::var_os("COZY_TEST_BINARY")
+            .map_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_cozy")), PathBuf::from);
         Some(Self {
             dir: tempfile::tempdir().expect("a temp dir"),
             binary: binary.into(),
