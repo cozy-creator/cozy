@@ -23,6 +23,15 @@ use tonic::{
 
 const OWNER: [u8; 32] = [5; 32];
 
+/// The machine's process group, ended however the test ends.
+struct Machine(std::process::Child);
+impl Drop for Machine {
+    fn drop(&mut self) {
+        let _ = Command::new("kill").args(["-KILL", "--", &format!("-{}", self.0.id())]).status();
+        let _ = self.0.wait();
+    }
+}
+
 fn authorized<T>(message: T) -> Request<T> {
     let expires = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64 + 600;
     let grant = Grant { machine: "local".into(), action: capability::MACHINE.into(), expires, ..Default::default() };
@@ -46,7 +55,8 @@ async fn a_v0_9_machine_home() {
     std::fs::set_permissions(&key_file, std::fs::Permissions::from_mode(0o600)).unwrap();
     let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
     let owner = URL_SAFE_NO_PAD.encode(SigningKey::from_bytes(&OWNER).verifying_key().as_bytes());
-    let mut machine = Command::new(env!("CARGO_BIN_EXE_tensord"))
+    let log = std::fs::File::create(home.join("machine.log")).unwrap();
+    let mut machine = Machine(Command::new(env!("CARGO_BIN_EXE_tensord"))
         .arg("run")
         .env("HOME", home)
         .env("COZY_MACHINE_ROOT", &root)
@@ -59,12 +69,13 @@ async fn a_v0_9_machine_home() {
         .env("CUDA_VISIBLE_DEVICES", "")
         .process_group(0)
         .stdout(Stdio::null())
+        .stderr(log)
         .spawn()
-        .unwrap();
+        .unwrap());
     let ready_path = root.join("var/lib/cozy/tensord/api-ready.json");
     let start = Instant::now();
     let ready: serde_json::Value = loop {
-        assert!(machine.try_wait().unwrap().is_none(), "the machine exited");
+        assert!(machine.0.try_wait().unwrap().is_none(), "the machine exited");
         if let Ok(bytes) = std::fs::read(&ready_path) {
             break serde_json::from_slice(&bytes).unwrap();
         }
@@ -125,6 +136,5 @@ async fn a_v0_9_machine_home() {
     }
     std::fs::write(home.join("pre-cohort.json"), serde_json::json!({"manifest": manifest}).to_string()).unwrap();
     // Its process group: the stable parent and the service it forked.
-    let _ = Command::new("kill").args(["-KILL", "--", &format!("-{}", machine.id())]).status();
-    let _ = machine.wait();
+    drop(machine);
 }

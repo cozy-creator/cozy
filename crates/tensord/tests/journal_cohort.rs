@@ -6,6 +6,7 @@
 use ed25519_dalek::{pkcs8::EncodePrivateKey, SigningKey};
 use std::{
     collections::BTreeSet,
+    os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -22,10 +23,11 @@ use tonic::{
 
 const OWNER: [u8; 32] = [5; 32];
 
+/// The machine's process group: the stable parent and the service it forked.
 struct Machine(Child);
 impl Drop for Machine {
     fn drop(&mut self) {
-        let _ = self.0.kill();
+        let _ = Command::new("kill").args(["-KILL", "--", &format!("-{}", self.0.id())]).status();
         let _ = self.0.wait();
     }
 }
@@ -96,8 +98,9 @@ async fn a_v0_9_home_keeps_its_identity_store_and_environments_across_the_journa
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
             .env("HOME", home.path())
+            .process_group(0)
             .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
+            .stderr(std::fs::File::create(home.path().join("machine-after.log")).unwrap())
             .spawn()
             .unwrap(),
     );
