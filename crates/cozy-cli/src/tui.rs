@@ -1,7 +1,8 @@
 //! Live full-screen views over Calcifer's event streams. A view is drawn again when its data
-//! changes or a key is pressed, never on a timer: ↑/↓ select, Enter opens the selected run, Esc
-//! goes back, q quits. The terminal is restored on every way out: q, Ctrl-C, a signal, an error,
-//! and (ratatui's hook) a panic.
+//! changes or a key is pressed, never on a timer: ↑/↓ or k/j select, Enter opens the selected
+//! row's own view (a run's as `cozy run show` draws it, a machine's as `cozy machine show` does),
+//! Esc or q goes back to the list as it was left, and q there quits. The terminal is restored on
+//! every way out: q, Ctrl-C, a signal, an error, and (ratatui's hook) a panic.
 use std::io;
 
 use cozy_proto::error::{Error, Kind};
@@ -23,6 +24,7 @@ pub(crate) enum Screen {
     Runs(run::live::Runs),
     Run(Box<run::live::Live>),
     Machines(machine::live::Machines),
+    Machine(Box<machine::live::Shown>),
     Packages(package::live::Packages),
 }
 
@@ -33,6 +35,7 @@ impl Screen {
             Screen::Runs(view) => view.changed(ctx).await,
             Screen::Run(view) => view.changed().await,
             Screen::Machines(view) => view.changed(ctx).await,
+            Screen::Machine(view) => view.changed().await,
             Screen::Packages(view) => view.changed(ctx).await,
         }
     }
@@ -43,6 +46,12 @@ impl Screen {
             Screen::Runs(view) => match view.id(selected) {
                 Some(id) => Ok(Some(Screen::Run(Box::new(
                     run::live::Live::open(ctx, &id).await?,
+                )))),
+                None => Ok(None),
+            },
+            Screen::Machines(view) => match view.id(selected) {
+                Some(id) => Ok(Some(Screen::Machine(Box::new(
+                    machine::live::Shown::open(ctx, &id).await?,
                 )))),
                 None => Ok(None),
             },
@@ -69,11 +78,8 @@ impl Screen {
                 view.rows(ctx),
                 selected,
             ),
-            Screen::Run(view) => {
-                let block = Block::new().title(format!("{}  (Esc back, q quits)", view.title()));
-                let lines: Vec<Line> = view.lines(ctx).into_iter().map(Line::from).collect();
-                frame.render_widget(Paragraph::new(lines).block(block), frame.area());
-            }
+            Screen::Run(view) => detail(frame, &view.title(), view.lines(ctx)),
+            Screen::Machine(view) => detail(frame, &view.title(), view.lines(ctx)),
         }
     }
 
@@ -82,7 +88,7 @@ impl Screen {
             Screen::Runs(view) => view.rows().len(),
             Screen::Machines(view) => view.rows(ctx).len(),
             Screen::Packages(view) => view.rows(ctx).len(),
-            Screen::Run(_) => 0,
+            Screen::Run(_) | Screen::Machine(_) => 0,
         }
     }
 }
@@ -134,11 +140,12 @@ pub(crate) async fn live<B: Backend>(
         let at = selected.selected().unwrap_or(0);
         match key.code {
             _ if ctrl_c => return Ok(()),
-            KeyCode::Char('q') => return Ok(()),
-            KeyCode::Esc if depth > 1 => drop(stack.pop()),
-            KeyCode::Esc => return Ok(()),
-            KeyCode::Up => selected.select(Some(at.saturating_sub(1))),
-            KeyCode::Down if rows > 0 => selected.select(Some((at + 1).min(rows - 1))),
+            KeyCode::Esc | KeyCode::Char('q') if depth > 1 => drop(stack.pop()),
+            KeyCode::Esc | KeyCode::Char('q') => return Ok(()),
+            KeyCode::Up | KeyCode::Char('k') => selected.select(Some(at.saturating_sub(1))),
+            KeyCode::Down | KeyCode::Char('j') if rows > 0 => {
+                selected.select(Some((at + 1).min(rows - 1)))
+            }
             KeyCode::Enter => {
                 if let Some(opened) = screen.open(ctx, at).await? {
                     stack.push((opened, TableState::default()));
@@ -183,6 +190,13 @@ fn table(
         .column_spacing(2)
         .block(Block::new().title(format!("{title}  (↑/↓, Enter opens, q quits)")));
     frame.render_stateful_widget(table, frame.area(), selected);
+}
+
+/// One run's or machine's record as its `show` prints it, drawn again as it changes.
+fn detail(frame: &mut Frame, title: &str, lines: Vec<String>) {
+    let block = Block::new().title(format!("{title}  (Esc or q back)"));
+    let lines: Vec<Line> = lines.into_iter().map(Line::from).collect();
+    frame.render_widget(Paragraph::new(lines).block(block), frame.area());
 }
 
 /// SIGINT and SIGTERM sent from outside: raw mode turns the terminal's own Ctrl-C into a key.

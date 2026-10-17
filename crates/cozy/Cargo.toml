@@ -22,6 +22,7 @@ ed25519-dalek.workspace = true
 hex.workspace = true
 hub-client = { workspace = true, features = ["testing"] }
 migrate = { workspace = true, features = ["testing"] }
+portable-pty.workspace = true
 prost.workspace = true
 rcgen.workspace = true
 reqwest.workspace = true
@@ -32,6 +33,7 @@ sha2.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
 url.workspace = true
+vt100.workspace = true
 
 [lints]
 workspace = true

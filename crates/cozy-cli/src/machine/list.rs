@@ -7,7 +7,7 @@ use cozy_proto::{
 };
 
 use super::{Notices, clock, machine, now_ms, usd};
-use crate::{Context, output};
+use crate::{Context, output, tui};
 
 /// A Hub failure code: the provider stopped the pod. The Hub keeps the rental and never replaces it.
 const PROVIDER_STOPPED: &str = "readiness.provider_stopped";
@@ -116,16 +116,28 @@ pub(crate) fn rows(ctx: &Context, list: &MachineList) -> Vec<Vec<String>> {
     .collect()
 }
 
-pub async fn show(ctx: &Context, name: &str) -> Result<ExitCode, Error> {
+/// One machine: a live view on a terminal while it lives, else its record once (or JSON).
+pub async fn show(ctx: &Context, name: &str, once: bool) -> Result<ExitCode, Error> {
     let m = machine(ctx, name).await?;
+    if !once && !ctx.json && ctx.term.stdout && m.state != MachineState::Ended {
+        let view = super::live::Shown::open(ctx, name).await?;
+        tui::show(ctx, tui::Screen::Machine(Box::new(view))).await?;
+        return Ok(ExitCode::SUCCESS);
+    }
     if ctx.json {
         output::json(&m);
         return Ok(ExitCode::SUCCESS);
     }
+    record(ctx, &m).print(ctx);
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `cozy machine show`'s record of `m`, printed once or drawn live.
+pub(crate) fn record(ctx: &Context, m: &Machine) -> output::Record {
     let mut record = output::Record::new()
         .field("machine", &m.name)
-        .field("kind", kind(&m))
-        .field("state", state_cell(&m));
+        .field("kind", kind(m))
+        .field("state", state_cell(m));
     if let Some(alias) = m.alias.as_deref().filter(|a| *a != m.name) {
         record = record.field("alias", alias);
     }
@@ -165,7 +177,7 @@ pub async fn show(ctx: &Context, name: &str) -> Result<ExitCode, Error> {
             record = record.field("provider", warning);
         }
     }
-    if let Some(since) = unreachable_since(&m) {
+    if let Some(since) = unreachable_since(m) {
         record = record.note(format!(
             "the Hub cannot reach it since {} ago, though its provider reports it running; \
              `cozy machine end {}` ends it",
@@ -197,18 +209,17 @@ pub async fn show(ctx: &Context, name: &str) -> Result<ExitCode, Error> {
                 };
                 record = record.field(&format!("warm {}/{}", item.source, item.entrypoint), held);
             }
-            record = record.field("ends", ends_cell(&m));
+            record = record.field("ends", ends_cell(m));
         }
         None if m.state == MachineState::Ready => {
             record = record.note("the machine has not reported its status yet");
         }
         None => {}
     }
-    if let Some(note) = provider_stopped(&m) {
+    if let Some(note) = provider_stopped(m) {
         record = record.note(note);
     }
-    record.print(ctx);
-    Ok(ExitCode::SUCCESS)
+    record
 }
 
 /// What a machine reports of itself, one fact per line, GPUs by number.

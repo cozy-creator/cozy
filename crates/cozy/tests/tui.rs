@@ -10,7 +10,7 @@ use std::{
     time::Duration,
 };
 
-use common::{Home, package, tensord};
+use common::{Home, package, pty::Pty, silent::SilentHub, tensord};
 use cozy_cli::tui::testing::{View, draw};
 use cozy_proto::error::Error;
 
@@ -112,4 +112,82 @@ fn the_live_package_list_draws_an_install_when_it_lands() {
     view.join().unwrap().expect("the view followed the machine");
     let row = last.lines().find(|l| l.contains("local/tiny")).unwrap();
     assert!(row.contains("live") && row.contains("0.1.0"), "{row}");
+}
+
+/// A count `machine show` draws for `key` (`running`, `queued`), on a screen of it.
+fn count(screen: &str, key: &str) -> Option<u32> {
+    screen.lines().find_map(|line| {
+        let mut words = line.split_whitespace();
+        (words.next() == Some(key)).then(|| words.next()?.parse().ok())?
+    })
+}
+
+/// The machine's runs, queued or running, on a screen of `machine show`.
+fn runs_on(screen: &str) -> Option<u32> {
+    Some(count(screen, "running")? + count(screen, "queued")?)
+}
+
+/// `cozy run list` and `cozy machine list` on a pseudo-terminal, as a person drives them: j/k move
+/// the selection, Enter opens the row's own live view (the run as `cozy run show` draws it, the
+/// machine as `cozy machine show` does), which is drawn again as Calcifer says it changed; Esc or q
+/// goes back to the list, and q there quits.
+#[test]
+fn enter_opens_a_rows_live_view_and_esc_or_q_comes_back() {
+    let Some(home) = Home::new() else { return };
+    let _hub = SilentHub::for_home(&home);
+    let _machine = tensord::added(&home, "live");
+    // Accepted by its machine, a run stays preparing (its Hub never answers) until canceled.
+    let submit = || {
+        let args = [
+            "run",
+            "fidika/sdxl/generate@2.10.0",
+            "a cat",
+            "--on",
+            "live",
+        ];
+        let run = home.json(args.iter().chain(&["--detach", "--json"]));
+        run["number"].as_u64().unwrap().to_string()
+    };
+    let first = submit();
+
+    let mut runs = Pty::spawn(home.command().args(["run", "list"]));
+    runs.until("the run list", |s| {
+        s.contains("TARGET") && s.contains("sdxl")
+    });
+    runs.key("j");
+    runs.key("k");
+    runs.key("\r");
+    let opened = format!("run {first}");
+    runs.until("the run's live view", |s| {
+        s.contains(&opened) && s.contains("Esc or q back")
+    });
+    home.json(["run", "cancel", &first, "--json"]);
+    runs.until("its cancel, drawn live", |s| {
+        s.contains(&opened) && s.contains("canceled")
+    });
+    runs.key("\x1b");
+    runs.until("the list again", |s| {
+        s.contains("TARGET") && !s.contains("Esc or q back")
+    });
+    runs.key("q");
+    assert!(runs.wait().success());
+
+    let mut machines = Pty::spawn(home.command().args(["machine", "list"]));
+    machines.until("the machine list", |s| {
+        s.contains("MACHINE") && s.contains("live")
+    });
+    machines.key("\r");
+    machines.until("the machine's live view", |s| {
+        s.contains("machine live") && runs_on(s) == Some(0)
+    });
+    let second = submit();
+    machines.until("its run, drawn live", |s| runs_on(s) == Some(1));
+    home.json(["run", "cancel", &second, "--json"]);
+    machines.until("its cancel, drawn live", |s| runs_on(s) == Some(0));
+    machines.key("q");
+    machines.until("the list again", |s| {
+        s.contains("MACHINE") && !s.contains("Esc or q back")
+    });
+    machines.key("q");
+    assert!(machines.wait().success());
 }
