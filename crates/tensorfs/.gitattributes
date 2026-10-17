@@ -1,1 +1,4 @@
+# Byte-exact checkouts on every OS: compiled-in documents and test vectors are hashed, and
+# Windows' CRLF conversion would change their bytes.
+* -text
 *.cbor binary
