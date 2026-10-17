@@ -85,7 +85,7 @@ def test_rust_tensorfs_materialization_and_trusted_installer(capture):
     archive = root / "source.tar"
     subprocess.run(["tar", "-cf", str(archive), "-C", str(source), "pyproject.toml", "uv.lock", "package.toml", "cpu_classifier"], check=True)
     output = root / "rust-owner-install"
-    target = Path(os.environ.get("CARGO_TARGET_DIR", ROOT / "target"))
+    target = Path(os.environ.get("CARGO_TARGET_DIR", ROOT.parents[1] / "target"))
     subprocess.run([str(target / "debug/install-capture"), "--archive", str(archive), "--output", str(output),
         "--helper-python", sys.executable, "--client-wheel", str(client), "--python", "3.12",
         "--package", "local/tensord-cpu-classifier", "--release", "0.1.0"], check=True)
