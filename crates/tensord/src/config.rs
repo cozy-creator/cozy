@@ -109,7 +109,7 @@ fn from_loaded(lifetime: Lifetime, loaded: Loaded, environment: &BTreeMap<String
 }
 
 fn known(name: &str) -> bool {
-    ENV.iter().any(|(n, _)| *n == name) || PROVIDER.contains(&name) || name == "COZY_DOWNLOAD_URL"
+    ENV.iter().any(|(n, _)| *n == name) || PROVIDER.contains(&name) || name == shared::AUTHORIZED_KEYS
 }
 
 /// A load refusal naming a `machine.*` key also names the variable a pod sets it with.

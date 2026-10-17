@@ -52,6 +52,7 @@ tracing-appender.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+tempfile.workspace = true
 x509-parser = "0.18"
 
 [build-dependencies]

@@ -30,7 +30,7 @@ pub const DEFAULT_HUB_URL: &str = "https://tensorhub.com";
 /// names their own tools use; where releases are downloaded from (dist's installers read the
 /// same one); and the machine's settings a pod's launcher gives (Tensorhub `podenv`, plus the
 /// devices the container may use).
-pub const ENV: [(&str, &str); 19] = [
+pub const ENV: [(&str, &str); 18] = [
     ("HF_TOKEN", "huggingface_token"),
     ("CIVITAI_TOKEN", "civitai_token"),
     ("COZY_DOWNLOAD_URL", "download_url"),
@@ -42,7 +42,6 @@ pub const ENV: [(&str, &str); 19] = [
     ("COZY_WORKER_AUTH_TOKEN", "machine.worker_token"),
     ("COZY_WORKER_INTERNAL_PORT", "machine.port"),
     ("COZY_WEBRTC_INTERNAL_PORT", "machine.webrtc_port"),
-    ("COZY_AUTHORIZED_KEYS", "machine.authorized_keys"),
     ("COZY_SSH_PUBLIC_KEY", "machine.ssh_public_key"),
     ("COZY_BOOTSTRAP_RECEIPT_HMAC_KEY_B64URL", "machine.receipt_key"),
     ("COZY_BOOTSTRAP_RECEIPT_HMAC_KEY_FILE", "machine.receipt_key_file"),
@@ -99,8 +98,9 @@ pub struct MachineConfig {
     pub listen_host: Option<String>,
     pub worker_id: Option<String>,
     pub worker_token: Option<Secret>,
-    /// Unpadded base64url Ed25519 keys (`a,b` in the environment).
-    #[serde(deserialize_with = "list")]
+    /// A pod's boot keys (`COZY_AUTHORIZED_KEYS=a,b`), from the environment only: this
+    /// computer's controllers are `keys/owner.pem`'s and `keys/authorized`'s.
+    #[serde(skip)]
     pub authorized_keys: Vec<String>,
     /// A development rental's SSH key.
     pub ssh_public_key: Option<String>,
@@ -115,6 +115,17 @@ pub struct MachineConfig {
     pub visible_devices: Option<String>,
 }
 
+impl MachineConfig {
+    /// This computer's machine root: `root`, else `~/.cozy/machine`. Its API's endpoint is
+    /// `<root>/var/lib/cozy/machine/api-ready.json`.
+    pub fn root(&self, home: &Home) -> PathBuf {
+        self.root.clone().unwrap_or_else(|| home.machine())
+    }
+}
+
+/// The environment name of a pod's boot keys.
+pub const AUTHORIZED_KEYS: &str = "COZY_AUTHORIZED_KEYS";
+
 /// A list as a TOML array, or as one comma-separated string (how the environment spells it).
 fn list<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
     #[derive(Deserialize)]
@@ -124,9 +135,13 @@ fn list<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error>
         Items(Vec<String>),
     }
     Ok(match List::deserialize(d)? {
-        List::Spelled(text) => text.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect(),
+        List::Spelled(text) => split(&text),
         List::Items(items) => items,
     })
+}
+
+fn split(text: &str) -> Vec<String> {
+    text.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect()
 }
 
 /// A credential: never printed.
@@ -201,7 +216,8 @@ pub fn load_from(
         }
     }
     let figment = figment.merge(Serialized::defaults(flags));
-    let (config, warnings) = extract(figment, &path.display().to_string())?;
+    let (mut config, warnings) = extract(figment, &path.display().to_string())?;
+    config.machine.authorized_keys = split(environment.get(AUTHORIZED_KEYS).map_or("", String::as_str));
     Ok(Loaded {
         config,
         home,

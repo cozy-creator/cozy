@@ -94,9 +94,8 @@ impl Grant {
         }
         let rental = lifetime == Lifetime::Rental;
         let root = match (&raw.root, rental) {
-            (Some(root), _) => root.clone(),
             (None, true) => PathBuf::from("/"),
-            (None, false) => home.machine(),
+            _ => raw.root(home),
         };
         clean_absolute(&root, "COZY_MACHINE_ROOT")?;
         for (path, name) in [(&raw.store, "COZY_TENSORFS_ROOT"), (&raw.cache, "COZY_TENSORFS_CACHE")] {
