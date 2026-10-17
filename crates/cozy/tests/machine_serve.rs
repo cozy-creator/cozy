@@ -73,7 +73,6 @@ fn this_computers_machine_serves_status_and_calcifer_adds_it() {
     assert!(frame.gpus.is_empty(), "CUDA_VISIBLE_DEVICES hides every GPU: {:?}", frame.gpus);
 
     // Calcifer adds it by address and fingerprint; its owner key, minted now, is admitted at once.
-    let _calcifer = home.want_calcifer();
     let fingerprint = format!("sha256:{}", hex::encode(pin));
     let out = home.cozy(["machine", "add", "box", &address, "--fingerprint", &fingerprint, "--json"]);
     assert_eq!(out.code, 0, "{out:?}");
