@@ -417,10 +417,10 @@ async fn startup_recovers_interrupted_publication_before_selecting_the_service()
     for (state, changed_links, runtime, outcome) in [
         ("installing", 0, "0.18.102", "rolled_back"),
         ("installing", 1, "0.18.102", "rolled_back"),
-        ("installing", 2, "0.18.102", "rolled_back"),
-        ("succeeded", 2, "0.18.103", "succeeded"),
-        ("rolled_back", 2, "0.18.102", "rolled_back"),
-        ("starting", 2, "0.18.102", "rolled_back"),
+        ("succeeded", 1, "0.18.103", "succeeded"),
+        ("rolled_back", 1, "0.18.102", "rolled_back"),
+        // A published pair whose service restarted before readiness proves itself now.
+        ("starting", 1, "0.18.103", "succeeded"),
         ("starting", 3, "0.18.102", "rolled_back"),
         ("starting", 4, "0.18.102", "rolled_back"),
     ] {
@@ -431,7 +431,7 @@ async fn startup_recovers_interrupted_publication_before_selecting_the_service()
         let engine = root.join("var/lib/cozy/tensord");
         let candidate = engine.join("sdk/candidate");
         let updates = engine.join("update");
-        for dir in [&image, &candidate, &updates, &engine.join("agent")] {
+        for dir in [&image, &candidate, &updates] {
             std::fs::create_dir_all(dir).unwrap();
         }
         for (dir, version) in [(&image, "0.18.102"), (&candidate, "0.18.103")] {
@@ -439,11 +439,6 @@ async fn startup_recovers_interrupted_publication_before_selecting_the_service()
                 std::fs::write(dir.join(name), bytes).unwrap();
             }
         }
-        if state != "starting" || changed_links >= 3 {
-            std::fs::copy(env!("CARGO_BIN_EXE_tensord"), candidate.join("tensord")).unwrap();
-        }
-        // `starting` exercises a dangling selected executable. It must fail exec and roll
-        // back, never fall through to the image executable and falsely commit the update.
         let status = serde_json::json!({
             "operation": "interrupted", "state": state,
             "from": {"runtime": "0.18.102", "tensorfs": "0.3.94"},
@@ -452,14 +447,13 @@ async fn startup_recovers_interrupted_publication_before_selecting_the_service()
         let mut pending_status = status.clone();
         pending_status["state"] = "installing".into();
         std::fs::write(updates.join("pending.json"), serde_json::to_vec(&serde_json::json!({
-            "status": pending_status, "sdk_before": null, "agent_before": null,
+            "status": pending_status, "sdk_before": null,
         })).unwrap()).unwrap();
         std::fs::write(updates.join("status.json"), serde_json::to_vec(&status).unwrap()).unwrap();
         if changed_links >= 1 && changed_links != 4 {
             let selected = if changed_links == 3 { engine.join("sdk/missing") } else { candidate.clone() };
             symlink(selected, engine.join("sdk/current")).unwrap();
         }
-        if changed_links >= 2 { symlink(candidate.join("tensord"), engine.join("agent/current")).unwrap(); }
         let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
         let mut machine = launch(&root, port, Some([7; 32]), true);
         let frame = self::status(&root, port).await;
@@ -469,8 +463,6 @@ async fn startup_recovers_interrupted_publication_before_selecting_the_service()
         assert_eq!(settled["state"], outcome);
         if state == "installing" {
             assert_eq!(settled["error"], "machine_restarted: software publication did not finish");
-        } else if state == "starting" && changed_links == 2 {
-            assert_eq!(settled["error"], "the service exited twice before readiness (1)");
         } else if changed_links >= 3 {
             assert_eq!(settled["error"], "activated SDK unavailable: no installed cozy_runtime wheel");
         }
