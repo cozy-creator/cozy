@@ -197,3 +197,70 @@ fn a_rental_is_asked_once_per_key_and_ends_with_the_hubs_proof() {
     let again = home.json(["machine", "end", id.as_str(), "--json"]);
     assert_eq!(again["changed"], false, "{again}");
 }
+
+/// The rental path end to end on the Hub's docker provider: a CPU machine is rented; a run sent to it
+/// while it boots waits, then completes on it once it is ready; the rental ends only on the Hub's
+/// affirmed absence and leaves the list.
+#[test]
+fn a_run_sent_to_a_booting_rental_completes_on_it_and_the_rental_ends() {
+    let Some(home) = Home::with_hub() else { return };
+    home.sign_in("cycle@cozy.test");
+    let _calcifer = home.want_calcifer();
+    let package = common::package::publish(&home, "tiny", "0.1.0");
+    let rented = home.json(["machine", "rent", "cpu", "--detach", "--json"]);
+    let machine = rented["machine"]["name"].as_str().unwrap().to_string();
+    let id = rented["machine"]["rental_id"].as_str().unwrap().to_string();
+    assert_eq!(rented["machine"]["state"], "booting", "{rented}");
+
+    // Sent while the machine boots: the run waits for it, unsent.
+    let target = format!("{package}/echo");
+    let queued = home.json([
+        "run",
+        &target,
+        "text=cycle",
+        "--on",
+        &machine,
+        "--detach",
+        "--json",
+    ]);
+    assert_eq!(queued["status"], "queued", "{queued}");
+    let number = queued["number"].to_string();
+
+    // Followed to its end: the machine boots, takes the run and answers it. The Hub may name the
+    // machine once it boots; the run moves with it, and the rental id names it throughout.
+    let out = home.cozy(["run", "watch", &number, "--json"]);
+    let last: Value = serde_json::from_str(out.stdout.lines().last().unwrap_or_default())
+        .unwrap_or_else(|e| panic!("{e}: {out:?}"));
+    let shown = home.json(["machine", "show", &id, "--json"]);
+    assert_eq!(
+        (
+            out.code,
+            last["type"].as_str(),
+            last["run"]["machine"].as_str()
+        ),
+        (0, Some("run.completed"), shown["name"].as_str()),
+        "{out:?}\n{shown}"
+    );
+    assert_eq!(last["run"]["result"]["text"], "cycle", "{last}");
+    assert_eq!(shown["state"], "ready", "{shown}");
+
+    // End returns once the Hub affirms the pod gone; it leaves the list.
+    let ended = home.json(["machine", "end", &id, "--json"]);
+    assert_eq!(
+        (
+            ended["changed"].as_bool(),
+            ended["machine"]["state"].as_str()
+        ),
+        (Some(true), Some("ended")),
+        "{ended}"
+    );
+    let list = home.json(["machine", "list", "--json"]);
+    assert!(
+        !list["machines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["rental_id"] == id.as_str() && m["state"] != "ended"),
+        "{list}"
+    );
+}

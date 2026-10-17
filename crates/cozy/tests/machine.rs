@@ -85,6 +85,12 @@ fn an_added_machine_is_checked_before_it_is_recorded_then_listed_shown_checked_a
 
     // show and doctor render what the machine reports of itself.
     let shown = home.json(["machine", "show", "box", "--json"]);
+    // It names the leaf another computer's `machine add` pins.
+    assert_eq!(
+        shown["fingerprint"],
+        machine.fingerprint.as_str(),
+        "{shown}"
+    );
     assert!(
         !shown["status"]["version"]
             .as_str()

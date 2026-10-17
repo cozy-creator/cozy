@@ -147,6 +147,10 @@ async fn add(
     output::Record::new()
         .field("machine", &added.name)
         .field("address", added.address.as_deref().unwrap_or("—"))
+        .field(
+            "fingerprint",
+            added.fingerprint.map_or("—".into(), |f| f.to_string()),
+        )
         .field("state", list::state_cell(&added))
         .print(ctx);
     output::next(
