@@ -49,6 +49,11 @@ fn main() {
             a_replaced_file_is_whole_under_a_reader,
             false,
         ),
+        (
+            "a_hard_link_counts_and_changes_its_file",
+            a_hard_link_counts_and_changes_its_file,
+            false,
+        ),
         ("a_tree_dies_whole", a_tree_dies_whole, false),
         #[cfg(unix)]
         (
@@ -317,6 +322,32 @@ fn a_replaced_file_is_whole_under_a_reader() {
         "no temporary file is left behind"
     );
     durable::sync_dir(&dir).unwrap();
+}
+
+fn a_hard_link_counts_and_changes_its_file() {
+    let dir = scratch("links");
+    let file = dir.join("file");
+    fs::write(&file, b"bytes").unwrap();
+    assert_eq!(durable::links(&file).unwrap(), 1);
+    let before = durable::changed(&file).unwrap();
+    let now = std::time::SystemTime::now();
+    // The system's own clock: neither ahead of it nor from another epoch.
+    assert!(before <= now + Duration::from_secs(5), "{before:?} is after {now:?}");
+    assert!(now.duration_since(before).is_ok_and(|age| age < Duration::from_secs(3600)), "{before:?}");
+    let link = dir.join("link");
+    fs::hard_link(&file, &link).unwrap();
+    assert_eq!(durable::links(&file).unwrap(), 2);
+    assert_eq!(durable::links(&link).unwrap(), 2);
+    assert!(durable::changed(&file).unwrap() >= before, "a new link is a status change");
+    #[cfg(unix)]
+    {
+        let symlink = dir.join("symlink");
+        std::os::unix::fs::symlink(&file, &symlink).unwrap();
+        assert_eq!(durable::links(&symlink).unwrap(), 1, "a symlink is not followed");
+    }
+    fs::remove_file(&link).unwrap();
+    assert_eq!(durable::links(&file).unwrap(), 1);
+    let _ = fs::remove_dir_all(&dir);
 }
 
 fn a_tree_dies_whole() {

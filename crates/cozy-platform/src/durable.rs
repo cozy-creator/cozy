@@ -365,6 +365,73 @@ pub fn set_sparse_len(file: &File, len: u64) -> Result<()> {
     Ok(())
 }
 
+/// Hard links to the file `path` names itself, a symlink not followed: unlinking one of several
+/// frees nothing.
+pub fn links(path: &Path) -> Result<u64> {
+    #[cfg(unix)]
+    return Ok(std::os::unix::fs::MetadataExt::nlink(&std::fs::symlink_metadata(path)?));
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+        };
+        let file = itself(path)?;
+        // SAFETY: plain-old-data the call fills, on a handle this File owns.
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        Ok(info.nNumberOfLinks as u64)
+    }
+}
+
+/// When `path` itself last changed status: a link, an unlink, its mode or its bytes. Unix
+/// ctime; NTFS ChangeTime.
+pub fn changed(path: &Path) -> Result<std::time::SystemTime> {
+    use std::time::{Duration, UNIX_EPOCH};
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::symlink_metadata(path)?;
+        Ok(UNIX_EPOCH + Duration::new(metadata.ctime().max(0) as u64, metadata.ctime_nsec() as u32))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_BASIC_INFO, FileBasicInfo, GetFileInformationByHandleEx,
+        };
+        let file = itself(path)?;
+        // SAFETY: plain-old-data the call fills, of the size it is told, on a handle this File owns.
+        let mut info: FILE_BASIC_INFO = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<FILE_BASIC_INFO>() as u32;
+        if unsafe {
+            GetFileInformationByHandleEx(file.as_raw_handle(), FileBasicInfo, (&mut info as *mut FILE_BASIC_INFO).cast(), size)
+        } == 0
+        {
+            return Err(io::Error::last_os_error().into());
+        }
+        // 100 ns intervals since 1601, 11,644,473,600 s before the Unix epoch.
+        let since = (info.ChangeTime as u64).saturating_sub(11_644_473_600 * 10_000_000);
+        Ok(UNIX_EPOCH + Duration::from_nanos(since.saturating_mul(100)))
+    }
+}
+
+/// The file or directory `path` names itself, a reparse point not followed, open only to read
+/// its attributes.
+#[cfg(windows)]
+fn itself(path: &Path) -> Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+    };
+    Ok(OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?)
+}
+
 /// Bytes a file holds on disk: a sparse file only what was written (Unix). An NTFS file is
 /// not sparse unless asked, so on Windows it holds its length.
 pub fn allocated(metadata: &Metadata) -> u64 {
