@@ -12,6 +12,7 @@ use cozy_proto::{
     calcifer::{Holder, MachineState},
     error::{Error, Kind},
 };
+use jiff::{SignedDuration, Timestamp};
 use serde_json::json;
 
 use crate::{Context, calcifer_client::Client, output};
@@ -171,7 +172,157 @@ enum Which {
 pub async fn logs(ctx: &Context, args: Logs) -> Result<ExitCode, Error> {
     match args.which {
         Which::Calcifer => calcifer_log(ctx, args.follow).await,
-        Which::Machine => crate::machine::logs(ctx, "local", None, args.follow).await,
+        Which::Machine => {
+            let query = LogQuery {
+                log: LogName::Tensord,
+                follow: args.follow,
+                lines: 200,
+                since: None,
+            };
+            machine_log(ctx, "local", &query).await
+        }
+    }
+}
+
+/// Which of a machine's logs, and how much of it.
+#[derive(clap::Args, Debug)]
+pub struct LogQuery {
+    /// The machine's own log, or the TensorFS transport or memory log it keeps.
+    #[arg(value_enum, default_value_t = LogName::Tensord)]
+    log: LogName,
+    /// Keep printing as it grows.
+    #[arg(short, long)]
+    follow: bool,
+    /// The newest N lines; 0 prints every line it keeps.
+    #[arg(short = 'n', long, value_name = "N", default_value_t = 200)]
+    lines: usize,
+    /// Only lines from the last DURATION, such as 90s, 30m or 2h.
+    #[arg(long, value_name = "DURATION", value_parser = since)]
+    since: Option<SignedDuration>,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum LogName {
+    Tensord,
+    Tensorfs,
+    Memory,
+}
+
+impl LogName {
+    fn as_str(self) -> &'static str {
+        match self {
+            LogName::Tensord => "tensord",
+            LogName::Tensorfs => "tensorfs",
+            LogName::Memory => "memory",
+        }
+    }
+}
+
+fn since(text: &str) -> Result<SignedDuration, String> {
+    text.parse()
+        .map_err(|_| format!("{text:?} is not a duration such as 90s, 30m or 2h"))
+}
+
+/// One read's worth while following: more than a busy machine writes between two reads.
+const FOLLOW_TAIL: u64 = 256 << 10;
+
+/// A machine's log through Calcifer: its newest lines, then, with `--follow`, each line as it
+/// appears, read again every sampling period. A machine keeps its logs, so reading never needs
+/// it to have run anything here.
+pub(crate) async fn machine_log(
+    ctx: &Context,
+    name: &str,
+    q: &LogQuery,
+) -> Result<ExitCode, Error> {
+    let path = format!("{}/logs/{}", crate::machine::route(name)?, q.log.as_str());
+    let calcifer = ctx.calcifer().await?;
+    // Lines run to a few hundred bytes: read generously, then keep the newest N.
+    let tail = match q.lines {
+        0 => 0,
+        n => (n as u64).saturating_mul(512).max(64 << 10),
+    };
+    let text = calcifer.text(&format!("{path}?tail_bytes={tail}")).await?;
+    let read = whole_lines(&text);
+    let mut shown = match q.since {
+        Some(window) => from(
+            &read,
+            Timestamp::now().saturating_sub(window).unwrap_or_default(),
+        ),
+        None => &read[..],
+    };
+    if q.lines > 0 && shown.len() > q.lines {
+        shown = &shown[shown.len() - q.lines..];
+    }
+    if shown.is_empty() && !q.follow {
+        output::say(
+            ctx,
+            &format!("{name} has logged nothing in its {} log", q.log.as_str()),
+        );
+    }
+    for line in shown {
+        print_log_line(ctx, name, q.log, line);
+    }
+    if !q.follow {
+        return Ok(ExitCode::SUCCESS);
+    }
+    let mut last = read.last().map(|l| l.to_string());
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => return Ok(ExitCode::SUCCESS),
+            () = tokio::time::sleep(FOLLOW) => {}
+        }
+        let text = calcifer
+            .text(&format!("{path}?tail_bytes={FOLLOW_TAIL}"))
+            .await?;
+        let read = whole_lines(&text);
+        // The lines after the last one printed; all of them when it rolled out of the tail.
+        let fresh = match &last {
+            Some(last) => match read.iter().rposition(|l| l == last) {
+                Some(at) => &read[at + 1..],
+                None => &read[..],
+            },
+            None => &read[..],
+        };
+        for line in fresh {
+            print_log_line(ctx, name, q.log, line);
+        }
+        if let Some(line) = read.last() {
+            last = Some(line.to_string());
+        }
+    }
+}
+
+/// The complete lines of a read: one still being written waits for its end.
+fn whole_lines(text: &str) -> Vec<&str> {
+    let complete = text.rfind('\n').map_or("", |end| &text[..end]);
+    complete.lines().filter(|l| !l.is_empty()).collect()
+}
+
+/// The lines from the first one stamped at or after `cutoff`. A line's stamp is its first word:
+/// an RFC 3339 instant (TensorD's own log) or Unix seconds (the TensorFS and memory logs). A
+/// line without one goes with the line before it.
+fn from<'a>(lines: &'a [&'a str], cutoff: Timestamp) -> &'a [&'a str] {
+    let stamp = |line: &&str| -> Option<Timestamp> {
+        let word = line.split_whitespace().next()?;
+        word.parse().ok().or_else(|| {
+            let seconds: f64 = word.parse().ok()?;
+            Timestamp::from_millisecond((seconds * 1000.0) as i64).ok()
+        })
+    };
+    match lines
+        .iter()
+        .position(|line| stamp(line).is_some_and(|at| at >= cutoff))
+    {
+        Some(at) => &lines[at..],
+        None => &[],
+    }
+}
+
+fn print_log_line(ctx: &Context, machine: &str, log: LogName, line: &str) {
+    if ctx.json {
+        output::ndjson(&json!({ "machine": machine, "log": log.as_str(), "text": line }));
+    } else {
+        println!("{line}");
     }
 }
 
