@@ -623,8 +623,6 @@ pub struct Pool {
     reserve: Mutex<cozy_platform::contain::host_pressure::Reserve>,
     stalls: std::sync::atomic::AtomicU64,
     stalls_seen: std::sync::atomic::AtomicU64,
-    /// The memory policy's host ledger; the tier's limit reads it.
-    host_ledger: Arc<crate::memory::host::HostLedger>,
     /// Degree 2: GPU weights kept across executors. None on a GPU that drives a display.
     custody: Option<Mutex<ResidentCustody>>,
     /// Memoized Model methods' results, shared by every run on this machine.
@@ -694,7 +692,6 @@ impl Pool {
             )?;
         }
         let defaults = HostTierConfig::default();
-        let host_ledger = Arc::new(crate::memory::host::HostLedger::default());
         let host = HostTier::new(
             store.clone(),
             HostTierConfig {
@@ -705,7 +702,8 @@ impl Pool {
                     .map_or(defaults.ttl, std::time::Duration::from_secs),
                 plans: Some(root.join("host-plans")),
             },
-            Box::new(crate::memory::host::TierPolicy(host_ledger.clone())),
+            // The machine's one pinned host total: executors' pinned budgets split it too.
+            Box::new(crate::host_tier::HalfOfHeadroom),
         )?;
         // Fill leases and GPU custody hold one descriptor per object or chunk.
         cozy_platform::process::raise_fd_limit();
@@ -761,7 +759,6 @@ impl Pool {
             reserve: Mutex::default(),
             stalls: Default::default(),
             stalls_seen: Default::default(),
-            host_ledger,
             custody,
             memo: Arc::new(crate::memo::Memo::open(root.join("stage-memo"))?),
         });
@@ -971,7 +968,6 @@ impl Pool {
         for device in self.lane(start, degree).unwrap_or_default() {
             device.memory.with(|gpu| gpu.ended(plan));
         }
-        self.host_ledger.private(&key, None);
     }
     /// Each GPU of `plan`'s lane observes its own rank's facts; returns the first GPU's.
     fn observe(
@@ -3338,8 +3334,6 @@ impl Pool {
                 .and_then(|v| u64::try_from(v).ok())
         });
         self.observe(&construction, start, degree, facts, &reply.rank_planes, Some(true));
-        // Every executor's weights are the tier's: none pins memory of its own.
-        self.host_ledger.private(&session_key(&construction, start), None);
         // Rank 0 answered, so a follower that ended during the call is the group's first fault.
         let lost = self.lost_followers(start, degree, &session.followers);
         if !reply.ok || !reply.quiescent || !reply.poisoned.is_empty() || !lost.is_empty() {
@@ -3564,8 +3558,9 @@ impl Pool {
     }
 
     /// Host pinned budgets by `session_key` over every GPU's executors (a group's on its first
-    /// GPU): `plan`'s on the lane from `start` first, then most recently used first. None: the
-    /// host is unreadable.
+    /// GPU): `plan`'s on the lane from `start` first, then most recently used first, each up to
+    /// its weights out of the machine's one pinned total (the host tier's limit, whose pages
+    /// executors lock). None: the host is unreadable.
     fn pinned_budgets(&self, plan: &str, start: usize) -> Option<BTreeMap<String, u64>> {
         let first = session_key(plan, start);
         let leaders = self.leaders.lock().unwrap().clone();
@@ -3574,17 +3569,22 @@ impl Pool {
             let lane_first = |tenant: &str| leaders.contains(&(tenant.to_owned(), gpu));
             let tenants = device.memory.with(|ledger| ledger.pinned_rows());
             rows.extend(tenants.into_iter().filter(|row| lane_first(&row.0)).map(
-                |(tenant, weights, pinned, used)| (session_key(&tenant, gpu), weights, pinned, used),
+                |(tenant, weights, used)| (session_key(&tenant, gpu), weights, used),
             ));
         }
-        rows.sort_by_key(|(key, .., used)| (*key != first, std::cmp::Reverse(*used)));
+        rows.sort_by_key(|(key, _, used)| (*key != first, std::cmp::Reverse(*used)));
         if rows.first().is_none_or(|row| row.0 != first) {
             let weights = self.devices[start].memory.with(|gpu| gpu.facts(plan).weights);
-            rows.insert(0, (first, weights.unwrap_or(0), 0, 0));
+            rows.insert(0, (first, weights.unwrap_or(0), 0));
         }
-        let order: Vec<_> = rows.into_iter().map(|(key, weights, pinned, _)| (key, weights, pinned)).collect();
-        let memory = cozy_platform::contain::host_memory::read();
-        crate::memory::host::pinned_split(memory.available, memory.shmem, &order)
+        let tier = self.host.facts();
+        let mut left = (tier.host.available >= 0).then_some(tier.limit)?;
+        let share = |(key, weights, _): (String, u64, u64)| {
+            let share = weights.min(left);
+            left -= share;
+            (key, share)
+        };
+        Some(rows.into_iter().map(share).collect())
     }
 
     /// Followers whose process has ended, as people name their GPUs ("GPU 1's process 3224
@@ -3675,7 +3675,6 @@ fn plane_facts(plane: Option<&device_executor::PlaneFacts>) -> Facts {
         context: known(plane.context_bytes),
         process: known(plane.process_bytes),
         activation: known(plane.activation_peak_bytes).filter(|v| *v > 0),
-        pinned: known(plane.pinned_bytes),
         pinned_budget: known(plane.pinned_budget_bytes),
         ..Facts::default()
     })
@@ -3684,15 +3683,14 @@ fn plane_facts(plane: Option<&device_executor::PlaneFacts>) -> Facts {
 /// One `Facts` per GPU of a group from rank 0's and each follower's own plane facts
 /// (`rank_planes`, rank 1 first): a GPU's own process and context; weights and activation
 /// are rank 0's (its activation is the group's largest peak), as is a follower's whole set
-/// before it stated its own. The host tier is the group's, so the first GPU's pinned bytes
-/// and budget are every rank's.
+/// before it stated its own. The host tier is the group's, so the first GPU's pinned budget
+/// is every rank's.
 fn rank_facts(
     facts: Facts,
     ranks: &[Option<device_executor::PlaneFacts>],
     degree: u32,
 ) -> Vec<Facts> {
     let host = Facts {
-        pinned: None,
         pinned_budget: None,
         ..facts
     };
@@ -3703,7 +3701,6 @@ fn rank_facts(
                 weights: facts.weights,
                 weights_floor: facts.weights_floor,
                 activation: facts.activation,
-                pinned: None,
                 pinned_budget: None,
                 ..plane_facts(Some(own))
             },
@@ -3713,7 +3710,6 @@ fn rank_facts(
     let stated = |of: fn(&device_executor::PlaneFacts) -> Option<i64>| -> u64 {
         ranks.iter().flatten().filter_map(|r| known(of(r))).sum()
     };
-    each[0].pinned = facts.pinned.map(|own| own + stated(|r| r.pinned_bytes));
     each[0].pinned_budget = facts
         .pinned_budget
         .map(|own| own + stated(|r| r.pinned_budget_bytes));
@@ -4757,36 +4753,31 @@ mod tests {
             context: Some(1),
             weights: Some(6),
             activation: Some(3),
-            pinned: Some(4),
             pinned_budget: Some(5),
             ..Facts::default()
         };
         let follower = device_executor::PlaneFacts {
             process_bytes: Some(7),
             context_bytes: Some(2),
-            pinned_bytes: Some(4),
             pinned_budget_bytes: Some(5),
             ..Default::default()
         };
         let each = rank_facts(rank0, &[Some(follower), None], 3);
         assert_eq!(each.len(), 3);
-        // The host tier is the group's: the first GPU holds every stated rank's pinned bytes.
-        assert_eq!(
-            (each[0].process, each[0].pinned, each[0].pinned_budget),
-            (Some(9), Some(8), Some(10))
-        );
+        // The host tier is the group's: the first GPU holds every stated rank's pinned budget.
+        assert_eq!((each[0].process, each[0].pinned_budget), (Some(9), Some(10)));
         assert_eq!(
             (
                 each[1].process,
                 each[1].context,
                 each[1].weights,
                 each[1].activation,
-                each[1].pinned
+                each[1].pinned_budget
             ),
             (Some(7), Some(2), Some(6), Some(3), None)
         );
         // A follower that has not stated its own yet is charged rank 0's.
-        assert_eq!((each[2].process, each[2].pinned), (Some(9), None));
+        assert_eq!((each[2].process, each[2].pinned_budget), (Some(9), None));
         assert_eq!(rank_facts(rank0, &[], 1), vec![rank0]);
     }
 
@@ -5178,13 +5169,14 @@ int nvmlDeviceGetDisplayActive(void *d, int *s) { *s = 0; return 0; }
         for (gpu, tenant) in [(0, "film"), (1, "film"), (2, "film"), (3, "film"), (0, "image"), (2, "image")] {
             pool.devices[gpu].memory.with(|ledger| {
                 ledger.starting(tenant, 0);
-                let facts = Facts { weights: Some(gib), pinned: Some(0), ..Facts::default() };
+                let facts = Facts { weights: Some(gib), ..Facts::default() };
                 ledger.observe(tenant, facts, None);
             });
         }
         let split = pool.pinned_budgets("image", 2).unwrap();
         let keys: Vec<_> = split.keys().map(String::as_str).collect();
         assert_eq!(keys, ["film", "film@2", "image", "image@2"]);
+        assert!(split.values().sum::<u64>() <= pool.host.facts().limit, "one pinned total");
         pool.ended("film", 2, 2);
         let split = pool.pinned_budgets("image", 0).unwrap();
         let keys: Vec<_> = split.keys().map(String::as_str).collect();
