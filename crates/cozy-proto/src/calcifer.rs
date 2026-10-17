@@ -273,6 +273,7 @@ pub enum Event {
     Call { sequence_number: u64, call: Call },
     #[serde(rename = "run.progress")]
     Progress { progress: Progress },
+    /// Why the run waits now; an empty reason: it waits no longer.
     #[serde(rename = "run.waiting")]
     Waiting { reason: String },
 }

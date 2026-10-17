@@ -80,7 +80,7 @@ async fn an_input_uploads_near_the_link_rate_over_a_long_round_trip() {
             }
             match event {
                 Event::Waiting { reason } => {
-                    if let Some(progress) = reason.strip_prefix("writing image: ") {
+                    if let Some(progress) = reason.strip_prefix("uploading image: ") {
                         seen.push((Instant::now(), parse(progress.split('/').next().unwrap())));
                     }
                 }

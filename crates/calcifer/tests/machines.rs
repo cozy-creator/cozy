@@ -338,8 +338,8 @@ async fn runs_wait_for_a_booting_rental_through_its_rename_and_go_when_its_addre
         .unwrap()
         .run
         .id;
-    let waiting = until(&mut events, &early, |e| matches!(e, Event::Waiting { .. })).await;
-    assert!(matches!(waiting, Event::Waiting { reason } if reason.contains("start")));
+    let booting = |e: &Event| matches!(e, Event::Waiting { reason } if reason.contains("start"));
+    until(&mut events, &early, booting).await;
 
     // The Hub names the pod while it boots: the run moves with it, and the old name still works.
     assert!(calcifer.rename_machine("rent-0a1b", "kiyui").unwrap());

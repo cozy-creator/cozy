@@ -218,8 +218,9 @@ async fn runs_wait_for_a_booting_machine_and_a_cancel_there_never_sends() {
         .unwrap()
         .run
         .id;
-    let waiting = until(&mut events, &waits, |e| matches!(e, Event::Waiting { .. })).await;
-    assert!(matches!(waiting, Event::Waiting { reason } if reason.contains("start")));
+    // Its first reason is the send; then that its machine has not started.
+    let booting = |e: &Event| matches!(e, Event::Waiting { reason } if reason.contains("start"));
+    until(&mut events, &waits, booting).await;
     calcifer.cancel(&canceled).unwrap();
     assert_eq!(
         calcifer
@@ -469,7 +470,7 @@ async fn inputs_are_written_as_a_visible_stage_and_once_per_machine() {
         while accepted.len() < 2 {
             let (id, event) = events.recv().await.unwrap();
             match event {
-                Event::Waiting { reason } if reason.starts_with("writing image: ") => {
+                Event::Waiting { reason } if reason.starts_with("uploading image: ") => {
                     writing.entry(id).or_default().push(reason);
                 }
                 event if is_status(Status::InProgress)(&event) => {
@@ -487,13 +488,13 @@ async fn inputs_are_written_as_a_visible_stage_and_once_per_machine() {
         "one run wrote the object, the other found it held: {writing:?}"
     );
     let shown = writing.values().next().unwrap();
-    assert_eq!(shown[0], "writing image: 0 B/24.0 MiB", "{shown:?}");
+    assert_eq!(shown[0], "uploading image: 0 B/24.0 MiB", "{shown:?}");
     assert!(shown.len() >= 2, "from nothing to all of it: {shown:?}");
     assert!(
         shown
             .last()
             .unwrap()
-            .starts_with("writing image: 24.0 MiB/24.0 MiB at "),
+            .starts_with("uploading image: 24.0 MiB/24.0 MiB at "),
         "{shown:?}"
     );
     let link = Link::new(&machine.endpoint, common::key()).unwrap();

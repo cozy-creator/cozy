@@ -402,3 +402,101 @@ fn unchanged_local_code_is_called_at_once_and_an_edit_only_syncs() {
         ]
     );
 }
+
+/// Run 10375 showed a bare "queued" while it uploaded its clip. Two runs, each with a 60 MiB
+/// file, go to one machine at once: each follower's line says why it waits with what `cozy run
+/// list` reads (its upload and its progress, the send, another run's upload it waits for, by
+/// number), never a bare `queued`; `--json` carries the same text; and a run past its wait shows
+/// no reason in `cozy run show`.
+#[test]
+fn a_waiting_run_says_why_and_stops_saying_it_once_it_no_longer_waits() {
+    let Some(home) = Home::new() else { return };
+    if std::env::var_os("COZY_TEST_TENSORD").is_none() {
+        eprintln!("skipped: no TensorD (COZY_TEST_TENSORD is unset)");
+        return;
+    }
+    let _machine = common::tensord::added(&home, "m1");
+    let work = home.path().join("work");
+    copy(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/package/tiny"),
+        &work.join("tiny"),
+    );
+    let code = work.join("tiny/tiny/__init__.py");
+    let measure = "\n\nimport time\n\nfrom cozy_runtime.author import FileAsset\n\n\n\
+                   class MeasureInput(msgspec.Struct):\n    document: FileAsset\n\n\n\
+                   class MeasureOutput(msgspec.Struct):\n    length: int\n\n\n\
+                   @app.entrypoint(accelerator=False)\n\
+                   def measure(payload: MeasureInput) -> MeasureOutput:\n    \
+                   time.sleep(4)\n    \
+                   return MeasureOutput(len(payload.document.read_bytes()))\n";
+    let mut text = std::fs::read_to_string(&code).unwrap();
+    text.push_str(measure);
+    std::fs::write(&code, text).unwrap();
+    for (name, seed) in [("a.bin", 1u32), ("b.bin", 2)] {
+        let bytes: Vec<u8> = (0..60u32 << 20)
+            .map(|i| (i.wrapping_add(seed).wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        std::fs::write(work.join(name), bytes).unwrap();
+    }
+    let follow = |file: &str, json: bool| {
+        let mut args = vec!["run", "./tiny/measure", file, "--on", "m1"];
+        if json {
+            args.insert(0, "--json");
+        }
+        home.command()
+            .current_dir(&work)
+            .args(args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    let (mut person, mut machine) = (follow("./a.bin", false), follow("./b.bin", true));
+    // While one runs past its wait, `run show` says no reason.
+    let (mut held_shown, mut seen) = (false, Value::Null);
+    let ended = |child: &mut std::process::Child| child.try_wait().unwrap().is_some();
+    while !held_shown && !(ended(&mut person) && ended(&mut machine)) {
+        seen = home.json(["run", "list", "--json"]);
+        for run in seen["runs"].as_array().into_iter().flatten() {
+            let measuring = run["target"]
+                .as_str()
+                .is_some_and(|t| t.ends_with("/measure"));
+            let running = run["status"] == "in_progress"
+                && run["machine_state"]
+                    .as_str()
+                    .is_some_and(|s| s != "queued" && s != "preparing");
+            if measuring && running {
+                let number = run["number"].to_string();
+                let shown = cozy(&home, &work, &["run", "show", &number]);
+                assert!(!shown.stdout.contains("waiting"), "{shown:?}");
+                held_shown = true;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let person = common::out(person.wait_with_output().unwrap());
+    let machine = common::out(machine.wait_with_output().unwrap());
+    assert!(
+        held_shown,
+        "no run was seen running: {seen}\n{person:?}\n{machine:?}"
+    );
+    assert_eq!(
+        (person.code, machine.code),
+        (0, 0),
+        "{person:?}\n{machine:?}"
+    );
+    let said: Vec<&str> = person.stderr.lines().map(str::trim).collect();
+    let reasons: Vec<String> = machine
+        .stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|e| e["type"] == "run.waiting")
+        .filter_map(|e| e["reason"].as_str().map(str::to_owned))
+        .collect();
+    // Each upload says so with its progress, in the person's line and in the events alike.
+    let uploading =
+        |line: &str| line.starts_with("uploading document: ") && line.contains("/60.0 MiB");
+    assert!(said.iter().any(|l| uploading(l)), "{said:?}");
+    assert!(reasons.iter().any(|r| uploading(r)), "{reasons:?}");
+    assert!(!said.contains(&"queued"), "a bare queued: {said:?}");
+}
