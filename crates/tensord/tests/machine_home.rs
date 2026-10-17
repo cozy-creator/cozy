@@ -34,7 +34,6 @@ fn boot(home: &Path) -> Machine {
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
             .env("HOME", home)
-            .env("CUDA_VISIBLE_DEVICES", "")
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
             .spawn()
@@ -112,6 +111,15 @@ async fn this_computers_machine_runs_from_its_home() {
     // The owner key Calcifer signs with is admitted; another is not, until it is authorized.
     let frame = status(&mut client, &owner).await.unwrap();
     assert_eq!(frame.worker_id, "local");
+    // Every GPU names its tensor-core family and memory class; a computer with no NVIDIA driver
+    // (a hosted runner) has none to name.
+    if !Path::new("/dev/nvidiactl").exists() {
+        assert!(frame.gpus.is_empty(), "{:?}", frame.gpus);
+    }
+    for gpu in &frame.gpus {
+        assert!(gpu.family.starts_with("sm"), "{gpu:?}");
+        assert!(["discrete", "coherent", "unified"].contains(&gpu.memory_class.as_str()), "{gpu:?}");
+    }
     let other = SigningKey::from_bytes(&[6; 32]);
     assert_eq!(status(&mut client, &other).await.unwrap_err().code(), Code::Unauthenticated);
     let line = URL_SAFE_NO_PAD.encode(other.verifying_key().as_bytes());
