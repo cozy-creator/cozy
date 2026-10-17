@@ -2,7 +2,7 @@
 name = "tiny"
 version = "0.1.0"
 requires-python = ">=3.12"
-dependencies = ["cozy-runtime>=0.25.1", "msgspec>=0.19"]
+dependencies = ["cozy-runtime", "msgspec>=0.19"]
 
 [project.entry-points."cozy.application"]
 default = "tiny:app"

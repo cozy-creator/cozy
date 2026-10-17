@@ -1,6 +1,6 @@
 //! The model ingest cycle on a real Tensorhub with real machines: Tensorhub's dev-build `cozy_ref`
 //! job (TENSORHUB_URL, TENSORHUB_LOG; MinIO storage; its public origin behind a private CA) and the
-//! TensorD COZY_TEST_TENSORD names (the released one by default). The machines trust that CA
+//! TensorD COZY_TEST_TENSORD names (this workspace's). The machines trust that CA
 //! only as each run's Hub access names it, never through their environment, so every Hub call a
 //! run makes proves it: the capability's trade, the upload's presign and publication, a private
 //! checkpoint's closure, a package's card and install plan. The machine pins, makes, quantizes
@@ -107,29 +107,9 @@ fn publish_quantizer(home: &Home) {
     }
 }
 
-/// Whether COZY_TEST_TENSORD is this workspace's TensorD (`cozy_tensord=workspace` sets
-/// COZY_TENSORD), not a released one.
-fn workspace() -> bool {
-    std::env::var("COZY_TENSORD").as_deref() == Ok("workspace")
-}
-
-/// A machine added to this home. TensorD v0.7.3 doesn't apply the run's CA to every Hub call
-/// (fixed in #1384, ships with the cohort), so a released one also trusts the Hub's CA through
-/// SSL_CERT_FILE: the system's roots and the Hub's CA together, since its uv reads PyPI through the
-/// same file. The workspace's (`cozy_tensord=workspace`, which sets COZY_TENSORD) gets none, and
-/// every Hub call it makes proves the CA arrives through the run's access alone.
+/// A machine added to this home; every Hub call it makes trusts the CA through the run's access.
 fn machine(home: &Home, name: &str) -> common::tensord::Tensord {
-    if workspace() {
-        return common::tensord::added(home, name);
-    }
-    let hub = std::fs::read_to_string(std::env::var("TENSORHUB_CA").expect("the CI Hub's CA")).unwrap();
-    let roots = ["/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt"]
-        .iter()
-        .find_map(|path| std::fs::read_to_string(path).ok())
-        .expect("the system's CA roots");
-    let bundle = home.path().join("ca-bundle.pem");
-    std::fs::write(&bundle, format!("{roots}\n{hub}")).unwrap();
-    common::tensord::added_with(home, name, &[("SSL_CERT_FILE", bundle.to_str().unwrap())])
+    common::tensord::added(home, name)
 }
 
 #[test]
@@ -147,14 +127,10 @@ fn a_model_is_uploaded_quantized_and_published_by_its_machine() {
     let source = made["published"]["checkpoint"].as_str().unwrap().to_owned();
 
     // Another machine reads the private checkpoint by its digest, under the run's capability.
-    // TensorD v0.7.3 cannot read a by-hash checkpoint without its length (NOT_CONTAINED; fixed in
-    // #1384, ships with the cohort), so this runs on the workspace's TensorD.
-    if workspace() {
-        let _other = machine(&home, "m2");
-        let checkpoint = format!("{model}#{source}");
-        let run = completed(&home, &cozy(&home, None, &["--json", "model", "download", &checkpoint, "--on", "m2"]));
-        assert_eq!(run["result"]["models"][0]["manifest"], source.as_str(), "{run}");
-    }
+    let _other = machine(&home, "m2");
+    let checkpoint = format!("{model}#{source}");
+    let run = completed(&home, &cozy(&home, None, &["--json", "model", "download", &checkpoint, "--on", "m2"]));
+    assert_eq!(run["result"]["models"][0]["manifest"], source.as_str(), "{run}");
 
     // A release names it; info shows the lane and its checkpoint.
     let lane = format!("f32={source}");

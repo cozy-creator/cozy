@@ -1,4 +1,4 @@
-//! A real TensorD (`COZY_TEST_TENSORD`, the binary a cozy-runtime wheel carries) on a temp root, for
+//! A real TensorD (`COZY_TEST_TENSORD`, this workspace's build) on a temp root, for
 //! tests that add it as another computer's machine. It runs as a persistent machine from a grant in
 //! its environment, as a computer's machine does, so its Status carries its store, disk, models and
 //! environments. Its TLS identity outlives a restart.
@@ -152,24 +152,6 @@ fn wait_ready(child: &mut Child, leaf: &Path, address: &str) {
         );
         std::thread::sleep(Duration::from_millis(50));
     }
-}
-
-/// Whether COZY_TEST_TENSORD is this workspace's TensorD rather than a released cozy-runtime
-/// wheel's: Tensorhub's job says so when it builds it (`cozy_tensord=workspace` sets COZY_TENSORD).
-pub fn workspace() -> bool {
-    std::env::var("COZY_TENSORD").as_deref() == Ok("workspace")
-}
-
-/// TensorD 0.7.x, released and this workspace's alike, keeps no log of its own for `cozy
-/// machine logs`; the v0.10.0 cohort's does. The cohort deletes this.
-pub fn serves_own_log() -> bool {
-    false
-}
-
-/// Released TensorD 0.7.3 drops the executor's adjustment rows; this workspace's keeps them on the
-/// outcome (cr-197 U2, #1383). The cohort deletes this.
-pub fn reports_adjustments() -> bool {
-    workspace()
 }
 
 /// A TensorD added to `home`'s Calcifer as `name`, the way a person adds one: `cozy machine add`

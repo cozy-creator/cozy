@@ -216,9 +216,9 @@ fn an_update_installs_the_hubs_target_and_then_has_nothing_to_do() {
     );
 }
 
-/// The Runtime 0.25.1 and a TensorFS 0.10 wheel for this platform, downloaded into `dir`.
+/// PyPI's Runtime and TensorFS wheels for this platform, downloaded into `dir`.
 fn downloaded(dir: &Path) -> (PathBuf, PathBuf) {
-    for requirement in ["cozy-runtime==0.25.1", "tensorfs>=0.10,<0.11"] {
+    for requirement in ["cozy-runtime", "tensorfs"] {
         let fetched = std::process::Command::new("python3")
             .args([
                 "-m",
@@ -253,6 +253,11 @@ fn downloaded(dir: &Path) -> (PathBuf, PathBuf) {
     (wheel("cozy_runtime-"), wheel("tensorfs-"))
 }
 
+/// A wheel's version, from its file name.
+fn version(wheel: &Path) -> String {
+    wheel.file_name().unwrap().to_str().unwrap().split('-').nth(1).unwrap().to_owned()
+}
+
 /// `machine update --runtime-wheel/--tensorfs-wheel` installs local wheels, each written to the machine
 /// with the run, in place of the Hub's target: how a release gate runs an unpublished Runtime. The
 /// machine's Status then reports the wheels' versions.
@@ -281,11 +286,11 @@ fn an_update_installs_local_wheels() {
             last["type"].as_str(),
             last["run"]["result"]["to"]["runtime"].as_str()
         ),
-        (0, Some("run.completed"), Some("0.25.1")),
+        (0, Some("run.completed"), Some(version(&runtime).as_str())),
         "{out:?}"
     );
     let shown = home.json(["machine", "show", "wheels", "--json"]);
-    assert_eq!(shown["status"]["runtime"], "0.25.1", "{shown}");
+    assert_eq!(shown["status"]["runtime"], version(&runtime).as_str(), "{shown}");
     // A file that is not the member's wheel is refused before anything is sent.
     let out = home.cozy([
         "machine".as_ref(),
@@ -303,17 +308,17 @@ fn an_update_installs_local_wheels() {
 }
 
 /// A PyPI wheel URL names its release: the CLI checks with PyPI that the release holds that file at
-/// that sha256 and sends the release, which a machine of any version fetches from PyPI (TensorD
-/// 0.7.3 included). A digest PyPI does not list is refused before anything is sent.
+/// that sha256 and sends the release, which the machine fetches from PyPI. A digest PyPI does not
+/// list is refused before anything is sent.
 #[test]
 fn an_update_names_a_published_wheel_by_its_pypi_url() {
     let Some(home) = Home::new() else { return };
     let _machine = tensord::added(&home, "pypi");
-    let wheel = |project: &str, release: &str| {
+    let wheel = |project: &str| {
         let listed = std::process::Command::new("curl")
             .args([
                 "-sSfL",
-                &format!("https://pypi.org/pypi/{project}/{release}/json"),
+                &format!("https://pypi.org/pypi/{project}/json"),
             ])
             .output()
             .unwrap();
@@ -327,15 +332,16 @@ fn an_update_names_a_published_wheel_by_its_pypi_url() {
                 name.ends_with(".whl") && name.contains("manylinux") && name.contains("x86_64")
             })
             .cloned()
-            .unwrap_or_else(|| panic!("{project} {release} has no manylinux x86_64 wheel"));
+            .unwrap_or_else(|| panic!("{project}'s newest has no manylinux x86_64 wheel"));
         let (url, sha256) = (
             file["url"].as_str().unwrap(),
             file["digests"]["sha256"].as_str().unwrap(),
         );
-        (format!("{url}#sha256={sha256}"), url.to_owned())
+        let release = listed["info"]["version"].as_str().unwrap().to_owned();
+        (format!("{url}#sha256={sha256}"), url.to_owned(), release)
     };
-    let (runtime, runtime_url) = wheel("cozy-runtime", "0.25.1");
-    let (tensorfs, _) = wheel("tensorfs", "0.10.0");
+    let (runtime, runtime_url, release) = wheel("cozy-runtime");
+    let (tensorfs, _, _) = wheel("tensorfs");
     let wrong = format!("{runtime_url}#sha256={}", "ab".repeat(32));
     let out = home.cozy([
         "machine",
@@ -368,7 +374,7 @@ fn an_update_names_a_published_wheel_by_its_pypi_url() {
             last["type"].as_str(),
             last["run"]["result"]["to"]["runtime"].as_str()
         ),
-        (0, Some("run.completed"), Some("0.25.1")),
+        (0, Some("run.completed"), Some(release.as_str())),
         "{out:?}"
     );
 }
@@ -376,8 +382,7 @@ fn an_update_names_a_published_wheel_by_its_pypi_url() {
 /// `machine update --runtime-wheel/--tensorfs-wheel https://…#sha256=<hex>`: the machine fetches each
 /// wheel itself, through a redirect to another host, and nothing is written to it from here. The
 /// bytes are held to the digest: under a wrong one the update fails `wheel_digest_mismatch` naming
-/// both digests, and the machine keeps its software. That needs this workspace's TensorD; a released
-/// one refuses the form at submission.
+/// both digests, and the machine keeps its software.
 #[test]
 fn an_update_fetches_wheels_by_url_held_to_their_digests() {
     let Some(home) = Home::new() else { return };
@@ -435,33 +440,6 @@ fn an_update_fetches_wheels_by_url_held_to_their_digests() {
             "{out:?}"
         );
     }
-    // Fetching by URL needs the cohort's TensorD, this workspace's. A released TensorD (0.7.3)
-    // refuses the {url, sha256} member at submission: the run fails typed, and the machine
-    // fetches nothing, as nothing is sent from here.
-    if !tensord::workspace() {
-        let (out, last) = update(
-            url(&runtime, &digest(&runtime)).as_str(),
-            url(&tensorfs, &digest(&tensorfs)).as_str(),
-        );
-        let reason = &last["run"]["reason"];
-        assert_eq!(
-            (out.code, last["type"].as_str(), reason["code"].as_str()),
-            (1, Some("run.failed"), Some("InvalidArgument")),
-            "{out:?}"
-        );
-        let message = reason["message"].as_str().unwrap_or_default();
-        assert!(
-            message.contains("an update payload is a JSON object"),
-            "{out:?}"
-        );
-        assert_eq!(
-            server.served.load(Ordering::Relaxed),
-            0,
-            "the machine fetched"
-        );
-        assert_eq!(running(), before);
-        return;
-    }
     let wrong = "ab".repeat(32);
     let (out, last) = update(
         url(&runtime, &wrong).as_str(),
@@ -489,10 +467,10 @@ fn an_update_fetches_wheels_by_url_held_to_their_digests() {
             last["type"].as_str(),
             last["run"]["result"]["to"]["runtime"].as_str()
         ),
-        (0, Some("run.completed"), Some("0.25.1")),
+        (0, Some("run.completed"), Some(version(&runtime).as_str())),
         "{out:?}"
     );
-    assert_eq!(running(), "0.25.1");
+    assert_eq!(running(), version(&runtime).as_str());
     assert!(
         server.served.load(Ordering::Relaxed) > 0,
         "the machine fetched the wheels"

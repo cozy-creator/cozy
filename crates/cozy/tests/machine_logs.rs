@@ -35,20 +35,16 @@ fn a_machines_logs_read_and_follow_what_it_did() {
         (1, Some("machine_not_found")),
         "{unknown:?}"
     );
-    // Its own log, once its TensorD serves one; before, a refusal that names it and what to do.
+    // TensorD keeps no log of its own yet: a refusal that names the machine and what to do.
     let own = home.cozy(["machine", "logs", "m1", "--json"]);
-    if common::tensord::serves_own_log() {
-        assert!(lines(&own).iter().all(|l| l["log"] == "tensord"), "{own:?}");
-    } else {
-        let refusal = own.refusal();
-        assert_eq!(own.code, 1, "{own:?}");
-        assert_eq!(refusal["code"], "machine_log_unsupported", "{own:?}");
-        assert!(
-            refusal["message"].as_str().unwrap().contains("m1"),
-            "{own:?}"
-        );
-        assert_eq!(refusal["next"][1], "cozy machine update m1", "{own:?}");
-    }
+    let refusal = own.refusal();
+    assert_eq!(own.code, 1, "{own:?}");
+    assert_eq!(refusal["code"], "machine_log_unsupported", "{own:?}");
+    assert!(
+        refusal["message"].as_str().unwrap().contains("m1"),
+        "{own:?}"
+    );
+    assert_eq!(refusal["next"][1], "cozy machine update m1", "{own:?}");
 
     // A download writes the transport log; its lines read back whole, newest last.
     let out = home.cozy([

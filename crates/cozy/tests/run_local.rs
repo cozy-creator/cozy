@@ -11,7 +11,7 @@ use serde_json::Value;
 
 const SCRIPT: &str = r#"# /// script
 # requires-python = ">=3.12"
-# dependencies = ["cozy-runtime>=0.25.1"]
+# dependencies = ["cozy-runtime"]
 # [tool.cozy]
 # accelerator = false
 # ///
@@ -166,7 +166,7 @@ fn a_local_wheel_a_path_source_names_is_carried_to_the_machine() {
     write(
         "carried.py",
         &format!(
-            "# /// script\n# requires-python = \">=3.12\"\n# dependencies = [\"cozy-runtime>=0.25.1\", \"probe-kernels\"]\n\
+            "# /// script\n# requires-python = \">=3.12\"\n# dependencies = [\"cozy-runtime\", \"probe-kernels\"]\n\
          # [tool.uv.sources]\n# probe-kernels = {{ path = \"{wheel}\" }}\n# [tool.cozy]\n# accelerator = false\n# ///\n\
          import probe_kernels\n\n\ndef main() -> str:\n    return probe_kernels.VALUE\n"
         ),
@@ -183,7 +183,7 @@ fn a_local_wheel_a_path_source_names_is_carried_to_the_machine() {
         "locked/pyproject.toml",
         &format!(
             "[project]\nname = \"locked-probe\"\nversion = \"0.1.0\"\nrequires-python = \">=3.12\"\n\
-         dependencies = [\"cozy-runtime>=0.25.1\", \"msgspec>=0.19\", \"probe-kernels\"]\n\n\
+         dependencies = [\"cozy-runtime\", \"msgspec>=0.19\", \"probe-kernels\"]\n\n\
          [project.entry-points.\"cozy.application\"]\ndefault = \"locked_probe:app\"\n\n\
          [tool.uv.sources]\nprobe-kernels = {{ path = \"../{wheel}\" }}\n\n{backend}"
         ),
@@ -524,10 +524,6 @@ fn a_runs_adjustments_reach_its_record() {
         &["--json", "run", "./tiny-adjusted/steps", "--on", "m1"],
     ));
     assert_eq!(run["result"]["steps"], 30, "{run}");
-    if !common::tensord::reports_adjustments() {
-        assert!(run["adjustments"].is_null(), "{run}");
-        return;
-    }
     assert_eq!(
         run["adjustments"],
         serde_json::json!([

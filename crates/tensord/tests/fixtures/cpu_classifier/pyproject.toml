@@ -7,7 +7,7 @@ name = "tensord-cpu-classifier"
 version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
-    "cozy-runtime>=0.26",
+    "cozy-runtime",
     "msgspec>=0.19,<1",
     "numpy>=2,<3",
     "scikit-learn>=1.5,<2",

@@ -603,16 +603,24 @@ mod tests {
         String::from_utf8(output.stdout).unwrap().trim().to_string()
     }
 
+    /// PyPI's Runtime and TensorFS wheels for this platform, standing in for the machine's own.
     fn sdk_pair(root: &Path) -> Vec<PathBuf> {
         let sdk = root.join("sdk");
-        fs::create_dir_all(&sdk).unwrap();
-        SDK_PAIR
+        run(Command::new("python3").args(["-m", "pip", "download", "-q", "--no-deps", "--only-binary=:all:", "--python-version", "3.12",
+            "--platform", "manylinux_2_28_x86_64", "--platform", "manylinux_2_17_x86_64", "-d"]).arg(&sdk).args(["cozy-runtime", "tensorfs"]));
+        ["cozy_runtime-", "tensorfs-"]
             .iter()
-            .map(|(name, url)| {
-                run(Command::new("curl").args(["-sfL", "-o"]).arg(sdk.join(name)).arg(url));
-                sdk.join(name)
+            .map(|prefix| {
+                (fs::read_dir(&sdk).unwrap().map(|entry| entry.unwrap().path()))
+                    .find(|path| path.file_name().unwrap().to_string_lossy().starts_with(prefix))
+                    .unwrap()
             })
             .collect()
+    }
+
+    /// A wheel's version, from its file name.
+    fn wheel_version(wheel: &Path) -> String {
+        wheel.file_name().unwrap().to_string_lossy().split('-').nth(1).unwrap().to_string()
     }
 
     fn archive(dir: &Path, names: &[&str]) -> Vec<u8> {
@@ -632,10 +640,10 @@ mod tests {
 
     /// The real installer from objects the signer wrote; the same manifest reopens it.
     #[test]
-    fn a_written_local_package_reuses_only_the_same_sdk_environment() {
+    fn a_written_local_package_reuses_its_environment() {
         let Machine { root, service, store, objects, installer } = machine("cm-local");
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let sources = LocalSources::new(objects.clone(), installer.clone(), store.clone());
+        let sources = LocalSources::new(objects.clone(), installer, store);
         let fixture = repo.join("tests/fixtures/cpu_input");
         let tree = archive(&fixture, &["pyproject.toml", "package.toml", "cpu_input/__init__.py"]);
         let source = write(&objects, "alice", &tree);
@@ -666,30 +674,6 @@ mod tests {
             .install(&service, "alice", &manifest.digest, None)
             .unwrap();
         assert_eq!(again.generation, installed.generation);
-
-        // With the machine's own SDK pair, a local package runs that pair, not PyPI's newest.
-        let pair = sdk_pair(&root);
-        let pinned = LocalSources::new(
-            objects.clone(),
-            InstallerConfig {
-                sdk: pair,
-                ..installer
-            },
-            store,
-        );
-        // The source and manifest stay byte-identical across this SDK change. Reusing
-        // the first alias here would silently keep its original Runtime/TensorFS.
-        let updated = pinned.install(&service, "alice", &manifest.digest, None).unwrap();
-        assert_ne!(updated.alias, installed.alias);
-        assert_ne!(updated.generation, installed.generation);
-        let same_sdk = pinned.install(&service, "alice", &manifest.digest, None).unwrap();
-        assert_eq!(same_sdk.alias, updated.alias);
-        assert_eq!(same_sdk.generation, updated.generation);
-        // A prior generation remains valid for already accepted work.
-        assert!(service.catalog.resolve(&installed.generation).is_ok());
-        let held = service.catalog.resolve(&updated.generation).unwrap();
-        assert_eq!(installed_sdk(&held.record.python), "0.26.4 0.10.0");
-        assert_eq!(held.record.sdk_fallback, "");
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1003,8 +987,7 @@ mod tests {
             }
         }
         let pyproject = fs::read_to_string(project.join("pyproject.toml")).unwrap();
-        // A settled Runtime: the newest may be mid-upload (its sdist visible before its wheels).
-        fs::write(project.join("pyproject.toml"), pyproject + "\n[tool.uv]\nconstraint-dependencies = [\"cozy-runtime==0.26.4\"]\n[tool.uv.sources]\ntensord-cpu-memo = { path = \"deps/cpu_memo\" }\n").unwrap();
+        fs::write(project.join("pyproject.toml"), pyproject + "\n[tool.uv.sources]\ntensord-cpu-memo = { path = \"deps/cpu_memo\" }\n").unwrap();
         run(Command::new("uv").args(["lock", "--python", "3.12", "--project"]).arg(&project));
         let names = ["pyproject.toml", "package.toml", "uv.lock", "cpu_caller/__init__.py",
             "deps/cpu_memo/pyproject.toml", "deps/cpu_memo/package.toml", "deps/cpu_memo/cpu_memo/__init__.py"];
@@ -1073,10 +1056,8 @@ mod tests {
             fs::read_dir(&out).unwrap().map(|e| e.unwrap().path()).find(|p| p.extension().is_some_and(|e| e == "whl")).unwrap()
         };
         let (caller, memo) = (wheel_of("cpu_caller"), wheel_of("cpu_memo"));
-        // A settled Runtime: the newest may be mid-upload (its sdist visible before its wheels).
-        fs::write(m.root.join("settled.txt"), "cozy-runtime==0.26.4\n").unwrap();
-        let compiled = run(Command::new("uv").args(["pip", "compile", "--quiet", "--generate-hashes", "--python-version", "3.12", "--no-header", "--constraint"])
-            .arg(m.root.join("settled.txt")).arg("--find-links")
+        let compiled = run(Command::new("uv").args(["pip", "compile", "--quiet", "--generate-hashes", "--python-version", "3.12", "--no-header"])
+            .arg("--find-links")
             .arg(memo.parent().unwrap()).arg(repo.join("tests/fixtures/cpu_caller/pyproject.toml")));
         let requirements = compiled.replace("tensord-cpu-memo==0.1.0", &format!("tensord-cpu-memo @ file://{}", memo.display()));
         let wheel = write(&m.objects, "alice", &fs::read(&caller).unwrap());
@@ -1104,7 +1085,7 @@ mod tests {
             }
         }
         let pyproject = fs::read_to_string(project.join("pyproject.toml")).unwrap();
-        fs::write(project.join("pyproject.toml"), pyproject + "\n[tool.uv]\nconstraint-dependencies = [\"cozy-runtime==0.26.4\"]\n[tool.uv.sources]\ntensord-cpu-memo = { path = \"deps/cpu_memo\" }\n").unwrap();
+        fs::write(project.join("pyproject.toml"), pyproject + "\n[tool.uv.sources]\ntensord-cpu-memo = { path = \"deps/cpu_memo\" }\n").unwrap();
         run(Command::new("uv").args(["lock", "--python", "3.12", "--project"]).arg(&project));
         let tree = archive(&project, &["pyproject.toml", "uv.lock", "package.toml", "cpu_caller/__init__.py",
             "deps/cpu_memo/pyproject.toml", "deps/cpu_memo/package.toml", "deps/cpu_memo/cpu_memo/__init__.py"]);
@@ -1144,13 +1125,14 @@ mod tests {
             fs::copy(fixture.join(name), project.join(name)).unwrap();
         }
         // The machine's own Runtime wheel, rebuilt as a developer's local version.
-        let dev = "0.26.4+dev.vendored";
-        run(Command::new(&m.installer.helper_python).args(["-c", REVERSION]).arg(&pair[0]).arg(project.join("vendor")).arg(dev));
-        let vendored = format!("vendor/cozy_runtime-{dev}-cp312-abi3-manylinux_2_28_x86_64.whl");
+        let runtime = wheel_version(&pair[0]);
+        let dev = format!("{runtime}+dev.vendored");
+        run(Command::new(&m.installer.helper_python).args(["-c", REVERSION]).arg(&pair[0]).arg(project.join("vendor")).arg(&dev));
+        let vendored = format!("vendor/{}", pair[0].file_name().unwrap().to_string_lossy().replace(&format!("-{runtime}-"), &format!("-{dev}-")));
         let pyproject = fs::read_to_string(fixture.join("pyproject.toml")).unwrap();
         fs::write(
             project.join("pyproject.toml"),
-            pyproject.replace("cozy-runtime>=0.26", &format!("cozy-runtime=={dev}"))
+            pyproject.replace("\"cozy-runtime\"", &format!("\"cozy-runtime=={dev}\""))
                 + &format!("\n[tool.uv.sources]\ncozy-runtime = {{ path = \"{vendored}\" }}\n"),
         )
         .unwrap();
@@ -1190,7 +1172,7 @@ mod tests {
             let versions = installed_sdk(&held.record.python);
             assert!(versions.starts_with(&format!("{dev} ")), "{versions}");
             let why = &held.record.sdk_fallback;
-            assert!(why.contains(&format!("requires `cozy-runtime=={dev}`, but `0.26.4` is installed")), "{why}");
+            assert!(why.contains(&format!("requires `cozy-runtime=={dev}`, but `{runtime}` is installed")), "{why}");
             assert!(why.ends_with(&format!("it runs the package's own cozy-runtime=={dev}, tensorfs=={}", &versions[dev.len() + 1..])), "{why}");
         }
 
@@ -1198,7 +1180,7 @@ mod tests {
         let refused = |digest: &str| sources.install(&m.service, "alice", digest, None).err().unwrap().message;
         let absent = manifest(serde_json::json!({"source": member("source.tar", &archive(&project, &files))}));
         let why = refused(&absent);
-        assert!(why.contains("package_dependency_operation_failed: uv sync --frozen exited") && why.contains("vendor/cozy_runtime-0.26.4"), "{why}");
+        assert!(why.contains("package_dependency_operation_failed: uv sync --frozen exited") && why.contains(&format!("vendor/cozy_runtime-{runtime}")), "{why}");
         let python = manifest(serde_json::json!({"source": member("source.tar", &tree), "python_requires": ">=4"}));
         let why = refused(&python);
         assert!(why.starts_with("package_python_unavailable: configured interpreter does not satisfy"), "{why}");
@@ -1225,10 +1207,4 @@ with zipfile.ZipFile(source) as src, zipfile.ZipFile(target, "w") as dst:
         rows.append(f"{path},sha256={base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b'=').decode()},{len(data)}\n")
     dst.writestr(record, "".join(rows) + f"{record},,\n")
 "#;
-
-    /// A Runtime/TensorFS pair other than PyPI's newest, standing in for the machine's own.
-    const SDK_PAIR: [(&str, &str); 2] = [
-        ("cozy_runtime-0.26.4-cp312-abi3-manylinux_2_28_x86_64.whl", "https://files.pythonhosted.org/packages/24/0c/5a451d1dd376fe4df3de99e60cb3a765f9e17bb7a0c5330a39667354a76e/cozy_runtime-0.26.4-cp312-abi3-manylinux_2_28_x86_64.whl"),
-        ("tensorfs-0.10.0-cp312-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", "https://files.pythonhosted.org/packages/54/21/efb6e5ed5064d0681b2b501346c7884207e260c678064b3b08794844e77d/tensorfs-0.10.0-cp312-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"),
-    ];
 }

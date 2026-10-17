@@ -13,10 +13,10 @@ use cozy_proto::{machine as v1, machine_json as json};
 use prost::Message as _;
 use serde_json::Value;
 
-const KEPT: &str = "# /// script\n# requires-python = \">=3.12\"\n# dependencies = [\"cozy-runtime>=0.25.1\"]\n\
+const KEPT: &str = "# /// script\n# requires-python = \">=3.12\"\n# dependencies = [\"cozy-runtime\"]\n\
 # [tool.cozy]\n# accelerator = false\n# ///\ndef main() -> str:\n    return \"kept\"\n";
 
-const FAILS: &str = "# /// script\n# requires-python = \">=3.12\"\n# dependencies = [\"cozy-runtime>=0.25.1\"]\n\
+const FAILS: &str = "# /// script\n# requires-python = \">=3.12\"\n# dependencies = [\"cozy-runtime\"]\n\
 # [tool.cozy]\n# accelerator = false\n# ///\ndef main() -> str:\n    raise RuntimeError(\"kept failing\")\n";
 
 /// A followed `--json` run's last event: its type and its run.

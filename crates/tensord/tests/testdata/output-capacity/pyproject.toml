@@ -2,7 +2,7 @@
 name = "native-output-capacity-proof"
 version = "0.0.1"
 requires-python = ">=3.12,<3.13"
-dependencies = ["cozy-runtime>=0.26"]
+dependencies = ["cozy-runtime"]
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

@@ -124,7 +124,7 @@ wheels = [
 
 [[package]]
 name = "cozy-runtime"
-version = "0.26.4"
+version = "0.27.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "cryptography" },
@@ -134,10 +134,10 @@ dependencies = [
     { name = "pillow" },
     { name = "tensorfs" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/6b/b3/c7a839798cb6a7cf978bdc8606fe9b7421ec2a340f1a9009cd37b83220af/cozy_runtime-0.26.4.tar.gz", hash = "sha256:ad3bf5afe33fa8778a79430c0b4284fced19f5f834578e4f92dee1d2dc67b3a4", size = 1935001, upload-time = "2026-10-17T02:30:35.85Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/ef/fa/c95612ff8b2ad2f6d676d645c8675fb071e5e2b9fd993b15df0ebe43db06/cozy_runtime-0.27.4.tar.gz", hash = "sha256:eb5291ae4841ac301e65e7b41fcfe65af9b8ff7515a50f20c315494a13dc2445", size = 1996469, upload-time = "2026-10-17T21:31:21.478Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/24/0c/5a451d1dd376fe4df3de99e60cb3a765f9e17bb7a0c5330a39667354a76e/cozy_runtime-0.26.4-cp312-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:ae21bcd33acf33237f53bc6bc5a2b6c65c22982771c285b79389e69e787366aa", size = 26153917, upload-time = "2026-10-17T02:30:31.625Z" },
-    { url = "https://files.pythonhosted.org/packages/c4/19/22528594cdf3b54db137d8001723a5aa28456a6517c005678092a0b22af3/cozy_runtime-0.26.4-py3-none-any.whl", hash = "sha256:7eb328f52dc6cfab18ba62bd3d84c1f9b8ea4e7f069498c6e95c02c851c7d9c7", size = 1022453, upload-time = "2026-10-17T02:30:34.385Z" },
+    { url = "https://files.pythonhosted.org/packages/ef/64/19055384aa109be1d4da4ef247aa35fe5e8b9401e23e8b54b8b706412082/cozy_runtime-0.27.4-cp312-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:410a06d800bd4a7c105e079e91bf7003266cf170464df7668c02ff8589d1d7bd", size = 26176926, upload-time = "2026-10-17T21:31:17.418Z" },
+    { url = "https://files.pythonhosted.org/packages/dd/0f/556fa152eb3c2a1b06751d74f2c101fa438b89f039e9be5ed447481318f0/cozy_runtime-0.27.4-py3-none-any.whl", hash = "sha256:beb9861ebe2ce89758e5f16775a220e269d5315f88a995d6d422079b73346fa1", size = 1045458, upload-time = "2026-10-17T21:31:19.888Z" },
 ]
 
 [[package]]
@@ -842,7 +842,7 @@ test = [
 
 [package.metadata]
 requires-dist = [
-    { name = "cozy-runtime", marker = "python_full_version >= '3.12' and extra == 'test'", specifier = ">=0.26,<0.27" },
+    { name = "cozy-runtime", marker = "python_full_version >= '3.12' and extra == 'test'" },
     { name = "msgspec", specifier = ">=0.18,<1" },
     { name = "numpy", marker = "extra == 'test'", specifier = ">=2,<3" },
     { name = "packaging", marker = "extra == 'installer'", specifier = ">=24,<27" },

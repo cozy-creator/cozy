@@ -2,7 +2,7 @@
 name = "tiny-quantizer"
 version = "0.1.0"
 requires-python = ">=3.12"
-dependencies = ["cozy-runtime>=0.25.1"]
+dependencies = ["cozy-runtime"]
 
 [project.entry-points."cozy.application"]
 default = "tiny_quantizer:app"
