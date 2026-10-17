@@ -294,7 +294,26 @@ pub fn transient(error: &io::Error) -> bool {
 #[cfg(windows)]
 pub(crate) use sys::command_line;
 #[cfg(unix)]
-pub use unix::{cloexec_from, inherit_nothing};
+pub use unix::cloexec_from;
+
+/// A child inherits no descriptor its spawner does not hand on explicitly. Unix closes every
+/// one past stdio at exec (run it before any other `pre_exec`, which then clear close-on-exec on
+/// what they hand on); a Windows child inherits only handles marked inheritable, which std never
+/// marks, so there is nothing to do.
+pub fn inherit_nothing(command: &mut Command) {
+    #[cfg(unix)]
+    unix::inherit_nothing(command);
+    #[cfg(windows)]
+    let _ = command;
+}
+
+/// `command` leads its own process group (Unix), so the group ends together. A Windows tree is
+/// a Job Object, which only [`spawn`] gives it: nothing to do here.
+pub fn own_group(command: &mut Command) -> &mut Command {
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(command, 0);
+    command
+}
 
 /// Whether a process handle kept as a file (a pidfd, a kqueue on its exit) shows its exit now.
 #[cfg(unix)]

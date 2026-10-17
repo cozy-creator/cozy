@@ -44,9 +44,8 @@ pub fn cloexec_from(first: u32) {
     }
 }
 
-/// A child inherits no descriptor its spawner does not hand on explicitly: run before every other
-/// `pre_exec` of `command`, which then clear close-on-exec on what they hand on.
-pub fn inherit_nothing(command: &mut Command) {
+/// [`super::inherit_nothing`] on Unix.
+pub(super) fn inherit_nothing(command: &mut Command) {
     // SAFETY: cloexec_from is async-signal-safe.
     unsafe {
         command.pre_exec(|| {
