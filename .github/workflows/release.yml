@@ -46,6 +46,12 @@ on:
         required: true
         default: dry-run
         type: string
+      # HAND-EDITED (dist-workspace.toml allow-dirty): this input and the plan job's first step.
+      must_contain:
+        description: Comma-separated commits the release must contain
+        required: false
+        default: ''
+        type: string
 
 jobs:
   # Run 'dist plan' (or host) to determine what tasks we need to do
@@ -59,6 +65,20 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
+      # HAND-EDITED (dist-workspace.toml allow-dirty): a release, dry or not, refuses unless every
+      # must_contain commit is in the commit it releases.
+      - name: The release contains every must_contain commit
+        if: ${{ inputs.must_contain != '' }}
+        env:
+          MUST: ${{ inputs.must_contain }}
+        run: |
+          for sha in ${MUST//,/ }; do
+            status=$(gh api "repos/$GITHUB_REPOSITORY/compare/$sha...$GITHUB_SHA" -q .status)
+            case $status in
+              ahead | identical) echo "$sha is in $GITHUB_SHA" ;;
+              *) echo "::error::$sha is not in $GITHUB_SHA ($status)"; exit 1 ;;
+            esac
+          done
       - uses: actions/checkout@v6
         with:
           persist-credentials: false

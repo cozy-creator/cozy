@@ -3,8 +3,8 @@ name: release-gate
 # commit that covered every release runner. When the binary links TensorFS (cargo tree, a fact of the
 # build), the newest tensorfs wheel on PyPI must also speak its store format and claim protocol
 # (design §2, crates/tensorfs/scripts/format_contract.py). A dry run reports the verdicts without refusing.
-# The release carries gates.json: its commit, that platforms run, the tensorfs wheel it matches (or why
-# none was checked), and this release run (its smoke).
+# The release carries gates.json: its commit, the must_contain commits release.yml's plan job verified,
+# that platforms run, the tensorfs wheel it matches (or why none was checked), and this release run.
 on:
   workflow_call:
     inputs:
@@ -23,6 +23,7 @@ jobs:
           SHA: ${{ github.sha }}
           REF: ${{ github.ref_name }}
           TAG: ${{ github.event.inputs.tag }}
+          MUST: ${{ github.event.inputs.must_contain }}
           RUNNERS: ubuntu-24.04 ubuntu-24.04-arm macos-15 windows-2025 windows-11-arm
         run: |
           runs=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs
@@ -42,8 +43,10 @@ jobs:
             notes+=("tensorfs: not checked, the cozy binary does not link tensorfs-core")
           fi
           mkdir gates
-          jq -n --arg commit "$SHA" --arg platforms "$platforms" --arg tensorfs "$tensorfs" --arg release "$runs/$GITHUB_RUN_ID" \
-            '{commit: $commit, platforms: (($platforms | select(. != "")) // null), tensorfs: (($tensorfs | select(. != "")) // null),
+          jq -n --arg commit "$SHA" --arg must "$MUST" --arg platforms "$platforms" --arg tensorfs "$tensorfs" \
+            --arg release "$runs/$GITHUB_RUN_ID" \
+            '{commit: $commit, must_contain: ($must | split(",") | map(select(. != ""))),
+              platforms: (($platforms | select(. != "")) // null), tensorfs: (($tensorfs | select(. != "")) // null),
               notes: $ARGS.positional, release: $release}' --args "${notes[@]}" "${refusals[@]}" \
             | tee gates/gates.json
           [ ${#refusals[@]} -gt 0 ] || exit 0
