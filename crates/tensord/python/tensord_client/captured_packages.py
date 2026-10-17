@@ -72,10 +72,13 @@ def inventory(interpreter: Path) -> list[Dependency]:
     return msgspec.json.decode(subprocess.check_output(["uv", "pip", "list", "--python", str(interpreter), "--format", "json"]), type=list[Dependency])
 
 
-def incompatibilities(interpreter: Path, step: subprocess.CompletedProcess | None = None) -> set[str]:
-    """`uv pip check`'s findings, one line each."""
+def conflicts(interpreter: Path, step: subprocess.CompletedProcess | None = None) -> set[str]:
+    """`uv pip check`'s findings that refuse an environment, one line each: every requirement an
+    installed version misses. A wheel tagged for another platform still runs and stands (NVIDIA's
+    aarch64 cusparseLt wheel says sbsa, not aarch64)."""
     step = step or subprocess.run(["uv", "pip", "check", "--python", str(interpreter)], capture_output=True, text=True)
-    return {line.strip() for line in (step.stdout + step.stderr).splitlines() if line.strip().startswith("The package")}
+    lines = map(str.strip, (step.stdout + step.stderr).splitlines())
+    return {line for line in lines if line.startswith("The package") and not line.endswith("was built for a different platform")}
 
 
 def machine_sdk(interpreter: Path, sdk: list[Path], capture) -> str:
@@ -84,9 +87,8 @@ def machine_sdk(interpreter: Path, sdk: list[Path], capture) -> str:
     capture's own pair (a vendored dev Runtime, say) is restored: a package's bounds are never
     overridden. Returns "" for the machine's pair, else why and what runs instead; never silent."""
     pair = {canonicalize_name(wheel.name.split("-")[0]) for wheel in sdk}
-    # What the capture already reports (NVIDIA's aarch64 cusparseLt wheel says sbsa, not aarch64)
-    # is not the pair's doing: the pair is refused only for an incompatibility it adds.
-    before = incompatibilities(interpreter)
+    # A conflict the capture already has is not the pair's doing: the pair is refused only for one it adds.
+    before = conflicts(interpreter)
     kept = interpreter.parents[2] / "sdk-constraints.txt"
     kept.write_text("".join(f"{row.name}=={row.version}\n" for row in inventory(interpreter)
                             if canonicalize_name(row.name) not in pair))
@@ -95,7 +97,7 @@ def machine_sdk(interpreter: Path, sdk: list[Path], capture) -> str:
     sys.stderr.write(step.stderr)
     if step.returncode == 0:
         step = subprocess.run(["uv", "pip", "check", "--python", str(interpreter)], capture_output=True, text=True)
-        if step.returncode == 0 or incompatibilities(interpreter, step) <= before:
+        if step.returncode == 0 or conflicts(interpreter, step) <= before:
             return ""
     reason = [line.strip() for line in ((step.stdout or "") + step.stderr).splitlines()
               if line.strip() and not line.startswith(("Using Python", "Checked "))][-12:]
@@ -121,15 +123,14 @@ def interpreter_for(python: str, python_requires: str, python_version: str) -> s
 def add_client(interpreter: Path, constraints: Path, client_wheel: Path) -> None:
     """The machine client beside a selected closure: it may add its own dependencies only
     without changing one already selected package or SDK version (uv reports any conflict)."""
-    locked, before = inventory(interpreter), incompatibilities(interpreter)
+    locked = inventory(interpreter)
     constraints.write_text("".join(f"{row.name}=={row.version}\n" for row in locked))
     subprocess.run(["uv", "pip", "install", *COPY, "--python", str(interpreter), "-c", str(constraints), str(client_wheel)], check=True)
     after = {canonicalize_name(row.name): row.version for row in inventory(interpreter)}
     if any(after.get(canonicalize_name(row.name)) != row.version for row in locked):
         raise PackageError("package_lock_changed", "client installation changed the captured dependency closure")
-    # Only what the client adds refuses; the selected closure's own findings stand as captured.
-    if added := sorted(incompatibilities(interpreter) - before):
-        raise PackageError("package_dependency_conflict", "; ".join(added)[:2000])
+    if found := sorted(conflicts(interpreter)):
+        raise PackageError("package_dependency_conflict", "; ".join(found)[:2000])
 
 
 def live_paths(environment: Path) -> None:

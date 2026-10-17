@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 import tomllib
 
-from tensord_client.captured_packages import install_captured, installed_description
+from tensord_client.captured_packages import conflicts, install_captured, installed_description
 from tensord_client.packages import GenerationHold, PackageError
 from tensord_client.package_records import GENERATION_DECODER
 from test_package_bridge import FIXTURE, ROOT
@@ -161,3 +161,21 @@ def test_a_dependency_conflict_fails_the_installation_naming_it(capture):
             requirements=requirements, distribution="tensord-cpu-classifier", release="0.1.0", python_requires=">=3.12",
             python_version="3.12", generations=root / "conflicted-generations", client_wheel=client, python="3.12")
     assert raised.value.code == "package_dependency_conflict"
+
+
+def test_a_wheel_tagged_for_another_platform_stands_and_a_missed_requirement_refuses(tmp_path):
+    """uv's real check of an environment holding both (NVIDIA's aarch64 cusparseLt wheel says sbsa)."""
+    subprocess.run(["uv", "venv", "--python", "3.12", str(tmp_path / "env")], check=True)
+    site = next((tmp_path / "env").glob("lib/python*/site-packages"))
+    for name, version, tag, requires in [("numpy", "2.0.0", "cp312-cp312-manylinux_2_17_x86_64", ""),
+                                         ("conflicted_app", "0.1.0", "py3-none-any", "Requires-Dist: numpy==1.0.0\n"),
+                                         ("nvidia_cusparselt_cu12", "0.6.3", "py3-none-manylinux2014_sbsa", "")]:
+        info = site / f"{name}-{version}.dist-info"
+        info.mkdir()
+        (info / "METADATA").write_text(f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n{requires}")
+        (info / "WHEEL").write_text(f"Wheel-Version: 1.0\nRoot-Is-Purelib: false\nTag: {tag}\n")
+        (info / "RECORD").write_text(f"{info.name}/METADATA,,\n")
+    python = tmp_path / "env/bin/python"
+    check = subprocess.run(["uv", "pip", "check", "--python", str(python)], capture_output=True, text=True)
+    assert "The package `nvidia-cusparselt-cu12` was built for a different platform" in check.stdout + check.stderr
+    assert conflicts(python) == {"The package `conflicted-app` requires `numpy==1.0.0`, but `2.0.0` is installed"}
