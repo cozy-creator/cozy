@@ -22,7 +22,6 @@ use cozy_proto::{
     machine as v1,
 };
 use ed25519_dalek::pkcs8::EncodePrivateKey as _;
-use prost::Message as _;
 
 /// A Hub no test signs in to: what a rental's Hub would be had a Hub answered for it.
 const NO_HUB: &str = "http://127.0.0.1:9";
@@ -54,7 +53,7 @@ fn rental(name: &str, id: &str, machine: Option<&Tensord>, key: &Path) -> Machin
     }
 }
 
-fn submit(on: &str, spec: Vec<u8>) -> SubmitRun {
+fn submit(on: &str, spec: v1::RunSpec) -> SubmitRun {
     SubmitRun {
         on: on.to_owned().into(),
         hub: "https://tensorhub.com".into(),
@@ -67,10 +66,8 @@ fn submit(on: &str, spec: Vec<u8>) -> SubmitRun {
     }
 }
 
-fn gpus(spec: Vec<u8>, gpus: u32) -> Vec<u8> {
-    let mut spec = v1::RunSpec::decode(spec.as_slice()).unwrap();
-    spec.gpus = gpus;
-    spec.encode_to_vec()
+fn gpus(spec: v1::RunSpec, gpus: u32) -> v1::RunSpec {
+    v1::RunSpec { gpus, ..spec }
 }
 
 fn run_of(event: &Event) -> Option<&cozy_proto::calcifer::Run> {
@@ -592,9 +589,9 @@ async fn a_publishing_run_without_its_hub_sign_in_fails_unsent() {
     calcifer.put_machine(&machine.row("m", &key)).unwrap();
     let mut events = calcifer.subscribe();
     let machines = machines(&calcifer, home.path());
-    let mut spec = v1::RunSpec::decode(common::warm_spec(NO_HUB, vec![]).as_slice()).unwrap();
+    let mut spec = common::warm_spec(NO_HUB, vec![]);
     spec.weights_destination = "fidika/uploaded".into();
-    let mut publish = submit("m", spec.encode_to_vec());
+    let mut publish = submit("m", spec);
     publish.hub = NO_HUB.into();
     let id = calcifer.submit("k", publish).await.unwrap().run.id;
     let end = until(&mut events, &id, Event::is_terminal).await;
@@ -602,7 +599,7 @@ async fn a_publishing_run_without_its_hub_sign_in_fails_unsent() {
     let link = calcifer::Link::new(&machine.endpoint, common::key()).unwrap();
     assert!(
         matches!(
-            link.run(id.as_str(), 0, None).await,
+            link.attach(id.as_str(), 0).await,
             Err(calcifer::LinkError::NotFound)
         ),
         "never sent"
@@ -622,7 +619,7 @@ async fn a_signed_out_local_run_reaches_its_machine_with_no_owner() {
     calcifer.put_machine(&machine.row("m", &key)).unwrap();
     let machines = machines(&calcifer, home.path());
     let (staged, spec) = common::local_spec(home.path());
-    let mut run = submit("m", spec.encode_to_vec());
+    let mut run = submit("m", spec.clone());
     run.inputs = vec![staged];
     let id = calcifer.submit("k", run).await.unwrap().run.id;
     eventually("the run accepted", async || {

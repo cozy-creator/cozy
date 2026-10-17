@@ -27,13 +27,11 @@ tokio.workspace = true
 tokio-stream = { workspace = true, features = ["net"] }
 tokio-rustls.workspace = true
 hyper = { workspace = true, features = ["client", "http1"] }
-hyper-util.workspace = true
+hyper-util = { workspace = true, features = ["server-auto", "service"] }
 http-body-util.workspace = true
 bytes.workspace = true
 webpki-roots.workspace = true
 zip = { version = "7", default-features = false, features = ["deflate-flate2"] }
-tonic = { workspace = true, features = ["router", "transport", "tls-aws-lc"] }
-tonic-prost.workspace = true
 prost.workspace = true
 axum.workspace = true
 ed25519-dalek = { workspace = true, features = ["pem", "pkcs8"] }
@@ -54,6 +52,7 @@ tracing-appender.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+tower.workspace = true
 tempfile.workspace = true
 x509-parser = "0.18"
 

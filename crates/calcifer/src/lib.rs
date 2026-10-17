@@ -9,6 +9,7 @@
 //! cursor.
 mod access;
 pub mod api;
+mod lanes;
 pub mod link;
 pub mod machines;
 pub mod outputs;
@@ -33,13 +34,12 @@ use cozy_proto::{
     machine as v1,
 };
 use ed25519_dalek::{SigningKey, pkcs8::DecodePrivateKey as _};
-use prost::Message as _;
 use sha2::{Digest as _, Sha256};
 use tokio::{
     sync::{Notify, broadcast, watch},
     task::JoinSet,
 };
-use tokio_stream::{Stream, StreamExt as _};
+use futures_util::{Stream, StreamExt as _};
 use tracing::warn;
 
 pub use link::{Link, LinkError};
@@ -212,8 +212,6 @@ impl Calcifer {
         key: &str,
         submit: SubmitRun,
     ) -> Result<Submitted, Error> {
-        let spec = v1::RunSpec::decode(submit.spec.as_slice())
-            .map_err(|e| Error::Invalid(format!("the run's spec is not a RunSpec: {e}")))?;
         let digest = format!(
             "sha256:{}",
             hex::encode(Sha256::digest(
@@ -245,9 +243,9 @@ impl Calcifer {
         let (row, fresh) = tokio::task::spawn_blocking(move || {
             // Copied first; then, against a settled run's deletion of the same objects, checked
             // again and recorded under one guard.
-            stage(&me.inputs, &spec, &given)?;
+            stage(&me.inputs, &new.spec, &given)?;
             let _staging = lock(&me.staging);
-            let inputs = stage(&me.inputs, &spec, &given)?;
+            let inputs = stage(&me.inputs, &new.spec, &given)?;
             Ok::<_, Error>(me.store.submit(&key, &digest, NewRun { inputs, ..new })?)
         })
         .await
@@ -587,12 +585,7 @@ impl Calcifer {
         // The spec as sent: finished under the machine's send lock, so a warm set merges into what
         // the machine reported after the runs sent before it.
         let spec = |access| {
-            let mut spec = v1::RunSpec::decode(run.spec.as_slice()).map_err(|e| {
-                Stop::Refused(Reason {
-                    code: "spec_unreadable".into(),
-                    message: format!("the stored spec: {e}"),
-                })
-            })?;
+            let mut spec = run.spec.clone().ok_or_else(not_kept)?;
             self.finish_spec(run, &mut spec, access);
             Ok::<_, Stop>(spec)
         };
@@ -600,6 +593,7 @@ impl Calcifer {
         let (state, stream) = match run.state {
             State::Settled => return Ok(()),
             State::Queued => {
+                run.spec.as_ref().ok_or_else(not_kept)?;
                 self.write_inputs(link, run, machine).await?;
                 let _turn = sending.lock().await;
                 self.known_warm(run, machine, link).await?;
@@ -607,7 +601,7 @@ impl Calcifer {
                 if !self.store.mark_sent(id, machine)? {
                     return Ok(());
                 }
-                link.run(id, 0, Some(spec)).await?
+                (link.submit(id, spec).await?, None)
             }
             State::Sent | State::Accepted => {
                 if run.cancel_requested {
@@ -615,24 +609,19 @@ impl Calcifer {
                     canceled = true;
                 }
                 // It may be there: attach first, and send again only to a machine that never got it.
-                match link.run(id, run.cursor, None).await {
-                    // Imported from the Go CLI, which did not keep what it sent.
-                    Err(LinkError::NotFound) if run.state == State::Sent && run.spec.is_empty() => {
-                        return Err(Stop::Refused(Reason {
-                            code: "spec_not_kept".into(),
-                            message: "its machine never confirmed the run, and its spec was not kept across \
-                                      the move from the Go CLI; run it again"
-                                .into(),
-                        }));
-                    }
+                match link.attach(id, run.cursor).await {
                     Err(LinkError::NotFound) if run.state == State::Sent => {
+                        run.spec.as_ref().ok_or_else(not_kept)?;
                         self.write_inputs(link, run, machine).await?;
                         let _turn = sending.lock().await;
                         self.known_warm(run, machine, link).await?;
                         let spec = spec(self.access(run, machine).await?)?;
-                        link.run(id, 0, Some(spec)).await?
+                        (link.submit(id, spec).await?, None)
                     }
-                    attached => attached?,
+                    attached => {
+                        let (state, events) = attached?;
+                        (state, Some(events))
+                    }
                 }
             }
         };
@@ -648,6 +637,11 @@ impl Calcifer {
                 return Ok(());
             }
         }
+        // A run just sent is accepted by the machine's answer; its events follow from the start.
+        let stream = match stream {
+            Some(stream) => stream,
+            None => link.events(id, 0).await?,
+        };
         self.follow(&run.id, stream, link, wake, canceled).await
     }
 
@@ -657,12 +651,12 @@ impl Calcifer {
     async fn follow(
         &self,
         id: &RunId,
-        mut stream: impl Stream<Item = Result<v1::RunEvent, tonic::Status>> + Unpin,
+        mut stream: impl Stream<Item = Result<v1::RunEvent, LinkError>> + Unpin,
         link: &Link,
         wake: &Notify,
         mut canceled: bool,
     ) -> Result<(), Stop> {
-        use v1::run_event::Event as Frame;
+        use v1::Event as Frame;
         let (mut batch, mut frames) = (Batch::default(), 0u64);
         loop {
             let next = if batch.is_empty() {
@@ -691,9 +685,9 @@ impl Calcifer {
             };
             let frame = match next {
                 Some(Ok(frame)) => frame,
-                Some(Err(status)) => {
+                Some(Err(e)) => {
                     self.record_batch(id, &mut batch)?;
-                    return Err(link::classify(status).into());
+                    return Err(e.into());
                 }
                 // The machine ends a stream it holds open only to start another: attach again.
                 None if frames > 0 => return self.record_batch(id, &mut batch),
@@ -706,8 +700,8 @@ impl Calcifer {
             frames += 1;
             let durable = frame.sequence;
             match frame.event {
-                Some(Frame::Log(line)) => batch.logs.push((frame.at_ms, line.level, line.text)),
-                Some(Frame::Call(call)) => {
+                Frame::Log(line) => batch.logs.push((frame.at_ms, line.level, line.text)),
+                Frame::Call(call) => {
                     let call = cozy_proto::calcifer::Call {
                         run: call.run,
                         index: call.index,
@@ -716,7 +710,8 @@ impl Calcifer {
                         status: call.status,
                         called_at_ms: call.called_at_ms,
                         finished_at_ms: call.finished_at_ms,
-                        measurements: serde_json::from_slice(&call.measurements).ok(),
+                        measurements: (call.measurements.as_ref())
+                            .and_then(|m| serde_json::from_str(m.get()).ok()),
                         reason: call.reason.map(|r| Reason {
                             code: r.code,
                             message: r.message,
@@ -726,8 +721,8 @@ impl Calcifer {
                     let text = serde_json::to_string(&call).expect("serializes");
                     batch.logs.push((frame.at_ms, "call".into(), text));
                 }
-                Some(Frame::Product(product)) => batch.products.push(product),
-                Some(Frame::Gpu(gpu)) => {
+                Frame::Product(product) => batch.products.push(product),
+                Frame::Gpu(gpu) => {
                     if gpu.state == "wait" {
                         self.waiting(
                             id,
@@ -735,7 +730,7 @@ impl Calcifer {
                         );
                     }
                 }
-                Some(Frame::Progress(p)) => {
+                Frame::Progress(p) => {
                     self.progress(
                         id,
                         Progress {
@@ -750,7 +745,7 @@ impl Calcifer {
                     );
                     continue;
                 }
-                Some(Frame::State(state)) => {
+                Frame::State(state) => {
                     match state.waiting.as_str() {
                         "" => self.not_waiting(id),
                         waiting => self.waiting(id, format!("{}: {waiting}", state.state)),
@@ -758,13 +753,12 @@ impl Calcifer {
                     batch.machine_state = Some(state.state);
                     continue;
                 }
-                Some(Frame::Outcome(outcome)) => {
+                Frame::Outcome(outcome) => {
                     self.record_batch(id, &mut batch)?;
                     let events = self.store.settle(id.as_str(), &outcome, durable)?;
                     self.publish(id, events);
                     return Ok(());
                 }
-                None => continue,
             }
             batch.cursor = batch.cursor.max(durable);
         }
@@ -779,52 +773,41 @@ impl Calcifer {
     }
 
     /// Writes the run's staged objects to its machine, each shown as the run's `writing` stage.
-    /// What the machine holds is asked of `PROBES` objects at once, so a long round trip costs
-    /// one turn for a resubmitted tree, not one per file (37 files over 270 ms: 10 s per run).
-    /// One object is written to one machine once at a time: a run naming an object another run
-    /// is writing there waits its turn, then finds it held.
+    /// What the machine already holds is asked once for all of them. One object is written to one
+    /// machine once at a time: a run naming an object another run is writing there waits its
+    /// turn, then asks again what is held.
     async fn write_inputs(&self, link: &Link, run: &RunRow, machine: &str) -> Result<(), Stop> {
-        const PROBES: usize = 64;
-        let mut held = Vec::with_capacity(run.inputs.len());
-        for some in run.inputs.chunks(PROBES) {
-            let asked = some
-                .iter()
-                .map(|(digest, length)| link.held(digest, *length));
-            let answers = futures_util::future::join_all(asked).await;
-            let whole = answers.into_iter().zip(some);
-            held.extend(
-                whole.map(|(answer, (_, length))| answer.is_ok_and(|held| held >= *length)),
-            );
+        if run.inputs.is_empty() {
+            return Ok(());
         }
-        let names: HashMap<String, String> = v1::RunSpec::decode(run.spec.as_slice())
-            .map(|spec| {
-                spec.inputs
-                    .into_iter()
-                    .map(|i| (i.digest, i.field))
-                    .collect()
-            })
-            .unwrap_or_default();
-        // An object asked of in error is asked again, and its error told, as it is written.
-        for ((digest, length), _) in run.inputs.iter().zip(held).filter(|(_, held)| !held) {
+        let names: HashMap<&str, &str> = (run.spec.iter())
+            .flat_map(|spec| &spec.inputs)
+            .map(|i| (i.digest.as_str(), i.field.as_str()))
+            .collect();
+        let digests: Vec<Digest> = run.inputs.iter().map(|(digest, _)| *digest).collect();
+        let held = link.held_many(&digests).await?;
+        for ((digest, length), held) in run.inputs.iter().zip(held) {
+            if v1::held_bytes(&held) >= *length {
+                continue;
+            }
             let key = (machine.to_owned(), *digest);
             let turn = lock(&self.writing).entry(key.clone()).or_default().clone();
-            let held = turn.lock().await;
-            let path = self.inputs.join(hex::encode(digest.bytes()));
-            let file = tokio::fs::File::open(&path).await.map_err(|e| {
-                Stop::Refused(Reason {
-                    code: "input_missing".into(),
-                    message: format!(
-                        "input {digest} is no longer staged at {}: {e}",
-                        path.display()
-                    ),
-                })
-            })?;
-            let name = names.get(&digest.to_string()).cloned().unwrap_or_else(|| {
-                let hex = hex::encode(digest.bytes());
-                format!("sha256:{}", &hex[..12])
-            });
+            let (mine, held) = match turn.try_lock() {
+                Ok(mine) => (mine, held),
+                Err(_) => {
+                    let mine = turn.lock().await;
+                    let now = link.held_many(std::slice::from_ref(digest)).await?;
+                    (mine, now.into_iter().next().unwrap_or_default())
+                }
+            };
+            let hex = hex::encode(digest.bytes());
+            let path = self.inputs.join(&hex);
+            let name = match names.get(digest.to_string().as_str()) {
+                Some(field) => field.to_string(),
+                None => format!("sha256:{}", &hex[..12]),
+            };
             let written = link
-                .write(digest, *length, file, |done, rate| {
+                .write(digest, *length, &path, held, |done, rate| {
                     let mut reason = format!(
                         "writing {name}: {}/{}",
                         bytes(done as f64),
@@ -836,7 +819,7 @@ impl Calcifer {
                     self.waiting(&run.id, reason);
                 })
                 .await;
-            drop(held);
+            drop(mine);
             let mut writing = lock(&self.writing);
             if Arc::strong_count(&turn) <= 2 {
                 writing.remove(&key);
@@ -849,18 +832,12 @@ impl Calcifer {
     /// Reads the machine's warm set before a warm run's set is merged into it, if none was seen
     /// yet.
     async fn known_warm(&self, run: &RunRow, machine: &str, link: &Link) -> Result<(), Stop> {
-        let merges = v1::RunSpec::decode(run.spec.as_slice())
-            .is_ok_and(|spec| spec.kind == v1::RunKind::Warm as i32 && spec.set.is_some());
+        let merges = (run.spec.as_ref())
+            .is_some_and(|spec| spec.kind == v1::RunKind::Warm && spec.set.is_some());
         if !merges || lock(&self.warm).contains_key(machine) {
             return Ok(());
         }
-        let frame = link
-            .status(false)
-            .await?
-            .message()
-            .await
-            .map_err(link::classify)?;
-        self.observe_warm(machine, frame.map(|f| f.warm).unwrap_or_default());
+        self.observe_warm(machine, link.status().await?.warm);
         Ok(())
     }
 
@@ -872,7 +849,7 @@ impl Calcifer {
         }
         // Local code's org-relative references name this computer's account at the run's Hub,
         // unless the spec names one.
-        if let (Some(v1::run_spec::Source::Local(_)), Some(owner)) = (&spec.source, access.owner)
+        if let (Some(v1::Source::Local(_)), Some(owner)) = (&spec.source, access.owner)
             && spec.owner.is_empty()
         {
             spec.owner = owner;
@@ -981,6 +958,16 @@ fn copy_checked(inputs: &Path, source: &StagedInput, target: &Path) -> Result<()
         .map_err(|e| failed(e.to_string()))?;
     part.persist(target).map_err(|e| failed(e.to_string()))?;
     Ok(())
+}
+
+/// A run its machine never confirmed whose spec was not kept (sent before xs-044's JSON specs).
+fn not_kept() -> Stop {
+    Stop::Refused(Reason {
+        code: "spec_not_kept".into(),
+        message: "its machine never confirmed the run, and its spec was not kept across the move \
+                  to the HTTP machine API; run it again"
+            .into(),
+    })
 }
 
 /// The stream's next item if it has one now, without waiting.

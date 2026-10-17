@@ -2,8 +2,10 @@
 //! `cargo build -p tensord`) on a temp root that admits the test's key, and run specs it accepts with no Runtime.
 #![allow(dead_code)]
 use std::{
+    ffi::OsStr,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
+    sync::OnceLock,
     time::{Duration, Instant},
 };
 
@@ -11,12 +13,11 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use calcifer::store::{Endpoint, MachineRow};
 use cozy_platform::durable;
 use cozy_proto::{
-    calcifer::{Event, MachineKind, MachineState},
+    calcifer::{Event, Kind, MachineKind, MachineState, On, StagedInput, SubmitRun},
     ids::{Digest, RunId},
     machine as v1,
 };
 use ed25519_dalek::{SigningKey, pkcs8::EncodePrivateKey as _};
-use prost::Message as _;
 use sha2::{Digest as _, Sha256};
 use tokio::sync::broadcast;
 
@@ -190,10 +191,10 @@ impl SilentHub {
 }
 
 /// A warm run of a release from `hub`, with `inputs` written first.
-pub fn warm_spec(hub: &str, inputs: Vec<v1::InputFile>) -> Vec<u8> {
+pub fn warm_spec(hub: &str, inputs: Vec<v1::InputFile>) -> v1::RunSpec {
     v1::RunSpec {
-        kind: v1::RunKind::Warm as i32,
-        source: Some(v1::run_spec::Source::Release(v1::Release {
+        kind: v1::RunKind::Warm,
+        source: Some(v1::Source::Release(v1::Release {
             package: "cozy-test/held".into(),
             release: String::new(),
         })),
@@ -204,7 +205,6 @@ pub fn warm_spec(hub: &str, inputs: Vec<v1::InputFile>) -> Vec<u8> {
         inputs,
         ..Default::default()
     }
-    .encode_to_vec()
 }
 
 /// A file the run names as an input, and what the spec says of it.
@@ -260,8 +260,8 @@ pub fn local_spec(dir: &Path) -> (cozy_proto::calcifer::StagedInput, v1::RunSpec
         length: bytes.len() as u64,
     };
     let spec = v1::RunSpec {
-        kind: v1::RunKind::Warm as i32,
-        source: Some(v1::run_spec::Source::Local(v1::LocalSource {
+        kind: v1::RunKind::Warm,
+        source: Some(v1::Source::Local(v1::LocalSource {
             manifest: digest.to_string(),
         })),
         ..Default::default()
@@ -272,7 +272,7 @@ pub fn local_spec(dir: &Path) -> (cozy_proto::calcifer::StagedInput, v1::RunSpec
 /// Whether the machine holds run `id` under exactly `spec`: the same id and spec answer the
 /// run, another spec is `run_id_conflict` (the machine's digest of what it was sent).
 pub async fn holds_as(link: &calcifer::Link, id: &RunId, spec: v1::RunSpec) -> bool {
-    match link.run(id.as_str(), 0, Some(spec)).await {
+    match link.submit(id.as_str(), spec).await {
         Ok(_) => true,
         Err(calcifer::LinkError::Refused { code, .. }) if code == "run_id_conflict" => false,
         Err(e) => panic!("run {id}: {e}"),
@@ -373,4 +373,147 @@ fn pem_der(pem: &str) -> Vec<u8> {
     base64::engine::general_purpose::STANDARD
         .decode(body)
         .unwrap()
+}
+
+pub fn run_ok(command: &mut Command) {
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{command:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// A TensorD that installs local packages: its installer helper made as TensorD makes it on a
+/// pod (a uv environment over Python 3.12 holding the client wheel its binary embeds).
+pub fn installing_machine() -> Tensord {
+    installing_machine_at("127.0.0.1:0")
+}
+
+/// As `installing_machine`, listening on `listen`.
+pub fn installing_machine_at(listen: &str) -> Tensord {
+    static TOOLS: OnceLock<(PathBuf, PathBuf)> = OnceLock::new();
+    let (python, wheel) = TOOLS.get_or_init(|| {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let tensord = std::env::var_os("COZY_TEST_TENSORD").expect("COZY_TEST_TENSORD");
+        let wheel = client_wheel(Path::new(&tensord), &dir);
+        let helper = dir.join("helper");
+        run_ok(
+            Command::new("uv")
+                .args(["venv", "--no-project", "--no-config", "--python", "3.12"])
+                .arg(&helper),
+        );
+        let python = helper.join("bin/python");
+        run_ok(
+            Command::new("uv")
+                .args(["pip", "install", "--no-config", "--python"])
+                .arg(&python)
+                .arg(format!("{}[installer]", wheel.display())),
+        );
+        (python, wheel)
+    });
+    Tensord::start_at(
+        listen,
+        &[
+            OsStr::new("--installer-python"),
+            python.as_os_str(),
+            OsStr::new("--client-wheel"),
+            wheel.as_os_str(),
+        ],
+    )
+}
+
+/// The client wheel the TensorD binary embeds: the zip in it whose dist-info is
+/// `tensord_client`'s, named as its dist-info says.
+fn client_wheel(tensord: &Path, dir: &Path) -> PathBuf {
+    let binary = std::fs::read(tensord).unwrap();
+    let int = |at: usize, width: usize| {
+        let bytes = binary.get(at..at + width)?;
+        Some(bytes.iter().rev().fold(0usize, |n, b| n << 8 | *b as usize))
+    };
+    let zip_ends = binary
+        .windows(4)
+        .enumerate()
+        .filter(|(_, w)| w == b"PK\x05\x06");
+    for (end, _) in zip_ends {
+        let (Some(size), Some(offset), Some(comment)) =
+            (int(end + 12, 4), int(end + 16, 4), int(end + 20, 2))
+        else {
+            continue;
+        };
+        let Some(start) = end.checked_sub(size + offset) else {
+            continue;
+        };
+        let mut entry = start + offset;
+        let mut dist = None;
+        while binary.get(entry..entry + 4) == Some(b"PK\x01\x02") {
+            let (Some(name), Some(extra), Some(note)) =
+                (int(entry + 28, 2), int(entry + 30, 2), int(entry + 32, 2))
+            else {
+                break;
+            };
+            let file = binary
+                .get(entry + 46..entry + 46 + name)
+                .unwrap_or_default();
+            let file = std::str::from_utf8(file).unwrap_or_default();
+            dist = dist.or(file.strip_suffix(".dist-info/WHEEL").map(str::to_owned));
+            entry += 46 + name + extra + note;
+        }
+        if let Some(dist) = dist.filter(|d| d.starts_with("tensord_client-")) {
+            let wheel = dir.join(format!("{dist}-py3-none-any.whl"));
+            std::fs::write(&wheel, &binary[start..end + 22 + comment]).unwrap();
+            return wheel;
+        }
+    }
+    panic!("{} embeds no client wheel", tensord.display());
+}
+
+/// The `cpu_outputs` fixture package as `cozy run ./dir` sends it (its files in a tar and the
+/// manifest naming that, both staged with the run), calling its `make` with a `big` output of that
+/// many bytes.
+pub fn package_run(dir: &Path, gate: &Path, big: u64) -> SubmitRun {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cpu_outputs");
+    let source = dir.join("source.tar");
+    run_ok(
+        Command::new("tar")
+            .args(["--format=ustar", "-cf"])
+            .arg(&source)
+            .arg("-C")
+            .arg(&fixture)
+            .args(["pyproject.toml", "package.toml", "cpu_outputs/__init__.py"]),
+    );
+    let tar = std::fs::read(&source).unwrap();
+    let manifest = serde_json::json!({"package": "local/calcifer-cpu-outputs", "release": "0.1.0",
+        "python_version": "3.12", "source": {"digest": Digest::of(&tar), "length": tar.len()}});
+    let manifest = serde_json::to_vec(&manifest).unwrap();
+    std::fs::write(dir.join("manifest.json"), &manifest).unwrap();
+    let staged = |path: PathBuf, bytes: &[u8]| StagedInput {
+        path,
+        digest: Digest::of(bytes),
+        length: bytes.len() as u64,
+    };
+    let payload = serde_json::json!({"revisions": 3, "big": big, "gate": gate});
+    let spec = v1::RunSpec {
+        kind: v1::RunKind::Call,
+        source: Some(v1::Source::Local(v1::LocalSource {
+            manifest: Digest::of(&manifest).to_string(),
+        })),
+        entrypoint: "make".into(),
+        payload: Some(v1::Json::parse(payload.to_string()).unwrap()),
+        owner: "alice".into(),
+        ..Default::default()
+    };
+    SubmitRun {
+        on: On::Machine("m".into()),
+        hub: String::new(),
+        kind: Kind::Call,
+        target: "local/calcifer-cpu-outputs/make".into(),
+        spec,
+        inputs: vec![
+            staged(source, &tar),
+            staged(dir.join("manifest.json"), &manifest),
+        ],
+        out: None,
+        warnings: vec![],
+    }
 }
