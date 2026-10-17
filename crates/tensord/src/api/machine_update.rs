@@ -170,7 +170,7 @@ fn submit(
         Status::invalid_argument(format!("an update payload is a JSON object: {e}"))
     })?;
     for name in cohort.unknown.keys() {
-        eprintln!("tensord: update {id}: ignoring unknown payload field {name:?}");
+        tracing::warn!("update {id}: ignoring unknown payload field {name:?}");
     }
     let choose = |member: &str, value: Option<String>| -> Result<Option<Choice>, Status> {
         let Some(value) = value else {

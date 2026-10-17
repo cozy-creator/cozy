@@ -1235,14 +1235,14 @@ impl PyDerivedWriter {
         };
         for (_, lease) in guards.source_leases {
             if let Err(error) = lease.release(&self.meta) {
-                eprintln!(
+                tracing::warn!(
                     "DEGRADED derived-source-lease-release transaction={} — {error}",
                     self.transaction_id
                 );
             }
         }
         if let Err(error) = guards.writer_hold.release(&self.meta) {
-            eprintln!(
+            tracing::warn!(
                 "DEGRADED derived-writer-hold-release transaction={} — {error}",
                 self.transaction_id
             );

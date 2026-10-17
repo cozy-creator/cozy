@@ -3,7 +3,7 @@
 use super::*;
 use crate::transport::{api_get, form_post, AccessToken, Client, DpopCredential, DpopKey};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use ring::signature::{UnparsedPublicKey, ECDSA_P256_SHA256_FIXED};
+use aws_lc_rs::signature::{UnparsedPublicKey, ECDSA_P256_SHA256_FIXED};
 use serde_json::{Map, Value};
 use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};

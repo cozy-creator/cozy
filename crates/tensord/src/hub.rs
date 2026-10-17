@@ -5,8 +5,8 @@
 //! through AuthKit's JWT-bearer grant: an assertion its leaf signs carries the capability. The
 //! token lives in memory until the capability expires; there is no refresh and no second trade.
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use ring::rand::{SecureRandom, SystemRandom};
-use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
+use aws_lc_rs::rand::{SecureRandom, SystemRandom};
+use aws_lc_rs::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
@@ -148,12 +148,8 @@ impl Leaf {
             _ => return Err(unusable("not a PKCS#8 PRIVATE KEY")),
         };
         let rng = SystemRandom::new();
-        let pair = EcdsaKeyPair::from_pkcs8(
-            &ECDSA_P256_SHA256_FIXED_SIGNING,
-            der.secret_pkcs8_der(),
-            &rng,
-        )
-        .map_err(|_| unusable("not a P-256 key"))?;
+        let pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, der.secret_pkcs8_der())
+            .map_err(|_| unusable("not a P-256 key"))?;
         let point = pair.public_key().as_ref();
         let jwk = json!({"kty": "EC", "crv": "P-256",
             "x": URL_SAFE_NO_PAD.encode(&point[1..33]), "y": URL_SAFE_NO_PAD.encode(&point[33..])});
@@ -403,11 +399,11 @@ impl Capability {
             Err(TradeRefusal::Refused { expired, why }) => {
                 let code = if expired { reason::EXPIRED } else { reason::REFUSED };
                 let why = format!("{origin} refused the run's capability: {why}");
-                eprintln!("Hub capability: {why}");
+                tracing::warn!("Hub capability: {why}");
                 state.ended = Some((code, why));
             }
             Err(TradeRefusal::Unanswered(why)) => {
-                eprintln!("Hub capability at {origin}: {why}");
+                tracing::warn!("Hub capability at {origin}: {why}");
                 state.quiet_until = Some(Instant::now() + RETRY);
             }
         }
@@ -731,7 +727,7 @@ mod tests {
     /// exactly what AuthKit checks.
     #[test]
     fn the_leaf_signs_what_authkit_and_the_hub_verify() {
-        use ring::signature::{UnparsedPublicKey, ECDSA_P256_SHA256_FIXED};
+        use aws_lc_rs::signature::{UnparsedPublicKey, ECDSA_P256_SHA256_FIXED};
         let leaf = leaf();
         let public = UnparsedPublicKey::new(&ECDSA_P256_SHA256_FIXED, leaf.pair.public_key().as_ref().to_vec());
         let open = |jws: &str| {

@@ -451,7 +451,7 @@ enum ZygoteState {
 impl Zygote {
     fn set(&self, state: ZygoteState) {
         if let ZygoteState::Off(reason) | ZygoteState::Failed(reason) = &state {
-            eprintln!("executor prespawn off: {reason}");
+            tracing::info!("executor prespawn off: {reason}");
         }
         *self.state.lock().unwrap() = state;
         self.changed.notify_all();
@@ -756,7 +756,7 @@ impl Pool {
         let pressure = match crate::host_pressure::Pressure::arm(mode) {
             Ok(pressure) => pressure,
             Err(error) => {
-                eprintln!("host pressure: no PSI trigger ({error}); memory goes back only as calls plan");
+                tracing::warn!("host pressure: no PSI trigger ({error}); memory goes back only as calls plan");
                 return;
             }
         };
@@ -785,7 +785,7 @@ impl Pool {
                 }
             });
         if let Err(error) = started {
-            eprintln!("host pressure: {error}");
+            tracing::warn!("host pressure: {error}");
         }
     }
     /// Host bytes discretionary holdings may take now (a warm member, an import ahead): what
@@ -840,7 +840,7 @@ impl Pool {
         };
         let (plan, start) = (session.plan.clone(), session.start);
         if let Err(error) = session.executor.shutdown() {
-            eprintln!("ending idle deviceless executor of {plan}: {error}");
+            tracing::warn!("ending idle deviceless executor of {plan}: {error}");
         }
         self.ended(&plan, start, 0);
         true
@@ -1008,7 +1008,7 @@ impl Pool {
                 continue;
             };
             if let Err(error) = self.carry_out(start, &Step::End(plan)) {
-                eprintln!("ending a removed package's executor: {error}");
+                tracing::warn!("ending a removed package's executor: {error}");
             }
             drop(permit);
         }
@@ -1025,14 +1025,14 @@ impl Pool {
         for zygote in parents {
             if let ZygoteState::Ready(parent) = std::mem::take(&mut *zygote.state.lock().unwrap()) {
                 if let Err(error) = parent.shutdown() {
-                    eprintln!("ending a removed package's import-only executor: {error}");
+                    tracing::warn!("ending a removed package's import-only executor: {error}");
                 }
             }
         }
         let unread = self.custody.as_ref().map(|c| c.lock().unwrap().end_environment(identity));
         for (key, generation) in unread.unwrap_or_default() {
             if let Err(error) = self.revoke(&key, generation) {
-                eprintln!("revoking a removed package's GPU weights: {error}");
+                tracing::warn!("revoking a removed package's GPU weights: {error}");
             }
         }
     }
@@ -1046,7 +1046,7 @@ impl Pool {
             // From `downloaded` up, what its constructions read comes behind every call's.
             if let (Some(plan), Some(fetch), true) = (&member.plan, &member.fetch, member.level >= Level::Downloaded) {
                 if let Err(error) = fetch.keep(&plan.upfront()) {
-                    eprintln!("warm set: downloading {}: {error}", plan.construction);
+                    tracing::warn!("warm set: downloading {}: {error}", plan.construction);
                 }
             }
             let held_back = match (&member.plan, member.level) {
@@ -1075,7 +1075,7 @@ impl Pool {
             .name("warm-set".into())
             .spawn(move || actors.iter().for_each(|actor| pool.keep(&engine, actor)));
         if let Err(error) = started {
-            eprintln!("warm set: {error}");
+            tracing::warn!("warm set: {error}");
         }
     }
     /// A member's executor loaded when the call slot is free: empty once it is, else why not.
@@ -1102,7 +1102,7 @@ impl Pool {
             Ok("loaded" | "already loaded" | "mapped") => "",
             Ok(held_back) => held_back,
             Err(error) => {
-                eprintln!("warm set: loading {}: {error}", plan.construction);
+                tracing::warn!("warm set: loading {}: {error}", plan.construction);
                 "its load failed (the machine's log says why)"
             }
         }
@@ -1147,7 +1147,7 @@ impl Pool {
         self.keep_idle(session);
         let reply = reply?;
         if !reply.ok {
-            eprintln!("warm set: mapping {}: {} {}", plan.construction, reply.code, reply.detail);
+            tracing::warn!("warm set: mapping {}: {} {}", plan.construction, reply.code, reply.detail);
             return Ok("its weights could not be mapped (the machine's log says why)");
         }
         match complete {
@@ -1201,7 +1201,7 @@ impl Pool {
             }
             drop(idle);
             if let Err(error) = session.executor.shutdown() {
-                eprintln!("ending executor {key} after the pool stopped: {error}");
+                tracing::warn!("ending executor {key} after the pool stopped: {error}");
             }
             return;
         }
@@ -1210,7 +1210,7 @@ impl Pool {
             drop(sessions);
             let (plan, start, degree) = (session.plan.clone(), session.start, session.degree);
             if let Err(error) = session.executor.shutdown() {
-                eprintln!("ending executor {key} after the pool stopped: {error}");
+                tracing::warn!("ending executor {key} after the pool stopped: {error}");
             }
             return self.ended(&plan, start, degree);
         }
@@ -1326,7 +1326,7 @@ impl Pool {
         custody.lock().unwrap().begin_revoke(key, generation)?;
         for session in self.sessions.lock().unwrap().values_mut() {
             if let Err(error) = release_revoked(custody, &mut session.executor) {
-                eprintln!("resident revoke left a lease charged: {error}");
+                tracing::warn!("resident revoke left a lease charged: {error}");
             }
         }
         log_released(custody.lock().unwrap().collect());
@@ -1700,7 +1700,7 @@ impl Pool {
         let body = serde_json::json!({"gpu": {"state": state, "gpus": gpus.collect::<Vec<_>>(),
             "width": width, "behind": behind.map(request).unwrap_or_default()}});
         if let Err(error) = engine.append_gpu(&root.to_string(), &body) {
-            eprintln!("gpu allocation entry: {error}");
+            tracing::warn!("gpu allocation entry: {error}");
         }
     }
     /// The GPUs with an executor of `plan` now, by envelope index.
@@ -1889,7 +1889,7 @@ impl Pool {
             .open(self.root.join("invokes.jsonl"))
             .and_then(|mut file| file.write_all(format!("{line}\n").as_bytes()));
         if let Err(error) = written {
-            eprintln!("invokes.jsonl: {error}");
+            tracing::warn!("invokes.jsonl: {error}");
         }
     }
 
@@ -1941,7 +1941,7 @@ impl Pool {
                 pool.note_prewarm(&key, waited, asked.elapsed() - waited, &result);
             });
         if let Err(error) = started {
-            eprintln!("executor prefetch: {error}");
+            tracing::warn!("executor prefetch: {error}");
         }
     }
 
@@ -1965,7 +1965,7 @@ impl Pool {
             .open(self.root.join("prewarm.jsonl"))
             .and_then(|mut file| file.write_all(format!("{line}\n").as_bytes()));
         if let Err(error) = written {
-            eprintln!("prewarm.jsonl: {error}");
+            tracing::warn!("prewarm.jsonl: {error}");
         }
     }
 
@@ -2070,7 +2070,7 @@ impl Pool {
         };
         match unpack_runtime(&image.runtime_wheel, &self.root.join("kernel-runtime")) {
             Ok(runtime) => self.boot_kernels("image".into(), image.python, Some(runtime)),
-            Err(error) => eprintln!("kernel boot: image Runtime: {error}"),
+            Err(error) => tracing::warn!("kernel boot: image Runtime: {error}"),
         }
     }
 
@@ -2107,7 +2107,7 @@ impl Pool {
                 }
             });
         if let Err(error) = started {
-            eprintln!("kernel boot: {error}");
+            tracing::warn!("kernel boot: {error}");
         }
     }
 
@@ -2192,14 +2192,14 @@ impl Pool {
             }
             Err(error) => line["failed"] = error.to_string().into(),
         }
-        eprintln!("kernel boot: {line}");
+        tracing::info!("kernel boot: {line}");
         let written = fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(self.root.join("kernel-boot.jsonl"))
             .and_then(|mut file| file.write_all(format!("{line}\n").as_bytes()));
         if let Err(error) = written {
-            eprintln!("kernel-boot.jsonl: {error}");
+            tracing::warn!("kernel-boot.jsonl: {error}");
         }
     }
 
@@ -2210,7 +2210,7 @@ impl Pool {
             return;
         }
         if !self.parent_fits(&held) {
-            eprintln!(
+            tracing::info!(
                 "executor prespawn skipped for {}: no host room",
                 held.record.identity
             );
@@ -2231,7 +2231,7 @@ impl Pool {
                 zygote.set(state);
             });
         if let Err(error) = started {
-            eprintln!("executor prespawn: {error}");
+            tracing::warn!("executor prespawn: {error}");
         }
     }
 
@@ -2293,7 +2293,7 @@ impl Pool {
         let freed = zygote.private_bytes();
         if let ZygoteState::Ready(parent) = std::mem::take(&mut *zygote.state.lock().unwrap()) {
             if let Err(error) = parent.shutdown() {
-                eprintln!("ending an idle import-only executor: {error}");
+                tracing::warn!("ending an idle import-only executor: {error}");
             }
         }
         freed.max(1)
@@ -2538,7 +2538,7 @@ impl Pool {
                     )?;
                     if !reply.ok {
                         // Its mapping stays a reference: the regions stay charged, nothing freed.
-                        eprintln!("trim of {} refused: {} {}", id, reply.code, reply.detail);
+                        tracing::warn!("trim of {} refused: {} {}", id, reply.code, reply.detail);
                         return Ok(false);
                     }
                 }
@@ -2547,7 +2547,7 @@ impl Pool {
                         .lock()
                         .unwrap()
                         .trim(&holding.key, holding.generation, &regions);
-                eprintln!(
+                tracing::info!(
                     "resident GPU weights trimmed: {} on {}, {freed} bytes in {} regions",
                     holding.key.layout,
                     holding.key.device,
@@ -2588,7 +2588,7 @@ impl Pool {
         // holds this GPU's call slot, so nothing starts there meanwhile). Another tenant's
         // broken channel is its own failure, never this call's.
         if let Err(error) = session.executor.shutdown() {
-            eprintln!("memory: ending idle executor {key}: {error}");
+            tracing::warn!("memory: ending idle executor {key}: {error}");
         }
         self.ended(plan, start, degree);
         Ok(true)
@@ -2712,7 +2712,7 @@ impl Pool {
         if !undelivered(&error) {
             return Err(error);
         }
-        eprintln!("execution {id}: {error}; starting it on a fresh executor");
+        tracing::warn!("execution {id}: {error}; starting it on a fresh executor");
         for device in self.lane(start, fresh.degree)? {
             device.memory.finished(&fresh.construction);
         }
@@ -2757,7 +2757,7 @@ impl Pool {
                     break;
                 }
                 Forked::Refused(returned, reason) => {
-                    eprintln!("executor fork refused, spawning: {reason}");
+                    tracing::warn!("executor fork refused, spawning: {reason}");
                     config = Some(*returned);
                     if zygote.failed() {
                         self.forget_parent(held, &zygote);
@@ -2765,7 +2765,7 @@ impl Pool {
                     break;
                 }
                 Forked::Lost(returned, reason) => {
-                    eprintln!("import-only executor lost ({reason}); starting another");
+                    tracing::warn!("import-only executor lost ({reason}); starting another");
                     config = Some(*returned);
                     self.forget_parent(held, &zygote);
                 }
@@ -3279,7 +3279,7 @@ impl Pool {
         }
         if reply.attention_applied {
             if let Err(error) = engine.apply_attention(id) {
-                eprintln!("run {id}: applied attention pin not recorded: {error}");
+                tracing::warn!("run {id}: applied attention pin not recorded: {error}");
             }
         }
         let mut facts = plane_facts(reply.plane.as_ref());
@@ -3365,7 +3365,7 @@ impl Pool {
             }
             let released = shared.and_then(|_| release_revoked(custody, &mut session.executor));
             if let Err(error) = released {
-                eprintln!("device weights share/revoke failed; replacing the executor: {error}");
+                tracing::warn!("device weights share/revoke failed; replacing the executor: {error}");
                 return Ok(false);
             }
         }
@@ -3753,7 +3753,7 @@ fn release_revoked(
                 .released(&key, generation, &executor.birth);
         } else {
             // A reader that cannot release keeps its lease charged until it ends: no kill.
-            eprintln!(
+            tracing::warn!(
                 "revoke of {} refused: {} {}",
                 key.layout, reply.code, reply.detail
             );
@@ -3965,7 +3965,7 @@ pub(crate) fn remove_old_executor_roots(root: &Path) {
             .is_ok_and(|modified| modified.elapsed().is_ok_and(|age| age > KEEP));
         if executor && old {
             if let Err(error) = fs::remove_dir_all(entry.path()) {
-                eprintln!("old executor root {}: {error}", entry.path().display());
+                tracing::warn!("old executor root {}: {error}", entry.path().display());
             }
         }
     }
@@ -4252,7 +4252,7 @@ pub(crate) fn record_measurements(engine: &Engine, id: &str, reply: &Frame, sinc
         .map_err(io::Error::other)
         .and_then(|bytes| engine.with_journal(|journal| journal.record_measurements(id, &bytes)));
     if let Err(error) = recorded {
-        eprintln!("run {id}: measurements not kept: {error}");
+        tracing::warn!("run {id}: measurements not kept: {error}");
     }
 }
 

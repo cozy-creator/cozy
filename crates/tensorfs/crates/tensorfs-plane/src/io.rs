@@ -264,7 +264,7 @@ impl Source {
 impl Drop for Source {
     fn drop(&mut self) {
         if let Err(e) = self.release() {
-            eprintln!("tensorfs-plane: read lease release failed: {e}");
+            tracing::warn!("tensorfs-plane: read lease release failed: {e}");
         }
     }
 }
