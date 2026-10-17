@@ -88,7 +88,7 @@ async fn download(client: &Client, id: &str, hub: &str) -> serde_json::Value {
     };
     let outcome = common::outcome(&common::run(client, id, spec).await);
     assert_eq!(outcome.status, "succeeded", "{outcome:?}");
-    let result: serde_json::Value = serde_json::from_str(outcome.result.unwrap().get()).unwrap();
+    let result: serde_json::Value = serde_json::from_str(outcome.result.as_ref().unwrap().get()).unwrap();
     result["models"][0].clone()
 }
 

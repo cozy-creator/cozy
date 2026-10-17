@@ -138,9 +138,10 @@ impl<B: MachineBackend> Machine<B> {
             .and_then(|value| value.strip_prefix("Cozy-Cap "))
             .ok_or_else(|| Error::credential("capability_absent", "the call carries no Cozy-Cap"))?;
         let authority = &self.identity.authority;
-        let (grant, signer) =
-            capability::verify(token, &authority.worker_id, &authority.keys.admitted(), unix_now(), "")
-                .map_err(|refusal| Error::credential("capability_invalid", refusal.to_string()))?;
+        let (grant, signer) = authority
+            .keys
+            .check(|keys| capability::verify(token, &authority.worker_id, keys, unix_now(), ""))
+            .map_err(|refusal| Error::credential("capability_invalid", refusal.to_string()))?;
         Ok(Caller { actor: VerifiedActor { public_key: signer.to_bytes() }, grant })
     }
 
@@ -415,12 +416,17 @@ fn ranged(headers: &HeaderMap, parts: Parts, length: u64, authority: StreamAutho
         .take(end - start);
     let (sender, receiver) = tokio::sync::mpsc::channel(4);
     tokio::task::spawn_blocking(move || {
-        let (mut reader, mut buffer) = (reader, vec![0; 1 << 20]);
-        loop {
+        let (mut reader, mut buffer, mut left) = (reader, vec![0; 1 << 20], end - start);
+        while left > 0 {
+            // Bytes that end before the revision's length fail the body, never a short success.
             let read = match reader.read(&mut buffer) {
-                Ok(0) => return,
+                Ok(0) => Err(Error::internal("output_short", "the output's bytes ended before its length")),
                 Ok(n) => Ok(Bytes::copy_from_slice(&buffer[..n])),
                 Err(error) => Err(Error::internal("output_unreadable", error.to_string())),
+            };
+            left = match &read {
+                Ok(bytes) => left - bytes.len() as u64,
+                Err(_) => 0,
             };
             if sender.blocking_send(read).is_err() {
                 return;
@@ -492,6 +498,7 @@ async fn log<B: MachineBackend>(
     let log = match name.as_str() {
         "tensorfs-transport" => domain::MachineLog::TensorfsTransport,
         "memory" => domain::MachineLog::Memory,
+        "tensord" => domain::MachineLog::Tensord,
         _ => return Err(Error::not_found("log_not_found", format!("this machine keeps no log {name}")).into()),
     };
     let actor = caller.actor;
