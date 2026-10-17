@@ -232,10 +232,27 @@ mod tests {
         );
         let own = super::process(std::process::id()).unwrap();
         assert!(own.rss > 0 && own.pss > 0 && own.pss <= own.rss, "{own:?}");
-        let mut child = std::process::Command::new("sleep").arg("5").spawn().unwrap();
-        let tree = super::tree_private(std::process::id());
-        child.kill().unwrap();
-        child.wait().unwrap();
-        assert!(tree > own.pss.saturating_sub(own.pss_shmem), "a child counts too: {tree}");
+        // A quiet tree, not this test process, whose other threads move its memory between
+        // two reads: a shell waiting on the `sleep` it started.
+        let mut shell = std::process::Command::new("sh")
+            .args(["-c", "sleep 60 & echo $!; wait"])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut pid = String::new();
+        std::io::BufRead::read_line(&mut std::io::BufReader::new(shell.stdout.take().unwrap()), &mut pid).unwrap();
+        let sleeper: u32 = pid.trim().parse().unwrap();
+        // Until the child has become `sleep`, it shares the shell's pages and their sizes move.
+        while std::fs::read_to_string(format!("/proc/{sleeper}/comm")).is_ok_and(|c| c.trim() != "sleep") {
+            std::thread::yield_now();
+        }
+        let private = |pid: u32| super::process(pid).map(|m| m.pss.saturating_sub(m.pss_shmem)).unwrap();
+        let (alone, child) = (private(shell.id()), private(sleeper));
+        let tree = super::tree_private(shell.id());
+        let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(sleeper as i32), nix::sys::signal::Signal::SIGKILL);
+        shell.wait().unwrap();
+        // Shared library pages split their size among every process mapping them, so a quiet
+        // process still moves by a few hundred bytes; the child's own pages are far more.
+        assert!(child > 0 && tree > alone, "a child counts too: {tree} vs {alone} alone, {child} child");
     }
 }
