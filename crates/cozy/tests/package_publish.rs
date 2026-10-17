@@ -237,6 +237,37 @@ fn packages_lock_publish_and_yank_on_a_real_hub() {
         "{lock}"
     );
 
+    // A newer release of a package another one pins: that release's info says so to its owner.
+    let tiny_toml = read(tiny.join("pyproject.toml"));
+    let newer = tiny_toml.replace("version = \"0.1.0\"", "version = \"0.2.0\"");
+    std::fs::write(tiny.join("pyproject.toml"), newer).unwrap();
+    json(&home, &tiny, &["package", "lock"]);
+    assert_eq!(
+        json(&home, &tiny, &["package", "publish"])["status"],
+        "published"
+    );
+    let pinned = format!("{account}/tiny-user@0.1.0");
+    let info = json(&home, &user, &["package", "info", &pinned]);
+    let newer = format!("{account}/tiny 0.2.0 is newer than the 0.1.0 this lock pins");
+    assert_eq!(info["releases"].as_array().unwrap().len(), 1, "{info}");
+    let warned = |info: &Value, warning: &str| {
+        let warnings = info["warnings"].as_array().cloned().unwrap_or_default();
+        warnings.iter().any(|w| w == warning)
+    };
+    assert!(warned(&info, &newer), "{info}");
+    let shown = cozy(&home, &user, &["package", "info", &pinned]);
+    assert!(
+        shown.stdout.contains(&format!("warning: {newer}")),
+        "{shown:?}"
+    );
+    // Anyone else reads the release, not its owner's warnings.
+    let read_by_other = json(
+        &second,
+        &project(&second, "tiny"),
+        &["package", "info", &pinned],
+    );
+    assert!(read_by_other["warnings"].is_null(), "{read_by_other}");
+
     let release = format!("{account}/tiny@0.1.0");
     assert_eq!(
         json(&home, &tiny, &["package", "yank", &release])["changed"],
@@ -246,10 +277,9 @@ fn packages_lock_publish_and_yank_on_a_real_hub() {
         json(&home, &tiny, &["package", "yank", &release])["changed"],
         false
     );
-    let info = json(
-        &home,
-        &tiny,
-        &["package", "info", &format!("{account}/tiny")],
-    );
+    let info = json(&home, &tiny, &["package", "info", &release]);
     assert_eq!(info["releases"][0]["yanked"], true, "{info}");
+    let info = json(&home, &user, &["package", "info", &pinned]);
+    let yanked = format!("{account}/tiny 0.1.0 is yanked; this release pins it");
+    assert!(warned(&info, &yanked) && warned(&info, &newer), "{info}");
 }

@@ -1,7 +1,10 @@
 //! `cozy package search|info`: the Hub's catalog, as this computer's account sees it (anonymous when signed out).
 use std::process::ExitCode;
 
-use cozy_proto::error::{Error, Kind};
+use cozy_proto::{
+    config::Hub,
+    error::{Error, Kind},
+};
 use serde::Serialize;
 
 use super::{PackageRef, release_order, stamp};
@@ -88,6 +91,9 @@ struct Info {
     package: String,
     latest_release: Option<String>,
     releases: Vec<Release>,
+    /// The named release's publish warnings, which the Hub tells its owner.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
 }
 
 pub async fn info(ctx: &Context, package: &PackageRef) -> Result<ExitCode, Error> {
@@ -108,10 +114,29 @@ pub async fn info(ctx: &Context, package: &PackageRef) -> Result<ExitCode, Error
         })
         .collect();
     releases.sort_by_key(|r| std::cmp::Reverse(release_order(&r.release)));
+    // A named release: its row alone, and what its publish warned of.
+    let mut warned = vec![];
+    if let Some(release) = &package.release {
+        releases.retain(|r| r.release == *release);
+        if releases.is_empty() {
+            return Err(Error::new(
+                Kind::NotFound,
+                "release_not_found",
+                format!(
+                    "{} has no release {release} on {}",
+                    package.package(),
+                    hub.label()
+                ),
+            )
+            .next(format!("cozy package info {}", package.package())));
+        }
+        warned = warnings(ctx, &hub, package, release).await?;
+    }
     let info = Info {
         package: package.package(),
         latest_release: card.package.latest_release,
         releases,
+        warnings: warned,
     };
     if ctx.json {
         output::json(&info);
@@ -132,8 +157,35 @@ pub async fn info(ctx: &Context, package: &PackageRef) -> Result<ExitCode, Error
             yanked,
         ]);
     }
+    for warning in &info.warnings {
+        table = table.note(format!("warning: {warning}"));
+    }
     table.print();
     Ok(ExitCode::SUCCESS)
+}
+
+/// A release's publish warnings (a pin of its org's own package since yanked, or with a newer
+/// release), as the Hub's publish status tells the package's owner; none for anyone else.
+async fn warnings(
+    ctx: &Context,
+    hub: &Hub,
+    package: &PackageRef,
+    release: &str,
+) -> Result<Vec<String>, Error> {
+    if !ctx.signed_in(hub) {
+        return Ok(vec![]);
+    }
+    let status = ctx
+        .hub_signed_in(hub)?
+        .get_package_finalization(&package.org, &package.name, release)
+        .await;
+    match status.map_err(hub_error) {
+        Ok(status) => Ok(status.into_inner().warnings),
+        Err(e) if matches!(e.kind, Kind::Forbidden | Kind::Credential | Kind::NotFound) => {
+            Ok(vec![])
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// A package this Hub does not have, named with the Hub searched and where to look instead.
