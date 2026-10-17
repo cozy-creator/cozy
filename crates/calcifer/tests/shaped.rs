@@ -70,36 +70,42 @@ async fn an_input_uploads_near_the_link_rate_over_a_long_round_trip() {
     };
     let id = calcifer.submit("k", submit).await.unwrap().run.id;
     let mut seen: Vec<(Instant, f64)> = vec![];
+    // Written, then sent: the machine's acceptance follows the upload's end.
     // A hang bound for a broken link; the product waits without one.
-    tokio::time::timeout(Duration::from_secs(600), async {
+    let accepted = tokio::time::timeout(Duration::from_secs(600), async {
         loop {
             let (run, event) = events.recv().await.unwrap();
             if run != id {
                 continue;
             }
-            if let Event::Waiting { reason } = event
-                && let Some(progress) = reason.strip_prefix("writing image: ")
-            {
-                let done = parse(progress.split('/').next().unwrap());
-                seen.push((Instant::now(), done));
-                if done >= total as f64 {
-                    return;
+            match event {
+                Event::Waiting { reason } => {
+                    if let Some(progress) = reason.strip_prefix("writing image: ") {
+                        seen.push((Instant::now(), parse(progress.split('/').next().unwrap())));
+                    }
                 }
+                Event::InProgress { .. } => return Instant::now(),
+                _ => {}
             }
         }
     })
     .await
-    .expect("the input was written");
+    .expect("the input was written and the run accepted");
     let (first, from) = seen[0];
-    let (last, _) = *seen.last().unwrap();
-    let rate = (total as f64 - from) / (last - first).as_secs_f64();
+    let rate = (total as f64 - from) / (accepted - first).as_secs_f64();
     eprintln!(
-        "{} MiB in {:.1} s over {} progress events: {:.0} B/s, {:.0}% of the shaped {shaped:.0} B/s",
+        "{} MiB written and the run accepted in {:.1} s over {} progress events: {:.0} B/s, {:.0}% of the shaped {shaped:.0} B/s",
         total >> 20,
-        (last - first).as_secs_f64(),
+        (accepted - first).as_secs_f64(),
         seen.len(),
         rate,
         100.0 * rate / shaped,
+    );
+    let link = calcifer::Link::new(&machine.endpoint, common::key()).unwrap();
+    let digest = cozy_proto::ids::Digest::of(&bytes);
+    assert_eq!(
+        link.held(&digest, total as u64).await.unwrap(),
+        total as u64
     );
     for (at, done) in &seen {
         let carried = shaped * (*at - first).as_secs_f64();

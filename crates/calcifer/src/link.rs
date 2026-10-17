@@ -293,7 +293,9 @@ impl Link {
         let started = Instant::now();
         let rate =
             move |offset: u64| (offset - held) as f64 / started.elapsed().as_secs_f64().max(1e-3);
-        let send = async {
+        // Owns the sender: when the object is read, the stream ends and the machine answers.
+        let tell = &mut progress;
+        let send = async move {
             file.seek(std::io::SeekFrom::Start(held)).await?;
             let (mut offset, mut told) = (held, Instant::now());
             loop {
@@ -315,7 +317,7 @@ impl Link {
                 offset += read as u64;
                 if told.elapsed() >= TELL_EVERY {
                     told = Instant::now();
-                    progress(offset, Some(rate(offset)));
+                    tell(offset, Some(rate(offset)));
                 }
             }
         };
