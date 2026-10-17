@@ -37,7 +37,7 @@ Plan of record and workstream IDs (A–F):
 ```
 Calcifer ──HTTPS (Cozy-Cap)──> api::http ─> machine_api::NativeBackend
                                                         │
-machine.sock (weight peers) / admin.sock ─> main.rs ▼
+                                                        ▼
                                           service::Service (dispatch policy)
                                            │ journal + supervision: execution::Engine / journal::Journal
                                            │
@@ -64,16 +64,14 @@ What belongs to a submitter is in the journal and the API: installations, prepar
 inputs, outputs, triage and controls are read by actor; a run's spool lives only for its call,
 and a failure quotes only the stderr its own request wrote.
 
-Local sockets, both 0600 and announced on start as `READY <machine.sock>` then
-`ADMIN <admin.sock>`: `machine.sock` serves weight peers (hello, import, attach, release, stats);
-`admin.sock` serves the owner (submit, executions, cancel, results, shutdown) and refuses any peer
-that descends from the machine. Same-UID package code is still not sandboxed.
+The HTTPS machine API is the only way in; there is no local control socket. Same-UID package
+code is still not sandboxed.
 
 ## Module map
 
 | Module | Owns | Main types | Owner |
 |---|---|---|---|
-| `main.rs` | `serve`/`version` commands, weight-peer socket and owner-only admin socket, wiring | — | E (admin socket split), D2 (rental config) |
+| `main.rs`, `serve.rs` | `serve`/`version` commands, the state root's owner lock and store claim, wiring | — | D2 (rental config) |
 | `api/server.rs` | The pinned-TLS listener (h2 and http/1.1) and the readiness self-probe | `MachineIdentity`, `serve` | D1 |
 | `api/http.rs` | The machine API's Router (`MACHINE-API.md`): auth, refusals as the error envelope, SSE, ranged outputs, object parts | `router`, `Refusal` | H |
 | `api/auth.rs` | Admitted keys (a rental's Hub lease) and each open stream's authority | `Authority`, `Keys`, `StreamAuthority` | D1 |
@@ -115,8 +113,7 @@ that descends from the machine. Same-UID package code is still not sandboxed.
 | `reclaim.rs` | Self-managing caches: TTL and storage pressure for spools, logs, collected results, generations | `Disk`, `Swept`, `sweep` | E |
 | `child_launcher.rs` | Pool-owned spawn thread (PDEATHSIG follows the creating thread) | `ChildLauncher` | E |
 | `os.rs` | memfd, seals, peer credentials (`SO_PEERPIDFD`, `pidfd_open` fallback), pidfd exit | — | E |
-| `owner.rs` | Weight peers, import, sealed memfd cache (LRU/TTL), leases per pidfd; store claim through TensorFS `ensure_owned` | `Owner` | B1 |
-| `protocol.rs` | Private control-socket protocol (length-prefixed JSON + `SCM_RIGHTS`) | `Request`, `Command`, `Reply` | E |
+| `protocol.rs` | Length-prefixed frames of the executor seam | `read_body`, `write_body` | E |
 | `host_tier.rs` | Degree 1 host tier: machine-filled sealed layouts, adopted read-only, sized by live headroom; a region's absent objects are fetched (Now) and copied as they land | `HostTier`, `HostGrant`, `TierLimit`, `HostTierFacts` | B1 |
 | `host_memory.rs` | Live host headroom (cgroup v1/v2 path, `MemAvailable`) | `HostMemory` | B1 |
 | `model_sources.rs` | Selected model headers/assets as verified bytes and sealed read-only descriptors; component byte facts for planning | `ModelSources`, `SelectedManifest` | B1 |
@@ -130,7 +127,6 @@ that descends from the machine. Same-UID package code is still not sandboxed.
 |---|---|
 | `packages.py`, `captured_packages.py`, `installer.py`, `package_records.py`, `runtime_describe.py` | Static description and uv generation install (`python -m tensord_client.installer`) |
 | `device_codec.py` | Output encoder, embedded into `device_executor.rs` with `include_str!` |
-| `client.py`, `protocol.py`, `linux.py`, `execution_client.py`, `cpu_gate.py` | Private control-socket client and the CPU component gate |
 
 ## Development tools (not proof; see PLAN decision 5)
 
@@ -141,7 +137,6 @@ that descends from the machine. Same-UID package code is still not sandboxed.
 | `src/bin/install-capture.rs` | Run the installer path on a captured archive (used by Python tests) | D1 |
 | `scripts/gate/` | Matched ComfyUI vs TensorD gate through ordinary `cozy run` | F |
 | `scripts/benchmarks/permission_probe.py` | CPU executor permission probe | E |
-| `scripts/service_cpu_gate.py` | CPU service end-to-end gate over the admin socket, including machine kill and restart | E |
 
 ## Contracts
 

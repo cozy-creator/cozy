@@ -3,25 +3,13 @@
 use crate::{
     config::{self, Flags},
     machine::grant::Lifetime,
-    owner::{Owner, Shared},
-    protocol::{self, Body, Command, Reply, CAPS},
 };
-use std::{
-    collections::HashSet,
-    io::{self, Write},
-    os::unix::{
-        fs::PermissionsExt,
-        net::{UnixListener, UnixStream},
-    },
-    path::PathBuf,
-    process::ExitCode,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
-    time::Duration,
+use std::{io, os::unix::fs::PermissionsExt, path::PathBuf, process::ExitCode, sync::Arc};
+use fs2::FileExt;
+use tensorfs_core::{
+    fetch::{Fetcher, Volume},
+    store::Store,
 };
-use tensorfs_core::fetch::{Fetcher, Volume};
 
 /// `cozy machine serve --rental|--persistent`, from the arguments after `machine`: this
 /// computer's or a pod's machine, until it stops.
@@ -141,10 +129,6 @@ pub struct Dev {
     package_find_links: Option<PathBuf>,
     #[arg(long, default_value_t = 1)]
     cpu_parallelism: usize,
-    #[arg(long, default_value_t = 16 * 1024 * 1024)]
-    host_bytes: u64,
-    #[arg(long, default_value_t = 300)]
-    cache_ttl_seconds: u64,
 }
 
 pub fn dev(args: Dev) -> io::Result<()> {
@@ -158,14 +142,13 @@ pub fn dev(args: Dev) -> io::Result<()> {
     machine_runtime()?;
     let root = args.state;
     let generations = args.generations.unwrap_or_else(|| root.join("generations"));
-    let owner = Owner::new(&root, &root.join("tensorfs"), args.host_bytes, Duration::from_secs(args.cache_ttl_seconds))?;
+    let (_owned, store) = own(&root, &root.join("tensorfs"))?;
     let service = crate::service::Service::open(&root, &generations, args.cpu_parallelism)?;
     let pool = match args.gpu_config {
         Some(config) => crate::gpu_service::GpuConfig::load(&config)?,
         None => crate::gpu_service::GpuConfig::deviceless(&root.join("cpu").join("home"))?,
     };
-    service.configure_pool(crate::gpu_service::Pool::new(&root.join("gpu"), pool, owner.lock().unwrap().store())?)?;
-    let listener = bind_control(&owner)?;
+    service.configure_pool(crate::gpu_service::Pool::new(&root.join("gpu"), pool, store.clone())?)?;
     let sdk = crate::published::PackageSdk {
         uv: args.uv,
         requirements: args.package_sdk,
@@ -176,15 +159,31 @@ pub fn dev(args: Dev) -> io::Result<()> {
     match (args.machine_config, args.listen) {
         (Some(config), Some(listen)) => {
             let identity = crate::api::MachineIdentity::retained(&crate::api::identity::MachineConfig::load(&config)?)?;
-            start_api(&root, &generations, identity, std::net::TcpListener::bind(listen)?, &owner, &service,
+            start_api(&root, &generations, identity, std::net::TcpListener::bind(listen)?, &store, &service,
                 args.installer_python, args.client_wheel, args.package_python, sdk, None, None)?
         }
         (None, None) => {
-            crate::calls::Calls::configure(&service, owner.lock().unwrap().store(), None)?;
+            crate::calls::Calls::configure(&service, store.clone(), None)?;
         }
         _ => return Err(io::Error::other("--machine-config and --listen are required together")),
     }
-    serve(owner, service, listener)
+    drop(service);
+    // The machine runs on its own threads until it is stopped.
+    loop {
+        std::thread::park();
+    }
+}
+
+/// The state root's one owner: its lock held while the process lives, and the TensorFS store it
+/// serves (which may live outside `root`), claimed for this machine alone.
+fn own(root: &std::path::Path, store: &std::path::Path) -> io::Result<(std::fs::File, Arc<Store>)> {
+    std::fs::create_dir_all(root)?;
+    let lock = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false)
+        .open(root.join("owner.lock"))?;
+    lock.try_lock_exclusive()
+        .map_err(|_| io::Error::new(io::ErrorKind::AlreadyExists, "state already has a machine owner"))?;
+    std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700))?;
+    Ok((lock, Arc::new(Store::ensure_owned(store).map_err(io::Error::other)?)))
 }
 
 /// `tensord version --json`: what a candidate binary declares to the machine's update.
@@ -198,12 +197,8 @@ pub fn version() -> io::Result<()> {
         api: [&'static str; 1],
         capabilities: Vec<&'static str>,
     }
-    // Machine contracts beside the private socket's: clients choose by capability.
-    let capabilities = crate::api::CAPABILITIES
-        .iter()
-        .chain(CAPS)
-        .copied()
-        .collect();
+    // Machine contracts: clients choose by capability.
+    let capabilities = crate::api::CAPABILITIES.to_vec();
     let record = Version {
         name: "tensord",
         version: env!("CARGO_PKG_VERSION"),
@@ -254,11 +249,11 @@ fn run_machine(config: config::Config, mut ready: crate::machine::supervise::Rea
     let engine = layout.engine();
     identity.store = Some(layout.store.clone());
     let generations = engine.join("generations");
-    let owner = Owner::new(&engine, &layout.store, 16 * 1024 * 1024, Duration::from_secs(300))?;
+    let (_owned, store) = own(&engine, &layout.store)?;
     // The machine's one Fetcher, held for its life: it reads the datacenter volume before the Hub
     // and fills it. A variable naming no mount point (the volume was not delivered) is no volume.
     let _fetcher = match layout.cache.as_ref().and_then(|cache| Volume::mounted(cache, crate::reclaim::TTL)) {
-        Some(volume) => Some(Fetcher::of(&owner.lock().unwrap().store()).map_err(io::Error::other)?.with_volume(volume)),
+        Some(volume) => Some(Fetcher::of(&store).map_err(io::Error::other)?.with_volume(volume)),
         None => None,
     };
     let service = crate::service::Service::open(&engine, &generations, 1)?;
@@ -274,7 +269,7 @@ fn run_machine(config: config::Config, mut ready: crate::machine::supervise::Rea
             paths.clone(),
             Box::new(idle),
             Some(lifecycle.clone()),
-            Some(owner.lock().unwrap().store()),
+            Some(store.clone()),
         )?
     };
     identity.updates = Some(updates.clone());
@@ -321,7 +316,7 @@ fn run_machine(config: config::Config, mut ready: crate::machine::supervise::Rea
         }
         let config: crate::gpu_service::GpuConfig =
             serde_json::from_value(config).map_err(io::Error::other)?;
-        let store = owner.lock().unwrap().store();
+        let store = store.clone();
         service.configure_pool(crate::gpu_service::Pool::new(
             &engine.join("gpu"),
             config,
@@ -351,7 +346,6 @@ fn run_machine(config: config::Config, mut ready: crate::machine::supervise::Rea
                 std::process::exit(0);
             })?;
     }
-    let control = bind_control(&owner)?;
     let api = crate::machine::net::kept_listener(&layout.state.join("api-port"), grant.listen_host, grant.worker_port)?;
     identity.webrtc = crate::machine::player::listen(&layout.state, grant.webrtc_port, !rental)?;
     identity.player = grant.webrtc_reach.clone();
@@ -363,7 +357,7 @@ fn run_machine(config: config::Config, mut ready: crate::machine::supervise::Rea
         &generations,
         identity,
         api,
-        &owner,
+        &store,
         &service,
         Some(crate::machine::client::helper_python(&engine)),
         Some(wheel),
@@ -380,7 +374,11 @@ fn run_machine(config: config::Config, mut ready: crate::machine::supervise::Rea
             .name("endpoint-report".into())
             .spawn(move || report_endpoint(hub, endpoint))?;
     }
-    serve(owner, service, control)
+    drop(service);
+    // The machine runs on its own threads until it is stopped.
+    loop {
+        std::thread::park();
+    }
 }
 
 /// The image's Runtime interpreter and the executors' Runtime wheel, when both are here: the
@@ -403,7 +401,7 @@ fn start_api(
     generations: &std::path::Path,
     identity: crate::api::MachineIdentity,
     listener: std::net::TcpListener,
-    owner: &Shared,
+    store: &Arc<Store>,
     service: &Arc<crate::service::Service>,
     helper: Option<PathBuf>,
     wheel: Option<PathBuf>,
@@ -419,7 +417,7 @@ fn start_api(
         sdk.uv.clone(),
         sdk.seed_cache.clone(),
     );
-    let store = owner.lock().unwrap().store();
+    let store = store.clone();
     let mut backend = NativeBackend::new(service.clone(), identity.authority.clone(), store.clone());
     backend.logs = logs;
     let publisher =
@@ -507,374 +505,6 @@ fn start_api(
         })?;
     Ok(())
 }
-fn bind_control(owner: &Shared) -> io::Result<(UnixListener, UnixListener)> {
-    let (weights, admin) = {
-        let owner = owner.lock().unwrap();
-        (owner.socket.clone(), owner.admin.clone())
-    };
-    Ok((bind_private(&weights)?, bind_private(&admin)?))
-}
-fn bind_private(path: &std::path::Path) -> io::Result<UnixListener> {
-    // Only the singleton owner can remove a stale socket; no active peer store is touched.
-    match std::fs::remove_file(path) {
-        Ok(()) => (),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => (),
-        Err(e) => return Err(e),
-    }
-    let listener = UnixListener::bind(path)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    Ok(listener)
-}
-fn serve(
-    owner: Shared,
-    service: Arc<crate::service::Service>,
-    (listener, admin): (UnixListener, UnixListener),
-) -> io::Result<()> {
-    let paths = {
-        let owner = owner.lock().unwrap();
-        Arc::new([owner.socket.clone(), owner.admin.clone()])
-    };
-    let stopped = Arc::new(AtomicBool::new(false));
-    println!("READY {}", paths[0].display());
-    println!("ADMIN {}", paths[1].display());
-    io::stdout().flush()?;
-    {
-        let (owner, stopped, paths, service) = (
-            owner.clone(),
-            stopped.clone(),
-            paths.clone(),
-            service.clone(),
-        );
-        std::thread::Builder::new()
-            .name("machine-admin".into())
-            .spawn(move || {
-                for stream in admin.incoming() {
-                    let Ok(mut stream) = stream else {
-                        // Out of descriptors, say: the listener still stands, so pause and
-                        // accept again rather than spin.
-                        std::thread::sleep(Duration::from_millis(100));
-                        continue;
-                    };
-                    if stopped.load(Ordering::Acquire) {
-                        break;
-                    }
-                    if !matches!(os_peer_outside(&stream), Ok(true)) {
-                        let _ = protocol::write(
-                            &mut stream,
-                            &Reply {
-                                seq: 0,
-                                body: Body::Error {
-                                    code: "connection_unavailable",
-                                    detail: "administration is refused to the machine's own \
-                                             descendants"
-                                        .into(),
-                                },
-                            },
-                        );
-                        continue;
-                    }
-                    let (owner, stopped, paths, service) = (
-                        owner.clone(),
-                        stopped.clone(),
-                        paths.clone(),
-                        service.clone(),
-                    );
-                    std::thread::spawn(move || {
-                        if let Err(error) = client(stream, None, &owner, &stopped, &paths, &service)
-                        {
-                            tracing::warn!("admin peer: {error}");
-                        }
-                    });
-                }
-            })?;
-    }
-    for stream in listener.incoming() {
-        // A failed accept (out of descriptors, say) is not the end of the weight socket.
-        let Ok(stream) = stream else {
-            std::thread::sleep(Duration::from_millis(100));
-            continue;
-        };
-        if stopped.load(Ordering::Acquire) {
-            break;
-        }
-        let peer = match owner.lock().unwrap().connect(&stream) {
-            Ok(peer) => peer,
-            Err(error) => {
-                let mut stream = stream;
-                let _ = protocol::write(
-                    &mut stream,
-                    &Reply {
-                        seq: 0,
-                        body: Body::Error {
-                            code: "connection_unavailable",
-                            detail: error.to_string(),
-                        },
-                    },
-                );
-                continue;
-            }
-        };
-        let (owner, stopped, paths, service) = (
-            owner.clone(),
-            stopped.clone(),
-            paths.clone(),
-            service.clone(),
-        );
-        std::thread::spawn(move || {
-            let result = client(stream, Some(peer), &owner, &stopped, &paths, &service);
-            owner.lock().unwrap().disconnect(peer);
-            if let Err(error) = result {
-                tracing::warn!("peer {peer}: {error}");
-            }
-        });
-    }
-    for path in paths.iter() {
-        std::fs::remove_file(path)?;
-    }
-    Ok(())
-}
-fn os_peer_outside(stream: &UnixStream) -> io::Result<bool> {
-    Ok(!cozy_platform::handles::peer_descends_from_machine(stream)?)
-}
-/// `peer` is a registered weight peer; `None` is the owner's admin connection.
-fn client(
-    mut stream: UnixStream,
-    peer: Option<u64>,
-    owner: &Shared,
-    stopped: &AtomicBool,
-    paths: &[PathBuf; 2],
-    service: &Arc<crate::service::Service>,
-) -> io::Result<()> {
-    let mut capabilities = HashSet::new();
-    loop {
-        let request = match protocol::read(&mut stream) {
-            Ok(Some(request)) => request,
-            Ok(None) => return Ok(()),
-            Err(error) if error.kind() != io::ErrorKind::InvalidData => {
-                // A complete malformed JSON request is operation-local; truncated transport ends this peer.
-                if !error.to_string().contains("JSON") && error.kind() != io::ErrorKind::Other {
-                    return Err(error);
-                }
-                protocol::write(
-                    &mut stream,
-                    &Reply {
-                        seq: 0,
-                        body: Body::Error {
-                            code: "invalid_request",
-                            detail: error.to_string(),
-                        },
-                    },
-                )?;
-                continue;
-            }
-            Err(error) => return Err(error),
-        };
-        let seq = request.seq;
-        if let Command::Hello {
-            runtime,
-            capabilities: offered,
-        } = request.command
-        {
-            let _ = runtime; // Version is provenance, never an admission condition.
-            capabilities = offered
-                .into_iter()
-                .filter(|c| CAPS.contains(&c.as_str()))
-                .collect();
-            let mut selected: Vec<_> = capabilities.iter().cloned().collect();
-            selected.sort();
-            let incarnation = owner.lock().unwrap().incarnation.clone();
-            protocol::write(
-                &mut stream,
-                &Reply {
-                    seq,
-                    body: Body::Hello {
-                        version: env!("CARGO_PKG_VERSION"),
-                        tensorfs: tensorfs_core::VERSION,
-                        incarnation,
-                        capabilities: selected,
-                    },
-                },
-            )?;
-            continue;
-        }
-        let required = match &request.command {
-            Command::Import { .. } => Some("objects.put-fd/1"),
-            Command::Attach { .. } => Some("weights.hosted/1"),
-            Command::Submit { .. }
-            | Command::Execution { .. }
-            | Command::Executions
-            | Command::Cancel { .. }
-            | Command::ReadResult { .. } => Some("execution.cpu/1"),
-            _ => None,
-        };
-        let admin = peer.is_none();
-        let wrong = match &request.command {
-            Command::Import { .. } | Command::Attach { .. } | Command::Release { .. } => {
-                admin.then_some("weight operations use the machine socket")
-            }
-            Command::Submit { .. }
-            | Command::Execution { .. }
-            | Command::Executions
-            | Command::Cancel { .. }
-            | Command::ReadResult { .. }
-            | Command::Shutdown => (!admin).then_some("administration uses the admin socket"),
-            _ => None,
-        };
-        if let Some(detail) = wrong {
-            if matches!(request.command, Command::Import { .. }) {
-                drop(cozy_platform::handles::recv_fd(&stream)?);
-            }
-            protocol::write(
-                &mut stream,
-                &Reply {
-                    seq,
-                    body: Body::Error {
-                        code: "wrong_socket",
-                        detail: detail.into(),
-                    },
-                },
-            )?;
-            continue;
-        }
-        let peer = peer.unwrap_or(0); // only weight operations, never reached by admin, use it
-        if let Some(cap) = required {
-            if !capabilities.contains(cap) {
-                if matches!(request.command, Command::Import { .. }) {
-                    drop(cozy_platform::handles::recv_fd(&stream)?);
-                }
-                protocol::write(
-                    &mut stream,
-                    &Reply {
-                        seq,
-                        body: Body::Error {
-                            code: "capability_missing",
-                            detail: cap.into(),
-                        },
-                    },
-                )?;
-                continue;
-            }
-        }
-        let result: io::Result<(Body, Option<std::fs::File>)> = match request.command {
-            Command::Import { object } => {
-                let fd = cozy_platform::handles::recv_fd(&stream)?;
-                owner
-                    .lock()
-                    .unwrap()
-                    .import(object, fd.into())
-                    .map(|body| (body, None))
-            }
-            Command::Attach { object } => owner
-                .lock()
-                .unwrap()
-                .attach(peer, object)
-                .map(|(body, fd)| (body, Some(fd))),
-            Command::Release { lease, incarnation } => owner
-                .lock()
-                .unwrap()
-                .release(peer, lease, &incarnation)
-                .map(|body| (body, None)),
-            Command::Stats => Ok((owner.lock().unwrap().stats(), None)),
-            Command::Submit {
-                key,
-                generation,
-                entrypoint,
-                input,
-            } => service
-                .submit(&key, &generation, &entrypoint, input)
-                .map(|record| {
-                    (
-                        Body::Execution {
-                            record: Box::new(record),
-                        },
-                        None,
-                    )
-                }),
-            Command::Execution { id } => service.engine.get(&id).map(|record| {
-                (
-                    Body::Execution {
-                        record: Box::new(record),
-                    },
-                    None,
-                )
-            }),
-            Command::Executions => service
-                .engine
-                .list()
-                .map(|records| (Body::Executions { records }, None)),
-            Command::Cancel { id } => {
-                service
-                    .engine
-                    .cancel(&id, "local-machine-owner")
-                    .map(|record| {
-                        (
-                            Body::Execution {
-                                record: Box::new(record),
-                            },
-                            None,
-                        )
-                    })
-            }
-            Command::ReadResult { id, index } => (|| {
-                let record = service.engine.get(&id)?;
-                let artifact = record
-                    .result
-                    .as_ref()
-                    .and_then(|r| r.artifacts.get(index))
-                    .cloned()
-                    .ok_or_else(|| io::Error::other("result artifact absent"))?;
-                let file = service.engine.open_result(&id, index)?;
-                Ok((Body::ResultArtifact { id, artifact }, Some(file)))
-            })(),
-            Command::Shutdown => {
-                // Hold the weight gate while quiescing dispatch: neither half may
-                // stop after discovering the other still has live obligations.
-                let mut weight_owner = owner.lock().unwrap();
-                if !weight_owner.idle() || !service.stop()? {
-                    Err(io::Error::other(
-                        "accepted work or active leases prevent shutdown",
-                    ))
-                } else {
-                    assert!(weight_owner.stop());
-                    drop(weight_owner);
-                    let acknowledgement = protocol::write(
-                        &mut stream,
-                        &Reply {
-                            seq,
-                            body: Body::Shutdown,
-                        },
-                    );
-                    stopped.store(true, Ordering::Release);
-                    for path in paths {
-                        let _ = UnixStream::connect(path);
-                    }
-                    return acknowledgement;
-                }
-            }
-            _ => Ok((
-                Body::Error {
-                    code: "operation_unsupported",
-                    detail: "this operation is not implemented".into(),
-                },
-                None,
-            )),
-        };
-        let (body, fd) = result.unwrap_or_else(|e| {
-            (
-                Body::Error {
-                    code: "operation_failed",
-                    detail: e.to_string(),
-                },
-                None,
-            )
-        });
-        protocol::write(&mut stream, &Reply { seq, body })?;
-        if let Some(fd) = fd {
-            cozy_platform::handles::send_fd(&stream, &fd)?;
-        }
-    }
-}
-
 /// Tells the Hub this machine's endpoint, trying again while the Hub cannot be reached. The
 /// report only saves the provider's lag: after a few misses the provider's view serves.
 fn report_endpoint(grant: crate::machine::grant::HubGrant, endpoint: crate::machine::endpoint::Endpoint) {

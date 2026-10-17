@@ -1,7 +1,6 @@
 //! The actual CPU service keeps its name when launched through update/proc executable aliases.
 use std::{
     fs,
-    io::{BufRead, BufReader},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
 };
@@ -14,19 +13,16 @@ struct OwnedService {
 impl OwnedService {
     fn start(executable: &Path, root: PathBuf) -> Self {
         fs::create_dir_all(&root).unwrap();
-        let mut child = Command::new(executable)
+        let child = Command::new(executable)
             .arg("serve").arg("--state").arg(root.join("state"))
-            .arg("--host-bytes").arg("0")
-            .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
-        let mut stdout = BufReader::new(child.stdout.take().unwrap());
-        let mut ready = String::new();
-        stdout.read_line(&mut ready).unwrap();
-        assert!(ready.starts_with("READY "), "service did not start: {ready}");
-        let mut admin = String::new();
-        stdout.read_line(&mut admin).unwrap();
-        assert!(admin.starts_with("ADMIN "), "service admin did not start: {admin}");
+            .stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
         let mut service = Self { child, root };
         let process = PathBuf::from(format!("/proc/{}", service.child.id()));
+        // Started once it owns its state: the lock it takes after naming itself.
+        while !service.root.join("state/owner.lock").exists() {
+            assert!(service.child.try_wait().unwrap().is_none(), "service did not start");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
         assert_eq!(fs::read_to_string(process.join("comm")).unwrap().trim(), "tensord");
         let maps = fs::read_to_string(process.join("maps")).unwrap();
         assert!(!maps.contains("libcuda") && !maps.contains("libnvidia-ml"));

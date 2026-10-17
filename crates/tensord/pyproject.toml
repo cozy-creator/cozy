@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "tensord-client"
 version = "0.1.0"
-description = "Experimental typed Unix-socket client for Cozy machine component qualification"
+description = "TensorD's package installer helper and output encoder"
 requires-python = ">=3.11"
 dependencies = ["msgspec>=0.18,<1"]
 
@@ -13,9 +13,6 @@ dependencies = ["msgspec>=0.18,<1"]
 installer = ["packaging>=24,<27"]
 # cozy-runtime is the trusted helper SDK the tests drive; its absence must fail, not skip.
 test = ["cozy-runtime; python_version >= '3.12'", "numpy>=2,<3", "scikit-learn>=1.5,<2", "pytest>=8,<10"]
-
-[project.scripts]
-tensord-cpu-gate = "tensord_client.cpu_gate:main"
 
 [tool.setuptools.packages.find]
 where = ["python"]
