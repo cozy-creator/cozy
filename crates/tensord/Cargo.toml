@@ -41,7 +41,7 @@ tar.workspace = true
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
 rustls-pemfile = "2"
 ring = "0.17"
-time = "0.3"
+time.workspace = true
 
 [dev-dependencies]
 x509-parser = "0.18"
