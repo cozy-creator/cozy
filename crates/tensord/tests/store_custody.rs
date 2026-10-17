@@ -29,12 +29,10 @@ impl Area {
     }
     fn write(&self, bytes: &[u8]) -> ObjectRef {
         let object = ObjectRef::of(bytes);
-        let mut writer = self
-            .objects
-            .begin("alice", &object.id(), object.length, 0)
-            .unwrap();
-        writer.append(bytes).unwrap();
-        writer.finish().unwrap();
+        if let Some(upload) = self.objects.upload("alice", &object.id(), object.length).unwrap() {
+            upload.write_at(0, bytes).unwrap();
+            self.objects.settle(&upload).unwrap();
+        }
         object
     }
     fn present(&self, object: &ObjectRef) -> bool {
