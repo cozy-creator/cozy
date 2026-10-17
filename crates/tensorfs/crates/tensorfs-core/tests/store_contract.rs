@@ -143,13 +143,18 @@ fn the_binary_and_the_wheel_share_one_store() {
     assert!(!store.put_file(&new, Some(&theirs), &Fault::default()).unwrap().admitted);
     assert_eq!(contract::recorded(&root).unwrap(), Some(Contract::OURS));
 
-    // A Store made before the record existed is adopted.
+    // A Store made before the record existed is adopted, and so is one a crash cut short.
     let older = scratch.0.join("older");
     wheel(&python, "ensure", &older, &[]);
     fs::remove_file(older.join(contract::RECORD)).unwrap();
     Store::open(&older).unwrap();
     assert_eq!(contract::recorded(&older).unwrap(), Some(Contract::OURS));
     assert_eq!(wheel(&python, "open", &older, &[]), serde_json::json!({}));
+    let torn = scratch.0.join("torn");
+    wheel(&python, "ensure", &torn, &[]);
+    fs::write(torn.join(contract::RECORD), "store-format 1\nclaim-pro").unwrap();
+    Store::open(&torn).unwrap();
+    assert_eq!(contract::recorded(&torn).unwrap(), Some(Contract::OURS));
 
     // Another store format refuses both builds, the owner included.
     let format = scratch.0.join("format");

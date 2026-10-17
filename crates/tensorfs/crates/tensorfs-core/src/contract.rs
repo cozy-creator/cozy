@@ -3,7 +3,8 @@
 //! apart. A Store records the [`STORE_FORMAT`] and [`CLAIM_PROTOCOL`] it is used under in
 //! `<root>/format`, and every open compares them with its own:
 //!
-//! - no record (a Store made before it existed): the opener writes its own;
+//! - no record (a Store made before it existed), or one a crash cut short: the opener writes its
+//!   own. The record is never synced, since any opener can write it again;
 //! - another store format: refused, since this build would misread the bytes on disk;
 //! - another claim protocol: refused, except by the Store's owner (TensorD), which records its
 //!   own. The owner decides how the Store is coordinated, and its restart ends what it started.
@@ -56,17 +57,11 @@ impl Contract {
     }
 }
 
-/// The contract recorded at `root`, if any.
+/// The contract recorded at `root`: `None` when there is none, or only a crash's remains.
 pub fn recorded(root: &Path) -> Result<Option<Contract>> {
     let path = root.join(RECORD);
     match fs::read_to_string(&path) {
-        Ok(text) => match Contract::parse(&text) {
-            Some(contract) => Ok(Some(contract)),
-            None => refuse(
-                Code::STORE_ERA,
-                format!("{} is not a store contract record", path.display()),
-            ),
-        },
+        Ok(text) => Ok(Contract::parse(&text)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(crate::store::classify_io(
             format!("read {}", path.display()),
@@ -87,7 +82,8 @@ pub(crate) fn judge(root: &Path, owner: bool) -> Result<()> {
         match recorded(root)? {
             Some(theirs) if theirs == Contract::OURS => break,
             None => {
-                if write(root, false)? {
+                // Only over a crash's remains does a write replace: two first openers race.
+                if write(root, root.join(RECORD).exists())? {
                     break;
                 }
             }
@@ -126,7 +122,6 @@ fn write(root: &Path, replace: bool) -> Result<bool> {
     ));
     let mut file = fs::File::create(&temp).map_err(|e| io("create store contract record", e))?;
     file.write_all(Contract::OURS.render().as_bytes())
-        .and_then(|()| file.sync_all())
         .map_err(|e| io("write store contract record", e))?;
     let target = root.join(RECORD);
     let placed = if replace {
@@ -139,9 +134,7 @@ fn write(root: &Path, replace: bool) -> Result<bool> {
             other => other.map(|()| true),
         }
     };
-    let placed = placed.map_err(|e| io("place store contract record", e))?;
-    crate::store::fsync_dir(root)?;
-    Ok(placed)
+    placed.map_err(|e| io("place store contract record", e))
 }
 
 #[cfg(test)]
