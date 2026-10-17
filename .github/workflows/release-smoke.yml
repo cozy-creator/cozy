@@ -3,8 +3,8 @@ name: release-smoke
 # It also adds each archive's attestation bundles to the release (<archive>.sigstore.jsonl).
 # The CPU smoke of design §6.4 on every release runner, against this run's own artifacts served from a local
 # mirror (COZY_DOWNLOAD_URL is the release location for the installers and `cozy update` alike): install
-# script, --version, PATH, up, hub list, package search (tensorhub.com, anonymous), update to this release,
-# down. A verb answering not_ported is skipped, so the smoke grows as the verbs land.
+# script, --version, PATH, up, status, hub list, package search (tensorhub.com, anonymous), the local machine
+# (enable, show, disable on Linux; refused elsewhere), update to this release, down. A verb answering not_ported is skipped, so the smoke grows as the verbs land.
 on:
   workflow_call:
     inputs:
@@ -153,9 +153,38 @@ jobs:
             printf '%s\n' "$out"
             if [ "$code" = 0 ]; then ran=1; else echo "::error::cozy $* exited $code"; fail=1; fi
           }
+          # `cozy --json <words…>` must be refused with code $1; skipped like `step`.
+          refuses() {
+            want=$1 code=0
+            shift
+            if ! "$cozy" "$@" --help > /dev/null 2>&1; then
+              echo "skipped, not in the grammar yet: cozy $*"
+              return
+            fi
+            out=$("$cozy" --json "$@") || code=$?
+            if printf '%s' "$out" | grep -Eq '"code": *"not_ported"'; then
+              echo "skipped, not ported: cozy $*"
+              return
+            fi
+            printf '%s\n' "$out"
+            [ "$code" != 0 ] && printf '%s' "$out" | grep -Eq "\"code\": *\"$want\"" \
+              || { echo "::error::cozy $* answered $code, not $want"; fail=1; }
+          }
           step up
+          # A second command finds Calcifer already up (and must not hang on a pipe it holds).
+          step status
           step hub list
           step package search sdxl
+          # The local machine: `enable` returns once `local` is ready (Linux); elsewhere it is refused.
+          if [ "$RUNNER_OS" = Linux ]; then
+            step machine enable
+            if [ "$ran" = 1 ]; then
+              step machine show local
+              step machine disable
+            fi
+          else
+            refuses machine_role_unsupported machine enable
+          fi
           before=$(ls -i "$cozy")
           step update "$VERSION"
           if [ "$ran" = 1 ]; then
