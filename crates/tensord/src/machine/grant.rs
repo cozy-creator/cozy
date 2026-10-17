@@ -89,7 +89,9 @@ impl Layout {
 
 impl Grant {
     pub fn new(lifetime: Lifetime, raw: &MachineConfig, webrtc_reach: super::player::Reach, home: &Home) -> io::Result<Self> {
-        let get = |text: &Option<String>| text.as_deref().filter(|v| !v.is_empty());
+        fn get(text: &Option<String>) -> Option<&str> {
+            text.as_deref().filter(|v| !v.is_empty())
+        }
         let rental = lifetime == Lifetime::Rental;
         let root = match (&raw.root, rental) {
             (Some(root), _) => root.clone(),
@@ -136,16 +138,11 @@ impl Grant {
                     worker_id: worker_id.clone(),
                     worker_token: token.into(),
                     ca_der,
-                    object_hosts: get(&raw.object_storage_hosts)
-                        .map(|h| h.split(',').map(str::to_owned).collect())
-                        .unwrap_or_default(),
+                    object_hosts: raw.object_storage_hosts.clone(),
                 })
             }
         };
-        let authorized = match get(&raw.authorized_keys) {
-            Some(text) => text.split(',').map(public_key).collect::<io::Result<Vec<_>>>()?,
-            None => vec![],
-        };
+        let authorized = raw.authorized_keys.iter().map(|k| public_key(k)).collect::<io::Result<Vec<_>>>()?;
         if rental && authorized.is_empty() && home_keys(home)?.is_empty() {
             return Err(invalid("the grant authorizes no key: COZY_AUTHORIZED_KEYS is required"));
         }

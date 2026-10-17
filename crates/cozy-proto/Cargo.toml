@@ -23,6 +23,9 @@ tonic.workspace = true
 tonic-prost.workspace = true
 url.workspace = true
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [build-dependencies]
 protoc-bin-vendored.workspace = true
 tonic-prost-build.workspace = true

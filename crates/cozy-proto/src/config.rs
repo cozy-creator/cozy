@@ -88,7 +88,8 @@ pub struct MachineConfig {
     pub webrtc_port: Option<u16>,
     /// The TensorFS store it fills; absent: `var/lib/tensorfs` under its root.
     pub store: Option<PathBuf>,
-    /// How long a rental stays with no job before it releases itself; absent: 15 minutes.
+    /// How long a rental stays with no job before it releases itself; absent: 15 minutes
+    /// (shorter only in tests).
     pub rental_idle_seconds: Option<u32>,
     /// The image layout's root: `/` on a pod, `~/.cozy/machine` on this computer.
     pub root: Option<PathBuf>,
@@ -98,17 +99,34 @@ pub struct MachineConfig {
     pub listen_host: Option<String>,
     pub worker_id: Option<String>,
     pub worker_token: Option<Secret>,
-    /// Comma-separated unpadded base64url Ed25519 keys.
-    pub authorized_keys: Option<String>,
+    /// Unpadded base64url Ed25519 keys (`a,b` in the environment).
+    #[serde(deserialize_with = "list")]
+    pub authorized_keys: Vec<String>,
     /// A development rental's SSH key.
     pub ssh_public_key: Option<String>,
     pub receipt_key: Option<Secret>,
     pub receipt_key_file: Option<PathBuf>,
     pub hub_origin: Option<String>,
     pub hub_ca_der: Option<String>,
-    pub object_storage_hosts: Option<String>,
+    /// Exact hosts, or `.suffix` for subdomains (`a,b` in the environment).
+    #[serde(deserialize_with = "list")]
+    pub object_storage_hosts: Vec<String>,
     /// CUDA_VISIBLE_DEVICES: indices or UUIDs; empty is no GPU.
     pub visible_devices: Option<String>,
+}
+
+/// A list as a TOML array, or as one comma-separated string (how the environment spells it).
+fn list<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum List {
+        Spelled(String),
+        Items(Vec<String>),
+    }
+    Ok(match List::deserialize(d)? {
+        List::Spelled(text) => text.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect(),
+        List::Items(items) => items,
+    })
 }
 
 /// A credential: never printed.
@@ -445,30 +463,38 @@ mod tests {
         );
     }
 
+    fn env(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
     #[test]
     fn the_machine_reads_its_table_and_a_pods_environment_as_spelled() {
-        let user = std::env::temp_dir().join(format!("cozy-config-{}", std::process::id()));
-        let home = Home::under(&user);
+        let user = tempfile::tempdir().unwrap();
+        let home = Home::under(user.path());
         std::fs::create_dir_all(home.root()).unwrap();
         std::fs::write(home.config(), "[machine]\nport = 7443\nstore = \"/s\"\n").unwrap();
-        let environment: BTreeMap<String, String> = [
+        let environment = env(&[
             ("COZY_WEBRTC_INTERNAL_PORT", "8445"),
             ("CUDA_VISIBLE_DEVICES", "0"),
             ("COZY_WORKER_AUTH_TOKEN", "secret"),
+            ("COZY_AUTHORIZED_KEYS", "a, b,"),
             ("HF_TOKEN", "12345"),
-        ]
-        .into_iter()
-        .map(|(k, v)| (k.to_owned(), v.to_owned()))
-        .collect();
-        let loaded = load_from(Flags::default(), &environment, user.clone()).unwrap();
+        ]);
+        let loaded = load_from(Flags::default(), &environment, user.path().into()).unwrap();
         let machine = &loaded.config.machine;
         assert_eq!((machine.port, machine.webrtc_port), (Some(7443), Some(8445)));
         assert_eq!(machine.store.as_deref(), Some(std::path::Path::new("/s")));
         assert_eq!(machine.visible_devices.as_deref(), Some("0"));
         assert_eq!(machine.worker_token.as_ref().map(Secret::expose), Some("secret"));
+        assert_eq!(machine.authorized_keys, ["a", "b"]);
         assert_eq!(loaded.config.huggingface_token.as_ref().map(Secret::expose), Some("12345"));
         assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
-        std::fs::remove_dir_all(&user).unwrap();
+
+        // A pod's variable left in a shell refuses every command, naming its key.
+        let stray = env(&[("COZY_WORKER_INTERNAL_PORT", "abc")]);
+        let error = load_from(Flags::default(), &stray, user.path().into()).unwrap_err();
+        assert_eq!(error.code, "config_invalid");
+        assert!(error.message.contains("`machine.port`"), "{}", error.message);
     }
 
     #[test]
