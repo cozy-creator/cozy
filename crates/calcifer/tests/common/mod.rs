@@ -1,5 +1,5 @@
-//! What the tests share: a real TensorD process (`COZY_TEST_TENSORD`, the binary a Runtime wheel
-//! carries) on a temp root that admits the test's key, and run specs it accepts with no Runtime.
+//! What the tests share: a real TensorD process (`COZY_TEST_TENSORD`: this workspace's,
+//! `cargo build -p tensord`) on a temp root that admits the test's key, and run specs it accepts with no Runtime.
 #![allow(dead_code)]
 use std::{
     path::{Path, PathBuf},
@@ -303,12 +303,13 @@ impl Machine {
         let machine = root.path().join("machine");
         let mut command = Command::new(binary);
         command
-            .arg("run")
+            .args(["run", "--persistent"])
             .env_remove("COZY_TEST_TENSORD")
+            // A home of its own: this computer's keys and config are not the test machine's.
+            .env("HOME", root.path())
             .env("COZY_MACHINE_ROOT", &machine)
             .env("COZY_LISTEN_HOST", "127.0.0.1")
             .env("COZY_WORKER_ID", WORKER)
-            .env("COZY_MACHINE_LIFETIME", "persistent")
             .env("COZY_WORKER_INTERNAL_PORT", address.port().to_string())
             .env(
                 "COZY_AUTHORIZED_KEYS",

@@ -1,11 +1,12 @@
 //! `Run kind: update` (G/API.md, D2): the payload names the software cohort, `{"runtime": …,
-//! "tensorfs": …, "agent": "bundled" | "explicit"}`. A member is a published version (fetched
-//! from PyPI, digest checked); when an input binds that field to an object sent with Write,
-//! that wheel's file name; or `{"url": "https://…/<wheel>", "sha256": …}`, a wheel the machine
-//! fetches itself, held to that digest. The update stages and verifies the pair, waits for
-//! measured idleness, restarts the service on it in place and commits once the new service
-//! proves readiness, or rolls back. Its log is the update's state history, so a client that lost the stream across
-//! the restart attaches again with `Run{id, after}` and reads the outcome.
+//! "tensorfs": …}`; the machine's own binary moves only with the `cozy` release. A member is a
+//! published version (fetched from PyPI, digest checked); when an input binds that field to an
+//! object sent with Write, that wheel's file name; or `{"url": "https://…/<wheel>", "sha256": …}`,
+//! a wheel the machine fetches itself, held to that digest. The update stages and verifies the
+//! pair, waits for measured idleness, restarts the service on it in place and commits once the new
+//! service proves readiness, or rolls back. Its log is the update's state history, so a client
+//! that lost the stream across the restart attaches again with `Run{id, after}` and reads the
+//! outcome.
 use super::{auth::VerifiedActor, backend::MachineBackend, v1, MachineIdentity};
 use crate::machine::update::{Choice, Request, Status as Update, Updates};
 use std::{collections::BTreeMap, pin::Pin, sync::Arc, time::Duration};
@@ -53,8 +54,6 @@ pub(super) fn owns(
 struct Cohort {
     runtime: Option<Member>,
     tensorfs: Option<Member>,
-    #[serde(default)]
-    agent: String,
     #[serde(flatten)]
     unknown: BTreeMap<String, serde_json::Value>,
 }
@@ -225,7 +224,6 @@ fn submit(
     };
     let request = Request {
         operation: id.into(),
-        agent: cohort.agent,
         pin: None,
         runtime: choose("runtime", cohort.runtime)?,
         tensorfs: choose("tensorfs", cohort.tensorfs)?,

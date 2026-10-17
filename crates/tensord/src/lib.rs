@@ -5,6 +5,7 @@ pub mod api;
 mod boundary_json;
 mod call_memo;
 pub mod catalog;
+pub mod config;
 pub mod child_launcher;
 pub mod device_executor;
 pub mod execution;
@@ -36,5 +37,8 @@ pub mod reclaim;
 pub mod resident_custody;
 pub mod runs;
 pub mod weights;
+#[cfg(test)]
+mod sdk_selection_tests;
+pub mod serve;
 pub mod service;
 pub mod triage;

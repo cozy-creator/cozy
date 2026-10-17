@@ -105,6 +105,7 @@ tonic-prost = "0.14.6"
 tonic-prost-build = "0.14.6"
 tower = { version = "0.5", default-features = false, features = ["util"] }
 tracing = "0.1"
+tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std"] }
 url = { version = "2.5.8", features = ["serde"] }
 webpki-roots = "1"
