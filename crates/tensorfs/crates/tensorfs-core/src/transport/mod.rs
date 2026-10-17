@@ -49,6 +49,7 @@ pub(crate) mod sources;
 pub(crate) mod tests;
 
 pub use api::{api_get, fetch_prefix, probe_length, Prefix};
+pub use net::use_runtime;
 pub use credential::{
     credential_from_spec, Anonymous, Answer, Ask, Both, CredentialProvider, ScopedHeaders,
 };

@@ -106,6 +106,20 @@ fn hold_handed_descriptors() {
     }
 }
 
+/// The machine's one async runtime: its API, its lifecycle and TensorFS's transport, where every
+/// object request in flight is a task, never a thread. Made in the service, after the stable
+/// parent's fork and before anything fetches.
+fn machine_runtime() -> io::Result<&'static tokio::runtime::Runtime> {
+    static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    if let Some(runtime) = RUNTIME.get() {
+        return Ok(runtime);
+    }
+    // The API's two threads and the transport's two, together.
+    let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(4).thread_name("tensord").enable_all().build()?;
+    tensorfs_core::transport::use_runtime(runtime.handle().clone());
+    Ok(RUNTIME.get_or_init(|| runtime))
+}
+
 /// `tensord serve`: a machine on a state directory with no grant, for tests.
 #[derive(Debug, clap::Args)]
 pub struct Dev {
@@ -147,6 +161,7 @@ pub fn dev(args: Dev) -> io::Result<()> {
         }
     }
     crate::process::cloexec_from(3);
+    machine_runtime()?;
     let root = args.state;
     let generations = args.generations.unwrap_or_else(|| root.join("generations"));
     let owner = Owner::new(&root, &root.join("tensorfs"), args.host_bytes, Duration::from_secs(args.cache_ttl_seconds))?;
@@ -211,6 +226,7 @@ pub fn version() -> io::Result<()> {
 /// under `var/lib/cozy/tensord`, the API on the granted port.
 fn run_machine(config: config::Config, mut ready: crate::machine::supervise::Ready) -> io::Result<()> {
     let config::Config { mut grant, visible_devices, endpoint, logs, .. } = config;
+    let runtime = machine_runtime()?;
     use crate::machine::{identity, receipt};
     // An older stable parent may have selected a partially published candidate. Restore the
     // links before opening services, then let that parent select the restored executable.
@@ -328,10 +344,6 @@ fn run_machine(config: config::Config, mut ready: crate::machine::supervise::Rea
         std::thread::Builder::new()
             .name("rental-lifecycle".into())
             .spawn(move || {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("a lifecycle runtime");
                 runtime.block_on(async {
                     tokio::spawn(crate::machine::lifecycle::keep_authority(
                         hub.clone(),
@@ -485,10 +497,7 @@ fn start_api(
         cert_pem: &identity.cert_pem,
     })?;
     crate::machine::identity::write_atomic(&root.join("api-ready.json"), &ready, 0o600)?;
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()?;
+    let runtime = machine_runtime()?;
     std::thread::Builder::new()
         .name("machine-api".into())
         .spawn(move || {
@@ -878,7 +887,7 @@ fn client(
 /// report only saves the provider's lag: after a few misses the provider's view serves.
 fn report_endpoint(grant: crate::machine::grant::HubGrant, endpoint: crate::machine::endpoint::Endpoint) {
     use crate::machine::hub::{Hub, Refusal};
-    let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+    let runtime = match machine_runtime() {
         Ok(runtime) => runtime,
         Err(error) => return tracing::warn!("endpoint report: {error}"),
     };
