@@ -582,9 +582,12 @@ fn local_policy() -> SourcePolicy {
     }
 }
 
+/// At a 0.25 s sample the watch restarts a request only once it is 100 ms (two ticks) behind its
+/// peers. At 25 ms that was 10 ms, which a loopback answer under a loaded runner often misses:
+/// healthy objects were restarted and asked twice.
 fn request_for<'a>(store: &'a Store, base: &'a str, policy: &'a SourcePolicy) -> PullRequest<'a> {
     let mut request = PullRequest::new(store, base, "acme/model", Anonymous, policy);
-    request.sample_seconds = 0.025;
+    request.sample_seconds = 0.25;
     request
 }
 
@@ -1359,6 +1362,7 @@ fn a_mint_that_goes_silent_on_a_still_pull_faults_with_what_it_measured() {
     let policy = SourcePolicy::default();
     let mut request = request_for(&store, &origin.base, &policy);
     request.streams = 1;
+    request.sample_seconds = 0.025;
     // NO DEADLINE — `Deadline::none()` is `PullRequest`'s default and is exactly what the pod
     // supervisor passes, deliberately. Before tfs-106 this pull could not end.
     let started = std::time::Instant::now();
@@ -1694,10 +1698,7 @@ fn retryable_status_buys_a_reask_and_authorization_answers_do_not() {
         None
     });
     let policy = SourcePolicy::default();
-    let mut request = request_for(&store, &origin.base, &policy);
-    // An unstated 503 waits the ledger's patience; sample in tens of milliseconds, wide enough
-    // that a slow runner's answer is not also a stall to restart.
-    request.sample_seconds = 0.05;
+    let request = request_for(&store, &origin.base, &policy);
     let report = pull(&request).unwrap();
     assert_eq!(report.fetched, 4);
     assert_eq!(origin.hits(&format!("/obj/{flaky}")), 2);
