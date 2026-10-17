@@ -113,20 +113,6 @@ fn bounds(c: &Constraints) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join(", "))
 }
 
-/// The callable's arguments, one per line, as a refusal shows them.
-pub fn arguments(callable: &Callable) -> String {
-    let mut out = String::from("Arguments:\n");
-    fields(
-        &mut out,
-        callable,
-        &callable.request.fields,
-        "  ",
-        "request",
-        true,
-    );
-    out
-}
-
 /// `--describe`: where it runs, request, model slots with their defaults, output, and the
 /// usage line.
 pub fn contract(target: &str, interface: &Interface, callable: &Callable) -> String {

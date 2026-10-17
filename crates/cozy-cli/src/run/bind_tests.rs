@@ -13,6 +13,7 @@ const MP4: &[u8] = b"\0\0\0\x18ftypmp42\0\0\0\0mp42isom\0\0\0\x08free";
 
 struct Case {
     read: Interface,
+    release: String,
     dir: tempfile::TempDir,
 }
 
@@ -25,6 +26,10 @@ impl Case {
         std::fs::write(dir.path().join("notes.txt"), "plain words").unwrap();
         Self {
             read: interface(card),
+            release: super::super::interface::tests::card(card)["release"]["release"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
             dir,
         }
     }
@@ -46,6 +51,7 @@ impl Case {
     fn bind(&self, function: &str, terms: &Terms) -> Result<Bound, Error> {
         bind(
             &format!("fidika/x/{function}"),
+            Some(&self.release),
             self.callable(function),
             terms,
         )
@@ -179,11 +185,9 @@ fn types_required_fields_and_bounds_are_strict_and_named_together() {
         "{}",
         missing.message
     );
-    assert!(
-        missing
-            .remedy
-            .unwrap()
-            .starts_with("cozy run fidika/x/generate prompt=<str>")
+    assert_eq!(
+        missing.next,
+        ["cozy run fidika/x/generate@2.10.0 --describe"]
     );
     for (term, code) in [
         ("steps=many", "value_type"),
@@ -752,4 +756,69 @@ fn a_reference_video_in_an_input_file_is_staged_from_beside_it() {
             ),
         ]
     );
+}
+
+/// The owner's `roll-over.yaml` (two characters with images, a background, a reference clip)
+/// bound against 1.39.0, whose reference kinds are audio, character and scene and which has no
+/// `video`: each bad kind at its path with the allowed values, the clip as an unknown field's
+/// warning, the release it was checked against, and no argument dump. 1.40.0 takes it whole.
+#[test]
+fn a_refusal_names_each_problem_at_its_path_and_the_release_it_checked() {
+    let request = "duration_s: 15\nresolution: 768p\nstyle: Realistic action.\nreferences:\n  \
+                   - {name: Azul, kind: character, image: images/a2.JPEG}\n  \
+                   - {name: Sophia, kind: character, image: images/so.png}\n  \
+                   - {name: Background, kind: background, description: A wooden dojo at dusk.}\n  \
+                   - {name: Video 1, kind: video, video: videos/roll-over.mp4}\n\
+                   prompt: |\n  <Azul> and <Sophia> follow the motion of <Video 1>\n";
+    let bound = |card: &str| {
+        let case = Case::new(card);
+        let dir = case.dir.path();
+        std::fs::create_dir_all(dir.join("images")).unwrap();
+        std::fs::create_dir_all(dir.join("videos")).unwrap();
+        std::fs::write(dir.join("images/a2.JPEG"), PNG).unwrap();
+        std::fs::write(dir.join("images/so.png"), PNG).unwrap();
+        std::fs::write(dir.join("videos/roll-over.mp4"), MP4).unwrap();
+        let yaml = dir.join("roll-over.yaml");
+        std::fs::write(&yaml, request).unwrap();
+        let terms = Terms {
+            input_file: Some(yaml),
+            ..case.terms(&[])
+        };
+        let target = "fidika/minimax-h3/ref2va_turbo";
+        bind(
+            target,
+            Some(&case.release),
+            case.callable("ref2va_turbo"),
+            &terms,
+        )
+    };
+    let refused = bound("minimax-h3-1.39.0").unwrap_err();
+    assert_eq!(refused.code, "request_payload_invalid");
+    assert_eq!(
+        refused.message.lines().collect::<Vec<_>>(),
+        [
+            "fidika/minimax-h3/ref2va_turbo cannot take this request (checked against fidika/minimax-h3 1.39.0):",
+            "  references[2].kind: \"background\" is not one of audio, character, scene",
+            "  references[3].kind: \"video\" is not one of audio, character, scene",
+            "warning: ignored unknown field references[3].video — not in fidika/minimax-h3/ref2va_turbo's interface",
+        ]
+    );
+    assert_eq!(
+        (refused.remedy, refused.next),
+        (
+            None,
+            vec!["cozy run fidika/minimax-h3/ref2va_turbo@1.39.0 --describe".to_owned()]
+        )
+    );
+    let taken = bound("minimax-h3-1.40.0").unwrap();
+    let fields: Vec<&str> = taken.files.iter().map(|f| f.field.as_str()).collect();
+    assert_eq!(
+        fields,
+        [
+            "references.0.image",
+            "references.1.image",
+            "references.3.video"
+        ]
+    );
+    assert!(taken.ignored.is_empty(), "{:?}", taken.ignored);
 }

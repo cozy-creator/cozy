@@ -346,7 +346,7 @@ async fn invoke(
         let submission = call.submission(on, &hub.origin, &call.warm(level, &models)?, None, None);
         return send(ctx, submission, &terms.key, args.detach).await;
     }
-    let (target, bound) = bind(ctx, package, card, function, &terms)?;
+    let (target, bound) = bind(package, card, function, &terms)?;
     if let Some(warning) = bound.warning(&target) {
         output::warn(ctx, &warning);
     }
@@ -395,9 +395,8 @@ async fn send(ctx: &Context, submission: SubmitRun, key: &str, detach: bool) -> 
     follow(ctx, submitted.run, detach).await
 }
 
-/// Binds `terms` to `function` of `card`; a person's refusal lists the arguments.
+/// Binds `terms` to `function` of `card`, against its release.
 fn bind(
-    ctx: &Context,
     package: &str,
     card: &Card,
     function: &str,
@@ -405,29 +404,8 @@ fn bind(
 ) -> Result<(String, bind::Bound), Error> {
     let callable = callable(package, &card.interface, function)?;
     let target = format!("{package}/{}", callable.name);
-    Ok((
-        target.clone(),
-        bind_callable(ctx, &target, callable, terms)?,
-    ))
-}
-
-/// Binds `terms` to `callable`; a person's refusal lists the arguments.
-fn bind_callable(
-    ctx: &Context,
-    target: &str,
-    callable: &Callable,
-    terms: &Terms,
-) -> Result<bind::Bound, Error> {
-    bind::bind(target, callable, terms).map_err(|mut error| {
-        if !ctx.json && error.code == "request_payload_invalid" {
-            error.message = format!(
-                "{}\n\n{}",
-                error.message,
-                describe::arguments(callable).trim_end()
-            );
-        }
-        error
-    })
+    let bound = bind::bind(&target, Some(&card.release), callable, terms)?;
+    Ok((target, bound))
 }
 
 /// The function `asked` names: exact, else the one name equal with `-` as `_`.

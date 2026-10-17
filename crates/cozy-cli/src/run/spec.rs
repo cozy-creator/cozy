@@ -238,7 +238,7 @@ mod tests {
             .unwrap();
         let mut with = terms(&["a cat", "steps=8", "model.model=Fidika/SDXL-Base@1.0/int8"]);
         with.loras = vec!["model:unet=fidika/detail#sha256:".to_owned() + &"a".repeat(64) + ",0.5"];
-        let bound = bind("fidika/sdxl/generate", generate, &with).unwrap();
+        let bound = bind("fidika/sdxl/generate", None, generate, &with).unwrap();
         let call = Call {
             package: "fidika/sdxl",
             source: Source::Release(None),
