@@ -18,10 +18,9 @@ pub fn bound_unsent(socket: &impl std::os::fd::AsRawFd, bytes: u32) -> Result<()
     };
     match set {
         0 => Ok(()),
-        _ => Err(crate::Error::Os {
-            op: "setsockopt TCP_NOTSENT_LOWAT",
-            source: std::io::Error::last_os_error(),
-        }),
+        _ => Err(crate::Error::os("bound unsent bytes")(
+            std::io::Error::last_os_error(),
+        )),
     }
 }
 
