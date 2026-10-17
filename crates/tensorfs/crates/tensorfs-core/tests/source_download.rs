@@ -79,6 +79,8 @@ struct Origin {
     connections: AtomicUsize,
     live: AtomicUsize,
     most_live: AtomicUsize,
+    /// Bodies wait to be sent until this many are live: concurrency driven, not raced.
+    together: AtomicUsize,
     puts: AtomicUsize,
     /// Per-connection pace, bytes per second; 0 is unpaced.
     pace: u64,
@@ -105,6 +107,7 @@ impl Origin {
             connections: AtomicUsize::new(0),
             live: AtomicUsize::new(0),
             most_live: AtomicUsize::new(0),
+            together: AtomicUsize::new(0),
             puts: AtomicUsize::new(0),
             pace,
             decide: Box::new(decide),
@@ -245,6 +248,14 @@ impl Origin {
             }
             let live = self.live.fetch_add(1, Ordering::SeqCst) + 1;
             self.most_live.fetch_max(live, Ordering::SeqCst);
+            // A client asking one at a time never brings the others: the bound turns that
+            // into the assertion's failure instead of a hang.
+            let began = Instant::now();
+            while self.live.load(Ordering::SeqCst) < self.together.load(Ordering::SeqCst)
+                && began.elapsed() < Duration::from_secs(60)
+            {
+                thread::sleep(Duration::from_millis(1));
+            }
             let cut = match act {
                 Act::Cut(n) => Some(n.min(slice.len())),
                 _ => None,
@@ -384,8 +395,9 @@ fn members_download_concurrently_once_each_and_report_progress() {
         (names[3], body(4, 911)),
     ];
     let total: u64 = objects.iter().map(|(_, bytes)| bytes.len() as u64).sum();
-    // Paced so every member is still in flight when the next one starts.
+    // Every body waits until three are in flight, so a concurrent client always shows three.
     let origin = Origin::start(objects, 8 << 20, |_, _| Act::Serve);
+    origin.together.store(3, Ordering::SeqCst);
     let dir = root("concurrent");
     let store = Store::init(&dir).unwrap();
     let reports = Mutex::new(vec![]);
