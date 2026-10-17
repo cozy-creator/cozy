@@ -92,9 +92,14 @@ fn terms_bind_strictly_and_unknown_fields_only_warn() {
             && message.contains("steps is 99"),
         "{message}"
     );
+    // A person reads each problem and the release it was checked against, then where to look.
     let human = home.cozy(["run", "fidika/sdxl/generate@2.10.0", "steps=99"]);
+    let said = format!("{}{}", human.stdout, human.stderr);
     assert!(
-        human.stdout.contains("Arguments:\n  prompt: str"),
+        said.contains("(checked against fidika/sdxl 2.10.0)")
+            && said.contains("  steps is 99; its maximum is 50")
+            && said.contains("cozy run fidika/sdxl/generate@2.10.0 --describe")
+            && !said.contains("Arguments:"),
         "{human:?}"
     );
 

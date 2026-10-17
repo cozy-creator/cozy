@@ -89,17 +89,7 @@ pub struct Adapter {
 impl Bound {
     /// The warning for the fields that were dropped, if any.
     pub fn warning(&self, target: &str) -> Option<String> {
-        (!self.ignored.is_empty()).then(|| {
-            let noun = if self.ignored.len() == 1 {
-                "field"
-            } else {
-                "fields"
-            };
-            format!(
-                "ignored unknown {noun} {} — not in {target}'s interface",
-                self.ignored.join(", ")
-            )
-        })
+        ignored_warning(target, &self.ignored)
     }
 }
 
@@ -159,8 +149,14 @@ pub fn warm_choices(callable: &Callable, terms: &Terms) -> Result<Vec<Choice>, E
     Ok(binder.choices.into_values().collect())
 }
 
-/// Binds `terms` for `callable`; `target` names it in messages (`org/pkg/fn`).
-pub fn bind(target: &str, callable: &Callable, terms: &Terms) -> Result<Bound, Error> {
+/// Binds `terms` for `callable`; `target` names it in messages (`org/pkg/fn`) and `release` the
+/// one its interface is (none for local code).
+pub fn bind(
+    target: &str,
+    release: Option<&str>,
+    callable: &Callable,
+    terms: &Terms,
+) -> Result<Bound, Error> {
     let mut binder = Binder {
         target,
         callable,
@@ -179,7 +175,7 @@ pub fn bind(target: &str, callable: &Callable, terms: &Terms) -> Result<Bound, E
     binder.loras()?;
     let files = binder.attach()?;
     binder.seed();
-    let ignored = validate(target, callable, &mut binder.document)?;
+    let ignored = validate(target, release, callable, &mut binder.document)?;
     Ok(Bound {
         payload: binder.document,
         files,
@@ -1275,7 +1271,7 @@ pub(super) fn scalar(ty: &Type, raw: &str) -> Option<Value> {
             // A branch with an unambiguous JSON spelling wins over a string branch.
             if let Ok(parsed) = serde_json::from_str::<Value>(raw)
                 && !parsed.is_string()
-                && scalars().any(|b| check(b, &mut parsed.clone(), "", &mut vec![]).is_ok())
+                && scalars().any(|b| check(b, &mut parsed.clone(), "", &mut vec![]).is_empty())
             {
                 return Some(match parsed {
                     Value::Number(_) => scalars()
@@ -1308,9 +1304,11 @@ fn same(a: &Value, b: &Value) -> bool {
 }
 
 /// Validates the payload against the request, dropping undeclared fields at any depth. Answers
-/// the dropped paths; refuses with every problem at once.
+/// the dropped paths; refuses with each problem at its path (five, then how many more), the
+/// release it was checked against, and the dropped paths as a warning.
 fn validate(
     target: &str,
+    release: Option<&str>,
     callable: &Callable,
     document: &mut Map<String, Value>,
 ) -> Result<Vec<String>, Error> {
@@ -1334,11 +1332,7 @@ fn validate(
         match document.get_mut(&field.name) {
             None if field.wire == Wire::Required => missing.push(describe::signature(field)),
             None => {}
-            Some(value) => {
-                if let Err(problem) = check_field(field, value, &field.name, &mut ignored) {
-                    problems.push(problem);
-                }
-            }
+            Some(value) => problems.extend(check_field(field, value, &field.name, &mut ignored)),
         }
     }
     ignored.sort();
@@ -1351,14 +1345,45 @@ fn validate(
     if problems.is_empty() {
         return Ok(ignored);
     }
-    Err(invalid(
-        "request_payload_invalid",
+    let package = target
+        .rsplit_once('/')
+        .map_or(target, |(package, _)| package);
+    let mut lines = vec![match release {
+        Some(release) => {
+            format!("{target} cannot take this request (checked against {package} {release}):")
+        }
+        None => format!("{target} cannot take this request:"),
+    }];
+    lines.extend(
+        problems
+            .iter()
+            .take(5)
+            .map(|problem| format!("  {problem}")),
+    );
+    if problems.len() > 5 {
+        lines.push(format!("  and {} more", problems.len() - 5));
+    }
+    lines.extend(ignored_warning(target, &ignored).map(|w| format!("warning: {w}")));
+    let refusal = invalid("request_payload_invalid", lines.join("\n"));
+    Err(match release {
+        Some(release) => refusal.next(format!("cozy run {target}@{release} --describe")),
+        None => refusal,
+    })
+}
+
+/// The warning for fields the payload named that the interface does not.
+fn ignored_warning(target: &str, ignored: &[String]) -> Option<String> {
+    let noun = if ignored.len() == 1 {
+        "field"
+    } else {
+        "fields"
+    };
+    (!ignored.is_empty()).then(|| {
         format!(
-            "{target} request payload is invalid: {}",
-            problems.join("; ")
-        ),
-    )
-    .remedy(describe::usage_line(target, callable)))
+            "ignored unknown {noun} {} — not in {target}'s interface",
+            ignored.join(", ")
+        )
+    })
 }
 
 fn check_field(
@@ -1366,27 +1391,41 @@ fn check_field(
     value: &mut Value,
     path: &str,
     ignored: &mut Vec<String>,
-) -> Result<(), String> {
-    check(&field.ty, value, path, ignored)?;
-    bounds(&field.constraints, value, path)
+) -> Vec<String> {
+    let problems = check(&field.ty, value, path, ignored);
+    match problems.is_empty() {
+        true => bounds(&field.constraints, value, path)
+            .err()
+            .into_iter()
+            .collect(),
+        false => problems,
+    }
 }
 
-/// Checks `value` against `ty`, dropping undeclared struct members into `ignored`.
-fn check(
-    ty: &Type,
-    value: &mut Value,
-    path: &str,
-    ignored: &mut Vec<String>,
-) -> Result<(), String> {
-    let ok = match (ty, &mut *value) {
-        (Type::Unknown | Type::Model, _) => true,
-        (Type::Str, Value::String(_))
+/// Checks `value` against `ty`: each problem at its path, every failing item and member. A union
+/// no branch takes answers for its closest branch, the one the value's shape is (then the one
+/// with fewest problems), never just that it matched none. Undeclared struct members are
+/// dropped into `ignored`.
+fn check(ty: &Type, value: &mut Value, path: &str, ignored: &mut Vec<String>) -> Vec<String> {
+    match (ty, &mut *value) {
+        (Type::Unknown | Type::Model, _)
+        | (Type::Str, Value::String(_))
         | (Type::Bool, Value::Bool(_))
-        | (Type::Null, Value::Null) => true,
-        (Type::Int, Value::Number(n)) => n.is_i64() || n.is_u64(),
-        (Type::Float, Value::Number(_)) => true,
-        (Type::Literal(members), value) => members.iter().any(|m| same(m, value)),
-        (Type::Asset(_) | Type::Tree, Value::String(s)) => !s.is_empty(),
+        | (Type::Null, Value::Null)
+        | (Type::Float, Value::Number(_)) => vec![],
+        (Type::Int, Value::Number(n)) if n.is_i64() || n.is_u64() => vec![],
+        (Type::Asset(_) | Type::Tree, Value::String(s)) if !s.is_empty() => vec![],
+        (Type::Literal(members), value) if members.iter().any(|m| same(m, value)) => vec![],
+        (Type::Literal(members), value) => {
+            let allowed: Vec<String> = (members.iter())
+                .map(|m| m.as_str().map_or_else(|| m.to_string(), str::to_owned))
+                .collect();
+            vec![format!(
+                "{path}: {} is not one of {}",
+                shown(value),
+                allowed.join(", ")
+            )]
+        }
         (
             Type::Union {
                 branches,
@@ -1394,9 +1433,8 @@ fn check(
             },
             value,
         ) => {
+            let mut closest: Option<(u8, Vec<String>, Vec<String>)> = None;
             for branch in branches {
-                let mut tried = value.clone();
-                let mut dropped = Vec::new();
                 let branch = match (branch, tag_field) {
                     (Type::Struct(s), Some(tag)) if s.tag_field.is_none() => {
                         Type::Struct(Box::new(Struct {
@@ -1406,32 +1444,53 @@ fn check(
                     }
                     _ => branch.clone(),
                 };
-                if check(&branch, &mut tried, path, &mut dropped).is_ok() {
+                let (mut tried, mut dropped) = (value.clone(), Vec::new());
+                let problems = check(&branch, &mut tried, path, &mut dropped);
+                if problems.is_empty() {
                     *value = tried;
                     ignored.extend(dropped);
-                    return Ok(());
+                    return vec![];
+                }
+                let shape = shape(&branch, value);
+                let closer = closest.as_ref().is_none_or(|(best, kept, _)| {
+                    shape > *best || shape == *best && problems.len() < kept.len()
+                });
+                if shape > 0 && closer {
+                    closest = Some((shape, problems, dropped));
                 }
             }
-            return Err(format!("{path} matches none of {}", describe::phrase(ty)));
+            match closest {
+                Some((_, problems, dropped)) => {
+                    ignored.extend(dropped);
+                    problems
+                }
+                None => vec![format!(
+                    "{path}: {} is not {}",
+                    shown(value),
+                    describe::phrase(ty)
+                )],
+            }
         }
         (Type::List(item), Value::Array(values)) => {
+            let mut problems = vec![];
             for (i, value) in values.iter_mut().enumerate() {
-                check(item, value, &format!("{path}[{i}]"), ignored)?;
+                problems.extend(check(item, value, &format!("{path}[{i}]"), ignored));
             }
-            true
+            problems
         }
         (Type::Map(item), Value::Object(values)) => {
+            let mut problems = vec![];
             for (key, value) in values.iter_mut() {
-                check(item, value, &format!("{path}.{key}"), ignored)?;
+                problems.extend(check(item, value, &format!("{path}.{key}"), ignored));
             }
-            true
+            problems
         }
         (Type::Struct(s), Value::Object(object)) => {
             if let Some(tag) = &s.tag_field
                 && s.tag.is_some()
                 && object.get(tag) != s.tag.as_ref()
             {
-                return Err(format!("{path} has an absent or other {tag}"));
+                return vec![format!("{path} has an absent or other {tag}")];
             }
             object.retain(|name, _| {
                 let keep = s.fields.iter().any(|f| &f.name == name)
@@ -1441,25 +1500,64 @@ fn check(
                 }
                 keep
             });
+            let mut problems = vec![];
             for field in &s.fields {
                 match object.get_mut(&field.name) {
-                    Some(value) => {
-                        check_field(field, value, &format!("{path}.{}", field.name), ignored)?
-                    }
+                    Some(value) => problems.extend(check_field(
+                        field,
+                        value,
+                        &format!("{path}.{}", field.name),
+                        ignored,
+                    )),
                     None if field.wire == Wire::Required => {
-                        return Err(format!("{path} omits required {}", field.name));
+                        problems.push(format!("{path} omits required {}", field.name));
                     }
                     None => {}
                 }
             }
-            true
+            problems
         }
-        _ => false,
-    };
-    if ok {
-        Ok(())
-    } else {
-        Err(format!("{path} is not {}", describe::phrase(ty)))
+        _ => vec![format!("{path} is not {}", describe::phrase(ty))],
+    }
+}
+
+/// How closely `value`'s shape is `ty`'s: 2 the same kind (a list for a list, an object for a
+/// struct whose tag it carries), 1 near (an object for a map), 0 another.
+fn shape(ty: &Type, value: &Value) -> u8 {
+    match (ty, value) {
+        (Type::Union { branches, .. }, value) => {
+            branches.iter().map(|b| shape(b, value)).max().unwrap_or(0)
+        }
+        (Type::Struct(s), Value::Object(object)) => match (&s.tag_field, &s.tag) {
+            (Some(tag), Some(expected)) if object.get(tag) != Some(expected) => 0,
+            _ => 2,
+        },
+        (Type::Map(_), Value::Object(_)) => 1,
+        (Type::List(_), Value::Array(_))
+        | (Type::Null, Value::Null)
+        | (Type::Bool, Value::Bool(_))
+        | (Type::Str | Type::Asset(_) | Type::Tree, Value::String(_))
+        | (Type::Int | Type::Float, Value::Number(_)) => 2,
+        (Type::Literal(members), value) => {
+            let kind = |v: &Value| std::mem::discriminant(v);
+            u8::from(members.iter().any(|m| kind(m) == kind(value))) * 2
+        }
+        _ => 0,
+    }
+}
+
+/// A value as a refusal quotes it: a scalar as written (a long string cut), else its kind.
+fn shown(value: &Value) -> String {
+    match value {
+        Value::String(s) if s.chars().count() > 40 => {
+            format!(
+                "{:?}",
+                format!("{}…", s.chars().take(39).collect::<String>())
+            )
+        }
+        Value::Array(_) => "a list".into(),
+        Value::Object(_) => "an object".into(),
+        value => value.to_string(),
     }
 }
 

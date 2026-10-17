@@ -65,7 +65,7 @@ pub async fn run(
         return Ok(ExitCode::SUCCESS);
     }
     let terms = super::terms(ctx, &args)?;
-    let bound = super::bind_callable(ctx, &target, callable, &terms)?;
+    let bound = super::bind::bind(&target, None, callable, &terms)?;
     if let Some(warning) = bound.warning(&target) {
         output::warn(ctx, &warning);
     }
