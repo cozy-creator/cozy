@@ -24,12 +24,13 @@ permissions:
 
 env:
   CGO_ENABLED: '0'
-  # Not yet in the `cozy` binary, and Linux-only until ported: reported, not judged.
-  IMPORTED: --exclude tensord --exclude tensorfs-core --exclude tensorfs-plane --exclude tensorfs-py
 
 jobs:
   build:
     name: ${{ matrix.os }}
+    env:
+      # TensorD and TensorFS are judged where they build (Linux); elsewhere reported until ported.
+      IMPORTED: ${{ !startsWith(matrix.os, 'ubuntu') && '--exclude tensord --exclude tensorfs-core --exclude tensorfs-plane --exclude tensorfs-py' || '' }}
     runs-on: ${{ matrix.os }}
     # Hang bound, not a work budget.
     timeout-minutes: 30
@@ -72,6 +73,7 @@ jobs:
 
       - name: TensorD and TensorFS (reported)
         id: imported
+        if: env.IMPORTED != ''
         continue-on-error: true
         run: cargo check ${IMPORTED//--exclude/-p} --all-targets --locked --message-format=short 2>&1 | tee imported.txt; exit "${PIPESTATUS[0]}"
 
