@@ -588,14 +588,14 @@ impl MachineBackend for NativeBackend {
             bundle_canonical_bytes: bytes,
         })
     }
-    fn log(&self, name: &str) -> Result<crate::logs::Log, Error> {
+    fn log(&self, name: &str) -> Result<cozy_platform::tail::Log, Error> {
         // TensorFS and TensorD's memory notes append to the store's logs, each rotating to one
         // older file; TensorD's own log rolls daily.
         let store = self.store.root().join("logs");
         match (name, &self.logs) {
-            ("tensorfs-transport", _) => Ok(crate::logs::Log::rotated(store, "transport.log")),
-            ("memory", _) => Ok(crate::logs::Log::rotated(store, "memory.log")),
-            ("tensord", Some(dir)) => Ok(crate::logs::Log::daily(dir.clone(), "tensord")),
+            ("tensorfs-transport", _) => Ok(cozy_platform::tail::Log::rotated(store, "transport.log")),
+            ("memory", _) => Ok(cozy_platform::tail::Log::rotated(store, "memory.log")),
+            ("tensord", Some(dir)) => Ok(cozy_platform::tail::Log::daily(dir.clone(), "tensord")),
             _ => Err(Error::not_found("log_not_found", format!("this machine keeps no log {name}"))),
         }
     }

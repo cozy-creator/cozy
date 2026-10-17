@@ -16,6 +16,7 @@ pub mod process;
 pub mod service;
 #[cfg(unix)]
 pub mod shm;
+pub mod tail;
 pub mod tools;
 pub mod watch;
 
