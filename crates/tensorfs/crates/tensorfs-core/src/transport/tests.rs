@@ -3803,10 +3803,17 @@ fn a_budget_one_byte_short_refuses_before_a_byte_moves_and_the_same_byte_admits(
     let store = store
         .bind_disk_budget(Some(SIX_BLOB_CLOSURE_BYTES - 1))
         .unwrap();
-    let refusal = pull(&request_for(&store, &origin.base, &policy)).unwrap_err();
+    // One request at a time, each object would land before the next is admitted: only the
+    // whole closure's admission refuses before a byte moves.
+    let mut one_at_a_time = request_for(&store, &origin.base, &policy);
+    one_at_a_time.streams = 1;
+    let refusal = pull(&one_at_a_time).unwrap_err();
     assert_eq!(refusal.code, Code::CAPACITY_EXHAUSTED, "{refusal}");
-    // "Before a byte moves" is proved by the store, not by the exit code: no object landed
-    // and no put- temp was even opened.
+    // "Before a byte moves" is proved by the origin and the store, not by the exit code: no
+    // object was asked for, none landed and no put- temp was even opened.
+    for object in &checkpoint.objects {
+        assert_eq!(origin.hits(&format!("/obj/{}", object.sha256)), 0, "an object was asked for");
+    }
     assert!(
         store.objects().unwrap().is_empty(),
         "the refusal still admitted objects"
@@ -3859,6 +3866,29 @@ fn the_budget_charges_what_the_pull_adds_not_what_it_declares() {
     let report = pull(&request_for(&store, &large_origin.base, &policy)).unwrap();
     assert_eq!(report.held, 3, "the three shared blobs were not credited");
     assert_eq!(store.occupancy().unwrap(), budget);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn a_pull_that_fits_once_gc_evicts_an_idle_cache_root_proceeds() {
+    let root = temporary("budget-after-gc");
+    let store = Store::init(&root).unwrap();
+    let policy = SourcePolicy::default();
+    // Its blobs are 16 KiB, so it shares nothing with the six-blob closure.
+    let idle = Arc::new(checkpoint_sizes(&[16 * 1024; 2]));
+    let idle_origin = hub_origin(Arc::clone(&idle), |_, _| None);
+    pull(&request_for(&store, &idle_origin.base, &policy)).unwrap();
+    assert_eq!(store.occupancy().unwrap(), closure_bytes(&idle));
+
+    // Room for the six-blob closure alone: it fits only once the idle root is gone.
+    let store = store.bind_disk_budget(Some(SIX_BLOB_CLOSURE_BYTES)).unwrap();
+    let wanted = Arc::new(checkpoint(6, 32 * 1024));
+    let wanted_origin = hub_origin(Arc::clone(&wanted), |_, _| None);
+    let report = pull(&request_for(&store, &wanted_origin.base, &policy)).unwrap();
+    assert_eq!(report.fetched, 8);
+    // Exactly the six-blob closure: the idle root's objects made the room.
+    assert_eq!(store.occupancy().unwrap(), SIX_BLOB_CLOSURE_BYTES);
+    assert!(idle.objects.iter().all(|object| !store.contains(&object.sha256)));
     let _ = std::fs::remove_dir_all(root);
 }
 

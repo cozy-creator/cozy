@@ -439,6 +439,12 @@ impl Fetcher {
         self
     }
 
+    /// What a whole checkpoint of `origin` lacks, admitted before a byte of it moves; what it
+    /// already `held` is kept from the GC that may make room.
+    pub(crate) fn admit_whole(&self, origin: &Origin, held: &[ObjectRef], bytes: u64, objects: u64) -> Result<()> {
+        self.0.shared.admit_whole(origin, held, bytes, objects)
+    }
+
     /// Interest in `objects` of `origin`, and in its structure, at `at`. Never blocks on the
     /// network: what is absent is queued, and the origin's closure resolved on its own thread.
     pub fn want(
@@ -1107,37 +1113,11 @@ impl Shared {
     }
 
     /// Admit `object`, which is open, against the disk beside every object admitted and not
-    /// yet landed, and set its bytes aside; relieve a short disk by GC first. One at a time,
-    /// so what one is refused never counts against another.
+    /// yet landed, and set its bytes aside. One at a time, so what one is refused never counts
+    /// against another.
     fn admit(&self, object: &ObjectRef, cell: &Cell) -> Result<()> {
         let _one = self.admitting.lock().unwrap();
-        let (reserved, admitted) = {
-            let state = self.state.lock().unwrap();
-            (state.reserved, state.admitted)
-        };
-        let need = || self.short(reserved + object.length, admitted + 1);
-        if let Some(short) = need()? {
-            let protected = self.protected();
-            let collected = {
-                let _collecting = self.gate.write().unwrap();
-                crate::gc::collect_cached_for(self.store.root(), &protected, short)
-            };
-            if let Some(short) = need()? {
-                let why = collected
-                    .err()
-                    .map_or(String::new(), |r| format!("; GC could not run: {r}"));
-                return refuse(
-                    Code::CAPACITY_EXHAUSTED,
-                    format!(
-                        "{} needs {} B beside {reserved} B admitted; the disk under {} is {short} B \
-                         short after GC{why}",
-                        object.id(),
-                        object.length,
-                        self.store.root().display(),
-                    ),
-                );
-            }
-        }
+        self.room(&object.id(), object.length, 1, None)?;
         let mut state = self.state.lock().unwrap();
         let state = &mut *state;
         if let Some(entry) = state.entries.get_mut(&object.sha256) {
@@ -1165,6 +1145,60 @@ impl Shared {
     }
 
     /// The manifests of every origin a live ticket names: GC keeps their present objects.
+    /// What a whole checkpoint of `origin` lacks, `bytes` in `objects`, admitted before a byte
+    /// of it moves: a pull that cannot land is refused whole, not after its first objects did.
+    /// Each object is still admitted as it opens, where pulls racing for the same space meet.
+    fn admit_whole(&self, origin: &Origin, held: &[ObjectRef], bytes: u64, objects: u64) -> Result<()> {
+        let owner = crate::meta::owner(self.store.root());
+        let hold = match held.is_empty() {
+            true => None,
+            false => Some({
+                let _admitting = owner.as_ref().map(|owner| owner.gate.read().unwrap());
+                self.meta.read_hold(owner.as_ref(), held)?
+            }),
+        };
+        let admitted = {
+            let _one = self.admitting.lock().unwrap();
+            let what = format!("{} ({objects} absent objects)", origin.manifest.id());
+            self.room(&what, bytes, objects, Some(&origin.manifest))
+        };
+        if let Some(hold) = hold {
+            hold.release(&self.meta)?;
+        }
+        admitted
+    }
+
+    /// Room for `bytes` in `objects` beside every object admitted and not yet landed. A short
+    /// disk is relieved by GC first, which keeps every checkpoint a ticket wants and `keeping`.
+    fn room(&self, what: &str, bytes: u64, objects: u64, keeping: Option<&ObjectRef>) -> Result<()> {
+        let (reserved, admitted) = {
+            let state = self.state.lock().unwrap();
+            (state.reserved, state.admitted)
+        };
+        let need = || self.short(reserved + bytes, admitted + objects);
+        let Some(short) = need()? else {
+            return Ok(());
+        };
+        let mut protected = self.protected();
+        protected.extend(keeping.map(|manifest| manifest.sha256.clone()));
+        let collected = {
+            let _collecting = self.gate.write().unwrap();
+            crate::gc::collect_cached_for(self.store.root(), &protected, short)
+        };
+        let Some(short) = need()? else {
+            return Ok(());
+        };
+        let why = collected.err().map_or(String::new(), |r| format!("; GC could not run: {r}"));
+        refuse(
+            Code::CAPACITY_EXHAUSTED,
+            format!(
+                "{what} needs {bytes} B beside {reserved} B admitted; the disk under {} is {short} B short \
+                 after GC{why}",
+                self.store.root().display(),
+            ),
+        )
+    }
+
     fn protected(&self) -> Vec<String> {
         let state = self.state.lock().unwrap();
         state
