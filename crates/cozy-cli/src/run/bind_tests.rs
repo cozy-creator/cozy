@@ -658,3 +658,98 @@ fn an_input_files_video_list_is_staged_from_beside_it() {
     );
     assert_eq!(named.files[2].path, dir.join("shots/b.mp4"));
 }
+
+/// The next minimax-h3 moves clips into named references (`kind: video`): a nullable video file
+/// nested in a list of objects, `references.<i>.video`, binds from a YAML `--input` relative to
+/// the file (or under `~`) and is staged as its own input, as `videos.<i>` is. The card is
+/// 1.39.0's with that field added.
+#[test]
+fn a_reference_video_in_an_input_file_is_staged_from_beside_it() {
+    let mut card =
+        super::super::interface::tests::card("minimax-h3-1.39.0")["package_interface"].clone();
+    let ref2va = card["entrypoints"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|e| e["name"] == "ref2va")
+        .unwrap();
+    let references = ref2va["request"]["fields"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|f| f["name"] == "references")
+        .unwrap();
+    let item = &mut references["type"]["union"][1]["list"];
+    item["fields"][1]["type"]["literal"]
+        .as_array_mut()
+        .unwrap()
+        .push("video".into());
+    item["fields"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"asset_bound": {"max_bytes": 268435456},
+        "name": "video", "type": {"union": ["null", {"asset": "video"}]}, "wire": "optional"}));
+    let h3 = Case {
+        read: Interface::parse(&card).unwrap(),
+        ..Case::new("sdxl-2.10.0")
+    };
+    let dir = h3.dir.path();
+    let clip = |n: u8| [MP4, &[n]].concat();
+    std::fs::create_dir_all(dir.join("shoot/clips")).unwrap();
+    std::fs::create_dir_all(dir.join("home/clips")).unwrap();
+    std::fs::write(dir.join("shoot/juno.png"), PNG).unwrap();
+    std::fs::write(dir.join("shoot/clips/dance.mp4"), clip(1)).unwrap();
+    std::fs::write(dir.join("home/clips/rain.mp4"), clip(2)).unwrap();
+    let yaml = dir.join("shoot/request.yaml");
+    std::fs::write(
+        &yaml,
+        "prompt: <Juno> dances in the rain\nduration_s: 10\nreferences:\n  \
+         - {name: <Juno>, kind: character, image: juno.png}\n  \
+         - {name: dance, kind: video, video: clips/dance.mp4}\n  \
+         - {name: rain, kind: video, video: ~/clips/rain.mp4}\n",
+    )
+    .unwrap();
+    let terms = Terms {
+        input_file: Some(yaml),
+        ..h3.terms(&[])
+    };
+    let bound = h3.bind("ref2va", &terms).unwrap();
+    let references = &bound.payload["references"];
+    assert_eq!(
+        (
+            &references[1]["video"],
+            &references[2]["video"],
+            &references[1]["kind"]
+        ),
+        (
+            &json!(digest_of(&clip(1))),
+            &json!(digest_of(&clip(2))),
+            &json!("video")
+        )
+    );
+    let staged: Vec<(&str, &str, &Path)> = bound
+        .files
+        .iter()
+        .map(|f| (f.field.as_str(), f.media_type.as_str(), f.path.as_path()))
+        .collect();
+    assert_eq!(
+        staged,
+        [
+            (
+                "references.0.image",
+                "image/png",
+                dir.join("shoot/juno.png").as_path()
+            ),
+            (
+                "references.1.video",
+                "video/mp4",
+                dir.join("shoot/clips/dance.mp4").as_path()
+            ),
+            (
+                "references.2.video",
+                "video/mp4",
+                dir.join("home/clips/rain.mp4").as_path()
+            ),
+        ]
+    );
+}
