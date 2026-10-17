@@ -101,7 +101,9 @@ fn published_lock(url: &str, account: &str, name: &str, release: &str) -> String
 /// - A package naming its author's packages through `{ index = "tensorhub" }` locks against that
 ///   account's index on this Hub without its authored files changing, and publishes.
 /// - Another account publishes the same tree: its lock is rebound to that account's index, every
-///   version kept.
+///   version kept, a newer release there included (minimax-h3 1.41.2 was refused when uv
+///   re-resolved its describer to the newest); a pin that account does not publish is refused
+///   by name.
 /// - Addressed where it listens rather than at its public origin, the Hub's index is still the
 ///   public one: `lock` binds it, and `publish` relocks a lock made against the listen address.
 /// - A yank is idempotent and shows in `info`.
@@ -170,21 +172,43 @@ fn packages_lock_publish_and_yank_on_a_real_hub() {
     let Some((second, other)) = publisher("second@cozy.test") else {
         return;
     };
-    for fixture in ["tiny", "tiny-user"] {
-        let dir = project(&second, fixture);
-        std::fs::copy(
-            home.path().join("src").join(fixture).join("uv.lock"),
-            dir.join("uv.lock"),
-        )
-        .unwrap();
-        let published = json(&second, &dir, &["package", "publish"]);
-        assert_eq!(
-            published["package"],
-            format!("{other}/{fixture}"),
-            "{published}"
-        );
-        assert_eq!(published["status"], "published", "{published}");
-    }
+    let first_lock = |fixture: &str| home.path().join("src").join(fixture).join("uv.lock");
+    let user_two = project(&second, "tiny-user");
+    std::fs::copy(first_lock("tiny-user"), user_two.join("uv.lock")).unwrap();
+    let unmet = refused(&second, &user_two, &["package", "publish"]);
+    assert_eq!(unmet["code"], "account_index_pin_unpublished", "{unmet}");
+    assert!(
+        unmet["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(&format!("{other}/tiny 0.1.0")),
+        "{unmet}"
+    );
+    let tiny_two = project(&second, "tiny");
+    std::fs::copy(first_lock("tiny"), tiny_two.join("uv.lock")).unwrap();
+    let published = json(&second, &tiny_two, &["package", "publish"]);
+    assert_eq!(published["package"], format!("{other}/tiny"), "{published}");
+    assert_eq!(published["status"], "published", "{published}");
+    let newer =
+        read(tiny_two.join("pyproject.toml")).replace("version = \"0.1.0\"", "version = \"0.2.0\"");
+    std::fs::write(tiny_two.join("pyproject.toml"), newer).unwrap();
+    json(&second, &tiny_two, &["package", "lock"]);
+    assert_eq!(
+        json(&second, &tiny_two, &["package", "publish"])["status"],
+        "published"
+    );
+    let published = json(&second, &user_two, &["package", "publish"]);
+    assert_eq!(
+        published["package"],
+        format!("{other}/tiny-user"),
+        "{published}"
+    );
+    assert_eq!(published["status"], "published", "{published}");
+    let lock = published_lock(&url, &other, "tiny-user", "0.1.0");
+    assert!(
+        lock.contains("/tiny/0.1.0/") && !lock.contains("/tiny/0.2.0/"),
+        "{lock}"
+    );
 
     // The first account addressing its Hub where the Hub listens (TENSORHUB_URL), as a laptop names
     // its local Hub: the index it locks against is still the one at the Hub's public origin, and
