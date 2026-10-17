@@ -123,7 +123,7 @@ struct Kernel {
 }
 
 /// One kernel choice the executor confessed: `attention.selected` and `gemm.selected` per
-/// component, `gemm.fallback` when a component's GEMM leaf could not serve.
+/// component, `gemm.fallback` when a component's GEMM leaf could not serve (its log warns).
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct Observation {
@@ -194,8 +194,6 @@ pub async fn exec(ctx: &Context, id: &str) -> Result<ExitCode, Error> {
         gpu_rows,
     );
     gpus.print(ctx, "attention kernels");
-    let fallbacks = grid(&["COMPONENT", "WARNING"], &measured, fallback_rows);
-    fallbacks.print(ctx, "warnings");
     if !run.calls.is_empty() {
         anstream::println!("\ncalls");
         let mut table =
@@ -402,7 +400,8 @@ fn model_rows(measured: &Measured) -> Vec<Vec<String>> {
     measured.models.iter().map(row).collect()
 }
 
-/// Each component's attention and GEMM kernels (a 16-bit lane's components have no GEMM row).
+/// Each component's attention and GEMM kernels (a 16-bit lane's components have no GEMM row),
+/// a GEMM that served below its lane with what it wanted and why.
 fn component_rows(measured: &Measured) -> Vec<Vec<String>> {
     let measured = &measured.m;
     let mut components: BTreeMap<&str, [String; 2]> = BTreeMap::new();
@@ -411,6 +410,15 @@ fn component_rows(measured: &Measured) -> Vec<Vec<String>> {
         let (column, said) = match o.name.as_str() {
             "attention.selected" => (0, o.value()),
             "gemm.selected" => (1, format!("{} ({})", o.value(), fields.format)),
+            "gemm.fallback" => {
+                let kernel = o.value();
+                let served = [&fields.format, &fields.served]
+                    .into_iter()
+                    .find(|s| !s.is_empty() && **s != kernel);
+                let served = served.map_or(String::new(), |s| format!("{s}; "));
+                let (wanted, reason) = (&fields.wanted, &fields.reason);
+                (1, format!("{kernel} ({served}wanted {wanted}: {reason})"))
+            }
             _ => continue,
         };
         let cell = &mut components.entry(&fields.component).or_default()[column];
@@ -423,29 +431,6 @@ fn component_rows(measured: &Measured) -> Vec<Vec<String>> {
         vec![component.to_owned(), or_dash(&attention), or_dash(&gemm)]
     };
     components.into_iter().map(row).collect()
-}
-
-/// Each component whose GEMM leaf could not serve, as one warning line: what it wanted, what
-/// served instead and why.
-fn fallback_rows(measured: &Measured) -> Vec<Vec<String>> {
-    let measured = &measured.m;
-    let fallbacks = measured
-        .observations
-        .iter()
-        .filter(|o| o.name == "gemm.fallback");
-    let row = |o: &Observation| {
-        let (f, kernel) = (&o.fields, o.value());
-        let on = match kernel == f.served {
-            true => String::new(),
-            false => format!(" on {kernel}"),
-        };
-        let said = format!(
-            "GEMM wanted {}, served {}{on}: {}",
-            f.wanted, f.served, f.reason
-        );
-        vec![f.component.clone(), said]
-    };
-    fallbacks.map(row).collect()
 }
 
 /// Every GPU's attention kernels: the one that served, and the others with why not.
@@ -631,10 +616,10 @@ mod tests {
         assert!(denoise[3].starts_with("8 × "), "{denoise:?}");
     }
 
-    /// The machine's resolution and the executor's GEMM leaves, as TensorD and Runtime (#1519)
-    /// record them: each call's slot with its release and lane (run 10236's background removal
-    /// resolved `paul/birefnet@0.1.0 fp16`), each component's GEMM kernel beside its attention,
-    /// and a leaf that could not serve as one warning line.
+    /// The machine's resolution and the executor's GEMM leaves, as TensorD and Runtime (#1519,
+    /// #1522) record them: each call's slot with its release and lane (run 10236's background
+    /// removal resolved `paul/birefnet@0.1.0 fp16`), and each component's GEMM kernel beside its
+    /// attention, one that served below its lane with what it wanted and why.
     #[test]
     fn a_calls_resolved_models_and_gemm_leaves_show_beside_its_attention() {
         let mut calls = h3_calls();
@@ -643,15 +628,18 @@ mod tests {
         calls[0].measurements.as_mut().unwrap()["models"] = birefnet;
         let measurements = calls[1].measurements.as_mut().unwrap();
         let observations = measurements["observations"].as_array_mut().unwrap();
-        observations.push(
-            serde_json::json!({"kind": "confession", "name": "gemm.selected",
-            "value": "cozy-int8", "fields": {"component": "base_model/ref2va_dit", "format": "int8",
-            "leaf": "cozy.int8-convrot256.native-leaf/1", "sites": 416}}),
-        );
-        observations.push(serde_json::json!({"kind": "confession", "name": "gemm.fallback",
-            "value": "torch.linear", "fields": {"component": "base_model/video_vae", "wanted": "fp8",
-            "served": "bf16", "reason": "the leaf refused its shape", "sites": 4}}));
-        let mut measured = measured(None, &calls);
+        observations.extend([
+            serde_json::json!({"kind": "confession", "name": "gemm.selected", "value": "cozy-int8",
+                "fields": {"component": "base_model/ref2va_dit", "format": "int8",
+                "leaf": "cozy.int8-convrot256.native-leaf/1", "sites": 416}}),
+            serde_json::json!({"kind": "confession", "name": "gemm.fallback", "value": "torch.linear",
+                "fields": {"component": "base_model/video_vae", "wanted": "fp8", "served": "bf16",
+                "reason": "the leaf refused its shape", "sites": 4}}),
+            serde_json::json!({"kind": "confession", "name": "gemm.fallback", "value": "torch._int_mm",
+                "fields": {"component": "base_model/audio_vae", "wanted": "cozy-int8",
+                "served": "torch._int_mm", "reason": "the op library did not load", "sites": 1}}),
+        ]);
+        let measured = measured(None, &calls);
         let models = grid(&["SLOT", "MODEL", "LANE"], &measured, model_rows);
         assert_eq!(
             rows(&models),
@@ -665,35 +653,23 @@ mod tests {
         assert_eq!(
             rows(&components)[..3],
             [
-                ["1", "base_model/audio_vae", "sdpa", "-"],
+                [
+                    "1",
+                    "base_model/audio_vae",
+                    "sdpa",
+                    "torch._int_mm (wanted cozy-int8: the op library did not load)"
+                ],
                 [
                     "1",
                     "base_model/ref2va_dit",
                     "kitchen-sol-producer-fast-shared-qkv",
                     "cozy-int8 (int8)"
                 ],
-                ["1", "base_model/video_vae", "sdpa", "-"],
-            ]
-        );
-        // A failed 8-bit library's fallback names its kernel once.
-        let library = serde_json::json!({"kind": "confession", "name": "gemm.fallback",
-            "value": "torch._int_mm", "fields": {"component": "base_model/audio_vae", "wanted": "cozy-int8",
-            "served": "torch._int_mm", "reason": "the op library did not load", "sites": 1}});
-        let library = serde_json::from_value(library).unwrap();
-        measured[1].m.observations.push(library);
-        let warnings = grid(&["COMPONENT", "WARNING"], &measured, fallback_rows);
-        assert_eq!(
-            rows(&warnings),
-            [
                 [
                     "1",
                     "base_model/video_vae",
-                    "GEMM wanted fp8, served bf16 on torch.linear: the leaf refused its shape"
-                ],
-                [
-                    "1",
-                    "base_model/audio_vae",
-                    "GEMM wanted cozy-int8, served torch._int_mm: the op library did not load"
+                    "sdpa",
+                    "torch.linear (bf16; wanted fp8: the leaf refused its shape)"
                 ],
             ]
         );
