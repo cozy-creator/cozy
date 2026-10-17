@@ -4215,7 +4215,7 @@ dependencies = [
 
 [[package]]
 name = "tensord"
-version = "0.7.3"
+version = "0.9.6"
 dependencies = [
  "aws-lc-rs",
  "axum",
