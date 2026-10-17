@@ -426,7 +426,10 @@ fn a_process_takes_its_role_name() {
 
 fn the_gpu_probe_answers_without_a_driver() {
     assert!(gpu::probe(Some("")).unwrap().is_empty());
-    let gpus = gpu::probe(None).unwrap();
+    gpu::memory_classes(&mut []).unwrap();
+    let mut gpus = gpu::probe(None).unwrap();
+    let probed = gpus.clone();
+    gpu::memory_classes(&mut gpus).unwrap();
     let driver = if cfg!(target_os = "linux") {
         Path::new("/dev/nvidiactl").exists()
     } else {
@@ -435,16 +438,19 @@ fn the_gpu_probe_answers_without_a_driver() {
     if !driver {
         assert!(gpus.is_empty(), "no NVIDIA driver, yet {gpus:?}");
     }
-    for gpu in &gpus {
+    for (gpu, probed) in gpus.iter().zip(&probed) {
         assert!(
             gpu.uuid.starts_with("GPU-") && !gpu.name.is_empty() && !gpu.driver.is_empty(),
             "{gpu:?}"
         );
+        // An integrated GPU (GB10) has no framebuffer of its own.
+        let unified = gpu.memory_class == Some(gpu::MemoryClass::Unified);
         assert!(
-            gpu.memory_bytes > 0 && !gpu.pci_bus_id.is_empty(),
+            (gpu.memory_bytes > 0 || unified) && !gpu.pci_bus_id.is_empty(),
             "{gpu:?}"
         );
-        assert_eq!(gpu::probe(Some(&gpu.uuid)).unwrap(), vec![gpu.clone()]);
+        assert!(gpu.compute_capability.is_some() && gpu.memory_class.is_some(), "{gpu:?}");
+        assert_eq!(gpu::probe(Some(&gpu.uuid)).unwrap(), vec![probed.clone()]);
     }
 }
 
