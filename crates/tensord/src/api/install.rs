@@ -218,7 +218,6 @@ fn installer(config: &InstallerConfig, root: &RootSet) -> Result<Command, Error>
             .map_err(|e| Error::unavailable("unavailable", format!("the installer helper: {e}")))?;
     }
     let mut command = Command::new(&config.helper_python);
-    #[cfg(unix)]
     cozy_platform::process::inherit_nothing(&mut command);
     // The uploaded build backend runs here: it gets the machine's environment without
     // credentials or Runtime-owned names, never the whole service environment.
@@ -259,9 +258,7 @@ fn installer(config: &InstallerConfig, root: &RootSet) -> Result<Command, Error>
 /// with its run's cancel (`stop`), or when it stops moving past its measured patience
 /// (`process::supervise`); a long install that moves is never killed.
 fn publish(config: &InstallerConfig, mut command: Command, stop: Option<&PullCancellation>) -> Result<PreparedGeneration, Error> {
-    #[cfg(unix)]
-    std::os::unix::process::CommandExt::process_group(&mut command, 0);
-    let mut child = command
+    let mut child = cozy_platform::process::own_group(&mut command)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

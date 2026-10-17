@@ -16,10 +16,10 @@ use std::{
     collections::{HashMap, HashSet},
     fs::{self, File},
     io,
-    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime},
 };
+use cozy_platform::durable::{self, FileId};
 use tensorfs_core::store::Store;
 
 pub use tensorfs_core::admission::Disk;
@@ -155,7 +155,7 @@ impl Entry {
 /// it is held (an executor of it still runs); reclaim removes it once nothing names it.
 pub fn remove_generation(generations: &Path, identity: &str) -> io::Result<Option<u64>> {
     let path = generations.join(identity);
-    let Ok(filesystem) = fs::metadata(&path).map(|m| m.dev()) else {
+    let Ok(filesystem) = durable::device(&path) else {
         return Ok(Some(0));
     };
     let bytes = releasable(&path, filesystem, &open_files()).unwrap_or(0);
@@ -209,30 +209,34 @@ fn remove(path: &Path) -> bool {
     }
 }
 
-/// Files this process holds open, by (device, inode): unlinking one frees nothing yet.
-fn open_files() -> HashSet<(u64, u64)> {
+/// Files this process holds open: unlinking one frees nothing yet. Linux lists them; elsewhere
+/// none are known (Windows refuses to delete an open file anyway).
+fn open_files() -> HashSet<FileId> {
     let Ok(descriptors) = fs::read_dir("/proc/self/fd") else {
         return HashSet::new();
     };
     descriptors
         .flatten()
-        .filter_map(|fd| fs::metadata(fd.path()).ok())
-        .map(|m| (m.dev(), m.ino()))
+        .filter_map(|fd| FileId::at(&fd.path()).ok())
         .collect()
 }
 
 /// Bytes unlinking `path` frees on `filesystem`, or None when something under it is open
 /// here. Multiply linked files free nothing (uv environments share payload with a cache);
 /// symlinks are not followed and another mount is never counted.
-fn releasable(path: &Path, filesystem: u64, open: &HashSet<(u64, u64)>) -> Option<u64> {
+fn releasable(path: &Path, filesystem: u64, open: &HashSet<FileId>) -> Option<u64> {
     let metadata = fs::symlink_metadata(path).ok()?;
-    if metadata.dev() != filesystem || metadata.file_type().is_symlink() {
+    if metadata.file_type().is_symlink() {
         return Some(0);
     }
-    if open.contains(&(metadata.dev(), metadata.ino())) {
+    let id = FileId::at(path).ok()?;
+    if id.dev != filesystem {
+        return Some(0);
+    }
+    if open.contains(&id) {
         return None;
     }
-    let own = metadata.blocks() * 512;
+    let own = durable::allocated(&metadata);
     if metadata.is_dir() {
         fs::read_dir(path)
             .ok()?
@@ -240,7 +244,7 @@ fn releasable(path: &Path, filesystem: u64, open: &HashSet<(u64, u64)>) -> Optio
             .try_fold(own, |total, entry| {
                 Some(total + releasable(&entry.path(), filesystem, open)?)
             })
-    } else if metadata.nlink() == 1 {
+    } else if durable::links(path).ok()? == 1 {
         Some(own)
     } else {
         Some(0)
@@ -360,14 +364,13 @@ fn remove_pointer(pointer: &Path) {
 /// has another link, or cannot be read.
 fn unlinked_since(path: &Path) -> Option<SystemTime> {
     let metadata = fs::symlink_metadata(path).ok()?;
-    let nanos = Duration::new(metadata.ctime().max(0) as u64, metadata.ctime_nsec() as u32);
-    let changed = UNIX_EPOCH + nanos;
+    let changed = durable::changed(path).ok()?;
     if metadata.is_dir() {
         let children = fs::read_dir(path).ok()?.flatten();
         children
             .map(|entry| unlinked_since(&entry.path()))
             .try_fold(changed, |newest, child| Some(newest.max(child?)))
-    } else if metadata.is_file() && metadata.nlink() > 1 {
+    } else if metadata.is_file() && durable::links(path).ok()? > 1 {
         None
     } else {
         Some(changed)
@@ -481,11 +484,11 @@ pub fn sweep(caches: &Caches) -> io::Result<Swept> {
         }
     }
 
-    let filesystem = fs::metadata(root)?.dev();
+    let filesystem = durable::device(root)?;
     let store = caches.store.as_ref();
     // A store on its own filesystem is relieved under TensorFS's rule for it.
     let shared = match store {
-        Some(store) if fs::metadata(store.store.root())?.dev() != filesystem => {
+        Some(store) if durable::device(store.store.root())? != filesystem => {
             let relief = tensorfs_core::admission::relieve(store.store, &store.keep);
             swept.store_bytes += relief.map_err(io::Error::other)?.collected_bytes;
             None

@@ -13,10 +13,7 @@ use std::{
     io::{self, Read, Write},
     os::{
         fd::{AsRawFd, FromRawFd},
-        unix::{
-            ffi::OsStrExt,
-            fs::{OpenOptionsExt, PermissionsExt},
-        },
+        unix::ffi::OsStrExt,
     },
     path::{Component, Path, PathBuf},
     sync::{Arc, Condvar, Mutex, OnceLock, Weak},
@@ -135,11 +132,11 @@ type Stop = Arc<dyn Fn() -> io::Result<()> + Send + Sync>;
 impl Engine {
     pub fn open(root: &Path) -> io::Result<Arc<Self>> {
         fs::create_dir_all(root)?;
-        fs::set_permissions(root, fs::Permissions::from_mode(0o700))?;
+        cozy_platform::durable::set_mode(root, 0o700)?;
         for name in ["staging", "results"] {
             fs::create_dir_all(root.join(name))?;
         }
-        File::open(root)?.sync_all()?;
+        cozy_platform::durable::sync_dir(root)?;
         let mut journal = Journal::open(root)?;
         journal.interrupt_preparations()?;
         Ok(Arc::new(Self {
@@ -1032,11 +1029,9 @@ impl Engine {
         for (index, name) in paths.into_iter().enumerate() {
             let mut source = open_artifact(output_root, Path::new(&name))?;
             let temporary = destination.join(format!("{index}.pending"));
-            let mut output = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&temporary)?;
+            let mut output =
+                cozy_platform::durable::Mode::mode(OpenOptions::new().write(true).create_new(true), 0o600)
+                    .open(&temporary)?;
             let mut hash = tensorfs_core::sha256::Sha256::new();
             let mut length = 0;
             let mut buffer = [0; 64 * 1024];
@@ -1050,7 +1045,7 @@ impl Engine {
                 length += count as u64;
             }
             let digest = tensorfs_core::sha256::hex(&hash.finish());
-            output.set_permissions(fs::Permissions::from_mode(0o400))?;
+            cozy_platform::durable::set_file_mode(&output, 0o400)?;
             output.sync_all()?;
             let filename = format!("{index}-{digest}");
             fs::rename(&temporary, destination.join(&filename))?;
@@ -1307,13 +1302,16 @@ mod tests {
             });
             engine.get(&id).unwrap()
         };
-        let escaped = run("symlink", |path| std::os::unix::fs::symlink("/etc/passwd", path).unwrap());
-        assert_eq!(escaped.state, State::Failed);
-        let fifo = run("fifo", |path| {
-            let name = CString::new(path.as_os_str().as_bytes()).unwrap();
-            assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
-        });
-        assert_eq!(fifo.state, State::Failed);
+        #[cfg(unix)]
+        {
+            let escaped = run("symlink", |path| std::os::unix::fs::symlink("/etc/passwd", path).unwrap());
+            assert_eq!(escaped.state, State::Failed);
+            let fifo = run("fifo", |path| {
+                let name = CString::new(path.as_os_str().as_bytes()).unwrap();
+                assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+            });
+            assert_eq!(fifo.state, State::Failed);
+        }
         let held = run("held", |path| fs::write(path, b"17,39\n").unwrap());
         assert_eq!(held.state, State::Completed, "{held:?}");
         assert!(!root.join("staging").join(&held.id).exists(), "the spool goes once settled");
@@ -1321,7 +1319,7 @@ mod tests {
         engine.open_result(&held.id, 0).unwrap().read_to_string(&mut bytes).unwrap();
         assert_eq!(bytes, "17,39\n");
         let path = root.join(&held.result.unwrap().artifacts[0].path);
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        cozy_platform::durable::set_mode(&path, 0o600).unwrap();
         fs::write(&path, b"corrupted").unwrap();
         assert_eq!(engine.open_result(&held.id, 0).unwrap_err().kind(), io::ErrorKind::InvalidData);
         drop(engine);

@@ -15,6 +15,11 @@ pub mod execution;
 mod gpu_allocation;
 pub mod gpu_service;
 pub mod held_models;
+#[cfg(unix)]
+pub mod host_tier;
+/// Off where the OS has no sealed shared memory.
+#[cfg(not(unix))]
+#[path = "host_tier_off.rs"]
 pub mod host_tier;
 pub mod hub;
 pub mod calls;

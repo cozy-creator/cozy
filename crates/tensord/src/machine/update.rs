@@ -641,9 +641,7 @@ impl Updates {
         let pair: Vec<String> = wheels(candidate).into_iter().map(|(_, _, p)| p.display().to_string() + "\n").collect();
         super::client::ensure_uv(&self.paths.uv)?;
         let mut command = std::process::Command::new(&self.paths.uv);
-        #[cfg(unix)]
-        std::os::unix::process::CommandExt::process_group(&mut command, 0);
-        let mut child = command
+        let mut child = cozy_platform::process::own_group(&mut command)
             .args(["pip", "compile", "--quiet", "--no-config", "--no-cache", "--no-header", "--python", "3.12", "-"])
             .current_dir(candidate)
             .stdin(Stdio::piped())
