@@ -45,6 +45,8 @@ pub struct Terms {
     /// Where relative paths start, and what `~` means.
     pub cwd: PathBuf,
     pub user_home: PathBuf,
+    /// Where input files' digests are remembered across runs; None reads each file every time.
+    pub digests: Option<PathBuf>,
 }
 
 #[derive(Debug, Default, PartialEq)]
@@ -704,7 +706,7 @@ impl Binder<'_> {
                     ),
                 ));
             }
-            let digest = digest(&path)?;
+            let digest = super::digests::of(self.terms.digests.as_deref(), &path)?;
             set_path(
                 &mut self.document,
                 &parts,
@@ -1641,25 +1643,6 @@ fn sniff(path: &Path) -> Result<Sniffed, Error> {
         length,
         media_type: media_type.to_owned(),
     })
-}
-
-fn digest(path: &Path) -> Result<Digest, Error> {
-    let mut file = File::open(path).map_err(|e| {
-        Error::new(
-            Kind::NotFound,
-            "input_file_unreadable",
-            format!("input file {}: {e}", path.display()),
-        )
-    })?;
-    let mut hasher = Sha256::new();
-    std::io::copy(&mut file, &mut hasher).map_err(|e| {
-        Error::new(
-            Kind::Internal,
-            "input_file_unreadable",
-            format!("input file {}: {e}", path.display()),
-        )
-    })?;
-    Ok(Digest::from_bytes(hasher.finalize().into()))
 }
 
 /// A LoRA strength as a canonical decimal string: finite, `0` for zero.

@@ -560,3 +560,171 @@ fn a_runs_adjustments_reach_its_record() {
         assert!(shown.stdout.contains(line), "{line:?} not in {shown:?}");
     }
 }
+
+/// Counts the bytes sent to `target` through it: a TCP relay a machine is added behind.
+struct Relay {
+    address: String,
+    sent: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl Relay {
+    fn to(target: &str) -> Self {
+        use std::{
+            io::{Read as _, Write as _},
+            net::{Shutdown, TcpListener, TcpStream},
+            sync::{
+                Arc,
+                atomic::{AtomicU64, Ordering},
+            },
+        };
+        fn pump(mut from: TcpStream, mut to: TcpStream, count: Option<Arc<AtomicU64>>) {
+            let mut buffer = vec![0; 64 << 10];
+            while let Ok(read @ 1..) = from.read(&mut buffer) {
+                if to.write_all(&buffer[..read]).is_err() {
+                    break;
+                }
+                if let Some(count) = &count {
+                    count.fetch_add(read as u64, Ordering::Relaxed);
+                }
+            }
+            let _ = to.shutdown(Shutdown::Write);
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let sent = Arc::new(AtomicU64::new(0));
+        let (target, counted) = (target.to_owned(), sent.clone());
+        std::thread::spawn(move || {
+            for client in listener.incoming().flatten() {
+                let Ok(machine) = TcpStream::connect(&target) else {
+                    continue;
+                };
+                let (back, forth) = (machine.try_clone().unwrap(), client.try_clone().unwrap());
+                let counted = counted.clone();
+                std::thread::spawn(move || pump(client, machine, Some(counted)));
+                std::thread::spawn(move || pump(back, forth, None));
+            }
+        });
+        Self { address, sent }
+    }
+
+    fn sent(&self) -> u64 {
+        self.sent.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// Owner: "inputs that were already uploaded shouldn't be uploaded again by the client". A second
+/// run with the same video and image to the same machine sends none of their bytes (counted on
+/// the way to the machine) and says it reused them; the client read each file once, its digest
+/// remembered by the file's path, length and time.
+#[test]
+fn a_second_run_reuses_the_video_and_image_its_machine_holds() {
+    let Some(home) = Home::new() else { return };
+    if std::env::var_os("COZY_TEST_TENSORD").is_none() {
+        eprintln!("skipped: no TensorD (COZY_TEST_TENSORD is unset)");
+        return;
+    }
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let mut machine =
+        common::tensord::Tensord::start_on(Some(port), &[common::tensord::stranger()], &[]);
+    let relay = Relay::to(&machine.address);
+    let fingerprint = machine.fingerprint.clone();
+    let add = || {
+        home.cozy([
+            "machine",
+            "add",
+            "m1",
+            &relay.address,
+            "--fingerprint",
+            &fingerprint,
+            "--json",
+        ])
+    };
+    machine.restart(&[common::tensord::key_to_authorize(&add())]);
+    let added = add();
+    assert_eq!(added.code, 0, "{added:?}");
+
+    let work = home.path().join("work");
+    copy(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/package/tiny"),
+        &work.join("tiny"),
+    );
+    let code = work.join("tiny/tiny/__init__.py");
+    let reuse = "\n\nfrom cozy_runtime.author import FileAsset\n\n\n\
+                 class ReuseInput(msgspec.Struct):\n    video: FileAsset\n    image: FileAsset\n\n\n\
+                 class ReuseOutput(msgspec.Struct):\n    video: int\n    image: int\n\n\n\
+                 @app.entrypoint(accelerator=False)\n\
+                 def reuse(payload: ReuseInput) -> ReuseOutput:\n    \
+                 return ReuseOutput(len(payload.video.read_bytes()), len(payload.image.read_bytes()))\n";
+    let mut text = std::fs::read_to_string(&code).unwrap();
+    text.push_str(reuse);
+    std::fs::write(&code, text).unwrap();
+    let video: Vec<u8> = (0..16u32 << 20)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    std::fs::write(work.join("clip.mp4"), &video).unwrap();
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/media/azul.png"),
+        work.join("azul.png"),
+    )
+    .unwrap();
+
+    let run = || {
+        let before = relay.sent();
+        let args = [
+            "--json",
+            "run",
+            "./tiny/reuse",
+            "--asset",
+            "video=./clip.mp4",
+            "--asset",
+            "image=./azul.png",
+            "--on",
+            "m1",
+        ];
+        let out = cozy(&home, &work, &args);
+        let run = completed(&out);
+        assert_eq!(run["result"]["video"], 16 << 20, "{run}");
+        let reasons: Vec<String> = out
+            .stdout
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|e| e["type"] == "run.waiting")
+            .filter_map(|e| e["reason"].as_str().map(str::to_owned))
+            .collect();
+        (reasons, relay.sent() - before)
+    };
+    let (first, sent) = run();
+    assert!(
+        sent > 16 << 20,
+        "the first run sent {sent} bytes: {first:?}"
+    );
+    assert!(
+        first.iter().any(|r| r.starts_with("uploading video: ")),
+        "{first:?}"
+    );
+
+    let (second, sent) = run();
+    assert!(
+        sent < 1 << 20,
+        "the second run sent {sent} bytes, its files among them: {second:?}"
+    );
+    assert!(
+        !second.iter().any(|r| r.starts_with("uploading ")),
+        "{second:?}"
+    );
+    assert!(
+        second
+            .iter()
+            .any(|r| r.starts_with("reusing image, video (16.0 MiB): m1 already holds it")),
+        "{second:?}"
+    );
+    // Each file was read once on this computer: its digest is remembered.
+    let remembered = std::fs::read_dir(home.root().join("cache/digests"))
+        .unwrap()
+        .count();
+    assert_eq!(remembered, 2);
+}

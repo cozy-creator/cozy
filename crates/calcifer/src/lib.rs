@@ -820,6 +820,23 @@ impl Calcifer {
             .collect();
         let digests: Vec<Digest> = run.inputs.iter().map(|(digest, _)| *digest).collect();
         let held = link.held_many(&digests).await?;
+        // The request's files the machine already holds are not sent again, and the run says so.
+        let reused: Vec<(&str, u64)> = (run.inputs.iter().zip(&held))
+            .filter(|((_, length), held)| v1::held_bytes(held) >= *length)
+            .filter_map(|((digest, length), _)| {
+                Some((*names.get(digest.to_string().as_str())?, *length))
+            })
+            .collect();
+        if !reused.is_empty() {
+            let mut fields: Vec<&str> = reused.iter().map(|(field, _)| *field).collect();
+            fields.sort_unstable();
+            let size = bytes(reused.iter().map(|(_, length)| *length).sum::<u64>() as f64);
+            let reason = format!(
+                "reusing {} ({size}): {machine} already holds it",
+                fields.join(", ")
+            );
+            self.waiting(&run.id, reason);
+        }
         for ((digest, length), held) in run.inputs.iter().zip(held) {
             if v1::held_bytes(&held) >= *length {
                 continue;
@@ -939,8 +956,9 @@ impl Calcifer {
     }
 }
 
-/// Copies each given file into `inputs/<sha256 hex>`, checking its digest and length, unless a
-/// copy is there, and answers the objects the run's machine is written: every given file and every
+/// Keeps each given file as `inputs/<sha256 hex>` unless it is there: a hard link, which reads
+/// nothing (the machine verifies the bytes it is sent), else a copy checked against its digest
+/// and length. Answers the objects the run's machine is written: every given file and every
 /// object `spec.inputs` names, each of which must be staged.
 fn stage(
     inputs: &Path,
@@ -950,7 +968,11 @@ fn stage(
     let mut objects = vec![];
     for source in given {
         let target = inputs.join(hex::encode(source.digest.bytes()));
-        if !target.exists() {
+        let linked = || {
+            let same = std::fs::metadata(&source.path).is_ok_and(|m| m.len() == source.length);
+            same && std::fs::hard_link(&source.path, &target).is_ok()
+        };
+        if !target.exists() && !linked() {
             copy_checked(inputs, source, &target)?;
         }
         objects.push((source.digest, source.length));
