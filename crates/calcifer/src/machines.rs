@@ -568,7 +568,7 @@ impl Machines {
             Err(e) => return warn!("reading unplaced runs: {e}"),
         };
         for (run, wants) in unplaced {
-            let gpus = run.spec.as_ref().map_or(0, |spec| spec.gpus);
+            let gpus = run.spec.gpus;
             let placed = match wants.as_str() {
                 // It waits for a rental that fits while none does.
                 "any" => match self.fitting(gpus) {

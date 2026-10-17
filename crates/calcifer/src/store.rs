@@ -16,15 +16,13 @@ use cozy_proto::{
     machine as v1,
 };
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
-use rusqlite_migration::{M, Migrations};
 
 /// The version at which runs' specs and outcomes are JSON.
-const JSON_ROWS: usize = 5;
-
-/// The schema before xs-044's JSON rows.
-const MIGRATIONS: &[M] = &[
-    M::up(
-        "CREATE TABLE machines (
+/// The store's version (`PRAGMA user_version`), and the schema a new store is made with. A store
+/// at an older version is from before cozy 0.9.4, which this cozy does not read.
+const VERSION: i64 = 5;
+const SCHEMA: &str = "
+    CREATE TABLE machines (
         name TEXT PRIMARY KEY,
         kind TEXT NOT NULL CHECK (kind IN ('local', 'rental', 'added')),
         hub TEXT NOT NULL DEFAULT '',
@@ -36,9 +34,11 @@ const MIGRATIONS: &[M] = &[
         state TEXT NOT NULL CHECK (state IN ('booting', 'ready', 'ended')),
         served INTEGER NOT NULL DEFAULT 0,
         reason TEXT,
-        created_at INTEGER NOT NULL
+        created_at INTEGER NOT NULL,
+        alias TEXT
     ) STRICT;
     CREATE UNIQUE INDEX machines_rental ON machines (rental_id) WHERE rental_id IS NOT NULL;
+    CREATE UNIQUE INDEX machines_alias ON machines (alias) WHERE alias IS NOT NULL;
     CREATE TABLE runs (
         id TEXT PRIMARY KEY,
         number INTEGER NOT NULL UNIQUE,
@@ -64,7 +64,10 @@ const MIGRATIONS: &[M] = &[
         state_seq INTEGER NOT NULL DEFAULT 1,
         created_at INTEGER NOT NULL,
         accepted_at INTEGER,
-        settled_at INTEGER
+        settled_at INTEGER,
+        warnings TEXT NOT NULL DEFAULT '[]',
+        inputs TEXT NOT NULL DEFAULT '[]',
+        wants TEXT
     ) STRICT;
     CREATE INDEX runs_owed ON runs (machine) WHERE state <> 'settled';
     CREATE TABLE outputs (
@@ -82,6 +85,8 @@ const MIGRATIONS: &[M] = &[
         exported_rev INTEGER,
         created_seq INTEGER NOT NULL,
         seq INTEGER NOT NULL,
+        failed_rev INTEGER,
+        export_error TEXT,
         PRIMARY KEY (run, name, idx)
     ) STRICT, WITHOUT ROWID;
     CREATE INDEX outputs_unexported ON outputs (run) WHERE exported_rev IS NOT rev;
@@ -101,61 +106,19 @@ const MIGRATIONS: &[M] = &[
         machine TEXT,
         state TEXT NOT NULL CHECK (state IN ('pending', 'done', 'failed')),
         reason TEXT,
-        created_at INTEGER NOT NULL
-    ) STRICT;",
-    ),
-    // What the CLI noticed when binding the run, and the objects the run's machine is written.
-    M::up(
-        "ALTER TABLE runs ADD COLUMN warnings TEXT NOT NULL DEFAULT '[]';
-        ALTER TABLE runs ADD COLUMN inputs TEXT NOT NULL DEFAULT '[]';",
-    ),
-    // The output revision Calcifer gave up exporting, and why.
-    M::up(
-        "ALTER TABLE outputs ADD COLUMN failed_rev INTEGER;
-        ALTER TABLE outputs ADD COLUMN export_error TEXT;",
-    ),
-    // Machines and rentals: a renamed machine's old name, where an unpinned run may go, and
-    // which run an ask was made for.
-    M::up(
-        "ALTER TABLE machines ADD COLUMN alias TEXT;
-        CREATE UNIQUE INDEX machines_alias ON machines (alias) WHERE alias IS NOT NULL;
-        ALTER TABLE runs ADD COLUMN wants TEXT;
-        ALTER TABLE asks ADD COLUMN kind TEXT NOT NULL DEFAULT 'rent' CHECK (kind IN ('rent', 'end'));
-        ALTER TABLE asks ADD COLUMN run TEXT REFERENCES runs (id);",
-    ),
-];
-
-/// The schema; its version is `PRAGMA user_version`.
-fn migrations() -> Migrations<'static> {
-    let mut all = MIGRATIONS.to_vec();
-    // xs-044: a run's spec and outcome are JSON. v0.9.4+ rewrote them so at this version; a store
-    // no such build opened still holds protobuf, which is not kept: an unconfirmed run fails
-    // `spec_not_kept`, a settled one keeps all but its result.
-    all.push(M::up_with_hook("", |tx: &Transaction| {
-        let cleared = tx.execute(
-            "UPDATE runs SET spec = x'', outcome = NULL
-             WHERE (spec <> x'' AND hex(substr(spec, 1, 1)) <> '7B')
-                OR (outcome IS NOT NULL AND hex(substr(outcome, 1, 1)) <> '7B')",
-            [],
-        )?;
-        if cleared > 0 {
-            tracing::warn!(
-                "{cleared} runs kept their specs and outcomes as protobuf, which this cozy cannot read; \
-                 their results are left out here, and the store's copy beside it \
-                 (state.db.pre-json-*) keeps them"
-            );
-        }
-        Ok(())
-    }));
-    Migrations::new(all)
-}
+        created_at INTEGER NOT NULL,
+        kind TEXT NOT NULL DEFAULT 'rent' CHECK (kind IN ('rent', 'end')),
+        run TEXT REFERENCES runs (id)
+    ) STRICT;";
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("Calcifer's store: {0}")]
     Sqlite(#[from] rusqlite::Error),
-    #[error("Calcifer's store cannot migrate: {0}")]
-    Migration(#[from] rusqlite_migration::Error),
+    #[error(
+        "Calcifer's store is at version {0}: this cozy reads version 5, the stores of cozy 0.9.4 on"
+    )]
+    Version(i64),
     #[error("idempotency key {0:?} already names another submission")]
     Conflict(String),
     #[error("no machine named {0:?}")]
@@ -188,8 +151,8 @@ pub struct RunRow {
     pub machine: Option<String>,
     /// The caller named the machine: the run is never placed elsewhere.
     pub pinned: bool,
-    /// The spec as it is sent; none when it was not kept (before xs-044).
-    pub spec: Option<v1::RunSpec>,
+    /// The spec as it is sent.
+    pub spec: v1::RunSpec,
     pub out_dir: PathBuf,
     pub state: State,
     pub cancel_requested: bool,
@@ -334,14 +297,16 @@ impl Store {
         writer.pragma_update(None, "journal_mode", "WAL")?;
         writer.pragma_update(None, "synchronous", "FULL")?;
         writer.pragma_update(None, "foreign_keys", "ON")?;
-        let migrations = migrations();
-        let version: usize = migrations.current_version(&writer)?.into();
-        if version < JSON_ROWS && version > 0 {
-            // A copy of the store as it was, beside it, before rows still protobuf are cleared.
-            let backup = path.with_extension(format!("db.pre-json-{}", now_ms()));
-            writer.backup(rusqlite::MAIN_DB, &backup, None)?;
+        match writer.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))? {
+            0 => {
+                let tx = writer.transaction()?;
+                tx.execute_batch(SCHEMA)?;
+                tx.pragma_update(None, "user_version", VERSION)?;
+                tx.commit()?;
+            }
+            VERSION => {}
+            other => return Err(StoreError::Version(other)),
         }
-        migrations.to_latest(&mut writer)?;
         let reader = Connection::open(path)?;
         reader.pragma_update(None, "query_only", "ON")?;
         Ok(Self {
@@ -1249,10 +1214,7 @@ fn run_row(r: &Row) -> rusqlite::Result<Result<RunRow>> {
             hub: r.get(4)?,
             machine: r.get(5)?,
             pinned: r.get(6)?,
-            spec: match spec.is_empty() {
-                true => None,
-                false => Some(serde_json::from_slice(&spec).map_err(|_| corrupt("a run's spec"))?),
-            },
+            spec: serde_json::from_slice(&spec).map_err(|_| corrupt("a run's spec"))?,
             out_dir: PathBuf::from(out_dir),
             state: match state.as_str() {
                 "queued" => State::Queued,

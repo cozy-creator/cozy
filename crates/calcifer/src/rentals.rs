@@ -478,9 +478,7 @@ impl Machines {
     /// Asks the run's Hub where to run it: the product to rent and its GPU count. The answer is
     /// kept on the run as a warning naming the product, its price and why.
     async fn placed(&self, run: &RunRow) -> Result<(String, Option<u32>), Error> {
-        let Some(spec) = &run.spec else {
-            return Err(Error::new(Kind::Conflict, "spec_not_kept", "the run's spec was not kept"));
-        };
+        let spec = &run.spec;
         let Some(v1::Source::Release(release)) = &spec.source else {
             return Err(Error::new(
                 Kind::Usage,
