@@ -24,6 +24,8 @@ pub struct Tensord {
     pub address: String,
     /// `sha256:<hex>` of its TLS leaf.
     pub fingerprint: String,
+    /// The port it listens on across restarts, when a test names one (a shaped link's).
+    port: Option<u16>,
 }
 
 /// A controller key no Calcifer holds, base64url as TensorD's keys file spells it.
@@ -40,6 +42,11 @@ impl Tensord {
 
     /// `start`, with extra environment for the process.
     pub fn start_with(keys: &[String], env: &[(&str, &str)]) -> Self {
+        Self::start_on(None, keys, env)
+    }
+
+    /// `start_with`, listening on `port` (a new free one each start when `None`).
+    pub fn start_on(port: Option<u16>, keys: &[String], env: &[(&str, &str)]) -> Self {
         let root = tempfile::tempdir().unwrap();
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let mut machine = Self {
@@ -51,6 +58,7 @@ impl Tensord {
                 .collect(),
             address: String::new(),
             fingerprint: String::new(),
+            port,
         };
         machine.restart(keys);
         machine
@@ -63,11 +71,13 @@ impl Tensord {
         let key_file = self.root.path().join("receipt-key");
         std::fs::write(&key_file, URL_SAFE_NO_PAD.encode([7u8; 32])).unwrap();
         std::fs::set_permissions(&key_file, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
+        let port = self.port.unwrap_or_else(|| {
+            std::net::TcpListener::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port()
+        });
         let binary = std::env::var_os("COZY_TEST_TENSORD")
             .expect("COZY_TEST_TENSORD names the tensord binary these tests run against");
         let mut child = Command::new(binary)
@@ -112,7 +122,10 @@ impl Tensord {
                 .args(["-KILL", "--", &format!("-{}", child.id())])
                 .status();
             let _ = child.wait();
-            let lock = self.root.path().join("machine/var/lib/cozy/tensord/owner.lock");
+            let lock = self
+                .root
+                .path()
+                .join("machine/var/lib/cozy/tensord/owner.lock");
             if let Ok(file) = std::fs::File::open(lock) {
                 let _ = file.lock();
             }
@@ -147,6 +160,18 @@ pub fn workspace() -> bool {
     std::env::var("COZY_TENSORD").as_deref() == Ok("workspace")
 }
 
+/// TensorD 0.7.x, released and this workspace's alike, keeps no log of its own for `cozy
+/// machine logs`; the v0.10.0 cohort's does. The cohort deletes this.
+pub fn serves_own_log() -> bool {
+    false
+}
+
+/// Released TensorD 0.7.3 drops the executor's adjustment rows; this workspace's keeps them on the
+/// outcome (cr-197 U2, #1383). The cohort deletes this.
+pub fn reports_adjustments() -> bool {
+    workspace()
+}
+
 /// A TensorD added to `home`'s Calcifer as `name`, the way a person adds one: `cozy machine add`
 /// answers the key this controller signs with, the machine admits it, and the add is made again.
 pub fn added(home: &super::Home, name: &str) -> Tensord {
@@ -155,7 +180,17 @@ pub fn added(home: &super::Home, name: &str) -> Tensord {
 
 /// `added`, with extra environment for the TensorD process.
 pub fn added_with(home: &super::Home, name: &str, env: &[(&str, &str)]) -> Tensord {
-    let mut machine = Tensord::start_with(&[stranger()], env);
+    added_on(home, name, None, env)
+}
+
+/// `added_with`, listening on `port`.
+pub fn added_on(
+    home: &super::Home,
+    name: &str,
+    port: Option<u16>,
+    env: &[(&str, &str)],
+) -> Tensord {
+    let mut machine = Tensord::start_on(port, &[stranger()], env);
     let add = |machine: &Tensord| {
         home.cozy([
             "machine",

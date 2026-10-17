@@ -18,7 +18,8 @@ use std::{
 
 pub struct Home {
     dir: tempfile::TempDir,
-    /// The `cozy` it runs: this build's, unless a test chose another (`use_binary`).
+    /// The `cozy` it runs: this build's or COZY_TEST_BINARY, unless a test chose another
+    /// (`use_binary`).
     binary: std::cell::RefCell<PathBuf>,
 }
 
@@ -39,9 +40,12 @@ impl Home {
             let _ = writeln!(std::io::stderr(), "skipped: not on a hosted runner");
             return None;
         }
+        // COZY_TEST_BINARY: a release's own `cozy` (owner-day.yml, called by release.yml).
+        let binary = std::env::var_os("COZY_TEST_BINARY")
+            .map_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_cozy")), PathBuf::from);
         Some(Self {
             dir: tempfile::tempdir().expect("a temp dir"),
-            binary: PathBuf::from(env!("CARGO_BIN_EXE_cozy")).into(),
+            binary: binary.into(),
         })
     }
 
