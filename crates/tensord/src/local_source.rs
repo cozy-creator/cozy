@@ -1004,7 +1004,7 @@ mod tests {
         }
         let pyproject = fs::read_to_string(project.join("pyproject.toml")).unwrap();
         // A settled Runtime: the newest may be mid-upload (its sdist visible before its wheels).
-        fs::write(project.join("pyproject.toml"), pyproject + "\n[tool.uv]\nconstraint-dependencies = [\"cozy-runtime==0.24.1\"]\n[tool.uv.sources]\ntensord-cpu-memo = { path = \"deps/cpu_memo\" }\n").unwrap();
+        fs::write(project.join("pyproject.toml"), pyproject + "\n[tool.uv]\nconstraint-dependencies = [\"cozy-runtime==0.26.4\"]\n[tool.uv.sources]\ntensord-cpu-memo = { path = \"deps/cpu_memo\" }\n").unwrap();
         run(Command::new("uv").args(["lock", "--python", "3.12", "--project"]).arg(&project));
         let names = ["pyproject.toml", "package.toml", "uv.lock", "cpu_caller/__init__.py",
             "deps/cpu_memo/pyproject.toml", "deps/cpu_memo/package.toml", "deps/cpu_memo/cpu_memo/__init__.py"];
@@ -1074,7 +1074,7 @@ mod tests {
         };
         let (caller, memo) = (wheel_of("cpu_caller"), wheel_of("cpu_memo"));
         // A settled Runtime: the newest may be mid-upload (its sdist visible before its wheels).
-        fs::write(m.root.join("settled.txt"), "cozy-runtime==0.24.1\n").unwrap();
+        fs::write(m.root.join("settled.txt"), "cozy-runtime==0.26.4\n").unwrap();
         let compiled = run(Command::new("uv").args(["pip", "compile", "--quiet", "--generate-hashes", "--python-version", "3.12", "--no-header", "--constraint"])
             .arg(m.root.join("settled.txt")).arg("--find-links")
             .arg(memo.parent().unwrap()).arg(repo.join("tests/fixtures/cpu_caller/pyproject.toml")));
@@ -1104,7 +1104,7 @@ mod tests {
             }
         }
         let pyproject = fs::read_to_string(project.join("pyproject.toml")).unwrap();
-        fs::write(project.join("pyproject.toml"), pyproject + "\n[tool.uv]\nconstraint-dependencies = [\"cozy-runtime==0.24.1\"]\n[tool.uv.sources]\ntensord-cpu-memo = { path = \"deps/cpu_memo\" }\n").unwrap();
+        fs::write(project.join("pyproject.toml"), pyproject + "\n[tool.uv]\nconstraint-dependencies = [\"cozy-runtime==0.26.4\"]\n[tool.uv.sources]\ntensord-cpu-memo = { path = \"deps/cpu_memo\" }\n").unwrap();
         run(Command::new("uv").args(["lock", "--python", "3.12", "--project"]).arg(&project));
         let tree = archive(&project, &["pyproject.toml", "uv.lock", "package.toml", "cpu_caller/__init__.py",
             "deps/cpu_memo/pyproject.toml", "deps/cpu_memo/package.toml", "deps/cpu_memo/cpu_memo/__init__.py"]);
