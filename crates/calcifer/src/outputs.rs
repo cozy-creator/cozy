@@ -66,6 +66,7 @@ pub(crate) struct Exports {
 }
 
 /// Why an export stopped short.
+#[derive(Clone)]
 enum Failure {
     /// A newer revision is recorded: that one is exported instead.
     Superseded,
@@ -146,12 +147,13 @@ impl Calcifer {
         self.spawn_task(async move { me.export_run(&id, &wake).await });
     }
 
-    /// Exports the run's outputs, each at its newest revision, until none is left. Paces retries
-    /// while nothing moves; never gives up without recording why.
+    /// Exports the run's outputs, each at its newest revision, until none is left: up to `LANES`
+    /// items side by side, so a run's many small outputs cost one round trip together, not one
+    /// each. Paces retries while nothing moves; never gives up without recording why.
     async fn export_run(&self, id: &RunId, wake: &Notify) {
         let mut pause = Pause::default();
         loop {
-            let (run, item) = match self.next_export(id) {
+            let (run, items) = match self.next_exports(id) {
                 Ok(Some(next)) => next,
                 Ok(None) => {
                     self.owed.send_replace(());
@@ -165,45 +167,50 @@ impl Calcifer {
             };
             let mut changed = None;
             let exported = match self.reach(&run, &mut changed) {
-                Ok(link) => self.export_item(&run, &item, &link, wake).await,
-                Err(failure) => Err(failure),
+                Ok(link) => {
+                    let exports = items.iter().map(|item| self.export_item(&run, item, &link));
+                    futures_util::future::join_all(exports).await
+                }
+                Err(failure) => items.iter().map(|_| Err(failure.clone())).collect(),
             };
-            match exported {
-                Ok(()) => pause.reset(),
-                Err(Failure::Superseded) => {}
-                Err(Failure::Lost(reason)) => {
-                    warn!(run = %id, output = %item.name, rev = item.rev, "not exported: {reason}");
-                    let (name, index, rev) = (&item.name, item.index, item.rev);
-                    match self
-                        .store
-                        .export_failed(id.as_str(), name, index, rev, &reason)
-                    {
-                        Ok(events) => self.publish(id, events),
-                        Err(e) => {
-                            warn!(run = %id, "{e}");
-                            pause.wait(wake, None).await;
+            let mut again = false;
+            for (item, exported) in items.iter().zip(exported) {
+                let (name, index, rev) = (&item.name, item.index, item.rev);
+                match exported {
+                    Ok(()) | Err(Failure::Superseded) => {}
+                    Err(Failure::Lost(reason)) => {
+                        warn!(run = %id, output = %name, rev, "not exported: {reason}");
+                        match (self.store).export_failed(id.as_str(), name, index, rev, &reason) {
+                            Ok(events) => self.publish(id, events),
+                            Err(e) => {
+                                warn!(run = %id, "{e}");
+                                again = true;
+                            }
                         }
                     }
+                    Err(Failure::Again(message)) => {
+                        warn!(run = %id, output = %name, rev, "export waits: {message}");
+                        again = true;
+                    }
                 }
-                Err(Failure::Again(message)) => {
-                    warn!(run = %id, output = %item.name, rev = item.rev, "export waits: {message}");
-                    pause.wait(wake, changed.as_mut()).await;
-                }
+            }
+            match again {
+                true => pause.wait(wake, changed.as_mut()).await,
+                false => pause.reset(),
             }
         }
     }
 
-    /// The run and its first output to export; none ends the exporter, under the lock `export`
-    /// takes, so an event after this starts another.
-    fn next_export(&self, id: &RunId) -> Result<Option<(RunRow, OutputRow)>, StoreError> {
+    /// The run and its first `LANES` outputs to export; none ends the exporter, under the lock
+    /// `export` takes, so an event after this starts another.
+    fn next_exports(&self, id: &RunId) -> Result<Option<(RunRow, Vec<OutputRow>)>, StoreError> {
         let mut runs = lock(&self.exports.runs);
         let next = match self.store.run(id.as_str())? {
-            Some(run) => (self
-                .store
-                .outputs_to_export(id.as_str())?
-                .into_iter()
-                .next())
-            .map(|item| (run, item)),
+            Some(run) => {
+                let mut items = self.store.outputs_to_export(id.as_str())?;
+                items.truncate(LANES);
+                Some((run, items)).filter(|(_, items)| !items.is_empty())
+            }
             None => None,
         };
         if next.is_none() {
@@ -234,13 +241,15 @@ impl Calcifer {
 
     /// Makes the item's file (a directory for a tree) this revision's bytes. A newer revision
     /// stops it.
-    async fn export_item(
-        &self,
-        run: &RunRow,
-        item: &OutputRow,
-        link: &Link,
-        wake: &Notify,
-    ) -> Result<(), Failure> {
+    async fn export_item(&self, run: &RunRow, item: &OutputRow, link: &Link) -> Result<(), Failure> {
+        let mut events = self.subscribe();
+        let superseded = || -> Result<bool, Failure> {
+            let now = self.store.output(run.id.as_str(), &item.name, item.index)?;
+            Ok(now.is_none_or(|now| now.rev != item.rev))
+        };
+        if superseded()? {
+            return Err(Failure::Superseded);
+        }
         let name = file_name(run.number, &item.name, item.index, &item.media_type);
         let dest = run.out_dir.join(name);
         let target = v1::OutputTarget {
@@ -264,14 +273,20 @@ impl Calcifer {
         };
         tokio::pin!(work);
         loop {
-            tokio::select! {
+            let told = tokio::select! {
                 done = &mut work => return done,
-                () = wake.notified() => {
-                    let now = self.store.output(run.id.as_str(), &item.name, item.index)?;
-                    if now.is_none_or(|now| now.rev != item.rev) {
-                        return Err(Failure::Superseded);
-                    }
-                }
+                told = events.recv() => told,
+            };
+            let changed = match told {
+                Ok((id, event)) => id == run.id && matches!(
+                    event,
+                    Event::OutputAdded { .. } | Event::OutputDelta { .. } | Event::OutputDone { .. }
+                ),
+                Err(RecvError::Lagged(_)) => true,
+                Err(RecvError::Closed) => return work.await,
+            };
+            if changed && superseded()? {
+                return Err(Failure::Superseded);
             }
         }
     }
