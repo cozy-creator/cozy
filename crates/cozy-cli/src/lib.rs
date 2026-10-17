@@ -98,7 +98,7 @@ pub fn main() -> ExitCode {
     let warnings = loaded.warnings.clone();
     let ctx = Context::new(cli.json, loaded, output::Term::detect());
     for warning in &warnings {
-        output::warn(&ctx, warning);
+        output::warn(warning);
     }
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(runtime) => runtime,

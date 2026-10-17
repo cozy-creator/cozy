@@ -81,13 +81,10 @@ pub async fn end(ctx: &Context, name: &str, force: bool) -> Result<ExitCode, Err
         }
     };
     if !abandoned.is_empty() {
-        output::warn(
-            ctx,
-            &format!(
-                "Gave up outputs that had not landed: {}",
-                abandoned.join(", ")
-            ),
-        );
+        output::warn(&format!(
+            "Gave up outputs that had not landed: {}",
+            abandoned.join(", ")
+        ));
     }
     if machine.state == MachineState::Ending {
         output::say(ctx, &format!("Shutting down {}…", machine.name));

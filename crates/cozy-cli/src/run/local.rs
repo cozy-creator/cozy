@@ -83,7 +83,7 @@ pub async fn run(
     let terms = super::terms(ctx, &args)?;
     let bound = super::bind::bind(&target, None, callable, &terms)?;
     if let Some(warning) = bound.warning(&target) {
-        output::warn(ctx, &warning);
+        output::warn(&warning);
     }
     let call = spec::Call {
         package: &local.package,

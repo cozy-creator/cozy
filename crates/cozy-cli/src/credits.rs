@@ -1,8 +1,9 @@
 //! `cozy credits [history|buy]`: the account's prepaid rental credit at the command's Hub, in
 //! micros of USD. A Hub that does not meter the account says so, and nothing is bought there.
-use std::{process::ExitCode, time::Duration};
+use std::{path::PathBuf, process::ExitCode, time::Duration};
 
 use clap::Subcommand;
+use cozy_platform::tools;
 use cozy_proto::{
     config::Hub,
     error::{Error, Kind},
@@ -218,7 +219,9 @@ async fn buy(
                 format!("{hub} answered order {} with no payment page", order.id),
             )
         })?;
-    let opened = browser && open(&page);
+    let path: Vec<_> =
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect();
+    let opened = browser && open(&page, &path);
     if !wait {
         if ctx.json {
             output::json(&json!({
@@ -288,18 +291,24 @@ fn idempotency_key() -> Result<String, Error> {
     Ok(hex::encode(bytes))
 }
 
-/// Asks this OS to open `url` in the user's browser; false when it cannot.
-fn open(url: &str) -> bool {
-    let mut command = match std::env::consts::OS {
-        "macos" => std::process::Command::new("open"),
-        "windows" => {
-            let mut command = std::process::Command::new("rundll32");
-            command.arg("url.dll,FileProtocolHandler");
-            command
-        }
-        _ => std::process::Command::new("xdg-open"),
+/// Asks this OS to open `url` in the user's browser, its opener looked for on `path`; false when
+/// it cannot. A missing xdg-open is warned of once (macOS and Windows always have theirs).
+fn open(url: &str, path: &[PathBuf]) -> bool {
+    let (program, before): (&str, &[&str]) = match std::env::consts::OS {
+        "macos" => ("open", &[]),
+        "windows" => ("rundll32", &["url.dll,FileProtocolHandler"]),
+        _ => ("xdg-open", &[]),
     };
-    command
+    let Some(opener) = tools::on_path(program, path) else {
+        if program == "xdg-open"
+            && let Some(warning) = tools::warn_once(program)
+        {
+            output::warn(&warning);
+        }
+        return false;
+    };
+    std::process::Command::new(opener.path)
+        .args(before)
         .arg(url)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -373,5 +382,17 @@ mod tests {
         assert_eq!(usd(25_500_000), "$25.50");
         assert_eq!(usd(1), "$0.000001");
         assert_eq!(usd(-3_000_000), "-$3.00");
+    }
+
+    /// The opener is looked for on PATH, never assumed: with none there the URL stands alone, and
+    /// the warning that says so was given once, by the first attempt.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_missing_xdg_open_opens_nothing_and_is_warned_of_once() {
+        let empty = tempfile::tempdir().unwrap();
+        let path = [empty.path().to_path_buf()];
+        assert!(!open("https://example.test/pay", &path));
+        assert!(!open("https://example.test/pay", &path));
+        assert_eq!(tools::warn_once("xdg-open"), None, "the first open warned");
     }
 }

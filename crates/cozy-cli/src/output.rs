@@ -85,7 +85,7 @@ pub fn say(ctx: &Context, message: &str) {
 }
 
 /// A warning on stderr: the command goes on.
-pub fn warn(_ctx: &Context, message: &str) {
+pub fn warn(message: &str) {
     anstream::eprintln!("{WARN}warning{WARN:#}: {message}");
 }
 

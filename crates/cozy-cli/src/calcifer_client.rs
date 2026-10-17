@@ -16,6 +16,7 @@ use cozy_platform::{
     paths::Home,
     process::{self, Detached},
     service::{ServiceSpec, Services},
+    tools,
 };
 use cozy_proto::{
     calcifer::{Down, Event, Holder, MachineList, REFUSED, Run, RunList, SubmitRun, Submitted},
@@ -24,7 +25,7 @@ use cozy_proto::{
 use reqwest::{RequestBuilder, Response, StatusCode, header};
 use serde::{Serialize, de::DeserializeOwned};
 
-use crate::Context;
+use crate::{Context, output};
 
 /// How often a wait looks again: a sampling period, never a deadline.
 const SAMPLE: Duration = Duration::from_millis(50);
@@ -282,6 +283,16 @@ impl Client {
         let services = Services::new(home, &self.0.user_home);
         let mut steps = Steps::new(home.calcifer_log());
         let managed = services.available();
+        // Started detached for want of systemctl: no login starts it again.
+        let path: Vec<_> =
+            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect();
+        if !managed
+            && cfg!(target_os = "linux")
+            && tools::on_path("systemctl", &path).is_none()
+            && let Some(warning) = tools::warn_once("systemctl")
+        {
+            output::warn(&warning);
+        }
         if managed {
             let wrote = services.ensure(&self.spec()).map_err(failed)?;
             steps.done(match wrote {
