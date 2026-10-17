@@ -49,4 +49,8 @@ impl Machines {
     pub(crate) fn rows(&self, ctx: &Context) -> Vec<Vec<String>> {
         list::rows(ctx, &self.list)
     }
+
+    pub(crate) fn list(&self) -> &MachineList {
+        &self.list
+    }
 }

@@ -183,16 +183,21 @@ async fn machines(ctx: &Context, on: Option<&On>) -> Result<Vec<Machine>, Error>
             .filter(|m| m.state == MachineState::Ready)
             .collect());
     };
-    let On::Machine(name) = on else {
-        return Err(Error::new(
+    let path = format!("/v1/machines/{}", named(on)?.to_ascii_lowercase());
+    let machine: Machine = calcifer.get_query(&path, &[("fresh", "true")]).await?;
+    Ok(vec![machine])
+}
+
+/// The machine `--on` names, whose packages can be read.
+pub(crate) fn named(on: &On) -> Result<&str, Error> {
+    match on {
+        On::Machine(name) => Ok(name),
+        _ => Err(Error::new(
             Kind::Usage,
             "machine_name_required",
             format!("--on {on} names no machine whose packages can be read"),
-        ));
-    };
-    let path = format!("/v1/machines/{}", name.to_ascii_lowercase());
-    let machine: Machine = calcifer.get_query(&path, &[("fresh", "true")]).await?;
-    Ok(vec![machine])
+        )),
+    }
 }
 
 /// A machine's installations within `--tensorhub`'s scope: that Hub's and local code.
@@ -246,21 +251,15 @@ fn held(names: &[String], envs: &[&Environment], machine: &str) -> Result<(), Er
     }
 }
 
-#[derive(Serialize)]
-struct Held<'a> {
-    machine: &'a str,
-    package: &'a str,
-    release: &'a str,
-    level: &'a str,
-    hub: String,
-    /// Why the environment does not run the machine's own Runtime; empty when it does.
-    warning: &'a str,
-}
+pub(crate) const HEADERS: [&str; 5] = ["MACHINE", "PACKAGE", "RELEASE", "LEVEL", "HUB"];
 
-pub async fn list(ctx: &Context, on: Option<On>) -> Result<ExitCode, Error> {
-    let machines = machines(ctx, on.as_ref()).await?;
+/// Each package `machines` hold within `--tensorhub`'s scope.
+pub(crate) fn rows<'a>(
+    ctx: &Context,
+    machines: impl IntoIterator<Item = &'a Machine>,
+) -> Result<Vec<Held<'a>>, Error> {
     let mut rows = vec![];
-    for machine in &machines {
+    for machine in machines {
         for env in environments(ctx, machine)? {
             rows.push(Held {
                 machine: &machine.name,
@@ -272,6 +271,41 @@ pub async fn list(ctx: &Context, on: Option<On>) -> Result<ExitCode, Error> {
             });
         }
     }
+    Ok(rows)
+}
+
+#[derive(Serialize)]
+pub(crate) struct Held<'a> {
+    machine: &'a str,
+    package: &'a str,
+    release: &'a str,
+    level: &'a str,
+    hub: String,
+    /// Why the environment does not run the machine's own Runtime; empty when it does.
+    warning: &'a str,
+}
+
+impl Held<'_> {
+    pub(crate) fn cells(&self) -> Vec<String> {
+        let (machine, package, release) = (self.machine, self.package, self.release);
+        vec![
+            machine.into(),
+            package.into(),
+            release.into(),
+            self.level.into(),
+            self.hub.clone(),
+        ]
+    }
+}
+
+pub async fn list(ctx: &Context, on: Option<On>, once: bool) -> Result<ExitCode, Error> {
+    if !once && !ctx.json && ctx.term.stdout {
+        let view = super::live::Packages::open(ctx, on).await?;
+        crate::tui::show(ctx, crate::tui::Screen::Packages(view)).await?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    let machines = machines(ctx, on.as_ref()).await?;
+    let rows = rows(ctx, &machines)?;
     if ctx.json {
         output::json(&serde_json::json!({ "packages": rows }));
         return Ok(ExitCode::SUCCESS);
@@ -284,15 +318,9 @@ pub async fn list(ctx: &Context, on: Option<On>) -> Result<ExitCode, Error> {
         );
         return Ok(ExitCode::SUCCESS);
     }
-    let mut table = Table::new(ctx, ["MACHINE", "PACKAGE", "RELEASE", "LEVEL", "HUB"]);
+    let mut table = Table::new(ctx, HEADERS);
     for row in &rows {
-        table = table.row([
-            row.machine,
-            row.package,
-            row.release,
-            row.level,
-            row.hub.as_str(),
-        ]);
+        table = table.row(row.cells());
     }
     for row in rows.iter().filter(|row| !row.warning.is_empty()) {
         table = table.note(format!("{}@{}: {}", row.package, row.release, row.warning));
