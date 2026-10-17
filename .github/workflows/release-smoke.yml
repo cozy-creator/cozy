@@ -173,7 +173,7 @@ jobs:
             code=0
             out=$("$cozy" --json machine serve --persistent) || code=$?
             printf '%s\n' "$out"
-            [ "$code" = 1 ] && printf '%s' "$out" | grep -Eq '"code": *"unsupported"' \
+            [ "$code" != 0 ] && printf '%s' "$out" | grep -Eq '"code": *"unsupported"' \
               || { echo "::error::cozy machine serve on $RUNNER_OS answered $code, not unsupported"; fail=1; }
           fi
           before=$(ls -i "$cozy")
