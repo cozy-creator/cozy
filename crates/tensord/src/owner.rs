@@ -1,7 +1,4 @@
-use crate::{
-    os,
-    protocol::{Body, Object},
-};
+use crate::protocol::{Body, Object};
 use fs2::FileExt;
 use std::{
     collections::{HashMap, HashSet},
@@ -113,7 +110,7 @@ impl Owner {
     }
     pub fn connect(&mut self, stream: &UnixStream) -> io::Result<u64> {
         self.accepting()?;
-        let pidfd = os::peer_pidfd(stream)?;
+        let pidfd = cozy_platform::handles::peer_pidfd(stream)?;
         self.reap();
         if self.peers.len() >= 64 {
             return Err(io::Error::other("64 active client limit reached"));
@@ -145,7 +142,7 @@ impl Owner {
         let dead: HashSet<_> = self
             .peers
             .iter()
-            .filter(|(_, p)| os::ended(&p.pidfd))
+            .filter(|(_, p)| cozy_platform::process::ended(&p.pidfd))
             .map(|(id, _)| *id)
             .collect();
         self.leases.retain(|_, lease| !dead.contains(&lease.peer));
@@ -182,7 +179,7 @@ impl Owner {
     pub fn import(&mut self, object: Object, mut file: File) -> io::Result<Body> {
         self.accepting()?;
         validate(&object)?;
-        if os::seals(&file)? & os::FULL_SEALS != os::FULL_SEALS {
+        if cozy_platform::shm::seals(&file)? & cozy_platform::shm::FULL_SEALS != cozy_platform::shm::FULL_SEALS {
             return Err(failure("input fd must have full immutable seals"));
         }
         if file.metadata()?.len() != object.length {
@@ -244,10 +241,10 @@ impl Owner {
             }
             if self.host_bytes().saturating_add(pages) <= self.budget {
                 let cached = (|| -> io::Result<File> {
-                    let mut file = os::memfd()?;
+                    let mut file = cozy_platform::shm::memfd_named("tensord-weights")?;
                     io::copy(&mut source, &mut file)?;
                     file.flush()?;
-                    os::seal(&file)?;
+                    cozy_platform::shm::seal(&file)?;
                     Ok(file)
                 })();
                 if let Ok(file) = cached {

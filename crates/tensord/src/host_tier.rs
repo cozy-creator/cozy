@@ -9,7 +9,7 @@
 //! A layout can instead expose unstaged regions through granted object descriptors, or use
 //! a sealed streaming window that TensorD refills as Runtime claims regions. These are data
 //! paths for a granted weight set, not permission for the executor to open the managed Store.
-use crate::{access::Fetch, os};
+use crate::access::Fetch;
 use cozy_platform::contain::host_memory::HostMemory;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1113,7 +1113,7 @@ impl HostTier {
 
     /// A sealed memfd of exactly the declared bytes and digest.
     fn body(request: SealedRequest<'_>, plan: File) -> io::Result<Vec<u8>> {
-        if os::seals(&plan)? & os::FULL_SEALS != os::FULL_SEALS
+        if cozy_platform::shm::seals(&plan)? & cozy_platform::shm::FULL_SEALS != cozy_platform::shm::FULL_SEALS
             || plan.metadata()?.len() != request.length
             || request.length > crate::protocol::MAX_FRAME as u64
         {
@@ -1178,7 +1178,7 @@ impl HostTier {
         let ended: Vec<u64> = state
             .peers
             .iter()
-            .filter(|(_, peer)| os::ended(&peer.pidfd))
+            .filter(|(_, peer)| cozy_platform::process::ended(&peer.pidfd))
             .map(|(id, _)| *id)
             .collect();
         for id in &ended {
@@ -1261,7 +1261,7 @@ impl HostTier {
         state.ledger.released += 1;
         state.ledger.released_bytes += entry.charged;
         match file {
-            Ok((dev, ino)) if !os::held(dev, ino) => state.ledger.freed_bytes += entry.charged,
+            Ok((dev, ino)) if cozy_platform::shm::held(dev, ino).is_ok_and(|held| !held) => state.ledger.freed_bytes += entry.charged,
             _ => state.ledger.stranded_bytes += entry.charged,
         }
     }
@@ -1337,9 +1337,9 @@ mod tests {
     #[test]
     fn a_sealed_plan_over_64_mib_is_read_and_a_lying_length_is_refused() {
         let body = vec![b' '; (64 << 20) + 1];
-        let mut file = os::memfd().unwrap();
+        let mut file = cozy_platform::shm::memfd_named("tensord-weights").unwrap();
         file.write_all(&body).unwrap();
-        os::seal(&file).unwrap();
+        cozy_platform::shm::seal(&file).unwrap();
         let sha256 = format!("{:x}", Sha256::digest(&body));
         let request = |length| SealedRequest { sha256: &sha256, length, stage: None };
         let read = HostTier::body(request(body.len() as u64), file.try_clone().unwrap()).unwrap();

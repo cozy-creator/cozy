@@ -1927,7 +1927,7 @@ impl DeviceExecutor {
                     }
                     let mut fds = Vec::with_capacity(frame.descriptors as usize);
                     for _ in 0..frame.descriptors {
-                        fds.push(protocol::recv_fd(&self.stream)?);
+                        fds.push(cozy_platform::handles::recv_fd(&self.stream)?);
                     }
                     let (mut answer, out) = services.device_tier(&frame, fds)?;
                     answer.event = "answer";
@@ -1937,7 +1937,7 @@ impl DeviceExecutor {
                     answer.descriptors = out.len().saturating_sub(usize::from(answer.lease)) as u64;
                     write_frame(&mut self.stream, &answer)?;
                     for fd in &out {
-                        protocol::send_fd(&self.stream, fd)?;
+                        cozy_platform::handles::send_fd(&self.stream, fd)?;
                     }
                 }
                 Some(Event::Request)
@@ -1954,7 +1954,7 @@ impl DeviceExecutor {
                 }
                 Some(Event::Request) if frame.kind == Kind::ObjectFiles => {
                     let plan = if frame.descriptor {
-                        Some(File::from(protocol::recv_fd(&self.stream)?))
+                        Some(File::from(cozy_platform::handles::recv_fd(&self.stream)?))
                     } else {
                         None
                     };
@@ -1968,7 +1968,7 @@ impl DeviceExecutor {
                     answer.descriptors = out.len() as u64;
                     write_frame(&mut self.stream, &answer)?;
                     for file in &out {
-                        protocol::send_fd(&self.stream, file)?;
+                        cozy_platform::handles::send_fd(&self.stream, file)?;
                     }
                 }
                 Some(Event::Request) => {
@@ -1987,7 +1987,7 @@ impl DeviceExecutor {
 
     fn answer(&mut self, frame: &Frame, services: &mut impl Services) -> io::Result<()> {
         let descriptor = if frame.descriptor {
-            Some(File::from(protocol::recv_fd(&self.stream)?))
+            Some(File::from(cozy_platform::handles::recv_fd(&self.stream)?))
         } else {
             None
         };
@@ -1997,7 +1997,7 @@ impl DeviceExecutor {
         answer.descriptor = descriptor.is_some();
         write_frame(&mut self.stream, &answer)?;
         if let Some(descriptor) = descriptor {
-            protocol::send_fd(&self.stream, &descriptor)?;
+            cozy_platform::handles::send_fd(&self.stream, &descriptor)?;
         }
         Ok(())
     }

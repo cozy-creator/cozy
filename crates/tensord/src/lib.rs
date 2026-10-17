@@ -25,7 +25,6 @@ pub mod memory;
 pub mod model_sources;
 pub mod native_inputs;
 pub mod objects;
-pub mod os;
 pub mod owner;
 pub mod output_capacity;
 pub mod precision;

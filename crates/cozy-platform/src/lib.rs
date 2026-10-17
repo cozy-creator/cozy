@@ -8,10 +8,14 @@ use std::{fmt, io, path::PathBuf};
 pub mod contain;
 pub mod durable;
 pub mod gpu;
+#[cfg(unix)]
+pub mod handles;
 pub mod lock;
 pub mod paths;
 pub mod process;
 pub mod service;
+#[cfg(unix)]
+pub mod shm;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

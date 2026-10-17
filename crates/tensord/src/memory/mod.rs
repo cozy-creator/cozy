@@ -506,9 +506,9 @@ mod tests {
 
     #[test]
     fn room_grants_reach_each_rank_without_borrowing_another_gpus_cap() {
-        let leader = crate::os::memfd().unwrap();
+        let leader = cozy_platform::shm::memfd_named("tensord-weights").unwrap();
         leader.set_len(32).unwrap();
-        let follower = crate::os::memfd().unwrap();
+        let follower = cozy_platform::shm::memfd_named("tensord-weights").unwrap();
         follower.set_len(32).unwrap();
         let leader_memory = memory();
         let follower_memory = memory();
@@ -555,7 +555,7 @@ mod tests {
     fn a_room_grant_below_the_floor_never_raises_the_cap_the_watchdog_lowered() {
         // Run 5424 (an 8 GB laptop card): the executor held its cap, the card was below its
         // floor, and the grant answered with what the process held, above the watchdog's cap.
-        let cell = crate::os::memfd().unwrap();
+        let cell = cozy_platform::shm::memfd_named("tensord-weights").unwrap();
         cell.set_len(32).unwrap();
         let memory = memory();
         memory.observe(
@@ -591,7 +591,7 @@ mod tests {
 
     #[test]
     fn an_unmeasured_gpu_publishes_no_room_grant() {
-        let cell = crate::os::memfd().unwrap();
+        let cell = cozy_platform::shm::memfd_named("tensord-weights").unwrap();
         cell.set_len(32).unwrap();
         let memory = memory();
         assert_eq!(
@@ -608,9 +608,9 @@ mod tests {
 
     #[test]
     fn a_failed_room_cell_does_not_record_an_unpublished_cap() {
-        let cell = crate::os::memfd().unwrap();
+        let cell = cozy_platform::shm::memfd_named("tensord-weights").unwrap();
         cell.set_len(32).unwrap();
-        crate::os::seal(&cell).unwrap();
+        cozy_platform::shm::seal(&cell).unwrap();
         let memory = memory();
         assert!(memory.grant_room("plan", &sample(30), Some(&cell)).is_err());
         assert_eq!(memory.with(|gpu| gpu.tenant("plan").unwrap().cap), 0);

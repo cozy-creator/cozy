@@ -4,7 +4,6 @@
 //! and object descriptors. Runtime parses the metadata, constructs models and performs GPU
 //! transfers/mappings with its own TensorFS plane. Selection remains the access boundary.
 use crate::device_executor::{Answer, Frame};
-use crate::os;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -199,9 +198,9 @@ impl ModelSources {
     /// Answer a `model_source` request: the bytes in a sealed memfd, with their digest.
     pub fn serve(&self, frame: &Frame) -> io::Result<(Answer, File)> {
         let bytes = self.source(&frame.manifest, &frame.name)?;
-        let mut file = os::memfd()?;
+        let mut file = cozy_platform::shm::memfd_named("tensord-weights")?;
         file.write_all(&bytes)?;
-        os::seal(&file)?;
+        cozy_platform::shm::seal(&file)?;
         let file = File::open(format!("/proc/self/fd/{}", file.as_raw_fd()))?;
         let mut answer = Answer::unavailable(frame.seq);
         (answer.ok, answer.held) = (true, true);
