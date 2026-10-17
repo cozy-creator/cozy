@@ -94,3 +94,47 @@ mod tests {
         assert!(watch.wait(WAKE).unwrap(), "a write to the rotated file");
     }
 }
+
+#[cfg(test)]
+mod measure {
+    use super::*;
+    use std::{fs, io::Write, time::Instant};
+
+    #[test]
+    #[ignore]
+    fn measure_how_late_each_kind_of_write_wakes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut watch = DirWatch::new(dir.path()).unwrap();
+        let mut log = fs::File::create(dir.path().join("a.log")).unwrap();
+        assert!(watch.wait(Duration::from_secs(10)).unwrap());
+        while watch.wait(Duration::from_millis(50)).unwrap() {}
+        let woke = |watch: &mut DirWatch, what: &str| {
+            let began = Instant::now();
+            let woke = watch.wait(Duration::from_secs(10)).unwrap();
+            eprintln!("MEASURE {what}: woke={woke} after {:?}", began.elapsed());
+            while watch.wait(Duration::from_millis(50)).unwrap() {}
+        };
+        writeln!(log, "plain").unwrap();
+        woke(&mut watch, "write");
+        writeln!(log, "synced").unwrap();
+        log.sync_data().unwrap();
+        woke(&mut watch, "write + sync_data");
+        writeln!(log, "metadata").unwrap();
+        log.sync_all().unwrap();
+        woke(&mut watch, "write + sync_all");
+        writeln!(log, "closed").unwrap();
+        drop(log);
+        woke(&mut watch, "write + close");
+        let mut reopened = fs::OpenOptions::new().append(true).open(dir.path().join("a.log")).unwrap();
+        writeln!(reopened, "reopened").unwrap();
+        woke(&mut watch, "reopen + write");
+        for n in 0..3 {
+            let began = Instant::now();
+            let mut other = fs::File::open(dir.path().join("a.log")).unwrap();
+            let mut s = String::new();
+            std::io::Read::read_to_string(&mut other, &mut s).unwrap();
+            writeln!(reopened, "after a reader {n}").unwrap();
+            woke(&mut watch, &format!("write after a reader opened ({:?})", began.elapsed()));
+        }
+    }
+}
