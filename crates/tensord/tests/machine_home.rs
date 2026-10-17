@@ -1,6 +1,7 @@
 //! This computer's machine (`--persistent`) from nothing but its user's home: its root, port,
 //! keys and log come from `~/.cozy`. A key `cozy machine authorize` appends is admitted at the
-//! next call, a restart keeps the port, and the machine's own log reads back over Read.
+//! next call, the machine's own log reads back over Read, local code installs on a root with no
+//! uv (the pinned one is fetched), and a restart keeps the port.
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use ed25519_dalek::{pkcs8::EncodePrivateKey, SigningKey};
 use std::{
@@ -78,6 +79,16 @@ fn authorized<T>(message: T, key: &SigningKey) -> Request<T> {
     request
 }
 
+/// `bytes` written to the machine as one object: its digest.
+async fn write(client: &mut MachineClient<Channel>, key: &SigningKey, bytes: &[u8]) -> String {
+    let digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(bytes));
+    let mut frames = vec![v1::WriteFrame { digest: digest.clone(), length: bytes.len() as u64, offset: 0, data: vec![] }];
+    frames.extend(bytes.chunks(64 << 10).map(|chunk| v1::WriteFrame { data: chunk.to_vec(), ..Default::default() }));
+    let held = client.write(authorized(tokio_stream::iter(frames), key)).await.unwrap().into_inner().held;
+    assert_eq!(held, bytes.len() as u64);
+    digest
+}
+
 /// A machine cap's Status: the first frame, or the refusal.
 async fn status(client: &mut MachineClient<Channel>, key: &SigningKey) -> Result<v1::StatusFrame, tonic::Status> {
     let mut frames = client.status(authorized(v1::StatusRequest { keepalive: false }, key)).await?.into_inner();
@@ -118,6 +129,38 @@ async fn this_computers_machine_runs_from_its_home() {
     assert!(text.contains("readiness sealed"), "{text}");
     let logs = home.path().join(".cozy/machine/var/lib/cozy/machine/logs");
     assert!(std::fs::read_dir(&logs).unwrap().flatten().any(|e| e.file_name().to_string_lossy().starts_with("tensord.")));
+
+    // Local code on a fresh root: the pinned uv and the installer helper are made at this first
+    // install, and the warm run returns the code's interface.
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cpu_memo");
+    let mut files = vec![];
+    for name in ["pyproject.toml", "package.toml", "cpu_memo/__init__.py"] {
+        let bytes = std::fs::read(fixture.join(name)).unwrap();
+        let digest = write(&mut client, &owner, &bytes).await;
+        files.push(serde_json::json!({"name": name, "digest": digest, "length": bytes.len()}));
+    }
+    let manifest = serde_json::json!({"package": "local/tensord-cpu-memo", "release": "0.1.0", "files": files});
+    let manifest = write(&mut client, &owner, manifest.to_string().as_bytes()).await;
+    let spec = v1::RunSpec {
+        kind: v1::RunKind::Warm as i32,
+        source: Some(v1::run_spec::Source::Local(v1::LocalSource { manifest })),
+        ..Default::default()
+    };
+    let request = authorized(v1::RunRequest { id: "local".into(), after: 0, spec: Some(spec) }, &owner);
+    let mut events = client.run(request).await.unwrap().into_inner();
+    let mut outcome = None;
+    while let Some(event) = events.message().await.unwrap() {
+        if let Some(v1::run_event::Event::Outcome(done)) = event.event {
+            outcome = Some(done);
+        }
+    }
+    let outcome = outcome.expect("an outcome");
+    assert_eq!(outcome.status, "succeeded", "{outcome:?}");
+    let result: serde_json::Value = serde_json::from_slice(&outcome.result).unwrap();
+    assert!(result["interface"]["entrypoints"].as_array().unwrap().iter().any(|e| e["name"] == "measure"), "{result}");
+    let uv = home.path().join(".cozy/machine/usr/local/bin/uv");
+    let version = Command::new(&uv).arg("--version").output().unwrap();
+    assert!(String::from_utf8_lossy(&version.stdout).starts_with(&format!("uv {}", tensord::machine::client::UV)));
 
     // A restart keeps the port Calcifer recorded.
     drop(client);
