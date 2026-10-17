@@ -599,11 +599,48 @@ pub(crate) async fn list(
     ))
 }
 
+#[derive(Deserialize)]
+pub(crate) struct Fresh {
+    #[serde(default)]
+    fresh: bool,
+}
+
+/// The machine; `?fresh=true` answers a Status it read now, or refuses.
 pub(crate) async fn show(
     State(api): State<Arc<Api>>,
     UrlPath(name): UrlPath<String>,
+    query: Result<Query<Fresh>, QueryRejection>,
 ) -> Result<Json<Machine>, Refusal> {
-    Ok(Json(api.machines.show(&name).await.map_err(Refusal)?))
+    let Query(query) = query.map_err(|e| Refusal(usage(e.body_text())))?;
+    let machine = match query.fresh {
+        true => fresh(&api.machines, &name).await,
+        false => api.machines.show(&name).await,
+    };
+    Ok(Json(machine.map_err(Refusal)?))
+}
+
+/// One of Calcifer's machines with the Status frame it answered now, recorded as its latest:
+/// one that cannot answer is `machine_unavailable`, never its last picture.
+async fn fresh(machines: &Arc<Machines>, text: &str) -> Result<Machine, Error> {
+    let row = machines.store().find_machine(text).map_err(internal)?;
+    let row = row.ok_or_else(|| not_found(text))?;
+    let unavailable = |why: String| {
+        let message = format!("{} cannot answer now: {why}", row.name);
+        Error::new(Kind::Unavailable, "machine_unavailable", message)
+    };
+    if row.state == MachineState::Ended {
+        return Err(unavailable("it has ended".into()));
+    }
+    let link = machines.calcifer.link(&row.name).map_err(unavailable)?;
+    let link = link.ok_or_else(|| unavailable("it has no address yet".into()))?;
+    match first(link.status(false)).await {
+        Ok(frame) => machines.observe(&row.name, frame),
+        Err(e) => {
+            machines.unreachable(&row.name, e.to_string());
+            return Err(unavailable(e.to_string()));
+        }
+    }
+    machines.picture(&row)
 }
 
 /// Rents one under the request's `Idempotency-Key` (202, or 200 when the key had), or adds
