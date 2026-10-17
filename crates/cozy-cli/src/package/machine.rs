@@ -5,9 +5,8 @@ use std::{collections::BTreeMap, path::Path, process::ExitCode};
 use cozy_proto::{
     calcifer::{self, Environment, Machine, MachineState, On, Run, Status, SubmitRun},
     error::{Error, Kind},
-    machine::{self as v1, run_spec::Source},
+    machine::{self as v1, Source},
 };
-use prost::Message as _;
 use serde::{Deserialize, Serialize};
 
 use super::{PackageRef, release_order};
@@ -17,14 +16,13 @@ use crate::{
     run,
 };
 
-fn spec(kind: v1::RunKind, source: Source, catalog_revision: String) -> Vec<u8> {
+fn spec(kind: v1::RunKind, source: Source, catalog_revision: String) -> v1::RunSpec {
     v1::RunSpec {
-        kind: kind as i32,
+        kind,
         source: Some(source),
         catalog_revision,
         ..Default::default()
     }
-    .encode_to_vec()
 }
 
 fn release(package: &str, release: &str) -> Source {
@@ -40,7 +38,7 @@ async fn submit(
     hub: &str,
     kind: calcifer::Kind,
     target: String,
-    spec: Vec<u8>,
+    spec: v1::RunSpec,
 ) -> Result<Run, Error> {
     let ask = SubmitRun {
         on,

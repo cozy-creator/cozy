@@ -227,14 +227,13 @@ fn held(on: &str, hub: &SilentHub) -> serde_json::Value {
     submission(on, &common::warm_spec(&hub.origin(), vec![]))
 }
 
-fn submission(on: &str, spec: &[u8]) -> serde_json::Value {
-    use base64::Engine as _;
+fn submission(on: &str, spec: &cozy_proto::machine::RunSpec) -> serde_json::Value {
     json!({
         "on": on,
         "hub": "https://tensorhub.com",
         "kind": "warm",
         "target": "cozy-test/held",
-        "spec": base64::engine::general_purpose::STANDARD.encode(spec),
+        "spec": spec,
     })
 }
 

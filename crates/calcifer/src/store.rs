@@ -120,6 +120,9 @@ const MIGRATIONS: &[M] = &[
         ALTER TABLE asks ADD COLUMN kind TEXT NOT NULL DEFAULT 'rent' CHECK (kind IN ('rent', 'end'));
         ALTER TABLE asks ADD COLUMN run TEXT REFERENCES runs (id);",
     ),
+    // xs-044: a run's spec and outcome are JSON. Protobuf ones from before are not kept: an
+    // unconfirmed run fails `spec_not_kept`, a settled one keeps all but its result.
+    M::up("UPDATE runs SET spec = x'', outcome = NULL;"),
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -160,7 +163,8 @@ pub struct RunRow {
     pub machine: Option<String>,
     /// The caller named the machine: the run is never placed elsewhere.
     pub pinned: bool,
-    pub spec: Vec<u8>,
+    /// The spec as it is sent; none when it was not kept (before xs-044).
+    pub spec: Option<v1::RunSpec>,
     pub out_dir: PathBuf,
     pub state: State,
     pub cancel_requested: bool,
@@ -200,7 +204,7 @@ pub struct NewRun {
     pub hub: String,
     pub machine: Option<String>,
     pub pinned: bool,
-    pub spec: Vec<u8>,
+    pub spec: v1::RunSpec,
     pub out_dir: PathBuf,
     pub warnings: Vec<Warning>,
     pub inputs: Vec<(Digest, u64)>,
@@ -559,7 +563,7 @@ impl Store {
                     new.target,
                     machine,
                     new.pinned,
-                    new.spec,
+                    serde_json::to_vec(&new.spec).expect("serializes"),
                     new.out_dir.to_string_lossy(),
                     now_ms(),
                     serde_json::to_string(&new.warnings).expect("serializes"),
@@ -667,7 +671,8 @@ impl Store {
             run.measurements = row
                 .outcome
                 .as_ref()
-                .and_then(|outcome| serde_json::from_slice(&outcome.measurements).ok());
+                .and_then(|outcome| outcome.measurements.as_ref())
+                .and_then(|measurements| serde_json::from_str(measurements.get()).ok());
             let mut statement = conn.prepare(
                 "SELECT text FROM run_logs WHERE run = ?1 AND level = 'call' ORDER BY seq",
             )?;
@@ -772,7 +777,7 @@ impl Store {
                 });
             tx.execute(
                 "UPDATE runs SET cursor = MAX(cursor, ?2), outcome = ?3 WHERE id = ?1",
-                params![id, cursor as i64, prost::Message::encode_to_vec(outcome)],
+                params![id, cursor as i64, serde_json::to_vec(outcome).expect("serializes")],
             )?;
             events.extend(end(tx, id, status, reason)?);
             Ok(events)
@@ -1119,6 +1124,7 @@ fn run_row(r: &Row) -> rusqlite::Result<Result<RunRow>> {
     let out_dir: String = r.get(8)?;
     let warnings: String = r.get(20)?;
     let inputs: String = r.get(21)?;
+    let spec: Vec<u8> = r.get(7)?;
     let outcome: Option<Vec<u8>> = r.get(22)?;
     Ok((|| {
         Ok(RunRow {
@@ -1129,7 +1135,10 @@ fn run_row(r: &Row) -> rusqlite::Result<Result<RunRow>> {
             hub: r.get(4)?,
             machine: r.get(5)?,
             pinned: r.get(6)?,
-            spec: r.get(7)?,
+            spec: match spec.is_empty() {
+                true => None,
+                false => Some(serde_json::from_slice(&spec).map_err(|_| corrupt("a run's spec"))?),
+            },
             out_dir: PathBuf::from(out_dir),
             state: match state.as_str() {
                 "queued" => State::Queued,
@@ -1158,9 +1167,9 @@ fn run_row(r: &Row) -> rusqlite::Result<Result<RunRow>> {
             warnings: serde_json::from_str(&warnings).map_err(|_| corrupt("a run's warnings"))?,
             inputs: serde_json::from_str(&inputs).map_err(|_| corrupt("a run's inputs"))?,
             outcome: match outcome {
-                Some(bytes) => Some(
-                    prost::Message::decode(bytes.as_slice()).map_err(|_| corrupt("an outcome"))?,
-                ),
+                Some(bytes) => {
+                    Some(serde_json::from_slice(&bytes).map_err(|_| corrupt("an outcome"))?)
+                }
                 None => None,
             },
         })
@@ -1580,7 +1589,8 @@ fn record(conn: &Connection, row: &RunRow) -> Result<Run> {
         result: row
             .outcome
             .as_ref()
-            .and_then(|outcome| serde_json::from_slice(&outcome.result).ok()),
+            .and_then(|outcome| outcome.result.as_ref())
+            .and_then(|result| serde_json::from_str(result.get()).ok()),
         execution_ms: row
             .outcome
             .as_ref()

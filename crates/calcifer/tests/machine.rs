@@ -20,13 +20,16 @@ use cozy_proto::{
     ids::RunId,
     machine as v1,
 };
-use prost::Message as _;
 
 fn open(home: &Path) -> Arc<Calcifer> {
     Calcifer::open(&home.join("calcifer"), &home.join("outputs")).unwrap()
 }
 
-fn submit(on: &str, spec: Vec<u8>, inputs: Vec<cozy_proto::calcifer::StagedInput>) -> SubmitRun {
+fn submit(
+    on: &str,
+    spec: v1::RunSpec,
+    inputs: Vec<cozy_proto::calcifer::StagedInput>,
+) -> SubmitRun {
     SubmitRun {
         on: On::from(on.to_owned()),
         hub: "https://tensorhub.com".into(),
@@ -260,8 +263,8 @@ async fn a_sent_run_its_machine_never_got_is_sent_again_after_a_restart() {
         .unwrap();
     // The spec names no Hub: the run's own Hub is filled in at the send.
     let spec = v1::RunSpec {
-        kind: v1::RunKind::Warm as i32,
-        source: Some(v1::run_spec::Source::Release(v1::Release {
+        kind: v1::RunKind::Warm,
+        source: Some(v1::Source::Release(v1::Release {
             package: "cozy-test/held".into(),
             release: String::new(),
         })),
@@ -269,7 +272,7 @@ async fn a_sent_run_its_machine_never_got_is_sent_again_after_a_restart() {
     };
     let submitted = SubmitRun {
         hub: hub.origin(),
-        ..submit("m", spec.encode_to_vec(), vec![])
+        ..submit("m", spec, vec![])
     };
     let id = first.submit("k", submitted).await.unwrap().run.id;
     first.close();
@@ -368,6 +371,64 @@ async fn a_run_lost_after_acceptance_fails_and_is_not_run_again() {
         (row.state, row.machine.as_deref()),
         (State::Settled, Some("a"))
     );
+    calcifer.close();
+}
+
+/// Runs recorded before specs were JSON keep none (the store's xs-044 step clears protobuf
+/// ones): one its machine holds is followed from its cursor to the machine's own outcome; one its
+/// machine never got fails `spec_not_kept` and is never sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runs_whose_spec_was_not_kept_are_followed_and_never_sent() {
+    let home = tempfile::tempdir().unwrap();
+    let key = common::key_file(home.path());
+    let machine = Tensord::start();
+    let hub = SilentHub::new();
+    let first = open(home.path());
+    first.put_machine(&machine.row("m", &key)).unwrap();
+    let mut events = first.subscribe();
+    let spec = common::warm_spec(&hub.origin(), vec![]);
+    let held = first.submit("k1", submit("m", spec.clone(), vec![])).await;
+    let held = held.unwrap().run.id;
+    until(&mut events, &held, is_status(Status::InProgress)).await;
+    first.close();
+    drop(first);
+    let never = RunId::mint([9; 12]);
+    let store = Store::open(&home.path().join("calcifer/state.db")).unwrap();
+    let new = calcifer::store::NewRun {
+        id: never.clone(),
+        kind: Kind::Warm,
+        target: "cozy-test/held".into(),
+        hub: hub.origin(),
+        machine: Some("m".into()),
+        pinned: true,
+        spec,
+        out_dir: home.path().join("outputs"),
+        warnings: vec![],
+        inputs: vec![],
+        wants: None,
+    };
+    store.submit("k2", "sha256:k2", new).unwrap();
+    assert!(store.mark_sent(never.as_str(), "m").unwrap());
+    drop(store);
+    // As a store from before xs-044 holds them: protobuf specs, one step behind.
+    let db = rusqlite::Connection::open(home.path().join("calcifer/state.db")).unwrap();
+    db.execute_batch("UPDATE runs SET spec = x'0802'; PRAGMA user_version = 4;")
+        .unwrap();
+    drop(db);
+
+    let calcifer = open(home.path());
+    let mut events = calcifer.subscribe();
+    settled(&calcifer, &never).await;
+    let row = calcifer.store().run(never.as_str()).unwrap().unwrap();
+    assert_eq!(row.reason.unwrap().code, "spec_not_kept");
+    assert!(
+        matches!(on_machine(&machine, &never).await, Err(LinkError::NotFound)),
+        "never sent"
+    );
+    assert!(calcifer.store().run(held.as_str()).unwrap().unwrap().spec.is_none());
+    calcifer.cancel(&held).unwrap();
+    let end = until(&mut events, &held, |e| e.is_terminal()).await;
+    assert_eq!(reason_of(&end), "canceled", "the machine's own outcome: {end:?}");
     calcifer.close();
 }
 
