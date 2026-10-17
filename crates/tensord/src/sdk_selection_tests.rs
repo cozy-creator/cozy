@@ -1,5 +1,5 @@
-use tensord::published::PackageSdk;
-use tensord::machine::update::Paths;
+use crate::published::PackageSdk;
+use crate::machine::update::Paths;
 use std::{fs, os::unix::fs::symlink, path::Path};
 
 const RUNTIME: &str = "cozy_runtime-0.21.1-py3-none-any.whl";
@@ -91,7 +91,7 @@ fn image_sdk_selection_preserves_baked_and_absent_pair_behavior() {
 #[test]
 #[ignore = "requires COZY_SDK_TEST_RUNTIME_A/B, COZY_SDK_TEST_TENSORFS, COZY_SDK_TEST_REPORT and cached offline uv dependencies"]
 fn same_filename_activation_installs_new_runtime_and_retains_old_generation() {
-    use tensord::{
+    use crate::{
         api::install::InstallerConfig, local_source::LocalSources, machine::client,
         objects::Objects, service::Service,
     };
@@ -162,11 +162,12 @@ fn same_filename_activation_installs_new_runtime_and_retains_old_generation() {
     );
     let manifest = manifest["digest"].as_str().unwrap();
     let selected = || PackageSdk::selected(&paths.sdk(), &root, "uv".into());
-    let local = |sdk: &tensord::published::PackageSdk| {
+    let local = |sdk: &crate::published::PackageSdk| {
         LocalSources::new(
             objects.clone(),
             InstallerConfig {
                 helper_python: helper.clone(),
+                helper_engine: None,
                 python: "3.12".into(),
                 generations: generations.clone(),
                 client_wheel: client.clone(),

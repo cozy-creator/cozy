@@ -204,6 +204,7 @@ pub enum MachineLog {
     Unspecified = 0,
     TensorfsTransport = 1,
     Memory = 2,
+    Tensord = 3,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
