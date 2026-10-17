@@ -759,17 +759,33 @@ impl Calcifer {
     }
 
     /// Writes the run's staged objects to its machine, each shown as the run's `writing` stage.
-    /// One object is written to one machine once at a time: a run naming an object another run
-    /// is writing there waits its turn, then finds it held.
+    /// What the machine already holds is asked once for all of them. One object is written to one
+    /// machine once at a time: a run naming an object another run is writing there waits its
+    /// turn, then asks again what is held.
     async fn write_inputs(&self, link: &Link, run: &RunRow, machine: &str) -> Result<(), Stop> {
+        if run.inputs.is_empty() {
+            return Ok(());
+        }
         let names: HashMap<&str, &str> = (run.spec.iter())
             .flat_map(|spec| &spec.inputs)
             .map(|i| (i.digest.as_str(), i.field.as_str()))
             .collect();
-        for (digest, length) in &run.inputs {
+        let digests: Vec<Digest> = run.inputs.iter().map(|(digest, _)| *digest).collect();
+        let held = link.held_many(&digests).await?;
+        for ((digest, length), held) in run.inputs.iter().zip(held) {
+            if v1::held_bytes(&held) >= *length {
+                continue;
+            }
             let key = (machine.to_owned(), *digest);
             let turn = lock(&self.writing).entry(key.clone()).or_default().clone();
-            let held = turn.lock().await;
+            let (mine, held) = match turn.try_lock() {
+                Ok(mine) => (mine, held),
+                Err(_) => {
+                    let mine = turn.lock().await;
+                    let now = link.held_many(std::slice::from_ref(digest)).await?;
+                    (mine, now.into_iter().next().unwrap_or_default())
+                }
+            };
             let hex = hex::encode(digest.bytes());
             let path = self.inputs.join(&hex);
             let name = match names.get(digest.to_string().as_str()) {
@@ -777,7 +793,7 @@ impl Calcifer {
                 None => format!("sha256:{}", &hex[..12]),
             };
             let written = link
-                .write(digest, *length, &path, |done, rate| {
+                .write(digest, *length, &path, held, |done, rate| {
                     let mut reason = format!(
                         "writing {name}: {}/{}",
                         bytes(done as f64),
@@ -789,7 +805,7 @@ impl Calcifer {
                     self.waiting(&run.id, reason);
                 })
                 .await;
-            drop(held);
+            drop(mine);
             let mut writing = lock(&self.writing);
             if Arc::strong_count(&turn) <= 2 {
                 writing.remove(&key);

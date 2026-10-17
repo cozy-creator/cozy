@@ -86,6 +86,7 @@ pub(super) fn router<B: MachineBackend>(identity: Arc<MachineIdentity>, backend:
         .route(path::TRIAGE, get(triage::<B>))
         .route(path::LOG, get(log::<B>))
         .route(path::OBJECT, put(put_object::<B>).head(head_object::<B>))
+        .route(path::OBJECTS_HELD, post(held_objects::<B>).layer(DefaultBodyLimit::max(16 << 20)))
         .route(path::HEALTH, get(health))
         .fallback(|| async { Refusal::from(Error::not_found("route_not_found", "this machine serves no such path")) })
         .method_not_allowed_fallback(|| async {
@@ -532,6 +533,24 @@ async fn head_object<B: MachineBackend>(State(m): State<Machine<B>>, Path(digest
     let (runs, actor) = (runs_of(&m)?, crate::machine_api::actor_id(caller.actor));
     let ranges = blocking(&runs, move |runs| runs.objects.held(&actor, &digest).map_err(Into::into)).await?;
     Ok((StatusCode::OK, [(v1::HELD, held(&ranges))]).into_response())
+}
+
+/// `POST /v1/objects/held`: `HEAD`'s answer for many objects in one request, in the order asked.
+async fn held_objects<B: MachineBackend>(State(m): State<Machine<B>>, headers: HeaderMap, body: Bytes) -> Answer {
+    let caller = m.caller(&headers)?;
+    caller.machine()?;
+    let ask: v1::HeldRequest = serde_json::from_slice(&body)
+        .map_err(|e| Error::validation("invalid_request", format!("the held request is not JSON: {e}")))?;
+    let (runs, actor) = (runs_of(&m)?, crate::machine_api::actor_id(caller.actor));
+    let held = blocking(&runs, move |runs| {
+        let held = ask.digests.into_iter().map(|digest| {
+            let ranges = runs.objects.held(&actor, &digest)?;
+            Ok(v1::HeldObject { digest, ranges })
+        });
+        held.collect::<Result<Vec<_>, crate::objects::Refused>>().map_err(Into::into)
+    })
+    .await?;
+    Ok(json(StatusCode::OK, &v1::HeldAnswer { held }))
 }
 
 /// `PUT /v1/objects/sha256:<hex>`: lands the body at the offset its `Content-Range` names (the

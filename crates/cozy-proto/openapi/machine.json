@@ -108,6 +108,45 @@
         }
       }
     },
+    "/v1/objects/held": {
+      "post": {
+        "tags": [],
+        "summary": "What the machine holds of many objects in one request, in the order asked: each stored object\nwhole (renewed, as a `HEAD` renews it), else the ranges its upload has landed.",
+        "operationId": "held_objects",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HeldRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Each object's held ranges",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HeldAnswer"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A digest that is not `sha256:<hex>`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/objects/{digest}": {
       "put": {
         "tags": [],
@@ -1028,6 +1067,54 @@
             "format": "int32",
             "default": 0,
             "minimum": 0
+          }
+        }
+      },
+      "HeldAnswer": {
+        "type": "object",
+        "description": "What the machine holds of each object asked, in the order asked; a stored object is held\nwhole, and asking renews it, as a `HEAD` does.",
+        "properties": {
+          "held": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/HeldObject"
+            },
+            "default": []
+          }
+        }
+      },
+      "HeldObject": {
+        "type": "object",
+        "properties": {
+          "digest": {
+            "type": "string",
+            "default": ""
+          },
+          "ranges": {
+            "type": "array",
+            "items": {
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              }
+            },
+            "description": "Byte ranges `[start, end)`; none: nothing held.",
+            "default": []
+          }
+        }
+      },
+      "HeldRequest": {
+        "type": "object",
+        "description": "`POST /v1/objects/held`: which of these objects (`sha256:<hex>`) the machine holds for this\nsigner.",
+        "properties": {
+          "digests": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": []
           }
         }
       },

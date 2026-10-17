@@ -212,3 +212,71 @@ async fn a_runs_output_downloads_near_the_link_rate_over_a_long_round_trip() {
     );
     calcifer.close();
 }
+
+/// A run naming many inputs its machine already holds asks what is held once: it is sent about
+/// one round trip later than a run with no inputs, not one round trip per input.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs the loopback shaped for port 47123; see the module doc"]
+async fn inputs_the_machine_holds_are_asked_about_once_over_a_long_round_trip() {
+    const INPUTS: usize = 100;
+    let home = tempfile::tempdir().unwrap();
+    let key = common::key_file(home.path());
+    let machine = Tensord::start_at(SHAPED, &[]);
+    let hub = SilentHub::new();
+    let calcifer =
+        Calcifer::open(&home.path().join("calcifer"), &home.path().join("outputs")).unwrap();
+    calcifer.put_machine(&machine.row("m", &key)).unwrap();
+    let mut events = calcifer.subscribe();
+    let inputs: Vec<_> = (0..INPUTS)
+        .map(|i| {
+            let bytes = format!("input {i}").into_bytes();
+            let path = home.path().join(format!("input-{i}"));
+            std::fs::write(&path, &bytes).unwrap();
+            let digest = cozy_proto::ids::Digest::of(&bytes);
+            let length = bytes.len() as u64;
+            let staged = cozy_proto::calcifer::StagedInput { path, digest, length };
+            let spec = cozy_proto::machine::InputFile {
+                field: format!("images[{i}]"),
+                digest: digest.to_string(),
+                length,
+                media_type: "image/png".into(),
+                order: i as u32,
+            };
+            (staged, spec)
+        })
+        .collect();
+    // Sent, then accepted: how long a run takes from its submit to its machine's acceptance.
+    let mut sent = async |key: &str, inputs: &[(cozy_proto::calcifer::StagedInput, cozy_proto::machine::InputFile)]| {
+        let submit = SubmitRun {
+            on: On::from("m".to_owned()),
+            hub: "https://tensorhub.com".into(),
+            kind: Kind::Warm,
+            target: "cozy-test/held".into(),
+            spec: common::warm_spec(&hub.origin(), inputs.iter().map(|(_, i)| i.clone()).collect()),
+            inputs: inputs.iter().map(|(s, _)| s.clone()).collect(),
+            out: None,
+            warnings: vec![],
+        };
+        let started = Instant::now();
+        let id = calcifer.submit(key, submit).await.unwrap().run.id;
+        common::until(&mut events, &id, |e| matches!(e, Event::InProgress { .. })).await;
+        started.elapsed()
+    };
+    let writing = sent("write", &inputs).await;
+    let bare = sent("bare", &[]).await;
+    let held = sent("held", &inputs).await;
+    // One round trip on this link, on a connection already open.
+    let link = calcifer::Link::new(&machine.endpoint, common::key()).unwrap();
+    link.held_many(&[]).await.unwrap();
+    let probe = Instant::now();
+    link.held_many(&[inputs[0].0.digest]).await.unwrap();
+    let round_trip = probe.elapsed();
+    eprintln!(
+        "{INPUTS} inputs written and sent in {writing:.1?}; with none sent in {bare:.1?}; all held, sent in {held:.1?}; a round trip {round_trip:.1?}"
+    );
+    assert!(
+        held <= bare + round_trip * 2,
+        "{held:?} for {INPUTS} held inputs against {bare:?} for none, at {round_trip:?} a round trip"
+    );
+    calcifer.close();
+}

@@ -144,3 +144,40 @@ async fn this_computers_machine_runs_from_its_home() {
     assert_eq!(second["address"], first["address"]);
     assert_eq!(second["cert_pem"], first["cert_pem"], "the pinned leaf survives a restart");
 }
+
+/// What is held of 1,000 objects is one request: each stored one whole, a partial upload its
+/// ranges, an unknown one nothing, in the order asked; a digest that is not one is refused.
+#[tokio::test]
+async fn a_thousand_objects_answer_what_is_held_in_one_request() {
+    let home = tempfile::tempdir().unwrap();
+    let keys = home.path().join(".cozy/keys");
+    std::fs::create_dir_all(&keys).unwrap();
+    let owner = SigningKey::from_bytes(&[5; 32]);
+    std::fs::write(keys.join("owner.pem"), owner.to_pkcs8_pem(Default::default()).unwrap().as_bytes()).unwrap();
+    let mut machine = boot(home.path());
+    let client = client(&ready(&mut machine, home.path()), &owner);
+
+    let mut asked = vec![];
+    for i in 0..998u32 {
+        asked.push(write(&client, format!("object {i}").as_bytes()).await);
+    }
+    let partial = b"0123456789".to_vec();
+    let digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&partial));
+    client.bulk().unwrap().put(&digest, (6, 4, 10), partial[6..].to_vec()).await.unwrap();
+    asked.push(digest);
+    asked.push(format!("sha256:{}", "0".repeat(64)));
+
+    let started = Instant::now();
+    let held = client.held_many(&asked).await.unwrap();
+    eprintln!("1,000 objects asked in {:?}", started.elapsed());
+    let digests: Vec<&str> = held.iter().map(|h| h.digest.as_str()).collect();
+    assert_eq!(digests, asked.iter().map(String::as_str).collect::<Vec<_>>());
+    for (i, object) in held[..998].iter().enumerate() {
+        assert_eq!(object.ranges, [(0, format!("object {i}").len() as u64)], "{object:?}");
+    }
+    assert_eq!(held[998].ranges, [(6, 10)]);
+    assert_eq!(held[999].ranges, []);
+
+    let refused = client.held_many(&["sha256:nope".into()]).await.unwrap_err();
+    assert_eq!(refused.status(), Some(400), "{refused:?}");
+}
