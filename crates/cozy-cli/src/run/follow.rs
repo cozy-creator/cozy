@@ -53,6 +53,21 @@ pub(crate) async fn follow(ctx: &Context, run: Run, detach: bool) -> Result<Run,
         record(ctx, &run);
         return Ok(run);
     }
+    let run = watch(ctx, run, ctx.json).await?;
+    if !ctx.json {
+        record(ctx, &run);
+    }
+    Ok(run)
+}
+
+/// Follows a run another one waits on (local code's install): its progress on a terminal, no
+/// record and no events of its own.
+pub(super) async fn settle(ctx: &Context, run: Run) -> Result<Run, Error> {
+    watch(ctx, run, false).await
+}
+
+/// Renders `run`'s events until its stream ends (NDJSON with `events`); Ctrl-C stops early.
+async fn watch(ctx: &Context, run: Run, events_out: bool) -> Result<Run, Error> {
     let calcifer = ctx.calcifer().await?;
     let mut events = calcifer.events(run.id.as_str(), 0);
     let mut view = View::new(ctx, &run);
@@ -76,17 +91,14 @@ pub(crate) async fn follow(ctx: &Context, run: Run, detach: bool) -> Result<Run,
                     view.done();
                     return Err(error);
                 }
-                Some(Ok(event)) if ctx.json => output::ndjson(&event),
+                Some(Ok(event)) if events_out => output::ndjson(&event),
+                Some(Ok(_)) if ctx.json => {}
                 Some(Ok(event)) => view.on(&event),
             }
         }
     }
     view.done();
-    let run = calcifer.run(id.as_str()).await?;
-    if !ctx.json {
-        record(ctx, &run);
-    }
-    Ok(run)
+    calcifer.run(id.as_str()).await
 }
 
 pub(crate) fn settled(run: &Run) -> bool {
@@ -161,16 +173,20 @@ pub(super) fn next(ctx: &Context, run: &Run) {
     }
 }
 
-/// The status as people read it: `canceling` once a cancel is asked, `⚠` when warned.
-pub(super) fn status(run: &Run) -> String {
-    let mut status = match run.status {
+/// A status's word.
+pub(super) fn status_word(status: Status) -> &'static str {
+    match status {
         Status::Queued => "queued",
         Status::InProgress => "in_progress",
         Status::Completed => "completed",
         Status::Failed => "failed",
         Status::Canceled => "canceled",
     }
-    .to_owned();
+}
+
+/// The status as people read it: `canceling` once a cancel is asked, `⚠` when warned.
+pub(super) fn status(run: &Run) -> String {
+    let mut status = status_word(run.status).to_owned();
     if run.cancel_requested && !settled(run) {
         status = "canceling".into();
     }

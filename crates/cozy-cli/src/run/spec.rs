@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use cozy_proto::{
     calcifer::{Kind as RunKind, On, StagedInput, SubmitRun, Warning},
-    error::Error,
+    error::{Error, Kind},
     machine::{self as v1, ModelChoice},
 };
 use prost::Message as _;
@@ -15,11 +15,11 @@ use super::{
 };
 use crate::model::refs::ModelRef;
 
-/// A published function as a run names it.
+/// A function as a run names it: a published release's, or local code's.
 pub struct Call<'a> {
+    /// `org/pkg`, or local code's `local/<dist>`.
     pub package: &'a str,
-    /// Empty: the machine runs the release it holds, else the newest.
-    pub release: Option<&'a str>,
+    pub source: Source<'a>,
     pub callable: &'a Callable,
     /// 0: every GPU the run's slots support on its machine.
     pub gpus: u32,
@@ -27,13 +27,24 @@ pub struct Call<'a> {
     pub bits: u32,
 }
 
+/// Where the machine finds the function's code.
+pub enum Source<'a> {
+    /// A published release; none: the one the machine holds, else the newest.
+    Release(Option<&'a str>),
+    /// Local code the machine installed under `installation`, from `source`, for `owner`.
+    Local {
+        source: &'a v1::LocalSource,
+        installation: Option<&'a str>,
+    },
+}
+
 impl Call<'_> {
-    /// The run's name for people: `org/pkg/fn[@release]`.
+    /// The run's name for people: `org/pkg/fn[@release]`, `local/<dist>/fn`.
     pub fn target(&self) -> String {
         let target = format!("{}/{}", self.package, self.callable.name);
-        match self.release {
-            Some(release) => format!("{target}@{release}"),
-            None => target,
+        match self.source {
+            Source::Release(Some(release)) => format!("{target}@{release}"),
+            _ => target,
         }
     }
 
@@ -41,7 +52,11 @@ impl Call<'_> {
     pub fn spec(&self, bound: &Bound) -> Result<v1::RunSpec, Error> {
         Ok(v1::RunSpec {
             kind: v1::RunKind::Call.into(),
-            source: Some(v1::run_spec::Source::Release(self.release())),
+            source: Some(match self.source {
+                Source::Release(_) => v1::run_spec::Source::Release(self.release()),
+                // The same source as the install: unchanged, the machine installs nothing again.
+                Source::Local { source, .. } => v1::run_spec::Source::Local(source.clone()),
+            }),
             entrypoint: self.callable.name.clone(),
             payload: bound.canonical_payload(),
             inputs: bound
@@ -74,8 +89,26 @@ impl Call<'_> {
             Warm::Gpu => v1::WarmLevel::Gpu,
             Warm::Off => v1::WarmLevel::Unspecified,
         };
+        let source = match self.source {
+            Source::Release(_) => v1::warm_item::Source::Release(self.release()),
+            Source::Local {
+                installation: Some(installation),
+                ..
+            } => v1::warm_item::Source::Installation(installation.to_owned()),
+            // An older machine's install names no installation, which a warm set needs.
+            Source::Local {
+                installation: None, ..
+            } => {
+                return Err(Error::new(
+                    Kind::Unavailable,
+                    "local_warm_unsupported",
+                    "this machine names no installation for local code, so it cannot keep it ready",
+                )
+                .remedy("update the machine: `cozy machine update <name>`"));
+            }
+        };
         let item = v1::WarmItem {
-            source: Some(v1::warm_item::Source::Release(self.release())),
+            source: Some(source),
             entrypoint: self.callable.name.clone(),
             models: choices(models)?,
             level: level.into(),
@@ -134,9 +167,13 @@ impl Call<'_> {
     }
 
     fn release(&self) -> v1::Release {
+        let release = match self.source {
+            Source::Release(release) => release.unwrap_or_default(),
+            Source::Local { .. } => "",
+        };
         v1::Release {
             package: self.package.to_owned(),
-            release: self.release.unwrap_or_default().to_owned(),
+            release: release.to_owned(),
         }
     }
 }
@@ -204,7 +241,7 @@ mod tests {
         let bound = bind("fidika/sdxl/generate", generate, &with).unwrap();
         let call = Call {
             package: "fidika/sdxl",
-            release: None,
+            source: Source::Release(None),
             callable: generate,
             gpus: 2,
             bits: 8,
@@ -265,7 +302,7 @@ mod tests {
         let models = warm_choices(generate, &terms(&["model.model=fidika/base@2"])).unwrap();
         let call = Call {
             package: "fidika/sdxl",
-            release: Some("2.10.0"),
+            source: Source::Release(Some("2.10.0")),
             callable: generate,
             gpus: 0,
             bits: 16,

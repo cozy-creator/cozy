@@ -57,7 +57,11 @@ fn until(reader: &mut impl BufRead, want: impl Fn(&Value) -> bool) -> Value {
     loop {
         let mut line = String::new();
         assert!(reader.read_line(&mut line).unwrap() > 0, "stdout closed");
-        let event: Value = serde_json::from_str(&line).unwrap_or_else(|e| panic!("{e}: {line}"));
+        let Ok(event) = serde_json::from_str::<Value>(&line) else {
+            let mut rest = String::new();
+            let _ = reader.read_to_string(&mut rest);
+            panic!("not an event: {line}{rest}");
+        };
         if want(&event) {
             return event;
         }
