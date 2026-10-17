@@ -3,7 +3,10 @@
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::{
+    ffi::OsString,
+    fs::OpenOptions,
     io,
+    path::Path,
     process::{Child, ChildStdout, Command, ExitStatus},
     sync::Arc,
     time::Duration,
@@ -267,6 +270,8 @@ pub fn transient(error: &io::Error) -> bool {
     sys::transient(error)
 }
 
+#[cfg(windows)]
+pub(crate) use sys::command_line;
 #[cfg(unix)]
 pub use unix::{cloexec_from, inherit_nothing};
 
@@ -279,33 +284,52 @@ pub fn ended(handle: &impl std::os::fd::AsFd) -> bool {
     )
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Lifetime {
-    /// The spawner's: dropping the `Tree` ends it, and on Windows so does the spawner's death.
-    Owned,
-    /// Outlives the spawner: its own session, no console, out of the spawner's job when allowed.
-    Detached,
-}
-
-/// A process and everything it starts: its own process group (Unix) or Job Object (Windows,
-/// created suspended and resumed only once the job holds it, so nothing ever runs outside it).
-/// The seam sets the command's process group and, on Windows, its creation flags.
+/// A process and everything it starts, the spawner's: dropping the `Tree` ends it, and on Windows
+/// so does the spawner's death. Its own process group (Unix) or Job Object (Windows, created
+/// suspended and resumed only once the job holds it, so nothing ever runs outside it). The seam
+/// sets the command's process group and, on Windows, its creation flags.
 #[derive(Debug)]
 pub struct Tree {
     child: Child,
     group: tree::Group,
-    lifetime: Lifetime,
     reaped: bool,
 }
 
-pub fn spawn(mut command: Command, lifetime: Lifetime) -> Result<Tree> {
-    let (child, group) = tree::spawn(&mut command, lifetime).map_err(Error::os("spawn"))?;
+pub fn spawn(mut command: Command) -> Result<Tree> {
+    let (child, group) = tree::spawn(&mut command).map_err(Error::os("spawn"))?;
     Ok(Tree {
         child,
         group,
-        lifetime,
         reaped: false,
     })
+}
+
+/// A process that outlives its spawner: its own session (Unix); no console, out of the spawner's
+/// job when allowed (Windows). It reads null and appends stdout and stderr to `log` (null without
+/// one), and inherits nothing else: a caller reading the spawner's output to its end, as
+/// `out=$(cozy up)` does, gets that end when the spawner exits.
+pub fn detach(program: &Path, args: &[OsString], log: Option<&Path>) -> Result<Detached> {
+    let log = log
+        .map(|path| {
+            let opened = OpenOptions::new().create(true).append(true).open(path);
+            opened.map_err(Error::io("open log", path))
+        })
+        .transpose()?;
+    let child = tree::detach(program, args, log).map_err(Error::os("spawn"))?;
+    Ok(Detached(child))
+}
+
+#[derive(Debug)]
+pub struct Detached(tree::Detached);
+
+impl Detached {
+    pub fn pid(&self) -> u32 {
+        self.0.pid()
+    }
+
+    pub fn try_wait(&mut self) -> Result<Option<ExitStatus>> {
+        self.0.try_wait().map_err(Error::os("wait for a process"))
+    }
 }
 
 impl Tree {
@@ -346,8 +370,6 @@ impl Tree {
 
 impl Drop for Tree {
     fn drop(&mut self) {
-        if self.lifetime == Lifetime::Owned {
-            let _ = self.kill();
-        }
+        let _ = self.kill();
     }
 }
