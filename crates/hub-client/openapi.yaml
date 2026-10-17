@@ -1180,7 +1180,7 @@ paths:
     get:
       operationId: get_software
       tags: [machine]
-      summary: The Runtime and TensorFS versions machines run.
+      summary: The Runtime, TensorFS and cozy binary versions machines run.
       security: []
       responses:
         '200':
@@ -2904,6 +2904,9 @@ components:
       properties:
         runtime: {type: string}
         tensorfs: {type: string}
+        cozy:
+          type: string
+          description: The cozy binary's release version (`cozy --version`, tag v<cozy>). Absent, a machine keeps its binary.
         pinned:
           type: boolean
           description: The version is the operator's pin, not the current worker image's.

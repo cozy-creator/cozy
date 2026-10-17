@@ -1,6 +1,6 @@
 //! `cozy package install|update|remove|list`: runs on a machine through Calcifer. The machine
 //! resolves releases from the Hub and owns its environments; the CLI reads nothing from the Hub.
-use std::{collections::BTreeMap, process::ExitCode};
+use std::{collections::BTreeMap, path::Path, process::ExitCode};
 
 use cozy_proto::{
     calcifer::{self, Environment, Machine, MachineState, On, Run, Status, SubmitRun},
@@ -107,6 +107,45 @@ pub async fn install(
         warm,
     )
     .await?;
+    installed(ctx, submitted, &package.package(), detach).await
+}
+
+/// A directory or a PEP 723 script, installed live: the next run reads its files as they are
+/// then. This computer's machine reads them in place; another is sent what it lacks.
+pub async fn install_directory(
+    ctx: &Context,
+    path: &Path,
+    on: On,
+    detach: bool,
+) -> Result<ExitCode, Error> {
+    let in_place = matches!(&on, On::Machine(name) if name.eq_ignore_ascii_case("local"));
+    let local = super::local::source(ctx, path, in_place).await?;
+    let warm = spec(
+        v1::RunKind::Warm,
+        Source::Local(local.source.clone()),
+        String::new(),
+    );
+    let ask = SubmitRun {
+        on,
+        hub: ctx.hub()?.origin,
+        kind: calcifer::Kind::Warm,
+        target: local.package.clone(),
+        spec: warm,
+        inputs: local.inputs.clone(),
+        out: None,
+        warnings: vec![],
+    };
+    let submitted = run::submit(ctx, ask, None).await?.run;
+    installed(ctx, submitted, &local.package, detach).await
+}
+
+/// Follows an install to its outcome and says what the machine holds now.
+async fn installed(
+    ctx: &Context,
+    submitted: Run,
+    package: &str,
+    detach: bool,
+) -> Result<ExitCode, Error> {
     let settled = run::follow(ctx, submitted, detach).await?;
     if detach || ctx.json || settled.status != Status::Completed {
         return Ok(run::exit_code(&settled));
@@ -120,20 +159,13 @@ pub async fn install(
     if let Some(installed) = installed {
         output::say(
             ctx,
-            &format!(
-                "{}@{} is installed on {machine}",
-                package.package(),
-                installed.release
-            ),
+            &format!("{package}@{} is installed on {machine}", installed.release),
         );
         let first = run::interface::Interface::parse(&installed.interface)
             .ok()
             .and_then(|interface| interface.public().first().map(|name| name.to_string()));
         if let Some(callable) = first {
-            next.insert(
-                0,
-                format!("cozy run {}/{callable} --describe", package.package()),
-            );
+            next.insert(0, format!("cozy run {package}/{callable} --describe"));
         }
     }
     output::next(ctx, &next.iter().map(String::as_str).collect::<Vec<_>>());

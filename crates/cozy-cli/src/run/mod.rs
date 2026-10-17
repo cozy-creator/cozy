@@ -21,6 +21,7 @@ mod describe;
 mod follow;
 pub(crate) mod interface;
 mod list;
+mod local;
 mod play;
 mod show;
 mod spec;
@@ -210,10 +211,10 @@ async fn run(ctx: &Context, args: RunArgs) -> Result<ExitCode, Error> {
             function,
             release,
         } => (package, function, release),
-        Target::Directory { .. } | Target::Script(_) => {
-            return Err(crate::not_ported("run ./local-code")
-                .remedy("local code runs once machines describe it (xs-043 unit T); publish it, or use the Go cozy"));
+        Target::Directory { path, function } => {
+            return local::run(ctx, &cwd.join(path), function, args).await;
         }
+        Target::Script(path) => return local::run(ctx, &cwd.join(path), None, args).await,
     };
     let hub = ctx.hub()?;
     let (card, read) = catalog::card(ctx, &hub, &package, release.as_deref(), false).await?;
@@ -240,7 +241,6 @@ async fn run(ctx: &Context, args: RunArgs) -> Result<ExitCode, Error> {
         &function,
         (card, read),
         args,
-        cwd,
     )
     .await
 }
@@ -256,8 +256,6 @@ pub(crate) async fn call(
     placement: &Placement,
     detach: bool,
 ) -> Result<ExitCode, Error> {
-    let cwd = std::env::current_dir()
-        .map_err(|e| Error::new(Kind::Internal, "cwd", format!("the working directory: {e}")))?;
     let card = catalog::card(ctx, &ctx.hub()?, package, release, false).await?;
     let args = RunArgs {
         target: None,
@@ -274,7 +272,7 @@ pub(crate) async fn call(
         describe: false,
         idempotency_key: None,
     };
-    invoke(ctx, package, release, function, card, args, cwd).await
+    invoke(ctx, package, release, function, card, args).await
 }
 
 /// A release's card: the kept one, else the Hub's, kept from then on.
@@ -295,21 +293,10 @@ async fn invoke(
     function: &str,
     (mut card, read): (Card, bool),
     args: RunArgs,
-    cwd: PathBuf,
 ) -> Result<ExitCode, Error> {
     let hub = ctx.hub()?;
-    let terms = Terms {
-        inputs: args.inputs,
-        input_file: args.input_file,
-        assets: args.assets,
-        loras: args.loras,
-        key: args.idempotency_key.unwrap_or_else(follow::mint_key),
-        cwd,
-        user_home: ctx.user_home.clone(),
-    };
-    let bits = args
-        .bits
-        .map_or(0, |b| b.parse().expect("clap admits 16, 8 or 4"));
+    let terms = terms(ctx, &args)?;
+    let bits = bits(&args);
     let on = args.placement.on();
     if let Some(level) = args.warm {
         if args.gpus.is_some() {
@@ -323,7 +310,7 @@ async fn invoke(
         let models = bind::warm_choices(callable, &terms)?;
         let call = spec::Call {
             package,
-            release,
+            source: spec::Source::Release(release),
             callable,
             gpus: 0,
             bits,
@@ -351,7 +338,7 @@ async fn invoke(
     let gpus = args.gpus.unwrap_or(0);
     let call = spec::Call {
         package,
-        release,
+        source: spec::Source::Release(release),
         callable,
         gpus,
         bits,
@@ -359,6 +346,31 @@ async fn invoke(
     let out = args.out.map(|dir| terms.cwd.join(dir));
     let submission = call.submission(on, &hub.origin, &call.spec(&bound)?, Some(&bound), out);
     send(ctx, submission, &terms.key, args.detach).await
+}
+
+/// The terms a run was given; an omitted key is minted, as the seed derives from it.
+fn terms(ctx: &Context, args: &RunArgs) -> Result<Terms, Error> {
+    let cwd = std::env::current_dir()
+        .map_err(|e| Error::new(Kind::Internal, "cwd", format!("the working directory: {e}")))?;
+    Ok(Terms {
+        inputs: args.inputs.clone(),
+        input_file: args.input_file.clone(),
+        assets: args.assets.clone(),
+        loras: args.loras.clone(),
+        key: args
+            .idempotency_key
+            .clone()
+            .unwrap_or_else(follow::mint_key),
+        cwd,
+        user_home: ctx.user_home.clone(),
+    })
+}
+
+/// `--bits`; 0 lets the machine's rules choose.
+fn bits(args: &RunArgs) -> u32 {
+    args.bits
+        .as_deref()
+        .map_or(0, |b| b.parse().expect("clap admits 16, 8 or 4"))
 }
 
 /// Submits, then follows the run (or prints it at once with `detach`).
@@ -382,7 +394,20 @@ fn bind(
 ) -> Result<(String, bind::Bound), Error> {
     let callable = callable(package, &card.interface, function)?;
     let target = format!("{package}/{}", callable.name);
-    let bound = bind::bind(&target, callable, terms).map_err(|mut error| {
+    Ok((
+        target.clone(),
+        bind_callable(ctx, &target, callable, terms)?,
+    ))
+}
+
+/// Binds `terms` to `callable`; a person's refusal lists the arguments.
+fn bind_callable(
+    ctx: &Context,
+    target: &str,
+    callable: &Callable,
+    terms: &Terms,
+) -> Result<bind::Bound, Error> {
+    bind::bind(target, callable, terms).map_err(|mut error| {
         if !ctx.json && error.code == "request_payload_invalid" {
             error.message = format!(
                 "{}\n\n{}",
@@ -391,8 +416,7 @@ fn bind(
             );
         }
         error
-    })?;
-    Ok((target, bound))
+    })
 }
 
 /// The function `asked` names: exact, else the one name equal with `-` as `_`.
@@ -451,10 +475,14 @@ fn callable<'a>(
 
 /// `cozy run org/pkg`: the package's public functions.
 fn functions(ctx: &Context, package: &str, card: &Card) {
-    let public = card.interface.public();
+    functions_of(ctx, package, &card.release, &card.interface);
+}
+
+/// A package's public functions, and where each runs.
+fn functions_of(ctx: &Context, package: &str, release: &str, interface: &Interface) {
+    let public = interface.public();
     let runs_on = |name: &str| {
-        let cpu = card
-            .interface
+        let cpu = interface
             .callables
             .iter()
             .any(|c| c.name == name && c.accelerator == Some(false));
@@ -466,7 +494,7 @@ fn functions(ctx: &Context, package: &str, card: &Card) {
             .map(|name| serde_json::json!({"function": name, "runs_on": runs_on(name)}))
             .collect();
         output::json(
-            &serde_json::json!({"package": package, "release": card.release, "functions": rows}),
+            &serde_json::json!({"package": package, "release": release, "functions": rows}),
         );
         return;
     }
@@ -474,7 +502,7 @@ fn functions(ctx: &Context, package: &str, card: &Card) {
     for name in &public {
         table = table.row([*name, runs_on(name)]);
     }
-    table.note(format!("{package} {}", card.release)).print();
+    table.note(format!("{package} {release}")).print();
     let next: Vec<String> = public
         .iter()
         .take(2)

@@ -145,6 +145,9 @@ pub async fn show(ctx: &Context, name: &str) -> Result<ExitCode, Error> {
     if let Some(address) = &m.address {
         record = record.field("address", address);
     }
+    if let Some(fingerprint) = &m.fingerprint {
+        record = record.field("fingerprint", fingerprint);
+    }
     if let Some(r) = &m.rental {
         record = record
             .field("sku", &r.sku)
