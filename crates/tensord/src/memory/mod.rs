@@ -21,7 +21,7 @@ use std::{
 const ROTATE_BYTES: u64 = 4 << 20;
 
 /// Budget-cell `wanted` at or below this asks for a process cap of `CAP - wanted` bytes
-/// (Runtime `budget_cell.CAP`, `process_cap/1`).
+/// (Runtime `budget_cell.CAP`).
 const CELL_CAP: i64 = -2;
 
 #[derive(Clone, Debug, Default, Deserialize)]

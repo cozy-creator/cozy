@@ -417,7 +417,7 @@ struct Session {
     followers: Vec<cozy_platform::process::Exact>,
     loaded: bool,
     executor: DeviceExecutor,
-    /// Budget cells by rank: rank 0's own, and each follower's (`rank_cells/1`).
+    /// Budget cells by rank: rank 0's own, and each follower's.
     budget_cells: BTreeMap<u32, File>,
     /// Its selected models' headers and assets, served on `model_source`.
     sources: Arc<ModelSources>,
@@ -704,7 +704,6 @@ impl Pool {
                     .host
                     .ttl_seconds
                     .map_or(defaults.ttl, std::time::Duration::from_secs),
-                plans: Some(root.join("host-plans")),
             },
             // The machine's one pinned host total: executors' pinned budgets split it too.
             Box::new(crate::host_tier::HalfOfHeadroom),
@@ -1142,9 +1141,8 @@ impl Pool {
         if plan.degree != 1 {
             return Ok("a group of GPUs maps its weights at its first call");
         }
-        let offers = |s: &Session| s.executor.hello.offers("weights.map/1");
-        if !self.sessions.lock().unwrap().get(&plan.construction).is_some_and(offers) {
-            return Ok("its Runtime maps no weights ahead of a request");
+        if !self.sessions.lock().unwrap().contains_key(&plan.construction) {
+            return Ok("its executor ended");
         }
         let step = |step: &Step| self.carry_out(0, step);
         let Some(cap) = self.first().admit_member(&plan.construction, true, || self.holdings(), step)? else {
@@ -2387,15 +2385,6 @@ impl Pool {
                 |_, _| Ok(()),
             )?;
             executor.retain_until_exit(directory);
-            if !executor.hello.offers(device_executor::FORK)
-                || !executor.hello.offers("import_only")
-            {
-                executor.shutdown()?;
-                return Ok(ZygoteState::Off(format!(
-                    "Runtime {} does not fork executors",
-                    held.record.identity
-                )));
-            }
             let interface = self.interface_file(&executor, held)?;
             let reply = executor.command(
                 &DeviceCommand::Start {
@@ -2572,17 +2561,13 @@ impl Pool {
                     holding.generation,
                     *bytes,
                 );
-                // Every reader must be an executor here that trims (`weights.trim/1`); an
-                // older one, or a reader this service does not hold, gets the whole revoke.
-                let trims = |s: &Session| s.executor.hello.offers("weights.trim/1");
+                // Every reader must be an executor this service holds; else the whole revoke.
                 let mut sessions = self.sessions.lock().unwrap();
                 let readers = sessions
                     .values()
                     .filter(|s| holding.readers.contains(&s.executor.birth))
-                    .collect::<Vec<_>>();
-                let Some(regions) = regions.filter(|_| {
-                    readers.len() == holding.readers.len() && readers.iter().all(|s| trims(s))
-                }) else {
+                    .count();
+                let Some(regions) = regions.filter(|_| readers == holding.readers.len()) else {
                     drop(sessions);
                     return self.carry_out(device, &Step::Revoke(id.clone()));
                 };
@@ -2634,20 +2619,18 @@ impl Pool {
         };
         if let Step::Unmap(_) = step {
             let session = sessions.get_mut(&key).expect("found above");
-            if session.executor.hello.offers("weight_plane/1") {
-                let reply = session.executor.command(
-                    &DeviceCommand::Budget {
-                        vram_bytes: 0,
-                        pinned_bytes: -1,
-                        cap_bytes: None,
-                    },
-                    &mut device_executor::Baseline,
-                );
-                if let Some(reply) = reply.ok().filter(|reply| reply.ok) {
-                    let facts = plane_facts(reply.plane.as_ref());
-                    self.observe(plan, session.start, session.degree, facts, &reply.rank_planes, Some(false));
-                    return Ok(true);
-                }
+            let reply = session.executor.command(
+                &DeviceCommand::Budget {
+                    vram_bytes: 0,
+                    pinned_bytes: -1,
+                    cap_bytes: None,
+                },
+                &mut device_executor::Baseline,
+            );
+            if let Some(reply) = reply.ok().filter(|reply| reply.ok) {
+                let facts = plane_facts(reply.plane.as_ref());
+                self.observe(plan, session.start, session.degree, facts, &reply.rank_planes, Some(false));
+                return Ok(true);
             }
         }
         let session = sessions.remove(&key).expect("found above");
@@ -2783,8 +2766,7 @@ impl Pool {
     }
 
     /// Launch an executor for `plan` (fork from its generation's import-only executor, else
-    /// spawn) and open its selected metadata sources and CPU-buffer grants. The advertised
-    /// capabilities select sealed-tier delivery or the supported legacy peer route.
+    /// spawn) and open its selected metadata sources and CPU-buffer grants.
     fn new_session(
         &self,
         engine: &Arc<Engine>,
@@ -2863,9 +2845,8 @@ impl Pool {
             id,
         });
         let sources = Arc::new(ModelSources::open_shared(self.store.clone(), &selections)?);
-        // An executor that reads holes from object files gets only what it streams staged.
-        let staged = executor.hello.offers("host_tiers.staged/1");
-        let peer = self.host.register_peer(executor.observer_pidfd()?, staged);
+        // The executor reads holes from object files: it gets only what it streams staged.
+        let peer = self.host.register_peer(executor.observer_pidfd()?);
         let grants = selections
             .iter()
             .map(|selected| {
@@ -2878,7 +2859,7 @@ impl Pool {
             .collect::<io::Result<Vec<_>>>()?;
         // Weights come from the machine's sealed host tier, filled through TensorFS (what is
         // here, while Runtime imports and constructs the model; the rest as it lands).
-        self.host.prepare(grants.clone(), staged);
+        self.host.prepare(grants.clone());
         Ok(Session {
             plan: plan.construction.clone(),
             start,
@@ -2928,7 +2909,7 @@ impl Pool {
         let ranks = if plan.slots.is_empty() { 1 } else { degree.max(1) };
         let ranked = ranks > 1;
         if !session.loaded {
-            session.sharing = self.degree2(&construction, start, degree, &session.executor)?;
+            session.sharing = self.degree2(&construction, start, degree)?;
         }
         let sharing = session.sharing;
         let lane = self.lane_devices(start, degree)?;
@@ -3027,9 +3008,8 @@ impl Pool {
                 device.memory.with(|gpu| gpu.spawned(&construction, *pid));
             }
             let (load_cap, load_group) = rank_grant(&load_caps[..load_caps.len().min(ranks as usize)]);
-            // Its pinned budget, the Load's when the executor takes it there (`load_pinned/1`).
-            let plane = !plan.slots.is_empty() && session.executor.hello.offers("weight_plane/1");
-            let at_load = plane && session.executor.hello.offers("load_pinned/1");
+            // Its pinned budget, applied by the Load before any weight set registers.
+            let plane = !plan.slots.is_empty();
             let pinned = (degree > 0)
                 .then(|| self.pinned_budgets(&construction, start))
                 .flatten()
@@ -3085,16 +3065,14 @@ impl Pool {
                         models,
                         authorized_device_limit_bytes: self.device_limit(gpus),
                         // The request it loads for names a kernel: its build is imported first.
-                        attention_pin: match load_only
-                            || !session.executor.hello.offers("attention.load_pin/1")
-                        {
+                        attention_pin: match load_only {
                             true => String::new(),
                             false => engine.get(id)?.invocation.attention_kernel,
                         },
                         sealed_tiers: true,
                         model_sources: true,
                         staged_tiers: true,
-                        pinned_bytes: at_load.then_some(pinned),
+                        pinned_bytes: plane.then_some(pinned),
                         device_weights: sharing,
                         cap_bytes: load_cap,
                     }
@@ -3123,16 +3101,6 @@ impl Pool {
                 session.executor.birth.pid,
                 &session.launch,
             )?;
-            if plane && !at_load {
-                command_ok(session.executor.command(
-                    &DeviceCommand::Budget {
-                        vram_bytes: -1,
-                        pinned_bytes: pinned,
-                        cap_bytes: None,
-                    },
-                    &mut callbacks,
-                )?)?;
-            }
             command_ok(session.executor.command(
                 &DeviceCommand::Activate {
                     construction: construction.clone(),
@@ -3243,8 +3211,7 @@ impl Pool {
         // Degree 2 per call: on while the whole construction and its activations fit beside the
         // other tenants now. A sharing executor that no longer fits lets go of what it maps
         // first, so this call streams privately and the ladder can reclaim those holdings.
-        let attaches = session.executor.hello.offers("weights.attach/1");
-        let share = self.degree2(&construction, start, degree, &session.executor)?;
+        let share = self.degree2(&construction, start, degree)?;
         if session.sharing && !share {
             if let Some(custody) = &self.custody {
                 detach(custody, &mut session.executor, &self.notes)?;
@@ -3259,9 +3226,8 @@ impl Pool {
         // A group's cap holds on every GPU of it (each rank caps its own process).
         let caps = self.decide(&construction, start, degree, false)?;
         let (cap, group) = rank_grant(&caps[..caps.len().min(ranks as usize)]);
-        // Every executor of the cohort caps its whole process (`process_cap/1`): the plane
-        // derives its budget inside the cap.
-        let (plane_budget_bytes, cap_bytes) = (-1, cap);
+        // Every executor caps its whole process: the plane derives its budget inside the cap.
+        let cap_bytes = cap;
         // Each GPU's floor watchdog writes the cell of its own rank's process.
         for ((rank, device), own) in (0u32..).zip(gpus).zip(&caps) {
             if let Some(own) = *own {
@@ -3299,14 +3265,13 @@ impl Pool {
                 deadline_s: None,
                 attention_kernel: record.invocation.attention_kernel.clone(),
                 bits: record.invocation.bits,
-                plane_budget_bytes,
                 cap_bytes,
                 inputs: inputs.inputs,
                 trees: inputs.trees,
                 floor_bytes: gpu.and_then(GpuMemory::floor),
                 activation_bytes: gpu.map(|gpu| gpu.with(|gpu| gpu.seeds(&construction))).unwrap_or_default(),
                 squeezed_bytes: gpu.map(|gpu| gpu.with(|gpu| gpu.squeezed(&construction))).unwrap_or_default(),
-                device_weights: attaches.then_some(share),
+                device_weights: Some(share),
                 sources: plan.sources.iter().map(|s| (s.parameter.clone(), s.manifest.clone())).collect(),
                 weights: grant.as_ref().map(|grant| grant.outputs.clone()).unwrap_or_default(),
             },
@@ -3400,7 +3365,7 @@ impl Pool {
         }
         // Degree 2 once this call measured that the construction fits: an executor loaded
         // without it (its plan never ran here) offers everything it holds at this boundary.
-        if !session.sharing && self.degree2(&construction, start, degree, &session.executor)? {
+        if !session.sharing && self.degree2(&construction, start, degree)? {
             session.sharing = true;
             callbacks.custody = self.custody.as_ref();
         }
@@ -3431,10 +3396,9 @@ impl Pool {
     /// it reads, so only when the whole construction and its activations fit beside the other
     /// tenants, as measured here or in an earlier run (unmeasured: Degree 1, where stages
     /// evict each other). World-one on the first GPU only: a group or a replica shares nothing.
-    fn degree2(&self, plan: &str, start: usize, degree: u32, executor: &DeviceExecutor) -> io::Result<bool> {
+    fn degree2(&self, plan: &str, start: usize, degree: u32) -> io::Result<bool> {
         Ok(self.custody.is_some()
             && (start, degree) == (0, 1)
-            && executor.hello.offers("weights.attach/1")
             && self.first().fits_resident(plan, || self.holdings()))
     }
 
@@ -3543,9 +3507,7 @@ impl Pool {
             let Some(share) = split.get(&session_key(other, session.start)).copied() else {
                 continue;
             };
-            if !session.executor.hello.offers("weight_plane/1")
-                || budget.is_none_or(|budget| share >= budget)
-            {
+            if budget.is_none_or(|budget| share >= budget) {
                 continue;
             }
             let reply = session.executor.command(

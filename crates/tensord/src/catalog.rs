@@ -54,16 +54,11 @@ pub struct Callee {
     pub interface: serde_json::Value,
     #[serde(default)]
     pub source_digest: String,
-    #[serde(default)]
     pub package: String,
 }
 impl Generation {
-    /// A legacy bare distribution names the same local App, without changing an accepted
-    /// invocation or pretending it is a published package.
     pub(crate) fn owns(&self, application: &str, package: &str) -> bool {
-        self.app(application).is_some_and(|(expected, ..)| {
-            expected == package || (!package.contains('/') && expected == format!("local/{}", normalized(package)))
-        })
+        self.app(application).is_some_and(|(expected, ..)| expected == package)
     }
 
     /// The widest GPU group any constructing entrypoint of this environment (its own App's or
@@ -153,14 +148,7 @@ impl Catalog {
             .read(true)
             .custom_flags(libc::O_NOFOLLOW)
             .open(directory.join("generation.json"))?;
-        let mut record: Generation = serde_json::from_reader(manifest).map_err(io::Error::other)?;
-        // Older generations recorded only the distribution. That is local code, never a
-        // bare identity to send to the Hub's package-binding route.
-        for callee in &mut record.callees {
-            if callee.package.is_empty() {
-                callee.package = format!("local/{}", normalized(&callee.distribution));
-            }
-        }
+        let record: Generation = serde_json::from_reader(manifest).map_err(io::Error::other)?;
         if record.identity != identity {
             return Err(invalid("generation identity differs from its installation"));
         }

@@ -221,12 +221,6 @@ fn run_machine(config: config::Config, mut ready: crate::machine::supervise::Rea
     let config::Config { mut grant, visible_devices, endpoint, logs, .. } = config;
     let runtime = machine_runtime()?;
     use crate::machine::{identity, receipt};
-    // An older stable parent may have selected a partially published candidate. Restore the
-    // links before opening services, then let that parent select the restored executable.
-    let paths = crate::machine::update::Paths::new(&grant.layout.engine(), &grant.layout.root);
-    if crate::machine::update::recover_activation(&paths)? {
-        std::process::exit(crate::machine::update::REPLACE_EXIT);
-    }
     let layout = grant.layout.clone();
     let lifetime = identity::open(&layout)?;
     let rental = grant.lifetime == Lifetime::Rental;
@@ -313,7 +307,6 @@ fn run_machine(config: config::Config, mut ready: crate::machine::supervise::Rea
             "devices": devices.join(","),
             "inventory": gpus,
             "authorized_device_limit_bytes": null,
-            "pinned_budget_bytes": 4i64 << 30,
             "environment": {"PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8", "HOME": home, "COZY_HOME": home},
             // A rented pod is the machine's alone (its grant says so); anywhere else it is a guest.
             "host": {"mode": if rental { "dedicated" } else { "shared" }},

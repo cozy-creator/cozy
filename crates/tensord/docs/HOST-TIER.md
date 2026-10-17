@@ -14,9 +14,7 @@ executor death and model switches. The host-tier implementation uses no CUDA or 
 
 ## Exchange
 
-- `GpuPool` enables `Load.sealed_tiers` when the executor offers both
-  `host_tiers.sealed/1` and `weight_plane/1`. It reports the unsealed route for older peers
-  without those capabilities; the capability negotiation does not grant arbitrary store access.
+- `GpuPool` sends every Load with `sealed_tiers`; nothing grants arbitrary store access.
 - Per weight set the executor sends `sealed_tier` with a sealed memfd holding its `SealedPlan`
   (manifest, traversal, window, components, regions, parts). The machine checks seals, length and
   SHA-256, that the manifest and components are the session's (`HostGrant`), and rebuilds the read
@@ -24,26 +22,24 @@ executor death and model switches. The host-tier implementation uses no CUDA or 
 - Answer `held: true` with a read-only reopen of the sealed memfd at once: whole and filling, or
   streamed when it does not fit. A refused plan (outside the selection, unsealed) is an answer
   too, never a session failure by itself. The executor either uses another supported granted
-  source or reports that it cannot load the weight set. Legacy peers may use their older
-  store-reading route; current managed Runtime requires owner-provided sources.
+  source or reports that it cannot load the weight set.
 - A checkpoint held in part (its structure, as preparation lands it): the filler fetches each
   region's absent objects through the call's ticket (Now) and copies regions in order as they land;
   `sealed_stage` stages in the order asked. A cold `sealed_tier` with nothing staged waits for nothing;
   `object_files` waits for every object of its plan. A region that will never be copied is failed,
   and its layout opened afresh on the next ask.
 
-## Staged layouts (`host_tiers.staged/1`)
+## Staged layouts
 
-A GPU executor that offers `host_tiers.staged/1` (and is told `Load.staged_tiers`, so it never asks
-an older machine) gets each layout with only the regions it streams every step staged; the rest are holes (`HOLE` in the state page). For the holes it asks
+An executor (told `Load.staged_tiers`) gets each layout with only the regions it streams every step staged; the rest are holes (`HOLE` in the state page). For the holes it asks
 `object_files`: the machine opens each object of the plan through the store's verification and
 hands the read-only descriptors over (no Store-opening authority or path is supplied). Runtime's
 TensorFS plane copies a hole from those files to GPU memory (page cache, or O_DIRECT into its pinned staging
 buffers), so resident blocks and idle models cost page cache, which the kernel reclaims, not tier
 RAM. When its stages plan streaming, the executor asks `sealed_stage` for those regions; the
 machine stages each one the tier has room for (`TierLimit::limit` per region; the rest keep
-reading the files) and the executor pins what was staged. An executor that reads no holes (CPU,
-or without the capability) gets every region staged when the tier has room for all of them;
+reading the files) and the executor pins what was staged. An ask that names no regions (a CPU
+executor) gets every region staged when the tier has room for all of them;
 adopting a layout staged in part that cannot grow, it reads through a window of its own.
 
 ## Size and release
@@ -73,12 +69,10 @@ reads no store. The window is released with its last holder; `facts()` reports l
 their bytes and reads, and the ledger `windows_opened` and `streamed_bytes`. A streamed layout
 cannot be pinned (the plane answers `BelowFloor`).
 
-## Remembered plans
+## Read-ahead
 
-A filled layout's verified plan is kept in `<gpu>/host-plans` (latest per manifest and
-components). When `GpuPool` spawns an executor that adopts sealed tiers, layouts of its model the
-tier no longer holds refill in the background while it imports (`prefill`); its asks then hit.
-Components without a plan get their memory reserved from the manifest at spawn.
+When `GpuPool` spawns an executor, the objects of its model's components already in the store are
+read ahead into the page cache while it imports; nothing is allocated before its plan.
 
 ## Bounds
 
@@ -92,5 +86,5 @@ Components without a plan get their memory reserved from the manifest at spawn.
   is a separate Runtime/device-plane operation requested by TensorD's memory policy; see
   [resident custody](RESIDENT-CUSTODY.md) for shared GPU handles.
 - `GpuPool` appends one line per Load to `<state>/gpu/loads.jsonl`: executor load facts and the
-  host tier's facts (fills with ms, bytes by read mode and disk reads; hits; prefills;
+  host tier's facts (fills with ms, bytes by read mode and disk reads; hits;
   releases), and the machine's and executor's RSS/PSS.
