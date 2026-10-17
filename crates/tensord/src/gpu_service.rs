@@ -928,8 +928,6 @@ impl Pool {
     fn inventory(&self, entry: &str) -> Option<&crate::machine::receipt::Gpu> {
         self.config.inventory.iter().find(|g| g.device_index.to_string() == entry || g.device_uuid == entry)
     }
-    /// The `degree` GPUs from envelope index `start`: a group's are the first ones; none for a
-    /// deviceless call.
     /// The per-GPU ceiling every Load carries: the group's smallest card, else the configured one.
     fn device_limit(&self, gpus: &[Device]) -> Option<u64> {
         gpus.iter()
@@ -939,6 +937,8 @@ impl Pool {
             .or(self.config.authorized_device_limit_bytes)
     }
 
+    /// The `degree` GPUs from envelope index `start`: a group's are the first ones; none for a
+    /// deviceless call.
     fn lane(&self, start: usize, degree: u32) -> io::Result<&[Device]> {
         if degree == 0 {
             return Ok(&[]);
