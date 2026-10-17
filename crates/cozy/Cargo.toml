@@ -14,6 +14,10 @@ calcifer.workspace = true
 cozy-cli.workspace = true
 migrate.workspace = true
 
+# This computer's machine runs on Linux; elsewhere `cozy machine serve` refuses.
+[target.'cfg(target_os = "linux")'.dependencies]
+tensord.workspace = true
+
 [dev-dependencies]
 base64.workspace = true
 cozy-platform.workspace = true

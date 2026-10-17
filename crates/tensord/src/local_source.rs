@@ -577,6 +577,7 @@ mod tests {
         );
         let installer = InstallerConfig {
             helper_python: helper.into(),
+            helper_engine: None,
             python: "3.12".into(),
             generations: root.join("generations"),
             client_wheel: client,

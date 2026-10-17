@@ -3,7 +3,7 @@
 //! the Go guardian restarts its request plane. A clean exit (a stop or an accepted release)
 //! ends it, and so does a second consecutive exit before readiness: measured progress, no timer.
 //! The parent is never replaced: an activated Runtime update runs as the service child
-//! (`tensord service`, readiness pipe on fd 3, this boot's readiness key on fd 4, the
+//! (`tensord service --rental|--persistent`, readiness pipe on fd 3, this boot's readiness key on fd 4, the
 //! provider credential on fd 5), and a candidate that never proves readiness is rolled back by
 //! this same parent.
 use nix::{
@@ -34,6 +34,7 @@ const KEY_FD: i32 = 4;
 /// service would have.
 pub fn supervise(
     paths: &super::update::Paths,
+    lifetime: super::grant::Lifetime,
     key: Option<&[u8]>,
     provider: Option<&super::provider::ProviderSelf>,
 ) -> io::Result<Ready> {
@@ -68,7 +69,7 @@ pub fn supervise(
                 let Some(binary) = activated else {
                     return Ok(Ready(Some(File::from(write))));
                 };
-                exec_service(&binary, write, key, credential);
+                exec_service(&binary, lifetime, write, key, credential);
             }
             ForkResult::Parent { child } => child,
         };
@@ -107,6 +108,7 @@ pub fn supervise(
 /// Runs an activated machine binary as this service child; never returns.
 fn exec_service(
     binary: &std::path::Path,
+    lifetime: super::grant::Lifetime,
     ready: std::os::fd::OwnedFd,
     key: Option<&[u8]>,
     provider: Option<&super::provider::ProviderSelf>,
@@ -139,7 +141,11 @@ fn exec_service(
             libc::close(super::provider::CREDENTIAL_FD);
         },
     }
-    let error = std::process::Command::new(binary).arg("service").exec();
+    let lifetime = match lifetime {
+        super::grant::Lifetime::Rental => "--rental",
+        super::grant::Lifetime::Persistent => "--persistent",
+    };
+    let error = std::process::Command::new(binary).args(["service", lifetime]).exec();
     tracing::error!("cannot run {}: {error}", binary.display());
     std::process::exit(1)
 }
