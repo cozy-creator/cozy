@@ -341,15 +341,14 @@ mod tests {
     /// descriptor table, so only descriptors of this test's own file are counted.
     fn descriptors_of(file: &std::fs::File) -> usize {
         let own = file.metadata().unwrap();
-        std::fs::read_dir(if cfg!(target_os = "linux") {
-            "/proc/self/fd"
-        } else {
-            "/dev/fd"
-        })
-        .unwrap()
-        .filter_map(|entry| std::fs::metadata(entry.ok()?.path()).ok())
-        .filter(|open| (open.dev(), open.ino()) == (own.dev(), own.ino()))
-        .count()
+        (0..4096)
+            .filter(|fd| {
+                // SAFETY: plain-old-data the call fills; a closed number fails harmlessly.
+                let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+                let open = unsafe { libc::fstat(*fd, &mut stat) } == 0;
+                open && (stat.st_dev as u64, stat.st_ino as u64) == (own.dev(), own.ino())
+            })
+            .count()
     }
 
     #[test]
@@ -371,7 +370,16 @@ mod tests {
         assert_eq!(me.pid, std::process::id());
         assert!(!hung_up(&receive));
         drop(send);
-        assert!(hung_up(&receive));
+        // Readable once the peer's end is closed everywhere (a child spawned meanwhile by another
+        // test may hold it until it exits): woken by the kernel, not a timer.
+        let mut poll = libc::pollfd {
+            fd: receive.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one live descriptor.
+        assert_eq!(unsafe { libc::poll(&mut poll, 1, -1) }, 1);
+        assert!(hung_up(&receive), "revents {:#x}", poll.revents);
     }
 
     #[test]
