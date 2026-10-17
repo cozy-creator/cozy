@@ -1,20 +1,36 @@
-//! A run that completes on a real machine: the job's Tensorhub (Tensorhub's dev-build `cozy_ref`
-//! job: TENSORHUB_URL, TENSORHUB_LOG) holds a just-published torch-free package, and TensorD from
-//! the cozy-runtime wheel (COZY_TEST_TENSORD) installs it and runs it. Elsewhere it skips.
+//! Runs that complete on a real machine: the job's Tensorhub (Tensorhub's dev-build `cozy_ref`
+//! job: TENSORHUB_URL, TENSORHUB_LOG) holds just-published torch-free packages, and TensorD from
+//! the cozy-runtime wheel (COZY_TEST_TENSORD) installs and runs them. Elsewhere it skips.
 #![cfg(unix)]
 mod common;
 
-use std::path::{Path, PathBuf};
+use std::{
+    io::BufRead,
+    path::{Path, PathBuf},
+    process::Stdio,
+};
 
 use common::Home;
 use serde_json::Value;
+use sha2::{Digest as _, Sha256};
 
-/// L-package's `tiny` fixture, copied into the home where `cozy` publishes it.
-fn tiny(home: &Home) -> PathBuf {
-    let from = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/package/tiny");
-    let to = home.path().join("src/tiny");
-    copy(&from, &to);
-    to
+/// Locks and publishes a fixture package from a copy in the home, as its author would.
+fn publish(home: &Home, fixture: &str) {
+    let from = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/package")
+        .join(fixture);
+    let project = home.path().join("src").join(fixture);
+    copy(&from, &project);
+    for verb in ["lock", "publish"] {
+        let out = common::out(
+            home.command()
+                .current_dir(&project)
+                .args(["--json", "package", verb])
+                .output()
+                .unwrap(),
+        );
+        assert_eq!(out.code, 0, "package {verb} {fixture}: {out:?}");
+    }
 }
 
 fn copy(from: &Path, to: &Path) {
@@ -36,40 +52,52 @@ fn events(out: &common::Out) -> Vec<Value> {
         .collect()
 }
 
-/// A published function runs to completion on its machine and its result comes back; a field
-/// its interface lacks is dropped with a warning, so the package's strict struct never sees it.
+/// Reads NDJSON lines until one satisfies `want`.
+fn until(reader: &mut impl BufRead, want: impl Fn(&Value) -> bool) -> Value {
+    loop {
+        let mut line = String::new();
+        assert!(reader.read_line(&mut line).unwrap() > 0, "stdout closed");
+        let event: Value = serde_json::from_str(&line).unwrap_or_else(|e| panic!("{e}: {line}"));
+        if want(&event) {
+            return event;
+        }
+    }
+}
+
+/// Every file under `dir`.
+fn files(dir: &Path) -> Vec<PathBuf> {
+    let mut out = vec![];
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        match entry.file_type().unwrap().is_dir() {
+            true => out.extend(files(&entry.path())),
+            false => out.push(entry.path()),
+        }
+    }
+    out
+}
+
+/// One account (the Hub paces sign-ups), two packages:
+/// - a published function runs to completion on its machine and its result comes back; a field
+///   its interface lacks is dropped with a warning, so the package's strict struct never sees it;
+/// - an output the machine writes lands once in `--out`, its bytes the digest the run records,
+///   though Calcifer stopped while the run went on.
 #[test]
-fn a_published_function_runs_to_completion_on_a_real_machine() {
+fn published_functions_run_to_completion_on_a_real_machine() {
     let Some(home) = Home::with_hub() else { return };
     if std::env::var_os("COZY_TEST_TENSORD").is_none() {
         eprintln!("skipped: no TensorD (COZY_TEST_TENSORD is unset)");
         return;
     }
     let account = home.sign_in("runner@cozy.test");
-    let project = tiny(&home);
-    let locked = common::out(
-        home.command()
-            .current_dir(&project)
-            .args(["--json", "package", "lock"])
-            .output()
-            .unwrap(),
-    );
-    assert_eq!(locked.code, 0, "{locked:?}");
-    let published = common::out(
-        home.command()
-            .current_dir(&project)
-            .args(["--json", "package", "publish"])
-            .output()
-            .unwrap(),
-    );
-    assert_eq!(published.code, 0, "{published:?}");
+    publish(&home, "tiny");
+    publish(&home, "tiny-output");
     let _machine = common::tensord::added(&home, "m1");
-    let target = format!("{account}/tiny/echo");
 
+    let echo = format!("{account}/tiny/echo");
     let out = home.cozy([
         "--json",
         "run",
-        &target,
+        &echo,
         "hi there",
         "mood=calm",
         "--on",
@@ -90,17 +118,74 @@ fn a_published_function_runs_to_completion_on_a_real_machine() {
         "{run}"
     );
     let number = run["number"].as_u64().unwrap().to_string();
-
-    let human = home.cozy(["run", &target, "again", "--on", "m1"]);
+    let human = home.cozy(["run", &echo, "again", "--on", "m1"]);
     assert_eq!(human.code, 0, "{human:?}");
     assert!(
         human.stdout.contains("completed") && human.stdout.contains("again"),
         "{human:?}"
     );
+    let shown = home.json(["run", "show", &number, "--json"]);
+    assert_eq!(
+        (
+            shown["status"].as_str(),
+            shown["warnings"][0]["code"].as_str()
+        ),
+        (Some("completed"), Some("request_fields_ignored"))
+    );
+
+    // The writer waits on its machine while Calcifer stops; the follower starts it again and
+    // reattaches, and the file lands once.
+    let landing = home.path().join("landing");
+    let write = format!("{account}/tiny-output/write");
+    let text = "a file the machine wrote";
+    let mut follower = home
+        .command()
+        .args([
+            "--json",
+            "run",
+            &write,
+            &format!("text={text}"),
+            "seconds=8",
+            "--on",
+            "m1",
+            "--out",
+        ])
+        .arg(&landing)
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = std::io::BufReader::new(follower.stdout.take().unwrap());
+    let accepted = until(&mut stdout, |e| e["type"] == "run.in_progress");
+    let number = accepted["run"]["number"].as_u64().unwrap().to_string();
+    let down = home.cozy(["down"]);
+    assert_eq!(down.code, 0, "{down:?}");
+    let ended = until(&mut stdout, |e| {
+        e.get("type").and_then(Value::as_str).is_some_and(|t| {
+            t.starts_with("run.") && ["run.completed", "run.failed", "run.canceled"].contains(&t)
+        })
+    });
+    assert_eq!(ended["type"], "run.completed", "{ended}");
+    assert_eq!(follower.wait().unwrap().code(), Some(0));
 
     let shown = home.json(["run", "show", &number, "--json"]);
-    assert_eq!(shown["status"], "completed", "{shown}");
-    assert_eq!(shown["warnings"][0]["code"], "request_fields_ignored");
-    let listed = home.json(["run", "list", "--state", "completed", "--json"]);
-    assert_eq!(listed["runs"].as_array().unwrap().len(), 2, "{listed}");
+    let item = &shown["output"][0];
+    assert_eq!(
+        (item["name"].as_str(), item["status"].as_str()),
+        (Some("file"), Some("completed")),
+        "{shown}"
+    );
+    let landed = files(&landing);
+    assert_eq!(landed.len(), 1, "the output landed once: {landed:?}");
+    assert_eq!(
+        item["path"].as_str().map(PathBuf::from),
+        Some(landed[0].clone()),
+        "{shown}"
+    );
+    let bytes = std::fs::read(&landed[0]).unwrap();
+    assert_eq!(bytes, text.as_bytes());
+    assert_eq!(
+        item["sha256"].as_str(),
+        Some(format!("sha256:{}", hex::encode(Sha256::digest(&bytes))).as_str()),
+        "{shown}"
+    );
 }
