@@ -531,6 +531,91 @@ paths:
         4XX: {$ref: '#/components/responses/Error'}
         5XX: {$ref: '#/components/responses/Error'}
 
+  /v1/models/{org}/{name}/checkpoints/{checkpoint}/assessments:
+    get:
+      operationId: list_checkpoint_assessments
+      tags: [models]
+      summary: A checkpoint's attached assessment reports, newest first (at most 128).
+      security: [{bearer: []}]
+      parameters:
+      - {$ref: '#/components/parameters/Org'}
+      - {$ref: '#/components/parameters/Name'}
+      - {name: checkpoint, in: path, required: true, schema: {type: string}}
+      responses:
+        '200':
+          description: The assessments.
+          content:
+            application/json: {schema: {$ref: '#/components/schemas/CheckpointAssessmentList'}}
+        4XX: {$ref: '#/components/responses/Error'}
+        5XX: {$ref: '#/components/responses/Error'}
+
+  /v1/models/{org}/{name}/checkpoints/{checkpoint}/assessments/{report}:
+    put:
+      operationId: attach_checkpoint_assessment
+      tags: [models]
+      summary: Attaches one cozy-eval assessment report to its candidate checkpoint (eval-system, th-190).
+      description: |
+        The body is the report's exact canonical bytes; `report` is their sha256 digest. The Hub's
+        inspector re-derives the verdict. A generator may skip this operation (`x-raw-body`): a client
+        sends the bytes as they are, never re-encoded.
+      security: [{bearer: []}]
+      x-raw-body: true
+      parameters:
+      - {$ref: '#/components/parameters/Org'}
+      - {$ref: '#/components/parameters/Name'}
+      - {name: checkpoint, in: path, required: true, schema: {type: string}}
+      - name: report
+        in: path
+        required: true
+        schema: {type: string}
+        description: sha256:<hex> of the report bytes.
+      requestBody:
+        required: true
+        content:
+          application/json: {schema: {$ref: '#/components/schemas/AssessmentReport'}}
+      responses:
+        '200':
+          description: The attached assessment.
+          content:
+            application/json: {schema: {$ref: '#/components/schemas/CheckpointAssessmentAttached'}}
+        4XX: {$ref: '#/components/responses/Error'}
+        5XX: {$ref: '#/components/responses/Error'}
+    get:
+      operationId: get_checkpoint_assessment
+      tags: [models]
+      summary: One attached report's exact bytes.
+      security: [{bearer: []}]
+      x-raw-body: true
+      parameters:
+      - {$ref: '#/components/parameters/Org'}
+      - {$ref: '#/components/parameters/Name'}
+      - {name: checkpoint, in: path, required: true, schema: {type: string}}
+      - {name: report, in: path, required: true, schema: {type: string}}
+      responses:
+        '200':
+          description: The report as attached.
+          content:
+            application/json: {schema: {$ref: '#/components/schemas/AssessmentReport'}}
+        4XX: {$ref: '#/components/responses/Error'}
+        5XX: {$ref: '#/components/responses/Error'}
+    delete:
+      operationId: remove_checkpoint_assessment
+      tags: [models]
+      summary: Removes one attached report.
+      security: [{bearer: []}]
+      parameters:
+      - {$ref: '#/components/parameters/Org'}
+      - {$ref: '#/components/parameters/Name'}
+      - {name: checkpoint, in: path, required: true, schema: {type: string}}
+      - {name: report, in: path, required: true, schema: {type: string}}
+      responses:
+        '200':
+          description: Whether a report was removed.
+          content:
+            application/json: {schema: {$ref: '#/components/schemas/CheckpointAssessmentRemoval'}}
+        4XX: {$ref: '#/components/responses/Error'}
+        5XX: {$ref: '#/components/responses/Error'}
+
   /v1/models/{org}/{name}/checkpoints/{manifest}:
     get:
       operationId: get_model_checkpoint
@@ -1232,6 +1317,12 @@ components:
       type: object
       required: [name, user_id]
       properties: {name: {type: string}, user_id: {type: string}}
+    ArtifactRef:
+      type: object
+      required: [digest, length]
+      properties: {digest: {type: string}, length: {type: integer, format: int64}}
+    AssessmentReport:
+      description: A cozy-eval AssessmentReport (cozy-eval/checkpoint-validation@4), in its canonical bytes.
     AuthAccountRecoveryConfirmation:
       type: object
       required: [token, expires_at, purge_at]
@@ -1904,6 +1995,36 @@ components:
         created_at: {type: string, format: date-time}
         categories: {type: object, additionalProperties: {type: string}}
         kernel_symbol: {type: string}
+    CheckpointAssessmentAttached:
+      type: object
+      required: [assessment, publisher_reported_verdict]
+      properties:
+        assessment: {$ref: '#/components/schemas/CheckpointAssessmentRow'}
+        publisher_reported_verdict: {type: string}
+    CheckpointAssessmentList:
+      type: object
+      required: [assessments, limit, at_limit]
+      properties:
+        assessments:
+          type: array
+          nullable: true
+          items: {$ref: '#/components/schemas/CheckpointAssessmentRow'}
+        limit: {type: integer, format: int64}
+        at_limit: {type: boolean}
+    CheckpointAssessmentRemoval:
+      type: object
+      required: [removed, report_digest]
+      properties: {removed: {type: boolean}, report_digest: {type: string}}
+    CheckpointAssessmentRow:
+      type: object
+      required: [checkpoint_id, report, actor, created_at, scope, verdict]
+      properties:
+        checkpoint_id: {type: string}
+        report: {$ref: '#/components/schemas/ArtifactRef'}
+        actor: {type: string}
+        created_at: {type: string, format: date-time}
+        scope: {type: string}
+        verdict: {type: string, description: The inspector's verdict.}
     CheckpointDocument:
       type: object
       description: A CozyTensors manifest document, or {"held":true} to a publishing run.

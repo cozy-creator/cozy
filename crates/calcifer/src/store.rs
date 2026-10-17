@@ -1358,6 +1358,7 @@ impl From<&MachineRow> for Machine {
             rental_id: row.rental_id.clone(),
             alias: None,
             address: row.endpoint.as_ref().map(|e| e.address.clone()),
+            fingerprint: row.endpoint.as_ref().map(|e| Digest::from_bytes(e.pin)),
             reason: row.reason.clone(),
             rental: None,
             status: None,

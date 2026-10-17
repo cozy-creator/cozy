@@ -5,6 +5,7 @@
 mod auth;
 mod device;
 mod jws;
+mod raw;
 mod run;
 #[cfg(feature = "testing")]
 pub mod testing;

@@ -38,6 +38,8 @@ pub(crate) struct Hubs {
     home: Home,
     configured: Vec<config::Hub>,
     listings: Mutex<HashMap<String, Listing>>,
+    /// This computer's account at each Hub, for runs' capabilities.
+    pub(crate) facts: Mutex<HashMap<String, crate::access::Facts>>,
 }
 
 /// A Hub's last word: its listing, and every rental read since by id.
@@ -56,11 +58,12 @@ impl Hubs {
             home: home.clone(),
             configured,
             listings: Mutex::default(),
+            facts: Mutex::default(),
         }
     }
 
     /// A client speaking as this computer's device key at the Hub.
-    fn client(&self, origin: &str) -> Result<Client, Error> {
+    pub(crate) fn client(&self, origin: &str) -> Result<Client, Error> {
         let hub = config::Hub {
             name: None,
             origin: origin.to_owned(),
@@ -912,7 +915,7 @@ fn asked(origin: &str, e: hub_client::Error) -> Asked {
 }
 
 /// A Hub's refusal as the API answers it: the Hub's own code is the cause.
-fn hub_refusal(origin: &str, e: hub_client::Error) -> Error {
+pub(crate) fn hub_refusal(origin: &str, e: hub_client::Error) -> Error {
     match e {
         hub_client::Error::Hub {
             status,
@@ -942,7 +945,7 @@ fn hub_refusal(origin: &str, e: hub_client::Error) -> Error {
     }
 }
 
-fn signed_out(origin: &str) -> Error {
+pub(crate) fn signed_out(origin: &str) -> Error {
     Error::new(
         Kind::Credential,
         "signed_out",
@@ -1039,6 +1042,11 @@ fn other(origin: &str, rental: &types::Rental, unverified: bool) -> Machine {
         rental_id: Some(rental.rental_id.clone()),
         alias: None,
         address: rental.worker_address.clone(),
+        fingerprint: rental
+            .cert_pem
+            .as_deref()
+            .and_then(pin_of)
+            .map(cozy_proto::ids::Digest::from_bytes),
         reason: None,
         rental: Some(view(rental, None)),
         status: None,
