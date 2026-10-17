@@ -216,6 +216,14 @@ impl Exact {
     }
 }
 
+#[cfg(windows)]
+impl std::os::windows::io::AsHandle for Exact {
+    /// Signaled once the process has exited, for a caller's own wait set.
+    fn as_handle(&self) -> std::os::windows::io::BorrowedHandle<'_> {
+        std::os::windows::io::AsHandle::as_handle(&self.handle.0)
+    }
+}
+
 #[cfg(unix)]
 impl std::os::fd::AsFd for Exact {
     /// Readable once the process has exited, for a caller's own poll set.

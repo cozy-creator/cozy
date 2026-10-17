@@ -8,7 +8,6 @@ use std::{fmt, io, path::PathBuf};
 pub mod contain;
 pub mod durable;
 pub mod gpu;
-#[cfg(unix)]
 pub mod handles;
 pub mod ipc;
 pub mod lock;
