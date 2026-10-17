@@ -1,5 +1,9 @@
 //! Waking when a directory's files change: inotify on Linux, kqueue on macOS, change
 //! notifications on Windows. A wake says only that something changed; the caller rereads.
+//!
+//! Every OS wakes on a file created, renamed in or out, removed, closed after a write, or written
+//! and synced. Linux and macOS also wake on a plain write; Windows reports one only once the
+//! cache flushes (measured: not within 10 s), so a follower there rereads on `most` too.
 use crate::Result;
 use std::{path::Path, time::Duration};
 
@@ -47,14 +51,14 @@ mod tests {
     }
 
     #[test]
-    fn an_append_to_a_file_held_open_wakes_the_watch() {
+    fn a_synced_append_to_a_file_held_open_wakes_the_watch() {
         let (dir, mut watch) = watched();
         let mut log = fs::File::create(dir.path().join("a.log")).unwrap();
         assert!(watch.wait(WAKE).unwrap(), "the create");
         while watch.wait(QUIET).unwrap() {}
         for line in 0..3 {
             writeln!(log, "line {line}").unwrap();
-            log.flush().unwrap();
+            log.sync_data().unwrap();
             assert!(watch.wait(WAKE).unwrap(), "append {line}");
             while watch.wait(QUIET).unwrap() {}
         }
@@ -81,7 +85,7 @@ mod tests {
         assert!(watch.wait(WAKE).unwrap(), "the rotation");
         while watch.wait(QUIET).unwrap() {}
         writeln!(fresh, "new").unwrap();
-        fresh.flush().unwrap();
+        fresh.sync_data().unwrap();
         assert!(watch.wait(WAKE).unwrap(), "a write to the rotated-in file");
         // And the file rotated aside is no longer this directory's live log, but still its file.
         while watch.wait(QUIET).unwrap() {}
@@ -92,49 +96,5 @@ mod tests {
             .write_all(b"late\n")
             .unwrap();
         assert!(watch.wait(WAKE).unwrap(), "a write to the rotated file");
-    }
-}
-
-#[cfg(test)]
-mod measure {
-    use super::*;
-    use std::{fs, io::Write, time::Instant};
-
-    #[test]
-    #[ignore]
-    fn measure_how_late_each_kind_of_write_wakes() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut watch = DirWatch::new(dir.path()).unwrap();
-        let mut log = fs::File::create(dir.path().join("a.log")).unwrap();
-        assert!(watch.wait(Duration::from_secs(10)).unwrap());
-        while watch.wait(Duration::from_millis(50)).unwrap() {}
-        let woke = |watch: &mut DirWatch, what: &str| {
-            let began = Instant::now();
-            let woke = watch.wait(Duration::from_secs(10)).unwrap();
-            eprintln!("MEASURE {what}: woke={woke} after {:?}", began.elapsed());
-            while watch.wait(Duration::from_millis(50)).unwrap() {}
-        };
-        writeln!(log, "plain").unwrap();
-        woke(&mut watch, "write");
-        writeln!(log, "synced").unwrap();
-        log.sync_data().unwrap();
-        woke(&mut watch, "write + sync_data");
-        writeln!(log, "metadata").unwrap();
-        log.sync_all().unwrap();
-        woke(&mut watch, "write + sync_all");
-        writeln!(log, "closed").unwrap();
-        drop(log);
-        woke(&mut watch, "write + close");
-        let mut reopened = fs::OpenOptions::new().append(true).open(dir.path().join("a.log")).unwrap();
-        writeln!(reopened, "reopened").unwrap();
-        woke(&mut watch, "reopen + write");
-        for n in 0..3 {
-            let began = Instant::now();
-            let mut other = fs::File::open(dir.path().join("a.log")).unwrap();
-            let mut s = String::new();
-            std::io::Read::read_to_string(&mut other, &mut s).unwrap();
-            writeln!(reopened, "after a reader {n}").unwrap();
-            woke(&mut watch, &format!("write after a reader opened ({:?})", began.elapsed()));
-        }
     }
 }
