@@ -120,6 +120,8 @@ fn complete_device(journal: &mut Journal, n: usize, generation: &str, birth: Bir
         .unwrap();
 }
 
+/// Containment scopes are cgroups: Linux's.
+#[cfg(target_os = "linux")]
 #[test]
 fn restart_ends_processes_left_in_earlier_executor_scopes() {
     use cozy_platform::contain::{namespace, Scope};

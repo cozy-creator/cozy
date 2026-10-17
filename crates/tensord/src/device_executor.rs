@@ -1052,6 +1052,19 @@ fn endpoint(config: &ExecutorConfig) -> io::Result<(UnixListener, BTreeMap<Strin
     Ok((listener, config.seal.environment(&config.environment)))
 }
 
+/// The executor's containment scope, when its config names one. No scopes on this OS (macOS,
+/// Windows until its Job Object backend): none, and the executor's tree ends by its group.
+fn scope(config: &ExecutorConfig) -> io::Result<Option<Arc<cozy_platform::contain::Scope>>> {
+    let Some(namespace) = &config.cgroup_namespace else {
+        return Ok(None);
+    };
+    match cozy_platform::contain::Scope::create(namespace) {
+        Ok(scope) => Ok(Some(Arc::new(scope))),
+        Err(error) if error.is_unsupported() => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn parent_of(pid: u32) -> io::Result<u32> {
     Ok(cozy_platform::process::parent_of(pid)?)
 }
@@ -1533,10 +1546,7 @@ impl DeviceExecutor {
         on_birth: impl FnOnce(&Birth, &Cancellation) -> io::Result<()>,
     ) -> io::Result<Self> {
         let (listener, environment) = endpoint(&config)?;
-        let scope = match &config.cgroup_namespace {
-            Some(namespace) => Some(Arc::new(cozy_platform::contain::Scope::create(namespace)?)),
-            None => None,
-        };
+        let scope = scope(&config)?;
         let mut command =
             crate::launch_identity::trampoline(&config.python, config.identity, scope.as_deref())?;
         command
@@ -1582,10 +1592,7 @@ impl DeviceExecutor {
         on_birth: impl FnOnce(&Birth, &Cancellation) -> io::Result<()>,
     ) -> io::Result<Forked> {
         let (listener, environment) = endpoint(&config)?;
-        let scope = match &config.cgroup_namespace {
-            Some(namespace) => Some(Arc::new(cozy_platform::contain::Scope::create(namespace)?)),
-            None => None,
-        };
+        let scope = scope(&config)?;
         let mut forked = environment.clone();
         if let Some((name, token)) = scope.as_deref().and_then(cozy_platform::contain::Scope::environment) {
             forked.insert(name.into(), token.into());

@@ -27,8 +27,12 @@ pub fn supervise(paths: &super::update::Paths) -> io::Result<Ready> {
         signals.add(signal);
     }
     signals.thread_block().map_err(io::Error::from)?;
-    // Orphans of the service reparent here, not to a PID 1 that may not reap them.
-    cozy_platform::process::become_subreaper()?;
+    // Orphans of the service reparent here, not to a PID 1 that may not reap them. Elsewhere
+    // (macOS) they reparent to launchd, which reaps them, and executor trees end by group.
+    match cozy_platform::process::become_subreaper() {
+        Err(error) if error.is_unsupported() => {}
+        other => other?,
+    }
     let parent = nix::unistd::getpid();
     let mut failures_before_ready = 0;
     loop {
