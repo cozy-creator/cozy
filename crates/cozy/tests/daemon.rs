@@ -64,6 +64,34 @@ fn calcifer_starts_on_demand_and_down_stops_it() {
     assert_ne!(calcifer(&home, "up")["pid"], up["pid"]);
 }
 
+/// Without systemctl, `cozy up` starts Calcifer detached and says once that no login will start
+/// it; an `up` that finds it running says nothing of it.
+#[cfg(target_os = "linux")]
+#[test]
+fn up_without_systemctl_serves_and_warns_once() {
+    let Some(home) = Home::new() else { return };
+    let empty = home.path().join("empty-path");
+    std::fs::create_dir_all(&empty).unwrap();
+    let up = || {
+        let mut command = home.command();
+        common::out(
+            command
+                .env("PATH", &empty)
+                .args(["up", "--json"])
+                .output()
+                .unwrap(),
+        )
+    };
+    let warned = |out: &common::Out| out.stderr.matches("systemctl not found").count();
+    let first = up();
+    assert_eq!((first.code, warned(&first)), (0, 1), "{first:?}");
+    let served: Value = serde_json::from_str(&first.stdout).unwrap();
+    assert_eq!(served["calcifer"]["running"], true, "{served}");
+    let again = up();
+    assert_eq!((again.code, warned(&again)), (0, 0), "{again:?}");
+    assert_eq!(home.json(["down", "--json"])["changed"], true);
+}
+
 /// A Calcifer killed before it could erase its record is not mistaken for a live one.
 #[test]
 fn a_killed_calcifer_is_replaced() {

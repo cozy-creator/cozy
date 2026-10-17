@@ -64,13 +64,10 @@ pub async fn exec(ctx: &Context, rent: Rent) -> Result<ExitCode, Error> {
         .inspect(|note| output::say(ctx, note))
         .is_some();
     if let Some(asked) = rent.disk_gb.filter(|asked| rented.quote.disk_gb < *asked) {
-        output::warn(
-            ctx,
-            &format!(
-                "the Hub plans a {} GB disk, below the {asked} GB asked",
-                rented.quote.disk_gb
-            ),
-        );
+        output::warn(&format!(
+            "the Hub plans a {} GB disk, below the {asked} GB asked",
+            rented.quote.disk_gb
+        ));
     }
     if rented.replay {
         output::say(ctx, "this order was placed already; following it");

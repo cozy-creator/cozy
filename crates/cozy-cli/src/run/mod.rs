@@ -351,7 +351,7 @@ async fn invoke(
     }
     let (target, bound) = bind(package, card, function, &terms)?;
     if let Some(warning) = bound.warning(&target) {
-        output::warn(ctx, &warning);
+        output::warn(&warning);
     }
     let callable = callable(package, &card.interface, function)?;
     let gpus = args.gpus.unwrap_or(0);
