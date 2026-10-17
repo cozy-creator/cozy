@@ -145,7 +145,7 @@ pub async fn serve(loaded: &Loaded) -> Result<Stopped, Error> {
     let mut token = [0; 32];
     getrandom::fill(&mut token).expect("the OS provides randomness");
     let token = hex::encode(token);
-    let machines = Machines::start(calcifer.clone(), home.clone(), loaded.config.hubs());
+    let machines = Machines::start(calcifer.clone(), home.clone(), &loaded.config);
     let api = Api::new(calcifer.clone(), machines.clone(), address.port(), &token);
     // Kept here too, so `open` always has a sender while Calcifer serves.
     let (count, mut open) = watch::channel(0);

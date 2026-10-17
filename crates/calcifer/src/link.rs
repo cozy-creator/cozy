@@ -341,9 +341,9 @@ pub fn classify(status: Status) -> LinkError {
     }
 }
 
-/// The sha256 of the TLS leaf the machine at `address` presents, whatever it is. Nothing is
-/// sent: the handshake is refused once the leaf is seen.
-pub async fn presented_leaf(address: &str) -> Result<[u8; 32], LinkError> {
+/// The TLS leaf (DER) the machine at `address` presents, whatever it is. Nothing is sent: the
+/// handshake is refused once the leaf is seen.
+pub async fn presented_leaf(address: &str) -> Result<Vec<u8>, LinkError> {
     let unreachable = |e: std::io::Error| LinkError::Unreachable(format!("{address}: {e}"));
     let pinned = Arc::new(Pinned::new([0; 32]));
     let tcp = tokio::net::TcpStream::connect(address)
@@ -353,7 +353,7 @@ pub async fn presented_leaf(address: &str) -> Result<[u8; 32], LinkError> {
     let refused = tokio_rustls::TlsConnector::from(Arc::new(tls(pinned.clone())))
         .connect(name, tcp)
         .await;
-    let seen = *pinned.seen.lock().unwrap_or_else(|e| e.into_inner());
+    let seen = pinned.seen.lock().unwrap_or_else(|e| e.into_inner()).take();
     match (seen, refused) {
         (Some(leaf), _) => Ok(leaf),
         (None, Err(e)) => Err(unreachable(e)),
@@ -380,7 +380,7 @@ struct Pinned {
     pin: [u8; 32],
     provider: Arc<CryptoProvider>,
     /// The leaf the peer presented last.
-    seen: Mutex<Option<[u8; 32]>>,
+    seen: Mutex<Option<Vec<u8>>>,
 }
 
 impl Pinned {
@@ -402,9 +402,8 @@ impl ServerCertVerifier for Pinned {
         _: &[u8],
         _: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
-        let leaf: [u8; 32] = Sha256::digest(end_entity.as_ref()).into();
-        *self.seen.lock().unwrap_or_else(|e| e.into_inner()) = Some(leaf);
-        if leaf == self.pin {
+        *self.seen.lock().unwrap_or_else(|e| e.into_inner()) = Some(end_entity.to_vec());
+        if Sha256::digest(end_entity.as_ref()).as_slice() == self.pin {
             Ok(ServerCertVerified::assertion())
         } else {
             Err(rustls::Error::General(

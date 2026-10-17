@@ -405,6 +405,9 @@ pub struct Machine {
     pub alias: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub address: Option<String>,
+    /// The sha256 of its pinned TLS leaf: what `cozy machine add … --fingerprint` takes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<Digest>,
     /// Why it ended.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
