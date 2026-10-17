@@ -135,11 +135,7 @@ fn same_filename_activation_installs_new_runtime_and_retains_old_generation() {
     );
     let write = |bytes: &[u8]| {
         let digest = format!("sha256:{}", sha256::hex_digest(bytes));
-        let mut writer = objects
-            .begin("alice", &digest, bytes.len() as u64, 0)
-            .unwrap();
-        writer.append(bytes).unwrap();
-        writer.finish().unwrap();
+        objects.write("alice", &digest, bytes).unwrap();
         serde_json::json!({"digest":digest,"length":bytes.len()})
     };
     let mut archive = tar::Builder::new(Vec::new());
