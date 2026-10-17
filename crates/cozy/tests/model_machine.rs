@@ -1,0 +1,73 @@
+//! `cozy model download|list` on a real machine: TensorD 0.6.0 from the cozy-runtime wheel
+//! (COZY_TEST_TENSORD) added to this home's Calcifer. The machine makes the model from a tiny
+//! public Hugging Face repository; no weight byte lands in the controller's home.
+#![cfg(unix)]
+mod common;
+
+use common::Home;
+use serde_json::Value;
+
+const TINY: &str = "hf://hf-internal-testing/tiny-random-gpt2@71034c5d8bde858ff824298bdedc65515b97d2b9";
+
+/// The last NDJSON event a followed `--json` run printed: its end.
+fn end(out: &common::Out) -> Value {
+    let line = out.stdout.lines().last().unwrap_or_else(|| panic!("no events: {out:?}"));
+    serde_json::from_str(line).unwrap_or_else(|e| panic!("{e}: {out:?}"))
+}
+
+#[test]
+fn download_makes_a_provider_source_on_the_machine() {
+    let Some(home) = Home::new() else { return };
+    let _calcifer = home.want_calcifer();
+    let _machine = common::tensord::added(&home, "m1");
+
+    let out = home.cozy(["--json", "model", "download", TINY, "local/tiny", "--on", "m1"]);
+    assert_eq!(out.code, 0, "{out:?}");
+    let ended = end(&out);
+    assert_eq!(ended["type"], "run.completed", "{ended}");
+    let model = &ended["run"]["result"]["models"][0];
+    assert_eq!(model["resolved"], TINY, "{model}");
+    assert_eq!(model["published"]["destination"], "local/tiny", "{model}");
+
+    // The machine holds it by name now; the human record names the checkpoint.
+    let held = home.cozy(["model", "download", "local/tiny", "--on", "m1"]);
+    assert_eq!(held.code, 0, "{held:?}");
+    assert!(held.stdout.contains("local/tiny"), "{held:?}");
+
+    // `model list` reads the machine's Status: every machine by default, one with --on.
+    for args in [&["--json", "model", "list"][..], &["--json", "model", "list", "--on", "m1"]] {
+        let listed = home.json(args);
+        let rows = listed["models"].as_array().unwrap();
+        assert!(rows.iter().any(|r| r["machine"] == "m1" && r["model"] == "local/tiny"), "{listed}");
+    }
+    let missing = home.cozy(["--json", "model", "list", "--on", "nowhere"]);
+    assert_eq!((missing.code, missing.refusal()["code"].as_str()), (1, Some("machine_not_found")), "{missing:?}");
+
+    // An unpinned source is the machine's refusal, which names the pinned grammar.
+    let unpinned = home.cozy(["--json", "model", "download", "hf://hf-internal-testing/tiny-random-gpt2", "local/x", "--on", "m1"]);
+    assert_eq!(unpinned.code, 1, "{unpinned:?}");
+    let failed = end(&unpinned);
+    assert_eq!(failed["run"]["reason"]["code"], "model_source_failed", "{failed}");
+    assert!(failed["run"]["reason"]["message"].as_str().unwrap().contains('@'), "{failed}");
+
+    // The 454 KB model never passed through this computer's home.
+    let state = |path: &std::path::Path| {
+        let name = path.file_name().unwrap().to_string_lossy();
+        [".db", ".db-wal", ".db-shm", ".log"].iter().any(|s| name.ends_with(s))
+    };
+    let big: Vec<_> = walk(&home.root()).into_iter().filter(|(path, len)| *len >= 400 << 10 && !state(path)).collect();
+    assert!(big.is_empty(), "weights in the controller's home: {big:?}");
+}
+
+fn walk(dir: &std::path::Path) -> Vec<(std::path::PathBuf, u64)> {
+    let mut files = vec![];
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let meta = entry.metadata().unwrap();
+        if meta.is_dir() {
+            files.extend(walk(&entry.path()));
+        } else {
+            files.push((entry.path(), meta.len()));
+        }
+    }
+    files
+}
