@@ -59,9 +59,15 @@ fn db(home: &Home) -> std::path::PathBuf {
     home.root().join("calcifer/state.db")
 }
 
+/// Each run as `run show --json` answers, without what is live rather than kept (why an unsettled
+/// run waits, which names its unreachable machine as each build's client says it).
 fn shown(home: &Home, ids: &[&str]) -> Vec<Value> {
     ids.iter()
-        .map(|id| home.json(["run", "show", id, "--json"]))
+        .map(|id| {
+            let mut run = home.json(["run", "show", id, "--json"]);
+            run.as_object_mut().unwrap().remove("waiting");
+            run
+        })
         .collect()
 }
 
