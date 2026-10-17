@@ -3,11 +3,18 @@
 #![cfg(unix)]
 mod common;
 
+use std::{
+    path::{Path, PathBuf},
+    sync::atomic::Ordering,
+};
+
 use common::{
     Home,
+    https::Https,
     tensord::{self, Tensord},
 };
 use serde_json::Value;
+use sha2::{Digest as _, Sha256};
 
 fn listed(home: &Home, name: &str) -> Option<Value> {
     home.json(["machine", "list", "--json"])["machines"]
@@ -215,15 +222,8 @@ fn an_update_installs_the_hubs_target_and_then_has_nothing_to_do() {
     );
 }
 
-/// `machine update --runtime-wheel/--tensorfs-wheel` installs local wheels, each written to the machine
-/// with the run, in place of the Hub's target: how a release gate runs an unpublished Runtime. The
-/// machine's Status then reports the wheels' versions.
-#[test]
-fn an_update_installs_local_wheels() {
-    let Some(home) = Home::new() else { return };
-    let _calcifer = home.want_calcifer();
-    let _machine = tensord::added(&home, "wheels");
-    let dir = tempfile::tempdir().unwrap();
+/// The Runtime 0.25.1 and a TensorFS 0.10 wheel for this platform, downloaded into `dir`.
+fn downloaded(dir: &Path) -> (PathBuf, PathBuf) {
     for requirement in ["cozy-runtime==0.25.1", "tensorfs>=0.10,<0.11"] {
         let fetched = std::process::Command::new("python3")
             .args([
@@ -243,20 +243,32 @@ fn an_update_installs_local_wheels() {
                 "manylinux_2_17_x86_64",
                 "-d",
             ])
-            .arg(dir.path())
+            .arg(dir)
             .arg(requirement)
             .status()
             .unwrap();
         assert!(fetched.success(), "pip download {requirement}");
     }
     let wheel = |prefix: &str| {
-        std::fs::read_dir(dir.path())
+        std::fs::read_dir(dir)
             .unwrap()
             .map(|e| e.unwrap().path())
             .find(|p| p.file_name().unwrap().to_str().unwrap().starts_with(prefix))
             .unwrap_or_else(|| panic!("no {prefix} wheel"))
     };
-    let (runtime, tensorfs) = (wheel("cozy_runtime-"), wheel("tensorfs-"));
+    (wheel("cozy_runtime-"), wheel("tensorfs-"))
+}
+
+/// `machine update --runtime-wheel/--tensorfs-wheel` installs local wheels, each written to the machine
+/// with the run, in place of the Hub's target: how a release gate runs an unpublished Runtime. The
+/// machine's Status then reports the wheels' versions.
+#[test]
+fn an_update_installs_local_wheels() {
+    let Some(home) = Home::new() else { return };
+    let _calcifer = home.want_calcifer();
+    let _machine = tensord::added(&home, "wheels");
+    let dir = tempfile::tempdir().unwrap();
+    let (runtime, tensorfs) = downloaded(dir.path());
     let out = home.cozy([
         "machine".as_ref(),
         "update".as_ref(),
@@ -295,4 +307,103 @@ fn an_update_installs_local_wheels() {
         (1, "wheel_refused".into()),
         "{out:?}"
     );
+}
+
+/// `machine update --runtime-wheel/--tensorfs-wheel https://…#sha256=<hex>`: the machine fetches each
+/// wheel itself, through a redirect to another host, and nothing is written to it from here. The
+/// bytes are held to the digest: under a wrong one the update fails `wheel_digest_mismatch` naming
+/// both digests, and the machine keeps its software.
+#[test]
+fn an_update_fetches_wheels_by_url_held_to_their_digests() {
+    let Some(home) = Home::new() else { return };
+    let _calcifer = home.want_calcifer();
+    let (dir, trust) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (runtime, tensorfs) = downloaded(dir.path());
+    let server = Https::serve(dir.path());
+    // The machine's bundle, which uv reads too: the runner's roots and the server's.
+    let ca = trust.path().join("ca.pem");
+    let system = std::fs::read_to_string("/etc/ssl/certs/ca-certificates.crt").unwrap_or_default();
+    std::fs::write(&ca, system + &server.ca).unwrap();
+    let env = [("SSL_CERT_FILE", ca.to_str().unwrap())];
+    let _machine = tensord::added_with(&home, "fetching", &env);
+    let url = |wheel: &Path, sha256: &str| {
+        let name = wheel.file_name().unwrap().to_str().unwrap();
+        format!("{}/to/{name}#sha256={sha256}", server.base)
+    };
+    let digest = |wheel: &Path| hex::encode(Sha256::digest(std::fs::read(wheel).unwrap()));
+    let update = |runtime: &str, tensorfs: &str| {
+        let out = home.cozy([
+            "machine",
+            "update",
+            "fetching",
+            "--runtime-wheel",
+            runtime,
+            "--tensorfs-wheel",
+            tensorfs,
+            "--json",
+        ]);
+        let last: Value = serde_json::from_str(out.stdout.lines().last().unwrap_or_default())
+            .unwrap_or_else(|e| panic!("{e}: {out:?}"));
+        (out, last)
+    };
+    let running =
+        || home.json(["machine", "show", "fetching", "--json"])["status"]["runtime"].clone();
+    let before = running();
+    let wrong = "ab".repeat(32);
+    let (out, last) = update(
+        url(&runtime, &wrong).as_str(),
+        url(&tensorfs, &digest(&tensorfs)).as_str(),
+    );
+    let reason = &last["run"]["reason"];
+    assert_eq!(
+        (out.code, last["type"].as_str(), reason["code"].as_str()),
+        (1, Some("run.failed"), Some("wheel_digest_mismatch")),
+        "{out:?}"
+    );
+    let message = reason["message"].as_str().unwrap();
+    assert!(
+        message.contains(&wrong) && message.contains(&digest(&runtime)),
+        "{message}"
+    );
+    assert_eq!(running(), before);
+    let (out, last) = update(
+        url(&runtime, &digest(&runtime)).as_str(),
+        url(&tensorfs, &digest(&tensorfs)).as_str(),
+    );
+    assert_eq!(
+        (
+            out.code,
+            last["type"].as_str(),
+            last["run"]["result"]["to"]["runtime"].as_str()
+        ),
+        (0, Some("run.completed"), Some("0.25.1")),
+        "{out:?}"
+    );
+    assert_eq!(running(), "0.25.1");
+    assert!(
+        server.served.load(Ordering::Relaxed) > 0,
+        "the machine fetched the wheels"
+    );
+    // Plain http, or a URL without its digest, is refused before anything is sent.
+    let http = url(&runtime, &digest(&runtime)).replace("https://", "http://");
+    let bare = format!(
+        "{}/to/{}",
+        server.base,
+        runtime.file_name().unwrap().to_str().unwrap()
+    );
+    for refused in [http, bare] {
+        let out = home.cozy([
+            "machine",
+            "update",
+            "fetching",
+            "--runtime-wheel",
+            refused.as_str(),
+            "--json",
+        ]);
+        assert_eq!(
+            (out.code, out.refusal()["code"].clone()),
+            (1, "wheel_refused".into()),
+            "{out:?}"
+        );
+    }
 }

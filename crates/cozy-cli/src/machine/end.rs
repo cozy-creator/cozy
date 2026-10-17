@@ -163,9 +163,10 @@ pub async fn keepalive(ctx: &Context, name: &str) -> Result<ExitCode, Error> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// Updates a machine's Runtime and TensorFS: to local wheels when named (each written to the machine
-/// with the run; a member not named keeps the machine's own), else to its Hub's target. A numbered
-/// run of kind update, which waits for the work the machine accepted and is followed like any run.
+/// Updates a machine's Runtime and TensorFS: to wheels when named (a local file is written to the
+/// machine with the run; an `https://…#sha256=<hex>` URL the machine fetches itself; a member not
+/// named keeps the machine's own), else to its Hub's target. A numbered run of kind update, which
+/// waits for the work the machine accepted and is followed like any run.
 pub async fn update(
     ctx: &Context,
     name: &str,
@@ -173,13 +174,20 @@ pub async fn update(
     tensorfs_wheel: Option<PathBuf>,
 ) -> Result<ExitCode, Error> {
     let mut payload = serde_json::Map::new();
-    let (mut staged, mut inputs) = (vec![], vec![]);
+    let (mut staged, mut inputs, mut named) = (vec![], vec![], vec![]);
     for (member, distribution, path) in [
         ("runtime", "cozy_runtime", runtime_wheel),
         ("tensorfs", "tensorfs", tensorfs_wheel),
     ] {
         let Some(path) = path else { continue };
+        if let Some(at) = path.to_str().filter(|p| p.contains("://")) {
+            let (file, fetched) = fetched(at, distribution)?;
+            named.push(format!("{member} {file}"));
+            payload.insert(member.into(), fetched);
+            continue;
+        }
         let (file, input) = wheel(&path, distribution)?;
+        named.push(format!("{member} {file}"));
         inputs.push(v1::InputFile {
             field: member.into(),
             digest: input.digest.to_string(),
@@ -195,7 +203,7 @@ pub async fn update(
         "" => ctx.hub()?,
         origin => ctx.config.resolve(origin)?,
     };
-    if staged.is_empty() {
+    if payload.is_empty() {
         let Some(status) = &m.status else {
             return Err(Error::new(
                 Kind::Unavailable,
@@ -211,13 +219,11 @@ pub async fn update(
         {
             return up_to_date(ctx, &m, &target.runtime);
         }
+        named.push(format!("runtime {}", target.runtime));
+        named.push(format!("tensorfs {}", target.tensorfs));
         payload.insert("runtime".into(), target.runtime.into());
         payload.insert("tensorfs".into(), target.tensorfs.into());
     }
-    let named: Vec<String> = payload
-        .iter()
-        .map(|(member, value)| format!("{member} {}", value.as_str().unwrap_or_default()))
-        .collect();
     payload.insert("agent".into(), "bundled".into());
     let spec = v1::RunSpec {
         kind: v1::RunKind::Update as i32,
@@ -238,6 +244,34 @@ pub async fn update(
     let submitted = crate::run::submit(ctx, submit, None).await?;
     let run = crate::run::follow(ctx, submitted.run, false).await?;
     Ok(crate::run::exit_code(&run))
+}
+
+/// A wheel of `distribution` the machine fetches itself, `https://…/<wheel>#sha256=<hex>`: its
+/// file name and the payload member. Nothing is sent from here.
+fn fetched(at: &str, distribution: &str) -> Result<(String, serde_json::Value), Error> {
+    let refused = |why: String| Error::new(Kind::Validation, "wheel_refused", why);
+    let (url, sha256) = at.split_once("#sha256=").unwrap_or((at, ""));
+    let path = url
+        .strip_prefix("https://")
+        .map(|rest| rest.split('?').next().unwrap_or_default());
+    let Some(path) = path else {
+        return Err(refused(format!("{at}: a wheel URL is https")));
+    };
+    let file = path
+        .split_once('/')
+        .map_or("", |(_, p)| p.rsplit('/').next().unwrap_or_default());
+    if !file.starts_with(&format!("{distribution}-")) || !file.ends_with(".whl") {
+        return Err(refused(format!(
+            "{url} names no {distribution} wheel ({distribution}-<version>-….whl)"
+        )));
+    }
+    if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(refused(format!(
+            "{at}: a wheel URL ends #sha256=<64 hex>, the digest the machine holds its bytes to"
+        )));
+    }
+    let member = serde_json::json!({"url": url, "sha256": sha256.to_ascii_lowercase()});
+    Ok((file.to_owned(), member))
 }
 
 /// A local wheel of `distribution`, measured once: its file name and what the run stages.

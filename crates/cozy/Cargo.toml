@@ -23,7 +23,9 @@ hex.workspace = true
 hub-client = { workspace = true, features = ["testing"] }
 migrate = { workspace = true, features = ["testing"] }
 prost.workspace = true
+rcgen.workspace = true
 reqwest.workspace = true
+rustls.workspace = true
 rusqlite.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

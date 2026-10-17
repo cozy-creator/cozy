@@ -1,9 +1,10 @@
 //! `Run kind: update` (G/API.md, D2): the payload names the software cohort, `{"runtime": …,
 //! "tensorfs": …, "agent": "bundled" | "explicit"}`. A member is a published version (fetched
-//! from PyPI, digest checked) or, when an input binds that field to an object sent with Write,
-//! that wheel's file name. The update stages and verifies the pair, waits for measured idleness,
-//! restarts the service on it in place and commits once the new service proves readiness, or
-//! rolls back. Its log is the update's state history, so a client that lost the stream across
+//! from PyPI, digest checked); when an input binds that field to an object sent with Write,
+//! that wheel's file name; or `{"url": "https://…/<wheel>", "sha256": …}`, a wheel the machine
+//! fetches itself, held to that digest. The update stages and verifies the pair, waits for
+//! measured idleness, restarts the service on it in place and commits once the new service
+//! proves readiness, or rolls back. Its log is the update's state history, so a client that lost the stream across
 //! the restart attaches again with `Run{id, after}` and reads the outcome.
 use super::{auth::VerifiedActor, backend::MachineBackend, v1, MachineIdentity};
 use crate::machine::update::{Choice, Request, Status as Update, Updates};
@@ -50,12 +51,19 @@ pub(super) fn owns(
 
 #[derive(serde::Deserialize)]
 struct Cohort {
-    runtime: Option<String>,
-    tensorfs: Option<String>,
+    runtime: Option<Member>,
+    tensorfs: Option<Member>,
     #[serde(default)]
     agent: String,
     #[serde(flatten)]
     unknown: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum Member {
+    Named(String),
+    Fetched { url: String, sha256: String },
 }
 
 static SUBMITTING: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -172,9 +180,16 @@ fn submit(
     for name in cohort.unknown.keys() {
         tracing::warn!("update {id}: ignoring unknown payload field {name:?}");
     }
-    let choose = |member: &str, value: Option<String>| -> Result<Option<Choice>, Status> {
-        let Some(value) = value else {
-            return Ok(None);
+    let choose = |member: &str, value: Option<Member>| -> Result<Option<Choice>, Status> {
+        let value = match value {
+            None => return Ok(None),
+            Some(Member::Fetched { url, sha256 }) => {
+                let distribution = if member == "runtime" { "cozy_runtime" } else { member };
+                return Choice::fetched(distribution, &url, &sha256)
+                    .map(Some)
+                    .map_err(|why| super::machine_v1::refused("wheel_refused", &why));
+            }
+            Some(Member::Named(value)) => value,
         };
         let Some(input) = spec.inputs.iter().find(|i| i.field == member) else {
             return Ok(Some(Choice {
@@ -307,7 +322,8 @@ fn step_event(update: &Update, step: &crate::machine::update::Step) -> v1::run_e
         "succeeded" => outcome("succeeded", ""),
         "canceled" => outcome("canceled", "canceled"),
         "rolled_back" => outcome("failed", "update_rolled_back"),
-        "failed" => outcome("failed", "update_failed"),
+        "failed" if update.code.is_empty() => outcome("failed", "update_failed"),
+        "failed" => outcome("failed", &update.code),
         stage => v1::run_event::Event::Progress(v1::Progress {
             stage: stage.into(),
             fraction: -1.0,
