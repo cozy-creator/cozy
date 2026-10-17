@@ -117,6 +117,11 @@ impl Origin {
     pub(crate) fn hits(&self, path: &str) -> usize {
         *self.hits.lock().unwrap().get(path).unwrap_or(&0)
     }
+    fn hits_all(&self) -> Vec<(String, usize)> {
+        let mut all: Vec<_> = self.hits.lock().unwrap().iter().map(|(k, v)| (k.clone(), *v)).collect();
+        all.sort();
+        all
+    }
     fn total_hits(&self) -> usize {
         self.hits.lock().unwrap().values().sum()
     }
@@ -3957,6 +3962,17 @@ fn downloaded_cache_root_is_protected_then_evicted_and_refetched() {
     assert!(report.reclaimed_bytes > 0);
     assert!(!store.repository_path(&repository).exists());
     let again = pull(&request).unwrap();
+    if again.bytes_moved != cold.bytes_moved {
+        println!("CR cold={cold:?}");
+        println!("CR again={again:?}");
+        println!("CR report={report:?}");
+        for line in std::fs::read_to_string(root.join("logs/transport.log")).unwrap_or_default().lines() {
+            println!("CR log {line}");
+        }
+        for (path, hits) in origin.hits_all() {
+            println!("CR hits {path} {hits}");
+        }
+    }
     assert_eq!(again.bytes_moved, cold.bytes_moved);
     assert!(store.repository_path(&repository).exists());
     let _ = std::fs::remove_dir_all(root);
