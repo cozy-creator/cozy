@@ -85,6 +85,11 @@ impl Home {
         self.root.join("services")
     }
 
+    /// Tools cozy installed for this computer's own use (`cozy tools install`), never bundled.
+    pub fn tools(&self) -> PathBuf {
+        self.root.join("tools")
+    }
+
     /// The owner's backups, and the one-shot importer's archive of the Go CLI's state.
     pub fn backups(&self) -> PathBuf {
         self.root.join("backups")
