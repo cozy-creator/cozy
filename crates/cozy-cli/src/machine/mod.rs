@@ -52,8 +52,16 @@ enum Verb {
     End { name: String },
     /// Reset a rental's 15-minute idle clock once.
     Keepalive { name: String },
-    /// Update a machine to its Hub's target software, as a run.
-    Update { name: String },
+    /// Update a machine to its Hub's target software, or to local wheels, as a run.
+    Update {
+        name: String,
+        /// Install this local cozy-runtime wheel instead of the Hub's target.
+        #[arg(long, value_name = "FILE")]
+        runtime_wheel: Option<std::path::PathBuf>,
+        /// Install this local tensorfs wheel instead of the Hub's target.
+        #[arg(long, value_name = "FILE")]
+        tensorfs_wheel: Option<std::path::PathBuf>,
+    },
     /// Add another computer's machine by its address and TLS fingerprint.
     Add {
         name: String,
@@ -90,7 +98,11 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
             address,
             fingerprint,
         } => add(ctx, name, address, fingerprint).await,
-        Verb::Update { name } => end::update(ctx, &name).await,
+        Verb::Update {
+            name,
+            runtime_wheel,
+            tensorfs_wheel,
+        } => end::update(ctx, &name, runtime_wheel, tensorfs_wheel).await,
         // This computer's machine role needs TensorD inside the binary.
         Verb::Enable => Err(crate::not_ported("machine enable")),
         Verb::Disable => Err(crate::not_ported("machine disable")),

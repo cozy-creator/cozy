@@ -214,3 +214,85 @@ fn an_update_installs_the_hubs_target_and_then_has_nothing_to_do() {
         "{again}"
     );
 }
+
+/// `machine update --runtime-wheel/--tensorfs-wheel` installs local wheels, each written to the machine
+/// with the run, in place of the Hub's target: how a release gate runs an unpublished Runtime. The
+/// machine's Status then reports the wheels' versions.
+#[test]
+fn an_update_installs_local_wheels() {
+    let Some(home) = Home::new() else { return };
+    let _calcifer = home.want_calcifer();
+    let _machine = tensord::added(&home, "wheels");
+    let dir = tempfile::tempdir().unwrap();
+    for requirement in ["cozy-runtime==0.25.1", "tensorfs>=0.10,<0.11"] {
+        let fetched = std::process::Command::new("python3")
+            .args([
+                "-m",
+                "pip",
+                "download",
+                "-q",
+                "--no-deps",
+                "--only-binary=:all:",
+            ])
+            .args([
+                "--python-version",
+                "3.12",
+                "--platform",
+                "manylinux_2_28_x86_64",
+                "--platform",
+                "manylinux_2_17_x86_64",
+                "-d",
+            ])
+            .arg(dir.path())
+            .arg(requirement)
+            .status()
+            .unwrap();
+        assert!(fetched.success(), "pip download {requirement}");
+    }
+    let wheel = |prefix: &str| {
+        std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.file_name().unwrap().to_str().unwrap().starts_with(prefix))
+            .unwrap_or_else(|| panic!("no {prefix} wheel"))
+    };
+    let (runtime, tensorfs) = (wheel("cozy_runtime-"), wheel("tensorfs-"));
+    let out = home.cozy([
+        "machine".as_ref(),
+        "update".as_ref(),
+        "wheels".as_ref(),
+        "--runtime-wheel".as_ref(),
+        runtime.as_os_str(),
+        "--tensorfs-wheel".as_ref(),
+        tensorfs.as_os_str(),
+        "--json".as_ref(),
+    ]);
+    let last: serde_json::Value =
+        serde_json::from_str(out.stdout.lines().last().unwrap_or_default())
+            .unwrap_or_else(|e| panic!("{e}: {out:?}"));
+    assert_eq!(
+        (
+            out.code,
+            last["type"].as_str(),
+            last["run"]["result"]["to"]["runtime"].as_str()
+        ),
+        (0, Some("run.completed"), Some("0.25.1")),
+        "{out:?}"
+    );
+    let shown = home.json(["machine", "show", "wheels", "--json"]);
+    assert_eq!(shown["status"]["runtime"], "0.25.1", "{shown}");
+    // A file that is not the member's wheel is refused before anything is sent.
+    let out = home.cozy([
+        "machine".as_ref(),
+        "update".as_ref(),
+        "wheels".as_ref(),
+        "--runtime-wheel".as_ref(),
+        tensorfs.as_os_str(),
+        "--json".as_ref(),
+    ]);
+    assert_eq!(
+        (out.code, out.refusal()["code"].clone()),
+        (1, "wheel_refused".into()),
+        "{out:?}"
+    );
+}
