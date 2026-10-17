@@ -7,6 +7,7 @@ use cozy_proto::error::Error;
 use crate::Context;
 
 mod catalog;
+mod machine;
 pub(crate) mod refs;
 mod releases;
 
@@ -82,6 +83,11 @@ pub(crate) struct Download {
     /// Keep it on the machine under this name.
     #[arg(value_name = "local/ALIAS")]
     alias: Option<String>,
+    #[command(flatten)]
+    placement: crate::run::Placement,
+    /// Print the run and return at once instead of following it.
+    #[arg(long)]
+    detach: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -93,6 +99,11 @@ pub(crate) struct Upload {
     /// A reviewed TensorFS profile to convert with; repeat to compose one model.
     #[arg(long = "source-profile", value_name = "PROFILE")]
     profiles: Vec<String>,
+    #[command(flatten)]
+    placement: crate::run::Placement,
+    /// Print the run and return at once instead of following it.
+    #[arg(long)]
+    detach: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -174,8 +185,8 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
         Verb::Yank(args) => releases::yank(ctx, args).await,
         Verb::Delete(args) => releases::delete(ctx, args).await,
         Verb::List(_) => Err(crate::not_ported("model list")),
-        Verb::Download(_) => Err(crate::not_ported("model download")),
-        Verb::Upload(_) => Err(crate::not_ported("model upload")),
+        Verb::Download(args) => machine::download(ctx, args).await,
+        Verb::Upload(args) => machine::upload(ctx, args).await,
         Verb::Quantize(_) => Err(crate::not_ported("model quantize")),
     }
 }
