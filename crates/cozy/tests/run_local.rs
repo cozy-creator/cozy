@@ -537,6 +537,7 @@ fn a_runs_adjustments_reach_its_record() {
 
     let shown = cozy(&home, &work, &["run", "./tiny-adjusted/steps", "--on", "m1"]);
     assert_eq!(shown.code, 0, "{shown:?}");
+    eprintln!("{}", shown.stdout);
     for line in [
         "clamp steps: 50 -> 30 (at most 30 steps) [handler]",
         "warn seed: none given; the result is not reproducible [handler]",
