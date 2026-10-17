@@ -1,6 +1,6 @@
 //! The model ingest cycle on a real Tensorhub with a real machine: Tensorhub's dev-build
-//! `cozy_ref` job (TENSORHUB_URL, TENSORHUB_CA, TENSORHUB_LOG; MinIO storage) and TensorD from the
-//! cozy-runtime wheel (COZY_TEST_TENSORD) trusting the Hub's CA. The machine pins, makes,
+//! `cozy_ref` job (TENSORHUB_URL, TENSORHUB_CA, TENSORHUB_LOG; MinIO storage) and the workspace's
+//! TensorD (`cozy_tensord=workspace`, COZY_TEST_TENSORD) trusting the Hub's CA. The machine pins, makes,
 //! quantizes and uploads every byte; this computer only asks.
 //!
 //! upload → publish → info → family → quantize (a package's quantizer) → publish its lane →
@@ -13,7 +13,8 @@ use std::path::{Path, PathBuf};
 use common::{Home, Out};
 use serde_json::Value;
 
-const TINY: &str = "hf://hf-internal-testing/tiny-random-gpt2@71034c5d8bde858ff824298bdedc65515b97d2b9";
+/// Unpinned: the machine pins it to the commit `main` names now.
+const TINY: &str = "hf://hf-internal-testing/tiny-random-gpt2";
 
 /// The last NDJSON event a followed `--json` run printed: its end.
 fn end(out: &Out) -> Value {
@@ -60,7 +61,8 @@ fn a_model_is_uploaded_quantized_and_published_by_its_machine() {
     // The machine pins the source, makes it and uploads a private checkpoint.
     let run = completed(&home.cozy(["--json", "model", "upload", TINY, &model, "--on", "m1"]));
     let made = &run["result"]["models"][0];
-    assert_eq!(made["resolved"], TINY, "{run}");
+    let pinned = made["resolved"].as_str().and_then(|r| r.strip_prefix(&format!("{TINY}@"))).unwrap_or_default();
+    assert!(pinned.len() >= 40 && pinned[..40].bytes().all(|b| b.is_ascii_hexdigit()), "{run}");
     assert_eq!(made["published"]["destination"], model.as_str(), "{run}");
     let source = made["published"]["checkpoint"].as_str().unwrap().to_owned();
 
