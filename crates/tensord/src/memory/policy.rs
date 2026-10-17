@@ -33,8 +33,7 @@ pub struct Facts {
     pub weights: Option<u64>,
     pub weights_floor: Option<u64>,
     pub activation: Option<u64>,
-    /// Host bytes its pinned tier holds, and the budget that bounds it.
-    pub pinned: Option<u64>,
+    /// The budget that bounds its pinned host tier.
     pub pinned_budget: Option<u64>,
 }
 impl Facts {
@@ -44,7 +43,6 @@ impl Facts {
         self.process = newer.process.or(self.process);
         self.weights = newer.weights.or(self.weights);
         self.weights_floor = newer.weights_floor.or(self.weights_floor);
-        self.pinned = newer.pinned.or(self.pinned);
         self.pinned_budget = newer.pinned_budget.or(self.pinned_budget);
         self.activation = match (self.activation, newer.activation) {
             (Some(a), Some(b)) => Some(a.max(b)),
@@ -665,13 +663,10 @@ impl Gpu {
         Decision::Wait
     }
 
-    /// Every live tenant as `(plan, weights, pinned now, last used)`: what host pinned budgets
-    /// are shared by.
-    pub fn pinned_rows(&self) -> Vec<(String, u64, u64, u64)> {
+    /// Every live tenant as `(plan, weights, last used)`: what host pinned budgets are shared by.
+    pub fn pinned_rows(&self) -> Vec<(String, u64, u64)> {
         let row = |(plan, tenant): (&String, &Tenant)| {
-            let facts = self.facts(plan);
-            let (weights, pinned) = (facts.weights.unwrap_or(0), facts.pinned.unwrap_or(0));
-            (plan.clone(), weights, pinned, tenant.last_used)
+            (plan.clone(), self.facts(plan).weights.unwrap_or(0), tenant.last_used)
         };
         self.tenants.iter().map(row).collect()
     }

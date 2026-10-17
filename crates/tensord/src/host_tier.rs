@@ -73,8 +73,8 @@ pub trait TierLimit: Send + Sync {
         self.limit(host, charged).saturating_sub(charged)
     }
 }
-/// A simple standalone policy: half the live headroom plus the tier's retained bytes.
-/// Pool uses the shared host ledger's TierPolicy to include executor-private pinned bytes.
+/// The machine's one pinned host total: half the live headroom plus the tier's retained
+/// bytes. Executors' pinned budgets split the same total (`Pool::pinned_budgets`).
 pub struct HalfOfHeadroom;
 impl TierLimit for HalfOfHeadroom {
     fn limit(&self, host: &HostMemory, charged: u64) -> u64 {
