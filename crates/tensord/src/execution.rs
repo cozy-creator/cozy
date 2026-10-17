@@ -803,48 +803,28 @@ impl Engine {
         if birth.ended()? {
             return Ok(());
         }
-        // Read birth on both sides of pidfd_open so PID reuse cannot watch or
-        // reclaim a different process. A kernel exit event only wakes reconciliation.
-        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, birth.pid, 0) } as i32;
-        if raw < 0 {
-            let error = io::Error::last_os_error();
-            return match error.raw_os_error() {
-                Some(libc::ESRCH) => {
+        // An exact handle (a pidfd on Linux, a kqueue on macOS), read on both sides of its
+        // open so PID reuse cannot watch or reclaim a different process. A kernel exit event
+        // only wakes reconciliation.
+        let Some(exact) = cozy_platform::process::Exact::open(&birth)? else {
+            // Reaped, or a leader whose exit is still tearing down (a large GPU context) with
+            // no handle yet: observe that exit by sampling instead, then wake dispatch.
+            return match birth.ended()? {
+                true => {
                     self.notify_activity();
                     Ok(())
                 }
-                // A leader whose exit is still tearing down (a large GPU context) has no
-                // pidfd yet: observe that exit by sampling instead, then wake dispatch.
-                Some(libc::EINVAL) => self.watch_by_sampling(birth),
-                _ => Err(error),
+                false => self.watch_by_sampling(birth),
             };
-        }
-        let pidfd = unsafe { File::from_raw_fd(raw) };
-        if birth.ended()? {
-            self.notify_activity();
-            return Ok(());
-        }
+        };
         let engine = self.clone();
         std::thread::Builder::new()
             .name(format!("orphan-{}", birth.pid))
             .spawn(move || {
-                let mut item = libc::pollfd {
-                    fd: pidfd.as_raw_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                loop {
-                    let result = unsafe { libc::poll(&mut item, 1, -1) };
-                    if result >= 0 {
-                        engine.notify_activity();
-                        return;
-                    }
-                    let error = io::Error::last_os_error();
-                    if error.kind() != io::ErrorKind::Interrupted {
-                        tracing::warn!("orphan kernel observation: {error}");
-                        return;
-                    }
+                if let Err(error) = exact.wait() {
+                    tracing::warn!("orphan kernel observation: {error}");
                 }
+                engine.notify_activity();
             })?;
         Ok(())
     }
@@ -1184,11 +1164,16 @@ pub(crate) fn open_artifact(root: &Path, path: &Path) -> io::Result<File> {
     for (index, name) in parts.iter().enumerate() {
         let name = CString::new(name.as_bytes()).map_err(io::Error::other)?;
         let final_component = index + 1 == parts.len();
-        // O_PATH inspects the final inode without opening devices or blocking on FIFOs.
+        // O_PATH inspects the final inode without opening devices or blocking on FIFOs; where
+        // there is none, O_NONBLOCK keeps a FIFO from blocking and only a regular file is kept.
+        #[cfg(target_os = "linux")]
+        let last = libc::O_PATH;
+        #[cfg(not(target_os = "linux"))]
+        let last = libc::O_RDONLY | libc::O_NONBLOCK;
         let flags = libc::O_CLOEXEC
             | libc::O_NOFOLLOW
             | if final_component {
-                libc::O_PATH
+                last
             } else {
                 libc::O_RDONLY | libc::O_DIRECTORY
             };
@@ -1207,7 +1192,10 @@ pub(crate) fn open_artifact(root: &Path, path: &Path) -> io::Result<File> {
                 ));
             }
             // Reopen this exact, retained regular inode through our descriptor, not its name.
+            #[cfg(target_os = "linux")]
             return File::open(format!("/proc/self/fd/{}", file.as_raw_fd()));
+            #[cfg(not(target_os = "linux"))]
+            return Ok(file);
         }
         directory = file;
     }

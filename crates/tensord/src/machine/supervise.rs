@@ -7,12 +7,11 @@
 //! parent.
 use nix::{
     errno::Errno,
-    fcntl::OFlag,
     sys::{
         signal::{kill, SigSet, Signal},
         wait::{waitpid, WaitPidFlag, WaitStatus},
     },
-    unistd::{fork, pipe2, ForkResult, Pid},
+    unistd::{fork, ForkResult, Pid},
 };
 use std::{
     fs::File,
@@ -34,7 +33,7 @@ pub fn supervise(paths: &super::update::Paths) -> io::Result<Ready> {
     let mut failures_before_ready = 0;
     loop {
         super::update::recover_activation(paths)?;
-        let (read, write) = pipe2(OFlag::O_CLOEXEC).map_err(io::Error::from)?;
+        let (read, write) = cloexec_pipe()?;
         // SAFETY: no thread exists yet in this process; the child continues single-threaded.
         let child = match unsafe { fork() }.map_err(io::Error::from)? {
             ForkResult::Child => {
@@ -125,4 +124,10 @@ impl Ready {
             let _ = pipe.write_all(b"r");
         }
     }
+}
+
+/// A pipe whose ends close on exec (std makes it so on every Unix).
+pub(crate) fn cloexec_pipe() -> io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
+    let (read, write) = std::io::pipe()?;
+    Ok((read.into(), write.into()))
 }

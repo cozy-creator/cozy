@@ -1053,11 +1053,7 @@ fn endpoint(config: &ExecutorConfig) -> io::Result<(UnixListener, BTreeMap<Strin
 }
 
 fn parent_of(pid: u32) -> io::Result<u32> {
-    fs::read_to_string(format!("/proc/{pid}/status"))?
-        .lines()
-        .find_map(|line| line.strip_prefix("PPid:"))
-        .and_then(|value| value.trim().parse().ok())
-        .ok_or_else(|| io::Error::other("process status names no parent"))
+    Ok(cozy_platform::process::parent_of(pid)?)
 }
 
 /// The executor's end of the channel is gone: a write broke or no reply came.
@@ -1711,27 +1707,14 @@ impl DeviceExecutor {
             }
         }
         let (stream, _) = listener.accept()?;
-        let mut credential: libc::ucred = unsafe { std::mem::zeroed() };
-        let mut size = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-        if unsafe {
-            libc::getsockopt(
-                stream.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_PEERCRED,
-                (&mut credential as *mut libc::ucred).cast(),
-                &mut size,
-            )
-        } < 0
-        {
-            return Err(io::Error::last_os_error());
-        }
+        let credential = cozy_platform::handles::peer(&stream)?;
         let expected_uid = config
             .identity
             .map_or_else(|| unsafe { libc::geteuid() }, |identity| identity.uid);
         let expected_gid = config
             .identity
             .map_or_else(|| unsafe { libc::getegid() }, |identity| identity.gid);
-        if credential.pid != pid as i32
+        if credential.pid != pid
             || credential.uid != expected_uid
             || credential.gid != expected_gid
         {

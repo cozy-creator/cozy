@@ -152,7 +152,10 @@ fn live(stream: &tokio::net::TcpStream) {
     let _ = stream.set_nodelay(true);
     let seconds = LIVENESS.as_secs() as u32;
     let _ = setsockopt(stream, sockopt::KeepAlive, &true);
+    #[cfg(target_os = "linux")]
     let _ = setsockopt(stream, sockopt::TcpKeepIdle, &seconds);
+    #[cfg(target_os = "macos")]
+    let _ = setsockopt(stream, sockopt::TcpKeepAlive, &seconds);
     let _ = setsockopt(stream, sockopt::TcpKeepInterval, &seconds);
     let _ = setsockopt(stream, sockopt::TcpKeepCount, &1);
 }
