@@ -687,3 +687,54 @@ async fn a_run_completes_and_its_outputs_land_once_across_a_calcifer_restart() {
     landed_whole(&second, &machine, &id, &all).await;
     second.down().await;
 }
+
+/// `GET /v1/machines/{name}?fresh=true` answers the machine as it is now: the environment a warm
+/// run installed is there the moment the run settles, with no wait for a Status tick. A machine
+/// that cannot answer is refused, never shown stale as fresh.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fresh_machine_read_shows_what_a_settled_warm_run_installed() {
+    let home = tempfile::tempdir().unwrap();
+    let mut machine = installing_machine();
+    with_machine(home.path(), &machine);
+    let served = Served::start(home.path()).await;
+    let mut warm = package_run(home.path(), &home.path().join("gate"));
+    let mut spec = v1::RunSpec::decode(warm.spec.as_slice()).unwrap();
+    spec.kind = v1::RunKind::Warm as i32;
+    spec.payload.clear();
+    warm.kind = Kind::Warm;
+    warm.spec = spec.encode_to_vec();
+    let run = served.submit(&warm).await;
+    let mut events = served.events(&run.id).await;
+    events.until(|e| e.is_terminal()).await;
+    assert_eq!(served.run(&run.id).await.status, Status::Completed);
+
+    let fresh = served
+        .get("/v1/machines/m?fresh=true")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(fresh.status(), StatusCode::OK);
+    let fresh: cozy_proto::calcifer::Machine = fresh.json().await.unwrap();
+    let status = fresh.status.expect("a Status read now");
+    assert!(
+        status
+            .environments
+            .iter()
+            .any(|env| env.package.ends_with("calcifer-cpu-outputs")),
+        "{status:?}"
+    );
+    machine.stop();
+    let gone = served
+        .get("/v1/machines/m?fresh=true")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        code(gone).await,
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "machine_unavailable".into()
+        )
+    );
+    served.down().await;
+}
