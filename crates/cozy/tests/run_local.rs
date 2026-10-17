@@ -688,26 +688,27 @@ fn a_second_run_reuses_the_video_and_image_its_machine_holds() {
         let out = cozy(&home, &work, &args);
         let run = completed(&out);
         assert_eq!(run["result"]["video"], 16 << 20, "{run}");
-        let reasons: Vec<String> = out
+        let said: Vec<String> = out
             .stdout
             .lines()
             .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-            .filter(|e| e["type"] == "run.waiting")
-            .filter_map(|e| e["reason"].as_str().map(str::to_owned))
+            .filter_map(|e| match e["type"].as_str() {
+                Some("run.waiting") => e["reason"].as_str().map(str::to_owned),
+                Some("run.log") => {
+                    Some(format!("{}: {}", e["level"].as_str()?, e["text"].as_str()?))
+                }
+                _ => None,
+            })
             .collect();
-        (reasons, relay.sent() - before)
+        (run["number"].to_string(), said, relay.sent() - before)
     };
-    let (first, sent) = run();
+    let (_, first, sent) = run();
     assert!(
         sent > 16 << 20,
         "the first run sent {sent} bytes: {first:?}"
     );
-    assert!(
-        first.iter().any(|r| r.starts_with("uploading video: ")),
-        "{first:?}"
-    );
 
-    let (second, sent) = run();
+    let (number, second, sent) = run();
     assert!(
         sent < 1 << 20,
         "the second run sent {sent} bytes, its files among them: {second:?}"
@@ -716,12 +717,11 @@ fn a_second_run_reuses_the_video_and_image_its_machine_holds() {
         !second.iter().any(|r| r.starts_with("uploading ")),
         "{second:?}"
     );
-    assert!(
-        second
-            .iter()
-            .any(|r| r.starts_with("reusing image, video (16.0 MiB): m1 already holds it")),
-        "{second:?}"
-    );
+    // The run's log keeps it: its follower and `run show` say it, however late they look.
+    let reused = "inputs: reused image, video (16.0 MiB): m1 already holds them";
+    assert!(second.iter().any(|r| r == reused), "{second:?}");
+    let shown = cozy(&home, &work, &["run", "show", &number]);
+    assert!(shown.stdout.contains(reused), "{shown:?}");
     // Each file was read once on this computer: its digest is remembered.
     let remembered = std::fs::read_dir(home.root().join("cache/digests"))
         .unwrap()

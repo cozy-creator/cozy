@@ -820,7 +820,8 @@ impl Calcifer {
             .collect();
         let digests: Vec<Digest> = run.inputs.iter().map(|(digest, _)| *digest).collect();
         let held = link.held_many(&digests).await?;
-        // The request's files the machine already holds are not sent again, and the run says so.
+        // The request's files the machine already holds are not sent again, and the run's log says
+        // so: `run show` and a follower that attaches late read it too.
         let reused: Vec<(&str, u64)> = (run.inputs.iter().zip(&held))
             .filter(|((_, length), held)| v1::held_bytes(held) >= *length)
             .filter_map(|((digest, length), _)| {
@@ -831,11 +832,12 @@ impl Calcifer {
             let mut fields: Vec<&str> = reused.iter().map(|(field, _)| *field).collect();
             fields.sort_unstable();
             let size = bytes(reused.iter().map(|(_, length)| *length).sum::<u64>() as f64);
-            let reason = format!(
-                "reusing {} ({size}): {machine} already holds it",
+            let text = format!(
+                "reused {} ({size}): {machine} already holds them",
                 fields.join(", ")
             );
-            self.waiting(&run.id, reason);
+            let events = self.store.note(run.id.as_str(), "inputs", &text)?;
+            self.publish(&run.id, events);
         }
         for ((digest, length), held) in run.inputs.iter().zip(held) {
             if v1::held_bytes(&held) >= *length {

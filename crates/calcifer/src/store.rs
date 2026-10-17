@@ -808,6 +808,22 @@ impl Store {
         })
     }
 
+    /// A line of Calcifer's own in the run's log, whatever its machine has said yet (the inputs it
+    /// reused); none once it settled.
+    pub fn note(&self, id: &str, level: &str, text: &str) -> Result<Vec<Event>> {
+        self.write(|tx| {
+            if run_in(tx, id)?.is_none_or(|row| row.state == State::Settled) {
+                return Ok(vec![]);
+            }
+            let (seq, at_ms) = (next_seq(tx, id)?, now_ms());
+            tx.execute(
+                "INSERT INTO run_logs (run, seq, at_ms, level, text) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![id, seq as i64, at_ms, level, text],
+            )?;
+            Ok(vec![log_event(seq, at_ms, level.to_owned(), text.to_owned())])
+        })
+    }
+
     /// Ends an accepted run with its machine's outcome.
     pub fn settle(&self, id: &str, outcome: &v1::Outcome, cursor: u64) -> Result<Vec<Event>> {
         self.write(|tx| {
