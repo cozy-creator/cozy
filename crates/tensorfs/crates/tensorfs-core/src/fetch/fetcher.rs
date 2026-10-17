@@ -206,9 +206,11 @@ enum Back {
 }
 
 /// Volume reads and writes in flight at most: 16 readers outrun the local disk (2.6-3.7 GB/s
-/// measured), and one writer moves 60 MB/s of the volume's 68.
+/// measured), and one writer moves 60 MB/s of the volume's 68. One write at a time also judges
+/// room after the last write landed: two judging at once both counted the same free bytes, so
+/// neither evicted for the other and the volume fell below its reserve.
 const READS: usize = 16;
-const WRITES: usize = 2;
+const WRITES: usize = 1;
 
 /// The queue holds `sha256` at its key while it is queued, and not otherwise.
 fn requeue(entries: &mut HashMap<String, Entry>, queue: &mut BTreeSet<(u64, u64, String)>, sha256: &str) {

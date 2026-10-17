@@ -8,7 +8,8 @@
 //!   one object converge and no reader sees part of one.
 //! - **Room.** A write that finds the volume short, or that the volume refuses for space (a
 //!   network volume's quota, which `statvfs` does not show), removes temps and objects unused
-//!   for the TTL, then the least recently used, and is skipped when still short.
+//!   for the TTL, then the least recently used, and is skipped when still short. A fetcher writes
+//!   one object at a time, so each write measures room after the last one landed.
 //! - **Liveness.** An operation beats after every call into the volume; the fetcher abandons
 //!   one silent beyond the transport's stall rule. A hard mount's call cannot be cancelled,
 //!   so its thread waits on the kernel.
