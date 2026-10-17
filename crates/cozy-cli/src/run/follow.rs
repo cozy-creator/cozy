@@ -17,7 +17,7 @@ use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use crate::{
     Context,
     calcifer_client::Client,
-    machine::{Following, placement_note, route},
+    machine::{Following, Notices, route},
     output,
 };
 
@@ -134,10 +134,11 @@ async fn watch(ctx: &Context, run: Run, events_out: bool) -> Result<(Run, bool),
     // The rental the run was placed on, followed until it is known whether its Hub placed it far
     // away: the Hub decides after it accepts the order.
     let mut placing: Option<Following> = None;
+    let mut notices = Notices::default();
     loop {
         tokio::select! {
             next = next_of(&mut placing, &calcifer), if placing.is_some() => match next {
-                Ok(Some(machine)) if !placed(&view, &machine) => {}
+                Ok(Some(machine)) if !placed(&view, &machine, &mut notices) => {}
                 _ => placing = None,
             },
             _ = &mut interrupt => {
@@ -177,7 +178,7 @@ async fn watch(ctx: &Context, run: Run, events_out: bool) -> Result<(Run, bool),
                     let before = view.machine.clone();
                     view.on(&event);
                     if let Some(name) = view.machine.as_deref().filter(|_| view.machine != before) {
-                        placing = follow_placement(&calcifer, &view, name).await;
+                        placing = follow_placement(&calcifer, &view, name, &mut notices).await;
                     }
                 }
             }
@@ -185,15 +186,20 @@ async fn watch(ctx: &Context, run: Run, events_out: bool) -> Result<(Run, bool),
     }
 }
 
-/// Follows the machine a run was placed on while it boots with no word yet on its placement;
-/// a machine read once that says it, or is up, needs no following.
-async fn follow_placement(calcifer: &Client, view: &View, name: &str) -> Option<Following> {
+/// Follows the machine a run was placed on while it boots, saying the Hub's notices of it as they
+/// appear; a machine already up needs no following.
+async fn follow_placement(
+    calcifer: &Client,
+    view: &View,
+    name: &str,
+    notices: &mut Notices,
+) -> Option<Following> {
     let machine: Machine = calcifer.get(&route(name).ok()?).await.ok()?;
-    if placed(view, &machine) {
+    if placed(view, &machine, notices) {
         return None;
     }
     let (following, machine) = Following::open(calcifer, name).await.ok()?;
-    (!placed(view, &machine)).then_some(following)
+    (!placed(view, &machine, notices)).then_some(following)
 }
 
 async fn next_of(
@@ -206,12 +212,11 @@ async fn next_of(
     }
 }
 
-/// Says why the Hub placed the run's rental off this continent, once it has: true when nothing
-/// more will be said (said, or done booting).
-fn placed(view: &View, machine: &Machine) -> bool {
-    if let Some(note) = placement_note(machine) {
+/// Says each notice the Hub gives of the run's rental as it appears: true once the machine is done
+/// booting, when nothing more is followed.
+fn placed(view: &View, machine: &Machine, notices: &mut Notices) -> bool {
+    for note in notices.fresh(machine) {
         view.line(&format!("  {note}"));
-        return true;
     }
     machine.state != MachineState::Booting
 }

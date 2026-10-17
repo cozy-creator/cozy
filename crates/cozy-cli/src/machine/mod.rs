@@ -18,7 +18,7 @@ mod rent;
 
 pub(crate) use list::status_fields;
 pub(crate) use live::Following;
-pub(crate) use rent::placement_note;
+pub(crate) use rent::Notices;
 
 #[derive(clap::Args, Debug)]
 pub struct Args {

@@ -1025,6 +1025,8 @@ fn view(rental: &types::Rental, sku: Option<String>) -> Rental {
         disk_gb: u32::try_from(rental.container_disk_gb).unwrap_or_default(),
         failure: rental.failure.as_ref().map(|f| f.code.clone()),
         placement_note: rental.placement_note.clone().filter(|n| !n.is_empty()),
+        provider_warning: rental.provider_warning.clone().filter(|w| !w.is_empty()),
+        unreachable_since_ms: rental.unreachable_since.as_deref().and_then(ms),
     }
 }
 

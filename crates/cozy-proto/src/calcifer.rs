@@ -490,6 +490,12 @@ pub struct Rental {
     /// Why it runs off the requester's continent: nothing nearer fit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placement_note: Option<String>,
+    /// For an admin: the prepaid provider account it runs on is spent or runs low.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_warning: Option<String>,
+    /// Since when the Hub cannot reach it, though its provider reports it running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unreachable_since_ms: Option<i64>,
 }
 
 /// A machine's `Status`, as it last sent it.
