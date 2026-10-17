@@ -4,6 +4,7 @@
 //! services or their Calcifer.
 #![allow(dead_code)]
 #[cfg(unix)]
+pub mod package;
 pub mod tensord;
 
 use std::{
@@ -39,13 +40,14 @@ impl Home {
         })
     }
 
-    /// A fresh home whose current Hub is the job's Tensorhub (`TENSORHUB_URL`, Tensorhub's
-    /// dev-build `cozy_ref` job); `None` without one.
+    /// A fresh home whose current Hub is the job's Tensorhub at its public origin
+    /// (`TENSORHUB_ORIGIN`, Tensorhub's dev-build `cozy_ref` job, trusted through the job's
+    /// `SSL_CERT_FILE`), as a person's names tensorhub.com; `None` without one.
     pub fn with_hub() -> Option<Self> {
-        let Some(url) = std::env::var_os("TENSORHUB_URL") else {
+        let Some(url) = std::env::var_os("TENSORHUB_ORIGIN") else {
             let _ = writeln!(
                 std::io::stderr(),
-                "skipped: no Tensorhub (TENSORHUB_URL is unset)"
+                "skipped: no Tensorhub (TENSORHUB_ORIGIN is unset)"
             );
             return None;
         };
@@ -60,7 +62,7 @@ impl Home {
     /// Signs `email` up at the home's Hub and keeps its device key where `cozy` reads it, as
     /// `cozy login` would; registers the account name before the `@`. Answers that name.
     pub fn sign_in(&self, email: &str) -> String {
-        let url = std::env::var("TENSORHUB_URL").expect("a Tensorhub");
+        let url = std::env::var("TENSORHUB_ORIGIN").expect("a Tensorhub");
         let log = std::env::var("TENSORHUB_LOG").expect("the Tensorhub's log");
         let hub = cozy_proto::config::Hub {
             name: Some("ci".into()),
