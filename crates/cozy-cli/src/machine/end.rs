@@ -8,7 +8,6 @@ use cozy_proto::{
     error::{Error, Kind},
     machine as v1,
 };
-use prost::Message as _;
 
 use super::{FOLLOW, clock, machine, now_ms, route, usd};
 use crate::context::hub_answer;
@@ -140,8 +139,8 @@ pub async fn update(ctx: &Context, name: &str) -> Result<ExitCode, Error> {
     }
     let payload = serde_json::json!({"runtime": target.runtime, "tensorfs": target.tensorfs, "agent": "bundled"});
     let spec = v1::RunSpec {
-        kind: v1::RunKind::Update as i32,
-        payload: serde_json::to_vec(&payload).expect("JSON serializes"),
+        kind: v1::RunKind::Update,
+        payload: Some(v1::Json::parse(payload.to_string()).expect("JSON")),
         ..Default::default()
     };
     let submit = SubmitRun {
@@ -152,7 +151,7 @@ pub async fn update(ctx: &Context, name: &str) -> Result<ExitCode, Error> {
             "cozy-runtime {}, tensorfs {}",
             target.runtime, target.tensorfs
         ),
-        spec: spec.encode_to_vec(),
+        spec,
         inputs: vec![],
         out: None,
         warnings: vec![],

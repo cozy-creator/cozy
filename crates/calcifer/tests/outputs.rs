@@ -29,7 +29,7 @@ use cozy_proto::{
     ids::{Digest, RunId},
     machine as v1,
 };
-use prost::Message as _;
+use futures_util::StreamExt as _;
 use reqwest::{Client, RequestBuilder, StatusCode, header};
 use tokio::task::JoinHandle;
 
@@ -286,12 +286,12 @@ fn package_run(dir: &Path, gate: &Path) -> SubmitRun {
     };
     let payload = serde_json::json!({"revisions": 3, "big": BIG, "gate": gate});
     let spec = v1::RunSpec {
-        kind: v1::RunKind::Call as i32,
-        source: Some(v1::run_spec::Source::Local(v1::LocalSource {
+        kind: v1::RunKind::Call,
+        source: Some(v1::Source::Local(v1::LocalSource {
             manifest: Digest::of(&manifest).to_string(),
         })),
         entrypoint: "make".into(),
-        payload: serde_json::to_vec(&payload).unwrap(),
+        payload: Some(v1::Json::parse(payload.to_string()).unwrap()),
         owner: "alice".into(),
         ..Default::default()
     };
@@ -300,7 +300,7 @@ fn package_run(dir: &Path, gate: &Path) -> SubmitRun {
         hub: String::new(),
         kind: Kind::Call,
         target: "local/calcifer-cpu-outputs/make".into(),
-        spec: spec.encode_to_vec(),
+        spec,
         inputs: vec![
             staged(source, &tar),
             staged(dir.join("manifest.json"), &manifest),
@@ -326,10 +326,10 @@ async fn on_machine(machine: &Tensord, run: &RunId, name: &str, index: u32) -> V
         index,
         member: String::new(),
     };
-    let (_, mut frames) = link.read(target, 0, 0, 0).await.unwrap();
+    let mut output = link.bulk().unwrap().get(&target, (0, 0), 0).await.unwrap();
     let mut bytes = vec![];
-    while let Some(frame) = frames.message().await.unwrap() {
-        bytes.extend(frame.data);
+    while let Some(data) = output.body.next().await {
+        bytes.extend(data.unwrap());
     }
     bytes
 }
@@ -698,11 +698,9 @@ async fn a_fresh_machine_read_shows_what_a_settled_warm_run_installed() {
     with_machine(home.path(), &machine);
     let served = Served::start(home.path()).await;
     let mut warm = package_run(home.path(), &home.path().join("gate"));
-    let mut spec = v1::RunSpec::decode(warm.spec.as_slice()).unwrap();
-    spec.kind = v1::RunKind::Warm as i32;
-    spec.payload.clear();
+    warm.spec.kind = v1::RunKind::Warm;
+    warm.spec.payload = None;
     warm.kind = Kind::Warm;
-    warm.spec = spec.encode_to_vec();
     let run = served.submit(&warm).await;
     let mut events = served.events(&run.id).await;
     events.until(|e| e.is_terminal()).await;

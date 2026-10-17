@@ -20,7 +20,6 @@ use cozy_proto::{
     machine as v1,
 };
 use ed25519_dalek::{SigningKey, pkcs8::EncodePrivateKey as _};
-use prost::Message as _;
 use sha2::{Digest as _, Sha256};
 use tokio::sync::broadcast;
 
@@ -198,10 +197,10 @@ impl SilentHub {
 }
 
 /// A warm run of a release from `hub`, with `inputs` written first.
-pub fn warm_spec(hub: &str, inputs: Vec<v1::InputFile>) -> Vec<u8> {
+pub fn warm_spec(hub: &str, inputs: Vec<v1::InputFile>) -> v1::RunSpec {
     v1::RunSpec {
-        kind: v1::RunKind::Warm as i32,
-        source: Some(v1::run_spec::Source::Release(v1::Release {
+        kind: v1::RunKind::Warm,
+        source: Some(v1::Source::Release(v1::Release {
             package: "cozy-test/held".into(),
             release: String::new(),
         })),
@@ -212,7 +211,6 @@ pub fn warm_spec(hub: &str, inputs: Vec<v1::InputFile>) -> Vec<u8> {
         inputs,
         ..Default::default()
     }
-    .encode_to_vec()
 }
 
 /// A file the run names as an input, and what the spec says of it.
@@ -268,8 +266,8 @@ pub fn local_spec(dir: &Path) -> (cozy_proto::calcifer::StagedInput, v1::RunSpec
         length: bytes.len() as u64,
     };
     let spec = v1::RunSpec {
-        kind: v1::RunKind::Warm as i32,
-        source: Some(v1::run_spec::Source::Local(v1::LocalSource {
+        kind: v1::RunKind::Warm,
+        source: Some(v1::Source::Local(v1::LocalSource {
             manifest: digest.to_string(),
         })),
         ..Default::default()

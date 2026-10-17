@@ -7,7 +7,6 @@ use cozy_proto::{
     error::{Error, Kind},
     machine::{self as v1, ModelChoice},
 };
-use prost::Message as _;
 
 use super::{exit_code, follow, submit};
 use crate::{Context, model::refs::Repo};
@@ -92,7 +91,7 @@ fn weights<'a>(run: &'a Run, output: Option<&str>) -> Result<&'a OutputItem, Err
 fn submission(run: &Run, item: &OutputItem, machine: String, destination: &Repo) -> SubmitRun {
     let digest = item.sha256.expect("a final output carries its digest");
     let spec = v1::RunSpec {
-        kind: v1::RunKind::Warm.into(),
+        kind: v1::RunKind::Warm,
         models: vec![ModelChoice {
             parameter: item.name.clone(),
             manifest: digest.to_string(),
@@ -107,7 +106,7 @@ fn submission(run: &Run, item: &OutputItem, machine: String, destination: &Repo)
         hub: run.hub.clone(),
         kind: RunKind::Warm,
         target: format!("upload {}#{} to {destination}", run.number, item.name),
-        spec: spec.encode_to_vec(),
+        spec,
         inputs: vec![],
         out: None,
         warnings: vec![],
@@ -183,10 +182,10 @@ mod tests {
             (On::Machine("kiyui".into()), RunKind::Warm)
         );
         assert_eq!(submit.target, "upload 7#int8 to paul/sdxl-int8");
-        let spec = v1::RunSpec::decode(submit.spec.as_slice()).unwrap();
+        let spec = submit.spec;
         assert_eq!(
             (spec.kind, spec.weights_destination.as_str()),
-            (v1::RunKind::Warm as i32, "paul/sdxl-int8")
+            (v1::RunKind::Warm, "paul/sdxl-int8")
         );
         let model = &spec.models[0];
         assert_eq!(

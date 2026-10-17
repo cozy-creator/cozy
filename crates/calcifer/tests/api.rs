@@ -227,14 +227,13 @@ fn held(on: &str, hub: &SilentHub) -> serde_json::Value {
     submission(on, &common::warm_spec(&hub.origin(), vec![]))
 }
 
-fn submission(on: &str, spec: &[u8]) -> serde_json::Value {
-    use base64::Engine as _;
+fn submission(on: &str, spec: &cozy_proto::machine::RunSpec) -> serde_json::Value {
     json!({
         "on": on,
         "hub": "https://tensorhub.com",
         "kind": "warm",
         "target": "cozy-test/held",
-        "spec": base64::engine::general_purpose::STANDARD.encode(spec),
+        "spec": spec,
     })
 }
 
@@ -306,7 +305,7 @@ async fn the_guard_chain_refuses_a_foreign_host_origin_bearer_or_missing_key() {
     );
     let unkeyed = calcifer
         .request(Method::POST, "/v1/runs")
-        .json(&submission("any", &[]));
+        .json(&submission("any", &Default::default()));
     assert_eq!(
         refusal(unkeyed).await,
         refused(StatusCode::BAD_REQUEST, "idempotency_key_required")

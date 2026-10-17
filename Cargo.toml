@@ -10,7 +10,6 @@ members = [
     "crates/cozy-platform",
     "crates/cozy-proto",
     "crates/hub-client",
-    "crates/migrate",
     "crates/tensord",
     "crates/tensorfs/crates/tensorfs-core",
     "crates/tensorfs/crates/tensorfs-plane",
@@ -32,7 +31,6 @@ cozy-cli = { path = "crates/cozy-cli" }
 cozy-platform = { path = "crates/cozy-platform" }
 cozy-proto = { path = "crates/cozy-proto" }
 hub-client = { path = "crates/hub-client" }
-migrate = { path = "crates/migrate" }
 tensord = { path = "crates/tensord" }
 tensorfs-core = { path = "crates/tensorfs/crates/tensorfs-core", default-features = false }
 tensorfs-plane = { path = "crates/tensorfs/crates/tensorfs-plane", default-features = false }

@@ -17,7 +17,6 @@ use cozy_proto::{
     machine as v1,
 };
 use hub_client::{DeviceKey, RunCapability};
-use prost::Message as _;
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 
@@ -66,9 +65,9 @@ impl Machines {
     /// The Hub access and provider tokens the run's send to `machine` carries.
     pub(crate) async fn access(&self, run: &RunRow, machine: &str) -> Result<Access, Denied> {
         let providers = self.providers.clone();
-        let spec = v1::RunSpec::decode(run.spec.as_slice())
-            .map_err(|e| refused("spec_unreadable", format!("the stored spec: {e}")))?;
-        if run.hub.is_empty() || (self.device_key(&run.hub).is_err() && !private(&spec)) {
+        let unkept = v1::RunSpec::default();
+        let spec = run.spec.as_ref().unwrap_or(&unkept);
+        if run.hub.is_empty() || (self.device_key(&run.hub).is_err() && !private(spec)) {
             return Ok(Access {
                 hub: None,
                 providers,
@@ -76,8 +75,8 @@ impl Machines {
             });
         }
         let facts = self.hubs.facts(&run.hub).await?;
-        let operations = match private(&spec) {
-            true => operations(&facts.account, &spec),
+        let operations = match private(spec) {
+            true => operations(&facts.account, spec),
             false => vec![],
         };
         let mut hub = v1::HubAccess {

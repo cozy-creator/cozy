@@ -6,14 +6,13 @@
 //! run's output events or, at startup, from the store. `serve` answers
 //! `GET /v1/runs/{id}/outputs/{name}` from the exported file.
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet},
     io::{Read as _, Seek as _, SeekFrom},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
 };
 
 use axum::{
@@ -26,22 +25,25 @@ use cozy_proto::{
     calcifer::{Event, MachineState},
     error::Kind,
     ids::{Digest, RunId},
-    machine as v1,
+    machine::{
+        self as v1,
+        client::{self, Bulk},
+    },
 };
 use ed25519_dalek::{SigningKey, pkcs8::DecodePrivateKey as _};
+use futures_util::StreamExt as _;
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 use tokio::{
     io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _},
     sync::{Notify, broadcast::error::RecvError, watch},
-    task::{AbortHandle, Id, JoinSet},
 };
-use tonic::{Code, Status};
 use tracing::warn;
 
 use crate::{
     Calcifer, Error, Link, Pause,
     api::{self, Api, Refusal},
+    lanes::{self, Ranged},
     lock,
     store::{Endpoint, OutputRow, RunRow, State as RunState, StoreError},
 };
@@ -51,11 +53,6 @@ const TREE: &str = "application/vnd.cozy.tree-manifest";
 /// Bytes are read in ranges of this size, at most `LANES` side by side on their own connections.
 const RANGE: u64 = 8 << 20;
 const LANES: usize = 8;
-/// A range whose bytes come this many times slower than its peers' is asked again.
-const SLOW: f64 = 8.0;
-/// How often ranges in flight are measured, and the shortest window a rate is judged over.
-const SAMPLE: Duration = Duration::from_secs(1);
-const WINDOW: Duration = Duration::from_secs(2);
 
 /// The exporters at work, and what they share.
 #[derive(Default)]
@@ -677,12 +674,12 @@ async fn check(path: &Path, length: u64, digest: &str) -> Result<(), String> {
     checked.await.unwrap_or_else(|e| Err(e.to_string()))
 }
 
-/// Connections that read one machine's outputs, apart from the one its runs' frames use, so a
-/// big read never holds a run's events up.
+/// Bulk lanes that read one machine's outputs, apart from the connection its runs' events use,
+/// so a big read never holds a run's events up.
 #[derive(Default)]
 struct Lanes {
-    machine: Option<(Endpoint, SigningKey)>,
-    links: Vec<Option<Link>>,
+    machine: Option<(Endpoint, Link)>,
+    bulk: Vec<Option<Bulk>>,
 }
 
 impl Lanes {
@@ -694,53 +691,26 @@ impl Lanes {
             .ok()
             .and_then(|pem| SigningKey::from_pkcs8_pem(&pem).ok())
             .ok_or_else(|| format!("cannot read the signing key {}", key.display()))?;
+        let link = Link::new(&endpoint, signer).map_err(|e| e.to_string())?;
         *self = Lanes {
-            machine: Some((endpoint, signer)),
-            links: vec![None; LANES],
+            machine: Some((endpoint, link)),
+            bulk: vec![None; LANES],
         };
         Ok(())
     }
 
-    /// Lane `i`'s connection, opened on first use and after `redial`.
-    fn link(&mut self, i: usize) -> Result<Link, String> {
-        let (endpoint, key) = self.machine.as_ref().expect("pointed at a machine");
-        if self.links[i].is_none() {
-            self.links[i] = Some(Link::new(endpoint, key.clone()).map_err(|e| e.to_string())?);
+    /// Lane `i`'s connections, opened on first use and again when `fresh`.
+    fn lane(&mut self, i: usize, fresh: bool) -> Result<Bulk, String> {
+        let (_, link) = self.machine.as_ref().expect("pointed at a machine");
+        if fresh || self.bulk[i].is_none() {
+            self.bulk[i] = Some(link.bulk().map_err(|e| e.to_string())?);
         }
-        Ok(self.links[i].clone().expect("opened"))
-    }
-
-    fn redial(&mut self, i: usize) {
-        self.links[i] = None;
+        Ok(self.bulk[i].clone().expect("opened"))
     }
 }
 
-/// A range being read: its task and how far its bytes are in place.
-struct Flight {
-    lane: usize,
-    first: u64,
-    end: u64,
-    at: Arc<AtomicU64>,
-    began: Instant,
-    /// Since its first byte: the start of the window its rate is measured over, and `at` then.
-    window: Option<(Instant, u64)>,
-    slow: bool,
-    task: AbortHandle,
-}
-
-/// Why a range's read stopped.
-enum Ranged {
-    /// Asked again on a fresh connection.
-    Again(String),
-    /// The whole read stops.
-    Stop(Failure),
-}
-
-/// Reads bytes `[from, length)` of `target` at revision `rev` into `part` at their offsets, as an
-/// S3 client does: ranges of `RANGE` bytes, at most `LANES` side by side on their own
-/// connections. A range that fails, or whose bytes come `SLOW` times slower than its peers', is
-/// asked again from where its bytes stopped on a fresh connection. The read gives up only when
-/// every lane has failed since a byte last landed.
+/// Reads bytes `[from, length)` of `target` at revision `rev` into `part` at their offsets: ranges
+/// of `RANGE` bytes, at most `LANES` side by side on their own connections (`lanes::transfer`).
 async fn fetch(
     lanes: &mut Lanes,
     target: &v1::OutputTarget,
@@ -749,141 +719,48 @@ async fn fetch(
     length: u64,
     part: &Path,
 ) -> Result<(), Failure> {
-    let mut queue: VecDeque<(u64, u64)> = (from..length)
+    let ranges = (from..length)
         .step_by(RANGE as usize)
-        .map(|first| (first, (first + RANGE).min(length)))
-        .collect();
-    let (mut reads, mut flights) = (JoinSet::new(), HashMap::<Id, Flight>::new());
-    let (mut rates, mut waits) = (vec![], vec![]);
-    let (mut failures, mut landed, mut landed_then) = (0, 0, 0);
-    let mut sample = tokio::time::interval(SAMPLE);
-    loop {
-        while flights.len() < LANES
-            && let Some((first, end)) = queue.pop_front()
-        {
-            let lane = (0..LANES)
-                .find(|lane| !flights.values().any(|f| f.lane == *lane))
-                .expect("a free lane");
-            let link = lanes.link(lane).map_err(Failure::Again)?;
-            let at = Arc::new(AtomicU64::new(first));
-            let range = (first, end, length);
-            let read = read_range(
-                link,
-                target.clone(),
-                rev,
-                range,
-                part.to_owned(),
-                at.clone(),
-            );
-            let task = reads.spawn(read);
-            let (began, window, slow) = (Instant::now(), None, false);
-            let flight = Flight {
-                lane,
-                first,
-                end,
-                at,
-                began,
-                window,
-                slow,
-                task,
-            };
-            flights.insert(flight.task.id(), flight);
+        .map(|first| (first, (first + RANGE).min(length)));
+    let read = lanes::transfer(ranges, LANES, |leg| {
+        let lane = lanes.lane(leg.lane, leg.fresh);
+        let (target, part) = (target.clone(), part.to_owned());
+        async move {
+            let lane = lane.map_err(Ranged::Again)?;
+            let range = (leg.first, leg.end, length);
+            read_range(lane, target, rev, range, part, leg.at).await
         }
-        if flights.is_empty() {
-            return Ok(());
-        }
-        tokio::select! {
-            Some(joined) = reads.join_next_with_id() => {
-                let (id, read) = match joined {
-                    Ok((id, read)) => (id, read),
-                    Err(e) => (e.id(), Err(Ranged::Again(e.to_string()))),
-                };
-                let flight = flights.remove(&id).expect("a flight per read");
-                let at = flight.at.load(Ordering::Relaxed);
-                landed += at - flight.first;
-                match read {
-                    Ok(()) => {
-                        let seconds = flight.began.elapsed().as_secs_f64().max(1e-3);
-                        rates.push((flight.end - flight.first) as f64 / seconds);
-                    }
-                    Err(Ranged::Stop(failure)) => return Err(failure),
-                    Err(Ranged::Again(message)) => {
-                        lanes.redial(flight.lane);
-                        queue.push_front((at, flight.end));
-                        if !flight.slow {
-                            if landed > landed_then {
-                                (failures, landed_then) = (0, landed);
-                            }
-                            failures += 1;
-                            if failures > LANES {
-                                return Err(Failure::Again(message));
-                            }
-                        }
-                    }
-                }
-            }
-            _ = sample.tick() => judge(&mut flights, &rates, &mut waits),
-        }
-    }
-}
-
-/// Measures the ranges in flight and drops the one whose first byte waits `SLOW` times longer
-/// than its peers' did, or whose bytes come `SLOW` times slower than its peers' (finished ranges
-/// included) over its latest window; its rest is asked again.
-fn judge(flights: &mut HashMap<Id, Flight>, finished: &[f64], waits: &mut Vec<Duration>) {
-    let now = Instant::now();
-    let mut rates = finished.to_vec();
-    let mut judged = vec![];
-    for flight in flights.values_mut() {
-        let at = flight.at.load(Ordering::Relaxed);
-        match flight.window {
-            None if at > flight.first => {
-                waits.push(now - flight.began);
-                flight.window = Some((now, at));
-            }
-            None => {
-                waits.sort();
-                let typical = waits.get(waits.len() / 2).map(|wait| wait.mul_f64(SLOW));
-                flight.slow |= typical.is_some_and(|t| now - flight.began > t.max(WINDOW));
-            }
-            Some((since, seen)) if now - since >= WINDOW => {
-                let rate = (at - seen) as f64 / (now - since).as_secs_f64();
-                flight.window = Some((now, at));
-                rates.push(rate);
-                judged.push((flight.task.id(), rate));
-            }
-            Some(_) => {}
-        }
-    }
-    rates.sort_by(f64::total_cmp);
-    let typical = (rates.len() >= 2).then(|| rates[rates.len() / 2]);
-    for (id, rate) in judged {
-        if let (Some(typical), Some(flight)) = (typical, flights.get_mut(&id)) {
-            flight.slow |= rate * SLOW < typical;
-        }
-    }
-    for flight in flights.values().filter(|flight| flight.slow) {
-        flight.task.abort();
+    });
+    match read.await {
+        Ok(()) => Ok(()),
+        Err(Ranged::Stop(failure)) => Err(failure),
+        Err(Ranged::Again(message)) => Err(Failure::Again(message)),
     }
 }
 
 /// Reads `[first, end)` of an output `length` bytes long into `part`, moving `at` past each byte
 /// in place.
 async fn read_range(
-    link: Link,
+    lane: Bulk,
     target: v1::OutputTarget,
     rev: u64,
     (first, end, length): (u64, u64, u64),
     part: PathBuf,
     at: Arc<AtomicU64>,
-) -> Result<(), Ranged> {
-    let (head, mut frames) = (link.read(target, first, end - first, rev).await).map_err(refused)?;
-    if head.length != length {
+) -> Result<(), Ranged<Failure>> {
+    let mut output = lane.get(&target, (first, end), rev).await.map_err(refused)?;
+    if output.length != length {
         let held = format!(
             "the machine holds {} bytes of revision {rev}, not {length}",
-            head.length
+            output.length
         );
         return Err(Ranged::Stop(Failure::Lost(held)));
+    }
+    if output.range.0 != first {
+        return Err(Ranged::Again(format!(
+            "the machine answered bytes from {}, not {first}",
+            output.range.0
+        )));
     }
     let unwritable = |e: std::io::Error| {
         Ranged::Stop(Failure::Again(format!(
@@ -901,10 +778,10 @@ async fn read_range(
         .map_err(unwritable)?;
     let mut done = first;
     while done < end {
-        let data = match frames.message().await {
-            Ok(Some(frame)) => frame.data,
-            Ok(None) => return Err(Ranged::Again("the machine ended the range early".into())),
-            Err(status) => return Err(refused(status)),
+        let data = match output.body.next().await {
+            Some(Ok(data)) => data,
+            Some(Err(e)) => return Err(Ranged::Again(e.to_string())),
+            None => return Err(Ranged::Again("the machine ended the range early".into())),
         };
         let data = &data[..data.len().min((end - done) as usize)];
         file.write_all(data).await.map_err(unwritable)?;
@@ -916,19 +793,17 @@ async fn read_range(
 }
 
 /// A machine's refusal of a read, as the read acts on it.
-fn refused(status: Status) -> Ranged {
-    let message = format!("{:?}: {}", status.code(), status.message());
-    match status.code() {
-        Code::NotFound => Ranged::Stop(Failure::Lost(format!(
-            "the machine no longer holds it ({message})"
+fn refused(e: client::Error) -> Ranged<Failure> {
+    match e {
+        client::Error::Refused { status: 404, error } => Ranged::Stop(Failure::Lost(format!(
+            "the machine no longer holds it ({}: {})",
+            error.code, error.message
         ))),
-        // The machine moved past this revision: the run's frames bring the newer one.
-        Code::FailedPrecondition
-        | Code::OutOfRange
-        | Code::Unauthenticated
-        | Code::PermissionDenied
-        | Code::InvalidArgument
-        | Code::Unimplemented => Ranged::Stop(Failure::Again(message)),
-        _ => Ranged::Again(message),
+        // A moved revision (412) is not read again: the run's events bring the newer one.
+        client::Error::Refused { status, error } if status < 500 => {
+            Ranged::Stop(Failure::Again(format!("{}: {}", error.code, error.message)))
+        }
+        client::Error::NotMachineApi(message) => Ranged::Stop(Failure::Again(message)),
+        e => Ranged::Again(e.to_string()),
     }
 }
