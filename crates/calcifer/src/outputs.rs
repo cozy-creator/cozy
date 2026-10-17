@@ -501,6 +501,25 @@ fn ranged(header: Option<&HeaderValue>, len: u64) -> Result<Option<(u64, u64)>, 
     Ok(Some((first, last)))
 }
 
+/// Where a run that names no directory puts its outputs: its package's folder, `<org>-<name>` as
+/// the Go CLI named it (`fidika-minimax-h3`, `local-cozy-script-<hex>`), from a target
+/// `<org>/<name>/<function>[@release]`; the outputs folder itself for any other target.
+pub fn package_outputs(outputs: &Path, target: &str) -> PathBuf {
+    let named = |part: &&str| {
+        !part.is_empty()
+            && !part.starts_with('.')
+            && part
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    };
+    match target.split('/').collect::<Vec<_>>().as_slice() {
+        [org, name, function] if named(org) && named(name) && !function.is_empty() => {
+            outputs.join(format!("{org}-{name}"))
+        }
+        _ => outputs.to_owned(),
+    }
+}
+
 /// The item's name in its run's output directory: `<number>-<name>[-<i>]` and its media type's
 /// extension (none for a tree, a directory).
 pub fn file_name(number: u64, name: &str, index: u32, media_type: &str) -> String {
@@ -1021,5 +1040,39 @@ fn refused(status: Status) -> Ranged {
         | Code::InvalidArgument
         | Code::Unimplemented => Ranged::Stop(Failure::Again(message)),
         _ => Ranged::Again(message),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_runs_outputs_default_to_its_packages_folder_as_go_named_it() {
+        let outputs = Path::new("/home/me/.cozy/outputs");
+        for (target, folder) in [
+            ("fidika/minimax-h3/long_form@1.39.0", "fidika-minimax-h3"),
+            ("paul/sdxl/generate", "paul-sdxl"),
+            ("local/h3-tools/caption", "local-h3-tools"),
+            (
+                "local/cozy-script-0123456789abcdef01234567/main",
+                "local-cozy-script-0123456789abcdef01234567",
+            ),
+        ] {
+            assert_eq!(
+                package_outputs(outputs, target),
+                outputs.join(folder),
+                "{target}"
+            );
+        }
+        for target in [
+            "hf://org/model → acme/model",
+            "../x/y",
+            "a/b",
+            "a/../b/c",
+            "",
+        ] {
+            assert_eq!(package_outputs(outputs, target), outputs, "{target}");
+        }
     }
 }
