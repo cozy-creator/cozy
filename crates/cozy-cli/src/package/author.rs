@@ -883,14 +883,18 @@ fn describe(
     })
 }
 
-/// PUTs the files the Hub does not hold yet, 16 at a time; answers the bytes sent. A 412 means
-/// the store already holds those exact bytes.
+/// Sends each file the Hub does not hold to its grant, once per digest, sixteen at once; the bytes
+/// sent.
 async fn upload(
     http: &reqwest::Client,
     files: &[File],
     grants: &[types::PackageFileGrant],
 ) -> Result<u64, Error> {
-    let sends = grants.iter().filter(|g| !g.present).map(|grant| {
+    let mut digests = std::collections::BTreeSet::new();
+    let owed = grants
+        .iter()
+        .filter(|g| !g.present && digests.insert(g.digest.as_str()));
+    let sends = owed.map(|grant| {
         let http = http.clone();
         let file = files.iter().find(|f| f.path == grant.path);
         async move {
@@ -900,36 +904,99 @@ async fn upload(
                     format!("the Hub granted {} without an upload", grant.path),
                 ));
             };
-            let bytes = tokio::fs::read(&file.local)
-                .await
-                .map_err(|e| refuse("release_file_unreadable", e))?;
-            let length = bytes.len() as u64;
-            let mut request = http.put(&target.url).body(bytes);
-            for (name, value) in &target.required_headers {
-                request = request.header(name, value);
-            }
-            let answer = request.send().await.map_err(|e| {
-                Error::new(
-                    Kind::Unavailable,
-                    "release_upload_failed",
-                    format!("{}: {e}", file.path),
-                )
-            })?;
-            match answer.status().as_u16() {
-                200..=299 => Ok(length),
-                412 => Ok(0),
-                status => Err(Error::new(
-                    Kind::Unavailable,
-                    "release_upload_failed",
-                    format!("{}: the store answered HTTP {status}", file.path),
-                )),
-            }
+            put(&http, &file.path, &file.local, target).await
         }
     });
     futures_util::stream::iter(sends)
         .buffer_unordered(16)
         .try_fold(0, |sum, sent| async move { Ok::<u64, Error>(sum + sent) })
         .await
+}
+
+/// PUTs the file at `local` to a content-addressed `target`, whose signed `If-None-Match: *`
+/// makes a re-send safe. A send that ends with no answer, or with the store's 5xx (transient by
+/// design, as S3's SlowDown), goes again after a pause as long as it took, while each carries the
+/// body further than the one before; one that carries it no further ends the upload. Another
+/// 4xx is final, and 412 is the object already there (0 bytes sent).
+async fn put(
+    http: &reqwest::Client,
+    path: &str,
+    local: &Path,
+    target: &types::PresignedUpload,
+) -> Result<u64, Error> {
+    let failed = |message: String| Error::new(Kind::Unavailable, "release_upload_failed", message);
+    let mut before = None;
+    loop {
+        let file = tokio::fs::File::open(local)
+            .await
+            .map_err(|e| refuse("release_file_unreadable", e))?;
+        let length = file
+            .metadata()
+            .await
+            .map_err(|e| refuse("release_file_unreadable", e))?
+            .len();
+        let carried = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let started = std::time::Instant::now();
+        let mut request = http
+            .put(&target.url)
+            .header(reqwest::header::CONTENT_LENGTH, length)
+            .body(counted(file, carried.clone()));
+        for (name, value) in &target.required_headers {
+            request = request.header(name, value);
+        }
+        let why = match request.send().await {
+            Ok(answer) => match answer.status().as_u16() {
+                200..=299 => return Ok(length),
+                412 => return Ok(0),
+                status @ 500..=599 => format!("the store answered HTTP {status}"),
+                status => return Err(failed(format!("{path}: the store answered HTTP {status}"))),
+            },
+            Err(e) => chain(&e),
+        };
+        let reached = carried
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .min(length);
+        if before.is_some_and(|before| reached <= before) {
+            return Err(failed(format!(
+                "{path}: {why}, after {reached} of {length} bytes, no further than the send before"
+            )));
+        }
+        before = Some(reached);
+        let pause = started.elapsed().max(Duration::from_millis(250));
+        output::warn(&format!(
+            "re-sending {path} in {:.1}s: {why}, after {reached} of {length} bytes",
+            pause.as_secs_f64()
+        ));
+        tokio::time::sleep(pause).await;
+    }
+}
+
+/// The file as a body, adding each part's length to `carried` as the transport takes it.
+fn counted(
+    file: tokio::fs::File,
+    carried: std::sync::Arc<std::sync::atomic::AtomicU64>,
+) -> reqwest::Body {
+    let parts = tokio_util::io::ReaderStream::with_capacity(file, 1 << 20);
+    reqwest::Body::wrap_stream(parts.inspect(move |part| {
+        if let Ok(part) = part {
+            carried.fetch_add(part.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+    }))
+}
+
+/// An error and each of its sources, as `error sending request: …: connection reset by peer`.
+fn chain(error: &dyn std::error::Error) -> String {
+    let mut said = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        let text = cause.to_string();
+        if !said.contains(&text) {
+            said.push_str(": ");
+            said.push_str(&text);
+        }
+        source = cause.source();
+    }
+    said
 }
 
 #[derive(Serialize)]
@@ -984,3 +1051,7 @@ pub async fn yank(ctx: &Context, package: &PackageRef) -> Result<ExitCode, Error
     }
     Ok(ExitCode::SUCCESS)
 }
+
+#[cfg(test)]
+#[path = "upload_tests.rs"]
+mod upload_tests;
