@@ -4262,9 +4262,13 @@ fn attempt_cancellation_interrupts_a_partial_tls_record() {
     .unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
+    // The cancel lands only with the head in the client's hands and part of the body's record
+    // on the wire, the rest withheld: the client is inside that record, whatever the load.
     let (partial, receiving) = std::sync::mpsc::channel();
+    let (headed, head_seen) = std::sync::mpsc::channel();
     let peer = std::thread::spawn(move || {
         let (socket, _) = listener.accept().unwrap();
+        socket.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
         let conn = rustls::ServerConnection::new(Arc::new(config)).unwrap();
         let mut stream = rustls::StreamOwned::new(conn, socket);
         let mut request = Vec::new();
@@ -4282,21 +4286,17 @@ fn attempt_cancellation_interrupts_a_partial_tls_record() {
         while stream.conn.wants_write() {
             stream.conn.write_tls(&mut encrypted).unwrap();
         }
-        for (at, byte) in encrypted.iter().enumerate() {
-            if stream.sock.write_all(&[*byte]).is_err() {
-                break;
-            }
-            if at == 40 {
-                partial.send(()).unwrap();
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        stream.sock.write_all(&encrypted[..41]).unwrap();
+        partial.send(()).unwrap();
+        // Nothing more until the client gives up the connection.
+        let _ = stream.sock.read(&mut [0u8; 16]);
     });
     let root = Ledger::with_resolution(Duration::from_millis(100));
     let attempt = Arc::new(super::ledger::Attempt::default());
     let ledger = root.for_request(Arc::clone(&attempt), root.sample());
     let cancel = std::thread::spawn(move || {
-        receiving.recv_timeout(Duration::from_secs(2)).unwrap();
+        receiving.recv().unwrap();
+        head_seen.recv().unwrap();
         attempt.stopped.store(true, Ordering::Release);
     });
     let client = super::http::Client::with_extra_roots(&[cert]);
@@ -4322,6 +4322,7 @@ fn attempt_cancellation_interrupts_a_partial_tls_record() {
         Code::TRANSFER_FAILED,
     )
     .unwrap();
+    headed.send(()).unwrap();
     let started = std::time::Instant::now();
     let refusal = response.read_capped(1024).unwrap_err();
     assert!(
