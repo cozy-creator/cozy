@@ -254,3 +254,35 @@ pub async fn until(
     .await
     .unwrap_or_else(|_| panic!("run {run}: the awaited event never came"))
 }
+
+/// Local code a machine accepts with no Runtime: a manifest naming a package and nothing else,
+/// staged as the run's input, and a warm (install-only) spec of it.
+pub fn local_spec(dir: &Path) -> (cozy_proto::calcifer::StagedInput, v1::RunSpec) {
+    let bytes = br#"{"package":"local/hello"}"#;
+    let path = dir.join("manifest.json");
+    std::fs::write(&path, bytes).unwrap();
+    let digest = Digest::of(bytes);
+    let staged = cozy_proto::calcifer::StagedInput {
+        path,
+        digest,
+        length: bytes.len() as u64,
+    };
+    let spec = v1::RunSpec {
+        kind: v1::RunKind::Warm as i32,
+        source: Some(v1::run_spec::Source::Local(v1::LocalSource {
+            manifest: digest.to_string(),
+        })),
+        ..Default::default()
+    };
+    (staged, spec)
+}
+
+/// Whether the machine holds run `id` under exactly `spec`: the same id and spec answer the
+/// run, another spec is `run_id_conflict` (the machine's digest of what it was sent).
+pub async fn holds_as(link: &calcifer::Link, id: &RunId, spec: v1::RunSpec) -> bool {
+    match link.run(id.as_str(), 0, Some(spec)).await {
+        Ok(_) => true,
+        Err(calcifer::LinkError::Refused { code, .. }) if code == "run_id_conflict" => false,
+        Err(e) => panic!("run {id}: {e}"),
+    }
+}

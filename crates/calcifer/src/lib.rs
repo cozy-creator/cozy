@@ -799,6 +799,13 @@ impl Calcifer {
         if access.providers.is_some() {
             spec.providers = access.providers;
         }
+        // Local code's org-relative references name this computer's account at the run's Hub,
+        // unless the spec names one.
+        if let (Some(v1::run_spec::Source::Local(_)), Some(owner)) = (&spec.source, access.owner)
+            && spec.owner.is_empty()
+        {
+            spec.owner = owner;
+        }
         if access.hub.is_some() {
             spec.hub = access.hub;
         } else if spec.hub.is_none() && !run.hub.is_empty() {
