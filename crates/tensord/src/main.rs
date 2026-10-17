@@ -1,5 +1,5 @@
-//! The `tensord` binary: the machine role for TensorD's and Calcifer's tests and an activated
-//! update's service. `cozy machine serve` is the product's entry.
+//! The `tensord` binary: the machine role for TensorD's and Calcifer's tests. `cozy machine
+//! serve` is the product's entry.
 use clap::{Parser, Subcommand};
 use std::process::ExitCode;
 use tensord::{
@@ -21,8 +21,6 @@ struct Tensord {
 enum Mode {
     /// The machine (the default; a rental unless --persistent).
     Run(Flags),
-    /// The service an updated machine's stable parent starts.
-    Service(Flags),
     /// What this binary is, as JSON.
     Version {
         #[arg(long)]
@@ -36,9 +34,8 @@ fn main() -> ExitCode {
     let tensord = Tensord::parse();
     let lifetime = |flags: Flags| flags.lifetime().unwrap_or(Lifetime::Rental);
     let done = match tensord.mode {
-        None => return serve::machine(lifetime(tensord.flags), false),
-        Some(Mode::Run(flags)) => return serve::machine(lifetime(flags), false),
-        Some(Mode::Service(flags)) => return serve::machine(lifetime(flags), true),
+        None => return serve::machine(lifetime(tensord.flags)),
+        Some(Mode::Run(flags)) => return serve::machine(lifetime(flags)),
         Some(Mode::Version { .. }) => serve::version(),
         Some(Mode::Serve(dev)) => serve::dev(*dev),
     };

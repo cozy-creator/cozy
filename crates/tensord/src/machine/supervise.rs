@@ -2,10 +2,9 @@
 //! PID 1 must), forwards stop signals and starts the service again after an abnormal exit, as
 //! the Go guardian restarts its request plane. A clean exit (a stop or an accepted release)
 //! ends it, and so does a second consecutive exit before readiness: measured progress, no timer.
-//! The parent is never replaced: an activated Runtime update runs as the service child
-//! (`tensord service --rental|--persistent`, readiness pipe on fd 3, this boot's readiness key on fd 4, the
-//! provider credential on fd 5), and a candidate that never proves readiness is rolled back by
-//! this same parent.
+//! The service is always this executable, forked; an activated Runtime update is a new service
+//! on the activated SDK, and a candidate that never proves readiness is rolled back by this same
+//! parent.
 use nix::{
     errno::Errno,
     fcntl::OFlag,
@@ -18,26 +17,12 @@ use nix::{
 use std::{
     fs::File,
     io::{self, Read, Write},
-    os::fd::{AsRawFd, FromRawFd},
+    os::fd::AsRawFd,
 };
 
-/// The fd an exec'd service reports readiness on.
-const READY_FD: i32 = 3;
-/// The fd an exec'd service reads this boot's readiness key from: open only when the parent
-/// placed the key there. The key is never in an environment or an argument, the service closes
-/// the fd once it has read it, and a service that predates it ignores it.
-const KEY_FD: i32 = 4;
-
-/// Forks the service. Returns only in a service child that runs this executable, with the pipe
-/// it reports readiness on; the parent exits with the service's final status. An activated
-/// binary's service gets the readiness `key` on KEY_FD: it proves this boot as the first
-/// service would have.
-pub fn supervise(
-    paths: &super::update::Paths,
-    lifetime: super::grant::Lifetime,
-    key: Option<&[u8]>,
-    provider: Option<&super::provider::ProviderSelf>,
-) -> io::Result<Ready> {
+/// Forks the service. Returns only in the service child, with the pipe it reports readiness
+/// on; the parent exits with the service's final status.
+pub fn supervise(paths: &super::update::Paths) -> io::Result<Ready> {
     let mut signals = SigSet::empty();
     for signal in [Signal::SIGTERM, Signal::SIGINT, Signal::SIGCHLD] {
         signals.add(signal);
@@ -49,13 +34,6 @@ pub fn supervise(
     let mut failures_before_ready = 0;
     loop {
         super::update::recover_activation(paths)?;
-        let activated = super::update::activated_binary(paths)?;
-        // An activated binary that does not read the credential is never handed it.
-        let credential = provider.filter(|_| {
-            activated
-                .as_deref()
-                .is_some_and(super::provider::reads_credential)
-        });
         let (read, write) = pipe2(OFlag::O_CLOEXEC).map_err(io::Error::from)?;
         // SAFETY: no thread exists yet in this process; the child continues single-threaded.
         let child = match unsafe { fork() }.map_err(io::Error::from)? {
@@ -66,10 +44,7 @@ pub fn supervise(
                     std::process::exit(1);
                 }
                 SigSet::empty().thread_set_mask().map_err(io::Error::from)?;
-                let Some(binary) = activated else {
-                    return Ok(Ready(Some(File::from(write))));
-                };
-                exec_service(&binary, lifetime, write, key, credential);
+                return Ok(Ready(Some(File::from(write))));
             }
             ForkResult::Parent { child } => child,
         };
@@ -105,52 +80,7 @@ pub fn supervise(
     }
 }
 
-/// Runs an activated machine binary as this service child; never returns.
-fn exec_service(
-    binary: &std::path::Path,
-    lifetime: super::grant::Lifetime,
-    ready: std::os::fd::OwnedFd,
-    key: Option<&[u8]>,
-    provider: Option<&super::provider::ProviderSelf>,
-) -> ! {
-    use std::os::unix::process::CommandExt;
-    if !inherit(ready, READY_FD) {
-        std::process::exit(1);
-    }
-    match key {
-        Some(key) => {
-            // The whole key fits a pipe's buffer: written and closed before the exec.
-            let Ok((read, write)) = pipe2(OFlag::O_CLOEXEC) else {
-                std::process::exit(1)
-            };
-            if File::from(write).write_all(key).is_err() || !inherit(read, KEY_FD) {
-                std::process::exit(1);
-            }
-        }
-        // Whatever this process inherited there is not a key.
-        // SAFETY: closing an fd nothing in this single-threaded child uses.
-        None => unsafe {
-            libc::close(KEY_FD);
-        },
-    }
-    match provider {
-        Some(provider) if !super::provider::hand_on(provider) => std::process::exit(1),
-        Some(_) => (),
-        // SAFETY: as above.
-        None => unsafe {
-            libc::close(super::provider::CREDENTIAL_FD);
-        },
-    }
-    let lifetime = match lifetime {
-        super::grant::Lifetime::Rental => "--rental",
-        super::grant::Lifetime::Persistent => "--persistent",
-    };
-    let error = std::process::Command::new(binary).args(["service", lifetime]).exec();
-    tracing::error!("cannot run {}: {error}", binary.display());
-    std::process::exit(1)
-}
-
-/// Places `fd` at `at` for the exec'd service to inherit (dup2 clears close-on-exec on the copy).
+/// Places `fd` at `at` for the re-executed machine to inherit (dup2 clears close-on-exec on the copy).
 pub(super) fn inherit(fd: std::os::fd::OwnedFd, at: i32) -> bool {
     // SAFETY: plain fd calls in a single-threaded child.
     let placed = unsafe {
@@ -164,29 +94,6 @@ pub(super) fn inherit(fd: std::os::fd::OwnedFd, at: i32) -> bool {
         std::mem::forget(fd);
     }
     placed >= 0
-}
-
-/// The readiness key the parent handed this exec'd service, read once (the fd is then closed);
-/// None when it handed none.
-pub fn inherited_key() -> Option<Vec<u8>> {
-    // SAFETY: KEY_FD is the parent's key pipe, or not open (F_GETFD then fails).
-    if unsafe { libc::fcntl(KEY_FD, libc::F_GETFD) } < 0 {
-        return None;
-    }
-    // SAFETY: the open fd is owned by nothing else in this process. The pipe was written and
-    // closed before the exec, so a read never waits on it.
-    let mut pipe = unsafe { File::from_raw_fd(KEY_FD) };
-    unsafe { libc::fcntl(KEY_FD, libc::F_SETFL, libc::O_NONBLOCK) };
-    let mut key = vec![0u8; 33];
-    let read = pipe.read(&mut key).ok()?;
-    key.truncate(read);
-    (read == 32).then_some(key)
-}
-
-/// The readiness pipe an exec'd service inherited from its parent.
-pub fn inherited() -> Ready {
-    // SAFETY: the parent placed the pipe's write end at READY_FD before exec.
-    Ready(Some(unsafe { File::from_raw_fd(READY_FD) }))
 }
 
 /// Waits for the service to end, reaping every orphan meanwhile and forwarding stop signals.
