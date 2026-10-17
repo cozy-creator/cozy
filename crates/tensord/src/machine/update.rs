@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use std::{
     fs,
     io::{self, Read, Write},
-    os::unix::{fs::{symlink, PermissionsExt}, process::CommandExt},
+    os::unix::{fs::symlink, process::CommandExt},
     path::{Path, PathBuf},
     process::Stdio,
     sync::{Arc, Mutex},
