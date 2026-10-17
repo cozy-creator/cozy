@@ -25,7 +25,7 @@ def capture(tmp_path_factory):
     source = root / "source"
     shutil.copytree(FIXTURE, source)
     project = source / "pyproject.toml"
-    project.write_text(project.read_text().replace("cozy-runtime>=0.26,<0.27", "cozy-runtime==0.26.0"))
+    project.write_text(project.read_text().replace("cozy-runtime>=0.26", "cozy-runtime==0.26.0"))
     subprocess.run(["uv", "lock", "--project", str(source), "--python", "3.12"], check=True)
     subprocess.run(["uv", "build", "--wheel", "--out-dir", str(root / "client"), str(ROOT)], check=True)
     client = next((root / "client").glob("*.whl"))
