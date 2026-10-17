@@ -4,6 +4,8 @@
 //! that needs it up holds `wanted.lock` as a client would.
 mod common;
 
+use std::io::Write as _;
+
 use common::Home;
 use serde_json::Value;
 
@@ -134,4 +136,33 @@ fn commands_racing_down_reach_a_live_calcifer() {
             );
         }
     }
+}
+
+/// `status` shows the machines Calcifer holds, from its own picture, beside the unsettled runs.
+#[cfg(unix)]
+#[test]
+fn status_shows_the_machines() {
+    let Some(home) = Home::new() else { return };
+    if std::env::var_os("COZY_TEST_TENSORD").is_none() {
+        let _ = writeln!(
+            std::io::stderr(),
+            "skipped: no TensorD (COZY_TEST_TENSORD is unset)"
+        );
+        return;
+    }
+    let _wanted = home.want_calcifer();
+    let _machine = common::tensord::added(&home, "box");
+    let status = home.json(["status", "--json"]);
+    let machines = status["machines"].as_array().unwrap();
+    assert!(
+        machines
+            .iter()
+            .any(|m| m["name"] == "box" && m["kind"] == "added" && m["state"] == "ready"),
+        "{status}"
+    );
+    let human = home.cozy(["status"]);
+    assert!(
+        human.code == 0 && human.stdout.contains("MACHINE") && human.stdout.contains("box"),
+        "{human:?}"
+    );
 }
