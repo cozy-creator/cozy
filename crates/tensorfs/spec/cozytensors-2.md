@@ -7,8 +7,8 @@ tree) whose `model.cozytensors` file is a **header**; the header names **chunks*
 describes every tensor in them, plain or encoded, by component. A **repo** document maps a model's releases and lanes
 to checkpoints. Everything a reader needs to read and decode a tensor is in these documents and this spec.
 
-The key words MUST, MUST NOT, SHOULD and MAY are used as in RFC 2119. §1–§8 define meaning; §9 defines the one byte
-encoding of documents; §10 is informative writer guidance.
+The key words MUST, MUST NOT, SHOULD and MAY are used as in RFC 2119. §1–§8 define meaning; §9 defines the byte encoding
+of documents; §10 is informative writer guidance.
 
 ## 1. Objects
 
@@ -74,7 +74,8 @@ or more segments joined by `/`.
   zero-length location reads no bytes (writers emit `{0, 0, 0}`).
 - `length` MUST equal the byte size of the dtype and shape (§5) for plain data and for every part.
 
-Tensor bytes are row-major (C order) and little-endian. Padding between ranges is unspecified and never read.
+Tensor bytes are row-major (C order) and little-endian. Writers fill gaps between ranges with zeros; readers never
+read them.
 
 ## 5. Dtypes
 

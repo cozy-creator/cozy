@@ -83,7 +83,7 @@ def need(ok: bool, detail: str):
 
 
 def field(doc: dict, name: str, kind, optional=False):
-    if name not in doc or (optional and doc[name] is None and kind is not dict):
+    if name not in doc:
         need(optional, f"missing {name!r}")
         return kind()
     v = doc[name]
