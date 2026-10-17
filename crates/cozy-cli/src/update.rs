@@ -1,7 +1,8 @@
 //! `cozy update [VERSION]` (design §5): replaces this binary with a release's, restarts Calcifer on it and
 //! asks the local machine to update. The release's dist-manifest.json names this target's archive and its
 //! sha256; the release also carries the archive's GitHub attestations (`<archive>.sigstore.jsonl`, one
-//! Sigstore bundle per line), and one must verify as this repo's release workflow.
+//! Sigstore bundle per line), and one must verify as this repo's release workflow, pinned by GitHub
+//! repository id so a rename keeps verifying and a repo that takes an old name never does.
 use std::{
     collections::BTreeMap,
     io,
@@ -13,7 +14,7 @@ use cozy_proto::error::{Error, Kind};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sigstore_verify::{
-    VerificationPolicy,
+    VerificationPolicy, VerificationResult,
     trust_root::{SigstoreInstance, TrustedRoot},
     types::Bundle,
 };
@@ -22,11 +23,10 @@ use crate::Context;
 
 const RELEASES: &str = "https://github.com/cozy-creator/cozy-creator/releases";
 const ISSUER: &str = "https://token.actions.githubusercontent.com";
-/// The release workflow of this repo, on any ref; releases through v0.9.6 were signed before the repo's rename.
-const SIGNERS: [&str; 2] = [
-    "https://github.com/cozy-creator/cozy-creator/.github/workflows/release.yml@",
-    "https://github.com/cozy-creator/cozy/.github/workflows/release.yml@",
-];
+/// This repo's GitHub id (releases through v0.9.6 were signed under its old name, `cozy-creator/cozy`).
+const REPOSITORY_ID: &str = "1345607976";
+/// Its release workflow, on any ref.
+const WORKFLOW: &str = "/.github/workflows/release.yml@";
 
 /// The dist target whose archive replaces this binary.
 const TARGET: &str = if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
@@ -235,6 +235,15 @@ async fn attested(http: &reqwest::Client, url: &str, archive: &[u8]) -> Result<S
         .text()
         .await
         .map_err(|e| unavailable(&bundles, e))?;
+    signer(&bundles, &lines, archive.into())
+}
+
+/// The signer of the first bundle in `lines` that attests `artifact` as this repo's release workflow.
+fn signer(
+    bundles: &str,
+    lines: &str,
+    artifact: sigstore_verify::types::Artifact<'_>,
+) -> Result<String, Error> {
     let root = TrustedRoot::from_embedded(SigstoreInstance::PublicGood)
         .map_err(|e| Error::new(Kind::Internal, "sigstore_root", e.to_string()))?;
     let policy = VerificationPolicy::any_identity().require_issuer(ISSUER);
@@ -243,13 +252,12 @@ async fn attested(http: &reqwest::Client, url: &str, archive: &[u8]) -> Result<S
         let verified = Bundle::from_json(line)
             .map_err(|e| e.to_string())
             .and_then(|bundle| {
-                sigstore_verify::verify(archive, &bundle, &policy, &root).map_err(|e| e.to_string())
-            });
+                sigstore_verify::verify(artifact.clone(), &bundle, &policy, &root)
+                    .map_err(|e| e.to_string())
+            })
+            .and_then(|result| ours(&result));
         match verified {
-            Ok(result) => match result.identity().map(|id| id.as_str().to_owned()) {
-                Some(id) if SIGNERS.iter().any(|s| id.starts_with(s)) => return Ok(id),
-                id => seen.push(format!("signed by {}", id.unwrap_or_default())),
-            },
+            Ok(signer) => return Ok(signer),
             Err(e) => seen.push(e),
         }
     }
@@ -257,11 +265,31 @@ async fn attested(http: &reqwest::Client, url: &str, archive: &[u8]) -> Result<S
         Kind::Validation,
         "unattested",
         format!(
-            "no bundle in {bundles} verifies as {}…: [{}]",
-            SIGNERS[0],
+            "no bundle in {bundles} verifies as the release workflow of GitHub repository {REPOSITORY_ID}: [{}]",
             seen.join("; ")
         ),
     ))
+}
+
+/// The signer, when the certificate is this repository's (by id) and the signer is its own release workflow.
+fn ours(result: &VerificationResult) -> Result<String, String> {
+    let signer = result.identity().map_or("", |id| id.as_str());
+    let claims = result.certificate().map(|cert| &cert.ci_claims);
+    let repository = claims
+        .and_then(|c| c.source_repository_uri.as_deref())
+        .unwrap_or_default();
+    let id = claims
+        .and_then(|c| c.source_repository_identifier.as_deref())
+        .unwrap_or_default();
+    let release_workflow = !repository.is_empty()
+        && signer
+            .strip_prefix(repository)
+            .is_some_and(|path| path.starts_with(WORKFLOW));
+    if result.certificate_verified() && id == REPOSITORY_ID && release_workflow {
+        Ok(signer.to_owned())
+    } else {
+        Err(format!("signed by {signer} (GitHub repository {id})"))
+    }
 }
 
 /// Writes the archive's `cozy` beside `binary` (a file there can run, and the swap stays on one disk).
@@ -354,4 +382,37 @@ fn unavailable(url: &str, error: impl std::fmt::Display) -> Error {
 
 fn local(op: &str, error: io::Error) -> Error {
     Error::new(Kind::Internal, "update_failed", format!("{op}: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use sigstore_verify::types::{Artifact, Sha256Hash};
+
+    fn sha256(hex: &str) -> Artifact<'static> {
+        Artifact::from_digest(Sha256Hash::from_hex(hex).unwrap())
+    }
+
+    /// v0.9.6 was signed under the repo's old name; its certificate still names this repository id.
+    #[test]
+    fn a_release_signed_before_the_rename_verifies() {
+        let lines = include_str!("../tests/fixtures/sigstore/cozy-v0.9.6.jsonl");
+        let archive = sha256("05f72ee7e573691e20bad0676c8d222a57b293b34d2a71b25d5fcf68e220df63");
+        let signer = super::signer("v0.9.6", lines, archive).unwrap();
+        assert_eq!(
+            signer,
+            "https://github.com/cozy-creator/cozy/.github/workflows/release.yml@refs/heads/release-v0.9.6"
+        );
+    }
+
+    /// cli/cli's genuine GitHub Actions provenance of its own archive verifies, but is not this repo's.
+    #[test]
+    fn another_repos_release_is_refused_for_its_signer() {
+        let lines = include_str!("../tests/fixtures/sigstore/cli-v2.102.0.jsonl");
+        let archive = sha256("bb766f710eef8ede859c18578c72c327597cd4c8a85b06001b1f3843c6019386");
+        let refusal = super::signer("gh v2.102.0", lines, archive).unwrap_err();
+        assert_eq!(refusal.code, "unattested");
+        let cli = "signed by https://github.com/cli/cli/.github/workflows/deployment.yml@refs/heads/trunk \
+            (GitHub repository 212613049)";
+        assert!(refusal.message.contains(cli), "{}", refusal.message);
+    }
 }
