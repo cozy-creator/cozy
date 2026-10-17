@@ -107,6 +107,8 @@ pub enum Progress {
 }
 
 pub struct Request {
+    /// The run this prepares for: a run waiting on its install is told so by this id.
+    pub run: String,
     pub source: hub::Source,
     pub package: String,
     /// Empty: the Hub's newest, as it named it under `catalog_revision`.
@@ -189,6 +191,10 @@ struct Job {
     observer: Option<Observer>,
     /// Its run's stop: a cancel ends its downloads and installs.
     stop: Option<PullCancellation>,
+    /// Its run as its caller names it, and how that run is told what it waits for
+    /// (`Engine::waiting`).
+    caller: String,
+    waiting: Option<Box<dyn Fn(Option<String>) + Send + Sync>>,
 }
 impl Default for Progress {
     fn default() -> Self {
@@ -208,6 +214,11 @@ impl Job {
         }
         *self.progress.lock().unwrap() = progress;
         self.changed.notify_all();
+    }
+    fn waiting(&self, reason: Option<String>) {
+        if let Some(waiting) = &self.waiting {
+            waiting(reason);
+        }
     }
     fn stage(&self, stage: String) {
         self.set(Progress::Preparing {
@@ -260,6 +271,16 @@ pub struct Publisher {
     jobs: Mutex<HashMap<String, Arc<Job>>>,
     /// One maker per source: a second asker waits, then finds it held (runs 5393/5394).
     making: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// The run building each environment identity, which a second run waits for.
+    building: Mutex<HashMap<String, String>>,
+}
+
+/// An identity's builder, forgotten however the build ends.
+struct Building<'a>(&'a Mutex<HashMap<String, String>>, String);
+impl Drop for Building<'_> {
+    fn drop(&mut self) {
+        self.0.lock().unwrap().remove(&self.1);
+    }
 }
 
 impl Publisher {
@@ -271,6 +292,7 @@ impl Publisher {
             store,
             jobs: Mutex::new(HashMap::new()),
             making: Mutex::new(HashMap::new()),
+            building: Mutex::new(HashMap::new()),
         }))
     }
 
@@ -356,9 +378,19 @@ impl Publisher {
         if let Ok(Some(prepared)) = self.held(service, actor, request) {
             return Ok(prepared);
         }
+        let engine = service.engine.clone();
+        let run = request.run.clone();
         let job = Job {
             observer: observe,
             stop: stop.cloned(),
+            caller: service.engine.caller_id(&run),
+            waiting: (!run.is_empty()).then(|| {
+                Box::new(move |reason| {
+                    if let Err(error) = engine.waiting(&run, reason) {
+                        tracing::warn!("run {run}: its waiting reason was not shown: {error}");
+                    }
+                }) as Box<dyn Fn(Option<String>) + Send + Sync>
+            }),
             ..Default::default()
         };
         self.work(service, actor, request, &job)
@@ -871,7 +903,17 @@ impl Publisher {
         let locks = generations.join(".locks");
         fs::create_dir_all(&locks).map_err(io_failure)?;
         let lock = File::create(locks.join(format!("{identity}.lock"))).map_err(io_failure)?;
-        lock.lock_exclusive().map_err(io_failure)?;
+        if lock.try_lock_exclusive().is_err() {
+            let holder = self.building.lock().unwrap().get(identity).cloned();
+            job.waiting(Some(match holder {
+                Some(run) => format!("waiting for run {run} to install {package} {release}"),
+                None => format!("waiting for another run's install of {package} {release}"),
+            }));
+            lock.lock_exclusive().map_err(io_failure)?;
+            job.waiting(None);
+        }
+        self.building.lock().unwrap().insert(identity.into(), job.caller.clone());
+        let _building = Building(&self.building, identity.into());
         let dir = generations.join(identity);
         if dir.join("generation.json").is_file() {
             return Ok(());
@@ -2406,6 +2448,7 @@ mod tests {
     #[test]
     fn an_explicit_gpu_count_and_bits_have_their_own_preparation_cache_key() {
         let mut request = Request {
+            run: String::new(),
             source: hub::Source::new("https://hub.example", None, vec![], None).unwrap(),
             package: "org/package".into(), release: "1".into(), installed: None,
             owner: "org".into(), catalog_revision: String::new(), providers: Providers::default(),
@@ -2839,7 +2882,7 @@ mod tests {
 
         /// `render` prepared for `acme`'s run at `bits` with `choices`.
         fn prepare(&self, bits: u32, choices: Vec<domain::ModelChoice>) -> Prepared {
-            let request = Request { source: self.hub.clone(), package: self.installation.package.clone(), release: "1.0.0".into(),
+            let request = Request { run: String::new(), source: self.hub.clone(), package: self.installation.package.clone(), release: "1.0.0".into(),
                 installed: Some(self.installation.clone()), owner: "acme".into(), catalog_revision: "r1".into(),
                 providers: Providers::default(), entrypoint: "render".into(), choices, gpus: 0, bits, imports: false };
             self.publisher.prepare_now(&self.service, "alice", &request, None, None).unwrap()

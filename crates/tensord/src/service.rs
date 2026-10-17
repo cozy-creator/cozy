@@ -472,7 +472,14 @@ impl Service {
                 continue;
             }
             let invocation = &record.invocation;
-            if (invocation.degree == 0 && room == 0) || (invocation.degree > 0 && gpu_fenced) {
+            if invocation.degree == 0 && room == 0 {
+                let busy = format!("waiting for an executor slot ({} busy)", self.parallelism);
+                if let Err(error) = self.engine.waiting(&record.id, Some(busy)) {
+                    tracing::warn!("run {}: its waiting reason was not shown: {error}", record.id);
+                }
+                continue;
+            }
+            if invocation.degree > 0 && gpu_fenced {
                 continue;
             }
             let plan = match record.submission.as_ref().map(|s| s.preparation_id.as_str()) {
