@@ -3023,12 +3023,8 @@ mod v1_api {
         // The id names that spec: another spec under it is refused.
         let mut other = local(v1::RunKind::Call);
         other.payload = v1::Json::parse(r#"{"steps":3}"#).ok();
-        let conflict = run_events(&client, &all, run("call-1", other))
-            .await
-            .unwrap()
-            .next().await.transpose()
-            .unwrap_err();
-        assert_eq!(conflict.status(), Some(409));
+        let conflict = run_events(&client, &all, run("call-1", other)).await.err().unwrap();
+        assert_eq!((conflict.status(), conflict.code()), (Some(409), Some("run_id_conflict")));
         let _ = fs::remove_dir_all(tools);
     }
 
