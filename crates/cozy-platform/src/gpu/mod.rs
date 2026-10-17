@@ -34,6 +34,27 @@ pub enum MemoryClass {
     Unified,
 }
 
+/// The oldest NVIDIA driver the stack's CUDA 13.0 runs on. The cozy-kernels wheel declares the same
+/// (`cozy_kernels.DRIVER_FLOOR`), and cozy-runtime's `kernels.yaml` checks the two are equal.
+pub const DRIVER_FLOOR: &str = if cfg!(windows) { "580.88" } else { "580.65.06" };
+
+/// Why a GPU on `driver` cannot serve: it is older than [`DRIVER_FLOOR`]. `None` when it meets the
+/// floor, or when the driver's version does not parse (CUDA then answers for itself).
+pub fn below_floor(driver: &str) -> Option<String> {
+    let version = |text: &str| {
+        text.trim()
+            .split('.')
+            .map(|part| part.parse::<u32>().ok())
+            .collect::<Option<Vec<u32>>>()
+    };
+    (version(driver)? < version(DRIVER_FLOOR)?).then(|| {
+        format!(
+            "NVIDIA driver {driver} is below {DRIVER_FLOOR}, the oldest CUDA 13.0 runs on: \
+             update the driver to {DRIVER_FLOOR} or newer"
+        )
+    })
+}
+
 /// `visible` is `CUDA_VISIBLE_DEVICES` as the caller's config read it: indices or UUIDs, and an
 /// empty value hides every GPU.
 pub fn probe(visible: Option<&str>) -> Result<Vec<Gpu>> {
@@ -156,5 +177,29 @@ fn failed(op: &'static str) -> impl FnOnce(NvmlError) -> Error {
     move |error| Error::Gpu {
         op,
         detail: error.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_driver_below_the_floor_is_named_with_the_driver_it_needs() {
+        let message = below_floor("570.133.20").expect("570 is below CUDA 13.0's floor");
+        assert!(
+            message.contains("570.133.20") && message.contains(DRIVER_FLOOR),
+            "{message}"
+        );
+        assert!(below_floor("580.0").is_some());
+    }
+
+    #[test]
+    fn the_floor_and_newer_drivers_serve_and_an_unreadable_version_is_not_judged() {
+        for driver in [DRIVER_FLOOR, "580.95.05", "581.57", "590.10", " 600.1 "] {
+            assert_eq!(below_floor(driver), None, "{driver}");
+        }
+        assert_eq!(below_floor("N/A"), None);
+        assert_eq!(below_floor(""), None);
     }
 }
