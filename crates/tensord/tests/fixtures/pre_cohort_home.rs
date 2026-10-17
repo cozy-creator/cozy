@@ -111,7 +111,7 @@ async fn a_v0_9_machine_home() {
     let manifest = write(manifest.to_string().as_bytes()).await;
 
     let counter = home.join("counter");
-    let payload = serde_json::json!({"value": 3, "counter": counter}).to_string().into_bytes();
+    let payload = serde_json::json!({"payload": {"value": 3, "counter": counter}}).to_string().into_bytes();
     for (id, kind, entrypoint) in [("warm", v1::RunKind::Warm, ""), ("note", v1::RunKind::Call, "note")] {
         let spec = v1::RunSpec {
             kind: kind as i32,

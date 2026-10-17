@@ -1,5 +1,6 @@
 //! A machine home v0.9 left (COZY_TEST_PRE_COHORT_HOME, built by tests/fixtures/pre_cohort_home.rs
-//! at v0.9.1), opened by this machine on a copy: its journal of protobuf values is archived
+//! at v0.9.1, a CI scratch home this test consumes; it stays where it was built, since environments
+//! name their absolute paths), opened by this machine: its journal of protobuf values is archived
 //! beside it, never read, and a fresh journal starts. The machine keeps its identity (leaf,
 //! worker id, owner key), its store and its installed environment, whose code runs again with
 //! no reinstall.
@@ -68,10 +69,8 @@ async fn a_v0_9_home_keeps_its_identity_store_and_environments_across_the_journa
         eprintln!("skipped: no pre-cohort home (COZY_TEST_PRE_COHORT_HOME is unset)");
         return;
     };
-    let home = tempfile::tempdir().unwrap();
-    let copied = Command::new("cp").arg("-a").arg(Path::new(&built).join(".")).arg(home.path()).status().unwrap();
-    assert!(copied.success());
-    let root = home.path().join(".cozy/machine");
+    let home = Path::new(&built);
+    let root = home.join(".cozy/machine");
     let engine = root.join("var/lib/cozy/tensord");
     let journal = files(&root)
         .into_iter()
@@ -88,19 +87,19 @@ async fn a_v0_9_home_keeps_its_identity_store_and_environments_across_the_journa
     let generations = files(&engine.join("generations")).len();
     assert!(generations > 0, "the v0.9 home holds its environment");
     // Calcifer's owner key, as the home holds it.
-    std::fs::create_dir_all(home.path().join(".cozy/keys")).unwrap();
+    std::fs::create_dir_all(home.join(".cozy/keys")).unwrap();
     let pem = SigningKey::from_bytes(&OWNER).to_pkcs8_pem(Default::default()).unwrap();
-    std::fs::write(home.path().join(".cozy/keys/owner.pem"), pem.as_bytes()).unwrap();
+    std::fs::write(home.join(".cozy/keys/owner.pem"), pem.as_bytes()).unwrap();
 
     let mut machine = Machine(
         Command::new(env!("CARGO_BIN_EXE_tensord"))
             .arg("--persistent")
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
-            .env("HOME", home.path())
+            .env("HOME", home)
             .process_group(0)
             .stdout(Stdio::null())
-            .stderr(std::fs::File::create(home.path().join("machine-after.log")).unwrap())
+            .stderr(std::fs::File::create(home.join("machine-after.log")).unwrap())
             .spawn()
             .unwrap(),
     );
@@ -148,13 +147,13 @@ async fn a_v0_9_home_keeps_its_identity_store_and_environments_across_the_journa
 
     // The installed code runs again from the objects the owner wrote before, with no reinstall.
     let pre: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(home.path().join("pre-cohort.json")).unwrap()).unwrap();
-    let counter = home.path().join("counter-after");
+        serde_json::from_slice(&std::fs::read(home.join("pre-cohort.json")).unwrap()).unwrap();
+    let counter = home.join("counter-after");
     let spec = v1::RunSpec {
         kind: v1::RunKind::Call as i32,
         source: Some(v1::run_spec::Source::Local(v1::LocalSource { manifest: pre["manifest"].as_str().unwrap().into() })),
         entrypoint: "note".into(),
-        payload: serde_json::json!({"value": 4, "counter": counter}).to_string().into_bytes(),
+        payload: serde_json::json!({"payload": {"value": 4, "counter": counter}}).to_string().into_bytes(),
         ..Default::default()
     };
     let request = authorized(v1::RunRequest { id: "after".into(), after: 0, spec: Some(spec) });
