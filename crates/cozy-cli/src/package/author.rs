@@ -33,9 +33,9 @@ pub(super) fn refuse(code: &str, detail: impl Display) -> Error {
     Error::new(Kind::Validation, code, detail.to_string())
 }
 
-/// uv in `dir`, quiet and colorless.
-pub(super) fn uv(dir: &Path) -> Command {
-    let mut command = Command::new("uv");
+/// `uv` (cozy's pinned uv, else PATH's: `tools::uv`) in `dir`, quiet and colorless.
+pub(super) fn uv(uv: &Path, dir: &Path) -> Command {
+    let mut command = Command::new(uv);
     command.current_dir(dir).env("NO_COLOR", "1");
     command
 }
@@ -45,10 +45,11 @@ pub(super) fn run(command: &mut Command, code: &str) -> Result<String, Error> {
     let out = command.output().map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => Error::new(
             Kind::Unavailable,
-            "uv_not_found",
-            "authoring packages needs uv, which is not on PATH",
+            "uv_unavailable",
+            format!("{} is gone", command.get_program().to_string_lossy()),
         )
-        .remedy("install it: https://docs.astral.sh/uv/getting-started/installation/"),
+        .next("cozy tools install uv")
+        .next("cozy doctor"),
         _ => refuse(code, e),
     })?;
     if !out.status.success() {
@@ -70,6 +71,8 @@ pub(super) struct Project {
     pub version: String,
     pub requires_python: String,
     pub account_index: bool,
+    /// A dependency or uv source fetched with git: locking and publishing need git.
+    pub git: bool,
 }
 
 impl Project {
@@ -153,18 +156,46 @@ impl Project {
                     toml::Value::Array(alternatives) => alternatives.iter().any(names_index),
                     source => names_index(source),
                 });
+        let requirements = field(&["project", "dependencies"])
+            .and_then(toml::Value::as_array)
+            .into_iter()
+            .flatten();
+        let git_source = |source: &toml::Value| source.get("git").is_some();
+        let git = requirements
+            .filter_map(toml::Value::as_str)
+            .any(|r| r.contains("git+"))
+            || sources
+                .into_iter()
+                .flat_map(|s| s.values())
+                .any(|source| match source {
+                    toml::Value::Array(alternatives) => alternatives.iter().any(git_source),
+                    source => git_source(source),
+                });
         Ok(Self {
             root,
             name: normalize(&name),
             version,
             requires_python: text(&["project", "requires-python"]).unwrap_or_default(),
             account_index,
+            git,
         })
+    }
+
+    /// The tools locking and publishing it need: git when it depends on a git source (refused
+    /// with its install named, before uv runs and fails on it), and uv (fetched, pinned).
+    async fn tools(&self, ctx: &Context) -> Result<PathBuf, Error> {
+        let path: Vec<PathBuf> = std::env::var_os("PATH")
+            .map(|path| std::env::split_paths(&path).collect())
+            .unwrap_or_default();
+        if self.git && cozy_platform::tools::on_path("git", &path).is_none() {
+            return Err(crate::tools::missing(ctx, "git"));
+        }
+        crate::tools::uv(ctx).await
     }
 
     /// The Python a release runs on: `.python-version`, else requires-python's floor; its exact
     /// version as uv finds it (installing a managed one when none is here).
-    fn python(&self) -> Result<Python, Error> {
+    fn python(&self, uv: &Path) -> Result<Python, Error> {
         let pinned = fs::read_to_string(self.root.join(".python-version")).ok();
         let floor = self.requires_python.split(',').find_map(|clause| {
             let version = clause
@@ -190,7 +221,12 @@ impl Project {
             .unwrap_or_else(|| "3.12".into());
         let find = || {
             run(
-                uv(&self.root).args(["python", "find", "--show-version", request.as_str()]),
+                self::uv(uv, &self.root).args([
+                    "python",
+                    "find",
+                    "--show-version",
+                    request.as_str(),
+                ]),
                 "python_not_found",
             )
         };
@@ -198,7 +234,7 @@ impl Project {
             Ok(version) => version,
             Err(_) => {
                 run(
-                    uv(&self.root).args(["python", "install", request.as_str()]),
+                    self::uv(uv, &self.root).args(["python", "install", request.as_str()]),
                     "python_install_failed",
                 )?;
                 find()?
@@ -236,10 +272,12 @@ pub(super) struct Stage {
     _dir: tempfile::TempDir,
     pub root: PathBuf,
     pub src: PathBuf,
+    /// The uv it is locked and built with.
+    pub uv: PathBuf,
 }
 
 impl Stage {
-    fn new(project: &Project) -> Result<Self, Error> {
+    fn new(project: &Project, uv: PathBuf) -> Result<Self, Error> {
         let dir = tempfile::tempdir().map_err(|e| refuse("stage_unavailable", e))?;
         let root = dir.path().to_path_buf();
         let src = root.join("src");
@@ -253,6 +291,7 @@ impl Stage {
             _dir: dir,
             root,
             src,
+            uv,
         })
     }
 
@@ -288,7 +327,7 @@ impl Stage {
         }
         fs::write(&path, doc.to_string()).map_err(|e| refuse("stage_unavailable", e))?;
         let locked = run(
-            uv(&self.src).args(["lock", "--no-progress", "--python", python]),
+            uv(&self.uv, &self.src).args(["lock", "--no-progress", "--python", python]),
             "lock_failed",
         );
         fs::write(&path, authored).map_err(|e| refuse("stage_unavailable", e))?;
@@ -468,7 +507,7 @@ struct Locked {
 
 pub async fn lock(ctx: &Context, upgrade: &[String]) -> Result<ExitCode, Error> {
     let project = Project::here()?;
-    let stage = Stage::new(&project)?;
+    let stage = Stage::new(&project, project.tools(ctx).await?)?;
     let account_index = match project.account_index {
         false => None,
         true => {
@@ -480,8 +519,8 @@ pub async fn lock(ctx: &Context, upgrade: &[String]) -> Result<ExitCode, Error> 
             Some(url)
         }
     };
-    let python = project.python()?;
-    let mut command = uv(&stage.src);
+    let python = project.python(&stage.uv)?;
+    let mut command = uv(&stage.uv, &stage.src);
     command.args(["lock", "--no-progress", "--python", python.request.as_str()]);
     for package in upgrade {
         command.args(["--upgrade-package", package.as_str()]);
@@ -596,7 +635,7 @@ pub async fn publish(ctx: &Context) -> Result<ExitCode, Error> {
         },
     }
 
-    let stage = Stage::new(&project)?;
+    let stage = Stage::new(&project, project.tools(ctx).await?)?;
     let committed = fs::read_to_string(project.root.join("uv.lock")).map_err(|_| {
         Error::new(
             Kind::Validation,
@@ -608,7 +647,7 @@ pub async fn publish(ctx: &Context) -> Result<ExitCode, Error> {
     // Locking the copy is a no-op for a lock made for this Hub and account. For another, it moves
     // the account's packages to this index pinned to the versions the lock holds: a pin this Hub
     // cannot meet is refused by name, never re-resolved to a newer release.
-    let python = project.python()?;
+    let python = project.python(&stage.uv)?;
     if project.account_index {
         let url = index_url(&client, &hub, &account).await?;
         stage.bind(&url)?;
@@ -620,7 +659,12 @@ pub async fn publish(ctx: &Context) -> Result<ExitCode, Error> {
         }
     }
     run(
-        uv(&stage.src).args(["lock", "--no-progress", "--python", python.request.as_str()]),
+        uv(&stage.uv, &stage.src).args([
+            "lock",
+            "--no-progress",
+            "--python",
+            python.request.as_str(),
+        ]),
         "lock_failed",
     )?;
     let bound =
@@ -649,7 +693,7 @@ pub async fn publish(ctx: &Context) -> Result<ExitCode, Error> {
 
     let dist = stage.root.join("dist");
     run(
-        uv(&stage.src)
+        uv(&stage.uv, &stage.src)
             .args([
                 "build",
                 "--no-progress",
@@ -660,7 +704,7 @@ pub async fn publish(ctx: &Context) -> Result<ExitCode, Error> {
             .arg(&dist),
         "build_failed",
     )?;
-    let (rows, git_wheels) = registry::dependencies(&stage, &python.full)?;
+    let (rows, git_wheels) = registry::dependencies(ctx, &stage, &python.full)?;
     let interface = describe(&stage, &python, after.get("cozy-runtime"), &account)?;
     let interface_path = stage.root.join("package-interface.json");
     fs::write(&interface_path, &interface).map_err(|e| refuse("stage_unavailable", e))?;
@@ -784,7 +828,7 @@ fn describe(
         None => "cozy-runtime".into(),
     };
     let said = run(
-        uv(&stage.src)
+        uv(&stage.uv, &stage.src)
             .args([
                 "tool",
                 "run",
