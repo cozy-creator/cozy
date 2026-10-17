@@ -1,8 +1,6 @@
 //! This computer's machine (`--persistent`) from nothing but its user's home: its root, port,
 //! keys and log come from `~/.cozy`. A key `cozy machine authorize` appends is admitted at the
 //! next call, a restart keeps the port, and the machine's own log reads back over Read.
-mod common;
-
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use ed25519_dalek::{pkcs8::EncodePrivateKey, SigningKey};
 use std::{
@@ -109,7 +107,7 @@ async fn this_computers_machine_runs_from_its_home() {
     std::fs::write(keys.join("authorized"), format!("# a laptop\n{line}\n")).unwrap();
     assert_eq!(status(&mut client, &other).await.unwrap().worker_id, "local");
 
-    // Its own log rolls beside the store's and reads back by name.
+    // Its own log rolls in its state directory and reads back by name.
     let log = v1::ReadRequest { target: Some(v1::read_request::Target::Log("tensord".into())), ..Default::default() };
     let mut frames = client.read(authorized(log, &owner)).await.unwrap().into_inner();
     let mut text = vec![];
@@ -118,7 +116,7 @@ async fn this_computers_machine_runs_from_its_home() {
     }
     let text = String::from_utf8(text).unwrap();
     assert!(text.contains("readiness sealed"), "{text}");
-    let logs = home.path().join(".cozy/machine/var/lib/tensorfs/logs");
+    let logs = home.path().join(".cozy/machine/var/lib/cozy/machine/logs");
     assert!(std::fs::read_dir(&logs).unwrap().flatten().any(|e| e.file_name().to_string_lossy().starts_with("tensord.")));
 
     // A restart keeps the port Calcifer recorded.

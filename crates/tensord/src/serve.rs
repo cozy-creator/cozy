@@ -59,12 +59,12 @@ fn run(lifetime: Lifetime, service: bool) -> io::Result<()> {
     // Whatever this process inherited (a parent's readiness, key or credential pipe) reaches
     // nothing it starts; descriptors it hands on are handed explicitly.
     crate::process::cloexec_from(3);
-    let config = config::load(lifetime)?;
+    let mut config = config::load(lifetime)?;
     config::init_logs(Some(&config.logs));
     for warning in &config.warnings {
         tracing::warn!("{warning}");
     }
-    let mut grant = config.grant;
+    let grant = &mut config.grant;
     // A pod's provider credential, kept from everything this machine starts: on its first start
     // this re-executes the machine without the key in its environment, before any thread.
     if lifetime == Lifetime::Rental {
@@ -83,7 +83,7 @@ fn run(lifetime: Lifetime, service: bool) -> io::Result<()> {
         let paths = update::Paths::new(&grant.layout.engine(), &grant.layout.root);
         supervise::supervise(&paths, lifetime, grant.receipt_key.as_deref(), grant.provider.as_ref())?
     };
-    run_machine(grant, ready, config.visible_devices.as_deref(), config.endpoint)
+    run_machine(config, ready)
 }
 
 /// `tensord serve`: a machine on a state directory with no grant, for tests.
@@ -148,7 +148,7 @@ pub fn dev(args: Dev) -> io::Result<()> {
         (Some(config), Some(listen)) => {
             let identity = crate::api::MachineIdentity::retained(&crate::api::identity::MachineConfig::load(&config)?)?;
             start_api(&root, &generations, identity, std::net::TcpListener::bind(listen)?, &owner, &service,
-                args.installer_python, args.client_wheel, args.package_python, sdk, None)?
+                args.installer_python, args.client_wheel, args.package_python, sdk, None, None)?
         }
         (None, None) => {
             crate::calls::Calls::configure(&service, owner.lock().unwrap().store(), None)?;
@@ -189,12 +189,8 @@ pub fn version() -> io::Result<()> {
 
 /// Runs the machine from its grant: identity and readiness under the machine root, the engine
 /// under `var/lib/cozy/tensord`, the API on the granted port.
-fn run_machine(
-    mut grant: crate::machine::grant::Grant,
-    mut ready: crate::machine::supervise::Ready,
-    visible_devices: Option<&str>,
-    endpoint: Option<Endpoint>,
-) -> io::Result<()> {
+fn run_machine(config: config::Config, mut ready: crate::machine::supervise::Ready) -> io::Result<()> {
+    let config::Config { mut grant, visible_devices, endpoint, logs, .. } = config;
     use crate::machine::{identity, receipt};
     // An older stable parent may have selected a partially published candidate. Restore the
     // links before opening services, then let that parent select the restored executable.
@@ -273,7 +269,7 @@ fn run_machine(
     // A machine serves every package on its pool: its GPUs (the envelope, sorted by index; a
     // degree-K plan uses the first K) and deviceless executors, with the executor environment
     // the pod proofs used.
-    let gpus = receipt::gpus(visible_devices)?;
+    let gpus = receipt::gpus(visible_devices.as_deref())?;
     identity.gpus = gpus.clone();
     {
         let devices: Vec<String> = gpus.iter().map(|g| g.device_index.to_string()).collect();
@@ -360,6 +356,7 @@ fn run_machine(
         crate::published::PackageSdk::selected(&paths.sdk(), &layout.root, uv),
         // A run naming no Hub reads this rental's own Hub's public content.
         grant.hub.clone().filter(|_| rental),
+        Some(logs),
     )?;
     // The Hub probes the endpoint the provider put in this pod's environment at once,
     // instead of waiting for the provider to report it.
@@ -398,6 +395,7 @@ fn start_api(
     python: String,
     mut sdk: crate::published::PackageSdk,
     own_hub: Option<crate::machine::grant::HubGrant>,
+    logs: Option<PathBuf>,
 ) -> io::Result<()> {
     use crate::{api, machine_api::NativeBackend};
     sdk.client_wheel = wheel.clone();
@@ -408,6 +406,7 @@ fn start_api(
     );
     let store = owner.lock().unwrap().store();
     let mut backend = NativeBackend::new(service.clone(), identity.authority.clone(), store.clone());
+    backend.logs = logs;
     let publisher =
         crate::published::Publisher::new(&root.join("published"), sdk, store.clone())?;
     service.configure_publisher(publisher.clone());

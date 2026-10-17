@@ -59,7 +59,7 @@ pub struct Config {
     pub endpoint: Option<Endpoint>,
     /// The provider's names, for [`crate::machine::provider::ProviderSelf::take`].
     pub provider: BTreeMap<String, String>,
-    /// Where this machine's own log rolls: beside the store's transport and memory logs.
+    /// Where this machine's own log rolls: `<root>/var/lib/cozy/machine/logs`.
     pub logs: PathBuf,
     /// What the load ignored, said once the log is up.
     pub warnings: Vec<String>,
@@ -99,7 +99,7 @@ fn from_loaded(lifetime: Lifetime, loaded: Loaded, environment: &BTreeMap<String
     );
     let rental = lifetime == Lifetime::Rental;
     Ok(Config {
-        logs: grant.layout.store.join("logs"),
+        logs: grant.layout.state.join("logs"),
         visible_devices: machine.visible_devices.clone(),
         endpoint: rental.then(|| crate::machine::endpoint::from_env(provider.clone())).flatten(),
         provider,
@@ -127,6 +127,9 @@ pub fn init_logs(dir: Option<&Path>) {
     use tracing_subscriber::fmt::writer::MakeWriterExt;
     let builder = tracing_subscriber::fmt().with_ansi(false);
     let file = dir.and_then(|dir| {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| eprintln!("tensord: no log directory {}: {e}", dir.display()))
+            .ok()?;
         tracing_appender::rolling::Builder::new()
             .rotation(tracing_appender::rolling::Rotation::DAILY)
             .filename_prefix("tensord")

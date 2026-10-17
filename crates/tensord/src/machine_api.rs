@@ -33,6 +33,8 @@ pub struct NativeBackend {
     pub publisher: Option<Arc<crate::published::Publisher>>,
     /// `cozy.machine.v1` Run sources and Write.
     pub runs: Option<Arc<crate::runs::Runs>>,
+    /// Where TensorD's own log rolls; None on development front doors.
+    pub logs: Option<std::path::PathBuf>,
     // Serialize native projection, not inference or observation. Only one result
     // projection may establish a given immutable output's native custody at once.
     projection: Mutex<()>,
@@ -50,6 +52,7 @@ impl NativeBackend {
             installer: None,
             publisher: None,
             runs: None,
+            logs: None,
             projection: Mutex::new(()),
         }
     }
@@ -582,19 +585,21 @@ impl MachineBackend for NativeBackend {
         _: VerifiedActor,
         request: domain::MachineLogQuery,
     ) -> Result<Vec<u8>, Status> {
-        // TensorFS and TensorD's memory notes append here, each rotating to one older file;
-        // TensorD's own log rolls daily (`tensord.<date>.log`): its newest two days.
-        let logs = self.store.root().join("logs");
-        let names = match domain::MachineLog::try_from(request.log) {
-            Ok(domain::MachineLog::TensorfsTransport) => vec!["transport.log.1".into(), "transport.log".into()],
-            Ok(domain::MachineLog::Memory) => vec!["memory.log.1".into(), "memory.log".into()],
-            Ok(domain::MachineLog::Tensord) => {
+        // TensorFS and TensorD's memory notes append to the store's logs, each rotating to one
+        // older file; TensorD's own log rolls daily (`tensord.<date>.log`): its newest two days.
+        let store_logs = self.store.root().join("logs");
+        let (logs, names) = match domain::MachineLog::try_from(request.log) {
+            Ok(domain::MachineLog::TensorfsTransport) => (store_logs, vec!["transport.log.1".into(), "transport.log".into()]),
+            Ok(domain::MachineLog::Memory) => (store_logs, vec!["memory.log.1".into(), "memory.log".into()]),
+            Ok(domain::MachineLog::Tensord) if self.logs.is_some() => {
+                let logs = self.logs.clone().expect("checked");
                 let mut days: Vec<String> = std::fs::read_dir(&logs)
                     .map(|dir| dir.flatten().filter_map(|e| e.file_name().into_string().ok()).collect())
                     .unwrap_or_default();
                 days.retain(|name| name.starts_with("tensord.") && name.ends_with(".log"));
                 days.sort();
-                days.split_off(days.len().saturating_sub(2))
+                let newest = days.split_off(days.len().saturating_sub(2));
+                (logs, newest)
             }
             _ => return Err(Status::not_found(format!("this machine keeps no log {}", request.log))),
         };

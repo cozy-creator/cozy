@@ -340,7 +340,7 @@ mod tests {
         assert_eq!(grant.developer_key.as_deref(), Some("ssh-ed25519 AAAA"));
         assert_eq!(config.visible_devices.as_deref(), Some("0"));
         assert_eq!(config.endpoint.unwrap().ports["8443"], 40001);
-        assert_eq!(config.logs, Path::new("/var/lib/tensorfs/logs"));
+        assert_eq!(config.logs, Path::new("/var/lib/cozy/machine/logs"));
         // The lifetime is the command line's: the old variable is named and ignored.
         assert_eq!(
             config.warnings,
