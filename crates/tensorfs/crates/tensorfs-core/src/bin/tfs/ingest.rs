@@ -933,11 +933,18 @@ fn isolation(argv: &[String], f: &Flags) -> (Command, i64, String) {
     // unprivileged user namespaces, which this box does not grant — so the tier is
     // recorded rather than asserted.
     let netns = !flag_on(f, "no-netns")
-        && Command::new("unshare")
-            .args(["-rn", "/bin/true"])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+        && match Command::new("unshare").args(["-rn", "/bin/true"]).status() {
+            Ok(status) => status.success(),
+            // A missing optional tool is one warning, and the run goes on without it.
+            Err(error) => {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    if let Some(warning) = cozy_platform::tools::warn_once("unshare") {
+                        eprintln!("tfs: warning: {warning}");
+                    }
+                }
+                false
+            }
+        };
     if netns {
         let mut c = Command::new("unshare");
         c.args(["-rn", "/bin/sh", "-c", &inner]);

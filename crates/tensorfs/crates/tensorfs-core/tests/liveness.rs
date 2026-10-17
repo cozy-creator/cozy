@@ -279,6 +279,38 @@ fn ingest_run_ends_on_observed_inactivity_and_never_on_cpu_time() {
     let _ = fs::remove_dir_all(root);
 }
 
+/// The owner's missing-tool rule: an ingest on a host without `unshare` runs, separated by
+/// process and rlimits, after exactly one warning naming the tool and `cozy doctor`.
+#[test]
+fn an_ingest_without_unshare_completes_after_one_warning() {
+    let root = temporary("no-unshare");
+    fs::create_dir_all(&root).unwrap();
+    let (weight, bias) = (root.join("weight.safetensors"), root.join("bias.safetensors"));
+    carrier(&weight, "weight", MIB, 0);
+    carrier(&bias, "bias", MIB, 1 << 30);
+    let plan = plan(&root, &weight, &bias);
+    let store = root.join("store");
+    assert_ok(&tfs().args(["store", "init"]).arg(&store).output().unwrap(), "store init");
+    // A PATH holding nothing at all: the worker's shell and the binary are named by path.
+    let empty = root.join("empty-path");
+    fs::create_dir_all(&empty).unwrap();
+    let run = tfs()
+        .args(["ingest", "run"])
+        .arg(&store)
+        .arg("--source-plan")
+        .arg(&plan)
+        .env("PATH", &empty)
+        .output()
+        .unwrap();
+    let out = assert_ok(&run, "ingest run without unshare");
+    assert!(out.contains("worker exited 0"), "{out}");
+    assert!(out.contains("isolation    tier 1"), "{out}");
+    let warning = "unshare not found: ingest runs without network isolation; see `cozy doctor`";
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert_eq!(stderr.matches(warning).count(), 1, "{stderr}");
+    let _ = fs::remove_dir_all(root);
+}
+
 #[test]
 fn reap_decides_on_the_writers_lock_and_never_on_age() {
     let root = temporary("row21");
