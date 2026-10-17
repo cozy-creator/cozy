@@ -1448,15 +1448,8 @@ mod v1_api {
         assert!(Command::new("uv").args(["build", "--wheel", "--out-dir"]).arg(&built).arg(&fixture).status().unwrap().success());
         let wheel = fs::read_dir(&built).unwrap().flatten().map(|e| e.path()).find(|p| p.extension().is_some_and(|e| e == "whl")).unwrap();
         let requirements = fs::read_to_string(fixture.join("pyproject.toml")).unwrap();
-        let requirements = requirements.split("dependencies = [").nth(1).unwrap().split(']').next().unwrap()
-            .split('"').skip(1).step_by(2).collect::<Vec<_>>().join("\n");
-        let pypi = Command::new("uv").args(["pip", "compile", "--generate-hashes", "--no-header", "--quiet", "--python-version", "3.12", "-"])
-            .stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().and_then(|mut child| {
-                use std::io::Write as _;
-                child.stdin.take().unwrap().write_all(requirements.as_bytes())?;
-                child.wait_with_output()
-            }).unwrap();
-        assert!(pypi.status.success());
+        let requires: Vec<String> = requirements.split("dependencies = [").nth(1).unwrap().split(']').next().unwrap()
+            .split('"').skip(1).step_by(2).map(str::to_string).collect();
         let source = std::env::temp_dir().join(format!("cm-update-{}", uuid::Uuid::new_v4()));
         let store = tensorfs_core::store::Store::ensure(&source).unwrap();
         let model = names_hub::Model { repository: "acme/weight".into(), release: "1".into(), lane: "f32".into(),
@@ -1464,7 +1457,7 @@ mod v1_api {
         let release = |release: &str| names_hub::Package {
             name: format!("acme/{}", FIXTURE.1), release: release.into(), interface: interface.clone(),
             wheel: wheel.file_name().unwrap().to_str().unwrap().into(), bytes: fs::read(&wheel).unwrap(), callees: vec![],
-            pypi: String::from_utf8(pypi.stdout.clone()).unwrap(),
+            requires: requires.clone(),
         };
         let (origin, _) = names_hub::serve(&store, model, [release("0.1.0"), release("0.2.0")]);
         let spec = |kind: v1::RunKind, release: &str, entrypoint: &str| v1::RunSpec {
@@ -1668,7 +1661,7 @@ mod v1_api {
     }
 
     /// th-245: a run names its release and model and the machine resolves both at its Hub by
-    /// name, anonymously: the newest release's card and lock, the model's lane by one closure
+    /// name, anonymously: the newest release's install plan (its uv.lock), the model's lane by one closure
     /// call, then the checkpoint pulled pinned to that lane. Under the same catalog revision a
     /// second run asks the Hub nothing; a moved revision resolves once more and moves no bytes;
     /// a hash alone is the owner's, refused without the capability. Real uv, Python and TensorFS.
@@ -1690,7 +1683,7 @@ mod v1_api {
             wheel: "pkg-1.0.0-py3-none-any.whl".into(),
             bytes: wheel("pkg", "1.0.0"),
             callees: vec![],
-            pypi: String::new(),
+            requires: vec![],
         };
         let (origin, heard) = names_hub::serve(&store, model, Some(package));
         let machine = Machine::start().await;
@@ -1729,8 +1722,7 @@ mod v1_api {
         let cold = take();
         for asked in [
             "GET /v1/packages/acme/pkg",
-            "GET /v1/packages/acme/pkg/releases/1.0.0",
-            "GET /v1/packages/acme/pkg/releases/1.0.0/locked-requirements",
+            "POST /v1/packages/acme/pkg/download",
             "POST /v1/tensorfs/closure acme/model@1.0.0 bf16",
             "POST /v1/tensorfs/presign",
         ] {
@@ -1769,8 +1761,8 @@ mod v1_api {
         assert_eq!(done.status, "succeeded", "{done:?}");
         assert_eq!(take(), ["POST /v1/tensorfs/closure acme/model@1.0.0 bf16"]);
 
-        // Another SDK is another environment of the same release: its card and locked
-        // requirements are the ones its first installation kept, never read again.
+        // Another SDK is another environment of the same release: its card (pyproject, uv.lock)
+        // is the one its first installation kept, never read again.
         let links = machine.root.join("links");
         fs::create_dir_all(&links).unwrap();
         machine.stop();
@@ -2825,9 +2817,9 @@ mod v1_api {
         let _ = fs::remove_dir_all(tools);
     }
 
-    /// A published release calls another package its lock pins at the Hub (long_form calling
-    /// qwen-image-2's generate_image): the callee installs from the Hub's file door through
-    /// TensorFS and runs as a child under its own Hub name, `<org>/<name>`, so the run's model
+    /// A published release calls another package its uv.lock pins at the Hub (long_form calling
+    /// qwen-image-2's generate_image): the release installs from that lock, the callee from the
+    /// Hub's file door through TensorFS, and runs as a child under its own Hub name, `<org>/<name>`, so the run's model
     /// choices addressed to it reach it. Named `local/<name>` (TensorD 0.4.1-0.5.0), a choice
     /// for generate_image never arrived: model_choice_absent (runs 5141, 5142).
     #[tokio::test]
@@ -2864,20 +2856,11 @@ mod v1_api {
             repository: "acme/model".into(), release: "1.0.0".into(), lane: "bf16".into(),
             manifest: hub_oauth::checkpoint(&store, &[5; 8192]),
         };
-        // The rest of the lock is PyPI's, hash-pinned as the Hub's export pins it.
-        let pypi = Command::new("uv").args(["pip", "compile", "--generate-hashes", "--no-header", "--quiet",
-            "--python-version", "3.12", "-"])
-            .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped())
-            .spawn().and_then(|mut child| {
-                use std::io::Write as _;
-                child.stdin.take().unwrap().write_all(b"cozy-runtime>=0.19,<0.20\nmsgspec>=0.19,<1\n")?;
-                child.wait_with_output()
-            }).unwrap();
-        assert!(pypi.status.success());
         let package = names_hub::Package {
             name: "acme/tensord-cpu-caller".into(), release: "0.1.0".into(),
             interface: described["interface"].clone(), wheel: root, bytes: root_bytes, callees: vec![callee],
-            pypi: String::from_utf8(pypi.stdout).unwrap(),
+            // The rest of its lock is PyPI's: a real Runtime and its dependencies.
+            requires: vec!["cozy-runtime>=0.24.1".into(), "msgspec>=0.19,<1".into()],
         };
         let (origin, _) = names_hub::serve(&store, model, Some(package));
         let counter = machine.root.join("published-measured");
