@@ -1,15 +1,18 @@
 //! `cozy package`: find packages on a Hub, keep them on machines, and publish your own.
 //!
-//! Only `lock` and `publish` need uv, on the author's computer, and neither runs package code.
-use std::process::ExitCode;
+//! Install, update and remove are runs on a machine through Calcifer; the machine resolves and
+//! installs releases. Only `lock` and `publish` need uv, on the author's computer, and neither
+//! runs package code.
+use std::{path::PathBuf, process::ExitCode};
 
 use clap::Subcommand;
 use cozy_proto::error::{Error, Kind};
 
-use crate::Context;
+use crate::{Context, run::Placement};
 
 mod author;
 mod catalog;
+mod machine;
 mod registry;
 
 #[derive(clap::Args, Debug)]
@@ -33,6 +36,37 @@ enum Command {
         /// org/name
         package: String,
     },
+    /// Install a published package (org/name[@release]) on a machine: its environment, no weights.
+    Install {
+        /// org/name[@release]; a directory such as `.` or `./project` comes next.
+        package: String,
+        #[command(flatten)]
+        placement: Placement,
+        /// Print the run and return instead of following it.
+        #[arg(long)]
+        detach: bool,
+    },
+    /// Move a machine's packages to their Hub's newest release: the named ones, else every one.
+    Update {
+        /// org/name; none updates every published package on the machine.
+        packages: Vec<String>,
+        #[command(flatten)]
+        placement: Placement,
+    },
+    /// Remove packages from a machine, every Hub's installation unless --tensorhub narrows.
+    Remove {
+        /// org/name or local/name.
+        #[arg(required = true)]
+        packages: Vec<String>,
+        #[command(flatten)]
+        placement: Placement,
+    },
+    /// The packages your ready machines hold.
+    List {
+        /// Only this machine.
+        #[arg(long, value_name = "MACHINE")]
+        on: Option<String>,
+    },
     /// Lock this project's dependencies for the Hub and account it publishes to (needs uv).
     Lock {
         /// Let this dependency move to its newest compatible release; repeat for each.
@@ -52,6 +86,32 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
     match args.command {
         Command::Search { query, limit } => catalog::search(ctx, &query.join(" "), limit).await,
         Command::Info { package } => catalog::info(ctx, &PackageRef::parse(&package)?).await,
+        Command::Install {
+            package,
+            placement,
+            detach,
+        } => match directory(&package) {
+            Some(dir) => Err(Error::new(
+                Kind::Usage,
+                "not_ported",
+                format!(
+                    "installing a directory ({}) is not in this build yet",
+                    dir.display()
+                ),
+            )),
+            None => {
+                machine::install(ctx, &PackageRef::parse(&package)?, placement.on(), detach).await
+            }
+        },
+        Command::Update {
+            packages,
+            placement,
+        } => machine::update(ctx, &names(&packages)?, placement.on()).await,
+        Command::Remove {
+            packages,
+            placement,
+        } => machine::remove(ctx, &names(&packages)?, placement.on()).await,
+        Command::List { on } => machine::list(ctx, on.map(Into::into)).await,
         Command::Lock { upgrade } => author::lock(ctx, &upgrade).await,
         Command::Publish => author::publish(ctx).await,
         Command::Yank { release } => author::yank(ctx, &PackageRef::parse(&release)?).await,
@@ -102,6 +162,44 @@ impl PackageRef {
     }
 }
 
+impl std::fmt::Display for PackageRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.release {
+            Some(release) => write!(f, "{}/{}@{release}", self.org, self.name),
+            None => write!(f, "{}/{}", self.org, self.name),
+        }
+    }
+}
+
+/// A package directory only when it is written as one: `.`, `..`, absolute, or `./…`, `../…`.
+/// A bare word is a package name.
+fn directory(text: &str) -> Option<PathBuf> {
+    let explicit = text == "."
+        || text == ".."
+        || ["./", "../", ".\\", "..\\"]
+            .iter()
+            .any(|p| text.starts_with(p))
+        || std::path::Path::new(text).is_absolute();
+    explicit.then(|| PathBuf::from(text))
+}
+
+/// Names for update and remove: `org/name` (or `local/name`), with no release.
+fn names(texts: &[String]) -> Result<Vec<String>, Error> {
+    texts
+        .iter()
+        .map(|text| match PackageRef::parse(text)? {
+            PackageRef {
+                release: Some(_), ..
+            } => Err(Error::new(
+                Kind::Usage,
+                "package_release_not_taken",
+                format!("{text} names a release; name the package alone"),
+            )),
+            parsed => Ok(parsed.package()),
+        })
+        .collect()
+}
+
 /// A Hub timestamp in whole seconds: its nanoseconds are noise in a listing.
 pub(crate) fn stamp(at: &str) -> String {
     match at.split_once('.') {
@@ -146,6 +244,7 @@ mod tests {
             "fidika/sdxl"
         );
         assert!(PackageRef::parse("sdxl").is_err());
+        assert!(directory("sdxl").is_none() && directory("./sdxl").is_some());
         let mut releases = ["2.9.0", "2.10.0", "2.10.0-rc.1", "1.37.2"];
         releases.sort_by_key(|r| release_order(r));
         assert_eq!(releases, ["1.37.2", "2.9.0", "2.10.0-rc.1", "2.10.0"]);
