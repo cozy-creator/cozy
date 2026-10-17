@@ -4,6 +4,7 @@ name: tensorfs-release
 # tensorfs repo's wheels.yaml and publish.yaml. Dispatch only; a release is its tensorfs-vX.Y.Z tag:
 #   gh workflow run tensorfs-release.yaml -R cozy-creator/cozy --ref <branch>                         # build and prove
 #   gh workflow run tensorfs-release.yaml -R cozy-creator/cozy --ref tensorfs-vX.Y.Z -f publish=true  # PyPI
+#   gh workflow run tensorfs-release.yaml -R cozy-creator/cozy --ref <branch> -f dev=true             # <version>+dev.g<sha>
 on:
   # TEMP: test runs on this branch before the file is on master (dropped before merge).
   push:
@@ -12,6 +13,10 @@ on:
     inputs:
       publish:
         description: Publish to PyPI (runs only on a tensorfs-vX.Y.Z tag)
+        type: boolean
+        default: false
+      dev:
+        description: Build <version>+dev.g<sha>, a development wheel PyPI never accepts (artifacts only)
         type: boolean
         default: false
 
@@ -84,6 +89,8 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+      - if: inputs.dev
+        run: scripts/dev-version.sh
       # `tfs` ships in the wheel's data scripts beside the module. On Linux it is built INSIDE the
       # manylinux container, so its glibc floor matches the extension's (tfs-051).
       - if: runner.os == 'Linux'
@@ -126,7 +133,7 @@ jobs:
           name: wheel-${{ matrix.name }}
           path: crates/tensorfs/dist/*.whl
           if-no-files-found: error
-          retention-days: 3
+          retention-days: 7
 
   # Built from source it carries the module, not the `tfs` binary (the wheels do).
   sdist:
@@ -137,6 +144,8 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+      - if: inputs.dev
+        run: crates/tensorfs/scripts/dev-version.sh
       - uses: PyO3/maturin-action@v1
         with:
           maturin-version: v1.15.0
@@ -152,11 +161,11 @@ jobs:
           name: wheel-sdist
           path: crates/tensorfs/dist/*.tar.gz
           if-no-files-found: error
-          retention-days: 3
+          retention-days: 7
 
   # Every platform and the sdist, or nothing.
   publish:
-    if: inputs.publish
+    if: inputs.publish && !inputs.dev
     needs: [gate, fetch-faults, download-tail, wheel, sdist]
     runs-on: ubuntu-24.04
     environment: pypi
