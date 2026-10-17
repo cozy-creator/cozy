@@ -141,23 +141,34 @@ async fn this_computers_machine_runs_from_its_home() {
     }
     let manifest = serde_json::json!({"package": "local/tensord-cpu-memo", "release": "0.1.0", "files": files});
     let manifest = write(&mut client, &owner, manifest.to_string().as_bytes()).await;
-    let spec = v1::RunSpec {
-        kind: v1::RunKind::Warm as i32,
-        source: Some(v1::run_spec::Source::Local(v1::LocalSource { manifest })),
-        ..Default::default()
-    };
-    let request = authorized(v1::RunRequest { id: "local".into(), after: 0, spec: Some(spec) }, &owner);
-    let mut events = client.run(request).await.unwrap().into_inner();
-    let mut outcome = None;
-    while let Some(event) = events.message().await.unwrap() {
-        if let Some(v1::run_event::Event::Outcome(done)) = event.event {
-            outcome = Some(done);
+    // Its outcome and the stages it showed.
+    let mut warm = async |id: &str| -> (v1::Outcome, Vec<String>) {
+        let spec = v1::RunSpec {
+            kind: v1::RunKind::Warm as i32,
+            source: Some(v1::run_spec::Source::Local(v1::LocalSource { manifest: manifest.clone() })),
+            ..Default::default()
+        };
+        let request = authorized(v1::RunRequest { id: id.into(), after: 0, spec: Some(spec) }, &owner);
+        let mut events = client.run(request).await.unwrap().into_inner();
+        let (mut outcome, mut stages) = (None, vec![]);
+        while let Some(event) = events.message().await.unwrap() {
+            match event.event {
+                Some(v1::run_event::Event::Outcome(done)) => outcome = Some(done),
+                Some(v1::run_event::Event::Progress(progress)) => stages.push(progress.stage),
+                _ => {}
+            }
         }
-    }
-    let outcome = outcome.expect("an outcome");
+        (outcome.expect("an outcome"), stages)
+    };
+    let (outcome, stages) = warm("local").await;
     assert_eq!(outcome.status, "succeeded", "{outcome:?}");
     let result: serde_json::Value = serde_json::from_slice(&outcome.result).unwrap();
     assert!(result["interface"]["entrypoints"].as_array().unwrap().iter().any(|e| e["name"] == "measure"), "{result}");
+    assert!(stages.iter().any(|s| s == "installing local/tensord-cpu-memo on this machine"), "{stages:?}");
+    // The same tree again: its environment is held, and no install shows.
+    let (outcome, stages) = warm("local-again").await;
+    assert_eq!(outcome.status, "succeeded", "{outcome:?}");
+    assert!(!stages.iter().any(|s| s.contains("installing") || s.contains("syncing")), "{stages:?}");
     let uv = home.path().join(".cozy/machine/usr/local/bin/uv");
     let version = Command::new(&uv).arg("--version").output().unwrap();
     assert!(String::from_utf8_lossy(&version.stdout).starts_with(&format!("uv {}", tensord::machine::client::UV)));
