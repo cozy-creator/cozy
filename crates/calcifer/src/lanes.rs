@@ -218,7 +218,7 @@ mod tests {
         );
     }
 
-    /// A range that fails resumes from where its bytes stopped on a fresh lane; one that never
+    /// A range that fails resumes from where its bytes stopped, its lane redialed; one that never
     /// moves a byte while its peers finish is judged slow and asked again.
     #[tokio::test(start_paused = true)]
     async fn a_failed_or_stalled_range_resumes_where_it_stopped() {
@@ -249,8 +249,9 @@ mod tests {
         .await;
         assert!(done.is_ok());
         let legs = legs.lock().unwrap().clone();
-        assert!(legs.contains(&(50, 100, true)), "{legs:?}");
-        assert!(legs.contains(&(200, 300, true)), "{legs:?}");
+        assert!(legs.contains(&(50, 100, true)), "on its lane, redialed: {legs:?}");
+        let stalled = legs.iter().filter(|(first, ..)| *first == 200).count();
+        assert_eq!(stalled, 2, "asked again on a free lane: {legs:?}");
     }
 
     /// Every lane failing with no byte moved gives up; a byte moving starts the count over.

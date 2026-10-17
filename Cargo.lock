@@ -359,12 +359,9 @@ dependencies = [
  "getrandom 0.3.4",
  "hex",
  "hub-client",
- "hyper-util",
- "prost",
  "reqwest",
  "rusqlite",
  "rusqlite_migration",
- "rustls",
  "serde",
  "serde_ignored",
  "serde_json",
@@ -373,11 +370,7 @@ dependencies = [
  "thiserror 2.0.21",
  "time",
  "tokio",
- "tokio-rustls",
- "tokio-stream",
  "tokio-util",
- "tonic",
- "tower",
  "tracing",
  "tracing-subscriber",
 ]
@@ -617,7 +610,6 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "hub-client",
- "migrate",
  "reqwest",
  "serde_json",
  "sha2",
@@ -646,7 +638,6 @@ dependencies = [
  "indicatif",
  "infer",
  "progenitor-client",
- "prost",
  "ratatui",
  "reqwest",
  "self-replace",
@@ -2121,33 +2112,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
 dependencies = [
  "autocfg",
-]
-
-[[package]]
-name = "migrate"
-version = "0.9.0"
-dependencies = [
- "base64 0.22.1",
- "calcifer",
- "clap",
- "cozy-platform",
- "cozy-proto",
- "ed25519-dalek",
- "hex",
- "hub-client",
- "jiff",
- "migrate",
- "prost",
- "reqwest",
- "rusqlite",
- "serde",
- "serde_json",
- "serde_yaml",
- "sha2",
- "tar",
- "tempfile",
- "tokio",
- "toml_edit",
 ]
 
 [[package]]
