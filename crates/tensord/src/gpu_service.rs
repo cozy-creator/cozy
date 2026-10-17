@@ -4839,6 +4839,7 @@ mod tests {
 
     /// NVML for one integrated GPU: every call the memory sampler makes, and memory info
     /// NotSupported (3), as GB10's driver answers.
+    #[cfg(target_os = "linux")]
     const FAKE_NVML: &str = r#"
 #include <stdio.h>
 static int gpu;

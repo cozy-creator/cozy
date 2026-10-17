@@ -337,27 +337,11 @@ fn exec(
 }
 
 fn kill(exec: Exec) -> io::Result<()> {
-    let pidfd = exec.executor.observer_pidfd()?;
-    // SAFETY: signalling the exact live child we spawned, through its pidfd.
-    if unsafe {
-        libc::syscall(
-            libc::SYS_pidfd_send_signal,
-            std::os::fd::AsRawFd::as_raw_fd(&pidfd),
-            libc::SIGKILL,
-            0,
-            0,
-        )
-    } < 0
-    {
-        return Err(io::Error::last_os_error());
+    // The exact live child we spawned, killed and waited for: no elapsed-time policy.
+    if let Some(exact) = cozy_platform::process::Exact::open(&exec.executor.birth)? {
+        exact.kill()?;
+        exact.wait()?;
     }
-    let mut poll = libc::pollfd {
-        fd: std::os::fd::AsRawFd::as_raw_fd(&pidfd),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    // SAFETY: one live pidfd; waits for the exact process's exit, no elapsed-time policy.
-    unsafe { libc::poll(&mut poll, 1, -1) };
     drop(exec);
     Ok(())
 }
