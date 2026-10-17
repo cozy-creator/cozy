@@ -226,14 +226,13 @@ fn held(on: &str, hub: &SilentHub) -> serde_json::Value {
     submission(on, &common::warm_spec(&hub.origin(), vec![]))
 }
 
-fn submission(on: &str, spec: &[u8]) -> serde_json::Value {
-    use base64::Engine as _;
+fn submission(on: &str, spec: &cozy_proto::machine::RunSpec) -> serde_json::Value {
     json!({
         "on": on,
         "hub": "https://tensorhub.com",
         "kind": "warm",
         "target": "cozy-test/held",
-        "spec": base64::engine::general_purpose::STANDARD.encode(spec),
+        "spec": spec,
     })
 }
 
@@ -305,7 +304,7 @@ async fn the_guard_chain_refuses_a_foreign_host_origin_bearer_or_missing_key() {
     );
     let unkeyed = calcifer
         .request(Method::POST, "/v1/runs")
-        .json(&submission("any", &[]));
+        .json(&submission("any", &Default::default()));
     assert_eq!(
         refusal(unkeyed).await,
         refused(StatusCode::BAD_REQUEST, "idempotency_key_required")
@@ -553,7 +552,7 @@ async fn down_names_what_is_owed_the_machine_keeps_running_it_and_the_next_calci
     );
     assert_eq!(calcifer.stopped().await, Stopped::Down);
     let link = Link::new(&machine.endpoint, common::key()).unwrap();
-    let (state, _) = link.run(&id, 0, None).await.unwrap();
+    let (state, _) = link.attach(&id, 0).await.unwrap();
     assert_eq!(state.state, "preparing", "the machine keeps the run");
 
     let calcifer = Calcifer::start(home.path()).await;

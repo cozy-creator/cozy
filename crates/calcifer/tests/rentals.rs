@@ -13,7 +13,6 @@ use cozy_proto::{
     config, machine as v1,
 };
 use hub_client::{Client, Credential, DeviceKey, P256Key, RunToken, UserSession, testing, types};
-use prost::Message as _;
 use sha2::{Digest as _, Sha256};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -99,14 +98,13 @@ async fn a_hub_is_listed_signed_in_and_a_rent_it_will_not_price_records_nothing(
                 kind: Kind::Call,
                 target: "cozy-test/held/generate".into(),
                 spec: v1::RunSpec {
-                    source: Some(v1::run_spec::Source::Release(v1::Release {
+                    source: Some(v1::Source::Release(v1::Release {
                         package: "cozy-test/held".into(),
                         release: String::new(),
                     })),
                     entrypoint: "generate".into(),
                     ..Default::default()
-                }
-                .encode_to_vec(),
+                },
                 inputs: vec![],
                 out: None,
                 warnings: vec![],
@@ -196,7 +194,7 @@ async fn a_runs_capability_is_bound_to_its_machine_and_traded_at_its_hub() {
     let machines = Machines::start(calcifer.clone(), Home::at(home.path()), &Default::default());
     let submit = |key: &'static str, destination: String| {
         let spec = v1::RunSpec {
-            kind: v1::RunKind::Warm as i32,
+            kind: v1::RunKind::Warm,
             weights_destination: destination,
             ..Default::default()
         };
@@ -207,7 +205,7 @@ async fn a_runs_capability_is_bound_to_its_machine_and_traded_at_its_hub() {
                 hub: origin.clone(),
                 kind: Kind::Warm,
                 target: "upload".into(),
-                spec: spec.encode_to_vec(),
+                spec,
                 inputs: vec![],
                 out: None,
                 warnings: vec![],
@@ -267,7 +265,7 @@ async fn a_runs_capability_is_bound_to_its_machine_and_traded_at_its_hub() {
         hub: origin.clone(),
         kind: Kind::Warm,
         target: "local/hello".into(),
-        spec: local.encode_to_vec(),
+        spec: local.clone(),
         inputs: vec![staged],
         out: None,
         warnings: vec![],

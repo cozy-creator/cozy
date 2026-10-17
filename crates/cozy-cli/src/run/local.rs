@@ -15,7 +15,6 @@ use cozy_proto::{
     error::{Error, Kind},
     machine as v1,
 };
-use prost::Message as _;
 
 use super::{
     RunArgs, describe,
@@ -120,8 +119,8 @@ async fn install(ctx: &Context, hub: &str, on: On, local: &Local) -> Result<Inst
         false => format!("install {}", local.package),
     };
     let spec = v1::RunSpec {
-        kind: v1::RunKind::Warm.into(),
-        source: Some(v1::run_spec::Source::Local(local.source.clone())),
+        kind: v1::RunKind::Warm,
+        source: Some(v1::Source::Local(local.source.clone())),
         ..Default::default()
     };
     let submission = SubmitRun {
@@ -129,7 +128,7 @@ async fn install(ctx: &Context, hub: &str, on: On, local: &Local) -> Result<Inst
         hub: hub.to_owned(),
         kind: RunKind::Warm,
         target,
-        spec: spec.encode_to_vec(),
+        spec,
         inputs: local.inputs.clone(),
         out: None,
         warnings: vec![],
