@@ -317,7 +317,7 @@ fn an_h3_request_binds_its_references_from_a_yaml_and_its_video_lands_whole() {
     assert_eq!(refusal["code"], "request_payload_invalid", "{refused:?}");
     let lines = [
         format!("{ref2va} cannot take this request (checked against {package} 1.0.0):"),
-        "  references[1].kind: \"scene\" is not one of character, background, audio, video".into(),
+        "  references[1].kind: \"scene\" is not one of audio, background, character, video".into(),
         format!("warning: ignored unknown field videos — not in {ref2va}'s interface"),
     ];
     assert_eq!(
