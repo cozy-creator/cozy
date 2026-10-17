@@ -19,6 +19,10 @@ const SLOW: f64 = 8.0;
 /// How often ranges in flight are measured, and the shortest window a rate is judged over.
 const SAMPLE: Duration = Duration::from_secs(1);
 const WINDOW: Duration = Duration::from_secs(2);
+/// A rate is judged over at least this many round trips (a range's typical wait for its first
+/// byte), so TCP's own loss recovery, which holds bytes back a round trip or two, never reads as a
+/// slow range on a far link.
+const ROUND_TRIPS: u32 = 4;
 
 /// Why a range's transfer stopped.
 pub(crate) enum Ranged<E> {
@@ -139,10 +143,13 @@ where
 
 /// Measures the ranges in flight and drops the one whose first byte waits `SLOW` times longer
 /// than its peers' did, or whose bytes come `SLOW` times slower than its peers' (finished ranges
-/// included) over its latest window; its rest is asked again. A range whose bytes have all moved
-/// is waiting for its answer and is not judged.
+/// included) over its latest window of `ROUND_TRIPS` round trips; its rest is asked again. A
+/// range whose bytes have all moved is waiting for its answer and is not judged.
 fn judge(flights: &mut HashMap<Id, Flight>, finished: &[f64], waits: &mut Vec<Duration>) {
     let now = Instant::now();
+    waits.sort();
+    let wait = waits.get(waits.len() / 2).copied();
+    let window = wait.map_or(WINDOW, |wait| (wait * ROUND_TRIPS).max(WINDOW));
     let mut rates = finished.to_vec();
     let mut judged = vec![];
     for flight in flights.values_mut() {
@@ -154,11 +161,10 @@ fn judge(flights: &mut HashMap<Id, Flight>, finished: &[f64], waits: &mut Vec<Du
                 flight.window = Some((now, at));
             }
             None => {
-                waits.sort();
-                let typical = waits.get(waits.len() / 2).map(|wait| wait.mul_f64(SLOW));
+                let typical = wait.map(|wait| wait.mul_f64(SLOW));
                 flight.slow |= typical.is_some_and(|t| now - flight.began > t.max(WINDOW));
             }
-            Some((since, seen)) if now - since >= WINDOW => {
+            Some((since, seen)) if now - since >= window => {
                 let rate = (at - seen) as f64 / (now - since).as_secs_f64();
                 flight.window = Some((now, at));
                 rates.push(rate);
