@@ -413,11 +413,9 @@ fn runs_list_filter_and_show() {
     );
     assert!(!human.stdout.contains("next:"), "{human:?}");
 
-    let board = home.cozy(["run", "list", "--watch"]);
-    assert!(
-        board.code == 2 && board.stdout.contains("watch_needs_terminal"),
-        "{board:?}"
-    );
+    // Off a terminal the list prints once; `--once` asks the same on one.
+    let once = home.cozy(["run", "list", "--once"]);
+    assert!(once.code == 0 && once.stdout.contains("TARGET"), "{once:?}");
     home.json(["run", "cancel", &second.to_string(), "--json"]);
 }
 

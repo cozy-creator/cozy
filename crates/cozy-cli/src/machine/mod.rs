@@ -13,6 +13,7 @@ use crate::{Context, output};
 
 mod end;
 mod list;
+pub(crate) mod live;
 mod rent;
 
 pub(crate) use list::status_fields;
@@ -29,9 +30,9 @@ pub struct Args {
 enum Verb {
     /// Every machine: this computer's, rentals on every Hub, and added ones.
     List {
-        /// Redraw the list live (a terminal only).
+        /// One snapshot even on a terminal, instead of the live view.
         #[arg(long)]
-        watch: bool,
+        once: bool,
     },
     /// One machine and what it reports of itself.
     Show {
@@ -88,7 +89,7 @@ enum Verb {
 
 pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
     match args.verb {
-        Verb::List { watch } => list::list(ctx, watch).await,
+        Verb::List { once } => list::list(ctx, once).await,
         Verb::Show { name } => list::show(ctx, &name).await,
         Verb::Logs { name, query } => crate::daemon::machine_log(ctx, &name, &query).await,
         Verb::Rent(rent) => rent::exec(ctx, rent).await,

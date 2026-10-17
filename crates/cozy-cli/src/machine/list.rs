@@ -3,7 +3,7 @@ use std::process::ExitCode;
 
 use cozy_proto::{
     calcifer::{Machine, MachineKind, MachineList, MachineState, MachineStatus, Rental},
-    error::{Error, Kind},
+    error::Error,
 };
 
 use super::{clock, machine, now_ms, usd};
@@ -14,30 +14,15 @@ const PROVIDER_STOPPED: &str = "readiness.provider_stopped";
 
 const IDLE_RULE: &str = "Rentals end themselves after 15 minutes idle (no queued or running work).";
 
-const HEADERS: [&str; 12] = [
+pub(crate) const HEADERS: [&str; 12] = [
     "MACHINE", "KIND", "GPUS", "FAMILY", "STATE", "$/HOUR", "SPENT", "UPTIME", "RUNNING", "QUEUED",
     "ENDS", "HUB",
 ];
 
-pub async fn list(ctx: &Context, watch: bool) -> Result<ExitCode, Error> {
-    if watch {
-        if ctx.json || !ctx.term.stdout {
-            return Err(Error::new(
-                Kind::Usage,
-                "watch_needs_terminal",
-                "--watch redraws a terminal",
-            )
-            .remedy("omit --watch for one snapshot, or use --json"));
-        }
-        // The Hubs are listed again once; each redraw reads Calcifer's memory only.
-        let calcifer = ctx.calcifer().await?;
-        let mut path = "/v1/machines?refresh=true";
-        crate::run::board::watch("machines", &HEADERS, async || {
-            let list: MachineList = calcifer.get(path).await?;
-            path = "/v1/machines";
-            Ok(rows(ctx, &list))
-        })
-        .await?;
+pub async fn list(ctx: &Context, once: bool) -> Result<ExitCode, Error> {
+    if !once && !ctx.json && ctx.term.stdout {
+        let view = super::live::Machines::open(ctx).await?;
+        crate::tui::show(ctx, crate::tui::Screen::Machines(view)).await?;
         return Ok(ExitCode::SUCCESS);
     }
     let list: MachineList = ctx
@@ -94,7 +79,7 @@ pub async fn list(ctx: &Context, watch: bool) -> Result<ExitCode, Error> {
     Ok(code)
 }
 
-fn rows(ctx: &Context, list: &MachineList) -> Vec<Vec<String>> {
+pub(crate) fn rows(ctx: &Context, list: &MachineList) -> Vec<Vec<String>> {
     let live = list
         .machines
         .iter()

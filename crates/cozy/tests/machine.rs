@@ -157,11 +157,8 @@ fn machine_refusals_say_what_to_do_instead() {
         // `local` is ended by disabling it, and there is no local machine to check yet.
         (vec!["machine", "end", "local"], 1, "machine_local"),
         (vec!["doctor"], 1, "no_local_machine"),
-        (
-            vec!["machine", "list", "--watch"],
-            2,
-            "watch_needs_terminal",
-        ),
+        // The live view is the terminal's default: `--watch` is gone.
+        (vec!["machine", "list", "--watch"], 2, "usage"),
         (vec!["machine", "show", "../etc"], 2, "machine_name_invalid"),
     ] {
         let out = home.cozy(args.iter().chain(&["--json"]));

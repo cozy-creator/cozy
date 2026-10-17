@@ -179,6 +179,21 @@ impl Client {
         }
     }
 
+    /// A list-level stream (`/v1/runs/events`, `/v1/machines/events`), subscribed once this
+    /// answers: it carries no backlog, so a caller lists after it. It ends when its connection
+    /// closes; the caller subscribes and lists again.
+    pub async fn watch<T: DeserializeOwned>(&self, path: &str) -> Result<Watch<T>, Error> {
+        let answer = self.send(|c, base| {
+            c.get(format!("{base}{path}"))
+                .header(header::ACCEPT, "text/event-stream")
+        });
+        Ok(Watch {
+            stream: ok(answer.await?).await?,
+            sse: Sse::default(),
+            of: std::marker::PhantomData,
+        })
+    }
+
     /// Asks Calcifer to stop and waits until that process has let go of the home. Runs on
     /// machines continue; the next Calcifer resumes what it owed.
     pub async fn stop(&self) -> Result<Down, Error> {
@@ -523,6 +538,30 @@ impl Events {
             }
         }
         None
+    }
+}
+
+/// One list-level stream (`Client::watch`).
+pub struct Watch<T> {
+    stream: Response,
+    sse: Sse,
+    of: std::marker::PhantomData<T>,
+}
+
+impl<T: DeserializeOwned> Watch<T> {
+    /// The next item, skipping types this build does not read; `None` once the stream closed.
+    pub async fn next(&mut self) -> Option<T> {
+        loop {
+            while let Some(data) = self.sse.next() {
+                if let Ok(item) = serde_json::from_str(&data) {
+                    return Some(item);
+                }
+            }
+            match self.stream.chunk().await {
+                Ok(Some(bytes)) => self.sse.push(&bytes),
+                Ok(None) | Err(_) => return None,
+            }
+        }
     }
 }
 
