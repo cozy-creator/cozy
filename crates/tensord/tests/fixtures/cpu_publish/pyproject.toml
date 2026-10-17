@@ -6,7 +6,7 @@ build-backend = "uv_build"
 name = "tensord-cpu-publish"
 version = "0.1.0"
 requires-python = ">=3.12"
-dependencies = ["cozy-runtime>=0.18.99,<0.19", "msgspec>=0.19,<1"]
+dependencies = ["cozy-runtime>=0.26,<0.27", "msgspec>=0.19,<1"]
 
 [project.entry-points."cozy.application"]
 default = "cpu_publish:app"

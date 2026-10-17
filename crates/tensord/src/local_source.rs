@@ -688,7 +688,7 @@ mod tests {
         // A prior generation remains valid for already accepted work.
         assert!(service.catalog.resolve(&installed.generation).is_ok());
         let held = service.catalog.resolve(&updated.generation).unwrap();
-        assert_eq!(installed_sdk(&held.record.python), "0.18.101 0.3.92");
+        assert_eq!(installed_sdk(&held.record.python), "0.26.4 0.10.0");
         assert_eq!(held.record.sdk_fallback, "");
         let _ = fs::remove_dir_all(root);
     }
@@ -1144,13 +1144,13 @@ mod tests {
             fs::copy(fixture.join(name), project.join(name)).unwrap();
         }
         // The machine's own Runtime wheel, rebuilt as a developer's local version.
-        let dev = "0.18.101+dev.vendored";
+        let dev = "0.26.4+dev.vendored";
         run(Command::new(&m.installer.helper_python).args(["-c", REVERSION]).arg(&pair[0]).arg(project.join("vendor")).arg(dev));
         let vendored = format!("vendor/cozy_runtime-{dev}-cp312-abi3-manylinux_2_28_x86_64.whl");
         let pyproject = fs::read_to_string(fixture.join("pyproject.toml")).unwrap();
         fs::write(
             project.join("pyproject.toml"),
-            pyproject.replace("cozy-runtime>=0.18.99,<0.19", &format!("cozy-runtime=={dev}"))
+            pyproject.replace("cozy-runtime>=0.26,<0.27", &format!("cozy-runtime=={dev}"))
                 + &format!("\n[tool.uv.sources]\ncozy-runtime = {{ path = \"{vendored}\" }}\n"),
         )
         .unwrap();
@@ -1190,7 +1190,7 @@ mod tests {
             let versions = installed_sdk(&held.record.python);
             assert!(versions.starts_with(&format!("{dev} ")), "{versions}");
             let why = &held.record.sdk_fallback;
-            assert!(why.contains(&format!("requires `cozy-runtime=={dev}`, but `0.18.101` is installed")), "{why}");
+            assert!(why.contains(&format!("requires `cozy-runtime=={dev}`, but `0.26.4` is installed")), "{why}");
             assert!(why.ends_with(&format!("it runs the package's own cozy-runtime=={dev}, tensorfs=={}", &versions[dev.len() + 1..])), "{why}");
         }
 
@@ -1198,7 +1198,7 @@ mod tests {
         let refused = |digest: &str| sources.install(&m.service, "alice", digest, None).err().unwrap().message;
         let absent = manifest(serde_json::json!({"source": member("source.tar", &archive(&project, &files))}));
         let why = refused(&absent);
-        assert!(why.contains("package_dependency_operation_failed: uv sync --frozen exited") && why.contains("vendor/cozy_runtime-0.18.101"), "{why}");
+        assert!(why.contains("package_dependency_operation_failed: uv sync --frozen exited") && why.contains("vendor/cozy_runtime-0.26.4"), "{why}");
         let python = manifest(serde_json::json!({"source": member("source.tar", &tree), "python_requires": ">=4"}));
         let why = refused(&python);
         assert!(why.starts_with("package_python_unavailable: configured interpreter does not satisfy"), "{why}");
@@ -1228,7 +1228,7 @@ with zipfile.ZipFile(source) as src, zipfile.ZipFile(target, "w") as dst:
 
     /// A Runtime/TensorFS pair other than PyPI's newest, standing in for the machine's own.
     const SDK_PAIR: [(&str, &str); 2] = [
-        ("cozy_runtime-0.18.101-cp312-abi3-manylinux_2_28_x86_64.whl", "https://files.pythonhosted.org/packages/23/be/107c41ae8c978de51c315ba0c18152625454cd3767fb584683420b799d6b/cozy_runtime-0.18.101-cp312-abi3-manylinux_2_28_x86_64.whl"),
-        ("tensorfs-0.3.92-cp312-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", "https://files.pythonhosted.org/packages/f4/fc/8bc1e8fd0927b08257663e0b599da5e503a09adc8ee1db9cc183e78a73eb/tensorfs-0.3.92-cp312-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"),
+        ("cozy_runtime-0.26.4-cp312-abi3-manylinux_2_28_x86_64.whl", "https://files.pythonhosted.org/packages/24/0c/5a451d1dd376fe4df3de99e60cb3a765f9e17bb7a0c5330a39667354a76e/cozy_runtime-0.26.4-cp312-abi3-manylinux_2_28_x86_64.whl"),
+        ("tensorfs-0.10.0-cp312-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", "https://files.pythonhosted.org/packages/54/21/efb6e5ed5064d0681b2b501346c7884207e260c678064b3b08794844e77d/tensorfs-0.10.0-cp312-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"),
     ];
 }

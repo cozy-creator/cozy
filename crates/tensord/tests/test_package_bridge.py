@@ -62,7 +62,7 @@ def test_sdk_interface_remains_opaque_through_generation_boundary():
 
 def test_bound_is_preserved_and_live_generation_cannot_be_collected(generation):
     versions = {entry.name: entry.version for entry in generation.dependencies}
-    assert Version("0.18.89") <= Version(versions["cozy-runtime"]) < Version("0.18.101")
+    assert Version("0.26.0") <= Version(versions["cozy-runtime"]) < Version("0.27")
     assert not collect(Path(generation.python).parents[2])
 
 
@@ -71,11 +71,11 @@ def test_real_older_sdk_package_installs_without_peer_version_floor(generation, 
     shutil.copytree(FIXTURE, source)
     project = source / "pyproject.toml"
     project.write_text(project.read_text().replace(
-        "cozy-runtime>=0.18.89,<0.18.101", "cozy-runtime==0.18.89"))
+        "cozy-runtime>=0.26,<0.27", "cozy-runtime==0.26.0"))
     client_wheel = next((Path(generation.python).parents[4] / "client").glob("*.whl"))
     older = install(source, tmp_path / "older-generations", client_wheel)
     versions = {dependency.name: dependency.version for dependency in older.dependencies}
-    assert versions["cozy-runtime"] == "0.18.89"
+    assert versions["cozy-runtime"] == "0.26.0"
     assert b"classify" in bytes(older.interface)
 
 
