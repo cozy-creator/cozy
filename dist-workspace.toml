@@ -17,7 +17,8 @@ targets = [
   "aarch64-pc-windows-msvc",
 ]
 install-path = "~/.cozy/bin"
-install-success-msg = "cozy is installed. Optional: `cozy tools install ffmpeg` trims video uploads (`cozy tools list` shows each tool and what it adds)."
+# Embedded in the installers' double-quoted strings (sh, PowerShell): no backticks, $ or double quotes.
+install-success-msg = "cozy is installed. Optional: run 'cozy tools install ffmpeg' to trim video uploads; 'cozy tools list' shows each tool and what it adds."
 install-updater = false
 dispatch-releases = true
 precise-builds = true
