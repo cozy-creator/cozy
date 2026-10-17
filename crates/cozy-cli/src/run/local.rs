@@ -27,7 +27,7 @@ use crate::{Context, output, package::local::Local};
 /// What the machine installed: the package's interface and where the call must go.
 struct Installed {
     interface: Interface,
-    /// The machine's name for the installation; an older machine names none.
+    /// The machine's name for the installation; none for a kept interface.
     installation: Option<String>,
     /// Where it was installed; none for a kept interface.
     machine: Option<String>,

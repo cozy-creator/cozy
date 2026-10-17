@@ -288,7 +288,7 @@ fn script(ctx: &Context, path: &Path) -> Result<PathBuf, Error> {
             .starts_with("cozy-runtime")
     });
     if !names_runtime {
-        dependencies.push("cozy-runtime>=0.25".into());
+        dependencies.push("cozy-runtime>=0.27".into());
     }
     let requires = metadata
         .remove("requires-python")
