@@ -5,6 +5,9 @@ name: tensorfs-release
 #   gh workflow run tensorfs-release.yaml -R cozy-creator/cozy --ref <branch>                         # build and prove
 #   gh workflow run tensorfs-release.yaml -R cozy-creator/cozy --ref tensorfs-vX.Y.Z -f publish=true  # PyPI
 on:
+  # TEMP: test runs on this branch before the file is on master (dropped before merge).
+  push:
+    branches: [xs043-tensorfs-release]
   workflow_dispatch:
     inputs:
       publish:
