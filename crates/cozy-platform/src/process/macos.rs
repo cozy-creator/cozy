@@ -181,6 +181,10 @@ fn info(pid: u32) -> io::Result<libc::proc_bsdinfo> {
     })
 }
 
+pub(super) fn parent_of(pid: u32) -> io::Result<u32> {
+    Ok(info(pid)?.pbi_ppid)
+}
+
 /// Groups and meters are read only on Linux so far: unreadable here, which decides nothing.
 pub(super) fn group_members(_: &Birth) -> Vec<Birth> {
     Vec::new()
