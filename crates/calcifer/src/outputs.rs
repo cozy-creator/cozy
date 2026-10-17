@@ -30,7 +30,6 @@ use cozy_proto::{
         client::{self, Bulk},
     },
 };
-use ed25519_dalek::{SigningKey, pkcs8::DecodePrivateKey as _};
 use futures_util::StreamExt as _;
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
@@ -45,14 +44,15 @@ use crate::{
     api::{self, Api, Refusal},
     lanes::{self, Ranged},
     lock,
-    store::{Endpoint, OutputRow, RunRow, State as RunState, StoreError},
+    link::LANES,
+    store::{OutputRow, RunRow, State as RunState, StoreError},
 };
 
 /// A tree output's media type: its bytes are the manifest of its files.
 const TREE: &str = "application/vnd.cozy.tree-manifest";
-/// Bytes are read in ranges of this size, at most `LANES` side by side on their own connections.
+/// Bytes are read in ranges of `clamp(length / LANES, 1 MiB, RANGE)`, at most `LANES` side by side
+/// on their own connections.
 const RANGE: u64 = 8 << 20;
-const LANES: usize = 8;
 
 /// The exporters at work, and what they share.
 #[derive(Default)]
@@ -149,7 +149,7 @@ impl Calcifer {
     /// Exports the run's outputs, each at its newest revision, until none is left. Paces retries
     /// while nothing moves; never gives up without recording why.
     async fn export_run(&self, id: &RunId, wake: &Notify) {
-        let (mut pause, mut lanes) = (Pause::default(), Lanes::default());
+        let mut pause = Pause::default();
         loop {
             let (run, item) = match self.next_export(id) {
                 Ok(Some(next)) => next,
@@ -164,8 +164,8 @@ impl Calcifer {
                 }
             };
             let mut changed = None;
-            let exported = match self.reach(&run, &mut lanes, &mut changed) {
-                Ok(()) => self.export_item(&run, &item, &mut lanes, wake).await,
+            let exported = match self.reach(&run, &mut changed) {
+                Ok(link) => self.export_item(&run, &item, &link, wake).await,
                 Err(failure) => Err(failure),
             };
             match exported {
@@ -213,26 +213,23 @@ impl Calcifer {
         Ok(next)
     }
 
-    /// Points `lanes` at the run's machine; `changed` is told when the machine changes.
+    /// The run's machine's connection, whose bulk lanes read; `changed` is told when the
+    /// machine changes.
     fn reach(
         &self,
         run: &RunRow,
-        lanes: &mut Lanes,
         changed: &mut Option<watch::Receiver<()>>,
-    ) -> Result<(), Failure> {
+    ) -> Result<Link, Failure> {
         let Some(name) = &run.machine else {
             return Err(Failure::Lost("the run never reached a machine".into()));
         };
-        let (machine, _, watch, _) = self.machine(name).map_err(Failure::Again)?;
+        let (machine, link, watch, _) = self.machine(name).map_err(Failure::Again)?;
         *changed = Some(watch);
         if machine.state == MachineState::Ended {
             let reason = machine.reason.as_deref().unwrap_or("no reason was given");
             return Err(Failure::Lost(format!("its machine {name} ended: {reason}")));
         }
-        let Some(endpoint) = machine.endpoint else {
-            return Err(Failure::Again(format!("waiting for {name} to start")));
-        };
-        lanes.point(endpoint, &machine.key).map_err(Failure::Again)
+        link.ok_or_else(|| Failure::Again(format!("waiting for {name} to start")))
     }
 
     /// Makes the item's file (a directory for a tree) this revision's bytes. A newer revision
@@ -241,7 +238,7 @@ impl Calcifer {
         &self,
         run: &RunRow,
         item: &OutputRow,
-        lanes: &mut Lanes,
+        link: &Link,
         wake: &Notify,
     ) -> Result<(), Failure> {
         let name = file_name(run.number, &item.name, item.index, &item.media_type);
@@ -257,11 +254,11 @@ impl Calcifer {
                 Failure::Again(format!("cannot create {}: {e}", run.out_dir.display()))
             })?;
             let staged = if item.media_type == TREE {
-                fetch_tree(lanes, &target, item, &dest).await?
+                fetch_tree(link, &target, item, &dest).await?
             } else {
                 let appended = (run.id.clone(), item_id(run.number, item), item.rev);
                 let appended = lock(&self.exports.appended).get(&appended).copied();
-                fetch_file(lanes, &target, item, &dest, appended).await?
+                fetch_file(link, &target, item, &dest, appended).await?
             };
             self.land(run, item, &staged, &dest)
         };
@@ -482,7 +479,7 @@ fn remove(path: &Path) {
 /// This revision's bytes in `<file>.part`, checked against its digest. A revision that extends
 /// the one the file holds reads only its new tail.
 async fn fetch_file(
-    lanes: &mut Lanes,
+    link: &Link,
     target: &v1::OutputTarget,
     item: &OutputRow,
     dest: &Path,
@@ -507,7 +504,7 @@ async fn fetch_file(
             from = 0;
             continue;
         }
-        fetch(lanes, target, item.rev, from, item.length, &part).await?;
+        fetch(link, target, item.rev, from, item.length, &part).await?;
         match check(&part, item.length, &item.digest).await {
             Ok(()) => return Ok(part),
             // The file did not hold the revision this one extends.
@@ -520,7 +517,7 @@ async fn fetch_file(
 /// This revision's tree in `<dir>.part/`: its manifest, then each file it names, each checked
 /// against its digest; a file the tree names twice is read once.
 async fn fetch_tree(
-    lanes: &mut Lanes,
+    link: &Link,
     target: &v1::OutputTarget,
     item: &OutputRow,
     dest: &Path,
@@ -537,7 +534,7 @@ async fn fetch_tree(
         }
     });
     prepared.await.map_err(unwritable)?;
-    fetch(lanes, target, item.rev, 0, item.length, &manifest).await?;
+    fetch(link, target, item.rev, 0, item.length, &manifest).await?;
     check(&manifest, item.length, &item.digest)
         .await
         .map_err(Failure::Again)?;
@@ -559,7 +556,7 @@ async fn fetch_tree(
             member: path,
             ..target.clone()
         };
-        fetch(lanes, &member, item.rev, 0, length, &file).await?;
+        fetch(link, &member, item.rev, 0, length, &file).await?;
         check(&file, length, &digest)
             .await
             .map_err(Failure::Again)?;
@@ -674,59 +671,23 @@ async fn check(path: &Path, length: u64, digest: &str) -> Result<(), String> {
     checked.await.unwrap_or_else(|e| Err(e.to_string()))
 }
 
-/// Bulk lanes that read one machine's outputs, apart from the connection its runs' events use,
-/// so a big read never holds a run's events up.
-#[derive(Default)]
-struct Lanes {
-    machine: Option<(Endpoint, Link)>,
-    bulk: Vec<Option<Bulk>>,
-}
-
-impl Lanes {
-    fn point(&mut self, endpoint: Endpoint, key: &Path) -> Result<(), String> {
-        if self.machine.as_ref().is_some_and(|(at, _)| *at == endpoint) {
-            return Ok(());
-        }
-        let signer = std::fs::read_to_string(key)
-            .ok()
-            .and_then(|pem| SigningKey::from_pkcs8_pem(&pem).ok())
-            .ok_or_else(|| format!("cannot read the signing key {}", key.display()))?;
-        let link = Link::new(&endpoint, signer).map_err(|e| e.to_string())?;
-        *self = Lanes {
-            machine: Some((endpoint, link)),
-            bulk: vec![None; LANES],
-        };
-        Ok(())
-    }
-
-    /// Lane `i`'s connections, opened on first use and again when `fresh`.
-    fn lane(&mut self, i: usize, fresh: bool) -> Result<Bulk, String> {
-        let (_, link) = self.machine.as_ref().expect("pointed at a machine");
-        if fresh || self.bulk[i].is_none() {
-            self.bulk[i] = Some(link.bulk().map_err(|e| e.to_string())?);
-        }
-        Ok(self.bulk[i].clone().expect("opened"))
-    }
-}
-
 /// Reads bytes `[from, length)` of `target` at revision `rev` into `part` at their offsets: ranges
-/// of `RANGE` bytes, at most `LANES` side by side on their own connections (`lanes::transfer`).
+/// cut as `lanes::parts` cuts them (at most `RANGE`), `LANES` side by side on the machine's bulk
+/// lanes (`lanes::transfer`).
 async fn fetch(
-    lanes: &mut Lanes,
+    link: &Link,
     target: &v1::OutputTarget,
     rev: u64,
     from: u64,
     length: u64,
     part: &Path,
 ) -> Result<(), Failure> {
-    let ranges = (from..length)
-        .step_by(RANGE as usize)
-        .map(|first| (first, (first + RANGE).min(length)));
+    let ranges = lanes::parts(&[(0, from)], length, LANES, RANGE);
     let read = lanes::transfer(ranges, LANES, |leg| {
-        let lane = lanes.lane(leg.lane, leg.fresh);
+        let lane = link.lane(leg.lane, leg.fresh);
         let (target, part) = (target.clone(), part.to_owned());
         async move {
-            let lane = lane.map_err(Ranged::Again)?;
+            let lane = lane.ok_or_else(|| Ranged::Again("no connection to the machine".into()))?;
             let range = (leg.first, leg.end, length);
             read_range(lane, target, rev, range, part, leg.at).await
         }

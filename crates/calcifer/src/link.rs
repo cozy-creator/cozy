@@ -30,8 +30,13 @@ use crate::{
 
 /// The refusal of a machine from before this API (cozy v0.9's gRPC), which is never driven.
 pub const OUTDATED: &str = "machine_outdated";
+/// A machine's bulk lanes, each its own HTTP/1.1 connections: output reads use them all, an
+/// upload `UPLOAD_LANES` of them.
+pub(crate) const LANES: usize = 8;
 /// Parts of an upload in flight side by side, each on its own connection.
-const LANES: usize = 4;
+const UPLOAD_LANES: usize = 4;
+/// The most one upload part carries.
+const PART: u64 = 64 << 20;
 /// How often an upload asks the machine what it holds, which is its progress.
 const TELL_EVERY: Duration = Duration::from_secs(1);
 /// What an upload reads from its file at a time.
@@ -85,7 +90,7 @@ pub type Live<T> = Pin<Box<dyn Stream<Item = Result<T, LinkError>> + Send>>;
 #[derive(Clone)]
 pub struct Link {
     machine: Machine,
-    /// The upload lanes, kept across objects: a project's many small files reuse connections.
+    /// The bulk lanes, kept across transfers: a project's many small files reuse connections.
     lanes: Arc<Mutex<Vec<Option<Bulk>>>>,
 }
 
@@ -107,8 +112,8 @@ impl Link {
         Ok(self.machine.bulk()?)
     }
 
-    /// Upload lane `i`, connected again when `fresh`.
-    fn lane(&self, i: usize, fresh: bool) -> Option<Bulk> {
+    /// Bulk lane `i`, connected again when `fresh`.
+    pub(crate) fn lane(&self, i: usize, fresh: bool) -> Option<Bulk> {
         let mut lanes = self.lanes.lock().unwrap_or_else(|e| e.into_inner());
         if fresh || lanes[i].is_none() {
             lanes[i] = self.machine.bulk().ok();
@@ -218,8 +223,8 @@ impl Link {
         let landed = Arc::new(AtomicU64::new(from));
         loop {
             let before = v1::held_bytes(&held);
-            let parts = lanes::parts(&held, length, LANES);
-            let sent = lanes::transfer(parts, LANES, |leg| {
+            let parts = lanes::parts(&held, length, UPLOAD_LANES, PART);
+            let sent = lanes::transfer(parts, UPLOAD_LANES, |leg| {
                 let lane = self.lane(leg.lane, leg.fresh);
                 put(lane, name.clone(), path.to_owned(), length, leg, landed.clone())
             });
