@@ -930,6 +930,15 @@ impl Pool {
     }
     /// The `degree` GPUs from envelope index `start`: a group's are the first ones; none for a
     /// deviceless call.
+    /// The per-GPU ceiling every Load carries: the group's smallest card, else the configured one.
+    fn device_limit(&self, gpus: &[Device]) -> Option<u64> {
+        gpus.iter()
+            .map(|device| device.memory.sample().map(|sample| sample.total))
+            .collect::<Option<Vec<_>>>()
+            .and_then(|totals| totals.into_iter().min())
+            .or(self.config.authorized_device_limit_bytes)
+    }
+
     fn lane(&self, start: usize, degree: u32) -> io::Result<&[Device]> {
         if degree == 0 {
             return Ok(&[]);
@@ -3034,12 +3043,6 @@ impl Pool {
                         1 => vec![],
                         _ => plan.slots.iter().map(load).collect(),
                     };
-                    // The group's per-GPU ceiling: the smallest card.
-                    let device_total = gpus
-                        .iter()
-                        .map(|device| device.memory.sample().map(|sample| sample.total))
-                        .collect::<Option<Vec<_>>>()
-                        .and_then(|totals| totals.into_iter().min());
                     DeviceCommand::Load {
                         construction: construction.clone(),
                         devices: lane.clone(),
@@ -3047,8 +3050,7 @@ impl Pool {
                         binding: Box::new(first.binding),
                         budgets: first.budgets,
                         models,
-                        authorized_device_limit_bytes:
-                            device_total.or(self.config.authorized_device_limit_bytes),
+                        authorized_device_limit_bytes: self.device_limit(gpus),
                         // The request it loads for names a kernel: its build is imported first.
                         attention_pin: match load_only
                             || !session.executor.hello.offers("attention.load_pin/1")
@@ -4780,6 +4782,62 @@ mod tests {
         assert_eq!(group_degree(&mixed, 0, 4), 1);
         assert_eq!(group_degree(&[json!({"path":"e.models.vae"})], 2, 2), 1);
     }
+
+    /// An integrated GPU (GB10) answers NVML's memory info with NotSupported. Its Loads still
+    /// carry a device limit (the host's memory), without which Runtime refuses the executor
+    /// (run 10322). Under a fake `libnvidia-ml.so.1` that answers so, in a child of this test.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_gpu_whose_memory_nvml_does_not_support_still_bounds_every_load() {
+        let dir = std::env::temp_dir().join(format!("fake-nvml-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("nvml.c"), FAKE_NVML).unwrap();
+        let built = std::process::Command::new("cc")
+            .args(["-shared", "-fPIC", "-o"]).arg(dir.join("libnvidia-ml.so.1")).arg(dir.join("nvml.c"))
+            .status().unwrap();
+        assert!(built.success());
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "gpu_service::tests::an_integrated_gpus_load_limit_is_the_hosts_memory", "--ignored"])
+            .env("LD_LIBRARY_PATH", &dir)
+            .output().unwrap();
+        let out = String::from_utf8_lossy(&child.stdout);
+        assert!(child.status.success() && out.contains("1 passed"), "{out}{}", String::from_utf8_lossy(&child.stderr));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    #[ignore = "a_gpu_whose_memory_nvml_does_not_support_still_bounds_every_load runs it under its fake NVML"]
+    fn an_integrated_gpus_load_limit_is_the_hosts_memory() {
+        let root = std::env::temp_dir().join(format!("gpu-integrated-{}", uuid::Uuid::new_v4()));
+        let config: GpuConfig = serde_json::from_value(json!({"devices": "0",
+            "authorized_device_limit_bytes": null, "prespawn": false})).unwrap();
+        let store = Arc::new(Store::ensure(&root.join("store")).unwrap());
+        let pool = Pool::new(&root.join("gpu"), config, store).unwrap();
+        let host = cozy_platform::contain::host_memory::total();
+        assert!(host > 0);
+        assert_eq!(pool.device_limit(pool.lane(0, 1).unwrap()), Some(host as u64));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// NVML for one integrated GPU: every call the memory sampler makes, and memory info
+    /// NotSupported (3), as GB10's driver answers.
+    const FAKE_NVML: &str = r#"
+#include <stdio.h>
+static int gpu;
+int nvmlInit_v2(void) { return 0; }
+int nvmlInit_v3(unsigned flags) { return 0; }
+int nvmlShutdown(void) { return 0; }
+int nvmlDeviceGetCount_v2(unsigned *n) { *n = 1; return 0; }
+int nvmlDeviceGetHandleByIndex_v2(unsigned i, void **d) { if (i) return 2; *d = &gpu; return 0; }
+int nvmlDeviceGetHandleByUUID(const char *u, void **d) { *d = &gpu; return 0; }
+int nvmlDeviceGetIndex(void *d, unsigned *i) { *i = 0; return 0; }
+int nvmlDeviceGetUUID(void *d, char *b, unsigned n) { snprintf(b, n, "GPU-integrated-test"); return 0; }
+int nvmlDeviceGetName(void *d, char *b, unsigned n) { snprintf(b, n, "NVIDIA GB10"); return 0; }
+int nvmlSystemGetDriverVersion(char *b, unsigned n) { snprintf(b, n, "595.84"); return 0; }
+int nvmlDeviceGetMemoryInfo(void *d, void *m) { return 3; }
+int nvmlDeviceGetMemoryInfo_v2(void *d, void *m) { return 3; }
+int nvmlDeviceGetDisplayActive(void *d, int *s) { *s = 0; return 0; }
+"#;
 
     /// A fresh pool over `width` GPUs NVML does not know (this host's own stay untouched):
     /// every GPU has room.
