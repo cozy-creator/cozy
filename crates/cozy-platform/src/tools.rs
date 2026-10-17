@@ -1,9 +1,13 @@
-//! The tools cozy uses when present and never bundles: where each is found, what its absence
-//! costs, and how it is installed. `cozy doctor` lists them, and a warning about a missing one says
-//! its cost and its install from here. Probes read no environment: the caller hands in PATH.
+//! The tools cozy uses when present and never bundles: where each is found, whether a run or a
+//! command needs it, what its absence costs, and how it is installed. `cozy doctor` lists them; a
+//! missing optional tool is one warning (`warn_once`) and the work goes on without it; a missing
+//! essential one is a refusal naming its install. Probes read no environment: the caller hands in
+//! PATH.
 use std::{
+    collections::BTreeSet,
     path::{Path, PathBuf},
     process::Command,
+    sync::{Mutex, PoisonError},
 };
 
 use crate::paths::exe;
@@ -17,13 +21,34 @@ pub enum Side {
     Machine,
 }
 
+/// Whether the work can go on without it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Class {
+    /// Its feature cannot work without it: guaranteed where cozy can fetch it, else refused with
+    /// its install named.
+    Essential,
+    /// A slower or smaller path serves without it, after one warning.
+    Optional,
+}
+
+/// How a missing tool is installed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Install {
+    /// A cozy verb: `cozy tools install uv`.
+    Cozy(&'static str),
+    /// The OS package that carries it (`system_install` spells the command).
+    System(&'static str),
+    /// No package installs it alone: what to install, in words.
+    Note(&'static str),
+}
+
 pub struct Tool {
     pub name: &'static str,
     pub side: Side,
+    pub class: Class,
     /// What its absence costs, as doctor and a warning say it.
     pub cost: &'static str,
-    /// The cozy verb that installs it.
-    pub install: &'static str,
+    pub install: Install,
     /// Finds it in `tools` (cozy's own install), else on `path`.
     pub probe: fn(tools: &Path, path: &[PathBuf]) -> Option<Found>,
 }
@@ -31,17 +56,98 @@ pub struct Tool {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Found {
     pub path: PathBuf,
-    /// The first line of its own version output.
+    /// The first line of its own version output; empty for a tool that is only looked for.
     pub version: String,
 }
 
-pub const TOOLS: &[Tool] = &[Tool {
-    name: "ffmpeg",
-    side: Side::Computer,
-    cost: "uploads go untrimmed (larger, slower)",
-    install: "cozy tools install ffmpeg",
-    probe: |tools, path| ffmpeg(tools, path).map(|(ffmpeg, _)| ffmpeg),
-}];
+macro_rules! looked_for {
+    ($name:literal) => {
+        |_, path| on_path($name, path)
+    };
+}
+
+pub const TOOLS: &[Tool] = &[
+    Tool {
+        name: "uv",
+        side: Side::Computer,
+        class: Class::Essential,
+        cost: "packages can't be authored, locked or published here",
+        install: Install::Cozy("cozy tools install uv"),
+        probe: uv,
+    },
+    Tool {
+        name: "git",
+        side: Side::Computer,
+        class: Class::Essential,
+        cost: "a package's git dependencies can't be built",
+        install: Install::System("git"),
+        probe: looked_for!("git"),
+    },
+    Tool {
+        name: "ffmpeg",
+        side: Side::Computer,
+        class: Class::Optional,
+        cost: "uploads go untrimmed (larger, slower)",
+        install: Install::Cozy("cozy tools install ffmpeg"),
+        probe: |tools, path| ffmpeg(tools, path).map(|(ffmpeg, _)| ffmpeg),
+    },
+    Tool {
+        name: "xdg-open",
+        side: Side::Computer,
+        class: Class::Optional,
+        cost: "the browser isn't opened; the URL is printed instead",
+        install: Install::System("xdg-utils"),
+        probe: looked_for!("xdg-open"),
+    },
+    Tool {
+        name: "systemctl",
+        side: Side::Computer,
+        class: Class::Optional,
+        cost: "Calcifer doesn't start at login; the next command starts it",
+        install: Install::Note("a systemd user session"),
+        probe: looked_for!("systemctl"),
+    },
+    Tool {
+        name: "sshd",
+        side: Side::Machine,
+        class: Class::Optional,
+        cost: "no SSH into this dev machine",
+        install: Install::System("openssh-server"),
+        probe: looked_for!("sshd"),
+    },
+    Tool {
+        name: "unshare",
+        side: Side::Machine,
+        class: Class::Optional,
+        cost: "ingest runs without network isolation",
+        install: Install::System("util-linux"),
+        probe: looked_for!("unshare"),
+    },
+    Tool {
+        name: "nvcc",
+        side: Side::Machine,
+        class: Class::Optional,
+        cost: "cards without a prebuilt kernel use the slower SDPA path",
+        install: Install::Note("the CUDA toolkit"),
+        probe: looked_for!("nvcc"),
+    },
+    Tool {
+        name: "cc",
+        side: Side::Machine,
+        class: Class::Optional,
+        cost: "Triton kernels and package extensions can't build; those ops use slower fallbacks",
+        install: Install::System("gcc"),
+        probe: looked_for!("cc"),
+    },
+    Tool {
+        name: "ninja",
+        side: Side::Machine,
+        class: Class::Optional,
+        cost: "kernel builds compile one file at a time",
+        install: Install::System("ninja"),
+        probe: looked_for!("ninja"),
+    },
+];
 
 /// The table's entry for `name`.
 pub fn tool(name: &str) -> &'static Tool {
@@ -51,16 +157,109 @@ pub fn tool(name: &str) -> &'static Tool {
         .unwrap_or_else(|| panic!("{name} is not in the tool table"))
 }
 
-/// ffmpeg's pinned static build, one per OS/CPU: each archive held to its sha256, nothing else
-/// trusted at download. Every one has libx264 and the native aac encoder, and ships ffprobe.
-pub const FFMPEG_VERSION: &str = "9.0.2";
+/// The one warning a missing optional tool gets in this process: its name, what its absence
+/// costs, and `cozy doctor`. None once it was given, so a caller prints only what it gets, the way
+/// it prints (a terminal line, a log record, a run's warning).
+pub fn warn_once(name: &str) -> Option<String> {
+    static WARNED: Mutex<BTreeSet<&'static str>> = Mutex::new(BTreeSet::new());
+    let tool = tool(name);
+    let mut warned = WARNED.lock().unwrap_or_else(PoisonError::into_inner);
+    warned.insert(tool.name).then(|| warning(tool))
+}
 
+/// What a missing tool's warning says.
+pub fn warning(tool: &Tool) -> String {
+    format!("{} not found: {}; see `cozy doctor`", tool.name, tool.cost)
+}
+
+/// `name` on `path`, the first match in order; only looked for, never run.
+pub fn on_path(name: &str, path: &[PathBuf]) -> Option<Found> {
+    path.iter()
+        .map(|dir| dir.join(exe(name)))
+        .find(|file| executable(file))
+        .map(|path| Found {
+            path,
+            version: String::new(),
+        })
+}
+
+/// A pinned archive, held to its sha256: nothing else is trusted at download.
 pub struct Archive {
     pub url: &'static str,
     pub sha256: &'static str,
-    /// Archive member → the file it becomes in the build's directory.
+    /// Archive member → the file it becomes in the tool's directory.
     pub members: &'static [(&'static str, &'static str)],
 }
+
+/// The uv cozy fetches where this computer or machine brings none: one version everywhere.
+pub const UV_VERSION: &str = "0.12.24";
+
+/// This OS/CPU's uv archive, or none where no build is pinned.
+pub fn uv_build() -> Option<Archive> {
+    macro_rules! astral {
+        ($triple:literal, $sha256:literal) => {
+            Some(Archive {
+                url: concat!(
+                    "https://github.com/astral-sh/uv/releases/download/0.12.24/uv-",
+                    $triple,
+                    ".tar.gz"
+                ),
+                sha256: $sha256,
+                members: &[(concat!("uv-", $triple, "/uv"), "uv")],
+            })
+        };
+    }
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", "x86_64") => astral!(
+            "x86_64-unknown-linux-gnu",
+            "b4dfaef47d491a7296981f8374a4595f55dbf84e8937c8ecd2983574d8bb3da6"
+        ),
+        ("linux", "aarch64") => astral!(
+            "aarch64-unknown-linux-gnu",
+            "5231be65f496304623895dacdbf1de8504fec90303684bdf05805aa34414dd21"
+        ),
+        ("macos", "aarch64") => astral!(
+            "aarch64-apple-darwin",
+            "0c4346de7abdb49495b393b9ec809fe387aa43e586be20fecb972216c1e71732"
+        ),
+        ("macos", "x86_64") => astral!(
+            "x86_64-apple-darwin",
+            "4fa82e37cb94767661f532b001e470b67a186c7260e305bd84ddb78fd545c0b6"
+        ),
+        ("windows", "x86_64") => Some(Archive {
+            url: "https://github.com/astral-sh/uv/releases/download/0.12.24/uv-x86_64-pc-windows-msvc.zip",
+            sha256: "7c38608c8a18ee137d748a1773053b07ec8f3a30fab49aebaa6f4e4efeceb019",
+            members: &[("uv.exe", "uv.exe")],
+        }),
+        ("windows", "aarch64") => Some(Archive {
+            url: "https://github.com/astral-sh/uv/releases/download/0.12.24/uv-aarch64-pc-windows-msvc.zip",
+            sha256: "4b783bda5cc44bbae0651a837223873a7acee31152381aef5fc86ef6bef25997",
+            members: &[("uv.exe", "uv.exe")],
+        }),
+        _ => None,
+    }
+}
+
+/// The pinned uv's directory under `tools`.
+pub fn uv_dir(tools: &Path) -> PathBuf {
+    tools.join("uv").join(UV_VERSION)
+}
+
+/// The pinned uv in `tools`, else uv on `path`.
+pub fn uv(tools: &Path, path: &[PathBuf]) -> Option<Found> {
+    std::iter::once(uv_dir(tools))
+        .chain(path.iter().cloned())
+        .map(|dir| dir.join(exe("uv")))
+        .filter(|uv| executable(uv))
+        .find_map(|uv| {
+            let version = first_line(&uv, &["--version"])?;
+            Some(Found { path: uv, version })
+        })
+}
+
+/// ffmpeg's pinned static build, one per OS/CPU: each archive held to its sha256, nothing else
+/// trusted at download. Every one has libx264 and the native aac encoder, and ships ffprobe.
+pub const FFMPEG_VERSION: &str = "9.0.2";
 
 /// This OS/CPU's archives, or none where no build is pinned.
 pub fn ffmpeg_build() -> &'static [Archive] {
@@ -68,12 +267,20 @@ pub fn ffmpeg_build() -> &'static [Archive] {
         ($dir:literal, $ffmpeg:literal, $ffprobe:literal) => {
             &[
                 Archive {
-                    url: concat!("https://ffmpeg.martin-riedl.de/download/", $dir, "/ffmpeg.zip"),
+                    url: concat!(
+                        "https://ffmpeg.martin-riedl.de/download/",
+                        $dir,
+                        "/ffmpeg.zip"
+                    ),
                     sha256: $ffmpeg,
                     members: &[("ffmpeg", "ffmpeg")],
                 },
                 Archive {
-                    url: concat!("https://ffmpeg.martin-riedl.de/download/", $dir, "/ffprobe.zip"),
+                    url: concat!(
+                        "https://ffmpeg.martin-riedl.de/download/",
+                        $dir,
+                        "/ffprobe.zip"
+                    ),
                     sha256: $ffprobe,
                     members: &[("ffprobe", "ffprobe")],
                 },
@@ -106,7 +313,10 @@ pub fn ffmpeg_build() -> &'static [Archive] {
             sha256: "4705843ccaaf54257c16ad90f3e952ece33c17df964ecf7bfdbb0f49c7171077",
             members: &[
                 ("ffmpeg-9.0.2-essentials_build/bin/ffmpeg.exe", "ffmpeg.exe"),
-                ("ffmpeg-9.0.2-essentials_build/bin/ffprobe.exe", "ffprobe.exe"),
+                (
+                    "ffmpeg-9.0.2-essentials_build/bin/ffprobe.exe",
+                    "ffprobe.exe",
+                ),
             ],
         }],
         _ => &[],
@@ -125,17 +335,25 @@ pub fn ffmpeg(tools: &Path, path: &[PathBuf]) -> Option<(Found, PathBuf)> {
         .chain(path.iter().map(PathBuf::as_path))
         .find_map(|dir| {
             let (ffmpeg, ffprobe) = (dir.join(exe("ffmpeg")), dir.join(exe("ffprobe")));
-            if !ffmpeg.is_file() || !ffprobe.is_file() {
+            if !executable(&ffmpeg) || !executable(&ffprobe) {
                 return None;
             }
             let version = first_line(&ffmpeg, &["-hide_banner", "-version"])?;
-            Some((Found { path: ffmpeg, version }, ffprobe))
+            Some((
+                Found {
+                    path: ffmpeg,
+                    version,
+                },
+                ffprobe,
+            ))
         })
 }
 
 /// Whether the ffmpeg at `ffmpeg` has an encoder named `encoder`.
 pub fn ffmpeg_encodes(ffmpeg: &Path, encoder: &str) -> bool {
-    let out = Command::new(ffmpeg).args(["-hide_banner", "-encoders"]).output();
+    let out = Command::new(ffmpeg)
+        .args(["-hide_banner", "-encoders"])
+        .output();
     out.is_ok_and(|out| {
         String::from_utf8_lossy(&out.stdout)
             .lines()
@@ -146,7 +364,6 @@ pub fn ffmpeg_encodes(ffmpeg: &Path, encoder: &str) -> bool {
 /// The OS package manager's command for `package`, when this computer has one: `sudo` named where
 /// it needs it, for the person to run.
 pub fn system_install(package: &str, path: &[PathBuf]) -> Option<String> {
-    let has = |program: &str| path.iter().any(|dir| dir.join(exe(program)).is_file());
     let managers: &[(&str, &str)] = match std::env::consts::OS {
         "linux" => &[
             ("apt-get", "sudo apt-get install -y"),
@@ -157,18 +374,88 @@ pub fn system_install(package: &str, path: &[PathBuf]) -> Option<String> {
         "windows" => &[("winget", "winget install --exact --id")],
         _ => &[],
     };
-    let name = match (std::env::consts::OS, package) {
-        ("windows", "ffmpeg") => "Gyan.FFmpeg",
+    let (manager, command) = managers
+        .iter()
+        .find(|(program, _)| on_path(program, path).is_some())?;
+    let name = match (*manager, package) {
+        ("winget", "ffmpeg") => "Gyan.FFmpeg",
+        ("winget", "git") => "Git.Git",
+        ("apt-get" | "dnf", "ninja") => "ninja-build",
         _ => package,
     };
-    managers
-        .iter()
-        .find(|(program, _)| has(program))
-        .map(|(_, command)| format!("{command} {name}"))
+    Some(format!("{command} {name}"))
+}
+
+/// A file this process may run.
+fn executable(file: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(file).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        file.is_file()
+    }
 }
 
 fn first_line(program: &Path, args: &[&str]) -> Option<String> {
     let out = Command::new(program).args(args).output().ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
-    text.lines().next().map(str::trim).filter(|l| !l.is_empty()).map(str::to_owned)
+    text.lines()
+        .next()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_owned)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_tool_is_named_once_and_says_what_its_absence_costs() {
+        let names: BTreeSet<_> = TOOLS.iter().map(|t| t.name).collect();
+        assert_eq!(names.len(), TOOLS.len());
+        for tool in TOOLS {
+            assert!(
+                !tool.cost.is_empty() && !tool.cost.ends_with('.'),
+                "{}",
+                tool.name
+            );
+        }
+        assert_eq!(
+            warning(tool("unshare")),
+            "unshare not found: ingest runs without network isolation; see `cozy doctor`"
+        );
+    }
+
+    #[test]
+    fn a_missing_tool_is_warned_about_once_per_process() {
+        assert!(warn_once("ninja").is_some_and(|w| w.starts_with("ninja not found: ")));
+        assert_eq!(warn_once("ninja"), None);
+    }
+
+    #[test]
+    fn a_tool_is_found_on_the_path_only_where_it_can_run() {
+        let dirs = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+        let path: Vec<PathBuf> = dirs.iter().map(|d| d.path().to_owned()).collect();
+        assert_eq!(on_path("git", &path), None);
+        let git = path[1].join(exe("git"));
+        std::fs::write(&git, b"").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(on_path("git", &path), None, "not executable");
+            std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        assert_eq!(on_path("git", &path).map(|f| f.path), Some(git));
+    }
+
+    #[test]
+    fn every_platform_cozy_ships_for_has_a_pinned_uv() {
+        let build = uv_build().expect("a pinned uv for this OS/CPU");
+        assert!(build.url.contains(UV_VERSION) && build.sha256.len() == 64);
+        assert_eq!(build.members.len(), 1);
+    }
 }
