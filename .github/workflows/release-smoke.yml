@@ -3,8 +3,8 @@ name: release-smoke
 # It also adds each archive's attestation bundles to the release (<archive>.sigstore.jsonl).
 # The CPU smoke of design §6.4 on every release runner, against this run's own artifacts served from a local
 # mirror (COZY_DOWNLOAD_URL is the release location for the installers and `cozy update` alike): install
-# script, --version, PATH, up, hub list, package search (tensorhub.com, anonymous), update to this release,
-# down. A verb answering not_ported is skipped, so the smoke grows as the verbs land.
+# script, --version, PATH, up, hub list, package search (tensorhub.com, anonymous), the local machine
+# (Linux; refused unsupported elsewhere), update to this release, down. A verb answering not_ported is skipped, so the smoke grows as the verbs land.
 on:
   workflow_call:
     inputs:
@@ -156,6 +156,26 @@ jobs:
           step up
           step hub list
           step package search sdxl
+          # The local machine: Linux serves it until stopped; elsewhere `machine serve` is refused unsupported.
+          if ! "$cozy" machine serve --help > /dev/null 2>&1; then
+            echo "skipped, not in the grammar yet: cozy machine serve"
+          elif [ "$RUNNER_OS" = Linux ]; then
+            "$cozy" machine serve --persistent > machine.log 2>&1 &
+            machine=$!
+            until "$cozy" --json machine list | jq -e '.machines[] | select(.name == "local" and .state == "ready")' > /dev/null; do
+              kill -0 "$machine" 2> /dev/null || { cat machine.log; echo "::error::cozy machine serve exited"; exit 1; }
+              sleep 1
+            done
+            step machine show local
+            kill "$machine"
+            wait "$machine" || true
+          else
+            code=0
+            out=$("$cozy" --json machine serve --persistent) || code=$?
+            printf '%s\n' "$out"
+            [ "$code" = 1 ] && printf '%s' "$out" | grep -Eq '"code": *"unsupported"' \
+              || { echo "::error::cozy machine serve on $RUNNER_OS answered $code, not unsupported"; fail=1; }
+          fi
           before=$(ls -i "$cozy")
           step update "$VERSION"
           if [ "$ran" = 1 ]; then
