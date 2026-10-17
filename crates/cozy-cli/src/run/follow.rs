@@ -66,11 +66,12 @@ pub(crate) async fn follow(ctx: &Context, run: Run, detach: bool) -> Result<Run,
     }
 }
 
-/// An output still owed to this computer: its last revision neither landed nor failed.
+/// An output still owed to this computer: its last revision neither landed nor failed. A
+/// checkpoint stays on its machine and is owed nowhere.
 fn owed(run: &Run) -> bool {
     run.output
         .iter()
-        .any(|item| item.path.is_none() && item.export_error.is_none())
+        .any(|item| !item.is_checkpoint() && item.path.is_none() && item.export_error.is_none())
 }
 
 /// `run`, once each of its outputs' last revision landed; else a refusal naming those that did not.
@@ -78,7 +79,7 @@ fn saved(run: Run) -> Result<Run, Error> {
     let lost: Vec<String> = run
         .output
         .iter()
-        .filter(|item| item.path.is_none())
+        .filter(|item| !item.is_checkpoint() && item.path.is_none())
         .map(|item| match &item.export_error {
             Some(error) => format!("{} ({error})", item_name(item)),
             None => format!("{} (still saving when following ended)", item_name(item)),
@@ -180,6 +181,18 @@ pub(crate) fn record(ctx: &Context, run: &Run) {
     next(ctx, run);
 }
 
+/// A checkpoint as a record shows it: its digest, the machine it stays on, and how to publish it.
+fn checkpoint(run: &Run, item: &OutputItem) -> String {
+    let digest = item
+        .sha256
+        .map_or_else(|| "not final yet".into(), |d| d.to_string());
+    let on = run.machine.as_deref().unwrap_or("its machine");
+    format!(
+        "checkpoint {digest} on {on} (`cozy run upload {}#{} <org/model>`)",
+        run.number, item.name
+    )
+}
+
 /// The record's fields, for a person.
 pub(super) fn fields(ctx: &Context, run: &Run) -> output::Record {
     let mut record = output::Record::new()
@@ -198,6 +211,7 @@ pub(super) fn fields(ctx: &Context, run: &Run) -> output::Record {
     }
     for item in &run.output {
         let shown = match (&item.path, &item.export_error) {
+            _ if item.is_checkpoint() => checkpoint(run, item),
             (Some(path), _) => output::link(ctx, path),
             (None, Some(error)) => format!("not saved: {error}"),
             (None, None) => output::bytes(item.length),
@@ -351,6 +365,13 @@ impl View {
             Event::OutputDone { item, .. } => {
                 if let Some(error) = &item.export_error {
                     self.line(&format!("  {}  not saved: {error}", item_name(item)));
+                } else if item.is_checkpoint() && self.named.insert(item.id.clone()) {
+                    let on = self.machine.as_deref().unwrap_or("its machine");
+                    let digest = item.sha256.map(|d| d.to_string()).unwrap_or_default();
+                    self.line(&format!(
+                        "  {}  checkpoint {digest} on {on}",
+                        item_name(item)
+                    ));
                 }
             }
             Event::Log { level, text, .. } if !matches!(level.as_str(), "info" | "debug") => {
@@ -453,6 +474,64 @@ impl View {
     fn done(&mut self) {
         if let Some(bar) = self.bar.take() {
             bar.finish_and_clear();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use cozy_proto::{
+        calcifer::{CHECKPOINT, ItemStatus},
+        ids::RunId,
+    };
+
+    use super::*;
+
+    /// A settled run with one output of each kind: (name, media type, landed path, error).
+    fn run(outputs: &[(&str, &str, Option<&str>, Option<&str>)]) -> Run {
+        let mut run = serde_json::from_value::<Run>(serde_json::json!({
+            "id": RunId::mint([7; 12]), "number": 7, "kind": "call", "target": "fidika/flux/fp8",
+            "hub": "https://tensorhub.com", "machine": "m1", "status": Status::Completed,
+            "created_at_ms": 1,
+        }))
+        .unwrap();
+        run.output = (outputs.iter())
+            .map(|(name, media_type, path, error)| OutputItem {
+                id: format!("7/{name}"),
+                name: (*name).to_owned(),
+                index: 0,
+                rev: 1,
+                length: 1,
+                media_type: (*media_type).to_owned(),
+                label: String::new(),
+                status: ItemStatus::Completed,
+                sha256: None,
+                path: path.map(Into::into),
+                export_error: error.map(Into::into),
+            })
+            .collect();
+        run
+    }
+
+    /// Each output kind's terminal state: a landed file, a lost one and a checkpoint end a
+    /// follow (and only a lost file fails it); a file still on its way keeps it going.
+    #[test]
+    fn a_follow_ends_once_each_output_is_landed_lost_or_a_checkpoint() {
+        let image = "image/webp";
+        let cases = [
+            (("image", image, Some("/o/7-image.webp"), None), false, true),
+            (
+                ("image", image, None, Some("its machine ended")),
+                false,
+                false,
+            ),
+            (("fp8", CHECKPOINT, None, None), false, true),
+            (("image", image, None, None), true, false),
+        ];
+        for (output, owes, saves) in cases {
+            let run = run(&[output]);
+            assert_eq!(owed(&run), owes, "{output:?}");
+            assert_eq!(saved(run).is_ok(), saves, "{output:?}");
         }
     }
 }

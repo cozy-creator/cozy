@@ -23,7 +23,7 @@ use axum::{
     response::Response,
 };
 use cozy_proto::{
-    calcifer::{Event, MachineState},
+    calcifer::{CHECKPOINT, Event, MachineState},
     error::Kind,
     ids::{Digest, RunId},
     machine as v1,
@@ -98,6 +98,9 @@ enum Failure {
     Lost(String),
     /// Tried again after a pause, or once the machine changes.
     Again(String),
+    /// The machine's definitive refusal: final once the run has ended (no newer revision can
+    /// come to read instead), tried again before.
+    Refused(String),
 }
 
 impl From<StoreError> for Failure {
@@ -190,6 +193,12 @@ impl Calcifer {
                 Ok(()) => (self.export_item(&run, &item, &mut lanes, wake, changed.as_mut())).await,
                 Err(failure) => Err(failure),
             };
+            let exported = match exported {
+                Err(Failure::Refused(message)) if run.state == RunState::Settled => {
+                    Err(Failure::Lost(format!("the machine refused it ({message})")))
+                }
+                exported => exported,
+            };
             match exported {
                 Ok(()) => pause.reset(),
                 Err(Failure::Superseded) => {}
@@ -215,7 +224,7 @@ impl Calcifer {
                         }
                     }
                 }
-                Err(Failure::Again(message)) => {
+                Err(Failure::Again(message) | Failure::Refused(message)) => {
                     warn!(run = %id, output = %item.name, rev = item.rev, "export waits: {message}");
                     pause.wait(wake, changed.as_mut()).await;
                 }
@@ -421,6 +430,15 @@ pub async fn serve(
     if item.media_type == TREE {
         let message = format!("output {name} of run {number} is a folder: open it on disk");
         return Err(api::refuse(Kind::Conflict, "output_is_a_tree", message));
+    }
+    if item.media_type == CHECKPOINT {
+        let machine = row.machine.as_deref().unwrap_or("its machine");
+        let message = format!(
+            "output {name} of run {number} is a checkpoint: it stays on {machine}, not this computer"
+        );
+        let refusal = api::refuse(Kind::Conflict, "output_is_a_checkpoint", message);
+        let next = format!("cozy run upload {number}#{name} <org/model>");
+        return Err(Refusal(refusal.0.next(next)));
     }
     let (Some(mut file), Some(rev)) = (file, item.exported_rev) else {
         if let Some(reason) = item.export_error {
@@ -1029,13 +1047,18 @@ fn refused(status: Status) -> Ranged {
         Code::NotFound => Ranged::Stop(Failure::Lost(format!(
             "the machine no longer holds it ({message})"
         ))),
-        // The machine moved past this revision: the run's frames bring the newer one.
-        Code::FailedPrecondition
-        | Code::OutOfRange
-        | Code::Unauthenticated
-        | Code::PermissionDenied
-        | Code::InvalidArgument
-        | Code::Unimplemented => Ranged::Stop(Failure::Again(message)),
+        // Definitive: the machine will not serve this read, or holds the output at another
+        // revision (while the run goes on, its frames bring the newer one; once it ended, none
+        // comes).
+        Code::OutOfRange | Code::PermissionDenied | Code::InvalidArgument | Code::Unimplemented => {
+            Ranged::Stop(Failure::Refused(message))
+        }
+        Code::FailedPrecondition if status.message().starts_with("the output is at revision") => {
+            Ranged::Stop(Failure::Refused(message))
+        }
+        // Anything else may pass (its store busy, its key not admitted yet, a restart): asked
+        // again, paced, until it serves or the machine ends, which loses the item.
+        Code::FailedPrecondition | Code::Unauthenticated => Ranged::Stop(Failure::Again(message)),
         _ => Ranged::Again(message),
     }
 }
