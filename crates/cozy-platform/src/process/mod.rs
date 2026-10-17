@@ -193,6 +193,15 @@ pub fn transient(error: &io::Error) -> bool {
 #[cfg(unix)]
 pub use unix::{cloexec_from, inherit_nothing};
 
+/// Whether a process handle kept as a file (a pidfd, a kqueue on its exit) shows its exit now.
+#[cfg(unix)]
+pub fn ended(handle: &impl std::os::fd::AsFd) -> bool {
+    matches!(
+        unix::readable(handle.as_fd(), Some(Duration::ZERO)),
+        Ok(true)
+    )
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Lifetime {
     /// The spawner's: dropping the `Tree` ends it, and on Windows so does the spawner's death.

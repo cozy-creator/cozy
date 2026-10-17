@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io;
-use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::time::Instant;
 
@@ -105,21 +105,9 @@ impl Reader {
     }
 
     fn ended(&self) -> bool {
-        hung_up(&self.lease)
-            || (crate::os::ended(&self.exit) && self.birth.ended().unwrap_or(false))
+        cozy_platform::handles::hung_up(&self.lease)
+            || (cozy_platform::process::ended(&self.exit) && self.birth.ended().unwrap_or(false))
     }
-}
-
-/// The peer end of a lease is closed: the reader released, or its process is gone.
-fn hung_up(lease: &UnixStream) -> bool {
-    let mut poll = libc::pollfd {
-        fd: lease.as_raw_fd(),
-        events: libc::POLLIN | libc::POLLRDHUP,
-        revents: 0,
-    };
-    // SAFETY: one live descriptor, instantaneous observation.
-    let ready = unsafe { libc::poll(&mut poll, 1, 0) } > 0;
-    ready && poll.revents & (libc::POLLHUP | libc::POLLRDHUP | libc::POLLERR) != 0
 }
 
 struct Holding {
