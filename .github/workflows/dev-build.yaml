@@ -7,8 +7,8 @@ name: dev-build
 # SHA256SUMS, stamped dev-<sha>), tensord-<sha> (the manylinux x86_64 tensord Runtime's wheel
 # bundles) and tensorfs-wheel-<sha> (the manylinux x86_64 wheel). Tests get
 # PostgreSQL (AUTHKIT_TEST_DATABASE_URL), the TensorFS wheel installed in a venv
-# (TENSORFS_TEST_PYTHON) when it was built, and a dev Runtime wheel (COZY_TEST_RUNTIME_WHEEL) with
-# runtime_ref. No whole-suite default: `test` is empty unless given.
+# (TENSORFS_TEST_PYTHON) when it was built, and a Runtime wheel (COZY_TEST_RUNTIME_WHEEL): the newest
+# published one, or runtime_ref's. No whole-suite default: `test` is empty unless given.
 on:
   workflow_dispatch:
     inputs:
@@ -25,7 +25,7 @@ on:
         type: string
         default: ''
       runtime_ref:
-        description: cozy-runtime branch, tag or SHA whose wheel tests get as COZY_TEST_RUNTIME_WHEEL; empty for none
+        description: cozy-runtime branch, tag or SHA whose wheel tests get as COZY_TEST_RUNTIME_WHEEL; empty for the newest published
         type: string
         default: ''
       runner:
@@ -153,9 +153,14 @@ jobs:
           ssh-key: ${{ secrets.COZY_RUNTIME_READ_KEY }}
           path: .runtime
       - if: inputs.runtime_ref != ''
+        run: uv build --wheel --out-dir "$RUNNER_TEMP/runtime" .runtime
+      # Without runtime_ref, the Runtime machines install today: the newest published wheel.
+      - if: inputs.test != '' && inputs.runtime_ref == ''
         run: |
-          uv build --wheel --out-dir "$RUNNER_TEMP/runtime" .runtime
-          echo "COZY_TEST_RUNTIME_WHEEL=$(ls "$RUNNER_TEMP"/runtime/cozy_runtime-*.whl)" >> "$GITHUB_ENV"
+          uvx --from pip pip download --quiet --no-deps --only-binary :all: --python-version 3.12 \
+            --platform manylinux_2_28_x86_64 --dest "$RUNNER_TEMP/runtime" cozy-runtime
+      - if: inputs.test != '' || inputs.runtime_ref != ''
+        run: echo "COZY_TEST_RUNTIME_WHEEL=$(ls "$RUNNER_TEMP"/runtime/cozy_runtime-*.whl)" >> "$GITHUB_ENV"
       # ci.yaml's isolation: the product tests' executor containment needs a delegated cgroup subtree.
       - if: inputs.test != ''
         env:
