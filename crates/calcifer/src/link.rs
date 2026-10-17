@@ -5,7 +5,7 @@
 use std::{
     path::Path,
     pin::Pin,
-    sync::{Arc, atomic::Ordering},
+    sync::{Arc, Mutex, atomic::Ordering},
     time::{Duration, Instant},
 };
 
@@ -82,6 +82,8 @@ pub type Live<T> = Pin<Box<dyn Stream<Item = Result<T, LinkError>> + Send>>;
 #[derive(Clone)]
 pub struct Link {
     machine: Machine,
+    /// The upload lanes, kept across objects: a project's many small files reuse connections.
+    lanes: Arc<Mutex<Vec<Option<Bulk>>>>,
 }
 
 impl Link {
@@ -93,12 +95,22 @@ impl Link {
         };
         Ok(Self {
             machine: Machine::new(&endpoint.address, endpoint.pin, auth)?,
+            lanes: Arc::new(Mutex::new(vec![None; LANES])),
         })
     }
 
     /// A bulk lane of its own: HTTP/1.1 connections apart from the control one.
     pub fn bulk(&self) -> Result<Bulk, LinkError> {
         Ok(self.machine.bulk()?)
+    }
+
+    /// Upload lane `i`, connected again when `fresh`.
+    fn lane(&self, i: usize, fresh: bool) -> Option<Bulk> {
+        let mut lanes = self.lanes.lock().unwrap_or_else(|e| e.into_inner());
+        if fresh || lanes[i].is_none() {
+            lanes[i] = self.machine.bulk().ok();
+        }
+        lanes[i].clone()
     }
 
     /// Sends the run (with `spec`) or attaches to it, and answers its state with its events after
@@ -191,16 +203,12 @@ impl Link {
             Some(now.saturating_sub(from) as f64 / seconds)
         };
         progress(from, None);
-        let mut lanes: Vec<Option<Bulk>> = vec![None; LANES];
         loop {
             let before = v1::held_bytes(&held);
             let parts = lanes::parts(&held, length, LANES);
             let sent = lanes::transfer(parts, LANES, |leg| {
-                let lane = &mut lanes[leg.lane];
-                if leg.fresh || lane.is_none() {
-                    *lane = self.bulk().ok();
-                }
-                put(lane.clone(), name.clone(), path.to_owned(), length, leg)
+                let lane = self.lane(leg.lane, leg.fresh);
+                put(lane, name.clone(), path.to_owned(), length, leg)
             });
             let tell = async {
                 let mut tick = tokio::time::interval(TELL_EVERY);
