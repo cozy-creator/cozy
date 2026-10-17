@@ -13,14 +13,11 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tensorfs_core::transport::{
     self, Anonymous, Answer, Ask, Client, Closure, CredentialProvider, Deadline, Ledger,
-    SourcePolicy,
+    SourcePolicy, SAMPLE_SECONDS, STILL_SAMPLES,
 };
 use tokio_stream::StreamExt as _;
 
 pub use hub_client::{types, Op};
-
-/// A Hub call that has made no progress for this long has not answered.
-const QUIET: Duration = Duration::from_secs(30);
 
 /// A run's reasons when its capability does not carry it (th-241's typed refusals).
 pub mod reason {
@@ -142,8 +139,9 @@ fn block<T: Send>(call: impl Future<Output = T> + Send) -> T {
     })
 }
 
-/// HTTPS to one Hub: the public roots and its granted CA, no redirects, and a call ends only
-/// when it stops moving.
+/// HTTPS to one Hub: the public roots and its granted CA, no redirects. A live Hub that is
+/// merely slow is waited for; a dead one is found by TCP keepalive at the transport's own
+/// resolution (probes after its noise floor of silence, a sample apart), as TensorFS's are.
 pub fn http(ca_der: Option<&[u8]>) -> Result<reqwest::Client, Refusal> {
     static CLIENTS: Mutex<Vec<(Option<Vec<u8>>, reqwest::Client)>> = Mutex::new(Vec::new());
     let mut clients = CLIENTS.lock().unwrap();
@@ -169,8 +167,9 @@ pub fn http(ca_der: Option<&[u8]>) -> Result<reqwest::Client, Refusal> {
     let client = reqwest::Client::builder()
         .tls_backend_preconfigured(tls)
         .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(QUIET)
-        .read_timeout(QUIET)
+        .tcp_keepalive(Duration::from_secs_f64(SAMPLE_SECONDS) * STILL_SAMPLES)
+        .tcp_keepalive_interval(Duration::from_secs_f64(SAMPLE_SECONDS))
+        .tcp_keepalive_retries(STILL_SAMPLES)
         .build()
         .map_err(|e| unusable(e.to_string()))?;
     clients.push((ca_der.map(<[u8]>::to_vec), client.clone()));

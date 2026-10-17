@@ -12,6 +12,9 @@ use std::{
     time::Duration,
 };
 
+/// A bounded transport budget per call, never a limit on any work.
+const CALL_BUDGET: Duration = Duration::from_secs(30);
+
 pub struct Hub {
     grant: HubGrant,
     client: hub_client::Client,
@@ -50,6 +53,19 @@ impl Hub {
         self.contact_ms.load(Ordering::Acquire)
     }
 
+    /// One call within the budget.
+    async fn call<T, E: Into<hub_client::Error>>(
+        &self,
+        call: impl std::future::Future<Output = Result<T, E>>,
+    ) -> Result<T, hub_client::Error> {
+        match tokio::time::timeout(CALL_BUDGET, call).await {
+            Ok(answer) => answer.map_err(Into::into),
+            Err(_) => Err(hub_client::Error::Call(
+                "Tensorhub did not answer within its call budget".into(),
+            )),
+        }
+    }
+
     /// An answer, or a refusal the Hub made, is contact; only an unreachable Hub is not.
     fn heard<T>(&self, answer: Result<T, hub_client::Error>) -> Result<T, Refusal> {
         if !matches!(
@@ -71,10 +87,9 @@ impl Hub {
     /// The rental's current authorized keys and their lease.
     pub async fn authorized_keys(&self) -> Result<(Vec<VerifyingKey>, Duration), Refusal> {
         let answer = self
-            .client
-            .get_worker_authorized_keys(&self.grant.worker_id)
+            .call(self.client.get_worker_authorized_keys(&self.grant.worker_id))
             .await;
-        let document = self.heard(answer.map(|a| a.into_inner()).map_err(Into::into))?;
+        let document = self.heard(answer.map(|a| a.into_inner()))?;
         let invalid = || Refusal::Transport("rental authority metadata is invalid".into());
         if document.worker_id != self.grant.worker_id
             || !(1..=3600).contains(&document.lease_seconds)
@@ -110,10 +125,9 @@ impl Hub {
                 .collect(),
         };
         let answer = self
-            .client
-            .report_worker_endpoint(&self.grant.worker_id, &report)
+            .call(self.client.report_worker_endpoint(&self.grant.worker_id, &report))
             .await;
-        match answer.map(drop).map_err(hub_client::Error::from) {
+        match answer.map(drop) {
             Err(hub_client::Error::Hub { status: 404, .. }) => self.heard(Ok(false)),
             answer => self.heard(answer.map(|()| true)),
         }
@@ -125,10 +139,9 @@ impl Hub {
             worker_id: self.grant.worker_id.clone(),
         };
         let answer = self
-            .client
-            .release_worker_rental(&self.grant.worker_id, &request)
+            .call(self.client.release_worker_rental(&self.grant.worker_id, &request))
             .await;
-        self.heard(answer.map(drop).map_err(Into::into))
+        self.heard(answer.map(drop))
     }
 }
 
