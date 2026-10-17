@@ -150,7 +150,11 @@ fn the_grammar_refuses_what_it_cannot_run() {
             "usage",
             2,
         ),
-        (&["run", "play", "1", "--json"], "not_ported", 2),
+        (
+            &["run", "play", "1", "--expires", "0h", "--json"],
+            "play_expires_invalid",
+            2,
+        ),
     ] {
         let out = home.cozy(args);
         assert_eq!(
@@ -408,4 +412,53 @@ fn runs_list_filter_and_show() {
         "{board:?}"
     );
     home.json(["run", "cancel", &second.to_string(), "--json"]);
+}
+
+/// An upload names a weights output the run wrote, on the run's machine; one that wrote none,
+/// or a local destination, is refused before anything is sent.
+#[test]
+fn an_upload_needs_a_weights_output_and_a_hub_destination() {
+    let Some(home) = Home::new() else { return };
+    kept(&home, "sdxl-2.10.0", "fidika/sdxl");
+    let run = home.json([
+        "run",
+        "fidika/sdxl/generate",
+        "a cat",
+        "--on",
+        "any",
+        "--detach",
+        "--json",
+    ]);
+    let number = run["number"].as_u64().unwrap().to_string();
+    for (args, code, exit) in [
+        (
+            vec!["run", "upload", &number, "paul/sdxl-int8", "--json"],
+            "run_output_absent",
+            1,
+        ),
+        (
+            vec![
+                "run",
+                "upload",
+                &format!("{number}#int8"),
+                "paul/sdxl-int8",
+                "--json",
+            ],
+            "run_output_absent",
+            1,
+        ),
+        (
+            vec!["run", "upload", &number, "local/mine", "--json"],
+            "model_local_destination",
+            2,
+        ),
+    ] {
+        let out = home.cozy(&args);
+        assert_eq!(
+            (out.code, out.refusal()["code"].as_str()),
+            (exit, Some(code)),
+            "{args:?}: {out:?}"
+        );
+    }
+    home.json(["run", "cancel", &number, "--json"]);
 }

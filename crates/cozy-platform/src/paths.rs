@@ -44,6 +44,17 @@ impl Home {
         self.root.join("keys")
     }
 
+    /// This controller's Ed25519 signer for the local machine and added machines.
+    pub fn owner_key(&self) -> PathBuf {
+        self.keys().join("owner.pem")
+    }
+
+    /// One rental's key (PKCS#8 PEM, 0600), named by the name it was asked under: a single path
+    /// component.
+    pub fn rental_key(&self, name: &str) -> PathBuf {
+        self.keys().join(format!("rental-{name}.pem"))
+    }
+
     pub fn calcifer(&self) -> PathBuf {
         self.root.join("calcifer")
     }

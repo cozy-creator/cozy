@@ -15,8 +15,10 @@ cozy-cli.workspace = true
 migrate.workspace = true
 
 [dev-dependencies]
+base64.workspace = true
 cozy-platform.workspace = true
 cozy-proto.workspace = true
+ed25519-dalek.workspace = true
 hex.workspace = true
 hub-client = { workspace = true, features = ["testing"] }
 migrate = { workspace = true, features = ["testing"] }
@@ -25,6 +27,7 @@ serde_json.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
+url.workspace = true
 
 [lints]
 workspace = true

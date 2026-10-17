@@ -9,7 +9,10 @@
 //! cursor.
 pub mod api;
 pub mod link;
+pub mod machines;
 pub mod outputs;
+pub mod play;
+mod rentals;
 pub mod serve;
 pub mod store;
 
@@ -65,6 +68,8 @@ pub struct Calcifer {
     /// Told each time a run is settled: what Calcifer owes may now be nothing.
     owed: watch::Sender<()>,
     exports: outputs::Exports,
+    /// Each machine's warm set as it last reported it, and as this Calcifer since sent it.
+    warm: Mutex<HashMap<String, Vec<v1::WarmItem>>>,
 }
 
 /// What a run is doing now, never stored: the latest of each live event.
@@ -95,7 +100,9 @@ impl From<LinkError> for Stop {
             LinkError::Refused { code, message } => Stop::Refused(Reason { code, message }),
             LinkError::Released(message) => Stop::Released(message),
             LinkError::NotFound => Stop::Unreachable("the machine does not know the run".into()),
-            LinkError::Unreachable(message) => Stop::Unreachable(message),
+            LinkError::Unreachable(message) | LinkError::Unauthorized(message) => {
+                Stop::Unreachable(message)
+            }
         }
     }
 }
@@ -128,6 +135,7 @@ impl Calcifer {
             staging: Mutex::default(),
             owed: watch::channel(()).0,
             exports: outputs::Exports::default(),
+            warm: Mutex::default(),
         });
         calcifer.sweep_inputs()?;
         for id in calcifer.store.unsettled()? {
@@ -146,18 +154,31 @@ impl Calcifer {
         &self.store
     }
 
-    /// What Calcifer still owes, which a next Calcifer would resume: every unsettled run's id, and
-    /// each run with an output still to land. A store it cannot read owes its error.
+    /// What Calcifer still owes, which a next Calcifer would resume: every unsettled run's id,
+    /// each run with an output still to land, and every ask of a Hub not yet answered. A store it
+    /// cannot read owes its error.
     pub fn owed(&self) -> Vec<String> {
         let owed = self.store.unsettled().and_then(|ids| {
             let outputs = self.store.exports_owed()?.into_iter();
             let outputs = outputs.map(|(_, number)| format!("outputs of run {number}"));
-            Ok(ids.into_iter().map(String::from).chain(outputs).collect())
+            let asks = self.store.pending_asks()?.into_iter();
+            let asks = asks.map(|ask| format!("the Hub ask {}", ask.key));
+            Ok(ids
+                .into_iter()
+                .map(String::from)
+                .chain(outputs)
+                .chain(asks)
+                .collect())
         });
         owed.unwrap_or_else(|e| vec![e.to_string()])
     }
 
-    /// Changes each time a run is settled, or its outputs have all landed.
+    /// Tells the exit watch that what Calcifer owes may have shrunk.
+    pub(crate) fn owe_less(&self) {
+        self.owed.send_replace(());
+    }
+
+    /// Changes each time a run is settled, its outputs have all landed, or a Hub ask is answered.
     pub fn owed_changed(&self) -> watch::Receiver<()> {
         self.owed.subscribe()
     }
@@ -181,9 +202,9 @@ impl Calcifer {
                 serde_json::to_vec(&submit).expect("serializes")
             ))
         );
-        let (machine, pinned) = match &submit.on {
-            On::Machine(name) => (Some(name.clone()), true),
-            On::Any | On::New(_) => (None, false),
+        let (machine, pinned, wants) = match &submit.on {
+            On::Machine(name) => (Some(name.clone()), true, None),
+            on => (None, false, Some(on.to_string())),
         };
         let new = NewRun {
             id: RunId::mint(random()),
@@ -196,6 +217,7 @@ impl Calcifer {
             out_dir: submit.out.unwrap_or_else(|| self.outputs.clone()),
             warnings: submit.warnings,
             inputs: vec![],
+            wants,
         };
         let (me, key, given) = (self.clone(), key.to_owned(), submit.inputs);
         let (row, fresh) = tokio::task::spawn_blocking(move || {
@@ -280,6 +302,46 @@ impl Calcifer {
             entry.changed.send_replace(());
         }
         Ok(())
+    }
+
+    /// Renames a machine that has not served (its Hub named it); its runs move with it, and the
+    /// old name stays its alias.
+    pub fn rename_machine(&self, old: &str, new: &str) -> Result<bool, Error> {
+        let renamed = self.store.rename_machine(old, new)?;
+        if renamed {
+            let mut machines = lock(&self.machines);
+            for name in [old, new] {
+                if let Some(entry) = machines.remove(name) {
+                    entry.changed.send_replace(());
+                }
+            }
+        }
+        Ok(renamed)
+    }
+
+    /// Adds a warning to an unsettled run.
+    pub fn warn(&self, id: &RunId, warning: &cozy_proto::calcifer::Warning) -> Result<(), Error> {
+        let events = self.store.warn(id.as_str(), warning)?;
+        self.publish(id, events);
+        Ok(())
+    }
+
+    /// Ends a run no machine took, with `reason`.
+    pub fn fail(&self, id: &RunId, reason: Reason) -> Result<(), Error> {
+        let events = self.store.fail(id.as_str(), reason)?;
+        self.publish(id, events);
+        self.wake(id);
+        Ok(())
+    }
+
+    /// The machine's connection, shared with its runs' drivers; none while it has no endpoint.
+    pub fn link(&self, name: &str) -> Result<Option<Link>, String> {
+        self.machine(name).map(|(_, link, _, _)| link)
+    }
+
+    /// Records the warm set the machine reported, which a warm run's item is merged into.
+    pub fn observe_warm(&self, machine: &str, items: Vec<v1::WarmItem>) {
+        lock(&self.warm).insert(machine.to_owned(), items);
     }
 
     /// Places an unplaced run on `machine`.
@@ -496,6 +558,7 @@ impl Calcifer {
             State::Queued => {
                 self.write_inputs(link, run).await?;
                 let _turn = sending.lock().await;
+                self.known_warm(run, machine, link).await?;
                 let spec = spec()?;
                 if !self.store.mark_sent(id, machine)? {
                     return Ok(());
@@ -521,6 +584,7 @@ impl Calcifer {
                     Err(LinkError::NotFound) if run.state == State::Sent => {
                         self.write_inputs(link, run).await?;
                         let _turn = sending.lock().await;
+                        self.known_warm(run, machine, link).await?;
                         link.run(id, 0, Some(spec()?)).await?
                     }
                     attached => attached?,
@@ -686,6 +750,24 @@ impl Calcifer {
         Ok(())
     }
 
+    /// Reads the machine's warm set before a warm run's set is merged into it, if none was seen
+    /// yet.
+    async fn known_warm(&self, run: &RunRow, machine: &str, link: &Link) -> Result<(), Stop> {
+        let merges = v1::RunSpec::decode(run.spec.as_slice())
+            .is_ok_and(|spec| spec.kind == v1::RunKind::Warm as i32 && spec.set.is_some());
+        if !merges || lock(&self.warm).contains_key(machine) {
+            return Ok(());
+        }
+        let frame = link
+            .status(false)
+            .await?
+            .message()
+            .await
+            .map_err(link::classify)?;
+        self.observe_warm(machine, frame.map(|f| f.warm).unwrap_or_default());
+        Ok(())
+    }
+
     /// The spec as the machine is sent it: the run's Hub origin, unless the spec names one.
     fn finish_spec(&self, run: &RunRow, spec: &mut v1::RunSpec) {
         if spec.hub.is_none() && !run.hub.is_empty() {
@@ -693,6 +775,11 @@ impl Calcifer {
                 origin: run.hub.clone(),
                 ..Default::default()
             });
+        }
+        if let Some(machine) = &run.machine
+            && let Some(warm) = lock(&self.warm).get_mut(machine)
+        {
+            machines::merge_warm(warm, spec);
         }
     }
 

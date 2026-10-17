@@ -7,6 +7,8 @@ use cozy_proto::error::Error;
 use crate::Context;
 
 mod catalog;
+mod machine;
+mod quantize;
 pub(crate) mod refs;
 mod releases;
 
@@ -73,7 +75,11 @@ pub(crate) struct Family {
 }
 
 #[derive(clap::Args, Debug)]
-pub(crate) struct List {}
+pub(crate) struct List {
+    /// Only this machine; default: every machine.
+    #[arg(long, value_name = "MACHINE")]
+    on: Option<String>,
+}
 
 #[derive(clap::Args, Debug)]
 pub(crate) struct Download {
@@ -82,6 +88,11 @@ pub(crate) struct Download {
     /// Keep it on the machine under this name.
     #[arg(value_name = "local/ALIAS")]
     alias: Option<String>,
+    #[command(flatten)]
+    placement: crate::run::Placement,
+    /// Print the run and return at once instead of following it.
+    #[arg(long)]
+    detach: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -93,6 +104,11 @@ pub(crate) struct Upload {
     /// A reviewed TensorFS profile to convert with; repeat to compose one model.
     #[arg(long = "source-profile", value_name = "PROFILE")]
     profiles: Vec<String>,
+    #[command(flatten)]
+    placement: crate::run::Placement,
+    /// Print the run and return at once instead of following it.
+    #[arg(long)]
+    detach: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -111,9 +127,14 @@ pub(crate) struct Quantize {
     /// Write the nvfp4 lane (block-scaled FP4).
     #[arg(long)]
     nvfp4: bool,
-    /// The package (org/name) whose quantizer runs; default: the one the machine holds.
+    /// The package (org/name[@release]) whose quantizer runs; default: the one the machine holds.
     #[arg(long)]
     package: Option<String>,
+    #[command(flatten)]
+    placement: crate::run::Placement,
+    /// Print the run and return at once instead of following it.
+    #[arg(long)]
+    detach: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -173,9 +194,9 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
         Verb::Retarget(args) => releases::retarget(ctx, args).await,
         Verb::Yank(args) => releases::yank(ctx, args).await,
         Verb::Delete(args) => releases::delete(ctx, args).await,
-        Verb::List(_) => Err(crate::not_ported("model list")),
-        Verb::Download(_) => Err(crate::not_ported("model download")),
-        Verb::Upload(_) => Err(crate::not_ported("model upload")),
-        Verb::Quantize(_) => Err(crate::not_ported("model quantize")),
+        Verb::List(args) => machine::list(ctx, args).await,
+        Verb::Download(args) => machine::download(ctx, args).await,
+        Verb::Upload(args) => machine::upload(ctx, args).await,
+        Verb::Quantize(args) => quantize::quantize(ctx, args).await,
     }
 }

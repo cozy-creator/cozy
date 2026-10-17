@@ -3,12 +3,13 @@ use std::{path::PathBuf, process::ExitCode};
 
 use cozy_proto::{
     calcifer::{On, SubmitRun},
+    config::Hub,
     error::{Error, Kind},
 };
 
 use crate::{Context, output};
 use bind::Terms;
-use catalog::Card;
+pub(crate) use catalog::Card;
 pub(crate) use follow::{exit_code, follow, submit};
 use interface::{Callable, Interface};
 use target::Target;
@@ -20,9 +21,11 @@ mod describe;
 mod follow;
 pub(crate) mod interface;
 mod list;
+mod play;
 mod show;
 mod spec;
 mod target;
+mod upload;
 
 #[derive(clap::Args, Debug)]
 #[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
@@ -187,8 +190,12 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
             follow::record(ctx, &run);
             Ok(ExitCode::SUCCESS)
         }
-        Some(Verb::Play { .. }) => Err(crate::not_ported("run play")),
-        Some(Verb::Upload { .. }) => Err(crate::not_ported("run upload")),
+        Some(Verb::Play {
+            run,
+            output,
+            expires,
+        }) => play::exec(ctx, &run, &output, &expires).await,
+        Some(Verb::Upload { run, model, detach }) => upload::exec(ctx, &run, &model, detach).await,
         None => run(ctx, *args.run).await,
     }
 }
@@ -209,7 +216,7 @@ async fn run(ctx: &Context, args: RunArgs) -> Result<ExitCode, Error> {
         }
     };
     let hub = ctx.hub()?;
-    let (mut card, read) = catalog::card(ctx, &hub, &package, release.as_deref(), false).await?;
+    let (card, read) = catalog::card(ctx, &hub, &package, release.as_deref(), false).await?;
     let Some(function) = function else {
         functions(ctx, &package, &card);
         return Ok(ExitCode::SUCCESS);
@@ -226,6 +233,71 @@ async fn run(ctx: &Context, args: RunArgs) -> Result<ExitCode, Error> {
         }
         return Ok(ExitCode::SUCCESS);
     }
+    invoke(
+        ctx,
+        &package,
+        release.as_deref(),
+        &function,
+        (card, read),
+        args,
+        cwd,
+    )
+    .await
+}
+
+/// `cozy run <package>/<function>[@release] <inputs…> --on …` for another verb: `model
+/// quantize` runs a package's conversion this way.
+pub(crate) async fn call(
+    ctx: &Context,
+    package: &str,
+    release: Option<&str>,
+    function: &str,
+    inputs: Vec<String>,
+    placement: &Placement,
+    detach: bool,
+) -> Result<ExitCode, Error> {
+    let cwd = std::env::current_dir()
+        .map_err(|e| Error::new(Kind::Internal, "cwd", format!("the working directory: {e}")))?;
+    let card = catalog::card(ctx, &ctx.hub()?, package, release, false).await?;
+    let args = RunArgs {
+        target: None,
+        inputs,
+        placement: placement.clone(),
+        gpus: None,
+        bits: None,
+        input_file: None,
+        assets: vec![],
+        loras: vec![],
+        out: None,
+        detach,
+        warm: None,
+        describe: false,
+        idempotency_key: None,
+    };
+    invoke(ctx, package, release, function, card, args, cwd).await
+}
+
+/// A release's card: the kept one, else the Hub's, kept from then on.
+pub(crate) async fn card(
+    ctx: &Context,
+    hub: &Hub,
+    package: &str,
+    release: Option<&str>,
+) -> Result<Card, Error> {
+    Ok(catalog::card(ctx, hub, package, release, false).await?.0)
+}
+
+/// Binds the run's inputs, submits it and follows it.
+async fn invoke(
+    ctx: &Context,
+    package: &str,
+    release: Option<&str>,
+    function: &str,
+    (mut card, read): (Card, bool),
+    args: RunArgs,
+    cwd: PathBuf,
+) -> Result<ExitCode, Error> {
+    let hub = ctx.hub()?;
     let terms = Terms {
         inputs: args.inputs,
         input_file: args.input_file,
@@ -247,11 +319,11 @@ async fn run(ctx: &Context, args: RunArgs) -> Result<ExitCode, Error> {
                 "--gpus applies to a run, not to --warm",
             ));
         }
-        let callable = callable(&package, &card.interface, &function)?;
+        let callable = callable(package, &card.interface, function)?;
         let models = bind::warm_choices(callable, &terms)?;
         let call = spec::Call {
-            package: &package,
-            release: release.as_deref(),
+            package,
+            release,
             callable,
             gpus: 0,
             bits,
@@ -259,27 +331,27 @@ async fn run(ctx: &Context, args: RunArgs) -> Result<ExitCode, Error> {
         let submission = call.submission(on, &hub.origin, &call.warm(level, &models)?, None, None);
         return send(ctx, submission, &terms.key, args.detach).await;
     }
-    let mut bound = bind(ctx, &package, &card, &function, &terms)?;
+    let mut bound = bind(ctx, package, &card, function, &terms)?;
     // A kept card that lacks a field the run names may be older than the release the machine
     // runs: read the newest once, and bind again.
     if release.is_none()
         && !read
         && !bound.1.ignored.is_empty()
-        && let Ok((newer, _)) = catalog::card(ctx, &hub, &package, None, true).await
+        && let Ok((newer, _)) = catalog::card(ctx, &hub, package, None, true).await
         && newer.release != card.release
     {
         card = newer;
-        bound = bind(ctx, &package, &card, &function, &terms)?;
+        bound = bind(ctx, package, &card, function, &terms)?;
     }
     let (target, bound) = bound;
     if let Some(warning) = bound.warning(&target) {
         output::warn(ctx, &warning);
     }
-    let callable = callable(&package, &card.interface, &function)?;
+    let callable = callable(package, &card.interface, function)?;
     let gpus = args.gpus.unwrap_or(0);
     let call = spec::Call {
-        package: &package,
-        release: release.as_deref(),
+        package,
+        release,
         callable,
         gpus,
         bits,

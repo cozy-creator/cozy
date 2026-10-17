@@ -21,7 +21,7 @@ use axum::{
 };
 use cozy_platform::lock::{Kind as LockKind, LockFile};
 use cozy_proto::{
-    calcifer::{Down, Event, On, Run, RunList, Status, SubmitRun, Submitted},
+    calcifer::{Down, Event, Run, RunList, Status, SubmitRun, Submitted},
     error::{Envelope, Error, Kind},
     ids::RunId,
 };
@@ -33,6 +33,7 @@ use tracing::{info, warn};
 
 use crate::{
     Calcifer,
+    machines::{self, Machines},
     serve::Peer,
     store::{RunFilter, RunRow, State as RunState, StoreError},
 };
@@ -43,6 +44,7 @@ const MAX_BODY: usize = 8 << 20;
 /// What every handler shares.
 pub struct Api {
     pub calcifer: Arc<Calcifer>,
+    pub machines: Arc<Machines>,
     /// The three spellings of this server's own `host:port`.
     hosts: [String; 3],
     bearer: [u8; 32],
@@ -53,9 +55,15 @@ pub struct Api {
 }
 
 impl Api {
-    pub fn new(calcifer: Arc<Calcifer>, port: u16, token: &str) -> Arc<Self> {
+    pub fn new(
+        calcifer: Arc<Calcifer>,
+        machines: Arc<Machines>,
+        port: u16,
+        token: &str,
+    ) -> Arc<Self> {
         Arc::new(Self {
             calcifer,
+            machines,
             hosts: [
                 format!("127.0.0.1:{port}"),
                 format!("localhost:{port}"),
@@ -113,7 +121,15 @@ pub fn router(api: Arc<Api>) -> Router {
         .route("/v1/runs/{id}/cancel", post(cancel))
         .route("/v1/runs/{id}/events", get(events))
         .route("/v1/runs/{id}/outputs/{name}", get(crate::outputs::serve))
+        .route("/v1/runs/{id}/play", get(crate::play::play))
         .route("/v1/down", post(down))
+        .route("/v1/machines", get(machines::list).post(machines::create))
+        .route(
+            "/v1/machines/{name}",
+            get(machines::show).delete(machines::end),
+        )
+        .route("/v1/machines/{name}/keepalive", post(machines::keepalive))
+        .route("/v1/machines/{name}/logs/{log}", get(machines::logs))
         // Routes go above this line: the bearer and the admission gate guard only those.
         .route_layer(middleware::from_fn_with_state(api.clone(), admit))
         .fallback(unknown_route)
@@ -368,14 +384,6 @@ async fn submit(
     body: Result<Bytes, BytesRejection>,
 ) -> Result<(StatusCode, Json<Submitted>), Refusal> {
     let submit: SubmitRun = parse(&body?)?;
-    if submit.on == On::New(None) {
-        return Err(refuse(
-            Kind::Unavailable,
-            "placement_unavailable",
-            "`--on new` needs the Hub's placement, which this Calcifer cannot ask yet",
-        )
-        .remedy("name a machine with `--on <machine>`, or queue for one with `--on any`"));
-    }
     let submitted = api.calcifer.submit(&key, submit).await?;
     let status = if submitted.replay {
         StatusCode::OK

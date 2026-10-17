@@ -35,6 +35,7 @@ use tracing::{error, info, warn};
 use crate::{
     Calcifer,
     api::{self, Api},
+    machines::Machines,
 };
 
 /// Why `serve` returned.
@@ -144,7 +145,8 @@ pub async fn serve(loaded: &Loaded) -> Result<Stopped, Error> {
     let mut token = [0; 32];
     getrandom::fill(&mut token).expect("the OS provides randomness");
     let token = hex::encode(token);
-    let api = Api::new(calcifer.clone(), address.port(), &token);
+    let machines = Machines::start(calcifer.clone(), home.clone(), loaded.config.hubs());
+    let api = Api::new(calcifer.clone(), machines.clone(), address.port(), &token);
     // Kept here too, so `open` always has a sender while Calcifer serves.
     let (count, mut open) = watch::channel(0);
     let count = Arc::new(count);
@@ -171,6 +173,7 @@ pub async fn serve(loaded: &Loaded) -> Result<Stopped, Error> {
     if let Err(e) = held.publish(&record) {
         api.stop();
         let _ = server.await;
+        machines.close();
         calcifer.close();
         return Err(failed(Error::new(
             Kind::Internal,
@@ -200,6 +203,7 @@ pub async fn serve(loaded: &Loaded) -> Result<Stopped, Error> {
     if let Ok(Err(e)) = server.await {
         warn!("the API server ended: {e}");
     }
+    machines.close();
     calcifer.close();
     drop((held, count));
     info!(?why, "Calcifer stopped");

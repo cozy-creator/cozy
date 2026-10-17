@@ -787,9 +787,6 @@ func (s *Server) resolvePendingServing(ctx context.Context, sub Submission, out 
 	if problem != nil {
 		return out, nil, problem
 	}
-	if len(entrypoint.Models) > 0 && len(out.Models) == 0 {
-		return out, nil, exit.Named(exit.Validation, "package_model_binding_required", "%s/%s requires exact model selections", sub.Package, sub.Function)
-	}
 	if problem := validateInputs(entrypoint, &out); problem != nil {
 		return out, nil, problem
 	}
