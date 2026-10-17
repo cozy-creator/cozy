@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 use sigstore_verify::{
     VerificationPolicy, VerificationResult,
     trust_root::{SigstoreInstance, TrustedRoot},
-    types::{Artifact, Bundle},
+    types::Bundle,
 };
 
 use crate::Context;
@@ -239,7 +239,11 @@ async fn attested(http: &reqwest::Client, url: &str, archive: &[u8]) -> Result<S
 }
 
 /// The signer of the first bundle in `lines` that attests `artifact` as this repo's release workflow.
-fn signer(bundles: &str, lines: &str, artifact: Artifact<'_>) -> Result<String, Error> {
+fn signer(
+    bundles: &str,
+    lines: &str,
+    artifact: sigstore_verify::types::Artifact<'_>,
+) -> Result<String, Error> {
     let root = TrustedRoot::from_embedded(SigstoreInstance::PublicGood)
         .map_err(|e| Error::new(Kind::Internal, "sigstore_root", e.to_string()))?;
     let policy = VerificationPolicy::any_identity().require_issuer(ISSUER);
