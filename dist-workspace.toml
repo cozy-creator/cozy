@@ -3,10 +3,6 @@ members = ["cargo:."]
 
 [dist]
 cargo-dist-version = "0.33.0"
-# Until the cutover, a Rust release never takes GitHub's "latest" mark from the Go CLI's (Go's install.sh
-# reads releases/latest). dist cannot say so, so release.yml's `gh release create` carries --latest=false
-# by hand; at the cutover drop this line and run `dist generate`.
-allow-dirty = ["ci"]
 ci = "github"
 installers = ["shell", "powershell", "homebrew"]
 targets = [
