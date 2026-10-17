@@ -237,6 +237,43 @@ fn digest64(value: &str) -> Option<String> {
     (lower.len() == 64 && lower.bytes().all(|b| b.is_ascii_hexdigit())).then(|| lower.to_string())
 }
 
+/// The full commit `reference` (a branch, a tag or a commit) names now in a HuggingFace
+/// repository: one metadata read, through the provider's fence and credential.
+pub fn huggingface_commit(
+    org: &str,
+    repo: &str,
+    reference: &str,
+    endpoints: &Endpoints,
+    credentials: &dyn CredentialProvider,
+    deadline: Deadline,
+) -> Result<String> {
+    if !hf_name(org) || !hf_name(repo) {
+        return refuse(Code::SOURCE_NOT_ALLOWED, "hf source names are outside the grammar");
+    }
+    let uri = SourceUri::HuggingFace {
+        org: org.into(),
+        repo: repo.into(),
+        revision: String::new(),
+    };
+    let escaped: String = reference
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' | b'-' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect();
+    let url = format!("{}/api/models/{org}/{repo}/revision/{escaped}", endpoints.base(&uri));
+    let (body, _) = api_get(&url, &endpoints.policy(&uri), credentials, API_DOC_MAX_BYTES, deadline, &Ledger::new())?;
+    let document = jcs::parse(&body, API_DOC_MAX_BYTES as usize)?;
+    match json_str(&document, "sha") {
+        Some(sha) if sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_hexdigit()) => Ok(sha.to_ascii_lowercase()),
+        _ => refuse(
+            Code::MISSING_FIELD,
+            format!("HuggingFace names no full commit for hf://{org}/{repo}@{reference}"),
+        ),
+    }
+}
+
 /// `unnameable`, when given, collects tensor carriers whose paths are outside the member
 /// grammar instead of refusing the listing: the caller names its carriers exactly, so a
 /// file no selection can name cannot shrink it.

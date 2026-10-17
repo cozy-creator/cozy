@@ -1,5 +1,5 @@
 //! `cozy model download|list` on a real machine: TensorD 0.6.0 from the cozy-runtime wheel
-//! (COZY_TEST_TENSORD) added to this home's Calcifer. The machine makes the model from a tiny
+//! (COZY_TEST_TENSORD, the workspace's own build) added to this home's Calcifer. The machine makes the model from a tiny
 //! public Hugging Face repository; no weight byte lands in the controller's home.
 #![cfg(unix)]
 mod common;
@@ -51,12 +51,27 @@ fn download_makes_a_provider_source_on_the_machine() {
     let missing = home.cozy(["--json", "model", "list", "--on", "nowhere"]);
     assert_eq!((missing.code, missing.refusal()["code"].as_str()), (1, Some("machine_not_found")), "{missing:?}");
 
-    // An unpinned source is the machine's refusal, which names the pinned grammar.
-    let unpinned = home.cozy(["--json", "model", "download", "hf://hf-internal-testing/tiny-random-gpt2", "local/x", "--on", "m1"]);
-    assert_eq!(unpinned.code, 1, "{unpinned:?}");
-    let failed = end(&unpinned);
+    // The machine pins a moving revision and reads a pasted URL as its source; the result
+    // names the commit. Anything ambiguous is the machine's refusal, naming the spellings.
+    let pinned = |resolved: &Value| {
+        let commit = resolved.as_str().and_then(|r| r.strip_prefix("hf://hf-internal-testing/tiny-random-gpt2@"));
+        commit.is_some_and(|c| c.len() >= 40 && c[..40].bytes().all(|b| b.is_ascii_hexdigit()))
+    };
+    for (source, alias) in [
+        ("hf://hf-internal-testing/tiny-random-gpt2", "local/main"),
+        ("https://huggingface.co/hf-internal-testing/tiny-random-gpt2/blob/main/model.safetensors", "local/pasted"),
+    ] {
+        let out = home.cozy(["--json", "model", "download", source, alias, "--on", "m1"]);
+        let ended = end(&out);
+        assert_eq!(ended["type"], "run.completed", "{source}: {out:?}");
+        let resolved = &ended["run"]["result"]["models"][0]["resolved"];
+        assert!(pinned(resolved), "{source} → {resolved}");
+    }
+    let vague = home.cozy(["--json", "model", "download", "https://huggingface.co/hf-internal-testing", "local/x", "--on", "m1"]);
+    assert_eq!(vague.code, 1, "{vague:?}");
+    let failed = end(&vague);
     assert_eq!(failed["run"]["reason"]["code"], "model_source_failed", "{failed}");
-    assert!(failed["run"]["reason"]["message"].as_str().unwrap().contains('@'), "{failed}");
+    assert!(failed["run"]["reason"]["message"].as_str().unwrap().contains("hf://"), "{failed}");
 
     // The 454 KB model never passed through this computer's home.
     let state = |path: &std::path::Path| {

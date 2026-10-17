@@ -1348,25 +1348,23 @@ fn make_source(
     cancellation: Option<PullCancellation>,
     progress: &(dyn Fn(&str, u64, u64) + Sync),
 ) -> Result<tensorfs_core::source_model::Made, Failure> {
+    let access = |token: &str| tensorfs_core::source_model::Access {
+        credential: if token.is_empty() { String::new() } else { format!("bearer {token}") },
+        endpoints: Default::default(),
+    };
+    // Named by its pinned spelling: a moving revision is read again, a pasted URL is its source.
+    let source = &tensorfs_core::source_model::pin(source, &access(&providers.huggingface))
+        .map_err(|e| refused("model_source_failed", e))?;
     let mut sorted = profiles.to_vec();
     sorted.sort();
     let identity =
         serde_json_canonicalizer::to_vec(&json!(["cozy.machine-source-model/1", source, sorted]))
             .map_err(|e| io_failure(io::Error::other(e)))?;
     let name = format!("source-{}", &sha256::hex_digest(&identity)[..40]);
-    let token = if source.starts_with("civitai://") {
-        &providers.civitai
-    } else {
-        &providers.huggingface
-    };
-    let access = tensorfs_core::source_model::Access {
-        credential: if token.is_empty() {
-            String::new()
-        } else {
-            format!("bearer {token}")
-        },
-        endpoints: Default::default(),
-    };
+    let access = access(match source.starts_with("civitai://") {
+        true => &providers.civitai,
+        false => &providers.huggingface,
+    });
     tensorfs_core::source_model::make(
         store,
         &tensorfs_core::source_model::Request {
