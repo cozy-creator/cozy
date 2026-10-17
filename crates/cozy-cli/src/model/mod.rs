@@ -75,7 +75,11 @@ pub(crate) struct Family {
 }
 
 #[derive(clap::Args, Debug)]
-pub(crate) struct List {}
+pub(crate) struct List {
+    /// Only this machine; default: every machine.
+    #[arg(long, value_name = "MACHINE")]
+    on: Option<String>,
+}
 
 #[derive(clap::Args, Debug)]
 pub(crate) struct Download {
@@ -190,7 +194,7 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
         Verb::Retarget(args) => releases::retarget(ctx, args).await,
         Verb::Yank(args) => releases::yank(ctx, args).await,
         Verb::Delete(args) => releases::delete(ctx, args).await,
-        Verb::List(_) => Err(crate::not_ported("model list")),
+        Verb::List(args) => machine::list(ctx, args).await,
         Verb::Download(args) => machine::download(ctx, args).await,
         Verb::Upload(args) => machine::upload(ctx, args).await,
         Verb::Quantize(args) => quantize::quantize(ctx, args).await,
