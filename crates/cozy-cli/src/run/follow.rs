@@ -6,12 +6,14 @@
 use std::{collections::HashSet, fmt::Write as _, process::ExitCode, time::Duration};
 
 use cozy_proto::{
-    calcifer::{Event, OutputItem, Progress, Run, Status, SubmitRun, Submitted},
+    calcifer::{
+        Event, Machine, MachineState, OutputItem, Progress, Run, Status, SubmitRun, Submitted,
+    },
     error::{Error, Kind},
 };
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 
-use crate::{Context, output};
+use crate::{Context, calcifer_client::Client, output};
 
 /// Submits under `key`, or a fresh one: one key names one submission forever.
 pub(crate) async fn submit(
@@ -123,8 +125,16 @@ async fn watch(ctx: &Context, run: Run, events_out: bool) -> Result<(Run, bool),
     tokio::pin!(interrupt);
     let id = run.id.clone();
     let mut terminal = None;
+    // The machine the run was placed on, until it is known whether its Hub placed it far away.
+    let mut placing = None;
     loop {
         tokio::select! {
+            () = tokio::time::sleep(crate::machine::FOLLOW), if placing.is_some() => {
+                let name: String = placing.take().unwrap_or_default();
+                if !placed(&calcifer, &view, &name).await {
+                    placing = Some(name);
+                }
+            }
             _ = &mut interrupt => {
                 view.done();
                 let run = calcifer.run(id.as_str()).await?;
@@ -158,10 +168,32 @@ async fn watch(ctx: &Context, run: Run, events_out: bool) -> Result<(Run, bool),
                 }
                 Some(Ok(event)) if events_out => output::ndjson(&event),
                 Some(Ok(_)) if ctx.json => {}
-                Some(Ok(event)) => view.on(&event),
+                Some(Ok(event)) => {
+                    let before = view.machine.clone();
+                    view.on(&event);
+                    if view.machine != before {
+                        placing.clone_from(&view.machine);
+                    }
+                }
             }
         }
     }
+}
+
+/// Says why the Hub placed the run's rental off this continent, once it has: true when nothing
+/// more will be said (said, unreadable, or done booting).
+async fn placed(calcifer: &Client, view: &View, name: &str) -> bool {
+    let Ok(path) = crate::machine::route(name) else {
+        return true;
+    };
+    let Ok(machine) = calcifer.get::<Machine>(&path).await else {
+        return true;
+    };
+    if let Some(note) = crate::machine::placement_note(&machine) {
+        view.line(&format!("  {note}"));
+        return true;
+    }
+    machine.state != MachineState::Booting
 }
 
 pub(crate) fn settled(run: &Run) -> bool {

@@ -17,6 +17,7 @@ pub(crate) mod live;
 mod rent;
 
 pub(crate) use list::status_fields;
+pub(crate) use rent::placement_note;
 
 #[derive(clap::Args, Debug)]
 pub struct Args {
@@ -113,7 +114,7 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
 }
 
 /// How often a command following a machine re-reads Calcifer, which answers from memory.
-const FOLLOW: Duration = Duration::from_secs(1);
+pub(crate) const FOLLOW: Duration = Duration::from_secs(1);
 
 /// The route of one machine, by name, alias or rental id: `[A-Za-z0-9][A-Za-z0-9._-]{0,127}`.
 pub(crate) fn route(name: &str) -> Result<String, Error> {

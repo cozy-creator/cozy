@@ -73,6 +73,11 @@ pub async fn list(ctx: &Context, once: bool) -> Result<ExitCode, Error> {
     for note in live().filter_map(provider_stopped) {
         println!("{note}");
     }
+    for m in live() {
+        if let Some(note) = m.rental.as_ref().and_then(|r| r.placement_note.as_ref()) {
+            println!("{}: {note}", m.name);
+        }
+    }
     if !rentals.is_empty() {
         println!("{IDLE_RULE}");
     }
@@ -149,6 +154,9 @@ pub async fn show(ctx: &Context, name: &str) -> Result<ExitCode, Error> {
         }
         if let Some(failure) = &r.failure {
             record = record.field("failure", failure);
+        }
+        if let Some(note) = &r.placement_note {
+            record = record.field("placement", note);
         }
     }
     if let Some(reason) = &m.reason {

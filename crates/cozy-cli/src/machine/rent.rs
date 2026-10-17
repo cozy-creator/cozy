@@ -60,6 +60,9 @@ pub async fn exec(ctx: &Context, rent: Rent) -> Result<ExitCode, Error> {
         answer => answer?,
     };
     output::say(ctx, &price(&sku, &rented.quote));
+    let noted = placement_note(&rented.machine)
+        .inspect(|note| output::say(ctx, note))
+        .is_some();
     if let Some(asked) = rent.disk_gb.filter(|asked| rented.quote.disk_gb < *asked) {
         output::warn(
             ctx,
@@ -74,7 +77,7 @@ pub async fn exec(ctx: &Context, rent: Rent) -> Result<ExitCode, Error> {
     }
     let machine = match rent.detach {
         true => rented.machine.clone(),
-        false => match follow(ctx, rented.machine.clone()).await? {
+        false => match follow(ctx, rented.machine.clone(), noted).await? {
             Some(machine) => machine,
             None => return Ok(ExitCode::SUCCESS),
         },
@@ -116,6 +119,12 @@ pub async fn exec(ctx: &Context, rent: Rent) -> Result<ExitCode, Error> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// Why the Hub placed a rental off the requester's continent, when it did. It decides after it
+/// accepts the order, so a follower says it once it appears.
+pub(crate) fn placement_note(machine: &Machine) -> Option<&str> {
+    machine.rental.as_ref()?.placement_note.as_deref()
+}
+
 /// The price the order is held to: per hour and for the Hub's assumed hours and download.
 fn price(sku: &str, q: &Quote) -> String {
     let mut line = format!(
@@ -137,13 +146,21 @@ fn price(sku: &str, q: &Quote) -> String {
 
 /// Follows the boot until the machine is ready, saying the Hub's phase as it changes. Ctrl-C stops
 /// watching only (`None`): the order goes on in Calcifer.
-async fn follow(ctx: &Context, booting: Machine) -> Result<Option<Machine>, Error> {
+async fn follow(
+    ctx: &Context,
+    booting: Machine,
+    mut noted: bool,
+) -> Result<Option<Machine>, Error> {
     let calcifer = ctx.calcifer().await?;
     // A rental id never changes; the Hub may rename the machine while it boots.
     let path = route(booting.rental_id.as_deref().unwrap_or(&booting.name))?;
     let mut said = String::new();
     let mut machine = booting;
     loop {
+        if !noted && let Some(note) = placement_note(&machine) {
+            output::say(ctx, note);
+            noted = true;
+        }
         match machine.state {
             MachineState::Ready => return Ok(Some(machine)),
             MachineState::Booting => {

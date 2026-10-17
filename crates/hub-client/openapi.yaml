@@ -864,11 +864,23 @@ paths:
       parameters:
       - {$ref: '#/components/parameters/Org'}
       - {$ref: '#/components/parameters/Name'}
+      - name: If-None-Match
+        in: header
+        schema: {type: string}
+        description: The ETag of a card already held; the Hub answers 304 while it is current.
       responses:
         '200':
           description: The package card.
+          headers:
+            ETag:
+              description: Moves when a publish or a yank changes the latest release or the release list.
+              schema: {type: string}
           content:
             application/json: {schema: {$ref: '#/components/schemas/PackageCard'}}
+        '304':
+          description: The held card is current.
+          headers:
+            ETag: {schema: {type: string}}
         4XX: {$ref: '#/components/responses/Error'}
         5XX: {$ref: '#/components/responses/Error'}
 
@@ -2510,6 +2522,9 @@ components:
       - container_disk_gb
       - created_at
       properties:
+        placement_note:
+          type: string
+          description: The rental runs off the continent its request came from, because nothing there fit.
         development: {type: boolean}
         ssh_address: {type: string}
         rental_id: {type: string}
@@ -2754,6 +2769,8 @@ components:
         accelerator_model: {type: string}
         base_worker_profile: {type: string}
         compute_capability: {type: string}
+        cpu_arch: {type: string, description: 'The host CPU: amd64 or arm64.'}
+        memory_class: {type: string, description: 'How the GPU reaches host memory: discrete, coherent or unified.'}
         vram_gb: {type: integer, format: int64}
         widths: {type: array, items: {$ref: '#/components/schemas/RentalSkuWidth'}}
         accelerator_count: {type: integer, format: int64}
@@ -2841,6 +2858,8 @@ components:
         accelerator_model: {type: string, description: 'The GPU model, or CPU.'}
         base_worker_profile: {type: string}
         compute_capability: {type: string, description: major.minor; empty for the CPU product.}
+        cpu_arch: {type: string, description: 'The host CPU: amd64 or arm64.'}
+        memory_class: {type: string, description: 'How the GPU reaches host memory: discrete, coherent or unified.'}
         vram_gb: {type: integer, format: int64}
         widths:
           type: array

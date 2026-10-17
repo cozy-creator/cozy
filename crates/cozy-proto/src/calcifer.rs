@@ -481,6 +481,9 @@ pub struct Rental {
     /// The Hub's failure code, for a rental that failed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure: Option<String>,
+    /// Why it runs off the requester's continent: nothing nearer fit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement_note: Option<String>,
 }
 
 /// A machine's `Status`, as it last sent it.

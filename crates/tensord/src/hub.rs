@@ -440,7 +440,7 @@ impl Catalog {
 
     /// A package and its releases.
     pub fn package(&self, org: &str, name: &str) -> Result<types::PackageCard, hub_client::Error> {
-        block(async { Ok(self.hub.get_package(org, name).await?.into_inner()) })
+        block(async { Ok(self.hub.get_package(org, name, None).await?.into_inner()) })
     }
 
     /// The exact files of one committed release (`python_version` picks its project wheel):
