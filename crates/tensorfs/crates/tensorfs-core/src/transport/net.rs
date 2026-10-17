@@ -9,7 +9,7 @@
 
 use std::future::Future;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -25,16 +25,28 @@ use super::ledger::Ledger;
 use super::policy::CheckedUrl;
 use crate::err::{refuse, Code, Refusal, Result};
 
-/// Threads the runtime polls sockets and timers on, whatever the number of requests.
+/// Threads its own runtime polls sockets and timers on, whatever the number of requests.
 const NET_THREADS: usize = 2;
 
-/// The process's one network runtime. A runtime that cannot start (its threads refused) is
-/// asked for again by the next request, never remembered as broken.
-pub(crate) fn runtime() -> Result<Arc<tokio::runtime::Runtime>> {
-    static RUNTIME: Mutex<Option<Arc<tokio::runtime::Runtime>>> = Mutex::new(None);
+/// The runtime its host process lent it ([`use_runtime`]: TensorD's).
+static HOST: OnceLock<tokio::runtime::Handle> = OnceLock::new();
+
+/// Runs every later request on `runtime`, the host process's own, instead of the transport's.
+pub fn use_runtime(runtime: tokio::runtime::Handle) {
+    let _ = HOST.set(runtime);
+}
+
+/// The process's one network runtime: its host's, else the transport's own (the wheel's
+/// extension, `tfs`). One that cannot start (its threads refused) is asked for again by the next
+/// request, never remembered as broken.
+pub(crate) fn runtime() -> Result<tokio::runtime::Handle> {
+    if let Some(host) = HOST.get() {
+        return Ok(host.clone());
+    }
+    static RUNTIME: Mutex<Option<tokio::runtime::Runtime>> = Mutex::new(None);
     let mut held = RUNTIME.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(runtime) = held.as_ref() {
-        return Ok(Arc::clone(runtime));
+        return Ok(runtime.handle().clone());
     }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(NET_THREADS)
@@ -47,7 +59,7 @@ pub(crate) fn runtime() -> Result<Arc<tokio::runtime::Runtime>> {
             code: Code::TRANSFER_FAILED,
             detail: format!("the network runtime could not start: {error}"),
         })?;
-    Ok(Arc::clone(held.insert(Arc::new(runtime))))
+    Ok(held.insert(runtime).handle().clone())
 }
 
 /// `future` to its end on the calling thread, its sockets and timers driven by the runtime.

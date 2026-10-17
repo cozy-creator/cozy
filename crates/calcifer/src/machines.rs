@@ -1001,8 +1001,8 @@ fn status(frame: &v1::StatusFrame) -> MachineStatus {
                 name: gpu.name.clone(),
                 memory_bytes: gpu.memory_bytes,
                 driver: gpu.driver.clone(),
-                family: None,
-                memory_class: None,
+                family: Some(gpu.family.clone()).filter(|f| !f.is_empty()),
+                memory_class: Some(gpu.memory_class.clone()).filter(|c| !c.is_empty()),
             })
             .collect(),
         disk_total_bytes: frame.disk.as_ref().map_or(0, |d| d.total_bytes),
