@@ -115,6 +115,7 @@ async fn a_second_machine_downloads_from_the_volume_the_first_filled() {
     let tmpfs = PathBuf::from(format!("/dev/shm/tensord-volume-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&tmpfs).unwrap();
     let cache = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("target/volume-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
     std::os::unix::fs::symlink(&tmpfs, &cache).unwrap();
 
     let (a, client, a_root) = start("a", Some(&cache)).await;
