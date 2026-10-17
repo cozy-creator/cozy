@@ -7,8 +7,8 @@ use std::{
     task::{Context, Poll},
     time::Duration,
 };
+use cozy_proto::error::Error;
 use tokio_stream::Stream;
-use tonic::Status;
 
 #[derive(Clone)]
 pub struct Authority {
@@ -113,18 +113,18 @@ impl Lapse {
         }
     }
 }
-impl From<Lapse> for Status {
+impl From<Lapse> for Error {
     fn from(lapse: Lapse) -> Self {
-        Status::unauthenticated(lapse.message())
+        Error::credential(format!("capability_{}", lapse.code()), lapse.message())
     }
 }
 
-type Transport<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
+type Transport<T> = Pin<Box<dyn Stream<Item = Result<T, Error>> + Send + 'static>>;
 
-/// One open transport's authority. A `cozy.machine.v1` stream ends only when its key stops
+/// One open transport's authority. A machine-scope stream ends only when its key stops
 /// authorizing: its capability's expiry was checked when it opened, and a long run, upload or
-/// read outlives it. A media session also ends at its signed expiry, which its viewer chose.
-/// Losing authority detaches the transport; it never controls accepted work.
+/// read outlives it. A play link's stream, and a media session, also end at the signed expiry
+/// their signer chose. Losing authority detaches the transport; it never controls accepted work.
 #[derive(Clone)]
 pub(crate) struct StreamAuthority {
     keys: Keys,
@@ -160,8 +160,8 @@ impl StreamAuthority {
             _ = expiry => Lapse::Expired,
         }
     }
-    /// Ends `stream` with UNAUTHENTICATED once authority lapses, dropping it (and the observer
-    /// and files behind it) even while its peer applies backpressure.
+    /// Ends `stream` with a credential error once authority lapses, dropping it (and the
+    /// observer and files behind it) even while its peer applies backpressure.
     pub(crate) fn wrap<T: Send + 'static>(&self, stream: Transport<T>) -> Transport<T> {
         Box::pin(Authorized { stream: Some(stream), ended: Box::pin(self.clone().ended()) })
     }
@@ -176,7 +176,7 @@ struct Authorized<T> {
     ended: Pin<Box<dyn Future<Output = Lapse> + Send>>,
 }
 impl<T> Stream for Authorized<T> {
-    type Item = Result<T, Status>;
+    type Item = Result<T, Error>;
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         if self.stream.is_none() {
             return Poll::Ready(None);
@@ -210,7 +210,7 @@ mod tests {
             .wrap(Box::pin(tokio_stream::iter([Ok(1), Ok(2)])));
         assert_eq!(stream.next().await.unwrap().unwrap(), 1);
         keys.revoke();
-        assert_eq!(stream.next().await.unwrap().unwrap_err().message(), Lapse::Revoked.message());
+        assert_eq!(stream.next().await.unwrap().unwrap_err().message, Lapse::Revoked.message());
         assert!(stream.next().await.is_none());
 
         let keys = Keys::fixed(vec![signer.verifying_key()]);

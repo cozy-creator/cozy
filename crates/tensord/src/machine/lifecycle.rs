@@ -14,7 +14,7 @@ use std::{
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tonic::Status;
+use cozy_proto::error::Error;
 
 /// A rental's idle window, `RentalIdleTimeoutSeconds` in the CLI.
 pub const IDLE_GRACE_MS: i64 = 900_000;
@@ -126,16 +126,18 @@ impl Lifecycle {
         }
     }
 
-    pub fn admit(self: &Arc<Self>) -> Result<Admission, Status> {
+    pub fn admit(self: &Arc<Self>) -> Result<Admission, Error> {
         let state = self.state.lock().unwrap();
         if state.activating {
-            return Err(Status::unavailable(
-                "machine_updating: the machine is activating an update; submit again once it is back",
+            return Err(Error::unavailable(
+                "machine_updating",
+                "the machine is activating an update; submit again once it is back",
             ));
         }
         if self.rental && self.due(&state, now_ms()) {
-            return Err(Status::unavailable(
-                "machine_released: this rental released itself after 15 minutes idle",
+            return Err(Error::unavailable(
+                "machine_released",
+                "this rental released itself after 15 minutes idle",
             ));
         }
         self.admissions.fetch_add(1, Ordering::AcqRel);
@@ -145,10 +147,11 @@ impl Lifecycle {
 
     /// Closes admission under the lock `admit` takes: a call is either admitted (and counted)
     /// before activation or refused after it, never accepted while the service exits.
-    pub fn activate(self: &Arc<Self>) -> Result<Activation, Status> {
+    pub fn activate(self: &Arc<Self>) -> Result<Activation, Error> {
         let mut state = self.state.lock().unwrap();
         if state.activating || state.ledger.released {
-            return Err(Status::unavailable(
+            return Err(Error::unavailable(
+                "machine_updating",
                 "the machine is already activating or released",
             ));
         }
@@ -173,22 +176,23 @@ impl Lifecycle {
         self.state.lock().unwrap().jobs.ended_ms
     }
 
-    /// `Status{keepalive}`: restarts the idle clock once; answers the new deadline.
-    pub fn renew(&self) -> Result<i64, Status> {
+    /// `POST /v1/keepalive`: restarts the idle clock once; answers the new deadline.
+    pub fn renew(&self) -> Result<i64, Error> {
         if !self.rental {
             return Ok(0);
         }
         let now = now_ms();
         let mut state = self.state.lock().unwrap();
         if self.due(&state, now) {
-            return Err(Status::failed_precondition(
+            return Err(Error::unavailable(
+                "machine_released",
                 "this rental's idle release is already due or committed",
             ));
         }
         let mut ledger = state.ledger.clone();
         ledger.idle_since_ms = ledger.idle_since_ms.max(now);
         self.save(&ledger).map_err(|e| {
-            Status::unavailable(format!("the idle ledger could not be written: {e}"))
+            Error::unavailable("idle_ledger_unwritable", format!("the idle ledger could not be written: {e}"))
         })?;
         state.ledger = ledger;
         Ok(self.deadline(&state))

@@ -504,13 +504,13 @@ impl LocalSources {
 
 /// The trusted installer's end as a run's reason: canceled with its run, wedged (no CPU or
 /// bytes moved past its measured patience), or failed.
-fn installer_refusal(status: tonic::Status) -> Refused {
-    let code = match status.code() {
-        tonic::Code::Cancelled => crate::published::CANCELED,
-        tonic::Code::Aborted => "package_installation_stalled",
+fn installer_refusal(error: cozy_proto::error::Error) -> Refused {
+    let code = match error.code.as_str() {
+        crate::published::CANCELED => crate::published::CANCELED,
+        "package_installation_stalled" => "package_installation_stalled",
         _ => "package_installation_failed",
     };
-    refused(code, status.message())
+    refused(code, error.message)
 }
 #[cfg(test)]
 mod tests {
@@ -523,11 +523,7 @@ mod tests {
 
     fn write(objects: &Objects, actor: &str, bytes: &[u8]) -> Member {
         let digest = format!("sha256:{}", sha256::hex_digest(bytes));
-        let mut writer = objects
-            .begin(actor, &digest, bytes.len() as u64, 0)
-            .unwrap();
-        writer.append(bytes).unwrap();
-        writer.finish().unwrap();
+        objects.write(actor, &digest, bytes).unwrap();
         Member {
             name: String::new(),
             digest,
