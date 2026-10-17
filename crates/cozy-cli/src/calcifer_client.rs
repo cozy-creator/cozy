@@ -21,6 +21,7 @@ use cozy_platform::{
 use cozy_proto::{
     calcifer::{Down, Event, Holder, MachineList, REFUSED, Run, RunList, SubmitRun, Submitted},
     error::{Envelope, Error, Kind},
+    machine::LogLines,
 };
 use reqwest::{RequestBuilder, Response, StatusCode, header};
 use serde::{Serialize, de::DeserializeOwned};
@@ -152,6 +153,21 @@ impl Client {
 
     pub async fn machines(&self) -> Result<MachineList, Error> {
         self.get("/v1/machines").await
+    }
+
+    /// A machine log's newest `lines` whole lines (0: all) at `path`, then each batch as the
+    /// machine appends it.
+    pub fn follow_log(&self, path: &str, lines: u64) -> LogFollow {
+        LogFollow {
+            client: self.clone(),
+            path: path.to_owned(),
+            lines,
+            after: None,
+            stream: None,
+            sse: Sse::default(),
+            received: false,
+            empty: 0,
+        }
     }
 
     /// A run's events after `starting_after`, to its terminal one.
@@ -523,6 +539,69 @@ impl Events {
             }
         }
         None
+    }
+}
+
+/// A followed machine log. A closed stream is opened again after the last batch's place, across
+/// a Calcifer restart too, so no line arrives twice.
+pub struct LogFollow {
+    client: Client,
+    path: String,
+    lines: u64,
+    after: Option<String>,
+    stream: Option<Response>,
+    sse: Sse,
+    /// Whether this connection has carried lines.
+    received: bool,
+    /// Connections in a row that closed carrying none.
+    empty: u32,
+}
+
+impl LogFollow {
+    pub async fn next(&mut self) -> Result<LogLines, Error> {
+        loop {
+            if let Some(data) = self.sse.next() {
+                if let Ok(lines) = serde_json::from_str::<LogLines>(&data) {
+                    self.after = Some(lines.after.clone());
+                    (self.received, self.empty) = (true, 0);
+                    return Ok(lines);
+                }
+                continue;
+            }
+            let Some(stream) = self.stream.as_mut() else {
+                self.stream = Some(self.open().await?);
+                continue;
+            };
+            match stream.chunk().await {
+                Ok(Some(bytes)) => self.sse.push(&bytes),
+                Ok(None) | Err(_) => {
+                    (self.stream, self.sse) = (None, Sse::default());
+                    if !std::mem::take(&mut self.received) {
+                        self.empty += 1;
+                    }
+                    if self.empty > AGAIN {
+                        return Err(Error::new(
+                            Kind::Unavailable,
+                            "log_closed",
+                            format!("the log stream closed {} times without a line", self.empty),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    async fn open(&self) -> Result<Response, Error> {
+        let answer = self.client.send(|c, base| {
+            let request = c
+                .get(format!("{base}{}", self.path))
+                .header(header::ACCEPT, "text/event-stream");
+            match &self.after {
+                Some(after) => request.query(&[("after", after)]),
+                None => request.query(&[("lines", self.lines)]),
+            }
+        });
+        ok(answer.await?).await
     }
 }
 

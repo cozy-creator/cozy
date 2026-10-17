@@ -585,45 +585,16 @@ impl MachineBackend for NativeBackend {
             bundle_canonical_bytes: bytes,
         })
     }
-    fn read_machine_log(
-        &self,
-        _: VerifiedActor,
-        request: domain::MachineLogQuery,
-    ) -> Result<Vec<u8>, Error> {
+    fn log(&self, name: &str) -> Result<crate::logs::Log, Error> {
         // TensorFS and TensorD's memory notes append to the store's logs, each rotating to one
-        // older file; TensorD's own log rolls daily (`tensord.<date>.log`): its newest two days.
-        let store_logs = self.store.root().join("logs");
-        let (logs, names) = match domain::MachineLog::try_from(request.log) {
-            Ok(domain::MachineLog::TensorfsTransport) => (store_logs, vec!["transport.log.1".into(), "transport.log".into()]),
-            Ok(domain::MachineLog::Memory) => (store_logs, vec!["memory.log.1".into(), "memory.log".into()]),
-            Ok(domain::MachineLog::Tensord) if self.logs.is_some() => {
-                let logs = self.logs.clone().expect("checked");
-                let mut days: Vec<String> = std::fs::read_dir(&logs)
-                    .map(|dir| dir.flatten().filter_map(|e| e.file_name().into_string().ok()).collect())
-                    .unwrap_or_default();
-                days.retain(|name| name.starts_with("tensord.") && name.ends_with(".log"));
-                days.sort();
-                let newest = days.split_off(days.len().saturating_sub(2));
-                (logs, newest)
-            }
-            _ => return Err(Error::not_found("log_not_found", format!("this machine keeps no log {}", request.log))),
-        };
-        let mut data = vec![];
-        for name in names {
-            match std::fs::read(logs.join(&name)) {
-                Ok(kept) => data.extend(kept),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(Error::internal("internal", format!("read {name}: {error}"))),
-            }
+        // older file; TensorD's own log rolls daily.
+        let store = self.store.root().join("logs");
+        match (name, &self.logs) {
+            ("tensorfs-transport", _) => Ok(crate::logs::Log::rotated(store, "transport.log")),
+            ("memory", _) => Ok(crate::logs::Log::rotated(store, "memory.log")),
+            ("tensord", Some(dir)) => Ok(crate::logs::Log::daily(dir.clone(), "tensord")),
+            _ => Err(Error::not_found("log_not_found", format!("this machine keeps no log {name}"))),
         }
-        let tail = request.tail_bytes as usize;
-        if tail > 0 && data.len() > tail {
-            data.drain(..data.len() - tail);
-            if let Some(line) = data.iter().position(|b| *b == b'\n') {
-                data.drain(..=line);
-            }
-        }
-        Ok(data)
     }
     fn object(&self, actor: VerifiedActor, sha256: &str) -> Result<std::fs::File, Error> {
         // Only an object this signer wrote: another signer's reads as absent.

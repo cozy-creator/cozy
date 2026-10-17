@@ -96,7 +96,6 @@ pub trait MachineBackend: Send + Sync + 'static {
     ) -> Result<OutputSnapshot, Error> {
         unsupported()
     }
-    /// One kept log's bytes, oldest first (wire 72). A log not written yet is empty.
     /// A failed attempt's retained triage bundle.
     fn read_triage(
         &self,
@@ -105,12 +104,9 @@ pub trait MachineBackend: Send + Sync + 'static {
     ) -> Result<domain::MachineExecutionTriage, Error> {
         unsupported()
     }
-    fn read_machine_log(
-        &self,
-        _: VerifiedActor,
-        _: domain::MachineLogQuery,
-    ) -> Result<Vec<u8>, Error> {
-        unsupported()
+    /// A log this machine keeps, by its name on the wire.
+    fn log(&self, name: &str) -> Result<crate::logs::Log, Error> {
+        Err(Error::not_found("log_not_found", format!("this machine keeps no log {name}")))
     }
     /// A complete content-addressed object this signer wrote with `Write`, verified against
     /// `sha256` (hex).

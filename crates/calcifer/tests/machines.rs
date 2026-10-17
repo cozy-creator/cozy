@@ -546,7 +546,7 @@ async fn the_machine_routes_answer_over_loopback() {
         .await
         .unwrap();
     assert_eq!(shown.status.unwrap().worker_id, common::WORKER);
-    let log = call(Method::GET, "/v1/machines/box/logs/memory?tail_bytes=4096")
+    let log = call(Method::GET, "/v1/machines/box/logs/memory?lines=10")
         .send()
         .await
         .unwrap();

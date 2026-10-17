@@ -144,13 +144,19 @@ pub fn output() {}
     ))]
 pub fn triage() {}
 
-/// A log the machine keeps (`tensorfs-transport`, `memory`, `tensord`).
+/// A log the machine keeps (`tensorfs-transport`, `memory`, `tensord`): its whole lines. With
+/// `Accept: text/event-stream`, those and then each batch as it is appended, across rotations.
 #[utoipa::path(get, path = path::LOG, params(
     ("name" = String, Path, description = "The log's name"),
-    ("tail" = Option<u64>, Query, description = "Its newest bytes, from a line start; absent: all"),
+    ("lines" = Option<u64>, Query, description = "Its newest N whole lines; absent or 0: all"),
+    ("Last-Event-ID" = Option<String>, Header, description = "Follow on from this event's place"),
 ), responses(
-    (status = 200, description = "The log", body = String, content_type = "text/plain"),
+    (status = 200, description = "The lines, or SSE `event: lines` with the place after them as id", content(
+        (String = "text/plain"),
+        (LogLines = "text/event-stream"),
+    )),
     (status = 404, description = "No such log", body = Envelope),
+    (status = 503, description = "`log_follow_unsupported`: this machine's OS cannot follow", body = Envelope),
 ))]
 pub fn log() {}
 

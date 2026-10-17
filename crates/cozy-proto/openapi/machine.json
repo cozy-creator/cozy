@@ -60,7 +60,7 @@
     "/v1/logs/{name}": {
       "get": {
         "tags": [],
-        "summary": "A log the machine keeps (`tensorfs-transport`, `memory`, `tensord`).",
+        "summary": "A log the machine keeps (`tensorfs-transport`, `memory`, `tensord`): its whole lines. With\n`Accept: text/event-stream`, those and then each batch as it is appended, across rotations.",
         "operationId": "log",
         "parameters": [
           {
@@ -73,30 +73,57 @@
             }
           },
           {
-            "name": "tail",
+            "name": "lines",
             "in": "query",
-            "description": "Its newest bytes, from a line start; absent: all",
+            "description": "Its newest N whole lines; absent or 0: all",
             "required": false,
             "schema": {
               "type": "integer",
               "format": "int64",
               "minimum": 0
             }
+          },
+          {
+            "name": "Last-Event-ID",
+            "in": "header",
+            "description": "Follow on from this event's place",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
           }
         ],
         "responses": {
           "200": {
-            "description": "The log",
+            "description": "The lines, or SSE `event: lines` with the place after them as id",
             "content": {
               "text/plain": {
                 "schema": {
                   "type": "string"
+                }
+              },
+              "text/event-stream": {
+                "schema": {
+                  "$ref": "#/components/schemas/LogLines"
                 }
               }
             }
           },
           "404": {
             "description": "No such log",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`log_follow_unsupported`: this machine's OS cannot follow",
             "content": {
               "application/json": {
                 "schema": {
@@ -1230,6 +1257,21 @@
         "properties": {
           "level": {
             "type": "string",
+            "default": ""
+          },
+          "text": {
+            "type": "string",
+            "default": ""
+          }
+        }
+      },
+      "LogLines": {
+        "type": "object",
+        "description": "Whole lines of a machine log, as `GET /v1/logs/{name}` streams them (`event: lines`).",
+        "properties": {
+          "after": {
+            "type": "string",
+            "description": "The place after them, also the event's id: a follow resumed there goes on with the next line.",
             "default": ""
           },
           "text": {

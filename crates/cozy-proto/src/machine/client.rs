@@ -24,8 +24,8 @@ use sha2::{Digest as _, Sha256};
 use url::Url;
 
 use super::{
-    Event, HELD, HeldAnswer, HeldObject, HeldRequest, OutputTarget, Ranges, RunEvent, RunRequest,
-    RunState, StatusFrame, parse_held, path,
+    Event, HELD, HeldAnswer, HeldObject, HeldRequest, LogLines, OutputTarget, Ranges, RunEvent,
+    RunRequest, RunState, StatusFrame, parse_held, path,
 };
 use crate::{
     capability,
@@ -234,13 +234,33 @@ impl Machine {
         bytes(send(self.request(Method::GET, path::TRIAGE, &[id])).await?).await
     }
 
-    /// The last `tail` bytes (0: all) of a log the machine keeps.
-    pub async fn log(&self, name: &str, tail: u64) -> Result<Bytes, Error> {
+    /// The newest `lines` whole lines (0: all) of a log the machine keeps.
+    pub async fn log(&self, name: &str, lines: u64) -> Result<Bytes, Error> {
+        let request = self.request(Method::GET, path::LOG, &[name]);
+        bytes(send(request.query(&[("lines", lines)])).await?).await
+    }
+
+    /// A log's lines as [`Self::log`] reads them, or those after `after` (a batch's place), then
+    /// each batch as the machine appends it.
+    pub async fn follow_log(
+        &self,
+        name: &str,
+        lines: u64,
+        after: Option<&str>,
+    ) -> Result<impl Stream<Item = Result<LogLines, Error>> + Send + 'static, Error> {
         let mut request = self.request(Method::GET, path::LOG, &[name]);
-        if tail > 0 {
-            request = request.query(&[("tail", tail)]);
-        }
-        bytes(send(request).await?).await
+        request = match after {
+            Some(after) => request.header("last-event-id", after),
+            None => request.query(&[("lines", lines)]),
+        };
+        let events = sse(send(request.header(header::ACCEPT, "text/event-stream")).await?)?;
+        Ok(events.filter_map(|event| async move {
+            match event {
+                Ok(event) if event.event == "lines" => Some(parse(&event.data)),
+                Ok(_) => None,
+                Err(e) => Some(Err(e)),
+            }
+        }))
     }
 
     /// The ranges of the object (`sha256:<hex>`) the machine holds for this signer; a stored

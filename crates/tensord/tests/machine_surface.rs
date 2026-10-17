@@ -285,7 +285,7 @@ mod v1_api {
         }
     }
     /// What a test reads: one output (from `offset`, `length` bytes, refused unless at `if_rev`)
-    /// or a machine log's newest `tail` bytes.
+    /// or a machine log's newest `tail` lines.
     #[derive(Clone, Default)]
     struct ReadRequest {
         target: Option<Target>,
@@ -327,10 +327,10 @@ mod v1_api {
         Ok((Meta { rev: output.rev, length: output.length, digest }, data))
     }
 
-    /// Read returns the store's transport and memory logs, each's rotated part first, or a tail
-    /// from a line start; only a machine capability reads them.
+    /// Read returns the store's transport and memory logs, each's rotated part first, or its
+    /// newest lines; only a machine capability reads them.
     #[tokio::test]
-    async fn read_returns_the_stores_logs_with_rotation_and_tail() {
+    async fn read_returns_the_stores_logs_with_rotation_and_newest_lines() {
         let machine = Machine::start().await;
         let client = client(&machine);
         let owner = cap(Grant { action: MACHINE.into(), ..Default::default() });
@@ -348,15 +348,56 @@ mod v1_api {
             fs::write(logs.join(file), &current).unwrap();
             let (_, whole) = read(&client, &owner, log(name, 0)).await.unwrap();
             assert_eq!(whole, format!("1.000 pull a 1 old\n{current}").into_bytes());
-            let (_, tail) = read(&client, &owner, log(name, 100)).await.unwrap();
-            let tail = String::from_utf8(tail).unwrap();
-            assert!(tail.len() <= 100 && tail.ends_with("2999.000 hedge object-2999 4096 grant\n"));
-            assert!(current.ends_with(&tail) && current.as_bytes()[current.len() - tail.len() - 1] == b'\n');
+            let (_, newest) = read(&client, &owner, log(name, 2)).await.unwrap();
+            assert_eq!(newest, b"2998.000 hedge object-2998 4096 grant\n2999.000 hedge object-2999 4096 grant\n");
+            let (_, all) = read(&client, &owner, log(name, 3001)).await.unwrap();
+            assert_eq!(all, whole, "lines reach back into the rotated part");
             let run = cap(Grant { run: "1".into(), ..Default::default() });
             assert_eq!(read(&client, &run, log(name, 0)).await.unwrap_err().status(), Some(403));
         }
         let unknown = read(&client, &owner, log("other", 0)).await.unwrap_err();
         assert_eq!(unknown.status(), Some(404));
+    }
+
+    /// A follow sends the kept lines, then each line as it is written, across two rotations with
+    /// none missed or repeated; one resumed from a batch's place goes on with the next line.
+    #[tokio::test]
+    async fn a_followed_log_crosses_rotations_and_resumes_where_it_left() {
+        let machine = Machine::start().await;
+        let (client, owner) = (client(&machine), cap(Grant { action: MACHINE.into(), ..Default::default() }));
+        let follower = by(&client, &owner);
+        let logs = machine.store().join("logs");
+        fs::create_dir_all(&logs).unwrap();
+        let line = |n: usize| format!("{n}.000 pull object-{n} 4096\n");
+        let write = |n: usize| {
+            use std::io::Write as _;
+            if n > 0 && n.is_multiple_of(50) {
+                fs::rename(logs.join("transport.log"), logs.join("transport.log.1")).unwrap();
+            }
+            let mut log = fs::OpenOptions::new().create(true).append(true).open(logs.join("transport.log")).unwrap();
+            log.write_all(line(n).as_bytes()).unwrap();
+        };
+        async fn until(lines: &mut (impl Stream<Item = Result<v1::LogLines, ClientError>> + Unpin), count: usize) -> (String, String) {
+            let (mut text, mut after) = (String::new(), String::new());
+            while text.lines().count() < count {
+                let batch = tokio::time::timeout(Duration::from_secs(30), lines.next()).await;
+                let batch = batch.expect("lines arrive as written").expect("the follow stays open").unwrap();
+                text.push_str(&batch.text);
+                after = batch.after;
+            }
+            (text, after)
+        }
+
+        write(0);
+        let mut follow = Box::pin(follower.follow_log("tensorfs-transport", 0, None).await.unwrap());
+        (1..120).for_each(write);
+        let (text, after) = until(&mut follow, 120).await;
+        assert_eq!(text, (0..120).map(line).collect::<String>());
+        drop(follow);
+
+        (120..125).for_each(write);
+        let mut resumed = Box::pin(follower.follow_log("tensorfs-transport", 0, Some(&after)).await.unwrap());
+        assert_eq!(until(&mut resumed, 5).await.0, (120..125).map(line).collect::<String>());
     }
 
     #[tokio::test]
