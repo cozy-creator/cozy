@@ -905,7 +905,7 @@ mod v1_api {
                 ..Default::default()
             });
             let manifest = write_package(
-                &mut peer,
+                &peer,
                 &all,
                 "cpu_weights",
                 "local/tensord-cpu-weights",
@@ -965,7 +965,7 @@ mod v1_api {
                 machine.child = child;
                 machine.address = address;
                 peer = client(&machine);
-                until(&mut peer, &all, "native-cancel", "canceled").await;
+                until(&peer, &all, "native-cancel", "canceled").await;
             } else {
                 cancel(&peer, &all, "native-cancel").await.unwrap();
                 let ended = collect(stream).await.unwrap();
@@ -1174,7 +1174,7 @@ mod v1_api {
             ..Default::default()
         };
         let request = authorized(RunRequest { id: id.into(), after: 0, spec: Some(spec) }, cap);
-        let done = outcome(&collect(run_as(&client, request).await.unwrap()).await.unwrap());
+        let done = outcome(&collect(run_as(client, request).await.unwrap()).await.unwrap());
         assert_eq!(done.status, "succeeded", "{id}: {done:?}");
         json(&done.result)
     }
@@ -1626,7 +1626,7 @@ mod v1_api {
         spec: v1::RunSpec,
     ) -> v1::Outcome {
         let request = RunRequest { id: id.into(), after: 0, spec: Some(spec) };
-        outcome(&collect(run_events(&client, cap, request).await.unwrap()).await.unwrap())
+        outcome(&collect(run_events(client, cap, request).await.unwrap()).await.unwrap())
     }
 
     /// th-245: a run names its release and model and the machine resolves both at its Hub by
@@ -3344,7 +3344,7 @@ mod v1_api {
             after: 0,
             spec: None,
         };
-        match run_events(&client, cap, request).await {
+        match run_events(client, cap, request).await {
             Ok(mut stream) => match stream.next().await.transpose() {
                 Ok(Some(v1::RunEvent {
                     event: v1::Event::State(state),

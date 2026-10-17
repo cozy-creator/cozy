@@ -330,7 +330,7 @@ impl Calcifer {
                 Err(RecvError::Lagged(_)) => true,
                 Err(RecvError::Closed) => break (&mut work).await,
             };
-            match newer.then(|| superseded()) {
+            match newer.then(superseded) {
                 Some(Ok(true)) => break Err(Failure::Superseded),
                 Some(Err(e)) => break Err(e),
                 _ => {}

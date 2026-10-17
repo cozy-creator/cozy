@@ -44,7 +44,7 @@ pub enum Error {
     #[error("the machine refused it ({}): {}", .error.code, .error.message)]
     Refused {
         status: u16,
-        error: crate::error::Error,
+        error: Box<crate::error::Error>,
     },
     /// Not reached, or the connection broke.
     #[error("{0}")]
@@ -436,7 +436,7 @@ async fn send(request: RequestBuilder) -> Result<Response, Error> {
     };
     Err(Error::Refused {
         status: status.as_u16(),
-        error,
+        error: Box::new(error),
     })
 }
 

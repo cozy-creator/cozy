@@ -18,10 +18,10 @@ use cozy_proto::{
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
 use rusqlite_migration::{M, Migrations};
 
-/// The schema before xs-044's JSON rows.
-
 /// The version at which runs' specs and outcomes are JSON.
 const JSON_ROWS: usize = 5;
+
+/// The schema before xs-044's JSON rows.
 const MIGRATIONS: &[M] = &[
     M::up(
         "CREATE TABLE machines (

@@ -790,11 +790,10 @@ impl MachineBackend for NativeBackend {
         query: domain::MachineExecutionQuery,
     ) -> Result<Option<Vec<u8>>, Error> {
         let record = self.query(actor, query)?;
-        Ok(self
-            .service
+        self.service
             .engine
             .with_journal(|journal| journal.measurements(&record.id))
-            .map_err(problem)?)
+            .map_err(problem)
     }
     fn events(
         &self,
