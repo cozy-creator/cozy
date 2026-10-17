@@ -64,6 +64,11 @@ impl DeviceKey {
         write_private(path, &serde_json::to_vec(&kept).expect("a key serializes"))
     }
 
+    /// The public key, unpadded base64url: what a rental's `creator_public_key` names.
+    pub fn public_key(&self) -> String {
+        b64(self.key.verifying_key().as_bytes())
+    }
+
     fn sign_challenge(key: &SigningKey, domain: &str, challenge: &str) -> Result<String, Error> {
         let challenge = unb64(challenge)
             .filter(|bytes| bytes.len() == 32)

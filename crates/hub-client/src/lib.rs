@@ -17,7 +17,7 @@ mod generated {
 pub use auth::{Auth, Credential};
 pub use device::{Bearer, DeviceKey, Enrollment, RunCapability, UserSession};
 pub use generated::{Client, types};
-pub use jws::{P256Key, thumbprint};
+pub use jws::{P256Key, leaf_thumbprint, thumbprint};
 pub use progenitor_client::{ByteStream, ResponseValue};
 pub use run::{Ended, Op, RunToken};
 

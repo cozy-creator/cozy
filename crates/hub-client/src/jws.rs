@@ -6,6 +6,8 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
+use x509_cert::Certificate;
+use x509_cert::der::{Decode as _, oid::ObjectIdentifier};
 
 use crate::Error;
 
@@ -55,6 +57,27 @@ pub fn thumbprint(x: &str, y: &str) -> String {
     b64(Sha256::digest(format!(
         r#"{{"crv":"P-256","kty":"EC","x":"{x}","y":"{y}"}}"#
     )))
+}
+
+/// The thumbprint of a machine's TLS leaf (`der`): the `machine` a run capability binds to, the
+/// leaf's P-256 key being the one the machine proves DPoP and signs assertions with.
+pub fn leaf_thumbprint(der: &[u8]) -> Result<String, Error> {
+    const EC: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.2.1");
+    const P256: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.3.1.7");
+    let refused = |why: &str| Error::Key(format!("the machine's leaf {why}"));
+    let leaf =
+        Certificate::from_der(der).map_err(|e| refused(&format!("is not a certificate: {e}")))?;
+    let key = leaf.tbs_certificate.subject_public_key_info;
+    let curve = key
+        .algorithm
+        .parameters
+        .and_then(|p| p.decode_as::<ObjectIdentifier>().ok());
+    match key.subject_public_key.raw_bytes() {
+        [4, point @ ..] if key.algorithm.oid == EC && curve == Some(P256) && point.len() == 64 => {
+            Ok(thumbprint(&b64(&point[..32]), &b64(&point[32..])))
+        }
+        _ => Err(refused("key is not P-256")),
+    }
 }
 
 /// A P-256 key that signs ES256: a machine's TLS leaf key, or a fresh one held in memory.

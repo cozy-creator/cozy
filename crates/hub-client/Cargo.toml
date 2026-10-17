@@ -19,14 +19,11 @@ sha2.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 tracing.workspace = true
-# testing
-rcgen = { workspace = true, optional = true }
-rustls = { workspace = true, optional = true }
-tokio-rustls = { workspace = true, optional = true }
+x509-cert.workspace = true
 
 [features]
 # Helpers for tests against a real Tensorhub (hub_client::testing).
-testing = ["dep:rcgen", "dep:rustls", "dep:tokio-rustls", "tokio/io-util", "tokio/net", "tokio/rt"]
+testing = []
 
 [build-dependencies]
 openapiv3.workspace = true
