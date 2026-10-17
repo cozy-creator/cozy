@@ -108,6 +108,18 @@ pub(super) fn parent_of(pid: u32) -> io::Result<u32> {
     Ok(stat(pid)?.ppid)
 }
 
+/// Every process with its parent.
+pub(super) fn parents() -> Vec<(u32, u32)> {
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return vec![];
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+        .filter_map(|pid| Some((pid, stat(pid).ok()?.ppid)))
+        .collect()
+}
+
 pub(super) fn group_members(leader: &Birth) -> Vec<Birth> {
     let Ok(boot) = boot_id() else {
         return vec![];

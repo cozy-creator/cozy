@@ -185,6 +185,25 @@ pub(super) fn parent_of(pid: u32) -> io::Result<u32> {
     Ok(info(pid)?.pbi_ppid)
 }
 
+/// Every process with its parent.
+pub(super) fn parents() -> Vec<(u32, u32)> {
+    // SAFETY: a null buffer asks for the count.
+    let count = unsafe { libc::proc_listallpids(ptr::null_mut(), 0) };
+    if count <= 0 {
+        return vec![];
+    }
+    // Room for processes started since the count.
+    let mut pids = vec![0 as libc::pid_t; count as usize + 64];
+    let bytes = (pids.len() * mem::size_of::<libc::pid_t>()) as libc::c_int;
+    // SAFETY: a writable buffer of the length given.
+    let listed = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
+    pids.truncate(listed.max(0) as usize);
+    pids.into_iter()
+        .filter(|pid| *pid > 0)
+        .filter_map(|pid| Some((pid as u32, info(pid as u32).ok()?.pbi_ppid)))
+        .collect()
+}
+
 /// Groups and meters are read only on Linux so far: unreadable here, which decides nothing.
 pub(super) fn group_members(_: &Birth) -> Vec<Birth> {
     Vec::new()
