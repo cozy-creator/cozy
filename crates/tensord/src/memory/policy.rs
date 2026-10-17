@@ -97,8 +97,6 @@ pub enum Step {
     Unmap(String),
     /// End the idle executor for the device context it holds.
     End(String),
-    /// Lower a running executor's process cap through its budget cell.
-    Shrink(String, u64),
     /// Revoke a Degree 2 holding the planned call does not read.
     Revoke(String),
     /// Revoke only enough of a holding's regions for these bytes; the rest stays attachable.
@@ -547,8 +545,9 @@ impl Gpu {
 
     /// The next step toward `want` (None: everything) and `need` bytes for `plan`, or its cap.
     /// Idle weights go first (LRU), then idle processes for their contexts while `need` is
-    /// unmet, then running calls shrink toward their own lowest rung. Never refuses by size:
-    /// with nothing left to free, the cap is what there is.
+    /// unmet. Another tenant's room never lowers a running call's cap (only the driver's floor
+    /// does, `below_floor`). Never refuses by size: with nothing left to free, the cap is what
+    /// there is.
     pub fn decide(
         &self,
         plan: &str,
@@ -597,18 +596,9 @@ impl Gpu {
         if room >= need {
             return Decision::Go(room);
         }
-        let short = need - room;
         if let Some((other, _)) = others().into_iter().find(|(_, t)| t.phase == Phase::Idle) {
             round.tried.insert(other.clone());
             return Decision::Step(Step::End(other.clone()));
-        }
-        if let Some((other, tenant)) = others()
-            .into_iter()
-            .find(|(other, t)| t.phase == Phase::Active && t.cap > self.need(other))
-        {
-            round.tried.insert(other.clone());
-            let lowered = tenant.cap.saturating_sub(short).max(self.need(other));
-            return Decision::Step(Step::Shrink(other.clone(), lowered));
         }
         if self
             .tenants
@@ -931,29 +921,14 @@ mod tests {
     }
 
     #[test]
-    fn a_spawn_beside_a_running_call_shrinks_it_to_its_lowest_rung_at_most() {
+    fn a_spawn_beside_a_running_call_never_lowers_its_cap() {
         let mut gpu = Gpu::default();
         loaded(&mut gpu, "sdxl", 10, 7 * GIB, 3 * GIB);
         gpu.active("sdxl", 15 * GIB);
         let s = sample(16 * GIB, 4 * GIB, &[(10, 12 * GIB)]);
-        let mut round = Round::default();
         let need = 2 * GIB;
-        let Decision::Step(Step::Shrink(plan, cap)) =
-            gpu.decide("anima", Some(need), need, &s, &mut round)
-        else {
-            panic!("expected a shrink")
-        };
-        assert_eq!(plan, "sdxl");
-        assert!(cap >= gpu.need("sdxl") && cap < 15 * GIB);
-        gpu.set_cap("sdxl", cap);
-        assert_eq!(
-            gpu.decide("anima", Some(need), need, &s, &mut round),
-            if gpu.room("anima", &s) >= need {
-                Decision::Go(gpu.room("anima", &s))
-            } else {
-                Decision::Wait
-            }
-        );
+        assert_eq!(gpu.decide("anima", Some(need), need, &s, &mut Round::default()), Decision::Wait);
+        assert_eq!(gpu.tenant("sdxl").unwrap().cap, 15 * GIB);
     }
 
     #[test]
