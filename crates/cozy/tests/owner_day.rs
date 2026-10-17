@@ -1,7 +1,7 @@
 //! The owner's day with cozy, end to end: the real binary, a real Calcifer and real TensorDs
 //! (COZY_TEST_TENSORD: the newest cozy-runtime wheel's, or this workspace's with
 //! COZY_TENSORD=workspace) against the CI Tensorhub that Tensorhub's `live-hub-client.sh` starts
-//! (TENSORHUB_ORIGIN, TENSORHUB_LOG; its docker provider rents CPU machines). `owner-day.yaml`
+//! (TENSORHUB_ORIGIN, TENSORHUB_LOG; its docker provider rents CPU machines). `owner-day.yml`
 //! runs it, with the other scenario targets, on every release candidate. `h3-standin` has
 //! minimax-h3's request shape without torch. Each test has its own home, account and machines,
 //! so they run in parallel. Elsewhere it skips.
@@ -9,7 +9,7 @@
 mod common;
 
 use std::{
-    io::BufRead as _,
+    io::BufRead,
     path::{Path, PathBuf},
     process::{Child, Stdio},
     time::{Duration, Instant},
@@ -140,12 +140,17 @@ fn shoot(home: &Home) -> (PathBuf, Vec<(String, String, String, String)>) {
             true => String::new(),
             false => hex::encode(Sha256::digest(bytes)),
         };
-        (name.into(), kind.into(), digest, description.into())
+        (
+            name.to_owned(),
+            kind.to_owned(),
+            digest,
+            description.to_owned(),
+        )
     };
     let expected = vec![
         seen("Azul", "character", &azul, ""),
         seen("Sophia", "character", &sophia, ""),
-        seen("Background", "background", &[], "A wooden dojo at dusk."),
+        seen("Background", "background", b"", "A wooden dojo at dusk."),
         seen("Video 1", "video", &clip, ""),
         seen("Voice", "audio", &voice, ""),
     ];
@@ -306,7 +311,7 @@ fn an_h3_request_binds_its_references_from_a_yaml_and_its_video_lands_whole() {
         "--on",
         "m1",
     ];
-    let refused = cozy(&home, &elsewhere, &[&["--json"], &old[..]].concat());
+    let refused = cozy(&home, &elsewhere, &[&["--json"][..], &old].concat());
     assert_eq!(refused.code, 1, "{refused:?}");
     let refusal = refused.refusal();
     assert_eq!(refusal["code"], "request_payload_invalid", "{refused:?}");
@@ -469,7 +474,10 @@ fn views_print_once_off_a_terminal_and_cancel_settles_running_and_queued_runs() 
 
     let views: [(Vec<&str>, [&str; 2]); 4] = [
         (vec!["run", "list"], ["TARGET", "STATUS"]),
-        (vec!["run", "show", &number], ["target", "/long_form"]),
+        (
+            vec!["run", "show", number.as_str()],
+            ["target", "/long_form"],
+        ),
         (vec!["machine", "list"], ["KIND", "STATE"]),
         (vec!["package", "list"], ["PACKAGE", "RELEASE"]),
     ];
@@ -492,7 +500,7 @@ fn views_print_once_off_a_terminal_and_cancel_settles_running_and_queued_runs() 
         let json = bounded(
             &home,
             &elsewhere,
-            &[&view[..], &["--json"]].concat(),
+            &[view.clone(), vec!["--json"]].concat(),
             Duration::from_secs(60),
         );
         assert_eq!(json.code, 0, "{view:?}: {json:?}");
@@ -505,7 +513,7 @@ fn views_print_once_off_a_terminal_and_cancel_settles_running_and_queued_runs() 
         assert_eq!(out.code, 0, "{out:?}");
         reaches(&home, number, "canceled")
     };
-    let run = canceled(&number);
+    let run = canceled(number.as_str());
     assert!(
         run["output"]
             .as_array()
@@ -593,7 +601,7 @@ fn a_rental_ended_the_moment_its_run_returns_loses_nothing() {
     );
 }
 
-/// A clip uploads to a machine over a link shaped like the owner's uplink (`owner-day.yaml` shapes
+/// A clip uploads to a machine over a link shaped like the owner's uplink (`owner-day.yml` shapes
 /// the loopback for COZY_TEST_SHAPED_PORT at COZY_TEST_SHAPED_BPS, 400 ms round trip): the run
 /// says how far the upload is as it moves, and completes with the clip whole on the machine.
 #[test]
