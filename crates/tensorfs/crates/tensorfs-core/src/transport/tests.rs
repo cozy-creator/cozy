@@ -3950,7 +3950,21 @@ fn zz_cache_root_loop() {
         let store = Store::init(&root).unwrap();
         let request = PullRequest::new(&store, &origin.base, "acme/model", Anonymous, &policy);
         let cold = pull(&request).unwrap();
+        let pins_before = crate::meta::owner(&root).map(|owner| owner.pinned().len());
+        let repository = crate::repository::RepositoryName::new("acme", "model").unwrap();
+        let body = std::fs::read(store.repository_path(&repository)).unwrap_or_default();
+        let cached_before = crate::cache_roots::matches(&store, &repository, &body).ok();
         let report = crate::gc::collect_cached(&root, &[]).unwrap();
+        if report.reclaimed_bytes == 0 {
+            let pins_after = crate::meta::owner(&root).map(|owner| owner.pinned().len());
+            println!(
+                "ZZCR zero: pins_before={pins_before:?} pins_after={pins_after:?} cached_before={cached_before:?} sessions={:?} origins={:?} repos={} repo_file={}",
+                crate::gc::session_holds(&store).map(|(holds, sessions)| (holds.len(), sessions)),
+                crate::origin::manifests(&store).map(|m| m.len()),
+                crate::storage::read_repositories(&root).map(|r| r.len()).unwrap_or(99),
+                store.repository_path(&repository).exists(),
+            );
+        }
         let again = pull(&request).unwrap();
         if again.bytes_moved != cold.bytes_moved {
             odd += 1;
