@@ -169,3 +169,27 @@ fn machine_refusals_say_what_to_do_instead() {
         assert_eq!(home.cozy(&args).code, 2, "{args:?}");
     }
 }
+
+/// `machine update` is a numbered run of kind update, sent to the machine and followed like any run.
+/// The target comes from the default Hub's public `/v1/software`; this TensorD does not update in
+/// place, so the run ends failed with the machine's own reason.
+#[test]
+fn an_update_is_a_run_the_machine_answers() {
+    let Some(home) = Home::new() else { return };
+    let _calcifer = home.want_calcifer();
+    let _machine = tensord::added(&home, "upd");
+    let out = home.cozy(["machine", "update", "upd", "--json"]);
+    let last: serde_json::Value =
+        serde_json::from_str(out.stdout.lines().last().unwrap_or_default())
+            .unwrap_or_else(|e| panic!("{e}: {out:?}"));
+    assert_eq!(
+        (
+            out.code,
+            last["type"].as_str(),
+            last["run"]["kind"].as_str()
+        ),
+        (1, Some("run.failed"), Some("update")),
+        "{out:?}"
+    );
+    eprintln!("the update ended: {}", last["run"]["reason"]);
+}

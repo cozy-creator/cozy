@@ -23,7 +23,7 @@ pub struct Args {
     verb: Verb,
 }
 
-// `update` and this computer's machine role read their arguments once they land.
+// This computer's machine role reads its arguments once it lands.
 #[allow(dead_code)]
 #[derive(Subcommand, Debug)]
 enum Verb {
@@ -90,7 +90,7 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
             address,
             fingerprint,
         } => add(ctx, name, address, fingerprint).await,
-        Verb::Update { .. } => Err(crate::not_ported("machine update")),
+        Verb::Update { name } => end::update(ctx, &name).await,
         // This computer's machine role needs TensorD inside the binary.
         Verb::Enable => Err(crate::not_ported("machine enable")),
         Verb::Disable => Err(crate::not_ported("machine disable")),
