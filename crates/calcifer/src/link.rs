@@ -212,6 +212,7 @@ impl Link {
             });
             let tell = async {
                 let mut tick = tokio::time::interval(TELL_EVERY);
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 tick.tick().await;
                 loop {
                     tick.tick().await;
