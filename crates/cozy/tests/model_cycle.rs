@@ -115,16 +115,21 @@ fn workspace() -> bool {
 
 /// A machine added to this home. TensorD v0.7.3 doesn't apply the run's CA to every Hub call
 /// (fixed in #1384, ships with the cohort), so a released one also trusts the Hub's CA through
-/// SSL_CERT_FILE; the workspace's (`cozy_tensord=workspace`, which sets COZY_TENSORD) gets none,
-/// and every Hub call it makes proves the CA arrives through the run's access alone.
+/// SSL_CERT_FILE: the system's roots and the Hub's CA together, since its uv reads PyPI through the
+/// same file. The workspace's (`cozy_tensord=workspace`, which sets COZY_TENSORD) gets none, and
+/// every Hub call it makes proves the CA arrives through the run's access alone.
 fn machine(home: &Home, name: &str) -> common::tensord::Tensord {
-    match workspace() {
-        true => common::tensord::added(home, name),
-        false => {
-            let ca = std::env::var("TENSORHUB_CA").expect("the CI Hub's CA");
-            common::tensord::added_with(home, name, &[("SSL_CERT_FILE", &ca)])
-        }
+    if workspace() {
+        return common::tensord::added(home, name);
     }
+    let hub = std::fs::read_to_string(std::env::var("TENSORHUB_CA").expect("the CI Hub's CA")).unwrap();
+    let roots = ["/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt"]
+        .iter()
+        .find_map(|path| std::fs::read_to_string(path).ok())
+        .expect("the system's CA roots");
+    let bundle = home.path().join("ca-bundle.pem");
+    std::fs::write(&bundle, format!("{roots}\n{hub}")).unwrap();
+    common::tensord::added_with(home, name, &[("SSL_CERT_FILE", bundle.to_str().unwrap())])
 }
 
 #[test]
