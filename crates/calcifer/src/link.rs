@@ -25,6 +25,8 @@ use crate::{
     store,
 };
 
+/// The refusal of a machine from before this API (cozy v0.9's gRPC), which is never driven.
+pub const OUTDATED: &str = "machine_outdated";
 /// Parts of an upload in flight side by side, each on its own connection.
 const LANES: usize = 4;
 /// How often an upload asks the machine what it holds, which is its progress.
@@ -66,10 +68,9 @@ impl From<Error> for LinkError {
                 LinkError::Unreachable(format!("{}: {}", error.code, error.message))
             }
             Error::Transport(message) => LinkError::Unreachable(message),
-            // A machine from before this API (cozy v0.9's gRPC) is never driven: end it.
             Error::NotMachineApi(message) => LinkError::Refused {
-                code: "machine_outdated".into(),
-                message: format!("{message}; end it (`cozy machine end`) and use a new one"),
+                code: OUTDATED.into(),
+                message,
             },
         }
     }
