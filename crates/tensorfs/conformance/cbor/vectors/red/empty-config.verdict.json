@@ -1,4 +1,0 @@
-{
-  "expect": "refuse",
-  "why": "inline configs are JSON objects"
-}

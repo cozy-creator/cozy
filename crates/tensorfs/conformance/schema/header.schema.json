@@ -1,0 +1,288 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "$id": "https://github.com/cozy-creator/cozy-creator/crates/tensorfs/conformance/schema/header.schema.json",
+ "title": "cozytensors/2 header",
+ "description": "Structure only; byte-length, bounds and duplicate-key rules are in spec/cozytensors-2.md. Unknown fields are allowed.",
+ "type": "object",
+ "required": [
+  "format",
+  "chunks",
+  "components"
+ ],
+ "properties": {
+  "format": {
+   "type": "string",
+   "pattern": "^cozytensors/2(\\.[0-9]+)?$"
+  },
+  "chunks": {
+   "type": "array",
+   "items": {
+    "$ref": "#/$defs/objectRef"
+   }
+  },
+  "components": {
+   "type": "object",
+   "propertyNames": {
+    "$ref": "#/$defs/segment"
+   },
+   "additionalProperties": {
+    "type": "object",
+    "required": [
+     "tensors"
+    ],
+    "properties": {
+     "tensors": {
+      "type": "object",
+      "propertyNames": {
+       "minLength": 1
+      },
+      "additionalProperties": {
+       "$ref": "#/$defs/tensor"
+      }
+     }
+    }
+   }
+  },
+  "metadata": {
+   "$ref": "#/$defs/metadata"
+  }
+ },
+ "$defs": {
+  "u64": {
+   "type": "integer",
+   "minimum": 0,
+   "maximum": 18446744073709551615
+  },
+  "segment": {
+   "type": "string",
+   "pattern": "^(?!\\.\\.?$)[^/\\\\\\u0000]+$"
+  },
+  "objectRef": {
+   "type": "object",
+   "required": [
+    "sha256",
+    "length"
+   ],
+   "properties": {
+    "sha256": {
+     "type": "string",
+     "pattern": "^[0-9a-f]{64}$"
+    },
+    "length": {
+     "$ref": "#/$defs/u64"
+    }
+   }
+  },
+  "value": {
+   "anyOf": [
+    {
+     "type": [
+      "null",
+      "boolean",
+      "string"
+     ]
+    },
+    {
+     "type": "integer",
+     "minimum": -9223372036854775808,
+     "maximum": 18446744073709551615
+    },
+    {
+     "type": "array",
+     "items": {
+      "$ref": "#/$defs/value"
+     }
+    },
+    {
+     "type": "object",
+     "additionalProperties": {
+      "$ref": "#/$defs/value"
+     }
+    }
+   ]
+  },
+  "metadata": {
+   "type": "object",
+   "additionalProperties": {
+    "$ref": "#/$defs/value"
+   }
+  },
+  "dtype": {
+   "enum": [
+    "BOOL",
+    "F4",
+    "F6_E2M3",
+    "F6_E3M2",
+    "U8",
+    "I8",
+    "F8_E5M2",
+    "F8_E4M3",
+    "F8_E8M0",
+    "F8_E4M3FNUZ",
+    "F8_E5M2FNUZ",
+    "I16",
+    "U16",
+    "F16",
+    "BF16",
+    "I32",
+    "U32",
+    "F32",
+    "C64",
+    "F64",
+    "I64",
+    "U64"
+   ]
+  },
+  "shape": {
+   "type": "array",
+   "items": {
+    "$ref": "#/$defs/u64"
+   }
+  },
+  "location": {
+   "type": "object",
+   "required": [
+    "chunk",
+    "offset",
+    "length"
+   ],
+   "properties": {
+    "chunk": {
+     "$ref": "#/$defs/u64"
+    },
+    "offset": {
+     "$ref": "#/$defs/u64"
+    },
+    "length": {
+     "$ref": "#/$defs/u64"
+    }
+   }
+  },
+  "part": {
+   "type": "object",
+   "required": [
+    "dtype",
+    "shape",
+    "chunk",
+    "offset",
+    "length"
+   ],
+   "properties": {
+    "dtype": {
+     "$ref": "#/$defs/dtype"
+    },
+    "shape": {
+     "$ref": "#/$defs/shape"
+    },
+    "chunk": {
+     "$ref": "#/$defs/u64"
+    },
+    "offset": {
+     "$ref": "#/$defs/u64"
+    },
+    "length": {
+     "$ref": "#/$defs/u64"
+    }
+   }
+  },
+  "tensor": {
+   "type": "object",
+   "required": [
+    "dtype",
+    "shape"
+   ],
+   "properties": {
+    "dtype": {
+     "$ref": "#/$defs/dtype"
+    },
+    "shape": {
+     "$ref": "#/$defs/shape"
+    },
+    "data": {
+     "anyOf": [
+      {
+       "type": "null"
+      },
+      {
+       "$ref": "#/$defs/location"
+      }
+     ]
+    },
+    "encoding": {
+     "anyOf": [
+      {
+       "type": "null"
+      },
+      {
+       "type": "object",
+       "required": [
+        "scheme"
+       ],
+       "properties": {
+        "scheme": {
+         "type": "string",
+         "minLength": 1
+        },
+        "params": {
+         "$ref": "#/$defs/metadata"
+        }
+       }
+      }
+     ]
+    },
+    "parts": {
+     "anyOf": [
+      {
+       "type": "null"
+      },
+      {
+       "type": "object",
+       "minProperties": 1,
+       "propertyNames": {
+        "minLength": 1
+       },
+       "additionalProperties": {
+        "$ref": "#/$defs/part"
+       }
+      }
+     ]
+    }
+   },
+   "oneOf": [
+    {
+     "required": [
+      "data"
+     ],
+     "properties": {
+      "data": {
+       "type": "object"
+      },
+      "encoding": {
+       "type": "null"
+      },
+      "parts": {
+       "type": "null"
+      }
+     }
+    },
+    {
+     "required": [
+      "encoding",
+      "parts"
+     ],
+     "properties": {
+      "data": {
+       "type": "null"
+      },
+      "encoding": {
+       "type": "object"
+      },
+      "parts": {
+       "type": "object"
+      }
+     }
+    }
+   ]
+  }
+ }
+}

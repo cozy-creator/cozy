@@ -1,4 +1,0 @@
-{
-  "expect": "refuse",
-  "why": "tensor names are unique within a component"
-}

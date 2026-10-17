@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::{
-    check_format, invalid, json, Dtype, Error, Result, Value, HEADER_FORMAT, HEADER_PATH,
-    MANIFEST_FORMAT, REPO_FORMAT,
+    check_format, decode, invalid, json, Dtype, Error, PartBytes, Result, Value, HEADER_FORMAT,
+    HEADER_PATH, MANIFEST_FORMAT, REPO_FORMAT,
 };
 
 /// Free-form metadata, and a scheme's params.
@@ -357,6 +357,42 @@ impl Header {
             out.extend_from_slice(&bytes[s.start as usize..(s.start + s.length) as usize]);
         }
         Ok(out)
+    }
+
+    /// A tensor's logical bytes: a plain tensor's data, or its parts through the reference decode.
+    pub fn read<B: AsRef<[u8]>>(
+        &self,
+        component: &str,
+        key: &str,
+        mut chunk: impl FnMut(usize) -> Result<B>,
+    ) -> Result<Vec<u8>> {
+        let Some(t) = self.tensor(component, key) else {
+            return invalid(format!("no tensor {component}/{key}"));
+        };
+        match &t.body {
+            Body::Data(at) => self.bytes(at, &mut chunk),
+            Body::Encoded { encoding, parts } => {
+                let bytes = parts
+                    .values()
+                    .map(|p| self.bytes(&p.at(), &mut chunk))
+                    .collect::<Result<Vec<_>>>()?;
+                let views = parts
+                    .iter()
+                    .zip(&bytes)
+                    .map(|((role, p), b)| {
+                        (
+                            role.as_str(),
+                            PartBytes {
+                                dtype: p.dtype,
+                                shape: &p.shape,
+                                bytes: b,
+                            },
+                        )
+                    })
+                    .collect();
+                decode(t.dtype, &t.shape, encoding, &views)
+            }
+        }
     }
 
     fn check(&self, at: &Location, dtype: Dtype, shape: &[u64], what: &str) -> Result<()> {

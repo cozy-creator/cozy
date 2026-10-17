@@ -1,0 +1,108 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "$id": "https://github.com/cozy-creator/cozy-creator/crates/tensorfs/conformance/schema/repo.schema.json",
+ "title": "tensorfs.repo/2",
+ "description": "Structure only; byte-length, bounds and duplicate-key rules are in spec/cozytensors-2.md. Unknown fields are allowed.",
+ "type": "object",
+ "required": [
+  "format",
+  "name",
+  "releases"
+ ],
+ "properties": {
+  "format": {
+   "type": "string",
+   "pattern": "^tensorfs\\.repo/2(\\.[0-9]+)?$"
+  },
+  "name": {
+   "type": "string",
+   "pattern": "^(?!\\.\\.?/)[^/\\\\\\u0000]+/(?!\\.\\.?$)[^/\\\\\\u0000]+$"
+  },
+  "releases": {
+   "type": "array",
+   "items": {
+    "type": "object",
+    "required": [
+     "version",
+     "lanes"
+    ],
+    "properties": {
+     "version": {
+      "type": "string",
+      "minLength": 1
+     },
+     "lanes": {
+      "type": "object",
+      "propertyNames": {
+       "minLength": 1
+      },
+      "additionalProperties": {
+       "$ref": "#/$defs/objectRef"
+      }
+     }
+    }
+   }
+  }
+ },
+ "$defs": {
+  "u64": {
+   "type": "integer",
+   "minimum": 0,
+   "maximum": 18446744073709551615
+  },
+  "segment": {
+   "type": "string",
+   "pattern": "^(?!\\.\\.?$)[^/\\\\\\u0000]+$"
+  },
+  "objectRef": {
+   "type": "object",
+   "required": [
+    "sha256",
+    "length"
+   ],
+   "properties": {
+    "sha256": {
+     "type": "string",
+     "pattern": "^[0-9a-f]{64}$"
+    },
+    "length": {
+     "$ref": "#/$defs/u64"
+    }
+   }
+  },
+  "value": {
+   "anyOf": [
+    {
+     "type": [
+      "null",
+      "boolean",
+      "string"
+     ]
+    },
+    {
+     "type": "integer",
+     "minimum": -9223372036854775808,
+     "maximum": 18446744073709551615
+    },
+    {
+     "type": "array",
+     "items": {
+      "$ref": "#/$defs/value"
+     }
+    },
+    {
+     "type": "object",
+     "additionalProperties": {
+      "$ref": "#/$defs/value"
+     }
+    }
+   ]
+  },
+  "metadata": {
+   "type": "object",
+   "additionalProperties": {
+    "$ref": "#/$defs/value"
+   }
+  }
+ }
+}

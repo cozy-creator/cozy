@@ -1,0 +1,68 @@
+{
+  "format": "cozytensors/2",
+  "chunks": [
+    {
+      "sha256": "4862f447f2c7f272fa2f4aaf89dadb3b1ac09105bd5864f8d1a0c9452bb0a226",
+      "length": 8192
+    },
+    {
+      "sha256": "0c62f876ef1dea830de9f32c2f4b46dd6d74d50d15896e09ef5a2fcd4ac7e1d7",
+      "length": 64
+    }
+  ],
+  "components": {
+    "unet": {
+      "tensors": {
+        "a.weight": {
+          "dtype": "BF16",
+          "shape": [
+            2,
+            3
+          ],
+          "data": {
+            "chunk": 0,
+            "offset": 0,
+            "length": 12
+          }
+        },
+        "b.weight": {
+          "dtype": "F32",
+          "shape": [
+            4,
+            1024
+          ],
+          "encoding": {
+            "scheme": "fp8-rowwise",
+            "params": {
+              "axis": 0
+            }
+          },
+          "parts": {
+            "weight": {
+              "dtype": "F8_E4M3",
+              "shape": [
+                4,
+                1024
+              ],
+              "chunk": 0,
+              "offset": 4096,
+              "length": 4096
+            },
+            "scale": {
+              "dtype": "F32",
+              "shape": [
+                4
+              ],
+              "chunk": 1,
+              "offset": 0,
+              "length": 16
+            }
+          }
+        }
+      }
+    }
+  },
+  "metadata": {
+    "prompt": "a cat"
+  }
+}

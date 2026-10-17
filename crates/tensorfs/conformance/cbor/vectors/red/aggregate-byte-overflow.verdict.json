@@ -1,4 +1,0 @@
-{
-  "expect": "refuse",
-  "why": "aggregate byte arithmetic refuses overflow"
-}

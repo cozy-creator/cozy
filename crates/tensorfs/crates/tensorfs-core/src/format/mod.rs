@@ -2,11 +2,14 @@
 //! Normative spec: `crates/tensorfs/spec/cozytensors-2.md`. Depends on serde, serde_json and
 //! sha2 only, so it builds without the `store` feature.
 
+mod decode;
 mod doc;
 mod dtype;
 mod json;
+pub mod layout;
 mod value;
 
+pub use decode::{decode, PartBytes, SCHEMES};
 pub use doc::{
     Body, Component, Encoding, Header, Location, Manifest, Metadata, ObjectRef, Part, Release,
     Repo, Span, Tensor,

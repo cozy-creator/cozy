@@ -1,0 +1,1 @@
+{"files":{"LICENSE":{"length":"4","sha256":"cc1d3b0234846714b0aeda6cc34b057b4305bb83dd447fb88f816efeb59a4e96"},"model.cozytensors":{"length":900,"sha256":"1e0584a25d9f43bf5cbd0aec01eb1af2220ed085b4e7f1837b0d89958cae353a"},"unet/config.json":{"length":120,"sha256":"b79606fb3afea5bd1609ed40b622142f1c98125abcfe89a76a661b0e8e343910"}},"format":"tensorfs.manifest/2"}
