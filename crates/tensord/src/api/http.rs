@@ -583,7 +583,8 @@ async fn put_object<B: MachineBackend>(
     drop(sender);
     let held = writer
         .await
-        .map_err(|_| Error::internal("machine_operation_stopped", "machine operation stopped"))??;
+        .map_err(|_| Error::internal("machine_operation_stopped", "machine operation stopped"))?
+        .map_err(Error::from)?;
     if let Some(error) = failed {
         return Err(error.into());
     }
