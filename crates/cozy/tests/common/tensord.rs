@@ -1,7 +1,9 @@
 //! A real TensorD (`COZY_TEST_TENSORD`, the binary a cozy-runtime wheel carries) on a temp root, for
-//! tests that add it as another computer's machine. Its TLS identity outlives a restart.
+//! tests that add it as another computer's machine. It runs as a persistent machine from a grant in
+//! its environment, as a computer's machine does, so its Status carries its store, disk, models and
+//! environments. Its TLS identity outlives a restart.
 use std::{
-    os::unix::fs::PermissionsExt as _,
+    os::unix::{fs::PermissionsExt as _, process::CommandExt as _},
     path::Path,
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
@@ -57,42 +59,39 @@ impl Tensord {
     /// Restarts it admitting `keys`: same identity and leaf, a new port.
     pub fn restart(&mut self, keys: &[String]) {
         self.stop();
-        let config = self.root.path().join("config");
-        std::fs::create_dir_all(&config).unwrap();
-        let write = |name: &str, value: serde_json::Value| {
-            let path = config.join(name);
-            std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        };
-        write("keys.json", serde_json::json!({ "keys": keys }));
-        write(
-            "readiness.json",
-            serde_json::json!({ "key_b64url": URL_SAFE_NO_PAD.encode([7u8; 32]) }),
-        );
-        write(
-            "machine.json",
-            serde_json::json!({"worker_id": "cli-test", "identity_directory": "identity",
-                "authorized_keys_file": "keys.json", "readiness_hmac_key_file": "readiness.json"}),
-        );
-        let state = self.root.path().join("state");
-        let _ = std::fs::remove_file(state.join("api-ready.json"));
+        let root = self.root.path().join("machine");
+        let key_file = self.root.path().join("receipt-key");
+        std::fs::write(&key_file, URL_SAFE_NO_PAD.encode([7u8; 32])).unwrap();
+        std::fs::set_permissions(&key_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
         let binary = std::env::var_os("COZY_TEST_TENSORD")
             .expect("COZY_TEST_TENSORD names the tensord binary these tests run against");
         let mut child = Command::new(binary)
+            .arg("run")
+            .env_remove("COZY_TEST_TENSORD")
+            .env("COZY_MACHINE_ROOT", &root)
+            .env("COZY_LISTEN_HOST", "127.0.0.1")
+            .env("COZY_WORKER_ID", "cli-test")
+            .env("COZY_MACHINE_LIFETIME", "persistent")
+            .env("COZY_WORKER_INTERNAL_PORT", port.to_string())
+            .env("COZY_AUTHORIZED_KEYS", keys.join(","))
+            .env("COZY_BOOTSTRAP_RECEIPT_HMAC_KEY_FILE", &key_file)
+            .env("CUDA_VISIBLE_DEVICES", "")
             .envs(self.env.iter().map(|(k, v)| (k, v)))
-            .args(["serve", "--state"])
-            .arg(&state)
-            .arg("--machine-config")
-            .arg(config.join("machine.json"))
-            .args(["--listen", "127.0.0.1:0", "--host-bytes", "0"])
+            // Its own process group: the machine's stable parent starts children, and stop ends them all.
+            .process_group(0)
             .stdout(Stdio::null())
             .spawn()
             .unwrap();
-        let ready = wait_ready(&mut child, &state);
+        self.address = format!("127.0.0.1:{port}");
+        let leaf = root.join("run/cozy/bootstrap/tls.crt");
+        wait_ready(&mut child, &leaf, &self.address);
         self.child = Some(child);
-        self.address = ready["address"].as_str().unwrap().into();
-        let body: String = ready["cert_pem"]
-            .as_str()
+        let body: String = std::fs::read_to_string(&leaf)
             .unwrap()
             .lines()
             .filter(|line| !line.starts_with("-----"))
@@ -101,10 +100,12 @@ impl Tensord {
         self.fingerprint = format!("sha256:{}", hex::encode(Sha256::digest(&der)));
     }
 
-    /// Ends the exact process this test started.
+    /// Ends the exact processes this test started: its process group.
     pub fn stop(&mut self) {
         if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
+            let _ = Command::new("kill")
+                .args(["-KILL", "--", &format!("-{}", child.id())])
+                .status();
             let _ = child.wait();
         }
     }
@@ -116,19 +117,16 @@ impl Drop for Tensord {
     }
 }
 
-fn wait_ready(child: &mut Child, state: &Path) -> serde_json::Value {
+fn wait_ready(child: &mut Child, leaf: &Path, address: &str) {
     // A hang bound for a machine that never starts; the product waits without one.
     let until = Instant::now() + Duration::from_secs(120);
-    loop {
-        if let Ok(bytes) = std::fs::read(state.join("api-ready.json")) {
-            return serde_json::from_slice(&bytes).unwrap();
-        }
+    while !(leaf.exists() && std::net::TcpStream::connect(address).is_ok()) {
         if let Ok(Some(status)) = child.try_wait() {
             panic!("tensord exited before it served: {status}");
         }
         assert!(
             Instant::now() < until,
-            "tensord did not publish api-ready.json"
+            "tensord did not listen on {address}"
         );
         std::thread::sleep(Duration::from_millis(50));
     }

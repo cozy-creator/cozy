@@ -92,6 +92,11 @@ fn an_added_machine_is_checked_before_it_is_recorded_then_listed_shown_checked_a
             .is_empty(),
         "{shown}"
     );
+    // A persistent machine reports its store's disk.
+    assert!(
+        shown["status"]["disk_total_bytes"].as_u64() > Some(0),
+        "{shown}"
+    );
     let out = home.cozy(["machine", "show", "box"]);
     assert!(out.stdout.contains("platform"), "{out:?}");
     let out = home.cozy(["doctor", "--on", "box"]);
@@ -170,11 +175,11 @@ fn machine_refusals_say_what_to_do_instead() {
     }
 }
 
-/// `machine update` is a numbered run of kind update, sent to the machine and followed like any run.
-/// The target comes from the default Hub's public `/v1/software`; this TensorD does not update in
-/// place, so the run ends failed with the machine's own reason.
+/// `machine update` is a numbered run of kind update, sent to the machine and followed like any run
+/// across the machine's restart. The target is the default Hub's public `/v1/software`; once the
+/// machine runs it, another update sends nothing.
 #[test]
-fn an_update_is_a_run_the_machine_answers() {
+fn an_update_installs_the_hubs_target_and_then_has_nothing_to_do() {
     let Some(home) = Home::new() else { return };
     let _calcifer = home.want_calcifer();
     let _machine = tensord::added(&home, "upd");
@@ -182,14 +187,24 @@ fn an_update_is_a_run_the_machine_answers() {
     let last: serde_json::Value =
         serde_json::from_str(out.stdout.lines().last().unwrap_or_default())
             .unwrap_or_else(|e| panic!("{e}: {out:?}"));
+    let run = &last["run"];
     assert_eq!(
-        (
-            out.code,
-            last["type"].as_str(),
-            last["run"]["kind"].as_str()
-        ),
-        (1, Some("run.failed"), Some("update")),
+        (out.code, last["type"].as_str(), run["kind"].as_str()),
+        (0, Some("run.completed"), Some("update")),
         "{out:?}"
     );
-    eprintln!("the update ended: {}", last["run"]["reason"]);
+    let to = run["result"]["to"]["runtime"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        run["target"].as_str().unwrap().contains(&to) && !to.is_empty(),
+        "{run}"
+    );
+    let again = home.json(["machine", "update", "upd", "--json"]);
+    assert_eq!(
+        (again["changed"].as_bool(), again["runtime"].as_str()),
+        (Some(false), Some(to.as_str())),
+        "{again}"
+    );
 }
