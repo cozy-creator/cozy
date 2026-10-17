@@ -619,6 +619,8 @@ pub async fn publish(ctx: &Context) -> Result<ExitCode, Error> {
     let finalize = types::PackageReleaseFinalize {
         publication_id: grants.publication_id.clone(),
         python_version: Some(python.full.clone()),
+        // Machines install from the release's uv.lock; the Hub needs no rows.
+        registry: None,
     };
     let mut state = client
         .finalize_package_release(org, name, release, &finalize)
