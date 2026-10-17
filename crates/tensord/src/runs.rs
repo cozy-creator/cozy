@@ -505,11 +505,11 @@ impl Runs {
                     })?,
             ),
             Source::Local(digest) => {
-                observe("installing the local package", 0, 0);
                 let local = self.local.as_ref().ok_or_else(|| {
                     refused("capability_unavailable", "this machine installs no local packages")
                 })?;
-                let installed = local.install(&self.service, actor, digest, Some(&stoppable.stop))?;
+                let stage = |stage: &str| observe(stage, 0, 0);
+                let installed = local.install(&self.service, actor, digest, Some(&stoppable.stop), &stage)?;
                 self.supersede(actor, &installed)?;
                 local.collect(actor, &installed.package);
                 // A call's imports start as soon as its code is installed, as a release's do.
