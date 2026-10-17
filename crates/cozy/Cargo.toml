@@ -22,7 +22,9 @@ ed25519-dalek.workspace = true
 hex.workspace = true
 hub-client = { workspace = true, features = ["testing"] }
 migrate = { workspace = true, features = ["testing"] }
+prost.workspace = true
 reqwest.workspace = true
+rusqlite.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tempfile.workspace = true

@@ -20,7 +20,7 @@ hub-client.workspace = true
 hyper-util.workspace = true
 prost.workspace = true
 reqwest.workspace = true
-rusqlite.workspace = true
+rusqlite = { workspace = true, features = ["backup"] }
 rusqlite_migration.workspace = true
 rustls.workspace = true
 serde.workspace = true
