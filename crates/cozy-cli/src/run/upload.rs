@@ -11,9 +11,6 @@ use cozy_proto::{
 use super::{exit_code, follow, submit};
 use crate::{Context, model::refs::Repo};
 
-/// A weights output's media type: its bytes are the checkpoint's manifest.
-const MANIFEST: &str = "application/vnd.cozy.model-manifest";
-
 pub async fn exec(
     ctx: &Context,
     reference: &str,
@@ -56,7 +53,7 @@ fn weights<'a>(run: &'a Run, output: Option<&str>) -> Result<&'a OutputItem, Err
     let held: Vec<&OutputItem> = run
         .output
         .iter()
-        .filter(|item| item.media_type == MANIFEST && output.is_none_or(|name| item.name == name))
+        .filter(|item| item.is_checkpoint() && output.is_none_or(|name| item.name == name))
         .collect();
     match held.as_slice() {
         [item] if item.sha256.is_some() => Ok(item),
@@ -116,7 +113,7 @@ fn submission(run: &Run, item: &OutputItem, machine: String, destination: &Repo)
 #[cfg(test)]
 mod tests {
     use cozy_proto::{
-        calcifer::{ItemStatus, Status},
+        calcifer::{CHECKPOINT, ItemStatus, Status},
         ids::{Digest, RunId},
     };
 
@@ -153,19 +150,19 @@ mod tests {
 
     #[test]
     fn the_weights_output_is_named_or_the_only_one() {
-        let one = run(&[("int8", MANIFEST, true), ("preview", "image/webp", true)]);
+        let one = run(&[("int8", CHECKPOINT, true), ("preview", "image/webp", true)]);
         assert_eq!(weights(&one, None).unwrap().name, "int8");
         assert_eq!(
             weights(&one, Some("preview")).unwrap_err().code,
             "run_output_absent"
         );
-        let two = run(&[("int8", MANIFEST, true), ("fp8", MANIFEST, true)]);
+        let two = run(&[("int8", CHECKPOINT, true), ("fp8", CHECKPOINT, true)]);
         assert_eq!(
             weights(&two, None).unwrap_err().code,
             "run_output_ambiguous"
         );
         assert_eq!(weights(&two, Some("fp8")).unwrap().name, "fp8");
-        let unfinished = run(&[("int8", MANIFEST, false)]);
+        let unfinished = run(&[("int8", CHECKPOINT, false)]);
         assert_eq!(
             weights(&unfinished, None).unwrap_err().code,
             "run_output_unfinished"
@@ -174,7 +171,7 @@ mod tests {
 
     #[test]
     fn an_upload_is_a_warm_run_on_the_runs_machine() {
-        let held = run(&[("int8", MANIFEST, true)]);
+        let held = run(&[("int8", CHECKPOINT, true)]);
         let destination = Repo::hub("Paul/SDXL-int8").unwrap();
         let submit = submission(&held, &held.output[0], "kiyui".into(), &destination);
         assert_eq!(

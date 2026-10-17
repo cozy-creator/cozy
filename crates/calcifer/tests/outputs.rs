@@ -21,7 +21,7 @@ use common::{Tensord, installing_machine, package_run};
 use cozy_platform::{lock::LockFile, paths::Home};
 use cozy_proto::{
     calcifer::{
-        Event, Holder, Kind, MachinesEvent, OutputItem, Run, RunsEvent, Status,
+        CHECKPOINT, Event, Holder, Kind, MachinesEvent, OutputItem, Run, RunsEvent, Status,
         SubmitRun,
     },
     config::{Config, Loaded},
@@ -854,5 +854,150 @@ async fn the_machines_stream_says_when_a_machine_changes_and_when_it_is_removed(
         matches!(removed.last(), Some(MachinesEvent::Removed { .. })),
         "{removed:?}"
     );
+    served.down().await;
+}
+
+/// Every output a run makes ends in one terminal state: a file, a list's items and a tree land
+/// here; a checkpoint stays on its machine and is final at once, so it holds up no follower and no
+/// `machine end`; an output its machine refuses once the run has ended is recorded lost, never
+/// asked for again and again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_output_ends_landed_kept_or_lost_and_a_checkpoint_waits_on_nothing() {
+    let home = tempfile::tempdir().unwrap();
+    let mut machine = installing_machine();
+    with_machine(home.path(), &machine);
+    // A settled run on a machine nothing can be read from, whose output is a checkpoint.
+    let key = common::key_file(home.path());
+    let store = Store::open(&Home::at(home.path()).calcifer_db()).unwrap();
+    store
+        .put_machine(&common::machine("c", None, &key))
+        .unwrap();
+    let kept = RunId::mint([6; 12]);
+    let new = NewRun {
+        id: kept.clone(),
+        kind: Kind::Call,
+        target: "quantize".into(),
+        hub: String::new(),
+        machine: Some("c".into()),
+        pinned: true,
+        spec: common::warm_spec("https://tensorhub.com", vec![]),
+        out_dir: home.path().join("kept"),
+        warnings: vec![],
+        inputs: vec![],
+        wants: None,
+    };
+    store.submit("kept", "sha256:kept", new).unwrap();
+    assert!(store.mark_sent(kept.as_str(), "c").unwrap());
+    let state = v1::RunState {
+        id: kept.to_string(),
+        number: 1,
+        state: "running".into(),
+        ..Default::default()
+    };
+    store.accept(kept.as_str(), "c", &state).unwrap();
+    let outcome = v1::Outcome {
+        status: "succeeded".into(),
+        outputs: vec![v1::Product {
+            media_type: CHECKPOINT.into(),
+            ..product("fp8", 0, 1, br#"{"entries":[]}"#)
+        }],
+        ..Default::default()
+    };
+    store.settle(kept.as_str(), &outcome, 1 << 32).unwrap();
+    drop(store);
+
+    let served = Served::start(home.path()).await;
+    let gate = home.path().join("gate");
+    std::fs::write(&gate, b"").unwrap();
+    let made = served
+        .submit_as("made", &package_run(home.path(), &gate, 1 << 20))
+        .await;
+    let until = Instant::now() + PATIENCE;
+    let landed = loop {
+        let run = served.run(&made.id).await;
+        if run.status == Status::Completed && run.output.iter().all(|o| o.path.is_some()) {
+            break run;
+        }
+        assert!(Instant::now() < until, "{run:?}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    let kinds: BTreeSet<&str> = landed.output.iter().map(|o| o.name.as_str()).collect();
+    assert_eq!(kinds, BTreeSet::from(["big", "frames", "tree", "video"]));
+
+    let run = served.run(&kept).await;
+    let fp8 = &run.output[0];
+    assert!(
+        fp8.is_checkpoint() && fp8.path.is_none() && fp8.export_error.is_none(),
+        "{fp8:?}"
+    );
+    let route = served.get(&format!("/v1/runs/{kept}/outputs/fp8")).send();
+    assert_eq!(
+        code(route.await.unwrap()).await,
+        (StatusCode::CONFLICT, "output_is_a_checkpoint".into())
+    );
+    let (status, ended) = served.end("c", false).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a checkpoint holds up no end: {ended}"
+    );
+
+    // `big` is owed again while its machine restarts after the run ended: the export waits for it,
+    // never giving the output up, and lands once it serves again.
+    served.down().await;
+    let db = rusqlite::Connection::open(Home::at(home.path()).calcifer_db()).unwrap();
+    let owed = db
+        .execute(
+            "UPDATE outputs SET exported_rev = NULL, path = NULL WHERE run = ?1 AND name = 'big'",
+            [made.id.as_str()],
+        )
+        .unwrap();
+    assert_eq!(owed, 1);
+    drop(db);
+    machine.stop();
+    let served = Served::start(home.path()).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let big = |run: Run| run.output.into_iter().find(|o| o.name == "big").unwrap();
+    let waiting = big(served.run(&made.id).await);
+    assert!(
+        waiting.path.is_none() && waiting.export_error.is_none(),
+        "{waiting:?}"
+    );
+    machine.start_again();
+    let until = Instant::now() + PATIENCE;
+    loop {
+        let now = big(served.run(&made.id).await);
+        assert!(now.export_error.is_none(), "{now:?}");
+        if now.path.is_some() {
+            break;
+        }
+        assert!(Instant::now() < until, "{now:?}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // The store says `big` is at a revision its machine never had: once the run has ended, the
+    // machine's refusal is final.
+    served.down().await;
+    let db = rusqlite::Connection::open(Home::at(home.path()).calcifer_db()).unwrap();
+    let bumped = db
+        .execute(
+            "UPDATE outputs SET rev = rev + 1 WHERE run = ?1 AND name = 'big'",
+            [made.id.as_str()],
+        )
+        .unwrap();
+    assert_eq!(bumped, 1);
+    drop(db);
+    let served = Served::start(home.path()).await;
+    let until = Instant::now() + PATIENCE;
+    let big = loop {
+        let big = big(served.run(&made.id).await);
+        if big.export_error.is_some() || big.path.is_some() {
+            break big;
+        }
+        assert!(Instant::now() < until, "{big:?}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    let error = big.export_error.as_deref().unwrap_or_default();
+    assert!(error.contains("the machine refused it"), "{big:?}");
     served.down().await;
 }

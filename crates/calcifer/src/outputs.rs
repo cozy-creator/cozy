@@ -22,7 +22,7 @@ use axum::{
     response::Response,
 };
 use cozy_proto::{
-    calcifer::{Event, MachineState},
+    calcifer::{CHECKPOINT, Event, MachineState},
     error::Kind,
     ids::{Digest, RunId},
     machine::{
@@ -43,8 +43,8 @@ use crate::{
     Calcifer, Error, Link, Pause,
     api::{self, Api, Refusal},
     lanes::{self, Ranged},
-    lock,
     link::LANES,
+    lock,
     store::{OutputRow, RunRow, State as RunState, StoreError},
 };
 
@@ -96,6 +96,9 @@ enum Failure {
     Lost(String),
     /// Tried again after a pause, or once the machine changes.
     Again(String),
+    /// The machine's definitive refusal: final once the run has ended (no newer revision can
+    /// come to read instead), tried again before.
+    Refused(String),
 }
 
 impl From<StoreError> for Failure {
@@ -196,11 +199,22 @@ impl Calcifer {
             let mut again = false;
             for (item, exported) in items.iter().zip(exported) {
                 let (name, index, rev) = (&item.name, item.index, item.rev);
+                let exported = match exported {
+                    Err(Failure::Refused(message)) if run.state == RunState::Settled => {
+                        Err(Failure::Lost(format!("the machine refused it ({message})")))
+                    }
+                    exported => exported,
+                };
                 match exported {
                     Ok(()) | Err(Failure::Superseded) => {}
                     Err(Failure::Lost(reason)) => {
                         warn!(run = %id, output = %name, rev, "not exported: {reason}");
-                        let dest = (run.out_dir).join(file_name(run.number, name, index, &item.media_type));
+                        let dest = (run.out_dir).join(file_name(
+                            run.number,
+                            name,
+                            index,
+                            &item.media_type,
+                        ));
                         remove(&suffixed(&dest, ".part"));
                         remove(&suffixed(&dest, ".manifest.part"));
                         match (self.store).export_failed(id.as_str(), name, index, rev, &reason) {
@@ -211,7 +225,7 @@ impl Calcifer {
                             }
                         }
                     }
-                    Err(Failure::Again(message)) => {
+                    Err(Failure::Again(message) | Failure::Refused(message)) => {
                         warn!(run = %id, output = %name, rev, "export waits: {message}");
                         again = true;
                     }
@@ -320,10 +334,15 @@ impl Calcifer {
                 }
             };
             let newer = match told {
-                Ok((id, event)) => id == run.id && matches!(
-                    event,
-                    Event::OutputAdded { .. } | Event::OutputDelta { .. } | Event::OutputDone { .. }
-                ),
+                Ok((id, event)) => {
+                    id == run.id
+                        && matches!(
+                            event,
+                            Event::OutputAdded { .. }
+                                | Event::OutputDelta { .. }
+                                | Event::OutputDone { .. }
+                        )
+                }
                 Err(RecvError::Lagged(_)) => true,
                 Err(RecvError::Closed) => break (&mut work).await,
             };
@@ -430,6 +449,15 @@ pub async fn serve(
     if item.media_type == TREE {
         let message = format!("output {name} of run {number} is a folder: open it on disk");
         return Err(api::refuse(Kind::Conflict, "output_is_a_tree", message));
+    }
+    if item.media_type == CHECKPOINT {
+        let machine = row.machine.as_deref().unwrap_or("its machine");
+        let message = format!(
+            "output {name} of run {number} is a checkpoint: it stays on {machine}, not this computer"
+        );
+        let refusal = api::refuse(Kind::Conflict, "output_is_a_checkpoint", message);
+        let next = format!("cozy run upload {number}#{name} <org/model>");
+        return Err(Refusal(refusal.0.next(next)));
     }
     let (Some(mut file), Some(rev)) = (file, item.exported_rev) else {
         if let Some(reason) = item.export_error {
@@ -825,7 +853,10 @@ async fn read_range(
     at: Arc<AtomicU64>,
     moved: &AtomicU64,
 ) -> Result<(), Ranged<Failure>> {
-    let mut output = lane.get(&target, (first, end), rev).await.map_err(refused)?;
+    let mut output = lane
+        .get(&target, (first, end), rev)
+        .await
+        .map_err(refused)?;
     if output.length != length {
         let held = format!(
             "the machine holds {} bytes of revision {rev}, not {length}",
@@ -878,7 +909,18 @@ fn refused(e: client::Error) -> Ranged<Failure> {
             "the machine no longer holds it ({}: {})",
             error.code, error.message
         ))),
-        // A moved revision (412) is not read again: the run's events bring the newer one.
+        // Definitive: the machine will not serve this read (403, 400, 416, 501) or holds the
+        // output at another revision (412). While the run goes on, its events bring the newer
+        // one; once it ended, none comes.
+        client::Error::Refused {
+            status: 400 | 403 | 412 | 416 | 501,
+            error,
+        } => Ranged::Stop(Failure::Refused(format!(
+            "{}: {}",
+            error.code, error.message
+        ))),
+        // Anything else may pass (its key not admitted yet, a refusal while it starts): asked
+        // again, paced, until it serves or the machine ends, which loses the item.
         client::Error::Refused { status, error } if status < 500 => {
             Ranged::Stop(Failure::Again(format!("{}: {}", error.code, error.message)))
         }

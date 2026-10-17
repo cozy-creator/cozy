@@ -89,6 +89,11 @@ impl Tensord {
     /// restarted.
     pub fn restart(&mut self) {
         self.stop();
+        self.start_again();
+    }
+
+    /// Starts the stopped machine again on its root and address.
+    pub fn start_again(&mut self) {
         let _ = std::fs::remove_file(self.root.path().join("state/api-ready.json"));
         let (child, endpoint) = serve(self.root.path(), &self.endpoint.address, &self.extra);
         assert_eq!(endpoint, self.endpoint, "the same machine");
