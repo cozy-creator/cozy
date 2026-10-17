@@ -236,7 +236,7 @@ fn a_followed_run_returns_only_once_its_outputs_landed() {
         &work,
         &["--json", "run", "big.py", "--on", "m1", "--out", "saved"],
     );
-    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(out.code, 0, "{out:?}");
     let events: Vec<Value> = out
         .stdout
         .lines()
