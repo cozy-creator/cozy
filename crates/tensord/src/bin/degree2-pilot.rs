@@ -129,17 +129,9 @@ struct Exec {
 }
 
 fn used_mib() -> u64 {
-    std::process::Command::new("nvidia-smi")
-        .args([
-            "--query-gpu=memory.used",
-            "--format=csv,noheader,nounits",
-            "-i",
-            "0",
-        ])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok())
-        .unwrap_or(0)
+    cozy_platform::gpu::Device::open("0")
+        .and_then(|device| device.read())
+        .map_or(0, |reading| reading.total.saturating_sub(reading.free) >> 20)
 }
 
 fn fail(what: &str, frame: &Frame) -> io::Error {
