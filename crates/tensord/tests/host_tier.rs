@@ -1070,7 +1070,7 @@ fn concurrent_windows_never_spend_the_same_room() {
 /// object comes once, and what nobody read stays at the Hub.
 #[test]
 fn a_staged_region_waits_on_its_ticket_and_nothing_else_downloads() {
-    use tensorfs_core::{fetch::{Fetcher, Priority}, transport::PullCancellation};
+    use tensorfs_core::{fetch_v1::{Fetcher, Priority}, transport::PullCancellation};
     let fx = Fixture::new("fetched", &[2 * MIB, 3 * MIB, MIB + 7, 5 * MIB]);
     let hex = fx.manifest.trim_start_matches("sha256:").to_string();
     let length = fs::metadata(fx.store.manifest_path(&hex)).unwrap().len();

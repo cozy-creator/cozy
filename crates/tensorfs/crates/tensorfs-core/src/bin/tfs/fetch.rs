@@ -7,7 +7,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tensorfs_core::fetch::{self, FetchPlan, Fetcher, Plain, Priority};
+use tensorfs_core::fetch_v1::{self as fetch, FetchPlan, Fetcher, Plain, Priority};
 use tensorfs_core::store::Store;
 use tensorfs_core::transport::{self, PullCancellation, SourcePolicy};
 

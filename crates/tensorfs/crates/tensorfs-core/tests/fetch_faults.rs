@@ -24,7 +24,7 @@ use tensorfs_core::ids::{Doc, ObjectRef};
 use tensorfs_core::manifest::{Draft, Entry};
 use tensorfs_core::registry;
 use tensorfs_core::store::Store;
-use tensorfs_core::fetch::{Fetcher, Origin, Priority};
+use tensorfs_core::fetch_v1::{Fetcher, Origin, Priority};
 use tensorfs_core::transport::{Anonymous, PullCancellation, SourcePolicy};
 
 /// The ledger's sampling resolution in these proofs. Every patience the transport derives
@@ -711,7 +711,7 @@ impl<'a> Run<'a> {
                 }
                 seen.lock().unwrap().push((Instant::now(), event));
             };
-            let access = Arc::new(tensorfs_core::fetch::Plain { credential: Anonymous, policy });
+            let access = Arc::new(tensorfs_core::fetch_v1::Plain { credential: Anonymous, policy });
             let fetcher = Fetcher::new(&store, streams, sample()).unwrap();
             let origin = Origin {
                 hub: hub_base,
@@ -719,7 +719,7 @@ impl<'a> Run<'a> {
                 lane: "public".into(),
                 manifest: checkpoint.manifest.clone(),
             };
-            let landed = tensorfs_core::fetch::whole(&fetcher, &origin, access, Priority::Now, &stop, &on_progress)
+            let landed = tensorfs_core::fetch_v1::whole(&fetcher, &origin, access, Priority::Now, &stop, &on_progress)
                 .map(|_| Ensured { manifest: checkpoint.manifest.clone(), bytes_total: checkpoint.total() });
             // Its last handle joins its downloader: nothing it started outlives the answer.
             drop(fetcher);
@@ -1198,8 +1198,8 @@ fn a_killed_download_child() {
     let manifest = ObjectRef { sha256: manifest.clone(), length: std::env::var("TFS_KILLED_LENGTH").unwrap().parse().unwrap() };
     let origin = Origin { hub: base.into(), refspec: "acme/model@r1".into(), lane: "public".into(), manifest };
     let policy = SourcePolicy { allowed_hosts: vec!["127.0.0.1".into()], allow_local: true, ..Default::default() };
-    let access = Arc::new(tensorfs_core::fetch::Plain { credential: Anonymous, policy });
-    let _ = tensorfs_core::fetch::whole(&fetcher, &origin, access, Priority::Now, &PullCancellation::default(), &|_, _| {});
+    let access = Arc::new(tensorfs_core::fetch_v1::Plain { credential: Anonymous, policy });
+    let _ = tensorfs_core::fetch_v1::whole(&fetcher, &origin, access, Priority::Now, &PullCancellation::default(), &|_, _| {});
 }
 
 /// A download killed mid-object strands its partial temp; the next download takes it,
@@ -1699,8 +1699,8 @@ fn a_task_capped_child() {
     let fetcher = Fetcher::new(&store, tensorfs_core::transport::PULL_STREAMS, Duration::from_secs(1)).unwrap();
     let origin = Origin { hub: fields[1].into(), refspec: "acme/model@r1".into(), lane: "public".into(), manifest };
     let policy = SourcePolicy { allowed_hosts: vec!["127.0.0.1".into()], allow_local: true, ..Default::default() };
-    let access = Arc::new(tensorfs_core::fetch::Plain { credential: Anonymous, policy });
-    tensorfs_core::fetch::whole(&fetcher, &origin, access, Priority::Now, &PullCancellation::default(), &|_, _| {}).unwrap();
+    let access = Arc::new(tensorfs_core::fetch_v1::Plain { credential: Anonymous, policy });
+    tensorfs_core::fetch_v1::whole(&fetcher, &origin, access, Priority::Now, &PullCancellation::default(), &|_, _| {}).unwrap();
     println!("LANDED");
 }
 

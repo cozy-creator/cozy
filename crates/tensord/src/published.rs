@@ -29,7 +29,7 @@ use std::{
 };
 use tensorfs_core::{
     err::{Code, Refusal},
-    fetch::{DeliveryGrant, FetchPlan},
+    fetch_v1::{DeliveryGrant, FetchPlan},
     ids::ObjectRef,
     sha256,
     store::Store,
@@ -464,10 +464,10 @@ impl Publisher {
         bytes: &(dyn Fn(u64, u64) + Sync)) -> Result<(u64, u64), Failure> {
         let origin = crate::access::origin(source, &named.repository, &named.release, &named.lane, &named.object());
         let catalog = access::of(source, &origin)?;
-        let fetcher = tensorfs_core::fetch::Fetcher::of(&self.store).map_err(|e| refused("model_download_failed", e))?;
+        let fetcher = tensorfs_core::fetch_v1::Fetcher::of(&self.store).map_err(|e| refused("model_download_failed", e))?;
         let stop = stop.cloned().unwrap_or_default();
-        let at = tensorfs_core::fetch::Priority::Now;
-        tensorfs_core::fetch::whole(&fetcher, &origin, catalog.clone(), at, &stop, bytes).map_err(|e| match stop.is_cancelled() {
+        let at = tensorfs_core::fetch_v1::Priority::Now;
+        tensorfs_core::fetch_v1::whole(&fetcher, &origin, catalog.clone(), at, &stop, bytes).map_err(|e| match stop.is_cancelled() {
             true => canceled(),
             false => {
                 let (code, message) = refused("model_download_failed", e);
@@ -484,13 +484,13 @@ impl Publisher {
         }
         let names: Vec<String> = checkpoints.iter().map(|n| format!("{}@{} {}", n.repository, n.release, n.lane)).collect();
         job.stage(format!("resolving {}", names.join(" and ")));
-        let fetcher = tensorfs_core::fetch::Fetcher::of(&self.store).map_err(|e| refused("model_download_failed", e))?;
+        let fetcher = tensorfs_core::fetch_v1::Fetcher::of(&self.store).map_err(|e| refused("model_download_failed", e))?;
         let stop = job.stop.clone().unwrap_or_default();
         let mut wanted = vec![];
         for named in checkpoints {
             let origin = crate::access::origin(source, &named.repository, &named.release, &named.lane, &named.object());
             let catalog = access::of(source, &origin)?;
-            let ticket = fetcher.want(&origin, catalog.clone(), &[], tensorfs_core::fetch::Priority::Now);
+            let ticket = fetcher.want(&origin, catalog.clone(), &[], tensorfs_core::fetch_v1::Priority::Now);
             wanted.push((ticket, catalog));
         }
         for (ticket, catalog) in wanted {

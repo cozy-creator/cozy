@@ -7,7 +7,7 @@ use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use tensorfs_core::fetch::{DeliveryGrant, Destination};
+use tensorfs_core::fetch_v1::{DeliveryGrant, Destination};
 use tensorfs_core::ids::ObjectRef;
 use tensorfs_core::sha256::{hex, Sha256};
 use tensorfs_core::store::{Fault, Store};

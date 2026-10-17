@@ -4,7 +4,7 @@ use crate::{
     canon::{as_arr, Fields, Value},
     catalog::WriterGuard,
     err::{refuse, Code, Refusal, Result},
-    fetch::FetchPlan,
+    fetch_v1::FetchPlan,
     ids::{prefixed, Doc, ObjectRef, Plain},
     manifest::Manifest,
     storage::HeldKey,

@@ -40,6 +40,7 @@ tensorfs-plane = { path = "crates/tensorfs/crates/tensorfs-plane", default-featu
 
 anstream = "1.0.0"
 anstyle = "1.0.14"
+async-trait = "0.1.92"
 aws-lc-rs = "1.18"
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "tokio", "tracing"] }
 base64 = "0.22"
@@ -106,6 +107,7 @@ tonic = { version = "0.14.6", default-features = false, features = ["codegen"] }
 tonic-prost = "0.14.6"
 tonic-prost-build = "0.14.6"
 tower = { version = "0.5", default-features = false, features = ["util"] }
+tower-service = "0.3.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std"] }
 url = { version = "2.5.8", features = ["serde"] }

@@ -15,7 +15,7 @@ use std::{
 };
 use tensorfs_core::{
     err::{Code, Refusal},
-    fetch::{self, Access, Fetcher, Origin, Priority, Ticket},
+    fetch_v1::{self as fetch, Access, Fetcher, Origin, Priority, Ticket},
     header::{Body, Header},
     ids::ObjectRef,
     store::Store,

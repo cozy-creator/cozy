@@ -231,6 +231,11 @@ impl Resolved {
         }
         Ok(addrs)
     }
+
+    /// Answers no connection could use: the next lookup asks the resolver again.
+    pub fn forget(&self, host: &str, port: u16) {
+        self.0.lock().unwrap().remove(&(host.to_string(), port));
+    }
 }
 
 impl SourcePolicy {
@@ -257,6 +262,14 @@ impl SourcePolicy {
     /// every answer. Everything this module fetches or pushes passes here first, and every
     /// redirect hop passes here again.
     pub fn check(&self, url: &str) -> Result<CheckedUrl> {
+        let (https, host, port, target) = self.admit(url)?;
+        let port = port.unwrap_or(if https { 443 } else { 80 });
+        self.resolve_checked(https, host, port, target)
+    }
+
+    /// Everything [`check`](Self::check) refuses before resolving: shape, scheme and allowlist.
+    /// Returns whether the URL is https, its host, port and target.
+    pub fn admit(&self, url: &str) -> Result<(bool, String, Option<u16>, String)> {
         let (scheme, host, port, target) = split_url(url)?;
         let https = scheme == "https";
         if !https && !self.allow_local {
@@ -279,7 +292,16 @@ impl SourcePolicy {
                 ),
             );
         }
-        let port = port.unwrap_or(if https { 443 } else { 80 });
+        Ok((https, host, port, target))
+    }
+
+    fn resolve_checked(
+        &self,
+        https: bool,
+        host: String,
+        port: u16,
+        target: String,
+    ) -> Result<CheckedUrl> {
         let addrs = self
             .resolved
             .lookup(&host, port)

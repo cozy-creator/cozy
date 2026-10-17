@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use common::{components, hub, serve_all, store, temporary, Answer, Checkpoint, Rule};
 use tensorfs_core::err::Code;
-use tensorfs_core::fetch::{self, Access, Fetcher, Origin, Plain, Priority};
+use tensorfs_core::fetch_v1::{self as fetch, Access, Fetcher, Origin, Plain, Priority};
 use tensorfs_core::ids::ObjectRef;
 use tensorfs_core::store::Store;
 use tensorfs_core::transport::{Anonymous, PullCancellation, SourcePolicy};

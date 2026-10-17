@@ -12,7 +12,7 @@ use super::push::{push_object, UploadGrant};
 use crate::canon::Value;
 use crate::dtype::Dtype;
 use crate::err::Code;
-use crate::fetch::{DeliveryGrant, FetchPlan};
+use crate::fetch_v1::{DeliveryGrant, FetchPlan};
 use crate::header::{Body, Closure, Header, Part, Tensor};
 use crate::ids::{Doc, ObjectRef};
 use crate::manifest::{Draft, Entry};
@@ -592,13 +592,13 @@ fn request_for<'a>(store: &'a Store, base: &'a str, policy: &'a SourcePolicy) ->
 }
 
 /// One whole checkpoint the way the machine downloads one: its closure asked of the hub, then
-/// [`crate::fetch::whole`] on a Fetcher of this request's streams and sample.
+/// [`crate::fetch_v1::whole`] on a Fetcher of this request's streams and sample.
 struct PullRequest<'a> {
     store: &'a Store,
     base: &'a str,
     refspec: &'a str,
     lane: &'a str,
-    access: Arc<dyn crate::fetch::Access>,
+    access: Arc<dyn crate::fetch_v1::Access>,
     streams: usize,
     sample_seconds: f64,
     cancellation: Option<super::PullCancellation>,
@@ -620,7 +620,7 @@ impl<'a> PullRequest<'a> {
             base,
             refspec,
             lane: "",
-            access: Arc::new(crate::fetch::Plain { credential, policy: policy.clone() }),
+            access: Arc::new(crate::fetch_v1::Plain { credential, policy: policy.clone() }),
             streams: super::PULL_STREAMS,
             sample_seconds: super::SAMPLE_SECONDS,
             cancellation: None,
@@ -679,8 +679,8 @@ fn pull(request: &PullRequest<'_>) -> crate::err::Result<Pulled> {
         ..Pulled::default()
     };
     let walks = walk_lines(request.store).len();
-    let fetcher = crate::fetch::Fetcher::new(request.store, request.streams, sample)?;
-    let origin = crate::fetch::Origin {
+    let fetcher = crate::fetch_v1::Fetcher::new(request.store, request.streams, sample)?;
+    let origin = crate::fetch_v1::Origin {
         hub: request.base.to_string(),
         refspec: request.refspec.to_string(),
         lane: request.lane.to_string(),
@@ -693,8 +693,8 @@ fn pull(request: &PullRequest<'_>) -> crate::err::Result<Pulled> {
             on_progress(done, total);
         }
     };
-    let priority = crate::fetch::Priority::Now;
-    let landed = crate::fetch::whole(&fetcher, &origin, Arc::clone(&request.access), priority, &stop, &progress);
+    let priority = crate::fetch_v1::Priority::Now;
+    let landed = crate::fetch_v1::whole(&fetcher, &origin, Arc::clone(&request.access), priority, &stop, &progress);
     // Its last handle waits for its downloader, whose walks are then on record.
     drop(fetcher);
     landed?;

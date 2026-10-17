@@ -1,4 +1,4 @@
-use tensorfs_core::fetch::{Fetcher, Volume};
+use tensorfs_core::fetch_v1::{Fetcher, Volume};
 use tensord::{
     owner::{Owner, Shared},
     protocol::{self, Body, Command, Reply, CAPS},
