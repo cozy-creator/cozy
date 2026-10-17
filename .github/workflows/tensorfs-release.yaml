@@ -1,0 +1,183 @@
+name: tensorfs-release
+# TensorFS's Python package (design §2): one abi3 wheel per platform, each built and smoke-installed on a
+# runner of its own platform, and the sdist, proven by a source install. Moved losslessly from the
+# tensorfs repo's wheels.yaml and publish.yaml. Dispatch only; a release is its tensorfs-vX.Y.Z tag:
+#   gh workflow run tensorfs-release.yaml -R cozy-creator/cozy --ref <branch>                         # build and prove
+#   gh workflow run tensorfs-release.yaml -R cozy-creator/cozy --ref tensorfs-vX.Y.Z -f publish=true  # PyPI
+#   gh workflow run tensorfs-release.yaml -R cozy-creator/cozy --ref <branch> -f dev=true             # <version>+dev.g<sha>
+on:
+  # TEMP: test runs on this branch before the file is on master (dropped before merge).
+  push:
+    branches: [xs043-tensorfs-release]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish to PyPI (runs only on a tensorfs-vX.Y.Z tag)
+        type: boolean
+        default: false
+      dev:
+        description: Build <version>+dev.g<sha>, a development wheel PyPI never accepts (artifacts only)
+        type: boolean
+        default: false
+
+concurrency:
+  group: tensorfs-release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # One version everywhere; a publish runs on that version's tag; a store format or claim protocol
+  # unlike the newest published wheel's needs a newer minor (format_contract.py).
+  gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: python3 crates/tensorfs/scripts/version_contract.py source
+      - if: inputs.publish
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("crates/tensorfs/pyproject.toml", "rb"))["project"]["version"])')
+          [ "$GITHUB_REF" = "refs/tags/tensorfs-v$version" ] || { echo "::error::publish runs on tensorfs-v$version, not $GITHUB_REF"; exit 1; }
+      - uses: astral-sh/setup-uv@v7
+      - run: python3 crates/tensorfs/scripts/format_contract.py wheel
+
+  # Release gate (2026-10-01): weights fetched through `ensure` against a real loopback hub and object
+  # store injecting resets, stalls, truncation, 5xx/429, expired URLs and wrong bytes.
+  fetch-faults:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked -p tensorfs-core --test fetch_faults -- --test-threads=2
+
+  # Release gate (run 2322): a real-HTTP hub pull whose first MiBs crawl still finishes at body throughput.
+  download-tail:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked -p tensorfs-core --lib transport::tests::tail -- --nocapture
+
+  wheel:
+    name: wheel ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    # Hang bound, not a work budget.
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x86_64, os: ubuntu-24.04, target: x86_64 }
+          - { name: linux-aarch64, os: ubuntu-24.04-arm, target: aarch64 }
+          - { name: macos-arm64, os: macos-15, target: aarch64-apple-darwin }
+          - { name: windows-x86_64, os: windows-2025, target: x86_64-pc-windows-msvc }
+    env:
+      CARGO_BUILD_JOBS: "4"
+    defaults:
+      run:
+        shell: bash
+        working-directory: crates/tensorfs
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - if: inputs.dev || github.event_name == 'push'
+        run: scripts/dev-version.sh
+      # `tfs` ships in the wheel's data scripts beside the module. On Linux it is built INSIDE the
+      # manylinux container, so its glibc floor matches the extension's (tfs-051).
+      - if: runner.os == 'Linux'
+        uses: PyO3/maturin-action@v1
+        with:
+          maturin-version: v1.15.0
+          working-directory: crates/tensorfs
+          target: ${{ matrix.target }}
+          args: --release --locked --out dist
+          manylinux: auto
+          before-script-linux: |
+            cargo build --release --locked -p tensorfs-core --bin tfs
+            install -D -m 755 ../../target/release/tfs wheel-data/scripts/tfs
+      - if: runner.os != 'Linux'
+        run: |
+          cargo build --release --locked -p tensorfs-core --bin tfs
+          cp ../../target/release/tfs$([ "$RUNNER_OS" = Windows ] && echo .exe) wheel-data/scripts/
+      - if: runner.os != 'Linux'
+        uses: PyO3/maturin-action@v1
+        with:
+          maturin-version: v1.15.0
+          working-directory: crates/tensorfs
+          target: ${{ matrix.target }}
+          args: --release --locked --out dist
+      - name: Smoke (the installed module and CLI)
+        run: |
+          python -m pip install dist/*.whl
+          cd "$RUNNER_TEMP"
+          python -c 'import tensorfs, tensorfs.plane; print(tensorfs.__version__)'
+          tfs version
+      # The whole wheel's contract (version, executable, platform tag), where it is defined: Linux.
+      - if: runner.os == 'Linux'
+        uses: astral-sh/setup-uv@v7
+      - if: runner.os == 'Linux'
+        run: |
+          python3 scripts/version_contract.py wheel dist/*.whl
+          uv run --script scripts/wheel-platform.py dist/*.whl
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.name }}
+          path: crates/tensorfs/dist/*.whl
+          if-no-files-found: error
+          retention-days: 7
+
+  # Built from source it carries the module, not the `tfs` binary (the wheels do).
+  sdist:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - if: inputs.dev || github.event_name == 'push'
+        run: crates/tensorfs/scripts/dev-version.sh
+      - uses: PyO3/maturin-action@v1
+        with:
+          maturin-version: v1.15.0
+          working-directory: crates/tensorfs
+          command: sdist
+          args: --out dist
+      - run: |
+          python -m pip install crates/tensorfs/dist/*.tar.gz
+          cd "$RUNNER_TEMP"
+          python -c 'import tensorfs, tensorfs.plane; print(tensorfs.__version__)'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-sdist
+          path: crates/tensorfs/dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  # Every platform and the sdist, or nothing.
+  publish:
+    if: inputs.publish && !inputs.dev
+    needs: [gate, fetch-faults, download-tail, wheel, sdist]
+    runs-on: ubuntu-24.04
+    environment: pypi
+    # Hang bound, not a work budget.
+    timeout-minutes: 30
+    permissions:
+      id-token: write  # PyPI trusted publishing (OIDC)
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-*
+          merge-multiple: true
+          path: dist
+      - run: ls -l dist
+      - uses: pypa/gh-action-pypi-publish@release/v1

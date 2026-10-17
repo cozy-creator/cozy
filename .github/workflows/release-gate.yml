@@ -2,7 +2,9 @@ name: release-gate
 # dist local-artifacts job (dist-workspace.toml): a release needs a green platforms.yaml run on its own
 # commit that covered every release runner. When the binary links TensorFS (cargo tree, a fact of the
 # build), the newest tensorfs wheel on PyPI must also speak its store format and claim protocol
-# (design §2, crates/tensorfs/scripts/format_contract.py). A dry run reports the verdicts without refusing.
+# (design §2, crates/tensorfs/scripts/format_contract.py); a dry run or prerelease may name a
+# tensorfs-release run (`tensorfs_run`) whose unpublished wheel stands in. A dry run reports the verdicts
+# without refusing.
 # The release carries gates.json: its commit, the must_contain commits release.yml's plan job verified,
 # that platforms run, the tensorfs wheel it matches (or why none was checked), tensorhub.com's
 # /v1/software at release time, and this release run.
@@ -25,6 +27,7 @@ jobs:
           REF: ${{ github.ref_name }}
           TAG: ${{ github.event.inputs.tag }}
           MUST: ${{ github.event.inputs.must_contain }}
+          TENSORFS_RUN: ${{ github.event.inputs.tensorfs_run }}
           RUNNERS: ubuntu-24.04 ubuntu-24.04-arm macos-15 windows-2025 windows-11-arm
         run: |
           runs=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs
@@ -38,7 +41,13 @@ jobs:
           [ -n "$platforms" ] || refusals+=("no green platforms.yaml run on $SHA covers $RUNNERS; run: gh workflow run platforms.yaml --ref $REF")
           tensorfs=
           links=$(cargo tree --locked -p cozy --target all -e normal --prefix none --format '{p}')
-          if grep -q '^tensorfs-core v' <<< "$links"; then
+          if grep -q '^tensorfs-core v' <<< "$links" && [ -n "$TENSORFS_RUN" ]; then
+            # An unpublished wheel (a tensorfs-release run's) stands in for PyPI's, never for a final release.
+            case $TAG in '' | dry-run | *-*) ;; *) refusals+=("tensorfs_run is for dry runs and prereleases, not $TAG") ;; esac
+            gh run download "$TENSORFS_RUN" -R "$GITHUB_REPOSITORY" -n wheel-linux-x86_64 -D candidate
+            tensorfs=$(python3 crates/tensorfs/scripts/format_contract.py binary --wheel candidate/*.whl 2> format.err) \
+              && tensorfs="$tensorfs (unpublished, run $TENSORFS_RUN)" || refusals+=("$(cat format.err)")
+          elif grep -q '^tensorfs-core v' <<< "$links"; then
             tensorfs=$(python3 crates/tensorfs/scripts/format_contract.py binary 2> format.err) || refusals+=("$(cat format.err)")
           else
             notes+=("tensorfs: not checked, the cozy binary does not link tensorfs-core")
