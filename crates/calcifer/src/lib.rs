@@ -762,8 +762,8 @@ impl Calcifer {
             let key = (machine.to_owned(), *digest);
             let turn = lock(&self.writing).entry(key.clone()).or_default().clone();
             let held = turn.lock().await;
-            let path = self.inputs.join(hex::encode(digest.bytes()));
             let hex = hex::encode(digest.bytes());
+            let path = self.inputs.join(&hex);
             let name = match names.get(digest.to_string().as_str()) {
                 Some(field) => field.to_string(),
                 None => format!("sha256:{}", &hex[..12]),
