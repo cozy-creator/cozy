@@ -162,7 +162,6 @@ fn live(stream: &tokio::net::TcpStream) {
 struct MeasuredIdentity {
     worker_id: String,
     boot_id: String,
-    cert_pem: String,
     cert_der: Vec<u8>,
     webrtc_port: Option<u16>,
     capabilities: Vec<String>,
@@ -173,7 +172,6 @@ impl MeasuredIdentity {
         Self {
             worker_id: identity.authority.worker_id.clone(),
             boot_id: identity.authority.boot_id.clone(),
-            cert_pem: identity.cert_pem.clone(),
             cert_der: identity.cert_der.clone(),
             webrtc_port: None,
             capabilities: super::machine_status::capabilities(identity),
@@ -187,7 +185,7 @@ impl MeasuredIdentity {
 async fn prove_readiness(port: u16, readiness: Arc<Readiness>, id: MeasuredIdentity) {
     let listener_bound = crate::machine::probe::presents_leaf(port, &id.cert_der).await;
     let foreign_credential_refused =
-        crate::machine::probe::refuses_foreign_capability(port, &id.cert_pem, &id.worker_id).await;
+        crate::machine::probe::refuses_foreign_capability(port, &id.cert_der, &id.worker_id).await;
     let gpus = match readiness.measures_gpus() {
         false => vec![],
         true => id.gpus,

@@ -793,7 +793,8 @@ impl MachineBackend for NativeBackend {
         Ok(self
             .service
             .engine
-            .with_journal(|journal| journal.measurements(&record.id))?)
+            .with_journal(|journal| journal.measurements(&record.id))
+            .map_err(problem)?)
     }
     fn events(
         &self,

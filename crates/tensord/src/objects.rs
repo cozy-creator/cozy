@@ -321,15 +321,23 @@ impl Objects {
     }
 
     /// The ranges of `digest` (`sha256:<hex>`) this signer holds: all of it once stored, else
-    /// what its upload has landed.
+    /// what its upload has landed. An upload whose ranges cover it is settled first, so whole
+    /// always means stored; bytes that differ from the digest are dropped, and held no more.
     pub fn held(&self, actor: &str, digest: &str) -> Result<Ranges, Refused> {
         let hex = valid(digest)?;
         if let Some(length) = self.renew(actor, digest)? {
             return Ok(whole(length));
         }
         let part = self.part(actor, &hex);
-        if let Some(upload) = self.uploads.lock().unwrap().get(&part).and_then(Weak::upgrade) {
-            return Ok(upload.held());
+        let upload = self.uploads.lock().unwrap().get(&part).and_then(Weak::upgrade);
+        if let Some(upload) = upload {
+            return match upload.held() {
+                held if held != whole(upload.object.length) => Ok(held),
+                _ => match self.settle(&upload) {
+                    Err(refusal) if refusal.code == "object_digest_mismatch" => Ok(vec![]),
+                    settled => settled,
+                },
+            };
         }
         Ok(read_held(&part)?.map(|(_, held)| held).unwrap_or_default())
     }

@@ -26,7 +26,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio_stream::{Stream, StreamExt};
-use v1::api as path;
+use v1::path;
 
 /// A refusal as its envelope, at the status its kind names unless the protocol names another.
 #[derive(Debug)]
@@ -37,8 +37,13 @@ impl From<Error> for Refusal {
     }
 }
 impl From<crate::objects::Refused> for Refusal {
-    fn from(refused: crate::objects::Refused) -> Self {
-        Self(refused_error(refused.code, refused.message), None)
+    fn from(refusal: crate::objects::Refused) -> Self {
+        Self(refusal.into(), None)
+    }
+}
+impl From<crate::objects::Refused> for Error {
+    fn from(refusal: crate::objects::Refused) -> Self {
+        refused(refusal.code, refusal.message)
     }
 }
 impl IntoResponse for Refusal {
@@ -51,7 +56,7 @@ impl IntoResponse for Refusal {
 }
 
 /// A typed refusal of the run layer (`runs`, `objects`) as the error its code names.
-pub(crate) fn refused_error(code: &str, message: impl Into<String>) -> Error {
+pub(crate) fn refused(code: &str, message: impl Into<String>) -> Error {
     match code {
         "run_id_conflict" => Error::conflict(code, message),
         "machine_disk_full" => Error::capacity(code, message),
@@ -257,10 +262,12 @@ async fn submit<B: MachineBackend>(State(m): State<Machine<B>>, headers: HeaderM
         .map_err(|e| Error::validation("invalid_request", format!("the run request is not JSON: {e}")))?;
     run_id(&request.id)?;
     let (created, state) = match request.spec.kind {
-        v1::RunKind::Update => super::machine_update::submit(&m.identity, caller.actor, request).await?,
+        v1::RunKind::Update => {
+            super::machine_update::submit(m.identity.clone(), m.backend.clone(), caller.actor, request).await?
+        }
         _ => {
             let admitted = m.admit()?;
-            let accepted = super::runs::submit(&m.backend, caller.actor, request).await?;
+            let accepted = super::machine_runs::submit(&m.backend, caller.actor, request).await?;
             drop(admitted);
             accepted
         }
@@ -293,7 +300,8 @@ async fn events<B: MachineBackend>(
         let events = super::machine_update::events(m.identity.clone(), id, after).await?;
         return Ok(sse(m.authority(&caller), events.map(|e| e.and_then(|e| run_event(&e)))));
     }
-    let events = super::runs::follow(m.backend.clone(), caller.actor, id, after, caller.limit()).await?;
+    let events = super::machine_runs::follow(m.backend.clone(), caller.actor, id, after, caller.limit()).await?;
+    let events = tokio_stream::wrappers::ReceiverStream::new(events);
     Ok(sse(m.authority(&caller), events.map(|e| e.and_then(|e| run_event(&e)))))
 }
 
@@ -317,12 +325,12 @@ async fn cancel<B: MachineBackend>(State(m): State<Machine<B>>, Path(id): Path<S
     let run = id.clone();
     let changed = m
         .call(move |backend| {
-            let execution = Some(super::runs::query(backend, actor, &run)?);
+            let execution = Some(super::machine_runs::query(backend, actor, &run)?);
             let action = domain::MachineExecutionAction::Cancel as i32;
             backend.control(actor, domain::MachineExecutionControl { execution, action })
         })
         .await?;
-    Ok(json(StatusCode::OK, &super::runs::state(&id, &changed)))
+    Ok(json(StatusCode::OK, &super::machine_runs::state(&id, &changed)))
 }
 
 #[derive(Deserialize)]
@@ -348,7 +356,7 @@ async fn output<B: MachineBackend>(
     let actor = caller.actor;
     let snapshot = m
         .call(move |backend| {
-            let run = backend.get(actor, super::runs::query(backend, actor, &id)?)?;
+            let run = backend.get(actor, super::machine_runs::query(backend, actor, &id)?)?;
             match member.as_str() {
                 "" => backend.open_output(actor, run.number, &output, index),
                 member => backend.open_member(actor, run.number, &output, index, member),
@@ -362,7 +370,7 @@ async fn output<B: MachineBackend>(
         return Err(Refusal(moved, Some(StatusCode::PRECONDITION_FAILED)));
     }
     let OutputSnapshot { parts, length, media_type, .. } = snapshot;
-    let mut response = ranged(&headers, Bytes_::Parts(parts), length, m.authority(&caller))?;
+    let mut response = ranged(&headers, parts, length, m.authority(&caller))?;
     let headers = response.headers_mut();
     headers.insert(header::ETAG, HeaderValue::from_str(&tag).expect("a revision is ASCII"));
     if let Ok(media_type) = HeaderValue::from_str(&media_type) {
@@ -371,10 +379,8 @@ async fn output<B: MachineBackend>(
     Ok(response)
 }
 
-/// What a ranged read answers from: an output's parts on disk, or bytes held in memory.
-enum Bytes_ {
-    Parts(Vec<(std::fs::File, u64)>),
-}
+/// An output's bytes on disk: its parts in order, each with its length.
+type Parts = Vec<(std::fs::File, u64)>;
 
 /// `Range: bytes=a-b` (or `a-`, `-n`) of `length` bytes as `[start, end)`; None for the whole.
 fn range(headers: &HeaderMap, length: u64) -> Result<Option<(u64, u64)>, Refusal> {
@@ -400,11 +406,11 @@ fn range(headers: &HeaderMap, length: u64) -> Result<Option<(u64, u64)>, Refusal
     }
 }
 
-/// `bytes` as 200, or the range the request names as 206, streamed from the blocking pool.
-fn ranged(headers: &HeaderMap, bytes: Bytes_, length: u64, authority: StreamAuthority) -> Answer {
+/// `parts` as 200, or the range the request names as 206, streamed from the blocking pool.
+fn ranged(headers: &HeaderMap, parts: Parts, length: u64, authority: StreamAuthority) -> Answer {
     let range = range(headers, length)?;
     let (start, end) = range.unwrap_or((0, length));
-    let reader = from_offset(bytes, start)
+    let reader = from_offset(parts, start)
         .map_err(|e| Error::internal("output_unreadable", e.to_string()))?
         .take(end - start);
     let (sender, receiver) = tokio::sync::mpsc::channel(4);
@@ -436,8 +442,7 @@ fn ranged(headers: &HeaderMap, bytes: Bytes_, length: u64, authority: StreamAuth
 
 /// The bytes from `offset`. Parts before it are skipped and the part it falls in is seeked
 /// into, so a resumed download costs the machine only its tail.
-fn from_offset(bytes: Bytes_, mut offset: u64) -> std::io::Result<Box<dyn Read + Send>> {
-    let Bytes_::Parts(parts) = bytes;
+fn from_offset(parts: Parts, mut offset: u64) -> std::io::Result<Box<dyn Read + Send>> {
     let mut reader: Box<dyn Read + Send> = Box::new(std::io::empty());
     for (mut file, length) in parts {
         if offset >= length {
@@ -461,7 +466,7 @@ async fn triage<B: MachineBackend>(State(m): State<Machine<B>>, Path(id): Path<S
     let actor = caller.actor;
     let triage = m
         .call(move |backend| {
-            let execution = Some(super::runs::query(backend, actor, &id)?);
+            let execution = Some(super::machine_runs::query(backend, actor, &id)?);
             backend.read_triage(actor, domain::MachineExecutionTriageQuery { execution, attempt_ordinal: 0 })
         })
         .await?;
@@ -501,7 +506,7 @@ fn runs_of<B: MachineBackend>(m: &Machine<B>) -> Result<Arc<crate::runs::Runs>, 
 }
 
 fn held(ranges: &[(u64, u64)]) -> HeaderValue {
-    HeaderValue::from_str(&v1::held::format(ranges)).expect("ranges are ASCII")
+    HeaderValue::from_str(&v1::spell_held(ranges)).expect("ranges are ASCII")
 }
 
 /// `HEAD /v1/objects/sha256:<hex>`: the ranges this signer holds (all of it once stored, its
@@ -511,7 +516,7 @@ async fn head_object<B: MachineBackend>(State(m): State<Machine<B>>, Path(digest
     caller.machine()?;
     let (runs, actor) = (runs_of(&m)?, crate::machine_api::actor_id(caller.actor));
     let ranges = blocking(&runs, move |runs| runs.objects.held(&actor, &digest).map_err(Into::into)).await?;
-    Ok((StatusCode::OK, [(v1::held::HEADER, held(&ranges))]).into_response())
+    Ok((StatusCode::OK, [(v1::HELD, held(&ranges))]).into_response())
 }
 
 /// `PUT /v1/objects/sha256:<hex>`: lands the body at the offset its `Content-Range` names (the
@@ -530,7 +535,7 @@ async fn put_object<B: MachineBackend>(
     let (runs, actor) = (runs_of(&m)?, crate::machine_api::actor_id(caller.actor));
     let objects = runs.clone();
     let Some(upload) = blocking(&objects, move |runs| runs.objects.upload(&actor, &digest, length).map_err(Into::into)).await? else {
-        return Ok((StatusCode::NO_CONTENT, [(v1::held::HEADER, held(&[(0, length)]))]).into_response());
+        return Ok((StatusCode::NO_CONTENT, [(v1::HELD, held(&[(0, length)]))]).into_response());
     };
     let (sender, mut receiver) = tokio::sync::mpsc::channel::<Bytes>(8);
     let landing = upload.clone();
@@ -561,8 +566,12 @@ async fn put_object<B: MachineBackend>(
     let mut failed = None;
     while let Some(frame) = frames.next().await {
         match frame {
-            Ok(data) if sender.send(data).await.is_ok() => {}
-            Ok(_) => break, // the writer refused; its refusal is the answer
+            // A refused writer drops its receiver; its refusal is the answer.
+            Ok(data) => {
+                if sender.send(data).await.is_err() {
+                    break;
+                }
+            }
             Err(error) => {
                 failed = Some(error);
                 break;
@@ -576,7 +585,7 @@ async fn put_object<B: MachineBackend>(
     if let Some(error) = failed {
         return Err(error.into());
     }
-    Ok((StatusCode::NO_CONTENT, [(v1::held::HEADER, self::held(&held))]).into_response())
+    Ok((StatusCode::NO_CONTENT, [(v1::HELD, self::held(&held))]).into_response())
 }
 
 /// A PUT's `[start, end)` of an object of `length` bytes: its `Content-Range`, else the whole
@@ -605,9 +614,64 @@ fn span(headers: &HeaderMap) -> Result<(u64, u64, u64), Error> {
 }
 
 /// `/v1/health`: answers a bare probe, refuses one that carries a credential.
-async fn health(headers: HeaderMap) -> StatusCode {
+async fn health(headers: HeaderMap) -> Result<StatusCode, Refusal> {
     match headers.contains_key(header::AUTHORIZATION) {
-        true => StatusCode::UNAUTHORIZED,
-        false => StatusCode::NO_CONTENT,
+        true => Err(Error::credential("health_takes_no_credential", "health answers a bare probe").into()),
+        false => Ok(StatusCode::NO_CONTENT),
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A read from any offset answers exactly the bytes after it, across parts, and reads
+    /// none before it: the parts it skips are not read at all.
+    #[test]
+    fn a_read_from_an_offset_reads_only_the_tail() {
+        let root = std::env::temp_dir().join(format!("cm-read-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let lengths = [3u64, 0, 4 << 20, 5];
+        let mut whole = vec![];
+        for (i, length) in lengths.iter().enumerate() {
+            let bytes: Vec<u8> = (0..*length).map(|b| (b % 251) as u8 ^ i as u8).collect();
+            std::fs::write(root.join(i.to_string()), &bytes).unwrap();
+            whole.extend(bytes);
+        }
+        let parts = || {
+            let open = |i: usize| std::fs::File::open(root.join(i.to_string())).unwrap();
+            lengths
+                .iter()
+                .enumerate()
+                .map(|(i, l)| (open(i), *l))
+                .collect()
+        };
+        let total = whole.len() as u64;
+        for offset in [0, 1, 3, 4, 2 << 20, total - 5, total - 1, total] {
+            let mut read = vec![];
+            from_offset(parts(), offset)
+                .unwrap()
+                .read_to_end(&mut read)
+                .unwrap();
+            assert_eq!(read, whole[offset as usize..], "from {offset}");
+        }
+        // This thread's read syscalls carry the tail, not the 4 MiB before it.
+        let read_bytes = || {
+            let io = std::fs::read_to_string("/proc/thread-self/io").unwrap();
+            let line = io.lines().find(|l| l.starts_with("rchar:")).unwrap();
+            line[6..].trim().parse::<u64>().unwrap()
+        };
+        let opened = parts();
+        let before = read_bytes();
+        let mut tail = vec![];
+        from_offset(opened, total - 5)
+            .unwrap()
+            .read_to_end(&mut tail)
+            .unwrap();
+        let read = read_bytes() - before;
+        assert!(read < 4096, "a read of 5 bytes read {read}");
+        assert_eq!(tail, whole[whole.len() - 5..]);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
 }

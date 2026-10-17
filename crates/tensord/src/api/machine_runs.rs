@@ -163,12 +163,14 @@ fn spec_of(mut spec: v1::RunSpec) -> Result<(crate::runs::Spec, Option<v1::HubAc
     let identity_digest = {
         let mut identity = spec.clone();
         identity.catalog_revision.clear();
-        identity.payload = v1::Json::parse(String::from_utf8(crate::boundary_json::exact(&input)).expect("JSON is UTF-8")).ok();
+        identity.payload = None;
         identity.hub = hub.as_ref().map(|hub| v1::HubAccess {
             origin: hub.origin.trim_end_matches('/').into(),
             ..Default::default()
         });
-        let encoded = serde_json::to_vec(&identity).expect("a run spec serializes");
+        let mut identity = serde_json::to_value(&identity).expect("a run spec serializes");
+        identity["payload"] = input.clone();
+        let encoded = serde_json_canonicalizer::to_vec(&identity).expect("JSON canonicalizes");
         format!("sha256:{}", tensorfs_core::sha256::hex_digest(&encoded))
     };
     if hub.as_ref().is_some_and(|hub| !crate::hub::valid_origin(&hub.origin)) {

@@ -16,11 +16,8 @@ use std::{
     sync::mpsc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tensord::api::{
-    capability::{self, Grant},
-    v1::{self, machine_client::MachineClient},
-};
-use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
+use tensord::api::v1::{self, client::Machine as Client};
+use tokio_stream::{Stream, StreamExt};
 
 struct Machine(Child);
 impl Drop for Machine {
@@ -342,33 +339,18 @@ fn stop(machine: &mut Machine) {
     machine.0.wait().unwrap();
 }
 
-/// The owner's client and machine cap.
-async fn owner(root: &Path, port: u16) -> (MachineClient<Channel>, String) {
-    let pem = std::fs::read(root.join("run/cozy/bootstrap/tls.crt")).unwrap();
-    let endpoint = Endpoint::from_shared(format!("https://127.0.0.1:{port}"))
-        .unwrap()
-        .tls_config(ClientTlsConfig::new().ca_certificate(Certificate::from_pem(pem)).domain_name("cozy-worker"))
-        .unwrap();
-    let grant = Grant {
-        machine: "ends-itself".into(),
-        action: capability::MACHINE.into(),
-        expires: now_ms() / 1000 + 600,
-        ..Default::default()
-    };
-    let cap = capability::mint(&SigningKey::from_bytes(&[3; 32]), grant);
-    (MachineClient::new(endpoint.connect().await.unwrap()), cap)
-}
-
-fn authorized<T>(message: T, cap: &str) -> tonic::Request<T> {
-    let mut request = tonic::Request::new(message);
-    request.metadata_mut().insert("authorization", format!("Cozy-Cap {cap}").parse().unwrap());
-    request
+/// The owner's client.
+fn owner(root: &Path, port: u16) -> Client {
+    common::client(root, port, common::signed([3; 32], "ends-itself"))
 }
 
 /// The idle deadline Status reports; `keepalive` restarts the clock first.
-async fn deadline(client: &mut MachineClient<Channel>, cap: &str, keepalive: bool) -> i64 {
-    let mut frames = client.status(authorized(v1::StatusRequest { keepalive }, cap)).await.unwrap().into_inner();
-    frames.message().await.unwrap().unwrap().idle_deadline_unix_ms
+async fn deadline(client: &Client, keepalive: bool) -> i64 {
+    let frame = match keepalive {
+        true => client.keepalive().await,
+        false => client.status().await,
+    };
+    frame.unwrap().idle_deadline_unix_ms
 }
 
 /// A Hub whose every request is held open, as one stalled mid-preparation, until `close`.
@@ -414,29 +396,31 @@ fn keepalive_timer(local: u16, remote: u16) -> Option<f64> {
     })
 }
 
+type Events = std::pin::Pin<Box<dyn Stream<Item = Result<v1::RunEvent, v1::client::Error>> + Send>>;
+
 /// Submits a run of a release that prepares from `hub`: a job queued for this rental.
-async fn submit(client: &mut MachineClient<Channel>, cap: &str, id: &str, hub: &str) -> tonic::Streaming<v1::RunEvent> {
-    submit_kind(client, cap, id, hub, v1::RunKind::Call).await
+async fn submit(client: &Client, id: &str, hub: &str) -> Events {
+    submit_kind(client, id, hub, v1::RunKind::Call).await
 }
 
-async fn submit_kind(client: &mut MachineClient<Channel>, cap: &str, id: &str, hub: &str, kind: v1::RunKind) -> tonic::Streaming<v1::RunEvent> {
+async fn submit_kind(client: &Client, id: &str, hub: &str, kind: v1::RunKind) -> Events {
     let spec = v1::RunSpec {
-        kind: kind as i32,
-        source: Some(v1::run_spec::Source::Release(v1::Release { package: "acme/stalled".into(), ..Default::default() })),
+        kind,
+        source: Some(v1::Source::Release(v1::Release { package: "acme/stalled".into(), ..Default::default() })),
         entrypoint: "generate".into(),
         hub: Some(v1::HubAccess { origin: hub.into(), ..Default::default() }),
         ..Default::default()
     };
-    let request = v1::RunRequest { id: id.into(), after: 0, spec: Some(spec) };
-    let mut events = client.run(authorized(request, cap)).await.unwrap().into_inner();
-    assert!(events.message().await.unwrap().is_some(), "the job was accepted");
+    client.submit(&v1::RunRequest { id: id.into(), spec }).await.expect("the job was accepted");
+    let mut events: Events = Box::pin(client.events(id, 0).await.unwrap());
+    assert!(events.next().await.is_some(), "the job was accepted");
     events
 }
 
 /// The run's end (its outcome event), whenever it comes.
-async fn ended(events: &mut tonic::Streaming<v1::RunEvent>) -> v1::Outcome {
-    while let Some(event) = events.message().await.unwrap() {
-        if let Some(v1::run_event::Event::Outcome(outcome)) = event.event {
+async fn ended(events: &mut Events) -> v1::Outcome {
+    while let Some(event) = events.next().await {
+        if let v1::Event::Outcome(outcome) = event.unwrap().event {
             return outcome;
         }
     }
@@ -453,16 +437,16 @@ async fn a_job_holds_the_rental_and_its_end_starts_the_idle_clock() {
     let (provider_port, received) = provider();
     let mut machine = launch_idle(&root, port, provider_port, IDLE);
     ready(&mut machine, &root, port);
-    let (mut client, cap) = owner(&root, port).await;
+    let client = owner(&root, port);
     let idle_ms = i64::from(IDLE) * 1000;
-    let renewed = deadline(&mut client, &cap, true).await;
+    let renewed = deadline(&client, true).await;
     let at = now_ms();
     assert!((renewed - at - idle_ms).abs() < 1_000, "keepalive answers the real deadline: {renewed} at {at}");
     let hub = held_hub();
     // A controller's warm request is a job: asked of the machine, it holds the rental.
-    let mut events = submit_kind(&mut client, &cap, "stalled-1", &hub.origin, v1::RunKind::Warm).await;
-    assert_eq!(deadline(&mut client, &cap, false).await, 0, "a queued job has no deadline");
-    assert_eq!(deadline(&mut client, &cap, true).await, 0, "nor does a keepalive give it one");
+    let mut events = submit_kind(&client, "stalled-1", &hub.origin, v1::RunKind::Warm).await;
+    assert_eq!(deadline(&client, false).await, 0, "a queued job has no deadline");
+    assert_eq!(deadline(&client, true).await, 0, "nor does a keepalive give it one");
     // Its Hub connection is waited on while alive and probed for liveness at the transfer's
     // measured window (a 5 s sample, 6 still samples): a dead one fails the job.
     let (local, remote) = hub.accepted.recv_timeout(Duration::from_secs(30)).expect("the run never reached its Hub");
@@ -479,7 +463,7 @@ async fn a_job_holds_the_rental_and_its_end_starts_the_idle_clock() {
     assert_eq!(outcome.status, "failed", "{outcome:?}");
     // Status reads the jobs the machine sampled within the last second.
     tokio::time::sleep(Duration::from_millis(1_500)).await;
-    let due = deadline(&mut client, &cap, false).await;
+    let due = deadline(&client, false).await;
     // The job ended between the Hub's close and its outcome reaching this client.
     assert!(due >= closed + idle_ms && due <= end + idle_ms, "{due} vs closed {closed}, end {end}");
     let (method, _, _, body) = received
@@ -504,9 +488,9 @@ async fn a_restart_neither_shortens_nor_extends_the_idle_clock() {
     let idle = 2 * IDLE;
     let mut machine = launch_idle(&root, port, provider_port, idle);
     ready(&mut machine, &root, port);
-    let (mut client, cap) = owner(&root, port).await;
+    let client = owner(&root, port);
     let hub = held_hub();
-    let events = submit(&mut client, &cap, "stalled-2", &hub.origin).await;
+    let events = submit(&client, "stalled-2", &hub.origin).await;
     drop((events, client));
     stop(&mut machine);
     // Down longer than the whole window: the clock from before the job ran out long ago.
@@ -514,16 +498,16 @@ async fn a_restart_neither_shortens_nor_extends_the_idle_clock() {
     let relaunched = now_ms();
     let mut machine = launch_idle(&root, port, provider_port, idle);
     ready(&mut machine, &root, port);
-    let (mut client, cap) = owner(&root, port).await;
-    let first = deadline(&mut client, &cap, false).await;
+    let client = owner(&root, port);
+    let first = deadline(&client, false).await;
     assert!(first >= relaunched + idle_ms, "the job ended at the restart: {first} vs {relaunched}");
     assert!(received.recv_timeout(Duration::from_millis(idle_ms as u64 / 3)).is_err(), "released early after a restart mid-job");
     drop(client);
     stop(&mut machine);
     let mut machine = launch_idle(&root, port, provider_port, idle);
     ready(&mut machine, &root, port);
-    let (mut client, cap) = owner(&root, port).await;
-    assert_eq!(deadline(&mut client, &cap, false).await, first, "a restart mid-idle keeps the deadline");
+    let client = owner(&root, port);
+    assert_eq!(deadline(&client, false).await, first, "a restart mid-idle keeps the deadline");
     let wait = (first - now_ms() + 5_000).max(0) as u64;
     received.recv_timeout(Duration::from_millis(wait)).expect("no release at the kept deadline");
     let released = now_ms();
