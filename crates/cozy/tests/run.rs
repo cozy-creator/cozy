@@ -133,7 +133,7 @@ fn the_grammar_refuses_what_it_cannot_run() {
             "target_malformed",
             2,
         ),
-        (&["run", "./experiment.py", "--json"], "not_ported", 2),
+        (&["run", "./experiment.py", "--json"], "target_not_found", 1),
         (
             &[
                 "run",
