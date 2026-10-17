@@ -149,7 +149,7 @@ fn spec_of(mut spec: v1::RunSpec) -> Result<(crate::runs::Spec, Option<v1::HubAc
         v1::RunKind::Call => (false, false),
         v1::RunKind::Warm => (true, false),
         v1::RunKind::Remove => (false, true),
-        v1::RunKind::Update => unreachable!("machine_update takes updates"),
+        v1::RunKind::Update => return Err(Error::validation("invalid_kind", "an update is not a run of code")),
     };
     let input: Value = match &spec.payload {
         None => serde_json::json!({}),
@@ -168,9 +168,10 @@ fn spec_of(mut spec: v1::RunSpec) -> Result<(crate::runs::Spec, Option<v1::HubAc
             origin: hub.origin.trim_end_matches('/').into(),
             ..Default::default()
         });
+        // A JSON value's objects are sorted maps and its numbers exact: one spelling per spec.
         let mut identity = serde_json::to_value(&identity).expect("a run spec serializes");
         identity["payload"] = input.clone();
-        let encoded = serde_json_canonicalizer::to_vec(&identity).expect("JSON canonicalizes");
+        let encoded = crate::boundary_json::exact(&identity);
         format!("sha256:{}", tensorfs_core::sha256::hex_digest(&encoded))
     };
     if hub.as_ref().is_some_and(|hub| !crate::hub::valid_origin(&hub.origin)) {

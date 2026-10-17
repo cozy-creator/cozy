@@ -499,6 +499,8 @@ mod tests {
             upload.write_at(250_000, &[0; 50_001]).unwrap_err().code,
             "object_length_exceeded"
         );
+        // Asked while its ranges cover it, the upload is settled first: whole means stored.
+        assert_eq!(objects.held("alice", &digest).unwrap(), [(0, length)]);
         assert_eq!(objects.settle(&upload).unwrap(), [(0, length)]);
         let (path, held) = objects.path("alice", &digest).unwrap().unwrap();
         assert_eq!((fs::read(path).unwrap(), held), (bytes.clone(), length));

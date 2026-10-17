@@ -71,7 +71,7 @@ impl MachineBackend for Run {
                 }),
                 ..Default::default()
             };
-            let outcome = br#"{"status":3,"safe_message":"author_failed: the author's secret","result":{"inline_result":"c2VjcmV0"},"triage_bundle":{}}"#;
+            let outcome = br#"{"status":3,"safe_message":"author_failed: the author's secret","result":{"inline_result":"InNlY3JldCI="},"triage_bundle":{}}"#;
             vec![
                 product(1, "image", 1),
                 product(2, "image", 2),
@@ -156,19 +156,17 @@ async fn attach(client: &Machine, token: &str, after: u64) -> Events {
     events
 }
 
-/// The bytes of `image` in `[first, end)` (empty: all of it), and how its body ended.
-async fn read(client: &Machine, (first, end): (u64, u64)) -> (u64, Result<Vec<u8>, v1::client::Error>) {
+/// The bytes of `image` in `[first, end)` (empty: all of it) and the output's length, or how the
+/// read failed: refused, or its body broken off.
+async fn read(client: &Machine, (first, end): (u64, u64)) -> Result<(u64, Vec<u8>), v1::client::Error> {
     let target = v1::OutputTarget { run: "run".into(), output: "image".into(), ..Default::default() };
-    let output = client.bulk().unwrap().get(&target, (first, end), 0).await.unwrap();
+    let output = client.bulk().unwrap().get(&target, (first, end), 0).await?;
     let mut body = output.body;
     let mut bytes = vec![];
     while let Some(chunk) = body.next().await {
-        match chunk {
-            Ok(chunk) => bytes.extend_from_slice(&chunk),
-            Err(error) => return (output.length, Err(error)),
-        }
+        bytes.extend_from_slice(&chunk?);
     }
-    (output.length, Ok(bytes))
+    Ok((output.length, bytes))
 }
 
 /// A reattach (every daemon restart) past earlier products keeps each output's revision and
@@ -262,14 +260,14 @@ async fn open_streams_end_on_revocation_not_at_expiry() {
     }
 }
 
-/// An output whose file is shorter than its revision fails its body, never a short success.
+/// An output whose file is shorter than its revision fails its read, never a short success.
 #[tokio::test]
 async fn a_short_output_read_fails() {
     let (client, _) = serve(Run { live: false, held: 3 }).await;
-    let (length, read) = read(&client, (0, 0)).await;
-    assert_eq!(length, 8);
-    assert!(read.is_err(), "{read:?}");
-    assert!(self::read(&client, (5, 8)).await.1.is_err());
+    for range in [(0, 0), (5, 8)] {
+        let read = read(&client, range).await;
+        assert!(read.is_err(), "{range:?}: {read:?}");
+    }
 }
 
 /// A range is one part of a parallel read: exactly its bytes, clamped at the output's end, and
@@ -277,11 +275,10 @@ async fn a_short_output_read_fails() {
 #[tokio::test]
 async fn a_range_reads_its_bytes_alone() {
     let (client, _) = serve(Run { live: false, held: 8 }).await;
-    let whole = |(length, read): (u64, Result<Vec<u8>, v1::client::Error>)| (length, read.unwrap());
-    assert_eq!(whole(read(&client, (2, 6)).await), (128 << 20, b"byte".to_vec()));
+    assert_eq!(read(&client, (2, 6)).await.unwrap(), (128 << 20, b"byte".to_vec()));
     let end = 128 << 20;
-    assert_eq!(whole(read(&client, (end - 3, end + (1 << 20))).await), (end, vec![0; 3]));
-    assert_eq!(read(&client, (end - 1, end)).await.1.unwrap().len(), 1);
+    assert_eq!(read(&client, (end - 3, end + (1 << 20))).await.unwrap(), (end, vec![0; 3]));
+    assert_eq!(read(&client, (end - 1, end)).await.unwrap().1.len(), 1);
     let target = v1::OutputTarget { run: "run".into(), output: "image".into(), ..Default::default() };
     let past = client.bulk().unwrap().get(&target, (end, end + 1), 0).await.err().unwrap();
     assert_eq!((past.status(), past.code()), (Some(416), Some("range_unsatisfiable")));
@@ -289,6 +286,6 @@ async fn a_range_reads_its_bytes_alone() {
     assert_eq!((moved.status(), moved.code()), (Some(412), Some("output_revision_moved")));
 
     let (client, _) = serve(Run { live: false, held: 3 }).await;
-    assert_eq!(whole(read(&client, (0, 3)).await), (8, b"8 b".to_vec()));
-    assert!(read(&client, (1, 5)).await.1.is_err());
+    assert_eq!(read(&client, (0, 3)).await.unwrap(), (8, b"8 b".to_vec()));
+    assert!(read(&client, (1, 5)).await.is_err());
 }

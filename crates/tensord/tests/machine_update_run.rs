@@ -103,15 +103,17 @@ fn cap(action: &str) -> String {
     capability::mint(&SigningKey::from_bytes(&OWNER), grant)
 }
 
-/// A client pinned to the machine's leaf, once the service answers Status ready.
+/// A client pinned to the machine's leaf, authorized by `cap`, once the service answers its
+/// owner's Status ready.
 async fn client(root: &Path, port: u16, cap: &str) -> Client {
     let start = Instant::now();
     loop {
+        let owner = Auth::Token(self::cap(capability::MACHINE));
         if let Some(client) = common::pin(root)
-            .and_then(|pin| Client::new(&format!("127.0.0.1:{port}"), pin, Auth::Token(cap.into())).ok())
+            .and_then(|pin| Client::new(&format!("127.0.0.1:{port}"), pin, owner).ok())
         {
             if client.status().await.is_ok_and(|frame| frame.phase == "ready") {
-                return client;
+                return client.with_auth(Auth::Token(cap.into()));
             }
         }
         assert!(

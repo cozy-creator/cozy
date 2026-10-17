@@ -3893,6 +3893,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-stream",
  "toml",
+ "tower",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
