@@ -508,7 +508,7 @@ impl Publisher {
     /// catalog revision so a warm run, across restarts too, asks the Hub nothing (th-245).
     pub(crate) fn resolve(&self, service: &Service, source: &hub::Source, named: Named, lanes: &[&str], revision: &str) -> Result<Named, Failure> {
         if !named.manifest.is_empty() {
-            return Ok(named);
+            return measured(service, source, named);
         }
         let asked: Vec<String> = match named.lane.is_empty() {
             true => lanes.iter().chain(&[""]).map(|lane| lane.to_string()).collect(),
@@ -1497,6 +1497,33 @@ fn absent(refusal: hub_client::Error, code: &'static str, named: impl FnOnce() -
 /// The journal name of an unnamed release of the request's package at its Hub.
 fn newest_key(request: &Request) -> String {
     json!(["newest", hub::origin_key(&request.source.origin), request.package]).to_string()
+}
+
+/// A checkpoint named by its hash, with the length a hash alone does not say: its closure's at
+/// the Hub, read once under the run's access (the owner's capability for a private one) and
+/// kept, since a hash never names other bytes.
+fn measured(service: &Service, source: &hub::Source, mut named: Named) -> Result<Named, Failure> {
+    if named.length > 0 {
+        return Ok(named);
+    }
+    let key = json!([hub::origin_key(&source.origin).unwrap_or_default(), named.repository, named.manifest]).to_string();
+    let held = service.engine.with_journal(|j| j.named(&key, "")).map_err(io_failure)?;
+    if let Some(length) = held.and_then(|held| held.parse().ok()) {
+        named.length = length;
+        return Ok(named);
+    }
+    let origin = crate::access::origin(source, &named.repository, &named.release, &named.lane, &named.object());
+    let catalog = access::of(source, &origin)?;
+    let closure = catalog.closure(&origin.refspec, &named.lane).map_err(|e| {
+        let (code, message) = refused("model_resolution_failed", e);
+        catalog.reason(code, message)
+    })?;
+    if closure.manifest.sha256 != origin.manifest.sha256 {
+        return Err(("model_resolution_failed", format!("{} answered {}", origin.refspec, closure.manifest.id())));
+    }
+    named.length = closure.manifest.length;
+    service.engine.with_journal(|j| j.bind_named(&key, "", &named.length.to_string())).map_err(io_failure)?;
+    Ok(named)
 }
 
 /// What installing a release reads of it, from its install plan: its interface and Python, its

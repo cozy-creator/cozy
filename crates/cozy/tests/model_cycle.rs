@@ -1,10 +1,13 @@
-//! The model ingest cycle on a real Tensorhub with a real machine: Tensorhub's dev-build
-//! `cozy_ref` job (TENSORHUB_URL, TENSORHUB_CA, TENSORHUB_LOG; MinIO storage) and the workspace's
-//! TensorD (`cozy_tensord=workspace`, COZY_TEST_TENSORD) trusting the Hub's CA. The machine pins, makes,
-//! quantizes and uploads every byte; this computer only asks.
+//! The model ingest cycle on a real Tensorhub with real machines: Tensorhub's dev-build `cozy_ref`
+//! job (TENSORHUB_URL, TENSORHUB_LOG; MinIO storage; its public origin behind a private CA) and the
+//! workspace's TensorD (`cozy_tensord=workspace`, COZY_TEST_TENSORD). The machines trust that CA
+//! only as each run's Hub access names it, never through their environment, so every Hub call a
+//! run makes proves it: the capability's trade, the upload's presign and publication, a private
+//! checkpoint's closure, a package's card and install plan. The machine pins, makes, quantizes
+//! and uploads every byte; this computer only asks.
 //!
-//! upload → publish → info → family → quantize (a package's quantizer) → publish its lane →
-//! retarget → yank → delete.
+//! upload → private download elsewhere → publish → info → family → quantize (a package's
+//! quantizer) → publish its lane → retarget → yank → delete.
 #![cfg(unix)]
 mod common;
 
@@ -52,10 +55,9 @@ fn publish_quantizer(home: &Home) {
 #[test]
 fn a_model_is_uploaded_quantized_and_published_by_its_machine() {
     let Some(home) = Home::with_hub() else { return };
-    let ca = std::env::var("TENSORHUB_CA").expect("the CI Hub's CA");
     let account = home.sign_in("modelcycle@cozy.test");
     let _calcifer = home.want_calcifer();
-    let _machine = common::tensord::added_with(&home, "m1", &[("SSL_CERT_FILE", &ca)]);
+    let _machine = common::tensord::added(&home, "m1");
     let model = format!("{account}/tiny");
 
     // The machine pins the source, makes it and uploads a private checkpoint.
@@ -65,6 +67,12 @@ fn a_model_is_uploaded_quantized_and_published_by_its_machine() {
     assert!(pinned.len() >= 40 && pinned[..40].bytes().all(|b| b.is_ascii_hexdigit()), "{run}");
     assert_eq!(made["published"]["destination"], model.as_str(), "{run}");
     let source = made["published"]["checkpoint"].as_str().unwrap().to_owned();
+
+    // Another machine reads the private checkpoint by its digest, under the run's capability.
+    let _other = common::tensord::added(&home, "m2");
+    let checkpoint = format!("{model}#{source}");
+    let run = completed(&home.cozy(["--json", "model", "download", &checkpoint, "--on", "m2"]));
+    println!("private download run: {run}");
 
     // A release names it; info shows the lane and its checkpoint.
     let lane = format!("f32={source}");
