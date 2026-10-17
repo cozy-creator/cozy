@@ -204,6 +204,13 @@ fn packages_lock_publish_and_yank_on_a_real_hub() {
         "{published}"
     );
     assert_eq!(published["status"], "published", "{published}");
+    let newer = format!("{other}/tiny 0.2.0 is newer than the 0.1.0 this lock pins");
+    assert!(
+        published["warnings"]
+            .as_array()
+            .is_some_and(|w| w.iter().any(|w| w == newer.as_str())),
+        "{published}"
+    );
     let lock = published_lock(&url, &other, "tiny-user", "0.1.0");
     assert!(
         lock.contains("/tiny/0.1.0/") && !lock.contains("/tiny/0.2.0/"),
