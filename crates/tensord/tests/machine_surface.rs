@@ -2204,6 +2204,86 @@ mod v1_api {
         }
     }
 
+    /// `cozy run ./dir` and `cozy run script.py` first ask the machine what the code declares: a
+    /// warm run of the local source, at `installed`, installs it (editable, unlocked here, as the
+    /// controller sends it) and its result carries the interface the environment's Runtime reads
+    /// statically, with the installation a call may name. An edit written again returns the new
+    /// interface.
+    #[tokio::test]
+    async fn a_warm_install_of_local_code_returns_its_interface() {
+        let (machine, tools) = installing_machine().await;
+        let mut client = client(&machine).await;
+        let all = cap(Grant { action: MACHINE.into(), ..Default::default() });
+        let mut runner = client.clone();
+        let mut installed = async |id: &str, manifest: &str| -> serde_json::Value {
+            let spec = v1::RunSpec {
+                kind: v1::RunKind::Warm as i32,
+                source: Some(v1::run_spec::Source::Local(v1::LocalSource { manifest: manifest.into() })),
+                owner: "alice".into(),
+                ..Default::default()
+            };
+            let request = authorized(v1::RunRequest { id: id.into(), after: 0, spec: Some(spec) }, &all);
+            let done = outcome(&collect(runner.run(request).await.unwrap().into_inner()).await.unwrap());
+            assert_eq!(done.status, "succeeded", "{done:?}");
+            serde_json::from_slice(&done.result).unwrap()
+        };
+        let names = |result: &serde_json::Value| -> Vec<String> {
+            let rows = result["interface"]["entrypoints"].as_array().unwrap_or_else(|| panic!("{result}"));
+            rows.iter().map(|row| row["name"].as_str().unwrap().to_owned()).collect()
+        };
+
+        // A project directory.
+        let files = ["pyproject.toml", "package.toml", "cpu_memo/__init__.py"];
+        let dir = project("cpu_memo", &files);
+        let package = "local/tensord-cpu-memo";
+        let manifest = write_live(&mut client, &all, &dir, package, &files).await;
+        let first = installed("dir-1", &manifest).await;
+        assert_eq!((first["package"].as_str(), first["release"].as_str()), (Some(package), Some("0.1.0")), "{first}");
+        assert!(names(&first).contains(&"measure".to_string()), "{first}");
+        assert!(first["installation"].as_str().is_some_and(|a| a.starts_with("local-")), "{first}");
+        // A live edit adds a function: written again, the interface names it.
+        let code = dir.join("cpu_memo/__init__.py");
+        let added = "\n\nasync def tally(ctx: Context, payload: Probe) -> Measured:\n    return Measured(square=0)\n\n\napp.entrypoint(tally, accelerator=False)\n";
+        fs::write(&code, fs::read_to_string(&code).unwrap() + added).unwrap();
+        let edited = write_live(&mut client, &all, &dir, package, &files).await;
+        assert_ne!(edited, manifest);
+        let second = installed("dir-2", &edited).await;
+        assert!(names(&second).contains(&"tally".to_string()) && !names(&first).contains(&"tally".to_string()), "{second}");
+
+        // A script: the project the CLI generates around it (PEP 723 metadata, never locked).
+        let script = std::env::temp_dir().join(format!("cm-script-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&script).unwrap();
+        let generated = [
+            ("pyproject.toml", concat!(
+                "[project]\nname = \"cozy-script-0123456789ab\"\nversion = \"0.1.0\"\nrequires-python = \">=3.12\"\n",
+                "dependencies = [\"cozy-runtime>=0.4.0,<1\"]\n\n",
+                "[project.entry-points.\"cozy.application\"]\ndefault = \"cozy_script_entry:app\"\n\n",
+                "[build-system]\nrequires = [\"hatchling>=1.25\"]\nbuild-backend = \"hatchling.build\"\n\n",
+                "[tool.hatch.metadata]\nallow-direct-references = true\n\n",
+                "[tool.hatch.build.targets.wheel]\nonly-include = [\"cozy_script.py\", \"cozy_script_entry.py\"]\n",
+            )),
+            ("package.toml", "[application]\nobject = \"cozy_script_entry:app\"\n"),
+            ("cozy_script_entry.py", "from cozy_runtime.author import script_app\napp = script_app(\"cozy_script\")\n"),
+            ("cozy_script.py", "# /// script\n# requires-python = \">=3.12\"\n# [tool.cozy]\n# accelerator = false\n# ///\ndef main() -> int:\n    return 1\n"),
+        ];
+        for (name, text) in generated {
+            fs::write(script.join(name), text).unwrap();
+        }
+        let files: Vec<&str> = generated.iter().map(|(name, _)| *name).collect();
+        let package = "local/cozy-script-0123456789ab";
+        let manifest = write_live(&mut client, &all, &script, package, &files).await;
+        let third = installed("script-1", &manifest).await;
+        assert_eq!(names(&third), ["main"], "{third}");
+        fs::write(script.join("cozy_script.py"), generated[3].1.replace("-> int:\n    return 1", "-> str:\n    return \"one\"")).unwrap();
+        let edited = write_live(&mut client, &all, &script, package, &files).await;
+        let fourth = installed("script-2", &edited).await;
+        assert_eq!(names(&fourth), ["main"], "{fourth}");
+        assert_ne!(third["interface"], fourth["interface"], "the edited return type");
+        let _ = fs::remove_dir_all(dir);
+        let _ = fs::remove_dir_all(script);
+        let _ = fs::remove_dir_all(tools);
+    }
+
     /// A job's memoized call that ran is held by this machine for its signer: a later job has
     /// the same call answered from it, never run, and a new one runs. The client carries none.
     #[tokio::test]
