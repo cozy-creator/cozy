@@ -487,6 +487,23 @@ pub fn encode_attempt_outcome(value: &domain::AttemptOutcome) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn measure_json_against_protobuf() {
+        let model_bytes = include_bytes!("../tests/fixtures/journal-codecs/model.bin");
+        let product_bytes = include_bytes!("../tests/fixtures/journal-codecs/product.bin");
+        let intake_bytes = include_bytes!("../tests/fixtures/journal-codecs/intake.bin");
+        let terminal_bytes = include_bytes!("../tests/fixtures/journal-codecs/terminal.bin");
+        let sizes = [
+            ("model", model_bytes.len(), serde_json::to_vec(&decode_model_choice(model_bytes).unwrap()).unwrap()),
+            ("product", product_bytes.len(), serde_json::to_vec(&decode_run_product(product_bytes).unwrap()).unwrap()),
+            ("intake", intake_bytes.len(), serde_json::to_vec(&decode_native_byte_retention_result(intake_bytes).unwrap()).unwrap()),
+            ("terminal", terminal_bytes.len(), serde_json::to_vec(&decode_machine_execution_event_page(terminal_bytes).unwrap()).unwrap()),
+        ];
+        for (name, proto, json) in sizes {
+            println!("MEASURE {name}: protobuf {proto} B, json {} B: {}", json.len(), String::from_utf8_lossy(&json));
+        }
+    }
+
     /// Bytes emitted by the pre-retirement native machine remain readable and stable. These
     /// are stored custody/journal records, not a deployed-peer synchronization requirement.
     #[test]
