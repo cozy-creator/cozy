@@ -1924,7 +1924,11 @@ mod tests {
                             }
                             answer
                         }
-                        _ => b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+                        // The Hub's own refusal: its envelope names the absence.
+                        _ => {
+                            let body = r#"{"error":{"code":"package.not_found","message":"absent","remedy":""}}"#;
+                            format!("HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).into_bytes()
+                        }
                     };
                     let _ = out.write_all(&answer);
                 });
