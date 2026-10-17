@@ -144,6 +144,12 @@ pub enum StoreError {
     UnknownMachine(String),
     #[error("Calcifer's store holds a row it cannot read: {0}")]
     Corrupt(String),
+    #[error(
+        "Calcifer could not rewrite its store's runs as JSON ({reason}); the store is as it was, and \
+         a copy of it is at {}",
+        backup.display()
+    )]
+    Conversion { backup: PathBuf, reason: String },
     #[error("Calcifer's store already holds runs or machines; an import needs an empty one")]
     NotEmpty,
 }
@@ -320,6 +326,15 @@ impl Store {
             // A copy of the store as it was, beside it, before its rows are rewritten.
             let backup = path.with_extension(format!("db.pre-json-{}", now_ms()));
             conn.backup(rusqlite::MAIN_DB, &backup, None)?;
+            migrations
+                .to_latest(&mut conn)
+                .map_err(|e| StoreError::Conversion {
+                    backup,
+                    reason: match e {
+                        rusqlite_migration::Error::Hook(reason) => reason,
+                        e => e.to_string(),
+                    },
+                })?;
         }
         migrations.to_latest(&mut conn)?;
         Ok(Self {
@@ -1668,13 +1683,21 @@ fn json_rows(tx: &Transaction) -> rusqlite_migration::HookResult {
         .collect::<rusqlite::Result<_>>()?;
     let unreadable =
         |id: &str, what: &str, e: String| HookError::Hook(format!("run {id}'s {what}: {e}"));
+    let mut left_out = 0;
     for (id, spec, outcome) in rows {
         let spec = spec_json(&spec).map_err(|e| unreadable(&id, "spec", e.to_string()))?;
         let outcome = match outcome {
             Some(bytes) => {
                 let pb: v1::Outcome = prost::Message::decode(bytes.as_slice())
                     .map_err(|e| unreadable(&id, "outcome", e.to_string()))?;
-                Some(outcome_json(&pb).map_err(|e| unreadable(&id, "outcome", e.to_string()))?)
+                let json = json::Outcome::try_from(&pb)
+                    .map_err(|e| unreadable(&id, "outcome", e.to_string()))?;
+                let lost =
+                    |bytes: &[u8], kept: &Option<json::Json>| !bytes.is_empty() && kept.is_none();
+                if lost(&pb.result, &json.result) || lost(&pb.measurements, &json.measurements) {
+                    left_out += 1;
+                }
+                Some(serde_json::to_vec(&json).expect("serializes"))
             }
             None => None,
         };
@@ -1682,6 +1705,12 @@ fn json_rows(tx: &Transaction) -> rusqlite_migration::HookResult {
             "UPDATE runs SET spec = ?2, outcome = ?3 WHERE id = ?1",
             params![id, spec, outcome],
         )?;
+    }
+    if left_out > 0 {
+        tracing::warn!(
+            "{left_out} runs' results or measurements were not JSON, so their JSON rows leave them out; \
+             the store's copy beside it (state.db.pre-json-*) keeps those bytes"
+        );
     }
     Ok(())
 }

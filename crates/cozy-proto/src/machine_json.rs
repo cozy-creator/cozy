@@ -536,16 +536,18 @@ pub mod pb {
         }
     }
 
+    /// An outcome's result and measurements that are not JSON are left out: no reader of them
+    /// ever showed bytes it could not parse.
     impl TryFrom<&v1::Outcome> for Outcome {
         type Error = Unreadable;
         fn try_from(o: &v1::Outcome) -> Result<Self, Unreadable> {
             Ok(Self {
                 status: o.status.clone(),
                 reason: o.reason.as_ref().map(Into::into),
-                result: json(&o.result, "the result")?,
+                result: json(&o.result, "the result").unwrap_or_default(),
                 outputs: o.outputs.iter().map(Into::into).collect(),
                 triage: o.triage,
-                measurements: json(&o.measurements, "the measurements")?,
+                measurements: json(&o.measurements, "the measurements").unwrap_or_default(),
                 execution_ms: o.execution_ms,
                 computation_digest: o.computation_digest.clone(),
                 memoized: o.memoized,
@@ -693,14 +695,20 @@ mod tests {
         let back = v1::Outcome::from(&serde_json::from_str::<Outcome>(&json).unwrap());
         assert_eq!(back, outcome);
 
-        // Empty bytes are absent JSON; bytes that are not JSON are refused, never guessed.
+        // Empty bytes are absent JSON; an outcome's unreadable result is left out, a spec's payload
+        // that is not JSON is refused.
         let empty = Outcome::try_from(&v1::Outcome::default()).unwrap();
         assert_eq!((empty.result, empty.measurements), (None, None));
         let garbled = v1::Outcome {
             result: b"{".to_vec(),
             ..Default::default()
         };
-        assert!(Outcome::try_from(&garbled).is_err());
+        assert_eq!(Outcome::try_from(&garbled).unwrap().result, None);
+        let garbled = v1::RunSpec {
+            payload: b"{".to_vec(),
+            ..Default::default()
+        };
+        assert!(RunSpec::try_from(&garbled).is_err());
         let unknown = v1::RunSpec {
             kind: 9,
             ..Default::default()
