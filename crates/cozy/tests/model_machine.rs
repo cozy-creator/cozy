@@ -1,6 +1,6 @@
-//! `cozy model download|list` on a real machine: TensorD 0.6.0 from the cozy-runtime wheel
-//! (COZY_TEST_TENSORD, the workspace's own build) added to this home's Calcifer. The machine makes the model from a tiny
-//! public Hugging Face repository; no weight byte lands in the controller's home.
+//! `cozy model download|list` on a real machine: the workspace's TensorD (COZY_TEST_TENSORD)
+//! added to this home's Calcifer. The machine makes the model from a tiny public Hugging Face
+//! repository, pinning a moving revision itself; no weight byte lands in the controller's home.
 #![cfg(unix)]
 mod common;
 
