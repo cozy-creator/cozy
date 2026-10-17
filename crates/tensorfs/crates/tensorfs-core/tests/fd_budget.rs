@@ -6,11 +6,10 @@
 mod common;
 
 use std::io::Read;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::{components, hub, serve_all, temporary, Checkpoint, Hub};
+use common::{components, hub, serve_all, temporary, Answer, Checkpoint, Hub, Rule};
 use rustix::process::{getrlimit, setrlimit, Resource, Rlimit};
 use tensorfs_core::fetch::{whole, Fetcher, Origin, Plain, Priority};
 use tensorfs_core::ids::ObjectRef;
@@ -64,7 +63,17 @@ fn a_low_descriptor_limit_is_raised_and_a_full_table_is_backpressure() {
     let hard = original.maximum.unwrap_or(u64::MAX);
     assert!(hard >= 4096, "this proof needs a hard limit of at least 4096");
     let checkpoints = checkpoints();
-    let hub = hub(checkpoints.clone(), None, GAP, serve_all());
+    // The second walk's first asks wait at the hub until the squeeze lets them through.
+    let squeezed: Arc<std::collections::HashSet<String>> =
+        Arc::new(checkpoints[1].bodies.keys().cloned().collect());
+    let rule: Rule = Arc::new({
+        let squeezed = Arc::clone(&squeezed);
+        move |hex, asked| match asked == 1 && squeezed.contains(hex) {
+            true => Answer::Hold,
+            false => Answer::Body,
+        }
+    });
+    let hub = Arc::new(hub(checkpoints.clone(), None, GAP, rule));
 
     // A Go parent hands its child the original soft limit. The download raises it to the hard
     // limit and grows as far as the link rewards, with no descriptor error.
@@ -75,30 +84,29 @@ fn a_low_descriptor_limit_is_raised_and_a_full_table_is_backpressure() {
     assert!(raised > 256, "the soft limit was not raised");
     assert_eq!(tensorfs_core::descriptors::exhaustions(), before, "EMFILE after the raise");
 
-    // The table shrinks under a running walk. The squeeze is driven by the walk's own
-    // progress, never by a clock: once the hub has served 16 more GETs, the soft limit drops
-    // just below what is open, and it comes back after the walk has met a full table three
-    // times. EMFILE is then backpressure: what met it is asked again and every byte lands.
-    let done = Arc::new(AtomicBool::new(false));
+    // The table shrinks under a running walk, driven by the walk itself, never by a clock.
+    // Its asks are held at the hub, so nothing it opened can close: the soft limit drops to
+    // half of what is open, and one answer is let through, which needs a descriptor to land.
+    // Every open then meets a full table until three have, and the limit comes back. EMFILE
+    // is backpressure: what met it is asked again and every byte lands.
     let squeeze = std::thread::spawn({
-        let (done, gets) = (Arc::clone(&done), hub.gets.clone());
-        let served = move || gets.lock().unwrap().values().sum::<usize>();
+        let hub = Arc::clone(&hub);
         move || {
-            let start = served();
-            while served() < start + 16 && !done.load(Ordering::Relaxed) {
+            while !hub.log().iter().any(|hex| squeezed.contains(hex)) {
                 std::thread::sleep(Duration::from_millis(1));
             }
             let open = tensorfs_core::platform::process::open_fds().unwrap();
             let pressed = tensorfs_core::descriptors::exhaustions();
-            set_limit(open.saturating_sub(4), original.maximum);
-            while tensorfs_core::descriptors::exhaustions() < pressed + 3 && !done.load(Ordering::Relaxed) {
+            set_limit(open / 2, original.maximum);
+            hub.admit(1);
+            while tensorfs_core::descriptors::exhaustions() < pressed + 3 {
                 std::thread::sleep(Duration::from_millis(1));
             }
             set_limit(raised, original.maximum);
+            hub.open();
         }
     });
     walk(&hub, &checkpoints[1]);
-    done.store(true, Ordering::Relaxed);
     squeeze.join().unwrap();
     assert!(tensorfs_core::descriptors::exhaustions() > before, "the squeeze never pressed the walk");
 
