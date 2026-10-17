@@ -625,9 +625,11 @@ impl Runs {
                     }
                 })?;
             }
-            // The installed release and its interface, in the warm run's result.
+            // The installed release, its interface and the installation a call may name, in the
+            // warm run's result.
             let installed = json!({"package": installation.package, "release": installation.release,
-                "interface": interface, "bytes": {"hub": moved.0, "volume": moved.1}});
+                "installation": installation.alias, "interface": interface,
+                "bytes": {"hub": moved.0, "volume": moved.1}});
             return warm_result(installed, models);
         }
         let entry = declared.expect("checked above");
