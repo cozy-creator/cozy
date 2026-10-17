@@ -523,11 +523,7 @@ mod tests {
 
     fn write(objects: &Objects, actor: &str, bytes: &[u8]) -> Member {
         let digest = format!("sha256:{}", sha256::hex_digest(bytes));
-        let mut writer = objects
-            .begin(actor, &digest, bytes.len() as u64, 0)
-            .unwrap();
-        writer.append(bytes).unwrap();
-        writer.finish().unwrap();
+        objects.write(actor, &digest, bytes).unwrap();
         Member {
             name: String::new(),
             digest,

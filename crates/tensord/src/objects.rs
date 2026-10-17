@@ -1,18 +1,22 @@
-//! Write: content-addressed objects a signer uploads (run inputs, local package sources),
-//! resumable from the length already held. Bytes stage per signer and enter the TensorFS
-//! store only once their digest verifies. A run names only objects its own signer wrote, so
-//! another signer's object is neither readable nor reported as held.
+//! Objects a signer uploads (run inputs, local package sources), content-addressed. An upload
+//! lands byte ranges in any order, several side by side, and resumes from the ranges held. Bytes
+//! stage per signer and enter the TensorFS store only once every byte is held and the digest
+//! verifies. A run names only objects its own signer wrote, so another signer's object is neither
+//! readable nor reported as held.
 use crate::{
     execution::Engine,
     journal::{Artifact, Execution, HeldMemo, ResultRecord},
 };
-use fs2::FileExt;
 use std::{
+    collections::HashMap,
     fs::{self, File, OpenOptions},
-    io::{self, Seek, SeekFrom, Write},
-    os::unix::fs::MetadataExt,
+    io,
+    os::unix::fs::FileExt,
     path::{Path, PathBuf},
-    sync::{Arc, MutexGuard},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, MutexGuard, Weak,
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tensorfs_core::{
@@ -22,10 +26,15 @@ use tensorfs_core::{
 /// The largest memoized result record this machine holds for reuse.
 const MEMO_RESULT_BYTES: usize = 48 << 10;
 
+/// Byte ranges `[start, end)`, sorted and apart.
+pub type Ranges = Vec<(u64, u64)>;
+
 pub struct Objects {
     root: PathBuf,
     store: Arc<Store>,
     engine: Arc<Engine>,
+    /// Uploads under way, by part file.
+    uploads: Mutex<HashMap<PathBuf, Weak<Upload>>>,
 }
 
 /// Why a write was refused, as the API's typed reason.
@@ -46,15 +55,82 @@ impl From<io::Error> for Refused {
     }
 }
 
-/// One object's upload in progress: bytes append from the held length.
-pub struct Writer<'a> {
-    objects: &'a Objects,
+/// One object's upload, shared by the writes that carry its ranges.
+pub struct Upload {
     actor: String,
     object: ObjectRef,
     part: PathBuf,
-    file: Option<File>,
-    held: u64,
-    skip: u64,
+    file: File,
+    held: Mutex<Ranges>,
+    /// One settle at a time records what landed.
+    settling: Mutex<()>,
+    /// Stored or dropped: later writes to it land nowhere, and a new upload starts afresh.
+    ended: AtomicBool,
+}
+
+impl Upload {
+    /// Lands `data` at `offset`.
+    pub fn write_at(&self, offset: u64, data: &[u8]) -> Result<(), Refused> {
+        let end = offset + data.len() as u64;
+        if end > self.object.length {
+            return Err(refused(
+                "object_length_exceeded",
+                "more bytes than the object's declared length",
+            ));
+        }
+        if self.ended.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        self.file.write_all_at(data, offset)?;
+        insert(&mut self.held.lock().unwrap(), (offset, end));
+        Ok(())
+    }
+
+    /// What has landed, synced or not.
+    pub fn held(&self) -> Ranges {
+        self.held.lock().unwrap().clone()
+    }
+}
+
+/// Adds `[start, end)` to `ranges`, merging what it touches.
+fn insert(ranges: &mut Ranges, (mut start, mut end): (u64, u64)) {
+    if start >= end {
+        return;
+    }
+    ranges.retain(|&(s, e)| {
+        let apart = e < start || s > end;
+        if !apart {
+            (start, end) = (start.min(s), end.max(e));
+        }
+        apart
+    });
+    let at = ranges.partition_point(|&(s, _)| s < start);
+    ranges.insert(at, (start, end));
+}
+
+fn whole(length: u64) -> Ranges {
+    match length {
+        0 => vec![],
+        length => vec![(0, length)],
+    }
+}
+
+/// The record of what a part holds: its object's length and the ranges synced.
+fn held_path(part: &Path) -> PathBuf {
+    part.with_extension("held")
+}
+fn read_held(part: &Path) -> io::Result<Option<(u64, Ranges)>> {
+    match fs::read(held_path(part)) {
+        Ok(raw) => Ok(serde_json::from_slice(&raw).ok()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+fn write_held(part: &Path, length: u64, held: &Ranges) -> io::Result<()> {
+    let path = held_path(part);
+    let next = path.with_extension("held.next");
+    fs::write(&next, serde_json::to_vec(&(length, held))?)?;
+    fs::rename(next, path)
 }
 
 impl Objects {
@@ -64,6 +140,7 @@ impl Objects {
             root: root.to_path_buf(),
             store,
             engine,
+            uploads: Mutex::default(),
         })
     }
 
@@ -222,133 +299,110 @@ impl Objects {
         Ok(())
     }
 
-    /// Opens `digest` (`sha256:<hex>`) of `length` for this signer, its bytes continuing at
-    /// `offset`. Bytes before the held length are skipped; a gap beyond it is refused.
-    pub fn begin(
-        &self,
-        actor: &str,
-        digest: &str,
-        length: u64,
-        offset: u64,
-    ) -> Result<Writer<'_>, Refused> {
-        let hex = hex(digest).ok_or_else(|| {
-            refused(
-                "invalid_request",
-                "an object is named by sha256:<64 lowercase hex>",
-            )
-        })?;
+    fn part(&self, actor: &str, hex: &str) -> PathBuf {
+        let dir = self.root.join(&sha256::hex_digest(actor.as_bytes())[..32]);
+        dir.join(format!("{hex}.part"))
+    }
+
+    /// The stored object this signer wrote, its roots renewed so a run naming it soon finds it.
+    fn renew(&self, actor: &str, digest: &str) -> io::Result<Option<u64>> {
+        let _custody = self.guard();
+        let Some((_, length)) = self.path(actor, digest)? else {
+            return Ok(None);
+        };
         let object = ObjectRef {
-            sha256: hex.clone(),
+            sha256: digest["sha256:".len()..].to_string(),
             length,
         };
-        let dir = self.root.join(&sha256::hex_digest(actor.as_bytes())[..32]);
-        let part = dir.join(format!("{hex}.part"));
-        let mut writer = Writer {
-            objects: self,
-            actor: actor.to_string(),
-            object,
-            part,
-            file: None,
-            held: 0,
-            skip: 0,
-        };
-        if self.path(actor, digest)?.is_some_and(|(_, l)| l == length) {
-            writer.held = length;
-            return Ok(writer);
+        let _writer = self.writer_guard()?;
+        self.retain(std::slice::from_ref(&object))?;
+        self.engine.with_journal(|j| j.bind_object(actor, &object))?;
+        Ok(Some(length))
+    }
+
+    /// The ranges of `digest` (`sha256:<hex>`) this signer holds: all of it once stored, else
+    /// what its upload has landed.
+    pub fn held(&self, actor: &str, digest: &str) -> Result<Ranges, Refused> {
+        let hex = valid(digest)?;
+        if let Some(length) = self.renew(actor, digest)? {
+            return Ok(whole(length));
         }
-        fs::create_dir_all(&dir)?;
-        // Writes of one object take turns (a client's concurrent first calls each send the
-        // package source): the next continues from what the last left, or finds it stored.
-        let file = loop {
-            let file = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&writer.part)?;
-            file.lock_exclusive()?;
-            if self.path(actor, digest)?.is_some_and(|(_, l)| l == length) {
-                writer.held = length;
-                return Ok(writer);
+        let part = self.part(actor, &hex);
+        if let Some(upload) = self.uploads.lock().unwrap().get(&part).and_then(Weak::upgrade) {
+            return Ok(upload.held());
+        }
+        Ok(read_held(&part)?.map(|(_, held)| held).unwrap_or_default())
+    }
+
+    /// The upload of `digest`, `length` bytes, for this signer: joined while under way, else
+    /// resumed from the ranges an earlier one synced. None once the object is stored.
+    pub fn upload(&self, actor: &str, digest: &str, length: u64) -> Result<Option<Arc<Upload>>, Refused> {
+        let hex = valid(digest)?;
+        if self.renew(actor, digest)? == Some(length) {
+            return Ok(None);
+        }
+        let part = self.part(actor, &hex);
+        let mut uploads = self.uploads.lock().unwrap();
+        uploads.retain(|_, upload| upload.strong_count() > 0);
+        if let Some(upload) = uploads.get(&part).and_then(Weak::upgrade) {
+            if upload.object.length != length {
+                return Err(refused(
+                    "invalid_request",
+                    format!("{digest} is being written as {} bytes", upload.object.length),
+                ));
             }
-            // The last write may have stored or dropped the part this handle opened.
-            let held = file.metadata()?;
-            match fs::metadata(&writer.part) {
-                Ok(at) if (at.dev(), at.ino()) == (held.dev(), held.ino()) => break file,
-                Ok(_) => continue,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-                Err(e) => return Err(e.into()),
+            return Ok(Some(upload));
+        }
+        fs::create_dir_all(part.parent().expect("a signer's directory"))?;
+        let file = OpenOptions::new().read(true).write(true).create(true).open(&part)?;
+        let held = match read_held(&part)? {
+            Some((was, held)) if was == length => held,
+            _ => {
+                file.set_len(0)?;
+                vec![]
             }
         };
-        writer.held = file.metadata()?.len();
-        if writer.held > length {
-            file.set_len(0)?;
-            writer.held = 0;
-        }
-        if offset > writer.held {
-            return Err(refused(
-                "object_offset_ahead",
-                format!("this machine holds {} bytes of the object", writer.held),
-            ));
-        }
+        file.set_len(length)?;
+        let missing = length - held.iter().map(|(s, e)| e - s).sum::<u64>();
         self.store
-            .admits(length - writer.held)
+            .admits(missing)
             .map_err(|e| refused("machine_disk_full", format!("no room for the object: {e}")))?;
-        writer.file = Some(file);
-        writer.skip = writer.held - offset;
-        Ok(writer)
-    }
-}
-
-impl Writer<'_> {
-    pub fn held(&self) -> u64 {
-        self.held
-    }
-
-    /// The next bytes of the stream, in order from the frame's offset.
-    pub fn append(&mut self, mut data: &[u8]) -> Result<(), Refused> {
-        let skip = (self.skip as usize).min(data.len());
-        self.skip -= skip as u64;
-        data = &data[skip..];
-        if data.is_empty() {
-            return Ok(());
-        }
-        let Some(file) = self.file.as_mut() else {
-            return Ok(()); // already written: the bytes are known
-        };
-        if self.held + data.len() as u64 > self.object.length {
-            return Err(refused(
-                "object_length_exceeded",
-                "more bytes than the object's declared length",
-            ));
-        }
-        file.seek(SeekFrom::End(0))?;
-        file.write_all(data)?;
-        self.held += data.len() as u64;
-        Ok(())
+        let upload = Arc::new(Upload {
+            actor: actor.to_string(),
+            object: ObjectRef { sha256: hex, length },
+            part: part.clone(),
+            file,
+            held: Mutex::new(held),
+            settling: Mutex::default(),
+            ended: AtomicBool::new(false),
+        });
+        uploads.insert(part, Arc::downgrade(&upload));
+        Ok(Some(upload))
     }
 
-    /// Ends this attempt: a complete object is verified and stored for this signer; a
-    /// partial one stays staged for the next attempt. Answers the bytes held.
-    pub fn finish(mut self) -> Result<u64, Refused> {
-        let Some(file) = self.file.take() else {
-            let _custody = self.objects.guard();
-            let _writer = self.objects.writer_guard()?;
-            self.objects.retain(std::slice::from_ref(&self.object))?;
-            self.objects
-                .engine
-                .with_journal(|j| j.bind_object(&self.actor, &self.object))?;
-            return Ok(self.held);
-        };
-        file.sync_data()?;
-        if self.held < self.object.length {
-            return Ok(self.held);
+    /// Records what `upload` landed, durably. Once it holds every byte, the object is verified
+    /// against its digest and stored for its signer; bytes that differ are dropped. Answers the
+    /// ranges held.
+    pub fn settle(&self, upload: &Upload) -> Result<Ranges, Refused> {
+        let digest = format!("sha256:{}", upload.object.sha256);
+        let length = upload.object.length;
+        let _settling = upload.settling.lock().unwrap();
+        if upload.ended.load(Ordering::Acquire) {
+            return self.held(&upload.actor, &digest);
         }
-        let _custody = self.objects.guard();
-        let _writer = self.objects.writer_guard()?;
-        let stored = self
-            .objects
-            .store
-            .put_file(&self.part, Some(&self.object), &Fault::default());
-        let _ = fs::remove_file(&self.part);
+        let held = upload.held();
+        upload.file.sync_data()?;
+        if held != whole(length) {
+            write_held(&upload.part, length, &held)?;
+            return Ok(held);
+        }
+        let _custody = self.guard();
+        let _writer = self.writer_guard()?;
+        upload.ended.store(true, Ordering::Release);
+        self.uploads.lock().unwrap().remove(&upload.part);
+        let stored = (self.store).put_file(&upload.part, Some(&upload.object), &Fault::default());
+        let _ = fs::remove_file(&upload.part);
+        let _ = fs::remove_file(held_path(&upload.part));
         stored.map_err(|e| {
             refused(
                 match e.code {
@@ -360,13 +414,32 @@ impl Writer<'_> {
                 e.to_string(),
             )
         })?;
-        self.objects.retain(std::slice::from_ref(&self.object))?;
-        let (actor, object) = (self.actor.clone(), self.object.clone());
-        self.objects
-            .engine
-            .with_journal(|j| j.bind_object(&actor, &object))?;
-        Ok(self.held)
+        self.retain(std::slice::from_ref(&upload.object))?;
+        self.engine
+            .with_journal(|j| j.bind_object(&upload.actor, &upload.object))?;
+        Ok(held)
     }
+
+    /// Writes all of `bytes` as one upload.
+    #[cfg(test)]
+    pub fn write(&self, actor: &str, digest: &str, bytes: &[u8]) -> Result<Ranges, Refused> {
+        match self.upload(actor, digest, bytes.len() as u64)? {
+            None => Ok(whole(bytes.len() as u64)),
+            Some(upload) => {
+                upload.write_at(0, bytes)?;
+                self.settle(&upload)
+            }
+        }
+    }
+}
+
+fn valid(digest: &str) -> Result<String, Refused> {
+    hex(digest).ok_or_else(|| {
+        refused(
+            "invalid_request",
+            "an object is named by sha256:<64 lowercase hex>",
+        )
+    })
 }
 
 fn hex(digest: &str) -> Option<String> {
@@ -380,59 +453,58 @@ fn hex(digest: &str) -> Option<String> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_write_resumes_verifies_and_belongs_to_its_signer() {
-        let root = std::env::temp_dir().join(format!("cm-objects-{}", uuid::Uuid::new_v4()));
+    fn objects(root: &Path) -> Objects {
         let service =
             crate::service::Service::open(&root.join("state"), &root.join("g"), 1).unwrap();
         let store = Arc::new(Store::ensure(&root.join("tensorfs")).unwrap());
-        let objects = Objects::new(&root.join("writes"), store, service.engine.clone()).unwrap();
+        Objects::new(&root.join("writes"), store, service.engine.clone()).unwrap()
+    }
+
+    /// Ranges land in any order, side by side, survive the machine's restart, verify once whole,
+    /// and belong to their signer.
+    #[test]
+    fn an_upload_lands_ranges_resumes_verifies_and_belongs_to_its_signer() {
+        let root = std::env::temp_dir().join(format!("cm-objects-{}", uuid::Uuid::new_v4()));
+        let objects = objects(&root);
         let bytes: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
         let digest = format!("sha256:{}", sha256::hex_digest(&bytes));
         let length = bytes.len() as u64;
 
-        // A first attempt stops partway; a probe then reports what is held.
-        let mut first = objects.begin("alice", &digest, length, 0).unwrap();
-        first.append(&bytes[..100_000]).unwrap();
-        assert_eq!(first.finish().unwrap(), 100_000);
-        assert_eq!(
-            objects
-                .begin("alice", &digest, length, 0)
-                .unwrap()
-                .finish()
-                .unwrap(),
-            100_000
+        let (first, second) = (
+            objects.upload("alice", &digest, length).unwrap().unwrap(),
+            objects.upload("alice", &digest, length).unwrap().unwrap(),
         );
-        assert!(objects.path("alice", &digest).unwrap().is_none());
+        assert!(Arc::ptr_eq(&first, &second), "one upload, joined");
+        second.write_at(200_000, &bytes[200_000..250_000]).unwrap();
+        first.write_at(0, &bytes[..100_000]).unwrap();
+        assert_eq!(objects.held("alice", &digest).unwrap(), [(0, 100_000), (200_000, 250_000)]);
+        assert_eq!(objects.settle(&first).unwrap(), [(0, 100_000), (200_000, 250_000)]);
+        drop((first, second));
+
+        // What was synced is held after a restart; the rest completes the object.
+        let objects = Objects::new(&root.join("writes"), objects.store.clone(), objects.engine.clone()).unwrap();
+        assert_eq!(objects.held("alice", &digest).unwrap(), [(0, 100_000), (200_000, 250_000)]);
+        let upload = objects.upload("alice", &digest, length).unwrap().unwrap();
+        upload.write_at(50_000, &bytes[50_000..200_000]).unwrap();
+        upload.write_at(250_000, &bytes[250_000..]).unwrap();
         assert_eq!(
-            objects
-                .begin("alice", &digest, length, 200_000)
-                .err()
-                .unwrap()
-                .code,
-            "object_offset_ahead"
+            upload.write_at(250_000, &[0; 50_001]).unwrap_err().code,
+            "object_length_exceeded"
         );
-        // A resend overlapping the held prefix skips it; the rest completes the object.
-        let mut second = objects.begin("alice", &digest, length, 50_000).unwrap();
-        second.append(&bytes[50_000..]).unwrap();
-        assert_eq!(second.finish().unwrap(), length);
+        assert_eq!(objects.settle(&upload).unwrap(), [(0, length)]);
         let (path, held) = objects.path("alice", &digest).unwrap().unwrap();
         assert_eq!((fs::read(path).unwrap(), held), (bytes.clone(), length));
-        assert_eq!(
-            objects.begin("alice", &digest, length, 0).unwrap().held(),
-            length
-        );
+        assert!(objects.upload("alice", &digest, length).unwrap().is_none());
+        assert_eq!(objects.held("alice", &digest).unwrap(), [(0, length)]);
 
         // Another signer learns nothing of it and must send the bytes itself.
         assert!(objects.path("bob", &digest).unwrap().is_none());
-        assert_eq!(objects.begin("bob", &digest, length, 0).unwrap().held(), 0);
+        assert_eq!(objects.held("bob", &digest).unwrap(), []);
 
         // Bytes that differ from their digest are dropped, not stored.
         let wrong = format!("sha256:{}", "0".repeat(64));
-        let mut bad = objects.begin("alice", &wrong, 3, 0).unwrap();
-        bad.append(b"abc").unwrap();
-        assert_eq!(bad.finish().err().unwrap().code, "object_digest_mismatch");
-        assert_eq!(objects.begin("alice", &wrong, 3, 0).unwrap().held(), 0);
+        assert_eq!(objects.write("alice", &wrong, b"abc").unwrap_err().code, "object_digest_mismatch");
+        assert_eq!(objects.held("alice", &wrong).unwrap(), []);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -441,15 +513,10 @@ mod tests {
     #[test]
     fn a_held_memo_answers_while_its_file_is_held_and_goes_with_it() {
         let root = std::env::temp_dir().join(format!("cm-objects-{}", uuid::Uuid::new_v4()));
-        let service =
-            crate::service::Service::open(&root.join("state"), &root.join("g"), 1).unwrap();
-        let store = Arc::new(Store::ensure(&root.join("tensorfs")).unwrap());
-        let objects = Objects::new(&root.join("writes"), store, service.engine.clone()).unwrap();
+        let objects = objects(&root);
         let bytes = b"note 5".to_vec();
         let hex = sha256::hex_digest(&bytes);
-        let mut writer = objects.begin("alice", &format!("sha256:{hex}"), 6, 0).unwrap();
-        writer.append(&bytes).unwrap();
-        writer.finish().unwrap();
+        objects.write("alice", &format!("sha256:{hex}"), &bytes).unwrap();
         let record = crate::journal::ResultRecord {
             value: serde_json::json!({"file": {"asset_ref": "attempt:1/file/0001"}}),
             artifacts: vec![crate::journal::Artifact { name: "file-0001".into(), path: String::new(), sha256: hex.clone(), length: 6 }],
@@ -458,7 +525,7 @@ mod tests {
                 length: 6,
             }],
         };
-        let engine = service.engine.clone();
+        let engine = objects.engine.clone();
         let held = crate::journal::HeldMemo { actor: "alice".into(), computation: "sha256:c".into(),
             record: serde_json::to_vec(&record).unwrap(), objects: vec![hex.clone()] };
         engine.with_journal(|j| j.hold_memo(&held)).unwrap();
@@ -470,56 +537,6 @@ mod tests {
         std::thread::sleep(Duration::from_millis(20));
         assert_eq!(objects.release(Duration::ZERO).unwrap(), 1);
         assert!(engine.with_journal(|j| j.held_memo("alice", "sha256:c")).unwrap().is_none(), "reclaim dropped the memo");
-        let _ = fs::remove_dir_all(root);
-    }
-
-    /// A client's concurrent first calls each send the package source: the second write
-    /// waits for the first, then finds the object stored instead of being refused.
-    #[test]
-    fn a_second_write_of_an_object_waits_for_the_first() {
-        let root = std::env::temp_dir().join(format!("cm-objects-{}", uuid::Uuid::new_v4()));
-        let service =
-            crate::service::Service::open(&root.join("state"), &root.join("g"), 1).unwrap();
-        let store = Arc::new(Store::ensure(&root.join("tensorfs")).unwrap());
-        let objects = Objects::new(&root.join("writes"), store, service.engine.clone()).unwrap();
-        let bytes: Vec<u8> = (0..300_000u32).map(|i| (i % 241) as u8).collect();
-        let digest = format!("sha256:{}", sha256::hex_digest(&bytes));
-        let length = bytes.len() as u64;
-
-        let mut first = objects.begin("alice", &digest, length, 0).unwrap();
-        first.append(&bytes[..100_000]).unwrap();
-        let part = first.part.clone();
-        let waiting = format!(":{} ", fs::metadata(&part).unwrap().ino());
-        let (sent, answer) = std::sync::mpsc::channel();
-        std::thread::scope(|scope| {
-            scope.spawn(|| {
-                let second = objects
-                    .begin("alice", &digest, length, 0)
-                    .map(|writer| writer.held());
-                sent.send(second.map_err(|refused| refused.code)).unwrap();
-            });
-            // The second write either answers or blocks on the first's lock.
-            let early = loop {
-                if let Ok(answer) = answer.try_recv() {
-                    break Some(answer);
-                }
-                let locks = fs::read_to_string("/proc/locks").unwrap();
-                if locks
-                    .lines()
-                    .any(|l| l.contains("->") && l.contains(&waiting))
-                {
-                    break None;
-                }
-                std::thread::yield_now();
-            };
-            assert_eq!(early, None, "the second write did not wait for the first");
-            first.append(&bytes[100_000..]).unwrap();
-            assert_eq!(first.finish().unwrap(), length);
-            assert_eq!(answer.recv().unwrap(), Ok(length));
-        });
-        assert!(!part.exists());
-        let (path, held) = objects.path("alice", &digest).unwrap().unwrap();
-        assert_eq!((fs::read(path).unwrap(), held), (bytes, length));
         let _ = fs::remove_dir_all(root);
     }
 }
