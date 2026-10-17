@@ -17,6 +17,7 @@ targets = [
   "aarch64-pc-windows-msvc",
 ]
 install-path = "~/.cozy/bin"
+install-success-msg = "cozy is installed. Optional: `cozy tools install ffmpeg` trims video uploads (`cozy tools list` shows each tool and what it adds)."
 install-updater = false
 dispatch-releases = true
 precise-builds = true
