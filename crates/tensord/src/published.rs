@@ -1477,9 +1477,11 @@ fn apply_adapters(
 /// by version, else the newest pre-release; yanked ones never.
 /// A catalog read the Hub answered 404 to is the thing named absent there; any other failure
 /// is the read's.
+/// The Hub's own 404 names an absence; one without its envelope (`http_404`: a tunnel or proxy
+/// in front of it) names nothing (tfs-101).
 fn absent(refusal: hub_client::Error, code: &'static str, named: impl FnOnce() -> String) -> Failure {
     match refusal {
-        hub_client::Error::Hub { status: 404, .. } => (code, named()),
+        hub_client::Error::Hub { status: 404, code: hub, .. } if !hub.starts_with("http_") => (code, named()),
         other => ("catalog_read_failed", other.to_string()),
     }
 }
