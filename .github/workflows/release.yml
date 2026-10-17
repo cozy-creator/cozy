@@ -53,7 +53,7 @@ on:
         default: ''
         type: string
       tensorfs_run:
-        description: A tensorfs-release run whose unpublished wheel stands in for PyPI's (dry runs and prereleases)
+        description: A publish-tensorfs run whose unpublished wheel stands in for PyPI's (dry runs and prereleases)
         required: false
         default: ''
         type: string

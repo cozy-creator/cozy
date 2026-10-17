@@ -22,8 +22,8 @@ version = "0.9.6"
 edition = "2024"
 rust-version = "1.99"
 license = "MIT"
-repository = "https://github.com/cozy-creator/cozy"
-homepage = "https://github.com/cozy-creator/cozy"
+repository = "https://github.com/cozy-creator/cozy-creator"
+homepage = "https://github.com/cozy-creator/cozy-creator"
 publish = false
 
 [workspace.dependencies]

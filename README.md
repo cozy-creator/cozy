@@ -9,13 +9,13 @@ carries the command line, Calcifer (the local controller), TensorD (the machine)
 Linux and macOS:
 
 ```sh
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/cozy-creator/cozy/releases/latest/download/cozy-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/cozy-creator/cozy-creator/releases/latest/download/cozy-installer.sh | sh
 ```
 
 Windows:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -c "irm https://github.com/cozy-creator/cozy/releases/latest/download/cozy-installer.ps1 | iex"
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/cozy-creator/cozy-creator/releases/latest/download/cozy-installer.ps1 | iex"
 ```
 
 Both put `cozy` in `~/.cozy/bin`; `cozy update` moves to the newest release.

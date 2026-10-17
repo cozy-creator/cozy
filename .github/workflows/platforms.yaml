@@ -3,7 +3,7 @@ name: platforms
 # as the control; the job's verdict is that. TensorD and TensorFS are reported, not judged, where they are
 # not ported yet (xs-043 T, X, WM, AP).
 # Nightly on master, and per question:
-#   gh workflow run platforms.yaml -R cozy-creator/cozy --ref <branch> [-f os='["windows-2025"]'] [-f test='cargo test -p <crate>']
+#   gh workflow run platforms.yaml -R cozy-creator/cozy-creator --ref <branch> [-f os='["windows-2025"]'] [-f test='cargo test -p <crate>']
 # A release (release.yml) needs a green run on its commit covering every release runner (release-gate.yml).
 on:
   schedule:
