@@ -3938,6 +3938,38 @@ fn a_full_disk_met_outside_the_store_is_still_a_capacity_verdict() {
 }
 
 #[test]
+fn zz_cache_root_loop() {
+    let end = std::time::Instant::now() + Duration::from_secs(50);
+    let (mut rounds, mut odd) = (0, 0);
+    while std::time::Instant::now() < end {
+        rounds += 1;
+        let checkpoint = Arc::new(checkpoint(2, 1024));
+        let origin = hub_origin(Arc::clone(&checkpoint), |_, _| None);
+        let policy = SourcePolicy::default();
+        let root = temporary("zz-cached-root");
+        let store = Store::init(&root).unwrap();
+        let request = PullRequest::new(&store, &origin.base, "acme/model", Anonymous, &policy);
+        let cold = pull(&request).unwrap();
+        let report = crate::gc::collect_cached(&root, &[]).unwrap();
+        let again = pull(&request).unwrap();
+        if again.bytes_moved != cold.bytes_moved {
+            odd += 1;
+            println!("ZZCR cold={cold:?}");
+            println!("ZZCR again={again:?}");
+            println!("ZZCR report={report:?}");
+            for line in std::fs::read_to_string(root.join("logs/transport.log")).unwrap_or_default().lines() {
+                println!("ZZCR log {line}");
+            }
+            for (path, hits) in origin.hits_all() {
+                println!("ZZCR hits {path} {hits}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+    println!("ZZCR rounds={rounds} odd={odd}");
+}
+
+#[test]
 fn downloaded_cache_root_is_protected_then_evicted_and_refetched() {
     let checkpoint = Arc::new(checkpoint(2, 1024));
     let origin = hub_origin(Arc::clone(&checkpoint), |_, _| None);
