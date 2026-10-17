@@ -683,6 +683,7 @@ dependencies = [
 name = "cozy-proto"
 version = "0.9.0"
 dependencies = [
+ "axum",
  "base64 0.22.1",
  "bytes",
  "cozy-platform",
@@ -691,6 +692,8 @@ dependencies = [
  "figment",
  "futures-util",
  "hex",
+ "hyper-util",
+ "rcgen",
  "reqwest",
  "rustls",
  "serde",

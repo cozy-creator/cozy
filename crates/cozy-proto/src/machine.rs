@@ -60,6 +60,42 @@ pub fn parse_held(value: &str) -> Option<Ranges> {
     Some(ranges)
 }
 
+/// The bytes `ranges` cover.
+pub fn held_bytes(ranges: &[(u64, u64)]) -> u64 {
+    ranges
+        .iter()
+        .map(|(start, end)| end.saturating_sub(*start))
+        .sum()
+}
+
+/// What of `[0, length)` `ranges` does not cover.
+pub fn missing(ranges: &[(u64, u64)], length: u64) -> Ranges {
+    let mut gaps = vec![];
+    let mut at = 0;
+    for &(start, end) in ranges {
+        if start > at {
+            gaps.push((at, start.min(length)));
+        }
+        at = at.max(end);
+    }
+    if at < length {
+        gaps.push((at, length));
+    }
+    gaps.retain(|(start, end)| end > start);
+    gaps
+}
+
+/// One output of a run, as `GET /v1/runs/{id}/outputs/{output}?index=&member=` names it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct OutputTarget {
+    pub run: String,
+    pub output: String,
+    /// A list item's 1-based index; 0 for a single output.
+    pub index: u32,
+    /// One file of a tree output, by its manifest path; empty: the manifest.
+    pub member: String,
+}
+
 /// Raw JSON, kept as its exact text: canonical bytes and 64-bit integers survive.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -672,11 +708,18 @@ mod tests {
     fn held_ranges_spell_and_parse_back() {
         let ranges = vec![(0, 1 << 20), (2 << 20, 4 << 20)];
         assert_eq!(spell_held(&ranges), "0-1048575,2097152-4194303");
-        assert_eq!(parse_held(&spell_held(&ranges)), Some(ranges));
+        assert_eq!(parse_held(&spell_held(&ranges)), Some(ranges.clone()));
         assert_eq!(parse_held(""), Some(vec![]));
         assert_eq!(parse_held("5-4"), None);
         assert_eq!(parse_held("0-9,5-20"), None, "overlapping");
         assert_eq!(parse_held("x"), None);
+        assert_eq!(held_bytes(&ranges), 3 << 20);
+        assert_eq!(
+            missing(&ranges, 5 << 20),
+            [(1 << 20, 2 << 20), (4 << 20, 5 << 20)]
+        );
+        assert_eq!(missing(&[], 7), [(0, 7)]);
+        assert_eq!(missing(&[(0, 7)], 7), []);
     }
 
     /// A spec's payload keeps its exact text, unknown fields are ignored, and an event is named
