@@ -57,6 +57,7 @@ async fn an_input_uploads_near_the_link_rate_over_a_long_round_trip() {
     let hub = SilentHub::new();
     let calcifer =
         Calcifer::open(&home.path().join("calcifer"), &home.path().join("outputs")).unwrap();
+    calcifer.resume().unwrap();
     calcifer.put_machine(&machine.row("m", &key)).unwrap();
     let mut events = calcifer.subscribe();
     let total = 20u32 << 20;
@@ -164,6 +165,7 @@ async fn a_runs_output_downloads_near_the_link_rate_over_a_long_round_trip() {
     let machine = common::installing_machine_at(SHAPED);
     let calcifer =
         Calcifer::open(&home.path().join("calcifer"), &home.path().join("outputs")).unwrap();
+    calcifer.resume().unwrap();
     calcifer.put_machine(&machine.row("m", &key)).unwrap();
     let mut events = calcifer.subscribe();
     let gate = home.path().join("gate");
@@ -225,6 +227,7 @@ async fn inputs_the_machine_holds_are_asked_about_once_over_a_long_round_trip() 
     let hub = SilentHub::new();
     let calcifer =
         Calcifer::open(&home.path().join("calcifer"), &home.path().join("outputs")).unwrap();
+    calcifer.resume().unwrap();
     calcifer.put_machine(&machine.row("m", &key)).unwrap();
     let mut events = calcifer.subscribe();
     let inputs: Vec<_> = (0..INPUTS)
