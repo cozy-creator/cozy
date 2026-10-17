@@ -220,7 +220,10 @@ fn a_queued_call_runs_once_the_running_one_ends() {
 fn deterministic_launch_failure_fails_once_with_its_reason() {
     let machine = Machine::open();
     let (generations, identity) = lifecycle();
-    let broken = format!("{}0", &identity[..identity.len() - 1]);
+    // Another identity: one that ended in 0 would be the real generation, whose interpreter
+    // link this test must never write through.
+    let last = if identity.ends_with('0') { '1' } else { '0' };
+    let broken = format!("{}{last}", &identity[..identity.len() - 1]);
     let directory = generations.join(&broken);
     fs::create_dir_all(&directory).unwrap();
     fs::write(directory.join(".hold"), b"").unwrap();
