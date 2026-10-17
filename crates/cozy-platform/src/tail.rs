@@ -9,15 +9,7 @@ use std::{
     time::Duration,
 };
 
-#[cfg(windows)]
-use std::os::windows::io::AsRawHandle as _;
-
-#[cfg(windows)]
-use windows_sys::Win32::Storage::FileSystem::{
-    BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
-};
-
-use crate::watch::DirWatch;
+use crate::{durable::FileId, watch::DirWatch};
 
 /// At most this much is read at once.
 const BATCH: usize = 64 << 10;
@@ -366,21 +358,10 @@ impl Reader {
     }
 }
 
-/// What names a file across a rename: its inode, or on Windows its file index (a creation time
-/// is no name there: a file made under a just-renamed name inherits the old one's).
-#[cfg(unix)]
+/// What names a file across a rename, in its directory: its inode, or on Windows its file index
+/// (not its creation time, which a file made under a just-renamed name inherits).
 fn identity(file: &File) -> io::Result<u64> {
-    Ok(std::os::unix::fs::MetadataExt::ino(&file.metadata()?))
-}
-
-#[cfg(windows)]
-fn identity(file: &File) -> io::Result<u64> {
-    let mut info = BY_HANDLE_FILE_INFORMATION::default();
-    // SAFETY: an open file's handle and a writable information block.
-    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(u64::from(info.nFileIndexHigh) << 32 | u64::from(info.nFileIndexLow))
+    Ok(FileId::of(file)?.ino)
 }
 
 #[cfg(test)]
