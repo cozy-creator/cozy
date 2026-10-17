@@ -1650,6 +1650,7 @@ mod tests {
     /// `lock_holder_child`, until it has taken the lock.
     fn holder(catalog: &Path, millis: u64) -> std::process::Child {
         use std::io::BufRead;
+        let fence = crate::fork_fence::spawning();
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "catalog::tests::lock_holder_child", "--ignored"])
             .args(["--nocapture", "--test-threads=1"])
@@ -1658,6 +1659,7 @@ mod tests {
             .stdout(std::process::Stdio::piped())
             .spawn()
             .unwrap();
+        drop(fence);
         let mut lines = std::io::BufReader::new(child.stdout.take().unwrap()).lines();
         let held = lines
             .by_ref()
@@ -1846,6 +1848,7 @@ mod tests {
 
     #[test]
     fn rebuild_refuses_live_writer_and_reaps_dead_marker() {
+        let _quiet = crate::fork_fence::quiet();
         let root = temporary("writer");
         fs::create_dir_all(&root).unwrap();
         let guard = WriterGuard::acquire(&root).unwrap();
@@ -1880,6 +1883,8 @@ mod tests {
     #[test]
     fn inherited_recovery_descriptor_keeps_gc_fenced_until_child_exit() {
         use std::process::{Command, Stdio};
+        // Its own child is the only one: no other test's fork holds the lock after it exits.
+        let _quiet = crate::fork_fence::quiet();
         let root = temporary("inherited-recovery");
         crate::store::Store::init(&root).unwrap();
         let writer = WriterGuard::acquire(&root).unwrap();
@@ -1901,6 +1906,7 @@ mod tests {
 
     #[test]
     fn gc_recovery_lock_refuses_live_read_or_derived_hold() {
+        let _quiet = crate::fork_fence::quiet();
         let root = temporary("hold-fence");
         let store = crate::store::Store::init(&root).unwrap();
         let meta = crate::meta::Meta::open(&store).unwrap();

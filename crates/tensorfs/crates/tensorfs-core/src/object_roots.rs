@@ -216,15 +216,17 @@ mod tests {
             "tfs-object-crash-{}",
             crate::meta::now_nanos_unique()
         ));
-        let status = std::process::Command::new(std::env::current_exe().unwrap())
+        let fence = crate::fork_fence::spawning();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
                 "object_roots::tests::object_root_written_before_journal_ack_survives_process_exit",
             ])
             .env(AREA, &root)
-            .status()
+            .spawn()
             .unwrap();
-        assert!(status.success());
+        drop(fence);
+        assert!(child.wait().unwrap().success());
         crate::gc::collect(&root, false).unwrap();
         let store = Store::open(&root).unwrap();
         let object = ObjectRef::of(b"rooted before journal acknowledgment");
