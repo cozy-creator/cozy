@@ -9,10 +9,10 @@ use tensord::{
     launch_identity::Seal,
     reclaim::{self, Caches, Disk, KernelCaches, StoreCaches, Swept},
 };
+use cozy_platform::durable;
 use std::{
     collections::HashSet,
     fs, io,
-    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     sync::Arc,
     time::SystemTime,
@@ -220,15 +220,18 @@ fn reserve() -> u64 {
     disk(0).reserve()
 }
 
-/// Bytes on disk under `path`, each inode once.
-fn allocated(path: &Path, seen: &mut HashSet<u64>) -> u64 {
+/// Bytes on disk under `path`, each file once.
+fn allocated(path: &Path, seen: &mut HashSet<durable::FileId>) -> u64 {
     let Ok(metadata) = fs::symlink_metadata(path) else {
         return 0;
     };
-    let own = if seen.insert(metadata.ino()) {
-        metadata.blocks() * 512
-    } else {
-        0
+    // A symlink is its own entry; anything else is counted once, however many names it has.
+    let own = match metadata.file_type().is_symlink() {
+        true => durable::allocated(&metadata),
+        false => match durable::FileId::at(path) {
+            Ok(id) if seen.insert(id) => durable::allocated(&metadata),
+            _ => 0,
+        },
     };
     let children = if metadata.is_dir() {
         fs::read_dir(path).ok()
@@ -278,11 +281,7 @@ fn held_linked_and_open_bytes_do_not_make_a_plan_cover() {
     let outside = fixture.root.join("outside/triton/foreign");
     fs::create_dir_all(&outside).unwrap();
     fs::write(outside.join("kernel"), vec![1u8; MIB as usize]).unwrap();
-    std::os::unix::fs::symlink(
-        fixture.root.join("outside"),
-        fixture.kernels.root.join("u2"),
-    )
-    .unwrap();
+    durable::symlink(&fixture.root.join("outside"), &fixture.kernels.root.join("u2")).unwrap();
     // Counted by size alone these would cover half a mebibyte many times over.
     assert_eq!(fixture.sweep(None, &fixture.low(MIB / 2)), Swept::default());
     assert!(held.exists() && linked.exists() && result.exists() && kernel.exists());
@@ -416,7 +415,7 @@ fn the_uv_cache_drops_wheels_no_environment_links_before_generations_and_never_m
     assert_eq!((swept.uv_cache, swept.generations), (1, 0), "{swept:?}");
     assert_eq!(unpacked(), 1);
     assert!(generation.exists() && module.exists());
-    assert_eq!(fs::metadata(&module).unwrap().nlink(), 2);
+    assert_eq!(durable::links(&module).unwrap(), 2);
     // A removed entry is a cache miss: uv unpacks the wheel again.
     let again = fixture.root.join("env-again");
     fixture.install("beta", &again);

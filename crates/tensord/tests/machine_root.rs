@@ -6,8 +6,8 @@ mod common;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use ed25519_dalek::SigningKey;
 use fs2::FileExt;
+use cozy_platform::durable::{self, FileId};
 use std::{
-    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::Arc,
@@ -151,7 +151,7 @@ fn one_store_runs_one_machine() {
     let (first_root, second_root) = (scratch.join("first"), scratch.join("second"));
     let store = scratch.join("real/store");
     std::fs::create_dir_all(scratch.join("real")).unwrap();
-    std::os::unix::fs::symlink(scratch.join("real"), scratch.join("alias")).unwrap();
+    durable::symlink(&scratch.join("real"), &scratch.join("alias")).unwrap();
     let port = free_port();
     let mut first = boot(&first_root, port, Some(&store));
     ready(&mut first, &first_root, port);
@@ -192,7 +192,7 @@ async fn the_named_store_is_the_machines_store() {
             .unwrap();
     }
     let blob = Store::open(&named).unwrap().object_path(&kept_hex);
-    let inode = std::fs::metadata(&blob).unwrap().ino();
+    let inode = FileId::at(&blob).unwrap();
 
     let machine_root = root.join("machine");
     std::fs::create_dir_all(&machine_root).unwrap();
@@ -212,7 +212,7 @@ async fn the_named_store_is_the_machines_store() {
     let store = Store::open(&named).unwrap();
     assert!(store.contains(&written_hex), "the write went elsewhere");
     assert_eq!(std::fs::read(&blob).unwrap(), kept);
-    assert_eq!(std::fs::metadata(&blob).unwrap().ino(), inode);
+    assert_eq!(FileId::at(&blob).unwrap(), inode);
     assert!(
         !machine_root.join("var/lib/tensorfs").exists(),
         "the machine made a second store"

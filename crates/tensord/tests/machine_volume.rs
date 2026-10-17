@@ -98,6 +98,8 @@ fn on_volume(cache: &Path) -> usize {
     dirs(&cache.join("objects")).iter().flat_map(|a| dirs(a)).map(|b| dirs(&b).len()).sum()
 }
 
+/// A tmpfs mount named from a disk directory is Linux's.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn a_second_machine_downloads_from_the_volume_the_first_filled() {
     let source = std::env::temp_dir().join(format!("tensord-volume-source-{}", uuid::Uuid::new_v4()));

@@ -1,4 +1,6 @@
 //! CPU birth/journal proof only: this does not qualify a GPU or ordinary CLI inference.
+//! Its executors are Unix processes (a shell, `setsid`, signals).
+#![cfg(unix)]
 use cozy_platform::process::Birth;
 use tensord::{
     journal::{
