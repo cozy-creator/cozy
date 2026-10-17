@@ -93,15 +93,6 @@ jobs:
           pattern: wheel-*
           merge-multiple: true
           path: dist
-      # The sdist carries sources only, never the staged binary; pyproject's `data`
-      # option needs the directory to exist even for an sdist.
-      - run: mkdir -p wheel-data/scripts
-      - name: Build sdist
-        uses: PyO3/maturin-action@v1
-        with:
-          maturin-version: v1.15.0
-          command: sdist
-          args: --out dist
       # `needs: wheels` fails the release if any platform failed: every platform or none.
       - run: ls -l dist
       - name: Publish (trusted publishing)
