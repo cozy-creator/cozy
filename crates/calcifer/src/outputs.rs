@@ -98,8 +98,8 @@ enum Failure {
     Lost(String),
     /// Tried again after a pause, or once the machine changes.
     Again(String),
-    /// The machine refused the read: final once the run has ended (no newer revision can come
-    /// to read instead), tried again before.
+    /// The machine's definitive refusal: final once the run has ended (no newer revision can
+    /// come to read instead), tried again before.
     Refused(String),
 }
 
@@ -1047,15 +1047,18 @@ fn refused(status: Status) -> Ranged {
         Code::NotFound => Ranged::Stop(Failure::Lost(format!(
             "the machine no longer holds it ({message})"
         ))),
-        // While the run goes on, the machine may have moved past this revision: the run's frames
-        // bring the newer one. Once it ended, the answer is final.
-        Code::FailedPrecondition
-        | Code::OutOfRange
-        | Code::PermissionDenied
-        | Code::InvalidArgument
-        | Code::Unimplemented => Ranged::Stop(Failure::Refused(message)),
-        // Its key may not be admitted yet; a machine that ends loses the item anyway.
-        Code::Unauthenticated => Ranged::Stop(Failure::Again(message)),
+        // Definitive: the machine will not serve this read, or holds the output at another
+        // revision (while the run goes on, its frames bring the newer one; once it ended, none
+        // comes).
+        Code::OutOfRange | Code::PermissionDenied | Code::InvalidArgument | Code::Unimplemented => {
+            Ranged::Stop(Failure::Refused(message))
+        }
+        Code::FailedPrecondition if status.message().starts_with("the output is at revision") => {
+            Ranged::Stop(Failure::Refused(message))
+        }
+        // Anything else may pass (its store busy, its key not admitted yet, a restart): asked
+        // again, paced, until it serves or the machine ends, which loses the item.
+        Code::FailedPrecondition | Code::Unauthenticated => Ranged::Stop(Failure::Again(message)),
         _ => Ranged::Again(message),
     }
 }

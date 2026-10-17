@@ -1003,7 +1003,7 @@ async fn the_machines_stream_says_when_a_machine_changes_and_when_it_is_removed(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn every_output_ends_landed_kept_or_lost_and_a_checkpoint_waits_on_nothing() {
     let home = tempfile::tempdir().unwrap();
-    let machine = installing_machine();
+    let mut machine = installing_machine();
     with_machine(home.path(), &machine);
     // A settled run on a machine nothing can be read from, whose output is a checkpoint.
     let key = common::key_file(home.path());
@@ -1081,6 +1081,39 @@ async fn every_output_ends_landed_kept_or_lost_and_a_checkpoint_waits_on_nothing
         "a checkpoint holds up no end: {ended}"
     );
 
+    // `big` is owed again while its machine restarts after the run ended: the export waits for it,
+    // never giving the output up, and lands once it serves again.
+    served.down().await;
+    let db = rusqlite::Connection::open(Home::at(home.path()).calcifer_db()).unwrap();
+    let owed = db
+        .execute(
+            "UPDATE outputs SET exported_rev = NULL, path = NULL WHERE run = ?1 AND name = 'big'",
+            [made.id.as_str()],
+        )
+        .unwrap();
+    assert_eq!(owed, 1);
+    drop(db);
+    machine.stop();
+    let served = Served::start(home.path()).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let big = |run: Run| run.output.into_iter().find(|o| o.name == "big").unwrap();
+    let waiting = big(served.run(&made.id).await);
+    assert!(
+        waiting.path.is_none() && waiting.export_error.is_none(),
+        "{waiting:?}"
+    );
+    machine.start_again();
+    let until = Instant::now() + PATIENCE;
+    loop {
+        let now = big(served.run(&made.id).await);
+        assert!(now.export_error.is_none(), "{now:?}");
+        if now.path.is_some() {
+            break;
+        }
+        assert!(Instant::now() < until, "{now:?}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
     // The store says `big` is at a revision its machine never had: once the run has ended, the
     // machine's refusal is final.
     served.down().await;
@@ -1096,8 +1129,7 @@ async fn every_output_ends_landed_kept_or_lost_and_a_checkpoint_waits_on_nothing
     let served = Served::start(home.path()).await;
     let until = Instant::now() + PATIENCE;
     let big = loop {
-        let run = served.run(&made.id).await;
-        let big = run.output.into_iter().find(|o| o.name == "big").unwrap();
+        let big = big(served.run(&made.id).await);
         if big.export_error.is_some() || big.path.is_some() {
             break big;
         }
