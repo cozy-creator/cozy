@@ -21,6 +21,7 @@ pub mod calls;
 pub mod journal;
 pub mod launch_identity;
 pub mod local_source;
+pub mod logs;
 pub mod machine;
 pub mod machine_api;
 pub mod memo;

@@ -178,9 +178,21 @@ impl Link {
         Ok(Machine::new(address, pin, Auth::None)?.status().await?)
     }
 
-    /// The last `tail` bytes (0: all) of a log the machine keeps.
-    pub async fn read_log(&self, log: &str, tail: u64) -> Result<Vec<u8>, LinkError> {
-        Ok(self.machine.log(log, tail).await?.to_vec())
+    /// The newest `lines` whole lines (0: all) of a log the machine keeps.
+    pub async fn read_log(&self, log: &str, lines: u64) -> Result<Vec<u8>, LinkError> {
+        Ok(self.machine.log(log, lines).await?.to_vec())
+    }
+
+    /// A log's lines as `read_log` reads them, or those after `after` (a batch's place), then
+    /// each batch as the machine appends it.
+    pub async fn follow_log(
+        &self,
+        log: &str,
+        lines: u64,
+        after: Option<&str>,
+    ) -> Result<Live<v1::LogLines>, LinkError> {
+        let lines = self.machine.follow_log(log, lines, after).await?;
+        Ok(Box::pin(lines.map_err(LinkError::from)))
     }
 
     /// Asks the machine to cancel the run. A machine that never received it records it canceled,

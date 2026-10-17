@@ -123,6 +123,15 @@ pub struct HeldObject {
     pub ranges: Ranges,
 }
 
+/// Whole lines of a machine log, as `GET /v1/logs/{name}` streams them (`event: lines`).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct LogLines {
+    /// The place after them, also the event's id: a follow resumed there goes on with the next line.
+    pub after: String,
+    pub text: String,
+}
+
 /// Raw JSON, kept as its exact text: canonical bytes and 64-bit integers survive.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(transparent)]

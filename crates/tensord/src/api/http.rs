@@ -7,6 +7,7 @@ use super::{
     capability::{self, Grant},
     domain, v1, MachineIdentity,
 };
+use crate::logs;
 use axum::{
     body::{Body, Bytes},
     extract::{rejection::QueryRejection, DefaultBodyLimit, Path, Query, State},
@@ -489,32 +490,54 @@ async fn triage<B: MachineBackend>(State(m): State<Machine<B>>, Path(id): Path<S
 }
 
 #[derive(Deserialize)]
-struct Tail {
+struct Last {
     #[serde(default)]
-    tail: u64,
+    lines: u64,
 }
 
-/// `GET /v1/logs/{name}?tail=N`: a machine log's newest bytes, from a line start.
+/// `GET /v1/logs/{name}?lines=N`: a machine log's newest N whole lines (0: all it keeps). As SSE,
+/// those and then each batch as it is appended, each event's id the place after it: a
+/// `Last-Event-ID` resumes there.
 async fn log<B: MachineBackend>(
     State(m): State<Machine<B>>,
     Path(name): Path<String>,
-    tail: Result<Query<Tail>, QueryRejection>,
+    last: Result<Query<Last>, QueryRejection>,
     headers: HeaderMap,
 ) -> Answer {
     let caller = m.caller(&headers)?;
     caller.machine()?;
-    let tail_bytes = query(tail)?.tail;
-    let log = match name.as_str() {
-        "tensorfs-transport" => domain::MachineLog::TensorfsTransport,
-        "memory" => domain::MachineLog::Memory,
-        "tensord" => domain::MachineLog::Tensord,
-        _ => return Err(Error::not_found("log_not_found", format!("this machine keeps no log {name}")).into()),
+    let log = m.backend.log(&name)?;
+    let start = match headers.get("last-event-id") {
+        None => logs::Start::Last(query(last)?.lines),
+        Some(id) => logs::Start::After(
+            id.to_str()
+                .ok()
+                .and_then(|id| id.trim().parse().ok())
+                .ok_or_else(|| Error::validation("invalid_request", "Last-Event-ID is not a log cursor"))?,
+        ),
     };
-    let actor = caller.actor;
-    let bytes = m
-        .call(move |backend| backend.read_machine_log(actor, domain::MachineLogQuery { log: log as i32, tail_bytes }))
+    let unreadable = |e: std::io::Error| Error::internal("log_unreadable", e.to_string());
+    if !wants_events(&headers) {
+        let text = m.call(move |_| log.read(start).map_err(unreadable)).await?;
+        return Ok(([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], text).into_response());
+    }
+    let follow = m
+        .call(move |_| match log.follow(start) {
+            Ok(follow) => Ok(follow),
+            Err(e) if e.is_unsupported() => Err(Error::unavailable("log_follow_unsupported", e.to_string())),
+            Err(e) => Err(Error::internal("log_unreadable", e.to_string())),
+        })
         .await?;
-    Ok(([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], bytes).into_response())
+    let (sender, lines) = tokio::sync::mpsc::channel(16);
+    tokio::task::spawn_blocking(move || follow.run(sender));
+    let lines = tokio_stream::wrappers::ReceiverStream::new(lines).map(move |lines| match lines {
+        Ok(lines) => {
+            let after = lines.after.to_string();
+            Ok(event("lines", &v1::LogLines { after: after.clone(), text: lines.text })?.id(after))
+        }
+        Err(e) => Err(unreadable(e)),
+    });
+    Ok(sse(m.authority(&caller), lines))
 }
 
 fn runs_of<B: MachineBackend>(m: &Machine<B>) -> Result<Arc<crate::runs::Runs>, Error> {

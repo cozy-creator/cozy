@@ -208,34 +208,6 @@ pub struct MachineExecutionWorkspace {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MachineExecutionWorkspaceQuery {}
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(i32)]
-pub enum MachineLog {
-    Unspecified = 0,
-    TensorfsTransport = 1,
-    Memory = 2,
-    Tensord = 3,
-}
-
-impl TryFrom<i32> for MachineLog {
-    type Error = i32;
-    fn try_from(value: i32) -> Result<Self, i32> {
-        Ok(match value {
-            0 => Self::Unspecified,
-            1 => Self::TensorfsTransport,
-            2 => Self::Memory,
-            3 => Self::Tensord,
-            other => return Err(other),
-        })
-    }
-}
-
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct MachineLogQuery {
-    pub log: i32,
-    pub tail_bytes: u64,
-}
-
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MachinePackage {
     pub installation_id: String,

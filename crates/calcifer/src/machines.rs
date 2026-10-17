@@ -339,27 +339,25 @@ impl Machines {
         })
     }
 
-    /// The last `tail` bytes (0: all) of a log the machine keeps; empty when it keeps none.
-    pub async fn logs(&self, text: &str, log: MachineLog, tail: u64) -> Result<Vec<u8>, Error> {
+    /// The newest `lines` whole lines (0: all) of a log the machine keeps.
+    pub async fn logs(&self, text: &str, log: MachineLog, lines: u64) -> Result<Vec<u8>, Error> {
         let (row, link) = self.linked(text)?;
-        let name = match log {
-            MachineLog::Tensord => "tensord",
-            MachineLog::Tensorfs => "tensorfs-transport",
-            MachineLog::Memory => "memory",
-        };
-        match link.read_log(name, tail).await {
-            // A TensorD before its own log could be read (0.7.x) keeps none to serve.
-            Err(LinkError::NotFound) if log == MachineLog::Tensord => Err(Error::new(
-                Kind::NotFound,
-                "machine_log_unsupported",
-                format!("{}'s TensorD serves no log of its own", row.name),
-            )
-            .remedy("update its TensorD; its tensorfs and memory logs read today")
-            .next(format!("cozy machine logs {} tensorfs", row.name))
-            .next(format!("cozy machine update {}", row.name))),
-            Err(LinkError::NotFound) => Ok(vec![]),
-            read => read.map_err(|e| refusal(&row.name, e)),
-        }
+        let read = link.read_log(log_name(log), lines).await;
+        read.map_err(|e| log_refusal(&row.name, log, e))
+    }
+
+    /// As `logs`, or the lines after `after` (a batch's place), then each batch as the machine
+    /// appends it.
+    pub async fn follow_logs(
+        &self,
+        text: &str,
+        log: MachineLog,
+        lines: u64,
+        after: Option<&str>,
+    ) -> Result<crate::link::Live<v1::LogLines>, Error> {
+        let (row, link) = self.linked(text)?;
+        let lines = link.follow_log(log_name(log), lines, after).await;
+        lines.map_err(|e| log_refusal(&row.name, log, e))
     }
 
     pub(crate) fn row(&self, name: &str) -> Result<MachineRow, Error> {
@@ -876,15 +874,21 @@ pub(crate) async fn keepalive(
 }
 
 #[derive(Deserialize)]
-pub(crate) struct Tail {
+pub(crate) struct LogQuery {
+    /// The newest N whole lines; 0: all it keeps.
     #[serde(default)]
-    tail_bytes: u64,
+    lines: u64,
+    /// Following: on from this batch's place.
+    after: Option<String>,
 }
 
+/// A machine's log: its whole lines, or with `Accept: text/event-stream` those and then each
+/// batch as the machine appends it, as `lines` events whose id (`after`) resumes the follow.
 pub(crate) async fn logs(
     State(api): State<Arc<Api>>,
     UrlPath((name, log)): UrlPath<(String, String)>,
-    query: Result<Query<Tail>, QueryRejection>,
+    query: Result<Query<LogQuery>, QueryRejection>,
+    headers: HeaderMap,
 ) -> Result<Response, Refusal> {
     let Query(query) = query.map_err(|e| Refusal(usage(e.body_text())))?;
     let log = match log.as_str() {
@@ -899,12 +903,35 @@ pub(crate) async fn logs(
             )));
         }
     };
-    let bytes = api
+    let follows = headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.contains("text/event-stream"));
+    if !follows {
+        let bytes = api
+            .machines
+            .logs(&name, log, query.lines)
+            .await
+            .map_err(Refusal)?;
+        return Ok(([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], bytes).into_response());
+    }
+    let lines = api
         .machines
-        .logs(&name, log, query.tail_bytes)
+        .follow_logs(&name, log, query.lines, query.after.as_deref())
         .await
         .map_err(Refusal)?;
-    Ok(([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], bytes).into_response())
+    // Ends when the machine's stream does, or Calcifer stops: the follower resumes from its id.
+    let events = lines
+        .take_while(|batch| std::future::ready(batch.is_ok()))
+        .filter_map(|batch| async move {
+            let batch = batch.ok()?;
+            let event = sse::Event::default().event("lines").id(&batch.after);
+            event.json_data(&batch).ok().map(Ok::<_, Infallible>)
+        })
+        .take_until(api.stopped());
+    Ok(Sse::new(events)
+        .keep_alive(KeepAlive::default())
+        .into_response())
 }
 
 fn usage(message: String) -> Error {
@@ -1115,6 +1142,28 @@ pub(crate) fn signer(path: &Path) -> Result<SigningKey, Error> {
                 format!("cannot read the signing key {}", path.display()),
             )
         })
+}
+
+fn log_name(log: MachineLog) -> &'static str {
+    match log {
+        MachineLog::Tensord => "tensord",
+        MachineLog::Tensorfs => "tensorfs-transport",
+        MachineLog::Memory => "memory",
+    }
+}
+
+fn log_refusal(name: &str, log: MachineLog, e: LinkError) -> Error {
+    match e {
+        // A TensorD serving in dev mode logs to its stderr only.
+        LinkError::NotFound if log == MachineLog::Tensord => Error::new(
+            Kind::NotFound,
+            "machine_log_unsupported",
+            format!("{name}'s TensorD keeps no log of its own"),
+        )
+        .remedy("its tensorfs and memory logs read")
+        .next(format!("cozy machine logs {name} tensorfs")),
+        e => refusal(name, e),
+    }
 }
 
 /// A machine's refusal, as the API answers it.

@@ -35,17 +35,9 @@ fn a_machines_logs_read_and_follow_what_it_did() {
         (1, Some("machine_not_found")),
         "{unknown:?}"
     );
-    // Its own log, once its TensorD serves one; before, a refusal that names it and what to do.
-    let own = home.cozy(["machine", "logs", "m1", "--json"]);
-    if own.code != 0 {
-        let refusal = own.refusal();
-        assert_eq!(refusal["code"], "machine_log_unsupported", "{own:?}");
-        assert!(
-            refusal["message"].as_str().unwrap().contains("m1"),
-            "{own:?}"
-        );
-        assert_eq!(refusal["next"][1], "cozy machine update m1", "{own:?}");
-    }
+    // Its own log: TensorD's lines since it started.
+    let own = lines(&home.cozy(["machine", "logs", "m1", "-n", "0", "--json"]));
+    assert!(!own.is_empty() && own.iter().all(|l| l["log"] == "tensord"), "{own:?}");
 
     // A download writes the transport log; its lines read back whole, newest last.
     let out = home.cozy([
@@ -77,7 +69,8 @@ fn a_machines_logs_read_and_follow_what_it_did() {
     let bad = home.cozy(["machine", "logs", "m1", "--since", "soon", "--json"]);
     assert_eq!(bad.code, 2, "{bad:?}");
 
-    // Following prints what it kept, then each line as the machine writes it.
+    // Following prints what it kept, then each line as the machine writes it, across a rotation
+    // and a Calcifer restart, each line once.
     let mut follower = home
         .command()
         .args([
@@ -98,15 +91,25 @@ fn a_machines_logs_read_and_follow_what_it_did() {
             }
         }
     });
-    let next = |what: &str| {
-        let line = followed
-            .recv_timeout(Duration::from_secs(120))
-            .unwrap_or_else(|e| panic!("no {what} line from the follower: {e}"));
-        serde_json::from_str::<Value>(&line).unwrap()
+    let mut seen = std::collections::HashSet::new();
+    // The lines through the first that holds `text`, none seen before.
+    let mut until = |text: &str| {
+        let mut got = vec![];
+        loop {
+            let line = followed
+                .recv_timeout(Duration::from_secs(120))
+                .unwrap_or_else(|e| panic!("no line with {text:?} from the follower: {e}"));
+            let line: Value = serde_json::from_str(&line).unwrap();
+            let line = line["text"].as_str().unwrap().to_owned();
+            assert!(seen.insert(line.clone()), "{line:?} came twice");
+            got.push(line);
+            if got.last().unwrap().contains(text) {
+                return got;
+            }
+        }
     };
-    for kept in &read {
-        assert_eq!(&next("kept"), kept);
-    }
+    let kept: Vec<&str> = read.iter().map(|l| l["text"].as_str().unwrap()).collect();
+    assert_eq!(until(kept.last().unwrap()), kept, "the kept lines, in order");
     let out = home.cozy([
         "--json",
         "model",
@@ -117,11 +120,31 @@ fn a_machines_logs_read_and_follow_what_it_did() {
         "m1",
     ]);
     assert_eq!(out.code, 0, "{out:?}");
-    let fresh = next("new");
-    assert!(
-        fresh["text"].as_str().unwrap().contains(" walk "),
-        "{fresh}"
-    );
+    until(" walk ");
+    let logs = machine.root().join("var/lib/tensorfs/logs");
+    let write = |text: &str| {
+        use std::io::Write as _;
+        let at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        let mut log = std::fs::OpenOptions::new()
+            .append(true)
+            .open(logs.join("transport.log"))
+            .unwrap();
+        log.write_all(format!("{at:.3} {text}\n").as_bytes())
+            .unwrap();
+    };
+    write("followed one");
+    until("followed one");
+    std::fs::rename(logs.join("transport.log"), logs.join("transport.log.1")).unwrap();
+    std::fs::write(logs.join("transport.log"), "").unwrap();
+    write("followed two");
+    until("followed two");
+    let down = home.cozy(["down", "--json"]);
+    assert_eq!(down.code, 0, "{down:?}");
+    write("followed three");
+    until("followed three");
     follower.kill().unwrap();
     let _ = follower.wait();
 
