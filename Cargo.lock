@@ -4255,7 +4255,6 @@ dependencies = [
  "hyper-util",
  "libc",
  "minicbor",
- "nix 0.31.3",
  "rcgen",
  "rusqlite",
  "rustix",

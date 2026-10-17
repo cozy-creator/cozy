@@ -33,8 +33,6 @@ pub mod err;
 #[cfg(feature = "store")]
 pub mod fetch;
 #[cfg(feature = "store")]
-mod filesystem_identity;
-#[cfg(feature = "store")]
 pub mod fill;
 pub mod fit;
 pub mod format;
@@ -80,7 +78,12 @@ pub mod stats;
 #[cfg(feature = "store")]
 pub mod storage;
 #[cfg(feature = "store")]
+#[path = "store.rs"]
 pub mod store;
+/// The v2 store (xs-045 U3). It becomes `store` once the last v1 caller is ported.
+#[cfg(feature = "store")]
+#[path = "store/mod.rs"]
+pub mod store2;
 #[cfg(feature = "store")]
 pub mod transport;
 #[cfg(feature = "store")]

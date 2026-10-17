@@ -99,13 +99,6 @@ pub fn connections_opened(root: &Path) -> u64 {
 }
 
 pub(crate) fn connect(path: &Path) -> Result<Connection> {
-    // SQLite creates WAL/SHM files before assigning their database owner. Opening
-    // them under root exposes a transient root-owned inode to concurrent owner
-    // connections, which can permanently fall back to read-only WAL access.
-    let _identity = crate::filesystem_identity::FilesystemIdentity::for_store_root(
-        path.parent().unwrap_or(path),
-    )
-    .map_err(|error| io("enter catalog filesystem identity", error))?;
     *opened()
         .lock()
         .unwrap_or_else(|error| error.into_inner())
@@ -285,10 +278,6 @@ impl Trust {
         // A kept connection can be used by another Runtime thread later. Install
         // the lock context on the thread actually executing this operation.
         lock::wait_for_live_holders(connection, &self.path)?;
-        let _identity = crate::filesystem_identity::FilesystemIdentity::for_store_root(
-            self.path.parent().unwrap_or(&self.path),
-        )
-        .map_err(|error| io("enter catalog filesystem identity", error))?;
         use_connection(connection)
     }
 
