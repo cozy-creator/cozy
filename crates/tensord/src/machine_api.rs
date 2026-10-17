@@ -375,6 +375,9 @@ impl NativeBackend {
         if let Some(value) = value {
             body["result"] = json!({"result_schema_digest":schema_digest, "inline_result":STANDARD.encode(crate::boundary_json::exact(&value))});
         }
+        if let Some(result) = record.result.as_ref().filter(|r| !r.adjustments.is_empty()) {
+            body["adjustments"] = json!(result.adjustments);
+        }
         let bytes = canonical(&body)?;
         let digest = sha256::digest(&bytes);
         let outcome = domain::AttemptOutcome {
@@ -1482,6 +1485,7 @@ print(json.dumps({"identity": generation.identity}))
                         &spool,
                         value,
                         crate::gpu_service::output_bindings(bindings),
+                        device_executor::adjustments(&id, &reply),
                     )?;
                     executor.shutdown()
                 })();

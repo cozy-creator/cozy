@@ -98,6 +98,10 @@ pub(crate) async fn source(ctx: &Context, path: &Path, in_place: bool) -> Result
             false => names.extend(source_files(local)?.into_iter().map(|f| local.join(f))),
         }
     }
+    // A path source inside the project (`deps/x.whl`) is one of its files already: listed twice,
+    // its wheel was carried twice and the machine's second copy was refused.
+    let mut seen = std::collections::HashSet::new();
+    names.retain(|name| seen.insert(name.clone()));
     let carried = |file: &Path| {
         locals.iter().any(|l| l == file) && file.extension().is_some_and(|e| e == "whl")
     };

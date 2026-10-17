@@ -31,7 +31,6 @@ from cozy_runtime.author import (
     ImageAsset,
     ImageFrame,
     InvalidRequest,
-    MediaDecoder,
     Outputs,
     Telemetry,
     VideoAsset,
@@ -175,10 +174,8 @@ def fail(payload: RefuseInput) -> TileOutput:
 
 
 @app.entrypoint(accelerator=False)
-def relay(
-    payload: RelayInput, ctx: Context, decoder: MediaDecoder, out: Outputs, tel: Telemetry
-) -> RelayOutput:
-    """CPU-only exact workflow handoff: decode the prior accepted image and save it again."""
+def relay(payload: RelayInput, ctx: Context, out: Outputs, tel: Telemetry) -> RelayOutput:
+    """CPU-only exact workflow handoff: read the prior accepted image and save it again."""
     remaining = payload.delay_ms
     if remaining > 0:
         # cl-104: the delay is a MEASURED step loop — the fixture's stand-in for a
@@ -191,9 +188,9 @@ def relay(
             remaining -= step
             on_step(index)
             index += 1
-    image = decoder.decode_image(payload.image)
+    image = payload.image.read()
     return RelayOutput(
-        image=out.save_image(ImageFrame(image.width, image.height, image.rgb), format="webp")
+        image=out.save_image(ImageFrame(image.width, image.height, image.tobytes()), format="webp")
     )
 
 

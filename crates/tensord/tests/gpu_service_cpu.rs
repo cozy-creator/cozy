@@ -114,6 +114,7 @@ fn complete_device(journal: &mut Journal, n: usize, generation: &str, birth: Bir
                 value: json!(n),
                 artifacts: vec![],
                 asset_bindings: vec![],
+                adjustments: vec![],
             }),
         )
         .unwrap();

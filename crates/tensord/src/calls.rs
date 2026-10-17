@@ -1231,7 +1231,7 @@ mod exact_tests {
         let first = seed(r#"{"seed":9007199254740992,"nested":{"b":2,"a":1}}"#);
         assert_eq!(intent(&first), intent(&seed(r#" {"nested":{"a":1,"b":2}, "seed":9007199254740992} "#)));
         assert_ne!(intent(&first), intent(&seed(r#"{"seed":9007199254740993,"nested":{"b":2,"a":1}}"#)));
-        let result = crate::journal::ResultRecord { value: json!({"seed": u64::MAX, "float": 1.0}), artifacts: vec![], asset_bindings: vec![] };
+        let result = crate::journal::ResultRecord { value: json!({"seed": u64::MAX, "float": 1.0}), artifacts: vec![], asset_bindings: vec![], adjustments: vec![] };
         let (sent, _, _) = receive(Path::new("unused"), &result, Path::new("unused"), Path::new("unused"), None).unwrap();
         let received = crate::boundary_json::parse(sent.as_bytes()).unwrap();
         assert_eq!(received["seed"].as_u64(), Some(u64::MAX));

@@ -722,6 +722,9 @@ pub struct Frame {
     pub observations: Value,
     /// `invoke`: some attention site of the call applied the request's pin.
     pub attention_applied: bool,
+    /// `invoke`: the rows of how the request was served other than as sent; read row by row
+    /// (`adjustments`).
+    pub adjustments: Value,
     // `child_*` (a job's managed calls): the call's index, callee and canonical request.
     pub call_index: u64,
     pub module: String,
@@ -1240,6 +1243,44 @@ struct PostRequest<'a> {
     frames: &'a [HostFrame],
     outputs: &'a [Output],
     max_output_bytes: Option<u64>,
+}
+
+/// Rows a run keeps, and the characters of each of their texts.
+const MAX_ADJUSTMENTS: usize = 64;
+const MAX_ADJUSTMENT_TEXT: usize = 512;
+
+/// The invoke reply's adjustment rows. They are advisory: a malformed row is skipped with a
+/// warning and never fails the run.
+pub fn adjustments(id: &str, reply: &Frame) -> Vec<crate::journal::Adjustment> {
+    let rows = match &reply.adjustments {
+        Value::Null => return vec![],
+        Value::Array(rows) => rows,
+        other => {
+            let other = crate::triage::ends(&other.to_string(), 200);
+            tracing::warn!("run {id}: adjustments skipped: not a list: {other}");
+            return vec![];
+        }
+    };
+    if rows.len() > MAX_ADJUSTMENTS {
+        tracing::warn!("run {id}: {} adjustment rows; the first {MAX_ADJUSTMENTS} are kept", rows.len());
+    }
+    let clip = |text: &mut String| *text = crate::triage::ends(text, MAX_ADJUSTMENT_TEXT);
+    rows.iter()
+        .take(MAX_ADJUSTMENTS)
+        .filter_map(|row| match crate::journal::Adjustment::deserialize(row) {
+            Ok(mut row) => {
+                for text in [&mut row.field, &mut row.requested, &mut row.applied, &mut row.reason, &mut row.source] {
+                    clip(text);
+                }
+                Some(row)
+            }
+            Err(error) => {
+                let row = crate::triage::ends(&row.to_string(), 200);
+                tracing::warn!("run {id}: adjustment row skipped ({error}): {row}");
+                None
+            }
+        })
+        .collect()
 }
 
 pub fn postprocess(
@@ -2285,6 +2326,37 @@ fn scan(value: &Value) -> io::Result<()> {
 #[cfg(test)]
 mod codec_tests {
     use super::*;
+
+    /// An invoke reply's adjustment rows are advisory: each malformed one is skipped and the
+    /// reply, the run and the other rows stand, in the executor's order, each text bounded.
+    #[test]
+    fn a_malformed_adjustment_row_is_skipped_and_the_reply_stands() {
+        let row = |kind: &str, field: &str| serde_json::json!({"field": field, "kind": kind,
+            "requested": "21.4", "applied": "15", "reason": "video truncated to 15 s", "source": "policy"});
+        let long = "x".repeat(4096);
+        let reply = serde_json::json!({"reply": "invoke", "ok": true, "adjustments": [
+            row("adjusted", "assets.2.asset"),
+            row("shrink", "steps"),
+            {"field": "steps", "requested": "50", "applied": "30", "reason": "", "source": "handler"},
+            {"field": 7, "kind": "clamp", "requested": "50", "applied": "30", "reason": "", "source": "handler"},
+            "steps",
+            row("warn", &long),
+        ]});
+        let (mut runtime, mut machine) = std::os::unix::net::UnixStream::pair().unwrap();
+        write_frame(&mut runtime, &reply).unwrap();
+        let frame = read_frame(&mut machine).unwrap().unwrap();
+        assert!(frame.ok && frame.reply == "invoke");
+        let kept = adjustments("run-1", &frame);
+        assert_eq!(kept.len(), 2, "{kept:?}");
+        assert_eq!(kept[0], serde_json::from_value(row("adjusted", "assets.2.asset")).unwrap());
+        assert_eq!((kept[1].kind, kept[1].field.chars().count()), (crate::journal::AdjustmentKind::Warn, MAX_ADJUSTMENT_TEXT));
+
+        let rows: Vec<_> = (0..MAX_ADJUSTMENTS + 3).map(|i| row("clamp", &format!("f{i}"))).collect();
+        let many = Frame { adjustments: rows.into(), ..Default::default() };
+        assert_eq!(adjustments("run-2", &many).len(), MAX_ADJUSTMENTS);
+        let none = Frame { adjustments: serde_json::json!({"steps": 30}), ..Default::default() };
+        assert!(adjustments("run-3", &none).is_empty() && adjustments("run-4", &Frame::default()).is_empty());
+    }
 
     /// A null in any optional field reads as its absence: a string, a flattened hello field,
     /// a count, a flag, a kind or a list (the Runtime's `None`).

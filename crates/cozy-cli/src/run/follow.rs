@@ -7,7 +7,8 @@ use std::{collections::HashSet, fmt::Write as _, process::ExitCode, time::Durati
 
 use cozy_proto::{
     calcifer::{
-        Event, Machine, MachineState, OutputItem, Progress, Run, Status, SubmitRun, Submitted,
+        Adjustment, Event, Machine, MachineState, OutputItem, Progress, Run, Status, SubmitRun,
+        Submitted,
     },
     error::{Error, Kind},
 };
@@ -283,10 +284,31 @@ pub(super) fn fields(ctx: &Context, run: &Run) -> output::Record {
             );
         }
     }
+    for row in &run.adjustments {
+        record = record.note(adjustment(row));
+    }
     for warning in &run.warnings {
         record = record.note(format!("warning: {}", warning.message));
     }
     record
+}
+
+/// One adjustment as a line: `adjusted assets.2.asset: 21.4 -> 15 (video truncated to 15 s)
+/// [policy]`; a warning reads `warn field: reason [source]`.
+fn adjustment(row: &Adjustment) -> String {
+    let mut line = format!("{} {}:", row.kind, row.field);
+    if row.kind != "warn" {
+        let _ = write!(line, " {} -> {}", row.requested, row.applied);
+    }
+    let _ = match (row.kind.as_str(), row.reason.as_str()) {
+        (_, "") => Ok(()),
+        ("warn", reason) => write!(line, " {reason}"),
+        (_, reason) => write!(line, " ({reason})"),
+    };
+    if !row.source.is_empty() {
+        let _ = write!(line, " [{}]", row.source);
+    }
+    line
 }
 
 /// What to do next with `run`: watch it while it goes on, show it when it did not succeed.

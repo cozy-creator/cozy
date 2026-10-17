@@ -5,7 +5,7 @@ use std::{path::Path, sync::Arc};
 
 use calcifer::store::{Acceptance, Batch, NewRun, RunFilter, State, Store, StoreError};
 use cozy_proto::{
-    calcifer::{Call, Event, ItemStatus, Kind, Status, Warning},
+    calcifer::{Adjustment, Call, Event, ItemStatus, Kind, Status, Warning},
     ids::{Digest, RunId},
     machine as v1,
 };
@@ -384,6 +384,14 @@ fn a_reconnect_replays_the_newest_picture_after_its_cursor() {
         result: br#"{"caption":"a cat"}"#.to_vec(),
         measurements: br#"{"stages":[]}"#.to_vec(),
         execution_ms: 1234,
+        adjustments: vec![v1::Adjustment {
+            field: "steps".into(),
+            kind: "clamp".into(),
+            requested: "50".into(),
+            applied: "30".into(),
+            reason: "at most 30 steps".into(),
+            source: "handler".into(),
+        }],
         ..Default::default()
     };
     let settled = store.settle(&id, &outcome, 3 << 33).unwrap();
@@ -420,6 +428,11 @@ fn a_reconnect_replays_the_newest_picture_after_its_cursor() {
     assert_eq!(detail.calls, vec![call]);
     let plain = store.record(&row).unwrap();
     assert!(plain.calls.is_empty() && plain.measurements.is_none() && plain.result.is_some());
+    let Event::Completed { run: completed, .. } = &all[3] else {
+        unreachable!()
+    };
+    let rows: Vec<_> = outcome.adjustments.iter().map(Adjustment::from).collect();
+    assert_eq!((&plain.adjustments, &completed.adjustments), (&rows, &rows));
     let numbers: Vec<_> = all.iter().filter_map(Event::sequence_number).collect();
     assert!(numbers.windows(2).all(|w| w[0] < w[1]));
     assert!(

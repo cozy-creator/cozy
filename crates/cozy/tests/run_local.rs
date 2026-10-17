@@ -500,3 +500,48 @@ fn a_waiting_run_says_why_and_stops_saying_it_once_it_no_longer_waits() {
     assert!(reasons.iter().any(|r| uploading(r)), "{reasons:?}");
     assert!(!said.contains(&"queued"), "a bare queued: {said:?}");
 }
+
+/// What a run's executor served other than as sent reaches its record: the machine keeps the
+/// executor's rows on the outcome, Calcifer on the run, and `cozy run` prints each, `--json`
+/// carries them (Runtime 0.27.0 sends each row's kind and source).
+#[test]
+fn a_runs_adjustments_reach_its_record() {
+    let Some(home) = Home::new() else { return };
+    if std::env::var_os("COZY_TEST_TENSORD").is_none() {
+        eprintln!("skipped: no TensorD (COZY_TEST_TENSORD is unset)");
+        return;
+    }
+    let _machine = common::tensord::added(&home, "m1");
+    let work = home.path().join("work");
+    copy(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/package/tiny-adjusted"),
+        &work.join("tiny-adjusted"),
+    );
+
+    let run = completed(&cozy(
+        &home,
+        &work,
+        &["--json", "run", "./tiny-adjusted/steps", "--on", "m1"],
+    ));
+    assert_eq!(run["result"]["steps"], 30, "{run}");
+    assert_eq!(
+        run["adjustments"],
+        serde_json::json!([
+            {"field": "steps", "kind": "clamp", "requested": "50", "applied": "30",
+             "reason": "at most 30 steps", "source": "handler"},
+            {"field": "seed", "kind": "warn", "requested": "", "applied": "",
+             "reason": "none given; the result is not reproducible", "source": "handler"},
+        ]),
+        "{run}"
+    );
+
+    let shown = cozy(&home, &work, &["run", "./tiny-adjusted/steps", "--on", "m1"]);
+    assert_eq!(shown.code, 0, "{shown:?}");
+    eprintln!("{}", shown.stdout);
+    for line in [
+        "clamp steps: 50 -> 30 (at most 30 steps) [handler]",
+        "warn seed: none given; the result is not reproducible [handler]",
+    ] {
+        assert!(shown.stdout.contains(line), "{line:?} not in {shown:?}");
+    }
+}
