@@ -34,12 +34,20 @@ fn download_makes_a_provider_source_on_the_machine() {
     assert_eq!(held.code, 0, "{held:?}");
     assert!(held.stdout.contains("local/tiny"), "{held:?}");
 
-    // `model list` reads the machine's Status: every machine by default, one with --on.
-    for args in [&["--json", "model", "list"][..], &["--json", "model", "list", "--on", "m1"]] {
+    // `model list` reads the machine's Status, which follows the store within a frame or two:
+    // every machine by default, one with --on.
+    let holds = |args: &[&str]| {
         let listed = home.json(args);
-        let rows = listed["models"].as_array().unwrap();
-        assert!(rows.iter().any(|r| r["machine"] == "m1" && r["model"] == "local/tiny"), "{listed}");
+        listed["models"].as_array().unwrap().iter().any(|r| r["machine"] == "m1" && r["model"] == "local/tiny")
+    };
+    // A hang bound for the test; the product never waits on it.
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !holds(&["--json", "model", "list"]) {
+        let machines = home.cozy(["--json", "machine", "list"]);
+        assert!(std::time::Instant::now() < until, "local/tiny never listed: {machines:?}");
+        std::thread::sleep(std::time::Duration::from_millis(500));
     }
+    assert!(holds(&["--json", "model", "list", "--on", "m1"]));
     let missing = home.cozy(["--json", "model", "list", "--on", "nowhere"]);
     assert_eq!((missing.code, missing.refusal()["code"].as_str()), (1, Some("machine_not_found")), "{missing:?}");
 
