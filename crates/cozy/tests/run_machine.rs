@@ -39,7 +39,6 @@ impl SilentHub {
         std::fs::create_dir_all(&dir).unwrap();
         let card = std::fs::read_to_string(format!("{CARDS}/sdxl-2.10.0.json")).unwrap();
         std::fs::write(dir.join("2.10.0.json"), card).unwrap();
-        std::fs::write(dir.join("newest"), "2.10.0").unwrap();
         Self {
             _listener: listener,
             origin,
@@ -81,7 +80,7 @@ fn a_run_on_a_real_machine_survives_calcifer_stopping_and_cancels_on_the_machine
         &home,
         &[
             "run",
-            "fidika/sdxl/generate",
+            "fidika/sdxl/generate@2.10.0",
             "a cat",
             "--on",
             "m1",

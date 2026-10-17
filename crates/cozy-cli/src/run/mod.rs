@@ -217,14 +217,7 @@ async fn run(ctx: &Context, args: RunArgs) -> Result<ExitCode, Error> {
         Target::Script(path) => return local::run(ctx, &cwd.join(path), None, args).await,
     };
     let hub = ctx.hub()?;
-    let resolved = resolve(
-        ctx,
-        &hub,
-        &package,
-        release.as_deref(),
-        &args.placement.on(),
-    )
-    .await?;
+    let resolved = resolve(ctx, &hub, &package, release.as_deref()).await?;
     let Some(function) = function else {
         functions(ctx, &package, &resolved);
         return Ok(ExitCode::SUCCESS);
@@ -238,11 +231,10 @@ async fn run(ctx: &Context, args: RunArgs) -> Result<ExitCode, Error> {
             request["release_from"] = resolved.from.to_string().into();
             output::json(&request);
         } else {
-            let title = format!(
-                "{package}/{}@{} ({})",
-                callable.name, card.release, resolved.from
-            );
-            anstream::print!("{}", describe::contract(&title, &card.interface, callable));
+            let target = format!("{package}/{}", callable.name);
+            let text = describe::contract(&target, &card.interface, callable);
+            let release = format!("\n  release: {} ({})\n", card.release, resolved.from);
+            anstream::print!("{}", text.replacen('\n', &release, 1));
         }
         return Ok(ExitCode::SUCCESS);
     }
@@ -259,9 +251,7 @@ pub(crate) struct Resolved {
 pub(crate) enum From {
     /// The run named it.
     Asked,
-    /// The machine the run goes to holds it.
-    Installed(String),
-    /// The Hub's latest: the machine holds none, or is not named.
+    /// The Hub's newest published release.
     Latest,
 }
 
@@ -269,57 +259,26 @@ impl std::fmt::Display for From {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             From::Asked => f.write_str("asked"),
-            From::Installed(machine) => write!(f, "installed on {machine}"),
             From::Latest => f.write_str("the Hub's latest"),
         }
     }
 }
 
-/// Resolves a run's release once, before binding: the one asked; else the newest release of the
-/// package that the machine `on` names holds, asked of the machine through Calcifer (no Hub
-/// read); else the Hub's latest. The run is then pinned to it, so the machine runs exactly the
-/// release its inputs were bound against.
+/// Resolves a run's release once, before binding: the one asked, else the Hub's newest published
+/// release, wherever the run goes (a machine holding an older one installs it first). The run is
+/// pinned to it, so the machine runs exactly the release its inputs were bound against.
 pub(crate) async fn resolve(
     ctx: &Context,
     hub: &Hub,
     package: &str,
     release: Option<&str>,
-    on: &On,
 ) -> Result<Resolved, Error> {
     let (release, from) = match release {
         Some(release) => (release.to_owned(), From::Asked),
-        None => match installed(ctx, hub, package, on).await {
-            Some((machine, release)) => (release, From::Installed(machine)),
-            None => (catalog::latest(ctx, hub, package).await?, From::Latest),
-        },
+        None => (catalog::latest(ctx, hub, package).await?, From::Latest),
     };
     let card = catalog::card(ctx, hub, package, &release).await?;
     Ok(Resolved { card, from })
-}
-
-/// The newest release of `package` from `hub` that the machine `on` names holds, as it says now.
-/// A machine that is not there or does not answer holds nothing this run can rely on.
-async fn installed(ctx: &Context, hub: &Hub, package: &str, on: &On) -> Option<(String, String)> {
-    let On::Machine(name) = on else {
-        return None;
-    };
-    let path = format!("/v1/machines/{}", name.to_ascii_lowercase());
-    let calcifer = ctx.calcifer().await.ok()?;
-    let machine: cozy_proto::calcifer::Machine =
-        calcifer.get_query(&path, &[("fresh", "true")]).await.ok()?;
-    let same = |a: &str, b: &str| {
-        a.trim_end_matches('/')
-            .eq_ignore_ascii_case(b.trim_end_matches('/'))
-    };
-    let release = machine
-        .status?
-        .environments
-        .into_iter()
-        .filter(|e| e.package.eq_ignore_ascii_case(package) && same(&e.hub, &hub.origin))
-        .map(|e| e.release)
-        .filter(|r| !r.is_empty())
-        .max_by_key(|r| crate::package::release_order(r))?;
-    Some((machine.name, release))
 }
 
 /// `cozy run <package>/<function>[@release] <inputs…> --on …` for another verb: `model
@@ -335,7 +294,7 @@ pub(crate) async fn call(
     detach: bool,
 ) -> Result<Run, Error> {
     let hub = ctx.hub()?;
-    let resolved = resolve(ctx, &hub, package, release, &placement.on()).await?;
+    let resolved = resolve(ctx, &hub, package, release).await?;
     let args = RunArgs {
         target: None,
         inputs,

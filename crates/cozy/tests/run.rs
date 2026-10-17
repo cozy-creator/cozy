@@ -11,7 +11,7 @@ const CARDS: &str = concat!(
 );
 
 /// Points this home at a Hub that never answers and keeps a real release card for it, as a Hub
-/// read would: every command after reads no Hub.
+/// read would: every command after that names the release reads no Hub.
 fn kept(home: &Home, card: &str, package: &str) {
     home.json(["hub", "add", "dead", "http://127.0.0.1:1", "--json"]);
     home.json(["hub", "use", "dead", "--json"]);
@@ -21,7 +21,6 @@ fn kept(home: &Home, card: &str, package: &str) {
     let doc: Value = serde_json::from_str(&text).unwrap();
     let release = doc["release"]["release"].as_str().unwrap();
     std::fs::write(dir.join(format!("{release}.json")), &text).unwrap();
-    std::fs::write(dir.join("newest"), release).unwrap();
 }
 
 #[test]
@@ -29,7 +28,7 @@ fn a_package_lists_its_functions_and_describes_each() {
     let Some(home) = Home::new() else { return };
     kept(&home, "sdxl-2.10.0", "fidika/sdxl");
 
-    let listed = home.json(["run", "Fidika/SDXL", "--json"]);
+    let listed = home.json(["run", "Fidika/SDXL@2.10.0", "--json"]);
     assert_eq!(listed["release"], "2.10.0");
     let names: Vec<&str> = listed["functions"]
         .as_array()
@@ -38,7 +37,7 @@ fn a_package_lists_its_functions_and_describes_each() {
         .map(|f| f["function"].as_str().unwrap())
         .collect();
     assert_eq!(names, ["fp8", "generate", "int8"]);
-    let human = home.cozy(["run", "fidika/sdxl"]);
+    let human = home.cozy(["run", "fidika/sdxl@2.10.0"]);
     assert_eq!(human.code, 0, "{human:?}");
     assert!(
         human.stdout.contains("generate")
@@ -48,7 +47,7 @@ fn a_package_lists_its_functions_and_describes_each() {
         "{human:?}"
     );
 
-    let contract = home.cozy(["run", "fidika/sdxl/generate", "--describe"]);
+    let contract = home.cozy(["run", "fidika/sdxl/generate@2.10.0", "--describe"]);
     assert_eq!(contract.code, 0, "{contract:?}");
     assert!(
         contract
@@ -62,11 +61,11 @@ fn a_package_lists_its_functions_and_describes_each() {
             .contains("usage: cozy run fidika/sdxl/generate prompt=<str>"),
         "{contract:?}"
     );
-    let request = home.json(["run", "fidika/sdxl/fp8", "--describe", "--json"]);
+    let request = home.json(["run", "fidika/sdxl/fp8@2.10.0", "--describe", "--json"]);
     assert_eq!(request["accelerator"], false);
     assert_eq!(request["fields"][0]["name"], "max_relative_frobenius");
 
-    let unknown = home.cozy(["run", "fidika/sdxl/upscale", "--json"]);
+    let unknown = home.cozy(["run", "fidika/sdxl/upscale@2.10.0", "--json"]);
     assert_eq!(
         (unknown.code, unknown.refusal()["code"].as_str()),
         (1, Some("callable_unknown")),
@@ -80,7 +79,7 @@ fn terms_bind_strictly_and_unknown_fields_only_warn() {
     let Some(home) = Home::new() else { return };
     kept(&home, "sdxl-2.10.0", "fidika/sdxl");
 
-    let invalid = home.cozy(["run", "fidika/sdxl/generate", "steps=99", "--json"]);
+    let invalid = home.cozy(["run", "fidika/sdxl/generate@2.10.0", "steps=99", "--json"]);
     let refusal = invalid.refusal();
     assert_eq!(
         (invalid.code, refusal["code"].as_str()),
@@ -93,7 +92,7 @@ fn terms_bind_strictly_and_unknown_fields_only_warn() {
             && message.contains("steps is 99"),
         "{message}"
     );
-    let human = home.cozy(["run", "fidika/sdxl/generate", "steps=99"]);
+    let human = home.cozy(["run", "fidika/sdxl/generate@2.10.0", "steps=99"]);
     assert!(
         human.stdout.contains("Arguments:\n  prompt: str"),
         "{human:?}"
@@ -101,7 +100,7 @@ fn terms_bind_strictly_and_unknown_fields_only_warn() {
 
     let typed = home.cozy([
         "run",
-        "fidika/sdxl/generate",
+        "fidika/sdxl/generate@2.10.0",
         "a cat",
         "steps=lots",
         "--json",
@@ -110,7 +109,7 @@ fn terms_bind_strictly_and_unknown_fields_only_warn() {
 
     let warned = home.cozy([
         "run",
-        "fidika/sdxl/generate",
+        "fidika/sdxl/generate@2.10.0",
         "a cat",
         "style=noir",
         "--json",
@@ -146,7 +145,13 @@ fn the_grammar_refuses_what_it_cannot_run() {
             1,
         ),
         (
-            &["run", "fidika/sdxl/generate", "--bits", "3", "--json"],
+            &[
+                "run",
+                "fidika/sdxl/generate@2.10.0",
+                "--bits",
+                "3",
+                "--json",
+            ],
             "usage",
             2,
         ),
@@ -179,10 +184,7 @@ fn a_release_card_is_read_from_the_hub_once_and_kept() {
     assert!(names.contains(&"generate"), "{listed}");
     let kept = home.root().join("packages/tensorhub.com/fidika/sdxl");
     assert!(kept.join(format!("{release}.json")).is_file());
-    assert_eq!(
-        std::fs::read_to_string(kept.join("newest")).unwrap(),
-        release
-    );
+    assert_eq!(listed["release_from"], "the Hub's latest", "{listed}");
 
     let pinned = home.json(["run", "fidika/sdxl/generate@2.10.0", "--describe", "--json"]);
     assert_eq!(pinned["fields"][0]["name"], "prompt");
@@ -221,7 +223,7 @@ fn a_run_is_submitted_followed_detached_and_canceled() {
     let Some(home) = Home::new() else { return };
     kept(&home, "sdxl-2.10.0", "fidika/sdxl");
 
-    let local = home.cozy(["run", "fidika/sdxl/generate", "a cat", "--json"]);
+    let local = home.cozy(["run", "fidika/sdxl/generate@2.10.0", "a cat", "--json"]);
     assert_eq!(
         (local.code, local.refusal()["code"].as_str()),
         (1, Some("machine_not_found")),
@@ -230,7 +232,7 @@ fn a_run_is_submitted_followed_detached_and_canceled() {
 
     let args = [
         "run",
-        "fidika/sdxl/generate",
+        "fidika/sdxl/generate@2.10.0",
         "a cat",
         "style=noir",
         "--on",
@@ -240,7 +242,7 @@ fn a_run_is_submitted_followed_detached_and_canceled() {
     ];
     let detached = home.json([&args[..], &["--detach", "--json"]].concat());
     assert_eq!(detached["status"], "queued", "{detached}");
-    assert_eq!(detached["target"], "fidika/sdxl/generate");
+    assert_eq!(detached["target"], "fidika/sdxl/generate@2.10.0");
     assert_eq!(detached["warnings"][0]["code"], "request_fields_ignored");
     let replay = home.json([&args[..], &["--detach", "--json"]].concat());
     assert_eq!(replay["id"], detached["id"]);
@@ -296,7 +298,7 @@ fn ctrl_c_detaches_and_never_cancels() {
         .command()
         .args([
             "run",
-            "fidika/sdxl/generate",
+            "fidika/sdxl/generate@2.10.0",
             "a dog",
             "--on",
             "any",
@@ -350,7 +352,7 @@ fn runs_list_filter_and_show() {
     let submit = |prompt: &str| {
         let run = home.json([
             "run",
-            "fidika/sdxl/generate",
+            "fidika/sdxl/generate@2.10.0",
             prompt,
             "mood=calm",
             "--on",
@@ -422,7 +424,7 @@ fn an_upload_needs_a_weights_output_and_a_hub_destination() {
     kept(&home, "sdxl-2.10.0", "fidika/sdxl");
     let run = home.json([
         "run",
-        "fidika/sdxl/generate",
+        "fidika/sdxl/generate@2.10.0",
         "a cat",
         "--on",
         "any",
