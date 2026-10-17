@@ -6,8 +6,8 @@ use std::{
 
 use cozy_proto::{
     calcifer::{
-        self, Ended, Keepalive, Machine, MachineKind, MachineList, MachineState, On, StagedInput,
-        SubmitRun,
+        self, Ended, Keepalive, Machine, MachineKind, MachineList, MachineState, On, RunsEvent,
+        StagedInput, SubmitRun,
     },
     error::{Error, Kind},
     ids::Digest,
@@ -15,12 +15,17 @@ use cozy_proto::{
 };
 use prost::Message as _;
 
-use super::{FOLLOW, clock, machine, now_ms, route, usd};
-use crate::context::hub_answer;
-use crate::{Context, output};
+use super::{Following, clock, machine, now_ms, route, usd};
+use crate::{
+    Context,
+    calcifer_client::{Client, Watch},
+    context::hub_answer,
+    output,
+};
 
 /// Ends a rental, returning once its Hub affirms the pod gone, or removes an added machine. It
-/// waits first for its runs' outputs to land here, unless `force`.
+/// waits first for its runs' outputs to land here, unless `force`. Both waits follow Calcifer's
+/// streams: its runs' changes, then the machine's.
 pub async fn end(ctx: &Context, name: &str, force: bool) -> Result<ExitCode, Error> {
     if name == "local" {
         return Err(Error::new(
@@ -32,12 +37,13 @@ pub async fn end(ctx: &Context, name: &str, force: bool) -> Result<ExitCode, Err
     }
     let calcifer = ctx.calcifer().await?;
     let path = route(name)?;
-    let asked = if force {
-        format!("{path}?force=true")
-    } else {
-        path
+    let asked = match force {
+        true => format!("{path}?force=true"),
+        false => path.clone(),
     };
     let mut said = String::new();
+    // The runs stream, and the machine's name its runs carry.
+    let mut runs: Option<(Watch<RunsEvent>, String)> = None;
     let Ended {
         mut machine,
         changed,
@@ -49,8 +55,17 @@ pub async fn end(ctx: &Context, name: &str, force: bool) -> Result<ExitCode, Err
                     output::say(ctx, &format!("Waiting to end {name}: {}", e.message));
                     said = e.message;
                 }
+                let Some((watch, on)) = runs.as_mut() else {
+                    // Subscribed after the refusal: asked again first, a landing in between counts.
+                    let watch = calcifer.watch("/v1/runs/events").await?;
+                    let machine: Machine = calcifer.get(&path).await?;
+                    runs = Some((watch, machine.name));
+                    continue;
+                };
                 tokio::select! {
-                    () = tokio::time::sleep(FOLLOW) => {}
+                    moved = run_moved(watch, on) => if !moved {
+                        runs = None;
+                    },
                     _ = tokio::signal::ctrl_c() => {
                         return Err(Error::new(
                             Kind::Unavailable,
@@ -74,36 +89,15 @@ pub async fn end(ctx: &Context, name: &str, force: bool) -> Result<ExitCode, Err
             ),
         );
     }
-    // Follow the row by its rental id: the name is the Hub's and an alias may be what was typed.
-    let path = route(machine.rental_id.as_deref().unwrap_or(&machine.name))?;
     if machine.state == MachineState::Ending {
         output::say(ctx, &format!("Shutting down {}…", machine.name));
-    }
-    while machine.state == MachineState::Ending {
-        if machine.reason.as_deref() == Some("release_unconfirmed") {
-            return Err(Error::new(
-                Kind::Conflict,
-                "release_unconfirmed",
-                format!(
-                    "the Hub has not confirmed {}'s pod destroyed, and its missing record is not proof",
-                    machine.name
-                ),
-            )
-            .remedy("Calcifer keeps the record and keeps asking; the pod may still be billing")
-            .next(format!("cozy machine show {}", machine.name)));
-        }
-        tokio::select! {
-            () = tokio::time::sleep(FOLLOW) => {}
-            _ = tokio::signal::ctrl_c() => {
-                return Err(Error::new(
-                    Kind::Unavailable,
-                    "end_unconfirmed",
-                    format!("stopped watching; the release of {} continues in Calcifer", machine.name),
-                )
-                .next(format!("cozy machine show {}", machine.name)));
-            }
-        }
-        machine = calcifer.get(&path).await?;
+        // Followed by its rental id: the name is the Hub's and an alias may be what was typed.
+        let id = machine
+            .rental_id
+            .clone()
+            .unwrap_or_else(|| machine.name.clone());
+        let (following, now) = Following::open(&calcifer, &id).await?;
+        machine = released(&calcifer, following, now, &route(&id)?).await?;
     }
     if ctx.json {
         output::json(&Ended {
@@ -138,6 +132,59 @@ pub async fn end(ctx: &Context, name: &str, force: bool) -> Result<ExitCode, Err
     }
     output::next(ctx, &["cozy machine list"]);
     Ok(ExitCode::SUCCESS)
+}
+
+/// Waits for a change to a run on `machine` (an output landed or lost, a run moved on); false
+/// once the stream ended.
+async fn run_moved(runs: &mut Watch<RunsEvent>, machine: &str) -> bool {
+    loop {
+        match runs.next().await {
+            Some(RunsEvent::Updated { run }) if run.machine.as_deref() == Some(machine) => {
+                return true;
+            }
+            Some(_) => {}
+            None => return false,
+        }
+    }
+}
+
+/// Follows an ending rental until its Hub affirms the pod gone.
+async fn released(
+    calcifer: &Client,
+    mut following: Following,
+    mut machine: Machine,
+    path: &str,
+) -> Result<Machine, Error> {
+    while machine.state == MachineState::Ending {
+        if machine.reason.as_deref() == Some("release_unconfirmed") {
+            return Err(Error::new(
+                Kind::Conflict,
+                "release_unconfirmed",
+                format!(
+                    "the Hub has not confirmed {}'s pod destroyed, and its missing record is not proof",
+                    machine.name
+                ),
+            )
+            .remedy("Calcifer keeps the record and keeps asking; the pod may still be billing")
+            .next(format!("cozy machine show {}", machine.name)));
+        }
+        tokio::select! {
+            next = following.next(calcifer) => machine = match next? {
+                Some(next) => next,
+                // Left the list: as Calcifer records it now.
+                None => calcifer.get(path).await?,
+            },
+            _ = tokio::signal::ctrl_c() => {
+                return Err(Error::new(
+                    Kind::Unavailable,
+                    "end_unconfirmed",
+                    format!("stopped watching; the release of {} continues in Calcifer", machine.name),
+                )
+                .next(format!("cozy machine show {}", machine.name)));
+            }
+        }
+    }
+    Ok(machine)
 }
 
 /// Resets a rental's idle clock once; it answers only after the machine acknowledged.
