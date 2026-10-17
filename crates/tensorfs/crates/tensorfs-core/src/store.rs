@@ -296,6 +296,12 @@ pub trait Progress: Send + Sync {
     fn discarded(&self, _bytes: u64) {}
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Manifests this thread has read: a test measures work in reads, not in seconds.
+    pub(crate) static MANIFEST_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 #[derive(Clone)]
 pub struct Store {
     root: PathBuf,
@@ -893,6 +899,8 @@ impl Store {
     }
 
     pub fn read_manifest(&self, reference: &ObjectRef) -> Result<crate::manifest::Manifest> {
+        #[cfg(test)]
+        MANIFEST_READS.with(|reads| reads.set(reads.get() + 1));
         let path = self.manifest_path(&reference.sha256);
         let file = durable::open_nofollow(&path, OpenOptions::new().read(true))
             .map_err(std::io::Error::from)
