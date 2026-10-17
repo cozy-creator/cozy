@@ -1,7 +1,8 @@
 //! The NVIDIA GPUs a machine reports in `StatusFrame.gpus[]`, read through NVML, which is opened
 //! at run time (`libnvidia-ml.so.1`, `nvml.dll`). No driver is "no NVIDIA GPU", never an error.
 use crate::{Error, Result};
-use nvml_wrapper::{Nvml, error::NvmlError};
+use nvml_wrapper::{Nvml, enums::device::UsedGpuMemory, error::NvmlError};
+use std::collections::BTreeMap;
 
 /// One GPU: machine.proto `Gpu` fields 1-6, plus the memory class.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -66,6 +67,80 @@ pub fn probe(visible: Option<&str>) -> Result<Vec<Gpu>> {
         });
     }
     Ok(gpus)
+}
+
+/// One GPU opened for repeated reads (TensorD's memory sampler reads it every second). NVML
+/// stays loaded while it lives.
+pub struct Device {
+    nvml: Nvml,
+    index: u32,
+    key: String,
+}
+
+/// One reading of a GPU's memory.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Reading {
+    pub total: u64,
+    pub free: u64,
+    /// A desktop is initialized on it.
+    pub display: bool,
+    /// Device bytes the driver charges each process (pid -> bytes); `None` where it cannot
+    /// account every one (a container whose pids are not the driver's, WDDM).
+    pub processes: Option<BTreeMap<u32, u64>>,
+}
+
+impl Device {
+    /// `entry` as `CUDA_VISIBLE_DEVICES` spells it: an index, or a `GPU-…` UUID.
+    pub fn open(entry: &str) -> Result<Self> {
+        let nvml = Nvml::init().map_err(failed("init"))?;
+        let device = match entry.parse::<u32>() {
+            Ok(index) => nvml.device_by_index(index),
+            Err(_) => nvml.device_by_uuid(entry),
+        }
+        .map_err(failed("open device"))?;
+        let index = device.index().map_err(failed("device index"))?;
+        let uuid = device.uuid().unwrap_or_else(|_| entry.into());
+        let driver = nvml.sys_driver_version().unwrap_or_default();
+        Ok(Self {
+            key: format!("{uuid}/{driver}"),
+            index,
+            nvml,
+        })
+    }
+
+    /// `<GPU UUID>/<driver version>`: what a learned context is valid for.
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    pub fn read(&self) -> Result<Reading> {
+        let device = self
+            .nvml
+            .device_by_index(self.index)
+            .map_err(failed("open device"))?;
+        let memory = device.memory_info().map_err(failed("memory info"))?;
+        let processes = device.running_compute_processes().ok().and_then(|rows| {
+            rows.into_iter()
+                .map(|row| match row.used_gpu_memory {
+                    UsedGpuMemory::Used(bytes) => Some((row.pid, bytes)),
+                    UsedGpuMemory::Unavailable => None,
+                })
+                .collect()
+        });
+        Ok(Reading {
+            total: memory.total,
+            free: memory.free,
+            display: device.is_display_active().unwrap_or(false),
+            processes,
+        })
+    }
+
+    pub fn display_active(&self) -> Result<bool> {
+        self.nvml
+            .device_by_index(self.index)
+            .and_then(|device| device.is_display_active())
+            .map_err(failed("display active"))
+    }
 }
 
 fn failed(op: &'static str) -> impl FnOnce(NvmlError) -> Error {

@@ -434,6 +434,10 @@ fn the_gpu_probe_answers_without_a_driver() {
     };
     if !driver {
         assert!(gpus.is_empty(), "no NVIDIA driver, yet {gpus:?}");
+        assert!(
+            gpu::Device::open("0").is_err(),
+            "a device opened with no driver"
+        );
     }
     for gpu in &gpus {
         assert!(
@@ -445,6 +449,9 @@ fn the_gpu_probe_answers_without_a_driver() {
             "{gpu:?}"
         );
         assert_eq!(gpu::probe(Some(&gpu.uuid)).unwrap(), vec![gpu.clone()]);
+        let device = gpu::Device::open(&gpu.uuid).unwrap();
+        assert!(device.key().starts_with(&gpu.uuid));
+        assert_eq!(device.read().unwrap().total, gpu.memory_bytes);
     }
 }
 
