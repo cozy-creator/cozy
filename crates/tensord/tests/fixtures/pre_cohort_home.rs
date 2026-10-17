@@ -6,7 +6,7 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use ed25519_dalek::SigningKey;
 use std::{
-    os::unix::process::CommandExt,
+    os::unix::{fs::PermissionsExt, process::CommandExt},
     path::Path,
     process::{Command, Stdio},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -43,6 +43,7 @@ async fn a_v0_9_machine_home() {
     std::fs::copy(String::from_utf8(uv.stdout).unwrap().trim(), root.join("usr/local/bin/uv")).unwrap();
     let key_file = home.join("receipt-key");
     std::fs::write(&key_file, URL_SAFE_NO_PAD.encode([7u8; 32])).unwrap();
+    std::fs::set_permissions(&key_file, std::fs::Permissions::from_mode(0o600)).unwrap();
     let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
     let owner = URL_SAFE_NO_PAD.encode(SigningKey::from_bytes(&OWNER).verifying_key().as_bytes());
     let mut machine = Command::new(env!("CARGO_BIN_EXE_tensord"))
