@@ -155,7 +155,7 @@ impl Entry {
 /// it is held (an executor of it still runs); reclaim removes it once nothing names it.
 pub fn remove_generation(generations: &Path, identity: &str) -> io::Result<Option<u64>> {
     let path = generations.join(identity);
-    let Ok(filesystem) = durable::device(&path) else {
+    let Ok(filesystem) = FileId::at(&path).map(|id| id.dev) else {
         return Ok(Some(0));
     };
     let bytes = releasable(&path, filesystem, &open_files()).unwrap_or(0);
@@ -484,11 +484,11 @@ pub fn sweep(caches: &Caches) -> io::Result<Swept> {
         }
     }
 
-    let filesystem = durable::device(root)?;
+    let filesystem = FileId::at(root)?.dev;
     let store = caches.store.as_ref();
     // A store on its own filesystem is relieved under TensorFS's rule for it.
     let shared = match store {
-        Some(store) if durable::device(store.store.root())? != filesystem => {
+        Some(store) if FileId::at(store.store.root())?.dev != filesystem => {
             let relief = tensorfs_core::admission::relieve(store.store, &store.keep);
             swept.store_bytes += relief.map_err(io::Error::other)?.collected_bytes;
             None
