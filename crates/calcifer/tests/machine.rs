@@ -3,7 +3,12 @@
 //! canceled or the Hub goes away; no Runtime is involved.
 mod common;
 
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+    sync::Arc,
+    time::Duration,
+};
 
 use calcifer::{
     Calcifer, Link, LinkError,
@@ -431,5 +436,73 @@ async fn imported_runs_are_followed_and_never_sent() {
         calcifer.store().run(held.as_str()).unwrap().unwrap().number,
         41
     );
+    calcifer.close();
+}
+
+/// A run's inputs reach its machine as a visible stage, in steps of what the machine holds, and an
+/// object two runs name is written to one machine once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inputs_are_written_as_a_visible_stage_and_once_per_machine() {
+    let home = tempfile::tempdir().unwrap();
+    let key = common::key_file(home.path());
+    let machine = Tensord::start();
+    let hub = SilentHub::new();
+    let calcifer = open(home.path());
+    calcifer.put_machine(&machine.row("m", &key)).unwrap();
+    let mut events = calcifer.subscribe();
+    let bytes: Vec<u8> = (0..24u32 << 20)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    let (staged, input) = common::input_file(home.path(), &bytes);
+    let spec = common::warm_spec(&hub.origin(), vec![input]);
+    let (first, second) = tokio::join!(
+        calcifer.submit("k1", submit("m", spec.clone(), vec![staged.clone()])),
+        calcifer.submit("k2", submit("m", spec, vec![staged.clone()])),
+    );
+    let ids = [first.unwrap().run.id, second.unwrap().run.id];
+    let (mut writing, mut accepted) = (HashMap::<RunId, Vec<String>>::new(), HashSet::new());
+    // A hang bound for a test whose runs never get there; the product waits without one.
+    tokio::time::timeout(Duration::from_secs(120), async {
+        while accepted.len() < 2 {
+            let (id, event) = events.recv().await.unwrap();
+            match event {
+                Event::Waiting { reason } if reason.starts_with("writing image: ") => {
+                    writing.entry(id).or_default().push(reason);
+                }
+                event if is_status(Status::InProgress)(&event) => {
+                    accepted.insert(id);
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("both runs were accepted");
+    assert_eq!(
+        writing.len(),
+        1,
+        "one run wrote the object, the other found it held: {writing:?}"
+    );
+    let shown = writing.values().next().unwrap();
+    assert_eq!(shown[0], "writing image: 0 B/24.0 MiB", "{shown:?}");
+    assert!(shown.len() >= 3, "it moved in steps: {shown:?}");
+    assert!(
+        shown
+            .last()
+            .unwrap()
+            .starts_with("writing image: 24.0 MiB/24.0 MiB at "),
+        "{shown:?}"
+    );
+    let link = Link::new(&machine.endpoint, common::key()).unwrap();
+    assert_eq!(
+        link.held(&staged.digest, staged.length).await.unwrap(),
+        staged.length
+    );
+    for id in &ids {
+        calcifer.cancel(id).unwrap();
+    }
+    for id in &ids {
+        settled(&calcifer, id).await;
+    }
     calcifer.close();
 }

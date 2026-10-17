@@ -66,6 +66,8 @@ pub struct Calcifer {
     tasks: Mutex<JoinSet<()>>,
     /// Orders staging a run's inputs against deleting a settled run's.
     staging: Mutex<()>,
+    /// The object each machine is being written, one Write at a time.
+    writing: Mutex<HashMap<(String, Digest), Turn>>,
     /// Told each time a run is settled: what Calcifer owes may now be nothing.
     owed: watch::Sender<()>,
     exports: outputs::Exports,
@@ -74,6 +76,9 @@ pub struct Calcifer {
     /// The machines and their Hubs, which mint what a send carries to its Hub.
     granting: OnceLock<Weak<machines::Machines>>,
 }
+
+/// A turn to write one object to one machine.
+type Turn = Arc<tokio::sync::Mutex<()>>;
 
 /// What a run is doing now, never stored: the latest of each live event.
 #[derive(Default)]
@@ -136,6 +141,7 @@ impl Calcifer {
             machines: Mutex::default(),
             tasks: Mutex::default(),
             staging: Mutex::default(),
+            writing: Mutex::default(),
             owed: watch::channel(()).0,
             exports: outputs::Exports::default(),
             warm: Mutex::default(),
@@ -580,7 +586,7 @@ impl Calcifer {
         let (state, stream) = match run.state {
             State::Settled => return Ok(()),
             State::Queued => {
-                self.write_inputs(link, run).await?;
+                self.write_inputs(link, run, machine).await?;
                 let _turn = sending.lock().await;
                 self.known_warm(run, machine, link).await?;
                 let spec = spec(self.access(run, machine).await?)?;
@@ -606,7 +612,7 @@ impl Calcifer {
                         }));
                     }
                     Err(LinkError::NotFound) if run.state == State::Sent => {
-                        self.write_inputs(link, run).await?;
+                        self.write_inputs(link, run, machine).await?;
                         let _turn = sending.lock().await;
                         self.known_warm(run, machine, link).await?;
                         let spec = spec(self.access(run, machine).await?)?;
@@ -758,8 +764,22 @@ impl Calcifer {
         Ok(())
     }
 
-    async fn write_inputs(&self, link: &Link, run: &RunRow) -> Result<(), Stop> {
+    /// Writes the run's staged objects to its machine, each shown as the run's `writing` stage.
+    /// One object is written to one machine once at a time: a run naming an object another run
+    /// is writing there waits its turn, then finds it held.
+    async fn write_inputs(&self, link: &Link, run: &RunRow, machine: &str) -> Result<(), Stop> {
+        let names: HashMap<String, String> = v1::RunSpec::decode(run.spec.as_slice())
+            .map(|spec| {
+                spec.inputs
+                    .into_iter()
+                    .map(|i| (i.digest, i.field))
+                    .collect()
+            })
+            .unwrap_or_default();
         for (digest, length) in &run.inputs {
+            let key = (machine.to_owned(), *digest);
+            let turn = lock(&self.writing).entry(key.clone()).or_default().clone();
+            let held = turn.lock().await;
             let path = self.inputs.join(hex::encode(digest.bytes()));
             let file = tokio::fs::File::open(&path).await.map_err(|e| {
                 Stop::Refused(Reason {
@@ -770,7 +790,29 @@ impl Calcifer {
                     ),
                 })
             })?;
-            link.write(digest, *length, file).await?;
+            let name = names.get(&digest.to_string()).cloned().unwrap_or_else(|| {
+                let hex = hex::encode(digest.bytes());
+                format!("sha256:{}", &hex[..12])
+            });
+            let written = link
+                .write(digest, *length, file, |done, rate| {
+                    let mut reason = format!(
+                        "writing {name}: {}/{}",
+                        bytes(done as f64),
+                        bytes(*length as f64)
+                    );
+                    if let Some(rate) = rate {
+                        reason = format!("{reason} at {}/s", bytes(rate));
+                    }
+                    self.waiting(&run.id, reason);
+                })
+                .await;
+            drop(held);
+            let mut writing = lock(&self.writing);
+            if Arc::strong_count(&turn) <= 2 {
+                writing.remove(&key);
+            }
+            written?;
         }
         Ok(())
     }
@@ -943,6 +985,22 @@ impl Pause {
             _ = wake.notified() => {}
             _ = changed => {}
         }
+    }
+}
+
+/// A byte count for people: `1.5 MiB`.
+fn bytes(n: f64) -> String {
+    let (mut value, mut unit) = (n, "B");
+    for next in ["KiB", "MiB", "GiB"] {
+        if value < 1024.0 {
+            break;
+        }
+        (value, unit) = (value / 1024.0, next);
+    }
+    if unit == "B" {
+        format!("{value:.0} B")
+    } else {
+        format!("{value:.1} {unit}")
     }
 }
 
