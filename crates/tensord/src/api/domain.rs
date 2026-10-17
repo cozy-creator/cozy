@@ -1,13 +1,19 @@
-//! Current native execution values. These are not an RPC protocol.
+//! Current native execution values. These are not an RPC protocol. The journal stores the
+//! values marked Serialize as JSON, their bytes in base64 (archive.rs).
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AttemptOutcome {
     pub worker_boot_id: String,
     pub request_id: String,
     pub attempt_ordinal: u64,
+    #[serde(with = "b64")]
     pub invocation_spec_digest: Vec<u8>,
     pub outcome_id: String,
+    #[serde(with = "b64")]
     pub outcome_digest: Vec<u8>,
+    #[serde(with = "b64")]
     pub outcome_canonical_bytes: Vec<u8>,
 }
 
@@ -29,7 +35,8 @@ pub struct DevelopmentPackage {
     pub installation_id: String,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct DownloadAdapterRef {
     pub component: String,
     pub model: String,
@@ -88,7 +95,7 @@ pub struct LocalPackageUploadHeader {
     pub file: Option<LocalPackageFileRef>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ::prost::Enumeration)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(i32)]
 pub enum MachineExecutionAction {
     Unspecified = 0,
@@ -101,18 +108,21 @@ pub struct MachineExecutionControl {
     pub action: i32,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct MachineExecutionEvent {
     pub sequence: u64,
     pub attempt_ordinal: u64,
     pub at_ms: u64,
     pub kind: String,
+    #[serde(with = "b64")]
     pub body_canonical_bytes: Vec<u8>,
     pub product: Option<RunProduct>,
     pub outcome: Option<AttemptOutcome>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct MachineExecutionEventPage {
     pub events: Vec<MachineExecutionEvent>,
     pub next_after: u64,
@@ -198,13 +208,26 @@ pub struct MachineExecutionWorkspace {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MachineExecutionWorkspaceQuery {}
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ::prost::Enumeration)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(i32)]
 pub enum MachineLog {
     Unspecified = 0,
     TensorfsTransport = 1,
     Memory = 2,
     Tensord = 3,
+}
+
+impl TryFrom<i32> for MachineLog {
+    type Error = i32;
+    fn try_from(value: i32) -> Result<Self, i32> {
+        Ok(match value {
+            0 => Self::Unspecified,
+            1 => Self::TensorfsTransport,
+            2 => Self::Memory,
+            3 => Self::Tensord,
+            other => return Err(other),
+        })
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -227,7 +250,8 @@ pub struct MachinePackage {
     pub warning: String,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ModelChoice {
     pub parameter: String,
     pub repository: String,
@@ -239,22 +263,26 @@ pub struct ModelChoice {
     pub adapters: Vec<DownloadAdapterRef>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct NativeByteRetentionRequest {
     pub source: Option<NativeByteTreeRef>,
     pub retention_id: String,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct NativeByteRetentionResult {
     pub source: Option<NativeByteTreeRef>,
     pub retention_id: String,
     pub released: bool,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct NativeByteTreeRef {
     pub producer_root_id: String,
+    #[serde(with = "b64")]
     pub receipt_digest: Vec<u8>,
     pub manifest: Option<Ref>,
     pub content_bytes: u64,
@@ -268,13 +296,16 @@ pub struct PackageList {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PackageListQuery {}
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Ref {
+    #[serde(with = "b64")]
     pub digest: Vec<u8>,
     pub length: u64,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct RunProduct {
     pub output: String,
     pub op: i32,
@@ -286,7 +317,7 @@ pub struct RunProduct {
     pub parts: Vec<RunProductPart>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ::prost::Enumeration)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(i32)]
 pub enum RunProductOp {
     Unspecified = 0,
@@ -294,7 +325,8 @@ pub enum RunProductOp {
     Append = 2,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct RunProductPart {
     pub content: Option<Ref>,
     pub source: Option<NativeByteRetentionRequest>,
@@ -306,4 +338,17 @@ pub struct TriageBundleRef {
     pub subject_id: String,
     pub write_receipt_digest: Vec<u8>,
     pub length: u64,
+}
+
+/// Stored bytes as base64 text.
+mod b64 {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use serde::{Deserialize, Deserializer, Serializer};
+    pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&STANDARD.encode(bytes))
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        let text = std::borrow::Cow::<str>::deserialize(deserializer)?;
+        STANDARD.decode(text.as_bytes()).map_err(serde::de::Error::custom)
+    }
 }

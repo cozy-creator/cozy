@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     fs, io,
-    path::Path,
+    path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -361,8 +361,97 @@ pub struct Journal {
 }
 
 /// The record layout this machine writes. A newer journal still opens: unknown fields are
-/// ignored and rows it cannot read are skipped, never a refusal of the whole journal.
-pub const JOURNAL_FORMAT: u32 = 1;
+/// ignored and rows it cannot read are skipped, never a refusal of the whole journal. An older
+/// one (1: stored values in protobuf) is archived beside it, never read, and a fresh journal
+/// starts with what is not a record of runs carried over (`CARRIED`).
+pub const JOURNAL_FORMAT: u32 = 2;
+const FILE: &str = "executions.sqlite3";
+/// What a fresh journal keeps of an archived one: this machine's installed environments and
+/// their preparations, its name resolutions, the objects its owners wrote and when objects were
+/// last used. Plain columns and JSON text, never a stored value of the older layout.
+const CARRIED: &[(&str, &str)] = &[
+    ("installations", "actor,alias,record"),
+    ("preparations", "actor,id,record"),
+    ("resolutions", "actor,key,package,preparation"),
+    ("names", "name,revision,named"),
+    ("objects", "actor,sha256,length"),
+    ("object_uses", "sha256,length,used_ms"),
+];
+
+/// The journal at `root` when its layout is older than this machine's, archived beside it
+/// (`executions.format-<n>-<unix ms>.sqlite3`, whole: its WAL checkpointed into it first).
+fn archive_older(root: &Path) -> io::Result<Option<PathBuf>> {
+    let path = root.join(FILE);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let format = {
+        let connection = Connection::open(&path).map_err(db_error)?;
+        let format: Option<String> = connection
+            .query_row("SELECT value FROM machine_metadata WHERE key='journal_format'", [], |r| r.get(0))
+            .optional()
+            .or_else(|e| match e {
+                // A journal from before machine metadata.
+                rusqlite::Error::SqliteFailure(_, Some(message)) if message.contains("no such table") => Ok(None),
+                other => Err(other),
+            })
+            .map_err(db_error)?;
+        let format = format.and_then(|f| f.parse::<u32>().ok()).unwrap_or(0);
+        if format >= JOURNAL_FORMAT {
+            return Ok(None);
+        }
+        connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;")
+            .map_err(db_error)?;
+        format
+    };
+    let archived = root.join(format!("executions.format-{format}-{}.sqlite3", timestamp()));
+    fs::rename(&path, &archived)?;
+    for suffix in ["-wal", "-shm"] {
+        let side = root.join(format!("{FILE}{suffix}"));
+        if side.exists() {
+            fs::rename(&side, root.join(format!("{}{suffix}", archived.display())))?;
+        }
+    }
+    fs::File::open(root)?.sync_all()?;
+    tracing::warn!(
+        "journal: format {format} is older than {JOURNAL_FORMAT}; archived it as {} and started a fresh one",
+        archived.display()
+    );
+    Ok(Some(archived))
+}
+
+/// `CARRIED` from the archived journal into this fresh one, in one transaction.
+fn carry(connection: &mut Connection, archived: &Path) -> io::Result<()> {
+    connection
+        .execute("ATTACH DATABASE ?1 AS archived", [archived.to_string_lossy()])
+        .map_err(db_error)?;
+    let carried = (|| {
+        let tx = connection.transaction().map_err(db_error)?;
+        for (table, columns) in CARRIED {
+            let held: bool = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM archived.sqlite_master WHERE type='table' AND name=?1",
+                    [table],
+                    |r| r.get(0),
+                )
+                .map_err(db_error)?;
+            let copied = tx.execute(
+                &format!("INSERT OR IGNORE INTO main.{table}({columns}) SELECT {columns} FROM archived.{table}"),
+                [],
+            );
+            match copied {
+                Ok(rows) => tracing::info!("journal: carried {rows} {table} rows"),
+                // A layout older than these columns: the fresh journal starts without them.
+                Err(error) if held => tracing::warn!("journal: {table} not carried: {error}"),
+                Err(_) => {}
+            }
+        }
+        tx.commit().map_err(db_error)
+    })();
+    connection.execute("DETACH DATABASE archived", []).map_err(db_error)?;
+    carried
+}
 
 /// One unreadable row (written by a newer machine, or damaged) must not hide every other run.
 fn readable(rows: Vec<String>) -> Vec<Execution> {
@@ -394,7 +483,8 @@ fn timestamp() -> i64 {
 impl Journal {
     pub fn open(root: &Path) -> io::Result<Self> {
         fs::create_dir_all(root)?;
-        let mut connection = Connection::open(root.join("executions.sqlite3")).map_err(db_error)?;
+        let archived = archive_older(root)?;
+        let mut connection = Connection::open(root.join(FILE)).map_err(db_error)?;
         connection
             .execute_batch(
                 "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;
@@ -461,7 +551,9 @@ impl Journal {
             CREATE UNIQUE INDEX IF NOT EXISTS executions_actor_request ON executions(actor,request_id) WHERE actor IS NOT NULL;
             CREATE UNIQUE INDEX IF NOT EXISTS executions_actor_submission ON executions(actor,submission_id) WHERE actor IS NOT NULL;
             CREATE INDEX IF NOT EXISTS executions_actor_order ON executions(actor,id) WHERE actor IS NOT NULL; COMMIT;").map_err(db_error)?;
-        crate::failure_upgrade::upgrade(&mut connection)?;
+        if let Some(archived) = &archived {
+            carry(&mut connection, archived)?;
+        }
         // A journal from before held memos kept their use (#148's builds) gains the column.
         let used: bool = connection
             .query_row("SELECT COUNT(*) FROM pragma_table_info('held_memos') WHERE name='used_ms'", [], |r| r.get(0))

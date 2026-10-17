@@ -68,7 +68,6 @@ prettyplease = "0.2"
 progenitor = { version = "0.15.1", default-features = false }
 pep508_rs = "0.9"
 progenitor-client = "0.15.1"
-prost = "0.14"
 quote = "1"
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }

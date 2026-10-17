@@ -32,7 +32,6 @@ http-body-util.workspace = true
 bytes.workspace = true
 webpki-roots.workspace = true
 zip = { version = "7", default-features = false, features = ["deflate-flate2"] }
-prost.workspace = true
 axum.workspace = true
 ed25519-dalek = { workspace = true, features = ["pem", "pkcs8"] }
 rcgen.workspace = true
