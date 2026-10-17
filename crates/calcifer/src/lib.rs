@@ -77,8 +77,8 @@ pub struct Calcifer {
     granting: OnceLock<Weak<machines::Machines>>,
 }
 
-/// A turn to write one object to one machine.
-type Turn = Arc<tokio::sync::Mutex<()>>;
+/// A turn to write one object to one machine, and the number of the run whose turn it is.
+type Turn = Arc<(tokio::sync::Mutex<()>, Mutex<u64>)>;
 
 /// What a run is doing now, never stored: the latest of each live event.
 #[derive(Default)]
@@ -253,6 +253,14 @@ impl Calcifer {
         .await
         .map_err(|e| Error::Invalid(e.to_string()))??;
         if fresh {
+            // Never a bare `queued`: its driver says more as soon as it knows more.
+            self.waiting(
+                &row.id,
+                match &row.machine {
+                    Some(machine) => format!("sending to {machine}"),
+                    None => "waiting for a machine to be chosen".into(),
+                },
+            );
             let created = self.store.events_after(row.id.as_str(), 0)?;
             self.publish(&row.id, created);
             self.drive(row.id.clone());
@@ -396,15 +404,30 @@ impl Calcifer {
         Ok(placed)
     }
 
+    /// Sends the run's events; a lifecycle event says why the run waits now, as its record does.
     fn publish(&self, id: &RunId, events: Vec<Event>) {
-        for event in events {
+        let waiting = lock(&self.live)
+            .get(id)
+            .and_then(|live| live.waiting.clone());
+        for mut event in events {
+            if let Event::Created { run, .. }
+            | Event::Queued { run, .. }
+            | Event::InProgress { run, .. } = &mut event
+            {
+                run.waiting.clone_from(&waiting);
+            }
             let _ = self.events.send((id.clone(), event));
         }
     }
 
+    /// The run waits no longer: its record says so, and its followers hear an empty reason.
     fn not_waiting(&self, id: &RunId) {
-        if let Some(live) = lock(&self.live).get_mut(id) {
-            live.waiting = None;
+        let cleared = lock(&self.live)
+            .get_mut(id)
+            .and_then(|live| live.waiting.take());
+        if cleared.is_some() {
+            let reason = String::new();
+            let _ = self.events.send((id.clone(), Event::Waiting { reason }));
         }
     }
 
@@ -639,7 +662,10 @@ impl Calcifer {
         pause.reset();
         match self.store.accept(id, machine, &state)? {
             Acceptance::Fresh(events) => {
-                self.not_waiting(&run.id);
+                // Accepted, it waits no more: its in-progress event says so.
+                lock(&self.live)
+                    .get_mut(&run.id)
+                    .map(|live| live.waiting.take());
                 self.publish(&run.id, events);
             }
             Acceptance::Again => {}
@@ -727,14 +753,19 @@ impl Calcifer {
                     batch.logs.push((frame.at_ms, "call".into(), text));
                 }
                 Some(Frame::Product(product)) => batch.products.push(product),
-                Some(Frame::Gpu(gpu)) => {
-                    if gpu.state == "wait" {
-                        self.waiting(
-                            id,
-                            format!("waiting for {} GPUs behind run {}", gpu.width, gpu.behind),
-                        );
-                    }
+                // Waiting for GPUs another run holds, named by its number; granted, it waits no more.
+                Some(Frame::Gpu(gpu)) if gpu.state == "wait" => {
+                    let gpus = match gpu.width {
+                        1 => "a GPU".to_owned(),
+                        n => format!("{n} GPUs"),
+                    };
+                    let holder = match self.store.run(&gpu.behind) {
+                        Ok(Some(holder)) => format!("run {}", holder.number),
+                        _ => "another run".to_owned(),
+                    };
+                    self.waiting(id, format!("waiting for {gpus}, held by {holder}"));
                 }
+                Some(Frame::Gpu(_)) => self.not_waiting(id),
                 Some(Frame::Progress(p)) => {
                     self.progress(
                         id,
@@ -751,8 +782,11 @@ impl Calcifer {
                     continue;
                 }
                 Some(Frame::State(state)) => {
+                    // A reason that only repeats the machine's state (`preparing`) says nothing more.
                     match state.waiting.as_str() {
-                        "" => self.not_waiting(id),
+                        waiting if waiting.is_empty() || waiting == state.state => {
+                            self.not_waiting(id)
+                        }
                         waiting => self.waiting(id, format!("{}: {waiting}", state.state)),
                     }
                     batch.machine_state = Some(state.state);
@@ -778,7 +812,7 @@ impl Calcifer {
         Ok(())
     }
 
-    /// Writes the run's staged objects to its machine, each shown as the run's `writing` stage.
+    /// Writes the run's staged objects to its machine, each shown as its reason (`uploading <field>`).
     /// What the machine holds is asked of `PROBES` objects at once, so a long round trip costs
     /// one turn for a resubmitted tree, not one per file (37 files over 270 ms: 10 s per run).
     /// One object is written to one machine once at a time: a run naming an object another run
@@ -806,9 +840,24 @@ impl Calcifer {
             .unwrap_or_default();
         // An object asked of in error is asked again, and its error told, as it is written.
         for ((digest, length), _) in run.inputs.iter().zip(held).filter(|(_, held)| !held) {
+            let name = names.get(&digest.to_string()).cloned().unwrap_or_else(|| {
+                let hex = hex::encode(digest.bytes());
+                format!("sha256:{}", &hex[..12])
+            });
             let key = (machine.to_owned(), *digest);
             let turn = lock(&self.writing).entry(key.clone()).or_default().clone();
-            let held = turn.lock().await;
+            let held = match turn.0.try_lock() {
+                Ok(held) => held,
+                Err(_) => {
+                    let holder = match *lock(&turn.1) {
+                        0 => "another run".to_owned(),
+                        n => format!("run {n}"),
+                    };
+                    self.waiting(&run.id, format!("waiting for {holder} to upload {name}"));
+                    turn.0.lock().await
+                }
+            };
+            *lock(&turn.1) = run.number;
             let path = self.inputs.join(hex::encode(digest.bytes()));
             let file = tokio::fs::File::open(&path).await.map_err(|e| {
                 Stop::Refused(Reason {
@@ -819,14 +868,10 @@ impl Calcifer {
                     ),
                 })
             })?;
-            let name = names.get(&digest.to_string()).cloned().unwrap_or_else(|| {
-                let hex = hex::encode(digest.bytes());
-                format!("sha256:{}", &hex[..12])
-            });
             let written = link
                 .write(digest, *length, file, |done, rate| {
                     let mut reason = format!(
-                        "writing {name}: {}/{}",
+                        "uploading {name}: {}/{}",
                         bytes(done as f64),
                         bytes(*length as f64)
                     );

@@ -271,6 +271,11 @@ struct View {
     /// Off a terminal, what was last written: the status or stage, and the tenth reached.
     shown: (String, i64),
     machine: Option<String>,
+    /// The run's own word for where it is (`queued`, the machine's state), and why it waits now
+    /// (Calcifer's reason, as `cozy run list` shows it): the status line says the reason first.
+    state: String,
+    waiting: Option<String>,
+    status: Option<Status>,
     /// The output items already named.
     named: HashSet<String>,
 }
@@ -292,6 +297,9 @@ impl View {
             bar,
             shown: (String::new(), -1),
             machine: None,
+            state: String::new(),
+            waiting: None,
+            status: None,
             named: HashSet::new(),
         };
         view.lifecycle(run);
@@ -317,7 +325,10 @@ impl View {
             {
                 self.status("saving its outputs to this computer")
             }
-            Event::Waiting { reason } => self.status(&format!("waiting: {reason}")),
+            Event::Waiting { reason } => {
+                self.waiting = Some(reason.clone()).filter(|r| !r.is_empty());
+                self.show();
+            }
             Event::Progress { progress } => self.progress(progress),
             // Each output is named once, when its file first lands; a person's terminal shows
             // where to look, the log off a terminal each revision after.
@@ -368,16 +379,24 @@ impl View {
                 run.machine.as_deref().unwrap_or_default()
             ));
         }
-        match run.status {
-            Status::Queued => self.status(
-                run.waiting
-                    .as_deref()
-                    .map_or("queued".into(), |w| format!("waiting: {w}"))
-                    .as_str(),
-            ),
-            Status::InProgress => self.status(run.machine_state.as_deref().unwrap_or("running")),
-            _ => {}
+        self.state = match (run.status, run.machine_state.as_deref(), &run.machine) {
+            (Status::Queued, ..) => "queued".into(),
+            (Status::InProgress, Some("queued"), Some(machine)) => format!("queued on {machine}"),
+            (Status::InProgress, state, _) => state.unwrap_or("running").into(),
+            _ => return,
+        };
+        // A replayed event of the same status knows no reason; a new status says its own.
+        if run.waiting.is_some() || self.status != Some(run.status) {
+            self.waiting.clone_from(&run.waiting);
         }
+        self.status = Some(run.status);
+        self.show();
+    }
+
+    /// The status line: why the run waits, else where it is.
+    fn show(&mut self) {
+        let text = self.waiting.clone().unwrap_or_else(|| self.state.clone());
+        self.status(&text);
     }
 
     fn status(&mut self, text: &str) {
