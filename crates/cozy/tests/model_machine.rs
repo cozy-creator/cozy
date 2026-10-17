@@ -1,6 +1,6 @@
-//! `cozy model download|list` on a real machine: the workspace's TensorD (COZY_TEST_TENSORD)
-//! added to this home's Calcifer. The machine makes the model from a tiny public Hugging Face
-//! repository, pinning a moving revision itself; no weight byte lands in the controller's home.
+//! `cozy model download|list` on a real machine: a TensorD (COZY_TEST_TENSORD) added to this
+//! home's Calcifer makes a tiny public Hugging Face repository into its own store; no weight
+//! byte lands in the controller's home.
 #![cfg(unix)]
 mod common;
 
@@ -50,7 +50,40 @@ fn download_makes_a_provider_source_on_the_machine() {
     let missing = home.cozy(["--json", "model", "list", "--on", "nowhere"]);
     assert_eq!((missing.code, missing.refusal()["code"].as_str()), (1, Some("machine_not_found")), "{missing:?}");
 
-    // The machine pins a moving revision and reads a pasted URL as its source; the result
+    // The 454 KB model never passed through this computer's home.
+    let state = |path: &std::path::Path| {
+        let name = path.file_name().unwrap().to_string_lossy();
+        [".db", ".db-wal", ".db-shm", ".log"].iter().any(|s| name.ends_with(s))
+    };
+    let big: Vec<_> = walk(&home.root()).into_iter().filter(|(path, len)| *len >= 400 << 10 && !state(path)).collect();
+    assert!(big.is_empty(), "weights in the controller's home: {big:?}");
+}
+
+fn walk(dir: &std::path::Path) -> Vec<(std::path::PathBuf, u64)> {
+    let mut files = vec![];
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let meta = entry.metadata().unwrap();
+        if meta.is_dir() {
+            files.extend(walk(&entry.path()));
+        } else {
+            files.push((entry.path(), meta.len()));
+        }
+    }
+    files
+}
+
+/// A moving revision and a pasted URL are pinned by the machine itself: only TensorD from this
+/// workspace does that, so this runs where the job builds it (`cozy_tensord=workspace`, which
+/// sets COZY_TENSORD); a released TensorD refuses unpinned spellings.
+#[test]
+fn the_machine_pins_a_moving_source() {
+    let Some(home) = Home::new() else { return };
+    if std::env::var("COZY_TENSORD").as_deref() != Ok("workspace") {
+        eprintln!("skipped: COZY_TEST_TENSORD is not this workspace's TensorD (COZY_TENSORD=workspace)");
+        return;
+    }
+    let _machine = common::tensord::added(&home, "m1");
+    // It pins a moving revision and reads a pasted URL as its source; the result
     // names the commit. Anything ambiguous is the machine's refusal, naming the spellings.
     let pinned = |resolved: &Value| {
         let commit = resolved.as_str().and_then(|r| r.strip_prefix("hf://hf-internal-testing/tiny-random-gpt2@"));
@@ -72,24 +105,4 @@ fn download_makes_a_provider_source_on_the_machine() {
     assert_eq!(failed["run"]["reason"]["code"], "model_source_failed", "{failed}");
     assert!(failed["run"]["reason"]["message"].as_str().unwrap().contains("hf://"), "{failed}");
 
-    // The 454 KB model never passed through this computer's home.
-    let state = |path: &std::path::Path| {
-        let name = path.file_name().unwrap().to_string_lossy();
-        [".db", ".db-wal", ".db-shm", ".log"].iter().any(|s| name.ends_with(s))
-    };
-    let big: Vec<_> = walk(&home.root()).into_iter().filter(|(path, len)| *len >= 400 << 10 && !state(path)).collect();
-    assert!(big.is_empty(), "weights in the controller's home: {big:?}");
-}
-
-fn walk(dir: &std::path::Path) -> Vec<(std::path::PathBuf, u64)> {
-    let mut files = vec![];
-    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-        let meta = entry.metadata().unwrap();
-        if meta.is_dir() {
-            files.extend(walk(&entry.path()));
-        } else {
-            files.push((entry.path(), meta.len()));
-        }
-    }
-    files
 }

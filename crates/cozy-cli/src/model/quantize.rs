@@ -3,7 +3,7 @@
 //! the lane and uploads it as a private checkpoint.
 use std::process::ExitCode;
 
-use cozy_proto::calcifer::On;
+use cozy_proto::calcifer::{On, Status};
 use cozy_proto::config::Hub;
 use cozy_proto::error::{Error, Kind};
 
@@ -11,6 +11,7 @@ use super::Quantize;
 use super::refs::{ModelRef, Repo};
 use crate::Context;
 use crate::context::hub_answer;
+use crate::output::{self, Record};
 use crate::run::interface::{Callable, Interface};
 
 /// The callables of `interface` that write `lane` from a checkpoint with `components`: a
@@ -115,10 +116,18 @@ pub(crate) async fn quantize(ctx: &Context, args: Quantize) -> Result<ExitCode, 
     let destination = args.destination.as_deref().map(Repo::hub).transpose()?;
     let hub = ctx.hub()?;
     let (source, components, repo) = checkpoint(ctx, &hub, &model).await?;
-    let destination = destination.unwrap_or(repo);
+    let destination = destination.unwrap_or_else(|| repo.clone());
     let (package, release, function) = quantizer(ctx, &hub, &args, lane, &components).await?;
-    let inputs = vec![source, destination.to_string()];
+    let inputs = vec![source.clone(), destination.to_string()];
     let run = crate::run::call(ctx, &package, Some(&release), &function, inputs, &args.placement, args.detach).await?;
+    // The lane the machine wrote (`result` is the quantizer's artifact), and how to publish it.
+    let digest = run.result.as_ref().and_then(|r| r["manifest"]["digest"].as_str());
+    if let (false, Status::Completed, Some(digest)) = (ctx.json, run.status, digest) {
+        let pinned = source.split_once('@').map(|(_, rest)| rest.split('/').next().unwrap_or(rest));
+        let release = pinned.filter(|_| destination == repo).unwrap_or("<release>");
+        Record::new().field("checkpoint", format!("{destination}#{digest}")).print(ctx);
+        output::next(ctx, &[&format!("cozy model publish {destination} --release {release} --lane {lane}={digest}")]);
+    }
     Ok(crate::run::exit_code(&run))
 }
 
