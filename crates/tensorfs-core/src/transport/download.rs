@@ -46,11 +46,10 @@ use crate::err::{refuse, Code, Refusal, Result};
 use crate::fetch::{DeliveryGrant, Destination};
 use crate::ids::ObjectRef;
 use crate::store::{Fault, Store, Verified, PUT_TEMP};
-use fs2::FileExt;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::Read;
-use std::os::unix::fs::{FileExt as _, OpenOptionsExt};
+use crate::platform::durable::{FileAt as _, Mode as _};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use futures::FutureExt;
@@ -1032,9 +1031,12 @@ impl<'a> Run<'_, 'a> {
             .mode(0o600)
             .open(&path)
             .map_err(|error| io("create", error))?;
-        let sized = file
-            .try_lock_exclusive()
-            .and_then(|()| file.set_len(length));
+        let sized = crate::platform::lock::try_claim(&file)
+            .and_then(|claimed| match claimed {
+                true => crate::platform::durable::set_sparse_len(&file, length),
+                false => Err(std::io::Error::from(std::io::ErrorKind::WouldBlock).into()),
+            })
+            .map_err(std::io::Error::from);
         if let Err(error) = sized {
             let _ = std::fs::remove_file(&path);
             return Err(io("size", error));

@@ -1,7 +1,9 @@
 name: platforms
 # Native builds on every desktop platform, Linux x86_64 as the control. Manual only: macOS
 # bills 10x and Windows 2x, so run it per question, never per push.
-#   gh workflow run platforms.yaml -R cozy-creator/tensorfs --ref <branch> [-f os='["macos-15"]'] [-f test='cargo test -p tensorfs-core --lib']
+#   gh workflow run platforms.yaml -R cozy-creator/tensorfs --ref <branch> [-f os='["macos-15"]'] [-f test='cargo nextest run --profile platforms -p tensorfs-core']
+# Tests run under nextest's `platforms` profile (.config/nextest.toml): each test is bounded on
+# its own, so a hang is one reported test, not a cancelled job.
 # Each job uploads build.txt (rustc short diagnostics) and a step summary of its errors.
 on:
   workflow_dispatch:
@@ -33,12 +35,20 @@ jobs:
         shell: bash
     env:
       CARGO_TERM_COLOR: never
+      # Full debug info for every test binary fills the x86_64 runner's disk, and the store's
+      # admission then refuses its own tests for space.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@1.91.1
 
       - uses: Swatinem/rust-cache@v2
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
 
       - uses: actions/setup-python@v5
         with:
@@ -76,7 +86,18 @@ jobs:
         continue-on-error: true
         env:
           TEST: ${{ inputs.test }}
-        run: bash -euo pipefail -c "$TEST" 2>&1 | tee test.txt; exit "${PIPESTATUS[0]}"
+          # Windows' temp is on C:, which a runner keeps nearly full; D: holds the work.
+          TMP: ${{ runner.temp }}
+          TEMP: ${{ runner.temp }}
+        # Into a file, not a pipe: a test's orphaned child (Windows has no process group to
+        # end) would hold a pipe open and the step with it.
+        timeout-minutes: 45
+        run: |
+          df -h . "$RUNNER_TEMP" > test.txt 2>&1
+          status=0
+          bash -euo pipefail -c "$TEST" >> test.txt 2>&1 || status=$?
+          grep -E '^ *(FAIL|TIMEOUT|LEAK|SIGSEGV|SIGABRT) |Summary \[' test.txt | sort -u || true
+          exit "$status"
 
       - name: Summary
         if: always()

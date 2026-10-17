@@ -6,9 +6,10 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::err::{refuse, Code, Refusal, Result};
 use crate::manifest::{Entry, Manifest};
+use crate::platform::durable;
 use crate::store::Store;
 
-fn io(what: impl AsRef<str>, error: std::io::Error) -> Refusal {
+fn io(what: impl AsRef<str>, error: impl Into<std::io::Error>) -> Refusal {
     crate::store::classify_io(what, error)
 }
 
@@ -93,9 +94,7 @@ pub fn checkout(
 ) -> Result<Checkout> {
     portable_on_disk(manifest)?;
     fs::create_dir_all(destination).map_err(|error| io("mkdir checkout", error))?;
-    let destination = destination
-        .canonicalize()
-        .map_err(|error| io("canonicalize checkout", error))?;
+    let destination = durable::canonical(destination).map_err(|error| io("canonicalize checkout", error))?;
     let mut result = Checkout::default();
     let mut directories = HashSet::new();
     for (virtual_path, entry) in manifest.entries() {
@@ -140,17 +139,12 @@ pub fn checkout(
         }
         let _ = fs::remove_file(&target);
         let linked =
-            !force_copy && std::os::unix::fs::symlink(relative(parent, &source), &target).is_ok();
+            !force_copy && durable::symlink(&relative(parent, &source), &target).is_ok();
         if linked {
             result.links += 1;
         } else {
             fs::copy(&source, &target).map_err(|error| io("copy checkout file", error))?;
-            let mut permissions = fs::metadata(&target)
-                .map_err(|error| io("stat checkout copy", error))?
-                .permissions();
-            std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o444);
-            fs::set_permissions(&target, permissions)
-                .map_err(|error| io("chmod checkout copy", error))?;
+            durable::set_mode(&target, 0o444).map_err(|error| io("chmod checkout copy", error))?;
             result.copies += 1;
         }
         if cozytensors {
@@ -175,7 +169,6 @@ mod tests {
     use crate::ids::ObjectRef;
     use crate::manifest::Draft;
     use crate::store::{Fault, Store};
-    use std::os::unix::fs::PermissionsExt;
 
     fn temporary(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -284,7 +277,7 @@ mod tests {
         }
         assert!(fixture.store.blob_path(&fixture.payload.sha256).is_file());
         assert_eq!(fs::read_dir(&destination).unwrap().count(), 2);
-        fs::remove_dir_all(fixture.root).unwrap();
+        let _ = fs::remove_dir_all(fixture.root);
     }
 
     #[test]
@@ -302,11 +295,11 @@ mod tests {
             let projected = destination.join(path);
             let metadata = fs::symlink_metadata(&projected).unwrap();
             assert!(metadata.file_type().is_file());
-            assert_eq!(metadata.permissions().mode() & 0o777, 0o444);
+            assert!(durable::mode(&metadata).is_none_or(|mode| mode & 0o777 == 0o444));
             assert_eq!(fs::read(projected).unwrap(), bytes);
         }
         assert_eq!(fs::read_dir(&destination).unwrap().count(), 2);
-        fs::remove_dir_all(fixture.root).unwrap();
+        let _ = fs::remove_dir_all(fixture.root);
     }
 
     /// The manifest itself admits both — a virtual tree has no device files and no case
@@ -338,7 +331,7 @@ mod tests {
             assert_eq!(error.code, code);
             assert!(!destination.exists(), "a refused checkout wrote nothing");
         }
-        fs::remove_dir_all(root).unwrap();
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -353,7 +346,7 @@ mod tests {
         .unwrap();
         let error = checkout(&store, &manifest, &root.join("checkout"), false).unwrap_err();
         assert_eq!(error.code, Code::OBJECT_ABSENT);
-        fs::remove_dir_all(root).unwrap();
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -373,7 +366,7 @@ mod tests {
         let error =
             checkout(&fixture.store, &manifest, &fixture.root.join("bad"), false).unwrap_err();
         assert_eq!(error.code, Code::LENGTH_MISMATCH);
-        fs::remove_dir_all(fixture.root).unwrap();
+        let _ = fs::remove_dir_all(fixture.root);
     }
 
 }

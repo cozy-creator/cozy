@@ -12,7 +12,7 @@
 //! Waits answer out of order. The channel's tickets end when its peer closes it.
 
 use std::collections::HashMap;
-use std::os::unix::net::UnixStream;
+use crate::platform::ipc::LocalStream;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::derived::channel::{array, num, obj, reference, text, uint, Channel, Frame};
@@ -34,7 +34,7 @@ pub struct Grant {
 }
 
 /// Serve `stream` until its peer closes it.
-pub fn serve(fetcher: &Fetcher, grant: Grant, stream: UnixStream) -> Result<()> {
+pub fn serve(fetcher: &Fetcher, grant: Grant, stream: LocalStream) -> Result<()> {
     let io = |e: std::io::Error| Refusal {
         code: Code::TRANSFER_FAILED,
         detail: format!("fetch channel: {e}"),

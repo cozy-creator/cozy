@@ -2,6 +2,7 @@
 //! budgets and eviction, the streaming cursor's slot reuse under a slow consumer, driver truth.
 //! Ignored by default; run one GPU operator at a time:
 //! `flock <locks>/gpu.lock cargo test -p tensorfs-plane --test gpu -- --ignored --test-threads 1`
+#![cfg(target_os = "linux")] // The host tier (memfd, seals, OFD locks) is Linux-only.
 
 mod common;
 

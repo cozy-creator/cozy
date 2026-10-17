@@ -218,7 +218,7 @@ fn trainer_fused_projection_and_converted_qkv_have_the_same_heads() {
         drop(writer);
         drop(catalog);
         drop(store);
-        fs::remove_dir_all(root).unwrap();
+        let _ = fs::remove_dir_all(root);
     }
 }
 
@@ -316,7 +316,7 @@ fn both_dialects_permute_only_b_rows_and_resume_without_new_bytes() {
         drop(writer);
         drop(catalog);
         drop(store);
-        fs::remove_dir_all(root).unwrap();
+        let _ = fs::remove_dir_all(root);
     }
 }
 
@@ -366,7 +366,7 @@ fn bad_pair_shape_unknown_tensor_and_unreviewed_geometry_refuse_before_payload()
         };
         assert_eq!(plan(&file).unwrap_err().code, want, "{kind}");
     }
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 struct Fixture {
@@ -525,7 +525,7 @@ fn real_headers_plan_by_grammar_and_multiple_versions_require_file_selection() {
     assert_eq!(error.code, Code::AMBIGUOUS_CLASSIFICATION);
     assert!(error.detail.contains(&heads[0].member));
     assert!(error.detail.contains(&heads[1].member));
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -619,7 +619,7 @@ fn grammar_takes_complete_subsets_and_refuses_half_pairs_mixed_ranks_unknown_and
             }
         }
     }
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 /// The path an upload takes on a pod: header preflight, landed body, then
@@ -682,7 +682,7 @@ fn attention_only_upload_converts_under_the_declared_profile() {
         );
     }
     drop(store);
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -741,7 +741,7 @@ fn attention_only_subset_converts_through_the_cli_source_plan() {
         .join("receipt.json");
     let receipt = String::from_utf8(fs::read(receipt).unwrap()).unwrap();
     assert!(receipt.contains("\"tensors\":12") && receipt.contains("\"golden_cases\":2"));
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -778,7 +778,8 @@ fn ambiguous_fused_exporter_needs_a_declared_layout_before_preflight_or_planning
         assert!(!root.join("preflight").exists());
         let path = root.join("unknown.safetensors");
         fs::write(&path, &bytes).unwrap();
-        fs::OpenOptions::new().write(true).open(&path).unwrap().set_len(length).unwrap();
+        let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        tensorfs_core::platform::durable::set_sparse_len(&file, length).unwrap();
         let carrier = source::CarrierInput { member: Some(head.member.clone()), path };
         assert_eq!(source::plan_source(source::BUILTIN_REGISTRY, source::BUILTIN_REGISTRY_BYTES, std::slice::from_ref(&carrier), None, None).unwrap_err().code, Code::AMBIGUOUS_CLASSIFICATION);
         // Intentional raw preservation remains available; it performs no guessed
@@ -789,7 +790,7 @@ fn ambiguous_fused_exporter_needs_a_declared_layout_before_preflight_or_planning
         let refusal = preflight::select_members(source::BUILTIN_REGISTRY, source::BUILTIN_REGISTRY_BYTES, &resolution, &[], |_| { reads.set(reads.get() + 1); Ok(vec![head.clone()]) }, &root.join("selection")).unwrap_err();
         assert_eq!(refusal.code, Code::AMBIGUOUS_CLASSIFICATION);
         assert_eq!(reads.get(), 1, "a single unknown carrier must be checked before payload transfer");
-        fs::remove_dir_all(root).unwrap();
+        let _ = fs::remove_dir_all(root);
     }
 }
 
@@ -893,5 +894,5 @@ fn full_cli_conversion_mints_a_receipt_after_the_live_golden_suite() {
         fs::read(store.join("tmp/ingest").join(session).join("receipt.json")).unwrap();
     assert!(String::from_utf8_lossy(&replay_receipt).contains("\"roles_resumed\":18"));
     assert!(String::from_utf8_lossy(&replay_receipt).contains("\"bytes_written\":0"));
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }

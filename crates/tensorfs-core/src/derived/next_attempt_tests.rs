@@ -67,7 +67,7 @@ fn next_attempt_survives_a_large_old_epoch_fence_and_restart_with_progress() {
             .code,
         Code::TRANSACTION_CLOSED
     );
-    std::fs::remove_dir_all(root).unwrap();
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
@@ -107,7 +107,7 @@ fn concurrent_next_attempts_allocate_distinct_durable_sessions() {
     let after = begin_next(&store, &meta, &id, tests::created_declaration(), None).unwrap();
     assert_eq!(after.writer_session_id, 5);
     release(&meta, after.begun);
-    std::fs::remove_dir_all(root).unwrap();
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
@@ -138,7 +138,7 @@ fn next_attempt_preserves_conflicting_declarations_and_terminal_states() {
             .code,
         Code::TRANSACTION_CLOSED
     );
-    std::fs::remove_dir_all(root).unwrap();
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
@@ -185,7 +185,7 @@ fn next_attempt_honors_retained_restore_fences_and_refuses_session_exhaustion() 
             .code,
         Code::TRANSACTION_CLOSED
     );
-    std::fs::remove_dir_all(root).unwrap();
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
@@ -221,7 +221,7 @@ fn closing_an_old_native_channel_cannot_fence_its_replacement() {
         .current_session
         .unwrap();
     assert_eq!(second_session, first_session + 1);
-    let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+    let (client, server) = crate::platform::ipc::pair().unwrap();
     drop(client); // The stale executor disconnects after its replacement was admitted.
     channel::serve_derived(
         &first,
@@ -243,5 +243,5 @@ fn closing_an_old_native_channel_cannot_fence_its_replacement() {
     );
     drop(second);
     drop(first);
-    std::fs::remove_dir_all(root).unwrap();
+    let _ = std::fs::remove_dir_all(root);
 }

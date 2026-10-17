@@ -1,5 +1,7 @@
 //! A read lease needs one descriptor per object. A low soft RLIMIT_NOFILE is raised toward
-//! the hard limit rather than refused; only a hard limit too small refuses.
+//! the hard limit rather than refused; only a hard limit too small refuses. Windows has no
+//! such limit.
+#![cfg(unix)]
 use std::path::PathBuf;
 
 use rustix::process::{getrlimit, setrlimit, Resource, Rlimit};

@@ -4,7 +4,7 @@
 //! its region's last claim ends. Adopters wait per region exactly as for a layout still filling
 //! (`HostMem::with_region`); none of them reads the store.
 
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsFd, OwnedFd};
 use std::sync::atomic::{fence, AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -24,10 +24,8 @@ pub struct OpenWindow {
 pub fn open_window(name: &str, layout: &Layout, slots: usize) -> Result<(OwnedFd, OpenWindow)> {
     let host = HostMem::create_window(name, layout, slots)?;
     let fd = host::reopen(host.raw_fd())?;
-    // SAFETY: a scalar fcntl on our own descriptor. Future-write leaves our mapping writable.
-    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_ADD_SEALS, host::SEALS) } != 0 {
-        return Err(Error::Io(format!("seal window: {}", std::io::Error::last_os_error())));
-    }
+    // Future-write leaves our mapping writable.
+    tensorfs_core::platform::shm::seal(fd.as_fd()).map_err(crate::os("seal window"))?;
     Ok((fd, OpenWindow { host }))
 }
 

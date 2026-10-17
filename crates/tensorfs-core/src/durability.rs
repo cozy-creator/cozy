@@ -751,7 +751,7 @@ mod tests {
             Code::COUNT_CAP
         );
         assert_eq!(read_document(&store, &object, bytes.len()).unwrap(), bytes);
-        std::fs::remove_dir_all(root).unwrap();
+        let _ = std::fs::remove_dir_all(root);
     }
 
     fn object(byte: &str, length: u64) -> ObjectRef {

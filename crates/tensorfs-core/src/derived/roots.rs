@@ -3,7 +3,7 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::unix::fs::FileExt;
+use crate::platform::durable::FileAt;
 use std::path::PathBuf;
 
 use crate::canon::{Fields, Value};
@@ -114,7 +114,7 @@ impl Plain for Root {
     }
 }
 
-fn io(error: std::io::Error) -> Refusal {
+fn io(error: impl Into<std::io::Error>) -> Refusal {
     crate::store::classify_io("private derived root", error)
 }
 fn directory(store: &Store) -> PathBuf {
@@ -260,9 +260,7 @@ fn sync_directories(store: &Store, parents: bool) -> Result<()> {
         store.root().to_path_buf(),
     ];
     for directory in if parents { &all[..] } else { &own[..] } {
-        File::open(directory)
-            .and_then(|file| file.sync_all())
-            .map_err(io)?;
+        crate::platform::durable::sync_dir(directory).map_err(io)?;
     }
     Ok(())
 }
@@ -411,9 +409,7 @@ pub(super) fn remove(store: &Store, transaction: &str) -> Result<()> {
     }
     match fs::remove_file(path(store, transaction)?) {
         Ok(()) if !durable(store) => Ok(()),
-        Ok(()) => File::open(directory(store))
-            .and_then(|file| file.sync_all())
-            .map_err(io),
+        Ok(()) => crate::platform::durable::sync_dir(&directory(store)).map_err(io),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(io(error)),
     }

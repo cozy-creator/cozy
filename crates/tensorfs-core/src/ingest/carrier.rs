@@ -25,7 +25,7 @@ use crate::err::{refuse, Code, Refusal, Result};
 use crate::jcs::{self, Json};
 use crate::limits;
 
-fn io(what: impl AsRef<str>, e: std::io::Error) -> Refusal {
+fn io(what: impl AsRef<str>, e: impl Into<std::io::Error>) -> Refusal {
     crate::store::classify_io(what, e)
 }
 

@@ -79,7 +79,7 @@ fn held_admission_rolls_back_both_catalog_facts_on_failure() {
     assert_eq!(catalog.held_keys().unwrap().len(), 1);
     drop(db);
     drop(_writer);
-    std::fs::remove_dir_all(store.root()).unwrap();
+    let _ = std::fs::remove_dir_all(store.root());
 }
 
 #[test]
@@ -111,5 +111,5 @@ fn public_whole_digest_and_segment_ids_remain_exact() {
             );
         }
     }
-    std::fs::remove_dir_all(store.root()).unwrap();
+    let _ = std::fs::remove_dir_all(store.root());
 }

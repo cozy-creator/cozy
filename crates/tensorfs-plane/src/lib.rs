@@ -8,6 +8,12 @@
 //! A plane applies caller-supplied budgets, regions and priorities for fills, prefetch,
 //! eviction and streaming. It does not measure free memory or reorder the caller's schedule.
 //! `tensorfs-core` supplies verified serialized bytes and metadata and stays CUDA-free.
+//!
+//! The plane is a Unix mechanism: weight sets cross processes as descriptors. Its host tier
+//! (sealed memfds claimed by OFD locks) is Linux-only and answers [`Error::Unsupported`]
+//! elsewhere; a Mac's host tier is the page cache of the store's objects. On Windows the crate
+//! is empty until its tier exists (xs-043 unit WM).
+#![cfg(unix)]
 
 pub mod cuda;
 pub mod cursor;
@@ -70,6 +76,20 @@ pub enum Error {
     /// What closed: a weight set, a cursor, a copy stream.
     #[error("closed: {0}")]
     Closed(String),
+    /// This OS has no such mechanism (the host tier off Linux).
+    #[error("unsupported: {0}")]
+    Unsupported(String),
+}
+
+/// An OS seam's failure, named by what was attempted.
+pub(crate) fn os(what: &'static str) -> impl FnOnce(tensorfs_core::platform::Error) -> Error {
+    move |error| {
+        if error.is_unsupported() {
+            Error::Unsupported(format!("{what}: {error}"))
+        } else {
+            Error::Io(format!("{what}: {}", std::io::Error::from(error)))
+        }
+    }
 }
 
 impl Error {
@@ -87,6 +107,7 @@ impl Error {
             Error::Io(_) => "IO",
             Error::Source(_) => "SOURCE",
             Error::Closed(_) => "CLOSED",
+            Error::Unsupported(_) => "UNSUPPORTED",
         }
     }
 }

@@ -40,7 +40,7 @@ use tensorfs_core::registry;
 use tensorfs_core::store::{Progress, Store};
 
 use crate::watch::{self, Verdict, PROGRESS_PREFIX};
-use crate::{bail, flag, flag_num, flag_on, rss_kb, Flags};
+use crate::{bail, flag, flag_num, flag_on, peak_rss_kb, Flags};
 
 // ------------------------------------------------------------------ shared plumbing
 
@@ -105,7 +105,7 @@ fn carriers(f: &Flags) -> Result<Vec<CarrierInput>, ExitCode> {
                 }
                 None => (None, value.as_str()),
             };
-            match fs::canonicalize(location) {
+            match tensorfs_core::platform::durable::canonical(location.as_ref()) {
                 Ok(path) => out.push(CarrierInput { member, path }),
                 Err(error) => {
                     eprintln!("REFUSED IO_FAILED: resolve carrier {location:?}: {error}");
@@ -145,7 +145,7 @@ pub(crate) fn registry_bytes(f: &Flags) -> Result<(String, Vec<u8>), ExitCode> {
             BUILTIN_REGISTRY_BYTES.to_vec(),
         ));
     };
-    let path = match fs::canonicalize(path) {
+    let path = match tensorfs_core::platform::durable::canonical(path.as_ref()) {
         Ok(path) => path,
         Err(error) => {
             eprintln!("REFUSED IO_FAILED: resolve source registry {path}: {error}");
@@ -894,7 +894,7 @@ pub fn cmd_plan(target: &str, f: &Flags) -> ExitCode {
     println!(
         "planned in {:.1} ms, peak RSS {:.1} MiB",
         t0.elapsed().as_secs_f64() * 1000.0,
-        rss_kb("VmHWM") as f64 / 1024.0
+        peak_rss_kb() as f64 / 1024.0
     );
     ExitCode::SUCCESS
 }
@@ -912,6 +912,12 @@ fn isolation(argv: &[String], f: &Flags) -> (Command, i64, String) {
     let me = std::env::current_exe()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "tfs".to_string());
+    // No shell rlimits off Unix: the worker is a separate process and no more.
+    if !cfg!(unix) {
+        let mut c = Command::new(&me);
+        c.args(argv);
+        return (c, 0, "separate process; no rlimits on this OS".into());
+    }
     let quoted: Vec<String> = argv
         .iter()
         .map(|a| format!("'{}'", a.replace('\'', "'\\''")))
@@ -1308,7 +1314,7 @@ pub fn cmd_worker(root: &Path, target: &str, f: &Flags) -> ExitCode {
     out.obs
         .push(("isolation_tier".to_string(), isolation_tier as i64));
     out.obs
-        .push(("peak_rss_kb".to_string(), rss_kb("VmHWM") as i64));
+        .push(("peak_rss_kb".to_string(), peak_rss_kb() as i64));
     out.obs
         .push(("elapsed_ms".to_string(), t0.elapsed().as_millis() as i64));
     out.obs.push((

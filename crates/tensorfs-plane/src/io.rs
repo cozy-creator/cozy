@@ -5,9 +5,8 @@
 //! Each mode's bytes are counted.
 
 use std::collections::{HashMap, VecDeque};
-use std::ffi::CString;
 use std::fs::File;
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 #[cfg(feature = "store")]
@@ -16,6 +15,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
 use tensorfs_core::ids::ObjectRef;
+use tensorfs_core::platform::durable;
 #[cfg(feature = "store")]
 use tensorfs_core::{meta::Meta, read::ReadLease, store::Store};
 
@@ -45,29 +45,17 @@ pub enum Mode {
 struct Fds {
     buffered: File,
     direct: Option<File>,
-    /// On overlayfs (a container's root): the file reports no page cache of its own.
-    overlay: bool,
 }
 
 impl Fds {
-    /// A buffered descriptor and, with `direct_io`, a second O_DIRECT description of the SAME
-    /// inode through /proc: no pathname is resolved again.
+    /// A buffered descriptor and, with `direct_io`, a second description of the SAME inode that
+    /// bypasses the page cache (`open_direct`): no pathname is resolved again.
     fn of(buffered: File, direct_io: bool, tally: &IoTally) -> Fds {
-        let direct = if direct_io {
-            let p = CString::new(format!("/proc/self/fd/{}", buffered.as_raw_fd())).unwrap();
-            // SAFETY: plain open of a magic link to our own descriptor.
-            let fd = unsafe { libc::open(p.as_ptr(), libc::O_RDONLY | libc::O_DIRECT | libc::O_CLOEXEC) };
-            if fd < 0 {
-                tally.direct_refused.fetch_add(1, Ordering::Relaxed);
-                None
-            } else {
-                // SAFETY: fresh descriptor from the kernel.
-                Some(unsafe { File::from_raw_fd(fd) })
-            }
-        } else {
-            None
-        };
-        Fds { overlay: overlay(&buffered), buffered, direct }
+        let direct = direct_io.then(|| durable::open_direct(&buffered).ok().flatten()).flatten();
+        if direct_io && direct.is_none() {
+            tally.direct_refused.fetch_add(1, Ordering::Relaxed);
+        }
+        Fds { buffered, direct }
     }
 }
 
@@ -91,64 +79,10 @@ pub struct Source {
     plane: usize,
 }
 
-/// Whether the page cache holds every page of `[off, off+len)`, from `cachestat(2)`: a pure
-/// query (unlike an `RWF_NOWAIT` read, which starts readahead on a miss). Where that cannot
-/// answer, the pages are counted through a mapping: a kernel without it (< 6.5), a container
-/// whose seccomp filter refuses it, and overlayfs (a container's root), whose files report no
-/// pages of their own.
+/// Whether the page cache holds every page of `[off, off+len)`; where the OS cannot say, it
+/// does not.
 fn cached(f: &Fds, off: u64, len: u64) -> bool {
-    #[repr(C)]
-    struct Range {
-        off: u64,
-        len: u64,
-    }
-    #[repr(C)]
-    #[derive(Default)]
-    struct Stat {
-        nr_cache: u64,
-        nr_dirty: u64,
-        nr_writeback: u64,
-        nr_evicted: u64,
-        nr_recently_evicted: u64,
-    }
-    const SYS_CACHESTAT: libc::c_long = 451;
-    let r = Range { off, len };
-    let mut st = Stat::default();
-    // SAFETY: the documented cachestat ABI; both structs outlive the call.
-    let rc = unsafe { libc::syscall(SYS_CACHESTAT, f.buffered.as_raw_fd(), &r, &mut st, 0) };
-    let page = 4096u64;
-    if rc == 0 && st.nr_cache >= (off + len).div_ceil(page) - off / page {
-        return true;
-    }
-    (rc != 0 || f.overlay) && resident(&f.buffered, off, len)
-}
-
-fn overlay(f: &File) -> bool {
-    const OVERLAYFS_SUPER_MAGIC: i64 = 0x794c7630;
-    // SAFETY: out-param of the right type on our own descriptor.
-    let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
-    #[allow(clippy::unnecessary_cast)] // f_type is not an i64 on every target
-    let magic = unsafe { libc::fstatfs(f.as_raw_fd(), &mut fs) == 0 }.then_some(fs.f_type as i64);
-    magic == Some(OVERLAYFS_SUPER_MAGIC)
-}
-
-/// Every page of `[off, off+len)` is in core, by `mincore(2)` over a mapping (never faults).
-fn resident(f: &File, off: u64, len: u64) -> bool {
-    let start = off - off % 4096;
-    let n = (off + len - start) as usize;
-    if n == 0 {
-        return true;
-    }
-    // SAFETY: a read-only shared mapping of our descriptor, unmapped below.
-    let p = unsafe { libc::mmap(std::ptr::null_mut(), n, libc::PROT_READ, libc::MAP_SHARED, f.as_raw_fd(), start as libc::off_t) };
-    if p == libc::MAP_FAILED {
-        return false;
-    }
-    let mut pages = vec![0u8; n.div_ceil(4096)];
-    // SAFETY: the vector holds one byte per page of the mapping.
-    let ok = unsafe { libc::mincore(p, n, pages.as_mut_ptr()) } == 0 && pages.iter().all(|b| b & 1 == 1);
-    unsafe { libc::munmap(p, n) };
-    ok
+    durable::cached(&f.buffered, off, len).unwrap_or(false)
 }
 
 fn pread_exact(f: &File, buf: &mut [u8], at: u64, what: &str) -> Result<()> {

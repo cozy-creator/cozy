@@ -11,7 +11,7 @@ use tensorfs_core::transport;
 use crate::errors::IntoPy;
 use crate::store::PyStore;
 
-/// Serve one fetch channel on `fd` (a connected Unix stream; ownership passes here) from
+/// Serve one fetch channel on `fd` (a connected `platform::ipc` stream; ownership passes here) from
 /// `store`'s fetcher until its peer closes it: what TensorD does for each attempt, for tests
 /// and tools. `origins` are the checkpoints the channel may fetch from:
 /// `{"hub", "ref", "lane", "manifest", "manifest_length", "credential"?, "allowed_hosts"?,
@@ -21,11 +21,10 @@ use crate::store::PyStore;
 pub fn serve_fetch(
     py: Python<'_>,
     store: &PyStore,
-    fd: i32,
+    fd: i64,
     origins: Vec<Bound<'_, PyDict>>,
     run: u64,
 ) -> PyResult<()> {
-    use std::os::fd::FromRawFd;
     use tensorfs_core::fetch::{self, Access, Origin, Plain};
     let mut granted: Vec<(Origin, std::sync::Arc<dyn Access>)> = vec![];
     for row in origins {
@@ -50,13 +49,13 @@ pub fn serve_fetch(
         granted.push((origin, std::sync::Arc::new(Plain { credential, policy })));
     }
     // SAFETY: the caller hands over a connected descriptor it no longer uses.
-    let stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
+    let stream = unsafe { tensorfs_core::platform::ipc::adopt(fd) };
     let fetcher = fetch::Fetcher::of(&store.store).or_refuse(py)?;
     let grant = fetch::Grant { run, origins: granted, stop: Default::default() };
     py.detach(|| fetch::serve(&fetcher, grant, stream)).or_refuse(py)
 }
 
-/// Serve one exact source's channel on `fd` (a connected Unix stream; ownership passes here)
+/// Serve one exact source's channel on `fd` (a connected `platform::ipc` stream; ownership passes here)
 /// until its peer closes it: the owner's half of `SourceCapability.from_fd`, for tests and
 /// tools. `check_current` is called before each operation; what it raises ends the channel and
 /// is raised here.
@@ -65,16 +64,15 @@ pub fn serve_fetch(
 pub fn serve_source(
     py: Python<'_>,
     store: &PyStore,
-    fd: i32,
+    fd: i64,
     manifest: &str,
     length: u64,
     check_current: Option<Py<PyAny>>,
 ) -> PyResult<()> {
-    use std::os::fd::FromRawFd;
     let sha256 = manifest.strip_prefix("sha256:").unwrap_or(manifest).to_string();
     let source = tensorfs_core::ids::ObjectRef { sha256, length };
     // SAFETY: the caller hands over a connected descriptor it no longer uses.
-    let stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
+    let stream = unsafe { tensorfs_core::platform::ipc::adopt(fd) };
     let raised: Mutex<Option<PyErr>> = Mutex::new(None);
     let check = || -> Result<(), Refusal> {
         let Some(check) = &check_current else { return Ok(()) };

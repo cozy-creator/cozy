@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Read;
-use std::os::unix::fs::MetadataExt;
+use crate::platform::durable::FileId;
 use std::path::{Path, PathBuf};
 
 use crate::canon::{self, Value};
@@ -387,7 +387,7 @@ pub fn bind_registry(store: &Store, bytes: Option<&[u8]>) -> Result<()> {
         crate::meta::now_nanos_unique()
     ));
     let written = fs::write(&temporary, bytes)
-        .and_then(|()| fs::File::open(&temporary)?.sync_all())
+        .and_then(|()| Ok(crate::platform::durable::sync_file(&temporary)?))
         .and_then(|()| fs::rename(&temporary, &path));
     if let Err(error) = written {
         let _ = fs::remove_file(&temporary);
@@ -1256,14 +1256,20 @@ pub struct SourceCheckpoint {
     pub head: durability::Head,
 }
 
+fn identity(path: &std::path::Path) -> Result<FileId> {
+    FileId::at(path).map_err(|error| crate::store::classify_io(format!("identify {}", path.display()), error))
+}
+
+fn modified(metadata: &fs::Metadata) -> Result<std::time::SystemTime> {
+    metadata.modified().map_err(|error| crate::store::classify_io("read a change time", error))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FileFence {
     path: PathBuf,
-    dev: u64,
-    ino: u64,
+    id: FileId,
     length: u64,
-    mtime_s: i64,
-    mtime_ns: i64,
+    modified: std::time::SystemTime,
 }
 
 impl FileFence {
@@ -1304,11 +1310,9 @@ impl FileFence {
         }
         Ok(Self {
             path: file.path.clone(),
-            dev: metadata.dev(),
-            ino: metadata.ino(),
+            id: identity(&file.path)?,
             length: metadata.len(),
-            mtime_s: metadata.mtime(),
-            mtime_ns: metadata.mtime_nsec(),
+            modified: modified(&metadata)?,
         })
     }
 
@@ -1316,11 +1320,9 @@ impl FileFence {
         let metadata = fs::symlink_metadata(&self.path).map_err(|error| crate::store::classify_io(format!("restat {}", self.path.display()), error))?;
         if metadata.file_type().is_symlink()
             || !metadata.is_file()
-            || metadata.dev() != self.dev
-            || metadata.ino() != self.ino
+            || identity(&self.path)? != self.id
             || metadata.len() != self.length
-            || metadata.mtime() != self.mtime_s
-            || metadata.mtime_nsec() != self.mtime_ns
+            || modified(&metadata)? != self.modified
         {
             return refuse(
                 Code::OBJECT_ID_MISMATCH,
@@ -2900,8 +2902,8 @@ mod tests {
         release_model_source(&store, &retry.operation_id).unwrap();
         crate::gc::collect(store.root(), false).unwrap();
         assert!(!store.contains(&part.sha256));
-        fs::remove_dir_all(root).unwrap();
-        fs::remove_dir_all(control_root).unwrap();
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(control_root);
     }
 
     #[test]
@@ -2929,7 +2931,7 @@ mod tests {
         assert_eq!(adopted.resumed_roles, 2);
         assert_eq!(adopted.sources, first.sources);
         assert_eq!(adopted.checkpoints[0], partial.checkpoints[0]);
-        fs::remove_dir_all(root).unwrap();
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2971,7 +2973,7 @@ mod tests {
             Code::ROOT_ABSENT
         );
         drop(_bridge);
-        fs::remove_dir_all(root).unwrap();
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2997,7 +2999,7 @@ mod tests {
                 .join("session.json")
                 .exists()
         );
-        fs::remove_dir_all(root).unwrap();
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -3043,7 +3045,7 @@ mod tests {
         assert!(source_checkpoints(&store, &original.operation_id)
             .unwrap()
             .is_empty());
-        fs::remove_dir_all(root).unwrap();
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -3117,7 +3119,7 @@ mod tests {
         }
         release_model_source(&store, &retry.operation_id).unwrap();
         crate::gc::collect(store.root(), false).unwrap();
-        fs::remove_dir_all(root).unwrap();
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -3163,7 +3165,7 @@ mod tests {
         assert_eq!(completed.resumed_roles, 1);
         assert_eq!(completed.checkpoints[0], adopted.checkpoints[0]);
         release_model_source(&store, &retry.operation_id).unwrap();
-        fs::remove_dir_all(root).unwrap();
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -3228,7 +3230,7 @@ mod tests {
                 .model_source_operations()
                 .unwrap()
                 .contains(&request.operation_id));
-            fs::remove_dir_all(root).unwrap();
+            let _ = fs::remove_dir_all(root);
         }
     }
 
@@ -3322,7 +3324,7 @@ mod tests {
         assert!(replay.replayed && replay.complete);
         assert_eq!(replay.converted_bytes, 0);
         release_model_source(&store, &request.operation_id).unwrap();
-        fs::remove_dir_all(root).unwrap();
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -3374,7 +3376,7 @@ mod tests {
         assert_eq!(completed.sources, expected.sources);
         release_model_source(&store, &request.operation_id).unwrap();
         release_model_source(&clean, &request.operation_id).unwrap();
-        fs::remove_dir_all(root).unwrap();
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -3428,7 +3430,7 @@ mod tests {
                 prepare_model_source_with_registry(&clean, &request, "fixture:registry", &registry)
                     .unwrap();
             assert_eq!(second.sources, expected.sources);
-            fs::remove_dir_all(root).unwrap();
+            let _ = fs::remove_dir_all(root);
         }
     }
 
@@ -3584,7 +3586,7 @@ mod tests {
                 .code,
             Code::ROOT_ABSENT
         );
-        fs::remove_dir_all(root).unwrap();
+        let _ = fs::remove_dir_all(root);
     }
 
     // The replacement-Runtime consumer needs a real native prepared source and head,
@@ -3802,7 +3804,7 @@ mod tests {
                 .unwrap()
                 .complete
         );
-        fs::remove_dir_all(root).unwrap();
+        let _ = fs::remove_dir_all(root);
     }
 
     /// A SHARDED model, prepared end to end out of a content-addressed staging area — the
@@ -4593,7 +4595,7 @@ mod tests {
 
     #[test]
     fn verified_file_fence_refuses_symlinks_and_same_length_replacement() {
-        use std::os::unix::fs::symlink;
+        use crate::platform::durable::symlink;
 
         let root = temporary("file-fence");
         fs::create_dir_all(&root).unwrap();

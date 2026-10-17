@@ -48,7 +48,7 @@ use crate::store::Store;
 use super::carrier::SourceHeader;
 use super::convert::{Bytes, Plan, Xform};
 
-fn io(what: impl AsRef<str>, error: std::io::Error) -> Refusal {
+fn io(what: impl AsRef<str>, error: impl Into<std::io::Error>) -> Refusal {
     crate::store::classify_io(what, error)
 }
 
@@ -293,7 +293,11 @@ impl Journal {
             .len()
             != good_bytes
         {
-            sink.set_len(good_bytes)
+            // Through a writing handle: Windows grants an appending one no truncation.
+            OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .and_then(|file| file.set_len(good_bytes))
                 .map_err(|error| io("truncate torn conversion journal", error))?;
         }
         Ok(Journal {
@@ -405,8 +409,7 @@ impl Journal {
             .map_err(|error| io("sync local checkpoint cursor", error))?;
         fs::rename(&temporary, &path)
             .map_err(|error| io("replace local checkpoint cursor", error))?;
-        File::open(path.parent().expect("journal has a parent"))
-            .and_then(|file| file.sync_all())
+        crate::platform::durable::sync_dir(path.parent().expect("journal has a parent"))
             .map_err(|error| io("sync local checkpoint cursor directory", error))
     }
 

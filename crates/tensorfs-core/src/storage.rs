@@ -15,7 +15,7 @@ use crate::ids::{hex64, Doc, ObjectRef};
 use crate::manifest::Manifest;
 use crate::repository::{Checkpoint, Release, Repository, RepositoryName};
 
-fn io(what: impl AsRef<str>, error: std::io::Error) -> Refusal {
+fn io(what: impl AsRef<str>, error: impl Into<std::io::Error>) -> Refusal {
     crate::store::classify_io(what, error)
 }
 
@@ -1212,6 +1212,12 @@ pub(crate) fn read_repositories(root: &Path) -> Result<Vec<(Repository, Vec<u8>)
     Ok(result)
 }
 
+/// The storage key a path under `root` spells, `/`-separated on every OS.
+fn key_of(root: &Path, path: &Path) -> Option<String> {
+    let parts: Option<Vec<&str>> = path.strip_prefix(root).ok()?.iter().map(|part| part.to_str()).collect();
+    Some(parts?.join("/"))
+}
+
 fn read_manifests(root: &Path) -> Result<BTreeMap<String, (Manifest, Vec<u8>)>> {
     let mut result = BTreeMap::new();
     let base = root.join("manifests");
@@ -1226,9 +1232,7 @@ fn read_manifests(root: &Path) -> Result<BTreeMap<String, (Manifest, Vec<u8>)>> 
                 }
                 let digest = path.file_stem().unwrap().to_string_lossy().to_string();
                 hex64("manifest filename", &digest)?;
-                if path.strip_prefix(root).ok().and_then(Path::to_str)
-                    != Some(&manifest_key(&digest)?)
-                {
+                if key_of(root, &path) != Some(manifest_key(&digest)?) {
                     return refuse(
                         Code::PATH_DIGEST_MISMATCH,
                         "manifest fanout path is not canonical",
@@ -1302,7 +1306,7 @@ fn inventory_from_tree(root: &Path) -> Result<BTreeMap<String, InventoryEntry>> 
                 }
                 let sha256 = path.file_name().unwrap().to_string_lossy().to_string();
                 let key = blob_key(&sha256)?;
-                if path.strip_prefix(root).ok().and_then(Path::to_str) != Some(&key) {
+                if key_of(root, &path).as_deref() != Some(key.as_str()) {
                     return refuse(
                         Code::PATH_DIGEST_MISMATCH,
                         "blob fanout path is not canonical",
@@ -1743,7 +1747,7 @@ mod tests {
                 actual.checkpoints[0].manifest
             );
             assert!(crate::cache_roots::matches(&store, &repo, &bytes).unwrap());
-            fs::remove_dir_all(root).unwrap();
+            let _ = fs::remove_dir_all(root);
         }
     }
 
@@ -1791,7 +1795,7 @@ mod tests {
                 .code,
             Code::REPOSITORY_CONFLICT
         );
-        fs::remove_dir_all(root).unwrap();
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1831,7 +1835,7 @@ mod tests {
             fs::read(store.repository_path(&repo)).unwrap(),
             b"not a repository"
         );
-        fs::remove_dir_all(root).unwrap();
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1892,7 +1896,7 @@ mod tests {
             Code::REPOSITORY_CONFLICT
         );
         assert_eq!(fs::read(store.repository_path(&repo)).unwrap(), edited);
-        fs::remove_dir_all(root).unwrap();
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1931,7 +1935,7 @@ mod tests {
         );
         assert_eq!(fs::read(store.repository_path(&repo)).unwrap(), edited);
         assert!(!crate::cache_roots::matches(&store, &repo, &edited).unwrap());
-        fs::remove_dir_all(root).unwrap();
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1950,7 +1954,7 @@ mod tests {
             .apply_cached_repository(None, &mutations, &Fault::default())
             .is_err());
         assert_eq!(fs::read(store.repository_path(&repo)).unwrap(), before);
-        fs::remove_dir_all(root).unwrap();
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

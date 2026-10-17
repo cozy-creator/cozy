@@ -537,30 +537,31 @@ impl Wire {
     }
 }
 
-#[cfg(not(target_vendor = "apple"))]
-fn nonblocking_socket(
-    family: rustix::net::AddressFamily,
-) -> rustix::io::Result<std::os::fd::OwnedFd> {
-    use rustix::net::{self, SocketFlags, SocketType};
-    net::socket_with(
+/// A non-blocking TCP socket. Linux takes the flags in socket(2); Darwin's takes none, and
+/// Windows' sockets are not inherited, so there they are set before the socket is used.
+fn nonblocking_socket(family: rustix::net::AddressFamily) -> rustix::io::Result<rustix::fd::OwnedFd> {
+    use rustix::net::{self, SocketType};
+    #[cfg(target_os = "linux")]
+    return net::socket_with(
         family,
         SocketType::STREAM,
-        SocketFlags::NONBLOCK | SocketFlags::CLOEXEC,
+        net::SocketFlags::NONBLOCK | net::SocketFlags::CLOEXEC,
         Some(net::ipproto::TCP),
-    )
-}
-
-/// Darwin's socket(2) takes no type flags; they are set before the fd is used.
-#[cfg(target_vendor = "apple")]
-fn nonblocking_socket(
-    family: rustix::net::AddressFamily,
-) -> rustix::io::Result<std::os::fd::OwnedFd> {
-    use rustix::io::{fcntl_setfd, ioctl_fionbio, FdFlags};
-    use rustix::net::{self, SocketType};
-    let socket = net::socket(family, SocketType::STREAM, Some(net::ipproto::TCP))?;
-    fcntl_setfd(&socket, FdFlags::CLOEXEC)?;
-    ioctl_fionbio(&socket, true)?;
-    Ok(socket)
+    );
+    #[cfg(not(target_os = "linux"))]
+    {
+        // Winsock serves no socket before WSAStartup; std's own sockets start it lazily.
+        #[cfg(windows)]
+        {
+            static STARTED: std::sync::OnceLock<rustix::io::Result<()>> = std::sync::OnceLock::new();
+            (*STARTED.get_or_init(|| net::wsa_startup().map(|_| ())))?;
+        }
+        let socket = net::socket(family, SocketType::STREAM, Some(net::ipproto::TCP))?;
+        #[cfg(unix)]
+        rustix::io::fcntl_setfd(&socket, rustix::io::FdFlags::CLOEXEC)?;
+        rustix::io::ioctl_fionbio(&socket, true)?;
+        Ok(socket)
+    }
 }
 
 /// One TCP connection to the first checked address that answers. Another address is
@@ -576,7 +577,7 @@ fn connect(
 ) -> Result<TcpStream> {
     use rustix::event::{poll, PollFd, PollFlags, Timespec};
     use rustix::net::{self, AddressFamily};
-    let connected = |socket: std::os::fd::OwnedFd| -> Result<TcpStream> {
+    let connected = |socket: rustix::fd::OwnedFd| -> Result<TcpStream> {
         let socket: TcpStream = socket.into();
         socket.set_nonblocking(false).map_err(|error| Refusal {
             code: fail,
@@ -595,7 +596,7 @@ fn connect(
         .take_while(|pair| pair.iter().any(Option::is_some))
         .flatten()
         .flatten();
-    let mut pending: Vec<(std::os::fd::OwnedFd, Instant)> = Vec::new();
+    let mut pending: Vec<(rustix::fd::OwnedFd, Instant)> = Vec::new();
     let mut last: Option<std::io::Error> = None;
     loop {
         ledger.check_running()?;
@@ -624,7 +625,10 @@ fn connect(
             };
             match net::connect(&socket, addr) {
                 Ok(()) => return connected(socket),
-                Err(rustix::io::Errno::INPROGRESS) => pending.push((socket, Instant::now())),
+                // Windows answers a connect in flight as would-block.
+                Err(errno) if errno == rustix::io::Errno::INPROGRESS || (cfg!(windows) && errno == rustix::io::Errno::WOULDBLOCK) => {
+                    pending.push((socket, Instant::now()))
+                }
                 Err(error) => last = Some(error.into()),
             }
             continue;
@@ -686,8 +690,9 @@ fn connect(
 /// silence and a peer that answers none of `STILL_SAMPLES` probes, a sample apart, is gone.
 /// A live hub that is merely slow ACKs every probe and is waited for; a dead host or a
 /// dropped tunnel fails the read as weather, which the caller asks again.
-pub(super) fn keepalive(socket: &impl std::os::fd::AsFd, ledger: &Ledger) {
+pub(super) fn keepalive(socket: &impl rustix::fd::AsFd, ledger: &Ledger) {
     use rustix::net::sockopt;
+    let socket = socket.as_fd();
     let second = Duration::from_secs(1);
     let _ = sockopt::set_socket_keepalive(socket, true);
     let _ = sockopt::set_tcp_keepidle(socket, ledger.floor().max(second));

@@ -1,4 +1,5 @@
 //! CPU artifact identity and shared-host admission; no GPU qualification.
+#![cfg(target_os = "linux")] // The host tier (memfd, seals, OFD locks) is Linux-only.
 use std::os::fd::AsRawFd;
 use tensorfs_core::{
     dtype::Dtype,

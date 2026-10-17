@@ -1577,7 +1577,7 @@ fn the_committed_corpus_is_what_the_builder_writes() {
             );
         }
     }
-    fs::remove_dir_all(built).unwrap();
+    let _ = fs::remove_dir_all(built);
 }
 
 /// Rewrites `vectors/cases` and `vectors/closure`; run explicitly after an intended change.

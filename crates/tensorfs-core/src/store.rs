@@ -20,13 +20,11 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::{fchown, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-
-use fs2::FileExt;
 
 use crate::err::{refuse, Code, Refusal, Result};
 use crate::ids::{hex64, Doc, ObjectRef};
+use crate::platform::durable::{self, FileId, Mode, Owner};
 use crate::sha256::{self, Sha256};
 
 /// An addition already held by a cache repository needs no mutation. Authored local
@@ -139,18 +137,6 @@ fn merge_cached_repository(
 
 pub(crate) const BUF: usize = 1 << 20;
 
-#[cfg(target_os = "linux")]
-pub(crate) const O_NOFOLLOW: i32 = 0o400_000;
-#[cfg(target_os = "macos")]
-pub(crate) const O_NOFOLLOW: i32 = 0x0100;
-
-/// ENOSPC on Linux and macOS alike; EDQUOT differs.
-const ENOSPC: i32 = 28;
-#[cfg(target_os = "linux")]
-const EDQUOT: i32 = 122;
-#[cfg(target_os = "macos")]
-const EDQUOT: i32 = 69;
-
 /// An I/O failure, classified.
 ///
 /// Out of space and denied access need an external change before retrying. The difference is the
@@ -158,7 +144,8 @@ const EDQUOT: i32 = 69;
 /// a bad sector or a revoked permission — so `pod-supervisor` classified it `Resumable` and
 /// the owner re-issued the fetch, which re-planned, re-asked, and failed at the same byte.
 /// On rented hardware, forever. Naming the condition is what lets a caller stop.
-pub(crate) fn classify_io(what: impl AsRef<str>, e: std::io::Error) -> Refusal {
+pub(crate) fn classify_io(what: impl AsRef<str>, e: impl Into<std::io::Error>) -> Refusal {
+    let e = e.into();
     // A full descriptor table is the process's shortage, not the Store's: every open in
     // the Store says so the same way, and a transfer treats it as backpressure.
     if crate::descriptors::exhausted(&e) {
@@ -167,7 +154,7 @@ pub(crate) fn classify_io(what: impl AsRef<str>, e: std::io::Error) -> Refusal {
             detail: format!("{}: no file descriptor ({e})", what.as_ref()),
         };
     }
-    if matches!(e.raw_os_error(), Some(ENOSPC) | Some(EDQUOT)) {
+    if durable::quota_or_space(&e) {
         return Refusal {
             code: Code::CAPACITY_EXHAUSTED,
             detail: format!("{}: the filesystem is full ({e})", what.as_ref()),
@@ -198,7 +185,7 @@ pub(crate) fn classify_sql(what: impl AsRef<str>, e: rusqlite::Error) -> Refusal
 }
 
 /// The short local spelling used by every call site in this module.
-fn io(what: impl AsRef<str>, e: std::io::Error) -> Refusal {
+fn io(what: impl AsRef<str>, e: impl Into<std::io::Error>) -> Refusal {
     classify_io(what, e)
 }
 
@@ -217,22 +204,27 @@ pub struct VRecord {
 }
 
 impl VRecord {
-    fn of(hex: &str, md: &fs::Metadata) -> VRecord {
+    fn of(hex: &str, md: &fs::Metadata, id: FileId) -> VRecord {
+        let mtime = md
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .unwrap_or_default();
         VRecord {
             sha256: hex.to_string(),
             length: md.len(),
-            dev: md.dev(),
-            ino: md.ino(),
-            mtime_s: md.mtime().max(0) as u64,
-            mtime_ns: md.mtime_nsec().max(0) as u64,
+            dev: id.dev,
+            ino: id.ino,
+            mtime_s: mtime.as_secs(),
+            mtime_ns: mtime.subsec_nanos() as u64,
         }
     }
     /// The first disagreeing bound fact, or None when the record still stands.
-    fn disagreement(&self, hex: &str, md: &fs::Metadata) -> Option<String> {
-        if self.dev != md.dev() {
-            return Some(format!("file device {} != {}", self.dev, md.dev()));
+    fn disagreement(&self, hex: &str, md: &fs::Metadata, id: FileId) -> Option<String> {
+        if self.dev != id.dev {
+            return Some(format!("file device {} != {}", self.dev, id.dev));
         }
-        let now = VRecord::of(hex, md);
+        let now = VRecord::of(hex, md, id);
         if self.sha256 != now.sha256 {
             return Some(format!("object id {} != {}", self.sha256, now.sha256));
         }
@@ -387,8 +379,7 @@ impl VerifiedFile {
     /// Positional read through the pinned descriptor — the fd, never the name. Shared-ref
     /// on purpose: `pread` moves no cursor, so concurrent readers need no lock.
     pub fn read_exact_at(&self, buf: &mut [u8], off: u64) -> std::io::Result<()> {
-        use std::os::unix::fs::FileExt;
-        self.file.read_exact_at(buf, off)
+        durable::FileAt::read_exact_at(&self.file, buf, off)
     }
 
     /// `fstat` on the pinned descriptor. A truncation of THIS inode is visible here; a
@@ -677,13 +668,11 @@ impl Store {
             std::process::id(),
             crate::meta::now_nanos_unique()
         ));
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .mode(0o644)
-            .custom_flags(O_NOFOLLOW)
-            .open(&temp)
-            .map_err(|error| io("open disk budget temp", error))?;
+        let mut file = durable::open_nofollow(
+            &temp,
+            OpenOptions::new().create_new(true).write(true).mode(0o644),
+        )
+        .map_err(|error| io("open disk budget temp", error))?;
         let written = file
             .write_all(&bytes)
             .and_then(|()| file.sync_all())
@@ -810,16 +799,17 @@ impl Store {
             );
         }
         let mut current = self.root.clone();
-        let mut parent = open_real_directory(&current)?;
-        let owner = parent
-            .metadata()
-            .map_err(|error| io("stat Store owner", error))?;
+        let owner = Owner::of(
+            &open_real_directory(&current)?
+                .metadata()
+                .map_err(|error| io("stat Store owner", error))?,
+        );
         for part in relative.components() {
             // The directory fd itself coordinates only mkdir/chown, never payload I/O.
             // This also prevents another writer from seeing a newly created directory
             // before its owner/mode are established. A crashed creator leaves a named,
             // explicitly refused owner mismatch rather than a blind repair permission.
-            FileExt::lock_exclusive(&parent)
+            let admission = crate::platform::lock::dir(&current)
                 .map_err(|error| io("lock Store directory admission", error))?;
             current.push(part.as_os_str());
             let created = match fs::create_dir(&current) {
@@ -832,22 +822,20 @@ impl Store {
                 .metadata()
                 .map_err(|error| io("stat Store directory", error))?;
             if created {
-                if metadata.uid() != owner.uid() || metadata.gid() != owner.gid() {
-                    fchown(&child, Some(owner.uid()), Some(owner.gid()))
+                if Owner::of(&metadata) != owner {
+                    owner
+                        .assign(&child)
                         .map_err(|error| io("assign public directory to Store owner", error))?;
                 }
-                child
-                    .set_permissions(fs::Permissions::from_mode(0o755))
+                durable::set_file_mode(&child, 0o755)
                     .map_err(|error| io("set public Store directory mode", error))?;
                 if self.flushes() {
-                    child
-                        .sync_all()
+                    durable::sync_dir(&current)
                         .map_err(|error| io("sync public Store directory", error))?;
-                    parent
-                        .sync_all()
+                    durable::sync_dir(current.parent().unwrap_or(&self.root))
                         .map_err(|error| io("sync public directory parent", error))?;
                 }
-            } else if metadata.uid() != owner.uid() || metadata.gid() != owner.gid() {
+            } else if Owner::of(&metadata) != owner {
                 return refuse(
                     Code::STORE_ERA,
                     format!(
@@ -856,9 +844,7 @@ impl Store {
                     ),
                 );
             }
-            FileExt::unlock(&parent)
-                .map_err(|error| io("unlock Store directory admission", error))?;
-            parent = child;
+            drop(admission);
         }
         Ok(())
     }
@@ -866,12 +852,13 @@ impl Store {
     /// A newly-created repository metadata inode follows the trusted Store owner.
     /// Never called on existing files, immutable payloads, or operation-private state.
     pub(crate) fn assign_new_metadata_owner(&self, file: &File) -> Result<()> {
-        let owner = fs::metadata(&self.root).map_err(|error| io("stat Store owner", error))?;
+        let owner = Owner::of(&fs::metadata(&self.root).map_err(|error| io("stat Store owner", error))?);
         let current = file
             .metadata()
             .map_err(|error| io("stat metadata owner", error))?;
-        if (current.uid(), current.gid()) != (owner.uid(), owner.gid()) {
-            fchown(file, Some(owner.uid()), Some(owner.gid()))
+        if Owner::of(&current) != owner {
+            owner
+                .assign(file)
                 .map_err(|error| io("assign metadata to Store owner", error))?;
         }
         Ok(())
@@ -906,10 +893,8 @@ impl Store {
 
     pub fn read_manifest(&self, reference: &ObjectRef) -> Result<crate::manifest::Manifest> {
         let path = self.manifest_path(&reference.sha256);
-        let file = OpenOptions::new()
-            .read(true)
-            .custom_flags(O_NOFOLLOW)
-            .open(&path)
+        let file = durable::open_nofollow(&path, OpenOptions::new().read(true))
+            .map_err(std::io::Error::from)
             .map_err(|error| {
                 if error.kind() == std::io::ErrorKind::NotFound {
                     Refusal {
@@ -982,10 +967,7 @@ impl Store {
             std::process::id(),
             crate::meta::now_nanos_unique()
         ));
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
+        let mut file = OpenOptions::new().write(true).create_new(true).mode(0o600)
             .open(&temporary)
             .map_err(|error| io("create manifest temp", error))?;
         file.write_all(&bytes)
@@ -994,8 +976,7 @@ impl Store {
             file.sync_all()
                 .map_err(|error| io("fsync manifest", error))?;
         }
-        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o444))
-            .map_err(|error| io("chmod manifest", error))?;
+        durable::set_mode(&temporary, 0o444).map_err(|error| io("chmod manifest", error))?;
         let admitted = match fs::hard_link(&temporary, &path) {
             Ok(()) => true,
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
@@ -1206,10 +1187,7 @@ impl Store {
                             std::process::id(),
                             crate::meta::now_nanos_unique()
                         ));
-                        let mut file = OpenOptions::new()
-                            .write(true)
-                            .create_new(true)
-                            .mode(0o600)
+                        let mut file = OpenOptions::new().write(true).create_new(true).mode(0o600)
                             .open(&temporary)
                             .map_err(|error| io("create repository temp", error))?;
                         if let Err(error) = file.write_all(&bytes) {
@@ -1289,18 +1267,17 @@ impl Store {
                 std::process::id(),
                 crate::meta::now_nanos_unique()
             ));
-            let f = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
+            let f = OpenOptions::new().write(true).create_new(true).mode(0o600)
                 .open(&tmp)
                 .map_err(|e| io(format!("create temp {}", tmp.display()), e))?;
-            match f.try_lock_exclusive() {
-                Ok(()) => break (tmp, f),
+            match crate::platform::lock::try_claim(&f) {
+                // A reaper that saw the temp before the lock landed may have unlinked it
+                // already: the name must still be this descriptor's.
+                Ok(true) if FileId::at(&tmp).ok() == FileId::of(&f).ok() => break (tmp, f),
                 // Only a reaper can hold the lock on a name this process just minted: it
                 // saw the temp before the lock landed, and it unlinks what it locks. Mint
                 // another.
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Ok(_) => continue,
                 Err(e) => return cleanup(&tmp, io("lock temp", e)),
             }
         };
@@ -1458,7 +1435,7 @@ impl Store {
         fault: &Fault,
     ) -> Result<Option<PathBuf>> {
         let tmp = &verified.tmp;
-        if let Err(e) = fs::set_permissions(tmp, fs::Permissions::from_mode(0o444)) {
+        if let Err(e) = durable::set_mode(tmp, 0o444) {
             return cleanup(tmp, io("chmod 0444", e));
         }
         fault.hit("chmod");
@@ -1494,10 +1471,8 @@ impl Store {
         if !admitted {
             return Ok(None);
         }
-        Ok(Some(VRecord::of(
-            &verified.sha256,
-            &stat(&self.object_path(&verified.sha256))?,
-        )))
+        let path = self.object_path(&verified.sha256);
+        Ok(Some(VRecord::of(&verified.sha256, &stat(&path)?, file_id(&path)?)))
     }
 
     pub fn put_file(&self, src: &Path, expect: Option<&ObjectRef>, fault: &Fault) -> Result<Put> {
@@ -1524,14 +1499,15 @@ impl Store {
     /// The one question the read and resume paths ask: may these bytes be trusted without
     /// hashing them again?
     pub fn record_valid(&self, hex: &str) -> std::result::Result<VRecord, String> {
-        let md = match stat(&self.object_path(hex)) {
-            Ok(md) => md,
+        let path = self.object_path(hex);
+        let (md, id) = match stat(&path).and_then(|md| Ok((md, file_id(&path)?))) {
+            Ok(facts) => facts,
             Err(e) => return Err(e.detail),
         };
         let rec = self
             .record(hex)
             .ok_or_else(|| "no verification record".to_string())?;
-        match rec.disagreement(hex, &md) {
+        match rec.disagreement(hex, &md, id) {
             Some(why) => Err(why),
             None => Ok(rec),
         }
@@ -1543,10 +1519,8 @@ impl Store {
     /// anything that is not a regular file.
     pub fn open_nofollow(&self, hex: &str) -> Result<File> {
         let p = self.object_path(hex);
-        let f = OpenOptions::new()
-            .read(true)
-            .custom_flags(O_NOFOLLOW)
-            .open(&p)
+        let f = durable::open_nofollow(&p, OpenOptions::new().read(true))
+            .map_err(std::io::Error::from)
             .map_err(|e| {
                 if e.kind() == std::io::ErrorKind::NotFound {
                     Refusal {
@@ -1669,9 +1643,10 @@ impl Store {
     fn verify_pinned(&self, hex: &str) -> Result<(Verdict, Option<File>)> {
         let mut f = self.open_nofollow(hex)?;
         let md = f.metadata().map_err(|e| io("fstat object", e))?;
+        let id = FileId::of(&f).map_err(|e| io("identify object", e))?;
         let why = match self.record(hex) {
             None => "no verification record".to_string(),
-            Some(rec) => match rec.disagreement(hex, &md) {
+            Some(rec) => match rec.disagreement(hex, &md, id) {
                 None => return Ok((Verdict::Verified { rehashed: false }, Some(f))),
                 Some(why) => why,
             },
@@ -1689,7 +1664,7 @@ impl Store {
             ));
         }
         let md = f.metadata().map_err(|e| io("fstat object", e))?;
-        self.write_record(&VRecord::of(hex, &md))?;
+        self.write_record(&VRecord::of(hex, &md, id))?;
         Ok((Verdict::Invalidated { why }, Some(f)))
     }
 
@@ -1773,7 +1748,7 @@ impl Store {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(e) => return Err(io(format!("open temp {}", p.display()), e)),
             };
-            if f.try_lock_exclusive().is_err() {
+            if !crate::platform::lock::try_claim(&f).unwrap_or(false) {
                 kept += 1;
                 continue;
             }
@@ -1854,11 +1829,7 @@ const DISK_BUDGET_MAX: u64 = 32;
 /// that will not open is an availability failure and a policy record may not cause one. A
 /// number that is not a number refuses at BIND time, where it is a caller's mistake.
 fn read_disk_budget(root: &Path) -> Option<u64> {
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(O_NOFOLLOW)
-        .open(root.join(DISK_BUDGET))
-        .ok()?;
+    let file = durable::open_nofollow(&root.join(DISK_BUDGET), OpenOptions::new().read(true)).ok()?;
     if !file.metadata().ok()?.is_file() {
         return None;
     }
@@ -1869,16 +1840,10 @@ fn read_disk_budget(root: &Path) -> Option<u64> {
 
 /// Serializes Store creation on one root across threads and processes. A lock on the root
 /// directory itself leaves nothing behind in it.
-fn creation_lock(root: &Path) -> Result<File> {
-    let directory = OpenOptions::new()
-        .read(true)
-        .custom_flags(O_NOFOLLOW)
-        .open(root)
+fn creation_lock(root: &Path) -> Result<crate::platform::lock::DirLock> {
+    durable::open_nofollow(root, OpenOptions::new().read(true))
         .map_err(|error| io(format!("open Store root {}", root.display()), error))?;
-    directory
-        .lock_exclusive()
-        .map_err(|error| io(format!("lock Store root {}", root.display()), error))?;
-    Ok(directory)
+    crate::platform::lock::dir(root).map_err(|error| io(format!("lock Store root {}", root.display()), error))
 }
 
 /// No handle is returned while an unclean shutdown's unsynced admissions are unverified.
@@ -1898,10 +1863,7 @@ fn open_validated(root: &Path) -> Result<Store> {
 }
 
 fn open_real_directory(path: &Path) -> Result<File> {
-    let directory = OpenOptions::new()
-        .read(true)
-        .custom_flags(O_NOFOLLOW)
-        .open(path)
+    let directory = durable::open_nofollow(path, OpenOptions::new().read(true))
         .map_err(|error| io(format!("open directory {}", path.display()), error))?;
     if !directory
         .metadata()
@@ -1919,7 +1881,7 @@ fn open_real_directory(path: &Path) -> Result<File> {
 // ---------------------------------------------------------------- helpers
 
 fn cleanup<T>(tmp: &Path, e: Refusal) -> Result<T> {
-    let _ = fs::set_permissions(tmp, fs::Permissions::from_mode(0o600));
+    let _ = durable::set_mode(tmp, 0o600);
     let _ = fs::remove_file(tmp);
     Err(e)
 }
@@ -1978,9 +1940,11 @@ fn read_dir(p: &Path) -> Result<Vec<PathBuf>> {
 }
 
 pub(crate) fn fsync_dir(dir: &Path) -> Result<()> {
-    File::open(dir)
-        .and_then(|d| d.sync_all())
-        .map_err(|e| io(format!("fsync dir {}", dir.display()), e))
+    durable::sync_dir(dir).map_err(|e| io(format!("fsync dir {}", dir.display()), e))
+}
+
+fn file_id(path: &Path) -> Result<FileId> {
+    FileId::at(path).map_err(|e| io(format!("identify {}", path.display()), e))
 }
 
 /// Make an entry just renamed into `dir` durable. The ancestors up to the store `root` hold
@@ -1990,10 +1954,9 @@ pub(crate) fn fsync_dir(dir: &Path) -> Result<()> {
 pub(crate) fn fsync_entry_dir(root: &Path, dir: &Path) -> Result<()> {
     use std::collections::HashSet;
     use std::sync::{Mutex, OnceLock};
-    static SYNCED: OnceLock<Mutex<HashSet<(u64, u64)>>> = OnceLock::new();
+    static SYNCED: OnceLock<Mutex<HashSet<FileId>>> = OnceLock::new();
     fsync_dir(dir)?;
-    let meta = fs::metadata(dir).map_err(|e| io(format!("stat {}", dir.display()), e))?;
-    let identity = (meta.dev(), meta.ino());
+    let identity = file_id(dir)?;
     let synced = SYNCED.get_or_init(Default::default);
     if synced.lock().is_ok_and(|set| set.contains(&identity)) {
         return Ok(());

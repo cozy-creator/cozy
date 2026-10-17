@@ -3,7 +3,7 @@
 
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::fs::symlink;
+use tensorfs_core::platform::durable::symlink;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
@@ -142,7 +142,7 @@ fn the_existing_daemon_lock_and_library_claim_exclude_each_other() {
         .truncate(false)
         .open(root.join("owner.lock"))
         .unwrap();
-    fs2::FileExt::try_lock_exclusive(&legacy).unwrap();
+    legacy.try_lock().unwrap();
     assert_eq!(
         Store::ensure_owned(&root).unwrap_err().code,
         Code::STORE_BUSY
@@ -150,14 +150,12 @@ fn the_existing_daemon_lock_and_library_claim_exclude_each_other() {
     drop(legacy);
     let owner = Store::ensure_owned(&root).unwrap();
     let another = fs::File::open(root.join("owner.lock")).unwrap();
-    assert_eq!(
-        fs2::FileExt::try_lock_exclusive(&another)
-            .unwrap_err()
-            .kind(),
-        std::io::ErrorKind::WouldBlock
-    );
+    assert!(matches!(
+        another.try_lock(),
+        Err(std::fs::TryLockError::WouldBlock)
+    ));
     drop(owner);
-    fs2::FileExt::try_lock_exclusive(&another).unwrap();
+    another.try_lock().unwrap();
 }
 
 #[test]
@@ -213,7 +211,7 @@ fn another_process_and_path_alias_cannot_claim_until_owner_death() {
     let scratch = Scratch::new();
     let root = scratch.store();
     let first = Process::start(&root, "owned");
-    symlink(&scratch.0, scratch.0.join("alias")).unwrap();
+    symlink(&scratch.0, &scratch.0.join("alias")).unwrap();
     let alias = scratch.0.join("alias/store");
     assert_eq!(
         Store::ensure_owned(&alias).unwrap_err().code,
@@ -296,7 +294,7 @@ fn contention_refuses_before_inspecting_or_recovering_the_catalog() {
     );
     // Failed open relinquishes its claim as well.
     let lock = fs::File::open(root.join("owner.lock")).unwrap();
-    fs2::FileExt::try_lock_exclusive(&lock).unwrap();
+    lock.try_lock().unwrap();
 }
 
 #[test]
@@ -317,7 +315,7 @@ fn ownership_does_not_initialize_foreign_or_partial_roots() {
         Code::STORE_ERA
     );
     assert!(!partial.join("owner.lock").exists());
-    symlink(&foreign, scratch.store()).unwrap();
+    symlink(&foreign, &scratch.store()).unwrap();
     assert_eq!(
         Store::ensure_owned(&scratch.store()).unwrap_err().code,
         Code::STORE_ERA
@@ -331,18 +329,21 @@ fn an_owner_lock_symlink_or_nonregular_file_is_refused() {
     drop(Store::ensure(&root).unwrap());
     let other = scratch.0.join("other");
     fs::write(&other, b"leave intact").unwrap();
-    symlink(&other, root.join("owner.lock")).unwrap();
+    symlink(&other, &root.join("owner.lock")).unwrap();
     assert_eq!(
         Store::ensure_owned(&root).unwrap_err().code,
         Code::IO_FAILED
     );
     assert_eq!(fs::read(&other).unwrap(), b"leave intact");
     fs::remove_file(root.join("owner.lock")).unwrap();
-    let fifo =
-        std::ffi::CString::new(root.join("owner.lock").as_os_str().as_encoded_bytes()).unwrap();
-    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
-    assert_eq!(
-        Store::ensure_owned(&root).unwrap_err().code,
-        Code::NOT_REGULAR_FILE
-    );
+    #[cfg(unix)] // A FIFO is Unix's.
+    {
+        let fifo = std::ffi::CString::new(root.join("owner.lock").as_os_str().as_encoded_bytes())
+            .unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert_eq!(
+            Store::ensure_owned(&root).unwrap_err().code,
+            Code::NOT_REGULAR_FILE
+        );
+    }
 }

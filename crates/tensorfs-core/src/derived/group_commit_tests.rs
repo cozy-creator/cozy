@@ -109,6 +109,6 @@ fn a_power_loss_after_a_checkpoint_resumes_from_it_to_the_same_manifest() {
     release_guards(&meta, Some(writer.writer_hold), writer.source_leases);
     assert_eq!(resumed.manifest, expected.manifest);
     assert!(markers(&root).is_empty());
-    std::fs::remove_dir_all(clean.root()).unwrap();
-    std::fs::remove_dir_all(&root).unwrap();
+    let _ = std::fs::remove_dir_all(clean.root());
+    let _ = std::fs::remove_dir_all(&root);
 }

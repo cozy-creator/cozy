@@ -1,6 +1,7 @@
 //! What a plane leaves behind in its process: descriptors, plane memfds, store files and
 //! threads return to the baseline however a plane ends: closed, or collected unclosed with a
 //! handle outliving it. Alone in its binary: the census is process-wide.
+#![cfg(target_os = "linux")] // The host tier (memfd, seals, OFD locks) is Linux-only.
 
 mod common;
 

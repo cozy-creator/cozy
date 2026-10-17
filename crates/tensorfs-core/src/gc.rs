@@ -36,7 +36,7 @@ use crate::repository::{Repository, RepositoryName};
 use crate::storage::{self, Census, GcDelete, HeldKey};
 use crate::store::Store;
 
-fn io(what: impl AsRef<str>, error: std::io::Error) -> Refusal {
+fn io(what: impl AsRef<str>, error: impl Into<std::io::Error>) -> Refusal {
     crate::store::classify_io(what, error)
 }
 
@@ -582,7 +582,7 @@ mod tests {
         lease.release(&meta).unwrap();
         collect(&root, false).unwrap();
         assert!(!present(&leased));
-        fs::remove_dir_all(root).unwrap();
+        let _ = fs::remove_dir_all(root);
     }
 
     /// A concurrent ingest that creates and releases its own session root (run 6801 failed
@@ -621,7 +621,7 @@ mod tests {
                 for _ in 0..300 {
                     tx::ensure_session_root(&root, "churn", "_tensorfs").unwrap();
                     tx::name_candidates(&root, "churn", std::slice::from_ref(&held)).unwrap();
-                    fs::remove_dir_all(tx::candidate_dir(&root, "churn")).unwrap();
+                    let _ = fs::remove_dir_all(tx::candidate_dir(&root, "churn"));
                 }
             }
         });
@@ -629,6 +629,6 @@ mod tests {
             holds(&store);
         }
         churn.join().unwrap();
-        fs::remove_dir_all(root).unwrap();
+        let _ = fs::remove_dir_all(root);
     }
 }

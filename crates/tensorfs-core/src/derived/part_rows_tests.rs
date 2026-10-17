@@ -123,7 +123,7 @@ fn parts_are_rows_that_resume_refuse_conflicts_and_stay_retained() {
     assert_eq!(stored_rows(&store, &id).1, None);
     fence(&meta, &id, 2).unwrap();
     release_guards(&meta, Some(resumed.writer_hold), resumed.source_leases);
-    std::fs::remove_dir_all(store.root()).unwrap();
+    let _ = std::fs::remove_dir_all(store.root());
 }
 
 #[test]
@@ -167,7 +167,7 @@ fn an_older_builds_inline_row_and_a_torn_journal_line_are_read() {
     assert!(store.contains(&ObjectRef::of(&[2u8; 512]).sha256));
     abandon(&store, &meta, &id).unwrap();
     assert!(!journal.exists());
-    std::fs::remove_dir_all(store.root()).unwrap();
+    let _ = std::fs::remove_dir_all(store.root());
 }
 
 #[test]
@@ -268,11 +268,11 @@ fn indexed_checkpoints_write_the_chain_full_checkpoints_write() {
     assert_eq!(completed(&meta, &id, 2).unwrap().0.len(), COUNT);
     fence(&meta, &id, 2).unwrap();
     release_guards(&meta, Some(resumed.writer_hold), resumed.source_leases);
-    std::fs::remove_dir_all(store.root()).unwrap();
+    let _ = std::fs::remove_dir_all(store.root());
     for (store, meta, id, _, writer) in stores {
         fence(&meta, &id, 1).unwrap();
         release_guards(&meta, Some(writer.writer_hold), writer.source_leases);
-        std::fs::remove_dir_all(store.root()).unwrap();
+        let _ = std::fs::remove_dir_all(store.root());
     }
 }
 
@@ -322,7 +322,7 @@ fn an_indexed_checkpoint_does_not_reread_its_chain() {
     assert_eq!(cursor.as_ref().unwrap().parts, 3);
     fence(&meta, &id, 1).unwrap();
     release_guards(&meta, Some(writer.writer_hold), writer.source_leases);
-    std::fs::remove_dir_all(store.root()).unwrap();
+    let _ = std::fs::remove_dir_all(store.root());
 }
 
 #[test]
@@ -352,5 +352,5 @@ fn a_digest_receipt_names_the_declaration_the_intent_bound() {
     );
     let _ = fence(&meta, &id, 1);
     release_guards(&meta, Some(writer.writer_hold), writer.source_leases);
-    std::fs::remove_dir_all(store.root()).unwrap();
+    let _ = std::fs::remove_dir_all(store.root());
 }

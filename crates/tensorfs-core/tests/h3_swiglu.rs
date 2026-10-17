@@ -177,7 +177,7 @@ fn fused_gate_value_rows_convert_and_resume_for_both_dits_and_refiners() {
         drop(_writer);
         drop(catalog);
         drop(store);
-        fs::remove_dir_all(root).unwrap();
+        let _ = fs::remove_dir_all(root);
     }
 }
 
@@ -191,7 +191,7 @@ fn fused_mlp_refuses_odd_rows_or_missing_companions() {
         let root = root();
         let source = carrier_file(&root, "blocks.0", rows, first, second, bias);
         assert_eq!(plan(&source, "ref2va_dit").unwrap_err().code, code);
-        fs::remove_dir_all(root).unwrap();
+        let _ = fs::remove_dir_all(root);
     }
     assert!(
         convert::converter("h3.native/1").is_err(),
@@ -236,5 +236,5 @@ fn old_identity_journal_cannot_satisfy_swapped_plan() {
     assert!(matches!(failure, Err(ref e) if e.code == Code::TRANSACTION_CONFLICT));
     drop(catalog);
     drop(store);
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }

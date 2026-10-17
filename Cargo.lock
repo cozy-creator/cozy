@@ -133,16 +133,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d45db016d36b838f563236e9193d0ee6ce38f3f68b6c94e914b4929c96bbb890"
 
 [[package]]
-name = "fs2"
-version = "0.4.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9564fc758e15025b46aa6643b1b77d047d1a56a1aea6e01002ac0c7026876213"
-dependencies = [
- "libc",
- "winapi",
-]
-
-[[package]]
 name = "fuser"
 version = "0.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -799,7 +789,6 @@ version = "0.10.0"
 dependencies = [
  "base64",
  "bytes",
- "fs2",
  "fuser",
  "futures",
  "http-body-util",
@@ -817,9 +806,11 @@ dependencies = [
  "serde_json",
  "serde_json_canonicalizer",
  "sha2",
+ "thiserror",
  "tokio",
  "tokio-rustls",
  "webpki-roots 0.26.11",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

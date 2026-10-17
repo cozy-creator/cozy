@@ -68,19 +68,18 @@ pub struct Disk {
 
 impl Disk {
     pub fn measure(root: &Path) -> Result<Disk> {
-        let stat = rustix::fs::statvfs(root).map_err(|e| Refusal {
+        let space = crate::platform::durable::space(root).map_err(|e| Refusal {
             code: Code::CAPACITY_EXHAUSTED,
             detail: format!(
                 "cannot measure the filesystem under {}: {e}; admission fails closed",
                 root.display()
             ),
         })?;
-        let unit = stat.f_frsize.max(1);
         Ok(Disk {
-            capacity: stat.f_blocks.saturating_mul(unit),
-            available: stat.f_bavail.saturating_mul(unit),
-            inodes: stat.f_files,
-            available_inodes: stat.f_favail,
+            capacity: space.total,
+            available: space.free,
+            inodes: space.inodes,
+            available_inodes: space.free_inodes,
         })
     }
 

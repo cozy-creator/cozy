@@ -3,14 +3,12 @@
 
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
-
-use fs2::FileExt;
 use rusqlite::{params, Connection};
 
 use crate::err::{refuse, Code, Refusal, Result};
+use crate::platform::durable::FileId;
 
 mod lock;
 
@@ -54,7 +52,7 @@ fn sql(what: impl AsRef<str>, error: rusqlite::Error) -> Refusal {
     crate::store::classify_sql(what, error)
 }
 
-fn io(what: impl AsRef<str>, error: std::io::Error) -> Refusal {
+fn io(what: impl AsRef<str>, error: impl Into<std::io::Error>) -> Refusal {
     crate::store::classify_io(what, error)
 }
 
@@ -118,9 +116,7 @@ pub(crate) fn connect(path: &Path) -> Result<Connection> {
         // SQLite reports a full descriptor table only as "unable to open"; the table
         // itself answers whether that is what happened.
         if crate::descriptors::available().is_some_and(|free| free == 0) {
-            crate::descriptors::exhausted(&std::io::Error::from_raw_os_error(
-                rustix::io::Errno::MFILE.raw_os_error(),
-            ));
+            crate::descriptors::exhaustion();
             return Refusal {
                 code: Code::FD_HEADROOM,
                 detail: format!("open catalog: no file descriptor ({error})"),
@@ -156,16 +152,16 @@ pub(crate) fn configure(connection: &Connection, path: &Path) -> Result<()> {
         .map_err(|error| sql("configure catalog", error))
 }
 
-pub(crate) type Judged = OnceLock<Mutex<std::collections::HashSet<(u64, u64, std::time::SystemTime)>>>;
+pub(crate) type Judged = OnceLock<Mutex<std::collections::HashSet<(FileId, std::time::SystemTime)>>>;
 
 /// Run `judge` once per process per catalog file: device, inode and birth time, so a rebuilt
 /// catalog is judged again even on a reused inode. Without a birth time it is judged every
 /// time; an absent catalog is judged, and refused, every time.
 pub(crate) fn once_per_file(judged: &'static Judged, path: &Path, judge: impl FnOnce() -> Result<()>) -> Result<()> {
     let judged = judged.get_or_init(Default::default);
-    let identity = fs::metadata(path)
+    let identity = FileId::at(path)
         .ok()
-        .and_then(|metadata| Some((metadata.dev(), metadata.ino(), metadata.created().ok()?)));
+        .and_then(|id| Some((id, fs::metadata(path).ok()?.created().ok()?)));
     if identity.is_some_and(|identity| judged.lock().unwrap_or_else(|error| error.into_inner()).contains(&identity)) {
         return Ok(());
     }
@@ -219,7 +215,7 @@ pub(crate) struct Trust {
 }
 
 struct Kept {
-    identity: (u64, u64),
+    identity: FileId,
     connection: Connection,
 }
 
@@ -315,9 +311,7 @@ impl Trust {
     /// Keep a validated connection to the current catalog file, loading every row when it is
     /// newly opened. Returns whether it was (re)opened.
     fn load(&self, kept: &mut Option<Kept>) -> Result<bool> {
-        let identity = fs::symlink_metadata(&self.path)
-            .map(|metadata| (metadata.dev(), metadata.ino()))
-            .ok();
+        let identity = FileId::at(&self.path).ok();
         if kept
             .as_ref()
             .is_some_and(|open| Some(open.identity) == identity)
@@ -1430,7 +1424,7 @@ fn marker_is_live(path: &Path) -> Result<bool> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(io("open operation marker", error)),
     };
-    Ok(marker.try_lock_exclusive().is_err())
+    Ok(marker.try_lock().is_err())
 }
 
 /// Process-liveness marker used while the database may be absent. The retained advisory
@@ -1481,7 +1475,7 @@ impl WriterGuard {
             .write(true)
             .open(directory.join("recovery.lock"))
             .map_err(|error| io("open recovery lock", error))?;
-        FileExt::lock_shared(&recovery).map_err(|error| io("share recovery lock", error))?;
+        recovery.lock_shared().map_err(|error| io("share recovery lock", error))?;
         let path = directory.join(format!(
             "{}-{}.writer",
             std::process::id(),
@@ -1493,7 +1487,7 @@ impl WriterGuard {
             .write(true)
             .open(&path)
             .map_err(|error| io("create writer marker", error))?;
-        file.try_lock_exclusive()
+        file.try_lock()
             .map_err(|error| io("lock writer marker", error))?;
         Ok(Self {
             path,
@@ -1514,7 +1508,7 @@ impl WriterGuard {
             .write(true)
             .open(directory.join("recovery.lock"))
             .map_err(|error| io("open recovery lock", error))?;
-        if recovery.try_lock_exclusive().is_err() {
+        if recovery.try_lock().is_err() {
             return refuse(
                 Code::STORE_BUSY,
                 format!("the store is held by {}", live_holders(root)?),
@@ -1532,7 +1526,7 @@ impl WriterGuard {
                 .write(true)
                 .open(&path)
                 .map_err(|error| io("open writer marker", error))?;
-            if marker.try_lock_exclusive().is_err() {
+            if marker.try_lock().is_err() {
                 return refuse(
                     Code::STORE_BUSY,
                     format!("the store is held by {}", live_holders(root)?),
@@ -1562,7 +1556,7 @@ fn live_holders(root: &Path) -> Result<String> {
             let Ok(marker) = File::options().read(true).write(true).open(&path) else {
                 continue;
             };
-            if marker.try_lock_exclusive().is_ok() {
+            if marker.try_lock().is_ok() {
                 continue;
             }
             let stem = path
@@ -1649,7 +1643,7 @@ mod tests {
         }
         fs::write(&path, b"").unwrap();
         assert_eq!(Catalog::open(&root).unwrap_err().code, Code::UNKNOWN_FORMAT);
-        fs::remove_dir_all(root).unwrap();
+        let _ = fs::remove_dir_all(root);
     }
 
     /// Another process holding the catalog's write lock: this test binary, re-run as
@@ -1718,6 +1712,8 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    /// Windows has no stopped processes.
+    #[cfg(unix)]
     #[test]
     fn a_stopped_lock_holder_is_refused() {
         use rustix::process::{kill_process, Pid, Signal};
@@ -1879,6 +1875,8 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    /// A lock held by an inherited descriptor is flock's; a Windows lock is its handle's alone.
+    #[cfg(unix)]
     #[test]
     fn inherited_recovery_descriptor_keeps_gc_fenced_until_child_exit() {
         use std::process::{Command, Stdio};
@@ -1898,7 +1896,7 @@ mod tests {
         assert!(child.wait().unwrap().success());
         assert_eq!(refused.unwrap_err().code, Code::STORE_BUSY);
         WriterGuard::lock_rebuild(&root).unwrap();
-        fs::remove_dir_all(root).unwrap();
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

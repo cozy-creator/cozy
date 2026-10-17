@@ -2081,7 +2081,7 @@ mod tests {
                 .all(|component| component.source_member.as_deref()
                     == Some(roster[0].member.as_str()))
         );
-        std::fs::remove_dir_all(root).unwrap();
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2314,7 +2314,7 @@ mod tests {
             .unwrap()
             .iter()
             .any(|(path, _)| path.contains("tokenizer%20files/")));
-        std::fs::remove_dir_all(root).unwrap();
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2471,7 +2471,7 @@ mod tests {
                 .complete
         );
         handle.join().unwrap();
-        std::fs::remove_dir_all(root).unwrap();
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2516,6 +2516,6 @@ mod tests {
             .record_valid(&selected.members[0].object.sha256)
             .is_ok());
         handle.join().unwrap();
-        std::fs::remove_dir_all(root).unwrap();
+        let _ = std::fs::remove_dir_all(root);
     }
 }

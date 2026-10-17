@@ -453,5 +453,5 @@ fn a_synthetic_carrier_with_the_real_layout_ingests_to_the_constructor_census() 
         )
     );
     drop((_writer, catalog, store));
-    fs::remove_dir_all(dir).unwrap();
+    let _ = fs::remove_dir_all(dir);
 }

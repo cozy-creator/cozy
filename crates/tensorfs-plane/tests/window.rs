@@ -1,6 +1,7 @@
 //! Streamed layouts (the disk rung) on the real code path: the machine's window stages regions
 //! from a real store through the verified read path; adopters (other descriptions, as executors
 //! are) read each region only through `with_region` and check every byte.
+#![cfg(target_os = "linux")] // The host tier (memfd, seals, OFD locks) is Linux-only.
 
 mod common;
 

@@ -71,7 +71,7 @@ fn refuses_roster_and_typed_header_before_starting_custody() {
         Code::WRONG_TYPE
     );
     assert!(source_artifact::read(&store, &owner()).unwrap().is_none());
-    fs::remove_dir_all(dir).unwrap();
+    let _ = fs::remove_dir_all(dir);
 }
 
 #[test]
@@ -140,7 +140,7 @@ fn verifies_bytes_and_resumes_only_missing_members() {
             .code,
         Code::TRANSACTION_CLOSED
     );
-    fs::remove_dir_all(dir).unwrap();
+    let _ = fs::remove_dir_all(dir);
 }
 
 #[test]
@@ -169,7 +169,7 @@ fn symlink_member_is_refused_before_reading_its_target() {
     let dir = directory("symlink");
     let store = Store::init(&dir).unwrap();
     fs::write(dir.join("target"), b"first member").unwrap();
-    std::os::unix::fs::symlink(dir.join("target"), dir.join("a")).unwrap();
+    tensorfs_core::platform::durable::symlink(&dir.join("target"), &dir.join("a")).unwrap();
     assert_eq!(
         source_artifact::import_tree(&store, &owner(), &tree(), &files(&dir), &Fault::default())
             .unwrap_err()
@@ -177,7 +177,7 @@ fn symlink_member_is_refused_before_reading_its_target() {
         Code::WRONG_TYPE
     );
     assert!(!store.contains(&ObjectRef::of(b"first member").sha256));
-    fs::remove_dir_all(dir).unwrap();
+    let _ = fs::remove_dir_all(dir);
 }
 
 #[test]
@@ -213,5 +213,5 @@ fn killed_after_admission_before_landed_keeps_member_live_for_gc_and_resume() {
     assert!(completed.complete);
     gc::collect(&dir, false).unwrap();
     assert_eq!(store.read_manifest(&completed.manifest).unwrap(), tree());
-    fs::remove_dir_all(dir).unwrap();
+    let _ = fs::remove_dir_all(dir);
 }
