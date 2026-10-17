@@ -3,7 +3,7 @@ name: release-smoke
 # It also adds each archive's attestation bundles to the release (<archive>.sigstore.jsonl).
 # The CPU smoke of design §6.4 on every release runner, against this run's own artifacts served from a local
 # mirror (COZY_DOWNLOAD_URL is the release location for the installers and `cozy update` alike): install
-# script, --version, PATH, up, hub list, package search (tensorhub.com, anonymous), the local machine
+# script, --version, PATH, up, status, hub list, package search (tensorhub.com, anonymous), the local machine
 # (enable, show, disable on Linux; refused elsewhere), update to this release, down. A verb answering not_ported is skipped, so the smoke grows as the verbs land.
 on:
   workflow_call:
@@ -171,6 +171,8 @@ jobs:
               || { echo "::error::cozy $* answered $code, not $want"; fail=1; }
           }
           step up
+          # A second command finds Calcifer already up (and must not hang on a pipe it holds).
+          step status
           step hub list
           step package search sdxl
           # The local machine: `enable` returns once `local` is ready (Linux); elsewhere it is refused.
