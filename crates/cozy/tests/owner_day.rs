@@ -1,6 +1,5 @@
 //! The owner's day with cozy, end to end: the real binary, a real Calcifer and real TensorDs
-//! (COZY_TEST_TENSORD: the newest cozy-runtime wheel's, or this workspace's with
-//! COZY_TENSORD=workspace) against the CI Tensorhub that Tensorhub's `live-hub-client.sh` starts
+//! (COZY_TEST_TENSORD: this workspace's) against the CI Tensorhub that Tensorhub's `live-hub-client.sh` starts
 //! (TENSORHUB_ORIGIN, TENSORHUB_LOG; its docker provider rents CPU machines). `owner-day.yml`
 //! runs it, with the other scenario targets, on every release candidate. `h3-standin` has
 //! minimax-h3's request shape without torch. Each test has its own home, account and machines,

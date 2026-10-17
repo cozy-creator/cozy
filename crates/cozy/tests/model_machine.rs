@@ -72,16 +72,10 @@ fn walk(dir: &std::path::Path) -> Vec<(std::path::PathBuf, u64)> {
     files
 }
 
-/// A moving revision and a pasted URL are pinned by the machine itself: only TensorD from this
-/// workspace does that, so this runs where the job builds it (`cozy_tensord=workspace`, which
-/// sets COZY_TENSORD); a released TensorD refuses unpinned spellings.
+/// A moving revision and a pasted URL are pinned by the machine itself.
 #[test]
 fn the_machine_pins_a_moving_source() {
     let Some(home) = Home::new() else { return };
-    if std::env::var("COZY_TENSORD").as_deref() != Ok("workspace") {
-        eprintln!("skipped: COZY_TEST_TENSORD is not this workspace's TensorD (COZY_TENSORD=workspace)");
-        return;
-    }
     let _machine = common::tensord::added(&home, "m1");
     // It pins a moving revision and reads a pasted URL as its source; the result
     // names the commit. Anything ambiguous is the machine's refusal, naming the spellings.
