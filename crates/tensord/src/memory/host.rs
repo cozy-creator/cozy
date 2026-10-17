@@ -3,7 +3,8 @@
 //! CPU weight buffers, TensorD's sealed tier and Runtime's own pinned tiers together, may hold
 //! half of it plus what they hold now (Runtime `weight_policy.pinned_total`). The other half
 //! stays for processes and the page cache, the tier's own fallback.
-use crate::{host_memory::HostMemory, host_tier::TierLimit};
+use crate::host_tier::TierLimit;
+use cozy_platform::contain::host_memory::HostMemory;
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},

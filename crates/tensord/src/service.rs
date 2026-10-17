@@ -1,10 +1,11 @@
 //! The machine's sole dispatch policy; the engine only journals/supervises. Every run takes
 //! one path: its plan (journaled when it binds models, else weightless) on the pool.
+use cozy_platform::process::Birth;
 use crate::{
     catalog::Catalog,
-    execution::{process_ended, Engine},
+    execution::Engine,
     gpu_service::{KeptMember, Level, Member, Plan, Pool},
-    journal::{Execution, ProcessBirth, SubmissionContext},
+    journal::{Execution, SubmissionContext},
 };
 use serde_json::Value;
 use std::{
@@ -43,7 +44,7 @@ pub struct Service {
     calls: Mutex<Option<Arc<crate::calls::Calls>>>,
     /// The TensorFS store's caches (`Publisher::reclaim`), swept with the machine's.
     publisher: Mutex<Option<Arc<crate::published::Publisher>>>,
-    startup_gpu_births: Mutex<Vec<ProcessBirth>>,
+    startup_gpu_births: Mutex<Vec<Birth>>,
     /// Package/model preparations in flight: work a rental's idle release must wait for.
     preparing: std::sync::atomic::AtomicUsize,
     /// This machine's birth: a fenced leader's group members born before it are its
@@ -78,7 +79,7 @@ impl Service {
         let mut cursor = 0;
         let mut seen = HashSet::new();
         let mut startup_gpu_births = vec![];
-        let started_ticks = crate::process::own_start_ticks()?;
+        let started_ticks = Birth::own()?.start_ticks;
         loop {
             let page = engine.gpu_births_after(cursor, 256)?;
             if page.is_empty() {
@@ -86,13 +87,13 @@ impl Service {
             }
             for (id, birth) in page {
                 cursor = id;
-                let alive = !process_ended(&birth).unwrap_or(false)
+                let alive = !birth.ended().unwrap_or(false)
                     || crate::process::group_outlives(&birth, started_ticks);
                 if alive && seen.insert((birth.pid, birth.boot_id.clone(), birth.start_ticks)) {
                     // A follower left behind by a leader that already ended is ended too.
-                    for member in crate::process::group_members(&birth) {
+                    for member in cozy_platform::process::group_members(&birth) {
                         if member.start_ticks < started_ticks {
-                            if let Ok(Some(exact)) = crate::process::Exact::open(&member) {
+                            if let Ok(Some(exact)) = cozy_platform::process::Exact::open(&member) {
                                 let _ = exact.kill();
                             }
                         }
@@ -106,7 +107,7 @@ impl Service {
         }
         // Descendants of those executors (a setsid daemon, a compile worker) live on in the
         // executors' own scopes; every such scope of this machine is ended now.
-        match crate::scope::Scope::sweep(&crate::scope::namespace(root)) {
+        match cozy_platform::contain::Scope::sweep(&cozy_platform::contain::namespace(root)) {
             Ok(0) => (),
             Ok(held) => tracing::info!("ended {held} process(es) left in earlier executor scopes"),
             Err(error) => tracing::warn!("earlier executor scopes remain: {error}"),
@@ -169,7 +170,7 @@ impl Service {
         let mut births = self.startup_gpu_births.lock().unwrap();
         // A group's followers die with their leader (one group kill); each exit is observed.
         births.retain(|birth| {
-            !process_ended(birth).unwrap_or(false)
+            !birth.ended().unwrap_or(false)
                 || crate::process::group_outlives(birth, self.started_ticks)
         });
         births.len()
@@ -217,8 +218,8 @@ impl Service {
         let (gpu, engine) = (gpu.clone(), self.engine.clone());
         std::thread::Builder::new().name("warm-set-restore".into()).spawn(move || {
             let mut seen = engine.activity_epoch();
-            let alive = |birth: &ProcessBirth| {
-                !process_ended(birth).unwrap_or(false) || crate::process::group_outlives(birth, started)
+            let alive = |birth: &Birth| {
+                !birth.ended().unwrap_or(false) || crate::process::group_outlives(birth, started)
             };
             while fence.iter().any(alive) {
                 seen = engine.wait_activity(seen, Some(std::time::Duration::from_millis(100)));

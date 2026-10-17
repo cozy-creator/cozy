@@ -1,4 +1,5 @@
 use std::ffi::CString;
+use cozy_platform::process::Birth;
 use std::fs::File;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd};
@@ -116,9 +117,9 @@ pub fn peer_pidfd(stream: &UnixStream) -> io::Result<File> {
 /// birth is read on both sides of the open. A peer that exited and whose PID was reused in
 /// that instant is the remaining (negligible) window.
 fn pidfd_of_live(pid: i32) -> io::Result<File> {
-    let birth = crate::process::process_birth(u32::try_from(pid).map_err(io::Error::other)?)?;
-    crate::process::Exact::open(&birth)?
-        .map(crate::process::Exact::into_file)
+    let birth = Birth::of(u32::try_from(pid).map_err(io::Error::other)?)?;
+    cozy_platform::process::Exact::open(&birth)?
+        .map(cozy_platform::process::Exact::into_file)
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "peer exited before it was pinned"))
 }
 

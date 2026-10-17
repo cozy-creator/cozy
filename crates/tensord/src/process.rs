@@ -1,348 +1,28 @@
-//! Exact executor processes: birth identity, group kill, exit observation and the progress
-//! meter. Nothing here kills because time passed. Callers kill on a measured wedge
-//! (`Pace`), an owner restart, or a launch that never reached authored code.
-use crate::journal::ProcessBirth;
+//! Executor process policy: the progress meter's pace, wedge watches and reaping. The OS half
+//! (births, exact handles, groups, meters) is `cozy_platform::process`. Nothing here kills
+//! because time passed. Callers kill on a measured wedge (`Pace`), an owner restart, or a launch
+//! that never reached authored code.
+use cozy_platform::process::{Birth, Exact, State, burn, gone, group_members, meter, read_bytes};
 use std::{
-    fs::{self, File},
+    fs::File,
     io,
-    os::{
-        fd::{AsRawFd, FromRawFd},
-        unix::process::ExitStatusExt,
-    },
+    os::unix::process::ExitStatusExt,
     process::{Child, ExitStatus},
     sync::{Arc, Condvar, Mutex},
     time::{Duration, Instant},
 };
 
-/// Marks every descriptor from `first` up close-on-exec in this process. In a child about to exec
-/// it leaves the new program only what its spawner hands on afterwards; at a machine's start it
-/// keeps whatever this process inherited (a parent's key or credential pipe) from anything it
-/// starts. Async-signal-safe: `close_range` (Linux 5.11), else each descriptor to the soft limit.
-pub fn cloexec_from(first: u32) {
-    // SAFETY: plain syscalls on this process's own descriptor table.
-    unsafe {
-        if libc::syscall(libc::SYS_close_range, first, u32::MAX, libc::CLOSE_RANGE_CLOEXEC) == 0 {
-            return;
-        }
-        let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
-        let last = if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) == 0 {
-            limit.rlim_cur.min(1 << 20) as u32
-        } else {
-            1 << 16
-        };
-        for fd in first..last {
-            libc::fcntl(fd as i32, libc::F_SETFD, libc::FD_CLOEXEC);
-        }
-    }
-}
-
-/// A package process inherits no descriptor its spawner does not hand on explicitly: run before
-/// every other `pre_exec` of `command`, which then clear close-on-exec on what they hand on.
-pub fn inherit_nothing(command: &mut std::process::Command) {
-    use std::os::unix::process::CommandExt;
-    // SAFETY: cloexec_from is async-signal-safe.
-    unsafe {
-        command.pre_exec(|| {
-            cloexec_from(3);
-            Ok(())
-        });
-    }
-}
-
-pub fn process_birth(pid: u32) -> io::Result<ProcessBirth> {
-    let stat = process_stat(pid)?;
-    Ok(ProcessBirth {
-        pid,
-        boot_id: boot_id()?,
-        start_ticks: stat.start_ticks,
-    })
-}
-
-pub fn process_ended(birth: &ProcessBirth) -> io::Result<bool> {
-    if boot_id()? != birth.boot_id {
-        return Ok(true);
-    }
-    match process_stat(birth.pid) {
-        Ok(stat) => Ok(stat.start_ticks != birth.start_ticks || matches!(stat.state, 'Z' | 'X')),
-        Err(error) if gone(&error) => Ok(true),
-        Err(error) => Err(error),
-    }
-}
-
-/// Ended or certain to end: gone, a zombie, exiting, or with SIGKILL pending. A process the
-/// kernel is tearing down, perhaps in uninterruptible sleep, still holds its files.
-pub fn dying(birth: &ProcessBirth) -> io::Result<bool> {
-    const PF_EXITING: u64 = 0x4;
-    if process_ended(birth)? {
-        return Ok(true);
-    }
-    match process_stat(birth.pid) {
-        Ok(stat) if stat.flags & PF_EXITING != 0 => return Ok(true),
-        Ok(_) => {}
-        Err(error) if gone(&error) => return Ok(true),
-        Err(error) => return Err(error),
-    }
-    let status = match fs::read_to_string(format!("/proc/{}/status", birth.pid)) {
-        Ok(status) => status,
-        Err(error) if gone(&error) => return Ok(true),
-        Err(error) => return Err(error),
-    };
-    let kill = 1u64 << (libc::SIGKILL - 1);
-    Ok(status
-        .lines()
-        .filter_map(|line| line.strip_prefix("SigPnd:").or_else(|| line.strip_prefix("ShdPnd:")))
-        .filter_map(|mask| u64::from_str_radix(mask.trim(), 16).ok())
-        .any(|mask| mask & kill != 0))
-}
-
-/// `/proc/<pid>` vanished: ENOENT, or ESRCH when the process was reaped mid-read.
-pub fn gone(error: &io::Error) -> bool {
-    error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
-}
-
-fn boot_id() -> io::Result<String> {
-    Ok(fs::read_to_string("/proc/sys/kernel/random/boot_id")?
-        .trim()
-        .into())
-}
-
-struct Stat {
-    state: char,
-    pgrp: i32,
-    /// The kernel's PF_* flags.
-    flags: u64,
-    start_ticks: u64,
-}
-
-fn process_stat(pid: u32) -> io::Result<Stat> {
-    let record = fs::read_to_string(format!("/proc/{pid}/stat"))?;
-    let (_, suffix) = record
-        .rsplit_once(") ")
-        .ok_or_else(|| io::Error::other("invalid process stat"))?;
-    let fields: Vec<_> = suffix.split_whitespace().collect();
-    let field = |index: usize| {
-        fields
-            .get(index)
-            .copied()
-            .ok_or_else(|| io::Error::other("process stat is truncated"))
-    };
-    Ok(Stat {
-        state: field(0)?.chars().next().unwrap_or('?'),
-        pgrp: field(2)?.parse().map_err(io::Error::other)?,
-        flags: field(6)?.parse().map_err(io::Error::other)?,
-        start_ticks: field(19)?.parse().map_err(io::Error::other)?,
-    })
-}
-
-/// A pidfd proven to name one recorded birth. It never names a reused PID.
-pub struct Exact {
-    pidfd: File,
-    pub birth: ProcessBirth,
-    /// The executor's own scope (a cgroup or a token): kills reach every descendant.
-    scope: Option<Arc<crate::scope::Scope>>,
-}
-
-impl Exact {
-    /// `None` when that birth has already been reaped or the PID belongs to another process.
-    pub fn open(birth: &ProcessBirth) -> io::Result<Option<Self>> {
-        if boot_id()? != birth.boot_id {
-            return Ok(None);
-        }
-        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, birth.pid, 0) } as i32;
-        if raw < 0 {
-            let error = io::Error::last_os_error();
-            return match error.raw_os_error() {
-                // ESRCH: reaped. EINVAL: a leader already exiting (its threads tearing down).
-                Some(libc::ESRCH | libc::EINVAL) => Ok(None),
-                _ => Err(error),
-            };
-        }
-        // SAFETY: pidfd_open returned a new descriptor that we now own.
-        let pidfd = unsafe { File::from_raw_fd(raw) };
-        // Read after opening: the pidfd now pins this exact task.
-        match process_stat(birth.pid) {
-            Ok(stat) if stat.start_ticks == birth.start_ticks => Ok(Some(Self {
-                pidfd,
-                birth: birth.clone(),
-                scope: None,
-            })),
-            Ok(_) => Ok(None),
-            Err(error) if gone(&error) => Ok(None),
-            Err(error) => Err(error),
-        }
-    }
-
-    pub fn try_clone(&self) -> io::Result<Self> {
-        Ok(Self {
-            pidfd: self.pidfd.try_clone()?,
-            birth: self.birth.clone(),
-            scope: self.scope.clone(),
-        })
-    }
-
-    pub fn with_scope(mut self, scope: Option<Arc<crate::scope::Scope>>) -> Self {
-        self.scope = scope;
-        self
-    }
-
-    pub fn as_file(&self) -> &File {
-        &self.pidfd
-    }
-
-    pub fn into_file(self) -> File {
-        self.pidfd
-    }
-
-    /// SIGKILL this birth and everything it started: its scope when it has one, and the
-    /// process group it still anchors (a group outlives its leader's number while members
-    /// remain, so it cannot be reused).
-    pub fn kill(&self) -> io::Result<()> {
-        if let Some(scope) = &self.scope {
-            scope.kill()?;
-        }
-        let leads_group = process_stat(self.birth.pid).is_ok_and(|stat| {
-            stat.start_ticks == self.birth.start_ticks && stat.pgrp as u32 == self.birth.pid
-        });
-        if unsafe {
-            libc::syscall(
-                libc::SYS_pidfd_send_signal,
-                self.pidfd.as_raw_fd(),
-                libc::SIGKILL,
-                std::ptr::null::<libc::siginfo_t>(),
-                0,
-            )
-        } < 0
-        {
-            let error = io::Error::last_os_error();
-            if error.raw_os_error() != Some(libc::ESRCH) {
-                return Err(error);
-            }
-        }
-        if leads_group && unsafe { libc::killpg(self.birth.pid as i32, libc::SIGKILL) } < 0 {
-            let error = io::Error::last_os_error();
-            if error.raw_os_error() != Some(libc::ESRCH) {
-                return Err(error);
-            }
-        }
-        Ok(())
-    }
-
-    pub fn ended(&self) -> bool {
-        crate::os::ended(&self.pidfd)
-    }
-
-    /// Block until this exact process has exited. No deadline: exit is the only answer.
-    pub fn wait(&self) -> io::Result<()> {
-        wait_readable(&self.pidfd)
-    }
-}
-
-pub fn wait_readable(file: &File) -> io::Result<()> {
-    let mut poll = libc::pollfd {
-        fd: file.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    loop {
-        let result = unsafe { libc::poll(&mut poll, 1, -1) };
-        if result > 0 && poll.revents & libc::POLLIN != 0 {
-            return Ok(());
-        }
-        if result < 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(error);
-        }
-        if poll.revents != 0 {
-            return Err(io::Error::other("process exit is not observable"));
-        }
-    }
-}
-
-/// CPU nanoseconds plus every byte moved (`rchar`, `wchar`, `read_bytes`, `write_bytes`):
-/// Runtime's `proctree.progress_burn`. `None` is unreadable and decides nothing.
-pub fn burn(pid: u32) -> Option<u64> {
-    meter(pid).map(|(cpu, moved)| cpu.saturating_add(moved))
-}
-
-/// `burn`'s two parts: CPU nanoseconds used or owed, and bytes moved. Owed is the time its live
-/// threads waited runnable for a CPU (`schedstat` run delay): busy cores or a container's spent
-/// CPU quota (a boot kernel compile beside it) slow a working process, never still it.
-fn meter(pid: u32) -> Option<(u64, u64)> {
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let fields: Vec<_> = stat.rsplit_once(") ")?.1.split_whitespace().collect();
-    let ticks = fields.get(11)?.parse::<u64>().ok()? + fields.get(12)?.parse::<u64>().ok()?;
-    let hertz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as u64;
-    let waited: u64 = fs::read_dir(format!("/proc/{pid}/task"))
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|task| fs::read_to_string(task.path().join("schedstat")).ok())
-        .filter_map(|line| line.split_whitespace().nth(1)?.parse::<u64>().ok())
-        .sum();
-    let cpu = ticks.saturating_mul(1_000_000_000 / hertz).saturating_add(waited);
-    let moved = fs::read_to_string(format!("/proc/{pid}/io"))
-        .ok()
-        .and_then(|io| {
-            io.lines()
-                .filter_map(|line| line.split_once(": "))
-                .filter(|(name, _)| {
-                    matches!(*name, "rchar" | "wchar" | "read_bytes" | "write_bytes")
-                })
-                .map(|(_, value)| value.trim().parse::<u64>().ok())
-                .sum::<Option<u64>>()
-        });
-    Some((cpu, moved.unwrap_or(0)))
-}
-
-/// Every process still in `leader`'s process group and born with or after it: an executor's
-/// followers (Runtime `RankGroup` keeps rank 0's PGID). A group number is not reused while a
-/// member lives, so a scan before or right after the leader is reaped names only its own.
-pub fn group_members(leader: &ProcessBirth) -> Vec<ProcessBirth> {
-    let Ok(boot) = boot_id() else {
-        return vec![];
-    };
-    if boot != leader.boot_id {
-        return vec![];
-    }
-    let Ok(entries) = fs::read_dir("/proc") else {
-        return vec![];
-    };
-    entries
-        .flatten()
-        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
-        .filter(|pid| *pid != leader.pid)
-        .filter_map(|pid| {
-            let stat = process_stat(pid).ok()?;
-            (stat.pgrp as u32 == leader.pid && stat.start_ticks >= leader.start_ticks).then(|| {
-                ProcessBirth {
-                    pid,
-                    boot_id: boot.clone(),
-                    start_ticks: stat.start_ticks,
-                }
-            })
-        })
-        .collect()
-}
-
 /// Whether a member of `leader`'s group born before `before` (start ticks) still lives: a
 /// previous machine's follower, killed with its leader, until its exit is observed.
-pub fn group_outlives(leader: &ProcessBirth, before: u64) -> bool {
+pub fn group_outlives(leader: &Birth, before: u64) -> bool {
     group_members(leader)
         .iter()
-        .any(|member| member.start_ticks < before && !process_ended(member).unwrap_or(true))
-}
-
-/// This process's own birth, in start ticks.
-pub fn own_start_ticks() -> io::Result<u64> {
-    Ok(process_stat(std::process::id())?.start_ticks)
+        .any(|member| member.start_ticks < before && member.state().is_ok_and(|state| state != State::Gone))
 }
 
 /// The leader's meter plus its group members': a follower's imports, fills and collectives
 /// are the executor's work. `None` only when the leader itself is unreadable.
-pub fn group_burn(leader: &ProcessBirth) -> Option<u64> {
+pub fn group_burn(leader: &Birth) -> Option<u64> {
     let own = burn(leader.pid)?;
     Some(
         group_members(leader)
@@ -471,7 +151,7 @@ impl Watch {
         while !state.done {
             let now = Instant::now();
             let reading = match self.meter {
-                Meter::Burn => group_burn(&exact.birth),
+                Meter::Burn => group_burn(exact.birth()),
                 Meter::Frames => Some(state.frames),
             };
             pace.observe(reading, now);
@@ -577,9 +257,9 @@ pub fn reap(
     let floor = liveness.floor();
     let mut pace = Pace::default();
     let mut killed = None;
-    while !readable_within(exact.as_file(), liveness.sample)? {
+    while !exact.wait_for(liveness.sample)? {
         let now = Instant::now();
-        pace.observe(group_burn(&exact.birth), now);
+        pace.observe(group_burn(exact.birth()), now);
         if killed.is_some() {
             continue;
         }
@@ -598,7 +278,7 @@ pub fn reap(
         Some(child) => child.wait()?,
         None => ExitStatus::from_raw(0),
     };
-    let stragglers = match &exact.scope {
+    let stragglers = match exact.scope() {
         Some(scope) => scope.end()?,
         None => 0,
     };
@@ -627,14 +307,14 @@ pub fn reap_group(
 ) -> io::Result<Reaped> {
     // With a scope the leader's reap already ended its followers (they share it).
     let mut reaped = reap(exact, child, liveness)?;
-    for member in group_members(&exact.birth) {
+    for member in group_members(exact.birth()) {
         let Some(member) = Exact::open(&member)? else {
             continue;
         };
         if let Some(verdict) = reap(&member, None, liveness)?.killed {
             reaped.killed = Some(match reaped.killed.take() {
-                Some(first) => format!("{first}; process {}: {verdict}", member.birth.pid),
-                None => format!("process {}: {verdict}", member.birth.pid),
+                Some(first) => format!("{first}; process {}: {verdict}", member.birth().pid),
+                None => format!("process {}: {verdict}", member.birth().pid),
             });
         }
     }
@@ -661,7 +341,7 @@ pub fn supervise(
     what: &str,
     read: &dyn Fn(u64),
 ) -> io::Result<Supervised> {
-    let exact = match process_birth(child.id()) {
+    let exact = match Birth::of(child.id()).map_err(io::Error::from) {
         Ok(birth) => Exact::open(&birth)?,
         Err(error) if gone(&error) => None,
         Err(error) => return Err(error),
@@ -672,7 +352,7 @@ pub fn supervise(
     let (floor, tick) = (Liveness::default().floor(), Duration::from_secs(1));
     let (mut pace, mut ended) = (Pace::default(), None);
     let (mut last, mut advances) = (None, 0u64);
-    while !readable_within(exact.as_file(), tick)? {
+    while !exact.wait_for(tick)? {
         if ended.is_some() {
             continue;
         }
@@ -680,15 +360,15 @@ pub fn supervise(
         // Bytes moved are progress, and CPU used or owed at a tenth of a core or more (`meter`).
         // An idle process's timer wakeups are not: uv waiting on its build spends one 10 ms
         // tick in about 10 s.
-        let members = group_members(&exact.birth).into_iter().map(|member| member.pid);
-        let reading = std::iter::once(exact.birth.pid).chain(members).filter_map(meter)
+        let members = group_members(exact.birth()).into_iter().map(|member| member.pid);
+        let reading = std::iter::once(exact.birth().pid).chain(members).filter_map(meter)
             .fold((0u64, 0u64), |(cpu, moved), (c, m)| (cpu + c, moved + m));
         if last.is_some_and(|(cpu, moved): (u64, u64)| reading.1 != moved || reading.0.saturating_sub(cpu) >= tick.as_nanos() as u64 / 10) {
             advances += 1;
         }
         last = Some(reading);
         pace.observe(Some(advances), now);
-        if let Some(bytes) = read_bytes(exact.birth.pid) {
+        if let Some(bytes) = read_bytes(exact.birth().pid) {
             read(bytes);
         }
         if stop.is_some_and(|stop| stop.is_cancelled()) {
@@ -704,51 +384,6 @@ pub fn supervise(
     }
     let status = child.wait()?;
     Ok(ended.unwrap_or(Supervised::Exited(status)))
-}
-
-/// The bytes a process has read (`rchar`).
-fn read_bytes(pid: u32) -> Option<u64> {
-    fs::read_to_string(format!("/proc/{pid}/io"))
-        .ok()?
-        .lines()
-        .find_map(|line| line.strip_prefix("rchar: "))?
-        .trim()
-        .parse()
-        .ok()
-}
-
-fn readable_within(file: &File, period: Duration) -> io::Result<bool> {
-    let mut poll = libc::pollfd {
-        fd: file.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    let milliseconds = period.as_millis().clamp(1, i32::MAX as u128) as i32;
-    loop {
-        let result = unsafe { libc::poll(&mut poll, 1, milliseconds) };
-        if result < 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(error);
-        }
-        if result == 0 {
-            return Ok(false);
-        }
-        if poll.revents & libc::POLLIN != 0 {
-            return Ok(true);
-        }
-        return Err(io::Error::other("process exit is not observable"));
-    }
-}
-
-/// An OS shortage that may clear by itself; nothing else justifies requeueing a launch.
-pub fn transient(error: &io::Error) -> bool {
-    matches!(
-        error.raw_os_error(),
-        Some(libc::EAGAIN | libc::ENOMEM | libc::EMFILE | libc::ENFILE | libc::EINTR)
-    )
 }
 
 /// The last bytes of a log, for a failure reason.
@@ -794,39 +429,6 @@ mod tests {
     }
 
     #[test]
-    fn exact_kill_takes_the_group_and_never_a_reused_birth() {
-        let mut child = Command::new("/bin/sh")
-            .args(["-c", "sleep 1000 & wait"])
-            .process_group(0)
-            .stdin(Stdio::null())
-            .spawn()
-            .unwrap();
-        let birth = process_birth(child.id()).unwrap();
-        let mut stale = birth.clone();
-        stale.start_ticks += 1;
-        assert!(Exact::open(&stale).unwrap().is_none());
-        let exact = Exact::open(&birth).unwrap().unwrap();
-        // The grandchild is in the leader's group: wait until it exists.
-        let grandchild = loop {
-            let children =
-                fs::read_to_string(format!("/proc/{0}/task/{0}/children", child.id())).unwrap();
-            if let Some(pid) = children.split_whitespace().next() {
-                break pid.parse::<u32>().unwrap();
-            }
-            std::thread::yield_now();
-        };
-        let grandchild = Exact::open(&process_birth(grandchild).unwrap())
-            .unwrap()
-            .unwrap();
-        exact.kill().unwrap();
-        exact.wait().unwrap();
-        grandchild.wait().unwrap();
-        use std::os::unix::process::ExitStatusExt;
-        assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGKILL));
-        assert!(process_ended(&birth).unwrap());
-    }
-
-    #[test]
     fn reap_group_waits_for_members_left_behind_and_ends_a_still_one() {
         // The leader leaves two members in its group; killing only the leader (no group
         // signal) orphans them, as a follower can outlive rank 0 for a moment.
@@ -836,7 +438,7 @@ mod tests {
             .stdin(Stdio::null())
             .spawn()
             .unwrap();
-        let birth = process_birth(child.id()).unwrap();
+        let birth = Birth::of(child.id()).unwrap();
         let members = loop {
             let members = group_members(&birth);
             if members.len() == 2 {
@@ -856,7 +458,7 @@ mod tests {
         let killed = killed.expect("still members are ended on their measurement");
         assert!(killed.contains("no measurable progress"), "{killed}");
         for member in members {
-            assert!(process_ended(&member).unwrap(), "{member:?}");
+            assert!(member.ended().unwrap(), "{member:?}");
         }
         assert!(group_members(&birth).is_empty());
     }
@@ -870,7 +472,7 @@ mod tests {
             .stdin(Stdio::null())
             .spawn()
             .unwrap();
-        let birth = process_birth(child.id()).unwrap();
+        let birth = Birth::of(child.id()).unwrap();
         let exact = Exact::open(&birth).unwrap().unwrap();
         let liveness = Liveness {
             sample: Duration::from_millis(20),
@@ -889,7 +491,7 @@ mod tests {
         )
         .unwrap();
         std::thread::sleep(liveness.floor() * 4);
-        assert!(!process_ended(&birth).unwrap());
+        assert!(!birth.ended().unwrap());
         waiting.store(false, std::sync::atomic::Ordering::Release);
         use std::os::unix::process::ExitStatusExt;
         assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGKILL));
@@ -897,9 +499,4 @@ mod tests {
         assert!(killed.contains("wedged during run_job"), "{killed}");
     }
 
-    #[test]
-    fn burn_reads_this_process() {
-        assert!(burn(std::process::id()).is_some_and(|value| value > 0));
-        assert!(burn(u32::MAX).is_none());
-    }
 }

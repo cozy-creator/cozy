@@ -1,4 +1,5 @@
 //! Durable acceptance and transitions. Observation has no lifecycle side effects.
+use cozy_platform::process::Birth;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -202,13 +203,6 @@ impl ExecutorFacts {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-pub struct ProcessBirth {
-    pub pid: u32,
-    pub boot_id: String,
-    pub start_ticks: u64,
-}
-
 /// Memoized results each signer keeps, its most recently used first.
 pub const MAX_HELD_MEMOS: i64 = 4096;
 
@@ -260,7 +254,7 @@ pub struct Execution {
     pub attempt: u32,
     #[serde(default)]
     pub waiting_reason: Option<String>,
-    pub process: Option<ProcessBirth>,
+    pub process: Option<Birth>,
     pub cancel_actor: Option<String>,
     /// Explicit cancellation reserved this actor/ID before any Run spec was accepted.
     #[serde(default)]
@@ -1827,7 +1821,7 @@ impl Journal {
         &self,
         after: u64,
         limit: usize,
-    ) -> io::Result<Vec<(u64, ProcessBirth)>> {
+    ) -> io::Result<Vec<(u64, Birth)>> {
         let mut statement = self.connection.prepare("SELECT id,json_extract(record,'$.process') FROM executions WHERE id>?1 AND (json_extract(record,'$.invocation.degree')>0) AND json_extract(record,'$.process') IS NOT NULL ORDER BY id LIMIT ?2").map_err(db_error)?;
         let rows = statement
             .query_map(
@@ -2250,7 +2244,7 @@ impl Journal {
     }
 
     /// Called once the attempt's executor exists, before its Invoke.
-    pub fn register_process(&mut self, id: &str, process: ProcessBirth) -> io::Result<Execution> {
+    pub fn register_process(&mut self, id: &str, process: Birth) -> io::Result<Execution> {
         self.update(id, |record| {
             if record.state != State::Starting || record.process.is_some() {
                 return Err(db_error("attempt is not awaiting its first executor"));

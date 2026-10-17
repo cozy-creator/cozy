@@ -35,7 +35,7 @@ use windows_sys::Win32::{
 };
 
 #[derive(Debug)]
-pub(super) struct Handle(OwnedHandle);
+pub(super) struct Handle(pub(super) OwnedHandle);
 
 /// The tree's job.
 #[derive(Debug)]
@@ -96,6 +96,31 @@ pub(super) fn kill(handle: &Handle, _: &Birth) -> io::Result<()> {
 
 pub(super) fn set_name(_: &str) -> crate::Result<()> {
     Err(crate::Error::unsupported(crate::Seam::Process))
+}
+
+/// Groups and meters are read only on Linux so far: unreadable here, which decides nothing.
+pub(super) fn group_members(_: &Birth) -> Vec<Birth> {
+    Vec::new()
+}
+
+pub(super) fn meter(_: u32) -> Option<(u64, u64)> {
+    None
+}
+
+pub(super) fn read_bytes(_: u32) -> Option<u64> {
+    None
+}
+
+pub(super) fn transient(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::OutOfMemory | io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+    )
+}
+
+/// A process id that names no process any more.
+pub(super) fn gone(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32)
 }
 
 pub(super) fn wait(handle: &Handle, period: Option<Duration>) -> io::Result<bool> {

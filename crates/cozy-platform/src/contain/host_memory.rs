@@ -191,7 +191,11 @@ pub fn tree_private(pid: u32) -> u64 {
     let mut parents: Vec<(u32, u32)> = vec![];
     if let Ok(entries) = fs::read_dir("/proc") {
         for entry in entries.flatten() {
-            let Some(child) = entry.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else {
+            let Some(child) = entry
+                .file_name()
+                .to_str()
+                .and_then(|n| n.parse::<u32>().ok())
+            else {
                 continue;
             };
             let Ok(stat) = fs::read_to_string(format!("/proc/{child}/stat")) else {
@@ -211,7 +215,12 @@ pub fn tree_private(pid: u32) -> u64 {
     let mut at = 0;
     while at < tree.len() {
         let parent = tree[at];
-        tree.extend(parents.iter().filter(|(_, p)| *p == parent).map(|(c, _)| *c));
+        tree.extend(
+            parents
+                .iter()
+                .filter(|(_, p)| *p == parent)
+                .map(|(c, _)| *c),
+        );
         at += 1;
     }
     tree.iter()
@@ -232,10 +241,16 @@ mod tests {
         );
         let own = super::process(std::process::id()).unwrap();
         assert!(own.rss > 0 && own.pss > 0 && own.pss <= own.rss, "{own:?}");
-        let mut child = std::process::Command::new("sleep").arg("5").spawn().unwrap();
+        let mut child = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .unwrap();
         let tree = super::tree_private(std::process::id());
         child.kill().unwrap();
         child.wait().unwrap();
-        assert!(tree > own.pss.saturating_sub(own.pss_shmem), "a child counts too: {tree}");
+        assert!(
+            tree > own.pss.saturating_sub(own.pss_shmem),
+            "a child counts too: {tree}"
+        );
     }
 }

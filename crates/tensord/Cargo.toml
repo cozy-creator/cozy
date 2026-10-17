@@ -5,6 +5,7 @@ edition = "2021"
 publish.workspace = true
 
 [dependencies]
+cozy-platform.workspace = true
 cozy-proto.workspace = true
 str0m = { version = "0.24", default-features = false, features = ["aws-lc-rs"] }
 tensorfs-core = { workspace = true, features = ["store"] }

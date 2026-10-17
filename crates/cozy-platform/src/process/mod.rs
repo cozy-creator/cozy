@@ -3,7 +3,9 @@
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::{
+    io,
     process::{Child, ChildStdout, Command, ExitStatus},
+    sync::Arc,
     time::Duration,
 };
 
@@ -53,6 +55,11 @@ impl Birth {
     pub fn state(&self) -> Result<State> {
         sys::state(self).map_err(Error::os("read a process's state"))
     }
+
+    /// Exited (a zombie included) or never this birth: `state() == Gone`.
+    pub fn ended(&self) -> Result<bool> {
+        Ok(self.state()? == State::Gone)
+    }
 }
 
 /// Names this process for `ps` and `top` by its role (`calcifer`, `tensord`). It names the calling
@@ -68,6 +75,8 @@ pub fn set_name(name: &str) -> Result<()> {
 pub struct Exact {
     birth: Birth,
     handle: sys::Handle,
+    /// The process's own containment scope: a kill reaches every descendant.
+    scope: Option<Arc<crate::contain::Scope>>,
 }
 
 impl Exact {
@@ -78,6 +87,7 @@ impl Exact {
         Ok(handle.map(|handle| Exact {
             birth: birth.clone(),
             handle,
+            scope: None,
         }))
     }
 
@@ -85,8 +95,40 @@ impl Exact {
         &self.birth
     }
 
-    /// SIGKILL this birth and the process group it still leads (TerminateProcess on Windows).
+    pub fn scope(&self) -> Option<&Arc<crate::contain::Scope>> {
+        self.scope.as_ref()
+    }
+
+    pub fn with_scope(mut self, scope: Option<Arc<crate::contain::Scope>>) -> Self {
+        self.scope = scope;
+        self
+    }
+
+    pub fn try_clone(&self) -> Result<Self> {
+        Ok(Self {
+            birth: self.birth.clone(),
+            handle: sys::Handle(
+                self.handle
+                    .0
+                    .try_clone()
+                    .map_err(Error::os("clone a process handle"))?,
+            ),
+            scope: self.scope.clone(),
+        })
+    }
+
+    /// The handle as a file a caller keeps: readable (Unix) or signaled (Windows) once it exits.
+    #[cfg(unix)]
+    pub fn into_file(self) -> std::fs::File {
+        self.handle.0.into()
+    }
+
+    /// SIGKILL this birth, its scope when it has one, and the process group it still leads
+    /// (TerminateProcess on Windows).
     pub fn kill(&self) -> Result<()> {
+        if let Some(scope) = &self.scope {
+            scope.kill()?;
+        }
         sys::kill(&self.handle, &self.birth).map_err(Error::os("kill a process"))
     }
 
@@ -114,6 +156,42 @@ impl std::os::fd::AsFd for Exact {
         std::os::fd::AsFd::as_fd(&self.handle.0)
     }
 }
+
+/// Every process in `leader`'s process group born with or after it: a leader's followers. A
+/// group number is not reused while a member lives. Empty where it cannot be read (only Linux
+/// reads groups so far).
+pub fn group_members(leader: &Birth) -> Vec<Birth> {
+    sys::group_members(leader)
+}
+
+/// CPU nanoseconds used or owed (time runnable but waiting for a CPU) and bytes moved, the
+/// measure of a process's progress. `None`: unreadable, which decides nothing (Linux only so far).
+pub fn meter(pid: u32) -> Option<(u64, u64)> {
+    sys::meter(pid)
+}
+
+/// `meter`'s two parts summed: Runtime's `proctree.progress_burn`.
+pub fn burn(pid: u32) -> Option<u64> {
+    meter(pid).map(|(cpu, moved)| cpu.saturating_add(moved))
+}
+
+/// The bytes a process has read. `None`: unreadable.
+pub fn read_bytes(pid: u32) -> Option<u64> {
+    sys::read_bytes(pid)
+}
+
+/// A process this error was about is gone: its record vanished, or it was reaped mid-read.
+pub fn gone(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::NotFound || sys::gone(error)
+}
+
+/// An OS shortage that may clear by itself; nothing else justifies requeueing a launch.
+pub fn transient(error: &io::Error) -> bool {
+    sys::transient(error)
+}
+
+#[cfg(unix)]
+pub use unix::{cloexec_from, inherit_nothing};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Lifetime {

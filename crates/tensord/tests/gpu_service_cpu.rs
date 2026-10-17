@@ -1,8 +1,8 @@
 //! CPU birth/journal proof only: this does not qualify a GPU or ordinary CLI inference.
+use cozy_platform::process::Birth;
 use tensord::{
-    execution::process_birth,
     journal::{
-        Installation, Invocation, Journal, Outcome, Preparation, ProcessBirth, ResultRecord,
+        Installation, Invocation, Journal, Outcome, Preparation, ResultRecord,
         SubmissionContext,
     },
     service::Service,
@@ -21,7 +21,7 @@ fn restart_ends_a_retained_gpu_birth_before_admitting_gpu_work() {
         .stdin(Stdio::piped())
         .spawn()
         .unwrap();
-    let birth = process_birth(child.id()).unwrap();
+    let birth = Birth::of(child.id()).unwrap();
     let state = root.join("state");
     let mut journal = Journal::open(&state.join("execution")).unwrap();
     let generation = "a".repeat(32);
@@ -75,11 +75,11 @@ fn restart_ends_a_retained_gpu_birth_before_admitting_gpu_work() {
     fs::remove_dir_all(root).unwrap();
 }
 
-fn complete(journal: &mut Journal, n: usize, generation: &str, birth: ProcessBirth, preparation: &str) {
+fn complete(journal: &mut Journal, n: usize, generation: &str, birth: Birth, preparation: &str) {
     complete_device(journal, n, generation, birth, preparation, 1);
 }
 
-fn complete_device(journal: &mut Journal, n: usize, generation: &str, birth: ProcessBirth, preparation: &str, degree: u32) {
+fn complete_device(journal: &mut Journal, n: usize, generation: &str, birth: Birth, preparation: &str, degree: u32) {
     let context = SubmissionContext {
         actor: "actor".into(),
         request_id: format!("request-{n}"),
@@ -121,7 +121,7 @@ fn complete_device(journal: &mut Journal, n: usize, generation: &str, birth: Pro
 
 #[test]
 fn restart_ends_processes_left_in_earlier_executor_scopes() {
-    use tensord::scope::{namespace, Scope};
+    use cozy_platform::contain::{namespace, Scope};
     use std::io::{Read, Write};
     let root = std::env::temp_dir().join(format!("machine-scope-sweep-{}", uuid::Uuid::new_v4()));
     let state = root.join("state");
@@ -142,13 +142,13 @@ fn restart_ends_processes_left_in_earlier_executor_scopes() {
     let mut daemon = String::new();
     leader.stdout.take().unwrap().read_to_string(&mut daemon).unwrap();
     assert!(leader.wait().unwrap().success());
-    let daemon = tensord::process::process_birth(daemon.trim().parse().unwrap()).unwrap();
+    let daemon = cozy_platform::process::Birth::of(daemon.trim().parse().unwrap()).unwrap();
     assert_eq!(scope.processes().unwrap(), 1);
     // That machine is gone: nothing in this process claims the scope any more.
     let cgroup = scope.cgroup_relative().map(|relative| format!("/sys/fs/cgroup{relative}"));
     drop(scope);
     let service = Service::open(&state, &root.join("generations"), 1).unwrap();
-    assert!(tensord::process::process_ended(&daemon).unwrap());
+    assert!(daemon.ended().unwrap());
     if let Some(path) = cgroup {
         assert!(!std::path::Path::new(&path).exists());
     }
@@ -162,7 +162,7 @@ fn restart_fences_a_terminal_weightless_gpu_call_by_its_degree() {
     let mut child = Command::new("/usr/bin/python3")
         .args(["-I", "-c", "import sys; sys.stdin.buffer.read()"])
         .stdin(Stdio::piped()).spawn().unwrap();
-    let birth = process_birth(child.id()).unwrap();
+    let birth = Birth::of(child.id()).unwrap();
     let state = root.join("state");
     let mut journal = Journal::open(&state.join("execution")).unwrap();
     complete_device(&mut journal, 1, &"a".repeat(32), birth.clone(), "", 1);
