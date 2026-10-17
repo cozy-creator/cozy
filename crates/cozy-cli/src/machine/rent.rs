@@ -2,16 +2,15 @@
 use std::{num::NonZeroU64, process::ExitCode};
 
 use cozy_proto::{
+    calcifer::{Machine, MachineState, NewMachine, Quote, Rented},
     config::Hub,
     error::{Error, Kind},
 };
 use hub_client::types::{RentalSku, RentalSkuStatus};
 
-use super::usd;
+use super::{FOLLOW, list::state_cell, route, usd};
 use crate::{Context, context::hub_answer, output};
 
-// The order itself (disk, detach, key) goes to Calcifer's rentals once they land.
-#[allow(dead_code)]
 #[derive(clap::Args, Debug)]
 pub struct Rent {
     /// A product from the catalog.
@@ -35,8 +34,162 @@ pub async fn exec(ctx: &Context, rent: Rent) -> Result<ExitCode, Error> {
     let Some(sku) = rent.sku else {
         return catalog(ctx, &hub).await;
     };
-    admit(ctx, &hub, &sku, rent.gpus.unwrap_or(1)).await?;
-    Err(crate::not_ported("machine rent <sku>"))
+    let gpus = rent.gpus.unwrap_or(1);
+    admit(ctx, &hub, &sku, gpus).await?;
+    let minted = rent.idempotency_key.is_none();
+    let key = rent.idempotency_key.unwrap_or_else(mint_key);
+    let ask = NewMachine::Rent {
+        sku: sku.clone(),
+        hub: hub.origin.clone(),
+        gpus: rent.gpus,
+        disk_gb: rent.disk_gb,
+    };
+    let rented: Rented = match ctx
+        .calcifer()
+        .await?
+        .post("/v1/machines", &ask, Some(&key))
+        .await
+    {
+        // An answer lost on the way back may still have placed the order: only its key resumes it.
+        Err(e) if minted && matches!(e.kind, Kind::Unavailable | Kind::Internal) => {
+            return Err(e.remedy(format!(
+                "the order may stand; resume it (never a second one) with \
+                 `cozy machine rent {sku} --idempotency-key {key}`"
+            )));
+        }
+        answer => answer?,
+    };
+    output::say(ctx, &price(&sku, &rented.quote));
+    if let Some(asked) = rent.disk_gb.filter(|asked| rented.quote.disk_gb < *asked) {
+        output::warn(
+            ctx,
+            &format!(
+                "the Hub plans a {} GB disk, below the {asked} GB asked",
+                rented.quote.disk_gb
+            ),
+        );
+    }
+    if rented.replay {
+        output::say(ctx, "this order was placed already; following it");
+    }
+    let machine = match rent.detach {
+        true => rented.machine.clone(),
+        false => match follow(ctx, rented.machine.clone()).await? {
+            Some(machine) => machine,
+            None => return Ok(ExitCode::SUCCESS),
+        },
+    };
+    if ctx.json {
+        output::json(&Rented { machine, ..rented });
+        return Ok(ExitCode::SUCCESS);
+    }
+    let q = &rented.quote;
+    let mut record = output::Record::new()
+        .field("machine", &machine.name)
+        .field("state", state_cell(&machine))
+        .field("gpus", gpus)
+        .field(
+            "$/hour",
+            usd(q.gpu_usd_micros_per_hour + q.storage_usd_micros_per_hour),
+        )
+        .note(format!(
+            "billing continues until `cozy machine end {}` confirms its release",
+            machine.name
+        ))
+        .note("it ends itself after 15 minutes idle (no queued or running work)");
+    if machine.state == MachineState::Booting {
+        record = record.note("runs sent to it now wait until it is ready");
+    }
+    if gpus > 1 && gpus % 2 == 1 {
+        record = record.note(
+            "an odd GPU count leaves one GPU out of parallel runs, which shard at even counts",
+        );
+    }
+    record.print(ctx);
+    output::next(
+        ctx,
+        &[
+            &format!("cozy run <org/package/function> --on {}", machine.name),
+            &format!("cozy machine end {}", machine.name),
+        ],
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+/// The price the order is held to: per hour and for the Hub's assumed hours and download.
+fn price(sku: &str, q: &Quote) -> String {
+    let mut line = format!(
+        "{sku} with a {} GB disk: {}/h GPU + {}/h disk",
+        q.disk_gb,
+        usd(q.gpu_usd_micros_per_hour),
+        usd(q.storage_usd_micros_per_hour)
+    );
+    if let Some(per_gb) = q.bandwidth_usd_micros_per_gb.filter(|p| *p > 0) {
+        line += &format!(", traffic up to ${:.3}/GB", per_gb as f64 / 1e6);
+    }
+    line + &format!(
+        "; about {} for {} h and a {} GB download",
+        usd(q.expected_total_usd_micros),
+        q.expected_hours,
+        q.expected_download_gb
+    )
+}
+
+/// Follows the boot until the machine is ready, saying the Hub's phase as it changes. Ctrl-C stops
+/// watching only (`None`): the order goes on in Calcifer.
+async fn follow(ctx: &Context, booting: Machine) -> Result<Option<Machine>, Error> {
+    let calcifer = ctx.calcifer().await?;
+    // A rental id never changes; the Hub may rename the machine while it boots.
+    let path = route(booting.rental_id.as_deref().unwrap_or(&booting.name))?;
+    let mut said = String::new();
+    let mut machine = booting;
+    loop {
+        match machine.state {
+            MachineState::Ready => return Ok(Some(machine)),
+            MachineState::Booting => {
+                let line = state_cell(&machine);
+                if line != said {
+                    output::say(ctx, &format!("{}: {line}", machine.name));
+                    said = line;
+                }
+            }
+            MachineState::Ending | MachineState::Ended => return Err(boot_failed(&machine)),
+        }
+        tokio::select! {
+            () = tokio::time::sleep(FOLLOW) => {}
+            _ = tokio::signal::ctrl_c() => {
+                output::say(ctx, &format!(
+                    "stopped watching {}: the order continues and bills once it boots; \
+                     `cozy machine end {}` ends it", machine.name, machine.name));
+                return Ok(None);
+            }
+        }
+        machine = calcifer.get(&path).await?;
+    }
+}
+
+fn boot_failed(m: &Machine) -> Error {
+    let code = m.reason.clone().unwrap_or_else(|| "rental_failed".into());
+    let error = Error::new(
+        Kind::Unavailable,
+        code.clone(),
+        format!("rental {} did not come up: {code}", m.name),
+    );
+    if code == "provider_create_did_not_happen" {
+        return error
+            .remedy("Please try again later or rent a different GPU.")
+            .next("cozy machine rent");
+    }
+    let sku = m.rental.as_ref().map_or("<sku>", |r| r.sku.as_str());
+    error
+        .next(format!("cozy machine show {}", m.name))
+        .next(format!("cozy machine rent {sku}"))
+}
+
+fn mint_key() -> String {
+    let mut bytes = [0u8; 8];
+    getrandom::fill(&mut bytes).expect("the OS has randomness");
+    format!("rent-{}", hex::encode(bytes))
 }
 
 /// An explicit ask is honoured or refused, never widened to another card or count; the refusal names
