@@ -1024,6 +1024,7 @@ fn view(rental: &types::Rental, sku: Option<String>) -> Rental {
         ended_at_ms: rental.ended_at.as_deref().and_then(ms),
         disk_gb: u32::try_from(rental.container_disk_gb).unwrap_or_default(),
         failure: rental.failure.as_ref().map(|f| f.code.clone()),
+        placement_note: rental.placement_note.clone().filter(|n| !n.is_empty()),
     }
 }
 

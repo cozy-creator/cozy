@@ -100,7 +100,7 @@ pub async fn info(ctx: &Context, package: &PackageRef) -> Result<ExitCode, Error
     let hub = ctx.hub()?;
     let card = ctx
         .hub_client(&hub)?
-        .get_package(&package.org, &package.name)
+        .get_package(&package.org, &package.name, None)
         .await
         .map_err(|e| missing(hub_error(e), package, hub.label()))?
         .into_inner();
