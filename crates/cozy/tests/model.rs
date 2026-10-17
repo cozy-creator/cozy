@@ -73,3 +73,25 @@ fn usage_refusals_reach_no_hub() {
         assert_eq!(out.code, 2, "{args:?}: {out:?}");
     }
 }
+
+#[test]
+fn download_and_upload_refuse_before_any_run() {
+    let Some(home) = Home::new() else { return };
+    std::fs::write(home.path().join("weights.bin"), b"x").unwrap();
+    std::fs::write(home.path().join("w.safetensors"), b"x").unwrap();
+    let file = home.path().join("w.safetensors");
+    let file = file.to_str().unwrap();
+    let not_safetensors = home.path().join("weights.bin");
+    let cases: [(&[&str], i32, &str); 5] = [
+        (&["model", "download", file], 2, "model_alias_missing"),
+        (&["model", "download", "fidika/sdxl", "fidika/other"], 2, "model_alias_invalid"),
+        (&["model", "upload", not_safetensors.to_str().unwrap(), "fidika/x"], 1, "model_file_refused"),
+        (&["model", "upload", "fidika/sdxl", "local/x"], 2, "model_local_destination"),
+        (&["model", "upload", "local/tiny", "fidika/x"], 1, "not_logged_in"),
+    ];
+    for (args, code, refusal) in cases {
+        let out = home.cozy(["--json"].iter().chain(args));
+        assert_eq!((out.code, out.refusal()["code"].as_str()), (code, Some(refusal)), "{args:?}: {out:?}");
+    }
+    assert!(!home.root().join("calcifer").exists(), "a refusal started Calcifer");
+}
