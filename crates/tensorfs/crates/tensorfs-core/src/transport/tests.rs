@@ -4337,6 +4337,112 @@ fn attempt_cancellation_interrupts_a_partial_tls_record() {
     peer.join().unwrap();
 }
 
+#[test]
+fn zz_tls_cancel_loop() {
+    let end_at = std::time::Instant::now() + Duration::from_secs(50);
+    let (mut rounds, mut odd) = (0, 0);
+    while std::time::Instant::now() < end_at {
+    rounds += 1;
+
+    let key = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let cert = rustls::pki_types::CertificateDer::from(key.cert.der().to_vec());
+    let private = rustls::pki_types::PrivateKeyDer::try_from(key.signing_key.serialize_der()).unwrap();
+    let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(vec![cert.clone()], private)
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (partial, receiving) = std::sync::mpsc::channel();
+    let peer = std::thread::spawn(move || {
+        let (socket, _) = listener.accept().unwrap();
+        let conn = rustls::ServerConnection::new(Arc::new(config)).unwrap();
+        let mut stream = rustls::StreamOwned::new(conn, socket);
+        let mut request = Vec::new();
+        let mut buffer = [0u8; 1024];
+        while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+            let n = stream.read(&mut buffer).unwrap();
+            request.extend_from_slice(&buffer[..n]);
+        }
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1024\r\n\r\n")
+            .unwrap();
+        stream.flush().unwrap();
+        stream.conn.writer().write_all(&[b'x'; 1024]).unwrap();
+        let mut encrypted = Vec::new();
+        while stream.conn.wants_write() {
+            stream.conn.write_tls(&mut encrypted).unwrap();
+        }
+        for (at, byte) in encrypted.iter().enumerate() {
+            if stream.sock.write_all(&[*byte]).is_err() {
+                break;
+            }
+            if at == 40 {
+                partial.send(()).unwrap();
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    });
+    let root = Ledger::with_resolution(Duration::from_millis(100));
+    let attempt = Arc::new(super::ledger::Attempt::default());
+    let ledger = root.for_request(Arc::clone(&attempt), root.sample());
+    let cancel = std::thread::spawn(move || {
+        receiving.recv_timeout(Duration::from_secs(2)).unwrap();
+        attempt.stopped.store(true, Ordering::Release);
+    });
+    let client = super::http::Client::with_extra_roots(&[cert]);
+    let policy = SourcePolicy {
+        allowed_hosts: vec!["localhost".into()],
+        allow_local: true,
+        max_redirects: 0,
+        ..Default::default()
+    };
+    let checked = policy
+        .check(&format!("https://localhost:{port}/object"))
+        .unwrap();
+    let response = super::http::request(
+        &client,
+        &checked,
+        "GET",
+        &[],
+        None,
+        Deadline::after_seconds(Some(2.0)),
+        &ledger,
+        super::http::Judge::Stream,
+        None,
+        Code::TRANSFER_FAILED,
+    );
+    let response = match response {
+        Ok(response) => response,
+        Err(refusal) => {
+            odd += 1;
+            println!("ZZTLS request failed: {refusal}");
+            let _ = cancel.join();
+            let _ = peer.join();
+            continue;
+        }
+    };
+    let started = std::time::Instant::now();
+    let refusal = response.read_capped(1024).unwrap_err();
+    assert!(
+        refusal.detail.contains("object attempt was stopped"),
+        "{refusal}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "partial TLS record hid cancellation"
+    );
+    root.check_running().unwrap();
+    cancel.join().unwrap();
+    peer.join().unwrap();
+    }
+    println!("ZZTLS rounds={rounds} odd={odd}");
+}
+
 /// Where the door spends its time at pull concurrency: 64 MiB objects from memory, so no
 /// network, through the same stream_verified -> admit_verified pair every pull uses. One
 /// real disk, three durability disciplines: per-object fsync (every admission before, and a
