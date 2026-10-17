@@ -4,8 +4,8 @@ name: dev-build
 #   Rust: -f build=none -f test='cargo test -p cozy-proto'
 #   TensorFS: -f build=tensorfs -f test='cargo test -p tensorfs-core --test store_contract'
 # Artifacts: cozy-cli-<sha> (cozy-<os>-<arch>.tar.gz for every release platform, the player and
-# SHA256SUMS, stamped dev-<sha>), tensord-<sha> (the manylinux x86_64 tensord Runtime's wheel
-# bundles) and tensorfs-wheel-<sha> (the manylinux x86_64 wheel). Tests get
+# SHA256SUMS, stamped dev-<sha>), tensord-<sha> (the runner arch's manylinux tensord that Runtime's
+# wheel bundles) and tensorfs-wheel-<sha> (the manylinux x86_64 wheel). Tests get
 # PostgreSQL (AUTHKIT_TEST_DATABASE_URL), the TensorFS wheel installed in a venv
 # (TENSORFS_TEST_PYTHON) when it was built, and a Runtime wheel (COZY_TEST_RUNTIME_WHEEL): the newest
 # published one, or runtime_ref's. No whole-suite default: `test` is empty unless given.
@@ -113,7 +113,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: tensord-${{ steps.sha.outputs.sha }}
-          path: dist/tensord/tensord-linux-x86_64
+          path: dist/tensord/tensord-linux-*
           if-no-files-found: error
           retention-days: 7
       # TensorFS's release wheel: the extension and the `tfs` it carries, both built in the
