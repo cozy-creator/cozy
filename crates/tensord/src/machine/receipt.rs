@@ -7,7 +7,6 @@ use std::{
     collections::BTreeMap,
     fs, io,
     path::PathBuf,
-    process::Command,
     sync::{Arc, Condvar, Mutex},
 };
 
@@ -178,82 +177,49 @@ pub struct Gpu {
     /// `"9.0"`: the lane rule's row (`precision`). Absent from envelopes sealed before it.
     #[serde(default)]
     pub compute_cap: String,
+    /// How it reaches host memory (`discrete`, `coherent`, `unified`); empty when unread. Status
+    /// reports it; the sealed receipt does not carry it.
+    #[serde(skip)]
+    pub memory_class: String,
 }
 
-/// The driver's inventory through the Runtime's fixed query; this process never loads CUDA or
-/// NVML. No `nvidia-smi` is a CPU machine; a driver that answers wrongly refuses the boot.
+/// The driver's inventory (NVML) and each GPU's memory class (CUDA's device attributes). It
+/// initializes CUDA here: call it once, in the service, which forks nothing without exec after.
+/// No NVIDIA driver is a CPU machine.
 pub fn gpus(visible: Option<&str>) -> io::Result<Vec<Gpu>> {
-    if visible == Some("") {
-        return Ok(vec![]);
+    let mut probed = cozy_platform::gpu::probe(visible).map_err(io::Error::other)?;
+    cozy_platform::gpu::memory_classes(&mut probed).map_err(io::Error::other)?;
+    if probed.len() > 16 {
+        return Err(invalid("GPU inventory is oversized"));
     }
-    let output = match Command::new("nvidia-smi")
-        .args([
-            "--query-gpu=index,name,uuid,pci.bus_id,memory.total,driver_version,compute_cap",
-            "--format=csv,noheader,nounits",
-        ])
-        .output()
-    {
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(vec![]),
-        Err(e) => return Err(e),
-        Ok(output) if !output.status.success() => {
-            return Err(invalid(&format!(
-                "nvidia-smi failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            )))
-        }
-        Ok(output) => output,
-    };
-    let mut rows = parse_gpus(
-        &String::from_utf8_lossy(&output.stdout),
-        cozy_platform::contain::host_memory::total(),
-    )?;
-    if let Some(visible) = visible {
-        let named: Vec<&str> = visible.split(',').map(str::trim).collect();
-        rows.retain(|g| {
-            named.contains(&g.device_index.to_string().as_str())
-                || named.contains(&g.device_uuid.as_str())
-        });
-    }
-    Ok(rows)
+    probed.into_iter().map(row).collect()
 }
 
-/// `host_total` is the host's `MemTotal`: an integrated GPU's memory (GB10, Jetson), for which
-/// nvidia-smi answers `[N/A]` because it has no framebuffer of its own.
-fn parse_gpus(text: &str, host_total: i64) -> io::Result<Vec<Gpu>> {
-    let mut rows = Vec::new();
-    for line in text.lines().filter(|l| !l.trim().is_empty()) {
-        let fields: Vec<&str> = line.split(',').map(str::trim).collect();
-        let row = match fields.as_slice() {
-            [index, name, uuid, bus, memory, driver, cc] if fields.iter().all(|f| !f.is_empty()) => {
-                Gpu {
-                    device_index: index
-                        .parse()
-                        .map_err(|_| invalid("nvidia-smi returned an invalid index"))?,
-                    device_name: (*name).into(),
-                    device_uuid: (*uuid).into(),
-                    driver_version: (*driver).into(),
-                    memory_bytes: match memory.parse::<u64>() {
-                        Ok(mib) => mib << 20,
-                        Err(_) if memory.contains("N/A") && host_total > 0 => host_total as u64,
-                        Err(_) => return Err(invalid("nvidia-smi returned invalid memory")),
-                    },
-                    pci_bus_id: (*bus).into(),
-                    compute_cap: (*cc).into(),
-                }
-            }
-            _ => return Err(invalid("nvidia-smi returned an invalid row")),
-        };
-        rows.push(row);
-    }
-    rows.sort_by_key(|g| g.device_index);
-    if rows.len() > 16
-        || rows
-            .windows(2)
-            .any(|w| w[0].device_index == w[1].device_index)
-    {
-        return Err(invalid("GPU inventory is duplicate or oversized"));
-    }
-    Ok(rows)
+/// One probed GPU as the receipt names it. An integrated GPU's (GB10) memory is the host's, as
+/// the probe reads it.
+fn row(g: cozy_platform::gpu::Gpu) -> io::Result<Gpu> {
+    use cozy_platform::gpu::MemoryClass;
+    let memory_bytes = match g.memory_bytes {
+        0 => return Err(invalid(&format!("the driver reports no memory for {}", g.name))),
+        // Whole MiB, as the receipts sealed before NVML read them.
+        bytes => bytes >> 20 << 20,
+    };
+    Ok(Gpu {
+        device_index: g.index,
+        device_name: g.name,
+        device_uuid: g.uuid,
+        driver_version: g.driver,
+        memory_bytes,
+        pci_bus_id: g.pci_bus_id,
+        compute_cap: g.compute_capability.map(|(major, minor)| format!("{major}.{minor}")).unwrap_or_default(),
+        memory_class: match g.memory_class {
+            Some(MemoryClass::Discrete) => "discrete",
+            Some(MemoryClass::Coherent) => "coherent",
+            Some(MemoryClass::Unified) => "unified",
+            None => "",
+        }
+        .into(),
+    })
 }
 
 /// The facts the Hub's readiness reader requires of a machine image, as measured here on
@@ -396,6 +362,7 @@ mod tests {
                 memory_bytes: 1 << 30,
                 pci_bus_id: "00000000:01:00.0".into(),
                 compute_cap: "8.6".into(),
+                memory_class: String::new(),
             }],
             listener_bound: true,
             foreign_credential_refused: true,
@@ -438,18 +405,19 @@ mod tests {
     }
 
     #[test]
-    fn nvidia_smi_rows_parse_as_the_runtime_reads_them() {
-        let rows = parse_gpus("1, NVIDIA A40, GPU-b, 00000000:02:00.0, 46068, 580.65.06, 8.6\n0, NVIDIA A40, GPU-a, 00000000:01:00.0, 46068, 580.65.06, 8.6\n", 1 << 40).unwrap();
-        assert_eq!(
-            rows.iter().map(|g| g.device_index).collect::<Vec<_>>(),
-            [0, 1]
-        );
-        assert_eq!((rows[0].memory_bytes, rows[0].compute_cap.as_str()), (46068 << 20, "8.6"));
-        assert!(parse_gpus("0, NVIDIA A40, , 00:01.0, 1, 1, 8.6", 1 << 40).is_err());
-        // GB10 shares the host's memory: nvidia-smi has no framebuffer total to report.
-        let gb10 = "0, NVIDIA GB10, GPU-c, 0000000F:01:00.0, [N/A], 580.95.05, 12.1\n";
-        assert_eq!(parse_gpus(gb10, 128 << 30).unwrap()[0].memory_bytes, 128 << 30);
-        assert!(parse_gpus(gb10, -1).is_err());
-        assert!(parse_gpus("0, NVIDIA A40, GPU-a, 00:01.0, lots, 1, 8.6", 1 << 40).is_err());
+    fn a_probed_gpu_reads_as_the_receipt_names_it() {
+        let a40 = cozy_platform::gpu::Gpu {
+            index: 0,
+            name: "NVIDIA A40".into(),
+            uuid: "GPU-a".into(),
+            pci_bus_id: "00000000:01:00.0".into(),
+            memory_bytes: (46068 << 20) + 12345,
+            driver: "580.65.06".into(),
+            compute_capability: Some((8, 6)),
+            memory_class: Some(cozy_platform::gpu::MemoryClass::Discrete),
+        };
+        let read = row(a40.clone()).unwrap();
+        assert_eq!((read.memory_bytes, read.compute_cap.as_str(), read.memory_class.as_str()), (46068 << 20, "8.6", "discrete"));
+        assert!(row(cozy_platform::gpu::Gpu { memory_bytes: 0, ..a40 }).is_err());
     }
 }
