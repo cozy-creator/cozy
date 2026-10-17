@@ -153,19 +153,18 @@ jobs:
             printf '%s\n' "$out"
             if [ "$code" = 0 ]; then ran=1; else echo "::error::cozy $* exited $code"; fail=1; fi
           }
-          # `cozy --json <words…>` must be refused with code $1; skipped like `step`.
+          # `cozy --json <words…>` must succeed: these verbs are in every release, never skipped.
+          must() {
+            code=0
+            out=$("$cozy" --json "$@") || code=$?
+            printf '%s\n' "$out"
+            [ "$code" = 0 ] || { echo "::error::cozy $* exited $code"; fail=1; }
+          }
+          # `cozy --json <words…>` must be refused with code $1.
           refuses() {
             want=$1 code=0
             shift
-            if ! "$cozy" "$@" --help > /dev/null 2>&1; then
-              echo "skipped, not in the grammar yet: cozy $*"
-              return
-            fi
             out=$("$cozy" --json "$@") || code=$?
-            if printf '%s' "$out" | grep -Eq '"code": *"not_ported"'; then
-              echo "skipped, not ported: cozy $*"
-              return
-            fi
             printf '%s\n' "$out"
             [ "$code" != 0 ] && printf '%s' "$out" | grep -Eq "\"code\": *\"$want\"" \
               || { echo "::error::cozy $* answered $code, not $want"; fail=1; }
@@ -177,11 +176,9 @@ jobs:
           step package search sdxl
           # The local machine: `enable` returns once `local` is ready (Linux); elsewhere it is refused.
           if [ "$RUNNER_OS" = Linux ]; then
-            step machine enable
-            if [ "$ran" = 1 ]; then
-              step machine show local
-              step machine disable
-            fi
+            must machine enable
+            must machine show local
+            must machine disable
           else
             refuses machine_role_unsupported machine enable
           fi
