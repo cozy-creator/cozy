@@ -280,7 +280,8 @@ pub fn become_subreaper() -> Result<()> {
 
 /// In a child just forked from `parent`: SIGKILL arrives when the parent dies. `false` when the
 /// parent was already gone before this call armed it (the child then has no parent to serve).
-/// Linux only.
+/// Linux's parent-death signal; a thread watching the parent's exit on macOS (it ends at an
+/// exec); Windows answers `Unsupported`.
 pub fn die_with_parent(parent: u32) -> Result<bool> {
     sys::die_with_parent(parent)
 }
