@@ -166,6 +166,12 @@ pub fn serves_own_log() -> bool {
     false
 }
 
+/// Released TensorD 0.7.3 drops the executor's adjustment rows; this workspace's keeps them on the
+/// outcome (cr-197 U2, #1383). The cohort deletes this.
+pub fn reports_adjustments() -> bool {
+    workspace()
+}
+
 /// A TensorD added to `home`'s Calcifer as `name`, the way a person adds one: `cozy machine add`
 /// answers the key this controller signs with, the machine admits it, and the add is made again.
 pub fn added(home: &super::Home, name: &str) -> Tensord {

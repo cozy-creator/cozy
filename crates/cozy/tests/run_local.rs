@@ -524,6 +524,10 @@ fn a_runs_adjustments_reach_its_record() {
         &["--json", "run", "./tiny-adjusted/steps", "--on", "m1"],
     ));
     assert_eq!(run["result"]["steps"], 30, "{run}");
+    if !common::tensord::reports_adjustments() {
+        assert!(run["adjustments"].is_null(), "{run}");
+        return;
+    }
     assert_eq!(
         run["adjustments"],
         serde_json::json!([
