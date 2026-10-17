@@ -16,13 +16,14 @@ use ratatui::{
     widgets::{Block, Paragraph, Row, Table, TableState},
 };
 
-use crate::{Context, machine, run};
+use crate::{Context, machine, package, run};
 
 /// One live view.
 pub(crate) enum Screen {
     Runs(run::live::Runs),
     Run(Box<run::live::Live>),
     Machines(machine::live::Machines),
+    Packages(package::live::Packages),
 }
 
 impl Screen {
@@ -32,6 +33,7 @@ impl Screen {
             Screen::Runs(view) => view.changed(ctx).await,
             Screen::Run(view) => view.changed().await,
             Screen::Machines(view) => view.changed(ctx).await,
+            Screen::Packages(view) => view.changed(ctx).await,
         }
     }
 
@@ -60,6 +62,13 @@ impl Screen {
                 view.rows(ctx),
                 selected,
             ),
+            Screen::Packages(view) => table(
+                frame,
+                &view.title(),
+                &view.headers(),
+                view.rows(ctx),
+                selected,
+            ),
             Screen::Run(view) => {
                 let block = Block::new().title(format!("{}  (Esc back, q quits)", view.title()));
                 let lines: Vec<Line> = view.lines(ctx).into_iter().map(Line::from).collect();
@@ -72,6 +81,7 @@ impl Screen {
         match self {
             Screen::Runs(view) => view.rows().len(),
             Screen::Machines(view) => view.rows(ctx).len(),
+            Screen::Packages(view) => view.rows(ctx).len(),
             Screen::Run(_) => 0,
         }
     }
@@ -218,14 +228,29 @@ pub mod testing {
     use ratatui::{Terminal, backend::TestBackend};
 
     use super::Screen;
-    use crate::{Context, output::Term, run};
+    use crate::{Context, output::Term, package, run};
 
-    /// Draws `cozy run list`'s live view of the Calcifer serving the cozy home `root` (a
-    /// `~/.cozy`, whose Calcifer already runs), handing each frame's text to `frame` until it
-    /// answers true. A frame is drawn only when Calcifer says a run changed.
-    pub async fn run_list(root: &Path, mut frame: impl FnMut(&str) -> bool) -> Result<(), Error> {
+    /// A live view the product tests draw.
+    pub enum View {
+        /// `cozy run list`
+        Runs,
+        /// `cozy package list`
+        Packages,
+    }
+
+    /// Draws `view` of the Calcifer serving the cozy home `root` (a `~/.cozy`, whose Calcifer
+    /// already runs), handing each frame's text to `frame` until it answers true. A frame is
+    /// drawn only when Calcifer says something the view shows changed.
+    pub async fn draw(
+        root: &Path,
+        view: View,
+        mut frame: impl FnMut(&str) -> bool,
+    ) -> Result<(), Error> {
         let ctx = context(root)?;
-        let mut screen = Screen::Runs(run::live::Runs::open(&ctx, Default::default(), 50).await?);
+        let mut screen = match view {
+            View::Runs => Screen::Runs(run::live::Runs::open(&ctx, Default::default(), 50).await?),
+            View::Packages => Screen::Packages(package::live::Packages::open(&ctx, None).await?),
+        };
         let mut terminal = Terminal::new(TestBackend::new(200, 20)).expect("a test terminal");
         let mut selected = ratatui::widgets::TableState::default().with_selected(Some(0));
         loop {

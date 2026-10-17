@@ -12,6 +12,7 @@ use crate::{Context, run::Placement};
 
 mod author;
 mod catalog;
+pub(crate) mod live;
 pub(crate) mod local;
 mod machine;
 mod registry;
@@ -63,11 +64,14 @@ enum Command {
         #[command(flatten)]
         placement: Placement,
     },
-    /// The packages your ready machines hold.
+    /// The packages your ready machines hold, live on a terminal.
     List {
         /// Only this machine.
         #[arg(long, value_name = "MACHINE")]
         on: Option<String>,
+        /// One snapshot even on a terminal, instead of the live view.
+        #[arg(long)]
+        once: bool,
     },
     /// Lock this project's dependencies for the Hub and account it publishes to (needs uv).
     Lock {
@@ -106,7 +110,7 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
             packages,
             placement,
         } => machine::remove(ctx, &names(&packages)?, placement.on()).await,
-        Command::List { on } => machine::list(ctx, on.map(Into::into)).await,
+        Command::List { on, once } => machine::list(ctx, on.map(Into::into), once).await,
         Command::Lock { upgrade } => author::lock(ctx, &upgrade).await,
         Command::Publish => author::publish(ctx).await,
         Command::Yank { release } => author::yank(ctx, &PackageRef::parse(&release)?).await,
