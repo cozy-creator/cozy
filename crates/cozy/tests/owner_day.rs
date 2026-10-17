@@ -471,6 +471,15 @@ fn views_print_once_off_a_terminal_and_cancel_settles_running_and_queued_runs() 
     assert_eq!(sent.code, 0, "{sent:?}");
     let number = serde_json::from_str::<Value>(&sent.stdout).unwrap()["number"].to_string();
     reaches(&home, &number, "in_progress");
+    // Rendering, past its install: the machine holds the package.
+    let until = Instant::now() + PATIENCE;
+    while home.json(["package", "list", "--json"])["packages"]
+        .as_array()
+        .is_none_or(Vec::is_empty)
+    {
+        assert!(Instant::now() < until, "the package never installed");
+        std::thread::sleep(Duration::from_millis(500));
+    }
 
     let views: [(Vec<&str>, [&str; 2]); 4] = [
         (vec!["run", "list"], ["TARGET", "STATUS"]),
