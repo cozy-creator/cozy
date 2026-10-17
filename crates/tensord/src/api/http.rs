@@ -632,6 +632,42 @@ async fn health(headers: HeaderMap) -> Result<StatusCode, Refusal> {
 mod tests {
     use super::*;
 
+    /// Every path and method the committed spec names is routed: none answers the router's
+    /// fallbacks (`route_not_found`, 405).
+    #[tokio::test]
+    async fn every_path_and_method_in_the_spec_is_routed() {
+        use tower::ServiceExt;
+        struct Bare;
+        impl MachineBackend for Bare {
+            fn workspace(
+                &self,
+                _: VerifiedActor,
+                _: domain::MachineExecutionWorkspaceQuery,
+            ) -> Result<domain::MachineExecutionWorkspace, Error> {
+                Ok(Default::default())
+            }
+        }
+        let key = ed25519_dalek::SigningKey::from_bytes(&[1; 32]).verifying_key();
+        let identity = MachineIdentity::ephemeral("m".into(), vec![key], vec![7; 32]).unwrap();
+        let router = router(Arc::new(identity), Arc::new(Bare));
+        let spec: serde_json::Value = serde_json::from_str(&v1::api::spec()).unwrap();
+        let paths = spec["paths"].as_object().unwrap();
+        let mut routed = 0;
+        for (path, item) in paths {
+            let uri = path.split('/').map(|s| if s.starts_with('{') { "x" } else { s }).collect::<Vec<_>>().join("/");
+            for method in item.as_object().unwrap().keys().filter(|m| ["get", "put", "post", "head"].contains(&m.as_str())) {
+                let request = axum::http::Request::builder().method(method.to_uppercase().as_str()).uri(&uri);
+                let response = router.clone().oneshot(request.body(Body::empty()).unwrap()).await.unwrap();
+                let status = response.status();
+                let body = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+                let fallback = String::from_utf8_lossy(&body).contains("route_not_found");
+                assert!(status != StatusCode::METHOD_NOT_ALLOWED && !fallback, "{method} {path}: {status}");
+                routed += 1;
+            }
+        }
+        assert_eq!(routed, 11, "the spec's routes");
+    }
+
     /// A read from any offset answers exactly the bytes after it, across parts, and reads
     /// none before it: the parts it skips are not read at all.
     #[test]
