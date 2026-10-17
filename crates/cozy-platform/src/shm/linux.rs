@@ -142,6 +142,16 @@ pub(super) fn populate_write(base: *mut u8, len: usize) -> bool {
     unsafe { libc::madvise(base.cast(), len, MADV_POPULATE_WRITE) == 0 }
 }
 
+/// `bytes` as a file no process can write or resize: a memfd sealed against writes, handed on
+/// as a new read-only description.
+pub fn frozen(name: &str, bytes: &[u8]) -> Result<std::fs::File> {
+    use std::{io::Write, os::fd::AsFd};
+    let mut file = std::fs::File::from(memfd_named(name)?);
+    file.write_all(bytes)?;
+    seal_with(file.as_fd(), super::NO_WRITE_SEALS)?;
+    Ok(std::fs::File::from(reopen(file.as_fd(), false)?))
+}
+
 /// Whether a process still holds the file `(dev, ino)`: an open descriptor of it or a mapping.
 /// Only processes this one may inspect are asked; another user's process cannot have been
 /// handed this process's files.
