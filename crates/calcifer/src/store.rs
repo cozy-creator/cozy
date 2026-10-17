@@ -144,6 +144,12 @@ pub enum StoreError {
     UnknownMachine(String),
     #[error("Calcifer's store holds a row it cannot read: {0}")]
     Corrupt(String),
+    #[error(
+        "Calcifer could not rewrite its store's runs as JSON ({reason}); the store is as it was, and \
+         a copy of it is at {}",
+        backup.display()
+    )]
+    Conversion { backup: PathBuf, reason: String },
     #[error("Calcifer's store already holds runs or machines; an import needs an empty one")]
     NotEmpty,
 }
@@ -320,6 +326,15 @@ impl Store {
             // A copy of the store as it was, beside it, before its rows are rewritten.
             let backup = path.with_extension(format!("db.pre-json-{}", now_ms()));
             conn.backup(rusqlite::MAIN_DB, &backup, None)?;
+            migrations
+                .to_latest(&mut conn)
+                .map_err(|e| StoreError::Conversion {
+                    backup,
+                    reason: match e {
+                        rusqlite_migration::Error::Hook(reason) => reason,
+                        e => e.to_string(),
+                    },
+                })?;
         }
         migrations.to_latest(&mut conn)?;
         Ok(Self {
