@@ -17,7 +17,7 @@ use tensorfs_core::{
     sha256, source_artifact,
     store::{Fault, Store},
 };
-use tonic::Status;
+use cozy_proto::error::Error;
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct IntakeSpec {
@@ -78,7 +78,7 @@ impl SourceIntake {
         workspace: &str,
         actor: VerifiedActor,
         header: domain::InputTreeImportHeader,
-    ) -> Result<Box<dyn InputTreeReceiver>, Status> {
+    ) -> Result<Box<dyn InputTreeReceiver>, Error> {
         if header.request_id.is_empty()
             || header.request_id.len() > 128
             || !header
@@ -89,21 +89,21 @@ impl SourceIntake {
             || header.input_id.len() > 1024
             || !header.input_id.bytes().all(|b| (0x20..=0x7e).contains(&b))
         {
-            return Err(Status::invalid_argument(
+            return Err(Error::validation("invalid_request",
                 "input subject is outside its typed identifier bound",
             ));
         }
         let reference = header
             .manifest
             .as_ref()
-            .ok_or_else(|| Status::invalid_argument("input manifest reference is absent"))?;
+            .ok_or_else(|| Error::validation("invalid_request", "input manifest reference is absent"))?;
         if reference.digest.len() != 32
             || reference.length != header.manifest_canonical_bytes.len() as u64
             || header.manifest_canonical_bytes.is_empty()
             || header.manifest_canonical_bytes.len() > 1 << 20
             || sha256::digest(&header.manifest_canonical_bytes).as_slice() != reference.digest
         {
-            return Err(Status::invalid_argument(
+            return Err(Error::validation("invalid_request",
                 "input manifest bytes do not verify",
             ));
         }
@@ -114,7 +114,7 @@ impl SourceIntake {
                 .iter()
                 .any(|(_, entry)| entry.kind() != "file")
         {
-            return Err(Status::invalid_argument(
+            return Err(Error::validation("invalid_request",
                 "input tree must contain ordinary files",
             ));
         }
@@ -122,9 +122,9 @@ impl SourceIntake {
             .entries()
             .iter()
             .try_fold(0u64, |sum, (_, entry)| sum.checked_add(entry.blob().length))
-            .ok_or_else(|| Status::invalid_argument("input content length overflow"))?;
+            .ok_or_else(|| Error::validation("invalid_request", "input content length overflow"))?;
         if content != header.content_bytes {
-            return Err(Status::invalid_argument(
+            return Err(Error::validation("invalid_request",
                 "input content count differs from manifest",
             ));
         }
@@ -135,7 +135,7 @@ impl SourceIntake {
                 .insert(reference.sha256.clone(), reference.clone())
                 .is_some_and(|prior: ObjectRef| prior.length != reference.length)
             {
-                return Err(Status::invalid_argument(
+                return Err(Error::validation("invalid_request",
                     "one input object cannot declare multiple lengths",
                 ));
             }
@@ -163,7 +163,7 @@ impl SourceIntake {
         };
         let state = journal.begin_intake(spec.clone()).map_err(database)?;
         if state.spec != spec {
-            return Err(Status::failed_precondition(
+            return Err(Error::conflict("precondition_failed",
                 "input intake changed its immutable subject",
             ));
         }
@@ -189,7 +189,7 @@ impl SourceIntake {
             _writer: writer,
         }))
     }
-    fn result(&self, released: bool) -> Result<domain::NativeByteRetentionResult, Status> {
+    fn result(&self, released: bool) -> Result<domain::NativeByteRetentionResult, Error> {
         let root =
             source_artifact::read(&self.store, &self.state.spec.retention_id).map_err(native)?;
         let source = match root {
@@ -210,7 +210,7 @@ impl SourceIntake {
             released,
         })
     }
-    fn release_native(&self) -> Result<(), Status> {
+    fn release_native(&self) -> Result<(), Error> {
         if source_artifact::read(&self.store, &self.state.spec.retention_id)
             .map_err(native)?
             .is_some()
@@ -221,25 +221,25 @@ impl SourceIntake {
     }
 }
 impl InputTreeReceiver for SourceIntake {
-    fn blob(&mut self, blob: domain::InputTreeImportBlob) -> Result<(), Status> {
+    fn blob(&mut self, blob: domain::InputTreeImportBlob) -> Result<(), Error> {
         if self.state.released {
-            return Err(Status::failed_precondition(
+            return Err(Error::conflict("precondition_failed",
                 "input intake is permanently released",
             ));
         }
         let object = blob
             .object
-            .ok_or_else(|| Status::invalid_argument("input object reference absent"))?;
+            .ok_or_else(|| Error::validation("invalid_request", "input object reference absent"))?;
         if object.digest.len() != 32 {
-            return Err(Status::invalid_argument("input object digest is invalid"));
+            return Err(Error::validation("invalid_request", "input object digest is invalid"));
         }
         let hash = sha256::hex(&object.digest);
         let expected = self
             .objects
             .get(&hash)
-            .ok_or_else(|| Status::invalid_argument("input object is outside declared manifest"))?;
+            .ok_or_else(|| Error::validation("invalid_request", "input object is outside declared manifest"))?;
         if object.length != expected.length || blob.data.len() > 1 << 20 {
-            return Err(Status::invalid_argument(
+            return Err(Error::validation("invalid_request",
                 "input object identity or chunk bound differs",
             ));
         }
@@ -267,7 +267,7 @@ impl InputTreeReceiver for SourceIntake {
             || blob.data.len() as u64 > partial.reference.length - partial.received
             || (blob.data.is_empty() && partial.reference.length != 0)
         {
-            return Err(Status::failed_precondition(
+            return Err(Error::conflict("precondition_failed",
                 "input object chunks must be contiguous within one stream",
             ));
         }
@@ -282,7 +282,7 @@ impl InputTreeReceiver for SourceIntake {
     fn commit(
         self: Box<Self>,
         commit: domain::InputTreeImportCommit,
-    ) -> Result<domain::NativeByteRetentionResult, Status> {
+    ) -> Result<domain::NativeByteRetentionResult, Error> {
         if commit.abort || self.state.released {
             self.journal
                 .abort_intake(&self.state.spec.actor, &self.state.spec.retention_id)
@@ -299,9 +299,9 @@ impl InputTreeReceiver for SourceIntake {
             let partial = self
                 .partials
                 .get(&reference.sha256)
-                .ok_or_else(|| Status::failed_precondition("input object is incomplete"))?;
+                .ok_or_else(|| Error::conflict("precondition_failed", "input object is incomplete"))?;
             if partial.received != reference.length {
-                return Err(Status::failed_precondition("input object is incomplete"));
+                return Err(Error::conflict("precondition_failed", "input object is incomplete"));
             }
             partial.file.sync_all().map_err(database)?;
         }
@@ -345,29 +345,29 @@ impl InputTreeReceiver for SourceIntake {
         }
         if let Some(receipt) = committed.receipt {
             return crate::archive::decode_native_byte_retention_result(receipt.as_slice())
-                .map_err(|_| Status::data_loss("committed intake receipt is invalid"));
+                .map_err(|_| Error::internal("custody_corrupt", "committed intake receipt is invalid"));
         }
-        Err(Status::data_loss(
+        Err(Error::internal("custody_corrupt",
             "journal acknowledged input without durable receipt",
         ))
     }
 }
-fn decode_hex(spelling: &str) -> Result<Vec<u8>, Status> {
+fn decode_hex(spelling: &str) -> Result<Vec<u8>, Error> {
     (0..32)
         .map(|index| {
             u8::from_str_radix(&spelling[index * 2..index * 2 + 2], 16)
-                .map_err(|_| Status::data_loss("native digest is invalid"))
+                .map_err(|_| Error::internal("custody_corrupt", "native digest is invalid"))
         })
         .collect()
 }
-fn native(error: impl std::fmt::Display) -> Status {
-    Status::failed_precondition(format!("native input custody: {error}"))
+fn native(error: impl std::fmt::Display) -> Error {
+    Error::conflict("precondition_failed", format!("native input custody: {error}"))
 }
-fn database(error: io::Error) -> Status {
+fn database(error: io::Error) -> Error {
     match error.kind() {
-        io::ErrorKind::AlreadyExists => Status::already_exists(error.to_string()),
-        io::ErrorKind::PermissionDenied => Status::permission_denied(error.to_string()),
-        io::ErrorKind::InvalidInput => Status::invalid_argument(error.to_string()),
-        _ => Status::unavailable(error.to_string()),
+        io::ErrorKind::AlreadyExists => Error::conflict("already_exists", error.to_string()),
+        io::ErrorKind::PermissionDenied => Error::forbidden("capability_scope", error.to_string()),
+        io::ErrorKind::InvalidInput => Error::validation("invalid_request", error.to_string()),
+        _ => Error::unavailable("unavailable", error.to_string()),
     }
 }
