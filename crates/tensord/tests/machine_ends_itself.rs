@@ -560,3 +560,69 @@ async fn a_job_that_cannot_start_fails_once_and_the_rental_idles_out() {
     drop(machine);
     std::fs::remove_dir_all(root).unwrap();
 }
+
+/// An output read that moves bytes is the rental in use: a throttled download outlasts the idle
+/// window several times over and holds the rental, which releases one window after the read's
+/// last bytes. (A read that stalls moves nothing, so it holds nothing.)
+#[tokio::test]
+async fn a_slow_output_read_holds_the_rental_until_its_last_bytes() {
+    const WINDOW: u32 = 8;
+    let root = root("idle-read");
+    let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let (provider_port, received) = provider();
+    let mut machine = launch_idle(&root, port, provider_port, WINDOW);
+    ready(&mut machine, &root, port);
+    let client = owner(&root, port);
+    let bulk = client.bulk().unwrap();
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cpu_bulk");
+    let write = async |bytes: Vec<u8>| -> String {
+        let digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&bytes));
+        let length = bytes.len() as u64;
+        bulk.put(&digest, (0, length, length), bytes).await.unwrap();
+        digest
+    };
+    let mut files = vec![];
+    for name in ["pyproject.toml", "package.toml", "cpu_bulk/__init__.py"] {
+        let bytes = std::fs::read(fixture.join(name)).unwrap();
+        let length = bytes.len();
+        files.push(serde_json::json!({"name": name, "digest": write(bytes).await, "length": length}));
+    }
+    let manifest = serde_json::json!({"package": "local/tensord-cpu-bulk", "release": "0.1.0", "files": files});
+    let manifest = write(manifest.to_string().into_bytes()).await;
+    const SIZE: u64 = 96 << 20;
+    let spec = v1::RunSpec {
+        kind: v1::RunKind::Call,
+        source: Some(v1::Source::Local(v1::LocalSource { manifest })),
+        entrypoint: "bulk".into(),
+        payload: Some(v1::Json::parse(format!(r#"{{"size":{SIZE}}}"#)).unwrap()),
+        ..Default::default()
+    };
+    let events = common::run(&client, "bulk", spec).await;
+    let outcome = common::outcome(&events);
+    assert_eq!(outcome.status, "succeeded", "{outcome:?}");
+    let product = outcome.outputs.first().unwrap_or_else(|| panic!("{outcome:?}"));
+    assert_eq!(product.length, SIZE);
+
+    // About 4 MiB a second: three idle windows and more.
+    let target = v1::OutputTarget { run: "bulk".into(), output: product.output.clone(), index: product.index, member: String::new() };
+    let mut output = bulk.get(&target, (0, 0), 0).await.unwrap();
+    let started = now_ms();
+    let mut read = 0u64;
+    while let Some(chunk) = output.body.next().await {
+        read += chunk.unwrap().len() as u64;
+        let due = started + (read >> 20) as i64 * 250;
+        tokio::time::sleep(Duration::from_millis((due - now_ms()).max(0) as u64)).await;
+    }
+    let finished = now_ms();
+    assert_eq!(read, SIZE);
+    assert!(finished - started > 3 * i64::from(WINDOW) * 1000, "the read took {} ms", finished - started);
+    assert!(received.try_recv().is_err(), "the rental released itself while its output was being read");
+    received
+        .recv_timeout(Duration::from_millis(u64::from(WINDOW) * 1000 + 15_000))
+        .expect("the rental did not release itself one window after the read");
+    let released = now_ms();
+    // The read's last bytes left the machine a few buffers before they reached this client.
+    assert!(released >= finished - 4_000 + i64::from(WINDOW) * 1000 - 1_000, "released at {released}, read ended {finished}");
+    drop(machine);
+    std::fs::remove_dir_all(root).unwrap();
+}

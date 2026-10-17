@@ -9,7 +9,7 @@ use std::{
     io,
     path::PathBuf,
     sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -51,6 +51,8 @@ pub struct Lifecycle {
     state: Mutex<State>,
     admissions: AtomicUsize,
     epoch: AtomicU64,
+    /// When an output read last moved bytes (unix ms).
+    transferred: AtomicI64,
 }
 
 /// Holds the release while a call that may queue a job is in flight.
@@ -97,6 +99,7 @@ impl Lifecycle {
             state: Mutex::new(State { ledger, jobs: Jobs::default(), sampled: 0, activating: false }),
             admissions: AtomicUsize::new(0),
             epoch: AtomicU64::new(0),
+            transferred: AtomicI64::new(0),
         });
         lifecycle.save(&lifecycle.state.lock().unwrap().ledger)?;
         Ok(lifecycle)
@@ -106,10 +109,17 @@ impl Lifecycle {
         super::identity::write_atomic(&self.path, &serde_json::to_vec(ledger)?, 0o600)
     }
 
-    /// When the idle clock runs out: 15 minutes after the later of its start and the last
-    /// job's end.
+    /// When the idle clock runs out: 15 minutes after the latest of its start, the last job's end
+    /// and the last bytes an output read moved.
     fn idle_end(&self, state: &State) -> i64 {
-        state.ledger.idle_since_ms.max(state.jobs.ended_ms) + self.grace
+        let used = state.jobs.ended_ms.max(self.transferred.load(Ordering::Acquire));
+        state.ledger.idle_since_ms.max(used) + self.grace
+    }
+
+    /// An output read moved bytes: the rental is in use, and its idle clock starts again now. A
+    /// read that stalls moves nothing, so it never holds the rental past one window.
+    pub fn transferred(&self) {
+        self.transferred.fetch_max(now_ms(), Ordering::AcqRel);
     }
 
     fn due(&self, state: &State, now: i64) -> bool {
