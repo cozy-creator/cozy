@@ -41,6 +41,7 @@ fn boot(root: &Path, port: u16, cache: Option<&Path>) -> Machine {
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
         .env("COZY_MACHINE_ROOT", root)
+            .env("HOME", root.join("home"))
         .env("COZY_WORKER_ID", WORKER)
         .env("COZY_WORKER_AUTH_TOKEN", URL_SAFE_NO_PAD.encode([1; 32]))
         .env("COZY_WORKER_INTERNAL_PORT", port.to_string())
@@ -49,7 +50,7 @@ fn boot(root: &Path, port: u16, cache: Option<&Path>) -> Machine {
         .env("COZY_BOOTSTRAP_RECEIPT_HMAC_KEY_B64URL", URL_SAFE_NO_PAD.encode([7; 32]))
         .env("TENSORHUB_ORIGIN", "https://hub.invalid")
         .env("CUDA_VISIBLE_DEVICES", "")
-        .env("COZY_MACHINE_LIFETIME", "persistent")
+        .arg("--persistent")
         .stdout(Stdio::null())
         .stderr(Stdio::inherit());
     if let Some(cache) = cache {
