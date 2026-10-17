@@ -2,7 +2,6 @@
 //! `policy` decides from samples and executor facts; `nvml` samples on its own thread; this
 //! module joins them and keeps the floor while a call runs.
 pub mod call;
-pub mod host;
 pub mod learned;
 pub mod nvml;
 pub mod policy;
