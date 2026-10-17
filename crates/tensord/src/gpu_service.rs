@@ -1321,6 +1321,7 @@ impl Pool {
     /// Each GPU of the lane decides for itself, in device order (so two groups never wait
     /// on each other): one cap per GPU, rank 0's first. None: that GPU could not say.
     fn decide(&self, plan: &str, start: usize, degree: u32, spawn: bool) -> io::Result<Vec<Option<u64>>> {
+        self.reap();
         let mut caps = vec![];
         for (gpu, device) in (start..).zip(self.lane(start, degree)?) {
             caps.push(device.memory.decide(
@@ -1352,13 +1353,40 @@ impl Pool {
             .as_ref()
             .ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, "no GPU weight custody"))?;
         custody.lock().unwrap().begin_revoke(key, generation)?;
-        for session in self.sessions.lock().unwrap().values_mut() {
+        let mut failed = vec![];
+        for (name, session) in self.sessions.lock().unwrap().iter_mut() {
             if let Err(error) = release_revoked(custody, &mut session.executor) {
-                tracing::warn!("resident revoke left a lease charged: {error}");
+                failed.push((name.clone(), error));
             }
         }
+        self.end_failed(failed);
         log_released(custody.lock().unwrap().collect(), &self.notes);
         Ok(())
+    }
+    /// Idle executors whose channel failed end, and what they held (context, leases) with them:
+    /// another tenant's failure is never the asking call's.
+    fn end_failed(&self, failed: Vec<(String, io::Error)>) {
+        for (key, error) in failed {
+            let Some(session) = self.sessions.lock().unwrap().remove(&key) else { continue };
+            tracing::warn!("memory: idle executor {key} failed ({error}); ending it");
+            let (plan, start, degree) = (session.plan.clone(), session.start, session.degree);
+            if let Err(error) = session.executor.terminate() {
+                tracing::warn!("memory: ending idle executor {key}: {error}");
+            }
+            self.ended(&plan, start, degree);
+        }
+    }
+    /// Idle executors that exited leave the ledger now: no GPU charges what they held.
+    fn reap(&self) {
+        let gone: Vec<Session> = {
+            let mut sessions = self.sessions.lock().unwrap();
+            let ended = |s: &Session| s.executor.birth.ended().unwrap_or(false);
+            let keys: Vec<String> = sessions.iter().filter(|(_, s)| ended(s)).map(|(key, _)| key.clone()).collect();
+            keys.iter().filter_map(|key| sessions.remove(key)).collect()
+        };
+        for session in gone {
+            self.ended(&session.plan, session.start, session.degree);
+        }
     }
     pub fn source_facts(&self, selections: &[SelectedManifest]) -> io::Result<ModelSources> {
         ModelSources::open_shared(self.store.clone(), selections)
@@ -2553,9 +2581,10 @@ impl Pool {
                     drop(sessions);
                     return self.carry_out(device, &Step::Revoke(id.clone()));
                 };
-                for session in sessions
-                    .values_mut()
-                    .filter(|s| holding.readers.contains(&s.executor.birth))
+                let mut failed = vec![];
+                for (key, session) in sessions
+                    .iter_mut()
+                    .filter(|(_, s)| holding.readers.contains(&s.executor.birth))
                 {
                     let reply = session.executor.command(
                         &DeviceCommand::Revoke {
@@ -2564,13 +2593,20 @@ impl Pool {
                             regions: regions.clone(),
                         },
                         &mut device_executor::Baseline,
-                    )?;
-                    if !reply.ok {
+                    );
+                    match reply {
+                        Ok(reply) if reply.ok => {}
                         // Its mapping stays a reference: the regions stay charged, nothing freed.
-                        tracing::warn!("trim of {} refused: {} {}", id, reply.code, reply.detail);
-                        return Ok(false);
+                        Ok(reply) => {
+                            tracing::warn!("trim of {} refused: {} {}", id, reply.code, reply.detail);
+                            return Ok(false);
+                        }
+                        Err(error) => failed.push((key.clone(), error)),
                     }
                 }
+                // A reader whose channel failed ends, and its mapping with it.
+                drop(sessions);
+                self.end_failed(failed);
                 let freed =
                     custody
                         .lock()
@@ -2656,18 +2692,8 @@ impl Pool {
                 newest.map(|at| idle.remove(at))
             }
             _ => {
-                let mut sessions = self.sessions.lock().unwrap();
-                let mut ended = vec![];
-                for (key, session) in sessions.iter() {
-                    if session.executor.birth.ended()? {
-                        ended.push(key.clone());
-                    }
-                }
-                for key in ended {
-                    let session = sessions.remove(&key).expect("listed above");
-                    self.ended(&session.plan, session.start, session.degree);
-                }
-                sessions.remove(&key)
+                self.reap();
+                self.sessions.lock().unwrap().remove(&key)
             }
         };
         let (session, load_caps) = match retained {
@@ -3587,6 +3613,7 @@ impl Pool {
         free_bytes: u64,
         cells: &BTreeMap<u32, File>,
     ) -> io::Result<Option<u64>> {
+        self.reap();
         let mut caps = Vec::new();
         for (rank, (gpu, device)) in (start..).zip(self.lane(start, degree)?).enumerate() {
             caps.push(device.memory.make_room(
@@ -4540,7 +4567,7 @@ impl Services for Callbacks<'_> {
             }
             Kind::DeviceRoom => {
                 drop(descriptor);
-                if let Some(held) = known(frame.holding_bytes).filter(|_| self.degree == 1) {
+                if let Some(held) = known(frame.holding_bytes) {
                     // Without it the ledger keeps its load-time report, and the bytes it holds
                     // since read as external: a holding dropped for it raised no cap (run 4557).
                     let facts = crate::memory::policy::Facts {
