@@ -275,7 +275,9 @@ pub async fn update(
     payload.insert("agent".into(), "bundled".into());
     let spec = v1::RunSpec {
         kind: v1::RunKind::Update,
-        payload: Some(v1::Json::parse(serde_json::Value::Object(payload).to_string()).expect("JSON")),
+        payload: Some(
+            v1::Json::parse(serde_json::Value::Object(payload).to_string()).expect("JSON"),
+        ),
         inputs,
         ..Default::default()
     };
@@ -286,6 +288,51 @@ pub async fn update(
         target: named.join(", "),
         spec,
         inputs: staged,
+        out: None,
+        warnings: vec![],
+    };
+    let submitted = crate::run::submit(ctx, submit, None).await?;
+    let run = crate::run::follow(ctx, submitted.run, false).await?;
+    Ok(crate::run::exit_code(&run))
+}
+
+/// `cozy machine toolchain install`: CUDA's compiler, headers and ninja onto a machine, as an
+/// update run, so cards without a prebuilt kernel compile their own. Never run on its own: a run
+/// that would have used it says so and names this command.
+pub async fn toolchain(ctx: &Context, name: &str) -> Result<ExitCode, Error> {
+    let m = machine(ctx, name).await?;
+    if let Some(toolchain) = m.status.as_ref().and_then(|s| s.toolchain.as_ref())
+        && toolchain.state == "ready"
+    {
+        if ctx.json {
+            output::json(
+                &serde_json::json!({"machine": m.name, "changed": false, "toolchain": toolchain}),
+            );
+        } else {
+            output::say(
+                ctx,
+                &format!("{}'s toolchain is ready: {}", m.name, toolchain.nvcc),
+            );
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+    let hub = match m.hub.as_str() {
+        "" => ctx.hub()?,
+        origin => ctx.config.resolve(origin)?,
+    };
+    let payload = serde_json::json!({"toolchain": "install"});
+    let spec = v1::RunSpec {
+        kind: v1::RunKind::Update,
+        payload: Some(v1::Json::parse(payload.to_string()).expect("JSON")),
+        ..Default::default()
+    };
+    let submit = SubmitRun {
+        on: On::Machine(m.name.clone()),
+        hub: hub.origin,
+        kind: calcifer::Kind::Update,
+        target: "toolchain (CUDA 13.0 compiler, ninja)".into(),
+        spec,
+        inputs: vec![],
         out: None,
         warnings: vec![],
     };

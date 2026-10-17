@@ -1038,6 +1038,9 @@ fn status(frame: &v1::StatusFrame) -> MachineStatus {
                 memory_class: Some(gpu.memory_class.clone()).filter(|c| !c.is_empty()),
             })
             .collect(),
+        driver_floor: frame.driver_floor.clone(),
+        toolchain: Some(frame.toolchain.clone()).filter(|t| !t.state.is_empty()),
+        kernels: frame.kernels.clone(),
         disk_total_bytes: frame.disk.as_ref().map_or(0, |d| d.total_bytes),
         disk_free_bytes: frame.disk.as_ref().map_or(0, |d| d.free_bytes),
         live_runs: frame.runs.len() as u32,

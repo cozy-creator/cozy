@@ -161,6 +161,12 @@ pub(super) async fn frame<B: MachineBackend>(
         webrtc: identity.webrtc_port.map(|port| {
             crate::machine::player::endpoint(port, &identity.player, &identity.cert_der)
         }),
+        driver_floor: match identity.gpus.is_empty() {
+            true => String::new(),
+            false => cozy_platform::gpu::DRIVER_FLOOR.into(),
+        },
+        toolchain: identity.updates.as_ref().map(|u| u.toolchain()).unwrap_or_default(),
+        kernels: identity.updates.as_ref().map(|u| u.kernels()).unwrap_or_default(),
         ..identity_frame(identity)
     })
 }
