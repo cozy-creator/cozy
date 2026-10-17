@@ -4,7 +4,7 @@
 //! `code` is the stable specific name (`idempotency_conflict`, `machine_not_found`).
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Kind {
     /// A bad invocation: unknown flag, malformed `key=value`, malformed target.
@@ -26,7 +26,9 @@ pub enum Kind {
     Internal,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, thiserror::Error)]
+#[derive(
+    Clone, Debug, Deserialize, Serialize, PartialEq, Eq, thiserror::Error, utoipa::ToSchema,
+)]
 #[error("{code}: {message}")]
 pub struct Error {
     pub kind: Kind,
@@ -43,7 +45,7 @@ pub struct Error {
 }
 
 /// The HTTP body of a refusal.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, utoipa::ToSchema)]
 pub struct Envelope {
     pub error: Error,
 }
@@ -58,6 +60,31 @@ impl Error {
             next: vec![],
             cause: None,
         }
+    }
+
+    pub fn validation(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::new(Kind::Validation, code, message)
+    }
+    pub fn not_found(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::new(Kind::NotFound, code, message)
+    }
+    pub fn credential(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::new(Kind::Credential, code, message)
+    }
+    pub fn forbidden(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::new(Kind::Forbidden, code, message)
+    }
+    pub fn conflict(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::new(Kind::Conflict, code, message)
+    }
+    pub fn capacity(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::new(Kind::Capacity, code, message)
+    }
+    pub fn unavailable(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::new(Kind::Unavailable, code, message)
+    }
+    pub fn internal(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::new(Kind::Internal, code, message)
     }
 
     pub fn remedy(mut self, remedy: impl Into<String>) -> Self {

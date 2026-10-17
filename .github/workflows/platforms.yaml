@@ -60,6 +60,13 @@ jobs:
         continue-on-error: true
         run: cargo test -p cozy-platform --test seams --locked -- --include-ignored 2>&1 | tee seams.txt; exit "${PIPESTATUS[0]}"
 
+      # The committed machine API spec is what cozy-proto's types generate (xs-044): drift fails the run.
+      - name: Machine API spec
+        id: spec
+        if: runner.os == 'Linux'
+        continue-on-error: true
+        run: cargo test -p cozy-proto --locked --lib machine::api 2>&1 | tee spec.txt; exit "${PIPESTATUS[0]}"
+
       - name: Test
         if: inputs.test != ''
         id: test
@@ -73,10 +80,10 @@ jobs:
         run: |
           {
             echo "## ${{ matrix.os }}"
-            echo "rust=${{ steps.rust.outcome }} seams=${{ steps.seams.outcome }} test=${{ steps.test.outcome }} imported=${{ steps.imported.outcome }}"
+            echo "rust=${{ steps.rust.outcome }} seams=${{ steps.seams.outcome }} spec=${{ steps.spec.outcome }} test=${{ steps.test.outcome }} imported=${{ steps.imported.outcome }}"
             echo '```'
             # The tail of each: where errors are. `head` would end the pipe early (SIGPIPE under pipefail).
-            for f in rust.txt imported.txt seams.txt; do [ ! -f "$f" ] || tail -n 50 "$f"; done
+            for f in rust.txt imported.txt seams.txt spec.txt; do [ ! -f "$f" ] || tail -n 50 "$f"; done
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
@@ -88,10 +95,11 @@ jobs:
             rust.txt
             imported.txt
             seams.txt
+            spec.txt
             test.txt
           if-no-files-found: ignore
           retention-days: 30
 
       - name: Verdict
         if: always()
-        run: test "${{ steps.rust.outcome }}/${{ steps.seams.outcome }}" = success/success && test "${{ steps.test.outcome }}" != failure
+        run: test "${{ steps.rust.outcome }}/${{ steps.seams.outcome }}" = success/success && test "${{ steps.test.outcome }}" != failure && test "${{ steps.spec.outcome }}" != failure
