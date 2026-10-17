@@ -81,6 +81,9 @@ impl Tensord {
             .env("COZY_AUTHORIZED_KEYS", keys.join(","))
             .env("COZY_BOOTSTRAP_RECEIPT_HMAC_KEY_FILE", &key_file)
             .env("CUDA_VISIBLE_DEVICES", "")
+            // It trusts a private Hub only as a run's Hub access names its CA.
+            .env_remove("SSL_CERT_FILE")
+            .env_remove("SSL_CERT_DIR")
             .envs(self.env.iter().map(|(k, v)| (k, v)))
             // Its own process group: the machine's stable parent starts children, and stop ends them all.
             .process_group(0)
