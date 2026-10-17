@@ -12,6 +12,7 @@ use crate::{Context, run::Placement};
 
 mod author;
 mod catalog;
+pub(crate) mod local;
 mod machine;
 mod registry;
 
@@ -36,9 +37,10 @@ enum Command {
         /// org/name
         package: String,
     },
-    /// Install a published package (org/name[@release]) on a machine: its environment, no weights.
+    /// Install a published package (org/name[@release]), a directory or a script on a machine: its
+    /// environment, no weights.
     Install {
-        /// org/name[@release]; a directory such as `.` or `./project` comes next.
+        /// org/name[@release], a directory such as `.` or `./project`, or a PEP 723 `script.py`.
         package: String,
         #[command(flatten)]
         placement: Placement,
@@ -91,14 +93,7 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
             placement,
             detach,
         } => match directory(&package) {
-            Some(dir) => Err(Error::new(
-                Kind::Usage,
-                "not_ported",
-                format!(
-                    "installing a directory ({}) is not in this build yet",
-                    dir.display()
-                ),
-            )),
+            Some(path) => machine::install_directory(ctx, &path, placement.on(), detach).await,
             None => {
                 machine::install(ctx, &PackageRef::parse(&package)?, placement.on(), detach).await
             }
@@ -171,10 +166,11 @@ impl std::fmt::Display for PackageRef {
     }
 }
 
-/// A package directory only when it is written as one: `.`, `..`, absolute, or `./…`, `../…`.
-/// A bare word is a package name.
+/// Local code only when it is written as a path (`.`, `..`, absolute, `./…`, `../…`) or names a
+/// `.py` script; a bare word is a package name.
 fn directory(text: &str) -> Option<PathBuf> {
-    let explicit = text == "."
+    let explicit = text.ends_with(".py")
+        || text == "."
         || text == ".."
         || ["./", "../", ".\\", "..\\"]
             .iter()
