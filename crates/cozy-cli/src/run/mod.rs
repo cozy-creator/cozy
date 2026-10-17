@@ -21,6 +21,7 @@ mod describe;
 mod follow;
 pub(crate) mod interface;
 mod list;
+mod play;
 mod show;
 mod spec;
 mod target;
@@ -189,7 +190,11 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
             follow::record(ctx, &run);
             Ok(ExitCode::SUCCESS)
         }
-        Some(Verb::Play { .. }) => Err(crate::not_ported("run play")),
+        Some(Verb::Play {
+            run,
+            output,
+            expires,
+        }) => play::exec(ctx, &run, &output, &expires).await,
         Some(Verb::Upload { run, model, detach }) => upload::exec(ctx, &run, &model, detach).await,
         None => run(ctx, *args.run).await,
     }

@@ -150,7 +150,11 @@ fn the_grammar_refuses_what_it_cannot_run() {
             "usage",
             2,
         ),
-        (&["run", "play", "1", "--json"], "not_ported", 2),
+        (
+            &["run", "play", "1", "--expires", "0h", "--json"],
+            "play_expires_invalid",
+            2,
+        ),
     ] {
         let out = home.cozy(args);
         assert_eq!(
