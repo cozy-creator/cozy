@@ -13,7 +13,10 @@ use std::{
     time::Duration,
 };
 
-use cozy_proto::error::{Error, Kind};
+use cozy_proto::{
+    config::Hub,
+    error::{Error, Kind},
+};
 use futures_util::{StreamExt as _, TryStreamExt as _};
 use hub_client::types;
 use serde::{Deserialize, Serialize};
@@ -368,11 +371,25 @@ fn versions(lock: &str) -> Result<BTreeMap<String, String>, Error> {
     Ok(out)
 }
 
-pub(super) fn index_url(origin: &str, account: &str) -> String {
-    format!(
+/// The account's index on `hub` at the origin the Hub advertises (RFC 9728 `resource`): the one
+/// its publish check holds a uv.lock to, wherever this computer reaches the Hub. A Hub that
+/// advertises none takes no publication, and its configured origin stands.
+pub(super) async fn index_url(
+    client: &hub_client::Client,
+    hub: &Hub,
+    account: &str,
+) -> Result<String, Error> {
+    let origin = match client.get_protected_resource_metadata().await {
+        Ok(metadata) => metadata.into_inner().resource,
+        Err(e) => match hub_error(e) {
+            e if e.code == "capability.not_served" => hub.origin.clone(),
+            e => return Err(e),
+        },
+    };
+    Ok(format!(
         "{}/v1/index/{account}/simple/",
         origin.trim_end_matches('/')
-    )
+    ))
 }
 
 pub(super) async fn account(client: &hub_client::Client) -> Result<String, Error> {
@@ -398,8 +415,9 @@ pub async fn lock(ctx: &Context, upgrade: &[String]) -> Result<ExitCode, Error> 
         false => None,
         true => {
             let hub = ctx.hub()?;
-            let account = account(&ctx.hub_signed_in(&hub)?).await?;
-            let url = index_url(&hub.origin, &account);
+            let client = ctx.hub_signed_in(&hub)?;
+            let account = account(&client).await?;
+            let url = index_url(&client, &hub, &account).await?;
             stage.bind(&url)?;
             Some(url)
         }
@@ -522,7 +540,7 @@ pub async fn publish(ctx: &Context) -> Result<ExitCode, Error> {
 
     let stage = Stage::new(&project)?;
     if project.account_index {
-        stage.bind(&index_url(&hub.origin, &account))?;
+        stage.bind(&index_url(&client, &hub, &account).await?)?;
     }
     let python = project.python()?;
     let committed = fs::read_to_string(project.root.join("uv.lock")).map_err(|_| {
