@@ -56,12 +56,54 @@ fn read(path: PathBuf) -> String {
     std::fs::read_to_string(path).unwrap()
 }
 
+/// Points `home` at its Hub's listen address (`TENSORHUB_URL`, plain HTTP on loopback) instead of
+/// its public origin, keeping the device key it signed in with. Answers that address.
+fn at_listen_address(home: &Home) -> String {
+    let listen = std::env::var("TENSORHUB_URL").expect("the Tensorhub's listen address");
+    let paths = cozy_platform::paths::Home::at(home.root());
+    let hub = |url: &str| cozy_proto::config::Hub {
+        name: Some("ci".into()),
+        origin: cozy_proto::config::origin(url).unwrap(),
+    };
+    let public = std::env::var("TENSORHUB_ORIGIN").unwrap();
+    std::fs::copy(
+        hub(&public).device_key(&paths),
+        hub(&listen).device_key(&paths),
+    )
+    .unwrap();
+    home.write_config(&format!("hub = \"ci\"\n[hubs]\nci = \"{listen}\"\n"));
+    listen
+}
+
+/// The uv.lock the Hub holds for `account/name@release`, as a machine's install plan carries it.
+fn published_lock(url: &str, account: &str, name: &str, release: &str) -> String {
+    use base64::Engine as _;
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let plan = runtime.block_on(async {
+        let hub = hub_client::Client::connect(
+            url,
+            reqwest::Client::new(),
+            hub_client::Credential::Anonymous,
+        );
+        let empty = hub_client::types::Empty(Default::default());
+        hub.get_package_download_plan(account, name, None, Some(release), &empty)
+            .await
+    });
+    let plan = plan.expect("the release's install plan").into_inner();
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&plan.uv_lock.canonical_bytes)
+        .unwrap();
+    String::from_utf8(bytes).unwrap()
+}
+
 /// - What must never ship is refused, and so is a project that declares the account index itself.
 /// - A release publishes once: the second publish uploads nothing.
 /// - A package naming its author's packages through `{ index = "tensorhub" }` locks against that
 ///   account's index on this Hub without its authored files changing, and publishes.
 /// - Another account publishes the same tree: its lock is rebound to that account's index, every
 ///   version kept.
+/// - Addressed where it listens rather than at its public origin, the Hub's index is still the
+///   public one: `lock` binds it, and `publish` relocks a lock made against the listen address.
 /// - A yank is idempotent and shows in `info`.
 #[test]
 fn packages_lock_publish_and_yank_on_a_real_hub() {
@@ -143,6 +185,26 @@ fn packages_lock_publish_and_yank_on_a_real_hub() {
         );
         assert_eq!(published["status"], "published", "{published}");
     }
+
+    // The first account addressing its Hub where the Hub listens (TENSORHUB_URL), as a laptop names
+    // its local Hub: the index it locks against is still the one at the Hub's public origin, and
+    // a lock made against the listen address is relocked to it on publish.
+    let listen = at_listen_address(&home);
+    let pyproject = authored.replace("version = \"0.1.0\"", "version = \"0.2.0\"");
+    std::fs::write(user.join("pyproject.toml"), &pyproject).unwrap();
+    let locked = json(&home, &user, &["package", "lock"]);
+    assert_eq!(locked["account_index"], index.as_str(), "{locked}");
+    let public = url.trim_end_matches('/');
+    let elsewhere = read(user.join("uv.lock")).replace(public, listen.trim_end_matches('/'));
+    assert!(elsewhere.contains(&format!("{listen}/v1/index/{account}/simple/")));
+    std::fs::write(user.join("uv.lock"), &elsewhere).unwrap();
+    let published = json(&home, &user, &["package", "publish"]);
+    assert_eq!(published["status"], "published", "{published}");
+    let lock = published_lock(&url, &account, "tiny-user", "0.2.0");
+    assert!(
+        lock.contains(&index) && !lock.contains(listen.as_str()),
+        "{lock}"
+    );
 
     let release = format!("{account}/tiny@0.1.0");
     assert_eq!(
