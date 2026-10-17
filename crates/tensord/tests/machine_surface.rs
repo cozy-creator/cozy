@@ -1919,7 +1919,8 @@ mod v1_api {
             Err(status) => status,
             Ok(stream) => collect(stream.into_inner()).await.unwrap_err(),
         };
-        assert!(refused.message().contains("hub_access_invalid"), "{refused:?}");
+        let code = refused.metadata().get("cozy-error-code").and_then(|v| v.to_str().ok());
+        assert_eq!(code, Some("hub_access_invalid"), "{refused:?}");
         let _ = fs::remove_dir_all(source);
     }
 
