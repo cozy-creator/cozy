@@ -1,8 +1,7 @@
 //! A derivation costs the same however many derivations the Store already retains (finding
 //! 50): proving its source rooted walked every retained checkpoint chain, so each lane on a
-//! conversion pod took longer than the one before.
-
-use std::time::{Duration, Instant};
+//! conversion pod took longer than the one before. The cost is counted in manifests read, the
+//! walk's own unit, not in seconds a busy runner stretches.
 
 use super::tests::created_declaration;
 use super::*;
@@ -11,12 +10,13 @@ use crate::store::Fault;
 
 const PARTS: usize = 32;
 const CONVERSIONS: usize = 60;
-const WINDOW: usize = 10;
 
 /// A source-inheriting derivation that adds PARTS tensors and checkpoints after each, as a
-/// quantization lane does: its source inspection, writer, chain and pending root.
-fn convert(store: &Store, meta: &Meta, index: usize, source: &ObjectRef) -> Duration {
-    let started = Instant::now();
+/// quantization lane does: its source inspection, writer, chain and pending root. Answers the
+/// manifests it read.
+fn convert(store: &Store, meta: &Meta, index: usize, source: &ObjectRef) -> u64 {
+    let read = || crate::store::MANIFEST_READS.with(|reads| reads.get());
+    let before = read();
     inspect_source(
         store,
         meta,
@@ -83,7 +83,7 @@ fn convert(store: &Store, meta: &Meta, index: usize, source: &ObjectRef) -> Dura
     }
     commit(store, meta, &transaction, 1).unwrap();
     release_guards(meta, Some(writer.writer_hold), writer.source_leases);
-    started.elapsed()
+    read() - before
 }
 
 #[test]
@@ -127,23 +127,14 @@ fn a_conversion_costs_the_same_after_many_retained_conversions() {
         )
         .unwrap();
 
-    let costs: Vec<Duration> = (0..CONVERSIONS)
+    let costs: Vec<u64> = (0..CONVERSIONS)
         .map(|index| convert(&store, &meta, index, &source))
         .collect();
-    let median = |window: &[Duration]| {
-        let mut sorted = window.to_vec();
-        sorted.sort();
-        sorted[sorted.len() / 2]
-    };
-    let (first, last) = (
-        median(&costs[..WINDOW]),
-        median(&costs[CONVERSIONS - WINDOW..]),
-    );
     let _ = std::fs::remove_dir_all(&root);
-    // Retained history grew six-fold between the windows; the cost of one conversion may
-    // not follow it. Before the fix the last window cost several times the first.
+    // Retained history grows with every conversion; the manifests one conversion reads may
+    // not follow it. Before the fix every retained chain was walked again.
     assert!(
-        last.as_secs_f64() < 2.0 * first.as_secs_f64(),
-        "conversion cost grew with retained history: first {first:?}, last {last:?}"
+        costs[0] > 0 && costs.iter().all(|&cost| cost == costs[0]),
+        "conversion cost grew with retained history: manifests read {costs:?}"
     );
 }
