@@ -117,7 +117,7 @@ pub struct MachineConfig {
 
 impl MachineConfig {
     /// This computer's machine root: `root`, else `~/.cozy/machine`. Its API's endpoint is
-    /// `<root>/var/lib/cozy/machine/api-ready.json`.
+    /// `<root>/var/lib/cozy/tensord/api-ready.json`.
     pub fn root(&self, home: &Home) -> PathBuf {
         self.root.clone().unwrap_or_else(|| home.machine())
     }

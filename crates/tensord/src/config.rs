@@ -65,14 +65,18 @@ pub struct Config {
     pub warnings: Vec<String>,
 }
 
-/// The one load. Call before any thread starts: the readiness key leaves the environment here, so
-/// nothing this machine starts inherits it.
+/// The one load.
 pub fn load(lifetime: Lifetime) -> io::Result<Config> {
     let loaded = shared::load(shared::Flags::default()).map_err(|e| invalid(&named(&e.message)))?;
+    from_loaded(lifetime, loaded, shared::environment())
+}
+
+/// Takes the readiness key out of the environment, so nothing this machine starts inherits it.
+/// Call before any thread starts, after a provider's re-execution (which still needs it).
+pub fn forget_receipt_key() {
     for name in RECEIPT_KEYS {
         std::env::remove_var(name);
     }
-    from_loaded(lifetime, loaded, shared::environment())
 }
 
 /// The load over a given environment and user home (what the tests drive).

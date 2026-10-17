@@ -2,7 +2,7 @@
 //! the `tensord` binary's modes, which TensorD's and Calcifer's tests run.
 use crate::{
     config::{self, Flags},
-    machine::{endpoint::Endpoint, grant::Lifetime},
+    machine::grant::Lifetime,
     owner::{Owner, Shared},
     protocol::{self, Body, Command, Reply, CAPS},
 };
@@ -70,6 +70,7 @@ fn run(lifetime: Lifetime, service: bool) -> io::Result<()> {
     if lifetime == Lifetime::Rental {
         grant.provider = ProviderSelf::take(&grant.layout.root, &config.provider);
     }
+    config::forget_receipt_key();
     let ready = if service {
         // The parent's key pipe is read and closed whether or not the grant has a key.
         let inherited = supervise::inherited_key();

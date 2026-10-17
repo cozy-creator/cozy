@@ -43,7 +43,7 @@ fn boot(home: &Path) -> Machine {
 
 /// The endpoint the machine published once its API listens.
 fn ready(machine: &mut Machine, home: &Path) -> serde_json::Value {
-    let path = home.join(".cozy/machine/var/lib/cozy/machine/api-ready.json");
+    let path = home.join(".cozy/machine/var/lib/cozy/tensord/api-ready.json");
     let start = Instant::now();
     loop {
         assert!(machine.0.try_wait().unwrap().is_none(), "the machine exited");
@@ -122,7 +122,7 @@ async fn this_computers_machine_runs_from_its_home() {
     // A restart keeps the port Calcifer recorded.
     drop(client);
     drop(machine);
-    std::fs::remove_file(home.path().join(".cozy/machine/var/lib/cozy/machine/api-ready.json")).unwrap();
+    std::fs::remove_file(home.path().join(".cozy/machine/var/lib/cozy/tensord/api-ready.json")).unwrap();
     let mut machine = boot(home.path());
     let second = ready(&mut machine, home.path());
     assert_eq!(second["address"], first["address"]);
