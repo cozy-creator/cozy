@@ -5,7 +5,9 @@ mod cuda;
 pub use cuda::memory_classes;
 
 use crate::{Error, Result};
-use nvml_wrapper::{Nvml, enums::device::UsedGpuMemory, error::NvmlError};
+use nvml_wrapper::{
+    Nvml, enums::device::UsedGpuMemory, error::NvmlError, struct_wrappers::device::MemoryInfo,
+};
 use std::collections::BTreeMap;
 
 /// One GPU: machine.proto `Gpu` fields 1-6, plus the memory class.
@@ -81,7 +83,7 @@ pub fn probe(visible: Option<&str>) -> Result<Vec<Gpu>> {
             name: device.name().map_err(failed("name"))?,
             uuid: device.uuid().map_err(failed("uuid"))?,
             pci_bus_id: device.pci_info().map_err(failed("PCI info"))?.bus_id,
-            memory_bytes: device.memory_info().map_err(failed("memory info"))?.total,
+            memory_bytes: memory(device.memory_info())?.0,
             driver: driver.clone(),
             compute_capability: device
                 .cuda_compute_capability()
@@ -148,7 +150,7 @@ impl Device {
             .nvml
             .device_by_index(self.index)
             .map_err(failed("open device"))?;
-        let memory = device.memory_info().map_err(failed("memory info"))?;
+        let (total, free) = memory(device.memory_info())?;
         let processes = device.running_compute_processes().ok().and_then(|rows| {
             rows.into_iter()
                 .map(|row| match row.used_gpu_memory {
@@ -158,8 +160,8 @@ impl Device {
                 .collect()
         });
         Ok(Reading {
-            total: memory.total,
-            free: memory.free,
+            total,
+            free,
             display: device.is_display_active().unwrap_or(false),
             processes,
         })
@@ -170,6 +172,24 @@ impl Device {
             .device_by_index(self.index)
             .and_then(|device| device.is_display_active())
             .map_err(failed("display active"))
+    }
+}
+
+/// A GPU's (total, free) memory from NVML's answer. An integrated GPU (GB10) has no
+/// framebuffer, so NVML answers NotSupported: its memory is the host's (`MemTotal`,
+/// `MemAvailable`).
+fn memory(answer: std::result::Result<MemoryInfo, NvmlError>) -> Result<(u64, u64)> {
+    match answer {
+        Ok(memory) => Ok((memory.total, memory.free)),
+        Err(NvmlError::NotSupported) => {
+            let total = crate::contain::host_memory::total();
+            let free = crate::contain::host_memory::read().mem_available;
+            match total > 0 && free >= 0 {
+                true => Ok((total as u64, free as u64)),
+                false => Err(failed("memory info")(NvmlError::NotSupported)),
+            }
+        }
+        Err(error) => Err(failed("memory info")(error)),
     }
 }
 
@@ -192,6 +212,15 @@ mod tests {
             "{message}"
         );
         assert!(below_floor("580.0").is_some());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_integrated_gpus_memory_is_the_hosts() {
+        let (total, free) = memory(Err(NvmlError::NotSupported)).unwrap();
+        assert_eq!(total as i64, crate::contain::host_memory::total());
+        assert!(free > 0 && free <= total, "{free} of {total}");
+        assert!(memory(Err(NvmlError::Unknown)).is_err());
     }
 
     #[test]
