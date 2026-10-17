@@ -92,7 +92,7 @@ fn scalars_take_their_declared_types() {
     );
     assert!(bound.ignored.is_empty() && bound.files.is_empty() && bound.models.is_empty());
     assert_eq!(
-        String::from_utf8(bound.canonical_payload()).unwrap(),
+        bound.canonical_payload().get(),
         r#"{"aspect_ratio":"16:9","guidance":7.0,"hidiffusion":true,"megapixels":2,"prompt":"a cat","seed":7,"steps":20}"#
     );
     assert_eq!(

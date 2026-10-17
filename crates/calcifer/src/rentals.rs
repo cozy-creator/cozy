@@ -23,7 +23,6 @@ use cozy_proto::{
 };
 use ed25519_dalek::SigningKey;
 use hub_client::{Client, Credential, DeviceKey, UserSession, types};
-use prost::Message as _;
 use sha2::{Digest as _, Sha256};
 use tracing::warn;
 
@@ -481,8 +480,10 @@ impl Machines {
     /// Asks the run's Hub where to run it: the product to rent and its GPU count. The answer is
     /// kept on the run as a warning naming the product, its price and why.
     async fn placed(&self, run: &RunRow) -> Result<(String, Option<u32>), Error> {
-        let spec = v1::RunSpec::decode(run.spec.as_slice()).map_err(internal)?;
-        let Some(v1::run_spec::Source::Release(release)) = &spec.source else {
+        let Some(spec) = &run.spec else {
+            return Err(Error::new(Kind::Conflict, "spec_not_kept", "the run's spec was not kept"));
+        };
+        let Some(v1::Source::Release(release)) = &spec.source else {
             return Err(Error::new(
                 Kind::Usage,
                 "placement_needs_release",

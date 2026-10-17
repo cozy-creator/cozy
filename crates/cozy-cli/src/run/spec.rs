@@ -6,7 +6,6 @@ use cozy_proto::{
     error::{Error, Kind},
     machine::{self as v1, ModelChoice},
 };
-use prost::Message as _;
 
 use super::{
     Warm,
@@ -51,14 +50,14 @@ impl Call<'_> {
     /// A CALL of the function with `bound`.
     pub fn spec(&self, bound: &Bound) -> Result<v1::RunSpec, Error> {
         Ok(v1::RunSpec {
-            kind: v1::RunKind::Call.into(),
+            kind: v1::RunKind::Call,
             source: Some(match self.source {
-                Source::Release(_) => v1::run_spec::Source::Release(self.release()),
+                Source::Release(_) => v1::Source::Release(self.release()),
                 // The same source as the install: unchanged, the machine installs nothing again.
-                Source::Local { source, .. } => v1::run_spec::Source::Local(source.clone()),
+                Source::Local { source, .. } => v1::Source::Local(source.clone()),
             }),
             entrypoint: self.callable.name.clone(),
-            payload: bound.canonical_payload(),
+            payload: Some(bound.canonical_payload()),
             inputs: bound
                 .files
                 .iter()
@@ -87,14 +86,14 @@ impl Call<'_> {
             Warm::Imported => v1::WarmLevel::Imported,
             Warm::Host => v1::WarmLevel::Host,
             Warm::Gpu => v1::WarmLevel::Gpu,
-            Warm::Off => v1::WarmLevel::Unspecified,
+            Warm::Off => v1::WarmLevel::Off,
         };
         let source = match self.source {
-            Source::Release(_) => v1::warm_item::Source::Release(self.release()),
+            Source::Release(_) => v1::WarmSource::Release(self.release()),
             Source::Local {
                 installation: Some(installation),
                 ..
-            } => v1::warm_item::Source::Installation(installation.to_owned()),
+            } => v1::WarmSource::Installation(installation.to_owned()),
             // An older machine's install names no installation, which a warm set needs.
             Source::Local {
                 installation: None, ..
@@ -111,12 +110,12 @@ impl Call<'_> {
             source: Some(source),
             entrypoint: self.callable.name.clone(),
             models: choices(models)?,
-            level: level.into(),
+            level,
             bits: self.bits,
             ..Default::default()
         };
         Ok(v1::RunSpec {
-            kind: v1::RunKind::Warm.into(),
+            kind: v1::RunKind::Warm,
             set: Some(v1::WarmSet { items: vec![item] }),
             ..Default::default()
         })
@@ -132,8 +131,8 @@ impl Call<'_> {
         out: Option<PathBuf>,
     ) -> SubmitRun {
         let target = self.target();
-        let kind = match v1::RunKind::try_from(spec.kind) {
-            Ok(v1::RunKind::Warm) => RunKind::Warm,
+        let kind = match spec.kind {
+            v1::RunKind::Warm => RunKind::Warm,
             _ => RunKind::Call,
         };
         let inputs = bound.map_or_else(Vec::new, |b| {
@@ -159,7 +158,7 @@ impl Call<'_> {
             hub: hub.to_owned(),
             kind,
             target,
-            spec: spec.encode_to_vec(),
+            spec: spec.clone(),
             inputs,
             out,
             warnings,
@@ -247,17 +246,17 @@ mod tests {
             bits: 8,
         };
         let spec = call.spec(&bound).unwrap();
-        assert_eq!(spec.kind, v1::RunKind::Call as i32);
+        assert_eq!(spec.kind, v1::RunKind::Call);
         assert_eq!(
             spec.source,
-            Some(v1::run_spec::Source::Release(v1::Release {
+            Some(v1::Source::Release(v1::Release {
                 package: "fidika/sdxl".into(),
                 release: String::new()
             }))
         );
         assert_eq!(spec.entrypoint, "generate");
         assert_eq!(
-            String::from_utf8(spec.payload.clone()).unwrap(),
+            spec.payload.as_ref().unwrap().get(),
             r#"{"prompt":"a cat","steps":8}"#
         );
         assert_eq!((spec.gpus, spec.bits), (2, 8));
@@ -287,7 +286,7 @@ mod tests {
             (submit.kind, submit.target.as_str()),
             (RunKind::Call, "fidika/sdxl/generate")
         );
-        assert_eq!(v1::RunSpec::decode(submit.spec.as_slice()).unwrap(), spec);
+        assert_eq!(submit.spec, spec);
         assert!(submit.inputs.is_empty() && submit.warnings.is_empty());
     }
 
@@ -311,13 +310,13 @@ mod tests {
         let item = &spec.set.as_ref().unwrap().items[0];
         assert_eq!(
             (spec.kind, item.level, item.bits),
-            (v1::RunKind::Warm as i32, v1::WarmLevel::Gpu as i32, 16)
+            (v1::RunKind::Warm, v1::WarmLevel::Gpu, 16)
         );
         assert_eq!(item.entrypoint, "generate");
         assert_eq!(item.models[0].repository, "fidika/base");
         assert_eq!(
             call.warm(Warm::Off, &[]).unwrap().set.unwrap().items[0].level,
-            0
+            v1::WarmLevel::Off
         );
         assert_eq!(
             call.submission(On::Machine("local".into()), "h", &spec, None, None)

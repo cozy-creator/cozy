@@ -6,10 +6,7 @@ mod common;
 
 use std::{
     collections::BTreeSet,
-    ffi::OsStr,
-    path::{Path, PathBuf},
-    process::Command,
-    sync::OnceLock,
+    path::Path,
     time::{Duration, Instant},
 };
 
@@ -20,11 +17,11 @@ use calcifer::{
     serve::{Stopped, serve},
     store::{Batch, NewRun, Store},
 };
-use common::Tensord;
+use common::{Tensord, installing_machine, package_run};
 use cozy_platform::{lock::LockFile, paths::Home};
 use cozy_proto::{
     calcifer::{
-        Event, Holder, Kind, MachinesEvent, On, OutputItem, Run, RunsEvent, StagedInput, Status,
+        Event, Holder, Kind, MachinesEvent, OutputItem, Run, RunsEvent, Status,
         SubmitRun,
     },
     config::{Config, Loaded},
@@ -32,7 +29,7 @@ use cozy_proto::{
     ids::{Digest, RunId},
     machine as v1,
 };
-use prost::Message as _;
+use futures_util::StreamExt as _;
 use reqwest::{Client, RequestBuilder, StatusCode, header};
 use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as _},
@@ -210,140 +207,6 @@ fn landed(event: &Event) -> Option<&OutputItem> {
     }
 }
 
-fn run_ok(command: &mut Command) {
-    let output = command.output().unwrap();
-    assert!(
-        output.status.success(),
-        "{command:?}: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-/// A TensorD that installs local packages: its installer helper made as TensorD makes it on a
-/// pod (a uv environment over Python 3.12 holding the client wheel its binary embeds).
-fn installing_machine() -> Tensord {
-    static TOOLS: OnceLock<(PathBuf, PathBuf)> = OnceLock::new();
-    let (python, wheel) = TOOLS.get_or_init(|| {
-        let dir = tempfile::tempdir().unwrap().keep();
-        let tensord = std::env::var_os("COZY_TEST_TENSORD").expect("COZY_TEST_TENSORD");
-        let wheel = client_wheel(Path::new(&tensord), &dir);
-        let helper = dir.join("helper");
-        run_ok(
-            Command::new("uv")
-                .args(["venv", "--no-project", "--no-config", "--python", "3.12"])
-                .arg(&helper),
-        );
-        let python = helper.join("bin/python");
-        run_ok(
-            Command::new("uv")
-                .args(["pip", "install", "--no-config", "--python"])
-                .arg(&python)
-                .arg(format!("{}[installer]", wheel.display())),
-        );
-        (python, wheel)
-    });
-    Tensord::start_args(&[
-        OsStr::new("--installer-python"),
-        python.as_os_str(),
-        OsStr::new("--client-wheel"),
-        wheel.as_os_str(),
-    ])
-}
-
-/// The client wheel the TensorD binary embeds: the zip in it whose dist-info is
-/// `tensord_client`'s, named as its dist-info says.
-fn client_wheel(tensord: &Path, dir: &Path) -> PathBuf {
-    let binary = std::fs::read(tensord).unwrap();
-    let int = |at: usize, width: usize| {
-        let bytes = binary.get(at..at + width)?;
-        Some(bytes.iter().rev().fold(0usize, |n, b| n << 8 | *b as usize))
-    };
-    let zip_ends = binary
-        .windows(4)
-        .enumerate()
-        .filter(|(_, w)| w == b"PK\x05\x06");
-    for (end, _) in zip_ends {
-        let (Some(size), Some(offset), Some(comment)) =
-            (int(end + 12, 4), int(end + 16, 4), int(end + 20, 2))
-        else {
-            continue;
-        };
-        let Some(start) = end.checked_sub(size + offset) else {
-            continue;
-        };
-        let mut entry = start + offset;
-        let mut dist = None;
-        while binary.get(entry..entry + 4) == Some(b"PK\x01\x02") {
-            let (Some(name), Some(extra), Some(note)) =
-                (int(entry + 28, 2), int(entry + 30, 2), int(entry + 32, 2))
-            else {
-                break;
-            };
-            let file = binary
-                .get(entry + 46..entry + 46 + name)
-                .unwrap_or_default();
-            let file = std::str::from_utf8(file).unwrap_or_default();
-            dist = dist.or(file.strip_suffix(".dist-info/WHEEL").map(str::to_owned));
-            entry += 46 + name + extra + note;
-        }
-        if let Some(dist) = dist.filter(|d| d.starts_with("tensord_client-")) {
-            let wheel = dir.join(format!("{dist}-py3-none-any.whl"));
-            std::fs::write(&wheel, &binary[start..end + 22 + comment]).unwrap();
-            return wheel;
-        }
-    }
-    panic!("{} embeds no client wheel", tensord.display());
-}
-
-/// The fixture package as `cozy run ./dir` sends it (its files in a tar and the manifest naming
-/// that, both staged with the run), calling its `make` with a `big` output that many bytes long.
-fn package_run(dir: &Path, gate: &Path, big: u64) -> SubmitRun {
-    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cpu_outputs");
-    let source = dir.join("source.tar");
-    run_ok(
-        Command::new("tar")
-            .args(["--format=ustar", "-cf"])
-            .arg(&source)
-            .arg("-C")
-            .arg(&fixture)
-            .args(["pyproject.toml", "package.toml", "cpu_outputs/__init__.py"]),
-    );
-    let tar = std::fs::read(&source).unwrap();
-    let manifest = serde_json::json!({"package": "local/calcifer-cpu-outputs", "release": "0.1.0",
-        "python_version": "3.12", "source": {"digest": Digest::of(&tar), "length": tar.len()}});
-    let manifest = serde_json::to_vec(&manifest).unwrap();
-    std::fs::write(dir.join("manifest.json"), &manifest).unwrap();
-    let staged = |path: PathBuf, bytes: &[u8]| StagedInput {
-        path,
-        digest: Digest::of(bytes),
-        length: bytes.len() as u64,
-    };
-    let payload = serde_json::json!({"revisions": 3, "big": big, "gate": gate});
-    let spec = v1::RunSpec {
-        kind: v1::RunKind::Call as i32,
-        source: Some(v1::run_spec::Source::Local(v1::LocalSource {
-            manifest: Digest::of(&manifest).to_string(),
-        })),
-        entrypoint: "make".into(),
-        payload: serde_json::to_vec(&payload).unwrap(),
-        owner: "alice".into(),
-        ..Default::default()
-    };
-    SubmitRun {
-        on: On::Machine("m".into()),
-        hub: String::new(),
-        kind: Kind::Call,
-        target: "local/calcifer-cpu-outputs/make".into(),
-        spec: spec.encode_to_vec(),
-        inputs: vec![
-            staged(source, &tar),
-            staged(dir.join("manifest.json"), &manifest),
-        ],
-        out: None,
-        warnings: vec![],
-    }
-}
-
 /// A home whose store knows the machine `m`.
 fn with_machine(home: &Path, machine: &Tensord) {
     let key = common::key_file(home);
@@ -360,10 +223,10 @@ async fn on_machine(machine: &Tensord, run: &RunId, name: &str, index: u32) -> V
         index,
         member: String::new(),
     };
-    let (_, mut frames) = link.read(target, 0, 0, 0).await.unwrap();
+    let mut output = link.bulk().unwrap().get(&target, (0, 0), 0).await.unwrap();
     let mut bytes = vec![];
-    while let Some(frame) = frames.message().await.unwrap() {
-        bytes.extend(frame.data);
+    while let Some(data) = output.body.next().await {
+        bytes.extend(data.unwrap());
     }
     bytes
 }
@@ -732,11 +595,9 @@ async fn a_fresh_machine_read_shows_what_a_settled_warm_run_installed() {
     with_machine(home.path(), &machine);
     let served = Served::start(home.path()).await;
     let mut warm = package_run(home.path(), &home.path().join("gate"), BIG);
-    let mut spec = v1::RunSpec::decode(warm.spec.as_slice()).unwrap();
-    spec.kind = v1::RunKind::Warm as i32;
-    spec.payload.clear();
+    warm.spec.kind = v1::RunKind::Warm;
+    warm.spec.payload = None;
     warm.kind = Kind::Warm;
-    warm.spec = spec.encode_to_vec();
     let run = served.submit(&warm).await;
     let mut events = served.events(&run.id).await;
     events.until(|e| e.is_terminal()).await;

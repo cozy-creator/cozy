@@ -1,7 +1,7 @@
 //! One adapter into the owned execution engine. This module owns no journal.
 use super::{auth::VerifiedActor, domain, v1};
 use std::collections::BTreeMap;
-use tonic::Status;
+use cozy_proto::error::Error;
 
 pub trait MachineBackend: Send + Sync + 'static {
     /// `cozy.machine.v1` Run sources and Write (`runs`).
@@ -12,35 +12,35 @@ pub trait MachineBackend: Send + Sync + 'static {
         &self,
         _: VerifiedActor,
         _: domain::PackageListQuery,
-    ) -> Result<domain::PackageList, Status> {
+    ) -> Result<domain::PackageList, Error> {
         unsupported()
     }
     /// What each of the caller's installations holds now (`Environment.level`), by
     /// installation id.
-    fn levels(&self, _: VerifiedActor) -> Result<BTreeMap<String, &'static str>, Status> {
+    fn levels(&self, _: VerifiedActor) -> Result<BTreeMap<String, &'static str>, Error> {
         Ok(BTreeMap::new())
     }
     /// The caller's warm set, each member with what it holds now (`StatusFrame.warm`).
-    fn warm_set(&self, _: VerifiedActor) -> Result<Vec<v1::WarmItem>, Status> {
+    fn warm_set(&self, _: VerifiedActor) -> Result<Vec<v1::WarmItem>, Error> {
         Ok(vec![])
     }
     fn workspace(
         &self,
         _: VerifiedActor,
         _: domain::MachineExecutionWorkspaceQuery,
-    ) -> Result<domain::MachineExecutionWorkspace, Status>;
+    ) -> Result<domain::MachineExecutionWorkspace, Error>;
     fn get(
         &self,
         _: VerifiedActor,
         _: domain::MachineExecutionQuery,
-    ) -> Result<domain::MachineExecutionState, Status> {
+    ) -> Result<domain::MachineExecutionState, Error> {
         unsupported()
     }
     fn events(
         &self,
         _: VerifiedActor,
         _: domain::MachineExecutionEventsQuery,
-    ) -> Result<domain::MachineExecutionEventPage, Status> {
+    ) -> Result<domain::MachineExecutionEventPage, Error> {
         unsupported()
     }
     /// What a run's executor measured (canonical JSON), when it ran on a device.
@@ -48,29 +48,29 @@ pub trait MachineBackend: Send + Sync + 'static {
         &self,
         _: VerifiedActor,
         _: domain::MachineExecutionQuery,
-    ) -> Result<Option<Vec<u8>>, Status> {
+    ) -> Result<Option<Vec<u8>>, Error> {
         Ok(None)
     }
     /// A run's own time running its callable, every attempt summed (0: unknown).
-    fn execution_ms(&self, _: VerifiedActor, _: domain::MachineExecutionQuery) -> Result<u64, Status> {
+    fn execution_ms(&self, _: VerifiedActor, _: domain::MachineExecutionQuery) -> Result<u64, Error> {
         Ok(0)
     }
     /// How the machine memo met a run (`call_memo`).
-    fn memo(&self, _: VerifiedActor, _: domain::MachineExecutionQuery) -> Result<crate::journal::CallMemo, Status> {
+    fn memo(&self, _: VerifiedActor, _: domain::MachineExecutionQuery) -> Result<crate::journal::CallMemo, Error> {
         Ok(Default::default())
     }
     fn control(
         &self,
         _: VerifiedActor,
         _: domain::MachineExecutionControl,
-    ) -> Result<domain::MachineExecutionState, Status> {
+    ) -> Result<domain::MachineExecutionState, Error> {
         unsupported()
     }
     fn list(
         &self,
         _: VerifiedActor,
         _: domain::MachineExecutionListQuery,
-    ) -> Result<domain::MachineExecutionList, Status> {
+    ) -> Result<domain::MachineExecutionList, Error> {
         unsupported()
     }
     /// One run output's current bytes (`GET /v1/runs/{run}/outputs/{output}[/{index}]`).
@@ -82,7 +82,7 @@ pub trait MachineBackend: Send + Sync + 'static {
         _run: u64,
         _output: &str,
         _index: Option<u32>,
-    ) -> Result<OutputSnapshot, Status> {
+    ) -> Result<OutputSnapshot, Error> {
         unsupported()
     }
     /// One file of a tree output (`member`, its manifest path), at the output's revision.
@@ -93,7 +93,7 @@ pub trait MachineBackend: Send + Sync + 'static {
         _output: &str,
         _index: Option<u32>,
         _member: &str,
-    ) -> Result<OutputSnapshot, Status> {
+    ) -> Result<OutputSnapshot, Error> {
         unsupported()
     }
     /// One kept log's bytes, oldest first (wire 72). A log not written yet is empty.
@@ -102,19 +102,19 @@ pub trait MachineBackend: Send + Sync + 'static {
         &self,
         _: VerifiedActor,
         _: domain::MachineExecutionTriageQuery,
-    ) -> Result<domain::MachineExecutionTriage, Status> {
+    ) -> Result<domain::MachineExecutionTriage, Error> {
         unsupported()
     }
     fn read_machine_log(
         &self,
         _: VerifiedActor,
         _: domain::MachineLogQuery,
-    ) -> Result<Vec<u8>, Status> {
+    ) -> Result<Vec<u8>, Error> {
         unsupported()
     }
     /// A complete content-addressed object this signer wrote with `Write`, verified against
     /// `sha256` (hex).
-    fn object(&self, _: VerifiedActor, _sha256: &str) -> Result<std::fs::File, Status> {
+    fn object(&self, _: VerifiedActor, _sha256: &str) -> Result<std::fs::File, Error> {
         unsupported()
     }
 }
@@ -132,15 +132,16 @@ pub struct OutputSnapshot {
 /// membership, contiguous offsets, native custody and durable commit/abort semantics.
 /// Dropping a disconnected transfer never supplies execution cancellation authority.
 pub trait InputTreeReceiver: Send {
-    fn blob(&mut self, blob: domain::InputTreeImportBlob) -> Result<(), Status>;
+    fn blob(&mut self, blob: domain::InputTreeImportBlob) -> Result<(), Error>;
     fn commit(
         self: Box<Self>,
         commit: domain::InputTreeImportCommit,
-    ) -> Result<domain::NativeByteRetentionResult, Status>;
+    ) -> Result<domain::NativeByteRetentionResult, Error>;
 }
 
-fn unsupported<T>() -> Result<T, Status> {
-    Err(Status::unimplemented(
-        "capability_unavailable: this machine backend does not implement this operation",
+fn unsupported<T>() -> Result<T, Error> {
+    Err(Error::not_found(
+        "capability_unavailable",
+        "this machine backend does not implement this operation",
     ))
 }

@@ -469,7 +469,7 @@ impl Updates {
         // An update is not a job: a released or activating machine refuses it, and preparing it
         // never holds the rental's idle release. Activation then closes admission.
         drop(self.lifecycle.as_ref().map(|l| l.admit()).transpose()
-            .map_err(|refused| (503, refused.message().to_string()))?);
+            .map_err(|refused| (503, refused.to_string()))?);
         let mut status = Status {
             operation: request.operation.clone(),
             from: identified(&self.paths.sdk()).map_err(server)?,
@@ -625,7 +625,7 @@ impl Updates {
         self.set(|s| s.to = to.clone())?;
         // No new work is admitted from here; work admitted before drains first.
         let activation = self.lifecycle.as_ref().map(|l| l.activate()).transpose()
-            .map_err(|refused| io::Error::other(refused.message().to_string()))?;
+            .map_err(|refused| io::Error::other(refused.to_string()))?;
         if !(self.idle)() {
             self.set(|s| s.enter("waiting_activation"))?;
             while !(self.idle)() {
