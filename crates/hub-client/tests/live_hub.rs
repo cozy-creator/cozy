@@ -1,5 +1,6 @@
 //! hub-client against a real Tensorhub (Tensorhub's dev-build `cozy_ref` job starts one):
-//! device-key enrollment and login, the account, model info and search, a rental quote, a
+//! device-key enrollment and login, the account, model info and search, a checkpoint assessment
+//! reaching the Hub's inspector, a rental quote, a
 //! closure read, a run capability traded for a DPoP-bound token over real TLS, and (with the
 //! job's docker provider) a rental that boots to ready and ends.
 //!
@@ -105,6 +106,26 @@ async fn a_user_and_a_machine_at_a_real_hub() {
         .await
         .unwrap();
     anonymous.search_packages(None, Some("sdxl")).await.unwrap();
+
+    // Assessments: a report travels as its exact bytes (their digest names it), so a body that
+    // is not a cozy-eval report passes the identity check and the Hub's inspector refuses it.
+    let checkpoint = format!("sha256:{:x}", Sha256::digest(b"candidate"));
+    assert_eq!(
+        refused(
+            user.list_checkpoint_assessments(&account, "model", &checkpoint)
+                .await
+                .map_err(Error::from)
+        ),
+        (404, "checkpoint.not_found".into())
+    );
+    let report = br#"{"schema":"not a report"}"#.to_vec();
+    assert_eq!(
+        refused(
+            user.attach_assessment(&account, "model", &checkpoint, report)
+                .await
+        ),
+        (422, "assessment.report_invalid".into())
+    );
 
     // The catalog and a quote: nothing is bought.
     let skus = anonymous.list_rental_skus(None).await.unwrap().into_inner();
