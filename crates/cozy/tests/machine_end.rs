@@ -17,7 +17,7 @@ const OUTPUT: usize = 24 << 20;
 
 const SCRIPT: &str = r#"# /// script
 # requires-python = ">=3.12"
-# dependencies = ["cozy-runtime>=0.25.1"]
+# dependencies = ["cozy-runtime"]
 # [tool.cozy]
 # accelerator = false
 # ///

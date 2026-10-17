@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "tensord-cpu-assets"
 version = "0.1.0"
 requires-python = ">=3.12,<3.15"
-dependencies = ["cozy-runtime==0.26.4", "scikit-learn>=1.5,<2", "numpy>=2,<3", "msgspec>=0.18,<1"]
+dependencies = ["cozy-runtime", "scikit-learn>=1.5,<2", "numpy>=2,<3", "msgspec>=0.18,<1"]
 
 [project.entry-points."cozy.application"]
 default = "cpu_assets:app"

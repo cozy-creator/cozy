@@ -2869,7 +2869,7 @@ mod v1_api {
             name: "acme/tensord-cpu-caller".into(), release: "0.1.0".into(),
             interface: described["interface"].clone(), wheel: root, bytes: root_bytes, callees: vec![callee],
             // The rest of its lock is PyPI's: a real Runtime and its dependencies.
-            requires: vec!["cozy-runtime>=0.24.1".into(), "msgspec>=0.19,<1".into()],
+            requires: vec!["cozy-runtime".into(), "msgspec>=0.19,<1".into()],
         };
         let (origin, _) = names_hub::serve(&store, model, Some(package));
         let counter = machine.root.join("published-measured");

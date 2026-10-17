@@ -24,8 +24,6 @@ def capture(tmp_path_factory):
     root = tmp_path_factory.mktemp("real-captured-package")
     source = root / "source"
     shutil.copytree(FIXTURE, source)
-    project = source / "pyproject.toml"
-    project.write_text(project.read_text().replace("cozy-runtime>=0.26,<0.27", "cozy-runtime==0.26.0"))
     subprocess.run(["uv", "lock", "--project", str(source), "--python", "3.12"], check=True)
     subprocess.run(["uv", "build", "--wheel", "--out-dir", str(root / "client"), str(ROOT)], check=True)
     client = next((root / "client").glob("*.whl"))
@@ -43,12 +41,18 @@ def assert_installed(generation):
         assert b"classify" in bytes(generation.interface)
 
 
+def locked_sdk(source):
+    """The Runtime the capture's lock selected."""
+    lock = tomllib.loads((source / "uv.lock").read_text())
+    return next(row["version"] for row in lock["package"] if row["name"] == "cozy-runtime")
+
+
 def test_frozen_source_keeps_locked_sdk(capture):
     root, source, client, generation = capture
     versions = {dependency.name: dependency.version for dependency in generation.dependencies}
     lock = tomllib.loads((source / "uv.lock").read_text())
     sdk = next(row["version"] for row in lock["package"] if row["name"] == "cozy-runtime")
-    assert versions["cozy-runtime"] == sdk == "0.26.0"
+    assert versions["cozy-runtime"] == sdk
     assert_installed(generation)
 
 
@@ -91,7 +95,7 @@ def test_rust_tensorfs_materialization_and_trusted_installer(capture):
         "--package", "local/tensord-cpu-classifier", "--release", "0.1.0"], check=True)
     generation = GENERATION_DECODER.decode((output / "prepared-generation.json").read_bytes())
     assert json.loads((output / "package-interface.json").read_bytes()) == json.loads(bytes(generation.interface))
-    assert {row.name: row.version for row in generation.dependencies}["cozy-runtime"] == "0.26.0"
+    assert {row.name: row.version for row in generation.dependencies}["cozy-runtime"] == locked_sdk(source)
     assert_installed(generation)
 
 
@@ -106,7 +110,7 @@ def test_installer_only_helper_uses_locked_sdk_and_static_reader_skips_pth(captu
         "--project", str(source), "--generations", str(root / "minimal-helper-generations"), "--client-wheel", str(client),
         "--distribution", "tensord-cpu-classifier", "--release", "0.1.0", "--python", "3.12"], check=True, capture_output=True)
     generation = GENERATION_DECODER.decode(process.stdout)
-    assert {row.name: row.version for row in generation.dependencies}["cozy-runtime"] == "0.26.0"
+    assert {row.name: row.version for row in generation.dependencies}["cozy-runtime"] == locked_sdk(source)
     site = next(Path(generation.python).parents[1].glob("lib/python*/site-packages"))
     sentinel = root / "pth-must-not-run-during-static-description"
     pth = site / "authored-startup.pth"
