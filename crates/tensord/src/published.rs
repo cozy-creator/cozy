@@ -2319,7 +2319,7 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    /// A Runtime wheel an update named (`cozy rental update --runtime-wheel`) runs every
+    /// A Runtime wheel an update named (`cozy machine update --runtime-wheel`) runs every
     /// package: one whose floor it meets without a word, one whose floor it misses regardless,
     /// its runs warned with that floor and the build. Real update and uv, no network.
     #[test]
