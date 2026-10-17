@@ -1,3 +1,6 @@
+// The machine API's error envelope is TensorD's error type; refusals are cold paths, so its size
+// costs nothing worth boxing it for.
+#![allow(clippy::result_large_err)]
 pub mod access;
 pub mod adapter_views;
 mod archive;

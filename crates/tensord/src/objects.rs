@@ -362,7 +362,7 @@ impl Objects {
             return Ok(Some(upload));
         }
         fs::create_dir_all(part.parent().expect("a signer's directory"))?;
-        let file = OpenOptions::new().read(true).write(true).create(true).open(&part)?;
+        let file = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&part)?;
         let held = match read_held(&part)? {
             Some((was, held)) if was == length => held,
             _ => {
