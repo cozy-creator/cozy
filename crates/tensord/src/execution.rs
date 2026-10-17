@@ -939,6 +939,7 @@ impl Engine {
         source: &Path,
         value: Value,
         bindings: Vec<crate::journal::AssetBinding>,
+        adjustments: Vec<crate::journal::Adjustment>,
     ) -> io::Result<Execution> {
         let mut paths: Vec<_> = bindings.iter().map(|b| b.relative_path.clone()).collect();
         // A tree's member files are held beside its manifest, by digest (`tree_binding`).
@@ -950,7 +951,7 @@ impl Engine {
         paths.sort();
         paths.dedup();
         let result = self.bound_custody(id, source, value, paths, bindings)?;
-        self.finish(id, Outcome::Completed(result))
+        self.finish(id, Outcome::Completed(ResultRecord { adjustments, ..result }))
     }
 
     /// Reconcile a previous service incarnation without adopting or repeating authored work.
@@ -1078,6 +1079,7 @@ impl Engine {
             value,
             artifacts,
             asset_bindings: vec![],
+            adjustments: vec![],
         })
     }
 
@@ -1268,7 +1270,7 @@ mod tests {
                 if applied {
                     engine.apply_attention(&child).unwrap();
                 }
-                let value = ResultRecord { value: serde_json::json!({}), artifacts: vec![], asset_bindings: vec![] };
+                let value = ResultRecord { value: serde_json::json!({}), artifacts: vec![], asset_bindings: vec![], adjustments: vec![] };
                 engine.finish(id, Outcome::Completed(value)).unwrap();
             });
             assert_eq!(engine.get(&id).unwrap().state, State::Completed);
@@ -1303,7 +1305,7 @@ mod tests {
                 place(&spool.join("prediction"));
                 let _spool = Spool(spool.clone());
                 let length = fs::symlink_metadata(spool.join("prediction")).map_or(0, |m| m.len());
-                if let Err(error) = engine.managed_result(id, &spool, serde_json::json!({"rows": 2}), vec![binding(length)]) {
+                if let Err(error) = engine.managed_result(id, &spool, serde_json::json!({"rows": 2}), vec![binding(length)], vec![]) {
                     engine.finish(id, Outcome::Failed(crate::journal::Failure::custody(&error.to_string()))).unwrap();
                 }
             });

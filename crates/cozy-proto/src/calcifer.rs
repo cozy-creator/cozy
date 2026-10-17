@@ -127,6 +127,9 @@ pub struct Run {
     pub progress: Option<Progress>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<Warning>,
+    /// How its machine served the request other than as sent, once settled.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub adjustments: Vec<Adjustment>,
     /// The result's canonical JSON, once settled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<serde_json::Value>,
@@ -139,6 +142,9 @@ pub struct Run {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub calls: Vec<Call>,
 }
+
+/// One request field a run's executor served other than as sent (`Outcome.adjustments`).
+pub use crate::machine_json::Adjustment;
 
 /// One settled call of a run (the run's own function or a child call).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -820,6 +826,7 @@ mod tests {
             waiting: None,
             progress: None,
             warnings: vec![],
+            adjustments: vec![],
             result: None,
             execution_ms: None,
             measurements: None,

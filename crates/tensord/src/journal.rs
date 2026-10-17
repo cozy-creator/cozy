@@ -220,6 +220,40 @@ pub struct ResultRecord {
     pub artifacts: Vec<Artifact>,
     #[serde(default)]
     pub asset_bindings: Vec<AssetBinding>,
+    /// How its executor served the request other than as sent; a memo answer repeats them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub adjustments: Vec<Adjustment>,
+}
+
+/// One request field its executor served other than as sent (the invoke reply's row).
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct Adjustment {
+    /// The request field's path: `steps`, `assets.2.asset`.
+    pub field: String,
+    pub kind: AdjustmentKind,
+    pub requested: String,
+    pub applied: String,
+    pub reason: String,
+    /// `handler`, or what the Runtime applied: `policy`, `checkpoint:…`, `adapter:…`.
+    pub source: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AdjustmentKind {
+    Adjusted,
+    Clamp,
+    Warn,
+}
+
+impl AdjustmentKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Adjusted => "adjusted",
+            Self::Clamp => "clamp",
+            Self::Warn => "warn",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]

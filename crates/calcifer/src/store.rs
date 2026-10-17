@@ -1674,6 +1674,12 @@ fn record(conn: &Connection, row: &RunRow) -> Result<Run> {
         waiting: None,
         progress: None,
         warnings: row.warnings.clone(),
+        adjustments: row
+            .outcome
+            .iter()
+            .flat_map(|outcome| &outcome.adjustments)
+            .map(Into::into)
+            .collect(),
         result: row
             .outcome
             .as_ref()

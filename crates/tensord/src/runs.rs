@@ -476,6 +476,7 @@ impl Runs {
                 value,
                 artifacts: vec![],
                 asset_bindings: vec![],
+                adjustments: vec![],
             }))
         };
         if spec.remove {
@@ -788,6 +789,7 @@ impl Runs {
             value: json!({"set": rows}),
             artifacts: vec![],
             asset_bindings: vec![],
+            adjustments: vec![],
         }))
     }
 
@@ -822,6 +824,7 @@ impl Runs {
             value: json!({"removed": rows, "reclaimed_bytes": reclaimed, "retained": retained}),
             artifacts: vec![],
             asset_bindings: vec![],
+            adjustments: vec![],
         })
     }
 

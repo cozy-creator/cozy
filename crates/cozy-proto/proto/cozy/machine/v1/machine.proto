@@ -254,6 +254,17 @@ message Outcome {
   string computation_digest = 8;
   bool memoized = 9;
   string unmemoized = 10;
+  // How its executor served the request other than as sent, in the executor's order. Advisory.
+  repeated Adjustment adjustments = 11;
+}
+// One request field served other than as sent.
+message Adjustment {
+  string field = 1;      // its path in the request: `steps`, `assets.2.asset`
+  string kind = 2;       // adjusted, clamp, warn
+  string requested = 3;
+  string applied = 4;
+  string reason = 5;
+  string source = 6;     // handler, policy, checkpoint:<…>, adapter:<…>
 }
 message Reason {
   string code = 1;

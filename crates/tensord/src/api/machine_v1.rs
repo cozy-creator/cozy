@@ -64,9 +64,24 @@ impl Caller {
     }
 }
 
+/// The outcome document's adjustment rows, as TensorD kept them.
+fn adjustments(rows: &Value) -> Vec<v1::Adjustment> {
+    let rows: Vec<crate::journal::Adjustment> = serde_json::from_value(rows.clone()).unwrap_or_default();
+    rows.into_iter()
+        .map(|row| v1::Adjustment {
+            field: row.field,
+            kind: row.kind.as_str().into(),
+            requested: row.requested,
+            applied: row.applied,
+            reason: row.reason,
+            source: row.source,
+        })
+        .collect()
+}
+
 /// What an output-limited grant sees of an event: its outputs' products, and the outcome's
-/// status and inventory of them. Results, reasons, triage, measurements, waiting details,
-/// progress and logs stay the run owner's.
+/// status and inventory of them. Results, reasons, triage, measurements, adjustments, waiting
+/// details, progress and logs stay the run owner's.
 fn visible(grant: &Grant, event: &mut v1::RunEvent) -> bool {
     let allows = |p: &v1::Product| grant.allows(&grant.run, &p.output, (p.index > 0).then_some(p.index));
     match &mut event.event {
@@ -77,6 +92,7 @@ fn visible(grant: &Grant, event: &mut v1::RunEvent) -> bool {
             outcome.reason = None;
             outcome.triage = false;
             outcome.measurements.clear();
+            outcome.adjustments.clear();
             true
         }
         Some(v1::run_event::Event::State(state)) => {
@@ -539,6 +555,7 @@ impl Log {
                     outputs: self.products.clone(),
                     triage: body.get("triage_bundle").is_some(),
                     measurements: vec![], // `stream_run` adds them, the execution time and memo
+                    adjustments: adjustments(&body["adjustments"]),
                     ..Default::default()
                 })
             }

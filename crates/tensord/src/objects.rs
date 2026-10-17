@@ -189,6 +189,7 @@ impl Objects {
             value: result.value.clone(),
             artifacts: bound.iter().map(|a| Artifact { path: String::new(), ..(*a).clone() }).collect(),
             asset_bindings: result.asset_bindings.clone(),
+            adjustments: result.adjustments.clone(),
         };
         let raw = serde_json::to_vec(&held)?;
         if raw.len() > MEMO_RESULT_BYTES {
@@ -457,6 +458,7 @@ mod tests {
                 relative_path: "file-0001".into(), asset_ref: "attempt:1/file/0001".into(), media_type: "text/plain".into(),
                 length: 6,
             }],
+            adjustments: vec![],
         };
         let engine = service.engine.clone();
         let held = crate::journal::HeldMemo { actor: "alice".into(), computation: "sha256:c".into(),

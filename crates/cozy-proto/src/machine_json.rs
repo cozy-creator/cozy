@@ -303,6 +303,24 @@ pub struct Outcome {
     pub memoized: bool,
     /// Why it was neither looked up nor held (its author's condition unmet, e.g. "seed not given").
     pub unmemoized: String,
+    /// How its executor served the request other than as sent, in the executor's order. Advisory.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub adjustments: Vec<Adjustment>,
+}
+
+/// One request field served other than as sent.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Adjustment {
+    /// Its path in the request: `steps`, `assets.2.asset`.
+    pub field: String,
+    /// `adjusted`, `clamp` or `warn`.
+    pub kind: String,
+    pub requested: String,
+    pub applied: String,
+    pub reason: String,
+    /// `handler`, or what the Runtime applied: `policy`, `checkpoint:…`, `adapter:…`.
+    pub source: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -365,6 +383,7 @@ pub mod pb {
         ProviderAccess { huggingface, civitai }
         Product { output, index, rev, length, digest, media_type, label, duration_us, appended_from }
         Reason { code, message, origin }
+        Adjustment { field, kind, requested, applied, reason, source }
     }
 
     fn json(bytes: &[u8], what: &str) -> Result<Option<Json>, Unreadable> {
@@ -552,6 +571,7 @@ pub mod pb {
                 computation_digest: o.computation_digest.clone(),
                 memoized: o.memoized,
                 unmemoized: o.unmemoized.clone(),
+                adjustments: o.adjustments.iter().map(Into::into).collect(),
             })
         }
     }
@@ -569,6 +589,7 @@ pub mod pb {
                 computation_digest: o.computation_digest.clone(),
                 memoized: o.memoized,
                 unmemoized: o.unmemoized.clone(),
+                adjustments: o.adjustments.iter().map(Into::into).collect(),
             }
         }
     }
@@ -686,6 +707,14 @@ mod tests {
             computation_digest: "sha256:bb".into(),
             memoized: true,
             unmemoized: "seed not given".into(),
+            adjustments: vec![v1::Adjustment {
+                field: "assets.2.asset".into(),
+                kind: "adjusted".into(),
+                requested: "21.4".into(),
+                applied: "15".into(),
+                reason: "video truncated to 15 s".into(),
+                source: "policy".into(),
+            }],
         };
         let json = serde_json::to_string(&Outcome::try_from(&outcome).unwrap()).unwrap();
         assert!(

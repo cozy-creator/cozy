@@ -648,6 +648,7 @@ fn acceptance_and_cancel_have_one_durable_winner_and_preserve_completed_outcomes
                 value: serde_json::json!(42),
                 artifacts: vec![],
                 asset_bindings: vec![],
+                adjustments: vec![],
             }),
         )
         .unwrap();

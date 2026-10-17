@@ -3335,7 +3335,8 @@ impl Pool {
                 let result = (|| {
                     let (value, bindings) =
                         device_executor::postprocess(&session.executor.codec(), &spool, &reply)?;
-                    engine.managed_result(id, &spool, value, output_bindings(bindings))
+                    let adjusted = device_executor::adjustments(id, &reply);
+                    engine.managed_result(id, &spool, value, output_bindings(bindings), adjusted)
                 })();
                 if let Err(error) = result {
                     // The invocation is already quiescent; a codec/custody
