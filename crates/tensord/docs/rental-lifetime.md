@@ -14,7 +14,7 @@ job it's going to work on."
   quantization): queued (preparing included), starting or running. Each ends completed or failed.
   Updates and paused jobs are idle time.
 - The clock starts when the last job ends (or pauses), or at the rental's first boot, or at an
-  explicit `cozy rental keepalive`, which restarts it once.
+  explicit `cozy machine keepalive`, which restarts it once.
 - The clock is durable: the journal's last job end and the ledger's idle start (`idle.json`). A
   restart or update neither shortens nor extends it; a job a restart interrupts ends at the restart.
 - Status reports a deadline only once the rental is idle: the clock's end. While a job is queued

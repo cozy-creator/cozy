@@ -74,8 +74,8 @@ Acceptance, journal, progress and output custody stay in `Engine`; scheduling st
   new executor's GPU is logged as `{"event": "place"}` in the memory log; `loads.jsonl` and
   `invokes.jsonl` name each line's `gpus`.
 - Memory decisions (floor caps, placements, sheds, admissions, estimates) are lines of the store's
-  `logs/memory.log` (rotated once past 4 MiB), machine log `memory` (`cozy machine logs --memory`,
-  `cozy rental logs <r> --memory`). Each call's own memory is the run's `memory` measurements
+  `logs/memory.log` (rotated once past 4 MiB), machine log `memory`
+  (`cozy machine logs <name> memory`; `local` names this computer's). Each call's own memory is the run's `memory` measurements
   (`cozy run show`): torch's peaks, the process at the end, and what the plane paged since the
   executor's previous call.
 - A memory step on a GPU runs under that GPU's call slot; host pressure ends idle executors only on

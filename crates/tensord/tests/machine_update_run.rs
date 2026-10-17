@@ -363,7 +363,7 @@ async fn an_update_run_activates_in_place_and_a_failing_candidate_ends_failed() 
         assert_eq!(stages(&log).contains(&"starting".to_string()), installs, "{id}: {log:?}");
     }
 
-    // Stopped and launched again: `cozy machine stop` / `start` on this computer (a persistent
+    // Stopped and launched again: `cozy machine disable` / `enable` on this computer (a persistent
     // machine), then a rental's pod restarted. Each launch proves itself under a new key, which
     // the parent hands to the updated service it runs.
     for (persistent, key) in [(true, [8; 32]), (true, [9; 32]), (false, [10; 32])] {
@@ -427,7 +427,7 @@ fn launch(root: &Path, port: u16, key: Option<[u8; 32]>, persistent: bool) -> Ma
     Machine(command.spawn().unwrap())
 }
 
-/// Stops the machine as `cozy machine stop` does: SIGTERM to its parent, which ends cleanly.
+/// Stops the machine as `cozy machine disable` does: SIGTERM to its parent, which ends cleanly.
 fn stop(machine: &mut Machine) {
     nix::sys::signal::kill(
         nix::unistd::Pid::from_raw(machine.0.id() as i32),
