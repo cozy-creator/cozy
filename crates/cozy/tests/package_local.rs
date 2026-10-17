@@ -1,5 +1,7 @@
 //! `cozy package install DIR|script.py --on` through the real binary: local code installed live on
 //! a real TensorD (COZY_TEST_TENSORD) added as a machine, its files sent through Calcifer.
+// TensorD runs on Unix only for now, and so does its fixture (common::tensord).
+#![cfg(unix)]
 mod common;
 
 use std::path::Path;
