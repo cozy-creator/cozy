@@ -1,6 +1,7 @@
-//! A loopback Hub that answers by name (th-245): one package's card, each release's card, locked
-//! requirements and file door, and its models' closures by name, release and lane (a hash only
-//! to a credentialed caller), presign and objects, with ranges. It records every request.
+//! A loopback Hub that answers by name (th-245): one package's card, each release's card and install
+//! plan (its pyproject and a uv.lock real uv made against PyPI and this Hub's org index), the org
+//! index and file doors, and its models' closures by name, release and lane (a hash only to a
+//! credentialed caller), presign and objects, with ranges. It records every request.
 #![allow(dead_code)]
 use axum::{
     body::Bytes,
@@ -8,6 +9,7 @@ use axum::{
     http::{HeaderMap, Method, StatusCode, Uri},
     response::{IntoResponse, Response},
 };
+use base64::Engine as _;
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
@@ -32,8 +34,8 @@ pub struct Package {
     pub wheel: String,
     pub bytes: Vec<u8>,
     pub callees: Vec<(String, Vec<u8>)>,
-    /// The lock's other rows (PyPI's), verbatim.
-    pub pypi: String,
+    /// The release's requirements beyond its callees, locked from PyPI.
+    pub requires: Vec<String>,
 }
 
 struct Served {
@@ -42,6 +44,8 @@ struct Served {
     bytes: HashMap<String, Vec<u8>>,
     /// Releases of one package.
     packages: Vec<Package>,
+    /// Each release's pyproject and uv.lock, locked once the Hub answers.
+    locked: std::sync::OnceLock<Vec<(String, String)>>,
     origin: String,
     heard: Arc<Mutex<Vec<String>>>,
     /// How long each object answer takes, as a slow link's would.
@@ -97,19 +101,48 @@ fn start(
         models,
         bytes,
         packages: packages.into_iter().collect(),
+        locked: Default::default(),
         origin: format!("http://127.0.0.1:{port}"),
         heard: heard.clone(),
         pace,
     });
+    let serving = served.clone();
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         runtime.block_on(async move {
-            let router = axum::Router::new().fallback(answer).with_state(served);
+            let router = axum::Router::new().fallback(answer).with_state(serving);
             let listener = tokio::net::TcpListener::from_std(listener).unwrap();
             axum::serve(listener, router).await.unwrap()
         })
     });
+    let locked = served.packages.iter().map(|package| lock(package, &served.origin)).collect();
+    served.locked.set(locked).unwrap();
+    served.heard.lock().unwrap().clear();
     (format!("http://127.0.0.1:{port}"), heard)
+}
+
+/// `package`'s pyproject and the uv.lock `uv lock` makes of it, as `cozy package publish` binds
+/// one: its callees from this Hub's org index, the rest from PyPI.
+fn lock(package: &Package, origin: &str) -> (String, String) {
+    let (org, _) = package.name.split_once('/').unwrap();
+    let mut parts = package.wheel.split('-');
+    let (name, version) = (parts.next().unwrap().replace('_', "-"), parts.next().unwrap());
+    let callees: Vec<String> = doors(package).skip(1).map(|(distribution, _, _)| distribution).collect();
+    let dependencies: Vec<String> = package.requires.iter().chain(&callees).map(|r| format!("{r:?}")).collect();
+    let sources: String = callees.iter().map(|c| format!("{c} = {{ index = \"hub\" }}\n")).collect();
+    let pyproject = format!(
+        "[project]\nname = \"{name}\"\nversion = \"{version}\"\nrequires-python = \">=3.12\"\ndependencies = [{}]\n\n\
+         [[tool.uv.index]]\nname = \"hub\"\nurl = \"{origin}/v1/index/{org}/simple\"\nexplicit = true\n\n[tool.uv.sources]\n{sources}",
+        dependencies.join(", ")
+    );
+    let dir = std::env::temp_dir().join(format!("names-hub-lock-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("pyproject.toml"), &pyproject).unwrap();
+    let locked = std::process::Command::new("uv").args(["lock", "--quiet", "--no-config", "--python", "3.12"]).current_dir(&dir).output().unwrap();
+    assert!(locked.status.success(), "uv lock: {}", String::from_utf8_lossy(&locked.stderr));
+    let lock = std::fs::read_to_string(dir.join("uv.lock")).unwrap();
+    let _ = std::fs::remove_dir_all(dir);
+    (pyproject, lock)
 }
 
 /// Each wheel the release's lock pins at this Hub, as the Hub renders its row (th-245): its
@@ -173,8 +206,21 @@ async fn answer(State(served): State<Arc<Served>>, method: Method, uri: Uri, hea
     let first = served.packages.first();
     let release_path = |p: &Package| format!("/v1/packages/{}/releases/{}", p.name, p.release);
     let release = served.packages.iter().find(|p| path == release_path(p));
-    let locked = served.packages.iter().find(|p| path == format!("{}/locked-requirements", release_path(p)));
+    let query = uri.query().unwrap_or_default();
+    let planned = served.packages.iter().position(|p| {
+        path == format!("/v1/packages/{}/download", p.name) && query.split('&').any(|q| q == format!("release={}", p.release))
+    });
     let door = served.packages.iter().flat_map(doors).find(|(_, door, _)| *door == path);
+    // The org index's page for one distribution: each file door that serves it.
+    let page = path.strip_prefix("/v1/index/").and_then(|rest| rest.split_once("/simple/")).map(|(org, rest)| {
+        let distribution = rest.trim_end_matches('/');
+        let links: String = served.packages.iter().filter(|p| p.name.starts_with(&format!("{org}/"))).flat_map(doors)
+            .filter(|(name, _, _)| name == distribution)
+            .map(|(_, door, bytes)| format!("<a href=\"{}{door}#sha256={}\">{}</a>\n", served.origin,
+                tensorfs_core::sha256::hex_digest(bytes), door.rsplit('/').next().unwrap()))
+            .collect();
+        format!("<!DOCTYPE html><html><body>\n{links}</body></html>\n")
+    });
     match (method, path.as_str()) {
         (Method::GET, p) if first.is_some_and(|package| p == format!("/v1/packages/{}", package.name)) => {
             let mut releases: Vec<Value> = served.packages.iter().map(|p| json!({"release": p.release})).collect();
@@ -189,16 +235,23 @@ async fn answer(State(served): State<Arc<Served>>, method: Method, uri: Uri, hea
             json(json!({"release": summary, "package_interface": package.interface, "requirements": [],
                 "requires_python": ">=3.12", "python_version": "3.12"}))
         }
-        (Method::GET, _) if locked.is_some() => {
-            let package = locked.unwrap();
-            let lock: String = doors(package)
-                .map(|(distribution, door, bytes)| {
-                    let sha = tensorfs_core::sha256::hex_digest(bytes);
-                    format!("{distribution} @ {}{door} --hash=sha256:{sha}\n", served.origin)
-                })
-                .collect::<String>()
-                + &package.pypi;
-            (StatusCode::OK, lock).into_response()
+        // The release's install plan: its exact documents, and its project wheel at a presigned
+        // URL on the object host.
+        (Method::POST, _) if planned.is_some() => {
+            let (package, (pyproject, lock)) = (&served.packages[planned.unwrap()], &served.locked.get().unwrap()[planned.unwrap()]);
+            let exact = |bytes: &[u8]| json!({"canonical_bytes": base64::engine::general_purpose::STANDARD.encode(bytes),
+                "digest": format!("sha256:{}", tensorfs_core::sha256::hex_digest(bytes)), "length": bytes.len()});
+            let (distribution, door, bytes) = doors(package).next().unwrap();
+            let wheel = json!({"digest": format!("sha256:{}", tensorfs_core::sha256::hex_digest(bytes)),
+                "distribution": distribution, "import_roots": [], "kind": "project_wheel", "length": bytes.len(),
+                "path": package.wheel, "tags": ["py3-none-any"], "url": format!("{}{door}", served.origin.replace("127.0.0.1", "localhost")),
+                "version": package.release});
+            json(json!({"python_version": "3.12", "downloads": [wheel], "package_config": exact(b"[package]\n"),
+                "package_interface": exact(&serde_json::to_vec(&package.interface).unwrap()), "pyproject": exact(pyproject.as_bytes()),
+                "release": package.release, "uv_lock": exact(lock.as_bytes())}))
+        }
+        (Method::GET, _) if page.is_some() => {
+            ([("content-type", "text/html")], page.unwrap()).into_response()
         }
         (Method::GET, _) if door.is_some() => ranged(door.unwrap().2, &headers),
         (Method::POST, "/v1/tensorfs/closure") => {

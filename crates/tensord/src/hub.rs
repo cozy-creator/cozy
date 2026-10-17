@@ -15,7 +15,6 @@ use tensorfs_core::transport::{
     self, Anonymous, Answer, Ask, Client, Closure, CredentialProvider, Deadline, Ledger,
     SourcePolicy, SAMPLE_SECONDS, STILL_SAMPLES,
 };
-use tokio_stream::StreamExt as _;
 
 pub use hub_client::{types, Op};
 
@@ -436,22 +435,6 @@ impl Catalog {
         block(async { Ok(self.hub.get_package(org, name).await?.into_inner()) })
     }
 
-    /// One committed release, its interface and its Python environment.
-    pub fn release(
-        &self,
-        org: &str,
-        name: &str,
-        release: &str,
-    ) -> Result<types::PackageRelease, hub_client::Error> {
-        block(async {
-            Ok(self
-                .hub
-                .get_package_release(org, name, release)
-                .await?
-                .into_inner())
-        })
-    }
-
     /// The exact files of one committed release (`python_version` picks its project wheel):
     /// its documents' bytes and its wheels behind presigned URLs, which expire.
     pub fn install_plan(
@@ -465,28 +448,6 @@ impl Catalog {
         block(async {
             let plan = self.hub.get_package_download_plan(org, name, python_version, Some(release), &empty).await?;
             Ok(plan.into_inner())
-        })
-    }
-
-    /// The release's hash-pinned requirements, as uv installs them.
-    pub fn locked_requirements(
-        &self,
-        org: &str,
-        name: &str,
-        release: &str,
-    ) -> Result<Vec<u8>, hub_client::Error> {
-        block(async {
-            let mut stream = self
-                .hub
-                .get_package_locked_requirements(org, name, release)
-                .await?
-                .into_inner();
-            let mut bytes = Vec::new();
-            while let Some(chunk) = stream.next().await {
-                bytes
-                    .extend_from_slice(&chunk.map_err(|e| hub_client::Error::Call(e.to_string()))?);
-            }
-            Ok(bytes)
         })
     }
 
