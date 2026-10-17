@@ -265,6 +265,35 @@ impl Stage {
         ));
         fs::write(&path, text).map_err(|e| refuse("stage_unavailable", e))
     }
+
+    /// Relocks the copy against its bound index with `pins` as constraints, then without them:
+    /// a lock made for another index moves to this one keeping each exact version (or fails
+    /// naming the pin), and the copy publishes with no constraint it did not author.
+    fn relock_pinned(&self, python: &str, pins: &BTreeMap<String, String>) -> Result<(), Error> {
+        let path = self.src.join("pyproject.toml");
+        let authored = fs::read_to_string(&path).map_err(|e| refuse("stage_unavailable", e))?;
+        let mut doc: toml_edit::DocumentMut =
+            authored.parse().map_err(|e| refuse("project_invalid", e))?;
+        let constraints = doc["tool"]["uv"]["constraint-dependencies"]
+            .or_insert(toml_edit::value(toml_edit::Array::new()))
+            .as_array_mut()
+            .ok_or_else(|| {
+                refuse(
+                    "project_invalid",
+                    "tool.uv.constraint-dependencies is not a list",
+                )
+            })?;
+        for (name, version) in pins {
+            constraints.push(format!("{name}=={version}"));
+        }
+        fs::write(&path, doc.to_string()).map_err(|e| refuse("stage_unavailable", e))?;
+        let locked = run(
+            uv(&self.src).args(["lock", "--no-progress", "--python", python]),
+            "lock_failed",
+        );
+        fs::write(&path, authored).map_err(|e| refuse("stage_unavailable", e))?;
+        locked.map(drop)
+    }
 }
 
 /// The project's source files, relative to `root`: what is never source is skipped, and what must
@@ -334,6 +363,35 @@ fn walk(root: &Path, rel: &Path, files: &mut Vec<PathBuf>) -> Result<(), Error> 
 }
 
 /// Each locked package's version.
+/// The packages a lock takes from a Tensorhub account index, by exact version.
+fn index_pins(lock: &str) -> Result<BTreeMap<String, String>, Error> {
+    #[derive(Deserialize)]
+    struct Lock {
+        #[serde(default)]
+        package: Vec<Locked>,
+    }
+    #[derive(Deserialize)]
+    struct Locked {
+        name: String,
+        #[serde(default)]
+        version: String,
+        #[serde(default)]
+        source: toml::Table,
+    }
+    let lock: Lock = toml::from_str(lock).map_err(|e| refuse("lock_invalid", e))?;
+    Ok(lock
+        .package
+        .into_iter()
+        .filter(|p| {
+            p.source
+                .get("registry")
+                .and_then(|r| r.as_str())
+                .is_some_and(|r| r.contains("/v1/index/"))
+        })
+        .map(|p| (p.name, p.version))
+        .collect())
+}
+
 fn versions(lock: &str) -> Result<BTreeMap<String, String>, Error> {
     #[derive(Deserialize)]
     struct Lock {
@@ -539,10 +597,6 @@ pub async fn publish(ctx: &Context) -> Result<ExitCode, Error> {
     }
 
     let stage = Stage::new(&project)?;
-    if project.account_index {
-        stage.bind(&index_url(&client, &hub, &account).await?)?;
-    }
-    let python = project.python()?;
     let committed = fs::read_to_string(project.root.join("uv.lock")).map_err(|_| {
         Error::new(
             Kind::Validation,
@@ -551,8 +605,20 @@ pub async fn publish(ctx: &Context) -> Result<ExitCode, Error> {
         )
         .next("cozy package lock")
     })?;
-    // Locking the copy is a no-op for a lock made for this Hub and account; for another, it moves
-    // the account's packages to this index and must keep every version.
+    // Locking the copy is a no-op for a lock made for this Hub and account. For another, it moves
+    // the account's packages to this index pinned to the versions the lock holds: a pin this Hub
+    // cannot meet is refused by name, never re-resolved to a newer release.
+    let python = project.python()?;
+    if project.account_index {
+        let url = index_url(&client, &hub, &account).await?;
+        stage.bind(&url)?;
+        let pins = index_pins(&committed)?;
+        if !pins.is_empty() && !committed.contains(&url) {
+            stage
+                .relock_pinned(python.request.as_str(), &pins)
+                .map_err(|e| unmet(e, &pins, &account, &hub))?;
+        }
+    }
     run(
         uv(&stage.src).args(["lock", "--no-progress", "--python", python.request.as_str()]),
         "lock_failed",
@@ -561,12 +627,14 @@ pub async fn publish(ctx: &Context) -> Result<ExitCode, Error> {
         fs::read_to_string(stage.src.join("uv.lock")).map_err(|e| refuse("lock_failed", e))?;
     let (before, after) = (versions(&committed)?, versions(&bound)?);
     if before != after {
-        let moved = after
+        let detail = before
             .iter()
-            .find(|(name, version)| before.get(*name) != Some(*version));
-        let detail = moved
-            .map(|(n, v)| format!("{n} would be {v}"))
-            .unwrap_or_else(|| "a package would leave the lock".into());
+            .find(|(name, version)| after.get(*name) != Some(*version))
+            .map(|(name, version)| match after.get(name) {
+                Some(now) => format!("uv re-resolved {name} from {version} to {now}"),
+                None => format!("uv dropped {name} {version}"),
+            })
+            .unwrap_or_else(|| "uv added a package the lock does not hold".into());
         return Err(refuse(
             "account_index_lock_drift",
             format!(
@@ -679,6 +747,28 @@ pub async fn publish(ctx: &Context) -> Result<ExitCode, Error> {
     result.warnings = state.warnings;
     result.print(ctx);
     Ok(ExitCode::SUCCESS)
+}
+
+/// A relock that could not keep the lock's account-index pins on `hub`: the pin uv names, by
+/// package, version and Hub, when it names one; otherwise uv's own words.
+fn unmet(error: Error, pins: &BTreeMap<String, String>, account: &str, hub: &Hub) -> Error {
+    let named = pins
+        .iter()
+        .find(|(name, version)| error.message.contains(&format!("{name}=={version}")));
+    match named {
+        Some((name, version)) => refuse(
+            "account_index_pin_unpublished",
+            format!(
+                "uv.lock pins {account}/{name} {version}, which {} does not publish",
+                hub.label()
+            ),
+        )
+        .remedy(format!(
+            "publish {name} {version} to this Hub as {account} first, or relock against it"
+        ))
+        .next(format!("cozy package lock --tensorhub {}", hub.label())),
+        None => error,
+    }
 }
 
 /// The interface Runtime's static describer reads from the staged source, with the publishing
