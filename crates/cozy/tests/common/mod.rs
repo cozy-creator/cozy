@@ -7,6 +7,9 @@
 pub mod https;
 pub mod package;
 #[cfg(unix)]
+pub mod pty;
+pub mod silent;
+#[cfg(unix)]
 pub mod tensord;
 
 use std::{

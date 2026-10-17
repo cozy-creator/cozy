@@ -1,6 +1,6 @@
 //! `cozy machine list` as a live view (`crate::tui`), fed by Calcifer's machine events.
 use cozy_proto::{
-    calcifer::{Machine, MachineList, MachinesEvent},
+    calcifer::{Machine, MachineList, MachineState, MachinesEvent},
     error::Error,
 };
 
@@ -106,5 +106,59 @@ impl Machines {
 
     pub(crate) fn list(&self) -> &MachineList {
         &self.list
+    }
+
+    /// The machine on row `selected` (the rows are the live machines), by a name that keeps
+    /// resolving: its rental id where it has one.
+    pub(crate) fn id(&self, selected: usize) -> Option<String> {
+        let mut live = self
+            .list
+            .machines
+            .iter()
+            .filter(|m| m.state != MachineState::Ended);
+        let machine = live.nth(selected)?;
+        Some(
+            machine
+                .rental_id
+                .clone()
+                .unwrap_or_else(|| machine.name.clone()),
+        )
+    }
+}
+
+/// One machine as `cozy machine show` draws it, kept as Calcifer says it changes.
+pub(crate) struct Shown {
+    calcifer: Client,
+    following: Following,
+    machine: Machine,
+}
+
+impl Shown {
+    pub(crate) async fn open(ctx: &Context, name: &str) -> Result<Self, Error> {
+        let calcifer = ctx.calcifer().await?;
+        let (following, machine) = Following::open(&calcifer, name).await?;
+        Ok(Self {
+            calcifer,
+            following,
+            machine,
+        })
+    }
+
+    /// Cancel-safe, as [`Following::next`] is.
+    pub(crate) async fn changed(&mut self) -> Result<(), Error> {
+        match self.following.next(&self.calcifer).await? {
+            Some(machine) => self.machine = machine,
+            // It left the list: nothing more will change.
+            None => std::future::pending().await,
+        }
+        Ok(())
+    }
+
+    pub(crate) fn title(&self) -> String {
+        format!("machine {}", self.machine.name)
+    }
+
+    pub(crate) fn lines(&self, ctx: &Context) -> Vec<String> {
+        list::record(ctx, &self.machine).lines()
     }
 }

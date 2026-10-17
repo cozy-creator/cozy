@@ -40,6 +40,9 @@ enum Verb {
     Show {
         /// A machine name or rental id.
         name: String,
+        /// One snapshot even on a terminal, instead of the live view.
+        #[arg(long)]
+        once: bool,
     },
     /// Print a machine's log: its own, or the tensorfs or memory log it keeps.
     Logs {
@@ -92,7 +95,7 @@ enum Verb {
 pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
     match args.verb {
         Verb::List { once } => list::list(ctx, once).await,
-        Verb::Show { name } => list::show(ctx, &name).await,
+        Verb::Show { name, once } => list::show(ctx, &name, once).await,
         Verb::Logs { name, query } => crate::daemon::machine_log(ctx, &name, &query).await,
         Verb::Rent(rent) => rent::exec(ctx, rent).await,
         Verb::End { name, force } => end::end(ctx, &name, force).await,

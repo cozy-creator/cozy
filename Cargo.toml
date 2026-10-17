@@ -33,6 +33,7 @@ cozy-platform = { path = "crates/cozy-platform" }
 cozy-proto = { path = "crates/cozy-proto" }
 hub-client = { path = "crates/hub-client" }
 migrate = { path = "crates/migrate" }
+portable-pty = "0.9.0"
 tensord = { path = "crates/tensord" }
 tensorfs-core = { path = "crates/tensorfs/crates/tensorfs-core", default-features = false }
 tensorfs-plane = { path = "crates/tensorfs/crates/tensorfs-plane", default-features = false }
@@ -108,6 +109,7 @@ tower = { version = "0.5", default-features = false, features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std"] }
 url = { version = "2.5.8", features = ["serde"] }
+vt100 = "0.16.2"
 webpki-roots = "1"
 windows-sys = "0.61"
 x509-cert = { version = "0.2.5", default-features = false }
