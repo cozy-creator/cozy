@@ -23,7 +23,10 @@ use crate::error::{Envelope, Error, Kind};
     ),
     modifiers(&CozyCap),
     security(("cozy_cap" = [])),
-    paths(health, status, keepalive, submit, events, cancel, output, triage, log, head_object, put_object),
+    paths(
+        health, status, keepalive, submit, events, cancel, output, triage, log, head_object, put_object,
+        held_objects
+    ),
     components(schemas(Envelope, Error, Kind))
 )]
 pub struct MachineApi;
@@ -176,6 +179,14 @@ pub fn head_object() {}
     (status = 507, description = "`machine_disk_full`", body = Envelope),
 ))]
 pub fn put_object() {}
+
+/// What the machine holds of many objects in one request, in the order asked: each stored object
+/// whole (renewed, as a `HEAD` renews it), else the ranges its upload has landed.
+#[utoipa::path(post, path = path::OBJECTS_HELD, request_body = HeldRequest, responses(
+    (status = 200, description = "Each object's held ranges", body = HeldAnswer),
+    (status = 400, description = "A digest that is not `sha256:<hex>`", body = Envelope),
+))]
+pub fn held_objects() {}
 
 #[cfg(test)]
 mod tests {

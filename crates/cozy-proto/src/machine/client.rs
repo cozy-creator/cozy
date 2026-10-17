@@ -24,8 +24,8 @@ use sha2::{Digest as _, Sha256};
 use url::Url;
 
 use super::{
-    Event, HELD, OutputTarget, Ranges, RunEvent, RunRequest, RunState, StatusFrame, parse_held,
-    path,
+    Event, HELD, HeldAnswer, HeldObject, HeldRequest, OutputTarget, Ranges, RunEvent, RunRequest,
+    RunState, StatusFrame, parse_held, path,
 };
 use crate::{
     capability,
@@ -247,6 +247,18 @@ impl Machine {
     /// object is held whole.
     pub async fn held(&self, digest: &str) -> Result<Ranges, Error> {
         held(&send(self.request(Method::HEAD, path::OBJECT, &[digest])).await?)
+    }
+
+    /// What the machine holds of each of `digests`, in one request, in the order asked.
+    pub async fn held_many(&self, digests: &[String]) -> Result<Vec<HeldObject>, Error> {
+        let ask = HeldRequest {
+            digests: digests.to_vec(),
+        };
+        let request = self
+            .request(Method::POST, path::OBJECTS_HELD, &[])
+            .json(&ask);
+        let answer: HeldAnswer = json(send(request).await?).await?;
+        Ok(answer.held)
     }
 
     fn request(&self, method: Method, template: &str, args: &[&str]) -> RequestBuilder {

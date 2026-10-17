@@ -195,8 +195,19 @@ impl Link {
         Ok(v1::held_bytes(&held).min(length))
     }
 
-    /// Uploads the object at `path`: what the machine does not hold yet, in parts side by side
-    /// (`lanes`). `progress` hears what the machine holds, from a HEAD about once a second while
+    /// What the machine holds of each of `digests`, asked in one round trip.
+    pub async fn held_many(&self, digests: &[Digest]) -> Result<Vec<v1::Ranges>, LinkError> {
+        let names: Vec<String> = digests.iter().map(Digest::to_string).collect();
+        let held = self.machine.held_many(&names).await?;
+        if held.len() != names.len() || held.iter().zip(&names).any(|(h, n)| h.digest != *n) {
+            let other = "the machine answered for other objects than asked";
+            return Err(LinkError::Unreachable(other.into()));
+        }
+        Ok(held.into_iter().map(|h| h.ranges).collect())
+    }
+
+    /// Uploads the object at `path`: what the machine does not hold yet (`held`, as it last
+    /// said), in parts side by side (`lanes`). `progress` hears what the machine holds, from a HEAD about once a second while
     /// parts fly, with the rate; an object the machine already holds is not written and
     /// `progress` hears nothing. A failed or stalled part resumes on a fresh connection; the
     /// upload gives up only when every lane has failed since a byte last moved, or a whole pass
@@ -206,10 +217,10 @@ impl Link {
         digest: &Digest,
         length: u64,
         path: &Path,
+        mut held: v1::Ranges,
         mut progress: impl FnMut(u64, Option<f64>),
     ) -> Result<(), LinkError> {
         let name = digest.to_string();
-        let mut held = self.machine.held(&name).await?;
         if v1::held_bytes(&held) >= length {
             return Ok(());
         }

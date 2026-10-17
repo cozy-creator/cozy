@@ -27,6 +27,8 @@ pub mod path {
     pub const LOG: &str = "/v1/logs/{name}";
     /// `PUT` with `Content-Range`, `HEAD`; `{digest}` is `sha256:<hex>`.
     pub const OBJECT: &str = "/v1/objects/{digest}";
+    /// `POST` a [`super::HeldRequest`]: what the machine holds of many objects, in one request.
+    pub const OBJECTS_HELD: &str = "/v1/objects/held";
 }
 
 /// The header naming the byte ranges of an object the machine holds: `0-1048575,2097152-4194303`
@@ -94,6 +96,31 @@ pub struct OutputTarget {
     pub index: u32,
     /// One file of a tree output, by its manifest path; empty: the manifest.
     pub member: String,
+}
+
+/// `POST /v1/objects/held`: which of these objects (`sha256:<hex>`) the machine holds for this
+/// signer.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct HeldRequest {
+    pub digests: Vec<String>,
+}
+
+/// What the machine holds of each object asked, in the order asked; a stored object is held
+/// whole, and asking renews it, as a `HEAD` does.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct HeldAnswer {
+    pub held: Vec<HeldObject>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct HeldObject {
+    pub digest: String,
+    /// Byte ranges `[start, end)`; none: nothing held.
+    #[schema(value_type = Vec<Vec<u64>>)]
+    pub ranges: Ranges,
 }
 
 /// Raw JSON, kept as its exact text: canonical bytes and 64-bit integers survive.
