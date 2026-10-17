@@ -13,7 +13,6 @@ use cozy_proto::{
     ids::Digest,
     machine as v1,
 };
-use prost::Message as _;
 
 use super::{Following, clock, machine, now_ms, route, usd};
 use crate::{
@@ -270,8 +269,8 @@ pub async fn update(
     }
     payload.insert("agent".into(), "bundled".into());
     let spec = v1::RunSpec {
-        kind: v1::RunKind::Update as i32,
-        payload: serde_json::to_vec(&payload).expect("JSON serializes"),
+        kind: v1::RunKind::Update,
+        payload: Some(v1::Json::parse(serde_json::Value::Object(payload).to_string()).expect("JSON")),
         inputs,
         ..Default::default()
     };
@@ -280,7 +279,7 @@ pub async fn update(
         hub: hub.origin,
         kind: calcifer::Kind::Update,
         target: named.join(", "),
-        spec: spec.encode_to_vec(),
+        spec,
         inputs: staged,
         out: None,
         warnings: vec![],

@@ -51,6 +51,6 @@ reads metadata and AST inside the environment without importing package code.
 Model slots and resolution-cache entries belong to the callee package. The caller's model
 choices do not override another package's slots; a choice addressed to a callee slot names it. GPU
 execution uses the callee's interface; import-only parents are keyed by generation and App.
-These are additive generation and manifest fields; `cozy.machine.v1` is unchanged.
+These are additive generation and manifest fields; the machine API is unchanged.
 An export registered by distinct Apps is refused only when that ambiguous call is made;
 other calls and same-App aliases continue to work.
