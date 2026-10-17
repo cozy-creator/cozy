@@ -87,8 +87,6 @@ pub struct Choice {
 pub struct Request {
     pub operation: String,
     #[serde(default)]
-    pub agent: String,
-    #[serde(default)]
     pub pin: Option<bool>,
     pub runtime: Option<Choice>,
     pub tensorfs: Option<Choice>,
@@ -408,14 +406,9 @@ impl Updates {
                 .operation
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
-            && matches!(request.agent.as_str(), "" | "bundled" | "explicit")
             && (request.runtime.is_some() || request.tensorfs.is_some());
         if !valid {
-            return Err((
-                400,
-                "an update requires operation, valid agent selection, and a Runtime or TensorFS"
-                    .into(),
-            ));
+            return Err((400, "an update requires operation and a Runtime or TensorFS".into()));
         }
         let mut current = self.status.lock().unwrap();
         if let Some(status) = current.as_ref() {
@@ -523,7 +516,7 @@ impl Updates {
             // Never selected: nothing refers to it.
             let _ = fs::remove_dir_all(&candidate);
         }
-        let (agent, to, _activation) = prepared?;
+        let (to, _activation) = prepared?;
         let pending = Pending {
             status: self.status.lock().unwrap().clone().unwrap_or_default(),
             sdk_before: previous_link(&self.paths.current_sdk_link())?,
@@ -532,9 +525,6 @@ impl Updates {
         let publication = (|| {
             write_json(&self.paths.update("pending.json"), &pending)?;
             relink(&self.paths.current_sdk_link(), Some(&candidate))?;
-            if let Some(binary) = agent {
-                relink(&self.paths.current_agent_link(), Some(&binary))?;
-            }
             self.set(|s| s.enter("starting"))
         })();
         if let Err(error) = publication {
@@ -568,8 +558,7 @@ impl Updates {
         &self,
         request: &Request,
         candidate: &Path,
-    ) -> io::Result<(Option<PathBuf>, Pair, Option<super::lifecycle::Activation>)> {
-        let mut agent = None;
+    ) -> io::Result<(Pair, Option<super::lifecycle::Activation>)> {
         for (distribution, choice) in [
             ("cozy_runtime", &request.runtime),
             ("tensorfs", &request.tensorfs),
@@ -583,15 +572,12 @@ impl Updates {
                 .and_then(|n| n.to_str())
                 .ok_or_else(|| invalid("wheel name"))?
                 .to_owned();
-            let bundled = verify_wheel(&wheel, distribution)?;
+            verify_wheel(&wheel, distribution)?;
             let prepared = candidate.join(&name);
             fs::copy(&wheel, &prepared)?;
             fs::File::open(prepared)?.sync_all()?;
             if let Some(file) = choice.as_ref().filter(|c| distribution == "cozy_runtime" && !c.file.is_empty()) {
                 fs::write(candidate.join(RUNTIME_BUILD), build(&wheel, &file.sha256)?)?;
-            }
-            if let Some(binary) = bundled.filter(|_| request.agent != "explicit") {
-                agent = bundled_tensord(&binary, candidate)?;
             }
         }
         self.resolves(candidate)?;
@@ -611,7 +597,7 @@ impl Updates {
                 std::thread::sleep(std::time::Duration::from_secs(1));
             }
         }
-        Ok((agent, to, activation))
+        Ok((to, activation))
     }
 
     /// The pair resolves as a package environment installs it (uv, over the index), or the
@@ -686,9 +672,10 @@ fn existing_wheel(dir: &Path, distribution: &str) -> io::Result<PathBuf> {
         .ok_or_else(|| invalid(&format!("no installed {distribution} wheel")))
 }
 
-/// Checks the wheel's METADATA names the distribution and version its file name does; returns
-/// a bundled `tensord` executable when a Runtime wheel carries one.
-fn verify_wheel(path: &Path, distribution: &str) -> io::Result<Option<Vec<u8>>> {
+/// Checks the wheel's METADATA names the distribution and version its file name does. A
+/// `tensord` a Runtime wheel still bundles is never this machine's: its binary moves only with the
+/// `cozy` release.
+fn verify_wheel(path: &Path, distribution: &str) -> io::Result<()> {
     let name = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -719,13 +706,7 @@ fn verify_wheel(path: &Path, distribution: &str) -> io::Result<Option<Vec<u8>>> 
             "{name} METADATA names another distribution or version"
         )));
     }
-    let script = format!("{distribution}-{version}.data/scripts/tensord");
-    let Ok(mut entry) = archive.by_name(&script) else {
-        return Ok(None);
-    };
-    let mut binary = Vec::new();
-    entry.read_to_end(&mut binary)?;
-    Ok(Some(binary))
+    Ok(())
 }
 
 /// A development Runtime wheel's version and build: the source commit it embeds, else its
@@ -741,32 +722,6 @@ fn build(path: &Path, sha256: &str) -> io::Result<String> {
     let commit = provenance.lines().find_map(|l| l.strip_prefix("COMMIT = ")).map(|c| c.trim().trim_matches('"'));
     let id = commit.filter(|c| c.len() >= 8 && c.chars().all(|c| c.is_ascii_hexdigit())).unwrap_or(sha256);
     Ok(format!("{version}+{}", &id[..8]))
-}
-
-/// The bundled executable when it is TensorD (its `version --json` says so). A wheel bundling
-/// anything else leaves this one running.
-fn bundled_tensord(binary: &[u8], dir: &Path) -> io::Result<Option<PathBuf>> {
-    let path = dir.join("tensord");
-    fs::write(&path, binary)?;
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
-    let output = std::process::Command::new(&path)
-        .args(["version", "--json"])
-        .output();
-    #[derive(Deserialize)]
-    struct Identity {
-        name: String,
-    }
-    let tensord = output
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| serde_json::from_slice::<Identity>(&o.stdout).ok())
-        .is_some_and(|i| i.name == "tensord");
-    if !tensord {
-        fs::remove_file(&path)?;
-        return Ok(None);
-    }
-    fs::File::open(&path)?.sync_all()?;
-    Ok(Some(path))
 }
 
 /// `cozy_runtime-0.18.102-cp312-…whl` → ("cozy_runtime", "0.18.102").
@@ -901,19 +856,14 @@ mod tests {
     }
 
     #[test]
-    fn wheels_verify_by_metadata_and_a_bundled_tensord_is_recognized() {
+    fn wheels_verify_by_metadata() {
         let dir = std::env::temp_dir().join(format!("cozy-update-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
+        // A Runtime wheel that still bundles a tensord verifies; the bundled one is never run.
         let script = b"#!/bin/sh\necho '{\"name\":\"tensord\"}'\n";
         let runtime = wheel(&dir, "cozy_runtime", "0.18.103", Some(script));
-        let binary = verify_wheel(&runtime, "cozy_runtime").unwrap().unwrap();
-        assert!(bundled_tensord(&binary, &dir).unwrap().is_some());
-        let other = b"#!/bin/sh\necho '{\"name\":\"other\",\"version\":\"0.18.103\"}'\n";
-        assert!(
-            bundled_tensord(other, &dir).unwrap().is_none(),
-            "another executable leaves this machine running"
-        );
+        verify_wheel(&runtime, "cozy_runtime").unwrap();
         assert!(verify_wheel(&runtime, "tensorfs").is_err());
         let wrong = dir.join("tensorfs-0.3.94-py3-none-any.whl");
         fs::copy(wheel(&dir, "tensorfs", "0.3.93", None), &wrong).unwrap();
@@ -998,7 +948,7 @@ mod tests {
         let file = candidate.file_name().unwrap().to_str().unwrap().to_owned();
         let (sha256, _) = updates.stage(&file, &mut fs::File::open(&candidate).unwrap()).unwrap();
         let runtime = Some(Choice { file, sha256, ..Default::default() });
-        let request = Request { operation: "u1".into(), agent: "explicit".into(), pin: None, runtime, tensorfs: None };
+        let request = Request { operation: "u1".into(), pin: None, runtime, tensorfs: None };
         updates.request(request, |code| assert_eq!(code, REPLACE_EXIT)).unwrap();
         state(&updates, "u1", "waiting_activation");
         assert!(lifecycle.admit().is_err(), "a new run was admitted during activation");
@@ -1057,7 +1007,7 @@ mod tests {
         wheel(&paths.image_wheels, "tensorfs", "0.1.0", None);
         let updates = Updates::open(paths.clone(), Box::new(|| true), None, None).unwrap();
         let request = Request {
-            operation: "same".into(), agent: "bundled".into(), pin: None,
+            operation: "same".into(), pin: None,
             runtime: Some(Choice { version: "0.1.0".into(), ..Default::default() }),
             tensorfs: Some(Choice { version: "0.1.0".into(), ..Default::default() }),
         };
@@ -1237,7 +1187,7 @@ mod tests {
         let persisted: Status = serde_json::from_slice(&fs::read(transaction.paths.update("status.json")).unwrap()).unwrap();
         assert_eq!(persisted.state, "succeeded");
         let next = Request {
-            operation: "next".into(), agent: "explicit".into(), pin: None,
+            operation: "next".into(), pin: None,
             runtime: Some(Choice { version: "0.2.0".into(), ..Default::default() }),
             tensorfs: None,
         };
@@ -1272,7 +1222,7 @@ mod tests {
         let file = wheel.file_name().unwrap().to_str().unwrap().to_owned();
         let (sha256, _) = updates.stage(&file, &mut fs::File::open(wheel).unwrap()).unwrap();
         Request {
-            operation: id.into(), agent: "explicit".into(), pin: None,
+            operation: id.into(), pin: None,
             runtime: Some(Choice { file, sha256, ..Default::default() }), tensorfs: None,
         }
     }

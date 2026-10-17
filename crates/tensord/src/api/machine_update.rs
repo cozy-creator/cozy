@@ -1,5 +1,5 @@
 //! `Run kind: update` (G/API.md, D2): the payload names the software cohort, `{"runtime": …,
-//! "tensorfs": …, "agent": "bundled" | "explicit"}`. A member is a published version (fetched
+//! "tensorfs": …}`; the machine's own binary moves only with the `cozy` release. A member is a published version (fetched
 //! from PyPI, digest checked) or, when an input binds that field to an object sent with Write,
 //! that wheel's file name. The update stages and verifies the pair, waits for measured idleness,
 //! restarts the service on it in place and commits once the new service proves readiness, or
@@ -52,8 +52,6 @@ pub(super) fn owns(
 struct Cohort {
     runtime: Option<String>,
     tensorfs: Option<String>,
-    #[serde(default)]
-    agent: String,
     #[serde(flatten)]
     unknown: BTreeMap<String, serde_json::Value>,
 }
@@ -210,7 +208,6 @@ fn submit(
     };
     let request = Request {
         operation: id.into(),
-        agent: cohort.agent,
         pin: None,
         runtime: choose("runtime", cohort.runtime)?,
         tensorfs: choose("tensorfs", cohort.tensorfs)?,

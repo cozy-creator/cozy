@@ -32,6 +32,11 @@ impl Drop for Machine {
 }
 
 fn wheel(distribution: &str, version: &str, script: Option<&[u8]>) -> (String, Vec<u8>) {
+    requiring(distribution, version, script, "")
+}
+
+/// `wheel`, its METADATA requiring `requires` (`Requires-Dist:` lines).
+fn requiring(distribution: &str, version: &str, script: Option<&[u8]>, requires: &str) -> (String, Vec<u8>) {
     let name = format!("{distribution}-{version}-py3-none-any.whl");
     let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
     let options = zip::write::SimpleFileOptions::default();
@@ -41,7 +46,7 @@ fn wheel(distribution: &str, version: &str, script: Option<&[u8]>) -> (String, V
     )
     .unwrap();
     let metadata = format!(
-        "Name: {}\nVersion: {version}\n",
+        "Name: {}\nVersion: {version}\n{requires}",
         distribution.replace('_', "-")
     );
     zip.write_all(metadata.as_bytes()).unwrap();
@@ -186,7 +191,7 @@ fn outcome(log: &[v1::RunEvent]) -> v1::Outcome {
 
 fn spec(runtime: (&str, &str), tensorfs: (&str, &str)) -> v1::RunSpec {
     let payload = serde_json::json!({
-        "runtime": runtime.0, "tensorfs": tensorfs.0, "agent": "bundled", "note": "ignored",
+        "runtime": runtime.0, "tensorfs": tensorfs.0, "note": "ignored",
     });
     let input = |field: &str, digest: &str| v1::InputFile {
         field: field.into(),
@@ -212,8 +217,11 @@ fn service_cmdline(parent: u32) -> String {
         .unwrap_or_default()
 }
 
+/// An update installs a Runtime/TensorFS pair and restarts the service on the machine's own
+/// binary: a `tensord` a Runtime wheel still bundles is never run (the binary moves only with the
+/// `cozy` release). A pair that does not resolve ends the update failed and changes nothing.
 #[tokio::test]
-async fn an_update_run_activates_in_place_and_a_failing_candidate_ends_failed() {
+async fn an_update_run_installs_its_pair_in_place_and_an_unresolvable_one_ends_failed() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("target/machine-update-run")
         .join(std::process::id().to_string());
@@ -226,14 +234,14 @@ async fn an_update_run_activates_in_place_and_a_failing_candidate_ends_failed() 
     ] {
         std::fs::write(image.join(name), bytes).unwrap();
     }
-    let this_machine = std::fs::read(env!("CARGO_BIN_EXE_tensord")).unwrap();
-    let (runtime, runtime_bytes) = wheel("cozy_runtime", "0.18.103", Some(&this_machine));
+    // A tensord this machine must never become: run, it would end the service.
+    let bundled = b"#!/bin/sh\n[ \"$1\" = version ] && echo '{\"name\":\"tensord\"}' && exit 0\nexit 3\n";
+    let (runtime, runtime_bytes) = wheel("cozy_runtime", "0.18.103", Some(bundled));
     let (tensorfs, tensorfs_bytes) = wheel("tensorfs", "0.3.94", None);
-    let broken = b"#!/bin/sh\n[ \"$1\" = version ] && echo '{\"name\":\"tensord\"}' && exit 0\nexit 3\n";
-    let (failing, failing_bytes) = wheel("cozy_runtime", "0.18.104", Some(broken));
-    // The running version rebuilt: other bytes (trailing data an ELF ignores), the same label.
-    let rebuilt_machine = [this_machine.as_slice(), b"\0rebuilt"].concat();
-    let (rebuilt, rebuilt_bytes) = wheel("cozy_runtime", "0.18.103", Some(&rebuilt_machine));
+    let (failing, failing_bytes) =
+        requiring("cozy_runtime", "0.18.104", None, "Requires-Dist: cozy-no-such-distribution==0\n");
+    // The running version rebuilt: other bytes, the same label.
+    let (rebuilt, rebuilt_bytes) = wheel("cozy_runtime", "0.18.103", Some(b"rebuilt"));
     let (runtime_digest, tensorfs_digest, failing_digest, rebuilt_digest) = (
         hold(&root, &runtime_bytes),
         hold(&root, &tensorfs_bytes),
@@ -305,8 +313,8 @@ async fn an_update_run_activates_in_place_and_a_failing_candidate_ends_failed() 
         (before.boot_id.as_str(), before.receipt.as_slice())
     );
     assert!(
-        service_cmdline(machine.0.id()).contains("agent/current service"),
-        "the parent runs the activated binary"
+        !service_cmdline(machine.0.id()).contains("agent/current"),
+        "the service runs the machine's own binary, never the wheel's"
     );
 
     // The same id again attaches to the finished update; nothing runs twice.
@@ -322,7 +330,7 @@ async fn an_update_run_activates_in_place_and_a_failing_candidate_ends_failed() 
     .await;
     assert_eq!(outcome(&again), done);
 
-    // A candidate whose service never proves readiness: FAILED, rolled back, still serving.
+    // A pair that does not resolve together: FAILED before anything changes, still serving.
     let log = update(
         &root,
         port,
@@ -335,11 +343,11 @@ async fn an_update_run_activates_in_place_and_a_failing_candidate_ends_failed() 
     .await;
     let failed = outcome(&log);
     assert_eq!(failed.status, "failed", "{log:?}");
-    assert_eq!(failed.reason.unwrap().code, "update_rolled_back");
+    assert_eq!(failed.reason.unwrap().code, "update_failed");
     assert_eq!(status(&root, port).await.runtime, "0.18.103");
     assert!(
         machine.0.try_wait().unwrap().is_none(),
-        "the machine keeps running after a rollback"
+        "the machine keeps running after a failed update"
     );
 
     // A wheel rebuilt at the running version is installed: compared by bytes, never by label.
@@ -364,18 +372,15 @@ async fn an_update_run_activates_in_place_and_a_failing_candidate_ends_failed() 
     }
 
     // Stopped and launched again: `cozy machine stop` / `start` on this computer (a persistent
-    // machine), then a rental's pod restarted. Each launch proves itself under a new key, which
-    // the parent hands to the updated service it runs.
+    // machine), then a rental's pod restarted. Each launch proves itself under a new key and keeps
+    // the installed pair.
     for (persistent, key) in [(true, [8; 32]), (true, [9; 32]), (false, [10; 32])] {
         stop(&mut machine);
         std::fs::remove_file(root.join("run/cozy/bootstrap/readiness-envelope.json")).unwrap();
         machine = launch(&root, port, Some(key), persistent);
         let frame = status(&root, port).await;
         assert_eq!(frame.runtime, "0.18.103");
-        assert!(
-            service_cmdline(machine.0.id()).contains("agent/current service"),
-            "the launch runs the activated binary"
-        );
+        assert!(!service_cmdline(machine.0.id()).contains("agent/current"), "the launch runs its own binary");
     }
 
     // A rental's launch that cannot prove its boot to its Hub ends, with a status, instead of
