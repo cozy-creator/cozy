@@ -6,7 +6,6 @@ mod common;
 
 use std::{path::Path, sync::Arc};
 
-use base64::Engine as _;
 use calcifer::{Calcifer, machines::Machines};
 use cozy_platform::paths::Home;
 use cozy_proto::{
@@ -189,7 +188,7 @@ async fn a_runs_capability_is_bound_to_its_machine_and_traded_at_its_hub() {
     .unwrap();
 
     // The machine: a real TensorD, whose leaf key the test reads to act as it at the Hub.
-    let tensord = common::Tensord::start();
+    let tensord = common::Machine::start();
     let calcifer =
         Calcifer::open(&home.path().join("calcifer"), &home.path().join("outputs")).unwrap();
     let key = common::key_file(home.path());
@@ -236,16 +235,7 @@ async fn a_runs_capability_is_bound_to_its_machine_and_traded_at_its_hub() {
     assert!(public_access.capability.is_empty() && public_access.token_endpoint.is_empty());
 
     // As the machine: trade it with the leaf's key, then publish where it names, and only there.
-    let identity: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(tensord.root.path().join("config/identity/identity.json")).unwrap(),
-    )
-    .unwrap();
-    let pem = identity["private_key_pem"].as_str().unwrap();
-    let body: String = pem.lines().filter(|l| !l.starts_with("-----")).collect();
-    let der = base64::engine::general_purpose::STANDARD
-        .decode(body)
-        .unwrap();
-    let leaf = Arc::new(P256Key::from_pkcs8(&der).unwrap());
+    let leaf = Arc::new(P256Key::from_pkcs8(&tensord.leaf_key()).unwrap());
     let token = RunToken::new(&access.capability, &access.token_endpoint, leaf).unwrap();
     let machine = Client::connect(
         &origin,

@@ -286,3 +286,98 @@ pub async fn holds_as(link: &calcifer::Link, id: &RunId, spec: v1::RunSpec) -> b
         Err(e) => panic!("run {id}: {e}"),
     }
 }
+
+/// A TensorD running as a computer's persistent machine from a grant (`tensord run`): unlike
+/// `serve`, it installs local packages. It admits the test's key.
+pub struct Machine {
+    tree: cozy_platform::process::Tree,
+    pub root: tempfile::TempDir,
+    pub endpoint: Endpoint,
+}
+
+impl Machine {
+    pub fn start() -> Self {
+        let binary = std::env::var_os("COZY_TEST_TENSORD")
+            .expect("COZY_TEST_TENSORD names the tensord binary these tests run against");
+        let root = tempfile::tempdir().unwrap();
+        durable::private_dir(root.path()).unwrap();
+        let receipt = root.path().join("receipt-key");
+        let receipt_key = URL_SAFE_NO_PAD.encode([7u8; 32]);
+        durable::replace(&receipt, receipt_key.as_bytes(), 0o600).unwrap();
+        let address = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let machine = root.path().join("machine");
+        let mut command = Command::new(binary);
+        command
+            .arg("run")
+            .env_remove("COZY_TEST_TENSORD")
+            .env("COZY_MACHINE_ROOT", &machine)
+            .env("COZY_LISTEN_HOST", "127.0.0.1")
+            .env("COZY_WORKER_ID", WORKER)
+            .env("COZY_MACHINE_LIFETIME", "persistent")
+            .env("COZY_WORKER_INTERNAL_PORT", address.port().to_string())
+            .env(
+                "COZY_AUTHORIZED_KEYS",
+                URL_SAFE_NO_PAD.encode(key().verifying_key().to_bytes()),
+            )
+            .env("COZY_BOOTSTRAP_RECEIPT_HMAC_KEY_FILE", &receipt)
+            .env("CUDA_VISIBLE_DEVICES", "")
+            .stdout(Stdio::null());
+        let process = cozy_platform::process::Lifetime::Owned;
+        let mut tree = cozy_platform::process::spawn(command, process).unwrap();
+        let leaf = machine.join("run/cozy/bootstrap/tls.crt");
+        // A hang bound for a machine that never starts; the product waits without one.
+        let until = Instant::now() + Duration::from_secs(120);
+        while !(leaf.exists() && std::net::TcpStream::connect(address).is_ok()) {
+            if let Ok(Some(status)) = tree.try_wait() {
+                panic!("tensord exited before it served: {status}");
+            }
+            assert!(
+                Instant::now() < until,
+                "tensord did not listen on {address}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let endpoint = Endpoint {
+            worker_id: WORKER.into(),
+            address: address.to_string(),
+            pin: Sha256::digest(pem_der(&std::fs::read_to_string(&leaf).unwrap())).into(),
+        };
+        Self {
+            tree,
+            root,
+            endpoint,
+        }
+    }
+
+    /// Its TLS leaf's private key (PKCS#8 DER): the key it proves itself with at a Hub.
+    pub fn leaf_key(&self) -> Vec<u8> {
+        let key = self.root.path().join("machine/run/cozy/bootstrap/tls.key");
+        pem_der(&std::fs::read_to_string(key).unwrap())
+    }
+
+    pub fn row(&self, name: &str, key: &Path) -> MachineRow {
+        machine(name, Some(self.endpoint.clone()), key)
+    }
+}
+
+impl Drop for Machine {
+    /// Ends the exact processes this test started.
+    fn drop(&mut self) {
+        let _ = self.tree.kill();
+        let _ = self.tree.wait();
+    }
+}
+
+/// A PEM block's DER.
+fn pem_der(pem: &str) -> Vec<u8> {
+    let body: String = pem
+        .lines()
+        .filter(|line| !line.starts_with("-----"))
+        .collect();
+    base64::engine::general_purpose::STANDARD
+        .decode(body)
+        .unwrap()
+}

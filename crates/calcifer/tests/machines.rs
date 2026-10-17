@@ -617,7 +617,7 @@ async fn a_publishing_run_without_its_hub_sign_in_fails_unsent() {
 async fn a_signed_out_local_run_reaches_its_machine_with_no_owner() {
     let home = tempfile::tempdir().unwrap();
     let key = common::key_file(home.path());
-    let machine = Tensord::start();
+    let machine = common::Machine::start();
     let calcifer = calcifer(home.path());
     calcifer.put_machine(&machine.row("m", &key)).unwrap();
     let machines = machines(&calcifer, home.path());
