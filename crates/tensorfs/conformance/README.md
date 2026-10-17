@@ -24,8 +24,8 @@ cargo test -p tensorfs-core --no-default-features --test format_conformance --te
 
 `cargo test ... --test format_conformance -- --ignored regenerate` rewrites `vectors/store/` after a deliberate change.
 
-**Provenance.** The `fp8-rowwise`, `fp8-tensorwise`, `int8-convrot`, `nvfp4` and `mxfp8` cases are the producer-mined
-vectors of cozytensors/1 (ComfyUI's fp8_scaled quantizer, cozy-runtime's int8 ConvRot and NVFP4 producers), renamed to
-v2 parts; cozy-runtime's decoders reproduce them bit for bit. The other cases (per-column scales, `F8_E5M2` weights,
-`int8-rowwise`, a ragged `mxfp8` block, rounding of 3,072 f32 patterns to BF16/F16, plain dtypes, refusals) were
-computed exactly from the spec's formulas.
+**Provenance.** The `fp8-rowwise`, `fp8-tensorwise`, `int8-convrot` and `nvfp4` cases are the producer-mined vectors
+of cozytensors/1 (ComfyUI's fp8_scaled quantizer, cozy-runtime's int8 ConvRot and NVFP4 producers), renamed to v2
+parts; cozy-runtime's decoders reproduce them bit for bit. The other cases (per-column scales, `F8_E5M2` weights,
+rounding of 3,072 f32 patterns to BF16/F16, plain and unknown dtypes, refusals) were computed exactly from the spec's
+formulas.

@@ -108,30 +108,9 @@
    }
   },
   "dtype": {
-   "enum": [
-    "BOOL",
-    "F4",
-    "F6_E2M3",
-    "F6_E3M2",
-    "U8",
-    "I8",
-    "F8_E5M2",
-    "F8_E4M3",
-    "F8_E8M0",
-    "F8_E4M3FNUZ",
-    "F8_E5M2FNUZ",
-    "I16",
-    "U16",
-    "F16",
-    "BF16",
-    "I32",
-    "U32",
-    "F32",
-    "C64",
-    "F64",
-    "I64",
-    "U64"
-   ]
+   "type": "string",
+   "minLength": 1,
+   "description": "A dtype name. Known: BOOL, F4, F6_E2M3, F6_E3M2, U8, I8, F8_E5M2, F8_E4M3, F8_E8M0, F8_E4M3FNUZ, F8_E5M2FNUZ, I16, U16, F16, BF16, I32, U32, F32, C64, F64, I64, U64. Other names are newer dtypes and still read."
   },
   "shape": {
    "type": "array",

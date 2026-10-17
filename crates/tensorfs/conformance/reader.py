@@ -102,9 +102,12 @@ def object_ref(v) -> dict:
     return {"sha256": sha, "length": length}
 
 
-def byte_len(dtype, shape) -> int:
-    need(dtype in BITS, f"unknown dtype {dtype!r}")
+def byte_len(dtype, shape) -> int | None:
+    """Bytes of a known dtype and shape; None for an unknown dtype (its length stands)."""
+    need(isinstance(dtype, str) and dtype != "", f"bad dtype {dtype!r}")
     need(isinstance(shape, list) and all(uint(x) for x in shape), f"bad shape {shape!r}")
+    if dtype not in BITS:
+        return None
     bits = BITS[dtype]
     for x in shape:
         bits *= x
@@ -141,7 +144,8 @@ def parse_repo(data: bytes) -> dict:
 
 def parse_location(v: dict, dtype, shape, chunks, what) -> dict:
     loc = {k: field(v, k, int) for k in ("chunk", "offset", "length")}
-    need(byte_len(dtype, shape) == loc["length"], f"{what}: length disagrees with dtype and shape")
+    size = byte_len(dtype, shape)
+    need(size in (None, loc["length"]), f"{what}: length disagrees with dtype and shape")
     if loc["length"]:
         c = loc["chunk"]
         need(c < len(chunks), f"{what}: chunk {c} of {len(chunks)}")
@@ -242,18 +246,15 @@ def _e4m3() -> np.ndarray:
 E4M3 = _e4m3()
 E5M2 = (np.arange(256, dtype=np.uint16) << 8).view(np.float16).astype(np.float32)
 E2M1 = np.array([0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6], np.float32)
-E8M0 = np.array([2.0 ** (b - 127) for b in range(255)] + [np.nan], np.float32)
 
 
 def values(dtype: str, data: bytes) -> np.ndarray:
     raw = np.frombuffer(data, np.uint8)
     if dtype == "F32":
         return np.frombuffer(data, "<f4").astype(np.float32)
-    if dtype == "I8":
-        return raw.view(np.int8).astype(np.float32)
     if dtype == "F4":
         return E2M1[np.stack([raw & 15, raw >> 4], -1).reshape(-1)]
-    return {"F8_E4M3": E4M3, "F8_E5M2": E5M2, "F8_E8M0": E8M0}[dtype][raw]
+    return {"F8_E4M3": E4M3, "F8_E5M2": E5M2}[dtype][raw]
 
 
 def to_dtype(dtype: str, x: np.ndarray) -> bytes:
@@ -295,11 +296,9 @@ def hadamard(x: np.ndarray, k: int) -> np.ndarray:
 
 SCHEMES = {  # scheme: (required parts, optional parts, params)
     "fp8-rowwise": ({"weight", "scale"}, set(), {"axis"}),
-    "int8-rowwise": ({"weight", "scale"}, set(), {"axis"}),
     "fp8-tensorwise": ({"weight", "scale"}, {"input_scale"}, set()),
     "int8-convrot": ({"weight", "scale"}, set(), {"block", "rotation"}),
     "nvfp4": ({"weight", "scale", "scale_2"}, {"input_scale"}, {"block"}),
-    "mxfp8": ({"weight", "scale"}, set(), {"block"}),
 }
 
 
@@ -332,19 +331,18 @@ def _decode(dtype: str, shape: list, encoding: dict, parts: dict) -> bytes:
         if pd not in dtypes or (want is not None and ps != list(want)) or (
                 count is not None and int(np.prod(ps, dtype=np.int64)) != count):
             raise fail(f"part {role} is {pd} {ps}")
-        return values(pd, data) if pd != "I8" or scheme != "int8-convrot" else \
-            np.frombuffer(data, np.int8).astype(np.int64)
+        return np.frombuffer(data, np.int8).astype(np.int64) if pd == "I8" else values(pd, data)
 
     def param(name):
         v = params.get(name)
         return v if uint(v) else None
 
     fp8 = ("F8_E4M3", "F8_E5M2")
-    if scheme in ("fp8-rowwise", "int8-rowwise"):
+    if scheme == "fp8-rowwise":
         axis = param("axis")
         if axis not in (0, 1):
             raise fail("axis")
-        w = part("weight", ("I8",) if scheme == "int8-rowwise" else fp8, want=shape).reshape(rows, cols)
+        w = part("weight", fp8, want=shape).reshape(rows, cols)
         s = part("scale", ("F32",), count=shape[axis])
         out = w * (s.reshape(rows, 1) if axis == 0 else s.reshape(1, cols))
     elif scheme == "fp8-tensorwise":
@@ -362,7 +360,7 @@ def _decode(dtype: str, shape: list, encoding: dict, parts: dict) -> bytes:
         s = part("scale", ("F32",), count=rows)
         h = hadamard(w, k).astype(np.float32).reshape(rows, cols)
         out = (h * s.reshape(rows, 1)) * np.float32(2.0**-k)
-    elif scheme == "nvfp4":
+    else:  # nvfp4
         if param("block") != 16 or cols % 16:
             raise fail("block")
         w = part("weight", ("F4",), want=shape).reshape(rows, cols // 16, 16)
@@ -371,13 +369,6 @@ def _decode(dtype: str, shape: list, encoding: dict, parts: dict) -> bytes:
         if "input_scale" in parts:
             part("input_scale", ("F32",), count=1)
         out = (w * s) * s2
-    else:  # mxfp8
-        if param("block") != 32:
-            raise fail("block")
-        blocks = -(-cols // 32)
-        w = part("weight", fp8, want=shape).reshape(rows, cols)
-        s = part("scale", ("F8_E8M0",), want=[rows, blocks])
-        out = w * np.repeat(s.reshape(rows, blocks), 32, axis=1)[:, :cols]
     return to_dtype(dtype, out)
 
 

@@ -114,12 +114,17 @@ fn unknown_fields_and_minor_versions_read() {
     v["components"]["unet"]["tensors"]["a.weight"]["future"] = json!(true);
     v["components"]["unet"]["future"] = json!("y");
     v["components"]["unet"]["tensors"]["b.weight"]["encoding"]["scheme"] = json!("acme-int3");
+    v["components"]["unet"]["tensors"]["a.weight"]["dtype"] = json!("F3_E1M1");
     let pretty = serde_json::to_vec_pretty(&v).unwrap();
     let h = Header::from_json(&pretty).unwrap();
     let Body::Encoded { encoding, .. } = &h.tensor("unet", "b.weight").unwrap().body else {
         panic!()
     };
     assert_eq!(encoding.scheme, "acme-int3");
+    let a = h.tensor("unet", "a.weight").unwrap();
+    assert_eq!(a.dtype, Dtype::Other("F3_E1M1".into()));
+    let again = Header::from_json(&h.to_json().unwrap()).unwrap();
+    assert_eq!(again.tensor("unet", "a.weight"), Some(a));
 }
 
 #[test]
@@ -147,7 +152,12 @@ fn red_documents_are_refused() {
         ),
         ("nested duplicate", r#""n":1"#, r#""n":1,"n":2"#, "invalid"),
         ("length", r#""length":12"#, r#""length":14"#, "invalid"),
-        ("dtype", r#""dtype":"BF16""#, r#""dtype":"bf16""#, "invalid"),
+        (
+            "empty dtype",
+            r#""dtype":"BF16""#,
+            r#""dtype":"""#,
+            "invalid",
+        ),
         (
             "bounds",
             r#""chunk":1,"dtype":"F32","length":16,"offset":0"#,
@@ -223,5 +233,11 @@ fn spans_continue_into_following_chunks() {
     );
     assert_eq!(Dtype::F4.byte_len(&[3]), None);
     assert_eq!(Dtype::F4.byte_len(&[16, 64]), Some(512));
-    assert_eq!(Dtype::ALL.len(), 22);
+    assert_eq!(Dtype::known().count(), 22);
+    assert!(Dtype::known().all(|d| Dtype::parse(d.name()) == d));
+    let future = Dtype::parse("F3_E1M1");
+    assert_eq!(
+        (future.name(), future.bits(), future.byte_len(&[8])),
+        ("F3_E1M1", None, None)
+    );
 }

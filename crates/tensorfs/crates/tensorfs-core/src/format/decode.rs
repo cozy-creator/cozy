@@ -7,26 +7,19 @@ use std::collections::BTreeMap;
 use super::{Dtype, Encoding, Error, Result, Value};
 
 /// The schemes this reader decodes. A plain tensor (`data`) needs no scheme.
-pub const SCHEMES: [&str; 6] = [
-    "fp8-rowwise",
-    "fp8-tensorwise",
-    "int8-rowwise",
-    "int8-convrot",
-    "nvfp4",
-    "mxfp8",
-];
+pub const SCHEMES: [&str; 4] = ["fp8-rowwise", "fp8-tensorwise", "int8-convrot", "nvfp4"];
 
 /// One part's stored bytes, as the header declares them.
 #[derive(Debug, Clone, Copy)]
 pub struct PartBytes<'a> {
-    pub dtype: Dtype,
+    pub dtype: &'a Dtype,
     pub shape: &'a [u64],
     pub bytes: &'a [u8],
 }
 
 /// The logical tensor's bytes from its encoded parts.
 pub fn decode(
-    dtype: Dtype,
+    dtype: &Dtype,
     shape: &[u64],
     encoding: &Encoding,
     parts: &BTreeMap<&str, PartBytes>,
@@ -34,7 +27,7 @@ pub fn decode(
     use Dtype::*;
     let scheme = encoding.scheme.as_str();
     let (required, optional, params): (&[&str], &[&str], &[&str]) = match scheme {
-        "fp8-rowwise" | "int8-rowwise" => (&["scale", "weight"], &[], &["axis"]),
+        "fp8-rowwise" => (&["scale", "weight"], &[], &["axis"]),
         "fp8-tensorwise" => (&["scale", "weight"], &["input_scale"], &[]),
         "int8-convrot" => (&["scale", "weight"], &[], &["block", "rotation"]),
         "nvfp4" => (
@@ -42,7 +35,6 @@ pub fn decode(
             &["input_scale"],
             &["block"],
         ),
-        "mxfp8" => (&["scale", "weight"], &[], &["block"]),
         other => return Err(Error::UnknownScheme(other.into())),
     };
     let fail = |detail: String| Error::Decode(format!("{scheme}: {detail}"));
@@ -63,7 +55,7 @@ pub fn decode(
     }
     if !matches!(dtype, F32 | BF16 | F16) {
         return Err(fail(format!(
-            "logical dtype {dtype:?} is not F32, BF16 or F16"
+            "logical dtype {dtype} is not F32, BF16 or F16"
         )));
     }
     let numel = shape.iter().try_fold(1u64, |a, b| a.checked_mul(*b));
@@ -74,9 +66,9 @@ pub fn decode(
     };
     let part = |role: &str, dtypes: &[Dtype], want: Option<&[u64]>, count: u64| {
         let p = parts[role];
-        if !dtypes.contains(&p.dtype) {
+        if !dtypes.contains(p.dtype) {
             return Err(fail(format!(
-                "part {role} is {:?}, not one of {dtypes:?}",
+                "part {role} is {}, not one of {dtypes:?}",
                 p.dtype
             )));
         }
@@ -92,16 +84,11 @@ pub fn decode(
     };
     let fp8 = [F8_E4M3, F8_E5M2];
     let out: Vec<f32> = match scheme {
-        "fp8-rowwise" | "int8-rowwise" => {
+        "fp8-rowwise" => {
             let axis = uint(&encoding.params, "axis")
                 .filter(|a| *a < 2)
                 .ok_or_else(|| fail("axis is not 0 or 1".into()))?;
-            let w_types: &[Dtype] = if scheme == "int8-rowwise" {
-                &[I8]
-            } else {
-                &fp8
-            };
-            let w = floats(part("weight", w_types, Some(shape), 0)?);
+            let w = floats(part("weight", &fp8, Some(shape), 0)?);
             let s = floats(part("scale", &[F32], None, shape[axis as usize])?);
             let at = |i: usize| if axis == 0 { i / cols } else { i % cols };
             w.iter().enumerate().map(|(i, v)| v * s[at(i)]).collect()
@@ -159,23 +146,6 @@ pub fn decode(
                 .map(|(i, v)| v * s[i / 16] * s2)
                 .collect()
         }
-        "mxfp8" => {
-            if uint(&encoding.params, "block") != Some(32) {
-                return Err(fail("block must be 32".into()));
-            }
-            let blocks = cols.div_ceil(32);
-            let w = floats(part("weight", &fp8, Some(shape), 0)?);
-            let s = floats(part(
-                "scale",
-                &[F8_E8M0],
-                Some(&[rows as u64, blocks as u64]),
-                0,
-            )?);
-            w.iter()
-                .enumerate()
-                .map(|(i, v)| v * s[i / cols * blocks + i % cols / 32])
-                .collect()
-        }
         _ => unreachable!("matched above"),
     };
     Ok(round(dtype, &out))
@@ -195,24 +165,13 @@ fn floats(p: PartBytes) -> Vec<f32> {
             .iter()
             .map(|c| f32::from_le_bytes(*c))
             .collect(),
-        Dtype::I8 => b.iter().map(|v| *v as i8 as f32).collect(),
         Dtype::F8_E4M3 => b.iter().map(|v| e4m3(*v)).collect(),
         Dtype::F8_E5M2 => b.iter().map(|v| e5m2(*v)).collect(),
-        Dtype::F8_E8M0 => b
-            .iter()
-            .map(|v| {
-                if *v == 255 {
-                    f32::NAN
-                } else {
-                    pow2(*v as i32 - 127)
-                }
-            })
-            .collect(),
         Dtype::F4 => b
             .iter()
             .flat_map(|v| [e2m1(v & 15), e2m1(v >> 4)])
             .collect(),
-        other => unreachable!("no scheme reads {other:?} elements"),
+        other => unreachable!("no scheme reads {other} elements"),
     }
 }
 
@@ -275,7 +234,7 @@ fn hadamard(x: &mut [i32]) {
 }
 
 /// `x` rounded to the logical dtype and read back as f32.
-fn narrow(dtype: Dtype, x: f32) -> f32 {
+fn narrow(dtype: &Dtype, x: f32) -> f32 {
     match dtype {
         Dtype::BF16 => f32::from_bits((bf16(x) as u32) << 16),
         Dtype::F16 => f16_to_f32(f16(x)),
@@ -284,7 +243,7 @@ fn narrow(dtype: Dtype, x: f32) -> f32 {
 }
 
 /// Little-endian bytes of `xs` in `dtype` (F32, BF16 or F16).
-fn round(dtype: Dtype, xs: &[f32]) -> Vec<u8> {
+fn round(dtype: &Dtype, xs: &[f32]) -> Vec<u8> {
     match dtype {
         Dtype::F32 => xs
             .iter()

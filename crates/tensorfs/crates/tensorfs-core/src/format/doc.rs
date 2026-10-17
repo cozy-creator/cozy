@@ -279,12 +279,12 @@ impl TryFrom<HeaderWire> for Header {
                 }
                 let at = |what: &str| format!("{name}/{key}{what}");
                 match &t.body {
-                    Body::Data(loc) => header.check(loc, t.dtype, &t.shape, &at(""))?,
+                    Body::Data(loc) => header.check(loc, &t.dtype, &t.shape, &at(""))?,
                     Body::Encoded { parts, .. } => {
                         for (role, p) in parts {
                             header.check(
                                 &p.at(),
-                                p.dtype,
+                                &p.dtype,
                                 &p.shape,
                                 &at(&format!(" part {role}")),
                             )?;
@@ -383,30 +383,32 @@ impl Header {
                         (
                             role.as_str(),
                             PartBytes {
-                                dtype: p.dtype,
+                                dtype: &p.dtype,
                                 shape: &p.shape,
                                 bytes: b,
                             },
                         )
                     })
                     .collect();
-                decode(t.dtype, &t.shape, encoding, &views)
+                decode(&t.dtype, &t.shape, encoding, &views)
             }
         }
     }
 
-    fn check(&self, at: &Location, dtype: Dtype, shape: &[u64], what: &str) -> Result<()> {
-        match dtype.byte_len(shape) {
-            Some(n) if n == at.length => {}
-            Some(n) => {
+    /// Sizes known dtypes; an unknown dtype's `length` stands as written.
+    fn check(&self, at: &Location, dtype: &Dtype, shape: &[u64], what: &str) -> Result<()> {
+        match (dtype.bits(), dtype.byte_len(shape)) {
+            (None, _) => {}
+            (_, Some(n)) if n == at.length => {}
+            (_, Some(n)) => {
                 return invalid(format!(
-                    "{what}: length {} but {dtype:?} {shape:?} is {n} bytes",
+                    "{what}: length {} but {dtype} {shape:?} is {n} bytes",
                     at.length
                 ))
             }
-            None => {
+            (_, None) => {
                 return invalid(format!(
-                    "{what}: {dtype:?} {shape:?} is not a whole number of bytes"
+                    "{what}: {dtype} {shape:?} overflows or is not whole bytes"
                 ))
             }
         }

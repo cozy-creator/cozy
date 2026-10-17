@@ -72,14 +72,15 @@ or more segments joined by `/`.
 - For every location with `length > 0`, a reader MUST refuse the header unless `chunk` is in range,
   `offset < chunks[chunk].length`, and `offset + length` is at most the summed lengths of `chunks[chunk..]`. A
   zero-length location reads no bytes (writers emit `{0, 0, 0}`).
-- `length` MUST equal the byte size of the dtype and shape (§5) for plain data and for every part.
+- When the dtype is known, `length` MUST equal the byte size of the dtype and shape (§5), for plain data and for
+  every part.
 
 Tensor bytes are row-major (C order) and little-endian. Writers fill gaps between ranges with zeros; readers never
 read them.
 
 ## 5. Dtypes
 
-The dtypes are the 22 safetensors 0.8 names:
+The known dtypes are the 22 safetensors 0.8 names:
 
 | Bits | Dtypes |
 |---|---|
@@ -90,12 +91,14 @@ The dtypes are the 22 safetensors 0.8 names:
 | 32 | `I32`, `U32`, `F32` |
 | 64 | `C64`, `F64`, `I64`, `U64` |
 
-- The byte size of a dtype and shape is `bits × Π shape / 8`. A reader MUST refuse a tensor or part whose element
-  bits are not a multiple of 8, or whose product overflows 64 bits at any step (`bits`, then each extent in order).
+- The byte size of a known dtype and shape is `bits × Π shape / 8`. A reader MUST refuse a tensor or part whose
+  element bits are not a multiple of 8, or whose product overflows 64 bits at any step (`bits`, then each extent in
+  order).
 - Sub-byte elements pack from the low bits: `F4` element 2k is bits 0–3 of byte k and element 2k+1 bits 4–7; `F6`
   elements fill bits continuously from bit 0 of byte 0.
 - `BOOL` is one byte, 0 or 1. `C64` is two `F32` (real, imaginary).
-- An unknown dtype name is a refusal.
+- A dtype is any non-empty name. A name outside this table is a newer dtype: a reader still reads the document and
+  checks bounds, takes the `length` as written, and refuses only a typed view of the bytes or a decode that needs it.
 
 Element formats used by the schemes:
 
@@ -104,7 +107,6 @@ Element formats used by the schemes:
 | `F8_E4M3` | sign bit 7, exponent bits 3–6 (bias 7), mantissa bits 0–2. `e = 0`: `m × 2^−9`; otherwise `(1 + m/8) × 2^(e−7)`. `S.1111.111` is NaN; no infinities. |
 | `F8_E5M2` | sign bit 7, exponent bits 2–6 (bias 15), mantissa bits 0–1. `e = 0`: `m × 2^−16`; `e = 31`: infinity if `m = 0`, else NaN; otherwise `(1 + m/4) × 2^(e−15)`. |
 | `F4` (E2M1) | sign bit 3; bits 0–2 index `0, 0.5, 1, 1.5, 2, 3, 4, 6`. |
-| `F8_E8M0` | `2^(b−127)` for `b < 255`; `255` is NaN. |
 | `I8` | two's complement. |
 
 ## 6. Encodings
@@ -127,11 +129,11 @@ The result is then rounded once to the logical dtype `L`, written `round_L`:
 
 `R × C` below is the logical shape `[R, C]`; `i` indexes rows and `j` columns.
 
-### `fp8-rowwise`, `int8-rowwise`
+### `fp8-rowwise`
 
 | | |
 |---|---|
-| Parts | `weight`: `F8_E4M3` or `F8_E5M2` (`fp8-rowwise`), `I8` (`int8-rowwise`); shape `[R, C]`. `scale`: `F32`, `shape[axis]` elements (for example `[R]` or `[R, 1]`). |
+| Parts | `weight`: `F8_E4M3` or `F8_E5M2`, `[R, C]`. `scale`: `F32`, `shape[axis]` elements (for example `[R]` or `[R, 1]`). |
 | Params | `axis`: `0` (a scale per row) or `1` (a scale per column). Required. |
 | Decode | `value[i, j] = round_L(weight[i, j] × scale[axis = 0 ? i : j])` |
 
@@ -177,14 +179,6 @@ compute it: view each group of `B` as `k` base-4 digits (most significant first)
 This is NVIDIA ModelOpt's NVFP4 layout: ModelOpt's `weight` (`uint8 [R, C/2]`, element 2k in the low nibble),
 `weight_scale` and `weight_scale_2` are `weight`, `scale` and `scale_2` here. `input_scale` is the activation scale.
 
-### `mxfp8`
-
-| | |
-|---|---|
-| Parts | `weight`: `F8_E4M3` or `F8_E5M2`, `[R, C]`. `scale`: `F8_E8M0`, `[R, ⌈C/32⌉]` (the last block may be short). |
-| Params | `block`: `32`. |
-| Decode | `value[i, j] = round_L(weight[i, j] × scale[i, ⌊j/32⌋])` |
-
 ### Plain tensors
 
 A plain tensor's bytes are its value; reading it is a copy, whatever its dtype.
@@ -207,9 +201,8 @@ reader that needs only some components MAY fetch only the chunks their locations
 ## 8. Versioning
 
 - Minor versions add fields or values whose absence keeps the old meaning; readers of the same major read them.
-- A new scheme is a minor change: an old reader reads the document and refuses only the decode of that scheme's
-  tensors.
-- A new dtype is a major change, because a reader must size every location; an unknown dtype refuses the document.
+- A new scheme or dtype is a minor change: every location carries its `length`, so an old reader reads the document,
+  locates and verifies every byte, and refuses only a decode or typed view of the tensors that use it.
 - A change that alters the meaning of an existing field, scheme or param is a new major.
 
 ## 9. Encoding
