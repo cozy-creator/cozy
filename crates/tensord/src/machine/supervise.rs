@@ -43,7 +43,7 @@ pub fn supervise(
     }
     signals.thread_block().map_err(io::Error::from)?;
     // Orphans of the service reparent here, not to a PID 1 that may not reap them.
-    nix::sys::prctl::set_child_subreaper(true).map_err(io::Error::from)?;
+    cozy_platform::process::become_subreaper()?;
     let parent = nix::unistd::getpid();
     let mut failures_before_ready = 0;
     loop {
@@ -61,8 +61,7 @@ pub fn supervise(
             ForkResult::Child => {
                 drop(read);
                 // The service never outlives its supervisor.
-                nix::sys::prctl::set_pdeathsig(Signal::SIGKILL).map_err(io::Error::from)?;
-                if nix::unistd::getppid() != parent {
+                if !cozy_platform::process::die_with_parent(parent.as_raw() as u32)? {
                     std::process::exit(1);
                 }
                 SigSet::empty().thread_set_mask().map_err(io::Error::from)?;

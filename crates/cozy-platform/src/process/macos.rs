@@ -139,6 +139,14 @@ pub(super) fn read_bytes(_: u32) -> Option<u64> {
     None
 }
 
+pub(super) fn become_subreaper() -> crate::Result<()> {
+    Err(crate::Error::unsupported(crate::Seam::Process))
+}
+
+pub(super) fn die_with_parent(_: u32) -> crate::Result<bool> {
+    Err(crate::Error::unsupported(crate::Seam::Process))
+}
+
 pub(super) fn transient(error: &io::Error) -> bool {
     matches!(
         error.raw_os_error(),

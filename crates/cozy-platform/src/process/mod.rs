@@ -185,6 +185,19 @@ pub fn gone(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::NotFound || sys::gone(error)
 }
 
+/// Orphans of this process's descendants reparent to it, which must then reap them (a pod's
+/// stable parent, PID 1 or not). Linux only.
+pub fn become_subreaper() -> Result<()> {
+    sys::become_subreaper()
+}
+
+/// In a child just forked from `parent`: SIGKILL arrives when the parent dies. `false` when the
+/// parent was already gone before this call armed it (the child then has no parent to serve).
+/// Linux only.
+pub fn die_with_parent(parent: u32) -> Result<bool> {
+    sys::die_with_parent(parent)
+}
+
 /// An OS shortage that may clear by itself; nothing else justifies requeueing a launch.
 pub fn transient(error: &io::Error) -> bool {
     sys::transient(error)

@@ -174,6 +174,27 @@ pub(super) fn read_bytes(pid: u32) -> Option<u64> {
         .ok()
 }
 
+pub(super) fn become_subreaper() -> crate::Result<()> {
+    // SAFETY: prctl with scalar arguments.
+    if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) } < 0 {
+        return Err(crate::Error::os("become a subreaper")(
+            io::Error::last_os_error(),
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn die_with_parent(parent: u32) -> crate::Result<bool> {
+    // SAFETY: prctl with scalar arguments; async-signal-safe, as is getppid.
+    if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } < 0 {
+        return Err(crate::Error::os("die with the parent")(
+            io::Error::last_os_error(),
+        ));
+    }
+    // SAFETY: getppid has no arguments.
+    Ok(unsafe { libc::getppid() } as u32 == parent)
+}
+
 pub(super) fn transient(error: &io::Error) -> bool {
     matches!(
         error.raw_os_error(),

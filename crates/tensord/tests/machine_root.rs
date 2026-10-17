@@ -136,12 +136,16 @@ fn one_root_runs_one_machine() {
     lock.try_lock_exclusive()
         .expect("the stopped machine still holds its root");
 
-    // The lock is the Go agent's: whoever holds it owns the root.
-    let said = refused(&root, None);
-    assert!(said.contains("another machine owns the root"), "{said}");
-    FileExt::unlock(&lock).unwrap();
+    // A holder that names no live machine (a launcher's guard) is waited out, never refused:
+    // the machine neither exits nor serves while it holds, and starts once it lets go.
     let port = free_port();
     let mut again = boot(&root, port, None);
+    for _ in 0..10 {
+        assert!(again.0.try_wait().unwrap().is_none(), "a guarded root was refused");
+        assert!(!served(&root, port), "a machine served a guarded root");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    FileExt::unlock(&lock).unwrap();
     ready(&mut again, &root, port);
     drop(again);
     std::fs::remove_dir_all(&root).unwrap();
