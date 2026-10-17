@@ -1785,7 +1785,11 @@ impl<'a> Run<'_, 'a> {
                 return;
             }
             let now = Instant::now();
+            // A chunk a worker holds is being asked, whether or not its request is in flight
+            // yet: one counted as idle between the queue and its flight restarted the clock,
+            // so a chunk refused fast and forever never stopped the pull (macOS, Windows).
             let asking = flying
+                || state.busy > 0
                 || state
                     .queue
                     .iter()
