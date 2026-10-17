@@ -131,6 +131,8 @@ fn target(store: &Store, key: &str) -> types::PresignedUpload {
 }
 
 const LENGTH: usize = 6 << 20;
+/// The pauses of `put`, a thousandth as long: the same run, quick to wait out.
+const QUICK: (Duration, Duration) = (Duration::from_micros(250), Duration::from_millis(32));
 
 #[tokio::test]
 async fn a_send_dropped_mid_body_goes_again_and_lands_whole() {
@@ -141,11 +143,12 @@ async fn a_send_dropped_mid_body_goes_again_and_lands_whole() {
     .await;
     let dir = tempfile::tempdir().unwrap();
     let (file, bytes) = file(dir.path(), "tiny-1.0.0.tar.gz", LENGTH);
-    let sent = put(
+    let sent = put_paced(
         &reqwest::Client::new(),
         &file.path,
         &file.local,
         &target(&store, "k"),
+        QUICK,
     )
     .await;
     assert_eq!(sent.unwrap(), LENGTH as u64);
@@ -157,7 +160,8 @@ async fn a_send_dropped_mid_body_goes_again_and_lands_whole() {
 }
 
 /// Owner-day run 39068104998: five publishes put identical bytes to one content-addressed key at
-/// once, and the store dropped them unanswered. Each goes again: one lands, the rest find it held.
+/// once, and the store dropped them unanswered. Each sends again: one lands, the rest find it held
+/// (412). This is the re-send; `one_digest_is_sent_once` is the dedupe within one publish.
 #[tokio::test]
 async fn five_identical_puts_to_one_key_all_settle() {
     let store = store(|arrival| match arrival {
@@ -171,7 +175,7 @@ async fn five_identical_puts_to_one_key_all_settle() {
         reqwest::Client::new(),
         target(&store, "artifacts/sha256/30/66"),
     );
-    let puts = (0..5).map(|_| put(&http, &file.path, &file.local, &grant));
+    let puts = (0..5).map(|_| put_paced(&http, &file.path, &file.local, &grant, QUICK));
     let sent: Vec<u64> = futures_util::future::try_join_all(puts).await.unwrap();
     assert_eq!(
         sent.iter().sum::<u64>(),
@@ -182,29 +186,31 @@ async fn five_identical_puts_to_one_key_all_settle() {
 }
 
 #[tokio::test]
-async fn a_5xx_goes_again_and_another_4xx_is_final() {
+async fn slow_downs_go_again_and_another_4xx_is_final() {
     let slow = store(|arrival| match arrival {
-        0 => Turn::Answer(503),
+        0..2 => Turn::Answer(503),
         _ => Turn::Keep,
     })
     .await;
     let dir = tempfile::tempdir().unwrap();
     let (file, _) = file(dir.path(), "a.whl", 1 << 20);
-    let sent = put(
+    let sent = put_paced(
         &reqwest::Client::new(),
         &file.path,
         &file.local,
         &target(&slow, "a"),
+        QUICK,
     )
     .await;
     assert_eq!(sent.unwrap(), 1 << 20);
 
     let forbidding = store(|_| Turn::Answer(403)).await;
-    let refused = put(
+    let refused = put_paced(
         &reqwest::Client::new(),
         &file.path,
         &file.local,
         &target(&forbidding, "a"),
+        QUICK,
     )
     .await
     .unwrap_err();
@@ -221,24 +227,26 @@ async fn a_5xx_goes_again_and_another_4xx_is_final() {
     );
 }
 
-/// A store that takes the body and never answers makes no progress: the upload ends, naming the
-/// whole cause chain, instead of sending forever.
+/// A store that takes the body and never answers makes no progress: once a whole backoff run passes
+/// with no send getting further, the upload ends naming the whole cause chain, never sending
+/// forever.
 #[tokio::test]
 async fn sends_that_carry_the_body_no_further_end_naming_the_cause() {
     let store = store(|_| Turn::Drop(usize::MAX)).await;
     let dir = tempfile::tempdir().unwrap();
     let (file, _) = file(dir.path(), "b.tar.gz", 1 << 20);
-    let refused = put(
+    let refused = put_paced(
         &reqwest::Client::new(),
         &file.path,
         &file.local,
         &target(&store, "b"),
+        QUICK,
     )
     .await
     .unwrap_err();
     assert_eq!(refused.code, "release_upload_failed");
     assert!(
-        refused.message.contains("no further than the send before"),
+        refused.message.contains("sends, none carrying more than"),
         "{}",
         refused.message
     );
@@ -277,4 +285,32 @@ async fn one_digest_is_sent_once() {
         (sent, store.connections.load(Ordering::SeqCst)),
         (1 << 20, 1)
     );
+}
+
+/// A store that restarts refuses connections for a while, then takes the upload: the backoff
+/// waits it out instead of failing the publish.
+#[tokio::test]
+async fn a_store_that_comes_back_takes_the_upload() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let dir = tempfile::tempdir().unwrap();
+    let (file, bytes) = file(dir.path(), "e.tar.gz", 1 << 20);
+    let url = format!("http://{address}/e");
+    let grant: types::PresignedUpload =
+        serde_json::from_value(json!({"url": url, "required_headers": {"if-none-match": "*"}}))
+            .unwrap();
+    let http = reqwest::Client::new();
+    let sending = put_paced(&http, &file.path, &file.local, &grant, QUICK);
+    let returning = async {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let listener = TcpListener::bind(address).await.unwrap();
+        let held = Arc::<Mutex<BTreeMap<_, _>>>::default();
+        let (socket, _) = listener.accept().await.unwrap();
+        serve(socket, Turn::Keep, held.clone()).await;
+        held
+    };
+    let (sent, held) = tokio::join!(sending, returning);
+    assert_eq!(sent.unwrap(), 1 << 20);
+    assert!(held.lock().unwrap()["/e"] == bytes);
 }

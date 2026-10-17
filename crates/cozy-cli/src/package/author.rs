@@ -915,17 +915,30 @@ async fn upload(
 
 /// PUTs the file at `local` to a content-addressed `target`, whose signed `If-None-Match: *`
 /// makes a re-send safe. A send that ends with no answer, or with the store's 5xx (transient by
-/// design, as S3's SlowDown), goes again after a pause as long as it took, while each carries the
-/// body further than the one before; one that carries it no further ends the upload. Another
-/// 4xx is final, and 412 is the object already there (0 bytes sent).
+/// design, as S3's SlowDown), goes again after a pause that doubles from a quarter second to 32
+/// seconds and starts over whenever a send carries the body further than any before. It gives up
+/// only when a whole such run passes with no send getting further: the store took nothing more.
+/// Another 4xx is final, and 412 is the object already there (0 bytes sent).
 async fn put(
     http: &reqwest::Client,
     path: &str,
     local: &Path,
     target: &types::PresignedUpload,
 ) -> Result<u64, Error> {
+    let pace = (Duration::from_millis(250), Duration::from_secs(32));
+    put_paced(http, path, local, target, pace).await
+}
+
+/// `put` with its first pause and `ceiling` given.
+async fn put_paced(
+    http: &reqwest::Client,
+    path: &str,
+    local: &Path,
+    target: &types::PresignedUpload,
+    (first, ceiling): (Duration, Duration),
+) -> Result<u64, Error> {
     let failed = |message: String| Error::new(Kind::Unavailable, "release_upload_failed", message);
-    let mut before = None;
+    let (mut furthest, mut pause, mut sends) = (0, first, 0u32);
     loop {
         let file = tokio::fs::File::open(local)
             .await
@@ -936,7 +949,6 @@ async fn put(
             .map_err(|e| refuse("release_file_unreadable", e))?
             .len();
         let carried = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let started = std::time::Instant::now();
         let mut request = http
             .put(&target.url)
             .header(reqwest::header::CONTENT_LENGTH, length)
@@ -944,6 +956,7 @@ async fn put(
         for (name, value) in &target.required_headers {
             request = request.header(name, value);
         }
+        sends += 1;
         let why = match request.send().await {
             Ok(answer) => match answer.status().as_u16() {
                 200..=299 => return Ok(length),
@@ -956,18 +969,20 @@ async fn put(
         let reached = carried
             .load(std::sync::atomic::Ordering::Relaxed)
             .min(length);
-        if before.is_some_and(|before| reached <= before) {
+        if reached > furthest {
+            (furthest, pause) = (reached, first);
+        } else if pause > ceiling {
             return Err(failed(format!(
-                "{path}: {why}, after {reached} of {length} bytes, no further than the send before"
+                "{path}: {why}; {sends} sends, none carrying more than {furthest} of its {length} bytes since a pause of {}s",
+                ceiling.as_secs_f64()
             )));
         }
-        before = Some(reached);
-        let pause = started.elapsed().max(Duration::from_millis(250));
         output::warn(&format!(
-            "re-sending {path} in {:.1}s: {why}, after {reached} of {length} bytes",
+            "{path}: {why}, after {reached} of {length} bytes; sending it again in {:.2}s",
             pause.as_secs_f64()
         ));
         tokio::time::sleep(pause).await;
+        pause *= 2;
     }
 }
 
