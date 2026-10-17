@@ -34,6 +34,11 @@ pub(super) fn install(dir: &Path, spec: &ServiceSpec) -> Result<()> {
     run(MANAGER, systemctl().arg("daemon-reload"))
 }
 
+/// Whether the unit kept here is `spec`'s, as `install` wrote it (and linked it).
+pub(super) fn current(dir: &Path, spec: &ServiceSpec) -> bool {
+    fs::read(dir.join(unit(&spec.name))).is_ok_and(|kept| kept == render(spec).as_bytes())
+}
+
 pub(super) fn start(_: &Path, spec: &ServiceSpec) -> Result<()> {
     run(MANAGER, systemctl().args(["start", &unit(&spec.name)]))
 }

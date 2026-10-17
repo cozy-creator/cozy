@@ -19,6 +19,7 @@ futures-util = { workspace = true, features = ["alloc"] }
 getrandom.workspace = true
 hex.workspace = true
 hub-client.workspace = true
+jiff.workspace = true
 indicatif.workspace = true
 infer.workspace = true
 pep508_rs.workspace = true
