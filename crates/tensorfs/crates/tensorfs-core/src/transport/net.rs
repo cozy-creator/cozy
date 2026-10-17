@@ -189,9 +189,7 @@ fn keep(idle: Idle) {
 fn reuse(scope: &Scope, checked: &CheckedUrl) -> Option<(SocketAddr, SendRequest<Empty<Bytes>>)> {
     let mut held = IDLE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     held.retain(|idle| !idle.sender.is_closed());
-    let at = held.iter().rposition(|idle| {
-        idle.scope == *scope && idle.sender.is_ready() && checked.addrs.contains(&idle.peer)
-    })?;
+    let at = held.iter().rposition(|idle| idle.scope == *scope && checked.addrs.contains(&idle.peer))?;
     let idle = held.remove(at);
     Some((idle.peer, idle.sender))
 }
@@ -212,11 +210,16 @@ pub(crate) async fn get<'l>(
     let scope = Scope::of(checked, &scoped);
     // An idle connection its origin closed meanwhile fails before any answer: a GET is
     // idempotent, so it is asked again on a fresh connection.
-    if let Some((peer, sender)) = reuse(&scope, checked) {
-        let held = Idle { scope: scope.clone(), peer, sender };
-        match exchange(held, checked, headers, ledger, judge, Instant::now(), fail).await {
-            Err(refusal) if refusal.code == fail && ledger.check_running().is_ok() => {}
-            answered => return answered,
+    if let Some((peer, mut sender)) = reuse(&scope, checked) {
+        // Kept the moment its body ended, a connection takes the next request once its driver
+        // on the runtime has seen that end. Passing it over until then dialed a second
+        // connection whenever the runtime was busy: a handshake per chunk on a loaded machine.
+        if let Ok(Ok(())) = judged(sender.ready(), ledger, judge, Instant::now(), "an idle connection", fail).await {
+            let held = Idle { scope: scope.clone(), peer, sender };
+            match exchange(held, checked, headers, ledger, judge, Instant::now(), fail).await {
+                Err(refusal) if refusal.code == fail && ledger.check_running().is_ok() => {}
+                answered => return answered,
+            }
         }
     }
     let opened = Instant::now();
@@ -419,4 +422,106 @@ fn tls_refusal(checked: &CheckedUrl, error: std::io::Error, ledger: &Ledger, fai
         false => Refusal { code: fail, detail: format!("{}: TLS handshake failed: {error}", checked.host) },
     };
     http::recanted_now(checked, refusal, ledger, fail)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transport::SourcePolicy;
+    use std::io::{Read, Write};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A loopback HTTP/1.1 origin answering every GET with six bytes on a kept-alive connection,
+    /// counting the connections it accepts; with `close_first` it shuts its first one unanswered.
+    fn origin(close_first: bool) -> (CheckedUrl, Arc<AtomicUsize>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&accepted);
+        std::thread::spawn(move || {
+            for socket in listener.incoming() {
+                let Ok(mut socket) = socket else { return };
+                if counted.fetch_add(1, Ordering::SeqCst) == 0 && close_first {
+                    let _ = socket.shutdown(std::net::Shutdown::Both);
+                    continue;
+                }
+                std::thread::spawn(move || {
+                    let (mut head, mut byte) = (Vec::new(), [0]);
+                    while socket.read_exact(&mut byte).is_ok() {
+                        head.push(byte[0]);
+                        if head.ends_with(b"\r\n\r\n") {
+                            head.clear();
+                            let _ = socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nanswer");
+                        }
+                    }
+                });
+            }
+        });
+        let policy = SourcePolicy { allowed_hosts: vec!["localhost".into()], allow_local: true, ..Default::default() };
+        (policy.check(&format!("http://localhost:{port}/object")).unwrap(), accepted)
+    }
+
+    /// A connection to `checked` kept idle before its driver has ever run, as a kept connection is
+    /// on a busy runtime: its driver is returned, for the test to start when it chooses.
+    fn kept_before_its_driver(checked: &CheckedUrl) -> impl Future<Output = ()> + Send + 'static {
+        let socket = std::net::TcpStream::connect(("127.0.0.1", checked.port)).unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let (peer, scope) = (socket.peer_addr().unwrap(), Scope::of(checked, &[]));
+        let (sender, connection) = block_on(async {
+            let socket = TcpStream::from_std(socket).unwrap();
+            hyper::client::conn::http1::handshake::<_, Empty<Bytes>>(TokioIo::new(socket)).await.unwrap()
+        })
+        .unwrap();
+        assert!(!sender.is_ready(), "a driver that never ran has not asked for a request");
+        keep(Idle { scope, peer, sender });
+        async move {
+            let _ = connection.await;
+        }
+    }
+
+    fn held(checked: &CheckedUrl) -> bool {
+        let scope = Scope::of(checked, &[]);
+        IDLE.lock().unwrap().iter().any(|idle| idle.scope == scope)
+    }
+
+    /// One GET of `checked` read to its end; meanwhile the kept connection's driver starts once the
+    /// ask has taken it from the pool or dialed past it.
+    fn get_starting(checked: &CheckedUrl, driver: impl Future<Output = ()> + Send + 'static, accepted: &AtomicUsize) -> Result<Vec<u8>> {
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                while held(checked) && accepted.load(Ordering::SeqCst) < 2 {
+                    std::thread::yield_now();
+                }
+                runtime().unwrap().spawn(driver);
+            });
+            let ledger = Ledger::new();
+            block_on(async {
+                let mut answer = get(&Client::new(), checked, &[], &ledger, Judge::Transfer, Code::TRANSFER_FAILED).await?;
+                let mut body = Vec::new();
+                while let Some(data) = answer.body.chunk().await? {
+                    body.extend_from_slice(&data);
+                }
+                Ok(body)
+            })?
+        })
+    }
+
+    #[test]
+    fn a_connection_kept_before_its_driver_ran_serves_the_next_ask() {
+        let (checked, accepted) = origin(false);
+        let driver = kept_before_its_driver(&checked);
+        assert_eq!(get_starting(&checked, driver, &accepted).unwrap(), b"answer");
+        assert_eq!(accepted.load(Ordering::SeqCst), 1, "the next ask dialed past its kept connection");
+    }
+
+    #[test]
+    fn a_kept_connection_its_peer_closed_gives_way_to_a_fresh_one_at_once() {
+        let (checked, accepted) = origin(true);
+        let driver = kept_before_its_driver(&checked);
+        let started = Instant::now();
+        assert_eq!(get_starting(&checked, driver, &accepted).unwrap(), b"answer");
+        assert_eq!(accepted.load(Ordering::SeqCst), 2);
+        // A dead sender is no wait: nothing here came near a verdict on silence.
+        assert!(started.elapsed() < Ledger::new().patience(), "{:?}", started.elapsed());
+    }
 }
