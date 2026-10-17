@@ -8,6 +8,7 @@ use crate::Context;
 
 mod catalog;
 mod machine;
+mod quantize;
 pub(crate) mod refs;
 mod releases;
 
@@ -122,9 +123,14 @@ pub(crate) struct Quantize {
     /// Write the nvfp4 lane (block-scaled FP4).
     #[arg(long)]
     nvfp4: bool,
-    /// The package (org/name) whose quantizer runs; default: the one the machine holds.
+    /// The package (org/name[@release]) whose quantizer runs; default: the one the machine holds.
     #[arg(long)]
     package: Option<String>,
+    #[command(flatten)]
+    placement: crate::run::Placement,
+    /// Print the run and return at once instead of following it.
+    #[arg(long)]
+    detach: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -187,6 +193,6 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
         Verb::List(_) => Err(crate::not_ported("model list")),
         Verb::Download(args) => machine::download(ctx, args).await,
         Verb::Upload(args) => machine::upload(ctx, args).await,
-        Verb::Quantize(_) => Err(crate::not_ported("model quantize")),
+        Verb::Quantize(args) => quantize::quantize(ctx, args).await,
     }
 }
