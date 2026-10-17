@@ -28,11 +28,11 @@ struct Noise {
 impl Read for Noise {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         let n = (buffer.len() as u64).min(self.left) as usize & !7;
-        for chunk in buffer[..n].chunks_exact_mut(8) {
+        for chunk in buffer[..n].as_chunks_mut::<8>().0 {
             self.state ^= self.state << 13;
             self.state ^= self.state >> 7;
             self.state ^= self.state << 17;
-            chunk.copy_from_slice(&self.state.to_le_bytes());
+            *chunk = self.state.to_le_bytes();
         }
         self.left -= n as u64;
         Ok(n)

@@ -170,7 +170,7 @@ pub(super) fn append_parts(store: &Store, transaction: &str, objects: &[ObjectRe
         .open(&path)
         .map_err(io)?;
     let length = file.metadata().map_err(io)?.len();
-    let mut last = [b'\n'];
+    let mut last = *b"\n";
     if length > 0 {
         file.read_exact_at(&mut last, length - 1).map_err(io)?;
     }

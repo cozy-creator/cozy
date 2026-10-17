@@ -46,8 +46,8 @@ fn carrier(path: &Path, key: &str, bytes: u64, seed: u32) {
     let mut n = seed;
     let mut left = bytes;
     while left > 0 {
-        for word in chunk.chunks_exact_mut(4) {
-            word.copy_from_slice(&n.to_le_bytes());
+        for word in chunk.as_chunks_mut::<4>().0 {
+            *word = n.to_le_bytes();
             n = n.wrapping_add(1);
         }
         let take = left.min(MIB) as usize;

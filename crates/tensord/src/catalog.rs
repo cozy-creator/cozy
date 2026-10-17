@@ -197,7 +197,7 @@ impl Catalog {
                 Some((installed, self.resolve(&name).ok()?))
             })
             .collect();
-        found.sort_by(|a, b| b.0.cmp(&a.0));
+        found.sort_by_key(|(installed, _)| std::cmp::Reverse(*installed));
         found.into_iter().map(|(_, held)| held).collect()
     }
 }

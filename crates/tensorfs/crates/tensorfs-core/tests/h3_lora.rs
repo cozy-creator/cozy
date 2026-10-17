@@ -154,8 +154,10 @@ fn trainer_fused_projection_and_converted_qkv_have_the_same_heads() {
             let start = (file.header.data_start + tensor.begin) as usize;
             let end = (file.header.data_start + tensor.end) as usize;
             carrier_bytes[start..end]
-                .chunks_exact(4)
-                .map(|v| f32::from_le_bytes(v.try_into().unwrap()) as f64)
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|v| f32::from_le_bytes(*v) as f64)
                 .collect::<Vec<_>>()
         };
         let (a, b) = if kohya {
@@ -171,11 +173,15 @@ fn trainer_fused_projection_and_converted_qkv_have_the_same_heads() {
         };
         // A sparse but nontrivial input; both rank directions contribute.
         let projected = a
-            .chunks_exact(5376)
+            .as_chunks::<5376>()
+            .0
+            .iter()
             .map(|row| row[0] * 0.25 - row[5375] * 0.125)
             .collect::<Vec<_>>();
         let fused = b
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|row| row.iter().zip(&projected).map(|(b, a)| b * a).sum::<f64>())
             .collect::<Vec<_>>();
         let store = Store::init(&root.join("store")).unwrap();
@@ -195,15 +201,22 @@ fn trainer_fused_projection_and_converted_qkv_have_the_same_heads() {
         .unwrap();
         let out = out.unwrap();
         let tensors = &out.header.components[0].1;
-        for (part, expected) in ["q", "k", "v"].into_iter().zip(fused.chunks_exact(7168)) {
+        for (part, expected) in ["q", "k", "v"].into_iter().zip(fused.as_chunks::<7168>().0) {
             let key = format!("transformer_blocks.0.attn.to_{part}.lora_B.weight");
             let tensor = &tensors.iter().find(|(name, _)| name == &key).unwrap().1;
             let converted = bytes(&store, &tensor.parts[0].1);
-            for (head, rows) in converted.chunks_exact(128 * 2 * 4).enumerate() {
-                for (dim, row) in rows.chunks_exact(2 * 4).enumerate() {
+            for (head, rows) in converted
+                .as_chunks::<{ 128 * 2 * 4 }>()
+                .0
+                .iter()
+                .enumerate()
+            {
+                for (dim, row) in rows.as_chunks::<{ 2 * 4 }>().0.iter().enumerate() {
                     let actual = row
-                        .chunks_exact(4)
-                        .map(|v| f32::from_le_bytes(v.try_into().unwrap()) as f64)
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|v| f32::from_le_bytes(*v) as f64)
                         .zip(&projected)
                         .map(|(b, a)| b * a)
                         .sum::<f64>();
@@ -273,8 +286,10 @@ fn both_dialects_permute_only_b_rows_and_resume_without_new_bytes() {
                 assert!(key.starts_with(out_prefix));
                 let actual = bytes(&store, &tensor.parts[0].1);
                 let values = actual
-                    .chunks_exact(4)
-                    .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| f32::from_le_bytes(*b))
                     .collect::<Vec<_>>();
                 for (i, actual) in values.iter().enumerate() {
                     let source_index = if key.ends_with(".lora_B.weight")
