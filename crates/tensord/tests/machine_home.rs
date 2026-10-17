@@ -142,10 +142,11 @@ async fn this_computers_machine_runs_from_its_home() {
     let manifest = serde_json::json!({"package": "local/tensord-cpu-memo", "release": "0.1.0", "files": files});
     let manifest = write(&mut client, &owner, manifest.to_string().as_bytes()).await;
     // Its outcome and the stages it showed.
-    let mut warm = async |id: &str| -> (v1::Outcome, Vec<String>) {
+    let warm = async |id: &str, manifest: String| -> (v1::Outcome, Vec<String>) {
+        let mut client = client.clone();
         let spec = v1::RunSpec {
             kind: v1::RunKind::Warm as i32,
-            source: Some(v1::run_spec::Source::Local(v1::LocalSource { manifest: manifest.clone() })),
+            source: Some(v1::run_spec::Source::Local(v1::LocalSource { manifest })),
             ..Default::default()
         };
         let request = authorized(v1::RunRequest { id: id.into(), after: 0, spec: Some(spec) }, &owner);
@@ -160,15 +161,59 @@ async fn this_computers_machine_runs_from_its_home() {
         }
         (outcome.expect("an outcome"), stages)
     };
-    let (outcome, stages) = warm("local").await;
+    let (outcome, stages) = warm("local", manifest.clone()).await;
     assert_eq!(outcome.status, "succeeded", "{outcome:?}");
     let result: serde_json::Value = serde_json::from_slice(&outcome.result).unwrap();
     assert!(result["interface"]["entrypoints"].as_array().unwrap().iter().any(|e| e["name"] == "measure"), "{result}");
     assert!(stages.iter().any(|s| s == "installing local/tensord-cpu-memo on this machine"), "{stages:?}");
     // The same tree again: its environment is held, and no install shows.
-    let (outcome, stages) = warm("local-again").await;
+    let (outcome, stages) = warm("local-again", manifest.clone()).await;
     assert_eq!(outcome.status, "succeeded", "{outcome:?}");
     assert!(!stages.iter().any(|s| s.contains("installing") || s.contains("syncing")), "{stages:?}");
+
+    // This computer's own directory, read in place (`cozy run ./dir --on local`): an edited
+    // module syncs into the environment it already has.
+    let tree = home.path().join("src/cpu_memo");
+    std::fs::create_dir_all(tree.join("cpu_memo")).unwrap();
+    for name in ["pyproject.toml", "package.toml", "cpu_memo/__init__.py"] {
+        std::fs::copy(fixture.join(name), tree.join(name)).unwrap();
+    }
+    let in_place = async |tree: &Path| -> String {
+        let files: Vec<_> = ["pyproject.toml", "package.toml", "cpu_memo/__init__.py"].iter().map(|name| {
+            let bytes = std::fs::read(tree.join(name)).unwrap();
+            let digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&bytes));
+            serde_json::json!({"name": name, "digest": digest, "length": bytes.len()})
+        }).collect();
+        let manifest = serde_json::json!({"package": "local/tensord-cpu-memo", "release": "0.1.0",
+            "path": tree, "files": files});
+        write(&mut client.clone(), &owner, manifest.to_string().as_bytes()).await
+    };
+    let environments = || -> Vec<String> {
+        let editable = home.path().join(".cozy/machine/var/lib/cozy/tensord/editable");
+        let mut found = vec![];
+        for actor in std::fs::read_dir(&editable).unwrap().flatten() {
+            for entry in std::fs::read_dir(actor.path().join("tensord-cpu-memo")).into_iter().flatten().flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with("env-") {
+                    found.push(name);
+                }
+            }
+        }
+        found
+    };
+    let manifest = in_place(&tree).await;
+    let (outcome, stages) = warm("in-place", manifest).await;
+    assert_eq!(outcome.status, "succeeded", "{outcome:?}");
+    assert!(stages.iter().any(|s| s == "installing local/tensord-cpu-memo on this machine"), "{stages:?}");
+    let before = environments();
+    let module = tree.join("cpu_memo/__init__.py");
+    std::fs::write(&module, std::fs::read_to_string(&module).unwrap() + "\n# edited\n").unwrap();
+    let manifest = in_place(&tree).await;
+    let (outcome, stages) = warm("in-place-edited", manifest).await;
+    assert_eq!(outcome.status, "succeeded", "{outcome:?}");
+    assert!(stages.iter().any(|s| s == "syncing local/tensord-cpu-memo's changed source"), "{stages:?}");
+    assert!(!stages.iter().any(|s| s.contains("installing")), "{stages:?}");
+    assert_eq!(environments(), before, "the edit made no new environment");
     let uv = home.path().join(".cozy/machine/usr/local/bin/uv");
     let version = Command::new(&uv).arg("--version").output().unwrap();
     assert!(String::from_utf8_lossy(&version.stdout).starts_with(&format!("uv {}", tensord::machine::client::UV)));
