@@ -12,7 +12,7 @@ use hyper::{Method, Request, StatusCode};
 use hyper_util::rt::TokioIo;
 use nix::fcntl::OFlag;
 use std::{
-    collections::HashMap,
+    collections::BTreeMap,
     fs::File,
     io::{self, Read, Write},
     os::fd::FromRawFd,
@@ -65,11 +65,10 @@ impl ProviderSelf {
     /// environment (a pod's boot) it scrubs the key's copies under `root` and re-executes this
     /// program without it, and does not return unless that fails; a re-executed machine or an
     /// activated service reads it from CREDENTIAL_FD. Call before any thread starts.
-    pub fn take(root: &Path) -> Option<Self> {
+    pub fn take(root: &Path, env: &BTreeMap<String, String>) -> Option<Self> {
         if let Some(own) = inherited() {
             return Some(own);
         }
-        let env: HashMap<String, String> = std::env::vars().collect();
         let secrets: Vec<&str> = KEYS
             .iter()
             .filter_map(|name| env.get(*name).map(String::as_str))
@@ -78,7 +77,7 @@ impl ProviderSelf {
         if secrets.is_empty() {
             return None;
         }
-        let own = Self::from_env(&env);
+        let own = Self::from_env(env);
         for copy in copies(root) {
             match scrub(&copy, &secrets) {
                 Ok(true) => tracing::info!(
@@ -101,7 +100,7 @@ impl ProviderSelf {
     }
 
     /// The pod's own provider credential, when its provider gave one.
-    pub fn from_env(env: &HashMap<String, String>) -> Option<Self> {
+    pub fn from_env(env: &BTreeMap<String, String>) -> Option<Self> {
         let get = |name: &str| env.get(name).filter(|v| !v.is_empty()).cloned();
         let origin = |default: &str| get(API_ORIGIN).unwrap_or_else(|| default.to_owned());
         if let (Some(pod), Some(key)) = (get("RUNPOD_POD_ID"), get("RUNPOD_API_KEY")) {

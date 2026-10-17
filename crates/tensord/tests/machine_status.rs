@@ -38,6 +38,7 @@ fn boot(root: &Path, port: u16, lifetime: &str) -> Machine {
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
             .env("COZY_MACHINE_ROOT", root)
+            .env("HOME", root.join("home"))
             .env("COZY_WORKER_ID", WORKER)
             .env("COZY_WORKER_AUTH_TOKEN", URL_SAFE_NO_PAD.encode([1; 32]))
             .env("COZY_WORKER_INTERNAL_PORT", port.to_string())
@@ -52,7 +53,7 @@ fn boot(root: &Path, port: u16, lifetime: &str) -> Machine {
             )
             .env("TENSORHUB_ORIGIN", "https://hub.invalid")
             .env("CUDA_VISIBLE_DEVICES", "")
-            .env("COZY_MACHINE_LIFETIME", lifetime)
+            .arg(format!("--{lifetime}"))
             .envs(webrtc(lifetime))
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
@@ -280,25 +281,10 @@ async fn a_persistent_machine_reports_no_idle_deadline() {
         .local_addr()
         .unwrap()
         .port();
-    // The root's own uv, as an image or a local install provides it: the machine makes its
-    // installer helper with it from the client it embeds.
-    let uv = std::env::split_paths(&std::env::var_os("PATH").unwrap())
-        .map(|dir| dir.join("uv"))
-        .find(|path| path.is_file())
-        .expect("uv is required");
-    std::fs::create_dir_all(root.join("usr/local/bin")).unwrap();
-    std::os::unix::fs::symlink(&uv, root.join("usr/local/bin/uv")).unwrap();
     let mut machine = boot(&root, port, "persistent");
     receipt(&mut machine, &root, port);
-    let helper = root.join("var/lib/cozy/tensord/helper/bin/python");
-    let imported = Command::new(&helper)
-        .args(["-c", "import tensord_client.packages, packaging"])
-        .status()
-        .unwrap();
-    assert!(
-        imported.success(),
-        "the installer helper holds the embedded client"
-    );
+    // Its installer helper (and the uv it needs) is made at the first install, not at boot.
+    assert!(!root.join("var/lib/cozy/tensord/helper").exists());
     let pem = std::fs::read(root.join("run/cozy/bootstrap/tls.crt")).unwrap();
     let channel = Endpoint::from_shared(format!("https://127.0.0.1:{port}"))
         .unwrap()
