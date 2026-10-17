@@ -1477,10 +1477,12 @@ fn apply_adapters(
 /// by version, else the newest pre-release; yanked ones never.
 /// A catalog read the Hub answered 404 to is the thing named absent there; any other failure
 /// is the read's.
-fn absent(refusal: hub::Refusal, code: &'static str, named: impl FnOnce() -> String) -> Failure {
-    match refusal.0.contains("HTTP 404") {
-        true => (code, named()),
-        false => ("catalog_read_failed", refusal.0),
+/// The Hub's own 404 names an absence; one without its envelope (`http_404`: a tunnel or proxy
+/// in front of it) names nothing (tfs-101).
+fn absent(refusal: hub_client::Error, code: &'static str, named: impl FnOnce() -> String) -> Failure {
+    match refusal {
+        hub_client::Error::Hub { status: 404, code: hub, .. } if !hub.starts_with("http_") => (code, named()),
+        other => ("catalog_read_failed", other.to_string()),
     }
 }
 
@@ -1502,21 +1504,20 @@ const CARD: &str = "release.json";
 /// `release`'s card and locked requirements, read at its Hub.
 fn hub_card(catalog: &Catalog, package: &str, release: &str, python: &str) -> Result<Card, Failure> {
     let (org, name) = package.split_once('/').unwrap_or_default();
-    let base = format!("/v1/packages/{}/{}/releases/{}", hub::escape(org), hub::escape(name), hub::escape(release));
-    let card = catalog.json(&base).map_err(|e| absent(e, "release_absent", || {
+    let card = catalog.release(org, name, release).map_err(|e| absent(e, "release_absent", || {
         format!("{package} has no release {release} at {}", catalog.origin())
     }))?;
-    if card.pointer("/release/release").and_then(Value::as_str) != Some(release) {
-        return Err(("catalog_read_failed", format!("{base} named another release")));
+    if card.release.release != release {
+        return Err(("catalog_read_failed", format!("{package}@{release} named another release")));
     }
-    let interface = card.get("package_interface").filter(|v| v.is_object()).cloned().ok_or((
+    let interface = Some(card.package_interface).filter(Value::is_object).ok_or((
         "package_prepare_interface_missing",
         "the release carries no package interface".to_string(),
     ))?;
-    let python = card["python_version"].as_str().filter(|v| !v.is_empty()).unwrap_or(python).to_string();
+    let python = Some(card.python_version).filter(|v| !v.is_empty()).unwrap_or_else(|| python.to_string());
     let lock = catalog
-        .get(&format!("{base}/locked-requirements"), 16 << 20)
-        .map_err(|e| ("catalog_read_failed", e.0))?;
+        .locked_requirements(org, name, release)
+        .map_err(|e| ("catalog_read_failed", e.to_string()))?;
     let lock = String::from_utf8(lock).map_err(|_| {
         ("package_prepare_locked_requirements_invalid", "locked requirements are not UTF-8".to_string())
     })?;
@@ -1537,14 +1538,12 @@ fn keep_card(generation: &Path, card: &Card) {
 
 fn newest_release(catalog: &Catalog, org: &str, name: &str) -> Result<String, Failure> {
     let card = catalog
-        .json(&format!("/v1/packages/{}/{}", hub::escape(org), hub::escape(name)))
+        .package(org, name)
         .map_err(|e| absent(e, "package_absent", || format!("{org}/{name} is not published at {}", catalog.origin())))?;
-    card["releases"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|row| row["yanked"].as_bool() != Some(true) && row["yanked_at"].as_str().is_none_or(str::is_empty))
-        .filter_map(|row| row["release"].as_str())
+    card.releases
+        .iter()
+        .filter(|row| row.yanked != Some(true) && row.yanked_at.as_deref().is_none_or(str::is_empty))
+        .map(|row| row.release.as_str())
         .max_by(|a, b| release_order(a).cmp(&release_order(b)))
         .map(str::to_string)
         .ok_or(("release_absent", format!("{org}/{name} has no release that is not yanked")))

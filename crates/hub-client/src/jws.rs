@@ -142,7 +142,7 @@ impl P256Key {
 
     /// A DPoP proof for one request: `htu` is its URL without query or fragment; `token` the
     /// access token it presents, if any; `nonce` the server's last one.
-    pub(crate) fn proof(
+    pub fn proof(
         &self,
         method: &str,
         htu: &str,

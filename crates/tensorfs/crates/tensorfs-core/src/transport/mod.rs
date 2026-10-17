@@ -35,7 +35,6 @@ mod api;
 mod credential;
 pub(crate) mod decisions;
 mod download;
-mod dpop;
 mod http;
 mod hub;
 mod ledger;
@@ -49,12 +48,11 @@ pub(crate) mod sources;
 #[cfg(test)]
 pub(crate) mod tests;
 
-pub use api::{api_get, fetch_prefix, form_post, probe_length, Prefix};
+pub use api::{api_get, fetch_prefix, probe_length, Prefix};
 pub use credential::{
     credential_from_spec, Anonymous, Answer, Ask, Both, CredentialProvider, ScopedHeaders,
 };
 pub use download::{fetch_ranged, Ranged, CHUNK_BYTES, PART_BYTES};
-pub use dpop::{AccessToken, DpopCredential, DpopKey};
 pub use http::{trust_roots, Client};
 pub use hub::{closure, closure_all, presign, Closure, Presigned};
 pub use ledger::{
