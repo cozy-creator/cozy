@@ -33,9 +33,10 @@ enum Command {
         #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u32).range(1..=200))]
         limit: u32,
     },
-    /// A published package's releases, newest first.
+    /// A published package's releases, newest first; one release, with what its publish warned
+    /// of (its owner sees the warnings).
     Info {
-        /// org/name
+        /// org/name[@release]
         package: String,
     },
     /// Install a published package (org/name[@release]), a directory or a script on a machine: its
