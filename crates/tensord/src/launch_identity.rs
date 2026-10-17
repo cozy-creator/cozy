@@ -186,10 +186,12 @@ pub fn credential_name(name: &str) -> bool {
 /// The process environment every machine-launched package process starts from: the
 /// machine's own environment without credentials or names the seal owns.
 pub fn inherited() -> BTreeMap<String, String> {
-    std::env::vars()
+    cozy_proto::config::environment()
+        .iter()
         .filter(|(name, _)| {
             !credential_name(name) && !ERASED_PREFIXES.iter().any(|p| name.starts_with(p))
         })
+        .map(|(name, value)| (name.clone(), value.clone()))
         .collect()
 }
 

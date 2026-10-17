@@ -604,13 +604,9 @@ impl<B: MachineBackend> Cozy<B> {
             .map(spelled)
             .unwrap_or_default();
         let authority = &self.media.identity.authority;
-        let verified = capability::verify(
-            token,
-            &authority.worker_id,
-            &authority.keys.admitted(),
-            unix_now(),
-            &binding,
-        );
+        let verified = authority
+            .keys
+            .check(|keys| capability::verify(token, &authority.worker_id, keys, unix_now(), &binding));
         match verified {
             Ok((grant, signer)) => {
                 let mut welcome = json!({"t": "welcome", "v": 1, "machine": grant.machine,

@@ -124,14 +124,10 @@ impl<B: MachineBackend> MachineV1<B> {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |since| since.as_secs() as i64);
         let authority = &self.identity.authority;
-        let (grant, signer) = capability::verify(
-            token,
-            &authority.worker_id,
-            &authority.keys.admitted(),
-            now,
-            "",
-        )
-        .map_err(|refusal| Status::unauthenticated(refusal.to_string()))?;
+        let (grant, signer) = authority
+            .keys
+            .check(|keys| capability::verify(token, &authority.worker_id, keys, now, ""))
+            .map_err(|refusal| Status::unauthenticated(refusal.to_string()))?;
         Ok(Caller {
             actor: VerifiedActor {
                 public_key: signer.to_bytes(),
@@ -803,6 +799,7 @@ impl<B: MachineBackend> v1::machine_server::Machine for MachineV1<B> {
                 let log = match name.as_str() {
                     "tensorfs-transport" => domain::MachineLog::TensorfsTransport,
                     "memory" => domain::MachineLog::Memory,
+                    "tensord" => domain::MachineLog::Tensord,
                     _ => {
                         return Err(Status::not_found(format!(
                             "this machine keeps no log {name}"
