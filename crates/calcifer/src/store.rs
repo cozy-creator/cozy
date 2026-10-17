@@ -18,7 +18,7 @@ use cozy_proto::{
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
 use rusqlite_migration::{M, Migrations};
 
-/// The schema; its version is `PRAGMA user_version`.
+/// The schema before xs-044's JSON rows.
 const MIGRATIONS: &[M] = &[
     M::up(
         "CREATE TABLE machines (
@@ -120,10 +120,31 @@ const MIGRATIONS: &[M] = &[
         ALTER TABLE asks ADD COLUMN kind TEXT NOT NULL DEFAULT 'rent' CHECK (kind IN ('rent', 'end'));
         ALTER TABLE asks ADD COLUMN run TEXT REFERENCES runs (id);",
     ),
-    // xs-044: a run's spec and outcome are JSON. Protobuf ones from before are not kept: an
-    // unconfirmed run fails `spec_not_kept`, a settled one keeps all but its result.
-    M::up("UPDATE runs SET spec = x'', outcome = NULL;"),
 ];
+
+/// The schema; its version is `PRAGMA user_version`.
+fn migrations() -> Migrations<'static> {
+    let mut all = MIGRATIONS.to_vec();
+    // xs-044: a run's spec and outcome are JSON. v0.9.4+ rewrote them so at this version; a store
+    // no such build opened still holds protobuf, which is not kept: an unconfirmed run fails
+    // `spec_not_kept`, a settled one keeps all but its result.
+    all.push(M::up_with_hook("", |tx: &Transaction| {
+        let cleared = tx.execute(
+            "UPDATE runs SET spec = x'', outcome = NULL
+             WHERE (spec <> x'' AND hex(substr(spec, 1, 1)) <> '7B')
+                OR (outcome IS NOT NULL AND hex(substr(outcome, 1, 1)) <> '7B')",
+            [],
+        )?;
+        if cleared > 0 {
+            tracing::warn!(
+                "{cleared} runs kept their specs and outcomes as protobuf, which this cozy cannot read; \
+                 their results are not kept (a cozy from v0.9.4 on converts them)"
+            );
+        }
+        Ok(())
+    }));
+    Migrations::new(all)
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -296,7 +317,7 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "FULL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
-        Migrations::from_slice(MIGRATIONS).to_latest(&mut conn)?;
+        migrations().to_latest(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -777,7 +798,11 @@ impl Store {
                 });
             tx.execute(
                 "UPDATE runs SET cursor = MAX(cursor, ?2), outcome = ?3 WHERE id = ?1",
-                params![id, cursor as i64, serde_json::to_vec(outcome).expect("serializes")],
+                params![
+                    id,
+                    cursor as i64,
+                    serde_json::to_vec(outcome).expect("serializes")
+                ],
             )?;
             events.extend(end(tx, id, status, reason)?);
             Ok(events)
