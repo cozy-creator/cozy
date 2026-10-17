@@ -4077,6 +4077,7 @@ dependencies = [
  "cozy-platform",
  "cozy-proto",
  "ed25519-dalek",
+ "flate2",
  "fs2",
  "hmac",
  "http-body-util",

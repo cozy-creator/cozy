@@ -1100,6 +1100,7 @@ impl Publisher {
     /// past its measured patience (`process::supervise`).
     fn uv_observed(&self, args: &[&str], env: &[(&str, &std::ffi::OsStr)], stop: Option<&PullCancellation>,
         read: &(dyn Fn(u64) + Sync)) -> Result<(), Failure> {
+        crate::machine::client::ensure_uv(&self.sdk.uv).map_err(|e| ("uv_unavailable", e.to_string()))?;
         let mut command = Command::new(&self.sdk.uv);
         command.args(args).env_clear().envs(env.iter().copied()).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
         command.process_group(0);

@@ -1453,6 +1453,7 @@ mod tests {
             objects.clone(),
             InstallerConfig {
                 helper_python: String::from_utf8(helper.stdout).unwrap().trim().into(),
+                helper_engine: None,
                 python: "3.12".into(),
                 generations: root.join("generations"),
                 client_wheel: client,

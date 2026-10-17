@@ -351,18 +351,9 @@ fn run_machine(config: config::Config, mut ready: crate::machine::supervise::Rea
     let api = crate::machine::net::kept_listener(&layout.state.join("api-port"), grant.listen_host, grant.worker_port)?;
     identity.webrtc = crate::machine::player::listen(&layout.state, grant.webrtc_port, !rental)?;
     identity.player = grant.webrtc_reach.clone();
-    // The client this binary embeds, and the installer helper over it (made once per client).
+    // The client this binary embeds; the installer helper over it is made at the first install.
     let uv = crate::machine::client::uv(&layout.root);
     let wheel = crate::machine::client::wheel(&engine)?;
-    let helper = match crate::machine::client::helper(&engine, &uv, &wheel) {
-        Ok(python) => Some(python),
-        Err(error) => {
-            tracing::warn!(
-                "no installer helper, so local packages cannot install: {error}"
-            );
-            None
-        }
-    };
     start_api(
         &engine,
         &generations,
@@ -370,7 +361,7 @@ fn run_machine(config: config::Config, mut ready: crate::machine::supervise::Rea
         api,
         &owner,
         &service,
-        helper,
+        Some(crate::machine::client::helper_python(&engine)),
         Some(wheel),
         "3.12".into(),
         crate::published::PackageSdk::selected(&paths.sdk(), &layout.root, uv),
@@ -434,6 +425,8 @@ fn start_api(
     // Local packages install only with the helper; package environments get the client either way.
     backend.installer = match (helper, wheel) {
         (Some(helper_python), Some(client_wheel)) => Some(api::install::InstallerConfig {
+            // The machine's own helper is made on first use; a given one is the caller's.
+            helper_engine: (helper_python == crate::machine::client::helper_python(root)).then(|| root.to_path_buf()),
             helper_python,
             client_wheel,
             python,

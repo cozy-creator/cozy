@@ -619,6 +619,7 @@ impl Updates {
     /// set aside for a release's locked Runtime.
     fn resolves(&self, candidate: &Path) -> io::Result<()> {
         let pair: Vec<String> = wheels(candidate).into_iter().map(|(_, _, p)| p.display().to_string() + "\n").collect();
+        super::client::ensure_uv(&self.paths.uv)?;
         let mut child = std::process::Command::new(&self.paths.uv)
             .args(["pip", "compile", "--quiet", "--no-config", "--no-cache", "--no-header", "--python", "3.12", "-"])
             .current_dir(candidate)

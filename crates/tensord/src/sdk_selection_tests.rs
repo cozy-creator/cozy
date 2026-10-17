@@ -167,6 +167,7 @@ fn same_filename_activation_installs_new_runtime_and_retains_old_generation() {
             objects.clone(),
             InstallerConfig {
                 helper_python: helper.clone(),
+                helper_engine: None,
                 python: "3.12".into(),
                 generations: generations.clone(),
                 client_wheel: client.clone(),

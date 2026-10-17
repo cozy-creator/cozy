@@ -76,6 +76,7 @@ fn open(root: &Path, tools: &Tools) -> Machine {
         objects.clone(),
         InstallerConfig {
             helper_python: tools.helper.clone(),
+            helper_engine: None,
             python: "3.12".into(),
             generations: root.join("generations"),
             client_wheel: tools.client.clone(),

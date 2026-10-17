@@ -20,6 +20,8 @@ use tonic::Status;
 #[derive(Clone)]
 pub struct InstallerConfig {
     pub helper_python: PathBuf,
+    /// The engine whose helper `helper_python` is, made at the first install that needs it.
+    pub helper_engine: Option<PathBuf>,
     pub python: String,
     pub generations: PathBuf,
     pub client_wheel: PathBuf,
@@ -227,6 +229,10 @@ fn installer(config: &InstallerConfig, root: &RootSet) -> Result<Command, Status
     } else {
         &config.python
     };
+    if let Some(engine) = &config.helper_engine {
+        crate::machine::client::helper(engine, &config.uv, &config.client_wheel)
+            .map_err(|e| Status::unavailable(format!("the installer helper: {e}")))?;
+    }
     let mut command = Command::new(&config.helper_python);
     crate::process::inherit_nothing(&mut command);
     // The uploaded build backend runs here: it gets the machine's environment without
@@ -465,6 +471,7 @@ mod tests {
     fn a_failed_install_quotes_the_installers_stderr_tail() {
         let config = super::InstallerConfig {
             helper_python: "python3".into(),
+            helper_engine: None,
             python: "3.12".into(),
             generations: std::env::temp_dir(),
             client_wheel: Default::default(),
