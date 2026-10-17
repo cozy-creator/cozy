@@ -50,9 +50,11 @@ use crate::{
 
 /// A tree output's media type: its bytes are the manifest of its files.
 const TREE: &str = "application/vnd.cozy.tree-manifest";
-/// Bytes are read in ranges of `clamp(length / LANES, 1 MiB, RANGE)`, at most `LANES` side by side
-/// on their own connections.
+/// Bytes are read in ranges of `clamp(length / (RANGES_PER_LANE * LANES), 1 MiB, RANGE)`, at
+/// most `LANES` side by side on their own connections. More ranges than lanes, as an S3 client
+/// cuts parts: a lane that finishes early takes the next from the queue, so no lane trails alone.
 const RANGE: u64 = 8 << 20;
+const RANGES_PER_LANE: usize = 4;
 
 /// An output Calcifer still owes this computer: its run's number, its name and index, its length
 /// and the bytes of it in place.
@@ -825,7 +827,7 @@ async fn fetch(
     part: &Path,
     moved: &Arc<AtomicU64>,
 ) -> Result<(), Failure> {
-    let ranges = lanes::parts(&[(0, from)], length, LANES, RANGE);
+    let ranges = lanes::parts(&[(0, from)], length, RANGES_PER_LANE * LANES, RANGE);
     let read = lanes::transfer(ranges, LANES, |leg| {
         let lane = link.lane(leg.lane, leg.fresh);
         let (target, part, moved) = (target.clone(), part.to_owned(), moved.clone());
