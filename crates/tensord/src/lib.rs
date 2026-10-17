@@ -41,6 +41,11 @@ pub mod products;
 pub mod protocol;
 pub mod published;
 pub mod reclaim;
+#[cfg(unix)]
+pub mod resident_custody;
+/// Off where the OS cannot share an executor's device memory by handle.
+#[cfg(not(unix))]
+#[path = "resident_custody_off.rs"]
 pub mod resident_custody;
 pub mod runs;
 pub mod weights;

@@ -708,10 +708,11 @@ impl Pool {
         // Fill leases and GPU custody hold one descriptor per object or chunk.
         cozy_platform::process::raise_fd_limit();
         let envelope = config.envelope();
-        // Degree 2 is world-one, on the first device; off where it drives a display.
+        // Degree 2 is world-one, on the first device; off where it drives a display, and
+        // outside Unix, where one executor's device memory cannot be handed to another.
         let custody = envelope
             .first()
-            .filter(|first| !display_active(first))
+            .filter(|first| cfg!(unix) && !display_active(first))
             .map(|_| Mutex::new(ResidentCustody::default()));
         let incarnation = uuid::Uuid::new_v4().simple().to_string();
         crate::launch_identity::remove_stale_jit(root, &incarnation);
