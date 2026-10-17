@@ -4157,7 +4157,7 @@ dependencies = [
 
 [[package]]
 name = "tensorfs-core"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -4188,7 +4188,7 @@ dependencies = [
 
 [[package]]
 name = "tensorfs-plane"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "cozy-platform",
  "libc",
@@ -4200,7 +4200,7 @@ dependencies = [
 
 [[package]]
 name = "tensorfs-py"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "cozy-platform",
  "pyo3",
