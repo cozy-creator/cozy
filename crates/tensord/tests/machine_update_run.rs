@@ -378,10 +378,11 @@ async fn an_update_run_activates_in_place_and_a_failing_candidate_ends_failed() 
         );
     }
 
-    // A launch that cannot prove its boot ends, with a status, instead of serving unready.
+    // A rental's launch that cannot prove its boot to its Hub ends, with a status, instead of
+    // serving unready. (This computer's machine seals its readiness unsigned.)
     stop(&mut machine);
     std::fs::remove_file(root.join("run/cozy/bootstrap/readiness-envelope.json")).unwrap();
-    let mut unprovable = launch(&root, port, None, true);
+    let mut unprovable = launch(&root, port, None, false);
     let ended = unprovable.0.wait().unwrap();
     assert!(!ended.success(), "an unprovable launch ended {ended}");
     std::fs::remove_dir_all(&root).unwrap();
