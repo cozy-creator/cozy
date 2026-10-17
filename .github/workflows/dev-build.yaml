@@ -10,7 +10,7 @@ on:
         type: string
         default: master
       build:
-        description: "wheel: the release's manylinux x86_64 wheel; none: tests only"
+        description: "wheel: the release's manylinux wheel for the runner's arch; none: tests only"
         type: string
         default: wheel
       test:
@@ -60,7 +60,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           maturin-version: v1.15.0
-          target: x86_64
+          target: ${{ runner.arch == 'ARM64' && 'aarch64' || 'x86_64' }}
           args: --release --locked --target-dir target/manylinux --out dist
           manylinux: auto
           before-script-linux: |

@@ -24,8 +24,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # macOS and aarch64 wheels are off until the owner decides (2026-09-28).
+          # Linux arm64 is a consumer platform (owner, 2026-10-16); macOS waits for its host tier.
           - { name: linux-x86_64, os: ubuntu-latest, target: x86_64 }
+          - { name: linux-aarch64, os: ubuntu-24.04-arm, target: aarch64 }
     env:
       CARGO_BUILD_JOBS: "4"
       PYTHON: python
