@@ -380,6 +380,7 @@ mod tests {
 
     #[test]
     fn native_exclusive_fence_blocks_activation_and_preserves_generation() {
+        let _quiet = crate::fork_fence::quiet();
         let f = Fixture::new();
         let (repo, _) = f.model("race", b"race", true);
         let body = fs::read(f.store.repository_path(&repo)).unwrap();
@@ -466,6 +467,7 @@ mod tests {
     }
     #[test]
     fn orphan_provenance_cleanup_is_bounded_and_never_removes_a_repository() {
+        let _quiet = crate::fork_fence::quiet();
         let f = Fixture::new();
         let mut stale = Vec::new();
         for number in 0..5 {

@@ -86,6 +86,7 @@ pub mod transport;
 pub mod unsynced;
 pub mod vectors;
 
+
 /// This TensorFS's release version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -97,3 +98,21 @@ pub const STORE_FORMAT: u32 = 1;
 /// The cross-process protocol over one Store: owner claim, writer guards, read leases and
 /// holds. Bumped like [`STORE_FORMAT`] by a change a process speaking the old one would break.
 pub const CLAIM_PROTOCOL: u32 = 1;
+
+/// A fork copies every descriptor, so until its child execs, a lock this process released is
+/// still held. Tests spawn children under `spawning()` (`spawn` returns once the child has
+/// exec'd); a test that needs a lock it released to be free at once holds `quiet()` throughout.
+#[cfg(test)]
+pub(crate) mod fork_fence {
+    use std::sync::{PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+
+    static FENCE: RwLock<()> = RwLock::new(());
+
+    pub(crate) fn spawning() -> RwLockReadGuard<'static, ()> {
+        FENCE.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub(crate) fn quiet() -> RwLockWriteGuard<'static, ()> {
+        FENCE.write().unwrap_or_else(PoisonError::into_inner)
+    }
+}

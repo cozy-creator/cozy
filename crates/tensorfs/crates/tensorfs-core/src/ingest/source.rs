@@ -2781,6 +2781,7 @@ mod tests {
         use std::time::{Duration, Instant};
         let root = temporary("source-tail-sigkill");
         let (store, registry, request) = fixture_sized(&root, false, Some(1024));
+        let fence = crate::fork_fence::spawning();
         let mut child = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -2793,6 +2794,7 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
+        drop(fence);
         let deadline = Instant::now() + Duration::from_secs(20);
         while !root.join("journal-ready").exists() {
             assert!(

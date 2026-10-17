@@ -4475,6 +4475,7 @@ fn a_pull_killed_mid_walk_is_repaired_after_an_unclean_shutdown() {
             }
         }
     });
+    let fence = crate::fork_fence::spawning();
     let mut child = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "transport::tests::durability_child_pull",
@@ -4490,6 +4491,7 @@ fn a_pull_killed_mid_walk_is_repaired_after_an_unclean_shutdown() {
         .stderr(std::process::Stdio::null())
         .spawn()
         .unwrap();
+    drop(fence);
     let recorded = |store: &Store| {
         checkpoint
             .objects
