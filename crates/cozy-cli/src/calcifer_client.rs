@@ -166,7 +166,18 @@ impl Client {
             sse: Sse::default(),
             received: false,
             empty: 0,
+            landing: false,
+            ended: false,
             done: false,
+        }
+    }
+
+    /// A run's events after `starting_after` past its terminal one, until Calcifer ends the
+    /// stream: once each output's last revision landed or failed (or Calcifer stopped).
+    pub fn events_until_landed(&self, id: &str, starting_after: u64) -> Events {
+        Events {
+            landing: true,
+            ..self.events(id, starting_after)
         }
     }
 
@@ -416,11 +427,22 @@ pub struct Events {
     received: bool,
     /// Connections in a row that closed carrying none.
     empty: u32,
+    /// Reads past the terminal event until Calcifer ends the stream.
+    landing: bool,
+    /// The terminal event was read.
+    ended: bool,
     done: bool,
 }
 
 impl Events {
-    /// The next event; `None` after the terminal one. Cancel-safe: a dropped call loses nothing
+    /// Reads on after `None` from where it stopped: a landing follower whose run still owes an
+    /// output (its Calcifer stopped) waits again.
+    pub fn again(&mut self) {
+        self.done = false;
+    }
+
+    /// The next event; `None` after the terminal one, or for a landing stream once Calcifer ends
+    /// it after that. Cancel-safe: a dropped call loses nothing
     /// a later one would not read again.
     pub async fn next(&mut self) -> Option<Result<Event, Error>> {
         while !self.done {
@@ -430,7 +452,8 @@ impl Events {
                 }
                 self.received = true;
                 self.empty = 0;
-                self.done = event.is_terminal();
+                self.ended |= event.is_terminal();
+                self.done = self.ended && !self.landing;
                 return Some(Ok(event));
             }
             let Some(stream) = self.stream.as_mut() else {
@@ -445,6 +468,11 @@ impl Events {
             };
             match stream.chunk().await {
                 Ok(Some(bytes)) => self.sse.push(&bytes),
+                // An ended run's stream ends once its outputs settled; its follower checks them.
+                Ok(None) if self.ended => {
+                    self.stream = None;
+                    self.done = true;
+                }
                 // A close is not a verdict: reconnect from the cursor.
                 Ok(None) | Err(_) => {
                     self.stream = None;

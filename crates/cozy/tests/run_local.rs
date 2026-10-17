@@ -207,3 +207,66 @@ fn a_local_wheel_a_path_source_names_is_carried_to_the_machine() {
     ));
     assert_eq!(run["result"]["text"], "from a carried wheel", "{run}");
 }
+
+/// Run 10297: `cozy run --json` exited at `run.completed` while its 11 MB video was still being
+/// saved, and its caller ended the machine. A followed run returns only once each output's last
+/// revision landed here, checked against its digest: a 128 MiB output still exporting when the
+/// run completed is whole at its path when `cozy run` exits, its landing before the final record.
+#[test]
+fn a_followed_run_returns_only_once_its_outputs_landed() {
+    use sha2::{Digest as _, Sha256};
+    let Some(home) = Home::new() else { return };
+    if std::env::var_os("COZY_TEST_TENSORD").is_none() {
+        eprintln!("skipped: no TensorD (COZY_TEST_TENSORD is unset)");
+        return;
+    }
+    let _machine = common::tensord::added(&home, "m1");
+    let work = home.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let script = SCRIPT
+        .replace(
+            "def main() -> str:\n    return \"hello from a script\"",
+            "from cozy_runtime.author import FileAsset, Outputs\n\n\
+             def main(*, out: Outputs) -> FileAsset:\n    \
+             return out.save_bytes(bytes(range(256)) * (512 << 10), media_type=\"application/octet-stream\")",
+        );
+    std::fs::write(work.join("big.py"), script).unwrap();
+    let out = cozy(
+        &home,
+        &work,
+        &["--json", "run", "big.py", "--on", "m1", "--out", "saved"],
+    );
+    assert_eq!(out.code, 0, "{out:?}");
+    let events: Vec<Value> = out
+        .stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    let last = events.last().expect("events");
+    assert_eq!(last["type"], "run.completed", "{last}");
+    let item = &last["run"]["output"][0];
+    let path = Path::new(
+        item["path"]
+            .as_str()
+            .expect("the record names the landed file"),
+    );
+    let expected: Vec<u8> = (0..=255u8).cycle().take(128 << 20).collect();
+    let digest = format!("sha256:{}", hex::encode(Sha256::digest(&expected)));
+    assert_eq!(item["sha256"], digest.as_str(), "{item}");
+    let held = std::fs::read(path).unwrap();
+    assert!(
+        held.len() == expected.len() && held == expected,
+        "{} holds other bytes",
+        path.display()
+    );
+    assert!(!Path::new(&format!("{}.part", path.display())).exists());
+    let landed = events
+        .iter()
+        .find(|e| e["type"] == "output_item.landed" && e["item"]["rev"] == item["rev"])
+        .expect("its landing comes before the final record");
+    // It was still being saved when the run completed: the follower waited for it.
+    assert!(
+        landed["sequence_number"].as_u64() > last["sequence_number"].as_u64(),
+        "landed {landed} before completing {last}"
+    );
+}

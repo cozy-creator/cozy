@@ -1,11 +1,13 @@
 //! Following a run: live progress on stderr, each output named as it lands, and the run's record
-//! on stdout at the end; NDJSON of Calcifer's events with `--json`. Ctrl-C stops following and
-//! never cancels: the run is Calcifer's, and `cozy run watch` reattaches.
+//! on stdout at the end; NDJSON of Calcifer's events with `--json`, its terminal event last. A
+//! followed run is over once it ended and each output's last revision landed here (checked
+//! against its digest) or failed; an output not saved fails the follow. Ctrl-C stops following
+//! and never cancels: the run is Calcifer's, and `cozy run watch` reattaches.
 use std::{collections::HashSet, fmt::Write as _, process::ExitCode, time::Duration};
 
 use cozy_proto::{
     calcifer::{Event, OutputItem, Progress, Run, Status, SubmitRun, Submitted},
-    error::Error,
+    error::{Error, Kind},
 };
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 
@@ -46,50 +48,112 @@ pub(crate) fn exit_code(run: &Run) -> ExitCode {
     }
 }
 
-/// Follows `run` to its end, or prints it at once with `detach`; answers the run as it ended,
-/// or as it was when following stopped.
+/// Follows `run` to its end and its outputs to this computer, or prints it at once with
+/// `detach`; answers the run as it ended, or as it was when following stopped. An output that
+/// was not saved is a refusal naming it, after the record.
 pub(crate) async fn follow(ctx: &Context, run: Run, detach: bool) -> Result<Run, Error> {
     if detach {
         record(ctx, &run);
         return Ok(run);
     }
-    let run = watch(ctx, run, ctx.json).await?;
+    let (run, interrupted) = watch(ctx, run, ctx.json).await?;
     if !ctx.json {
         record(ctx, &run);
     }
-    Ok(run)
+    match interrupted {
+        true => Ok(run),
+        false => saved(run),
+    }
+}
+
+/// An output still owed to this computer: its last revision neither landed nor failed.
+fn owed(run: &Run) -> bool {
+    run.output
+        .iter()
+        .any(|item| item.path.is_none() && item.export_error.is_none())
+}
+
+/// `run`, once each of its outputs' last revision landed; else a refusal naming those that did not.
+fn saved(run: Run) -> Result<Run, Error> {
+    let lost: Vec<String> = run
+        .output
+        .iter()
+        .filter(|item| item.path.is_none())
+        .map(|item| match &item.export_error {
+            Some(error) => format!("{} ({error})", item_name(item)),
+            None => format!("{} (still saving when following ended)", item_name(item)),
+        })
+        .collect();
+    if lost.is_empty() || !settled(&run) {
+        return Ok(run);
+    }
+    let show = format!("cozy run show {}", run.number);
+    Err(Error::new(
+        Kind::Unavailable,
+        "output_not_saved",
+        format!(
+            "run {} ended {}, but this computer did not save its output {}",
+            run.number,
+            status_word(run.status),
+            lost.join(", ")
+        ),
+    )
+    .remedy(format!(
+        "`cozy run watch {}` saves what its machine still holds",
+        run.number
+    ))
+    .next(&show))
 }
 
 /// Follows a run another one waits on (local code's install): its progress on a terminal, no
 /// record and no events of its own.
 pub(super) async fn settle(ctx: &Context, run: Run) -> Result<Run, Error> {
-    watch(ctx, run, false).await
+    Ok(watch(ctx, run, false).await?.0)
 }
 
-/// Renders `run`'s events until its stream ends (NDJSON with `events`); Ctrl-C stops early.
-async fn watch(ctx: &Context, run: Run, events_out: bool) -> Result<Run, Error> {
+/// Renders `run`'s events until it ended and its outputs landed or failed (NDJSON with `events`,
+/// its terminal event held back to come last, as the run then stands); Ctrl-C stops early and
+/// says so.
+async fn watch(ctx: &Context, run: Run, events_out: bool) -> Result<(Run, bool), Error> {
     let calcifer = ctx.calcifer().await?;
-    let mut events = calcifer.events(run.id.as_str(), 0);
+    let mut events = calcifer.events_until_landed(run.id.as_str(), 0);
     let mut view = View::new(ctx, &run);
     let interrupt = tokio::signal::ctrl_c();
     tokio::pin!(interrupt);
     let id = run.id.clone();
+    let mut terminal = None;
     loop {
         tokio::select! {
             _ = &mut interrupt => {
                 view.done();
                 let run = calcifer.run(id.as_str()).await?;
-                output::say(ctx, &format!(
-                    "detached: run {n} keeps running; `cozy run watch {n}` follows it again, `cozy run cancel {n}` cancels it",
-                    n = run.number
-                ));
-                return Ok(run);
+                let n = run.number;
+                output::say(ctx, &match settled(&run) {
+                    true => format!("detached: run {n} ended and its outputs are still being saved; `cozy run watch {n}` follows them"),
+                    false => format!("detached: run {n} keeps running; `cozy run watch {n}` follows it again, `cozy run cancel {n}` cancels it"),
+                });
+                return Ok((run, true));
             }
             event = events.next() => match event {
-                None => break,
+                None => {
+                    let run = calcifer.run(id.as_str()).await?;
+                    // Its Calcifer stopped with an output still owed: wait on the next one.
+                    if settled(&run) && owed(&run) {
+                        events.again();
+                        continue;
+                    }
+                    view.done();
+                    if let Some(sequence_number) = terminal {
+                        output::ndjson(&Event::lifecycle(sequence_number, run.clone(), false));
+                    }
+                    return Ok((run, false));
+                }
                 Some(Err(error)) => {
                     view.done();
                     return Err(error);
+                }
+                Some(Ok(event)) if events_out && event.is_terminal() => {
+                    terminal = event.sequence_number();
                 }
                 Some(Ok(event)) if events_out => output::ndjson(&event),
                 Some(Ok(_)) if ctx.json => {}
@@ -97,8 +161,6 @@ async fn watch(ctx: &Context, run: Run, events_out: bool) -> Result<Run, Error> 
             }
         }
     }
-    view.done();
-    calcifer.run(id.as_str()).await
 }
 
 pub(crate) fn settled(run: &Run) -> bool {
@@ -248,6 +310,13 @@ impl View {
             Event::Created { run, .. }
             | Event::Queued { run, .. }
             | Event::InProgress { run, .. } => self.lifecycle(run),
+            Event::Completed { run, .. }
+            | Event::Failed { run, .. }
+            | Event::Canceled { run, .. }
+                if owed(run) =>
+            {
+                self.status("saving its outputs to this computer")
+            }
             Event::Waiting { reason } => self.status(&format!("waiting: {reason}")),
             Event::Progress { progress } => self.progress(progress),
             // Each output is named once, when its file first lands; a person's terminal shows
