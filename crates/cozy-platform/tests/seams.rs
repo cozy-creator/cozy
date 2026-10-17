@@ -426,7 +426,9 @@ fn a_process_takes_its_role_name() {
 
 fn the_gpu_probe_answers_without_a_driver() {
     assert!(gpu::probe(Some("")).unwrap().is_empty());
-    let gpus = gpu::probe(None).unwrap();
+    gpu::memory_classes(&mut []).unwrap();
+    let mut gpus = gpu::probe(None).unwrap();
+    gpu::memory_classes(&mut gpus).unwrap();
     let driver = if cfg!(target_os = "linux") {
         Path::new("/dev/nvidiactl").exists()
     } else {
@@ -446,6 +448,10 @@ fn the_gpu_probe_answers_without_a_driver() {
         );
         assert!(
             gpu.memory_bytes > 0 && !gpu.pci_bus_id.is_empty(),
+            "{gpu:?}"
+        );
+        assert!(
+            gpu.compute_capability.is_some() && gpu.memory_class.is_some(),
             "{gpu:?}"
         );
         assert_eq!(gpu::probe(Some(&gpu.uuid)).unwrap(), vec![gpu.clone()]);

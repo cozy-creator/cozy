@@ -665,6 +665,7 @@ dependencies = [
  "getrandom 0.3.4",
  "hex",
  "libc",
+ "libloading 0.9.0",
  "nvml-wrapper",
  "serde",
  "serde_json",
