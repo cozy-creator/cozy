@@ -72,12 +72,21 @@ def inventory(interpreter: Path) -> list[Dependency]:
     return msgspec.json.decode(subprocess.check_output(["uv", "pip", "list", "--python", str(interpreter), "--format", "json"]), type=list[Dependency])
 
 
+def incompatibilities(interpreter: Path, step: subprocess.CompletedProcess | None = None) -> set[str]:
+    """`uv pip check`'s findings, one line each."""
+    step = step or subprocess.run(["uv", "pip", "check", "--python", str(interpreter)], capture_output=True, text=True)
+    return {line.strip() for line in (step.stdout + step.stderr).splitlines() if line.strip().startswith("The package")}
+
+
 def machine_sdk(interpreter: Path, sdk: list[Path], capture) -> str:
     """The machine's own Runtime/TensorFS pair over the captured closure, every other selected
     version constrained, where every installed requirement admits it (uv's check). Else the
     capture's own pair (a vendored dev Runtime, say) is restored: a package's bounds are never
     overridden. Returns "" for the machine's pair, else why and what runs instead; never silent."""
     pair = {canonicalize_name(wheel.name.split("-")[0]) for wheel in sdk}
+    # What the capture already reports (NVIDIA's aarch64 cusparseLt wheel says sbsa, not aarch64)
+    # is not the pair's doing: the pair is refused only for an incompatibility it adds.
+    before = incompatibilities(interpreter)
     kept = interpreter.parents[2] / "sdk-constraints.txt"
     kept.write_text("".join(f"{row.name}=={row.version}\n" for row in inventory(interpreter)
                             if canonicalize_name(row.name) not in pair))
@@ -86,7 +95,7 @@ def machine_sdk(interpreter: Path, sdk: list[Path], capture) -> str:
     sys.stderr.write(step.stderr)
     if step.returncode == 0:
         step = subprocess.run(["uv", "pip", "check", "--python", str(interpreter)], capture_output=True, text=True)
-        if step.returncode == 0:
+        if step.returncode == 0 or incompatibilities(interpreter, step) <= before:
             return ""
     reason = [line.strip() for line in ((step.stdout or "") + step.stderr).splitlines()
               if line.strip() and not line.startswith(("Using Python", "Checked "))][-12:]
@@ -112,16 +121,15 @@ def interpreter_for(python: str, python_requires: str, python_version: str) -> s
 def add_client(interpreter: Path, constraints: Path, client_wheel: Path) -> None:
     """The machine client beside a selected closure: it may add its own dependencies only
     without changing one already selected package or SDK version (uv reports any conflict)."""
-    locked = inventory(interpreter)
+    locked, before = inventory(interpreter), incompatibilities(interpreter)
     constraints.write_text("".join(f"{row.name}=={row.version}\n" for row in locked))
     subprocess.run(["uv", "pip", "install", *COPY, "--python", str(interpreter), "-c", str(constraints), str(client_wheel)], check=True)
     after = {canonicalize_name(row.name): row.version for row in inventory(interpreter)}
     if any(after.get(canonicalize_name(row.name)) != row.version for row in locked):
         raise PackageError("package_lock_changed", "client installation changed the captured dependency closure")
-    check = subprocess.run(["uv", "pip", "check", "--python", str(interpreter)], capture_output=True, text=True)
-    if check.returncode != 0:
-        conflicts = [line.strip() for line in (check.stdout + check.stderr).splitlines() if "requires" in line or "not installed" in line]
-        raise PackageError("package_dependency_conflict", "; ".join(conflicts)[:2000] or f"uv pip check exited {check.returncode}")
+    # Only what the client adds refuses; the selected closure's own findings stand as captured.
+    if added := sorted(incompatibilities(interpreter) - before):
+        raise PackageError("package_dependency_conflict", "; ".join(added)[:2000])
 
 
 def live_paths(environment: Path) -> None:
@@ -158,15 +166,18 @@ def install_editable(*, project: Path, environment: Path, wheels: list[Path], di
         shutil.rmtree(environment, ignore_errors=True)  # a build that never finished
         environment.parent.mkdir(parents=True, exist_ok=True)
 
-        def capture():
-            """The project's own selection. Run again, it restores what the machine's pair replaced."""
+        def capture(machine: set[str] = frozenset()):
+            """The project's own selection, without the `machine` SDK distributions the machine's pair
+            replaces next (the lock's may not install here: TensorFS has no aarch64 wheel on PyPI).
+            Run again with none, it restores what the machine's pair replaced."""
             if (project / "uv.lock").is_file():
                 # Each carried distribution at the version the lock selected, from its own
                 # files (uv picks the one this platform takes); the lock installs the rest,
                 # every dependency as an ordinary install: only the project itself is live.
                 carried = sorted({tuple(wheel.name.split("-")[:2]) for wheel in wheels})
                 sync = ["uv", "sync", "--frozen", "--no-dev", "--no-editable", "--no-install-project", "--no-python-downloads",
-                        "--project", str(project), "--python", python, *(f"--no-install-package={name}" for name, _ in carried),
+                        "--project", str(project), "--python", python,
+                        *(f"--no-install-package={name}" for name in sorted({name for name, _ in carried} | machine)),
                         *(f"--refresh-package={name}" for name in local_builds(project))]
                 placed = {**os.environ, "UV_PROJECT_ENVIRONMENT": str(environment)}
                 subprocess.run(sync, env=placed, check=True)
@@ -186,7 +197,7 @@ def install_editable(*, project: Path, environment: Path, wheels: list[Path], di
                 subprocess.run(["uv", "pip", "install", "--python", str(interpreter), *found, *named, "--editable", str(project)], check=True)
             live_paths(environment)
 
-        capture()
+        capture({canonicalize_name(wheel.name.split("-")[0]) for wheel in sdk})
         fallback = machine_sdk(interpreter, sdk, capture) if sdk else ""
         add_client(interpreter, environment.parent / (environment.name + ".constraints.txt"), client_wheel)
         ready.write_text(fallback)
