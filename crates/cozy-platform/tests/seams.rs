@@ -426,7 +426,9 @@ fn a_process_takes_its_role_name() {
 
 fn the_gpu_probe_answers_without_a_driver() {
     assert!(gpu::probe(Some("")).unwrap().is_empty());
-    let gpus = gpu::probe(None).unwrap();
+    gpu::memory_classes(&mut []).unwrap();
+    let mut gpus = gpu::probe(None).unwrap();
+    gpu::memory_classes(&mut gpus).unwrap();
     let driver = if cfg!(target_os = "linux") {
         Path::new("/dev/nvidiactl").exists()
     } else {
@@ -434,6 +436,10 @@ fn the_gpu_probe_answers_without_a_driver() {
     };
     if !driver {
         assert!(gpus.is_empty(), "no NVIDIA driver, yet {gpus:?}");
+        assert!(
+            gpu::Device::open("0").is_err(),
+            "a device opened with no driver"
+        );
     }
     for gpu in &gpus {
         assert!(
@@ -444,7 +450,15 @@ fn the_gpu_probe_answers_without_a_driver() {
             gpu.memory_bytes > 0 && !gpu.pci_bus_id.is_empty(),
             "{gpu:?}"
         );
-        assert_eq!(gpu::probe(Some(&gpu.uuid)).unwrap(), vec![gpu.clone()]);
+        assert!(
+            gpu.compute_capability.is_some() && gpu.memory_class.is_some(),
+            "{gpu:?}"
+        );
+        let probed = gpu::Gpu { memory_class: None, ..gpu.clone() };
+        assert_eq!(gpu::probe(Some(&gpu.uuid)).unwrap(), vec![probed]);
+        let device = gpu::Device::open(&gpu.uuid).unwrap();
+        assert!(device.key().starts_with(&gpu.uuid));
+        assert_eq!(device.read().unwrap().total, gpu.memory_bytes);
     }
 }
 

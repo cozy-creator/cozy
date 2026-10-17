@@ -106,9 +106,9 @@ impl GpuMemory {
                 .map_err(|error| tracing::warn!("memory: sample log {path:?} unavailable: {error}"))
                 .ok()
         });
-        let sampler = match nvml::Device::open(device) {
+        let sampler = match cozy_platform::gpu::Device::open(device) {
             Ok(opened) => {
-                ledger.lock().unwrap().device = opened.key.clone();
+                ledger.lock().unwrap().device = opened.key().to_string();
                 let (watched, cells) = (ledger.clone(), running.clone());
                 let log = Mutex::new(log);
                 nvml::Sampler::start(opened, move |sample| {

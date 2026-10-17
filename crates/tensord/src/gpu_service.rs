@@ -3822,16 +3822,10 @@ fn binds_models(interface: &serde_json::Value) -> bool {
 }
 
 /// Degree 2 stays off on a GPU that drives a display until qualified there. Unknown is "yes".
-fn display_active(devices: &str) -> bool {
-    let output = std::process::Command::new("nvidia-smi")
-        .args([
-            "--query-gpu=display_active",
-            "--format=csv,noheader",
-            "-i",
-            devices,
-        ])
-        .output();
-    !matches!(output, Ok(o) if o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "Disabled")
+fn display_active(device: &str) -> bool {
+    cozy_platform::gpu::Device::open(device)
+        .and_then(|device| device.display_active())
+        .unwrap_or(true)
 }
 
 /// Each held chunk is one fd: let the soft descriptor limit reach the hard one.
