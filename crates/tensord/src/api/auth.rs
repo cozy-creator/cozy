@@ -20,17 +20,43 @@ pub struct Authority {
 /// The signing keys this machine admits, shared by every clone of its Authority. A rental's
 /// set is the Hub's: the granted boot keys hold until the Hub answers, and each answer holds
 /// until the next. Only the Hub's answer changes it: a Hub this machine cannot reach is weather
-/// and changes nothing, a denial revokes at once. Losing authority never cancels accepted work.
+/// and changes nothing, a denial revokes at once. This computer's set is its home's files, read
+/// again when a signer is unknown. Losing authority never cancels accepted work.
 #[derive(Clone)]
 pub struct Keys {
     keys: Arc<RwLock<Vec<VerifyingKey>>>,
     changes: Arc<tokio::sync::watch::Sender<u64>>,
+    source: Option<Arc<dyn Fn() -> std::io::Result<Vec<VerifyingKey>> + Send + Sync>>,
 }
 impl Keys {
     pub fn fixed(keys: Vec<VerifyingKey>) -> Self {
         Self {
             keys: Arc::new(RwLock::new(keys)),
             changes: Arc::new(tokio::sync::watch::channel(0).0),
+            source: None,
+        }
+    }
+    /// The set `source` reads, read again whenever a signer is unknown (`cozy machine authorize`
+    /// takes effect at the next call).
+    pub fn read(source: impl Fn() -> std::io::Result<Vec<VerifyingKey>> + Send + Sync + 'static) -> std::io::Result<Self> {
+        let keys = source()?;
+        Ok(Self { source: Some(Arc::new(source)), ..Self::fixed(keys) })
+    }
+    /// `check` over the admitted keys; when it refuses and the set has a source, once more over
+    /// the source's current set.
+    pub fn check<T, E>(&self, check: impl Fn(&[VerifyingKey]) -> Result<T, E>) -> Result<T, E> {
+        let first = check(&self.admitted());
+        let (Err(_), Some(source)) = (&first, &self.source) else { return first };
+        match source() {
+            Ok(keys) if keys != self.admitted() => {
+                self.replace(keys);
+                check(&self.admitted())
+            }
+            Ok(_) => first,
+            Err(error) => {
+                tracing::warn!("authorized keys unreadable: {error}");
+                first
+            }
         }
     }
     fn replace(&self, keys: Vec<VerifyingKey>) {

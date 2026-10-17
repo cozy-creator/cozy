@@ -293,6 +293,7 @@ impl LocalSources {
     }
 
     /// Install editable against this manifest's remote tree, or the explicit direct path.
+    #[allow(clippy::too_many_arguments)]
     fn install_live(
         &self,
         service: &Service,
@@ -301,6 +302,7 @@ impl LocalSources {
         manifest: Manifest,
         digest: &str,
         stop: Option<&PullCancellation>,
+        stage: &dyn Fn(&str),
     ) -> Result<Installation, Refused> {
         let home = self.home(actor, &manifest.package)?;
         let home = if manifest.path.is_empty() { home.join(format!("source-{digest}")) } else { home };
@@ -320,6 +322,10 @@ impl LocalSources {
             ));
         }
         let environment = self.environment(&home, &manifest);
+        stage(&match environment.join(".ready").is_file() {
+            true => format!("syncing {}'s changed source", manifest.package),
+            false => format!("installing {} on this machine", manifest.package),
+        });
         let source_digest = manifest.source_digest();
         // Wheels the CLI carries for locked dependencies this machine cannot fetch itself (a
         // Hub's on the caller's computer, a private git source): beside the environment they
@@ -412,12 +418,14 @@ impl LocalSources {
     }
 
     /// This signer's installation of the manifest `digest` (`sha256:<hex>`).
+    /// `stage` hears what is built: nothing for an environment this machine holds.
     pub fn install(
         &self,
         service: &Service,
         actor: &str,
         digest: &str,
         stop: Option<&PullCancellation>,
+        stage: &dyn Fn(&str),
     ) -> Result<Installation, Refused> {
         // Like published installations, local aliases include the selected SDK and
         // client. The source digest alone cannot identify the environment after an update.
@@ -437,8 +445,9 @@ impl LocalSources {
         let member = |m: &Member| written_member(&self.objects, actor, m);
         let (manifest, object) = open_manifest(&self.objects, actor, digest)?;
         if !manifest.files.is_empty() || !manifest.path.is_empty() {
-            return self.install_live(service, actor, alias, manifest, &object.sha256, stop);
+            return self.install_live(service, actor, alias, manifest, &object.sha256, stop, stage);
         }
+        stage(&format!("installing {} on this machine", manifest.package));
         if !manifest.package.starts_with("local/") || (manifest.source.is_none() && manifest.wheels.is_empty()) {
             return Err(refused(
                 "local_source_invalid",
@@ -577,6 +586,7 @@ mod tests {
         );
         let installer = InstallerConfig {
             helper_python: helper.into(),
+            helper_engine: None,
             python: "3.12".into(),
             generations: root.join("generations"),
             client_wheel: client,
@@ -649,13 +659,13 @@ mod tests {
 
         // Another signer cannot install what it did not write.
         let refused = sources
-            .install(&service, "bob", &manifest.digest, None)
+            .install(&service, "bob", &manifest.digest, None, &|_| ())
             .err()
             .unwrap();
         assert_eq!(refused.code, "local_source_incomplete");
 
         let installed = sources
-            .install(&service, "alice", &manifest.digest, None)
+            .install(&service, "alice", &manifest.digest, None, &|_| ())
             .unwrap();
         assert_eq!(installed.package, "local/tensord-cpu-input");
         let interface: serde_json::Value = serde_json::from_slice(&installed.interface).unwrap();
@@ -663,7 +673,7 @@ mod tests {
             .as_array()
             .is_some_and(|e| !e.is_empty()));
         let again = sources
-            .install(&service, "alice", &manifest.digest, None)
+            .install(&service, "alice", &manifest.digest, None, &|_| ())
             .unwrap();
         assert_eq!(again.generation, installed.generation);
 
@@ -679,10 +689,10 @@ mod tests {
         );
         // The source and manifest stay byte-identical across this SDK change. Reusing
         // the first alias here would silently keep its original Runtime/TensorFS.
-        let updated = pinned.install(&service, "alice", &manifest.digest, None).unwrap();
+        let updated = pinned.install(&service, "alice", &manifest.digest, None, &|_| ()).unwrap();
         assert_ne!(updated.alias, installed.alias);
         assert_ne!(updated.generation, installed.generation);
-        let same_sdk = pinned.install(&service, "alice", &manifest.digest, None).unwrap();
+        let same_sdk = pinned.install(&service, "alice", &manifest.digest, None, &|_| ()).unwrap();
         assert_eq!(same_sdk.alias, updated.alias);
         assert_eq!(same_sdk.generation, updated.generation);
         // A prior generation remains valid for already accepted work.
@@ -714,7 +724,7 @@ mod tests {
         };
         let none = serde_json::json!({});
         let first = manifest(live_files(&m.objects, "alice", &project, &["pyproject.toml", "package.toml", "cpu_input/__init__.py", "notes.txt"]), none.clone());
-        let installed = sources.install(&m.service, "alice", &first, None).unwrap();
+        let installed = sources.install(&m.service, "alice", &first, None, &|_| ()).unwrap();
         let home = sources.home("alice", "local/tensord-cpu-input").unwrap();
         let first_home = home.join(format!("source-{}", first.trim_start_matches("sha256:")));
         assert_eq!(fs::read_to_string(first_home.join("tree/notes.txt")).unwrap(), "dropped by the edit");
@@ -748,7 +758,7 @@ mod tests {
         // Another signer holds no tree: every file is asked of it.
         let theirs = sources.written("bob", &second).err().unwrap();
         assert_eq!(theirs.code, "local_source_incomplete");
-        let edited = sources.install(&m.service, "alice", &second, None).unwrap();
+        let edited = sources.install(&m.service, "alice", &second, None, &|_| ()).unwrap();
         assert_ne!(edited.generation, installed.generation);
         // Its own memoized calls are keyed by its code: the edit is another computation.
         let code = m.service.catalog.resolve(&edited.generation).unwrap().record.source_digest;
@@ -775,7 +785,7 @@ mod tests {
             write(&m.objects, "carol", document.to_string().as_bytes()).digest
         };
         assert_eq!(sources.written("carol", &live).unwrap().len(), 1);
-        let placed = sources.install(&m.service, "carol", &live, None).unwrap();
+        let placed = sources.install(&m.service, "carol", &live, None, &|_| ()).unwrap();
         let python = m.service.catalog.resolve(&placed.generation).unwrap().record.python;
         let imported = run(Command::new(&python).args(["-I", "-c", "import cpu_input; print(cpu_input.__file__)"]));
         assert_eq!(Path::new(&imported), fs::canonicalize(project.join("cpu_input/__init__.py")).unwrap());
@@ -855,7 +865,7 @@ mod tests {
             write(&m.objects, "alice", document.to_string().as_bytes()).digest
         };
         let first = manifest();
-        let a = sources.install(&m.service, "alice", &first, None).unwrap();
+        let a = sources.install(&m.service, "alice", &first, None, &|_| ()).unwrap();
         let held_a = m.service.catalog.resolve(&a.generation).unwrap();
         let (child_a, reader_a) = waiting(&held_a.record.python);
         fs::write(project.join("cpu_input/late.py"), "VALUE = 'new-root-code'\n").unwrap();
@@ -863,7 +873,7 @@ mod tests {
         fs::write(library.join("late.py"), "VALUE = 'new-code'\n").unwrap();
         fs::write(library.join("data.txt"), "new-data").unwrap();
         let second = manifest();
-        let b = sources.install(&m.service, "alice", &second, None).unwrap();
+        let b = sources.install(&m.service, "alice", &second, None, &|_| ()).unwrap();
         let held_b = m.service.catalog.resolve(&b.generation).unwrap();
         assert_ne!(held_a.record.source_digest, held_b.record.source_digest, "late authored files are another computation");
         assert_ne!(held_a.record.python, held_b.record.python);
@@ -879,7 +889,7 @@ mod tests {
         assert_eq!(sources.written("alice", &first).unwrap_err().code, "local_source_incomplete");
         write(&m.objects, "alice", b"VALUE = 'old-code'\n");
         assert_eq!(sources.written("alice", &first).unwrap().len(), files.len() + 1);
-        assert_eq!(sources.install(&m.service, "alice", &first, None).unwrap().generation, a.generation);
+        assert_eq!(sources.install(&m.service, "alice", &first, None, &|_| ()).unwrap().generation, a.generation);
         let _ = fs::remove_dir_all(m.root);
     }
 
@@ -911,7 +921,7 @@ mod tests {
         };
         let name = memo.file_name().unwrap().to_string_lossy();
         let with = manifest(serde_json::json!([{"name": name, "digest": carried.digest, "length": carried.length}]));
-        let installed = sources.install(&m.service, "alice", &with, None).unwrap();
+        let installed = sources.install(&m.service, "alice", &with, None, &|_| ()).unwrap();
         let held = m.service.catalog.resolve(&installed.generation).unwrap();
         let callee = held.record.callees.iter().find(|c| c.distribution == "tensord-cpu-memo").expect("the carried callee App");
         assert_eq!((callee.package.as_str(), callee.version.as_str()), ("proof/tensord-cpu-memo", "0.1.0"));
@@ -919,7 +929,7 @@ mod tests {
         // exists: that environment could be reclaimed before a queued run uses it.
         assert_eq!(sources.written("alice", &with).unwrap().len(), files.len() + 3);
         // Without the wheel the lock's own source is all there is, and uv says so.
-        let why = sources.install(&m.service, "alice", &manifest(serde_json::json!([])), None).err().unwrap().message;
+        let why = sources.install(&m.service, "alice", &manifest(serde_json::json!([])), None, &|_| ()).err().unwrap().message;
         assert!(why.contains("package_dependency_operation_failed: uv sync --frozen exited") && why.contains("tensord-cpu-memo"), "{why}");
         let _ = fs::remove_dir_all(m.root);
     }
@@ -978,11 +988,11 @@ mod tests {
             assert!(held.record.callees.iter().any(|c| c.distribution == "tensord-cpu-memo"), "{:?}", held.record.callees);
         };
         let locked = [&files[..], &["uv.lock"]].concat();
-        callee(sources.install(&m.service, "alice", &manifest(&project, &locked, serde_json::json!({})), None).unwrap());
-        let why = sources.install(&m.service, "alice", &manifest(&unlocked, &files, serde_json::json!({})), None).err().unwrap().message;
+        callee(sources.install(&m.service, "alice", &manifest(&project, &locked, serde_json::json!({})), None, &|_| ()).unwrap());
+        let why = sources.install(&m.service, "alice", &manifest(&unlocked, &files, serde_json::json!({})), None, &|_| ()).err().unwrap().message;
         assert!(why.contains("undeclared index"), "{why}");
-        callee(sources.install(&m.service, "alice", &manifest(&unlocked, &files, serde_json::json!({"tensorhub": url})), None).unwrap());
-        let bad = sources.install(&m.service, "alice", &manifest(&unlocked, &files, serde_json::json!({"tensorhub": "file:///etc"})), None).err().unwrap();
+        callee(sources.install(&m.service, "alice", &manifest(&unlocked, &files, serde_json::json!({"tensorhub": url})), None, &|_| ()).unwrap());
+        let bad = sources.install(&m.service, "alice", &manifest(&unlocked, &files, serde_json::json!({"tensorhub": "file:///etc"})), None, &|_| ()).err().unwrap();
         assert_eq!(bad.code, "local_source_invalid");
         let _ = fs::remove_dir_all(m.root);
     }
@@ -1011,7 +1021,7 @@ mod tests {
         let install = || {
             let document = serde_json::json!({"package": "local/tensord-cpu-caller", "release": "0.1.0", "python_version": "3.12",
                 "files": live_files(&m.objects, "alice", &project, &names), "path": project.to_string_lossy(), "locals": ["deps/cpu_memo"]});
-            let installed = sources.install(&m.service, "alice", &write(&m.objects, "alice", document.to_string().as_bytes()).digest, None).unwrap();
+            let installed = sources.install(&m.service, "alice", &write(&m.objects, "alice", document.to_string().as_bytes()).digest, None, &|_| ()).unwrap();
             m.service.catalog.resolve(&installed.generation).unwrap().record.python
         };
         let python = install();
@@ -1052,7 +1062,7 @@ mod tests {
             "wheels": [{"name": name, "digest": wheel.digest, "length": wheel.length}],
             "requirements": {"digest": locked.digest, "length": locked.length}});
         let manifest = write(&m.objects, "alice", manifest.to_string().as_bytes());
-        let installed = sources.install(&m.service, "alice", &manifest.digest, None).unwrap();
+        let installed = sources.install(&m.service, "alice", &manifest.digest, None, &|_| ()).unwrap();
         let python = m.service.catalog.resolve(&installed.generation).unwrap().record.python;
         let site = python.parent().unwrap().parent().unwrap().join("lib/python3.12/site-packages");
         // A locked dependency links into the seed; the App the Runtime describes is copied.
@@ -1086,7 +1096,7 @@ mod tests {
             "wheels": [{"name": name, "digest": wheel.digest, "length": wheel.length}],
             "requirements": {"digest": locked.digest, "length": locked.length}});
         let manifest = write(&m.objects, "alice", manifest.to_string().as_bytes());
-        let installed = sources.install(&m.service, "alice", &manifest.digest, None).unwrap();
+        let installed = sources.install(&m.service, "alice", &manifest.digest, None, &|_| ()).unwrap();
         let held = m.service.catalog.resolve(&installed.generation).unwrap();
         assert!(held.record.callees.iter().any(|c| c.distribution == "tensord-cpu-memo"), "{:?}", held.record.callees);
         let site = held.record.python.parent().unwrap().parent().unwrap().join("lib/python3.12/site-packages");
@@ -1112,7 +1122,7 @@ mod tests {
         let manifest = serde_json::json!({"package": "local/tensord-cpu-caller", "release": "0.1.0", "python_version": "3.12",
             "source": {"digest": source.digest, "length": source.length}});
         let manifest = write(&m.objects, "alice", manifest.to_string().as_bytes());
-        let installed = sources.install(&m.service, "alice", &manifest.digest, None).unwrap();
+        let installed = sources.install(&m.service, "alice", &manifest.digest, None, &|_| ()).unwrap();
         let held = m.service.catalog.resolve(&installed.generation).unwrap();
         assert!(held.record.callees.iter().any(|c| c.distribution == "tensord-cpu-memo"), "{:?}", held.record.callees);
         let site = held.record.python.parent().unwrap().parent().unwrap().join("lib/python3.12/site-packages");
@@ -1185,7 +1195,7 @@ mod tests {
         // The live tree, file by file: the project as it is, its lock and vendor/ wheel.
         let live = manifest(serde_json::json!({"files": live_files(&m.objects, "alice", &project, &[&files[..], &[vendored.as_str()]].concat())}));
         for digest in [source, carried, live] {
-            let installed = sources.install(&m.service, "alice", &digest, None).unwrap();
+            let installed = sources.install(&m.service, "alice", &digest, None, &|_| ()).unwrap();
             let held = m.service.catalog.resolve(&installed.generation).unwrap();
             let versions = installed_sdk(&held.record.python);
             assert!(versions.starts_with(&format!("{dev} ")), "{versions}");
@@ -1195,7 +1205,7 @@ mod tests {
         }
 
         // A refusal carries its reason: a typed one as itself, a failed operation in uv's words.
-        let refused = |digest: &str| sources.install(&m.service, "alice", digest, None).err().unwrap().message;
+        let refused = |digest: &str| sources.install(&m.service, "alice", digest, None, &|_| ()).err().unwrap().message;
         let absent = manifest(serde_json::json!({"source": member("source.tar", &archive(&project, &files))}));
         let why = refused(&absent);
         assert!(why.contains("package_dependency_operation_failed: uv sync --frozen exited") && why.contains("vendor/cozy_runtime-0.26.4"), "{why}");
