@@ -501,6 +501,7 @@ async fn the_route_serves_a_landed_output_and_says_why_another_has_not_landed() 
     drop(store);
 
     let calcifer = Calcifer::open(&home.path().join("calcifer"), &out).unwrap();
+    calcifer.resume().unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let router = axum::Router::new()
