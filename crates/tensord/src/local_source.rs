@@ -17,7 +17,6 @@ use serde::Deserialize;
 use std::{
     collections::{BTreeMap, HashSet},
     fs,
-    os::unix::fs::PermissionsExt,
     path::{Component, Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -272,7 +271,7 @@ impl LocalSources {
             fs::create_dir_all(target.parent().expect("a file inside the tree"))?;
             let incoming = home.join(".incoming");
             fs::copy(self.store.object_path(&object.sha256), &incoming)?;
-            fs::set_permissions(&incoming, fs::Permissions::from_mode(if file.executable { 0o755 } else { 0o644 }))?;
+            cozy_platform::durable::set_mode(&incoming, if file.executable { 0o755 } else { 0o644 }).map_err(std::io::Error::from)?;
             fs::rename(&incoming, &target)?;
         }
         for gone in held.keys().filter(|name| !next.contains_key(*name)) {

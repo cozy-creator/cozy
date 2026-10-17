@@ -4063,7 +4063,7 @@ fn copy_held(
 ) -> io::Result<()> {
     let sha = digest.strip_prefix("sha256:").unwrap_or(digest);
     let mut source = store.open_verified(sha).map_err(io::Error::other)?.into_file();
-    let mut copy = std::os::unix::fs::OpenOptionsExt::mode(
+    let mut copy = cozy_platform::durable::Mode::mode(
         fs::OpenOptions::new().write(true).create_new(true),
         0o444,
     )
@@ -4601,6 +4601,7 @@ impl Services for Callbacks<'_> {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[cfg(unix)]
     use std::os::unix::process::ExitStatusExt;
 
     /// Runs 5313/5318/5319 ended `executor_poisoned: ; the executor did not settle quiescent
@@ -4673,6 +4674,7 @@ mod tests {
         assert_eq!(kept, ["attention.selected", "gemm.selected"]);
     }
 
+    #[cfg(unix)]
     #[test]
     fn an_executor_that_ended_on_its_own_names_its_exit() {
         let ended = |status: i32| device_executor::Ended {

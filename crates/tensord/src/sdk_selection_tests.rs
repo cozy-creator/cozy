@@ -1,6 +1,10 @@
 use crate::published::PackageSdk;
 use crate::machine::update::Paths;
-use std::{fs, os::unix::fs::symlink, path::Path};
+use std::{fs, path::Path};
+
+fn symlink(target: impl AsRef<Path>, link: impl AsRef<Path>) -> std::io::Result<()> {
+    Ok(cozy_platform::durable::symlink(target.as_ref(), link.as_ref())?)
+}
 
 const RUNTIME: &str = "cozy_runtime-0.21.1-py3-none-any.whl";
 const TENSORFS: &str = "tensorfs-0.6.1-cp312-abi3-linux_x86_64.whl";

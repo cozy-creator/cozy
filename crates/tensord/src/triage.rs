@@ -7,9 +7,9 @@ use serde_json::json;
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, Write},
-    os::unix::fs::OpenOptionsExt,
     path::Path,
 };
+use cozy_platform::durable::Mode;
 use tensorfs_core::sha256;
 
 /// `TriageBundleRef.length` is bounded at 1 MiB by the protocol; fields are capped well below.

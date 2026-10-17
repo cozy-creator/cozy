@@ -9,11 +9,11 @@ use crate::{
     device_executor::{Answer, Frame, Kind},
     reclaim::{self, TTL},
 };
+use cozy_platform::durable::Mode;
 use std::{
     collections::{HashMap, HashSet},
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
-    os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
     sync::{Condvar, Mutex},
     time::{SystemTime, UNIX_EPOCH},
@@ -151,12 +151,8 @@ impl Memo {
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |d| d.as_nanos());
             let local = spool.join(format!("stage-memo-{}-{stamp}.safetensors", &key[..16]));
-            OpenOptions::new()
-                .write(true)
-                .create_new(true) // never through a link
-                .mode(0o644)
-                .custom_flags(libc::O_NOFOLLOW)
-                .open(&local)?
+            // Never through a link.
+            cozy_platform::durable::open_nofollow(&local, OpenOptions::new().write(true).create_new(true).mode(0o644))?
                 .write_all(&raw)?;
             // Its last use, for the least-recently-used order.
             let _ = File::open(&entry.path).and_then(|file| file.set_modified(SystemTime::now()));
@@ -252,8 +248,8 @@ impl Memo {
                 .unwrap_or(UNIX_EPOCH);
             match facts {
                 Some(facts) if now.duration_since(written).is_ok_and(|age| age <= TTL) => {
-                    total += facts.size();
-                    kept.push((facts.modified().unwrap_or(UNIX_EPOCH), facts.size(), path));
+                    total += facts.len();
+                    kept.push((facts.modified().unwrap_or(UNIX_EPOCH), facts.len(), path));
                 }
                 // Expired, or a home left without its entry (an interrupted store).
                 _ => dropped += usize::from(fs::remove_dir_all(&path).is_ok()),
@@ -278,10 +274,7 @@ fn spooled(spool: &Path, local: &Path, length: u64) -> Option<Vec<u8>> {
     if local.parent() != Some(spool) {
         return None;
     }
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(local)
+    let file = cozy_platform::durable::open_nofollow(local, OpenOptions::new().read(true)).map_err(std::io::Error::from)
         .ok()?;
     if !file.metadata().ok()?.is_file() {
         return None;

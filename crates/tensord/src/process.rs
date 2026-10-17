@@ -6,7 +6,6 @@ use cozy_platform::process::{Birth, Exact, State, burn, gone, group_members, met
 use std::{
     fs::File,
     io,
-    os::unix::process::ExitStatusExt,
     process::{Child, ExitStatus},
     sync::{Arc, Condvar, Mutex},
     time::{Duration, Instant},
@@ -276,7 +275,7 @@ pub fn reap(
     }
     let status = match child {
         Some(child) => child.wait()?,
-        None => ExitStatus::from_raw(0),
+        None => ExitStatus::default(),
     };
     let stragglers = match exact.scope() {
         Some(scope) => scope.end()?,
@@ -410,7 +409,9 @@ pub fn tail_from(path: &std::path::Path, from: u64, limit: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::process::CommandExt;
+    #[cfg(unix)]
     use std::process::{Command, Stdio};
 
     #[test]
@@ -428,6 +429,7 @@ mod tests {
         assert_eq!(Pace::default().patience(floor), floor);
     }
 
+    #[cfg(unix)]
     #[test]
     fn reap_group_waits_for_members_left_behind_and_ends_a_still_one() {
         // The leader leaves two members in its group; killing only the leader (no group
@@ -453,6 +455,7 @@ mod tests {
         };
         let reaped = reap_group(&exact, Some(&mut child), liveness).unwrap();
         let (status, killed) = (reaped.status, reaped.killed);
+        use std::os::unix::process::ExitStatusExt;
         assert_eq!(status.signal(), Some(libc::SIGKILL));
         // A sleeping member shows no progress: it is ended on that measurement, then waited.
         let killed = killed.expect("still members are ended on their measurement");
@@ -463,6 +466,7 @@ mod tests {
         assert!(group_members(&birth).is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_subject_waiting_on_watched_work_is_still_only_once_that_work_ends() {
         // A job root sleeps while its child runs on the GPU (run 3858 was ended there).

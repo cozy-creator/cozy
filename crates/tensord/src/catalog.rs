@@ -5,9 +5,9 @@ use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File, OpenOptions},
     io,
-    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     sync::Arc,
+    time::SystemTime,
 };
 
 /// The package a Runtime's built-in operations run as: every environment holds them.
@@ -141,18 +141,12 @@ impl Catalog {
                 "generation directory must not be an alias or symlink",
             ));
         }
-        let hold = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(directory.join(".hold"))?;
+        let hold = cozy_platform::durable::open_nofollow(&directory.join(".hold"), OpenOptions::new().read(true))?;
         FileExt::lock_shared(&hold)?;
         // Last use, for least-recently-used eviction of unheld generations.
-        // SAFETY: a live descriptor; a null time sets both times to now.
-        unsafe { libc::futimens(std::os::fd::AsRawFd::as_raw_fd(&hold), std::ptr::null()) };
-        let manifest = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(directory.join("generation.json"))?;
+        let now = SystemTime::now();
+        let _ = hold.set_times(fs::FileTimes::new().set_accessed(now).set_modified(now));
+        let manifest = cozy_platform::durable::open_nofollow(&directory.join("generation.json"), OpenOptions::new().read(true))?;
         let mut record: Generation = serde_json::from_reader(manifest).map_err(io::Error::other)?;
         // Older generations recorded only the distribution. That is local code, never a
         // bare identity to send to the Hub's package-binding route.

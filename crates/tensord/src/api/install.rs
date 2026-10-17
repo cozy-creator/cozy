@@ -1,15 +1,12 @@
 //! Materialize verified package carriers and call the trusted Python/uv installer.
 //! The service commits actor/installation aliases in its one execution journal.
 use super::workspaces::{RootSet, UploadedPackage};
+use cozy_platform::durable::Mode;
 use fs2::FileExt;
 use serde::Deserialize;
 use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
-    os::unix::{
-        fs::{OpenOptionsExt, PermissionsExt},
-        process::CommandExt,
-    },
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::Arc,
@@ -77,7 +74,7 @@ pub fn materialize_uploaded(
     fs::create_dir_all(staging).map_err(storage)?;
     let root = staging.join(uuid::Uuid::new_v4().to_string());
     fs::create_dir(&root).map_err(storage)?;
-    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).map_err(storage)?;
+    cozy_platform::durable::set_mode(&root, 0o700).map_err(std::io::Error::from).map_err(storage)?;
     let hold = OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -120,30 +117,17 @@ pub fn materialize_uploaded(
                 }
                 fs::create_dir_all(target.parent().expect("source member parent"))
                     .map_err(storage)?;
-                let mut output = OpenOptions::new()
-                    .create_new(true)
-                    .write(true)
-                    .mode(0o600)
-                    .custom_flags(libc::O_NOFOLLOW)
-                    .open(&target)
+                let mut output = cozy_platform::durable::open_nofollow(&target, OpenOptions::new().create_new(true).write(true).mode(0o600)).map_err(std::io::Error::from)
                     .map_err(storage)?;
                 std::io::copy(&mut entry, &mut output).map_err(storage)?;
                 output.sync_all().map_err(storage)?;
-                fs::set_permissions(
-                    &target,
-                    fs::Permissions::from_mode(entry.header().mode().map_err(storage)? & 0o777),
-                )
+                cozy_platform::durable::set_mode(&target, entry.header().mode().map_err(storage)? & 0o777).map_err(std::io::Error::from)
                 .map_err(storage)?;
             }
             materialized.project = Some(project);
         } else {
             let path = materialized.root.join(&carrier.filename);
-            let mut output = OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW)
-                .open(&path)
+            let mut output = cozy_platform::durable::open_nofollow(&path, OpenOptions::new().create_new(true).write(true).mode(0o600)).map_err(std::io::Error::from)
                 .map_err(storage)?;
             std::io::copy(&mut { file }, &mut output).map_err(storage)?;
             output.sync_all().map_err(storage)?;
@@ -234,6 +218,7 @@ fn installer(config: &InstallerConfig, root: &RootSet) -> Result<Command, Error>
             .map_err(|e| Error::unavailable("unavailable", format!("the installer helper: {e}")))?;
     }
     let mut command = Command::new(&config.helper_python);
+    #[cfg(unix)]
     cozy_platform::process::inherit_nothing(&mut command);
     // The uploaded build backend runs here: it gets the machine's environment without
     // credentials or Runtime-owned names, never the whole service environment.
@@ -274,8 +259,9 @@ fn installer(config: &InstallerConfig, root: &RootSet) -> Result<Command, Error>
 /// with its run's cancel (`stop`), or when it stops moving past its measured patience
 /// (`process::supervise`); a long install that moves is never killed.
 fn publish(config: &InstallerConfig, mut command: Command, stop: Option<&PullCancellation>) -> Result<PreparedGeneration, Error> {
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
     let mut child = command
-        .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -351,16 +337,10 @@ fn publish(config: &InstallerConfig, mut command: Command, stop: Option<&PullCan
             "published generation path is not an owned native directory",
         ));
     }
-    let hold = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(directory.join(".hold"))
+    let hold = cozy_platform::durable::open_nofollow(&directory.join(".hold"), OpenOptions::new().read(true)).map_err(std::io::Error::from)
         .map_err(storage)?;
     hold.lock_shared().map_err(storage)?;
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(directory.join("generation.json"))
+    let file = cozy_platform::durable::open_nofollow(&directory.join("generation.json"), OpenOptions::new().read(true)).map_err(std::io::Error::from)
         .map_err(storage)?;
     let record: GenerationRecord = serde_json::from_reader(file.take(8 << 20))
         .map_err(|_| Error::internal("custody_corrupt", "published generation manifest is invalid"))?;

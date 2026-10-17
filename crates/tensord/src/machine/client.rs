@@ -128,7 +128,7 @@ pub fn helper(engine: &Path, uv: &Path, wheel: &Path) -> io::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::MetadataExt;
+    use cozy_platform::durable::FileId;
 
     /// A root with no uv gets the pinned one, verified, once; a bare name is the PATH's.
     #[test]
@@ -139,9 +139,9 @@ mod tests {
         ensure_uv(&path).unwrap();
         let version = Command::new(&path).arg("--version").output().unwrap();
         assert!(String::from_utf8_lossy(&version.stdout).starts_with(&format!("uv {UV}")), "{version:?}");
-        let fetched = fs::metadata(&path).unwrap();
+        let fetched = FileId::at(&path).unwrap();
         ensure_uv(&path).unwrap();
-        assert_eq!(fs::metadata(&path).unwrap().ino(), fetched.ino(), "fetched again");
+        assert_eq!(FileId::at(&path).unwrap(), fetched, "fetched again");
     }
 
     #[test]
@@ -169,13 +169,10 @@ mod tests {
                 .unwrap(),
             format!("{:x}", Sha256::digest(WHEEL))
         );
-        let before = fs::metadata(&selected).unwrap();
+        let stamp = |path: &Path| (FileId::at(path).unwrap(), fs::metadata(path).unwrap().modified().unwrap());
+        let before = stamp(&selected);
         assert_eq!(wheel(&engine).unwrap(), selected);
-        let after = fs::metadata(&selected).unwrap();
-        assert_eq!(
-            (before.ino(), before.mtime(), before.mtime_nsec()),
-            (after.ino(), after.mtime(), after.mtime_nsec())
-        );
+        assert_eq!(before, stamp(&selected));
         fs::remove_dir_all(engine).unwrap();
     }
 }

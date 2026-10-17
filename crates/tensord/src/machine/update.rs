@@ -11,7 +11,6 @@ use sha2::{Digest, Sha256};
 use std::{
     fs,
     io::{self, Read, Write},
-    os::unix::{fs::symlink, process::CommandExt},
     path::{Path, PathBuf},
     process::Stdio,
     sync::{Arc, Mutex},
@@ -641,10 +640,12 @@ impl Updates {
     fn resolves(&self, candidate: &Path) -> io::Result<()> {
         let pair: Vec<String> = wheels(candidate).into_iter().map(|(_, _, p)| p.display().to_string() + "\n").collect();
         super::client::ensure_uv(&self.paths.uv)?;
-        let mut child = std::process::Command::new(&self.paths.uv)
+        let mut command = std::process::Command::new(&self.paths.uv);
+        #[cfg(unix)]
+        std::os::unix::process::CommandExt::process_group(&mut command, 0);
+        let mut child = command
             .args(["pip", "compile", "--quiet", "--no-config", "--no-cache", "--no-header", "--python", "3.12", "-"])
             .current_dir(candidate)
-            .process_group(0)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -826,7 +827,7 @@ fn previous_link(link: &Path) -> io::Result<Option<PathBuf>> {
 fn relink(link: &Path, target: Option<&Path>) -> io::Result<()> {
     let Some(target) = target else {
         return match fs::remove_file(link) {
-            Ok(()) => fs::File::open(link.parent().expect("link has a parent"))?.sync_all(),
+            Ok(()) => Ok(cozy_platform::durable::sync_dir(link.parent().expect("link has a parent"))?),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e),
         };
@@ -836,11 +837,11 @@ fn relink(link: &Path, target: Option<&Path>) -> io::Result<()> {
         .ok_or_else(|| invalid("a link needs a directory"))?;
     fs::create_dir_all(dir)?;
     // The first activation creates the link's directory. Its entry must survive with the link.
-    fs::File::open(dir.parent().ok_or_else(|| invalid("a link directory needs a parent"))?)?.sync_all()?;
+    cozy_platform::durable::sync_dir(dir.parent().ok_or_else(|| invalid("a link directory needs a parent"))?)?;
     let temp = dir.join(format!(".link-{}", hex(&super::identity::random::<8>()?)));
-    symlink(target, &temp)?;
+    cozy_platform::durable::symlink(target, &temp)?;
     fs::rename(&temp, link)?;
-    fs::File::open(dir)?.sync_all()
+    Ok(cozy_platform::durable::sync_dir(dir)?)
 }
 
 fn write_json<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {

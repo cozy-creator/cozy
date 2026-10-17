@@ -1260,7 +1260,7 @@ mod tests {
         let generation = "a".repeat(32);
         let directory = service.catalog.root().join(&generation);
         fs::create_dir_all(directory.join("env/bin")).unwrap();
-        std::os::unix::fs::symlink("/usr/bin/python3", directory.join("env/bin/python")).unwrap();
+        cozy_platform::durable::symlink(Path::new("/usr/bin/python3"), &directory.join("env/bin/python")).unwrap();
         fs::write(directory.join(".hold"), "").unwrap();
         let interface = json!({
             "application":"fixture:app",
@@ -1642,7 +1642,7 @@ mod tests {
         let generation = "a".repeat(32);
         let directory = service.catalog.root().join(&generation);
         fs::create_dir_all(directory.join("env/bin")).unwrap();
-        std::os::unix::fs::symlink("/usr/bin/python3", directory.join("env/bin/python")).unwrap();
+        cozy_platform::durable::symlink(Path::new("/usr/bin/python3"), &directory.join("env/bin/python")).unwrap();
         fs::write(directory.join(".hold"), "").unwrap();
         let callee = json!({"application":"callee:app","entrypoints":[{
             "name":"render","models":[{"path":"render.models.network","class":"callee.Model"}]
@@ -1678,7 +1678,7 @@ mod tests {
         let legacy_id = "b".repeat(32);
         let legacy = service.catalog.root().join(&legacy_id);
         fs::create_dir_all(legacy.join("env/bin")).unwrap();
-        std::os::unix::fs::symlink("/usr/bin/python3",legacy.join("env/bin/python")).unwrap();
+        cozy_platform::durable::symlink(Path::new("/usr/bin/python3"), &legacy.join("env/bin/python")).unwrap();
         fs::write(legacy.join(".hold"),"").unwrap();
         fs::write(legacy.join("generation.json"),json!({
             "identity":legacy_id,"package":"caller","version":"1.0.0","application":"caller:app",
