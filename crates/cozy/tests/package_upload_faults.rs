@@ -86,7 +86,7 @@ fn carry(mut client: TcpStream, puts: &AtomicUsize) {
     {
         return;
     }
-    let (mut from_client, mut to_store) = (client.try_clone().unwrap(), store.try_clone().unwrap());
+    let (from_client, mut to_store) = (client.try_clone().unwrap(), store.try_clone().unwrap());
     std::thread::spawn(move || {
         let mut body = from_client.take(length as u64);
         let _ = std::io::copy(&mut body, &mut to_store);
