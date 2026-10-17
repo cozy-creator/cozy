@@ -1,5 +1,6 @@
 //! Generates the client from the vendored API document. Operations marked `x-raw-body` whose
-//! only success is a redirect (the package index's doors) are left to uv. Timestamps are read
+//! only success is a redirect (the package index's doors) are left to uv, and those that take
+//! exact bytes are hand-written (`raw.rs`): a generated body would be re-encoded. Timestamps are read
 //! as strings: one malformed optional field (an older Hub's `"cut_at": ""`) must never reject a
 //! whole answer, while the Hub's own conformance tests still hold it to `date-time`.
 fn main() {
@@ -21,15 +22,16 @@ fn main() {
             &mut item.delete,
             &mut item.patch,
         ] {
-            let redirect_only = op.as_ref().is_some_and(|op| {
+            let skipped = op.as_ref().is_some_and(|op| {
                 op.extensions.get("x-raw-body").and_then(|v| v.as_bool()) == Some(true)
-                    && !op
-                        .responses
-                        .responses
-                        .keys()
-                        .any(|status| status.to_string().starts_with('2'))
+                    && (op.request_body.is_some()
+                        || !op
+                            .responses
+                            .responses
+                            .keys()
+                            .any(|status| status.to_string().starts_with('2')))
             });
-            if redirect_only {
+            if skipped {
                 *op = None;
             }
         }
