@@ -335,7 +335,6 @@ fn stock_executor_deferred_webp_reuses_sdk_encoder_and_exact_asset_binding() {
 #[test]
 #[ignore = "actual SDK receiver custody gate needs installed current generation"]
 fn retained_source_is_released_only_after_actual_receiver_exit() {
-    use tensord::execution::process_ended;
     use fs2::FileExt;
     use std::time::{Duration, Instant};
     let (mut executor, root) = prepared(
@@ -350,13 +349,13 @@ fn retained_source_is_released_only_after_actual_receiver_exit() {
     drop(source);
     let observer = File::open(&path).unwrap();
     assert!(observer.try_lock_exclusive().is_err());
-    assert!(!process_ended(&birth).unwrap());
+    assert!(!birth.ended().unwrap());
     // Loss of the private owner handle detaches its source custody from that handle.
     drop(executor);
     let observed = Instant::now();
     loop {
         if observer.try_lock_exclusive().is_ok() {
-            assert!(process_ended(&birth).unwrap());
+            assert!(birth.ended().unwrap());
             break;
         }
         // Test observation bound, not authority to terminate or release any receiver.

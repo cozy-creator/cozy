@@ -2,12 +2,13 @@
 //! `tests/fixtures/cpu_lifecycle`, no doubles. CUDA is hidden by the seal; the GPU half is
 //! proven on a rental. `TENSORD_FORK_GENERATIONS` names installed generations whose
 //! Runtime offers `fork/1`.
+use cozy_platform::process::Exact;
 use tensord::{
     device_executor::{
         Baseline, Binding, Budgets, DeviceCommand, DeviceExecutor, ExecutorConfig, Forked, FORK,
     },
     launch_identity::Seal,
-    process::{process_ended, Exact},
+    
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -194,7 +195,7 @@ fn a_forked_executor_is_sealed_serves_and_is_reaped_with_its_status() {
 
         // A second child; the parent reaps the first at this fork.
         let second = fork(&mut parent, config(&generation, &hold, &root, "second"));
-        assert!(process_ended(&birth).unwrap());
+        assert!(birth.ended().unwrap());
         assert!(!Path::new(&format!("/proc/{}", birth.pid)).exists());
         second.shutdown().unwrap();
         parent.shutdown().unwrap();

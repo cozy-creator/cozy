@@ -1,5 +1,6 @@
 //! The machine lifetime: its boot id and TLS leaf, persisted with the root so a restarted
 //! service is the same machine. Files and formats are the Go agent's (`layout.go`).
+use cozy_platform::process::{Birth, State};
 use super::grant::Layout;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use std::{
@@ -36,7 +37,7 @@ pub fn hold(layout: &Layout) -> io::Result<()> {
         .mode(0o600)
         .open(layout.state.join("agent.lock"))?;
     if lock.try_lock_exclusive().is_err() {
-        let dying = |pid: &u32| crate::process::process_birth(*pid).and_then(|birth| crate::process::dying(&birth)).unwrap_or(true);
+        let dying = |pid: &u32| Birth::of(*pid).and_then(|birth| birth.state()).map_or(true, |state| matches!(state, State::Gone | State::Dying));
         if let Some(live) = holders(&lock)?.into_iter().find(|pid| !dying(pid)) {
             let root = layout.root.display();
             return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("another machine owns the root {root} (pid {live})")));
@@ -194,14 +195,15 @@ mod tests {
         let mut holder = std::process::Command::new("python3").args(["-c", HOLD]).arg(layout.state.join("agent.lock"))
             .stdout(std::process::Stdio::piped()).spawn().unwrap();
         holder.stdout.take().unwrap().read_exact(&mut [0u8; 5]).unwrap();
-        let birth = crate::process::process_birth(holder.id()).unwrap();
-        assert!(!crate::process::dying(&birth).unwrap());
+        let birth = Birth::of(holder.id()).unwrap();
+        let dying = |birth: &Birth| matches!(birth.state().unwrap(), State::Gone | State::Dying);
+        assert!(!dying(&birth));
         assert_eq!(hold(&layout).unwrap_err().kind(), io::ErrorKind::AlreadyExists);
         holder.kill().unwrap();
-        assert!(crate::process::dying(&birth).unwrap());
+        assert!(dying(&birth));
         hold(&layout).unwrap();
         holder.wait().unwrap();
-        assert!(crate::process::dying(&birth).unwrap());
+        assert!(dying(&birth));
         // This process holds it now: a second machine here is refused.
         assert_eq!(hold(&layout).unwrap_err().kind(), io::ErrorKind::AlreadyExists);
         fs::remove_dir_all(root).unwrap();

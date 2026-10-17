@@ -2,7 +2,8 @@
 //! below the machine's where the host delegates one, else a process-tree token. Either
 //! reaches descendants that call `setsid` or double-fork. Lifecycle containment, not a
 //! sandbox: same-UID code can move out of a delegated cgroup or scrub its token.
-use crate::process::{gone, process_birth, process_ended, Exact};
+use super::TOKEN_ENV;
+use crate::process::{Birth, Exact, State, gone};
 use std::{
     collections::BTreeSet,
     fs::{self, File, OpenOptions},
@@ -14,8 +15,6 @@ use std::{
 };
 
 const ROOT: &str = "/sys/fs/cgroup";
-/// Runtime `child_env.EXECUTOR_SCOPE_ENV`: one complete inherited environment entry.
-pub const TOKEN_ENV: &str = "COZY_EXECUTOR_SCOPE";
 
 /// This process's live tree scopes: a token on no live scope is unclaimed.
 static LIVE: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
@@ -33,10 +32,19 @@ enum Backend {
     Tree { token: String },
 }
 
-/// Opaque, stable per state root, so a machine only ever sweeps its own scopes.
-pub fn namespace(state: &Path) -> String {
-    let path = state.canonicalize().unwrap_or_else(|_| state.to_path_buf());
-    tensorfs_core::sha256::hex_digest(path.as_os_str().as_encoded_bytes())[..16].to_string()
+/// 16 random hex digits naming one scope.
+fn id() -> io::Result<String> {
+    let mut bytes = [0u8; 8];
+    getrandom::fill(&mut bytes).map_err(|error| io::Error::other(error.to_string()))?;
+    Ok(hex::encode(bytes))
+}
+
+fn process_birth(pid: u32) -> io::Result<Birth> {
+    Birth::of(pid).map_err(io::Error::from)
+}
+
+fn process_ended(birth: &Birth) -> io::Result<bool> {
+    Ok(birth.state()? == State::Gone)
 }
 
 fn own_cgroup() -> io::Result<PathBuf> {
@@ -61,8 +69,8 @@ fn writable_unified() -> bool {
 impl Scope {
     /// A fresh scope: a cgroup where the unified hierarchy is writable and delegated, else a
     /// token (read-only or v1 hierarchies: Docker, RunPod).
-    pub fn create(namespace: &str) -> io::Result<Self> {
-        let id = &uuid::Uuid::new_v4().simple().to_string()[..16];
+    pub fn create(namespace: &str) -> crate::Result<Self> {
+        let id = &id()?;
         if let Some(scope) = Self::cgroup(namespace, id)? {
             return Ok(scope);
         }
@@ -140,7 +148,7 @@ impl Scope {
     }
 
     /// Live processes in the scope.
-    pub fn processes(&self) -> io::Result<usize> {
+    pub fn processes(&self) -> crate::Result<usize> {
         fn count(path: &Path) -> io::Result<usize> {
             let mut total = fs::read_to_string(path.join("cgroup.procs"))?
                 .lines()
@@ -155,31 +163,33 @@ impl Scope {
             Ok(total)
         }
         match &self.0 {
-            Backend::Cgroup { relative, inode } => count(&Self::path(relative, *inode)?),
+            Backend::Cgroup { relative, inode } => Ok(count(&Self::path(relative, *inode)?)?),
             Backend::Tree { token } => {
                 let rows = census()?;
-                Ok(members(&rows, |t| t == token).filter(|row| row.alive).count())
+                Ok(members(&rows, |t| t == token)
+                    .filter(|row| row.alive)
+                    .count())
             }
         }
     }
 
     /// Move a running process into a cgroup scope (a fork starts in its parent's).
-    pub fn adopt(&self, pid: u32) -> io::Result<()> {
+    pub fn adopt(&self, pid: u32) -> crate::Result<()> {
         match &self.0 {
-            Backend::Cgroup { relative, inode } => OpenOptions::new()
+            Backend::Cgroup { relative, inode } => Ok(OpenOptions::new()
                 .write(true)
                 .open(Self::path(relative, *inode)?.join("cgroup.procs"))?
-                .write_all(pid.to_string().as_bytes()),
+                .write_all(pid.to_string().as_bytes())?),
             Backend::Tree { .. } => Ok(()),
         }
     }
 
-    pub fn kill(&self) -> io::Result<()> {
+    pub fn kill(&self) -> crate::Result<()> {
         match &self.0 {
-            Backend::Cgroup { relative, inode } => OpenOptions::new()
+            Backend::Cgroup { relative, inode } => Ok(OpenOptions::new()
                 .write(true)
                 .open(Self::path(relative, *inode)?.join("cgroup.kill"))?
-                .write_all(b"1"),
+                .write_all(b"1")?),
             Backend::Tree { token } => {
                 let rows = census()?;
                 for row in members(&rows, |t| t == token).filter(|row| row.alive) {
@@ -194,7 +204,7 @@ impl Scope {
 
     /// Kill whatever outlived the executor (after its leader is reaped), wait for it, and
     /// remove the scope. Returns how many processes were still inside.
-    pub fn end(&self) -> io::Result<usize> {
+    pub fn end(&self) -> crate::Result<usize> {
         match &self.0 {
             Backend::Cgroup { relative, inode } => {
                 let stragglers = self.processes()?;
@@ -210,7 +220,9 @@ impl Scope {
                 let stragglers = end_members(|t| t == token)?;
                 LIVE.lock().unwrap().remove(token);
                 // Anything of this machine's that no live scope claims goes now too.
-                let namespace = token.rsplit_once('-').map_or("", |(namespace, _)| namespace);
+                let namespace = token
+                    .rsplit_once('-')
+                    .map_or("", |(namespace, _)| namespace);
                 Ok(stragglers + end_members(unclaimed(namespace))?)
             }
         }
@@ -218,7 +230,7 @@ impl Scope {
 
     /// At machine start every scope of this namespace belongs to an earlier run: kill, wait
     /// for and remove each. Returns how many processes they still held.
-    pub fn sweep(namespace: &str) -> io::Result<usize> {
+    pub fn sweep(namespace: &str) -> crate::Result<usize> {
         let mut held = end_members(unclaimed(namespace))?;
         if !writable_unified() {
             return Ok(held);
@@ -293,7 +305,7 @@ struct Row {
 impl Row {
     fn exact(&self) -> io::Result<Option<Exact>> {
         match process_birth(self.pid) {
-            Ok(birth) if birth.start_ticks == self.start_ticks => Exact::open(&birth),
+            Ok(birth) if birth.start_ticks == self.start_ticks => Ok(Exact::open(&birth)?),
             Ok(_) => Ok(None),
             Err(error) if gone(&error) => Ok(None),
             Err(error) => Err(error),
@@ -307,7 +319,11 @@ fn census() -> io::Result<Vec<Row>> {
     let own = std::process::id();
     let mut rows = Vec::new();
     for entry in fs::read_dir("/proc")? {
-        let Some(pid) = entry?.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else {
+        let Some(pid) = entry?
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
             continue;
         };
         if pid == own || pid == 1 {
@@ -333,7 +349,9 @@ fn census() -> io::Result<Vec<Row>> {
             .flatten()
             .and_then(|environ| {
                 environ.split(|b| *b == 0).find_map(|entry| {
-                    let value = entry.strip_prefix(TOKEN_ENV.as_bytes())?.strip_prefix(b"=")?;
+                    let value = entry
+                        .strip_prefix(TOKEN_ENV.as_bytes())?
+                        .strip_prefix(b"=")?;
                     String::from_utf8(value.to_vec()).ok()
                 })
             });
@@ -424,14 +442,17 @@ mod tests {
     use std::process::{Command, Stdio};
 
     fn id() -> String {
-        uuid::Uuid::new_v4().simple().to_string()[..16].to_string()
+        super::id().unwrap()
     }
 
     /// The leader detaches a daemon into its own session, then exits; the daemon's pid.
     fn detach(scope: &Scope) -> u32 {
         let mut command = Command::new("/bin/sh");
         command
-            .args(["-c", "read go; setsid sleep 1000 </dev/null >/dev/null 2>&1 & echo $!"])
+            .args([
+                "-c",
+                "read go; setsid sleep 1000 </dev/null >/dev/null 2>&1 & echo $!",
+            ])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped());
         if let Some((name, value)) = scope.environment() {
@@ -441,7 +462,12 @@ mod tests {
         scope.adopt(leader.id()).unwrap();
         leader.stdin.take().unwrap().write_all(b"go\n").unwrap();
         let mut daemon = String::new();
-        leader.stdout.take().unwrap().read_to_string(&mut daemon).unwrap();
+        leader
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut daemon)
+            .unwrap();
         assert!(leader.wait().unwrap().success());
         daemon.trim().parse().unwrap()
     }

@@ -1,9 +1,9 @@
 //! Existing Runtime device-executor control seam. Models and codecs remain in Python SDK.
+use cozy_platform::process::{Birth, Exact};
 use crate::{
     execution::open_artifact,
-    journal::ProcessBirth,
     launch_identity::{LaunchIdentity, Seal},
-    process::{process_birth, reap_group, tail, Exact, Liveness, Meter, Watch, Watching},
+    process::{reap_group, tail, Liveness, Meter, Watch, Watching},
     protocol,
 };
 use serde::{Deserialize, Serialize};
@@ -959,7 +959,7 @@ pub struct DeviceExecutor {
     forked: bool,
     exact: Exact,
     stream: UnixStream,
-    pub birth: ProcessBirth,
+    pub birth: Birth,
     pub hello: Hello,
     /// Sampling resolution of the wedge rule. Tests shorten it; nothing else changes it.
     pub liveness: Liveness,
@@ -1026,7 +1026,7 @@ pub enum Forked {
 }
 
 /// A forked executor's wait status while it is its parent's zombie (`/proc` `exit_code`).
-fn zombie_status(birth: &ProcessBirth) -> Option<ExitStatus> {
+fn zombie_status(birth: &Birth) -> Option<ExitStatus> {
     let stat = fs::read_to_string(format!("/proc/{}/stat", birth.pid)).ok()?;
     let fields: Vec<&str> = stat.rsplit_once(')')?.1.split_whitespace().collect();
     let start: u64 = fields.get(19)?.parse().ok()?;
@@ -1130,7 +1130,7 @@ impl Codec {
             .as_ref()
             .map(|hold| hold.as_raw_fd());
         let mut command = Command::new(&self.config.python);
-        crate::process::inherit_nothing(&mut command);
+        cozy_platform::process::inherit_nothing(&mut command);
         command
             .args([
                 "-I",
@@ -1479,25 +1479,25 @@ impl DeviceExecutor {
 
     pub fn spawn_observed(
         config: ExecutorConfig,
-        on_birth: impl FnOnce(&ProcessBirth, &Cancellation) -> io::Result<()>,
+        on_birth: impl FnOnce(&Birth, &Cancellation) -> io::Result<()>,
     ) -> io::Result<Self> {
         Self::spawn_internal(config, None, on_birth)
     }
     pub fn spawn_owned(
         config: ExecutorConfig,
         launcher: &crate::child_launcher::ChildLauncher,
-        on_birth: impl FnOnce(&ProcessBirth, &Cancellation) -> io::Result<()>,
+        on_birth: impl FnOnce(&Birth, &Cancellation) -> io::Result<()>,
     ) -> io::Result<Self> {
         Self::spawn_internal(config, Some(launcher), on_birth)
     }
     fn spawn_internal(
         config: ExecutorConfig,
         launcher: Option<&crate::child_launcher::ChildLauncher>,
-        on_birth: impl FnOnce(&ProcessBirth, &Cancellation) -> io::Result<()>,
+        on_birth: impl FnOnce(&Birth, &Cancellation) -> io::Result<()>,
     ) -> io::Result<Self> {
         let (listener, environment) = endpoint(&config)?;
         let scope = match &config.cgroup_namespace {
-            Some(namespace) => Some(Arc::new(crate::scope::Scope::create(namespace)?)),
+            Some(namespace) => Some(Arc::new(cozy_platform::contain::Scope::create(namespace)?)),
             None => None,
         };
         let mut command =
@@ -1509,7 +1509,7 @@ impl DeviceExecutor {
             .arg(&config.root)
             .env_clear()
             .envs(&environment)
-            .envs(scope.as_deref().and_then(crate::scope::Scope::environment))
+            .envs(scope.as_deref().and_then(cozy_platform::contain::Scope::environment))
             .stdin(Stdio::null())
             .stdout(File::create(config.root.join("stdout.log"))?)
             .stderr(File::create(config.root.join("stderr.log"))?);
@@ -1542,15 +1542,15 @@ impl DeviceExecutor {
     pub fn fork(
         &mut self,
         config: ExecutorConfig,
-        on_birth: impl FnOnce(&ProcessBirth, &Cancellation) -> io::Result<()>,
+        on_birth: impl FnOnce(&Birth, &Cancellation) -> io::Result<()>,
     ) -> io::Result<Forked> {
         let (listener, environment) = endpoint(&config)?;
         let scope = match &config.cgroup_namespace {
-            Some(namespace) => Some(Arc::new(crate::scope::Scope::create(namespace)?)),
+            Some(namespace) => Some(Arc::new(cozy_platform::contain::Scope::create(namespace)?)),
             None => None,
         };
         let mut forked = environment.clone();
-        if let Some((name, token)) = scope.as_deref().and_then(crate::scope::Scope::environment) {
+        if let Some((name, token)) = scope.as_deref().and_then(cozy_platform::contain::Scope::environment) {
             forked.insert(name.into(), token.into());
         }
         let reply = self.command(
@@ -1567,7 +1567,7 @@ impl DeviceExecutor {
                 drop(listener);
                 fs::remove_file(&config.socket)?;
                 // A child the parent made before its channel failed carries the token too.
-                if let Err(error) = scope.as_deref().map_or(Ok(0), crate::scope::Scope::end) {
+                if let Err(error) = scope.as_deref().map_or(Ok(0), cozy_platform::contain::Scope::end) {
                     tracing::warn!("refused fork's scope not ended: {error}");
                 }
                 return Ok(match refused {
@@ -1604,7 +1604,7 @@ impl DeviceExecutor {
         listener: UnixListener,
         environment: BTreeMap<String, String>,
         mut unready: Unready,
-        on_birth: impl FnOnce(&ProcessBirth, &Cancellation) -> io::Result<()>,
+        on_birth: impl FnOnce(&Birth, &Cancellation) -> io::Result<()>,
     ) -> io::Result<Self> {
         let codec = Arc::new(Codec::new(
             CodecConfig {
@@ -1615,7 +1615,7 @@ impl DeviceExecutor {
             config.root.join("codec.stderr.log"),
         ));
         let pid = unready.pid;
-        let birth = process_birth(pid)?;
+        let birth = Birth::of(pid)?;
         let exact = Exact::open(&birth)?
             .ok_or_else(|| io::Error::other("launched executor has no exact birth"))?
             .with_scope(unready.scope.clone());
@@ -1644,7 +1644,7 @@ impl DeviceExecutor {
                 revents: 0,
             },
             libc::pollfd {
-                fd: exact.as_file().as_raw_fd(),
+                fd: std::os::fd::AsFd::as_fd(&exact).as_raw_fd(),
                 events: libc::POLLIN,
                 revents: 0,
             },
@@ -1776,7 +1776,7 @@ impl DeviceExecutor {
     }
 
     pub fn observer_pidfd(&self) -> io::Result<File> {
-        self.exact.as_file().try_clone()
+        Ok(self.exact.try_clone()?.into_file())
     }
 
     /// Retain a source/resource until this exact receiver exits, including owner-handle loss.
@@ -2040,7 +2040,7 @@ impl DeviceExecutor {
     fn parts(&mut self) -> Ending {
         let _ = self.stream.shutdown(std::net::Shutdown::Both);
         Ending {
-            exact: self.exact.try_clone(),
+            exact: self.exact.try_clone().map_err(io::Error::from),
             child: self.child.take(),
             forked: std::mem::take(&mut self.forked),
             retained: std::mem::take(&mut self.retained),
@@ -2059,9 +2059,9 @@ struct Unready {
     parent: u32,
     child: Option<Child>,
     exact: Option<Exact>,
-    birth: Option<ProcessBirth>,
+    birth: Option<Birth>,
     /// Its own scope, ended with it if it never becomes an executor.
-    scope: Option<Arc<crate::scope::Scope>>,
+    scope: Option<Arc<cozy_platform::contain::Scope>>,
 }
 impl Unready {
     /// Its exit status, once the process is seen to have exited.
@@ -2082,7 +2082,7 @@ impl Drop for Unready {
             return;
         }
         let exact = self.exact.take().or_else(|| {
-            process_birth(self.pid)
+            Birth::of(self.pid)
                 .ok()
                 .and_then(|birth| Exact::open(&birth).ok().flatten())
         });
@@ -2129,7 +2129,7 @@ impl Ending {
             }
         };
         if self.forked {
-            ended.status = zombie_status(&exact.birth).unwrap_or(ended.status);
+            ended.status = zombie_status(exact.birth()).unwrap_or(ended.status);
         }
         if !self.socket.as_os_str().is_empty() {
             let _ = fs::remove_file(&self.socket);

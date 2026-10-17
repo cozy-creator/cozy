@@ -2,13 +2,14 @@
 //! one finished run with a large output (MiB); `measure` (on the client) reads it N times through
 //! `cozy.machine.v1` Read and prints MB/s. Not proof of
 //! anything but the transport.
+use cozy_platform::process::Birth;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use tensord::{
     api::{
         capability::{mint, Grant, MACHINE},
         domain, v1,
     },
-    journal::{Invocation, Journal, Outcome, ProcessBirth, SubmissionContext},
+    journal::{Invocation, Journal, Outcome, SubmissionContext},
 };
 use ed25519_dalek::SigningKey;
 use std::{
@@ -91,8 +92,8 @@ fn seed(state: PathBuf, mib: u64, key_seed: &str) -> io::Result<()> {
     )?;
     journal.claim(&record.id)?;
     let mut holder = Command::new("sleep").arg("60").spawn()?;
-    let birth = tensord::execution::process_birth(holder.id())?;
-    journal.register_process(&record.id, ProcessBirth { ..birth })?;
+    let birth = cozy_platform::process::Birth::of(holder.id())?;
+    journal.register_process(&record.id, Birth { ..birth })?;
     journal.running(&record.id, None)?;
     let product = domain::RunProduct {
         output: "blob".into(),

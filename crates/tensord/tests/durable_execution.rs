@@ -1,8 +1,9 @@
 //! The engine's durable execution on real processes, sockets and files. Calls run on the
 //! machine's own pool (a deviceless one, `tests/fixtures/cpu_lifecycle` installed); journal
 //! checks drive the journal with stand-in processes. Not CLI qualification.
+use cozy_platform::process::Birth;
 use tensord::{
-    execution::{process_birth, Engine},
+    execution::Engine,
     gpu_service::{GpuConfig, Pool},
     journal::{self, Invocation, Journal, State},
     service::Service,
@@ -414,7 +415,7 @@ fn cursor_reservation_renewal_never_reuses_old_cursors_and_accepts_older_records
         .spawn()
         .unwrap();
     journal
-        .register_process(&id, process_birth(child.id()).unwrap())
+        .register_process(&id, Birth::of(child.id()).unwrap())
         .unwrap();
     let first = journal.running(&id, None).unwrap();
     let old_edge = first.revision_ceiling;
@@ -466,7 +467,7 @@ fn restart_settlement_waits_for_exact_process_birth_without_adoption() {
         .spawn()
         .unwrap();
     journal
-        .register_process(&id, process_birth(child.id()).unwrap())
+        .register_process(&id, Birth::of(child.id()).unwrap())
         .unwrap();
     journal.running(&id, None).unwrap();
     drop(journal);
@@ -496,7 +497,7 @@ fn never_authorized_restart_can_retry_only_after_exact_birth_ends() {
         .spawn()
         .unwrap();
     journal
-        .register_process(&id, process_birth(child.id()).unwrap())
+        .register_process(&id, Birth::of(child.id()).unwrap())
         .unwrap();
     drop(journal);
     let reopened = Engine::open(&journal_root).unwrap();
@@ -528,7 +529,7 @@ fn an_authorized_attempt_that_never_reached_a_handler_starts_again_under_its_cla
         assert!(journal.claim(&id).unwrap());
         let mut retained = executor();
         journal
-            .register_process(&id, process_birth(retained.id()).unwrap())
+            .register_process(&id, Birth::of(retained.id()).unwrap())
             .unwrap();
         journal.running(&id, None).unwrap();
         retained.kill().unwrap();
@@ -544,7 +545,7 @@ fn an_authorized_attempt_that_never_reached_a_handler_starts_again_under_its_cla
     assert!(!journal.claim(&id).unwrap());
     let mut fresh = executor();
     journal
-        .register_process(&id, process_birth(fresh.id()).unwrap())
+        .register_process(&id, Birth::of(fresh.id()).unwrap())
         .unwrap();
     assert_eq!(journal.running(&id, None).unwrap().state, State::Running);
     drop(fresh.stdin.take());

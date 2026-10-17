@@ -126,6 +126,26 @@ fn info(pid: u32) -> io::Result<libc::proc_bsdinfo> {
     })
 }
 
+/// Groups and meters are read only on Linux so far: unreadable here, which decides nothing.
+pub(super) fn group_members(_: &Birth) -> Vec<Birth> {
+    Vec::new()
+}
+
+pub(super) fn meter(_: u32) -> Option<(u64, u64)> {
+    None
+}
+
+pub(super) fn read_bytes(_: u32) -> Option<u64> {
+    None
+}
+
+pub(super) fn transient(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::EAGAIN | libc::ENOMEM | libc::EMFILE | libc::ENFILE | libc::EINTR)
+    )
+}
+
 /// Exited, a zombie included, or gone altogether.
 pub(super) fn exited(pid: u32) -> bool {
     match info(pid) {
@@ -138,6 +158,6 @@ fn start(info: &libc::proc_bsdinfo) -> u64 {
     info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec
 }
 
-fn gone(error: &io::Error) -> bool {
+pub(super) fn gone(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
 }

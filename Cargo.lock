@@ -669,10 +669,13 @@ dependencies = [
 name = "cozy-platform"
 version = "0.9.1"
 dependencies = [
+ "getrandom 0.3.4",
+ "hex",
  "libc",
  "nvml-wrapper",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.21",
  "windows-sys 0.61.2",
 ]
@@ -4050,6 +4053,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "bytes",
+ "cozy-platform",
  "cozy-proto",
  "ed25519-dalek",
  "fs2",

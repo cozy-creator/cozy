@@ -37,7 +37,7 @@ struct Config {
 
 struct Pilot {
     custody: Arc<Mutex<ResidentCustody>>,
-    reader: Option<(tensord::journal::ProcessBirth, File)>,
+    reader: Option<(cozy_platform::process::Birth, File)>,
     cells: Vec<File>,
     log: File,
 }

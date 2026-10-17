@@ -140,8 +140,8 @@ impl Device {
                 SUCCESS => {}
                 // An integrated GPU (GB10) has no framebuffer: its memory is the host's.
                 NOT_SUPPORTED => {
-                    let total = crate::host_memory::total();
-                    let free = crate::host_memory::read().mem_available;
+                    let total = cozy_platform::contain::host_memory::total();
+                    let free = cozy_platform::contain::host_memory::read().mem_available;
                     if total <= 0 || free < 0 {
                         return Err(io::Error::other("host memory is unreadable"));
                     }

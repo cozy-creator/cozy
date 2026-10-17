@@ -203,7 +203,7 @@ pub fn gpus() -> io::Result<Vec<Gpu>> {
     };
     let mut rows = parse_gpus(
         &String::from_utf8_lossy(&output.stdout),
-        crate::host_memory::total(),
+        cozy_platform::contain::host_memory::total(),
     )?;
     if let Some(visible) = visible {
         let named: Vec<&str> = visible.split(',').map(str::trim).collect();

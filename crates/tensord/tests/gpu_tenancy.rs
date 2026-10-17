@@ -9,7 +9,6 @@
 use tensord::{
     gpu_service::{GpuConfig, Pool},
     journal::{Execution, Preparation, State, SubmissionContext},
-    process::process_ended,
     resident_custody::HoldingFacts,
     service::{Call, Service},
 };
@@ -266,12 +265,12 @@ fn submitters_share_a_packages_executor_and_packages_share_a_checkpoints_weights
     // nothing.
     let birth = second.process.clone().unwrap();
     assert_eq!(
-        tensord::execution::process_birth(birth.pid).unwrap(),
+        cozy_platform::process::Birth::of(birth.pid).unwrap(),
         birth
     );
     // SAFETY: the exact process this test's pool started, by its recorded birth.
     assert_eq!(unsafe { libc::kill(birth.pid as i32, libc::SIGKILL) }, 0);
-    while !process_ended(&birth).unwrap() {
+    while !birth.ended().unwrap() {
         std::thread::sleep(Duration::from_millis(20));
     }
     let (_, replaced) = pod.run("bob", 1, None);
