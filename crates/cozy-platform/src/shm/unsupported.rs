@@ -75,5 +75,5 @@ pub fn frozen(name: &str, bytes: &[u8]) -> Result<std::fs::File> {
         fs::File::open(&path)
     })();
     let _ = fs::remove_file(&path);
-    Ok(frozen.map_err(crate::Error::io("freeze", path))?)
+    frozen.map_err(crate::Error::io("freeze", path))
 }
