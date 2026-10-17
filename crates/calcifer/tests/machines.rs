@@ -32,7 +32,7 @@ fn calcifer(home: &Path) -> Arc<Calcifer> {
 }
 
 fn machines(calcifer: &Arc<Calcifer>, home: &Path) -> Arc<Machines> {
-    Machines::start(calcifer.clone(), Home::at(home), vec![])
+    Machines::start(calcifer.clone(), Home::at(home), &Default::default())
 }
 
 /// Makes the test key, which every test TensorD admits, this controller's owner key.
@@ -579,4 +579,34 @@ async fn the_machine_routes_answer_over_loopback() {
     call(Method::POST, "/v1/down").send().await.unwrap();
     drop(client);
     served.await.unwrap().unwrap();
+}
+
+/// A run that publishes into a Hub model carries its owner's capability for it; on a Hub this
+/// computer is not signed in to there is none, so the run fails before its machine gets it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_publishing_run_without_its_hub_sign_in_fails_unsent() {
+    let home = tempfile::tempdir().unwrap();
+    let key = common::key_file(home.path());
+    let machine = Tensord::start();
+    let calcifer = calcifer(home.path());
+    calcifer.put_machine(&machine.row("m", &key)).unwrap();
+    let mut events = calcifer.subscribe();
+    let machines = machines(&calcifer, home.path());
+    let mut spec = v1::RunSpec::decode(common::warm_spec(NO_HUB, vec![]).as_slice()).unwrap();
+    spec.weights_destination = "fidika/uploaded".into();
+    let mut publish = submit("m", spec.encode_to_vec());
+    publish.hub = NO_HUB.into();
+    let id = calcifer.submit("k", publish).await.unwrap().run.id;
+    let end = until(&mut events, &id, Event::is_terminal).await;
+    assert_eq!(reason(&end), "hub_sign_in_required");
+    let link = calcifer::Link::new(&machine.endpoint, common::key()).unwrap();
+    assert!(
+        matches!(
+            link.run(id.as_str(), 0, None).await,
+            Err(calcifer::LinkError::NotFound)
+        ),
+        "never sent"
+    );
+    machines.close();
+    calcifer.close();
 }

@@ -7,6 +7,7 @@
 //! its acceptance. From then on, the task follows the run from the durable cursor to its outcome.
 //! A Calcifer that stops leaves accepted work running; the next one resumes each run from the
 //! cursor.
+mod access;
 pub mod api;
 pub mod link;
 pub mod machines;
@@ -21,7 +22,7 @@ use std::{
     io::{Read as _, Write as _},
     path::{Path, PathBuf},
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock, Weak},
     task::{Context, Poll},
     time::Duration,
 };
@@ -70,6 +71,8 @@ pub struct Calcifer {
     exports: outputs::Exports,
     /// Each machine's warm set as it last reported it, and as this Calcifer since sent it.
     warm: Mutex<HashMap<String, Vec<v1::WarmItem>>>,
+    /// The machines and their Hubs, which mint what a send carries to its Hub.
+    granting: OnceLock<Weak<machines::Machines>>,
 }
 
 /// What a run is doing now, never stored: the latest of each live event.
@@ -136,6 +139,7 @@ impl Calcifer {
             owed: watch::channel(()).0,
             exports: outputs::Exports::default(),
             warm: Mutex::default(),
+            granting: OnceLock::new(),
         });
         calcifer.sweep_inputs()?;
         for id in calcifer.store.unsettled()? {
@@ -324,6 +328,26 @@ impl Calcifer {
         let events = self.store.warn(id.as_str(), warning)?;
         self.publish(id, events);
         Ok(())
+    }
+
+    /// Lets `machines` mint what each send carries to its Hub.
+    pub(crate) fn serve_with(&self, machines: &Arc<machines::Machines>) {
+        let _ = self.granting.set(Arc::downgrade(machines));
+    }
+
+    /// What the run's send carries besides its spec: its Hub access and model-source tokens,
+    /// minted now. Without machines (a bare core) it carries the run's Hub origin only.
+    async fn access(&self, run: &RunRow, machine: &str) -> Result<access::Access, Stop> {
+        let Some(machines) = self.granting.get().and_then(Weak::upgrade) else {
+            return Ok(access::Access::default());
+        };
+        machines
+            .access(run, machine)
+            .await
+            .map_err(|denied| match denied {
+                access::Denied::Refused(reason) => Stop::Refused(reason),
+                access::Denied::Unreachable(message) => Stop::Unreachable(message),
+            })
     }
 
     /// Ends a run no machine took, with `reason`.
@@ -542,14 +566,14 @@ impl Calcifer {
         let id = run.id.as_str();
         // The spec as sent: finished under the machine's send lock, so a warm set merges into what
         // the machine reported after the runs sent before it.
-        let spec = || {
+        let spec = |access| {
             let mut spec = v1::RunSpec::decode(run.spec.as_slice()).map_err(|e| {
                 Stop::Refused(Reason {
                     code: "spec_unreadable".into(),
                     message: format!("the stored spec: {e}"),
                 })
             })?;
-            self.finish_spec(run, &mut spec);
+            self.finish_spec(run, &mut spec, access);
             Ok::<_, Stop>(spec)
         };
         let mut canceled = false;
@@ -559,7 +583,7 @@ impl Calcifer {
                 self.write_inputs(link, run).await?;
                 let _turn = sending.lock().await;
                 self.known_warm(run, machine, link).await?;
-                let spec = spec()?;
+                let spec = spec(self.access(run, machine).await?)?;
                 if !self.store.mark_sent(id, machine)? {
                     return Ok(());
                 }
@@ -585,7 +609,8 @@ impl Calcifer {
                         self.write_inputs(link, run).await?;
                         let _turn = sending.lock().await;
                         self.known_warm(run, machine, link).await?;
-                        link.run(id, 0, Some(spec()?)).await?
+                        let spec = spec(self.access(run, machine).await?)?;
+                        link.run(id, 0, Some(spec)).await?
                     }
                     attached => attached?,
                 }
@@ -768,9 +793,15 @@ impl Calcifer {
         Ok(())
     }
 
-    /// The spec as the machine is sent it: the run's Hub origin, unless the spec names one.
-    fn finish_spec(&self, run: &RunRow, spec: &mut v1::RunSpec) {
-        if spec.hub.is_none() && !run.hub.is_empty() {
+    /// The spec as the machine is sent it: the Hub access and model-source tokens minted for
+    /// this send, else the run's Hub origin unless the spec names one; a warm set merged.
+    fn finish_spec(&self, run: &RunRow, spec: &mut v1::RunSpec, access: access::Access) {
+        if access.providers.is_some() {
+            spec.providers = access.providers;
+        }
+        if access.hub.is_some() {
+            spec.hub = access.hub;
+        } else if spec.hub.is_none() && !run.hub.is_empty() {
             spec.hub = Some(v1::HubAccess {
                 origin: run.hub.clone(),
                 ..Default::default()

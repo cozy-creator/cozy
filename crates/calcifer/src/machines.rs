@@ -56,6 +56,8 @@ pub struct Machines {
     pub(crate) calcifer: Arc<Calcifer>,
     pub(crate) home: Home,
     pub(crate) hubs: Hubs,
+    /// Model-source tokens every run carries (`ProviderAccess`), from the config.
+    pub(crate) providers: Option<v1::ProviderAccess>,
     pub(crate) seen: Mutex<HashMap<String, Seen>>,
     watching: Mutex<HashMap<String, (Endpoint, AbortHandle)>>,
     /// Rentals whose boot is followed, by rental id.
@@ -78,12 +80,22 @@ pub(crate) struct Seen {
 
 impl Machines {
     /// Watches every machine Calcifer holds, follows booting rentals, asks again what it asked
-    /// a Hub and was not answered, and places unplaced runs. `hubs` are the Hubs the config
-    /// names; a rental's own Hub is always read.
-    pub fn start(calcifer: Arc<Calcifer>, home: Home, hubs: Vec<config::Hub>) -> Arc<Self> {
+    /// a Hub and was not answered, and places unplaced runs. The config names the Hubs listed
+    /// (a rental's own Hub is always read) and the model-source tokens runs carry.
+    pub fn start(calcifer: Arc<Calcifer>, home: Home, config: &config::Config) -> Arc<Self> {
+        let token = |secret: &Option<config::Secret>| {
+            secret
+                .as_ref()
+                .map(|s| s.expose().to_owned())
+                .unwrap_or_default()
+        };
+        let providers = v1::ProviderAccess {
+            huggingface: token(&config.huggingface_token),
+            civitai: token(&config.civitai_token),
+        };
         let me = Arc::new(Self {
-            calcifer,
-            hubs: Hubs::new(&home, hubs),
+            hubs: Hubs::new(&home, config.hubs()),
+            providers: (providers != v1::ProviderAccess::default()).then_some(providers),
             home,
             seen: Mutex::default(),
             watching: Mutex::default(),
@@ -91,7 +103,9 @@ impl Machines {
             renting: Mutex::default(),
             placing: Notify::new(),
             tasks: Mutex::default(),
+            calcifer,
         });
+        me.calcifer.serve_with(&me);
         match me.store().machines() {
             Ok(rows) => {
                 for row in rows.iter().filter(|r| r.state != MachineState::Ended) {
@@ -196,7 +210,8 @@ impl Machines {
                 format!("{address}: {e}"),
             )
         };
-        let leaf = link::presented_leaf(address).await.map_err(unreachable)?;
+        let leaf: [u8; 32] =
+            Sha256::digest(link::presented_leaf(address).await.map_err(unreachable)?).into();
         if &leaf != fingerprint.bytes() {
             return Err(Error::new(
                 Kind::Credential,
