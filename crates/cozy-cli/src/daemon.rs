@@ -9,7 +9,7 @@ use std::{
 
 use clap::ValueEnum;
 use cozy_proto::{
-    calcifer::Holder,
+    calcifer::{Holder, MachineState},
     error::{Error, Kind},
 };
 use serde_json::json;
@@ -78,7 +78,7 @@ pub(crate) async fn restart(ctx: &Context, program: &Path) -> Result<bool, Error
 #[derive(clap::Args, Debug)]
 pub struct Status {}
 
-/// Calcifer and the runs not yet settled. Never starts Calcifer.
+/// Calcifer, its machines and the runs not yet settled. Never starts Calcifer.
 pub async fn status(ctx: &Context, _args: Status) -> Result<ExitCode, Error> {
     let Some(client) = Client::running(ctx).await? else {
         if ctx.json {
@@ -92,16 +92,41 @@ pub async fn status(ctx: &Context, _args: Status) -> Result<ExitCode, Error> {
         return Ok(ExitCode::SUCCESS);
     };
     let holder = client.holder().expect("a running client has a record");
+    // Calcifer's picture: it never waits on a Hub here.
+    let mut machines = client.machines().await?.machines;
+    machines.retain(|m| m.state != MachineState::Ended);
     let mut runs = vec![];
     for status in ["queued", "in_progress"] {
         runs.extend(client.runs(&[("status", status)]).await?.runs);
     }
     runs.sort_by_key(|run| run.number);
     if ctx.json {
-        output::json(&json!({ "calcifer": running(ctx, &holder), "runs": runs }));
+        output::json(&json!({
+            "calcifer": running(ctx, &holder), "machines": machines, "runs": runs,
+        }));
         return Ok(ExitCode::SUCCESS);
     }
     calcifer_record(ctx, &holder).print(ctx);
+    if !machines.is_empty() {
+        println!();
+        let headers = ["MACHINE", "KIND", "STATE", "RUNNING", "QUEUED", "HUB"];
+        let mut table = output::Table::new(ctx, headers);
+        for m in &machines {
+            let hub = match ctx.config.resolve(&m.hub) {
+                Ok(hub) if !m.hub.is_empty() => hub.label().to_owned(),
+                _ => m.hub.clone(),
+            };
+            table = table.row([
+                m.name.clone(),
+                word(m.kind),
+                m.boot.clone().unwrap_or_else(|| word(m.state)),
+                m.running.to_string(),
+                m.queued.to_string(),
+                hub,
+            ]);
+        }
+        table.print();
+    }
     if !runs.is_empty() {
         println!();
         let mut table = output::Table::new(ctx, ["RUN", "TARGET", "MACHINE", "STATE"]);
@@ -117,6 +142,14 @@ pub async fn status(ctx: &Context, _args: Status) -> Result<ExitCode, Error> {
         table.print();
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// A wire enum as it is spelled on the wire.
+fn word(value: impl serde::Serialize) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .unwrap_or_default()
 }
 
 #[derive(clap::Args, Debug)]
