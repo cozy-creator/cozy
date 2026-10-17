@@ -309,7 +309,8 @@ fn an_update_installs_local_wheels() {
 /// `machine update --runtime-wheel/--tensorfs-wheel https://…#sha256=<hex>`: the machine fetches each
 /// wheel itself, through a redirect to another host, and nothing is written to it from here. The
 /// bytes are held to the digest: under a wrong one the update fails `wheel_digest_mismatch` naming
-/// both digests, and the machine keeps its software.
+/// both digests, and the machine keeps its software. That needs this workspace's TensorD; a released
+/// one refuses the form at submission.
 #[test]
 fn an_update_fetches_wheels_by_url_held_to_their_digests() {
     let Some(home) = Home::new() else { return };
@@ -345,6 +346,55 @@ fn an_update_fetches_wheels_by_url_held_to_their_digests() {
     let running =
         || home.json(["machine", "show", "fetching", "--json"])["status"]["runtime"].clone();
     let before = running();
+    // Plain http, or a URL without its digest, is refused before anything is sent.
+    let http = url(&runtime, &digest(&runtime)).replace("https://", "http://");
+    let bare = format!(
+        "{}/to/{}",
+        server.base,
+        runtime.file_name().unwrap().to_str().unwrap()
+    );
+    for refused in [http, bare] {
+        let out = home.cozy([
+            "machine",
+            "update",
+            "fetching",
+            "--runtime-wheel",
+            refused.as_str(),
+            "--json",
+        ]);
+        assert_eq!(
+            (out.code, out.refusal()["code"].clone()),
+            (1, "wheel_refused".into()),
+            "{out:?}"
+        );
+    }
+    // Fetching by URL needs the cohort's TensorD, this workspace's. A released TensorD (0.7.3)
+    // refuses the {url, sha256} member at submission: the run fails typed, and the machine
+    // fetches nothing, as nothing is sent from here.
+    if !tensord::workspace() {
+        let (out, last) = update(
+            url(&runtime, &digest(&runtime)).as_str(),
+            url(&tensorfs, &digest(&tensorfs)).as_str(),
+        );
+        let reason = &last["run"]["reason"];
+        assert_eq!(
+            (out.code, last["type"].as_str(), reason["code"].as_str()),
+            (1, Some("run.failed"), Some("InvalidArgument")),
+            "{out:?}"
+        );
+        let message = reason["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("an update payload is a JSON object"),
+            "{out:?}"
+        );
+        assert_eq!(
+            server.served.load(Ordering::Relaxed),
+            0,
+            "the machine fetched"
+        );
+        assert_eq!(running(), before);
+        return;
+    }
     let wrong = "ab".repeat(32);
     let (out, last) = update(
         url(&runtime, &wrong).as_str(),
@@ -380,26 +430,4 @@ fn an_update_fetches_wheels_by_url_held_to_their_digests() {
         server.served.load(Ordering::Relaxed) > 0,
         "the machine fetched the wheels"
     );
-    // Plain http, or a URL without its digest, is refused before anything is sent.
-    let http = url(&runtime, &digest(&runtime)).replace("https://", "http://");
-    let bare = format!(
-        "{}/to/{}",
-        server.base,
-        runtime.file_name().unwrap().to_str().unwrap()
-    );
-    for refused in [http, bare] {
-        let out = home.cozy([
-            "machine",
-            "update",
-            "fetching",
-            "--runtime-wheel",
-            refused.as_str(),
-            "--json",
-        ]);
-        assert_eq!(
-            (out.code, out.refusal()["code"].clone()),
-            (1, "wheel_refused".into()),
-            "{out:?}"
-        );
-    }
 }
