@@ -4,6 +4,7 @@
 //! that needs it up holds `wanted.lock` as a client would.
 mod common;
 
+#[cfg(unix)]
 use std::io::Write as _;
 
 use common::Home;
