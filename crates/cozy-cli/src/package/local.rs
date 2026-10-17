@@ -2,8 +2,8 @@
 //! by its content. A directory travels with the path dependencies its sources name, under their
 //! common directory; a PEP 723 script becomes a generated project (scripts are packages). Nothing
 //! is locked here: a project without a uv.lock is resolved on the machine. This computer's machine
-//! reads the files in place, so only the manifest travels; another receives the files too, and
-//! Calcifer writes only the bytes it lacks.
+//! reads the files in place, so only the manifest and the carried wheels travel; another receives
+//! the files too, and Calcifer writes only the bytes it lacks.
 use std::{
     collections::BTreeMap,
     fs,
@@ -34,6 +34,10 @@ struct Manifest {
     callees: BTreeMap<String, String>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     indexes: BTreeMap<String, String>,
+    /// Wheels a path source names (`{ path = "dist/x.whl" }`), carried: no index the machine
+    /// reaches serves them.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    wheels: Vec<Member>,
 }
 
 #[derive(Serialize)]
@@ -91,7 +95,10 @@ pub(crate) async fn source(ctx: &Context, path: &Path, in_place: bool) -> Result
             false => names.extend(source_files(local)?.into_iter().map(|f| local.join(f))),
         }
     }
-    let (mut files, mut inputs) = (vec![], vec![]);
+    let carried = |file: &Path| {
+        locals.iter().any(|l| l == file) && file.extension().is_some_and(|e| e == "whl")
+    };
+    let (mut files, mut wheels, mut inputs) = (vec![], vec![], vec![]);
     for file in names {
         let bytes = fs::read(&file).map_err(|e| refuse("project_unreadable", e))?;
         let digest = Digest::of(&bytes);
@@ -102,7 +109,21 @@ pub(crate) async fn source(ctx: &Context, path: &Path, in_place: bool) -> Result
             length,
             executable: executable(&file),
         });
-        if !in_place {
+        // A carried wheel is an object the machine holds, even one that reads the tree in place.
+        if carried(&file) {
+            let name = file
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            wheels.push(Member {
+                name,
+                digest: digest.to_string(),
+                length,
+                executable: false,
+            });
+        }
+        if !in_place || carried(&file) {
             inputs.push(StagedInput {
                 path: file,
                 digest,
@@ -130,6 +151,7 @@ pub(crate) async fn source(ctx: &Context, path: &Path, in_place: bool) -> Result
         },
         callees: callees(&project_dir)?,
         indexes,
+        wheels,
     };
     let document = serde_json::to_vec(&manifest).map_err(|e| refuse("local_source_invalid", e))?;
     let held = tempfile::tempdir().map_err(|e| refuse("stage_unavailable", e))?;
