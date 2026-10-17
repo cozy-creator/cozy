@@ -20,6 +20,9 @@ pub use device::{Bearer, DeviceKey, Enrollment, RunCapability, UserSession};
 pub use generated::{Client, types};
 pub use jws::{P256Key, leaf_thumbprint, thumbprint};
 pub use progenitor_client::{ByteStream, ResponseValue};
+
+/// A generated call's own error, before it is read as an [`Error`].
+pub type CallError = progenitor_client::Error<types::Error>;
 pub use run::{Ended, Op, RunToken};
 
 /// A refused or failed call. `Hub` carries the Hub's own typed refusal verbatim.

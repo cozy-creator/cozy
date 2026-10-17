@@ -6,10 +6,10 @@
 #[path = "common/hub_oauth.rs"]
 mod hub_oauth;
 
-use tensord::hub::{reason, Capability, Catalog, Leaf, Op, Source};
+use tensord::hub::{reason, Capability, Catalog, Leaf, Op, Publication, Source};
 use serde_json::json;
 use std::{sync::Arc, thread::sleep, time::Duration};
-use tensorfs_core::transport::{Ask, CredentialProvider, Publication};
+use tensorfs_core::transport::{Ask, CredentialProvider};
 
 /// A key as the machine's identity holds it: a P-256 PKCS#8 PEM.
 fn leaf() -> Arc<Leaf> {
@@ -25,20 +25,18 @@ fn publish(
     manifest: &tensorfs_core::ids::ObjectRef,
     operation: &str,
 ) -> tensorfs_core::err::Result<()> {
-    tensorfs_core::transport::publish(&Publication {
-        store,
-        hub: catalog.origin(),
-        destination: "acme/tiny",
-        manifest,
-        operation,
-        credential: catalog.credential(),
-        policy: catalog.policy(),
-        progress: &|_, _| (),
-        streams: 2,
-        stop: None,
-        commit: &|| true,
-    })
-    .map(drop)
+    catalog
+        .publish(&Publication {
+            store,
+            destination: "acme/tiny",
+            manifest,
+            operation,
+            progress: &|_, _| (),
+            streams: 2,
+            stop: None,
+            commit: &|| true,
+        })
+        .map(drop)
 }
 
 const TINY: Op = Op::Publish { model: "acme/tiny" };
@@ -127,7 +125,14 @@ fn a_run_capability_trades_once_for_exactly_what_it_names() {
     }
     let thief = Thief { key: hub_client::P256Key::generate(), token: authkit.last_token(), origin: authkit.resource.clone() };
     let finalized = hub.lock().unwrap().finalized.len();
-    let stolen = publish_with(&thief, &authkit.hub, tiny.policy(), &store, &manifest);
+    let stolen = tensorfs_core::transport::api_get(
+        &format!("{}/v1/models/acme/tiny/checkpoints/{}", authkit.hub, manifest.id()),
+        tiny.policy(),
+        &thief,
+        1 << 20,
+        tensorfs_core::transport::Deadline::after_seconds(Some(30.0)),
+        &tensorfs_core::transport::Ledger::new(),
+    );
     assert!(stolen.is_err(), "a stolen token without the key is refused");
     assert_eq!(hub.lock().unwrap().finalized.len(), finalized);
 
@@ -148,28 +153,4 @@ fn a_run_capability_trades_once_for_exactly_what_it_names() {
     assert_eq!(authkit.exchanges(), 1);
     assert_eq!(hub.lock().unwrap().finalized.len(), finalized);
     let _ = std::fs::remove_dir_all(store_root);
-}
-
-/// One publication presented by `credential`, whatever it is.
-fn publish_with(
-    credential: &dyn tensorfs_core::transport::CredentialProvider,
-    hub: &str,
-    policy: &tensorfs_core::transport::SourcePolicy,
-    store: &tensorfs_core::store::Store,
-    manifest: &tensorfs_core::ids::ObjectRef,
-) -> tensorfs_core::err::Result<()> {
-    tensorfs_core::transport::publish(&Publication {
-        store,
-        hub,
-        destination: "acme/tiny",
-        manifest,
-        operation: "op-stolen",
-        credential,
-        policy,
-        progress: &|_, _| (),
-        streams: 2,
-        stop: None,
-        commit: &|| true,
-    })
-    .map(drop)
 }
