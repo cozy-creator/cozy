@@ -310,6 +310,16 @@ fn outputs_land_in_their_packages_folder_unless_the_run_names_one() {
     );
 }
 
+/// The `--json` follow's stages (`run.progress`).
+fn stages(out: &Out) -> Vec<String> {
+    out.stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|e| e["type"] == "run.progress")
+        .filter_map(|e| e["progress"]["stage"].as_str().map(str::to_owned))
+        .collect()
+}
+
 /// The targets of the home's warm runs, oldest first.
 fn warm_targets(home: &Home, dir: &Path) -> Vec<String> {
     let listed = cozy(home, dir, &["--json", "run", "list"]);
@@ -353,13 +363,18 @@ fn unchanged_local_code_is_called_at_once_and_an_edit_only_syncs() {
         );
         let run = completed(&out);
         assert_eq!(run["result"]["text"], text, "{run}");
-        run
+        let installing: Vec<String> = stages(&out)
+            .into_iter()
+            .filter(|s| s.contains("install") || s.contains("sync"))
+            .collect();
+        (run, installing)
     };
     call("first");
     assert_eq!(warm_targets(&home, &work), ["install local/tiny"]);
 
     let began = std::time::Instant::now();
-    let run = call("again");
+    let (run, installing) = call("again");
+    assert!(installing.is_empty(), "{installing:?}");
     let started = run["accepted_at_ms"].as_i64().unwrap() - run["created_at_ms"].as_i64().unwrap();
     eprintln!(
         "unchanged resubmit: accepted {started} ms after creation, completed in {:?}",
