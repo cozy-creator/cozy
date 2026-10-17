@@ -2,7 +2,7 @@
 //! added by address. Every machine is reached through Calcifer.
 use std::{process::ExitCode, time::Duration};
 
-use clap::{Subcommand, ValueEnum};
+use clap::Subcommand;
 use cozy_proto::{
     calcifer::{Machine, NewMachine},
     error::{Error, Kind},
@@ -40,11 +40,10 @@ enum Verb {
     },
     /// Print a machine's log: its own, or the tensorfs or memory log it keeps.
     Logs {
+        /// A machine name or rental id.
         name: String,
-        log: Option<Log>,
-        /// Keep printing as it grows.
-        #[arg(short, long)]
-        follow: bool,
+        #[command(flatten)]
+        query: crate::daemon::LogQuery,
     },
     /// Rent a machine; with no SKU, list what is for rent.
     Rent(rent::Rent),
@@ -87,17 +86,11 @@ enum Verb {
     Authorize { public_key: String },
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
-pub(crate) enum Log {
-    Tensorfs,
-    Memory,
-}
-
 pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
     match args.verb {
         Verb::List { watch } => list::list(ctx, watch).await,
         Verb::Show { name } => list::show(ctx, &name).await,
-        Verb::Logs { name, log, follow } => logs(ctx, &name, log, follow).await,
+        Verb::Logs { name, query } => crate::daemon::machine_log(ctx, &name, &query).await,
         Verb::Rent(rent) => rent::exec(ctx, rent).await,
         Verb::End { name, force } => end::end(ctx, &name, force).await,
         Verb::Keepalive { name } => end::keepalive(ctx, &name).await,
@@ -180,39 +173,6 @@ async fn add(
             &format!("cozy machine show {}", added.name),
         ],
     );
-    Ok(ExitCode::SUCCESS)
-}
-
-/// A machine's log; `None` is the machine's own (`cozy logs machine` is this computer's).
-pub(crate) async fn logs(
-    ctx: &Context,
-    name: &str,
-    log: Option<Log>,
-    follow: bool,
-) -> Result<ExitCode, Error> {
-    // A machine serves its own log, and follows a log, once TensorD is inside the binary.
-    let log = match (log, follow) {
-        (None, _) => {
-            return Err(crate::not_ported(
-                "machine logs <name> (the machine's own log)",
-            ));
-        }
-        (Some(_), true) => return Err(crate::not_ported("machine logs --follow")),
-        (Some(Log::Tensorfs), false) => "tensorfs",
-        (Some(Log::Memory), false) => "memory",
-    };
-    let text = ctx
-        .calcifer()
-        .await?
-        .text(&format!("{}/logs/{log}", route(name)?))
-        .await?;
-    if ctx.json {
-        output::json(&serde_json::json!({"machine": name, "log": log, "text": text}));
-    } else if text.is_empty() {
-        output::say(ctx, &format!("{name} has logged nothing in its {log} log"));
-    } else {
-        print!("{text}");
-    }
     Ok(ExitCode::SUCCESS)
 }
 

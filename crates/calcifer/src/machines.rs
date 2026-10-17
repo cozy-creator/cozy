@@ -341,11 +341,21 @@ impl Machines {
     /// The last `tail` bytes (0: all) of a log the machine keeps; empty when it keeps none.
     pub async fn logs(&self, text: &str, log: MachineLog, tail: u64) -> Result<Vec<u8>, Error> {
         let (row, link) = self.linked(text)?;
-        let log = match log {
+        let name = match log {
+            MachineLog::Tensord => "tensord",
             MachineLog::Tensorfs => "tensorfs-transport",
             MachineLog::Memory => "memory",
         };
-        match link.read_log(log, tail).await {
+        match link.read_log(name, tail).await {
+            // A TensorD before its own log could be read (0.7.x) keeps none to serve.
+            Err(LinkError::NotFound) if log == MachineLog::Tensord => Err(Error::new(
+                Kind::NotFound,
+                "machine_log_unsupported",
+                format!("{}'s TensorD serves no log of its own", row.name),
+            )
+            .remedy("update its TensorD; its tensorfs and memory logs read today")
+            .next(format!("cozy machine logs {} tensorfs", row.name))
+            .next(format!("cozy machine update {}", row.name))),
             Err(LinkError::NotFound) => Ok(vec![]),
             read => read.map_err(|e| refusal(&row.name, e)),
         }
@@ -364,8 +374,15 @@ impl Machines {
             .store()
             .find_machine(text)
             .map_err(internal)?
-            .filter(|row| row.state != MachineState::Ended)
             .ok_or_else(|| not_found(text))?;
+        if row.state == MachineState::Ended {
+            return Err(Error::new(
+                Kind::Conflict,
+                "machine_ended",
+                format!("{} has ended", row.name),
+            )
+            .next("cozy machine list"));
+        }
         match self.calcifer.link(&row.name) {
             Ok(Some(link)) => Ok((row, link)),
             Ok(None) => Err(Error::new(
@@ -870,13 +887,14 @@ pub(crate) async fn logs(
 ) -> Result<Response, Refusal> {
     let Query(query) = query.map_err(|e| Refusal(usage(e.body_text())))?;
     let log = match log.as_str() {
+        "tensord" => MachineLog::Tensord,
         "tensorfs" => MachineLog::Tensorfs,
         "memory" => MachineLog::Memory,
         other => {
             return Err(Refusal(Error::new(
                 Kind::NotFound,
                 "machine_log_unknown",
-                format!("machines keep no log {other:?}: tensorfs or memory"),
+                format!("machines keep no log {other:?}: tensord, tensorfs or memory"),
             )));
         }
     };
