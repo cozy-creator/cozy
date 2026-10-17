@@ -3,7 +3,7 @@
 //! its runs to.
 use std::{
     sync::{Arc, Mutex},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use cozy_proto::{capability, ids::Digest, machine as v1};
@@ -16,8 +16,7 @@ use rustls::{
     pki_types::{CertificateDer, ServerName, UnixTime},
 };
 use sha2::{Digest as _, Sha256};
-use tokio::io::AsyncReadExt as _;
-use tokio_stream::wrappers::ReceiverStream;
+use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
 use tonic::{
     Code, Status, Streaming,
     codegen::http::Uri,
@@ -29,6 +28,10 @@ use crate::store;
 
 /// The name every machine's self-signed leaf carries.
 const SERVER_NAME: &str = "cozy-worker";
+/// The bounds of one Write call while an object uploads: small enough that a slow uplink shows
+/// progress, big enough that a fast one is not slowed by calls.
+const MIN_CHUNK: u64 = 64 << 10;
+const MAX_CHUNK: u64 = 64 << 20;
 /// A cap is checked when a call opens; an open stream outlives it.
 const CAP_SECONDS: i64 = 300;
 
@@ -259,58 +262,63 @@ impl Link {
         Ok(asked.map_err(classify)?.into_inner().held)
     }
 
+    /// Uploads one object from `file` in successive calls, each continuing from what the machine
+    /// holds and sized to about a second at the rate measured so far. `progress` hears the bytes
+    /// the machine holds, with the rate, before the first call and after each; an object it
+    /// already holds is not written and `progress` hears nothing.
     pub async fn write(
         &self,
         digest: &Digest,
         length: u64,
         mut file: tokio::fs::File,
+        mut progress: impl FnMut(u64, Option<f64>),
     ) -> Result<(), LinkError> {
-        let held = self.held(digest, length).await?;
+        let mut held = self.held(digest, length).await?;
         if held >= length {
             return Ok(());
         }
-        let (frames, receiver) = tokio::sync::mpsc::channel(4);
-        let name = digest.to_string();
-        let reader = tokio::spawn(async move {
-            use tokio::io::AsyncSeekExt as _;
-            file.seek(std::io::SeekFrom::Start(held)).await?;
-            let mut offset = held;
-            loop {
-                let mut data = vec![0; 1 << 20];
-                let read = file.read(&mut data).await?;
-                if read == 0 {
-                    return Ok::<_, std::io::Error>(());
-                }
-                data.truncate(read);
-                let frame = v1::WriteFrame {
-                    digest: name.clone(),
-                    length,
-                    offset,
-                    data,
-                };
-                if frames.send(frame).await.is_err() {
-                    return Ok(());
-                }
-                offset += read as u64;
-            }
-        });
-        let written = self
-            .client
-            .clone()
-            .write(self.request(ReceiverStream::new(receiver)))
-            .await;
-        if let Ok(Err(e)) = reader.await {
-            return Err(LinkError::Refused {
+        progress(held, None);
+        let (from, started, mut chunk) = (held, Instant::now(), MIN_CHUNK);
+        while held < length {
+            let size = chunk.min(length - held) as usize;
+            let mut bytes = vec![0; size];
+            let read = async {
+                file.seek(std::io::SeekFrom::Start(held)).await?;
+                file.read_exact(&mut bytes).await
+            };
+            read.await.map_err(|e| LinkError::Refused {
                 code: "input_unreadable".into(),
                 message: e.to_string(),
-            });
+            })?;
+            let frames: Vec<_> = bytes
+                .chunks(1 << 20)
+                .scan(held, |offset, data| {
+                    let frame = v1::WriteFrame {
+                        digest: digest.to_string(),
+                        length,
+                        offset: *offset,
+                        data: data.to_vec(),
+                    };
+                    *offset += data.len() as u64;
+                    Some(frame)
+                })
+                .collect();
+            let call = Instant::now();
+            let request = self.request(tokio_stream::iter(frames));
+            let answered = self.client.clone().write(request).await;
+            let now = answered.map_err(classify)?.into_inner().held;
+            if now <= held {
+                return Err(LinkError::Unreachable(format!(
+                    "the machine took none of {digest} past {held} of its {length} bytes"
+                )));
+            }
+            let rate = (now - held) as f64 / call.elapsed().as_secs_f64().max(1e-3);
+            chunk = (rate as u64).clamp(MIN_CHUNK, MAX_CHUNK);
+            held = now;
+            let overall = (held - from) as f64 / started.elapsed().as_secs_f64().max(1e-3);
+            progress(held, Some(overall));
         }
-        match written.map_err(classify)?.into_inner().held {
-            held if held == length => Ok(()),
-            held => Err(LinkError::Unreachable(format!(
-                "the machine holds {held} of the {length} bytes of {digest}"
-            ))),
-        }
+        Ok(())
     }
 }
 
