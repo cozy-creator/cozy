@@ -5,7 +5,7 @@
 //! ```sh
 //! sudo ip link set dev lo mtu 1500
 //! sudo tc qdisc add dev lo root handle 1: prio bands 4 priomap 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
-//! sudo tc qdisc add dev lo parent 1:4 handle 40: netem delay 200ms rate 2600kbit limit 100000
+//! sudo tc qdisc add dev lo parent 1:4 handle 40: netem delay 200ms rate 2600kbit limit 200
 //! sudo tc filter add dev lo parent 1: protocol ip prio 1 u32 match ip dport 47123 0xffff flowid 1:4
 //! sudo tc filter add dev lo parent 1: protocol ip prio 1 u32 match ip sport 47123 0xffff flowid 1:4
 //! ```
@@ -22,8 +22,9 @@ use cozy_proto::calcifer::{Event, Kind, On, SubmitRun};
 
 /// The machine's port the shaping names.
 const SHAPED: &str = "127.0.0.1:47123";
-/// How far progress may run ahead of what the link could have carried: what sits in buffers.
-const AHEAD: f64 = 1.5 * (1 << 20) as f64;
+/// How far progress may run ahead of what the link could have carried: what sits in buffers
+/// (HTTP/2's 1 MiB per stream, the socket's bounded unsent bytes, the link's own queue).
+const AHEAD: f64 = 2.0 * (1 << 20) as f64;
 
 /// `3.2 MiB` as bytes.
 fn parse(text: &str) -> f64 {
