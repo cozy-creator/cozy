@@ -305,7 +305,7 @@ async fn the_guard_chain_refuses_a_foreign_host_origin_bearer_or_missing_key() {
     );
     let unkeyed = calcifer
         .request(Method::POST, "/v1/runs")
-        .json(&submission("any", &[]));
+        .json(&submission("any", &Default::default()));
     assert_eq!(
         refusal(unkeyed).await,
         refused(StatusCode::BAD_REQUEST, "idempotency_key_required")

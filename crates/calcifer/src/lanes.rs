@@ -179,23 +179,13 @@ fn judge(flights: &mut HashMap<Id, Flight>, finished: &[f64], waits: &mut Vec<Du
     }
 }
 
-/// `[first, end)` ranges covering what `held` (sorted, merged, end-exclusive) leaves of
-/// `[0, length)`, cut into parts of `clamp(missing / lanes, MIN, MAX)` bytes.
+/// What `held` leaves of `[0, length)`, cut into parts of `clamp(missing / lanes, MIN, MAX)`
+/// bytes.
 pub(crate) fn parts(held: &[(u64, u64)], length: u64, lanes: usize) -> Vec<(u64, u64)> {
     const MIN: u64 = 1 << 20;
     const MAX: u64 = 64 << 20;
-    let mut missing = vec![];
-    let mut from = 0;
-    for &(a, b) in held {
-        if a > from {
-            missing.push((from, a.min(length)));
-        }
-        from = from.max(b);
-    }
-    if from < length {
-        missing.push((from, length));
-    }
-    let total: u64 = missing.iter().map(|(a, b)| b - a).sum();
+    let missing = cozy_proto::machine::missing(held, length);
+    let total = cozy_proto::machine::held_bytes(&missing);
     let size = (total / lanes as u64).clamp(MIN, MAX);
     missing
         .into_iter()

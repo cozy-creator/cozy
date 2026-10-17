@@ -25,16 +25,19 @@ use cozy_proto::{
     calcifer::{Event, MachineState},
     error::Kind,
     ids::{Digest, RunId},
-    machine as v1,
+    machine::{
+        self as v1,
+        client::{self, Bulk},
+    },
 };
 use ed25519_dalek::{SigningKey, pkcs8::DecodePrivateKey as _};
+use futures_util::StreamExt as _;
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 use tokio::{
     io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _},
     sync::{Notify, broadcast::error::RecvError, watch},
 };
-use tonic::{Code, Status};
 use tracing::warn;
 
 use crate::{
@@ -671,12 +674,12 @@ async fn check(path: &Path, length: u64, digest: &str) -> Result<(), String> {
     checked.await.unwrap_or_else(|e| Err(e.to_string()))
 }
 
-/// Connections that read one machine's outputs, apart from the one its runs' frames use, so a
-/// big read never holds a run's events up.
+/// Bulk lanes that read one machine's outputs, apart from the connection its runs' events use,
+/// so a big read never holds a run's events up.
 #[derive(Default)]
 struct Lanes {
-    machine: Option<(Endpoint, SigningKey)>,
-    links: Vec<Option<Link>>,
+    machine: Option<(Endpoint, Link)>,
+    bulk: Vec<Option<Bulk>>,
 }
 
 impl Lanes {
@@ -688,24 +691,21 @@ impl Lanes {
             .ok()
             .and_then(|pem| SigningKey::from_pkcs8_pem(&pem).ok())
             .ok_or_else(|| format!("cannot read the signing key {}", key.display()))?;
+        let link = Link::new(&endpoint, signer).map_err(|e| e.to_string())?;
         *self = Lanes {
-            machine: Some((endpoint, signer)),
-            links: vec![None; LANES],
+            machine: Some((endpoint, link)),
+            bulk: vec![None; LANES],
         };
         Ok(())
     }
 
-    /// Lane `i`'s connection, opened on first use and after `redial`.
-    fn link(&mut self, i: usize) -> Result<Link, String> {
-        let (endpoint, key) = self.machine.as_ref().expect("pointed at a machine");
-        if self.links[i].is_none() {
-            self.links[i] = Some(Link::new(endpoint, key.clone()).map_err(|e| e.to_string())?);
+    /// Lane `i`'s connections, opened on first use and again when `fresh`.
+    fn lane(&mut self, i: usize, fresh: bool) -> Result<Bulk, String> {
+        let (_, link) = self.machine.as_ref().expect("pointed at a machine");
+        if fresh || self.bulk[i].is_none() {
+            self.bulk[i] = Some(link.bulk().map_err(|e| e.to_string())?);
         }
-        Ok(self.links[i].clone().expect("opened"))
-    }
-
-    fn redial(&mut self, i: usize) {
-        self.links[i] = None;
+        Ok(self.bulk[i].clone().expect("opened"))
     }
 }
 
@@ -723,15 +723,12 @@ async fn fetch(
         .step_by(RANGE as usize)
         .map(|first| (first, (first + RANGE).min(length)));
     let read = lanes::transfer(ranges, LANES, |leg| {
-        if leg.fresh {
-            lanes.redial(leg.lane);
-        }
-        let link = lanes.link(leg.lane);
+        let lane = lanes.lane(leg.lane, leg.fresh);
         let (target, part) = (target.clone(), part.to_owned());
         async move {
-            let link = link.map_err(|e| Ranged::Stop(Failure::Again(e)))?;
+            let lane = lane.map_err(Ranged::Again)?;
             let range = (leg.first, leg.end, length);
-            read_range(link, target, rev, range, part, leg.at).await
+            read_range(lane, target, rev, range, part, leg.at).await
         }
     });
     match read.await {
@@ -744,20 +741,26 @@ async fn fetch(
 /// Reads `[first, end)` of an output `length` bytes long into `part`, moving `at` past each byte
 /// in place.
 async fn read_range(
-    link: Link,
+    lane: Bulk,
     target: v1::OutputTarget,
     rev: u64,
     (first, end, length): (u64, u64, u64),
     part: PathBuf,
     at: Arc<AtomicU64>,
 ) -> Result<(), Ranged<Failure>> {
-    let (head, mut frames) = (link.read(target, first, end - first, rev).await).map_err(refused)?;
-    if head.length != length {
+    let mut output = lane.get(&target, (first, end), rev).await.map_err(refused)?;
+    if output.length != length {
         let held = format!(
             "the machine holds {} bytes of revision {rev}, not {length}",
-            head.length
+            output.length
         );
         return Err(Ranged::Stop(Failure::Lost(held)));
+    }
+    if output.range.0 != first {
+        return Err(Ranged::Again(format!(
+            "the machine answered bytes from {}, not {first}",
+            output.range.0
+        )));
     }
     let unwritable = |e: std::io::Error| {
         Ranged::Stop(Failure::Again(format!(
@@ -775,10 +778,10 @@ async fn read_range(
         .map_err(unwritable)?;
     let mut done = first;
     while done < end {
-        let data = match frames.message().await {
-            Ok(Some(frame)) => frame.data,
-            Ok(None) => return Err(Ranged::Again("the machine ended the range early".into())),
-            Err(status) => return Err(refused(status)),
+        let data = match output.body.next().await {
+            Some(Ok(data)) => data,
+            Some(Err(e)) => return Err(Ranged::Again(e.to_string())),
+            None => return Err(Ranged::Again("the machine ended the range early".into())),
         };
         let data = &data[..data.len().min((end - done) as usize)];
         file.write_all(data).await.map_err(unwritable)?;
@@ -790,19 +793,17 @@ async fn read_range(
 }
 
 /// A machine's refusal of a read, as the read acts on it.
-fn refused(status: Status) -> Ranged<Failure> {
-    let message = format!("{:?}: {}", status.code(), status.message());
-    match status.code() {
-        Code::NotFound => Ranged::Stop(Failure::Lost(format!(
-            "the machine no longer holds it ({message})"
+fn refused(e: client::Error) -> Ranged<Failure> {
+    match e {
+        client::Error::Refused { status: 404, error } => Ranged::Stop(Failure::Lost(format!(
+            "the machine no longer holds it ({}: {})",
+            error.code, error.message
         ))),
-        // The machine moved past this revision: the run's frames bring the newer one.
-        Code::FailedPrecondition
-        | Code::OutOfRange
-        | Code::Unauthenticated
-        | Code::PermissionDenied
-        | Code::InvalidArgument
-        | Code::Unimplemented => Ranged::Stop(Failure::Again(message)),
-        _ => Ranged::Again(message),
+        // A moved revision (412) is not read again: the run's events bring the newer one.
+        client::Error::Refused { status, error } if status < 500 => {
+            Ranged::Stop(Failure::Again(format!("{}: {}", error.code, error.message)))
+        }
+        client::Error::NotMachineApi(message) => Ranged::Stop(Failure::Again(message)),
+        e => Ranged::Again(e.to_string()),
     }
 }

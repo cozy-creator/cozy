@@ -381,8 +381,8 @@ fn a_reconnect_replays_the_newest_picture_after_its_cursor() {
     let outcome = v1::Outcome {
         status: "succeeded".into(),
         outputs: vec![product("image", 0, 3)],
-        result: br#"{"caption":"a cat"}"#.to_vec(),
-        measurements: br#"{"stages":[]}"#.to_vec(),
+        result: v1::Json::parse(r#"{"caption":"a cat"}"#).ok(),
+        measurements: v1::Json::parse(r#"{"stages":[]}"#).ok(),
         execution_ms: 1234,
         ..Default::default()
     };

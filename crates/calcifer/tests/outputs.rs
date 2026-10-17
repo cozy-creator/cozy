@@ -29,6 +29,7 @@ use cozy_proto::{
     ids::{Digest, RunId},
     machine as v1,
 };
+use futures_util::StreamExt as _;
 use reqwest::{Client, RequestBuilder, StatusCode, header};
 use tokio::task::JoinHandle;
 
@@ -325,10 +326,10 @@ async fn on_machine(machine: &Tensord, run: &RunId, name: &str, index: u32) -> V
         index,
         member: String::new(),
     };
-    let (_, mut frames) = link.read(target, 0, 0, 0).await.unwrap();
+    let mut output = link.bulk().unwrap().get(&target, (0, 0), 0).await.unwrap();
     let mut bytes = vec![];
-    while let Some(frame) = frames.message().await.unwrap() {
-        bytes.extend(frame.data);
+    while let Some(data) = output.body.next().await {
+        bytes.extend(data.unwrap());
     }
     bytes
 }

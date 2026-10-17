@@ -39,7 +39,7 @@ use tokio::{
     sync::{Notify, broadcast, watch},
     task::JoinSet,
 };
-use tokio_stream::{Stream, StreamExt as _};
+use futures_util::{Stream, StreamExt as _};
 use tracing::warn;
 
 pub use link::{Link, LinkError};
