@@ -87,7 +87,7 @@ async fn quantizer(ctx: &Context, hub: &Hub, args: &Quantize, lane: &str, compon
     };
     let mut found = vec![];
     for (package, release) in candidates {
-        let card = crate::run::card(ctx, hub, &package, release.as_deref()).await?;
+        let card = crate::run::resolve(ctx, hub, &package, release.as_deref()).await?.card;
         for callable in quantizers(&card.interface, lane, components) {
             found.push((package.clone(), card.release.clone(), callable.name.clone()));
         }

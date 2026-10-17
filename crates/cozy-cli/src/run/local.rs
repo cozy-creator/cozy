@@ -51,7 +51,7 @@ pub async fn run(
         (Some(function), _) => function,
         (None, [only]) if script => (*only).to_owned(),
         (None, _) => {
-            super::functions_of(ctx, &local.package, "local", &installed.interface);
+            super::functions_of(ctx, &local.package, "local", None, &installed.interface);
             return Ok(ExitCode::SUCCESS);
         }
     };
