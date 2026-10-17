@@ -5,12 +5,14 @@
 mod doc;
 mod dtype;
 mod json;
+mod value;
 
 pub use doc::{
     Body, Component, Encoding, Header, Location, Manifest, Metadata, ObjectRef, Part, Release,
     Repo, Span, Tensor,
 };
 pub use dtype::Dtype;
+pub use value::Value;
 
 pub const HEADER_FORMAT: &str = "cozytensors/2";
 pub const MANIFEST_FORMAT: &str = "tensorfs.manifest/2";
@@ -52,4 +54,22 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 pub(crate) fn invalid<T>(detail: impl Into<String>) -> Result<T> {
     Err(Error::Invalid(detail.into()))
+}
+
+/// `<name>/<major>` or `<name>/<major>.<minor>`: a reader takes any minor of its major.
+pub(crate) fn check_format(found: &str, expected: &'static str) -> Result<()> {
+    let ok = found.strip_prefix(expected).is_some_and(|rest| {
+        rest.is_empty()
+            || rest
+                .strip_prefix('.')
+                .is_some_and(|m| !m.is_empty() && m.bytes().all(|c| c.is_ascii_digit()))
+    });
+    if ok {
+        Ok(())
+    } else {
+        Err(Error::Format {
+            found: found.into(),
+            expected,
+        })
+    }
 }

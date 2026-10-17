@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use serde_json::json;
 use tensorfs_core::format::{
     Body, Component, Dtype, Encoding, Header, Location, Manifest, ObjectRef, Part, Release, Repo,
-    Tensor, HEADER_PATH,
+    Tensor, Value, HEADER_PATH,
 };
 
 fn header() -> Header {
@@ -32,7 +32,7 @@ fn header() -> Header {
         body: Body::Encoded {
             encoding: Encoding {
                 scheme: "fp8-rowwise".into(),
-                params: [("axis".into(), json!(0))].into(),
+                params: [("axis".into(), Value::from(0u64))].into(),
             },
             parts: BTreeMap::from([
                 (
@@ -47,7 +47,17 @@ fn header() -> Header {
     Header {
         chunks,
         components: BTreeMap::from([("unet".into(), Component { tensors })]),
-        metadata: [("prompt".into(), json!({"rows": ["a cat"], "n": 1}))].into(),
+        metadata: [(
+            "prompt".into(),
+            Value::Map(
+                [
+                    ("rows".into(), Value::List(vec!["a cat".into()])),
+                    ("n".into(), 1u64.into()),
+                ]
+                .into(),
+            ),
+        )]
+        .into(),
     }
 }
 
@@ -64,6 +74,16 @@ fn writer_is_deterministic_and_reader_round_trips() {
         .contains(r#""format":"cozytensors/2","metadata":{"prompt":{"n":1,"rows":["a cat"]}}}"#));
     assert!(!text.contains(' ') || text.contains("a cat") && text.matches(' ').count() == 1);
     assert_eq!(Header::from_json(&bytes).unwrap(), h);
+
+    let mut wide = h.clone();
+    wide.metadata.insert("max".into(), Value::from(u64::MAX));
+    wide.metadata.insert("min".into(), Value::from(i64::MIN));
+    wide.metadata.insert("none".into(), Value::Null);
+    let wb = wide.to_json().unwrap();
+    assert!(std::str::from_utf8(&wb)
+        .unwrap()
+        .contains(r#""max":18446744073709551615,"min":-9223372036854775808,"none":null"#));
+    assert_eq!(Header::from_json(&wb).unwrap(), wide);
 
     let m = Manifest {
         files: BTreeMap::from([(HEADER_PATH.into(), ObjectRef::of(&bytes))]),

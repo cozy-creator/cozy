@@ -11,7 +11,7 @@ use serde::de::{DeserializeOwned, DeserializeSeed, Deserializer, MapAccess, SeqA
 use serde::Serialize;
 use serde_json::Value;
 
-use super::{invalid, Error, Result};
+use super::{check_format, invalid, Error, Result};
 
 /// Parse a document whose `format` tag must be `expected` (any minor).
 pub(crate) fn read<T: DeserializeOwned>(bytes: &[u8], expected: &'static str) -> Result<T> {
@@ -24,24 +24,6 @@ pub(crate) fn read<T: DeserializeOwned>(bytes: &[u8], expected: &'static str) ->
         None => return invalid(format!("no `format` tag (want {expected})")),
     }
     serde_json::from_slice(bytes).map_err(bad)
-}
-
-/// `<name>/<major>` or `<name>/<major>.<minor>`: a reader takes any minor of its major.
-pub(crate) fn check_format(found: &str, expected: &'static str) -> Result<()> {
-    let ok = found.strip_prefix(expected).is_some_and(|rest| {
-        rest.is_empty()
-            || rest
-                .strip_prefix('.')
-                .is_some_and(|m| !m.is_empty() && m.bytes().all(|c| c.is_ascii_digit()))
-    });
-    if ok {
-        Ok(())
-    } else {
-        Err(Error::Format {
-            found: found.into(),
-            expected,
-        })
-    }
 }
 
 pub(crate) fn write<T: Serialize>(doc: &T) -> Result<Vec<u8>> {

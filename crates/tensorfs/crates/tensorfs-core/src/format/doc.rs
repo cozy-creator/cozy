@@ -4,15 +4,14 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use super::json::{self, check_format};
 use super::{
-    invalid, Dtype, Error, Result, HEADER_FORMAT, HEADER_PATH, MANIFEST_FORMAT, REPO_FORMAT,
+    check_format, invalid, json, Dtype, Error, Result, Value, HEADER_FORMAT, HEADER_PATH,
+    MANIFEST_FORMAT, REPO_FORMAT,
 };
 
-/// Free-form document metadata. Values may be any JSON except non-integer numbers.
+/// Free-form metadata, and a scheme's params.
 pub type Metadata = BTreeMap<String, Value>;
 
 /// An immutable object: `{sha256, length}`, stored at `blobs/<aa>/<bb>/<sha256>`.
