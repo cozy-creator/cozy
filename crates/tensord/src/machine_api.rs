@@ -842,7 +842,9 @@ impl MachineBackend for NativeBackend {
             // A run preparing inside itself (`runs`) shows its stage and bytes as progress.
             let preparing = record.state == State::Queued
                 && record.waiting_reason.as_deref() == Some(crate::journal::PREPARING);
-            if let Some(progress) = record.progress.as_ref().filter(|_| running || preparing) {
+            // What a queued run waits for (another run's install, an executor slot) is its state.
+            let waiting = record.waiting.clone().filter(|_| record.state == State::Queued);
+            if let Some(progress) = record.progress.as_ref().filter(|_| (running || preparing) && waiting.is_none()) {
                 let payload = serde_json::from_str::<Value>(progress)
                     .ok()
                     .filter(Value::is_object)
@@ -854,7 +856,8 @@ impl MachineBackend for NativeBackend {
                 )?);
             } else {
                 // Every cursor up to the head is answered, or a waiting client would spin.
-                events.push(event(record.revision, "state", &json!({"state":self.state(&record)?.state,"completed_units":record.completed_units,"waiting_reason":record.waiting_reason}))?);
+                let waiting = waiting.or_else(|| record.waiting_reason.clone());
+                events.push(event(record.revision, "state", &json!({"state":self.state(&record)?.state,"completed_units":record.completed_units,"waiting_reason":waiting}))?);
             }
         }
         events.sort_by_key(|event| event.sequence);

@@ -1,5 +1,7 @@
-"""One output of `size` bytes, for reads that take their time."""
+"""One output of `size` bytes, for reads that take their time; a call that takes its time."""
 from __future__ import annotations
+
+import asyncio
 
 import msgspec
 
@@ -23,3 +25,19 @@ async def bulk(ctx: Context, *, payload: Size, out: Outputs) -> Written:
 
 
 app.entrypoint(bulk, accelerator=False)
+
+
+class Nap(msgspec.Struct):
+    seconds: float
+
+
+class Napped(msgspec.Struct):
+    seconds: float
+
+
+async def nap(ctx: Context, *, payload: Nap) -> Napped:
+    await asyncio.sleep(payload.seconds)
+    return Napped(payload.seconds)
+
+
+app.entrypoint(nap, accelerator=False)
