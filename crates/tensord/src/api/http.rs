@@ -36,11 +36,6 @@ impl From<Error> for Refusal {
         Self(error, None)
     }
 }
-impl From<crate::objects::Refused> for Refusal {
-    fn from(refusal: crate::objects::Refused) -> Self {
-        Self(refusal.into(), None)
-    }
-}
 impl From<crate::objects::Refused> for Error {
     fn from(refusal: crate::objects::Refused) -> Self {
         refused(refusal.code, refusal.message)
@@ -135,7 +130,7 @@ impl<B: MachineBackend> Machine<B> {
         let token = headers
             .get(header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.strip_prefix("Cozy-Cap "))
+            .and_then(|value| value.strip_prefix(capability::SCHEME))
             .ok_or_else(|| Error::credential("capability_absent", "the call carries no Cozy-Cap"))?;
         let authority = &self.identity.authority;
         let (grant, signer) = authority
