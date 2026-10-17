@@ -105,7 +105,7 @@ pub trait MachineBackend: Send + Sync + 'static {
         unsupported()
     }
     /// A log this machine keeps, by its name on the wire.
-    fn log(&self, name: &str) -> Result<crate::logs::Log, Error> {
+    fn log(&self, name: &str) -> Result<cozy_platform::tail::Log, Error> {
         Err(Error::not_found("log_not_found", format!("this machine keeps no log {name}")))
     }
     /// A complete content-addressed object this signer wrote with `Write`, verified against

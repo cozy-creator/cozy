@@ -1,5 +1,5 @@
-//! The logs a machine keeps, read as a tail or followed as they grow (`tail -F`): across a
-//! rotation and the daily roll, no line is missed or read twice.
+//! A log read as a tail or followed as it grows (`tail -F`): across a rotation and a daily roll,
+//! no line is missed or read twice. TensorD's logs and Calcifer's.
 use std::{
     fmt,
     fs::{self, File},
@@ -9,8 +9,7 @@ use std::{
     time::Duration,
 };
 
-use cozy_platform::watch::DirWatch;
-use tokio::sync::mpsc;
+use crate::{durable::FileId, watch::DirWatch};
 
 /// At most this much is read at once.
 const BATCH: usize = 64 << 10;
@@ -50,7 +49,10 @@ impl FromStr for Cursor {
     fn from_str(text: &str) -> Result<Self, String> {
         let parse = || {
             let (file, offset) = text.split_once(':')?;
-            Some(Self { file: file.parse().ok()?, offset: offset.parse().ok()? })
+            Some(Self {
+                file: file.parse().ok()?,
+                offset: offset.parse().ok()?,
+            })
         };
         parse().ok_or_else(|| format!("{text:?} is not a log cursor"))
     }
@@ -87,11 +89,17 @@ pub struct Follow {
 
 impl Log {
     pub fn rotated(dir: PathBuf, name: &'static str) -> Self {
-        Self { dir, files: Files::Rotated(name) }
+        Self {
+            dir,
+            files: Files::Rotated(name),
+        }
     }
 
     pub fn daily(dir: PathBuf, prefix: &'static str) -> Self {
-        Self { dir, files: Files::Daily(prefix) }
+        Self {
+            dir,
+            files: Files::Daily(prefix),
+        }
     }
 
     /// The whole lines from `start` to the end now.
@@ -109,11 +117,15 @@ impl Log {
     }
 
     /// Unsupported where this OS cannot watch a directory.
-    pub fn follow(self, start: Start) -> cozy_platform::Result<Follow> {
-        fs::create_dir_all(&self.dir).map_err(cozy_platform::Error::from)?;
+    pub fn follow(self, start: Start) -> crate::Result<Follow> {
+        fs::create_dir_all(&self.dir).map_err(crate::Error::from)?;
         let watch = DirWatch::new(&self.dir)?;
         let reader = self.open(start)?;
-        Ok(Follow { log: self, reader, watch })
+        Ok(Follow {
+            log: self,
+            reader,
+            watch,
+        })
     }
 
     /// Hands `send` each batch of whole lines from `reader` on; at the end of the newest file,
@@ -134,11 +146,13 @@ impl Log {
             }
             match newer {
                 Some(part) => {
-                    let Some(next) = Reader::open(&part, 0)? else { continue };
-                    if let Some(rest) = reader.rest() {
-                        if !send(rest) {
-                            return Ok(());
-                        }
+                    let Some(next) = Reader::open(&part, 0)? else {
+                        continue;
+                    };
+                    if let Some(rest) = reader.rest()
+                        && !send(rest)
+                    {
+                        return Ok(());
                     }
                     reader = next;
                 }
@@ -162,7 +176,9 @@ impl Log {
                     None => continue,
                 },
             };
-            let Some(part) = parts.get(index) else { return Ok(Reader::empty()) };
+            let Some(part) = parts.get(index) else {
+                return Ok(Reader::empty());
+            };
             if let Some(reader) = Reader::open(part, offset)? {
                 return Ok(reader);
             }
@@ -185,9 +201,17 @@ impl Log {
             Files::Rotated(name) => vec![format!("{name}.1"), name.to_owned()],
             Files::Daily(prefix) => {
                 let mut days: Vec<String> = fs::read_dir(&self.dir)
-                    .map(|dir| dir.flatten().filter_map(|e| e.file_name().into_string().ok()).collect())
+                    .map(|dir| {
+                        dir.flatten()
+                            .filter_map(|e| e.file_name().into_string().ok())
+                            .collect()
+                    })
                     .unwrap_or_default();
-                days.retain(|name| name.strip_prefix(prefix).is_some_and(|rest| rest.starts_with('.')) && name.ends_with(".log"));
+                days.retain(|name| {
+                    name.strip_prefix(prefix)
+                        .is_some_and(|rest| rest.starts_with('.'))
+                        && name.ends_with(".log")
+                });
                 days.sort();
                 days.split_off(days.len().saturating_sub(2))
             }
@@ -196,29 +220,31 @@ impl Log {
             .into_iter()
             .filter_map(|name| {
                 let path = self.dir.join(name);
-                let meta = fs::metadata(&path).ok()?;
-                Some(Part { file: identity(&meta), length: meta.len(), path })
+                let file = File::open(&path).ok()?;
+                let length = file.metadata().ok()?.len();
+                Some(Part {
+                    file: identity(&file).ok()?,
+                    length,
+                    path,
+                })
             })
             .collect()
     }
 }
 
 impl Follow {
-    /// Sends the lines from its start, then each batch as it is appended, until `lines` closes;
-    /// a failed read is the last thing sent.
-    pub fn run(mut self, lines: mpsc::Sender<io::Result<Lines>>) {
+    /// Hands `send` the lines from its start, then each batch as it is appended, until `send`
+    /// says stop or, caught up, `wanted` says nobody reads any more.
+    pub fn run(
+        mut self,
+        send: impl FnMut(Lines) -> bool,
+        wanted: impl Fn() -> bool,
+    ) -> io::Result<()> {
         let watch = &mut self.watch;
-        let read = self.log.lines(
-            self.reader,
-            |batch| lines.blocking_send(Ok(batch)).is_ok(),
-            || {
-                watch.wait(IDLE)?;
-                Ok(!lines.is_closed())
-            },
-        );
-        if let Err(e) = read {
-            let _ = lines.blocking_send(Err(e));
-        }
+        self.log.lines(self.reader, send, || {
+            watch.wait(IDLE)?;
+            Ok(wanted())
+        })
     }
 }
 
@@ -226,7 +252,9 @@ impl Follow {
 fn last(parts: &[Part], n: u64) -> io::Result<Option<(usize, u64)>> {
     let mut ends = 0;
     for (index, part) in parts.iter().enumerate().rev() {
-        let Some(mut file) = open(part)? else { return Ok(None) };
+        let Some(mut file) = open(part)? else {
+            return Ok(None);
+        };
         let mut end = part.length;
         while end > 0 {
             let from = end.saturating_sub(BATCH as u64);
@@ -253,7 +281,7 @@ fn open(part: &Part) -> io::Result<Option<File>> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
-    Ok((identity(&file.metadata()?) == part.file).then_some(file))
+    Ok((identity(&file)? == part.file).then_some(file))
 }
 
 /// One file read from a place on, handing out whole lines.
@@ -267,18 +295,32 @@ struct Reader {
 
 impl Reader {
     fn empty() -> Self {
-        Self { file: None, handle: None, at: 0, pending: vec![] }
+        Self {
+            file: None,
+            handle: None,
+            at: 0,
+            pending: vec![],
+        }
     }
 
     fn open(part: &Part, at: u64) -> io::Result<Option<Self>> {
-        let Some(mut handle) = open(part)? else { return Ok(None) };
+        let Some(mut handle) = open(part)? else {
+            return Ok(None);
+        };
         handle.seek(SeekFrom::Start(at))?;
-        Ok(Some(Self { file: Some(part.file), handle: Some(handle), at, pending: vec![] }))
+        Ok(Some(Self {
+            file: Some(part.file),
+            handle: Some(handle),
+            at,
+            pending: vec![],
+        }))
     }
 
     /// The next whole lines the file holds now.
     fn next(&mut self) -> io::Result<Option<Lines>> {
-        let (Some(handle), Some(file)) = (self.handle.as_mut(), self.file) else { return Ok(None) };
+        let (Some(handle), Some(file)) = (self.handle.as_mut(), self.file) else {
+            return Ok(None);
+        };
         loop {
             let mut chunk = vec![0; BATCH];
             let read = handle.read(&mut chunk)?;
@@ -290,7 +332,10 @@ impl Reader {
             if let Some(end) = self.pending.iter().rposition(|b| *b == b'\n') {
                 let text = String::from_utf8_lossy(&self.pending[..=end]).into_owned();
                 self.pending.drain(..=end);
-                let after = Cursor { file, offset: self.at - self.pending.len() as u64 };
+                let after = Cursor {
+                    file,
+                    offset: self.at - self.pending.len() as u64,
+                };
                 return Ok(Some(Lines { text, after }));
             }
         }
@@ -302,28 +347,31 @@ impl Reader {
         (!self.pending.is_empty()).then(|| {
             let mut text = String::from_utf8_lossy(&std::mem::take(&mut self.pending)).into_owned();
             text.push('\n');
-            Lines { text, after: Cursor { file, offset: self.at } }
+            Lines {
+                text,
+                after: Cursor {
+                    file,
+                    offset: self.at,
+                },
+            }
         })
     }
 }
 
-/// What names a file across a rename.
-#[cfg(unix)]
-fn identity(meta: &fs::Metadata) -> u64 {
-    std::os::unix::fs::MetadataExt::ino(meta)
+/// What names a file across a rename, in its directory: its inode, or on Windows its file index
+/// (not its creation time, which a file made under a just-renamed name inherits).
+fn identity(file: &File) -> io::Result<u64> {
+    Ok(FileId::of(file)?.ino)
 }
 
-#[cfg(not(unix))]
-fn identity(meta: &fs::Metadata) -> u64 {
-    meta.created()
-        .ok()
-        .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(0, |at| at.as_nanos() as u64)
-}
-
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    };
 
     /// Lines written while a follower reads, rotated twice partway, arrive once each and in order;
     /// a follow resumed from a cursor carries on with the next line.
@@ -336,33 +384,57 @@ mod tests {
             if n > 0 && n.is_multiple_of(400) {
                 fs::rename(&path, dir.path().join("transport.log.1")).unwrap();
             }
-            let mut file = fs::OpenOptions::new().create(true).append(true).open(&path).unwrap();
+            let mut file = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .unwrap();
             file.write_all(format!("line {n}\n").as_bytes()).unwrap();
         };
         write(0);
-        let (sender, mut received) = mpsc::channel(4);
-        let follow = Log::rotated(dir.path().into(), "transport.log").follow(Start::Last(0)).unwrap();
-        let reading = std::thread::spawn(move || follow.run(sender));
+        let (sender, received) = mpsc::sync_channel(4);
+        let done = Arc::new(AtomicBool::new(false));
+        let follow = Log::rotated(dir.path().into(), "transport.log")
+            .follow(Start::Last(0))
+            .unwrap();
+        let reading = {
+            let done = done.clone();
+            std::thread::spawn(move || {
+                follow.run(
+                    |lines| sender.send(lines).is_ok(),
+                    || !done.load(Ordering::Relaxed),
+                )
+            })
+        };
         (1..1000).for_each(write);
         let (mut text, mut last) = (String::new(), None);
         while text.lines().count() < 1000 {
-            let lines = received.blocking_recv().expect("the follower keeps reading").unwrap();
+            let lines = received.recv().expect("the follower keeps reading");
             text.push_str(&lines.text);
             last = Some(lines.after);
         }
         let expected: String = (0..1000).map(|n| format!("line {n}\n")).collect();
         assert_eq!(text, expected);
+        done.store(true, Ordering::Relaxed);
         drop(received);
-        reading.join().unwrap();
+        reading.join().unwrap().unwrap();
 
         // Resumed after the last line read: only what came after it.
         write(1000);
         let log = Log::rotated(dir.path().into(), "transport.log");
-        assert_eq!(log.read(Start::After(last.unwrap())).unwrap(), "line 1000\n");
+        assert_eq!(
+            log.read(Start::After(last.unwrap())).unwrap(),
+            "line 1000\n"
+        );
         assert_eq!(log.read(Start::Last(2)).unwrap(), "line 999\nline 1000\n");
         // The newest lines reach back into the rotated file; a line still being written waits.
         write(1001);
-        fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(b"line 10").unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"line 10")
+            .unwrap();
         let newest: String = (799..1002).map(|n| format!("line {n}\n")).collect();
         assert_eq!(log.read(Start::Last(203)).unwrap(), newest);
     }
