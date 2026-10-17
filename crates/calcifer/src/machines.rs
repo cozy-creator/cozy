@@ -111,6 +111,13 @@ impl Machines {
         me
     }
 
+    /// The machine's latest Status, once one has arrived.
+    pub fn frame(&self, name: &str) -> Option<v1::StatusFrame> {
+        lock(&self.seen)
+            .get(name)
+            .and_then(|seen| seen.frame.clone())
+    }
+
     /// Stops every task where it stands, as if the process ended.
     pub fn close(&self) {
         lock(&self.tasks).abort_all();
@@ -832,6 +839,7 @@ fn status(frame: &v1::StatusFrame) -> MachineStatus {
                 release: env.release.clone(),
                 hub: env.hub.clone(),
                 level: env.level.clone(),
+                warning: env.warning.clone(),
             })
             .collect(),
         warm: frame

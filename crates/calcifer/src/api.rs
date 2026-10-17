@@ -121,6 +121,7 @@ pub fn router(api: Arc<Api>) -> Router {
         .route("/v1/runs/{id}/cancel", post(cancel))
         .route("/v1/runs/{id}/events", get(events))
         .route("/v1/runs/{id}/outputs/{name}", get(crate::outputs::serve))
+        .route("/v1/runs/{id}/play", get(crate::play::play))
         .route("/v1/down", post(down))
         .route("/v1/machines", get(machines::list).post(machines::create))
         .route(

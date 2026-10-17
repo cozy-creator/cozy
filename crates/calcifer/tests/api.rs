@@ -20,7 +20,8 @@ use cozy_platform::{
     paths::Home,
 };
 use cozy_proto::{
-    calcifer::{Down, Event, Holder, Run, RunList, Status, Submitted},
+    calcifer::{Down, Event, Holder, Play, Run, RunList, Status, Submitted},
+    capability,
     config::{Config, Loaded},
     error::Envelope,
 };
@@ -628,5 +629,85 @@ async fn a_run_for_a_disabled_local_machine_or_an_unknown_one_is_refused_unrecor
         .await
         .unwrap();
     assert!(listed.runs.is_empty(), "nothing was recorded");
+    assert_eq!(calcifer.stopped().await, Stopped::Idle);
+}
+
+/// The play answer for one output of a run, as `cozy run play` asks for it.
+async fn play(calcifer: &Calcifer, run: &str, output: &str) -> reqwest::Response {
+    let path = format!("/v1/runs/{run}/play?output={output}&expires_s=60");
+    calcifer.request(Method::GET, &path).send().await.unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_play_answer_names_the_machines_player_and_a_cap_for_that_output_alone() {
+    let home = tempfile::tempdir().unwrap();
+    let key = common::key_file(home.path());
+    let machine = Tensord::start();
+    let hub = SilentHub::new();
+    add_machine(home.path(), &machine.row("m", &key));
+    let calcifer = Calcifer::start(home.path()).await;
+    let spec = common::warm_spec("http://127.0.0.1:9", vec![]);
+    let (_, unplaced) = calcifer.submit("u", submission("any", &spec)).await;
+    let unplaced = unplaced.run.id.to_string();
+    assert_eq!(
+        refusal(calcifer.request(
+            Method::GET,
+            &format!("/v1/runs/{unplaced}/play?output=video")
+        ))
+        .await,
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "machine_unavailable".to_owned()
+        )
+    );
+    let (_, submitted) = calcifer.submit("k", held("m", &hub)).await;
+    let id = submitted.run.id.to_string();
+    let mut events = calcifer.events(&id, 0).await;
+    events.until(is_status(Status::InProgress)).await;
+
+    // The machine's first Status may still be on its way.
+    let deadline = tokio::time::Instant::now() + PATIENCE;
+    let (status, body) = loop {
+        let answer = play(&calcifer, &id, "video").await;
+        let status = answer.status();
+        let body: serde_json::Value = answer.json().await.unwrap();
+        if body["error"]["code"] != "machine_unavailable" {
+            break (status, body);
+        }
+        assert!(tokio::time::Instant::now() < deadline, "no Status came");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    if status == StatusCode::OK {
+        let answer: Play = serde_json::from_value(body).unwrap();
+        assert!(
+            answer.address.parse::<std::net::SocketAddr>().is_ok(),
+            "{answer:?}"
+        );
+        assert_eq!(answer.fingerprint.len(), 64);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let keys = [common::key().verifying_key()];
+        let (grant, _) = capability::verify(&answer.token, common::WORKER, &keys, now, "").unwrap();
+        assert!(grant.allows(&id, "video", None));
+        assert!(!grant.allows(&id, "image", None), "that output alone");
+        assert!((now + 55..=now + 61).contains(&grant.expires));
+    } else {
+        // TensorD's `serve --machine-config` (this harness) opens no player listener, so its
+        // Status names none: the machine's own word is refused as such.
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"]["code"], "webrtc_unavailable", "{body}");
+        assert_eq!(body["error"]["message"], "m does not listen for players");
+    }
+
+    calcifer.cancel(&id).await;
+    events.rest().await;
+    assert_eq!(
+        refusal(calcifer.request(Method::GET, &format!("/v1/runs/{id}/play?output=video"))).await,
+        (StatusCode::NOT_FOUND, "output_not_found".to_owned()),
+        "an ended run made no video"
+    );
+    calcifer.cancel(&unplaced).await;
     assert_eq!(calcifer.stopped().await, Stopped::Idle);
 }

@@ -11,6 +11,7 @@ pub mod api;
 pub mod link;
 pub mod machines;
 pub mod outputs;
+pub mod play;
 mod rentals;
 pub mod serve;
 pub mod store;
