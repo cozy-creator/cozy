@@ -747,6 +747,7 @@ impl Machines {
         Ok(Ended {
             machine: self.picture(&row)?,
             changed: true,
+            abandoned: vec![],
         })
     }
 
@@ -762,6 +763,7 @@ impl Machines {
         Ok(Ended {
             machine,
             changed: true,
+            abandoned: vec![],
         })
     }
 

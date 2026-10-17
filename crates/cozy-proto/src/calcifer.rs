@@ -614,11 +614,15 @@ pub struct Quote {
     pub expected_total_usd_micros: i64,
 }
 
-/// `DELETE /v1/machines/{name}`: `changed` is false when it had ended already.
+/// `DELETE /v1/machines/{name}[?force=true]`: `changed` is false when it had ended already. While
+/// its runs' outputs have not landed it is refused `outputs_exporting`, unless `force`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Ended {
     pub machine: Machine,
     pub changed: bool,
+    /// Outputs of its runs that had not landed when `force` ended it, given up: `run 12 big`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub abandoned: Vec<String>,
 }
 
 /// `GET /v1/runs/{id}/play?output=<name[/i]>&expires_s=N`: how a browser plays one run output

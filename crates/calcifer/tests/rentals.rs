@@ -141,7 +141,7 @@ async fn a_hub_is_listed_signed_in_and_a_rent_it_will_not_price_records_nothing(
     );
     assert!(calcifer.store().machines().unwrap().is_empty());
     assert_eq!(
-        machines.end("kiyui").await.unwrap_err().code,
+        machines.end("kiyui", false).await.unwrap_err().code,
         "machine_not_found"
     );
     machines.close();

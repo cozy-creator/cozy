@@ -279,8 +279,9 @@ impl Machines {
     }
 
     /// Ends a rental at its Hub (`ending` until the Hub affirms it), or removes an added machine
-    /// from this controller. `local` is disabled, never ended.
-    pub async fn end(self: &Arc<Self>, text: &str) -> Result<Ended, Error> {
+    /// from this controller. `local` is disabled, never ended. While outputs of its runs have not
+    /// landed it is refused `outputs_exporting`; `force` ends it anyway and names them given up.
+    pub async fn end(self: &Arc<Self>, text: &str, force: bool) -> Result<Ended, Error> {
         let Some(row) = self.store().find_machine(text).map_err(internal)? else {
             return self.end_other(text).await;
         };
@@ -288,24 +289,34 @@ impl Machines {
             return Ok(Ended {
                 machine: self.picture(&row)?,
                 changed: false,
+                abandoned: vec![],
             });
         }
-        match row.kind {
-            MachineKind::Local => Err(Error::new(
+        if row.kind == MachineKind::Local {
+            return Err(Error::new(
                 Kind::Conflict,
                 "machine_local",
                 "local is this computer's machine: it is disabled, not ended",
             )
-            .next("cozy machine disable")),
-            MachineKind::Added => {
+            .next("cozy machine disable"));
+        }
+        let owed = self.calcifer.owed_on(&row.name).map_err(internal)?;
+        if !owed.is_empty() && !force {
+            return Err(exporting(&row.name, &owed));
+        }
+        let mut ended = match row.kind {
+            MachineKind::Rental => self.end_rental(row).await?,
+            _ => {
                 self.ended(&row.name, "removed from this controller");
-                Ok(Ended {
+                Ended {
                     machine: self.picture(&self.row(&row.name)?)?,
                     changed: true,
-                })
+                    abandoned: vec![],
+                }
             }
-            MachineKind::Rental => self.end_rental(row).await,
-        }
+        };
+        ended.abandoned = owed.iter().map(ToString::to_string).collect();
+        Ok(ended)
     }
 
     /// Starts a rental's 15-minute idle clock over, once the machine acknowledges it.
@@ -710,11 +721,23 @@ pub(crate) async fn create(
 }
 
 /// 202 while its Hub has not affirmed the end, 200 once it is over.
+#[derive(Deserialize)]
+pub(crate) struct Force {
+    #[serde(default)]
+    force: bool,
+}
+
 pub(crate) async fn end(
     State(api): State<Arc<Api>>,
     UrlPath(name): UrlPath<String>,
+    query: Result<Query<Force>, QueryRejection>,
 ) -> Result<(StatusCode, Json<Ended>), Refusal> {
-    let ended = api.machines.end(&name).await.map_err(Refusal)?;
+    let Query(query) = query.map_err(|e| Refusal(usage(e.body_text())))?;
+    let ended = api
+        .machines
+        .end(&name, query.force)
+        .await
+        .map_err(Refusal)?;
     let status = match ended.machine.state {
         MachineState::Ending => StatusCode::ACCEPTED,
         _ => StatusCode::OK,
@@ -1026,6 +1049,28 @@ pub(crate) fn not_found(text: &str) -> Error {
         format!("no machine is named {text:?}"),
     )
     .next("cozy machine list")
+}
+
+/// The refusal to end `name` while outputs of its runs have not landed.
+fn exporting(name: &str, owed: &[crate::outputs::Owed]) -> Error {
+    let (moved, length) = (owed.iter()).fold((0, 0), |(m, l), o| (m + o.moved, l + o.length));
+    let outputs = match owed.len() {
+        1 => "1 output".to_owned(),
+        n => format!("{n} outputs"),
+    };
+    Error::new(
+        Kind::Conflict,
+        "outputs_exporting",
+        format!(
+            "{outputs} of its runs have not landed on this computer yet: {} of {} in place",
+            crate::bytes(moved as f64),
+            crate::bytes(length as f64)
+        ),
+    )
+    .remedy(format!(
+        "{name} ends once they land; ending it now loses them"
+    ))
+    .next(format!("cozy machine end {name} --force"))
 }
 
 pub(crate) fn internal(e: impl ToString) -> Error {
