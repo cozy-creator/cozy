@@ -270,3 +270,42 @@ fn a_followed_run_returns_only_once_its_outputs_landed() {
         "landed {landed} before completing {last}"
     );
 }
+
+/// A run that names no directory puts its outputs in its package's folder, as the Go CLI did
+/// (`outputs/<org>-<name>/`, here a script's `local-cozy-script-<hex>`); `--out` names another.
+#[test]
+fn outputs_land_in_their_packages_folder_unless_the_run_names_one() {
+    let Some(home) = Home::new() else { return };
+    if std::env::var_os("COZY_TEST_TENSORD").is_none() {
+        eprintln!("skipped: no TensorD (COZY_TEST_TENSORD is unset)");
+        return;
+    }
+    let _machine = common::tensord::added(&home, "m1");
+    let work = home.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let script = SCRIPT.replace(
+        "def main() -> str:\n    return \"hello from a script\"",
+        "from cozy_runtime.author import FileAsset, Outputs\n\n\
+         def main(*, out: Outputs) -> FileAsset:\n    \
+         return out.save_bytes(b\"a small file\", media_type=\"text/plain\")",
+    );
+    std::fs::write(work.join("small.py"), script).unwrap();
+    let landed = |args: &[&str]| -> std::path::PathBuf {
+        let run = completed(&cozy(&home, &work, args));
+        let path = run["output"][0]["path"].as_str().expect("a landed path");
+        assert_eq!(std::fs::read(path).unwrap(), b"a small file");
+        Path::new(path).parent().unwrap().to_owned()
+    };
+    let folder = landed(&["--json", "run", "small.py", "--on", "m1"]);
+    let name = folder.file_name().unwrap().to_str().unwrap().to_owned();
+    assert_eq!(folder.parent().unwrap(), home.root().join("outputs"));
+    assert!(
+        name.starts_with("local-cozy-script-") && name.len() == "local-cozy-script-".len() + 24,
+        "{}",
+        folder.display()
+    );
+    assert_eq!(
+        landed(&["--json", "run", "small.py", "--on", "m1", "--out", "mine"]),
+        work.join("mine")
+    );
+}

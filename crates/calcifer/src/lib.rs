@@ -124,8 +124,8 @@ impl From<StoreError> for Stop {
 }
 
 impl Calcifer {
-    /// Opens Calcifer's home (`~/.cozy/calcifer`) and resumes every run it owes. `outputs` is
-    /// where a run's outputs land unless it names its own.
+    /// Opens Calcifer's home (`~/.cozy/calcifer`) and resumes every run it owes. `outputs` holds
+    /// each package's folder, where a run's outputs land unless it names its own directory.
     pub fn open(home: &Path, outputs: &Path) -> Result<Arc<Self>, Error> {
         let store = Store::open(&home.join("state.db"))?;
         let inputs = home.join("inputs");
@@ -229,6 +229,10 @@ impl Calcifer {
             On::Machine(name) => (Some(name.clone()), true, None),
             on => (None, false, Some(on.to_string())),
         };
+        let out_dir = match submit.out {
+            Some(dir) => dir,
+            None => outputs::package_outputs(&self.outputs, &submit.target),
+        };
         let new = NewRun {
             id: RunId::mint(random()),
             kind: submit.kind,
@@ -237,7 +241,7 @@ impl Calcifer {
             machine,
             pinned,
             spec: submit.spec,
-            out_dir: submit.out.unwrap_or_else(|| self.outputs.clone()),
+            out_dir,
             warnings: submit.warnings,
             inputs: vec![],
             wants,
