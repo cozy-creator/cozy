@@ -710,22 +710,35 @@ impl MachineBackend for NativeBackend {
             .with_journal(|journal| journal.warm_sets())
             .map_err(problem)?;
         let holds = self.service.gpu().map(|gpu| gpu.members(&actor));
-        let mut items = vec![];
+        let mut items: Vec<v1::WarmItem> = vec![];
         fn corrupt<E>(_: E) -> Error {
             Error::internal("custody_corrupt", "kept warm set corrupt")
         }
+        // An item an orchestrator's callees joined is several members in a row: one item, at
+        // its lowest member's level.
+        let mut last: Option<(String, Level)> = None;
         for (position, (_, record)) in kept.iter().filter(|(of, _)| *of == actor).enumerate() {
             let kept: KeptMember = serde_json::from_str(record).map_err(corrupt)?;
-            let sent = STANDARD.decode(&kept.item).map_err(corrupt)?;
-            // A member kept before the cohort (protobuf) is not reported; the next set replaces it.
-            let Ok(mut item) = serde_json::from_slice::<v1::WarmItem>(&sent) else { continue };
             // Before the pool has taken the set up (a restart in progress) it holds its code.
             let (level, held_back) = match &holds {
                 Some(holds) => holds.get(position).copied().unwrap_or((Level::Installed, "")),
                 None => without_gpus(Level::named(&kept.level).ok_or_else(|| corrupt(()))?),
             };
+            if let (Some((sent, lowest)), Some(item)) = (&mut last, items.last_mut()) {
+                if *sent == kept.item {
+                    if level < *lowest {
+                        *lowest = level;
+                        (item.holds, item.held_back) = (level.name().into(), held_back.into());
+                    }
+                    continue;
+                }
+            }
+            let sent = STANDARD.decode(&kept.item).map_err(corrupt)?;
+            // A member kept before the cohort (protobuf) is not reported; the next set replaces it.
+            let Ok(mut item) = serde_json::from_slice::<v1::WarmItem>(&sent) else { continue };
             (item.holds, item.held_back) = (level.name().into(), held_back.into());
             items.push(item);
+            last = Some((kept.item, level));
         }
         Ok(items)
     }

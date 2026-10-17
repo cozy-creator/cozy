@@ -140,6 +140,24 @@ fn addressed(parameter: &str, package: &str, interface: &Value) -> Option<String
         .then(|| path.to_string())
 }
 
+/// `installation`'s internal functions that construct a model: what a function loading none
+/// itself calls.
+fn internal_models(installation: &Installation) -> Result<Vec<String>, Refused> {
+    let interface: Value = serde_json::from_slice(&installation.interface)
+        .map_err(|_| refused("package_interface_invalid", "held interface is corrupt"))?;
+    let constructs = |entry: &Value| {
+        let models = entry["models"].as_array().into_iter().flatten();
+        models.into_iter().any(crate::gpu_service::constructed)
+    };
+    Ok(interface["entrypoints"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|entry| entry["internal"].as_bool() == Some(true) && constructs(entry))
+        .filter_map(|entry| entry["name"].as_str().map(str::to_owned))
+        .collect())
+}
+
 /// Whether `installation` declares a public entrypoint `name` for a warm set.
 fn declares(installation: &Installation, name: &str) -> Result<bool, Refused> {
     let interface: Value = serde_json::from_slice(&installation.interface)
@@ -756,21 +774,46 @@ impl Runs {
                     format!("{} declares no entrypoint {:?}", installation.package, item.entrypoint),
                 ));
             }
-            kept.push(serde_json::to_string(&KeptMember {
-                installation: installation.alias.clone(),
-                level: item.level.name().into(),
-                preparation: plan.as_ref().map(|plan| plan.id.clone()).unwrap_or_default(),
-                item: STANDARD.encode(&item.sent),
-            })
-            .map_err(io::Error::other)?);
-            rows.push(json!({"package": installation.package, "release": installation.release,
-                "entrypoint": item.entrypoint}));
-            let held = self.service.catalog.resolve(&installation.generation)?;
-            // A member's weights come under the warm run's access, after every run's.
-            let fetch = self.publisher.as_ref().zip(plan.as_ref()).map(|(publisher, plan)| {
-                crate::access::Fetch::new(publisher.store().clone(), hub.clone(), plan.manifests(), u64::MAX)
-            });
-            members.push(Member::new(held, plan, item.level, fetch));
+            // A function that loads no model itself (an orchestrator) runs on the ones it calls.
+            // The interface names no call graph, and internal functions exist only to be called:
+            // it brings its package's internal functions' models, each a member of its own.
+            let mut plans = vec![plan];
+            if item.level > Level::Installed && plans[0].is_none() {
+                for callee in internal_models(&installation)? {
+                    let own: Vec<_> = item.models.iter().filter(|c| own_choice(c, &callee)).cloned().collect();
+                    let report = observe.clone();
+                    let (_, plan, _) = self.resolve(
+                        actor,
+                        Some(installation.clone()),
+                        None,
+                        hub.clone(),
+                        spec,
+                        &callee,
+                        &own,
+                        item.bits,
+                        Some(Box::new(move |stage: &str, done: u64, total: u64| report(stage, done, total))),
+                        Some(&stoppable.stop),
+                    )?;
+                    plans.push(plan);
+                }
+            }
+            rows.push((json!({"package": installation.package, "release": installation.release,
+                "entrypoint": item.entrypoint}), plans.len()));
+            for plan in plans {
+                kept.push(serde_json::to_string(&KeptMember {
+                    installation: installation.alias.clone(),
+                    level: item.level.name().into(),
+                    preparation: plan.as_ref().map(|plan| plan.id.clone()).unwrap_or_default(),
+                    item: STANDARD.encode(&item.sent),
+                })
+                .map_err(io::Error::other)?);
+                let held = self.service.catalog.resolve(&installation.generation)?;
+                // A member's weights come under the warm run's access, after every run's.
+                let fetch = self.publisher.as_ref().zip(plan.as_ref()).map(|(publisher, plan)| {
+                    crate::access::Fetch::new(publisher.store().clone(), hub.clone(), plan.manifests(), u64::MAX)
+                });
+                members.push(Member::new(held, plan, item.level, fetch));
+            }
         }
         self.service
             .engine
@@ -784,12 +827,21 @@ impl Runs {
             }
             None => members.iter().map(|member| without_gpus(member.level)).collect(),
         };
-        for (row, (level, held_back)) in rows.iter_mut().zip(holds) {
-            row["level"] = level.name().into();
-            if !held_back.is_empty() {
-                row["held_back"] = held_back.into();
-            }
-        }
+        // An item's level is its lowest member's, and why that one is held back.
+        let mut holds = holds.into_iter();
+        let rows: Vec<Value> = rows
+            .into_iter()
+            .map(|(mut row, count)| {
+                let lowest = holds.by_ref().take(count).min_by_key(|(level, _)| *level);
+                if let Some((level, held_back)) = lowest {
+                    row["level"] = level.name().into();
+                    if !held_back.is_empty() {
+                        row["held_back"] = held_back.into();
+                    }
+                }
+                row
+            })
+            .collect();
         Ok(Some(ResultRecord {
             value: json!({"set": rows}),
             artifacts: vec![],
@@ -1257,6 +1309,37 @@ mod tests {
             catalog_revision: String::new(),
             application: String::new(),
             digest: digest.into(),
+        }
+    }
+
+    /// The 4090 bench: `cozy run …/ref2va_turbo --warm=downloaded` downloaded nothing, since that
+    /// function loads no model itself; the internal ones it calls do. Warming it now brings their
+    /// models onto the machine's disk, and its warm set still shows the one function asked for.
+    #[test]
+    fn warming_a_function_that_loads_no_model_downloads_its_internal_functions_models() {
+        let entrypoints = json!([
+            {"name": "render", "accelerator": false},
+            {"name": "generate", "internal": true,
+                "models": [{"path": "generate.models.model", "class": "M", "default": "model@1.0.0"}]}]);
+        let machine = crate::published::tests::Machine::with("acme/pkg", &[("8.9", 24 << 30)], entrypoints, &["bf16"]);
+        let store = machine.publisher.store().clone();
+        let objects = Arc::new(Objects::new(&machine.root.join("writes"), store.clone(), machine.service.engine.clone()).unwrap());
+        let runs = Runs { service: machine.service.clone(), objects, publisher: Some(machine.publisher.clone()), local: None,
+            own_hub: None, leaf: None, contexts: Default::default() };
+        let mut warm = spec(Source::Models, true, "set");
+        (warm.hub, warm.owner, warm.catalog_revision) = (Some(machine.hub.clone()), "acme".into(), "r1".into());
+        warm.set = Some(vec![SetItem {
+            source: Source::Installation(machine.installation.alias.clone()), entrypoint: "render".into(),
+            models: vec![], bits: 0, level: Level::Downloaded, sent: b"render".to_vec(),
+        }]);
+        let set = runs.prepare("alice", "set", warm, &runs.service.engine.stoppable("set")).unwrap().unwrap();
+        assert_eq!(set.value["set"].as_array().map(Vec::len), Some(1), "{}", set.value);
+        assert_eq!(set.value["set"][0]["entrypoint"], "render");
+        let manifest = machine.lanes.keys().next().unwrap().clone();
+        let started = std::time::Instant::now();
+        while !crate::access::whole(&store, &manifest, &[]) {
+            assert!(started.elapsed() < Duration::from_secs(60), "generate's model never reached the disk");
+            std::thread::sleep(Duration::from_millis(20));
         }
     }
 

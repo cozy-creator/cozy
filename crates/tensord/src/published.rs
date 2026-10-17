@@ -1965,7 +1965,7 @@ fn platform(failure: Failure, package: &str, release: &str) -> Failure {
 pub(crate) mod names_hub;
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// A wheel with nothing but its metadata: `name` `version`, requiring `requires`.
@@ -2830,19 +2830,24 @@ mod tests {
     /// A machine on the GPUs its inventory names (compute capability, memory) holding `package`,
     /// whose `render` declares `slots`, and a Hub publishing `acme/model@1.0.0` in `lanes` and the
     /// LoRA `acme/lora@1.0.0`.
-    struct Machine {
-        root: PathBuf,
-        service: Arc<Service>,
-        publisher: Arc<Publisher>,
-        installation: Installation,
-        hub: hub::Source,
+    pub(crate) struct Machine {
+        pub root: PathBuf,
+        pub service: Arc<Service>,
+        pub publisher: Arc<Publisher>,
+        pub installation: Installation,
+        pub hub: hub::Source,
         heard: names_hub::Heard,
         /// Each published manifest's lane.
-        lanes: HashMap<String, String>,
+        pub lanes: HashMap<String, String>,
     }
 
     impl Machine {
         fn new(package: &str, gpus: &[(&str, u64)], slots: Value, lanes: &[&str]) -> Self {
+            Self::with(package, gpus, json!([{"name": "render", "models": slots}]), lanes)
+        }
+
+        /// `new`, its package declaring `entrypoints`.
+        pub(crate) fn with(package: &str, gpus: &[(&str, u64)], entrypoints: Value, lanes: &[&str]) -> Self {
             use crate::adapter_views::tests::{checkpoint as tensors, f32s};
             let root = std::env::temp_dir().join(format!("cm-precision-{}", uuid::Uuid::new_v4()));
             let service = Service::open(&root.join("state"), &root.join("generations"), 1).unwrap();
@@ -2859,7 +2864,7 @@ mod tests {
             fs::create_dir_all(dir.join("env/bin")).unwrap();
             fs::write(dir.join("env/bin/python"), "").unwrap();
             File::create(dir.join(".hold")).unwrap();
-            let interface = json!({"application": "pkg:app", "entrypoints": [{"name": "render", "models": slots}]});
+            let interface = json!({"application": "pkg:app", "entrypoints": entrypoints});
             fs::write(dir.join("generation.json"), json!({"identity": identity, "package": package, "version": "1.0.0",
                 "application": "pkg:app", "python": dir.join("env/bin/python"), "interface": interface}).to_string()).unwrap();
             let installation = service.engine.bind_installation(Installation { actor: "alice".into(), alias: "held".into(),
