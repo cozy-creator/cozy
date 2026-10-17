@@ -1,5 +1,5 @@
 //! A systemd `--user` unit kept in the home and linked into the user's manager, so no XDG path is
-//! looked up. `Restart=on-failure`: a clean exit (Calcifer owing nothing) is not restarted.
+//! looked up. `Restart=on-failure`: a clean exit (`cozy down`, an update) is not restarted.
 use super::{ServiceSpec, run};
 use crate::{Error, Result, durable, paths::Home};
 use std::{

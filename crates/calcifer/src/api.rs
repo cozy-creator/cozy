@@ -2,7 +2,7 @@
 //! passes the guard chain in order: a loopback peer, an allowed `Host`, no foreign `Origin`, then
 //! (on the routes Calcifer serves) the bearer and the admission gate a stopping Calcifer closes.
 //! Refusals are `cozy_proto::error::Envelope`s. No CORS header is ever sent and no cookie is read.
-use std::{collections::VecDeque, convert::Infallible, sync::Arc};
+use std::{collections::VecDeque, convert::Infallible, net::SocketAddr, sync::Arc};
 
 use axum::{
     Json, Router,
@@ -19,7 +19,6 @@ use axum::{
     },
     routing::{get, post},
 };
-use cozy_platform::lock::{Kind as LockKind, LockFile};
 use cozy_proto::{
     calcifer::{Down, Event, Run, RunList, RunsEvent, Status, SubmitRun, Submitted},
     error::{Envelope, Error, Kind},
@@ -34,7 +33,6 @@ use tracing::{info, warn};
 use crate::{
     Calcifer,
     machines::{self, Machines},
-    serve::Peer,
     store::{RunFilter, RunRow, State as RunState, StoreError},
 };
 
@@ -73,22 +71,6 @@ impl Api {
             stopping: RwLock::new(false),
             stop: watch::channel(false).0,
         })
-    }
-
-    /// Closes the admission gate, after any mutation in flight, when no client is connected
-    /// (`open` counts them), nothing is owed and no client is starting it (`wanted` is free).
-    /// Answers whether this call closed it.
-    pub async fn stop_unless_owed(&self, open: &watch::Receiver<usize>, wanted: &LockFile) -> bool {
-        if *open.borrow() > 0 {
-            return false;
-        }
-        let mut stopping = self.stopping.write().await;
-        let idle = !*stopping
-            && *open.borrow() == 0
-            && self.calcifer.owed().is_empty()
-            && matches!(wanted.try_lock(LockKind::Exclusive), Ok(Some(_)));
-        *stopping |= idle;
-        idle
     }
 
     /// Ends every stream and the server.
@@ -229,7 +211,7 @@ impl From<BytesRejection> for Refusal {
 /// anything asks whether it holds a credential.
 async fn guard(
     State(api): State<Arc<Api>>,
-    ConnectInfo(peer): ConnectInfo<Peer>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     request: Request,
     next: Next,
 ) -> Response {
@@ -255,14 +237,14 @@ async fn guard(
     response
 }
 
-fn refusal(api: &Api, peer: &Peer, request: &Request) -> Option<Refusal> {
+fn refusal(api: &Api, peer: &SocketAddr, request: &Request) -> Option<Refusal> {
     let header = |name| {
         request
             .headers()
             .get(name)
             .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
     };
-    if !peer.addr.ip().is_loopback() {
+    if !peer.ip().is_loopback() {
         Some(refuse(
             Kind::Forbidden,
             "not_loopback",

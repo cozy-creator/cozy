@@ -9,13 +9,9 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use calcifer::store::{Endpoint, MachineRow};
-use cozy_platform::{
-    durable,
-    lock::{Held, Kind as LockKind, LockFile},
-    paths::Home,
-};
+use cozy_platform::durable;
 use cozy_proto::{
-    calcifer::{Event, MachineKind, MachineState, WANTED},
+    calcifer::{Event, MachineKind, MachineState},
     ids::{Digest, RunId},
     machine as v1,
 };
@@ -25,15 +21,6 @@ use sha2::{Digest as _, Sha256};
 use tokio::sync::broadcast;
 
 pub const WORKER: &str = "calcifer-test";
-
-/// A client's claim that it is starting Calcifer on `home` (`wanted.lock`, shared): the CLI holds
-/// it until Calcifer's first answer, so a Calcifer owing nothing waits for that client.
-pub fn want(home: &Path) -> Held {
-    let dir = Home::at(home).calcifer();
-    durable::private_dir(&dir).unwrap();
-    let wanted = LockFile::new(dir.join(WANTED)).try_lock(LockKind::Shared);
-    wanted.unwrap().expect("a shared lock")
-}
 
 pub fn key() -> SigningKey {
     SigningKey::from_bytes(&[33; 32])

@@ -178,10 +178,7 @@ impl Calcifer {
         loop {
             let (run, item) = match self.next_export(id) {
                 Ok(Some(next)) => next,
-                Ok(None) => {
-                    self.owed.send_replace(());
-                    return;
-                }
+                Ok(None) => return,
                 Err(e) => {
                     warn!(run = %id, "{e}");
                     pause.wait(wake, None).await;

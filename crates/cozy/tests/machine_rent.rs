@@ -140,7 +140,6 @@ fn a_rental_is_asked_once_per_key_and_ends_with_the_hubs_proof() {
         return;
     }
     home.sign_in("renter@example.com");
-    let _calcifer = home.want_calcifer();
     let ask = [
         "machine",
         "rent",
@@ -205,7 +204,6 @@ fn a_rental_is_asked_once_per_key_and_ends_with_the_hubs_proof() {
 fn a_run_sent_to_a_booting_rental_completes_on_it_and_the_rental_ends() {
     let Some(home) = Home::with_hub() else { return };
     home.sign_in("cycle@cozy.test");
-    let _calcifer = home.want_calcifer();
     let package = common::package::publish(&home, "tiny", "0.1.0");
     let rented = home.json(["machine", "rent", "cpu", "--detach", "--json"]);
     let machine = rented["machine"]["name"].as_str().unwrap().to_string();

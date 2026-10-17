@@ -22,8 +22,11 @@ use cozy_proto::{
 };
 use prost::Message as _;
 
+/// Calcifer on `home`, taking up what an earlier one left, as `serve` does once it serves.
 fn open(home: &Path) -> Arc<Calcifer> {
-    Calcifer::open(&home.join("calcifer"), &home.join("outputs")).unwrap()
+    let calcifer = Calcifer::open(&home.join("calcifer"), &home.join("outputs")).unwrap();
+    calcifer.resume().unwrap();
+    calcifer
 }
 
 fn submit(on: &str, spec: Vec<u8>, inputs: Vec<cozy_proto::calcifer::StagedInput>) -> SubmitRun {

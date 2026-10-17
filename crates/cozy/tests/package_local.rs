@@ -57,7 +57,6 @@ fn local_code_installs_live_on_a_machine() {
         eprintln!("skipped: no TensorD (COZY_TEST_TENSORD is unset)");
         return;
     }
-    let _calcifer = home.want_calcifer();
     let _machine = tensord::added(&home, "t1");
 
     let project = package::project(&home, "tiny");

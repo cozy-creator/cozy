@@ -706,11 +706,6 @@ pub struct Down {
 /// the last start failed; a successful start deletes it.
 pub const REFUSED: &str = "refused.json";
 
-/// The lock in Calcifer's directory a client holds shared from before it starts Calcifer until its
-/// first answer. A Calcifer that owes nothing and has no client stops only while nobody holds it,
-/// so a login start stops at once and an on-demand start waits for the client that wanted it.
-pub const WANTED: &str = "wanted.lock";
-
 /// What a serving Calcifer publishes beside its lock (`calcifer.lock.holder`, 0600, one JSON
 /// line): where its API listens and the bearer it wants, fresh at every start. Absent while the
 /// lock is held: Calcifer is still opening its store.

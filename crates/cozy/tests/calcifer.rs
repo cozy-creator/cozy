@@ -7,12 +7,8 @@ use std::{
 };
 
 use common::Home;
-use cozy_platform::{
-    durable,
-    lock::{Kind, LockFile},
-    paths,
-};
-use cozy_proto::calcifer::{Down, Holder, WANTED};
+use cozy_platform::{durable, lock::LockFile, paths};
+use cozy_proto::calcifer::{Down, Holder};
 
 /// `cozy calcifer` is named `calcifer`, serves its home, and exits 0 on `down`.
 #[test]
@@ -20,9 +16,6 @@ fn cozy_calcifer_is_a_process_named_calcifer_that_down_stops() {
     let Some(home) = Home::new() else { return };
     let cozy = paths::Home::at(home.root());
     durable::private_dir(&cozy.calcifer()).unwrap();
-    // Wanted, as the CLI does before a start: owing nothing, it would otherwise stop at once.
-    let wanted = LockFile::new(cozy.calcifer().join(WANTED));
-    let _wanted = wanted.try_lock(Kind::Shared).unwrap().unwrap();
     let mut calcifer = home
         .command()
         .arg("calcifer")

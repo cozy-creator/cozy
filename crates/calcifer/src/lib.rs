@@ -68,8 +68,6 @@ pub struct Calcifer {
     staging: Mutex<()>,
     /// The object each machine is being written, one Write at a time.
     writing: Mutex<HashMap<(String, Digest), Turn>>,
-    /// Told each time a run is settled: what Calcifer owes may now be nothing.
-    owed: watch::Sender<()>,
     /// Told each time a machine's row or what Calcifer heard of it may have changed.
     machines_changed: watch::Sender<()>,
     exports: outputs::Exports,
@@ -144,18 +142,25 @@ impl Calcifer {
             tasks: Mutex::default(),
             staging: Mutex::default(),
             writing: Mutex::default(),
-            owed: watch::channel(()).0,
             machines_changed: watch::channel(()).0,
             exports: outputs::Exports::default(),
             warm: Mutex::default(),
             granting: OnceLock::new(),
         });
         calcifer.sweep_inputs()?;
-        for id in calcifer.store.unsettled()? {
-            calcifer.drive(id);
-        }
-        calcifer.export_outputs()?;
         Ok(calcifer)
+    }
+
+    /// Takes up what an earlier Calcifer left: follows every unsettled run and exports every
+    /// output still owed. Each goes on in its own task.
+    pub fn resume(self: &Arc<Self>) -> Result<usize, Error> {
+        let unsettled = self.store.unsettled()?;
+        let resumed = unsettled.len();
+        for id in unsettled {
+            self.drive(id);
+        }
+        self.export_outputs()?;
+        Ok(resumed)
     }
 
     /// Stops every driver where it stands, as if the process ended. Machines keep their runs.
@@ -184,16 +189,6 @@ impl Calcifer {
                 .collect())
         });
         owed.unwrap_or_else(|e| vec![e.to_string()])
-    }
-
-    /// Tells the exit watch that what Calcifer owes may have shrunk.
-    pub(crate) fn owe_less(&self) {
-        self.owed.send_replace(());
-    }
-
-    /// Changes each time a run is settled, its outputs have all landed, or a Hub ask is answered.
-    pub fn owed_changed(&self) -> watch::Receiver<()> {
-        self.owed.subscribe()
     }
 
     /// Every event of every run, as it happens.
@@ -451,7 +446,6 @@ impl Calcifer {
             me.follow_to_end(&id, &wake).await;
             lock(&me.drivers).remove(&id);
             lock(&me.live).remove(&id);
-            me.owed.send_replace(());
         });
     }
 

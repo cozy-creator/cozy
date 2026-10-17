@@ -6,15 +6,15 @@ mod common;
 use std::{
     path::Path,
     process::{Command, Stdio},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use calcifer::{
     Link,
     serve::{Stopped, serve},
-    store::{MachineRow, Store},
+    store::{MachineRow, NewRun, Store},
 };
-use common::{SilentHub, Tensord, want};
+use common::{SilentHub, Tensord};
 use cozy_platform::{
     lock::{Kind as LockKind, LockFile},
     paths::Home,
@@ -24,6 +24,7 @@ use cozy_proto::{
     capability,
     config::{Config, Loaded},
     error::Envelope,
+    ids::RunId,
 };
 use reqwest::{Client, Method, RequestBuilder, StatusCode, header};
 use serde_json::json;
@@ -40,9 +41,8 @@ struct Calcifer {
 }
 
 impl Calcifer {
-    /// Starts `serve` as the CLI does: wanting it (`wanted.lock`) until its first answer.
+    /// Starts `serve` as the CLI does, and waits for its first answer.
     async fn start(home: &Path) -> Self {
-        let wanted = want(home);
         let loaded = loaded(home);
         let watched = loaded.home.clone();
         let task = tokio::spawn(async move { serve(&loaded).await });
@@ -54,7 +54,6 @@ impl Calcifer {
         };
         let first = calcifer.request(Method::GET, "/v1/runs").send().await;
         assert_eq!(first.unwrap().status(), StatusCode::OK);
-        drop(wanted);
         calcifer
     }
 
@@ -107,7 +106,7 @@ impl Calcifer {
         response.json().await.unwrap()
     }
 
-    /// Lets go of the client's connections and waits for Calcifer to stop on its own.
+    /// Lets go of the client's connections and waits for Calcifer to stop, after `down`.
     async fn stopped(self) -> Stopped {
         drop(self.client);
         tokio::time::timeout(PATIENCE, self.task)
@@ -330,13 +329,13 @@ async fn the_guard_chain_refuses_a_foreign_host_origin_bearer_or_missing_key() {
     assert_eq!(good.headers()[header::CACHE_CONTROL], "no-store");
     let list: RunList = good.json().await.unwrap();
     assert!(list.runs.is_empty());
-    assert_eq!(calcifer.stopped().await, Stopped::Idle);
+    calcifer.down().await;
+    assert_eq!(calcifer.stopped().await, Stopped::Down);
 }
 
 /// Unplaced runs (`on: any`) wait in the outbox without a machine: no TensorD is needed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_submission_is_accepted_replayed_and_refused_under_another_body_and_calcifer_exits_once_it_is_settled()
- {
+async fn a_submission_is_accepted_replayed_and_refused_under_another_body() {
     let home = tempfile::tempdir().unwrap();
     let calcifer = Calcifer::start(home.path()).await;
     let mut body = submission("any", &common::warm_spec("http://127.0.0.1:9", vec![]));
@@ -383,7 +382,8 @@ async fn a_submission_is_accepted_replayed_and_refused_under_another_body_and_ca
     assert_eq!(canceled.status, Status::Canceled);
     let (status, _) = calcifer.cancel(&number).await;
     assert_eq!(status, StatusCode::OK, "already settled");
-    assert_eq!(calcifer.stopped().await, Stopped::Idle);
+    calcifer.down().await;
+    assert_eq!(calcifer.stopped().await, Stopped::Down);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -427,7 +427,6 @@ async fn serve_until_killed() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_killed_calcifer_leaves_a_record_the_next_one_replaces() {
     let home = tempfile::tempdir().unwrap();
-    let wanted = want(home.path());
     let mut child = Command::new(std::env::current_exe().unwrap())
         .args([
             "serve_until_killed",
@@ -444,7 +443,6 @@ async fn a_killed_calcifer_leaves_a_record_the_next_one_replaces() {
     let stale = record(&Home::at(home.path()), |h| h.pid == pid).await;
     child.kill().unwrap();
     child.wait().unwrap();
-    drop(wanted);
     let lock = LockFile::new(Home::at(home.path()).calcifer_lock());
     let left: Holder = serde_json::from_slice(&lock.holder().unwrap().unwrap()).unwrap();
     assert_eq!(left, stale, "SIGKILL leaves the record behind");
@@ -529,7 +527,8 @@ async fn a_run_is_followed_to_the_machines_outcome_and_a_reconnect_gets_only_wha
     let after_end = calcifer.events(&id, end.unwrap()).await.rest().await;
     assert!(after_end.is_empty(), "{after_end:?}");
     assert_eq!(calcifer.cancel(&id).await.0, StatusCode::OK);
-    assert_eq!(calcifer.stopped().await, Stopped::Idle);
+    calcifer.down().await;
+    assert_eq!(calcifer.stopped().await, Stopped::Down);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -571,29 +570,85 @@ async fn down_names_what_is_owed_the_machine_keeps_running_it_and_the_next_calci
     calcifer.cancel(&id).await;
     let end = events.rest().await.pop().unwrap().1;
     assert_eq!(run_of(&end).unwrap().status, Status::Canceled);
+    let still = calcifer.request(Method::GET, "/v1/runs").send().await;
     assert_eq!(
-        calcifer.stopped().await,
-        Stopped::Idle,
-        "it exits by itself once nothing is owed"
+        still.unwrap().status(),
+        StatusCode::OK,
+        "owing nothing, it keeps serving"
     );
+    calcifer.down().await;
+    assert_eq!(calcifer.stopped().await, Stopped::Down);
 }
 
+/// Calcifer is the laptop's long-lived daemon. Started on a home of 10,000 runs while another
+/// connection holds the store's write lock (as a commit stuck on a busy disk's write-back does),
+/// it answers within a second: nothing before its first answer writes or flushes. Owing nothing
+/// and with no client connected, it keeps serving until `down`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_calcifer_owing_nothing_stops_at_once_unless_a_client_wants_it() {
+async fn calcifer_answers_within_a_second_on_a_big_store_while_a_commit_is_stuck_and_never_idles() {
     let home = tempfile::tempdir().unwrap();
-    let unwanted = tokio::time::timeout(PATIENCE, serve(&loaded(home.path()))).await;
-    assert_eq!(unwanted.unwrap().unwrap(), Stopped::Idle, "a login start");
-    let lock = LockFile::new(Home::at(home.path()).calcifer_lock());
-    assert_eq!(lock.holder().unwrap(), None);
+    let db = Home::at(home.path()).calcifer_db();
+    let store = Store::open(&db).unwrap();
+    let new = NewRun {
+        id: RunId::mint([1; 12]),
+        kind: cozy_proto::calcifer::Kind::Warm,
+        target: "cozy-test/held".into(),
+        hub: String::new(),
+        machine: None,
+        pinned: false,
+        spec: common::warm_spec("https://tensorhub.com", vec![]),
+        out_dir: home.path().join("outputs"),
+        warnings: vec![],
+        inputs: vec![],
+        wants: None,
+    };
+    store.submit("k", "sha256:k", new).unwrap();
+    drop(store);
+    let writer = rusqlite::Connection::open(&db).unwrap();
+    writer
+        .execute_batch(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 10000)
+             INSERT INTO runs (id, number, idempotency_key, digest, hub, kind, target, pinned,
+                 spec, out_dir, state, status, created_at, settled_at)
+             SELECT printf('run-%024x', i), 1 + i, 'k' || i, digest, hub, kind, target, pinned,
+                 spec, out_dir, 'settled', 'completed', created_at, created_at FROM runs, n
+             WHERE runs.number = 1;
+             BEGIN IMMEDIATE;",
+        )
+        .unwrap();
 
-    let calcifer = Calcifer::start(home.path()).await;
-    let again = calcifer.request(Method::GET, "/v1/runs").send().await;
-    assert_eq!(
-        again.unwrap().status(),
-        StatusCode::OK,
-        "its client is connected"
+    let began = Instant::now();
+    let loaded = loaded(home.path());
+    let task = tokio::spawn(async move { serve(&loaded).await });
+    let holder = record(&Home::at(home.path()), |h| h.pid == std::process::id()).await;
+    let client = Client::new();
+    let url = format!("http://{}/v1/runs?limit=5", holder.address);
+    let first = client.get(&url).bearer_auth(&holder.token).send().await;
+    let answered = began.elapsed();
+    let first: RunList = first.unwrap().json().await.unwrap();
+    assert_eq!(first.runs.len(), 5);
+    assert!(
+        answered < Duration::from_secs(1),
+        "the first answer took {answered:?}"
     );
-    assert_eq!(calcifer.stopped().await, Stopped::Idle);
+    writer.execute_batch("ROLLBACK").unwrap();
+    drop(writer);
+
+    let calcifer = Calcifer {
+        task,
+        holder,
+        client: Client::new(),
+    };
+    drop(client);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(
+        !calcifer.task.is_finished(),
+        "owing nothing, it keeps serving"
+    );
+    let again = calcifer.request(Method::GET, "/v1/runs").send().await;
+    assert_eq!(again.unwrap().status(), StatusCode::OK);
+    calcifer.down().await;
+    assert_eq!(calcifer.stopped().await, Stopped::Down);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -629,7 +684,8 @@ async fn a_run_for_a_disabled_local_machine_or_an_unknown_one_is_refused_unrecor
         .await
         .unwrap();
     assert!(listed.runs.is_empty(), "nothing was recorded");
-    assert_eq!(calcifer.stopped().await, Stopped::Idle);
+    calcifer.down().await;
+    assert_eq!(calcifer.stopped().await, Stopped::Down);
 }
 
 /// The play answer for one output of a run, as `cozy run play` asks for it.
@@ -709,5 +765,6 @@ async fn a_play_answer_names_the_machines_player_and_a_cap_for_that_output_alone
         "an ended run made no video"
     );
     calcifer.cancel(&unplaced).await;
-    assert_eq!(calcifer.stopped().await, Stopped::Idle);
+    calcifer.down().await;
+    assert_eq!(calcifer.stopped().await, Stopped::Down);
 }

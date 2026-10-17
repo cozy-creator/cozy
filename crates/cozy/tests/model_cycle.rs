@@ -56,7 +56,6 @@ fn publish_quantizer(home: &Home) {
 fn a_model_is_uploaded_quantized_and_published_by_its_machine() {
     let Some(home) = Home::with_hub() else { return };
     let account = home.sign_in("modelcycle@cozy.test");
-    let _calcifer = home.want_calcifer();
     let _machine = common::tensord::added(&home, "m1");
     let model = format!("{account}/tiny");
 

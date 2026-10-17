@@ -1,19 +1,15 @@
-//! `cozy calcifer`, the role entry. One Calcifer per home, held by `calcifer.lock`: it opens its
-//! store (resuming every run it owes), serves the loopback API, and only then publishes its
-//! `Holder` record, which is the readiness signal. It exits once nothing is owed, no client is
-//! connected and no client is starting it (`wanted.lock`), or on `POST /v1/down`; machines keep
-//! running what they accepted either way.
+//! `cozy calcifer`, the role entry. One Calcifer per home, held by `calcifer.lock`. It serves the
+//! loopback API as soon as its store is open and publishes its `Holder` record, the readiness
+//! signal; only then does it take up what an earlier Calcifer left (runs, their outputs), while its
+//! machines reattach in their own tasks. It runs until `POST /v1/down`, an update or a crash: the
+//! login service keeps it up. Machines keep running what they accepted either way. Each startup
+//! step is logged with its time, so a slow start names itself.
 use std::{
-    io,
     net::{Ipv4Addr, SocketAddr},
     process::ExitCode,
-    sync::Arc,
+    time::Instant,
 };
 
-use axum::{
-    extract::connect_info::Connected,
-    serve::{IncomingStream, Listener},
-};
 use cozy_platform::{
     durable,
     lock::{Kind as LockKind, LockFile},
@@ -22,14 +18,11 @@ use cozy_platform::{
     service::Services,
 };
 use cozy_proto::{
-    calcifer::{Holder, REFUSED, WANTED},
+    calcifer::{Holder, REFUSED},
     config::{self, Flags, Loaded},
     error::{Envelope, Error, Kind},
 };
-use tokio::{
-    net::{TcpListener, TcpStream},
-    sync::watch,
-};
+use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 
 use crate::{
@@ -46,8 +39,6 @@ pub enum Stopped {
     AnotherHolds,
     /// `POST /v1/down`.
     Down,
-    /// Nothing was owed and no client was connected.
-    Idle,
 }
 
 /// `cozy calcifer`: exits 0 unless Calcifer could not start, which `refused.json` then says.
@@ -96,9 +87,10 @@ fn refuse(home: &Home, error: Error) -> Error {
     error
 }
 
-/// Serves `loaded.home` on `127.0.0.1:<calcifer.port>` (0: any free port) until Calcifer stops.
+/// Serves `loaded.home` on `127.0.0.1:<calcifer.port>` (0: any free port) until `POST /v1/down`.
 pub async fn serve(loaded: &Loaded) -> Result<Stopped, Error> {
     let (home, port) = (&loaded.home, loaded.config.calcifer.port);
+    let (began, mut steps) = (Instant::now(), Steps(Instant::now()));
     let failed = |error| refuse(home, error);
     let lock = LockFile::new(home.calcifer_lock());
     let held = home
@@ -123,6 +115,7 @@ pub async fn serve(loaded: &Loaded) -> Result<Stopped, Error> {
     for warning in &loaded.warnings {
         warn!("{warning}");
     }
+    steps.done("home");
 
     let calcifer = Calcifer::open(&home.calcifer(), &home.outputs()).map_err(|e| {
         failed(match e {
@@ -134,6 +127,7 @@ pub async fn serve(loaded: &Loaded) -> Result<Stopped, Error> {
             e => Error::new(Kind::Internal, "calcifer_store", e.to_string()),
         })
     })?;
+    steps.done("store");
     let listener = match TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await {
         Ok(listener) => listener,
         Err(e) => {
@@ -151,19 +145,14 @@ pub async fn serve(loaded: &Loaded) -> Result<Stopped, Error> {
     let address = listener
         .local_addr()
         .map_err(|e| failed(Error::new(Kind::Internal, "calcifer_port", e.to_string())))?;
+    steps.done("listen");
     let mut token = [0; 32];
     getrandom::fill(&mut token).expect("the OS provides randomness");
     let token = hex::encode(token);
     let machines = Machines::start(calcifer.clone(), home.clone(), &loaded.config);
+    steps.done("machines");
     let api = Api::new(calcifer.clone(), machines.clone(), address.port(), &token);
-    // Kept here too, so `open` always has a sender while Calcifer serves.
-    let (count, mut open) = watch::channel(0);
-    let count = Arc::new(count);
-    let listener = Counted {
-        listener,
-        open: count.clone(),
-    };
-    let app = api::router(api.clone()).into_make_service_with_connect_info::<Peer>();
+    let app = api::router(api.clone()).into_make_service_with_connect_info::<SocketAddr>();
     let server = tokio::spawn(
         axum::serve(listener, app)
             .with_graceful_shutdown(api.stopped())
@@ -191,84 +180,30 @@ pub async fn serve(loaded: &Loaded) -> Result<Stopped, Error> {
         )));
     }
     let _ = std::fs::remove_file(home.calcifer().join(REFUSED));
-    info!(%address, "Calcifer serves");
+    steps.done("record");
+    info!(%address, ms = began.elapsed().as_millis() as u64, "Calcifer serves");
+    match calcifer.resume() {
+        Ok(runs) => steps.done(&format!("resume ({runs} runs)")),
+        Err(e) => warn!("resuming what an earlier Calcifer left: {e}"),
+    }
 
-    let mut owed = calcifer.owed_changed();
-    let stopped = api.stopped();
-    tokio::pin!(stopped);
-    // Checked at once (a login start owing nothing stops here) and on every change after.
-    let wanted = LockFile::new(home.calcifer().join(WANTED));
-    let why = loop {
-        if api.stop_unless_owed(&open, &wanted).await {
-            break Stopped::Idle;
-        }
-        tokio::select! {
-            () = &mut stopped => break Stopped::Down,
-            _ = owed.changed() => {}
-            _ = open.changed() => {}
-        }
-    };
-    api.stop();
+    api.stopped().await;
     if let Ok(Err(e)) = server.await {
         warn!("the API server ended: {e}");
     }
     machines.close();
     calcifer.close();
-    drop((held, count));
-    info!(?why, "Calcifer stopped");
-    Ok(why)
+    drop(held);
+    info!("Calcifer stopped");
+    Ok(Stopped::Down)
 }
 
-/// A client's connection: its address, and its share in the count of open connections.
-#[derive(Clone, Debug)]
-pub struct Peer {
-    pub addr: SocketAddr,
-    _open: Option<Arc<Open>>,
-}
+/// Logs each startup step with the time it took.
+struct Steps(Instant);
 
-/// Counted in for as long as its connection, or a request on it, lives.
-#[derive(Debug)]
-struct Open(Arc<watch::Sender<usize>>);
-
-impl Drop for Open {
-    fn drop(&mut self) {
-        self.0.send_modify(|n| *n -= 1);
-    }
-}
-
-/// The loopback listener, counting the connections open on it.
-struct Counted {
-    listener: TcpListener,
-    open: Arc<watch::Sender<usize>>,
-}
-
-impl Listener for Counted {
-    type Io = TcpStream;
-    type Addr = Peer;
-
-    async fn accept(&mut self) -> (TcpStream, Peer) {
-        let (io, addr) = Listener::accept(&mut self.listener).await;
-        self.open.send_modify(|n| *n += 1);
-        let open = Open(self.open.clone());
-        (
-            io,
-            Peer {
-                addr,
-                _open: Some(Arc::new(open)),
-            },
-        )
-    }
-
-    fn local_addr(&self) -> io::Result<Peer> {
-        Ok(Peer {
-            addr: self.listener.local_addr()?,
-            _open: None,
-        })
-    }
-}
-
-impl Connected<IncomingStream<'_, Counted>> for Peer {
-    fn connect_info(stream: IncomingStream<'_, Counted>) -> Self {
-        stream.remote_addr().clone()
+impl Steps {
+    fn done(&mut self, step: &str) {
+        info!(step, ms = self.0.elapsed().as_millis() as u64, "started");
+        self.0 = Instant::now();
     }
 }

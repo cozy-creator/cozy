@@ -1,7 +1,5 @@
-//! Calcifer's lifecycle through the real binary: started on demand, one per home, stopped by
-//! `down` without stopping work, replaced when killed, and a refusal to start said in its own
-//! words. Calcifer stops once it owes nothing and no client is connected or wants it, so a test
-//! that needs it up holds `wanted.lock` as a client would.
+//! Calcifer's lifecycle through the real binary: started on demand, one per home, serving until
+//! `down` (which stops no work), replaced when killed, and a refusal to start said in its own words.
 mod common;
 
 #[cfg(unix)]
@@ -44,16 +42,11 @@ fn calcifer_starts_on_demand_and_down_stops_it() {
     );
     assert_eq!(home.json(["down", "--json"])["changed"], false);
 
-    // Nobody wants it after `up` returns: it stops by itself.
-    let first = calcifer(&home, "up");
-    assert_eq!(first["running"], true, "{first}");
-    let holder = home.root().join("calcifer/calcifer.lock.holder");
-    while holder.exists() {
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-
-    let _wanted = home.want_calcifer();
     let up = calcifer(&home, "up");
+    assert_eq!(up["running"], true, "{up}");
+    let holder = home.root().join("calcifer/calcifer.lock.holder");
+    // Owing nothing, with no client connected, it keeps serving.
+    std::thread::sleep(std::time::Duration::from_secs(1));
     assert_eq!(
         calcifer(&home, "up")["pid"],
         up["pid"],
@@ -75,7 +68,6 @@ fn calcifer_starts_on_demand_and_down_stops_it() {
 #[test]
 fn a_killed_calcifer_is_replaced() {
     let Some(home) = Home::new() else { return };
-    let _wanted = home.want_calcifer();
     let first = calcifer(&home, "up");
     kill(first["pid"].as_u64().unwrap());
     assert!(home.root().join("calcifer/calcifer.lock.holder").exists());
@@ -106,7 +98,6 @@ fn a_calcifer_that_cannot_start_says_why() {
 #[test]
 fn commands_racing_down_reach_a_live_calcifer() {
     let Some(home) = Home::new() else { return };
-    let _wanted = home.want_calcifer();
     let quiet = || std::process::Stdio::null();
     for round in 0..8 {
         calcifer(&home, "up");
@@ -151,7 +142,6 @@ fn status_shows_the_machines() {
         );
         return;
     }
-    let _wanted = home.want_calcifer();
     let _machine = common::tensord::added(&home, "box");
     let status = home.json(["status", "--json"]);
     let machines = status["machines"].as_array().unwrap();

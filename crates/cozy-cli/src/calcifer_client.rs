@@ -19,9 +19,7 @@ use cozy_platform::{
     service::{ServiceSpec, Services},
 };
 use cozy_proto::{
-    calcifer::{
-        Down, Event, Holder, MachineList, REFUSED, Run, RunList, SubmitRun, Submitted, WANTED,
-    },
+    calcifer::{Down, Event, Holder, MachineList, REFUSED, Run, RunList, SubmitRun, Submitted},
     error::{Envelope, Error, Kind},
 };
 use reqwest::{RequestBuilder, Response, StatusCode, header};
@@ -267,10 +265,6 @@ impl Client {
                 source: e,
             }));
         }
-        // Held until Calcifer answers: a Calcifer owing nothing stops at once unless a client
-        // wants it.
-        let wanted = LockFile::new(home.calcifer().join(WANTED));
-        let _wanted = wanted.lock(LockKind::Shared).map_err(failed)?;
         let services = Services::new(home, &self.0.user_home);
         let managed = services.available();
         let mut child = None;
