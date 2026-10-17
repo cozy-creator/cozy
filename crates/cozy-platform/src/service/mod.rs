@@ -28,6 +28,8 @@ pub struct ServiceSpec {
 pub struct Services {
     /// Where this OS's definitions (or, on Windows, the births of what it started) are kept.
     dir: PathBuf,
+    /// The home is this OS user's own: a service starts at their login and serves it.
+    login: bool,
 }
 
 impl Services {
@@ -35,12 +37,15 @@ impl Services {
     pub fn new(home: &Home, user_home: &Path) -> Self {
         Self {
             dir: sys::dir(home, user_home),
+            login: crate::paths::is_login_home(user_home),
         }
     }
 
-    /// Whether this session has a user service manager to talk to.
+    /// Whether this session has a user service manager to talk to, for this home. A service
+    /// starts at the OS user's login and runs with their own home, so a home other than theirs (a
+    /// test's, a second HOME) has none: its programs run detached instead.
     pub fn available(&self) -> bool {
-        sys::available()
+        self.login && sys::available()
     }
 
     /// Writes the definition and enables it at login, without starting it.
