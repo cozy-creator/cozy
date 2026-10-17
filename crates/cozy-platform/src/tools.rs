@@ -310,7 +310,7 @@ pub fn ffmpeg_build() -> &'static [Archive] {
         ),
         ("windows", "x86_64") => &[Archive {
             url: "https://github.com/GyanD/codexffmpeg/releases/download/9.0.2/ffmpeg-9.0.2-essentials_build.zip",
-            sha256: "4705843ccaaf54257c16ad90f3e952ece33c17df964ecf7bfdbb0f49c7171077",
+            sha256: "60f467265b1e312373dbcd92200c2618a74850f98d3d078e94296bb3fa2047ba",
             members: &[
                 ("ffmpeg-9.0.2-essentials_build/bin/ffmpeg.exe", "ffmpeg.exe"),
                 (

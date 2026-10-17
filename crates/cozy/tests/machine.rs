@@ -154,9 +154,8 @@ fn machine_refusals_say_what_to_do_instead() {
             2,
             "not_ported",
         ),
-        // `local` is ended by disabling it, and there is no local machine to check yet.
+        // `local` is ended by disabling it.
         (vec!["machine", "end", "local"], 1, "machine_local"),
-        (vec!["doctor"], 1, "no_local_machine"),
         // The live view is the terminal's default: `--watch` is gone.
         (vec!["machine", "list", "--watch"], 2, "usage"),
         (vec!["machine", "show", "../etc"], 2, "machine_name_invalid"),

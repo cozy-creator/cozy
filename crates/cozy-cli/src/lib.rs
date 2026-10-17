@@ -21,6 +21,7 @@ mod model;
 pub mod output;
 mod package;
 mod run;
+pub mod tools;
 pub mod tui;
 mod update;
 
@@ -77,6 +78,8 @@ enum Command {
     Completion(completion::Args),
     /// Check a machine: driver, GPUs, toolchain, kernels.
     Doctor(doctor::Args),
+    /// The tools cozy uses on this computer, and installing the ones it fetches itself.
+    Tools(tools::Args),
 }
 
 /// Parses the command line, loads the config once, runs the verb and renders its refusal. Exit
@@ -153,6 +156,7 @@ async fn dispatch(ctx: &Context, command: Command) -> Result<ExitCode, Error> {
         Command::Update(args) => update::exec(ctx, args).await,
         Command::Completion(args) => completion::exec(ctx, args).await,
         Command::Doctor(args) => doctor::exec(ctx, args).await,
+        Command::Tools(args) => tools::exec(ctx, args).await,
     }
 }
 
