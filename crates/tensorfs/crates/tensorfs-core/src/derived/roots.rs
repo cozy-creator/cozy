@@ -3,7 +3,7 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use crate::platform::durable::FileAt;
+use cozy_platform::durable::FileAt;
 use std::path::PathBuf;
 
 use crate::canon::{Fields, Value};
@@ -125,7 +125,7 @@ fn directory(store: &Store) -> PathBuf {
 /// its container. A parts journal follows the Store's admissions instead ([`Store::flushes`]):
 /// under a writer's epoch its lines become durable with that writer's next checkpoint.
 fn durable(store: &Store) -> bool {
-    store.disk_class() != crate::disk::DiskClass::Ephemeral
+    store.disk_class() != cozy_platform::durable::DiskClass::Ephemeral
 }
 
 /// Create the root directory; true when this call created it (so its parents need a sync).
@@ -260,7 +260,7 @@ fn sync_directories(store: &Store, parents: bool) -> Result<()> {
         store.root().to_path_buf(),
     ];
     for directory in if parents { &all[..] } else { &own[..] } {
-        crate::platform::durable::sync_dir(directory).map_err(io)?;
+        cozy_platform::durable::sync_dir(directory).map_err(io)?;
     }
     Ok(())
 }
@@ -409,7 +409,7 @@ pub(super) fn remove(store: &Store, transaction: &str) -> Result<()> {
     }
     match fs::remove_file(path(store, transaction)?) {
         Ok(()) if !durable(store) => Ok(()),
-        Ok(()) => crate::platform::durable::sync_dir(&directory(store)).map_err(io),
+        Ok(()) => cozy_platform::durable::sync_dir(&directory(store)).map_err(io),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(io(error)),
     }

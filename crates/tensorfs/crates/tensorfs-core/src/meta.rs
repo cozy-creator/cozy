@@ -70,7 +70,7 @@ fn canonical(root: &Path) -> PathBuf {
 }
 
 fn owner_file(root: &Path) -> Result<File> {
-    let lock = crate::platform::durable::open_nofollow(
+    let lock = cozy_platform::durable::open_nofollow(
         &root.join("owner.lock"),
         OpenOptions::new().read(true).write(true).create(true).truncate(false),
     )

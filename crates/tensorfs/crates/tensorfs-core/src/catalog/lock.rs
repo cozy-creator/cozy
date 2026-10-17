@@ -6,7 +6,7 @@
 //! holder that cannot release is one that is stopped (a debugger or SIGSTOP), and only
 //! then does a statement give up. Dead processes have already released their locks.
 //!
-//! Holders are named by a lock test on the catalog and its WAL `-shm` (`platform::lock`), which
+//! Holders are named by a lock test on the catalog and its WAL `-shm` (`cozy_platform::lock`), which
 //! keeps its probe descriptor open: closing a second descriptor on the catalog would drop every
 //! POSIX lock this process holds on it. Where the OS names no holder (Windows, which also has no
 //! stopped processes), a statement waits.
@@ -18,7 +18,7 @@ use std::time::Duration;
 use rusqlite::Connection;
 
 use crate::err::Result;
-use crate::platform;
+use cozy_platform as platform;
 
 thread_local! {
     /// The catalog this thread's statements wait on. A connection is opened for each

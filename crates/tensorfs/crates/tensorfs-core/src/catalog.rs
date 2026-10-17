@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use rusqlite::{params, Connection};
 
 use crate::err::{refuse, Code, Refusal, Result};
-use crate::platform::durable::FileId;
+use cozy_platform::durable::FileId;
 
 mod lock;
 
@@ -129,16 +129,16 @@ pub(crate) fn connect(path: &Path) -> Result<Connection> {
 }
 
 /// Journal and sync by what a crash can take from the disk the catalog lives on
-/// (`disk::DiskClass`): an ephemeral disk dies with the machine, so no sync buys anything;
+/// (`cozy_platform::durable::DiskClass`): an ephemeral disk dies with the machine, so no sync buys anything;
 /// a persistent one keeps a WAL synced at checkpoints; a network filesystem keeps the
 /// rollback journal and a full sync, because WAL's shared memory is not coherent across
 /// hosts. The catalog is only ever opened by processes on one host otherwise.
 pub(crate) fn configure(connection: &Connection, path: &Path) -> Result<()> {
     lock::wait_for_live_holders(connection, path)?;
-    let (journal, synchronous) = match crate::disk::DiskClass::of(path.parent().unwrap_or(path)) {
-        crate::disk::DiskClass::Ephemeral => ("wal", "OFF"),
-        crate::disk::DiskClass::Persistent => ("wal", "NORMAL"),
-        crate::disk::DiskClass::Network => ("delete", "FULL"),
+    let (journal, synchronous) = match cozy_platform::durable::DiskClass::of(path.parent().unwrap_or(path)) {
+        cozy_platform::durable::DiskClass::Ephemeral => ("wal", "OFF"),
+        cozy_platform::durable::DiskClass::Persistent => ("wal", "NORMAL"),
+        cozy_platform::durable::DiskClass::Network => ("delete", "FULL"),
     };
     connection
         .query_row(&format!("PRAGMA journal_mode={journal}"), [], |row| {

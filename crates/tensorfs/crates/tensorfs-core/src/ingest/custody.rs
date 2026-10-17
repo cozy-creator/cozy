@@ -158,7 +158,7 @@ pub fn journalled(store_root: &Path, operation: &str) -> Result<Vec<ObjectRef>> 
 /// A session directory GC already enumerated; its name came from the filesystem.
 pub(crate) fn read_session(store_root: &Path, session: &str) -> Result<Custody> {
     let path = candidate_dir(store_root, session).join(FILE);
-    let file = match crate::platform::durable::open_racing(&path) {
+    let file = match cozy_platform::durable::open_racing(&path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Custody::default()),
         Err(error) => return Err(io("open", error)),

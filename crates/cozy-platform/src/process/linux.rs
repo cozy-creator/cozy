@@ -210,7 +210,34 @@ pub(super) fn exited(pid: u32) -> bool {
     }
 }
 
-fn boot_id() -> io::Result<String> {
+pub(super) fn usage(pid: u32) -> io::Result<super::Usage> {
+    let stat = stat(pid)?;
+    Ok(super::Usage {
+        cpu: stat.cpu,
+        running: matches!(stat.state, 'R' | 'D'),
+    })
+}
+
+/// `VmHWM`, this image's own peak: `ru_maxrss` keeps the peak of the image this process exec'd
+/// from.
+pub(super) fn peak_resident() -> io::Result<u64> {
+    let status = fs::read_to_string("/proc/self/status")?;
+    let kib = status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmHWM:"))
+        .and_then(|value| {
+            value
+                .trim()
+                .trim_end_matches("kB")
+                .trim()
+                .parse::<u64>()
+                .ok()
+        })
+        .ok_or_else(|| io::Error::other("no VmHWM in /proc/self/status"))?;
+    Ok(kib * 1024)
+}
+
+pub(super) fn boot_id() -> io::Result<String> {
     Ok(fs::read_to_string("/proc/sys/kernel/random/boot_id")?
         .trim()
         .into())
@@ -226,6 +253,8 @@ struct Stat {
     pgrp: i32,
     /// The kernel's PF_* flags.
     flags: u64,
+    /// User plus system clock ticks.
+    cpu: u64,
     start_ticks: u64,
 }
 
@@ -245,6 +274,8 @@ fn stat(pid: u32) -> io::Result<Stat> {
         state: field(0)?.chars().next().unwrap_or('?'),
         pgrp: field(2)?.parse().map_err(io::Error::other)?,
         flags: field(6)?.parse().map_err(io::Error::other)?,
+        cpu: field(11)?.parse::<u64>().map_err(io::Error::other)?
+            + field(12)?.parse::<u64>().map_err(io::Error::other)?,
         start_ticks: field(19)?.parse().map_err(io::Error::other)?,
     })
 }

@@ -36,7 +36,7 @@ fn one_tmp_tree_is_recreatable_and_corruption_is_not_retained() {
         .put_stream(&mut bytes.as_slice(), Some(&object), &Fault::default())
         .unwrap();
     let path = store.blob_path(&object.sha256);
-    tensorfs_core::platform::durable::set_mode(&path, 0o644).unwrap();
+    cozy_platform::durable::set_mode(&path, 0o644).unwrap();
     fs::write(&path, b"corruption").unwrap();
     assert!(matches!(
         store.verify(&object.sha256).unwrap(),

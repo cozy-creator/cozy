@@ -95,7 +95,7 @@ fn a_low_descriptor_limit_is_raised_and_a_full_table_is_backpressure() {
             while !hub.log().iter().any(|hex| squeezed.contains(hex)) {
                 std::thread::sleep(Duration::from_millis(1));
             }
-            let open = tensorfs_core::platform::process::open_fds().unwrap();
+            let open = cozy_platform::process::open_fds().unwrap();
             let pressed = tensorfs_core::descriptors::exhaustions();
             set_limit(open / 2, original.maximum);
             hub.admit(1);

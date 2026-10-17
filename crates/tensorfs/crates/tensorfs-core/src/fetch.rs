@@ -672,7 +672,7 @@ mod tests {
         let root = temporary("repair");
         let (store, manifest, header, manifest_bytes) = fixture(&root);
         let path = store.manifest_path(&manifest.sha256);
-        crate::platform::durable::set_mode(&path, 0o644).unwrap();
+        cozy_platform::durable::set_mode(&path, 0o644).unwrap();
         fs::write(&path, vec![b'x'; manifest.length as usize]).unwrap();
 
         let (plan, why) =
@@ -935,7 +935,7 @@ mod object_set_tests {
             .put_stream(&mut bytes.as_slice(), Some(&object), &Fault::default())
             .unwrap();
         let path = store.blob_path(&object.sha256);
-        crate::platform::durable::set_mode(&path, 0o644).unwrap();
+        cozy_platform::durable::set_mode(&path, 0o644).unwrap();
         fs::write(&path, vec![b'x'; bytes.len()]).unwrap();
 
         let (plan, why) =

@@ -129,3 +129,34 @@ pub(super) fn readable(fd: BorrowedFd<'_>, period: Option<Duration>) -> io::Resu
         return Ok(ready > 0);
     }
 }
+
+pub(super) fn raise_fd_limit() {
+    // SAFETY: plain-old-data in and out.
+    let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return;
+    }
+    // macOS refuses a soft limit above OPEN_MAX (10240) even under an unlimited hard limit.
+    let ceiling = if cfg!(target_vendor = "apple") {
+        limit.rlim_max.min(10240)
+    } else {
+        limit.rlim_max
+    };
+    if limit.rlim_cur < ceiling {
+        limit.rlim_cur = ceiling;
+        // SAFETY: as above.
+        unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) };
+    }
+}
+
+pub(super) fn fd_limit() -> Option<u64> {
+    // SAFETY: plain-old-data out-param.
+    let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0
+        || limit.rlim_cur == libc::RLIM_INFINITY
+    {
+        return None;
+    }
+    #[allow(clippy::unnecessary_cast)]
+    Some(limit.rlim_cur as u64)
+}

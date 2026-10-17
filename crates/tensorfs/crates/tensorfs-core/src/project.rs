@@ -6,7 +6,7 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::err::{refuse, Code, Refusal, Result};
 use crate::manifest::{Entry, Manifest};
-use crate::platform::durable;
+use cozy_platform::durable;
 use crate::store::Store;
 
 fn io(what: impl AsRef<str>, error: impl Into<std::io::Error>) -> Refusal {

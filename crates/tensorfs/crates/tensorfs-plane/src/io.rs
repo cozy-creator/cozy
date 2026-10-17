@@ -15,7 +15,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
 use tensorfs_core::ids::ObjectRef;
-use tensorfs_core::platform::durable;
+use cozy_platform::durable;
 #[cfg(feature = "store")]
 use tensorfs_core::{meta::Meta, read::ReadLease, store::Store};
 

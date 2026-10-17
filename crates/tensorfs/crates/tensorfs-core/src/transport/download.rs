@@ -49,7 +49,7 @@ use crate::store::{Fault, Store, Verified, PUT_TEMP};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::Read;
-use crate::platform::durable::{FileAt as _, Mode as _};
+use cozy_platform::durable::{FileAt as _, Mode as _};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use futures::FutureExt;
@@ -1031,9 +1031,9 @@ impl<'a> Run<'_, 'a> {
             .mode(0o600)
             .open(&path)
             .map_err(|error| io("create", error))?;
-        let sized = crate::platform::lock::try_claim(&file)
+        let sized = cozy_platform::lock::try_claim(&file)
             .and_then(|claimed| match claimed {
-                true => crate::platform::durable::set_sparse_len(&file, length),
+                true => cozy_platform::durable::set_sparse_len(&file, length),
                 false => Err(std::io::Error::from(std::io::ErrorKind::WouldBlock).into()),
             })
             .map_err(std::io::Error::from);

@@ -10,6 +10,7 @@ pub mod durable;
 pub mod gpu;
 #[cfg(unix)]
 pub mod handles;
+pub mod ipc;
 pub mod lock;
 pub mod net;
 pub mod paths;

@@ -1020,7 +1020,7 @@ fn corrupt_object_heals_into_wanted_and_refetches() {
     // Rot one blob on disk, same length.
     let victim = &checkpoint.objects[0];
     let path = store.blob_path(&victim.sha256);
-    crate::platform::durable::set_mode(&path, 0o644).unwrap();
+    cozy_platform::durable::set_mode(&path, 0o644).unwrap();
     std::fs::write(&path, vec![b'x'; victim.length as usize]).unwrap();
 
     let healed = pull(&request_for(&store, &origin.base, &policy)).unwrap();
@@ -4300,7 +4300,7 @@ fn attempt_cancellation_interrupts_a_partial_tls_record() {
 #[test]
 #[ignore = "benchmark; run explicitly with --ignored --nocapture"]
 fn bench_door_concurrency() {
-    use crate::disk::DiskClass;
+    use cozy_platform::durable::DiskClass;
     const SIZE: usize = 64 << 20;
     let (declared, body) = paced_objects(SIZE, 32);
     // Interleaved, so the three share whatever else the disk is doing at the time.
@@ -4392,7 +4392,7 @@ fn an_ephemeral_store_downloads_without_a_marker() {
     let policy = SourcePolicy::default();
     let report = pull(&request_for(&store, &origin.base, &policy)).unwrap();
     assert_eq!(report.fetched, 8);
-    assert_eq!(store.disk_class(), crate::disk::DiskClass::Ephemeral);
+    assert_eq!(store.disk_class(), cozy_platform::durable::DiskClass::Ephemeral);
     assert!(!root.join("tmp/unsynced").exists());
     for object in &checkpoint.objects {
         assert!(store.record_valid(&object.sha256).is_ok());
@@ -4404,7 +4404,7 @@ fn an_ephemeral_store_downloads_without_a_marker() {
 fn a_persistent_store_downloads_and_retires_its_marker() {
     let root = crate::unsynced::testing::persistent_root("persistent-pull");
     let store = Store::init(&root).unwrap();
-    assert_eq!(store.disk_class(), crate::disk::DiskClass::Persistent);
+    assert_eq!(store.disk_class(), cozy_platform::durable::DiskClass::Persistent);
     let checkpoint = Arc::new(checkpoint(6, 32 * 1024));
     let origin = hub_origin(Arc::clone(&checkpoint), |_, _| None);
     let policy = SourcePolicy::default();
@@ -4445,7 +4445,7 @@ fn a_pull_killed_mid_walk_is_repaired_after_an_unclean_shutdown() {
     use crate::unsynced::testing::{from_an_earlier_boot, markers, persistent_root, tear};
     let root = persistent_root("killed-pull");
     let store = Store::init(&root).unwrap();
-    assert_eq!(store.disk_class(), crate::disk::DiskClass::Persistent);
+    assert_eq!(store.disk_class(), cozy_platform::durable::DiskClass::Persistent);
     let checkpoint = Arc::new(checkpoint(8, 64 * 1024));
     let served = Arc::new(AtomicUsize::new(0));
     let stalling = Arc::new(std::sync::atomic::AtomicBool::new(true));

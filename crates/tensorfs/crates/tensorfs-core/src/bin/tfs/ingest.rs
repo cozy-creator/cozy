@@ -105,7 +105,7 @@ fn carriers(f: &Flags) -> Result<Vec<CarrierInput>, ExitCode> {
                 }
                 None => (None, value.as_str()),
             };
-            match tensorfs_core::platform::durable::canonical(location.as_ref()) {
+            match cozy_platform::durable::canonical(location.as_ref()) {
                 Ok(path) => out.push(CarrierInput { member, path }),
                 Err(error) => {
                     eprintln!("REFUSED IO_FAILED: resolve carrier {location:?}: {error}");
@@ -145,7 +145,7 @@ pub(crate) fn registry_bytes(f: &Flags) -> Result<(String, Vec<u8>), ExitCode> {
             BUILTIN_REGISTRY_BYTES.to_vec(),
         ));
     };
-    let path = match tensorfs_core::platform::durable::canonical(path.as_ref()) {
+    let path = match cozy_platform::durable::canonical(path.as_ref()) {
         Ok(path) => path,
         Err(error) => {
             eprintln!("REFUSED IO_FAILED: resolve source registry {path}: {error}");

@@ -12,7 +12,7 @@
 //! Waits answer out of order. The channel's tickets end when its peer closes it.
 
 use std::collections::HashMap;
-use crate::platform::ipc::LocalStream;
+use cozy_platform::ipc::LocalStream;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::derived::channel::{array, num, obj, reference, text, uint, Channel, Frame};

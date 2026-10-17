@@ -46,7 +46,7 @@ fn body(index: usize) -> Vec<u8> {
 
 fn rewrite_in_place(path: &Path, keep_mtime: bool) {
     let before = fs::metadata(path).unwrap().modified().unwrap();
-    tensorfs_core::platform::durable::set_mode(path, 0o644).unwrap();
+    cozy_platform::durable::set_mode(path, 0o644).unwrap();
     let length = fs::metadata(path).unwrap().len() as usize;
     fs::write(path, vec![0xA5; length]).unwrap();
     if keep_mtime {

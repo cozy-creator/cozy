@@ -221,7 +221,7 @@ fn closing_an_old_native_channel_cannot_fence_its_replacement() {
         .current_session
         .unwrap();
     assert_eq!(second_session, first_session + 1);
-    let (client, server) = crate::platform::ipc::pair().unwrap();
+    let (client, server) = cozy_platform::ipc::pair().unwrap();
     drop(client); // The stale executor disconnects after its replacement was admitted.
     channel::serve_derived(
         &first,

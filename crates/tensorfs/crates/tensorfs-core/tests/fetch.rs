@@ -3,7 +3,7 @@
 
 mod common;
 
-use tensorfs_core::platform::ipc::{self, LocalStream};
+use cozy_platform::ipc::{self, LocalStream};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 

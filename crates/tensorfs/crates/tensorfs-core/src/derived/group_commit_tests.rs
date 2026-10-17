@@ -2,7 +2,7 @@
 //! resumes from its last checkpoint after the machine loses its page cache.
 
 use super::*;
-use crate::disk::DiskClass;
+use cozy_platform::durable::DiskClass;
 use crate::unsynced::testing::{from_an_earlier_boot, markers, persistent_root, tear};
 
 const TENSORS: usize = 6;

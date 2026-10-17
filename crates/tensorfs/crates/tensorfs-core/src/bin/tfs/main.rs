@@ -430,7 +430,7 @@ fn cmd_reap(root: &Path) -> ExitCode {
 }
 
 fn peak_rss_kb() -> u64 {
-    tensorfs_core::platform::process::peak_resident().map_or(0, |bytes| bytes / 1024)
+    cozy_platform::process::peak_resident().map_or(0, |bytes| bytes / 1024)
 }
 
 

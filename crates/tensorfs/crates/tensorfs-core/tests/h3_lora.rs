@@ -779,7 +779,7 @@ fn ambiguous_fused_exporter_needs_a_declared_layout_before_preflight_or_planning
         let path = root.join("unknown.safetensors");
         fs::write(&path, &bytes).unwrap();
         let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
-        tensorfs_core::platform::durable::set_sparse_len(&file, length).unwrap();
+        cozy_platform::durable::set_sparse_len(&file, length).unwrap();
         let carrier = source::CarrierInput { member: Some(head.member.clone()), path };
         assert_eq!(source::plan_source(source::BUILTIN_REGISTRY, source::BUILTIN_REGISTRY_BYTES, std::slice::from_ref(&carrier), None, None).unwrap_err().code, Code::AMBIGUOUS_CLASSIFICATION);
         // Intentional raw preservation remains available; it performs no guessed

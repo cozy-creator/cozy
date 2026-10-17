@@ -62,6 +62,70 @@ impl Birth {
     }
 }
 
+/// What a process is doing: CPU it has used (monotonic, in the OS's own unit) and whether a
+/// thread of it is running or waiting on a disk now (Linux `R`/`D`, macOS running threads;
+/// Windows cannot say, so false).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Usage {
+    pub cpu: u64,
+    pub running: bool,
+}
+
+pub fn usage(pid: u32) -> Result<Usage> {
+    sys::usage(pid).map_err(Error::os("read a process's usage"))
+}
+
+/// This kernel's boot. Page cache and process starts belong to a boot.
+pub fn boot_id() -> Result<String> {
+    sys::boot_id().map_err(Error::os("read the boot id"))
+}
+
+/// This process's peak resident memory, in bytes.
+pub fn peak_resident() -> Result<u64> {
+    sys::peak_resident().map_err(Error::os("read peak resident memory"))
+}
+
+/// Raises the soft descriptor limit as far as the OS lets a process; once is enough.
+pub fn raise_fd_limit() {
+    #[cfg(unix)]
+    unix::raise_fd_limit();
+}
+
+/// The soft descriptor limit, or `None` where the table has no practical limit (Windows'
+/// handle table) or the limit is infinite.
+pub fn fd_limit() -> Option<u64> {
+    #[cfg(unix)]
+    return unix::fd_limit();
+    #[cfg(windows)]
+    None
+}
+
+/// Descriptors this process has open now.
+pub fn open_fds() -> Result<u64> {
+    let dir = if cfg!(target_os = "linux") {
+        "/proc/self/fd"
+    } else if cfg!(target_vendor = "apple") {
+        "/dev/fd"
+    } else {
+        return Err(Error::unsupported(crate::Seam::Process));
+    };
+    Ok(std::fs::read_dir(dir)
+        .map_err(Error::io("list descriptors", dir))?
+        .count() as u64)
+}
+
+/// The process's or the system's descriptor table is full.
+pub fn fd_table_full(error: &io::Error) -> bool {
+    #[cfg(unix)]
+    let full = [libc::EMFILE, libc::ENFILE];
+    // ERROR_TOO_MANY_OPEN_FILES, WSAEMFILE.
+    #[cfg(windows)]
+    let full = [4, 10024];
+    error
+        .raw_os_error()
+        .is_some_and(|code| full.contains(&code))
+}
+
 /// Names this process for `ps` and `top` by its role (`calcifer`, `tensord`). It names the calling
 /// thread, so call it from the main thread before others start; Linux keeps 15 bytes. macOS and
 /// Windows can rename only threads, not a process: `Unsupported`.

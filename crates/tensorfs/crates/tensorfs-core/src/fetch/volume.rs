@@ -16,7 +16,7 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use crate::platform::durable::Mode;
+use cozy_platform::durable::Mode;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
@@ -59,7 +59,7 @@ impl Volume {
     /// Read from cached attributes, so a hung mount cannot hold the caller.
     pub fn mounted(root: impl Into<PathBuf>, ttl: Duration) -> Option<Volume> {
         let root = root.into();
-        let device = |path: &Path| crate::platform::durable::device(path).ok();
+        let device = |path: &Path| cozy_platform::durable::device(path).ok();
         (device(&root)? != device(root.parent()?)?).then(|| Volume::new(root, ttl))
     }
 
@@ -77,7 +77,7 @@ impl Volume {
         if object.length > crate::limits::GRID_BYTES {
             return None;
         }
-        let mut file = crate::platform::durable::open_nofollow(&self.object(&object.sha256), OpenOptions::new().read(true)).ok()?;
+        let mut file = cozy_platform::durable::open_nofollow(&self.object(&object.sha256), OpenOptions::new().read(true)).ok()?;
         op.beat();
         let metadata = file.metadata().ok()?;
         op.beat();
