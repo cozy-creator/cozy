@@ -143,7 +143,7 @@ fn uint(d: &mut Decoder<'_>, what: &At<'_>) -> Result<u64> {
 fn digest_bytes(what: &str, hex: &str) -> Result<[u8; 32]> {
     crate::ids::hex64(what, hex)?;
     let mut out = [0u8; 32];
-    for (i, pair) in hex.as_bytes().chunks_exact(2).enumerate() {
+    for (i, pair) in hex.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let nibble = |b: u8| match b {
             b'0'..=b'9' => b - b'0',
             b'a'..=b'f' => b - b'a' + 10,
@@ -677,7 +677,7 @@ fn decode(bytes: &[u8]) -> Result<Header> {
         let name = text(&mut d, &what.field("name"), limits::MAX_NAME_BYTES)?;
         let config = d
             .bytes()
-            .map_err(|error| malformed(&what.field("canonical_json"), error))?;
+            .map_err(|error| malformed(what.field("canonical_json"), error))?;
         if config.len() > limits::DOC_MAX_BYTES {
             return refuse(
                 Code::SIZE_CAP,
@@ -740,7 +740,7 @@ fn decode(bytes: &[u8]) -> Result<Header> {
         )?;
         tensor_count = tensor_count
             .checked_add(count)
-            .ok_or_else(|| malformed(&what, "tensor count overflow"))?;
+            .ok_or_else(|| malformed(what, "tensor count overflow"))?;
         if tensor_count > limits::MAX_TENSORS {
             return refuse(Code::COUNT_CAP, "whole-header tensor count over cap");
         }

@@ -3068,8 +3068,8 @@ pub fn checkpoint_progress(
         })
         .transpose()?;
     let delta = progress::Delta::between(&progress, prior.as_ref(), work_ref.clone())?;
-    if delta.is_empty() && previous.is_some() {
-        let prior = crate::durability::local_chain(store, previous.as_ref().unwrap(), &plan)?;
+    if let Some(head) = previous.as_ref().filter(|_| delta.is_empty()) {
+        let prior = crate::durability::local_chain(store, head, &plan)?;
         return Ok((
             plan,
             crate::durability::Head {

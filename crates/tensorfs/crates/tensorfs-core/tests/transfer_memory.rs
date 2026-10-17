@@ -34,9 +34,9 @@ struct Pattern {
 impl Read for Pattern {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let n = buf.len().min((self.end - self.at) as usize) / 8 * 8;
-        for (i, word) in buf[..n].chunks_exact_mut(8).enumerate() {
+        for (i, word) in buf[..n].as_chunks_mut::<8>().0.iter_mut().enumerate() {
             let at = (self.at / 8 + i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-            word.copy_from_slice(&at.to_le_bytes());
+            *word = at.to_le_bytes();
         }
         self.at += n as u64;
         Ok(n)
