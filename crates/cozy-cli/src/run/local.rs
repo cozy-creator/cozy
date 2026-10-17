@@ -87,7 +87,8 @@ pub async fn run(
     let out = args.out.as_ref().map(|dir| terms.cwd.join(dir));
     let mut submission = call.submission(on, &hub.origin, &spec, bound, out);
     submission.inputs.extend(local.inputs.iter().cloned());
-    super::send(ctx, submission, &terms.key, args.detach).await
+    let run = super::send(ctx, submission, &terms.key, args.detach).await?;
+    Ok(super::exit_code(&run))
 }
 
 /// Installs the code on its machine: a WARM run naming no function, whose result is the

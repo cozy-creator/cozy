@@ -1,0 +1,1086 @@
+[
+ {
+  "called_at_ms": 1792208871921,
+  "finished_at_ms": 1792208894263,
+  "function": "remove_background",
+  "index": 0,
+  "label": "Removing background from Juno",
+  "measurements": {
+   "attribution": {
+    "stages": {
+     "loading weights": {
+      "count": 1,
+      "ended_unix_ms": 1792208893771,
+      "first_ms": 55.859,
+      "last_ms": 55.859,
+      "max_ms": 55.859,
+      "mean_ms": 55.859,
+      "min_ms": 55.859,
+      "started_unix_ms": 1792208893715,
+      "total_ms": 55.859
+     },
+     "reading reference": {
+      "count": 1,
+      "ended_unix_ms": 1792208893706,
+      "first_ms": 64.456,
+      "last_ms": 64.456,
+      "max_ms": 64.456,
+      "mean_ms": 64.456,
+      "min_ms": 64.456,
+      "started_unix_ms": 1792208893642,
+      "total_ms": 64.456
+     },
+     "removing background": {
+      "count": 1,
+      "ended_unix_ms": 1792208894183,
+      "first_ms": 420.747,
+      "last_ms": 420.747,
+      "max_ms": 420.747,
+      "mean_ms": 420.747,
+      "min_ms": 420.747,
+      "started_unix_ms": 1792208893762,
+      "total_ms": 420.747
+     },
+     "saving character reference": {
+      "count": 1,
+      "ended_unix_ms": 1792208894189,
+      "first_ms": 5.716,
+      "last_ms": 5.716,
+      "max_ms": 5.716,
+      "mean_ms": 5.716,
+      "min_ms": 5.716,
+      "started_unix_ms": 1792208894183,
+      "total_ms": 5.716
+     }
+    },
+    "steps": {}
+   },
+   "execution": {
+    "construction": {
+     "fill_ms": 0.0,
+     "legs_ms": {
+      "admission": 0.0,
+      "attention_pin": 3.5,
+      "backend_ctor": 231.0,
+      "checkpoint_headers": 7.9,
+      "construct.census": 18.1,
+      "construct.factory": 340.0,
+      "construct.fill": 173.6,
+      "construct.fit": 5.2,
+      "construct_and_register": 539.4,
+      "construction_config": 0.4,
+      "cuda_init": 0.0,
+      "execution_plan": 0.0,
+      "expect": 6.4,
+      "install": 70.8,
+      "measure_device": 74.3,
+      "package_import": 0.0,
+      "qualify": 5080.9,
+      "resolve": 67.3,
+      "runtime_imports": 0.3,
+      "torch_import": 0.1
+     },
+     "prepare_ms": 6085.81,
+     "prepared_unix_ms": 1792208893525,
+     "warm_ms": 0.0
+    },
+    "degree": 1,
+    "executor": {
+     "legs_ms": {
+      "cuda_init": 758.2,
+      "fork": 261.9,
+      "package_import": 4758.7,
+      "package_warmup": 0.0,
+      "runtime_imports": 0.0,
+      "torch_import": 0.0
+     },
+     "ms": 758.2,
+     "started_unix_ms": 1792208886676
+    },
+    "ranks": [
+     {
+      "arch": "sm_80",
+      "attention": {
+       "impl": "",
+       "observed": "",
+       "requested": ""
+      },
+      "end_us": 1792208894193254,
+      "ordinal": 0,
+      "pid": 1148,
+      "rank": 0,
+      "start_us": 1792208893635353,
+      "uuid": "GPU-6699154a-f45c-a21b-6cb2-b054fbadc231"
+     }
+    ],
+    "spread": {}
+   },
+   "memory": {
+    "activation_peak_bytes": 1258291200,
+    "alloc_ooms": 0,
+    "alloc_retries": 0,
+    "bounce_bytes": 0,
+    "budget_bytes": 488636416,
+    "cache_released_bytes": 0,
+    "cache_releases": 0,
+    "cap_bytes": 84817084416,
+    "context_bytes": 564133888,
+    "disk_bytes": 446204802,
+    "evictions": 0,
+    "modes": {
+     "model.grain": "sub-block"
+    },
+    "oom_retries": 0,
+    "paged_in_bytes": 446204802,
+    "paged_out": 0,
+    "paged_out_bytes": 0,
+    "peak_allocated_bytes": 1233725440,
+    "peak_reserved_bytes": 1453326336,
+    "process_bytes": 2506096640,
+    "register_failed": 0,
+    "reserved_bytes": 1453326336,
+    "shortfall": null,
+    "stage_peaks": {
+     "mask": 1258291200
+    },
+    "weights_bytes": 488636416
+   },
+   "observations": [],
+   "software": {
+    "attempt_ordinal": 1,
+    "runtime": "0.26.4",
+    "tensord": "0.7.3",
+    "tensord_commit": "b6a317076067112c536dd3429de1daa410c9b323",
+    "tensorfs": "0.10.0"
+   }
+  },
+  "run": "req-7b6cf18c7b6603b7d6e2ee30/0",
+  "status": "succeeded"
+ },
+ {
+  "called_at_ms": 1792208894415,
+  "finished_at_ms": 1792209303849,
+  "function": "motion_segment",
+  "index": 1,
+  "label": "Segment 1 of 2",
+  "measurements": {
+   "attribution": {
+    "stages": {
+     "condition": {
+      "count": 1,
+      "ended_unix_ms": 1792209096897,
+      "first_ms": 2219.202,
+      "last_ms": 2219.202,
+      "max_ms": 2219.202,
+      "mean_ms": 2219.202,
+      "min_ms": 2219.202,
+      "started_unix_ms": 1792209094678,
+      "total_ms": 2219.202
+     },
+     "decode_audio": {
+      "count": 1,
+      "ended_unix_ms": 1792209281315,
+      "first_ms": 202.284,
+      "last_ms": 202.284,
+      "max_ms": 202.284,
+      "mean_ms": 202.284,
+      "min_ms": 202.284,
+      "started_unix_ms": 1792209281113,
+      "total_ms": 202.284
+     },
+     "decode_video": {
+      "count": 1,
+      "ended_unix_ms": 1792209302315,
+      "first_ms": 20996.321,
+      "last_ms": 20996.321,
+      "max_ms": 20996.321,
+      "mean_ms": 20996.321,
+      "min_ms": 20996.321,
+      "started_unix_ms": 1792209281318,
+      "total_ms": 20996.321
+     },
+     "denoise": {
+      "count": 1,
+      "ended_unix_ms": 1792209281105,
+      "first_ms": 183114.893,
+      "last_ms": 183114.893,
+      "max_ms": 183114.893,
+      "mean_ms": 183114.893,
+      "min_ms": 183114.893,
+      "started_unix_ms": 1792209097991,
+      "total_ms": 183114.893
+     },
+     "loading weights": {
+      "count": 4,
+      "ended_unix_ms": 1792209098093,
+      "first_ms": 175047.94,
+      "last_ms": 49.215,
+      "max_ms": 175047.94,
+      "mean_ms": 44805.754,
+      "min_ms": 49.215,
+      "started_unix_ms": 1792208916650,
+      "total_ms": 179223.018
+     },
+     "prepare": {
+      "count": 1,
+      "ended_unix_ms": 1792208916547,
+      "first_ms": 147.532,
+      "last_ms": 147.532,
+      "max_ms": 147.532,
+      "mean_ms": 147.532,
+      "min_ms": 147.532,
+      "started_unix_ms": 1792208916399,
+      "total_ms": 147.532
+     }
+    },
+    "steps": {
+     "decode_video": {
+      "count": 11,
+      "ended_unix_ms": 1792209302311,
+      "first_ms": 2119.347,
+      "last_ms": 42.047,
+      "max_ms": 2119.347,
+      "mean_ms": 1908.372,
+      "min_ms": 42.047,
+      "series": [
+       [
+        1792209283438,
+        2119.347
+       ],
+       [
+        1792209285517,
+        2079.468
+       ],
+       [
+        1792209287613,
+        2095.372
+       ],
+       [
+        1792209289709,
+        2095.782
+       ],
+       [
+        1792209291801,
+        2092.986
+       ],
+       [
+        1792209293906,
+        2104.339
+       ],
+       [
+        1792209296001,
+        2094.702
+       ],
+       [
+        1792209298089,
+        2088.896
+       ],
+       [
+        1792209300184,
+        2094.767
+       ],
+       [
+        1792209302269,
+        2084.384
+       ],
+       [
+        1792209302311,
+        42.047
+       ]
+      ],
+      "series_dropped": 0,
+      "started_unix_ms": 1792209281319,
+      "total_ms": 20992.09
+     },
+     "denoise": {
+      "count": 8,
+      "ended_unix_ms": 1792209280812,
+      "first_ms": 30113.762,
+      "last_ms": 15662.555,
+      "max_ms": 30113.762,
+      "mean_ms": 22852.649,
+      "min_ms": 15662.555,
+      "series": [
+       [
+        1792209128104,
+        30113.762
+       ],
+       [
+        1792209151047,
+        22942.719
+       ],
+       [
+        1792209180493,
+        29445.616
+       ],
+       [
+        1792209209943,
+        29450.764
+       ],
+       [
+        1792209233669,
+        23725.829
+       ],
+       [
+        1792209249434,
+        15764.66
+       ],
+       [
+        1792209265149,
+        15715.287
+       ],
+       [
+        1792209280812,
+        15662.555
+       ]
+      ],
+      "series_dropped": 0,
+      "started_unix_ms": 1792209097991,
+      "total_ms": 182821.192
+     }
+    }
+   },
+   "execution": {
+    "construction": {
+     "fill_ms": 0.0,
+     "legs_ms": {
+      "base_model.admission": 0.0,
+      "base_model.attention_pin": 38.9,
+      "base_model.backend_ctor": 350.5,
+      "base_model.checkpoint_headers": 37.0,
+      "base_model.construct.census": 105.6,
+      "base_model.construct.factory": 2343.1,
+      "base_model.construct.fill": 1410.0,
+      "base_model.construct.fit": 21.4,
+      "base_model.construct_and_register": 3885.6,
+      "base_model.construction_config": 15.0,
+      "base_model.cuda_init": 0.0,
+      "base_model.execution_plan": 17.2,
+      "base_model.expect": 24.1,
+      "base_model.install": 135.8,
+      "base_model.measure_device": 77.7,
+      "base_model.package_import": 0.0,
+      "base_model.qualify": 14855.8,
+      "base_model.resolve": 443.1,
+      "base_model.runtime_imports": 0.3,
+      "base_model.torch_import": 0.1,
+      "turbo_lora.admission": 0.0,
+      "turbo_lora.attention_pin": 4.3,
+      "turbo_lora.backend_ctor": 26.1,
+      "turbo_lora.checkpoint_headers": 10.0,
+      "turbo_lora.construct.census": 32.9,
+      "turbo_lora.construct.factory": 121.2,
+      "turbo_lora.construct.fill": 198.1,
+      "turbo_lora.construct.fit": 6.0,
+      "turbo_lora.construct_and_register": 359.9,
+      "turbo_lora.construction_config": 2.1,
+      "turbo_lora.cuda_init": 0.0,
+      "turbo_lora.execution_plan": 0.0,
+      "turbo_lora.expect": 4.7,
+      "turbo_lora.install": 17.0,
+      "turbo_lora.measure_device": 92.6,
+      "turbo_lora.package_import": 0.0,
+      "turbo_lora.qualify": 7.4,
+      "turbo_lora.resolve": 71.3,
+      "turbo_lora.runtime_imports": 0.1,
+      "turbo_lora.torch_import": 0.1
+     },
+     "prepare_ms": 20502.57,
+     "prepared_unix_ms": 1792208916065,
+     "warm_ms": 0.0
+    },
+    "degree": 1,
+    "executor": {
+     "legs_ms": {
+      "cuda_init": 746.2,
+      "fork": 30.1,
+      "package_import": 11801.2,
+      "package_warmup": 0.0,
+      "runtime_imports": 0.0,
+      "torch_import": 0.0
+     },
+     "ms": 746.3,
+     "started_unix_ms": 1792208894591
+    },
+    "ranks": [
+     {
+      "arch": "sm_80",
+      "attention": {
+       "impl": "kitchen-int8:comfy_kitchen.int8_attention,kitchen-sol-producer-fast-shared-qkv:comfy_kitchen.sol_attn(int8, tau=1, current-call stats)+comfy_kitchen.sol_attn_chunked(int8, stats=current-call, vmargin=1.1, prefix=int8, qkv=non-rowwise-leaf:28)+comfy_kitchen.sol_attn_chunked(int8, stats=previous-step, vmargin=1.1, prefix=int8, qkv=non-rowwise-leaf:14),sdpa:flash",
+       "kernels": [
+        {
+         "compile_ms": 803.7,
+         "kernel": "kitchen-sol",
+         "line": "ready (compiled in 0.8 s)",
+         "served": false,
+         "state": "ready"
+        },
+        {
+         "kernel": "kitchen-sol-producer-fast-shared-qkv",
+         "line": "ready",
+         "served": true,
+         "state": "ready"
+        },
+        {
+         "kernel": "sdpa",
+         "line": "ready",
+         "served": true,
+         "state": "ready"
+        }
+       ],
+       "observed": "audio_vae=sdpa,ref2va_dit=kitchen-sol-producer-fast-shared-qkv,video_vae=sdpa",
+       "requested": ""
+      },
+      "end_us": 1792209302565325,
+      "ordinal": 0,
+      "pid": 1197,
+      "rank": 0,
+      "start_us": 1792208916367057,
+      "uuid": "GPU-6699154a-f45c-a21b-6cb2-b054fbadc231"
+     }
+    ],
+    "spread": {}
+   },
+   "memory": {
+    "activation_peak_bytes": 12736004096,
+    "alloc_ooms": 0,
+    "alloc_retries": 0,
+    "bounce_bytes": 55226461984,
+    "budget_bytes": 61171826688,
+    "cache_released_bytes": 0,
+    "cache_releases": 0,
+    "cap_bytes": 82305155072,
+    "context_bytes": 568328192,
+    "disk_bytes": 0,
+    "evictions": 0,
+    "modes": {
+     "TileBatchedVideoVAE._decode_tiles.pieces": "10",
+     "audio_vae.grain": "sub-block",
+     "lora_bake": "fused",
+     "ref2va_dit.graphs": "runs as written in an attention layout's scope",
+     "ref2va_turbo.grain": "sub-block"
+    },
+    "oom_retries": 0,
+    "paged_in_bytes": 55226461984,
+    "paged_out": 0,
+    "paged_out_bytes": 0,
+    "peak_allocated_bytes": 5066231296,
+    "peak_reserved_bytes": 13132365824,
+    "process_bytes": 69214404608,
+    "register_failed": 5,
+    "reserved_bytes": 13132365824,
+    "shortfall": null,
+    "stage_peaks": {
+     "base_model.condition_ref2va_media": 322710016,
+     "base_model.condition_text": 310617088,
+     "base_model.decode_audio": 428481024,
+     "base_model.decode_video": 4865098240,
+     "base_model.sample_ref2va_turbo": 12736004096,
+     "turbo_lora.sample_ref2va": 12736004096
+    },
+    "weights_bytes": 55513710592
+   },
+   "observations": [
+    {
+     "at_unix_ms": 1792209302554,
+     "attempt_key": "3",
+     "fields": {
+      "artifact": "comfy-kitchen",
+      "compile_ms": "803.7",
+      "key": "2c34122edcea8f38",
+      "selection": "attention.selected"
+     },
+     "kind": "confession",
+     "name": "attention.artifact",
+     "seq": 21,
+     "value": "kitchen-sol-producer-fast-shared-qkv"
+    },
+    {
+     "at_unix_ms": 1792209302554,
+     "attempt_key": "3",
+     "fields": {
+      "component": "base_model/audio_vae",
+      "dense_reference": "",
+      "pin": "",
+      "sites": 1
+     },
+     "kind": "confession",
+     "name": "attention.selected",
+     "seq": 22,
+     "value": "sdpa"
+    },
+    {
+     "at_unix_ms": 1792209302554,
+     "attempt_key": "3",
+     "fields": {
+      "component": "base_model/ref2va_dit",
+      "dense_reference": "kitchen-int8",
+      "pin": "",
+      "sites": 52
+     },
+     "kind": "confession",
+     "name": "attention.selected",
+     "seq": 23,
+     "value": "kitchen-sol-producer-fast-shared-qkv"
+    },
+    {
+     "at_unix_ms": 1792209302554,
+     "attempt_key": "3",
+     "fields": {
+      "component": "base_model/video_vae",
+      "dense_reference": "",
+      "pin": "",
+      "sites": 36
+     },
+     "kind": "confession",
+     "name": "attention.selected",
+     "seq": 24,
+     "value": "sdpa"
+    },
+    {
+     "at_unix_ms": 1792209302554,
+     "attempt_key": "3",
+     "fields": {
+      "dense_path": 32,
+      "dense_prefix": 192,
+      "dense_reference": "kitchen-int8",
+      "dense_step": 192,
+      "rank": 0,
+      "sparse": 192,
+      "world": 1
+     },
+     "kind": "confession",
+     "name": "attention.sol.calls",
+     "seq": 25,
+     "value": "kitchen-sol-producer-fast-shared-qkv"
+    },
+    {
+     "at_unix_ms": 1792209302554,
+     "attempt_key": "3",
+     "fields": {
+      "artifact": "comfy-kitchen",
+      "compile_ms": "803.7",
+      "key": "2c34122edcea8f38",
+      "selection": "attention.restored"
+     },
+     "kind": "confession",
+     "name": "attention.artifact",
+     "seq": 26,
+     "value": "kitchen-sol-producer-fast-shared-qkv"
+    },
+    {
+     "at_unix_ms": 1792209302555,
+     "attempt_key": "3",
+     "fields": {
+      "component": "base_model/audio_vae",
+      "dense_reference": "",
+      "pin": "",
+      "sites": 1
+     },
+     "kind": "confession",
+     "name": "attention.restored",
+     "seq": 27,
+     "value": "sdpa"
+    },
+    {
+     "at_unix_ms": 1792209302555,
+     "attempt_key": "3",
+     "fields": {
+      "component": "base_model/ref2va_dit",
+      "dense_reference": "kitchen-int8",
+      "pin": "",
+      "sites": 52
+     },
+     "kind": "confession",
+     "name": "attention.restored",
+     "seq": 28,
+     "value": "kitchen-sol-producer-fast-shared-qkv"
+    },
+    {
+     "at_unix_ms": 1792209302555,
+     "attempt_key": "3",
+     "fields": {
+      "component": "base_model/video_vae",
+      "dense_reference": "",
+      "pin": "",
+      "sites": 36
+     },
+     "kind": "confession",
+     "name": "attention.restored",
+     "seq": 29,
+     "value": "sdpa"
+    }
+   ],
+   "software": {
+    "attempt_ordinal": 1,
+    "runtime": "0.26.4",
+    "tensord": "0.7.3",
+    "tensord_commit": "b6a317076067112c536dd3429de1daa410c9b323",
+    "tensorfs": "0.10.0"
+   }
+  },
+  "run": "req-7b6cf18c7b6603b7d6e2ee30/1",
+  "status": "succeeded"
+ },
+ {
+  "called_at_ms": 1792209303952,
+  "finished_at_ms": 1792209608237,
+  "function": "motion_segment",
+  "index": 2,
+  "label": "Segment 2 of 2",
+  "measurements": {
+   "attribution": {
+    "stages": {
+     "condition": {
+      "count": 1,
+      "ended_unix_ms": 1792209305005,
+      "first_ms": 350.683,
+      "last_ms": 350.683,
+      "max_ms": 350.683,
+      "mean_ms": 350.683,
+      "min_ms": 350.683,
+      "started_unix_ms": 1792209304654,
+      "total_ms": 350.683
+     },
+     "decode_audio": {
+      "count": 1,
+      "ended_unix_ms": 1792209579625,
+      "first_ms": 146.444,
+      "last_ms": 146.444,
+      "max_ms": 146.444,
+      "mean_ms": 146.444,
+      "min_ms": 146.444,
+      "started_unix_ms": 1792209579478,
+      "total_ms": 146.444
+     },
+     "decode_video": {
+      "count": 1,
+      "ended_unix_ms": 1792209606722,
+      "first_ms": 27095.401,
+      "last_ms": 27095.401,
+      "max_ms": 27095.401,
+      "mean_ms": 27095.401,
+      "min_ms": 27095.401,
+      "started_unix_ms": 1792209579627,
+      "total_ms": 27095.401
+     },
+     "denoise": {
+      "count": 1,
+      "ended_unix_ms": 1792209579478,
+      "first_ms": 274472.523,
+      "last_ms": 274472.523,
+      "max_ms": 274472.523,
+      "mean_ms": 274472.523,
+      "min_ms": 274472.523,
+      "started_unix_ms": 1792209305005,
+      "total_ms": 274472.523
+     },
+     "prepare": {
+      "count": 1,
+      "ended_unix_ms": 1792209304654,
+      "first_ms": 23.713,
+      "last_ms": 23.713,
+      "max_ms": 23.713,
+      "mean_ms": 23.713,
+      "min_ms": 23.713,
+      "started_unix_ms": 1792209304630,
+      "total_ms": 23.713
+     }
+    },
+    "steps": {
+     "decode_video": {
+      "count": 13,
+      "ended_unix_ms": 1792209606718,
+      "first_ms": 4022.258,
+      "last_ms": 41.073,
+      "max_ms": 4022.258,
+      "mean_ms": 2083.925,
+      "min_ms": 41.073,
+      "series": [
+       [
+        1792209583649,
+        4022.258
+       ],
+       [
+        1792209585747,
+        2097.474
+       ],
+       [
+        1792209587842,
+        2095.605
+       ],
+       [
+        1792209589930,
+        2087.571
+       ],
+       [
+        1792209592030,
+        2100.458
+       ],
+       [
+        1792209594118,
+        2087.904
+       ],
+       [
+        1792209596217,
+        2098.357
+       ],
+       [
+        1792209598313,
+        2096.35
+       ],
+       [
+        1792209600400,
+        2087.027
+       ],
+       [
+        1792209602490,
+        2089.675
+       ],
+       [
+        1792209604584,
+        2094.112
+       ],
+       [
+        1792209606677,
+        2093.166
+       ],
+       [
+        1792209606718,
+        41.073
+       ]
+      ],
+      "series_dropped": 0,
+      "started_unix_ms": 1792209579627,
+      "total_ms": 27091.03
+     },
+     "denoise": {
+      "count": 8,
+      "ended_unix_ms": 1792209579052,
+      "first_ms": 45480.14,
+      "last_ms": 22604.001,
+      "max_ms": 45480.14,
+      "mean_ms": 34255.779,
+      "min_ms": 22604.001,
+      "series": [
+       [
+        1792209350486,
+        45480.14
+       ],
+       [
+        1792209387754,
+        37268.677
+       ],
+       [
+        1792209433140,
+        45385.714
+       ],
+       [
+        1792209478536,
+        45395.774
+       ],
+       [
+        1792209511144,
+        32608.289
+       ],
+       [
+        1792209533813,
+        22669.106
+       ],
+       [
+        1792209556448,
+        22634.535
+       ],
+       [
+        1792209579052,
+        22604.001
+       ]
+      ],
+      "series_dropped": 0,
+      "started_unix_ms": 1792209305005,
+      "total_ms": 274046.236
+     }
+    }
+   },
+   "execution": {
+    "construction": {
+     "fill_ms": 0.0,
+     "legs_ms": {
+      "base_model.admission": 0.0,
+      "base_model.attention_pin": 38.9,
+      "base_model.backend_ctor": 350.5,
+      "base_model.checkpoint_headers": 37.0,
+      "base_model.construct.census": 105.6,
+      "base_model.construct.factory": 2343.1,
+      "base_model.construct.fill": 1410.0,
+      "base_model.construct.fit": 21.4,
+      "base_model.construct_and_register": 3885.6,
+      "base_model.construction_config": 15.0,
+      "base_model.cuda_init": 0.0,
+      "base_model.execution_plan": 17.2,
+      "base_model.expect": 24.1,
+      "base_model.install": 135.8,
+      "base_model.measure_device": 77.7,
+      "base_model.package_import": 0.0,
+      "base_model.qualify": 14855.8,
+      "base_model.resolve": 443.1,
+      "base_model.runtime_imports": 0.3,
+      "base_model.torch_import": 0.1,
+      "turbo_lora.admission": 0.0,
+      "turbo_lora.attention_pin": 4.3,
+      "turbo_lora.backend_ctor": 26.1,
+      "turbo_lora.checkpoint_headers": 10.0,
+      "turbo_lora.construct.census": 32.9,
+      "turbo_lora.construct.factory": 121.2,
+      "turbo_lora.construct.fill": 198.1,
+      "turbo_lora.construct.fit": 6.0,
+      "turbo_lora.construct_and_register": 359.9,
+      "turbo_lora.construction_config": 2.1,
+      "turbo_lora.cuda_init": 0.0,
+      "turbo_lora.execution_plan": 0.0,
+      "turbo_lora.expect": 4.7,
+      "turbo_lora.install": 17.0,
+      "turbo_lora.measure_device": 92.6,
+      "turbo_lora.package_import": 0.0,
+      "turbo_lora.qualify": 7.4,
+      "turbo_lora.resolve": 71.3,
+      "turbo_lora.runtime_imports": 0.1,
+      "turbo_lora.torch_import": 0.1
+     },
+     "prepare_ms": 20502.57,
+     "prepared_unix_ms": 1792208916065,
+     "warm_ms": 0.0
+    },
+    "degree": 1,
+    "executor": {
+     "legs_ms": {
+      "cuda_init": 746.2,
+      "fork": 30.1,
+      "package_import": 11801.2,
+      "package_warmup": 0.0,
+      "runtime_imports": 0.0,
+      "torch_import": 0.0
+     },
+     "ms": 746.3,
+     "started_unix_ms": 1792208894591
+    },
+    "ranks": [
+     {
+      "arch": "sm_80",
+      "attention": {
+       "impl": "kitchen-int8:comfy_kitchen.int8_attention,kitchen-sol-producer-fast-shared-qkv:comfy_kitchen.sol_attn(int8, tau=1, current-call stats)+comfy_kitchen.sol_attn_chunked(int8, stats=current-call, vmargin=1.1, prefix=int8, qkv=non-rowwise-leaf:36)+comfy_kitchen.sol_attn_chunked(int8, stats=previous-step, vmargin=1.1, prefix=int8, qkv=non-rowwise-leaf:18),sdpa:flash",
+       "kernels": [
+        {
+         "compile_ms": 803.7,
+         "kernel": "kitchen-sol",
+         "line": "ready (compiled in 0.8 s)",
+         "served": false,
+         "state": "ready"
+        },
+        {
+         "kernel": "kitchen-sol-producer-fast-shared-qkv",
+         "line": "ready",
+         "served": true,
+         "state": "ready"
+        },
+        {
+         "kernel": "sdpa",
+         "line": "ready",
+         "served": true,
+         "state": "ready"
+        }
+       ],
+       "observed": "audio_vae=sdpa,ref2va_dit=kitchen-sol-producer-fast-shared-qkv,video_vae=sdpa",
+       "requested": ""
+      },
+      "end_us": 1792209607038901,
+      "ordinal": 0,
+      "pid": 1197,
+      "rank": 0,
+      "start_us": 1792209304599842,
+      "uuid": "GPU-6699154a-f45c-a21b-6cb2-b054fbadc231"
+     }
+    ],
+    "spread": {}
+   },
+   "memory": {
+    "activation_peak_bytes": 12910018048,
+    "alloc_ooms": 0,
+    "alloc_retries": 0,
+    "bounce_bytes": 0,
+    "budget_bytes": 9349431296,
+    "cache_released_bytes": 0,
+    "cache_releases": 0,
+    "cap_bytes": 26789347328,
+    "context_bytes": 568328192,
+    "disk_bytes": 0,
+    "evictions": 0,
+    "modes": {
+     "audio_vae.grain": "sub-block",
+     "lora_bake": "fused",
+     "ref2va_dit.graphs": "runs as written in an attention layout's scope",
+     "ref2va_turbo.grain": "sub-block"
+    },
+    "oom_retries": 0,
+    "paged_in_bytes": 0,
+    "paged_out": 0,
+    "paged_out_bytes": 0,
+    "peak_allocated_bytes": 5121505280,
+    "peak_reserved_bytes": 16804478976,
+    "process_bytes": 17372807168,
+    "register_failed": 0,
+    "reserved_bytes": 16804478976,
+    "shortfall": null,
+    "stage_peaks": {
+     "base_model.condition_ref2va_media": 0,
+     "base_model.condition_text": 310001664,
+     "base_model.decode_audio": 477767680,
+     "base_model.decode_video": 4870904320,
+     "base_model.sample_ref2va_turbo": 12910018048,
+     "turbo_lora.sample_ref2va": 12910018048
+    },
+    "weights_bytes": 55513710592
+   },
+   "observations": [
+    {
+     "at_unix_ms": 1792209607028,
+     "attempt_key": "4",
+     "fields": {
+      "artifact": "comfy-kitchen",
+      "compile_ms": "803.7",
+      "key": "2c34122edcea8f38",
+      "selection": "attention.selected"
+     },
+     "kind": "confession",
+     "name": "attention.artifact",
+     "seq": 17,
+     "value": "kitchen-sol-producer-fast-shared-qkv"
+    },
+    {
+     "at_unix_ms": 1792209607028,
+     "attempt_key": "4",
+     "fields": {
+      "component": "base_model/audio_vae",
+      "dense_reference": "",
+      "pin": "",
+      "sites": 1
+     },
+     "kind": "confession",
+     "name": "attention.selected",
+     "seq": 18,
+     "value": "sdpa"
+    },
+    {
+     "at_unix_ms": 1792209607028,
+     "attempt_key": "4",
+     "fields": {
+      "component": "base_model/ref2va_dit",
+      "dense_reference": "kitchen-int8",
+      "pin": "",
+      "sites": 52
+     },
+     "kind": "confession",
+     "name": "attention.selected",
+     "seq": 19,
+     "value": "kitchen-sol-producer-fast-shared-qkv"
+    },
+    {
+     "at_unix_ms": 1792209607028,
+     "attempt_key": "4",
+     "fields": {
+      "component": "base_model/video_vae",
+      "dense_reference": "",
+      "pin": "",
+      "sites": 36
+     },
+     "kind": "confession",
+     "name": "attention.selected",
+     "seq": 20,
+     "value": "sdpa"
+    },
+    {
+     "at_unix_ms": 1792209607029,
+     "attempt_key": "4",
+     "fields": {
+      "dense_path": 32,
+      "dense_prefix": 192,
+      "dense_reference": "kitchen-int8",
+      "dense_step": 192,
+      "rank": 0,
+      "sparse": 192,
+      "world": 1
+     },
+     "kind": "confession",
+     "name": "attention.sol.calls",
+     "seq": 21,
+     "value": "kitchen-sol-producer-fast-shared-qkv"
+    },
+    {
+     "at_unix_ms": 1792209607029,
+     "attempt_key": "4",
+     "fields": {
+      "artifact": "comfy-kitchen",
+      "compile_ms": "803.7",
+      "key": "2c34122edcea8f38",
+      "selection": "attention.restored"
+     },
+     "kind": "confession",
+     "name": "attention.artifact",
+     "seq": 22,
+     "value": "kitchen-sol-producer-fast-shared-qkv"
+    },
+    {
+     "at_unix_ms": 1792209607029,
+     "attempt_key": "4",
+     "fields": {
+      "component": "base_model/audio_vae",
+      "dense_reference": "",
+      "pin": "",
+      "sites": 1
+     },
+     "kind": "confession",
+     "name": "attention.restored",
+     "seq": 23,
+     "value": "sdpa"
+    },
+    {
+     "at_unix_ms": 1792209607029,
+     "attempt_key": "4",
+     "fields": {
+      "component": "base_model/ref2va_dit",
+      "dense_reference": "kitchen-int8",
+      "pin": "",
+      "sites": 52
+     },
+     "kind": "confession",
+     "name": "attention.restored",
+     "seq": 24,
+     "value": "kitchen-sol-producer-fast-shared-qkv"
+    },
+    {
+     "at_unix_ms": 1792209607029,
+     "attempt_key": "4",
+     "fields": {
+      "component": "base_model/video_vae",
+      "dense_reference": "",
+      "pin": "",
+      "sites": 36
+     },
+     "kind": "confession",
+     "name": "attention.restored",
+     "seq": 25,
+     "value": "sdpa"
+    }
+   ],
+   "software": {
+    "attempt_ordinal": 1,
+    "runtime": "0.26.4",
+    "tensord": "0.7.3",
+    "tensord_commit": "b6a317076067112c536dd3429de1daa410c9b323",
+    "tensorfs": "0.10.0"
+   }
+  },
+  "run": "req-7b6cf18c7b6603b7d6e2ee30/2",
+  "status": "succeeded"
+ }
+]
