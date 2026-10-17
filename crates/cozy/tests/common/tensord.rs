@@ -147,12 +147,6 @@ fn wait_ready(child: &mut Child, leaf: &Path, address: &str) {
     }
 }
 
-/// Whether COZY_TEST_TENSORD is this workspace's TensorD rather than a released cozy-runtime
-/// wheel's: Tensorhub's job says so when it builds it (`cozy_tensord=workspace` sets COZY_TENSORD).
-pub fn workspace() -> bool {
-    std::env::var("COZY_TENSORD").as_deref() == Ok("workspace")
-}
-
 /// A TensorD added to `home`'s Calcifer as `name`, the way a person adds one: `cozy machine add`
 /// answers the key this controller signs with, the machine admits it, and the add is made again.
 pub fn added(home: &super::Home, name: &str) -> Tensord {
