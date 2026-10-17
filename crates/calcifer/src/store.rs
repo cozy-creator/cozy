@@ -9,8 +9,8 @@ use std::{
 
 use cozy_proto::{
     calcifer::{
-        Call, Event, ItemStatus, Kind, Machine, MachineKind, MachineState, OutputItem, Reason, Run,
-        Status, Warning,
+        CHECKPOINT, Call, Event, ItemStatus, Kind, Machine, MachineKind, MachineState, OutputItem,
+        Reason, Run, Status, Warning,
     },
     ids::{Digest, RunId},
     machine as v1,
@@ -1000,10 +1000,11 @@ impl Store {
             let mut statement = conn.prepare(
                 "SELECT DISTINCT runs.id, runs.number FROM outputs JOIN runs ON runs.id = outputs.run
                  WHERE outputs.exported_rev IS NOT outputs.rev AND outputs.failed_rev IS NOT outputs.rev
+                   AND outputs.media_type IS NOT ?1
                  ORDER BY runs.number",
             )?;
             let rows = statement
-                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64)))?
+                .query_map([CHECKPOINT], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64)))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             rows.into_iter()
                 .map(|(id, number)| Ok((RunId::try_from(id).map_err(|e| StoreError::Corrupt(e.into()))?, number)))
@@ -1019,11 +1020,11 @@ impl Store {
                 "SELECT runs.id, runs.number, outputs.name, outputs.idx, outputs.length
                  FROM outputs JOIN runs ON runs.id = outputs.run
                  WHERE runs.machine = ?1 AND outputs.exported_rev IS NOT outputs.rev
-                   AND outputs.failed_rev IS NOT outputs.rev
+                   AND outputs.failed_rev IS NOT outputs.rev AND outputs.media_type IS NOT ?2
                  ORDER BY runs.number, outputs.created_seq",
             )?;
             let rows = statement
-                .query_map([machine], |r| {
+                .query_map([machine, CHECKPOINT], |r| {
                     Ok((
                         r.get::<_, String>(0)?,
                         r.get::<_, i64>(1)? as u64,
@@ -1048,15 +1049,16 @@ impl Store {
         })
     }
 
-    /// The run's outputs to export, in the order they first appeared.
+    /// The run's outputs to export, in the order they first appeared. A checkpoint is never
+    /// exported: it stays on its machine (`OutputItem::is_checkpoint`), so it is owed nowhere.
     pub fn outputs_to_export(&self, run: &str) -> Result<Vec<OutputRow>> {
         self.read(|conn| {
             let mut statement = conn.prepare(&format!(
                 "SELECT {OUTPUT_COLUMNS} FROM outputs WHERE run = ?1 AND exported_rev IS NOT rev
-                 AND failed_rev IS NOT rev ORDER BY created_seq"
+                 AND failed_rev IS NOT rev AND media_type IS NOT ?2 ORDER BY created_seq"
             ))?;
             Ok(statement
-                .query_map([run], output_row)?
+                .query_map([run, CHECKPOINT], output_row)?
                 .collect::<rusqlite::Result<_>>()?)
         })
     }

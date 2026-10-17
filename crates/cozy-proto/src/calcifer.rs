@@ -197,6 +197,17 @@ pub struct OutputItem {
     pub export_error: Option<String>,
 }
 
+/// A weights output's media type: its bytes are a checkpoint's manifest.
+pub const CHECKPOINT: &str = "application/vnd.cozy.model-manifest";
+
+impl OutputItem {
+    /// A checkpoint (a weights output) stays on the machine that wrote it, which uploads it to
+    /// the Hub; it is never saved to this computer, so it is final as soon as it is done.
+    pub fn is_checkpoint(&self) -> bool {
+        self.media_type == CHECKPOINT
+    }
+}
+
 /// The machine's progress report, as it last sent it.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Progress {
