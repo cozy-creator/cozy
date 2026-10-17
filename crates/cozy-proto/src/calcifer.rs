@@ -686,7 +686,8 @@ pub struct Keepalive {
     pub idle_deadline_ms: Option<i64>,
 }
 
-/// `POST /v1/machines`: rent one (with an `Idempotency-Key`) or add another computer's.
+/// `POST /v1/machines`: rent one (with an `Idempotency-Key`), add another computer's, or record
+/// this computer's.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum NewMachine {
@@ -704,6 +705,8 @@ pub enum NewMachine {
         /// `sha256:<hex>` of the machine's TLS leaf.
         fingerprint: Digest,
     },
+    /// This computer's machine, serving from `root` (`cozy machine enable`): recorded as `local`.
+    Local { root: std::path::PathBuf },
 }
 
 /// `GET /v1/machines/{name}/logs/{log}`: the logs a machine keeps.

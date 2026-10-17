@@ -163,13 +163,14 @@ async fn a_machine_is_added_only_at_its_fingerprint_with_this_controllers_key_ad
     );
     assert!(listed(&machines, "box").await.is_none());
 
+    // `local` is disabled, not ended: its row ends, and enable records it again.
     let local = machines.put_local(machine.endpoint.clone()).unwrap();
     assert_eq!(local.kind, MachineKind::Local);
-    let local_end = machines.end("local", false).await.unwrap_err();
-    assert_eq!(
-        (local_end.code.as_str(), local_end.next.as_slice()),
-        ("machine_local", &["cozy machine disable".to_string()][..])
-    );
+    let disabled = machines.end("local", false).await.unwrap();
+    assert!(disabled.changed && disabled.machine.state == MachineState::Ended);
+    assert!(listed(&machines, "local").await.is_none());
+    let again = machines.put_local(machine.endpoint.clone()).unwrap();
+    assert_eq!(again.state, MachineState::Ready);
     machines.close();
     calcifer.close();
 }

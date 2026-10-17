@@ -97,11 +97,22 @@ fn render(spec: &ServiceSpec) -> String {
         let log = string(&log.to_string_lossy());
         format!("<key>StandardOutPath</key>{log}<key>StandardErrorPath</key>{log}")
     });
+    let env = match spec.env.is_empty() {
+        true => String::new(),
+        false => {
+            let pairs: String = spec
+                .env
+                .iter()
+                .map(|(name, value)| format!("<key>{}</key>{}", escape(name), string(value)))
+                .collect();
+            format!("<key>EnvironmentVariables</key><dict>{pairs}</dict>")
+        }
+    };
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
          <plist version=\"1.0\"><dict><key>Label</key>{}<key>ProgramArguments</key><array>{arguments}</array>\
-         <key>RunAtLoad</key><true/><key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>{log}\
+         <key>RunAtLoad</key><true/><key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>{log}{env}\
          </dict></plist>\n",
         string(&label(&spec.name))
     )
@@ -113,6 +124,15 @@ fn escape(text: &str) -> String {
         .replace('>', "&gt;")
 }
 
+/// Only systemd ran an older cozy's machine.
+pub(super) fn legacy(_: &Path) -> Result<Option<super::Legacy>> {
+    Ok(None)
+}
+
+pub(super) fn retire(_: &str) -> Result<()> {
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -122,6 +142,7 @@ mod tests {
             program: "/Users/a b/.cozy/bin/cozy".into(),
             args: vec!["calcifer".into(), "<a & b>".into()],
             log: None,
+            env: vec![],
         };
         let plist = super::render(&spec);
         assert!(plist.contains(

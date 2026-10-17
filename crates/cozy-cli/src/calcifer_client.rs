@@ -360,6 +360,7 @@ impl Client {
             program: self.0.program.clone(),
             args: vec!["calcifer".into()],
             log: Some(self.0.home.calcifer_log()),
+            env: vec![("HOME".into(), self.0.user_home.display().to_string())],
         }
     }
 

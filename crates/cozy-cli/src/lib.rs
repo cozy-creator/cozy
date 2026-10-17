@@ -156,15 +156,6 @@ async fn dispatch(ctx: &Context, command: Command) -> Result<ExitCode, Error> {
     }
 }
 
-/// The refusal of a verb that is not ported yet.
-fn not_ported(verb: &str) -> Error {
-    Error::new(
-        Kind::Usage,
-        "not_ported",
-        format!("`cozy {verb}` is not in this build yet"),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use clap::CommandFactory as _;

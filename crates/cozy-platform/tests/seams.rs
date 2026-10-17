@@ -500,6 +500,7 @@ fn a_user_service_starts_and_stops() {
             name.into(),
         ],
         log: Some(odd.join("service.log")),
+        env: vec![],
     };
     services.start(&spec).unwrap();
     let running = started(&file, None);

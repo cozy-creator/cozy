@@ -14,6 +14,7 @@ use crate::{Context, output};
 mod end;
 mod list;
 pub(crate) mod live;
+mod local;
 mod rent;
 
 pub(crate) use list::status_fields;
@@ -107,10 +108,9 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
             runtime_wheel,
             tensorfs_wheel,
         } => end::update(ctx, &name, runtime_wheel, tensorfs_wheel).await,
-        // This computer's machine role needs TensorD inside the binary.
-        Verb::Enable => Err(crate::not_ported("machine enable")),
-        Verb::Disable => Err(crate::not_ported("machine disable")),
-        Verb::Authorize { .. } => Err(crate::not_ported("machine authorize")),
+        Verb::Enable => local::enable(ctx).await,
+        Verb::Disable => local::disable(ctx).await,
+        Verb::Authorize { public_key } => local::authorize(ctx, &public_key),
     }
 }
 

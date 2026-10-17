@@ -297,13 +297,14 @@ impl Machines {
                 abandoned: vec![],
             });
         }
+        // `cozy machine disable`: its runs here end, its files stay, and enable records it again.
         if row.kind == MachineKind::Local {
-            return Err(Error::new(
-                Kind::Conflict,
-                "machine_local",
-                "local is this computer's machine: it is disabled, not ended",
-            )
-            .next("cozy machine disable"));
+            self.ended(&row.name, "disabled on this computer");
+            return Ok(Ended {
+                machine: self.picture(&self.row(&row.name)?)?,
+                changed: true,
+                abandoned: vec![],
+            });
         }
         let owed = self.calcifer.owed_on(&row.name).map_err(internal)?;
         if !owed.is_empty() && !force {
@@ -837,6 +838,11 @@ pub(crate) async fn create(
         } => {
             let added = api.machines.add(&name, &address, &fingerprint).await;
             Ok(Json(added.map_err(Refusal)?).into_response())
+        }
+        NewMachine::Local { root } => {
+            let ready = root.join("var/lib/cozy/tensord/api-ready.json");
+            let local = api.machines.put_local(endpoint_of(&ready).map_err(Refusal)?);
+            Ok(Json(local.map_err(Refusal)?).into_response())
         }
     }
 }
