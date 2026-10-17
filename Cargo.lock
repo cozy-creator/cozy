@@ -1530,9 +1530,7 @@ dependencies = [
  "progenitor",
  "progenitor-client",
  "quote",
- "rcgen 0.14.10",
  "reqwest",
- "rustls",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -1540,8 +1538,8 @@ dependencies = [
  "syn 2.0.119",
  "thiserror 2.0.21",
  "tokio",
- "tokio-rustls",
  "tracing",
+ "x509-cert",
 ]
 
 [[package]]
