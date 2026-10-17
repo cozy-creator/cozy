@@ -229,7 +229,11 @@ async fn run(ctx: &Context, args: RunArgs) -> Result<ExitCode, Error> {
         } else {
             anstream::print!(
                 "{}",
-                describe::contract(&format!("{package}/{}", callable.name), callable)
+                describe::contract(
+                    &format!("{package}/{}", callable.name),
+                    &card.interface,
+                    callable
+                )
             );
         }
         return Ok(ExitCode::SUCCESS);

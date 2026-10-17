@@ -594,7 +594,8 @@ impl Binder<'_> {
             }
         }
         for raw in &self.terms.assets {
-            specs.push(self.asset_spec(raw));
+            let spec = self.asset_spec(raw, &specs);
+            specs.push(spec);
         }
         if let Some(assets) = &self.callable.assets {
             self.document
@@ -731,9 +732,10 @@ impl Binder<'_> {
         Ok(files)
     }
 
-    /// `field.path=file` names an input; `label=file` labels an Assets occurrence; a bare file
-    /// joins the Assets collection. An explicit path is never split on `=`.
-    fn asset_spec(&self, raw: &str) -> Spec {
+    /// `field.path=file` names an input (a list of files named whole takes its next slot);
+    /// `label=file` labels an Assets occurrence; a bare file joins the Assets collection. An
+    /// explicit path is never split on `=`.
+    fn asset_spec(&self, raw: &str, specs: &[Spec]) -> Spec {
         let bare = Spec {
             field: None,
             source: PathBuf::from(raw),
@@ -748,8 +750,39 @@ impl Binder<'_> {
         let source = PathBuf::from(source.trim());
         let name = name.trim();
         let parts: Vec<String> = name.split('.').map(str::to_owned).collect();
+        let first = self.fold(&parts[0]).ok();
+        let list = first.as_deref().filter(|first| {
+            let field = self.callable.field(first);
+            parts.len() == 1
+                && field
+                    .and_then(|f| f.ty.media())
+                    .is_some_and(|(_, list)| list)
+        });
+        if let Some(list) = list {
+            let held = self
+                .document
+                .get(list)
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            let prefix = format!("{list}.");
+            let slot = |s: &Spec| -> Option<usize> {
+                let rest = s.field.as_deref()?.strip_prefix(&prefix)?;
+                rest.split('.').next()?.parse().ok()
+            };
+            let next = specs
+                .iter()
+                .filter_map(slot)
+                .map(|i| i + 1)
+                .max()
+                .unwrap_or(0);
+            return Spec {
+                field: Some(format!("{list}.{}", held.max(next))),
+                source,
+                label: None,
+            };
+        }
         let named = self.callable.assets.is_none()
-            || self.fold(&parts[0]).is_ok_and(|first| {
+            || first.is_some_and(|first| {
                 self.accepts(&[&[first][..], &parts[1..]].concat())
                     .is_some()
             });
@@ -893,6 +926,11 @@ impl Binder<'_> {
                 }
                 several => {
                     let names: Vec<&str> = several.iter().map(|i| i.name).collect();
+                    let choice = |i: &&Input| match i.assets {
+                        true => format!("--asset {shown} (joins {})", i.name),
+                        false => format!("--asset {}={shown}", i.name),
+                    };
+                    let choices: Vec<String> = several.iter().map(choice).collect();
                     return Err(usage(
                         "positional_file_ambiguous",
                         format!(
@@ -900,7 +938,7 @@ impl Binder<'_> {
                             names.join(" and ")
                         ),
                     )
-                    .remedy(format!("name one: --asset {}={shown}", names[0])));
+                    .remedy(format!("name one: {}", choices.join(" or "))));
                 }
             }
         }

@@ -590,3 +590,71 @@ fn a_warm_run_takes_only_model_choices() {
     let refused = warm_choices(sdxl.callable("generate"), &sdxl.terms(&["prompt=x"])).unwrap_err();
     assert_eq!(refused.code, "warm_inputs");
 }
+
+/// The owner's ref2va request (1.39.0): a YAML `--input` whose `videos:` names clips beside it,
+/// under a folder and under `~`; each is staged as its own input, `videos.<i>`, in order.
+#[test]
+fn an_input_files_video_list_is_staged_from_beside_it() {
+    let h3 = Case::new("minimax-h3-1.39.0");
+    let dir = h3.dir.path();
+    let clip = |n: u8| [MP4, &[n]].concat();
+    std::fs::create_dir_all(dir.join("shots")).unwrap();
+    std::fs::create_dir_all(dir.join("home/clips")).unwrap();
+    std::fs::write(dir.join("shots/b.mp4"), clip(1)).unwrap();
+    std::fs::write(dir.join("home/clips/c.mp4"), clip(2)).unwrap();
+    let yaml = dir.join("request.yaml");
+    let request = "prompt: <Ann> dances\nduration_s: 10\nvideos:\n  - clip.mp4\n  - ./shots/b.mp4\n  - ~/clips/c.mp4\n";
+    std::fs::write(&yaml, request).unwrap();
+    let terms = Terms {
+        input_file: Some(yaml.clone()),
+        ..h3.terms(&[])
+    };
+    let bound = h3.bind("ref2va", &terms).unwrap();
+    assert_eq!(
+        bound.payload["videos"],
+        json!([digest_of(MP4), digest_of(&clip(1)), digest_of(&clip(2))])
+    );
+    let staged: Vec<(&str, &str, &Path)> = bound
+        .files
+        .iter()
+        .map(|f| (f.field.as_str(), f.media_type.as_str(), f.path.as_path()))
+        .collect();
+    assert_eq!(
+        staged,
+        [
+            ("videos.0", "video/mp4", dir.join("clip.mp4").as_path()),
+            ("videos.1", "video/mp4", dir.join("shots/b.mp4").as_path()),
+            (
+                "videos.2",
+                "video/mp4",
+                dir.join("home/clips/c.mp4").as_path()
+            ),
+        ]
+    );
+    // A fourth clip is past the list's bound: refused before anything is staged.
+    std::fs::write(&yaml, format!("{request}  - clip.mp4\n")).unwrap();
+    let four = h3.bind("ref2va", &terms).unwrap_err();
+    assert!(four.message.contains("videos"), "{four:?}");
+    // A clip given on the command line fits `videos` and the assets collection alike: named.
+    let ambiguous = h3.refused("ref2va", &["prompt=p", "duration_s=5", "./clip.mp4"]);
+    assert_eq!(ambiguous.code, "positional_file_ambiguous");
+    let remedy = ambiguous.remedy.unwrap_or_default();
+    assert!(remedy.contains("--asset videos="), "{remedy}");
+    // Named whole, a list of files takes its next slots, after the ones the file filled.
+    std::fs::write(&yaml, "prompt: p\nduration_s: 5\nvideos: [clip.mp4]\n").unwrap();
+    let named = Terms {
+        assets: vec![
+            "videos=shots/b.mp4".into(),
+            "videos=clip.mp4".into(),
+            "dog.png".into(),
+        ],
+        ..terms
+    };
+    let named = h3.bind("ref2va", &named).unwrap();
+    let fields: Vec<&str> = named.files.iter().map(|f| f.field.as_str()).collect();
+    assert_eq!(
+        fields,
+        ["assets.0.asset", "videos.0", "videos.1", "videos.2"]
+    );
+    assert_eq!(named.files[2].path, dir.join("shots/b.mp4"));
+}

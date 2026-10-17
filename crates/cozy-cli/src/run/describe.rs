@@ -4,7 +4,7 @@ use std::fmt::Write as _;
 
 use serde_json::Value;
 
-use super::interface::{Callable, Constraints, Field, Type, Wire};
+use super::interface::{Callable, Constraints, Field, Interface, Type, Wire};
 
 /// One concrete invocation: required terms bare, optional ones bracketed.
 pub fn usage_line(target: &str, callable: &Callable) -> String {
@@ -127,11 +127,19 @@ pub fn arguments(callable: &Callable) -> String {
     out
 }
 
-/// `--describe`: request, model slots with their defaults, output, and the usage line.
-pub fn contract(target: &str, callable: &Callable) -> String {
+/// `--describe`: where it runs, request, model slots with their defaults, output, and the
+/// usage line.
+pub fn contract(target: &str, interface: &Interface, callable: &Callable) -> String {
     let mut out = target.to_owned();
     if callable.accelerator == Some(false) {
-        out.push_str("\n  runs on: CPU");
+        // An internal function exists only to be called: a CPU function of a package with
+        // internal GPU ones orchestrates them (H3's ref2va and long_form).
+        let gpu_calls =
+            (interface.callables.iter()).any(|c| c.internal && c.accelerator != Some(false));
+        out.push_str(match gpu_calls {
+            true => "\n  runs on: CPU; calls the package's GPU functions",
+            false => "\n  runs on: CPU",
+        });
     }
     out.push('\n');
     if callable.request.fields.is_empty() {
@@ -283,7 +291,7 @@ mod tests {
     #[test]
     fn the_contract_names_defaults_bounds_slots_and_output() {
         let sdxl = interface("sdxl-2.10.0");
-        let text = contract("fidika/sdxl/generate", callable(&sdxl, "generate"));
+        let text = contract("fidika/sdxl/generate", &sdxl, callable(&sdxl, "generate"));
         for line in [
             "    prompt: str\n",
             "    steps: int (>=1, <=50) (default = 20)\n",
@@ -301,10 +309,17 @@ mod tests {
         slot["min_bits"] = 8.into();
         let after = super::super::interface::Interface::parse(&card).unwrap();
         assert!(
-            contract("fidika/sdxl/generate", callable(&after, "generate"))
+            contract("fidika/sdxl/generate", &after, callable(&after, "generate"))
                 .contains("    model: SdxlModel (default fidika/sdxl-base@1.0; at least 8 bits)\n")
         );
-        let fp8 = contract("fidika/sdxl/fp8", callable(&sdxl, "fp8"));
+        let h3 = interface("minimax-h3-1.39.0");
+        let ref2va = contract("fidika/minimax-h3/ref2va", &h3, callable(&h3, "ref2va"));
+        assert!(
+            ref2va.contains("\n  runs on: CPU; calls the package's GPU functions\n"),
+            "{ref2va}"
+        );
+        let fp8 = contract("fidika/sdxl/fp8", &sdxl, callable(&sdxl, "fp8"));
+        assert!(fp8.contains("\n  runs on: CPU\n"), "{fp8}");
         for line in [
             "runs on: CPU",
             "source: SdxlModel weights\n",

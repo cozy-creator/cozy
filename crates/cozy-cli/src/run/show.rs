@@ -1,5 +1,6 @@
 //! `cozy run show`: one run whole, with what its machine measured of it and of each call it
-//! made: each stage's time and steps, the models it ran as resolved (release and lane), each
+//! made: where its execution time went (executor start, construction, each stage and its steps,
+//! and what no measurement covers), the models it ran as resolved (release and lane), each
 //! component's attention and GEMM kernels, every GPU's attention kernels (the one that served,
 //! the others and why not), its calls, and its log.
 use std::{collections::BTreeMap, process::ExitCode};
@@ -38,6 +39,9 @@ struct Track {
     count: u64,
     total_ms: f64,
     started_unix_ms: i64,
+    ended_unix_ms: Option<i64>,
+    first_ms: Option<f64>,
+    last_ms: Option<f64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -46,6 +50,50 @@ struct Execution {
     gpus: Vec<Gpu>,
     /// An older Runtime's GPUs: `ordinal` is the GPU's number.
     ranks: Vec<Gpu>,
+    /// The executor's start: its fork, imports and CUDA initialization, one after another.
+    executor: Option<Legs>,
+    /// Its construction's preparation (qualifying, constructing, registering its models).
+    construction: Option<Legs>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct Legs {
+    legs_ms: BTreeMap<String, f64>,
+    started_unix_ms: Option<i64>,
+    prepare_ms: Option<f64>,
+    prepared_unix_ms: Option<i64>,
+}
+
+impl Legs {
+    /// When it ran: an executor from its start for its legs' sum, a construction for its
+    /// `prepare_ms` until it was prepared.
+    fn span(&self) -> Option<(f64, f64)> {
+        match (self.started_unix_ms, self.prepare_ms, self.prepared_unix_ms) {
+            (Some(start), _, _) => Some((
+                start as f64,
+                start as f64 + self.legs_ms.values().sum::<f64>(),
+            )),
+            (None, Some(ms), Some(end)) if ms > 0.0 => Some((end as f64 - ms, end as f64)),
+            _ => None,
+        }
+    }
+
+    /// Its three longest legs, a construction's sub-legs aside: `package_import 10.0s, …`.
+    fn longest(&self) -> String {
+        let mut legs: Vec<(&String, &f64)> = self
+            .legs_ms
+            .iter()
+            .filter(|(name, ms)| **ms >= 1.0 && !name.contains("construct."))
+            .collect();
+        legs.sort_by(|a, b| b.1.total_cmp(a.1));
+        let said: Vec<String> = legs
+            .iter()
+            .take(3)
+            .map(|(name, ms)| format!("{name} {}", duration(**ms)))
+            .collect();
+        said.join(", ")
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -123,8 +171,15 @@ pub async fn exec(ctx: &Context, id: &str) -> Result<ExitCode, Error> {
         return Ok(ExitCode::SUCCESS);
     }
     follow::fields(ctx, &run).print(ctx);
-    let measured = measured(run.measurements.as_ref(), &run.calls);
-    let stages = grid(&["STAGE", "TIME", "STEPS"], &measured, stage_rows);
+    let execution = run
+        .settled_at_ms
+        .zip(run.execution_ms)
+        .map(|(end, ms)| (end - ms as i64, end));
+    let measured = measured(
+        run.measurements.as_ref().map(|m| (m, execution)),
+        &run.calls,
+    );
+    let stages = grid(&["STAGE", "TIME", "DETAIL"], &measured, stage_rows);
     stages.print(ctx, "stages");
     grid(&["SLOT", "MODEL", "LANE"], &measured, model_rows).print(ctx, "models");
     let components = grid(
@@ -190,14 +245,27 @@ pub async fn exec(ctx: &Context, id: &str) -> Result<ExitCode, Error> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// The run's own measurements and each call's, by who measured them: `run`, or the call's
-/// index.
-fn measured(own: Option<&serde_json::Value>, calls: &[Call]) -> Vec<(String, Measurements)> {
-    let read = |m: Option<&serde_json::Value>| m.and_then(|m| Measurements::deserialize(m).ok());
-    let own = read(own).map(|m| ("run".to_owned(), m));
-    let calls = calls
-        .iter()
-        .filter_map(|c| read(c.measurements.as_ref()).map(|m| (c.index.to_string(), m)));
+/// One executor's measurements, by who measured them (`run`, or the call's index), and the
+/// span they account for: the run's execution, or the call from its call to its end.
+struct Measured {
+    who: String,
+    span: Option<(i64, i64)>,
+    m: Measurements,
+}
+
+type Span = Option<(i64, i64)>;
+
+fn measured(own: Option<(&serde_json::Value, Span)>, calls: &[Call]) -> Vec<Measured> {
+    let read = |who: String, m: &serde_json::Value, span: Span| {
+        let m = Measurements::deserialize(m).ok()?;
+        Some(Measured { who, span, m })
+    };
+    let own = own.and_then(|(m, span)| read("run".into(), m, span));
+    let calls = calls.iter().filter_map(|c| {
+        let span =
+            (c.finished_at_ms >= c.called_at_ms).then_some((c.called_at_ms, c.finished_at_ms));
+        read(c.index.to_string(), c.measurements.as_ref()?, span)
+    });
     own.into_iter().chain(calls).collect()
 }
 
@@ -210,17 +278,17 @@ struct Grid {
 
 fn grid(
     header: &[&'static str],
-    measured: &[(String, Measurements)],
-    rows_of: fn(&Measurements) -> Vec<Vec<String>>,
+    measured: &[Measured],
+    rows_of: fn(&Measured) -> Vec<Vec<String>>,
 ) -> Grid {
     let lead = measured.len() > 1;
     let header = lead
         .then_some("CALL")
         .into_iter()
         .chain(header.iter().copied());
-    let rows = measured.iter().flat_map(|(who, m)| {
+    let rows = measured.iter().flat_map(|m| {
         rows_of(m).into_iter().map(move |row| {
-            let who = lead.then(|| who.clone());
+            let who = lead.then(|| m.who.clone());
             who.into_iter().chain(row).collect::<Vec<_>>()
         })
     });
@@ -244,29 +312,86 @@ impl Grid {
     }
 }
 
-/// Each stage in the order it started, with its time and, for a stepped stage, its steps.
-fn stage_rows(measured: &Measurements) -> Vec<Vec<String>> {
-    let attribution = &measured.attribution;
+/// Where the span's time went, in the order it ran: the executor's start and its construction
+/// when they ran inside it (a warm executor's were an earlier call's), each stage with its steps,
+/// and last what no measurement covers.
+fn stage_rows(measured: &Measured) -> Vec<Vec<String>> {
+    let (attribution, execution) = (&measured.m.attribution, &measured.m.execution);
+    let inside = |(start, end): (f64, f64)| {
+        measured
+            .span
+            .is_none_or(|(from, to)| end > from as f64 && start < to as f64)
+    };
+    // Each row by its start, and the times it covers: a stage met twice covers its first and
+    // its last occurrence; those between are counted, not placed.
+    let (mut rows, mut covers, mut unplaced) = (vec![], vec![], 0.0);
+    for (name, legs) in [
+        ("executor start", &execution.executor),
+        ("construction", &execution.construction),
+    ] {
+        if let Some((legs, span)) = legs
+            .as_ref()
+            .and_then(|l| Some((l, l.span()?)))
+            .filter(|(_, s)| inside(*s))
+        {
+            covers.push(span);
+            let row = vec![name.into(), duration(span.1 - span.0), legs.longest()];
+            rows.push((span.0, row));
+        }
+    }
     let mut stages: Vec<(&String, &Track)> = attribution.stages.iter().collect();
     for (name, track) in &attribution.steps {
         if !attribution.stages.contains_key(name) {
             stages.push((name, track));
         }
     }
-    stages.sort_by_key(|(name, track)| (track.started_unix_ms, (*name).clone()));
-    let row = |(name, track): (&String, &Track)| {
+    for (name, track) in stages {
         let steps = attribution.steps.get(name).map_or_else(String::new, |s| {
             let each = s.total_ms / s.count.max(1) as f64;
             format!("{} × {}", s.count, duration(each))
         });
-        vec![name.clone(), duration(track.total_ms), steps]
-    };
-    stages.into_iter().map(row).collect()
+        let start = track.started_unix_ms as f64;
+        let end = track
+            .ended_unix_ms
+            .map_or(start + track.total_ms, |end| end as f64);
+        match (track.count, track.first_ms, track.last_ms) {
+            (2.., Some(first), Some(last)) => {
+                covers.extend([(start, start + first), (end - last, end)]);
+                unplaced += track.total_ms - first - last;
+            }
+            _ => covers.push((start, end)),
+        }
+        rows.push((start, vec![name.clone(), duration(track.total_ms), steps]));
+    }
+    rows.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1[0].cmp(&b.1[0])));
+    covers.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let unaccounted = measured.span.map(|(from, to)| {
+        let (from, to) = (from as f64, to as f64);
+        let (mut covered, mut reached) = (unplaced, from);
+        for (start, end) in covers {
+            let (start, end) = (start.max(reached), end.min(to));
+            if end > start {
+                covered += end - start;
+                reached = end;
+            }
+        }
+        to - from - covered
+    });
+    let mut rows: Vec<Vec<String>> = rows.into_iter().map(|(_, row)| row).collect();
+    if let Some(ms) = unaccounted.filter(|ms| *ms >= 1.0) {
+        rows.push(vec![
+            "unaccounted".into(),
+            duration(ms),
+            "no measurement covers it".into(),
+        ]);
+    }
+    rows
 }
 
 /// Each model slot's checkpoint: its repository and release, or its hash when it was passed
 /// by value, and the lane it was resolved in.
-fn model_rows(measured: &Measurements) -> Vec<Vec<String>> {
+fn model_rows(measured: &Measured) -> Vec<Vec<String>> {
+    let measured = &measured.m;
     let row = |m: &Model| {
         let model = match m.repository.is_empty() {
             true => m.manifest.chars().take(19).collect(),
@@ -278,7 +403,8 @@ fn model_rows(measured: &Measurements) -> Vec<Vec<String>> {
 }
 
 /// Each component's attention and GEMM kernels (a 16-bit lane's components have no GEMM row).
-fn component_rows(measured: &Measurements) -> Vec<Vec<String>> {
+fn component_rows(measured: &Measured) -> Vec<Vec<String>> {
+    let measured = &measured.m;
     let mut components: BTreeMap<&str, [String; 2]> = BTreeMap::new();
     for o in &measured.observations {
         let fields = &o.fields;
@@ -301,7 +427,8 @@ fn component_rows(measured: &Measurements) -> Vec<Vec<String>> {
 
 /// Each component whose GEMM leaf could not serve, as one warning line: what it wanted, what
 /// served instead and why.
-fn fallback_rows(measured: &Measurements) -> Vec<Vec<String>> {
+fn fallback_rows(measured: &Measured) -> Vec<Vec<String>> {
+    let measured = &measured.m;
     let fallbacks = measured
         .observations
         .iter()
@@ -322,7 +449,8 @@ fn fallback_rows(measured: &Measurements) -> Vec<Vec<String>> {
 }
 
 /// Every GPU's attention kernels: the one that served, and the others with why not.
-fn gpu_rows(measured: &Measurements) -> Vec<Vec<String>> {
+fn gpu_rows(measured: &Measured) -> Vec<Vec<String>> {
+    let measured = &measured.m;
     let execution = &measured.execution;
     let gpus = if execution.gpus.is_empty() {
         &execution.ranks
@@ -391,9 +519,14 @@ mod tests {
         serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap()
     }
 
-    fn measured_alone(name: &str) -> Measurements {
+    fn measured_alone(name: &str) -> Measured {
         let document = fixture(name);
-        Measurements::deserialize(document.get("measurements").unwrap_or(&document)).unwrap()
+        let m = Measurements::deserialize(document.get("measurements").unwrap_or(&document));
+        Measured {
+            who: "run".into(),
+            span: None,
+            m: m.unwrap(),
+        }
     }
 
     /// Run 10236 (H3 long_form on an A100): its deviceless root measured nothing; its calls
@@ -413,7 +546,8 @@ mod tests {
     fn a_real_h3_runs_stages_read_in_the_order_they_ran() {
         let h3 = measured_alone("h3-run-5243-measurements");
         let stages = stage_rows(&h3);
-        assert_eq!(stages[0][0], "prepare");
+        assert_eq!(stages[0][0], "executor start");
+        assert_eq!(stages[2][0], "prepare");
         let denoise = stages.iter().find(|r| r[0] == "denoise").unwrap();
         assert_eq!(denoise[1], "3m48.7s");
         let video = stages.iter().find(|r| r[0] == "decode_video").unwrap();
@@ -487,7 +621,7 @@ mod tests {
             ]
         );
 
-        let stages = grid(&["STAGE", "TIME", "STEPS"], &measured, stage_rows);
+        let stages = grid(&["STAGE", "TIME", "DETAIL"], &measured, stage_rows);
         let first: Vec<&str> = rows(&stages).iter().map(|r| r[0]).collect();
         assert_eq!(first.first(), Some(&"0"));
         let denoise = rows(&stages)
@@ -545,10 +679,8 @@ mod tests {
         let library = serde_json::json!({"kind": "confession", "name": "gemm.fallback",
             "value": "torch._int_mm", "fields": {"component": "base_model/audio_vae", "wanted": "cozy-int8",
             "served": "torch._int_mm", "reason": "the op library did not load", "sites": 1}});
-        measured[1]
-            .1
-            .observations
-            .push(serde_json::from_value(library).unwrap());
+        let library = serde_json::from_value(library).unwrap();
+        measured[1].m.observations.push(library);
         let warnings = grid(&["COMPONENT", "WARNING"], &measured, fallback_rows);
         assert_eq!(
             rows(&warnings),
@@ -574,13 +706,58 @@ mod tests {
             }],
             ..Default::default()
         };
-        let alone = grid(
-            &["SLOT", "MODEL", "LANE"],
-            &[("run".into(), held)],
-            model_rows,
-        );
+        let held = Measured {
+            who: "run".into(),
+            span: None,
+            m: held,
+        };
+        let alone = grid(&["SLOT", "MODEL", "LANE"], &[held], model_rows);
         assert_eq!(rows(&alone), [["model", "sha256:cdcdcdcdcdcd", "-"]]);
         assert_eq!(alone.header, ["SLOT", "MODEL", "LANE"]);
+    }
+
+    /// Run 10264 (sdxl on a fresh A5000): 17.4 s of execution whose stages add to 5.8 s. The
+    /// rest is its executor's start and its construction; what no measurement covers is said.
+    #[test]
+    fn a_runs_execution_is_accounted_for_whole() {
+        let run = fixture("sdxl-run-10264");
+        let end = run["settled_at_ms"].as_i64().unwrap();
+        let span = Some((end - run["execution_ms"].as_i64().unwrap(), end));
+        let sdxl = measured(Some((&run["measurements"], span)), &[]);
+        let stages = grid(&["STAGE", "TIME", "DETAIL"], &sdxl, stage_rows);
+        assert_eq!(stages.header, ["STAGE", "TIME", "DETAIL"]);
+        assert_eq!(
+            rows(&stages),
+            [
+                vec![
+                    "executor start",
+                    "10.9s",
+                    "package_import 10.0s, cuda_init 658ms, fork 206ms"
+                ],
+                vec![
+                    "construction",
+                    "10.4s",
+                    "qualify 7.1s, construct_and_register 2.4s, resolve 352ms"
+                ],
+                vec!["tokenize", "4ms", ""],
+                vec!["loading weights", "465ms", ""],
+                vec!["encode", "434ms", ""],
+                vec!["denoise", "4.6s", "20 × 224ms"],
+                vec!["decode", "311ms", ""],
+                vec!["encode_webp", "1ms", ""],
+                vec!["unaccounted", "696ms", "no measurement covers it"],
+            ]
+        );
+        // A warm executor's start was an earlier call's: run 10236's second segment reused the
+        // first's, and its own stages leave 2.2 s uncovered.
+        let calls = h3_calls();
+        let segment = measured(None, &calls)
+            .into_iter()
+            .find(|m| m.who == "2")
+            .unwrap();
+        let rows = stage_rows(&segment);
+        assert_eq!(rows[0][0], "prepare");
+        assert_eq!(rows.last().unwrap()[..2], ["unaccounted", "2.2s"]);
     }
 
     #[test]

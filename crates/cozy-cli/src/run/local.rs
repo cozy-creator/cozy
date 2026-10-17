@@ -58,7 +58,10 @@ pub async fn run(
     let callable = super::callable(&local.package, &installed.interface, &function)?;
     let target = format!("{}/{}", local.package, callable.name);
     if args.describe {
-        anstream::print!("{}", describe::contract(&target, callable));
+        anstream::print!(
+            "{}",
+            describe::contract(&target, &installed.interface, callable)
+        );
         return Ok(ExitCode::SUCCESS);
     }
     let terms = super::terms(ctx, &args)?;
