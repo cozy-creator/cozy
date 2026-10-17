@@ -13,7 +13,12 @@ use cozy_proto::{
 };
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 
-use crate::{Context, calcifer_client::Client, output};
+use crate::{
+    Context,
+    calcifer_client::Client,
+    machine::{Following, placement_note, route},
+    output,
+};
 
 /// Submits under `key`, or a fresh one: one key names one submission forever.
 pub(crate) async fn submit(
@@ -125,16 +130,15 @@ async fn watch(ctx: &Context, run: Run, events_out: bool) -> Result<(Run, bool),
     tokio::pin!(interrupt);
     let id = run.id.clone();
     let mut terminal = None;
-    // The machine the run was placed on, until it is known whether its Hub placed it far away.
-    let mut placing = None;
+    // The rental the run was placed on, followed until it is known whether its Hub placed it far
+    // away: the Hub decides after it accepts the order.
+    let mut placing: Option<Following> = None;
     loop {
         tokio::select! {
-            () = tokio::time::sleep(crate::machine::FOLLOW), if placing.is_some() => {
-                let name: String = placing.take().unwrap_or_default();
-                if !placed(&calcifer, &view, &name).await {
-                    placing = Some(name);
-                }
-            }
+            next = next_of(&mut placing, &calcifer), if placing.is_some() => match next {
+                Ok(Some(machine)) if !placed(&view, &machine) => {}
+                _ => placing = None,
+            },
             _ = &mut interrupt => {
                 view.done();
                 let run = calcifer.run(id.as_str()).await?;
@@ -171,8 +175,8 @@ async fn watch(ctx: &Context, run: Run, events_out: bool) -> Result<(Run, bool),
                 Some(Ok(event)) => {
                     let before = view.machine.clone();
                     view.on(&event);
-                    if view.machine != before {
-                        placing.clone_from(&view.machine);
+                    if let Some(name) = view.machine.as_deref().filter(|_| view.machine != before) {
+                        placing = follow_placement(&calcifer, &view, name).await;
                     }
                 }
             }
@@ -180,16 +184,31 @@ async fn watch(ctx: &Context, run: Run, events_out: bool) -> Result<(Run, bool),
     }
 }
 
+/// Follows the machine a run was placed on while it boots with no word yet on its placement;
+/// a machine read once that says it, or is up, needs no following.
+async fn follow_placement(calcifer: &Client, view: &View, name: &str) -> Option<Following> {
+    let machine: Machine = calcifer.get(&route(name).ok()?).await.ok()?;
+    if placed(view, &machine) {
+        return None;
+    }
+    let (following, machine) = Following::open(calcifer, name).await.ok()?;
+    (!placed(view, &machine)).then_some(following)
+}
+
+async fn next_of(
+    placing: &mut Option<Following>,
+    calcifer: &Client,
+) -> Result<Option<Machine>, Error> {
+    match placing {
+        Some(following) => following.next(calcifer).await,
+        None => std::future::pending().await,
+    }
+}
+
 /// Says why the Hub placed the run's rental off this continent, once it has: true when nothing
-/// more will be said (said, unreadable, or done booting).
-async fn placed(calcifer: &Client, view: &View, name: &str) -> bool {
-    let Ok(path) = crate::machine::route(name) else {
-        return true;
-    };
-    let Ok(machine) = calcifer.get::<Machine>(&path).await else {
-        return true;
-    };
-    if let Some(note) = crate::machine::placement_note(&machine) {
+/// more will be said (said, or done booting).
+fn placed(view: &View, machine: &Machine) -> bool {
+    if let Some(note) = placement_note(machine) {
         view.line(&format!("  {note}"));
         return true;
     }
