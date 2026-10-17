@@ -1000,24 +1000,6 @@ paths:
         4XX: {$ref: '#/components/responses/Error'}
         5XX: {$ref: '#/components/responses/Error'}
 
-  /v1/packages/{org}/{name}/releases/{release}/locked-requirements:
-    get:
-      operationId: get_package_locked_requirements
-      tags: [packages]
-      summary: The release's hash-pinned requirements, as uv installs them.
-      security: []
-      x-raw-body: true
-      parameters:
-      - {$ref: '#/components/parameters/Org'}
-      - {$ref: '#/components/parameters/Name'}
-      - {$ref: '#/components/parameters/Release'}
-      responses:
-        '200':
-          description: A requirements file.
-          content: {text/plain: {schema: {type: string}}}
-        4XX: {$ref: '#/components/responses/Error'}
-        5XX: {$ref: '#/components/responses/Error'}
-
   /v1/rental-placements:
     post:
       operationId: place_rental
@@ -2341,15 +2323,6 @@ components:
         pyproject: {$ref: '#/components/schemas/ExactDocument'}
         release: {type: string}
         uv_lock: {$ref: '#/components/schemas/ExactDocument'}
-    PackageRegistryPin:
-      type: object
-      required: [name, sha256, size, url, version]
-      properties:
-        name: {type: string}
-        sha256: {type: string}
-        size: {type: integer, format: int64}
-        url: {type: string}
-        version: {type: string}
     PackageRelease:
       type: object
       required: [release, package_interface, requirements, requires_python, python_version]
@@ -2370,10 +2343,6 @@ components:
       properties:
         publication_id: {type: string}
         python_version: {type: string}
-        registry:
-          type: array
-          nullable: true
-          items: {$ref: '#/components/schemas/PackageRegistryPin'}
     PackageReleaseGrants:
       type: object
       required: [files, publication_id]
