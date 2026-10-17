@@ -145,13 +145,21 @@ impl Record {
     }
 
     pub fn print(self, _ctx: &Context) {
+        for line in self.styled(KEY, DIM) {
+            anstream::println!("{line}");
+        }
+    }
+
+    /// The lines `print` writes, unstyled: keys aligned, then the notes.
+    pub fn lines(&self) -> Vec<String> {
+        self.styled(Style::new(), Style::new())
+    }
+
+    fn styled(&self, key: Style, note: Style) -> Vec<String> {
         let width = self.fields.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
-        for (key, value) in &self.fields {
-            anstream::println!("{KEY}{key:<width$}{KEY:#}  {value}");
-        }
-        for note in &self.notes {
-            anstream::println!("{DIM}{note}{DIM:#}");
-        }
+        let fields = (self.fields.iter()).map(|(k, v)| format!("{key}{k:<width$}{key:#}  {v}"));
+        let notes = self.notes.iter().map(|n| format!("{note}{n}{note:#}"));
+        fields.chain(notes).collect()
     }
 }
 

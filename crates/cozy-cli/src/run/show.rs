@@ -12,7 +12,7 @@ use cozy_proto::{
 use serde::Deserialize;
 
 use super::follow;
-use crate::{Context, output};
+use crate::{Context, output, tui};
 
 /// What an executor measured (`Outcome.measurements`, `Call.measurements`), read tolerantly: a
 /// newer machine's fields are ignored and absent ones are empty.
@@ -161,11 +161,16 @@ struct Model {
     manifest: String,
 }
 
-pub async fn exec(ctx: &Context, id: &str) -> Result<ExitCode, Error> {
+pub async fn exec(ctx: &Context, id: &str, once: bool) -> Result<ExitCode, Error> {
     let calcifer = ctx.calcifer().await?;
     let run: Run = calcifer
         .get_query(&format!("/v1/runs/{id}"), &[("detail", "full")])
         .await?;
+    if !once && !ctx.json && ctx.term.stdout && !follow::settled(&run) {
+        let view = super::live::Live::open(ctx, run.id.as_str()).await?;
+        tui::show(ctx, tui::Screen::Run(Box::new(view))).await?;
+        return Ok(ExitCode::SUCCESS);
+    }
     if ctx.json {
         output::json(&run);
         return Ok(ExitCode::SUCCESS);

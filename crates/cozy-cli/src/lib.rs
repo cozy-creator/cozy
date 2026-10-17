@@ -21,6 +21,7 @@ mod model;
 pub mod output;
 mod package;
 mod run;
+pub mod tui;
 mod update;
 
 pub use context::Context;

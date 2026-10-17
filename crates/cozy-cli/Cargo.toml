@@ -13,6 +13,7 @@ anstyle.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
 comfy-table.workspace = true
+crossterm.workspace = true
 cozy-platform.workspace = true
 cozy-proto.workspace = true
 futures-util = { workspace = true, features = ["alloc"] }

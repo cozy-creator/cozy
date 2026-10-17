@@ -1,16 +1,17 @@
-//! `cozy run list`: runs on every Hub, newest first, as a table, a live board, or JSON.
+//! `cozy run list`: runs on every Hub, newest first: a live view on a terminal, else a table or
+//! JSON.
 use std::process::ExitCode;
 
 use cozy_proto::{
     calcifer::{Kind as RunKind, Run, RunList, Status},
-    error::{Error, Kind},
+    error::Error,
 };
 use serde::Serialize;
 
-use super::{board, follow};
-use crate::{Context, output};
+use super::{follow, live};
+use crate::{Context, output, tui};
 
-const HEADERS: [&str; 7] = [
+pub(crate) const HEADERS: [&str; 7] = [
     "#", "TARGET", "MACHINE", "STATUS", "PROGRESS", "TIME", "REASON",
 ];
 /// The newest runs a list shows unless `--limit` says otherwise.
@@ -19,7 +20,7 @@ const SHOWN: u64 = 50;
 const REASON: usize = 72;
 
 /// `GET /v1/runs`' filters.
-#[derive(Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct Query {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
@@ -31,23 +32,12 @@ pub struct Query {
     pub limit: Option<u64>,
 }
 
-pub async fn exec(ctx: &Context, mut query: Query, watch: bool) -> Result<ExitCode, Error> {
+pub async fn exec(ctx: &Context, mut query: Query, once: bool) -> Result<ExitCode, Error> {
     let limit = query.limit.unwrap_or(SHOWN);
     query.limit = (limit > 0).then_some(limit);
-    if watch {
-        if ctx.json || !ctx.term.stdout {
-            return Err(Error::new(
-                Kind::Usage,
-                "watch_needs_terminal",
-                "--watch draws on a terminal",
-            )
-            .remedy("omit --watch for one table, or use --json"));
-        }
-        let title = format!("runs, newest {limit}");
-        board::watch(&title, &HEADERS, async || {
-            Ok(runs(ctx, &query).await?.runs.iter().map(row).collect())
-        })
-        .await?;
+    if !once && !ctx.json && ctx.term.stdout {
+        let view = live::Runs::open(ctx, query, limit).await?;
+        tui::show(ctx, tui::Screen::Runs(view)).await?;
         return Ok(ExitCode::SUCCESS);
     }
     let list = runs(ctx, &query).await?;
@@ -70,7 +60,7 @@ pub async fn exec(ctx: &Context, mut query: Query, watch: bool) -> Result<ExitCo
 }
 
 /// The runs `query` asks for, page by page; with `--tensorhub`, only that Hub's.
-async fn runs(ctx: &Context, query: &Query) -> Result<RunList, Error> {
+pub(crate) async fn runs(ctx: &Context, query: &Query) -> Result<RunList, Error> {
     let calcifer = ctx.calcifer().await?;
     let hub = ctx.narrowed()?;
     let mut out = RunList {
@@ -103,8 +93,23 @@ async fn runs(ctx: &Context, query: &Query) -> Result<RunList, Error> {
     }
 }
 
-/// A run as one row of the table and the board.
-fn row(run: &Run) -> Vec<String> {
+/// Whether `run` is one `query` lists: its state, package and (with `--tensorhub`) Hub.
+pub(crate) fn matches(ctx: &Context, query: &Query, run: &Run) -> Result<bool, Error> {
+    let status = serde_json::to_value(run.status).ok();
+    let state = query
+        .status
+        .as_ref()
+        .is_none_or(|s| status.as_ref().and_then(|v| v.as_str()) == Some(s.as_str()));
+    let package = query
+        .package
+        .as_ref()
+        .is_none_or(|p| run.target.starts_with(p.as_str()));
+    let hub = ctx.narrowed()?.is_none_or(|h| h.origin == run.hub);
+    Ok(state && package && hub)
+}
+
+/// A run as one row of the table and the live view.
+pub(crate) fn row(run: &Run) -> Vec<String> {
     let mut target = run.target.clone();
     if run.kind != RunKind::Call {
         target = format!("{} {target}", run.kind.as_str());
@@ -131,7 +136,8 @@ fn row(run: &Run) -> Vec<String> {
         _ => "—".into(),
     };
     let reason = match run.status {
-        Status::Queued => run.waiting.clone().unwrap_or_default(),
+        // Why it waits, until it settles: sending, uploading, a GPU another run holds.
+        Status::Queued | Status::InProgress => run.waiting.clone().unwrap_or_default(),
         Status::Failed | Status::Canceled => run
             .reason
             .as_ref()

@@ -15,12 +15,12 @@ use interface::{Callable, Interface};
 use target::Target;
 
 mod bind;
-pub(crate) mod board;
 mod catalog;
 mod describe;
 mod follow;
 pub(crate) mod interface;
 mod list;
+pub(crate) mod live;
 mod local;
 mod play;
 mod show;
@@ -117,14 +117,17 @@ enum Verb {
         /// At most N runs (default 50; 0 shows all).
         #[arg(long, value_name = "N")]
         limit: Option<u64>,
-        /// A live board, redrawn as runs change.
+        /// One snapshot even on a terminal, instead of the live view.
         #[arg(long)]
-        watch: bool,
+        once: bool,
     },
     /// One run: its result, outputs, calls, logs and how it ran.
     Show {
         /// The run's number or id.
         run: String,
+        /// One snapshot even on a terminal, instead of the live view of a run not yet settled.
+        #[arg(long)]
+        once: bool,
     },
     /// Follow a run until it ends; Ctrl-C stops watching, never the run.
     Watch {
@@ -167,7 +170,7 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
             state,
             package,
             limit,
-            watch,
+            once,
         }) => {
             let query = list::Query {
                 status: state,
@@ -175,9 +178,9 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
                 before: None,
                 limit,
             };
-            list::exec(ctx, query, watch).await
+            list::exec(ctx, query, once).await
         }
-        Some(Verb::Show { run }) => show::exec(ctx, &run).await,
+        Some(Verb::Show { run, once }) => show::exec(ctx, &run, once).await,
         Some(Verb::Watch { run }) => {
             let run = ctx.calcifer().await?.run(&run).await?;
             Ok(exit_code(&follow(ctx, run, false).await?))
