@@ -224,6 +224,26 @@ impl std::os::fd::AsFd for Exact {
     }
 }
 
+/// The process that started `pid`, or that adopted it when its parent ended.
+pub fn parent_of(pid: u32) -> Result<u32> {
+    sys::parent_of(pid).map_err(Error::os("read a process's parent"))
+}
+
+/// Every process descended from `pid` (children, theirs, and so on), read now. Empty where
+/// nothing could be read.
+pub fn descendants(pid: u32) -> Vec<u32> {
+    let table = sys::parents();
+    let mut tree = vec![pid];
+    let mut at = 0;
+    while at < tree.len() {
+        let parent = tree[at];
+        tree.extend(table.iter().filter(|(_, p)| *p == parent).map(|(c, _)| *c));
+        at += 1;
+    }
+    tree.remove(0);
+    tree
+}
+
 /// Every process in `leader`'s process group born with or after it: a leader's followers. A
 /// group number is not reused while a member lives. Empty where it cannot be read (only Linux
 /// reads groups so far).
@@ -260,7 +280,8 @@ pub fn become_subreaper() -> Result<()> {
 
 /// In a child just forked from `parent`: SIGKILL arrives when the parent dies. `false` when the
 /// parent was already gone before this call armed it (the child then has no parent to serve).
-/// Linux only.
+/// Linux's parent-death signal; a thread watching the parent's exit on macOS (it ends at an
+/// exec); Windows answers `Unsupported`.
 pub fn die_with_parent(parent: u32) -> Result<bool> {
     sys::die_with_parent(parent)
 }
@@ -371,5 +392,24 @@ impl Tree {
 impl Drop for Tree {
     fn drop(&mut self) {
         let _ = self.kill();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_child_names_this_process_as_its_parent() {
+        let mut child = std::process::Command::new(if cfg!(windows) { "cmd" } else { "sleep" })
+            .args(if cfg!(windows) {
+                &["/C", "ping -n 30 127.0.0.1 >NUL"][..]
+            } else {
+                &["30"][..]
+            })
+            .spawn()
+            .unwrap();
+        let parent = super::parent_of(child.id());
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(parent.unwrap(), std::process::id());
     }
 }

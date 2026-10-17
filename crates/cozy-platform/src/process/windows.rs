@@ -446,6 +446,43 @@ pub(super) fn peak_resident() -> io::Result<u64> {
     Ok(counters.PeakWorkingSetSize as u64)
 }
 
+pub(super) fn parent_of(pid: u32) -> io::Result<u32> {
+    parents()
+        .into_iter()
+        .find(|(child, _)| *child == pid)
+        .map(|(_, parent)| parent)
+        .ok_or_else(|| io::ErrorKind::NotFound.into())
+}
+
+/// Every process with its parent, from one Toolhelp snapshot.
+pub(super) fn parents() -> Vec<(u32, u32)> {
+    snapshot().unwrap_or_default()
+}
+
+fn snapshot() -> io::Result<Vec<(u32, u32)>> {
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
+    };
+    // SAFETY: a snapshot of every process; the handle is owned at once.
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    let snapshot = owned(snapshot)?;
+    // SAFETY: plain-old-data with its size set, as the call requires.
+    let mut entry: PROCESSENTRY32W = unsafe { mem::zeroed() };
+    entry.dwSize = mem::size_of::<PROCESSENTRY32W>() as u32;
+    // SAFETY: a live snapshot and an entry sized above.
+    let mut more = unsafe { Process32FirstW(raw(&snapshot), &mut entry) } != 0;
+    let mut table = vec![];
+    while more {
+        table.push((entry.th32ProcessID, entry.th32ParentProcessID));
+        // SAFETY: as above.
+        more = unsafe { Process32NextW(raw(&snapshot), &mut entry) } != 0;
+    }
+    Ok(table)
+}
+
 fn open_process(pid: u32, access: u32) -> io::Result<OwnedHandle> {
     // SAFETY: plain call; a null handle is the failure.
     let process = unsafe { OpenProcess(access, 0, pid) };

@@ -181,6 +181,29 @@ fn info(pid: u32) -> io::Result<libc::proc_bsdinfo> {
     })
 }
 
+pub(super) fn parent_of(pid: u32) -> io::Result<u32> {
+    Ok(info(pid)?.pbi_ppid)
+}
+
+/// Every process with its parent.
+pub(super) fn parents() -> Vec<(u32, u32)> {
+    // SAFETY: a null buffer asks for the count.
+    let count = unsafe { libc::proc_listallpids(ptr::null_mut(), 0) };
+    if count <= 0 {
+        return vec![];
+    }
+    // Room for processes started since the count.
+    let mut pids = vec![0 as libc::pid_t; count as usize + 64];
+    let bytes = (pids.len() * mem::size_of::<libc::pid_t>()) as libc::c_int;
+    // SAFETY: a writable buffer of the length given.
+    let listed = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
+    pids.truncate(listed.max(0) as usize);
+    pids.into_iter()
+        .filter(|pid| *pid > 0)
+        .filter_map(|pid| Some((pid as u32, info(pid as u32).ok()?.pbi_ppid)))
+        .collect()
+}
+
 /// Groups and meters are read only on Linux so far: unreadable here, which decides nothing.
 pub(super) fn group_members(_: &Birth) -> Vec<Birth> {
     Vec::new()
@@ -198,8 +221,31 @@ pub(super) fn become_subreaper() -> crate::Result<()> {
     Err(crate::Error::unsupported(crate::Seam::Process))
 }
 
-pub(super) fn die_with_parent(_: u32) -> crate::Result<bool> {
-    Err(crate::Error::unsupported(crate::Seam::Process))
+/// No parent-death signal on macOS: a thread waits on the parent's exit (kqueue `NOTE_EXIT`)
+/// and kills this process. The watch ends at an exec, which Linux's signal survives.
+pub(super) fn die_with_parent(parent: u32) -> crate::Result<bool> {
+    let born = match birth(parent) {
+        Ok(born) => born,
+        Err(error) if gone(&error) => return Ok(false),
+        Err(error) => return Err(crate::Error::os("read the parent's birth")(error)),
+    };
+    // SAFETY: getppid has no arguments.
+    if unsafe { libc::getppid() } as u32 != parent {
+        return Ok(false);
+    }
+    let Some(watch) = open(&born).map_err(crate::Error::os("watch the parent"))? else {
+        return Ok(false);
+    };
+    std::thread::Builder::new()
+        .name("parent-watch".into())
+        .spawn(move || {
+            if wait(&watch, None).is_ok() {
+                // SAFETY: a signal to this process.
+                unsafe { libc::kill(libc::getpid(), libc::SIGKILL) };
+            }
+        })
+        .map_err(crate::Error::os("start the parent watch"))?;
+    Ok(true)
 }
 
 pub(super) fn transient(error: &io::Error) -> bool {

@@ -1,15 +1,14 @@
 //! Descriptor passing and peer identity on a local socket (TensorD `os.rs` and `protocol.rs`):
-//! `SCM_RIGHTS`, `SO_PEERCRED` and `SO_PEERPIDFD` on Linux. macOS answers `Unsupported` until the
-//! Apple tier (AP) ports them to `getpeereid` and `LOCAL_PEERPID`.
-#[cfg_attr(target_os = "linux", path = "linux.rs")]
-#[cfg_attr(not(target_os = "linux"), path = "unsupported.rs")]
-mod imp;
+//! `SCM_RIGHTS` on both Unixes; the peer from `SO_PEERCRED` and `SO_PEERPIDFD` on Linux,
+//! `getpeereid` and `LOCAL_PEERPID` on macOS.
+mod unix;
 
-pub use imp::*;
+pub use unix::*;
 
-/// The process on the other end of a local socket, always this user (another is refused).
+/// The process on the other end of a local socket and the ids it runs as.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Peer {
     pub pid: u32,
     pub uid: u32,
+    pub gid: u32,
 }

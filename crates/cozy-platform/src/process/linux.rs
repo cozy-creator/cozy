@@ -104,6 +104,22 @@ pub(super) fn set_name(name: &str) -> crate::Result<()> {
     Ok(())
 }
 
+pub(super) fn parent_of(pid: u32) -> io::Result<u32> {
+    Ok(stat(pid)?.ppid)
+}
+
+/// Every process with its parent.
+pub(super) fn parents() -> Vec<(u32, u32)> {
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return vec![];
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+        .filter_map(|pid| Some((pid, stat(pid).ok()?.ppid)))
+        .collect()
+}
+
 pub(super) fn group_members(leader: &Birth) -> Vec<Birth> {
     let Ok(boot) = boot_id() else {
         return vec![];
@@ -250,6 +266,7 @@ pub(super) fn gone(error: &io::Error) -> bool {
 
 struct Stat {
     state: char,
+    ppid: u32,
     pgrp: i32,
     /// The kernel's PF_* flags.
     flags: u64,
@@ -272,6 +289,7 @@ fn stat(pid: u32) -> io::Result<Stat> {
     };
     Ok(Stat {
         state: field(0)?.chars().next().unwrap_or('?'),
+        ppid: field(1)?.parse().map_err(io::Error::other)?,
         pgrp: field(2)?.parse().map_err(io::Error::other)?,
         flags: field(6)?.parse().map_err(io::Error::other)?,
         cpu: field(11)?.parse::<u64>().map_err(io::Error::other)?

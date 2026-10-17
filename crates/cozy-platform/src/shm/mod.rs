@@ -63,3 +63,16 @@ pub fn populate(base: *mut u8, len: usize, threads: usize) {
         }
     });
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn frozen_bytes_read_back_and_refuse_a_write() {
+        use std::io::{Read, Write};
+        let mut file = super::frozen("frozen-test", b"weights").unwrap();
+        let mut text = String::new();
+        file.read_to_string(&mut text).unwrap();
+        assert_eq!(text, "weights");
+        assert!(file.write_all(b"more").is_err(), "a read-only description");
+    }
+}
