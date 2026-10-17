@@ -173,7 +173,7 @@ fn row(object: &ObjectRef) -> Value {
 }
 
 /// How one object GET is answered: its body, `Truncate` (declare it, send half, close), or
-/// `Hold` (wait until [`Hub::open`], then its body).
+/// `Hold` (wait until [`Hub::open`] or an [`Hub::admit`], then its body).
 pub enum Answer {
     Body,
     Truncate,
@@ -191,7 +191,14 @@ pub struct Hub {
     pub gets: Arc<Mutex<HashMap<String, usize>>>,
     /// Object GETs in the order they were asked.
     pub log: Arc<Mutex<Vec<String>>>,
-    gate: Arc<(Mutex<bool>, Condvar)>,
+    gate: Arc<(Mutex<Gate>, Condvar)>,
+}
+
+/// Held GETs wait for the gate to open, or for one of the admissions it has to give.
+#[derive(Default)]
+struct Gate {
+    open: bool,
+    admits: usize,
 }
 
 impl Hub {
@@ -211,7 +218,12 @@ impl Hub {
     }
     /// Every held GET is answered.
     pub fn open(&self) {
-        *self.gate.0.lock().unwrap() = true;
+        self.gate.0.lock().unwrap().open = true;
+        self.gate.1.notify_all();
+    }
+    /// `n` more held GETs are answered.
+    pub fn admit(&self, n: usize) {
+        self.gate.0.lock().unwrap().admits += n;
         self.gate.1.notify_all();
     }
 }
@@ -231,7 +243,7 @@ pub fn hub(
         base,
         gets: Arc::default(),
         log: Arc::default(),
-        gate: Arc::new((Mutex::new(false), Condvar::new())),
+        gate: Arc::default(),
     };
     let served = Served {
         checkpoints: Arc::new(checkpoints),
@@ -271,7 +283,7 @@ struct Served {
     base: String,
     gets: Arc<Mutex<HashMap<String, usize>>>,
     log: Arc<Mutex<Vec<String>>>,
-    gate: Arc<(Mutex<bool>, Condvar)>,
+    gate: Arc<(Mutex<Gate>, Condvar)>,
     gap: Duration,
     rule: Rule,
 }
@@ -367,8 +379,11 @@ impl Served {
                 self.log.lock().unwrap().push(hex.clone());
                 let answer = (self.rule)(&hex, asked);
                 if matches!(answer, Answer::Hold) {
-                    let (open, opened) = &*self.gate;
-                    drop(opened.wait_while(open.lock().unwrap(), |open| !*open).unwrap());
+                    let (gate, changed) = &*self.gate;
+                    let mut gate = changed.wait_while(gate.lock().unwrap(), |g| !g.open && g.admits == 0).unwrap();
+                    if !gate.open {
+                        gate.admits -= 1;
+                    }
                 }
                 match self.checkpoints.iter().find_map(|c| c.bodies.get(&hex)) {
                     Some(body) => (200, body.clone(), matches!(answer, Answer::Truncate)),
