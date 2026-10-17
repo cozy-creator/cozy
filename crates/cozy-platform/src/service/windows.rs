@@ -149,3 +149,21 @@ fn registry(op: &'static str, status: u32) -> Result<()> {
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(iter::once(0)).collect()
 }
+
+/// Only systemd ran an older cozy's machine.
+pub(super) fn legacy(_: &Path) -> Result<Option<super::Legacy>> {
+    Ok(None)
+}
+
+pub(super) fn retire(_: &str) -> Result<()> {
+    Ok(())
+}
+
+pub(super) fn revive(_: &super::Legacy) -> Result<()> {
+    Ok(())
+}
+
+/// Only a manager that restarts services can say one failed to start.
+pub(super) fn failed(_: &str) -> bool {
+    false
+}

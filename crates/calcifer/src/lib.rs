@@ -535,10 +535,16 @@ impl Calcifer {
                     );
                     pause.wait(wake, Some(&mut changed)).await;
                 }
-                Err(Stop::Refused(reason)) => match self.store.fail(id.as_str(), reason) {
-                    Ok(events) => self.publish(id, events),
-                    Err(e) => warn!(run = %id, "{e}"),
-                },
+                Err(Stop::Refused(mut reason)) => {
+                    // An outdated machine's refusal says what to do about it, by its name.
+                    if reason.code == link::OUTDATED {
+                        reason.message = format!("{name}: {}; {}", reason.message, link::outdated_remedy(&name));
+                    }
+                    match self.store.fail(id.as_str(), reason) {
+                        Ok(events) => self.publish(id, events),
+                        Err(e) => warn!(run = %id, "{e}"),
+                    }
+                }
                 Err(Stop::Released(message)) => {
                     if let Err(e) = self.machine_ended(&name, &message) {
                         warn!(run = %id, "{e}");

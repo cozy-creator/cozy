@@ -290,8 +290,13 @@ pub fn state_cell(m: &Machine) -> String {
     if m.unverified {
         cell += " (unverified)";
     }
-    if m.unreachable.is_some() && m.state == MachineState::Ready && unreachable_since(m).is_none() {
-        cell += " (unreachable)";
+    match m.unreachable.as_deref() {
+        // Calcifer's word for a machine from before the HTTP API.
+        Some(why) if why.starts_with("outdated:") => cell = "outdated".into(),
+        Some(_) if m.state == MachineState::Ready && unreachable_since(m).is_none() => {
+            cell += " (unreachable)"
+        }
+        _ => {}
     }
     cell
 }

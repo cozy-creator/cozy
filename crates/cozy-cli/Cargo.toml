@@ -10,12 +10,14 @@ publish.workspace = true
 [dependencies]
 anstream.workspace = true
 anstyle.workspace = true
+base64.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
 comfy-table.workspace = true
 crossterm.workspace = true
 cozy-platform.workspace = true
 cozy-proto.workspace = true
+ed25519-dalek.workspace = true
 futures-util = { workspace = true, features = ["alloc"] }
 getrandom.workspace = true
 hex.workspace = true
