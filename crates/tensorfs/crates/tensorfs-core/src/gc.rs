@@ -443,10 +443,21 @@ pub fn collect_cached_for(
     let store = Store::open(root)?;
     let exclusive = WriterGuard::lock_rebuild(root)?;
     let mut collected = collect_locked(&store, false, &exclusive)?;
+    #[cfg(test)]
+    let zz = root.to_string_lossy().contains("zz-cached-root");
+    #[cfg(test)]
+    if zz {
+        println!("GCDBG {} garbage={}", root.display(), collected.reclaimed_bytes);
+    }
     if collected.reclaimed_bytes >= need.max(1) {
         return Ok(collected);
     }
     let evicted = evict(&store, protected_manifests, need.max(1) - collected.reclaimed_bytes, &exclusive)?;
+    #[cfg(test)]
+    if zz {
+        let pins = crate::meta::owner(root).map(|owner| owner.pinned().len());
+        println!("GCDBG {} evicted={} origins={:?} pins={pins:?}", root.display(), evicted.reclaimed_bytes, crate::origin::manifests(&store).map(|m| m.len()));
+    }
     collected.reclaimed_bytes += evicted.reclaimed_bytes;
     collected.reclaimed_blobs += evicted.reclaimed_blobs;
     collected.reclaimed_manifests += evicted.reclaimed_manifests;
@@ -455,6 +466,11 @@ pub fn collect_cached_for(
     }
     let need = need.max(1) - collected.reclaimed_bytes;
     let roots = roots(&store, protected_manifests)?;
+    #[cfg(test)]
+    if zz {
+        let planned = crate::reclaim::plan(&store, need, &roots.keep, &roots.holds).map(|p| p.victims.len()).map_err(|e| e.to_string());
+        println!("GCDBG {} roots: repos={} keep={} used={} holds={} plan={planned:?}", root.display(), roots.repositories.len(), roots.keep.len(), roots.used.len(), roots.holds.len());
+    }
     let plan = match crate::reclaim::plan(&store, need, &roots.keep, &roots.holds) {
         Ok(plan) => plan,
         Err(error) if error.code == Code::RECLAIM_INSUFFICIENT => return Ok(collected),

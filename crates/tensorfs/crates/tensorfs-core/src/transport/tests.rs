@@ -3957,6 +3957,7 @@ fn zz_cache_root_loop() {
             let body = std::fs::read(store.repository_path(&repository)).unwrap_or_default();
             let cached_after = crate::cache_roots::matches(&store, &repository, &body).ok();
             let second = crate::gc::collect_cached(&root, &[]).map(|r| r.reclaimed_bytes);
+            println!("ZZCR zero root {}", root.display());
             println!(
                 "ZZCR zero: pins_after={pins_after:?} cached_after={cached_after:?} second_gc={second:?} sessions={:?} origins={:?} repos={} repo_file={}",
                 crate::gc::session_holds(&store).map(|(holds, sessions)| (holds.len(), sessions)),
