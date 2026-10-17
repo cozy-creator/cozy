@@ -68,7 +68,6 @@ prettyplease = "0.2"
 progenitor = { version = "0.15.1", default-features = false }
 progenitor-client = "0.15.1"
 prost = "0.14"
-protoc-bin-vendored = "3"
 quote = "1"
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
@@ -98,9 +97,6 @@ tokio-util = { version = "0.7", features = ["io"] }
 # figment's toml 0.8 already builds this one.
 toml = "0.8"
 toml_edit = "0.22.27"
-tonic = { version = "0.14.6", default-features = false, features = ["codegen"] }
-tonic-prost = "0.14.6"
-tonic-prost-build = "0.14.6"
 tower = { version = "0.5", default-features = false, features = ["util"] }
 tracing = "0.1"
 tracing-appender = "0.2.5"
