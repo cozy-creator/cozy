@@ -9,6 +9,7 @@
 //! cursor.
 mod access;
 pub mod api;
+mod lanes;
 pub mod link;
 pub mod machines;
 pub mod outputs;

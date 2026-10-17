@@ -6,14 +6,13 @@
 //! run's output events or, at startup, from the store. `serve` answers
 //! `GET /v1/runs/{id}/outputs/{name}` from the exported file.
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet},
     io::{Read as _, Seek as _, SeekFrom},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
 };
 
 use axum::{
@@ -34,7 +33,6 @@ use sha2::{Digest as _, Sha256};
 use tokio::{
     io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _},
     sync::{Notify, broadcast::error::RecvError, watch},
-    task::{AbortHandle, Id, JoinSet},
 };
 use tonic::{Code, Status};
 use tracing::warn;
@@ -42,6 +40,7 @@ use tracing::warn;
 use crate::{
     Calcifer, Error, Link, Pause,
     api::{self, Api, Refusal},
+    lanes::{self, Ranged},
     lock,
     store::{Endpoint, OutputRow, RunRow, State as RunState, StoreError},
 };
@@ -51,11 +50,6 @@ const TREE: &str = "application/vnd.cozy.tree-manifest";
 /// Bytes are read in ranges of this size, at most `LANES` side by side on their own connections.
 const RANGE: u64 = 8 << 20;
 const LANES: usize = 8;
-/// A range whose bytes come this many times slower than its peers' is asked again.
-const SLOW: f64 = 8.0;
-/// How often ranges in flight are measured, and the shortest window a rate is judged over.
-const SAMPLE: Duration = Duration::from_secs(1);
-const WINDOW: Duration = Duration::from_secs(2);
 
 /// The exporters at work, and what they share.
 #[derive(Default)]
@@ -715,32 +709,8 @@ impl Lanes {
     }
 }
 
-/// A range being read: its task and how far its bytes are in place.
-struct Flight {
-    lane: usize,
-    first: u64,
-    end: u64,
-    at: Arc<AtomicU64>,
-    began: Instant,
-    /// Since its first byte: the start of the window its rate is measured over, and `at` then.
-    window: Option<(Instant, u64)>,
-    slow: bool,
-    task: AbortHandle,
-}
-
-/// Why a range's read stopped.
-enum Ranged {
-    /// Asked again on a fresh connection.
-    Again(String),
-    /// The whole read stops.
-    Stop(Failure),
-}
-
-/// Reads bytes `[from, length)` of `target` at revision `rev` into `part` at their offsets, as an
-/// S3 client does: ranges of `RANGE` bytes, at most `LANES` side by side on their own
-/// connections. A range that fails, or whose bytes come `SLOW` times slower than its peers', is
-/// asked again from where its bytes stopped on a fresh connection. The read gives up only when
-/// every lane has failed since a byte last landed.
+/// Reads bytes `[from, length)` of `target` at revision `rev` into `part` at their offsets: ranges
+/// of `RANGE` bytes, at most `LANES` side by side on their own connections (`lanes::transfer`).
 async fn fetch(
     lanes: &mut Lanes,
     target: &v1::OutputTarget,
@@ -749,121 +719,25 @@ async fn fetch(
     length: u64,
     part: &Path,
 ) -> Result<(), Failure> {
-    let mut queue: VecDeque<(u64, u64)> = (from..length)
+    let ranges = (from..length)
         .step_by(RANGE as usize)
-        .map(|first| (first, (first + RANGE).min(length)))
-        .collect();
-    let (mut reads, mut flights) = (JoinSet::new(), HashMap::<Id, Flight>::new());
-    let (mut rates, mut waits) = (vec![], vec![]);
-    let (mut failures, mut landed, mut landed_then) = (0, 0, 0);
-    let mut sample = tokio::time::interval(SAMPLE);
-    loop {
-        while flights.len() < LANES
-            && let Some((first, end)) = queue.pop_front()
-        {
-            let lane = (0..LANES)
-                .find(|lane| !flights.values().any(|f| f.lane == *lane))
-                .expect("a free lane");
-            let link = lanes.link(lane).map_err(Failure::Again)?;
-            let at = Arc::new(AtomicU64::new(first));
-            let range = (first, end, length);
-            let read = read_range(
-                link,
-                target.clone(),
-                rev,
-                range,
-                part.to_owned(),
-                at.clone(),
-            );
-            let task = reads.spawn(read);
-            let (began, window, slow) = (Instant::now(), None, false);
-            let flight = Flight {
-                lane,
-                first,
-                end,
-                at,
-                began,
-                window,
-                slow,
-                task,
-            };
-            flights.insert(flight.task.id(), flight);
+        .map(|first| (first, (first + RANGE).min(length)));
+    let read = lanes::transfer(ranges, LANES, |leg| {
+        if leg.fresh {
+            lanes.redial(leg.lane);
         }
-        if flights.is_empty() {
-            return Ok(());
+        let link = lanes.link(leg.lane);
+        let (target, part) = (target.clone(), part.to_owned());
+        async move {
+            let link = link.map_err(|e| Ranged::Stop(Failure::Again(e)))?;
+            let range = (leg.first, leg.end, length);
+            read_range(link, target, rev, range, part, leg.at).await
         }
-        tokio::select! {
-            Some(joined) = reads.join_next_with_id() => {
-                let (id, read) = match joined {
-                    Ok((id, read)) => (id, read),
-                    Err(e) => (e.id(), Err(Ranged::Again(e.to_string()))),
-                };
-                let flight = flights.remove(&id).expect("a flight per read");
-                let at = flight.at.load(Ordering::Relaxed);
-                landed += at - flight.first;
-                match read {
-                    Ok(()) => {
-                        let seconds = flight.began.elapsed().as_secs_f64().max(1e-3);
-                        rates.push((flight.end - flight.first) as f64 / seconds);
-                    }
-                    Err(Ranged::Stop(failure)) => return Err(failure),
-                    Err(Ranged::Again(message)) => {
-                        lanes.redial(flight.lane);
-                        queue.push_front((at, flight.end));
-                        if !flight.slow {
-                            if landed > landed_then {
-                                (failures, landed_then) = (0, landed);
-                            }
-                            failures += 1;
-                            if failures > LANES {
-                                return Err(Failure::Again(message));
-                            }
-                        }
-                    }
-                }
-            }
-            _ = sample.tick() => judge(&mut flights, &rates, &mut waits),
-        }
-    }
-}
-
-/// Measures the ranges in flight and drops the one whose first byte waits `SLOW` times longer
-/// than its peers' did, or whose bytes come `SLOW` times slower than its peers' (finished ranges
-/// included) over its latest window; its rest is asked again.
-fn judge(flights: &mut HashMap<Id, Flight>, finished: &[f64], waits: &mut Vec<Duration>) {
-    let now = Instant::now();
-    let mut rates = finished.to_vec();
-    let mut judged = vec![];
-    for flight in flights.values_mut() {
-        let at = flight.at.load(Ordering::Relaxed);
-        match flight.window {
-            None if at > flight.first => {
-                waits.push(now - flight.began);
-                flight.window = Some((now, at));
-            }
-            None => {
-                waits.sort();
-                let typical = waits.get(waits.len() / 2).map(|wait| wait.mul_f64(SLOW));
-                flight.slow |= typical.is_some_and(|t| now - flight.began > t.max(WINDOW));
-            }
-            Some((since, seen)) if now - since >= WINDOW => {
-                let rate = (at - seen) as f64 / (now - since).as_secs_f64();
-                flight.window = Some((now, at));
-                rates.push(rate);
-                judged.push((flight.task.id(), rate));
-            }
-            Some(_) => {}
-        }
-    }
-    rates.sort_by(f64::total_cmp);
-    let typical = (rates.len() >= 2).then(|| rates[rates.len() / 2]);
-    for (id, rate) in judged {
-        if let (Some(typical), Some(flight)) = (typical, flights.get_mut(&id)) {
-            flight.slow |= rate * SLOW < typical;
-        }
-    }
-    for flight in flights.values().filter(|flight| flight.slow) {
-        flight.task.abort();
+    });
+    match read.await {
+        Ok(()) => Ok(()),
+        Err(Ranged::Stop(failure)) => Err(failure),
+        Err(Ranged::Again(message)) => Err(Failure::Again(message)),
     }
 }
 
@@ -876,7 +750,7 @@ async fn read_range(
     (first, end, length): (u64, u64, u64),
     part: PathBuf,
     at: Arc<AtomicU64>,
-) -> Result<(), Ranged> {
+) -> Result<(), Ranged<Failure>> {
     let (head, mut frames) = (link.read(target, first, end - first, rev).await).map_err(refused)?;
     if head.length != length {
         let held = format!(
@@ -916,7 +790,7 @@ async fn read_range(
 }
 
 /// A machine's refusal of a read, as the read acts on it.
-fn refused(status: Status) -> Ranged {
+fn refused(status: Status) -> Ranged<Failure> {
     let message = format!("{:?}: {}", status.code(), status.message());
     match status.code() {
         Code::NotFound => Ranged::Stop(Failure::Lost(format!(
