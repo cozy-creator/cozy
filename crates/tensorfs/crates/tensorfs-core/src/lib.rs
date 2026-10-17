@@ -37,6 +37,7 @@ mod filesystem_identity;
 #[cfg(feature = "store")]
 pub mod fill;
 pub mod fit;
+pub mod format;
 #[cfg(feature = "store")]
 pub mod gc;
 pub mod header;
