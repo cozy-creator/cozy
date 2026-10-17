@@ -6,7 +6,8 @@
 //! ends it. Unpinned runs are placed here: `any` on a rental of this controller that fits,
 //! `new:<sku>` on one rented for the run (`rentals`).
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
+    convert::Infallible,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
@@ -17,14 +18,17 @@ use axum::{
     body::Bytes,
     extract::{Path as UrlPath, Query, State, rejection::QueryRejection},
     http::{HeaderMap, StatusCode, header},
-    response::{IntoResponse, Response},
+    response::{
+        IntoResponse, Response,
+        sse::{self, KeepAlive, Sse},
+    },
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use cozy_platform::{durable, paths::Home};
 use cozy_proto::{
     calcifer::{
         self as wire, Ended, Event, Keepalive, Machine, MachineKind, MachineList, MachineLog,
-        MachineState, MachineStatus, NewMachine,
+        MachineState, MachineStatus, MachinesEvent, NewMachine,
     },
     config,
     error::{Error, Kind},
@@ -35,11 +39,12 @@ use ed25519_dalek::{
     SigningKey,
     pkcs8::{DecodePrivateKey as _, EncodePrivateKey as _},
 };
+use futures_util::Stream;
 use prost::Message as _;
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 use tokio::{
-    sync::{Notify, broadcast::error::RecvError},
+    sync::{Notify, broadcast, broadcast::error::RecvError, watch},
     task::{AbortHandle, JoinSet},
 };
 use tracing::warn;
@@ -434,6 +439,7 @@ impl Machines {
         if let Some(seen) = lock(&self.seen).get_mut(name) {
             seen.boot = None;
         }
+        self.calcifer.machine_changed();
     }
 
     /// Follows the machine's Status for as long as it lives. A broken stream is opened again,
@@ -503,6 +509,7 @@ impl Machines {
         }
         seen.frame = Some(frame);
         seen.unreachable = None;
+        self.calcifer.machine_changed();
     }
 
     fn unreachable(&self, name: &str, reason: String) {
@@ -510,6 +517,7 @@ impl Machines {
             .entry(name.to_owned())
             .or_default()
             .unreachable = Some(reason);
+        self.calcifer.machine_changed();
     }
 
     /// Places each unplaced run, now, whenever one is created or returned to the outbox, and
@@ -623,6 +631,103 @@ pub(crate) async fn list(
     Ok(Json(
         api.machines.list(query.refresh).await.map_err(Refusal)?,
     ))
+}
+
+/// A machine as `GET /v1/machines` lists it, each time its row changes (its state, Status, boot,
+/// Hub listing, or the runs on it), and the name of one that left the list. No backlog: a client
+/// subscribes, then lists.
+pub(crate) async fn events(
+    State(api): State<Arc<Api>>,
+) -> Result<Sse<impl Stream<Item = Result<sse::Event, Infallible>>>, Refusal> {
+    let mut changed = api.calcifer.machines_changed();
+    changed.mark_unchanged();
+    let runs = api.calcifer.subscribe();
+    let watch = MachinesWatch {
+        shown: listed(&api.machines).await.map_err(Refusal)?,
+        changed,
+        runs,
+        stop: api.stop_signal(),
+        machines: api.machines.clone(),
+        pending: VecDeque::new(),
+    };
+    let stream = futures_util::stream::unfold(watch, MachinesWatch::next);
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
+/// One `events` subscriber: the list as it last told it, and what it owes.
+struct MachinesWatch {
+    shown: HashMap<String, Machine>,
+    changed: watch::Receiver<()>,
+    runs: broadcast::Receiver<(RunId, Event)>,
+    stop: watch::Receiver<bool>,
+    machines: Arc<Machines>,
+    pending: VecDeque<MachinesEvent>,
+}
+
+impl MachinesWatch {
+    async fn next(mut self) -> Option<(Result<sse::Event, Infallible>, Self)> {
+        loop {
+            if let Some(event) = self.pending.pop_front() {
+                let data = serde_json::to_string(&event).expect("an event serializes");
+                return Some((Ok(sse::Event::default().data(data)), self));
+            }
+            tokio::select! {
+                changed = self.changed.changed() => if changed.is_err() { return None },
+                received = self.runs.recv() => match received {
+                    // A run's lifecycle moves its machine's running and queued counts.
+                    Ok((_, event)) if lifecycle(&event) => {}
+                    Ok(_) => continue,
+                    // Falling behind loses nothing here: the whole list is read again below.
+                    Err(RecvError::Lagged(_)) => {}
+                    Err(RecvError::Closed) => return None,
+                },
+                _ = self.stop.wait_for(|stop| *stop) => return None,
+            }
+            let now = match listed(&self.machines).await {
+                Ok(now) => now,
+                Err(e) => {
+                    warn!(
+                        "the machines stream cannot list the machines: {}",
+                        e.message
+                    );
+                    return None;
+                }
+            };
+            for (name, machine) in &now {
+                if self.shown.get(name) != Some(machine) {
+                    let machine = Box::new(machine.clone());
+                    self.pending.push_back(MachinesEvent::Updated { machine });
+                }
+            }
+            for name in self.shown.keys().filter(|name| !now.contains_key(*name)) {
+                let name = name.clone();
+                self.pending.push_back(MachinesEvent::Removed { name });
+            }
+            self.shown = now;
+        }
+    }
+}
+
+/// The machines a list shows now, by name, from what Calcifer holds (no Hub is asked).
+async fn listed(machines: &Arc<Machines>) -> Result<HashMap<String, Machine>, Error> {
+    let list = machines.list(false).await?;
+    Ok(list
+        .machines
+        .into_iter()
+        .map(|m| (m.name.clone(), m))
+        .collect())
+}
+
+fn lifecycle(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::Created { .. }
+            | Event::Queued { .. }
+            | Event::InProgress { .. }
+            | Event::Completed { .. }
+            | Event::Failed { .. }
+            | Event::Canceled { .. }
+    )
 }
 
 #[derive(Deserialize)]

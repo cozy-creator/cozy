@@ -21,7 +21,7 @@ use axum::{
 };
 use cozy_platform::lock::{Kind as LockKind, LockFile};
 use cozy_proto::{
-    calcifer::{Down, Event, Run, RunList, Status, SubmitRun, Submitted},
+    calcifer::{Down, Event, Run, RunList, RunsEvent, Status, SubmitRun, Submitted},
     error::{Envelope, Error, Kind},
     ids::RunId,
 };
@@ -96,6 +96,11 @@ impl Api {
         self.stop.send_replace(true);
     }
 
+    /// True once Calcifer is stopping: what ends every stream.
+    pub(crate) fn stop_signal(&self) -> watch::Receiver<bool> {
+        self.stop.subscribe()
+    }
+
     pub fn stopped(&self) -> impl Future<Output = ()> + use<> {
         let mut stop = self.stop.subscribe();
         async move {
@@ -117,6 +122,7 @@ impl Api {
 pub fn router(api: Arc<Api>) -> Router {
     Router::new()
         .route("/v1/runs", post(submit).get(list))
+        .route("/v1/runs/events", get(runs_events))
         .route("/v1/runs/{id}", get(show))
         .route("/v1/runs/{id}/cancel", post(cancel))
         .route("/v1/runs/{id}/events", get(events))
@@ -124,6 +130,7 @@ pub fn router(api: Arc<Api>) -> Router {
         .route("/v1/runs/{id}/play", get(crate::play::play))
         .route("/v1/down", post(down))
         .route("/v1/machines", get(machines::list).post(machines::create))
+        .route("/v1/machines/events", get(machines::events))
         .route(
             "/v1/machines/{name}",
             get(machines::show).delete(machines::end),
@@ -523,6 +530,78 @@ async fn events(
     };
     let stream = futures_util::stream::unfold(follow, Follow::next);
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
+/// Every run's changes as `run.updated`, each run whole: its lifecycle, outputs and live progress or
+/// wait. No backlog: a client subscribes, then lists. Changes that arrive together are sent once
+/// per run. A subscriber that falls behind is ended, never skipped past: it lists again.
+async fn runs_events(
+    State(api): State<Arc<Api>>,
+) -> Sse<impl Stream<Item = Result<sse::Event, Infallible>>> {
+    let watch = RunsWatch {
+        tail: api.calcifer.subscribe(),
+        stop: api.stop_signal(),
+        calcifer: api.calcifer.clone(),
+        pending: VecDeque::new(),
+    };
+    Sse::new(futures_util::stream::unfold(watch, RunsWatch::next)).keep_alive(KeepAlive::default())
+}
+
+/// One `runs_events` subscriber: the runs it owes an update, in the order they changed.
+struct RunsWatch {
+    tail: broadcast::Receiver<(RunId, Event)>,
+    stop: watch::Receiver<bool>,
+    calcifer: Arc<Calcifer>,
+    pending: VecDeque<RunId>,
+}
+
+impl RunsWatch {
+    async fn next(mut self) -> Option<(Result<sse::Event, Infallible>, Self)> {
+        loop {
+            // Whatever else already arrived joins the batch: a run is sent once, as it is now.
+            loop {
+                match self.tail.try_recv() {
+                    Ok((id, event)) => self.owe(id, &event),
+                    Err(broadcast::error::TryRecvError::Empty) => break,
+                    Err(_) => return None,
+                }
+            }
+            if let Some(id) = self.pending.pop_front() {
+                let run = match self.calcifer.store().run(id.as_str()) {
+                    Ok(Some(row)) => self.calcifer.record(&row),
+                    Ok(None) => continue,
+                    Err(e) => Err(crate::Error::Store(e)),
+                };
+                let run = match run {
+                    Ok(run) => run,
+                    Err(e) => {
+                        warn!(run = %id, "the runs stream cannot read the run: {e}");
+                        return None;
+                    }
+                };
+                let data = serde_json::to_string(&RunsEvent::Updated { run })
+                    .expect("an event serializes");
+                return Some((Ok(sse::Event::default().data(data)), self));
+            }
+            let received = tokio::select! {
+                received = self.tail.recv() => received.ok(),
+                _ = self.stop.wait_for(|stop| *stop) => None,
+            };
+            match received {
+                Some((id, event)) => self.owe(id, &event),
+                None => return None,
+            }
+        }
+    }
+
+    /// Owes `id` an update unless `event` leaves its record as it was (a log line, an output's
+    /// growth) or it is owed one already.
+    fn owe(&mut self, id: RunId, event: &Event) {
+        let shown = !matches!(event, Event::Log { .. } | Event::OutputDelta { .. });
+        if shown && !self.pending.contains(&id) {
+            self.pending.push_back(id);
+        }
+    }
 }
 
 /// One SSE subscriber's place in its run's stream.

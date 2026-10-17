@@ -369,6 +369,15 @@ pub struct RunList {
     pub older: u64,
 }
 
+/// `GET /v1/runs/events`: every run's changes, each run whole as `GET /v1/runs/{id}` answers it. No
+/// backlog: a client subscribes, then lists. A stream that falls behind ends; its client lists again.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum RunsEvent {
+    #[serde(rename = "run.updated")]
+    Updated { run: Run },
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MachineKind {
@@ -576,6 +585,17 @@ pub struct MachineList {
     /// Hubs this computer holds no login for.
     #[serde(default)]
     pub signed_out: Vec<String>,
+}
+
+/// `GET /v1/machines/events`: a machine as `GET /v1/machines` lists it, each time its row changes,
+/// and the name of one that left the list. No backlog: a client subscribes, then lists.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum MachinesEvent {
+    #[serde(rename = "machine.updated")]
+    Updated { machine: Box<Machine> },
+    #[serde(rename = "machine.removed")]
+    Removed { name: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

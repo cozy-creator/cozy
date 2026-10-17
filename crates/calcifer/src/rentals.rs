@@ -396,6 +396,7 @@ impl Machines {
                     self.store()
                         .settle_ask(&ask.key, Ok(Some(&row)))
                         .map_err(internal)?;
+                    self.calcifer.machine_changed();
                     self.calcifer.owe_less();
                     if let Some(run) = &ask.run {
                         self.calcifer.place(run, &row.name).map_err(internal)?;
@@ -617,6 +618,7 @@ impl Machines {
                     }
                     let boot = boot_phase(&rental);
                     lock(&self.seen).entry(row.name.clone()).or_default().boot = boot.clone();
+                    self.calcifer.machine_changed();
                     if gone(&rental.state) {
                         return self.ended(&row.name, &cause(&rental));
                     }
@@ -628,6 +630,7 @@ impl Machines {
                             continue;
                         }
                         lock(&self.seen).entry(row.name.clone()).or_default().boot = None;
+                        self.calcifer.machine_changed();
                         return self.watch(&row);
                     }
                     let now = format!("{} {boot:?}", rental.state);
@@ -681,6 +684,7 @@ impl Machines {
             lists.spawn(async move { me.list_hub(&origin).await });
         }
         lists.join_all().await;
+        self.calcifer.machine_changed();
     }
 
     async fn list_hub(&self, origin: &str) {
@@ -788,6 +792,8 @@ impl Machines {
         if ask.state == AskState::Failed {
             self.store().reopen_ask(&ask.key).map_err(internal)?;
         }
+        // A pending end shows the machine `ending`.
+        self.calcifer.machine_changed();
         let me = self.clone();
         self.spawn(async move { me.finish_end(ask).await });
         Ok(())
@@ -807,6 +813,7 @@ impl Machines {
             if let Err(e) = settled {
                 warn!(ask = ask.key, "{e}");
             }
+            self.calcifer.machine_changed();
             self.calcifer.owe_less();
         };
         let mut released = false;
