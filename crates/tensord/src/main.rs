@@ -19,6 +19,9 @@ use std::{
 };
 
 fn main() {
+    // rustls links two providers (ring for TensorD's TLS, aws-lc-rs through hub-client's
+    // reqwest), so the process default is named: TensorD's. T1's move to aws-lc-rs drops this.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     if let Err(error) = run() {
         eprintln!("tensord: {error}");
         std::process::exit(1);
