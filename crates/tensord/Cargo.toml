@@ -7,6 +7,8 @@ publish.workspace = true
 [dependencies]
 cozy-proto.workspace = true
 str0m = { version = "0.24", default-features = false, features = ["aws-lc-rs"] }
+hub-client.workspace = true
+reqwest.workspace = true
 tensorfs-core = { workspace = true, features = ["store"] }
 tensorfs-plane = { workspace = true, features = ["store"] }
 serde.workspace = true

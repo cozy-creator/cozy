@@ -13,7 +13,7 @@ required-features = ["store"]
 # The store, downloader, ingest, GC and everything that opens one. Without it: documents,
 # headers, read plans and the fit function only (what a plane-only executor links).
 default = ["store"]
-store = ["dep:rusqlite", "dep:rustix", "dep:rustls", "dep:webpki-roots", "dep:nix", "dep:ring", "dep:tokio", "dep:tokio-rustls", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:bytes", "dep:futures"]
+store = ["dep:rusqlite", "dep:rustix", "dep:rustls", "dep:webpki-roots", "dep:nix", "dep:tokio", "dep:tokio-rustls", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:bytes", "dep:futures"]
 
 [dependencies]
 base64.workspace = true
@@ -29,8 +29,6 @@ rustix = { version = "1.1.4", default-features = false, features = ["std", "net"
 # there; scripts/fence.py refuses it anywhere else so a second mover cannot grow.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
 webpki-roots = { version = "0.26", optional = true }
-# DPoP proofs (RFC 9449, ES256): the same ring rustls already links.
-ring = { version = "0.17", optional = true }
 # The transport's async half (src/transport/net.rs): requests in flight are tasks on two
 # threads, never a thread each. hyper frames HTTP/1.1; the connect, TLS and policy are ours.
 tokio = { workspace = true, optional = true }

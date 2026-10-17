@@ -1,31 +1,20 @@
-//! The Hub's worker API as this machine: worker id and token headers, JSON, HTTPS to the
-//! granted origin (public roots plus the granted CA). Two calls: rental authority and release.
+//! The Hub's worker API as this machine (hub-client, the worker credential), HTTPS to the
+//! granted origin (public roots plus the granted CA): rental authority, the endpoint report and
+//! release.
 use super::grant::HubGrant;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use bytes::Bytes;
 use ed25519_dalek::VerifyingKey;
-use http_body_util::{BodyExt, Full, Limited};
-use hyper::{Method, Request, StatusCode};
-use hyper_util::rt::TokioIo;
+use hub_client::{types, Credential};
 use std::{
     io,
-    sync::{
-        atomic::{AtomicI64, Ordering},
-        Arc,
-    },
+    num::NonZeroU64,
+    sync::atomic::{AtomicI64, Ordering},
     time::Duration,
 };
-use tokio_rustls::rustls::{self, pki_types::ServerName, RootCertStore};
-
-/// A bounded transport budget per call, never a limit on any work.
-const CALL_BUDGET: Duration = Duration::from_secs(30);
-const MAX_ANSWER_BYTES: usize = 64 << 10;
 
 pub struct Hub {
     grant: HubGrant,
-    host: String,
-    port: u16,
-    tls: Arc<rustls::ClientConfig>,
+    client: hub_client::Client,
     /// When the Hub last answered anything (0: never in this process).
     contact_ms: AtomicI64,
 }
@@ -40,31 +29,14 @@ pub enum Refusal {
 
 impl Hub {
     pub fn new(grant: HubGrant) -> io::Result<Self> {
-        let authority = grant.origin.trim_start_matches("https://");
-        let (host, port) = match authority
-            .rsplit_once(':')
-            .map(|(h, p)| (h, p.parse::<u16>()))
-        {
-            Some((host, Ok(port))) => (host.to_owned(), port),
-            _ => (authority.to_owned(), 443),
+        let http = crate::hub::http(grant.ca_der.as_deref()).map_err(|e| io::Error::other(e.0))?;
+        let credential = Credential::Worker {
+            id: grant.worker_id.clone(),
+            token: grant.worker_token.clone(),
         };
-        let mut roots = RootCertStore {
-            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-        };
-        if let Some(ca) = &grant.ca_der {
-            roots.add(ca.clone().into()).map_err(io::Error::other)?;
-        }
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let tls = rustls::ClientConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()
-            .map_err(io::Error::other)?
-            .with_root_certificates(roots)
-            .with_no_client_auth();
         Ok(Self {
+            client: hub_client::Client::connect(&grant.origin, http, credential),
             grant,
-            host,
-            port,
-            tls: Arc::new(tls),
             contact_ms: AtomicI64::new(0),
         })
     }
@@ -78,81 +50,32 @@ impl Hub {
         self.contact_ms.load(Ordering::Acquire)
     }
 
-    async fn call(
-        &self,
-        method: Method,
-        path: &str,
-        body: Option<Vec<u8>>,
-    ) -> Result<(StatusCode, Bytes), Refusal> {
-        let exchange = async {
-            let tcp = super::net::connect(&self.host, self.port).await?;
-            let name = ServerName::try_from(self.host.clone()).map_err(io::Error::other)?;
-            let tls = tokio_rustls::TlsConnector::from(self.tls.clone())
-                .connect(name, tcp)
-                .await?;
-            let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(tls))
-                .await
-                .map_err(io::Error::other)?;
-            tokio::spawn(connection);
-            let request = Request::builder()
-                .method(method)
-                .uri(path)
-                .header("host", &self.host)
-                .header("x-cozy-worker-id", &self.grant.worker_id)
-                .header("x-cozy-worker-token", &self.grant.worker_token)
-                .header("accept", "application/json")
-                .header("content-type", "application/json")
-                .body(Full::new(Bytes::from(body.unwrap_or_default())))
-                .map_err(io::Error::other)?;
-            let response = sender
-                .send_request(request)
-                .await
-                .map_err(io::Error::other)?;
-            let status = response.status();
-            let answer = Limited::new(response.into_body(), MAX_ANSWER_BYTES)
-                .collect()
-                .await
-                .map_err(io::Error::other)?
-                .to_bytes();
-            Ok::<_, io::Error>((status, answer))
-        };
-        let answered = tokio::time::timeout(CALL_BUDGET, exchange).await;
-        if let Ok(Ok(_)) = &answered {
+    /// An answer, or a refusal the Hub made, is contact; only an unreachable Hub is not.
+    fn heard<T>(&self, answer: Result<T, hub_client::Error>) -> Result<T, Refusal> {
+        if !matches!(
+            answer,
+            Err(hub_client::Error::Call(_) | hub_client::Error::Credential(_))
+        ) {
             self.contact_ms
                 .store(super::lifecycle::now_ms(), Ordering::Release);
         }
-        match answered {
-            Ok(Ok((status, _)))
-                if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN =>
-            {
-                Err(Refusal::Denied)
-            }
-            Ok(Ok(answer)) => Ok(answer),
-            Ok(Err(error)) => Err(Refusal::Transport(format!("reach Tensorhub: {error}"))),
-            Err(_) => Err(Refusal::Transport(
-                "Tensorhub did not answer within its call budget".into(),
-            )),
-        }
+        answer.map_err(|error| match error {
+            hub_client::Error::Hub {
+                status: 401 | 403, ..
+            } => Refusal::Denied,
+            hub_client::Error::Call(why) => Refusal::Transport(format!("reach Tensorhub: {why}")),
+            other => Refusal::Transport(other.to_string()),
+        })
     }
 
     /// The rental's current authorized keys and their lease.
     pub async fn authorized_keys(&self) -> Result<(Vec<VerifyingKey>, Duration), Refusal> {
-        let (status, answer) = self
-            .call(Method::GET, "/v1/worker/rental/authorized-keys", None)
-            .await?;
-        if status != StatusCode::OK {
-            return Err(Refusal::Transport(format!(
-                "rental authority answered HTTP {status}"
-            )));
-        }
-        #[derive(serde::Deserialize)]
-        struct Document {
-            worker_id: String,
-            authorized_keys: Vec<String>,
-            lease_seconds: u64,
-        }
+        let answer = self
+            .client
+            .get_worker_authorized_keys(&self.grant.worker_id)
+            .await;
+        let document = self.heard(answer.map(|a| a.into_inner()).map_err(Into::into))?;
         let invalid = || Refusal::Transport("rental authority metadata is invalid".into());
-        let document: Document = serde_json::from_slice(&answer).map_err(|_| invalid())?;
         if document.worker_id != self.grant.worker_id
             || !(1..=3600).contains(&document.lease_seconds)
         {
@@ -167,51 +90,45 @@ impl Hub {
             })
             .collect::<Option<Vec<_>>>()
             .ok_or_else(invalid)?;
-        Ok((keys, Duration::from_secs(document.lease_seconds)))
+        Ok((keys, Duration::from_secs(document.lease_seconds as u64)))
     }
 
     /// Tells the Hub where this booting machine listens. Ok(false): a Hub that takes no
     /// reports and waits for the provider instead.
-    pub async fn report_endpoint(&self, endpoint: &super::endpoint::Endpoint) -> Result<bool, Refusal> {
-        let body = serde_json::to_vec(endpoint).expect("JSON");
-        let (status, _) = self
-            .call(Method::POST, "/v1/worker/rental/endpoint", Some(body))
-            .await?;
-        match status {
-            StatusCode::NO_CONTENT => Ok(true),
-            StatusCode::NOT_FOUND => Ok(false),
-            other => Err(Refusal::Transport(format!("the endpoint report answered HTTP {other}"))),
+    pub async fn report_endpoint(
+        &self,
+        endpoint: &super::endpoint::Endpoint,
+    ) -> Result<bool, Refusal> {
+        let report = types::WorkerEndpointReport {
+            public_host: endpoint.public_host.clone(),
+            ports: endpoint
+                .ports
+                .iter()
+                .filter_map(|(private, public)| {
+                    Some((private.clone(), NonZeroU64::new((*public).into())?))
+                })
+                .collect(),
+        };
+        let answer = self
+            .client
+            .report_worker_endpoint(&self.grant.worker_id, &report)
+            .await;
+        match answer.map(drop).map_err(hub_client::Error::from) {
+            Err(hub_client::Error::Hub { status: 404, .. }) => self.heard(Ok(false)),
+            answer => self.heard(answer.map(|()| true)),
         }
     }
 
-    /// Ends this rental's allocation; 204 is acceptance.
+    /// Ends this rental's allocation; acceptance is the Hub's 204.
     pub async fn release(&self) -> Result<(), Refusal> {
-        let body = serde_json::to_vec(&serde_json::json!({ "worker_id": self.grant.worker_id }))
-            .expect("JSON");
-        let (status, answer) = self
-            .call(Method::POST, "/v1/worker/rental/release", Some(body))
-            .await?;
-        if status == StatusCode::NO_CONTENT {
-            return Ok(());
-        }
-        #[derive(serde::Deserialize)]
-        struct Refused {
-            error: Detail,
-        }
-        #[derive(serde::Deserialize)]
-        struct Detail {
-            code: String,
-            message: String,
-        }
-        Err(Refusal::Transport(
-            match serde_json::from_slice::<Refused>(&answer) {
-                Ok(refused) => format!(
-                    "{}: {:.512} (HTTP {status})",
-                    refused.error.code, refused.error.message
-                ),
-                Err(_) => format!("Tensorhub answered HTTP {status}"),
-            },
-        ))
+        let request = types::WorkerReleaseRequest {
+            worker_id: self.grant.worker_id.clone(),
+        };
+        let answer = self
+            .client
+            .release_worker_rental(&self.grant.worker_id, &request)
+            .await;
+        self.heard(answer.map(drop).map_err(Into::into))
     }
 }
 

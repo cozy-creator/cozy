@@ -909,7 +909,7 @@ mod v1_api {
     fn leaf_jkt(machine: &Machine) -> String {
         let identity: serde_json::Value =
             serde_json::from_slice(&fs::read(machine.root.join("config/identity/identity.json")).unwrap()).unwrap();
-        tensorfs_core::transport::DpopKey::from_pem(identity["private_key_pem"].as_str().unwrap())
+        hub_client::P256Key::from_pem(identity["private_key_pem"].as_str().unwrap())
             .unwrap()
             .thumbprint()
     }
@@ -1912,7 +1912,7 @@ mod v1_api {
         let closures: Vec<_> = heard.lock().unwrap().iter().filter(|h| h.contains("closure")).cloned().collect();
         assert_eq!(closures.len(), 2, "{closures:?}");
 
-        let forged = authkit.capability(&tensorfs_core::transport::DpopKey::generate().unwrap().thumbprint(), &read(&manifest.id()), 600);
+        let forged = authkit.capability(&hub_client::P256Key::generate().thumbprint(), &read(&manifest.id()), 600);
         let request = v1::RunRequest { id: "private-3".into(), after: 0, spec: Some(spec(forged)) };
         let refused = client.run(authorized(request, &all)).await;
         let refused = match refused {
