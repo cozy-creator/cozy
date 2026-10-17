@@ -302,6 +302,77 @@ fn an_update_installs_local_wheels() {
     );
 }
 
+/// A PyPI wheel URL names its release: the CLI checks with PyPI that the release holds that file at
+/// that sha256 and sends the release, which a machine of any version fetches from PyPI (TensorD
+/// 0.7.3 included). A digest PyPI does not list is refused before anything is sent.
+#[test]
+fn an_update_names_a_published_wheel_by_its_pypi_url() {
+    let Some(home) = Home::new() else { return };
+    let _machine = tensord::added(&home, "pypi");
+    let wheel = |project: &str, release: &str| {
+        let listed = std::process::Command::new("curl")
+            .args([
+                "-sSfL",
+                &format!("https://pypi.org/pypi/{project}/{release}/json"),
+            ])
+            .output()
+            .unwrap();
+        let listed: Value = serde_json::from_slice(&listed.stdout).unwrap();
+        let file = listed["urls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| {
+                let name = f["filename"].as_str().unwrap();
+                name.ends_with(".whl") && name.contains("manylinux") && name.contains("x86_64")
+            })
+            .cloned()
+            .unwrap_or_else(|| panic!("{project} {release} has no manylinux x86_64 wheel"));
+        let (url, sha256) = (
+            file["url"].as_str().unwrap(),
+            file["digests"]["sha256"].as_str().unwrap(),
+        );
+        (format!("{url}#sha256={sha256}"), url.to_owned())
+    };
+    let (runtime, runtime_url) = wheel("cozy-runtime", "0.25.1");
+    let (tensorfs, _) = wheel("tensorfs", "0.10.0");
+    let wrong = format!("{runtime_url}#sha256={}", "ab".repeat(32));
+    let out = home.cozy([
+        "machine",
+        "update",
+        "pypi",
+        "--runtime-wheel",
+        wrong.as_str(),
+        "--json",
+    ]);
+    assert_eq!(
+        (out.code, out.refusal()["code"].clone()),
+        (1, "wheel_digest_mismatch".into()),
+        "{out:?}"
+    );
+    let out = home.cozy([
+        "machine",
+        "update",
+        "pypi",
+        "--runtime-wheel",
+        runtime.as_str(),
+        "--tensorfs-wheel",
+        tensorfs.as_str(),
+        "--json",
+    ]);
+    let last: Value = serde_json::from_str(out.stdout.lines().last().unwrap_or_default())
+        .unwrap_or_else(|e| panic!("{e}: {out:?}"));
+    assert_eq!(
+        (
+            out.code,
+            last["type"].as_str(),
+            last["run"]["result"]["to"]["runtime"].as_str()
+        ),
+        (0, Some("run.completed"), Some("0.25.1")),
+        "{out:?}"
+    );
+}
+
 /// `machine update --runtime-wheel/--tensorfs-wheel https://…#sha256=<hex>`: the machine fetches each
 /// wheel itself, through a redirect to another host, and nothing is written to it from here. The
 /// bytes are held to the digest: under a wrong one the update fails `wheel_digest_mismatch` naming
