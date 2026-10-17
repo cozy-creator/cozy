@@ -17,6 +17,7 @@ use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 
 use super::author::{Stage, refuse, run, uv};
+use crate::Context;
 
 /// The oldest glibc on the machines' images.
 const GLIBC: u32 = 36;
@@ -57,12 +58,13 @@ struct Vcs {
 
 /// The registry rows of the staged project's lock, and the wheels its git dependencies build to.
 pub fn dependencies(
+    ctx: &Context,
     stage: &Stage,
     python: &str,
 ) -> Result<(Vec<PackageRegistryPin>, Vec<PathBuf>), Error> {
     let exported = stage.root.join("pylock.toml");
     run(
-        uv(&stage.src)
+        uv(&stage.uv, &stage.src)
             .args([
                 "export",
                 "--frozen",
@@ -97,7 +99,7 @@ pub fn dependencies(
         let name = package.name.to_ascii_lowercase();
         let version = package.version.unwrap_or_default();
         if let Some(vcs) = package.vcs {
-            wheels.push(git_wheel(stage, python, &name, &vcs)?);
+            wheels.push(git_wheel(ctx, stage, python, &name, &vcs)?);
             continue;
         }
         let wheel = choose(&package.wheels, python).ok_or_else(|| {
@@ -219,7 +221,13 @@ fn glibc(platform: &str) -> Option<u32> {
 
 /// A git dependency pinned to a full commit, built to a wheel whose build tag names its bytes:
 /// `<name>-<version>-0<12 hex>-<tags>.whl`. A branch or tag could move, so it is refused.
-fn git_wheel(stage: &Stage, python: &str, name: &str, vcs: &Vcs) -> Result<PathBuf, Error> {
+fn git_wheel(
+    ctx: &Context,
+    stage: &Stage,
+    python: &str,
+    name: &str,
+    vcs: &Vcs,
+) -> Result<PathBuf, Error> {
     let commit = vcs.commit.as_deref().unwrap_or_default();
     let pinned = commit.len() == 40 && commit.bytes().all(|b| b.is_ascii_hexdigit());
     if !pinned || vcs.requested.as_deref() != Some(commit) {
@@ -244,7 +252,10 @@ fn git_wheel(stage: &Stage, python: &str, name: &str, vcs: &Vcs) -> Result<PathB
             .arg(&checkout)
             .args(args)
             .output()
-            .map_err(|e| refuse("git_unavailable", e))?;
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::NotFound => crate::tools::missing(ctx, "git"),
+                _ => refuse("git_dependency_checkout", e),
+            })?;
         match out.status.success() {
             true => Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned()),
             false => Err(refuse(
@@ -259,7 +270,7 @@ fn git_wheel(stage: &Stage, python: &str, name: &str, vcs: &Vcs) -> Result<PathB
     let epoch = git(&["log", "-1", "--format=%ct"])?;
     let out = stage.root.join("git-wheels").join(name);
     run(
-        uv(&checkout)
+        uv(&stage.uv, &checkout)
             .args([
                 "build",
                 "--wheel",
