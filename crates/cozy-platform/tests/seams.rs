@@ -454,7 +454,8 @@ fn the_gpu_probe_answers_without_a_driver() {
             gpu.compute_capability.is_some() && gpu.memory_class.is_some(),
             "{gpu:?}"
         );
-        assert_eq!(gpu::probe(Some(&gpu.uuid)).unwrap(), vec![gpu.clone()]);
+        let probed = gpu::Gpu { memory_class: None, ..gpu.clone() };
+        assert_eq!(gpu::probe(Some(&gpu.uuid)).unwrap(), vec![probed]);
         let device = gpu::Device::open(&gpu.uuid).unwrap();
         assert!(device.key().starts_with(&gpu.uuid));
         assert_eq!(device.read().unwrap().total, gpu.memory_bytes);
