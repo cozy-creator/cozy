@@ -24,7 +24,8 @@ features = ["extension-module", "store"]
 # here by scripts/build-wheel.sh before maturin runs. The wheel contract checks both
 # the executable and full installed extension; use that script for local builds.
 data = "wheel-data"
-# Git tracks the empty data dir through this placeholder, so a plain source build (a git
-# dependency or the sdist) works; it never ships in a wheel.
+# Git and the sdist carry the empty data dir through this placeholder, so a source build (a
+# git dependency or the sdist) works; it never ships in a wheel. tensorfs-core carries the
+# documents it compiles in itself (crates/tensorfs-core/vectors/).
 include = [{ path = "wheel-data/scripts/.gitkeep", format = "sdist" }]
 exclude = [{ path = "wheel-data/scripts/.gitkeep", format = "wheel" }]
