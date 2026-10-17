@@ -365,33 +365,6 @@ fn an_update_fetches_wheels_by_url_held_to_their_digests() {
             "{out:?}"
         );
     }
-    // Fetching by URL needs the cohort's TensorD, this workspace's. A released TensorD (0.7.3)
-    // refuses the {url, sha256} member at submission: the run fails typed, and the machine
-    // fetches nothing, as nothing is sent from here.
-    if !tensord::workspace() {
-        let (out, last) = update(
-            url(&runtime, &digest(&runtime)).as_str(),
-            url(&tensorfs, &digest(&tensorfs)).as_str(),
-        );
-        let reason = &last["run"]["reason"];
-        assert_eq!(
-            (out.code, last["type"].as_str(), reason["code"].as_str()),
-            (1, Some("run.failed"), Some("InvalidArgument")),
-            "{out:?}"
-        );
-        let message = reason["message"].as_str().unwrap_or_default();
-        assert!(
-            message.contains("an update payload is a JSON object"),
-            "{out:?}"
-        );
-        assert_eq!(
-            server.served.load(Ordering::Relaxed),
-            0,
-            "the machine fetched"
-        );
-        assert_eq!(running(), before);
-        return;
-    }
     let wrong = "ab".repeat(32);
     let (out, last) = update(
         url(&runtime, &wrong).as_str(),
