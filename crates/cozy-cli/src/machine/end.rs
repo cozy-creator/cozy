@@ -225,7 +225,12 @@ pub async fn update(
     ] {
         let Some(path) = path else { continue };
         if let Some(at) = path.to_str().filter(|p| p.contains("://")) {
-            let (file, fetched) = fetched(at, distribution)?;
+            let (file, mut fetched) = fetched(at, distribution)?;
+            // A published wheel is named by its release, which every machine fetches from PyPI
+            // held to the index's digest: the one this URL names, checked here.
+            if let Some(release) = published(ctx, &fetched, &file, distribution).await? {
+                fetched = release.into();
+            }
             named.push(format!("{member} {file}"));
             payload.insert(member.into(), fetched);
             continue;
@@ -316,6 +321,73 @@ fn fetched(at: &str, distribution: &str) -> Result<(String, serde_json::Value), 
     }
     let member = serde_json::json!({"url": url, "sha256": sha256.to_ascii_lowercase()});
     Ok((file.to_owned(), member))
+}
+
+/// The release a PyPI wheel URL names, once PyPI says that release holds `file` at the URL's
+/// sha256; `None` for a URL elsewhere. Machines of every version take a release, and fetch their
+/// own platform's wheel of it from PyPI, held to the index's digest.
+async fn published(
+    ctx: &Context,
+    member: &serde_json::Value,
+    file: &str,
+    distribution: &str,
+) -> Result<Option<String>, Error> {
+    let (Some(url), Some(sha256)) = (member["url"].as_str(), member["sha256"].as_str()) else {
+        return Ok(None);
+    };
+    if !url.starts_with("https://files.pythonhosted.org/") {
+        return Ok(None);
+    }
+    let release = file.split('-').nth(1).unwrap_or_default();
+    let project = distribution.replace('_', "-");
+    let index = format!("https://pypi.org/pypi/{project}/{release}/json");
+    let unavailable = |e: String| {
+        Error::new(
+            Kind::Unavailable,
+            "pypi_unavailable",
+            format!("{index}: {e}"),
+        )
+    };
+    #[derive(serde::Deserialize)]
+    struct File {
+        filename: String,
+        digests: Digests,
+    }
+    #[derive(serde::Deserialize)]
+    struct Digests {
+        sha256: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct Release {
+        urls: Vec<File>,
+    }
+    let answer = ctx
+        .http()
+        .get(&index)
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .map_err(|e| unavailable(e.to_string()))?;
+    let listed: Release = answer
+        .json()
+        .await
+        .map_err(|e| unavailable(e.to_string()))?;
+    match listed.urls.iter().find(|f| f.filename == file) {
+        Some(f) if f.digests.sha256.eq_ignore_ascii_case(sha256) => Ok(Some(release.to_owned())),
+        Some(f) => Err(Error::new(
+            Kind::Validation,
+            "wheel_digest_mismatch",
+            format!(
+                "PyPI lists {file} as sha256:{}, not sha256:{sha256}",
+                f.digests.sha256
+            ),
+        )),
+        None => Err(Error::new(
+            Kind::NotFound,
+            "wheel_unpublished",
+            format!("{project} {release} on PyPI holds no {file}"),
+        )),
+    }
 }
 
 /// A local wheel of `distribution`, measured once: its file name and what the run stages.
