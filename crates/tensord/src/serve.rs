@@ -98,7 +98,8 @@ fn hold_handed_descriptors() {
             if libc::fcntl(fd, libc::F_GETFD) < 0 {
                 let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
                 if null >= 0 && null != fd {
-                    libc::dup3(null, fd, libc::O_CLOEXEC);
+                    libc::dup2(null, fd);
+                    libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
                     libc::close(null);
                 }
             }

@@ -8,12 +8,11 @@
 //! this same parent.
 use nix::{
     errno::Errno,
-    fcntl::OFlag,
     sys::{
         signal::{kill, SigSet, Signal},
         wait::{waitpid, WaitPidFlag, WaitStatus},
     },
-    unistd::{fork, pipe2, ForkResult, Pid},
+    unistd::{fork, ForkResult, Pid},
 };
 use std::{
     fs::File,
@@ -56,7 +55,7 @@ pub fn supervise(
                 .as_deref()
                 .is_some_and(super::provider::reads_credential)
         });
-        let (read, write) = pipe2(OFlag::O_CLOEXEC).map_err(io::Error::from)?;
+        let (read, write) = cloexec_pipe()?;
         // SAFETY: no thread exists yet in this process; the child continues single-threaded.
         let child = match unsafe { fork() }.map_err(io::Error::from)? {
             ForkResult::Child => {
@@ -120,7 +119,7 @@ fn exec_service(
     match key {
         Some(key) => {
             // The whole key fits a pipe's buffer: written and closed before the exec.
-            let Ok((read, write)) = pipe2(OFlag::O_CLOEXEC) else {
+            let Ok((read, write)) = cloexec_pipe() else {
                 std::process::exit(1)
             };
             if File::from(write).write_all(key).is_err() || !inherit(read, KEY_FD) {
@@ -218,4 +217,10 @@ impl Ready {
             let _ = pipe.write_all(b"r");
         }
     }
+}
+
+/// A pipe whose ends close on exec (std makes it so on every Unix).
+pub(crate) fn cloexec_pipe() -> io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
+    let (read, write) = std::io::pipe()?;
+    Ok((read.into(), write.into()))
 }

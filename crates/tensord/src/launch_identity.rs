@@ -55,7 +55,7 @@ impl LaunchIdentity {
         }
         // Exact opened directory only; never walk/chown an authored tree or generation.
         if unsafe { libc::fchown(file.as_raw_fd(), uid, self.gid) } != 0
-            || unsafe { libc::fchmod(file.as_raw_fd(), mode) } != 0
+            || unsafe { libc::fchmod(file.as_raw_fd(), mode as libc::mode_t) } != 0
         {
             return Err(io::Error::last_os_error());
         }
@@ -63,31 +63,38 @@ impl LaunchIdentity {
     }
     pub(crate) fn socket(self, path: &Path) -> io::Result<()> {
         self.validate()?;
+        // macOS has no O_PATH: the socket's own name is changed, never a link it points to.
+        #[cfg(not(target_os = "linux"))]
+        return std::os::unix::fs::lchown(path, Some(self.uid), Some(self.gid));
         // O_PATH/NOFOLLOW binds ownership to the actual socket inode created by this owner.
+        #[cfg(target_os = "linux")]
         let file = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_PATH | libc::O_NOFOLLOW)
             .open(path)?;
-        use std::os::unix::fs::FileTypeExt;
-        if !file.metadata()?.file_type().is_socket() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "executor endpoint is not the owned socket",
-            ));
-        }
-        if unsafe {
-            libc::fchownat(
-                file.as_raw_fd(),
-                c"".as_ptr(),
-                self.uid,
-                self.gid,
-                libc::AT_EMPTY_PATH,
-            )
-        } != 0
+        #[cfg(target_os = "linux")]
         {
-            return Err(io::Error::last_os_error());
+            use std::os::unix::fs::FileTypeExt;
+            if !file.metadata()?.file_type().is_socket() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "executor endpoint is not the owned socket",
+                ));
+            }
+            if unsafe {
+                libc::fchownat(
+                    file.as_raw_fd(),
+                    c"".as_ptr(),
+                    self.uid,
+                    self.gid,
+                    libc::AT_EMPTY_PATH,
+                )
+            } != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
         }
-        Ok(())
     }
     pub(crate) fn readable(self, path: &Path) -> io::Result<()> {
         let file = OpenOptions::new()

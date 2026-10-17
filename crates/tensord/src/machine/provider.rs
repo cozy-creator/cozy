@@ -10,7 +10,6 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::{Method, Request, StatusCode};
 use hyper_util::rt::TokioIo;
-use nix::fcntl::OFlag;
 use std::{
     collections::BTreeMap,
     fs::File,
@@ -182,10 +181,6 @@ fn reexec(own: Option<&ProviderSelf>) -> io::Error {
     command.exec()
 }
 
-fn pipe2_cloexec() -> io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
-    nix::unistd::pipe2(OFlag::O_CLOEXEC).map_err(io::Error::from)
-}
-
 /// The credential a parent handed this process on CREDENTIAL_FD, read once (the fd is then
 /// closed); None when it handed none.
 fn inherited() -> Option<ProviderSelf> {
@@ -205,7 +200,7 @@ fn inherited() -> Option<ProviderSelf> {
 /// Places the credential on CREDENTIAL_FD for the program this process execs next. It fits a
 /// pipe's buffer: written and closed before the exec.
 pub fn hand_on(own: &ProviderSelf) -> bool {
-    pipe2_cloexec()
+    super::supervise::cloexec_pipe()
         .and_then(|(read, write)| {
             File::from(write).write_all(&serde_json::to_vec(own)?)?;
             Ok(super::supervise::inherit(read, CREDENTIAL_FD))

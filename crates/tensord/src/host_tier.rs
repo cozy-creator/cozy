@@ -475,9 +475,12 @@ impl HostTier {
             if let Item::Object(range) = &item.source {
                 if let Ok(file) = File::open(self.store.blob_path(&range.obj.sha256)) {
                     // SAFETY: advice on a descriptor we hold.
+                    #[cfg(target_os = "linux")]
                     unsafe {
                         libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_WILLNEED)
                     };
+                    #[cfg(not(target_os = "linux"))]
+                    drop(file);
                 }
             }
         }
