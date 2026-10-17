@@ -149,7 +149,7 @@ fn spec_of(mut spec: v1::RunSpec) -> Result<(crate::runs::Spec, Option<v1::HubAc
         v1::RunKind::Call => (false, false),
         v1::RunKind::Warm => (true, false),
         v1::RunKind::Remove => (false, true),
-        v1::RunKind::Update => unreachable!("machine_update takes updates"),
+        v1::RunKind::Update => return Err(Error::validation("invalid_kind", "an update is not a run of code")),
     };
     let input: Value = match &spec.payload {
         None => serde_json::json!({}),
