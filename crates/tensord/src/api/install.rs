@@ -16,6 +16,7 @@ use std::{
 };
 use tensorfs_core::transport::PullCancellation;
 use cozy_proto::error::Error;
+use crate::triage::masked;
 
 #[derive(Clone)]
 pub struct InstallerConfig {
@@ -418,23 +419,6 @@ pub(crate) fn stderr_tail(stderr: &[u8]) -> String {
     masked(String::from_utf8_lossy(tail).trim())
 }
 
-/// `scheme://user:secret@host` becomes `scheme://***@host`.
-fn masked(text: &str) -> String {
-    let (mut out, mut rest) = (String::new(), text);
-    while let Some(at) = rest.find("://") {
-        let (head, after) = rest.split_at(at + 3);
-        out.push_str(head);
-        let authority = after.find(|c: char| c.is_whitespace() || c == '/').unwrap_or(after.len());
-        rest = match after[..authority].rfind('@') {
-            Some(user) => {
-                out.push_str("***");
-                &after[user..]
-            }
-            None => after,
-        };
-    }
-    out + rest
-}
 
 /// The helper's PATH: the machine's uv's directory first, then the machine's own PATH. The helper
 /// calls `uv` by name, and a machine started with no PATH still installs local packages.

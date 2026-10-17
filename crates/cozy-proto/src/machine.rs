@@ -546,6 +546,10 @@ pub struct Reason {
     pub message: String,
     /// request, runtime, author, machine
     pub origin: String,
+    /// A failed call's traceback, else its executor's stderr: the last lines, secrets masked.
+    /// It explains the failure after its machine is gone.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub detail: String,
 }
 
 /// One settled call the run made: a child run, or an effect such as its weights publication.

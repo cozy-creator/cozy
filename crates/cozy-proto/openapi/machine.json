@@ -1536,6 +1536,11 @@
             "type": "string",
             "default": ""
           },
+          "detail": {
+            "type": "string",
+            "description": "A failed call's traceback, else its executor's stderr: the last lines, secrets masked.\nIt explains the failure after its machine is gone.",
+            "default": ""
+          },
           "message": {
             "type": "string",
             "default": ""

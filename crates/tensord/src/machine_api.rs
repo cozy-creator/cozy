@@ -370,9 +370,12 @@ impl NativeBackend {
             body["error_code"] = json!(error_code);
         }
         // Observation only: the failed attempt's bundle, written before the run settled.
-        if let Some((triage, _)) = self.service.engine.triage(&record.id).map_err(problem)? {
+        if let Some((triage, bundle)) = self.service.engine.triage(&record.id).map_err(problem)? {
             body["triage_bundle"] = json!({"subject_id":triage.subject_id,
                 "write_receipt_digest":format!("sha256:{}", triage.sha256),"length":triage.length});
+            if let Some(detail) = crate::triage::detail(&bundle) {
+                body["failure_detail"] = json!(detail);
+            }
         }
         if !output_entries.is_empty() {
             body["output_manifest"] = json!({"outputs":output_entries});
