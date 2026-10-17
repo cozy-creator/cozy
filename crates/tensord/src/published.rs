@@ -1104,7 +1104,7 @@ impl Publisher {
         command.args(args).env_clear().envs(env.iter().copied()).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
         command.process_group(0);
         for name in ["PATH", "SSL_CERT_FILE", "SSL_CERT_DIR", "LANG"] {
-            if let Some(value) = std::env::var_os(name) {
+            if let Some(value) = cozy_proto::config::environment().get(name) {
                 command.env(name, value);
             }
         }

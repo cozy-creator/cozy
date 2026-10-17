@@ -403,6 +403,7 @@ fn launch(root: &Path, port: u16, key: Option<[u8; 32]>, persistent: bool) -> Ma
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
         .env("COZY_MACHINE_ROOT", root)
+            .env("HOME", root.join("home"))
         .env("COZY_WORKER_ID", WORKER)
         .env("COZY_WORKER_AUTH_TOKEN", URL_SAFE_NO_PAD.encode([1; 32]))
         .env("COZY_WORKER_INTERNAL_PORT", port.to_string())
@@ -416,7 +417,7 @@ fn launch(root: &Path, port: u16, key: Option<[u8; 32]>, persistent: bool) -> Ma
         .stdout(Stdio::null())
         .stderr(Stdio::inherit());
     if persistent {
-        command.env("COZY_MACHINE_LIFETIME", "persistent");
+        command.arg("--persistent");
     }
     if let Some(key) = key {
         command.env(

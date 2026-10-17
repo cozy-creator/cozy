@@ -13,6 +13,7 @@ publish.workspace = true
 calcifer.workspace = true
 cozy-cli.workspace = true
 migrate.workspace = true
+tensord.workspace = true
 
 [dev-dependencies]
 base64.workspace = true

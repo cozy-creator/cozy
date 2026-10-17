@@ -441,7 +441,8 @@ fn helper_path(uv: &Path) -> std::ffi::OsString {
         .into_iter()
         .collect();
     dirs.extend(
-        std::env::var_os("PATH")
+        cozy_proto::config::environment()
+            .get("PATH")
             .iter()
             .flat_map(std::env::split_paths),
     );

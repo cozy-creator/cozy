@@ -37,12 +37,17 @@ fn launch(root: &Path, port: u16, provider: u16) -> Machine {
 /// `launch` with an idle window of `idle` seconds.
 fn launch_idle(root: &Path, port: u16, provider: u16, idle: u32) -> Machine {
     let owner = SigningKey::from_bytes(&[3; 32]).verifying_key();
+    // The idle window is a setting of the machine's home.
+    let home = root.join("home/.cozy");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(home.join("config.toml"), format!("[machine]\nrental_idle_seconds = {idle}\n")).unwrap();
     Machine(
         Command::new(env!("CARGO_BIN_EXE_tensord"))
             .env_clear()
-            .env("COZY_RENTAL_IDLE_SECONDS", idle.to_string())
+            .arg("--rental")
             .env("PATH", "/usr/bin:/bin")
             .env("COZY_MACHINE_ROOT", root)
+            .env("HOME", root.join("home"))
             .env("COZY_WORKER_ID", "ends-itself")
             .env("COZY_WORKER_AUTH_TOKEN", URL_SAFE_NO_PAD.encode([1; 32]))
             .env("COZY_WORKER_INTERNAL_PORT", port.to_string())

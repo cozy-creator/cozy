@@ -582,15 +582,24 @@ impl MachineBackend for NativeBackend {
         _: VerifiedActor,
         request: domain::MachineLogQuery,
     ) -> Result<Vec<u8>, Status> {
-        // TensorFS and TensorD's memory notes append here, each rotating to one older file.
-        let name = match domain::MachineLog::try_from(request.log) {
-            Ok(domain::MachineLog::TensorfsTransport) => "transport.log",
-            Ok(domain::MachineLog::Memory) => "memory.log",
+        // TensorFS and TensorD's memory notes append here, each rotating to one older file;
+        // TensorD's own log rolls daily (`tensord.<date>.log`): its newest two days.
+        let logs = self.store.root().join("logs");
+        let names = match domain::MachineLog::try_from(request.log) {
+            Ok(domain::MachineLog::TensorfsTransport) => vec!["transport.log.1".into(), "transport.log".into()],
+            Ok(domain::MachineLog::Memory) => vec!["memory.log.1".into(), "memory.log".into()],
+            Ok(domain::MachineLog::Tensord) => {
+                let mut days: Vec<String> = std::fs::read_dir(&logs)
+                    .map(|dir| dir.flatten().filter_map(|e| e.file_name().into_string().ok()).collect())
+                    .unwrap_or_default();
+                days.retain(|name| name.starts_with("tensord.") && name.ends_with(".log"));
+                days.sort();
+                days.split_off(days.len().saturating_sub(2))
+            }
             _ => return Err(Status::not_found(format!("this machine keeps no log {}", request.log))),
         };
-        let logs = self.store.root().join("logs");
         let mut data = vec![];
-        for name in [format!("{name}.1"), name.into()] {
+        for name in names {
             match std::fs::read(logs.join(&name)) {
                 Ok(kept) => data.extend(kept),
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}

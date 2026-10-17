@@ -1,13 +1,20 @@
-//! `~/.cozy/config.toml`, loaded once per process through figment and shared by the CLI and
-//! Calcifer. Sources, each over the last: the file, the environment (two credentials and where
-//! releases come from, nothing else), the command line. The home is always `<user home>/.cozy`. A key this build does not read is named once
-//! and ignored, so a file another version wrote never disables a command.
-use std::{collections::BTreeMap, fmt, path::PathBuf};
+//! `~/.cozy/config.toml`, loaded once per process through figment and shared by the CLI,
+//! Calcifer and the machine (TensorD). Sources, each over the last: the file, the environment
+//! (credentials and locations only: two model-source tokens, where releases come from, and a
+//! pod's machine contract), the command line. The home is always `<user home>/.cozy`. A key this
+//! build does not read is named once and ignored, so a file another version wrote never disables
+//! a command.
+use std::{
+    collections::BTreeMap,
+    fmt,
+    path::PathBuf,
+    sync::OnceLock,
+};
 
 use cozy_platform::paths::Home;
 use figment::{
     Figment,
-    providers::{Env, Format, Serialized, Toml},
+    providers::{Format, Serialized, Toml},
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -19,12 +26,30 @@ use crate::error::{Error, Kind};
 pub const DEFAULT_HUB: &str = "tensorhub";
 pub const DEFAULT_HUB_URL: &str = "https://tensorhub.com";
 
-/// Every environment variable the load reads: credentials for model sources, by the names their
-/// own tools use, and where releases are downloaded from (dist's installers read the same one).
-const ENV: [(&str, &str); 3] = [
+/// Every environment variable the load reads, with its key: credentials for model sources, by the
+/// names their own tools use; where releases are downloaded from (dist's installers read the
+/// same one); and the machine's settings a pod's launcher gives (Tensorhub `podenv`, plus the
+/// devices the container may use).
+pub const ENV: [(&str, &str); 19] = [
     ("HF_TOKEN", "huggingface_token"),
     ("CIVITAI_TOKEN", "civitai_token"),
     ("COZY_DOWNLOAD_URL", "download_url"),
+    ("COZY_MACHINE_ROOT", "machine.root"),
+    ("COZY_TENSORFS_ROOT", "machine.store"),
+    ("COZY_TENSORFS_CACHE", "machine.cache"),
+    ("COZY_LISTEN_HOST", "machine.listen_host"),
+    ("COZY_WORKER_ID", "machine.worker_id"),
+    ("COZY_WORKER_AUTH_TOKEN", "machine.worker_token"),
+    ("COZY_WORKER_INTERNAL_PORT", "machine.port"),
+    ("COZY_WEBRTC_INTERNAL_PORT", "machine.webrtc_port"),
+    ("COZY_AUTHORIZED_KEYS", "machine.authorized_keys"),
+    ("COZY_SSH_PUBLIC_KEY", "machine.ssh_public_key"),
+    ("COZY_BOOTSTRAP_RECEIPT_HMAC_KEY_B64URL", "machine.receipt_key"),
+    ("COZY_BOOTSTRAP_RECEIPT_HMAC_KEY_FILE", "machine.receipt_key_file"),
+    ("TENSORHUB_ORIGIN", "machine.hub_origin"),
+    ("TENSORHUB_CA_DER_B64URL", "machine.hub_ca_der"),
+    ("TENSORHUB_OBJECT_STORAGE_HOSTS", "machine.object_storage_hosts"),
+    ("CUDA_VISIBLE_DEVICES", "machine.visible_devices"),
 ];
 
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
@@ -35,6 +60,7 @@ pub struct Config {
     /// Named Hubs, like kubectl contexts: name (lowercase) → canonical URL.
     pub hubs: BTreeMap<String, String>,
     pub calcifer: CalciferConfig,
+    pub machine: MachineConfig,
     pub huggingface_token: Option<Secret>,
     pub civitai_token: Option<Secret>,
     /// The directory holding one release's files (dist-manifest.json, the archives); absent: GitHub
@@ -49,6 +75,40 @@ pub struct Config {
 pub struct CalciferConfig {
     /// Calcifer's loopback port; 0 takes any free one (its lock record says which).
     pub port: u16,
+}
+
+/// `[machine]`: this computer's machine (TensorD, `cozy machine serve`), which judges these. A
+/// pod's launcher gives the same settings through the environment ([`ENV`]).
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct MachineConfig {
+    /// The machine API's port. On this computer, absent or 0: a free port, kept across restarts.
+    pub port: Option<u16>,
+    /// The WebRTC player's port, kept across restarts the same way.
+    pub webrtc_port: Option<u16>,
+    /// The TensorFS store it fills; absent: `var/lib/tensorfs` under its root.
+    pub store: Option<PathBuf>,
+    /// How long a rental stays with no job before it releases itself; absent: 15 minutes.
+    pub rental_idle_seconds: Option<u32>,
+    /// The image layout's root: `/` on a pod, `~/.cozy/machine` on this computer.
+    pub root: Option<PathBuf>,
+    /// The datacenter cache volume's mount.
+    pub cache: Option<PathBuf>,
+    /// `0.0.0.0` or `127.0.0.1`.
+    pub listen_host: Option<String>,
+    pub worker_id: Option<String>,
+    pub worker_token: Option<Secret>,
+    /// Comma-separated unpadded base64url Ed25519 keys.
+    pub authorized_keys: Option<String>,
+    /// A development rental's SSH key.
+    pub ssh_public_key: Option<String>,
+    pub receipt_key: Option<Secret>,
+    pub receipt_key_file: Option<PathBuf>,
+    pub hub_origin: Option<String>,
+    pub hub_ca_der: Option<String>,
+    pub object_storage_hosts: Option<String>,
+    /// CUDA_VISIBLE_DEVICES: indices or UUIDs; empty is no GPU.
+    pub visible_devices: Option<String>,
 }
 
 /// A credential: never printed.
@@ -101,14 +161,26 @@ pub struct Loaded {
 pub fn load(flags: Flags) -> Result<Loaded, Error> {
     let user_home = std::env::home_dir()
         .ok_or_else(|| Error::new(Kind::Internal, "no_home", "this user has no home directory"))?;
+    load_from(flags, environment(), user_home)
+}
+
+/// The load over a given environment and user home (what tests drive).
+pub fn load_from(
+    flags: Flags,
+    environment: &BTreeMap<String, String>,
+    user_home: PathBuf,
+) -> Result<Loaded, Error> {
     let home = Home::under(&user_home);
     let path = home.config();
     let mut figment = Figment::new();
     if path.exists() {
         figment = figment.merge(Toml::file_exact(&path));
     }
+    // As spelled: a value is a string until its setting's type reads it (`"0"` stays a device).
     for (var, key) in ENV {
-        figment = figment.merge(Env::raw().only(&[var]).map(move |_| key.into()));
+        if let Some(value) = environment.get(var).filter(|v| !v.is_empty()) {
+            figment = figment.merge(Serialized::default(key, value));
+        }
     }
     let figment = figment.merge(Serialized::defaults(flags));
     let (config, warnings) = extract(figment, &path.display().to_string())?;
@@ -203,7 +275,12 @@ impl Config {
             }
         }
         self.hubs = hubs;
-        for secret in [&mut self.huggingface_token, &mut self.civitai_token] {
+        for secret in [
+            &mut self.huggingface_token,
+            &mut self.civitai_token,
+            &mut self.machine.worker_token,
+            &mut self.machine.receipt_key,
+        ] {
             if secret.as_ref().is_some_and(|s| s.0.trim().is_empty()) {
                 *secret = None;
             }
@@ -240,6 +317,13 @@ impl fmt::Display for Hub {
             None => f.write_str(&self.origin),
         }
     }
+}
+
+/// This process's environment, read once: the load's source, and what the processes it starts
+/// inherit (each filters it further).
+pub fn environment() -> &'static BTreeMap<String, String> {
+    static ENVIRONMENT: OnceLock<BTreeMap<String, String>> = OnceLock::new();
+    ENVIRONMENT.get_or_init(|| std::env::vars().collect())
 }
 
 /// Whether `name` (already lowercase) can name a Hub. A name is never a URL.
@@ -288,7 +372,7 @@ fn extract(figment: Figment, file: &str) -> Result<(Config, Vec<String>), Error>
         )
         .remedy(format!("correct or remove it in {file}"))
     };
-    let mut config: Config = figment.extract().map_err(invalid)?;
+    let mut config: Config = figment.extract_lossy().map_err(invalid)?;
     let mut warnings = vec![];
     let value: figment::value::Value = figment.extract().map_err(invalid)?;
     let _: Result<Config, _> = serde_ignored::deserialize(&value, |path| {
@@ -359,6 +443,32 @@ mod tests {
             local.device_key(&Home::at("/h")),
             config.selected().unwrap().device_key(&Home::at("/h"))
         );
+    }
+
+    #[test]
+    fn the_machine_reads_its_table_and_a_pods_environment_as_spelled() {
+        let user = std::env::temp_dir().join(format!("cozy-config-{}", std::process::id()));
+        let home = Home::under(&user);
+        std::fs::create_dir_all(home.root()).unwrap();
+        std::fs::write(home.config(), "[machine]\nport = 7443\nstore = \"/s\"\n").unwrap();
+        let environment: BTreeMap<String, String> = [
+            ("COZY_WEBRTC_INTERNAL_PORT", "8445"),
+            ("CUDA_VISIBLE_DEVICES", "0"),
+            ("COZY_WORKER_AUTH_TOKEN", "secret"),
+            ("HF_TOKEN", "12345"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect();
+        let loaded = load_from(Flags::default(), &environment, user.clone()).unwrap();
+        let machine = &loaded.config.machine;
+        assert_eq!((machine.port, machine.webrtc_port), (Some(7443), Some(8445)));
+        assert_eq!(machine.store.as_deref(), Some(std::path::Path::new("/s")));
+        assert_eq!(machine.visible_devices.as_deref(), Some("0"));
+        assert_eq!(machine.worker_token.as_ref().map(Secret::expose), Some("secret"));
+        assert_eq!(loaded.config.huggingface_token.as_ref().map(Secret::expose), Some("12345"));
+        assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+        std::fs::remove_dir_all(&user).unwrap();
     }
 
     #[test]

@@ -1,9 +1,13 @@
 //! The `cozy` binary dispatches to its roles: CLI verbs, `calcifer` and `machine serve`, and the
 //! hidden one-shot `migrate` from the Go CLI's home.
 fn main() -> std::process::ExitCode {
-    match std::env::args_os().nth(1) {
-        Some(role) if role == "calcifer" => calcifer::serve::main(),
-        Some(verb) if verb == "migrate" => migrate::main(),
+    let mut args = std::env::args_os().skip(1);
+    match (args.next(), args.next()) {
+        (Some(role), _) if role == "calcifer" => calcifer::serve::main(),
+        (Some(verb), _) if verb == "migrate" => migrate::main(),
+        (Some(noun), Some(role)) if noun == "machine" && role == "serve" => {
+            tensord::serve::main(std::env::args_os().skip(2))
+        }
         _ => cozy_cli::main(),
     }
 }

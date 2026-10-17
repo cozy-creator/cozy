@@ -1,6 +1,29 @@
-//! Outbound TCP that never waits on an unroutable address family.
-use std::{io, net::SocketAddr};
+//! Outbound TCP that never waits on an unroutable address family, and listeners that keep
+//! their port.
+use std::{
+    fs, io,
+    net::{IpAddr, SocketAddr, TcpListener},
+    path::Path,
+};
 use tokio::{net::TcpStream, task::JoinSet};
+
+/// A listener on `port`, or with none, on the port `saved` names, else a free one that `saved`
+/// then names: this computer's machine keeps its ports across restarts.
+pub fn kept_listener(saved: &Path, host: IpAddr, port: Option<u16>) -> io::Result<TcpListener> {
+    if let Some(port) = port {
+        return TcpListener::bind((host, port));
+    }
+    let kept = fs::read_to_string(saved).ok().and_then(|text| text.trim().parse::<u16>().ok());
+    let listener = match kept.map(|port| TcpListener::bind((host, port))) {
+        Some(Ok(listener)) => listener,
+        _ => TcpListener::bind((host, 0))?,
+    };
+    let bound = listener.local_addr()?.port();
+    if kept != Some(bound) {
+        super::identity::write_atomic(saved, bound.to_string().as_bytes(), 0o600)?;
+    }
+    Ok(listener)
+}
 
 /// Connects to host:port over whichever of its addresses answers first. A host whose IPv6
 /// is unroutable otherwise stalls each connect for the kernel's SYN retries (about two

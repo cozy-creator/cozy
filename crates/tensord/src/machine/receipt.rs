@@ -26,6 +26,8 @@ struct Envelope {
 /// byte for byte: a provider restart may verify what was sealed, never sign again.
 pub struct Readiness {
     path: Option<PathBuf>,
+    /// A rental's envelope is signed for its Hub; this computer's is not signed.
+    required: bool,
     state: Mutex<State>,
     proved: Condvar,
 }
@@ -76,6 +78,7 @@ impl Readiness {
         }
         Ok(Arc::new(Self {
             path,
+            required,
             state: Mutex::new(state),
             proved: Condvar::new(),
         }))
@@ -124,7 +127,7 @@ impl Readiness {
         }
         let hmac_sha256 = match &state.key {
             Some(key) => mac(key, &payload),
-            None if self.path.is_none() => String::new(),
+            None if self.path.is_none() || !self.required => String::new(),
             None => {
                 return Err(invalid(
                     "the readiness key was spent; this boot signs nothing again",
@@ -179,9 +182,8 @@ pub struct Gpu {
 
 /// The driver's inventory through the Runtime's fixed query; this process never loads CUDA or
 /// NVML. No `nvidia-smi` is a CPU machine; a driver that answers wrongly refuses the boot.
-pub fn gpus() -> io::Result<Vec<Gpu>> {
-    let visible = std::env::var("CUDA_VISIBLE_DEVICES").ok();
-    if visible.as_deref() == Some("") {
+pub fn gpus(visible: Option<&str>) -> io::Result<Vec<Gpu>> {
+    if visible == Some("") {
         return Ok(vec![]);
     }
     let output = match Command::new("nvidia-smi")
