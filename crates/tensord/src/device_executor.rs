@@ -1936,7 +1936,7 @@ impl DeviceExecutor {
                     }
                     let mut fds = Vec::with_capacity(frame.descriptors as usize);
                     for _ in 0..frame.descriptors {
-                        fds.push(protocol::recv_fd(&self.stream)?);
+                        fds.push(cozy_platform::handles::recv_fd(&self.stream)?);
                     }
                     let (mut answer, out) = services.device_tier(&frame, fds)?;
                     answer.event = "answer";
@@ -1946,7 +1946,7 @@ impl DeviceExecutor {
                     answer.descriptors = out.len().saturating_sub(usize::from(answer.lease)) as u64;
                     write_frame(&mut self.stream, &answer)?;
                     for fd in &out {
-                        protocol::send_fd(&self.stream, fd)?;
+                        cozy_platform::handles::send_fd(&self.stream, fd)?;
                     }
                 }
                 Some(Event::Request)
@@ -1963,7 +1963,7 @@ impl DeviceExecutor {
                 }
                 Some(Event::Request) if frame.kind == Kind::ObjectFiles => {
                     let plan = if frame.descriptor {
-                        Some(File::from(protocol::recv_fd(&self.stream)?))
+                        Some(File::from(cozy_platform::handles::recv_fd(&self.stream)?))
                     } else {
                         None
                     };
@@ -1977,7 +1977,7 @@ impl DeviceExecutor {
                     answer.descriptors = out.len() as u64;
                     write_frame(&mut self.stream, &answer)?;
                     for file in &out {
-                        protocol::send_fd(&self.stream, file)?;
+                        cozy_platform::handles::send_fd(&self.stream, file)?;
                     }
                 }
                 Some(Event::Request) => {
@@ -1996,7 +1996,7 @@ impl DeviceExecutor {
 
     fn answer(&mut self, frame: &Frame, services: &mut impl Services) -> io::Result<()> {
         let descriptor = if frame.descriptor {
-            Some(File::from(protocol::recv_fd(&self.stream)?))
+            Some(File::from(cozy_platform::handles::recv_fd(&self.stream)?))
         } else {
             None
         };
@@ -2006,7 +2006,7 @@ impl DeviceExecutor {
         answer.descriptor = descriptor.is_some();
         write_frame(&mut self.stream, &answer)?;
         if let Some(descriptor) = descriptor {
-            protocol::send_fd(&self.stream, &descriptor)?;
+            cozy_platform::handles::send_fd(&self.stream, &descriptor)?;
         }
         Ok(())
     }
@@ -2246,7 +2246,7 @@ fn refuse_malformed(
         return Err(io::Error::other("a malformed request names too many descriptors"));
     }
     for _ in 0..u32::from(frame.descriptor) + frame.descriptors {
-        drop(protocol::recv_fd(stream)?);
+        drop(cozy_platform::handles::recv_fd(stream)?);
     }
     let answer = Answer::refused(frame.seq, "malformed_request", frame.malformed.clone());
     write_frame(stream, &answer)
@@ -2335,7 +2335,7 @@ mod codec_tests {
         let malformed = serde_json::json!({"event": "request", "kind": "device_room", "seq": 9,
             "free_bytes": -23068672, "holding_bytes": 1, "descriptor": true});
         write_frame(&mut runtime, &malformed).unwrap();
-        protocol::send_fd(&runtime, &File::open("/dev/null").unwrap()).unwrap();
+        cozy_platform::handles::send_fd(&runtime, &File::open("/dev/null").unwrap()).unwrap();
         let frame = read_frame(&mut machine).unwrap().unwrap();
         assert_eq!((frame.event, frame.seq), (Some(Event::Request), 9));
         assert!(frame.malformed.contains("expected u64"), "{}", frame.malformed);

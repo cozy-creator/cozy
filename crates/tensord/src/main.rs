@@ -575,7 +575,7 @@ fn serve(
     Ok(())
 }
 fn os_peer_outside(stream: &UnixStream) -> io::Result<bool> {
-    tensord::os::peer_descends_from_machine(stream).map(|inside| !inside)
+    Ok(!cozy_platform::handles::peer_descends_from_machine(stream)?)
 }
 /// `peer` is a registered weight peer; `None` is the owner's admin connection.
 fn client(
@@ -663,7 +663,7 @@ fn client(
         };
         if let Some(detail) = wrong {
             if matches!(request.command, Command::Import { .. }) {
-                drop(protocol::recv_fd(&stream)?);
+                drop(cozy_platform::handles::recv_fd(&stream)?);
             }
             protocol::write(
                 &mut stream,
@@ -681,7 +681,7 @@ fn client(
         if let Some(cap) = required {
             if !capabilities.contains(cap) {
                 if matches!(request.command, Command::Import { .. }) {
-                    drop(protocol::recv_fd(&stream)?);
+                    drop(cozy_platform::handles::recv_fd(&stream)?);
                 }
                 protocol::write(
                     &mut stream,
@@ -698,7 +698,7 @@ fn client(
         }
         let result: io::Result<(Body, Option<std::fs::File>)> = match request.command {
             Command::Import { object } => {
-                let fd = protocol::recv_fd(&stream)?;
+                let fd = cozy_platform::handles::recv_fd(&stream)?;
                 owner
                     .lock()
                     .unwrap()
@@ -811,7 +811,7 @@ fn client(
         });
         protocol::write(&mut stream, &Reply { seq, body })?;
         if let Some(fd) = fd {
-            protocol::send_fd(&stream, &fd)?;
+            cozy_platform::handles::send_fd(&stream, &fd)?;
         }
     }
 }
