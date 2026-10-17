@@ -1,11 +1,10 @@
 name: dev-build
 # Builds release artifacts for any ref and runs one targeted test command, off the dev box:
-#   gh workflow run dev-build.yaml -R cozy-creator/cozy -f ref=<sha> [-f build=none] [-f test='go test ./internal/run/...']
-#   Rust: -f build=none -f test='cargo test -p cozy-proto'
+#   gh workflow run dev-build.yaml -R cozy-creator/cozy -f ref=<sha> [-f build=none] [-f test='cargo test -p cozy-proto']
 #   TensorFS: -f build=tensorfs -f test='cargo test -p tensorfs-core --test store_contract'
-# Artifacts: cozy-cli-<sha> (cozy-<os>-<arch>.tar.gz for every release platform, the player and
-# SHA256SUMS, stamped dev-<sha>), tensord-<sha> (the runner arch's manylinux tensord that Runtime's
-# wheel bundles) and tensorfs-wheel-<sha> (the manylinux x86_64 wheel). Tests get
+# Artifacts: tensord-<sha> (the runner arch's manylinux tensord that Runtime's wheel bundles) and
+# tensorfs-wheel-<sha> (the manylinux x86_64 wheel). The cozy binary's release archives are dist's
+# (release.yml). Tests get
 # PostgreSQL (AUTHKIT_TEST_DATABASE_URL), the TensorFS wheel installed in a venv
 # (TENSORFS_TEST_PYTHON) when it was built, and a Runtime wheel (COZY_TEST_RUNTIME_WHEEL): the newest
 # published one, or runtime_ref's. No whole-suite default: `test` is empty unless given.
@@ -17,9 +16,9 @@ on:
         type: string
         default: master
       build:
-        description: "cli: the release archives; tensord: the manylinux tensord; tensorfs: the TensorFS wheel; none: tests only (comma-separate several)"
+        description: "tensord: the manylinux tensord; tensorfs: the TensorFS wheel; none: tests only (comma-separate several)"
         type: string
-        default: cli
+        default: none
       test:
         description: Targeted test command, run with bash at the ref in a delegated cgroup; empty runs none
         type: string
@@ -61,11 +60,12 @@ jobs:
           ref: ${{ inputs.ref }}
       - id: sha
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-      # Caches modules and the build cache keyed on go.sum.
+      # TensorD's OAuth tests build their Go harness (crates/tensord/tests/hub-oauth).
       - uses: actions/setup-go@v6
+        if: inputs.test != ''
         with:
-          go-version: '1.26.0'
-          check-latest: false
+          go-version-file: crates/tensord/tests/hub-oauth/go.mod
+          cache-dependency-path: crates/tensord/tests/hub-oauth/go.sum
       - uses: astral-sh/setup-uv@v6
         if: inputs.test != '' || inputs.runtime_ref != ''
       # The Rust workspace: rust-toolchain.toml's toolchain installs on first use. target/manylinux
@@ -78,25 +78,6 @@ jobs:
           workspaces: |
             . -> target
             . -> target/manylinux
-      # The release recipe (release.yaml): umask 0002, -buildvcs=false, scripts/release.sh.
-      - name: Build the release archives
-        if: contains(inputs.build, 'cli')
-        env:
-          GOFLAGS: -buildvcs=false
-          GOTOOLCHAIN: local
-          SHA: ${{ steps.sha.outputs.sha }}
-        run: |
-          umask 0002
-          find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
-          git checkout -- .
-          scripts/release.sh "dev-$SHA"
-      - if: contains(inputs.build, 'cli')
-        uses: actions/upload-artifact@v4
-        with:
-          name: cozy-cli-${{ steps.sha.outputs.sha }}
-          path: dist/dev-${{ steps.sha.outputs.sha }}/
-          if-no-files-found: error
-          retention-days: 7
       - uses: arduino/setup-task@v2
         if: contains(inputs.build, 'tensord')
         with:
@@ -161,7 +142,7 @@ jobs:
             --platform manylinux_2_28_x86_64 --dest "$RUNNER_TEMP/runtime" cozy-runtime
       - if: inputs.test != '' || inputs.runtime_ref != ''
         run: echo "COZY_TEST_RUNTIME_WHEEL=$(ls "$RUNNER_TEMP"/runtime/cozy_runtime-*.whl)" >> "$GITHUB_ENV"
-      # ci.yaml's isolation: the product tests' executor containment needs a delegated cgroup subtree.
+      # The machine's executor containment needs a delegated cgroup subtree.
       - if: inputs.test != ''
         env:
           TEST: ${{ inputs.test }}
@@ -174,7 +155,7 @@ jobs:
           sudo systemd-run --wait --pipe --collect \
             --unit="cozy-dev-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
             --uid="$(id -u)" --gid="$(id -g)" --property=Delegate=yes --working-directory="$PWD" \
-            --setenv="PATH=$PATH" --setenv="HOME=$HOME" --setenv=CGO_ENABLED=0 --setenv=UV_TORCH_BACKEND=cpu \
+            --setenv="PATH=$PATH" --setenv="HOME=$HOME" --setenv=UV_TORCH_BACKEND=cpu \
             --setenv="GOCACHE=$(go env GOCACHE)" --setenv="GOMODCACHE=$(go env GOMODCACHE)" \
             --setenv=CARGO_TERM_COLOR=never --setenv=GITHUB_ACTIONS=true "${locations[@]}" \
             bash -euo pipefail -c "$TEST"

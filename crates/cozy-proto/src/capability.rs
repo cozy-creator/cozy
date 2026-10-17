@@ -3,7 +3,7 @@
 //! `cozy.machine.v1` call, until an expiry. Machines verify offline and store no bearer.
 //!
 //! Token: `base64url(payload) "." base64url(ed25519(DOMAIN || payload))`, payload the grant's
-//! JSON. Byte-identical with the Go client's `internal/capability`.
+//! JSON. Byte-identical with the Go client's former `internal/capability`.
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use ed25519_dalek::{Signature, Signer as _, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
