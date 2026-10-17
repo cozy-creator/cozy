@@ -1,5 +1,5 @@
 //! `cozy package lock|publish|yank` through the real binary against a real Tensorhub: Tensorhub's
-//! dev-build `cozy_ref` job starts one (TENSORHUB_URL, TENSORHUB_LOG) with MinIO, and uv is on the
+//! dev-build `cozy_ref` job starts one (TENSORHUB_ORIGIN, TENSORHUB_LOG) with MinIO, and uv is on the
 //! runner. Elsewhere it skips. One test, two accounts: the Hub allows a sign-up a minute.
 mod common;
 
@@ -68,7 +68,7 @@ fn packages_lock_publish_and_yank_on_a_real_hub() {
     let Some((home, account)) = publisher("publisher@cozy.test") else {
         return;
     };
-    let url = std::env::var("TENSORHUB_URL").unwrap();
+    let url = std::env::var("TENSORHUB_ORIGIN").unwrap();
     let tiny = project(&home, "tiny");
     let user = project(&home, "tiny-user");
 
@@ -99,11 +99,9 @@ fn packages_lock_publish_and_yank_on_a_real_hub() {
         format!("{account}/tiny"),
         "{published}"
     );
+    // Bytes another release already stored (here, another test's identical `tiny`) never upload
+    // again, so a first publish may send nothing.
     assert_eq!(published["status"], "published", "{published}");
-    assert!(
-        published["uploaded_bytes"].as_u64().unwrap() > 0,
-        "{published}"
-    );
     let again = json(&home, &tiny, &["package", "publish"]);
     assert_eq!(again["status"], "already published", "{again}");
     assert_eq!(again["uploaded_bytes"], 0, "{again}");
