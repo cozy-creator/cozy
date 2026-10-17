@@ -821,9 +821,12 @@ async fn ending_a_machine_waits_for_its_runs_outputs_and_force_gives_them_up() {
     events.until(Event::is_terminal).await;
     let (status, refused) = served.end("m", false).await;
     assert_eq!(status, StatusCode::CONFLICT, "{refused}");
-    assert_eq!(refused["code"], "outputs_exporting", "{refused}");
+    assert_eq!(refused["error"]["code"], "outputs_exporting", "{refused}");
     assert!(
-        refused["message"].as_str().unwrap().contains("in place"),
+        refused["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("in place"),
         "{refused}"
     );
     let until = Instant::now() + PATIENCE;
@@ -832,7 +835,7 @@ async fn ending_a_machine_waits_for_its_runs_outputs_and_force_gives_them_up() {
         if status == StatusCode::OK {
             break answer;
         }
-        assert_eq!(answer["code"], "outputs_exporting", "{answer}");
+        assert_eq!(answer["error"]["code"], "outputs_exporting", "{answer}");
         assert!(Instant::now() < until, "the outputs never landed");
         tokio::time::sleep(Duration::from_millis(200)).await;
     };
@@ -856,7 +859,7 @@ async fn ending_a_machine_waits_for_its_runs_outputs_and_force_gives_them_up() {
     loop {
         let (status, answer) = served.end("n", false).await;
         assert_eq!(status, StatusCode::CONFLICT, "{answer}");
-        let said = answer["message"].as_str().unwrap();
+        let said = answer["error"]["message"].as_str().unwrap();
         if !said.contains(": 0 B of") {
             break;
         }
