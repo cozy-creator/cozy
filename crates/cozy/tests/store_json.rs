@@ -243,12 +243,9 @@ fn a_row_that_is_not_protobuf_stops_the_conversion_with_a_typed_refusal() {
     home.use_binary(&old);
     let root = home.root();
     migrate::testing::build(&root);
-    assert_eq!(
-        home.cozy(["migrate", "--from", root.to_str().unwrap()])
-            .code,
-        0
-    );
-    assert_eq!(home.cozy(["down"]).code, 0);
+    let migrated = home.cozy(["migrate", "--from", root.to_str().unwrap()]);
+    assert_eq!(migrated.code, 0, "{migrated:?}");
+    home.cozy(["down"]);
     let db = db(&home);
     let (bad, ..) = rows(&db).into_iter().find(|(_, _, o)| o.is_some()).unwrap();
     let conn = rusqlite::Connection::open(&db).unwrap();
