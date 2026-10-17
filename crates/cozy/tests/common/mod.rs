@@ -16,6 +16,8 @@ use std::{
 
 pub struct Home {
     dir: tempfile::TempDir,
+    /// The `cozy` it runs: this build's, unless a test chose another (`use_binary`).
+    binary: std::cell::RefCell<PathBuf>,
 }
 
 /// One finished `cozy` process.
@@ -37,6 +39,7 @@ impl Home {
         }
         Some(Self {
             dir: tempfile::tempdir().expect("a temp dir"),
+            binary: PathBuf::from(env!("CARGO_BIN_EXE_cozy")).into(),
         })
     }
 
@@ -113,7 +116,7 @@ impl Home {
     /// `cozy` with this home, no inherited credentials and no user service manager: a Calcifer
     /// it starts is its own detached process.
     pub fn command(&self) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_cozy"));
+        let mut command = Command::new(&*self.binary.borrow());
         command
             .env("HOME", self.dir.path())
             .env("USERPROFILE", self.dir.path())
@@ -153,6 +156,11 @@ impl Home {
 
     pub fn path(&self) -> &Path {
         self.dir.path()
+    }
+
+    /// Runs `binary` (another release's `cozy`) from now on.
+    pub fn use_binary(&self, binary: impl Into<PathBuf>) {
+        *self.binary.borrow_mut() = binary.into();
     }
 }
 

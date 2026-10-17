@@ -13,12 +13,22 @@ use cozy_proto::{
         Status, Warning,
     },
     ids::{Digest, RunId},
-    machine as v1,
+    machine as v1, machine_json as json,
 };
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
 use rusqlite_migration::{M, Migrations};
 
 /// The schema; its version is `PRAGMA user_version`.
+fn migrations() -> Migrations<'static> {
+    let mut all: Vec<M> = MIGRATIONS.to_vec();
+    // xs-044: a run's spec and outcome are kept as the JSON the HTTP machine API sends (v0.10).
+    all.push(M::up_with_hook("", |tx: &Transaction| json_rows(tx)));
+    Migrations::new(all)
+}
+
+/// The version at which runs' specs and outcomes are JSON.
+const JSON_ROWS: usize = 5;
+
 const MIGRATIONS: &[M] = &[
     M::up(
         "CREATE TABLE machines (
@@ -304,7 +314,14 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "FULL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
-        Migrations::from_slice(MIGRATIONS).to_latest(&mut conn)?;
+        let migrations = migrations();
+        let version: usize = migrations.current_version(&conn)?.into();
+        if version < JSON_ROWS && version > 0 {
+            // A copy of the store as it was, beside it, before its rows are rewritten.
+            let backup = path.with_extension(format!("db.pre-json-{}", now_ms()));
+            conn.backup(rusqlite::MAIN_DB, &backup, None)?;
+        }
+        migrations.to_latest(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -571,7 +588,7 @@ impl Store {
                     new.target,
                     machine,
                     new.pinned,
-                    new.spec,
+                    spec_json(&new.spec)?,
                     new.out_dir.to_string_lossy(),
                     now_ms(),
                     serde_json::to_string(&new.warnings).expect("serializes"),
@@ -784,7 +801,7 @@ impl Store {
                 });
             tx.execute(
                 "UPDATE runs SET cursor = MAX(cursor, ?2), outcome = ?3 WHERE id = ?1",
-                params![id, cursor as i64, prost::Message::encode_to_vec(outcome)],
+                params![id, cursor as i64, outcome_json(outcome)?],
             )?;
             events.extend(end(tx, id, status, reason)?);
             Ok(events)
@@ -1158,7 +1175,6 @@ const RUN_COLUMNS: &str = "id, number, kind, target, hub, machine, pinned, spec,
     inputs, outcome";
 
 fn run_row(r: &Row) -> rusqlite::Result<Result<RunRow>> {
-    let corrupt = |what: &str| StoreError::Corrupt(what.into());
     let id: String = r.get(0)?;
     let kind: String = r.get(2)?;
     let state: String = r.get(9)?;
@@ -1178,7 +1194,7 @@ fn run_row(r: &Row) -> rusqlite::Result<Result<RunRow>> {
             hub: r.get(4)?,
             machine: r.get(5)?,
             pinned: r.get(6)?,
-            spec: r.get(7)?,
+            spec: spec_pb(&r.get::<_, Vec<u8>>(7)?)?,
             out_dir: PathBuf::from(out_dir),
             state: match state.as_str() {
                 "queued" => State::Queued,
@@ -1207,9 +1223,10 @@ fn run_row(r: &Row) -> rusqlite::Result<Result<RunRow>> {
             warnings: serde_json::from_str(&warnings).map_err(|_| corrupt("a run's warnings"))?,
             inputs: serde_json::from_str(&inputs).map_err(|_| corrupt("a run's inputs"))?,
             outcome: match outcome {
-                Some(bytes) => Some(
-                    prost::Message::decode(bytes.as_slice()).map_err(|_| corrupt("an outcome"))?,
-                ),
+                Some(bytes) => Some(v1::Outcome::from(
+                    &serde_json::from_slice::<json::Outcome>(&bytes)
+                        .map_err(|_| corrupt("an outcome"))?,
+                )),
                 None => None,
             },
         })
@@ -1640,6 +1657,65 @@ fn record(conn: &Connection, row: &RunRow) -> Result<Run> {
     })
 }
 
+/// Rewrites every protobuf spec and outcome as JSON, in the migration's transaction. An empty spec
+/// (a run imported from the Go CLI) stays empty. A row that is not protobuf stops the migration:
+/// the store is left as it was, beside its copy.
+fn json_rows(tx: &Transaction) -> rusqlite_migration::HookResult {
+    use rusqlite_migration::HookError;
+    let mut rows = tx.prepare("SELECT id, spec, outcome FROM runs")?;
+    let rows: Vec<(String, Vec<u8>, Option<Vec<u8>>)> = rows
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let unreadable =
+        |id: &str, what: &str, e: String| HookError::Hook(format!("run {id}'s {what}: {e}"));
+    for (id, spec, outcome) in rows {
+        let spec = spec_json(&spec).map_err(|e| unreadable(&id, "spec", e.to_string()))?;
+        let outcome = match outcome {
+            Some(bytes) => {
+                let pb: v1::Outcome = prost::Message::decode(bytes.as_slice())
+                    .map_err(|e| unreadable(&id, "outcome", e.to_string()))?;
+                Some(outcome_json(&pb).map_err(|e| unreadable(&id, "outcome", e.to_string()))?)
+            }
+            None => None,
+        };
+        tx.execute(
+            "UPDATE runs SET spec = ?2, outcome = ?3 WHERE id = ?1",
+            params![id, spec, outcome],
+        )?;
+    }
+    Ok(())
+}
+
+/// A spec as the store keeps it: protobuf (as the wire sends it) in, JSON out.
+fn spec_json(spec: &[u8]) -> Result<Vec<u8>> {
+    if spec.is_empty() {
+        return Ok(vec![]);
+    }
+    let pb: v1::RunSpec = prost::Message::decode(spec).map_err(|_| corrupt("a run's spec"))?;
+    let json = json::RunSpec::try_from(&pb)
+        .map_err(|e| StoreError::Corrupt(format!("a run's spec: {e}")))?;
+    Ok(serde_json::to_vec(&json).expect("serializes"))
+}
+
+/// A kept spec as the wire sends it.
+fn spec_pb(spec: &[u8]) -> Result<Vec<u8>> {
+    if spec.is_empty() {
+        return Ok(vec![]);
+    }
+    let json: json::RunSpec = serde_json::from_slice(spec).map_err(|_| corrupt("a run's spec"))?;
+    Ok(prost::Message::encode_to_vec(&v1::RunSpec::from(&json)))
+}
+
+fn outcome_json(outcome: &v1::Outcome) -> Result<Vec<u8>> {
+    let json = json::Outcome::try_from(outcome)
+        .map_err(|e| StoreError::Corrupt(format!("an outcome: {e}")))?;
+    Ok(serde_json::to_vec(&json).expect("serializes"))
+}
+
+fn corrupt(what: &str) -> StoreError {
+    StoreError::Corrupt(what.into())
+}
+
 pub(crate) fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1747,7 +1823,7 @@ fn import_run(tx: &Transaction, run: &ImportedRun) -> Result<()> {
             status,
             run.reason.as_ref().map(|r| &r.code),
             run.reason.as_ref().map(|r| &r.message),
-            run.outcome.as_ref().map(prost::Message::encode_to_vec),
+            run.outcome.as_ref().map(outcome_json).transpose()?,
             state_seq,
             run.created_at_ms,
             run.accepted_at_ms,
