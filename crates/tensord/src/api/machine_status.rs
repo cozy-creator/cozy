@@ -168,16 +168,20 @@ async fn frame<B: MachineBackend>(
         platform: format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH),
         started_at_unix_ms: identity.started_at_ms as i64,
         gpus: identity
-            .readiness
-            .gpus()
-            .into_iter()
+            .gpus
+            .iter()
             .map(|g| v1::Gpu {
                 index: g.device_index,
-                name: g.device_name,
-                uuid: g.device_uuid,
-                pci_bus_id: g.pci_bus_id,
+                name: g.device_name.clone(),
+                uuid: g.device_uuid.clone(),
+                pci_bus_id: g.pci_bus_id.clone(),
                 memory_bytes: g.memory_bytes,
-                driver: g.driver_version,
+                driver: g.driver_version.clone(),
+                family: match g.compute_cap.as_str() {
+                    "" => String::new(),
+                    cc => crate::precision::Gpus::of(&[cc]).name,
+                },
+                memory_class: g.memory_class.clone(),
             })
             .collect(),
         hubs: identity

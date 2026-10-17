@@ -373,6 +373,8 @@ message Gpu {
   string pci_bus_id = 4;
   uint64 memory_bytes = 5;
   string driver = 6;
+  string family = 7;        // the tensor-core row by compute capability ("sm90"); empty: unread
+  string memory_class = 8;  // discrete, coherent (GH200, GB200), unified (GB10); empty: unread
 }
 message Hub {
   string origin = 1;
