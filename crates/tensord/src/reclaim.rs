@@ -203,7 +203,7 @@ fn remove(path: &Path) -> bool {
         Ok(()) => true,
         Err(error) if error.kind() == io::ErrorKind::NotFound => false,
         Err(error) => {
-            eprintln!("reclaim {}: {error}", path.display());
+            tracing::warn!("reclaim {}: {error}", path.display());
             false
         }
     }

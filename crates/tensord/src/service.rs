@@ -98,7 +98,7 @@ impl Service {
                         }
                     }
                     if let Err(error) = engine.end_orphan(birth.clone()) {
-                        eprintln!("GPU startup birth remains fenced: {error}");
+                        tracing::warn!("GPU startup birth remains fenced: {error}");
                     }
                     startup_gpu_births.push(birth);
                 }
@@ -108,8 +108,8 @@ impl Service {
         // executors' own scopes; every such scope of this machine is ended now.
         match crate::scope::Scope::sweep(&crate::scope::namespace(root)) {
             Ok(0) => (),
-            Ok(held) => eprintln!("ended {held} process(es) left in earlier executor scopes"),
-            Err(error) => eprintln!("earlier executor scopes remain: {error}"),
+            Ok(held) => tracing::info!("ended {held} process(es) left in earlier executor scopes"),
+            Err(error) => tracing::warn!("earlier executor scopes remain: {error}"),
         }
         let service = Arc::new(Self {
             engine,
@@ -359,7 +359,7 @@ impl Service {
                 return;
             }
             if let Err(error) = self.engine.reconcile() {
-                eprintln!("executor birth observation: {error}");
+                tracing::warn!("executor birth observation: {error}");
             }
             self.retained.lock().unwrap().retain(|id, _| {
                 self.engine
@@ -368,7 +368,7 @@ impl Service {
                     .unwrap_or(true)
             });
             if let Err(error) = self.dispatch_ready() {
-                eprintln!("dispatch observation: {error}");
+                tracing::warn!("dispatch observation: {error}");
             }
             if self.swept.lock().unwrap().elapsed() >= SWEEP_EVERY {
                 self.reclaim();
@@ -383,10 +383,10 @@ impl Service {
         // Released Write roots first, so the store's GC can collect their bytes.
         if let Some(calls) = self.calls() {
             if let Err(error) = calls.sweep_canceled_outputs(&self.engine) {
-                eprintln!("reclaim canceled native outputs: {error}");
+                tracing::warn!("reclaim canceled native outputs: {error}");
             }
             if let Err(error) = calls.sweep_objects() {
-                eprintln!("reclaim object roots: {error}");
+                tracing::warn!("reclaim object roots: {error}");
             }
         }
         let sweep = || -> io::Result<crate::reclaim::Swept> {
@@ -410,7 +410,7 @@ impl Service {
                 store: match publisher.as_ref().map(|publisher| publisher.caches(self)) {
                     Some(Ok(caches)) => Some(caches),
                     Some(Err(error)) => {
-                        eprintln!("reclaim: no store GC this pass, its keep list failed: {error}");
+                        tracing::warn!("reclaim: no store GC this pass, its keep list failed: {error}");
                         None
                     }
                     None => None,
@@ -421,12 +421,12 @@ impl Service {
         match sweep() {
             Ok(swept) => {
                 if swept != crate::reclaim::Swept::default() {
-                    eprintln!("reclaimed {swept:?}");
+                    tracing::info!("reclaimed {swept:?}");
                 }
                 swept
             }
             Err(error) => {
-                eprintln!("reclaim: {error}");
+                tracing::warn!("reclaim: {error}");
                 crate::reclaim::Swept::default()
             }
         }

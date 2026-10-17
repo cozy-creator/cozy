@@ -491,7 +491,7 @@ impl Watch {
                     let verdict = format!("wedged during {what}: {}", pace.verdict(still, floor));
                     match exact.kill() {
                         Ok(()) => state.killed = Some(verdict),
-                        Err(error) => eprintln!("{verdict}; kill failed: {error}"),
+                        Err(error) => tracing::warn!("{verdict}; kill failed: {error}"),
                     }
                     return;
                 }

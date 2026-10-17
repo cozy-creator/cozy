@@ -67,7 +67,7 @@ pub fn log_into(dir: PathBuf) {
 pub(crate) fn note(event: serde_json::Value) {
     let dir = LOG.lock().unwrap();
     let Some(dir) = dir.as_ref() else {
-        return eprintln!("memory: {event}");
+        return tracing::info!("memory: {event}");
     };
     let path = dir.join("memory.log");
     if fs::metadata(&path).is_ok_and(|meta| meta.len() > ROTATE_BYTES) {
@@ -78,7 +78,7 @@ pub(crate) fn note(event: serde_json::Value) {
         .and_then(|_| OpenOptions::new().create(true).append(true).open(&path))
         .and_then(|mut file| file.write_all(line.as_bytes()));
     if let Err(error) = written {
-        eprintln!("memory: {event} ({}: {error})", path.display());
+        tracing::warn!("memory: {event} ({}: {error})", path.display());
     }
 }
 
@@ -103,7 +103,7 @@ impl GpuMemory {
                 .create(true)
                 .append(true)
                 .open(path)
-                .map_err(|error| eprintln!("memory: sample log {path:?} unavailable: {error}"))
+                .map_err(|error| tracing::warn!("memory: sample log {path:?} unavailable: {error}"))
                 .ok()
         });
         let sampler = match nvml::Device::open(device) {
@@ -139,11 +139,11 @@ impl GpuMemory {
                             "plan":plan,"error":error.to_string()})),
                     }
                 })
-                .map_err(|error| eprintln!("memory: sampler did not start: {error}"))
+                .map_err(|error| tracing::warn!("memory: sampler did not start: {error}"))
                 .ok()
             }
             Err(error) => {
-                eprintln!("memory: NVML unavailable for {device:?}: {error}; executors derive their own budgets");
+                tracing::warn!("memory: NVML unavailable for {device:?}: {error}; executors derive their own budgets");
                 None
             }
         };

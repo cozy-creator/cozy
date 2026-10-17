@@ -54,7 +54,7 @@ impl Hub {
         if let Some(ca) = &grant.ca_der {
             roots.add(ca.clone().into()).map_err(io::Error::other)?;
         }
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
         let tls = rustls::ClientConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()
             .map_err(io::Error::other)?

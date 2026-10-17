@@ -30,6 +30,8 @@ fn python_distribution_version() -> String {
 
 #[pymodule]
 fn _ext(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // The store's warnings reach the executor's stderr, which its machine keeps.
+    let _ = tracing_subscriber::fmt().with_writer(std::io::stderr).try_init();
     errors::install(m)?;
 
     m.add("__version__", python_distribution_version())?;

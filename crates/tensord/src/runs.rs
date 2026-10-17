@@ -315,7 +315,7 @@ impl Runs {
                         }
                     };
                     if let Err(error) = ended {
-                        eprintln!("run {run} preparation: {error}");
+                        tracing::warn!("run {run} preparation: {error}");
                     }
                 })
                 .map_err(Refused::from)?;
@@ -563,7 +563,7 @@ impl Runs {
                 let order = self.service.engine.get(id).map_or(u64::MAX, |record| record.root_seq());
                 let fetch = crate::access::Fetch::new(publisher.store().clone(), hub.clone(), plan.manifests(), order);
                 if let Err(error) = fetch.ahead(&plan.upfront()) {
-                    eprintln!("run {id}: its weights' early fetch: {error}");
+                    tracing::warn!("run {id}: its weights' early fetch: {error}");
                 }
                 fetch
             });
@@ -573,7 +573,7 @@ impl Runs {
             .then(|| format!("{} {}: {}", installation.package, installation.release, generation.record.sdk_fallback));
         for warning in fallback.into_iter().chain(precision) {
             if let Err(error) = self.service.engine.append_log(id, "warning", &warning) {
-                eprintln!("run {id}: {warning} ({error})");
+                tracing::warn!("run {id}: {warning} ({error})");
             }
         }
         let declared = interface["entrypoints"]
@@ -603,7 +603,7 @@ impl Runs {
                     choice.parameter
                 );
                 if let Err(error) = self.service.engine.append_log(id, "warning", &warning) {
-                    eprintln!("run {id}: {warning} ({error})");
+                    tracing::warn!("run {id}: {warning} ({error})");
                 }
             }
         }
@@ -1084,17 +1084,17 @@ impl Runs {
                             let fetch = crate::access::Fetch::new(gpu.store().clone(), hub, plan.manifests(), root);
                             gpu.prefetch(&runs.service.engine, held, plan, (root, family.clone()), owner.clone(), fetch)
                         }
-                        Err(error) => eprintln!("prefetch of {entrypoint}: {error}"),
+                        Err(error) => tracing::warn!("prefetch of {entrypoint}: {error}"),
                     }
                 }
                 Ok(_) => (),
                 Err(refusal) => {
-                    eprintln!("prefetch of {entrypoint}: {}: {}", refusal.code, refusal.message)
+                    tracing::warn!("prefetch of {entrypoint}: {}: {}", refusal.code, refusal.message)
                 }
             }
         });
         if let Err(error) = started {
-            eprintln!("prefetch of a child: {error}");
+            tracing::warn!("prefetch of a child: {error}");
         }
         Ok(())
     }

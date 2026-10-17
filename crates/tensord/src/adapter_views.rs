@@ -589,7 +589,7 @@ pub fn compose(store: &Store, base: &ObjectRef, selections: &[Selection]) -> io:
         .open(&path)
         .and_then(|file| file.set_modified(SystemTime::now()))?;
     if let Err(error) = derived::dispose(store, &meta, &transaction) {
-        eprintln!("adapter view {name}: composition root not released: {error}");
+        tracing::warn!("adapter view {name}: composition root not released: {error}");
     }
     Ok(Composed {
         repository: format!("local/{name}"),
