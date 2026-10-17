@@ -23,7 +23,10 @@ use calcifer::{
 use common::Tensord;
 use cozy_platform::{lock::LockFile, paths::Home};
 use cozy_proto::{
-    calcifer::{Event, Holder, Kind, On, OutputItem, Run, StagedInput, Status, SubmitRun},
+    calcifer::{
+        Event, Holder, Kind, MachinesEvent, On, OutputItem, Run, RunsEvent, StagedInput, Status,
+        SubmitRun,
+    },
     config::{Config, Loaded},
     error::Envelope,
     ids::{Digest, RunId},
@@ -118,10 +121,14 @@ impl Served {
         let path = format!("/v1/runs/{id}/events?starting_after=0");
         let response = self.get(&path).send().await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        Events {
-            response,
-            buffer: String::new(),
-        }
+        Events::of(response)
+    }
+
+    /// A list-level stream (`/v1/runs/events`, `/v1/machines/events`), subscribed now.
+    async fn feed<T: serde::de::DeserializeOwned>(&self, path: &str) -> Events<T> {
+        let response = self.get(path).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        Events::of(response)
     }
 
     /// `DELETE /v1/machines/{name}`, as `cozy machine end [--force]` asks it.
@@ -145,15 +152,24 @@ impl Served {
     }
 }
 
-/// One run's SSE stream, parsed.
-struct Events {
+/// One SSE stream, parsed: a run's events, or a list-level stream's.
+struct Events<T = Event> {
     response: reqwest::Response,
     buffer: String,
+    of: std::marker::PhantomData<T>,
 }
 
-impl Events {
+impl<T: serde::de::DeserializeOwned> Events<T> {
+    fn of(response: reqwest::Response) -> Self {
+        Self {
+            response,
+            buffer: String::new(),
+            of: std::marker::PhantomData,
+        }
+    }
+
     /// The next event; none once the server ends the stream.
-    async fn next(&mut self) -> Option<Event> {
+    async fn next(&mut self) -> Option<T> {
         tokio::time::timeout(PATIENCE, async {
             loop {
                 if let Some(end) = self.buffer.find("\n\n") {
@@ -174,7 +190,7 @@ impl Events {
     }
 
     /// Every event until `wanted` accepts one (included); with no `wanted`, to the stream's end.
-    async fn until(&mut self, wanted: impl Fn(&Event) -> bool) -> Vec<Event> {
+    async fn until(&mut self, wanted: impl Fn(&T) -> bool) -> Vec<T> {
         let mut seen = vec![];
         while let Some(event) = self.next().await {
             let done = wanted(&event);
@@ -899,6 +915,83 @@ async fn ending_a_machine_waits_for_its_runs_outputs_and_force_gives_them_up() {
             .iter()
             .any(|name| name.ends_with(".part") || name.contains("big")),
         "{left:?}"
+    );
+    served.down().await;
+}
+
+/// `GET /v1/runs/events` carries each run whole as it changes: a local package's run is seen
+/// queued, in progress (held at its gate), then completed with its outputs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_runs_stream_carries_a_run_whole_from_queued_to_completed() {
+    let home = tempfile::tempdir().unwrap();
+    let machine = installing_machine();
+    with_machine(home.path(), &machine);
+    let served = Served::start(home.path()).await;
+    let mut runs: Events<RunsEvent> = served.feed("/v1/runs/events").await;
+    let gate = machine.root.path().join("gate");
+    let run = served
+        .submit(&package_run(home.path(), &gate, 1 << 20))
+        .await;
+    let status = |event: &RunsEvent| match event {
+        RunsEvent::Updated { run: seen } if seen.id == run.id => Some(seen.status),
+        _ => None,
+    };
+    let started = runs.until(|e| status(e) == Some(Status::InProgress)).await;
+    assert!(
+        started.iter().any(|e| status(e) == Some(Status::Queued)),
+        "{started:?}"
+    );
+    std::fs::write(&gate, b"").unwrap();
+    let done = runs.until(|e| status(e) == Some(Status::Completed)).await;
+    let RunsEvent::Updated { run: completed } = done.last().unwrap();
+    assert!(!completed.output.is_empty(), "the run whole: {completed:?}");
+    served.down().await;
+}
+
+/// `GET /v1/machines/events` says when a machine's row changes: a run landing on it and settling
+/// (its counts), what its Status reports (the run's environment), and its removal once the run's
+/// outputs have landed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_machines_stream_says_when_a_machine_changes_and_when_it_is_removed() {
+    let home = tempfile::tempdir().unwrap();
+    let machine = installing_machine();
+    with_machine(home.path(), &machine);
+    let served = Served::start(home.path()).await;
+    let mut machines: Events<MachinesEvent> = served.feed("/v1/machines/events").await;
+    let gate = home.path().join("gate");
+    std::fs::write(&gate, b"").unwrap();
+    let run = served
+        .submit(&package_run(home.path(), &gate, 1 << 20))
+        .await;
+    let (mut busy, mut settled, mut installed) = (false, false, false);
+    while !(settled && installed) {
+        let event = machines.next().await.expect("the stream ended first");
+        let MachinesEvent::Updated { machine: m } = &event else {
+            panic!("only updates while the machine lives: {event:?}");
+        };
+        assert_eq!(m.name, "m");
+        match m.running + m.queued {
+            0 => settled |= busy,
+            _ => busy = true,
+        }
+        installed |= m
+            .status
+            .as_ref()
+            .is_some_and(|s| !s.environments.is_empty());
+    }
+    let mut events = served.events(&run.id).await;
+    events.until(Event::is_terminal).await;
+    let until = Instant::now() + PATIENCE;
+    while served.end("m", false).await.0 != StatusCode::OK {
+        assert!(Instant::now() < until, "the machine never ended");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let removed = machines
+        .until(|e| matches!(e, MachinesEvent::Removed { name } if name == "m"))
+        .await;
+    assert!(
+        matches!(removed.last(), Some(MachinesEvent::Removed { .. })),
+        "{removed:?}"
     );
     served.down().await;
 }

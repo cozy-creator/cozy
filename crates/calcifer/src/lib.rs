@@ -70,6 +70,8 @@ pub struct Calcifer {
     writing: Mutex<HashMap<(String, Digest), Turn>>,
     /// Told each time a run is settled: what Calcifer owes may now be nothing.
     owed: watch::Sender<()>,
+    /// Told each time a machine's row or what Calcifer heard of it may have changed.
+    machines_changed: watch::Sender<()>,
     exports: outputs::Exports,
     /// Each machine's warm set as it last reported it, and as this Calcifer since sent it.
     warm: Mutex<HashMap<String, Vec<v1::WarmItem>>>,
@@ -143,6 +145,7 @@ impl Calcifer {
             staging: Mutex::default(),
             writing: Mutex::default(),
             owed: watch::channel(()).0,
+            machines_changed: watch::channel(()).0,
             exports: outputs::Exports::default(),
             warm: Mutex::default(),
             granting: OnceLock::new(),
@@ -196,6 +199,16 @@ impl Calcifer {
     /// Every event of every run, as it happens.
     pub fn subscribe(&self) -> broadcast::Receiver<(RunId, Event)> {
         self.events.subscribe()
+    }
+
+    /// Told each time a machine's row, Status, boot or Hub listing may have changed.
+    pub fn machines_changed(&self) -> watch::Receiver<()> {
+        self.machines_changed.subscribe()
+    }
+
+    /// Says a machine may have changed, to whoever watches the machines.
+    pub(crate) fn machine_changed(&self) {
+        self.machines_changed.send_replace(());
     }
 
     /// Records a run under `key` and starts it; the same key again answers the recorded run.
@@ -292,6 +305,7 @@ impl Calcifer {
         if let Some(entry) = lock(&self.machines).get(&machine.name) {
             entry.changed.send_replace(());
         }
+        self.machine_changed();
         Ok(())
     }
 
@@ -311,6 +325,7 @@ impl Calcifer {
             entry.link = None;
             entry.changed.send_replace(());
         }
+        self.machine_changed();
         Ok(())
     }
 
@@ -325,6 +340,7 @@ impl Calcifer {
                     entry.changed.send_replace(());
                 }
             }
+            self.machine_changed();
         }
         Ok(renamed)
     }
