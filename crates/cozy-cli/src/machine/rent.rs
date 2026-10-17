@@ -8,7 +8,7 @@ use cozy_proto::{
 };
 use hub_client::types::{RentalSku, RentalSkuStatus};
 
-use super::{FOLLOW, list::state_cell, route, usd};
+use super::{Following, list::state_cell, usd};
 use crate::{Context, context::hub_answer, output};
 
 #[derive(clap::Args, Debug)]
@@ -144,18 +144,17 @@ fn price(sku: &str, q: &Quote) -> String {
     )
 }
 
-/// Follows the boot until the machine is ready, saying the Hub's phase as it changes. Ctrl-C stops
-/// watching only (`None`): the order goes on in Calcifer.
+/// Follows the boot over Calcifer's machine events until the machine is ready, saying the Hub's
+/// phase as it changes. Ctrl-C stops watching only (`None`): the order goes on in Calcifer.
 async fn follow(
     ctx: &Context,
     booting: Machine,
     mut noted: bool,
 ) -> Result<Option<Machine>, Error> {
     let calcifer = ctx.calcifer().await?;
-    // A rental id never changes; the Hub may rename the machine while it boots.
-    let path = route(booting.rental_id.as_deref().unwrap_or(&booting.name))?;
+    let id = booting.rental_id.as_deref().unwrap_or(&booting.name);
+    let (mut following, mut machine) = Following::open(&calcifer, id).await?;
     let mut said = String::new();
-    let mut machine = booting;
     loop {
         if !noted && let Some(note) = placement_note(&machine) {
             output::say(ctx, note);
@@ -173,7 +172,11 @@ async fn follow(
             MachineState::Ending | MachineState::Ended => return Err(boot_failed(&machine)),
         }
         tokio::select! {
-            () = tokio::time::sleep(FOLLOW) => {}
+            next = following.next(&calcifer) => match next? {
+                Some(next) => machine = next,
+                // Left the list: it ended as last seen.
+                None => return Err(boot_failed(&machine)),
+            },
             _ = tokio::signal::ctrl_c() => {
                 output::say(ctx, &format!(
                     "stopped watching {}: the order continues and bills once it boots; \
@@ -181,7 +184,6 @@ async fn follow(
                 return Ok(None);
             }
         }
-        machine = calcifer.get(&path).await?;
     }
 }
 
