@@ -59,6 +59,7 @@ fn run(lifetime: Lifetime, service: bool) -> io::Result<()> {
     // Whatever this process inherited (a parent's readiness, key or credential pipe) reaches
     // nothing it starts; descriptors it hands on are handed explicitly.
     crate::process::cloexec_from(3);
+    hold_handed_descriptors();
     let mut config = config::load(lifetime)?;
     config::init_logs(Some(&config.logs));
     for warning in &config.warnings {
@@ -85,6 +86,24 @@ fn run(lifetime: Lifetime, service: bool) -> io::Result<()> {
         supervise::supervise(&paths, lifetime, grant.receipt_key.as_deref(), grant.provider.as_ref())?
     };
     run_machine(config, ready)
+}
+
+/// Descriptors 3, 4 and 5 carry a parent's readiness, key and credential pipes. Until they are
+/// read, nothing else may take those numbers: the log file there would be read as a pipe, or a
+/// forked service's log written into the readiness pipe.
+fn hold_handed_descriptors() {
+    for fd in 3..=5 {
+        // SAFETY: plain syscalls on this process's own descriptor table, before any thread.
+        unsafe {
+            if libc::fcntl(fd, libc::F_GETFD) < 0 {
+                let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
+                if null >= 0 && null != fd {
+                    libc::dup3(null, fd, libc::O_CLOEXEC);
+                    libc::close(null);
+                }
+            }
+        }
+    }
 }
 
 /// `tensord serve`: a machine on a state directory with no grant, for tests.
