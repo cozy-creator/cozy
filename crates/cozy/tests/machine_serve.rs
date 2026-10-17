@@ -68,6 +68,8 @@ fn this_computers_machine_serves_status_and_calcifer_adds_it() {
         Link::new(&endpoint, key).unwrap().status().await.unwrap()
     });
     assert_eq!((frame.worker_id.as_str(), frame.phase.as_str()), ("local", "ready"), "{frame:?}");
+    // The machine is this cozy release, not a TensorD of its own.
+    assert_eq!(frame.version, env!("CARGO_PKG_VERSION"), "{frame:?}");
     assert!(frame.gpus.is_empty(), "CUDA_VISIBLE_DEVICES hides every GPU: {:?}", frame.gpus);
 
     // Calcifer adds it by address and fingerprint; its owner key, minted now, is admitted at once.
