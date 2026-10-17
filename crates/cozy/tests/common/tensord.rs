@@ -103,13 +103,19 @@ impl Tensord {
         self.fingerprint = format!("sha256:{}", hex::encode(Sha256::digest(&der)));
     }
 
-    /// Ends the exact processes this test started: its process group.
+    /// Ends the exact processes this test started: its process group. Its service lets go of the
+    /// root's owner lock only as it exits, after its parent's wait returns, so this waits for that
+    /// lock too: a restart on the same root never finds it held.
     pub fn stop(&mut self) {
         if let Some(mut child) = self.child.take() {
             let _ = Command::new("kill")
                 .args(["-KILL", "--", &format!("-{}", child.id())])
                 .status();
             let _ = child.wait();
+            let lock = self.root.path().join("machine/var/lib/cozy/tensord/owner.lock");
+            if let Ok(file) = std::fs::File::open(lock) {
+                let _ = file.lock();
+            }
         }
     }
 }
