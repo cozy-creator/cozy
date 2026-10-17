@@ -779,9 +779,23 @@ impl Calcifer {
     }
 
     /// Writes the run's staged objects to its machine, each shown as the run's `writing` stage.
+    /// What the machine holds is asked of `PROBES` objects at once, so a long round trip costs
+    /// one turn for a resubmitted tree, not one per file (37 files over 270 ms: 10 s per run).
     /// One object is written to one machine once at a time: a run naming an object another run
     /// is writing there waits its turn, then finds it held.
     async fn write_inputs(&self, link: &Link, run: &RunRow, machine: &str) -> Result<(), Stop> {
+        const PROBES: usize = 64;
+        let mut held = Vec::with_capacity(run.inputs.len());
+        for some in run.inputs.chunks(PROBES) {
+            let asked = some
+                .iter()
+                .map(|(digest, length)| link.held(digest, *length));
+            let answers = futures_util::future::join_all(asked).await;
+            let whole = answers.into_iter().zip(some);
+            held.extend(
+                whole.map(|(answer, (_, length))| answer.is_ok_and(|held| held >= *length)),
+            );
+        }
         let names: HashMap<String, String> = v1::RunSpec::decode(run.spec.as_slice())
             .map(|spec| {
                 spec.inputs
@@ -790,7 +804,8 @@ impl Calcifer {
                     .collect()
             })
             .unwrap_or_default();
-        for (digest, length) in &run.inputs {
+        // An object asked of in error is asked again, and its error told, as it is written.
+        for ((digest, length), _) in run.inputs.iter().zip(held).filter(|(_, held)| !held) {
             let key = (machine.to_owned(), *digest);
             let turn = lock(&self.writing).entry(key.clone()).or_default().clone();
             let held = turn.lock().await;

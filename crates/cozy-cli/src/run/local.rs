@@ -1,7 +1,14 @@
 //! Local code: `cozy run ./dir[/fn]` and `cozy run ./script.py`, a package nobody published. The
 //! machine installs it and answers its interface; the CLI binds the terms against that and calls
-//! it, just as it calls a release. No Python runs here.
-use std::{path::Path, process::ExitCode};
+//! it, just as it calls a release. No Python runs here. The interface is the source's (a static
+//! description), so it is kept by the source manifest's digest: a source sent before is called
+//! at once, and its machine makes its environment ready inside the call.
+use std::{
+    path::{Path, PathBuf},
+    process::ExitCode,
+};
+
+use cozy_platform::{durable, paths::Home};
 
 use cozy_proto::{
     calcifer::{Kind as RunKind, On, Run, Status, SubmitRun},
@@ -23,7 +30,8 @@ struct Installed {
     interface: Interface,
     /// The machine's name for the installation; an older machine names none.
     installation: Option<String>,
-    machine: String,
+    /// Where it was installed; none for a kept interface.
+    machine: Option<String>,
 }
 
 pub async fn run(
@@ -44,7 +52,15 @@ pub async fn run(
     // This computer's machine reads the files in place; any other is sent them.
     let in_place = on == On::Machine("local".into());
     let local = crate::package::local::source(ctx, path, in_place).await?;
-    let installed = install(ctx, &hub.origin, on, &local).await?;
+    // A warm set names the machine's installation, which only an install answers.
+    let installed = match kept(&ctx.home, &local).filter(|_| args.warm.is_none()) {
+        Some(interface) => Installed {
+            interface,
+            installation: None,
+            machine: None,
+        },
+        None => install(ctx, &hub.origin, on.clone(), &local).await?,
+    };
     let script = path.extension().is_some_and(|e| e == "py");
     let public = installed.interface.public();
     let function = match (function, public.as_slice()) {
@@ -80,8 +96,8 @@ pub async fn run(
         bits: super::bits(&args),
     };
     // The call goes where the code was installed, with its files once more: a machine that
-    // dropped them meanwhile is sent only what it lacks.
-    let on = On::Machine(installed.machine);
+    // dropped them meanwhile is sent only what it lacks, and installs them in the call.
+    let on = installed.machine.map_or(on, On::Machine);
     let spec = match args.warm {
         Some(level) => call.warm(level, &bound.models)?,
         None => call.spec(&bound)?,
@@ -95,8 +111,14 @@ pub async fn run(
 }
 
 /// Installs the code on its machine: a WARM run naming no function, whose result is the
-/// installation and its interface.
+/// installation and its interface, then kept. It is named for what the machine does: an install
+/// when the environment's inputs (metadata, lock, path dependencies) are new here, else a sync of
+/// the changed source.
 async fn install(ctx: &Context, hub: &str, on: On, local: &Local) -> Result<Installed, Error> {
+    let target = match synced(&ctx.home, local) {
+        true => format!("sync {} (source changed)", local.package),
+        false => format!("install {}", local.package),
+    };
     let spec = v1::RunSpec {
         kind: v1::RunKind::Warm.into(),
         source: Some(v1::run_spec::Source::Local(local.source.clone())),
@@ -106,7 +128,7 @@ async fn install(ctx: &Context, hub: &str, on: On, local: &Local) -> Result<Inst
         on,
         hub: hub.to_owned(),
         kind: RunKind::Warm,
-        target: format!("install {}", local.package),
+        target,
         spec: spec.encode_to_vec(),
         inputs: local.inputs.clone(),
         out: None,
@@ -114,7 +136,68 @@ async fn install(ctx: &Context, hub: &str, on: On, local: &Local) -> Result<Inst
     };
     let submitted = submit(ctx, submission, None).await?;
     let run = settle(ctx, submitted.run).await?;
-    installed(run)
+    let result = run.result.clone().unwrap_or_default();
+    let installed = installed(run)?;
+    keep(&ctx.home, local, &result["interface"]);
+    Ok(installed)
+}
+
+/// Where local code's interfaces are kept, beside release cards: one file per source manifest,
+/// named for its environment's inputs, so a changed source with the same environment is seen.
+fn dir(home: &Home, local: &Local) -> PathBuf {
+    let mut dir = home.root().join("packages");
+    dir.extend(local.package.split('/'));
+    dir
+}
+
+fn file(home: &Home, local: &Local) -> PathBuf {
+    let manifest = local.source.manifest.trim_start_matches("sha256:");
+    dir(home, local).join(format!(
+        "{}-{manifest}.json",
+        &hex(&local.environment)[..16]
+    ))
+}
+
+fn hex(digest: &cozy_proto::ids::Digest) -> String {
+    digest.to_string().trim_start_matches("sha256:").to_owned()
+}
+
+/// The interface kept for this exact source.
+fn kept(home: &Home, local: &Local) -> Option<Interface> {
+    let document: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(file(home, local)).ok()?).ok()?;
+    Interface::parse(&document).ok()
+}
+
+/// Whether some kept source of this package has the same environment inputs.
+fn synced(home: &Home, local: &Local) -> bool {
+    let prefix = format!("{}-", &hex(&local.environment)[..16]);
+    std::fs::read_dir(dir(home, local))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|e| e.file_name().to_string_lossy().starts_with(&prefix))
+}
+
+/// Keeps `interface` for this source, and only the newest 16 sources of the package.
+fn keep(home: &Home, local: &Local, interface: &serde_json::Value) {
+    const KEPT: usize = 16;
+    let dir = dir(home, local);
+    let kept = durable::private_dir(&dir).and_then(|()| {
+        durable::replace(&file(home, local), interface.to_string().as_bytes(), 0o600)
+    });
+    // An interface that cannot be kept is asked again next time; the run goes on.
+    drop(kept);
+    let mut files: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(&dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
+        .collect();
+    files.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
+    for (_, old) in files.into_iter().skip(KEPT) {
+        let _ = std::fs::remove_file(old);
+    }
 }
 
 fn installed(run: Run) -> Result<Installed, Error> {
@@ -155,7 +238,7 @@ fn installed(run: Run) -> Result<Installed, Error> {
     Ok(Installed {
         interface,
         installation,
-        machine,
+        machine: Some(machine),
     })
 }
 
@@ -184,9 +267,9 @@ mod tests {
         assert_eq!(
             (
                 installed.installation.as_deref(),
-                installed.machine.as_str()
+                installed.machine.as_deref()
             ),
-            (Some("local-0123"), "local")
+            (Some("local-0123"), Some("local"))
         );
         assert_eq!(installed.interface.public(), ["fp8", "generate", "int8"]);
     }
