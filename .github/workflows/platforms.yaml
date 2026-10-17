@@ -1,7 +1,7 @@
 name: platforms
 # The Rust workspace builds, lints and passes the cozy-platform seams on every release runner, Linux x86_64
-# as the control; the job's verdict is that. The Go tree's build and vet are reported, not judged (it is
-# deleted at xs-043 G), and so are TensorD and TensorFS until they are ported (xs-043 T, X, WM, AP).
+# as the control; the job's verdict is that. TensorD and TensorFS are reported, not judged, where they are
+# not ported yet (xs-043 T, X, WM, AP).
 # Nightly on master, and per question:
 #   gh workflow run platforms.yaml -R cozy-creator/cozy --ref <branch> [-f os='["windows-2025"]'] [-f test='cargo test -p <crate>']
 # A release (release.yml) needs a green run on its commit covering every release runner (release-gate.yml).
@@ -22,9 +22,6 @@ on:
 permissions:
   contents: read
 
-env:
-  CGO_ENABLED: '0'
-
 jobs:
   build:
     name: ${{ matrix.os }}
@@ -43,26 +40,6 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v5
-
-      - uses: actions/setup-go@v6
-        with:
-          go-version-file: go.mod
-
-      - name: Build
-        id: build
-        continue-on-error: true
-        run: go build ./... 2>&1 | tee build.txt; exit "${PIPESTATUS[0]}"
-
-      - name: Vet (compiles tests too)
-        id: vet
-        continue-on-error: true
-        run: go vet ./... 2>&1 | tee vet.txt; exit "${PIPESTATUS[0]}"
-
-      - name: Binary runs
-        id: run
-        if: steps.build.outcome == 'success'
-        continue-on-error: true
-        run: go build -o cozy-bin . && ./cozy-bin --help 2>&1 | head -40 | tee run.txt
 
       - uses: Swatinem/rust-cache@v2
 
@@ -96,10 +73,10 @@ jobs:
         run: |
           {
             echo "## ${{ matrix.os }}"
-            echo "rust=${{ steps.rust.outcome }} seams=${{ steps.seams.outcome }} test=${{ steps.test.outcome }} imported=${{ steps.imported.outcome }} go: build=${{ steps.build.outcome }} vet=${{ steps.vet.outcome }} run=${{ steps.run.outcome }}"
+            echo "rust=${{ steps.rust.outcome }} seams=${{ steps.seams.outcome }} test=${{ steps.test.outcome }} imported=${{ steps.imported.outcome }}"
             echo '```'
             # The tail of each: where errors are. `head` would end the pipe early (SIGPIPE under pipefail).
-            for f in rust.txt imported.txt seams.txt build.txt vet.txt; do [ ! -f "$f" ] || tail -n 50 "$f"; done
+            for f in rust.txt imported.txt seams.txt; do [ ! -f "$f" ] || tail -n 50 "$f"; done
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
@@ -108,9 +85,6 @@ jobs:
         with:
           name: cozy-${{ matrix.os }}
           path: |
-            build.txt
-            vet.txt
-            run.txt
             rust.txt
             imported.txt
             seams.txt

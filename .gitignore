@@ -4,7 +4,6 @@ __pycache__/
 .venv/
 dist/
 *.egg-info/
-/cozy
 *.exe
 
 # Agent task and ownership notes stay out of history
