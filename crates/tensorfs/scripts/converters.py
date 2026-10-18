@@ -1,7 +1,10 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["diffusers==0.40.0", "transformers==5.16.1", "torch>=2.11", "numpy"]
+# dependencies = [
+#   "diffusers==0.40.0", "transformers==5.16.1", "torch>=2.11", "numpy",
+#   "einops==0.8.2", "omegaconf==2.4.0", "rotary-embedding-torch==0.9.1",
+# ]
 # [[tool.uv.index]]
 # name = "pytorch-cpu"
 # url = "https://download.pytorch.org/whl/cpu"
@@ -20,7 +23,8 @@ official MiniMax-H3 converter. Every non-rename row's ops, applied with numpy se
 engine's), must reproduce the converter's own output on those stand-ins, and every table's
 targets must be the constructor's census. Canonical names are upstream's on-disk names: SDXL
 `text_encoder` keeps `text_model.`, H3 drops `rope.inv_freq` (diffusers' converter does) and its
-transformers land as `transformer`/`transformer_ref`. Those are spec data below.
+transformers land as `transformer`/`transformer_ref`. Those are spec data below. Rows are in the
+target's construction order (its `state_dict()`), never sorted (#624).
 """
 
 from __future__ import annotations
@@ -28,14 +32,17 @@ from __future__ import annotations
 import argparse
 import hashlib
 import importlib
+import importlib.machinery
 import importlib.metadata
 import importlib.util
+import io
 import json
 import math
 import re
 import struct
 import sys
 import tempfile
+import types
 import urllib.request
 import zipfile
 from dataclasses import dataclass, replace
@@ -73,10 +80,6 @@ def header(path: Path) -> dict[str, tuple[str, tuple[int, ...]]]:
     (length,) = struct.unpack("<Q", raw[:8])
     doc = json.loads(raw[8 : 8 + length])
     return {k: (v["dtype"], tuple(v["shape"])) for k, v in doc.items() if k != "__metadata__"}
-
-
-def natural(key: str) -> list[Any]:
-    return [int(p) if p.isdigit() else p for p in re.split(r"(\d+)", key)]
 
 
 def apply(a: np.ndarray, ops: dict[str, Any]) -> np.ndarray:
@@ -453,15 +456,54 @@ def sdxl_lora(table: dict[str, Any], shapes: dict[str, dict[str, tuple[int, ...]
 # ------------------------------------------------------------------ SeedVR2
 
 
+# The seedvr2 package's NaDiT and VAE arguments (SeedVR's configs_7b).
+SEEDVR_DIT = dict(
+    vid_in_channels=33, vid_out_channels=16, vid_dim=3072, txt_in_dim=5120, txt_dim=3072, emb_dim=18432,
+    heads=24, head_dim=128, expand_ratio=4, norm="rms", norm_eps=1e-5, ada="single", qk_bias=False,
+    qk_norm="rms", qk_rope=True, patch_size=(1, 2, 2), num_layers=36, mlp_type="normal", shared_mlp=False,
+    shared_qkv=False, block_type=["mmdit_sr"] * 36, window=[(4, 3, 3)] * 36,
+    window_method=["720pwin_by_size_bysize", "720pswin_by_size_bysize"] * 18,
+)
+SEEDVR_VAE = dict(
+    act_fn="silu", block_out_channels=(128, 256, 512, 512), down_block_types=("DownEncoderBlock3D",) * 4,
+    up_block_types=("UpDecoderBlock3D",) * 4, in_channels=3, out_channels=3, latent_channels=16,
+    layers_per_block=2, norm_num_groups=32, slicing_sample_min_size=4, temporal_scale_num=2, inflation_mode="pad",
+    spatial_downsample_factor=8, temporal_downsample_factor=4, use_quant_conv=False, use_post_quant_conv=False,
+    freeze_encoder=False,
+)
+
+
+def seedvr_census() -> dict[str, list[str]]:
+    """NaDiT's and the VAE's `state_dict()` order, built on the meta device from SeedVR's code at
+    the pinned commit. Its attention module imports flash_attn, which construction never calls."""
+    commit = SEEDVR.rstrip("/").rsplit("/", 1)[1]
+    body = fetch(f"https://codeload.github.com/ByteDance-Seed/SeedVR/zip/{commit}")
+    root = Path(tempfile.mkdtemp())
+    zipfile.ZipFile(io.BytesIO(body)).extractall(root)
+    sys.path.insert(0, str(root / f"SeedVR-{commit}"))
+    stub = types.ModuleType("flash_attn")
+    stub.__spec__ = importlib.machinery.ModuleSpec("flash_attn", None)
+    stub.flash_attn_varlen_func = None
+    sys.modules.setdefault("flash_attn", stub)
+    from models.dit.nadit import NaDiT
+    from models.video_vae_v3.modules.attn_video_vae import VideoAutoencoderKLWrapper
+
+    with torch.device("meta"):
+        return {"dit": list(NaDiT(**SEEDVR_DIT).state_dict()),
+                "vae": list(VideoAutoencoderKLWrapper(**SEEDVR_VAE).state_dict())}
+
+
 def seedvr2() -> dict[str, Any]:
     """The package's normalize composition: the two fp16 checkpoints as they are, and
     upstream's fixed text conditioning read straight from the pinned `.pt` files' storage
-    (no unpickling). The banked headers equal the package's NaDiT/VAE census (checked
-    2026-10-17)."""
+    (no unpickling). Rows follow NaDiT's/the VAE's construction order; the banked headers hold
+    exactly their keys."""
+    census = seedvr_census()
     components = []
     for name, file in (("dit", "seedvr2_ema_7b_fp16.safetensors"), ("vae", "ema_vae_fp16.safetensors")):
-        keys = sorted(header(VECTORS / "seedvr2-headers" / f"{file}.header"), key=natural)
-        components.append({"name": name, "cast": "F16", "rows": [[k] for k in keys]})
+        keys = header(VECTORS / "seedvr2-headers" / f"{file}.header")
+        assert sorted(keys) == sorted(census[name]), name
+        components.append({"name": name, "cast": "F16", "rows": [[k] for k in census[name]]})
     rows = []
     for key, file, shape, digest in (
         ("positive", "pos_emb.pt", (58, 5120), "fa07a14844314772266b66c3b95deb0027696d8fe7065721263db5176f45d799"),

@@ -16,14 +16,16 @@ macro_rules! orders {
 
 /// Every class with a reference, by its `_class_name` (Diffusers) or `architectures[0]`
 /// (Transformers).
-const ORDERS: [(&str, &str); 15] = orders![
+const ORDERS: [(&str, &str); 17] = orders![
     "AnimaTextConditioner",
     "AutoencoderKL",
+    "AutoencoderKLFlux2",
     "AutoencoderKLQwenImage",
     "AutoencoderKLQwenImage21",
     "CLIPTextModel",
     "CLIPTextModelWithProjection",
     "CosmosTransformer3DModel",
+    "Flux3Transformer2DModel",
     "MiniMaxH3Transformer3DModel",
     "Qwen2_5_VLForConditionalGeneration",
     "Qwen3Model",

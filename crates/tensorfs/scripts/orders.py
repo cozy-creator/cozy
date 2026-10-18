@@ -25,7 +25,6 @@ as the checkpoints store the keys, and kept as a tree: for each parent pattern (
 `#`), its children in order, merged over every instance of that parent and every config (a down
 block with attentions and one without agree on `attentions` < `resnets` < `downsamplers`).
 `vectors/orders/*.json` holds full key orders of models the tests import; never references.
-Gated repositories need `HF_TOKEN`.
 """
 
 from __future__ import annotations
@@ -34,7 +33,6 @@ import argparse
 import hashlib
 import importlib.util
 import json
-import os
 import struct
 import sys
 import tempfile
@@ -60,7 +58,21 @@ QWEN_IMAGE = ("Qwen/Qwen-Image", "75e0b4be04f60ec59a75f475837eced720f823b6")
 QWEN_IMAGE_21 = ("Qwen/Qwen-Image-2.1", "790c92633540aa0cb11d9abf19eb46d861714758")
 QWEN3_VL = ("Qwen/Qwen3-VL-2B-Instruct", "89644892e4d85e24eaac8bacfd4f463576704203")
 QWEN3_5 = ("Qwen/Qwen3.5-9B", "c202236235762e1c871ad0ccb60c8ee5ba337b9a")
-KLEIN = ("black-forest-labs/flux-3-image-klein", "8454017f9ebaada30c998fccd9f67a80c7580f68")
+# FLUX.3 Klein's repository is gated; our released lanes carry its component configs inline in
+# their v1 headers (read anonymously from Tensorhub), checked in as `orders/inputs/`:
+# (lane, manifest, header, file, sha256).
+LANE_CONFIGS = [
+    ("fidika/flux-3-klein@0.1.0/bf16", "30615fedd4da5f7fa1a406320ff24783ae6ec2fe0e697e472c4a0c3d79e6647f",
+     "eb206412f6bd896f11dca285fff593a9f587de6bc9456bc16920d0094c64bcc0", "flux-3-klein-0.1.0-bf16.transformer.json",
+     "d4fe5c8c25ff4d8da4671c7255fde2137d6c0556f218d043e17872c9d9782ad5"),
+    ("fidika/flux-3-klein@0.1.0/bf16", "30615fedd4da5f7fa1a406320ff24783ae6ec2fe0e697e472c4a0c3d79e6647f",
+     "eb206412f6bd896f11dca285fff593a9f587de6bc9456bc16920d0094c64bcc0", "flux-3-klein-0.1.0-bf16.vae.json",
+     "97b82ffab5caa6c770eba04f001e2618d18870eb81896573c243629474a911be"),
+    ("fidika/flux-3-klein-base@0.1.0/bf16", "0116217d1469b88d7e639f1cf8d989ba258a58af4d755267bd0ae45dec008933",
+     "f7c52c23e843dc3afa8a70ff1a2d5b88215d5c4ccd03095332b7a02b3a294647",
+     "flux-3-klein-base-0.1.0-bf16.transformer.json",
+     "23d930769e38557099693f9eefb77364621705e43f0f0da3da0f349876bfb692"),
+]
 # MiniMax-H3's transformer has no Diffusers config upstream; diffusers' converter defines it.
 H3_SCRIPT = (
     "https://raw.githubusercontent.com/huggingface/diffusers/c60830ee365d520ab52b110dda562dd26f7b4d7f/"
@@ -75,7 +87,6 @@ SOURCES = [
     (QWEN_IMAGE, "transformer"), (QWEN_IMAGE, "vae"), (QWEN_IMAGE, "text_encoder"),
     (QWEN_IMAGE_21, "transformer"), (QWEN_IMAGE_21, "vae"), (QWEN_IMAGE_21, "text_encoder"),
     (QWEN3_VL, ""), (QWEN3_5, ""),
-    # (KLEIN, "transformer"), (KLEIN, "vae"): gated; waits for an HF_TOKEN here and in CI.
 ]
 # Models the tests import; their full orders are never references.
 CHECKS = [("tiny-sdxl-pipe", ("hf-internal-testing/tiny-sdxl-pipe", "20594cbc343cfcfe447af5c87cdaf6c436b453f2"),
@@ -84,8 +95,6 @@ CHECKS = [("tiny-sdxl-pipe", ("hf-internal-testing/tiny-sdxl-pipe", "20594cbc343
 
 def get(url: str, first: int | None = None, last: int | None = None) -> bytes:
     req = urllib.request.Request(url)
-    if token := os.environ.get("HF_TOKEN"):
-        req.add_header("Authorization", f"Bearer {token}")
     if first is not None:
         req.add_header("Range", f"bytes={first}-{last}")
     with urllib.request.urlopen(req, timeout=120) as r:
@@ -223,6 +232,14 @@ def build() -> dict[Path, bytes]:
         sources, orders = by_class.setdefault(name, ([], []))
         sources.append(f"hf://{repo[0]}@{repo[1]}/{folder}".rstrip("/"))
         orders.append(keys)
+    for lane, manifest, header, file, digest in LANE_CONFIGS:
+        body = (OUT / "inputs" / file).read_bytes()
+        if hashlib.sha256(body).hexdigest() != digest:
+            raise SystemExit(f"{file}: sha256 differs from the pinned {digest}")
+        name, model = construct(json.loads(body))
+        sources, orders = by_class.setdefault(name, ([], []))
+        sources.append(f"tensorhub://{lane} manifest {manifest} header {header}")
+        orders.append(list(model.state_dict()))
     name, source, keys = h3_transformer()
     by_class[name] = ([source], [keys])
     out = {}
