@@ -250,7 +250,6 @@ print(json.dumps({"identity": generation.identity}))
 
 mod v1_api {
     use super::*;
-    use std::io::Write as _;
     use tensord::api::{
         capability::{mint, Grant, MACHINE},
         v1,
