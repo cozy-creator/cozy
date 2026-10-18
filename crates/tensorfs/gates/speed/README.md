@@ -75,6 +75,28 @@ Qwen-Image int8, 19.2 GB, window 218 MB:
 - On this pod's storage the F1 Python reader (`T64`, 16 MiB requests) is the fastest full read; on the 3090
   pod's NVMe 16 MiB requests were the slowest. Request size is a per-disk trade-off; 1 MiB holds up on both.
 
+Window re-run with regions cut at blocks (`regions(ck, 64 MiB, boundaries)`, every `<component>/<prefix>.N`),
+run 11595 on an NVIDIA L4 (rumiho), 5 interleaved repetitions, ms median (best):
+
+| lane | reader | window cold | window warm |
+|---|---|---:|---:|
+| SDXL, window 187 MB | **T64+rust** (reads 211 MB) | **48** (44) | **43** (41) |
+| | fastsafetensors | 86 (81) | 92 (90) |
+| | st-cuda | 154 (138) | 61 (60) |
+| | st-cpu-cuda | 106 (102) | 52 (50) |
+| | gate | pass +78% | pass +22% |
+| Qwen, window 218 MB | **T64+rust** (reads 227 MB) | **46** (41) | **43** (39) |
+| | fastsafetensors | 67 (65) | 463 (449) |
+| | st-cuda | 121 (95) | 72 (45) |
+| | st-cpu-cuda | 88 (83) | 36 (35) |
+| | gate | pass +46% | **fail -17%** |
+
+- Boundaries cut Qwen's window read from 294 MB to 227 MB, the window's own chunks (what the engine reads).
+- The rest of the gap is fixed cost, not bytes: opening the checkpoint, `regions` and `register_checkpoint` take
+  16 ms of the 43 (19 ms of SDXL's), because they cover the whole checkpoint (Qwen: 19.2 GB, 544 chunks)
+  rather than the window. The window's want and wait take about 27 ms (8.4 GB/s), less than `st-cpu-cuda`'s 36 ms.
+  A loader that registers once and wants windows repeatedly pays the 16 ms once.
+
 ## F1 results
 
 F1's harness (in git history at `a1ae376df`) built the layouts itself: `v1` per-part objects, `T16`/`T64` packs
