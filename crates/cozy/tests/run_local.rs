@@ -646,11 +646,11 @@ fn asset_fidelity_reaches_the_package_by_label_or_index() {
     );
     let code = work.join("tiny/tiny/__init__.py");
     let fidelity = "\n\nfrom cozy_runtime.author import Assets, ImageAsset\n\n\n\
-                    class FidelityInput(msgspec.Struct):\n    assets: Assets[ImageAsset]\n\n\n\
+                    class FidelityInput(msgspec.Struct):\n    note: str = \"\"\n\n\n\
                     class FidelityOutput(msgspec.Struct):\n    fidelity: dict[str, str]\n\n\n\
                     @app.entrypoint(accelerator=False)\n\
-                    def fidelity(payload: FidelityInput) -> FidelityOutput:\n    \
-                    infos = [payload.assets.info(i) for i in range(len(payload.assets))]\n    \
+                    def fidelity(payload: FidelityInput, assets: Assets[ImageAsset]) -> FidelityOutput:\n    \
+                    infos = [assets.info(i) for i in range(len(assets))]\n    \
                     return FidelityOutput({i.label or str(i.position): i.fidelity for i in infos})\n";
     let mut text = std::fs::read_to_string(&code).unwrap();
     text.push_str(fidelity);
