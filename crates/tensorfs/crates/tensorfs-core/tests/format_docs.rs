@@ -8,9 +8,9 @@ use tensorfs_core::format::{
     Tensor, Value, HEADER_PATH,
 };
 
-fn header() -> Header {
-    let chunks = vec![ObjectRef::of(&[7u8; 8192]), ObjectRef::of(&[1u8; 100])];
+fn tensors() -> Vec<Tensor> {
     let plain = Tensor {
+        key: "a.weight".into(),
         dtype: Dtype::BF16,
         shape: vec![2, 3],
         body: Body::Data(Location {
@@ -19,7 +19,8 @@ fn header() -> Header {
             length: 12,
         }),
     };
-    let part = |dtype, shape: Vec<u64>, chunk, offset, length| Part {
+    let part = |role: &str, dtype, shape: Vec<u64>, chunk, offset, length| Part {
+        role: role.into(),
         dtype,
         shape,
         chunk,
@@ -27,6 +28,7 @@ fn header() -> Header {
         length,
     };
     let encoded = Tensor {
+        key: "b.weight".into(),
         dtype: Dtype::F32,
         shape: vec![4, 1024],
         body: Body::Encoded {
@@ -34,31 +36,33 @@ fn header() -> Header {
                 scheme: "fp8-rowwise".into(),
                 params: [("axis".into(), Value::from(0u64))].into(),
             },
-            parts: BTreeMap::from([
-                (
-                    "weight".into(),
-                    part(Dtype::F8_E4M3, vec![4, 1024], 0, 4096, 4096),
-                ),
-                ("scale".into(), part(Dtype::F32, vec![4], 1, 0, 16)),
-            ]),
+            parts: vec![
+                part("weight", Dtype::F8_E4M3, vec![4, 1024], 0, 4096, 4096),
+                part("scale", Dtype::F32, vec![4], 1, 0, 16),
+            ],
         },
     };
-    let tensors = BTreeMap::from([("a.weight".into(), plain), ("b.weight".into(), encoded)]);
-    Header {
-        chunks,
-        components: BTreeMap::from([("unet".into(), Component { tensors })]),
-        metadata: [(
-            "prompt".into(),
-            Value::Map(
-                [
-                    ("rows".into(), Value::List(vec!["a cat".into()])),
-                    ("n".into(), 1u64.into()),
-                ]
-                .into(),
-            ),
-        )]
+    vec![plain, encoded]
+}
+
+fn header_with(tensors: Vec<Tensor>) -> Header {
+    let chunks = vec![ObjectRef::of(&[7u8; 8192]), ObjectRef::of(&[1u8; 100])];
+    let unet = Component {
+        name: "unet".into(),
+        tensors,
+    };
+    let prompt = Value::Map(
+        [
+            ("rows".into(), Value::List(vec!["a cat".into()])),
+            ("n".into(), 1u64.into()),
+        ]
         .into(),
-    }
+    );
+    Header::new(chunks, vec![unet], [("prompt".into(), prompt)].into()).unwrap()
+}
+
+fn header() -> Header {
+    header_with(tensors())
 }
 
 #[test]
@@ -111,10 +115,12 @@ fn unknown_fields_and_minor_versions_read() {
     let mut v: serde_json::Value = serde_json::from_slice(&header().to_json().unwrap()).unwrap();
     v["format"] = json!("cozytensors/2.9");
     v["future"] = json!({"x": [1, 2]});
-    v["components"]["unet"]["tensors"]["a.weight"]["future"] = json!(true);
-    v["components"]["unet"]["future"] = json!("y");
-    v["components"]["unet"]["tensors"]["b.weight"]["encoding"]["scheme"] = json!("acme-int3");
-    v["components"]["unet"]["tensors"]["a.weight"]["dtype"] = json!("F3_E1M1");
+    let unet = &mut v["components"][0];
+    unet["future"] = json!("y");
+    unet["tensors"][0]["future"] = json!(true);
+    unet["tensors"][0]["dtype"] = json!("F3_E1M1");
+    unet["tensors"][1]["encoding"]["scheme"] = json!("acme-int3");
+    unet["tensors"][1]["parts"][0]["future"] = json!([]);
     let pretty = serde_json::to_vec_pretty(&v).unwrap();
     let h = Header::from_json(&pretty).unwrap();
     let Body::Encoded { encoding, .. } = &h.tensor("unet", "b.weight").unwrap().body else {
@@ -170,7 +176,25 @@ fn red_documents_are_refused() {
             r#""chunk":2,"dtype":"F32""#,
             "invalid",
         ),
-        ("component", r#""unet":"#, r#""un/et":"#, "invalid"),
+        ("component", r#""name":"unet""#, r#""name":"un/et""#, "invalid"),
+        (
+            "repeated key",
+            r#""key":"b.weight""#,
+            r#""key":"a.weight""#,
+            "invalid",
+        ),
+        (
+            "repeated role",
+            r#""role":"scale""#,
+            r#""role":"weight""#,
+            "invalid",
+        ),
+        (
+            "components as a map",
+            r#""components":[{"name":"unet","tensors":"#,
+            r#""components":{"unet":{"tensors":"#,
+            "invalid",
+        ),
         (
             "huge",
             r#""length":12"#,
@@ -208,13 +232,12 @@ fn red_documents_are_refused() {
 
 #[test]
 fn spans_continue_into_following_chunks() {
-    let mut h = header();
-    h.chunks = vec![
+    let chunks = vec![
         ObjectRef::of(&[0; 10]),
         ObjectRef::of(&[1; 10]),
         ObjectRef::of(&[2; 10]),
     ];
-    h.components.clear();
+    let h = Header::new(chunks, vec![], Default::default()).unwrap();
     let at = Location {
         chunk: 0,
         offset: 6,
@@ -239,5 +262,37 @@ fn spans_continue_into_following_chunks() {
     assert_eq!(
         (future.name(), future.bits(), future.byte_len(&[8])),
         ("F3_E1M1", None, None)
+    );
+}
+
+/// Construction order is data: it survives a round trip and the digest covers it.
+#[test]
+fn order_is_kept_and_a_reorder_changes_the_digest() {
+    let h = header();
+    let keys = |h: &Header| h.tensors().map(|(_, t)| t.key.clone()).collect::<Vec<_>>();
+    assert_eq!(keys(&h), ["a.weight", "b.weight"]);
+    let back = Header::from_json(&h.to_json().unwrap()).unwrap();
+    assert_eq!(keys(&back), ["a.weight", "b.weight"]);
+
+    let mut reordered = tensors();
+    reordered.reverse();
+    let r = header_with(reordered);
+    assert_eq!(keys(&Header::from_json(&r.to_json().unwrap()).unwrap()), ["b.weight", "a.weight"]);
+    assert_ne!(
+        ObjectRef::of(&r.to_json().unwrap()),
+        ObjectRef::of(&h.to_json().unwrap()),
+        "reordering two tensors changes the header digest"
+    );
+    assert_ne!(r, h);
+
+    let mut swapped = tensors();
+    let Body::Encoded { parts, .. } = &mut swapped[1].body else {
+        unreachable!()
+    };
+    parts.reverse();
+    assert_ne!(
+        ObjectRef::of(&header_with(swapped).to_json().unwrap()),
+        ObjectRef::of(&h.to_json().unwrap()),
+        "reordering two parts changes it too"
     );
 }

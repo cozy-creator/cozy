@@ -358,26 +358,28 @@ fn inspect(store: &Store, reference: &str, lane: Option<&str>) -> Done {
     let ck = store.checkpoint(&n.manifest)?;
     let header = ck.header();
     let mut human = vec![label(&n)];
-    let mut components = Map::new();
-    for (name, c) in &header.components {
-        let mut tensors = Map::new();
+    // Arrays in header (construction) order.
+    let mut components = Vec::new();
+    for c in header.components() {
+        let mut tensors = Vec::new();
         let mut bytes = 0;
-        for (key, t) in &c.tensors {
-            let mut doc = json!({"dtype": t.dtype.name(), "shape": t.shape});
+        for t in &c.tensors {
+            let mut doc = json!({"key": t.key, "dtype": t.dtype.name(), "shape": t.shape});
             match &t.body {
                 Body::Data(at) => bytes += at.length,
                 Body::Encoded { encoding, parts } => {
-                    bytes += parts.values().map(|p| p.length).sum::<u64>();
+                    bytes += parts.iter().map(|p| p.length).sum::<u64>();
                     doc["encoding"] = json!({"scheme": encoding.scheme, "params": encoding.params});
                 }
             }
-            tensors.insert(key.clone(), doc);
+            tensors.push(doc);
         }
         human.push(format!(
-            "  {name}: {} tensors, {bytes} bytes",
+            "  {}: {} tensors, {bytes} bytes",
+            c.name,
             c.tensors.len()
         ));
-        components.insert(name.clone(), json!({"bytes": bytes, "tensors": tensors}));
+        components.push(json!({"name": c.name, "bytes": bytes, "tensors": tensors}));
     }
     let chunk_bytes: u64 = header.chunks.iter().map(|c| c.length).sum();
     human.push(format!(
@@ -397,7 +399,7 @@ fn inspect(store: &Store, reference: &str, lane: Option<&str>) -> Done {
         ("chunks".into(), header.chunks.len().into()),
         ("bytes".into(), chunk_bytes.into()),
         ("metadata".into(), json!(header.metadata)),
-        ("components".into(), Json::Object(components)),
+        ("components".into(), Json::Array(components)),
     ]);
     Ok(Some((Json::Object(doc), human.join("\n"))))
 }

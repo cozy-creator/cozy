@@ -5,7 +5,7 @@ For anyone implementing [cozytensors/2](../spec/cozytensors-2.md).
 | Path | What |
 |---|---|
 | `schema/{header,manifest,repo}.schema.json` | JSON Schema (2020-12) of each document's structure. Byte lengths, bounds, duplicate keys, integer-only numbers and version uniqueness are spec rules the schema cannot express. |
-| `vectors/cases.json` | Decode cases: a tensor's parts (base64 bits) and its expected logical bytes, or the refusal code (`decode`, `unknown_scheme`). |
+| `vectors/cases.json` | Decode cases, in header order: a tensor's parts (base64 bits, in order) and its expected logical bytes, or the refusal code (`decode`, `unknown_scheme`). |
 | `vectors/store/` | A static origin holding those cases: repo `Conformance/Schemes` at `refs/conformance/schemes.json`, lane `all` (every case, laid out by the chunk rule) and lane `spans` (a range across three chunks). |
 | `vectors/green/`, `vectors/red/` | Single documents, named `<kind>-<case>.json`, that a reader must accept or refuse. |
 | `reader.py` | An independent reader (Python stdlib and numpy) with reference decoders. |
@@ -13,7 +13,8 @@ For anyone implementing [cozytensors/2](../spec/cozytensors-2.md).
 A conforming implementation:
 - reads the store, verifies every object, and decodes every case to its expected bytes or refuses it with its code;
 - accepts every green document and refuses every red one;
-- as a writer, reproduces the store byte for byte from `cases.json` (components by name, keys in natural order).
+- as a writer, reproduces the store byte for byte from `cases.json`, keeping its order: components by first
+  appearance, tensors and parts as listed (construction order is data, spec §4).
 
 Run both implementations:
 

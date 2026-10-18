@@ -130,10 +130,12 @@ fn a_synthetic_checkpoint_exports_pulls_and_verifies() {
 
     let inspected = ok(&a, &["inspect", "acme/syn"]);
     assert_eq!(inspected["manifest"], written["manifest"]);
-    let schemes: std::collections::BTreeSet<&str> = inspected["components"]["unet"]["tensors"]
-        .as_object()
+    let unet = &inspected["components"][0];
+    assert_eq!(unet["name"], "unet");
+    let schemes: std::collections::BTreeSet<&str> = unet["tensors"]
+        .as_array()
         .unwrap()
-        .values()
+        .iter()
         .filter_map(|t| t["encoding"]["scheme"].as_str())
         .collect();
     assert_eq!(
@@ -187,7 +189,8 @@ fn a_synthetic_checkpoint_exports_pulls_and_verifies() {
         let encodings: Json = meta.get("cozytensors.encodings").map_or(Json::Null, |t| {
             serde_json::from_str(t.as_str().unwrap()).unwrap()
         });
-        for (key, t) in &ck.header().components[component].tensors {
+        for t in &ck.header().component(component).unwrap().tensors {
+            let key = &t.key;
             match &t.body {
                 Body::Data(at) => {
                     assert_eq!(
@@ -199,7 +202,8 @@ fn a_synthetic_checkpoint_exports_pulls_and_verifies() {
                 }
                 Body::Encoded { encoding, parts } => {
                     assert_eq!(encodings[key]["scheme"], encoding.scheme.as_str());
-                    for (role, p) in parts {
+                    for p in parts {
+                        let role = &p.role;
                         let name = encodings[key]["parts"][role].as_str().unwrap();
                         assert_eq!(
                             tensors[name],
@@ -214,7 +218,7 @@ fn a_synthetic_checkpoint_exports_pulls_and_verifies() {
                     }
                     assert_eq!(
                         tensors.contains_key(&format!("{key}_scale")),
-                        parts.contains_key("scale")
+                        t.part("scale").is_some()
                     );
                 }
             }
@@ -237,21 +241,22 @@ fn a_synthetic_checkpoint_exports_pulls_and_verifies() {
     );
     let (tensors, meta) = safetensors(&deq.join("unet/diffusion_pytorch_model.safetensors"));
     assert!(meta.get("cozytensors.encodings").is_none());
-    for (key, t) in &ck.header().components["unet"].tensors {
+    for t in &ck.header().component("unet").unwrap().tensors {
+        let key = &t.key;
         if let Body::Encoded { encoding, parts } = &t.body {
             let bytes: BTreeMap<&str, Vec<u8>> = parts
                 .iter()
-                .map(|(r, p)| (r.as_str(), raw(&ck, &p.at())))
+                .map(|p| (p.role.as_str(), raw(&ck, &p.at())))
                 .collect();
             let views = parts
                 .iter()
-                .map(|(r, p)| {
+                .map(|p| {
                     (
-                        r.as_str(),
+                        p.role.as_str(),
                         PartBytes {
                             dtype: &p.dtype,
                             shape: &p.shape,
-                            bytes: &bytes[r.as_str()],
+                            bytes: &bytes[p.role.as_str()],
                         },
                     )
                 })

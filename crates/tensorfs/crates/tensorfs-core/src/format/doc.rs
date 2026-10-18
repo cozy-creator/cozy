@@ -1,7 +1,7 @@
 //! The three v2 documents and the tensor model. Each type parses through a `Wire` twin that
 //! carries the `format` tag; validation happens once, in `TryFrom<Wire>`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -118,33 +118,47 @@ impl Manifest {
     }
 }
 
-/// `cozytensors/2`: chunk objects and the tensors that live in them, by component.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+/// `cozytensors/2`: chunk objects and the tensors that live in them. Components, each
+/// component's tensors and each tensor's parts are in construction order (the order a model
+/// builds and fills them), which the header's bytes and digest carry. Lookup by name goes
+/// through an index built by [`Header::new`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(try_from = "HeaderWire", into = "HeaderWire")]
 pub struct Header {
     pub chunks: Vec<ObjectRef>,
-    pub components: BTreeMap<String, Component>,
+    components: Vec<Component>,
     pub metadata: Metadata,
+    /// Component name → (its index, tensor key → tensor index).
+    index: HashMap<String, (usize, HashMap<String, usize>)>,
+}
+
+impl PartialEq for Header {
+    fn eq(&self, other: &Header) -> bool {
+        (&self.chunks, &self.components, &self.metadata)
+            == (&other.chunks, &other.components, &other.metadata)
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
 struct HeaderWire {
     format: String,
     chunks: Vec<ObjectRef>,
-    components: BTreeMap<String, Component>,
+    components: Vec<Component>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     metadata: Metadata,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct Component {
-    pub tensors: BTreeMap<String, Tensor>,
+    pub name: String,
+    pub tensors: Vec<Tensor>,
 }
 
-/// A tensor: its logical dtype and shape, and either its bytes or its encoded parts.
+/// A tensor: its key, logical dtype and shape, and either its bytes or its encoded parts.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(try_from = "TensorWire", into = "TensorWire")]
 pub struct Tensor {
+    pub key: String,
     pub dtype: Dtype,
     pub shape: Vec<u64>,
     pub body: Body,
@@ -157,12 +171,13 @@ pub enum Body {
     /// Encoded: `encoding` names the scheme that turns `parts` into the logical tensor.
     Encoded {
         encoding: Encoding,
-        parts: BTreeMap<String, Part>,
+        parts: Vec<Part>,
     },
 }
 
 #[derive(Clone, Serialize, Deserialize)]
 struct TensorWire {
+    key: String,
     dtype: Dtype,
     shape: Vec<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -170,7 +185,7 @@ struct TensorWire {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     encoding: Option<Encoding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    parts: Option<BTreeMap<String, Part>>,
+    parts: Option<Vec<Part>>,
 }
 
 impl TryFrom<TensorWire> for Tensor {
@@ -182,14 +197,12 @@ impl TryFrom<TensorWire> for Tensor {
                 if encoding.scheme.is_empty() {
                     return invalid("an encoding names no scheme");
                 }
-                if parts.keys().any(String::is_empty) {
-                    return invalid("a part has an empty role");
-                }
                 Body::Encoded { encoding, parts }
             }
             _ => return invalid("a tensor has either `data`, or `encoding` and non-empty `parts`"),
         };
         Ok(Tensor {
+            key: w.key,
             dtype: w.dtype,
             shape: w.shape,
             body,
@@ -204,11 +217,30 @@ impl From<Tensor> for TensorWire {
             Body::Encoded { encoding, parts } => (None, Some(encoding), Some(parts)),
         };
         TensorWire {
+            key: t.key,
             dtype: t.dtype,
             shape: t.shape,
             data,
             encoding,
             parts,
+        }
+    }
+}
+
+impl Tensor {
+    /// An encoded tensor's part by role.
+    pub fn part(&self, role: &str) -> Option<&Part> {
+        match &self.body {
+            Body::Encoded { parts, .. } => parts.iter().find(|p| p.role == role),
+            Body::Data(_) => None,
+        }
+    }
+
+    /// Every stored range, in order: a plain tensor's data (role `""`), or each part.
+    pub fn locations(&self) -> Vec<(&str, Location)> {
+        match &self.body {
+            Body::Data(at) => vec![("", *at)],
+            Body::Encoded { parts, .. } => parts.iter().map(|p| (p.role.as_str(), p.at())).collect(),
         }
     }
 }
@@ -225,6 +257,7 @@ pub struct Location {
 /// One stored part of an encoded tensor.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Part {
+    pub role: String,
     pub dtype: Dtype,
     pub shape: Vec<u64>,
     pub chunk: u64,
@@ -262,38 +295,7 @@ impl TryFrom<HeaderWire> for Header {
     type Error = Error;
     fn try_from(w: HeaderWire) -> Result<Self> {
         check_format(&w.format, HEADER_FORMAT)?;
-        let header = Header {
-            chunks: w.chunks,
-            components: w.components,
-            metadata: w.metadata,
-        };
-        for (name, component) in &header.components {
-            if !segment(name) {
-                return invalid(format!(
-                    "component name {name:?} is not one plain path segment"
-                ));
-            }
-            for (key, t) in &component.tensors {
-                if key.is_empty() {
-                    return invalid(format!("component {name:?} has an empty tensor key"));
-                }
-                let at = |what: &str| format!("{name}/{key}{what}");
-                match &t.body {
-                    Body::Data(loc) => header.check(loc, &t.dtype, &t.shape, &at(""))?,
-                    Body::Encoded { parts, .. } => {
-                        for (role, p) in parts {
-                            header.check(
-                                &p.at(),
-                                &p.dtype,
-                                &p.shape,
-                                &at(&format!(" part {role}")),
-                            )?;
-                        }
-                    }
-                }
-            }
-        }
-        Ok(header)
+        Header::new(w.chunks, w.components, w.metadata)
     }
 }
 
@@ -309,6 +311,54 @@ impl From<Header> for HeaderWire {
 }
 
 impl Header {
+    /// A header with `components` in the given (construction) order. Refuses repeated names,
+    /// keys or roles, and locations outside `chunks`.
+    pub fn new(
+        chunks: Vec<ObjectRef>,
+        components: Vec<Component>,
+        metadata: Metadata,
+    ) -> Result<Header> {
+        let mut header = Header {
+            chunks,
+            components: Vec::new(),
+            metadata,
+            index: HashMap::new(),
+        };
+        for (ci, component) in components.iter().enumerate() {
+            let name = &component.name;
+            if !segment(name) {
+                return invalid(format!(
+                    "component name {name:?} is not one plain path segment"
+                ));
+            }
+            let mut keys = HashMap::with_capacity(component.tensors.len());
+            for (ti, t) in component.tensors.iter().enumerate() {
+                let key = &t.key;
+                if key.is_empty() || keys.insert(key.clone(), ti).is_some() {
+                    return invalid(format!("component {name:?}: tensor key {key:?} is empty or repeated"));
+                }
+                let at = |what: &str| format!("{name}/{key}{what}");
+                match &t.body {
+                    Body::Data(loc) => header.check(loc, &t.dtype, &t.shape, &at(""))?,
+                    Body::Encoded { parts, .. } => {
+                        for (i, p) in parts.iter().enumerate() {
+                            let role = &p.role;
+                            if role.is_empty() || parts[..i].iter().any(|o| &o.role == role) {
+                                return invalid(format!("{}: part role {role:?} is empty or repeated", at("")));
+                            }
+                            header.check(&p.at(), &p.dtype, &p.shape, &at(&format!(" part {role}")))?;
+                        }
+                    }
+                }
+            }
+            if header.index.insert(name.clone(), (ci, keys)).is_some() {
+                return invalid(format!("component {name:?} is repeated"));
+            }
+        }
+        header.components = components;
+        Ok(header)
+    }
+
     pub fn from_json(bytes: &[u8]) -> Result<Header> {
         json::read(bytes, HEADER_FORMAT)
     }
@@ -316,8 +366,25 @@ impl Header {
         json::write(self)
     }
 
+    /// The components, in construction order.
+    pub fn components(&self) -> &[Component] {
+        &self.components
+    }
+
+    pub fn component(&self, name: &str) -> Option<&Component> {
+        self.index.get(name).map(|(i, _)| &self.components[*i])
+    }
+
     pub fn tensor(&self, component: &str, key: &str) -> Option<&Tensor> {
-        self.components.get(component)?.tensors.get(key)
+        let (ci, keys) = self.index.get(component)?;
+        Some(&self.components[*ci].tensors[*keys.get(key)?])
+    }
+
+    /// Every tensor with its component's name, in construction order.
+    pub fn tensors(&self) -> impl Iterator<Item = (&str, &Tensor)> {
+        self.components
+            .iter()
+            .flat_map(|c| c.tensors.iter().map(move |t| (c.name.as_str(), t)))
     }
 
     /// The per-chunk spans of a location that [`Header::from_json`] accepted.
@@ -373,15 +440,15 @@ impl Header {
             Body::Data(at) => self.bytes(at, &mut chunk),
             Body::Encoded { encoding, parts } => {
                 let bytes = parts
-                    .values()
+                    .iter()
                     .map(|p| self.bytes(&p.at(), &mut chunk))
                     .collect::<Result<Vec<_>>>()?;
                 let views = parts
                     .iter()
                     .zip(&bytes)
-                    .map(|((role, p), b)| {
+                    .map(|(p, b)| {
                         (
-                            role.as_str(),
+                            p.role.as_str(),
                             PartBytes {
                                 dtype: &p.dtype,
                                 shape: &p.shape,

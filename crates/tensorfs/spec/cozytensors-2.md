@@ -55,17 +55,22 @@ or more segments joined by `/`.
 ## 4. Header
 
 ```
-{format: "cozytensors/2", chunks: [object-ref], components: {name: {tensors: {key: tensor}}}, metadata?}
+{format: "cozytensors/2", chunks: [object-ref], components: [{name, tensors: [tensor]}], metadata?}
 ```
 
-- Component names MUST be segments (they name folders on export). Tensor keys MUST be non-empty; they are the
-  state-dict names within the component.
-- A **tensor** has a logical `dtype` (§5) and `shape` (a list of non-negative integers; `[]` is a scalar), and
-  exactly one body:
+- **Construction order is data.** `components`, each component's `tensors` and each encoded tensor's `parts` are
+  arrays in construction order: the order in which the model builds and fills them (its `state_dict()` order). The
+  order is part of the header's bytes, so reordering changes its digest. A writer MUST take the order from its
+  producer (a converter's rows, a base checkpoint, a source's constructor order) and MUST NOT sort names. Readers
+  iterate in this order and look names up through an index.
+- Component `name`s MUST be segments (they name folders on export) and unique. Tensor `key`s MUST be non-empty and
+  unique within their component; they are the state-dict names within the component.
+- A **tensor** has a `key`, a logical `dtype` (§5) and `shape` (a list of non-negative integers; `[]` is a scalar),
+  and exactly one body:
   - **plain**: `data`, a location of its bytes; or
-  - **encoded**: `encoding: {scheme, params?}` with a non-empty scheme name, and a non-empty map
-    `parts: {role: part}` with non-empty roles (§6).
-- A **part** is `{dtype, shape, chunk, offset, length}`: the part's own dtype and shape, and its location.
+  - **encoded**: `encoding: {scheme, params?}` with a non-empty scheme name, and a non-empty array `parts` (§6).
+- A **part** is `{role, dtype, shape, chunk, offset, length}`: a non-empty role unique within the tensor, the part's
+  own dtype and shape, and its location.
 - A **location** `{chunk, offset, length}` names bytes in the chunks. `chunk` indexes `chunks`. The range starts at
   `offset` in that chunk and, when `length` exceeds the rest of the chunk, continues at offset 0 of the following
   chunks in list order.
@@ -233,8 +238,7 @@ Whitespace between tokens is allowed.
 Readers need only locations. Writers SHOULD lay tensors out by this rule, which keeps objects few (16–64 MiB),
 shares unchanged large tensors between lanes, and aligns every part for direct I/O:
 
-1. **Order.** Components by name; within a component, parts in execution order: the writer's explicit order, or
-   natural order of tensor keys (text runs compared by bytes, ASCII digit runs by value, ties by bytes), then role.
+1. **Order.** Parts in header order (components, their tensors, each tensor's parts); the layout never reorders.
 2. **Standalone.** A part of 16 MiB (2^24 bytes) or more is its own chunk(s), split every 64 MiB from its first byte.
    Its objects depend only on its bytes, so an unchanged large tensor dedupes across lanes and versions.
 3. **Packs.** Smaller parts are packed in order, each at a 4 KiB-aligned offset (zero padding). The open pack closes
@@ -246,3 +250,17 @@ shares unchanged large tensors between lanes, and aligns every part for direct I
 4. Chunks never span components. Zero-length parts take no space.
 
 The chunk concatenation is not a safetensors file (padding); export rebuilds one.
+
+**Construction order of an import.** A writer that converts with a table takes the table's row order, which its
+generator took from the target model's `state_dict()`. A source already in the canonical layout (a Diffusers or
+Transformers folder) carries no order, since safetensors files sort their keys; a writer orders it by a reference:
+the `state_dict()` order of the constructed model class, generated and checked in as data
+(`crates/tensorfs-core/converters/orders.json`). It applies the reference structurally:
+
+- a key is a path of dot-separated segments; a segment made only of digits is an index;
+- children of one parent come in the order the reference shows children of the same parent pattern (indices
+  written `#`), and indices ascend;
+- a child the reference never shows keeps the source's data order after the known ones.
+
+The reference is the one whose patterns cover the most of the source's keys. A source no reference covers is stored
+in its data order.

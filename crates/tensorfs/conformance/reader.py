@@ -155,16 +155,26 @@ def parse_location(v: dict, dtype, shape, chunks, what) -> dict:
     return loc
 
 
+def named(items, field_name: str, what: str) -> list:
+    """An array of objects, each named by `field_name`, with no name repeated."""
+    need(isinstance(items, list) and all(isinstance(x, dict) for x in items), f"{what} is not an array of objects")
+    names = [field(x, field_name, str) for x in items]
+    need(len(set(names)) == len(names), f"a repeated {field_name} in {what}")
+    return items
+
+
 def parse_header(data: bytes) -> dict:
+    """Components, tensors and parts as dicts, which keep the header's (construction) order."""
     doc = load(data, HEADER)
     chunks = [object_ref(c) for c in field(doc, "chunks", list)]
     components = {}
-    for name, comp in field(doc, "components", dict).items():
+    for comp in named(field(doc, "components", list), "name", "components"):
+        name = comp["name"]
         need(segment(name), f"bad component name {name!r}")
-        need(isinstance(comp, dict), "a component is not an object")
         tensors = {}
-        for key, t in field(comp, "tensors", dict).items():
-            need(key != "" and isinstance(t, dict), f"bad tensor {key!r}")
+        for t in named(field(comp, "tensors", list), "key", f"{name} tensors"):
+            key = t["key"]
+            need(key != "", f"{name}: an empty tensor key")
             dtype, shape = field(t, "dtype", str), field(t, "shape", list)
             byte_len(dtype, shape)
             data_, enc, parts = t.get("data"), t.get("encoding"), t.get("parts")
@@ -172,13 +182,14 @@ def parse_header(data: bytes) -> dict:
             if data_ is not None and enc is None and parts is None:
                 need(isinstance(data_, dict), "data is not an object")
                 out["data"] = parse_location(data_, dtype, shape, chunks, f"{name}/{key}")
-            elif data_ is None and isinstance(enc, dict) and isinstance(parts, dict) and parts:
+            elif data_ is None and isinstance(enc, dict) and isinstance(parts, list) and parts:
                 scheme = field(enc, "scheme", str)
                 need(scheme != "", "empty scheme")
                 out["encoding"] = {"scheme": scheme, "params": field(enc, "params", dict, optional=True)}
                 out["parts"] = {}
-                for role, p in parts.items():
-                    need(role != "" and isinstance(p, dict), f"bad part {role!r}")
+                for p in named(parts, "role", f"{name}/{key} parts"):
+                    role = p["role"]
+                    need(role != "", f"{name}/{key}: an empty role")
                     pd, ps = field(p, "dtype", str), field(p, "shape", list)
                     loc = parse_location(p, pd, ps, chunks, f"{name}/{key} part {role}")
                     out["parts"][role] = {"dtype": pd, "shape": ps, **loc}
@@ -399,6 +410,14 @@ def check(vectors: Path) -> int:
                     failures.append(f"{lane}:{comp}/{key}")
         missing = [k for k in cases if k[0] == lane and k[2] not in header["components"].get(k[1], {})]
         failures += [f"{lane}:{c}/{k} missing from the store" for _, c, k in missing]
+        # Order is data: components by first appearance, tensors and parts as cases.json lists them.
+        want = [(c, k, [p["role"] for p in case.get("parts", [])]) for (ln, c, k), case in cases.items() if ln == lane]
+        want = [w for comp in dict.fromkeys(c for c, _, _ in want) for w in want if w[0] == comp]
+        got = [(c, k, list(t.get("parts", {}))) for c, ts in header["components"].items() for k, t in ts.items()]
+        ok = got == want
+        passed += ok
+        if not ok:
+            failures.append(f"{lane}: header order differs from cases.json")
     parsers = {"header": parse_header, "manifest": parse_manifest, "repo": parse_repo}
     for verdict in ("green", "red"):
         for path in sorted((vectors / verdict).glob("*.json")):

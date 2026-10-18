@@ -12,7 +12,7 @@ use std::process::{ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
-use tensorfs_core::format::layout::{self, Item, Order, ALIGN, STANDALONE};
+use tensorfs_core::format::layout::{self, Item, ALIGN, STANDALONE};
 use tensorfs_core::format::{decode, Body, Dtype, Encoding, Location, ObjectRef, PartBytes, Value};
 use tensorfs_core::import::{self, source::SourceSet, Access, Request};
 use tensorfs_core::store2::{fault, Checkpoint, Store};
@@ -82,35 +82,14 @@ fn blobs(store: &Store) -> BTreeSet<String> {
     found
 }
 
-/// The checkpoint's layout is what the planner makes of its parts: in `order` when given
-/// (component, key), else in natural order.
-fn assert_layout(ck: &Checkpoint, order: Option<&[(&str, &str)]>) {
+/// The checkpoint's layout is what the planner makes of its parts in header order.
+fn assert_layout(ck: &Checkpoint) {
     let mut parts: Vec<(&str, &str, &str, Location)> = Vec::new();
-    for (component, key, t) in ck.tensors() {
-        match &t.body {
-            Body::Data(at) => parts.push((component, key, "", *at)),
-            Body::Encoded { parts: p, .. } => {
-                parts.extend(p.iter().map(|(r, p)| (component, key, r.as_str(), p.at())))
-            }
+    for (component, t) in ck.tensors() {
+        for (role, at) in t.locations() {
+            parts.push((component, &t.key, role, at));
         }
     }
-    let how = match order {
-        None => Order::Natural,
-        Some(order) => {
-            let rank = |c: &str, k: &str| order.iter().position(|o| *o == (c, k));
-            parts.sort_by(|x, y| {
-                (x.0.cmp(y.0))
-                    .then_with(|| {
-                        rank(x.0, x.1)
-                            .unwrap_or(usize::MAX)
-                            .cmp(&rank(y.0, y.1).unwrap_or(usize::MAX))
-                    })
-                    .then_with(|| layout::natural_cmp(x.1, y.1))
-                    .then_with(|| x.2.cmp(y.2))
-            });
-            Order::Given
-        }
-    };
     let items: Vec<Item> = parts
         .iter()
         .map(|(component, key, role, at)| Item {
@@ -120,11 +99,16 @@ fn assert_layout(ck: &Checkpoint, order: Option<&[(&str, &str)]>) {
             length: at.length,
         })
         .collect();
-    let plan = layout::plan(&items, how);
+    let plan = layout::plan(&items);
     let lengths: Vec<u64> = ck.header().chunks.iter().map(|c| c.length).collect();
     assert_eq!(plan.chunks, lengths, "chunk lengths");
     let written: Vec<Location> = parts.iter().map(|p| p.3).collect();
     assert_eq!(plan.places, written, "part locations");
+}
+
+/// The checkpoint's (component, key) pairs in header order.
+fn header_order(ck: &Checkpoint) -> Vec<(String, String)> {
+    ck.tensors().map(|(c, t)| (c.to_owned(), t.key.clone())).collect()
 }
 
 // --------------------------------------------------------------- a tiny HF SDXL, end to end
@@ -208,7 +192,7 @@ fn a_tiny_hf_sdxl_imports_and_reads_back_bit_identical() {
     ] {
         assert!(ck.manifest().files.contains_key(file), "{file}");
     }
-    assert_layout(&ck, None);
+    assert_layout(&ck);
     // Reimporting resumes nothing and lands on the same checkpoint.
     assert_eq!(store.import(&request, None).unwrap(), id);
 }
@@ -250,7 +234,7 @@ fn copy_and_a_base_share_the_large_parts_objects() {
     w.file("transformer/config.json", b"{\"layers\":3}")
         .unwrap();
     let a = store.checkpoint(&w.commit().unwrap()).unwrap();
-    assert_layout(&a, None);
+    assert_layout(&a);
     for (component, key, bytes) in &a_tensors {
         assert!(
             a.read(component, key).unwrap() == *bytes,
@@ -314,7 +298,7 @@ fn copy_and_a_base_share_the_large_parts_objects() {
     w.file("transformer/config.json", b"{\"layers\":3}")
         .unwrap();
     let b = store.checkpoint(&w.commit().unwrap()).unwrap();
-    assert_layout(&b, None);
+    assert_layout(&b);
 
     // Design §3's accounting: the share of B's chunk bytes that are objects of A.
     let (a_chunks, b_chunks) = (chunk_set(&a), chunk_set(&b));
@@ -390,7 +374,7 @@ fn copy_and_a_base_share_the_large_parts_objects() {
         "base tensors are not written"
     );
     let c = store.checkpoint(&w.commit().unwrap()).unwrap();
-    assert_layout(&c, None);
+    assert_layout(&c);
     assert_eq!(
         c.manifest().files["transformer/config.json"],
         a.manifest().files["transformer/config.json"]
@@ -427,7 +411,16 @@ fn copy_and_a_base_share_the_large_parts_objects() {
     let mut w = store.writer(Some(a.id()), None).unwrap();
     w.set_order(&order);
     let d = store.checkpoint(&w.commit().unwrap()).unwrap();
-    assert_layout(&d, Some(&order));
+    assert_layout(&d);
+    let head: Vec<(String, String)> = (order.iter())
+        .map(|(c, k)| (c.to_string(), k.to_string()))
+        .collect();
+    let d_order = header_order(&d);
+    assert_eq!(d_order[..2], head[..], "set_order's tensors come first, in its order");
+    let others: Vec<_> = (header_order(&a).into_iter())
+        .filter(|t| !head.contains(t))
+        .collect();
+    assert_eq!(d_order[2..], others[..], "the rest keep the base's order");
     assert_ne!(d.header().chunks, a.header().chunks);
 }
 
@@ -445,7 +438,7 @@ fn a_merged_plan_fills_a_buffer_with_o_direct() {
     let wanted: Vec<(&str, &str)> = ck
         .tensors()
         .filter(|t| t.0 == "transformer")
-        .map(|t| (t.0, t.1))
+        .map(|(c, t)| (c, t.key.as_str()))
         .collect();
     let plan = ck.plan(&wanted).unwrap();
     let touched: BTreeSet<usize> = plan.reads.iter().map(|r| r.chunk).collect();
@@ -653,7 +646,7 @@ fn a_writer_killed_mid_write_resumes_to_the_uninterrupted_checkpoint() {
         "the same checkpoint, byte for byte"
     );
     let ck = store.checkpoint(&resumed).unwrap();
-    assert_layout(&ck, None);
+    assert_layout(&ck);
     for (key, bytes) in kill_model() {
         assert!(ck.read("unet", &key).unwrap() == bytes, "{key}");
     }

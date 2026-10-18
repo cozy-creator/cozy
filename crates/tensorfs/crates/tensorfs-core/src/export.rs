@@ -22,7 +22,6 @@ use serde_json::{json, Map, Value as Json};
 
 use crate::client::io;
 use crate::failure::{fail, Kind, Result};
-use crate::format::layout::natural_cmp;
 use crate::format::{decode, Body, Dtype, Location, PartBytes, HEADER_PATH};
 use crate::store2::Checkpoint;
 
@@ -78,7 +77,8 @@ pub fn safetensors(ck: &Checkpoint, dir: &Path, dequantize: Option<&Dtype>) -> R
         fs::write(&dest, ck.file(path)?).map_err(|e| io(&dest, e))?;
         written.push(path.clone());
     }
-    for (component, c) in &ck.header().components {
+    for c in ck.header().components() {
+        let component = &c.name;
         let in_folder = index.contains_key(component)
             || files
                 .keys()
@@ -88,12 +88,11 @@ pub fn safetensors(ck: &Checkpoint, dir: &Path, dequantize: Option<&Dtype>) -> R
         } else {
             (String::new(), component.clone())
         };
-        let mut keys: Vec<&String> = c.tensors.keys().collect();
-        keys.sort_by(|a, b| natural_cmp(a, b));
+        // Header (construction) order, which is also the order of the files' data.
         let mut entries = Vec::new();
         let mut encodings = Map::new();
-        for key in keys {
-            let t = &c.tensors[key];
+        for t in &c.tensors {
+            let key = &t.key;
             match (&t.body, dequantize) {
                 (Body::Data(at), _) => entries.push(Entry {
                     name: key.clone(),
@@ -122,16 +121,16 @@ pub fn safetensors(ck: &Checkpoint, dir: &Path, dequantize: Option<&Dtype>) -> R
                 }
                 (Body::Encoded { encoding, parts }, None) => {
                     let names: Map<String, Json> = parts
-                        .keys()
-                        .map(|role| (role.clone(), Json::from(part_name(key, role))))
+                        .iter()
+                        .map(|p| (p.role.clone(), Json::from(part_name(key, &p.role))))
                         .collect();
                     encodings.insert(
                         key.clone(),
                         json!({"scheme": encoding.scheme, "params": encoding.params, "parts": names}),
                     );
-                    for (role, p) in parts {
+                    for p in parts {
                         entries.push(Entry {
-                            name: part_name(key, role),
+                            name: part_name(key, &p.role),
                             dtype: p.dtype.clone(),
                             shape: p.shape.clone(),
                             length: p.length,
@@ -296,7 +295,7 @@ fn decode_as(ck: &Checkpoint, component: &str, key: &str, dtype: &Dtype) -> Resu
         unreachable!("only encoded tensors are decoded")
     };
     let bytes = parts
-        .values()
+        .iter()
         .map(|p| {
             let mut buf = vec![0; p.length as usize];
             ck.bytes_into(&p.at(), &mut buf).map(|()| buf)
@@ -305,13 +304,13 @@ fn decode_as(ck: &Checkpoint, component: &str, key: &str, dtype: &Dtype) -> Resu
     let views = parts
         .iter()
         .zip(&bytes)
-        .map(|((role, p), b)| {
+        .map(|(p, b)| {
             let view = PartBytes {
                 dtype: &p.dtype,
                 shape: &p.shape,
                 bytes: b,
             };
-            (role.as_str(), view)
+            (p.role.as_str(), view)
         })
         .collect();
     Ok(decode(dtype, &t.shape, encoding, &views)?)
