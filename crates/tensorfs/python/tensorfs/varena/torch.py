@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import gc
 import threading
+import time
 import traceback
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -32,7 +33,7 @@ from torch.utils._pytree import tree_map_only
 
 import tensorfs
 
-from . import DeviceFull, Gpu, Host, Pinned, WeightSet
+from . import DeviceFull, Gpu, Host, Ledger, Pinned, Row, WeightSet
 
 #: Regions are cut only at block boundaries: one per block, plus each run of common tensors.
 _WHOLE = 1 << 62
@@ -415,8 +416,10 @@ class Memory:
 
     def __init__(self, gpus: Sequence[int], ledger: Sequence[LedgerGrant], mode: Mode) -> None:
         self.mode = mode
-        self.ledger = tuple(ledger)
         self.gpus = {gpu: Gpu(gpu) for gpu in gpus}
+        #: this process's device bytes outside torch and the weights (its CUDA context)
+        self.context = 0
+        self.last_use = 0
         self.host: Host | None = None
         self.models: dict[str, Model] = {}
         self.caches: dict[Cache, None] = {}
@@ -426,6 +429,15 @@ class Memory:
         self.ended: list[RequestStats] = []
         self.clock = 0
         self.evictions = 0
+        #: each GPU's ledger and this process's row in it, held for the process's life (§5.6)
+        self.rows: dict[int, tuple[Ledger, Row]] = {}
+        for grant in ledger:
+            table = Ledger.adopt(grant.fd)
+            row = table.claim()
+            self.rows[grant.gpu] = (table, row)
+            threading.Thread(
+                target=self._answer, args=(grant.gpu, row), name="varena-ledger", daemon=True
+            ).start()
 
     @classmethod
     def open(
@@ -510,7 +522,9 @@ class Memory:
             model.uses += 1
             self.clock += 1
             model.last_use = self.clock
+            self.last_use = time.monotonic_ns()
         self._enter(model.common)
+        self._publish(model.gpu)
 
     def _close_use(self, model: Model) -> None:
         self._exit(model.common)
@@ -518,6 +532,7 @@ class Memory:
             model.uses -= 1
             if model.uses == 0 and model.seen:
                 self._step(model)
+        self._publish(model.gpu)
 
     def _plan(self, model: Model, repeats: bool) -> None:
         """The watermark as a model's use opens, from its measured reserve. A repeating model is
@@ -686,6 +701,9 @@ class Memory:
             freed += self._evict(model, why, 2)
             if _free(gpu) >= target:
                 return True
+        freed += self._ask(gpu, target)
+        if _free(gpu) >= target:
+            return True
         hot = [m for m in self.models.values() if m.gpu == gpu and m.uses and not m.held]
         for model in sorted(hot, key=lambda m: (m is asking, m.kept, m.last_use)):
             while model.home and _free(gpu) < target:
@@ -711,8 +729,58 @@ class Memory:
         return freed
 
     def _cold(self, gpu: int) -> list[Model]:
-        cold = [m for m in self.models.values() if m.gpu == gpu and not m.uses and not m.held]
+        cold = [m for m in list(self.models.values()) if m.gpu == gpu and not m.uses and not m.held]
         return sorted(cold, key=lambda m: (m.kept, m.last_use))
+
+    def _ask(self, gpu: int, target: int) -> int:
+        """Rung 2 across processes: the ledger asks other rows for their cold bytes, each
+        evicting in its own process, and this waits for every answer (or death)."""
+        held = self.rows.get(gpu)
+        if held is None:
+            return 0
+        table, row = held
+        before = _free(gpu)
+        for victim in table.ask(target - before, row.id):
+            table.wait(victim)
+        return max(_free(gpu) - before, 0)
+
+    def _answer(self, gpu: int, row: Row) -> None:
+        """Another process's ask of this row: idle bytes and cold weights go, the facts are
+        published, then the ask is acked. It takes no lock: pages in use are pinned, and a
+        model a use opens meanwhile only refaults."""
+        with torch.cuda.device(gpu):
+            while True:
+                want = row.wait_want()
+                freed = self._idle(gpu, _free(gpu) + want, None)
+                for model in self._cold(gpu):
+                    if freed >= want:
+                        break
+                    freed += self._evict(model, "asked", 2)
+                self._publish(gpu)
+                row.ack(freed)
+
+    def _publish(self, gpu: int) -> None:
+        """This row's facts: at use boundaries, request ends and after an ask (§5.6)."""
+        held = self.rows.get(gpu)
+        if held is None:
+            return
+        models = [m for m in list(self.models.values()) if m.gpu == gpu]
+        resident = {m.name: _resident(m) for m in models}
+        cold = [m for m in models if not m.uses and not m.held]
+        reserved, allocated = torch.cuda.memory_reserved(gpu), torch.cuda.memory_allocated(gpu)
+        held[1].publish(
+            context=self.context,
+            resident=sum(resident.values()),
+            cold=sum(resident[m.name] for m in cold),
+            kept=sum(resident[m.name] for m in cold if m.kept),
+            pinned=sum(resident[m.name] for m in models if m.uses or m.held),
+            torch_reserved=reserved,
+            torch_allocated=allocated,
+            cache=sum(c.nbytes for c in list(self.caches) if c.gpu == gpu),
+            idle=reserved - allocated,
+            active_peak=torch.cuda.max_memory_allocated(gpu) if self._in_request(gpu) else 0,
+            last_use=self.last_use,
+        )
 
     def _evict(self, model: Model, why: str, rung: int) -> int:
         freed = int(model.ws.evict(None))
@@ -851,6 +919,8 @@ class Memory:
             for gpu in request.gpus:
                 if not self._in_request(gpu):
                     self._restore(gpu)
+        for gpu in request.gpus:
+            self._publish(gpu)
 
     def _restore(self, gpu: int) -> None:
         """After the last request on `gpu`: each model's reserve is what that request measured;
