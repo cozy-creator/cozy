@@ -315,7 +315,7 @@ impl Service {
         let entry = interface["entrypoints"].as_array()
             .and_then(|rows| rows.iter().find(|row| row["name"] == invocation.entrypoint.as_str()))
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "this application declares no such entrypoint"))?;
-        Ok(self.pool().map_or(0, |pool| pool.degree(entry, invocation.gpus)))
+        self.pool().map_or(Ok(0), |pool| pool.degree(entry, invocation.gpus))
     }
     fn retain(&self, record: &Execution, hold: Arc<File>) {
         if !record.state.terminal() {

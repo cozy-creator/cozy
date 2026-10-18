@@ -940,16 +940,13 @@ impl Pool {
         if degree == 0 {
             return Ok(&[]);
         }
-        let wanted = degree as usize;
-        self.devices.get(start..start + wanted).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::Unsupported,
-                format!(
-                    "gpu_count_unavailable: a {wanted}-GPU group on a machine with {} GPU(s)",
-                    self.devices.len()
-                ),
-            )
-        })
+        self.devices.get(start..start + degree as usize).ok_or_else(|| self.unavailable(degree))
+    }
+    fn unavailable(&self, wanted: u32) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("gpu_count_unavailable: {wanted} GPUs asked of a machine with {}", self.devices.len()),
+        )
     }
     fn lane_devices(&self, start: usize, degree: u32) -> io::Result<String> {
         Ok(self
@@ -1431,18 +1428,20 @@ impl Pool {
 
     /// A call's degree as its declaration and this machine set it: 0 for `accelerator=False`
     /// or a machine with no GPU, else its constructed slots' group, or the GPUs a call that
-    /// constructs nothing asks for (one by default).
-    pub fn degree(&self, entry: &serde_json::Value, wanted: u32) -> u32 {
+    /// constructs nothing asks for (one by default); more than the machine has is refused.
+    pub fn degree(&self, entry: &serde_json::Value, wanted: u32) -> io::Result<u32> {
         let models = entry.get("models").and_then(serde_json::Value::as_array).cloned().unwrap_or_default();
         let constructed: Vec<_> = models.into_iter().filter(constructed).collect();
-        match entry.get("accelerator").and_then(serde_json::Value::as_bool) {
+        Ok(match entry.get("accelerator").and_then(serde_json::Value::as_bool) {
             Some(false) => 0,
             _ if self.devices.is_empty() => 0,
-            // It constructs nothing (a script): the GPUs it asks for, held by its one process. A
-            // count wider than the machine is refused at its lane (`gpu_count_unavailable`).
+            _ if constructed.is_empty() && wanted as usize > self.devices.len() => {
+                return Err(self.unavailable(wanted))
+            }
+            // It constructs nothing (a script): the GPUs it asks for, held by its one process.
             _ if constructed.is_empty() => wanted.max(1),
             _ => group_degree(&constructed, wanted, self.devices.len()),
-        }
+        })
     }
 
     /// Derive each model slot's binding from the installed SDK's real static interface and
@@ -1508,7 +1507,7 @@ impl Pool {
                 ));
             }
         }
-        let degree = self.degree(entry, degree);
+        let degree = self.degree(entry, degree)?;
         let (mut planned, mut sources) = (vec![], vec![]);
         for (model, (path, parameter)) in models.iter().zip(&slots) {
             let class = model
