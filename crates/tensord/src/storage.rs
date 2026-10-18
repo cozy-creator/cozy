@@ -1,4 +1,4 @@
-//! The machine's one store (TensorFS v2) and TensorD's policy over it: what is pinned and under
+//! The machine's one TensorFS store and TensorD's policy over it: what is pinned and under
 //! which name, how much disk is kept back, and when pinned caches expire or give way.
 //!
 //! - Pins are the one retention record. Their ids are `<kind>-<name>` ([`pin`]): run objects,
@@ -60,8 +60,17 @@ pub mod pin {
 
 /// Opens (or creates) the machine store at `root`.
 pub fn open(root: &Path) -> io::Result<Arc<Store>> {
-    Store::open(root).map(Arc::new).map_err(io_error)
+    Store::open(root).map(Arc::new).map_err(|error| match root.join(PRE_CUT_CATALOG).exists() {
+        true => io::Error::new(io::ErrorKind::InvalidData, format!(
+            "{}: this store predates TensorFS 0.12's format cut and isn't read by this release; published models re-pull into a fresh store; local models need the one-time `migrate`",
+            root.display()
+        )),
+        false => io_error(error),
+    })
 }
+
+/// The catalog at the root of a store from before TensorFS 0.12's format cut.
+const PRE_CUT_CATALOG: &str = "tensorfs.sqlite";
 
 pub fn io_error(error: tensorfs_core::store2::Error) -> io::Error {
     let kind = match &error {
@@ -258,5 +267,18 @@ pub fn check_digest(what: &str, text: &str, prefixed: bool) -> io::Result<()> {
     match hex.is_some_and(|h| h.len() == 64 && h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))) {
         true => Ok(()),
         false => Err(io::Error::new(io::ErrorKind::InvalidInput, format!("{what}: {text:?} is not a sha256 digest"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_store_from_before_the_format_cut_is_refused_with_what_to_do() {
+        let root = std::env::temp_dir().join(format!("tensord-pre-cut-store-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("blobs")).unwrap();
+        std::fs::write(root.join(super::PRE_CUT_CATALOG), b"").unwrap();
+        let Err(refused) = super::open(&root) else { panic!("a store from before the cut is not opened") };
+        assert!(refused.to_string().contains("this store predates TensorFS 0.12's format cut and isn't read by this release"), "{refused}");
+        let _ = std::fs::remove_dir_all(root);
     }
 }
