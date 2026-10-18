@@ -11,8 +11,8 @@ use base64::Engine;
 use serde::Deserialize;
 use tensorfs_core::format::layout::{self, Item, Order};
 use tensorfs_core::format::{
-    Body, Component, Dtype, Encoding, Error, Header, Location, Manifest, ObjectRef, Part, Release,
-    Repo, Tensor, HEADER_PATH,
+    repo_key, Body, Component, Dtype, Encoding, Error, Header, Location, Manifest, ObjectRef, Part,
+    Release, Repo, Tensor, HEADER_PATH,
 };
 
 #[derive(Deserialize)]
@@ -61,7 +61,7 @@ fn cases() -> Vec<Case> {
     c.cases
 }
 
-const REPO: &str = "conformance/schemes";
+const REPO: &str = "Conformance/Schemes";
 const LICENSE: &[u8] = b"MIT\n";
 
 /// Every file of the store, by path, as the Rust writer produces it from `cases.json`.
@@ -249,7 +249,9 @@ fn blob(root: &Path, r: &ObjectRef) -> Vec<u8> {
 #[test]
 fn reader_decodes_every_case() {
     let root = vectors().join("store");
-    let repo = Repo::from_json(&fs::read(root.join(format!("refs/{REPO}.json"))).unwrap()).unwrap();
+    assert_eq!(repo_key(REPO), "refs/conformance/schemes.json");
+    let repo = Repo::from_json(&fs::read(root.join(repo_key(REPO))).unwrap()).unwrap();
+    assert_eq!(repo.name, REPO);
     let mut checked = 0;
     for c in cases() {
         let manifest =

@@ -191,6 +191,8 @@ A plain tensor's bytes are its value; reading it is a copy, whatever its dtype.
 
 - `name` is two segments. Versions MUST be non-empty and unique; lane names MUST be non-empty. Each lane cites a
   manifest. Releases are listed in publication order; the last is the latest.
+- Repo names are case-insensitive: `Acme/SDXL` and `acme/sdxl` are one repo. Keys and paths use the name with ASCII
+  `A`–`Z` lowered (`refs/acme/sdxl.json`); the document's `name` keeps the writer's spelling.
 - A **store** or **static origin** is a directory, bucket or HTTP prefix holding `refs/<org>/<name>.json` and
   `blobs/…` (§1). A reader resolves name → release → lane → manifest → header → chunks, verifying every object.
 

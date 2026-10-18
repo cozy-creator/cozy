@@ -193,6 +193,11 @@ def parse_header(data: bytes) -> dict:
 # ------------------------------------------------------------------- store
 
 
+def repo_key(name: str) -> str:
+    """refs/<org>/<name>.json with ASCII A-Z lowered: repo names are case-insensitive."""
+    return "refs/" + "".join(chr(ord(c) + 32) if "A" <= c <= "Z" else c for c in name) + ".json"
+
+
 class Store:
     """A store or static origin on disk: blobs/<aa>/<bb>/<sha256>, refs/<org>/<name>.json."""
 
@@ -207,7 +212,7 @@ class Store:
         return data
 
     def checkpoint(self, name: str, version: str | None = None, lane: str = ""):
-        repo = parse_repo((self.root / "refs" / f"{name}.json").read_bytes())
+        repo = parse_repo((self.root / repo_key(name)).read_bytes())
         release = repo["releases"][-1] if version is None else next(
             r for r in repo["releases"] if r["version"] == version)
         manifest = parse_manifest(self.blob(release["lanes"][lane]))
@@ -380,7 +385,7 @@ def check(vectors: Path) -> int:
     cases = load_cases(vectors / "cases.json")
     store = Store(vectors / "store")
     for lane in ("all", "spans"):
-        _, header = store.checkpoint("conformance/schemes", lane=lane)
+        _, header = store.checkpoint("Conformance/Schemes", lane=lane)
         for comp, tensors in header["components"].items():
             for key in tensors:
                 case = cases.get((lane, comp, key))

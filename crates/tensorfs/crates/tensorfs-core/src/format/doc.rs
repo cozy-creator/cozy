@@ -436,6 +436,11 @@ impl Header {
     }
 }
 
+/// `refs/<org>/<name>.json`, ASCII-lowercased: repo names are case-insensitive, one identity.
+pub fn repo_key(name: &str) -> String {
+    format!("refs/{}.json", name.to_ascii_lowercase())
+}
+
 /// `tensorfs.repo/2`: a model's releases, each mapping lanes to manifests. Kept at
 /// `refs/<org>/<name>.json`; the last release is the latest.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -502,9 +507,9 @@ impl Repo {
     pub fn to_json(&self) -> Result<Vec<u8>> {
         json::write(self)
     }
-    /// The repo's key in a store or static origin.
+    /// The repo's key in a store or static origin: [`repo_key`] of its name.
     pub fn key(&self) -> String {
-        format!("refs/{}.json", self.name)
+        repo_key(&self.name)
     }
     /// A lane's manifest in `version`, or in the latest release when `version` is `None`.
     pub fn lane(&self, version: Option<&str>, lane: &str) -> Option<&ObjectRef> {

@@ -6,7 +6,7 @@ For anyone implementing [cozytensors/2](../spec/cozytensors-2.md).
 |---|---|
 | `schema/{header,manifest,repo}.schema.json` | JSON Schema (2020-12) of each document's structure. Byte lengths, bounds, duplicate keys, integer-only numbers and version uniqueness are spec rules the schema cannot express. |
 | `vectors/cases.json` | Decode cases: a tensor's parts (base64 bits) and its expected logical bytes, or the refusal code (`decode`, `unknown_scheme`). |
-| `vectors/store/` | A static origin holding those cases: `refs/conformance/schemes.json`, lane `all` (every case, laid out by the chunk rule) and lane `spans` (a range across three chunks). |
+| `vectors/store/` | A static origin holding those cases: repo `Conformance/Schemes` at `refs/conformance/schemes.json`, lane `all` (every case, laid out by the chunk rule) and lane `spans` (a range across three chunks). |
 | `vectors/green/`, `vectors/red/` | Single documents, named `<kind>-<case>.json`, that a reader must accept or refuse. |
 | `reader.py` | An independent reader (Python stdlib and numpy) with reference decoders. |
 

@@ -11,8 +11,8 @@ mod value;
 
 pub use decode::{decode, PartBytes, SCHEMES};
 pub use doc::{
-    Body, Component, Encoding, Header, Location, Manifest, Metadata, ObjectRef, Part, Release,
-    Repo, Span, Tensor,
+    repo_key, Body, Component, Encoding, Header, Location, Manifest, Metadata, ObjectRef, Part,
+    Release, Repo, Span, Tensor,
 };
 pub use dtype::Dtype;
 pub use value::Value;

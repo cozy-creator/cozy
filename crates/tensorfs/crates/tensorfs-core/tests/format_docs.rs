@@ -94,7 +94,7 @@ fn writer_is_deterministic_and_reader_round_trips() {
     assert_eq!(Manifest::from_json(&mb).unwrap().header(), m.header());
 
     let r = Repo {
-        name: "acme/tiny".into(),
+        name: "Acme/Tiny".into(),
         releases: vec![Release {
             version: "1.0".into(),
             lanes: BTreeMap::from([("bf16".into(), ObjectRef::of(&mb))]),

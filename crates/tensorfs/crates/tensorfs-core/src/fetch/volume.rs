@@ -25,7 +25,7 @@ use cozy_platform::durable::Mode;
 use super::origin::{pick, split_name, Location, Origin};
 use super::ObjectStore;
 use crate::err::{Code, Refusal, Result};
-use crate::format::ObjectRef;
+use crate::format::{repo_key, ObjectRef};
 
 /// Bytes per read or write call into the volume: each call is progress.
 pub(crate) const STEP: usize = 8 << 20;
@@ -270,13 +270,8 @@ impl Origin for VolumeOrigin {
         release: Option<&str>,
         lane: Option<&str>,
     ) -> Result<ObjectRef> {
-        let (org, model) = split_name(name)?;
-        let path = self
-            .0
-            .root
-            .join("refs")
-            .join(org)
-            .join(format!("{model}.json"));
+        split_name(name)?;
+        let path = self.0.root.join(repo_key(name));
         let read =
             tokio::task::spawn_blocking(move || fs::read(&path).map_err(|error| (path, error)))
                 .await

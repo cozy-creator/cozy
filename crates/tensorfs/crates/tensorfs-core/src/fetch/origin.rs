@@ -8,7 +8,7 @@ use async_trait::async_trait;
 
 use super::net::Client;
 use crate::err::{refuse, Code, Refusal, Result};
-use crate::format::{ObjectRef, Repo};
+use crate::format::{repo_key, ObjectRef, Repo};
 
 /// The most bytes a refs document may have.
 const REPO_BYTES: u64 = 16 << 20;
@@ -118,7 +118,7 @@ pub(crate) fn pick(
     }
 }
 
-/// A static origin over HTTP: `{base}/refs/<org>/<model>.json` and `{base}/blobs/<aa>/<bb>/<sha256>`.
+/// A static origin over HTTP: `{base}/refs/<org>/<model>.json` (lowercase) and `{base}/blobs/<aa>/<bb>/<sha256>`.
 /// Any HTTP server, bucket or repository holding that layout serves it.
 pub struct HttpOrigin {
     client: Client,
@@ -159,8 +159,8 @@ impl Origin for HttpOrigin {
         release: Option<&str>,
         lane: Option<&str>,
     ) -> Result<ObjectRef> {
-        let (org, model) = split_name(name)?;
-        let url = format!("{}/refs/{org}/{model}.json", self.base);
+        split_name(name)?;
+        let url = format!("{}/{}", self.base, repo_key(name));
         let bytes = self
             .client
             .document(&url, &self.headers(), REPO_BYTES)
