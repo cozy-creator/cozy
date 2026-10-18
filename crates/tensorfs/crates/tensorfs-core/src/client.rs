@@ -422,8 +422,9 @@ pub fn regions(header: &Header, max_bytes: u64) -> Vec<Vec<String>> {
     for c in header.components() {
         let name = |key: &str| format!("{}/{key}", c.name);
         // Groups of tensors (by index) and the chunks they use; the group each chunk is in.
-        let (mut groups, mut empty): (Vec<(Vec<usize>, BTreeSet<usize>)>, Vec<String>) =
-            (Vec::new(), Vec::new());
+        // (members by tensor index, the chunks they use)
+        let mut groups: Vec<(Vec<usize>, BTreeSet<usize>)> = Vec::new();
+        let mut empty: Vec<String> = Vec::new();
         let mut owner: HashMap<usize, usize> = HashMap::new();
         for (i, t) in c.tensors.iter().enumerate() {
             let chunks: BTreeSet<usize> = (t.locations().iter())
