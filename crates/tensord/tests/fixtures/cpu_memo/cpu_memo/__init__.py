@@ -9,11 +9,10 @@ import struct
 from pathlib import Path
 
 import msgspec
-import tensorfs
-from tensorfs.derived import Derivation, Part, Target, Tensor
 
 from cozy_runtime.author import (App, Context, FileAsset, ImageAsset, ImageFrame, ModelArtifact, Outputs, Telemetry, WeightsOutput,
                                  invocable)
+from cozy_runtime.tensord_channels import Derivation
 
 app = App()
 
@@ -121,18 +120,13 @@ def paint(ctx: Context, payload: Painting, out: Outputs) -> Painted:
 @invocable()
 async def produce(ctx: Context) -> ModelArtifact:
     """A small f16 model this package writes, for a caller to quantize."""
-    plain = dict(tensorfs.seed_digests())["plain/1"]
-    matrix = Tensor("f16", (16, 32), plain, {"value": Part("f16", (16, 32))})
-    bias = Tensor("f16", (16,), plain, {"value": Part("f16", (16,))})
-    with ctx.output("model").open(Derivation(sources={}, targets={"body": Target(
-            add={"layer.weight": matrix, "layer.bias": bias})},
-            configs={}, order=(("body", "layer.weight"), ("body", "layer.bias")))) as output:
-        if output.receipt is not None:
-            return ctx.adopt_model(output.receipt)
-        output.add_part("body", "layer.weight", "value",
-                        io.BytesIO(struct.pack("<512e", *(i / 257 - 1 for i in range(512)))))
-        output.add_part("body", "layer.bias", "value", io.BytesIO(struct.pack("<16e", *range(16))))
-        return ctx.adopt_model(output.commit())
+    output = ctx.output("model", Derivation(None, order=(("body", "layer.weight"), ("body", "layer.bias"))))
+    if not output.has("body", "layer.weight"):
+        output.put("body", "layer.weight", "F16", [16, 32],
+                   io.BytesIO(struct.pack("<512e", *(i / 257 - 1 for i in range(512)))))
+    if not output.has("body", "layer.bias"):
+        output.put("body", "layer.bias", "F16", [16], io.BytesIO(struct.pack("<16e", *range(16))))
+    return ctx.adopt_model(output)
 
 
 app.entrypoint(produce, weights=(WeightsOutput("model", max_new_bytes=65536),), accelerator=False)
