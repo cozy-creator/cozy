@@ -141,7 +141,10 @@ no host block. A region not resident is filled on demand (counted as a miss) at 
 (when given, it becomes the region's priority first) and may evict only regions strictly
 below it; when nothing can go it raises `Shortfall` (need, available, blockers). Encode LRU
 among a stage's blocks as increasing priorities (e.g. a clock). Release exactly once; a lease
-garbage-collected unreleased POISONS the plane.
+garbage-collected unreleased POISONS the plane. `release` raises only on a second call: when the
+driver refuses the event it synchronizes the stream (`release_synced`), and when that fails too
+the bytes are never served again as they are (`release_unconfirmed`: the region turns Invalid and
+refills on its next acquire; a ring slot stays held until `close()`).
 
 ## Streaming (the hot path)
 
@@ -237,7 +240,7 @@ p.events() -> [{"kind", "ws", "region", "device", "bytes", "ns", "detail"}]   # 
   syncs the device; unfinished pairs count at a later call.
 - `ws` in every row and event is the `name` given to `register`.
 - Event kinds: `fill_done`, `fill_failed`, `evicted`, `budget`, `late`, `register_failed`,
-  `exported`, `attached`, `detached`.
+  `exported`, `attached`, `detached`, `release_synced`, `release_unconfirmed`, `prefetch_failed`.
 
 ## Errors
 
