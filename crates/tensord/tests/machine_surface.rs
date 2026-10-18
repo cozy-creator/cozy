@@ -824,13 +824,17 @@ mod v1_api {
     async fn installing_machine() -> (Machine, PathBuf) {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
         let tools = std::env::temp_dir().join(format!("cm-tools-{}", uuid::Uuid::new_v4()));
-        assert!(Command::new("uv")
-            .current_dir(repo)
-            .args(["build", "--wheel", "--out-dir"])
-            .arg(&tools)
-            .status()
-            .unwrap()
-            .success());
+        // The client wheel, built once per test process (concurrent builds share the tree's
+        // egg-info and tear it), then one copy in each test's tools.
+        static CLIENT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        let client = CLIENT.get_or_init(|| {
+            let out = std::env::temp_dir().join(format!("cm-client-{}", uuid::Uuid::new_v4()));
+            assert!(Command::new("uv").current_dir(repo).args(["build", "--wheel", "--out-dir"]).arg(&out)
+                .status().unwrap().success());
+            fs::read_dir(&out).unwrap().map(|e| e.unwrap().path()).find(|p| p.extension().is_some_and(|e| e == "whl")).unwrap()
+        });
+        fs::create_dir_all(&tools).unwrap();
+        fs::copy(client, tools.join(client.file_name().unwrap())).unwrap();
         NAMED_RUNTIME.get_or_init(|| named_runtime_loads(&tools)).await;
         let machine = Machine::start_args(|_, _| (), &installing_args(&tools)).await;
         (machine, tools)

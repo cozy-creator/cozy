@@ -600,15 +600,18 @@ mod tests {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
         let root = std::env::temp_dir().join(format!("{name}-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
-        run(Command::new("uv").current_dir(repo).args(["build", "--wheel", "--out-dir"]).arg(root.join("client")));
+        // Built once per test process: concurrent builds share the tree's egg-info and tear it.
+        static CLIENT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        let client = CLIENT
+            .get_or_init(|| {
+                let out = std::env::temp_dir().join(format!("tensord-client-{}", uuid::Uuid::new_v4()));
+                run(Command::new("uv").current_dir(repo).args(["build", "--wheel", "--out-dir"]).arg(&out));
+                fs::read_dir(&out).unwrap().map(|e| e.unwrap().path()).find(|p| p.extension().is_some_and(|e| e == "whl")).unwrap()
+            })
+            .clone();
         let helper = run(Command::new("uv").current_dir(repo).args([
             "run", "--locked", "--extra", "test", "python", "-c", "import sys; print(sys.executable)",
         ]));
-        let client = fs::read_dir(root.join("client"))
-            .unwrap()
-            .map(|e| e.unwrap().path())
-            .find(|p| p.extension().is_some_and(|e| e == "whl"))
-            .unwrap();
         let state = root.join("state");
         let service = Service::open(&state, &root.join("generations"), 1).unwrap();
         let store = Arc::new(Store::ensure(&state.join("tensorfs")).unwrap());
