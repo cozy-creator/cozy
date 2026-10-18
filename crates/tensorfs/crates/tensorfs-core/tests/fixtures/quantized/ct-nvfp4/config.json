@@ -1,0 +1,28 @@
+{
+  "architectures": [
+    "Toy"
+  ],
+  "torch_dtype": "bfloat16",
+  "quantization_config": {
+    "quant_method": "compressed-tensors",
+    "format": "nvfp4-pack-quantized",
+    "quantization_status": "compressed",
+    "config_groups": {
+      "group_0": {
+        "targets": [
+          "Linear"
+        ],
+        "weights": {
+          "num_bits": 4,
+          "type": "float",
+          "strategy": "tensor_group",
+          "group_size": 16,
+          "symmetric": true,
+          "dynamic": false
+        },
+        "format": "nvfp4-pack-quantized"
+      }
+    },
+    "ignore": []
+  }
+}
