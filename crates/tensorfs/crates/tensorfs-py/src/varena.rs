@@ -251,7 +251,7 @@ impl PyPlane {
         Ok(PyWeightSet { plane: self.plane.clone(), id, name, layout })
     }
 
-    /// Register `regions` (`tensorfs.regions(ck)` when None) of a v2 checkpoint as one
+    /// Register `regions` (`tensorfs.regions(ck)` when None) of a stored checkpoint as one
     /// weight set: its header, in order, is the read plan and its chunk files the source.
     #[cfg(feature = "store")]
     #[pyo3(signature = (name, ck, regions = None, host_fd = None))]

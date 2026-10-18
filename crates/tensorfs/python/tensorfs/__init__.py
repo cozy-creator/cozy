@@ -1,4 +1,4 @@
-"""TensorFS: cozytensors/2 checkpoints in a content-addressed store (design §1).
+"""TensorFS: cozytensors/1 checkpoints in a content-addressed store (design §1).
 
     store = tensorfs.Store("~/.tensorfs")                # created when absent
     m = store.import_("hf://hf-internal-testing/tiny-sdxl-pipe")

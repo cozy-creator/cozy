@@ -134,7 +134,7 @@ class Checkpoint:
 
     @staticmethod
     def parse(header: bytes) -> Checkpoint:
-        """A `cozytensors/2` header's tensors and metadata, with no store: `read`, `file` and
+        """A `cozytensors/1` header's tensors and metadata, with no store: `read`, `file` and
         the plane's `source` refuse (`UnsupportedError`)."""
     @property
     def manifest(self) -> Manifest | None:

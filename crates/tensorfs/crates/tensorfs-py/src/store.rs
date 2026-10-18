@@ -550,7 +550,7 @@ impl PyCheckpoint {
 
 #[pymethods]
 impl PyCheckpoint {
-    /// A `cozytensors/2` header document's tensors and metadata, with no store behind them.
+    /// A `cozytensors/1` header document's tensors and metadata, with no store behind them.
     #[staticmethod]
     fn parse(py: Python<'_>, header: &[u8]) -> PyResult<PyCheckpoint> {
         let header = Header::from_json(header).or_raise(py)?;
