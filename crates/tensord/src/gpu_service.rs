@@ -1430,14 +1430,17 @@ impl Pool {
     }
 
     /// A call's degree as its declaration and this machine set it: 0 for `accelerator=False`
-    /// or a machine with no GPU, else its constructed slots' group (one GPU without any).
+    /// or a machine with no GPU, else its constructed slots' group, or the GPUs a call that
+    /// constructs nothing asks for (one by default).
     pub fn degree(&self, entry: &serde_json::Value, wanted: u32) -> u32 {
         let models = entry.get("models").and_then(serde_json::Value::as_array).cloned().unwrap_or_default();
         let constructed: Vec<_> = models.into_iter().filter(constructed).collect();
         match entry.get("accelerator").and_then(serde_json::Value::as_bool) {
             Some(false) => 0,
             _ if self.devices.is_empty() => 0,
-            _ if constructed.is_empty() => 1,
+            // It constructs nothing (a script): the GPUs it asks for, held by its one process. A
+            // count wider than the machine is refused at its lane (`gpu_count_unavailable`).
+            _ if constructed.is_empty() => wanted.max(1),
             _ => group_degree(&constructed, wanted, self.devices.len()),
         }
     }
@@ -2914,7 +2917,10 @@ impl Pool {
             session.executor.begin_request();
         }
         // Every rank of a group reads its own GPU's cap and cell (`rank_cells/1`).
-        let ranked = degree > 1;
+        // A group runs one rank per GPU; a plan that constructs nothing holds its GPUs in one
+        // process (the Runtime refuses a group without constructed models).
+        let ranks = if plan.slots.is_empty() { 1 } else { degree.max(1) };
+        let ranked = ranks > 1;
         if !session.loaded {
             session.sharing = self.degree2(&construction, start, degree, &session.executor)?;
         }
@@ -2956,7 +2962,7 @@ impl Pool {
                     devices: lane.clone(),
                     application: held.record.application.clone(),
                     package_interface: interface_path.clone(),
-                    sequence_parallel_degree: degree.max(1),
+                    sequence_parallel_degree: ranks,
                     import_only: false,
                     call_interfaces: crate::calls::call_interfaces(held, &interface_path),
                     constructions,
@@ -2967,7 +2973,7 @@ impl Pool {
                 },
                 &mut callbacks,
             )?)?;
-            if ranked && (1..degree).any(|rank| !callbacks.cells.contains_key(&rank)) {
+            if ranked && (1..ranks).any(|rank| !callbacks.cells.contains_key(&rank)) {
                 return Err(io::Error::other(Refused {
                     code: "group_unformed".into(),
                     detail: "a follower's budget cell did not reach the machine".into(),
@@ -2993,7 +2999,7 @@ impl Pool {
             session.launch.start_ms = starting.elapsed().as_secs_f64() * 1e3;
             session.launch.start =
                 serde_json::from_value(started.stages.clone()).unwrap_or_default();
-            if started.follower_pids.len() + 1 != degree.max(1) as usize {
+            if started.follower_pids.len() + 1 != ranks as usize {
                 return Err(io::Error::other(Refused {
                     code: "group_unformed".into(),
                     detail: format!(
@@ -3014,7 +3020,7 @@ impl Pool {
             for (device, pid) in gpus.iter().skip(1).zip(&started.follower_pids) {
                 device.memory.with(|gpu| gpu.spawned(&construction, *pid));
             }
-            let (load_cap, load_group) = rank_grant(load_caps);
+            let (load_cap, load_group) = rank_grant(&load_caps[..load_caps.len().min(ranks as usize)]);
             // Its pinned budget, the Load's when the executor takes it there (`load_pinned/1`).
             let plane = !plan.slots.is_empty() && session.executor.hello.offers("weight_plane/1");
             let at_load = plane && session.executor.hello.offers("load_pinned/1");
@@ -3028,7 +3034,7 @@ impl Pool {
                 None => DeviceCommand::Load {
                     construction: construction.clone(),
                     devices: lane.clone(),
-                    sequence_parallel_degree: degree.max(1),
+                    sequence_parallel_degree: ranks,
                     binding: Box::new(Binding {
                         application: held.record.application.clone(),
                         package_interface: interface_path.to_string_lossy().into_owned(),
@@ -3067,7 +3073,7 @@ impl Pool {
                     DeviceCommand::Load {
                         construction: construction.clone(),
                         devices: lane.clone(),
-                        sequence_parallel_degree: degree.max(1),
+                        sequence_parallel_degree: ranks,
                         binding: Box::new(first.binding),
                         budgets: first.budgets,
                         models,
@@ -3246,7 +3252,7 @@ impl Pool {
         // A real grant for the whole call: one tenant needs no per-stage turns.
         // A group's cap holds on every GPU of it (each rank caps its own process).
         let caps = self.decide(&construction, start, degree, false)?;
-        let (cap, group) = rank_grant(&caps);
+        let (cap, group) = rank_grant(&caps[..caps.len().min(ranks as usize)]);
         // Every executor of the cohort caps its whole process (`process_cap/1`): the plane
         // derives its budget inside the cap.
         let (plane_budget_bytes, cap_bytes) = (-1, cap);
