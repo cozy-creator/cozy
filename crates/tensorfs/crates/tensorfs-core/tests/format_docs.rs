@@ -102,7 +102,9 @@ fn writer_is_deterministic_and_reader_round_trips() {
         releases: vec![Release {
             version: "1.0".into(),
             lanes: BTreeMap::from([("bf16".into(), ObjectRef::of(&mb))]),
+            ..Default::default()
         }],
+        ..Default::default()
     };
     let rb = r.to_json().unwrap();
     assert_eq!(Repo::from_json(&rb).unwrap(), r);

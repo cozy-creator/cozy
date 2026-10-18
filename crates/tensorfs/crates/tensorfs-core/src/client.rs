@@ -59,16 +59,22 @@ fn with_lane(
 ) -> Repo {
     let mut repo = repo.unwrap_or_else(|| Repo {
         name: name.to_owned(),
-        releases: vec![],
+        ..Default::default()
     });
-    match repo.releases.iter_mut().find(|r| r.version == version) {
-        Some(release) => {
-            release.lanes.insert(lane.to_owned(), manifest.clone());
+    let origin = order.iter().find(|r| r.version == version);
+    let release = match repo.releases.iter().position(|r| r.version == version) {
+        Some(i) => &mut repo.releases[i],
+        None => {
+            repo.releases.push(Release {
+                version: version.to_owned(),
+                ..Default::default()
+            });
+            repo.releases.last_mut().expect("just pushed")
         }
-        None => repo.releases.push(Release {
-            version: version.to_owned(),
-            lanes: BTreeMap::from([(lane.to_owned(), manifest.clone())]),
-        }),
+    };
+    release.lanes.insert(lane.to_owned(), manifest.clone());
+    if let Some(origin) = origin {
+        (release.yanked, release.revision) = (origin.yanked, origin.revision);
     }
     let rank = |v: &str| {
         order

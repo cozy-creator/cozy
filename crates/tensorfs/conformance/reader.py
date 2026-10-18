@@ -138,8 +138,18 @@ def parse_repo(data: bytes) -> dict:
         seen.add(version)
         lanes = field(r, "lanes", dict)
         need("" not in lanes, "empty lane name")
-        releases.append({"version": version, "lanes": {k: object_ref(v) for k, v in lanes.items()}})
-    return {"name": name, "releases": releases}
+        releases.append({"version": version, "lanes": {k: object_ref(v) for k, v in lanes.items()},
+                         "yanked": field(r, "yanked", bool, optional=True),
+                         "revision": field(r, "revision", int, optional=True)})
+    checkpoints = [object_ref(c) for c in field(doc, "checkpoints", list, optional=True)]
+    return {"name": name, "releases": releases, "checkpoints": checkpoints}
+
+
+def release(repo: dict, version: str | None) -> dict:
+    """`version`, yanked or not; with None, the newest release that is not yanked."""
+    if version is None:
+        return next(r for r in reversed(repo["releases"]) if not r["yanked"])
+    return next(r for r in repo["releases"] if r["version"] == version)
 
 
 def parse_location(v: dict, dtype, shape, chunks, what) -> dict:
@@ -224,9 +234,7 @@ class Store:
 
     def checkpoint(self, name: str, version: str | None = None, lane: str = ""):
         repo = parse_repo((self.root / repo_key(name)).read_bytes())
-        release = repo["releases"][-1] if version is None else next(
-            r for r in repo["releases"] if r["version"] == version)
-        manifest = parse_manifest(self.blob(release["lanes"][lane]))
+        manifest = parse_manifest(self.blob(release(repo, version)["lanes"][lane]))
         return manifest, parse_header(self.blob(manifest["files"]["model.cozytensors"]))
 
 
@@ -418,6 +426,12 @@ def check(vectors: Path) -> int:
         passed += ok
         if not ok:
             failures.append(f"{lane}: header order differs from cases.json")
+    # Release 2 is yanked and swaps the lanes: only an explicit version reaches it.
+    _, yanked = store.checkpoint("Conformance/Schemes", version="2", lane="all")
+    ok = list(yanked["components"]) == ["spans"]
+    passed += ok
+    if not ok:
+        failures.append("an explicit yanked version")
     parsers = {"header": parse_header, "manifest": parse_manifest, "repo": parse_repo}
     for verdict in ("green", "red"):
         for path in sorted((vectors / verdict).glob("*.json")):

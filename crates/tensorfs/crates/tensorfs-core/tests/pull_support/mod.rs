@@ -189,7 +189,9 @@ pub fn model(origin: &Path, name: &str, components: &[(&str, &[usize])], seed: u
         releases: vec![Release {
             version: "1.0".into(),
             lanes: [("int8".to_string(), manifest_ref.clone())].into(),
+            ..Default::default()
         }],
+        ..Default::default()
     };
     let path = origin.join(repo.key());
     fs::create_dir_all(path.parent().unwrap()).unwrap();

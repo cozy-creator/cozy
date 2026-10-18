@@ -520,19 +520,35 @@ pub fn repo_key(name: &str) -> String {
     format!("refs/{}.json", name.to_ascii_lowercase())
 }
 
-/// `tensorfs.repo/2`: a model's releases, each mapping lanes to manifests. Kept at
-/// `refs/<org>/<name>.json`; the last release is the latest.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// `tensorfs.repo/2`: a model's releases, each mapping lanes to manifests, and its unreleased
+/// checkpoints. Kept at [`repo_key`]; releases are in publication order.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(try_from = "RepoWire", into = "RepoWire")]
 pub struct Repo {
     pub name: String,
     pub releases: Vec<Release>,
+    /// Uploaded checkpoints no release cites yet. GC roots, like release lanes.
+    pub checkpoints: Vec<ObjectRef>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct Release {
     pub version: String,
     pub lanes: BTreeMap<String, ObjectRef>,
+    /// Skipped by an unversioned lookup; an explicit version still resolves it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub yanked: bool,
+    /// The release's expected-revision counter: each change to it increments this.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub revision: u64,
+}
+
+fn is_false(b: &bool) -> bool {
+    !b
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -540,6 +556,8 @@ struct RepoWire {
     format: String,
     name: String,
     releases: Vec<Release>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    checkpoints: Vec<ObjectRef>,
 }
 
 impl TryFrom<RepoWire> for Repo {
@@ -565,6 +583,7 @@ impl TryFrom<RepoWire> for Repo {
         Ok(Repo {
             name: w.name,
             releases: w.releases,
+            checkpoints: w.checkpoints,
         })
     }
 }
@@ -575,6 +594,7 @@ impl From<Repo> for RepoWire {
             format: REPO_FORMAT.into(),
             name: r.name,
             releases: r.releases,
+            checkpoints: r.checkpoints,
         }
     }
 }
@@ -590,13 +610,21 @@ impl Repo {
     pub fn key(&self) -> String {
         repo_key(&self.name)
     }
-    /// A lane's manifest in `version`, or in the latest release when `version` is `None`.
+    /// Release `version`, yanked or not; with `None`, the newest release that is not yanked.
+    pub fn release(&self, version: Option<&str>) -> Option<&Release> {
+        match version {
+            Some(v) => self.releases.iter().find(|r| r.version == v),
+            None => self.releases.iter().rev().find(|r| !r.yanked),
+        }
+    }
+    /// A lane's manifest in [`Repo::release`]`(version)`.
     pub fn lane(&self, version: Option<&str>, lane: &str) -> Option<&ObjectRef> {
-        let release = match version {
-            Some(v) => self.releases.iter().find(|r| r.version == v)?,
-            None => self.releases.last()?,
-        };
-        release.lanes.get(lane)
+        self.release(version)?.lanes.get(lane)
+    }
+    /// Every manifest the repo keeps alive: each release's lanes (yanked too) and each checkpoint.
+    pub fn roots(&self) -> impl Iterator<Item = &ObjectRef> {
+        let lanes = self.releases.iter().flat_map(|r| r.lanes.values());
+        lanes.chain(&self.checkpoints)
     }
 }
 

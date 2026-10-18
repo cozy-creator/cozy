@@ -135,10 +135,8 @@ impl Store {
         };
         let mut refs = HashSet::new();
         for repo in self.refs()? {
-            for release in &repo.releases {
-                for manifest in release.lanes.values() {
-                    refs.extend(reach(manifest)?);
-                }
+            for manifest in repo.roots() {
+                refs.extend(reach(manifest)?);
             }
         }
         let mut pins = Vec::new();

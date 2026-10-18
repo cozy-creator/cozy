@@ -81,7 +81,7 @@ pub(crate) fn pick(
     Ok(choose(&repo, release, lane)?.2)
 }
 
-/// `release` of `repo` (the latest when `None`), its lane `lane` (the only one when `None`) and
+/// `release` of `repo` (the newest not yanked when `None`), its lane `lane` (the only one when `None`) and
 /// that lane's manifest.
 pub fn choose(
     repo: &Repo,
@@ -95,16 +95,16 @@ pub fn choose(
             .map(|r| r.version.as_str())
             .collect::<Vec<_>>()
     };
-    let chosen = match release {
-        Some(version) => repo.releases.iter().find(|r| r.version == version),
-        None => repo.releases.last(),
-    };
-    let Some(chosen) = chosen else {
+    let Some(chosen) = repo.release(release) else {
+        let wanted = release.unwrap_or("that is not yanked");
         return refuse(
             Code::RELEASE_ABSENT,
-            format!("{name} has no release {release:?} (has {:?})", releases()),
+            format!("{name} has no release {wanted} (has {:?})", releases()),
         );
     };
+    if chosen.yanked {
+        tracing::warn!("{name}@{} is yanked", chosen.version);
+    }
     let lanes = || chosen.lanes.keys().cloned().collect::<Vec<_>>();
     let lane = match lane {
         Some(lane) => lane.to_string(),

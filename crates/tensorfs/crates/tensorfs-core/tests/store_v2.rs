@@ -97,7 +97,9 @@ fn repo(name: &str, manifest: ObjectRef) -> Repo {
         releases: vec![Release {
             version: "1.0".into(),
             lanes: BTreeMap::from([("int8".into(), manifest)]),
+            ..Default::default()
         }],
+        ..Default::default()
     }
 }
 

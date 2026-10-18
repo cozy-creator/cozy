@@ -191,10 +191,7 @@ impl Store {
         let _lock = self.lock("refs")?;
         let old = Self::parse_ref(&path)?;
         let lanes = |repo: &Option<Repo>| -> Vec<ObjectRef> {
-            repo.iter()
-                .flat_map(|repo| &repo.releases)
-                .flat_map(|release| release.lanes.values().cloned())
-                .collect()
+            repo.iter().flat_map(Repo::roots).cloned().collect()
         };
         let before = lanes(&old);
         let Some(new) = change(old) else {

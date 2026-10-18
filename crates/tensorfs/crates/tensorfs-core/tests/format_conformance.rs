@@ -183,12 +183,25 @@ fn write_store() -> BTreeMap<String, Vec<u8>> {
     };
     lanes.insert("spans".to_string(), put(manifest.to_json().unwrap()));
 
+    // Release 2 swaps the lanes and is yanked: unversioned lookups must land on release 1.
+    let swapped = BTreeMap::from([
+        ("all".to_string(), lanes["spans"].clone()),
+        ("spans".to_string(), lanes["all"].clone()),
+    ]);
+    let checkpoints = vec![lanes["spans"].clone()];
+    let release = |version: &str, lanes, yanked, revision| Release {
+        version: version.into(),
+        lanes,
+        yanked,
+        revision,
+    };
     let repo = Repo {
         name: REPO.into(),
-        releases: vec![Release {
-            version: "1".into(),
-            lanes,
-        }],
+        releases: vec![
+            release("1", lanes, false, 3),
+            release("2", swapped, true, 0),
+        ],
+        checkpoints,
     };
     files.insert(repo.key(), repo.to_json().unwrap());
     files
@@ -256,6 +269,17 @@ fn reader_decodes_every_case() {
     assert_eq!(repo_key(REPO), "refs/conformance/schemes.json");
     let repo = Repo::from_json(&fs::read(root.join(repo_key(REPO))).unwrap()).unwrap();
     assert_eq!(repo.name, REPO);
+    assert_eq!(
+        repo.release(None).unwrap().version,
+        "1",
+        "release 2 is yanked"
+    );
+    assert_eq!(
+        repo.lane(Some("2"), "all"),
+        repo.lane(None, "spans"),
+        "an explicit version still resolves"
+    );
+    assert_eq!(repo.roots().count(), 5);
     let mut checked = 0;
     for c in cases() {
         let manifest =

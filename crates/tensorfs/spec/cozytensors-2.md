@@ -37,7 +37,7 @@ Manifests, headers and repos are documents. Each is a map with a `format` tag `<
   new major.
 - Values are null, booleans, integers in [−2^63, 2^64), strings, lists and maps with string keys. There are no
   floating-point numbers anywhere in a document. A map MUST NOT repeat a key.
-- `metadata`, where allowed, is a free-form map of such values. An empty `metadata` or `params` map is omitted.
+- `metadata`, where allowed, is a free-form map of such values.
 
 **Names.** A *segment* is a non-empty string that is not `.` or `..` and contains no `/`, `\` or NUL. A *path* is one
 or more segments joined by `/`.
@@ -82,6 +82,21 @@ or more segments joined by `/`.
 
 Tensor bytes are row-major (C order) and little-endian. Writers fill gaps between ranges with zeros; readers never
 read them.
+
+### Canonical names
+
+- Component folders, layer names and tensor keys are the upstream on-disk names: the component's Diffusers or
+  Transformers folder (`unet`, `text_encoder`, `transformer`, `vae`) and the keys of its upstream `*.safetensors`
+  state dict, unchanged.
+- LoRAs are stored under the upstream module names they adapt, with PEFT's `lora_A` and `lora_B` keys.
+- A writer MUST NOT deviate from these names unless the deviation is listed below with its written, measured reason.
+
+| Model | Upstream name | Stored name | Measured reason |
+|---|---|---|---|
+| — | — | — | No deviations. |
+
+Per-head QKV layouts and the H3 gate/value order are the upstream layout (measured bit-identical, #508c, tfs-094),
+so they are not deviations.
 
 ## 5. Dtypes
 
@@ -191,11 +206,20 @@ A plain tensor's bytes are its value; reading it is a copy, whatever its dtype.
 ## 7. Repo, store and origin
 
 ```
-{format: "tensorfs.repo/2", name: "<org>/<name>", releases: [{version, lanes: {lane: object-ref}}]}
+{format: "tensorfs.repo/2", name: "<org>/<name>",
+ releases: [{version, lanes: {lane: object-ref}, yanked?, revision?}], checkpoints?: [object-ref]}
 ```
 
 - `name` is two segments. Versions MUST be non-empty and unique; lane names MUST be non-empty. Each lane cites a
-  manifest. Releases are listed in publication order; the last is the latest.
+  manifest. Releases are listed in publication order, newest last.
+- `yanked` (boolean, default `false`) withdraws a release from unversioned lookups. `revision` (non-negative integer,
+  default 0) is the release's expected-revision counter: every change to the release increments it, and a writer
+  that changes a release conditions the change on the revision it read.
+- `checkpoints` (default empty) lists manifests uploaded but not yet in any release.
+- **Resolution.** An unversioned lookup takes the newest release that is not yanked; an explicit version takes that
+  release, yanked or not (a reader MAY warn). The lane is then looked up in that release.
+- **Roots.** Every lane of every release, yanked included, and every checkpoint are roots: a store keeps their
+  closures.
 - Repo names are case-insensitive: `Acme/SDXL` and `acme/sdxl` are one repo. Keys and paths use the name with ASCII
   `A`–`Z` lowered (`refs/acme/sdxl.json`); the document's `name` keeps the writer's spelling.
 - A **store** or **static origin** is a directory, bucket or HTTP prefix holding `refs/<org>/<name>.json` and
@@ -231,7 +255,8 @@ Whitespace between tokens is allowed.
 - strings with `"` and `\` escaped as `\"` and `\\`, the controls U+0008, U+0009, U+000A, U+000C and U+000D as `\b`,
   `\t`, `\n`, `\f`, `\r`, other controls below U+0020 as `\u00XX` (lowercase hex), and every other character as its
   UTF-8 bytes (Python: `json.dumps(doc, sort_keys=True, separators=(",", ":"), ensure_ascii=False)`);
-- empty `metadata` and `params` omitted.
+- optional fields at their default omitted: empty `metadata`, `params` and `checkpoints`, `yanked: false`,
+  `revision: 0`.
 
 ## 10. Chunks (informative)
 

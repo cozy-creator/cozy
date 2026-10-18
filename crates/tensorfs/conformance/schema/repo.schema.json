@@ -39,8 +39,20 @@
       "additionalProperties": {
        "$ref": "#/$defs/objectRef"
       }
+     },
+     "yanked": {
+      "type": "boolean"
+     },
+     "revision": {
+      "$ref": "#/$defs/u64"
      }
     }
+   }
+  },
+  "checkpoints": {
+   "type": "array",
+   "items": {
+    "$ref": "#/$defs/objectRef"
    }
   }
  },
