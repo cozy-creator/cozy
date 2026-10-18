@@ -598,8 +598,16 @@ fn an_attention_kernel_pin_reaches_the_executor_and_run_show() {
     let id = run["id"].as_str().unwrap();
     let full = cozy(&home, &work, &["--json", "run", "show", id]);
     let full: Value = serde_json::from_str(&full.stdout).unwrap_or_else(|_| panic!("{full:?}"));
-    let gpus = &full["measurements"]["execution"]["gpus"];
-    assert_eq!(gpus[0]["attention"]["requested"], pin, "{full}");
+    // A Runtime before 0.28 names its GPUs `ranks`.
+    let execution = &full["measurements"]["execution"];
+    let first = execution["gpus"]
+        .get(0)
+        .or_else(|| execution["ranks"].get(0));
+    assert_eq!(
+        first.unwrap_or_else(|| panic!("{full}"))["attention"]["requested"],
+        pin,
+        "{full}"
+    );
 
     let shown = cozy(&home, &work, &["run", "show", id]);
     eprintln!("{}", shown.stdout);
