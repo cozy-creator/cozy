@@ -23,7 +23,7 @@ use crate::Context;
 
 const RELEASES: &str = "https://github.com/cozy-creator/cozy-creator/releases";
 const ISSUER: &str = "https://token.actions.githubusercontent.com";
-/// This repo's GitHub id (releases through v0.9.6 were signed under its old name, `cozy-creator/cozy`).
+/// This repo's GitHub id, which a rename keeps.
 const REPOSITORY_ID: &str = "1345607976";
 /// Its release workflow, on any ref.
 const WORKFLOW: &str = "/.github/workflows/release.yml@";
@@ -392,15 +392,15 @@ mod tests {
         Artifact::from_digest(Sha256Hash::from_hex(hex).unwrap())
     }
 
-    /// v0.9.6 was signed under the repo's old name; its certificate still names this repository id.
+    /// v0.10.0's own bundle for its x86_64 Linux archive.
     #[test]
-    fn a_release_signed_before_the_rename_verifies() {
-        let lines = include_str!("../tests/fixtures/sigstore/cozy-v0.9.6.jsonl");
-        let archive = sha256("05f72ee7e573691e20bad0676c8d222a57b293b34d2a71b25d5fcf68e220df63");
-        let signer = super::signer("v0.9.6", lines, archive).unwrap();
+    fn a_release_of_this_repo_verifies() {
+        let lines = include_str!("../tests/fixtures/sigstore/cozy-v0.10.0.jsonl");
+        let archive = sha256("28ec835fdef1d0a1eaf231cfa05d76bdef207ee6387bcb5ae8bf11c3ebc1017c");
+        let signer = super::signer("v0.10.0", lines, archive).unwrap();
         assert_eq!(
             signer,
-            "https://github.com/cozy-creator/cozy/.github/workflows/release.yml@refs/heads/release-v0.9.6"
+            "https://github.com/cozy-creator/cozy-creator/.github/workflows/release.yml@refs/heads/release-v0.10.0"
         );
     }
 
