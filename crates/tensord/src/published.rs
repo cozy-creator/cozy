@@ -49,9 +49,32 @@ pub struct PackageSdk {
     pub client_wheel: Option<PathBuf>,
     /// An image's baked uv cache (expanded wheels, index records), linked rather than copied.
     pub seed_cache: Option<PathBuf>,
+    /// On a local machine, its owner's uv cache and managed Pythons (what the owner's own and
+    /// local-package installs use), so a release's Torch stack is fetched and kept once.
+    pub owner_uv: Option<OwnerUv>,
     /// The development Runtime an update named by its wheel file (`0.24.6+e9baf7a4`): the
     /// operator's choice, which runs every package whatever its own bounds on the pair.
     pub runtime_build: String,
+}
+
+/// Where uv keeps its cache and managed Pythons for the owner whose environment `env` is: as
+/// uv itself resolves them (its variables, then XDG, then the home directory's defaults).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OwnerUv {
+    pub cache: PathBuf,
+    pub python: PathBuf,
+}
+
+impl OwnerUv {
+    pub fn of(env: &BTreeMap<String, String>) -> Option<Self> {
+        let path = |name: &str| env.get(name).map(PathBuf::from).filter(|p| p.is_absolute());
+        let home = path("HOME");
+        let base = |xdg: &str, default: &str| path(xdg).or_else(|| home.as_ref().map(|h| h.join(default)));
+        Some(Self {
+            cache: path("UV_CACHE_DIR").or_else(|| Some(base("XDG_CACHE_HOME", ".cache")?.join("uv")))?,
+            python: path("UV_PYTHON_INSTALL_DIR").or_else(|| Some(base("XDG_DATA_HOME", ".local/share")?.join("uv/python")))?,
+        })
+    }
 }
 
 impl PackageSdk {
@@ -84,6 +107,7 @@ impl PackageSdk {
             requirements: if complete { pair } else { vec![] },
             client_wheel: None,
             seed_cache: seed.is_dir().then_some(seed),
+            owner_uv: None,
         }
     }
 }
@@ -1095,12 +1119,10 @@ impl Publisher {
     }
 
     /// This machine's own uv cache, which `reclaim` manages; None when an image's seeded cache
-    /// serves installs (environments symlink into it, so nothing there is ever removed).
+    /// serves installs (environments symlink into it, so nothing there is ever removed) or the
+    /// owner's does (uv and its owner manage that one).
     pub fn uv_cache(&self) -> Option<PathBuf> {
-        self.sdk
-            .seed_cache
-            .is_none()
-            .then(|| self.root.join("uv-cache"))
+        (self.sdk.seed_cache.is_none() && self.sdk.owner_uv.is_none()).then(|| self.root.join("uv-cache"))
     }
 
     /// Held shared through one environment build, so `reclaim` removes nothing from the cache
@@ -1206,16 +1228,18 @@ impl Publisher {
                 command.env(name, value);
             }
         }
+        let owner = self.sdk.owner_uv.as_ref();
         command
             .env("HOME", self.root.join("home"))
-            .env("UV_PYTHON_INSTALL_DIR", self.root.join("python"));
+            .env("UV_PYTHON_INSTALL_DIR", owner.map_or_else(|| self.root.join("python"), |o| o.python.clone()));
         // As the Python worker: an image's seeded cache, symlinked so overlayfs never copies
-        // the baked Torch payload into each environment; else this machine's own cache.
-        match &self.sdk.seed_cache {
-            Some(seed) => command
+        // the baked Torch payload into each environment; else the owner's, else this machine's.
+        match (&self.sdk.seed_cache, owner) {
+            (Some(seed), _) => command
                 .env("UV_CACHE_DIR", seed)
                 .env("UV_LINK_MODE", "symlink"),
-            None => command.env("UV_CACHE_DIR", self.root.join("uv-cache")),
+            (None, Some(owner)) => command.env("UV_CACHE_DIR", &owner.cache),
+            (None, None) => command.env("UV_CACHE_DIR", self.root.join("uv-cache")),
         };
         let mut child = command.spawn().map_err(|e| {
             (
@@ -2359,6 +2383,46 @@ pub(crate) mod tests {
         let (code, why) = generate(&publisher, &root.join("generations"), "elsewhere", &card(pyproject, lock)).unwrap_err();
         assert_eq!(code, "release_platform_unsupported", "{why}");
         assert!(why.starts_with("acme/app@1.0 is not locked for this machine") && why.contains(elsewhere), "{why}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// On a local machine a release installs through its owner's uv cache: a wheel the owner's own
+    /// install cached serves it after its file is gone, where a machine with a cache of its own
+    /// finds nothing; that cache is never the machine's to reclaim. Real uv and lock; no network.
+    #[test]
+    fn a_local_machine_installs_through_its_owners_uv_cache() {
+        let root = std::env::temp_dir().join(format!("cm-owner-uv-{}", uuid::Uuid::new_v4()));
+        let wheels = root.join("wheels");
+        fs::create_dir_all(&wheels).unwrap();
+        let wheel = tiny_wheel(&wheels, "takes-any", "1.0", &[]);
+        let (pyproject, lock) = locked(&root.join("project"), &["takes-any"], &wheels, "");
+        let owner = OwnerUv::of(&BTreeMap::from([("HOME".into(), root.join("home").display().to_string())])).unwrap();
+        assert_eq!(owner, OwnerUv { cache: root.join("home/.cache/uv"), python: root.join("home/.local/share/uv/python") });
+        let named = BTreeMap::from([("HOME".into(), "/h".into()), ("XDG_CACHE_HOME".into(), "/x".into()),
+            ("XDG_DATA_HOME".into(), "relative".into()), ("UV_PYTHON_INSTALL_DIR".into(), "/p".into())]);
+        assert_eq!(OwnerUv::of(&named), Some(OwnerUv { cache: "/x/uv".into(), python: "/p".into() }));
+        // The owner's own install fills the cache; then the wheel's file goes.
+        let seeded = root.join("seeded");
+        for args in [
+            vec!["venv", "-q", "--python", "3.12", seeded.to_str().unwrap()],
+            vec!["pip", "install", "-q", "--python", seeded.join("bin/python").to_str().unwrap(), "--no-index",
+                "--find-links", wheels.to_str().unwrap(), "takes-any"],
+        ] {
+            assert!(Command::new("uv").args(&args).env("UV_CACHE_DIR", &owner.cache).status().unwrap().success(), "{args:?}");
+        }
+        fs::remove_file(&wheel).unwrap();
+        let store = Arc::new(Store::ensure(&root.join("tensorfs")).unwrap());
+        let sdk = PackageSdk { uv: PathBuf::from("uv"), python: "3.12".into(), ..Default::default() };
+        let card = card(pyproject, lock);
+
+        let own = Publisher::new(&root.join("own/published"), sdk.clone(), store.clone()).unwrap();
+        let (_, why) = generate(&own, &root.join("own/generations"), "app", &card).unwrap_err();
+        assert!(why.contains("takes_any-1.0-py3-none-any.whl"), "a cache of its own holds nothing: {why}");
+        let local = Publisher::new(&root.join("published"), PackageSdk { owner_uv: Some(owner), ..sdk }, store).unwrap();
+        let record = generate(&local, &root.join("generations"), "app", &card).unwrap();
+        assert!(Command::new(&record.python).args(["-I", "-c", "import takes_any"]).status().unwrap().success());
+        assert_eq!(local.uv_cache(), None);
+        assert!(!root.join("published/uv-cache").exists());
         let _ = fs::remove_dir_all(root);
     }
 
