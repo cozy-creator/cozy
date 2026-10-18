@@ -51,7 +51,7 @@ use tracing::warn;
 use crate::{
     Calcifer,
     api::{Api, Refusal, parse},
-    link::{self, Link, LinkError, OUTDATED},
+    link::{self, Link, LinkError},
     rentals::Hubs,
     store::{AskKind, Endpoint, MachineRow, Store},
 };
@@ -207,13 +207,12 @@ impl Machines {
             )
             .next(format!("cozy machine show {name}")));
         }
-        let unreachable = |e: LinkError| match e {
-            LinkError::Refused { code, message } if code == OUTDATED => outdated(address, message),
-            e => Error::new(
+        let unreachable = |e: LinkError| {
+            Error::new(
                 Kind::Unavailable,
                 "machine_unreachable",
                 format!("{address}: {e}"),
-            ),
+            )
         };
         let leaf: [u8; 32] =
             Sha256::digest(link::presented_leaf(address).await.map_err(unreachable)?).into();
@@ -500,7 +499,7 @@ impl Machines {
             .calcifer
             .link(name)?
             .ok_or_else(|| "it has no address".to_string())?;
-        let mut frames = link.watch().await.map_err(|e| unwatched(name, e))?;
+        let mut frames = link.watch().await.map_err(|e| e.to_string())?;
         loop {
             match frames.next().await {
                 Some(Ok(frame)) => {
@@ -512,7 +511,7 @@ impl Machines {
                     }
                 }
                 None => return Err("the machine closed its Status stream".into()),
-                Some(Err(e)) => return Err(unwatched(name, e)),
+                Some(Err(e)) => return Err(e.to_string()),
             }
         }
     }
@@ -1178,7 +1177,6 @@ fn log_refusal(name: &str, log: MachineLog, e: LinkError) -> Error {
 /// A machine's refusal, as the API answers it.
 fn refusal(name: &str, e: LinkError) -> Error {
     match e {
-        LinkError::Refused { code, message } if code == OUTDATED => outdated(name, message),
         LinkError::Refused { code, message } => Error::new(
             Kind::Conflict,
             "machine_refused",
@@ -1206,23 +1204,6 @@ fn refusal(name: &str, e: LinkError) -> Error {
             format!("{name}: {message}"),
         ),
     }
-}
-
-/// Why a machine's Status is not read: an outdated one says so first (`outdated:`), with what
-/// to do about it.
-fn unwatched(name: &str, e: LinkError) -> String {
-    match e {
-        LinkError::Refused { code, message } if code == OUTDATED => {
-            format!("outdated: {message}; {}", link::outdated_remedy(name))
-        }
-        e => e.to_string(),
-    }
-}
-
-/// A machine from before the HTTP API, which this controller never drives.
-fn outdated(name: &str, message: String) -> Error {
-    Error::new(Kind::Conflict, OUTDATED, format!("{name}: {message}"))
-        .remedy(link::outdated_remedy(name))
 }
 
 pub(crate) fn not_found(text: &str) -> Error {

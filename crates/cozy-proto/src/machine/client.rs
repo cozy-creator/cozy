@@ -49,10 +49,9 @@ pub enum Error {
     /// Not reached, or the connection broke.
     #[error("{0}")]
     Transport(String),
-    /// Something answered that does not speak this API: a machine from before it (gRPC), or
-    /// another service on the port.
+    /// It answered what this API does not say: another service on its port, a proxy's error page.
     #[error("{0}")]
-    NotMachineApi(String),
+    Answer(String),
 }
 
 impl Error {
@@ -366,8 +365,7 @@ impl Bulk {
                 .unwrap_or_default()
                 .to_owned()
         };
-        let unexpected =
-            |what: &str| Error::NotMachineApi(format!("an output read answered {what}"));
+        let unexpected = |what: &str| Error::Answer(format!("an output read answered {what}"));
         let rev = text(header::ETAG)
             .trim_matches('"')
             .parse()
@@ -429,11 +427,6 @@ fn builder(pin: [u8; 32], alpn: &[&[u8]]) -> reqwest::ClientBuilder {
 /// Sends `request`: a 2xx response, or the machine's refusal.
 async fn send(request: RequestBuilder) -> Result<Response, Error> {
     let response = request.send().await.map_err(transport)?;
-    if response.headers().contains_key("grpc-status") {
-        return Err(Error::NotMachineApi(
-            "the machine speaks gRPC (cozy.machine.v1): it is older than this cozy".into(),
-        ));
-    }
     let status = response.status();
     if status.is_success() {
         return Ok(response);
@@ -448,7 +441,7 @@ async fn send(request: RequestBuilder) -> Result<Response, Error> {
             status.canonical_reason().unwrap_or("refused"),
         ),
         Err(_) => {
-            return Err(Error::NotMachineApi(format!(
+            return Err(Error::Answer(format!(
                 "the machine answered {status} without the error envelope: {}",
                 String::from_utf8_lossy(&body[..body.len().min(200)])
             )));
@@ -479,7 +472,7 @@ async fn json<T: DeserializeOwned>(response: Response) -> Result<T, Error> {
 
 fn parse<T: DeserializeOwned>(text: &str) -> Result<T, Error> {
     serde_json::from_str(text)
-        .map_err(|e| Error::NotMachineApi(format!("the machine answered unreadable JSON: {e}")))
+        .map_err(|e| Error::Answer(format!("the machine answered unreadable JSON: {e}")))
 }
 
 async fn bytes(response: Response) -> Result<Bytes, Error> {
@@ -493,7 +486,7 @@ fn held(response: &Response) -> Result<Ranges, Error> {
         .map(|v| v.to_str().unwrap_or("-"));
     value
         .and_then(parse_held)
-        .ok_or_else(|| Error::NotMachineApi(format!("the machine answered {HELD} {value:?}")))
+        .ok_or_else(|| Error::Answer(format!("the machine answered {HELD} {value:?}")))
 }
 
 fn sse(
@@ -505,13 +498,13 @@ fn sse(
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v.starts_with("text/event-stream"));
     if !streams {
-        return Err(Error::NotMachineApi(
+        return Err(Error::Answer(
             "the machine answered a stream that is not SSE".into(),
         ));
     }
     Ok(response.bytes_stream().eventsource().map_err(|e| match e {
         eventsource_stream::EventStreamError::Transport(e) => transport(e),
-        e => Error::NotMachineApi(format!("the machine's SSE: {e}")),
+        e => Error::Answer(format!("the machine's SSE: {e}")),
     }))
 }
 
