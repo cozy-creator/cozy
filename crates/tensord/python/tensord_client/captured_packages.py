@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import configparser
 import email.parser
+import itertools
 import os
 import shutil
 import subprocess
@@ -82,11 +83,24 @@ def conflicts(interpreter: Path, step: subprocess.CompletedProcess | None = None
     return {line for line in lines if line.startswith("The package") and not line.endswith("was built for a different platform")}
 
 
-def machine_sdk(interpreter: Path, sdk: list[Path], capture) -> str:
+SDK = {"cozy-runtime", "tensorfs"}
+
+
+def pair_bound(finding: str) -> bool:
+    """Whether a check finding (`The package `x` requires `tensorfs==0.10.0`, but ...`) is a
+    bound on the Runtime or TensorFS."""
+    required = finding.partition("` requires `")[2]
+    return canonicalize_name("".join(itertools.takewhile(lambda c: c.isalnum() or c in "-_.", required)) or "-") in SDK
+
+
+def machine_sdk(interpreter: Path, sdk: list[Path], capture, runtime_build: str = "") -> str:
     """The machine's own Runtime/TensorFS pair over the captured closure, every other selected
     version constrained, where every installed requirement admits it (uv's check). Else the
     capture's own pair (a vendored dev Runtime, say) is restored: a package's bounds are never
-    overridden. Returns "" for the machine's pair, else why and what runs instead; never silent."""
+    overridden, except by a development Runtime an update named (`--runtime-wheel`,
+    `runtime_build`): the operator's choice runs whatever the package's bounds on the pair, which
+    the warning names, and one that cannot install refuses the package, as for a release.
+    Returns "" for the machine's pair, else why and what runs instead; never silent."""
     pair = {canonicalize_name(wheel.name.split("-")[0]) for wheel in sdk}
     # A conflict the capture already has is not the pair's doing: the pair is refused only for one it adds.
     before = conflicts(interpreter)
@@ -98,10 +112,19 @@ def machine_sdk(interpreter: Path, sdk: list[Path], capture) -> str:
     sys.stderr.write(step.stderr)
     if step.returncode == 0:
         step = subprocess.run(["uv", "pip", "check", "--python", str(interpreter)], capture_output=True, text=True)
-        if step.returncode == 0 or conflicts(interpreter, step) <= before:
+        added = conflicts(interpreter, step) - before
+        if step.returncode == 0 or not added:
             return ""
+        if runtime_build and all(map(pair_bound, added)):
+            regardless = (f"{'; '.join(sorted(added))}; this machine's development Runtime {runtime_build} "
+                          "(`--runtime-wheel`) runs it regardless")
+            print(regardless, file=sys.stderr)
+            return regardless
     reason = [line.strip() for line in ((step.stdout or "") + step.stderr).splitlines()
               if line.strip() and not line.startswith(("Using Python", "Checked "))][-12:]
+    if runtime_build:
+        raise PackageError("package_installation_uv_failed",
+                           f"this machine's development Runtime {runtime_build} cannot run this package: {' | '.join(reason)[:2000]}")
     capture()
     own = ", ".join(f"{row.name}=={row.version}" for row in inventory(interpreter) if canonicalize_name(row.name) in pair)
     fallback = (f"this machine's own Runtime and TensorFS did not install ({' '.join(map(str, step.args[:3]))}: "
@@ -149,7 +172,7 @@ def live_paths(environment: Path) -> None:
 
 def install_editable(*, project: Path, environment: Path, wheels: list[Path], distribution: str, release: str,
                      python_requires: str, python_version: str, generations: Path, client_wheel: Path,
-                     python: str, sdk: list[Path] = (), callees: dict[str, str] | None = None,
+                     python: str, sdk: list[Path] = (), runtime_build: str = "", callees: dict[str, str] | None = None,
                      indexes: list[str] = (), source_digest: str = ""):
     """Install editable in the controller's source home and environment. Remote captures keep
     separate source homes/environments; direct local paths reuse their live environment while
@@ -205,7 +228,7 @@ def install_editable(*, project: Path, environment: Path, wheels: list[Path], di
             live_paths(environment)
 
         capture({canonicalize_name(wheel.name.split("-")[0]) for wheel in sdk})
-        fallback = machine_sdk(interpreter, sdk, capture) if sdk else ""
+        fallback = machine_sdk(interpreter, sdk, capture, runtime_build) if sdk else ""
         add_client(interpreter, environment.parent / (environment.name + ".constraints.txt"), client_wheel)
         ready.write_text(fallback)
     generations.mkdir(parents=True, exist_ok=True)
@@ -225,7 +248,7 @@ def install_editable(*, project: Path, environment: Path, wheels: list[Path], di
 def install_captured(*, project: Path | None, wheels: list[Path], requirements: Path | None,
                      distribution: str, release: str, python_requires: str, python_version: str,
                      generations: Path, client_wheel: Path, python: str, sdk: list[Path] = (),
-                     callees: dict[str, str] | None = None):
+                     runtime_build: str = "", callees: dict[str, str] | None = None):
     python = interpreter_for(python, python_requires, python_version)
     project = project.resolve() if project else None
     wheels = [wheel.resolve(strict=True) for wheel in wheels]
@@ -296,7 +319,7 @@ def install_captured(*, project: Path | None, wheels: list[Path], requirements: 
                 subprocess.run(["uv", "pip", "install", *COPY, "--python", str(interpreter), *map(str,wheels)], check=True)
 
         capture()
-        fallback = machine_sdk(interpreter, sdk, capture) if sdk else ""
+        fallback = machine_sdk(interpreter, sdk, capture, runtime_build) if sdk else ""
         add_client(interpreter, root / "captured-constraints.txt", client_wheel)
         return publish_generation(root, metadata, None, callees, fallback)
     except BaseException:

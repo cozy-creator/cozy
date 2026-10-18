@@ -31,6 +31,8 @@ def main():
     captured.add_argument("--generations", type=Path, required=True)
     captured.add_argument("--client-wheel", type=Path, required=True)
     captured.add_argument("--sdk-wheel", action="append", type=Path, default=[])
+    # The development Runtime an update named: it runs whatever the package's bounds on the pair.
+    captured.add_argument("--runtime-build", default="")
     captured.add_argument("--python", default=sys.executable)
     captured.add_argument("--callees", default="{}")
     # A live project installed editable in this environment, kept while its lock stands.
@@ -43,7 +45,7 @@ def main():
     try:
         shared = dict(distribution=args.distribution, release=args.release, python_requires=args.python_requires,
             python_version=args.python_version, generations=args.generations, client_wheel=args.client_wheel,
-            python=args.python, sdk=args.sdk_wheel, callees=msgspec.json.decode(args.callees, type=dict[str, str]))
+            python=args.python, sdk=args.sdk_wheel, runtime_build=args.runtime_build, callees=msgspec.json.decode(args.callees, type=dict[str, str]))
         if args.editable_environment:
             result = install_editable(project=args.project, environment=args.editable_environment, wheels=args.wheel,
                                       indexes=args.index, source_digest=args.source_digest, **shared)

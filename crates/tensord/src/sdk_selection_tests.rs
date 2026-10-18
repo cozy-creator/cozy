@@ -169,6 +169,7 @@ fn same_filename_activation_installs_new_runtime_and_retains_old_generation() {
                 sdk: sdk.requirements.iter().map(PathBuf::from).collect(),
                 uv: "uv".into(),
                 seed_cache: None,
+                runtime_build: String::new(),
             },
             store.clone(),
         )

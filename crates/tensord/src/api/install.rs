@@ -26,6 +26,9 @@ pub struct InstallerConfig {
     pub staging_root: PathBuf,
     /// The machine's own Runtime/TensorFS wheels: a local package runs this pair too.
     pub sdk: Vec<PathBuf>,
+    /// The development Runtime an update named (`--runtime-wheel`, `PackageSdk::runtime_build`):
+    /// it runs a local package whatever the package's own bounds on the pair, as a release.
+    pub runtime_build: String,
     /// The machine's uv (`machine::client::uv`): the helper runs it, whatever PATH the machine had.
     pub uv: PathBuf,
     /// An image's baked uv cache: local environments symlink into it as published ones do, so
@@ -241,6 +244,7 @@ fn installer(config: &InstallerConfig, root: &RootSet) -> Result<Command, Error>
                 .iter()
                 .flat_map(|wheel| [std::ffi::OsStr::new("--sdk-wheel"), wheel.as_os_str()]),
         )
+        .arg(format!("--runtime-build={}", config.runtime_build))
         .arg("--python")
         .arg(python)
         .arg("--distribution")
@@ -439,6 +443,7 @@ mod tests {
             sdk: vec![],
             uv: "uv".into(),
             seed_cache: None,
+            runtime_build: String::new(),
         };
         let mut helper = std::process::Command::new("sh");
         helper.args(["-c", r#"echo '{"kind":"install_failed","code":"package_dependency_operation_failed","detail":"uv pip install"}'
