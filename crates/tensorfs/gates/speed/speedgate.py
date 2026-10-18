@@ -237,6 +237,7 @@ class Model:
         self.manifest = open(done).read()
         ck = self.checkpoint()
         self.chunks = ck.chunks
+        self.blocks = blocks(ck)  # the model's structure, known before any load
         self.st = [os.path.join(self.dir, "st", f) for f in sorted(os.listdir(os.path.join(self.dir, "st")))]
 
     def checkpoint(self):
@@ -265,8 +266,10 @@ class Model:
         """Checkpoint, regions cut at blocks (what the Runtime passes), register and want on the
         device: v2 weights read through the plane's register path."""
         plane.set_vram_budget(0, torch.cuda.mem_get_info()[0] - (1 << 30))
+        t0 = time.perf_counter()
         ck = self.checkpoint()
-        ws = plane.register_checkpoint(self.name, ck, v2.regions(ck, 64 << 20, blocks(ck)))
+        ws = plane.register_checkpoint(self.name, ck, v2.regions(ck, 64 << 20, self.blocks))
+        self.register_s = time.perf_counter() - t0  # open, regions and register: the part before any read
         picked = sorted({p["region"] for p in ws.parts if self.in_window(*p["what"].split("#")[0].split("/", 1))}) if window else None
         plane.want(ws, 0, picked).wait()
         return picked, ws
@@ -343,7 +346,8 @@ def bench(model, readers, log, warm_full, layouts=LAYOUTS, scopes=("full", "wind
                     s, moved = model.once(readers, layout, window, cold=cold)
                     cell = f"{layout} {scope} {'cold' if cold else 'warm'}"
                     res.setdefault(cell, []).append((s, moved))
-                    log(f"{model.name} {cell}: {1000 * s:.0f} ms {moved / 1e6:.0f} MB")
+                    reg = f" (register {1000 * model.register_s:.1f} ms)" if layout == "T64+rust" else ""
+                    log(f"{model.name} {cell}: {1000 * s:.0f} ms {moved / 1e6:.0f} MB{reg}")
             drop(files)
         log(f"{model.name}: rep {rep + 1}/{model.reps} done")
     return res
