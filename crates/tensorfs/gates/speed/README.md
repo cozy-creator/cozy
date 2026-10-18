@@ -97,6 +97,27 @@ run 11595 on an NVIDIA L4 (rumiho), 5 interleaved repetitions, ms median (best):
   rather than the window. The window's want and wait take about 27 ms (8.4 GB/s), less than `st-cpu-cuda`'s 36 ms.
   A loader that registers once and wants windows repeatedly pays the 16 ms once.
 
+Lazy window, run 11605 on an NVIDIA L4 (senko): `regions(..., only=[the window's block])` and a weight set
+of those regions alone, so the open no longer covers the whole checkpoint. 5 interleaved repetitions,
+ms median (best), then the medians of open (header parses, regions, registration) and read:
+
+| lane | reader | window cold | window warm |
+|---|---|---:|---:|
+| SDXL, window 187 MB | **T64+rust** (reads 211 MB) | **27** (24): open 5.6, read 21.0 | **26** (22): open 5.5, read 20.2 |
+| | fastsafetensors | 72 (69): open 34.6, read 35.7 | 78 (76): open 32.2, read 46.1 |
+| | st-cuda | 115 (101): open 6.8, read 108.3 | 47 (46): open 3.1, read 43.6 |
+| | st-cpu-cuda | 89 (86): open 6.7, read 81.2 | 42 (41): open 2.9, read 39.2 |
+| | gate | pass +172% | pass +62% |
+| Qwen, window 218 MB | **T64+rust** (reads 227 MB) | **25** (24): open 3.5, read 21.8 | **26** (21): open 3.5, read 21.1 |
+| | fastsafetensors | 59 (53): open 24.5, read 34.3 | 430 (428): open 29.3, read 404.6 |
+| | st-cuda | 108 (92): open 4.7, read 103.4 | 57 (42): open 1.8, read 55.2 |
+| | st-cpu-cuda | 126 (84): open 4.5, read 121.8 | 34 (32): open 1.8, read 31.8 |
+| | gate | pass +132% | pass +29% |
+
+- The open fell from 16 ms to 3.5 (Qwen) and 5.5 (SDXL); what is left is the header parse.
+- The read fell from about 27 ms to 21: the window's weight set is small, and the gate no longer lists
+  every part to pick the window.
+
 ## F1 results
 
 F1's harness (in git history at `a1ae376df`) built the layouts itself: `v1` per-part objects, `T16`/`T64` packs
