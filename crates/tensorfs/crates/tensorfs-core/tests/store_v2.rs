@@ -81,7 +81,7 @@ fn checkpoint(store: &Store, chunks: &[Vec<u8>], files: &[(&str, Vec<u8>)]) -> O
     };
     let header = Header::new(chunks, vec![unet], Default::default()).unwrap();
     let mut manifest = Manifest::default();
-    let header = store.put_bytes(&header.to_json().unwrap()).unwrap();
+    let header = store.put_bytes(&header.to_cbor().unwrap()).unwrap();
     manifest.files.insert(HEADER_PATH.into(), header);
     for (path, file) in files {
         manifest
@@ -112,7 +112,7 @@ fn closure(store: &Store, root: &ObjectRef) -> BTreeSet<ObjectRef> {
     };
     for (path, file) in manifest.into_iter().flat_map(|m| m.files) {
         if path == HEADER_PATH {
-            let header = Header::from_json(&store.read(&file).unwrap()).unwrap();
+            let header = Header::from_cbor(&store.read(&file).unwrap()).unwrap();
             reach.extend(header.chunks);
         }
         reach.insert(file);

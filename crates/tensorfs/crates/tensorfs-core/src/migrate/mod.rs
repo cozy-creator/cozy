@@ -670,10 +670,6 @@ fn encoding(scheme: &str) -> Encoding {
     }
 }
 
-/// Owner question (d): a packed nvfp4 weight as dtype `F4 [R, C]`. Until the F4 dtype is
-/// approved it stays v1's `U8 [R, C/2]` (the #624 form); the bytes are the same either way.
-const NVFP4_AS_F4: bool = false;
-
 /// Each v1 part's v2 role, dtype and shape, in v1 order.
 fn v2_parts(t: &v1::Tensor, mapping: &Mapping) -> Result<Vec<(String, Dtype, Vec<u64>)>> {
     let what = &t.key;
@@ -696,11 +692,8 @@ fn v2_parts(t: &v1::Tensor, mapping: &Mapping) -> Result<Vec<(String, Dtype, Vec
                     ("nvfp4", "weight", [rows, cols])
                         if p.dtype == Dtype::U8 && p.shape == [*rows, cols / 2] =>
                     {
-                        let (dtype, shape) = match NVFP4_AS_F4 {
-                            true => (Dtype::F4, vec![*rows, *cols]),
-                            false => (Dtype::U8, p.shape.clone()),
-                        };
-                        Ok((role.to_string(), dtype, shape))
+                        // v1's packed `U8 [R, C/2]` is `F4 [R, C]`: the same bytes.
+                        Ok((role.to_string(), Dtype::F4, vec![*rows, *cols]))
                     }
                     ("nvfp4", "weight", _) => {
                         fail(Kind::Invalid, format!("{what}: nvfp4 weight {:?}", p.shape))
@@ -757,10 +750,7 @@ fn conforms(
             want("scale", &[F32], &|s| numel(s) == rows)
         }
         "nvfp4" if cols % 16 == 0 => {
-            match NVFP4_AS_F4 {
-                true => want("weight", &[F4], &|s| s == [rows, cols])?,
-                false => want("weight", &[U8], &|s| s == [rows, cols / 2])?,
-            }
+            want("weight", &[F4], &|s| s == [rows, cols])?;
             want("scale", &[F8_E4M3], &|s| s == [rows, cols / 16])?;
             want("scale_2", &[F32], &|s| numel(s) == 1)?;
             optional("input_scale")

@@ -115,7 +115,7 @@ impl Store {
     fn chunks(&self, header: &ObjectRef) -> Result<Vec<ObjectRef>> {
         let path = self.path(header)?;
         match fs::read(&path) {
-            Ok(bytes) => Header::from_json(&bytes)
+            Ok(bytes) => Header::from_cbor(&bytes)
                 .map(|header| header.chunks)
                 .map_err(|error| invalid(&path, error)),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(vec![]),

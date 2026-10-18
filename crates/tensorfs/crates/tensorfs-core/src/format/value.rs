@@ -1,4 +1,4 @@
-//! Free-form values for metadata and scheme params: integers only, no floats, codec-agnostic.
+//! Free-form values for metadata and scheme params: no null, integers only, codec-agnostic.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -6,9 +6,8 @@ use std::fmt;
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Value {
-    Null,
     Bool(bool),
     /// Any integer in the i64 or u64 range.
     Int(i128),
@@ -56,7 +55,6 @@ impl From<bool> for Value {
 impl Serialize for Value {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         match self {
-            Value::Null => s.serialize_unit(),
             Value::Bool(b) => s.serialize_bool(*b),
             Value::Int(i) => match (i64::try_from(*i), u64::try_from(*i)) {
                 (Ok(v), _) => s.serialize_i64(v),
@@ -82,10 +80,7 @@ impl<'de> Visitor<'de> for ValueVisitor {
     type Value = Value;
 
     fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.write_str("null, a bool, an integer, a string, a list or a map")
-    }
-    fn visit_unit<E>(self) -> Result<Value, E> {
-        Ok(Value::Null)
+        f.write_str("a bool, an integer, a string, a list or a map")
     }
     fn visit_bool<E>(self, v: bool) -> Result<Value, E> {
         Ok(Value::Bool(v))

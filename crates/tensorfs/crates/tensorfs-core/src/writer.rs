@@ -494,7 +494,7 @@ impl Writer {
                 .map(|c| c.expect("every chunk is laid"))
                 .collect();
             let header = Header::new(chunks, components, metadata)?;
-            let header = self.store.put_bytes(&header.to_json()?)?;
+            let header = self.store.put_bytes(&header.to_cbor()?)?;
             files.insert(HEADER_PATH.to_owned(), header);
         }
         let manifest = Manifest {

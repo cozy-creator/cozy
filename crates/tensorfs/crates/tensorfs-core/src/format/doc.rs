@@ -6,9 +6,10 @@ use std::collections::{BTreeMap, HashMap};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use super::layout::ALIGN;
 use super::{
-    check_format, decode, invalid, json, Dtype, Error, PartBytes, Result, Value, HEADER_FORMAT,
-    HEADER_PATH, MANIFEST_FORMAT, REPO_FORMAT,
+    cbor, check_format, decode, invalid, json, Dtype, Error, PartBytes, Result, Value, HEADER_PATH,
+    MANIFEST_FORMAT, REPO_FORMAT,
 };
 
 /// Free-form metadata, and a scheme's params.
@@ -122,8 +123,7 @@ impl Manifest {
 /// component's tensors and each tensor's parts are in construction order (the order a model
 /// builds and fills them), which the header's bytes and digest carry. Lookup by name goes
 /// through an index built by [`Header::new`].
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(try_from = "HeaderWire", into = "HeaderWire")]
+#[derive(Debug, Clone, Default)]
 pub struct Header {
     pub chunks: Vec<ObjectRef>,
     components: Vec<Component>,
@@ -139,24 +139,14 @@ impl PartialEq for Header {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-struct HeaderWire {
-    format: String,
-    chunks: Vec<ObjectRef>,
-    components: Vec<Component>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    metadata: Metadata,
-}
-
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Component {
     pub name: String,
     pub tensors: Vec<Tensor>,
 }
 
 /// A tensor: its key, logical dtype and shape, and either its bytes or its encoded parts.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(try_from = "TensorWire", into = "TensorWire")]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Tensor {
     pub key: String,
     pub dtype: Dtype,
@@ -173,58 +163,6 @@ pub enum Body {
         encoding: Encoding,
         parts: Vec<Part>,
     },
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-struct TensorWire {
-    key: String,
-    dtype: Dtype,
-    shape: Vec<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    data: Option<Location>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    encoding: Option<Encoding>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    parts: Option<Vec<Part>>,
-}
-
-impl TryFrom<TensorWire> for Tensor {
-    type Error = Error;
-    fn try_from(w: TensorWire) -> Result<Self> {
-        let body = match (w.data, w.encoding, w.parts) {
-            (Some(at), None, None) => Body::Data(at),
-            (None, Some(encoding), Some(parts)) if !parts.is_empty() => {
-                if encoding.scheme.is_empty() {
-                    return invalid("an encoding names no scheme");
-                }
-                Body::Encoded { encoding, parts }
-            }
-            _ => return invalid("a tensor has either `data`, or `encoding` and non-empty `parts`"),
-        };
-        Ok(Tensor {
-            key: w.key,
-            dtype: w.dtype,
-            shape: w.shape,
-            body,
-        })
-    }
-}
-
-impl From<Tensor> for TensorWire {
-    fn from(t: Tensor) -> Self {
-        let (data, encoding, parts) = match t.body {
-            Body::Data(at) => (Some(at), None, None),
-            Body::Encoded { encoding, parts } => (None, Some(encoding), Some(parts)),
-        };
-        TensorWire {
-            key: t.key,
-            dtype: t.dtype,
-            shape: t.shape,
-            data,
-            encoding,
-            parts,
-        }
-    }
 }
 
 impl Tensor {
@@ -249,7 +187,7 @@ impl Tensor {
 
 /// `chunk` indexes `Header::chunks`. A range longer than the rest of its chunk continues at
 /// offset 0 of the following chunks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Location {
     pub chunk: u64,
     pub offset: u64,
@@ -257,7 +195,7 @@ pub struct Location {
 }
 
 /// One stored part of an encoded tensor.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Part {
     pub role: String,
     pub dtype: Dtype,
@@ -278,7 +216,7 @@ impl Part {
 }
 
 /// A scheme name from the spec's registry and its explicit params.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Encoding {
     pub scheme: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -291,25 +229,6 @@ pub struct Span {
     pub chunk: usize,
     pub start: u64,
     pub length: u64,
-}
-
-impl TryFrom<HeaderWire> for Header {
-    type Error = Error;
-    fn try_from(w: HeaderWire) -> Result<Self> {
-        check_format(&w.format, HEADER_FORMAT)?;
-        Header::new(w.chunks, w.components, w.metadata)
-    }
-}
-
-impl From<Header> for HeaderWire {
-    fn from(h: Header) -> Self {
-        HeaderWire {
-            format: HEADER_FORMAT.into(),
-            chunks: h.chunks,
-            components: h.components,
-            metadata: h.metadata,
-        }
-    }
 }
 
 impl Header {
@@ -344,7 +263,10 @@ impl Header {
                 let at = |what: &str| format!("{name}/{key}{what}");
                 match &t.body {
                     Body::Data(loc) => header.check(loc, &t.dtype, &t.shape, &at(""))?,
-                    Body::Encoded { parts, .. } => {
+                    Body::Encoded { encoding, parts } => {
+                        if encoding.scheme.is_empty() || parts.is_empty() {
+                            return invalid(format!("{}: no scheme or no parts", at("")));
+                        }
                         for (i, p) in parts.iter().enumerate() {
                             let role = &p.role;
                             if role.is_empty() || parts[..i].iter().any(|o| &o.role == role) {
@@ -371,11 +293,13 @@ impl Header {
         Ok(header)
     }
 
-    pub fn from_json(bytes: &[u8]) -> Result<Header> {
-        json::read(bytes, HEADER_FORMAT)
+    /// A header from its bytes (spec §9), read strictly.
+    pub fn from_cbor(bytes: &[u8]) -> Result<Header> {
+        cbor::read(bytes)
     }
-    pub fn to_json(&self) -> Result<Vec<u8>> {
-        json::write(self)
+    /// The header's deterministic bytes.
+    pub fn to_cbor(&self) -> Result<Vec<u8>> {
+        cbor::write(self)
     }
 
     /// The components, in construction order.
@@ -399,7 +323,7 @@ impl Header {
             .flat_map(|c| c.tensors.iter().map(move |t| (c.name.as_str(), t)))
     }
 
-    /// The per-chunk spans of a location that [`Header::from_json`] accepted.
+    /// The per-chunk spans of a location that [`Header::new`] accepted.
     pub fn spans(&self, at: &Location) -> Vec<Span> {
         let mut out = Vec::new();
         let (mut chunk, mut start, mut left) = (at.chunk as usize, at.offset, at.length);
@@ -505,6 +429,9 @@ impl Header {
             .iter()
             .map(|c| c.length as u128)
             .sum();
+        if at.offset % ALIGN != 0 {
+            return invalid(format!("{what}: offset {} is not 4 KiB aligned", at.offset));
+        }
         if at.offset >= first.length || at.offset as u128 + at.length as u128 > room {
             return invalid(format!(
                 "{what}: bytes {}+{} run past the chunks",

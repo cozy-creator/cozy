@@ -86,7 +86,6 @@ impl<T, E: Into<Failure>> OrRaise<T> for Result<T, E> {
 
 fn to_py<'py>(py: Python<'py>, v: &Value) -> PyResult<Bound<'py, PyAny>> {
     Ok(match v {
-        Value::Null => py.None().into_bound(py),
         Value::Bool(b) => PyBool::new(py, *b).to_owned().into_any(),
         Value::Int(i) => match i64::try_from(*i) {
             Ok(n) => n.into_pyobject(py)?.into_any(),
@@ -114,9 +113,6 @@ fn metadata<'py>(py: Python<'py>, map: &Metadata) -> PyResult<Bound<'py, PyDict>
 }
 
 fn from_py(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
-    if obj.is_none() {
-        return Ok(Value::Null);
-    }
     if let Ok(b) = obj.cast::<PyBool>() {
         return Ok(Value::Bool(b.is_true()));
     }

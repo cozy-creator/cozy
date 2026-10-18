@@ -1,35 +1,36 @@
-; cozytensors/1 — restricted RFC 8949 Core Deterministic CBOR
-; Every container is definite-length. Tags, floats, null, undefined,
-; arbitrary simple values, trailing items, and non-preferred widths are forbidden.
+; cozytensors header (spec §4, §9): RFC 8949 core deterministic CBOR.
+; Definite lengths, shortest heads, map keys in bytewise order of their encodings.
+; No tags, floats, null, undefined or simple values besides true and false.
+; A reader skips trailing elements (`* any`) of the root and of every record: later
+; versions only append fields.
 
-header       = ["cozytensors/1", chunks, encodings, components, metadata]
-chunks       = [* chunk]
-chunk        = [sha256: digest32, length: uint]
-encodings    = [* encoding]        ; each distinct encoding once, in order of first use
-encoding     = [scheme: tstr .size (1..), params]
-params       = {* tstr => value}   ; the scheme's params (spec §6)
-components   = [* component]       ; construction order
-component    = [name, tensors]
-tensors      = [* tensor]          ; construction order
-tensor       = [tensor-key, dtype, shape, encoding: uint, parts]
-; encoding 0 is plain: one part, role "", the tensor's dtype and shape.
-; encoding i > 0 is encodings[i - 1].
-parts        = [+ part]            ; construction order
-part         = [role, dtype, shape, body]
-body         = [chunk: uint, offset: uint, length: uint]
-; chunk indexes chunks. offset is a multiple of 4096 and inside that chunk; a range longer
-; than the rest of its chunk continues at offset 0 of the next chunks. length is the byte
-; size of the part's dtype and shape. A zero-length body is [0, 0, 0].
-digest32     = bstr .size 32
-shape        = [* uint]
-dtype        = 0..11
-metadata     = {* tstr => value}   ; free-form; keys in bytewise order of their encodings
-value        = bool / int / tstr / [* value] / {* tstr => value}
+header     = [format: tstr, chunks: [* chunk], encodings: [* encoding],
+              components: [* component], metadata: {* tstr => value}, * any]
+; format: "cozytensors/2" or "cozytensors/2.<minor>"; a reader takes any minor.
 
-; Configs, tokenizers and other assets are manifest files (spec §3), not header fields.
-; name is one path segment (non-empty, not "." or "..", no "/", "\" or NUL) and unique;
-; tensor-key is non-empty UTF-8, unique within its component; role is non-empty, unique
-; within its tensor. Components, tensors and parts are never sorted.
-name         = tstr
-tensor-key   = tstr
-role         = tstr
+chunk      = [sha256: bstr .size 32, length: uint, * any]
+
+encoding   = [scheme: tstr .size (1..), params: {* tstr => value}, * any]
+; Each distinct [scheme, params] once, in order of first citation. The scheme and its
+; params define the decode (spec §6); a reader ignores params keys the scheme does not define.
+
+component  = [name: tstr, tensors: [* tensor], * any]
+; name is one path segment (non-empty, not "." or "..", no "/", "\" or NUL), unique.
+; Components, tensors and parts are in construction order and never sorted.
+
+tensor     = plain / encoded
+plain      = [key: tstr, dtype, shape, 0, location, * any]
+encoded    = [key: tstr, dtype, shape, encoding: uint .gt 0, parts: [+ part], * any]
+; key is non-empty, unique within its component. encoding i cites encodings[i - 1].
+part       = [role: tstr .size (1..), dtype, shape, location, * any]
+; role is unique within its tensor.
+
+location   = [chunk: uint, offset: uint, length: uint, * any]
+; chunk indexes chunks; offset is a multiple of 4096 and inside that chunk. A range longer
+; than the rest of its chunk continues at offset 0 of the next chunks. For a known dtype,
+; length is the byte size of dtype and shape. A zero-length location is [0, 0, 0].
+
+dtype      = tstr .size (1..)   ; a safetensors name (spec §5); another name is a newer dtype, read raw
+shape      = [* uint]
+value      = bool / int / tstr / [* value] / {* tstr => value}
+any        = value / bstr / [* any] / {* tstr => any}

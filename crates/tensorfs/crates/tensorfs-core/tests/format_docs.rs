@@ -68,26 +68,25 @@ fn header() -> Header {
 #[test]
 fn writer_is_deterministic_and_reader_round_trips() {
     let h = header();
-    let bytes = h.to_json().unwrap();
-    let text = std::str::from_utf8(&bytes).unwrap();
-    assert!(
-        text.starts_with(r#"{"chunks":[{"length":8192,"sha256":""#),
-        "{text}"
-    );
-    assert!(text
-        .contains(r#""format":"cozytensors/2","metadata":{"prompt":{"n":1,"rows":["a cat"]}}}"#));
-    assert!(!text.contains(' ') || text.contains("a cat") && text.matches(' ').count() == 1);
-    assert_eq!(Header::from_json(&bytes).unwrap(), h);
+    let bytes = h.to_cbor().unwrap();
+    // [format, chunks, encodings, components, metadata]: a 5-array, then the format text.
+    assert_eq!(&bytes[..15], b"\x85\x6dcozytensors/2");
+    // The first chunk: [bstr .size 32, 8192].
+    assert_eq!(&bytes[15..19], b"\x82\x82\x58\x20");
+    assert_eq!(&bytes[51..54], b"\x19\x20\x00");
+    assert!(bytes.ends_with(b"\xa1\x66prompt\xa2\x61n\x01\x64rows\x81\x65a cat"));
+    assert_eq!(Header::from_cbor(&bytes).unwrap(), h);
+    assert_eq!(Header::from_cbor(&bytes).unwrap().to_cbor().unwrap(), bytes);
 
     let mut wide = h.clone();
     wide.metadata.insert("max".into(), Value::from(u64::MAX));
     wide.metadata.insert("min".into(), Value::from(i64::MIN));
-    wide.metadata.insert("none".into(), Value::Null);
-    let wb = wide.to_json().unwrap();
-    assert!(std::str::from_utf8(&wb)
-        .unwrap()
-        .contains(r#""max":18446744073709551615,"min":-9223372036854775808,"none":null"#));
-    assert_eq!(Header::from_json(&wb).unwrap(), wide);
+    let wb = wide.to_cbor().unwrap();
+    let tail = [b"\x63max\x1b".as_slice(), &[0xff; 8], b"\x63min\x3b\x7f", &[0xff; 7]].concat();
+    assert!(wb.windows(tail.len()).any(|w| w == tail));
+    assert_eq!(Header::from_cbor(&wb).unwrap(), wide);
+    wide.metadata.insert("huge".into(), Value::Int(1 << 64));
+    assert_eq!(wide.to_cbor().unwrap_err().code(), "invalid");
 
     let m = Manifest {
         files: BTreeMap::from([(HEADER_PATH.into(), ObjectRef::of(&bytes))]),
@@ -112,118 +111,85 @@ fn writer_is_deterministic_and_reader_round_trips() {
     assert_eq!(r.lane(None, "bf16"), Some(&ObjectRef::of(&mb)));
 }
 
+/// Later versions append fields to the root and to records, and add dtypes and schemes: this
+/// reader skips the fields and reads the tensors raw.
 #[test]
-fn unknown_fields_and_minor_versions_read() {
-    let mut v: serde_json::Value = serde_json::from_slice(&header().to_json().unwrap()).unwrap();
-    v["format"] = json!("cozytensors/2.9");
-    v["future"] = json!({"x": [1, 2]});
-    let unet = &mut v["components"][0];
-    unet["future"] = json!("y");
-    unet["tensors"][0]["future"] = json!(true);
-    unet["tensors"][0]["dtype"] = json!("F3_E1M1");
-    unet["tensors"][1]["encoding"]["scheme"] = json!("acme-int3");
-    unet["tensors"][1]["parts"][0]["future"] = json!([]);
-    let pretty = serde_json::to_vec_pretty(&v).unwrap();
-    let h = Header::from_json(&pretty).unwrap();
-    let Body::Encoded { encoding, .. } = &h.tensor("unet", "b.weight").unwrap().body else {
+fn appended_fields_newer_dtypes_and_schemes_read() {
+    let h = header();
+    let good = h.to_cbor().unwrap();
+    let digest = &good[19..51];
+    let chunk = [b"\x82\x58\x20".as_slice(), digest, b"\x19\x20\x00"].concat();
+    let longer = [b"\x84\x58\x20".as_slice(), digest, b"\x19\x20\x00\x41\x00\xa1\x61k\x80"].concat();
+    let mut newer = patch(&good, b"\x85\x6dcozytensors/2", b"\x86\x6fcozytensors/2.9");
+    newer = patch(&newer, &chunk, &longer);
+    newer = patch(&newer, b"\x64BF16", b"\x67F3_E1M1");
+    newer = patch(&newer, b"\x6bfp8-rowwise", b"\x6bacme.int3x2");
+    newer.extend(b"\x82\x01\x62hi");
+    let read = Header::from_cbor(&newer).unwrap();
+    let a = read.tensor("unet", "a.weight").unwrap();
+    assert_eq!(a.dtype, Dtype::Other("F3_E1M1".into()));
+    assert_eq!(a.body, Body::Data(Location { chunk: 0, offset: 0, length: 12 }));
+    assert_eq!(read.chunks, h.chunks);
+    let b = read.tensor("unet", "b.weight").unwrap();
+    let Body::Encoded { encoding, .. } = &b.body else {
         panic!()
     };
-    assert_eq!(encoding.scheme, "acme-int3");
-    let a = h.tensor("unet", "a.weight").unwrap();
-    assert_eq!(a.dtype, Dtype::Other("F3_E1M1".into()));
-    let again = Header::from_json(&h.to_json().unwrap()).unwrap();
-    assert_eq!(again.tensor("unet", "a.weight"), Some(a));
+    assert_eq!(encoding.scheme, "acme.int3x2");
+    let chunk = |i: usize| Ok(vec![i as u8; read.chunks[i].length as usize]);
+    assert_eq!(read.read("unet", "b.weight", chunk).unwrap_err().code(), "unknown_scheme");
+    let again = Header::from_cbor(&read.to_cbor().unwrap()).unwrap();
+    assert_eq!(again, read, "this writer drops the fields it does not know");
+}
+
+/// `bytes` with `from` (found once) replaced by `to`.
+fn patch(bytes: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
+    let at = (bytes.windows(from.len()).position(|w| w == from)).expect("pattern present");
+    [&bytes[..at], to, &bytes[at + from.len()..]].concat()
 }
 
 #[test]
 fn red_documents_are_refused() {
-    let good = String::from_utf8(header().to_json().unwrap()).unwrap();
-    let cases: &[(&str, &str, &str, &str)] = &[
-        (
-            "major 3",
-            r#""format":"cozytensors/2""#,
-            r#""format":"cozytensors/3""#,
-            "format",
-        ),
-        (
-            "other kind",
-            r#""format":"cozytensors/2""#,
-            r#""format":"tensorfs.manifest/2""#,
-            "format",
-        ),
-        ("float", r#""length":12"#, r#""length":12.0"#, "invalid"),
-        (
-            "duplicate",
-            r#""length":12"#,
-            r#""length":12,"length":12"#,
-            "invalid",
-        ),
-        ("nested duplicate", r#""n":1"#, r#""n":1,"n":2"#, "invalid"),
-        ("length", r#""length":12"#, r#""length":14"#, "invalid"),
-        (
-            "empty dtype",
-            r#""dtype":"BF16""#,
-            r#""dtype":"""#,
-            "invalid",
-        ),
-        (
-            "bounds",
-            r#""chunk":1,"dtype":"F32","length":16,"offset":0"#,
-            r#""chunk":1,"dtype":"F32","length":16,"offset":90"#,
-            "invalid",
-        ),
-        (
-            "chunk index",
-            r#""chunk":1,"dtype":"F32""#,
-            r#""chunk":2,"dtype":"F32""#,
-            "invalid",
-        ),
-        (
-            "component",
-            r#""name":"unet""#,
-            r#""name":"un/et""#,
-            "invalid",
-        ),
-        (
-            "repeated key",
-            r#""key":"b.weight""#,
-            r#""key":"a.weight""#,
-            "invalid",
-        ),
-        (
-            "repeated role",
-            r#""role":"scale""#,
-            r#""role":"weight""#,
-            "invalid",
-        ),
-        (
-            "components as a map",
-            r#""components":[{"name":"unet","tensors":"#,
-            r#""components":{"unet":{"tensors":"#,
-            "invalid",
-        ),
-        (
-            "huge",
-            r#""length":12"#,
-            r#""length":18446744073709551616"#,
-            "invalid",
-        ),
+    let good = header().to_cbor().unwrap();
+    let cases: &[(&str, Vec<u8>, &str)] = &[
+        ("major 3", patch(&good, b"cozytensors/2", b"cozytensors/3"), "format"),
+        ("minor empty", patch(&good, b"\x6dcozytensors/2", b"\x6ecozytensors/2."), "format"),
+        ("trailing byte", [good.as_slice(), &[0]].concat(), "invalid"),
+        ("truncated", good[..good.len() - 1].to_vec(), "invalid"),
+        ("non-preferred length", patch(&good, b"\x19\x20\x00", b"\x1a\x00\x00\x20\x00"), "invalid"),
+        ("non-preferred small int", patch(&good, b"\x61n\x01", b"\x61n\x18\x01"), "invalid"),
+        ("indefinite root", patch(&good, b"\x85\x6d", b"\x9f\x6d"), "invalid"),
+        ("tag", patch(&good, b"\x61n\x01", b"\x61n\xc1\x01"), "invalid"),
+        ("float", patch(&good, b"\x61n\x01", b"\x61n\xf9\x3c\x00"), "invalid"),
+        ("null", patch(&good, b"\x61n\x01", b"\x61n\xf6"), "invalid"),
+        ("undefined", patch(&good, b"\x61n\x01", b"\x61n\xf7"), "invalid"),
+        ("byte string value", patch(&good, b"\x61n\x01", b"\x61n\x41\x01"), "invalid"),
+        ("keys out of order", patch(&good, b"\x61n\x01\x64rows\x81\x65a cat", b"\x64rows\x81\x65a cat\x61n\x01"), "invalid"),
+        ("repeated key", patch(&good, b"\xa2\x61n\x01\x64rows\x81\x65a cat", b"\xa2\x61n\x01\x61n\x02"), "invalid"),
+        ("31-byte digest", patch(&good, b"\x58\x20", b"\x58\x1f"), "invalid"),
+        ("empty dtype", patch(&good, b"\x64BF16", b"\x60"), "invalid"),
+        ("short record", patch(&good, b"\x82\x82\x58\x20", b"\x82\x81\x58\x20"), "invalid"),
+        ("bad trailing field", [patch(&good, b"\x85\x6d", b"\x86\x6d"), vec![0xf6]].concat(), "invalid"),
+        ("component name", patch(&good, b"\x64unet", b"\x64un/t"), "invalid"),
+        ("repeated tensor key", patch(&good, b"b.weight", b"a.weight"), "invalid"),
     ];
-    for (name, from, to, code) in cases {
-        assert!(good.contains(from), "{name}: {from} not in {good}");
-        let bad = good.replacen(from, to, 1);
-        let err = Header::from_json(bad.as_bytes()).expect_err(name);
+    for (name, bad, code) in cases {
+        let err = Header::from_cbor(bad).expect_err(name);
         assert_eq!(err.code(), *code, "{name}: {err}");
     }
-    let digest = good.replacen(
-        &header().chunks[0].sha256,
-        &header().chunks[0].sha256.to_uppercase(),
-        1,
-    );
-    assert_eq!(
-        Header::from_json(digest.as_bytes()).unwrap_err().code(),
-        "invalid"
-    );
+
+    for (name, tensors) in [
+        ("length", tweak(|t| t[0].body = Body::Data(Location { chunk: 0, offset: 0, length: 14 }))),
+        ("bounds", tweak(|t| t[0].body = Body::Data(Location { chunk: 1, offset: 4096, length: 12 }))),
+        ("chunk index", tweak(|t| t[0].body = Body::Data(Location { chunk: 2, offset: 0, length: 12 }))),
+        ("unaligned", tweak(|t| t[0].body = Body::Data(Location { chunk: 0, offset: 12, length: 12 }))),
+        ("repeated role", tweak(|t| set_role(&mut t[1], 1, "weight"))),
+        ("empty role", tweak(|t| set_role(&mut t[1], 1, ""))),
+    ] {
+        let chunks = header().chunks;
+        let unet = Component { name: "unet".into(), tensors };
+        let err = Header::new(chunks, vec![unet], Default::default()).expect_err(name);
+        assert_eq!(err.code(), "invalid", "{name}: {err}");
+    }
 
     for path in ["../x", "/x", "a//b", "a/./b", ""] {
         let doc = json!({"format": "tensorfs.manifest/2", "files": {path: {"sha256": "0".repeat(64), "length": 0}}});
@@ -235,6 +201,19 @@ fn red_documents_are_refused() {
     let repo = json!({"format": "tensorfs.repo/2", "name": "acme/tiny", "releases": [
         {"version": "1", "lanes": {}}, {"version": "1", "lanes": {}}]});
     assert!(Repo::from_json(repo.to_string().as_bytes()).is_err());
+}
+
+fn tweak(f: impl FnOnce(&mut Vec<Tensor>)) -> Vec<Tensor> {
+    let mut t = tensors();
+    f(&mut t);
+    t
+}
+
+fn set_role(t: &mut Tensor, i: usize, role: &str) {
+    let Body::Encoded { parts, .. } = &mut t.body else {
+        unreachable!()
+    };
+    parts[i].role = role.into();
 }
 
 #[test]
@@ -265,11 +244,6 @@ fn spans_continue_into_following_chunks() {
     assert_eq!(Dtype::F4.byte_len(&[16, 64]), Some(512));
     assert_eq!(Dtype::known().count(), 22);
     assert!(Dtype::known().all(|d| Dtype::parse(d.name()) == d));
-    let future = Dtype::parse("F3_E1M1");
-    assert_eq!(
-        (future.name(), future.bits(), future.byte_len(&[8])),
-        ("F3_E1M1", None, None)
-    );
 }
 
 /// Construction order is data: it survives a round trip and the digest covers it.
@@ -278,19 +252,19 @@ fn order_is_kept_and_a_reorder_changes_the_digest() {
     let h = header();
     let keys = |h: &Header| h.tensors().map(|(_, t)| t.key.clone()).collect::<Vec<_>>();
     assert_eq!(keys(&h), ["a.weight", "b.weight"]);
-    let back = Header::from_json(&h.to_json().unwrap()).unwrap();
+    let back = Header::from_cbor(&h.to_cbor().unwrap()).unwrap();
     assert_eq!(keys(&back), ["a.weight", "b.weight"]);
 
     let mut reordered = tensors();
     reordered.reverse();
     let r = header_with(reordered);
     assert_eq!(
-        keys(&Header::from_json(&r.to_json().unwrap()).unwrap()),
+        keys(&Header::from_cbor(&r.to_cbor().unwrap()).unwrap()),
         ["b.weight", "a.weight"]
     );
     assert_ne!(
-        ObjectRef::of(&r.to_json().unwrap()),
-        ObjectRef::of(&h.to_json().unwrap()),
+        ObjectRef::of(&r.to_cbor().unwrap()),
+        ObjectRef::of(&h.to_cbor().unwrap()),
         "reordering two tensors changes the header digest"
     );
     assert_ne!(r, h);
@@ -301,8 +275,8 @@ fn order_is_kept_and_a_reorder_changes_the_digest() {
     };
     parts.reverse();
     assert_ne!(
-        ObjectRef::of(&header_with(swapped).to_json().unwrap()),
-        ObjectRef::of(&h.to_json().unwrap()),
+        ObjectRef::of(&header_with(swapped).to_cbor().unwrap()),
+        ObjectRef::of(&h.to_cbor().unwrap()),
         "reordering two parts changes it too"
     );
 }

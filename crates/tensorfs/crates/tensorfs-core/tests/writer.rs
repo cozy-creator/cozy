@@ -848,7 +848,7 @@ fn the_header_keeps_the_producers_order() {
     ];
     assert_eq!(layout_names(&a), names(want));
     assert_layout(&a);
-    let reread = tensorfs_core::format::Header::from_json(&a.file("model.cozytensors").unwrap());
+    let reread = tensorfs_core::format::Header::from_cbor(&a.file("model.cozytensors").unwrap());
     assert_eq!(reread.unwrap(), *a.header());
 
     // The same tensors in another order: another header, another checkpoint.

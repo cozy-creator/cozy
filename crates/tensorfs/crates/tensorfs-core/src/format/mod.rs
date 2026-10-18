@@ -2,6 +2,7 @@
 //! Normative spec: `crates/tensorfs/spec/cozytensors-2.md`. Depends on serde, serde_json and
 //! sha2 only, so it builds without the `store` feature.
 
+mod cbor;
 mod decode;
 mod doc;
 mod dtype;

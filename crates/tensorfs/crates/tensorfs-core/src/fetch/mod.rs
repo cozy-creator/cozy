@@ -214,7 +214,7 @@ impl Fetcher {
                     .await?,
             );
             let parsed =
-                Header::from_json(&self.read(header).await?).map_err(|e| invalid(header, e))?;
+                Header::from_cbor(&self.read(header).await?).map_err(|e| invalid(header, e))?;
             wanted.retain(|object| object != header);
             wanted.extend(chunks(&parsed, want.components)?);
         }

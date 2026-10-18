@@ -146,17 +146,17 @@ fn write_store() -> BTreeMap<String, Vec<u8>> {
     let header = Header::new(chunks, components, Default::default()).unwrap();
     let manifest = Manifest {
         files: BTreeMap::from([
-            (HEADER_PATH.into(), put(header.to_json().unwrap())),
+            (HEADER_PATH.into(), put(header.to_cbor().unwrap())),
             ("LICENSE".into(), put(LICENSE.to_vec())),
         ]),
         metadata: Default::default(),
     };
     lanes.insert("all".to_string(), put(manifest.to_json().unwrap()));
 
-    // Lane "spans": one plain tensor at offset 100 of chunk 0, continuing through chunk 2.
+    // Lane "spans": one plain tensor at offset 4096 of chunk 0, continuing through chunk 2.
     let span = cases.iter().find(|c| c.lane == "spans").unwrap();
     let bytes = b64(span.bits.as_ref().unwrap());
-    let first = [vec![0u8; 100], bytes[..3996].to_vec()].concat();
+    let first = [vec![0u8; 4096], bytes[..3996].to_vec()].concat();
     let chunks = vec![
         put(first),
         put(bytes[3996..8092].to_vec()),
@@ -168,7 +168,7 @@ fn write_store() -> BTreeMap<String, Vec<u8>> {
         shape: span.shape.clone(),
         body: Body::Data(Location {
             chunk: 0,
-            offset: 100,
+            offset: 4096,
             length: bytes.len() as u64,
         }),
     };
@@ -178,7 +178,7 @@ fn write_store() -> BTreeMap<String, Vec<u8>> {
     };
     let header = Header::new(chunks, vec![component], Default::default()).unwrap();
     let manifest = Manifest {
-        files: BTreeMap::from([(HEADER_PATH.into(), put(header.to_json().unwrap()))]),
+        files: BTreeMap::from([(HEADER_PATH.into(), put(header.to_cbor().unwrap()))]),
         metadata: Default::default(),
     };
     lanes.insert("spans".to_string(), put(manifest.to_json().unwrap()));
@@ -284,7 +284,7 @@ fn reader_decodes_every_case() {
     for c in cases() {
         let manifest =
             Manifest::from_json(&blob(&root, repo.lane(None, &c.lane).unwrap())).unwrap();
-        let header = Header::from_json(&blob(&root, manifest.header().unwrap())).unwrap();
+        let header = Header::from_cbor(&blob(&root, manifest.header().unwrap())).unwrap();
         let got = header.read(&c.component, &c.key, |i| {
             Ok::<_, Error>(blob(&root, &header.chunks[i]))
         });
@@ -310,7 +310,7 @@ fn green_documents_read_and_red_documents_refuse() {
             let name = path.file_name().unwrap().to_string_lossy().to_string();
             let bytes = fs::read(&path).unwrap();
             let read = match name.split('-').next().unwrap() {
-                "header" => Header::from_json(&bytes).map(drop),
+                "header" => Header::from_cbor(&bytes).map(drop),
                 "manifest" => Manifest::from_json(&bytes).map(drop),
                 "repo" => Repo::from_json(&bytes).map(drop),
                 other => panic!("{name}: unknown kind {other}"),

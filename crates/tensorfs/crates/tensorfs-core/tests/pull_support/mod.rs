@@ -177,7 +177,7 @@ pub fn model(origin: &Path, name: &str, components: &[(&str, &[usize])], seed: u
         put(origin, &noise(seed + 7, 3000)),
     );
     let header = Header::new(objects, parsed, Default::default()).unwrap();
-    let header_ref = put(origin, &header.to_json().unwrap());
+    let header_ref = put(origin, &header.to_cbor().unwrap());
     files.insert("model.cozytensors".into(), header_ref.clone());
     let manifest = Manifest {
         files,

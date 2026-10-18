@@ -25,7 +25,7 @@ impl Store {
     pub fn checkpoint(&self, manifest: &ObjectRef) -> Result<Checkpoint> {
         let parsed = Manifest::from_json(&self.read(manifest)?)?;
         let header = match parsed.header() {
-            Some(header) => Header::from_json(&self.read(header)?)?,
+            Some(header) => Header::from_cbor(&self.read(header)?)?,
             None => Header::default(),
         };
         let paths = header
