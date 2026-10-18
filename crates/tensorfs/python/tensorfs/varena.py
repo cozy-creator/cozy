@@ -34,6 +34,7 @@ from ._ext.varena import (
     release_tier,
     reserve,
 )
+from ._ext.varena import Admit, Ledger, LedgerError, Row, RowFacts, Victim
 
 # Store-backed sources and owner-side CPU fills use the native store feature, enabled
 # in every supported Python wheel. Managed executor access still requires supplied sources.
@@ -65,5 +66,6 @@ __all__ = [
     "release_tier",
     "reserve",
 ]
+__all__ += ["Admit", "Ledger", "LedgerError", "Row", "RowFacts", "Victim"]
 if _STORE:
     __all__ += ["Source", "fill_sealed"]
