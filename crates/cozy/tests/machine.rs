@@ -141,18 +141,36 @@ fn an_added_machine_is_checked_before_it_is_recorded_then_listed_shown_checked_a
     assert_eq!(listed(&home, "again").expect("added")["state"], "ready");
 }
 
+/// `machine authorize` adds a controller's key to `keys/authorized` once, at 0600; TensorD reads it
+/// again when a signer is unknown.
+#[test]
+fn authorize_adds_a_controllers_key_once() {
+    let Some(home) = Home::new() else { return };
+    let key = tensord::stranger();
+    let first = home.json(["machine", "authorize", key.as_str(), "--json"]);
+    let again = home.json(["machine", "authorize", key.as_str(), "--json"]);
+    assert_eq!(
+        (first["changed"].as_bool(), again["changed"].as_bool()),
+        (Some(true), Some(false))
+    );
+    let path = home.root().join("keys/authorized");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), format!("{key}\n"));
+    use std::os::unix::fs::PermissionsExt as _;
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+}
+
 #[test]
 fn machine_refusals_say_what_to_do_instead() {
     let Some(home) = Home::new() else { return };
-    let stranger = tensord::stranger();
     for (args, exit, code) in [
-        // This computer's machine role comes with TensorD inside the binary.
-        (vec!["machine", "enable"], 2, "not_ported"),
-        (vec!["machine", "disable"], 2, "not_ported"),
+        // A controller's key is 32 bytes of unpadded base64url.
         (
-            vec!["machine", "authorize", stranger.as_str()],
-            2,
-            "not_ported",
+            vec!["machine", "authorize", "not-a-key"],
+            1,
+            "public_key_invalid",
         ),
         // `local` is ended by disabling it.
         (vec!["machine", "end", "local"], 1, "machine_local"),
