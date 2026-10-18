@@ -550,7 +550,11 @@ fn a_runs_adjustments_reach_its_record() {
         "{run}"
     );
 
-    let shown = cozy(&home, &work, &["run", "./tiny-adjusted/steps", "--on", "m1"]);
+    let shown = cozy(
+        &home,
+        &work,
+        &["run", "./tiny-adjusted/steps", "--on", "m1"],
+    );
     assert_eq!(shown.code, 0, "{shown:?}");
     eprintln!("{}", shown.stdout);
     for line in [
@@ -559,6 +563,69 @@ fn a_runs_adjustments_reach_its_record() {
     ] {
         assert!(shown.stdout.contains(line), "{line:?} not in {shown:?}");
     }
+}
+
+/// `--attention-kernel` reaches the executor: the run records the pin it was sent, `run show`
+/// says it, and a pin no call could apply (this function has no attention) warns in its log. A
+/// malformed pin is refused before anything is sent.
+#[test]
+fn an_attention_kernel_pin_reaches_the_executor_and_run_show() {
+    let Some(home) = Home::new() else { return };
+    if std::env::var_os("COZY_TEST_TENSORD").is_none() {
+        eprintln!("skipped: no TensorD (COZY_TEST_TENSORD is unset)");
+        return;
+    }
+    let _machine = common::tensord::added(&home, "m1");
+    let work = home.path().join("work");
+    copy(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/package/tiny-adjusted"),
+        &work.join("tiny-adjusted"),
+    );
+    let pin = "model/unet=sdpa";
+    let steps = [
+        "run",
+        "./tiny-adjusted/steps",
+        "--on",
+        "m1",
+        "--attention-kernel",
+    ];
+
+    let run = completed(&cozy(
+        &home,
+        &work,
+        &[&["--json"], &steps[..], &[pin]].concat(),
+    ));
+    let id = run["id"].as_str().unwrap();
+    let full = cozy(&home, &work, &["--json", "run", "show", id]);
+    let full: Value = serde_json::from_str(&full.stdout).unwrap_or_else(|_| panic!("{full:?}"));
+    // A Runtime before 0.28 names its GPUs `ranks`.
+    let execution = &full["measurements"]["execution"];
+    let first = execution["gpus"]
+        .get(0)
+        .or_else(|| execution["ranks"].get(0));
+    assert_eq!(
+        first.unwrap_or_else(|| panic!("{full}"))["attention"]["requested"],
+        pin,
+        "{full}"
+    );
+
+    let shown = cozy(&home, &work, &["run", "show", id]);
+    eprintln!("{}", shown.stdout);
+    let said = |line: &str| {
+        shown
+            .stdout
+            .lines()
+            .any(|l| l.contains(line) && l.contains(pin))
+    };
+    assert!(said("attention kernel"), "{shown:?}");
+    assert!(said("was never applied"), "{shown:?}");
+
+    let refused = cozy(&home, &work, &[&steps[..], &["unet=a=b"]].concat());
+    assert_eq!(refused.code, 2, "{refused:?}");
+    assert!(
+        refused.stderr.contains("[SLOT/]COMPONENT=KERNEL"),
+        "{refused:?}"
+    );
 }
 
 /// Counts the bytes sent to `target` through it: a TCP relay a machine is added behind.

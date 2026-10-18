@@ -24,6 +24,8 @@ pub struct Call<'a> {
     pub gpus: u32,
     /// 0: the machine's rules choose each slot's precision.
     pub bits: u32,
+    /// `--attention-kernel`; empty: the machine's own selection.
+    pub attention_kernel: &'a str,
 }
 
 /// Where the machine finds the function's code.
@@ -71,6 +73,7 @@ impl Call<'_> {
                 .collect(),
             models: choices(&bound.models)?,
             weights_destination: bound.destination.clone().unwrap_or_default(),
+            attention_kernel: self.attention_kernel.to_owned(),
             gpus: self.gpus,
             bits: self.bits,
             ..Default::default()
@@ -243,6 +246,7 @@ mod tests {
             callable: generate,
             gpus: 2,
             bits: 8,
+            attention_kernel: "model/unet=sdpa",
         };
         let spec = call.spec(&bound).unwrap();
         assert_eq!(spec.kind, v1::RunKind::Call);
@@ -258,7 +262,10 @@ mod tests {
             spec.payload.as_ref().unwrap().get(),
             r#"{"prompt":"a cat","steps":8}"#
         );
-        assert_eq!((spec.gpus, spec.bits), (2, 8));
+        assert_eq!(
+            (spec.gpus, spec.bits, spec.attention_kernel.as_str()),
+            (2, 8, "model/unet=sdpa")
+        );
         let model = &spec.models[0];
         assert_eq!(
             (
@@ -304,6 +311,7 @@ mod tests {
             callable: generate,
             gpus: 0,
             bits: 16,
+            attention_kernel: "",
         };
         let spec = call.warm(Warm::Gpu, &models).unwrap();
         let item = &spec.set.as_ref().unwrap().items[0];

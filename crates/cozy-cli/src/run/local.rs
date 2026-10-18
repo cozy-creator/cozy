@@ -93,6 +93,7 @@ pub async fn run(
         callable,
         gpus: args.gpus.unwrap_or(0),
         bits: super::bits(&args),
+        attention_kernel: args.attention_kernel.as_deref().unwrap_or_default(),
     };
     // The call goes where the code was installed, with its files once more: a machine that
     // dropped them meanwhile is sent only what it lacks, and installs them in the call.
