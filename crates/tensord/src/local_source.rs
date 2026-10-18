@@ -776,6 +776,8 @@ mod tests {
         assert!(environment.starts_with(cozy_platform::durable::canonical(&first_home).unwrap()), "{environment:?}");
         // Published generations have a directory, not an editable env symlink. They remain
         // ordinary inventory entries; a failed directory read must retain every live source.
+        // (Windows renames no directory with a file open under it: the hold goes first.)
+        drop(held);
         fs::create_dir_all(m.installer.generations.join("published/env")).unwrap();
         let unavailable = m.root.join("unavailable-generations");
         fs::rename(&m.installer.generations, &unavailable).unwrap();
@@ -783,6 +785,7 @@ mod tests {
         assert!(cozy_platform::paths::venv_python(&environment).is_file());
         assert!(first_home.join("tree/notes.txt").is_file());
         fs::rename(&unavailable, &m.installer.generations).unwrap();
+        let held = m.service.catalog.resolve(&installed.generation).unwrap();
         // The environment imports the tree itself: nothing of the project was copied into it.
         let imported = run(Command::new(&held.record.python).args(["-I", "-c", "import cpu_input; print(cpu_input.__file__)"]));
         assert_eq!(fs::canonicalize(&imported).unwrap(), fs::canonicalize(first_home.join("tree/cpu_input/__init__.py")).unwrap());

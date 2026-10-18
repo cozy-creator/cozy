@@ -231,7 +231,8 @@ fn deterministic_launch_failure_fails_once_with_its_reason() {
     fs::create_dir_all(&directory).unwrap();
     fs::write(directory.join(".hold"), b"").unwrap();
     // Its interpreter is a file the kernel cannot execute.
-    let python = cozy_platform::paths::venv_python(&directory.join("env"));
+    // Named as the catalog names it: its canonical directory (no 8.3 short names on Windows).
+    let python = cozy_platform::paths::venv_python(&cozy_platform::durable::canonical(&directory).unwrap().join("env"));
     fs::create_dir_all(python.parent().unwrap()).unwrap();
     fs::write(&python, b"not an interpreter").unwrap();
     let mut record: Value = serde_json::from_slice(&fs::read(generations.join(identity).join("generation.json")).unwrap()).unwrap();
