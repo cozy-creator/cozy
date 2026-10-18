@@ -559,6 +559,7 @@ fn installer_refusal(error: cozy_proto::error::Error) -> Refused {
 mod tests {
     use super::*;
     use std::{
+        io::Read,
         path::{Path, PathBuf},
         process::Command,
     };
@@ -643,19 +644,40 @@ mod tests {
         String::from_utf8(output.stdout).unwrap().trim().to_string()
     }
 
-    /// PyPI's Runtime and TensorFS wheels for this platform, standing in for the machine's own.
+    /// PyPI's newest Runtime and the TensorFS it accepts (a newer TensorFS may be out first),
+    /// wheels for this platform, standing in for the machine's own pair.
     fn sdk_pair(root: &Path) -> Vec<PathBuf> {
         let sdk = root.join("sdk");
-        run(Command::new("python3").args(["-m", "pip", "download", "-q", "--no-deps", "--only-binary=:all:", "--python-version", "3.12",
-            "--platform", "manylinux_2_28_x86_64", "--platform", "manylinux_2_17_x86_64", "-d"]).arg(&sdk).args(["cozy-runtime", "tensorfs"]));
-        ["cozy_runtime-", "tensorfs-"]
-            .iter()
-            .map(|prefix| {
-                (fs::read_dir(&sdk).unwrap().map(|entry| entry.unwrap().path()))
-                    .find(|path| path.file_name().unwrap().to_string_lossy().starts_with(prefix))
-                    .unwrap()
-            })
-            .collect()
+        let download = |requirement: &str| {
+            run(Command::new("python3").args(["-m", "pip", "download", "-q", "--no-deps", "--only-binary=:all:", "--python-version", "3.12",
+                "--platform", "manylinux_2_28_x86_64", "--platform", "manylinux_2_17_x86_64", "-d"]).arg(&sdk).arg(requirement));
+        };
+        let wheel = |prefix: &str| {
+            (fs::read_dir(&sdk).unwrap().map(|entry| entry.unwrap().path()))
+                .find(|path| path.file_name().unwrap().to_string_lossy().starts_with(prefix))
+                .unwrap()
+        };
+        download("cozy-runtime");
+        let runtime = wheel("cozy_runtime-");
+        download(&requirement(&runtime, "tensorfs"));
+        vec![runtime, wheel("tensorfs-")]
+    }
+
+    /// The requirement a wheel's metadata names for `name` (`tensorfs>=0.10,<0.11`).
+    fn requirement(wheel: &Path, name: &str) -> String {
+        let mut archive = zip::ZipArchive::new(fs::File::open(wheel).unwrap()).unwrap();
+        let metadata = (0..archive.len())
+            .map(|i| archive.by_index(i).unwrap().name().to_string())
+            .find(|member| member.ends_with(".dist-info/METADATA"))
+            .unwrap();
+        let mut text = String::new();
+        archive.by_name(&metadata).unwrap().read_to_string(&mut text).unwrap();
+        text.lines()
+            .filter_map(|line| line.strip_prefix("Requires-Dist: "))
+            .map(|requirement| requirement.split(';').next().unwrap().trim())
+            .find(|requirement| requirement.strip_prefix(name).is_some_and(|rest| !rest.starts_with(|c: char| c.is_alphanumeric() || c == '-' || c == '_')))
+            .unwrap()
+            .replace(' ', "")
     }
 
     /// A wheel's version, from its file name.
