@@ -6,7 +6,6 @@ it never imports or runs authored modules. Generations are never updated in plac
 """
 from __future__ import annotations
 
-import fcntl
 import os
 import shutil
 import subprocess
@@ -18,6 +17,7 @@ from pathlib import Path
 
 import msgspec
 
+from . import filelock, layout
 from .package_records import (
     DESCRIPTION_DECODER, ENVIRONMENT_DECODER, GENERATION_DECODER, Dependency, Describe,
     DescribeEnvironment, DescribeFailed, DescribeInstalled, Generation, InstallFailed, PackageMetadata, Pyproject,
@@ -52,7 +52,7 @@ def read_metadata(project: Path) -> PackageMetadata:
 # are inserted before loading the installed SDK reader.
 BOOTSTRAP = ("import pathlib,runpy,sys;"
              "root=pathlib.Path(sys.executable).absolute().parent.parent;"
-             "sys.path[:0]=[str(p) for p in (root/'lib').glob('python*/site-packages')];"
+             "sys.path[:0]=[str(p) for p in (*(root/'lib').glob('python*/site-packages'),root/'Lib'/'site-packages') if p.is_dir()];"
              "runpy.run_module('tensord_client.runtime_describe',run_name='__main__')")
 
 
@@ -70,7 +70,7 @@ def publish_generation(root: Path, metadata: PackageMetadata, interface: msgspec
     """Record and publish the environment. With no `interface` the root's installed one is
     described in the same process as the environment. `source_digest` is a live project's own
     code, whose installed files only point at it."""
-    interpreter = root / "env" / "bin" / "python"
+    interpreter = layout.interpreter(root / "env")
     inventory = subprocess.check_output(["uv", "pip", "list", "--python", str(interpreter), "--format", "json"])
     dependencies = msgspec.json.decode(inventory, type=list[Dependency])
     request = DescribeEnvironment(metadata.name, callees or {}, interface is None)
@@ -86,7 +86,8 @@ def publish_generation(root: Path, metadata: PackageMetadata, interface: msgspec
         output.flush()
         os.fsync(output.fileno())
     (root / ".generation.json.new").replace(root / "generation.json")
-    for directory in [root, root.parent]:
+    # Windows has no directory descriptor; NTFS journals the rename itself.
+    for directory in [root, root.parent] if sys.platform != "win32" else []:
         fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
         try:
             os.fsync(fd)
@@ -105,7 +106,7 @@ class GenerationHold:
     def __enter__(self):
         self.file = (self.path / ".hold").open("rb")
         try:
-            fcntl.flock(self.file, fcntl.LOCK_SH)
+            filelock.lock(self.file, shared=True)
             return GENERATION_DECODER.decode((self.path / "generation.json").read_bytes())
         except BaseException:
             self.file.close()
@@ -119,7 +120,7 @@ def collect(path: Path) -> bool:
     """Delete only a completed unheld generation explicitly selected by the owner."""
     with (path / ".hold").open("rb") as lock:
         try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            filelock.lock(lock, wait=False)
         except BlockingIOError:
             return False
         generation = GENERATION_DECODER.decode((path / "generation.json").read_bytes())
@@ -154,7 +155,7 @@ def install(project: Path, generations: Path, client_wheel: Path, *,
             if len(wheels) != 1:
                 raise ValueError("one source project must produce exactly one wheel")
             subprocess.run(["uv", "venv", "--python", python, str(root / "env")], check=True)
-            interpreter = root / "env" / "bin" / "python"
+            interpreter = layout.interpreter(root / "env")
             # uv resolves the package's declared lower AND upper dependency bounds;
             # no service-version floor or SDK upgrade is inserted into this solve.
             subprocess.run(["uv", "pip", "install", "--python", str(interpreter),
