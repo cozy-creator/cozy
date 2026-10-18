@@ -253,14 +253,13 @@ The chunk concatenation is not a safetensors file (padding); export rebuilds one
 
 **Construction order of an import.** A writer that converts with a table takes the table's row order, which its
 generator took from the target model's `state_dict()`. A source already in the canonical layout (a Diffusers or
-Transformers folder) carries no order, since safetensors files sort their keys; a writer orders it by a reference:
-the `state_dict()` order of the constructed model class, generated and checked in as data
-(`crates/tensorfs-core/converters/orders.json`). It applies the reference structurally:
+Transformers folder) carries no order, since safetensors files sort their keys; a writer orders it by the reference
+of the class its `config.json` names (`_class_name`, or the first of `architectures`): that class's `state_dict()`
+order, generated on the meta device and checked in as data (`crates/tensorfs-core/orders/<class>.json`,
+`task -d crates/tensorfs orders`). It applies the reference structurally:
 
 - a key is a path of dot-separated segments; a segment made only of digits is an index;
-- children of one parent come in the order the reference shows children of the same parent pattern (indices
-  written `#`), and indices ascend;
-- a child the reference never shows keeps the source's data order after the known ones.
-
-The reference is the one whose patterns cover the most of the source's keys. A source no reference covers is stored
-in its data order.
+- children of one parent come in the order the reference gives children of the same parent pattern (indices written
+  `#`), merged over every instance of that parent; indices ascend;
+- a child the reference does not hold, or every key of a class without a reference, keeps the source's data order
+  after the known children, and is reported.

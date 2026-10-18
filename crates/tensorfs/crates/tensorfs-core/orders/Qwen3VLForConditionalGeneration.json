@@ -1,6 +1,7 @@
 {
  "class": "Qwen3VLForConditionalGeneration",
  "sources": [
+  "hf://Qwen/Qwen-Image-2.1@790c92633540aa0cb11d9abf19eb46d861714758/text_encoder",
   "hf://Qwen/Qwen3-VL-2B-Instruct@89644892e4d85e24eaac8bacfd4f463576704203"
  ],
  "generator": "scripts/orders.py",

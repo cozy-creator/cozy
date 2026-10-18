@@ -57,6 +57,7 @@ TRANSFORMERS = "5.20.0"
 SDXL = ("stabilityai/stable-diffusion-xl-base-1.0", "462165984030d82259a11f4367a4eed129e94a7b")
 ANIMA = ("circlestone-labs/Anima-Base-v1.0-Diffusers", "073c3a9db359c31ad0e8aa268d15775473c2176c")
 QWEN_IMAGE = ("Qwen/Qwen-Image", "75e0b4be04f60ec59a75f475837eced720f823b6")
+QWEN_IMAGE_21 = ("Qwen/Qwen-Image-2.1", "790c92633540aa0cb11d9abf19eb46d861714758")
 QWEN3_VL = ("Qwen/Qwen3-VL-2B-Instruct", "89644892e4d85e24eaac8bacfd4f463576704203")
 QWEN3_5 = ("Qwen/Qwen3.5-9B", "c202236235762e1c871ad0ccb60c8ee5ba337b9a")
 KLEIN = ("black-forest-labs/flux-3-image-klein", "8454017f9ebaada30c998fccd9f67a80c7580f68")
@@ -72,6 +73,7 @@ SOURCES = [
     (SDXL, "unet"), (SDXL, "vae"), (SDXL, "text_encoder"), (SDXL, "text_encoder_2"),
     (ANIMA, "transformer"), (ANIMA, "text_encoder"), (ANIMA, "text_conditioner"), (ANIMA, "vae"),
     (QWEN_IMAGE, "transformer"), (QWEN_IMAGE, "vae"), (QWEN_IMAGE, "text_encoder"),
+    (QWEN_IMAGE_21, "transformer"), (QWEN_IMAGE_21, "vae"), (QWEN_IMAGE_21, "text_encoder"),
     (QWEN3_VL, ""), (QWEN3_5, ""),
     # (KLEIN, "transformer"), (KLEIN, "vae"): gated; waits for an HF_TOKEN here and in CI.
 ]

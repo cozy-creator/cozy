@@ -1382,3 +1382,96 @@ fn sources_parse_and_pin() {
         Some("e6bb9ea85bbf7bf6478a7c6d18b71246f22e95d41bcdd80ed40aa212c33cfeff")
     );
 }
+
+/// Each reference against the owner's real v1 lanes (read-only), whose headers keep the
+/// construction order their producer wrote: from a lane's keys sorted (as a safetensors file
+/// lists them), the class's reference restores the lane's order (weight before bias, blocks by
+/// number) for every key it holds. Keys the reference lacks (v1 names that differ from
+/// upstream's) are counted, not ordered.
+#[test]
+#[ignore = "reads the owner's ~/.tensorfs v1 lanes"]
+fn references_match_real_lanes() {
+    let home = PathBuf::from(std::env::var_os("HOME").unwrap()).join(".tensorfs");
+    let blob = |sha: &str| {
+        fs::read(
+            home.join("blobs")
+                .join(&sha[..2])
+                .join(&sha[2..4])
+                .join(sha),
+        )
+        .unwrap()
+    };
+    let mut held = 0;
+    // (lane, manifest prefix, the class of components whose config does not name one)
+    for (lane, prefix, unnamed) in [
+        ("sdxl", "77cac5a0f4a5", None),
+        ("anima bf16", "5d6a05188427", None),
+        ("qwen-image-2.1 int8", "e7c79ee942b8", None),
+        (
+            "qwen3.5-9b int8",
+            "e0f61ce1ab03",
+            Some("Qwen3_5ForConditionalGeneration"),
+        ),
+    ] {
+        let dir = home
+            .join("manifests")
+            .join(&prefix[..2])
+            .join(&prefix[2..4]);
+        let manifest = (fs::read_dir(&dir).unwrap().flatten())
+            .find(|e| e.file_name().to_string_lossy().starts_with(prefix))
+            .unwrap()
+            .path();
+        let doc: serde_json::Value = serde_json::from_slice(&fs::read(manifest).unwrap()).unwrap();
+        let entry = (doc["entries"].as_array().unwrap().iter())
+            .find(|e| e["kind"] == "cozytensors")
+            .unwrap();
+        let v1 =
+            tensorfs_core::header::Header::parse(&blob(entry["blob"]["sha256"].as_str().unwrap()))
+                .unwrap();
+        for (component, tensors) in &v1.components {
+            let class = (v1.configs.iter())
+                .find(|(name, _)| name == component)
+                .and_then(|(_, bytes)| {
+                    let config: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+                    let class = config
+                        .get("_class_name")
+                        .or_else(|| config.get("architectures")?.get(0));
+                    class?.as_str().map(str::to_owned)
+                })
+                .or(unnamed.map(str::to_owned));
+            let Some(class) = class
+                .clone()
+                .filter(|c| import::order::classes().any(|k| k == c))
+            else {
+                println!("{lane}/{component}: {class:?} has no reference");
+                continue;
+            };
+            let built: Vec<&str> = tensors.iter().map(|(k, _)| k.as_str()).collect();
+            let mut stored = built.clone();
+            stored.sort_unstable();
+            let keys: Vec<(&str, usize)> =
+                stored.iter().enumerate().map(|(i, k)| (*k, i)).collect();
+            let ordered = import::constructor_order(Some(&class), &keys);
+            let lacking: Vec<&str> = ordered.unknown.iter().map(|i| keys[*i].0).collect();
+            let got: Vec<&str> = (ordered.order.iter())
+                .map(|i| keys[*i].0)
+                .filter(|k| !lacking.contains(k))
+                .collect();
+            let want: Vec<&str> = built
+                .iter()
+                .copied()
+                .filter(|k| !lacking.contains(k))
+                .collect();
+            println!(
+                "{lane}/{component} ({class}): {} of {} keys held, order {}; lacking e.g. {:?}",
+                want.len(),
+                built.len(),
+                if got == want { "matches" } else { "DIFFERS" },
+                &lacking[..lacking.len().min(2)]
+            );
+            assert_eq!(got, want, "{lane}/{component}");
+            held += want.len();
+        }
+    }
+    assert!(held > 5000, "{held}");
+}

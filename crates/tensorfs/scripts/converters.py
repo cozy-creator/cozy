@@ -406,6 +406,12 @@ def h3_lora(h3: Any, source: dict[str, tuple[str, tuple[int, ...]]]) -> dict[str
                 if b_ops := row_ops(b[:, 0].numpy(), (fused, 1)):
                     ops["b"] = b_ops
                 rows.extend([target.removesuffix(".weight"), stem, ops] for stem in stems)
+    # Rows in the transformer's construction order (#624): its state_dict, not the trainer's.
+    from diffusers import MiniMaxH3Transformer3DModel
+
+    with torch.device("meta"):
+        census = {k: i for i, k in enumerate(MiniMaxH3Transformer3DModel(**config).state_dict())}
+    rows.sort(key=lambda r: census[r[0] + ".weight"])
     lora = {"a": [".lora_A.weight", ".lora_down.weight"], "b": [".lora_B.weight", ".lora_up.weight"], "alpha": [".alpha"]}
     return {"name": "h3.lora", "explicit": True, "lora": lora, "components": [{"name": "transformer", "rows": rows}]}
 
