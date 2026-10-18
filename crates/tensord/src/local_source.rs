@@ -648,9 +648,16 @@ mod tests {
     /// wheels for this platform, standing in for the machine's own pair.
     fn sdk_pair(root: &Path) -> Vec<PathBuf> {
         let sdk = root.join("sdk");
+        // A Linux machine's pair is its manylinux wheels whatever this host's glibc; elsewhere this
+        // platform's own.
+        let platform: &[&str] = if cfg!(target_os = "linux") {
+            &["--platform", "manylinux_2_28_x86_64", "--platform", "manylinux_2_17_x86_64"]
+        } else {
+            &[]
+        };
         let download = |requirement: &str| {
-            run(Command::new("python3").args(["-m", "pip", "download", "-q", "--no-deps", "--only-binary=:all:", "--python-version", "3.12",
-                "--platform", "manylinux_2_28_x86_64", "--platform", "manylinux_2_17_x86_64", "-d"]).arg(&sdk).arg(requirement));
+            run(Command::new("python3").args(["-m", "pip", "download", "-q", "--no-deps", "--only-binary=:all:", "--python-version", "3.12"])
+                .args(platform).arg("-d").arg(&sdk).arg(requirement));
         };
         let wheel = |prefix: &str| {
             (fs::read_dir(&sdk).unwrap().map(|entry| entry.unwrap().path()))
