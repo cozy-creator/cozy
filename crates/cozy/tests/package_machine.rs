@@ -61,7 +61,7 @@ fn held(home: &Home, dir: &Path, package: &str) -> Vec<String> {
 
 /// A published package installs on a machine as a run the machine resolves, shows in `list` with
 /// its Hub, moves to its Hub's newest release with `update` (the older one leaving), and leaves
-/// with `remove`; a package the Hub lacks ends its run with the machine's reason.
+/// with `remove`; a package the Hub lacks is refused before any run.
 #[test]
 fn packages_install_update_and_remove_on_a_machine() {
     let Some(home) = Home::with_hub() else { return };
@@ -96,11 +96,18 @@ fn packages_install_update_and_remove_on_a_machine() {
     let current = json(&home, &dir, &["package", "update", &package, "--on", "t1"]);
     assert_eq!(current["packages"][0]["status"], "current", "{current}");
 
-    let (code, last) = install(&home, &dir, &format!("{account}/nope"));
+    // A name the Hub lacks is refused before any run, as `cozy run` refuses it.
+    let nope = format!("{account}/nope");
+    let missing = cozy(
+        &home,
+        &dir,
+        &["--json", "package", "install", &nope, "--on", "t1"],
+    );
+    assert_eq!(missing.code, 1, "{missing:?}");
     assert_eq!(
-        (code, last["type"].as_str()),
-        (1, Some("run.failed")),
-        "{last}"
+        missing.refusal()["code"],
+        "package_not_found",
+        "{missing:?}"
     );
 
     let removed = json(&home, &dir, &["package", "remove", &package, "--on", "t1"]);
@@ -144,7 +151,8 @@ fn an_unversioned_install_takes_the_hubs_newest_release() {
         format!("t1 also holds {package}@0.1.0"),
         format!("cozy package update {package} --on t1"),
     ] {
-        assert!(out.stderr.contains(&said), "{said:?} not in {out:?}");
+        let shown = format!("{}{}", out.stdout, out.stderr);
+        assert!(shown.contains(&said), "{said:?} not in {out:?}");
     }
     let mut releases = held(&home, &dir, &package);
     releases.sort();
