@@ -29,7 +29,7 @@ with p.acquire(ws, 0, region=0, stream=torch.cuda.current_stream().cuda_stream) 
 ## Open and register
 
 ```python
-p = Plane(devices, readers=16, copy_streams=1, staging_buffers=16, staging_bytes=16 << 20,
+p = Plane(devices, readers=16, copy_streams=1, staging_buffers=32, staging_bytes=1 << 20,
           floor_bytes=256 << 20)
 ws = p.register(ck, regions, host=PageCache(direct=True))   # or SealedLayout(fd)
 ws.nbytes, ws.digest, ws.regions, ws.parts; ws.close()

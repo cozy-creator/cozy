@@ -369,18 +369,20 @@ struct Slot {
 unsafe impl Send for Slot {}
 
 struct Slots {
-    free: Mutex<Vec<Slot>>,
+    free: Mutex<std::collections::VecDeque<Slot>>,
     cv: Condvar,
 }
 
 impl Slots {
-    /// A free slot whose last copy has landed.
+    /// A free slot whose last copy has landed: one already past it if any, else the one
+    /// returned longest ago, waited for.
     fn take(&self) -> Result<Slot> {
         let mut free = self.free.lock().unwrap();
         while free.is_empty() {
             free = self.cv.wait(free).unwrap();
         }
-        let mut slot = free.pop().unwrap();
+        let landed = free.iter().position(|s| s.last.as_ref().is_none_or(|e| e.done().unwrap_or(false)));
+        let mut slot = free.remove(landed.unwrap_or(0)).unwrap();
         drop(free);
         if let Some(ev) = slot.last.take() {
             if let Err(e) = ev.sync() {
@@ -391,7 +393,7 @@ impl Slots {
         Ok(slot)
     }
     fn put(&self, slot: Slot) {
-        self.free.lock().unwrap().push(slot);
+        self.free.lock().unwrap().push_back(slot);
         self.cv.notify_one();
     }
 }
@@ -529,7 +531,7 @@ fn mover_main(m: Arc<MoverCtx>, rx: Receiver<CopyJob>, ok: Sender<Result<()>>) {
     let (stream, slots) = match init {
         Ok((s, slots)) => {
             let _ = ok.send(Ok(()));
-            (Stream(s), Arc::new(Slots { free: Mutex::new(slots), cv: Condvar::new() }))
+            (Stream(s), Arc::new(Slots { free: Mutex::new(slots.into()), cv: Condvar::new() }))
         }
         Err(e) => {
             let _ = ok.send(Err(e));

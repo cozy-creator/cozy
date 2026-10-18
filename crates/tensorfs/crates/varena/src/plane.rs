@@ -43,8 +43,10 @@ impl Default for PlaneConfig {
             devices: Vec::new(),
             readers: 16,
             copy_streams: 1,
-            staging_buffers: 16,
-            staging_bytes: 16 << 20,
+            // Many small requests in flight read an NVMe at its rate; 4 MiB and up fall behind
+            // (U8's sweep on an RTX 3090 pod, as fastsafetensors' 512 KiB blocks).
+            staging_buffers: 32,
+            staging_bytes: 1 << 20,
             floor_bytes: 256 << 20,
         }
     }
@@ -102,7 +104,8 @@ pub(crate) struct DReg {
     pub shared: bool,
     pub state: DState,
     pub live: u32,
-    /// Release events of finished leases the device may not have reached.
+    /// The last fill's copy event and release events of finished leases: what the device may
+    /// still do with the region's bytes.
     pub pending: Vec<EvRef>,
     /// Plane-clock nanoseconds of the last map, acquire or release.
     pub last_use: u64,
@@ -352,11 +355,8 @@ impl Inner {
         let base = dw.base;
         dw.epoch += 1;
         let reg = &mut dw.regs[r as usize];
-        let waited = match &reg.state {
-            DState::Filling(ev) => ev.sync(),
-            _ => Ok(()),
-        }
-        .and_then(|_| reg.pending.drain(..).try_for_each(|e| e.sync()));
+        // The last fill's copy and every release the device may not have passed.
+        let waited = reg.pending.drain(..).try_for_each(|e| e.sync());
         let mem = std::mem::take(&mut reg.mem);
         let shared = std::mem::take(&mut reg.shared);
         reg.state = DState::Absent;
@@ -404,7 +404,12 @@ impl Inner {
                     return;
                 };
                 match res {
-                    Ok(cp) => reg.state = DState::Filling(cp.ready),
+                    Ok(cp) => {
+                        // Unmapping waits for it whatever the state becomes (an unconfirmed
+                        // release turns a filling region Invalid).
+                        reg.pending.push(cp.ready.clone());
+                        reg.state = DState::Filling(cp.ready);
+                    }
                     Err(e) => {
                         reg.state = DState::Invalid(e.clone());
                         c.latch(&e);

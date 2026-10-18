@@ -253,8 +253,7 @@ class Model:
             keep = set(self.window_chunks(ck))
             picked = [i for i, r in enumerate(regions) if keep & set(r)]
         plane.want(ws, 0, picked).wait()
-        moved = sum(ws.regions[i]["nbytes"] for i in (picked if picked is not None else range(len(regions))))
-        return moved, ws
+        return picked, ws
 
     def spans(self, window):
         ck = self.checkpoint()
@@ -281,11 +280,13 @@ class Model:
         if layout == "fastsafetensors":
             moved = self.safetensors(window)
         elif layout == "T64+rust":
-            moved, ws = self.rust(readers["plane"], window)
+            picked, ws = self.rust(readers["plane"], window)
         else:
             moved = readers[layout].run(self.spans(window), direct=cold)
         s = time.perf_counter() - t0
         if ws is not None:
+            regions = ws.regions
+            moved = sum(regions[i]["nbytes"] for i in (picked if picked is not None else range(len(regions))))
             ws.close()
         torch.cuda.empty_cache()
         return s, moved

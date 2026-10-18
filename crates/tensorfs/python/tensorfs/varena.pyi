@@ -166,8 +166,8 @@ class Plane:
         devices: Sequence[int],
         readers: int = 16,
         copy_streams: int = 1,
-        staging_buffers: int = 16,
-        staging_bytes: int = 16 << 20,
+        staging_buffers: int = 32,
+        staging_bytes: int = 1 << 20,
         floor_bytes: int = 256 << 20,
     ) -> None: ...
     @property

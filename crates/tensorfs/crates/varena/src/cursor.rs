@@ -28,6 +28,8 @@ struct Place {
     k: u64,
     off: u64,
     len: u64,
+    /// The copy that wrote these bytes, once it was taken by a lease.
+    copied: Option<EvRef>,
     /// None while leased or unread; Some(ev): the bytes may be overwritten after `ev`
     /// (None inside: at once).
     freed: Option<Option<EvRef>>,
@@ -111,7 +113,7 @@ fn pump(inner: &Arc<Inner>, c: &mut Core, id: u64) -> Result<()> {
         }
         let waits: Vec<EvRef> = cur.placed.iter().filter(|p| hit(p)).filter_map(|p| p.freed.clone().flatten()).collect();
         cur.placed.retain(|p| !hit(p));
-        cur.placed.push(Place { k, off, len: size, freed: None });
+        cur.placed.push(Place { k, off, len: size, copied: None, freed: None });
         cur.head = off + size;
         submit(inner, c, id, k, off, waits)?;
     }
@@ -199,8 +201,9 @@ fn finish(inner: &Arc<Inner>, c: &mut Core, id: u64) -> Result<()> {
     let d = c.cursors.get(&id).ok_or_else(|| closed(id))?.dev;
     let _g = inner.devices[d].bind()?;
     let cur = c.cursors.remove(&id).unwrap();
-    let freed = cur.placed.iter().filter_map(|p| p.freed.as_ref().and_then(Option::as_ref));
-    if let Err(e) = cur.ready.values().flatten().chain(freed).try_for_each(|e| e.sync()) {
+    // Every copy into the ring (taken or not) and every reader's release.
+    let placed = cur.placed.iter().flat_map(|p| p.copied.iter().chain(p.freed.iter().flatten()));
+    if let Err(e) = cur.ready.values().flatten().chain(placed).try_for_each(|e| e.sync()) {
         return Err(c.poison(format!("waiting for a ring's copies and readers failed: {e}")));
     }
     if cur.ring_len > 0 {
@@ -390,7 +393,9 @@ impl Cursor {
         cur.ready.remove(&k);
         cur.pos += 1;
         cur.live += 1;
-        let off = cur.placed.iter().find(|x| x.k == k).expect("a queued position is placed").off;
+        let place = cur.placed.iter_mut().find(|x| x.k == k).expect("a queued position is placed");
+        place.copied = Some(ev.clone());
+        let off = place.off;
         Ok(Lease {
             inner: inner.clone(),
             ptr: cur.ring_base + off,

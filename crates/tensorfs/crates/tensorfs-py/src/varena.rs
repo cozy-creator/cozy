@@ -171,7 +171,7 @@ impl PyPlane {
 #[pymethods]
 impl PyPlane {
     #[new]
-    #[pyo3(signature = (devices, readers = 16, copy_streams = 1, staging_buffers = 16, staging_bytes = 16 << 20, floor_bytes = 256 << 20))]
+    #[pyo3(signature = (devices, readers = 16, copy_streams = 1, staging_buffers = 32, staging_bytes = 1 << 20, floor_bytes = 256 << 20))]
     fn new(
         py: Python<'_>,
         devices: Vec<i32>,
