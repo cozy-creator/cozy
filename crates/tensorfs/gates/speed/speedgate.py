@@ -13,7 +13,9 @@ Readers:
   `register_checkpoint`, want, wait.
 - `T64+fst`: the same chunk files read by fastsafetensors' own C++ engine.
 - `T64`: the F1 Python reader over the same chunk files.
-- `fastsafetensors`: fastsafetensors 0.5.0 over the safetensors files (the gate's reference).
+- `fastsafetensors`: fastsafetensors 0.5.0 over the safetensors files.
+- `st-cuda`, `st-cpu-cuda`: `safetensors.safe_open` 0.8 onto the GPU, or onto the CPU then `.to("cuda")`.
+The gate compares `T64+rust` with the best of the three safetensors paths in each cell.
 """
 
 import ctypes
@@ -34,6 +36,7 @@ import torch
 from fastsafetensors import SafeTensorsFileLoader
 from fastsafetensors import cpp as fstcpp
 from fastsafetensors.frameworks import get_framework_op
+from safetensors import safe_open
 from tensorfs import v2, varena
 
 # fastsafetensors dlopens an unversioned libcudart.so; torch's wheels ship only the versioned one.
@@ -49,7 +52,8 @@ LANES = {  # v1 manifest, window component, window key prefix, repetitions
     "sdxl-int8": ("3eb5674846e82e5b8d3e20d73f083a6d4aaa57ea699425287d5669906cfe6064", "unet", "up_blocks.1.", 5),
     "qwen-int8": ("e7c79ee942b892d76e778fb873fbdce55deaadb1fe669fca6e7851980f747493", "transformer", "transformer_blocks.30.", 5),
 }
-LAYOUTS = ("T64+rust", "T64+fst", "T64", "fastsafetensors")
+LAYOUTS = ("T64+rust", "T64+fst", "T64", "fastsafetensors", "st-cuda", "st-cpu-cuda")
+SAFETENSORS = ("fastsafetensors", "st-cuda", "st-cpu-cuda")  # the paths the gate compares against
 
 
 def natkey(s):
@@ -241,7 +245,7 @@ class Model:
         return sorted(want)
 
     def files(self, layout):
-        return self.st if layout == "fastsafetensors" else [p for p, _ in self.chunks]
+        return self.st if layout in SAFETENSORS else [p for p, _ in self.chunks]
 
     def rust(self, plane, window):
         """Checkpoint, register (its default regions) and want on the device: v2 weights read
@@ -257,25 +261,35 @@ class Model:
         chunks = self.window_chunks(ck) if window else range(len(self.chunks))
         return [(self.chunks[c][0], 0, self.chunks[c][1]) for c in chunks]
 
-    def safetensors(self, window):
+    def safetensors(self, layout, window):
+        """fastsafetensors (one loader over every file), or `safe_open` per file onto the GPU
+        (`st-cuda`) or onto the CPU and then `.to("cuda")` (`st-cpu-cuda`)."""
         keys = [f"{p[1]}#{p[2]}" for p in self.parts if p[6] or not window]
-        loader = SafeTensorsFileLoader(None, "cuda:0", nogds=True)
-        if window:
-            keep = set(keys)
-            loader.set_tensor_filter(lambda n: n in keep)
-        loader.add_filenames({0: self.st})
-        fb = loader.copy_files_to_device()
-        out = [fb.get_tensor(k) for k in keys]
-        fb.close()
-        loader.close()
+        if layout == "fastsafetensors":
+            loader = SafeTensorsFileLoader(None, "cuda:0", nogds=True)
+            if window:
+                keep = set(keys)
+                loader.set_tensor_filter(lambda n: n in keep)
+            loader.add_filenames({0: self.st})
+            fb = loader.copy_files_to_device()
+            out = [fb.get_tensor(k) for k in keys]
+            fb.close()
+            loader.close()
+        else:
+            out = []
+            for path in self.st:
+                comp = os.path.basename(path).removesuffix(".safetensors")
+                names = [f"{p[1]}#{p[2]}" for p in self.parts if p[0] == comp and (p[6] or not window)]
+                with safe_open(path, framework="pt", device="cuda:0" if layout == "st-cuda" else "cpu") as f:
+                    out += [f.get_tensor(k) if layout == "st-cuda" else f.get_tensor(k).to("cuda:0") for k in names]
         torch.cuda.synchronize()
         return sum(t.numel() for t in out)
 
     def once(self, readers, layout, window, cold):
         ws = None
         t0 = time.perf_counter()
-        if layout == "fastsafetensors":
-            moved = self.safetensors(window)
+        if layout in SAFETENSORS:
+            moved = self.safetensors(layout, window)
         elif layout == "T64+rust":
             picked, ws = self.rust(readers["plane"], window)
         else:
@@ -333,12 +347,15 @@ def summary(model, res):
         lines.append(f"{layout} | " + " | ".join(row))
     gate = {}
     for cell in cells:
-        rust, fst = med(res[f"T64+rust {cell}"]), med(res[f"fastsafetensors {cell}"])
+        rust = med(res[f"T64+rust {cell}"])
+        st = {l: med(res[f"{l} {cell}"]) for l in SAFETENSORS if res.get(f"{l} {cell}")}
+        best = min(st, key=st.get)
         engine = med(res[f"T64+fst {cell}"])
-        gate[cell] = {"rust_ms": round(1000 * rust), "fastsafetensors_ms": round(1000 * fst), "engine_ms": round(1000 * engine),
-                      "margin": round(fst / rust - 1, 3), "pass": rust <= fst}
-        lines.append(f"gate {cell}: T64+rust {1000 * rust:.0f} ms vs fastsafetensors {1000 * fst:.0f} ms ({100 * (fst / rust - 1):+.0f}%), "
-                     f"vs its engine on the same chunks {1000 * engine:.0f} ms ({100 * (engine / rust - 1):+.0f}%) -> {'PASS' if rust <= fst else 'FAIL'}")
+        gate[cell] = {"rust_ms": round(1000 * rust), "safetensors": best, "safetensors_ms": round(1000 * st[best]),
+                      "engine_ms": round(1000 * engine), "margin": round(st[best] / rust - 1, 3), "pass": rust <= st[best]}
+        lines.append(f"gate {cell}: T64+rust {1000 * rust:.0f} ms vs best safetensors ({best}) {1000 * st[best]:.0f} ms "
+                     f"({100 * (st[best] / rust - 1):+.0f}%), vs fastsafetensors' engine on the same chunks {1000 * engine:.0f} ms "
+                     f"({100 * (engine / rust - 1):+.0f}%) -> {'PASS' if rust <= st[best] else 'FAIL'}")
     return lines, gate
 
 
