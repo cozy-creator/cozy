@@ -185,6 +185,16 @@ fn machine_refusals_say_what_to_do_instead() {
             "{args:?}: {out:?}"
         );
     }
+    // A bad key's next step starts on the controller's computer: installing cozy there.
+    let next = home
+        .cozy(["machine", "authorize", "not-a-key", "--json"])
+        .refusal()["next"][0]
+        .clone();
+    assert!(
+        next.as_str()
+            .is_some_and(|n| n.contains("https://tensorhub.com/install.sh")),
+        "{next}"
+    );
     // Rental options without a product, and a malformed fingerprint, are usage errors.
     for args in [
         vec!["machine", "rent", "--gpus", "2"],
