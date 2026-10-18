@@ -784,6 +784,7 @@ impl Runs {
                     let report = observe.clone();
                     let (_, plan, _) = self.resolve(
                         actor,
+                        id,
                         Some(installation.clone()),
                         None,
                         hub.clone(),
