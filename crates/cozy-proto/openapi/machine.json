@@ -1260,6 +1260,39 @@
       "Json": {
         "type": "object"
       },
+      "KernelVerdict": {
+        "type": "object",
+        "description": "One kernel's verification on this machine (the Runtime's `verify_op`), keyed by its\nartifact, the card's architecture and the driver.",
+        "properties": {
+          "artifact": {
+            "type": "string",
+            "default": ""
+          },
+          "detail": {
+            "type": "string",
+            "description": "What was measured, or why it failed.",
+            "default": ""
+          },
+          "driver": {
+            "type": "string",
+            "default": ""
+          },
+          "kernel": {
+            "type": "string",
+            "default": ""
+          },
+          "ok": {
+            "type": "boolean",
+            "default": false
+          },
+          "sm": {
+            "type": "integer",
+            "format": "int32",
+            "default": 0,
+            "minimum": 0
+          }
+        }
+      },
       "Kind": {
         "type": "string",
         "enum": [
@@ -1934,6 +1967,11 @@
             ],
             "default": null
           },
+          "driver_floor": {
+            "type": "string",
+            "description": "The oldest NVIDIA driver this machine's kernels run on; empty: no GPU stack.",
+            "default": ""
+          },
           "environments": {
             "type": "array",
             "items": {
@@ -1962,6 +2000,14 @@
             "format": "int64",
             "description": "An idle rental's release, 15 min after its last job; 0: none (a job is queued or running,\nor it never releases).",
             "default": 0
+          },
+          "kernels": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/KernelVerdict"
+            },
+            "description": "Each native kernel's verdict on this machine's cards, as the Runtime keeps it.",
+            "default": []
           },
           "models": {
             "type": "array",
@@ -2016,6 +2062,18 @@
             "type": "string",
             "default": ""
           },
+          "toolchain": {
+            "$ref": "#/components/schemas/Toolchain",
+            "description": "What builds kernels here when no prebuilt one serves the card.",
+            "default": {
+              "detail": "",
+              "host_compiler": "",
+              "install": "",
+              "missing": [],
+              "nvcc": "",
+              "state": ""
+            }
+          },
           "version": {
             "type": "string",
             "description": "This machine's release.",
@@ -2043,6 +2101,45 @@
           },
           "worker_id": {
             "type": "string",
+            "default": ""
+          }
+        }
+      },
+      "Toolchain": {
+        "type": "object",
+        "description": "The machine's build toolchain: CUDA's compiler and a host C/C++ compiler.",
+        "properties": {
+          "detail": {
+            "type": "string",
+            "description": "Why the last install failed.",
+            "default": ""
+          },
+          "host_compiler": {
+            "type": "string",
+            "description": "The host compiler's first version line; empty: none found.",
+            "default": ""
+          },
+          "install": {
+            "type": "string",
+            "description": "The OS's own command for a missing host compiler; empty when none is missing or known.",
+            "default": ""
+          },
+          "missing": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "What it lacks: `nvcc`, `cc`, `ninja`.",
+            "default": []
+          },
+          "nvcc": {
+            "type": "string",
+            "description": "`nvcc --version`'s release line; empty: none found.",
+            "default": ""
+          },
+          "state": {
+            "type": "string",
+            "description": "ready, absent, installing, failed",
             "default": ""
           }
         }
