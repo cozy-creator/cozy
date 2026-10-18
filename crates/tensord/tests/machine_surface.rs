@@ -340,19 +340,28 @@ mod v1_api {
             ..Default::default()
         };
         let logs = machine.store().join("logs");
-        for (name, file) in [("tensorfs-transport", "transport.log"), ("memory", "memory.log")] {
-            assert!(read(&client, &owner, log(name, 0)).await.unwrap().1.is_empty());
-            fs::create_dir_all(&logs).unwrap();
-            fs::write(logs.join(format!("{file}.1")), "1.000 pull a 1 old\n").unwrap();
-            let current: String = (0..3000).map(|n| format!("{n}.000 hedge object-{n} 4096 grant\n")).collect();
-            fs::write(logs.join(file), &current).unwrap();
-            let (_, whole) = read(&client, &owner, log(name, 0)).await.unwrap();
-            assert_eq!(whole, format!("1.000 pull a 1 old\n{current}").into_bytes());
-            let (_, newest) = read(&client, &owner, log(name, 2)).await.unwrap();
-            assert_eq!(newest, b"2998.000 hedge object-2998 4096 grant\n2999.000 hedge object-2999 4096 grant\n");
-            let (_, all) = read(&client, &owner, log(name, 3001)).await.unwrap();
-            assert_eq!(all, whole, "lines reach back into the rotated part");
-            let run = cap(Grant { run: "1".into(), ..Default::default() });
+        let rotated = "1.000 pull a 1 old\n";
+        let current: String = (0..3000).map(|n| format!("{n}.000 hedge object-{n} 4096 grant\n")).collect();
+        let written = format!("{rotated}{current}").into_bytes();
+        // Nothing here fetches, so the transport log is the test's alone: its reads are exact.
+        assert!(read(&client, &owner, log("tensorfs-transport", 0)).await.unwrap().1.is_empty());
+        fs::create_dir_all(&logs).unwrap();
+        fs::write(logs.join("transport.log.1"), rotated).unwrap();
+        fs::write(logs.join("transport.log"), &current).unwrap();
+        let (_, whole) = read(&client, &owner, log("tensorfs-transport", 0)).await.unwrap();
+        assert_eq!(whole, written);
+        let (_, newest) = read(&client, &owner, log("tensorfs-transport", 2)).await.unwrap();
+        assert_eq!(newest, b"2998.000 hedge object-2998 4096 grant\n2999.000 hedge object-2999 4096 grant\n");
+        let (_, all) = read(&client, &owner, log("tensorfs-transport", 3001)).await.unwrap();
+        assert_eq!(all, whole, "lines reach back into the rotated part");
+        // The memory log is the machine's own: a loaded host's pressure watcher may append a line
+        // to it at any moment, so it reads as what was written, then whole lines.
+        fs::write(logs.join("memory.log.1"), rotated).unwrap();
+        fs::write(logs.join("memory.log"), &current).unwrap();
+        let (_, whole) = read(&client, &owner, log("memory", 0)).await.unwrap();
+        assert!(whole.starts_with(&written) && whole.ends_with(b"\n"), "{}", String::from_utf8_lossy(&whole[written.len().min(whole.len())..]));
+        let run = cap(Grant { run: "1".into(), ..Default::default() });
+        for name in ["tensorfs-transport", "memory"] {
             assert_eq!(read(&client, &run, log(name, 0)).await.unwrap_err().status(), Some(403));
         }
         let unknown = read(&client, &owner, log("other", 0)).await.unwrap_err();

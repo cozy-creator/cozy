@@ -6,7 +6,7 @@ use std::{
     fs,
     io::{self, Read},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     sync::{Mutex, PoisonError},
 };
 
@@ -67,10 +67,29 @@ pub fn ensure_uv(uv: &Path) -> io::Result<()> {
             let mut bytes = vec![];
             entry.read_to_end(&mut bytes)?;
             fs::create_dir_all(uv.parent().expect("a file in a directory"))?;
-            return super::identity::write_atomic(uv, &bytes, 0o755);
+            let fetching = uv.with_extension("fetching");
+            super::identity::write_atomic(&fetching, &bytes, 0o755)?;
+            settle(&fetching)?;
+            return fs::rename(&fetching, uv);
         }
     }
     Err(io::Error::other(format!("{url} holds no uv")))
+}
+
+/// Waits until the executable just written at `path` runs. A child another thread forked while
+/// its file was open for writing holds that descriptor until the child execs, and any exec of
+/// the file meanwhile fails "Text file busy" (ETXTBSY). Once it runs, no writer is left, so `uv`
+/// appears under its name only then and no later exec of it meets that.
+fn settle(path: &Path) -> io::Result<()> {
+    loop {
+        match Command::new(path).arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status() {
+            Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) => {
+                std::thread::sleep(std::time::Duration::from_millis(2))
+            }
+            Err(error) => return Err(error),
+            Ok(_) => return Ok(()),
+        }
+    }
 }
 
 /// Publish the embedded wheel under its content identity. A new build with the same
