@@ -83,6 +83,7 @@ fn open(root: &Path, tools: &Tools) -> Machine {
             staging_root: root.join("staging"),
             // A Runtime wheel not yet published, installed as this machine's own (a dev build).
             sdk: std::env::var_os("COZY_TEST_RUNTIME_WHEEL").map(PathBuf::from).into_iter().collect(),
+            runtime_build: String::new(),
             uv: "uv".into(),
             seed_cache: None,
         },
