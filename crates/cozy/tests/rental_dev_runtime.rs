@@ -168,8 +168,16 @@ fn a_rentals_dev_runtime_runs_a_script_pinned_to_pypis() {
             .output()
             .unwrap(),
     );
+    let number = followed(&out, "run.completed")["number"].to_string();
+    let shown = home.cozy(["run", "show", number.as_str()]);
     let ended = rental.end();
     assert_eq!(ended["machine"]["state"].as_str(), Some("ended"), "{ended}");
+    assert!(
+        shown
+            .stdout
+            .contains("(`--runtime-wheel`) runs it regardless"),
+        "{shown:?}"
+    );
 
     assert!(updated.to_string().contains(&dev), "{updated}");
     let run = followed(&out, "run.completed");
@@ -178,15 +186,21 @@ fn a_rentals_dev_runtime_runs_a_script_pinned_to_pypis() {
         Some(format!("{dev} {dev}").as_str()),
         "{run}"
     );
+    // The machine's warning reaches whoever runs it: a `run.log` warning line, what `cozy run`
+    // prints as `warning: …` and `run show` lists.
+    let warned = out
+        .stdout
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|e| e["type"] == "run.log" && e["level"] == "warning")
+        .filter_map(|e| e["text"].as_str().map(str::to_owned))
+        .find(|text| text.contains("(`--runtime-wheel`) runs it regardless"));
+    let warned = warned
+        .unwrap_or_else(|| panic!("no warning that the dev Runtime runs regardless: {out:?}"));
     assert!(
-        run.to_string().contains(&format!(
+        warned.contains(&format!(
             "requires `cozy-runtime=={published}`, but `{dev}` is installed"
         )),
-        "{run}"
-    );
-    assert!(
-        run.to_string()
-            .contains("(`--runtime-wheel`) runs it regardless"),
-        "{run}"
+        "{warned}"
     );
 }
