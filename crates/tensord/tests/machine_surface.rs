@@ -822,8 +822,50 @@ mod v1_api {
             .status()
             .unwrap()
             .success());
+        NAMED_RUNTIME.get_or_init(|| named_runtime_loads(&tools)).await;
         let machine = Machine::start_args(|_, _| (), &installing_args(&tools)).await;
         (machine, tools)
+    }
+
+    /// Once per test process: a named Runtime wheel (`COZY_TEST_RUNTIME_WHEEL`) is the one an
+    /// installing machine's packages load, by the commit stamped in it, on a machine of its own so
+    /// no test's machine holds the probe's package.
+    static NAMED_RUNTIME: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+    async fn named_runtime_loads(tools: &Path) {
+        let Some(wheel) = std::env::var_os("COZY_TEST_RUNTIME_WHEEL") else { return };
+        let want = stamped(Path::new(&wheel));
+        assert!(
+            !want.is_empty() && want != "unknown",
+            "{wheel:?} names no commit (COMMIT = {want:?}): a wheel without provenance proves nothing"
+        );
+        let machine = Machine::start_args(|_, _| (), &installing_args(tools)).await;
+        let client = client(&machine);
+        let all = cap(Grant { action: MACHINE.into(), ..Default::default() });
+        let manifest = write_package(&client, &all, "cpu_bulk", "local/tensord-cpu-bulk").await;
+        let built = call(&client, &all, &manifest, ("provenance", "provenance"), serde_json::json!({})).await;
+        assert_eq!(built["commit"], want.as_str(), "the machine loaded another Runtime than {wheel:?}");
+    }
+
+    /// The TensorFS wheel a Runtime wheel accepts, from PyPI, into `dir`.
+    const ACCEPTED_TENSORFS: &str = "import re, subprocess, sys, zipfile, pathlib
+wheel, out = sys.argv[1], pathlib.Path(sys.argv[2])
+archive = zipfile.ZipFile(wheel)
+meta = next(n for n in archive.namelist() if n.endswith('.dist-info/METADATA'))
+req = next(l[15:].split(';')[0].replace(' ', '') for l in archive.read(meta).decode().splitlines()
+           if re.match(r'Requires-Dist: tensorfs[^A-Za-z0-9._-]', l))
+subprocess.run([sys.executable, '-m', 'pip', 'download', '-q', '--no-deps', '--only-binary=:all:', '--python-version', '3.12',
+                '--platform', 'manylinux_2_28_x86_64', '--platform', 'manylinux_2_17_x86_64', '-d', str(out), req], check=True)
+print(next(out.glob('tensorfs-*.whl')))
+";
+
+    /// The commit a Runtime wheel was built from: its `cozy_runtime._build_provenance.COMMIT`.
+    fn stamped(wheel: &Path) -> String {
+        let read = "import re, sys, zipfile\n\
+            text = zipfile.ZipFile(sys.argv[1]).read('cozy_runtime/_build_provenance.py').decode()\n\
+            print(re.search(r'^COMMIT = \"([^\"]*)\"', text, re.M).group(1))\n";
+        let out = Command::new("python3").args(["-I", "-c", read]).arg(wheel).output().unwrap();
+        assert!(out.status.success(), "reading {wheel:?}: {out:?}");
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
     }
 
     /// `serve`'s installer arguments: the test helper Python and the client wheel in `tools`.
@@ -850,9 +892,16 @@ mod v1_api {
         let helper = String::from_utf8(helper.stdout).unwrap().trim().to_string();
         let mut args: Vec<std::ffi::OsString> =
             vec!["--installer-python".into(), helper.into(), "--client-wheel".into(), wheel.into()];
-        // A Runtime wheel not yet published, installed as this machine's own (a dev build).
+        // A Runtime wheel not yet published, installed as this machine's own (a dev build), with
+        // the TensorFS it accepts, as an update that names a Runtime brings.
         if let Some(runtime) = std::env::var_os("COZY_TEST_RUNTIME_WHEEL") {
-            args.extend(["--package-sdk".into(), runtime]);
+            let tensorfs = std::env::var_os("COZY_TEST_TENSORFS_WHEEL").unwrap_or_else(|| {
+                let out = Command::new("python3").args(["-I", "-c", ACCEPTED_TENSORFS]).arg(&runtime).arg(tools.join("tensorfs-wheel"))
+                    .output().unwrap();
+                assert!(out.status.success(), "the TensorFS {runtime:?} accepts: {out:?}");
+                String::from_utf8(out.stdout).unwrap().trim().into()
+            });
+            args.extend(["--package-sdk".into(), runtime, "--package-sdk".into(), tensorfs]);
         }
         args
     }
@@ -3311,9 +3360,12 @@ mod v1_api {
             .unwrap();
             let child = outcome(&child);
             assert_eq!(child.status, "succeeded", "{child:?}");
-            // A call's measurements name the process that executed it.
+            // A call's measurements name the process that executed it: on its GPUs' rows (a
+            // Runtime before 0.28 names them `ranks`, as `run show` reads them).
             let measured: serde_json::Value = json(&child.measurements);
-            assert!(measured["execution"]["ranks"][0]["pid"].as_u64() > Some(0), "{measured}");
+            let execution = &measured["execution"];
+            let pid = execution["gpus"][0]["pid"].as_u64().or(execution["ranks"][0]["pid"].as_u64());
+            assert!(pid > Some(0), "{measured}");
         }
 
         // A canceled job ends its running child with it.

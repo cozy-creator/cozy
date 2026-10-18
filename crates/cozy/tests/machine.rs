@@ -217,7 +217,7 @@ fn machine_refusals_say_what_to_do_instead() {
 #[test]
 fn an_update_installs_the_hubs_target_and_then_has_nothing_to_do() {
     let Some(home) = Home::new() else { return };
-    let _machine = tensord::added(&home, "upd");
+    let _machine = tensord::added_unupdated(&home, "upd");
     let out = home.cozy(["machine", "update", "upd", "--json"]);
     let last: serde_json::Value =
         serde_json::from_str(out.stdout.lines().last().unwrap_or_default())
