@@ -172,6 +172,8 @@ async fn a_corrupted_object_is_refused_and_refetched() {
         .await
         .unwrap_err();
     assert_eq!(refused.code, Code::OBJECT_ID_MISMATCH, "{refused}");
+    // The refusal ends the pull; the other object's second answer may still be landing.
+    fetcher.settled().await;
     let asks = |path: &str| server.blob_asks().iter().filter(|a| a.path == path).count();
     assert_eq!(
         asks(&always),
