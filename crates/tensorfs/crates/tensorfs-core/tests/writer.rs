@@ -16,7 +16,7 @@ use tensorfs_core::format::layout::{self, Item, ALIGN, STANDALONE};
 use tensorfs_core::format::{decode, Body, Dtype, Encoding, Location, ObjectRef, PartBytes, Value};
 use tensorfs_core::import::{self, source::SourceSet, Access, Request};
 use tensorfs_core::store2::{fault, Checkpoint, Store};
-use tensorfs_core::writer::{Data, PartData, Writer};
+use tensorfs_core::writer::{Data, PartData, Source, Writer};
 
 const MIB: usize = 1 << 20;
 
@@ -65,7 +65,7 @@ fn plain(w: &mut Writer, component: &str, key: &str, bytes: &[u8]) {
         key,
         &Dtype::BF16,
         &shape,
-        Data::Plain(&mut &bytes[..]),
+        Data::Plain(Source::Read(&mut &bytes[..])),
     )
     .unwrap();
 }
@@ -274,13 +274,13 @@ fn copy_and_a_base_share_the_large_parts_objects() {
             role: "weight".into(),
             dtype: Dtype::F8_E4M3,
             shape: vec![rows, cols],
-            data: &mut weight_src,
+            data: Source::Read(&mut weight_src),
         },
         PartData {
             role: "scale".into(),
             dtype: Dtype::F32,
             shape: vec![rows],
-            data: &mut scale_src,
+            data: Source::Read(&mut scale_src),
         },
     ];
     let encoded = Data::Encoded {
@@ -431,6 +431,64 @@ fn copy_and_a_base_share_the_large_parts_objects() {
 }
 
 // --------------------------------------------------------------- the read plan, O_DIRECT
+
+/// Objects stored elsewhere (another store, an origin) are referenced, never copied or required:
+/// a large part on the grid by `Source::Reuse`, a file by `reuse_file`. A keyed writer resumes
+/// them, and once the objects arrive the checkpoint reads back bit-identical.
+#[test]
+fn reused_parts_and_files_are_referenced_not_copied() {
+    let scratch = Scratch::new("reuse");
+    let (a, b) = (scratch.store("a"), scratch.store("b"));
+    let big = noise(7, 80 * MIB);
+    let mut w = a.writer(None, None).unwrap();
+    plain(&mut w, "unet", "big.weight", &big);
+    let vocab = a.put_bytes(b"{\"a\":0}").unwrap();
+    let from = a.checkpoint(&w.commit().unwrap()).unwrap();
+    let Body::Data(at) = &from.tensor("unet", "big.weight").unwrap().body else {
+        panic!("plain");
+    };
+    let objects: Vec<ObjectRef> = (from.header().spans(at).iter())
+        .map(|s| from.header().chunks[s.chunk].clone())
+        .collect();
+    assert_eq!(objects.len(), 2);
+
+    let small = noise(8, MIB);
+    let shape = [big.len() as u64 / 2];
+    let mut w = b.writer(None, Some("migrate")).unwrap();
+    let wrong = Source::Reuse(vec![objects[1].clone()]);
+    assert!(w
+        .put(
+            "unet",
+            "short",
+            &Dtype::BF16,
+            &[MIB as u64 / 2],
+            Data::Plain(wrong)
+        )
+        .is_err());
+    let reuse = Data::Plain(Source::Reuse(objects.clone()));
+    w.put("unet", "big.weight", &Dtype::BF16, &shape, reuse)
+        .unwrap();
+    plain(&mut w, "unet", "small.weight", &small);
+    w.reuse_file("tokenizer/vocab.json", &vocab).unwrap();
+    drop(w);
+    let mut w = b.writer(None, Some("migrate")).unwrap();
+    assert!(w.has("unet", "big.weight") && w.has("unet", "small.weight"));
+    let ck = b.checkpoint(&w.commit().unwrap()).unwrap();
+
+    let here = blobs(&b);
+    assert!(objects
+        .iter()
+        .chain([&vocab])
+        .all(|o| !here.contains(&o.sha256)));
+    assert!(objects.iter().all(|o| ck.header().chunks.contains(o)));
+    assert_eq!(ck.manifest().files["tokenizer/vocab.json"], vocab);
+    assert_eq!(ck.read("unet", "small.weight").unwrap(), small);
+    for o in objects.iter().chain([&vocab]) {
+        b.put(&a.read(o).unwrap()[..], Some(o)).unwrap();
+    }
+    assert!(ck.read("unet", "big.weight").unwrap() == big);
+    assert_eq!(ck.file("tokenizer/vocab.json").unwrap(), b"{\"a\":0}");
+}
 
 #[test]
 fn a_merged_plan_fills_a_buffer_with_o_direct() {

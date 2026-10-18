@@ -9,6 +9,8 @@
 //! - Order is data: tensors land in the order the producer `put`s or `copy`s them (a base's
 //!   tensors keep the base's order, ones written again keep their place), or as `set_order`
 //!   says. Nothing is sorted; the chunk layout follows that order.
+//! - `Source::Reuse` and `reuse_file` reference objects already stored elsewhere (another store,
+//!   an origin): never read or copied, and not required here.
 //! - A writer opened with a key journals finished tensors in `tmp/writers/<key>/` and, reopened
 //!   after a crash, skips them (`has`). Its fence is `flock` on an O_CLOEXEC descriptor: a forked
 //!   child holds it only until it execs, and a second opener of the key waits.
@@ -43,7 +45,7 @@ const ZEROS: [u8; layout::ALIGN as usize] = [0; layout::ALIGN as usize];
 
 /// What `put` writes: a plain tensor's bytes, or an encoded tensor's parts.
 pub enum Data<'a> {
-    Plain(&'a mut dyn Read),
+    Plain(Source<'a>),
     Encoded {
         encoding: Encoding,
         parts: Vec<PartData<'a>>,
@@ -54,7 +56,15 @@ pub struct PartData<'a> {
     pub role: String,
     pub dtype: Dtype,
     pub shape: Vec<u64>,
-    pub data: &'a mut dyn Read,
+    pub data: Source<'a>,
+}
+
+/// A part's bytes.
+pub enum Source<'a> {
+    Read(&'a mut dyn Read),
+    /// A part of 16 MiB or more already stored as objects on the 64 MiB grid from its first byte:
+    /// referenced by digest, never read or copied, and not required in this store.
+    Reuse(Vec<ObjectRef>),
 }
 
 /// A finished tensor; one journal line. A plain tensor is one part with role `""`; an encoded
@@ -128,13 +138,20 @@ enum At {
     Spool(u64),
     /// In ranges `(object, offset, length)` of the store's objects.
     Ranges(Vec<(ObjectRef, u64, u64)>),
+    /// Objects on the grid that need not be here (`Source::Reuse`).
+    Reused(Vec<ObjectRef>),
 }
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Line {
     Tensor(Entry),
-    File { path: String, object: ObjectRef },
+    File {
+        path: String,
+        object: ObjectRef,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        reused: bool,
+    },
 }
 
 pub struct Writer {
@@ -148,6 +165,8 @@ pub struct Writer {
     metadata: Metadata,
     tensors: Tensors,
     files: BTreeMap<String, ObjectRef>,
+    /// Files given by `reuse_file`, which need not be here.
+    reused: std::collections::BTreeSet<String>,
     spool: File,
     spool_len: u64,
     journal: Option<File>,
@@ -191,6 +210,7 @@ impl Store {
             metadata: Metadata::new(),
             tensors: Tensors::default(),
             files: BTreeMap::new(),
+            reused: Default::default(),
             spool,
             spool_len: 0,
             journal,
@@ -311,16 +331,26 @@ impl Writer {
     /// A file of the checkpoint's tree: a config, a tokenizer.
     pub fn file(&mut self, path: &str, bytes: &[u8]) -> Result<()> {
         self.live()?;
-        let plain = |s: &str| !s.is_empty() && s != "." && s != ".." && !s.contains(['\\', '\0']);
-        if path == HEADER_PATH || !path.split('/').all(plain) {
-            return Err(bad(format!("{path:?} cannot be a file of the checkpoint")));
-        }
+        file_path(path)?;
         let object = self.store.put_bytes(bytes)?;
         let line = Line::File {
             path: path.to_owned(),
             object,
+            reused: false,
         };
         self.record(line, bytes.len() as u64)
+    }
+
+    /// A file already stored as `object` elsewhere: referenced, not copied or required here.
+    pub fn reuse_file(&mut self, path: &str, object: &ObjectRef) -> Result<()> {
+        self.live()?;
+        file_path(path)?;
+        let line = Line::File {
+            path: path.to_owned(),
+            object: object.clone(),
+            reused: true,
+        };
+        self.record(line, 0)
     }
 
     /// Lays out the chunks in header order, writes the header and manifest, and pins the
@@ -376,7 +406,7 @@ impl Writer {
         let mut packs: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
         for (i, (_, _, s)) in list.iter().enumerate() {
             match &s.at {
-                At::Grid(objects) => {
+                At::Grid(objects) | At::Reused(objects) => {
                     for (j, object) in objects.iter().enumerate() {
                         chunks[plan.places[i].chunk as usize + j] = Some(object.clone());
                     }
@@ -403,7 +433,7 @@ impl Writer {
                         Box::new(spool)
                     }
                     At::Ranges(ranges) => Box::new(Ranges::new(&self.store, ranges)),
-                    At::Grid(_) => unreachable!("grid parts are standalone"),
+                    At::Grid(_) | At::Reused(_) => unreachable!("grid parts are standalone"),
                 };
                 let what = format!("{}/{}", list[i].0.component, list[i].0.key);
                 pour(
@@ -534,7 +564,8 @@ impl Writer {
     fn present(&mut self) -> Result<()> {
         let mut gone = None;
         'find: for e in &self.tensors.list {
-            for object in e.stored().flat_map(|p| p.at.objects()) {
+            let here = e.stored().filter(|p| !matches!(p.at, At::Reused(_)));
+            for object in here.flat_map(|p| p.at.objects()) {
                 if !self.store.reuse(&object)? {
                     gone = Some((e.name(), object));
                     break 'find;
@@ -546,7 +577,7 @@ impl Writer {
             return Err(Error::Absent(object.sha256));
         }
         for (path, object) in self.files.clone() {
-            if !self.store.reuse(&object)? {
+            if !self.reused.contains(&path) && !self.store.reuse(&object)? {
                 self.files.remove(&path);
                 return Err(Error::Absent(object.sha256));
             }
@@ -654,8 +685,12 @@ impl Writer {
         what: &str,
         dtype: Dtype,
         shape: Vec<u64>,
-        data: &mut dyn Read,
+        data: Source,
     ) -> Result<Stored> {
+        let data = match data {
+            Source::Read(data) => data,
+            Source::Reuse(objects) => return reused(what, dtype, shape, objects),
+        };
         // A dtype this build does not know is sized by its bytes.
         let owned: Vec<u8>;
         let mut slice: &[u8];
@@ -720,7 +755,15 @@ impl Writer {
     fn apply(&mut self, line: Line) {
         match line {
             Line::Tensor(e) => self.tensors.insert(e),
-            Line::File { path, object } => {
+            Line::File {
+                path,
+                object,
+                reused,
+            } => {
+                match reused {
+                    true => self.reused.insert(path.clone()),
+                    false => self.reused.remove(&path),
+                };
                 self.files.insert(path, object);
             }
         }
@@ -788,6 +831,7 @@ impl Writer {
             for p in e.stored() {
                 match &p.at {
                     At::Spool(offset) => ok &= offset + p.length <= spooled,
+                    At::Reused(_) => {}
                     other => {
                         for object in other.objects() {
                             ok &= self.store.reuse(&object)?;
@@ -803,7 +847,7 @@ impl Writer {
         self.tensors.retain(|e| !lost.contains(&e.name()));
         let paths: Vec<String> = self.files.keys().cloned().collect();
         for path in paths {
-            if !self.store.reuse(&self.files[&path])? {
+            if !self.reused.contains(&path) && !self.store.reuse(&self.files[&path])? {
                 self.files.remove(&path);
             }
         }
@@ -849,7 +893,7 @@ impl Stored {
 impl At {
     fn objects(&self) -> Vec<ObjectRef> {
         match self {
-            At::Grid(objects) => objects.clone(),
+            At::Grid(objects) | At::Reused(objects) => objects.clone(),
             At::Spool(_) => vec![],
             At::Ranges(ranges) => ranges.iter().map(|r| r.0.clone()).collect(),
         }
@@ -869,7 +913,8 @@ impl Sink for Writer {
         if self.has(component, key) {
             return Ok(());
         }
-        Writer::put(self, component, key, dtype, shape, Data::Plain(data)).map_err(Error::refusal)
+        let data = Data::Plain(Source::Read(data));
+        Writer::put(self, component, key, dtype, shape, data).map_err(Error::refusal)
     }
 
     fn file(&mut self, path: &str, bytes: &[u8]) -> err::Result<()> {
@@ -925,6 +970,30 @@ impl Read for Ranges<'_> {
     }
 }
 
+/// A [`Source::Reuse`] part: whole objects on the grid that add up to its bytes.
+fn reused(what: &str, dtype: Dtype, shape: Vec<u64>, objects: Vec<ObjectRef>) -> Result<Stored> {
+    let length: u64 = objects.iter().map(|o| o.length).sum();
+    let last = objects.len().saturating_sub(1);
+    let on_grid = (objects.iter().enumerate())
+        .all(|(i, o)| o.length > 0 && o.length <= GRID && (i == last || o.length == GRID));
+    let sized = match dtype.byte_len(&shape) {
+        Some(n) => n == length,
+        None => dtype.bits().is_none(),
+    };
+    if length < STANDALONE || !on_grid || !sized {
+        return Err(bad(format!(
+            "{what}: {} objects of {length} bytes are not a {dtype} {shape:?} part on the grid",
+            objects.len()
+        )));
+    }
+    Ok(Stored {
+        dtype,
+        shape,
+        length,
+        at: At::Reused(objects),
+    })
+}
+
 /// `length` bytes of `data` as objects, one per 64 MiB from the first byte.
 fn grid(
     store: &Store,
@@ -968,6 +1037,14 @@ fn pour(
         };
         dst.write_all(&buf[..got]).map_err(fail("write", what))?;
         n -= got as u64;
+    }
+    Ok(())
+}
+
+fn file_path(path: &str) -> Result<()> {
+    let plain = |s: &str| !s.is_empty() && s != "." && s != ".." && !s.contains(['\\', '\0']);
+    if path == HEADER_PATH || !path.split('/').all(plain) {
+        return Err(bad(format!("{path:?} cannot be a file of the checkpoint")));
     }
     Ok(())
 }

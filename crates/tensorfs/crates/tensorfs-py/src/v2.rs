@@ -17,7 +17,7 @@ use tensorfs_core::export;
 use tensorfs_core::failure::{Failure, Kind};
 use tensorfs_core::format::{Body, Dtype, Encoding, Metadata, Value};
 use tensorfs_core::store2::{Checkpoint, Store};
-use tensorfs_core::writer::{Data, PartData, Writer};
+use tensorfs_core::writer::{Data, PartData, Source, Writer};
 
 create_exception!(
     tensorfs.v2,
@@ -847,7 +847,7 @@ impl PyWriter {
         let dtype = Dtype::parse(&dtype);
         self.with(py, |w| {
             let mut src = bytes.slice();
-            Ok(w.put(&component, &key, &dtype, &shape, Data::Plain(&mut src))?)
+            Ok(w.put(&component, &key, &dtype, &shape, Data::Plain(Source::Read(&mut src)))?)
         })
     }
 
@@ -892,7 +892,7 @@ impl PyWriter {
                     role: role.clone(),
                     dtype: dtype.clone(),
                     shape: shape.clone(),
-                    data,
+                    data: Source::Read(data),
                 })
                 .collect();
             let encoding = Encoding { scheme, params };

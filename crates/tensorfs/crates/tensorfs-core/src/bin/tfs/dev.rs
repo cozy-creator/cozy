@@ -9,7 +9,7 @@ use std::io::Read;
 use tensorfs_core::failure::Result;
 use tensorfs_core::format::{Dtype, Encoding, Metadata, ObjectRef, Value};
 use tensorfs_core::store2::Store;
-use tensorfs_core::writer::{Data, PartData};
+use tensorfs_core::writer::{Data, PartData, Source};
 
 pub struct Noise {
     state: u64,
@@ -219,7 +219,7 @@ pub fn ckpt(store: &Store, blocks: u64, scale: u64, plain: bool, files: bool) ->
                     &it.key,
                     &it.dtype,
                     &it.shape,
-                    Data::Plain(&mut noise),
+                    Data::Plain(Source::Read(&mut noise)),
                 )?;
                 continue;
             }
@@ -296,7 +296,7 @@ pub fn ckpt(store: &Store, blocks: u64, scale: u64, plain: bool, files: bool) ->
                 role: role.clone(),
                 dtype: dtype.clone(),
                 shape: shape.clone(),
-                data: bytes,
+                data: Source::Read(bytes),
             })
             .collect();
         w.put(

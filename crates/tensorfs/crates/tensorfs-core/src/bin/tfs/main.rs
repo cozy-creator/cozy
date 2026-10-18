@@ -16,6 +16,7 @@ use tensorfs_core::client::{self, ImportOptions, Named};
 use tensorfs_core::export;
 use tensorfs_core::failure::{fail, Failure, Kind, Result};
 use tensorfs_core::format::{Body, Dtype, ObjectRef};
+use tensorfs_core::migrate::{self, v1 as old};
 use tensorfs_core::store2::Store;
 
 const USAGE: &str = "usage: tfs [--store <dir>] [--json] <verb> ...
@@ -28,10 +29,19 @@ const USAGE: &str = "usage: tfs [--store <dir>] [--json] <verb> ...
   verify [<ref>]
   gc [--older-than <7d|12h|30m|90s>]
   dev ckpt [--name <org/name>] [--blocks <n>] [--scale <n>] [--plain] [--no-configs]
+  dev migrate <v1-dir> [<manifest-sha256>|<org/name>]... [--dry-run]
+      v1-dir: a v1 store (read only) or a directory of a v1 manifest and its objects
 <ref> is org/name[@release] (--lane names a lane, else the release's only one) or a manifest
 sha256. The store is --store, else $TENSORFS_HOME, else ~/.tensorfs; it is created when absent.";
 
-const SWITCHES: &[&str] = &["json", "safetensors", "origin", "plain", "no-configs"];
+const SWITCHES: &[&str] = &[
+    "json",
+    "safetensors",
+    "origin",
+    "plain",
+    "no-configs",
+    "dry-run",
+];
 const VALUED: &[&str] = &[
     "store",
     "name",
@@ -330,7 +340,92 @@ fn run(args: &Args) -> Done {
             let human = format!("wrote {} ({} objects)", label(&n), objects.len());
             Ok(Some((Json::Object(doc), human)))
         }
+        ["dev", "migrate", root, select @ ..] => {
+            migrate_v1(&store()?, root, select, args.on("dry-run"))
+        }
         _ => Ok(None),
+    }
+}
+
+/// Migrates the v1 checkpoints `select` names (a manifest digest or a repo), or every one the
+/// v1 store's repos name; one report per checkpoint and the totals.
+fn migrate_v1(store: &Store, root: &str, select: &[&str], dry_run: bool) -> Done {
+    let src = old::Source::new(root);
+    let named = match src.root().join("repos").is_dir() {
+        true => src.lanes()?,
+        false => vec![],
+    };
+    let mut lanes: Vec<old::Lane> = Vec::new();
+    for s in select {
+        let repo = |n: &String| n == s || n.starts_with(&format!("{s}@"));
+        let found: Vec<old::Lane> = match s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            true => match named.iter().find(|l| l.manifest.sha256 == *s) {
+                Some(lane) => vec![lane.clone()],
+                None => vec![old::Lane {
+                    manifest: src.manifest_ref(s)?,
+                    names: vec![],
+                }],
+            },
+            false => named
+                .iter()
+                .filter(|l| l.names.iter().any(repo))
+                .cloned()
+                .collect(),
+        };
+        if found.is_empty() {
+            return Err(Failure {
+                kind: Kind::NotFound,
+                detail: format!("no v1 checkpoint {s}"),
+            }
+            .into());
+        }
+        for lane in found {
+            if !lanes.iter().any(|l| l.manifest == lane.manifest) {
+                lanes.push(lane);
+            }
+        }
+    }
+    if select.is_empty() {
+        lanes = named;
+    }
+    let mut reports = Vec::new();
+    for (i, lane) in lanes.iter().enumerate() {
+        eprintln!(
+            "[{}/{}] {} {:?}",
+            i + 1,
+            lanes.len(),
+            lane.manifest.sha256,
+            lane.names
+        );
+        let report = migrate::lane(&src, store, lane, dry_run);
+        if let Some(error) = report.doc.get("error") {
+            eprintln!("  {error}");
+        }
+        reports.push(report);
+    }
+    let totals = migrate::totals(&reports);
+    let human = format!(
+        "{} checkpoints, {} passed; {} new objects, {} new bytes",
+        reports.len(),
+        totals["passed"],
+        totals["new"]["objects"],
+        totals["new"]["bytes"]
+    );
+    let checkpoints: Vec<Json> = reports
+        .iter()
+        .map(|r| Json::Object(r.doc.clone()))
+        .collect();
+    let doc = json!({"checkpoints": checkpoints, "totals": totals});
+    match reports.iter().all(|r| r.pass) {
+        true => Ok(Some((doc, human))),
+        false => Err(Failed(
+            Failure {
+                kind: Kind::Integrity,
+                detail: format!("{human}; some did not migrate"),
+            },
+            doc.as_object().cloned(),
+        )),
     }
 }
 

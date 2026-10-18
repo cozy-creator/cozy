@@ -61,6 +61,9 @@ pub mod machine;
 pub mod manifest;
 #[cfg(feature = "store")]
 pub mod meta;
+/// `tfs dev migrate`: v1 checkpoints into v2, with the last v1 reader (xs-045 U12).
+#[cfg(feature = "store")]
+pub mod migrate;
 #[cfg(feature = "store")]
 pub mod object_roots;
 #[cfg(feature = "store")]
