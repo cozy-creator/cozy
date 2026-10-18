@@ -28,6 +28,8 @@ pub const REPLACE_EXIT: i32 = 75;
 /// This binary's release, which an update's `from` and `to` name as `cozy`.
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_WHEEL_BYTES: u64 = 256 << 20;
+/// A dev binary's: a debug build with its debug info.
+const MAX_BINARY_BYTES: u64 = 2 << 30;
 /// A dev binary's file name where it is staged.
 pub const BINARY: &str = if cfg!(windows) { "cozy.exe" } else { "cozy" };
 
@@ -559,9 +561,10 @@ impl Updates {
                 break;
             }
             length += n as u64;
-            if length > MAX_WHEEL_BYTES {
+            let max = if file == BINARY { MAX_BINARY_BYTES } else { MAX_WHEEL_BYTES };
+            if length > max {
                 let _ = fs::remove_file(&temp);
-                return Err((400, "the wheel exceeds 256 MiB".into()));
+                return Err((400, format!("{file} exceeds {} MiB", max >> 20)));
             }
             hash.update(&buffer[..n]);
             out.write_all(&buffer[..n]).map_err(server)?;
