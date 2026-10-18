@@ -23,6 +23,20 @@ pub struct Lane {
     pub names: Vec<String>,
 }
 
+/// A v1 repo's own rows.
+pub struct Repo {
+    pub name: String,
+    pub checkpoints: Vec<ObjectRef>,
+    pub releases: Vec<Release>,
+}
+
+pub struct Release {
+    pub version: String,
+    pub revision: u64,
+    pub yanked: bool,
+    pub lanes: Vec<(String, ObjectRef)>,
+}
+
 pub struct Manifest {
     pub header: Option<ObjectRef>,
     pub files: Vec<(String, ObjectRef)>,
@@ -276,10 +290,8 @@ impl Source {
         }
     }
 
-    /// Every checkpoint the store's `repos/<org>/<name>.json` name, by manifest.
-    pub fn lanes(&self) -> Result<Vec<Lane>> {
-        let mut lanes: BTreeMap<ObjectRef, Vec<String>> = BTreeMap::new();
-        let repos = self.root.join("repos");
+    /// The store's `repos/<org>/<name>.json`, each as its own rows.
+    pub fn repos(&self) -> Result<Vec<Repo>> {
         let list = |dir: &Path| -> Result<Vec<PathBuf>> {
             let entries =
                 fs::read_dir(dir).or_else(|e| fail(Kind::Io, format!("{}: {e}", dir.display())))?;
@@ -287,27 +299,55 @@ impl Source {
             paths.sort();
             Ok(paths)
         };
-        for org in list(&repos)? {
+        let mut repos = Vec::new();
+        for org in list(&self.root.join("repos"))? {
             for path in list(&org)? {
                 let text = fs::read(&path)
                     .or_else(|e| fail(Kind::Io, format!("{}: {e}", path.display())))?;
-                let repo: Json = serde_json::from_slice(&text)
+                let doc: Json = serde_json::from_slice(&text)
                     .or_else(|e| bad(format!("{}: {e}", path.display())))?;
                 let name = format!(
                     "{}/{}",
-                    str_at(&repo, &["repo", "org"])?,
-                    str_at(&repo, &["repo", "name"])?
+                    str_at(&doc, &["repo", "org"])?,
+                    str_at(&doc, &["repo", "name"])?
                 );
-                for c in array(&repo, "checkpoints") {
-                    let names = lanes.entry(object(&c["manifest"])?).or_default();
-                    names.push(name.clone());
-                }
-                for r in array(&repo, "releases") {
-                    let version = str_at(&r, &["version"])?;
-                    for l in array(&r, "lanes") {
-                        let names = lanes.entry(object(&l["manifest"])?).or_default();
-                        names.push(format!("{name}@{version} {}", str_at(&l, &["lane"])?));
-                    }
+                let checkpoints = (array(&doc, "checkpoints").iter())
+                    .map(|c| object(&c["manifest"]))
+                    .collect::<Result<_>>()?;
+                let releases = (array(&doc, "releases").iter())
+                    .map(|r| {
+                        let lanes = (array(r, "lanes").iter())
+                            .map(|l| Ok((str_at(l, &["lane"])?, object(&l["manifest"])?)))
+                            .collect::<Result<_>>()?;
+                        Ok(Release {
+                            version: str_at(r, &["version"])?,
+                            revision: r.get("revision").and_then(Json::as_u64).unwrap_or(0),
+                            yanked: r.get("yanked").and_then(Json::as_bool).unwrap_or(false),
+                            lanes,
+                        })
+                    })
+                    .collect::<Result<_>>()?;
+                repos.push(Repo {
+                    name,
+                    checkpoints,
+                    releases,
+                });
+            }
+        }
+        Ok(repos)
+    }
+
+    /// Every checkpoint the repos name, by manifest, with the names.
+    pub fn lanes(&self) -> Result<Vec<Lane>> {
+        let mut lanes: BTreeMap<ObjectRef, Vec<String>> = BTreeMap::new();
+        for repo in self.repos()? {
+            for c in &repo.checkpoints {
+                lanes.entry(c.clone()).or_default().push(repo.name.clone());
+            }
+            for r in &repo.releases {
+                for (lane, manifest) in &r.lanes {
+                    let names = lanes.entry(manifest.clone()).or_default();
+                    names.push(format!("{}@{} {lane}", repo.name, r.version));
                 }
             }
         }

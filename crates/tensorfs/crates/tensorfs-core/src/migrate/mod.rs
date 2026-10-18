@@ -28,7 +28,9 @@ use serde_json::{json, Map, Value as Json};
 
 use crate::failure::{fail, Kind, Result};
 use crate::format::layout::{ALIGN, GRID, STANDALONE};
-use crate::format::{Body, Dtype, Encoding, Location, ObjectRef, Value, HEADER_PATH};
+use crate::format::{
+    Body, Dtype, Encoding, Location, ObjectRef, Release, Repo, Value, HEADER_PATH,
+};
 use crate::import::order::{self, constructor_order};
 use crate::import::tables;
 use crate::sha256::hex_digest;
@@ -51,6 +53,8 @@ pub struct Report {
     pub pass: bool,
     pub v1: BTreeSet<ObjectRef>,
     pub v2: BTreeSet<ObjectRef>,
+    /// The v1 manifest, and its v2 manifest once committed.
+    pub manifests: (ObjectRef, Option<ObjectRef>),
 }
 
 /// Migrates one v1 checkpoint into `store`, or plans it without one. A dry run collects what it
@@ -61,6 +65,7 @@ pub fn lane(src: &v1::Source, store: Option<&Store>, lane: &v1::Lane, dry_run: b
         pass: false,
         v1: BTreeSet::new(),
         v2: BTreeSet::new(),
+        manifests: (lane.manifest.clone(), None),
     };
     r.doc.insert("names".into(), json!(lane.names));
     match migrate(src, store, lane, dry_run, &mut r) {
@@ -112,6 +117,51 @@ pub fn totals(reports: &[Report]) -> Json {
         "v2": {"objects": v2.len(), "bytes": sum(&mut v2.iter().copied())},
         "new": {"objects": new.len(), "bytes": sum(&mut new.iter().map(|o| **o)), "sum_per_checkpoint": per_checkpoint},
     })
+}
+
+/// `repo`'s v2 refs file from its own v1 rows alone: each release's lanes, yanked and revision,
+/// and the checkpoints no release cites, every manifest replaced by its migration. The v1
+/// manifests that did not migrate when any did not.
+pub fn refs(repo: &v1::Repo, reports: &[Report]) -> std::result::Result<Repo, Vec<String>> {
+    let migrated: HashMap<&ObjectRef, &ObjectRef> = (reports.iter())
+        .filter(|r| r.pass)
+        .filter_map(|r| Some((&r.manifests.0, r.manifests.1.as_ref()?)))
+        .collect();
+    let mut missing = Vec::new();
+    let mut v2 = |v1: &ObjectRef| match migrated.get(v1) {
+        Some(m) => Some((*m).clone()),
+        None => {
+            missing.push(v1.sha256.clone());
+            None
+        }
+    };
+    let releases: Vec<Release> = (repo.releases.iter())
+        .map(|r| Release {
+            version: r.version.clone(),
+            lanes: (r.lanes.iter())
+                .filter_map(|(lane, m)| Some((lane.clone(), v2(m)?)))
+                .collect(),
+            yanked: r.yanked,
+            revision: r.revision,
+        })
+        .collect();
+    let cited: BTreeSet<&ObjectRef> = repo
+        .releases
+        .iter()
+        .flat_map(|r| r.lanes.iter().map(|l| &l.1))
+        .collect();
+    let checkpoints = (repo.checkpoints.iter())
+        .filter(|c| !cited.contains(c))
+        .filter_map(&mut v2)
+        .collect();
+    match missing.is_empty() {
+        true => Ok(Repo {
+            name: repo.name.clone(),
+            releases,
+            checkpoints,
+        }),
+        false => Err(missing),
+    }
 }
 
 fn object(o: &ObjectRef) -> Json {
@@ -264,6 +314,7 @@ fn migrate(
         }
     }
     let manifest = w.commit()?;
+    r.manifests.1 = Some(manifest.clone());
     let ck = store.checkpoint(&manifest)?;
     r.v2.insert(manifest.clone());
     r.v2.extend(ck.manifest().files.values().cloned());

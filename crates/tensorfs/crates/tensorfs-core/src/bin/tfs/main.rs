@@ -424,7 +424,32 @@ fn migrate_v1(store: Option<&Store>, root: &str, select: &[&str], dry_run: bool)
         .iter()
         .map(|r| Json::Object(r.doc.clone()))
         .collect();
-    let doc = json!({"checkpoints": checkpoints, "totals": totals});
+    // Each model's refs file from its own rows, once every checkpoint it names has migrated.
+    let mut refs = Vec::new();
+    if let (Some(store), false) = (store, dry_run) {
+        let wanted: Vec<&ObjectRef> = lanes.iter().map(|l| &l.manifest).collect();
+        let repos = match src.root().join("repos").is_dir() {
+            true => src.repos()?,
+            false => vec![],
+        };
+        for repo in repos {
+            let named = repo
+                .releases
+                .iter()
+                .flat_map(|r| r.lanes.iter().map(|l| &l.1));
+            if !named.chain(&repo.checkpoints).any(|m| wanted.contains(&m)) {
+                continue;
+            }
+            refs.push(match migrate::refs(&repo, &reports) {
+                Ok(v2) => {
+                    store.update_ref(&v2.name, |_| Some(v2.clone()))?;
+                    json!({"name": v2.name, "written": true, "releases": v2.releases.len(), "checkpoints": v2.checkpoints.len()})
+                }
+                Err(missing) => json!({"name": repo.name, "written": false, "not_migrated": missing}),
+            });
+        }
+    }
+    let doc = json!({"checkpoints": checkpoints, "refs": refs, "totals": totals});
     match reports.iter().all(|r| r.pass) {
         true => Ok(Some((doc, human))),
         false => Err(Failed(
