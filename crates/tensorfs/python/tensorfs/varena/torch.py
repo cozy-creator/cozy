@@ -67,13 +67,15 @@ class Mode(Enum):
 
 @dataclass(frozen=True, slots=True)
 class WeightGrant:
-    """TensorD's read grant for one component: its header, the sealed host-cache memfd, and the
-    stored tensors the module builds (None: all of the component's)."""
+    """TensorD's read grant for one component: its header, the sealed host-cache memfd or the
+    chunk files (`(sha256, length, fd)`), and the stored tensors the module builds (None: all
+    of the component's)."""
 
     ck: tensorfs.Checkpoint
     component: str
     host_fd: int | None = None
     keys: Collection[str] | None = None
+    files: Sequence[tuple[str, int, int]] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -482,7 +484,9 @@ class Memory:
                 module,
                 index,
                 device,
-                core.register(name, weights.ck, regions, weights.host_fd),
+                core.register(
+                    name, weights.ck, regions, weights.host_fd, list(weights.files) or None
+                ),
                 fill,
                 bind,
             )
