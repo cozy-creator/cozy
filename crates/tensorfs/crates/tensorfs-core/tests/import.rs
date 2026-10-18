@@ -6,10 +6,10 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use tensorfs_core::err::{Code, Result};
-use tensorfs_core::format::Dtype;
-use tensorfs_core::import::engine::{self, Ops, Planned, Reading, TensorReader};
+use tensorfs_core::format::{Dtype, Encoding};
+use tensorfs_core::import::engine::{self, Ops, Reading, TensorReader};
 use tensorfs_core::import::source::{Group, SourceSet};
-use tensorfs_core::import::{self, Access, Imported, Request, Sink};
+use tensorfs_core::import::{self, Access, Imported, Part, Request, Sink};
 
 fn scratch(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("tfs-import-{name}-{}", std::process::id()));
@@ -77,10 +77,17 @@ impl Sink for Collect {
         key: &str,
         dtype: &Dtype,
         shape: &[u64],
-        data: &mut dyn Read,
+        encoding: Option<&Encoding>,
+        mut parts: Vec<Part>,
     ) -> Result<()> {
+        assert!(
+            encoding.is_none() && parts.len() == 1,
+            "{component}/{key}: plain"
+        );
         let mut bytes = Vec::new();
-        data.read_to_end(&mut bytes)
+        parts[0]
+            .data
+            .read_to_end(&mut bytes)
             .map_err(|e| tensorfs_core::err::Refusal {
                 code: Code::IO_FAILED,
                 detail: e.to_string(),
@@ -203,16 +210,9 @@ fn through_engine(shape: &[u64], ops: &Ops) -> Vec<u64> {
         source: Dtype::U32,
         cast: None,
     };
-    let p = Planned {
-        component: "c".into(),
-        key: "k".into(),
-        dtype: Dtype::U32,
-        shape: out.clone(),
-        read,
-    };
     let file = fs::File::open(&path).unwrap();
     let mut bytes = Vec::new();
-    TensorReader::new(&file, &p)
+    TensorReader::new(&file, &read, "c/k".into())
         .unwrap()
         .read_to_end(&mut bytes)
         .unwrap();
@@ -429,16 +429,11 @@ fn narrowing_is_numpys_and_refuses_overflow() {
             source: Dtype::F32,
             cast: Some(Dtype::F16),
         };
-        let p = Planned {
-            component: "c".into(),
-            key: "k".into(),
-            dtype: Dtype::F16,
-            shape: vec![n],
-            read,
-        };
         let file = fs::File::open(&path).unwrap();
         let mut out = Vec::new();
-        let got = TensorReader::new(&file, &p).unwrap().read_to_end(&mut out);
+        let got = TensorReader::new(&file, &read, "c/k".into())
+            .unwrap()
+            .read_to_end(&mut out);
         assert_eq!(got.is_ok(), ok);
         if ok {
             assert_eq!(out, [0x00, 0x3c, 0xff, 0x7b, 0x00, 0x7c, 0x00, 0xc0]);
@@ -467,7 +462,10 @@ fn corpus(root: &Path, rows: &[(&str, &str)]) -> SourceSet {
         }
         members.push((path.to_string(), to));
     }
-    SourceSet::scan(&members).unwrap()
+    let mut set = SourceSet::scan(&members).unwrap();
+    // No real plain header reads as a quantized carrier.
+    import::carriers::fold(&mut set).unwrap();
+    set
 }
 
 fn recognized(set: &SourceSet, named: Option<&str>) -> Result<Vec<(String, String)>> {
@@ -1081,8 +1079,9 @@ fn seedvr2_composes_its_conditioning_from_the_pinned_files() {
         (Dtype::BF16, vec![58, 5120])
     );
     let mut bytes = Vec::new();
-    let file = fs::File::open(&set.files[positive.read.file]).unwrap();
-    TensorReader::new(&file, positive)
+    let read = &positive.parts[0].read;
+    let file = fs::File::open(&set.files[read.file]).unwrap();
+    TensorReader::new(&file, read, "conditioning/positive".into())
         .unwrap()
         .read_to_end(&mut bytes)
         .unwrap();
@@ -1190,10 +1189,15 @@ fn h3_native_real_bytes_equal_the_diffusers_packaging() {
         let key = format!("transformer_blocks.0.{key}");
         let p = planned.iter().find(|p| p.key == key).unwrap();
         let mut ours = Vec::new();
-        TensorReader::new(&fs::File::open(&set.files[p.read.file]).unwrap(), p)
-            .unwrap()
-            .read_to_end(&mut ours)
-            .unwrap();
+        let read = &p.parts[0].read;
+        TensorReader::new(
+            &fs::File::open(&set.files[read.file]).unwrap(),
+            read,
+            key.clone(),
+        )
+        .unwrap()
+        .read_to_end(&mut ours)
+        .unwrap();
         let at = &head[&key]["data_offsets"];
         let (begin, end) = (
             8 + n + at[0].as_u64().unwrap(),
@@ -1220,10 +1224,13 @@ impl Sink for Count {
         key: &str,
         dtype: &Dtype,
         shape: &[u64],
-        data: &mut dyn Read,
+        _: Option<&Encoding>,
+        parts: Vec<Part>,
     ) -> Result<()> {
-        let n = std::io::copy(data, &mut std::io::sink()).unwrap();
-        assert_eq!(Some(n), dtype.byte_len(shape), "{component}/{key}");
+        for p in parts {
+            let n = std::io::copy(p.data, &mut std::io::sink()).unwrap();
+            assert_eq!(Some(n), p.dtype.byte_len(p.shape), "{component}/{key}");
+        }
         self.tensors.insert(
             (component.into(), key.into()),
             (dtype.clone(), shape.to_vec()),

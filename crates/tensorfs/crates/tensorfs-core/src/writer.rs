@@ -908,12 +908,25 @@ impl Sink for Writer {
         key: &str,
         dtype: &Dtype,
         shape: &[u64],
-        data: &mut dyn Read,
+        encoding: Option<&Encoding>,
+        parts: Vec<import::Part>,
     ) -> err::Result<()> {
         if self.has(component, key) {
             return Ok(());
         }
-        let data = Data::Plain(Source::Read(data));
+        let mut parts = parts.into_iter().map(|p| PartData {
+            role: p.role.to_owned(),
+            dtype: p.dtype.clone(),
+            shape: p.shape.to_vec(),
+            data: Source::Read(p.data),
+        });
+        let data = match encoding {
+            Some(encoding) => Data::Encoded {
+                encoding: encoding.clone(),
+                parts: parts.collect(),
+            },
+            None => Data::Plain(parts.next().expect("a plain tensor's part").data),
+        };
         Writer::put(self, component, key, dtype, shape, data).map_err(Error::refusal)
     }
 
