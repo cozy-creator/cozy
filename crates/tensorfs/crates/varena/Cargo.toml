@@ -1,5 +1,5 @@
 [package]
-name = "tensorfs-plane"
+name = "varena"
 version = "0.10.0"
 edition = "2021"
 publish.workspace = true

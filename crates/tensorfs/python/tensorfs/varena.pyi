@@ -4,8 +4,8 @@ TensorD coordinates machine-wide budgets and shared-buffer/handle retention. Run
 constructs models and performs GPU allocation, copies and mappings through this local
 library within those grants. A prepared CPU layout is distinct from a GPU tensor.
 
-The contract is `crates/tensorfs-plane/API.md`. `scripts/stub_conform.py` holds this stub
-against the compiled `tensorfs._ext.plane`, name for name and parameter for parameter. The
+The contract is `crates/varena/API.md`. `scripts/stub_conform.py` holds this stub
+against the compiled `tensorfs._ext.varena`, name for name and parameter for parameter. The
 TypedDicts describe returned rows only; they do not exist at runtime.
 """
 

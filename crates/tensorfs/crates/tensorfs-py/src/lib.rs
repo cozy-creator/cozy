@@ -10,8 +10,8 @@
 
 mod docs;
 mod errors;
-#[cfg_attr(windows, path = "plane_windows.rs")]
-mod plane;
+#[cfg_attr(windows, path = "varena_windows.rs")]
+mod varena;
 mod readplan;
 #[cfg(feature = "store")]
 mod serve;
@@ -55,7 +55,7 @@ fn _ext(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<readplan::PyPlan>()?;
     #[cfg(feature = "store")]
     store_api(m)?;
-    plane::install(m)?;
+    varena::install(m)?;
     Ok(())
 }
 

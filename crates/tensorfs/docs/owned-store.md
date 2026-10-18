@@ -7,7 +7,7 @@ decisions remain with the daemon.
 
 This owner role covers the managed Store's serialized objects and metadata. Shared CPU
 buffers and exported GPU allocations have separate descriptor/mapping lifetimes in
-`tensorfs-plane`. TensorD coordinates their retention; Runtime constructs models and
+`varena`. TensorD coordinates their retention; Runtime constructs models and
 performs executor-side GPU operations using the library. A Store claim alone does not
 construct a model or make its tensors GPU-resident.
 

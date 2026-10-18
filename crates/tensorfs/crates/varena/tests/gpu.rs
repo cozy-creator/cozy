@@ -1,7 +1,7 @@
 //! Device paths on a real GPU: fills from the pinned tier and from disk, resident leases,
 //! budgets and eviction, the streaming cursor's slot reuse under a slow consumer, driver truth.
 //! Ignored by default; run one GPU operator at a time:
-//! `flock <locks>/gpu.lock cargo test -p tensorfs-plane --test gpu -- --ignored --test-threads 1`
+//! `flock <locks>/gpu.lock cargo test -p varena --test gpu -- --ignored --test-threads 1`
 #![cfg(target_os = "linux")] // The host tier (memfd, seals, OFD locks) is Linux-only.
 
 mod common;
@@ -11,8 +11,8 @@ use std::os::fd::{AsFd, BorrowedFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use common::*;
-use tensorfs_plane::cuda::{self, CUstream, CtxGuard};
-use tensorfs_plane::{Error, Lease, Plane, PlaneConfig, Tier, WsId};
+use varena::cuda::{self, CUstream, CtxGuard};
+use varena::{Error, Lease, Plane, PlaneConfig, Tier, WsId};
 
 const DEV: i32 = 0;
 const MIB64: u64 = 64 << 20;
@@ -672,7 +672,7 @@ fn shared_regions_attach_read_only_outlive_their_exporter_and_hold_no_budget() {
 mod copy_faults {
     use super::*;
     use std::time::Duration;
-    use tensorfs_plane::faults;
+    use varena::faults;
 
     fn staging_plane() -> Plane {
         // Eight bounces: the staged region's five chunks never wait for a bounce to come back.
@@ -714,9 +714,9 @@ mod copy_faults {
         use std::os::fd::AsRawFd;
         let fx = Fixture::new("gpu-sealed-refused");
         let (lease, _) = tensorfs_core::read::acquire(&fx.store, &fx.meta, "test", fx.objects.clone()).unwrap();
-        let source = tensorfs_plane::io::Source::new(fx.store.clone(), fx.meta.clone(), lease, true, 0);
-        let layout = tensorfs_plane::layout::Layout::build(&fx.plan(), &regions()).unwrap();
-        let fd = tensorfs_plane::host::fill_sealed("unet", &layout, &source, 3, &tensorfs_plane::io::IoTally::default(), None).unwrap();
+        let source = varena::io::Source::new(fx.store.clone(), fx.meta.clone(), lease, true, 0);
+        let layout = varena::layout::Layout::build(&fx.plan(), &regions()).unwrap();
+        let fd = varena::host::fill_sealed("unet", &layout, &source, 3, &varena::io::IoTally::default(), None).unwrap();
         drop(source);
         let p = staging_plane();
         let ws = p.register_sealed("unet", &fx.plan(), &regions(), fd.as_raw_fd()).unwrap();
@@ -881,10 +881,10 @@ fn a_sealed_layout_reaches_the_device_pinned_inside_the_budget_and_locked_past_i
     use std::os::fd::AsRawFd;
     let fx = Fixture::new("gpu-sealed");
     let (lease, _) = tensorfs_core::read::acquire(&fx.store, &fx.meta, "test", fx.objects.clone()).unwrap();
-    let source = tensorfs_plane::io::Source::new(fx.store.clone(), fx.meta.clone(), lease, true, 0);
-    let layout = tensorfs_plane::layout::Layout::build(&fx.plan(), &regions()).unwrap();
-    let tally = tensorfs_plane::io::IoTally::default();
-    let fd = tensorfs_plane::host::fill_sealed("unet", &layout, &source, 3, &tally, None).unwrap();
+    let source = varena::io::Source::new(fx.store.clone(), fx.meta.clone(), lease, true, 0);
+    let layout = varena::layout::Layout::build(&fx.plan(), &regions()).unwrap();
+    let tally = varena::io::IoTally::default();
+    let fd = varena::host::fill_sealed("unet", &layout, &source, 3, &tally, None).unwrap();
     drop(source);
     let p = plane();
     let ws = p.register_sealed("unet", &fx.plan(), &regions(), fd.as_raw_fd()).unwrap();
@@ -928,8 +928,8 @@ fn a_sealed_layout_reaches_the_device_pinned_inside_the_budget_and_locked_past_i
 fn a_layout_still_filling_reaches_the_device_region_by_region() {
     use std::os::fd::AsRawFd;
     let fx = Fixture::new("gpu-progressive");
-    let layout = tensorfs_plane::layout::Layout::build(&fx.plan(), &regions()).unwrap();
-    let (fd, fill) = tensorfs_plane::host::open_sealed("unet", &layout, None, None).unwrap();
+    let layout = varena::layout::Layout::build(&fx.plan(), &regions()).unwrap();
+    let (fd, fill) = varena::host::open_sealed("unet", &layout, None, None).unwrap();
     let p = plane();
     let ws = p.register_sealed("unet", &fx.plan(), &regions(), fd.as_raw_fd()).unwrap();
     let s = Stream::new();
@@ -942,8 +942,8 @@ fn a_layout_still_filling_reaches_the_device_region_by_region() {
     let device = p.want(ws, Tier::Device(DEV), None, 0, false).unwrap();
     assert!(!device.done().unwrap(), "no device copy before its region is Ready");
     let (lease, _) = tensorfs_core::read::acquire(&fx.store, &fx.meta, "test", fx.objects.clone()).unwrap();
-    let source = tensorfs_plane::io::Source::new(fx.store.clone(), fx.meta.clone(), lease, true, 0);
-    let filler = std::thread::spawn(move || fill.run(&layout, &source, 3, &tensorfs_plane::io::IoTally::default()));
+    let source = varena::io::Source::new(fx.store.clone(), fx.meta.clone(), lease, true, 0);
+    let filler = std::thread::spawn(move || fill.run(&layout, &source, 3, &varena::io::IoTally::default()));
     pinned.wait().unwrap();
     device.wait().unwrap();
     filler.join().unwrap().unwrap();
@@ -965,9 +965,9 @@ fn a_sealed_region_outside_the_pinned_books_is_locked_on_its_first_copy() {
     use std::os::fd::AsRawFd;
     let fx = Fixture::new("gpu-sealed-locked");
     let (lease, _) = tensorfs_core::read::acquire(&fx.store, &fx.meta, "test", fx.objects.clone()).unwrap();
-    let source = tensorfs_plane::io::Source::new(fx.store.clone(), fx.meta.clone(), lease, true, 0);
-    let layout = tensorfs_plane::layout::Layout::build(&fx.plan(), &regions()).unwrap();
-    let fd = tensorfs_plane::host::fill_sealed("unet", &layout, &source, 3, &tensorfs_plane::io::IoTally::default(), None).unwrap();
+    let source = varena::io::Source::new(fx.store.clone(), fx.meta.clone(), lease, true, 0);
+    let layout = varena::layout::Layout::build(&fx.plan(), &regions()).unwrap();
+    let fd = varena::host::fill_sealed("unet", &layout, &source, 3, &varena::io::IoTally::default(), None).unwrap();
     drop(source);
     let p = plane();
     let ws = p.register_sealed("unet", &fx.plan(), &regions(), fd.as_raw_fd()).unwrap();
@@ -995,14 +995,14 @@ fn a_sealed_region_outside_the_pinned_books_is_locked_on_its_first_copy() {
 }
 
 /// A streamed layout's machine on a thread: its window serves until the returned flag is set.
-fn served_window(fx: &Fixture, slots: usize) -> (std::os::fd::OwnedFd, std::sync::Arc<std::sync::atomic::AtomicBool>, std::thread::JoinHandle<tensorfs_plane::Result<()>>) {
-    let layout = tensorfs_plane::layout::Layout::build(&fx.plan(), &regions()).unwrap();
-    let (fd, window) = tensorfs_plane::window::open_window("unet", &layout, slots).unwrap();
+fn served_window(fx: &Fixture, slots: usize) -> (std::os::fd::OwnedFd, std::sync::Arc<std::sync::atomic::AtomicBool>, std::thread::JoinHandle<varena::Result<()>>) {
+    let layout = varena::layout::Layout::build(&fx.plan(), &regions()).unwrap();
+    let (fd, window) = varena::window::open_window("unet", &layout, slots).unwrap();
     let (lease, _) = tensorfs_core::read::acquire(&fx.store, &fx.meta, "test", fx.objects.clone()).unwrap();
-    let source = tensorfs_plane::io::Source::new(fx.store.clone(), fx.meta.clone(), lease, true, 0);
+    let source = varena::io::Source::new(fx.store.clone(), fx.meta.clone(), lease, true, 0);
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let s = stop.clone();
-    let t = std::thread::spawn(move || window.serve(&layout, &source, 3, &tensorfs_plane::io::IoTally::default(), &s));
+    let t = std::thread::spawn(move || window.serve(&layout, &source, 3, &varena::io::IoTally::default(), &s));
     (fd, stop, t)
 }
 
@@ -1072,11 +1072,11 @@ fn holes_reach_the_device_from_the_object_files_and_staged_regions_from_the_layo
     use std::os::fd::AsRawFd;
     let fx = Fixture::new("gpu-staged");
     fx.drop_cache();
-    let layout = tensorfs_plane::layout::Layout::build(&fx.plan(), &regions()).unwrap();
-    let (fd, fill) = tensorfs_plane::host::open_sealed("unet", &layout, None, Some(&[1])).unwrap();
+    let layout = varena::layout::Layout::build(&fx.plan(), &regions()).unwrap();
+    let (fd, fill) = varena::host::open_sealed("unet", &layout, None, Some(&[1])).unwrap();
     let (lease, _) = tensorfs_core::read::acquire(&fx.store, &fx.meta, "test", fx.objects.clone()).unwrap();
-    let source = tensorfs_plane::io::Source::new(fx.store.clone(), fx.meta.clone(), lease, true, 0);
-    fill.fill(&layout, &source, 3, &tensorfs_plane::io::IoTally::default()).unwrap();
+    let source = varena::io::Source::new(fx.store.clone(), fx.meta.clone(), lease, true, 0);
+    fill.fill(&layout, &source, 3, &varena::io::IoTally::default()).unwrap();
     let files = fx.objects.iter().map(|o| (o.clone(), std::fs::File::open(fx.store.blob_path(&o.sha256)).unwrap())).collect();
     let p = plane();
     let ws = p.register_staged("unet", &fx.plan(), &regions(), fd.as_raw_fd(), files).unwrap();
@@ -1106,13 +1106,13 @@ fn holes_reach_the_device_from_the_object_files_and_staged_regions_from_the_layo
 fn a_failed_demand_fill_reports_its_cause_and_the_next_acquire_fills_again() {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::FileExt;
-    use tensorfs_plane::layout::{ItemSource, Layout};
+    use varena::layout::{ItemSource, Layout};
     let fx = Fixture::new("gpu-refill");
     let layout = Layout::build(&fx.plan(), &regions()).unwrap();
-    let (fd, fill) = tensorfs_plane::host::open_sealed("unet", &layout, None, Some(&[1])).unwrap();
+    let (fd, fill) = varena::host::open_sealed("unet", &layout, None, Some(&[1])).unwrap();
     let (lease, _) = tensorfs_core::read::acquire(&fx.store, &fx.meta, "test", fx.objects.clone()).unwrap();
-    let source = tensorfs_plane::io::Source::new(fx.store.clone(), fx.meta.clone(), lease, true, 0);
-    fill.fill(&layout, &source, 3, &tensorfs_plane::io::IoTally::default()).unwrap();
+    let source = varena::io::Source::new(fx.store.clone(), fx.meta.clone(), lease, true, 0);
+    fill.fill(&layout, &source, 3, &varena::io::IoTally::default()).unwrap();
     // The handed files are copies, so the hole region 2 reads can be made to fail and recover.
     let dir = fx.root.join("handed");
     std::fs::create_dir_all(&dir).unwrap();

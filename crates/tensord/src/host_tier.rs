@@ -34,7 +34,7 @@ use tensorfs_core::{
     read::{self, Source as Item},
     store::Store,
 };
-use tensorfs_plane::{
+use varena::{
     host::{self, OpenFill},
     io::{IoTally, Source},
     layout::Layout,
@@ -944,13 +944,13 @@ impl HostTier {
         layout: &Layout,
         regions: &[u32],
         fetch: Option<&Fetch>,
-        copy: impl Fn(&[u32], &Source) -> tensorfs_plane::Result<()>,
+        copy: impl Fn(&[u32], &Source) -> varena::Result<()>,
     ) -> Result<(), (io::Error, Vec<u32>)> {
         let objects = |batch: &[u32]| -> Vec<tensorfs_core::ids::ObjectRef> {
             let mut objects = BTreeMap::new();
             for &r in batch {
                 for item in &layout.regions[r as usize].items {
-                    if let tensorfs_plane::layout::ItemSource::Object(range) = &item.source {
+                    if let varena::layout::ItemSource::Object(range) = &item.source {
                         objects.insert(range.obj.sha256.clone(), range.obj.clone());
                     }
                 }

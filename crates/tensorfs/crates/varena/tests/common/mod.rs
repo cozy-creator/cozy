@@ -14,7 +14,7 @@ use tensorfs_core::meta::Meta;
 use tensorfs_core::read::{self, plan_for_traversal, ReadPlan};
 use tensorfs_core::registry;
 use tensorfs_core::store::{Fault, Store};
-use tensorfs_plane::{Plane, PlaneConfig, WsId};
+use varena::{Plane, PlaneConfig, WsId};
 
 pub const MIB: usize = 1 << 20;
 

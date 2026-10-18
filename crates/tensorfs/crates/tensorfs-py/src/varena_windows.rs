@@ -1,4 +1,4 @@
-//! `tensorfs.plane` on Windows: the plane is a Unix mechanism (weight sets cross processes as
+//! `tensorfs.varena` on Windows: the plane is a Unix mechanism (weight sets cross processes as
 //! descriptors) and its Windows tier does not exist yet (xs-043 unit WM). Every name imports;
 //! constructing or calling one raises `Unsupported`.
 
@@ -7,18 +7,18 @@ use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
 
-create_exception!(tensorfs.plane, PlaneError, PyException, "A weight-plane error; `.code` names its class.");
-create_exception!(tensorfs.plane, BudgetExceeded, PlaneError);
-create_exception!(tensorfs.plane, Shortfall, PlaneError);
-create_exception!(tensorfs.plane, BelowFloor, PlaneError);
-create_exception!(tensorfs.plane, LeaseViolation, PlaneError);
-create_exception!(tensorfs.plane, Poisoned, PlaneError);
-create_exception!(tensorfs.plane, CudaError, PlaneError);
-create_exception!(tensorfs.plane, CudaUnavailable, PlaneError);
-create_exception!(tensorfs.plane, Invalid, PlaneError);
-create_exception!(tensorfs.plane, IoError, PlaneError);
-create_exception!(tensorfs.plane, Closed, PlaneError);
-create_exception!(tensorfs.plane, Unsupported, PlaneError);
+create_exception!(tensorfs.varena, PlaneError, PyException, "A weight-plane error; `.code` names its class.");
+create_exception!(tensorfs.varena, BudgetExceeded, PlaneError);
+create_exception!(tensorfs.varena, Shortfall, PlaneError);
+create_exception!(tensorfs.varena, BelowFloor, PlaneError);
+create_exception!(tensorfs.varena, LeaseViolation, PlaneError);
+create_exception!(tensorfs.varena, Poisoned, PlaneError);
+create_exception!(tensorfs.varena, CudaError, PlaneError);
+create_exception!(tensorfs.varena, CudaUnavailable, PlaneError);
+create_exception!(tensorfs.varena, Invalid, PlaneError);
+create_exception!(tensorfs.varena, IoError, PlaneError);
+create_exception!(tensorfs.varena, Closed, PlaneError);
+create_exception!(tensorfs.varena, Unsupported, PlaneError);
 
 fn unsupported(py: Python<'_>) -> PyErr {
     let error = Unsupported::new_err("the weight plane has no Windows tier yet; read objects through Store leases");
@@ -28,7 +28,7 @@ fn unsupported(py: Python<'_>) -> PyErr {
 
 macro_rules! unconstructible {
     ($($rust:ident = $name:literal),*) => {$(
-        #[pyclass(name = $name, module = "tensorfs.plane", frozen)]
+        #[pyclass(name = $name, module = "tensorfs.varena", frozen)]
         struct $rust;
 
         #[pymethods]
@@ -59,7 +59,7 @@ refused!(hold_tier, release_tier, reserve, fill_sealed);
 
 pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     let py = parent.py();
-    let m = PyModule::new(py, "plane")?;
+    let m = PyModule::new(py, "varena")?;
     m.add_class::<Plane>()?;
     m.add_class::<Source>()?;
     m.add_class::<WeightSet>()?;
@@ -79,5 +79,5 @@ pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     add_errors!(PlaneError, BudgetExceeded, Shortfall, BelowFloor, LeaseViolation, Poisoned, CudaError,
         CudaUnavailable, Invalid, IoError, Closed, Unsupported);
     parent.add_submodule(&m)?;
-    py.import("sys")?.getattr("modules")?.set_item("tensorfs._ext.plane", &m)
+    py.import("sys")?.getattr("modules")?.set_item("tensorfs._ext.varena", &m)
 }

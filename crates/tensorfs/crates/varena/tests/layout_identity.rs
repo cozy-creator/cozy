@@ -6,7 +6,7 @@ use tensorfs_core::{
     header::{Header, Part, Tensor},
     read,
 };
-use tensorfs_plane::{
+use varena::{
     host::{self, HostMem},
     io::{IoTally, Source},
     layout::Layout,

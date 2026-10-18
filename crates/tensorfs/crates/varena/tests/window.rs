@@ -12,11 +12,11 @@ use std::thread;
 
 use common::*;
 use tensorfs_core::read;
-use tensorfs_plane::host::HostMem;
-use tensorfs_plane::io::{IoTally, Source};
-use tensorfs_plane::layout::Layout;
-use tensorfs_plane::window::open_window;
-use tensorfs_plane::{Error, Tier};
+use varena::host::HostMem;
+use varena::io::{IoTally, Source};
+use varena::layout::Layout;
+use varena::window::open_window;
+use varena::{Error, Tier};
 
 /// Each region's expected bytes (padding excluded), by part.
 fn expected(layout: &Layout) -> Vec<Vec<(usize, Vec<u8>)>> {
@@ -36,12 +36,12 @@ fn expected(layout: &Layout) -> Vec<Vec<(usize, Vec<u8>)>> {
         .collect()
 }
 
-fn read_region(host: &HostMem, r: u32, want: &[(usize, Vec<u8>)]) -> tensorfs_plane::Result<()> {
+fn read_region(host: &HostMem, r: u32, want: &[(usize, Vec<u8>)]) -> varena::Result<()> {
     read_holding(host, r, want, std::time::Duration::ZERO)
 }
 
 /// Check region `r`, hold it `hold`, and check it again: a refill under the claim shows.
-fn read_holding(host: &HostMem, r: u32, want: &[(usize, Vec<u8>)], hold: std::time::Duration) -> tensorfs_plane::Result<()> {
+fn read_holding(host: &HostMem, r: u32, want: &[(usize, Vec<u8>)], hold: std::time::Duration) -> varena::Result<()> {
     host.with_region(r, |p| {
         for pass in 0..1 + usize::from(!hold.is_zero()) {
             for (at, bytes) in want {
@@ -57,10 +57,10 @@ fn read_holding(host: &HostMem, r: u32, want: &[(usize, Vec<u8>)], hold: std::ti
 
 struct Served {
     stop: Arc<AtomicBool>,
-    thread: Option<thread::JoinHandle<tensorfs_plane::Result<()>>>,
+    thread: Option<thread::JoinHandle<varena::Result<()>>>,
 }
 impl Served {
-    fn end(mut self) -> tensorfs_plane::Result<()> {
+    fn end(mut self) -> varena::Result<()> {
         self.stop.store(true, Ordering::Release);
         self.thread.take().unwrap().join().unwrap()
     }
@@ -108,7 +108,7 @@ fn concurrent_adopters_never_see_a_slot_refilled_under_them() {
     // Each refill waits a moment after the machine's snapshot of claims, so claims made in
     // between are the norm: only the check after clearing a slot's word keeps them safe.
     #[cfg(feature = "faults")]
-    tensorfs_plane::faults::arm_stall("window-victim", 3);
+    varena::faults::arm_stall("window-victim", 3);
     let fx = Fixture::new("window-race");
     let (fd, layout, served) = serve(&fx, 2);
     let want = Arc::new(expected(&layout));
@@ -143,7 +143,7 @@ fn a_region_the_machine_cannot_read_fails_its_readers_and_only_them() {
     // The object behind region 2 (c.weight) vanishes after the lease (a disk fault): its stage
     // fails, the others still stream.
     let object = layout.regions[2].items.iter().find_map(|it| match &it.source {
-        tensorfs_plane::layout::ItemSource::Object(o) => Some(o.obj.sha256.clone()),
+        varena::layout::ItemSource::Object(o) => Some(o.obj.sha256.clone()),
         _ => None,
     });
     std::fs::remove_file(fx.store.blob_path(&object.unwrap())).unwrap();
@@ -193,7 +193,7 @@ fn a_one_region_window_the_size_of_its_layout_is_still_a_window() {
     let one = vec![regions().concat()];
     let layout = Layout::build(&fx.plan(), &one).unwrap();
     let (fd, window) = open_window("unet", &layout, 1).unwrap();
-    let (full, _filling) = tensorfs_plane::host::open_sealed("unet", &layout, None, None).unwrap();
+    let (full, _filling) = varena::host::open_sealed("unet", &layout, None, None).unwrap();
     let size = |fd: i32| std::fs::File::from(fd_dup(fd)).metadata().unwrap().len();
     assert_eq!(size(fd.as_raw_fd()), size(full.as_raw_fd()), "the case this test is about");
     let host = HostMem::adopt_sealed(fd.as_raw_fd(), &layout).unwrap();

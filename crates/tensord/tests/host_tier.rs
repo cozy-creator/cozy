@@ -25,7 +25,7 @@ use tensorfs_core::{
     read, registry,
     store::{Fault, Store},
 };
-use tensorfs_plane::{layout::Layout, Plane, PlaneConfig, Tier};
+use varena::{layout::Layout, Plane, PlaneConfig, Tier};
 
 #[path = "common/names_hub.rs"]
 mod names_hub;
@@ -653,7 +653,7 @@ fn inside_a_256_mib_scope() {
         .unwrap();
     let granted = granted.expect("never refused");
     let streamed =
-        tensorfs_plane::host::HostMem::adopt_sealed(granted.as_raw_fd(), &small.layout())
+        varena::host::HostMem::adopt_sealed(granted.as_raw_fd(), &small.layout())
             .unwrap()
             .window()
             .is_some();
@@ -776,7 +776,7 @@ fn a_failed_fill_is_an_error_for_its_adopters_and_leaves_the_tier() {
     let fx = Fixture::new("corrupt", &[8 * MIB, 8 * MIB]);
     let layout = fx.layout();
     let last = layout.regions.last().unwrap().items.last().unwrap();
-    let tensorfs_plane::layout::ItemSource::Object(range) = &last.source else {
+    let varena::layout::ItemSource::Object(range) = &last.source else {
         panic!("an object-backed tensor")
     };
     let blob = fx.store.blob_path(&range.obj.sha256);
@@ -819,7 +819,7 @@ fn a_failed_fill_is_an_error_for_its_adopters_and_leaves_the_tier() {
 /// order, `passes` times, checking every byte; returns the bytes checked.
 fn stream_through(fx: &Fixture, granted: &File, passes: usize) -> u64 {
     let layout = fx.layout();
-    let host = tensorfs_plane::host::HostMem::adopt_sealed(granted.as_raw_fd(), &layout).unwrap();
+    let host = varena::host::HostMem::adopt_sealed(granted.as_raw_fd(), &layout).unwrap();
     assert!(host.window().is_some(), "a streamed layout");
     let mut checked = 0;
     for _ in 0..passes {
@@ -943,7 +943,7 @@ fn a_staged_executor_gets_only_what_it_streams_staged_and_object_files_for_the_r
     let (_executor, a) = Executor::spawn_staged(&tier);
     let granted = staged_ask(&tier, a, &fx, &[0]);
     let layout = fx.layout();
-    let host = tensorfs_plane::host::HostMem::adopt_sealed(granted.as_raw_fd(), &layout).unwrap();
+    let host = varena::host::HostMem::adopt_sealed(granted.as_raw_fd(), &layout).unwrap();
     host.wait_ready(0).unwrap();
     assert!((1..4).all(|r| host.hole(r)), "regions 1-3 read the object files");
     let facts = settled(&tier);
@@ -958,14 +958,14 @@ fn a_staged_executor_gets_only_what_it_streams_staged_and_object_files_for_the_r
         // SAFETY: a scalar fcntl query on a descriptor we hold.
         assert_eq!(unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) } & libc::O_ACCMODE, libc::O_RDONLY);
     }
-    let source = tensorfs_plane::io::Source::files(files, false, 0);
-    let tally = tensorfs_plane::io::IoTally::default();
+    let source = varena::io::Source::files(files, false, 0);
+    let tally = varena::io::IoTally::default();
     for r in 1..4 {
         let region = &layout.regions[r];
         let mut buf = vec![0u8; region.span as usize];
         for it in &region.items {
             // SAFETY: each item's range lies inside `buf`; one thread.
-            unsafe { source.read_item(it, buf.as_mut_ptr().add((it.offset - region.offset) as usize), tensorfs_plane::io::Mode::Cached, &tally) }.unwrap();
+            unsafe { source.read_item(it, buf.as_mut_ptr().add((it.offset - region.offset) as usize), varena::io::Mode::Cached, &tally) }.unwrap();
         }
         for part in layout.parts.iter().filter(|p| p.region as usize == r) {
             let key = part.what.trim_start_matches("unet/").trim_end_matches("#value");
@@ -999,7 +999,7 @@ fn without_room_a_staged_executor_reads_every_region_from_the_files() {
     let tier = tier(&fx, MIB as u64);
     let (_executor, a) = Executor::spawn_staged(&tier);
     let granted = staged_ask(&tier, a, &fx, &[0, 1, 2, 3]);
-    let host = tensorfs_plane::host::HostMem::adopt_sealed(granted.as_raw_fd(), &fx.layout()).unwrap();
+    let host = varena::host::HostMem::adopt_sealed(granted.as_raw_fd(), &fx.layout()).unwrap();
     assert!((0..4).all(|r| host.hole(r)));
     let facts = settled(&tier);
     assert_eq!((facts.windows, facts.ledger.windows_opened), (0, 0), "{facts:?}");
@@ -1017,7 +1017,7 @@ fn a_whole_reader_takes_a_window_when_a_layout_staged_in_part_cannot_grow() {
     let (_staged, a) = Executor::spawn_staged(&tier);
     let sparse = staged_ask(&tier, a, &fx, &[0]);
     let layout = fx.layout();
-    let host = tensorfs_plane::host::HostMem::adopt_sealed(sparse.as_raw_fd(), &layout).unwrap();
+    let host = varena::host::HostMem::adopt_sealed(sparse.as_raw_fd(), &layout).unwrap();
     host.wait_ready(0).unwrap();
     settled(&tier);
     let (_whole, b) = Executor::spawn(&tier);
@@ -1093,7 +1093,7 @@ fn a_staged_region_waits_on_its_ticket_and_nothing_else_downloads() {
     let granted = tier.seal(a, &[fx.grant()], cold, plan, Some(&fetch)).unwrap().expect("a layout with nothing staged");
     assert_eq!(gets(), structure, "registering a cold layout fetches nothing");
     let layout = fx.layout();
-    let host = tensorfs_plane::host::HostMem::adopt_sealed(granted.as_raw_fd(), &layout).unwrap();
+    let host = varena::host::HostMem::adopt_sealed(granted.as_raw_fd(), &layout).unwrap();
     let (plan, sha256, length) = fx.plan(&["unet"]);
     let request = SealedRequest { sha256: &sha256, length, stage: Some(&[2, 0]) };
     assert_eq!(tier.stage(a, &[fx.grant()], request, plan, Some(&fetch)).unwrap(), vec![2, 0]);
@@ -1111,7 +1111,7 @@ fn a_staged_region_waits_on_its_ticket_and_nothing_else_downloads() {
         .iter()
         .flat_map(|&r| layout.regions[r].items.iter())
         .filter_map(|item| match &item.source {
-            tensorfs_plane::layout::ItemSource::Object(range) => Some(range.obj.sha256.clone()),
+            varena::layout::ItemSource::Object(range) => Some(range.obj.sha256.clone()),
             _ => None,
         })
         .collect();

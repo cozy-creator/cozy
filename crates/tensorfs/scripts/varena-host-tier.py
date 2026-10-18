@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The weight plane's pinned host tier through `tensorfs.plane`, on a real store, CPU only.
+"""The weight plane's pinned host tier through `tensorfs.varena`, on a real store, CPU only.
 
 Register and layout alignment, a pinned fill checked byte for byte against the source,
 eviction order and memfd RAM release under a lowered budget, Shortfall, pinning, drop,
@@ -8,7 +8,7 @@ RAM is punched unless a Worker hold keeps it; releasing the hold punches it), an
 per manifest that ends only when its last weight set closes and its Source is dropped. Every
 Plane is `devices=[]`: libcuda is never loaded.
 
-    PYTHONPATH=python scripts/plane-host-tier.py [workdir]
+    PYTHONPATH=python scripts/varena-host-tier.py [workdir]
 """
 
 import gc
@@ -26,7 +26,7 @@ import time
 from pathlib import Path
 
 import tensorfs
-from tensorfs import plane
+from tensorfs import varena
 
 MIB = 1 << 20
 REGION_ALIGN, PART_ALIGN = 2 * MIB, 4096
@@ -141,7 +141,7 @@ def set_of(p, ws):
 def child(root, manifest, fd):
     """The second process: adopt the parent's memfd for the same layout."""
     store = tensorfs.Store.open(root)
-    p = plane.Plane(devices=[])
+    p = varena.Plane(devices=[])
     lease = store.acquire_cozytensors(manifest)
     src = p.source(store, lease)
     ws = register(p, src, store, manifest, "unet", host_fd=int(fd))
@@ -163,7 +163,7 @@ def main(work: Path):
     root = work / "store"
     store, manifest = build(root, data)
 
-    p = plane.Plane(devices=[])
+    p = varena.Plane(devices=[])
     check("host-only plane serves no device", p.devices == [])
     lease = store.acquire_cozytensors(manifest)
     hold = lease.hold_id
@@ -276,11 +276,11 @@ def main(work: Path):
 
     # ---- want evicts only strictly lower priority; pins hold; drop
     p.set_pinned_budget(spans[1])
-    e = raises("an equal-priority want raises Shortfall", plane.Shortfall,
+    e = raises("an equal-priority want raises Shortfall", varena.Shortfall,
                lambda: p.want(ws, "pinned", regions=[1], priority=1))
     if e is not None:
         check("Shortfall carries code, need, available, blockers",
-              isinstance(e, plane.PlaneError) and e.code == "SHORTFALL" and e.need == spans[1]
+              isinstance(e, varena.PlaneError) and e.code == "SHORTFALL" and e.need == spans[1]
               and e.available == spans[1] - spans[0] and e.blockers == [], vars(e))
     p.want(ws, "pinned", regions=[1], priority=2).wait()
     check("a higher-priority want evicts the lower region",
@@ -291,24 +291,24 @@ def main(work: Path):
     check("prioritise pins without moving a byte; a pin is never evicted implicitly",
           trim["evicted"] == [] and trim["over_budget_unreleasable"] == spans[1]
           and p.stats()["host"]["fills"] == fills, trim)
-    raises("a want above the whole pinned budget raises BelowFloor", plane.BelowFloor,
+    raises("a want above the whole pinned budget raises BelowFloor", varena.BelowFloor,
            lambda: p.want(ws, "pinned", regions=[0], priority=100))
     check("drop frees a pinned region", p.drop(ws, "pinned", [1]) == spans[1]
           and p.stats()["host"]["used"] == 0 and set_of(p, ws)["host_memfd_bytes"] < REGION_ALIGN)
     check("capacity refusals never poison", p.stats()["poisoned"] is None)
 
     # ---- refusals that must never reach a device
-    raises("an unknown tier is Invalid", plane.Invalid, lambda: p.want(ws, "gpu"))
-    raises("an unserved device is Invalid", plane.Invalid, lambda: p.want(ws, 0))
-    raises("a view on an unserved device is Invalid", plane.Invalid, lambda: ws.view(0))
-    other = plane.Plane(devices=[])
-    raises("a weight set is bound to its plane", plane.Invalid, lambda: other.want(ws, "pinned"))
+    raises("an unknown tier is Invalid", varena.Invalid, lambda: p.want(ws, "gpu"))
+    raises("an unserved device is Invalid", varena.Invalid, lambda: p.want(ws, 0))
+    raises("a view on an unserved device is Invalid", varena.Invalid, lambda: ws.view(0))
+    other = varena.Plane(devices=[])
+    raises("a weight set is bound to its plane", varena.Invalid, lambda: other.want(ws, "pinned"))
     other.close()
     raises("a consumed lease cannot make a second source", tensorfs.errors.LeaseRevoked,
            lambda: p.source(store, lease))
-    raises("adopting a memfd of another layout is Invalid", plane.Invalid,
+    raises("adopting a memfd of another layout is Invalid", varena.Invalid,
            lambda: register(p, src, store, manifest, "vae", host_fd=ws.host_fd))
-    raises("adopting a descriptor that is not open is IoError", plane.IoError,
+    raises("adopting a descriptor that is not open is IoError", varena.IoError,
            lambda: register(p, src, store, manifest, "vae", host_fd=1 << 20))
 
     # ---- claims: RAM a closed set leaves goes unless someone still claims it
@@ -320,11 +320,11 @@ def main(work: Path):
     p.want(tier, "pinned").wait()
     kept = os.dup(tier.host_fd)  # what the Worker's HostTiers keeps
     full = resident(kept)
-    hold_fd = plane.hold_tier(kept)
+    hold_fd = varena.hold_tier(kept)
     tier.close()
     check("a Worker hold keeps a closed set's pinned RAM", resident(kept) == full, resident(kept))
     check("releasing the hold punches what no plane claims",
-          plane.release_tier(hold_fd) == sum(spans) and resident(kept) < REGION_ALIGN, resident(kept))
+          varena.release_tier(hold_fd) == sum(spans) and resident(kept) < REGION_ALIGN, resident(kept))
     os.close(kept)
     tier = register(p, src, store, manifest, "unet")
     p.want(tier, "pinned").wait()
@@ -342,7 +342,7 @@ def main(work: Path):
         return (sum("memfd:tfs-plane" in f for f in fds), sum(n.startswith("tfs-plane") for n in names))
 
     def unclosed():
-        q = plane.Plane(devices=[])
+        q = varena.Plane(devices=[])
         qsrc = q.source(store, store.acquire_cozytensors(manifest))
         qws = register(q, qsrc, store, manifest, "unet")
         q.set_pinned_budget(qws.nbytes)
@@ -364,7 +364,7 @@ def main(work: Path):
     # ---- one lease per manifest: it ends with the last weight set and the source handle
     ws.close()
     check("closing one weight set keeps the source's lease", held(root, hold))
-    e = raises("a closed weight set is Closed", plane.Closed, lambda: ws.close())
+    e = raises("a closed weight set is Closed", varena.Closed, lambda: ws.close())
     check("Closed carries its code", e is not None and e.code == "CLOSED")
     del src
     check("dropping the source handle keeps the lease while a weight set uses it", held(root, hold))
@@ -384,5 +384,5 @@ if __name__ == "__main__":
     parent = Path(sys.argv[1]) if len(sys.argv) > 1 else None
     if parent is not None:
         parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(dir=parent, prefix="plane-host-tier-") as d:
+    with tempfile.TemporaryDirectory(dir=parent, prefix="varena-host-tier-") as d:
         sys.exit(main(Path(d)))

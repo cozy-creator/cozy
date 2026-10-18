@@ -13,7 +13,7 @@ members = [
     "crates/migrate",
     "crates/tensord",
     "crates/tensorfs/crates/tensorfs-core",
-    "crates/tensorfs/crates/tensorfs-plane",
+    "crates/tensorfs/crates/varena",
     "crates/tensorfs/crates/tensorfs-py",
 ]
 
@@ -36,7 +36,7 @@ migrate = { path = "crates/migrate" }
 portable-pty = "0.9.0"
 tensord = { path = "crates/tensord" }
 tensorfs-core = { path = "crates/tensorfs/crates/tensorfs-core", default-features = false }
-tensorfs-plane = { path = "crates/tensorfs/crates/tensorfs-plane", default-features = false }
+varena = { path = "crates/tensorfs/crates/varena", default-features = false }
 
 anstream = "1.0.0"
 anstyle = "1.0.14"

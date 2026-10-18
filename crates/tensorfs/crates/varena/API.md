@@ -1,4 +1,4 @@
-# tensorfs.plane — Python API (v3.5, 2026-10-02)
+# tensorfs.varena — Python API (v3.5, 2026-10-02)
 
 The weight plane supplies memory and transfer mechanisms in the process that calls it.
 In Cozy, TensorD coordinates machine-wide memory policy and makes model weights available

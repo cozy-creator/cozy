@@ -8,8 +8,8 @@ mod common;
 use std::time::Duration;
 
 use common::*;
-use tensorfs_plane::cuda::{self, CUstream, CtxGuard};
-use tensorfs_plane::{Error, Plane, PlaneConfig, Tier};
+use varena::cuda::{self, CUstream, CtxGuard};
+use varena::{Error, Plane, PlaneConfig, Tier};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Census {

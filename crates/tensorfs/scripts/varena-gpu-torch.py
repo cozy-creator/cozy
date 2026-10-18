@@ -7,7 +7,7 @@ holds it; a spread resident set is wanted on the device; the rest streams throug
 Every step's output must equal the all-resident reference bit for bit. Prints step times
 (streamed vs resident), stalls and per-region GPU compute from `stats()`.
 
-    flock <locks>/gpu.lock python scripts/plane-gpu-torch.py [workdir] [--layers N] [--dim D]
+    flock <locks>/gpu.lock python scripts/varena-gpu-torch.py [workdir] [--layers N] [--dim D]
         [--batch B] [--resident R] [--window W] [--steps S]
 Runs with any python that has torch (CUDA) and `PYTHONPATH=<worktree>/python`.
 """
@@ -23,7 +23,7 @@ from pathlib import Path
 import torch
 
 import tensorfs
-from tensorfs import plane
+from tensorfs import varena
 
 MIB = 1 << 20
 results: list[bool] = []
@@ -74,7 +74,7 @@ def main() -> int:
     dev = torch.device("cuda", 0)
     torch.cuda.init()
     s = torch.cuda.Stream(dev)
-    p = plane.Plane(devices=[0], readers=4)
+    p = varena.Plane(devices=[0], readers=4)
     src = p.source(store, store.acquire_cozytensors(manifest))
     ws = p.register("smoke/model", src, rplan, regions)
     del src

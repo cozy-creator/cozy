@@ -1,4 +1,4 @@
-//! tensorfs-plane: memory and transfer mechanisms used in the calling process.
+//! varena: memory and transfer mechanisms used in the calling process.
 //! In Cozy, TensorD coordinates machine-wide budgets and retention and uses TensorFS to
 //! prepare shared CPU weight buffers. Runtime constructs models and drives GPU allocation,
 //! copies, mapping and unmapping through the plane/device APIs within those grants.

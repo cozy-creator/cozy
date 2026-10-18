@@ -4225,7 +4225,6 @@ dependencies = [
  "str0m",
  "tar",
  "tensorfs-core",
- "tensorfs-plane",
  "time",
  "tokio",
  "tokio-rustls",
@@ -4236,6 +4235,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "varena",
  "webpki-roots",
  "x509-parser",
  "zip 7.4.0",
@@ -4274,27 +4274,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "tensorfs-plane"
-version = "0.10.0"
-dependencies = [
- "cozy-platform",
- "libc",
- "libloading 0.9.0",
- "tensorfs-core",
- "thiserror 2.0.21",
- "tracing",
-]
-
-[[package]]
 name = "tensorfs-py"
 version = "0.10.0"
 dependencies = [
  "cozy-platform",
  "pyo3",
  "tensorfs-core",
- "tensorfs-plane",
  "tracing",
  "tracing-subscriber",
+ "varena",
 ]
 
 [[package]]
@@ -4857,6 +4845,18 @@ dependencies = [
  "getrandom 0.4.3",
  "js-sys",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "varena"
+version = "0.10.0"
+dependencies = [
+ "cozy-platform",
+ "libc",
+ "libloading 0.9.0",
+ "tensorfs-core",
+ "thiserror 2.0.21",
+ "tracing",
 ]
 
 [[package]]

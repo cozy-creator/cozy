@@ -27,7 +27,7 @@ CLIENT = ("crates/tensorfs-core/Cargo.toml", "crates/tensorfs-core/src/fetch/net
           "crates/tensorfs-core/src/transport/")
 ALLOW = {"rustls": CLIENT, "webpki": CLIENT, "hyper": CLIENT}
 SCAN = ["crates/*/Cargo.toml", "crates/*/src/**/*.rs"]
-RANK = {"tensorfs-core": 0, "tensorfs-plane": 1, "tensorfs-py": 2}
+RANK = {"tensorfs-core": 0, "varena": 1, "tensorfs-py": 2}
 
 
 def rel(p):

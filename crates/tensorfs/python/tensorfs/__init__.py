@@ -7,7 +7,7 @@ computes none of them. What lives here is types and names.
 TensorFS is a library used in TensorD and Runtime's executor processes. TensorD makes
 weight sources and shared CPU buffers available and coordinates machine-wide memory
 policy. Runtime constructs models and performs GPU operations through the local plane
-and device APIs within those grants (`tensorfs.plane`), reads sources and writes derived
+and device APIs within those grants (`tensorfs.varena`), reads sources and writes derived
 weights through `tensorfs.derived`, and directs fetching through `tensorfs.fetch`.
 TensorFS never imports Torch.
 """

@@ -3,7 +3,7 @@
 `host_tier.rs` (`HostTier`) keeps shared **CPU weight buffers**, not Python/PyTorch models or
 GPU tensors. TensorD chooses which buffers to keep under its host-memory policy and uses
 embedded TensorFS to fill them from verified stored weight bytes. Each weight set's layout is a memfd
-sealed at creation (`tensorfs_plane::host::open_sealed`: nobody else can write, resize or punch
+sealed at creation (`varena::host::open_sealed`: nobody else can write, resize or punch
 it) and filled once through TensorFS's verified read path (page-cache copies, O_DIRECT for the
 rest, N threads) by one background filler, layouts in the order opened, each region marked Ready
 as its last byte lands. Runtime executors adopt it read-only (`Plane.register_sealed`); their

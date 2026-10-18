@@ -1,4 +1,4 @@
-//! `tensorfs.plane`: the weight plane's Python surface, exactly `crates/tensorfs-plane/API.md`.
+//! `tensorfs.varena`: the weight plane's Python surface, exactly `crates/varena/API.md`.
 //!
 //! Marshal only. Every call that can wait, do I/O or touch the driver runs detached from the
 //! GIL. Stats, events and trims cross as plain dicts and lists; device bytes cross as uint8
@@ -14,10 +14,10 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use pyo3::{create_exception, ffi};
 #[cfg(feature = "store")]
-use tensorfs_plane::io::Source;
-use tensorfs_plane::layout::Layout;
-use tensorfs_plane::plane::{Event, LeaseView, Stats};
-use tensorfs_plane::{
+use varena::io::Source;
+use varena::layout::Layout;
+use varena::plane::{Event, LeaseView, Stats};
+use varena::{
     Cursor, Error, Lease, Plane, PlaneConfig, RingView, Ticket, Tier, Trim, View, WsId,
 };
 
@@ -26,18 +26,18 @@ use crate::readplan::PyPlan;
 #[cfg(feature = "store")]
 use crate::store::{PyLease, PyStore};
 
-create_exception!(tensorfs.plane, PlaneError, PyException, "A weight-plane error; `.code` names its class.");
-create_exception!(tensorfs.plane, BudgetExceeded, PlaneError);
-create_exception!(tensorfs.plane, Shortfall, PlaneError);
-create_exception!(tensorfs.plane, BelowFloor, PlaneError);
-create_exception!(tensorfs.plane, LeaseViolation, PlaneError);
-create_exception!(tensorfs.plane, Poisoned, PlaneError);
-create_exception!(tensorfs.plane, CudaError, PlaneError);
-create_exception!(tensorfs.plane, CudaUnavailable, PlaneError);
-create_exception!(tensorfs.plane, Invalid, PlaneError);
-create_exception!(tensorfs.plane, IoError, PlaneError);
-create_exception!(tensorfs.plane, Closed, PlaneError);
-create_exception!(tensorfs.plane, Unsupported, PlaneError);
+create_exception!(tensorfs.varena, PlaneError, PyException, "A weight-plane error; `.code` names its class.");
+create_exception!(tensorfs.varena, BudgetExceeded, PlaneError);
+create_exception!(tensorfs.varena, Shortfall, PlaneError);
+create_exception!(tensorfs.varena, BelowFloor, PlaneError);
+create_exception!(tensorfs.varena, LeaseViolation, PlaneError);
+create_exception!(tensorfs.varena, Poisoned, PlaneError);
+create_exception!(tensorfs.varena, CudaError, PlaneError);
+create_exception!(tensorfs.varena, CudaUnavailable, PlaneError);
+create_exception!(tensorfs.varena, Invalid, PlaneError);
+create_exception!(tensorfs.varena, IoError, PlaneError);
+create_exception!(tensorfs.varena, Closed, PlaneError);
+create_exception!(tensorfs.varena, Unsupported, PlaneError);
 
 /// The one conversion. Source refusals cross as the usual `tensorfs.errors` classes.
 fn err(py: Python<'_>, e: Error) -> PyErr {
@@ -81,7 +81,7 @@ trait OrRaise<T> {
     fn or_raise(self, py: Python<'_>) -> PyResult<T>;
 }
 
-impl<T> OrRaise<T> for tensorfs_plane::Result<T> {
+impl<T> OrRaise<T> for varena::Result<T> {
     fn or_raise(self, py: Python<'_>) -> PyResult<T> {
         self.map_err(|e| err(py, e))
     }
@@ -193,7 +193,7 @@ fn event<'p>(py: Python<'p>, e: Event) -> PyResult<Bound<'p, PyDict>> {
 
 // ---------------------------------------------------------------- the plane
 
-#[pyclass(name = "Plane", module = "tensorfs.plane", frozen)]
+#[pyclass(name = "Plane", module = "tensorfs.varena", frozen)]
 pub struct PyPlane {
     plane: Arc<Plane>,
 }
@@ -479,7 +479,7 @@ impl PyPlane {
 
 // ---------------------------------------------------------------- weight sets
 
-#[pyclass(name = "WeightSet", module = "tensorfs.plane", frozen)]
+#[pyclass(name = "WeightSet", module = "tensorfs.varena", frozen)]
 pub struct PyWeightSet {
     plane: Arc<Plane>,
     id: WsId,
@@ -545,18 +545,18 @@ impl PyWeightSet {
     }
 
     fn __repr__(&self) -> String {
-        format!("<tensorfs.plane.WeightSet {:?} {} B in {} regions>", self.name, self.layout.nbytes, self.layout.regions.len())
+        format!("<tensorfs.varena.WeightSet {:?} {} B in {} regions>", self.name, self.layout.nbytes, self.layout.regions.len())
     }
 }
 
 /// A manifest's byte source: one TensorFS lease shared by its weight sets.
 #[cfg(feature = "store")]
-#[pyclass(name = "Source", module = "tensorfs.plane", frozen)]
+#[pyclass(name = "Source", module = "tensorfs.varena", frozen)]
 pub struct PySource {
     source: Arc<Source>,
 }
 
-#[pyclass(name = "Ticket", module = "tensorfs.plane", frozen)]
+#[pyclass(name = "Ticket", module = "tensorfs.varena", frozen)]
 pub struct PyTicket {
     ticket: Ticket,
 }
@@ -576,7 +576,7 @@ impl PyTicket {
 
 /// Use of one region's bytes on one stream. Release exactly once; a lease collected
 /// unreleased poisons the plane.
-#[pyclass(name = "Lease", module = "tensorfs.plane", frozen)]
+#[pyclass(name = "Lease", module = "tensorfs.varena", frozen)]
 pub struct PyPlaneLease {
     #[pyo3(get)]
     ptr: u64,
@@ -634,7 +634,7 @@ impl PyPlaneLease {
     }
 }
 
-#[pyclass(name = "Cursor", module = "tensorfs.plane", frozen)]
+#[pyclass(name = "Cursor", module = "tensorfs.varena", frozen)]
 pub struct PyCursor {
     /// Per order index: served in place (resident at `stream()`).
     #[pyo3(get)]
@@ -711,7 +711,7 @@ impl Viewed {
 }
 
 /// Device bytes as a 1-D uint8 DLPack tensor. Consumers' tensors keep the view alive.
-#[pyclass(name = "DeviceView", module = "tensorfs.plane", frozen)]
+#[pyclass(name = "DeviceView", module = "tensorfs.varena", frozen)]
 pub struct PyDeviceView {
     held: Arc<Viewed>,
 }
@@ -850,7 +850,7 @@ macro_rules! add_errors {
 /// new descriptor the caller owns; closing it ends the claim.
 #[pyfunction]
 fn hold_tier(py: Python<'_>, fd: i32) -> PyResult<i32> {
-    tensorfs_plane::host::hold(fd).map(std::os::fd::IntoRawFd::into_raw_fd).or_raise(py)
+    varena::host::hold(fd).map(std::os::fd::IntoRawFd::into_raw_fd).or_raise(py)
 }
 
 /// End a `hold_tier` claim: punches every Ready region no plane claims, closes `hold`, and
@@ -859,7 +859,7 @@ fn hold_tier(py: Python<'_>, fd: i32) -> PyResult<i32> {
 fn release_tier(py: Python<'_>, hold: i32) -> PyResult<u64> {
     // SAFETY: the caller hands over the descriptor `hold_tier` returned.
     let hold = unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(hold) };
-    tensorfs_plane::host::release_hold(hold).or_raise(py)
+    varena::host::release_hold(hold).or_raise(py)
 }
 
 /// Fill a shared CPU weight layout through the verified read path and seal it (the owner's
@@ -887,14 +887,14 @@ fn fill_sealed<'p>(
     let reserved = reserved.map(|fd| unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) });
     let lease = lease.take_for_plane(py)?;
     let (store, meta, p) = (store.store.clone(), store.meta.clone(), &plan.plan);
-    let tally = tensorfs_plane::io::IoTally::default();
+    let tally = varena::io::IoTally::default();
     let fd = py
         .detach(|| {
             let layout = Layout::build(p, &regions)?;
             let source = Source::new(store, meta, lease, true, 0);
-            let (fd, open) = tensorfs_plane::host::open_sealed(&name, &layout, reserved, staged.as_deref())?;
+            let (fd, open) = varena::host::open_sealed(&name, &layout, reserved, staged.as_deref())?;
             open.run(&layout, &source, threads, &tally)?;
-            Ok::<_, tensorfs_plane::Error>(fd)
+            Ok::<_, varena::Error>(fd)
         })
         .or_raise(py)?;
     let read = |n: &std::sync::atomic::AtomicU64| n.load(Ordering::Relaxed);
@@ -909,15 +909,15 @@ fn fill_sealed<'p>(
 #[pyfunction]
 #[pyo3(signature = (name, nbytes, threads = 8))]
 fn reserve(py: Python<'_>, name: String, nbytes: u64, threads: usize) -> PyResult<i32> {
-    py.detach(|| tensorfs_plane::host::reserve(&name, nbytes, threads))
+    py.detach(|| varena::host::reserve(&name, nbytes, threads))
         .map(std::os::fd::IntoRawFd::into_raw_fd)
         .or_raise(py)
 }
 
-/// `tensorfs._ext.plane`, importable as such (the facade module `tensorfs.plane` re-exports it).
+/// `tensorfs._ext.varena`, importable as such (the facade module `tensorfs.varena` re-exports it).
 pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     let py = parent.py();
-    let m = PyModule::new(py, "plane")?;
+    let m = PyModule::new(py, "varena")?;
     m.add_class::<PyPlane>()?;
     #[cfg(feature = "store")]
     m.add_class::<PySource>()?;
@@ -938,5 +938,5 @@ pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     add_errors!(m; PlaneError, BudgetExceeded, Shortfall, BelowFloor, LeaseViolation, Poisoned, CudaError,
         CudaUnavailable, Invalid, IoError, Closed, Unsupported);
     parent.add_submodule(&m)?;
-    py.import("sys")?.getattr("modules")?.set_item("tensorfs._ext.plane", &m)
+    py.import("sys")?.getattr("modules")?.set_item("tensorfs._ext.varena", &m)
 }

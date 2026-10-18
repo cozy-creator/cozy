@@ -9,10 +9,10 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 use common::*;
 use tensorfs_core::read;
-use tensorfs_plane::host::{fill_sealed, reserve};
-use tensorfs_plane::io::{IoTally, Source};
-use tensorfs_plane::layout::Layout;
-use tensorfs_plane::{Error, Tier};
+use varena::host::{fill_sealed, reserve};
+use varena::io::{IoTally, Source};
+use varena::layout::Layout;
+use varena::{Error, Tier};
 
 fn sealed(fx: &Fixture, tally: &IoTally) -> OwnedFd {
     let (lease, _) = read::acquire(&fx.store, &fx.meta, "test", fx.objects.clone()).unwrap();
@@ -150,9 +150,9 @@ fn a_reservation_made_before_the_plan_takes_any_layout_and_frees_what_it_does_no
     }
 }
 
-fn open(fx: &Fixture) -> (OwnedFd, tensorfs_plane::host::OpenFill, Layout) {
+fn open(fx: &Fixture) -> (OwnedFd, varena::host::OpenFill, Layout) {
     let layout = Layout::build(&fx.plan(), &regions()).unwrap();
-    let (fd, fill) = tensorfs_plane::host::open_sealed("unet", &layout, None, None).unwrap();
+    let (fd, fill) = varena::host::open_sealed("unet", &layout, None, None).unwrap();
     (fd, fill, layout)
 }
 
@@ -207,11 +207,11 @@ fn a_layout_staged_in_part_holds_only_its_staged_regions_and_stages_more_on_requ
     let fx = Fixture::new("staged");
     let layout = Layout::build(&fx.plan(), &regions()).unwrap();
     // Only region 0 is staged (the blocks that stream); 1 and 2 are holes.
-    let (fd, fill) = tensorfs_plane::host::open_sealed("unet", &layout, None, Some(&[0])).unwrap();
+    let (fd, fill) = varena::host::open_sealed("unet", &layout, None, Some(&[0])).unwrap();
     let (lease, _) = read::acquire(&fx.store, &fx.meta, "test", fx.objects.clone()).unwrap();
     let source = Source::new(fx.store.clone(), fx.meta.clone(), lease, true, 0);
     fill.fill(&layout, &source, 2, &IoTally::default()).unwrap();
-    let adopter = tensorfs_plane::host::HostMem::adopt_sealed(fd.as_raw_fd(), &layout).unwrap();
+    let adopter = varena::host::HostMem::adopt_sealed(fd.as_raw_fd(), &layout).unwrap();
     assert!(adopter.ready(0) && adopter.hole(1) && adopter.hole(2));
     let held = resident(fd.as_raw_fd());
     assert!(held < layout.regions[1].span, "the machine holds no copy of a hole: {held} B");
@@ -248,7 +248,7 @@ fn a_files_source_reads_exactly_the_verified_bytes_it_was_handed() {
         let mut buf = vec![0u8; region.span as usize];
         for it in &region.items {
             // SAFETY: each item's range and padding lie inside `buf`; one thread.
-            unsafe { source.read_item(it, buf.as_mut_ptr().add((it.offset - region.offset) as usize), tensorfs_plane::io::Mode::Cache, &tally) }.unwrap();
+            unsafe { source.read_item(it, buf.as_mut_ptr().add((it.offset - region.offset) as usize), varena::io::Mode::Cache, &tally) }.unwrap();
         }
         for p in layout.parts.iter().filter(|p| layout.regions[p.region as usize].offset == region.offset) {
             let key = p.what.trim_start_matches("unet/").trim_end_matches("#value");
@@ -259,7 +259,7 @@ fn a_files_source_reads_exactly_the_verified_bytes_it_was_handed() {
     }
     // An object it was not handed is refused, never opened from anywhere else.
     let other = Source::files(Vec::new(), true, 0);
-    let it = layout.regions[1].items.iter().find(|it| matches!(it.source, tensorfs_plane::layout::ItemSource::Object(_))).unwrap();
+    let it = layout.regions[1].items.iter().find(|it| matches!(it.source, varena::layout::ItemSource::Object(_))).unwrap();
     let mut buf = vec![0u8; layout.regions[1].span as usize];
-    assert!(unsafe { other.read_item(it, buf.as_mut_ptr(), tensorfs_plane::io::Mode::Cache, &tally) }.is_err());
+    assert!(unsafe { other.read_item(it, buf.as_mut_ptr(), varena::io::Mode::Cache, &tally) }.is_err());
 }

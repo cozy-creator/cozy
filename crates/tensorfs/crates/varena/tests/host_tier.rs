@@ -10,9 +10,9 @@ use tensorfs_core::fit::{fit, Custody, Fit, TensorRequirements};
 use tensorfs_core::read;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
-use tensorfs_plane::host::{hold, release_hold, HostMem};
-use tensorfs_plane::layout::{Layout, PART_ALIGN, REGION_ALIGN};
-use tensorfs_plane::{Error, Tier};
+use varena::host::{hold, release_hold, HostMem};
+use varena::layout::{Layout, PART_ALIGN, REGION_ALIGN};
+use varena::{Error, Tier};
 
 #[test]
 fn layout_aligns_every_tier_and_partitions_exactly() {

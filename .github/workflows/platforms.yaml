@@ -27,7 +27,7 @@ jobs:
     name: ${{ matrix.os }}
     env:
       # TensorD and TensorFS are judged where they build (Linux); elsewhere reported until ported.
-      IMPORTED: ${{ !startsWith(matrix.os, 'ubuntu') && '--exclude tensord --exclude tensorfs-core --exclude tensorfs-plane --exclude tensorfs-py' || '' }}
+      IMPORTED: ${{ !startsWith(matrix.os, 'ubuntu') && '--exclude tensord --exclude tensorfs-core --exclude varena --exclude tensorfs-py' || '' }}
     runs-on: ${{ matrix.os }}
     # Hang bound, not a work budget.
     timeout-minutes: 30

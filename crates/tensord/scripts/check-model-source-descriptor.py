@@ -43,7 +43,7 @@ def main() -> None:
     sys.modules["tensorfs._ext"] = extension
     spec.loader.exec_module(extension)
     # Optional native dependency is loaded only after selecting its explicit test artifact.
-    plane = importlib.import_module("tensorfs.plane")
+    plane = importlib.import_module("tensorfs.varena")
     fd = os.open(
         arguments.evidence / "selected-object", os.O_RDONLY | os.O_CLOEXEC
     )
