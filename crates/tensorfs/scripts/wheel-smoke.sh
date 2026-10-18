@@ -62,6 +62,7 @@ echo "installed into fresh venv: $("$work/venv/bin/python" -V)"
 "$work/venv/bin/python" scripts/scoped-model-reader.py
 "$work/venv/bin/python" scripts/read-plan-selection.py
 "$work/venv/bin/python" scripts/read-lease-concurrency.py
+"$work/venv/bin/python" scripts/varena-host.py
 # The frozen corpus, through the FACADE. `cargo test --test vectors` runs the same vectors
 # through Rust; this proves the marshal boundary agrees — same ids, same typed refusals.
 
