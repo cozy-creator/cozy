@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """varena's host core through the installed wheel, CPU only, no third-party packages.
 
-A v2 checkpoint is registered from its chunk files and from a sealed host layout. Every part is
-read back through `Pinned.ptr`. Freshness, close and the GPU core's refusals are checked.
+A v2 checkpoint is registered from its chunk files, from a grant's chunk-file descriptors (closed
+by the caller before any read: the core keeps its own) and from a sealed host layout. Every part
+is read back through `Pinned.ptr`. Freshness, close and the GPU core's refusals are checked.
 
     python varena-host.py [workdir]
 """
 
 import ctypes
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -27,8 +29,11 @@ def main(root: Path) -> None:
     ck = store.checkpoint(w.commit())
     rs = v2.regions(ck, 1 << 20, [f"unet/blocks.{b}" for b in range(3)])
     fd = varena.seal(ck, rs, "host-smoke")
-    for name, host_fd in (("files", None), ("sealed", fd)):
-        ws = varena.Host().register(name, ck, rs, host_fd)
+    for name, host_fd in (("files", None), ("granted", None), ("sealed", fd)):
+        grant = [(Path(p).name, n, os.open(p, os.O_RDONLY)) for p, n in ck.chunks] if name == "granted" else None
+        ws = varena.Host().register(name, ck, rs, host_fd, grant)
+        for _, _, f in grant or ():
+            os.close(f)
         assert ws.device is None and len(ws.spans) == len(rs) and len(ws.parts) == len(want)
         for r in range(len(rs)):
             pin = ws.bind(r)
@@ -50,7 +55,7 @@ def main(root: Path) -> None:
         raise AssertionError("chunks are whole 2 MiB pages")
     except varena.Invalid as e:
         assert e.code == "INVALID"
-    print("varena host core: every part exact, from the chunk files and a sealed layout")
+    print("varena host core: every part exact, from the chunk files, a grant and a sealed layout")
 
 
 if __name__ == "__main__":

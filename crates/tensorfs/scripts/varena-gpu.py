@@ -151,7 +151,7 @@ def test_stream(gpu, ck, rs, host_fd, stream, facts):
         streamed_s = time.perf_counter() - t0
         c = counters(gpu, ws.name)
         copy, stall = c.copy_ns - before.copy_ns, c.stall_ns - before.stall_ns
-        slot = c.slot_bytes - before.slot_bytes
+        slot = c.streamed_bytes - before.streamed_bytes
         assert torch.equal(out, home), "streamed output differs from all-home"
         assert slot >= sum(ws.spans[r] for r, _ in layer_regions(ws)) // 2, "the layers streamed"
         assert stall < copy, f"stall {stall} ns >= copy {copy} ns: copies did not overlap compute"

@@ -73,7 +73,7 @@ class Counters:
     def paged_in(self) -> int:
         """Bytes filled at home."""
     @property
-    def slot_bytes(self) -> int:
+    def streamed_bytes(self) -> int:
         """Bytes copied into scratch slots."""
     @property
     def evicted(self) -> int: ...
@@ -107,6 +107,9 @@ class SetStats:
     def pins(self) -> int:
         """Live pins, at home and in slots."""
     @property
+    def slot_bytes(self) -> int:
+        """Bytes of the slots holding this set's regions now."""
+    @property
     def step(self) -> Counters:
         """The step under way."""
     @property
@@ -130,6 +133,9 @@ class GpuStats:
         """Chunks kept unmapped for reuse; `trim()` releases them."""
     @property
     def slots(self) -> int: ...
+    @property
+    def slot_bytes(self) -> int:
+        """Bytes the slots map now."""
     @property
     def slot_span(self) -> int:
         """The largest streamed region's span: what a slot maps."""
@@ -216,15 +222,22 @@ class Gpu:
     @property
     def chunk(self) -> int: ...
     def register(
-        self, name: str, ck: Checkpoint, regions: Sequence[Sequence[str]], host_fd: int | None = None
+        self,
+        name: str,
+        ck: Checkpoint,
+        regions: Sequence[Sequence[str]],
+        host_fd: int | None = None,
+        files: Sequence[tuple[str, int, int]] | None = None,
     ) -> WeightSet:
         """`regions`: `tensorfs.v2.regions(ck, max_bytes, boundaries)`, every part of the
         components they name. `host_fd`: a sealed host layout of exactly these regions, filled
         by the owner (TensorD) with the same layout function (`seal()` here, Rust
         `varena::memory::open_checkpoint` + `host::open_sealed`). Its digest is checked; a
-        layout of other regions is refused. The core reopens the descriptor and closes nothing
-        the caller passed. Copies come from it, a region its owner left a hole from the chunk
-        files; without `host_fd`, every copy comes from the chunk files through the page cache."""
+        layout of other regions is refused. Copies come from it, and a region its owner left a
+        hole comes from the chunk files. Without `host_fd`, every copy comes from the chunk files
+        through the page cache. `files`: the chunk files a grant hands over, `(sha256, length,
+        fd)` each, the only ones read; without it, the checkpoint's own paths. The core
+        duplicates every descriptor it keeps and closes nothing the caller passed."""
     def trim(self) -> int:
         """Idle chunks and unneeded slots go back to the driver. Returns the bytes released."""
     def step(self) -> None:
@@ -236,7 +249,12 @@ class Host:
 
     def __init__(self) -> None: ...
     def register(
-        self, name: str, ck: Checkpoint, regions: Sequence[Sequence[str]], host_fd: int | None = None
+        self,
+        name: str,
+        ck: Checkpoint,
+        regions: Sequence[Sequence[str]],
+        host_fd: int | None = None,
+        files: Sequence[tuple[str, int, int]] | None = None,
     ) -> WeightSet:
         """As `Gpu.register`. Binds are views of the sealed layout (read-only), or private
         memory read once from the chunk files."""

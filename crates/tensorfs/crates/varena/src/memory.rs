@@ -11,13 +11,15 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::c_void;
 #[cfg(feature = "store")]
+use std::fs::File;
+#[cfg(feature = "store")]
 use std::os::fd::{OwnedFd, RawFd};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
 #[cfg(feature = "store")]
-use tensorfs_core::{format::Header, store2::Checkpoint};
+use tensorfs_core::{format::Header, ids::ObjectRef, store2::Checkpoint};
 
 use crate::cuda::{self, AccessDesc, AllocationProp, CUcontext, CUevent, CUstream, CtxGuard, Handle};
 use crate::host::HostMem;
@@ -143,7 +145,7 @@ pub struct Counters {
     /// Bytes filled at home.
     pub paged_in: u64,
     /// Bytes copied into scratch slots.
-    pub slot_bytes: u64,
+    pub streamed_bytes: u64,
     pub evicted: u64,
     /// Copy stream time of the fills, GPU-timed.
     pub copy_ns: u64,
@@ -175,6 +177,8 @@ pub struct SetStats {
     pub pinned: u64,
     /// Live pins, at home and in slots.
     pub pins: u32,
+    /// Bytes of the slots that hold this set's regions now.
+    pub slot_bytes: u64,
     pub step: Counters,
     pub last: Counters,
     pub total: Counters,
@@ -190,6 +194,8 @@ pub struct GpuStats {
     /// Chunks held unmapped for reuse.
     pub idle: u64,
     pub slots: u32,
+    /// Bytes the slots map now.
+    pub slot_bytes: u64,
     pub slot_span: u64,
     pub driver_free: u64,
     pub driver_total: u64,
@@ -582,10 +588,11 @@ impl Gpu {
 
     /// `regions` (`tensorfs_core::client::regions`) of a v2 checkpoint as one weight set. With
     /// `host_fd`, a sealed host layout of the same regions (TensorD's grant) serves the copies;
-    /// without, the chunk files do, through the page cache.
+    /// without, the chunk files do, through the page cache: `files` (a grant's descriptors), or
+    /// the checkpoint's own paths.
     #[cfg(feature = "store")]
-    pub fn register(self: &Arc<Self>, name: &str, ck: &Checkpoint, regions: &[Vec<String>], host_fd: Option<RawFd>) -> Result<Arc<WeightSet>> {
-        let (layout, source) = open_checkpoint(ck, regions, false)?;
+    pub fn register(self: &Arc<Self>, name: &str, ck: &Checkpoint, regions: &[Vec<String>], host_fd: Option<RawFd>, files: Option<Vec<(ObjectRef, File)>>) -> Result<Arc<WeightSet>> {
+        let (layout, source) = open_checkpoint(ck, regions, false, files)?;
         let host = host_fd.map(|fd| HostMem::adopt_sealed(fd, &layout)).transpose()?;
         if host.as_ref().is_some_and(|h| h.window().is_some()) {
             return Err(Error::Invalid("a streamed host layout: register takes a whole sealed layout".into()));
@@ -642,7 +649,7 @@ impl Gpu {
         cuda::check("cuMemGetInfo", unsafe { (cuda::driver()?.mem_get_info)(&mut free, &mut total) })?;
         let mut st = g.lock();
         st.resolve();
-        let slot_pins: Vec<(usize, u32)> = st.slots.iter().flatten().filter_map(|s| s.holds.map(|(set, _)| (set, s.pins))).collect();
+        let held: Vec<(usize, u32, u64)> = st.slots.iter().flatten().filter_map(|s| s.holds.map(|(set, _)| (set, s.pins, s.span))).collect();
         let sets = st
             .sets
             .iter()
@@ -658,7 +665,8 @@ impl Gpu {
                     home: sum(&|r| r.home),
                     resident: sum(&|r| r.map.is_some()),
                     pinned: sum(&|r| r.map.is_some() && r.pins > 0),
-                    pins: s.regs.iter().map(|r| r.pins).sum::<u32>() + slot_pins.iter().filter(|(set, _)| *set == id).map(|(_, p)| p).sum::<u32>(),
+                    pins: s.regs.iter().map(|r| r.pins).sum::<u32>() + held.iter().filter(|h| h.0 == id).map(|h| h.1).sum::<u32>(),
+                    slot_bytes: held.iter().filter(|h| h.0 == id).map(|h| h.2).sum(),
                     step: s.step,
                     last: s.last,
                     total: s.total,
@@ -672,6 +680,7 @@ impl Gpu {
             mapped: st.mapped,
             idle: st.idle_bytes(),
             slots: st.slots.iter().flatten().count() as u32,
+            slot_bytes: st.slots.iter().flatten().map(|s| s.span).sum(),
             slot_span: st.slot_span,
             driver_free: free as u64,
             driver_total: total as u64,
@@ -982,7 +991,7 @@ impl Inner {
         (s.fill, s.fresh, s.holds, s.pending, s.used) = (Some(fill.clone()), true, Some((set, r)), !urgent, clock);
         let dst = s.va;
         st.set(set).count(|c| {
-            c.slot_bytes += nbytes;
+            c.streamed_bytes += nbytes;
             c.faults += urgent as u64;
         });
         self.submit(Job { set, src, region: r, dst, waits, fill }, urgent);
@@ -1317,8 +1326,8 @@ pub struct HostSet {
 
 impl Host {
     #[cfg(feature = "store")]
-    pub fn register(&self, name: &str, ck: &Checkpoint, regions: &[Vec<String>], host_fd: Option<RawFd>) -> Result<Arc<HostSet>> {
-        let (layout, source) = open_checkpoint(ck, regions, false)?;
+    pub fn register(&self, name: &str, ck: &Checkpoint, regions: &[Vec<String>], host_fd: Option<RawFd>, files: Option<Vec<(ObjectRef, File)>>) -> Result<Arc<HostSet>> {
+        let (layout, source) = open_checkpoint(ck, regions, false, files)?;
         let host = host_fd.map(|fd| HostMem::adopt_sealed(fd, &layout)).transpose()?;
         if host.as_ref().is_some_and(|h| h.window().is_some()) {
             return Err(Error::Invalid("a streamed host layout: register takes a whole sealed layout".into()));
@@ -1410,14 +1419,18 @@ pub struct HostPinned {
 
 // ---------------------------------------------------------------- helpers
 
-/// The one layout of `regions` of `ck`, and its chunk files: what `register` maps and what a
-/// sealed host layout for it holds. An owner fills one with this (or `seal`), so the two agree
-/// by construction; `HostMem::adopt_sealed` checks the digest.
+/// The one layout of `regions` of `ck`, and its chunk files (`files`, else the checkpoint's own
+/// paths): what `register` maps and what a sealed host layout for it holds. An owner fills one
+/// with this (or `seal`), so the two agree by construction; `HostMem::adopt_sealed` checks the
+/// digest.
 #[cfg(feature = "store")]
-pub fn open_checkpoint(ck: &Checkpoint, regions: &[Vec<String>], direct_io: bool) -> Result<(Layout, Source)> {
+pub fn open_checkpoint(ck: &Checkpoint, regions: &[Vec<String>], direct_io: bool, files: Option<Vec<(ObjectRef, File)>>) -> Result<(Layout, Source)> {
     let components: Vec<&str> = regions.iter().flatten().filter_map(|t| t.split_once('/').map(|(c, _)| c)).collect();
     let plan = crate::checkpoint::read_plan(ck.header(), &components);
-    let files = crate::checkpoint::chunk_files(ck, &plan)?;
+    let files = match files {
+        Some(f) => f,
+        None => crate::checkpoint::chunk_files(ck, &plan)?,
+    };
     Ok((Layout::build(&plan, regions)?, Source::files(files, direct_io, 0)))
 }
 
@@ -1425,7 +1438,7 @@ pub fn open_checkpoint(ck: &Checkpoint, regions: &[Vec<String>], direct_io: bool
 /// chunk files, for `Gpu::register(host_fd=)`.
 #[cfg(feature = "store")]
 pub fn seal(ck: &Checkpoint, regions: &[Vec<String>], name: &str, threads: usize) -> Result<OwnedFd> {
-    let (layout, source) = open_checkpoint(ck, regions, true)?;
+    let (layout, source) = open_checkpoint(ck, regions, true, None)?;
     crate::host::fill_sealed(name, &layout, &source, threads, &IoTally::default(), None)
 }
 
