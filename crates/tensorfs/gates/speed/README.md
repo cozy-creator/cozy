@@ -118,6 +118,19 @@ ms median (best), then the medians of open (header parses, regions, registration
 - The read fell from about 27 ms to 21: the window's weight set is small, and the gate no longer lists
   every part to pick the window.
 
+On the CBOR header (U2e), run 11624 on an NVIDIA L4 (togepi), same cells and repetitions:
+
+| lane | reader | window cold | window warm |
+|---|---|---:|---:|
+| SDXL | **T64+rust** | **24** (20): open 2.3, read 21.1 | **23** (21): open 2.1, read 20.6 |
+| | best safetensors | fastsafetensors 79 (73): open 38.9, read 38.1 | st-cpu-cuda 45 (43): open 3.1, read 41.7 |
+| | gate | pass +231% | pass +97% |
+| Qwen | **T64+rust** | **33** (25): open 2.3, read 29.7 | **23** (21): open 2.2, read 21.8 |
+| | best safetensors | fastsafetensors 61 (58): open 27.6, read 32.7 | st-cpu-cuda 37 (33): open 1.8, read 35.0 |
+| | gate | pass +87% | pass +58% |
+
+The open fell from 3.5–5.6 ms (JSON) to 2.1–2.3 ms.
+
 ## F1 results
 
 F1's harness (in git history at `a1ae376df`) built the layouts itself: `v1` per-part objects, `T16`/`T64` packs
