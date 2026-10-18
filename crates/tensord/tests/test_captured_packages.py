@@ -209,7 +209,8 @@ def test_a_captured_lock_takes_the_machines_pair_without_fetching_its_own(captur
     project = tmp_path / "source"
     shutil.copytree(source, project)
     lock = (project / "uv.lock").read_text()
-    unreachable = lambda row: re.sub(r'url = "[^"]+"', 'url = "https://127.0.0.1:9/unreachable.whl"', row.group(0))
+    # Each file keeps its name (uv reads a locked wheel's tags) on a host nothing answers.
+    unreachable = lambda row: re.sub(r'url = "[^"]*/([^"/]+)"', r'url = "https://127.0.0.1:9/\1"', row.group(0))
     lock = re.sub(r'\[\[package\]\]\nname = "(cozy-runtime|tensorfs)"\n.*?(?=\n\[\[package\]\]|\Z)', unreachable, lock, flags=re.S)
     (project / "uv.lock").write_text(lock)
     generation = install_captured(project=project, wheels=[], requirements=None,
