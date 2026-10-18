@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
-use super::{PackageRef, registry};
+use super::{PackageRef, carried};
 use crate::{Context, context::hub_error, output};
 
 /// The uv index name a project's sources use for its own account's packages.
@@ -704,13 +704,13 @@ pub async fn publish(ctx: &Context) -> Result<ExitCode, Error> {
             .arg(&dist),
         "build_failed",
     )?;
-    let (rows, git_wheels) = registry::dependencies(ctx, &stage, &python.full)?;
+    let git_wheels = carried::git_wheels(ctx, &stage, &python.request)?;
     let interface = describe(&stage, &python, after.get("cozy-runtime"), &account)?;
     let interface_path = stage.root.join("package-interface.json");
     fs::write(&interface_path, &interface).map_err(|e| refuse("stage_unavailable", e))?;
 
-    let wheel = registry::single(&dist, ".whl")?;
-    let sdist = registry::single(&dist, ".tar.gz")?;
+    let wheel = carried::single(&dist, ".whl")?;
+    let sdist = carried::single(&dist, ".tar.gz")?;
     let named = |dir: &str, local: &Path| {
         format!(
             "{dir}/{}",
@@ -749,7 +749,6 @@ pub async fn publish(ctx: &Context) -> Result<ExitCode, Error> {
     let finalize = types::PackageReleaseFinalize {
         publication_id: grants.publication_id.clone(),
         python_version: Some(python.full.clone()),
-        registry: Some(rows),
     };
     let mut state = client
         .finalize_package_release(org, name, release, &finalize)
