@@ -940,16 +940,13 @@ impl Pool {
         if degree == 0 {
             return Ok(&[]);
         }
-        let wanted = degree as usize;
-        self.devices.get(start..start + wanted).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::Unsupported,
-                format!(
-                    "gpu_count_unavailable: a {wanted}-GPU group on a machine with {} GPU(s)",
-                    self.devices.len()
-                ),
-            )
-        })
+        self.devices.get(start..start + degree as usize).ok_or_else(|| self.unavailable(degree))
+    }
+    fn unavailable(&self, wanted: u32) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("gpu_count_unavailable: {wanted} GPUs asked of a machine with {}", self.devices.len()),
+        )
     }
     fn lane_devices(&self, start: usize, degree: u32) -> io::Result<String> {
         Ok(self
@@ -1430,16 +1427,21 @@ impl Pool {
     }
 
     /// A call's degree as its declaration and this machine set it: 0 for `accelerator=False`
-    /// or a machine with no GPU, else its constructed slots' group (one GPU without any).
-    pub fn degree(&self, entry: &serde_json::Value, wanted: u32) -> u32 {
+    /// or a machine with no GPU, else its constructed slots' group, or the GPUs a call that
+    /// constructs nothing asks for (one by default); more than the machine has is refused.
+    pub fn degree(&self, entry: &serde_json::Value, wanted: u32) -> io::Result<u32> {
         let models = entry.get("models").and_then(serde_json::Value::as_array).cloned().unwrap_or_default();
         let constructed: Vec<_> = models.into_iter().filter(constructed).collect();
-        match entry.get("accelerator").and_then(serde_json::Value::as_bool) {
+        Ok(match entry.get("accelerator").and_then(serde_json::Value::as_bool) {
             Some(false) => 0,
             _ if self.devices.is_empty() => 0,
-            _ if constructed.is_empty() => 1,
+            _ if constructed.is_empty() && wanted as usize > self.devices.len() => {
+                return Err(self.unavailable(wanted))
+            }
+            // It constructs nothing (a script): the GPUs it asks for, held by its one process.
+            _ if constructed.is_empty() => wanted.max(1),
             _ => group_degree(&constructed, wanted, self.devices.len()),
-        }
+        })
     }
 
     /// Derive each model slot's binding from the installed SDK's real static interface and
@@ -1505,7 +1507,7 @@ impl Pool {
                 ));
             }
         }
-        let degree = self.degree(entry, degree);
+        let degree = self.degree(entry, degree)?;
         let (mut planned, mut sources) = (vec![], vec![]);
         for (model, (path, parameter)) in models.iter().zip(&slots) {
             let class = model
@@ -2914,7 +2916,10 @@ impl Pool {
             session.executor.begin_request();
         }
         // Every rank of a group reads its own GPU's cap and cell (`rank_cells/1`).
-        let ranked = degree > 1;
+        // A group runs one rank per GPU; a plan that constructs nothing holds its GPUs in one
+        // process (the Runtime refuses a group without constructed models).
+        let ranks = if plan.slots.is_empty() { 1 } else { degree.max(1) };
+        let ranked = ranks > 1;
         if !session.loaded {
             session.sharing = self.degree2(&construction, start, degree, &session.executor)?;
         }
@@ -2956,7 +2961,7 @@ impl Pool {
                     devices: lane.clone(),
                     application: held.record.application.clone(),
                     package_interface: interface_path.clone(),
-                    sequence_parallel_degree: degree.max(1),
+                    sequence_parallel_degree: ranks,
                     import_only: false,
                     call_interfaces: crate::calls::call_interfaces(held, &interface_path),
                     constructions,
@@ -2967,7 +2972,7 @@ impl Pool {
                 },
                 &mut callbacks,
             )?)?;
-            if ranked && (1..degree).any(|rank| !callbacks.cells.contains_key(&rank)) {
+            if ranked && (1..ranks).any(|rank| !callbacks.cells.contains_key(&rank)) {
                 return Err(io::Error::other(Refused {
                     code: "group_unformed".into(),
                     detail: "a follower's budget cell did not reach the machine".into(),
@@ -2993,7 +2998,7 @@ impl Pool {
             session.launch.start_ms = starting.elapsed().as_secs_f64() * 1e3;
             session.launch.start =
                 serde_json::from_value(started.stages.clone()).unwrap_or_default();
-            if started.follower_pids.len() + 1 != degree.max(1) as usize {
+            if started.follower_pids.len() + 1 != ranks as usize {
                 return Err(io::Error::other(Refused {
                     code: "group_unformed".into(),
                     detail: format!(
@@ -3014,7 +3019,7 @@ impl Pool {
             for (device, pid) in gpus.iter().skip(1).zip(&started.follower_pids) {
                 device.memory.with(|gpu| gpu.spawned(&construction, *pid));
             }
-            let (load_cap, load_group) = rank_grant(load_caps);
+            let (load_cap, load_group) = rank_grant(&load_caps[..load_caps.len().min(ranks as usize)]);
             // Its pinned budget, the Load's when the executor takes it there (`load_pinned/1`).
             let plane = !plan.slots.is_empty() && session.executor.hello.offers("weight_plane/1");
             let at_load = plane && session.executor.hello.offers("load_pinned/1");
@@ -3028,7 +3033,7 @@ impl Pool {
                 None => DeviceCommand::Load {
                     construction: construction.clone(),
                     devices: lane.clone(),
-                    sequence_parallel_degree: degree.max(1),
+                    sequence_parallel_degree: ranks,
                     binding: Box::new(Binding {
                         application: held.record.application.clone(),
                         package_interface: interface_path.to_string_lossy().into_owned(),
@@ -3067,7 +3072,7 @@ impl Pool {
                     DeviceCommand::Load {
                         construction: construction.clone(),
                         devices: lane.clone(),
-                        sequence_parallel_degree: degree.max(1),
+                        sequence_parallel_degree: ranks,
                         binding: Box::new(first.binding),
                         budgets: first.budgets,
                         models,
@@ -3246,7 +3251,7 @@ impl Pool {
         // A real grant for the whole call: one tenant needs no per-stage turns.
         // A group's cap holds on every GPU of it (each rank caps its own process).
         let caps = self.decide(&construction, start, degree, false)?;
-        let (cap, group) = rank_grant(&caps);
+        let (cap, group) = rank_grant(&caps[..caps.len().min(ranks as usize)]);
         // Every executor of the cohort caps its whole process (`process_cap/1`): the plane
         // derives its budget inside the cap.
         let (plane_budget_bytes, cap_bytes) = (-1, cap);
@@ -3952,6 +3957,11 @@ pub(crate) fn settle(engine: &Arc<Engine>, id: &str, error: &io::Error) -> io::R
         keep_lifecycle_triage(engine, id, pid, &ended.to_string(), &ended.stderr_tail);
     }
     let outcome = if record.cancel_actor.is_some() {
+        // Canceled: the reason its executor ended (it ignored the cancel and was killed, say)
+        // is the run's last log line.
+        if let Err(log) = engine.append_log(id, "warn", &format!("canceled; its executor ended: {error}")) {
+            tracing::warn!("run {id}: {log}");
+        }
         Outcome::Canceled
     } else if let Some(refusal) = refused(error) {
         // The executor's own reason, typed: a group's first fault names its GPU.
