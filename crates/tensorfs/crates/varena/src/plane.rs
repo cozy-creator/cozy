@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 #[cfg(feature = "store")]
-use tensorfs_core::{meta::Meta, read::ReadLease, store::Store};
+use tensorfs_core::{meta::Meta, read::ReadLease, store::Store, store2::Checkpoint};
 use tensorfs_core::ids::ObjectRef;
 use tensorfs_core::read::ReadPlan;
 
@@ -46,11 +46,13 @@ impl Default for PlaneConfig {
     fn default() -> Self {
         PlaneConfig {
             devices: Vec::new(),
-            readers: 8,
+            readers: 16,
             copy_streams: 1,
             slab_bytes: 64 << 20,
-            staging_buffers: 4,
-            staging_bytes: 64 << 20,
+            // Many small requests in flight read an NVMe at its rate; 4 MiB and up fall behind
+            // (fastsafetensors reads 512 KiB blocks; U8's sweep on an RTX 3090 pod).
+            staging_buffers: 32,
+            staging_bytes: 1 << 20,
             direct_io: true,
         }
     }
@@ -1032,6 +1034,9 @@ pub struct Plane {
 
 impl Plane {
     pub fn open(cfg: PlaneConfig) -> Result<Plane> {
+        if cfg.staging_bytes == 0 || !cfg.staging_bytes.is_multiple_of(crate::layout::PART_ALIGN) {
+            return Err(Error::Invalid(format!("staging slots of {} bytes: a multiple of 4096", cfg.staging_bytes)));
+        }
         let readers = Arc::new(Readers::new(cfg.readers));
         let tally = Arc::new(IoTally::default());
         let mut devices = Vec::new();
@@ -1172,6 +1177,16 @@ impl Plane {
             }
         }
         Ok(id)
+    }
+
+    /// Register `regions` of a TensorFS v2 checkpoint (`tensorfs_core::client::regions`) as one
+    /// weight set: its header, in order, is the read plan, and its chunk files are the source.
+    #[cfg(feature = "store")]
+    pub fn register_checkpoint(&self, name: &str, ck: &Checkpoint, regions: &[Vec<String>], host_fd: Option<RawFd>) -> Result<WsId> {
+        let components: Vec<&str> = regions.iter().flatten().filter_map(|t| t.split_once('/').map(|(c, _)| c)).collect();
+        let plan = crate::checkpoint::read_plan(ck.header(), &components);
+        let source = Arc::new(Source::files(crate::checkpoint::chunk_files(ck, &plan)?, self.inner.cfg.direct_io, Arc::as_ptr(&self.inner) as usize));
+        self.register(name, source, &plan, regions, host_fd)
     }
 
     /// Register one weight set over a sealed layout (`host::fill_sealed`, the machine's): the

@@ -15,6 +15,8 @@
 //! is empty until its tier exists (xs-043 unit WM).
 #![cfg(unix)]
 
+#[cfg(feature = "store")]
+pub mod checkpoint;
 pub mod cuda;
 pub mod cursor;
 pub mod device;

@@ -210,7 +210,7 @@ impl PyPlane {
 #[pymethods]
 impl PyPlane {
     #[new]
-    #[pyo3(signature = (devices, readers = 8, copy_streams = 1, slab_bytes = 64 << 20, staging_buffers = 4, staging_bytes = 64 << 20, direct_io = true))]
+    #[pyo3(signature = (devices, readers = 16, copy_streams = 1, slab_bytes = 64 << 20, staging_buffers = 32, staging_bytes = 1 << 20, direct_io = true))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -255,6 +255,29 @@ impl PyPlane {
         let (id, layout) = py
             .detach(|| {
                 let id = plane.register(&name, src, p, &regions, host_fd)?;
+                Ok((id, plane.layout(id)?))
+            })
+            .or_raise(py)?;
+        Ok(PyWeightSet { plane: self.plane.clone(), id, name, layout })
+    }
+
+    /// Register `regions` (`tensorfs.v2.regions(ck)` when None) of a v2 checkpoint as one
+    /// weight set: its header, in order, is the read plan and its chunk files the source.
+    #[cfg(feature = "store")]
+    #[pyo3(signature = (name, ck, regions = None, host_fd = None))]
+    fn register_checkpoint(
+        &self,
+        py: Python<'_>,
+        name: String,
+        ck: PyRef<'_, crate::v2::PyCheckpoint>,
+        regions: Option<Vec<Vec<String>>>,
+        host_fd: Option<i32>,
+    ) -> PyResult<PyWeightSet> {
+        let (ck, plane) = (&ck.ck, &self.plane);
+        let regions = regions.unwrap_or_else(|| tensorfs_core::client::regions(ck.header(), 64 << 20));
+        let (id, layout) = py
+            .detach(|| {
+                let id = plane.register_checkpoint(&name, ck, &regions, host_fd)?;
                 Ok((id, plane.layout(id)?))
             })
             .or_raise(py)?;

@@ -10,12 +10,13 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
 use crate::cuda::{self, AccessDesc, AllocationProp, CUcontext, CUevent, CUstream, CtxGuard, Handle};
-use crate::io::{Batch, Dst, IoTally, Mode, Readers, Source};
+use crate::io::{Dst, IoTally, Mode, Readers, Source};
 use crate::layout::{Item, ItemSource, REGION_ALIGN};
 use crate::{Error, Result};
 
@@ -491,15 +492,106 @@ pub struct CopyJob {
     pub dst: u64,
     pub len: u64,
     pub src: CopySrc,
-    pub done: Box<dyn FnOnce(Result<Copied>) + Send>,
+    pub done: Done,
 }
 
-struct Bounce {
+/// A pinned staging slot and the copy that last read it.
+struct Slot {
     ptr: *mut u8,
     last: Option<EvRef>,
 }
+unsafe impl Send for Slot {}
 
-/// One copy stream and the thread that feeds it, in submission order.
+struct Slots {
+    free: Mutex<VecDeque<Slot>>,
+    cv: Condvar,
+}
+
+impl Slots {
+    /// A free slot whose last copy has landed: one already past it if any, else the one
+    /// returned longest ago, waited for.
+    fn take(&self) -> Result<Slot> {
+        let mut free = self.free.lock().unwrap();
+        while free.is_empty() {
+            free = self.cv.wait(free).unwrap();
+        }
+        let landed = free.iter().position(|s| s.last.as_ref().is_none_or(|e| e.done().unwrap_or(false)));
+        let mut slot = free.remove(landed.unwrap_or(0)).unwrap();
+        drop(free);
+        if let Some(ev) = slot.last.take() {
+            if let Err(e) = ev.sync() {
+                self.put(slot);
+                return Err(e);
+            }
+        }
+        Ok(slot)
+    }
+    fn put(&self, slot: Slot) {
+        self.free.lock().unwrap().push_back(slot);
+        self.cv.notify_one();
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Stream(CUstream);
+unsafe impl Send for Stream {}
+unsafe impl Sync for Stream {}
+
+type Done = Box<dyn FnOnce(Result<Copied>) + Send>;
+
+/// One staged job's pieces in flight: the last to finish reports it.
+struct Staged {
+    left: AtomicUsize,
+    failed: Mutex<Option<Error>>,
+    done: Mutex<Option<Done>>,
+    stream: Stream,
+    start: EvRef,
+    ready: EvRef,
+    bytes: u64,
+    path: CopyPath,
+    refused: bool,
+    /// The sealed layout a bounced region reads from, mapped until the last piece.
+    _kept: Option<Arc<crate::host::HostMem>>,
+}
+
+impl Staged {
+    fn fail(&self, e: Error) {
+        self.failed.lock().unwrap().get_or_insert(e);
+    }
+    fn failed(&self) -> bool {
+        self.failed.lock().unwrap().is_some()
+    }
+    /// The last piece out: every copy of the job is queued, so `ready` after them covers all.
+    fn finish_one(&self) {
+        if self.left.fetch_sub(1, Ordering::AcqRel) != 1 {
+            return;
+        }
+        let res = match self.failed.lock().unwrap().take() {
+            Some(e) => drained(self.stream.0, e),
+            None => match self.ready.record(self.stream.0) {
+                Ok(()) => Ok(Copied { ready: self.ready.clone(), start: self.start.clone(), bytes: self.bytes, path: self.path, refused: self.refused }),
+                Err(e) => drained(self.stream.0, e),
+            },
+        };
+        if let Some(done) = self.done.lock().unwrap().take() {
+            done(res);
+        }
+    }
+}
+
+/// A failure reported only once nothing it queued is in flight: no caller unmaps, unregisters or
+/// reuses a range a copy still touches. A drain that itself fails is ambiguous device state.
+fn drained<T>(stream: CUstream, e: Error) -> Result<T> {
+    let d = cuda::driver()?;
+    // SAFETY: our own stream.
+    let drain = crate::faults::hit("drain").and_then(|_| cuda::check("cuStreamSynchronize", unsafe { (d.stream_synchronize)(stream) }));
+    match drain {
+        Ok(()) => Err(e),
+        Err(drain) => Err(Error::Poisoned(format!("a failed copy ({e}) could not be drained: {drain}"))),
+    }
+}
+
+/// One copy stream and the thread that dispatches its jobs, in submission order.
 pub struct Mover {
     name: String,
     tx: Mutex<Option<Sender<CopyJob>>>,
@@ -511,9 +603,11 @@ pub struct MoverCtx {
     pub events: Arc<EventPool>,
     pub readers: Arc<Readers>,
     pub tally: Arc<IoTally>,
+    /// (slots, bytes each): bytes is a multiple of 4 KiB.
     pub staging: (usize, u64),
 }
 unsafe impl Send for MoverCtx {}
+unsafe impl Sync for MoverCtx {}
 
 impl Mover {
     pub fn start(name: String, m: MoverCtx) -> Result<Mover> {
@@ -521,16 +615,10 @@ impl Mover {
         let (ok_tx, ok_rx) = channel::<Result<()>>();
         let thread = std::thread::Builder::new()
             .name(name.clone())
-            .spawn(move || mover_main(m, rx, ok_tx))
+            .spawn(move || mover_main(Arc::new(m), rx, ok_tx))
             .map_err(|e| Error::Io(format!("spawn mover: {e}")))?;
-        ok_rx
-            .recv()
-            .map_err(|_| Error::Io("mover died at start".into()))??;
-        Ok(Mover {
-            name,
-            tx: Mutex::new(Some(tx)),
-            thread: Mutex::new(Some(thread)),
-        })
+        ok_rx.recv().map_err(|_| Error::Io("mover died at start".into()))??;
+        Ok(Mover { name, tx: Mutex::new(Some(tx)), thread: Mutex::new(Some(thread)) })
     }
 
     /// Queue a copy. On `Err` the job was dropped without calling `done`.
@@ -541,7 +629,7 @@ impl Mover {
         Err(Error::Closed(format!("copy stream {} has stopped", self.name)))
     }
 
-    /// Close the queue: the thread drains its stream, frees its buffers and exits by itself.
+    /// Close the queue: the thread finishes its jobs, frees its slots and exits by itself.
     pub fn detach(&self) {
         self.tx.lock().unwrap().take();
     }
@@ -554,28 +642,27 @@ impl Mover {
     }
 }
 
-fn mover_main(m: MoverCtx, rx: Receiver<CopyJob>, ok: Sender<Result<()>>) {
-    let init = (|| -> Result<(CUstream, Vec<Bounce>)> {
+fn mover_main(m: Arc<MoverCtx>, rx: Receiver<CopyJob>, ok: Sender<Result<()>>) {
+    let n = m.staging.0.max(1);
+    let init = (|| -> Result<(CUstream, VecDeque<Slot>)> {
         let d = cuda::driver()?;
         cuda::check("cuCtxSetCurrent", unsafe { (d.ctx_set_current)(m.ctx) })?;
         let mut s: CUstream = std::ptr::null_mut();
         // SAFETY: out-param, context bound.
         cuda::check("cuStreamCreate", unsafe { (d.stream_create)(&mut s, cuda::STREAM_NON_BLOCKING) })?;
-        let mut b = Vec::new();
-        for _ in 0..m.staging.0 {
+        let mut slots = VecDeque::new();
+        for _ in 0..n {
             let mut p: *mut libc::c_void = std::ptr::null_mut();
-            // SAFETY: out-param; pinned, portable host memory.
-            cuda::check("cuMemHostAlloc", unsafe {
-                (d.mem_host_alloc)(&mut p, m.staging.1 as usize, cuda::MEMHOSTALLOC_PORTABLE)
-            })?;
-            b.push(Bounce { ptr: p as *mut u8, last: None });
+            // SAFETY: out-param; pinned, portable host memory (page aligned).
+            cuda::check("cuMemHostAlloc", unsafe { (d.mem_host_alloc)(&mut p, m.staging.1 as usize, cuda::MEMHOSTALLOC_PORTABLE) })?;
+            slots.push_back(Slot { ptr: p as *mut u8, last: None });
         }
-        Ok((s, b))
+        Ok((s, slots))
     })();
-    let (stream, mut bounces) = match init {
-        Ok(x) => {
+    let (stream, slots) = match init {
+        Ok((s, slots)) => {
             let _ = ok.send(Ok(()));
-            x
+            (Stream(s), Arc::new(Slots { free: Mutex::new(slots), cv: Condvar::new() }))
         }
         Err(e) => {
             let _ = ok.send(Err(e));
@@ -583,261 +670,204 @@ fn mover_main(m: MoverCtx, rx: Receiver<CopyJob>, ok: Sender<Result<()>>) {
         }
     };
     while let Ok(job) = rx.recv() {
-        let done = job.done;
-        let r = run_copy(&m, stream, &mut bounces, job.waits, job.dst, job.len, job.src);
-        done(r);
+        dispatch(&m, stream, &slots, job);
+    }
+    // Every piece in flight returns its slot; then the stream drains and the slots go.
+    let mut free = slots.free.lock().unwrap();
+    while free.len() < n {
+        free = slots.cv.wait(free).unwrap();
     }
     if let Ok(d) = cuda::driver() {
-        // SAFETY: our stream and buffers; the stream is drained first.
+        // SAFETY: our stream and slots; the stream is drained first.
         unsafe {
-            (d.stream_synchronize)(stream);
-            (d.stream_destroy)(stream);
-            for b in bounces {
-                (d.mem_free_host)(b.ptr as *mut libc::c_void);
+            (d.stream_synchronize)(stream.0);
+            (d.stream_destroy)(stream.0);
+            for s in free.drain(..) {
+                (d.mem_free_host)(s.ptr as *mut libc::c_void);
             }
         }
     }
 }
 
-struct Waiter {
-    m: Mutex<Option<Result<()>>>,
-    cv: Condvar,
-}
-
-/// One job on the mover's stream. `Err` means nothing this job enqueued is still in flight and
-/// no reader still writes a bounce: a failed copy is drained before it is reported, so no
-/// caller unmaps, unregisters or reuses a range a copy still touches. A drain that itself fails
-/// is ambiguous device state: `Poisoned`.
-fn run_copy(
-    m: &MoverCtx,
-    stream: CUstream,
-    bounces: &mut [Bounce],
-    waits: Vec<EvRef>,
-    dst: u64,
-    len: u64,
-    src: CopySrc,
-) -> Result<Copied> {
-    let r = enqueue_copy(m, stream, bounces, waits, dst, len, src);
-    let Err(e) = r else { return r };
+/// Copy one slot's bytes to `dst` on the stream and mark the slot busy until they land.
+fn copy_slot(m: &MoverCtx, stream: Stream, slot: &mut Slot, dst: u64, n: u64) -> Result<()> {
+    crate::faults::hit("staged-copy")?;
     let d = cuda::driver()?;
-    // SAFETY: our own stream.
-    let drained = crate::faults::hit("drain").and_then(|_| {
-        cuda::check("cuStreamSynchronize", unsafe { (d.stream_synchronize)(stream) })
-    });
-    match drained {
-        Ok(()) => Err(e),
-        Err(drain) => Err(Error::Poisoned(format!("a failed copy ({e}) could not be drained: {drain}"))),
-    }
+    // SAFETY: the slot holds the bytes; pinned host memory; the destination is mapped.
+    cuda::check("cuMemcpyHtoDAsync", unsafe { (d.memcpy_htod_async)(dst, slot.ptr as *const libc::c_void, n as usize, stream.0) })?;
+    let e = m.events.get(false)?;
+    e.record(stream.0)?;
+    slot.last = Some(e);
+    Ok(())
 }
 
-fn enqueue_copy(
-    m: &MoverCtx,
-    stream: CUstream,
-    bounces: &mut [Bounce],
-    waits: Vec<EvRef>,
-    dst: u64,
-    len: u64,
-    src: CopySrc,
-) -> Result<Copied> {
-    // Never a byte a sealed layout's machine has not finished: wait for the region's Ready
-    // word. `_kept` holds the mapping until the enqueue is done (a bounce has read the bytes).
-    let mut refused = false;
-    let (src, _kept) = match src {
-        // A streamed layout's slot is refilled once this copy lets its region go, so it is never
-        // locked: its bytes are in the staging buffers by the time the call returns.
+/// The object items of `[lo, hi)` (layout offsets), adjacent ranges of one object merged into
+/// one read where the layout keeps their spacing (a chunk's 4 KiB padding reads along).
+fn coalesced(items: &[Item], lo: u64, hi: u64) -> Vec<Item> {
+    let mut out: Vec<Item> = Vec::new();
+    for it in slice_items(items, lo, hi) {
+        if let (Some(prev), ItemSource::Object(o)) = (out.last_mut(), &it.source) {
+            if let ItemSource::Object(p) = &mut prev.source {
+                if p.obj == o.obj && o.off >= p.off && it.offset >= prev.offset && o.off - p.off == it.offset - prev.offset {
+                    let end = it.offset + it.len;
+                    p.len = end - prev.offset;
+                    prev.len = end - prev.offset;
+                    prev.part_end = it.part_end;
+                    continue;
+                }
+            }
+        }
+        out.push(it);
+    }
+    out
+}
+
+/// One slot's worth of a staged job: its bytes `[at, at + n)` of the copy.
+struct Piece {
+    at: u64,
+    n: u64,
+}
+
+fn dispatch(m: &Arc<MoverCtx>, stream: Stream, slots: &Arc<Slots>, job: CopyJob) {
+    let CopyJob { waits, dst, len, src, done } = job;
+    let s = stream.0;
+    // Never a byte a sealed layout's machine has not finished: wait for the region's Ready word.
+    let (src, kept, refused) = match src {
+        // A streamed layout's slot is refilled once this copy lets its region go: its bytes are
+        // in the staging slots before the claim ends, so they are bounced here, in order.
         CopySrc::Sealed { host, region, .. } if host.window().is_some() => {
-            return host
-                .clone()
-                .with_region(region, |p| enqueue_copy(m, stream, bounces, waits, dst, len, CopySrc::Bounce(p)));
+            let copied = host.clone().with_region(region, |p| {
+                let begun = begin(m, s, &waits)?;
+                for at in (0..len).step_by(m.staging.1 as usize) {
+                    let n = m.staging.1.min(len - at);
+                    let mut slot = slots.take()?;
+                    // SAFETY: the slot is ours; the region stays in its slot while we claim it.
+                    unsafe { std::ptr::copy_nonoverlapping(p.add(at as usize), slot.ptr, n as usize) };
+                    let r = copy_slot(m, stream, &mut slot, dst + at, n);
+                    slots.put(slot);
+                    r?;
+                }
+                begun.1.record(s)?;
+                Ok(begun)
+            });
+            return done(match copied {
+                Ok((start, ready)) => Ok(Copied { ready, start, bytes: len, path: CopyPath::Bounced, refused: false }),
+                Err(e) => drained(s, e),
+            });
         }
         CopySrc::Sealed { host, region, offset } => {
-            host.wait_ready(region)?;
+            if let Err(e) = host.wait_ready(region) {
+                return done(Err(e));
+            }
             let span = crate::layout::align_up(len, crate::layout::PART_ALIGN);
             let (pinned, now) = host.pin_region(region, offset, span);
-            refused = now;
             // SAFETY: inside the live mapping `host` keeps; the region is complete.
             let p = unsafe { host.base().add(offset as usize) } as *const u8;
-            (if pinned { CopySrc::Host(p) } else { CopySrc::Bounce(p) }, Some(host))
+            (if pinned { CopySrc::Host(p) } else { CopySrc::Bounce(p) }, Some(host), now)
         }
-        src => (src, None),
+        src => (src, None, false),
     };
-    let d = cuda::driver()?;
-    let start = m.events.get(true)?;
-    let ready = m.events.get(true)?;
-    let wait_all = |waits: &[EvRef]| -> Result<()> {
-        for w in waits {
-            // SAFETY: events of this context; the stream is ours.
-            cuda::check("cuStreamWaitEvent", unsafe { (d.stream_wait_event)(stream, w.raw(), 0) })?;
-        }
-        Ok(())
+    let (start, ready) = match begin(m, s, &waits) {
+        Ok(x) => x,
+        Err(e) => return done(drained(s, e)),
     };
-    match src {
-        CopySrc::Sealed { .. } => unreachable!("resolved above"),
+    let size = m.staging.1;
+    let pieces = (0..len.div_ceil(size)).map(|i| Piece { at: i * size, n: size.min(len - i * size) });
+    let (disk, from, path) = match src {
         CopySrc::Host(p) => {
-            wait_all(&waits)?;
-            crate::faults::gate("copy", stream)?;
-            start.record(stream)?;
-            // SAFETY: `p` covers `len` bytes of the pinned tier, kept alive by the books.
-            cuda::check("cuMemcpyHtoDAsync", unsafe {
-                (d.memcpy_htod_async)(dst, p as *const libc::c_void, len as usize, stream)
-            })?;
-            crate::faults::hit("host-copy-recorded")?;
-            ready.record(stream)?;
-            Ok(Copied { ready, start, bytes: len, path: CopyPath::Pinned, refused })
+            let copied = (|| {
+                let d = cuda::driver()?;
+                // SAFETY: `p` covers `len` page-locked bytes, kept alive by the books.
+                cuda::check("cuMemcpyHtoDAsync", unsafe { (d.memcpy_htod_async)(dst, p as *const libc::c_void, len as usize, s) })?;
+                crate::faults::hit("host-copy-recorded")?;
+                ready.record(s)
+            })();
+            return done(match copied {
+                Ok(()) => Ok(Copied { ready, start, bytes: len, path: CopyPath::Pinned, refused }),
+                Err(e) => drained(s, e),
+            });
         }
-        CopySrc::Bounce(p) => staged_copy(m, stream, bounces, waits, dst, len, Staged::Host(p), start, ready)
-            .map(|c| Copied { refused, ..c }),
-        CopySrc::Disk { source, items, base } => {
-            staged_copy(m, stream, bounces, waits, dst, len, Staged::Files { source, items, base }, start, ready)
-        }
-    }
-}
-
-/// What a staged copy reads into the staging buffers: object-file items, or host memory.
-enum Staged {
-    Files { source: Arc<Source>, items: Vec<Item>, base: u64 },
-    Host(*const u8),
-}
-
-/// A copy through the staging buffers, chunk by chunk: the readers fill a buffer (from the
-/// object files, or by memcpy from host memory) while earlier chunks' DMA runs.
-#[allow(clippy::too_many_arguments)]
-fn staged_copy(
-    m: &MoverCtx,
-    stream: CUstream,
-    bounces: &mut [Bounce],
-    waits: Vec<EvRef>,
-    dst: u64,
-    len: u64,
-    staged: Staged,
-    start: EvRef,
-    ready: EvRef,
-) -> Result<Copied> {
-    let d = cuda::driver()?;
-    let wait_all = |waits: &[EvRef]| -> Result<()> {
-        for w in waits {
-            // SAFETY: events of this context; the stream is ours.
-            cuda::check("cuStreamWaitEvent", unsafe { (d.stream_wait_event)(stream, w.raw(), 0) })?;
-        }
-        Ok(())
+        CopySrc::Bounce(p) => (None, Some(Dst(p as *mut u8)), CopyPath::Bounced),
+        CopySrc::Disk { source, items, base } => (Some((source, Arc::new(items), base)), None, CopyPath::Files),
+        CopySrc::Sealed { .. } => unreachable!("resolved above"),
     };
-    let cap = m.staging.1;
-    if bounces.is_empty() || cap == 0 {
-        return Err(Error::Invalid("a staged device fill with no staging buffers".into()));
-    }
-    let nchunks = len.div_ceil(cap) as usize;
-    let mut inflight: VecDeque<(u64, usize, Arc<Waiter>)> = VecDeque::new();
-    let mut next = 0usize;
-    // The slot's previous readers first: the stream waits, the host keeps reading.
-    let mut failed = wait_all(&waits).and_then(|_| crate::faults::gate("copy", stream)).err();
-    let mut first = true;
-    loop {
-        while failed.is_none() && inflight.len() < bounces.len() && next < nchunks {
-            let b = next % bounces.len();
-            if let Some(last) = bounces[b].last.take() {
-                if let Err(e) = last.sync() {
-                    failed = Some(e);
-                    break;
-                }
-            }
-            let c0 = next as u64 * cap;
-            let c1 = (c0 + cap).min(len);
-            let w = Arc::new(Waiter { m: Mutex::new(None), cv: Condvar::new() });
-            let w2 = w.clone();
-            let signal = move |r| {
-                *w2.m.lock().unwrap() = Some(r);
-                w2.cv.notify_all();
-            };
-            match &staged {
-                Staged::Files { source, items, base } => {
-                    let base = *base;
-                    let pieces = slice_items(items, base + c0, base + c1);
-                    let batch = Batch::new(pieces.len(), signal);
-                    for it in pieces {
-                        let into = Dst(unsafe { bounces[b].ptr.add((it.offset - base - c0) as usize) });
-                        let (source, batch, tally) = (source.clone(), batch.clone(), m.tally.clone());
-                        m.readers.submit(true, move || {
-                            let into = into;
-                            // SAFETY: the bounce range belongs to this chunk until its copy
-                            // event, recorded only after this batch completes.
-                            let r = unsafe { source.read_item(&it, into.0, Mode::Buffered, &tally) };
-                            // Drop the source before signalling: whoever waits on the batch
-                            // may then close the last weight set and end the lease at once.
-                            drop(source);
-                            batch.finish(r);
-                        });
-                    }
-                }
-                Staged::Host(p) => {
-                    // One piece per reader thread: a chunk copied by one thread is the whole
-                    // pipeline's rate (an RTX 3070 pod under CPU pressure: 2 GB/s on a 12 GB/s
-                    // link), and the file path already reads a chunk's items in parallel.
-                    let n = (c1 - c0) as usize;
-                    let pieces = m.readers.threads().min(n.div_ceil(crate::layout::PART_ALIGN as usize)).max(1);
-                    let piece = n.div_ceil(pieces);
-                    let batch = Batch::new(pieces, signal);
-                    for k in 0..pieces {
-                        let (at, len) = (k * piece, piece.min(n - (k * piece).min(n)));
-                        let from = Dst(unsafe { p.add(c0 as usize + at) } as *mut u8);
-                        let into = Dst(unsafe { bounces[b].ptr.add(at) });
-                        let batch = batch.clone();
-                        m.readers.submit(true, move || {
-                            let (from, into) = (from, into);
-                            // SAFETY: the host range stays mapped until this copy returns (it
-                            // waits for every batch); the bounce range is this piece's.
-                            unsafe { std::ptr::copy_nonoverlapping(from.0 as *const u8, into.0, len) };
-                            batch.finish(Ok(()));
-                        });
-                    }
-                }
-            }
-            inflight.push_back((c0, b, w));
-            next += 1;
-        }
-        let Some((c0, b, w)) = inflight.pop_front() else { break };
-        let mut g = w.m.lock().unwrap();
-        while g.is_none() {
-            g = w.cv.wait(g).unwrap();
-        }
-        // After any failure keep draining: readers may still write the bounces.
-        if let Err(e) = g.take().unwrap() {
-            failed.get_or_insert(e);
-        }
-        if failed.is_some() {
+    let pieces: Vec<Piece> = pieces.collect();
+    let job = Arc::new(Staged {
+        left: AtomicUsize::new(pieces.len() + 1),
+        failed: Mutex::new(None),
+        done: Mutex::new(Some(done)),
+        stream,
+        start,
+        ready,
+        bytes: len,
+        path,
+        refused,
+        _kept: kept,
+    });
+    for piece in pieces {
+        if job.failed() {
+            job.finish_one();
             continue;
         }
-        let mut copy = || -> Result<()> {
-            if first {
-                start.record(stream)?;
-                first = false;
+        let slot = match slots.take() {
+            Ok(slot) => slot,
+            Err(e) => {
+                job.fail(e);
+                job.finish_one();
+                continue;
             }
-            crate::faults::hit("staged-copy")?;
-            let n = cap.min(len - c0);
-            // SAFETY: the bounce holds the chunk; pinned host memory.
-            cuda::check("cuMemcpyHtoDAsync", unsafe {
-                (d.memcpy_htod_async)(dst + c0, bounces[b].ptr as *const libc::c_void, n as usize, stream)
-            })?;
-            let e = m.events.get(false)?;
-            e.record(stream)?;
-            bounces[b].last = Some(e);
-            Ok(())
         };
-        if let Err(e) = copy() {
-            failed = Some(e);
-        }
+        let (m, job, slots, disk) = (m.clone(), job.clone(), slots.clone(), disk.clone());
+        m.readers.clone().submit(true, move || {
+            // Whole values, not their raw-pointer fields (closures capture fields precisely).
+            let (m, mut slot, stream, from) = (m, slot, stream, from);
+            let filled = match (&disk, from) {
+                (Some((source, items, base)), _) => coalesced(items, base + piece.at, base + piece.at + piece.n).iter().try_for_each(|it| {
+                    // SAFETY: the slot is this piece's alone until it is returned below; an
+                    // O_DIRECT read may run to the next 4 KiB boundary, inside the slot.
+                    unsafe { source.read_item(it, slot.ptr.add((it.offset - base - piece.at) as usize), Mode::Cache, &m.tally) }
+                }),
+                (None, Some(p)) => {
+                    // SAFETY: the host range stays mapped (the books, or `_kept`) until done.
+                    unsafe { std::ptr::copy_nonoverlapping(p.0.add(piece.at as usize), slot.ptr, piece.n as usize) };
+                    Ok(())
+                }
+                (None, None) => unreachable!("a staged job reads files or host memory"),
+            };
+            let copied = filled.and_then(|_| {
+                if job.failed() {
+                    return Ok(());
+                }
+                let _g = CtxGuard::enter(m.ctx)?;
+                copy_slot(&m, stream, &mut slot, dst + piece.at, piece.n)
+            });
+            if let Err(e) = copied {
+                job.fail(e);
+            }
+            slots.put(slot);
+            match CtxGuard::enter(m.ctx) {
+                Ok(_g) => job.finish_one(),
+                Err(e) => {
+                    job.fail(e);
+                    job.finish_one();
+                }
+            }
+        });
     }
-    if let Some(e) = failed {
-        return Err(e);
+    job.finish_one();
+}
+
+/// Enqueue `waits` on the stream, then a start event; returns (start, ready to record later).
+fn begin(m: &MoverCtx, s: CUstream, waits: &[EvRef]) -> Result<(EvRef, EvRef)> {
+    let d = cuda::driver()?;
+    for w in waits {
+        // SAFETY: events of this context; the stream is ours.
+        cuda::check("cuStreamWaitEvent", unsafe { (d.stream_wait_event)(s, w.raw(), 0) })?;
     }
-    if first {
-        start.record(stream)?;
-    }
-    ready.record(stream)?;
-    let path = match staged {
-        Staged::Files { .. } => CopyPath::Files,
-        Staged::Host(_) => CopyPath::Bounced,
-    };
-    Ok(Copied { ready, start, bytes: len, path, refused: false })
+    crate::faults::gate("copy", s)?;
+    let start = m.events.get(true)?;
+    start.record(s)?;
+    Ok((start, m.events.get(true)?))
 }
 
 /// The parts of `items` inside layout range `[lo, hi)`, split at the edges. Object ranges are

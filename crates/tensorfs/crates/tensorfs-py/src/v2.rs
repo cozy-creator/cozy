@@ -410,7 +410,7 @@ impl PyStore {
 /// A checkpoint in a store: its tensors, files and metadata.
 #[pyclass(name = "Checkpoint", module = "tensorfs.v2", frozen)]
 pub struct PyCheckpoint {
-    ck: Checkpoint,
+    pub(crate) ck: Checkpoint,
     named: Named,
     tensors: OnceLock<Py<PyDict>>,
 }

@@ -13,6 +13,7 @@ from collections.abc import Sequence
 from typing import Literal, Self, TypedDict
 
 from ._ext import ReadLease, ReadPlan, Store
+from .v2 import Checkpoint
 
 #: `"pinned"` or a CUDA ordinal.
 type Tier = Literal["pinned"] | int
@@ -250,11 +251,11 @@ class Plane:
     def __init__(
         self,
         devices: Sequence[int],
-        readers: int = 8,
+        readers: int = 16,
         copy_streams: int = 1,
         slab_bytes: int = 64 << 20,
-        staging_buffers: int = 4,
-        staging_bytes: int = 64 << 20,
+        staging_buffers: int = 32,
+        staging_bytes: int = 1 << 20,
         direct_io: bool = True,
     ) -> None: ...
     @property
@@ -268,6 +269,15 @@ class Plane:
         regions: Sequence[Sequence[str]],
         host_fd: int | None = None,
     ) -> WeightSet: ...
+    def register_checkpoint(
+        self,
+        name: str,
+        ck: Checkpoint,
+        regions: Sequence[Sequence[str]] | None = None,
+        host_fd: int | None = None,
+    ) -> WeightSet:
+        """Register `regions` (`tensorfs.v2.regions(ck)` when None) of a v2 checkpoint: its
+        header, in order, is the read plan and its chunk files the source."""
     def register_sealed(
         self,
         name: str,
