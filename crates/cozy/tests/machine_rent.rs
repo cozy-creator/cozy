@@ -81,19 +81,10 @@ fn an_ask_the_hub_cannot_fill_is_refused_and_never_widened() {
     );
 }
 
-/// Refusals that need no Hub: this computer's machine role waits for TensorD in the binary, and rental
-/// options without a product are usage errors.
+/// Refusals that need no Hub: rental options without a product are usage errors.
 #[test]
 fn machine_usage_refusals() {
     let Some(home) = Home::new() else { return };
-    for verb in ["enable", "disable"] {
-        let out = home.cozy(["machine", verb, "--json"]);
-        assert_eq!(
-            (out.code, out.refusal()["code"].as_str()),
-            (2, Some("not_ported")),
-            "{out:?}"
-        );
-    }
     for args in [
         vec!["machine", "rent", "--gpus", "2"],
         vec!["machine", "rent", "--disk-gb", "500"],

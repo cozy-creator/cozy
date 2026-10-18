@@ -431,7 +431,7 @@ async fn send(request: RequestBuilder) -> Result<Response, Error> {
     let response = request.send().await.map_err(transport)?;
     if response.headers().contains_key("grpc-status") {
         return Err(Error::NotMachineApi(
-            "the machine speaks gRPC (cozy.machine.v1): it is older than this cozy; end it".into(),
+            "the machine speaks gRPC (cozy.machine.v1): it is older than this cozy".into(),
         ));
     }
     let status = response.status();
