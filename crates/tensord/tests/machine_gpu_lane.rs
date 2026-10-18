@@ -95,7 +95,9 @@ async fn run(client: &Client, manifest: &str, id: &str, gpus: u32) -> v1::Outcom
     client.submit(&v1::RunRequest { id: id.into(), spec }).await.unwrap();
     let mut events = Box::pin(client.events(id, 0).await.unwrap());
     while let Some(event) = events.next().await {
-        if let v1::Event::Outcome(outcome) = event.unwrap().event {
+        let event = event.unwrap().event;
+        eprintln!("{id}: {event:?}");
+        if let v1::Event::Outcome(outcome) = event {
             return outcome;
         }
     }
@@ -132,7 +134,7 @@ async fn a_call_that_ignores_its_cancel_is_killed_and_its_gpu_serves_the_next_ru
         kind: v1::RunKind::Call,
         source: Some(v1::Source::Local(v1::LocalSource { manifest: manifest.clone() })),
         entrypoint: "stubborn".into(),
-        payload: Some(v1::Json::parse(&serde_json::json!({"label": pidfile}).to_string()).unwrap()),
+        payload: Some(v1::Json::parse(serde_json::json!({"label": pidfile}).to_string()).unwrap()),
         ..Default::default()
     };
     client.submit(&v1::RunRequest { id: "stuck".into(), spec }).await.unwrap();
@@ -148,7 +150,9 @@ async fn a_call_that_ignores_its_cancel_is_killed_and_its_gpu_serves_the_next_ru
     let mut events = Box::pin(client.events("stuck", 0).await.unwrap());
     let (mut lines, mut outcome) = (vec![], None);
     while let Some(event) = events.next().await {
-        match event.unwrap().event {
+        let event = event.unwrap().event;
+        eprintln!("stuck: {event:?}");
+        match event {
             v1::Event::Log(line) => lines.push(line.text),
             v1::Event::Outcome(ended) => {
                 outcome = Some(ended);
