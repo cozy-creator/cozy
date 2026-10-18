@@ -127,9 +127,6 @@ pub struct Driver {
         unsafe extern "C" fn(CUdeviceptr, *const c_void, usize, CUstream) -> CUresult,
     pub memcpy_dtoh_async:
         unsafe extern "C" fn(*mut c_void, CUdeviceptr, usize, CUstream) -> CUresult,
-    pub memcpy_dtod_async:
-        unsafe extern "C" fn(CUdeviceptr, CUdeviceptr, usize, CUstream) -> CUresult,
-    pub memset_d8_async: unsafe extern "C" fn(CUdeviceptr, u8, usize, CUstream) -> CUresult,
     pub mem_host_register: unsafe extern "C" fn(*mut c_void, usize, c_uint) -> CUresult,
     pub mem_host_unregister: F<*mut c_void>,
     pub mem_host_alloc: unsafe extern "C" fn(*mut *mut c_void, usize, c_uint) -> CUresult,
@@ -145,9 +142,6 @@ pub struct Driver {
     pub mem_unmap: unsafe extern "C" fn(CUdeviceptr, usize) -> CUresult,
     pub mem_set_access:
         unsafe extern "C" fn(CUdeviceptr, usize, *const AccessDesc, usize) -> CUresult,
-    /// The driver's own answer to "what is mapped here": the one call that reads residency
-    /// from the driver instead of the plane's books. Every success needs a `mem_release`.
-    pub mem_retain_allocation_handle: unsafe extern "C" fn(*mut Handle, *mut c_void) -> CUresult,
     /// Device sharing (`Plane::export_device`/`attach_device`). Optional: a driver without
     /// them still runs every other path.
     pub mem_export_to_shareable_handle: Option<unsafe extern "C" fn(*mut c_void, Handle, u32, u64) -> CUresult>,
@@ -226,8 +220,6 @@ impl Driver {
             event_elapsed_time: load!(lib, b"cuEventElapsedTime"),
             memcpy_htod_async: load!(lib, b"cuMemcpyHtoDAsync_v2"),
             memcpy_dtoh_async: load!(lib, b"cuMemcpyDtoHAsync_v2"),
-            memcpy_dtod_async: load!(lib, b"cuMemcpyDtoDAsync_v2"),
-            memset_d8_async: load!(lib, b"cuMemsetD8Async"),
             mem_host_register: load!(lib, b"cuMemHostRegister_v2"),
             mem_host_unregister: load!(lib, b"cuMemHostUnregister"),
             mem_host_alloc: load!(lib, b"cuMemHostAlloc"),
@@ -240,7 +232,6 @@ impl Driver {
             mem_map: load!(lib, b"cuMemMap"),
             mem_unmap: load!(lib, b"cuMemUnmap"),
             mem_set_access: load!(lib, b"cuMemSetAccess"),
-            mem_retain_allocation_handle: load!(lib, b"cuMemRetainAllocationHandle"),
             mem_export_to_shareable_handle: optional!(lib, b"cuMemExportToShareableHandle"),
             mem_import_from_shareable_handle: optional!(lib, b"cuMemImportFromShareableHandle"),
             mem_get_allocation_properties: optional!(lib, b"cuMemGetAllocationPropertiesFromHandle"),
