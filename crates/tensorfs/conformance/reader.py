@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""An independent cozytensors/2 reader: Python stdlib and numpy only, written from the spec.
+"""An independent cozytensors/1 reader: Python stdlib and numpy only, written from the spec.
 
     python reader.py <vectors-dir>     run the conformance vectors (exit 1 on any failure)
 
@@ -17,7 +17,7 @@ from pathlib import Path
 
 import numpy as np
 
-HEADER, MANIFEST, REPO = "cozytensors/2", "tensorfs.manifest/2", "tensorfs.repo/2"
+HEADER, MANIFEST, REPO = "cozytensors/1", "tensorfs.manifest/1", "tensorfs.repo/1"
 BITS = {
     "BOOL": 8, "F4": 4, "F6_E2M3": 6, "F6_E3M2": 6, "U8": 8, "I8": 8, "F8_E5M2": 8, "F8_E4M3": 8,
     "F8_E8M0": 8, "F8_E4M3FNUZ": 8, "F8_E5M2FNUZ": 8, "I16": 16, "U16": 16, "F16": 16, "BF16": 16,
@@ -445,7 +445,7 @@ def check(vectors: Path) -> int:
                 failures.append(f"{verdict}/{path.name}")
     for f in failures:
         print("FAIL", f)
-    print(f"cozytensors/2 conformance: {passed} passed, {len(failures)} failed")
+    print(f"cozytensors/1 conformance: {passed} passed, {len(failures)} failed")
     return 1 if failures else 0
 
 

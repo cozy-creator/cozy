@@ -1,4 +1,4 @@
-//! The writer (design §6): tensors and files in, one committed and pinned cozytensors/2
+//! The writer (design §6): tensors and files in, one committed and pinned cozytensors/1
 //! checkpoint out.
 //!
 //! - A part of 16 MiB or more streams straight into objects on the 64 MiB grid. Smaller parts

@@ -123,7 +123,7 @@ impl From<format::Error> for Failure {
     fn from(e: format::Error) -> Failure {
         let kind = match e {
             format::Error::Invalid(_) => Kind::Invalid,
-            format::Error::Format { .. } => Kind::Format,
+            format::Error::Format { .. } | format::Error::PreCut => Kind::Format,
             format::Error::UnknownScheme(_) => Kind::UnknownScheme,
             format::Error::Decode(_) => Kind::Decode,
         };

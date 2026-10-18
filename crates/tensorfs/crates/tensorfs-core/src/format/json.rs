@@ -1,4 +1,4 @@
-//! Strict reads and deterministic writes, shared by every v2 document.
+//! Strict reads and deterministic writes, for the manifest and the repo (JSON documents).
 //!
 //! Read: one JSON object, no duplicate keys, integers only (fitting i64 or u64); the typed
 //! layer then ignores unknown fields. Write: sorted keys (byte order), no whitespace, integers

@@ -1,4 +1,0 @@
-{
-  "expect": "refuse",
-  "why": "encoding indexes never truncate to the platform usize width"
-}

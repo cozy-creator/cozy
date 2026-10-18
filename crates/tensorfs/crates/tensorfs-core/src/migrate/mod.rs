@@ -1,4 +1,4 @@
-//! `tfs dev migrate` (xs-045 U12): v1 lane checkpoints become cozytensors/2 checkpoints. It goes,
+//! `tfs dev migrate` (xs-045 U12): v1 lane checkpoints become cozytensors/1 checkpoints. It goes,
 //! with [`v1`], the last v1 reader, once the live lanes have moved.
 //!
 //! Per checkpoint:

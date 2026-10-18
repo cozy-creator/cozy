@@ -1,4 +1,4 @@
-"""TensorFS speed gate: cozytensors/2 against safetensors, disk -> pinned -> GPU (xs-045 F1, U8).
+"""TensorFS speed gate: cozytensors/1 against safetensors, disk -> pinned -> GPU (xs-045 F1, U8).
 
     python speedgate.py <work dir> <result.json> [--build-only] [--plane=readers=16,staging_buffers=32]
         [--readers=T64+rust,st-cuda] [--cells=window]

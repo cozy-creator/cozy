@@ -1,5 +1,5 @@
-//! cozytensors/2 and the TensorFS v2 documents: types, strict reads, deterministic writes.
-//! Normative spec: `crates/tensorfs/spec/cozytensors-2.md`. Depends on serde, serde_json and
+//! cozytensors/1 and the TensorFS documents: types, strict reads, deterministic writes.
+//! Normative spec: `crates/tensorfs/spec/cozytensors.md`. Depends on serde, serde_json and
 //! sha2 only, so it builds without the `store` feature.
 
 mod cbor;
@@ -18,9 +18,9 @@ pub use doc::{
 pub use dtype::Dtype;
 pub use value::Value;
 
-pub const HEADER_FORMAT: &str = "cozytensors/2";
-pub const MANIFEST_FORMAT: &str = "tensorfs.manifest/2";
-pub const REPO_FORMAT: &str = "tensorfs.repo/2";
+pub const HEADER_FORMAT: &str = "cozytensors/1";
+pub const MANIFEST_FORMAT: &str = "tensorfs.manifest/1";
+pub const REPO_FORMAT: &str = "tensorfs.repo/1";
 /// The manifest path of a checkpoint's header.
 pub const HEADER_PATH: &str = "model.cozytensors";
 
@@ -35,6 +35,9 @@ pub enum Error {
         found: String,
         expected: &'static str,
     },
+    /// A header from before the cut to this format: same tag, older layout.
+    #[error("pre-cut cozytensors header (old layout); re-import or migrate")]
+    PreCut,
     /// The tensor reads, but this reader has no decoder for its scheme.
     #[error("unknown scheme {0:?}: its parts read raw, decode is refused")]
     UnknownScheme(String),
@@ -48,6 +51,7 @@ impl Error {
         match self {
             Error::Invalid(_) => "invalid",
             Error::Format { .. } => "format",
+            Error::PreCut => "pre_cut",
             Error::UnknownScheme(_) => "unknown_scheme",
             Error::Decode(_) => "decode",
         }

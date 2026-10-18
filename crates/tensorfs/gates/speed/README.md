@@ -1,4 +1,4 @@
-# Speed gate: cozytensors/2 against safetensors (xs-045 F1, U8)
+# Speed gate: cozytensors/1 against safetensors (xs-045 F1, U8)
 
 Requirement: cozytensors must be at least as fast as safetensors. Measured disk → pinned host → GPU on a
 rented card, with real lane bytes, from first open to the last byte resident on the GPU.

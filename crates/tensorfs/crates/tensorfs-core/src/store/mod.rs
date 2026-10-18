@@ -85,7 +85,7 @@ pub enum Error {
     Mismatch { expected: ObjectRef, got: String },
     #[error("{}: {why}", path.display())]
     Invalid { path: PathBuf, why: String },
-    /// A document, or a tensor written or read, breaks cozytensors/2.
+    /// A document, or a tensor written or read, breaks cozytensors/1.
     #[error(transparent)]
     Format(#[from] format::Error),
 }
@@ -114,7 +114,9 @@ impl Error {
             Error::Invalid { .. } => Code::UNKNOWN_FORMAT,
             Error::Format(format::Error::UnknownScheme(_)) => Code::UNKNOWN_ENCODING,
             Error::Format(format::Error::Decode(_)) => Code::ENCODING_MISMATCH,
-            Error::Format(format::Error::Format { .. }) => Code::UNKNOWN_FORMAT,
+            Error::Format(format::Error::Format { .. } | format::Error::PreCut) => {
+                Code::UNKNOWN_FORMAT
+            }
             Error::Format(format::Error::Invalid(_)) => Code::TENSOR_SCHEMA_MISMATCH,
         };
         Refusal {

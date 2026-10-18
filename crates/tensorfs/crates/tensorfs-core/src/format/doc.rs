@@ -1,5 +1,6 @@
-//! The three v2 documents and the tensor model. Each type parses through a `Wire` twin that
-//! carries the `format` tag; validation happens once, in `TryFrom<Wire>`.
+//! The three documents and the tensor model. The manifest and repo parse through a `Wire` twin
+//! that carries the `format` tag, the header through `cbor`; validation happens once, in
+//! `TryFrom<Wire>` and [`Header::new`].
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -63,7 +64,7 @@ impl ObjectRef {
     }
 }
 
-/// `tensorfs.manifest/2`: a checkpoint as a file tree. `model.cozytensors` is its header.
+/// `tensorfs.manifest/1`: a checkpoint as a file tree. `model.cozytensors` is its header.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(try_from = "ManifestWire", into = "ManifestWire")]
 pub struct Manifest {
@@ -119,7 +120,7 @@ impl Manifest {
     }
 }
 
-/// `cozytensors/2`: chunk objects and the tensors that live in them. Components, each
+/// `cozytensors/1`: chunk objects and the tensors that live in them. Components, each
 /// component's tensors and each tensor's parts are in construction order (the order a model
 /// builds and fills them), which the header's bytes and digest carry. Lookup by name goes
 /// through an index built by [`Header::new`].
@@ -447,7 +448,7 @@ pub fn repo_key(name: &str) -> String {
     format!("refs/{}.json", name.to_ascii_lowercase())
 }
 
-/// `tensorfs.repo/2`: a model's releases, each mapping lanes to manifests, and its unreleased
+/// `tensorfs.repo/1`: a model's releases, each mapping lanes to manifests, and its unreleased
 /// checkpoints. Kept at [`repo_key`]; releases are in publication order.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(try_from = "RepoWire", into = "RepoWire")]

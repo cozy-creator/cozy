@@ -1,4 +1,4 @@
-//! The cozytensors/2 conformance vectors (`crates/tensorfs/conformance/vectors`): the Rust writer
+//! The cozytensors/1 conformance vectors (`crates/tensorfs/conformance/vectors`): the Rust writer
 //! reproduces the store byte for byte from `cases.json`, the Rust reader decodes every case to
 //! its expected bytes or refuses it with its code, and green/red documents read or refuse.
 //! `cargo test ... -- --ignored regenerate` rewrites the store after a deliberate change.
@@ -310,6 +310,11 @@ fn green_documents_read_and_red_documents_refuse() {
             let name = path.file_name().unwrap().to_string_lossy().to_string();
             let bytes = fs::read(&path).unwrap();
             let read = match name.split('-').next().unwrap() {
+                "header" if name.starts_with("header-pre-cut") => {
+                    let err = Header::from_cbor(&bytes).unwrap_err();
+                    assert_eq!(err.code(), "pre_cut", "{name}: {err}");
+                    Err(err)
+                }
                 "header" => Header::from_cbor(&bytes).map(drop),
                 "manifest" => Manifest::from_json(&bytes).map(drop),
                 "repo" => Repo::from_json(&bytes).map(drop),

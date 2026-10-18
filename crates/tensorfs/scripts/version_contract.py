@@ -44,14 +44,12 @@ def _python_version_from_cargo(version: str) -> str:
 
 def source_versions() -> tuple[str, str]:
     pyproject = _toml(ROOT / "pyproject.toml")
-    conformance = _toml(ROOT / "conformance/cbor/python/pyproject.toml")
     cargo = _toml(ROOT / "crates/tensorfs-py/Cargo.toml")
     python_version = pyproject["project"]["version"]  # type: ignore[index]
     cargo_version = cargo["package"]["version"]  # type: ignore[index]
-    for name, project in (("pyproject.toml", pyproject), ("conformance CBOR", conformance)):
-        requires_python = project["project"]["requires-python"]  # type: ignore[index]
-        if requires_python != PYTHON_SPEC:
-            raise ValueError(f"{name} requires-python {requires_python!r} != {PYTHON_SPEC!r}")
+    requires_python = pyproject["project"]["requires-python"]  # type: ignore[index]
+    if requires_python != PYTHON_SPEC:
+        raise ValueError(f"pyproject.toml requires-python {requires_python!r} != {PYTHON_SPEC!r}")
     if not isinstance(python_version, str) or not isinstance(cargo_version, str):
         raise ValueError("pyproject and Cargo versions must be strings")
     if cargo_version != CURRENT_CARGO_VERSION:

@@ -1,6 +1,6 @@
-# cozytensors/2 conformance
+# cozytensors/1 conformance
 
-For anyone implementing [cozytensors/2](../spec/cozytensors-2.md).
+For anyone implementing [cozytensors/1](../spec/cozytensors.md).
 
 | Path | What |
 |---|---|

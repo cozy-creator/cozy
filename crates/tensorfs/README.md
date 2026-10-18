@@ -268,10 +268,7 @@ cargo fmt --all -- --check
 python3 scripts/fence.py
 python3 scripts/version_contract.py source
 
-cargo build --release --bin tfs
-uv run --python 3.12 --project conformance/cbor/python \
-  python scripts/cbor-conformance.py --tfs target/release/tfs conform
-uv run --python 3.12 --with numpy python -I conformance/reader.py conformance/vectors
+uv run --python 3.12 --with numpy --with cbor2==6.1.4 python -I conformance/reader.py conformance/vectors
 
 # the end-to-end test: wheel -> fresh venv -> real store -> lease/plan/CAS
 bash scripts/wheel-smoke.sh

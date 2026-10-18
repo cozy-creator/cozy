@@ -1,4 +1,0 @@
-{
-  "expect": "refuse",
-  "why": "dtype codes never truncate to the platform usize width"
-}

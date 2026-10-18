@@ -881,8 +881,9 @@ fn the_header_keeps_the_producers_order() {
     assert_layout(&c);
 }
 
-/// The owner's real v1 lanes (read-only): a v2 checkpoint the writer makes from them, tensor by
-/// tensor in v1 order, has v1's order. The bytes are one-byte stand-ins of an unknown dtype; the
+/// The owner's real pre-cut lanes (read-only): the reader refuses their headers as pre-cut; a
+/// checkpoint the writer makes from them, tensor by tensor in their order, has their order, and
+/// migrate's old decoder refuses its header. The bytes are one-byte stand-ins of an unknown dtype; the
 /// order is under test, and the chunk counts the rule gives the real part lengths are reported.
 #[test]
 #[ignore = "reads the owner's ~/.tensorfs v1 lanes"]
@@ -920,7 +921,10 @@ fn real_v1_lanes_keep_their_order() {
         let entry = (doc["entries"].as_array().unwrap().iter())
             .find(|e| e["kind"] == "cozytensors")
             .unwrap();
-        let v1 = V1::parse(&blob(entry["blob"]["sha256"].as_str().unwrap())).unwrap();
+        let old = blob(entry["blob"]["sha256"].as_str().unwrap());
+        let err = tensorfs_core::format::Header::from_cbor(&old).unwrap_err();
+        assert_eq!(err.code(), "pre_cut", "{lane}: {err}");
+        let v1 = V1::parse(&old).unwrap();
         let mut w = store.writer(None, None).unwrap();
         let mut want = Vec::new();
         let mut items = Vec::new();
@@ -967,6 +971,8 @@ fn real_v1_lanes_keep_their_order() {
         }
         let ck = store.checkpoint(&w.commit().unwrap()).unwrap();
         assert_eq!(layout_names(&ck), want, "{lane}: v2 order is v1 order");
+        let new = ck.file("model.cozytensors").unwrap();
+        assert!(tensorfs_core::migrate::v1::header(&new).is_err(), "{lane}");
         let items: Vec<Item> = (items.iter())
             .map(|(c, k, r, n)| Item {
                 component: c,

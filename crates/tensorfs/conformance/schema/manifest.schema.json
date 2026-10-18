@@ -1,8 +1,8 @@
 {
  "$schema": "https://json-schema.org/draft/2020-12/schema",
  "$id": "https://github.com/cozy-creator/cozy-creator/crates/tensorfs/conformance/schema/manifest.schema.json",
- "title": "tensorfs.manifest/2",
- "description": "Structure only; byte-length, bounds and duplicate-key rules are in spec/cozytensors-2.md. Unknown fields are allowed.",
+ "title": "tensorfs.manifest/1",
+ "description": "Structure only; byte-length, bounds and duplicate-key rules are in spec/cozytensors.md. Unknown fields are allowed.",
  "type": "object",
  "required": [
   "format",

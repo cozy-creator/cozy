@@ -1,4 +1,4 @@
-//! cozytensors/2 documents through the public reader and writer.
+//! cozytensors/1 documents through the public reader and writer.
 
 use std::collections::BTreeMap;
 
@@ -70,7 +70,7 @@ fn writer_is_deterministic_and_reader_round_trips() {
     let h = header();
     let bytes = h.to_cbor().unwrap();
     // [format, chunks, encodings, components, metadata]: a 5-array, then the format text.
-    assert_eq!(&bytes[..15], b"\x85\x6dcozytensors/2");
+    assert_eq!(&bytes[..15], b"\x85\x6dcozytensors/1");
     // The first chunk: [bstr .size 32, 8192].
     assert_eq!(&bytes[15..19], b"\x82\x82\x58\x20");
     assert_eq!(&bytes[51..54], b"\x19\x20\x00");
@@ -93,7 +93,7 @@ fn writer_is_deterministic_and_reader_round_trips() {
         metadata: Default::default(),
     };
     let mb = m.to_json().unwrap();
-    assert!(mb.ends_with(br#"}},"format":"tensorfs.manifest/2"}"#));
+    assert!(mb.ends_with(br#"}},"format":"tensorfs.manifest/1"}"#));
     assert_eq!(Manifest::from_json(&mb).unwrap().header(), m.header());
 
     let r = Repo {
@@ -120,7 +120,7 @@ fn appended_fields_newer_dtypes_and_schemes_read() {
     let digest = &good[19..51];
     let chunk = [b"\x82\x58\x20".as_slice(), digest, b"\x19\x20\x00"].concat();
     let longer = [b"\x84\x58\x20".as_slice(), digest, b"\x19\x20\x00\x41\x00\xa1\x61k\x80"].concat();
-    let mut newer = patch(&good, b"\x85\x6dcozytensors/2", b"\x86\x6fcozytensors/2.9");
+    let mut newer = patch(&good, b"\x85\x6dcozytensors/1", b"\x86\x6fcozytensors/1.9");
     newer = patch(&newer, &chunk, &longer);
     newer = patch(&newer, b"\x64BF16", b"\x67F3_E1M1");
     newer = patch(&newer, b"\x6bfp8-rowwise", b"\x6bacme.int3x2");
@@ -151,8 +151,8 @@ fn patch(bytes: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
 fn red_documents_are_refused() {
     let good = header().to_cbor().unwrap();
     let cases: &[(&str, Vec<u8>, &str)] = &[
-        ("major 3", patch(&good, b"cozytensors/2", b"cozytensors/3"), "format"),
-        ("minor empty", patch(&good, b"\x6dcozytensors/2", b"\x6ecozytensors/2."), "format"),
+        ("major 2", patch(&good, b"cozytensors/1", b"cozytensors/2"), "format"),
+        ("minor empty", patch(&good, b"\x6dcozytensors/1", b"\x6ecozytensors/1."), "format"),
         ("trailing byte", [good.as_slice(), &[0]].concat(), "invalid"),
         ("truncated", good[..good.len() - 1].to_vec(), "invalid"),
         ("non-preferred length", patch(&good, b"\x19\x20\x00", b"\x1a\x00\x00\x20\x00"), "invalid"),
@@ -192,13 +192,13 @@ fn red_documents_are_refused() {
     }
 
     for path in ["../x", "/x", "a//b", "a/./b", ""] {
-        let doc = json!({"format": "tensorfs.manifest/2", "files": {path: {"sha256": "0".repeat(64), "length": 0}}});
+        let doc = json!({"format": "tensorfs.manifest/1", "files": {path: {"sha256": "0".repeat(64), "length": 0}}});
         assert!(
             Manifest::from_json(doc.to_string().as_bytes()).is_err(),
             "{path:?}"
         );
     }
-    let repo = json!({"format": "tensorfs.repo/2", "name": "acme/tiny", "releases": [
+    let repo = json!({"format": "tensorfs.repo/1", "name": "acme/tiny", "releases": [
         {"version": "1", "lanes": {}}, {"version": "1", "lanes": {}}]});
     assert!(Repo::from_json(repo.to_string().as_bytes()).is_err());
 }

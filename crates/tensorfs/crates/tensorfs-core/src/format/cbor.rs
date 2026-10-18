@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::{
-    check_format, invalid, Body, Component, Dtype, Encoding, Header, Location, Metadata,
+    check_format, invalid, Body, Error, Component, Dtype, Encoding, Header, Location, Metadata,
     ObjectRef, Part, Result, Tensor, Value, HEADER_FORMAT,
 };
 
@@ -352,6 +352,28 @@ fn room(n: u64) -> usize {
 }
 
 pub(crate) fn read(bytes: &[u8]) -> Result<Header> {
+    parse(bytes).map_err(|e| if pre_cut(bytes) { Error::PreCut } else { e })
+}
+
+/// A header from before the cut: the JSON layout, or the first CBOR layout, a well-formed root
+/// of exactly five elements whose last is the components array where this one has the metadata
+/// map.
+fn pre_cut(bytes: &[u8]) -> bool {
+    let mut r = Reader { b: bytes, at: 0 };
+    let mut old = || -> Result<bool> {
+        if r.record(5, "the header")? > 0 {
+            return Ok(false);
+        }
+        r.text("format")?;
+        r.skip(3, 1)?;
+        let (major, n) = r.head()?;
+        r.skip(n, 1)?;
+        Ok(major == ARRAY && r.at == bytes.len())
+    };
+    bytes.first() == Some(&b'{') || old().unwrap_or(false)
+}
+
+fn parse(bytes: &[u8]) -> Result<Header> {
     let mut r = Reader { b: bytes, at: 0 };
     let more = r.record(5, "the header")?;
     check_format(r.text("format")?, HEADER_FORMAT)?;

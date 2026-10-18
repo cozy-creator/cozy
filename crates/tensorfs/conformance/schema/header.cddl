@@ -6,7 +6,7 @@
 
 header     = [format: tstr, chunks: [* chunk], encodings: [* encoding],
               components: [* component], metadata: {* tstr => value}, * any]
-; format: "cozytensors/2" or "cozytensors/2.<minor>"; a reader takes any minor.
+; format: "cozytensors/1" or "cozytensors/1.<minor>"; a reader takes any minor.
 
 chunk      = [sha256: bstr .size 32, length: uint, * any]
 
