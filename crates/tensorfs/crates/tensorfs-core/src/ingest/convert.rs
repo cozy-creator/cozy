@@ -1232,6 +1232,22 @@ fn plan_carrier(
             }
         };
 
+        // ComfyUI writes nvfp4 under ModelOpt's names and shapes but with other bytes: the even
+        // element in the HIGH nibble, block scales in cuBLAS 128x4 tiles. This border's nvfp4 is
+        // ModelOpt's layout, so a Comfy-marked one would decode wrong without an error.
+        let comfy = module_of(&t.key).is_some_and(|m| h.get(&format!("{m}.comfy_quant")).is_some())
+            || h.meta("_quantization_metadata").is_some();
+        if chosen.alias.starts_with("nvfp4") && comfy {
+            return refuse(
+                Code::UNREGISTERED_ENCODING,
+                format!(
+                    "{}: ComfyUI's nvfp4 layout (high nibble first, cuBLAS 128x4 block scales) \
+                     is not ModelOpt's, which this border writes. Import it into cozytensors/1 \
+                     as nvfp4 {{nibble_order: \"high_first\", scale_layout: \"cublas_128x4\"}}.",
+                    t.key
+                ),
+            );
+        }
         let logical_dtype = chosen.logical;
         let data = chosen.data_role.to_string();
         let mut roles = vec![RolePlan {

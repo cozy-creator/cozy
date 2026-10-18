@@ -238,3 +238,62 @@ fn old_identity_journal_cannot_satisfy_swapped_plan() {
     drop(store);
     let _ = fs::remove_dir_all(root);
 }
+
+/// ComfyUI's nvfp4 carries ModelOpt's names and shapes with other bytes (high nibble first,
+/// cuBLAS-tiled scales): the border refuses it instead of reading it as ModelOpt's.
+#[test]
+fn a_comfy_marked_nvfp4_weight_is_refused_not_misread() {
+    let root = root();
+    let carrier = |comfy: bool| {
+        let mut tensors = vec![
+            ("blk.weight", "U8", vec![16u64, 8], 128usize),
+            ("blk.weight_scale", "F8_E4M3", vec![16, 1], 16),
+            ("blk.weight_scale_2", "F32", vec![], 4),
+            ("norm.weight", "BF16", vec![2], 4),
+        ];
+        if comfy {
+            tensors.push(("blk.comfy_quant", "U8", vec![18], 18));
+        }
+        let (mut entries, mut payload) = (Vec::new(), Vec::new());
+        for (key, dtype, shape, len) in tensors {
+            let begin = payload.len() as u64;
+            payload.extend(std::iter::repeat_n(0x38u8, len));
+            let shape = Value::arr(shape.into_iter().map(Value::uint).collect());
+            let offsets = Value::arr(vec![Value::uint(begin), Value::uint(payload.len() as u64)]);
+            let entry = vec![
+                ("dtype", Value::str(dtype)),
+                ("shape", shape),
+                ("data_offsets", offsets),
+            ];
+            entries.push((key.to_string(), Value::obj(entry)));
+        }
+        let header = canon::write(&Value::map(entries));
+        let path = root.join(format!("nvfp4-{comfy}.safetensors"));
+        let mut data = (header.len() as u64).to_le_bytes().to_vec();
+        data.extend(header);
+        data.extend(payload);
+        fs::write(&path, data).unwrap();
+        carrier::read_header(&path).unwrap()
+    };
+    let specs: Vec<(String, EncodingSpec)> = (registry::seeds().into_iter())
+        .filter(|s| s.alias == "plain/1" || s.alias == "nvfp4-w4a4/1")
+        .map(|s| (s.alias.to_string(), s.spec))
+        .collect();
+    let plan = |header: &carrier::SourceHeader| {
+        convert::plan(
+            convert::converter("diffusers.identity/1")?,
+            &[Source::Carrier {
+                component: "transformer".into(),
+                file: 0,
+                header,
+            }],
+            &Target::parse("transformer=nvfp4-w4a4/1,transformer=plain/1")?,
+            &specs,
+        )
+    };
+    plan(&carrier(false)).expect("ModelOpt's nvfp4 plans");
+    let err = plan(&carrier(true)).unwrap_err();
+    assert_eq!(err.code, Code::UNREGISTERED_ENCODING, "{}", err.detail);
+    assert!(err.detail.contains("high_first"), "{}", err.detail);
+    let _ = fs::remove_dir_all(&root);
+}
