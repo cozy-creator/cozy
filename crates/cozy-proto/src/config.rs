@@ -166,10 +166,80 @@ impl fmt::Debug for Secret {
 pub struct Hub {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    /// Canonical base URL: lowercase host, no default port, no trailing slash. Every record and
-    /// credential is keyed by it.
     #[serde(rename = "url")]
-    pub origin: String,
+    pub origin: Origin,
+}
+
+/// A Tensorhub base URL in its one spelling: lowercase scheme and host, no default port, no
+/// trailing slash. Every record and credential is keyed by it, so `https://tensorhub.com:443/`
+/// and `https://tensorhub.com` are one Hub.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+#[serde(transparent)]
+pub struct Origin(String);
+
+impl Origin {
+    pub fn parse(text: &str) -> Result<Self, Error> {
+        let text = text.trim();
+        let url = Url::parse(text).ok().filter(|u| {
+            matches!(u.scheme(), "http" | "https")
+                && u.host_str().is_some()
+                && u.username().is_empty()
+                && u.password().is_none()
+                && u.query().is_none()
+                && u.fragment().is_none()
+        });
+        match url {
+            Some(url) => Ok(Self(url.as_str().trim_end_matches('/').to_owned())),
+            None => Err(Error::new(
+                Kind::Usage,
+                "hub_invalid",
+                format!(
+                    "{text:?} is not an http or https URL without credentials, query or fragment"
+                ),
+            )),
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for Origin {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for Origin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<Origin> for String {
+    fn from(origin: Origin) -> String {
+        origin.0
+    }
+}
+
+impl PartialEq<str> for Origin {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+
+impl PartialEq<&str> for Origin {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+
+impl PartialEq<String> for Origin {
+    fn eq(&self, other: &String) -> bool {
+        &self.0 == other
+    }
 }
 
 /// What the command line contributes to the load.
@@ -237,9 +307,11 @@ impl Config {
         let mut hubs: BTreeMap<&str, &str> = [(DEFAULT_HUB, DEFAULT_HUB_URL)].into();
         hubs.extend(self.hubs.iter().map(|(n, u)| (n.as_str(), u.as_str())));
         hubs.into_iter()
-            .map(|(name, origin)| Hub {
-                name: Some(name.to_owned()),
-                origin: origin.to_owned(),
+            .filter_map(|(name, origin)| {
+                Some(Hub {
+                    name: Some(name.to_owned()),
+                    origin: Origin::parse(origin).ok()?,
+                })
             })
             .collect()
     }
@@ -261,7 +333,7 @@ impl Config {
             .next("cozy hub list")
             .next("cozy hub add <name> <url>"));
         }
-        let origin = origin(text)?;
+        let origin = Origin::parse(text)?;
         let name = hubs
             .into_iter()
             .find(|h| h.origin == origin)
@@ -296,9 +368,9 @@ impl Config {
         let mut hubs = BTreeMap::new();
         for (name, url) in std::mem::take(&mut self.hubs) {
             let lower = name.to_ascii_lowercase();
-            match (valid_name(&lower), origin(&url)) {
+            match (valid_name(&lower), Origin::parse(&url)) {
                 (true, Ok(origin)) => {
-                    hubs.insert(lower, origin);
+                    hubs.insert(lower, origin.into());
                 }
                 (false, _) => warnings.push(format!(
                     "{file}: hub name {name:?} is not letters, digits, '.', '_' or '-'; ignored"
@@ -325,7 +397,7 @@ impl Config {
 impl Hub {
     /// How a person reads it: its name, else its URL.
     pub fn label(&self) -> &str {
-        self.name.as_deref().unwrap_or(&self.origin)
+        self.name.as_deref().unwrap_or(self.origin.as_str())
     }
 
     /// This computer's device key at this Hub (hub-client's `DeviceKey`), mode 0600.
@@ -348,7 +420,7 @@ impl fmt::Display for Hub {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.name {
             Some(name) => write!(f, "{name} ({})", self.origin),
-            None => f.write_str(&self.origin),
+            None => f.write_str(self.origin.as_str()),
         }
     }
 }
@@ -368,27 +440,6 @@ pub fn valid_name(name: &str) -> bool {
             .next()
             .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
         && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "._-".contains(c))
-}
-
-/// A Tensorhub base URL's canonical spelling.
-pub fn origin(text: &str) -> Result<String, Error> {
-    let text = text.trim();
-    let url = Url::parse(text).ok().filter(|u| {
-        matches!(u.scheme(), "http" | "https")
-            && u.host_str().is_some()
-            && u.username().is_empty()
-            && u.password().is_none()
-            && u.query().is_none()
-            && u.fragment().is_none()
-    });
-    match url {
-        Some(url) => Ok(url.as_str().trim_end_matches('/').to_owned()),
-        None => Err(Error::new(
-            Kind::Usage,
-            "hub_invalid",
-            format!("{text:?} is not an http or https URL without credentials, query or fragment"),
-        )),
-    }
 }
 
 fn extract(figment: Figment, file: &str) -> Result<(Config, Vec<String>), Error> {
@@ -430,11 +481,18 @@ mod tests {
     fn urls_have_one_spelling() {
         for (text, canonical) in [
             ("HTTPS://Example.TEST:443/", "https://example.test"),
+            ("https://tensorhub.com:443", "https://tensorhub.com"),
+            ("http://Hub.test:80", "http://hub.test"),
+            ("https://hub.test:80", "https://hub.test:80"),
             ("http://127.0.0.1:8819/", "http://127.0.0.1:8819"),
             ("https://hub.test/api/", "https://hub.test/api"),
         ] {
-            assert_eq!(origin(text).unwrap(), canonical);
+            assert_eq!(Origin::parse(text).unwrap(), canonical);
         }
+        assert_eq!(
+            Origin::parse("https://tensorhub.com:443/").unwrap(),
+            Origin::parse("https://tensorhub.com").unwrap()
+        );
         for bad in [
             "ftp://x",
             "https://u:p@x",
@@ -442,7 +500,7 @@ mod tests {
             "x",
             "https://x#f",
         ] {
-            assert_eq!(origin(bad).unwrap_err().code, "hub_invalid", "{bad}");
+            assert_eq!(Origin::parse(bad).unwrap_err().code, "hub_invalid", "{bad}");
         }
     }
 

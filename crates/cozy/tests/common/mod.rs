@@ -78,7 +78,7 @@ impl Home {
         let log = std::env::var("TENSORHUB_LOG").expect("the Tensorhub's log");
         let hub = cozy_proto::config::Hub {
             name: Some("ci".into()),
-            origin: cozy_proto::config::origin(&url).unwrap(),
+            origin: cozy_proto::config::Origin::parse(&url).unwrap(),
         };
         let home = cozy_platform::paths::Home::at(self.root());
         let name = email.split('@').next().unwrap().to_owned();

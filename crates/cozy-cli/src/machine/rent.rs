@@ -40,7 +40,7 @@ pub async fn exec(ctx: &Context, rent: Rent) -> Result<ExitCode, Error> {
     let key = rent.idempotency_key.unwrap_or_else(mint_key);
     let ask = NewMachine::Rent {
         sku: sku.clone(),
-        hub: hub.origin.clone(),
+        hub: hub.origin.to_string(),
         gpus: rent.gpus,
         disk_gb: rent.disk_gb,
     };

@@ -592,7 +592,7 @@ async fn calcifer_answers_within_a_second_on_a_big_store_while_a_commit_is_stuck
         id: RunId::mint([1; 12]),
         kind: cozy_proto::calcifer::Kind::Warm,
         target: "cozy-test/held".into(),
-        hub: String::new(),
+        hub: None,
         machine: None,
         pinned: false,
         spec: common::warm_spec("https://tensorhub.com", vec![]),

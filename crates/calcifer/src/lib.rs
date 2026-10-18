@@ -30,6 +30,7 @@ use std::{
 
 use cozy_proto::{
     calcifer::{Event, On, Progress, Reason, Run, StagedInput, SubmitRun, Submitted},
+    config::Origin,
     ids::{Digest, RunId},
     machine as v1,
 };
@@ -226,11 +227,15 @@ impl Calcifer {
             Some(dir) => dir,
             None => outputs::package_outputs(&self.outputs, &submit.target),
         };
+        let hub = (!submit.hub.is_empty())
+            .then(|| Origin::parse(&submit.hub))
+            .transpose()
+            .map_err(|e| Error::Invalid(e.message))?;
         let new = NewRun {
             id: RunId::mint(random()),
             kind: submit.kind,
             target: submit.target,
-            hub: submit.hub,
+            hub,
             machine,
             pinned,
             spec: submit.spec,
@@ -911,9 +916,11 @@ impl Calcifer {
         }
         if access.hub.is_some() {
             spec.hub = access.hub;
-        } else if spec.hub.is_none() && !run.hub.is_empty() {
+        } else if spec.hub.is_none()
+            && let Some(hub) = &run.hub
+        {
             spec.hub = Some(v1::HubAccess {
-                origin: run.hub.clone(),
+                origin: hub.to_string(),
                 ..Default::default()
             });
         }

@@ -4,7 +4,7 @@
 use std::process::ExitCode;
 
 use cozy_proto::calcifer::{On, Status};
-use cozy_proto::config::Hub;
+use cozy_proto::config::{Hub, Origin};
 use cozy_proto::error::{Error, Kind};
 
 use super::Quantize;
@@ -81,7 +81,7 @@ async fn quantizer(ctx: &Context, hub: &Hub, args: &Quantize, lane: &str, compon
             let environments = machine.status.map(|s| s.environments).unwrap_or_default();
             environments
                 .into_iter()
-                .filter(|e| e.hub == hub.origin && !e.package.starts_with("local/"))
+                .filter(|e| Origin::parse(&e.hub).is_ok_and(|o| o == hub.origin) && !e.package.starts_with("local/"))
                 .map(|e| (e.package, Some(e.release).filter(|r| !r.is_empty())))
                 .collect()
         }

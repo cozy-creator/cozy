@@ -278,7 +278,7 @@ pub async fn update(
     };
     let submit = SubmitRun {
         on: On::Machine(m.name.clone()),
-        hub: hub.origin,
+        hub: hub.origin.into(),
         kind: calcifer::Kind::Update,
         target: named.join(", "),
         spec,
@@ -323,7 +323,7 @@ pub async fn toolchain(ctx: &Context, name: &str) -> Result<ExitCode, Error> {
     };
     let submit = SubmitRun {
         on: On::Machine(m.name.clone()),
-        hub: hub.origin,
+        hub: hub.origin.into(),
         kind: calcifer::Kind::Update,
         target: "toolchain (CUDA 13.0 compiler, ninja)".into(),
         spec,
