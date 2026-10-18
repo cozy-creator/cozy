@@ -367,11 +367,14 @@ async fn get(http: &reqwest::Client, url: &str) -> Result<reqwest::Response, Err
 }
 
 /// Whether release `version` is newer than `current`; one that does not parse never is.
+/// Whether release `version` replaces `current`: a newer release, or any release over a dev build
+/// (`+dev.g<sha>`), even the release it was built from.
 fn newer(version: &str, current: &str) -> bool {
     match (
         semver::Version::parse(version),
         semver::Version::parse(current),
     ) {
+        (Ok(_), Ok(current)) if current.build.as_str().starts_with("dev") => true,
         (Ok(version), Ok(current)) => version > current,
         _ => false,
     }
@@ -434,6 +437,16 @@ mod tests {
             signer,
             "https://github.com/cozy-creator/cozy-creator/.github/workflows/release.yml@refs/heads/release-v0.10.0"
         );
+    }
+
+    /// A dev build is older than every release, even the one it was built from: `cozy update`
+    /// returns it to the newest.
+    #[test]
+    fn a_release_replaces_a_dev_build() {
+        assert!(super::newer("0.10.2", "0.10.2+dev.g1234abcd"));
+        assert!(super::newer("0.10.1", "0.10.2+dev.g1234abcd"));
+        assert!(!super::newer("0.10.2", "0.10.2"));
+        assert!(super::newer("0.10.3", "0.10.2"));
     }
 
     /// cli/cli's genuine GitHub Actions provenance of its own archive verifies, but is not this repo's.

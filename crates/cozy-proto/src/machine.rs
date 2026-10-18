@@ -629,6 +629,10 @@ pub struct StatusFrame {
     pub boot_id: String,
     /// This machine's release.
     pub version: String,
+    /// The commit its `cozy` binary was built from.
+    pub commit: String,
+    /// Its binary arrived by a dev update (`cozy machine update --tensord`), not a release.
+    pub dev: bool,
     pub capabilities: Vec<String>,
     /// The sealed readiness envelope (base64); empty until sealed.
     #[serde(with = "base64_bytes")]

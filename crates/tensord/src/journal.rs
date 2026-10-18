@@ -190,7 +190,7 @@ impl ExecutorFacts {
         Self {
             pid, runtime_version, tensorfs_version,
             tensord_version: env!("CARGO_PKG_VERSION").into(),
-            tensord_commit: option_env!("TENSORD_COMMIT").map(str::to_owned),
+            tensord_commit: Some(cozy_proto::COMMIT.to_owned()),
         }
     }
 
