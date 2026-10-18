@@ -175,6 +175,55 @@
       }
     },
     "/v1/objects/{digest}": {
+      "get": {
+        "tags": [],
+        "summary": "What this signer's upload of the object holds as its parts land, as SSE `held` events after\neach MiB more, ending once it holds all `length` bytes. A stored object answers at once.",
+        "operationId": "follow_object",
+        "parameters": [
+          {
+            "name": "digest",
+            "in": "path",
+            "description": "`sha256:<hex>`",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "length",
+            "in": "query",
+            "description": "The object's length",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "SSE `event: held`",
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "$ref": "#/components/schemas/HeldBytes"
+                }
+              }
+            }
+          },
+          "507": {
+            "description": "`machine_disk_full`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            }
+          }
+        }
+      },
       "put": {
         "tags": [],
         "summary": "Lands one part of the object: the body is `Content-Range`'s bytes (without it, the whole\nobject). Parts may go side by side, in any order. Once the held ranges cover the object, the\nmachine verifies its sha256 and stores it for the signer; bytes that differ are dropped\n(`object_digest_mismatch`).",
@@ -1140,6 +1189,19 @@
               "$ref": "#/components/schemas/HeldObject"
             },
             "default": []
+          }
+        }
+      },
+      "HeldBytes": {
+        "type": "object",
+        "description": "What an upload holds, as `GET /v1/objects/sha256:<hex>?length=N` streams it (`event: held`).",
+        "properties": {
+          "held": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Bytes landed, synced or not; the last event says all N.",
+            "default": 0,
+            "minimum": 0
           }
         }
       },

@@ -409,6 +409,31 @@ mod v1_api {
         assert_eq!(until(&mut resumed, 5).await.0, (120..125).map(line).collect::<String>());
     }
 
+    /// An upload followed from before its first byte says what the machine holds as its parts
+    /// land, after each MiB more, and ends at the whole object; a stored object answers at once.
+    #[tokio::test]
+    async fn an_upload_followed_says_what_lands_and_ends_whole() {
+        let machine = Machine::start().await;
+        let (client, owner) = (client(&machine), cap(Grant { action: MACHINE.into(), ..Default::default() }));
+        let body: Vec<u8> = (0..4u32 << 20).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+        let (digest, length) = (format!("sha256:{}", tensorfs_core::sha256::hex_digest(&body)), body.len() as u64);
+        let follower = by(&client, &owner);
+        let mut held = Box::pin(follower.follow_held(&digest, length).await.unwrap());
+        assert_eq!(held.next().await.unwrap().unwrap(), 0, "nothing held before the first part");
+        let mut seen = vec![];
+        for part in body.chunks(1 << 20).enumerate() {
+            let (index, data) = part;
+            write(&client, &owner, &digest, length, (index << 20) as u64, data).await.unwrap();
+            let now = tokio::time::timeout(Duration::from_secs(30), held.next()).await;
+            seen.push(now.expect("held follows each part").unwrap().unwrap());
+        }
+        assert_eq!(seen, [1 << 20, 2 << 20, 3 << 20, 4 << 20], "after each MiB, to the whole");
+        assert!(held.next().await.is_none(), "the stream ends at the whole object");
+        let mut stored = Box::pin(follower.follow_held(&digest, length).await.unwrap());
+        assert_eq!(stored.next().await.unwrap().unwrap(), length, "a stored object answers whole");
+        assert!(stored.next().await.is_none());
+    }
+
     #[tokio::test]
     async fn run_streams_a_real_run_to_its_outcome_and_read_returns_its_output() {
         let machine = Machine::start_with(hold_classifier).await;
