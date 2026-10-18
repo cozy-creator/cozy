@@ -52,6 +52,9 @@ pub struct Status {
     pub to: Pair,
     #[serde(default)]
     pub pinned: bool,
+    /// A toolchain install, not a software pair.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub toolchain: bool,
     /// Every state it passed through: the update's run log.
     #[serde(default)]
     pub history: Vec<Step>,
@@ -128,6 +131,9 @@ pub struct Request {
     pub pin: Option<bool>,
     pub runtime: Option<Choice>,
     pub tensorfs: Option<Choice>,
+    /// Install the build toolchain (`super::toolchain`) instead of a software pair.
+    #[serde(default)]
+    pub toolchain: bool,
 }
 
 /// The activation in flight: what a rollback restores.
@@ -271,6 +277,8 @@ pub struct Updates {
     store: Option<Arc<Store>>,
     /// The running update's stop: its cancel ends the download in flight.
     stop: Mutex<PullCancellation>,
+    /// The build toolchain as last probed: at start and after each install.
+    toolchain: Mutex<Option<cozy_proto::machine::Toolchain>>,
 }
 
 impl Updates {
@@ -299,7 +307,42 @@ impl Updates {
             lifecycle,
             store,
             stop: Mutex::default(),
+            toolchain: Mutex::default(),
         }))
+    }
+
+    /// The build toolchain, probed once and again after each install.
+    pub fn toolchain(&self) -> cozy_proto::machine::Toolchain {
+        let mut held = self.toolchain.lock().unwrap();
+        if held.is_none() {
+            *held = Some(self.probe_toolchain());
+        }
+        let mut toolchain = held.clone().unwrap_or_default();
+        if let Some(status) = self.status.lock().unwrap().as_ref().filter(|s| s.toolchain) {
+            match status.state.as_str() {
+                "failed" => toolchain.detail.clone_from(&status.error),
+                state if !status.terminal() && state != "waiting" => toolchain.state = "installing".into(),
+                _ => {}
+            }
+        }
+        toolchain
+    }
+
+    fn probe_toolchain(&self) -> cozy_proto::machine::Toolchain {
+        let environment = cozy_proto::config::environment();
+        let path: Vec<PathBuf> = environment.get("PATH").map(|p| std::env::split_paths(p).collect()).unwrap_or_default();
+        let cuda_home = environment.get("CUDA_HOME").map(PathBuf::from);
+        super::toolchain::probe(&super::toolchain::dir(&self.paths.engine), cuda_home.as_deref(), &path)
+    }
+
+    /// Each kernel's verdict on this machine, as the Runtime keeps them under its kernel store.
+    pub fn kernels(&self) -> Vec<cozy_proto::machine::KernelVerdict> {
+        super::toolchain::verdicts(&self.paths.engine.join("gpu/kernels"))
+    }
+
+    /// Where the machine's toolchain lives, which executors find through their environment.
+    pub fn toolchain_dir(&self) -> PathBuf {
+        super::toolchain::dir(&self.paths.engine)
     }
 
     /// After this process proved readiness: an activation in flight is committed.
@@ -441,9 +484,9 @@ impl Updates {
                 .operation
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
-            && (request.runtime.is_some() || request.tensorfs.is_some());
+            && (request.runtime.is_some() || request.tensorfs.is_some()) != request.toolchain;
         if !valid {
-            return Err((400, "an update requires operation and a Runtime or TensorFS".into()));
+            return Err((400, "an update requires operation and a Runtime or TensorFS, or the toolchain alone".into()));
         }
         let mut current = self.status.lock().unwrap();
         if let Some(status) = current.as_ref() {
@@ -469,6 +512,7 @@ impl Updates {
             .map_err(|refused| (503, refused.to_string()))?);
         let mut status = Status {
             operation: request.operation.clone(),
+            toolchain: request.toolchain,
             from: identified(&self.paths.sdk()).map_err(server)?,
             pinned: request.pin.unwrap_or(false),
             ..Status::default()
@@ -519,6 +563,18 @@ impl Updates {
 
     fn run(&self, request: &Request, exit: fn(i32)) -> io::Result<()> {
         let from = identified(&self.paths.sdk())?;
+        // A toolchain is installed beside the software, which keeps running: nothing restarts.
+        if request.toolchain {
+            self.set(|s| {
+                s.to = from.clone();
+                s.enter("installing");
+            })?;
+            let stop = self.stop.lock().unwrap().clone();
+            let installed = super::toolchain::install(&self.toolchain_dir(), &self.paths.uv, &stop);
+            *self.toolchain.lock().unwrap() = Some(self.probe_toolchain());
+            installed?;
+            return self.set(|s| s.enter("succeeded"));
+        }
         // A named wheel file is compared by its bytes: a rebuilt wheel at the running version
         // is installed, the very wheel the machine runs is not.
         let running = |choice: &Option<Choice>, version: &str, sha256: &str| {
@@ -987,7 +1043,7 @@ mod tests {
         let file = candidate.file_name().unwrap().to_str().unwrap().to_owned();
         let (sha256, _) = updates.stage(&file, &mut fs::File::open(&candidate).unwrap()).unwrap();
         let runtime = Some(Choice { file, sha256, ..Default::default() });
-        let request = Request { operation: "u1".into(), pin: None, runtime, tensorfs: None };
+        let request = Request { operation: "u1".into(), pin: None, runtime, tensorfs: None, toolchain: false };
         updates.request(request, |code| assert_eq!(code, REPLACE_EXIT)).unwrap();
         state(&updates, "u1", "waiting_activation");
         assert!(lifecycle.admit().is_err(), "a new run was admitted during activation");
@@ -1049,6 +1105,7 @@ mod tests {
             operation: "same".into(), pin: None,
             runtime: Some(Choice { version: "0.1.0".into(), ..Default::default() }),
             tensorfs: Some(Choice { version: "0.1.0".into(), ..Default::default() }),
+            toolchain: false,
         };
         updates.request(request, |_| panic!("an unchanged update restarted the service")).unwrap();
         loop {
@@ -1220,6 +1277,7 @@ mod tests {
             operation: "next".into(), pin: None,
             runtime: Some(Choice { version: "0.2.0".into(), ..Default::default() }),
             tensorfs: None,
+            toolchain: false,
         };
         let rejected = updates.request(next, |_| panic!("unsettled cleanup started an update")).unwrap_err();
         assert_eq!(rejected.0, 500);
@@ -1253,7 +1311,7 @@ mod tests {
         let (sha256, _) = updates.stage(&file, &mut fs::File::open(wheel).unwrap()).unwrap();
         Request {
             operation: id.into(), pin: None,
-            runtime: Some(Choice { file, sha256, ..Default::default() }), tensorfs: None,
+            runtime: Some(Choice { file, sha256, ..Default::default() }), tensorfs: None, toolchain: false,
         }
     }
 

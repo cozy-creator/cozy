@@ -242,8 +242,9 @@ pub async fn exec(ctx: &Context, id: &str, once: bool) -> Result<ExitCode, Error
             }
         }
     }
-    if !follow::settled(&run) {
-        follow::next(ctx, &run);
+    match follow::settled(&run) {
+        true => follow::toolchain_offer(ctx, &run),
+        false => follow::next(ctx, &run),
     }
     Ok(ExitCode::SUCCESS)
 }

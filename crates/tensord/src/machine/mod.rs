@@ -14,4 +14,5 @@ pub mod pypi;
 pub mod receipt;
 pub mod ssh;
 pub mod supervise;
+pub mod toolchain;
 pub mod update;

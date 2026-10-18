@@ -67,8 +67,10 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
             m.name
         ));
     }
-    record
-        .note("this machine does not report its driver floor, toolchain or kernel verification yet")
-        .print(ctx);
+    if status.toolchain.is_none() {
+        record = record
+            .note("this machine is older than this cozy: it reports no driver floor, toolchain or kernels");
+    }
+    record.print(ctx);
     Ok(ExitCode::SUCCESS)
 }

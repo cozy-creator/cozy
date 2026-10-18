@@ -258,7 +258,63 @@ pub fn status_fields(status: &MachineStatus) -> Vec<(String, String)> {
         ));
     }
     fields.push(("live runs".into(), status.live_runs.to_string()));
+    if !status.driver_floor.is_empty() {
+        let old: Vec<String> = status
+            .gpus
+            .iter()
+            .filter(|gpu| older(&gpu.driver, &status.driver_floor))
+            .map(|gpu| {
+                format!(
+                    "GPU {}'s driver {} is older: update it",
+                    gpu.index, gpu.driver
+                )
+            })
+            .collect();
+        let floor = match old.is_empty() {
+            true => format!("{} (met)", status.driver_floor),
+            false => format!("{}; {}", status.driver_floor, old.join("; ")),
+        };
+        fields.push(("driver floor".into(), floor));
+    }
+    if let Some(toolchain) = &status.toolchain {
+        let cell = match toolchain.state.as_str() {
+            "ready" => format!("ready: {} · {}", toolchain.nvcc, toolchain.host_compiler),
+            "installing" => "installing".into(),
+            state => {
+                let mut cell = format!(
+                    "{state}: missing {}; cards without a prebuilt kernel use the slower SDPA/kitchen path",
+                    toolchain.missing.join(", ")
+                );
+                if !toolchain.detail.is_empty() {
+                    cell += &format!(" ({})", toolchain.detail);
+                }
+                cell += "; cozy machine toolchain install";
+                if !toolchain.install.is_empty() {
+                    cell += &format!(", and for a host compiler: {}", toolchain.install);
+                }
+                cell
+            }
+        };
+        fields.push(("toolchain".into(), cell));
+    }
+    for kernel in &status.kernels {
+        let verdict = match kernel.ok {
+            true => format!("verified: {}", kernel.detail),
+            false => format!("refused: {}", kernel.detail),
+        };
+        fields.push((
+            format!("kernel {} sm{}", kernel.kernel, kernel.sm),
+            format!("{verdict} (driver {})", kernel.driver),
+        ));
+    }
     fields
+}
+
+/// Whether driver `version` is older than `floor`, by their dotted numbers; unreadable is not.
+fn older(version: &str, floor: &str) -> bool {
+    let parts =
+        |v: &str| -> Option<Vec<u32>> { v.trim().split('.').map(|p| p.parse().ok()).collect() };
+    matches!((parts(version), parts(floor)), (Some(v), Some(f)) if v < f)
 }
 
 fn kind(m: &Machine) -> &'static str {

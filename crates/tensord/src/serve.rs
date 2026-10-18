@@ -318,6 +318,7 @@ fn run_machine(config: config::Config, mut ready: crate::machine::supervise::Rea
             // A rented pod is the machine's alone (its grant says so); anywhere else it is a guest.
             "host": {"mode": if rental { "dedicated" } else { "shared" }},
             "image_kernels": (!gpus.is_empty()).then(|| image_kernels(&layout.root, &paths.sdk())).flatten(),
+            "toolchain": crate::machine::toolchain::dir(&engine),
         });
         // The operator's GPU settings, when the machine root has them, over these defaults.
         if let Ok(file) = std::fs::File::open(layout.state.join("gpu-config.json")) {

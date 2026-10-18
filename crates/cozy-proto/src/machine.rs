@@ -656,6 +656,44 @@ pub struct StatusFrame {
     pub webrtc: Option<WebRtc>,
     /// The caller's warm set, each with what it holds now.
     pub warm: Vec<WarmItem>,
+    /// The oldest NVIDIA driver this machine's kernels run on; empty: no GPU stack.
+    pub driver_floor: String,
+    /// What builds kernels here when no prebuilt one serves the card.
+    pub toolchain: Toolchain,
+    /// Each native kernel's verdict on this machine's cards, as the Runtime keeps it.
+    pub kernels: Vec<KernelVerdict>,
+}
+
+/// The machine's build toolchain: CUDA's compiler and a host C/C++ compiler.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct Toolchain {
+    /// ready, absent, installing, failed
+    pub state: String,
+    /// `nvcc --version`'s release line; empty: none found.
+    pub nvcc: String,
+    /// The host compiler's first version line; empty: none found.
+    pub host_compiler: String,
+    /// What it lacks: `nvcc`, `cc`, `ninja`.
+    pub missing: Vec<String>,
+    /// The OS's own command for a missing host compiler; empty when none is missing or known.
+    pub install: String,
+    /// Why the last install failed.
+    pub detail: String,
+}
+
+/// One kernel's verification on this machine (the Runtime's `verify_op`), keyed by its
+/// artifact, the card's architecture and the driver.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct KernelVerdict {
+    pub kernel: String,
+    pub artifact: String,
+    pub sm: u32,
+    pub driver: String,
+    pub ok: bool,
+    /// What was measured, or why it failed.
+    pub detail: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, ToSchema)]

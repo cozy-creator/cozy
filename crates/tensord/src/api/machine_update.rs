@@ -44,6 +44,8 @@ pub(super) fn owns(
 struct Cohort {
     runtime: Option<Member>,
     tensorfs: Option<Member>,
+    /// `"install"`: the build toolchain, alone (`cozy machine toolchain install`).
+    toolchain: Option<String>,
     #[serde(flatten)]
     unknown: BTreeMap<String, serde_json::Value>,
 }
@@ -202,11 +204,19 @@ fn stage(
             ..Default::default()
         }))
     };
+    let toolchain = match cohort.toolchain.as_deref() {
+        None => false,
+        Some("install") => true,
+        Some(other) => {
+            return Err(Error::validation("toolchain_unknown", format!("the toolchain is installed, not {other:?}")));
+        }
+    };
     let request = Request {
         operation: id.into(),
         pin: None,
         runtime: choose("runtime", cohort.runtime)?,
         tensorfs: choose("tensorfs", cohort.tensorfs)?,
+        toolchain,
     };
     updates
         .request(request, |code| std::process::exit(code))

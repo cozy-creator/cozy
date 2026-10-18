@@ -95,6 +95,10 @@ pub struct GpuConfig {
     /// Explicitly configured locations; the executor seal is imposed on top of them.
     #[serde(default)]
     pub environment: BTreeMap<String, String>,
+    /// The machine's build toolchain (`cozy machine toolchain install`): once it holds nvcc,
+    /// executors started after find it through CUDA_HOME and PATH.
+    #[serde(default)]
+    pub toolchain: Option<PathBuf>,
     /// `OMP_NUM_THREADS` the seal imposes. torch's allocator is the Runtime's, set in code.
     #[serde(default = "threads")]
     pub threads: u32,
@@ -2474,7 +2478,10 @@ impl Pool {
             python: held.record.python.clone(),
             root,
             socket,
-            environment: self.config.environment.clone(),
+            environment: match &self.config.toolchain {
+                Some(dir) => crate::machine::toolchain::environment(&self.config.environment, dir, ""),
+                None => self.config.environment.clone(),
+            },
             seal,
             generation_hold: Some(held.retention()),
             identity: self.config.identity,

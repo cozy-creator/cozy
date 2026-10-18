@@ -316,7 +316,17 @@ fn adjustment(row: &Adjustment) -> String {
     line
 }
 
-/// What to do next with `run`: watch it while it goes on, show it when it did not succeed.
+/// The Runtime's warnings a local compile would answer (K's codes): the toolchain is offered,
+/// never installed on its own.
+const TOOLCHAIN_WOULD_HELP: [&str; 4] = [
+    "kernel_prebuilt_missing",
+    "kernel_verify_failed",
+    "extension_needs_toolchain",
+    "triton_no_compiler",
+];
+
+/// What to do next with `run`: watch it while it goes on, show it when it did not succeed, and
+/// the machine's toolchain when a warning says a local compile would have served it.
 pub(super) fn next(ctx: &Context, run: &Run) {
     let watch = format!("cozy run watch {}", run.number);
     let show = format!("cozy run show {}", run.number);
@@ -324,6 +334,22 @@ pub(super) fn next(ctx: &Context, run: &Run) {
         Status::Completed => {}
         Status::Failed | Status::Canceled => output::next(ctx, &[&show]),
         _ => output::next(ctx, &[&watch]),
+    }
+    toolchain_offer(ctx, run);
+}
+
+/// `cozy machine toolchain install` when a warning of `run` says a local compile would have
+/// served it.
+pub(super) fn toolchain_offer(ctx: &Context, run: &Run) {
+    let compile = run
+        .warnings
+        .iter()
+        .any(|w| TOOLCHAIN_WOULD_HELP.contains(&w.code.as_str()));
+    if let (true, Some(machine)) = (compile, &run.machine) {
+        output::next(
+            ctx,
+            &[&format!("cozy machine toolchain install --on {machine}")],
+        );
     }
 }
 
