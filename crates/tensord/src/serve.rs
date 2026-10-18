@@ -352,6 +352,15 @@ fn run_machine(config: config::Config, mut ready: crate::machine::supervise::Rea
     // The client this binary embeds; the installer helper over it is made at the first install.
     let uv = crate::machine::client::uv(&layout.root);
     let wheel = crate::machine::client::wheel(&engine)?;
+    let mut sdk = crate::published::PackageSdk::selected(&paths.sdk(), &layout.root, uv);
+    // A local machine installs releases through its owner's uv cache, as its local packages do;
+    // a cache of its own from before is no longer read (environments keep their linked files).
+    if !rental {
+        sdk.owner_uv = crate::published::OwnerUv::of(cozy_proto::config::environment());
+        if sdk.owner_uv.is_some() {
+            let _ = std::fs::remove_dir_all(engine.join("published/uv-cache"));
+        }
+    }
     start_api(
         &engine,
         &generations,
@@ -362,7 +371,7 @@ fn run_machine(config: config::Config, mut ready: crate::machine::supervise::Rea
         Some(crate::machine::client::helper_python(&engine)),
         Some(wheel),
         "3.12".into(),
-        crate::published::PackageSdk::selected(&paths.sdk(), &layout.root, uv),
+        sdk,
         // A run naming no Hub reads this rental's own Hub's public content.
         grant.hub.clone().filter(|_| rental),
         Some(logs),
