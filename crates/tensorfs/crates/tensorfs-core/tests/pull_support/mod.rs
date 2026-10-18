@@ -1,10 +1,9 @@
-//! What the pull tests share: a filesystem store in the design §4 layout, a checkpoint written
-//! as a static origin, and two real loopback origins: `python -m http.server`, and a small
+//! What the pull tests share: the v2 store, a checkpoint written as a static origin, and two real loopback origins: `python -m http.server`, and a small
 //! server that injects faults on chosen asks.
 #![allow(dead_code)]
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fs::{self, File};
+use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -13,12 +12,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use sha2::{Digest, Sha256};
-use tensorfs_core::err::{refuse, Code, Refusal, Result};
-use tensorfs_core::fetch::{Admission, Client, ObjectStore, SourcePolicy};
+use tensorfs_core::fetch::{Client, SourcePolicy};
 use tensorfs_core::format::{
     Body, Component, Dtype, Header, Location, Manifest, ObjectRef, Release, Repo, Tensor,
 };
+use tensorfs_core::store2::Store;
 
 pub const MIB: usize = 1 << 20;
 
@@ -62,99 +60,9 @@ pub fn client() -> Client {
 
 // ------------------------------------------------------------------ the store
 
-/// `blobs/aa/bb/<sha256>` and `tmp/`: put streams into tmp, hashes, renames.
-pub struct DirStore {
-    pub root: PathBuf,
-}
-
-impl DirStore {
-    pub fn new(root: &Path) -> Arc<DirStore> {
-        fs::create_dir_all(root.join("tmp")).unwrap();
-        Arc::new(DirStore {
-            root: root.to_path_buf(),
-        })
-    }
-}
-
-impl ObjectStore for DirStore {
-    fn has(&self, object: &ObjectRef) -> bool {
-        fs::metadata(self.root.join(object.key())).is_ok_and(|m| m.len() == object.length)
-    }
-
-    fn open(&self, object: &ObjectRef) -> std::io::Result<File> {
-        File::open(self.root.join(object.key()))
-    }
-
-    fn admit(&self, object: &ObjectRef) -> Result<Box<dyn Admission>> {
-        static UNIQUE: AtomicU64 = AtomicU64::new(0);
-        let temp = self.root.join("tmp").join(format!(
-            "put-{}-{}",
-            std::process::id(),
-            UNIQUE.fetch_add(1, Ordering::Relaxed)
-        ));
-        let file = File::create(&temp).map_err(|e| Refusal {
-            code: Code::IO_FAILED,
-            detail: e.to_string(),
-        })?;
-        Ok(Box::new(Put {
-            file,
-            temp: Some(temp),
-            hash: Sha256::new(),
-            length: 0,
-            object: object.clone(),
-            root: self.root.clone(),
-        }))
-    }
-}
-
-struct Put {
-    file: File,
-    temp: Option<PathBuf>,
-    hash: Sha256,
-    length: u64,
-    object: ObjectRef,
-    root: PathBuf,
-}
-
-impl Admission for Put {
-    fn write(&mut self, bytes: &[u8]) -> Result<()> {
-        self.file.write_all(bytes).map_err(|e| Refusal {
-            code: Code::IO_FAILED,
-            detail: e.to_string(),
-        })?;
-        self.hash.update(bytes);
-        self.length += bytes.len() as u64;
-        Ok(())
-    }
-
-    fn commit(mut self: Box<Self>) -> Result<()> {
-        let got = hex(&std::mem::take(&mut self.hash).finalize());
-        if got != self.object.sha256 || self.length != self.object.length {
-            return refuse(
-                Code::OBJECT_ID_MISMATCH,
-                format!(
-                    "expected sha256:{} ({} B), got sha256:{got} ({} B)",
-                    self.object.sha256, self.object.length, self.length
-                ),
-            );
-        }
-        let io = |e: std::io::Error| Refusal {
-            code: Code::IO_FAILED,
-            detail: e.to_string(),
-        };
-        self.file.sync_all().map_err(io)?;
-        let blob = self.root.join(self.object.key());
-        fs::create_dir_all(blob.parent().unwrap()).map_err(io)?;
-        fs::rename(self.temp.take().unwrap(), &blob).map_err(io)
-    }
-}
-
-impl Drop for Put {
-    fn drop(&mut self) {
-        if let Some(temp) = self.temp.take() {
-            let _ = fs::remove_file(temp);
-        }
-    }
+/// The v2 store at `root`, which the fetcher admits through.
+pub fn open_store(root: &Path) -> Arc<Store> {
+    Arc::new(Store::open(root).unwrap())
 }
 
 pub fn hex(bytes: &[u8]) -> String {

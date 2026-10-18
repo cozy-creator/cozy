@@ -7,9 +7,7 @@ use std::path::PathBuf;
 
 use super::{fail, Result, Store};
 use crate::format::layout::ALIGN;
-use crate::format::{
-    self, decode, Body, Header, Location, Manifest, ObjectRef, PartBytes, Tensor,
-};
+use crate::format::{self, decode, Body, Header, Location, Manifest, ObjectRef, PartBytes, Tensor};
 
 /// A checkpoint in a store: the parsed manifest and header, and where each chunk lives.
 #[derive(Clone, Debug)]

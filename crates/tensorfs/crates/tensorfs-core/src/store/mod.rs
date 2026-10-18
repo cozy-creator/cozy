@@ -18,8 +18,8 @@ mod records;
 
 pub use checkpoint::{Checkpoint, ChunkRead, Piece, Placed, ReadPlan};
 pub use gc::{Collected, PinUsage, Usage};
-pub use records::Pin;
 pub(crate) use records::is_name;
+pub use records::Pin;
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};

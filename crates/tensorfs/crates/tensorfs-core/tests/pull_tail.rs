@@ -16,7 +16,7 @@ use tensorfs_core::fetch::{Config, Fetcher, HttpOrigin, ObjectStore, Origin, Wan
 async fn pull(server: &Server, name: &str, config: Config) -> (Duration, Fetcher, Scratch) {
     let root = temporary(&format!("{}-store", name.replace('/', "-")));
     let fetcher = Fetcher::new(
-        DirStore::new(&root) as Arc<dyn ObjectStore>,
+        open_store(&root) as Arc<dyn ObjectStore>,
         client(),
         None,
         config,

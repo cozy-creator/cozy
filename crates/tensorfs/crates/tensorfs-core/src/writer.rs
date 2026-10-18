@@ -286,7 +286,9 @@ impl Writer {
         let mut files = self.files.clone();
         let (mut metadata, mut tree) = (Metadata::new(), Metadata::new());
         let base = self.base.take();
-        let carried = base.as_ref().map(|b| self.carry(b, &mut tensors, &mut files));
+        let carried = base
+            .as_ref()
+            .map(|b| self.carry(b, &mut tensors, &mut files));
         if let Some(b) = &base {
             (metadata, tree) = (b.header().metadata.clone(), b.manifest().metadata.clone());
         }
@@ -339,7 +341,8 @@ impl Writer {
                 _ => {}
             }
         }
-        for (chunk, members) in packs {
+        for (chunk, mut members) in packs {
+            members.sort_by_key(|i| plan.places[*i].offset);
             let mut admission = self.store.admit(None)?;
             let mut end = 0;
             for i in members {
@@ -350,14 +353,22 @@ impl Writer {
                     At::Spool(offset) => {
                         let mut spool = &self.spool;
                         let at = self.dir.join(SPOOL);
-                        spool.seek(SeekFrom::Start(*offset)).map_err(fail("seek", at))?;
+                        spool
+                            .seek(SeekFrom::Start(*offset))
+                            .map_err(fail("seek", at))?;
                         Box::new(spool)
                     }
                     At::Ranges(ranges) => Box::new(Ranges::new(&self.store, ranges)),
                     At::Grid(_) => unreachable!("grid parts are standalone"),
                 };
                 let what = format!("{}/{}", list[i].0.component, list[i].0.key);
-                pour(&mut src, &mut admission, stored.length, &mut self.buffer, &what)?;
+                pour(
+                    &mut src,
+                    &mut admission,
+                    stored.length,
+                    &mut self.buffer,
+                    &what,
+                )?;
                 end = place.offset + stored.length;
             }
             let object = admission.finish()?;
@@ -379,9 +390,19 @@ impl Writer {
                     encoding: encoding.clone(),
                     parts: (e.parts.iter())
                         .map(|(role, s)| {
-                            let Location { chunk, offset, length } = at(role);
+                            let Location {
+                                chunk,
+                                offset,
+                                length,
+                            } = at(role);
                             let (dtype, shape) = (s.dtype.clone(), s.shape.clone());
-                            let part = Part { dtype, shape, chunk, offset, length };
+                            let part = Part {
+                                dtype,
+                                shape,
+                                chunk,
+                                offset,
+                                length,
+                            };
                             (role.clone(), part)
                         })
                         .collect(),
@@ -397,7 +418,10 @@ impl Writer {
         }
         if !components.is_empty() {
             let header = Header {
-                chunks: chunks.into_iter().map(|c| c.expect("every chunk is laid")).collect(),
+                chunks: chunks
+                    .into_iter()
+                    .map(|c| c.expect("every chunk is laid"))
+                    .collect(),
                 components,
                 metadata,
             };
@@ -519,7 +543,9 @@ impl Writer {
     /// one another writer laid off the grid is split onto it, a small one is read in place.
     fn adopt(&mut self, component: &str, key: &str, from: &Checkpoint) -> Result<Entry> {
         if from.store().root() != self.store.root() {
-            return Err(bad("copy takes tensors from a checkpoint of the same store"));
+            return Err(bad(
+                "copy takes tensors from a checkpoint of the same store",
+            ));
         }
         let tensor = from.tensor(component, key)?;
         let (header, what) = (from.header(), format!("{component}/{key}"));
@@ -541,14 +567,23 @@ impl Writer {
                 }
             }
             let last = ranges.len().saturating_sub(1);
-            let on_grid = ranges.iter().enumerate().all(|(i, (object, start, length))| {
-                *start == 0 && *length == object.length && (i == last || *length == GRID)
-            });
+            let on_grid = ranges
+                .iter()
+                .enumerate()
+                .all(|(i, (object, start, length))| {
+                    *start == 0 && *length == object.length && (i == last || *length == GRID)
+                });
             let place = match (at.length >= STANDALONE, on_grid) {
                 (true, true) => At::Grid(ranges.into_iter().map(|r| r.0).collect()),
                 (true, false) => {
                     let mut src = Ranges::new(&self.store, &ranges);
-                    At::Grid(grid(&self.store, &mut self.buffer, &mut src, at.length, &what)?)
+                    At::Grid(grid(
+                        &self.store,
+                        &mut self.buffer,
+                        &mut src,
+                        at.length,
+                        &what,
+                    )?)
                 }
                 (false, _) => At::Ranges(ranges),
             };
@@ -587,7 +622,8 @@ impl Writer {
             Some(length) => (length, data),
             None if dtype.bits().is_none() => {
                 let mut all = Vec::new();
-                data.read_to_end(&mut all).map_err(fail("read", &self.dir))?;
+                data.read_to_end(&mut all)
+                    .map_err(fail("read", &self.dir))?;
                 owned = all;
                 slice = &owned;
                 (owned.len() as u64, &mut slice)
@@ -696,7 +732,9 @@ impl Writer {
             good += line.len();
         }
         if good < bytes.len() {
-            journal.set_len(good as u64).map_err(fail("truncate", &path))?;
+            journal
+                .set_len(good as u64)
+                .map_err(fail("truncate", &path))?;
         }
         for line in lines {
             self.apply(line);
@@ -800,7 +838,8 @@ impl Sink for Writer {
     }
 
     fn commit(&mut self, imported: &Imported) -> err::Result<()> {
-        let list = |items: &[String]| Value::List(items.iter().map(|s| Value::Str(s.clone())).collect());
+        let list =
+            |items: &[String]| Value::List(items.iter().map(|s| Value::Str(s.clone())).collect());
         self.set_metadata("normalized", imported.normalized.into());
         self.set_metadata("converters", list(&imported.converters));
         self.set_metadata("sources", list(&imported.sources));

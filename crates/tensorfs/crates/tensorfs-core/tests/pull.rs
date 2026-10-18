@@ -12,6 +12,7 @@ use tensorfs_core::err::Code;
 use tensorfs_core::fetch::{
     Config, Fetcher, HttpOrigin, ObjectStore, Origin, Progress, VolumeOrigin, Want,
 };
+use tensorfs_core::store2::Store;
 
 const SAMPLE: Duration = Duration::from_millis(10);
 
@@ -22,7 +23,7 @@ fn config() -> Config {
     }
 }
 
-fn fetcher(store: &Arc<DirStore>, volume: Option<VolumeOrigin>) -> Fetcher {
+fn fetcher(store: &Arc<Store>, volume: Option<VolumeOrigin>) -> Fetcher {
     Fetcher::new(
         Arc::clone(store) as Arc<dyn ObjectStore>,
         client(),
@@ -58,7 +59,7 @@ async fn a_pull_from_python_http_server_is_bit_identical() {
     let origin = http(&python.base);
 
     let root = temporary("python-store");
-    let store = DirStore::new(&root);
+    let store = open_store(&root);
     let fetcher = fetcher(&store, None);
     let progress = Progress::default();
     let want = Want {
@@ -94,7 +95,7 @@ async fn a_pull_from_python_http_server_is_bit_identical() {
     );
 
     let vae_root = temporary("python-vae");
-    let vae_store = DirStore::new(&vae_root);
+    let vae_store = open_store(&vae_root);
     let vae = ["vae".to_string()];
     let partial = crate::fetcher(&vae_store, None)
         .pull(
@@ -163,7 +164,7 @@ async fn a_corrupted_object_is_refused_and_refetched() {
         }),
     );
     let root = temporary("corrupt-store");
-    let store = DirStore::new(&root);
+    let store = open_store(&root);
     let fetcher = fetcher(&store, None);
     let origin = http(&server.base);
     let refused = fetcher
@@ -207,7 +208,7 @@ async fn the_volume_is_written_back_and_serves_the_next_machine() {
         temporary("volume-b"),
         temporary("volume-c"),
     );
-    let a = fetcher(&DirStore::new(&a_root), Some(volume.clone()));
+    let a = fetcher(&open_store(&a_root), Some(volume.clone()));
     let pulled = a
         .pull(&origin, "acme/shared", None, Some("int8"), &all())
         .await
@@ -222,7 +223,7 @@ async fn the_volume_is_written_back_and_serves_the_next_machine() {
     assert_eq!(a.stats().volume_written, model.objects.len() as u64);
 
     let asked = server.blob_asks().len();
-    let b = fetcher(&DirStore::new(&b_root), Some(volume.clone()));
+    let b = fetcher(&open_store(&b_root), Some(volume.clone()));
     let pulled = b
         .pull(&origin, "acme/shared", None, Some("int8"), &all())
         .await
@@ -244,7 +245,7 @@ async fn the_volume_is_written_back_and_serves_the_next_machine() {
     let path = volume_dir.join(bad.key());
     std::fs::remove_file(&path).unwrap();
     std::fs::write(&path, &bytes).unwrap();
-    let c = fetcher(&DirStore::new(&c_root), Some(volume.clone()));
+    let c = fetcher(&open_store(&c_root), Some(volume.clone()));
     let pulled = c
         .pull(&origin, "acme/shared", None, Some("int8"), &all())
         .await
@@ -277,7 +278,7 @@ async fn https_trusts_a_private_ca_only_when_named() {
         tensorfs_core::fetch::Client::with_roots(policy.clone(), pem.as_bytes()).unwrap();
     let root = temporary("tls-store");
     let fetcher = Fetcher::new(
-        DirStore::new(&root) as Arc<dyn ObjectStore>,
+        open_store(&root) as Arc<dyn ObjectStore>,
         trusting.clone(),
         None,
         config(),
@@ -325,8 +326,11 @@ async fn a_private_origin_writes_nothing_to_the_volume() {
     );
     let (volume_dir, root) = (temporary("private-volume"), temporary("private-store"));
     let fetcher = fetcher(
-        &DirStore::new(&root),
-        Some(VolumeOrigin::new(volume_dir.to_path_buf(), Duration::from_secs(60))),
+        &open_store(&root),
+        Some(VolumeOrigin::new(
+            volume_dir.to_path_buf(),
+            Duration::from_secs(60),
+        )),
     );
     let pulled = fetcher
         .pull(&origin, "acme/private", None, Some("int8"), &all())
@@ -368,7 +372,7 @@ async fn a_hung_volume_is_left_alone_until_it_answers() {
     let volume = VolumeOrigin::new(volume_dir.to_path_buf(), Duration::from_secs(60));
 
     let root = temporary("hung-store");
-    let fetcher = fetcher(&DirStore::new(&root), Some(volume.clone()));
+    let fetcher = fetcher(&open_store(&root), Some(volume.clone()));
     let pulled = fetcher
         .pull(&origin, "acme/hung", None, Some("int8"), &all())
         .await
@@ -397,7 +401,7 @@ async fn a_hung_volume_is_left_alone_until_it_answers() {
     for attempt in 0..100 {
         let fresh = temporary(&format!("hung-after-{attempt}"));
         let next = Fetcher::new(
-            DirStore::new(&fresh) as Arc<dyn ObjectStore>,
+            open_store(&fresh) as Arc<dyn ObjectStore>,
             client(),
             Some(volume.clone()),
             config(),
@@ -445,7 +449,7 @@ async fn an_object_is_fetched_once_and_priority_orders_the_queue() {
     );
     let origin = http(&server.base);
     let root = temporary("order-store");
-    let store = DirStore::new(&root);
+    let store = open_store(&root);
     // A coarse tick: the held answer must not be judged a stall (that is the tail tests' job).
     let config = Config {
         tick: Duration::from_millis(100),
@@ -515,7 +519,7 @@ async fn a_pull_where_nothing_lands_ends_and_quotes_the_last_answer() {
         }),
     );
     let root = temporary("never-store");
-    let fetcher = fetcher(&DirStore::new(&root), None);
+    let fetcher = fetcher(&open_store(&root), None);
     let started = std::time::Instant::now();
     let refused = fetcher
         .pull(
