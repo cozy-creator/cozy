@@ -18,10 +18,9 @@ use crate::checkpoint::{self as ck, build_manifest};
 use crate::dtype::{checked_bytes, Dtype};
 use crate::err::{refuse, Code, Refusal, Result};
 use crate::header::{Closure, Header, Part, Tensor};
-use crate::ids::{ascii_name, hex64, Doc, ObjectRef, Plain};
+use crate::ids::{ascii_name, ObjectRef, Plain};
 use crate::limits;
 use crate::manifest::Manifest;
-use crate::repository::{Mutation, ReleaseLane, RepositoryName};
 use crate::spec::EncodingSpec;
 use crate::store::Store;
 
@@ -240,35 +239,6 @@ pub fn read_session(store_root: &Path, session: &str) -> Result<IngestSession> {
     }
 }
 
-/// Explicitly abandon every session whose writer is gone. Candidate blobs remain unreferenced
-/// content-addressed bytes until ordinary GC.
-///
-/// The operation's retained writer marker arbitrates this against a live worker or install.
-pub fn reap(store: &Store) -> Result<(Vec<String>, Vec<String>)> {
-    let store_root = store.root();
-    let base = store_root.join("tmp").join("ingest");
-    let (mut gone, mut kept) = (Vec::new(), Vec::new());
-    let rd = match fs::read_dir(&base) {
-        Ok(r) => r,
-        Err(_) => return Ok((gone, kept)),
-    };
-    for e in rd.flatten() {
-        let name = e.file_name().to_string_lossy().to_string();
-        let catalog = crate::catalog::Catalog::open(store.root())?;
-        match catalog.abandon(&name, true) {
-            Ok(()) => {
-                fs::remove_dir_all(e.path()).map_err(|err| io("reap session", err))?;
-                gone.push(name);
-            }
-            Err(error) if error.code == Code::STORE_BUSY => kept.push(name),
-            Err(error) => return Err(error),
-        }
-    }
-    gone.sort();
-    kept.sort();
-    Ok((gone, kept))
-}
-
 pub fn sessions(store: &Store) -> Vec<String> {
     let base = store.root().join("tmp").join("ingest");
     let mut sessions: Vec<String> = fs::read_dir(base)
@@ -281,162 +251,6 @@ pub fn sessions(store: &Store) -> Vec<String> {
     sessions.sort();
     sessions
 }
-
-/// The coordinator's act. The receipt must bind the exact triple it is presented with, the
-/// manifest must walk, and the candidate root must still exist.
-///
-/// Durable visibility is the repository release CAS. The operation's exact SQLite holds
-/// bridge every final key to that CAS and release only after it commits.
-pub struct Install<'a> {
-    pub session: &'a str,
-    pub receipt: &'a super::IngestVerificationReceipt,
-    pub subject: &'a super::IngestSubject,
-    pub manifest: &'a Manifest,
-    pub header: &'a Header,
-    pub stamp: &'a super::stamp::Stamp,
-    pub repo: RepositoryName,
-    pub version: &'a str,
-    pub lane: &'a str,
-    pub observed_repository: Option<&'a str>,
-}
-
-pub fn install(store: &Store, request: Install<'_>) -> Result<String> {
-    let Install {
-        session,
-        receipt,
-        subject,
-        manifest: snap,
-        header,
-        stamp,
-        repo,
-        version,
-        lane,
-        observed_repository,
-    } = request;
-    receipt.binds(subject, snap, header, stamp)?;
-    let walk = ck::walk(store, snap)?;
-    // Containment is not residency: a root never commits over missing objects (tfs-020).
-    walk.require_resident(store)?;
-    let id = snap.manifest_id();
-    read_session(store.root(), session)?;
-    let manifest = ObjectRef {
-        sha256: id.trim_start_matches("sha256:").to_string(),
-        length: snap.canonical_bytes().len() as u64,
-    };
-    let local_mutation = if repo.org == "local" {
-        if lane != "local" {
-            return refuse(Code::KEY_GRAMMAR, "local ingest requires lane local");
-        }
-        hex64("local source selection", version)?;
-        Some(Mutation::ReplaceLocal {
-            repo: repo.clone(),
-            manifest: manifest.clone(),
-            version: version.to_string(),
-        })
-    } else {
-        None
-    };
-    let path = store.repository_path(&repo);
-    let current = match fs::read(&path) {
-        Ok(bytes) => Some(bytes),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(io("read repository before ingest install", error)),
-    };
-    if repo.org == "local" {
-        let expected = observed_repository.ok_or_else(|| Refusal {
-            code: Code::MISSING_FIELD,
-            detail: "local ingest install requires --observed <sha256:...|absent>".into(),
-        })?;
-        match (expected, current.as_deref()) {
-            ("absent", None) => {}
-            ("absent", Some(_)) => {
-                return refuse(
-                    Code::REPOSITORY_CONFLICT,
-                    "local alias exists but the caller observed absence",
-                )
-            }
-            (digest, Some(bytes)) => {
-                let expected = crate::ids::prefixed("observed repository", digest)?;
-                let repository = crate::repository::Repository::parse(bytes)?;
-                repository.local_checkpoint()?;
-                let actual = format!("sha256:{}", repository.document_sha256());
-                if actual != expected {
-                    return refuse(
-                        Code::REPOSITORY_CONFLICT,
-                        format!("observed local repository {expected}, current is {actual}"),
-                    );
-                }
-            }
-            (_, None) => {
-                return refuse(
-                    Code::REPOSITORY_CONFLICT,
-                    "local alias is absent but the caller observed repository bytes",
-                )
-            }
-        }
-    }
-    if repo.org == "local" {
-        store.apply_repository(
-            current.as_deref(),
-            local_mutation.as_ref().expect("local mutation"),
-            &Default::default(),
-        )?;
-    } else {
-        let checkpointed = store
-            .apply_repository(
-                current.as_deref(),
-                &Mutation::PutCheckpoint {
-                    repo: repo.clone(),
-                    manifest: manifest.clone(),
-                },
-                &Default::default(),
-            )?
-            .expect("put_checkpoint retains the repository");
-        let expected_revision = checkpointed
-            .releases
-            .iter()
-            .find(|release| release.version == version)
-            .map_or(0, |release| release.revision);
-        let mutation = Mutation::UpdateRelease {
-            expected_revision,
-            repo: repo.clone(),
-            remove: Vec::new(),
-            set: vec![ReleaseLane {
-                extra: Default::default(),
-                lane: lane.to_string(),
-                manifest,
-            }],
-            version: version.to_string(),
-        };
-        store.apply_repository(
-            Some(&checkpointed.canonical_bytes()),
-            &mutation,
-            &Default::default(),
-        )?;
-    }
-    crate::catalog::Catalog::open(store.root())?.complete_operation(session)?;
-    let _ = fs::remove_dir_all(candidate_dir(store.root(), session));
-    Ok(id)
-}
-
-/// Installed checkpoints — the VISIBLE set, read from the AUTHORITY rather than from the
-/// rendering beside it. A crash mid-ingest must leave this unchanged.
-pub fn installed(store: &Store) -> Vec<String> {
-    let mut out: Vec<String> =
-        match crate::storage::Census::open(store.root()).and_then(|census| census.projection()) {
-            Ok(projection) => projection
-                .releases
-                .into_iter()
-                .map(|release| release.manifest_sha256)
-                .collect(),
-            Err(_) => Vec::new(),
-        };
-    out.sort();
-    out.dedup();
-    out
-}
-
-// ---------------------------------------------------------------- executing a plan
 
 #[derive(Debug)]
 pub struct Outcome {
@@ -1103,32 +917,6 @@ mod tests {
             open_root(&store, "session", "other").unwrap_err().code,
             Code::TRANSACTION_CONFLICT
         );
-        let _ = fs::remove_dir_all(path);
-    }
-
-    #[test]
-    fn session_has_no_clock_and_explicit_reap_waits_for_the_writer() {
-        let path = temporary("explicit-reap");
-        let store = Store::init(&path).unwrap();
-        let (root, writer) = open_root(&store, "session", "tenant").unwrap();
-        assert_eq!(
-            String::from_utf8(root.canonical_bytes()).unwrap(),
-            format!(
-                r#"{{"candidates":[],"session":"session","tenant":"tenant","tensorfs":"{}"}}"#,
-                crate::VERSION
-            )
-        );
-
-        let (gone, kept) = reap(&store).unwrap();
-        assert!(gone.is_empty());
-        assert_eq!(kept, ["session"]);
-        assert!(candidate_dir(&path, "session").is_dir());
-
-        drop(writer);
-        let (gone, kept) = reap(&store).unwrap();
-        assert_eq!(gone, ["session"]);
-        assert!(kept.is_empty());
-        assert!(!candidate_dir(&path, "session").exists());
         let _ = fs::remove_dir_all(path);
     }
 }

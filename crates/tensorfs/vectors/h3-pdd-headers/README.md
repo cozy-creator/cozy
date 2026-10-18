@@ -8,6 +8,4 @@ with alpha64 and PDD block size4. Each source profile selects exactly one carrie
 and preserves its keys under one adapter component. The producer owns collapsing
 heads, forming modulation tables and constructing the serving overlay.
 
-Verify the bank with `uv run --no-project scripts/rebank-h3-pdd.py --tfs /path/to/tfs`.
-The script creates temporary sparse geometry for the native header reader. Those
-holes never establish tensor-value or conversion correctness.
+No converter table claims these adapters: an import stores them as they are.

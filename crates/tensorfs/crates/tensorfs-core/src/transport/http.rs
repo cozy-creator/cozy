@@ -817,6 +817,21 @@ impl<'l> Response<'l> {
         stated_wait(&self.headers)
     }
 
+    /// The whole body, streamed into `out`; the bytes written.
+    pub fn read_into(mut self, out: &mut dyn std::io::Write) -> Result<u64> {
+        let mut buf = vec![0u8; 1 << 20];
+        let mut total = 0;
+        loop {
+            let n = self.body.read_refusing(&mut buf)?;
+            if n == 0 {
+                return Ok(total);
+            }
+            out.write_all(&buf[..n])
+                .map_err(|e| crate::store::classify_io("write a download", e))?;
+            total += n as u64;
+        }
+    }
+
     /// The whole body, refused above `cap` rather than truncated.
     pub fn read_capped(mut self, cap: usize) -> Result<Vec<u8>> {
         let mut out = Vec::new();

@@ -154,6 +154,35 @@ pub fn fetch_prefix(
     }
 }
 
+/// One GET of `url`'s bytes `from..to` (`to` absent: to its end), streamed into `out`; the
+/// bytes written.
+#[allow(clippy::too_many_arguments)]
+pub fn get_into(
+    url: &str,
+    policy: &SourcePolicy,
+    credential: &dyn CredentialProvider,
+    from: u64,
+    to: Option<u64>,
+    out: &mut dyn std::io::Write,
+    deadline: Deadline,
+    ledger: &Ledger,
+) -> Result<u64> {
+    let range = match to {
+        Some(to) => format!("bytes={from}-{}", to.saturating_sub(1)),
+        None => format!("bytes={from}-"),
+    };
+    let ranged = from > 0 || to.is_some();
+    let extra = [("range".to_string(), range)];
+    let response = open_following_with(url, policy, credential, deadline, ledger, if ranged { &extra } else { &[] })?;
+    match (response.status, ranged) {
+        (200, false) | (206, true) => response.read_into(out),
+        (status, _) => refuse(
+            Code::TRANSFER_FAILED,
+            format!("origin answered HTTP {status} to a download of bytes {from}..{to:?}"),
+        ),
+    }
+}
+
 fn open_following<'l>(
     url: &str,
     policy: &SourcePolicy,

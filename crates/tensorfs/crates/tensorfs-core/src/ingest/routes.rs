@@ -1,14 +1,7 @@
 //! Routed converters: a single-file checkpoint becomes its target pipeline's canonical
 //! checkpoint in the one ingest pass, driven by a generated route table.
 //!
-//! Each table (`routes/<family>.routes.json`) is derived by `scripts/single-file-routes.py`
-//! from diffusers' own single-file converters and the target census on meta, per family spec
-//! (`routes/<family>.spec.json`). Per component it lists the constructor's exact key order and
-//! how each key's bytes come from one source run; geometry is read from the carrier:
-//!   rekey     — the source run streams through under its canonical key
-//!   squeeze   — trailing unit axes drop (`[c, c, 1, 1]` conv to `[c, c]` linear)
-//!   split k n — row block `k` of `n` equal blocks (OpenCLIP's fused q|k|v), one run
-//!   transpose — a matrix becomes `[cols, rows]`
+//! The v1 tables (`routes/<family>.routes.json`), frozen; `crate::import` holds their successors.
 //! A key outside the table refuses; its `drop`/`optional` source keys are not constructed.
 //! A carrier's keys belong to the component with the longest matching prefix (Anima's `net.`
 //! DiT and its `net.llm_adapter.` conditioner share one file). Floating sources narrow to the

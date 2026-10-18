@@ -1157,39 +1157,6 @@ pub fn plan_source(
     .map(|(plan, _)| plan)
 }
 
-pub fn golden_bytes(name: &str, length: u64) -> Vec<u8> {
-    let mut seed = u64::from_le_bytes(
-        crate::sha256::digest(name.as_bytes())[0..8]
-            .try_into()
-            .unwrap(),
-    );
-    let mut source = vec![0u8; length as usize];
-    for chunk in source.chunks_mut(8) {
-        seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut value = seed;
-        value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        let bytes = (value ^ (value >> 31)).to_le_bytes();
-        chunk.copy_from_slice(&bytes[..chunk.len()]);
-    }
-    source
-}
-
-pub fn golden_suite(converter: &Converter) -> Result<usize> {
-    let mut count = 0;
-    for (name, transform) in convert::golden_cases(converter) {
-        let source = golden_bytes(name, transform.in_bytes());
-        if !transform.reassembles(&source)? {
-            return refuse(
-                Code::GOLDEN_MISMATCH,
-                format!("{}: golden case {name} does not reassemble", converter.name),
-            );
-        }
-        count += 1;
-    }
-    Ok(count)
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelSourceProfile {
     pub slot: String,
@@ -2397,15 +2364,6 @@ pub fn snapshot_model_source(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Every converter's frozen geometries reassemble bit for bit: checked here, once, not
-    /// on every preparation.
-    #[test]
-    fn every_converters_golden_cases_reassemble() {
-        for converter in convert::CONVERTERS.iter() {
-            golden_suite(converter).unwrap();
-        }
-    }
 
     use crate::catalog::Catalog;
     use crate::ingest::fingerprint::{Provenance, REAL};

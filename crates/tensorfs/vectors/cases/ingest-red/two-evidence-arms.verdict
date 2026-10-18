@@ -1,4 +1,0 @@
-doc: receipt
-expect: refuse
-code: EVIDENCE_ARM_AMBIGUOUS
-note: exactly one evidence arm

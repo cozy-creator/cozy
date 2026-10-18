@@ -37,8 +37,7 @@ const USAGE: &str = "usage: tfs <verb> ...
   gc plan <census> --holds <jsonl> --out <jsonl>
   put|get <root> ..., reap <root>
   fetch <root> <ref> --hub <base> [--lane <lane>]
-  checkpoint write <root> [--plain] [--blocks <n>] [--no-configs]
-  ingest bank <dialect> <converter> ..., ingest source-members|source-plan|plan|run|install|reap ...";
+  checkpoint write <root> [--plain] [--blocks <n>] [--no-configs]";
 
 /// Flags that never take a value.
 const SWITCHES: &[&str] = &[
@@ -117,30 +116,6 @@ fn main() -> ExitCode {
         ["key", kind, rest @ ..] => repo::cmd_key(kind, rest),
         ["gc", "headers", census] => repo::cmd_gc_headers(Path::new(census), &flags),
         ["gc", "plan", census] => repo::cmd_gc_plan(Path::new(census), &flags),
-        ["ingest", "bank", dia, conv] => ingest::cmd_bank(dia, conv, &flags),
-        ["ingest", "source-members", profiles @ ..] => ingest::cmd_source_members(profiles, &flags),
-        ["ingest", "source-plan"] => ingest::cmd_source_plan(&flags),
-        ["ingest", "plan"] => match flag(&flags, "source-plan") {
-            Some(path) => ingest::cmd_plan_source(Path::new(path)),
-            None => {
-                eprintln!("ingest plan requires a target or --source-plan <json>");
-                ExitCode::from(2)
-            }
-        },
-        ["ingest", "plan", t] => ingest::cmd_plan(t, &flags),
-        ["ingest", "run", r] => match flag(&flags, "source-plan") {
-            Some(path) => ingest::cmd_run_source(Path::new(r), Path::new(path)),
-            None => {
-                eprintln!("ingest run requires a target or --source-plan <json>");
-                ExitCode::from(2)
-            }
-        },
-        ["ingest", "run", r, t] => ingest::cmd_run(Path::new(r), t, &flags),
-        ["ingest-worker", r, t] => ingest::cmd_worker(Path::new(r), t, &flags),
-        ["ingest", "install", r, s, org, name, version, lane] => {
-            ingest::cmd_install(Path::new(r), s, org, name, version, lane, &flags)
-        }
-        ["ingest", "reap", r] => ingest::cmd_reap(Path::new(r), &flags),
         ["fetch", r, refspec] => fetch::cmd_fetch(Path::new(r), refspec, &flags),
         ["cbor", "encode", f] => cmd_cbor("encode", Path::new(f), &flags),
         ["cbor", "decode", f] => cmd_cbor("decode", Path::new(f), &flags),
@@ -229,10 +204,8 @@ fn bail(e: Refusal) -> ExitCode {
 
 mod ckpt;
 mod fetch;
-mod ingest;
 mod repo;
 mod snap;
-mod watch;
 
 /// `tfs store init <root>`, recording or clearing its disk budget.
 fn cmd_store_init(root: &Path, flags: &Flags) -> ExitCode {
