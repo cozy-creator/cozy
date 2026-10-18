@@ -48,10 +48,9 @@ fn copy(from: &Path, to: &Path) {
 #[test]
 fn local_code_runs_on_a_real_machine_and_runs_again_as_edited() {
     let Some(home) = Home::new() else { return };
-    if std::env::var_os("COZY_TEST_TENSORD").is_none() {
-        eprintln!("skipped: no TensorD (COZY_TEST_TENSORD is unset)");
+    let Some(_) = common::needs("COZY_TEST_TENSORD", common::TENSORD) else {
         return;
-    }
+    };
     let _machine = common::tensord::added(&home, "m1");
     let work = home.path().join("work");
     std::fs::create_dir_all(&work).unwrap();
@@ -123,10 +122,9 @@ fn local_code_runs_on_a_real_machine_and_runs_again_as_edited() {
 #[test]
 fn a_local_wheel_a_path_source_names_is_carried_to_the_machine() {
     let Some(home) = Home::new() else { return };
-    if std::env::var_os("COZY_TEST_TENSORD").is_none() {
-        eprintln!("skipped: no TensorD (COZY_TEST_TENSORD is unset)");
+    let Some(_) = common::needs("COZY_TEST_TENSORD", common::TENSORD) else {
         return;
-    }
+    };
     let _machine = common::tensord::added(&home, "m1");
     let work = home.path().join("work");
     let write = |path: &str, text: &str| {
@@ -216,10 +214,9 @@ fn a_local_wheel_a_path_source_names_is_carried_to_the_machine() {
 fn a_followed_run_returns_only_once_its_outputs_landed() {
     use sha2::{Digest as _, Sha256};
     let Some(home) = Home::new() else { return };
-    if std::env::var_os("COZY_TEST_TENSORD").is_none() {
-        eprintln!("skipped: no TensorD (COZY_TEST_TENSORD is unset)");
+    let Some(_) = common::needs("COZY_TEST_TENSORD", common::TENSORD) else {
         return;
-    }
+    };
     let _machine = common::tensord::added(&home, "m1");
     let work = home.path().join("work");
     std::fs::create_dir_all(&work).unwrap();
@@ -276,10 +273,9 @@ fn a_followed_run_returns_only_once_its_outputs_landed() {
 #[test]
 fn outputs_land_in_their_packages_folder_unless_the_run_names_one() {
     let Some(home) = Home::new() else { return };
-    if std::env::var_os("COZY_TEST_TENSORD").is_none() {
-        eprintln!("skipped: no TensorD (COZY_TEST_TENSORD is unset)");
+    let Some(_) = common::needs("COZY_TEST_TENSORD", common::TENSORD) else {
         return;
-    }
+    };
     let _machine = common::tensord::added(&home, "m1");
     let work = home.path().join("work");
     std::fs::create_dir_all(&work).unwrap();
@@ -339,10 +335,9 @@ fn warm_targets(home: &Home, dir: &Path) -> Vec<String> {
 #[test]
 fn unchanged_local_code_is_called_at_once_and_an_edit_only_syncs() {
     let Some(home) = Home::new() else { return };
-    if std::env::var_os("COZY_TEST_TENSORD").is_none() {
-        eprintln!("skipped: no TensorD (COZY_TEST_TENSORD is unset)");
+    let Some(_) = common::needs("COZY_TEST_TENSORD", common::TENSORD) else {
         return;
-    }
+    };
     let _machine = common::tensord::added(&home, "m1");
     let work = home.path().join("work");
     copy(
@@ -426,10 +421,9 @@ fn unchanged_local_code_is_called_at_once_and_an_edit_only_syncs() {
 #[test]
 fn a_waiting_run_says_why_and_stops_saying_it_once_it_no_longer_waits() {
     let Some(home) = Home::new() else { return };
-    if std::env::var_os("COZY_TEST_TENSORD").is_none() {
-        eprintln!("skipped: no TensorD (COZY_TEST_TENSORD is unset)");
+    let Some(_) = common::needs("COZY_TEST_TENSORD", common::TENSORD) else {
         return;
-    }
+    };
     let _machine = common::tensord::added(&home, "m1");
     let work = home.path().join("work");
     copy(
@@ -522,10 +516,9 @@ fn a_waiting_run_says_why_and_stops_saying_it_once_it_no_longer_waits() {
 #[test]
 fn a_runs_adjustments_reach_its_record() {
     let Some(home) = Home::new() else { return };
-    if std::env::var_os("COZY_TEST_TENSORD").is_none() {
-        eprintln!("skipped: no TensorD (COZY_TEST_TENSORD is unset)");
+    let Some(_) = common::needs("COZY_TEST_TENSORD", common::TENSORD) else {
         return;
-    }
+    };
     let _machine = common::tensord::added(&home, "m1");
     let work = home.path().join("work");
     copy(
@@ -571,10 +564,9 @@ fn a_runs_adjustments_reach_its_record() {
 #[test]
 fn an_attention_kernel_pin_reaches_the_executor_and_run_show() {
     let Some(home) = Home::new() else { return };
-    if std::env::var_os("COZY_TEST_TENSORD").is_none() {
-        eprintln!("skipped: no TensorD (COZY_TEST_TENSORD is unset)");
+    let Some(_) = common::needs("COZY_TEST_TENSORD", common::TENSORD) else {
         return;
-    }
+    };
     let _machine = common::tensord::added(&home, "m1");
     let work = home.path().join("work");
     copy(
@@ -634,10 +626,9 @@ fn an_attention_kernel_pin_reaches_the_executor_and_run_show() {
 #[test]
 fn asset_fidelity_reaches_the_package_by_label_or_index() {
     let Some(home) = Home::new() else { return };
-    if std::env::var_os("COZY_TEST_TENSORD").is_none() {
-        eprintln!("skipped: no TensorD (COZY_TEST_TENSORD is unset)");
+    let Some(_) = common::needs("COZY_TEST_TENSORD", common::TENSORD) else {
         return;
-    }
+    };
     let _machine = common::tensord::added(&home, "m1");
     let work = home.path().join("work");
     copy(
@@ -754,10 +745,9 @@ impl Relay {
 #[test]
 fn a_second_run_reuses_the_video_and_image_its_machine_holds() {
     let Some(home) = Home::new() else { return };
-    if std::env::var_os("COZY_TEST_TENSORD").is_none() {
-        eprintln!("skipped: no TensorD (COZY_TEST_TENSORD is unset)");
+    let Some(_) = common::needs("COZY_TEST_TENSORD", common::TENSORD) else {
         return;
-    }
+    };
     let port = std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()

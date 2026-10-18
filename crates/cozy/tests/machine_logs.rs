@@ -23,10 +23,9 @@ fn lines(out: &common::Out) -> Vec<Value> {
 #[test]
 fn a_machines_logs_read_and_follow_what_it_did() {
     let Some(home) = Home::new() else { return };
-    if std::env::var_os("COZY_TEST_TENSORD").is_none() {
-        eprintln!("skipped: no TensorD (COZY_TEST_TENSORD is unset)");
+    let Some(_) = common::needs("COZY_TEST_TENSORD", common::TENSORD) else {
         return;
-    }
+    };
     let machine = common::tensord::added(&home, "m1");
 
     let unknown = home.cozy(["machine", "logs", "nosuch", "--json"]);
@@ -37,7 +36,10 @@ fn a_machines_logs_read_and_follow_what_it_did() {
     );
     // Its own log: TensorD's lines since it started.
     let own = lines(&home.cozy(["machine", "logs", "m1", "-n", "0", "--json"]));
-    assert!(!own.is_empty() && own.iter().all(|l| l["log"] == "tensord"), "{own:?}");
+    assert!(
+        !own.is_empty() && own.iter().all(|l| l["log"] == "tensord"),
+        "{own:?}"
+    );
 
     // A download writes the transport log; its lines read back whole, newest last.
     let out = home.cozy([
@@ -109,7 +111,11 @@ fn a_machines_logs_read_and_follow_what_it_did() {
         }
     };
     let kept: Vec<&str> = read.iter().map(|l| l["text"].as_str().unwrap()).collect();
-    assert_eq!(until(kept.last().unwrap()), kept, "the kept lines, in order");
+    assert_eq!(
+        until(kept.last().unwrap()),
+        kept,
+        "the kept lines, in order"
+    );
     let out = home.cozy([
         "--json",
         "model",

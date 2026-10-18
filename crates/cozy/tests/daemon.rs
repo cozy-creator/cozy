@@ -225,13 +225,9 @@ fn commands_racing_down_reach_a_live_calcifer() {
 #[test]
 fn status_shows_the_machines() {
     let Some(home) = Home::new() else { return };
-    if std::env::var_os("COZY_TEST_TENSORD").is_none() {
-        let _ = writeln!(
-            std::io::stderr(),
-            "skipped: no TensorD (COZY_TEST_TENSORD is unset)"
-        );
+    let Some(_) = common::needs("COZY_TEST_TENSORD", common::TENSORD) else {
         return;
-    }
+    };
     let _machine = common::tensord::added(&home, "box");
     let status = home.json(["status", "--json"]);
     let machines = status["machines"].as_array().unwrap();

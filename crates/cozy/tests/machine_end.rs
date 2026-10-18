@@ -70,10 +70,9 @@ fn throttled(upstream: String, rate: f64) -> String {
 #[test]
 fn ending_a_machine_waits_for_its_runs_outputs_to_land() {
     let Some(home) = Home::new() else { return };
-    if std::env::var_os("COZY_TEST_TENSORD").is_none() {
-        eprintln!("skipped: no TensorD (COZY_TEST_TENSORD is unset)");
+    let Some(_) = common::needs("COZY_TEST_TENSORD", common::TENSORD) else {
         return;
-    }
+    };
     // Added as a person adds one, then reached only through a 4 MB/s link.
     let mut machine = tensord::Tensord::start(&[tensord::stranger()]);
     // Its TLS leaf outlives a restart.
