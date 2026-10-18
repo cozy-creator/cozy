@@ -88,10 +88,9 @@ fn files(dir: &Path) -> Vec<PathBuf> {
 #[test]
 fn published_functions_run_to_completion_on_a_real_machine() {
     let Some(home) = Home::with_hub() else { return };
-    if std::env::var_os("COZY_TEST_TENSORD").is_none() {
-        eprintln!("skipped: no TensorD (COZY_TEST_TENSORD is unset)");
+    let Some(_) = common::needs("COZY_TEST_TENSORD", common::TENSORD) else {
         return;
-    }
+    };
     let account = home.sign_in("runner@cozy.test");
     publish(&home, "tiny");
     publish(&home, "tiny-output");

@@ -20,8 +20,7 @@ async fn a_hub_is_listed_signed_in_and_a_rent_it_will_not_price_records_nothing(
     let var = |name| std::env::var(name).ok().filter(|v: &String| !v.is_empty());
     // The job's SSL_CERT_FILE trusts the Hub's origin.
     let (Some(url), Some(log)) = (var("TENSORHUB_ORIGIN"), var("TENSORHUB_LOG")) else {
-        eprintln!("skipped: TENSORHUB_ORIGIN and TENSORHUB_LOG name no hub");
-        return;
+        return no_hub();
     };
     let home = tempfile::tempdir().unwrap();
     let origin = config::Origin::parse(&url).unwrap().to_string();
@@ -154,8 +153,7 @@ async fn a_runs_capability_is_bound_to_its_machine_and_traded_at_its_hub() {
     let var = |name| std::env::var(name).ok().filter(|v: &String| !v.is_empty());
     // The job's SSL_CERT_FILE trusts the Hub's origin, which machines read too.
     let (Some(url), Some(log)) = (var("TENSORHUB_ORIGIN"), var("TENSORHUB_LOG")) else {
-        eprintln!("skipped: TENSORHUB_ORIGIN and TENSORHUB_LOG name no hub");
-        return;
+        return no_hub();
     };
     let home = tempfile::tempdir().unwrap();
     let origin = config::Origin::parse(&url).unwrap().to_string();
@@ -343,4 +341,15 @@ fn machine_spelling(origin: &str) -> String {
         (false, _) => ":80",
     };
     format!("{}://{rest}{port}/", scheme.to_uppercase())
+}
+
+/// A hosted job without a Hub fails the test, so a green run means it ran: tensorhub's cozy_ref
+/// job names one. Elsewhere it skips, saying why.
+fn no_hub() {
+    assert!(
+        std::env::var_os("GITHUB_ACTIONS").is_none(),
+        "TENSORHUB_ORIGIN and TENSORHUB_LOG are unset; the job must provide a Tensorhub: \
+         run it in tensorhub's dev-build cozy_ref job"
+    );
+    eprintln!("skipped: TENSORHUB_ORIGIN and TENSORHUB_LOG name no hub");
 }

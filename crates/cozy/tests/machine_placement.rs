@@ -22,10 +22,10 @@ fn rental(home: &Home, name: &str) -> Value {
 fn a_rental_placed_off_its_requesters_continent_says_why() {
     let Some(home) = Home::with_hub() else { return };
     // The job names it empty when no client address was asked for.
-    if std::env::var_os("COZY_TEST_CLIENT_IP").is_none_or(|ip| ip.is_empty()) {
-        eprintln!("skipped: the Hub knows no client continent (COZY_TEST_CLIENT_IP is unset)");
+    let client = "a client continent: tensorhub's cozy_ref job with cozy_client_ip";
+    let Some(_) = common::needs("COZY_TEST_CLIENT_IP", client) else {
         return;
-    }
+    };
     home.sign_in("placed@cozy.test");
 
     // The Hub places a rental after it accepts the order: the boot's follower says why.

@@ -53,10 +53,9 @@ fn held(home: &Home) -> Vec<(String, String)> {
 #[test]
 fn local_code_installs_live_on_a_machine() {
     let Some(home) = Home::new() else { return };
-    if std::env::var_os("COZY_TEST_TENSORD").is_none() {
-        eprintln!("skipped: no TensorD (COZY_TEST_TENSORD is unset)");
+    let Some(_) = common::needs("COZY_TEST_TENSORD", common::TENSORD) else {
         return;
-    }
+    };
     let _machine = tensord::added(&home, "t1");
 
     let project = package::project(&home, "tiny");

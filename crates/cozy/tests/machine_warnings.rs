@@ -38,38 +38,40 @@ fn rental(home: &Home, name: &str) -> Value {
         .clone()
 }
 
-/// The docker container this rental runs in: the one publishing its machine's port, else the one
-/// container whose TensorD answers `pidof`.
-fn container(machine: &Value) -> String {
-    let address = machine["address"].as_str().unwrap_or_default();
-    let port = address.rsplit(':').next().unwrap_or_default();
-    let filter = format!("publish={port}");
-    let published = run("docker".as_ref(), &["ps", "-q", "--filter", &filter]);
-    let all = run("docker".as_ref(), &["ps", "-q"]);
-    let holds = |id: &&str| {
-        let probe = Command::new("docker")
-            .args(["exec", id, "pidof", "tensord"])
-            .output();
-        probe.is_ok_and(|out| out.status.success())
+/// The machine processes of the one rental this test holds, as the host numbers them: what its
+/// container runs as `tensord` or as the `cozy` binary's machine role. Signaled from the host,
+/// they stop even as their container's first process.
+fn machine_processes(machine: &Value) -> Vec<String> {
+    let docker = std::ffi::OsStr::new("docker");
+    let named = |line: &str| match line.split_whitespace().collect::<Vec<_>>()[..] {
+        [pid, "tensord" | "cozy"] => Some(pid.to_owned()),
+        _ => None,
     };
-    let found: Vec<&str> = match published.lines().count() {
-        1 => published.lines().collect(),
-        _ => all.lines().filter(holds).collect(),
-    };
-    match found[..] {
-        [id] => id.to_owned(),
-        _ => panic!("no one container holds {machine}: {found:?}"),
+    let ids = run(docker, &["ps", "-q"]);
+    let found: Vec<Vec<String>> = ids
+        .lines()
+        .map(|id| {
+            run(docker, &["top", id, "-eo", "pid,comm"])
+                .lines()
+                .filter_map(named)
+                .collect()
+        })
+        .filter(|pids: &Vec<String>| !pids.is_empty())
+        .collect();
+    match &found[..] {
+        [pids] => pids.clone(),
+        _ => panic!("no one container holds the machine {machine}: {found:?}"),
     }
 }
 
 #[test]
 fn a_rentals_hub_warnings_reach_whoever_meets_it() {
     let Some(home) = Home::with_hub() else { return };
+    const HUB: &str = "the Hub's binary and database: tensorhub's cozy_ref job names both";
     let (Some(admin), Some(database)) = (
-        std::env::var_os("TENSORHUB_ADMIN"),
-        std::env::var_os("TENSORHUB_DATABASE_URL"),
+        common::needs("TENSORHUB_ADMIN", HUB),
+        common::needs("TENSORHUB_DATABASE_URL", HUB),
     ) else {
-        eprintln!("skipped: no Hub to administer (TENSORHUB_ADMIN is unset)");
         return;
     };
     let account = home.sign_in("warned@cozy.test");
@@ -105,11 +107,15 @@ fn a_rentals_hub_warnings_reach_whoever_meets_it() {
         "{listed:?}"
     );
 
-    // TensorD frozen in its container: docker reports it running, and the Hub cannot reach it.
-    let container = container(&machine);
+    // The machine frozen in its container: docker reports it running, and the Hub cannot reach it.
+    let pids = machine_processes(&machine);
     let signal = |sig: &str| {
-        let line = format!("kill -{sig} $(pidof tensord)");
-        run("docker".as_ref(), &["exec", &container, "sh", "-c", &line]);
+        let sig = format!("-{sig}");
+        let args: Vec<&str> = ["-n", "kill", sig.as_str()]
+            .into_iter()
+            .chain(pids.iter().map(String::as_str))
+            .collect();
+        run("sudo".as_ref(), &args);
     };
     signal("STOP");
     // A hang bound for a Hub that never notices; the product waits on its own passes.

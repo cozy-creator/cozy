@@ -25,10 +25,7 @@ const PATIENCE: Duration = Duration::from_secs(600);
 /// the package. `None` off the job.
 fn owner(email: &str) -> Option<(Home, String, String)> {
     let home = Home::with_hub()?;
-    if std::env::var_os("COZY_TEST_TENSORD").is_none() {
-        eprintln!("skipped: no TensorD (COZY_TEST_TENSORD is unset)");
-        return None;
-    }
+    common::needs("COZY_TEST_TENSORD", common::TENSORD)?;
     let account = home.sign_in(email);
     let package = common::package::publish(&home, "h3-standin", "1.0.0");
     Some((home, account, package))
@@ -614,14 +611,15 @@ fn a_rental_ended_the_moment_its_run_returns_loses_nothing() {
 /// says how far the upload is as it moves, and completes with the clip whole on the machine.
 #[test]
 fn a_clip_uploads_over_a_slow_link_with_progress_and_the_run_completes() {
-    let (Ok(port), Ok(rate)) = (
-        std::env::var("COZY_TEST_SHAPED_PORT"),
-        std::env::var("COZY_TEST_SHAPED_BPS"),
+    const SHAPED: &str = "a shaped link: owner-day.yml shapes the loopback";
+    let (Some(port), Some(rate)) = (
+        common::needs("COZY_TEST_SHAPED_PORT", SHAPED),
+        common::needs("COZY_TEST_SHAPED_BPS", SHAPED),
     ) else {
-        eprintln!("skipped: no shaped link (COZY_TEST_SHAPED_PORT, COZY_TEST_SHAPED_BPS)");
         return;
     };
-    let (port, rate): (u16, f64) = (port.parse().unwrap(), rate.parse().unwrap());
+    let port: u16 = port.to_str().unwrap().parse().unwrap();
+    let rate: f64 = rate.to_str().unwrap().parse().unwrap();
     let Some((home, _, package)) = owner("slow@cozy.test") else {
         return;
     };

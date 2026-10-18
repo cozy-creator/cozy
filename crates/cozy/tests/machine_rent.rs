@@ -126,10 +126,10 @@ fn machine_usage_refusals() {
 fn a_rental_is_asked_once_per_key_and_ends_with_the_hubs_proof() {
     let Some(home) = Home::with_hub() else { return };
     let skus = home.json(["machine", "rent", "--json"]);
-    if !skus.as_array().unwrap().iter().any(|s| s["name"] == "cpu") {
-        eprintln!("skipped: the Hub offers no cpu product (its docker provider is off)");
-        return;
-    }
+    assert!(
+        skus.as_array().unwrap().iter().any(|s| s["name"] == "cpu"),
+        "the Hub offers no cpu product: the job's hub_set must turn its docker provider on"
+    );
     home.sign_in("renter@example.com");
     let ask = [
         "machine",

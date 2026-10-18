@@ -26,6 +26,25 @@ pub struct Home {
     binary: std::cell::RefCell<PathBuf>,
 }
 
+/// What COZY_TEST_TENSORD names, for `needs`.
+pub const TENSORD: &str = "a TensorD: this workspace's `cargo build -p tensord` (owner-day.yml and \
+     tensorhub's cozy_ref job build it)";
+
+/// What the job must provide for a test to run. On a hosted runner a missing one fails the test,
+/// naming it, so a green run means every test ran; on any other computer the test skips, saying
+/// why. An empty value is missing.
+pub fn needs(var: &str, provides: &str) -> Option<std::ffi::OsString> {
+    if let Some(value) = std::env::var_os(var).filter(|v| !v.is_empty()) {
+        return Some(value);
+    }
+    assert!(
+        std::env::var_os("GITHUB_ACTIONS").is_none(),
+        "{var} is unset; the job must provide {provides}"
+    );
+    let _ = writeln!(std::io::stderr(), "skipped: {var} is unset ({provides})");
+    None
+}
+
 /// One finished `cozy` process.
 #[derive(Debug)]
 pub struct Out {
@@ -53,16 +72,13 @@ impl Home {
     }
 
     /// A fresh home whose current Hub is the job's Tensorhub at its public origin
-    /// (`TENSORHUB_ORIGIN`, Tensorhub's dev-build `cozy_ref` job, trusted through the job's
-    /// `SSL_CERT_FILE`), as a person's names tensorhub.com; `None` without one.
+    /// (`TENSORHUB_ORIGIN`, trusted through the job's `SSL_CERT_FILE`), as a person's names
+    /// tensorhub.com. A hosted job without one fails the test (`needs`).
     pub fn with_hub() -> Option<Self> {
-        let Some(url) = std::env::var_os("TENSORHUB_ORIGIN") else {
-            let _ = writeln!(
-                std::io::stderr(),
-                "skipped: no Tensorhub (TENSORHUB_ORIGIN is unset)"
-            );
-            return None;
-        };
+        let url = needs(
+            "TENSORHUB_ORIGIN",
+            "a Tensorhub: run it in tensorhub's dev-build cozy_ref job or owner-day.yml",
+        )?;
         let home = Self::new()?;
         home.write_config(&format!(
             "hub = \"ci\"\n[hubs]\nci = \"{}\"\n",
