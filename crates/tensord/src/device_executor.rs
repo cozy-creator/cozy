@@ -2506,7 +2506,11 @@ mod link_tests {
     /// An executor whose channel's other end the test speaks as the Runtime, and whose process
     /// (what its watches observe) is a `sleep`.
     fn executor() -> (Arc<DeviceExecutor>, UnixStream, Child) {
-        let process = Command::new("sleep").arg("600").spawn().unwrap();
+        let (executor, runtime, process) = sampled(Liveness::default());
+        (Arc::new(executor), runtime, process)
+    }
+    fn sampled(liveness: Liveness) -> (DeviceExecutor, UnixStream, Child) {
+        let process = Command::new("sleep").arg("600").process_group(0).spawn().unwrap();
         let birth = Birth::of(process.id()).unwrap();
         let (machine, runtime) = UnixStream::pair().unwrap();
         let link = Arc::new(Link::default());
@@ -2521,7 +2525,7 @@ mod link_tests {
             link,
             birth,
             hello: Hello::default(),
-            liveness: Liveness::default(),
+            liveness,
             socket: PathBuf::new(),
             _generation_hold: None,
             codec: Arc::new(Codec::new(codec, root.join("codec.log"))),
@@ -2530,7 +2534,7 @@ mod link_tests {
             worst_gap: Mutex::default(),
             memo: None,
         };
-        (Arc::new(executor), runtime, process)
+        (executor, runtime, process)
     }
     fn prepare(id: &str) -> DeviceCommand {
         DeviceCommand::PrepareRequest {
@@ -2691,5 +2695,56 @@ mod link_tests {
             process.kill().unwrap();
             process.wait().unwrap();
         }
+    }
+
+    /// A cancel escalates on its own call only (#1503): a canceled call that stops leaves the
+    /// executor and the call beside it running past its patience; one that ignores its cancel,
+    /// frames and all, gets the executor killed, and returns the cancel's verdict.
+    #[test]
+    fn only_a_canceled_call_that_ignores_its_cancel_ends_the_executor() {
+        let liveness = Liveness { sample: Duration::from_millis(20) };
+        let (executor, mut runtime, mut process) = sampled(liveness);
+        let (executor, patience) = (Arc::new(executor), liveness.floor());
+        let invoke = |id: &'static str| {
+            let executor = executor.clone();
+            std::thread::spawn(move || {
+                let command = DeviceCommand::Invoke {
+                    max_output_bytes: 0,
+                    request_id: id.into(),
+                    construction: "c".into(),
+                    entrypoint: "e".into(),
+                    spool: PathBuf::new(),
+                    deadline_s: None,
+                    attention_kernel: String::new(),
+                    bits: 0,
+                    inputs: BTreeMap::new(),
+                    trees: BTreeMap::new(),
+                    floor_bytes: None,
+                    device_weights: None,
+                    sources: BTreeMap::new(),
+                    weights: BTreeMap::new(),
+                };
+                executor.command(&command, &mut Baseline)
+            })
+        };
+        let (a, b) = (invoke("a"), invoke("b"));
+        commands(&mut runtime, 2);
+        executor.cancel("a").unwrap();
+        assert_eq!(read(&mut runtime), json!({"cmd": "cancel", "request_id": "a"}));
+        send(&mut runtime, json!({"reply": "invoke", "request_id": "a", "ok": true, "terminal": "canceled"}));
+        assert_eq!(a.join().unwrap().unwrap().terminal, "canceled");
+        std::thread::sleep(patience * 4);
+        assert!(process.try_wait().unwrap().is_none(), "a call that stopped for its cancel ends nothing");
+        executor.cancel("b").unwrap();
+        assert_eq!(read(&mut runtime), json!({"cmd": "cancel", "request_id": "b"}));
+        let canceled = std::time::Instant::now();
+        while process.try_wait().unwrap().is_none() {
+            assert!(canceled.elapsed() < patience * 50, "b ignored its cancel and the executor lives on");
+            send(&mut runtime, json!({"event": "progress", "request_id": "b", "stage": "still going"}));
+            std::thread::sleep(patience / 4);
+        }
+        drop(runtime);
+        let error = b.join().unwrap().err().unwrap();
+        assert!(error.to_string().contains("canceled during invoke"), "{error}");
     }
 }
