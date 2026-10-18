@@ -839,6 +839,18 @@ mod v1_api {
         (machine, tools)
     }
 
+    /// The TensorFS wheel a Runtime wheel accepts, from PyPI, into `dir`.
+    const ACCEPTED_TENSORFS: &str = "import re, subprocess, sys, zipfile, pathlib
+wheel, out = sys.argv[1], pathlib.Path(sys.argv[2])
+archive = zipfile.ZipFile(wheel)
+meta = next(n for n in archive.namelist() if n.endswith('.dist-info/METADATA'))
+req = next(l[15:].split(';')[0].replace(' ', '') for l in archive.read(meta).decode().splitlines()
+           if re.match(r'Requires-Dist: tensorfs[^A-Za-z0-9._-]', l))
+subprocess.run([sys.executable, '-m', 'pip', 'download', '-q', '--no-deps', '--only-binary=:all:', '--python-version', '3.12',
+                '--platform', 'manylinux_2_28_x86_64', '--platform', 'manylinux_2_17_x86_64', '-d', str(out), req], check=True)
+print(next(out.glob('tensorfs-*.whl')))
+";
+
     /// The commit a Runtime wheel was built from: its `cozy_runtime._build_provenance.COMMIT`.
     fn stamped(wheel: &Path) -> String {
         let read = "import re, sys, zipfile\n\
@@ -873,9 +885,16 @@ mod v1_api {
         let helper = String::from_utf8(helper.stdout).unwrap().trim().to_string();
         let mut args: Vec<std::ffi::OsString> =
             vec!["--installer-python".into(), helper.into(), "--client-wheel".into(), wheel.into()];
-        // A Runtime wheel not yet published, installed as this machine's own (a dev build).
+        // A Runtime wheel not yet published, installed as this machine's own (a dev build), with
+        // the TensorFS it accepts, as an update that names a Runtime brings.
         if let Some(runtime) = std::env::var_os("COZY_TEST_RUNTIME_WHEEL") {
-            args.extend(["--package-sdk".into(), runtime]);
+            let tensorfs = std::env::var_os("COZY_TEST_TENSORFS_WHEEL").unwrap_or_else(|| {
+                let out = Command::new("python3").args(["-I", "-c", ACCEPTED_TENSORFS]).arg(&runtime).arg(tools.join("tensorfs-wheel"))
+                    .output().unwrap();
+                assert!(out.status.success(), "the TensorFS {runtime:?} accepts: {out:?}");
+                String::from_utf8(out.stdout).unwrap().trim().into()
+            });
+            args.extend(["--package-sdk".into(), runtime, "--package-sdk".into(), tensorfs]);
         }
         args
     }

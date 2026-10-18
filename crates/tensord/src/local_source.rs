@@ -632,11 +632,20 @@ mod tests {
 
     /// The fixtures' author surface needs the Runtime of this cohort: a dev wheel
     /// (`COZY_TEST_RUNTIME_WHEEL`) as the machine's own until a release carries it.
-    /// Named, it is the operator's choice, as an update's `--runtime-wheel` is (`runtime_build`).
+    /// Named, it is the operator's choice, as an update's `--runtime-wheel` is (`runtime_build`),
+    /// with the TensorFS it accepts, as such an update brings: COZY_TEST_TENSORFS_WHEEL, else PyPI's.
     fn current_runtime(installer: &InstallerConfig) -> InstallerConfig {
-        let sdk: Vec<PathBuf> = std::env::var_os("COZY_TEST_RUNTIME_WHEEL").map(PathBuf::from).into_iter().collect();
-        let runtime_build = sdk.first().map(|wheel| wheel_version(wheel)).unwrap_or_default();
-        InstallerConfig { sdk, runtime_build, ..installer.clone() }
+        let Some(runtime) = std::env::var_os("COZY_TEST_RUNTIME_WHEEL").map(PathBuf::from) else {
+            return installer.clone();
+        };
+        let tensorfs = std::env::var_os("COZY_TEST_TENSORFS_WHEEL").map(PathBuf::from).unwrap_or_else(|| {
+            let dir = installer.generations.with_file_name("tensorfs-wheel");
+            run(Command::new("python3").args(["-m", "pip", "download", "-q", "--no-deps", "--only-binary=:all:", "--python-version", "3.12",
+                "--platform", "manylinux_2_28_x86_64", "--platform", "manylinux_2_17_x86_64", "-d"]).arg(&dir).arg(requirement(&runtime, "tensorfs")));
+            fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).find(|p| p.extension().is_some_and(|e| e == "whl")).unwrap()
+        });
+        let runtime_build = wheel_version(&runtime);
+        InstallerConfig { sdk: vec![runtime, tensorfs], runtime_build, ..installer.clone() }
     }
 
     /// With a named Runtime wheel (`COZY_TEST_RUNTIME_WHEEL`), the Runtime `python` loads is that

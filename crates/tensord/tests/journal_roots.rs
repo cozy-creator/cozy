@@ -83,7 +83,7 @@ fn open(root: &Path, tools: &Tools) -> Machine {
             staging_root: root.join("staging"),
             // A Runtime wheel not yet published, installed as this machine's own (a dev build),
             // the operator's choice as an update's `--runtime-wheel` is.
-            sdk: std::env::var_os("COZY_TEST_RUNTIME_WHEEL").map(PathBuf::from).into_iter().collect(),
+            sdk: named_pair(root),
             runtime_build: std::env::var_os("COZY_TEST_RUNTIME_WHEEL")
                 .and_then(|w| Some(PathBuf::from(w).file_name()?.to_str()?.split('-').nth(1)?.to_owned()))
                 .unwrap_or_default(),
@@ -110,6 +110,32 @@ fn open(root: &Path, tools: &Tools) -> Machine {
         objects,
         runs,
     }
+}
+
+/// The TensorFS wheel a Runtime wheel accepts, from PyPI, into `dir`.
+const ACCEPTED_TENSORFS: &str = "import re, subprocess, sys, zipfile, pathlib
+wheel, out = sys.argv[1], pathlib.Path(sys.argv[2])
+archive = zipfile.ZipFile(wheel)
+meta = next(n for n in archive.namelist() if n.endswith('.dist-info/METADATA'))
+req = next(l[15:].split(';')[0].replace(' ', '') for l in archive.read(meta).decode().splitlines()
+           if re.match(r'Requires-Dist: tensorfs[^A-Za-z0-9._-]', l))
+subprocess.run([sys.executable, '-m', 'pip', 'download', '-q', '--no-deps', '--only-binary=:all:', '--python-version', '3.12',
+                '--platform', 'manylinux_2_28_x86_64', '--platform', 'manylinux_2_17_x86_64', '-d', str(out), req], check=True)
+print(next(out.glob('tensorfs-*.whl')))
+";
+
+/// The named Runtime wheel (`COZY_TEST_RUNTIME_WHEEL`) with the TensorFS it accepts, as an update
+/// that names a Runtime brings: COZY_TEST_TENSORFS_WHEEL, else PyPI's. None named, none.
+fn named_pair(root: &Path) -> Vec<PathBuf> {
+    let Some(runtime) = std::env::var_os("COZY_TEST_RUNTIME_WHEEL").map(PathBuf::from) else {
+        return vec![];
+    };
+    let tensorfs = std::env::var_os("COZY_TEST_TENSORFS_WHEEL").map(PathBuf::from).unwrap_or_else(|| {
+        let out = Command::new("python3").args(["-I", "-c", ACCEPTED_TENSORFS]).arg(&runtime).arg(root.join("tensorfs-wheel")).output().unwrap();
+        assert!(out.status.success(), "the TensorFS {runtime:?} accepts: {out:?}");
+        PathBuf::from(String::from_utf8(out.stdout).unwrap().trim())
+    });
+    vec![runtime, tensorfs]
 }
 
 /// With a named Runtime wheel (`COZY_TEST_RUNTIME_WHEEL`), every environment under `generations`
