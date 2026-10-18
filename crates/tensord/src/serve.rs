@@ -446,10 +446,11 @@ fn start_api(
 ) -> io::Result<()> {
     use crate::{api, machine_api::NativeBackend};
     sdk.client_wheel = wheel.clone();
-    let (pair, uv, seed_cache): (Vec<PathBuf>, _, _) = (
+    let (pair, uv, seed_cache, runtime_build): (Vec<PathBuf>, _, _, _) = (
         sdk.requirements.iter().map(PathBuf::from).collect(),
         sdk.uv.clone(),
         sdk.seed_cache.clone(),
+        sdk.runtime_build.clone(),
     );
     let store = store.clone();
     let mut backend = NativeBackend::new(service.clone(), identity.authority.clone(), store.clone());
@@ -469,6 +470,7 @@ fn start_api(
             generations: generations.to_path_buf(),
             staging_root: root.join("package-staging"),
             sdk: pair,
+            runtime_build,
             uv: uv.clone(),
             seed_cache,
         }),

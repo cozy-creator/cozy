@@ -1549,6 +1549,7 @@ mod tests {
                 sdk: vec![],
                 uv: "uv".into(),
                 seed_cache: None,
+                runtime_build: String::new(),
             },
             store.clone(),
         );

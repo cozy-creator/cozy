@@ -625,6 +625,7 @@ mod tests {
             sdk: vec![],
             uv: "uv".into(),
             seed_cache: None,
+            runtime_build: String::new(),
         };
         Machine { root, service, store, objects, installer }
     }
@@ -1246,6 +1247,48 @@ mod tests {
         let python = manifest(serde_json::json!({"source": member("source.tar", &tree), "python_requires": ">=4"}));
         let why = refused(&python);
         assert!(why.starts_with("package_python_unavailable: configured interpreter does not satisfy"), "{why}");
+        let _ = fs::remove_dir_all(&m.root);
+    }
+
+    /// A machine whose Runtime an update named (`cozy machine update --runtime-wheel`, a version
+    /// PyPI never had) runs a script on it whatever the script's own bounds on the pair, as it
+    /// runs a release, and every run says so (cr-203: runs 11304/11371 fell back to PyPI's pair).
+    #[test]
+    fn a_machines_dev_runtime_runs_a_script_whose_bound_it_misses() {
+        let m = machine("cm-dev-machine");
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let pair = sdk_pair(&m.root);
+        let runtime = wheel_version(&pair[0]);
+        let dev = format!("{runtime}.1+dev.machine");
+        let sdk = m.root.join("dev-sdk");
+        fs::create_dir_all(&sdk).unwrap();
+        run(Command::new(&m.installer.helper_python).args(["-c", REVERSION]).arg(&pair[0]).arg(&sdk).arg(&dev));
+        let wheel = sdk.join(pair[0].file_name().unwrap().to_string_lossy().replace(&format!("-{runtime}-"), &format!("-{dev}-")));
+        let build = format!("{dev}+0123abcd");
+        let sources = LocalSources::new(
+            m.objects.clone(),
+            InstallerConfig { sdk: vec![wheel, pair[1].clone()], runtime_build: build.clone(), ..m.installer.clone() },
+            m.store.clone(),
+        );
+        // An unlocked project, as the CLI makes of a script, pinned to PyPI's Runtime.
+        let project = m.root.join("project");
+        let fixture = repo.join("tests/fixtures/cpu_input");
+        fs::create_dir_all(project.join("cpu_input")).unwrap();
+        for name in ["package.toml", "cpu_input/__init__.py"] {
+            fs::copy(fixture.join(name), project.join(name)).unwrap();
+        }
+        let pyproject = fs::read_to_string(fixture.join("pyproject.toml")).unwrap();
+        fs::write(project.join("pyproject.toml"), pyproject.replace("\"cozy-runtime\"", &format!("\"cozy-runtime=={runtime}\""))).unwrap();
+        let files = ["pyproject.toml", "package.toml", "cpu_input/__init__.py"];
+        let mut manifest = serde_json::json!({"package": "local/tensord-cpu-input", "release": "0.1.0", "python_version": "3.12"});
+        manifest["files"] = live_files(&m.objects, "alice", &project, &files).into();
+        let digest = write(&m.objects, "alice", manifest.to_string().as_bytes()).digest;
+        let installed = sources.install(&m.service, "alice", &digest, None, "", &|_| ()).unwrap();
+        let held = m.service.catalog.resolve(&installed.generation).unwrap();
+        assert_eq!(installed_sdk(&held.record.python), format!("{dev} {}", wheel_version(&pair[1])));
+        assert_eq!(held.record.sdk_fallback, format!(
+            "The package `tensord-cpu-input` requires `cozy-runtime=={runtime}`, but `{dev}` is installed; \
+             this machine's development Runtime {build} (`--runtime-wheel`) runs it regardless"));
         let _ = fs::remove_dir_all(&m.root);
     }
 

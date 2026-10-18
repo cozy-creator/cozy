@@ -94,6 +94,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             sdk: vec![],
             uv: "uv".into(),
             seed_cache: None,
+            runtime_build: String::new(),
         },
         &uploaded,
         None,
