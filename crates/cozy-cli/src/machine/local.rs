@@ -395,7 +395,7 @@ fn authorized(ctx: &Context, key: &str) -> Result<bool, Error> {
             "public_key_invalid",
             format!("{key:?} is not a controller's public key (32 bytes of unpadded base64url)"),
         )
-        .next("on that computer: cozy machine add <name> <address> --fingerprint <sha256:…>"));
+        .next("on that computer: install cozy (`curl -LsSf https://tensorhub.com/install.sh | sh`), then cozy machine add <name> <address> --fingerprint <sha256:…>"));
     }
     let path = ctx.home.keys().join("authorized");
     let unwritable = |e: io::Error| {
