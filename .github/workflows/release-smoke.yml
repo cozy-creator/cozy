@@ -4,8 +4,8 @@ name: release-smoke
 # The CPU smoke of design §6.4 on every release runner, against this run's own artifacts served from a local
 # mirror (COZY_DOWNLOAD_URL is the release location for the installers and `cozy update` alike): install
 # script, --version, PATH, up, status, hub list, package search (tensorhub.com, anonymous), the local machine
-# (enabled as a user service and shown where the platform has a machine role; refused elsewhere), update to this
-# release (an enabled machine restarts on the new binary), disable, down. A verb answering not_ported is skipped, so the smoke grows as the
+# (enabled as a user service and shown, on every OS), update to this release (the machine restarts on the new
+# binary), disable, down. A verb answering not_ported is skipped, so the smoke grows as the
 # verbs land.
 on:
   workflow_call:
@@ -181,41 +181,29 @@ jobs:
           step status
           step hub list
           step package search sdxl
-          # The local machine: `enable` returns once `local` is ready. Linux must enable it; macOS and Windows
-          # enable it where their machine role has landed and otherwise refuse it as machine_unsupported.
-          enabled=0
+          # The local machine, on every OS: `enable` returns once `local` is ready.
           if [ "$RUNNER_OS" = Linux ]; then
             # A user service manager, as a desktop login has: the runner's user lingers, with its bus.
             sudo loginctl enable-linger "$(id -un)"
             export XDG_RUNTIME_DIR=/run/user/$(id -u)
             until [ -S "$XDG_RUNTIME_DIR/bus" ]; do sleep 1; done
             export DBUS_SESSION_BUS_ADDRESS=unix:path=$XDG_RUNTIME_DIR/bus
-            must machine enable
-            enabled=1
-          else
-            code=0
-            out=$("$cozy" --json machine enable) || code=$?
-            printf '%s\n' "$out"
-            case $code:$out in
-              0:*) enabled=1 ;;
-              *'"machine_unsupported"'*) ;;
-              *) echo "::error::cozy machine enable exited $code, neither enabled nor machine_unsupported"; fail=1 ;;
-            esac
           fi
-          [ "$enabled" = 0 ] || must machine show local
+          must machine enable
+          must machine show local
           before=$(ls -i "$cozy")
           step update "$VERSION"
           if [ "$ran" = 1 ]; then
             [ "$(ls -i "$cozy")" != "$before" ] || { echo "::error::cozy update $VERSION left the binary in place"; fail=1; }
             [ "$("$cozy" --version)" = "cozy $VERSION" ] || { echo "::error::the updated binary is not cozy $VERSION"; fail=1; }
-            # The enabled machine takes the new binary (a new file, though the same version) and serves on it.
-            want=not_enabled; [ "$enabled" = 0 ] || want=restarted
-            [ "$(printf '%s' "$out" | jq -r .machine.state)" = "$want" ] || { echo "::error::the machine did not report $want"; fail=1; }
+            # The machine takes the new binary (a new file, though the same version) and serves on it.
+            if [ "$(printf '%s' "$out" | jq -r .machine.state)" = restarted ]; then
+              # Calcifer hears the restarted machine's status when its link reconnects.
+              until [ "$("$cozy" --json machine show local | jq -r .status.version)" = "$VERSION" ]; do sleep 2; done
+            else
+              echo "::error::the machine did not restart on the new binary"; fail=1
+            fi
           fi
-          if [ "$enabled" = 1 ]; then
-            # Calcifer hears the restarted machine's status when its link reconnects.
-            until [ "$("$cozy" --json machine show local | jq -r .status.version)" = "$VERSION" ]; do sleep 2; done
-            must machine disable
-          fi
+          must machine disable
           step down
           exit $fail
