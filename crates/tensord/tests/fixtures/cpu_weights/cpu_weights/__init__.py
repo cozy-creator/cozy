@@ -1,14 +1,13 @@
 """A quantizer's shape without torch: a CPU function writes one weights output through its
-owner's native writer channel, adopts it and returns the model."""
+owner's derive channel, adopts it and returns the model."""
 from __future__ import annotations
 
 import asyncio
 
 import msgspec
-import tensorfs
-from tensorfs.derived import Derivation, Part, Target, Tensor, derive
 
 from cozy_runtime.author import App, Context, ModelArtifact, Telemetry, WeightsOutput
+from cozy_runtime.tensord_channels import Derivation
 
 app = App()
 
@@ -26,25 +25,14 @@ async def table(ctx: Context, payload: TableInput, tel: Telemetry) -> ModelArtif
                 ctx.raise_if_cancelled()
                 await asyncio.sleep(0.01)
 
-    plain = next(digest for alias, digest in tensorfs.seed_digests() if alias == "plain/1")
-    shape = (payload.size,)
-    declaration = Derivation(
-        {},
-        {"model": Target(add={"table": Tensor("f32", shape, plain, {"value": Part("f32", shape)})})},
-        {},
-        [("model", "table")],
-    )
-    with derive(ctx.output("model"), declaration) as output:
-        if output.receipt is None:
-            output.add_part("model", "table", "value", bytes(range(256)) * (payload.size // 64))
-            if payload.hold == "checkpoint":
-                output.checkpoint()
-                await hold("checkpoint")
-        receipt = output.commit()
-        await hold("commit")
-        result = ctx.adopt_model(receipt)
-        await hold("adopt")
-        return result
+    output = ctx.output("model", Derivation(None, order=(("model", "table"),)))
+    if not output.has("model", "table"):
+        output.put("model", "table", "F32", [payload.size], bytes(range(256)) * (payload.size // 64))
+        await hold("checkpoint")  # TensorD journals each put: the write is resumable from here
+    await hold("commit")
+    result = ctx.adopt_model(output)  # commits, then TensorD checks and keeps the manifest
+    await hold("adopt")
+    return result
 
 
 app.entrypoint(table, weights=(WeightsOutput("model", max_new_bytes=1 << 20),), accelerator=False)
