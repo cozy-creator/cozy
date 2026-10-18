@@ -207,8 +207,8 @@ pub async fn keepalive(ctx: &Context, name: &str) -> Result<ExitCode, Error> {
 }
 
 /// Updates a machine's Runtime and TensorFS: to wheels when named (a local file is written to the
-/// machine with the run; an `https://…#sha256=<hex>` URL the machine fetches itself; a member not
-/// named keeps the machine's own), else to its Hub's target. A numbered run of kind update, which
+/// machine with the run; an `https://…#sha256=<hex>` URL the machine fetches itself; a TensorFS not
+/// named is the machine's own, or the one uv resolves for the Runtime), else to its Hub's target. A numbered run of kind update, which
 /// waits for the work the machine accepted and is followed like any run.
 pub async fn update(
     ctx: &Context,

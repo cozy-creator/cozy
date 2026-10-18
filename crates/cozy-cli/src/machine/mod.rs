@@ -68,7 +68,8 @@ enum Verb {
     Update {
         name: String,
         /// Install this cozy-runtime wheel instead of the Hub's target: a local file, or
-        /// https://…/<wheel>#sha256=<hex>, which the machine fetches itself.
+        /// https://…/<wheel>#sha256=<hex>, which the machine fetches itself. Alone, the machine
+        /// keeps its tensorfs when the wheel accepts it, else installs PyPI's newest that it does.
         #[arg(long, value_name = "FILE|URL")]
         runtime_wheel: Option<std::path::PathBuf>,
         /// Install this tensorfs wheel instead of the Hub's target: a local file, or
