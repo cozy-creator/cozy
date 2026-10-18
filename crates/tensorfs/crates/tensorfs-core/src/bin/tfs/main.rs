@@ -453,7 +453,10 @@ fn headers(hub: &str, dir: &str, lanes: &[&str]) -> Done {
         docs.push(json!({"lane": spec, "release": got.release, "manifest": object(&got.manifest), "bytes": got.bytes}));
     }
     let bytes: u64 = docs.iter().filter_map(|d| d["bytes"].as_u64()).sum();
-    let human = format!("{} lanes, {bytes} bytes of manifests and headers", docs.len());
+    let human = format!(
+        "{} lanes, {bytes} bytes of manifests and headers",
+        docs.len()
+    );
     Ok(Some((json!({"lanes": docs, "bytes": bytes}), human)))
 }
 
