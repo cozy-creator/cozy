@@ -1,0 +1,97 @@
+//! The Runtime wheel a hosted job names (`COZY_TEST_RUNTIME_WHEEL`, with `COZY_TEST_TENSORFS_WHEEL`
+//! when it built one): the pair every environment a test builds runs, and the commit that proves
+//! it did. With none named the pair is empty and nothing is asserted.
+#![allow(dead_code)]
+use std::{
+    io::Write as _,
+    path::{Path, PathBuf},
+    process::Command,
+    sync::OnceLock,
+};
+
+/// The TensorFS wheel a Runtime wheel accepts, from PyPI, into `dir`.
+const ACCEPTED_TENSORFS: &str = "import re, subprocess, sys, zipfile, pathlib
+wheel, out = sys.argv[1], pathlib.Path(sys.argv[2])
+archive = zipfile.ZipFile(wheel)
+meta = next(n for n in archive.namelist() if n.endswith('.dist-info/METADATA'))
+req = next(l[15:].split(';')[0].replace(' ', '') for l in archive.read(meta).decode().splitlines()
+           if re.match(r'Requires-Dist: tensorfs[^A-Za-z0-9._-]', l))
+subprocess.run([sys.executable, '-m', 'pip', 'download', '-q', '--no-deps', '--only-binary=:all:', '--python-version', '3.12',
+                '--platform', 'manylinux_2_28_x86_64', '--platform', 'manylinux_2_17_x86_64', '-d', str(out), req], check=True)
+print(next(out.glob('tensorfs-*.whl')))
+";
+
+/// The named Runtime with the TensorFS it accepts, as an update naming it brings, fetched once.
+pub fn pair() -> &'static [PathBuf] {
+    static PAIR: OnceLock<Vec<PathBuf>> = OnceLock::new();
+    PAIR.get_or_init(|| {
+        let Some(runtime) = std::env::var_os("COZY_TEST_RUNTIME_WHEEL").map(PathBuf::from) else {
+            return vec![];
+        };
+        let tensorfs = std::env::var_os("COZY_TEST_TENSORFS_WHEEL").map(PathBuf::from).unwrap_or_else(|| {
+            let dir = std::env::temp_dir().join(format!("tensorfs-wheel-{}", std::process::id()));
+            let out = Command::new("python3").args(["-I", "-c", ACCEPTED_TENSORFS]).arg(&runtime).arg(&dir).output().unwrap();
+            assert!(out.status.success(), "the TensorFS {runtime:?} accepts: {out:?}");
+            PathBuf::from(String::from_utf8(out.stdout).unwrap().trim())
+        });
+        vec![runtime, tensorfs]
+    })
+}
+
+/// The named Runtime's version and the commit stamped in it; a wheel without one proves nothing.
+pub fn named() -> Option<&'static (String, String)> {
+    static NAMED: OnceLock<Option<(String, String)>> = OnceLock::new();
+    NAMED
+        .get_or_init(|| {
+            let wheel = PathBuf::from(std::env::var_os("COZY_TEST_RUNTIME_WHEEL")?);
+            let commit = stamped(&wheel);
+            assert!(
+                !commit.is_empty() && commit != "unknown",
+                "{wheel:?} names no commit (COMMIT = {commit:?}): a wheel without provenance proves nothing"
+            );
+            Some((wheel.file_name()?.to_str()?.split('-').nth(1)?.to_owned(), commit))
+        })
+        .as_ref()
+}
+
+/// The commit a Runtime wheel was built from: its `cozy_runtime._build_provenance.COMMIT`.
+pub fn stamped(wheel: &Path) -> String {
+    let read = "import re, sys, zipfile\n\
+        text = zipfile.ZipFile(sys.argv[1]).read('cozy_runtime/_build_provenance.py').decode()\n\
+        print(re.search(r'^COMMIT = \"([^\"]*)\"', text, re.M).group(1))\n";
+    let out = Command::new("python3").args(["-I", "-c", read]).arg(wheel).output().unwrap();
+    assert!(out.status.success(), "reading {wheel:?}: {out:?}");
+    String::from_utf8(out.stdout).unwrap().trim().to_owned()
+}
+
+/// Every environment `pythons` names loads the named Runtime, by its commit; the log says so, since
+/// a silent pass reads as missing. Nothing named, nothing asserted.
+pub fn loaded(pythons: &[PathBuf], what: &str) {
+    let Some((version, commit)) = named() else { return };
+    for python in pythons {
+        let out = Command::new(python)
+            .args(["-I", "-c", "from cozy_runtime._build_provenance import COMMIT; print(COMMIT)"])
+            .output()
+            .unwrap();
+        let found = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        assert_eq!(&found, commit, "{python:?} loads another Runtime than the named {version}: {out:?}");
+    }
+    if !pythons.is_empty() {
+        let _ = writeln!(
+            std::io::stderr(),
+            "named Runtime {version} (commit {commit}) loads: asserted in {} environments of {what}",
+            pythons.len()
+        );
+    }
+}
+
+/// The environments under a generations directory.
+pub fn environments(generations: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(generations)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|generation| generation.path().join("env/bin/python"))
+        .filter(|python| python.exists())
+        .collect()
+}

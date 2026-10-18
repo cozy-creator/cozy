@@ -136,7 +136,9 @@ def collect(path: Path) -> bool:
 
 
 def install(project: Path, generations: Path, client_wheel: Path, *,
-            python: str = sys.executable, sdk: Sequence[Path] = ()) -> Generation:
+            python: str = sys.executable, sdk: Sequence[Path]) -> Generation:
+    """`project` installed for a test, its Runtime/TensorFS pair `sdk` named by the caller (the
+    machine's, or none): a caller that names none says so, never forgets it."""
     project = project.resolve()
     client_wheel = client_wheel.resolve(strict=True)
     interface = describe(project)

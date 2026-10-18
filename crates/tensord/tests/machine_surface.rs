@@ -12,6 +12,8 @@ use std::{
 
 #[path = "common/hub_oauth.rs"]
 mod hub_oauth;
+#[path = "common/named_runtime.rs"]
+mod named_runtime;
 #[path = "common/names_hub.rs"]
 mod names_hub;
 
@@ -85,95 +87,9 @@ impl Drop for Machine {
     fn drop(&mut self) {
         self.stop();
         if !std::thread::panicking() {
-            named_runtime_loaded(&self.root);
+            named_runtime::loaded(&named_runtime::environments(&self.root.join("state/generations")), "a machine");
         }
         let _ = fs::remove_dir_all(&self.root);
-    }
-}
-
-/// The named Runtime wheel's (`COZY_TEST_RUNTIME_WHEEL`) version and the commit stamped in it, read
-/// once; none unnamed. A wheel without a commit fails: it proves nothing.
-fn named_runtime() -> Option<&'static (String, String)> {
-    static NAMED: std::sync::OnceLock<Option<(String, String)>> = std::sync::OnceLock::new();
-    NAMED
-        .get_or_init(|| {
-            let wheel = PathBuf::from(std::env::var_os("COZY_TEST_RUNTIME_WHEEL")?);
-            let commit = stamped(&wheel);
-            assert!(
-                !commit.is_empty() && commit != "unknown",
-                "{wheel:?} names no commit (COMMIT = {commit:?}): a wheel without provenance proves nothing"
-            );
-            let version = wheel.file_name()?.to_str()?.split('-').nth(1)?.to_owned();
-            Some((version, commit))
-        })
-        .as_ref()
-}
-
-/// The TensorFS wheel a Runtime wheel accepts, from PyPI, into `dir`.
-const ACCEPTED_TENSORFS: &str = "import re, subprocess, sys, zipfile, pathlib
-wheel, out = sys.argv[1], pathlib.Path(sys.argv[2])
-archive = zipfile.ZipFile(wheel)
-meta = next(n for n in archive.namelist() if n.endswith('.dist-info/METADATA'))
-req = next(l[15:].split(';')[0].replace(' ', '') for l in archive.read(meta).decode().splitlines()
-           if re.match(r'Requires-Dist: tensorfs[^A-Za-z0-9._-]', l))
-subprocess.run([sys.executable, '-m', 'pip', 'download', '-q', '--no-deps', '--only-binary=:all:', '--python-version', '3.12',
-                '--platform', 'manylinux_2_28_x86_64', '--platform', 'manylinux_2_17_x86_64', '-d', str(out), req], check=True)
-print(next(out.glob('tensorfs-*.whl')))
-";
-
-/// The named Runtime wheel with the TensorFS it accepts (`COZY_TEST_TENSORFS_WHEEL`, else PyPI's),
-/// fetched once: the pair every machine of this suite installs. None named, none.
-fn named_pair() -> &'static [PathBuf] {
-    static PAIR: std::sync::OnceLock<Vec<PathBuf>> = std::sync::OnceLock::new();
-    PAIR.get_or_init(|| {
-        let Some(runtime) = std::env::var_os("COZY_TEST_RUNTIME_WHEEL").map(PathBuf::from) else {
-            return vec![];
-        };
-        let tensorfs = std::env::var_os("COZY_TEST_TENSORFS_WHEEL").map(PathBuf::from).unwrap_or_else(|| {
-            let dir = std::env::temp_dir().join(format!("cm-tensorfs-wheel-{}", uuid::Uuid::new_v4()));
-            let out = Command::new("python3").args(["-I", "-c", ACCEPTED_TENSORFS]).arg(&runtime).arg(&dir).output().unwrap();
-            assert!(out.status.success(), "the TensorFS {runtime:?} accepts: {out:?}");
-            PathBuf::from(String::from_utf8(out.stdout).unwrap().trim())
-        });
-        vec![runtime, tensorfs]
-    })
-}
-
-/// The commit a Runtime wheel was built from: its `cozy_runtime._build_provenance.COMMIT`.
-fn stamped(wheel: &Path) -> String {
-    let read = "import re, sys, zipfile\n\
-        text = zipfile.ZipFile(sys.argv[1]).read('cozy_runtime/_build_provenance.py').decode()\n\
-        print(re.search(r'^COMMIT = \"([^\"]*)\"', text, re.M).group(1))\n";
-    let out = Command::new("python3").args(["-I", "-c", read]).arg(wheel).output().unwrap();
-    assert!(out.status.success(), "reading {wheel:?}: {out:?}");
-    String::from_utf8(out.stdout).unwrap().trim().to_owned()
-}
-
-/// With a named Runtime, every package environment the machine at `root` built loads that build,
-/// by its commit; the log says so, since a silent pass reads as missing.
-fn named_runtime_loaded(root: &Path) {
-    let Some((version, commit)) = named_runtime() else { return };
-    let pythons: Vec<PathBuf> = fs::read_dir(root.join("state/generations"))
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|generation| generation.path().join("env/bin/python"))
-        .filter(|python| python.exists())
-        .collect();
-    for python in &pythons {
-        let out = Command::new(python)
-            .args(["-I", "-c", "from cozy_runtime._build_provenance import COMMIT; print(COMMIT)"])
-            .output()
-            .unwrap();
-        let loaded = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-        assert_eq!(&loaded, commit, "{python:?} loads another Runtime than the named {version}: {out:?}");
-    }
-    if !pythons.is_empty() {
-        let _ = writeln!(
-            std::io::stderr(),
-            "named Runtime {version} (commit {commit}) loads: asserted in {} environments",
-            pythons.len()
-        );
     }
 }
 
@@ -246,7 +162,7 @@ print(json.dumps({"identity": generation.identity}))
         .arg(repo.join("tests/fixtures/cpu_classifier"))
         .arg(state)
         // The named Runtime, as every machine of this suite runs it.
-        .args(named_pair())
+        .args(named_runtime::pair())
         .output()
         .unwrap();
     assert!(
@@ -925,7 +841,7 @@ mod v1_api {
     /// no test's machine holds the probe's package.
     static NAMED_RUNTIME: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
     async fn named_runtime_loads(tools: &Path) {
-        let Some((version, want)) = named_runtime() else { return };
+        let Some((version, want)) = named_runtime::named() else { return };
         let wheel = std::env::var_os("COZY_TEST_RUNTIME_WHEEL");
         let machine = Machine::start_args(|_, _| (), &installing_args(tools)).await;
         let client = client(&machine);
@@ -963,7 +879,7 @@ mod v1_api {
             vec!["--installer-python".into(), helper.into(), "--client-wheel".into(), wheel.into()];
         // A Runtime wheel not yet published, installed as this machine's own (a dev build), with
         // the TensorFS it accepts, as an update that names a Runtime brings.
-        for wheel in named_pair() {
+        for wheel in named_runtime::pair() {
             args.extend(["--package-sdk".into(), wheel.into()]);
         }
         args
