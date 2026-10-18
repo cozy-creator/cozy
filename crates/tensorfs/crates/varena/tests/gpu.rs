@@ -460,6 +460,11 @@ mod copy_faults {
     use std::time::Duration;
     use varena::faults;
 
+    /// Eight slots: a gated region's five pieces never wait for a slot whose copy the gate holds.
+    fn staging_plane() -> Plane {
+        open(PlaneConfig { devices: vec![DEV], readers: 4, staging_buffers: 8, staging_bytes: 16 << 20, ..Default::default() })
+    }
+
     fn open_later(g: &faults::Gate) -> std::thread::JoinHandle<()> {
         let open = g.opener();
         std::thread::spawn(move || {
@@ -529,7 +534,7 @@ mod copy_faults {
                 println!("this driver does not page-lock read-only memory: no DMA to fail");
                 continue;
             }
-            let p = plane();
+            let p = staging_plane();
             let ws = p.register(&fx.ck, &fx.regions(), host).unwrap();
             let s = Stream::new();
             fx.drop_cache();
@@ -558,7 +563,7 @@ mod copy_faults {
     #[ignore = "GPU"]
     fn a_failed_ring_copy_is_reported_only_after_draining_and_the_ring_closes_safely() {
         let fx = Fixture::new("gpu-ringdrain");
-        let p = plane();
+        let p = staging_plane();
         let ws = p.register(&fx.ck, &fx.regions(), PAGE).unwrap();
         let s = Stream::new();
         fx.drop_cache();
@@ -584,7 +589,7 @@ mod copy_faults {
     #[ignore = "GPU"]
     fn an_undrainable_failure_poisons_and_its_ranges_outlive_the_queued_copies() {
         let fx = Fixture::new("gpu-undrained");
-        let p = plane();
+        let p = staging_plane();
         let ws = p.register(&fx.ck, &fx.regions(), PAGE).unwrap();
         fx.drop_cache();
         let gate = faults::arm_gate("copy");

@@ -81,6 +81,34 @@ fn restart_reupload_from_a_sealed_layout() {
     }
     println!("{{\"cell\":\"owner-fill\",\"bytes\":{bytes},\"s\":{:.3}}}", t.elapsed().as_secs_f64());
 
+    // The mechanism alone: page-lock the layout's RAM and copy it in one DMA (what the plane
+    // does where the driver locks read-only memory; GeForce cards refuse and bounce instead).
+    {
+        let _g = CtxGuard::enter(ctx).unwrap();
+        let d = cuda::driver().unwrap();
+        let n = layout.nbytes as usize;
+        let t = Instant::now();
+        cuda::check("cuMemHostRegister", unsafe { (d.mem_host_register)(fill.base() as *mut libc::c_void, n, cuda::MEMHOSTREGISTER_PORTABLE) }).unwrap();
+        let pinned = t.elapsed().as_secs_f64();
+        let va = varena::device::reserve_va(layout.nbytes).unwrap();
+        let (dev, _) = cuda::primary_context(DEV).unwrap();
+        let mem = varena::device::create(&cuda::AllocationProp::device(dev, false), layout.nbytes).unwrap();
+        varena::device::map_span(va, &[mem], dev, cuda::MEM_ACCESS_PROT_READWRITE).unwrap();
+        let t = Instant::now();
+        cuda::check("cuMemcpyHtoD", unsafe { (d.memcpy_htod_async)(va, fill.base() as *const libc::c_void, n, std::ptr::null_mut()) }).unwrap();
+        cuda::check("cuCtxSynchronize", unsafe { (d.ctx_synchronize)() }).unwrap();
+        let dma = t.elapsed().as_secs_f64();
+        println!(
+            "{{\"cell\":\"pin-dma\",\"bytes\":{bytes},\"pin_s\":{pinned:.3},\"pin_gb_s\":{:.2},\"dma_s\":{dma:.3},\"dma_gb_s\":{:.2}}}",
+            n as f64 / pinned / 1e9,
+            n as f64 / dma / 1e9
+        );
+        varena::device::unmap_span(va, layout.nbytes).unwrap();
+        varena::device::release(mem.handle).unwrap();
+        varena::device::free_va(va, layout.nbytes).unwrap();
+        cuda::check("cuMemHostUnregister", unsafe { (d.mem_host_unregister)(fill.base() as *mut libc::c_void) }).unwrap();
+    }
+
     // The restart: a fresh plane opens, registers the layout, page-locks and copies it.
     for round in 0..2 {
         let t = Instant::now();

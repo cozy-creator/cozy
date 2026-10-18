@@ -366,7 +366,8 @@ def main(work, out_path):
     log(json.dumps(env))
     hard = resource.getrlimit(resource.RLIMIT_NOFILE)[1]  # the engine holds every file open
     resource.setrlimit(resource.RLIMIT_NOFILE, (hard if 0 <= hard < 1 << 20 else 1 << 20, hard))
-    readers = {"T64": Reader(), "T64+fst": Engine(), "plane": varena.Plane(devices=[0])}
+    readers = {"T64": Reader(), "T64+fst": Engine(), "plane": varena.Plane(devices=[0], **(plane or {}))}
+    env["plane"] = plane or {}
     out = {"env": env, "models": {}}
     for name in LANES:
         model = Model(name, root, work)
