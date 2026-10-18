@@ -109,6 +109,36 @@ fn named_runtime() -> Option<&'static (String, String)> {
         .as_ref()
 }
 
+/// The TensorFS wheel a Runtime wheel accepts, from PyPI, into `dir`.
+const ACCEPTED_TENSORFS: &str = "import re, subprocess, sys, zipfile, pathlib
+wheel, out = sys.argv[1], pathlib.Path(sys.argv[2])
+archive = zipfile.ZipFile(wheel)
+meta = next(n for n in archive.namelist() if n.endswith('.dist-info/METADATA'))
+req = next(l[15:].split(';')[0].replace(' ', '') for l in archive.read(meta).decode().splitlines()
+           if re.match(r'Requires-Dist: tensorfs[^A-Za-z0-9._-]', l))
+subprocess.run([sys.executable, '-m', 'pip', 'download', '-q', '--no-deps', '--only-binary=:all:', '--python-version', '3.12',
+                '--platform', 'manylinux_2_28_x86_64', '--platform', 'manylinux_2_17_x86_64', '-d', str(out), req], check=True)
+print(next(out.glob('tensorfs-*.whl')))
+";
+
+/// The named Runtime wheel with the TensorFS it accepts (`COZY_TEST_TENSORFS_WHEEL`, else PyPI's),
+/// fetched once: the pair every machine of this suite installs. None named, none.
+fn named_pair() -> &'static [PathBuf] {
+    static PAIR: std::sync::OnceLock<Vec<PathBuf>> = std::sync::OnceLock::new();
+    PAIR.get_or_init(|| {
+        let Some(runtime) = std::env::var_os("COZY_TEST_RUNTIME_WHEEL").map(PathBuf::from) else {
+            return vec![];
+        };
+        let tensorfs = std::env::var_os("COZY_TEST_TENSORFS_WHEEL").map(PathBuf::from).unwrap_or_else(|| {
+            let dir = std::env::temp_dir().join(format!("cm-tensorfs-wheel-{}", uuid::Uuid::new_v4()));
+            let out = Command::new("python3").args(["-I", "-c", ACCEPTED_TENSORFS]).arg(&runtime).arg(&dir).output().unwrap();
+            assert!(out.status.success(), "the TensorFS {runtime:?} accepts: {out:?}");
+            PathBuf::from(String::from_utf8(out.stdout).unwrap().trim())
+        });
+        vec![runtime, tensorfs]
+    })
+}
+
 /// The commit a Runtime wheel was built from: its `cozy_runtime._build_provenance.COMMIT`.
 fn stamped(wheel: &Path) -> String {
     let read = "import re, sys, zipfile\n\
@@ -202,7 +232,8 @@ from pathlib import Path
 from tensord_client.packages import install
 fixture, out = Path(sys.argv[1]), Path(sys.argv[2])
 subprocess.run(["uv", "build", "--wheel", "--out-dir", str(out / "client"), "."], check=True, capture_output=True)
-generation = install(fixture, out / "generations", next((out / "client").glob("*.whl")), python="3.12")
+generation = install(fixture, out / "generations", next((out / "client").glob("*.whl")), python="3.12",
+                     sdk=[Path(wheel) for wheel in sys.argv[3:]])
 print(json.dumps({"identity": generation.identity}))
 "#;
     let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -214,6 +245,8 @@ print(json.dumps({"identity": generation.identity}))
         ])
         .arg(repo.join("tests/fixtures/cpu_classifier"))
         .arg(state)
+        // The named Runtime, as every machine of this suite runs it.
+        .args(named_pair())
         .output()
         .unwrap();
     assert!(
@@ -903,17 +936,6 @@ mod v1_api {
         let _ = writeln!(std::io::stderr(), "named Runtime {version} (commit {want}) loads: asserted");
     }
 
-    /// The TensorFS wheel a Runtime wheel accepts, from PyPI, into `dir`.
-    const ACCEPTED_TENSORFS: &str = "import re, subprocess, sys, zipfile, pathlib
-wheel, out = sys.argv[1], pathlib.Path(sys.argv[2])
-archive = zipfile.ZipFile(wheel)
-meta = next(n for n in archive.namelist() if n.endswith('.dist-info/METADATA'))
-req = next(l[15:].split(';')[0].replace(' ', '') for l in archive.read(meta).decode().splitlines()
-           if re.match(r'Requires-Dist: tensorfs[^A-Za-z0-9._-]', l))
-subprocess.run([sys.executable, '-m', 'pip', 'download', '-q', '--no-deps', '--only-binary=:all:', '--python-version', '3.12',
-                '--platform', 'manylinux_2_28_x86_64', '--platform', 'manylinux_2_17_x86_64', '-d', str(out), req], check=True)
-print(next(out.glob('tensorfs-*.whl')))
-";
 
     /// `serve`'s installer arguments: the test helper Python and the client wheel in `tools`.
     fn installing_args(tools: &Path) -> Vec<std::ffi::OsString> {
@@ -941,14 +963,8 @@ print(next(out.glob('tensorfs-*.whl')))
             vec!["--installer-python".into(), helper.into(), "--client-wheel".into(), wheel.into()];
         // A Runtime wheel not yet published, installed as this machine's own (a dev build), with
         // the TensorFS it accepts, as an update that names a Runtime brings.
-        if let Some(runtime) = std::env::var_os("COZY_TEST_RUNTIME_WHEEL") {
-            let tensorfs = std::env::var_os("COZY_TEST_TENSORFS_WHEEL").unwrap_or_else(|| {
-                let out = Command::new("python3").args(["-I", "-c", ACCEPTED_TENSORFS]).arg(&runtime).arg(tools.join("tensorfs-wheel"))
-                    .output().unwrap();
-                assert!(out.status.success(), "the TensorFS {runtime:?} accepts: {out:?}");
-                String::from_utf8(out.stdout).unwrap().trim().into()
-            });
-            args.extend(["--package-sdk".into(), runtime, "--package-sdk".into(), tensorfs]);
+        for wheel in named_pair() {
+            args.extend(["--package-sdk".into(), wheel.into()]);
         }
         args
     }
