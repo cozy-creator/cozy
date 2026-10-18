@@ -124,6 +124,9 @@ class Checkpoint:
     @property
     def files(self) -> list[str]: ...
     @property
+    def chunks(self) -> list[tuple[str, int]]:
+        """Each chunk's file and length, in header order (`Part.chunk` indexes it)."""
+    @property
     def metadata(self) -> dict[str, Any]: ...
     def file(self, path: str) -> bytes: ...
     def read(self, component: str, key: str) -> Array:

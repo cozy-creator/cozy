@@ -537,6 +537,13 @@ impl PyCheckpoint {
         self.ck.manifest().files.keys().cloned().collect()
     }
 
+    /// Each chunk's file and length, in header order (`Part.chunk` indexes it).
+    #[getter]
+    fn chunks(&self) -> Vec<(String, u64)> {
+        let paths = self.ck.chunk_paths().iter().map(|p| p.display().to_string());
+        paths.zip(self.ck.header().chunks.iter().map(|c| c.length)).collect()
+    }
+
     /// The header's metadata.
     #[getter]
     fn metadata<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
