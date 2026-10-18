@@ -234,9 +234,10 @@ fn an_update_installs_the_hubs_target_and_then_has_nothing_to_do() {
     );
 }
 
-/// PyPI's Runtime and TensorFS wheels for this platform, downloaded into `dir`.
+/// PyPI's newest Runtime and the TensorFS it accepts (a newer TensorFS may be out first), wheels
+/// for this platform, downloaded into `dir`.
 fn downloaded(dir: &Path) -> (PathBuf, PathBuf) {
-    for requirement in ["cozy-runtime", "tensorfs"] {
+    let download = |requirement: &str| {
         let fetched = std::process::Command::new("python3")
             .args([
                 "-m",
@@ -260,7 +261,7 @@ fn downloaded(dir: &Path) -> (PathBuf, PathBuf) {
             .status()
             .unwrap();
         assert!(fetched.success(), "pip download {requirement}");
-    }
+    };
     let wheel = |prefix: &str| {
         std::fs::read_dir(dir)
             .unwrap()
@@ -268,7 +269,39 @@ fn downloaded(dir: &Path) -> (PathBuf, PathBuf) {
             .find(|p| p.file_name().unwrap().to_str().unwrap().starts_with(prefix))
             .unwrap_or_else(|| panic!("no {prefix} wheel"))
     };
-    (wheel("cozy_runtime-"), wheel("tensorfs-"))
+    download("cozy-runtime");
+    let runtime = wheel("cozy_runtime-");
+    download(&requirement(&runtime, "tensorfs"));
+    (runtime, wheel("tensorfs-"))
+}
+
+/// The requirement a wheel's metadata names for `name`, without extras (`tensorfs<0.11,>=0.10`).
+fn requirement(wheel: &Path, name: &str) -> String {
+    const READ: &str = r#"
+import re, sys, zipfile
+wheel, name = sys.argv[1:]
+archive = zipfile.ZipFile(wheel)
+metadata = next(n for n in archive.namelist() if n.endswith(".dist-info/METADATA"))
+for line in archive.read(metadata).decode().splitlines():
+    if line.startswith("Requires-Dist: ") and "extra ==" not in line:
+        requirement = line.removeprefix("Requires-Dist: ").replace(" ", "")
+        if re.match(re.escape(name) + r"[^A-Za-z0-9._-]", requirement):
+            print(requirement)
+            break
+"#;
+    let out = std::process::Command::new("python3")
+        .args(["-I", "-c", READ])
+        .arg(wheel)
+        .arg(name)
+        .output()
+        .unwrap();
+    let requirement = String::from_utf8(out.stdout).unwrap().trim().to_owned();
+    assert!(
+        !requirement.is_empty(),
+        "{} names no {name}",
+        wheel.display()
+    );
+    requirement
 }
 
 /// A wheel's version, from its file name.
@@ -350,7 +383,7 @@ fn an_update_names_a_published_wheel_by_its_pypi_url() {
                 name.ends_with(".whl") && name.contains("manylinux") && name.contains("x86_64")
             })
             .cloned()
-            .unwrap_or_else(|| panic!("{project}'s newest has no manylinux x86_64 wheel"));
+            .unwrap_or_else(|| panic!("{project} has no manylinux x86_64 wheel"));
         let (url, sha256) = (
             file["url"].as_str().unwrap(),
             file["digests"]["sha256"].as_str().unwrap(),
@@ -358,8 +391,10 @@ fn an_update_names_a_published_wheel_by_its_pypi_url() {
         let release = listed["info"]["version"].as_str().unwrap().to_owned();
         (format!("{url}#sha256={sha256}"), url.to_owned(), release)
     };
-    let (runtime, runtime_url, release) = wheel("cozy-runtime");
-    let (tensorfs, _, _) = wheel("tensorfs");
+    let dir = tempfile::tempdir().unwrap();
+    let (runtime, tensorfs) = downloaded(dir.path());
+    let (runtime, runtime_url, release) = wheel(&format!("cozy-runtime/{}", version(&runtime)));
+    let (tensorfs, _, _) = wheel(&format!("tensorfs/{}", version(&tensorfs)));
     let wrong = format!("{runtime_url}#sha256={}", "ab".repeat(32));
     let out = home.cozy([
         "machine",
