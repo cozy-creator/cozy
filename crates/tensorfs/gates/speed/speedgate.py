@@ -1,6 +1,6 @@
 """TensorFS speed gate: cozytensors/2 against safetensors, disk -> pinned -> GPU (xs-045 F1, U8).
 
-    python speedgate.py <work dir> <result.json>     # torch, fastsafetensors 0.5.0, tensorfs
+    python speedgate.py <work dir> <result.json> [--build-only] [--plane=readers=16,staging_buffers=32]
 
 The machine's v1 store supplies the real SDXL int8 and Qwen-Image int8 lane bytes. Each lane is
 written once into a TensorFS v2 store by its writer (the real chunk layout) and once as one
@@ -355,7 +355,7 @@ def environment(root, work):
             "store": root, "work": work}
 
 
-def main(work, out_path):
+def main(work, out_path, build_only=False, plane=None):
     root = store_root()
     os.makedirs(work, exist_ok=True)
     env = environment(root, work)
@@ -372,6 +372,10 @@ def main(work, out_path):
     for name in LANES:
         model = Model(name, root, work)
         model.build(log)
+        if build_only:
+            out["models"][name] = {"bytes": model.bytes, "manifest": model.manifest, "store": model.store, "table": [], "gate": {}}
+            json.dump(out, open(out_path, "w"))
+            continue
         warm_full = env["mem_available"] > 1.3 * model.bytes + 2 * SLOT * THREADS
         res = bench(model, readers, log, warm_full)
         lines, gate = summary(model, res)
@@ -385,4 +389,6 @@ def main(work, out_path):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1], sys.argv[2])
+    opts = sys.argv[3:]
+    plane = next((dict((k, int(v)) for k, v in (kv.split("=") for kv in o.removeprefix("--plane=").split(","))) for o in opts if o.startswith("--plane=")), None)
+    main(sys.argv[1], sys.argv[2], build_only="--build-only" in opts, plane=plane)
