@@ -2,6 +2,8 @@
 //! the lease it named revokes nothing: the owner's open stream stays open and a new call is
 //! admitted. The Hub's own answer without the key ends that stream at once. The real binary,
 //! and a Hub over real HTTPS.
+//! A rental is a Linux pod.
+#![cfg(target_os = "linux")]
 mod common;
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};

@@ -2,18 +2,22 @@
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io,
-    os::{
-        fd::AsRawFd,
-        unix::{
-            fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
-            process::CommandExt,
-        },
-    },
     path::{Path, PathBuf},
     process::Command,
     sync::Arc,
+};
+#[cfg(unix)]
+use std::{
+    fs::OpenOptions,
+    os::{
+        fd::AsRawFd,
+        unix::{
+            fs::{MetadataExt, OpenOptionsExt},
+            process::CommandExt,
+        },
+    },
 };
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -21,6 +25,7 @@ pub struct LaunchIdentity {
     pub uid: u32,
     pub gid: u32,
 }
+#[cfg(unix)]
 impl LaunchIdentity {
     pub fn validate(self) -> io::Result<Self> {
         // A nonprivileged owner can only retain its existing identity.
@@ -55,7 +60,7 @@ impl LaunchIdentity {
         }
         // Exact opened directory only; never walk/chown an authored tree or generation.
         if unsafe { libc::fchown(file.as_raw_fd(), uid, self.gid) } != 0
-            || unsafe { libc::fchmod(file.as_raw_fd(), mode) } != 0
+            || unsafe { libc::fchmod(file.as_raw_fd(), mode as libc::mode_t) } != 0
         {
             return Err(io::Error::last_os_error());
         }
@@ -63,31 +68,38 @@ impl LaunchIdentity {
     }
     pub(crate) fn socket(self, path: &Path) -> io::Result<()> {
         self.validate()?;
+        // macOS has no O_PATH: the socket's own name is changed, never a link it points to.
+        #[cfg(not(target_os = "linux"))]
+        return std::os::unix::fs::lchown(path, Some(self.uid), Some(self.gid));
         // O_PATH/NOFOLLOW binds ownership to the actual socket inode created by this owner.
+        #[cfg(target_os = "linux")]
         let file = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_PATH | libc::O_NOFOLLOW)
             .open(path)?;
-        use std::os::unix::fs::FileTypeExt;
-        if !file.metadata()?.file_type().is_socket() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "executor endpoint is not the owned socket",
-            ));
-        }
-        if unsafe {
-            libc::fchownat(
-                file.as_raw_fd(),
-                c"".as_ptr(),
-                self.uid,
-                self.gid,
-                libc::AT_EMPTY_PATH,
-            )
-        } != 0
+        #[cfg(target_os = "linux")]
         {
-            return Err(io::Error::last_os_error());
+            use std::os::unix::fs::FileTypeExt;
+            if !file.metadata()?.file_type().is_socket() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "executor endpoint is not the owned socket",
+                ));
+            }
+            if unsafe {
+                libc::fchownat(
+                    file.as_raw_fd(),
+                    c"".as_ptr(),
+                    self.uid,
+                    self.gid,
+                    libc::AT_EMPTY_PATH,
+                )
+            } != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
         }
-        Ok(())
     }
     pub(crate) fn readable(self, path: &Path) -> io::Result<()> {
         let file = OpenOptions::new()
@@ -109,9 +121,54 @@ impl LaunchIdentity {
     }
 }
 
+/// Run-as identities are Linux's: a Windows machine runs its executors as its own user.
+#[cfg(windows)]
+impl LaunchIdentity {
+    pub fn validate(self) -> io::Result<Self> {
+        Err(identity_unsupported())
+    }
+    pub(crate) fn traverse(self, _: &Path) -> io::Result<()> {
+        Err(identity_unsupported())
+    }
+    pub(crate) fn own(self, _: &Path) -> io::Result<()> {
+        Err(identity_unsupported())
+    }
+    pub(crate) fn socket(self, _: &Path) -> io::Result<()> {
+        Err(identity_unsupported())
+    }
+    pub(crate) fn readable(self, _: &Path) -> io::Result<()> {
+        Err(identity_unsupported())
+    }
+}
+
+#[cfg(windows)]
+fn identity_unsupported() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        "a configured executor identity is Linux's: a Windows machine runs executors as its user",
+    )
+}
+
+/// This process's user: the effective uid, or 0 where there is none (Windows).
+pub(crate) fn euid() -> u32 {
+    #[cfg(unix)]
+    return unsafe { libc::geteuid() };
+    #[cfg(windows)]
+    0
+}
+
+/// This process's group: the effective gid, or 0 where there is none (Windows).
+pub(crate) fn egid() -> u32 {
+    #[cfg(unix)]
+    return unsafe { libc::getegid() };
+    #[cfg(windows)]
+    0
+}
+
 /// Reuse Runtime's pre-CUDA seal: expected parent, parent-death SIGKILL, no_new_privs,
 /// OOM score and the optional identity. Every child gets its own process group, so a kill
 /// reaches the descendants that stayed in it and a terminal signal to the machine does not.
+#[cfg(unix)]
 pub fn trampoline(
     python: &Path,
     identity: Option<LaunchIdentity>,
@@ -145,6 +202,55 @@ pub fn trampoline(
     }
     command.process_group(0).arg("--").arg(python);
     Ok(command)
+}
+
+/// Windows: no trampoline. The executor starts as its Python, its tree held by the machine's
+/// handle on it; there is no parent-death signal, no seal of privileges and no other identity.
+/// A venv's python.exe is a launcher that starts the interpreter as its child, which would make
+/// the executor a stranger's child: the interpreter starts itself, told its venv as the launcher
+/// tells it ([`interpreter_environment`]).
+#[cfg(windows)]
+pub fn trampoline(
+    python: &Path,
+    identity: Option<LaunchIdentity>,
+    _scope: Option<&cozy_platform::contain::Scope>,
+) -> io::Result<Command> {
+    if let Some(identity) = identity {
+        identity.validate()?;
+    }
+    let mut command = Command::new(venv_home(python)?.map_or_else(|| python.into(), |home| home.join("python.exe")));
+    cozy_platform::process::inherit_nothing(&mut command);
+    Ok(command)
+}
+
+/// The environment `trampoline`'s interpreter needs beside the executor's own: on Windows, the
+/// venv python it stands in for (`__PYVENV_LAUNCHER__`, CPython's own handoff). None elsewhere.
+pub fn interpreter_environment(python: &Path) -> io::Result<Option<(&'static str, PathBuf)>> {
+    #[cfg(windows)]
+    if venv_home(python)?.is_some() {
+        return Ok(Some(("__PYVENV_LAUNCHER__", python.to_path_buf())));
+    }
+    let _ = python;
+    Ok(None)
+}
+
+/// The base interpreter's directory a venv's `pyvenv.cfg` names (`home`); None for a Python that
+/// is no venv's.
+#[cfg(windows)]
+fn venv_home(python: &Path) -> io::Result<Option<PathBuf>> {
+    let Some(venv) = python.parent().and_then(Path::parent) else {
+        return Ok(None);
+    };
+    let text = match fs::read_to_string(venv.join("pyvenv.cfg")) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let home = text.lines().find_map(|line| {
+        let (key, value) = line.split_once('=')?;
+        (key.trim() == "home").then(|| PathBuf::from(value.trim()))
+    });
+    home.map(Some).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "pyvenv.cfg names no home"))
 }
 
 /// Runtime `child_env.ERASED_PREFIXES`: inherited names no executor sees. The seal imposes
@@ -218,6 +324,12 @@ pub struct Seal {
 }
 
 /// The launched process keeps these shared locks open (not close-on-exec) until it exits.
+/// Windows inherits none: there the holds last while the machine does.
+#[cfg(windows)]
+pub fn inherit(_: &mut Command, _: &[Option<&Arc<File>>]) {}
+
+/// The launched process keeps these shared locks open (not close-on-exec) until it exits.
+#[cfg(unix)]
 pub fn inherit(command: &mut Command, holds: &[Option<&Arc<File>>]) {
     let descriptors: Vec<_> = holds
         .iter()
@@ -256,7 +368,7 @@ impl Seal {
         }
         // Directory names never carry a caller's spelling of the generation.
         let generation = &tensorfs_core::sha256::hex_digest(generation.as_bytes())[..32];
-        let uid = identity.map_or_else(|| unsafe { libc::geteuid() }, |i| i.uid);
+        let uid = identity.map_or_else(euid, |i| i.uid);
         let namespace = format!("u{uid}");
         let owned = |path: PathBuf| -> io::Result<PathBuf> {
             match fs::create_dir(&path) {
@@ -266,7 +378,7 @@ impl Seal {
             }
             match identity {
                 Some(identity) => identity.own(&path)?,
-                None => fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?,
+                None => cozy_platform::durable::set_mode(&path, 0o700)?,
             }
             Ok(path)
         };
@@ -389,22 +501,28 @@ fn boundary_directory(path: &Path) -> io::Result<()> {
         Err(error) => return Err(error),
     }
     let metadata = fs::symlink_metadata(path)?;
-    if !metadata.is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
+    // Windows has no POSIX owner: the profile's ACL keeps the directory the user's.
+    #[cfg(unix)]
+    let owned = metadata.uid() == euid();
+    #[cfg(windows)]
+    let owned = true;
+    if !metadata.is_dir() || !owned {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "seal boundary is not an owner directory",
         ));
     }
-    fs::set_permissions(path, fs::Permissions::from_mode(0o711))
+    Ok(cozy_platform::durable::set_mode(path, 0o711)?)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::{fs, os::unix::fs::PermissionsExt};
     #[test]
     fn owned_paths_keep_private_metadata_closed_and_peer_metadata_readable() {
-        let root = std::env::temp_dir().join(format!("machine-launch-{}", uuid::Uuid::new_v4()));
+        // Short: the socket below must fit macOS's 104-byte sun_path, and its temp dir is long.
+        let root = std::path::Path::new("/tmp").join(format!("ml-{}", &uuid::Uuid::new_v4().simple().to_string()[..12]));
         fs::create_dir(&root).unwrap();
         let identity = LaunchIdentity {
             uid: unsafe { libc::geteuid() },

@@ -28,7 +28,6 @@ use std::{
     collections::BTreeMap,
     fs::{self, File},
     io::{self, Read, Write},
-    os::fd::{AsRawFd, OwnedFd},
     path::{Path, PathBuf},
     sync::{
         atomic::Ordering,
@@ -711,10 +710,11 @@ impl Pool {
         // Fill leases and GPU custody hold one descriptor per object or chunk.
         cozy_platform::process::raise_fd_limit();
         let envelope = config.envelope();
-        // Degree 2 is world-one, on the first device; off where it drives a display.
+        // Degree 2 is world-one, on the first device; off where it drives a display, and
+        // outside Unix, where one executor's device memory cannot be handed to another.
         let custody = envelope
             .first()
-            .filter(|first| !display_active(first))
+            .filter(|first| cfg!(unix) && !display_active(first))
             .map(|_| Mutex::new(ResidentCustody::default()));
         let incarnation = uuid::Uuid::new_v4().simple().to_string();
         crate::launch_identity::remove_stale_jit(root, &incarnation);
@@ -2422,13 +2422,12 @@ impl Pool {
     fn executor_endpoint(&self) -> io::Result<(PathBuf, PathBuf, File)> {
         let root = self.root.join(uuid::Uuid::new_v4().simple().to_string());
         fs::create_dir(&root)?;
-        let directory = File::open(&root)?;
+        let directory = cozy_platform::durable::open_dir(&root)?;
         let socket = if self.config.identity.is_some() {
             // Another UID cannot traverse this owner's /proc/fd magic link.
             // A deliberately short owned state root is required for this operation.
             let socket = root.join("executor");
-            use std::os::unix::ffi::OsStrExt;
-            if socket.as_os_str().as_bytes().len() > 107 {
+            if socket.as_os_str().len() > 107 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "configured identity needs a short owned executor socket path (Linux sun_path)",
@@ -2436,11 +2435,17 @@ impl Pool {
             }
             socket
         } else {
-            PathBuf::from(format!(
+            // Linux names it through this process's descriptor of the root; elsewhere it is the
+            // root's own, or a short private one when that is too long.
+            #[cfg(target_os = "linux")]
+            let socket = PathBuf::from(format!(
                 "/proc/{}/fd/{}/executor",
                 std::process::id(),
-                directory.as_raw_fd()
-            ))
+                std::os::fd::AsRawFd::as_raw_fd(&directory)
+            ));
+            #[cfg(not(target_os = "linux"))]
+            let socket = crate::device_executor::socket_path(&root, "executor")?;
+            socket
         };
         Ok((root, socket, directory))
     }
@@ -4042,7 +4047,7 @@ fn copy_held(
 ) -> io::Result<()> {
     let sha = digest.strip_prefix("sha256:").unwrap_or(digest);
     let mut source = store.open_verified(sha).map_err(io::Error::other)?.into_file();
-    let mut copy = std::os::unix::fs::OpenOptionsExt::mode(
+    let mut copy = cozy_platform::durable::Mode::mode(
         fs::OpenOptions::new().write(true).create_new(true),
         0o444,
     )
@@ -4360,8 +4365,8 @@ impl Services for Callbacks<'_> {
     fn device_tier(
         &mut self,
         frame: &Frame,
-        fds: Vec<OwnedFd>,
-    ) -> io::Result<(Answer, Vec<OwnedFd>)> {
+        fds: Vec<cozy_platform::handles::Owned>,
+    ) -> io::Result<(Answer, Vec<cozy_platform::handles::Owned>)> {
         let mut answer = Answer::unavailable(frame.seq);
         let Some(custody) = self.custody else {
             return Ok((answer, Vec::new()));
@@ -4580,6 +4585,7 @@ impl Services for Callbacks<'_> {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[cfg(unix)]
     use std::os::unix::process::ExitStatusExt;
 
     /// Runs 5313/5318/5319 ended `executor_poisoned: ; the executor did not settle quiescent
@@ -4652,6 +4658,7 @@ mod tests {
         assert_eq!(kept, ["attention.selected", "gemm.selected"]);
     }
 
+    #[cfg(unix)]
     #[test]
     fn an_executor_that_ended_on_its_own_names_its_exit() {
         let ended = |status: i32| device_executor::Ended {
@@ -4818,6 +4825,7 @@ mod tests {
 
     /// NVML for one integrated GPU: every call the memory sampler makes, and memory info
     /// NotSupported (3), as GB10's driver answers.
+    #[cfg(target_os = "linux")]
     const FAKE_NVML: &str = r#"
 #include <stdio.h>
 static int gpu;
@@ -4893,7 +4901,7 @@ int nvmlDeviceGetDisplayActive(void *d, int *s) { *s = 0; return 0; }
         drop(held);
         assert_eq!(place(&film, 9, &mut [None; 4]).unwrap().0, 0);
         pool.stop().unwrap();
-        fs::remove_dir_all(root).unwrap();
+        crate::scratch::remove(&root);
     }
 
     #[test]
@@ -4909,7 +4917,7 @@ int nvmlDeviceGetDisplayActive(void *d, int *s) { *s = 0; return 0; }
         assert_eq!(place(3).unwrap().0, 0);
         drop(second);
         pool.stop().unwrap();
-        fs::remove_dir_all(root).unwrap();
+        crate::scratch::remove(&root);
     }
 
     /// A deviceless root accepted as request `key`, ready to dispatch.
@@ -4988,7 +4996,7 @@ int nvmlDeviceGetDisplayActive(void *d, int *s) { *s = 0; return 0; }
         ]);
         assert!(pool.place(&engine, &plan("other", 4), (9, None), None, &mut [None; 4]).is_some(), "exits end the lanes");
         pool.stop().unwrap();
-        fs::remove_dir_all(root).unwrap();
+        crate::scratch::remove(&root);
     }
 
     /// An older root still downloading its weights claims no GPU: a younger ready root runs
@@ -5023,7 +5031,7 @@ int nvmlDeviceGetDisplayActive(void *d, int *s) { *s = 0; return 0; }
         ]);
         drop(holds);
         pool.stop().unwrap();
-        fs::remove_dir_all(root).unwrap();
+        crate::scratch::remove(&root);
     }
 
     /// A waiting root's wait names its current blocker: a new entry when it changes.
@@ -5045,7 +5053,7 @@ int nvmlDeviceGetDisplayActive(void *d, int *s) { *s = 0; return 0; }
         ]);
         drop(holds);
         pool.stop().unwrap();
-        fs::remove_dir_all(root).unwrap();
+        crate::scratch::remove(&root);
     }
 
     /// Gate (f), runs 5673/5674 on one GPU: the older root's two ready first steps wait behind
@@ -5074,7 +5082,7 @@ int nvmlDeviceGetDisplayActive(void *d, int *s) { *s = 0; return 0; }
         ]);
         drop(holds);
         pool.stop().unwrap();
-        fs::remove_dir_all(root).unwrap();
+        crate::scratch::remove(&root);
     }
 
     #[test]
@@ -5098,7 +5106,7 @@ int nvmlDeviceGetDisplayActive(void *d, int *s) { *s = 0; return 0; }
         assert_eq!(pool.place(&engine, &group, (9, None), None, &mut [None; 4]).unwrap().0, 0);
         drop(other);
         pool.stop().unwrap();
-        fs::remove_dir_all(root).unwrap();
+        crate::scratch::remove(&root);
     }
 
     /// A fresh pod's burst of one unlearned plan: its first call starts on GPU 0, the second at
@@ -5118,7 +5126,7 @@ int nvmlDeviceGetDisplayActive(void *d, int *s) { *s = 0; return 0; }
         assert_eq!(claims, [Some(3), Some(3)]);
         drop((first, second));
         pool.stop().unwrap();
-        fs::remove_dir_all(root).unwrap();
+        crate::scratch::remove(&root);
     }
 
     /// Host admission counts executors admitted and not loaded yet; pinned budgets are shared
@@ -5161,6 +5169,6 @@ int nvmlDeviceGetDisplayActive(void *d, int *s) { *s = 0; return 0; }
         let keys: Vec<_> = split.keys().map(String::as_str).collect();
         assert_eq!(keys, ["film", "image", "image@2"]);
         pool.stop().unwrap();
-        fs::remove_dir_all(root).unwrap();
+        crate::scratch::remove(&root);
     }
 }

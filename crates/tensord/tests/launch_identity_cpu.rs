@@ -1,4 +1,6 @@
-//! Real installed SDK trampoline CPU proof; no executor/model/GPU imports.
+//! Real installed SDK trampoline CPU proof; no executor/model/GPU imports. Run-as identities
+//! are Linux's.
+#![cfg(target_os = "linux")]
 use tensord::launch_identity::{trampoline, LaunchIdentity};
 use serde_json::Value;
 use std::{fs, path::PathBuf};

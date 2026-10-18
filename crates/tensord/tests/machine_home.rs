@@ -2,6 +2,9 @@
 //! keys and log come from `~/.cozy`. A key `cozy machine authorize` appends is admitted at the
 //! next call, the machine's own log reads back by name, local code installs on a root with no
 //! uv (the pinned one is fetched), and a restart keeps the port.
+#[path = "common/child.rs"]
+mod child;
+use child::BareEnv;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use ed25519_dalek::{pkcs8::EncodePrivateKey, SigningKey};
 use std::{
@@ -27,9 +30,8 @@ fn boot(home: &Path) -> Machine {
     Machine(
         Command::new(env!("CARGO_BIN_EXE_tensord"))
             .arg("--persistent")
-            .env_clear()
-            .env("PATH", "/usr/bin:/bin")
-            .env("HOME", home)
+            .bare_env()
+            .user_home(home)
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
             .spawn()

@@ -4,7 +4,8 @@
 //! stops: the real binary, a stand-in provider API, and a Hub that cannot be reached. The
 //! provider key it ends itself with is the machine's alone: gone from every process environment
 //! and from the files the provider copies it into. A TensorD a pre-cohort update activated is
-//! retired, never run.
+//! retired, never run. A rental is a Linux pod.
+#![cfg(target_os = "linux")]
 mod common;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use ed25519_dalek::SigningKey;

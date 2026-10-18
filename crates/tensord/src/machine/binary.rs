@@ -1,10 +1,14 @@
 //! The `cozy` binary this machine runs from (design §5). `cozy update` renames a new binary over
 //! the launch path and keeps the one it replaces beside it as `.cozy-previous`; an UPDATE run then
 //! activates it: the service drains and exits `EXEC_EXIT`, and the stable parent execs the launch
-//! path with the same arguments. A binary that never proves readiness is renamed back.
+//! path with the same arguments. A binary that never proves readiness is renamed back. Windows
+//! has no exec: its stable parent starts each service from the launch path, so the next service
+//! is the activated (or restored) binary.
+use cozy_platform::durable::FileId;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt as _;
 use std::{
     io,
-    os::unix::{fs::MetadataExt as _, process::CommandExt as _},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::OnceLock,
@@ -17,7 +21,7 @@ pub const EXEC_EXIT: i32 = 76;
 /// file into place, after which `/proc/self/exe` names a deleted inode.
 pub struct Launch {
     pub path: PathBuf,
-    id: (u64, u64),
+    id: FileId,
 }
 
 static LAUNCH: OnceLock<Launch> = OnceLock::new();
@@ -25,8 +29,8 @@ static LAUNCH: OnceLock<Launch> = OnceLock::new();
 /// Records the launch path, first thing at start.
 pub fn record() -> io::Result<()> {
     let path = std::env::current_exe()?;
-    let meta = std::fs::metadata(&path)?;
-    let _ = LAUNCH.set(Launch { path, id: (meta.dev(), meta.ino()) });
+    let id = FileId::at(&path)?;
+    let _ = LAUNCH.set(Launch { path, id });
     Ok(())
 }
 
@@ -38,7 +42,7 @@ pub fn launch() -> Option<&'static Launch> {
 impl Launch {
     /// Whether the file at the launch path is no longer the one this process runs.
     pub fn swapped(&self) -> bool {
-        std::fs::metadata(&self.path).is_ok_and(|m| (m.dev(), m.ino()) != self.id)
+        FileId::at(&self.path).is_ok_and(|id| id != self.id)
     }
 }
 
@@ -64,6 +68,7 @@ pub fn version(path: &Path) -> io::Result<String> {
 
 /// Replaces this process with the binary at `path`, with this process's arguments; a rental's
 /// provider credential is handed on as at its first start. Returns only on failure.
+#[cfg(unix)]
 pub fn exec(path: &Path, provider: Option<&super::provider::ProviderSelf>) -> io::Error {
     if provider.is_some_and(|own| !super::provider::hand_on(own)) {
         return io::Error::other("cannot place the provider credential");

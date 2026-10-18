@@ -1,5 +1,8 @@
 //! A queued run says what it waits for, in its state, while it waits: another run's install of
 //! the same code, or an executor slot this machine's other runs hold.
+#[path = "common/child.rs"]
+mod child;
+use child::BareEnv;
 use ed25519_dalek::{pkcs8::EncodePrivateKey, SigningKey};
 use std::{
     path::Path,
@@ -30,9 +33,8 @@ fn boot(home: &Path) -> (Machine, Client) {
     let mut machine = Machine(
         Command::new(env!("CARGO_BIN_EXE_tensord"))
             .arg("--persistent")
-            .env_clear()
-            .env("PATH", "/usr/bin:/bin")
-            .env("HOME", home)
+            .bare_env()
+            .user_home(home)
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
             .spawn()

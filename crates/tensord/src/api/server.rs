@@ -148,11 +148,20 @@ fn tls(identity: &MachineIdentity) -> std::io::Result<rustls::ServerConfig> {
 /// keepalive judges an HTTP/1.1 peer as PINGs judge an HTTP/2 one, so a lane whose client
 /// vanished ends.
 fn live(stream: &tokio::net::TcpStream) {
-    use nix::sys::socket::{setsockopt, sockopt};
     let _ = stream.set_nodelay(true);
+    #[cfg(unix)]
+    keepalive(stream);
+}
+
+#[cfg(unix)]
+fn keepalive(stream: &tokio::net::TcpStream) {
+    use nix::sys::socket::{setsockopt, sockopt};
     let seconds = LIVENESS.as_secs() as u32;
     let _ = setsockopt(stream, sockopt::KeepAlive, &true);
+    #[cfg(target_os = "linux")]
     let _ = setsockopt(stream, sockopt::TcpKeepIdle, &seconds);
+    #[cfg(target_os = "macos")]
+    let _ = setsockopt(stream, sockopt::TcpKeepAlive, &seconds);
     let _ = setsockopt(stream, sockopt::TcpKeepInterval, &seconds);
     let _ = setsockopt(stream, sockopt::TcpKeepCount, &1);
 }

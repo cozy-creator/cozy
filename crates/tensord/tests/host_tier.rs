@@ -1,6 +1,7 @@
 //! The machine's sealed host tier on the real path: a real TensorFS store, TensorFS's verified
 //! fill, real executor stand-in processes (their pidfds hold layouts), and TensorFS's own
 //! read-only adoption (`Plane::register_sealed`) checking every byte.
+#![cfg(target_os = "linux")]
 use cozy_platform::contain::host_memory::HostMemory;
 use tensord::host_tier::{HostGrant, HostTier, HostTierConfig, SealedRequest, TierLimit};
 use sha2::{Digest, Sha256};

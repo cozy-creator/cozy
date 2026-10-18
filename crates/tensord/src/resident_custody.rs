@@ -412,7 +412,6 @@ fn validate(key: &HoldingKey, regions: &[SharedRegion], fds: &[OwnedFd]) -> io::
 mod tests {
     use super::*;
     use cozy_platform::process::Birth;
-    use std::os::fd::FromRawFd;
     use std::process::{Child, Command, Stdio};
 
     fn devnull() -> OwnedFd {
@@ -420,9 +419,8 @@ mod tests {
         File::open("/dev/null").unwrap().into()
     }
     fn pidfd(pid: u32) -> File {
-        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as i32;
-        assert!(raw >= 0);
-        unsafe { File::from_raw_fd(raw) }
+        let birth = Birth::of(pid).unwrap();
+        cozy_platform::process::Exact::open(&birth).unwrap().unwrap().into_file()
     }
     /// A lease whose executor end this test process keeps.
     fn mine() -> (Reader, OwnedFd) {

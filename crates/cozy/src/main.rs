@@ -12,12 +12,6 @@ fn main() -> std::process::ExitCode {
 }
 
 /// `machine serve`'s arguments, from `serve` on.
-#[cfg(target_os = "linux")]
 fn machine(args: impl Iterator<Item = std::ffi::OsString>) -> std::process::ExitCode {
     tensord::serve::main(args)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn machine(_: impl Iterator<Item = std::ffi::OsString>) -> std::process::ExitCode {
-    cozy_cli::output::unsupported("this computer's machine runs on Linux")
 }
