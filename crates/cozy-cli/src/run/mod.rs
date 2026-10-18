@@ -9,7 +9,7 @@ use cozy_proto::{
 
 use crate::{Context, output};
 use bind::Terms;
-pub(crate) use catalog::Card;
+pub(crate) use catalog::{Card, latest};
 pub(crate) use follow::{exit_code, follow, submit};
 use interface::{Callable, Interface};
 use target::Target;

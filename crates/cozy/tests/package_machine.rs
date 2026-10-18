@@ -8,6 +8,10 @@ mod common;
 use std::path::Path;
 
 use common::{Home, Out, package, tensord};
+use cozy_proto::{
+    calcifer::{Kind, On, SubmitRun},
+    machine as v1,
+};
 use serde_json::Value;
 
 fn cozy(home: &Home, dir: &Path, args: &[&str]) -> Out {
@@ -113,6 +117,86 @@ fn packages_install_update_and_remove_on_a_machine() {
     );
     assert_eq!(gone.code, 1, "{gone:?}");
     assert_eq!(gone.refusal()["code"], "package_not_installed", "{gone:?}");
+}
+
+/// An unversioned install takes the Hub's newest release, as `cozy run` does, and says the older
+/// one is still held. The same ask as a v0.10.1 CLI sent it (release and catalog revision empty)
+/// reads the Hub's newest each time, never the machine's first answer.
+#[test]
+fn an_unversioned_install_takes_the_hubs_newest_release() {
+    let Some(home) = Home::with_hub() else { return };
+    home.sign_in("newest@cozy.test");
+    let _machine = tensord::added(&home, "t1");
+    let package = package::publish(&home, "tiny", "0.1.0");
+    let dir = package::project(&home, "tiny");
+    let (code, first) = install(&home, &dir, &package);
+    assert_eq!(
+        (code, first["run"]["result"]["release"].as_str()),
+        (0, Some("0.1.0")),
+        "{first}"
+    );
+
+    package::publish(&home, "tiny", "0.1.1");
+    let out = cozy(&home, &dir, &["package", "install", &package, "--on", "t1"]);
+    assert_eq!(out.code, 0, "{out:?}");
+    for said in [
+        format!("{package}@0.1.1 is installed on t1"),
+        format!("t1 also holds {package}@0.1.0"),
+        format!("cozy package update {package} --on t1"),
+    ] {
+        assert!(out.stderr.contains(&said), "{said:?} not in {out:?}");
+    }
+    let mut releases = held(&home, &dir, &package);
+    releases.sort();
+    assert_eq!(releases, ["0.1.0", "0.1.1"]);
+
+    // The ask as it reached the machine before: no release, no catalog revision.
+    package::publish(&home, "tiny", "0.1.2");
+    let lock = cozy_platform::lock::LockFile::new(
+        cozy_platform::paths::Home::at(home.root()).calcifer_lock(),
+    );
+    let holder: cozy_proto::calcifer::Holder =
+        serde_json::from_slice(&lock.holder().unwrap().expect("Calcifer runs")).unwrap();
+    let ask = SubmitRun {
+        on: On::Machine("t1".into()),
+        hub: first["run"]["hub"].as_str().unwrap().into(),
+        kind: Kind::Warm,
+        target: package.clone(),
+        spec: v1::RunSpec {
+            kind: v1::RunKind::Warm,
+            source: Some(v1::Source::Release(v1::Release {
+                package: package.clone(),
+                release: String::new(),
+            })),
+            ..Default::default()
+        },
+        inputs: vec![],
+        out: None,
+        warnings: vec![],
+    };
+    let submitted: Value = tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let answer = reqwest::Client::new()
+            .post(format!("http://{}/v1/runs", holder.address))
+            .bearer_auth(&holder.token)
+            .header("Idempotency-Key", "unversioned-raw")
+            .json(&ask)
+            .send()
+            .await
+            .unwrap();
+        answer.json().await.unwrap()
+    });
+    let number = submitted["run"]["number"].to_string();
+    let watched = cozy(&home, &dir, &["--json", "run", "watch", &number]);
+    let last: Value = serde_json::from_str(watched.stdout.lines().last().unwrap_or_default())
+        .unwrap_or_else(|e| panic!("{e}: {watched:?}"));
+    assert_eq!(
+        (
+            last["type"].as_str(),
+            last["run"]["result"]["release"].as_str()
+        ),
+        (Some("run.completed"), Some("0.1.2")),
+        "{submitted}\n{watched:?}"
+    );
 }
 
 /// A laptop names its local Hub where it listens, while machines read that Hub at its public
