@@ -11,7 +11,7 @@ installation does not grant authority over a managed execution's store.
 | Consumer | Interface |
 |---|---|
 | TensorD | Makes model weights available; coordinates machine-wide memory policy, owns the managed Store, fills/retains shared CPU buffers and can retain exported GPU allocation handles through TensorFS |
-| Runtime | Constructs Python/PyTorch models; parses granted sources and performs executor-side GPU allocation, copies, mapping and unmapping through `tensorfs.varena` and device APIs within TensorD's grants |
+| Runtime | Constructs Python/PyTorch models; binds their weights through `tensorfs.varena`, which decides every byte of model memory in the executor |
 | Package code | `SourceCapability`, `OutputCapability`, `Derivation`, `DerivedTransaction` |
 | Standalone library users | Explicit Store construction and normal coordinated reads/writes |
 | Tensorhub | CLI metadata operations over explicitly staged files and census directories |
@@ -29,7 +29,7 @@ the model, binds its parameters and executes it. TensorD can request executor pr
 or prefetch that includes GPU work; those device operations still run in Runtime.
 TensorFS implements storage, layout, read and memory operations in whichever process
 calls the library; it is not another
-machine-wide policy authority. See the [weight-plane contract](../crates/varena/API.md).
+machine-wide policy authority. See the [varena contract](../python/tensorfs/varena/__init__.pyi).
 
 Constructing a managed Runtime model requires the machine's existing `model_sources` offer.
 Missing access refuses that operation; it cannot select `Store.open` by omission. Reusing

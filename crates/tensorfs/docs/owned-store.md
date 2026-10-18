@@ -6,9 +6,8 @@ remains a library; authentication, execution records, scheduling and memory budg
 decisions remain with the daemon.
 
 This owner role covers the managed Store's serialized objects and metadata. Shared CPU
-buffers and exported GPU allocations have separate descriptor/mapping lifetimes in
-`varena`. TensorD coordinates their retention; Runtime constructs models and
-performs executor-side GPU operations using the library. A Store claim alone does not
+buffers have separate descriptor/mapping lifetimes in `varena`. TensorD coordinates their
+retention; Runtime constructs models and binds their weights through the library. A Store claim alone does not
 construct a model or make its tensors GPU-resident.
 
 The store's `owner.lock` is retained by the returned Store, its clones, and every

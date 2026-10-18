@@ -13,7 +13,7 @@ python speedgate.py <work dir> <result.json>   # on the machine: torch, fastsafe
 chunk layout) and into one safetensors file per component, then times four readers in interleaved
 repetitions:
 
-- `T64+rust`: `tensorfs.varena`, the plane's Rust chunk reader: checkpoint, `register_checkpoint`, want, wait.
+- `T64+rust`: `tensorfs.varena`: checkpoint, `Gpu.register`, bind every region, synchronize.
 - `T64+fst`: the same chunk files through fastsafetensors' own C++ engine.
 - `T64`: F1's Python reader over the same chunk files (16 threads, 16 MiB requests).
 - `fastsafetensors`: fastsafetensors 0.5.0 over the safetensors files: the gate's reference.
