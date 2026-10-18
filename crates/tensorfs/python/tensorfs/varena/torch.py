@@ -328,8 +328,8 @@ class Model:
         self.seen: dict[int, None] = {}
         #: blocks at their home VA (the rest stream through slots); common is always home
         self.home: set[int] = set()
-        #: home blocks whose pages were evicted since they last bound
-        self.evicted: set[int] = set()
+        #: home blocks whose pages are resident now
+        self.loaded: set[int] = set()
         self.lowered = False
         self.uses = 0
         self.held = 0
@@ -538,12 +538,12 @@ class Memory:
         """The watermark as a model's use opens, from its measured reserve. A repeating model is
         wholly at home when it fits beside its reserve and the cold weights it may evict, else a
         spread set; one used once takes only free room and streams the rest. A model never
-        measured is wholly at home if it repeats, else keeps what is resident. Within a request
-        the watermark never rises."""
+        measured is wholly at home if it repeats, else keeps only what is resident (it evicts
+        nothing to become resident). Within a request the watermark never rises."""
         if not model.blocks or (model.reserve < 0 and repeats):
             return
         if model.reserve < 0:
-            want = model.home - model.evicted
+            want = model.home & model.loaded
         else:
             gpu = model.gpu
             free = torch.cuda.mem_get_info(gpu)[0] + torch.cuda.memory_reserved(gpu)
@@ -597,8 +597,10 @@ class Memory:
         try:
             views: dict[str, dict[str, Tensor]] = {}
             fresh: dict[str, dict[str, Tensor]] = {}
+            home = True
             for region in block.regions:
                 pinned = self._pin(model, region, stream.cuda_stream)
+                home = home and pinned.home
                 base = torch.from_dlpack(pinned)
                 block.pins.append(base)
                 parts = block.parts(region, base)
@@ -611,7 +613,8 @@ class Memory:
         except BaseException:
             _unbind(block)
             raise
-        model.evicted.discard(block.index)
+        if home and block.index >= 0:
+            model.loaded.add(block.index)
 
     def _pin(self, model: Model, region: int, stream: int) -> Pinned:
         """The region's pages, room made in §5.2's order until they map."""
@@ -668,7 +671,7 @@ class Memory:
             return
         for ahead in range(1, _AHEAD + 1):
             nxt = model.order[(at + ahead) % len(model.order)]
-            if nxt in model.home and nxt not in model.evicted or model.blocks[nxt].count:
+            if nxt in model.loaded and nxt in model.home or model.blocks[nxt].count:
                 continue
             for region in model.blocks[nxt].regions:
                 try:
@@ -702,7 +705,7 @@ class Memory:
         if _free(gpu) >= target:
             return True
         for model in self._cold(gpu):
-            freed += self._evict(model, why, 2)
+            freed += self._evict(model, why, 2, target - _free(gpu))
             if _free(gpu) >= target:
                 return True
         freed += self._ask(gpu, target)
@@ -759,7 +762,7 @@ class Memory:
                 for model in self._cold(gpu):
                     if freed >= want:
                         break
-                    freed += self._evict(model, "asked", 2)
+                    freed += self._evict(model, "asked", 2, want - freed)
                 self._publish(gpu)
                 row.ack(freed)
 
@@ -786,10 +789,22 @@ class Memory:
             last_use=self.last_use,
         )
 
-    def _evict(self, model: Model, why: str, rung: int) -> int:
-        freed = int(model.ws.evict(None))
+    def _evict(self, model: Model, why: str, rung: int, need: int | None = None) -> int:
+        """Pages of `model` nobody is using: all of them, or with `need` its lowest-ranked
+        blocks until that many bytes are free, its common last."""
+        freed = 0
+        if need is not None:
+            sizes = [model.blocks[b].nbytes for b in model.order]
+            for b in reversed(_spread(model.order, sizes, model.nbytes)):
+                if freed >= need:
+                    break
+                if b in model.loaded and not model.blocks[b].count:
+                    freed += int(model.ws.evict(model.blocks[b].regions))
+                    model.loaded.discard(b)
+        if need is None or freed < need:
+            freed += int(model.ws.evict(None))
+            model.loaded = {b for b in model.loaded if model.blocks[b].count}
         if freed:
-            model.evicted |= model.home
             self._evicted(model, rung, why, freed)
         return freed
 
@@ -810,7 +825,7 @@ class Memory:
         if self._in_request(model.gpu):
             model.lowered = True
         freed = int(model.ws.evict([r for b in gone for r in model.blocks[b].regions]))
-        model.evicted -= gone
+        model.loaded -= {b for b in gone if not model.blocks[b].count}
         if freed:
             self._evicted(model, rung, why, freed)
         return freed
@@ -832,7 +847,7 @@ class Memory:
             for model in self._cold(gpu):
                 if _free(gpu) >= grow:
                     break
-                self._evict(model, cache.owner, 2)
+                self._evict(model, cache.owner, 2, grow - _free(gpu))
             return _free(gpu) >= grow
 
     # -- caches, warm set, holds
@@ -927,23 +942,24 @@ class Memory:
             self._publish(gpu)
 
     def _restore(self, gpu: int) -> None:
-        """After the last request on `gpu`: each model's reserve is what that request measured;
-        the watermarks that fell rise again and what was evicted copies home, into free room
-        beside the largest reserve, warm models first. The copies are prefetches: an ask
+        """After the last request on `gpu`: each model's reserve is what that request measured,
+        every watermark rises again, and pages copy home into free room beside the largest
+        reserve, warm models first. Restore never evicts. The copies are prefetches: an ask
         evicts them again at once."""
         models = [m for m in self.models.values() if m.gpu == gpu]
         for model in models:
             if model.peak:
                 model.reserve, model.peak = model.peak, 0
             model.lowered = False
-        reserve = max((max(m.reserve, 0) for m in models), default=0)
+        room = _free(gpu) - max((max(m.reserve, 0) for m in models), default=0)
         for model in sorted(models, key=lambda m: (not m.kept, -m.last_use)):
             for b in model.order:
-                if b in model.home and b not in model.evicted:
+                if b in model.home and b in model.loaded:
                     continue
                 block = model.blocks[b]
-                if _free(gpu) - reserve < block.nbytes:
+                if room < block.nbytes:
                     return
+                room -= block.nbytes
                 model.home.add(b)
                 model.ws.home(_home_regions(model))
                 for region in block.regions:
@@ -951,6 +967,7 @@ class Memory:
                         model.ws.prefetch(region)
                     except DeviceFull:
                         return
+                model.loaded.add(b)
 
     def _requests(self, gpu: int) -> list[Request]:
         """The request a step or an eviction belongs to: this thread's, else the GPU's first."""
