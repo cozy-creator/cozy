@@ -42,11 +42,8 @@ use crate::err::{refuse, Code, Refusal, Result};
 use crate::header::{Body, Part};
 use crate::ids::{hex64, ObjectRef, Plain};
 use crate::limits;
-use crate::sha256::Sha256;
 use crate::store::Store;
 
-use super::carrier::SourceHeader;
-use super::convert::{Bytes, Plan, Xform};
 
 fn io(what: impl AsRef<str>, error: impl Into<std::io::Error>) -> Refusal {
     crate::store::classify_io(what, error)
@@ -147,102 +144,6 @@ fn part_from_value(value: &Value) -> Result<Part> {
     let part = Part { dtype, shape, body };
     part.check_bytes("ConversionJournalPart")?;
     Ok(part)
-}
-
-fn field(hash: &mut Sha256, value: &[u8]) {
-    hash.update(&(value.len() as u64).to_le_bytes());
-    hash.update(value);
-}
-
-/// The identity of the WORK, not of its result: converter, ordered ops, every role's exact
-/// byte source, and the carrier headers those sources index into. Two runs that agree here
-/// would produce byte-identical parts, which is the only condition under which reusing a
-/// journalled part instead of re-reading the carrier is sound.
-///
-/// Deliberately NOT a function of the output: the whole point is to know the plan before any
-/// weight byte has been converted. Nor of the TensorFS build: an upgraded or differently
-/// built pod resumes the same plan. Changing a converter's output bytes renames it or bumps
-/// the domain tag below.
-pub fn plan_digest(plan: &Plan, headers: &[(PathBuf, &SourceHeader)]) -> String {
-    let mut hash = Sha256::new();
-    field(&mut hash, b"tensorfs.conversion-journal/2");
-    field(&mut hash, plan.converter.as_bytes());
-    field(&mut hash, plan.class_name.as_bytes());
-    for (path, header) in headers {
-        field(&mut hash, path.as_os_str().as_encoded_bytes());
-        field(&mut hash, &header.file_len.to_le_bytes());
-        field(&mut hash, &header.data_start.to_le_bytes());
-        field(&mut hash, &header.header_bytes.to_le_bytes());
-        field(&mut hash, &(header.tensors.len() as u64).to_le_bytes());
-        for tensor in &header.tensors {
-            field(&mut hash, tensor.key.as_bytes());
-            field(&mut hash, tensor.dtype.name().as_bytes());
-            for dimension in &tensor.shape {
-                field(&mut hash, &dimension.to_le_bytes());
-            }
-            field(&mut hash, &tensor.begin.to_le_bytes());
-            field(&mut hash, &tensor.end.to_le_bytes());
-        }
-    }
-    for op in &plan.ops {
-        field(&mut hash, op.component.as_bytes());
-        field(&mut hash, op.out_key.as_bytes());
-        field(&mut hash, op.encoding_id.as_bytes());
-        field(&mut hash, op.logical_dtype.name().as_bytes());
-        for dimension in &op.logical_shape {
-            field(&mut hash, &dimension.to_le_bytes());
-        }
-        for role in &op.roles {
-            field(&mut hash, role.role.as_bytes());
-            field(&mut hash, role.dtype.name().as_bytes());
-            for dimension in &role.shape {
-                field(&mut hash, &dimension.to_le_bytes());
-            }
-            match &role.bytes {
-                Bytes::Stream { file, key } => {
-                    field(&mut hash, b"stream");
-                    field(&mut hash, &(*file as u64).to_le_bytes());
-                    field(&mut hash, key.as_bytes());
-                }
-                Bytes::Permute { file, key, xform } => {
-                    field(&mut hash, b"permute");
-                    field(&mut hash, &(*file as u64).to_le_bytes());
-                    field(&mut hash, key.as_bytes());
-                    match xform {
-                        Xform::QkvSplit {
-                            groups,
-                            shares,
-                            take,
-                            unit_bytes,
-                        } => {
-                            // Preserve the identity of every existing QKV conversion.
-                            field(&mut hash, &groups.to_le_bytes());
-                            for share in shares {
-                                field(&mut hash, &share.to_le_bytes());
-                            }
-                            field(&mut hash, &[*take]);
-                            field(&mut hash, &unit_bytes.to_le_bytes());
-                        }
-                        Xform::SwapHalves { half_bytes } => {
-                            field(&mut hash, b"swap-halves");
-                            field(&mut hash, &half_bytes.to_le_bytes());
-                        }
-                        Xform::Transpose {
-                            rows,
-                            cols,
-                            elem_bytes,
-                        } => {
-                            field(&mut hash, b"transpose");
-                            for n in [rows, cols, elem_bytes] {
-                                field(&mut hash, &n.to_le_bytes());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    crate::sha256::hex(&hash.finish())
 }
 
 fn journal_path(dir: &Path, plan_digest: &str) -> PathBuf {
@@ -530,93 +431,4 @@ pub fn session_objects(dir: &Path) -> Result<Vec<ObjectRef>> {
 #[cfg(test)]
 thread_local! {
     pub(crate) static RECORD_FAULT: std::cell::RefCell<Option<crate::store::Fault>> = const { std::cell::RefCell::new(None) };
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn temporary(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "tensorfs-journal-{name}-{}-{}",
-            std::process::id(),
-            crate::meta::now_nanos_unique()
-        ))
-    }
-
-    fn part(sha: &str) -> Part {
-        Part {
-            dtype: Dtype::F32,
-            shape: vec![64, 1024],
-            body: Body::Segments(vec![ObjectRef {
-                sha256: sha.repeat(32),
-                length: 64 * 1024 * 4,
-            }]),
-        }
-    }
-
-    #[test]
-    fn a_torn_last_line_costs_one_op_and_never_the_journal() {
-        let dir = temporary("torn");
-        let digest = "ab".repeat(32);
-        let mut journal = Journal::open(&dir, &digest).unwrap();
-        journal
-            .record("dit", "blocks.0.weight", &[("weight".into(), part("11"))])
-            .unwrap();
-        journal
-            .record("dit", "blocks.1.weight", &[("weight".into(), part("22"))])
-            .unwrap();
-        drop(journal);
-
-        // A crash mid-append: half a record on the end of the file.
-        let path = journal_path(&dir, &digest);
-        let mut bytes = fs::read(&path).unwrap();
-        bytes.extend_from_slice(br#"{"component":"dit","key":"blocks.2.weig"#);
-        fs::write(&path, &bytes).unwrap();
-
-        let resumed = Journal::open(&dir, &digest).unwrap();
-        assert_eq!(resumed.len(), 2);
-        assert!(resumed
-            .op("dit", "blocks.0.weight", &["weight".to_string()])
-            .is_some());
-        assert!(resumed
-            .op("dit", "blocks.2.weight", &["weight".to_string()])
-            .is_none());
-        // The torn tail is gone, so the next append cannot be buried behind it.
-        let on_disk = fs::read(&path).unwrap();
-        assert!(!String::from_utf8_lossy(&on_disk).contains("blocks.2.weig"));
-        assert!(on_disk.ends_with(b"\n"));
-        assert_eq!(session_objects(&dir).unwrap().len(), 2);
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn a_half_journalled_op_is_re_converted_whole() {
-        let dir = temporary("half");
-        let digest = "cd".repeat(32);
-        let mut journal = Journal::open(&dir, &digest).unwrap();
-        journal
-            .record("dit", "qkv", &[("weight".into(), part("33"))])
-            .unwrap();
-        let roles = vec!["weight".to_string(), "scale".to_string()];
-        assert!(journal.op("dit", "qkv", &roles).is_none());
-        assert!(journal.op("dit", "qkv", &["weight".to_string()]).is_some());
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn two_plans_under_one_session_do_not_share_a_journal() {
-        let dir = temporary("two-plans");
-        let first = "01".repeat(32);
-        let second = "02".repeat(32);
-        let mut a = Journal::open(&dir, &first).unwrap();
-        a.record("dit", "w", &[("weight".into(), part("44"))])
-            .unwrap();
-        let b = Journal::open(&dir, &second).unwrap();
-        assert_eq!(b.len(), 0);
-        assert_eq!(Journal::open(&dir, &first).unwrap().len(), 1);
-        // Both plans' objects are held while either is open.
-        assert_eq!(session_objects(&dir).unwrap().len(), 1);
-        let _ = fs::remove_dir_all(dir);
-    }
 }

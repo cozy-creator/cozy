@@ -557,16 +557,6 @@ impl Catalog {
         self.resume_operation_inner(id, org, name, true)
     }
 
-    /// Borrow an existing operation without recreating a released predecessor.
-    pub(crate) fn resume_retained_operation(
-        &self,
-        id: &str,
-        org: &str,
-        name: &str,
-    ) -> Result<WriterGuard> {
-        self.resume_operation_inner(id, org, name, false)
-    }
-
     fn resume_operation_inner(
         &self,
         id: &str,
@@ -648,14 +638,6 @@ impl Catalog {
         request_digest: &str,
     ) -> Result<SourcePreparation> {
         self.begin_source_preparation_inner(operation, request_digest, true)
-    }
-
-    pub(crate) fn begin_retained_source_preparation(
-        &self,
-        operation: &str,
-        request_digest: &str,
-    ) -> Result<SourcePreparation> {
-        self.begin_source_preparation_inner(operation, request_digest, false)
     }
 
     fn begin_source_preparation_inner(

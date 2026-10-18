@@ -4327,7 +4327,7 @@ mod tests {
             None,
         )
         .unwrap();
-        crate::ingest::source::release_model_source(&store, operation).unwrap();
+        crate::ingest::transaction::release_model_source(&store, operation).unwrap();
         // The resumable writer now retains its admitted sources independently of
         // their original source operation, including after the live writer exits.
         preview().unwrap();

@@ -1,5 +1,5 @@
 use super::*;
-use crate::transport::{Anonymous, CredentialProvider, SourceDownload, SourcePolicy};
+use crate::transport::{Anonymous, CredentialProvider, SourcePolicy};
 use std::net::{Shutdown, TcpListener};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
@@ -528,107 +528,6 @@ fn tls_range_fixture_measures_setup_reuse_with_identical_bytes_and_requests() {
         assert_eq!(origin.asks.lock().unwrap().len(), 8);
     }
     println!("TLS 8MiB, eight requests, 30ms connection setup: {timings:?}");
-}
-
-struct CloseRequests;
-impl CredentialProvider for CloseRequests {
-    fn headers(&self, _: &crate::transport::Ask) -> Vec<(String, String)> {
-        vec![("connection".into(), "close".into())]
-    }
-}
-
-#[test]
-fn source_chunks_ask_the_redirect_target_on_one_connection() {
-    use crate::{
-        ids::ObjectRef,
-        providers::{self, Provenance, Resolution, ResolvedMember},
-        store::{Fault, Store},
-    };
-    let bytes = Arc::new(vec![0x5a; 8 << 20]);
-    let object = ObjectRef::of(&bytes);
-    let mut timings = Vec::new();
-    for close in [true, false] {
-        let payload = bytes.clone();
-        let origin = Origin::new(false, Duration::from_millis(30), move |request, _| {
-            if request.path == "/source" {
-                return Reply {
-                    bytes: b"HTTP/1.1 302 Found\r\nLocation: /blob\r\nContent-Length: 0\r\n\r\n"
-                        .to_vec(),
-                    close: false,
-                };
-            }
-            let (first, last) = request
-                .header("range")
-                .unwrap()
-                .strip_prefix("bytes=")
-                .unwrap()
-                .split_once('-')
-                .unwrap();
-            let (first, last): (usize, usize) = (first.parse().unwrap(), last.parse().unwrap());
-            let mut response = format!("HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {first}-{last}/{}\r\n\r\n", last-first+1, payload.len()).into_bytes();
-            response.extend_from_slice(&payload[first..=last]);
-            Reply {
-                bytes: response,
-                close: false,
-            }
-        });
-        // Isolate transport setup from this host's unrelated disk journal load.
-        // The same durable prefix/CAS APIs still run; this is not a disk benchmark.
-        let temporary = if std::path::Path::new("/dev/shm").is_dir() {
-            std::path::PathBuf::from("/dev/shm")
-        } else {
-            std::env::temp_dir()
-        };
-        let root = temporary.join(format!(
-            "tfs-reuse-{}-{}",
-            std::process::id(),
-            crate::meta::now_nanos_unique()
-        ));
-        let store = Store::init(&root).unwrap();
-        let resolution = Resolution {
-            canonical: "hf://fixture/model@revision".into(),
-            selection_sha256: "accepted".into(),
-            members: vec![ResolvedMember {
-                member: "model.safetensors".into(),
-                object: object.clone(),
-                url: format!("{}/source", origin.url),
-                provenance: Provenance::Declared,
-                carrier: true,
-                requires: vec![],
-                companion: false,
-            }],
-        };
-        let owner = ObjectRef::of(format!("reuse-{close}").as_bytes()).id();
-        let credentials: &dyn CredentialProvider = if close { &CloseRequests } else { &Anonymous };
-        let start = Instant::now();
-        let (_, rows) = providers::materialize_selected_with_options(
-            &store,
-            &owner,
-            &resolution,
-            &Origin::policy(),
-            credentials,
-            Deadline::none(),
-            &|_, _| {},
-            &SourceDownload {
-                checkpoint_bytes: 1 << 20,
-                streams: 1,
-                fault: Fault::default(),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        let elapsed = start.elapsed();
-        assert_eq!(rows[0].transferred, bytes.len() as u64);
-        assert!(store.record_valid(&object.sha256).is_ok());
-        // One ask walks the redirect and the eight 1 MiB chunks ask its target directly,
-        // all on the drained redirect's socket unless each ask closes its own.
-        assert_eq!(origin.asks.lock().unwrap().len(), 9);
-        assert_eq!(origin.count(), if close { 9 } else { 1 });
-        timings.push((close, elapsed.as_secs_f64(), origin.count()));
-        drop(store);
-        let _ = std::fs::remove_dir_all(root);
-    }
-    println!("source 8 MiB, one redirect, eight 1 MiB chunks, 30 ms connection setup: {timings:?}");
 }
 
 #[test]

@@ -7,10 +7,10 @@
 //! chunk. A process that resumes re-hashes every recorded chunk, forgets any that no longer
 //! match, and asks only for what is not covered. The finished file is hashed whole and
 //! committed to the Store from where it lies; bytes that hash wrong start the object over.
-use super::download::{Batch, Download, PART_BYTES};
-use super::{CredentialProvider, Deadline, Ledger, PullCancellation, SourcePolicy, STREAMS};
+use super::download::PART_BYTES;
+use super::{PullCancellation, STREAMS};
 use crate::err::{refuse, Code, Refusal, Result};
-use crate::fetch_v1::{DeliveryGrant, FetchPlan};
+use crate::fetch_v1::FetchPlan;
 use crate::ids::{prefixed, ObjectRef};
 use crate::sha256::{hex, Sha256};
 use crate::store::{Fault, Store};
@@ -45,12 +45,6 @@ impl Default for SourceDownload {
 /// Bytes of the call's distinct objects present locally (held before it, or recorded by
 /// it) and their total. Present drops only when retained bytes are discarded.
 pub type SourceProgress<'a> = &'a (dyn Fn(u64, u64) + Sync);
-
-/// One wanted object: its grant and the source URL it is fetched from.
-pub(crate) struct SourceJob {
-    pub grant: DeliveryGrant,
-    pub url: String,
-}
 
 fn io(error: impl Into<std::io::Error>) -> Refusal {
     crate::store::classify_io("source download", error)
@@ -320,73 +314,6 @@ impl Keep<'_> {
         *present = present.saturating_add_signed(delta);
         (self.progress)(*present, self.total);
     }
-}
-
-/// Fetch every job into the store, returning the bytes this call moved per job.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn fetch_sources(
-    store: &Store,
-    owner: &str,
-    jobs: &[SourceJob],
-    policy: &SourcePolicy,
-    credentials: &dyn CredentialProvider,
-    deadline: Deadline,
-    ledger: &Ledger,
-    options: &SourceDownload,
-    held: u64,
-    progress: SourceProgress<'_>,
-) -> Result<Vec<u64>> {
-    // The whole remaining download against the disk budget, before any byte moves: bytes
-    // already retained under this owner are part of the store's occupancy.
-    let mut adding = 0u64;
-    for job in jobs {
-        let part = owner_dir(store, owner)?
-            .join(&job.grant.object.sha256)
-            .join("bytes.part");
-        let retained = fs::metadata(part).map_or(0, |md| allocated(&md));
-        adding = adding.saturating_add(job.grant.object.length.saturating_sub(retained));
-    }
-    store.admits(adding)?;
-    let keep = Keep {
-        owner,
-        fault: &options.fault,
-        progress,
-        total: held + jobs.iter().map(|job| job.grant.object.length).sum::<u64>(),
-        present: Mutex::new(held),
-    };
-    keep.landed(0);
-    let wanted: Vec<ObjectRef> = jobs.iter().map(|job| job.grant.object.clone()).collect();
-    let urls: BTreeMap<String, String> = jobs
-        .iter()
-        .map(|job| (job.grant.object.sha256.clone(), job.url.clone()))
-        .collect();
-    let moved = Mutex::new(BTreeMap::<String, u64>::new());
-    let on_object = |object: &ObjectRef, bytes: u64, _| {
-        moved.lock().unwrap().insert(object.sha256.clone(), bytes);
-    };
-    let grant = |object: &ObjectRef| {
-        let at = jobs.iter().position(|job| job.grant.object == *object);
-        Ok(jobs[at.expect("a wanted object has a job")].grant.clone())
-    };
-    let batch = Batch::new(&wanted, &grant, &urls, policy, credentials, Some(&on_object));
-    let chunk = options.checkpoint_bytes.clamp(1 << 20, 1 << 30);
-    let walked = Download {
-        store,
-        feed: &batch,
-        chunk,
-        ranged: false,
-        deadline,
-        ledger,
-        keep: Some(&keep),
-    }
-    .run(batch.streams(options.streams.clamp(1, 128), chunk), None);
-    drop(batch);
-    walked?;
-    let moved = moved.into_inner().unwrap();
-    Ok(jobs
-        .iter()
-        .map(|job| moved.get(&job.grant.object.sha256).copied().unwrap_or(0))
-        .collect())
 }
 
 /// Allocated bytes: a sparse part holds only what its chunks wrote.

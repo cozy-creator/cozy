@@ -710,7 +710,7 @@ fn restored_inherited_source_custody_survives_origin_release_and_writer_restart(
             vec!["model.json".into()]
         )
     );
-    crate::ingest::source::release_model_source(&restored, operation).unwrap();
+    crate::ingest::transaction::release_model_source(&restored, operation).unwrap();
     assert!(catalog.model_source_operations().unwrap().is_empty());
     fence(&restored_meta, &id, 1).unwrap();
     release(&restored_meta, first);

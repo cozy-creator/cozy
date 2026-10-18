@@ -500,101 +500,6 @@ pub fn adopt_partial(store: &Store, source: &str, owner: &str) -> Result<TreeRoo
     Ok(recipient.root.clone())
 }
 
-/// Build the existing converter's roster from verified retained raw members. Paths stay
-/// native implementation detail; they are never part of the client artifact capability.
-#[allow(clippy::type_complexity)]
-pub fn conversion_roster(
-    store: &Store,
-    owner: &str,
-) -> Result<(
-    ObjectRef,
-    Vec<crate::ingest::source::VerifiedModelSourceFile>,
-    Vec<String>,
-)> {
-    let _writer = WriterGuard::acquire(store.root())?;
-    let _lock = lock(store)?;
-    let root = read(store, owner)?.ok_or_else(|| Refusal {
-        code: Code::ROOT_ABSENT,
-        detail: "source tree root is absent".into(),
-    })?;
-    if !root.complete || root.released {
-        return refuse(
-            Code::TRANSACTION_CLOSED,
-            "conversion requires a complete retained source tree",
-        );
-    }
-    let tree = verify(store, &root.manifest)?;
-    let mut roster = Vec::new();
-    for (member, entry) in tree.entries() {
-        let object = entry.blob();
-        let mut file = store.open_nofollow(&object.sha256)?;
-        let header = if member.ends_with(".safetensors.index.json") {
-            if object.length > 32 << 20 {
-                return refuse(
-                    Code::SIZE_CAP,
-                    "source index exceeds converter header bound",
-                );
-            }
-            let mut bytes = Vec::new();
-            file.take(object.length)
-                .read_to_end(&mut bytes)
-                .map_err(io)?;
-            bytes
-        } else if member.ends_with(".safetensors") || crate::providers::is_civitai_member(member) {
-            let mut prefix = [0u8; 8];
-            file.read_exact(&mut prefix).map_err(io)?;
-            let length = u64::from_le_bytes(prefix);
-            if length > crate::limits::CARRIER_HEADER_MAX_BYTES as u64
-                || length.checked_add(8).is_none_or(|n| n > object.length)
-            {
-                return refuse(Code::SIZE_CAP, "source tensor header exceeds bound");
-            }
-            let mut bytes = prefix.to_vec();
-            file.take(length).read_to_end(&mut bytes).map_err(io)?;
-            bytes
-        } else {
-            continue;
-        };
-        roster.push(crate::ingest::source::VerifiedModelSourceFile {
-            member: member.clone(),
-            object_id: object.id(),
-            length: object.length,
-            path: store.object_path(&object.sha256),
-            header,
-        });
-    }
-    let landed = roster.iter().map(|row| row.member.clone()).collect();
-    Ok((root.manifest, roster, landed))
-}
-
-/// Prove the largest completed root fits before any member payload is transferred.
-pub fn check_roster(owner: &str, tree: &Manifest) -> Result<()> {
-    prefixed("source owner", owner)?;
-    let mut objects: Vec<_> = tree
-        .entries()
-        .iter()
-        .map(|(_, entry)| entry.blob().clone())
-        .collect();
-    objects.sort_by(|a, b| a.sha256.cmp(&b.sha256));
-    objects.dedup();
-    let root = TreeRoot {
-        tensorfs: Some(crate::VERSION.into()),
-        owner: owner.into(),
-        producer: owner.into(),
-        manifest: tree.object_ref(),
-        objects,
-        complete: true,
-        released: false,
-    };
-    if root.canonical_bytes().len() > TreeRoot::MAX_BYTES {
-        return refuse(
-            Code::SIZE_CAP,
-            "selected source root exceeds metadata bound before transfer",
-        );
-    }
-    Ok(())
-}
-
 /// Cancel a recipient before or after adoption. The original retained receipt supplies
 /// immutable producer/manifest identity; a durable tombstone fences any later retain.
 pub fn release_retention(
@@ -646,4 +551,31 @@ pub fn release_retention(
     root.objects.clear();
     write(store, &root)?;
     crate::transport::sources::discard_owner(store, owner)
+}
+
+pub fn check_roster(owner: &str, tree: &Manifest) -> Result<()> {
+    prefixed("source owner", owner)?;
+    let mut objects: Vec<_> = tree
+        .entries()
+        .iter()
+        .map(|(_, entry)| entry.blob().clone())
+        .collect();
+    objects.sort_by(|a, b| a.sha256.cmp(&b.sha256));
+    objects.dedup();
+    let root = TreeRoot {
+        tensorfs: Some(crate::VERSION.into()),
+        owner: owner.into(),
+        producer: owner.into(),
+        manifest: tree.object_ref(),
+        objects,
+        complete: true,
+        released: false,
+    };
+    if root.canonical_bytes().len() > TreeRoot::MAX_BYTES {
+        return refuse(
+            Code::SIZE_CAP,
+            "selected source root exceeds metadata bound before transfer",
+        );
+    }
+    Ok(())
 }

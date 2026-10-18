@@ -41,8 +41,6 @@ pub mod failure;
 pub mod fetch;
 #[cfg(feature = "store")]
 pub mod fetch_v1;
-#[cfg(feature = "store")]
-pub mod fill;
 pub mod fit;
 pub mod format;
 #[cfg(feature = "store")]
@@ -70,8 +68,6 @@ pub mod object_roots;
 pub mod origin;
 #[cfg(feature = "store")]
 pub mod project;
-#[cfg(feature = "store")]
-pub mod providers;
 pub mod read;
 #[cfg(feature = "store")]
 pub mod receipt;
@@ -84,8 +80,6 @@ pub mod repository;
 pub mod sha256;
 #[cfg(feature = "store")]
 pub mod source_artifact;
-#[cfg(feature = "store")]
-pub mod source_model;
 pub mod spec;
 #[cfg(feature = "store")]
 pub mod stats;
