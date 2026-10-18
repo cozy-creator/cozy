@@ -65,8 +65,7 @@ impl Machines {
     /// The Hub access and provider tokens the run's send to `machine` carries.
     pub(crate) async fn access(&self, run: &RunRow, machine: &str) -> Result<Access, Denied> {
         let providers = self.providers.clone();
-        let unkept = v1::RunSpec::default();
-        let spec = run.spec.as_ref().unwrap_or(&unkept);
+        let spec = &run.spec;
         if run.hub.is_empty() || (self.device_key(&run.hub).is_err() && !private(spec)) {
             return Ok(Access {
                 hub: None,

@@ -926,7 +926,7 @@ fn refused(e: client::Error) -> Ranged<Failure> {
         client::Error::Refused { status, error } if status < 500 => {
             Ranged::Stop(Failure::Again(format!("{}: {}", error.code, error.message)))
         }
-        client::Error::NotMachineApi(message) => Ranged::Stop(Failure::Again(message)),
+        client::Error::Answer(message) => Ranged::Stop(Failure::Again(message)),
         e => Ranged::Again(e.to_string()),
     }
 }

@@ -535,16 +535,10 @@ impl Calcifer {
                     );
                     pause.wait(wake, Some(&mut changed)).await;
                 }
-                Err(Stop::Refused(mut reason)) => {
-                    // An outdated machine's refusal says what to do about it, by its name.
-                    if reason.code == link::OUTDATED {
-                        reason.message = format!("{name}: {}; {}", reason.message, link::outdated_remedy(&name));
-                    }
-                    match self.store.fail(id.as_str(), reason) {
-                        Ok(events) => self.publish(id, events),
-                        Err(e) => warn!(run = %id, "{e}"),
-                    }
-                }
+                Err(Stop::Refused(reason)) => match self.store.fail(id.as_str(), reason) {
+                    Ok(events) => self.publish(id, events),
+                    Err(e) => warn!(run = %id, "{e}"),
+                },
                 Err(Stop::Released(message)) => {
                     if let Err(e) = self.machine_ended(&name, &message) {
                         warn!(run = %id, "{e}");
@@ -614,7 +608,7 @@ impl Calcifer {
         // The spec as sent: finished under the machine's send lock, so a warm set merges into what
         // the machine reported after the runs sent before it.
         let spec = |access| {
-            let mut spec = run.spec.clone().ok_or_else(not_kept)?;
+            let mut spec = run.spec.clone();
             self.finish_spec(run, &mut spec, access);
             Ok::<_, Stop>(spec)
         };
@@ -622,7 +616,6 @@ impl Calcifer {
         let (state, stream) = match run.state {
             State::Settled => return Ok(()),
             State::Queued => {
-                run.spec.as_ref().ok_or_else(not_kept)?;
                 self.write_inputs(link, run, machine).await?;
                 let _turn = sending.lock().await;
                 self.known_warm(run, machine, link).await?;
@@ -640,7 +633,6 @@ impl Calcifer {
                 // It may be there: attach first, and send again only to a machine that never got it.
                 match link.attach(id, run.cursor).await {
                     Err(LinkError::NotFound) if run.state == State::Sent => {
-                        run.spec.as_ref().ok_or_else(not_kept)?;
                         self.write_inputs(link, run, machine).await?;
                         let _turn = sending.lock().await;
                         self.known_warm(run, machine, link).await?;
@@ -820,8 +812,7 @@ impl Calcifer {
         if run.inputs.is_empty() {
             return Ok(());
         }
-        let names: HashMap<&str, &str> = (run.spec.iter())
-            .flat_map(|spec| &spec.inputs)
+        let names: HashMap<&str, &str> = (run.spec.inputs.iter())
             .map(|i| (i.digest.as_str(), i.field.as_str()))
             .collect();
         let digests: Vec<Digest> = run.inputs.iter().map(|(digest, _)| *digest).collect();
@@ -897,8 +888,7 @@ impl Calcifer {
     /// Reads the machine's warm set before a warm run's set is merged into it, if none was seen
     /// yet.
     async fn known_warm(&self, run: &RunRow, machine: &str, link: &Link) -> Result<(), Stop> {
-        let merges = (run.spec.as_ref())
-            .is_some_and(|spec| spec.kind == v1::RunKind::Warm && spec.set.is_some());
+        let merges = run.spec.kind == v1::RunKind::Warm && run.spec.set.is_some();
         if !merges || lock(&self.warm).contains_key(machine) {
             return Ok(());
         }
@@ -1028,16 +1018,6 @@ fn copy_checked(inputs: &Path, source: &StagedInput, target: &Path) -> Result<()
         .map_err(|e| failed(e.to_string()))?;
     part.persist(target).map_err(|e| failed(e.to_string()))?;
     Ok(())
-}
-
-/// A run its machine never confirmed whose spec was not kept (sent before xs-044's JSON specs).
-fn not_kept() -> Stop {
-    Stop::Refused(Reason {
-        code: "spec_not_kept".into(),
-        message: "its machine never confirmed the run, and its spec was not kept across the move \
-                  to the HTTP machine API; run it again"
-            .into(),
-    })
 }
 
 /// The stream's next item if it has one now, without waiting.

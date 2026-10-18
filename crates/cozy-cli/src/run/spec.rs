@@ -94,16 +94,15 @@ impl Call<'_> {
                 installation: Some(installation),
                 ..
             } => v1::WarmSource::Installation(installation.to_owned()),
-            // An older machine's install names no installation, which a warm set needs.
+            // A kept interface names no installation; a warm set always installs first.
             Source::Local {
                 installation: None, ..
             } => {
                 return Err(Error::new(
-                    Kind::Unavailable,
-                    "local_warm_unsupported",
-                    "this machine names no installation for local code, so it cannot keep it ready",
-                )
-                .remedy("update the machine: `cozy machine update <name>`"));
+                    Kind::Internal,
+                    "local_warm_uninstalled",
+                    "a warm set of local code needs the installation its install named",
+                ));
             }
         };
         let item = v1::WarmItem {

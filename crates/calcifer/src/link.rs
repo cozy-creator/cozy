@@ -28,18 +28,6 @@ use crate::{
     store,
 };
 
-/// The refusal of a machine from before this API (cozy v0.9's gRPC), which is never driven.
-pub const OUTDATED: &str = "machine_outdated";
-
-/// What to do about a machine from before the HTTP API, which this controller never drives:
-/// this computer's is taken over by `enable`, any other is ended.
-pub fn outdated_remedy(name: &str) -> String {
-    match name {
-        "local" => "this computer's machine is older than this cozy: `cozy machine enable` takes it over".into(),
-        _ => format!("end it: cozy machine end {name}"),
-    }
-}
-
 /// A machine's bulk lanes, each its own HTTP/1.1 connections: output reads use them all, an
 /// upload `UPLOAD_LANES` of them.
 pub(crate) const LANES: usize = 8;
@@ -85,11 +73,7 @@ impl From<Error> for LinkError {
             Error::Refused { error, .. } => {
                 LinkError::Unreachable(format!("{}: {}", error.code, error.message))
             }
-            Error::Transport(message) => LinkError::Unreachable(message),
-            Error::NotMachineApi(message) => LinkError::Refused {
-                code: OUTDATED.into(),
-                message,
-            },
+            Error::Transport(message) | Error::Answer(message) => LinkError::Unreachable(message),
         }
     }
 }

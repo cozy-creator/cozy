@@ -74,7 +74,6 @@ rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 reqwest = { version = "0.13", default-features = false, features = ["form", "http2", "json", "query", "rustls", "stream"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
-rusqlite_migration = "2.6"
 rustls = { version = "0.23.46", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 self-replace = "1.5"
 semver = "1"

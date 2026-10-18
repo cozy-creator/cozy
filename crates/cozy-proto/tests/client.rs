@@ -191,7 +191,7 @@ fn router() -> Router {
         )
         .route(
             path::CANCEL,
-            post(|| async { ([("grpc-status", "12")], "") }),
+            post(|| async { (StatusCode::BAD_GATEWAY, "<html>bad gateway</html>") }),
         )
 }
 
@@ -240,10 +240,7 @@ async fn the_client_pins_the_leaf_and_speaks_every_shape_of_the_api() {
         (refused.status(), refused.code()),
         (Some(409), Some("run_id_conflict"))
     );
-    assert!(matches!(
-        machine.cancel("r").await,
-        Err(Error::NotMachineApi(_))
-    ));
+    assert!(matches!(machine.cancel("r").await, Err(Error::Answer(_))));
 
     assert_eq!(
         machine.held("sha256:ab").await.unwrap(),
