@@ -1,4 +1,4 @@
-//! The one converter engine. A family's layout is a data table (`crates/tensorfs/converters/`),
+//! The one converter engine. A family's layout is a data table (`tensorfs-core/converters/`),
 //! generated from upstream's own converter; this file recognizes a source by its tables' key
 //! sets and applies a table row by row: `rename | view -> take(axis, idx) | permute -> shape`,
 //! then the component's `cast`. Nothing model-specific lives here.
@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::Read;
-use std::os::unix::fs::FileExt;
+use cozy_platform::durable::FileAt;
 
 use serde::Deserialize;
 
@@ -17,7 +17,7 @@ use super::source::{Group, SourceSet, Tensor};
 
 macro_rules! table {
     ($name:literal) => {
-        include_str!(concat!("../../../../converters/", $name, ".json"))
+        include_str!(concat!("../../converters/", $name, ".json"))
     };
 }
 

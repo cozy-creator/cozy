@@ -9,7 +9,7 @@
 # [tool.uv.sources]
 # torch = { index = "pytorch-cpu" }
 # ///
-"""Generate the converter tables (`crates/tensorfs/converters/*.json`) from upstream's converters.
+"""Generate the converter tables (`crates/tensorfs-core/converters/*.json`) from upstream's converters.
 
     uv run scripts/converters.py           # regenerate every table and compare byte for byte
     uv run scripts/converters.py --write   # rewrite them
@@ -48,7 +48,7 @@ from diffusers.loaders import single_file_utils
 
 PINS = {"diffusers": "0.40.0", "transformers": "5.16.1"}
 ROOT = Path(__file__).resolve().parents[1]
-OUT = ROOT / "converters"
+OUT = ROOT / "crates" / "tensorfs-core" / "converters"
 VECTORS = ROOT / "vectors"
 HF = "https://huggingface.co"
 H3_SCRIPT = (
