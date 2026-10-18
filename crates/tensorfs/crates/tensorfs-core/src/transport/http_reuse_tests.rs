@@ -1,5 +1,5 @@
 use super::*;
-use crate::transport::{Anonymous, CredentialProvider, SourcePolicy};
+use crate::transport::{Anonymous, SourcePolicy};
 use std::net::{Shutdown, TcpListener};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;

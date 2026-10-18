@@ -16,8 +16,6 @@ pub mod catalog;
 mod cbor;
 #[cfg(feature = "store")]
 pub mod checkpoint;
-#[cfg(feature = "store")]
-pub mod checkpoint_root;
 /// The v2 front door the `tfs` CLI and Python share (xs-045 U7).
 #[cfg(feature = "store")]
 pub mod client;
@@ -62,8 +60,6 @@ pub mod meta;
 /// `tfs dev migrate`: v1 checkpoints into v2, with the last v1 reader (xs-045 U12).
 #[cfg(feature = "store")]
 pub mod migrate;
-#[cfg(feature = "store")]
-pub mod object_roots;
 #[cfg(feature = "store")]
 pub mod origin;
 #[cfg(feature = "store")]
