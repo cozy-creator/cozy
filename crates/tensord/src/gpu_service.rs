@@ -17,7 +17,7 @@ use crate::{
     },
     launch_identity::Seal,
     memory::{
-        policy::{Ask, Facts, Gpu, Holding, Sample, Step},
+        policy::{Facts, Holding, Step},
         GpuMemory, MemoryConfig,
     },
     model_sources::{ModelSources, SelectedManifest},
@@ -542,7 +542,7 @@ const ENDED: &str = "import-only executor ended";
 /// 0.78 GiB RSS (J/RESULTS.md).
 const UNMEASURED_PARENT: u64 = 1 << 30;
 
-/// The host-facts key of a generation's import-only executor.
+/// The learned-host key of a generation's import-only executor.
 fn parent_key(held: &HeldGeneration) -> String {
     format!("parent:{}:{}", held.record.identity, held.record.application)
 }
@@ -718,18 +718,21 @@ impl Pool {
         remove_old_executor_roots(root);
         let mut devices = vec![];
         for entry in &envelope {
-            // Per GPU: its own sample log (two writers would tear it).
+            // Per GPU: its own sample log and learned file (two writers would tear them).
             let mut memory = config.memory.clone();
+            let mut learned = root.to_path_buf();
             if envelope.len() > 1 {
                 memory.sample_log = memory.sample_log.map(|path| {
                     let mut name = path.into_os_string();
                     name.push(format!(".gpu{entry}"));
                     name.into()
                 });
+                learned = root.join(format!("memory-gpu{entry}"));
+                fs::create_dir_all(&learned)?;
             }
             devices.push(Device {
                 entry: entry.clone(),
-                memory: GpuMemory::start(entry, &memory, notes.clone()),
+                memory: GpuMemory::start(entry, &memory, &learned, notes.clone()),
             });
         }
         let pool = Arc::new(Self {
@@ -911,12 +914,12 @@ impl Pool {
         crate::precision::Gpus::of(&ccs)
     }
     /// The lane rule's budget on the first `degree` GPUs (design §2.1): the smallest one's memory
-    /// less the largest activation peak `constructions` measured on them in this machine run,
-    /// a quarter of that memory before any. None when the inventory names no memory.
+    /// less the largest activation peak `constructions` measured on them, a quarter of that
+    /// memory before any. None when the inventory names no memory.
     pub fn budget(&self, degree: u32, constructions: &[String]) -> Option<u64> {
         let lane = &self.devices[..self.devices.len().min(degree as usize)];
         let memory = lane.iter().map(|d| self.inventory(&d.entry).map(|g| g.memory_bytes)).min()??;
-        let peak = lane.iter().flat_map(|d| constructions.iter().filter_map(|c| d.memory.with(|g| g.facts(c).activation))).max();
+        let peak = lane.iter().flat_map(|d| constructions.iter().filter_map(|c| d.memory.with(|g| g.learned.peak(c)))).max();
         Some(memory.saturating_sub(peak.unwrap_or(memory / 4)))
     }
     fn inventory(&self, entry: &str) -> Option<&crate::machine::receipt::Gpu> {
@@ -1142,15 +1145,17 @@ impl Pool {
         if !self.sessions.lock().unwrap().get(&plan.construction).is_some_and(offers) {
             return Ok("its Runtime maps no weights ahead of a request");
         }
-        if !self.member_room(&plan.construction, 0, true)? {
+        let step = |step: &Step| self.carry_out(0, step);
+        let Some(cap) = self.first().admit_member(&plan.construction, true, || self.holdings(), step)? else {
             return Ok("no GPU room for its weights beside the warm set and the running call");
-        }
+        };
         let Some(mut session) = self.sessions.lock().unwrap().remove(&plan.construction) else {
             return Ok("its executor ended");
         };
         let reply = session.executor.command(
             &DeviceCommand::Map {
                 construction: plan.construction.clone(),
+                cap_bytes: cap,
                 floor_bytes: self.first().floor(),
             },
             &mut device_executor::Baseline,
@@ -1309,32 +1314,20 @@ impl Pool {
             }
         }
     }
-    /// Before a spawn, on each GPU of the lane in device order (so two groups never wait on
-    /// each other): idle tenants give room for its context and, as measured, its first working
-    /// set. Never refused: it starts with the room there is.
-    fn spawn_room(&self, plan: &str, start: usize, degree: u32) -> io::Result<()> {
+    /// Each GPU of the lane decides for itself, in device order (so two groups never wait
+    /// on each other): one cap per GPU, rank 0's first. None: that GPU could not say.
+    fn decide(&self, plan: &str, start: usize, degree: u32, spawn: bool) -> io::Result<Vec<Option<u64>>> {
         self.reap();
+        let mut caps = vec![];
         for (gpu, device) in (start..).zip(self.lane(start, degree)?) {
-            let short = |g: &Gpu, s: &Sample| g.spawn_need(plan).saturating_sub(g.room(plan, s));
-            let holdings = || if gpu == 0 { self.holdings() } else { vec![] };
-            device.memory.make_room(plan, Ask::Spawn, short, holdings, |step| self.carry_out(gpu, step))?;
-            device.memory.with(|g| g.starting(plan));
+            caps.push(device.memory.decide(
+                plan,
+                spawn,
+                || if gpu == 0 { self.holdings() } else { vec![] },
+                |step| self.carry_out(gpu, step),
+            )?);
         }
-        Ok(())
-    }
-    /// Whether warm set member `plan` has room on GPU `gpu` for its spawn, or with `mapped` its
-    /// weights mapped, once idle tenants outside every warm set gave what they could. True
-    /// without NVML; false while its weights were never measured.
-    fn member_room(&self, plan: &str, gpu: usize, mapped: bool) -> io::Result<bool> {
-        let need = |g: &Gpu| if mapped { g.mapped_need(plan) } else { Some(g.spawn_need(plan)) };
-        let memory = &self.devices[gpu].memory;
-        if memory.with(|g| need(g).is_none()) {
-            return Ok(false);
-        }
-        let short = |g: &Gpu, s: &Sample| need(g).unwrap_or(0).saturating_sub(g.room(plan, s));
-        let holdings = || if gpu == 0 { self.holdings() } else { vec![] };
-        let room = memory.make_room(plan, Ask::Member, short, holdings, |step| self.carry_out(gpu, step))?;
-        Ok(room.is_none_or(|(_, short, _)| short == 0))
+        Ok(caps)
     }
     pub fn host_tier(&self) -> &Arc<HostTier> {
         &self.host
@@ -1769,19 +1762,23 @@ impl Pool {
         (0..self.devices.len()).filter(hosts).collect()
     }
     /// Whether a call of `plan` fits on GPU `device` now beside its tenants. A GPU that never
-    /// ran it first takes what another GPU measured of it.
+    /// ran it first learns what another GPU measured of it.
     fn fits(&self, plan: &str, device: usize) -> bool {
         let memory = &self.devices[device].memory;
-        let measured = self.devices.iter().map(|d| d.memory.with(|gpu| gpu.facts(plan))).find(|f| f.activation.is_some());
-        if let Some(measured) = measured {
-            memory.with(|gpu| gpu.adopt(plan, measured));
+        if !memory.with(|gpu| gpu.learned.plans.contains_key(plan)) {
+            let learned = self.devices.iter().find_map(|other| {
+                other.memory.with(|gpu| gpu.learned.plans.get(plan).cloned())
+            });
+            if let Some(learned) = learned {
+                memory.with(|gpu| gpu.learned.plans.insert(plan.into(), learned));
+            }
         }
         memory.fits(plan, || if device == 0 { self.holdings() } else { vec![] })
     }
     /// Where `plan` runs now, with its GPUs' call slots: inside its root's `lane` when it has
     /// one, else (a standalone call) on GPUs no root holds or older root claims. A group takes
     /// a free contiguous lane; one GPU, in order: a free one with its idle executor, a free one
-    /// where its measured call fits beside the tenants there (a replica when it runs elsewhere
+    /// where its learned call fits beside the tenants there (a replica when it runs elsewhere
     /// too), or, when it runs nowhere or inside its root's lane, any free one. None: it waits,
     /// and a standalone call claims the GPUs it waits for from later requests.
     fn place(
@@ -2039,28 +2036,39 @@ impl Pool {
             return Ok("already loaded");
         }
         let lane = self.lane(start, plan.degree)?;
+        let mut load_caps = vec![];
         for (gpu, device) in (start..).zip(lane) {
+            let holdings = || if gpu == 0 { self.holdings() } else { vec![] };
             // A warm set member may take the room of idle tenants outside every set; a
             // prefetch only what is free. Neither touches a member or a running call.
-            let room = match member {
-                true => self.member_room(&plan.construction, gpu, false)?,
-                false => device.memory.admits(&plan.construction, || if gpu == 0 { self.holdings() } else { vec![] }),
+            let cap = match member {
+                true => {
+                    let step = |step: &Step| self.carry_out(gpu, step);
+                    device.memory.admit_member(&plan.construction, false, holdings, step)?
+                }
+                false => device.memory.admits(&plan.construction, holdings).then_some(None),
             };
-            if !room {
-                return Ok("no GPU room beside the warm set and the running call");
+            match cap {
+                Some(cap) => load_caps.push(cap),
+                None => return Ok("no GPU room beside the warm set and the running call"),
             }
         }
         if !self.host_room(&plan.construction, start, plan.degree, true) {
             return Ok("host_memory: no host room beside the warm set and what this host's other programs used recently");
         }
+        if !member {
+            load_caps = self.decide(&plan.construction, start, plan.degree, true)?;
+        }
         for device in lane {
-            device.memory.with(|gpu| gpu.starting(&plan.construction));
+            device
+                .memory
+                .with(|gpu| gpu.starting(&plan.construction, gpu.spawn_need(&plan.construction)));
         }
         let mut session = self.new_session(engine, held, &plan, start, |birth, _| {
             self.devices[start].memory.with(|gpu| gpu.spawned(&plan.construction, birth.pid));
             Ok(())
         })?;
-        match self.call(engine, "", held, plan, &mut session, true, None, fetch) {
+        match self.call(engine, "", held, plan, &load_caps, &mut session, true, None, fetch) {
             Ok(_) => {
                 self.keep_idle(session);
                 Ok("loaded")
@@ -2281,11 +2289,24 @@ impl Pool {
     }
 
     /// Whether the host has room for `generation`'s parent beside what it holds now: its
-    /// private bytes as measured in this machine run. A prespawn never makes room; a request
-    /// that needs a parent always gets one.
+    /// measured private bytes (else the largest any parent measured). A prespawn never
+    /// makes room; a request that needs a parent always gets one.
     fn parent_fits(&self, held: &HeldGeneration) -> bool {
-        let need = self.first().with(|gpu| gpu.facts(&parent_key(held)).host);
-        self.host_room_now().is_none_or(|room| room >= need.filter(|b| *b > 0).unwrap_or(UNMEASURED_PARENT))
+        let need = self.first().with(|gpu| {
+            let learned = |key: &str| gpu.learned.plans.get(key).map(|plan| plan.host_bytes);
+            learned(&parent_key(held))
+                .or_else(|| {
+                    gpu.learned
+                        .plans
+                        .iter()
+                        .filter(|(key, _)| key.starts_with("parent:"))
+                        .map(|(_, plan)| plan.host_bytes)
+                        .max()
+                })
+                .filter(|bytes| *bytes > 0)
+                .unwrap_or(UNMEASURED_PARENT)
+        });
+        self.host_room_now().is_none_or(|room| room >= need)
     }
 
     /// Drop a dead parent, if it is still the generation's: the next launch starts another.
@@ -2390,8 +2411,10 @@ impl Pool {
                 )));
             }
             if let Ok(memory) = cozy_platform::contain::host_memory::process(executor.birth.pid) {
-                let host = Some(memory.pss.saturating_sub(memory.pss_shmem));
-                self.first().observe(&parent_key(held), Facts { host, ..Facts::default() }, None);
+                self.first().learn_host(
+                    &parent_key(held),
+                    memory.pss.saturating_sub(memory.pss_shmem),
+                );
             }
             io::Result::Ok(ZygoteState::Ready(Box::new(executor)))
         })();
@@ -2607,6 +2630,7 @@ impl Pool {
                     &DeviceCommand::Budget {
                         vram_bytes: 0,
                         pinned_bytes: -1,
+                        cap_bytes: None,
                     },
                     &mut device_executor::Baseline,
                 );
@@ -2668,22 +2692,27 @@ impl Pool {
                 self.sessions.lock().unwrap().remove(&key)
             }
         };
-        let session = match retained {
+        let (session, load_caps) = match retained {
             Some(session) => {
                 engine.register_managed(
                     id,
                     session.executor.birth.clone(),
                     stops(session.executor.cancellation()),
                 )?;
-                session
+                (session, vec![])
             }
             None => {
                 if degree > 0 {
                     self.host_room(&plan.construction, start, degree, false);
                 }
-                // Room for a context and the first working set on every GPU of the lane before
-                // the process exists.
-                self.spawn_room(&plan.construction, start, degree)?;
+                // A context and the first working set are reserved on every GPU of the lane
+                // before the process exists.
+                let load_caps = self.decide(&plan.construction, start, degree, true)?;
+                for device in self.lane(start, degree)? {
+                    device
+                        .memory
+                        .with(|gpu| gpu.starting(&plan.construction, gpu.spawn_need(&plan.construction)));
+                }
                 let on_birth = |birth: &Birth, cancel: &Cancellation| {
                     // Rank 0 drives the lane's first GPU; followers are named after Start.
                     if let Some(device) = self.lane(start, degree)?.first() {
@@ -2696,7 +2725,7 @@ impl Pool {
                         engine.finish(id, Outcome::Failed(Failure::machine("executor_unsupported", error.to_string())))?;
                         return Ok(());
                     }
-                    session => session?,
+                    session => (session?, load_caps),
                 }
             }
         };
@@ -2717,7 +2746,7 @@ impl Pool {
         let error = {
             let mut session = session;
             let fetch = calls.map(|calls| engine.get(id).map(|record| calls.fetch(&record, &plan))).transpose()?;
-            match self.call(engine, id, &held, plan, &mut session, false, calls, fetch) {
+            match self.call(engine, id, &held, plan, &load_caps, &mut session, false, calls, fetch) {
                 Ok(true) => {
                     self.keep_idle(session);
                     return Ok(());
@@ -2870,6 +2899,7 @@ impl Pool {
         id: &str,
         held: &HeldGeneration,
         plan: Plan,
+        load_caps: &[Option<u64>],
         session: &mut Session,
         load_only: bool,
         calls: Option<&Arc<crate::calls::Calls>>,
@@ -2931,7 +2961,10 @@ impl Pool {
                     call_interfaces: crate::calls::call_interfaces(held, &interface_path),
                     constructions,
                 },
-                &Group { rank_cells: ranked },
+                &Group {
+                    rank_cells: ranked,
+                    ..Group::default()
+                },
                 &mut callbacks,
             )?)?;
             if ranked && (1..degree).any(|rank| !callbacks.cells.contains_key(&rank)) {
@@ -2981,6 +3014,7 @@ impl Pool {
             for (device, pid) in gpus.iter().skip(1).zip(&started.follower_pids) {
                 device.memory.with(|gpu| gpu.spawned(&construction, *pid));
             }
+            let (load_cap, load_group) = rank_grant(load_caps);
             // Its pinned budget, the Load's when the executor takes it there (`load_pinned/1`).
             let plane = !plan.slots.is_empty() && session.executor.hello.offers("weight_plane/1");
             let at_load = plane && session.executor.hello.offers("load_pinned/1");
@@ -3009,6 +3043,7 @@ impl Pool {
                     staged_tiers: false,
                     pinned_bytes: None,
                     device_weights: false,
+                    cap_bytes: load_cap,
                 },
                 Some(first) => {
                     let store = self.store.root().to_string_lossy().into_owned();
@@ -3049,12 +3084,13 @@ impl Pool {
                         staged_tiers: true,
                         pinned_bytes: at_load.then_some(pinned),
                         device_weights: sharing,
+                        cap_bytes: load_cap,
                     }
                 }
             };
             let started = std::time::Instant::now();
-            let loaded = command_ok(session.executor.command(&load, &mut callbacks)?)?;
-            self.observe(
+            let loaded = command_ok(session.executor.command_with(&load, &load_group, &mut callbacks)?)?;
+            let facts = self.observe(
                 &construction,
                 start,
                 degree,
@@ -3062,6 +3098,11 @@ impl Pool {
                 &loaded.rank_planes,
                 Some(false),
             );
+            for device in gpus {
+                device
+                    .memory
+                    .learn_load(&construction, facts.weights, facts.weights_floor);
+            }
             self.record_load(
                 &construction,
                 &lane,
@@ -3075,6 +3116,7 @@ impl Pool {
                     &DeviceCommand::Budget {
                         vram_bytes: -1,
                         pinned_bytes: pinned,
+                        cap_bytes: None,
                     },
                     &mut callbacks,
                 )?)?;
@@ -3157,7 +3199,18 @@ impl Pool {
             engine.finish(id, Outcome::Failed(failure))?;
             return Ok(true);
         }
-        command_ok(prepared)?;
+        let prepared = command_ok(prepared)?;
+        let shape = crate::memory::learned::shape_cell(&prepared.features);
+        for device in gpus {
+            device.memory.with(|gpu| gpu.set_shape(&construction, &shape));
+        }
+        if let Some((from, ratio)) = gpu
+            .and_then(|gpu| gpu.with(|gpu| gpu.shape(&construction)))
+            .and_then(|learned| learned.estimated_from)
+        {
+            self.notes.note(serde_json::json!({"event": "estimate", "plan": construction,
+                "run": id, "shape": shape, "from": from, "ratio": ratio}));
+        }
         let spool = if let Some(identity) = self.config.identity {
             // Keep Journal/results/admin paths private to the core. A separate peer-owned
             // spool lives only inside this executor's already authorized output directory.
@@ -3190,11 +3243,23 @@ impl Pool {
         if degree > 0 {
             self.shed(&construction, start);
         }
-        // The call starts uncapped: its executor reads the driver and asks for room
-        // (`DeviceRoom`). Each GPU's floor watchdog writes the cell of its own rank's process.
-        for (rank, device) in (0u32..).zip(gpus) {
-            let cell = callbacks.cells.get(&rank).map(File::try_clone).transpose()?;
-            device.memory.running(&construction, cell);
+        // A real grant for the whole call: one tenant needs no per-stage turns.
+        // A group's cap holds on every GPU of it (each rank caps its own process).
+        let caps = self.decide(&construction, start, degree, false)?;
+        let (cap, group) = rank_grant(&caps);
+        // Every executor of the cohort caps its whole process (`process_cap/1`): the plane
+        // derives its budget inside the cap.
+        let (plane_budget_bytes, cap_bytes) = (-1, cap);
+        // Each GPU's floor watchdog writes the cell of its own rank's process.
+        for ((rank, device), own) in (0u32..).zip(gpus).zip(&caps) {
+            if let Some(own) = *own {
+                let cell = callbacks
+                    .cells
+                    .get(&rank)
+                    .map(File::try_clone)
+                    .transpose()?;
+                device.memory.running(&construction, own, cell);
+            }
         }
         callbacks.spool = Some(spool.clone());
         let document = held.record.app(&record.invocation.module)
@@ -3212,7 +3277,7 @@ impl Pool {
         let invoked = Instant::now();
         let first = !session.invoked;
         session.invoked = true;
-        let reply = session.executor.command(
+        let reply = session.executor.command_with(
             &DeviceCommand::Invoke {
                 max_output_bytes: crate::output_capacity::for_callable(document, "entrypoints", &plan.entrypoint)?,
                 request_id: id.into(),
@@ -3222,13 +3287,18 @@ impl Pool {
                 deadline_s: None,
                 attention_kernel: record.invocation.attention_kernel.clone(),
                 bits: record.invocation.bits,
+                plane_budget_bytes,
+                cap_bytes,
                 inputs: inputs.inputs,
                 trees: inputs.trees,
                 floor_bytes: gpu.and_then(GpuMemory::floor),
+                activation_bytes: gpu.map(|gpu| gpu.with(|gpu| gpu.seeds(&construction))).unwrap_or_default(),
+                squeezed_bytes: gpu.map(|gpu| gpu.with(|gpu| gpu.squeezed(&construction))).unwrap_or_default(),
                 device_weights: attaches.then_some(share),
                 sources: plan.sources.iter().map(|s| (s.parameter.clone(), s.manifest.clone())).collect(),
                 weights: grant.as_ref().map(|grant| grant.outputs.clone()).unwrap_or_default(),
             },
+            &group,
             &mut callbacks,
         );
         session.executor.waits = None;
@@ -3244,6 +3314,7 @@ impl Pool {
                 Some(own + p.shared_bytes.and_then(|b| u64::try_from(b).ok()).unwrap_or(0))
             })
             .filter(|bytes| *bytes > 0);
+        self.learn(&construction, gpus, &shape, &reply, session.executor.birth.pid, mapped);
         self.record_invoke(&construction, &lane, first, invoked.elapsed(), &reply);
         record_measurements(engine, id, &plan, &reply, &session.counted);
         if let Some(plane) = &reply.plane {
@@ -3262,9 +3333,6 @@ impl Pool {
                 .and_then(|m| m.activation_peak_bytes)
                 .and_then(|v| u64::try_from(v).ok())
         });
-        facts.mapped = mapped;
-        let host = cozy_platform::contain::host_memory::process(session.executor.birth.pid);
-        facts.host = host.ok().map(|host| host.pss.saturating_sub(host.pss_shmem));
         self.observe(&construction, start, degree, facts, &reply.rank_planes, Some(true));
         // Rank 0 answered, so a follower that ended during the call is the group's first fault.
         let lost = self.lost_followers(start, degree, &session.followers);
@@ -3349,7 +3417,7 @@ impl Pool {
     /// Degree 2 for `plan`'s executor: GPU weights the machine keeps across executors. It
     /// keeps every component resident until revoked, and a running call never revokes what
     /// it reads, so only when the whole construction and its activations fit beside the other
-    /// tenants, as measured in this machine run (unmeasured: Degree 1, where stages
+    /// tenants, as measured here or in an earlier run (unmeasured: Degree 1, where stages
     /// evict each other). World-one on the first GPU only: a group or a replica shares nothing.
     fn degree2(&self, plan: &str, start: usize, degree: u32, executor: &DeviceExecutor) -> io::Result<bool> {
         Ok(self.custody.is_some()
@@ -3358,8 +3426,8 @@ impl Pool {
             && self.first().fits_resident(plan, || self.holdings()))
     }
 
-    /// Before a spawn: the host has room for the executor's private bytes as measured in this
-    /// machine run, or gives it back in order: unheld sealed layouts (their bytes come from
+    /// Before a spawn: the host has room for the executor's private bytes as measured in
+    /// earlier runs, or gives it back in order: unheld sealed layouts (their bytes come from
     /// the page cache or the store again), then import-only parents with no live child, then
     /// idle executors, least recently used first.
     /// A plan never measured asks nothing; nothing is refused for the room that is left.
@@ -3368,7 +3436,12 @@ impl Pool {
     /// and not yet loaded count as held, so concurrent spawns never share one reading. Returns
     /// whether the room is there; a request is admitted either way.
     fn host_room(&self, plan: &str, start: usize, degree: u32, spare: bool) -> bool {
-        let need = self.devices[start].memory.with(|gpu| gpu.facts(plan).host.unwrap_or(0));
+        let need = self.devices[start].memory.with(|gpu| {
+            gpu.learned
+                .plans
+                .get(plan)
+                .map_or(0, |learned| learned.host_bytes)
+        });
         if need == 0 {
             return true;
         }
@@ -3406,6 +3479,44 @@ impl Pool {
         }
     }
 
+    /// What a call measured, for later executors and runs: its shape's activation growth
+    /// (the call's peak and each stage method's), its context, its private host bytes.
+    fn learn(
+        &self,
+        plan: &str,
+        lane: &[Device],
+        shape: &str,
+        reply: &Frame,
+        pid: u32,
+        mapped: Option<u64>,
+    ) {
+        let metrics = reply.metrics.clone().unwrap_or_default();
+        let plane = reply.plane.clone().unwrap_or_default();
+        let peak = known(plane.activation_peak_bytes)
+            .or(known(metrics.activation_peak_bytes))
+            .unwrap_or(0);
+        let methods = metrics
+            .activation_peaks
+            .iter()
+            .filter_map(|(method, bytes)| Some((method.clone(), u64::try_from(*bytes).ok()?)))
+            .collect();
+        let shape = metrics.shape_cell.as_deref().unwrap_or(shape);
+        // Every rank of a group runs the same shape on its own GPU, and learns only the context
+        // its own process measured there.
+        for (rank, device) in lane.iter().enumerate() {
+            device
+                .memory
+                .learn_call(plan, shape, peak, &methods, rank_context(reply, rank), mapped);
+        }
+        // The squeezed rooms are those of rank 0's process, whose facts these are.
+        if let Some(first) = lane.first() {
+            first.memory.learn_squeezed(plan, shape, &plane.squeezed);
+            if let Ok(host) = cozy_platform::contain::host_memory::process(pid) {
+                first.memory.learn_host(plan, host.pss.saturating_sub(host.pss_shmem));
+            }
+        }
+    }
+
     /// Idle tenants pinning more than their share of the host's pinned total give it back
     /// (their planes punch the least recently used regions; page cache and disk stay beneath)
     /// before `plan` runs. An idle executor's pinned tier is optional: a failure is noted.
@@ -3429,6 +3540,7 @@ impl Pool {
                 &DeviceCommand::Budget {
                     vram_bytes: -1,
                     pinned_bytes: i64::try_from(share).unwrap_or(i64::MAX),
+                    cap_bytes: None,
                 },
                 &mut device_executor::Baseline,
             );
@@ -3491,10 +3603,8 @@ impl Pool {
             .join(", ")
     }
 
-    /// A running call asks for `free_bytes` free on each GPU of its lane (`DeviceRoom`): idle
-    /// tenants give room there until it is met or none is left, never a running call, and each
-    /// rank's cap rises into what is there through its own cell. The bytes freed on the lane,
-    /// and rank 0's cap (a sibling's says nothing about its GPU); None: rank 0's GPU cannot say.
+    /// An executor's out-of-memory retry asks for `free_bytes` from the other tenants: idle
+    /// weights leave first, then idle processes; its cap rises into what they gave.
     fn room_for(
         &self,
         plan: &str,
@@ -3502,17 +3612,41 @@ impl Pool {
         degree: u32,
         free_bytes: u64,
         cells: &BTreeMap<u32, File>,
-    ) -> io::Result<(u64, Option<u64>)> {
+    ) -> io::Result<Option<u64>> {
         self.reap();
-        let (mut freed, mut caps) = (0, vec![]);
-        for (rank, (gpu, device)) in (0u32..).zip((start..).zip(self.lane(start, degree)?)) {
-            let holdings = || if gpu == 0 { self.holdings() } else { vec![] };
-            let room = device.memory.room_for(plan, free_bytes, cells.get(&rank), holdings, |step| self.carry_out(gpu, step))?;
-            freed += room.map_or(0, |(freed, _)| freed);
-            caps.push(room.map(|(_, cap)| cap));
+        let mut caps = Vec::new();
+        for (rank, (gpu, device)) in (start..).zip(self.lane(start, degree)?).enumerate() {
+            caps.push(device.memory.make_room(
+                plan,
+                free_bytes,
+                cells.get(&(rank as u32)),
+                || if gpu == 0 { self.holdings() } else { vec![] },
+                |step| self.carry_out(gpu, step),
+            )?);
         }
-        Ok((freed, caps.first().copied().flatten()))
+        // Each rank's own cell carries its cap. The scalar reply belongs to rank 0 alone,
+        // just as in Load and Invoke; a sibling's cap says nothing about its GPU.
+        Ok(rank_grant(&caps).0)
     }
+}
+
+/// A grant from one cap per GPU: rank 0's, and for a group every rank's own. A GPU that
+/// cannot say lifts its own rank's cap (-1). None: rank 0's GPU could not say.
+fn rank_grant(caps: &[Option<u64>]) -> (Option<u64>, Group) {
+    let rank_caps = if caps.len() > 1 {
+        caps.iter()
+            .map(|cap| cap.map_or(-1, |cap| i64::try_from(cap).unwrap_or(i64::MAX)))
+            .collect()
+    } else {
+        vec![]
+    };
+    (
+        caps.first().copied().flatten(),
+        Group {
+            rank_caps,
+            ..Group::default()
+        },
+    )
 }
 
 fn holding_id(key: &HoldingKey, generation: u64) -> String {
@@ -3525,6 +3659,15 @@ fn holding_id(key: &HoldingKey, generation: u64) -> String {
 
 fn known(value: Option<i64>) -> Option<u64> {
     value.and_then(|v| u64::try_from(v).ok())
+}
+
+/// The context rank `rank`'s own process measured: rank 0's plane, else its `rank_planes` row.
+fn rank_context(reply: &Frame, rank: usize) -> Option<u64> {
+    let own = match rank {
+        0 => reply.plane.as_ref(),
+        _ => reply.rank_planes.get(rank - 1).and_then(Option::as_ref),
+    };
+    own.and_then(|plane| known(plane.context_bytes))
 }
 
 fn plane_facts(plane: Option<&device_executor::PlaneFacts>) -> Facts {
@@ -4261,7 +4404,9 @@ impl Services for Callbacks<'_> {
         // This plan names this weight set: its next executor's Degree 2 fit counts it once
         // when another tenant holds and reads it.
         if key.variant != "*" {
-            self.pool.first().with(|gpu| gpu.named(self.plan, &holding_id(&key, 0)));
+            self.pool
+                .first()
+                .learn_holding(self.plan, &holding_id(&key, 0));
         }
         // The reader's lease is a connection: the executor keeps one end while it maps the
         // holding, and its close (release or death) ends the lease.
@@ -4419,14 +4564,22 @@ impl Services for Callbacks<'_> {
             Kind::DeviceRoom => {
                 drop(descriptor);
                 if let Some(held) = known(frame.holding_bytes) {
-                    // Without it the ledger keeps its load-time report: the grant would raise
-                    // its cap only to that (run 4557).
-                    let facts = Facts { process: Some(held), ..Facts::default() };
+                    // Without it the ledger keeps its load-time report, and the bytes it holds
+                    // since read as external: a holding dropped for it raised no cap (run 4557).
+                    let facts = crate::memory::policy::Facts {
+                        process: Some(held),
+                        ..Default::default()
+                    };
                     self.pool.devices[self.start].memory.observe(self.plan, facts, None);
                 }
-                let (freed, cap) = self.pool.room_for(self.plan, self.start, self.degree, frame.free_bytes, self.cells)?;
+                let cap = self.pool.room_for(
+                    self.plan,
+                    self.start,
+                    self.degree,
+                    frame.free_bytes,
+                    self.cells,
+                )?;
                 answer.ok = true;
-                answer.freed_bytes = freed;
                 answer.cap_bytes = cap.map_or(-1, |cap| i64::try_from(cap).unwrap_or(i64::MAX));
             }
             _ => {
@@ -4565,6 +4718,32 @@ mod tests {
             .unwrap();
         assert_eq!(String::from_utf8_lossy(&ran.stdout).trim(), format!("__main__ {}", tree.display()));
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn every_rank_of_a_group_gets_its_own_gpus_cap() {
+        let (cap, group) = rank_grant(&[Some(30), Some(20)]);
+        assert_eq!((cap, group.rank_caps), (Some(30), vec![30, 20]));
+        // A GPU that cannot say lifts only its own rank's cap.
+        let (cap, group) = rank_grant(&[Some(30), None]);
+        assert_eq!((cap, group.rank_caps), (Some(30), vec![30, -1]));
+        // A sibling's reading cannot manufacture an unmeasured leader's authority.
+        let (cap, group) = rank_grant(&[None, Some(20)]);
+        assert_eq!((cap, group.rank_caps), (None, vec![-1, 20]));
+        let (cap, group) = rank_grant(&[Some(30)]);
+        assert_eq!((cap, group.is_empty()), (Some(30), true));
+        assert_eq!(rank_grant(&[]).0, None);
+    }
+
+    #[test]
+    fn a_gpu_learns_only_the_context_its_own_rank_measured() {
+        let reply: Frame = serde_json::from_value(json!({
+            "plane": {"context_bytes": 100},
+            "rank_planes": [{"context_bytes": 200}, null]
+        }))
+        .unwrap();
+        let each: Vec<_> = (0..4).map(|rank| rank_context(&reply, rank)).collect();
+        assert_eq!(each, vec![Some(100), Some(200), None, None]);
     }
 
     #[test]
@@ -4708,7 +4887,7 @@ int nvmlDeviceGetDisplayActive(void *d, int *s) { *s = 0; return 0; }
         let (root, pool, engine) = pool_of(4);
         let (image, film) = (plan("image", 1), plan("film", 2));
         let place = |plan: &Plan, seq: u64, claims: &mut [Option<u64>]| pool.place(&engine, plan, (seq, None), None, claims);
-        let serving = |gpu: usize| pool.devices[gpu].memory.with(|ledger| ledger.starting("image"));
+        let serving = |gpu: usize| pool.devices[gpu].memory.with(|ledger| ledger.starting("image", 0));
         let mut claims = [None; 4];
         let (gpu, first) = place(&image, 1, &mut claims).unwrap();
         assert_eq!(gpu, 0);
@@ -4943,7 +5122,7 @@ int nvmlDeviceGetDisplayActive(void *d, int *s) { *s = 0; return 0; }
         fs::remove_dir_all(root).unwrap();
     }
 
-    /// A fresh pod's burst of one unmeasured plan: its first call starts on GPU 0, the second at
+    /// A fresh pod's burst of one unlearned plan: its first call starts on GPU 0, the second at
     /// once on empty GPU 1, the third waits for either.
     #[test]
     fn a_cold_burst_runs_on_every_empty_gpu_at_once() {
@@ -4952,10 +5131,10 @@ int nvmlDeviceGetDisplayActive(void *d, int *s) { *s = 0; return 0; }
         let mut claims = [None; 2];
         let (gpu, first) = pool.place(&engine, &image, (1, None), None, &mut claims).unwrap();
         assert_eq!(gpu, 0);
-        pool.devices[0].memory.with(|ledger| ledger.starting("image"));
+        pool.devices[0].memory.with(|ledger| ledger.starting("image", 0));
         let (gpu, second) = pool.place(&engine, &image, (2, None), None, &mut claims).unwrap();
         assert_eq!(gpu, 1);
-        pool.devices[1].memory.with(|ledger| ledger.starting("image"));
+        pool.devices[1].memory.with(|ledger| ledger.starting("image", 0));
         assert!(pool.place(&engine, &image, (3, None), None, &mut claims).is_none());
         assert_eq!(claims, [Some(3), Some(3)]);
         drop((first, second));
@@ -4970,8 +5149,12 @@ int nvmlDeviceGetDisplayActive(void *d, int *s) { *s = 0; return 0; }
         let (root, pool, _engine) = pool_of(4);
         let available = u64::try_from(cozy_platform::contain::host_memory::read().available).unwrap();
         let need = available / 10 * 6;
-        let measured = Facts { host: Some(need), ..Facts::default() };
-        (0..2).for_each(|gpu| pool.devices[gpu].memory.observe("image", measured, None));
+        let learn = |gpu: usize| {
+            pool.devices[gpu].memory.with(|ledger| {
+                ledger.learned.plans.entry("image".into()).or_default().host_bytes = need;
+            })
+        };
+        (0..2).for_each(learn);
         assert!(pool.host_room("image", 0, 1, false));
         assert!(!pool.host_room("image", 1, 1, false), "the first one is admitted, not loaded");
         pool.ended("image", 0, 1);
@@ -4985,7 +5168,7 @@ int nvmlDeviceGetDisplayActive(void *d, int *s) { *s = 0; return 0; }
         }
         for (gpu, tenant) in [(0, "film"), (1, "film"), (2, "film"), (3, "film"), (0, "image"), (2, "image")] {
             pool.devices[gpu].memory.with(|ledger| {
-                ledger.starting(tenant);
+                ledger.starting(tenant, 0);
                 let facts = Facts { weights: Some(gib), ..Facts::default() };
                 ledger.observe(tenant, facts, None);
             });
