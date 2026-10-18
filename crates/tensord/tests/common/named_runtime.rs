@@ -64,23 +64,30 @@ pub fn stamped(wheel: &Path) -> String {
     String::from_utf8(out.stdout).unwrap().trim().to_owned()
 }
 
-/// Every environment `pythons` names loads the named Runtime, by its commit; the log says so, since
-/// a silent pass reads as missing. Nothing named, nothing asserted.
+/// Every environment `pythons` names that holds a Runtime loads the named one, by its commit (one
+/// without any, a package that runs no code, holds none to check); the log says so, since a
+/// silent pass reads as missing. Nothing named, nothing asserted.
 pub fn loaded(pythons: &[PathBuf], what: &str) {
+    const COMMIT: &str = "import importlib.util\n\
+        if importlib.util.find_spec('cozy_runtime'):\n\
+        \x20   from cozy_runtime._build_provenance import COMMIT\n\
+        \x20   print(COMMIT)\n";
     let Some((version, commit)) = named() else { return };
+    let mut checked = 0;
     for python in pythons {
-        let out = Command::new(python)
-            .args(["-I", "-c", "from cozy_runtime._build_provenance import COMMIT; print(COMMIT)"])
-            .output()
-            .unwrap();
+        let out = Command::new(python).args(["-I", "-c", COMMIT]).output().unwrap();
+        assert!(out.status.success(), "{python:?}: {out:?}");
         let found = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        if found.is_empty() {
+            continue;
+        }
         assert_eq!(&found, commit, "{python:?} loads another Runtime than the named {version}: {out:?}");
+        checked += 1;
     }
-    if !pythons.is_empty() {
+    if checked > 0 {
         let _ = writeln!(
             std::io::stderr(),
-            "named Runtime {version} (commit {commit}) loads: asserted in {} environments of {what}",
-            pythons.len()
+            "named Runtime {version} (commit {commit}) loads: asserted in {checked} environments of {what}"
         );
     }
 }
