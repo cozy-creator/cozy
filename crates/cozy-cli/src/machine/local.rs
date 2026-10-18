@@ -1,9 +1,6 @@
 //! This computer's machine: `cozy machine enable`, `disable` and `authorize`. Enabling runs
-//! `cozy machine serve --persistent` as this user's service; a machine an older cozy started (a
-//! transient `tensord-*` unit) is taken over on the same root, store, ports, worker id and keys,
-//! once it is idle, so nothing it holds is fetched again.
+//! `cozy machine serve --persistent` as this user's service.
 use std::{
-    collections::BTreeMap,
     io,
     path::{Path, PathBuf},
     process::ExitCode,
@@ -13,13 +10,12 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use cozy_platform::{
     lock::{Kind as LockKind, LockFile},
-    service::{Legacy, ServiceSpec, Services},
+    service::{ServiceSpec, Services},
 };
 use cozy_proto::{
     calcifer::{Event, Machine, NewMachine, RunList},
     error::{Error, Kind},
 };
-use toml_edit::{Item, Table, value};
 
 use crate::{Context, calcifer_client::Client, output};
 
@@ -29,44 +25,13 @@ const SERVICE: &str = "machine";
 const SAMPLE: Duration = Duration::from_millis(250);
 const REPORT: Duration = Duration::from_secs(10);
 
-/// An older cozy's machine environment, and the `[machine]` key each carries into.
-const CARRIED: [(&str, &str); 7] = [
-    ("COZY_MACHINE_ROOT", "root"),
-    ("COZY_TENSORFS_ROOT", "store"),
-    ("COZY_WORKER_INTERNAL_PORT", "port"),
-    ("COZY_MEDIA_INTERNAL_PORT", "webrtc_port"),
-    ("COZY_WEBRTC_INTERNAL_PORT", "webrtc_port"),
-    ("COZY_LISTEN_HOST", "listen_host"),
-    ("COZY_WORKER_ID", "worker_id"),
-];
-
 /// `cozy machine enable`: this computer's machine as this user's service, recorded as `local`.
-/// A machine an older cozy started is taken over once its runs end; Ctrl-C before then leaves
-/// everything as it was. A service runs only for the login home under a user service manager;
-/// otherwise the machine runs detached, with one warning. Enabling an enabled machine changes
-/// nothing and says its state.
+/// A service runs only for the login home under a user service manager; otherwise the machine
+/// runs detached, with one warning. Enabling an enabled machine changes nothing and says its state.
 pub async fn enable(ctx: &Context) -> Result<ExitCode, Error> {
     let services = services(ctx)?;
     let managed = services.available();
     let calcifer = ctx.calcifer().await?;
-    // An older cozy's machine is taken over while it runs, or once if its settings were never
-    // carried; a stopped one whose settings are the config's is history.
-    let legacy = legacy(ctx, &services, "machine_takeover_failed")?
-        .filter(|legacy| legacy.active || !configured(ctx));
-    if let Some(legacy) = &legacy {
-        if legacy.active {
-            idle(ctx, &calcifer).await?;
-        }
-        carry(ctx, legacy)?;
-        services
-            .retire(legacy)
-            .map_err(|e| service_error("machine_takeover_failed", e))?;
-        output::say(
-            ctx,
-            &format!("stopped {}, which an older cozy started", legacy.unit),
-        );
-    }
-    // The config as the service reads it: the carried `[machine]` keys, if any were written.
     let root = machine_root(ctx)?;
     let spec = spec(&root)?;
     let running = !free(&root);
@@ -76,7 +41,7 @@ pub async fn enable(ctx: &Context) -> Result<ExitCode, Error> {
             .map_err(|e| service_error("machine_start_failed", e))?,
         false => false,
     };
-    let started = !running || changed || legacy.is_some();
+    let started = !running || changed;
     if started {
         let before = served_at(&root);
         let log = start_log(&root);
@@ -88,7 +53,7 @@ pub async fn enable(ctx: &Context) -> Result<ExitCode, Error> {
                 format!("{}: {e}", dir.display()),
             )
         })?;
-        let came = start(
+        start(
             ctx,
             managed.then_some(&services),
             &spec,
@@ -96,22 +61,7 @@ pub async fn enable(ctx: &Context) -> Result<ExitCode, Error> {
             running,
             before,
         )
-        .await;
-        // A machine that does not start leaves the older one running as it did, never none.
-        if let (Err(e), Some(legacy)) = (&came, &legacy) {
-            if managed {
-                let _ = services.uninstall(SERVICE);
-            }
-            let revived = match services.revive(legacy) {
-                Ok(()) => format!("{} runs again as it did", legacy.unit),
-                Err(again) => format!("{} did not start again either: {again}", legacy.unit),
-            };
-            return Err(Error {
-                remedy: Some(revived),
-                ..e.clone()
-            });
-        }
-        came?;
+        .await?;
     }
     if !managed {
         output::warn(match services.reachable() {
@@ -144,12 +94,9 @@ pub async fn enable(ctx: &Context) -> Result<ExitCode, Error> {
         record = record.field("address", address);
     }
     record
-        .note(match (started, legacy.is_some()) {
-            (_, true) => {
-                "it took over the machine an older cozy started: same root, store, ports and keys"
-            }
-            (true, false) => "this computer is a machine now",
-            (false, false) => "it was already enabled: nothing changed",
+        .note(match started {
+            true => "this computer is a machine now",
+            false => "it was already enabled: nothing changed",
         })
         .print(ctx);
     output::next(
@@ -167,16 +114,10 @@ pub async fn enable(ctx: &Context) -> Result<ExitCode, Error> {
 pub async fn disable(ctx: &Context) -> Result<ExitCode, Error> {
     let services = services(ctx)?;
     let calcifer = ctx.calcifer().await?;
-    let legacy = legacy(ctx, &services, "machine_stop_failed")?;
     let root = machine_root(ctx)?;
-    let was = !free(&root) || legacy.as_ref().is_some_and(|l| l.active);
+    let was = !free(&root);
     if was {
         idle(ctx, &calcifer).await?;
-    }
-    if let Some(legacy) = &legacy {
-        services
-            .retire(legacy)
-            .map_err(|e| service_error("machine_stop_failed", e))?;
     }
     match services.available() {
         true => services
@@ -223,16 +164,6 @@ fn services(ctx: &Context) -> Result<Services, Error> {
         .next("cozy machine rent"));
     }
     Ok(Services::new(&ctx.home, &ctx.user_home))
-}
-
-/// The machine an older cozy started under this session's user manager, wherever one answers.
-fn legacy(ctx: &Context, services: &Services, code: &str) -> Result<Option<Legacy>, Error> {
-    match services.reachable() {
-        true => services
-            .legacy(&ctx.home.machine())
-            .map_err(|e| service_error(code, e)),
-        false => Ok(None),
-    }
 }
 
 /// The service: this cozy as `machine serve --persistent`, saying anything before its own log
@@ -332,14 +263,6 @@ fn machine_root(ctx: &Context) -> Result<PathBuf, Error> {
     Ok(config.machine.root(&ctx.home))
 }
 
-/// Whether the config names the machine's root: settings an enable carried, or the person's.
-fn configured(ctx: &Context) -> bool {
-    let path = ctx.home.config();
-    let text = std::fs::read_to_string(&path).unwrap_or_default();
-    cozy_proto::config::Config::parse(&text, &path.display().to_string())
-        .is_ok_and(|(config, _)| config.machine.root.is_some())
-}
-
 /// Whether nothing holds the machine's root: no machine has run there, or none runs now.
 fn free(root: &Path) -> bool {
     let path = root.join("var/lib/cozy/machine/agent.lock");
@@ -431,47 +354,6 @@ async fn idle(ctx: &Context, calcifer: &Client) -> Result<(), Error> {
             }
         }
     }
-}
-
-/// Writes the older machine's settings into `[machine]` and its controller keys into
-/// `keys/authorized`, so the service serves the same root, store, ports and worker id.
-fn carry(ctx: &Context, legacy: &Legacy) -> Result<(), Error> {
-    let env: &BTreeMap<String, String> = &legacy.environment;
-    crate::hub::edit(ctx, |doc| {
-        if !doc.get("machine").is_some_and(Item::is_table) {
-            doc["machine"] = Item::Table(Table::new());
-        }
-        let machine = doc["machine"].as_table_mut().expect("machine is a table");
-        for (name, key) in CARRIED {
-            let Some(text) = env.get(name).filter(|v| !v.is_empty()) else {
-                continue;
-            };
-            machine[key] = match key {
-                "port" | "webrtc_port" => value(text.parse::<i64>().map_err(|_| {
-                    Error::new(
-                        Kind::Validation,
-                        "machine_takeover_failed",
-                        format!("{} has {name}={text}, which is no port", legacy.unit),
-                    )
-                })?),
-                _ => value(text.as_str()),
-            };
-        }
-        Ok(())
-    })?;
-    for key in env
-        .get("COZY_AUTHORIZED_KEYS")
-        .map(|keys| {
-            keys.split(',')
-                .map(str::trim)
-                .filter(|k| !k.is_empty())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default()
-    {
-        authorized(ctx, key)?;
-    }
-    Ok(())
 }
 
 fn service_error(code: &str, error: cozy_platform::Error) -> Error {

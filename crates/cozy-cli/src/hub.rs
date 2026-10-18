@@ -225,7 +225,7 @@ fn hubs_table(doc: &mut DocumentMut) -> &mut Table {
 
 /// Applies one edit to config.toml, keeping everything else as written. A file the load would
 /// refuse is never written; the new one replaces the old whole, at 0600.
-pub(crate) fn edit(
+fn edit(
     ctx: &Context,
     change: impl FnOnce(&mut DocumentMut) -> Result<(), Error>,
 ) -> Result<(), Error> {
