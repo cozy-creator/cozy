@@ -168,11 +168,17 @@ fn concurrent_writers_in_one_process_never_share_a_temp_name() {
                 })
             })
             .collect();
-        workers.into_iter().flat_map(|w| w.join().unwrap()).collect()
+        workers
+            .into_iter()
+            .flat_map(|w| w.join().unwrap())
+            .collect()
     });
     assert_eq!(written.len(), 16 * 16);
     for object in &written {
-        assert_eq!(fs::read(store.object_path(&object.sha256)).unwrap().len() as u64, object.length);
+        assert_eq!(
+            fs::read(store.object_path(&object.sha256)).unwrap().len() as u64,
+            object.length
+        );
     }
     let _ = fs::remove_dir_all(root);
 }

@@ -1,0 +1,184 @@
+{
+ "class": "Qwen3VLForConditionalGeneration",
+ "sources": [
+  "hf://Qwen/Qwen-Image-2.1@790c92633540aa0cb11d9abf19eb46d861714758/text_encoder",
+  "hf://Qwen/Qwen3-VL-2B-Instruct@89644892e4d85e24eaac8bacfd4f463576704203"
+ ],
+ "generator": "scripts/orders.py",
+ "diffusers": "0.41.0.dev0",
+ "transformers": "5.20.0",
+ "children": {
+  "": [
+   "model",
+   "lm_head"
+  ],
+  "model": [
+   "visual",
+   "language_model"
+  ],
+  "model.visual": [
+   "patch_embed",
+   "pos_embed",
+   "blocks",
+   "merger",
+   "deepstack_merger_list"
+  ],
+  "model.visual.patch_embed": [
+   "proj"
+  ],
+  "model.visual.patch_embed.proj": [
+   "weight",
+   "bias"
+  ],
+  "model.visual.pos_embed": [
+   "weight"
+  ],
+  "model.visual.blocks": [
+   "#"
+  ],
+  "model.visual.blocks.#": [
+   "norm1",
+   "norm2",
+   "attn",
+   "mlp"
+  ],
+  "model.visual.blocks.#.norm1": [
+   "weight",
+   "bias"
+  ],
+  "model.visual.blocks.#.norm2": [
+   "weight",
+   "bias"
+  ],
+  "model.visual.blocks.#.attn": [
+   "qkv",
+   "proj"
+  ],
+  "model.visual.blocks.#.attn.qkv": [
+   "weight",
+   "bias"
+  ],
+  "model.visual.blocks.#.attn.proj": [
+   "weight",
+   "bias"
+  ],
+  "model.visual.blocks.#.mlp": [
+   "linear_fc1",
+   "linear_fc2"
+  ],
+  "model.visual.blocks.#.mlp.linear_fc1": [
+   "weight",
+   "bias"
+  ],
+  "model.visual.blocks.#.mlp.linear_fc2": [
+   "weight",
+   "bias"
+  ],
+  "model.visual.merger": [
+   "norm",
+   "linear_fc1",
+   "linear_fc2"
+  ],
+  "model.visual.merger.norm": [
+   "weight",
+   "bias"
+  ],
+  "model.visual.merger.linear_fc1": [
+   "weight",
+   "bias"
+  ],
+  "model.visual.merger.linear_fc2": [
+   "weight",
+   "bias"
+  ],
+  "model.visual.deepstack_merger_list": [
+   "#"
+  ],
+  "model.visual.deepstack_merger_list.#": [
+   "norm",
+   "linear_fc1",
+   "linear_fc2"
+  ],
+  "model.visual.deepstack_merger_list.#.norm": [
+   "weight",
+   "bias"
+  ],
+  "model.visual.deepstack_merger_list.#.linear_fc1": [
+   "weight",
+   "bias"
+  ],
+  "model.visual.deepstack_merger_list.#.linear_fc2": [
+   "weight",
+   "bias"
+  ],
+  "model.language_model": [
+   "embed_tokens",
+   "layers",
+   "norm"
+  ],
+  "model.language_model.embed_tokens": [
+   "weight"
+  ],
+  "model.language_model.layers": [
+   "#"
+  ],
+  "model.language_model.layers.#": [
+   "self_attn",
+   "mlp",
+   "input_layernorm",
+   "post_attention_layernorm"
+  ],
+  "model.language_model.layers.#.self_attn": [
+   "q_proj",
+   "k_proj",
+   "v_proj",
+   "o_proj",
+   "q_norm",
+   "k_norm"
+  ],
+  "model.language_model.layers.#.self_attn.q_proj": [
+   "weight"
+  ],
+  "model.language_model.layers.#.self_attn.k_proj": [
+   "weight"
+  ],
+  "model.language_model.layers.#.self_attn.v_proj": [
+   "weight"
+  ],
+  "model.language_model.layers.#.self_attn.o_proj": [
+   "weight"
+  ],
+  "model.language_model.layers.#.self_attn.q_norm": [
+   "weight"
+  ],
+  "model.language_model.layers.#.self_attn.k_norm": [
+   "weight"
+  ],
+  "model.language_model.layers.#.mlp": [
+   "gate_proj",
+   "up_proj",
+   "down_proj"
+  ],
+  "model.language_model.layers.#.mlp.gate_proj": [
+   "weight"
+  ],
+  "model.language_model.layers.#.mlp.up_proj": [
+   "weight"
+  ],
+  "model.language_model.layers.#.mlp.down_proj": [
+   "weight"
+  ],
+  "model.language_model.layers.#.input_layernorm": [
+   "weight"
+  ],
+  "model.language_model.layers.#.post_attention_layernorm": [
+   "weight"
+  ],
+  "model.language_model.norm": [
+   "weight"
+  ],
+  "lm_head": [
+   "weight"
+  ]
+ }
+}

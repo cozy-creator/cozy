@@ -6,12 +6,15 @@
 //! - `copy` takes a tensor from a checkpoint of the same store. A large part already on the grid
 //!   keeps its objects, which is what lanes share; small parts are re-packed from where they are.
 //! - With a base, every base tensor and file not written again carries over.
+//! - Order is data: tensors land in the order the producer `put`s or `copy`s them (a base's
+//!   tensors keep the base's order, ones written again keep their place), or as `set_order`
+//!   says. Nothing is sorted; the chunk layout follows that order.
 //! - A writer opened with a key journals finished tensors in `tmp/writers/<key>/` and, reopened
 //!   after a crash, skips them (`has`). Its fence is `flock` on an O_CLOEXEC descriptor: a forked
 //!   child holds it only until it execs, and a second opener of the key waits.
 //! - Objects the writer refers to are kept young while it runs, so GC's grace never takes them.
 
-use std::collections::{btree_map, BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -22,7 +25,7 @@ use cozy_platform::durable::FileId;
 use serde::{Deserialize, Serialize};
 
 use crate::err;
-use crate::format::layout::{self, natural_cmp, GRID, STANDALONE};
+use crate::format::layout::{self, GRID, STANDALONE};
 use crate::format::{
     self, Body, Component, Dtype, Encoding, Header, Location, Manifest, Metadata, ObjectRef, Part,
     Tensor, Value, HEADER_PATH,
@@ -54,7 +57,8 @@ pub struct PartData<'a> {
     pub data: &'a mut dyn Read,
 }
 
-/// A finished tensor; one journal line. A plain tensor is one part with role `""`.
+/// A finished tensor; one journal line. A plain tensor is one part with role `""`; an encoded
+/// tensor's parts are in the producer's order.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Entry {
     component: String,
@@ -63,7 +67,48 @@ struct Entry {
     shape: Vec<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     encoding: Option<Encoding>,
-    parts: BTreeMap<String, Stored>,
+    parts: Vec<(String, Stored)>,
+}
+
+impl Entry {
+    fn name(&self) -> (String, String) {
+        (self.component.clone(), self.key.clone())
+    }
+    fn stored(&self) -> impl Iterator<Item = &Stored> {
+        self.parts.iter().map(|(_, s)| s)
+    }
+}
+
+/// Tensors in the order they were recorded, with an index by name. Writing a tensor again
+/// keeps its place.
+#[derive(Default)]
+struct Tensors {
+    list: Vec<Entry>,
+    index: HashMap<(String, String), usize>,
+}
+
+impl Tensors {
+    fn insert(&mut self, e: Entry) {
+        match self.index.get(&e.name()) {
+            Some(&i) => self.list[i] = e,
+            None => {
+                self.index.insert(e.name(), self.list.len());
+                self.list.push(e);
+            }
+        }
+    }
+    fn contains(&self, name: &(String, String)) -> bool {
+        self.index.contains_key(name)
+    }
+    fn get(&self, name: &(String, String)) -> Option<&Entry> {
+        self.index.get(name).map(|&i| &self.list[i])
+    }
+    fn retain(&mut self, keep: impl FnMut(&Entry) -> bool) {
+        self.list.retain(keep);
+        self.index = (self.list.iter().enumerate())
+            .map(|(i, e)| (e.name(), i))
+            .collect();
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -101,7 +146,7 @@ pub struct Writer {
     base: Option<Checkpoint>,
     order: HashMap<(String, String), usize>,
     metadata: Metadata,
-    tensors: BTreeMap<(String, String), Entry>,
+    tensors: Tensors,
     files: BTreeMap<String, ObjectRef>,
     spool: File,
     spool_len: u64,
@@ -144,7 +189,7 @@ impl Store {
             base,
             order: HashMap::new(),
             metadata: Metadata::new(),
-            tensors: BTreeMap::new(),
+            tensors: Tensors::default(),
             files: BTreeMap::new(),
             spool,
             spool_len: 0,
@@ -174,7 +219,7 @@ impl Writer {
     /// Written (or journaled by an interrupted writer of this key); base tensors don't count.
     pub fn has(&self, component: &str, key: &str) -> bool {
         self.tensors
-            .contains_key(&(component.to_owned(), key.to_owned()))
+            .contains(&(component.to_owned(), key.to_owned()))
     }
 
     /// The manifest, once committed.
@@ -182,8 +227,8 @@ impl Writer {
         self.committed.as_ref()
     }
 
-    /// Execution order for the layout: within each component these tensors first, in this
-    /// order, then the rest in natural order. Given per session, before `commit`.
+    /// The header order when the producer's calls are not it (a resumed migration): these
+    /// tensors first, in this order, then the rest in recorded order. Given before `commit`.
     pub fn set_order(&mut self, tensors: &[(&str, &str)]) {
         self.order = tensors
             .iter()
@@ -233,7 +278,7 @@ impl Writer {
                 (Some(encoding), parts)
             }
         };
-        let mut parts = BTreeMap::new();
+        let mut parts = Vec::new();
         let mut written = 0;
         for p in inputs {
             let what = match p.role.as_str() {
@@ -242,7 +287,7 @@ impl Writer {
             };
             let stored = self.write_part(&what, p.dtype, p.shape, p.data)?;
             written += stored.length;
-            parts.insert(p.role, stored);
+            parts.push((p.role, stored));
         }
         let entry = Entry {
             component: component.to_owned(),
@@ -259,7 +304,7 @@ impl Writer {
     pub fn copy(&mut self, component: &str, key: &str, from: &Checkpoint) -> Result<()> {
         self.ready(component, key)?;
         let entry = self.adopt(component, key, from)?;
-        let length = entry.parts.values().map(|p| p.length).sum();
+        let length = entry.stored().map(|p| p.length).sum();
         self.record(Line::Tensor(entry), length)
     }
 
@@ -278,45 +323,44 @@ impl Writer {
         self.record(line, bytes.len() as u64)
     }
 
-    /// Lays out the chunks, writes the header and manifest, and pins the manifest under the key
-    /// (or its own digest). The journal and spool go; the writer is spent.
+    /// Lays out the chunks in header order, writes the header and manifest, and pins the
+    /// manifest under the key (or its own digest). The journal and spool go; the writer is spent.
     pub fn commit(&mut self) -> Result<ObjectRef> {
         self.live()?;
-        let mut tensors = self.tensors.clone();
         let mut files = self.files.clone();
         let (mut metadata, mut tree) = (Metadata::new(), Metadata::new());
         let base = self.base.take();
-        let carried = base
-            .as_ref()
-            .map(|b| self.carry(b, &mut tensors, &mut files));
+        let carried = base.as_ref().map(|b| self.carry(b, &mut files));
         if let Some(b) = &base {
             (metadata, tree) = (b.header().metadata.clone(), b.manifest().metadata.clone());
         }
         self.base = base;
-        carried.transpose()?;
+        let mut order = carried.transpose()?.unwrap_or_default();
+        let from_base: HashSet<(String, String)> = order.iter().map(Entry::name).collect();
+        order.extend(
+            (self.tensors.list.iter())
+                .filter(|e| !from_base.contains(&e.name()))
+                .cloned(),
+        );
         metadata.extend(self.metadata.clone());
         self.present()?;
+        if !self.order.is_empty() {
+            let rank = |e: &Entry| self.order.get(&e.name()).copied().unwrap_or(usize::MAX);
+            order.sort_by_key(rank);
+        }
+        // Components in order of first appearance, each with its tensors in order.
+        let mut grouped: Vec<(String, Vec<Entry>)> = Vec::new();
+        for e in order {
+            match grouped.iter_mut().find(|(c, _)| *c == e.component) {
+                Some((_, list)) => list.push(e),
+                None => grouped.push((e.component.clone(), vec![e])),
+            }
+        }
 
-        let mut list: Vec<(&Entry, &str, &Stored)> = tensors
-            .values()
+        let list: Vec<(&Entry, &str, &Stored)> = (grouped.iter())
+            .flat_map(|(_, entries)| entries)
             .flat_map(|e| e.parts.iter().map(move |(role, s)| (e, role.as_str(), s)))
             .collect();
-        let order = match self.order.is_empty() {
-            true => layout::Order::Natural,
-            false => {
-                let rank = |e: &Entry| {
-                    let name = (e.component.clone(), e.key.clone());
-                    self.order.get(&name).copied().unwrap_or(usize::MAX)
-                };
-                list.sort_by(|(x, xr, _), (y, yr, _)| {
-                    (x.component.cmp(&y.component))
-                        .then_with(|| rank(x).cmp(&rank(y)))
-                        .then_with(|| natural_cmp(&x.key, &y.key))
-                        .then_with(|| xr.cmp(yr))
-                });
-                layout::Order::Given
-            }
-        };
         let items: Vec<layout::Item> = list
             .iter()
             .map(|(e, role, s)| layout::Item {
@@ -326,7 +370,7 @@ impl Writer {
                 length: s.length,
             })
             .collect();
-        let plan = layout::plan(&items, order);
+        let plan = layout::plan(&items);
 
         let mut chunks: Vec<Option<ObjectRef>> = vec![None; plan.chunks.len()];
         let mut packs: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
@@ -376,55 +420,50 @@ impl Writer {
             chunks[chunk as usize] = Some(object);
         }
 
-        let places: HashMap<(&str, &str, &str), Location> = list
-            .iter()
-            .zip(&plan.places)
-            .map(|((e, role, _), at)| ((e.component.as_str(), e.key.as_str(), *role), *at))
+        let mut places = plan.places.iter();
+        let components: Vec<Component> = (grouped.iter())
+            .map(|(name, entries)| {
+                let tensors = (entries.iter())
+                    .map(|e| {
+                        let mut at = e
+                            .parts
+                            .iter()
+                            .map(|(role, s)| (role, s, *places.next().expect("a place per part")));
+                        let body = match &e.encoding {
+                            None => Body::Data(at.next().expect("a plain tensor has its data").2),
+                            Some(encoding) => Body::Encoded {
+                                encoding: encoding.clone(),
+                                parts: at
+                                    .map(|(role, s, at)| Part {
+                                        role: role.clone(),
+                                        dtype: s.dtype.clone(),
+                                        shape: s.shape.clone(),
+                                        chunk: at.chunk,
+                                        offset: at.offset,
+                                        length: at.length,
+                                    })
+                                    .collect(),
+                            },
+                        };
+                        Tensor {
+                            key: e.key.clone(),
+                            dtype: e.dtype.clone(),
+                            shape: e.shape.clone(),
+                            body,
+                        }
+                    })
+                    .collect();
+                Component {
+                    name: name.clone(),
+                    tensors,
+                }
+            })
             .collect();
-        let mut components: BTreeMap<String, Component> = BTreeMap::new();
-        for e in tensors.values() {
-            let at = |role: &str| places[&(e.component.as_str(), e.key.as_str(), role)];
-            let body = match &e.encoding {
-                None => Body::Data(at("")),
-                Some(encoding) => Body::Encoded {
-                    encoding: encoding.clone(),
-                    parts: (e.parts.iter())
-                        .map(|(role, s)| {
-                            let Location {
-                                chunk,
-                                offset,
-                                length,
-                            } = at(role);
-                            let (dtype, shape) = (s.dtype.clone(), s.shape.clone());
-                            let part = Part {
-                                dtype,
-                                shape,
-                                chunk,
-                                offset,
-                                length,
-                            };
-                            (role.clone(), part)
-                        })
-                        .collect(),
-                },
-            };
-            let tensor = Tensor {
-                dtype: e.dtype.clone(),
-                shape: e.shape.clone(),
-                body,
-            };
-            let component = components.entry(e.component.clone()).or_default();
-            component.tensors.insert(e.key.clone(), tensor);
-        }
         if !components.is_empty() {
-            let header = Header {
-                chunks: chunks
-                    .into_iter()
-                    .map(|c| c.expect("every chunk is laid"))
-                    .collect(),
-                components,
-                metadata,
-            };
+            let chunks = (chunks.into_iter())
+                .map(|c| c.expect("every chunk is laid"))
+                .collect();
+            let header = Header::new(chunks, components, metadata)?;
             let header = self.store.put_bytes(&header.to_json()?)?;
             files.insert(HEADER_PATH.to_owned(), header);
         }
@@ -479,8 +518,8 @@ impl Writer {
 
     fn referenced(&self) -> Vec<ObjectRef> {
         let mut out: Vec<ObjectRef> = self.files.values().cloned().collect();
-        for e in self.tensors.values() {
-            out.extend(e.parts.values().flat_map(|p| p.at.objects()));
+        for e in &self.tensors.list {
+            out.extend(e.stored().flat_map(|p| p.at.objects()));
         }
         if let Some(base) = &self.base {
             out.push(base.id().clone());
@@ -494,16 +533,16 @@ impl Writer {
     /// gone is forgotten, to be put again.
     fn present(&mut self) -> Result<()> {
         let mut gone = None;
-        'find: for (name, e) in &self.tensors {
-            for object in e.parts.values().flat_map(|p| p.at.objects()) {
+        'find: for e in &self.tensors.list {
+            for object in e.stored().flat_map(|p| p.at.objects()) {
                 if !self.store.reuse(&object)? {
-                    gone = Some((name.clone(), object));
+                    gone = Some((e.name(), object));
                     break 'find;
                 }
             }
         }
         if let Some((name, object)) = gone {
-            self.tensors.remove(&name);
+            self.tensors.retain(|e| e.name() != name);
             return Err(Error::Absent(object.sha256));
         }
         for (path, object) in self.files.clone() {
@@ -515,17 +554,19 @@ impl Writer {
         Ok(())
     }
 
-    /// The base's tensors and files that were not written again.
+    /// The base's tensors in its order, each one written again in its place, and the base's
+    /// files that were not written again.
     fn carry(
         &mut self,
         base: &Checkpoint,
-        tensors: &mut BTreeMap<(String, String), Entry>,
         files: &mut BTreeMap<String, ObjectRef>,
-    ) -> Result<()> {
-        for (component, key, _) in base.tensors() {
-            let name = (component.to_owned(), key.to_owned());
-            if let btree_map::Entry::Vacant(slot) = tensors.entry(name) {
-                slot.insert(self.adopt(component, key, base)?);
+    ) -> Result<Vec<Entry>> {
+        let mut out = Vec::new();
+        for (component, t) in base.tensors() {
+            let name = (component.to_owned(), t.key.clone());
+            match self.tensors.get(&name) {
+                Some(e) => out.push(e.clone()),
+                None => out.push(self.adopt(component, &t.key, base)?),
             }
         }
         for (path, object) in &base.manifest().files {
@@ -536,7 +577,7 @@ impl Writer {
                 files.insert(path.clone(), object.clone());
             }
         }
-        Ok(())
+        Ok(out)
     }
 
     /// `from`'s tensor as an entry of this writer: a large part on the grid keeps its objects,
@@ -552,10 +593,10 @@ impl Writer {
         let parts: Vec<(&str, &Dtype, &[u64], Location)> = match &tensor.body {
             Body::Data(at) => vec![("", &tensor.dtype, &tensor.shape, *at)],
             Body::Encoded { parts, .. } => (parts.iter())
-                .map(|(role, p)| (role.as_str(), &p.dtype, p.shape.as_slice(), p.at()))
+                .map(|p| (p.role.as_str(), &p.dtype, p.shape.as_slice(), p.at()))
                 .collect(),
         };
-        let mut stored = BTreeMap::new();
+        let mut stored = Vec::new();
         for (role, dtype, shape, at) in parts {
             let spans = header.spans(&at);
             let ranges: Vec<(ObjectRef, u64, u64)> = (spans.iter())
@@ -593,7 +634,7 @@ impl Writer {
                 length: at.length,
                 at: place,
             };
-            stored.insert(role.to_owned(), part);
+            stored.push((role.to_owned(), part));
         }
         Ok(Entry {
             component: component.to_owned(),
@@ -678,9 +719,7 @@ impl Writer {
 
     fn apply(&mut self, line: Line) {
         match line {
-            Line::Tensor(e) => {
-                self.tensors.insert((e.component.clone(), e.key.clone()), e);
-            }
+            Line::Tensor(e) => self.tensors.insert(e),
             Line::File { path, object } => {
                 self.files.insert(path, object);
             }
@@ -743,11 +782,10 @@ impl Writer {
             .map_err(fail("stat", self.dir.join(SPOOL)))?
             .len();
         let mut end = 0;
-        let names: Vec<(String, String)> = self.tensors.keys().cloned().collect();
-        for name in names {
-            let e = &self.tensors[&name];
+        let mut lost = Vec::new();
+        for e in &self.tensors.list {
             let mut ok = true;
-            for p in e.parts.values() {
+            for p in e.stored() {
                 match &p.at {
                     At::Spool(offset) => ok &= offset + p.length <= spooled,
                     other => {
@@ -758,10 +796,11 @@ impl Writer {
                 }
             }
             match ok {
-                true => end = e.parts.values().fold(end, |end, p| end.max(p.spool_end())),
-                false => drop(self.tensors.remove(&name)),
+                true => end = e.stored().fold(end, |end, p| end.max(p.spool_end())),
+                false => lost.push(e.name()),
             }
         }
+        self.tensors.retain(|e| !lost.contains(&e.name()));
         let paths: Vec<String> = self.files.keys().cloned().collect();
         for path in paths {
             if !self.store.reuse(&self.files[&path])? {

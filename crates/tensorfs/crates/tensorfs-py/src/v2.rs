@@ -455,9 +455,10 @@ impl PyInfo {
 impl PyCheckpoint {
     fn build(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
         let out = PyDict::new(py);
-        for (component, c) in &self.ck.header().components {
+        // Dicts keep insertion order: components and tensors iterate in header order.
+        for c in self.ck.header().components() {
             let tensors = PyDict::new(py);
-            for (key, t) in &c.tensors {
+            for t in &c.tensors {
                 let parts = PyDict::new(py);
                 let part = |p: PyPart| Py::new(py, p);
                 let encoding = match &t.body {
@@ -476,7 +477,8 @@ impl PyCheckpoint {
                         encoding,
                         parts: stored,
                     } => {
-                        for (role, p) in stored {
+                        for p in stored {
+                            let role = &p.role;
                             let p = PyPart {
                                 dtype: p.dtype.name().into(),
                                 shape: PyTuple::new(py, &p.shape)?.unbind(),
@@ -502,9 +504,9 @@ impl PyCheckpoint {
                     encoding,
                     parts: parts.unbind(),
                 };
-                tensors.set_item(key, Py::new(py, info)?)?;
+                tensors.set_item(&t.key, Py::new(py, info)?)?;
             }
-            out.set_item(component, tensors)?;
+            out.set_item(&c.name, tensors)?;
         }
         Ok(out.unbind())
     }

@@ -66,13 +66,9 @@ impl Checkpoint {
         &self.paths
     }
 
-    /// Every tensor: component, key, tensor; components by name, keys in byte order.
-    pub fn tensors(&self) -> impl Iterator<Item = (&str, &str, &Tensor)> {
-        self.header.components.iter().flat_map(|(component, c)| {
-            c.tensors
-                .iter()
-                .map(move |(key, t)| (component.as_str(), key.as_str(), t))
-        })
+    /// Every tensor with its component's name, in header (construction) order.
+    pub fn tensors(&self) -> impl Iterator<Item = (&str, &Tensor)> {
+        self.header.tensors()
     }
 
     pub fn tensor(&self, component: &str, key: &str) -> Result<&Tensor> {
@@ -143,19 +139,19 @@ impl Checkpoint {
             Body::Data(at) => raw(at),
             Body::Encoded { encoding, parts } => {
                 let bytes = parts
-                    .values()
+                    .iter()
                     .map(|p| raw(&p.at()))
                     .collect::<Result<Vec<_>>>()?;
                 let views: BTreeMap<&str, PartBytes> = parts
                     .iter()
                     .zip(&bytes)
-                    .map(|((role, p), b)| {
+                    .map(|(p, b)| {
                         let view = PartBytes {
                             dtype: &p.dtype,
                             shape: &p.shape,
                             bytes: b,
                         };
-                        (role.as_str(), view)
+                        (p.role.as_str(), view)
                     })
                     .collect();
                 Ok(decode(&tensor.dtype, &tensor.shape, encoding, &views)?)
@@ -170,13 +166,7 @@ impl Checkpoint {
         let mut wanted: Vec<(usize, Location, Placed)> = Vec::new();
         for (component, key) in tensors {
             let tensor = self.tensor(component, key)?;
-            let parts: Vec<(&str, Location)> = match &tensor.body {
-                Body::Data(at) => vec![("", *at)],
-                Body::Encoded { parts, .. } => {
-                    parts.iter().map(|(r, p)| (r.as_str(), p.at())).collect()
-                }
-            };
-            for (role, at) in parts {
+            for (role, at) in tensor.locations() {
                 let placed = Placed {
                     component: component.to_string(),
                     key: key.to_string(),

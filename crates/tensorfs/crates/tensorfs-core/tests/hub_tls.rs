@@ -145,8 +145,20 @@ fn a_tls_alert_from_the_peer_is_weather_and_asked_again() {
     let (port, pem, _accepted) = private_hub(1);
     let ca = dir.join("hub-ca.pem");
     std::fs::write(&ca, pem).unwrap();
-    let (ok, stderr) = fetch(&root, port, &["--ca-file", ca.to_str().unwrap(), "--sample-seconds", "0.05"]);
-    assert!(!ok && stderr.contains("REFUSED REF_NOT_FOUND") && stderr.contains("checkpoint_not_found"), "{stderr}");
+    let (ok, stderr) = fetch(
+        &root,
+        port,
+        &[
+            "--ca-file",
+            ca.to_str().unwrap(),
+            "--sample-seconds",
+            "0.05",
+        ],
+    );
+    assert!(
+        !ok && stderr.contains("REFUSED REF_NOT_FOUND") && stderr.contains("checkpoint_not_found"),
+        "{stderr}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -190,6 +202,9 @@ fn a_hub_that_never_speaks_tls_is_weather_and_never_a_hang() {
     }
     let out = child.wait_with_output().unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(!out.status.success() && stderr.contains("REFUSED HUB_UNREACHABLE"), "{stderr}");
+    assert!(
+        !out.status.success() && stderr.contains("REFUSED HUB_UNREACHABLE"),
+        "{stderr}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

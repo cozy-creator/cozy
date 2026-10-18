@@ -55,7 +55,10 @@ pub fn cmd_manifest_build(entries_path: &Path, flags: &Flags) -> ExitCode {
                 detail: "manifest rows contain an empty line".into(),
             });
         }
-        let value = ok!(tensorfs_core::canon::parse_canonical(line, Manifest::MAX_BYTES));
+        let value = ok!(tensorfs_core::canon::parse_canonical(
+            line,
+            Manifest::MAX_BYTES
+        ));
         let mut fields = ok!(tensorfs_core::canon::Fields::new("ManifestFileRow", &value));
         let blob = match fields
             .req("blob")

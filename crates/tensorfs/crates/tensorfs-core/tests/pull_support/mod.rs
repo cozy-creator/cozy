@@ -131,15 +131,15 @@ fn put(origin: &Path, bytes: &[u8]) -> ObjectRef {
 /// chunks of the given sizes, each holding one U8 tensor (the first component's first tensor
 /// spans its first two chunks), plus a config per component and a tokenizer file.
 pub fn model(origin: &Path, name: &str, components: &[(&str, &[usize])], seed: u64) -> Model {
-    let mut header = Header::default();
+    let (mut objects, mut parsed) = (Vec::new(), Vec::new());
     let mut chunks = BTreeMap::new();
     let mut files = BTreeMap::new();
     for (c, (component, sizes)) in components.iter().enumerate() {
-        let mut tensors = BTreeMap::new();
-        let first = header.chunks.len();
+        let mut tensors = Vec::new();
+        let first = objects.len();
         for (i, size) in sizes.iter().enumerate() {
             let chunk = put(origin, &noise(seed * 1000 + (c * 100 + i) as u64, *size));
-            header.chunks.push(chunk);
+            objects.push(chunk);
             if c == 0 && i == 1 {
                 continue;
             }
@@ -152,19 +152,18 @@ pub fn model(origin: &Path, name: &str, components: &[(&str, &[usize])], seed: u
                 offset: 0,
                 length,
             };
-            tensors.insert(
-                format!("blocks.{i}.weight"),
-                Tensor {
-                    dtype: Dtype::U8,
-                    shape: vec![length],
-                    body: Body::Data(at),
-                },
-            );
+            tensors.push(Tensor {
+                key: format!("blocks.{i}.weight"),
+                dtype: Dtype::U8,
+                shape: vec![length],
+                body: Body::Data(at),
+            });
         }
-        chunks.insert(component.to_string(), header.chunks[first..].to_vec());
-        header
-            .components
-            .insert(component.to_string(), Component { tensors });
+        chunks.insert(component.to_string(), objects[first..].to_vec());
+        parsed.push(Component {
+            name: component.to_string(),
+            tensors,
+        });
         files.insert(
             format!("{component}/config.json"),
             put(
@@ -177,6 +176,7 @@ pub fn model(origin: &Path, name: &str, components: &[(&str, &[usize])], seed: u
         "tokenizer/vocab.json".into(),
         put(origin, &noise(seed + 7, 3000)),
     );
+    let header = Header::new(objects, parsed, Default::default()).unwrap();
     let header_ref = put(origin, &header.to_json().unwrap());
     files.insert("model.cozytensors".into(), header_ref.clone());
     let manifest = Manifest {

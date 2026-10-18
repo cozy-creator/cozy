@@ -10,6 +10,7 @@
 //!    pinned reference supplies them when the source has none), then delete the tmp area.
 
 pub mod engine;
+pub mod order;
 pub mod remote;
 pub mod source;
 
@@ -22,6 +23,7 @@ use crate::err::{refuse, Code, Result};
 use crate::format::Dtype;
 
 pub use engine::{tables, Table};
+pub use order::{constructor_order, Ordered};
 pub use remote::Access;
 
 /// Where an import's output goes: the writer, or anything that takes tensors and files.

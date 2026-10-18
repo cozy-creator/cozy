@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use base64::Engine;
 use serde::Deserialize;
-use tensorfs_core::format::layout::{self, Item, Order};
+use tensorfs_core::format::layout::{self, Item};
 use tensorfs_core::format::{
     repo_key, Body, Component, Dtype, Encoding, Error, Header, Location, Manifest, ObjectRef, Part,
     Release, Repo, Tensor, HEADER_PATH,
@@ -31,13 +31,14 @@ struct Case {
     bits: Option<String>,
     encoding: Option<Encoding>,
     #[serde(default)]
-    parts: BTreeMap<String, CasePart>,
+    parts: Vec<CasePart>,
     expect: Option<String>,
     refuse: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct CasePart {
+    role: String,
     dtype: Dtype,
     shape: Vec<u64>,
     bits: String,
@@ -75,71 +76,74 @@ fn write_store() -> BTreeMap<String, Vec<u8>> {
     };
     let mut lanes = BTreeMap::new();
 
-    // Lane "all": every case, laid out by the chunk rule.
-    let mine: Vec<&Case> = cases.iter().filter(|c| c.lane == "all").collect();
-    let mut items = Vec::new();
-    let mut data: Vec<Vec<u8>> = Vec::new();
-    for c in &mine {
-        match &c.bits {
-            Some(bits) => {
-                data.push(b64(bits));
-                items.push(Item {
-                    component: &c.component,
-                    key: &c.key,
-                    role: "",
-                    length: data.last().unwrap().len() as u64,
-                });
-            }
-            None => {
-                for (role, p) in &c.parts {
-                    data.push(b64(&p.bits));
-                    items.push(Item {
-                        component: &c.component,
-                        key: &c.key,
-                        role,
-                        length: data.last().unwrap().len() as u64,
-                    });
-                }
-            }
+    // Lane "all": every case in cases.json order (components by first appearance), laid out by
+    // the chunk rule.
+    let mut grouped: Vec<(&str, Vec<&Case>)> = Vec::new();
+    for c in cases.iter().filter(|c| c.lane == "all") {
+        match grouped.iter_mut().find(|(name, _)| *name == c.component) {
+            Some((_, list)) => list.push(c),
+            None => grouped.push((&c.component, vec![c])),
         }
     }
-    let plan = layout::plan(&items, Order::Natural);
+    let mut items = Vec::new();
+    let mut data: Vec<Vec<u8>> = Vec::new();
+    for c in grouped.iter().flat_map(|(_, list)| list) {
+        let parts: Vec<(&str, &str)> = match &c.bits {
+            Some(bits) => vec![("", bits.as_str())],
+            None => c
+                .parts
+                .iter()
+                .map(|p| (p.role.as_str(), p.bits.as_str()))
+                .collect(),
+        };
+        for (role, bits) in parts {
+            data.push(b64(bits));
+            items.push(Item {
+                component: &c.component,
+                key: &c.key,
+                role,
+                length: data.last().unwrap().len() as u64,
+            });
+        }
+    }
+    let plan = layout::plan(&items);
     let slices: Vec<&[u8]> = data.iter().map(Vec::as_slice).collect();
     let chunks: Vec<ObjectRef> = plan.assemble(&slices).into_iter().map(&mut put).collect();
-    let mut header = Header {
-        chunks,
-        ..Default::default()
-    };
     let mut places = plan.places.iter();
-    for c in &mine {
+    let mut tensor = |c: &Case| {
         let body = match &c.encoding {
             None => Body::Data(*places.next().unwrap()),
-            Some(encoding) => {
-                let parts = c.parts.iter().map(|(role, p)| {
-                    let at = places.next().unwrap();
-                    let part = Part {
-                        dtype: p.dtype.clone(),
-                        shape: p.shape.clone(),
-                        chunk: at.chunk,
-                        offset: at.offset,
-                        length: at.length,
-                    };
-                    (role.clone(), part)
-                });
-                Body::Encoded {
-                    encoding: encoding.clone(),
-                    parts: parts.collect(),
-                }
-            }
+            Some(encoding) => Body::Encoded {
+                encoding: encoding.clone(),
+                parts: (c.parts.iter())
+                    .map(|p| {
+                        let at = places.next().unwrap();
+                        Part {
+                            role: p.role.clone(),
+                            dtype: p.dtype.clone(),
+                            shape: p.shape.clone(),
+                            chunk: at.chunk,
+                            offset: at.offset,
+                            length: at.length,
+                        }
+                    })
+                    .collect(),
+            },
         };
-        let tensor = Tensor {
+        Tensor {
+            key: c.key.clone(),
             dtype: c.dtype.clone(),
             shape: c.shape.clone(),
             body,
-        };
-        let component = header.components.entry(c.component.clone()).or_default();
-        component.tensors.insert(c.key.clone(), tensor);
-    }
+        }
+    };
+    let components = (grouped.iter())
+        .map(|(name, list)| Component {
+            name: name.to_string(),
+            tensors: list.iter().map(|c| tensor(c)).collect(),
+        })
+        .collect();
+    let header = Header::new(chunks, components, Default::default()).unwrap();
     let manifest = Manifest {
         files: BTreeMap::from([
             (HEADER_PATH.into(), put(header.to_json().unwrap())),
@@ -159,6 +163,7 @@ fn write_store() -> BTreeMap<String, Vec<u8>> {
         put(bytes[8092..].to_vec()),
     ];
     let tensor = Tensor {
+        key: span.key.clone(),
         dtype: span.dtype.clone(),
         shape: span.shape.clone(),
         body: Body::Data(Location {
@@ -167,12 +172,11 @@ fn write_store() -> BTreeMap<String, Vec<u8>> {
             length: bytes.len() as u64,
         }),
     };
-    let tensors = BTreeMap::from([(span.key.clone(), tensor)]);
-    let header = Header {
-        chunks,
-        components: BTreeMap::from([(span.component.clone(), Component { tensors })]),
-        metadata: Default::default(),
+    let component = Component {
+        name: span.component.clone(),
+        tensors: vec![tensor],
     };
+    let header = Header::new(chunks, vec![component], Default::default()).unwrap();
     let manifest = Manifest {
         files: BTreeMap::from([(HEADER_PATH.into(), put(header.to_json().unwrap()))]),
         metadata: Default::default(),
@@ -303,8 +307,8 @@ fn chunk_rule() {
         role: "",
         length,
     };
-    // Natural order: block 10 after block 9; small parts pack at 4 KiB; a large part splits
-    // on the 64 MiB grid without closing the open pack.
+    // The given (header) order stands: block 10 before block 9 here. Small parts pack at
+    // 4 KiB; a large part splits on the 64 MiB grid without closing the open pack.
     let items = [
         item("unet", "blocks.10.w", 100),
         item("unet", "blocks.9.w", 5000),
@@ -312,13 +316,13 @@ fn chunk_rule() {
         item("unet", "blocks.9.x", 0),
         item("vae", "conv.w", 10),
     ];
-    let p = layout::plan(&items, Order::Natural);
-    assert_eq!(p.chunks, [64 * MIB, 64 * MIB, 22 * MIB, 8192 + 100, 10]);
+    let p = layout::plan(&items);
+    assert_eq!(p.chunks, [4096 + 5000, 64 * MIB, 64 * MIB, 22 * MIB, 10]);
     let at = |i: usize| (p.places[i].chunk, p.places[i].offset, p.places[i].length);
     let want = [
-        (3, 8192, 100),
-        (3, 0, 5000),
-        (0, 0, 150 * MIB),
+        (0, 0, 100),
+        (0, 4096, 5000),
+        (1, 0, 150 * MIB),
         (0, 0, 0),
         (4, 0, 10),
     ];
@@ -328,20 +332,14 @@ fn chunk_rule() {
     let small = 6 * MIB;
     let keys: Vec<String> = (0..12).map(|i| format!("b.{}.w", i / 4)).collect();
     let items: Vec<Item> = keys.iter().map(|k| item("t", k, small)).collect();
-    let p = layout::plan(&items, Order::Given);
+    let p = layout::plan(&items);
     assert_eq!(p.chunks, [24 * MIB, 24 * MIB, 24 * MIB]);
     let same_block: Vec<Item> = (0..12).map(|_| item("t", "b.0.w", small)).collect();
-    assert_eq!(
-        layout::plan(&same_block, Order::Given).chunks,
-        [60 * MIB, 12 * MIB]
-    );
+    assert_eq!(layout::plan(&same_block).chunks, [60 * MIB, 12 * MIB]);
 
     assert_eq!(
         layout::block_of("down_blocks.1.resnets.0.conv1.weight"),
         "down_blocks.1.resnets.0"
     );
     assert_eq!(layout::block_of("conv_in.weight"), "");
-    let mut keys = ["a10", "a9", "a", "a09b", "b1", "a9b", "1a"];
-    keys.sort_by(|a, b| layout::natural_cmp(a, b));
-    assert_eq!(keys, ["1a", "a", "a9", "a09b", "a9b", "a10", "b1"]);
 }

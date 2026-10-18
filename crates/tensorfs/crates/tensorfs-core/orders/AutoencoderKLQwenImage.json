@@ -1,0 +1,248 @@
+{
+ "class": "AutoencoderKLQwenImage",
+ "sources": [
+  "hf://circlestone-labs/Anima-Base-v1.0-Diffusers@073c3a9db359c31ad0e8aa268d15775473c2176c/vae",
+  "hf://Qwen/Qwen-Image@75e0b4be04f60ec59a75f475837eced720f823b6/vae"
+ ],
+ "generator": "scripts/orders.py",
+ "diffusers": "0.41.0.dev0",
+ "transformers": "5.20.0",
+ "children": {
+  "": [
+   "encoder",
+   "quant_conv",
+   "post_quant_conv",
+   "decoder"
+  ],
+  "encoder": [
+   "conv_in",
+   "down_blocks",
+   "mid_block",
+   "norm_out",
+   "conv_out"
+  ],
+  "encoder.conv_in": [
+   "weight",
+   "bias"
+  ],
+  "encoder.down_blocks": [
+   "#"
+  ],
+  "encoder.down_blocks.#": [
+   "norm1",
+   "conv1",
+   "norm2",
+   "conv2",
+   "resample",
+   "conv_shortcut",
+   "time_conv"
+  ],
+  "encoder.down_blocks.#.norm1": [
+   "gamma"
+  ],
+  "encoder.down_blocks.#.conv1": [
+   "weight",
+   "bias"
+  ],
+  "encoder.down_blocks.#.norm2": [
+   "gamma"
+  ],
+  "encoder.down_blocks.#.conv2": [
+   "weight",
+   "bias"
+  ],
+  "encoder.down_blocks.#.resample": [
+   "#"
+  ],
+  "encoder.down_blocks.#.resample.#": [
+   "weight",
+   "bias"
+  ],
+  "encoder.down_blocks.#.conv_shortcut": [
+   "weight",
+   "bias"
+  ],
+  "encoder.down_blocks.#.time_conv": [
+   "weight",
+   "bias"
+  ],
+  "encoder.mid_block": [
+   "attentions",
+   "resnets"
+  ],
+  "encoder.mid_block.attentions": [
+   "#"
+  ],
+  "encoder.mid_block.attentions.#": [
+   "norm",
+   "to_qkv",
+   "proj"
+  ],
+  "encoder.mid_block.attentions.#.norm": [
+   "gamma"
+  ],
+  "encoder.mid_block.attentions.#.to_qkv": [
+   "weight",
+   "bias"
+  ],
+  "encoder.mid_block.attentions.#.proj": [
+   "weight",
+   "bias"
+  ],
+  "encoder.mid_block.resnets": [
+   "#"
+  ],
+  "encoder.mid_block.resnets.#": [
+   "norm1",
+   "conv1",
+   "norm2",
+   "conv2"
+  ],
+  "encoder.mid_block.resnets.#.norm1": [
+   "gamma"
+  ],
+  "encoder.mid_block.resnets.#.conv1": [
+   "weight",
+   "bias"
+  ],
+  "encoder.mid_block.resnets.#.norm2": [
+   "gamma"
+  ],
+  "encoder.mid_block.resnets.#.conv2": [
+   "weight",
+   "bias"
+  ],
+  "encoder.norm_out": [
+   "gamma"
+  ],
+  "encoder.conv_out": [
+   "weight",
+   "bias"
+  ],
+  "quant_conv": [
+   "weight",
+   "bias"
+  ],
+  "post_quant_conv": [
+   "weight",
+   "bias"
+  ],
+  "decoder": [
+   "conv_in",
+   "mid_block",
+   "up_blocks",
+   "norm_out",
+   "conv_out"
+  ],
+  "decoder.conv_in": [
+   "weight",
+   "bias"
+  ],
+  "decoder.mid_block": [
+   "attentions",
+   "resnets"
+  ],
+  "decoder.mid_block.attentions": [
+   "#"
+  ],
+  "decoder.mid_block.attentions.#": [
+   "norm",
+   "to_qkv",
+   "proj"
+  ],
+  "decoder.mid_block.attentions.#.norm": [
+   "gamma"
+  ],
+  "decoder.mid_block.attentions.#.to_qkv": [
+   "weight",
+   "bias"
+  ],
+  "decoder.mid_block.attentions.#.proj": [
+   "weight",
+   "bias"
+  ],
+  "decoder.mid_block.resnets": [
+   "#"
+  ],
+  "decoder.mid_block.resnets.#": [
+   "norm1",
+   "conv1",
+   "norm2",
+   "conv2"
+  ],
+  "decoder.mid_block.resnets.#.norm1": [
+   "gamma"
+  ],
+  "decoder.mid_block.resnets.#.conv1": [
+   "weight",
+   "bias"
+  ],
+  "decoder.mid_block.resnets.#.norm2": [
+   "gamma"
+  ],
+  "decoder.mid_block.resnets.#.conv2": [
+   "weight",
+   "bias"
+  ],
+  "decoder.up_blocks": [
+   "#"
+  ],
+  "decoder.up_blocks.#": [
+   "resnets",
+   "upsamplers"
+  ],
+  "decoder.up_blocks.#.resnets": [
+   "#"
+  ],
+  "decoder.up_blocks.#.resnets.#": [
+   "norm1",
+   "conv1",
+   "norm2",
+   "conv2",
+   "conv_shortcut"
+  ],
+  "decoder.up_blocks.#.resnets.#.norm1": [
+   "gamma"
+  ],
+  "decoder.up_blocks.#.resnets.#.conv1": [
+   "weight",
+   "bias"
+  ],
+  "decoder.up_blocks.#.resnets.#.norm2": [
+   "gamma"
+  ],
+  "decoder.up_blocks.#.resnets.#.conv2": [
+   "weight",
+   "bias"
+  ],
+  "decoder.up_blocks.#.upsamplers": [
+   "#"
+  ],
+  "decoder.up_blocks.#.upsamplers.#": [
+   "resample",
+   "time_conv"
+  ],
+  "decoder.up_blocks.#.upsamplers.#.resample": [
+   "#"
+  ],
+  "decoder.up_blocks.#.upsamplers.#.resample.#": [
+   "weight",
+   "bias"
+  ],
+  "decoder.up_blocks.#.upsamplers.#.time_conv": [
+   "weight",
+   "bias"
+  ],
+  "decoder.up_blocks.#.resnets.#.conv_shortcut": [
+   "weight",
+   "bias"
+  ],
+  "decoder.norm_out": [
+   "gamma"
+  ],
+  "decoder.conv_out": [
+   "weight",
+   "bias"
+  ]
+ }
+}

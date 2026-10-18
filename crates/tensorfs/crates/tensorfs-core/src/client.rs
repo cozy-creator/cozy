@@ -4,7 +4,7 @@
 //! A reference is `org/name[@release]` (with a lane, else the release's only one) or a
 //! manifest digest, `sha256:<hex>` or bare hex.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -141,17 +141,15 @@ fn default_name(source: &str) -> String {
 /// most encoded bytes.
 fn main_lane(header: &Header) -> String {
     let mut bytes: BTreeMap<String, u64> = BTreeMap::new();
-    for component in header.components.values() {
-        for t in component.tensors.values() {
-            let (name, length) = match &t.body {
-                Body::Data(at) => (t.dtype.name().to_ascii_lowercase(), at.length),
-                Body::Encoded { encoding, parts } => (
-                    encoding.scheme.clone(),
-                    parts.values().map(|p| p.length).sum(),
-                ),
-            };
-            *bytes.entry(name).or_default() += length;
-        }
+    for (_, t) in header.tensors() {
+        let (name, length) = match &t.body {
+            Body::Data(at) => (t.dtype.name().to_ascii_lowercase(), at.length),
+            Body::Encoded { encoding, parts } => (
+                encoding.scheme.clone(),
+                parts.iter().map(|p| p.length).sum(),
+            ),
+        };
+        *bytes.entry(name).or_default() += length;
     }
     bytes
         .into_iter()
@@ -415,44 +413,60 @@ pub(crate) fn io(path: &Path, e: std::io::Error) -> crate::failure::Failure {
     failure
 }
 
-/// `header`'s tensors grouped into regions for a weight plane, as `<component>/<key>` names in
-/// chunk order. Tensors sharing a chunk stay together; neighbouring groups merge while their
-/// chunks total at most `max_bytes`, and a group larger than that is a region alone. A region
-/// never spans components.
+/// `header`'s tensors grouped into regions for a weight plane, as `<component>/<key>` names.
+/// Tensors sharing a chunk stay in one group, its members in header order; groups follow the
+/// header order of their first tensor, and neighbouring groups merge while their chunks total
+/// at most `max_bytes` (a larger group is a region alone). A region never spans components.
 pub fn regions(header: &Header, max_bytes: u64) -> Vec<Vec<String>> {
     let mut out = Vec::new();
-    for (component, c) in &header.components {
-        let name = |key: &str| format!("{component}/{key}");
-        // Each tensor's first (chunk, offset) and last chunk; an empty tensor has neither.
-        let (mut placed, mut empty) = (Vec::new(), Vec::new());
-        for (key, t) in &c.tensors {
-            let at: Vec<_> = match &t.body {
-                Body::Data(at) => vec![*at],
-                Body::Encoded { parts, .. } => parts.values().map(|p| p.at()).collect(),
-            };
-            let spans: Vec<_> = at.iter().flat_map(|a| header.spans(a)).collect();
-            let first = spans.iter().map(|s| (s.chunk, s.start)).min();
-            match (first, spans.iter().map(|s| s.chunk).max()) {
-                (Some(first), Some(last)) => placed.push((first, last, key.as_str())),
-                _ => empty.push(name(key)),
+    for c in header.components() {
+        let name = |key: &str| format!("{}/{key}", c.name);
+        // Groups of tensors (by index) and the chunks they use; the group each chunk is in.
+        // (members by tensor index, the chunks they use)
+        let mut groups: Vec<(Vec<usize>, BTreeSet<usize>)> = Vec::new();
+        let mut empty: Vec<String> = Vec::new();
+        let mut owner: HashMap<usize, usize> = HashMap::new();
+        for (i, t) in c.tensors.iter().enumerate() {
+            let chunks: BTreeSet<usize> = (t.locations().iter())
+                .flat_map(|(_, at)| header.spans(at))
+                .map(|s| s.chunk)
+                .collect();
+            if chunks.is_empty() {
+                empty.push(name(&t.key));
+                continue;
             }
-        }
-        placed.sort();
-        // Runs of tensors over overlapping chunks: (keys, first chunk, last chunk).
-        let mut groups: Vec<(Vec<&str>, usize, usize)> = Vec::new();
-        for ((chunk, _), last, key) in placed {
-            match groups.last_mut() {
-                Some(g) if chunk <= g.2 => {
-                    g.0.push(key);
-                    g.2 = g.2.max(last);
+            let mut joined: Vec<usize> = chunks
+                .iter()
+                .filter_map(|k| owner.get(k).copied())
+                .collect();
+            joined.sort_unstable();
+            joined.dedup();
+            let g = match joined.split_first() {
+                None => {
+                    groups.push((Vec::new(), BTreeSet::new()));
+                    groups.len() - 1
                 }
-                _ => groups.push((vec![key], chunk, last)),
+                Some((&first, rest)) => {
+                    // Fold later groups into the earliest; their members keep header order.
+                    for &other in rest.iter().rev() {
+                        let (members, used) = std::mem::take(&mut groups[other]);
+                        groups[first].0.extend(members);
+                        groups[first].1.extend(used);
+                    }
+                    groups[first].0.sort_unstable();
+                    first
+                }
+            };
+            groups[g].0.push(i);
+            groups[g].1.extend(chunks);
+            for &k in &groups[g].1 {
+                owner.insert(k, g);
             }
         }
         let mut regions: Vec<(Vec<String>, u64)> = Vec::new();
-        for (keys, lo, hi) in groups {
-            let n: u64 = header.chunks[lo..=hi].iter().map(|c| c.length).sum();
-            let keys = keys.into_iter().map(name);
+        for (members, used) in groups.into_iter().filter(|g| !g.0.is_empty()) {
+            let n: u64 = used.iter().map(|k| header.chunks[*k].length).sum();
+            let keys = members.into_iter().map(|i| name(&c.tensors[i].key));
             match regions.last_mut() {
                 Some((r, bytes)) if *bytes + n <= max_bytes => {
                     r.extend(keys);

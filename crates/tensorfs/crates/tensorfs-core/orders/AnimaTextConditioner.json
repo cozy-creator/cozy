@@ -1,0 +1,106 @@
+{
+ "class": "AnimaTextConditioner",
+ "sources": [
+  "hf://circlestone-labs/Anima-Base-v1.0-Diffusers@073c3a9db359c31ad0e8aa268d15775473c2176c/text_conditioner"
+ ],
+ "generator": "scripts/orders.py",
+ "diffusers": "0.41.0.dev0",
+ "transformers": "5.20.0",
+ "children": {
+  "": [
+   "embed",
+   "blocks",
+   "out_proj",
+   "norm"
+  ],
+  "embed": [
+   "weight"
+  ],
+  "blocks": [
+   "#"
+  ],
+  "blocks.#": [
+   "norm_self_attn",
+   "self_attn",
+   "norm_cross_attn",
+   "cross_attn",
+   "norm_mlp",
+   "mlp"
+  ],
+  "blocks.#.norm_self_attn": [
+   "weight"
+  ],
+  "blocks.#.self_attn": [
+   "q_proj",
+   "q_norm",
+   "k_proj",
+   "k_norm",
+   "v_proj",
+   "o_proj"
+  ],
+  "blocks.#.self_attn.q_proj": [
+   "weight"
+  ],
+  "blocks.#.self_attn.q_norm": [
+   "weight"
+  ],
+  "blocks.#.self_attn.k_proj": [
+   "weight"
+  ],
+  "blocks.#.self_attn.k_norm": [
+   "weight"
+  ],
+  "blocks.#.self_attn.v_proj": [
+   "weight"
+  ],
+  "blocks.#.self_attn.o_proj": [
+   "weight"
+  ],
+  "blocks.#.norm_cross_attn": [
+   "weight"
+  ],
+  "blocks.#.cross_attn": [
+   "q_proj",
+   "q_norm",
+   "k_proj",
+   "k_norm",
+   "v_proj",
+   "o_proj"
+  ],
+  "blocks.#.cross_attn.q_proj": [
+   "weight"
+  ],
+  "blocks.#.cross_attn.q_norm": [
+   "weight"
+  ],
+  "blocks.#.cross_attn.k_proj": [
+   "weight"
+  ],
+  "blocks.#.cross_attn.k_norm": [
+   "weight"
+  ],
+  "blocks.#.cross_attn.v_proj": [
+   "weight"
+  ],
+  "blocks.#.cross_attn.o_proj": [
+   "weight"
+  ],
+  "blocks.#.norm_mlp": [
+   "weight"
+  ],
+  "blocks.#.mlp": [
+   "#"
+  ],
+  "blocks.#.mlp.#": [
+   "weight",
+   "bias"
+  ],
+  "out_proj": [
+   "weight",
+   "bias"
+  ],
+  "norm": [
+   "weight"
+  ]
+ }
+}

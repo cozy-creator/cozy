@@ -67,19 +67,19 @@ fn checkpoint(store: &Store, chunks: &[Vec<u8>], files: &[(&str, Vec<u8>)]) -> O
                 offset: 0,
                 length: chunk.length,
             };
-            let tensor = Tensor {
+            Tensor {
+                key: format!("blocks.{i}.weight"),
                 dtype: Dtype::U8,
                 shape: vec![chunk.length],
                 body: Body::Data(at),
-            };
-            (format!("blocks.{i}.weight"), tensor)
+            }
         })
         .collect();
-    let header = Header {
-        chunks,
-        components: BTreeMap::from([("unet".into(), Component { tensors })]),
-        ..Header::default()
+    let unet = Component {
+        name: "unet".into(),
+        tensors,
     };
+    let header = Header::new(chunks, vec![unet], Default::default()).unwrap();
     let mut manifest = Manifest::default();
     let header = store.put_bytes(&header.to_json().unwrap()).unwrap();
     manifest.files.insert(HEADER_PATH.into(), header);

@@ -571,15 +571,28 @@ fn sdxl_diffusers_text_encoders_plan_into_the_spelling_runtime_constructs() {
 #[ignore = "real network: huggingface.co"]
 fn a_moving_hugging_face_revision_is_pinned_to_its_commit() {
     let access = Access::default();
-    let main = tensorfs_core::source_model::pin("hf://hf-internal-testing/tiny-random-gpt2", &access).unwrap();
-    let commit = main.strip_prefix("hf://hf-internal-testing/tiny-random-gpt2@").unwrap();
-    assert!(commit.len() == 40 && commit.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()), "{main}");
+    let main =
+        tensorfs_core::source_model::pin("hf://hf-internal-testing/tiny-random-gpt2", &access)
+            .unwrap();
+    let commit = main
+        .strip_prefix("hf://hf-internal-testing/tiny-random-gpt2@")
+        .unwrap();
+    assert!(
+        commit.len() == 40
+            && commit
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+        "{main}"
+    );
     let pasted = tensorfs_core::source_model::pin(
         "https://huggingface.co/hf-internal-testing/tiny-random-gpt2/blob/main/model.safetensors",
         &access,
     )
     .unwrap();
     assert_eq!(pasted, format!("{main}/model.safetensors"));
-    let missing = tensorfs_core::source_model::pin("hf://hf-internal-testing/tiny-random-gpt2@no-such-branch", &access);
+    let missing = tensorfs_core::source_model::pin(
+        "hf://hf-internal-testing/tiny-random-gpt2@no-such-branch",
+        &access,
+    );
     assert!(missing.is_err(), "{missing:?}");
 }

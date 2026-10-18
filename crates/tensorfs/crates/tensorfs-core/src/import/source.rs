@@ -248,6 +248,22 @@ impl SourceSet {
         let path = &self.files[p.file];
         std::fs::read(path).map_err(|e| io(path, e))
     }
+
+    /// The model class a group's `config.json` names: Diffusers' `_class_name`, or the first of
+    /// Transformers' `architectures`.
+    pub fn class_of(&self, group: &Group) -> Option<String> {
+        let path = match group.folder.as_str() {
+            "" => "config.json".to_owned(),
+            folder => format!("{folder}/config.json"),
+        };
+        let plain = self.plain.iter().find(|p| p.path == path)?;
+        let config: serde_json::Value =
+            serde_json::from_slice(&self.read_plain(plain).ok()?).ok()?;
+        let class = config
+            .get("_class_name")
+            .or_else(|| config.get("architectures")?.get(0));
+        class?.as_str().map(str::to_owned)
+    }
 }
 
 pub fn file_sha256(path: &Path) -> Result<String> {

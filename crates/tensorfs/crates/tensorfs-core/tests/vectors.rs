@@ -1433,7 +1433,10 @@ fn stored_headers_are_decoded_not_judged_again() {
     for bytes in [&canonical, &loose] {
         let reference = ObjectRef::of(bytes);
         ok!(store.put_stream(&mut bytes.as_slice(), Some(&reference), &fault));
-        assert_eq!(ok!(tensorfs_core::checkpoint::load_header(&store, &reference)), ha);
+        assert_eq!(
+            ok!(tensorfs_core::checkpoint::load_header(&store, &reference)),
+            ha
+        );
     }
     ok!(fs::remove_dir_all(&root));
 }

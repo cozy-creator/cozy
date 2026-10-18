@@ -10,10 +10,12 @@
       "length": 64
     }
   ],
-  "components": {
-    "unet": {
-      "tensors": {
-        "a.weight": {
+  "components": [
+    {
+      "name": "unet",
+      "tensors": [
+        {
+          "key": "a.weight",
           "dtype": "BF16",
           "shape": [
             2,
@@ -25,7 +27,8 @@
             "length": 12
           }
         },
-        "b.weight": {
+        {
+          "key": "b.weight",
           "dtype": "F32",
           "shape": [
             4,
@@ -37,8 +40,9 @@
               "axis": 0
             }
           },
-          "parts": {
-            "weight": {
+          "parts": [
+            {
+              "role": "weight",
               "dtype": "F8_E4M3",
               "shape": [
                 4,
@@ -48,7 +52,8 @@
               "offset": 4096,
               "length": 4096
             },
-            "scale": {
+            {
+              "role": "scale",
               "dtype": "F32",
               "shape": [
                 4
@@ -57,11 +62,11 @@
               "offset": 0,
               "length": 16
             }
-          }
+          ]
         }
-      }
+      ]
     }
-  },
+  ],
   "metadata": {
     "prompt": "a cat"
   }

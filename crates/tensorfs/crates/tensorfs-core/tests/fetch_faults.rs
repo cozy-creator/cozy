@@ -19,12 +19,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tensorfs_core::canon::{self, Value};
 use tensorfs_core::dtype::Dtype;
 use tensorfs_core::err::{Code, Refusal};
+use tensorfs_core::fetch_v1::{Fetcher, Origin, Priority};
 use tensorfs_core::header::{Body, Closure, Header, Part, Tensor};
 use tensorfs_core::ids::{Doc, ObjectRef};
 use tensorfs_core::manifest::{Draft, Entry};
 use tensorfs_core::registry;
 use tensorfs_core::store::Store;
-use tensorfs_core::fetch_v1::{Fetcher, Origin, Priority};
 use tensorfs_core::transport::{Anonymous, PullCancellation, SourcePolicy};
 
 /// The ledger's sampling resolution in these proofs. Every patience the transport derives
@@ -691,7 +691,11 @@ impl<'a> Run<'a> {
                 ..Default::default()
             };
             let on_progress = |bytes_done: u64, bytes_total: u64| {
-                let event = Event { phase: Phase::Fetching, bytes_done, bytes_total };
+                let event = Event {
+                    phase: Phase::Fetching,
+                    bytes_done,
+                    bytes_total,
+                };
                 if event.bytes_total > 0 {
                     let (held, flight) =
                         checkpoint.bodies.iter().fold((0, 0), |(h, f), (hex, b)| {
@@ -711,7 +715,10 @@ impl<'a> Run<'a> {
                 }
                 seen.lock().unwrap().push((Instant::now(), event));
             };
-            let access = Arc::new(tensorfs_core::fetch_v1::Plain { credential: Anonymous, policy });
+            let access = Arc::new(tensorfs_core::fetch_v1::Plain {
+                credential: Anonymous,
+                policy,
+            });
             let fetcher = Fetcher::new(&store, streams, sample()).unwrap();
             let origin = Origin {
                 hub: hub_base,
@@ -719,8 +726,18 @@ impl<'a> Run<'a> {
                 lane: "public".into(),
                 manifest: checkpoint.manifest.clone(),
             };
-            let landed = tensorfs_core::fetch_v1::whole(&fetcher, &origin, access, Priority::Now, &stop, &on_progress)
-                .map(|_| Ensured { manifest: checkpoint.manifest.clone(), bytes_total: checkpoint.total() });
+            let landed = tensorfs_core::fetch_v1::whole(
+                &fetcher,
+                &origin,
+                access,
+                Priority::Now,
+                &stop,
+                &on_progress,
+            )
+            .map(|_| Ensured {
+                manifest: checkpoint.manifest.clone(),
+                bytes_total: checkpoint.total(),
+            });
             // Its last handle joins its downloader: nothing it started outlives the answer.
             drop(fetcher);
             let _ = tx.send(landed);
@@ -1158,13 +1175,22 @@ fn a_stalled_object_is_asked_again_while_anything_else_moves() {
     };
     let alone = stuck();
     let root = store(&temporary("stuck-alone"));
-    assert_refused(&Run::new(&alone, &root).ensure(), &alone, &root, Code::STALLED);
+    assert_refused(
+        &Run::new(&alone, &root).ensure(),
+        &alone,
+        &root,
+        Code::STALLED,
+    );
     assert_eq!(alone.asks("presign"), 2, "{}", alone.log());
 
     let moving = hub(
         slow,
         Config {
-            rules: vec![on("*", 1..=usize::MAX, Fault::Slow(Duration::from_secs(60)))],
+            rules: vec![on(
+                "*",
+                1..=usize::MAX,
+                Fault::Slow(Duration::from_secs(60)),
+            )],
             ..Config::default()
         },
     );
@@ -1195,11 +1221,33 @@ fn a_killed_download_child() {
     let store = Store::open(Path::new(root)).unwrap();
     let fetcher = Fetcher::new(&store, 4, Duration::from_secs(60)).unwrap();
     let manifest = std::env::var("TFS_KILLED_MANIFEST").unwrap();
-    let manifest = ObjectRef { sha256: manifest.clone(), length: std::env::var("TFS_KILLED_LENGTH").unwrap().parse().unwrap() };
-    let origin = Origin { hub: base.into(), refspec: "acme/model@r1".into(), lane: "public".into(), manifest };
-    let policy = SourcePolicy { allowed_hosts: vec!["127.0.0.1".into()], allow_local: true, ..Default::default() };
-    let access = Arc::new(tensorfs_core::fetch_v1::Plain { credential: Anonymous, policy });
-    let _ = tensorfs_core::fetch_v1::whole(&fetcher, &origin, access, Priority::Now, &PullCancellation::default(), &|_, _| {});
+    let manifest = ObjectRef {
+        sha256: manifest.clone(),
+        length: std::env::var("TFS_KILLED_LENGTH").unwrap().parse().unwrap(),
+    };
+    let origin = Origin {
+        hub: base.into(),
+        refspec: "acme/model@r1".into(),
+        lane: "public".into(),
+        manifest,
+    };
+    let policy = SourcePolicy {
+        allowed_hosts: vec!["127.0.0.1".into()],
+        allow_local: true,
+        ..Default::default()
+    };
+    let access = Arc::new(tensorfs_core::fetch_v1::Plain {
+        credential: Anonymous,
+        policy,
+    });
+    let _ = tensorfs_core::fetch_v1::whole(
+        &fetcher,
+        &origin,
+        access,
+        Priority::Now,
+        &PullCancellation::default(),
+        &|_, _| {},
+    );
 }
 
 /// A download killed mid-object strands its partial temp; the next download takes it,
@@ -1218,7 +1266,10 @@ fn a_killed_downloads_partial_temp_is_reaped_by_the_next() {
     let root = store(&temporary("killed"));
     let mut child = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "a_killed_download_child", "--nocapture"])
-        .env("TFS_KILLED_CHILD", format!("{}\n{}", root.display(), stuck.base))
+        .env(
+            "TFS_KILLED_CHILD",
+            format!("{}\n{}", root.display(), stuck.base),
+        )
         .env("TFS_KILLED_MANIFEST", &checkpoint.manifest.sha256)
         .env("TFS_KILLED_LENGTH", checkpoint.manifest.length.to_string())
         .stdout(std::process::Stdio::null())
@@ -1231,7 +1282,10 @@ fn a_killed_downloads_partial_temp_is_reaped_by_the_next() {
         })
     };
     while !partial(&root) {
-        assert!(child.try_wait().unwrap().is_none(), "the download exited early");
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "the download exited early"
+        );
         std::thread::sleep(Duration::from_millis(10));
     }
     child.kill().unwrap();
@@ -1695,12 +1749,40 @@ fn a_task_capped_child() {
     };
     let fields: Vec<&str> = spec.split('\n').collect();
     let store = Store::open(Path::new(fields[0])).unwrap();
-    let manifest = ObjectRef { sha256: fields[2].into(), length: fields[3].parse().unwrap() };
-    let fetcher = Fetcher::new(&store, tensorfs_core::transport::PULL_STREAMS, Duration::from_secs(1)).unwrap();
-    let origin = Origin { hub: fields[1].into(), refspec: "acme/model@r1".into(), lane: "public".into(), manifest };
-    let policy = SourcePolicy { allowed_hosts: vec!["127.0.0.1".into()], allow_local: true, ..Default::default() };
-    let access = Arc::new(tensorfs_core::fetch_v1::Plain { credential: Anonymous, policy });
-    tensorfs_core::fetch_v1::whole(&fetcher, &origin, access, Priority::Now, &PullCancellation::default(), &|_, _| {}).unwrap();
+    let manifest = ObjectRef {
+        sha256: fields[2].into(),
+        length: fields[3].parse().unwrap(),
+    };
+    let fetcher = Fetcher::new(
+        &store,
+        tensorfs_core::transport::PULL_STREAMS,
+        Duration::from_secs(1),
+    )
+    .unwrap();
+    let origin = Origin {
+        hub: fields[1].into(),
+        refspec: "acme/model@r1".into(),
+        lane: "public".into(),
+        manifest,
+    };
+    let policy = SourcePolicy {
+        allowed_hosts: vec!["127.0.0.1".into()],
+        allow_local: true,
+        ..Default::default()
+    };
+    let access = Arc::new(tensorfs_core::fetch_v1::Plain {
+        credential: Anonymous,
+        policy,
+    });
+    tensorfs_core::fetch_v1::whole(
+        &fetcher,
+        &origin,
+        access,
+        Priority::Now,
+        &PullCancellation::default(),
+        &|_, _| {},
+    )
+    .unwrap();
     println!("LANDED");
 }
 
@@ -1728,7 +1810,13 @@ fn a_download_under_a_task_cap_keeps_more_requests_than_threads() {
     let checkpoint = checkpoint(251, 4096, 9);
     let hub = hub(Arc::clone(&checkpoint), Config::default());
     let root = store(&temporary("tasks"));
-    let spec = format!("{}\n{}\n{}\n{}", root.display(), hub.base, checkpoint.manifest.sha256, checkpoint.manifest.length);
+    let spec = format!(
+        "{}\n{}\n{}\n{}",
+        root.display(),
+        hub.base,
+        checkpoint.manifest.sha256,
+        checkpoint.manifest.length
+    );
     let mut child = std::process::Command::new(scope[0])
         .args(&scope[1..])
         .arg(std::env::current_exe().unwrap())
@@ -1760,5 +1848,8 @@ fn a_download_under_a_task_cap_keeps_more_requests_than_threads() {
         .unwrap()
         .parse()
         .unwrap();
-    assert!(streams > TASKS, "more requests in flight than the cap allows threads: {walk}");
+    assert!(
+        streams > TASKS,
+        "more requests in flight than the cap allows threads: {walk}"
+    );
 }

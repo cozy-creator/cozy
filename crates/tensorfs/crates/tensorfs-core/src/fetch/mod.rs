@@ -23,7 +23,7 @@ pub use policy::SourcePolicy;
 pub use volume::VolumeOrigin;
 
 use crate::err::{refuse, Code, Refusal, Result};
-use crate::format::{self, Body, Header, Manifest, ObjectRef};
+use crate::format::{self, Header, Manifest, ObjectRef};
 use download::Shared;
 
 /// The store objects are admitted into (design §4).
@@ -298,24 +298,30 @@ fn invalid(object: &ObjectRef, error: format::Error) -> Refusal {
 
 /// The chunks the tensors of `components` (every component when `None`) live in.
 fn chunks(header: &Header, components: Option<&[String]>) -> Result<Vec<ObjectRef>> {
-    let names: Vec<&String> = match components {
-        Some(names) => names.iter().collect(),
-        None => header.components.keys().collect(),
+    let names: Vec<&str> = match components {
+        Some(names) => names.iter().map(String::as_str).collect(),
+        None => header
+            .components()
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect(),
     };
     let mut wanted = BTreeSet::new();
     for name in names {
-        let Some(component) = header.components.get(name) else {
-            let has: Vec<&String> = header.components.keys().collect();
+        let Some(component) = header.component(name) else {
+            let has: Vec<&str> = header
+                .components()
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect();
             return refuse(
                 Code::REF_NOT_FOUND,
                 format!("no component {name:?} (has {has:?})"),
             );
         };
-        for tensor in component.tensors.values() {
-            let at: Vec<format::Location> = match &tensor.body {
-                Body::Data(at) => vec![*at],
-                Body::Encoded { parts, .. } => parts.values().map(format::Part::at).collect(),
-            };
+        for tensor in &component.tensors {
+            let at: Vec<format::Location> =
+                tensor.locations().into_iter().map(|(_, at)| at).collect();
             wanted.extend(
                 at.iter()
                     .flat_map(|at| header.spans(at))

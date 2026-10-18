@@ -612,7 +612,9 @@ mod tests {
         for (_, _, tensor) in header.tensors() {
             for (_, part) in &tensor.parts {
                 if let tensorfs_core::header::Body::Segments(objects) = &part.body {
-                    objects.iter().for_each(|o| drop(store.open_verified(&o.sha256).unwrap()));
+                    objects
+                        .iter()
+                        .for_each(|o| drop(store.open_verified(&o.sha256).unwrap()));
                 }
             }
         }

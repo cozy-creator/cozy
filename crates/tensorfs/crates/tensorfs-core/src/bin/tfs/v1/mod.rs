@@ -41,20 +41,68 @@ pub const USAGE: &str = "v1 (until xs-045 U11):
 
 /// Flags that never take a value.
 const SWITCHES: &[&str] = &[
-    "allow-local", "dry-run", "json", "keys", "no-configs",
-    "no-disk-budget", "no-netns", "plain", "progress",
+    "allow-local",
+    "dry-run",
+    "json",
+    "keys",
+    "no-configs",
+    "no-disk-budget",
+    "no-netns",
+    "plain",
+    "progress",
 ];
 /// Flags that take the next token as their value; given last, or before another flag, they
 /// are present without one.
 const VALUED: &[&str] = &[
-    "allow-hosts", "blocks", "ca-file", "carrier", "closure",
-    "config", "credential-file", "disk-budget", "expect", "expect-length", "fault",
-    "header", "holds", "hub", "inventory", "isolation-tier", "keep", "lane",
-    "manifest", "max-download-bytes", "max-download-objects", "max-redirects", "member",
-    "observed", "order", "out", "part-mib", "progress-bytes", "range", "ready", "refs",
-    "registry", "rlimit-as-mb", "rlimit-fsize-mb", "rows", "sample-seconds",
-    "scale", "session", "slow-ms", "source", "source-name", "source-plan", "source-profile",
-    "spec-variant", "step", "streams", "target", "tenant", "timeout",
+    "allow-hosts",
+    "blocks",
+    "ca-file",
+    "carrier",
+    "closure",
+    "config",
+    "credential-file",
+    "disk-budget",
+    "expect",
+    "expect-length",
+    "fault",
+    "header",
+    "holds",
+    "hub",
+    "inventory",
+    "isolation-tier",
+    "keep",
+    "lane",
+    "manifest",
+    "max-download-bytes",
+    "max-download-objects",
+    "max-redirects",
+    "member",
+    "observed",
+    "order",
+    "out",
+    "part-mib",
+    "progress-bytes",
+    "range",
+    "ready",
+    "refs",
+    "registry",
+    "rlimit-as-mb",
+    "rlimit-fsize-mb",
+    "rows",
+    "sample-seconds",
+    "scale",
+    "session",
+    "slow-ms",
+    "source",
+    "source-name",
+    "source-plan",
+    "source-profile",
+    "spec-variant",
+    "step",
+    "streams",
+    "target",
+    "tenant",
+    "timeout",
 ];
 
 fn usage() -> ExitCode {
@@ -405,7 +453,6 @@ fn peak_rss_kb() -> u64 {
     cozy_platform::process::peak_resident().map_or(0, |bytes| bytes / 1024)
 }
 
-
 // ------------------------------------------------------------------ id
 
 fn write_cli(bytes: &[u8], flags: &Flags) -> ExitCode {
@@ -439,8 +486,11 @@ fn cmd_cbor(action: &str, path: &Path, flags: &Flags) -> ExitCode {
     };
     match action {
         "encode" => {
-            let value =
-                ok!(canon::parse_with_depth(&bytes, tensorfs_core::limits::DOC_MAX_BYTES, 16));
+            let value = ok!(canon::parse_with_depth(
+                &bytes,
+                tensorfs_core::limits::DOC_MAX_BYTES,
+                16
+            ));
             let header = ok!(Header::from_diagnostic_value(&value));
             if let Err(error) = header.validate_structure() {
                 return bail(error);
