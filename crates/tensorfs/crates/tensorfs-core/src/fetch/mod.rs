@@ -300,12 +300,20 @@ fn invalid(object: &ObjectRef, error: format::Error) -> Refusal {
 fn chunks(header: &Header, components: Option<&[String]>) -> Result<Vec<ObjectRef>> {
     let names: Vec<&str> = match components {
         Some(names) => names.iter().map(String::as_str).collect(),
-        None => header.components().iter().map(|c| c.name.as_str()).collect(),
+        None => header
+            .components()
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect(),
     };
     let mut wanted = BTreeSet::new();
     for name in names {
         let Some(component) = header.component(name) else {
-            let has: Vec<&str> = header.components().iter().map(|c| c.name.as_str()).collect();
+            let has: Vec<&str> = header
+                .components()
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect();
             return refuse(
                 Code::REF_NOT_FOUND,
                 format!("no component {name:?} (has {has:?})"),

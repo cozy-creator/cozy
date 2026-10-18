@@ -1,3 +1,4 @@
+use cozy_platform::durable::{self, FileId};
 use std::{
     fs,
     io::{Read, Write},
@@ -10,7 +11,6 @@ use std::{
     thread,
     time::Duration,
 };
-use cozy_platform::durable::{self, FileId};
 use tensorfs_core::{
     gc,
     ids::{Doc, ObjectRef},
@@ -425,7 +425,13 @@ fn fresh_owner_after_admission(stage: &str, remove_cas: bool) {
         .join(&object.sha256);
     let before_state = fs::read(prefix.join("chunks")).unwrap();
     let part = prefix.join("bytes.part");
-    let facts = |metadata: fs::Metadata| (FileId::at(&part).unwrap(), metadata.len(), durable::mode(&metadata));
+    let facts = |metadata: fs::Metadata| {
+        (
+            FileId::at(&part).unwrap(),
+            metadata.len(),
+            durable::mode(&metadata),
+        )
+    };
     let before_bytes = fs::metadata(&part).ok().map(facts);
     if stage == "linked" {
         let (id, _, mode) = before_bytes.unwrap();
@@ -513,10 +519,7 @@ fn forked_descriptor_keeps_recovery_excluded_after_parent_guard_drop() {
     let _store = Store::init(&dir).unwrap();
     let writer = WriterGuard::acquire(&dir).unwrap();
     let mut signal = [0; 2];
-    assert_eq!(
-        unsafe { libc::pipe(signal.as_mut_ptr()) },
-        0
-    );
+    assert_eq!(unsafe { libc::pipe(signal.as_mut_ptr()) }, 0);
     let child = unsafe { libc::fork() };
     assert!(child >= 0);
     if child == 0 {

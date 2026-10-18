@@ -97,7 +97,11 @@ pub fn components(
     let (mut header_components, mut reached) = (vec![], vec![]);
     for (component, count) in counts.iter().enumerate() {
         let (mut tensors, mut refs) = (vec![], vec![]);
-        let extra = if component == 0 { shared.to_vec() } else { vec![] };
+        let extra = if component == 0 {
+            shared.to_vec()
+        } else {
+            vec![]
+        };
         let made = (0..*count).map(|index| {
             let body = body(size, salt, component, index);
             (ObjectRef::of(&body), body)
@@ -136,7 +140,10 @@ pub fn components(
     let header_ref = ObjectRef::of(&header_bytes);
     bodies.insert(header_ref.sha256.clone(), header_bytes);
     let manifest = Draft {
-        entries: vec![("model.cozytensors".into(), Entry::CozyTensors(header_ref.clone()))],
+        entries: vec![(
+            "model.cozytensors".into(),
+            Entry::CozyTensors(header_ref.clone()),
+        )],
     }
     .seal()
     .unwrap()
@@ -238,7 +245,10 @@ pub fn hub(
 ) -> Hub {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let scheme = if tls.is_some() { "https" } else { "http" };
-    let base = format!("{scheme}://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let base = format!(
+        "{scheme}://127.0.0.1:{}",
+        listener.local_addr().unwrap().port()
+    );
     let hub = Hub {
         base,
         gets: Arc::default(),
@@ -320,7 +330,8 @@ impl Served {
                 let asked = field("ref").unwrap_or_default();
                 let mut parts = asked.split('@');
                 let model = parts.next().unwrap_or_default().to_string();
-                let pinned = parts.find_map(|part| part.strip_prefix("sha256:").map(str::to_string));
+                let pinned =
+                    parts.find_map(|part| part.strip_prefix("sha256:").map(str::to_string));
                 let named = |c: &&Arc<Checkpoint>| {
                     c.model == model && pinned.as_ref().is_none_or(|hex| *hex == c.manifest.sha256)
                 };
@@ -341,7 +352,8 @@ impl Served {
                     }
                     None => (
                         404,
-                        b"{\"error\":{\"code\":\"ref_not_found\",\"message\":\"no such ref\"}}".to_vec(),
+                        b"{\"error\":{\"code\":\"ref_not_found\",\"message\":\"no such ref\"}}"
+                            .to_vec(),
                         false,
                     ),
                 }
@@ -351,7 +363,9 @@ impl Served {
                 let Value::Obj(fields) = canon::parse(&body, 1 << 20).unwrap() else {
                     panic!("presign body")
                 };
-                let Some((_, Value::Arr(digests))) = fields.into_iter().find(|(k, _)| k == "digests") else {
+                let Some((_, Value::Arr(digests))) =
+                    fields.into_iter().find(|(k, _)| k == "digests")
+                else {
                     panic!("presign digests")
                 };
                 let now = std::time::SystemTime::now()
@@ -380,7 +394,9 @@ impl Served {
                 let answer = (self.rule)(&hex, asked);
                 if matches!(answer, Answer::Hold) {
                     let (gate, changed) = &*self.gate;
-                    let mut gate = changed.wait_while(gate.lock().unwrap(), |g| !g.open && g.admits == 0).unwrap();
+                    let mut gate = changed
+                        .wait_while(gate.lock().unwrap(), |g| !g.open && g.admits == 0)
+                        .unwrap();
                     if !gate.open {
                         gate.admits -= 1;
                     }
@@ -408,7 +424,11 @@ impl Served {
         }
         for piece in sent.chunks(sent.len().div_ceil(4).max(1)) {
             std::thread::sleep(self.gap);
-            if stream.write_all(piece).and_then(|()| stream.flush()).is_err() {
+            if stream
+                .write_all(piece)
+                .and_then(|()| stream.flush())
+                .is_err()
+            {
                 return;
             }
         }
@@ -454,12 +474,13 @@ pub fn tls_config() -> (Arc<rustls::ServerConfig>, String) {
     let private = rustls::pki_types::PrivateKeyDer::try_from(key.signing_key.serialize_der())
         .unwrap()
         .clone_key();
-    let config =
-        rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
-            .with_safe_default_protocol_versions()
-            .unwrap()
-            .with_no_client_auth()
-            .with_single_cert(vec![cert], private)
-            .unwrap();
+    let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(vec![cert], private)
+    .unwrap();
     (Arc::new(config), key.cert.pem())
 }

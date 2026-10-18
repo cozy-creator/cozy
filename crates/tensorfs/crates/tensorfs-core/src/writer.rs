@@ -425,7 +425,10 @@ impl Writer {
             .map(|(name, entries)| {
                 let tensors = (entries.iter())
                     .map(|e| {
-                        let mut at = e.parts.iter().map(|(role, s)| (role, s, *places.next().expect("a place per part")));
+                        let mut at = e
+                            .parts
+                            .iter()
+                            .map(|(role, s)| (role, s, *places.next().expect("a place per part")));
                         let body = match &e.encoding {
                             None => Body::Data(at.next().expect("a plain tensor has its data").2),
                             Some(encoding) => Body::Encoded {

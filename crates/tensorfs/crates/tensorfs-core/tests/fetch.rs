@@ -107,9 +107,24 @@ fn now_goes_before_next_by_run_and_rank_and_behind_goes_last() {
     until(|| hub.total_gets() == 1);
     let tickets = [
         fetcher.want(&origin, access(), &blob(4), Priority::Behind),
-        fetcher.want(&origin, access(), &blob(3), Priority::Next { run: 2, rank: 0 }),
-        fetcher.want(&origin, access(), &blob(2), Priority::Next { run: 1, rank: 5 }),
-        fetcher.want(&origin, access(), &blob(1), Priority::Next { run: 1, rank: 1 }),
+        fetcher.want(
+            &origin,
+            access(),
+            &blob(3),
+            Priority::Next { run: 2, rank: 0 },
+        ),
+        fetcher.want(
+            &origin,
+            access(),
+            &blob(2),
+            Priority::Next { run: 1, rank: 5 },
+        ),
+        fetcher.want(
+            &origin,
+            access(),
+            &blob(1),
+            Priority::Next { run: 1, rank: 1 },
+        ),
         fetcher.want(&origin, access(), &blob(0), Priority::Now),
     ];
     hub.open();
@@ -121,14 +136,21 @@ fn now_goes_before_next_by_run_and_rank_and_behind_goes_last() {
     });
     structure.wait(&[], &never()).unwrap();
     let blobs: Vec<String> = checkpoint.blobs.iter().map(|o| o.sha256.clone()).collect();
-    let order: Vec<String> = hub.log().into_iter().filter(|hex| blobs.contains(hex)).collect();
+    let order: Vec<String> = hub
+        .log()
+        .into_iter()
+        .filter(|hex| blobs.contains(hex))
+        .collect();
     let name = |hex: &String| match blobs.iter().position(|b| b == hex) {
         Some(at) => format!("b{at}"),
         None if *hex == checkpoint.manifest.sha256 => "manifest".into(),
         None => "header".into(),
     };
     let log: Vec<String> = hub.log().iter().map(name).collect();
-    assert_eq!(order, blobs, "blobs in the order the hub was asked: {log:?}");
+    assert_eq!(
+        order, blobs,
+        "blobs in the order the hub was asked: {log:?}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -139,7 +161,13 @@ fn dropping_a_ticket_cancels_its_fetches() {
     let store = Store::open(&store(&dir)).unwrap();
     let checkpoint = Arc::new(components("acme/model", &[3], 64 << 10, 3, &[]));
     let held = checkpoint.blobs[0].sha256.clone();
-    let rule: Rule = Arc::new(move |hex, _| if hex == held { Answer::Hold } else { Answer::Body });
+    let rule: Rule = Arc::new(move |hex, _| {
+        if hex == held {
+            Answer::Hold
+        } else {
+            Answer::Body
+        }
+    });
     let hub = hub(vec![Arc::clone(&checkpoint)], None, Duration::ZERO, rule);
     // One request at a time, so what is queued behind the held one stays queued.
     let fetcher = Fetcher::new(&store, 1, SAMPLE).unwrap();
@@ -169,7 +197,9 @@ fn dropping_a_ticket_cancels_its_fetches() {
     std::thread::sleep(Duration::from_millis(300));
     assert!(checkpoint.blobs.iter().all(|o| !store.contains(&o.sha256)));
     assert_eq!(hub.gets(&checkpoint.blobs[0].sha256), 1);
-    assert!(checkpoint.blobs[1..].iter().all(|o| hub.gets(&o.sha256) == 0));
+    assert!(checkpoint.blobs[1..]
+        .iter()
+        .all(|o| hub.gets(&o.sha256) == 0));
 
     // Wanted again, it is fetched again.
     let again = fetcher.want(&origin, access(), &checkpoint.blobs[..1], Priority::Now);
@@ -186,7 +216,12 @@ fn a_wait_fetches_an_absent_object_and_the_hub_keeps_the_rest() {
     let root = store(&dir);
     let store = Store::open(&root).unwrap();
     let checkpoint = Arc::new(components("acme/model", &[2, 2], 16 << 10, 4, &[]));
-    let hub = hub(vec![Arc::clone(&checkpoint)], None, Duration::ZERO, serve_all());
+    let hub = hub(
+        vec![Arc::clone(&checkpoint)],
+        None,
+        Duration::ZERO,
+        serve_all(),
+    );
     let fetcher = Fetcher::new(&store, 8, SAMPLE).unwrap();
     let origin = origin(&hub, &checkpoint);
     let ticket = fetcher.want(&origin, access(), &[], Priority::Now);
@@ -201,7 +236,10 @@ fn a_wait_fetches_an_absent_object_and_the_hub_keeps_the_rest() {
         Some(origin.clone())
     );
     let custodied = tensorfs_core::ingest::custody::live(&root).unwrap();
-    assert!(checkpoint.blobs.iter().all(|o| custodied.contains(&o.sha256)));
+    assert!(checkpoint
+        .blobs
+        .iter()
+        .all(|o| custodied.contains(&o.sha256)));
 
     let read = checkpoint.components[1][1].clone();
     ticket.wait(std::slice::from_ref(&read), &never()).unwrap();
@@ -227,7 +265,12 @@ fn an_object_the_disk_cannot_hold_is_refused() {
     let dir = temporary("fetch-full");
     let root = store(&dir);
     let checkpoint = Arc::new(components("acme/model", &[1], 256 << 10, 5, &[]));
-    let hub = hub(vec![Arc::clone(&checkpoint)], None, Duration::ZERO, serve_all());
+    let hub = hub(
+        vec![Arc::clone(&checkpoint)],
+        None,
+        Duration::ZERO,
+        serve_all(),
+    );
     let structure = checkpoint.manifest.length + checkpoint.header.length;
     let store = Store::open(&root)
         .unwrap()
@@ -242,7 +285,10 @@ fn an_object_the_disk_cannot_hold_is_refused() {
     );
     let refused = ticket.wait(&[], &never()).unwrap_err();
     assert_eq!(refused.code, Code::CAPACITY_EXHAUSTED, "{refused}");
-    assert!(refused.detail.contains(&checkpoint.blobs[0].sha256), "{refused}");
+    assert!(
+        refused.detail.contains(&checkpoint.blobs[0].sha256),
+        "{refused}"
+    );
     assert_eq!(hub.gets(&checkpoint.blobs[0].sha256), 0);
     assert!(!store.contains(&checkpoint.blobs[0].sha256));
     let _ = std::fs::remove_dir_all(&dir);
@@ -291,12 +337,17 @@ fn a_short_disk_evicts_an_idle_partial_checkpoint_and_keeps_ticketed_objects() {
     );
     ticket.wait(&[], &never()).unwrap();
     assert!(store.contains(&own.sha256));
-    assert!(store.contains(&kept.sha256), "a ticketed object was evicted");
+    assert!(
+        store.contains(&kept.sha256),
+        "a ticketed object was evicted"
+    );
     assert!(
         idle.blobs[1..].iter().all(|o| !store.contains(&o.sha256)),
         "the idle checkpoint kept its objects"
     );
-    assert!(store.manifest_path(&idle.manifest.sha256).is_file() && store.contains(&idle.header.sha256));
+    assert!(
+        store.manifest_path(&idle.manifest.sha256).is_file() && store.contains(&idle.header.sha256)
+    );
     assert!(tensorfs_core::origin::of(&root, &idle.manifest)
         .unwrap()
         .is_some());
@@ -311,19 +362,37 @@ fn an_idle_partial_checkpoint_goes_at_its_ttl() {
     let root = store(&dir);
     let store = Store::open(&root).unwrap();
     let checkpoint = Arc::new(components("acme/model", &[2], 16 << 10, 9, &[]));
-    let hub = hub(vec![Arc::clone(&checkpoint)], None, Duration::ZERO, serve_all());
+    let hub = hub(
+        vec![Arc::clone(&checkpoint)],
+        None,
+        Duration::ZERO,
+        serve_all(),
+    );
     {
         let fetcher = Fetcher::new(&store, 8, SAMPLE).unwrap();
-        let ticket = fetcher.want(&origin(&hub, &checkpoint), access(), &checkpoint.blobs[..1], Priority::Now);
+        let ticket = fetcher.want(
+            &origin(&hub, &checkpoint),
+            access(),
+            &checkpoint.blobs[..1],
+            Priority::Now,
+        );
         ticket.wait(&[], &never()).unwrap();
     }
-    let present = |o: &ObjectRef| store.contains(&o.sha256) || store.manifest_path(&o.sha256).is_file();
+    let present =
+        |o: &ObjectRef| store.contains(&o.sha256) || store.manifest_path(&o.sha256).is_file();
     tensorfs_core::gc::collect_idle(&root, &[], Duration::from_secs(3600)).unwrap();
     assert!(present(&checkpoint.blobs[0]) && present(&checkpoint.manifest));
     std::thread::sleep(Duration::from_millis(20));
     tensorfs_core::gc::collect_idle(&root, &[], Duration::from_millis(1)).unwrap();
-    assert!(!present(&checkpoint.blobs[0]) && !present(&checkpoint.manifest) && !present(&checkpoint.header));
-    assert_eq!(tensorfs_core::origin::of(&root, &checkpoint.manifest).unwrap(), None);
+    assert!(
+        !present(&checkpoint.blobs[0])
+            && !present(&checkpoint.manifest)
+            && !present(&checkpoint.header)
+    );
+    assert_eq!(
+        tensorfs_core::origin::of(&root, &checkpoint.manifest).unwrap(),
+        None
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -335,7 +404,12 @@ fn the_executor_channel_schedules_waits_and_answers_presence() {
     let dir = temporary("fetch-channel");
     let store = Store::open(&store(&dir)).unwrap();
     let checkpoint = Arc::new(components("acme/model", &[3], 16 << 10, 8, &[]));
-    let hub = hub(vec![Arc::clone(&checkpoint)], None, Duration::ZERO, serve_all());
+    let hub = hub(
+        vec![Arc::clone(&checkpoint)],
+        None,
+        Duration::ZERO,
+        serve_all(),
+    );
     let fetcher = Fetcher::new(&store, 8, SAMPLE).unwrap();
     let grant = fetch::Grant {
         run: 7,
@@ -376,7 +450,10 @@ fn the_executor_channel_schedules_waits_and_answers_presence() {
                 rows(&checkpoint.blobs[..2])
             ),
         );
-        assert_eq!(jcs::write(&scheduled), br#"{"id":2,"result":null}"#.to_vec());
+        assert_eq!(
+            jcs::write(&scheduled),
+            br#"{"id":2,"result":null}"#.to_vec()
+        );
         let waited = ask(
             &mut channel,
             format!(
@@ -409,7 +486,13 @@ fn the_executor_channel_schedules_waits_and_answers_presence() {
 fn many(hub_base: &str) -> Vec<(Arc<Checkpoint>, Origin)> {
     (0..6)
         .map(|at| {
-            let checkpoint = Arc::new(components(&format!("acme/many{at}"), &[200], 4096, 40 + at, &[]));
+            let checkpoint = Arc::new(components(
+                &format!("acme/many{at}"),
+                &[200],
+                4096,
+                40 + at,
+                &[],
+            ));
             let origin = Origin {
                 hub: hub_base.to_string(),
                 refspec: checkpoint.refspec(),
@@ -427,8 +510,18 @@ fn many(hub_base: &str) -> Vec<(Arc<Checkpoint>, Origin)> {
 /// spawn panicked the driver, which never started again, and every wait polled forever.
 #[test]
 fn many_tickets_in_a_task_capped_process_all_land() {
-    let scope = ["systemd-run", "--user", "--scope", "-q", "-p", "TasksMax=48"];
-    let usable = std::process::Command::new(scope[0]).args(&scope[1..]).arg("true").output();
+    let scope = [
+        "systemd-run",
+        "--user",
+        "--scope",
+        "-q",
+        "-p",
+        "TasksMax=48",
+    ];
+    let usable = std::process::Command::new(scope[0])
+        .args(&scope[1..])
+        .arg("true")
+        .output();
     if !usable.is_ok_and(|output| output.status.success()) {
         eprintln!("SKIPPED: no systemd user manager to create a task-limited cgroup");
         return;
@@ -437,7 +530,12 @@ fn many_tickets_in_a_task_capped_process_all_land() {
     store(&dir);
     // The hub runs here, outside the cap: only the fetching process is limited.
     let checkpoints = many("");
-    let hub = hub(checkpoints.iter().map(|(c, _)| Arc::clone(c)).collect(), None, Duration::ZERO, serve_all());
+    let hub = hub(
+        checkpoints.iter().map(|(c, _)| Arc::clone(c)).collect(),
+        None,
+        Duration::ZERO,
+        serve_all(),
+    );
     let mut child = std::process::Command::new(scope[0])
         .args(&scope[1..])
         .arg(std::env::current_exe().unwrap())
@@ -461,21 +559,29 @@ fn many_tickets_in_a_task_capped_process_all_land() {
     assert!(status.success());
     let store = Store::open(&dir.join("store")).unwrap();
     for (checkpoint, _) in &checkpoints {
-        assert!(checkpoint.bodies.keys().all(|hex| store.contains(hex) || store.manifest_path(hex).is_file()));
+        assert!(checkpoint
+            .bodies
+            .keys()
+            .all(|hex| store.contains(hex) || store.manifest_path(hex).is_file()));
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn task_capped_child() {
-    let (Some(dir), Some(base)) = (std::env::var_os("TFS_FETCH_CHILD"), std::env::var_os("TFS_FETCH_HUB")) else {
+    let (Some(dir), Some(base)) = (
+        std::env::var_os("TFS_FETCH_CHILD"),
+        std::env::var_os("TFS_FETCH_HUB"),
+    ) else {
         return;
     };
     let store = Store::open(&std::path::Path::new(&dir).join("store")).unwrap();
     let fetcher = Fetcher::of(&store).unwrap();
     let checkpoints = many(base.to_str().unwrap());
     let tickets: Vec<_> = (checkpoints.iter())
-        .map(|(checkpoint, origin)| fetcher.want(origin, access(), &checkpoint.blobs, Priority::Now))
+        .map(|(checkpoint, origin)| {
+            fetcher.want(origin, access(), &checkpoint.blobs, Priority::Now)
+        })
         .collect();
     // Waited one after another on this thread: the cap is for the Fetcher's threads, not the
     // test's, and every ticket is already wanted at once.
@@ -489,7 +595,10 @@ struct Panicking;
 
 impl tensorfs_core::transport::CredentialProvider for Panicking {
     fn headers(&self, ask: &tensorfs_core::transport::Ask) -> Vec<(String, String)> {
-        assert!(!ask.url.target.starts_with("/obj/"), "a credential that panics on objects");
+        assert!(
+            !ask.url.target.starts_with("/obj/"),
+            "a credential that panics on objects"
+        );
         vec![]
     }
 }
@@ -505,16 +614,29 @@ fn a_panicking_download_ends_its_waits_and_the_fetcher_goes_on() {
         Arc::new(components("acme/bad", &[8], 16 << 10, 60, &[])),
         Arc::new(components("acme/good", &[8], 16 << 10, 61, &[])),
     );
-    let hub = hub(vec![Arc::clone(&bad), Arc::clone(&good)], None, Duration::ZERO, serve_all());
+    let hub = hub(
+        vec![Arc::clone(&bad), Arc::clone(&good)],
+        None,
+        Duration::ZERO,
+        serve_all(),
+    );
     let fetcher = Fetcher::new(&store, 8, SAMPLE).unwrap();
-    let panicking: Arc<dyn Access> = Arc::new(Plain { credential: Panicking, policy: SourcePolicy::default() });
-    let refused = fetcher.want(&origin(&hub, &bad), panicking, &bad.blobs, Priority::Now).wait(&[], &never());
+    let panicking: Arc<dyn Access> = Arc::new(Plain {
+        credential: Panicking,
+        policy: SourcePolicy::default(),
+    });
+    let refused = fetcher
+        .want(&origin(&hub, &bad), panicking, &bad.blobs, Priority::Now)
+        .wait(&[], &never());
     assert!(refused.is_err(), "a panicking download's wait answered Ok");
     let landed = fetcher.want(&origin(&hub, &good), access(), &good.blobs, Priority::Now);
     if landed.wait(&[], &never()).is_err() {
         landed.wait(&[], &never()).unwrap();
     }
-    assert!(good.bodies.keys().all(|hex| store.contains(hex) || store.manifest_path(hex).is_file()));
+    assert!(good
+        .bodies
+        .keys()
+        .all(|hex| store.contains(hex) || store.manifest_path(hex).is_file()));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -546,24 +668,55 @@ fn tfs_fetch_makes_a_checkpoint_whole_and_a_warm_one_moves_nothing() {
     let dir = temporary("tfs-fetch");
     let root = store(&dir);
     let checkpoint = Arc::new(components("acme/model", &[6], 64 << 10, 7, &[]));
-    let hub = hub(vec![Arc::clone(&checkpoint)], None, Duration::ZERO, serve_all());
+    let hub = hub(
+        vec![Arc::clone(&checkpoint)],
+        None,
+        Duration::ZERO,
+        serve_all(),
+    );
     let fetch = || {
         let out = std::process::Command::new(env!("CARGO_BIN_EXE_tfs"))
-            .args(["fetch", root.to_str().unwrap(), &checkpoint.refspec(), "--hub", &hub.base])
-            .args(["--lane", &checkpoint.lane, "--allow-local", "--sample-seconds", "0.05"])
+            .args([
+                "fetch",
+                root.to_str().unwrap(),
+                &checkpoint.refspec(),
+                "--hub",
+                &hub.base,
+            ])
+            .args([
+                "--lane",
+                &checkpoint.lane,
+                "--allow-local",
+                "--sample-seconds",
+                "0.05",
+            ])
             .env("TFS_CREDENTIAL", "")
             .output()
             .unwrap();
         let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-        assert!(out.status.success(), "{stdout}{}", String::from_utf8_lossy(&out.stderr));
-        assert!(stdout.contains("complete     every declared object verifiably local"), "{stdout}");
+        assert!(
+            out.status.success(),
+            "{stdout}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            stdout.contains("complete     every declared object verifiably local"),
+            "{stdout}"
+        );
         stdout
     };
     let cold = fetch();
     assert!(!cold.contains("fetched      0 object(s)"), "{cold}");
     let store = Store::open(&root).unwrap();
-    assert!(checkpoint.bodies.keys().all(|hex| store.contains(hex) || store.manifest_path(hex).is_file()));
-    assert!(checkpoint.bodies.keys().all(|hex| hub.gets(hex) <= 1), "{:?}", hub.gets.lock().unwrap());
+    assert!(checkpoint
+        .bodies
+        .keys()
+        .all(|hex| store.contains(hex) || store.manifest_path(hex).is_file()));
+    assert!(
+        checkpoint.bodies.keys().all(|hex| hub.gets(hex) <= 1),
+        "{:?}",
+        hub.gets.lock().unwrap()
+    );
     assert_eq!(hub.gets("closure"), 1);
     let warm = fetch();
     assert!(warm.contains("fetched      0 object(s), 0 B"), "{warm}");

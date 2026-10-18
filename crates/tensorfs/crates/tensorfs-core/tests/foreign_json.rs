@@ -4,10 +4,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
 };
-use tensorfs_core::{
-    err::Code,
-    ingest::carrier,
-};
+use tensorfs_core::{err::Code, ingest::carrier};
 
 fn root(name: &str) -> PathBuf {
     let p = std::env::temp_dir().join(format!(

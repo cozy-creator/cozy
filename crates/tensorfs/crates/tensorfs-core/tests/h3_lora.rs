@@ -508,7 +508,9 @@ fn real_headers_plan_by_grammar_and_multiple_versions_require_file_selection() {
             assert_eq!(refusal.code.as_str(), code, "{}", row.member);
             // The refusal counts the AdaLN factors (51 A/B pairs) and names the first four.
             assert!(
-                refusal.detail.starts_with("102 AdaLN modulation factor(s) (")
+                refusal
+                    .detail
+                    .starts_with("102 AdaLN modulation factor(s) (")
                     && refusal.detail.contains(", and 98 more)"),
                 "{refusal}"
             );
@@ -700,7 +702,6 @@ fn attention_only_upload_converts_under_the_declared_profile() {
     let _ = fs::remove_dir_all(root);
 }
 
-
 #[test]
 fn ambiguous_fused_exporter_needs_a_declared_layout_before_preflight_or_planning() {
     use std::cell::Cell;
@@ -750,4 +751,3 @@ fn ambiguous_fused_exporter_needs_a_declared_layout_before_preflight_or_planning
         let _ = fs::remove_dir_all(root);
     }
 }
-

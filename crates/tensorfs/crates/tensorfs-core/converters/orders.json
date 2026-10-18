@@ -7,582 +7,2086 @@
    "name": "sdxl/unet",
    "class": "UNet2DConditionModel",
    "source": "hf://stabilityai/stable-diffusion-xl-base-1.0@462165984030d82259a11f4367a4eed129e94a7b/unet",
-   "patterns": [
-    "conv_in.weight",
-    "conv_in.bias",
-    "time_embedding.linear_1.weight",
-    "time_embedding.linear_1.bias",
-    "time_embedding.linear_2.weight",
-    "time_embedding.linear_2.bias",
-    "add_embedding.linear_1.weight",
-    "add_embedding.linear_1.bias",
-    "add_embedding.linear_2.weight",
-    "add_embedding.linear_2.bias",
-    "down_blocks.#.resnets.#.norm1.weight",
-    "down_blocks.#.resnets.#.norm1.bias",
-    "down_blocks.#.resnets.#.conv1.weight",
-    "down_blocks.#.resnets.#.conv1.bias",
-    "down_blocks.#.resnets.#.time_emb_proj.weight",
-    "down_blocks.#.resnets.#.time_emb_proj.bias",
-    "down_blocks.#.resnets.#.norm2.weight",
-    "down_blocks.#.resnets.#.norm2.bias",
-    "down_blocks.#.resnets.#.conv2.weight",
-    "down_blocks.#.resnets.#.conv2.bias",
-    "down_blocks.#.downsamplers.#.conv.weight",
-    "down_blocks.#.downsamplers.#.conv.bias",
-    "down_blocks.#.attentions.#.norm.weight",
-    "down_blocks.#.attentions.#.norm.bias",
-    "down_blocks.#.attentions.#.proj_in.weight",
-    "down_blocks.#.attentions.#.proj_in.bias",
-    "down_blocks.#.attentions.#.transformer_blocks.#.norm1.weight",
-    "down_blocks.#.attentions.#.transformer_blocks.#.norm1.bias",
-    "down_blocks.#.attentions.#.transformer_blocks.#.attn1.to_q.weight",
-    "down_blocks.#.attentions.#.transformer_blocks.#.attn1.to_k.weight",
-    "down_blocks.#.attentions.#.transformer_blocks.#.attn1.to_v.weight",
-    "down_blocks.#.attentions.#.transformer_blocks.#.attn1.to_out.#.weight",
-    "down_blocks.#.attentions.#.transformer_blocks.#.attn1.to_out.#.bias",
-    "down_blocks.#.attentions.#.transformer_blocks.#.norm2.weight",
-    "down_blocks.#.attentions.#.transformer_blocks.#.norm2.bias",
-    "down_blocks.#.attentions.#.transformer_blocks.#.attn2.to_q.weight",
-    "down_blocks.#.attentions.#.transformer_blocks.#.attn2.to_k.weight",
-    "down_blocks.#.attentions.#.transformer_blocks.#.attn2.to_v.weight",
-    "down_blocks.#.attentions.#.transformer_blocks.#.attn2.to_out.#.weight",
-    "down_blocks.#.attentions.#.transformer_blocks.#.attn2.to_out.#.bias",
-    "down_blocks.#.attentions.#.transformer_blocks.#.norm3.weight",
-    "down_blocks.#.attentions.#.transformer_blocks.#.norm3.bias",
-    "down_blocks.#.attentions.#.transformer_blocks.#.ff.net.#.proj.weight",
-    "down_blocks.#.attentions.#.transformer_blocks.#.ff.net.#.proj.bias",
-    "down_blocks.#.attentions.#.transformer_blocks.#.ff.net.#.weight",
-    "down_blocks.#.attentions.#.transformer_blocks.#.ff.net.#.bias",
-    "down_blocks.#.attentions.#.proj_out.weight",
-    "down_blocks.#.attentions.#.proj_out.bias",
-    "down_blocks.#.resnets.#.conv_shortcut.weight",
-    "down_blocks.#.resnets.#.conv_shortcut.bias",
-    "up_blocks.#.attentions.#.norm.weight",
-    "up_blocks.#.attentions.#.norm.bias",
-    "up_blocks.#.attentions.#.proj_in.weight",
-    "up_blocks.#.attentions.#.proj_in.bias",
-    "up_blocks.#.attentions.#.transformer_blocks.#.norm1.weight",
-    "up_blocks.#.attentions.#.transformer_blocks.#.norm1.bias",
-    "up_blocks.#.attentions.#.transformer_blocks.#.attn1.to_q.weight",
-    "up_blocks.#.attentions.#.transformer_blocks.#.attn1.to_k.weight",
-    "up_blocks.#.attentions.#.transformer_blocks.#.attn1.to_v.weight",
-    "up_blocks.#.attentions.#.transformer_blocks.#.attn1.to_out.#.weight",
-    "up_blocks.#.attentions.#.transformer_blocks.#.attn1.to_out.#.bias",
-    "up_blocks.#.attentions.#.transformer_blocks.#.norm2.weight",
-    "up_blocks.#.attentions.#.transformer_blocks.#.norm2.bias",
-    "up_blocks.#.attentions.#.transformer_blocks.#.attn2.to_q.weight",
-    "up_blocks.#.attentions.#.transformer_blocks.#.attn2.to_k.weight",
-    "up_blocks.#.attentions.#.transformer_blocks.#.attn2.to_v.weight",
-    "up_blocks.#.attentions.#.transformer_blocks.#.attn2.to_out.#.weight",
-    "up_blocks.#.attentions.#.transformer_blocks.#.attn2.to_out.#.bias",
-    "up_blocks.#.attentions.#.transformer_blocks.#.norm3.weight",
-    "up_blocks.#.attentions.#.transformer_blocks.#.norm3.bias",
-    "up_blocks.#.attentions.#.transformer_blocks.#.ff.net.#.proj.weight",
-    "up_blocks.#.attentions.#.transformer_blocks.#.ff.net.#.proj.bias",
-    "up_blocks.#.attentions.#.transformer_blocks.#.ff.net.#.weight",
-    "up_blocks.#.attentions.#.transformer_blocks.#.ff.net.#.bias",
-    "up_blocks.#.attentions.#.proj_out.weight",
-    "up_blocks.#.attentions.#.proj_out.bias",
-    "up_blocks.#.resnets.#.norm1.weight",
-    "up_blocks.#.resnets.#.norm1.bias",
-    "up_blocks.#.resnets.#.conv1.weight",
-    "up_blocks.#.resnets.#.conv1.bias",
-    "up_blocks.#.resnets.#.time_emb_proj.weight",
-    "up_blocks.#.resnets.#.time_emb_proj.bias",
-    "up_blocks.#.resnets.#.norm2.weight",
-    "up_blocks.#.resnets.#.norm2.bias",
-    "up_blocks.#.resnets.#.conv2.weight",
-    "up_blocks.#.resnets.#.conv2.bias",
-    "up_blocks.#.resnets.#.conv_shortcut.weight",
-    "up_blocks.#.resnets.#.conv_shortcut.bias",
-    "up_blocks.#.upsamplers.#.conv.weight",
-    "up_blocks.#.upsamplers.#.conv.bias",
-    "mid_block.attentions.#.norm.weight",
-    "mid_block.attentions.#.norm.bias",
-    "mid_block.attentions.#.proj_in.weight",
-    "mid_block.attentions.#.proj_in.bias",
-    "mid_block.attentions.#.transformer_blocks.#.norm1.weight",
-    "mid_block.attentions.#.transformer_blocks.#.norm1.bias",
-    "mid_block.attentions.#.transformer_blocks.#.attn1.to_q.weight",
-    "mid_block.attentions.#.transformer_blocks.#.attn1.to_k.weight",
-    "mid_block.attentions.#.transformer_blocks.#.attn1.to_v.weight",
-    "mid_block.attentions.#.transformer_blocks.#.attn1.to_out.#.weight",
-    "mid_block.attentions.#.transformer_blocks.#.attn1.to_out.#.bias",
-    "mid_block.attentions.#.transformer_blocks.#.norm2.weight",
-    "mid_block.attentions.#.transformer_blocks.#.norm2.bias",
-    "mid_block.attentions.#.transformer_blocks.#.attn2.to_q.weight",
-    "mid_block.attentions.#.transformer_blocks.#.attn2.to_k.weight",
-    "mid_block.attentions.#.transformer_blocks.#.attn2.to_v.weight",
-    "mid_block.attentions.#.transformer_blocks.#.attn2.to_out.#.weight",
-    "mid_block.attentions.#.transformer_blocks.#.attn2.to_out.#.bias",
-    "mid_block.attentions.#.transformer_blocks.#.norm3.weight",
-    "mid_block.attentions.#.transformer_blocks.#.norm3.bias",
-    "mid_block.attentions.#.transformer_blocks.#.ff.net.#.proj.weight",
-    "mid_block.attentions.#.transformer_blocks.#.ff.net.#.proj.bias",
-    "mid_block.attentions.#.transformer_blocks.#.ff.net.#.weight",
-    "mid_block.attentions.#.transformer_blocks.#.ff.net.#.bias",
-    "mid_block.attentions.#.proj_out.weight",
-    "mid_block.attentions.#.proj_out.bias",
-    "mid_block.resnets.#.norm1.weight",
-    "mid_block.resnets.#.norm1.bias",
-    "mid_block.resnets.#.conv1.weight",
-    "mid_block.resnets.#.conv1.bias",
-    "mid_block.resnets.#.time_emb_proj.weight",
-    "mid_block.resnets.#.time_emb_proj.bias",
-    "mid_block.resnets.#.norm2.weight",
-    "mid_block.resnets.#.norm2.bias",
-    "mid_block.resnets.#.conv2.weight",
-    "mid_block.resnets.#.conv2.bias",
-    "conv_norm_out.weight",
-    "conv_norm_out.bias",
-    "conv_out.weight",
-    "conv_out.bias"
-   ]
+   "children": {
+    "": [
+     "conv_in",
+     "time_embedding",
+     "add_embedding",
+     "down_blocks",
+     "up_blocks",
+     "mid_block",
+     "conv_norm_out",
+     "conv_out"
+    ],
+    "conv_in": [
+     "weight",
+     "bias"
+    ],
+    "time_embedding": [
+     "linear_1",
+     "linear_2"
+    ],
+    "time_embedding.linear_1": [
+     "weight",
+     "bias"
+    ],
+    "time_embedding.linear_2": [
+     "weight",
+     "bias"
+    ],
+    "add_embedding": [
+     "linear_1",
+     "linear_2"
+    ],
+    "add_embedding.linear_1": [
+     "weight",
+     "bias"
+    ],
+    "add_embedding.linear_2": [
+     "weight",
+     "bias"
+    ],
+    "down_blocks": [
+     "#"
+    ],
+    "down_blocks.#": [
+     "attentions",
+     "resnets",
+     "downsamplers"
+    ],
+    "down_blocks.#.resnets": [
+     "#"
+    ],
+    "down_blocks.#.resnets.#": [
+     "norm1",
+     "conv1",
+     "time_emb_proj",
+     "norm2",
+     "conv2",
+     "conv_shortcut"
+    ],
+    "down_blocks.#.resnets.#.norm1": [
+     "weight",
+     "bias"
+    ],
+    "down_blocks.#.resnets.#.conv1": [
+     "weight",
+     "bias"
+    ],
+    "down_blocks.#.resnets.#.time_emb_proj": [
+     "weight",
+     "bias"
+    ],
+    "down_blocks.#.resnets.#.norm2": [
+     "weight",
+     "bias"
+    ],
+    "down_blocks.#.resnets.#.conv2": [
+     "weight",
+     "bias"
+    ],
+    "down_blocks.#.downsamplers": [
+     "#"
+    ],
+    "down_blocks.#.downsamplers.#": [
+     "conv"
+    ],
+    "down_blocks.#.downsamplers.#.conv": [
+     "weight",
+     "bias"
+    ],
+    "down_blocks.#.attentions": [
+     "#"
+    ],
+    "down_blocks.#.attentions.#": [
+     "norm",
+     "proj_in",
+     "transformer_blocks",
+     "proj_out"
+    ],
+    "down_blocks.#.attentions.#.norm": [
+     "weight",
+     "bias"
+    ],
+    "down_blocks.#.attentions.#.proj_in": [
+     "weight",
+     "bias"
+    ],
+    "down_blocks.#.attentions.#.transformer_blocks": [
+     "#"
+    ],
+    "down_blocks.#.attentions.#.transformer_blocks.#": [
+     "norm1",
+     "attn1",
+     "norm2",
+     "attn2",
+     "norm3",
+     "ff"
+    ],
+    "down_blocks.#.attentions.#.transformer_blocks.#.norm1": [
+     "weight",
+     "bias"
+    ],
+    "down_blocks.#.attentions.#.transformer_blocks.#.attn1": [
+     "to_q",
+     "to_k",
+     "to_v",
+     "to_out"
+    ],
+    "down_blocks.#.attentions.#.transformer_blocks.#.attn1.to_q": [
+     "weight"
+    ],
+    "down_blocks.#.attentions.#.transformer_blocks.#.attn1.to_k": [
+     "weight"
+    ],
+    "down_blocks.#.attentions.#.transformer_blocks.#.attn1.to_v": [
+     "weight"
+    ],
+    "down_blocks.#.attentions.#.transformer_blocks.#.attn1.to_out": [
+     "#"
+    ],
+    "down_blocks.#.attentions.#.transformer_blocks.#.attn1.to_out.#": [
+     "weight",
+     "bias"
+    ],
+    "down_blocks.#.attentions.#.transformer_blocks.#.norm2": [
+     "weight",
+     "bias"
+    ],
+    "down_blocks.#.attentions.#.transformer_blocks.#.attn2": [
+     "to_q",
+     "to_k",
+     "to_v",
+     "to_out"
+    ],
+    "down_blocks.#.attentions.#.transformer_blocks.#.attn2.to_q": [
+     "weight"
+    ],
+    "down_blocks.#.attentions.#.transformer_blocks.#.attn2.to_k": [
+     "weight"
+    ],
+    "down_blocks.#.attentions.#.transformer_blocks.#.attn2.to_v": [
+     "weight"
+    ],
+    "down_blocks.#.attentions.#.transformer_blocks.#.attn2.to_out": [
+     "#"
+    ],
+    "down_blocks.#.attentions.#.transformer_blocks.#.attn2.to_out.#": [
+     "weight",
+     "bias"
+    ],
+    "down_blocks.#.attentions.#.transformer_blocks.#.norm3": [
+     "weight",
+     "bias"
+    ],
+    "down_blocks.#.attentions.#.transformer_blocks.#.ff": [
+     "net"
+    ],
+    "down_blocks.#.attentions.#.transformer_blocks.#.ff.net": [
+     "#"
+    ],
+    "down_blocks.#.attentions.#.transformer_blocks.#.ff.net.#": [
+     "proj",
+     "weight",
+     "bias"
+    ],
+    "down_blocks.#.attentions.#.transformer_blocks.#.ff.net.#.proj": [
+     "weight",
+     "bias"
+    ],
+    "down_blocks.#.attentions.#.proj_out": [
+     "weight",
+     "bias"
+    ],
+    "down_blocks.#.resnets.#.conv_shortcut": [
+     "weight",
+     "bias"
+    ],
+    "up_blocks": [
+     "#"
+    ],
+    "up_blocks.#": [
+     "attentions",
+     "resnets",
+     "upsamplers"
+    ],
+    "up_blocks.#.attentions": [
+     "#"
+    ],
+    "up_blocks.#.attentions.#": [
+     "norm",
+     "proj_in",
+     "transformer_blocks",
+     "proj_out"
+    ],
+    "up_blocks.#.attentions.#.norm": [
+     "weight",
+     "bias"
+    ],
+    "up_blocks.#.attentions.#.proj_in": [
+     "weight",
+     "bias"
+    ],
+    "up_blocks.#.attentions.#.transformer_blocks": [
+     "#"
+    ],
+    "up_blocks.#.attentions.#.transformer_blocks.#": [
+     "norm1",
+     "attn1",
+     "norm2",
+     "attn2",
+     "norm3",
+     "ff"
+    ],
+    "up_blocks.#.attentions.#.transformer_blocks.#.norm1": [
+     "weight",
+     "bias"
+    ],
+    "up_blocks.#.attentions.#.transformer_blocks.#.attn1": [
+     "to_q",
+     "to_k",
+     "to_v",
+     "to_out"
+    ],
+    "up_blocks.#.attentions.#.transformer_blocks.#.attn1.to_q": [
+     "weight"
+    ],
+    "up_blocks.#.attentions.#.transformer_blocks.#.attn1.to_k": [
+     "weight"
+    ],
+    "up_blocks.#.attentions.#.transformer_blocks.#.attn1.to_v": [
+     "weight"
+    ],
+    "up_blocks.#.attentions.#.transformer_blocks.#.attn1.to_out": [
+     "#"
+    ],
+    "up_blocks.#.attentions.#.transformer_blocks.#.attn1.to_out.#": [
+     "weight",
+     "bias"
+    ],
+    "up_blocks.#.attentions.#.transformer_blocks.#.norm2": [
+     "weight",
+     "bias"
+    ],
+    "up_blocks.#.attentions.#.transformer_blocks.#.attn2": [
+     "to_q",
+     "to_k",
+     "to_v",
+     "to_out"
+    ],
+    "up_blocks.#.attentions.#.transformer_blocks.#.attn2.to_q": [
+     "weight"
+    ],
+    "up_blocks.#.attentions.#.transformer_blocks.#.attn2.to_k": [
+     "weight"
+    ],
+    "up_blocks.#.attentions.#.transformer_blocks.#.attn2.to_v": [
+     "weight"
+    ],
+    "up_blocks.#.attentions.#.transformer_blocks.#.attn2.to_out": [
+     "#"
+    ],
+    "up_blocks.#.attentions.#.transformer_blocks.#.attn2.to_out.#": [
+     "weight",
+     "bias"
+    ],
+    "up_blocks.#.attentions.#.transformer_blocks.#.norm3": [
+     "weight",
+     "bias"
+    ],
+    "up_blocks.#.attentions.#.transformer_blocks.#.ff": [
+     "net"
+    ],
+    "up_blocks.#.attentions.#.transformer_blocks.#.ff.net": [
+     "#"
+    ],
+    "up_blocks.#.attentions.#.transformer_blocks.#.ff.net.#": [
+     "proj",
+     "weight",
+     "bias"
+    ],
+    "up_blocks.#.attentions.#.transformer_blocks.#.ff.net.#.proj": [
+     "weight",
+     "bias"
+    ],
+    "up_blocks.#.attentions.#.proj_out": [
+     "weight",
+     "bias"
+    ],
+    "up_blocks.#.resnets": [
+     "#"
+    ],
+    "up_blocks.#.resnets.#": [
+     "norm1",
+     "conv1",
+     "time_emb_proj",
+     "norm2",
+     "conv2",
+     "conv_shortcut"
+    ],
+    "up_blocks.#.resnets.#.norm1": [
+     "weight",
+     "bias"
+    ],
+    "up_blocks.#.resnets.#.conv1": [
+     "weight",
+     "bias"
+    ],
+    "up_blocks.#.resnets.#.time_emb_proj": [
+     "weight",
+     "bias"
+    ],
+    "up_blocks.#.resnets.#.norm2": [
+     "weight",
+     "bias"
+    ],
+    "up_blocks.#.resnets.#.conv2": [
+     "weight",
+     "bias"
+    ],
+    "up_blocks.#.resnets.#.conv_shortcut": [
+     "weight",
+     "bias"
+    ],
+    "up_blocks.#.upsamplers": [
+     "#"
+    ],
+    "up_blocks.#.upsamplers.#": [
+     "conv"
+    ],
+    "up_blocks.#.upsamplers.#.conv": [
+     "weight",
+     "bias"
+    ],
+    "mid_block": [
+     "attentions",
+     "resnets"
+    ],
+    "mid_block.attentions": [
+     "#"
+    ],
+    "mid_block.attentions.#": [
+     "norm",
+     "proj_in",
+     "transformer_blocks",
+     "proj_out"
+    ],
+    "mid_block.attentions.#.norm": [
+     "weight",
+     "bias"
+    ],
+    "mid_block.attentions.#.proj_in": [
+     "weight",
+     "bias"
+    ],
+    "mid_block.attentions.#.transformer_blocks": [
+     "#"
+    ],
+    "mid_block.attentions.#.transformer_blocks.#": [
+     "norm1",
+     "attn1",
+     "norm2",
+     "attn2",
+     "norm3",
+     "ff"
+    ],
+    "mid_block.attentions.#.transformer_blocks.#.norm1": [
+     "weight",
+     "bias"
+    ],
+    "mid_block.attentions.#.transformer_blocks.#.attn1": [
+     "to_q",
+     "to_k",
+     "to_v",
+     "to_out"
+    ],
+    "mid_block.attentions.#.transformer_blocks.#.attn1.to_q": [
+     "weight"
+    ],
+    "mid_block.attentions.#.transformer_blocks.#.attn1.to_k": [
+     "weight"
+    ],
+    "mid_block.attentions.#.transformer_blocks.#.attn1.to_v": [
+     "weight"
+    ],
+    "mid_block.attentions.#.transformer_blocks.#.attn1.to_out": [
+     "#"
+    ],
+    "mid_block.attentions.#.transformer_blocks.#.attn1.to_out.#": [
+     "weight",
+     "bias"
+    ],
+    "mid_block.attentions.#.transformer_blocks.#.norm2": [
+     "weight",
+     "bias"
+    ],
+    "mid_block.attentions.#.transformer_blocks.#.attn2": [
+     "to_q",
+     "to_k",
+     "to_v",
+     "to_out"
+    ],
+    "mid_block.attentions.#.transformer_blocks.#.attn2.to_q": [
+     "weight"
+    ],
+    "mid_block.attentions.#.transformer_blocks.#.attn2.to_k": [
+     "weight"
+    ],
+    "mid_block.attentions.#.transformer_blocks.#.attn2.to_v": [
+     "weight"
+    ],
+    "mid_block.attentions.#.transformer_blocks.#.attn2.to_out": [
+     "#"
+    ],
+    "mid_block.attentions.#.transformer_blocks.#.attn2.to_out.#": [
+     "weight",
+     "bias"
+    ],
+    "mid_block.attentions.#.transformer_blocks.#.norm3": [
+     "weight",
+     "bias"
+    ],
+    "mid_block.attentions.#.transformer_blocks.#.ff": [
+     "net"
+    ],
+    "mid_block.attentions.#.transformer_blocks.#.ff.net": [
+     "#"
+    ],
+    "mid_block.attentions.#.transformer_blocks.#.ff.net.#": [
+     "proj",
+     "weight",
+     "bias"
+    ],
+    "mid_block.attentions.#.transformer_blocks.#.ff.net.#.proj": [
+     "weight",
+     "bias"
+    ],
+    "mid_block.attentions.#.proj_out": [
+     "weight",
+     "bias"
+    ],
+    "mid_block.resnets": [
+     "#"
+    ],
+    "mid_block.resnets.#": [
+     "norm1",
+     "conv1",
+     "time_emb_proj",
+     "norm2",
+     "conv2"
+    ],
+    "mid_block.resnets.#.norm1": [
+     "weight",
+     "bias"
+    ],
+    "mid_block.resnets.#.conv1": [
+     "weight",
+     "bias"
+    ],
+    "mid_block.resnets.#.time_emb_proj": [
+     "weight",
+     "bias"
+    ],
+    "mid_block.resnets.#.norm2": [
+     "weight",
+     "bias"
+    ],
+    "mid_block.resnets.#.conv2": [
+     "weight",
+     "bias"
+    ],
+    "conv_norm_out": [
+     "weight",
+     "bias"
+    ],
+    "conv_out": [
+     "weight",
+     "bias"
+    ]
+   }
   },
   {
    "name": "sdxl/vae",
    "class": "AutoencoderKL",
    "source": "hf://stabilityai/stable-diffusion-xl-base-1.0@462165984030d82259a11f4367a4eed129e94a7b/vae",
-   "patterns": [
-    "encoder.conv_in.weight",
-    "encoder.conv_in.bias",
-    "encoder.down_blocks.#.resnets.#.norm1.weight",
-    "encoder.down_blocks.#.resnets.#.norm1.bias",
-    "encoder.down_blocks.#.resnets.#.conv1.weight",
-    "encoder.down_blocks.#.resnets.#.conv1.bias",
-    "encoder.down_blocks.#.resnets.#.norm2.weight",
-    "encoder.down_blocks.#.resnets.#.norm2.bias",
-    "encoder.down_blocks.#.resnets.#.conv2.weight",
-    "encoder.down_blocks.#.resnets.#.conv2.bias",
-    "encoder.down_blocks.#.downsamplers.#.conv.weight",
-    "encoder.down_blocks.#.downsamplers.#.conv.bias",
-    "encoder.down_blocks.#.resnets.#.conv_shortcut.weight",
-    "encoder.down_blocks.#.resnets.#.conv_shortcut.bias",
-    "encoder.mid_block.attentions.#.group_norm.weight",
-    "encoder.mid_block.attentions.#.group_norm.bias",
-    "encoder.mid_block.attentions.#.to_q.weight",
-    "encoder.mid_block.attentions.#.to_q.bias",
-    "encoder.mid_block.attentions.#.to_k.weight",
-    "encoder.mid_block.attentions.#.to_k.bias",
-    "encoder.mid_block.attentions.#.to_v.weight",
-    "encoder.mid_block.attentions.#.to_v.bias",
-    "encoder.mid_block.attentions.#.to_out.#.weight",
-    "encoder.mid_block.attentions.#.to_out.#.bias",
-    "encoder.mid_block.resnets.#.norm1.weight",
-    "encoder.mid_block.resnets.#.norm1.bias",
-    "encoder.mid_block.resnets.#.conv1.weight",
-    "encoder.mid_block.resnets.#.conv1.bias",
-    "encoder.mid_block.resnets.#.norm2.weight",
-    "encoder.mid_block.resnets.#.norm2.bias",
-    "encoder.mid_block.resnets.#.conv2.weight",
-    "encoder.mid_block.resnets.#.conv2.bias",
-    "encoder.conv_norm_out.weight",
-    "encoder.conv_norm_out.bias",
-    "encoder.conv_out.weight",
-    "encoder.conv_out.bias",
-    "decoder.conv_in.weight",
-    "decoder.conv_in.bias",
-    "decoder.up_blocks.#.resnets.#.norm1.weight",
-    "decoder.up_blocks.#.resnets.#.norm1.bias",
-    "decoder.up_blocks.#.resnets.#.conv1.weight",
-    "decoder.up_blocks.#.resnets.#.conv1.bias",
-    "decoder.up_blocks.#.resnets.#.norm2.weight",
-    "decoder.up_blocks.#.resnets.#.norm2.bias",
-    "decoder.up_blocks.#.resnets.#.conv2.weight",
-    "decoder.up_blocks.#.resnets.#.conv2.bias",
-    "decoder.up_blocks.#.upsamplers.#.conv.weight",
-    "decoder.up_blocks.#.upsamplers.#.conv.bias",
-    "decoder.up_blocks.#.resnets.#.conv_shortcut.weight",
-    "decoder.up_blocks.#.resnets.#.conv_shortcut.bias",
-    "decoder.mid_block.attentions.#.group_norm.weight",
-    "decoder.mid_block.attentions.#.group_norm.bias",
-    "decoder.mid_block.attentions.#.to_q.weight",
-    "decoder.mid_block.attentions.#.to_q.bias",
-    "decoder.mid_block.attentions.#.to_k.weight",
-    "decoder.mid_block.attentions.#.to_k.bias",
-    "decoder.mid_block.attentions.#.to_v.weight",
-    "decoder.mid_block.attentions.#.to_v.bias",
-    "decoder.mid_block.attentions.#.to_out.#.weight",
-    "decoder.mid_block.attentions.#.to_out.#.bias",
-    "decoder.mid_block.resnets.#.norm1.weight",
-    "decoder.mid_block.resnets.#.norm1.bias",
-    "decoder.mid_block.resnets.#.conv1.weight",
-    "decoder.mid_block.resnets.#.conv1.bias",
-    "decoder.mid_block.resnets.#.norm2.weight",
-    "decoder.mid_block.resnets.#.norm2.bias",
-    "decoder.mid_block.resnets.#.conv2.weight",
-    "decoder.mid_block.resnets.#.conv2.bias",
-    "decoder.conv_norm_out.weight",
-    "decoder.conv_norm_out.bias",
-    "decoder.conv_out.weight",
-    "decoder.conv_out.bias",
-    "quant_conv.weight",
-    "quant_conv.bias",
-    "post_quant_conv.weight",
-    "post_quant_conv.bias"
-   ]
+   "children": {
+    "": [
+     "encoder",
+     "decoder",
+     "quant_conv",
+     "post_quant_conv"
+    ],
+    "encoder": [
+     "conv_in",
+     "down_blocks",
+     "mid_block",
+     "conv_norm_out",
+     "conv_out"
+    ],
+    "encoder.conv_in": [
+     "weight",
+     "bias"
+    ],
+    "encoder.down_blocks": [
+     "#"
+    ],
+    "encoder.down_blocks.#": [
+     "resnets",
+     "downsamplers"
+    ],
+    "encoder.down_blocks.#.resnets": [
+     "#"
+    ],
+    "encoder.down_blocks.#.resnets.#": [
+     "norm1",
+     "conv1",
+     "norm2",
+     "conv2",
+     "conv_shortcut"
+    ],
+    "encoder.down_blocks.#.resnets.#.norm1": [
+     "weight",
+     "bias"
+    ],
+    "encoder.down_blocks.#.resnets.#.conv1": [
+     "weight",
+     "bias"
+    ],
+    "encoder.down_blocks.#.resnets.#.norm2": [
+     "weight",
+     "bias"
+    ],
+    "encoder.down_blocks.#.resnets.#.conv2": [
+     "weight",
+     "bias"
+    ],
+    "encoder.down_blocks.#.downsamplers": [
+     "#"
+    ],
+    "encoder.down_blocks.#.downsamplers.#": [
+     "conv"
+    ],
+    "encoder.down_blocks.#.downsamplers.#.conv": [
+     "weight",
+     "bias"
+    ],
+    "encoder.down_blocks.#.resnets.#.conv_shortcut": [
+     "weight",
+     "bias"
+    ],
+    "encoder.mid_block": [
+     "attentions",
+     "resnets"
+    ],
+    "encoder.mid_block.attentions": [
+     "#"
+    ],
+    "encoder.mid_block.attentions.#": [
+     "group_norm",
+     "to_q",
+     "to_k",
+     "to_v",
+     "to_out"
+    ],
+    "encoder.mid_block.attentions.#.group_norm": [
+     "weight",
+     "bias"
+    ],
+    "encoder.mid_block.attentions.#.to_q": [
+     "weight",
+     "bias"
+    ],
+    "encoder.mid_block.attentions.#.to_k": [
+     "weight",
+     "bias"
+    ],
+    "encoder.mid_block.attentions.#.to_v": [
+     "weight",
+     "bias"
+    ],
+    "encoder.mid_block.attentions.#.to_out": [
+     "#"
+    ],
+    "encoder.mid_block.attentions.#.to_out.#": [
+     "weight",
+     "bias"
+    ],
+    "encoder.mid_block.resnets": [
+     "#"
+    ],
+    "encoder.mid_block.resnets.#": [
+     "norm1",
+     "conv1",
+     "norm2",
+     "conv2"
+    ],
+    "encoder.mid_block.resnets.#.norm1": [
+     "weight",
+     "bias"
+    ],
+    "encoder.mid_block.resnets.#.conv1": [
+     "weight",
+     "bias"
+    ],
+    "encoder.mid_block.resnets.#.norm2": [
+     "weight",
+     "bias"
+    ],
+    "encoder.mid_block.resnets.#.conv2": [
+     "weight",
+     "bias"
+    ],
+    "encoder.conv_norm_out": [
+     "weight",
+     "bias"
+    ],
+    "encoder.conv_out": [
+     "weight",
+     "bias"
+    ],
+    "decoder": [
+     "conv_in",
+     "up_blocks",
+     "mid_block",
+     "conv_norm_out",
+     "conv_out"
+    ],
+    "decoder.conv_in": [
+     "weight",
+     "bias"
+    ],
+    "decoder.up_blocks": [
+     "#"
+    ],
+    "decoder.up_blocks.#": [
+     "resnets",
+     "upsamplers"
+    ],
+    "decoder.up_blocks.#.resnets": [
+     "#"
+    ],
+    "decoder.up_blocks.#.resnets.#": [
+     "norm1",
+     "conv1",
+     "norm2",
+     "conv2",
+     "conv_shortcut"
+    ],
+    "decoder.up_blocks.#.resnets.#.norm1": [
+     "weight",
+     "bias"
+    ],
+    "decoder.up_blocks.#.resnets.#.conv1": [
+     "weight",
+     "bias"
+    ],
+    "decoder.up_blocks.#.resnets.#.norm2": [
+     "weight",
+     "bias"
+    ],
+    "decoder.up_blocks.#.resnets.#.conv2": [
+     "weight",
+     "bias"
+    ],
+    "decoder.up_blocks.#.upsamplers": [
+     "#"
+    ],
+    "decoder.up_blocks.#.upsamplers.#": [
+     "conv"
+    ],
+    "decoder.up_blocks.#.upsamplers.#.conv": [
+     "weight",
+     "bias"
+    ],
+    "decoder.up_blocks.#.resnets.#.conv_shortcut": [
+     "weight",
+     "bias"
+    ],
+    "decoder.mid_block": [
+     "attentions",
+     "resnets"
+    ],
+    "decoder.mid_block.attentions": [
+     "#"
+    ],
+    "decoder.mid_block.attentions.#": [
+     "group_norm",
+     "to_q",
+     "to_k",
+     "to_v",
+     "to_out"
+    ],
+    "decoder.mid_block.attentions.#.group_norm": [
+     "weight",
+     "bias"
+    ],
+    "decoder.mid_block.attentions.#.to_q": [
+     "weight",
+     "bias"
+    ],
+    "decoder.mid_block.attentions.#.to_k": [
+     "weight",
+     "bias"
+    ],
+    "decoder.mid_block.attentions.#.to_v": [
+     "weight",
+     "bias"
+    ],
+    "decoder.mid_block.attentions.#.to_out": [
+     "#"
+    ],
+    "decoder.mid_block.attentions.#.to_out.#": [
+     "weight",
+     "bias"
+    ],
+    "decoder.mid_block.resnets": [
+     "#"
+    ],
+    "decoder.mid_block.resnets.#": [
+     "norm1",
+     "conv1",
+     "norm2",
+     "conv2"
+    ],
+    "decoder.mid_block.resnets.#.norm1": [
+     "weight",
+     "bias"
+    ],
+    "decoder.mid_block.resnets.#.conv1": [
+     "weight",
+     "bias"
+    ],
+    "decoder.mid_block.resnets.#.norm2": [
+     "weight",
+     "bias"
+    ],
+    "decoder.mid_block.resnets.#.conv2": [
+     "weight",
+     "bias"
+    ],
+    "decoder.conv_norm_out": [
+     "weight",
+     "bias"
+    ],
+    "decoder.conv_out": [
+     "weight",
+     "bias"
+    ],
+    "quant_conv": [
+     "weight",
+     "bias"
+    ],
+    "post_quant_conv": [
+     "weight",
+     "bias"
+    ]
+   }
   },
   {
    "name": "sdxl/text_encoder",
    "class": "CLIPTextModel",
    "source": "hf://stabilityai/stable-diffusion-xl-base-1.0@462165984030d82259a11f4367a4eed129e94a7b/text_encoder",
-   "patterns": [
-    "embeddings.token_embedding.weight",
-    "embeddings.position_embedding.weight",
-    "encoder.layers.#.self_attn.k_proj.weight",
-    "encoder.layers.#.self_attn.k_proj.bias",
-    "encoder.layers.#.self_attn.v_proj.weight",
-    "encoder.layers.#.self_attn.v_proj.bias",
-    "encoder.layers.#.self_attn.q_proj.weight",
-    "encoder.layers.#.self_attn.q_proj.bias",
-    "encoder.layers.#.self_attn.out_proj.weight",
-    "encoder.layers.#.self_attn.out_proj.bias",
-    "encoder.layers.#.layer_norm1.weight",
-    "encoder.layers.#.layer_norm1.bias",
-    "encoder.layers.#.mlp.fc1.weight",
-    "encoder.layers.#.mlp.fc1.bias",
-    "encoder.layers.#.mlp.fc2.weight",
-    "encoder.layers.#.mlp.fc2.bias",
-    "encoder.layers.#.layer_norm2.weight",
-    "encoder.layers.#.layer_norm2.bias",
-    "final_layer_norm.weight",
-    "final_layer_norm.bias"
-   ]
+   "children": {
+    "": [
+     "text_model"
+    ],
+    "text_model": [
+     "embeddings",
+     "encoder",
+     "final_layer_norm"
+    ],
+    "text_model.embeddings": [
+     "token_embedding",
+     "position_embedding"
+    ],
+    "text_model.embeddings.token_embedding": [
+     "weight"
+    ],
+    "text_model.embeddings.position_embedding": [
+     "weight"
+    ],
+    "text_model.encoder": [
+     "layers"
+    ],
+    "text_model.encoder.layers": [
+     "#"
+    ],
+    "text_model.encoder.layers.#": [
+     "self_attn",
+     "layer_norm1",
+     "mlp",
+     "layer_norm2"
+    ],
+    "text_model.encoder.layers.#.self_attn": [
+     "k_proj",
+     "v_proj",
+     "q_proj",
+     "out_proj"
+    ],
+    "text_model.encoder.layers.#.self_attn.k_proj": [
+     "weight",
+     "bias"
+    ],
+    "text_model.encoder.layers.#.self_attn.v_proj": [
+     "weight",
+     "bias"
+    ],
+    "text_model.encoder.layers.#.self_attn.q_proj": [
+     "weight",
+     "bias"
+    ],
+    "text_model.encoder.layers.#.self_attn.out_proj": [
+     "weight",
+     "bias"
+    ],
+    "text_model.encoder.layers.#.layer_norm1": [
+     "weight",
+     "bias"
+    ],
+    "text_model.encoder.layers.#.mlp": [
+     "fc1",
+     "fc2"
+    ],
+    "text_model.encoder.layers.#.mlp.fc1": [
+     "weight",
+     "bias"
+    ],
+    "text_model.encoder.layers.#.mlp.fc2": [
+     "weight",
+     "bias"
+    ],
+    "text_model.encoder.layers.#.layer_norm2": [
+     "weight",
+     "bias"
+    ],
+    "text_model.final_layer_norm": [
+     "weight",
+     "bias"
+    ]
+   }
   },
   {
    "name": "sdxl/text_encoder_2",
    "class": "CLIPTextModelWithProjection",
    "source": "hf://stabilityai/stable-diffusion-xl-base-1.0@462165984030d82259a11f4367a4eed129e94a7b/text_encoder_2",
-   "patterns": [
-    "text_model.embeddings.token_embedding.weight",
-    "text_model.embeddings.position_embedding.weight",
-    "text_model.encoder.layers.#.self_attn.k_proj.weight",
-    "text_model.encoder.layers.#.self_attn.k_proj.bias",
-    "text_model.encoder.layers.#.self_attn.v_proj.weight",
-    "text_model.encoder.layers.#.self_attn.v_proj.bias",
-    "text_model.encoder.layers.#.self_attn.q_proj.weight",
-    "text_model.encoder.layers.#.self_attn.q_proj.bias",
-    "text_model.encoder.layers.#.self_attn.out_proj.weight",
-    "text_model.encoder.layers.#.self_attn.out_proj.bias",
-    "text_model.encoder.layers.#.layer_norm1.weight",
-    "text_model.encoder.layers.#.layer_norm1.bias",
-    "text_model.encoder.layers.#.mlp.fc1.weight",
-    "text_model.encoder.layers.#.mlp.fc1.bias",
-    "text_model.encoder.layers.#.mlp.fc2.weight",
-    "text_model.encoder.layers.#.mlp.fc2.bias",
-    "text_model.encoder.layers.#.layer_norm2.weight",
-    "text_model.encoder.layers.#.layer_norm2.bias",
-    "text_model.final_layer_norm.weight",
-    "text_model.final_layer_norm.bias",
-    "text_projection.weight"
-   ]
+   "children": {
+    "": [
+     "text_model",
+     "text_projection"
+    ],
+    "text_model": [
+     "embeddings",
+     "encoder",
+     "final_layer_norm"
+    ],
+    "text_model.embeddings": [
+     "token_embedding",
+     "position_embedding"
+    ],
+    "text_model.embeddings.token_embedding": [
+     "weight"
+    ],
+    "text_model.embeddings.position_embedding": [
+     "weight"
+    ],
+    "text_model.encoder": [
+     "layers"
+    ],
+    "text_model.encoder.layers": [
+     "#"
+    ],
+    "text_model.encoder.layers.#": [
+     "self_attn",
+     "layer_norm1",
+     "mlp",
+     "layer_norm2"
+    ],
+    "text_model.encoder.layers.#.self_attn": [
+     "k_proj",
+     "v_proj",
+     "q_proj",
+     "out_proj"
+    ],
+    "text_model.encoder.layers.#.self_attn.k_proj": [
+     "weight",
+     "bias"
+    ],
+    "text_model.encoder.layers.#.self_attn.v_proj": [
+     "weight",
+     "bias"
+    ],
+    "text_model.encoder.layers.#.self_attn.q_proj": [
+     "weight",
+     "bias"
+    ],
+    "text_model.encoder.layers.#.self_attn.out_proj": [
+     "weight",
+     "bias"
+    ],
+    "text_model.encoder.layers.#.layer_norm1": [
+     "weight",
+     "bias"
+    ],
+    "text_model.encoder.layers.#.mlp": [
+     "fc1",
+     "fc2"
+    ],
+    "text_model.encoder.layers.#.mlp.fc1": [
+     "weight",
+     "bias"
+    ],
+    "text_model.encoder.layers.#.mlp.fc2": [
+     "weight",
+     "bias"
+    ],
+    "text_model.encoder.layers.#.layer_norm2": [
+     "weight",
+     "bias"
+    ],
+    "text_model.final_layer_norm": [
+     "weight",
+     "bias"
+    ],
+    "text_projection": [
+     "weight"
+    ]
+   }
   },
   {
    "name": "anima/transformer",
    "class": "CosmosTransformer3DModel",
    "source": "hf://circlestone-labs/Anima-Base-v1.0-Diffusers@073c3a9db359c31ad0e8aa268d15775473c2176c/transformer",
-   "patterns": [
-    "patch_embed.proj.weight",
-    "time_embed.t_embedder.linear_1.weight",
-    "time_embed.t_embedder.linear_2.weight",
-    "time_embed.norm.weight",
-    "transformer_blocks.#.norm1.linear_1.weight",
-    "transformer_blocks.#.norm1.linear_2.weight",
-    "transformer_blocks.#.attn1.norm_q.weight",
-    "transformer_blocks.#.attn1.norm_k.weight",
-    "transformer_blocks.#.attn1.to_q.weight",
-    "transformer_blocks.#.attn1.to_k.weight",
-    "transformer_blocks.#.attn1.to_v.weight",
-    "transformer_blocks.#.attn1.to_out.#.weight",
-    "transformer_blocks.#.norm2.linear_1.weight",
-    "transformer_blocks.#.norm2.linear_2.weight",
-    "transformer_blocks.#.attn2.norm_q.weight",
-    "transformer_blocks.#.attn2.norm_k.weight",
-    "transformer_blocks.#.attn2.to_q.weight",
-    "transformer_blocks.#.attn2.to_k.weight",
-    "transformer_blocks.#.attn2.to_v.weight",
-    "transformer_blocks.#.attn2.to_out.#.weight",
-    "transformer_blocks.#.norm3.linear_1.weight",
-    "transformer_blocks.#.norm3.linear_2.weight",
-    "transformer_blocks.#.ff.net.#.proj.weight",
-    "transformer_blocks.#.ff.net.#.weight",
-    "norm_out.linear_1.weight",
-    "norm_out.linear_2.weight",
-    "proj_out.weight"
-   ]
+   "children": {
+    "": [
+     "patch_embed",
+     "time_embed",
+     "transformer_blocks",
+     "norm_out",
+     "proj_out"
+    ],
+    "patch_embed": [
+     "proj"
+    ],
+    "patch_embed.proj": [
+     "weight"
+    ],
+    "time_embed": [
+     "t_embedder",
+     "norm"
+    ],
+    "time_embed.t_embedder": [
+     "linear_1",
+     "linear_2"
+    ],
+    "time_embed.t_embedder.linear_1": [
+     "weight"
+    ],
+    "time_embed.t_embedder.linear_2": [
+     "weight"
+    ],
+    "time_embed.norm": [
+     "weight"
+    ],
+    "transformer_blocks": [
+     "#"
+    ],
+    "transformer_blocks.#": [
+     "norm1",
+     "attn1",
+     "norm2",
+     "attn2",
+     "norm3",
+     "ff"
+    ],
+    "transformer_blocks.#.norm1": [
+     "linear_1",
+     "linear_2"
+    ],
+    "transformer_blocks.#.norm1.linear_1": [
+     "weight"
+    ],
+    "transformer_blocks.#.norm1.linear_2": [
+     "weight"
+    ],
+    "transformer_blocks.#.attn1": [
+     "norm_q",
+     "norm_k",
+     "to_q",
+     "to_k",
+     "to_v",
+     "to_out"
+    ],
+    "transformer_blocks.#.attn1.norm_q": [
+     "weight"
+    ],
+    "transformer_blocks.#.attn1.norm_k": [
+     "weight"
+    ],
+    "transformer_blocks.#.attn1.to_q": [
+     "weight"
+    ],
+    "transformer_blocks.#.attn1.to_k": [
+     "weight"
+    ],
+    "transformer_blocks.#.attn1.to_v": [
+     "weight"
+    ],
+    "transformer_blocks.#.attn1.to_out": [
+     "#"
+    ],
+    "transformer_blocks.#.attn1.to_out.#": [
+     "weight"
+    ],
+    "transformer_blocks.#.norm2": [
+     "linear_1",
+     "linear_2"
+    ],
+    "transformer_blocks.#.norm2.linear_1": [
+     "weight"
+    ],
+    "transformer_blocks.#.norm2.linear_2": [
+     "weight"
+    ],
+    "transformer_blocks.#.attn2": [
+     "norm_q",
+     "norm_k",
+     "to_q",
+     "to_k",
+     "to_v",
+     "to_out"
+    ],
+    "transformer_blocks.#.attn2.norm_q": [
+     "weight"
+    ],
+    "transformer_blocks.#.attn2.norm_k": [
+     "weight"
+    ],
+    "transformer_blocks.#.attn2.to_q": [
+     "weight"
+    ],
+    "transformer_blocks.#.attn2.to_k": [
+     "weight"
+    ],
+    "transformer_blocks.#.attn2.to_v": [
+     "weight"
+    ],
+    "transformer_blocks.#.attn2.to_out": [
+     "#"
+    ],
+    "transformer_blocks.#.attn2.to_out.#": [
+     "weight"
+    ],
+    "transformer_blocks.#.norm3": [
+     "linear_1",
+     "linear_2"
+    ],
+    "transformer_blocks.#.norm3.linear_1": [
+     "weight"
+    ],
+    "transformer_blocks.#.norm3.linear_2": [
+     "weight"
+    ],
+    "transformer_blocks.#.ff": [
+     "net"
+    ],
+    "transformer_blocks.#.ff.net": [
+     "#"
+    ],
+    "transformer_blocks.#.ff.net.#": [
+     "proj",
+     "weight"
+    ],
+    "transformer_blocks.#.ff.net.#.proj": [
+     "weight"
+    ],
+    "norm_out": [
+     "linear_1",
+     "linear_2"
+    ],
+    "norm_out.linear_1": [
+     "weight"
+    ],
+    "norm_out.linear_2": [
+     "weight"
+    ],
+    "proj_out": [
+     "weight"
+    ]
+   }
   },
   {
    "name": "anima/text_encoder",
    "class": "Qwen3Model",
    "source": "hf://circlestone-labs/Anima-Base-v1.0-Diffusers@073c3a9db359c31ad0e8aa268d15775473c2176c/text_encoder",
-   "patterns": [
-    "embed_tokens.weight",
-    "layers.#.self_attn.q_proj.weight",
-    "layers.#.self_attn.k_proj.weight",
-    "layers.#.self_attn.v_proj.weight",
-    "layers.#.self_attn.o_proj.weight",
-    "layers.#.self_attn.q_norm.weight",
-    "layers.#.self_attn.k_norm.weight",
-    "layers.#.mlp.gate_proj.weight",
-    "layers.#.mlp.up_proj.weight",
-    "layers.#.mlp.down_proj.weight",
-    "layers.#.input_layernorm.weight",
-    "layers.#.post_attention_layernorm.weight",
-    "norm.weight"
-   ]
+   "children": {
+    "": [
+     "embed_tokens",
+     "layers",
+     "norm"
+    ],
+    "embed_tokens": [
+     "weight"
+    ],
+    "layers": [
+     "#"
+    ],
+    "layers.#": [
+     "self_attn",
+     "mlp",
+     "input_layernorm",
+     "post_attention_layernorm"
+    ],
+    "layers.#.self_attn": [
+     "q_proj",
+     "k_proj",
+     "v_proj",
+     "o_proj",
+     "q_norm",
+     "k_norm"
+    ],
+    "layers.#.self_attn.q_proj": [
+     "weight"
+    ],
+    "layers.#.self_attn.k_proj": [
+     "weight"
+    ],
+    "layers.#.self_attn.v_proj": [
+     "weight"
+    ],
+    "layers.#.self_attn.o_proj": [
+     "weight"
+    ],
+    "layers.#.self_attn.q_norm": [
+     "weight"
+    ],
+    "layers.#.self_attn.k_norm": [
+     "weight"
+    ],
+    "layers.#.mlp": [
+     "gate_proj",
+     "up_proj",
+     "down_proj"
+    ],
+    "layers.#.mlp.gate_proj": [
+     "weight"
+    ],
+    "layers.#.mlp.up_proj": [
+     "weight"
+    ],
+    "layers.#.mlp.down_proj": [
+     "weight"
+    ],
+    "layers.#.input_layernorm": [
+     "weight"
+    ],
+    "layers.#.post_attention_layernorm": [
+     "weight"
+    ],
+    "norm": [
+     "weight"
+    ]
+   }
   },
   {
    "name": "anima/text_conditioner",
    "class": "AnimaTextConditioner",
    "source": "hf://circlestone-labs/Anima-Base-v1.0-Diffusers@073c3a9db359c31ad0e8aa268d15775473c2176c/text_conditioner",
-   "patterns": [
-    "embed.weight",
-    "blocks.#.norm_self_attn.weight",
-    "blocks.#.self_attn.q_proj.weight",
-    "blocks.#.self_attn.q_norm.weight",
-    "blocks.#.self_attn.k_proj.weight",
-    "blocks.#.self_attn.k_norm.weight",
-    "blocks.#.self_attn.v_proj.weight",
-    "blocks.#.self_attn.o_proj.weight",
-    "blocks.#.norm_cross_attn.weight",
-    "blocks.#.cross_attn.q_proj.weight",
-    "blocks.#.cross_attn.q_norm.weight",
-    "blocks.#.cross_attn.k_proj.weight",
-    "blocks.#.cross_attn.k_norm.weight",
-    "blocks.#.cross_attn.v_proj.weight",
-    "blocks.#.cross_attn.o_proj.weight",
-    "blocks.#.norm_mlp.weight",
-    "blocks.#.mlp.#.weight",
-    "blocks.#.mlp.#.bias",
-    "out_proj.weight",
-    "out_proj.bias",
-    "norm.weight"
-   ]
+   "children": {
+    "": [
+     "embed",
+     "blocks",
+     "out_proj",
+     "norm"
+    ],
+    "embed": [
+     "weight"
+    ],
+    "blocks": [
+     "#"
+    ],
+    "blocks.#": [
+     "norm_self_attn",
+     "self_attn",
+     "norm_cross_attn",
+     "cross_attn",
+     "norm_mlp",
+     "mlp"
+    ],
+    "blocks.#.norm_self_attn": [
+     "weight"
+    ],
+    "blocks.#.self_attn": [
+     "q_proj",
+     "q_norm",
+     "k_proj",
+     "k_norm",
+     "v_proj",
+     "o_proj"
+    ],
+    "blocks.#.self_attn.q_proj": [
+     "weight"
+    ],
+    "blocks.#.self_attn.q_norm": [
+     "weight"
+    ],
+    "blocks.#.self_attn.k_proj": [
+     "weight"
+    ],
+    "blocks.#.self_attn.k_norm": [
+     "weight"
+    ],
+    "blocks.#.self_attn.v_proj": [
+     "weight"
+    ],
+    "blocks.#.self_attn.o_proj": [
+     "weight"
+    ],
+    "blocks.#.norm_cross_attn": [
+     "weight"
+    ],
+    "blocks.#.cross_attn": [
+     "q_proj",
+     "q_norm",
+     "k_proj",
+     "k_norm",
+     "v_proj",
+     "o_proj"
+    ],
+    "blocks.#.cross_attn.q_proj": [
+     "weight"
+    ],
+    "blocks.#.cross_attn.q_norm": [
+     "weight"
+    ],
+    "blocks.#.cross_attn.k_proj": [
+     "weight"
+    ],
+    "blocks.#.cross_attn.k_norm": [
+     "weight"
+    ],
+    "blocks.#.cross_attn.v_proj": [
+     "weight"
+    ],
+    "blocks.#.cross_attn.o_proj": [
+     "weight"
+    ],
+    "blocks.#.norm_mlp": [
+     "weight"
+    ],
+    "blocks.#.mlp": [
+     "#"
+    ],
+    "blocks.#.mlp.#": [
+     "weight",
+     "bias"
+    ],
+    "out_proj": [
+     "weight",
+     "bias"
+    ],
+    "norm": [
+     "weight"
+    ]
+   }
   },
   {
    "name": "anima/vae",
    "class": "AutoencoderKLQwenImage",
    "source": "hf://circlestone-labs/Anima-Base-v1.0-Diffusers@073c3a9db359c31ad0e8aa268d15775473c2176c/vae",
-   "patterns": [
-    "encoder.conv_in.weight",
-    "encoder.conv_in.bias",
-    "encoder.down_blocks.#.norm1.gamma",
-    "encoder.down_blocks.#.conv1.weight",
-    "encoder.down_blocks.#.conv1.bias",
-    "encoder.down_blocks.#.norm2.gamma",
-    "encoder.down_blocks.#.conv2.weight",
-    "encoder.down_blocks.#.conv2.bias",
-    "encoder.down_blocks.#.resample.#.weight",
-    "encoder.down_blocks.#.resample.#.bias",
-    "encoder.down_blocks.#.conv_shortcut.weight",
-    "encoder.down_blocks.#.conv_shortcut.bias",
-    "encoder.down_blocks.#.time_conv.weight",
-    "encoder.down_blocks.#.time_conv.bias",
-    "encoder.mid_block.attentions.#.norm.gamma",
-    "encoder.mid_block.attentions.#.to_qkv.weight",
-    "encoder.mid_block.attentions.#.to_qkv.bias",
-    "encoder.mid_block.attentions.#.proj.weight",
-    "encoder.mid_block.attentions.#.proj.bias",
-    "encoder.mid_block.resnets.#.norm1.gamma",
-    "encoder.mid_block.resnets.#.conv1.weight",
-    "encoder.mid_block.resnets.#.conv1.bias",
-    "encoder.mid_block.resnets.#.norm2.gamma",
-    "encoder.mid_block.resnets.#.conv2.weight",
-    "encoder.mid_block.resnets.#.conv2.bias",
-    "encoder.norm_out.gamma",
-    "encoder.conv_out.weight",
-    "encoder.conv_out.bias",
-    "quant_conv.weight",
-    "quant_conv.bias",
-    "post_quant_conv.weight",
-    "post_quant_conv.bias",
-    "decoder.conv_in.weight",
-    "decoder.conv_in.bias",
-    "decoder.mid_block.attentions.#.norm.gamma",
-    "decoder.mid_block.attentions.#.to_qkv.weight",
-    "decoder.mid_block.attentions.#.to_qkv.bias",
-    "decoder.mid_block.attentions.#.proj.weight",
-    "decoder.mid_block.attentions.#.proj.bias",
-    "decoder.mid_block.resnets.#.norm1.gamma",
-    "decoder.mid_block.resnets.#.conv1.weight",
-    "decoder.mid_block.resnets.#.conv1.bias",
-    "decoder.mid_block.resnets.#.norm2.gamma",
-    "decoder.mid_block.resnets.#.conv2.weight",
-    "decoder.mid_block.resnets.#.conv2.bias",
-    "decoder.up_blocks.#.resnets.#.norm1.gamma",
-    "decoder.up_blocks.#.resnets.#.conv1.weight",
-    "decoder.up_blocks.#.resnets.#.conv1.bias",
-    "decoder.up_blocks.#.resnets.#.norm2.gamma",
-    "decoder.up_blocks.#.resnets.#.conv2.weight",
-    "decoder.up_blocks.#.resnets.#.conv2.bias",
-    "decoder.up_blocks.#.upsamplers.#.resample.#.weight",
-    "decoder.up_blocks.#.upsamplers.#.resample.#.bias",
-    "decoder.up_blocks.#.upsamplers.#.time_conv.weight",
-    "decoder.up_blocks.#.upsamplers.#.time_conv.bias",
-    "decoder.up_blocks.#.resnets.#.conv_shortcut.weight",
-    "decoder.up_blocks.#.resnets.#.conv_shortcut.bias",
-    "decoder.norm_out.gamma",
-    "decoder.conv_out.weight",
-    "decoder.conv_out.bias"
-   ]
+   "children": {
+    "": [
+     "encoder",
+     "quant_conv",
+     "post_quant_conv",
+     "decoder"
+    ],
+    "encoder": [
+     "conv_in",
+     "down_blocks",
+     "mid_block",
+     "norm_out",
+     "conv_out"
+    ],
+    "encoder.conv_in": [
+     "weight",
+     "bias"
+    ],
+    "encoder.down_blocks": [
+     "#"
+    ],
+    "encoder.down_blocks.#": [
+     "norm1",
+     "conv1",
+     "norm2",
+     "conv2",
+     "resample",
+     "conv_shortcut",
+     "time_conv"
+    ],
+    "encoder.down_blocks.#.norm1": [
+     "gamma"
+    ],
+    "encoder.down_blocks.#.conv1": [
+     "weight",
+     "bias"
+    ],
+    "encoder.down_blocks.#.norm2": [
+     "gamma"
+    ],
+    "encoder.down_blocks.#.conv2": [
+     "weight",
+     "bias"
+    ],
+    "encoder.down_blocks.#.resample": [
+     "#"
+    ],
+    "encoder.down_blocks.#.resample.#": [
+     "weight",
+     "bias"
+    ],
+    "encoder.down_blocks.#.conv_shortcut": [
+     "weight",
+     "bias"
+    ],
+    "encoder.down_blocks.#.time_conv": [
+     "weight",
+     "bias"
+    ],
+    "encoder.mid_block": [
+     "attentions",
+     "resnets"
+    ],
+    "encoder.mid_block.attentions": [
+     "#"
+    ],
+    "encoder.mid_block.attentions.#": [
+     "norm",
+     "to_qkv",
+     "proj"
+    ],
+    "encoder.mid_block.attentions.#.norm": [
+     "gamma"
+    ],
+    "encoder.mid_block.attentions.#.to_qkv": [
+     "weight",
+     "bias"
+    ],
+    "encoder.mid_block.attentions.#.proj": [
+     "weight",
+     "bias"
+    ],
+    "encoder.mid_block.resnets": [
+     "#"
+    ],
+    "encoder.mid_block.resnets.#": [
+     "norm1",
+     "conv1",
+     "norm2",
+     "conv2"
+    ],
+    "encoder.mid_block.resnets.#.norm1": [
+     "gamma"
+    ],
+    "encoder.mid_block.resnets.#.conv1": [
+     "weight",
+     "bias"
+    ],
+    "encoder.mid_block.resnets.#.norm2": [
+     "gamma"
+    ],
+    "encoder.mid_block.resnets.#.conv2": [
+     "weight",
+     "bias"
+    ],
+    "encoder.norm_out": [
+     "gamma"
+    ],
+    "encoder.conv_out": [
+     "weight",
+     "bias"
+    ],
+    "quant_conv": [
+     "weight",
+     "bias"
+    ],
+    "post_quant_conv": [
+     "weight",
+     "bias"
+    ],
+    "decoder": [
+     "conv_in",
+     "mid_block",
+     "up_blocks",
+     "norm_out",
+     "conv_out"
+    ],
+    "decoder.conv_in": [
+     "weight",
+     "bias"
+    ],
+    "decoder.mid_block": [
+     "attentions",
+     "resnets"
+    ],
+    "decoder.mid_block.attentions": [
+     "#"
+    ],
+    "decoder.mid_block.attentions.#": [
+     "norm",
+     "to_qkv",
+     "proj"
+    ],
+    "decoder.mid_block.attentions.#.norm": [
+     "gamma"
+    ],
+    "decoder.mid_block.attentions.#.to_qkv": [
+     "weight",
+     "bias"
+    ],
+    "decoder.mid_block.attentions.#.proj": [
+     "weight",
+     "bias"
+    ],
+    "decoder.mid_block.resnets": [
+     "#"
+    ],
+    "decoder.mid_block.resnets.#": [
+     "norm1",
+     "conv1",
+     "norm2",
+     "conv2"
+    ],
+    "decoder.mid_block.resnets.#.norm1": [
+     "gamma"
+    ],
+    "decoder.mid_block.resnets.#.conv1": [
+     "weight",
+     "bias"
+    ],
+    "decoder.mid_block.resnets.#.norm2": [
+     "gamma"
+    ],
+    "decoder.mid_block.resnets.#.conv2": [
+     "weight",
+     "bias"
+    ],
+    "decoder.up_blocks": [
+     "#"
+    ],
+    "decoder.up_blocks.#": [
+     "resnets",
+     "upsamplers"
+    ],
+    "decoder.up_blocks.#.resnets": [
+     "#"
+    ],
+    "decoder.up_blocks.#.resnets.#": [
+     "norm1",
+     "conv1",
+     "norm2",
+     "conv2",
+     "conv_shortcut"
+    ],
+    "decoder.up_blocks.#.resnets.#.norm1": [
+     "gamma"
+    ],
+    "decoder.up_blocks.#.resnets.#.conv1": [
+     "weight",
+     "bias"
+    ],
+    "decoder.up_blocks.#.resnets.#.norm2": [
+     "gamma"
+    ],
+    "decoder.up_blocks.#.resnets.#.conv2": [
+     "weight",
+     "bias"
+    ],
+    "decoder.up_blocks.#.upsamplers": [
+     "#"
+    ],
+    "decoder.up_blocks.#.upsamplers.#": [
+     "resample",
+     "time_conv"
+    ],
+    "decoder.up_blocks.#.upsamplers.#.resample": [
+     "#"
+    ],
+    "decoder.up_blocks.#.upsamplers.#.resample.#": [
+     "weight",
+     "bias"
+    ],
+    "decoder.up_blocks.#.upsamplers.#.time_conv": [
+     "weight",
+     "bias"
+    ],
+    "decoder.up_blocks.#.resnets.#.conv_shortcut": [
+     "weight",
+     "bias"
+    ],
+    "decoder.norm_out": [
+     "gamma"
+    ],
+    "decoder.conv_out": [
+     "weight",
+     "bias"
+    ]
+   }
   },
   {
    "name": "qwen-image/transformer",
    "class": "QwenImageTransformer2DModel",
    "source": "hf://Qwen/Qwen-Image@75e0b4be04f60ec59a75f475837eced720f823b6/transformer",
-   "patterns": [
-    "time_text_embed.timestep_embedder.linear_1.weight",
-    "time_text_embed.timestep_embedder.linear_1.bias",
-    "time_text_embed.timestep_embedder.linear_2.weight",
-    "time_text_embed.timestep_embedder.linear_2.bias",
-    "txt_norm.weight",
-    "img_in.weight",
-    "img_in.bias",
-    "txt_in.weight",
-    "txt_in.bias",
-    "transformer_blocks.#.img_mod.#.weight",
-    "transformer_blocks.#.img_mod.#.bias",
-    "transformer_blocks.#.attn.norm_q.weight",
-    "transformer_blocks.#.attn.norm_k.weight",
-    "transformer_blocks.#.attn.to_q.weight",
-    "transformer_blocks.#.attn.to_q.bias",
-    "transformer_blocks.#.attn.to_k.weight",
-    "transformer_blocks.#.attn.to_k.bias",
-    "transformer_blocks.#.attn.to_v.weight",
-    "transformer_blocks.#.attn.to_v.bias",
-    "transformer_blocks.#.attn.add_k_proj.weight",
-    "transformer_blocks.#.attn.add_k_proj.bias",
-    "transformer_blocks.#.attn.add_v_proj.weight",
-    "transformer_blocks.#.attn.add_v_proj.bias",
-    "transformer_blocks.#.attn.add_q_proj.weight",
-    "transformer_blocks.#.attn.add_q_proj.bias",
-    "transformer_blocks.#.attn.to_out.#.weight",
-    "transformer_blocks.#.attn.to_out.#.bias",
-    "transformer_blocks.#.attn.to_add_out.weight",
-    "transformer_blocks.#.attn.to_add_out.bias",
-    "transformer_blocks.#.attn.norm_added_q.weight",
-    "transformer_blocks.#.attn.norm_added_k.weight",
-    "transformer_blocks.#.img_mlp.net.#.proj.weight",
-    "transformer_blocks.#.img_mlp.net.#.proj.bias",
-    "transformer_blocks.#.img_mlp.net.#.weight",
-    "transformer_blocks.#.img_mlp.net.#.bias",
-    "transformer_blocks.#.txt_mod.#.weight",
-    "transformer_blocks.#.txt_mod.#.bias",
-    "transformer_blocks.#.txt_mlp.net.#.proj.weight",
-    "transformer_blocks.#.txt_mlp.net.#.proj.bias",
-    "transformer_blocks.#.txt_mlp.net.#.weight",
-    "transformer_blocks.#.txt_mlp.net.#.bias",
-    "norm_out.linear.weight",
-    "norm_out.linear.bias",
-    "proj_out.weight",
-    "proj_out.bias"
-   ]
+   "children": {
+    "": [
+     "time_text_embed",
+     "txt_norm",
+     "img_in",
+     "txt_in",
+     "transformer_blocks",
+     "norm_out",
+     "proj_out"
+    ],
+    "time_text_embed": [
+     "timestep_embedder"
+    ],
+    "time_text_embed.timestep_embedder": [
+     "linear_1",
+     "linear_2"
+    ],
+    "time_text_embed.timestep_embedder.linear_1": [
+     "weight",
+     "bias"
+    ],
+    "time_text_embed.timestep_embedder.linear_2": [
+     "weight",
+     "bias"
+    ],
+    "txt_norm": [
+     "weight"
+    ],
+    "img_in": [
+     "weight",
+     "bias"
+    ],
+    "txt_in": [
+     "weight",
+     "bias"
+    ],
+    "transformer_blocks": [
+     "#"
+    ],
+    "transformer_blocks.#": [
+     "img_mod",
+     "attn",
+     "img_mlp",
+     "txt_mod",
+     "txt_mlp"
+    ],
+    "transformer_blocks.#.img_mod": [
+     "#"
+    ],
+    "transformer_blocks.#.img_mod.#": [
+     "weight",
+     "bias"
+    ],
+    "transformer_blocks.#.attn": [
+     "norm_q",
+     "norm_k",
+     "to_q",
+     "to_k",
+     "to_v",
+     "add_k_proj",
+     "add_v_proj",
+     "add_q_proj",
+     "to_out",
+     "to_add_out",
+     "norm_added_q",
+     "norm_added_k"
+    ],
+    "transformer_blocks.#.attn.norm_q": [
+     "weight"
+    ],
+    "transformer_blocks.#.attn.norm_k": [
+     "weight"
+    ],
+    "transformer_blocks.#.attn.to_q": [
+     "weight",
+     "bias"
+    ],
+    "transformer_blocks.#.attn.to_k": [
+     "weight",
+     "bias"
+    ],
+    "transformer_blocks.#.attn.to_v": [
+     "weight",
+     "bias"
+    ],
+    "transformer_blocks.#.attn.add_k_proj": [
+     "weight",
+     "bias"
+    ],
+    "transformer_blocks.#.attn.add_v_proj": [
+     "weight",
+     "bias"
+    ],
+    "transformer_blocks.#.attn.add_q_proj": [
+     "weight",
+     "bias"
+    ],
+    "transformer_blocks.#.attn.to_out": [
+     "#"
+    ],
+    "transformer_blocks.#.attn.to_out.#": [
+     "weight",
+     "bias"
+    ],
+    "transformer_blocks.#.attn.to_add_out": [
+     "weight",
+     "bias"
+    ],
+    "transformer_blocks.#.attn.norm_added_q": [
+     "weight"
+    ],
+    "transformer_blocks.#.attn.norm_added_k": [
+     "weight"
+    ],
+    "transformer_blocks.#.img_mlp": [
+     "net"
+    ],
+    "transformer_blocks.#.img_mlp.net": [
+     "#"
+    ],
+    "transformer_blocks.#.img_mlp.net.#": [
+     "proj",
+     "weight",
+     "bias"
+    ],
+    "transformer_blocks.#.img_mlp.net.#.proj": [
+     "weight",
+     "bias"
+    ],
+    "transformer_blocks.#.txt_mod": [
+     "#"
+    ],
+    "transformer_blocks.#.txt_mod.#": [
+     "weight",
+     "bias"
+    ],
+    "transformer_blocks.#.txt_mlp": [
+     "net"
+    ],
+    "transformer_blocks.#.txt_mlp.net": [
+     "#"
+    ],
+    "transformer_blocks.#.txt_mlp.net.#": [
+     "proj",
+     "weight",
+     "bias"
+    ],
+    "transformer_blocks.#.txt_mlp.net.#.proj": [
+     "weight",
+     "bias"
+    ],
+    "norm_out": [
+     "linear"
+    ],
+    "norm_out.linear": [
+     "weight",
+     "bias"
+    ],
+    "proj_out": [
+     "weight",
+     "bias"
+    ]
+   }
   },
   {
    "name": "qwen-image/vae",
    "class": "AutoencoderKLQwenImage",
    "source": "hf://Qwen/Qwen-Image@75e0b4be04f60ec59a75f475837eced720f823b6/vae",
-   "patterns": [
-    "encoder.conv_in.weight",
-    "encoder.conv_in.bias",
-    "encoder.down_blocks.#.norm1.gamma",
-    "encoder.down_blocks.#.conv1.weight",
-    "encoder.down_blocks.#.conv1.bias",
-    "encoder.down_blocks.#.norm2.gamma",
-    "encoder.down_blocks.#.conv2.weight",
-    "encoder.down_blocks.#.conv2.bias",
-    "encoder.down_blocks.#.resample.#.weight",
-    "encoder.down_blocks.#.resample.#.bias",
-    "encoder.down_blocks.#.conv_shortcut.weight",
-    "encoder.down_blocks.#.conv_shortcut.bias",
-    "encoder.down_blocks.#.time_conv.weight",
-    "encoder.down_blocks.#.time_conv.bias",
-    "encoder.mid_block.attentions.#.norm.gamma",
-    "encoder.mid_block.attentions.#.to_qkv.weight",
-    "encoder.mid_block.attentions.#.to_qkv.bias",
-    "encoder.mid_block.attentions.#.proj.weight",
-    "encoder.mid_block.attentions.#.proj.bias",
-    "encoder.mid_block.resnets.#.norm1.gamma",
-    "encoder.mid_block.resnets.#.conv1.weight",
-    "encoder.mid_block.resnets.#.conv1.bias",
-    "encoder.mid_block.resnets.#.norm2.gamma",
-    "encoder.mid_block.resnets.#.conv2.weight",
-    "encoder.mid_block.resnets.#.conv2.bias",
-    "encoder.norm_out.gamma",
-    "encoder.conv_out.weight",
-    "encoder.conv_out.bias",
-    "quant_conv.weight",
-    "quant_conv.bias",
-    "post_quant_conv.weight",
-    "post_quant_conv.bias",
-    "decoder.conv_in.weight",
-    "decoder.conv_in.bias",
-    "decoder.mid_block.attentions.#.norm.gamma",
-    "decoder.mid_block.attentions.#.to_qkv.weight",
-    "decoder.mid_block.attentions.#.to_qkv.bias",
-    "decoder.mid_block.attentions.#.proj.weight",
-    "decoder.mid_block.attentions.#.proj.bias",
-    "decoder.mid_block.resnets.#.norm1.gamma",
-    "decoder.mid_block.resnets.#.conv1.weight",
-    "decoder.mid_block.resnets.#.conv1.bias",
-    "decoder.mid_block.resnets.#.norm2.gamma",
-    "decoder.mid_block.resnets.#.conv2.weight",
-    "decoder.mid_block.resnets.#.conv2.bias",
-    "decoder.up_blocks.#.resnets.#.norm1.gamma",
-    "decoder.up_blocks.#.resnets.#.conv1.weight",
-    "decoder.up_blocks.#.resnets.#.conv1.bias",
-    "decoder.up_blocks.#.resnets.#.norm2.gamma",
-    "decoder.up_blocks.#.resnets.#.conv2.weight",
-    "decoder.up_blocks.#.resnets.#.conv2.bias",
-    "decoder.up_blocks.#.upsamplers.#.resample.#.weight",
-    "decoder.up_blocks.#.upsamplers.#.resample.#.bias",
-    "decoder.up_blocks.#.upsamplers.#.time_conv.weight",
-    "decoder.up_blocks.#.upsamplers.#.time_conv.bias",
-    "decoder.up_blocks.#.resnets.#.conv_shortcut.weight",
-    "decoder.up_blocks.#.resnets.#.conv_shortcut.bias",
-    "decoder.norm_out.gamma",
-    "decoder.conv_out.weight",
-    "decoder.conv_out.bias"
-   ]
+   "children": {
+    "": [
+     "encoder",
+     "quant_conv",
+     "post_quant_conv",
+     "decoder"
+    ],
+    "encoder": [
+     "conv_in",
+     "down_blocks",
+     "mid_block",
+     "norm_out",
+     "conv_out"
+    ],
+    "encoder.conv_in": [
+     "weight",
+     "bias"
+    ],
+    "encoder.down_blocks": [
+     "#"
+    ],
+    "encoder.down_blocks.#": [
+     "norm1",
+     "conv1",
+     "norm2",
+     "conv2",
+     "resample",
+     "conv_shortcut",
+     "time_conv"
+    ],
+    "encoder.down_blocks.#.norm1": [
+     "gamma"
+    ],
+    "encoder.down_blocks.#.conv1": [
+     "weight",
+     "bias"
+    ],
+    "encoder.down_blocks.#.norm2": [
+     "gamma"
+    ],
+    "encoder.down_blocks.#.conv2": [
+     "weight",
+     "bias"
+    ],
+    "encoder.down_blocks.#.resample": [
+     "#"
+    ],
+    "encoder.down_blocks.#.resample.#": [
+     "weight",
+     "bias"
+    ],
+    "encoder.down_blocks.#.conv_shortcut": [
+     "weight",
+     "bias"
+    ],
+    "encoder.down_blocks.#.time_conv": [
+     "weight",
+     "bias"
+    ],
+    "encoder.mid_block": [
+     "attentions",
+     "resnets"
+    ],
+    "encoder.mid_block.attentions": [
+     "#"
+    ],
+    "encoder.mid_block.attentions.#": [
+     "norm",
+     "to_qkv",
+     "proj"
+    ],
+    "encoder.mid_block.attentions.#.norm": [
+     "gamma"
+    ],
+    "encoder.mid_block.attentions.#.to_qkv": [
+     "weight",
+     "bias"
+    ],
+    "encoder.mid_block.attentions.#.proj": [
+     "weight",
+     "bias"
+    ],
+    "encoder.mid_block.resnets": [
+     "#"
+    ],
+    "encoder.mid_block.resnets.#": [
+     "norm1",
+     "conv1",
+     "norm2",
+     "conv2"
+    ],
+    "encoder.mid_block.resnets.#.norm1": [
+     "gamma"
+    ],
+    "encoder.mid_block.resnets.#.conv1": [
+     "weight",
+     "bias"
+    ],
+    "encoder.mid_block.resnets.#.norm2": [
+     "gamma"
+    ],
+    "encoder.mid_block.resnets.#.conv2": [
+     "weight",
+     "bias"
+    ],
+    "encoder.norm_out": [
+     "gamma"
+    ],
+    "encoder.conv_out": [
+     "weight",
+     "bias"
+    ],
+    "quant_conv": [
+     "weight",
+     "bias"
+    ],
+    "post_quant_conv": [
+     "weight",
+     "bias"
+    ],
+    "decoder": [
+     "conv_in",
+     "mid_block",
+     "up_blocks",
+     "norm_out",
+     "conv_out"
+    ],
+    "decoder.conv_in": [
+     "weight",
+     "bias"
+    ],
+    "decoder.mid_block": [
+     "attentions",
+     "resnets"
+    ],
+    "decoder.mid_block.attentions": [
+     "#"
+    ],
+    "decoder.mid_block.attentions.#": [
+     "norm",
+     "to_qkv",
+     "proj"
+    ],
+    "decoder.mid_block.attentions.#.norm": [
+     "gamma"
+    ],
+    "decoder.mid_block.attentions.#.to_qkv": [
+     "weight",
+     "bias"
+    ],
+    "decoder.mid_block.attentions.#.proj": [
+     "weight",
+     "bias"
+    ],
+    "decoder.mid_block.resnets": [
+     "#"
+    ],
+    "decoder.mid_block.resnets.#": [
+     "norm1",
+     "conv1",
+     "norm2",
+     "conv2"
+    ],
+    "decoder.mid_block.resnets.#.norm1": [
+     "gamma"
+    ],
+    "decoder.mid_block.resnets.#.conv1": [
+     "weight",
+     "bias"
+    ],
+    "decoder.mid_block.resnets.#.norm2": [
+     "gamma"
+    ],
+    "decoder.mid_block.resnets.#.conv2": [
+     "weight",
+     "bias"
+    ],
+    "decoder.up_blocks": [
+     "#"
+    ],
+    "decoder.up_blocks.#": [
+     "resnets",
+     "upsamplers"
+    ],
+    "decoder.up_blocks.#.resnets": [
+     "#"
+    ],
+    "decoder.up_blocks.#.resnets.#": [
+     "norm1",
+     "conv1",
+     "norm2",
+     "conv2",
+     "conv_shortcut"
+    ],
+    "decoder.up_blocks.#.resnets.#.norm1": [
+     "gamma"
+    ],
+    "decoder.up_blocks.#.resnets.#.conv1": [
+     "weight",
+     "bias"
+    ],
+    "decoder.up_blocks.#.resnets.#.norm2": [
+     "gamma"
+    ],
+    "decoder.up_blocks.#.resnets.#.conv2": [
+     "weight",
+     "bias"
+    ],
+    "decoder.up_blocks.#.upsamplers": [
+     "#"
+    ],
+    "decoder.up_blocks.#.upsamplers.#": [
+     "resample",
+     "time_conv"
+    ],
+    "decoder.up_blocks.#.upsamplers.#.resample": [
+     "#"
+    ],
+    "decoder.up_blocks.#.upsamplers.#.resample.#": [
+     "weight",
+     "bias"
+    ],
+    "decoder.up_blocks.#.upsamplers.#.time_conv": [
+     "weight",
+     "bias"
+    ],
+    "decoder.up_blocks.#.resnets.#.conv_shortcut": [
+     "weight",
+     "bias"
+    ],
+    "decoder.norm_out": [
+     "gamma"
+    ],
+    "decoder.conv_out": [
+     "weight",
+     "bias"
+    ]
+   }
   },
   {
    "name": "qwen-image/text_encoder",
    "class": "Qwen2_5_VLForConditionalGeneration",
    "source": "hf://Qwen/Qwen-Image@75e0b4be04f60ec59a75f475837eced720f823b6/text_encoder",
-   "patterns": [
-    "model.visual.patch_embed.proj.weight",
-    "model.visual.blocks.#.norm1.weight",
-    "model.visual.blocks.#.norm2.weight",
-    "model.visual.blocks.#.attn.qkv.weight",
-    "model.visual.blocks.#.attn.qkv.bias",
-    "model.visual.blocks.#.attn.proj.weight",
-    "model.visual.blocks.#.attn.proj.bias",
-    "model.visual.blocks.#.mlp.gate_proj.weight",
-    "model.visual.blocks.#.mlp.gate_proj.bias",
-    "model.visual.blocks.#.mlp.up_proj.weight",
-    "model.visual.blocks.#.mlp.up_proj.bias",
-    "model.visual.blocks.#.mlp.down_proj.weight",
-    "model.visual.blocks.#.mlp.down_proj.bias",
-    "model.visual.merger.ln_q.weight",
-    "model.visual.merger.mlp.#.weight",
-    "model.visual.merger.mlp.#.bias",
-    "model.language_model.embed_tokens.weight",
-    "model.language_model.layers.#.self_attn.q_proj.weight",
-    "model.language_model.layers.#.self_attn.q_proj.bias",
-    "model.language_model.layers.#.self_attn.k_proj.weight",
-    "model.language_model.layers.#.self_attn.k_proj.bias",
-    "model.language_model.layers.#.self_attn.v_proj.weight",
-    "model.language_model.layers.#.self_attn.v_proj.bias",
-    "model.language_model.layers.#.self_attn.o_proj.weight",
-    "model.language_model.layers.#.mlp.gate_proj.weight",
-    "model.language_model.layers.#.mlp.up_proj.weight",
-    "model.language_model.layers.#.mlp.down_proj.weight",
-    "model.language_model.layers.#.input_layernorm.weight",
-    "model.language_model.layers.#.post_attention_layernorm.weight",
-    "model.language_model.norm.weight",
-    "lm_head.weight"
-   ]
+   "children": {
+    "": [
+     "visual",
+     "model",
+     "lm_head"
+    ],
+    "visual": [
+     "patch_embed",
+     "blocks",
+     "merger"
+    ],
+    "visual.patch_embed": [
+     "proj"
+    ],
+    "visual.patch_embed.proj": [
+     "weight"
+    ],
+    "visual.blocks": [
+     "#"
+    ],
+    "visual.blocks.#": [
+     "norm1",
+     "norm2",
+     "attn",
+     "mlp"
+    ],
+    "visual.blocks.#.norm1": [
+     "weight"
+    ],
+    "visual.blocks.#.norm2": [
+     "weight"
+    ],
+    "visual.blocks.#.attn": [
+     "qkv",
+     "proj"
+    ],
+    "visual.blocks.#.attn.qkv": [
+     "weight",
+     "bias"
+    ],
+    "visual.blocks.#.attn.proj": [
+     "weight",
+     "bias"
+    ],
+    "visual.blocks.#.mlp": [
+     "gate_proj",
+     "up_proj",
+     "down_proj"
+    ],
+    "visual.blocks.#.mlp.gate_proj": [
+     "weight",
+     "bias"
+    ],
+    "visual.blocks.#.mlp.up_proj": [
+     "weight",
+     "bias"
+    ],
+    "visual.blocks.#.mlp.down_proj": [
+     "weight",
+     "bias"
+    ],
+    "visual.merger": [
+     "ln_q",
+     "mlp"
+    ],
+    "visual.merger.ln_q": [
+     "weight"
+    ],
+    "visual.merger.mlp": [
+     "#"
+    ],
+    "visual.merger.mlp.#": [
+     "weight",
+     "bias"
+    ],
+    "model": [
+     "embed_tokens",
+     "layers",
+     "norm"
+    ],
+    "model.embed_tokens": [
+     "weight"
+    ],
+    "model.layers": [
+     "#"
+    ],
+    "model.layers.#": [
+     "self_attn",
+     "mlp",
+     "input_layernorm",
+     "post_attention_layernorm"
+    ],
+    "model.layers.#.self_attn": [
+     "q_proj",
+     "k_proj",
+     "v_proj",
+     "o_proj"
+    ],
+    "model.layers.#.self_attn.q_proj": [
+     "weight",
+     "bias"
+    ],
+    "model.layers.#.self_attn.k_proj": [
+     "weight",
+     "bias"
+    ],
+    "model.layers.#.self_attn.v_proj": [
+     "weight",
+     "bias"
+    ],
+    "model.layers.#.self_attn.o_proj": [
+     "weight"
+    ],
+    "model.layers.#.mlp": [
+     "gate_proj",
+     "up_proj",
+     "down_proj"
+    ],
+    "model.layers.#.mlp.gate_proj": [
+     "weight"
+    ],
+    "model.layers.#.mlp.up_proj": [
+     "weight"
+    ],
+    "model.layers.#.mlp.down_proj": [
+     "weight"
+    ],
+    "model.layers.#.input_layernorm": [
+     "weight"
+    ],
+    "model.layers.#.post_attention_layernorm": [
+     "weight"
+    ],
+    "model.norm": [
+     "weight"
+    ],
+    "lm_head": [
+     "weight"
+    ]
+   }
   }
  ]
 }

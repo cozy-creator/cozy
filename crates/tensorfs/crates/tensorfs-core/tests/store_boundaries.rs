@@ -1,5 +1,5 @@
-use std::fs;
 use cozy_platform::durable::symlink;
+use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -27,7 +27,9 @@ fn concurrent_ensures_of_a_new_root_all_succeed() {
     fs::create_dir(&empty).unwrap();
     for target in [root.join("absent"), empty] {
         std::thread::scope(|scope| {
-            let ensures: Vec<_> = (0..16).map(|_| scope.spawn(|| Store::ensure(&target))).collect();
+            let ensures: Vec<_> = (0..16)
+                .map(|_| scope.spawn(|| Store::ensure(&target)))
+                .collect();
             for ensure in ensures {
                 ensure.join().unwrap().unwrap();
             }

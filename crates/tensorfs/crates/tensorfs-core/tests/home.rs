@@ -50,7 +50,11 @@ fn refuse_without_a_named_root(name: &str, args: &[&str]) {
 /// A store verb without a root is a usage error that writes nothing (tfs-053).
 #[test]
 fn store_verbs_name_their_root_and_write_nothing_without_one() {
-    for args in [&["store", "init"][..], &["store", "rebuild"], &["fetch", "ref"]] {
+    for args in [
+        &["store", "init"][..],
+        &["store", "rebuild"],
+        &["fetch", "ref"],
+    ] {
         let root = temporary("no-root");
         let home = root.join("home");
         let cwd = root.join("cwd");
@@ -64,7 +68,11 @@ fn store_verbs_name_their_root_and_write_nothing_without_one() {
             .output()
             .unwrap();
         assert_eq!(output.status.code(), Some(2), "tfs {args:?}");
-        assert_eq!(fs::read_dir(&cwd).unwrap().count(), 0, "tfs {args:?} wrote into its working directory");
+        assert_eq!(
+            fs::read_dir(&cwd).unwrap().count(),
+            0,
+            "tfs {args:?} wrote into its working directory"
+        );
         assert!(!home.join(".tensorfs").exists() && !root.join("environment").exists());
         let _ = fs::remove_dir_all(root);
     }
@@ -82,9 +90,18 @@ fn rebuild_refuses_an_absent_census_root_instead_of_creating_one() {
 fn a_named_root_is_created_and_a_second_init_refuses() {
     let root = temporary("named-root");
     let named = root.join("named");
-    let init = || Command::new(env!("CARGO_BIN_EXE_tfs")).args(["store", "init", named.to_str().unwrap()]).output().unwrap();
+    let init = || {
+        Command::new(env!("CARGO_BIN_EXE_tfs"))
+            .args(["store", "init", named.to_str().unwrap()])
+            .output()
+            .unwrap()
+    };
     let first = init();
-    assert!(first.status.success(), "{}", String::from_utf8_lossy(&first.stderr));
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
     assert!(named.join("blobs").is_dir());
     assert!(String::from_utf8_lossy(&init().stderr).contains("STORE_ERA"));
     let _ = fs::remove_dir_all(root);
@@ -104,12 +121,28 @@ fn switches_keep_their_positionals_and_unknown_flags_warn() {
             .output()
             .unwrap()
     };
-    let init = tfs(&["store", "init", named.to_str().unwrap(), "--streams-start", "4"]);
-    assert!(init.status.success(), "{}", String::from_utf8_lossy(&init.stderr));
+    let init = tfs(&[
+        "store",
+        "init",
+        named.to_str().unwrap(),
+        "--streams-start",
+        "4",
+    ]);
+    assert!(
+        init.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init.stderr)
+    );
     assert!(named.join("blobs").is_dir() && !environment.exists());
     assert!(String::from_utf8_lossy(&init.stderr).contains("unknown flag --streams-start"));
 
-    let written = tfs(&["checkpoint", "write", named.to_str().unwrap(), "--blocks", "two"]);
+    let written = tfs(&[
+        "checkpoint",
+        "write",
+        named.to_str().unwrap(),
+        "--blocks",
+        "two",
+    ]);
     assert_eq!(written.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&written.stderr).contains("--blocks \"two\" is not a number"));
     let _ = fs::remove_dir_all(root);

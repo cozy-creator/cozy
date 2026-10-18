@@ -41,27 +41,59 @@ fn walk(hub: &Hub, checkpoint: &Checkpoint) {
         lane: checkpoint.lane.clone(),
         manifest: checkpoint.manifest.clone(),
     };
-    let policy = SourcePolicy { allowed_hosts: vec!["127.0.0.1".into()], allow_local: true, ..Default::default() };
-    let access = Arc::new(Plain { credential: Anonymous, policy });
-    whole(&fetcher, &origin, access, Priority::Now, &PullCancellation::default(), &|_, _| {})
-        .unwrap_or_else(|refusal| panic!("the download refused: {refusal}"));
+    let policy = SourcePolicy {
+        allowed_hosts: vec!["127.0.0.1".into()],
+        allow_local: true,
+        ..Default::default()
+    };
+    let access = Arc::new(Plain {
+        credential: Anonymous,
+        policy,
+    });
+    whole(
+        &fetcher,
+        &origin,
+        access,
+        Priority::Now,
+        &PullCancellation::default(),
+        &|_, _| {},
+    )
+    .unwrap_or_else(|refusal| panic!("the download refused: {refusal}"));
     for object in &checkpoint.blobs {
         let mut bytes = Vec::new();
-        store.open_verified(&object.sha256).unwrap().read_to_end(&mut bytes).unwrap();
-        assert_eq!(ObjectRef::of(&bytes), *object, "the door admitted other bytes");
+        store
+            .open_verified(&object.sha256)
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        assert_eq!(
+            ObjectRef::of(&bytes),
+            *object,
+            "the door admitted other bytes"
+        );
     }
     let _ = std::fs::remove_dir_all(root);
 }
 
 fn set_limit(soft: u64, hard: Option<u64>) {
-    setrlimit(Resource::Nofile, Rlimit { current: Some(soft), maximum: hard }).unwrap();
+    setrlimit(
+        Resource::Nofile,
+        Rlimit {
+            current: Some(soft),
+            maximum: hard,
+        },
+    )
+    .unwrap();
 }
 
 #[test]
 fn a_low_descriptor_limit_is_raised_and_a_full_table_is_backpressure() {
     let original = getrlimit(Resource::Nofile);
     let hard = original.maximum.unwrap_or(u64::MAX);
-    assert!(hard >= 4096, "this proof needs a hard limit of at least 4096");
+    assert!(
+        hard >= 4096,
+        "this proof needs a hard limit of at least 4096"
+    );
     let checkpoints = checkpoints();
     // The second walk's first asks wait at the hub until the squeeze lets them through.
     let squeezed: Arc<std::collections::HashSet<String>> =
@@ -82,7 +114,11 @@ fn a_low_descriptor_limit_is_raised_and_a_full_table_is_backpressure() {
     walk(&hub, &checkpoints[0]);
     let raised = getrlimit(Resource::Nofile).current.unwrap();
     assert!(raised > 256, "the soft limit was not raised");
-    assert_eq!(tensorfs_core::descriptors::exhaustions(), before, "EMFILE after the raise");
+    assert_eq!(
+        tensorfs_core::descriptors::exhaustions(),
+        before,
+        "EMFILE after the raise"
+    );
 
     // The table shrinks under a running walk, driven by the walk itself, never by a clock.
     // Its asks are held at the hub, so nothing it opened can close: the soft limit drops to
@@ -108,7 +144,10 @@ fn a_low_descriptor_limit_is_raised_and_a_full_table_is_backpressure() {
     });
     walk(&hub, &checkpoints[1]);
     squeeze.join().unwrap();
-    assert!(tensorfs_core::descriptors::exhaustions() > before, "the squeeze never pressed the walk");
+    assert!(
+        tensorfs_core::descriptors::exhaustions() > before,
+        "the squeeze never pressed the walk"
+    );
 
     // A process started under a hard limit of 256, which cannot be raised past.
     let child = std::process::Command::new(std::env::current_exe().unwrap())
@@ -116,7 +155,8 @@ fn a_low_descriptor_limit_is_raised_and_a_full_table_is_backpressure() {
         .env("TFS_FD_CHILD", "1")
         .output()
         .unwrap();
-    let text = String::from_utf8_lossy(&child.stdout).to_string() + &String::from_utf8_lossy(&child.stderr);
+    let text = String::from_utf8_lossy(&child.stdout).to_string()
+        + &String::from_utf8_lossy(&child.stderr);
     assert!(child.status.success() && text.contains("BOUNDED"), "{text}");
 }
 

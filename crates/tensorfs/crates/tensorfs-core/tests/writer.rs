@@ -108,7 +108,9 @@ fn assert_layout(ck: &Checkpoint) {
 
 /// The checkpoint's (component, key) pairs in header order.
 fn header_order(ck: &Checkpoint) -> Vec<(String, String)> {
-    ck.tensors().map(|(c, t)| (c.to_owned(), t.key.clone())).collect()
+    ck.tensors()
+        .map(|(c, t)| (c.to_owned(), t.key.clone()))
+        .collect()
 }
 
 // --------------------------------------------------------------- a tiny HF SDXL, end to end
@@ -416,7 +418,11 @@ fn copy_and_a_base_share_the_large_parts_objects() {
         .map(|(c, k)| (c.to_string(), k.to_string()))
         .collect();
     let d_order = header_order(&d);
-    assert_eq!(d_order[..2], head[..], "set_order's tensors come first, in its order");
+    assert_eq!(
+        d_order[..2],
+        head[..],
+        "set_order's tensors come first, in its order"
+    );
     let others: Vec<_> = (header_order(&a).into_iter())
         .filter(|t| !head.contains(t))
         .collect();
@@ -706,4 +712,214 @@ fn children_forked_meanwhile_never_misfire_the_fence() {
     let w = store.writer(None, Some("fenced")).unwrap();
     w.abandon();
     assert!(!root.join("tmp/writers/fenced").exists());
+}
+
+// --------------------------------------------------------------- construction order (#624)
+
+/// (component, key, roles) of a checkpoint, in header order.
+fn layout_names(ck: &Checkpoint) -> Vec<(String, String, Vec<String>)> {
+    (ck.tensors())
+        .map(|(c, t)| {
+            let roles = t
+                .locations()
+                .into_iter()
+                .map(|(r, _)| r.to_owned())
+                .collect();
+            (c.to_owned(), t.key.clone(), roles)
+        })
+        .collect()
+}
+
+fn encoded(w: &mut Writer, component: &str, key: &str, roles: &[&str]) {
+    let bytes: Vec<Vec<u8>> = roles
+        .iter()
+        .enumerate()
+        .map(|(i, _)| noise(i as u64, 4))
+        .collect();
+    let mut readers: Vec<&[u8]> = bytes.iter().map(Vec::as_slice).collect();
+    let parts = (roles.iter().zip(readers.iter_mut()))
+        .map(|(role, data)| PartData {
+            role: role.to_string(),
+            dtype: Dtype::U8,
+            shape: vec![4],
+            data,
+        })
+        .collect();
+    let encoding = Encoding {
+        scheme: "acme-q".into(),
+        params: Default::default(),
+    };
+    w.put(
+        component,
+        key,
+        &Dtype::F32,
+        &[2],
+        Data::Encoded { encoding, parts },
+    )
+    .unwrap();
+}
+
+/// The header keeps the producer's order (no sorting, components by first appearance, parts as
+/// put), a base's order survives a derive, and reordering changes the checkpoint's identity.
+#[test]
+fn the_header_keeps_the_producers_order() {
+    let scratch = Scratch::new("order");
+    let store = scratch.store("store");
+    let names = |list: &[(&str, &str, &[&str])]| -> Vec<(String, String, Vec<String>)> {
+        (list.iter())
+            .map(|(c, k, r)| {
+                (
+                    c.to_string(),
+                    k.to_string(),
+                    r.iter().map(|r| r.to_string()).collect(),
+                )
+            })
+            .collect()
+    };
+    let mut w = store.writer(None, None).unwrap();
+    plain(&mut w, "vae", "z.weight", &noise(1, 8));
+    encoded(&mut w, "unet", "up.10.weight", &["weight", "scale"]);
+    plain(&mut w, "unet", "up.9.weight", &noise(2, 8));
+    plain(&mut w, "vae", "a.weight", &noise(3, 8));
+    let a = store.checkpoint(&w.commit().unwrap()).unwrap();
+    let want: &[(&str, &str, &[&str])] = &[
+        ("vae", "z.weight", &[""]),
+        ("vae", "a.weight", &[""]),
+        ("unet", "up.10.weight", &["weight", "scale"]),
+        ("unet", "up.9.weight", &[""]),
+    ];
+    assert_eq!(layout_names(&a), names(want));
+    assert_layout(&a);
+    let reread = tensorfs_core::format::Header::from_json(&a.file("model.cozytensors").unwrap());
+    assert_eq!(reread.unwrap(), *a.header());
+
+    // The same tensors in another order: another header, another checkpoint.
+    let mut w = store.writer(None, None).unwrap();
+    plain(&mut w, "vae", "a.weight", &noise(3, 8));
+    plain(&mut w, "vae", "z.weight", &noise(1, 8));
+    encoded(&mut w, "unet", "up.10.weight", &["weight", "scale"]);
+    plain(&mut w, "unet", "up.9.weight", &noise(2, 8));
+    let b = store.checkpoint(&w.commit().unwrap()).unwrap();
+    assert_ne!(
+        b.manifest().header(),
+        a.manifest().header(),
+        "reordering two tensors changes the header digest"
+    );
+    assert_ne!(b.id(), a.id());
+
+    // A derive keeps the base's order: a tensor written again keeps its place, a new one follows.
+    let mut w = store.writer(Some(a.id()), None).unwrap();
+    plain(&mut w, "extra", "x.weight", &noise(9, 8));
+    plain(&mut w, "unet", "up.10.weight", &noise(4, 8));
+    let c = store.checkpoint(&w.commit().unwrap()).unwrap();
+    let want: &[(&str, &str, &[&str])] = &[
+        ("vae", "z.weight", &[""]),
+        ("vae", "a.weight", &[""]),
+        ("unet", "up.10.weight", &[""]),
+        ("unet", "up.9.weight", &[""]),
+        ("extra", "x.weight", &[""]),
+    ];
+    assert_eq!(layout_names(&c), names(want));
+    assert_layout(&c);
+}
+
+/// The owner's real v1 lanes (read-only): a v2 checkpoint the writer makes from them, tensor by
+/// tensor in v1 order, has v1's order. The bytes are one-byte stand-ins of an unknown dtype; the
+/// order is under test, and the chunk counts the rule gives the real part lengths are reported.
+#[test]
+#[ignore = "reads the owner's ~/.tensorfs v1 lanes"]
+fn real_v1_lanes_keep_their_order() {
+    use tensorfs_core::header::Header as V1;
+    let home = PathBuf::from(std::env::var_os("HOME").unwrap()).join(".tensorfs");
+    let blob = |sha: &str| {
+        fs::read(
+            home.join("blobs")
+                .join(&sha[..2])
+                .join(&sha[2..4])
+                .join(sha),
+        )
+        .unwrap()
+    };
+    let scratch = Scratch::new("v1");
+    let store = scratch.store("store");
+    // (lane, manifest prefix, chunk count design §3 measured by the rule)
+    for (lane, prefix, chunks) in [
+        ("sdxl-int8", "3eb5674846e8", 203),
+        ("sdxl-fp8", "d33267e269ae", 201),
+        ("qwen-int8", "e7c79ee942b8", 544),
+        ("anima-fp8", "9bbe72e3b132", 173),
+        ("h3-fp8", "302eec1e11fd", 2138),
+    ] {
+        let dir = home
+            .join("manifests")
+            .join(&prefix[..2])
+            .join(&prefix[2..4]);
+        let manifest = (fs::read_dir(&dir).unwrap().flatten())
+            .find(|e| e.file_name().to_string_lossy().starts_with(prefix))
+            .unwrap()
+            .path();
+        let doc: serde_json::Value = serde_json::from_slice(&fs::read(manifest).unwrap()).unwrap();
+        let entry = (doc["entries"].as_array().unwrap().iter())
+            .find(|e| e["kind"] == "cozytensors")
+            .unwrap();
+        let v1 = V1::parse(&blob(entry["blob"]["sha256"].as_str().unwrap())).unwrap();
+        let mut w = store.writer(None, None).unwrap();
+        let mut want = Vec::new();
+        let mut items = Vec::new();
+        for (component, tensors) in &v1.components {
+            for (key, t) in tensors {
+                let roles: Vec<&str> = t.parts.iter().map(|(r, _)| r.as_str()).collect();
+                let stand_in = Dtype::Other("V1".into());
+                let data: Vec<Vec<u8>> = roles.iter().map(|_| vec![7u8]).collect();
+                let mut readers: Vec<&[u8]> = data.iter().map(Vec::as_slice).collect();
+                let parts = (roles.iter().zip(readers.iter_mut()))
+                    .map(|(role, data)| PartData {
+                        role: role.to_string(),
+                        dtype: stand_in.clone(),
+                        shape: vec![],
+                        data,
+                    })
+                    .collect();
+                let encoding = Encoding {
+                    scheme: "v1".into(),
+                    params: Default::default(),
+                };
+                w.put(
+                    component,
+                    key,
+                    &stand_in,
+                    &[],
+                    Data::Encoded { encoding, parts },
+                )
+                .unwrap();
+                want.push((
+                    component.clone(),
+                    key.clone(),
+                    roles.iter().map(|r| r.to_string()).collect::<Vec<_>>(),
+                ));
+                for (role, p) in &t.parts {
+                    items.push((
+                        component.clone(),
+                        key.clone(),
+                        role.clone(),
+                        p.nbytes(key).unwrap(),
+                    ));
+                }
+            }
+        }
+        let ck = store.checkpoint(&w.commit().unwrap()).unwrap();
+        assert_eq!(layout_names(&ck), want, "{lane}: v2 order is v1 order");
+        let items: Vec<Item> = (items.iter())
+            .map(|(c, k, r, n)| Item {
+                component: c,
+                key: k,
+                role: r,
+                length: *n,
+            })
+            .collect();
+        // The design measured its counts in natural key order; v1 order closes packs at other
+        // block boundaries, so the count is reported, not asserted.
+        let planned = layout::plan(&items).chunks.len();
+        println!("{lane}: {} tensors, v2 order = v1 order; {planned} chunks in v1 order (design §3, natural order: {chunks})", want.len());
+    }
 }

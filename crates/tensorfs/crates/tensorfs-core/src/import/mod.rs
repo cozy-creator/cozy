@@ -10,6 +10,7 @@
 //!    pinned reference supplies them when the source has none), then delete the tmp area.
 
 pub mod engine;
+pub mod order;
 pub mod remote;
 pub mod source;
 

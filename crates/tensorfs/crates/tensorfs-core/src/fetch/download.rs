@@ -707,7 +707,8 @@ impl Shared {
                     match located.map(|mut located| located.pop()) {
                         Ok(Some(here)) => here,
                         Ok(None) => {
-                            let what = format!("{}: the origin located nothing", task.object.sha256);
+                            let what =
+                                format!("{}: the origin located nothing", task.object.sha256);
                             return refuse(Code::REF_NOT_FOUND, what);
                         }
                         // The origin's weather is asked again, under the same stillness rule.

@@ -133,14 +133,25 @@ fn the_binary_and_the_wheel_share_one_store() {
     assert_eq!(answers["claim_protocol"], CLAIM_PROTOCOL);
     assert_eq!(answers["contains"], true);
     assert_eq!(answers["bytes"], hex(&fs::read(&old).unwrap()));
-    assert_eq!(answers["put"], serde_json::json!([theirs.id(), theirs.length, true]));
-    assert_eq!(answers["again"], serde_json::json!([id, put.obj.length, false]));
+    assert_eq!(
+        answers["put"],
+        serde_json::json!([theirs.id(), theirs.length, true])
+    );
+    assert_eq!(
+        answers["again"],
+        serde_json::json!([id, put.obj.length, false])
+    );
     assert!(store.contains(&theirs.sha256));
     assert_eq!(
         store.read_range(&theirs.sha256, 0, theirs.length).unwrap(),
         fs::read(&new).unwrap()
     );
-    assert!(!store.put_file(&new, Some(&theirs), &Fault::default()).unwrap().admitted);
+    assert!(
+        !store
+            .put_file(&new, Some(&theirs), &Fault::default())
+            .unwrap()
+            .admitted
+    );
     assert_eq!(contract::recorded(&root).unwrap(), Some(Contract::OURS));
 
     // A Store made before the record existed is adopted, and so is one a crash cut short.
@@ -159,7 +170,13 @@ fn the_binary_and_the_wheel_share_one_store() {
     // Another store format refuses both builds, the owner included.
     let format = scratch.0.join("format");
     wheel(&python, "ensure", &format, &[]);
-    record(&format, Contract { store_format: STORE_FORMAT + 1, ..Contract::OURS });
+    record(
+        &format,
+        Contract {
+            store_format: STORE_FORMAT + 1,
+            ..Contract::OURS
+        },
+    );
     assert_eq!(refused(Store::open(&format)), Code::STORE_ERA);
     assert_eq!(refused(Store::ensure_owned(&format)), Code::STORE_ERA);
     assert_eq!(wheel(&python, "open", &format, &[])["refused"], "STORE_ERA");
@@ -167,7 +184,13 @@ fn the_binary_and_the_wheel_share_one_store() {
     // Another claim protocol refuses both, until the owner records its own.
     let claim = scratch.0.join("claim");
     wheel(&python, "ensure", &claim, &[]);
-    record(&claim, Contract { claim_protocol: CLAIM_PROTOCOL + 1, ..Contract::OURS });
+    record(
+        &claim,
+        Contract {
+            claim_protocol: CLAIM_PROTOCOL + 1,
+            ..Contract::OURS
+        },
+    );
     assert_eq!(wheel(&python, "open", &claim, &[])["refused"], "STORE_ERA");
     assert_eq!(refused(Store::open(&claim)), Code::STORE_ERA);
     let owner = Store::ensure_owned(&claim).unwrap();

@@ -640,11 +640,19 @@ fn a_killed_download_fetches_only_what_it_had_not_retained() {
     asked.sort();
     let (mut requested, mut reached) = (0, None::<(String, u64)>);
     for (name, first, last) in asked {
-        let before = reached.as_ref().filter(|(seen, _)| *seen == name).map_or(0, |(_, end)| *end);
+        let before = reached
+            .as_ref()
+            .filter(|(seen, _)| *seen == name)
+            .map_or(0, |(_, end)| *end);
         requested += (last + 1).saturating_sub(first.max(before));
         reached = Some((name, before.max(last + 1)));
     }
-    assert_eq!(requested, owed, "retained {runs:?}; asked {:?}", resumed.asked.lock().unwrap());
+    assert_eq!(
+        requested,
+        owed,
+        "retained {runs:?}; asked {:?}",
+        resumed.asked.lock().unwrap()
+    );
     assert_eq!(rows.iter().map(|row| row.transferred).sum::<u64>(), owed);
     let _ = fs::remove_dir_all(dir);
 }
@@ -873,7 +881,6 @@ fn concurrent_admissions_queue_instead_of_refusing() {
     let _ = fs::remove_dir_all(dir);
 }
 
-
 /// Run one `*_child` test of this binary in its own process, optionally inside `scope`.
 fn run_child(test: &str, dir: &std::path::Path, scope: &[&str]) -> std::process::Output {
     let exe = std::env::current_exe().unwrap();
@@ -899,11 +906,15 @@ fn push_memory_child() {
     };
     // The objects were made by the parent: this process's peak is the pushes' alone.
     let store = Store::open(std::path::Path::new(&dir)).unwrap();
-    let objects: Vec<ObjectRef> = fs::read_to_string(std::path::Path::new(&dir).with_extension("objects"))
-        .unwrap()
-        .lines()
-        .map(|hex| ObjectRef { sha256: hex.into(), length: 16 * MIB as u64 })
-        .collect();
+    let objects: Vec<ObjectRef> =
+        fs::read_to_string(std::path::Path::new(&dir).with_extension("objects"))
+            .unwrap()
+            .lines()
+            .map(|hex| ObjectRef {
+                sha256: hex.into(),
+                length: 16 * MIB as u64,
+            })
+            .collect();
     let origin = Origin::start(vec![], 0, |_, _| Act::Serve);
     let peak_resident = || cozy_platform::process::peak_resident().unwrap();
     let before = peak_resident();
@@ -931,7 +942,10 @@ fn push_memory_child() {
     assert_eq!(origin.puts.load(Ordering::Relaxed), 16);
     // 256 MiB crossed the sockets; the pushes may hold their streams' buffers (2 MiB each)
     // and no more.
-    assert!(grew < 16 * (2 << 20) + (16 << 20), "pushes buffered {grew} B");
+    assert!(
+        grew < 16 * (2 << 20) + (16 << 20),
+        "pushes buffered {grew} B"
+    );
 }
 
 #[test]
@@ -1014,10 +1028,7 @@ fn a_memory_limited_scope_downloads() {
         output.status.success() && text.contains("DOWNLOADED"),
         "{text}"
     );
-    for line in text
-        .lines()
-        .filter(|line| line.contains("DOWNLOADED"))
-    {
+    for line in text.lines().filter(|line| line.contains("DOWNLOADED")) {
         println!("{line}");
     }
     let _ = fs::remove_dir_all(dir);

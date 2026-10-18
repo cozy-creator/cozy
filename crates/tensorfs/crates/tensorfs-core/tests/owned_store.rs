@@ -1,9 +1,9 @@
 //! The embedded owner role uses real store files, flock and process death. Ordinary
 //! readers retain their existing recovery-lock behavior across the ownership transition.
 
+use cozy_platform::durable::symlink;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
-use cozy_platform::durable::symlink;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
@@ -338,8 +338,8 @@ fn an_owner_lock_symlink_or_nonregular_file_is_refused() {
     fs::remove_file(root.join("owner.lock")).unwrap();
     #[cfg(unix)] // A FIFO is Unix's.
     {
-        let fifo = std::ffi::CString::new(root.join("owner.lock").as_os_str().as_encoded_bytes())
-            .unwrap();
+        let fifo =
+            std::ffi::CString::new(root.join("owner.lock").as_os_str().as_encoded_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
         assert_eq!(
             Store::ensure_owned(&root).unwrap_err().code,

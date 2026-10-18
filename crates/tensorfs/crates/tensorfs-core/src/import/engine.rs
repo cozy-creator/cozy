@@ -3,10 +3,10 @@
 //! sets and applies a table row by row: `rename | view -> take(axis, idx) | permute -> shape`,
 //! then the component's `cast`. Nothing model-specific lives here.
 
+use cozy_platform::durable::FileAt;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::Read;
-use cozy_platform::durable::FileAt;
 
 use serde::Deserialize;
 
@@ -649,8 +649,9 @@ fn planned(
     })
 }
 
-/// Every output tensor: claimed groups through their tables' rows in table order, then
-/// unclaimed groups as they are, under `identity(group)`'s component name.
+/// Every output tensor, in construction order: claimed groups through their tables' rows in
+/// row order (the target's `state_dict()` order), then unclaimed groups as they are, under
+/// `identity(group)`'s component name.
 pub fn plan(
     set: &SourceSet,
     tables: &[Table],
@@ -702,11 +703,23 @@ pub fn plan(
             }
         }
     }
+    // Unclaimed groups are stored as they are, in their model's construction order when a
+    // generated reference covers them, else in the order of their bytes in the source.
     for &g in &r.unclaimed {
         let group = &set.groups[g];
         let name = identity(group);
-        for (key, t) in &group.tensors {
-            out.push(planned(&name, key, t, &Ops::default(), None)?);
+        let keys: Vec<(&str, (usize, u64))> = (group.tensors.iter())
+            .map(|(k, t)| (k.as_str(), (t.file, t.start)))
+            .collect();
+        for i in super::order::order(&keys).0 {
+            let key = keys[i].0;
+            out.push(planned(
+                &name,
+                key,
+                &group.tensors[key],
+                &Ops::default(),
+                None,
+            )?);
         }
     }
     let mut seen = BTreeSet::new();

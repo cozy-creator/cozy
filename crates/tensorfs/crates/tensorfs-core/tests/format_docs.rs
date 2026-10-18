@@ -176,7 +176,12 @@ fn red_documents_are_refused() {
             r#""chunk":2,"dtype":"F32""#,
             "invalid",
         ),
-        ("component", r#""name":"unet""#, r#""name":"un/et""#, "invalid"),
+        (
+            "component",
+            r#""name":"unet""#,
+            r#""name":"un/et""#,
+            "invalid",
+        ),
         (
             "repeated key",
             r#""key":"b.weight""#,
@@ -277,7 +282,10 @@ fn order_is_kept_and_a_reorder_changes_the_digest() {
     let mut reordered = tensors();
     reordered.reverse();
     let r = header_with(reordered);
-    assert_eq!(keys(&Header::from_json(&r.to_json().unwrap()).unwrap()), ["b.weight", "a.weight"]);
+    assert_eq!(
+        keys(&Header::from_json(&r.to_json().unwrap()).unwrap()),
+        ["b.weight", "a.weight"]
+    );
     assert_ne!(
         ObjectRef::of(&r.to_json().unwrap()),
         ObjectRef::of(&h.to_json().unwrap()),

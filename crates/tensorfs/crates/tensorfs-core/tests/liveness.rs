@@ -22,7 +22,6 @@ fn temporary(name: &str) -> PathBuf {
     ))
 }
 
-
 fn tfs() -> Command {
     Command::new(env!("CARGO_BIN_EXE_tfs"))
 }
@@ -37,10 +36,6 @@ fn assert_ok(output: &std::process::Output, what: &str) -> String {
     String::from_utf8_lossy(&output.stdout).to_string()
 }
 
-
-
-
-
 fn reap(store: &Path) -> (u64, u64) {
     let out = assert_ok(&tfs().args(["reap"]).arg(store).output().unwrap(), "reap");
     let words: Vec<&str> = out.split_whitespace().collect();
@@ -48,8 +43,6 @@ fn reap(store: &Path) -> (u64, u64) {
     let kept = words[words.iter().position(|w| *w == "kept").unwrap() + 1];
     (gone.parse().unwrap(), kept.parse().unwrap())
 }
-
-
 
 #[test]
 fn reap_decides_on_the_writers_lock_and_never_on_age() {

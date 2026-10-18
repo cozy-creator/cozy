@@ -240,7 +240,9 @@ impl Tensor {
     pub fn locations(&self) -> Vec<(&str, Location)> {
         match &self.body {
             Body::Data(at) => vec![("", *at)],
-            Body::Encoded { parts, .. } => parts.iter().map(|p| (p.role.as_str(), p.at())).collect(),
+            Body::Encoded { parts, .. } => {
+                parts.iter().map(|p| (p.role.as_str(), p.at())).collect()
+            }
         }
     }
 }
@@ -335,7 +337,9 @@ impl Header {
             for (ti, t) in component.tensors.iter().enumerate() {
                 let key = &t.key;
                 if key.is_empty() || keys.insert(key.clone(), ti).is_some() {
-                    return invalid(format!("component {name:?}: tensor key {key:?} is empty or repeated"));
+                    return invalid(format!(
+                        "component {name:?}: tensor key {key:?} is empty or repeated"
+                    ));
                 }
                 let at = |what: &str| format!("{name}/{key}{what}");
                 match &t.body {
@@ -344,9 +348,17 @@ impl Header {
                         for (i, p) in parts.iter().enumerate() {
                             let role = &p.role;
                             if role.is_empty() || parts[..i].iter().any(|o| &o.role == role) {
-                                return invalid(format!("{}: part role {role:?} is empty or repeated", at("")));
+                                return invalid(format!(
+                                    "{}: part role {role:?} is empty or repeated",
+                                    at("")
+                                ));
                             }
-                            header.check(&p.at(), &p.dtype, &p.shape, &at(&format!(" part {role}")))?;
+                            header.check(
+                                &p.at(),
+                                &p.dtype,
+                                &p.shape,
+                                &at(&format!(" part {role}")),
+                            )?;
                         }
                     }
                 }

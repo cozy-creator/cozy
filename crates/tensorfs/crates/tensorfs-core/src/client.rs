@@ -434,7 +434,10 @@ pub fn regions(header: &Header, max_bytes: u64) -> Vec<Vec<String>> {
                 empty.push(name(&t.key));
                 continue;
             }
-            let mut joined: Vec<usize> = chunks.iter().filter_map(|k| owner.get(k).copied()).collect();
+            let mut joined: Vec<usize> = chunks
+                .iter()
+                .filter_map(|k| owner.get(k).copied())
+                .collect();
             joined.sort_unstable();
             joined.dedup();
             let g = match joined.split_first() {

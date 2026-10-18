@@ -90,7 +90,11 @@ fn write_store() -> BTreeMap<String, Vec<u8>> {
     for c in grouped.iter().flat_map(|(_, list)| list) {
         let parts: Vec<(&str, &str)> = match &c.bits {
             Some(bits) => vec![("", bits.as_str())],
-            None => c.parts.iter().map(|p| (p.role.as_str(), p.bits.as_str())).collect(),
+            None => c
+                .parts
+                .iter()
+                .map(|p| (p.role.as_str(), p.bits.as_str()))
+                .collect(),
         };
         for (role, bits) in parts {
             data.push(b64(bits));
@@ -331,10 +335,7 @@ fn chunk_rule() {
     let p = layout::plan(&items);
     assert_eq!(p.chunks, [24 * MIB, 24 * MIB, 24 * MIB]);
     let same_block: Vec<Item> = (0..12).map(|_| item("t", "b.0.w", small)).collect();
-    assert_eq!(
-        layout::plan(&same_block).chunks,
-        [60 * MIB, 12 * MIB]
-    );
+    assert_eq!(layout::plan(&same_block).chunks, [60 * MIB, 12 * MIB]);
 
     assert_eq!(
         layout::block_of("down_blocks.1.resnets.0.conv1.weight"),

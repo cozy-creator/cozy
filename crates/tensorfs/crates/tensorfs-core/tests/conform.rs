@@ -16,7 +16,6 @@ use tensorfs_core::registry;
 use tensorfs_core::spec::EncodingSpec;
 use tensorfs_core::vectors::{Case, EncodingVectors};
 
-
 // ---------------------------------------------------------------- carrier math
 
 fn f32_bits(v: f32) -> [u8; 4] {
@@ -353,7 +352,11 @@ fn candidates(alias: &str) -> Vec<Candidate> {
         "int8-convrot256/1" => vec![
             mk("int8-convrot256", false, int8_convrot256),
             mk("int8-convrot256:unrotated", true, int8_convrot_unrotated),
-            mk("int8-convrot256:scale-by-column", true, int8_convrot_scale_by_column),
+            mk(
+                "int8-convrot256:scale-by-column",
+                true,
+                int8_convrot_scale_by_column,
+            ),
         ],
         "nvfp4-w4a4/1" => vec![
             mk("nvfp4", false, nvfp4),
