@@ -81,9 +81,12 @@ fn open(root: &Path, tools: &Tools) -> Machine {
             generations: root.join("generations"),
             client_wheel: tools.client.clone(),
             staging_root: root.join("staging"),
-            // A Runtime wheel not yet published, installed as this machine's own (a dev build).
+            // A Runtime wheel not yet published, installed as this machine's own (a dev build),
+            // the operator's choice as an update's `--runtime-wheel` is.
             sdk: std::env::var_os("COZY_TEST_RUNTIME_WHEEL").map(PathBuf::from).into_iter().collect(),
-            runtime_build: String::new(),
+            runtime_build: std::env::var_os("COZY_TEST_RUNTIME_WHEEL")
+                .and_then(|w| Some(PathBuf::from(w).file_name()?.to_str()?.split('-').nth(1)?.to_owned()))
+                .unwrap_or_default(),
             uv: "uv".into(),
             seed_cache: None,
         },
@@ -106,6 +109,30 @@ fn open(root: &Path, tools: &Tools) -> Machine {
         store,
         objects,
         runs,
+    }
+}
+
+/// With a named Runtime wheel (`COZY_TEST_RUNTIME_WHEEL`), every environment under `generations`
+/// loads that build, by the commit stamped in it; a wheel without one proves nothing.
+fn named_runtime_loaded(generations: &Path) {
+    let Some(wheel) = std::env::var_os("COZY_TEST_RUNTIME_WHEEL") else { return };
+    let output = |command: &mut Command| {
+        let out = command.output().unwrap();
+        assert!(out.status.success(), "{command:?}: {out:?}");
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    };
+    let read = "import re, sys, zipfile\n\
+        text = zipfile.ZipFile(sys.argv[1]).read('cozy_runtime/_build_provenance.py').decode()\n\
+        print(re.search(r'^COMMIT = \"([^\"]*)\"', text, re.M).group(1))\n";
+    let want = output(Command::new("python3").args(["-I", "-c", read]).arg(&wheel));
+    assert!(!want.is_empty() && want != "unknown",
+        "{wheel:?} names no commit (COMMIT = {want:?}): a wheel without provenance proves nothing");
+    let pythons: Vec<PathBuf> = std::fs::read_dir(generations).unwrap().flatten()
+        .map(|entry| entry.path().join("env/bin/python")).filter(|python| python.exists()).collect();
+    assert!(!pythons.is_empty(), "no environment under {generations:?}");
+    for python in pythons {
+        let loaded = output(Command::new(&python).args(["-I", "-c", "from cozy_runtime._build_provenance import COMMIT; print(COMMIT)"]));
+        assert_eq!(loaded, want, "{python:?} loads another Runtime than {wheel:?}");
     }
 }
 
@@ -234,6 +261,7 @@ fn a_canceled_root_resubmitted_skips_its_finished_steps(restart: bool) {
     let (done, stopped) = (engine.get(&ended[0].id).unwrap(), engine.get(&ended[1].id).unwrap());
     assert_eq!((done.state, stopped.state), (State::Completed, State::Canceled));
     assert!(!done.memo.computation.is_empty() && !done.memo.memoized, "{:?}", done.memo);
+    named_runtime_loaded(&root.join("generations"));
 
     if restart {
         assert!(machine.service.stop().unwrap(), "the machine was not idle");

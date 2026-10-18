@@ -89,6 +89,7 @@ jobs:
       - name: Runtime wheel
         if: inputs.runtime_ref != ''
         run: |
+          uv run --no-project python .runtime/scripts/stamp-build-provenance.py "$(git -C .runtime rev-parse HEAD)"
           uv build --wheel --out-dir "$RUNNER_TEMP/runtime" .runtime
           echo "COZY_TEST_RUNTIME_WHEEL=$(ls "$RUNNER_TEMP"/runtime/cozy_runtime-*.whl)" >> "$GITHUB_ENV"
 

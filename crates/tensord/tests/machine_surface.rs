@@ -823,7 +823,30 @@ mod v1_api {
             .unwrap()
             .success());
         let machine = Machine::start_args(|_, _| (), &installing_args(&tools)).await;
+        // A named Runtime wheel is the one its packages load, by the commit stamped in it.
+        if let Some(wheel) = std::env::var_os("COZY_TEST_RUNTIME_WHEEL") {
+            let want = stamped(Path::new(&wheel));
+            assert!(
+                !want.is_empty() && want != "unknown",
+                "{wheel:?} names no commit (COMMIT = {want:?}): a wheel without provenance proves nothing"
+            );
+            let client = client(&machine);
+            let all = cap(Grant { action: MACHINE.into(), ..Default::default() });
+            let manifest = write_package(&client, &all, "cpu_bulk", "local/tensord-cpu-bulk").await;
+            let built = call(&client, &all, &manifest, ("provenance", "provenance"), serde_json::json!({})).await;
+            assert_eq!(built["commit"], want.as_str(), "the machine loaded another Runtime than {wheel:?}");
+        }
         (machine, tools)
+    }
+
+    /// The commit a Runtime wheel was built from: its `cozy_runtime._build_provenance.COMMIT`.
+    fn stamped(wheel: &Path) -> String {
+        let read = "import re, sys, zipfile\n\
+            text = zipfile.ZipFile(sys.argv[1]).read('cozy_runtime/_build_provenance.py').decode()\n\
+            print(re.search(r'^COMMIT = \"([^\"]*)\"', text, re.M).group(1))\n";
+        let out = Command::new("python3").args(["-I", "-c", read]).arg(wheel).output().unwrap();
+        assert!(out.status.success(), "reading {wheel:?}: {out:?}");
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
     }
 
     /// `serve`'s installer arguments: the test helper Python and the client wheel in `tools`.

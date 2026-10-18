@@ -174,11 +174,18 @@ pub fn dev(args: Dev) -> io::Result<()> {
         None => crate::gpu_service::GpuConfig::deviceless(&root.join("cpu").join("home"))?,
     };
     service.configure_pool(crate::gpu_service::Pool::new(&root.join("gpu"), pool, store.clone())?)?;
+    // A Runtime wheel named here is the operator's choice, as an update's `--runtime-wheel` is: it
+    // runs every package whatever the package's bounds on the pair.
+    let runtime_build = (args.package_sdk.iter())
+        .filter_map(|r| std::path::Path::new(r).file_name()?.to_str()?.strip_prefix("cozy_runtime-")?.split('-').next().map(str::to_owned))
+        .next()
+        .unwrap_or_default();
     let sdk = crate::published::PackageSdk {
         uv: args.uv,
         requirements: args.package_sdk,
         find_links: args.package_find_links,
         python: args.package_python.clone(),
+        runtime_build,
         ..Default::default()
     };
     match (args.machine_config, args.listen) {

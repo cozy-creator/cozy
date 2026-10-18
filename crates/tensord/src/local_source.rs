@@ -632,9 +632,25 @@ mod tests {
 
     /// The fixtures' author surface needs the Runtime of this cohort: a dev wheel
     /// (`COZY_TEST_RUNTIME_WHEEL`) as the machine's own until a release carries it.
+    /// Named, it is the operator's choice, as an update's `--runtime-wheel` is (`runtime_build`).
     fn current_runtime(installer: &InstallerConfig) -> InstallerConfig {
-        let sdk = std::env::var_os("COZY_TEST_RUNTIME_WHEEL").map(PathBuf::from).into_iter().collect();
-        InstallerConfig { sdk, ..installer.clone() }
+        let sdk: Vec<PathBuf> = std::env::var_os("COZY_TEST_RUNTIME_WHEEL").map(PathBuf::from).into_iter().collect();
+        let runtime_build = sdk.first().map(|wheel| wheel_version(wheel)).unwrap_or_default();
+        InstallerConfig { sdk, runtime_build, ..installer.clone() }
+    }
+
+    /// With a named Runtime wheel (`COZY_TEST_RUNTIME_WHEEL`), the Runtime `python` loads is that
+    /// build, by the commit stamped in it; a wheel without one proves nothing.
+    fn named_runtime_loaded(python: &Path) {
+        let Some(wheel) = std::env::var_os("COZY_TEST_RUNTIME_WHEEL") else { return };
+        let read = "import re, sys, zipfile\n\
+            text = zipfile.ZipFile(sys.argv[1]).read('cozy_runtime/_build_provenance.py').decode()\n\
+            print(re.search(r'^COMMIT = \"([^\"]*)\"', text, re.M).group(1))\n";
+        let want = run(Command::new("python3").args(["-I", "-c", read]).arg(&wheel));
+        assert!(!want.is_empty() && want != "unknown",
+            "{wheel:?} names no commit (COMMIT = {want:?}): a wheel without provenance proves nothing");
+        let loaded = run(Command::new(python).args(["-I", "-c", "from cozy_runtime._build_provenance import COMMIT; print(COMMIT)"]));
+        assert_eq!(loaded, want, "{python:?} loads another Runtime than {wheel:?}");
     }
 
     /// Its stdout, trimmed; a failure names the command and its stderr.
@@ -960,6 +976,7 @@ mod tests {
         let with = manifest(serde_json::json!([{"name": name, "digest": carried.digest, "length": carried.length}]));
         let installed = sources.install(&m.service, "alice", &with, None, "", &|_| ()).unwrap();
         let held = m.service.catalog.resolve(&installed.generation).unwrap();
+        named_runtime_loaded(&held.record.python);
         let callee = held.record.callees.iter().find(|c| c.distribution == "tensord-cpu-memo").expect("the carried callee App");
         assert_eq!((callee.package.as_str(), callee.version.as_str()), ("proof/tensord-cpu-memo", "0.1.0"));
         // Acceptance roots the captured files and carried wheel even when its environment
@@ -1022,6 +1039,7 @@ mod tests {
         };
         let callee = |installed: Installation| {
             let held = m.service.catalog.resolve(&installed.generation).unwrap();
+            named_runtime_loaded(&held.record.python);
             assert!(held.record.callees.iter().any(|c| c.distribution == "tensord-cpu-memo"), "{:?}", held.record.callees);
         };
         let locked = [&files[..], &["uv.lock"]].concat();
@@ -1058,7 +1076,9 @@ mod tests {
             let document = serde_json::json!({"package": "local/tensord-cpu-caller", "release": "0.1.0", "python_version": "3.12",
                 "files": live_files(&m.objects, "alice", &project, &names), "path": project.to_string_lossy(), "locals": ["deps/cpu_memo"]});
             let installed = sources.install(&m.service, "alice", &write(&m.objects, "alice", document.to_string().as_bytes()).digest, None, "", &|_| ()).unwrap();
-            m.service.catalog.resolve(&installed.generation).unwrap().record.python
+            let python = m.service.catalog.resolve(&installed.generation).unwrap().record.python;
+            named_runtime_loaded(&python);
+            python
         };
         let python = install();
         assert_eq!(run(Command::new(&python).args(["-I", "-c", "import cpu_memo; print(hasattr(cpu_memo, 'EDITED'))"])), "False");
@@ -1132,6 +1152,7 @@ mod tests {
         let manifest = write(&m.objects, "alice", manifest.to_string().as_bytes());
         let installed = sources.install(&m.service, "alice", &manifest.digest, None, "", &|_| ()).unwrap();
         let held = m.service.catalog.resolve(&installed.generation).unwrap();
+        named_runtime_loaded(&held.record.python);
         assert!(held.record.callees.iter().any(|c| c.distribution == "tensord-cpu-memo"), "{:?}", held.record.callees);
         let site = cozy_platform::paths::venv_site_packages(held.record.python.parent().unwrap().parent().unwrap()).unwrap();
         assert!(!fs::symlink_metadata(site.join("cpu_memo/__init__.py")).unwrap().file_type().is_symlink());
@@ -1158,6 +1179,7 @@ mod tests {
         let manifest = write(&m.objects, "alice", manifest.to_string().as_bytes());
         let installed = sources.install(&m.service, "alice", &manifest.digest, None, "", &|_| ()).unwrap();
         let held = m.service.catalog.resolve(&installed.generation).unwrap();
+        named_runtime_loaded(&held.record.python);
         assert!(held.record.callees.iter().any(|c| c.distribution == "tensord-cpu-memo"), "{:?}", held.record.callees);
         let site = cozy_platform::paths::venv_site_packages(held.record.python.parent().unwrap().parent().unwrap()).unwrap();
         for copied in ["cpu_caller/__init__.py", "cpu_memo/__init__.py"] {

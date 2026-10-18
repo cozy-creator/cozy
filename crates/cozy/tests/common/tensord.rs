@@ -193,7 +193,77 @@ pub fn added_on(
     machine.restart(&[key_to_authorize(&add(&machine))]);
     let out = add(&machine);
     assert_eq!(out.code, 0, "{out:?}");
+    dev_runtime(home, name);
     machine
+}
+
+/// A script that answers the commit of the Runtime it runs on.
+const PROVENANCE: &str = "# /// script\n# requires-python = \">=3.12\"\n# dependencies = [\"cozy-runtime\"]\n\
+    # [tool.cozy]\n# accelerator = false\n# ///\nfrom cozy_runtime._build_provenance import COMMIT\n\n\n\
+    def main() -> str:\n    return COMMIT\n";
+
+/// The Runtime wheel the job names (`COZY_TEST_RUNTIME_WHEEL`, with `COZY_TEST_TENSORFS_WHEEL` when
+/// it built one), installed on `name` as a person installs a development Runtime (`cozy machine
+/// update --runtime-wheel`); the Runtime its packages then load must be that build, by the commit
+/// stamped in it (`cozy_runtime._build_provenance.COMMIT`). Without the variable, nothing.
+fn dev_runtime(home: &super::Home, name: &str) {
+    let Some(runtime) = std::env::var_os("COZY_TEST_RUNTIME_WHEEL") else {
+        return;
+    };
+    let want = stamped(Path::new(&runtime));
+    assert!(
+        !want.is_empty() && want != "unknown",
+        "{runtime:?} names no commit (COMMIT = {want:?}): a wheel without provenance proves nothing"
+    );
+    let mut update: Vec<std::ffi::OsString> = vec![
+        "--json".into(),
+        "machine".into(),
+        "update".into(),
+        name.into(),
+    ];
+    update.extend(["--runtime-wheel".into(), runtime.clone()]);
+    if let Some(tensorfs) = std::env::var_os("COZY_TEST_TENSORFS_WHEEL") {
+        update.extend(["--tensorfs-wheel".into(), tensorfs]);
+    }
+    let out = home.cozy(&update);
+    assert!(
+        out.code == 0 && out.stdout.contains("\"run.completed\""),
+        "installing {runtime:?} on {name}: {out:?}"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("provenance.py"), PROVENANCE).unwrap();
+    let probe = super::out(
+        home.command()
+            .current_dir(dir.path())
+            .args(["--json", "run", "provenance.py", "--on", name])
+            .output()
+            .unwrap(),
+    );
+    let loaded = probe
+        .stdout
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .rfind(|e| e["type"] == "run.completed")
+        .and_then(|e| e["run"]["result"]["value"].as_str().map(str::to_owned));
+    assert_eq!(
+        loaded.as_deref(),
+        Some(want.as_str()),
+        "{name} runs another Runtime than {runtime:?}: {probe:?}"
+    );
+}
+
+/// The commit a Runtime wheel was built from: its `_build_provenance.COMMIT`.
+pub fn stamped(wheel: &Path) -> String {
+    const READ: &str = "import re, sys, zipfile\n\
+        text = zipfile.ZipFile(sys.argv[1]).read('cozy_runtime/_build_provenance.py').decode()\n\
+        print(re.search(r'^COMMIT = \"([^\"]*)\"', text, re.M).group(1))\n";
+    let out = Command::new("python3")
+        .args(["-I", "-c", READ])
+        .arg(wheel)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "reading {wheel:?}: {out:?}");
+    String::from_utf8(out.stdout).unwrap().trim().to_owned()
 }
 
 /// The controller key a refused `cozy machine add --json` asks that computer to authorize.

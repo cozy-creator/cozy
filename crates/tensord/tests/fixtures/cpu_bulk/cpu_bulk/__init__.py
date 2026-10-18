@@ -1,5 +1,5 @@
 """One output of `size` bytes, for reads that take their time; a call that takes its time; the
-GPUs a call's process was given."""
+GPUs a call's process was given; the commit of the Runtime a call runs on."""
 from __future__ import annotations
 
 import asyncio
@@ -8,6 +8,7 @@ import time
 
 import msgspec
 
+from cozy_runtime._build_provenance import COMMIT
 from cozy_runtime.author import App, Context, FileAsset, Outputs
 
 app = App()
@@ -71,3 +72,14 @@ def stubborn(ctx: Context, *, payload: Which) -> Seen:
 
 
 app.entrypoint(stubborn)
+
+
+class Built(msgspec.Struct):
+    commit: str
+
+
+async def provenance(ctx: Context, *, payload: Which) -> Built:
+    return Built(COMMIT)
+
+
+app.entrypoint(provenance, accelerator=False)
