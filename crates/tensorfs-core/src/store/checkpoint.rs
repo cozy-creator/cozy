@@ -9,14 +9,14 @@ use super::{fail, Result, Store};
 use crate::format::layout::ALIGN;
 use crate::format::{self, decode, Body, Header, Location, Manifest, ObjectRef, PartBytes, Tensor};
 
-/// A checkpoint in a store: the parsed manifest and header, and where each chunk lives.
+/// A checkpoint in a store: the parsed manifest and header. Opening one reads and parses those
+/// two documents and nothing more; a chunk's file is found when it is read.
 #[derive(Clone, Debug)]
 pub struct Checkpoint {
     store: Store,
     id: ObjectRef,
     manifest: Manifest,
     header: Header,
-    paths: Vec<PathBuf>,
 }
 
 impl Store {
@@ -28,17 +28,11 @@ impl Store {
             Some(header) => Header::from_cbor(&self.read(header)?)?,
             None => Header::default(),
         };
-        let paths = header
-            .chunks
-            .iter()
-            .map(|chunk| self.path(chunk))
-            .collect::<Result<_>>()?;
         Ok(Checkpoint {
             store: self.clone(),
             id: manifest.clone(),
             manifest: parsed,
             header,
-            paths,
         })
     }
 }
@@ -61,9 +55,9 @@ impl Checkpoint {
         &self.store
     }
 
-    /// Chunk `i`'s file, in `Header::chunks` order.
-    pub fn chunk_paths(&self) -> &[PathBuf] {
-        &self.paths
+    /// Chunk `i`'s file (`i` indexes `Header::chunks`).
+    pub fn chunk_path(&self, i: usize) -> PathBuf {
+        self.store.object_path(&self.header.chunks[i].sha256)
     }
 
     /// Every tensor with its component's name, in header (construction) order.
@@ -98,11 +92,10 @@ impl Checkpoint {
         let mut filled = 0;
         for span in self.header.spans(at) {
             let mut file = self.store.file(&self.header.chunks[span.chunk])?;
-            let path = &self.paths[span.chunk];
             let piece = &mut buf[filled..filled + span.length as usize];
             file.seek(SeekFrom::Start(span.start))
                 .and_then(|_| file.read_exact(piece))
-                .map_err(fail("read", path))?;
+                .map_err(|e| fail("read", self.chunk_path(span.chunk))(e))?;
             filled += span.length as usize;
         }
         Ok(())

@@ -289,7 +289,7 @@ fn write_file(
 /// Streams the stored bytes at `at` from their chunk files.
 fn copy(ck: &Checkpoint, at: &Location, out: &mut impl Write) -> Result<()> {
     for span in ck.header().spans(at) {
-        let path = &ck.chunk_paths()[span.chunk];
+        let path = &ck.chunk_path(span.chunk);
         let mut file = ck.store().file(&ck.header().chunks[span.chunk])?;
         file.seek(SeekFrom::Start(span.start))
             .map_err(|e| io(path, e))?;

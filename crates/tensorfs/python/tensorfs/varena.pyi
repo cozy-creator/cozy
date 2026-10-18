@@ -274,8 +274,9 @@ class Plane:
         regions: Sequence[Sequence[str]] | None = None,
         host_fd: int | None = None,
     ) -> WeightSet:
-        """Register `regions` (`tensorfs.regions(ck)` when None) of a stored checkpoint: its
-        header, in order, is the read plan and its chunk files the source."""
+        """Register `regions` (`tensorfs.regions(ck)` when None) of a stored checkpoint: the
+        parts they name, in header order, are the read plan and their chunk files the source. A
+        window's regions register a set as small as the window."""
     def register_sealed(
         self,
         name: str,
