@@ -570,7 +570,7 @@ class Memory:
         with self.lock, _disable_current_modes():
             if block.count == 0:
                 self._bind(block, stream)
-            elif stream != block.stream:
+            elif stream != block.stream and not torch.cuda.is_current_stream_capturing():
                 stream.wait_stream(block.stream)
             block.count += 1
             if record and block.index >= 0:
@@ -581,7 +581,11 @@ class Memory:
     def _exit(self, block: Block) -> None:
         stream = torch.cuda.current_stream(block.model.device)
         with self.lock, _disable_current_modes():
-            if stream != block.stream and block.stream is not None:
+            if (
+                stream != block.stream
+                and block.stream is not None
+                and not torch.cuda.is_current_stream_capturing()
+            ):
                 block.stream.wait_stream(stream)
             block.count -= 1
             if block.count == 0:
@@ -989,7 +993,7 @@ class _Reading:
     def __enter__(self) -> None:
         try:
             for block in self.blocks:
-                self.memory._enter(block)
+                self.memory._enter(block, record=False)
                 self.entered.append(block)
         except BaseException:
             self.__exit__()
