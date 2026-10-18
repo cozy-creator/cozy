@@ -21,6 +21,9 @@ pub struct Tensor {
     pub start: u64,
     /// Bytes; an unknown dtype's are its declared range, read as they are.
     pub len: u64,
+    /// A quantized carrier's tensors folded into one (`carriers`): `dtype` and `shape` are then
+    /// the logical ones, and the location is the data part's.
+    pub encoded: Option<Box<super::carriers::Folded>>,
 }
 
 #[derive(Debug)]
@@ -30,6 +33,8 @@ pub struct Group {
     /// The loose file's name without `.safetensors`, or the index's stem.
     pub stem: String,
     pub tensors: BTreeMap<String, Tensor>,
+    /// The files' safetensors `__metadata__`.
+    pub metadata: BTreeMap<String, String>,
 }
 
 impl Group {
@@ -67,9 +72,9 @@ struct Entry {
     data_offsets: (u64, u64),
 }
 
-/// A safetensors file's tensors, validated against its length: whole-byte sizes that fit
-/// the data section and do not overlap.
-pub fn read_header(path: &Path, file: usize) -> Result<BTreeMap<String, Tensor>> {
+/// A safetensors file's tensors, validated against its length (whole-byte sizes that fit the data
+/// section and do not overlap), and its `__metadata__`.
+pub fn read_header(path: &Path, file: usize) -> Result<Header> {
     let mut f = File::open(path).map_err(|e| io(path, e))?;
     let len_of_file = f.metadata().map_err(|e| io(path, e))?.len();
     let mut prefix = [0u8; 8];
@@ -88,7 +93,14 @@ pub fn read_header(path: &Path, file: usize) -> Result<BTreeMap<String, Tensor>>
             code: Code::MALFORMED_JSON,
             detail: format!("{}: {e}", path.display()),
         })?;
-    doc.remove("__metadata__");
+    // Safetensors metadata is string to string; anything else is not read.
+    let metadata = match doc.remove("__metadata__") {
+        Some(serde_json::Value::Object(m)) => m
+            .into_iter()
+            .filter_map(|(k, v)| Some((k, v.as_str()?.to_owned())))
+            .collect(),
+        _ => BTreeMap::new(),
+    };
     let data = 8 + n;
     let mut out = BTreeMap::new();
     let mut spans = Vec::new();
@@ -123,6 +135,7 @@ pub fn read_header(path: &Path, file: usize) -> Result<BTreeMap<String, Tensor>>
                 file,
                 start: data + begin,
                 len,
+                encoded: None,
             },
         );
     }
@@ -133,8 +146,10 @@ pub fn read_header(path: &Path, file: usize) -> Result<BTreeMap<String, Tensor>>
             format!("{}: {} overlaps {}", path.display(), w[0].2, w[1].2),
         );
     }
-    Ok(out)
+    Ok((out, metadata))
 }
+
+pub type Header = (BTreeMap<String, Tensor>, BTreeMap<String, String>);
 
 fn split(path: &str) -> (&str, &str) {
     path.rsplit_once('/').unwrap_or(("", path))
@@ -172,6 +187,7 @@ impl SourceSet {
                 folder: folder.into(),
                 stem: stem.into(),
                 tensors: BTreeMap::new(),
+                metadata: BTreeMap::new(),
             };
             let mut shards: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
             for (key, shard) in &index.weight_map {
@@ -192,7 +208,7 @@ impl SourceSet {
                 sharded.insert(shard_path.clone());
                 let file = set.files.len();
                 set.files.push(local.to_path_buf());
-                let tensors = read_header(local, file)?;
+                let (tensors, metadata) = read_header(local, file)?;
                 let mut named: Vec<&str> = keys.clone();
                 named.sort();
                 if tensors.keys().map(String::as_str).ne(named.iter().copied()) {
@@ -202,6 +218,7 @@ impl SourceSet {
                     );
                 }
                 group.tensors.extend(tensors);
+                group.metadata.extend(metadata);
             }
             set.groups.push(group);
         }
@@ -211,11 +228,12 @@ impl SourceSet {
                 set.files.push(local.clone());
                 let (folder, name) = split(path);
                 let stem = name.strip_suffix(".safetensors").unwrap_or(name);
-                let tensors = read_header(local, file)?;
+                let (tensors, metadata) = read_header(local, file)?;
                 set.groups.push(Group {
                     folder: folder.into(),
                     stem: stem.into(),
                     tensors,
+                    metadata,
                 });
             } else if !path.contains(".safetensors") {
                 let len = std::fs::metadata(local).map_err(|e| io(local, e))?.len();

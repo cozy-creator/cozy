@@ -1,0 +1,29 @@
+{
+  "architectures": [
+    "Toy"
+  ],
+  "torch_dtype": "bfloat16",
+  "quantization_config": {
+    "quant_method": "compressed-tensors",
+    "format": "mxfp8-quantized",
+    "quantization_status": "compressed",
+    "config_groups": {
+      "group_0": {
+        "targets": [
+          "Linear"
+        ],
+        "weights": {
+          "num_bits": 8,
+          "type": "float",
+          "strategy": "group",
+          "group_size": 32,
+          "scale_dtype": "torch.uint8",
+          "symmetric": true,
+          "dynamic": false
+        },
+        "format": "mxfp8-quantized"
+      }
+    },
+    "ignore": []
+  }
+}

@@ -4,11 +4,13 @@
 //! 2. Download remote members into `<tmp>/import/<id>/`, never the store; resumable, since
 //!    `<id>` is the pinned selection's digest, and locked (`<id>.lock`) while one import uses it.
 //!    Local members are read where they are.
-//! 3. Recognize from safetensors headers alone: a built-in table claims a group when its key
-//!    set is the table's (`engine`). Unclaimed groups are stored as they are.
+//! 3. Fold quantized carriers into encoded tensors, by their producer's declaration
+//!    (`carriers`). Recognize from safetensors headers alone: a built-in table claims a group
+//!    when its key set is the table's (`engine`). Unclaimed groups are stored as they are.
 //! 4. Convert row by row into the [`Sink`], with the configs and tokenizers (the table's
 //!    pinned reference supplies them when the source has none), then delete the tmp area.
 
+pub mod carriers;
 pub mod engine;
 pub mod order;
 pub mod remote;
@@ -20,22 +22,32 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::err::{refuse, Code, Result};
-use crate::format::Dtype;
+use crate::format::{Dtype, Encoding};
 
 pub use engine::{tables, Table};
 pub use order::{constructor_order, Ordered};
 pub use remote::Access;
 
+/// One stored part of an output tensor, `data` yielding exactly its bytes.
+pub struct Part<'a> {
+    /// `""` for a plain tensor's one part.
+    pub role: &'a str,
+    pub dtype: &'a Dtype,
+    pub shape: &'a [u64],
+    pub data: &'a mut dyn Read,
+}
+
 /// Where an import's output goes: the writer, or anything that takes tensors and files.
 pub trait Sink {
-    /// One tensor, `data` yielding exactly its bytes.
+    /// One tensor: plain (no encoding, one part) or encoded (its parts in order).
     fn put(
         &mut self,
         component: &str,
         key: &str,
         dtype: &Dtype,
         shape: &[u64],
-        data: &mut dyn Read,
+        encoding: Option<&Encoding>,
+        parts: Vec<Part>,
     ) -> Result<()>;
     fn file(&mut self, path: &str, bytes: &[u8]) -> Result<()>;
     fn commit(&mut self, imported: &Imported) -> Result<()>;
@@ -195,7 +207,8 @@ pub fn import(req: &Request, sink: &mut dyn Sink) -> Result<Imported> {
             crate::store::classify_io("lock the import area", std::io::Error::other(e.to_string()))
         })?;
     let landed = land(&members, &area.join("source"), req.access, progress)?;
-    let set = source::SourceSet::scan(&landed)?;
+    let mut set = source::SourceSet::scan(&landed)?;
+    carriers::fold(&mut set)?;
 
     let tables = tables();
     let recognized = engine::recognize(&set, tables, req.converter)?;
@@ -233,8 +246,28 @@ pub fn import(req: &Request, sink: &mut dyn Sink) -> Result<Imported> {
     let total = planned.len() as u64;
     for (n, p) in planned.iter().enumerate() {
         progress("converting", n as u64, total);
-        let mut reader = engine::TensorReader::new(&opened[p.read.file], p)?;
-        sink.put(&p.component, &p.key, &p.dtype, &p.shape, &mut reader)?;
+        let what = format!("{}/{}", p.component, p.key);
+        let mut readers = (p.parts.iter())
+            .map(|part| {
+                engine::TensorReader::new(&opened[part.read.file], &part.read, what.clone())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let parts = (p.parts.iter().zip(&mut readers))
+            .map(|(part, reader)| Part {
+                role: &part.role,
+                dtype: &part.dtype,
+                shape: &part.shape,
+                data: reader,
+            })
+            .collect();
+        sink.put(
+            &p.component,
+            &p.key,
+            &p.dtype,
+            &p.shape,
+            p.encoding.as_ref(),
+            parts,
+        )?;
     }
     for (path, bytes) in &files {
         sink.file(path, bytes)?;
