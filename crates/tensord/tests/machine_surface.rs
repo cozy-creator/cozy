@@ -3360,9 +3360,12 @@ print(next(out.glob('tensorfs-*.whl')))
             .unwrap();
             let child = outcome(&child);
             assert_eq!(child.status, "succeeded", "{child:?}");
-            // A call's measurements name the process that executed it.
+            // A call's measurements name the process that executed it: on its GPUs' rows (a
+            // Runtime before 0.28 names them `ranks`, as `run show` reads them).
             let measured: serde_json::Value = json(&child.measurements);
-            assert!(measured["execution"]["ranks"][0]["pid"].as_u64() > Some(0), "{measured}");
+            let execution = &measured["execution"];
+            let pid = execution["gpus"][0]["pid"].as_u64().or(execution["ranks"][0]["pid"].as_u64());
+            assert!(pid > Some(0), "{measured}");
         }
 
         // A canceled job ends its running child with it.
