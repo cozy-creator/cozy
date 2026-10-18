@@ -144,6 +144,23 @@ def interpreter_for(python: str, python_requires: str, python_version: str) -> s
     return python
 
 
+def without(requirements: Path, names: set[str], out: Path) -> Path:
+    """`requirements` (hashed, `\\`-continued) less the requirements naming `names`, at `out`."""
+    kept, entry = [], []
+    for line in requirements.read_text().splitlines():
+        entry.append(line)
+        if line.rstrip().endswith("\\"):
+            continue
+        first = entry[0].strip()
+        name = "".join(itertools.takewhile(lambda c: c.isalnum() or c in "-_.", first))
+        if not (name and not first.startswith(("#", "-")) and canonicalize_name(name) in names):
+            kept.extend(entry)
+        entry = []
+    kept.extend(entry)
+    out.write_text("\n".join(kept) + "\n")
+    return out
+
+
 def add_client(interpreter: Path, constraints: Path, client_wheel: Path, runtime_build: str = "") -> None:
     """The machine client beside a selected closure: it may add its own dependencies only
     without changing one already selected package or SDK version (uv reports any conflict). A
@@ -285,13 +302,17 @@ def install_captured(*, project: Path | None, wheels: list[Path], requirements: 
         else:
             subprocess.run(["uv", "venv", "--python", python, str(root / "env")], check=True)
 
-        def capture():
-            """The capture's own selection. Run again, it restores what the machine's pair replaced."""
+        def capture(machine: set[str] = frozenset()):
+            """The capture's own selection, without the `machine` SDK distributions the machine's pair
+            installs next: the pair is installed once, never the capture's first and then replaced.
+            Run again with none, it restores what the machine's pair replaced."""
+            offered = [str(wheel) for wheel in sdk] if machine else []
             if frozen:
                 # UV_PROJECT_ENVIRONMENT is a standard destination configuration value.
                 environment = {**os.environ, "UV_PROJECT_ENVIRONMENT": str(root / "env")}
                 sync = ["uv", "sync", "--frozen", "--no-dev", "--no-editable", "--no-python-downloads",
-                        "--project", str(source), "--python", python]
+                        "--project", str(source), "--python", python,
+                        *(f"--no-install-package={name}" for name in sorted(machine))]
                 if COPY:
                     # The locked dependencies link; then the project itself, and any App among
                     # them (a callee the lock holds by path), is copied.
@@ -305,21 +326,25 @@ def install_captured(*, project: Path | None, wheels: list[Path], requirements: 
             elif requirements and requirements.stat().st_size:
                 # uv owns hashed requirements parsing and standard download integrity. The locked
                 # dependencies link as the machine says (an image's seeded cache: symlinks).
-                command = ["uv", "pip", "install", "--python", str(interpreter), "--require-hashes", "-r", str(requirements)]
+                # Less the pair it is a whole closure: installed as listed, the pair comes next.
+                listed = without(requirements, machine, root / "requirements.txt") if machine else requirements
+                command = ["uv", "pip", "install", "--python", str(interpreter), "--require-hashes", "-r", str(listed)]
                 if wheels:
                     command += ["--find-links", str(wheels[0].parent)]
-                subprocess.run(command, check=True)
+                subprocess.run([*command, *(["--no-deps"] if machine else [])], check=True)
                 linked = linked_applications(interpreter) if COPY else []
                 if linked:
                     subprocess.run([*command, *COPY, "--no-deps", *(f"--reinstall-package={name}" for name in linked)], check=True)
                 if wheels:
                     subprocess.run(["uv", "pip", "install", *COPY, "--python", str(interpreter), "--no-deps", *map(str,wheels)], check=True)
-            elif project:
-                subprocess.run(["uv", "pip", "install", *COPY, "--python", str(interpreter), str(project), *map(str,wheels)], check=True)
             else:
-                subprocess.run(["uv", "pip", "install", *COPY, "--python", str(interpreter), *map(str,wheels)], check=True)
+                # Unlocked: resolved with the pair's wheels offered where its bounds admit them.
+                install = ["uv", "pip", "install", *COPY, "--python", str(interpreter), *([str(project)] if project else []),
+                           *map(str, wheels)]
+                if not offered or subprocess.run([*install, *offered]).returncode != 0:
+                    subprocess.run(install, check=True)
 
-        capture()
+        capture({canonicalize_name(wheel.name.split("-")[0]) for wheel in sdk})
         fallback = machine_sdk(interpreter, sdk, capture, runtime_build) if sdk else ""
         add_client(interpreter, root / "captured-constraints.txt", client_wheel, runtime_build)
         return publish_generation(root, metadata, None, callees, fallback)
