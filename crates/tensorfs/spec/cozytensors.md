@@ -127,19 +127,39 @@ Element formats used by the schemes:
 | `F8_E4M3` | sign bit 7, exponent bits 3–6 (bias 7), mantissa bits 0–2. `e = 0`: `m × 2^−9`; otherwise `(1 + m/8) × 2^(e−7)`. `S.1111.111` is NaN; no infinities. |
 | `F8_E5M2` | sign bit 7, exponent bits 2–6 (bias 15), mantissa bits 0–1. `e = 0`: `m × 2^−16`; `e = 31`: infinity if `m = 0`, else NaN; otherwise `(1 + m/4) × 2^(e−15)`. |
 | `F4` (E2M1) | sign bit 3; bits 0–2 index `0, 0.5, 1, 1.5, 2, 3, 4, 6`. |
+| `F8_E8M0` | `2^(b−127)` for `b < 255`; `255` is NaN. |
 | `I8` | two's complement. |
 
 ## 6. Encodings
 
-A scheme name and its params fully describe how parts become the logical tensor. Every scheme below is a function of
-the parts and params alone; no decode depends on any value outside the header and its chunks.
+An encoded tensor cites an **encoding**: a scheme name and its params. With this section they fully define how the
+parts become the logical tensor; no decode depends on anything outside the header, its chunks and this spec.
+
+**Names** are `family.variant` in lowercase: the element family (`fp8`, `int8`; later `int4`, …) and the method or scale
+granularity (`rowwise`, `tensorwise`, `convrot`; later `gptq`, `awq`, `block`). A format with an established name keeps
+it: `mxfp8` (OCP Microscaling), `nvfp4` (NVIDIA ModelOpt).
+
+**Params** are complete: every param a scheme defines is written, even where the name implies its value, so the params
+alone tell a reader the decode. Keys and text values are snake_case; dtypes are §5's names, the one dtype vocabulary of
+a header, in parts and params alike.
+
+| Param | Meaning |
+|---|---|
+| `weight_dtype` | The `weight` part's dtype. |
+| `scale` | The `scale` part's granularity: `per_tensor` (one), `per_row` (one per row `i`), `per_block` (one per row and block of `block` columns). |
+| `scale_dtype` | The `scale` part's dtype. |
+| `block` | Columns per block: of a `per_block` scale, or of a rotation group. |
+| `rotation` | The transform applied to each block before quantizing: `hadamard`. |
+| `global_scale`, `global_scale_dtype` | A second, per-tensor scale (the `global_scale` part) and its dtype. |
+
+No scheme here has a zero point.
 
 **Reading and decoding.**
 - A tensor with an unknown scheme still reads: its parts are located and verified like any other. Only decoding
   refuses, and the refusal MUST name the scheme.
 - A decoder MUST refuse a known scheme when a required part is missing, a part not listed for the scheme is present,
-  a param not listed is present, a param or a part's dtype or shape breaks the scheme's rule, or the logical dtype is
-  not `F32`, `BF16` or `F16`.
+  a param the scheme defines is missing or has another value, a part's dtype or shape breaks the scheme's rule, or the
+  logical dtype is not `F32`, `BF16` or `F16`. It MUST ignore params the scheme does not define.
 
 **Arithmetic.** Each formula is evaluated element by element in IEEE-754 binary32 (`f32`): every `×` is one f32
 multiplication rounded to nearest even, applied left to right as written; element formats (§5) convert to f32 exactly.
@@ -147,32 +167,39 @@ The result is then rounded once to the logical dtype `L`, written `round_L`:
 - `F32`: unchanged; `BF16`, `F16`: round to nearest, ties to even, keeping subnormals; `F16` overflows to ±infinity.
 - Any NaN result is written as the canonical quiet NaN: `0x7FC00000` (`F32`), `0x7FC0` (`BF16`), `0x7E00` (`F16`).
 
-`R × C` below is the logical shape `[R, C]`; `i` indexes rows and `j` columns.
+`R × C` below is the logical shape `[R, C]`; `i` indexes rows and `j` columns. `input_scale` (optional where listed,
+`F32`, one element) is the activation scale of a quantized matmul; it never enters a decode.
 
-### `fp8-rowwise`
-
-| | |
-|---|---|
-| Parts | `weight`: `F8_E4M3` or `F8_E5M2`, `[R, C]`. `scale`: `F32`, `shape[axis]` elements (for example `[R]` or `[R, 1]`). |
-| Params | `axis`: `0` (a scale per row) or `1` (a scale per column). Required. |
-| Decode | `value[i, j] = round_L(weight[i, j] × scale[axis = 0 ? i : j])` |
-
-### `fp8-tensorwise`
+### `fp8.rowwise`
 
 | | |
 |---|---|
-| Parts | `weight`: `F8_E4M3` or `F8_E5M2`, the logical shape (any rank). `scale`: `F32`, one element. `input_scale` (optional): `F32`, one element. |
-| Params | none |
+| Params | `scale: per_row`, `scale_dtype: F32`, `weight_dtype: F8_E4M3` or `F8_E5M2`. |
+| Parts | `weight`: `weight_dtype`, `[R, C]`. `scale`: `F32`, `R` elements (`[R]` or `[R, 1]`). |
+| Decode | `value[i, j] = round_L(weight[i, j] × scale[i])` |
+
+### `fp8.tensorwise`
+
+| | |
+|---|---|
+| Params | `scale: per_tensor`, `scale_dtype: F32`, `weight_dtype: F8_E4M3` or `F8_E5M2`. |
+| Parts | `weight`: `weight_dtype`, the logical shape (any rank). `scale`: `F32`, one element. `input_scale` (optional). |
 | Decode | `value = round_L(weight × s)` where `s` is `scale` rounded to `L` and read back as f32 (`s = scale` when `L` is `F32`). |
 
-`input_scale` is the activation scale of an fp8 matmul; it does not enter the decode.
-
-### `int8-convrot`
+### `int8.rowwise`
 
 | | |
 |---|---|
+| Params | `scale: per_row`, `scale_dtype: F32`, `weight_dtype: I8`. |
 | Parts | `weight`: `I8`, `[R, C]`. `scale`: `F32`, `R` elements. |
-| Params | `block`: `B = 4^k`, `1 ≤ k ≤ 8`, with `C` a multiple of `B` (256 in practice). `rotation`: `"hadamard"`. |
+| Decode | `value[i, j] = round_L(weight[i, j] × scale[i])` |
+
+### `int8.convrot`
+
+| | |
+|---|---|
+| Params | `block: B = 4^k`, `1 ≤ k ≤ 8` (256 in practice), with `C` a multiple of `B`. `rotation: hadamard`, `scale: per_row`, `scale_dtype: F32`, `weight_dtype: I8`. |
+| Parts | `weight`: `I8`, `[R, C]`. `scale`: `F32`, `R` elements. |
 | Decode | `value[i, gB + j] = round_L((y[i, g, j] × scale[i]) × 2^−k)`, with `y[i, g, ·] = weight[i, gB : gB + B] · H_B` |
 
 `H_B = H₄ ⊗ … ⊗ H₄` (`k` factors) with entries ±1, where
@@ -188,16 +215,26 @@ H₄ = [[ 1,  1,  1, -1],
 quantizing each row. `y` is an exact integer (|y| ≤ 128·B ≤ 2^23), so its conversion to f32 is exact. One way to
 compute it: view each group of `B` as `k` base-4 digits (most significant first) and apply `H₄` along every digit.
 
+### `mxfp8`
+
+| | |
+|---|---|
+| Params | `block: 32`, `scale: per_block`, `scale_dtype: F8_E8M0`, `weight_dtype: F8_E4M3` or `F8_E5M2`. |
+| Parts | `weight`: `weight_dtype`, `[R, C]`. `scale`: `F8_E8M0`, `[R, ⌈C/32⌉]` (the last block may be short). |
+| Decode | `value[i, j] = round_L(weight[i, j] × scale[i, ⌊j/32⌋])` |
+
+This is the OCP Microscaling MXFP8 format: a power-of-two scale per 32 consecutive elements of a row.
+
 ### `nvfp4`
 
 | | |
 |---|---|
-| Parts | `weight`: `F4`, `[R, C]`. `scale`: `F8_E4M3`, `[R, C/16]`. `scale_2`: `F32`, one element. `input_scale` (optional): `F32`, one element. |
-| Params | `block`: `16`. `C` MUST be a multiple of 16. |
-| Decode | `value[i, j] = round_L((weight[i, j] × scale[i, ⌊j/16⌋]) × scale_2)` |
+| Params | `block: 16`, `global_scale: per_tensor`, `global_scale_dtype: F32`, `scale: per_block`, `scale_dtype: F8_E4M3`, `weight_dtype: F4`. `C` MUST be a multiple of 16. |
+| Parts | `weight`: `F4`, `[R, C]` (two elements per byte, §5). `scale`: `F8_E4M3`, `[R, C/16]`. `global_scale`: `F32`, one element. `input_scale` (optional). |
+| Decode | `value[i, j] = round_L((weight[i, j] × scale[i, ⌊j/16⌋]) × global_scale)` |
 
 This is NVIDIA ModelOpt's NVFP4 layout: ModelOpt's `weight` (`uint8 [R, C/2]`, element 2k in the low nibble),
-`weight_scale` and `weight_scale_2` are `weight`, `scale` and `scale_2` here. `input_scale` is the activation scale.
+`weight_scale` and `weight_scale_2` are `weight`, `scale` and `global_scale` here.
 
 ### Plain tensors
 

@@ -31,6 +31,31 @@ impl Value {
     }
 }
 
+/// Strings bare, lists `[a, b]`, maps `{k: v}`: for reading, not parsing.
+impl fmt::Display for Value {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Value::Bool(b) => write!(f, "{b}"),
+            Value::Int(i) => write!(f, "{i}"),
+            Value::Str(s) => f.write_str(s),
+            Value::List(items) => {
+                f.write_str("[")?;
+                for (i, v) in items.iter().enumerate() {
+                    write!(f, "{}{v}", if i > 0 { ", " } else { "" })?;
+                }
+                f.write_str("]")
+            }
+            Value::Map(map) => {
+                f.write_str("{")?;
+                for (i, (k, v)) in map.iter().enumerate() {
+                    write!(f, "{}{k}: {v}", if i > 0 { ", " } else { "" })?;
+                }
+                f.write_str("}")
+            }
+        }
+    }
+}
+
 impl From<u64> for Value {
     fn from(v: u64) -> Self {
         Value::Int(v.into())

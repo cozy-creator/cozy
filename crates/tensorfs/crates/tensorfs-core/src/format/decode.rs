@@ -1,13 +1,21 @@
-//! The reference CPU decode of every scheme in the spec's registry. Each element is computed in
-//! f32 by the scheme's formula, then rounded once to the logical dtype (round to nearest even;
-//! NaN becomes the canonical quiet NaN). The Runtime's GPU decoders match it bit for bit.
+//! The schemes (spec §6): their complete params for writers, and the reference CPU decode. Each
+//! element is computed in f32 by the scheme's formula, then rounded once to the logical dtype
+//! (round to nearest even; NaN becomes the canonical quiet NaN). The Runtime's GPU decoders
+//! match it bit for bit.
 
 use std::collections::BTreeMap;
 
 use super::{Dtype, Encoding, Error, Result, Value};
 
-/// The schemes this reader decodes. A plain tensor (`data`) needs no scheme.
-pub const SCHEMES: [&str; 4] = ["fp8-rowwise", "fp8-tensorwise", "int8-convrot", "nvfp4"];
+/// The schemes this reader decodes. A plain tensor needs no scheme.
+pub const SCHEMES: [&str; 6] = [
+    "fp8.rowwise",
+    "fp8.tensorwise",
+    "int8.rowwise",
+    "int8.convrot",
+    "mxfp8",
+    "nvfp4",
+];
 
 /// One part's stored bytes, as the header declares them.
 #[derive(Debug, Clone, Copy)]
@@ -15,6 +23,78 @@ pub struct PartBytes<'a> {
     pub dtype: &'a Dtype,
     pub shape: &'a [u64],
     pub bytes: &'a [u8],
+}
+
+fn encoding(scheme: &str, params: &[(&str, Value)]) -> Encoding {
+    Encoding {
+        scheme: scheme.into(),
+        params: params.iter().map(|(k, v)| (k.to_string(), v.clone())).collect(),
+    }
+}
+
+/// Each scheme with its complete params: a reader needs nothing but these and the spec.
+impl Encoding {
+    /// An fp8 weight `[R, C]`, one F32 scale per row.
+    pub fn fp8_rowwise(weight: &Dtype) -> Encoding {
+        let p = [("scale", "per_row".into()), ("scale_dtype", "F32".into())];
+        encoding("fp8.rowwise", &[&p[..], &[("weight_dtype", weight.name().into())]].concat())
+    }
+    /// An fp8 weight of any shape, one F32 scale.
+    pub fn fp8_tensorwise(weight: &Dtype) -> Encoding {
+        let p = [("scale", "per_tensor".into()), ("scale_dtype", "F32".into())];
+        encoding("fp8.tensorwise", &[&p[..], &[("weight_dtype", weight.name().into())]].concat())
+    }
+    /// An I8 weight `[R, C]`, one F32 scale per row.
+    pub fn int8_rowwise() -> Encoding {
+        encoding(
+            "int8.rowwise",
+            &[
+                ("scale", "per_row".into()),
+                ("scale_dtype", "F32".into()),
+                ("weight_dtype", "I8".into()),
+            ],
+        )
+    }
+    /// An I8 weight `[R, C]` Hadamard-rotated in groups of `block` columns, one F32 scale per row.
+    pub fn int8_convrot(block: u64) -> Encoding {
+        encoding(
+            "int8.convrot",
+            &[
+                ("block", block.into()),
+                ("rotation", "hadamard".into()),
+                ("scale", "per_row".into()),
+                ("scale_dtype", "F32".into()),
+                ("weight_dtype", "I8".into()),
+            ],
+        )
+    }
+    /// OCP MX: an fp8 weight `[R, C]`, one E8M0 scale per row and block of 32 columns.
+    pub fn mxfp8(weight: &Dtype) -> Encoding {
+        encoding(
+            "mxfp8",
+            &[
+                ("block", 32u64.into()),
+                ("scale", "per_block".into()),
+                ("scale_dtype", "F8_E8M0".into()),
+                ("weight_dtype", weight.name().into()),
+            ],
+        )
+    }
+    /// NVIDIA NVFP4: an F4 weight `[R, C]`, one E4M3 scale per row and block of 16 columns, and
+    /// one F32 global scale.
+    pub fn nvfp4() -> Encoding {
+        encoding(
+            "nvfp4",
+            &[
+                ("block", 16u64.into()),
+                ("global_scale", "per_tensor".into()),
+                ("global_scale_dtype", "F32".into()),
+                ("scale", "per_block".into()),
+                ("scale_dtype", "F8_E4M3".into()),
+                ("weight_dtype", "F4".into()),
+            ],
+        )
+    }
 }
 
 /// The logical tensor's bytes from its encoded parts.
@@ -26,15 +106,10 @@ pub fn decode(
 ) -> Result<Vec<u8>> {
     use Dtype::*;
     let scheme = encoding.scheme.as_str();
-    let (required, optional, params): (&[&str], &[&str], &[&str]) = match scheme {
-        "fp8-rowwise" => (&["scale", "weight"], &[], &["axis"]),
-        "fp8-tensorwise" => (&["scale", "weight"], &["input_scale"], &[]),
-        "int8-convrot" => (&["scale", "weight"], &[], &["block", "rotation"]),
-        "nvfp4" => (
-            &["scale", "scale_2", "weight"],
-            &["input_scale"],
-            &["block"],
-        ),
+    let (required, optional): (&[&str], &[&str]) = match scheme {
+        "fp8.rowwise" | "int8.rowwise" | "int8.convrot" | "mxfp8" => (&["scale", "weight"], &[]),
+        "fp8.tensorwise" => (&["scale", "weight"], &["input_scale"]),
+        "nvfp4" => (&["global_scale", "scale", "weight"], &["input_scale"]),
         other => return Err(Error::UnknownScheme(other.into())),
     };
     let fail = |detail: String| Error::Decode(format!("{scheme}: {detail}"));
@@ -46,13 +121,26 @@ pub fn decode(
     if let Some(role) = required.iter().find(|r| !parts.contains_key(*r)) {
         return Err(fail(format!("missing part {role:?}")));
     }
-    if let Some(name) = encoding
-        .params
-        .keys()
-        .find(|k| !params.contains(&k.as_str()))
-    {
-        return Err(fail(format!("unknown param {name:?}")));
-    }
+    // Params a scheme defines must be present and right; others are ignored.
+    let param = |key: &str| encoding.params.get(key);
+    let text = |key: &str, allowed: &[&str]| match param(key).and_then(Value::as_str) {
+        Some(v) if allowed.contains(&v) => Ok(v),
+        _ => Err(fail(format!("param {key} is not one of {allowed:?}"))),
+    };
+    let fp8 = ["F8_E4M3", "F8_E5M2"];
+    let weight = match scheme {
+        "fp8.rowwise" | "fp8.tensorwise" | "mxfp8" => text("weight_dtype", &fp8)?,
+        "nvfp4" => text("weight_dtype", &["F4"])?,
+        _ => text("weight_dtype", &["I8"])?,
+    };
+    let (granularity, scale_dtype) = match scheme {
+        "fp8.tensorwise" => ("per_tensor", "F32"),
+        "mxfp8" => ("per_block", "F8_E8M0"),
+        "nvfp4" => ("per_block", "F8_E4M3"),
+        _ => ("per_row", "F32"),
+    };
+    text("scale", &[granularity])?;
+    text("scale_dtype", &[scale_dtype])?;
     if !matches!(dtype, F32 | BF16 | F16) {
         return Err(fail(format!(
             "logical dtype {dtype} is not F32, BF16 or F16"
@@ -61,16 +149,13 @@ pub fn decode(
     let numel = shape.iter().try_fold(1u64, |a, b| a.checked_mul(*b));
     let (rows, cols) = match (shape, numel) {
         ([r, c], Some(_)) => (*r as usize, *c as usize),
-        (_, Some(n)) if scheme == "fp8-tensorwise" => (1, n as usize),
+        (_, Some(n)) if scheme == "fp8.tensorwise" => (1, n as usize),
         _ => return Err(fail(format!("logical shape {shape:?} is not rank 2"))),
     };
-    let part = |role: &str, dtypes: &[Dtype], want: Option<&[u64]>, count: u64| {
+    let part = |role: &str, dtype: &str, want: Option<&[u64]>, count: u64| {
         let p = parts[role];
-        if !dtypes.contains(p.dtype) {
-            return Err(fail(format!(
-                "part {role} is {}, not one of {dtypes:?}",
-                p.dtype
-            )));
+        if p.dtype.name() != dtype {
+            return Err(fail(format!("part {role} is {}, not {dtype}", p.dtype)));
         }
         let ok = p.dtype.byte_len(p.shape) == Some(p.bytes.len() as u64)
             && match want {
@@ -82,77 +167,71 @@ pub fn decode(
         }
         Ok(p)
     };
-    let fp8 = [F8_E4M3, F8_E5M2];
+    // `whole`: the columns are whole blocks.
+    let block = |allowed: &[u64], whole: bool| match param("block").and_then(Value::as_u64) {
+        Some(b) if allowed.contains(&b) && (!whole || cols % b as usize == 0) => Ok(b as usize),
+        _ => Err(fail(format!(
+            "param block is not one of {allowed:?}, or {cols} columns are not whole blocks"
+        ))),
+    };
+    let w = part("weight", weight, Some(shape), 0)?;
     let out: Vec<f32> = match scheme {
-        "fp8-rowwise" => {
-            let axis = uint(&encoding.params, "axis")
-                .filter(|a| *a < 2)
-                .ok_or_else(|| fail("axis is not 0 or 1".into()))?;
-            let w = floats(part("weight", &fp8, Some(shape), 0)?);
-            let s = floats(part("scale", &[F32], None, shape[axis as usize])?);
-            let at = |i: usize| if axis == 0 { i / cols } else { i % cols };
-            w.iter().enumerate().map(|(i, v)| v * s[at(i)]).collect()
+        "fp8.rowwise" | "int8.rowwise" => {
+            let s = floats(part("scale", "F32", None, rows as u64)?);
+            let w = floats(w);
+            w.iter().enumerate().map(|(i, v)| v * s[i / cols]).collect()
         }
-        "fp8-tensorwise" => {
-            let w = floats(part("weight", &fp8, Some(shape), 0)?);
-            let s = narrow(dtype, floats(part("scale", &[F32], None, 1)?)[0]);
+        "fp8.tensorwise" => {
+            let s = narrow(dtype, floats(part("scale", "F32", None, 1)?)[0]);
             if parts.contains_key("input_scale") {
-                part("input_scale", &[F32], None, 1)?;
+                part("input_scale", "F32", None, 1)?;
             }
-            w.iter().map(|v| v * s).collect()
+            floats(w).iter().map(|v| v * s).collect()
         }
-        "int8-convrot" => {
-            let block = uint(&encoding.params, "block").unwrap_or(0);
-            let k = (1..=8)
-                .find(|k| 4u64.pow(*k) == block)
-                .ok_or_else(|| fail(format!("block {block} is not a power of 4")))?;
-            if encoding.params.get("rotation").and_then(Value::as_str) != Some("hadamard") {
-                return Err(fail("rotation is not \"hadamard\"".into()));
-            }
-            if cols % block as usize != 0 {
-                return Err(fail(format!(
-                    "{cols} columns are not whole blocks of {block}"
-                )));
-            }
-            let w = part("weight", &[I8], Some(shape), 0)?.bytes;
-            let s = floats(part("scale", &[F32], None, rows as u64)?);
+        "int8.convrot" => {
+            let block = block(&[4, 16, 64, 256, 1024, 4096, 16384, 65536], true)?;
+            text("rotation", &["hadamard"])?;
+            let k = block.trailing_zeros() / 2;
+            let s = floats(part("scale", "F32", None, rows as u64)?);
             let unit = pow2(-(k as i32));
             let mut out = Vec::with_capacity(rows * cols);
-            for (g, group) in w.chunks(block as usize).enumerate() {
-                let row = g * block as usize / cols;
+            for (g, group) in w.bytes.chunks(block).enumerate() {
+                let row = g * block / cols;
                 let mut h: Vec<i32> = group.iter().map(|b| *b as i8 as i32).collect();
                 hadamard(&mut h);
                 out.extend(h.iter().map(|v| *v as f32 * s[row] * unit));
             }
             out
         }
-        "nvfp4" => {
-            if uint(&encoding.params, "block") != Some(16) || cols % 16 != 0 {
-                return Err(fail(format!("block must be 16 and divide {cols} columns")));
-            }
-            let w = floats(part("weight", &[F4], Some(shape), 0)?);
-            let s = floats(part(
-                "scale",
-                &[F8_E4M3],
-                Some(&[rows as u64, cols as u64 / 16]),
-                0,
-            )?);
-            let s2 = floats(part("scale_2", &[F32], None, 1)?)[0];
-            if parts.contains_key("input_scale") {
-                part("input_scale", &[F32], None, 1)?;
-            }
+        "mxfp8" => {
+            block(&[32], false)?;
+            let blocks = cols.div_ceil(32);
+            let s = floats(part("scale", "F8_E8M0", Some(&[rows as u64, blocks as u64]), 0)?);
+            let w = floats(w);
             w.iter()
                 .enumerate()
-                .map(|(i, v)| v * s[i / 16] * s2)
+                .map(|(i, v)| v * s[i / cols * blocks + i % cols / 32])
+                .collect()
+        }
+        "nvfp4" => {
+            block(&[16], true)?;
+            text("global_scale", &["per_tensor"])?;
+            text("global_scale_dtype", &["F32"])?;
+            let shape = [rows as u64, cols as u64 / 16];
+            let s = floats(part("scale", "F8_E4M3", Some(&shape), 0)?);
+            let g = floats(part("global_scale", "F32", None, 1)?)[0];
+            if parts.contains_key("input_scale") {
+                part("input_scale", "F32", None, 1)?;
+            }
+            let w = floats(w);
+            w.iter()
+                .enumerate()
+                .map(|(i, v)| v * s[i / 16] * g)
                 .collect()
         }
         _ => unreachable!("matched above"),
     };
     Ok(round(dtype, &out))
-}
-
-fn uint(params: &BTreeMap<String, Value>, name: &str) -> Option<u64> {
-    params.get(name)?.as_u64()
 }
 
 /// Element values of a part, as f32.
@@ -165,7 +244,14 @@ fn floats(p: PartBytes) -> Vec<f32> {
             .iter()
             .map(|c| f32::from_le_bytes(*c))
             .collect(),
+        Dtype::I8 => b.iter().map(|v| *v as i8 as f32).collect(),
         Dtype::F8_E4M3 => b.iter().map(|v| e4m3(*v)).collect(),
+        Dtype::F8_E8M0 => (b.iter())
+            .map(|v| match v {
+                255 => f32::NAN,
+                _ => pow2(*v as i32 - 127),
+            })
+            .collect(),
         Dtype::F8_E5M2 => b.iter().map(|v| e5m2(*v)).collect(),
         Dtype::F4 => b
             .iter()

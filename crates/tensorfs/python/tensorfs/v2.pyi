@@ -78,10 +78,13 @@ class Part:
     def length(self) -> int: ...
 
 class Encoding:
+    """A scheme and its complete params; str() is `scheme {key: value, ...}`."""
+
     @property
     def scheme(self) -> str: ...
     @property
     def params(self) -> dict[str, Any]: ...
+    def __str__(self) -> str: ...
 
 class Info:
     """A tensor's logical dtype and shape, its encoding (None when plain), its parts."""

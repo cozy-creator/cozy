@@ -132,16 +132,39 @@ fn a_synthetic_checkpoint_exports_pulls_and_verifies() {
     assert_eq!(inspected["manifest"], written["manifest"]);
     let unet = &inspected["components"][0];
     assert_eq!(unet["name"], "unet");
-    let schemes: std::collections::BTreeSet<&str> = unet["tensors"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter_map(|t| t["encoding"]["scheme"].as_str())
-        .collect();
-    assert_eq!(
-        schemes.into_iter().collect::<Vec<_>>(),
-        ["fp8-rowwise", "int8-convrot", "nvfp4"]
-    );
+    // One tensor of each scheme: its encoding, complete, at a glance.
+    let first = |scheme: &str| {
+        let tensors = unet["tensors"].as_array().unwrap();
+        let t = tensors.iter().find(|t| {
+            (t["encoding"].as_str()).is_some_and(|e| e.split(' ').next() == Some(scheme))
+        });
+        t.unwrap().clone()
+    };
+    let k = |s: &str| format!("down_blocks.0.{s}");
+    let want = [
+        ("fp8.rowwise", k("attn1.to_q.weight"), [1024, 1024], "{scale: per_row, scale_dtype: F32, weight_dtype: F8_E4M3}"),
+        ("fp8.tensorwise", k("attn1.to_v.weight"), [1024, 1024], "{scale: per_tensor, scale_dtype: F32, weight_dtype: F8_E4M3}"),
+        ("int8.rowwise", k("attn2.to_k.weight"), [1024, 1024], "{scale: per_row, scale_dtype: F32, weight_dtype: I8}"),
+        ("int8.convrot", k("attn1.to_k.weight"), [1024, 1024], "{block: 256, rotation: hadamard, scale: per_row, scale_dtype: F32, weight_dtype: I8}"),
+        ("mxfp8", k("attn2.to_q.weight"), [1024, 1024], "{block: 32, scale: per_block, scale_dtype: F8_E8M0, weight_dtype: F8_E4M3}"),
+        ("nvfp4", k("ff.net.0.proj.weight"), [1024, 4096], "{block: 16, global_scale: per_tensor, global_scale_dtype: F32, scale: per_block, scale_dtype: F8_E4M3, weight_dtype: F4}"),
+    ];
+    for (scheme, key, shape, params) in &want {
+        let encoding = format!("{scheme} {params}");
+        let doc = serde_json::json!({"key": key, "dtype": "BF16", "shape": shape, "encoding": encoding});
+        assert_eq!(first(scheme), doc);
+    }
+    let out = Command::new(env!("CARGO_BIN_EXE_tfs"))
+        .arg("--store")
+        .arg(&a)
+        .args(["inspect", "acme/syn"])
+        .output()
+        .unwrap();
+    let human = String::from_utf8(out.stdout).unwrap();
+    for (scheme, _, _, params) in &want {
+        assert!(human.contains(&format!("    2 × {scheme} {params}\n")), "{human}");
+    }
+    assert!(human.contains("    6 × plain\n"), "{human}");
 
     let store = Store::open(&a).unwrap();
     let manifest = serde_json::from_value(written["manifest"].clone()).unwrap();

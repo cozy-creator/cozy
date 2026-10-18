@@ -224,6 +224,13 @@ pub struct Encoding {
     pub params: Metadata,
 }
 
+/// `int8.convrot {block: 256, rotation: hadamard, scale: per_row, ...}`: params in key order.
+impl std::fmt::Display for Encoding {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{} {}", self.scheme, Value::Map(self.params.clone()))
+    }
+}
+
 /// One chunk's share of a [`Location`]: bytes `start..start + length` of `chunk`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Span {

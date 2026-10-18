@@ -7,7 +7,7 @@
 use std::io::Read;
 
 use tensorfs_core::failure::Result;
-use tensorfs_core::format::{Dtype, Encoding, Metadata, ObjectRef, Value};
+use tensorfs_core::format::{Dtype, Encoding, ObjectRef};
 use tensorfs_core::store2::Store;
 use tensorfs_core::writer::{Data, PartData, Source};
 
@@ -76,7 +76,10 @@ fn scales(seed: &str, n: u64) -> Vec<u8> {
 enum Scheme {
     Plain,
     Fp8Rowwise,
+    Fp8Tensorwise,
+    Int8Rowwise,
     Int8Convrot,
+    Mxfp8,
     Nvfp4,
 }
 
@@ -124,10 +127,31 @@ fn plan(blocks: u64, scale: u64, plain: bool) -> Vec<Item> {
         ));
         v.push(item(
             "unet",
+            k("attn1.to_v.weight"),
+            Dtype::BF16,
+            square.clone(),
+            Scheme::Fp8Tensorwise,
+        ));
+        v.push(item(
+            "unet",
             k("attn1.to_out.0.weight"),
             Dtype::BF16,
-            square,
+            square.clone(),
             Scheme::Plain,
+        ));
+        v.push(item(
+            "unet",
+            k("attn2.to_q.weight"),
+            Dtype::BF16,
+            square.clone(),
+            Scheme::Mxfp8,
+        ));
+        v.push(item(
+            "unet",
+            k("attn2.to_k.weight"),
+            Dtype::BF16,
+            square,
+            Scheme::Int8Rowwise,
         ));
         v.push(item(
             "unet",
@@ -207,7 +231,7 @@ pub fn ckpt(store: &Store, blocks: u64, scale: u64, plain: bool, files: bool) ->
         let part = |role: &str, dtype: Dtype, shape: Vec<u64>, bytes: Vec<u8>| {
             (role.to_owned(), dtype, shape, bytes)
         };
-        let (scheme, params, parts): (&str, Vec<(&str, Value)>, Vec<_>) = match it.scheme {
+        let (encoding, parts): (Encoding, Vec<_>) = match it.scheme {
             Scheme::Plain => {
                 let len = it
                     .dtype
@@ -223,9 +247,11 @@ pub fn ckpt(store: &Store, blocks: u64, scale: u64, plain: bool, files: bool) ->
                 )?;
                 continue;
             }
-            Scheme::Fp8Rowwise => (
-                "fp8-rowwise",
-                vec![("axis", 0u64.into())],
+            Scheme::Fp8Rowwise | Scheme::Fp8Tensorwise => (
+                match it.scheme {
+                    Scheme::Fp8Rowwise => Encoding::fp8_rowwise(&Dtype::F8_E4M3),
+                    _ => Encoding::fp8_tensorwise(&Dtype::F8_E4M3),
+                },
                 vec![
                     part(
                         "weight",
@@ -233,17 +259,33 @@ pub fn ckpt(store: &Store, blocks: u64, scale: u64, plain: bool, files: bool) ->
                         it.shape.clone(),
                         fp8(&seed("weight"), numel),
                     ),
+                    match it.scheme {
+                        Scheme::Fp8Rowwise => {
+                            part("scale", Dtype::F32, vec![rows], scales(&seed("scale"), rows))
+                        }
+                        _ => part("scale", Dtype::F32, vec![], scales(&seed("scale"), 1)),
+                    },
+                ],
+            ),
+            Scheme::Mxfp8 => (
+                Encoding::mxfp8(&Dtype::F8_E4M3),
+                vec![
+                    part("weight", Dtype::F8_E4M3, it.shape.clone(), fp8(&seed("weight"), numel)),
                     part(
                         "scale",
-                        Dtype::F32,
-                        vec![rows],
-                        scales(&seed("scale"), rows),
+                        Dtype::F8_E8M0,
+                        vec![rows, cols.div_ceil(32)],
+                        (Noise::bytes(&seed("scale"), rows * cols.div_ceil(32)).iter())
+                            .map(|b| 120 + b % 8)
+                            .collect(),
                     ),
                 ],
             ),
-            Scheme::Int8Convrot => (
-                "int8-convrot",
-                vec![("block", 256u64.into()), ("rotation", "hadamard".into())],
+            Scheme::Int8Rowwise | Scheme::Int8Convrot => (
+                match it.scheme {
+                    Scheme::Int8Rowwise => Encoding::int8_rowwise(),
+                    _ => Encoding::int8_convrot(256),
+                },
                 vec![
                     part(
                         "weight",
@@ -260,8 +302,7 @@ pub fn ckpt(store: &Store, blocks: u64, scale: u64, plain: bool, files: bool) ->
                 ],
             ),
             Scheme::Nvfp4 => (
-                "nvfp4",
-                vec![("block", 16u64.into())],
+                Encoding::nvfp4(),
                 vec![
                     part(
                         "weight",
@@ -275,16 +316,9 @@ pub fn ckpt(store: &Store, blocks: u64, scale: u64, plain: bool, files: bool) ->
                         vec![rows, cols / 16],
                         fp8(&seed("scale"), numel / 16),
                     ),
-                    part("scale_2", Dtype::F32, vec![], scales(&seed("scale_2"), 1)),
+                    part("global_scale", Dtype::F32, vec![], scales(&seed("global_scale"), 1)),
                 ],
             ),
-        };
-        let encoding = Encoding {
-            scheme: scheme.into(),
-            params: params
-                .into_iter()
-                .map(|(k, v)| (k.to_owned(), v))
-                .collect::<Metadata>(),
         };
         let mut data: Vec<(String, Dtype, Vec<u64>, &[u8])> = parts
             .iter()

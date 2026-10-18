@@ -421,11 +421,26 @@ pub struct PyPart {
     length: u64,
 }
 
-/// A scheme from the spec's registry and its params.
+/// A scheme and its complete params; `str()` is `scheme {key: value, ...}`.
 #[pyclass(name = "Encoding", module = "tensorfs.v2", frozen, get_all)]
 pub struct PyEncoding {
     scheme: String,
     params: Py<PyDict>,
+}
+
+#[pymethods]
+impl PyEncoding {
+    fn __str__(&self, py: Python<'_>) -> PyResult<String> {
+        let params = match from_py(self.params.bind(py).as_any())? {
+            Value::Map(map) => map,
+            _ => unreachable!("a dict converts to a map"),
+        };
+        let e = Encoding { scheme: self.scheme.clone(), params };
+        Ok(e.to_string())
+    }
+    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+        Ok(format!("Encoding({})", self.__str__(py)?))
+    }
 }
 
 /// A tensor's logical dtype and shape, its encoding (`None` when plain) and its stored parts.

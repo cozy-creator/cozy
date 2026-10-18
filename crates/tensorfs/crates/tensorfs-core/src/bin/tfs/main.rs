@@ -514,14 +514,24 @@ fn inspect(store: &Store, reference: &str, lane: Option<&str>) -> Done {
     for c in header.components() {
         let mut tensors = Vec::new();
         let mut bytes = 0;
+        // Each distinct encoding (`plain` for none) and its tensor count, in order of first use.
+        let mut encodings: Vec<(String, usize)> = Vec::new();
         for t in &c.tensors {
             let mut doc = json!({"key": t.key, "dtype": t.dtype.name(), "shape": t.shape});
-            match &t.body {
-                Body::Data(at) => bytes += at.length,
+            let shown = match &t.body {
+                Body::Data(at) => {
+                    bytes += at.length;
+                    "plain".to_string()
+                }
                 Body::Encoded { encoding, parts } => {
                     bytes += parts.iter().map(|p| p.length).sum::<u64>();
-                    doc["encoding"] = json!({"scheme": encoding.scheme, "params": encoding.params});
+                    doc["encoding"] = encoding.to_string().into();
+                    encoding.to_string()
                 }
+            };
+            match encodings.iter_mut().find(|(e, _)| *e == shown) {
+                Some((_, n)) => *n += 1,
+                None => encodings.push((shown, 1)),
             }
             tensors.push(doc);
         }
@@ -530,6 +540,7 @@ fn inspect(store: &Store, reference: &str, lane: Option<&str>) -> Done {
             c.name,
             c.tensors.len()
         ));
+        human.extend(encodings.iter().map(|(e, n)| format!("    {n} × {e}")));
         components.push(json!({"name": c.name, "bytes": bytes, "tensors": tensors}));
     }
     let chunk_bytes: u64 = header.chunks.iter().map(|c| c.length).sum();

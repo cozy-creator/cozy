@@ -657,16 +657,14 @@ fn digest(p: &v1::Part, b: &[u8]) -> String {
     }
 }
 
-fn encoding(scheme: &str) -> Encoding {
-    let params: Vec<(&str, Value)> = match scheme {
-        "fp8-rowwise" => vec![("axis", 0u64.into())],
-        "int8-convrot" => vec![("block", 256u64.into()), ("rotation", "hadamard".into())],
-        "nvfp4" => vec![("block", 16u64.into())],
-        _ => vec![],
-    };
-    Encoding {
-        scheme: scheme.into(),
-        params: params.into_iter().map(|(k, v)| (k.to_owned(), v)).collect(),
+/// The scheme's complete encoding; `weight` is the weight part's dtype.
+fn encoding(scheme: &str, weight: &Dtype) -> Encoding {
+    match scheme {
+        "fp8.rowwise" => Encoding::fp8_rowwise(weight),
+        "fp8.tensorwise" => Encoding::fp8_tensorwise(weight),
+        "int8.convrot" => Encoding::int8_convrot(256),
+        "nvfp4" => Encoding::nvfp4(),
+        other => unreachable!("v1 maps to no {other}"),
     }
 }
 
@@ -719,7 +717,7 @@ fn conforms(
     }
     let (rows, cols) = match t.shape[..] {
         [r, c] => (r, c),
-        _ if scheme == "fp8-tensorwise" => (1, numel(&t.shape)),
+        _ if scheme == "fp8.tensorwise" => (1, numel(&t.shape)),
         _ => return Err(format!("logical shape {:?} is not rank 2", t.shape)),
     };
     let want = |role: &str, dtypes: &[Dtype], ok: &dyn Fn(&[u64]) -> bool| match parts
@@ -736,23 +734,23 @@ fn conforms(
     };
     let (fp8, logical) = ([F8_E4M3, F8_E5M2], t.shape.as_slice());
     match scheme {
-        "fp8-rowwise" => {
+        "fp8.rowwise" => {
             want("weight", &fp8, &|s| s == logical)?;
             want("scale", &[F32], &|s| numel(s) == rows)
         }
-        "fp8-tensorwise" => {
+        "fp8.tensorwise" => {
             want("weight", &fp8, &|s| s == logical)?;
             want("scale", &[F32], &|s| numel(s) == 1)?;
             optional("input_scale")
         }
-        "int8-convrot" if cols % 256 == 0 => {
+        "int8.convrot" if cols % 256 == 0 => {
             want("weight", &[I8], &|s| s == logical)?;
             want("scale", &[F32], &|s| numel(s) == rows)
         }
         "nvfp4" if cols % 16 == 0 => {
             want("weight", &[F4], &|s| s == [rows, cols])?;
             want("scale", &[F8_E4M3], &|s| s == [rows, cols / 16])?;
-            want("scale_2", &[F32], &|s| numel(s) == 1)?;
+            want("global_scale", &[F32], &|s| numel(s) == 1)?;
             optional("input_scale")
         }
         _ => Err(format!("{cols} columns do not fit {scheme}")),
@@ -799,7 +797,7 @@ fn put(
     }
     let data = match mapping {
         Mapping::Scheme(scheme, _) => Data::Encoded {
-            encoding: encoding(scheme),
+            encoding: encoding(scheme, &parts.iter().find(|p| p.role == "weight").expect("conforms() checked the weight").dtype),
             parts,
         },
         _ => Data::Plain(parts.pop().expect("a plain tensor has one part").data),
@@ -927,7 +925,9 @@ fn verify(
             let stored: Vec<(&str, &Dtype, &[u64], Location)> = match (&t2.body, mapping) {
                 (Body::Data(at), Mapping::Plain) => vec![("", &t2.dtype, &t2.shape, *at)],
                 (Body::Encoded { encoding: e, parts }, Mapping::Scheme(s, _))
-                    if *e == encoding(s) && parts.len() == t.parts.len() =>
+                    if parts.len() == t.parts.len()
+                        && (parts.iter().find(|p| p.role == "weight"))
+                            .is_some_and(|w| *e == encoding(s, &w.dtype)) =>
                 {
                     (parts.iter())
                         .map(|p| (p.role.as_str(), &p.dtype, p.shape.as_slice(), p.at()))

@@ -168,12 +168,14 @@ def main() -> None:
     w = store.writer(base=m)
     w.put("extra", "x.weight", "F32", [2, 2], np.arange(4, dtype=np.float32))
     parts = {"weight": ("F8_E4M3", [2, 16], bytes([0x38]) * 32), "scale": ("F32", [2], np.array([0.5, 2.0], dtype=np.float32))}
-    w.put_encoded("extra", "q.weight", "F32", [2, 16], "fp8-rowwise", parts, {"axis": 0})
+    params = {"scale": "per_row", "scale_dtype": "F32", "weight_dtype": "F8_E4M3"}
+    w.put_encoded("extra", "q.weight", "F32", [2, 16], "fp8.rowwise", parts, params)
     m3 = w.commit()
     ck3 = store.checkpoint(m3)
     assert ck3.tensors["unet"].keys() == ck.tensors["unet"].keys(), "the base carries over"
     q = ck3.tensors["extra"]["q.weight"]
-    assert q.encoding is not None and q.encoding.scheme == "fp8-rowwise" and set(q.parts) == {"weight", "scale"}
+    assert q.encoding is not None and q.encoding.scheme == "fp8.rowwise" and set(q.parts) == {"weight", "scale"}
+    assert str(q.encoding) == "fp8.rowwise {scale: per_row, scale_dtype: F32, weight_dtype: F8_E4M3}", q.encoding
     assert torch.equal(torch.from_dlpack(ck3.read("extra", "q.weight")), torch.tensor([[0.5] * 16, [2.0] * 16]))
     try:
         store.checkpoint("local/nothing")

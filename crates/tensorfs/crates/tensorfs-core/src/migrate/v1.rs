@@ -110,7 +110,7 @@ const TENSORWISE: &[(&str, &str)] = &[
 const NVFP4: &[(&str, &str)] = &[
     ("weight", "weight"),
     ("weight_scale", "scale"),
-    ("weight_scale_2", "scale_2"),
+    ("weight_scale_2", "global_scale"),
     ("input_scale", "input_scale"),
 ];
 
@@ -124,27 +124,27 @@ static REGISTRY: [(&str, &str, Mapping); 11] = [
     (
         "c4be0120fb4548306b134f6ee07eb2545a363bc140a005af1ef6543c790cf890",
         "fp8-rowwise/1",
-        Mapping::Scheme("fp8-rowwise", ROWWISE),
+        Mapping::Scheme("fp8.rowwise", ROWWISE),
     ),
     (
         "6773dfe384aeb380d8d32de9f0b384a59a3294a96da4f3f1c8b956e194e3ff2e",
         "fp8-rowwise/1 [out,1]",
-        Mapping::Scheme("fp8-rowwise", ROWWISE),
+        Mapping::Scheme("fp8.rowwise", ROWWISE),
     ),
     (
         "762e1d49dd11df1d9e99893213f232cf72797bf879aa6f07bc138ec86c04bac3",
         "fp8-scaled-scalar/1",
-        Mapping::Scheme("fp8-tensorwise", TENSORWISE),
+        Mapping::Scheme("fp8.tensorwise", TENSORWISE),
     ),
     (
         "7bede606ac5329020c2653eb04663b0d94d6c778e60234479509eddcce38240c",
         "fp8-scaled-scalar/1 weight-only",
-        Mapping::Scheme("fp8-tensorwise", TENSORWISE),
+        Mapping::Scheme("fp8.tensorwise", TENSORWISE),
     ),
     (
         "ac25d323baebfdf1fd0ce3fdfd9f26400ce57914fdc442d0ade8cb187aef183f",
         "int8-convrot256/1",
-        Mapping::Scheme("int8-convrot", ROWWISE),
+        Mapping::Scheme("int8.convrot", ROWWISE),
     ),
     (
         "f2e718c521634876830f9c2647bddfbbccafc744decc88adb345d33d73bf5b1a",
