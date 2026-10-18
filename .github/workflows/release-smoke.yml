@@ -16,6 +16,10 @@ jobs:
   mirror:
     # build-global-artifacts builds the installers beside this job; this builds the same ones.
     runs-on: ubuntu-24.04
+    # bash -eo pipefail: a failing command anywhere in a pipe fails the step.
+    defaults:
+      run:
+        shell: bash
     outputs:
       version: ${{ steps.mirror.outputs.version }}
     steps:
@@ -58,8 +62,9 @@ jobs:
                 *.zip) unzip -p "$f" cozy.exe > bin ;;
                 *) tar -xzOf "$f" "$(tar -tzf "$f" | grep -E '/cozy$')" > bin ;;
               esac
-              glibc=$(readelf -W --version-info bin 2>/dev/null | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)
-              echo "| ${f#mirror/} | $(du -k "$f" | awk '{printf "%.1f", $1/1024}') | $(du -k bin | awk '{printf "%.1f", $1/1024}') | ${glibc:--} |"
+              glibc=-
+              case $f in *linux*) glibc=$(readelf -W --version-info bin | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1) ;; esac
+              echo "| ${f#mirror/} | $(du -k "$f" | awk '{printf "%.1f", $1/1024}') | $(du -k bin | awk '{printf "%.1f", $1/1024}') | $glibc |"
             done
             rm bin
           } | tee -a "$GITHUB_STEP_SUMMARY"

@@ -18,6 +18,10 @@ on:
 jobs:
   platforms:
     runs-on: ubuntu-24.04
+    # bash -eo pipefail: a failing command anywhere in a pipe fails the step.
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v5
       - uses: astral-sh/setup-uv@v7
@@ -53,7 +57,7 @@ jobs:
             notes+=("tensorfs: not checked, the cozy binary does not link tensorfs-core")
           fi
           # What machines installed when this binary was released (information, never a refusal).
-          software=$(curl -sf https://tensorhub.com/v1/software || echo null)
+          software=$(curl -sf https://tensorhub.com/v1/software | jq -c .) || software=null
           mkdir gates
           jq -n --arg commit "$SHA" --arg must "$MUST" --arg platforms "$platforms" --arg tensorfs "$tensorfs" \
             --argjson software "$software" --arg release "$runs/$GITHUB_RUN_ID" \
