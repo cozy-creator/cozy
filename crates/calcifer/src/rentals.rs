@@ -187,9 +187,12 @@ impl Machines {
         disk_gb: Option<u32>,
         image: Option<String>,
     ) -> Result<Rented, Error> {
-        let (ask, fresh) = self
-            .ask_rent(key, hub, sku, gpus, disk_gb, image, None)
-            .await?;
+        let shape = Shape {
+            gpus,
+            disk_gb,
+            image,
+        };
+        let (ask, fresh) = self.ask_rent(key, hub, sku, shape, None).await?;
         let quote = quote_of(&RentBody::of(&ask)?.quote);
         let row = match ask.state {
             AskState::Done => {
@@ -237,11 +240,14 @@ impl Machines {
         key: &str,
         hub: &str,
         sku: &str,
-        gpus: Option<u32>,
-        disk_gb: Option<u32>,
-        image: Option<String>,
+        shape: Shape,
         run: Option<RunId>,
     ) -> Result<(Ask, bool), Error> {
+        let Shape {
+            gpus,
+            disk_gb,
+            image,
+        } = shape;
         let origin = config::Origin::parse(hub)?;
         let mut intent =
             serde_json::json!({"hub": origin, "sku": sku, "gpus": gpus, "disk_gb": disk_gb});
@@ -454,7 +460,12 @@ impl Machines {
                     None => me.placed(&run).await?,
                 };
                 let hub = run.hub.as_deref().unwrap_or_default();
-                let asked = me.ask_rent(&key, hub, &sku, gpus, None, None, Some(run.id.clone()));
+                let shape = Shape {
+                    gpus,
+                    disk_gb: None,
+                    image: None,
+                };
+                let asked = me.ask_rent(&key, hub, &sku, shape, Some(run.id.clone()));
                 Ok(asked.await?.0)
             };
             let rented = match asked.await {
@@ -1044,6 +1055,13 @@ fn view(rental: &types::Rental, sku: Option<String>) -> Rental {
         base_worker_image_digest: Some(rental.base_worker_image_digest.clone())
             .filter(|d| !d.is_empty()),
     }
+}
+
+/// The machine a rent asks for, beyond its SKU.
+struct Shape {
+    gpus: Option<u32>,
+    disk_gb: Option<u32>,
+    image: Option<String>,
 }
 
 /// An RFC 3339 time of the Hub's, in unix milliseconds.
