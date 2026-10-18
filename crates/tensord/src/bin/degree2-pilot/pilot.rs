@@ -1,7 +1,4 @@
-//! Development tool (not proof, PLAN decision 5): real stock executors on one GPU sharing GPU
-//! weights through the machine's real `ResidentCustody` and seam. Measures what Degree 2 buys:
-//! a replacement's first image with attached weights against a private fill, the bytes two
-//! live executors hold (NVML total), the release after a revoke, and output equality.
+//! The pilot itself (Unix: Degree 2 hands GPU memory between processes).
 use tensord::device_executor::{
     postprocess, Answer, Baseline, Binding, Budgets, DeviceCommand, DeviceExecutor, ExecutorConfig,
     Frame, Kind, Services,
@@ -336,32 +333,16 @@ fn exec(
 }
 
 fn kill(exec: Exec) -> io::Result<()> {
-    let pidfd = exec.executor.observer_pidfd()?;
-    // SAFETY: signalling the exact live child we spawned, through its pidfd.
-    if unsafe {
-        libc::syscall(
-            libc::SYS_pidfd_send_signal,
-            std::os::fd::AsRawFd::as_raw_fd(&pidfd),
-            libc::SIGKILL,
-            0,
-            0,
-        )
-    } < 0
-    {
-        return Err(io::Error::last_os_error());
+    // The exact live child we spawned, killed and waited for: no elapsed-time policy.
+    if let Some(exact) = cozy_platform::process::Exact::open(&exec.executor.birth)? {
+        exact.kill()?;
+        exact.wait()?;
     }
-    let mut poll = libc::pollfd {
-        fd: std::os::fd::AsRawFd::as_raw_fd(&pidfd),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    // SAFETY: one live pidfd; waits for the exact process's exit, no elapsed-time policy.
-    unsafe { libc::poll(&mut poll, 1, -1) };
     drop(exec);
     Ok(())
 }
 
-fn main() {
+pub fn main() {
     tracing_subscriber::fmt().with_writer(std::io::stderr).init();
     if let Err(error) = run() {
         eprintln!("degree2-pilot: {error}");

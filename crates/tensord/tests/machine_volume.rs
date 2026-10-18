@@ -1,6 +1,7 @@
 //! The datacenter volume on the real binary in machine mode: two machines (two Stores) given one
 //! cache mount by `COZY_TENSORFS_CACHE`, and a test Hub. The second machine's download comes from
 //! the volume, as its run's record says; a machine without the variable downloads from the Hub.
+#![cfg(target_os = "linux")]
 mod common;
 #[path = "common/hub_oauth.rs"]
 mod hub_oauth;
@@ -98,6 +99,7 @@ fn on_volume(cache: &Path) -> usize {
     dirs(&cache.join("objects")).iter().flat_map(|a| dirs(a)).map(|b| dirs(&b).len()).sum()
 }
 
+/// A tmpfs mount named from a disk directory is Linux's.
 #[tokio::test]
 async fn a_second_machine_downloads_from_the_volume_the_first_filled() {
     let source = std::env::temp_dir().join(format!("tensord-volume-source-{}", uuid::Uuid::new_v4()));

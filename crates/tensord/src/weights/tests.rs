@@ -70,7 +70,12 @@ impl Fixture {
 
     fn open(&self) -> (String, Wire) {
         let (answer, stream) = self.owner.output(&self.grant, &self.output).unwrap();
-        let stream = UnixStream::from(std::os::fd::OwnedFd::from(stream));
+        #[cfg(unix)]
+        let raw = std::os::fd::IntoRawFd::into_raw_fd(stream) as i64;
+        #[cfg(windows)]
+        let raw = std::os::windows::io::IntoRawHandle::into_raw_handle(stream) as i64;
+        // SAFETY: the connected stream the answer handed over, now this test's.
+        let stream = unsafe { cozy_platform::ipc::adopt(raw) };
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
@@ -115,7 +120,7 @@ impl Drop for Fixture {
     }
 }
 
-struct Wire(UnixStream);
+struct Wire(cozy_platform::ipc::LocalStream);
 impl Wire {
     fn frame(&mut self, kind: u8, body: &[u8]) {
         self.0.write_all(&[kind]).unwrap();
@@ -431,7 +436,7 @@ fn cancel_between_durable_binding_and_native_begin_cannot_resurrect_the_transact
         execution::Engine,
         journal::{Invocation, Journal},
     };
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
     let mut f = Fixture::new();
     let journal_root = f.root.join("execution");
     let engine = Engine::open(&journal_root).unwrap();
@@ -441,7 +446,7 @@ fn cancel_between_durable_binding_and_native_begin_cannot_resurrect_the_transact
             Invocation::default(),
         )
         .unwrap();
-    let mut child = Command::new("/bin/cat")
+    let mut child = crate::scratch::until_stdin_closes()
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .spawn()
@@ -527,12 +532,12 @@ fn changed_declaration_in_one_slot_keeps_both_acknowledged_results() {
 #[test]
 fn cancellation_retries_released_root_cleanup_before_acknowledging_the_binding() {
     use crate::{calls::Calls, journal::Invocation, service::Service};
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
     let mut f = Fixture::new();
     let service = Service::open(&f.root.join("state"), &f.root.join("generations"), 1).unwrap();
     let calls = Calls::configure(&service, f.owner.store.clone(), None).unwrap();
     let engine = service.engine.clone();
-    let mut child = Command::new("/bin/cat")
+    let mut child = crate::scratch::until_stdin_closes()
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .spawn()

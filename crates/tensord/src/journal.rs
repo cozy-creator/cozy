@@ -456,7 +456,7 @@ fn archive_older(root: &Path) -> io::Result<Option<PathBuf>> {
             fs::rename(&side, root.join(format!("{}{suffix}", archived.display())))?;
         }
     }
-    fs::File::open(root)?.sync_all()?;
+    cozy_platform::durable::sync_dir(root)?;
     tracing::warn!(
         "journal: format {format} is older than {JOURNAL_FORMAT}; archived it as {} and started a fresh one",
         archived.display()
@@ -650,7 +650,7 @@ impl Journal {
                 |row| row.get(0),
             )
             .map_err(db_error)?;
-        fs::File::open(root)?.sync_all()?;
+        cozy_platform::durable::sync_dir(root)?;
         Ok(Self {
             connection,
             workspace_id,

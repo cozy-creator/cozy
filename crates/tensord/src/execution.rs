@@ -8,21 +8,21 @@ use crate::journal::{
 use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet},
-    ffi::CString,
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
-    os::{
-        fd::{AsRawFd, FromRawFd},
-        unix::{
-            ffi::OsStrExt,
-            fs::{OpenOptionsExt, PermissionsExt},
-        },
-    },
     path::{Component, Path, PathBuf},
     sync::{Arc, Condvar, Mutex, OnceLock, Weak},
     time::Duration,
 };
 use tensorfs_core::transport::PullCancellation;
+#[cfg(unix)]
+use std::{
+    ffi::CString,
+    os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::ffi::OsStrExt,
+    },
+};
 
 /// The most text one package log line keeps.
 const PACKAGE_LOG_LINE: usize = 2 << 10;
@@ -135,11 +135,11 @@ type Stop = Arc<dyn Fn() -> io::Result<()> + Send + Sync>;
 impl Engine {
     pub fn open(root: &Path) -> io::Result<Arc<Self>> {
         fs::create_dir_all(root)?;
-        fs::set_permissions(root, fs::Permissions::from_mode(0o700))?;
+        cozy_platform::durable::set_mode(root, 0o700)?;
         for name in ["staging", "results"] {
             fs::create_dir_all(root.join(name))?;
         }
-        File::open(root)?.sync_all()?;
+        cozy_platform::durable::sync_dir(root)?;
         let mut journal = Journal::open(root)?;
         journal.interrupt_preparations()?;
         Ok(Arc::new(Self {
@@ -854,48 +854,28 @@ impl Engine {
         if birth.ended()? {
             return Ok(());
         }
-        // Read birth on both sides of pidfd_open so PID reuse cannot watch or
-        // reclaim a different process. A kernel exit event only wakes reconciliation.
-        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, birth.pid, 0) } as i32;
-        if raw < 0 {
-            let error = io::Error::last_os_error();
-            return match error.raw_os_error() {
-                Some(libc::ESRCH) => {
+        // An exact handle (a pidfd on Linux, a kqueue on macOS), read on both sides of its
+        // open so PID reuse cannot watch or reclaim a different process. A kernel exit event
+        // only wakes reconciliation.
+        let Some(exact) = cozy_platform::process::Exact::open(&birth)? else {
+            // Reaped, or a leader whose exit is still tearing down (a large GPU context) with
+            // no handle yet: observe that exit by sampling instead, then wake dispatch.
+            return match birth.ended()? {
+                true => {
                     self.notify_activity();
                     Ok(())
                 }
-                // A leader whose exit is still tearing down (a large GPU context) has no
-                // pidfd yet: observe that exit by sampling instead, then wake dispatch.
-                Some(libc::EINVAL) => self.watch_by_sampling(birth),
-                _ => Err(error),
+                false => self.watch_by_sampling(birth),
             };
-        }
-        let pidfd = unsafe { File::from_raw_fd(raw) };
-        if birth.ended()? {
-            self.notify_activity();
-            return Ok(());
-        }
+        };
         let engine = self.clone();
         std::thread::Builder::new()
             .name(format!("orphan-{}", birth.pid))
             .spawn(move || {
-                let mut item = libc::pollfd {
-                    fd: pidfd.as_raw_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                loop {
-                    let result = unsafe { libc::poll(&mut item, 1, -1) };
-                    if result >= 0 {
-                        engine.notify_activity();
-                        return;
-                    }
-                    let error = io::Error::last_os_error();
-                    if error.kind() != io::ErrorKind::Interrupted {
-                        tracing::warn!("orphan kernel observation: {error}");
-                        return;
-                    }
+                if let Err(error) = exact.wait() {
+                    tracing::warn!("orphan kernel observation: {error}");
                 }
+                engine.notify_activity();
             })?;
         Ok(())
     }
@@ -1103,11 +1083,9 @@ impl Engine {
         for (index, name) in paths.into_iter().enumerate() {
             let mut source = open_artifact(output_root, Path::new(&name))?;
             let temporary = destination.join(format!("{index}.pending"));
-            let mut output = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&temporary)?;
+            let mut output =
+                cozy_platform::durable::Mode::mode(OpenOptions::new().write(true).create_new(true), 0o600)
+                    .open(&temporary)?;
             let mut hash = tensorfs_core::sha256::Sha256::new();
             let mut length = 0;
             let mut buffer = [0; 64 * 1024];
@@ -1121,7 +1099,7 @@ impl Engine {
                 length += count as u64;
             }
             let digest = tensorfs_core::sha256::hex(&hash.finish());
-            output.set_permissions(fs::Permissions::from_mode(0o400))?;
+            cozy_platform::durable::set_file_mode(&output, 0o400)?;
             output.sync_all()?;
             let filename = format!("{index}-{digest}");
             fs::rename(&temporary, destination.join(&filename))?;
@@ -1132,8 +1110,8 @@ impl Engine {
                 length,
             });
         }
-        File::open(&destination)?.sync_all()?;
-        File::open(self.root.join("results"))?.sync_all()?;
+        cozy_platform::durable::sync_dir(&destination)?;
+        cozy_platform::durable::sync_dir(&self.root.join("results"))?;
         Ok(ResultRecord {
             value,
             artifacts,
@@ -1231,38 +1209,77 @@ pub(crate) fn open_artifact(root: &Path, path: &Path) -> io::Result<File> {
             "empty artifact path",
         ));
     }
-    let mut directory = File::open(root)?;
-    for (index, name) in parts.iter().enumerate() {
-        let name = CString::new(name.as_bytes()).map_err(io::Error::other)?;
-        let final_component = index + 1 == parts.len();
-        // O_PATH inspects the final inode without opening devices or blocking on FIFOs.
-        let flags = libc::O_CLOEXEC
-            | libc::O_NOFOLLOW
-            | if final_component {
-                libc::O_PATH
-            } else {
-                libc::O_RDONLY | libc::O_DIRECTORY
-            };
-        // SAFETY: live directory descriptor and NUL-terminated component, no pointer outputs.
-        let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
+    #[cfg(unix)]
+    {
+        let mut directory = File::open(root)?;
+        for (index, name) in parts.iter().enumerate() {
+            let name = CString::new(name.as_bytes()).map_err(io::Error::other)?;
+            let final_component = index + 1 == parts.len();
+            // O_PATH inspects the final inode without opening devices or blocking on FIFOs; where
+            // there is none, O_NONBLOCK keeps a FIFO from blocking and only a regular file is kept.
+            #[cfg(target_os = "linux")]
+            let last = libc::O_PATH;
+            #[cfg(not(target_os = "linux"))]
+            let last = libc::O_RDONLY | libc::O_NONBLOCK;
+            let flags = libc::O_CLOEXEC
+                | libc::O_NOFOLLOW
+                | if final_component {
+                    last
+                } else {
+                    libc::O_RDONLY | libc::O_DIRECTORY
+                };
+            // SAFETY: live directory descriptor and NUL-terminated component, no pointer outputs.
+            let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: openat returned a new owned descriptor.
+            let file = unsafe { File::from_raw_fd(fd) };
+            if final_component {
+                if !file.metadata()?.is_file() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "artifact is not a regular file",
+                    ));
+                }
+                // Reopen this exact, retained regular inode through our descriptor, not its name.
+                #[cfg(target_os = "linux")]
+                return File::open(format!("/proc/self/fd/{}", file.as_raw_fd()));
+                #[cfg(not(target_os = "linux"))]
+                return Ok(file);
+            }
+            directory = file;
         }
-        // SAFETY: openat returned a new owned descriptor.
-        let file = unsafe { File::from_raw_fd(fd) };
-        if final_component {
+        unreachable!()
+    }
+    // Windows has no descriptor-relative open: every component is checked to be no link, the
+    // last opened without following one and kept only when it is a regular file.
+    #[cfg(windows)]
+    {
+        let mut path = root.to_path_buf();
+        for (index, name) in parts.iter().enumerate() {
+            path.push(name);
+            let metadata = fs::symlink_metadata(&path)?;
+            if metadata.file_type().is_symlink() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "an artifact path never crosses a link",
+                ));
+            }
+            if index + 1 < parts.len() {
+                continue;
+            }
+            let file = cozy_platform::durable::open_nofollow(&path, OpenOptions::new().read(true))?;
             if !file.metadata()?.is_file() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "artifact is not a regular file",
                 ));
             }
-            // Reopen this exact, retained regular inode through our descriptor, not its name.
-            return File::open(format!("/proc/self/fd/{}", file.as_raw_fd()));
+            return Ok(file);
         }
-        directory = file;
+        unreachable!()
     }
-    unreachable!()
 }
 
 #[cfg(test)]
@@ -1290,7 +1307,7 @@ mod tests {
         assert_eq!((nested.root_seq(), nested.family()), (older.root_seq(), Some(job.id.as_str())));
         assert_eq!((younger_step.root_seq(), younger_step.family()), (younger.root_seq(), None));
         drop(engine);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::scratch::remove(&root);
     }
 
     /// One managed attempt of `id`, as the pool runs it: a real process registered and
@@ -1298,7 +1315,7 @@ mod tests {
     fn attempt(engine: &Arc<Engine>, id: &str, settle: impl FnOnce(&Engine, &str) + Send + 'static) {
         let (done, finished) = std::sync::mpsc::channel();
         assert!(engine.dispatch_managed(id, move |engine, id| {
-            let mut process = std::process::Command::new("/bin/cat")
+            let mut process = crate::scratch::until_stdin_closes()
                 .stdin(std::process::Stdio::piped())
                 .spawn()?;
             engine.register_managed(&id, Birth::of(process.id())?, Arc::new(|| Ok(())))?;
@@ -1341,7 +1358,7 @@ mod tests {
         assert_eq!(run("applied", "sdpa", true), Vec::<Value>::new());
         assert_eq!(run("unpinned", "", false), Vec::<Value>::new());
         drop(engine);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::scratch::remove(&root);
     }
 
     /// A result's files are taken into custody once, from the attempt's spool: a symlink or a
@@ -1370,13 +1387,16 @@ mod tests {
             });
             engine.get(&id).unwrap()
         };
-        let escaped = run("symlink", |path| std::os::unix::fs::symlink("/etc/passwd", path).unwrap());
-        assert_eq!(escaped.state, State::Failed);
-        let fifo = run("fifo", |path| {
-            let name = CString::new(path.as_os_str().as_bytes()).unwrap();
-            assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
-        });
-        assert_eq!(fifo.state, State::Failed);
+        #[cfg(unix)]
+        {
+            let escaped = run("symlink", |path| std::os::unix::fs::symlink("/etc/passwd", path).unwrap());
+            assert_eq!(escaped.state, State::Failed);
+            let fifo = run("fifo", |path| {
+                let name = CString::new(path.as_os_str().as_bytes()).unwrap();
+                assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+            });
+            assert_eq!(fifo.state, State::Failed);
+        }
         let held = run("held", |path| fs::write(path, b"17,39\n").unwrap());
         assert_eq!(held.state, State::Completed, "{held:?}");
         assert!(!root.join("staging").join(&held.id).exists(), "the spool goes once settled");
@@ -1384,7 +1404,7 @@ mod tests {
         engine.open_result(&held.id, 0).unwrap().read_to_string(&mut bytes).unwrap();
         assert_eq!(bytes, "17,39\n");
         let path = root.join(&held.result.unwrap().artifacts[0].path);
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        cozy_platform::durable::set_mode(&path, 0o600).unwrap();
         fs::write(&path, b"corrupted").unwrap();
         assert_eq!(engine.open_result(&held.id, 0).unwrap_err().kind(), io::ErrorKind::InvalidData);
         drop(engine);

@@ -1,5 +1,7 @@
 //! SSH is optional on a development rental: granted a developer key on a machine with no sshd,
 //! the machine serves anyway and says so once, naming sshd and `cozy doctor`.
+//! A rental is a Linux pod.
+#![cfg(target_os = "linux")]
 mod common;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use ed25519_dalek::SigningKey;

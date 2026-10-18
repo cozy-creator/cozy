@@ -1,6 +1,9 @@
 //! The engine's durable execution on real processes, sockets and files. Calls run on the
 //! machine's own pool (a deviceless one, `tests/fixtures/cpu_lifecycle` installed); journal
 //! checks drive the journal with stand-in processes. Not CLI qualification.
+#[path = "common/child.rs"]
+mod child;
+use child::until_stdin_closes;
 use cozy_platform::process::Birth;
 use tensord::{
     execution::Engine,
@@ -411,9 +414,7 @@ fn cursor_reservation_renewal_never_reuses_old_cursors_and_accepts_older_records
         .unwrap()
         .id;
     assert!(journal.claim(&id).unwrap());
-    let mut child = Command::new("/usr/bin/python3")
-        .arg("-c")
-        .arg("import sys;sys.stdin.read()")
+    let mut child = until_stdin_closes()
         .stdin(Stdio::piped())
         .spawn()
         .unwrap();
@@ -464,9 +465,7 @@ fn restart_settlement_waits_for_exact_process_birth_without_adoption() {
         .id;
     assert!(journal.claim(&id).unwrap());
     // Owned process holds actual execution lifetime until stdin EOF.
-    let mut child = Command::new("/usr/bin/python3")
-        .arg("-c")
-        .arg("import sys;sys.stdin.read()")
+    let mut child = until_stdin_closes()
         .stdin(Stdio::piped())
         .spawn()
         .unwrap();
@@ -494,9 +493,7 @@ fn never_authorized_restart_can_retry_only_after_exact_birth_ends() {
         .unwrap()
         .id;
     assert!(journal.claim(&id).unwrap());
-    let mut child = Command::new("/usr/bin/python3")
-        .arg("-c")
-        .arg("import sys;sys.stdin.read()")
+    let mut child = until_stdin_closes()
         .stdin(Stdio::piped())
         .spawn()
         .unwrap();
@@ -521,9 +518,7 @@ fn an_authorized_attempt_that_never_reached_a_handler_starts_again_under_its_cla
     let fixture = Fixture::new();
     let mut journal = Journal::open(&fixture.root.join("undelivered-state")).unwrap();
     let executor = || {
-        Command::new("/usr/bin/python3")
-            .arg("-c")
-            .arg("import sys;sys.stdin.read()")
+        until_stdin_closes()
             .stdin(Stdio::piped())
             .spawn()
             .unwrap()
@@ -614,7 +609,7 @@ fn a_newer_or_damaged_row_never_hides_the_rest_of_the_journal() {
 fn age(path: &std::path::Path, days: u64) {
     let when = std::time::SystemTime::now() - Duration::from_secs(days * 24 * 60 * 60);
     let times = fs::FileTimes::new().set_accessed(when).set_modified(when);
-    fs::File::open(path).unwrap().set_times(times).unwrap();
+    cozy_platform::durable::set_times(path, times).unwrap();
 }
 
 #[test]

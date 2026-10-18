@@ -4,7 +4,7 @@ use crate::{
     config::{self, Flags},
     machine::grant::Lifetime,
 };
-use std::{io, os::unix::fs::PermissionsExt, path::PathBuf, process::ExitCode, sync::Arc};
+use std::{io, path::PathBuf, process::ExitCode, sync::Arc};
 use fs2::FileExt;
 use tensorfs_core::{
     fetch::{Fetcher, Volume},
@@ -20,14 +20,18 @@ pub fn main(args: impl IntoIterator<Item = std::ffi::OsString>) -> ExitCode {
     struct Serve {
         #[command(flatten)]
         flags: Flags,
+        /// Windows: the readiness pipe a stable parent handed the service it started.
+        #[arg(long, hide = true)]
+        service_ready: Option<u64>,
     }
-    let flags = <Serve as clap::Parser>::parse_from(args).flags;
-    machine(flags.lifetime().expect("clap requires one"))
+    let serve = <Serve as clap::Parser>::parse_from(args);
+    machine(serve.flags.lifetime().expect("clap requires one"), serve.service_ready)
 }
 
-/// The machine: its stable parent, then the service it forks. Exits the process on failure.
-pub fn machine(lifetime: Lifetime) -> ExitCode {
-    if let Err(error) = run(lifetime) {
+/// The machine: its stable parent, then the service it starts (`service_ready`: this is that
+/// service, on Windows). Exits the process on failure.
+pub fn machine(lifetime: Lifetime, service_ready: Option<u64>) -> ExitCode {
+    if let Err(error) = run(lifetime, service_ready) {
         config::init_logs(None);
         tracing::error!("{error}");
         std::process::exit(1);
@@ -35,7 +39,7 @@ pub fn machine(lifetime: Lifetime) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn run(lifetime: Lifetime) -> io::Result<()> {
+fn run(lifetime: Lifetime, service_ready: Option<u64>) -> io::Result<()> {
     use crate::machine::{binary, identity, provider::ProviderSelf, ssh, supervise, update};
     // Where this binary was started from, before anything can rename another over it.
     if let Err(error) = binary::record() {
@@ -48,14 +52,27 @@ fn run(lifetime: Lifetime) -> io::Result<()> {
         }
     }
     // Whatever this process inherited (its own re-execution's credential pipe) reaches nothing
-    // it starts; descriptors it hands on are handed explicitly.
-    cozy_platform::process::cloexec_from(3);
-    hold_handed_descriptors();
+    // it starts; descriptors it hands on are handed explicitly. Windows hands on none.
+    #[cfg(unix)]
+    {
+        cozy_platform::process::cloexec_from(3);
+        hold_handed_descriptors();
+    }
     let mut config = config::load(lifetime)?;
     config::init_logs(Some(&config.logs));
     for warning in &config.warnings {
         tracing::warn!("{warning}");
     }
+    // Windows forks nothing: this process is the stable parent until the service it starts as
+    // this executable again returns here.
+    #[cfg(windows)]
+    let ready = supervise::supervise(
+        &update::Paths::new(&config.grant.layout.engine(), &config.grant.layout.root),
+        None,
+        service_ready,
+    )?;
+    #[cfg(unix)]
+    let _ = service_ready;
     let grant = &mut config.grant;
     // A pod's provider credential, kept from everything this machine starts: on its first start
     // this re-executes the machine without the key in its environment, before any thread.
@@ -71,12 +88,14 @@ fn run(lifetime: Lifetime) -> io::Result<()> {
     }
     let paths = update::Paths::new(&grant.layout.engine(), &grant.layout.root);
     update::retire_agent(&paths);
+    #[cfg(unix)]
     let ready = supervise::supervise(&paths, grant.provider.clone())?;
     run_machine(config, ready)
 }
 
 /// Descriptor 5 carries a re-executed machine's credential pipe. Until it is read, nothing else
 /// may take 3 to 5: a log file at 5 would be read as the pipe.
+#[cfg(unix)]
 fn hold_handed_descriptors() {
     for fd in 3..=5 {
         // SAFETY: plain syscalls on this process's own descriptor table, before any thread.
@@ -84,7 +103,8 @@ fn hold_handed_descriptors() {
             if libc::fcntl(fd, libc::F_GETFD) < 0 {
                 let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
                 if null >= 0 && null != fd {
-                    libc::dup3(null, fd, libc::O_CLOEXEC);
+                    libc::dup2(null, fd);
+                    libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
                     libc::close(null);
                 }
             }
@@ -142,6 +162,7 @@ pub fn dev(args: Dev) -> io::Result<()> {
             return Err(io::Error::other(format!("cannot set TensorD process name: {error}")));
         }
     }
+    #[cfg(unix)]
     cozy_platform::process::cloexec_from(3);
     machine_runtime()?;
     let root = args.state;
@@ -186,7 +207,7 @@ fn own(root: &std::path::Path, store: &std::path::Path) -> io::Result<(std::fs::
         .open(root.join("owner.lock"))?;
     lock.try_lock_exclusive()
         .map_err(|_| io::Error::new(io::ErrorKind::AlreadyExists, "state already has a machine owner"))?;
-    std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700))?;
+    cozy_platform::durable::set_mode(root, 0o700)?;
     Ok((lock, Arc::new(Store::ensure_owned(store).map_err(io::Error::other)?)))
 }
 

@@ -1,13 +1,16 @@
 //! One root, one machine, one store: the real binary as this computer's launcher starts it.
 //! A second machine on the root refuses, a holder of the Go agent's lock excludes it, and the
 //! store the launcher names is the store it fills, with what another writer left there.
+#[path = "common/child.rs"]
+mod child;
+use child::BareEnv;
 mod common;
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use ed25519_dalek::SigningKey;
 use fs2::FileExt;
+use cozy_platform::durable::{self, FileId};
 use std::{
-    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::Arc,
@@ -49,10 +52,9 @@ fn spawn(root: &Path, port: u16, store: Option<&Path>, stderr: Stdio) -> Child {
     let owner = SigningKey::from_bytes(&OWNER).verifying_key();
     let mut command = Command::new(env!("CARGO_BIN_EXE_tensord"));
     command
-        .env_clear()
-        .env("PATH", "/usr/bin:/bin")
+        .bare_env()
         .env("COZY_MACHINE_ROOT", root)
-            .env("HOME", root.join("home"))
+            .user_home(root.join("home"))
         .arg("--persistent")
         .env("COZY_WORKER_ID", WORKER)
         .env("COZY_WORKER_INTERNAL_PORT", port.to_string())
@@ -121,11 +123,7 @@ fn one_root_runs_one_machine() {
     assert!(served(&root, port));
 
     // A stopped machine frees the root at once.
-    Command::new("kill")
-        .args(["-TERM", &first.0.id().to_string()])
-        .status()
-        .unwrap();
-    first.0.wait().unwrap();
+    child::stop(&mut first.0);
     let lock = std::fs::File::open(root.join("var/lib/cozy/machine/agent.lock")).unwrap();
     lock.try_lock_exclusive()
         .expect("the stopped machine still holds its root");
@@ -151,7 +149,7 @@ fn one_store_runs_one_machine() {
     let (first_root, second_root) = (scratch.join("first"), scratch.join("second"));
     let store = scratch.join("real/store");
     std::fs::create_dir_all(scratch.join("real")).unwrap();
-    std::os::unix::fs::symlink(scratch.join("real"), scratch.join("alias")).unwrap();
+    durable::symlink(&scratch.join("real"), &scratch.join("alias")).unwrap();
     let port = free_port();
     let mut first = boot(&first_root, port, Some(&store));
     ready(&mut first, &first_root, port);
@@ -162,11 +160,7 @@ fn one_store_runs_one_machine() {
     assert!(served(&first_root, port));
 
     // A stopped machine frees its store at once.
-    Command::new("kill")
-        .args(["-TERM", &first.0.id().to_string()])
-        .status()
-        .unwrap();
-    first.0.wait().unwrap();
+    child::stop(&mut first.0);
     let port = free_port();
     let mut second = boot(&second_root, port, Some(&scratch.join("alias/store")));
     ready(&mut second, &second_root, port);
@@ -192,7 +186,7 @@ async fn the_named_store_is_the_machines_store() {
             .unwrap();
     }
     let blob = Store::open(&named).unwrap().object_path(&kept_hex);
-    let inode = std::fs::metadata(&blob).unwrap().ino();
+    let inode = FileId::at(&blob).unwrap();
 
     let machine_root = root.join("machine");
     std::fs::create_dir_all(&machine_root).unwrap();
@@ -212,7 +206,7 @@ async fn the_named_store_is_the_machines_store() {
     let store = Store::open(&named).unwrap();
     assert!(store.contains(&written_hex), "the write went elsewhere");
     assert_eq!(std::fs::read(&blob).unwrap(), kept);
-    assert_eq!(std::fs::metadata(&blob).unwrap().ino(), inode);
+    assert_eq!(FileId::at(&blob).unwrap(), inode);
     assert!(
         !machine_root.join("var/lib/tensorfs").exists(),
         "the machine made a second store"

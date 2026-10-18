@@ -5,7 +5,6 @@ use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
     io::{self, Seek, SeekFrom, Write},
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -175,7 +174,7 @@ impl SourceIntake {
             uuid::Uuid::new_v4().to_string(),
         );
         fs::create_dir(&directory).map_err(database)?;
-        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).map_err(database)?;
+        cozy_platform::durable::set_mode(&directory, 0o700).map_err(|error| database(error.into()))?;
         Ok(Box::new(Self {
             store,
             journal,
@@ -245,14 +244,11 @@ impl InputTreeReceiver for SourceIntake {
             std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
             std::collections::btree_map::Entry::Vacant(entry) => {
                 let path = self.directory.join(&hash);
-                let file = OpenOptions::new()
-                    .create_new(true)
-                    .read(true)
-                    .write(true)
-                    .mode(0o600)
-                    .custom_flags(libc::O_NOFOLLOW)
-                    .open(&path)
-                    .map_err(database)?;
+                let file = cozy_platform::durable::open_nofollow(
+                    &path,
+                    cozy_platform::durable::Mode::mode(OpenOptions::new().create_new(true).read(true).write(true), 0o600),
+                )
+                .map_err(|error| database(error.into()))?;
                 entry.insert(Partial {
                     reference: expected.clone(),
                     path,

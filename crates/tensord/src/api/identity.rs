@@ -4,10 +4,10 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use ed25519_dalek::VerifyingKey;
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
+use cozy_platform::durable::Mode;
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, BufReader, Read, Write},
-    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -68,14 +68,7 @@ impl MachineIdentity {
         config.validate()?;
         config.validate()?;
         private_directory(&config.identity_directory)?;
-        let lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(config.identity_directory.join("identity.lock"))?;
+        let lock = cozy_platform::durable::open_nofollow(&config.identity_directory.join("identity.lock"), OpenOptions::new().create(true).truncate(false).read(true).write(true).mode(0o600)).map_err(std::io::Error::from)?;
         check_file(&lock, true)?;
         lock.lock_exclusive()?;
         let path = config.identity_directory.join("identity.json");
@@ -106,7 +99,7 @@ impl MachineIdentity {
             }
             write_private(&pending, &retained)?;
             fs::rename(&pending, &path)?;
-            File::open(&config.identity_directory)?.sync_all()?;
+            cozy_platform::durable::sync_dir(&config.identity_directory)?;
             retained
         };
         if retained.worker_id != config.worker_id {
@@ -220,10 +213,7 @@ impl MachineIdentity {
 /// and records accepted before a restart remain addressable. Format as the Hub requires.
 fn retained_boot_id(directory: &Path) -> io::Result<String> {
     let path = directory.join("boot-id");
-    match OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&path)
+    match cozy_platform::durable::open_nofollow(&path, OpenOptions::new().read(true)).map_err(std::io::Error::from)
     {
         Ok(file) => {
             check_file(&file, true)?;
@@ -249,18 +239,13 @@ fn private_directory(path: &Path) -> io::Result<()> {
     match fs::symlink_metadata(path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             fs::create_dir_all(path)?;
-            fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+            cozy_platform::durable::set_mode(path, 0o700).map_err(std::io::Error::from)?;
             if let Some(parent) = path.parent() {
-                File::open(parent)?.sync_all()?;
+                cozy_platform::durable::sync_dir(parent)?;
             }
         }
         Err(error) => return Err(error),
-        Ok(metadata)
-            if !metadata.is_dir()
-                || metadata.file_type().is_symlink()
-                || metadata.mode() & 0o777 != 0o700
-                || metadata.uid() != nix::unistd::geteuid().as_raw() =>
-        {
+        Ok(metadata) if !metadata.is_dir() || metadata.file_type().is_symlink() || !owned(&metadata, Some(0o700)) => {
             return Err(invalid(
                 "identity directory must be owned, real and mode0700",
             ))
@@ -271,12 +256,7 @@ fn private_directory(path: &Path) -> io::Result<()> {
 }
 fn check_file(file: &File, private: bool) -> io::Result<()> {
     let metadata = file.metadata()?;
-    if !metadata.is_file()
-        || metadata.uid() != nix::unistd::geteuid().as_raw()
-        || metadata.nlink() != 1
-        || metadata.mode() & 0o022 != 0
-        || (private && metadata.mode() & 0o777 != 0o600)
-    {
+    if !metadata.is_file() || !owned(&metadata, private.then_some(0o600)) {
         return Err(invalid(
             "configuration/identity file ownership or modes are unsafe",
         ));
@@ -284,24 +264,33 @@ fn check_file(file: &File, private: bool) -> io::Result<()> {
     Ok(())
 }
 fn read_json<T: serde::de::DeserializeOwned>(path: &Path, private: bool) -> io::Result<T> {
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)?;
+    let file = cozy_platform::durable::open_nofollow(path, OpenOptions::new().read(true)).map_err(std::io::Error::from)?;
     check_file(&file, private)?;
     serde_json::from_reader(file.take(64 << 10)).map_err(other)
 }
 fn write_private<T: Serialize>(path: &Path, record: &T) -> io::Result<()> {
-    let mut file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)?;
+    let mut file = cozy_platform::durable::open_nofollow(path, OpenOptions::new().create(true).truncate(true).write(true).mode(0o600)).map_err(std::io::Error::from)?;
     check_file(&file, true)?;
     file.write_all(&serde_json::to_vec(record).map_err(other)?)?;
     file.sync_all()
+}
+/// This user's, on one link, writable by no one else, and exactly `mode` when given. Windows
+/// keeps an ACL instead, which the profile owns.
+fn owned(metadata: &fs::Metadata, mode: Option<u32>) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let bits = metadata.mode() & 0o777;
+        metadata.uid() == nix::unistd::geteuid().as_raw()
+            && (metadata.is_dir() || metadata.nlink() == 1)
+            && bits & 0o022 == 0
+            && mode.is_none_or(|mode| bits == mode)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (metadata, mode);
+        true
+    }
 }
 fn invalid(detail: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, detail)

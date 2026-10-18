@@ -2,6 +2,8 @@
 //! are staged, verified and activated in place (same boot, same receipt, the stable parent runs
 //! the new service); the client follows the events again across the restart and reads the outcome. A
 //! candidate whose service never proves readiness ends FAILED, rolled back.
+//! Linux: it reads `/proc` and signals the machine.
+#![cfg(target_os = "linux")]
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 mod common;
 

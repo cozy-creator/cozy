@@ -8,7 +8,6 @@ use std::{
     fs::{self, File},
     io::{self, Read},
     net::IpAddr,
-    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
 };
 
@@ -264,7 +263,7 @@ fn private_file(path: &Path) -> io::Result<String> {
     let meta = file.metadata()?;
     if !path.is_absolute()
         || !meta.is_file()
-        || meta.mode() & 0o077 != 0
+        || cozy_platform::durable::mode(&meta).is_some_and(|mode| mode & 0o077 != 0)
         || fs::symlink_metadata(path)?.file_type().is_symlink()
     {
         return Err(invalid(
@@ -286,6 +285,7 @@ mod tests {
     use crate::config::{load_from, Config};
     use std::collections::BTreeMap;
 
+    #[cfg(unix)]
     const TOKEN: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
     const KEY: &str = "O2onvM62pC1io6jQKm8Nc2UyFXcd4kOmOsBIoYtZ2ik";
 
@@ -309,6 +309,8 @@ mod tests {
         }
     }
 
+    /// A rental is a pod: its root and cache are Unix paths.
+    #[cfg(unix)]
     #[test]
     fn rental_grant_matches_the_hub_environment() {
         let config = Scratch::new()
@@ -380,6 +382,7 @@ mod tests {
         assert!(config.warnings.is_empty(), "{:?}", config.warnings);
     }
 
+    #[cfg(unix)]
     #[test]
     fn malformed_grants_refuse_by_name() {
         let base = [

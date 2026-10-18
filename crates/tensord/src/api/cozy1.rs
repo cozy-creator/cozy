@@ -14,13 +14,13 @@ use super::{
 };
 use cozy_proto::error::{Error, Kind};
 use serde_json::{json, Value};
+use cozy_platform::durable::FileAt;
 use std::{
     collections::{HashMap, VecDeque},
     fs::File,
     future::Future,
     io,
     net::{IpAddr, SocketAddr},
-    os::unix::fs::FileExt,
     pin::Pin,
     sync::{Arc, Mutex, OnceLock},
     time::{Instant, SystemTime, UNIX_EPOCH},

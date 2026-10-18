@@ -10,15 +10,17 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::{Method, Request, StatusCode};
 use hyper_util::rt::TokioIo;
-use nix::fcntl::OFlag;
 use std::{
     collections::BTreeMap,
-    fs::File,
-    io::{self, Read, Write},
-    os::fd::FromRawFd,
+    io,
     path::Path,
     sync::Arc,
     time::Duration,
+};
+#[cfg(target_os = "linux")]
+use std::{
+    fs::File,
+    io::{Read, Write},
 };
 use tokio_rustls::rustls::{self, pki_types::ServerName, RootCertStore};
 
@@ -158,8 +160,25 @@ impl ProviderSelf {
     }
 }
 
+/// A provider credential is a Linux pod's: elsewhere nothing is handed on or re-executed.
+#[cfg(not(target_os = "linux"))]
+fn reexec(_own: Option<&ProviderSelf>) -> io::Error {
+    io::Error::new(io::ErrorKind::Unsupported, "a provider credential is a Linux pod's")
+}
+
+#[cfg(not(target_os = "linux"))]
+fn inherited() -> Option<ProviderSelf> {
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn hand_on(_own: &ProviderSelf) -> bool {
+    false
+}
+
 /// Runs this program again in this process with the same arguments, the provider keys dropped
 /// from its environment and the credential on CREDENTIAL_FD. Returns only on failure.
+#[cfg(target_os = "linux")]
 fn reexec(own: Option<&ProviderSelf>) -> io::Error {
     use std::os::unix::process::CommandExt;
     if own.is_some_and(|own| !hand_on(own)) {
@@ -177,13 +196,11 @@ fn reexec(own: Option<&ProviderSelf>) -> io::Error {
     command.exec()
 }
 
-fn pipe2_cloexec() -> io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
-    nix::unistd::pipe2(OFlag::O_CLOEXEC).map_err(io::Error::from)
-}
-
 /// The credential a parent handed this process on CREDENTIAL_FD, read once (the fd is then
 /// closed); None when it handed none.
+#[cfg(target_os = "linux")]
 fn inherited() -> Option<ProviderSelf> {
+    use std::os::fd::FromRawFd;
     // SAFETY: CREDENTIAL_FD is the parent's pipe, or not open (F_GETFD then fails).
     if unsafe { libc::fcntl(CREDENTIAL_FD, libc::F_GETFD) } < 0 {
         return None;
@@ -199,8 +216,9 @@ fn inherited() -> Option<ProviderSelf> {
 
 /// Places the credential on CREDENTIAL_FD for the program this process execs next. It fits a
 /// pipe's buffer: written and closed before the exec.
+#[cfg(target_os = "linux")]
 pub fn hand_on(own: &ProviderSelf) -> bool {
-    pipe2_cloexec()
+    super::supervise::cloexec_pipe()
         .and_then(|(read, write)| {
             File::from(write).write_all(&serde_json::to_vec(own)?)?;
             Ok(super::supervise::inherit(read, CREDENTIAL_FD))

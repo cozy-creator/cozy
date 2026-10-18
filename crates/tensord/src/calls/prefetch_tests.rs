@@ -81,7 +81,7 @@ fn prefetch_choices_cross_the_native_handler_and_keep_callee_authority() {
             "module": "fixture", "export": export, "payload": payload, "future_field": 1,
         }))
         .unwrap();
-        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let (mut client, mut server) = cozy_platform::ipc::pair().unwrap();
         client
             .write_all(&(body.len() as u32).to_be_bytes())
             .unwrap();
@@ -153,5 +153,5 @@ fn prefetch_choices_cross_the_native_handler_and_keep_callee_authority() {
     drop(broker);
     drop(runs);
     drop(service);
-    std::fs::remove_dir_all(root).unwrap();
+    crate::scratch::remove(&root);
 }
