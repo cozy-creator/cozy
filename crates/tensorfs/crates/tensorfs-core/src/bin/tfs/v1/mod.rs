@@ -25,7 +25,7 @@ macro_rules! ok {
 pub const USAGE: &str = "v1 (until xs-045 U11):
   version [--json]
   key blob|manifest <sha256> | repo <org> <name>
-  cbor encode|decode <file> [--out <file>]
+  cbor encode|decode|check <file> [--out <file>]
   manifest build <entries.jsonl> --out <manifest.json>
   manifest inspect <manifest.json> --refs <jsonl> [--header <h> --inventory <i> --closure <c>]
   manifest get|walk <root> <sha256> ...
@@ -118,6 +118,7 @@ pub fn main(argv: Vec<String>) -> ExitCode {
         ["fetch", r, refspec] => fetch::cmd_fetch(Path::new(r), refspec, &flags),
         ["cbor", "encode", f] => cmd_cbor("encode", Path::new(f), &flags),
         ["cbor", "decode", f] => cmd_cbor("decode", Path::new(f), &flags),
+        ["cbor", "check", f] => cmd_cbor("check", Path::new(f), &flags),
         _ => usage(),
     }
 }
@@ -456,6 +457,20 @@ fn cmd_cbor(action: &str, path: &Path, flags: &Flags) -> ExitCode {
             let mut rendered = canon::pretty(&value, 0).into_bytes();
             rendered.push(b'\n');
             write_cli(&rendered, flags)
+        }
+        "check" => {
+            let header = ok!(Header::parse(&bytes));
+            println!("header_digest {}", tensorfs_core::ids::object_id(&bytes));
+            println!("bytes {}", bytes.len());
+            println!("components {}", header.components.len());
+            println!("tensors {}", header.tensors().count());
+            for (component, tensors) in &header.components {
+                println!("component {component} {}", tensors.len());
+                for (index, (key, _)) in tensors.iter().enumerate() {
+                    println!("order {component} {index} {key}");
+                }
+            }
+            ExitCode::SUCCESS
         }
         _ => unreachable!(),
     }
