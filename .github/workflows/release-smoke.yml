@@ -4,7 +4,9 @@ name: release-smoke
 # The CPU smoke of design §6.4 on every release runner, against this run's own artifacts served from a local
 # mirror (COZY_DOWNLOAD_URL is the release location for the installers and `cozy update` alike): install
 # script, --version, PATH, up, status, hub list, package search (tensorhub.com, anonymous), the local machine
-# (enable as a user service, show, disable on Linux; refused elsewhere), update to this release, down. A verb answering not_ported is skipped, so the smoke grows as the verbs land.
+# (enable as a user service and show on Linux; refused elsewhere), update to this release (the enabled machine
+# restarts on the new binary), disable, down. A verb answering not_ported is skipped, so the smoke grows as the
+# verbs land.
 on:
   workflow_call:
     inputs:
@@ -188,7 +190,6 @@ jobs:
             export DBUS_SESSION_BUS_ADDRESS=unix:path=$XDG_RUNTIME_DIR/bus
             must machine enable
             must machine show local
-            must machine disable
           else
             refuses machine_unsupported machine enable
           fi
@@ -197,6 +198,14 @@ jobs:
           if [ "$ran" = 1 ]; then
             [ "$(ls -i "$cozy")" != "$before" ] || { echo "::error::cozy update $VERSION left the binary in place"; fail=1; }
             [ "$("$cozy" --version)" = "cozy $VERSION" ] || { echo "::error::the updated binary is not cozy $VERSION"; fail=1; }
+            # The enabled machine takes the new binary (a new file, though the same version) and serves on it.
+            want=not_enabled; [ "$RUNNER_OS" != Linux ] || want=restarted
+            [ "$(printf '%s' "$out" | jq -r .machine.state)" = "$want" ] || { echo "::error::the machine did not report $want"; fail=1; }
+          fi
+          if [ "$RUNNER_OS" = Linux ]; then
+            # Calcifer hears the restarted machine's status when its link reconnects.
+            until [ "$("$cozy" --json machine show local | jq -r .status.version)" = "$VERSION" ]; do sleep 2; done
+            must machine disable
           fi
           step down
           exit $fail
