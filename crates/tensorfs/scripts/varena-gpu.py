@@ -239,6 +239,7 @@ def main(work: Path) -> int:
     facts: dict = {"device": torch.cuda.get_device_name(0), "torch": torch.__version__}
     ck = write(work / "store")
     rs = regions(ck)
+    assert len(rs) == LAYERS + BLOCKS, f"one region per layer and per block, got {len(rs)}"
     fd = varena.seal(ck, rs, "varena-gpu")
     stream = torch.cuda.current_stream().cuda_stream
     gpu = varena.Gpu(0)
