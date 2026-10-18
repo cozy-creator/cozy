@@ -25,7 +25,6 @@ hub-client.workspace = true
 jiff.workspace = true
 indicatif.workspace = true
 infer.workspace = true
-pep508_rs.workspace = true
 progenitor-client.workspace = true
 ratatui.workspace = true
 reqwest.workspace = true

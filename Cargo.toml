@@ -68,7 +68,6 @@ nvml-wrapper = "0.13"
 openapiv3 = "2"
 prettyplease = "0.2"
 progenitor = { version = "0.15.1", default-features = false }
-pep508_rs = "0.9"
 progenitor-client = "0.15.1"
 quote = "1"
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
