@@ -10,6 +10,7 @@
 
 mod docs;
 mod errors;
+#[cfg(feature = "store")]
 #[cfg_attr(windows, path = "varena_windows.rs")]
 mod varena;
 mod readplan;
@@ -55,7 +56,6 @@ fn _ext(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<readplan::PyPlan>()?;
     #[cfg(feature = "store")]
     store_api(m)?;
-    varena::install(m)?;
     Ok(())
 }
 
@@ -69,5 +69,6 @@ fn store_api(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<store::PyOperation>()?;
     m.add_class::<store::PyDerivedWriter>()?;
     m.add_class::<store::PyLease>()?;
-    v2::install(m)
+    v2::install(m)?;
+    varena::install(m)
 }

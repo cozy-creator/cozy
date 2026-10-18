@@ -124,6 +124,9 @@ class Checkpoint:
     @property
     def files(self) -> list[str]: ...
     @property
+    def chunks(self) -> list[tuple[str, int]]:
+        """Each chunk's file and length, in header order (`Part.chunk` indexes it)."""
+    @property
     def metadata(self) -> dict[str, Any]: ...
     def file(self, path: str) -> bytes: ...
     def read(self, component: str, key: str) -> Array:
@@ -177,5 +180,6 @@ class Store:
         """A Diffusers/Transformers folder, or with `origin=True` the static origin layout."""
     def gc(self, older_than: float | None = None) -> dict[str, Any]: ...
 
-def regions(ck: Checkpoint, max_bytes: int = ...) -> list[list[str]]:
-    """`<component>/<key>` regions: chunk-sharing tensors together, up to `max_bytes` each."""
+def regions(ck: Checkpoint, max_bytes: int = ..., boundaries: Sequence[str] | None = None) -> list[list[int]]:
+    """Chunk indexes per region, in execution order: whole chunks of one component, merged while
+    at most `max_bytes`, never across a `<component>/<key prefix>` boundary unless one chunk does."""

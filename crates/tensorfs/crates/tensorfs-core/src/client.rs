@@ -4,7 +4,7 @@
 //! A reference is `org/name[@release]` (with a lane, else the release's only one) or a
 //! manifest digest, `sha256:<hex>` or bare hex.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -415,58 +415,62 @@ pub(crate) fn io(path: &Path, e: std::io::Error) -> crate::failure::Failure {
     failure
 }
 
-/// `header`'s tensors grouped into regions for a weight plane, as `<component>/<key>` names in
-/// chunk order. Tensors sharing a chunk stay together; neighbouring groups merge while their
-/// chunks total at most `max_bytes`, and a group larger than that is a region alone. A region
-/// never spans components.
-pub fn regions(header: &Header, max_bytes: u64) -> Vec<Vec<String>> {
+/// `header`'s chunks grouped into weight-plane regions (`varena::Layout::build`), in chunk
+/// (execution) order. A region is a union of whole chunks of one component: chunks sharing a
+/// tensor stay together, neighbouring groups merge while they total at most `max_bytes`, and a
+/// group larger than that is a region alone. `boundaries` are `<component>/<key prefix>` module
+/// paths (`prefix` or `prefix.*`): a region never holds tensors of two of them, or of one and of
+/// none, unless a single chunk does.
+pub fn regions(header: &Header, max_bytes: u64, boundaries: &[String]) -> Vec<Vec<u32>> {
     let mut out = Vec::new();
     for (component, c) in &header.components {
-        let name = |key: &str| format!("{component}/{key}");
-        // Each tensor's first (chunk, offset) and last chunk; an empty tensor has neither.
-        let (mut placed, mut empty) = (Vec::new(), Vec::new());
+        let label = |key: &str| -> Option<&str> {
+            boundaries
+                .iter()
+                .filter_map(|b| b.split_once('/'))
+                .filter(|(bc, p)| bc == component && (key == *p || key.strip_prefix(p).is_some_and(|rest| rest.starts_with('.'))))
+                .map(|(_, p)| p)
+                .max_by_key(|p| p.len())
+        };
+        // Each tensor's first (chunk, offset), last chunk and boundary; empty tensors have no chunk.
+        let mut placed = Vec::new();
         for (key, t) in &c.tensors {
             let at: Vec<_> = match &t.body {
                 Body::Data(at) => vec![*at],
                 Body::Encoded { parts, .. } => parts.values().map(|p| p.at()).collect(),
             };
             let spans: Vec<_> = at.iter().flat_map(|a| header.spans(a)).collect();
-            let first = spans.iter().map(|s| (s.chunk, s.start)).min();
-            match (first, spans.iter().map(|s| s.chunk).max()) {
-                (Some(first), Some(last)) => placed.push((first, last, key.as_str())),
-                _ => empty.push(name(key)),
+            if let (Some(first), Some(last)) = (spans.iter().map(|s| (s.chunk, s.start)).min(), spans.iter().map(|s| s.chunk).max()) {
+                placed.push((first, last, label(key)));
             }
         }
         placed.sort();
-        // Runs of tensors over overlapping chunks: (keys, first chunk, last chunk).
-        let mut groups: Vec<(Vec<&str>, usize, usize)> = Vec::new();
-        for ((chunk, _), last, key) in placed {
+        // Runs of tensors over overlapping chunks: (first chunk, last chunk, boundaries).
+        let mut groups: Vec<(usize, usize, BTreeSet<Option<&str>>)> = Vec::new();
+        for ((chunk, _), last, label) in placed {
             match groups.last_mut() {
-                Some(g) if chunk <= g.2 => {
-                    g.0.push(key);
-                    g.2 = g.2.max(last);
+                Some(g) if chunk <= g.1 => {
+                    g.1 = g.1.max(last);
+                    g.2.insert(label);
                 }
-                _ => groups.push((vec![key], chunk, last)),
+                _ => groups.push((chunk, last, BTreeSet::from([label]))),
             }
         }
-        let mut regions: Vec<(Vec<String>, u64)> = Vec::new();
-        for (keys, lo, hi) in groups {
+        // (chunks, bytes, boundaries)
+        type Region<'b> = (Vec<u32>, u64, BTreeSet<Option<&'b str>>);
+        let mut regions: Vec<Region> = Vec::new();
+        for (lo, hi, labels) in groups {
             let n: u64 = header.chunks[lo..=hi].iter().map(|c| c.length).sum();
-            let keys = keys.into_iter().map(name);
+            let chunks = (lo as u32..=hi as u32).collect::<Vec<_>>();
             match regions.last_mut() {
-                Some((r, bytes)) if *bytes + n <= max_bytes => {
-                    r.extend(keys);
+                Some((r, bytes, l)) if *bytes + n <= max_bytes && *l == labels => {
+                    r.extend(chunks);
                     *bytes += n;
                 }
-                _ => regions.push((keys.collect(), n)),
+                _ => regions.push((chunks, n, labels)),
             }
         }
-        match regions.first_mut() {
-            Some((r, _)) => r.extend(empty),
-            None if !empty.is_empty() => regions.push((empty, 0)),
-            None => {}
-        }
-        out.extend(regions.into_iter().map(|(r, _)| r));
+        out.extend(regions.into_iter().map(|(r, _, _)| r));
     }
     out
 }

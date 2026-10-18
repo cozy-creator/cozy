@@ -166,8 +166,13 @@ static DRIVER: OnceLock<std::result::Result<Driver, String>> = OnceLock::new();
 pub fn driver() -> Result<&'static Driver> {
     match DRIVER.get_or_init(|| Driver::load().map_err(|e| e.to_string())) {
         Ok(d) => Ok(d),
-        Err(msg) => Err(Error::CudaUnavailable(msg.clone())),
+        Err(msg) => Err(unavailable(msg.clone())),
     }
+}
+
+/// No usable driver: a `Cuda` error with code -1.
+pub fn unavailable(why: String) -> Error {
+    Error::Cuda { op: "libcuda", code: -1, name: why }
 }
 
 pub fn available() -> bool {
@@ -178,7 +183,7 @@ macro_rules! load {
     ($lib:expr, $name:literal) => {
         // SAFETY: the field types above are the documented CUDA driver ABI for these names.
         *unsafe { $lib.get::<_>($name) }.map_err(|e| {
-            Error::CudaUnavailable(format!("{}: {e}", String::from_utf8_lossy($name)))
+            unavailable(format!("{}: {e}", String::from_utf8_lossy($name)))
         })?
     };
 }
@@ -195,7 +200,7 @@ impl Driver {
         // SAFETY: dlopen of the NVIDIA driver library; no initializer of ours runs.
         let lib = unsafe { libloading::Library::new("libcuda.so.1") }
             .or_else(|_| unsafe { libloading::Library::new("libcuda.so") })
-            .map_err(|e| Error::CudaUnavailable(format!("dlopen libcuda: {e}")))?;
+            .map_err(|e| unavailable(format!("dlopen libcuda: {e}")))?;
         let d = Driver {
             init: load!(lib, b"cuInit"),
             get_error_name: load!(lib, b"cuGetErrorName"),
@@ -245,7 +250,7 @@ impl Driver {
         // SAFETY: documented as safe to call repeatedly; flags must be 0.
         let rc = unsafe { (d.init)(0) };
         if rc != SUCCESS {
-            return Err(Error::CudaUnavailable(format!("cuInit -> {rc}")));
+            return Err(unavailable(format!("cuInit -> {rc}")));
         }
         Ok(d)
     }

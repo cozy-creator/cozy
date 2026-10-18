@@ -410,7 +410,7 @@ impl PyStore {
 /// A checkpoint in a store: its tensors, files and metadata.
 #[pyclass(name = "Checkpoint", module = "tensorfs.v2", frozen)]
 pub struct PyCheckpoint {
-    ck: Checkpoint,
+    pub(crate) ck: Checkpoint,
     named: Named,
     tensors: OnceLock<Py<PyDict>>,
 }
@@ -535,6 +535,13 @@ impl PyCheckpoint {
         self.ck.manifest().files.keys().cloned().collect()
     }
 
+    /// Each chunk's file and length, in header order (`Part.chunk` indexes it).
+    #[getter]
+    fn chunks(&self) -> Vec<(String, u64)> {
+        let paths = self.ck.chunk_paths().iter().map(|p| p.display().to_string());
+        paths.zip(self.ck.header().chunks.iter().map(|c| c.length)).collect()
+    }
+
     /// The header's metadata.
     #[getter]
     fn metadata<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
@@ -574,12 +581,13 @@ impl PyCheckpoint {
     }
 }
 
-/// Groups `ck`'s tensors into `<component>/<key>` regions for a weight plane: tensors sharing a
-/// chunk stay together, and neighbours merge while their chunks total at most `max_bytes`.
+/// `ck`'s chunks grouped into weight-plane regions (`varena.Plane.register`), in execution
+/// order: whole chunks of one component, merged while at most `max_bytes`, never across a
+/// `<component>/<key prefix>` boundary unless one chunk spans it.
 #[pyfunction]
-#[pyo3(signature = (ck, max_bytes = 64 << 20))]
-fn regions(ck: &PyCheckpoint, max_bytes: u64) -> Vec<Vec<String>> {
-    client::regions(ck.ck.header(), max_bytes)
+#[pyo3(signature = (ck, max_bytes = 64 << 20, boundaries = None))]
+fn regions(ck: &PyCheckpoint, max_bytes: u64, boundaries: Option<Vec<String>>) -> Vec<Vec<u32>> {
+    client::regions(ck.ck.header(), max_bytes, &boundaries.unwrap_or_default())
 }
 
 // ---------------------------------------------------------------- arrays

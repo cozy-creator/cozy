@@ -20,5 +20,5 @@ tracing-subscriber.workspace = true
 # Native feature isolation remains available to Rust builds. The published Python
 # distribution always enables store; managed executor authority comes from its owner.
 default = ["store"]
-store = ["tensorfs-core/store", "varena/store"]
+store = ["tensorfs-core/store"]
 extension-module = ["pyo3/extension-module"]

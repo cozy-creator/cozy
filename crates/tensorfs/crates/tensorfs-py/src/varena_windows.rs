@@ -1,6 +1,6 @@
-//! `tensorfs.varena` on Windows: the plane is a Unix mechanism (weight sets cross processes as
-//! descriptors) and its Windows tier does not exist yet (xs-043 unit WM). Every name imports;
-//! constructing or calling one raises `Unsupported`.
+//! `tensorfs.varena` on Windows: the plane is a Unix mechanism (a sealed host layout crosses
+//! processes as a memfd) and its Windows tier does not exist yet (xs-043 unit WM). Every name
+//! imports; constructing one raises `Invalid`.
 
 use pyo3::create_exception;
 use pyo3::exceptions::PyException;
@@ -8,21 +8,17 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
 
 create_exception!(tensorfs.varena, PlaneError, PyException, "A weight-plane error; `.code` names its class.");
-create_exception!(tensorfs.varena, BudgetExceeded, PlaneError);
-create_exception!(tensorfs.varena, Shortfall, PlaneError);
-create_exception!(tensorfs.varena, BelowFloor, PlaneError);
-create_exception!(tensorfs.varena, LeaseViolation, PlaneError);
-create_exception!(tensorfs.varena, Poisoned, PlaneError);
+create_exception!(tensorfs.varena, DeviceFull, PlaneError);
+create_exception!(tensorfs.varena, Floor, PlaneError);
 create_exception!(tensorfs.varena, CudaError, PlaneError);
-create_exception!(tensorfs.varena, CudaUnavailable, PlaneError);
-create_exception!(tensorfs.varena, Invalid, PlaneError);
-create_exception!(tensorfs.varena, IoError, PlaneError);
 create_exception!(tensorfs.varena, Closed, PlaneError);
-create_exception!(tensorfs.varena, Unsupported, PlaneError);
+create_exception!(tensorfs.varena, Invalid, PlaneError);
+create_exception!(tensorfs.varena, Poisoned, PlaneError);
+create_exception!(tensorfs.varena, IoError, PlaneError);
 
 fn unsupported(py: Python<'_>) -> PyErr {
-    let error = Unsupported::new_err("the weight plane has no Windows tier yet; read objects through Store leases");
-    let _ = error.value(py).setattr("code", "UNSUPPORTED");
+    let error = Invalid::new_err("the weight plane has no Windows tier yet; read tensors through tensorfs.v2");
+    let _ = error.value(py).setattr("code", "INVALID");
     error
 }
 
@@ -42,42 +38,24 @@ macro_rules! unconstructible {
     )*};
 }
 
-unconstructible!(Plane = "Plane", Source = "Source", WeightSet = "WeightSet", Ticket = "Ticket",
-    Lease = "Lease", Cursor = "Cursor", DeviceView = "DeviceView");
-
-macro_rules! refused {
-    ($($name:ident),*) => {$(
-        #[pyfunction]
-        #[pyo3(signature = (*_args, **_kwargs))]
-        fn $name(py: Python<'_>, _args: &Bound<'_, PyTuple>, _kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<()> {
-            Err(unsupported(py))
-        }
-    )*};
-}
-
-refused!(hold_tier, release_tier, reserve, fill_sealed);
+unconstructible!(Plane = "Plane", PageCache = "PageCache", SealedLayout = "SealedLayout", WeightSet = "WeightSet",
+    Ticket = "Ticket", Lease = "Lease", Cursor = "Cursor", DeviceView = "DeviceView");
 
 pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     let py = parent.py();
     let m = PyModule::new(py, "varena")?;
     m.add_class::<Plane>()?;
-    m.add_class::<Source>()?;
+    m.add_class::<PageCache>()?;
+    m.add_class::<SealedLayout>()?;
     m.add_class::<WeightSet>()?;
     m.add_class::<Ticket>()?;
     m.add_class::<Lease>()?;
     m.add_class::<Cursor>()?;
     m.add_class::<DeviceView>()?;
-    m.add_function(wrap_pyfunction!(hold_tier, &m)?)?;
-    m.add_function(wrap_pyfunction!(release_tier, &m)?)?;
-    m.add_function(wrap_pyfunction!(reserve, &m)?)?;
-    m.add_function(wrap_pyfunction!(fill_sealed, &m)?)?;
-    m.add("SEALED_WHILE_FILLING", false)?;
-    m.add("SEALED_HOLES", false)?;
     macro_rules! add_errors {
         ($($e:ident),*) => { $(m.add(stringify!($e), py.get_type::<$e>())?;)* };
     }
-    add_errors!(PlaneError, BudgetExceeded, Shortfall, BelowFloor, LeaseViolation, Poisoned, CudaError,
-        CudaUnavailable, Invalid, IoError, Closed, Unsupported);
+    add_errors!(PlaneError, DeviceFull, Floor, CudaError, Closed, Invalid, Poisoned, IoError);
     parent.add_submodule(&m)?;
     py.import("sys")?.getattr("modules")?.set_item("tensorfs._ext.varena", &m)
 }

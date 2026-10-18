@@ -1,244 +1,102 @@
-//! Source bytes: a TensorFS read lease (the GC hold and the verified door) plus per-object
-//! descriptors the plane opens through the store's own verification (`open_verified`). A
-//! pinned-tier fill copies what the page cache already holds and reads the rest by O_DIRECT
-//! into the destination (no second host copy), else through `tensorfs_core::read::read_into`.
-//! Each mode's bytes are counted.
+//! The chunk reader's disk half: a weight set's chunk files, and the reader threads.
+//!
+//! A chunk opens on its first read, with a second O_DIRECT description of the same inode where
+//! the filesystem allows. A chunk the page cache holds whole is copied from it; any other is read
+//! with O_DIRECT (`direct`), or buffered so it stays in the page cache. Each mode's bytes are
+//! counted.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::fs::File;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-#[cfg(feature = "store")]
-use std::sync::RwLock;
-use std::sync::{Arc, Condvar, Mutex};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::JoinHandle;
 
-use tensorfs_core::ids::ObjectRef;
 use cozy_platform::durable;
-#[cfg(feature = "store")]
-use tensorfs_core::{meta::Meta, read::ReadLease, store::Store};
 
-use crate::layout::{Item, ItemSource, PART_ALIGN};
+use crate::layout::PART_ALIGN;
 use crate::{Error, Result};
 
 #[derive(Debug, Default)]
 pub struct IoTally {
-    pub cached_bytes: AtomicU64,
+    /// Read with O_DIRECT.
     pub direct_bytes: AtomicU64,
+    /// Copied from the page cache (the chunk was resident whole).
+    pub cached_bytes: AtomicU64,
+    /// Read buffered from a chunk the page cache did not hold.
     pub buffered_bytes: AtomicU64,
-    pub inline_bytes: AtomicU64,
-    /// Objects whose filesystem refused O_DIRECT: their bytes went buffered.
+    /// Chunks whose filesystem refused O_DIRECT: their bytes went buffered.
     pub direct_refused: AtomicU64,
-}
-
-/// How a fill wants its bytes: `Cache` for the pinned tier (O_DIRECT for what the page cache
-/// lacks), `Buffered` when no pinned tier exists and the page cache is the host cache,
-/// `Cached` for an object its caller found resident (`Source::resident`): copied, no check.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mode {
-    Cache,
-    Buffered,
-    Cached,
 }
 
 struct Fds {
     buffered: File,
+    /// Present when this chunk reads O_DIRECT: it is not resident and the filesystem allows it.
     direct: Option<File>,
+    resident: bool,
 }
 
-impl Fds {
-    /// A buffered descriptor and, with `direct_io`, a second description of the SAME inode that
-    /// bypasses the page cache (`open_direct`): no pathname is resolved again.
-    fn of(buffered: File, direct_io: bool, tally: &IoTally) -> Fds {
-        let direct = direct_io.then(|| durable::open_direct(&buffered).ok().flatten()).flatten();
-        if direct_io && direct.is_none() {
-            tally.direct_refused.fetch_add(1, Ordering::Relaxed);
-        }
-        Fds { buffered, direct }
-    }
+/// A weight set's chunk files, by chunk index.
+pub struct Files {
+    paths: Vec<PathBuf>,
+    open: Vec<OnceLock<std::result::Result<Fds, Error>>>,
+    direct: bool,
+    pub tally: Arc<IoTally>,
 }
 
-/// Where a weight set's bytes come from when its plane fills them: a TensorFS read lease (the
-/// GC hold and the verified door) with descriptors opened through the store's verification;
-/// or verified object files supplied by the owner (`files`: a managed Runtime executor
-/// reads only those granted files); or nothing, for a sealed CPU layout that holds every
-/// byte (`sealed`). Source access does not construct a model or make a GPU tensor.
-pub struct Source {
-    #[cfg(feature = "store")]
-    lease: RwLock<Option<ReadLease>>,
-    #[cfg(feature = "store")]
-    meta: Option<Arc<Meta>>,
-    #[cfg(feature = "store")]
-    store: Option<Arc<Store>>,
-    fds: Mutex<HashMap<String, Arc<Fds>>>,
-    /// Handed-over object files: the only objects this source reads, kept open until it goes
-    /// (a read opens its working descriptors from them, and closes those after the fill).
-    handed: Option<HashMap<String, File>>,
-    direct_io: bool,
-    plane: usize,
-}
-
-/// Whether the page cache holds every page of `[off, off+len)`; where the OS cannot say, it
-/// does not.
-fn cached(f: &Fds, off: u64, len: u64) -> bool {
-    durable::cached(&f.buffered, off, len).unwrap_or(false)
-}
-
-fn pread_exact(f: &File, buf: &mut [u8], at: u64, what: &str) -> Result<()> {
-    f.read_exact_at(buf, at).map_err(|e| Error::Io(format!("{what}: read at {at}: {e}")))
-}
-
-impl Source {
-    #[cfg(feature = "store")]
-    pub fn new(store: Arc<Store>, meta: Arc<Meta>, lease: ReadLease, direct_io: bool, plane: usize) -> Source {
-        Source {
-            lease: RwLock::new(Some(lease)),
-            meta: Some(meta),
-            store: Some(store),
-            fds: Mutex::new(HashMap::new()),
-            handed: None,
-            direct_io,
-            plane,
-        }
+impl Files {
+    /// `direct`: chunks the page cache does not hold read O_DIRECT; otherwise buffered.
+    pub fn new(paths: Vec<PathBuf>, direct: bool, tally: Arc<IoTally>) -> Files {
+        let open = paths.iter().map(|_| OnceLock::new()).collect();
+        Files { paths, open, direct, tally }
     }
 
-    /// The source of a weight set over a sealed layout: the object files its machine verified
-    /// and handed over for the layout's holes, read through the same descriptors (O_DIRECT
-    /// through a second description of each, where the filesystem allows). No lease, no store;
-    /// with no files (a whole layout holds every byte) any read is refused.
-    pub fn files(files: Vec<(ObjectRef, File)>, direct_io: bool, plane: usize) -> Source {
-        Source {
-            #[cfg(feature = "store")]
-            lease: RwLock::new(None),
-            #[cfg(feature = "store")]
-            meta: None,
-            #[cfg(feature = "store")]
-            store: None,
-            fds: Mutex::new(HashMap::new()),
-            handed: Some(files.into_iter().map(|(obj, file)| (obj.sha256, file)).collect()),
-            direct_io,
-            plane,
-        }
+    fn fds(&self, c: u32) -> Result<&Fds> {
+        let path = self.paths.get(c as usize).ok_or_else(|| Error::Invalid(format!("no chunk {c}")))?;
+        self.open[c as usize]
+            .get_or_init(|| {
+                let buffered = File::open(path).map_err(|e| Error::Io(format!("{}: {e}", path.display())))?;
+                let len = buffered.metadata().map_err(|e| Error::Io(format!("{}: {e}", path.display())))?.len();
+                let resident = durable::cached(&buffered, 0, len).unwrap_or(false);
+                let direct = (self.direct && !resident).then(|| durable::open_direct(&buffered).ok().flatten()).flatten();
+                if self.direct && !resident && direct.is_none() {
+                    self.tally.direct_refused.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(Fds { buffered, direct, resident })
+            })
+            .as_ref()
+            .map_err(Error::clone)
     }
 
-    /// Close one object's working descriptors; the next read of it reopens them (through the
-    /// store, or from the file handed over, which stays).
-    pub fn close_object(&self, sha256: &str) {
-        self.fds.lock().unwrap().remove(sha256);
-    }
-
-    /// Whether the page cache holds every byte of `obj` (one check for all its items).
-    pub fn resident(&self, obj: &ObjectRef, tally: &IoTally) -> Result<bool> {
-        let fds = self.fds(obj, tally)?;
-        Ok(cached(&fds, 0, obj.length))
-    }
-
-    pub(crate) fn made_by(&self, plane: usize) -> bool {
-        self.plane == plane
-    }
-
-    /// End the TensorFS lease. Runs when the last weight set and handle drop the source.
-    fn release(&self) -> Result<()> {
-        self.fds.lock().unwrap().clear();
-        #[cfg(feature = "store")]
-        if let Some(l) = self.lease.write().unwrap().take() {
-            l.release(self.meta.as_ref().ok_or_else(|| Error::Closed("a store lease without its store".into()))?)?;
-        }
-        Ok(())
-    }
-
-    fn fds(&self, obj: &ObjectRef, tally: &IoTally) -> Result<Arc<Fds>> {
-        if let Some(f) = self.fds.lock().unwrap().get(&obj.sha256) {
-            return Ok(f.clone());
-        }
-        #[cfg(feature = "store")]
-        if let Some(store) = self.store.as_ref() {
-            let vf = store.open_verified(&obj.sha256)?;
-            if vf.len() != obj.length {
-                return Err(Error::Invalid(format!(
-                    "{}: verified descriptor has {} bytes, the plan says {}",
-                    obj.sha256,
-                    vf.len(),
-                    obj.length
-                )));
-            }
-            let f = Arc::new(Fds::of(vf.into_file(), self.direct_io, tally));
-            self.fds.lock().unwrap().insert(obj.sha256.clone(), f.clone());
-            return Ok(f);
-        }
-        let handed = self.handed.as_ref().and_then(|h| h.get(&obj.sha256));
-        let Some(file) = handed else {
-            return Err(Error::Invalid(format!("{}: no file for this object was handed over", obj.sha256)));
-        };
-        let file = file.try_clone().map_err(|e| Error::Io(format!("{}: {e}", obj.sha256)))?;
-        let f = Arc::new(Fds::of(file, self.direct_io, tally));
-        self.fds.lock().unwrap().insert(obj.sha256.clone(), f.clone());
-        Ok(f)
-    }
-
-    /// Fill `item.len` bytes at `dst`. `Mode::Cache` reads a range the page cache fully
-    /// holds by copy and everything else by O_DIRECT when alignment allows, which may DMA up
-    /// to the next `PART_ALIGN` boundary past the item: the layout reserves that as padding.
+    /// Read `len` bytes of chunk `c` from `off` into `dst`.
     ///
     /// # Safety
-    /// `dst` must be valid for writes of `align_up(item.len, PART_ALIGN)` bytes and not be
-    /// read or written by anyone else until this returns.
-    pub unsafe fn read_item(&self, item: &Item, dst: *mut u8, mode: Mode, tally: &IoTally) -> Result<()> {
-        // SAFETY: per the contract.
-        let buf = unsafe { std::slice::from_raw_parts_mut(dst, item.len as usize) };
-        let o = match &item.source {
-            ItemSource::Inline(b) => {
-                buf.copy_from_slice(b);
-                tally.inline_bytes.fetch_add(item.len, Ordering::Relaxed);
-                return Ok(());
-            }
-            ItemSource::Object(o) => o,
+    /// `dst` must be valid for writes of `align_up(len, PART_ALIGN)` bytes, `PART_ALIGN` aligned,
+    /// and touched by no one else until this returns. `off` is `PART_ALIGN` aligned.
+    pub unsafe fn read(&self, c: u32, off: u64, len: u64, dst: *mut u8) -> Result<()> {
+        let fds = self.fds(c)?;
+        let what = || self.paths[c as usize].display().to_string();
+        let Some(direct) = &fds.direct else {
+            // SAFETY: per the contract.
+            let buf = unsafe { std::slice::from_raw_parts_mut(dst, len as usize) };
+            fds.buffered.read_exact_at(buf, off).map_err(|e| Error::Io(format!("{}: read at {off}: {e}", what())))?;
+            let t = if fds.resident { &self.tally.cached_bytes } else { &self.tally.buffered_bytes };
+            t.fetch_add(len, Ordering::Relaxed);
+            return Ok(());
         };
-        #[cfg(feature = "store")]
-        let guard = self.lease.read().unwrap();
-        #[cfg(feature = "store")]
-        if let Some(lease) = guard.as_ref() {
-            lease.covers(o)?;
-        } else if self.handed.is_none() {
-            return Err(Error::Closed("the source's store lease has ended".into()));
-        }
-        let fds = self.fds(&o.obj, tally)?;
-        let a = PART_ALIGN;
-        let end = o.off + item.len;
-        let aligned = (dst as u64).wrapping_sub(o.off).is_multiple_of(a) && (end.is_multiple_of(a) || item.part_end);
-        let direct = match (mode, &fds.direct) {
-            (Mode::Cache, Some(f)) if aligned && !cached(&fds, o.off, item.len) => f,
-            _ => {
-                #[cfg(feature = "store")]
-                if let Some(lease) = guard.as_ref() {
-                    tensorfs_core::read::read_into(lease, o, buf)?;
-                } else {
-                    pread_exact(&fds.buffered, buf, o.off, &o.obj.sha256)?;
-                }
-                #[cfg(not(feature = "store"))]
-                pread_exact(&fds.buffered, buf, o.off, &o.obj.sha256)?;
-                let t = if mode == Mode::Buffered { &tally.buffered_bytes } else { &tally.cached_bytes };
-                t.fetch_add(item.len, Ordering::Relaxed);
-                return Ok(());
-            }
-        };
-        let from = o.off - o.off % a;
-        let need = (end - from) as usize;
-        // SAFETY: [dst - (o.off - from), dst + align_up(end) - o.off) lies inside this part
-        // plus its padding (`aligned` above; parts start on `a`).
-        let dbuf = unsafe {
-            std::slice::from_raw_parts_mut(dst.sub((o.off - from) as usize), (end.div_ceil(a) * a - from) as usize)
-        };
-        let mut done = 0usize;
-        while done < need {
+        // The last request of a chunk may end mid-page: read up to the next page, short at EOF.
+        let room = len.div_ceil(PART_ALIGN) * PART_ALIGN;
+        let mut done = 0u64;
+        while done < len {
             // SAFETY: aligned destination, offset and length (the O_DIRECT contract).
             let n = unsafe {
                 libc::pread(
                     direct.as_raw_fd(),
-                    dbuf[done..].as_mut_ptr() as *mut libc::c_void,
-                    dbuf.len() - done,
-                    (from + done as u64) as libc::off_t,
+                    dst.add(done as usize) as *mut libc::c_void,
+                    (room - done) as usize,
+                    (off + done) as libc::off_t,
                 )
             };
             if n < 0 {
@@ -246,66 +104,47 @@ impl Source {
                 if e.kind() == std::io::ErrorKind::Interrupted {
                     continue;
                 }
-                return Err(Error::Io(format!("O_DIRECT pread {}: {e}", o.obj.sha256)));
+                return Err(Error::Io(format!("{}: O_DIRECT read at {}: {e}", what(), off + done)));
             }
-            // A short read before `need` resumes at an aligned offset; EOF before it is short.
-            let next = done + n as usize;
-            let next = if next < need { next - next % a as usize } else { next };
+            // A short read resumes at an aligned offset; EOF before `len` is short.
+            let next = done + n as u64;
+            let next = if next < len { next - next % PART_ALIGN } else { next };
             if next <= done {
-                return Err(Error::Io(format!("{}: O_DIRECT read ended at {}", o.obj.sha256, from + done as u64)));
+                return Err(Error::Io(format!("{}: ends at {}, short of {}", what(), off + done, off + len)));
             }
             done = next;
         }
-        tally.direct_bytes.fetch_add(item.len, Ordering::Relaxed);
+        self.tally.direct_bytes.fetch_add(len, Ordering::Relaxed);
         Ok(())
     }
 }
 
-impl Drop for Source {
-    fn drop(&mut self) {
-        if let Err(e) = self.release() {
-            tracing::warn!("varena: read lease release failed: {e}");
-        }
-    }
-}
-
 type Job = Box<dyn FnOnce() + Send>;
+/// The jobs and whether to stop once they are done.
+type Queue = Arc<(Mutex<(VecDeque<Job>, bool)>, Condvar)>;
 
-#[derive(Default)]
-struct Queues {
-    urgent: VecDeque<Job>,
-    background: VecDeque<Job>,
-    stop: bool,
-}
-
-/// Persistent reader threads. Urgent jobs (staging for a device copy someone waits on) run
-/// before background jobs (pinned-tier prefetch), so a large prefetch never starves a stream.
+/// Persistent reader threads, first come first served.
 pub struct Readers {
-    q: Arc<(Mutex<Queues>, Condvar)>,
+    q: Queue,
     threads: Mutex<Vec<JoinHandle<()>>>,
 }
 
 impl Readers {
-    /// The pool's threads: how many pieces of one job can run at once.
-    pub fn threads(&self) -> usize {
-        self.threads.lock().unwrap().len().max(1)
-    }
-
     pub fn new(n: usize) -> Readers {
-        let q = Arc::new((Mutex::new(Queues::default()), Condvar::new()));
+        let q: Queue = Arc::new((Mutex::new((VecDeque::new(), false)), Condvar::new()));
         let threads = (0..n.max(1))
             .map(|i| {
                 let q = q.clone();
                 std::thread::Builder::new()
-                    .name(format!("tfs-plane-read-{i}"))
+                    .name(format!("tfs-gpu-read-{i}"))
                     .spawn(move || loop {
                         let job = {
                             let mut g = q.0.lock().unwrap();
                             loop {
-                                if let Some(j) = g.urgent.pop_front().or_else(|| g.background.pop_front()) {
+                                if let Some(j) = g.0.pop_front() {
                                     break j;
                                 }
-                                if g.stop {
+                                if g.1 {
                                     return;
                                 }
                                 g = q.1.wait(g).unwrap();
@@ -316,23 +155,18 @@ impl Readers {
                     .expect("spawn reader")
             })
             .collect();
-        Readers {
-            q,
-            threads: Mutex::new(threads),
-        }
+        Readers { q, threads: Mutex::new(threads) }
     }
 
-    pub fn submit(&self, urgent: bool, job: impl FnOnce() + Send + 'static) {
-        let mut g = self.q.0.lock().unwrap();
-        if urgent { &mut g.urgent } else { &mut g.background }.push_back(Box::new(job));
-        drop(g);
+    pub fn submit(&self, job: impl FnOnce() + Send + 'static) {
+        self.q.0.lock().unwrap().0.push_back(Box::new(job));
         self.q.1.notify_one();
     }
 
     /// Let the threads exit once the queue is empty; waits for nothing (the caller may be one
     /// of them).
     pub fn stop(&self) {
-        self.q.0.lock().unwrap().stop = true;
+        self.q.0.lock().unwrap().1 = true;
         self.q.1.notify_all();
     }
 
@@ -345,50 +179,7 @@ impl Readers {
     }
 }
 
-type Done = Box<dyn FnOnce(Result<()>) + Send>;
-
-/// A set of jobs with one completion: the last finisher calls `done` with the first error.
-pub struct Batch {
-    left: AtomicUsize,
-    err: Mutex<Option<Error>>,
-    done: Mutex<Option<Done>>,
-}
-
-impl Batch {
-    pub fn new(jobs: usize, done: impl FnOnce(Result<()>) + Send + 'static) -> Arc<Batch> {
-        let b = Arc::new(Batch {
-            left: AtomicUsize::new(jobs),
-            err: Mutex::new(None),
-            done: Mutex::new(Some(Box::new(done))),
-        });
-        if jobs == 0 {
-            b.fire();
-        }
-        b
-    }
-
-    pub fn finish(&self, r: Result<()>) {
-        if let Err(e) = r {
-            self.err.lock().unwrap().get_or_insert(e);
-        }
-        if self.left.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.fire();
-        }
-    }
-
-    fn fire(&self) {
-        let r = match self.err.lock().unwrap().take() {
-            Some(e) => Err(e),
-            None => Ok(()),
-        };
-        if let Some(f) = self.done.lock().unwrap().take() {
-            f(r);
-        }
-    }
-}
-
-/// A raw destination pointer handed to reader threads. The plane's books guarantee exclusive
-/// access to the range for the fill's duration.
+/// A raw pointer handed to reader threads; the plane's books keep its range exclusive.
 #[derive(Clone, Copy)]
-pub struct Dst(pub *mut u8);
-unsafe impl Send for Dst {}
+pub struct Ptr(pub *mut u8);
+unsafe impl Send for Ptr {}
