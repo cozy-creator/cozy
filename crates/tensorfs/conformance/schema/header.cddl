@@ -1,12 +1,8 @@
 ; cozytensors/1 — restricted RFC 8949 Core Deterministic CBOR
-; Every container is definite-length. Maps, tags, floats, null, undefined,
+; Every container is definite-length. Tags, floats, null, undefined,
 ; arbitrary simple values, trailing items, and non-preferred widths are forbidden.
 
-header       = ["cozytensors/1", configs, assets, encodings, components]
-configs      = [* config]
-config       = [name, bstr]
-assets       = [* asset]
-asset        = [asset-name, digest32, positive, media-type, [+ object-ref]]
+header       = ["cozytensors/1", encodings, components, metadata]
 encodings    = [+ encoding]
 encoding     = [[+ dtype], optional-uint, [+ encoding-role], optional-ref]
 encoding-role = [name, carrier, relation]
@@ -16,26 +12,25 @@ dim          = [0, uint] / [1, uint, positive] / [2, uint, positive]
              / [3, uint, positive, positive] / [4, positive] / [5, positive]
 optional-uint = [] / [positive]
 optional-ref = [] / [object-ref]
-components   = [+ component]
+components   = [* component]       ; construction order
 component    = [name, tensors]
-tensors      = [+ tensor]
+tensors      = [* tensor]          ; construction order
 tensor       = [tensor-key, dtype, shape, uint, parts]
-parts        = [+ part]
-part         = [name, dtype, shape, body]
+parts        = [+ part]            ; construction order
+part         = [role, dtype, shape, body]
 body         = bstr / [+ object-ref]
 object-ref   = [digest32, positive]
 digest32     = bstr .size 32
 shape        = [* uint]
 dtype        = 0..11
 positive     = uint .gt 0
+metadata     = {* tstr => value}   ; free-form; keys in bytewise order of their encodings
+value        = bool / int / tstr / [* value] / {* tstr => value}
 
-; All text is bounded printable ASCII. Names use [A-Za-z0-9_./-]; asset-name
-; additionally obeys the portable relative path law described in README.md.
-; Inline bodies obey the dtype/shape anchor equation and bool bytes are 0 or 1.
-; Configs/assets are sorted unique by
-; name, encodings by SHA-256 of their inline bytes. Components/tensors/parts/shapes/segments
-; preserve the supplied construction semantics and are never sorted.
+; Configs, tokenizers and other assets are manifest files (spec §3), not header fields.
+; name is one path segment (non-empty, not "." or "..", no "/", "\" or NUL) and unique;
+; tensor-key is non-empty UTF-8, unique within its component; role is non-empty, unique
+; within its tensor. Components, tensors and parts are never sorted.
 name         = tstr
-asset-name   = tstr
 tensor-key   = tstr
-media-type   = tstr
+role         = tstr
