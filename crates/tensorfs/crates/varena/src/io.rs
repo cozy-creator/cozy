@@ -76,7 +76,6 @@ pub struct Source {
     /// (a read opens its working descriptors from them, and closes those after the fill).
     handed: Option<HashMap<String, File>>,
     direct_io: bool,
-    plane: usize,
 }
 
 /// Whether the page cache holds every page of `[off, off+len)`; where the OS cannot say, it
@@ -91,7 +90,7 @@ fn pread_exact(f: &File, buf: &mut [u8], at: u64, what: &str) -> Result<()> {
 
 impl Source {
     #[cfg(feature = "store")]
-    pub fn new(store: Arc<Store>, meta: Arc<Meta>, lease: ReadLease, direct_io: bool, plane: usize) -> Source {
+    pub fn new(store: Arc<Store>, meta: Arc<Meta>, lease: ReadLease, direct_io: bool, _plane: usize) -> Source {
         Source {
             lease: RwLock::new(Some(lease)),
             meta: Some(meta),
@@ -99,7 +98,6 @@ impl Source {
             fds: Mutex::new(HashMap::new()),
             handed: None,
             direct_io,
-            plane,
         }
     }
 
@@ -107,7 +105,7 @@ impl Source {
     /// and handed over for the layout's holes, read through the same descriptors (O_DIRECT
     /// through a second description of each, where the filesystem allows). No lease, no store;
     /// with no files (a whole layout holds every byte) any read is refused.
-    pub fn files(files: Vec<(ObjectRef, File)>, direct_io: bool, plane: usize) -> Source {
+    pub fn files(files: Vec<(ObjectRef, File)>, direct_io: bool, _plane: usize) -> Source {
         Source {
             #[cfg(feature = "store")]
             lease: RwLock::new(None),
@@ -118,7 +116,6 @@ impl Source {
             fds: Mutex::new(HashMap::new()),
             handed: Some(files.into_iter().map(|(obj, file)| (obj.sha256, file)).collect()),
             direct_io,
-            plane,
         }
     }
 
@@ -132,10 +129,6 @@ impl Source {
     pub fn resident(&self, obj: &ObjectRef, tally: &IoTally) -> Result<bool> {
         let fds = self.fds(obj, tally)?;
         Ok(cached(&fds, 0, obj.length))
-    }
-
-    pub(crate) fn made_by(&self, plane: usize) -> bool {
-        self.plane == plane
     }
 
     /// End the TensorFS lease. Runs when the last weight set and handle drop the source.
