@@ -1,7 +1,8 @@
 //! The one converter engine. A family's layout is a data table (`tensorfs-core/converters/`),
 //! generated from upstream's own converter; this file recognizes a source by its tables' key
 //! sets and applies a table row by row: `rename | view -> take(axis, idx) | permute -> shape`,
-//! then the component's `cast`. Nothing model-specific lives here.
+//! then the component's `cast`. A quantized carrier, folded into one encoded tensor (`carriers`),
+//! is only renamed. Nothing model-specific lives here.
 
 use platform::durable::FileAt;
 use std::collections::{BTreeMap, BTreeSet};
@@ -11,7 +12,7 @@ use std::io::Read;
 use serde::Deserialize;
 
 use crate::err::{refuse, Code, Refusal, Result};
-use crate::format::Dtype;
+use crate::format::{Dtype, Encoding};
 
 use super::source::{Group, SourceSet, Tensor};
 
@@ -441,6 +442,16 @@ pub struct Planned {
     pub key: String,
     pub dtype: Dtype,
     pub shape: Vec<u64>,
+    pub encoding: Option<Encoding>,
+    /// A plain tensor's one part (role `""`), or an encoded tensor's parts in order.
+    pub parts: Vec<PlannedPart>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PlannedPart {
+    pub role: String,
+    pub dtype: Dtype,
+    pub shape: Vec<u64>,
     pub read: Reading,
 }
 
@@ -455,6 +466,25 @@ pub struct Reading {
     pub runs: Runs,
     pub source: Dtype,
     pub cast: Option<Dtype>,
+}
+
+impl Reading {
+    /// A source range read as it is.
+    fn whole(t: &Tensor) -> Reading {
+        Reading {
+            file: t.file,
+            start: t.start,
+            len: t.len,
+            unit: 1,
+            runs: Runs {
+                run: t.len,
+                base: 0,
+                outer: vec![],
+            },
+            source: t.dtype.clone(),
+            cast: None,
+        }
+    }
 }
 
 /// The output as contiguous source runs: `base + Σ index·stride` over the outer dims.
@@ -601,7 +631,8 @@ fn cast_to(what: &str, from: &Dtype, to: Option<&Dtype>) -> Result<(Dtype, Optio
 }
 
 /// `component/key` read from `t` through `ops` and `cast`. A tensor whose bytes do not
-/// move is one run of bytes, so it may be any dtype.
+/// move is one run of bytes, so it may be any dtype. An encoded tensor is only renamed: its
+/// parts are the producer's bytes, and `cast` names its logical dtype.
 fn planned(
     component: &str,
     key: &str,
@@ -610,42 +641,67 @@ fn planned(
     cast: Option<&Dtype>,
 ) -> Result<Planned> {
     let what = format!("{component}/{key}");
+    if let Some(folded) = &t.encoded {
+        if ops.view.is_some() || ops.take.is_some() || ops.permute.is_some() || ops.shape.is_some()
+        {
+            return refuse(
+                Code::SEAM_UNBANKED,
+                format!(
+                    "{what}: a {} tensor; a table row may rename it, never cut or reshape it",
+                    folded.encoding.scheme
+                ),
+            );
+        }
+        let parts = (folded.parts.iter())
+            .map(|p| PlannedPart {
+                role: p.role.clone(),
+                dtype: p.dtype.clone(),
+                shape: p.shape.clone(),
+                read: Reading::whole(&p.at),
+            })
+            .collect();
+        return Ok(Planned {
+            component: component.into(),
+            key: key.into(),
+            dtype: cast.unwrap_or(&t.dtype).clone(),
+            shape: t.shape.clone(),
+            encoding: Some(folded.encoding.clone()),
+            parts,
+        });
+    }
     let (dtype, cast) = cast_to(&what, &t.dtype, cast)?;
     let (shape, runs) = layout(&what, &t.shape, ops)?;
-    let len = t.len;
     let moves = ops.view.is_some() || ops.take.is_some() || ops.permute.is_some();
-    let (unit, runs) = match (moves || cast.is_some(), t.dtype.bits()) {
-        (true, Some(bits)) if bits.is_multiple_of(8) => (bits / 8, runs),
+    let read = match (moves || cast.is_some(), t.dtype.bits()) {
+        (true, Some(bits)) if bits.is_multiple_of(8) => Reading {
+            file: t.file,
+            start: t.start,
+            len: t.len,
+            unit: bits / 8,
+            runs,
+            source: t.dtype.clone(),
+            cast,
+        },
         (true, _) => {
             return refuse(
                 Code::DTYPE_MISMATCH,
                 format!("{what}: {} elements are not whole bytes", t.dtype),
             )
         }
-        (false, _) => (
-            1,
-            Runs {
-                run: len,
-                base: 0,
-                outer: vec![],
-            },
-        ),
-    };
-    let read = Reading {
-        file: t.file,
-        start: t.start,
-        len,
-        unit,
-        runs,
-        source: t.dtype.clone(),
-        cast,
+        (false, _) => Reading::whole(t),
     };
     Ok(Planned {
         component: component.into(),
         key: key.into(),
-        dtype,
-        shape,
-        read,
+        dtype: dtype.clone(),
+        shape: shape.clone(),
+        encoding: None,
+        parts: vec![PlannedPart {
+            role: String::new(),
+            dtype,
+            shape,
+            read,
+        }],
     })
 }
 
@@ -763,6 +819,7 @@ fn plan_raw(set: &SourceSet, c: &Component, out: &mut Vec<Planned>) -> Result<()
             file,
             start: raw.offset,
             len: bytes,
+            encoded: None,
         };
         out.push(planned(
             &c.name,
@@ -825,7 +882,9 @@ fn plan_lora(
         };
         let float = |d: &Dtype| matches!(d, Dtype::F16 | Dtype::BF16 | Dtype::F32);
         let rank = a.shape.first().copied().unwrap_or(0);
-        if a.shape.len() != 2
+        if a.encoded.is_some()
+            || b.encoded.is_some()
+            || a.shape.len() != 2
             || rank == 0
             || rank > input.min(output)
             || a.shape[1] != input
@@ -859,10 +918,11 @@ fn plan_lora(
 
 // ------------------------------------------------------------------------------ bytes
 
-/// Streams one planned tensor's output bytes out of its source file.
+/// Streams one planned part's bytes out of its source file.
 pub struct TensorReader<'f> {
     file: &'f File,
-    p: &'f Planned,
+    r: &'f Reading,
+    what: String,
     /// Next run, and units of it already read.
     run: u64,
     within: u64,
@@ -880,19 +940,20 @@ const SHORT_RUN: u64 = 4096;
 const STEP: u64 = 8 << 20;
 
 impl<'f> TensorReader<'f> {
-    pub fn new(file: &'f File, p: &'f Planned) -> Result<TensorReader<'f>> {
-        let r = &p.read;
+    /// `what` names the tensor in errors.
+    pub fn new(file: &'f File, r: &'f Reading, what: String) -> Result<TensorReader<'f>> {
         let whole = if r.runs.count() > 1 && r.runs.run * r.unit < SHORT_RUN {
             let mut buf = vec![0u8; r.len as usize];
             file.read_exact_at(&mut buf, r.start)
-                .map_err(|e| io(&p.key, e))?;
+                .map_err(|e| io(&what, e))?;
             Some(buf)
         } else {
             None
         };
         Ok(TensorReader {
             file,
-            p,
+            r,
+            what,
             run: 0,
             within: 0,
             whole,
@@ -904,7 +965,7 @@ impl<'f> TensorReader<'f> {
     }
 
     fn fill(&mut self) -> std::io::Result<bool> {
-        let r = &self.p.read;
+        let r = self.r;
         if self.run >= r.runs.count() || r.runs.run == 0 {
             return Ok(false);
         }
@@ -944,9 +1005,8 @@ impl<'f> TensorReader<'f> {
             let half = f32_to_f16(bits);
             if half & 0x7fff == 0x7c00 && bits & 0x7f80_0000 != 0x7f80_0000 {
                 return Err(std::io::Error::other(format!(
-                    "{}/{}: element {} ({}) overflows F16",
-                    self.p.component,
-                    self.p.key,
+                    "{}: element {} ({}) overflows F16",
+                    self.what,
                     self.seen,
                     f32::from_bits(bits)
                 )));

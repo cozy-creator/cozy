@@ -1,0 +1,11 @@
+{
+  "producer": {
+    "name": "modelopt",
+    "version": "0.44.0"
+  },
+  "quantization": {
+    "quant_algo": "MXFP8",
+    "group_size": 32,
+    "exclude_modules": []
+  }
+}
