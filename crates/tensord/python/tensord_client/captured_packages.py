@@ -17,6 +17,7 @@ from packaging.specifiers import SpecifierSet
 from packaging.utils import canonicalize_name
 from packaging.version import Version
 
+from . import layout
 from .package_records import Dependency, Describe, DescribeInstalled, DESCRIPTION_DECODER, PackageMetadata
 from .packages import PackageError, in_environment, publish_generation, read_metadata
 
@@ -60,7 +61,7 @@ def linked_applications(interpreter: Path) -> list[str]:
     """Installed distributions that declare an App and were linked, not copied: the Runtime's
     static reader describes only copied ones (a callee package among the locked dependencies)."""
     names = []
-    for site in interpreter.parents[1].glob("lib/python*/site-packages"):
+    for site in layout.site_packages(interpreter.parents[1]):
         for metadata in site.glob("*.dist-info"):
             entries = metadata / "entry_points.txt"
             if entries.is_symlink() and "[cozy.application]" in entries.read_text():
@@ -138,7 +139,7 @@ def live_paths(environment: Path) -> None:
     all the same, and the Runtime's static reader, which never interprets such a line, reads the
     environment's installed packages without following the project out of it: the project is
     described from its own directory."""
-    for path in environment.glob("lib/python*/site-packages/*.pth"):
+    for path in (pth for site in layout.site_packages(environment) for pth in site.glob("*.pth")):
         lines = path.read_text().splitlines()
         live = [line for line in lines if line and not line.startswith(("#", "import ", "import\t"))
                 and not (path.parent / line.rstrip()).resolve().is_relative_to(environment.resolve())]
@@ -162,7 +163,7 @@ def install_editable(*, project: Path, environment: Path, wheels: list[Path], di
     metadata = read_metadata(project)
     if canonicalize_name(metadata.name) != canonicalize_name(distribution) or Version(metadata.version) != Version(release):
         raise PackageError("package_metadata_changed", "the live project declares another package release")
-    interpreter, ready = environment / "bin" / "python", environment / ".ready"
+    interpreter, ready = layout.interpreter(environment), environment / ".ready"
     if not ready.is_file():
         shutil.rmtree(environment, ignore_errors=True)  # a build that never finished
         environment.parent.mkdir(parents=True, exist_ok=True)
@@ -170,7 +171,9 @@ def install_editable(*, project: Path, environment: Path, wheels: list[Path], di
         def capture(machine: set[str] = frozenset()):
             """The project's own selection, without the `machine` SDK distributions the machine's pair
             replaces next (the lock's may not install here: TensorFS has no aarch64 wheel on PyPI).
-            Run again with none, it restores what the machine's pair replaced."""
+            An unlocked project resolves with the pair's wheels offered, where its bounds admit
+            them: PyPI's may not install here either (no macOS TensorFS wheel). Run again with
+            none, it restores what the machine's pair replaced."""
             if (project / "uv.lock").is_file():
                 # Each carried distribution at the version the lock selected, from its own
                 # files (uv picks the one this platform takes); the lock installs the rest,
@@ -195,7 +198,10 @@ def install_editable(*, project: Path, environment: Path, wheels: list[Path], di
                 subprocess.run(["uv", "venv", "--allow-existing", "--python", python, str(environment)], check=True)
                 found = ["--find-links", str(wheels[0].parent)] if wheels else []
                 named = [f"--index={index}" for index in indexes]
-                subprocess.run(["uv", "pip", "install", "--python", str(interpreter), *found, *named, "--editable", str(project)], check=True)
+                install = ["uv", "pip", "install", "--python", str(interpreter), *found, *named, "--editable", str(project)]
+                offered = [str(wheel) for wheel in sdk] if machine else []
+                if not offered or subprocess.run([*install, *offered]).returncode != 0:
+                    subprocess.run(install, check=True)
             live_paths(environment)
 
         capture({canonicalize_name(wheel.name.split("-")[0]) for wheel in sdk})
@@ -208,7 +214,7 @@ def install_editable(*, project: Path, environment: Path, wheels: list[Path], di
     try:
         (root / "env").symlink_to(environment.resolve(), target_is_directory=True)
         # Described by the environment's own Runtime, from the project's directory.
-        live = root / "env" / "bin" / "python"
+        live = layout.interpreter(root / "env")
         interface = in_environment(live, Describe(str(project), str(live)), DESCRIPTION_DECODER).interface
         return publish_generation(root, metadata, interface, callees, ready.read_text(), source_digest)
     except BaseException:
@@ -247,7 +253,7 @@ def install_captured(*, project: Path | None, wheels: list[Path], requirements: 
     root = generations.resolve() / uuid.uuid4().hex
     root.mkdir(); (root / ".hold").touch()
     try:
-        interpreter = root / "env" / "bin" / "python"
+        interpreter = layout.interpreter(root / "env")
         frozen = project and (project / "uv.lock").is_file()
         if frozen:
             source = root / "source"
