@@ -5,19 +5,15 @@
 header       = ["cozytensors/1", chunks, encodings, components, metadata]
 chunks       = [* chunk]
 chunk        = [sha256: digest32, length: uint]
-encodings    = [+ encoding]
-encoding     = [[+ dtype], optional-uint, [+ encoding-role], optional-ref]
-encoding-role = [name, carrier, relation]
-carrier      = [0] / [1, [+ dtype]]
-relation     = [0] / [1, [* dim]]
-dim          = [0, uint] / [1, uint, positive] / [2, uint, positive]
-             / [3, uint, positive, positive] / [4, positive] / [5, positive]
-optional-uint = [] / [positive]
-optional-ref = [] / [[digest32, positive]]
+encodings    = [* encoding]        ; each distinct encoding once, in order of first use
+encoding     = [scheme: tstr .size (1..), params]
+params       = {* tstr => value}   ; the scheme's params (spec §6)
 components   = [* component]       ; construction order
 component    = [name, tensors]
 tensors      = [* tensor]          ; construction order
-tensor       = [tensor-key, dtype, shape, uint, parts]
+tensor       = [tensor-key, dtype, shape, encoding: uint, parts]
+; encoding 0 is plain: one part, role "", the tensor's dtype and shape.
+; encoding i > 0 is encodings[i - 1].
 parts        = [+ part]            ; construction order
 part         = [role, dtype, shape, body]
 body         = [chunk: uint, offset: uint, length: uint]
@@ -27,7 +23,6 @@ body         = [chunk: uint, offset: uint, length: uint]
 digest32     = bstr .size 32
 shape        = [* uint]
 dtype        = 0..11
-positive     = uint .gt 0
 metadata     = {* tstr => value}   ; free-form; keys in bytewise order of their encodings
 value        = bool / int / tstr / [* value] / {* tstr => value}
 
