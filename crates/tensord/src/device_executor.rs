@@ -1022,8 +1022,10 @@ impl Link {
     }
 
     /// A frame goes to the call it names. One naming none goes to the outstanding process-wide
-    /// command, else to the only exchange outstanding; otherwise a progress frame shows on
-    /// every call and a request is refused alone. Any frame shows the executor moving.
+    /// command, else: a request to any call in flight, whose services answer it for the
+    /// executor (its weights work); a reply to the only exchange outstanding; a progress frame
+    /// to every call. A request no exchange takes is refused alone. Any frame shows the
+    /// executor moving.
     fn route(&self, (frame, fds): Inbound) -> io::Result<()> {
         let routes = self.routes.lock().unwrap();
         routes.waiting.values().for_each(|waiter| waiter.watch.frame());
@@ -1037,7 +1039,10 @@ impl Link {
                 let waiter = match frame.request_id.as_str() {
                     "" => routes.waiting.get("").or_else(|| {
                         let mut all = routes.waiting.values();
-                        all.next().filter(|_| all.next().is_none())
+                        match frame.event {
+                            Some(Event::Request) => all.next(),
+                            _ => all.next().filter(|_| all.next().is_none()),
+                        }
                     }),
                     id => routes.waiting.get(id),
                 };
@@ -1088,11 +1093,18 @@ impl Link {
         routes.waiting.insert(id.into(), Waiter { inbox, watch });
         Ok(frames)
     }
-    fn leave(&self, id: &str, ended: bool) {
-        let mut routes = self.routes.lock().unwrap();
-        routes.waiting.remove(id);
-        if ended {
-            routes.canceled.remove(id);
+    /// The exchange under `id` is over: a frame still queued for it (a request that named no
+    /// call, sent as its reply came) goes to another.
+    fn leave(&self, id: &str, ended: bool, frames: std::sync::mpsc::Receiver<Inbound>) {
+        {
+            let mut routes = self.routes.lock().unwrap();
+            routes.waiting.remove(id);
+            if ended {
+                routes.canceled.remove(id);
+            }
+        }
+        for inbound in frames.try_iter() {
+            let _ = self.route(inbound);
         }
     }
     /// Why an exchange's frames stopped.
@@ -1981,11 +1993,11 @@ impl DeviceExecutor {
         let worst_gap = *self.worst_gap.lock().unwrap();
         let watching =
             Watching::start(self.exact.try_clone()?, meter, self.liveness, worst_gap, services.waits(), command.name())?;
-        let result = self
-            .link
-            .enter(id, watching.watch())
-            .and_then(|frames| self.exchange(command, group, services, &frames));
-        self.link.leave(id, matches!(command, DeviceCommand::Invoke { .. }));
+        let result = self.link.enter(id, watching.watch()).and_then(|frames| {
+            let result = self.exchange(command, group, services, &frames);
+            self.link.leave(id, matches!(command, DeviceCommand::Invoke { .. }), frames);
+            result
+        });
         // Whatever the run was computing when its exchange ended, its waiters compute themselves.
         if let (Some(memo), Some((run, _))) = (&self.memo, command.spool()) {
             memo.release(run);
@@ -2596,11 +2608,14 @@ mod link_tests {
         send(&mut runtime, json!({"event": "progress", "request_id": "b", "stage": "b1"}));
         send(&mut runtime, json!({"event": "request", "request_id": "a", "seq": 1, "kind": "device_room"}));
         send(&mut runtime, json!({"event": "request", "request_id": "b", "seq": 2, "kind": "device_room"}));
-        let answers: BTreeMap<_, _> = (0..2)
+        // The executor's own weights work names no call: a call in flight answers it.
+        send(&mut runtime, json!({"event": "request", "request_id": "", "seq": 3, "kind": "device_room"}));
+        let answers: BTreeMap<_, _> = (0..3)
             .map(|_| read(&mut runtime))
             .map(|answer| (answer["seq"].as_u64().unwrap(), answer["cap_bytes"].as_i64().unwrap()))
             .collect();
-        assert_eq!(answers, BTreeMap::from([(1, 7), (2, 9)]));
+        assert_eq!((answers[&1], answers[&2]), (7, 9));
+        assert!([7, 9].contains(&answers[&3]) && answers.len() == 3, "{answers:?}");
         let probe = {
             let executor = executor.clone();
             std::thread::spawn(move || executor.command(&DeviceCommand::Probe { collect: false }, &mut Baseline))
