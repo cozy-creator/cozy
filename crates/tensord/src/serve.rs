@@ -7,7 +7,7 @@ use crate::{
 use std::{io, path::PathBuf, process::ExitCode, sync::Arc};
 use fs2::FileExt;
 use tensorfs_core::{
-    fetch::{Fetcher, Volume},
+    fetch_v1::{Fetcher, Volume},
     store::Store,
 };
 
