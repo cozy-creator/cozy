@@ -9,7 +9,6 @@ impl<T: Read + Write> Io for T {}
 
 #[derive(Clone)]
 struct Ask {
-    path: String,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
 }
@@ -128,14 +127,6 @@ impl Origin {
                         }
                         let text = String::from_utf8(header).unwrap();
                         let ask = Ask {
-                            path: text
-                                .lines()
-                                .next()
-                                .unwrap()
-                                .split_whitespace()
-                                .nth(1)
-                                .unwrap()
-                                .into(),
                             headers: text
                                 .lines()
                                 .skip(1)
@@ -528,83 +519,6 @@ fn tls_range_fixture_measures_setup_reuse_with_identical_bytes_and_requests() {
         assert_eq!(origin.asks.lock().unwrap().len(), 8);
     }
     println!("TLS 8MiB, eight requests, 30ms connection setup: {timings:?}");
-}
-
-#[test]
-fn concurrent_pushes_to_one_origin_keep_their_sockets_across_signed_objects() {
-    use crate::transport::push::{push_object, UploadGrant};
-    let origin = Origin::new(false, Duration::ZERO, |_, _| Reply::body(b""));
-    let root = std::env::temp_dir().join(format!(
-        "tfs-push-reuse-{}-{}",
-        std::process::id(),
-        origin.url.rsplit(':').next().unwrap()
-    ));
-    let store = crate::store::Store::init(&root).unwrap();
-    let objects: Vec<_> = (0..12u8)
-        .map(|index| {
-            let body = vec![index; 256 << 10];
-            let object = crate::ids::ObjectRef::of(&body);
-            store
-                .put_stream(&mut body.as_slice(), Some(&object), &Default::default())
-                .unwrap();
-            object
-        })
-        .collect();
-    let streams = 3;
-    thread::scope(|scope| {
-        for lane in objects.chunks(objects.len() / streams) {
-            let (store, origin) = (&store, &origin);
-            scope.spawn(move || {
-                for object in lane {
-                    // Each grant is its own signed target with its own signed checksum.
-                    let grant = UploadGrant {
-                        url: format!(
-                            "{}/o/{}?X-Amz-Signature={}",
-                            origin.url, object.sha256, object.sha256
-                        ),
-                        headers: vec![("x-amz-checksum-sha256".into(), object.sha256.clone())],
-                    };
-                    let pushed = push_object(
-                        store,
-                        &object.sha256,
-                        false,
-                        &grant,
-                        &Origin::policy(),
-                        &Anonymous,
-                        Deadline::none(),
-                        // Test socket reuse at the production sampling cadence. A
-                        // 10ms cadence gives a 60ms silence floor and can retry an
-                        // otherwise healthy PUT when the fixture thread is delayed.
-                        &Ledger::new(),
-                        "",
-                    )
-                    .unwrap();
-                    assert_eq!(
-                        (pushed.http_status, pushed.bytes_sent),
-                        (200, object.length)
-                    );
-                }
-            });
-        }
-    });
-    let asks = origin.asks.lock().unwrap();
-    assert_eq!(asks.len(), objects.len());
-    for ask in asks.iter() {
-        let object = crate::ids::ObjectRef::of(&ask.body);
-        assert_eq!(
-            ask.path,
-            format!("/o/{}?X-Amz-Signature={}", object.sha256, object.sha256)
-        );
-        assert_eq!(
-            ask.header("x-amz-checksum-sha256"),
-            Some(object.sha256.as_str())
-        );
-        assert_eq!(ask.header("connection"), Some("keep-alive"));
-    }
-    // No stream ever waits on another's socket, and none opens a second one.
-    assert!(origin.count() <= streams, "{} connections", origin.count());
-    drop(asks);
-    let _ = std::fs::remove_dir_all(root);
 }
 
 /// A pull's hub calls ride one warm connection, chunked answers included; one the hub retired

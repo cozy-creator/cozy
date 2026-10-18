@@ -63,11 +63,6 @@ pub enum Judge {
     /// which is the owner's rule read literally: the lack of measured progress, never a
     /// number of seconds.
     Transfer,
-    /// An UPLOAD. Every wait — connect, handshake, each write, and the answer after the
-    /// last body byte — is judged by this exchange's own silence against the ledger's
-    /// patience. Nothing it moves lands here, so it neither counts as progress nor teaches
-    /// the pace.
-    Silence,
     /// Neither. The caller's deadline is the only bound, which is what a foreign-source
     /// read with its own per-part retry loop above it already had.
     Deadline,
@@ -184,7 +179,7 @@ pub(super) fn handshake_verdict(
 
 impl Judge {
     pub(super) fn silent_is_stall(self) -> bool {
-        matches!(self, Judge::Stream | Judge::Silence)
+        matches!(self, Judge::Stream)
     }
 }
 
@@ -810,13 +805,6 @@ impl<'l> Response<'l> {
         }
     }
 
-    /// The wait this answer states (`Retry-After`), read in the origin's own clock:
-    /// delta-seconds, or an HTTP-date against the answer's own `Date`. `None` when it
-    /// states nothing readable.
-    pub fn stated_wait(&self) -> Option<Duration> {
-        stated_wait(&self.headers)
-    }
-
     /// The whole body, streamed into `out`; the bytes written.
     pub fn read_into(mut self, out: &mut dyn std::io::Write) -> Result<u64> {
         let mut buf = vec![0u8; 1 << 20];
@@ -1182,25 +1170,19 @@ impl Read for BodyReader<'_> {
     }
 }
 
-/// A request body. A store object streams from its verified descriptor in bounded chunks,
-/// so an upload's memory does not grow with the object.
+/// A request body.
 #[derive(Clone, Copy)]
 pub enum Payload<'b> {
     Bytes(&'b [u8]),
-    Object(&'b crate::store::VerifiedFile),
 }
 
 impl Payload<'_> {
     fn len(&self) -> u64 {
         match self {
             Payload::Bytes(bytes) => bytes.len() as u64,
-            Payload::Object(file) => file.len(),
         }
     }
 }
-
-/// The largest slice of a streamed body held in memory at once.
-const BODY_CHUNK: u64 = 1 << 20;
 
 /// One exchange with an in-memory body. See [`send`].
 #[allow(clippy::too_many_arguments)]
@@ -1375,29 +1357,6 @@ fn exchange<'l>(
         write_silence,
         fail,
     )?;
-    if let Some(Payload::Object(file)) = body {
-        let mut chunk = vec![0u8; file.len().min(BODY_CHUNK) as usize];
-        let mut at = 0u64;
-        while at < file.len() {
-            let n = chunk.len().min((file.len() - at) as usize);
-            file.read_exact_at(&mut chunk[..n], at)
-                .map_err(|error| Refusal {
-                    code: Code::IO_FAILED,
-                    detail: format!("read request body at byte {at}: {error}"),
-                })?;
-            write_all(
-                &mut wire,
-                &chunk[..n],
-                deadline,
-                ledger,
-                judge,
-                opened,
-                write_silence,
-                fail,
-            )?;
-            at += n as u64;
-        }
-    }
 
     let (status, response_headers, spill, http11) =
         read_head(&mut wire, deadline, ledger, judge, opened, fail)?;

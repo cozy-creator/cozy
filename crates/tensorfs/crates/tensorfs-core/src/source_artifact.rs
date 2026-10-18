@@ -4,7 +4,6 @@ use crate::{
     canon::{as_arr, Fields, Value},
     catalog::WriterGuard,
     err::{refuse, Code, Refusal, Result},
-    fetch_v1::FetchPlan,
     ids::{prefixed, Doc, ObjectRef, Plain},
     manifest::Manifest,
     storage::HeldKey,
@@ -455,102 +454,6 @@ pub(crate) fn held_objects(store: &Store) -> Result<Vec<HeldKey>> {
         }
     }
     Ok(result)
-}
-
-/// Fence a stopped predecessor, retaining its completed objects and verified prefixes
-/// independently. Existing recipient checkpoints win; adoption never transfers ownership.
-pub fn adopt_partial(store: &Store, source: &str, owner: &str) -> Result<TreeRoot> {
-    if source == owner {
-        return refuse(
-            Code::TRANSACTION_CONFLICT,
-            "partial adoption needs independent owners",
-        );
-    }
-    let original = read(store, source)?.ok_or_else(|| Refusal {
-        code: Code::ROOT_ABSENT,
-        detail: "partial source root is absent".into(),
-    })?;
-    let source_writer = Writer::open(store, source, original.manifest.clone())?;
-    let original = source_writer.root.clone();
-    if original.complete {
-        return refuse(
-            Code::TRANSACTION_CLOSED,
-            "complete source should use retained-result adoption",
-        );
-    }
-    let mut recipient = Writer::open(store, owner, original.manifest)?;
-    if recipient.root.complete {
-        return refuse(
-            Code::TRANSACTION_CONFLICT,
-            "recipient source is already complete",
-        );
-    }
-    if !original.objects.is_empty() {
-        // Incomplete roots reserve expected members before downloading them. Only
-        // present, natively verified objects can become completed recipient work.
-        let (plan, _) =
-            FetchPlan::of_objects(store, "source-progress-adoption", &original.objects)?;
-        for object in plan.held {
-            recipient.landed(&object)?;
-        }
-    }
-    crate::transport::sources::adopt_owner(store, source, owner, |object| {
-        recipient.landed(object)
-    })?;
-    Ok(recipient.root.clone())
-}
-
-/// Cancel a recipient before or after adoption. The original retained receipt supplies
-/// immutable producer/manifest identity; a durable tombstone fences any later retain.
-pub fn release_retention(
-    store: &Store,
-    source: &str,
-    receipt_digest: &str,
-    owner: &str,
-) -> Result<()> {
-    let _writer = WriterGuard::acquire(store.root())?;
-    let _lock = lock(store)?;
-    let original = read(store, source)?.ok_or_else(|| Refusal {
-        code: Code::ROOT_ABSENT,
-        detail: "source receipt root is absent".into(),
-    })?;
-    prefixed("source receipt", receipt_digest)?;
-    if crate::ids::object_id(&original.receipt()?) != receipt_digest {
-        return refuse(
-            Code::CROSS_SUBJECT_REPLAY,
-            "tree release differs from original native receipt",
-        );
-    }
-    let mut root = match read(store, owner)? {
-        Some(root) => {
-            if root.producer != original.producer || root.manifest != original.manifest {
-                return refuse(
-                    Code::CROSS_SUBJECT_REPLAY,
-                    "tree release names another recipient receipt",
-                );
-            }
-            root
-        }
-        None => TreeRoot {
-            owner: prefixed("tree recipient", owner)?,
-            ..original
-        },
-    };
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path(store, owner)?.with_extension("lock"))
-        .map_err(io)?;
-    file.try_lock().map_err(|_| Refusal {
-        code: Code::STORE_BUSY,
-        detail: "source writer must stop before recipient release".into(),
-    })?;
-    root.released = true;
-    root.objects.clear();
-    write(store, &root)?;
-    crate::transport::sources::discard_owner(store, owner)
 }
 
 pub fn check_roster(owner: &str, tree: &Manifest) -> Result<()> {

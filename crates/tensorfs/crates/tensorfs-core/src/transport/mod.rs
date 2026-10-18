@@ -41,7 +41,6 @@ mod ledger;
 mod net;
 pub(crate) use crate::fetch::policy;
 mod pull;
-mod push;
 pub(crate) mod sources;
 
 #[cfg(test)]
@@ -61,7 +60,6 @@ pub use ledger::{
 };
 pub use policy::{base_host, blocked, is_loopback_origin, resolve, CheckedUrl, SourcePolicy};
 pub use pull::{FetchObserver, Fetched, ObjectSource, ObjectUrls, WalkOutcome, RETRYABLE_STATUS};
-pub use push::{push_object, Pushed, UploadGrant, MAX_GRANT_BYTES, PUT_ATTEMPTS};
 
 pub use sources::{SourceDownload, SourceProgress};
 

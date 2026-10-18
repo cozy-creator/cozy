@@ -10,7 +10,6 @@
 use super::download::PART_BYTES;
 use super::{PullCancellation, STREAMS};
 use crate::err::{refuse, Code, Refusal, Result};
-use crate::fetch_v1::FetchPlan;
 use crate::ids::{prefixed, ObjectRef};
 use crate::sha256::{hex, Sha256};
 use crate::store::{Fault, Store};
@@ -18,7 +17,7 @@ use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use cozy_platform::durable::FileAt as _;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 #[derive(Clone, Debug)]
@@ -351,97 +350,6 @@ pub(crate) fn bytes(store: &Store) -> Result<u64> {
         }
     }
     Ok(total)
-}
-
-/// The identity a record's first line names.
-fn recorded_object(dir: &Path) -> Result<Option<ObjectRef>> {
-    let mut text = String::new();
-    match File::open(dir.join("chunks")) {
-        Ok(file) => file.take(256).read_to_string(&mut text).map_err(io)?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(io(e)),
-    };
-    let line = text.lines().next().unwrap_or_default();
-    let mut fields = line.split_whitespace();
-    match (fields.next(), fields.next().and_then(|n| n.parse().ok())) {
-        (Some(sha256), Some(length))
-            if dir.file_name().and_then(|n| n.to_str()) == Some(sha256) =>
-        {
-            Ok(Some(ObjectRef {
-                sha256: sha256.into(),
-                length,
-            }))
-        }
-        _ => refuse(
-            Code::TRANSACTION_CONFLICT,
-            "source download record names another object",
-        ),
-    }
-}
-
-/// Copy an independently owned download's recorded chunks while both owners are fenced.
-/// A donor object that is whole is admitted through the digest-checked door instead.
-pub(crate) fn adopt_owner(
-    store: &Store,
-    source: &str,
-    owner: &str,
-    mut landed: impl FnMut(&ObjectRef) -> Result<()>,
-) -> Result<()> {
-    let entries = match fs::read_dir(owner_dir(store, source)?) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(io(e)),
-    };
-    for entry in entries {
-        let dir = entry.map_err(io)?.path();
-        let Some(object) = recorded_object(&dir)? else {
-            continue;
-        };
-        // Admission may have linked the bytes before the donor recorded this member: the
-        // Store's own verified object is reused, and the donor's files are left untouched.
-        let (plan, _) = FetchPlan::of_objects(
-            store,
-            "source-prefix-adoption",
-            std::slice::from_ref(&object),
-        )?;
-        if !plan.held.is_empty() {
-            landed(&object)?;
-            continue;
-        }
-        let from = Part::open(store, source, &object, false)?;
-        let done = from.done();
-        if missing(&done, object.length).is_empty() {
-            let mut reader = Read::take(&from.file, object.length);
-            store.put_stream(&mut reader, Some(&object), &Fault::default())?;
-            landed(&object)?;
-            continue;
-        }
-        let to = Part::open(store, owner, &object, true)?;
-        let have = to.done();
-        let wanted: Vec<(u64, u64)> = done
-            .into_iter()
-            .filter(|(first, end)| have.get(first) != Some(end))
-            .collect();
-        store.admits(wanted.iter().map(|(first, end)| end - first).sum())?;
-        let mut buffer = vec![0u8; 1 << 20];
-        for (first, end) in wanted {
-            let mut at = first;
-            while at < end {
-                let want = buffer.len().min((end - at) as usize);
-                let read = from.file.read_at(&mut buffer[..want], at).map_err(io)?;
-                if read == 0 {
-                    return refuse(
-                        Code::LENGTH_MISMATCH,
-                        "an adopted source range was truncated",
-                    );
-                }
-                to.file.write_all_at(&buffer[..read], at).map_err(io)?;
-                at += read as u64;
-            }
-            to.record(first, end, &Fault::default())?;
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
