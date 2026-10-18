@@ -687,6 +687,66 @@ fn asset_fidelity_reaches_the_package_by_label_or_index() {
     );
 }
 
+/// A local directory given to a Tree input reaches the package whole: the CLI sends a TensorFS
+/// manifest naming its files with them, and the machine materializes the tree from it. Sent again,
+/// the machine already holds it.
+#[test]
+fn a_local_directory_reaches_a_tree_input_whole() {
+    let Some(home) = Home::new() else { return };
+    if std::env::var_os("COZY_TEST_TENSORD").is_none() {
+        eprintln!("skipped: no TensorD (COZY_TEST_TENSORD is unset)");
+        return;
+    }
+    let _machine = common::tensord::added(&home, "m1");
+    let work = home.path().join("work");
+    copy(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/package/tiny"),
+        &work.join("tiny"),
+    );
+    let code = work.join("tiny/tiny/__init__.py");
+    let tree = "\n\nfrom cozy_runtime.author import Tree\n\n\n\
+                class TreeInput(msgspec.Struct):\n    constants: Tree\n\n\n\
+                class TreeOutput(msgspec.Struct):\n    files: dict[str, str]\n\n\n\
+                @app.entrypoint(accelerator=False)\n\
+                def tree(payload: TreeInput) -> TreeOutput:\n    \
+                root = payload.constants.path\n    \
+                found = sorted(p for p in root.rglob(\"*\") if p.is_file())\n    \
+                return TreeOutput({p.relative_to(root).as_posix(): p.read_text() for p in found})\n";
+    let mut text = std::fs::read_to_string(&code).unwrap();
+    text.push_str(tree);
+    std::fs::write(&code, text).unwrap();
+    std::fs::create_dir_all(work.join("constants/sub")).unwrap();
+    std::fs::write(work.join("constants/pos_emb.pt"), "positive").unwrap();
+    std::fs::write(work.join("constants/sub/neg_emb.pt"), "negative").unwrap();
+
+    let args = [
+        "--json",
+        "run",
+        "./tiny/tree",
+        "constants=./constants",
+        "--on",
+        "m1",
+    ];
+    let first = cozy(&home, &work, &args);
+    let run = completed(&first);
+    let files = serde_json::json!({"pos_emb.pt": "positive", "sub/neg_emb.pt": "negative"});
+    assert_eq!(run["result"]["files"], files, "{run}");
+
+    let again = cozy(&home, &work, &args);
+    assert_eq!(completed(&again)["result"]["files"], files, "{again:?}");
+    let reused = again
+        .stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .any(|e| {
+            e["type"] == "run.log"
+                && e["text"]
+                    .as_str()
+                    .is_some_and(|t| t.starts_with("reused constants"))
+        });
+    assert!(reused, "{again:?}");
+}
+
 /// Counts the bytes sent to `target` through it: a TCP relay a machine is added behind.
 struct Relay {
     address: String,

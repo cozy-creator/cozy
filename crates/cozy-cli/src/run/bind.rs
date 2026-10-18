@@ -12,6 +12,7 @@ use std::{
 };
 
 use cozy_proto::{
+    calcifer::StagedInput,
     error::{Error, Kind},
     ids::Digest,
 };
@@ -49,6 +50,8 @@ pub struct Terms {
     pub user_home: PathBuf,
     /// Where input files' digests are remembered across runs; None reads each file every time.
     pub digests: Option<PathBuf>,
+    /// Where input trees' manifests are written for the run to send; None: the temp directory.
+    pub manifests: Option<PathBuf>,
 }
 
 #[derive(Debug, Default, PartialEq)]
@@ -60,6 +63,8 @@ pub struct Bound {
     pub destination: Option<String>,
     /// Undeclared fields that were dropped, as people read their paths.
     pub ignored: Vec<String>,
+    /// The files of input trees, sent with the run; their manifests (in `files`) name them.
+    pub tree_files: Vec<StagedInput>,
 }
 
 /// A local file bound to a payload field, whose value is its digest.
@@ -179,8 +184,9 @@ pub fn bind(
     let positional = binder.read_terms(&inputs)?;
     binder.primary(positional)?;
     binder.loras()?;
-    let files = binder.attach()?;
+    let mut files = binder.attach()?;
     binder.fidelities()?;
+    let tree_files = binder.trees(&mut files)?;
     binder.seed();
     let ignored = validate(target, release, callable, &mut binder.document)?;
     Ok(Bound {
@@ -189,6 +195,7 @@ pub fn bind(
         models: binder.choices.into_values().collect(),
         destination,
         ignored,
+        tree_files,
     })
 }
 
@@ -735,6 +742,48 @@ impl Binder<'_> {
         Ok(files)
     }
 
+    /// Each local directory at a Tree input becomes a TensorFS manifest naming its files: the field
+    /// names the manifest by its digest, as the machine materializes the tree; the files go too.
+    fn trees(&mut self, files: &mut Vec<InputFile>) -> Result<Vec<StagedInput>, Error> {
+        let mut found = vec![];
+        for field in &self.callable.request.fields {
+            if let Some(value) = self.document.get(&field.name) {
+                tree_dirs(&field.ty, value, &field.name, &mut found);
+            }
+        }
+        let manifests = (self.terms.manifests.clone())
+            .unwrap_or_else(|| std::env::temp_dir().join("cozy-trees"));
+        let mut members = vec![];
+        for (field, source) in found {
+            let root = self.resolve(Path::new(&source));
+            if !root.is_dir() {
+                return Err(usage(
+                    "tree_not_a_directory",
+                    format!("{field}: {} is not a directory", root.display()),
+                ));
+            }
+            let staged = super::tree::stage(&root, self.terms.digests.as_deref(), &manifests)?;
+            let parts: Vec<String> = field.split('.').map(str::to_owned).collect();
+            let digest = staged.manifest.digest;
+            set_path(
+                &mut self.document,
+                &parts,
+                Value::String(digest.to_string()),
+            )?;
+            files.push(InputFile {
+                field,
+                path: staged.manifest.path,
+                digest,
+                length: staged.manifest.length,
+                media_type: super::tree::MEDIA.into(),
+                order: 0,
+            });
+            members.extend(staged.files);
+        }
+        files.sort_by(|a, b| a.field.cmp(&b.field));
+        Ok(members)
+    }
+
     /// `--asset-fidelity`: each hint goes on the Assets occurrence its label or index names, for
     /// the package to read.
     fn fidelities(&mut self) -> Result<(), Error> {
@@ -1195,10 +1244,39 @@ fn embedded_files(ty: &Type, value: &Value, path: &str, out: &mut Vec<Spec>) -> 
     Ok(())
 }
 
+/// Local directories at Tree positions: each field's path and the directory as written.
+fn tree_dirs(ty: &Type, value: &Value, path: &str, out: &mut Vec<(String, String)>) {
+    match (ty, value) {
+        (Type::Tree, Value::String(source))
+            if !source.starts_with("sha256:") && !source.is_empty() =>
+        {
+            out.push((path.to_owned(), source.clone()));
+        }
+        (Type::Union { branches, .. }, value) => {
+            for branch in branches {
+                tree_dirs(branch, value, path, out);
+            }
+        }
+        (Type::List(item), Value::Array(values)) => {
+            for (i, value) in values.iter().enumerate() {
+                tree_dirs(item, value, &format!("{path}.{i}"), out);
+            }
+        }
+        (Type::Struct(s), Value::Object(object)) => {
+            for field in &s.fields {
+                if let Some(value) = object.get(&field.name) {
+                    tree_dirs(&field.ty, value, &format!("{path}.{}", field.name), out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Rewrites relative file names at input-file positions against `base`.
 fn relative_files(ty: &Type, value: &mut Value, base: &Path) {
     match (ty, value) {
-        (Type::Asset(_), Value::String(source))
+        (Type::Asset(_) | Type::Tree, Value::String(source))
             if !source.contains("://")
                 && !source.starts_with("sha256:")
                 && !is_explicit_path(source)
@@ -1206,7 +1284,7 @@ fn relative_files(ty: &Type, value: &mut Value, base: &Path) {
         {
             *source = base.join(&*source).to_string_lossy().into_owned();
         }
-        (Type::Asset(_), Value::String(source))
+        (Type::Asset(_) | Type::Tree, Value::String(source))
             if source.starts_with("./") || source.starts_with("../") =>
         {
             *source = base.join(&*source).to_string_lossy().into_owned();
