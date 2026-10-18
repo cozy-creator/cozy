@@ -46,6 +46,8 @@ struct Cohort {
     tensorfs: Option<Member>,
     /// `"install"`: the build toolchain, alone (`cozy machine toolchain install`).
     toolchain: Option<String>,
+    /// The `cozy` release the caller installed at the machine's launch path (`cozy update`).
+    cozy: Option<String>,
     #[serde(flatten)]
     unknown: BTreeMap<String, serde_json::Value>,
 }
@@ -216,6 +218,7 @@ fn stage(
         pin: None,
         runtime: choose("runtime", cohort.runtime)?,
         tensorfs: choose("tensorfs", cohort.tensorfs)?,
+        cozy: cohort.cozy,
         toolchain,
     };
     updates
@@ -271,6 +274,8 @@ fn state(id: &str, update: &Update) -> v1::RunState {
         attempt: 1,
         waiting: if observation_error(update).is_some() {
             update.error.clone()
+        } else if update.state == "waiting_activation" && update.waiting_for > 0 {
+            format!("waiting for its {} runs to end", update.waiting_for)
         } else if update.state == "waiting_activation" {
             "waiting for the machine to be idle".into()
         } else {
@@ -310,6 +315,8 @@ fn step_event(update: &Update, step: &crate::machine::update::Step) -> v1::Event
         stage => v1::Event::Progress(v1::Progress {
             stage: stage.into(),
             fraction: -1.0,
+            completed: step.completed.into(),
+            total: step.total.into(),
             ..Default::default()
         }),
     }
