@@ -17,6 +17,7 @@ use target::Target;
 mod bind;
 mod catalog;
 mod describe;
+mod digests;
 mod follow;
 pub(crate) mod interface;
 mod list;
@@ -382,6 +383,7 @@ fn terms(ctx: &Context, args: &RunArgs) -> Result<Terms, Error> {
             .unwrap_or_else(follow::mint_key),
         cwd,
         user_home: ctx.user_home.clone(),
+        digests: Some(ctx.home.root().join("cache").join("digests")),
     })
 }
 

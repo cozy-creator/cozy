@@ -12,7 +12,6 @@ publish.workspace = true
 [dependencies]
 calcifer.workspace = true
 cozy-cli.workspace = true
-migrate.workspace = true
 
 # This computer's machine runs on Linux; elsewhere `cozy machine serve` refuses.
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -25,13 +24,10 @@ cozy-proto.workspace = true
 ed25519-dalek.workspace = true
 hex.workspace = true
 hub-client = { workspace = true, features = ["testing"] }
-migrate = { workspace = true, features = ["testing"] }
 portable-pty.workspace = true
-prost.workspace = true
 rcgen.workspace = true
 reqwest.workspace = true
 rustls.workspace = true
-rusqlite.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tempfile.workspace = true

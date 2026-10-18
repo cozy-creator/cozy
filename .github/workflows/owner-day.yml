@@ -81,6 +81,7 @@ jobs:
       - name: The owner's day
         env:
           COZY_TENSORD: workspace
+          COZY_WORKER: branch
           COZY_TEST_SHAPED_PORT: '47123'
           COZY_TEST_SHAPED_BPS: '325000'
           COZY_TEST_TFS: ${{ github.workspace }}/tools/evaluator/.venv/bin/tfs

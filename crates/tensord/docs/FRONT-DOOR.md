@@ -1,12 +1,13 @@
 # Front door
 
-One TLS listener (`api/server.rs`) serves `cozy.machine.v1` (`MACHINE-API.md`), with a 16 MiB
-message cap, plus HTTP `GET /v1/health` (204, or 401 if an `Authorization` header is sent). The
-readiness receipt is Status's `receipt`, read without a capability. Every `cozy.worker.v1` call answers FAILED_PRECONDITION
-(`api/retired.rs`): released CLIs print that message, which names the cozy CLI as the side to
-upgrade. `machine_api.rs` (`NativeBackend`) implements the backend over the journal, TensorFS
-store and installer; the API owns no scheduler, journal or store. Backend calls run in
-`spawn_blocking`; an observer's disconnect never cancels a run.
+One TLS listener (`api/server.rs`): tokio-rustls offering ALPN `h2, http/1.1`, hyper-util's auto
+builder and one axum `Router` (`api/http.rs`) serving the machine API (`MACHINE-API.md`) and
+`GET /v1/health` (204, or 401 if an `Authorization` header is sent). HTTP/2 connections are PINGed
+every 20 s and dropped after 20 s unanswered; TCP keepalive judges HTTP/1.1 lanes the same way.
+The readiness receipt is `GET /v1/status`'s `receipt`, read without a capability.
+`machine_api.rs` (`NativeBackend`) implements the backend over the journal, TensorFS store and
+installer; the API owns no scheduler, journal or store. Backend calls run in `spawn_blocking`; an
+observer's disconnect never cancels a run.
 
 ## Identity and configuration (`identity.rs`)
 
@@ -30,7 +31,6 @@ The readiness receipt is `{payload, hmac_sha256}`, where the HMAC covers
 `prepare_uploaded(InstallerConfig, UploadedPackage)` materializes verified descriptors into a
 private stage and runs `tensord_client.installer install-captured` (see `PACKAGE-BRIDGE.md`).
 - No wall-clock kill. Stdout is capped at 8 MiB.
-- A failure `{kind: "install_failed", code, detail}` maps `*_unsupported` to `UNIMPLEMENTED`.
-  Anything else is `FAILED_PRECONDITION`.
+- A failure `{kind: "install_failed", code, detail}` is refused with its code.
 - It returns `PreparedGeneration`: a 32-hex identity, the record, interface bytes, and a shared
   `.hold` lock.

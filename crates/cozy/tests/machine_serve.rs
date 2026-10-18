@@ -65,11 +65,11 @@ fn this_computers_machine_serves_status_and_calcifer_adds_it() {
     // Status over the machine API, under a Cozy-Cap the home admits.
     let endpoint = Endpoint { worker_id: "local".into(), address: address.clone(), pin };
     let frame = tokio::runtime::Runtime::new().unwrap().block_on(async {
-        let link = Link::new(&endpoint, key).unwrap();
-        let mut frames = link.status(false).await.unwrap();
-        frames.message().await.unwrap().expect("a frame")
+        Link::new(&endpoint, key).unwrap().status().await.unwrap()
     });
     assert_eq!((frame.worker_id.as_str(), frame.phase.as_str()), ("local", "ready"), "{frame:?}");
+    // The machine is this cozy release, not a TensorD of its own.
+    assert_eq!(frame.version, env!("CARGO_PKG_VERSION"), "{frame:?}");
     assert!(frame.gpus.is_empty(), "CUDA_VISIBLE_DEVICES hides every GPU: {:?}", frame.gpus);
 
     // Calcifer adds it by address and fingerprint; its owner key, minted now, is admitted at once.

@@ -5,10 +5,6 @@
 mod common;
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use tensord::api::{
-    capability::{self, Grant},
-    v1::{self, machine_client::MachineClient},
-};
 use ed25519_dalek::SigningKey;
 use std::{
     path::PathBuf,
@@ -17,15 +13,11 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     },
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_rustls::rustls;
-use tonic::{
-    metadata::MetadataValue,
-    transport::{Certificate, ClientTlsConfig, Endpoint},
-    Code, Request,
-};
+use tokio_stream::StreamExt;
 
 const WORKER: &str = "outage-test";
 const OWNER: [u8; 32] = [41; 32];
@@ -105,30 +97,6 @@ async fn serve_hub(hub: Arc<Hub>) -> (u16, Vec<u8>) {
     (port, der)
 }
 
-fn cap(signer: [u8; 32]) -> String {
-    let expires = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64
-        + 600;
-    let grant = Grant {
-        machine: WORKER.into(),
-        action: capability::MACHINE.into(),
-        expires,
-        ..Default::default()
-    };
-    capability::mint(&SigningKey::from_bytes(&signer), grant)
-}
-
-fn status(signer: [u8; 32]) -> Request<v1::StatusRequest> {
-    let mut request = Request::new(v1::StatusRequest { keepalive: false });
-    request.metadata_mut().insert(
-        "authorization",
-        MetadataValue::try_from(format!("Cozy-Cap {}", cap(signer))).unwrap(),
-    );
-    request
-}
-
 async fn until(what: &str, mut done: impl FnMut() -> bool) {
     let start = Instant::now();
     while !done() {
@@ -203,59 +171,32 @@ async fn an_unreachable_hub_revokes_nothing_and_its_answer_revokes_at_once() {
         hub.answered.load(Ordering::Acquire) >= 2
     })
     .await;
-    let pem = std::fs::read(root.join("run/cozy/bootstrap/tls.crt")).unwrap();
-    let channel = Endpoint::from_shared(format!("https://127.0.0.1:{port}"))
-        .unwrap()
-        .tls_config(
-            ClientTlsConfig::new()
-                .ca_certificate(Certificate::from_pem(&pem))
-                .domain_name("cozy-worker"),
-        )
-        .unwrap()
-        .connect()
-        .await
-        .unwrap();
-    let mut client = MachineClient::new(channel);
-    let mut frames = client.status(status(OWNER)).await.unwrap().into_inner();
-    assert_eq!(frames.message().await.unwrap().unwrap().worker_id, WORKER);
+    let client = common::client(&root, port, common::signed(OWNER, WORKER));
+    let mut frames = Box::pin(client.watch().await.unwrap());
+    assert_eq!(frames.next().await.unwrap().unwrap().worker_id, WORKER);
 
     // Down for three leases: the owner's stream stays open and a new call is admitted.
     hub.up.store(false, Ordering::Release);
     let outage = Instant::now();
     while outage.elapsed() < Duration::from_secs(3) {
-        if let Ok(next) = tokio::time::timeout(Duration::from_millis(250), frames.message()).await {
-            let frame = next
-                .unwrap_or_else(|refused| panic!("an unreachable Hub ended the stream: {refused}"));
-            assert!(frame.is_some(), "an unreachable Hub ended the stream");
+        if let Ok(next) = tokio::time::timeout(Duration::from_millis(250), frames.next()).await {
+            let frame = next.expect("an unreachable Hub ended the stream");
+            frame.unwrap_or_else(|refused| panic!("an unreachable Hub ended the stream: {refused}"));
         }
     }
-    let mut during = client
-        .status(status(OWNER))
-        .await
-        .expect("a new call during the outage")
-        .into_inner();
-    assert_eq!(during.message().await.unwrap().unwrap().worker_id, WORKER);
+    let during = client.status().await.expect("a new call during the outage");
+    assert_eq!(during.worker_id, WORKER);
 
     // The Hub answers again without the owner's key: its streams end, its calls are refused.
     *hub.keys.lock().unwrap() = vec![OTHER];
     hub.up.store(true, Ordering::Release);
-    let ended = tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            match frames.message().await {
-                Ok(Some(_)) => continue,
-                Ok(None) => panic!("the stream ended without saying why"),
-                Err(refused) => return refused,
-            }
-        }
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while let Some(Ok(_)) = frames.next().await {}
     })
     .await
     .expect("the Hub's revocation did not end the stream");
-    assert_eq!(ended.code(), Code::Unauthenticated);
-    assert_eq!(
-        client.status(status(OWNER)).await.unwrap_err().code(),
-        Code::Unauthenticated
-    );
-    let mut other = client.status(status(OTHER)).await.unwrap().into_inner();
-    assert_eq!(other.message().await.unwrap().unwrap().worker_id, WORKER);
+    assert_eq!(client.status().await.unwrap_err().status(), Some(401));
+    let other = client.with_auth(common::signed(OTHER, WORKER)).status().await.unwrap();
+    assert_eq!(other.worker_id, WORKER);
     let _ = std::fs::remove_dir_all(&root);
 }

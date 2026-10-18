@@ -135,7 +135,6 @@ pub struct Request {
 struct Pending {
     status: Status,
     sdk_before: Option<PathBuf>,
-    agent_before: Option<PathBuf>,
 }
 
 /// Where the machine keeps its software: everything under its own engine directory.
@@ -166,9 +165,6 @@ impl Paths {
     fn current_sdk_link(&self) -> PathBuf {
         self.engine.join("sdk/current")
     }
-    fn current_agent_link(&self) -> PathBuf {
-        self.engine.join("agent/current")
-    }
     /// The executors' Runtime/TensorFS wheels: the last activated pair, else the image's.
     pub fn sdk(&self) -> PathBuf {
         let link = self.current_sdk_link();
@@ -180,15 +176,17 @@ impl Paths {
     }
 }
 
-/// The machine binary an activated update installed, which the parent runs as its service.
-pub fn activated_binary(paths: &Paths) -> io::Result<Option<PathBuf>> {
-    let link = paths.current_agent_link();
-    // A dangling activation is still the selected candidate. Its exec must fail and roll back,
-    // rather than silently starting the original binary and committing the candidate as ready.
-    match fs::symlink_metadata(&link) {
-        Ok(_) => Ok(Some(link)),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error),
+/// A pre-cohort machine update may have activated the TensorD its Runtime wheel bundled
+/// (`agent/current`). This machine is the cozy binary and never runs another: the activation
+/// is removed, once.
+pub fn retire_agent(paths: &Paths) {
+    let agent = paths.engine.join("agent");
+    if fs::symlink_metadata(&agent).is_err() {
+        return;
+    }
+    match fs::remove_dir_all(&agent) {
+        Ok(()) => tracing::info!("retired the TensorD a pre-cohort update activated ({})", agent.display()),
+        Err(error) => tracing::warn!("{}: {error}; it is never run", agent.display()),
     }
 }
 
@@ -200,11 +198,10 @@ pub fn rollback_pending(paths: &Paths, cause: &str) -> io::Result<bool> {
     let mut status = latest(paths, pending.status)?;
     status.error = cause.into();
     status.enter("rolled_back");
-    // Persist the decision before changing either link. A crash during rollback then resumes
+    // Persist the decision before changing the link. A crash during rollback then resumes
     // rollback, even when the candidate had already published its starting marker.
     write_json(&paths.update("status.json"), &status)?;
     relink(&paths.current_sdk_link(), pending.sdk_before.as_deref())?;
-    relink(&paths.current_agent_link(), pending.agent_before.as_deref())?;
     remove_pending(paths)?;
     Ok(true)
 }
@@ -469,7 +466,7 @@ impl Updates {
         // An update is not a job: a released or activating machine refuses it, and preparing it
         // never holds the rental's idle release. Activation then closes admission.
         drop(self.lifecycle.as_ref().map(|l| l.admit()).transpose()
-            .map_err(|refused| (503, refused.message().to_string()))?);
+            .map_err(|refused| (503, refused.to_string()))?);
         let mut status = Status {
             operation: request.operation.clone(),
             from: identified(&self.paths.sdk()).map_err(server)?,
@@ -559,7 +556,6 @@ impl Updates {
         let pending = Pending {
             status: self.status.lock().unwrap().clone().unwrap_or_default(),
             sdk_before: previous_link(&self.paths.current_sdk_link())?,
-            agent_before: previous_link(&self.paths.current_agent_link())?,
         };
         let publication = (|| {
             write_json(&self.paths.update("pending.json"), &pending)?;
@@ -625,7 +621,7 @@ impl Updates {
         self.set(|s| s.to = to.clone())?;
         // No new work is admitted from here; work admitted before drains first.
         let activation = self.lifecycle.as_ref().map(|l| l.activate()).transpose()
-            .map_err(|refused| io::Error::other(refused.message().to_string()))?;
+            .map_err(|refused| io::Error::other(refused.to_string()))?;
         if !(self.idle)() {
             self.set(|s| s.enter("waiting_activation"))?;
             while !(self.idle)() {
@@ -839,7 +835,7 @@ fn relink(link: &Path, target: Option<&Path>) -> io::Result<()> {
         .parent()
         .ok_or_else(|| invalid("a link needs a directory"))?;
     fs::create_dir_all(dir)?;
-    // The first activation creates engine/agent. Its entry must survive along with the link.
+    // The first activation creates the link's directory. Its entry must survive with the link.
     fs::File::open(dir.parent().ok_or_else(|| invalid("a link directory needs a parent"))?)?.sync_all()?;
     let temp = dir.join(format!(".link-{}", hex(&super::identity::random::<8>()?)));
     symlink(target, &temp)?;
@@ -946,15 +942,12 @@ mod tests {
             &Pending {
                 status,
                 sdk_before: Some(old.clone()),
-                agent_before: None,
             },
         )
         .unwrap();
         relink(&paths.current_sdk_link(), Some(&new)).unwrap();
-        relink(&paths.current_agent_link(), Some(&new.join("tensord"))).unwrap();
         assert!(rollback_pending(&paths, "candidate never became ready").unwrap());
         assert_eq!(fs::read_link(paths.current_sdk_link()).unwrap(), old);
-        assert!(fs::symlink_metadata(paths.current_agent_link()).is_err());
         let status: Status =
             serde_json::from_slice(&fs::read(paths.update("status.json")).unwrap()).unwrap();
         assert_eq!(
@@ -1102,17 +1095,14 @@ mod tests {
                 fs::create_dir_all(dir).unwrap();
                 wheel(dir, "cozy_runtime", version, None);
                 wheel(dir, "tensorfs", version, None);
-                fs::write(dir.join("tensord"), b"executable").unwrap();
             }
             relink(&paths.current_sdk_link(), Some(&old)).unwrap();
-            relink(&paths.current_agent_link(), Some(&old.join("tensord"))).unwrap();
             let mut status = Status { operation: "transaction".into(), ..Default::default() };
             status.enter("installing");
             write_json(&paths.update("status.json"), &status).unwrap();
             write_json(&paths.update("pending.json"), &Pending {
                 status,
                 sdk_before: Some(old.clone()),
-                agent_before: Some(old.join("tensord")),
             }).unwrap();
             Self { root, paths, old, new }
         }
@@ -1123,7 +1113,6 @@ mod tests {
         }
         fn links(&self, dir: &Path) {
             assert_eq!(fs::read_link(self.paths.current_sdk_link()).unwrap(), dir);
-            assert_eq!(fs::read_link(self.paths.current_agent_link()).unwrap(), dir.join("tensord"));
         }
     }
     impl Drop for Activation {
@@ -1132,15 +1121,12 @@ mod tests {
 
     #[test]
     fn every_unpublished_activation_boundary_rolls_back_before_service_selection() {
-        // Process death after pending, after the SDK link, or after both links but before the
-        // durable starting marker: none may be reported as successfully activated.
-        for changed_links in 0..=2 {
+        // Process death after pending, or after the SDK link but before the durable starting
+        // marker: neither may be reported as successfully activated.
+        for changed_link in [false, true] {
             let transaction = Activation::prepare();
-            if changed_links >= 1 {
+            if changed_link {
                 relink(&transaction.paths.current_sdk_link(), Some(&transaction.new)).unwrap();
-            }
-            if changed_links >= 2 {
-                relink(&transaction.paths.current_agent_link(), Some(&transaction.new.join("tensord"))).unwrap();
             }
             let updates = Updates::open(transaction.paths.clone(), Box::new(|| true), None, None).unwrap();
             assert!(updates.commit().is_err(), "unpublished state committed");
@@ -1157,7 +1143,6 @@ mod tests {
     fn published_activation_waits_for_readiness_and_committed_cleanup_keeps_it() {
         let transaction = Activation::prepare();
         relink(&transaction.paths.current_sdk_link(), Some(&transaction.new)).unwrap();
-        relink(&transaction.paths.current_agent_link(), Some(&transaction.new.join("tensord"))).unwrap();
         transaction.state("starting");
         assert!(!recover_activation(&transaction.paths).unwrap());
         assert!(transaction.paths.update("pending.json").exists());
@@ -1194,8 +1179,7 @@ mod tests {
         for restored_links in 0..=1 {
             let transaction = Activation::prepare();
             relink(&transaction.paths.current_sdk_link(), Some(&transaction.new)).unwrap();
-            relink(&transaction.paths.current_agent_link(), Some(&transaction.new.join("tensord"))).unwrap();
-            transaction.state("starting");
+                transaction.state("starting");
             transaction.state("rolled_back");
             if restored_links == 1 {
                 relink(&transaction.paths.current_sdk_link(), Some(&transaction.old)).unwrap();
