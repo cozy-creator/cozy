@@ -288,7 +288,10 @@ fn package_verbs_sent_to_a_booting_rental_wait_for_it() {
     assert_eq!(list.code, 0, "{list:?}");
     assert!(list.stdout.contains("No packages installed"), "{list:?}");
     assert_eq!(remove.code, 1, "{remove:?}");
-    assert!(remove.stdout.contains("(package_not_installed)"), "{remove:?}");
+    assert!(
+        remove.stdout.contains("(package_not_installed)"),
+        "{remove:?}"
+    );
     let last: Option<Value> =
         (install.stdout.lines().rev()).find_map(|l| serde_json::from_str(l).ok());
     assert_eq!(
