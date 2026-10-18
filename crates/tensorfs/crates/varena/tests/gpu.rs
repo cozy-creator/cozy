@@ -468,6 +468,16 @@ mod copy_faults {
         })
     }
 
+    /// The driver page-locks a sealed (read-only) layout: its regions copy by one DMA.
+    fn locks_read_only(fx: &Fixture, fd: i32) -> bool {
+        let p = plane();
+        let ws = p.register(&fx.ck, &fx.regions(), Host::Sealed(fd)).unwrap();
+        p.want(ws, DEV, Some(&[0])).unwrap().wait().unwrap();
+        let locked = p.stats().io.register_failed == 0;
+        p.close().unwrap();
+        locked
+    }
+
     /// The device context survived: no copy faulted on an unmapped range.
     fn health() -> Result<(), Error> {
         let (_, ctx) = cuda::primary_context(DEV)?;
@@ -515,6 +525,10 @@ mod copy_faults {
         let (fd, _fill) = sealed(&fx, &layout, None);
         // (fault point, pass that fails, host): the second staged piece; the record after a DMA.
         for (point, n, host) in [("staged-copy", 2, PAGE), ("host-copy-recorded", 1, Host::Sealed(fd.as_raw_fd()))] {
+            if point == "host-copy-recorded" && !locks_read_only(&fx, fd.as_raw_fd()) {
+                println!("this driver does not page-lock read-only memory: no DMA to fail");
+                continue;
+            }
             let p = plane();
             let ws = p.register(&fx.ck, &fx.regions(), host).unwrap();
             let s = Stream::new();

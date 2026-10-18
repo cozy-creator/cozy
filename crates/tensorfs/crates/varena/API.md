@@ -55,8 +55,9 @@ c = p.stream(ws, device, regions, ring_bytes=None, repeat=1)   # repeat=0: cycle
 c.acquire(region, stream); c.home; c.ring_ptr; c.ring_nbytes; c.passes; c.close()
 ```
 
-- `want` maps all or nothing: `DeviceFull(deficit)` (free `deficit` bytes and ask again) or
-  `Floor(need, capacity)` (it can never fit) leave nothing mapped.
+- `want` checks the room for every region first: `DeviceFull(deficit)` (free `deficit` bytes and
+  ask again) or `Floor(need, capacity)` (it can never fit) map nothing. Each region's fill starts
+  as soon as it is mapped.
 - `drop` gives each region's physical memory back to the driver at once (no idle pool). A region
   still filling is unmapped once its copy lands. A cursor serving a region in place does not keep
   it: its next acquire refills it.

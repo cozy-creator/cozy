@@ -326,44 +326,20 @@ impl Inner {
         Ok(vec![mem])
     }
 
-    /// Map every unmapped region of `regions`, all or none: a refusal unmaps what this call
-    /// mapped and reports what to free. The caller binds the context.
-    pub(crate) fn map_regions(self: &Arc<Self>, c: &mut Core, ws: WsId, d: usize, regions: &[u32]) -> Result<()> {
-        let layout = c.ws(ws)?.layout.clone();
+    /// Map unmapped region `r` (the caller checked the room and binds the context).
+    pub(crate) fn map_region(&self, c: &mut Core, ws: WsId, d: usize, r: u32) -> Result<()> {
+        let region = c.ws(ws)?.layout.regions[r as usize].clone();
         let base = devws(c, ws, d)?.base;
-        let todo: Vec<u32> = {
-            let dw = devws(c, ws, d)?;
-            let mut v: Vec<u32> = regions.iter().copied().filter(|&r| dw.regs[r as usize].mem.is_empty()).collect();
-            v.dedup();
-            v
+        let mem = match self.map_span(d, base + region.offset, region.span) {
+            Ok(mem) => mem,
+            Err(Error::Poisoned(p)) => return Err(c.poison(p)),
+            Err(e) => return Err(e),
         };
-        let need: u64 = todo.iter().map(|&r| layout.regions[r as usize].span).sum();
-        self.room(need)?;
+        c.mapped[d] += region.span;
         let now = self.now();
-        for (i, &r) in todo.iter().enumerate() {
-            let region = &layout.regions[r as usize];
-            match self.map_span(d, base + region.offset, region.span) {
-                Ok(mem) => {
-                    c.mapped[d] += region.span;
-                    let reg = &mut devws(c, ws, d)?.regs[r as usize];
-                    reg.mem = mem;
-                    reg.last_use = now;
-                }
-                Err(e) => {
-                    for &q in &todo[..i] {
-                        self.unmap_region(c, ws, d, q)?;
-                    }
-                    if let Error::Poisoned(p) = e {
-                        return Err(c.poison(p));
-                    }
-                    let done: u64 = todo[..i].iter().map(|&q| layout.regions[q as usize].span).sum();
-                    return Err(match e {
-                        Error::DeviceFull { .. } => self.room(need).err().unwrap_or(Error::DeviceFull { deficit: need - done }),
-                        e => e,
-                    });
-                }
-            }
-        }
+        let reg = &mut devws(c, ws, d)?.regs[r as usize];
+        reg.mem = mem;
+        reg.last_use = now;
         Ok(())
     }
 
@@ -447,10 +423,20 @@ impl Inner {
         Ok(())
     }
 
-    /// Map and fill `regions` that are not resident on device slot `d`. The caller binds it.
+    /// Map and fill `regions` that are not resident on device slot `d` (the caller binds it).
+    /// The room for all of them is checked first (`DeviceFull`/`Floor`, nothing mapped); each
+    /// region's fill is queued as soon as it is mapped, so reads start at once. A driver refusal
+    /// past the check (another process took the room) keeps what was mapped.
     pub(crate) fn want(self: &Arc<Self>, c: &mut Core, ws: WsId, d: usize, regions: &[u32]) -> Result<()> {
-        self.map_regions(c, ws, d, regions)?;
+        let layout = c.ws(ws)?.layout.clone();
+        let dw = devws(c, ws, d)?;
+        let unmapped = |r: &&u32| dw.regs[**r as usize].mem.is_empty();
+        let need: u64 = regions.iter().filter(unmapped).map(|&r| layout.regions[r as usize].span).sum();
+        self.room(need)?;
         for &r in regions {
+            if devws(c, ws, d)?.regs[r as usize].mem.is_empty() {
+                self.map_region(c, ws, d, r)?;
+            }
             let reg = &mut devws(c, ws, d)?.regs[r as usize];
             commit(reg)?;
             if matches!(reg.state, DState::Absent | DState::Invalid(_)) {

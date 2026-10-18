@@ -31,11 +31,12 @@ def main(root, ref):
                 info = ck.tensors[part["component"]][part["key"]]
                 if info.encoding is not None:
                     continue
-                want = torch.from_numpy(np.from_dlpack(ck.read(part["component"], part["key"])).view(np.uint8).reshape(-1))
+                want = torch.from_numpy(np.from_dlpack(ck.read(part["component"], part["key"])).view(np.uint8).reshape(-1).copy())
                 got = x[part["offset"] - base : part["offset"] - base + part["nbytes"]].cpu()
                 assert torch.equal(got, want), f"{part['component']}/{part['key']} differs on the GPU"
                 checked += 1
             torch.cuda.current_stream().synchronize()
+            del x  # a view keeps the weight set from closing
     st = p.stats()
     assert st["poisoned"] is None and st["devices"][0]["misses"] == 0, st
     freed = p.drop(ws, 0)
