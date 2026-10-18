@@ -158,19 +158,22 @@ pub struct Budgets {
     pub declared_weight_bytes: u64,
 }
 
-/// An executor capability: a group's followers obey their own GPU's budget cell.
+/// An executor capability: a group's followers obey their own GPU's cap and budget cell.
 pub const RANK_CELLS: &str = "rank_cells/1";
 
-/// A group's per-rank fields (`rank_cells/1`), sent beside `Start`.
+/// A group's per-rank fields (`rank_cells/1`), sent beside `Start`, `Load` and `Invoke`.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct Group {
-    /// Rank 0 hands its owner one budget cell per follower (`BudgetCell.rank`).
+    /// `Start`: rank 0 hands its owner one budget cell per follower (`BudgetCell.rank`).
     #[serde(skip_serializing_if = "is_false")]
     pub rank_cells: bool,
+    /// `Load`/`Invoke`: each rank's own process cap, rank 0 first (-1: uncapped).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub rank_caps: Vec<i64>,
 }
 impl Group {
     pub fn is_empty(&self) -> bool {
-        !self.rank_cells
+        !self.rank_cells && self.rank_caps.is_empty()
     }
 }
 
@@ -232,6 +235,9 @@ pub enum DeviceCommand {
         /// Runtime maps GPU allocation handles retained by TensorD (`weights.attach/1`).
         #[serde(skip_serializing_if = "is_false")]
         device_weights: bool,
+        /// The process's device cap (`process_cap/1`).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cap_bytes: Option<u64>,
     },
     Activate {
         construction: String,
@@ -263,6 +269,9 @@ pub enum DeviceCommand {
         attention_kernel: String,
         #[serde(skip_serializing_if = "is_zero")]
         bits: u32,
+        plane_budget_bytes: i64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cap_bytes: Option<u64>,
         /// File inputs by field path: read-only copies in this call's spool.
         #[serde(skip_serializing_if = "BTreeMap::is_empty")]
         inputs: BTreeMap<String, Value>,
@@ -272,6 +281,12 @@ pub enum DeviceCommand {
         /// The machine's physical free floor on this GPU.
         #[serde(skip_serializing_if = "Option::is_none")]
         floor_bytes: Option<u64>,
+        /// Activation growth per stage method learned for this request's shape.
+        #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+        activation_bytes: BTreeMap<String, u64>,
+        /// Rooms known to squeeze its stage methods at this shape (`Shape::squeezed`).
+        #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+        squeezed_bytes: BTreeMap<String, u64>,
         /// Degree 2 for this call (`weights.attach/1`); None leaves the executor's setting.
         #[serde(skip_serializing_if = "Option::is_none")]
         device_weights: Option<bool>,
@@ -285,11 +300,15 @@ pub enum DeviceCommand {
     Budget {
         vram_bytes: i64,
         pinned_bytes: i64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cap_bytes: Option<u64>,
     },
-    /// Map a loaded construction's weights onto the GPU, nothing run (`weights.map/1`): a
-    /// warm set member at `gpu`, inside the room made for it.
+    /// Map a loaded construction's weights onto the GPU inside `cap_bytes`, nothing run
+    /// (`weights.map/1`): a warm set member at `gpu`.
     Map {
         construction: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cap_bytes: Option<u64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         floor_bytes: Option<u64>,
     },
@@ -507,6 +526,9 @@ pub struct PlaneFacts {
     pub cache_released_bytes: Option<u64>,
     /// Those releases by the executor function that asked: (count, bytes).
     pub cache_released_by: BTreeMap<String, (u64, u64)>,
+    /// Per stage method, the most room torch had at an entry that made it drop its whole
+    /// cache more than once (`memory::learned::Shape::squeezed`).
+    pub squeezed: BTreeMap<String, u64>,
     /// Components the executor gave back to make torch room since it started, and their bytes.
     pub paged_out: Option<u64>,
     pub paged_out_bytes: Option<u64>,
@@ -537,6 +559,7 @@ pub struct Metrics {
     pub rss_at_end_bytes: Option<i64>,
     pub started_unix: Option<f64>,
     pub gpu_count: Option<u32>,
+    pub shape_cell: Option<String>,
 }
 /// The device memory a stage could not have (`ResidencyRefusal`): what it needed at once and
 /// what the GPU could give at the finest grain.
@@ -667,6 +690,8 @@ pub struct Frame {
     /// `fields` its scalars.
     pub value: Value,
     pub fields: Value,
+    /// PrepareRequest: the request's normalized features (its shape).
+    pub features: BTreeMap<String, Value>,
     /// `device_tier`: fds that follow the frame, one per chunk of `regions`.
     pub descriptors: u32,
     /// `sealed_tier`/`sealed_stage`: the regions to stage (the ones the executor streams).
@@ -760,11 +785,8 @@ pub struct Answer {
     pub code: String,
     pub detail: String,
     pub held: bool,
-    /// A `DeviceRoom` answer: the process cap raised into the room made (-1 keeps it), and
-    /// the bytes idle tenants gave (the executor asks again while they are more than 0).
+    /// A `DeviceRoom` answer: the process cap raised into the room made; -1 keeps it.
     pub cap_bytes: i64,
-    #[serde(skip_serializing_if = "is_zero")]
-    pub freed_bytes: u64,
     /// One fd follows the answer. Sent only when true: a `Tier` answer types it as the fd.
     #[serde(skip_serializing_if = "is_false")]
     pub descriptor: bool,
@@ -850,7 +872,6 @@ impl Answer {
             detail: "owner has not qualified this operation".into(),
             held: false,
             cap_bytes: -1,
-            freed_bytes: 0,
             descriptor: false,
             sha256: String::new(),
             length: 0,

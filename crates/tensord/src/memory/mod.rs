@@ -2,10 +2,11 @@
 //! `policy` decides from samples and executor facts; `nvml` samples on its own thread; this
 //! module joins them and keeps the floor while a call runs.
 pub mod call;
+pub mod learned;
 pub mod nvml;
 pub mod policy;
 
-use policy::{Ask, Facts, Gpu, Holding, Round, Sample, Step};
+use policy::{Decision, Facts, Gpu, Holding, Round, Sample, Step};
 use serde::Deserialize;
 use std::{
     fs::{self, File, OpenOptions},
@@ -84,18 +85,21 @@ impl MemoryLog {
 }
 
 /// One GPU's ledger, sampler and floor watchdog. Without NVML nothing is decided here and
-/// executors read the driver alone.
+/// executors derive their own budgets (`grant` answers None).
 pub struct GpuMemory {
     ledger: Arc<Mutex<Gpu>>,
     running: Arc<Mutex<Running>>,
     sampler: Option<nvml::Sampler>,
-    device: String,
     log: MemoryLog,
 }
 
 impl GpuMemory {
-    pub fn start(device: &str, config: &MemoryConfig, notes: MemoryLog) -> Self {
-        let ledger = Arc::new(Mutex::new(Gpu::with_floor(config.floor_bytes)));
+    /// `root` keeps what executors measured across runs (`memory-learned.json`).
+    pub fn start(device: &str, config: &MemoryConfig, root: &std::path::Path, notes: MemoryLog) -> Self {
+        let mut gpu = Gpu::with_floor(config.floor_bytes);
+        gpu.learned = learned::Learned::open(&root.join("memory-learned.json"));
+        gpu.device = device.into();
+        let ledger = Arc::new(Mutex::new(gpu));
         let running: Arc<Mutex<Running>> = Arc::default();
         let log = config.sample_log.as_ref().and_then(|path| {
             OpenOptions::new()
@@ -105,11 +109,10 @@ impl GpuMemory {
                 .map_err(|error| tracing::warn!("memory: sample log {path:?} unavailable: {error}"))
                 .ok()
         });
-        let mut key = device.to_string();
         let sampler = match cozy_platform::gpu::Device::open(device) {
             Ok(opened) => {
-                key = opened.key().to_string();
-                let (watched, cells, notes, gpu) = (ledger.clone(), running.clone(), notes.clone(), key.clone());
+                ledger.lock().unwrap().device = opened.key().to_string();
+                let (watched, cells, notes) = (ledger.clone(), running.clone(), notes.clone());
                 let log = Mutex::new(log);
                 nvml::Sampler::start(opened, move |sample| {
                     let mut ledger = watched.lock().unwrap();
@@ -118,7 +121,8 @@ impl GpuMemory {
                             file,
                             "{}",
                             serde_json::json!({"t_ms": now_ms() as u64, "total": sample.total,
-                                "free": sample.free, "floor": ledger.floor(sample), "display": sample.display})
+                                "free": sample.free, "floor": ledger.floor(sample),
+                                "display": sample.display, "external": ledger.external(sample)})
                         );
                     }
                     let Some((plan, cap)) = ledger.below_floor(sample) else {
@@ -132,7 +136,7 @@ impl GpuMemory {
                         Ok(_) => {
                             ledger.set_cap(&plan, cap);
                             notes.note(serde_json::json!({"event":"floor","plan":plan,"cap":cap,
-                                "gpu":gpu,"free":sample.free,"floor":ledger.floor(sample)}));
+                                "gpu":ledger.device,"free":sample.free,"floor":ledger.floor(sample)}));
                         }
                         Err(error) => notes.note(serde_json::json!({"event":"floor_cell_failed",
                             "plan":plan,"error":error.to_string()})),
@@ -142,7 +146,7 @@ impl GpuMemory {
                 .ok()
             }
             Err(error) => {
-                tracing::warn!("memory: NVML unavailable for {device:?}: {error}; executors read the driver alone");
+                tracing::warn!("memory: NVML unavailable for {device:?}: {error}; executors derive their own budgets");
                 None
             }
         };
@@ -150,7 +154,6 @@ impl GpuMemory {
             ledger,
             running,
             sampler,
-            device: key,
             log: notes,
         }
     }
@@ -168,73 +171,51 @@ impl GpuMemory {
         f(&mut self.ledger.lock().unwrap())
     }
 
-    /// Idle tenants give room for `plan` (`ask` says whose) until `short`, the bytes still
-    /// missing by each new reading, is 0 or none is left: `holdings` reads custody before each
-    /// look, `carry_out` performs each step. Never refuses. The bytes the GPU freed meanwhile,
-    /// what is still missing, and the last reading; None without NVML (nothing is decided here).
-    pub fn make_room(
+    /// Decide for `plan` until it has its cap: `holdings` reads custody before each look,
+    /// `carry_out` performs each step (and returns whether it did). Never refuses by size.
+    /// None: no NVML, nothing decided here.
+    pub fn decide(
         &self,
         plan: &str,
-        ask: Ask,
-        short: impl Fn(&Gpu, &Sample) -> u64,
+        spawn: bool,
         holdings: impl Fn() -> Vec<Holding>,
         mut carry_out: impl FnMut(&Step) -> io::Result<bool>,
-    ) -> io::Result<Option<(u64, u64, Sample)>> {
+    ) -> io::Result<Option<u64>> {
         let mut round = Round::default();
-        let mut first = None;
         loop {
             let Some(sample) = self.sample() else {
                 return Ok(None);
             };
-            let first = *first.get_or_insert(sample.free);
             let held = holdings();
-            let (missing, step) = self.with(|gpu| {
+            let decision = self.with(|gpu| {
                 gpu.holdings = held;
-                let missing = short(gpu, &sample);
-                (missing, (missing > 0).then(|| gpu.step(plan, ask, missing, &mut round)).flatten())
+                let (want, need) = if spawn {
+                    let need = gpu.spawn_need(plan);
+                    (Some(need), need)
+                } else {
+                    (gpu.grant_want(plan), gpu.need(plan))
+                };
+                let decision = gpu.decide(plan, want, need, &sample, &mut round);
+                self.log.note(
+                    serde_json::json!({"event": if spawn {"admit"} else {"grant"}, "plan": plan,
+                    "gpu": gpu.device, "free": sample.free, "external": gpu.external(&sample),
+                    "room": gpu.room(plan, &sample), "want": want, "need": need,
+                    "decision": format!("{decision:?}")}),
+                );
+                decision
             });
-            self.log.note(serde_json::json!({"event": "room", "plan": plan, "ask": format!("{ask:?}"),
-                "gpu": self.device, "free": sample.free, "short": missing, "step": format!("{step:?}")}));
-            match step {
-                Some(step) => {
+            match decision {
+                Decision::Go(cap) => return Ok(Some(cap)),
+                // What another call holds frees only when it ends, which may wait on this one
+                // (a served call's child): it takes the room there is.
+                Decision::Wait => {
+                    return Ok(self.with(|gpu| Some(gpu.room(plan, &sample))));
+                }
+                Decision::Step(step) => {
                     carry_out(&step)?;
                 }
-                None => return Ok(Some((sample.free.saturating_sub(first), missing, sample))),
             }
         }
-    }
-
-    /// A running call's `DeviceRoom`: idle tenants give room until `free_bytes` are free beside
-    /// the floor or none is left, then `plan`'s cap rises into what is there, through its rank
-    /// cell when it has one (a cap the floor watchdog lowered comes back). The bytes freed and
-    /// the cap; None without NVML.
-    pub fn room_for(
-        &self,
-        plan: &str,
-        free_bytes: u64,
-        cell: Option<&File>,
-        holdings: impl Fn() -> Vec<Holding>,
-        carry_out: impl FnMut(&Step) -> io::Result<bool>,
-    ) -> io::Result<Option<(u64, u64)>> {
-        let short = |gpu: &Gpu, s: &Sample| (free_bytes + gpu.floor(s)).saturating_sub(s.free);
-        let Some((freed, _, sample)) = self.make_room(plan, Ask::Call, short, holdings, carry_out)? else {
-            return Ok(None);
-        };
-        Ok(Some((freed, self.grant_room(plan, &sample, cell)?)))
-    }
-
-    /// Grant the room there is and notify this rank through its budget cell: what the process
-    /// holds and everything free above the floor. The ledger lock serializes the grant and its
-    /// publication with the watchdog.
-    fn grant_room(&self, plan: &str, sample: &Sample, cell: Option<&File>) -> io::Result<u64> {
-        self.with(|gpu| {
-            let cap = gpu.room(plan, sample);
-            if let Some(cell) = cell {
-                ask_cap(cell, cap)?;
-            }
-            gpu.set_cap(plan, cap);
-            Ok(cap)
-        })
     }
 
     /// Whether `plan` takes Degree 2 now (`Gpu::fits_resident`). False when NVML cannot say.
@@ -251,42 +232,227 @@ impl GpuMemory {
         fits
     }
 
+    /// `plan`'s executor asked custody for holding `id` or offered it: kept so its next
+    /// executor's fit counts that weight set once when another tenant reads it.
+    pub fn learn_holding(&self, plan: &str, id: &str) {
+        self.with(|gpu| {
+            if gpu.learned.holding(plan, policy::holding_name(id)) {
+                if let Err(error) = gpu.learned.save() {
+                    self.log.note(
+                        serde_json::json!({"event": "learned_unsaved", "error": error.to_string()}),
+                    );
+                }
+            }
+        });
+    }
+
+    /// Make room for warm set member `plan` (`Gpu::admit_member`): its spawn, or with
+    /// `mapped` its weights mapped. Its cap, or None when only another member or a running
+    /// call has more (or its weights were never measured). Without NVML: admitted, no cap.
+    pub fn admit_member(
+        &self,
+        plan: &str,
+        mapped: bool,
+        holdings: impl Fn() -> Vec<Holding>,
+        mut carry_out: impl FnMut(&Step) -> io::Result<bool>,
+    ) -> io::Result<Option<Option<u64>>> {
+        let mut round = Round::default();
+        loop {
+            let Some(sample) = self.sample() else {
+                return Ok(Some(None));
+            };
+            let held = holdings();
+            let decision = self.with(|gpu| {
+                gpu.holdings = held;
+                let need = match mapped {
+                    true => gpu.mapped_need(plan),
+                    false => Some(gpu.spawn_need(plan)),
+                };
+                let decision = need.map_or(Decision::Wait, |need| {
+                    gpu.admit_member(plan, need, &sample, &mut round)
+                });
+                self.log.note(serde_json::json!({"event": "member", "plan": plan, "mapped": mapped,
+                    "free": sample.free, "room": gpu.room(plan, &sample), "need": need,
+                    "decision": format!("{decision:?}")}));
+                decision
+            });
+            match decision {
+                Decision::Go(cap) => return Ok(Some(Some(cap))),
+                Decision::Wait => return Ok(None),
+                Decision::Step(step) => drop(carry_out(&step)?),
+            }
+        }
+    }
+
     /// Whether `plan`'s executor and first working set fit in the room there is now, with no
-    /// step on another tenant (a prefetch never makes room). True without NVML.
+    /// step on another tenant (a prewarm never makes room). True without NVML: nothing is
+    /// decided here then.
     pub fn admits(&self, plan: &str, holdings: impl Fn() -> Vec<Holding>) -> bool {
-        self.within(holdings, |gpu, sample| gpu.room(plan, sample) >= gpu.spawn_need(plan))
-    }
-
-    /// Whether a call of `plan` fits here now with no step on another tenant (`Gpu::fits`).
-    /// True without NVML.
-    pub fn fits(&self, plan: &str, holdings: impl Fn() -> Vec<Holding>) -> bool {
-        self.within(holdings, |gpu, sample| gpu.fits(plan, sample))
-    }
-
-    fn within(&self, holdings: impl Fn() -> Vec<Holding>, test: impl FnOnce(&Gpu, &Sample) -> bool) -> bool {
         let Some(sample) = self.sample() else {
             return true;
         };
         let held = holdings();
         self.with(|gpu| {
             gpu.holdings = held;
-            test(gpu, &sample)
+            gpu.room(plan, &sample) >= gpu.spawn_need(plan)
         })
     }
 
-    /// The floor this GPU keeps now.
+    /// Whether a call of `plan` fits here now with no step on another tenant (`Gpu::fits`).
+    /// True without NVML.
+    pub fn fits(&self, plan: &str, holdings: impl Fn() -> Vec<Holding>) -> bool {
+        let Some(sample) = self.sample() else {
+            return true;
+        };
+        let held = holdings();
+        self.with(|gpu| {
+            gpu.holdings = held;
+            gpu.fits(plan, &sample)
+        })
+    }
+
+    /// Until `free_bytes` are free beside the floor: holdings `plan`'s own executor let go
+    /// are dropped, then idle tenants give room (weights first, then processes); then `plan`'s
+    /// cap rises into what is there. Its rank cell, when present, receives the grant before
+    /// the ledger records it. None: no NVML, no grant or cell update.
+    pub fn make_room(
+        &self,
+        plan: &str,
+        free_bytes: u64,
+        cell: Option<&File>,
+        holdings: impl Fn() -> Vec<Holding>,
+        mut carry_out: impl FnMut(&Step) -> io::Result<bool>,
+    ) -> io::Result<Option<u64>> {
+        let mut round = Round::default();
+        loop {
+            let Some(sample) = self.sample() else {
+                return Ok(None);
+            };
+            let held = holdings();
+            let step = self.with(|gpu| {
+                gpu.holdings = held;
+                if sample.free >= free_bytes + gpu.floor(&sample) {
+                    return None;
+                }
+                gpu.own_unread(plan, &mut round).or_else(|| {
+                    match gpu.decide(plan, None, u64::MAX, &sample, &mut round) {
+                        Decision::Step(
+                            step @ (Step::Unmap(_) | Step::Revoke(_) | Step::End(_)),
+                        ) => Some(step),
+                        _ => None,
+                    }
+                })
+            });
+            self.log.note(
+                serde_json::json!({"event":"room","plan":plan,"free_bytes":free_bytes,
+                "free":sample.free,"step":format!("{step:?}")}),
+            );
+            match step {
+                Some(step) => {
+                    carry_out(&step)?;
+                }
+                None => return self.grant_room(plan, &sample, cell).map(Some),
+            }
+        }
+    }
+
+    /// Grant reclaimed room and notify this rank through its existing budget cell: what the
+    /// process holds and everything free above the floor (the ledger's room is never more),
+    /// so a grant never undoes the floor watchdog's lowered cap. The ledger lock serializes
+    /// the grant and its publication with the watchdog.
+    fn grant_room(&self, plan: &str, sample: &Sample, cell: Option<&File>) -> io::Result<u64> {
+        self.with(|gpu| {
+            let cap = gpu.physical_cap(plan, sample);
+            if let Some(cell) = cell {
+                ask_cap(cell, cap)?;
+            }
+            gpu.set_cap(plan, cap);
+            Ok(cap)
+        })
+    }
+
+    /// The floor this GPU keeps now (the executor's own floor follows it).
     pub fn floor(&self) -> Option<u64> {
         let sample = self.sample()?;
         Some(self.with(|gpu| gpu.floor(&sample)))
+    }
+
+    /// One call's measurements, kept for later executors and runs: its shape's activation
+    /// growth (the call's peak and each method's) and the context it measured.
+    pub fn learn_call(
+        &self,
+        plan: &str,
+        shape: &str,
+        peak: u64,
+        methods: &std::collections::BTreeMap<String, u64>,
+        context: Option<u64>,
+        mapped: Option<u64>,
+    ) {
+        self.with(|gpu| {
+            gpu.learned.call(plan, shape, peak, methods);
+            if let Some(mapped) = mapped {
+                gpu.learned.mapped(plan, mapped);
+            }
+            if let Some(context) = context.filter(|c| *c > 0) {
+                let device = gpu.device.clone();
+                gpu.learned.context(&device, context);
+            }
+            if let Err(error) = gpu.learned.save() {
+                self.log.note(serde_json::json!({"event": "learned_unsaved", "error": error.to_string()}));
+            }
+        });
+    }
+
+    /// Rooms a call saw squeeze its stage methods, kept for later executors of its shape.
+    pub fn learn_squeezed(
+        &self,
+        plan: &str,
+        shape: &str,
+        rooms: &std::collections::BTreeMap<String, u64>,
+    ) {
+        if rooms.is_empty() {
+            return;
+        }
+        self.with(|gpu| {
+            gpu.learned.squeezed(plan, shape, rooms);
+            let shape = serde_json::json!({"plan": plan, "shape": shape, "rooms": rooms});
+            self.log.note(serde_json::json!({"event": "squeezed", "learned": shape}));
+            if let Err(error) = gpu.learned.save() {
+                self.log.note(serde_json::json!({"event": "learned_unsaved", "error": error.to_string()}));
+            }
+        });
+    }
+
+    /// A load's weights (as stages count them) and their floor, kept for the next load.
+    pub fn learn_load(&self, plan: &str, weights: Option<u64>, floor: Option<u64>) {
+        let Some(weights) = weights.filter(|w| *w > 0) else {
+            return;
+        };
+        self.with(|gpu| {
+            gpu.learned.load(plan, weights, floor.unwrap_or(0));
+            if let Err(error) = gpu.learned.save() {
+                self.log.note(serde_json::json!({"event": "learned_unsaved", "error": error.to_string()}));
+            }
+        });
+    }
+
+    /// A process's private host bytes (PSS less shared memory), kept across runs.
+    pub fn learn_host(&self, plan: &str, bytes: u64) {
+        self.with(|gpu| {
+            gpu.learned.host(plan, bytes);
+            if let Err(error) = gpu.learned.save() {
+                self.log.note(serde_json::json!({"event": "learned_unsaved", "error": error.to_string()}));
+            }
+        });
     }
 
     pub fn observe(&self, plan: &str, facts: Facts, mapped: Option<bool>) {
         self.with(|gpu| gpu.observe(plan, facts, mapped));
     }
 
-    /// A call starts uncapped; its cell (if any) is what the floor watchdog lowers.
-    pub fn running(&self, plan: &str, cell: Option<File>) {
-        self.with(|gpu| gpu.active(plan));
+    /// A call starts with `cap`; its cell (if any) is what the floor watchdog lowers.
+    pub fn running(&self, plan: &str, cap: u64, cell: Option<File>) {
+        self.with(|gpu| gpu.active(plan, cap));
         self.running.lock().unwrap().insert(plan.into(), cell);
     }
 
@@ -304,13 +470,12 @@ mod tests {
 
     fn memory() -> GpuMemory {
         let mut gpu = Gpu::default();
-        gpu.starting("plan");
-        gpu.active("plan");
+        gpu.starting("plan", 0);
+        gpu.active("plan", 0);
         GpuMemory {
             ledger: Arc::new(Mutex::new(gpu)),
             running: Arc::default(),
             sampler: None,
-            device: String::new(),
             log: MemoryLog::default(),
         }
     }
@@ -378,8 +543,8 @@ mod tests {
 
     #[test]
     fn a_room_grant_below_the_floor_never_raises_the_cap_the_watchdog_lowered() {
-        // Run 5424 (an 8 GB laptop card): the card was below its floor, and the grant answered
-        // with what the process held, above the watchdog's cap.
+        // Run 5424 (an 8 GB laptop card): the executor held its cap, the card was below its
+        // floor, and the grant answered with what the process held, above the watchdog's cap.
         let cell = cozy_platform::shm::memfd_named("tensord-weights").map(std::fs::File::from).unwrap();
         cell.set_len(32).unwrap();
         let memory = memory();
@@ -396,7 +561,10 @@ mod tests {
             free: HEADLESS_FLOOR - 100 * MIB,
             ..Default::default()
         };
-        let (_, lowered) = memory.with(|gpu| gpu.below_floor(&below).unwrap());
+        let (_, lowered) = memory.with(|gpu| {
+            gpu.set_cap("plan", 7 * GIB);
+            gpu.below_floor(&below).unwrap()
+        });
         memory.with(|gpu| gpu.set_cap("plan", lowered));
         let granted = memory.grant_room("plan", &below, Some(&cell)).unwrap();
         assert_eq!(granted, 7 * GIB - 100 * MIB);
@@ -418,13 +586,13 @@ mod tests {
         let memory = memory();
         assert_eq!(
             memory
-                .room_for("plan", 30, Some(&cell), Vec::new, |_| {
+                .make_room("plan", 30, Some(&cell), Vec::new, |_| {
                     panic!("an unmeasured GPU must not reclaim another tenant")
                 })
                 .unwrap(),
             None
         );
-        assert_eq!(memory.with(|gpu| gpu.tenant("plan").unwrap().cap), u64::MAX);
+        assert_eq!(memory.with(|gpu| gpu.tenant("plan").unwrap().cap), 0);
         assert_eq!(read_cell(&cell), [0; 4]);
     }
 
@@ -435,7 +603,7 @@ mod tests {
         cozy_platform::shm::seal_with(std::os::fd::AsFd::as_fd(&cell), cozy_platform::shm::NO_WRITE_SEALS).unwrap();
         let memory = memory();
         assert!(memory.grant_room("plan", &sample(30), Some(&cell)).is_err());
-        assert_eq!(memory.with(|gpu| gpu.tenant("plan").unwrap().cap), u64::MAX);
+        assert_eq!(memory.with(|gpu| gpu.tenant("plan").unwrap().cap), 0);
         assert_eq!(read_cell(&cell), [0; 4]);
     }
 }
