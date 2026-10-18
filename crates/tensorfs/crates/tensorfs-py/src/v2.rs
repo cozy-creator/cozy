@@ -419,7 +419,7 @@ pub struct PyCheckpoint {
 #[pyclass(name = "Part", module = "tensorfs.v2", frozen, get_all)]
 pub struct PyPart {
     dtype: String,
-    shape: Vec<u64>,
+    shape: Py<PyTuple>,
     chunk: u64,
     offset: u64,
     length: u64,
@@ -464,7 +464,7 @@ impl PyCheckpoint {
                     Body::Data(at) => {
                         let p = PyPart {
                             dtype: t.dtype.name().into(),
-                            shape: t.shape.clone(),
+                            shape: PyTuple::new(py, &t.shape)?.unbind(),
                             chunk: at.chunk,
                             offset: at.offset,
                             length: at.length,
@@ -479,7 +479,7 @@ impl PyCheckpoint {
                         for (role, p) in stored {
                             let p = PyPart {
                                 dtype: p.dtype.name().into(),
-                                shape: p.shape.clone(),
+                                shape: PyTuple::new(py, &p.shape)?.unbind(),
                                 chunk: p.chunk,
                                 offset: p.offset,
                                 length: p.length,
