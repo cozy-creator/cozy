@@ -184,6 +184,7 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
             });
         }
     };
+    let machine = crate::machine::adopt(ctx, &version).await;
     let updated = Updated {
         from: current,
         to: version,
@@ -192,7 +193,7 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
         sha256,
         signer,
         calcifer,
-        machine: crate::machine::adopt(ctx, &version).await,
+        machine,
     };
     let kept = matches!(updated.machine, Adopted::Kept { .. });
     if ctx.json {
