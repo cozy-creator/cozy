@@ -221,7 +221,6 @@ fn exec(
             staged_tiers: false,
             pinned_bytes: Some(config.pinned_budget_bytes),
             device_weights: sharing,
-            cap_bytes: None,
         },
         &mut pilot,
     )?;
@@ -233,7 +232,6 @@ fn exec(
         DeviceCommand::Budget {
             vram_bytes: config.plane_budget_bytes,
             pinned_bytes: config.pinned_budget_bytes,
-            cap_bytes: None,
         },
         DeviceCommand::Activate {
             construction: "pilot".into(),
@@ -275,13 +273,9 @@ fn exec(
                 deadline_s: None,
                 attention_kernel: String::new(),
                 bits: 0,
-                plane_budget_bytes: config.plane_budget_bytes,
-                cap_bytes: None,
                 inputs: Default::default(),
                 trees: Default::default(),
                 floor_bytes: None,
-                activation_bytes: Default::default(),
-                squeezed_bytes: Default::default(),
                 device_weights: None,
                 sources: Default::default(),
                 weights: Default::default(),
