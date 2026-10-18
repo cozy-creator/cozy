@@ -14,7 +14,11 @@
 //!    digest of its bytes read back from the packs against the digest of its v1 bytes. The v2
 //!    order of components, tensors and parts must be v1's.
 //! 6. One JSON report per checkpoint, and totals that count shared objects once.
+//!
+//! Without a store it is a plan: the census, the names and the new bytes, from the manifest and
+//! header alone ([`hub`] fetches just those from a Hub).
 
+pub mod hub;
 pub mod v1;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -23,7 +27,7 @@ use std::time::Duration;
 use serde_json::{json, Map, Value as Json};
 
 use crate::failure::{fail, Kind, Result};
-use crate::format::layout::{GRID, STANDALONE};
+use crate::format::layout::{ALIGN, GRID, STANDALONE};
 use crate::format::{Body, Dtype, Encoding, Location, ObjectRef, Value, HEADER_PATH};
 use crate::import::tables;
 use crate::sha256::hex_digest;
@@ -48,9 +52,9 @@ pub struct Report {
     pub v2: BTreeSet<ObjectRef>,
 }
 
-/// Migrates one v1 checkpoint into `store`. A dry run collects what it wrote once checked, so
-/// `store` is a scratch store.
-pub fn lane(src: &v1::Source, store: &Store, lane: &v1::Lane, dry_run: bool) -> Report {
+/// Migrates one v1 checkpoint into `store`, or plans it without one. A dry run collects what it
+/// wrote once checked, so `store` is a scratch store.
+pub fn lane(src: &v1::Source, store: Option<&Store>, lane: &v1::Lane, dry_run: bool) -> Report {
     let mut r = Report {
         doc: Map::new(),
         pass: false,
@@ -87,12 +91,22 @@ pub fn totals(reports: &[Report]) -> Json {
         .iter()
         .filter_map(|r| r.doc.get("new")?["bytes"].as_u64())
         .sum();
+    let order: BTreeMap<&str, Vec<Json>> = ["sorted", "mixed", "unknown"]
+        .into_iter()
+        .map(|class| {
+            (
+                class,
+                names(&|r| r.doc.get("order").is_some_and(|o| o["class"] == class)),
+            )
+        })
+        .collect();
     json!({
         "checkpoints": reports.len(),
         "passed": reports.iter().filter(|r| r.pass).count(),
         "failed": names(&|r| !r.pass && !r.doc.contains_key("dropped_schemes")),
         "dropped_schemes": names(&|r| r.doc.contains_key("dropped_schemes")),
         "renamed": names(&|r| r.doc.contains_key("renames")),
+        "order": order,
         "v1": {"objects": v1.len(), "bytes": sum(&mut v1.iter().copied())},
         "v2": {"objects": v2.len(), "bytes": sum(&mut v2.iter().copied())},
         "new": {"objects": new.len(), "bytes": sum(&mut new.iter().map(|o| **o)), "sum_per_checkpoint": per_checkpoint},
@@ -113,7 +127,7 @@ fn integrity<T>(detail: impl Into<String>) -> Result<T> {
 
 fn migrate(
     src: &v1::Source,
-    store: &Store,
+    store: Option<&Store>,
     lane: &v1::Lane,
     dry_run: bool,
     r: &mut Report,
@@ -150,25 +164,59 @@ fn migrate(
         BTreeMap::<String, u64>::new(),
         BTreeMap::<String, u64>::new(),
     );
+    let mut encodings = BTreeMap::<String, u64>::new();
     for (_, t) in all() {
         let (alias, mapping) = &mappings[t.spec];
+        *encodings.entry(alias.clone()).or_default() += 1;
         match mapping {
             Mapping::Plain => *schemes.entry("plain".into()).or_default() += 1,
             Mapping::Scheme(s, _) => *schemes.entry(s.to_string()).or_default() += 1,
             Mapping::Dropped => *dropped.entry(alias.clone()).or_default() += 1,
         }
     }
+    r.doc.insert("encodings".into(), json!(encodings));
+    r.doc.insert("order".into(), order(&h));
     r.doc.insert("schemes".into(), json!(schemes));
     if !dropped.is_empty() {
         r.doc.insert("dropped_schemes".into(), json!(dropped));
         return Ok(false);
     }
+    let mut nonconforming = BTreeMap::<String, (u64, String)>::new();
+    for (c, t) in all() {
+        if let Mapping::Scheme(scheme, _) = mappings[t.spec].1 {
+            if let Err(why) = conforms(t, scheme, &v2_parts(t, mappings[t.spec].1)?) {
+                let e = nonconforming.entry(mappings[t.spec].0.clone()).or_default();
+                e.0 += 1;
+                if e.1.is_empty() {
+                    e.1 = format!("{c}/{}: {why}", t.key);
+                }
+            }
+        }
+    }
+    if !nonconforming.is_empty() {
+        r.doc.insert("nonconforming".into(), json!(nonconforming));
+        return Ok(false);
+    }
 
     let mut names = Names::of(&h);
-    let files = files(src, &m, &h, &mut names)?;
+    let files = files(&m, &h, &mut names)?;
     if let Some(doc) = names.report() {
         r.doc.insert("renames".into(), doc);
     }
+    let Some(store) = store else {
+        let (mut packed, mut reused) = (0u64, 0u64);
+        let mut new = lane.manifest.length + header.length;
+        new += h.configs.iter().map(|c| c.1.len() as u64).sum::<u64>();
+        for p in all().flat_map(|(_, t)| &t.parts) {
+            match reusable(p) {
+                Some(_) => reused += 1,
+                None => (packed, new) = (packed + 1, new + p.length().next_multiple_of(ALIGN)),
+            }
+        }
+        let plan = json!({"new_bytes": new, "packed_parts": packed, "reused_parts": reused});
+        r.doc.insert("plan".into(), plan);
+        return Ok(true);
+    };
     let key = format!("migrate-{}", lane.manifest.sha256);
     let mut w = store.writer(None, Some(&key))?;
     let kept: Vec<(&String, &v1::Tensor, String, String)> = all()
@@ -192,6 +240,16 @@ fn migrate(
         match file {
             File::Reuse(object) => w.reuse_file(path, object)?,
             File::Bytes(bytes) => w.file(path, bytes)?,
+            File::Assemble { segments, object } => {
+                let mut bytes = Vec::new();
+                for s in segments {
+                    bytes.extend(src.read(s)?);
+                }
+                if ObjectRef::of(&bytes) != *object {
+                    return integrity(format!("asset {path} is not {}", object.sha256));
+                }
+                w.file(path, &bytes)?
+            }
             File::Split { v1, component } => {
                 let doc: Json =
                     serde_json::from_slice(v1).or_else(|e| fail(Kind::Invalid, e.to_string()))?;
@@ -232,6 +290,60 @@ fn migrate(
     }
     r.doc.insert("verified".into(), verified?);
     Ok(true)
+}
+
+/// How v1 ordered each component's tensors. A sort leaves almost no lexical descents (one per
+/// shard it was read from) and puts `.bias` before `.weight`; construction order has many and puts
+/// `.weight` first. `sorted` components take a constructor-order reference; `constructor` keep v1's.
+fn order(h: &v1::Header) -> Json {
+    let mut components = Map::new();
+    let mut classes = BTreeSet::new();
+    for (name, tensors) in &h.components {
+        let keys: Vec<&str> = tensors.iter().map(|t| t.key.as_str()).collect();
+        let (class, why) = order_class(&keys);
+        if class != "unknown" {
+            classes.insert(class);
+        }
+        components.insert(name.clone(), json!({"class": class, "evidence": why}));
+    }
+    let class = match classes.len() {
+        0 => "unknown",
+        1 => classes.first().copied().unwrap_or("unknown"),
+        _ => "mixed",
+    };
+    json!({"class": class, "components": components})
+}
+
+fn order_class(keys: &[&str]) -> (&'static str, String) {
+    let n = keys.len();
+    let descents = keys.windows(2).filter(|w| w[0] > w[1]).count();
+    let at: HashMap<&str, usize> = keys.iter().enumerate().map(|(i, k)| (*k, i)).collect();
+    let (mut pairs, mut weight_first) = (0, 0);
+    for (i, k) in keys.iter().enumerate() {
+        let weight = k
+            .strip_suffix(".bias")
+            .and_then(|m| at.get(format!("{m}.weight").as_str()));
+        if let Some(w) = weight {
+            pairs += 1;
+            weight_first += usize::from(*w < i);
+        }
+    }
+    let why =
+        format!("{descents} lexical descents in {n}; weight before bias {weight_first}/{pairs}");
+    let class = match (n, descents) {
+        (0..=2, _) => "unknown",
+        (_, 0) => "sorted",
+        (0..=19, _) => "unknown",
+        _ if descents <= 3 || descents * 20 < n => "sorted",
+        _ => "constructor",
+    };
+    let contradicted = pairs > 0
+        && match class {
+            "sorted" => weight_first == pairs,
+            "constructor" => weight_first == 0,
+            _ => false,
+        };
+    (if contradicted { "unknown" } else { class }, why)
 }
 
 /// D4's canonical names for one v1 checkpoint.
@@ -462,6 +574,59 @@ fn v2_parts(t: &v1::Tensor, mapping: &Mapping) -> Result<Vec<(String, Dtype, Vec
     }
 }
 
+/// The mapped parts against v2's definition of `scheme`, which its decoder enforces.
+fn conforms(
+    t: &v1::Tensor,
+    scheme: &str,
+    parts: &[(String, Dtype, Vec<u64>)],
+) -> std::result::Result<(), String> {
+    use Dtype::*;
+    let numel = |s: &[u64]| s.iter().product::<u64>();
+    if !matches!(t.dtype, F32 | BF16 | F16) {
+        return Err(format!("logical dtype {}", t.dtype));
+    }
+    let (rows, cols) = match t.shape[..] {
+        [r, c] => (r, c),
+        _ if scheme == "fp8-tensorwise" => (1, numel(&t.shape)),
+        _ => return Err(format!("logical shape {:?} is not rank 2", t.shape)),
+    };
+    let want = |role: &str, dtypes: &[Dtype], ok: &dyn Fn(&[u64]) -> bool| match parts
+        .iter()
+        .find(|p| p.0 == role)
+    {
+        Some((_, d, s)) if dtypes.contains(d) && ok(s) => Ok(()),
+        Some((_, d, s)) => Err(format!("part {role} is {d} {s:?}")),
+        None => Err(format!("no part {role}")),
+    };
+    let optional = |role: &str| match parts.iter().any(|p| p.0 == role) {
+        true => want(role, &[F32], &|s| numel(s) == 1),
+        false => Ok(()),
+    };
+    let (fp8, logical) = ([F8_E4M3, F8_E5M2], t.shape.as_slice());
+    match scheme {
+        "fp8-rowwise" => {
+            want("weight", &fp8, &|s| s == logical)?;
+            want("scale", &[F32], &|s| numel(s) == rows)
+        }
+        "fp8-tensorwise" => {
+            want("weight", &fp8, &|s| s == logical)?;
+            want("scale", &[F32], &|s| numel(s) == 1)?;
+            optional("input_scale")
+        }
+        "int8-convrot" if cols % 256 == 0 => {
+            want("weight", &[I8], &|s| s == logical)?;
+            want("scale", &[F32], &|s| numel(s) == rows)
+        }
+        "nvfp4" if cols % 16 == 0 => {
+            want("weight", &[F4], &|s| s == [rows, cols])?;
+            want("scale", &[F8_E4M3], &|s| s == [rows, cols / 16])?;
+            want("scale_2", &[F32], &|s| numel(s) == 1)?;
+            optional("input_scale")
+        }
+        _ => Err(format!("{cols} columns do not fit {scheme}")),
+    }
+}
+
 /// `(v2 component, v2 key, v2 role)` → sha256 of the part's v1 bytes, for packed parts.
 type Digests = HashMap<(String, String, String), String>;
 
@@ -514,22 +679,22 @@ fn put(
 enum File {
     /// A v1 file or single-object asset, by its object.
     Reuse(ObjectRef),
-    /// A v1 config (or a multi-object asset), as its v1 bytes.
+    /// A v1 config, as its v1 bytes.
     Bytes(Vec<u8>),
+    /// A multi-object asset, joined.
+    Assemble {
+        segments: Vec<ObjectRef>,
+        object: ObjectRef,
+    },
     /// One component's config out of v1's `model` config that holds every component's (H3).
     Split { v1: Vec<u8>, component: String },
 }
 
 /// The v2 tree's files: v1's files and assets, and its inline configs at their Diffusers or
 /// Transformers paths.
-fn files(
-    src: &v1::Source,
-    m: &v1::Manifest,
-    h: &v1::Header,
-    names: &mut Names,
-) -> Result<BTreeMap<String, File>> {
+fn files(m: &v1::Manifest, h: &v1::Header, names: &mut Names) -> Result<BTreeMap<String, File>> {
     let mut out: BTreeMap<String, File> = BTreeMap::new();
-    let mut add = |path: String, file: File| -> Result<()> {
+    fn add(out: &mut BTreeMap<String, File>, path: String, file: File) -> Result<()> {
         let same = match (out.get(&path), &file) {
             (None, _) => false,
             (Some(File::Reuse(a)), File::Reuse(b)) if a == b => true,
@@ -539,25 +704,19 @@ fn files(
             out.insert(path, file);
         }
         Ok(())
-    };
+    }
     for (path, object) in &m.files {
-        add(path.clone(), File::Reuse(object.clone()))?;
+        add(&mut out, path.clone(), File::Reuse(object.clone()))?;
     }
     for a in &h.assets {
         let file = match a.segments.as_slice() {
             [one] if *one == a.object => File::Reuse(one.clone()),
-            segments => {
-                let mut b = Vec::new();
-                for s in segments {
-                    b.extend(src.read(s)?);
-                }
-                if ObjectRef::of(&b) != a.object {
-                    return integrity(format!("asset {} is not {}", a.path, a.object.sha256));
-                }
-                File::Bytes(b)
-            }
+            segments => File::Assemble {
+                segments: segments.to_vec(),
+                object: a.object.clone(),
+            },
         };
-        add(a.path.clone(), file)?;
+        add(&mut out, a.path.clone(), file)?;
     }
     let components: BTreeSet<&str> = h.components.iter().map(|c| c.0.as_str()).collect();
     for (name, bytes) in &h.configs {
@@ -575,6 +734,7 @@ fn files(
                     for c in map.keys() {
                         let path = format!("{}/config.json", names.component(c));
                         add(
+                            &mut out,
                             path,
                             File::Split {
                                 v1: bytes.clone(),
@@ -592,7 +752,13 @@ fn files(
             c if components.contains(c) => format!("{}/config.json", names.component(c)),
             other => format!("{other}.json"),
         };
-        add(path, File::Bytes(bytes.clone()))?;
+        if matches!(out.get(&path), Some(File::Reuse(_))) {
+            names
+                .rules
+                .push(format!("config {name}: the tree's own {path} kept"));
+            continue;
+        }
+        add(&mut out, path, File::Bytes(bytes.clone()))?;
     }
     Ok(out)
 }
@@ -712,6 +878,7 @@ fn verify(
         let same = match file {
             File::Reuse(object) => stored[path] == *object,
             File::Bytes(bytes) => ck.file(path)? == *bytes,
+            File::Assemble { object, .. } => stored[path] == *object,
             File::Split { v1, component } => {
                 let parse = |b: &[u8]| serde_json::from_slice::<Json>(b).unwrap_or_default();
                 let v2 = parse(&ck.file(path)?);

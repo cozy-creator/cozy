@@ -29,8 +29,10 @@ const USAGE: &str = "usage: tfs [--store <dir>] [--json] <verb> ...
   verify [<ref>]
   gc [--older-than <7d|12h|30m|90s>]
   dev ckpt [--name <org/name>] [--blocks <n>] [--scale <n>] [--plain] [--no-configs]
-  dev migrate <v1-dir> [<manifest-sha256>|<org/name>]... [--dry-run]
-      v1-dir: a v1 store (read only) or a directory of a v1 manifest and its objects
+  dev migrate <v1-dir> [<manifest-sha256>|<org/name>]... [--dry-run | --plan]
+      v1-dir: a v1 store (read only) or a directory of a v1 manifest and its objects;
+      --plan: the census, names and new bytes from manifests and headers alone, no store
+  dev headers <hub-url> <dir> <org/name@release/lane>...   a released lane's v1 manifest and header
 <ref> is org/name[@release] (--lane names a lane, else the release's only one) or a manifest
 sha256. The store is --store, else $TENSORFS_HOME, else ~/.tensorfs; it is created when absent.";
 
@@ -41,6 +43,7 @@ const SWITCHES: &[&str] = &[
     "plain",
     "no-configs",
     "dry-run",
+    "plan",
 ];
 const VALUED: &[&str] = &[
     "store",
@@ -341,15 +344,20 @@ fn run(args: &Args) -> Done {
             Ok(Some((Json::Object(doc), human)))
         }
         ["dev", "migrate", root, select @ ..] => {
-            migrate_v1(&store()?, root, select, args.on("dry-run"))
+            let store = match args.on("plan") {
+                true => None,
+                false => Some(store()?),
+            };
+            migrate_v1(store.as_ref(), root, select, args.on("dry-run"))
         }
+        ["dev", "headers", hub, dir, lanes @ ..] if !lanes.is_empty() => headers(hub, dir, lanes),
         _ => Ok(None),
     }
 }
 
 /// Migrates the v1 checkpoints `select` names (a manifest digest or a repo), or every one the
 /// v1 store's repos name; one report per checkpoint and the totals.
-fn migrate_v1(store: &Store, root: &str, select: &[&str], dry_run: bool) -> Done {
+fn migrate_v1(store: Option<&Store>, root: &str, select: &[&str], dry_run: bool) -> Done {
     let src = old::Source::new(root);
     let named = match src.root().join("repos").is_dir() {
         true => src.lanes()?,
@@ -427,6 +435,26 @@ fn migrate_v1(store: &Store, root: &str, select: &[&str], dry_run: bool) -> Done
             doc.as_object().cloned(),
         )),
     }
+}
+
+/// Each released lane's v1 manifest and header from the Hub at `hub`, into `dir`.
+fn headers(hub: &str, dir: &str, lanes: &[&str]) -> Done {
+    fs::create_dir_all(dir).map_err(|e| Failure {
+        kind: Kind::Io,
+        detail: format!("{dir}: {e}"),
+    })?;
+    let mut docs = Vec::new();
+    for spec in lanes {
+        let Some((refspec, lane)) = spec.rsplit_once('/').filter(|(r, _)| r.contains('@')) else {
+            return Ok(None);
+        };
+        let got = migrate::hub::headers(hub, refspec, lane, Path::new(dir))?;
+        eprintln!("{spec}: {} ({} bytes)", got.manifest.sha256, got.bytes);
+        docs.push(json!({"lane": spec, "release": got.release, "manifest": object(&got.manifest), "bytes": got.bytes}));
+    }
+    let bytes: u64 = docs.iter().filter_map(|d| d["bytes"].as_u64()).sum();
+    let human = format!("{} lanes, {bytes} bytes of manifests and headers", docs.len());
+    Ok(Some((json!({"lanes": docs, "bytes": bytes}), human)))
 }
 
 /// `7d`, `12h`, `30m`, `90s` or seconds.
