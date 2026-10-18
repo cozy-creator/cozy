@@ -147,7 +147,7 @@ fn a_tiny_hf_sdxl_imports_and_reads_back_bit_identical() {
     let id = store.import(&request, Some("import-tiny-sdxl")).unwrap();
     assert_eq!(
         store.get_pin("import-tiny-sdxl").unwrap().unwrap().roots,
-        [id.clone()]
+        std::slice::from_ref(&id)
     );
     assert!(!store.root().join("tmp/writers/import-tiny-sdxl").exists());
     let ck = store.checkpoint(&id).unwrap();
@@ -641,7 +641,7 @@ fn a_writer_killed_mid_write_resumes_to_the_uninterrupted_checkpoint() {
     assert!(!root.join("tmp/writers/resume").exists());
     assert_eq!(
         store.get_pin("resume").unwrap().unwrap().roots,
-        [resumed.clone()]
+        std::slice::from_ref(&resumed)
     );
 
     let other = scratch.store("uninterrupted");

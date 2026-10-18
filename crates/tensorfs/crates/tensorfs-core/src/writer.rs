@@ -11,7 +11,7 @@
 //!   child holds it only until it execs, and a second opener of the key waits.
 //! - Objects the writer refers to are kept young while it runs, so GC's grace never takes them.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{btree_map, BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -524,8 +524,8 @@ impl Writer {
     ) -> Result<()> {
         for (component, key, _) in base.tensors() {
             let name = (component.to_owned(), key.to_owned());
-            if !tensors.contains_key(&name) {
-                tensors.insert(name, self.adopt(component, key, base)?);
+            if let btree_map::Entry::Vacant(slot) = tensors.entry(name) {
+                slot.insert(self.adopt(component, key, base)?);
             }
         }
         for (path, object) in &base.manifest().files {
