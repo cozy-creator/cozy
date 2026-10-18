@@ -1450,7 +1450,6 @@ print(json.dumps({"identity": generation.identity}))
                             deadline_s: None,
                             attention_kernel: String::new(),
                             bits: 0,
-                            plane_budget_bytes: -1,
                             cap_bytes: None,
                             inputs: Default::default(),
                             trees: Default::default(),

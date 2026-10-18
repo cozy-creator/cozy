@@ -179,7 +179,7 @@ fn exec(
         cells: Vec::new(),
         log: File::create(root.join("events.jsonl"))?,
     };
-    let sharing = device_weights && executor.hello.offers("weights.attach/1");
+    let sharing = device_weights;
     let devices = executor
         .hello
         .sealed
@@ -275,7 +275,6 @@ fn exec(
                 deadline_s: None,
                 attention_kernel: String::new(),
                 bits: 0,
-                plane_budget_bytes: config.plane_budget_bytes,
                 cap_bytes: None,
                 inputs: Default::default(),
                 trees: Default::default(),

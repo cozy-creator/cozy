@@ -114,7 +114,7 @@ fn launch_in(root: &Path, extra: &[std::ffi::OsString], scope: &[&str]) -> (Chil
         .arg(&state)
         .arg("--machine-config")
         .arg(root.join("config/machine.json"))
-        .args(["--listen", "127.0.0.1:0", "--host-bytes", "0"])
+        .args(["--listen", "127.0.0.1:0"])
         .args(extra)
         .stdout(Stdio::null())
         .spawn()

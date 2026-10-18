@@ -121,7 +121,7 @@ fn serve(root: &Path, listen: &str, extra: &[std::ffi::OsString]) -> (Child, End
         .arg(&state)
         .arg("--machine-config")
         .arg(root.join("config").join("machine.json"))
-        .args(["--listen", listen, "--host-bytes", "0"])
+        .args(["--listen", listen])
         .args(extra)
         .stdout(Stdio::null())
         .spawn()

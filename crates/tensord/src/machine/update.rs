@@ -212,10 +212,9 @@ pub fn rollback_pending(paths: &Paths, cause: &str) -> io::Result<bool> {
     Ok(true)
 }
 
-/// Recovers a publication interrupted before its durable `starting` marker. The parent calls
-/// this before choosing its service binary; a new service also calls it when an older parent
-/// launched it. True means links were restored and that child must let its parent select again.
-/// A succeeded marker means readiness already committed the update: only its cleanup remains.
+/// Recovers a publication interrupted before its durable `starting` marker; the parent calls
+/// this before each service it forks. True means links were restored. A succeeded marker means
+/// readiness already committed the update: only its cleanup remains.
 pub fn recover_activation(paths: &Paths) -> io::Result<bool> {
     let Some(pending) = read_pending(paths)? else {
         return Ok(false);

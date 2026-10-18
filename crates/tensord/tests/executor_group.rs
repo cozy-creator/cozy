@@ -191,7 +191,7 @@ fn a_degree_the_seal_does_not_name_is_refused_before_any_follower() {
 #[test]
 #[ignore = "needs a fork/1 cpu_group generation with CPU torch"]
 fn a_forked_rank_zero_takes_the_group_seal_and_spawns_its_follower() {
-    use tensord::device_executor::{Forked, FORK};
+    use tensord::device_executor::Forked;
     let root_dir = PathBuf::from(
         std::env::var("TENSORD_GROUP_FORK_GENERATIONS").expect("fork/1 generation"),
     );
@@ -230,7 +230,6 @@ fn a_forked_rank_zero_takes_the_group_seal_and_spawns_its_follower() {
         }
     };
     let mut parent = DeviceExecutor::spawn(config("parent", "0", false)).unwrap();
-    assert!(parent.hello.offers(FORK), "{:?}", parent.hello.memory);
     let imported = parent
         .command(
             &DeviceCommand::Start {

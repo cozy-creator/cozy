@@ -53,17 +53,8 @@ pub struct Hello {
     pub pgid: u32,
     pub runtime_version: String,
     pub tensorfs_version: String,
-    pub executor_protocol_revision: u64,
-    pub memory: Vec<String>,
-    /// Memo tiers the executor can use (`stage/1`: memoized Model methods).
-    pub memo: Vec<String>,
     pub sealed: BTreeMap<String, String>,
     pub torch_loaded: bool,
-}
-impl Hello {
-    pub fn offers(&self, capability: &str) -> bool {
-        self.memory.iter().any(|offered| offered == capability)
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -116,10 +107,6 @@ pub struct Binding {
     pub package: String,
     pub model: String,
     pub adapters: Vec<Adapter>,
-    pub window_bytes: u64,
-    pub slots: u64,
-    pub readers: u64,
-    pub inflight: u64,
 }
 impl Default for Binding {
     fn default() -> Self {
@@ -145,10 +132,6 @@ impl Default for Binding {
             package: String::new(),
             model: String::new(),
             adapters: Vec::new(),
-            window_bytes: 4 << 20,
-            slots: 16,
-            readers: 16,
-            inflight: 8,
         }
     }
 }
@@ -158,10 +141,8 @@ pub struct Budgets {
     pub declared_weight_bytes: u64,
 }
 
-/// An executor capability: a group's followers obey their own GPU's cap and budget cell.
-pub const RANK_CELLS: &str = "rank_cells/1";
-
-/// A group's per-rank fields (`rank_cells/1`), sent beside `Start`, `Load` and `Invoke`.
+/// A group's per-rank fields, sent beside `Start`, `Load` and `Invoke`: its followers obey
+/// their own GPU's cap and budget cell.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct Group {
     /// `Start`: rank 0 hands its owner one budget cell per follower (`BudgetCell.rank`).
@@ -218,7 +199,7 @@ pub enum DeviceCommand {
         authorized_device_limit_bytes: Option<u64>,
         #[serde(skip_serializing_if = "String::is_empty")]
         attention_pin: String,
-        /// `host_tiers.sealed/1`: each weight set asks for TensorD's sealed CPU-buffer layout.
+        /// Each weight set asks for TensorD's sealed CPU-buffer layout.
         #[serde(skip_serializing_if = "is_false")]
         sealed_tiers: bool,
         /// TensorD supplies the selected header/assets (`model_source`) for Runtime to parse
@@ -229,13 +210,13 @@ pub enum DeviceCommand {
         /// (`sealed_stage`, `object_files`): an executor asks for them only when told so.
         #[serde(skip_serializing_if = "is_false")]
         staged_tiers: bool,
-        /// `load_pinned/1`: the pinned budget, applied before any weight set registers.
+        /// The pinned budget, applied before any weight set registers.
         #[serde(skip_serializing_if = "Option::is_none")]
         pinned_bytes: Option<i64>,
-        /// Runtime maps GPU allocation handles retained by TensorD (`weights.attach/1`).
+        /// Runtime maps GPU allocation handles retained by TensorD.
         #[serde(skip_serializing_if = "is_false")]
         device_weights: bool,
-        /// The process's device cap (`process_cap/1`).
+        /// The process's device cap.
         #[serde(skip_serializing_if = "Option::is_none")]
         cap_bytes: Option<u64>,
     },
@@ -269,7 +250,6 @@ pub enum DeviceCommand {
         attention_kernel: String,
         #[serde(skip_serializing_if = "is_zero")]
         bits: u32,
-        plane_budget_bytes: i64,
         #[serde(skip_serializing_if = "Option::is_none")]
         cap_bytes: Option<u64>,
         /// File inputs by field path: read-only copies in this call's spool.
@@ -287,7 +267,7 @@ pub enum DeviceCommand {
         /// Rooms known to squeeze its stage methods at this shape (`Shape::squeezed`).
         #[serde(skip_serializing_if = "BTreeMap::is_empty")]
         squeezed_bytes: BTreeMap<String, u64>,
-        /// Degree 2 for this call (`weights.attach/1`); None leaves the executor's setting.
+        /// Degree 2 for this call; None leaves the executor's setting.
         #[serde(skip_serializing_if = "Option::is_none")]
         device_weights: Option<bool>,
         /// Each `Weights[M]` parameter's checkpoint (`sha256:<hex>`), read through `weights_writer`.
@@ -303,8 +283,8 @@ pub enum DeviceCommand {
         #[serde(skip_serializing_if = "Option::is_none")]
         cap_bytes: Option<u64>,
     },
-    /// Map a loaded construction's weights onto the GPU inside `cap_bytes`, nothing run
-    /// (`weights.map/1`): a warm set member at `gpu`.
+    /// Map a loaded construction's weights onto the GPU inside `cap_bytes`, nothing run: a warm
+    /// set member at `gpu`.
     Map {
         construction: String,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -312,10 +292,9 @@ pub enum DeviceCommand {
         #[serde(skip_serializing_if = "Option::is_none")]
         floor_bytes: Option<u64>,
     },
-    /// Offer the machine every GPU region filled and not shared yet (`weights.attach/1`).
+    /// Offer the machine every GPU region filled and not shared yet.
     Share,
-    /// Release the machine's GPU regions of one layout (`weights.revoke/1`), or only
-    /// `regions` of it (`weights.trim/1`).
+    /// Release the machine's GPU regions of one layout, or only `regions` of it.
     Revoke {
         layout: String,
         generation: u64,
@@ -481,7 +460,7 @@ pub struct HostFrame {
 pub struct PlaneFacts {
     pub budget_bytes: Option<i64>,
     pub committed_bytes: Option<i64>,
-    /// GPU regions mapped from custody (`weights.attach/1`): outside `committed_bytes`.
+    /// GPU regions mapped from custody: outside `committed_bytes`.
     pub shared_bytes: Option<i64>,
     pub leased_bytes: Option<i64>,
     pub pinned_budget_bytes: Option<i64>,
@@ -931,7 +910,7 @@ pub trait Services {
         drop(descriptor);
         Ok((Answer::unavailable(frame.seq), None))
     }
-    /// `device_tier` (`weights.attach/1`): `fds` arrived with the request; the returned ones
+    /// `device_tier`: `fds` arrived with the request; the returned ones
     /// follow the answer, the lease socket last when `answer.lease`.
     fn device_tier(
         &mut self,
@@ -941,7 +920,7 @@ pub trait Services {
         drop(fds);
         Ok((Answer::unavailable(frame.seq), Vec::new()))
     }
-    /// `object_files` (`host_tiers.staged/1`): the plan's memfd arrived with the request; the
+    /// `object_files`: the plan's memfd arrived with the request; the
     /// verified object files follow the answer, one fd per `objects` entry.
     fn object_files(
         &mut self,
@@ -1016,9 +995,6 @@ impl Cancellation {
 }
 
 type Watched = Arc<Mutex<Option<Arc<Watch>>>>;
-
-/// Executors fork from an import-only executor that offers this (Runtime `fork/1`).
-pub const FORK: &str = "fork/1";
 
 pub enum Forked {
     Ready(Box<DeviceExecutor>),
@@ -1826,63 +1802,6 @@ impl DeviceExecutor {
         self.retained.push(Box::new(resource));
     }
 
-    fn offered(&self, command: &DeviceCommand) -> io::Result<()> {
-        if matches!(command, DeviceCommand::Fork { .. }) && !self.hello.offers(FORK) {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "fork capability absent",
-            ));
-        }
-        if let DeviceCommand::Start {
-            import_only: true, ..
-        } = command
-        {
-            if !self.hello.offers("import_only") {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "import-only startup capability absent",
-                ));
-            }
-        }
-        if let DeviceCommand::Load {
-            sealed_tiers,
-            pinned_bytes,
-            ..
-        } = command
-        {
-            let plane = self.hello.offers("weight_plane/1");
-            if (*sealed_tiers && !(plane && self.hello.offers("host_tiers.sealed/1")))
-                || (pinned_bytes.is_some() && !(plane && self.hello.offers("load_pinned/1")))
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "sealed host tiers or a Load pinned budget without the executor capability",
-                ));
-            }
-        }
-        let sharing = match command {
-            DeviceCommand::Load { device_weights, .. } => *device_weights,
-            DeviceCommand::Share => true,
-            _ => false,
-        };
-        if (sharing && !self.hello.offers("weights.attach/1"))
-            || (matches!(command, DeviceCommand::Revoke { .. })
-                && !self.hello.offers("weights.revoke/1"))
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "shared GPU weight capability absent",
-            ));
-        }
-        if matches!(command, DeviceCommand::Budget { .. }) && !self.hello.offers("weight_plane/1") {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "plane budget capability absent; legacy residency remains available",
-            ));
-        }
-        Ok(())
-    }
-
     /// One command, observed: a wedged executor is killed on its measured lack of progress,
     /// which closes the channel and returns this call with the measurement.
     pub fn command(
@@ -1893,21 +1812,13 @@ impl DeviceExecutor {
         self.command_with(command, &Group::default(), services)
     }
 
-    /// `command` with a group's per-rank fields (`rank_cells/1`): only an executor that offers
-    /// the capability is sent them.
+    /// `command` with a group's per-rank fields.
     pub fn command_with(
         &mut self,
         command: &DeviceCommand,
         group: &Group,
         services: &mut impl Services,
     ) -> io::Result<Frame> {
-        self.offered(command)?;
-        if !group.is_empty() && !self.hello.offers(RANK_CELLS) {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "per-rank caps and cells without the executor capability",
-            ));
-        }
         let meter = match command {
             DeviceCommand::Invoke { .. } => Meter::Frames,
             _ => Meter::Burn,
@@ -1952,9 +1863,8 @@ impl DeviceExecutor {
         ) {
             object.extend(extra);
         }
-        // An executor that memoizes stages is told the machine tier takes their results.
-        let memoizes = self.hello.memo.iter().any(|tier| tier == "stage/1");
-        if matches!(command, DeviceCommand::Start { .. }) && self.memo.is_some() && memoizes {
+        // The executor's memoized stages go to the machine tier.
+        if matches!(command, DeviceCommand::Start { .. }) && self.memo.is_some() {
             value["memo"] =
                 serde_json::json!({"process_bytes": -1, "entry_bytes": crate::memo::ENTRY_BYTES});
         }
