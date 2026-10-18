@@ -15,8 +15,9 @@ use std::{
 use windows_sys::Win32::{
     Foundation::{
         DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_BROKEN_PIPE, ERROR_IO_PENDING,
-        ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, ERROR_PIPE_NOT_CONNECTED, GENERIC_READ,
-        GENERIC_WRITE, HANDLE, HLOCAL, INVALID_HANDLE_VALUE, LocalFree, WAIT_OBJECT_0,
+        ERROR_OPERATION_ABORTED, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, ERROR_PIPE_NOT_CONNECTED,
+        GENERIC_READ, GENERIC_WRITE, HANDLE, HLOCAL, INVALID_HANDLE_VALUE, LocalFree,
+        WAIT_OBJECT_0,
     },
     Security::{
         Authorization::{
@@ -40,6 +41,7 @@ use windows_sys::Win32::{
         },
         Threading::{
             CreateEventW, GetCurrentProcess, INFINITE, OpenProcessToken, WaitForMultipleObjects,
+            WaitForSingleObject,
         },
     },
 };
@@ -59,21 +61,75 @@ pub struct LocalStream {
     side: Side,
     reading: OwnedHandle,
     writing: OwnedHandle,
+    /// A read or write that cannot finish at once is cancelled and answers `WouldBlock`.
+    nonblocking: std::sync::atomic::AtomicBool,
+    /// Shut down, by this handle or a clone: reads read the end, writes break.
+    closed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// How long a read waits before it answers `TimedOut`; 0: for ever.
+    read_timeout_ms: std::sync::atomic::AtomicU32,
 }
 
 impl LocalStream {
     fn new(pipe: OwnedHandle, side: Side) -> io::Result<Self> {
+        Self::sharing(pipe, side, std::sync::Arc::default())
+    }
+
+    fn sharing(
+        pipe: OwnedHandle,
+        side: Side,
+        closed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> io::Result<Self> {
         Ok(Self {
             pipe,
             side,
             reading: event()?,
             writing: event()?,
+            nonblocking: std::sync::atomic::AtomicBool::new(false),
+            closed,
+            read_timeout_ms: std::sync::atomic::AtomicU32::new(0),
         })
     }
 
     /// Another handle on the same pipe, for a reader thread while this one writes.
     pub fn try_clone(&self) -> io::Result<Self> {
-        Self::new(self.pipe.try_clone()?, self.side)
+        Self::sharing(self.pipe.try_clone()?, self.side, self.closed.clone())
+    }
+
+    /// Ends the stream as a socket's shutdown does, whatever `how`: the listener's end
+    /// disconnects its dialer, so a read waiting on any clone of either end returns; later reads
+    /// here read the end and writes break.
+    pub fn shutdown(&self, _how: std::net::Shutdown) -> io::Result<()> {
+        use windows_sys::Win32::System::Pipes::DisconnectNamedPipe;
+        self.closed
+            .store(true, std::sync::atomic::Ordering::Release);
+        // SAFETY: a live pipe handle; cancelling I/O that is not there does nothing.
+        unsafe { CancelIoEx(raw(&self.pipe), ptr::null()) };
+        if self.side == Side::Server {
+            // SAFETY: as above, on the listener's end of the instance.
+            unsafe { DisconnectNamedPipe(raw(&self.pipe)) };
+        }
+        Ok(())
+    }
+
+    fn closed(&self) -> bool {
+        self.closed.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// How long a read waits before it answers `TimedOut`, as a socket's read timeout.
+    pub fn set_read_timeout(&self, timeout: Option<std::time::Duration>) -> io::Result<()> {
+        let ms = timeout.map_or(0, |t| {
+            t.as_millis().clamp(1, u128::from(INFINITE - 1)) as u32
+        });
+        self.read_timeout_ms
+            .store(ms, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Whether a read or write that cannot finish at once answers `WouldBlock` instead of waiting.
+    pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        self.nonblocking
+            .store(nonblocking, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
     }
 
     /// The process on the other end.
@@ -93,8 +149,19 @@ impl LocalStream {
     }
 
     fn read_into(&self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.closed() {
+            return Ok(0);
+        }
         let len = buf.len().min(u32::MAX as usize) as u32;
-        let done = transfer(&self.pipe, &self.reading, |overlapped| {
+        let waits = match self
+            .read_timeout_ms
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            _ if self.nonblocking() => Some(0),
+            0 => None,
+            ms => Some(ms),
+        };
+        let done = transfer(&self.pipe, &self.reading, waits, |overlapped| {
             // SAFETY: a live pipe, a writable buffer of `len` bytes and an OVERLAPPED that
             // outlives the operation (transfer waits for it).
             unsafe {
@@ -109,26 +176,38 @@ impl LocalStream {
         });
         match done {
             Ok(n) => Ok(n as usize),
-            // The other end closed: the end of the stream.
-            Err(error) if ended(&error) => Ok(0),
+            // The other end closed, or this one was shut down: the end of the stream.
+            Err(error) if ended(&error) || self.closed() => Ok(0),
             Err(error) => Err(error),
         }
     }
 
+    fn nonblocking(&self) -> bool {
+        self.nonblocking.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     fn write_from(&self, buf: &[u8]) -> io::Result<usize> {
+        if self.closed() {
+            return Err(io::ErrorKind::BrokenPipe.into());
+        }
         let len = buf.len().min(u32::MAX as usize) as u32;
-        transfer(&self.pipe, &self.writing, |overlapped| {
-            // SAFETY: as in read_into, with a readable buffer.
-            unsafe {
-                WriteFile(
-                    raw(&self.pipe),
-                    buf.as_ptr(),
-                    len,
-                    ptr::null_mut(),
-                    overlapped,
-                )
-            }
-        })
+        transfer(
+            &self.pipe,
+            &self.writing,
+            self.nonblocking().then_some(0),
+            |overlapped| {
+                // SAFETY: as in read_into, with a readable buffer.
+                unsafe {
+                    WriteFile(
+                        raw(&self.pipe),
+                        buf.as_ptr(),
+                        len,
+                        ptr::null_mut(),
+                        overlapped,
+                    )
+                }
+            },
+        )
         .map(|n| n as usize)
     }
 }
@@ -177,6 +256,12 @@ impl AsRawHandle for LocalStream {
     }
 }
 
+impl From<LocalStream> for OwnedHandle {
+    fn from(stream: LocalStream) -> Self {
+        stream.pipe
+    }
+}
+
 impl IntoRawHandle for LocalStream {
     fn into_raw_handle(self) -> RawHandle {
         self.pipe.into_raw_handle()
@@ -200,6 +285,11 @@ impl LocalListener {
             security,
             next: Mutex::new(Some(first)),
         })
+    }
+
+    /// Every dialer, one at a time, as `UnixListener::incoming` gives them.
+    pub fn incoming(&self) -> impl Iterator<Item = Result<LocalStream>> + '_ {
+        std::iter::repeat_with(|| self.accept())
     }
 
     pub fn accept(&self) -> Result<LocalStream> {
@@ -411,10 +501,12 @@ fn dial(name: &[u16]) -> io::Result<OwnedHandle> {
     }
 }
 
-/// Runs one overlapped read or write and waits for it to finish.
+/// Runs one overlapped read or write and waits for it to finish. Given `waits` milliseconds, one
+/// not done by then is cancelled and answers `WouldBlock` (0: not done at once) or `TimedOut`.
 fn transfer(
     pipe: &OwnedHandle,
     event: &OwnedHandle,
+    waits: Option<u32>,
     start: impl FnOnce(*mut OVERLAPPED) -> i32,
 ) -> io::Result<u32> {
     // SAFETY: plain-old-data with its event set.
@@ -424,6 +516,30 @@ fn transfer(
         let error = io::Error::last_os_error();
         if error.raw_os_error() != Some(ERROR_IO_PENDING as i32) {
             return Err(error);
+        }
+        if let Some(ms) = waits {
+            // SAFETY: a live event the operation signals.
+            if unsafe { WaitForSingleObject(raw(event), ms) } == WAIT_OBJECT_0 {
+                let mut done = 0u32;
+                // SAFETY: the operation has completed.
+                return match unsafe { GetOverlappedResult(raw(pipe), &overlapped, &mut done, 1) } {
+                    0 => Err(io::Error::last_os_error()),
+                    _ => Ok(done),
+                };
+            }
+            // SAFETY: the operation started above on this pipe.
+            unsafe { CancelIoEx(raw(pipe), &overlapped) };
+            let mut done = 0u32;
+            // SAFETY: as above; waits for the cancellation (or completion) to land.
+            if unsafe { GetOverlappedResult(raw(pipe), &overlapped, &mut done, 1) } == 0 {
+                let error = io::Error::last_os_error();
+                return Err(match error.raw_os_error().map(|code| code as u32) {
+                    Some(ERROR_OPERATION_ABORTED) if ms == 0 => io::ErrorKind::WouldBlock.into(),
+                    Some(ERROR_OPERATION_ABORTED) => io::ErrorKind::TimedOut.into(),
+                    _ => error,
+                });
+            }
+            return Ok(done);
         }
     }
     let mut done = 0u32;

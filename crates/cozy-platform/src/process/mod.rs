@@ -185,7 +185,6 @@ impl Exact {
     }
 
     /// The handle as a file a caller keeps: readable (Unix) or signaled (Windows) once it exits.
-    #[cfg(unix)]
     pub fn into_file(self) -> std::fs::File {
         self.handle.0.into()
     }
