@@ -162,6 +162,8 @@ class RequestStats:
     evictions: tuple[Eviction, ...]
     #: torch bytes still allocated at its end beyond its start, by GPU (§5.7)
     leftover: tuple[tuple[int, int], ...]
+    #: weight bytes copied to its GPUs while it ran, home or through slots
+    copied: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -409,6 +411,8 @@ class Request:
     id: str
     gpus: tuple[int, ...]
     start: dict[int, int]
+    #: each model's weight bytes copied to the device so far, as it began
+    copies: dict[str, int]
     steps: list[Step] = field(default_factory=list)
     evictions: list[Eviction] = field(default_factory=list)
     stats: RequestStats | None = None
@@ -916,7 +920,9 @@ class Memory:
         """Everything the request allocates is freed on exit, failed or not. A capacity failure
         never poisons; bytes package state still holds show as `leftover`."""
         mine = tuple(g for g in gpus if g in self.gpus)
-        request = Request(id, mine, {g: torch.cuda.memory_allocated(g) for g in mine})
+        request = Request(
+            id, mine, {g: torch.cuda.memory_allocated(g) for g in mine}, self._copies(mine)
+        )
         with self.lock:
             self.active[request] = None
         stack: list[Request] = self.local.__dict__.setdefault("requests", [])
@@ -938,8 +944,11 @@ class Memory:
         leftover = tuple(
             (g, max(torch.cuda.memory_allocated(g) - request.start[g], 0)) for g in request.gpus
         )
+        copied = sum(
+            n - request.copies.get(name, 0) for name, n in self._copies(request.gpus).items()
+        )
         request.stats = RequestStats(
-            request.id, tuple(request.steps), tuple(request.evictions), leftover
+            request.id, tuple(request.steps), tuple(request.evictions), leftover, copied
         )
         with self.lock:
             self.active.pop(request, None)
@@ -985,6 +994,10 @@ class Memory:
                     except DeviceFull:
                         return
                 model.loaded.add(b)
+
+    def _copies(self, gpus: Sequence[int]) -> dict[str, int]:
+        """Each model's weight bytes copied to `gpus` since it registered, home or slots."""
+        return {m.name: sum(_counters(m)[1:3]) for m in list(self.models.values()) if m.gpu in gpus}
 
     def _requests(self, gpu: int) -> list[Request]:
         """The request a step or an eviction belongs to: this thread's, else the GPU's first."""
