@@ -122,6 +122,26 @@ impl Home {
         std::fs::read_to_string(self.config_path()).unwrap_or_default()
     }
 
+    /// Points this home at its Hub's listen address (`TENSORHUB_URL`, plain HTTP on loopback)
+    /// instead of its public origin, as a laptop names its local Hub, keeping the device key it
+    /// signed in with. Answers that address.
+    pub fn at_listen_address(&self) -> String {
+        let listen = std::env::var("TENSORHUB_URL").expect("the Tensorhub's listen address");
+        let public = std::env::var("TENSORHUB_ORIGIN").expect("a Tensorhub");
+        std::fs::copy(self.device_key(&public), self.device_key(&listen)).unwrap();
+        self.write_config(&format!("hub = \"ci\"\n[hubs]\nci = \"{listen}\"\n"));
+        listen
+    }
+
+    /// Where `cozy` keeps this home's device key for the Hub at `url`.
+    pub fn device_key(&self, url: &str) -> PathBuf {
+        let hub = cozy_proto::config::Hub {
+            name: None,
+            origin: cozy_proto::config::Origin::parse(url).unwrap(),
+        };
+        hub.device_key(&cozy_platform::paths::Home::at(self.root()))
+    }
+
     /// `cozy` with this home, no inherited credentials and no user service manager: a Calcifer
     /// it starts is its own detached process.
     pub fn command(&self) -> Command {

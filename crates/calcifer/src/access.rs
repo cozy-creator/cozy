@@ -55,6 +55,8 @@ pub(crate) struct Facts {
     /// Where machines read the Hub, and its public origin: a capability's audience.
     reads: String,
     public: String,
+    /// Both, as a machine may record the Hub: the configured Hub's other names.
+    names: Vec<Origin>,
     object_hosts: Vec<String>,
     /// The CA a machine trusts for the Hub when a private one signs it (a test Hub).
     ca_der: Vec<u8>,
@@ -66,7 +68,11 @@ impl Machines {
     pub(crate) async fn access(&self, run: &RunRow, machine: &str) -> Result<Access, Denied> {
         let providers = self.providers.clone();
         let spec = &run.spec;
-        let Some(origin) = run.hub.as_ref().filter(|origin| {
+        let origin = match &run.hub {
+            Some(hub) => Some(self.hubs.resolve(hub).await),
+            None => None,
+        };
+        let Some(origin) = origin.filter(|origin| {
             // Signed out, a public run reads at its Hub's origin (lib's finish_spec).
             self.device_key(origin).is_ok() || private(spec)
         }) else {
@@ -76,6 +82,7 @@ impl Machines {
                 owner: None,
             });
         };
+        let origin = &origin;
         let facts = self.hubs.facts(origin).await?;
         let operations = match private(spec) {
             true => operations(&facts.account, spec),
@@ -195,9 +202,14 @@ impl Hubs {
             .into_inner()
             .environment;
         let account = account.into_inner();
+        let names = [
+            &environment.tensorhub_origin,
+            &environment.tensorhub_public_origin,
+        ];
         let facts = Facts {
             account: account.name,
             user_id: account.user_id,
+            names: names.iter().filter_map(|o| Origin::parse(o).ok()).collect(),
             reads: environment.tensorhub_origin,
             public: environment.tensorhub_public_origin,
             object_hosts: environment
@@ -222,6 +234,49 @@ impl Hubs {
         }
         lock(&self.facts).insert(origin.clone(), facts.clone());
         Ok(facts)
+    }
+
+    /// The configured Hub `origin` names: itself, or the one a machine reads or the public
+    /// knows at `origin` (a dev Hub this computer dials on loopback is read elsewhere), as the
+    /// facts read so far say.
+    pub(crate) fn configured(&self, origin: &Origin) -> Option<Origin> {
+        if self.configured.iter().any(|hub| &hub.origin == origin) {
+            return Some(origin.clone());
+        }
+        let facts = lock(&self.facts);
+        let named = self
+            .configured
+            .iter()
+            .find(|hub| (facts.get(&hub.origin)).is_some_and(|facts| facts.names.contains(origin)));
+        named.map(|hub| hub.origin.clone())
+    }
+
+    /// `origin`'s configured Hub, reading the facts of each configured Hub not read yet when the
+    /// ones read so far do not name it; `origin` itself when none does.
+    pub(crate) async fn resolve(&self, origin: &Origin) -> Origin {
+        if let Some(hub) = self.configured(origin) {
+            return hub;
+        }
+        self.learn().await;
+        self.configured(origin).unwrap_or_else(|| origin.clone())
+    }
+
+    /// Reads the facts of each configured Hub this computer is signed in to and has not read.
+    pub(crate) async fn learn(&self) {
+        for hub in &self.configured {
+            if !lock(&self.facts).contains_key(&hub.origin) {
+                let _ = self.facts(&hub.origin).await;
+            }
+        }
+    }
+
+    /// An installation's Hub as a machine records it, as this computer names that Hub: the
+    /// configured Hub's origin, else its one spelling; local code's stays empty.
+    pub(crate) fn named(&self, hub: &str) -> String {
+        match Origin::parse(hub) {
+            Ok(origin) => self.configured(&origin).unwrap_or(origin).into(),
+            Err(_) => hub.to_owned(),
+        }
     }
 }
 

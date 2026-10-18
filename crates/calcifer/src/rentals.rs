@@ -35,7 +35,7 @@ use crate::{
 pub(crate) struct Hubs {
     http: reqwest::Client,
     home: Home,
-    configured: Vec<config::Hub>,
+    pub(crate) configured: Vec<config::Hub>,
     listings: Mutex<HashMap<String, Listing>>,
     /// This computer's account at each Hub, for runs' capabilities.
     pub(crate) facts: Mutex<HashMap<config::Origin, crate::access::Facts>>,
@@ -683,6 +683,7 @@ impl Machines {
             lists.spawn(async move { me.list_hub(&origin).await });
         }
         lists.join_all().await;
+        self.hubs.learn().await;
         self.calcifer.machine_changed();
     }
 
