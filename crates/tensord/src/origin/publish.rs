@@ -4,8 +4,8 @@
 //! is finalized. The Hub's finalization job is the commit's only authority, so the call follows it
 //! to its end. A checkpoint the repository already holds converges with no transfer.
 //!
-//! U11: the Hub's finalize must decode the v2 manifest and header (JSON) to check this closure;
-//! today it walks a v1 checkpoint with `tfs`. The calls and their shapes stay as they are.
+//! U11: the Hub's finalize decodes the manifest and header itself to check this closure, with
+//! no `tfs`. The calls and their shapes stay as they are.
 //!
 //! The caller may stop it until it finalizes: PUTs in flight end within a tick and nothing is
 //! finalized. The Hub keeps every object it verified, so asking again resumes from there.

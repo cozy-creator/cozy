@@ -117,7 +117,7 @@ fn machine(home: &Home, name: &str) -> common::tensord::Tensord {
     common::tensord::added(home, name)
 }
 
-/// Every object `manifest` reaches in the store at `root` (TensorFS v2: manifest, files, header,
+/// Every object `manifest` reaches in the store at `root` (manifest, files, header,
 /// chunks), with its bytes.
 fn closure(root: &Path, manifest: &str) -> Vec<(String, Vec<u8>)> {
     let store = Store::open(root).unwrap();
@@ -130,7 +130,7 @@ fn closure(root: &Path, manifest: &str) -> Vec<(String, Vec<u8>)> {
     objects
 }
 
-/// TensorFS v2 end to end (xs-045 U9a): one machine imports a Hugging Face model into its store
+/// TensorFS end to end (xs-045 U9a): one machine imports a Hugging Face model into its store
 /// and puts it in the Hub's custody; a second, fresh machine pulls it by its digest under the
 /// run's capability, and the library's Tensorhub origin pulls it into a third store with the
 /// owner's bearer token (and is refused without one). Every store holds the same objects, byte
@@ -138,9 +138,9 @@ fn closure(root: &Path, manifest: &str) -> Vec<(String, Vec<u8>)> {
 #[test]
 fn a_model_uploaded_by_one_machine_is_pulled_bit_identical_by_another() {
     let Some(home) = Home::with_hub() else { return };
-    let account = home.sign_in("modelv2@cozy.test");
+    let account = home.sign_in("tfscycle@cozy.test");
     let first = machine(&home, "m1");
-    let model = format!("{account}/tiny-v2");
+    let model = format!("{account}/tiny-cycle");
     let run = completed(&home, &cozy(&home, None, &["--json", "model", "upload", TINY, &model, "--on", "m1"]));
     let made = &run["result"]["models"][0];
     assert_eq!(made["published"]["destination"], model.as_str(), "{run}");

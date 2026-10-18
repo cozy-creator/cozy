@@ -1,4 +1,4 @@
-//! The machine's downloader and the executor's fetch channel against a real static origin: a v2
+//! The machine's downloader and the executor's fetch channel against a real static origin: a
 //! store's own tree (`refs/`, `blobs/`) served by `python3 -m http.server`.
 use std::{
     collections::BTreeMap,

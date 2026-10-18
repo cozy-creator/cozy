@@ -4,7 +4,7 @@
 //! runs on the fetch runtime.
 //!
 //! U11 keeps the closure and presign wire as it is; it changes only what the Hub computes
-//! behind it (a v2 checkpoint's closure: manifest, files, the header's chunks).
+//! behind it (a checkpoint's closure: manifest, files, the header's chunks).
 use std::sync::Arc;
 
 use async_trait::async_trait;

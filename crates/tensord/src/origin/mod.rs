@@ -1,5 +1,5 @@
-//! Where the machine's checkpoints come from, and the one downloader that brings them (TensorFS
-//! v2's `Fetcher`, design §5): tiers local store → datacenter volume → origin, whole-object
+//! Where the machine's checkpoints come from, and the one downloader that brings them
+//! (TensorFS's `Fetcher`, design §5): tiers local store → datacenter volume → origin, whole-object
 //! GETs, every object verified as the store admits it. TensorD's threads are synchronous; each
 //! call here blocks on the fetch runtime and ends early when its [`Stop`] is cancelled.
 //!
