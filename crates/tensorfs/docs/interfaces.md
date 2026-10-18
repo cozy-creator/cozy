@@ -12,7 +12,7 @@ installation does not grant authority over a managed execution's store.
 |---|---|
 | TensorD | Makes model weights available; coordinates machine-wide memory policy, owns the managed Store, fills/retains shared CPU buffers and can retain exported GPU allocation handles through TensorFS |
 | Runtime | Constructs Python/PyTorch models; parses granted sources and performs executor-side GPU allocation, copies, mapping and unmapping through `tensorfs.varena` and device APIs within TensorD's grants |
-| Package code | `SourceCapability`, `OutputCapability`, `Derivation`, `DerivedTransaction` |
+| Package code | Runtime's TensorD channel clients (`cozy_runtime.tensord_channels`); TensorFS ships no package API |
 | Standalone library users | Explicit Store construction and normal coordinated reads/writes |
 | Tensorhub | CLI metadata operations over explicitly staged files and census directories |
 
@@ -39,7 +39,7 @@ require the existing `weights` grant, even when the installed library contains a
 Work without model or weights requirements remains usable without these offers.
 
 Weights are fetched only by the Store's `fetch::Fetcher`, in TensorD. Runtime directs it
-through the attempt's fetch channel (`tensorfs.fetch.Fetch`: `schedule`, `wait`, `present`),
+through the attempt's fetch channel (Runtime's `tensord_channels.Fetch`),
 scoped to the manifests the attempt selected; it never names a hub, credential or path.
 
 These are operation contracts, not whole-peer version checks. They do not require equal
@@ -60,48 +60,11 @@ Previously published reduced wheels remain immutable; consolidation applies to a
 release, with Runtime's grant boundary adopted first. Source changes and local wheel
 proofs do not imply release or installed/deployed adoption.
 
-## References, capabilities and receipts
+## The Python facade
 
-An `ObjectRef` is the existing `{sha256, length}` dictionary. A `derived.Source` names an
-exact content manifest; neither grants access by itself. A live `SourceCapability` binds
-that content to the owner's inspection and bounded-read operations. It provides actual
-tensor metadata, canonical configs and part bytes, and may use an owner channel.
-Granted sealed buffers can instead be consumed locally by the weight plane. Neither
-mechanism opens an arbitrary store path when access is missing.
-
-An `OutputCapability` opens one declared output. The executor receives a
-`DerivedTransaction`, not a root path or an unrestricted native Store writer. TensorD
-retains transaction authority and checks the attempt behind that channel.
-
-`tensorfs.records` supplies typed dictionary projections of native outputs:
-
-- `ObjectRef`: bare hexadecimal SHA-256 and length.
-- `PartReceipt`: bytes written/deduplicated, whole-part digest and object references.
-- `CheckpointReceipt`: resumable plan/head identity, head length, index and byte count.
-- `DerivedReceipt`: transaction and declaration identity, source facts, header, manifest,
-  added objects and inheritance observations.
-
-The four types are also exported from `tensorfs.derived`, so package authors can annotate
-their existing scoped interface. `DerivedSource` and `InheritObservation` name nested
-records in `tensorfs.records`. A checkpoint's existing nullable prefixed
-`head` field stays unchanged; this typing change introduces no new document format.
-Native Store writers and scoped channels return the same ordinary dictionaries. Rust
-continues to validate and canonicalize them. Python annotations neither revalidate
-native documents nor discard harmless extra fields from a newer producer.
-
-## Transaction lifetime
-
-| Operation | Meaning |
-|---|---|
-| `close()` or context exit | Disconnect this handle; no implicit commit, abandonment or retention release |
-| `checkpoint()` | Record resumable progress in the existing transaction |
-| `fence()` | End the current writer attempt according to native fencing rules |
-| `commit()` | Finalize the artifact and return native facts; another local call returns the held receipt |
-| Owner retry/resume | Bind a new writer attempt to the same transaction |
-| Owner abandonment | Explicitly abandon the transaction through the owner's existing operation |
-
-A receipt is not a grant or an independent retention claim. The owner validates retained
-custody before giving a replay receipt to another attempt. Socket loss is not cancellation.
+`tensorfs` exports cozytensors/2's `Store`, `Writer`, `Checkpoint` (`Checkpoint.parse` reads a
+granted header), `Manifest` and the typed errors, plus `tensorfs.varena`. A managed executor
+never opens the Store: TensorD serves its sources and outputs over channels Runtime speaks.
 
 ## Store ownership
 
@@ -128,44 +91,6 @@ object-storage operations, database coordination and actual cloud deletion.
 Keep each operation's format/result compatibility independent of deployment identity.
 Administrative commands that do mutate a local Store still obey its ownership and
 collector rules; metadata planning on a separate census is not such a mutation.
-
-## Typed consumer contracts
-
-[Tracker #340](https://github.com/cozy-creator/tracker/issues/340) completes the native
-Python input/result descriptions in `tensorfs.records`. These are ordinary dictionary
-projections and named aliases of existing tuple inputs; parameter lists, on-disk
-formats, canonical bytes and Python runtime representations are unchanged.
-
-| Consumer operations | Input/result records | Native producer |
-|---|---|---|
-| Content admission, walking, checkout | `PutResult`, `WalkObject`, `CheckoutResult`, `TreeRoot` | `store.rs`, `project.rs`, `checkpoint.rs`, `source_artifact.rs` |
-| Verified acquisition and reads | `ObjectKey`, `ReadItem` | `read.rs` |
-| Native derived inputs | `DeclarationSources`, `DeclarationTargets`, `DeclarationConfigs`, `DeclarationFiles`, `DerivationArguments` | `derived.rs`; native Python declaration parser |
-| Scoped inspection and writer recovery | `InspectedSource`, `SourceFacts`, `DerivedLookup`, `DispositionResult` | `derived.rs` |
-| Store maintenance | `GCResult` | `gc.rs` |
-| Document inspection | `Header`, `ManifestRow`, `FitResult` | `header.rs`, `manifest.rs`, `machine.rs` |
-
-Package authors keep using the typed `Derivation` inputs in `tensorfs.derived`.
-`native_arguments()` now describes the same native map/tuple shapes to the type checker.
-Direct Store callers may use the declaration records explicitly. The native parser still
-checks all cross-field, dtype, geometry and custody constraints; annotations do not replace it.
-`Reader` describes the existing bounded `.read(size)` source accepted by native writes.
-
-Trusted-owner `serve_derived` callbacks receive `CheckpointReceipt` and `DerivedReceipt`;
-`serve_derived_replay` also passes `DerivedReceipt`. A callback that consumes only some
-fields can accept `Mapping[str, object]`. Callers storing receipts without mutating them
-should use that mapping type rather than require a mutable `dict[str, Any]`.
-
-`ObjectKey` names the existing `(object_id, length)` tuple, while `ObjectRef` names the
-canonical `{sha256, length}` mapping. The aliases document existing native arguments;
-they are not additional storage objects or grants. `SourceInspection.from_native` takes
-the actual `InspectedSource` producer shape; callers should pass native inspection results
-directly.
-
-Rust consumers already use `ObjectRef`, `ReceiptFacts`, typed Store/read/derived methods
-and explicit ownership. This Python contract cleanup does not add parallel Rust wrappers.
-Open-ended encoding definitions and channel envelopes stay at their existing dynamic
-boundary; fixed native outputs no longer erase their contract into `Any`.
 
 ## Owner-assigned writer attempts
 

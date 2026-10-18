@@ -227,25 +227,6 @@ the collection performs, so the estimate and the act cannot drift.
 The native wheel is `cp312-abi3`, so CPython 3.12 is the floor and every later CPython loads
 the same wheel.
 
-`tensorfs.TensorRequirement(component, key, shape, logical_dtype=None)` describes one row of
-Runtime's request-time `factory(config)` census.
-
-## Fit
-
-`tensorfs.fit(requirements, header, *, custody, encoded_leaves, device=None,
-observations=None)` compares those in-memory rows with one `cozytensors/1` header. There is
-no CLI or document form.
-
-| code | rule |
-| --- | --- |
-| `ok` | routes counted: `verbatim` (plain), `decoded_float`, `encoded_gemm` |
-| `component_missing` | (1) every required component exists; extra components are ignored |
-| `tensor_missing`, `shape_mismatch` | (2) every constructed key exists at the same logical shape |
-| `dtype_mismatch` | (3) an optional logical dtype constraint disagrees |
-| `ok`, with `ignored` | (4) a stored key inside a constructed component absent from the requirements is skipped, never loaded, on every custody: `ignored` lists it, `ignored_bytes` sums what it stores, and `warning` is the one line to show (count, bytes, first keys). `extra_tensor` is no longer answered |
-| `encoding_unsupported` | (5) the package refuses encoded leaves |
-| `encoding_unqualified` | (6) with `--device`, every encoded leaf has a qualification record for that class (plain storage has nothing to qualify) |
-
 TensorFS has no compatibility grade or search plane.
 
 Each named construction config is one bounded RFC 8785 JSON-object byte string stored directly in

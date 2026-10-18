@@ -50,7 +50,7 @@ def spool():
 check('fresh_generation_hold',fresh_hold);check('inherited_generation_hold',inherited_hold)
 check('peer_spool_write',spool)
 check('private_journal_read',lambda:pathlib.Path(cfg['private']).read_bytes().decode())
-check('legacy_store_open',lambda:__import__('tensorfs').Store.open(cfg['legacy_store']).root)
+check('legacy_store_open',lambda:__import__('tensorfs').Store(cfg['legacy_store']).root)
 libc=ctypes.CDLL(None);death=ctypes.c_int();assert libc.prctl(2,ctypes.byref(death),0,0,0)==0
 status=pathlib.Path('/proc/self/status').read_text().splitlines()
 before=death.value
