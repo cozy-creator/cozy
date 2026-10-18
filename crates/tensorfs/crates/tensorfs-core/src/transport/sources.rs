@@ -10,7 +10,7 @@
 use super::download::{Batch, Download, PART_BYTES};
 use super::{CredentialProvider, Deadline, Ledger, PullCancellation, SourcePolicy, STREAMS};
 use crate::err::{refuse, Code, Refusal, Result};
-use crate::fetch::{DeliveryGrant, FetchPlan};
+use crate::fetch_v1::{DeliveryGrant, FetchPlan};
 use crate::ids::{prefixed, ObjectRef};
 use crate::sha256::{hex, Sha256};
 use crate::store::{Fault, Store};

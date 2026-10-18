@@ -15,7 +15,7 @@
 //! takes a short-lived scoped token through the same trait.
 
 use crate::err::{refuse, Code, Refusal, Result};
-use crate::fetch::{DeliveryGrant, FetchPlan};
+use crate::fetch_v1::{DeliveryGrant, FetchPlan};
 use crate::ids::ObjectRef;
 use crate::jcs::{self, Json};
 use crate::store::Store;

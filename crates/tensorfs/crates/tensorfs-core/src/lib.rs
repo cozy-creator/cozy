@@ -33,6 +33,8 @@ pub mod err;
 #[cfg(feature = "store")]
 pub mod fetch;
 #[cfg(feature = "store")]
+pub mod fetch_v1;
+#[cfg(feature = "store")]
 pub mod fill;
 pub mod fit;
 pub mod format;

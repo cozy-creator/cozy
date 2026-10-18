@@ -25,7 +25,7 @@
 //! rest, a 200 is the whole object. Where it redirects to is asked for the rest directly.
 //!
 //! Objects come from a [`Feed`]: a fixed [`Batch`] (a pull, a source download, one ranged
-//! fetch), or [`crate::fetch::Fetcher`]'s queue, which grows while the download runs. Each
+//! fetch), or [`crate::fetch_v1::Fetcher`]'s queue, which grows while the download runs. Each
 //! open object has a [`Cell`]: its urgency orders the queue, and a request for a lower class
 //! (Now, Next, Behind) gives way to waiting work of a higher one. A batch's refusal ends it;
 //! a lasting feed's refusal ends only its object.
@@ -43,7 +43,7 @@ use super::STREAMS;
 use super::http::Judge;
 use super::{CredentialProvider, SourcePolicy};
 use crate::err::{refuse, Code, Refusal, Result};
-use crate::fetch::{DeliveryGrant, Destination};
+use crate::fetch_v1::{DeliveryGrant, Destination};
 use crate::ids::ObjectRef;
 use crate::store::{Fault, Store, Verified, PUT_TEMP};
 use std::collections::{BTreeMap, HashMap, VecDeque};

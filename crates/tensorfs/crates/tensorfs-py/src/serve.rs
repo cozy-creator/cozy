@@ -25,7 +25,7 @@ pub fn serve_fetch(
     origins: Vec<Bound<'_, PyDict>>,
     run: u64,
 ) -> PyResult<()> {
-    use tensorfs_core::fetch::{self, Access, Origin, Plain};
+    use tensorfs_core::fetch_v1::{self as fetch, Access, Origin, Plain};
     let mut granted: Vec<(Origin, std::sync::Arc<dyn Access>)> = vec![];
     for row in origins {
         let text = |key: &str| -> PyResult<String> {

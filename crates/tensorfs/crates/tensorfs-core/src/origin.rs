@@ -1,6 +1,6 @@
 //! Origin custody: a checkpoint present here only in part, whose absent objects its hub
 //! holds. The fetcher attests a checkpoint once its structure is here
-//! ([`crate::fetch::Fetcher`]); a derivation that inherits absent objects attests its output
+//! ([`crate::fetch_v1::Fetcher`]); a derivation that inherits absent objects attests its output
 //! with its sources' origin. Nothing here reads an absent object: a reader fetches it through
 //! the fetcher, from the [`Origin`] its record names.
 //!
@@ -19,7 +19,7 @@ use std::time::SystemTime;
 
 use crate::canon::{Fields, Value};
 use crate::err::{refuse, Code, Refusal, Result};
-use crate::fetch::Origin;
+use crate::fetch_v1::Origin;
 use crate::ids::{ObjectRef, Plain};
 use crate::storage::{self, HeldKey};
 use crate::store::Store;

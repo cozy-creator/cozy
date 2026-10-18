@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use common::{components, hub, serve_all, temporary, Answer, Checkpoint, Hub, Rule};
 use rustix::process::{getrlimit, setrlimit, Resource, Rlimit};
-use tensorfs_core::fetch::{whole, Fetcher, Origin, Plain, Priority};
+use tensorfs_core::fetch_v1::{whole, Fetcher, Origin, Plain, Priority};
 use tensorfs_core::ids::ObjectRef;
 use tensorfs_core::store::Store;
 use tensorfs_core::transport::{Anonymous, PullCancellation, SourcePolicy, PULL_STREAMS};

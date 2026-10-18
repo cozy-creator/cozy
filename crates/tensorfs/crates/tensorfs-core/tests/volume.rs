@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use common::{components, hub, serve_all, store, temporary, Checkpoint, Hub};
-use tensorfs_core::fetch::{Access, Fetcher, Origin, Plain, Priority, Ticket, Volume};
+use tensorfs_core::fetch_v1::{Access, Fetcher, Origin, Plain, Priority, Ticket, Volume};
 use tensorfs_core::ids::ObjectRef;
 use tensorfs_core::store::Store;
 use tensorfs_core::transport::{Anonymous, PullCancellation, SourcePolicy};

@@ -39,7 +39,7 @@ mod http;
 mod hub;
 mod ledger;
 mod net;
-mod policy;
+pub(crate) use crate::fetch::policy;
 mod pull;
 mod push;
 pub(crate) mod sources;

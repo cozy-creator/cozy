@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """The two architecture fences boundaries.md actually mandates.
 
-1. forbidden dependencies — core is torch/CUDA/server-DB/hub-free. The ONE transport
-   (tfs-048/tfs-049) is the one exception: `rustls`/`webpki` serve `src/transport/` alone,
-   and every other HTTP/TLS stack stays denied everywhere so a second byte mover cannot
-   grow beside it.
+1. forbidden dependencies — core is torch/CUDA/server-DB/hub-free. The one HTTP client
+   (`src/fetch/net.rs`, xs-045) is the one exception, beside the v1 `src/transport/` until
+   TensorD leaves it: every other HTTP/TLS stack stays denied everywhere so a second byte
+   mover cannot grow beside it.
 2. no upward imports    — core < py; a crate may name only lower ranks
 
 Everything else that lived here was a word blacklist over source text: it could not tell
@@ -22,12 +22,10 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 DENY = ["torch", "cudarc", "cust", "tch", "reqwest", "hyper", "ureq", "curl", "openssl",
         "rustls", "native-tls", "webpki", "sqlx", "postgres", "tensorhub-v2",
         "cozy-creator-v2", "cozy-runtime-v2", "worker-protocol-v2"]
-#: The one transport's carve-out (tfs-049): these tokens are legal ONLY here.
-ALLOW = {
-    "rustls": ("crates/tensorfs-core/Cargo.toml", "crates/tensorfs-core/src/transport/"),
-    "webpki": ("crates/tensorfs-core/Cargo.toml", "crates/tensorfs-core/src/transport/"),
-    "hyper": ("crates/tensorfs-core/Cargo.toml", "crates/tensorfs-core/src/transport/"),
-}
+#: The one client's carve-out: these tokens are legal ONLY here.
+CLIENT = ("crates/tensorfs-core/Cargo.toml", "crates/tensorfs-core/src/fetch/net.rs",
+          "crates/tensorfs-core/src/transport/")
+ALLOW = {"rustls": CLIENT, "webpki": CLIENT, "hyper": CLIENT}
 SCAN = ["crates/*/Cargo.toml", "crates/*/src/**/*.rs"]
 RANK = {"tensorfs-core": 0, "tensorfs-plane": 1, "tensorfs-py": 2}
 

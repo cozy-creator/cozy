@@ -18,7 +18,7 @@ use crate::ids::ObjectRef;
 use crate::jcs::{self, Json};
 use crate::meta::{Hold, Meta};
 use crate::read::{self, ReadLease};
-use crate::fetch::{Access, Fetcher, Priority, Ticket};
+use crate::fetch_v1::{Access, Fetcher, Priority, Ticket};
 use crate::store::Store;
 use crate::transport::PullCancellation;
 use std::io::{self, Read, Write};
@@ -1027,7 +1027,7 @@ mod source_channel_tests {
             |_, _| None,
         );
         std::fs::remove_file(store.object_path(&absent.sha256)).unwrap();
-        let origin = crate::fetch::Origin {
+        let origin = crate::fetch_v1::Origin {
             hub: hub.base.clone(),
             refspec: "acme/model@r1".into(),
             lane: "public".into(),
@@ -1067,7 +1067,7 @@ mod source_channel_tests {
         // Reads fetch only what is absent, once: a writer's source reads, then a source channel's.
         let fetcher = Fetcher::new(&store, 8, std::time::Duration::from_millis(50)).unwrap();
         let stop = PullCancellation::default();
-        let access: Arc<dyn Access> = Arc::new(crate::fetch::Plain {
+        let access: Arc<dyn Access> = Arc::new(crate::fetch_v1::Plain {
             credential: crate::transport::Anonymous,
             policy: crate::transport::SourcePolicy::default(),
         });

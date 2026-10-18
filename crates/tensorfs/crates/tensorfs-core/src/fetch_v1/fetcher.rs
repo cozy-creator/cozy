@@ -30,8 +30,8 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, RwLock, Weak};
 use std::time::Duration;
 
 use crate::err::{refuse, Code, Refusal, Result};
-use crate::fetch::volume::{Op, Wrote};
-use crate::fetch::{DeliveryGrant, FetchPlan, Volume};
+use crate::fetch_v1::volume::{Op, Wrote};
+use crate::fetch_v1::{DeliveryGrant, FetchPlan, Volume};
 use crate::ids::{Doc, ObjectRef};
 use crate::meta::{Hold, Meta};
 use crate::store::Store;
