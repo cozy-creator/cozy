@@ -122,7 +122,7 @@ impl Store {
     }
 
     /// Removes pin `id` only while it still reads `last_use`: one used meanwhile stays.
-    pub(crate) fn unpin_unused(&self, id: &str, last_use: u64) -> Result<bool> {
+    pub fn unpin_unused(&self, id: &str, last_use: u64) -> Result<bool> {
         // `id` names a file `pins()` listed, so it needs no grammar check.
         let path = self.root.join("pins").join(format!("{id}.json"));
         let _lock = self.lock("pins")?;

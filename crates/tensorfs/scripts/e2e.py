@@ -162,7 +162,7 @@ def main() -> None:
     store.export(NAME, work / "origin2", safetensors=False, origin=True)
     with serve(work / "origin2") as url:
         second = tfs.Store(work / "d")
-        assert second.pull(url, NAME) == m
+        assert second.pull(NAME, origin=url) == m
         assert blobs(work / "d") == blobs(work / "c")
 
     w = store.writer(base=m)

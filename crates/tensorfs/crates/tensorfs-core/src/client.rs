@@ -1,5 +1,5 @@
 //! The v2 library's front door, shared by the `tfs` CLI and Python: references, import into a
-//! named ref, pull from a static origin, and plane regions.
+//! named ref, pull (from Tensorhub by default, or a static origin), and plane regions.
 //!
 //! A reference is `org/name[@release]` (with a lane, else the release's only one) or a
 //! manifest digest, `sha256:<hex>` or bare hex.
@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use crate::failure::{fail, Kind, Result};
 use crate::fetch::{self, policy, Client, Config, Fetcher, HttpOrigin, ObjectStore, Origin};
-use crate::fetch::{SourcePolicy, VolumeOrigin, Want};
+use crate::fetch::{SourcePolicy, TensorhubOrigin, VolumeOrigin, Want, TENSORHUB};
 use crate::format::{repo_key, Body, Header, ObjectRef, Release, Repo};
 use crate::import::{self, Access};
 use crate::store2::Store;
@@ -240,6 +240,7 @@ impl Store {
             access: &access,
             tmp: &self.root().join("tmp"),
             progress: opts.progress,
+            stop: None,
         };
         let key = format!("import.{}", name.replace('/', ".").to_ascii_lowercase());
         let manifest = self.import(&req, Some(&key))?;
@@ -271,9 +272,84 @@ impl Store {
         })
     }
 
-    /// Pulls `reference` (`org/name[@release]`) from `origin`, an http(s) URL of a static origin
-    /// or a directory in that layout, then refs it here as the origin does.
-    pub fn pull(&self, origin: &str, reference: &str, lane: Option<&str>) -> Result<Pulled> {
+    /// Pulls `reference` (`org/name[@release]`; from a Hub, `org/name@sha256:<hex>` names the
+    /// owner's checkpoint by hash) from `from`, then refs it here as the origin names it.
+    pub fn pull(&self, from: PullFrom<'_>, reference: &str, lane: Option<&str>) -> Result<Pulled> {
+        match from {
+            PullFrom::Origin(origin) => self.pull_static(origin, reference, lane),
+            PullFrom::Hub { base, token } => {
+                let base = base.unwrap_or(TENSORHUB);
+                let client = Client::new(SourcePolicy {
+                    any_host: true,
+                    allow_local: policy::is_loopback_origin(base),
+                    max_redirects: 5,
+                    ..SourcePolicy::default()
+                });
+                let mut hub = TensorhubOrigin::new(&client, base)?;
+                if let Some(token) = token {
+                    hub = hub.bearer(token);
+                }
+                self.pull_hub(client, hub, reference, lane)
+            }
+        }
+    }
+
+    /// [`Store::pull`] from the Tensorhub `hub`, read over `client`. A checkpoint asked by hash
+    /// is not a release: no ref names it here.
+    pub fn pull_hub(
+        &self,
+        client: Client,
+        hub: TensorhubOrigin,
+        reference: &str,
+        lane: Option<&str>,
+    ) -> Result<Pulled> {
+        let Reference::Name(name, release) = parse(reference) else {
+            return fail(
+                Kind::Invalid,
+                "a pull names org/name[@release], not a bare digest",
+            );
+        };
+        let store: Arc<dyn ObjectStore> = Arc::new(self.clone());
+        let hub = Arc::new(hub);
+        let (resolved, pulled) = fetch::runtime()?.block_on(async {
+            let resolved = hub.named(name, release, lane).await?;
+            let origin: Arc<dyn Origin> = hub.clone();
+            let fetcher = Fetcher::new(store, client, None, Config::default());
+            let pulled = fetcher
+                .pull_manifest(&origin, &resolved.manifest, &Want::default())
+                .await?;
+            fetcher.settled().await;
+            Ok::<_, crate::failure::Failure>((resolved, pulled))
+        })?;
+        let named = match resolved.release.is_empty() {
+            true => Named {
+                manifest: resolved.manifest,
+                name: None,
+                release: None,
+                lane: None,
+            },
+            false => {
+                let (model, release, lane) = (&resolved.model, &resolved.release, &resolved.lane);
+                let local = self.update_ref(model, |old| {
+                    Some(with_lane(old, model, release, lane, &resolved.manifest, &[]))
+                })?;
+                Named {
+                    manifest: resolved.manifest.clone(),
+                    name: local.map(|r| r.name),
+                    release: Some(resolved.release),
+                    lane: Some(resolved.lane),
+                }
+            }
+        };
+        Ok(Pulled {
+            named,
+            objects: pulled.objects,
+            fetched: pulled.landed.origin + pulled.landed.volume,
+            held: pulled.landed.local,
+        })
+    }
+
+    fn pull_static(&self, origin: &str, reference: &str, lane: Option<&str>) -> Result<Pulled> {
         let Reference::Name(name, release) = parse(reference) else {
             return fail(
                 Kind::Invalid,
@@ -313,6 +389,19 @@ impl Store {
             held: pulled.landed.local,
         })
     }
+}
+
+/// Where a pull reads.
+#[derive(Debug, Clone, Copy)]
+pub enum PullFrom<'a> {
+    /// A Tensorhub at `base` (by default [`TENSORHUB`]), anonymous for public release lanes; a
+    /// bearer `token` reads the private checkpoints it grants.
+    Hub {
+        base: Option<&'a str>,
+        token: Option<&'a str>,
+    },
+    /// A static origin: an http(s) URL or a directory in that layout.
+    Origin(&'a str),
 }
 
 /// What a pull named, and its objects: those fetched (bytes) and those already here.

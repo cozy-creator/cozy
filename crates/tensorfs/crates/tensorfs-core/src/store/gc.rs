@@ -73,7 +73,7 @@ impl Census {
 
 impl Store {
     /// `root`, and when it is a manifest, its files and its headers' chunks; each once.
-    pub(crate) fn closure(&self, root: &ObjectRef) -> Result<Vec<ObjectRef>> {
+    pub fn closure(&self, root: &ObjectRef) -> Result<Vec<ObjectRef>> {
         let mut reach = BTreeSet::from([root.clone()]);
         if let Some(manifest) = self.manifest(root)? {
             for (path, file) in manifest.files {

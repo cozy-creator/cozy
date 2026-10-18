@@ -22,7 +22,9 @@ use tensorfs_core::store2::Store;
 const USAGE: &str = "usage: tfs [--store <dir>] [--json] <verb> ...
   import <src>... [--name <org/name>] [--converter <table>] [--variant <variant>]
       src: a file, a directory, hf://<org>/<repo>[@<rev>][/<path>], civitai://<version>[/<file>], a URL
-  pull <origin> <org/name[@release]> [--lane <lane>]   origin: a static origin's URL or directory
+  pull [<origin>] <org/name[@release]> [--lane <lane>] [--hub <url>]
+      from Tensorhub (--hub, else https://tensorhub.com; $TENSORFS_HUB_TOKEN reads private
+      checkpoints), or from a static origin's URL or directory
   export <ref> <dir> --safetensors [--dequantize bf16|f16|f32]
   export <ref> <dir> --origin
   inspect <ref>
@@ -47,6 +49,7 @@ const SWITCHES: &[&str] = &[
 ];
 const VALUED: &[&str] = &[
     "store",
+    "hub",
     "name",
     "lane",
     "dequantize",
@@ -252,8 +255,16 @@ fn run(args: &Args) -> Done {
                 format!("imported {}", label(&n)),
             )))
         }
-        ["pull", origin, reference] => {
-            let p = store()?.pull(origin, reference, lane)?;
+        ["pull", .., reference] if pos.len() <= 3 => {
+            let token = std::env::var("TENSORFS_HUB_TOKEN").ok().filter(|t| !t.is_empty());
+            let from = match pos.as_slice() {
+                [_, origin, _] => client::PullFrom::Origin(origin),
+                _ => client::PullFrom::Hub {
+                    base: args.get("hub"),
+                    token: token.as_deref(),
+                },
+            };
+            let p = store()?.pull(from, reference, lane)?;
             let mut doc = named(&p.named);
             doc.extend([
                 ("objects".into(), p.objects.into()),

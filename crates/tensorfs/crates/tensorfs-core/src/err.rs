@@ -209,3 +209,32 @@ pub fn refuse<T>(code: Code, detail: impl Into<String>) -> Result<T> {
         detail: detail.into(),
     })
 }
+
+/// An I/O failure, classified: out of space and denied access need a change outside before a
+/// retry, so they are named apart from other failures (tfs-064).
+#[cfg(feature = "store")]
+pub(crate) fn classify_io(what: impl AsRef<str>, e: impl Into<std::io::Error>) -> Refusal {
+    let e = e.into();
+    // A full descriptor table is the process's shortage, not the Store's: every open in
+    // the Store says so the same way, and a transfer treats it as backpressure.
+    if crate::descriptors::exhausted(&e) {
+        return Refusal {
+            code: Code::FD_HEADROOM,
+            detail: format!("{}: no file descriptor ({e})", what.as_ref()),
+        };
+    }
+    if cozy_platform::durable::quota_or_space(&e) {
+        return Refusal {
+            code: Code::CAPACITY_EXHAUSTED,
+            detail: format!("{}: the filesystem is full ({e})", what.as_ref()),
+        };
+    }
+    Refusal {
+        code: if e.kind() == std::io::ErrorKind::PermissionDenied {
+            Code::PERMISSION_DENIED
+        } else {
+            Code::IO_FAILED
+        },
+        detail: format!("{}: {e}", what.as_ref()),
+    }
+}

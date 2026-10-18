@@ -11,9 +11,9 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Empty};
+use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
-use hyper::{Request, Response, Uri};
+use hyper::{HeaderMap, Request, Response, Uri};
 use hyper_util::client::legacy::connect::{Connected, Connection};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use rustls::pki_types::{CertificateDer, ServerName};
@@ -69,10 +69,17 @@ impl Answer {
     }
 }
 
+/// A POST's answer, read whole.
+pub(crate) struct Posted {
+    pub status: u16,
+    pub headers: HeaderMap,
+    pub body: Vec<u8>,
+}
+
 /// The client every fetch uses. Cheap to clone: clones share one connection pool.
 #[derive(Clone)]
 pub struct Client {
-    inner: hyper_util::client::legacy::Client<Connector, Empty<Bytes>>,
+    inner: hyper_util::client::legacy::Client<Connector, Full<Bytes>>,
     policy: SourcePolicy,
 }
 
@@ -139,7 +146,7 @@ impl Client {
             for (name, value) in &headers {
                 request = request.header(name.as_str(), value.as_str());
             }
-            let request = request.body(Empty::new()).map_err(|error| Refusal {
+            let request = request.body(Full::default()).map_err(|error| Refusal {
                 code: Code::SOURCE_NOT_ALLOWED,
                 detail: format!("{url}: {error}"),
             })?;
@@ -193,6 +200,56 @@ impl Client {
             }
             return Ok(Answer { url, response });
         }
+    }
+
+    /// POST `body` (JSON) to `url`, credentials in `headers`; redirects are not followed. The
+    /// answer is read whole, at most `cap` bytes.
+    pub(crate) async fn post(
+        &self,
+        url: &str,
+        headers: &[(String, String)],
+        body: Vec<u8>,
+        cap: u64,
+    ) -> Result<Posted> {
+        self.policy.admit(url)?;
+        let uri: Uri = url.parse().map_err(|_| Refusal {
+            code: Code::SOURCE_NOT_ALLOWED,
+            detail: format!("{url}: not a URL"),
+        })?;
+        let mut request = Request::post(uri)
+            .header("content-type", "application/json")
+            .header("accept-encoding", "identity");
+        for (name, value) in headers {
+            request = request.header(name.as_str(), value.as_str());
+        }
+        let request = request
+            .body(Full::new(Bytes::from(body)))
+            .map_err(|error| Refusal {
+                code: Code::SOURCE_NOT_ALLOWED,
+                detail: format!("{url}: {error}"),
+            })?;
+        let response = self
+            .inner
+            .request(request)
+            .await
+            .map_err(|error| refusal(url, &error))?;
+        let (status, headers) = (response.status().as_u16(), response.headers().clone());
+        let mut answer = Answer {
+            url: url.to_string(),
+            response,
+        };
+        let mut body = Vec::new();
+        while let Some(frame) = answer.frame().await? {
+            body.extend_from_slice(&frame);
+            if body.len() as u64 > cap {
+                return refuse(Code::SIZE_CAP, format!("{url}: over {cap} B"));
+            }
+        }
+        Ok(Posted {
+            status,
+            headers,
+            body,
+        })
     }
 
     /// A small document read whole: its bytes on a 2xx, `REF_NOT_FOUND` on 404/410.

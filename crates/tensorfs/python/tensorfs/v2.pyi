@@ -166,8 +166,16 @@ class Store:
         variant: str | None = None,
     ) -> Manifest:
         """A file, directory, `hf://`, `civitai://` or URL, refd as `name` (`local/<its name>`)."""
-    def pull(self, origin: str, ref: str, lane: str | None = None) -> Manifest:
-        """`org/name[@release]` from a static origin's URL or directory."""
+    def pull(
+        self,
+        ref: str,
+        lane: str | None = None,
+        origin: str | None = None,
+        hub: str | None = None,
+        token: str | None = None,
+    ) -> Manifest:
+        """`org/name[@release]` from Tensorhub (`hub`, else tensorhub.com; `token` reads private
+        checkpoints), or from a static `origin`'s URL or directory."""
     def checkpoint(self, ref: Ref, lane: str | None = None) -> Checkpoint: ...
     def writer(self, base: Ref | None = None, key: str | None = None) -> Writer: ...
     def export(

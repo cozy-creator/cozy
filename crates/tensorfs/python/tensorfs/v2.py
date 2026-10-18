@@ -2,7 +2,7 @@
 
     store = tensorfs.v2.Store("~/.tensorfs")             # created when absent
     m = store.import_("hf://hf-internal-testing/tiny-sdxl-pipe")
-    m = store.pull("https://models.example.com", "acme/sdxl@1.0", lane="int8")
+    m = store.pull("acme/sdxl@1.0", lane="int8")  # from tensorhub.com
     ck = store.checkpoint(m)
     ck.tensors["unet"]["conv_in.weight"]                  # Info(dtype, shape, encoding, parts)
     torch.from_dlpack(ck.read("unet", "conv_in.weight"))  # encoded tensors decode

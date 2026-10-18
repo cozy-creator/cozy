@@ -226,6 +226,68 @@ impl Store {
         Ok(writer)
     }
 
+    /// Removes the directories of writers no process holds and nothing touched for `older_than`
+    /// (`tmp/writers/<key>`), and of imports as idle (`tmp/import/<id>`): the number removed.
+    pub fn sweep_writers(&self, older_than: std::time::Duration) -> Result<usize> {
+        let cutoff = std::time::SystemTime::now()
+            .checked_sub(older_than)
+            .unwrap_or(std::time::UNIX_EPOCH);
+        let mut removed = 0;
+        let tmp = self.root().join("tmp");
+        for (area, lock) in [("writers", None), ("import", Some(".lock"))] {
+            let dir = tmp.join(area);
+            let entries = match fs::read_dir(&dir) {
+                Ok(entries) => entries,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(fail("list", &dir)(e)),
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_dir() || newest(&path) >= cutoff {
+                    continue;
+                }
+                let fence = match lock {
+                    None => path.join(LOCK),
+                    Some(suffix) => dir.join(format!("{}{suffix}", entry.file_name().to_string_lossy())),
+                };
+                let held = match File::open(&fence) {
+                    Ok(file) => match file.try_lock() {
+                        Ok(()) => Some(file),
+                        Err(_) => continue,
+                    },
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+                    Err(_) => continue,
+                };
+                if fs::remove_dir_all(&path).is_ok() {
+                    removed += 1;
+                }
+                drop(held);
+            }
+        }
+        Ok(removed)
+    }
+
+    /// Drops what writer `key` journaled, unless a writer holds it: false while one does.
+    pub fn abandon_writer(&self, key: &str) -> Result<bool> {
+        if !is_name(key, 200) {
+            return Err(bad(format!("{key:?} is not a writer key")));
+        }
+        let dir = self.root().join("tmp").join("writers").join(key);
+        let _held = match File::open(dir.join(LOCK)) {
+            Ok(file) => match file.try_lock() {
+                Ok(()) => file,
+                Err(_) => return Ok(false),
+            },
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(true),
+            Err(e) => return Err(fail("open", dir.join(LOCK))(e)),
+        };
+        match fs::remove_dir_all(&dir) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(true),
+            Err(e) => Err(fail("remove", &dir)(e)),
+        }
+    }
+
     /// Imports `req` into a committed, pinned checkpoint. With `key`, an interrupted import
     /// resumes: the tensors its journal holds are not converted again.
     pub fn import(&self, req: &import::Request, key: Option<&str>) -> err::Result<ObjectRef> {
@@ -322,8 +384,21 @@ impl Writer {
 
     /// Takes `component/key` from `from`, a checkpoint of this store.
     pub fn copy(&mut self, component: &str, key: &str, from: &Checkpoint) -> Result<()> {
+        self.copy_as(component, key, from, component, key)
+    }
+
+    /// Takes `from_component/from_key` from `from` as `component/key`.
+    pub fn copy_as(
+        &mut self,
+        component: &str,
+        key: &str,
+        from: &Checkpoint,
+        from_component: &str,
+        from_key: &str,
+    ) -> Result<()> {
         self.ready(component, key)?;
-        let entry = self.adopt(component, key, from)?;
+        let mut entry = self.adopt(from_component, from_key, from)?;
+        (entry.component, entry.key) = (component.to_owned(), key.to_owned());
         let length = entry.stored().map(|p| p.length).sum();
         self.record(Line::Tensor(entry), length)
     }
@@ -1093,6 +1168,20 @@ fn fence(dir: &Path) -> Result<File> {
 }
 
 /// Removes keyless writers' directories whose writer is gone (its fence is free).
+/// The newest modification under `path`: when a writer last wrote there.
+fn newest(path: &Path) -> std::time::SystemTime {
+    let own = fs::metadata(path)
+        .and_then(|m| m.modified())
+        .unwrap_or(std::time::UNIX_EPOCH);
+    match fs::read_dir(path) {
+        Ok(entries) => entries
+            .flatten()
+            .map(|entry| newest(&entry.path()))
+            .fold(own, std::cmp::max),
+        Err(_) => own,
+    }
+}
+
 fn sweep_anonymous(writers: &Path) -> Result<()> {
     let entries = match fs::read_dir(writers) {
         Ok(entries) => entries,

@@ -1,5 +1,6 @@
 //! Fetching checkpoints into a store (design §5). An [`Origin`] names a model's manifest and
-//! locates objects; the [`Fetcher`] walks the closure (manifest → header → the selected
+//! locates objects ([`TensorhubOrigin`] by default, [`HttpOrigin`] and [`VolumeOrigin`] for a
+//! static layout); the [`Fetcher`] walks the closure (manifest → header → the selected
 //! components' chunks), reads each object through the tiers local store → volume → origin,
 //! and admits it through the store, which verifies it. One HTTP client ([`Client`]) and one
 //! downloader serve every origin.
@@ -8,6 +9,7 @@ mod download;
 mod net;
 mod origin;
 pub mod policy;
+mod tensorhub;
 mod volume;
 
 use std::collections::BTreeSet;
@@ -20,6 +22,7 @@ use std::time::Duration;
 pub use net::Client;
 pub use origin::{choose, HttpOrigin, Location, Origin};
 pub use policy::SourcePolicy;
+pub use tensorhub::{Credential, Resolved, TensorhubOrigin, TENSORHUB};
 pub use volume::VolumeOrigin;
 
 use crate::err::{refuse, Code, Refusal, Result};
@@ -296,8 +299,8 @@ fn invalid(object: &ObjectRef, error: format::Error) -> Refusal {
     }
 }
 
-/// The chunks the tensors of `components` (every component when `None`) live in.
-fn chunks(header: &Header, components: Option<&[String]>) -> Result<Vec<ObjectRef>> {
+/// The chunks the tensors of `components` (every component when `None`) live in, each once.
+pub fn chunks(header: &Header, components: Option<&[String]>) -> Result<Vec<ObjectRef>> {
     let names: Vec<&str> = match components {
         Some(names) => names.iter().map(String::as_str).collect(),
         None => header

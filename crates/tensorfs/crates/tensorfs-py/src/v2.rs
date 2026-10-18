@@ -12,7 +12,7 @@ use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyDict, PyList, PyString, PyTuple};
 use pyo3::{create_exception, ffi};
-use tensorfs_core::client::{self, ImportOptions, Named};
+use tensorfs_core::client::{self, ImportOptions, Named, PullFrom};
 use tensorfs_core::export;
 use tensorfs_core::failure::{Failure, Kind};
 use tensorfs_core::format::{Body, Dtype, Encoding, Metadata, Value};
@@ -285,17 +285,28 @@ impl PyStore {
         Ok(PyManifest { named })
     }
 
-    /// Pulls `ref` (`org/name[@release]`) from a static origin's URL or directory.
-    #[pyo3(signature = (origin, r#ref, lane = None))]
+    /// Pulls `ref` (`org/name[@release]`) from Tensorhub (`hub`, else tensorhub.com; `token`
+    /// reads private checkpoints), or from a static `origin`'s URL or directory.
+    #[pyo3(signature = (r#ref, lane = None, origin = None, hub = None, token = None))]
     fn pull(
         &self,
         py: Python<'_>,
-        origin: String,
         r#ref: String,
         lane: Option<String>,
+        origin: Option<String>,
+        hub: Option<String>,
+        token: Option<String>,
     ) -> PyResult<PyManifest> {
+        let from = match (&origin, &hub, &token) {
+            (Some(origin), None, None) => PullFrom::Origin(origin),
+            (None, hub, token) => PullFrom::Hub {
+                base: hub.as_deref(),
+                token: token.as_deref(),
+            },
+            _ => return Err(invalid(py, "a static origin takes no hub or token")),
+        };
         let pulled = py
-            .detach(|| self.store.pull(&origin, &r#ref, lane.as_deref()))
+            .detach(|| self.store.pull(from, &r#ref, lane.as_deref()))
             .or_raise(py)?;
         Ok(PyManifest {
             named: pulled.named,

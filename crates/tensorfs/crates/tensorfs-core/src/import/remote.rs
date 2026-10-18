@@ -6,12 +6,17 @@
 
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
 use crate::err::{refuse, Code, Refusal, Result};
-use crate::transport::{self, Deadline, Ledger, SourcePolicy};
+use crate::fetch::policy::{base_host, SourcePolicy};
+use crate::fetch::Client;
+
+/// The most bytes of one listing or document read whole.
+const DOCUMENT_BYTES: usize = 32 << 20;
 
 /// Provider origins and credentials (`bearer <token>` or empty), each presented only to
 /// its own host. Tests point the origins at a loopback server and set `allow_local`.
@@ -168,7 +173,7 @@ impl Access {
             ],
             Provider::Web => vec![],
         };
-        if let Ok(host) = transport::base_host(self.base(p)) {
+        if let Ok(host) = base_host(self.base(p)) {
             hosts.push(host);
         }
         SourcePolicy {
@@ -180,40 +185,77 @@ impl Access {
         }
     }
 
-    fn credential(&self, p: Provider) -> Result<transport::ScopedHeaders> {
-        let (token, hosts) = match p {
-            Provider::Hf => (
-                &self.huggingface_token,
-                vec![transport::base_host(self.base(p))?],
-            ),
-            Provider::Civitai => (
-                &self.civitai_token,
-                vec![transport::base_host(self.base(p))?],
-            ),
-            Provider::Web => return transport::credential_from_spec("", vec![]),
+    /// The provider's credential, presented only to its own host (a redirect elsewhere drops it).
+    fn headers(&self, p: Provider, url: &str) -> Vec<(String, String)> {
+        let token = match p {
+            Provider::Hf => &self.huggingface_token,
+            Provider::Civitai => &self.civitai_token,
+            Provider::Web => return vec![],
         };
-        transport::credential_from_spec(token, hosts)
+        let token = token.strip_prefix("bearer ").unwrap_or(token).trim();
+        let ours = base_host(self.base(p)).is_ok_and(|host| base_host(url).is_ok_and(|at| at == host));
+        match token.is_empty() || !ours {
+            true => vec![],
+            false => vec![("authorization".into(), format!("Bearer {token}"))],
+        }
     }
 
-    fn get_json<T: for<'d> Deserialize<'d>>(
-        &self,
-        p: Provider,
-        url: &str,
-    ) -> Result<(T, Option<String>)> {
-        let (body, next) = transport::api_get(
-            url,
-            &self.policy(p),
-            &self.credential(p)?,
-            32 << 20,
-            Deadline::none(),
-            &Ledger::new(),
-        )?;
-        let doc = serde_json::from_slice(&body).map_err(|e| Refusal {
+    /// GET `url` from `p` (bytes `range` when given: from, and through), handing each body
+    /// frame to `sink`; the `Link: rel="next"` page when the answer names one.
+    fn get(&self, p: Provider, url: &str, range: Option<(u64, Option<u64>)>, sink: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<Option<String>> {
+        let mut headers = self.headers(p, url);
+        if let Some((from, through)) = range {
+            let through = through.map_or(String::new(), |t| t.to_string());
+            headers.push(("range".into(), format!("bytes={from}-{through}")));
+        }
+        let client = Client::new(self.policy(p));
+        crate::fetch::runtime()?.block_on(async {
+            let mut answer = client.get(url, &headers).await?;
+            let status = answer.status();
+            let ranged = range.is_some_and(|(from, _)| from > 0) || range.is_some_and(|(_, t)| t.is_some());
+            match status {
+                200 if !ranged => {}
+                206 if range.is_some() => {}
+                404 | 410 => return refuse(Code::REF_NOT_FOUND, format!("{url}: HTTP {status}")),
+                401 | 403 => return refuse(Code::PERMISSION_DENIED, format!("{url}: HTTP {status}")),
+                _ => return refuse(Code::TRANSFER_FAILED, format!("{url}: HTTP {status}")),
+            }
+            let next = answer.header("link").and_then(next_link);
+            while let Some(frame) = answer.frame().await? {
+                sink(&frame)?;
+            }
+            Ok(next)
+        })
+    }
+
+    fn get_json<T: for<'d> Deserialize<'d>>(&self, p: Provider, url: &str) -> Result<(T, Option<String>)> {
+        let body = self.document(p, url)?;
+        let doc = serde_json::from_slice(&body.0).map_err(|e| Refusal {
             code: Code::MALFORMED_JSON,
             detail: format!("{url}: {e}"),
         })?;
-        Ok((doc, next))
+        Ok((doc, body.1))
     }
+
+    /// A small document read whole, and the next page it names.
+    fn document(&self, p: Provider, url: &str) -> Result<(Vec<u8>, Option<String>)> {
+        let mut body = Vec::new();
+        let next = self.get(p, url, None, &mut |frame| {
+            if body.len() + frame.len() > DOCUMENT_BYTES {
+                return refuse(Code::SIZE_CAP, format!("{url}: more than {DOCUMENT_BYTES} bytes"));
+            }
+            body.extend_from_slice(frame);
+            Ok(())
+        })?;
+        Ok((body, next))
+    }
+}
+
+fn next_link(header: &str) -> Option<String> {
+    header.split(',').find_map(|part| {
+        let (target, params) = part.trim().split_once('>')?;
+        (params.contains("rel=\"next\"") || params.contains("rel=next")).then(|| target.trim_start_matches('<').to_string())
+    })
 }
 
 #[derive(Deserialize)]
@@ -415,7 +457,7 @@ pub fn list(spec: &Spec, access: &Access) -> Result<Listing> {
         Spec::Local(path) => {
             let path = path
                 .canonicalize()
-                .map_err(|e| crate::store::classify_io(format!("open {}", path.display()), e))?;
+                .map_err(|e| crate::err::classify_io(format!("open {}", path.display()), e))?;
             let mut members = Vec::new();
             let exact = path.is_file();
             if exact {
@@ -444,7 +486,7 @@ pub fn list(spec: &Spec, access: &Access) -> Result<Listing> {
 }
 
 fn walk(root: &Path, dir: &Path, out: &mut Vec<Member>) -> Result<()> {
-    let io = |e| crate::store::classify_io(format!("list {}", dir.display()), e);
+    let io = |e| crate::err::classify_io(format!("list {}", dir.display()), e);
     let mut entries: Vec<_> = std::fs::read_dir(dir)
         .map_err(io)?
         .collect::<std::io::Result<_>>()
@@ -646,7 +688,7 @@ pub fn land(m: &Member, dest: &Path, access: &Access) -> Result<PathBuf> {
         At::Local(path) => return Ok(path.clone()),
         At::Remote { url, provider } => (url, *provider),
     };
-    let io = |e| crate::store::classify_io(format!("write {}", dest.display()), e);
+    let io = |e| crate::err::classify_io(format!("write {}", dest.display()), e);
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(io)?;
     }
@@ -664,16 +706,8 @@ pub fn land(m: &Member, dest: &Path, access: &Access) -> Result<PathBuf> {
             .truncate(from == 0)
             .open(dest)
             .map_err(io)?;
-        transport::get_into(
-            url,
-            &access.policy(provider),
-            &access.credential(provider)?,
-            from,
-            None,
-            &mut out,
-            Deadline::none(),
-            &Ledger::new(),
-        )?;
+        let range = (from > 0).then_some((from, None));
+        access.get(provider, url, range, &mut |frame| out.write_all(frame).map_err(io))?;
         out.sync_all().map_err(io)?;
     }
     let len = std::fs::metadata(dest).map_err(io)?.len();
@@ -708,16 +742,10 @@ pub fn read_range(m: &Member, from: u64, to: u64, access: &Access) -> Result<Vec
         );
     };
     let mut out = Vec::new();
-    transport::get_into(
-        url,
-        &access.policy(*provider),
-        &access.credential(*provider)?,
-        from,
-        Some(to),
-        &mut out,
-        Deadline::none(),
-        &Ledger::new(),
-    )?;
+    access.get(*provider, url, Some((from, Some(to.saturating_sub(1)))), &mut |frame| {
+        out.extend_from_slice(frame);
+        Ok(())
+    })?;
     Ok(out)
 }
 
@@ -725,15 +753,7 @@ pub fn read_range(m: &Member, from: u64, to: u64, access: &Access) -> Result<Vec
 pub fn read_small(m: &Member, access: &Access) -> Result<Vec<u8>> {
     match &m.at {
         At::Local(path) => std::fs::read(path)
-            .map_err(|e| crate::store::classify_io(format!("read {}", path.display()), e)),
-        At::Remote { url, provider } => Ok(transport::api_get(
-            url,
-            &access.policy(*provider),
-            &access.credential(*provider)?,
-            32 << 20,
-            Deadline::none(),
-            &Ledger::new(),
-        )?
-        .0),
+            .map_err(|e| crate::err::classify_io(format!("read {}", path.display()), e)),
+        At::Remote { url, provider } => Ok(access.document(*provider, url)?.0),
     }
 }

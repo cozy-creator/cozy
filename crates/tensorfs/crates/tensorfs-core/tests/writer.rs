@@ -129,6 +129,7 @@ fn a_tiny_hf_sdxl_imports_and_reads_back_bit_identical() {
         access: &access,
         tmp: &store.root().join("tmp"),
         progress: &|_, _, _| {},
+        stop: None,
     };
     let id = store.import(&request, Some("import-tiny-sdxl")).unwrap();
     assert_eq!(

@@ -57,6 +57,11 @@ impl ObjectRef {
         }
     }
 
+    /// `sha256:<hex>`, the object's name where a digest is named alone.
+    pub fn id(&self) -> String {
+        format!("sha256:{}", self.sha256)
+    }
+
     /// The object's key in a store or static origin.
     pub fn key(&self) -> String {
         let h = &self.sha256;

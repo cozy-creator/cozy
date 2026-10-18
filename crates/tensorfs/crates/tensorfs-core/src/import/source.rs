@@ -57,7 +57,7 @@ pub struct SourceSet {
 }
 
 fn io(what: &Path, e: std::io::Error) -> Refusal {
-    crate::store::classify_io(format!("read {}", what.display()), e)
+    crate::err::classify_io(format!("read {}", what.display()), e)
 }
 
 #[derive(Deserialize)]

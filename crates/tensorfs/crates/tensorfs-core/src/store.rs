@@ -137,38 +137,7 @@ fn merge_cached_repository(
 
 pub(crate) const BUF: usize = 1 << 20;
 
-/// An I/O failure, classified.
-///
-/// Out of space and denied access need an external change before retrying. The difference is the
-/// whole of tfs-064. Before it, a full container disk raised `IO_FAILED` — the same code as
-/// a bad sector or a revoked permission — so `pod-supervisor` classified it `Resumable` and
-/// the owner re-issued the fetch, which re-planned, re-asked, and failed at the same byte.
-/// On rented hardware, forever. Naming the condition is what lets a caller stop.
-pub(crate) fn classify_io(what: impl AsRef<str>, e: impl Into<std::io::Error>) -> Refusal {
-    let e = e.into();
-    // A full descriptor table is the process's shortage, not the Store's: every open in
-    // the Store says so the same way, and a transfer treats it as backpressure.
-    if crate::descriptors::exhausted(&e) {
-        return Refusal {
-            code: Code::FD_HEADROOM,
-            detail: format!("{}: no file descriptor ({e})", what.as_ref()),
-        };
-    }
-    if durable::quota_or_space(&e) {
-        return Refusal {
-            code: Code::CAPACITY_EXHAUSTED,
-            detail: format!("{}: the filesystem is full ({e})", what.as_ref()),
-        };
-    }
-    Refusal {
-        code: if e.kind() == std::io::ErrorKind::PermissionDenied {
-            Code::PERMISSION_DENIED
-        } else {
-            Code::IO_FAILED
-        },
-        detail: format!("{}: {e}", what.as_ref()),
-    }
-}
+pub(crate) use crate::err::classify_io;
 
 /// SQLite's "database or disk is full" is the disk's verdict, exactly as ENOSPC is. As
 /// IO_FAILED it read as a transient catalog fault and bought the object three more times.

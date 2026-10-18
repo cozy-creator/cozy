@@ -62,6 +62,15 @@ pub struct Request<'a> {
     /// The store's tmp directory.
     pub tmp: &'a Path,
     pub progress: &'a (dyn Fn(&str, u64, u64) + Sync),
+    /// Asked between members and tensors: true ends the import (it resumes from there).
+    pub stop: Option<&'a (dyn Fn() -> bool + Sync)>,
+}
+
+fn stopped(req: &Request) -> Result<()> {
+    match req.stop.is_some_and(|stop| stop()) {
+        true => refuse(Code::TRANSFER_FAILED, "the import was stopped"),
+        false => Ok(()),
+    }
 }
 
 fn digest(parts: &[&str]) -> String {
@@ -151,7 +160,7 @@ fn documents(
                 .collect();
             for (path, local) in land(&docs, &area.join("reference"), req.access, req.progress)? {
                 let bytes = std::fs::read(&local)
-                    .map_err(|e| crate::store::classify_io(format!("read {path}"), e))?;
+                    .map_err(|e| crate::err::classify_io(format!("read {path}"), e))?;
                 files.entry(path).or_insert(bytes);
             }
         }
@@ -187,14 +196,16 @@ pub fn import(req: &Request, sink: &mut dyn Sink) -> Result<Imported> {
     ]);
     let area = req.tmp.join("import").join(&id[..32]);
     std::fs::create_dir_all(req.tmp.join("import"))
-        .map_err(|e| crate::store::classify_io("create the import area", e))?;
+        .map_err(|e| crate::err::classify_io("create the import area", e))?;
     // One import of a selection at a time: the kernel's lock, released when this ends.
     let _area = cozy_platform::lock::LockFile::new(area.with_extension("lock"))
         .lock(cozy_platform::lock::Kind::Exclusive)
         .map_err(|e| {
-            crate::store::classify_io("lock the import area", std::io::Error::other(e.to_string()))
+            crate::err::classify_io("lock the import area", std::io::Error::other(e.to_string()))
         })?;
+    stopped(req)?;
     let landed = land(&members, &area.join("source"), req.access, progress)?;
+    stopped(req)?;
     let set = source::SourceSet::scan(&landed)?;
 
     let tables = tables();
@@ -227,11 +238,12 @@ pub fn import(req: &Request, sink: &mut dyn Sink) -> Result<Imported> {
         .files
         .iter()
         .map(|f| {
-            File::open(f).map_err(|e| crate::store::classify_io(format!("open {}", f.display()), e))
+            File::open(f).map_err(|e| crate::err::classify_io(format!("open {}", f.display()), e))
         })
         .collect::<Result<_>>()?;
     let total = planned.len() as u64;
     for (n, p) in planned.iter().enumerate() {
+        stopped(req)?;
         progress("converting", n as u64, total);
         let mut reader = engine::TensorReader::new(&opened[p.read.file], p)?;
         sink.put(&p.component, &p.key, &p.dtype, &p.shape, &mut reader)?;
@@ -248,7 +260,7 @@ pub fn import(req: &Request, sink: &mut dyn Sink) -> Result<Imported> {
     drop(opened);
     match std::fs::remove_dir_all(&area) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-            return Err(crate::store::classify_io(
+            return Err(crate::err::classify_io(
                 format!("remove {}", area.display()),
                 e,
             ));

@@ -118,6 +118,7 @@ fn run(tmp: &Path, sources: &[String], converter: Option<&str>) -> Result<Collec
             access: &access,
             tmp,
             progress: &|_, _, _| {},
+            stop: None,
         },
         &mut sink,
     )?;
@@ -1262,6 +1263,7 @@ fn a_single_file_sdxl_becomes_the_upstream_layout() {
             access: &access,
             tmp: &tmp,
             progress: &|_, _, _| {},
+            stop: None,
         },
         &mut sink,
     )
