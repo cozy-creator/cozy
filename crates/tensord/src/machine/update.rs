@@ -915,14 +915,16 @@ impl Updates {
     }
 }
 
-/// Copies a verified `distribution` wheel into `candidate`, durably: where it is now.
+/// Copies a verified `distribution` wheel into `candidate`, durably: where it is now. The copy is
+/// written and flushed through its own handle, since a wheel from the store is read-only (a copy
+/// keeps that) and Windows flushes only through a writable handle.
 fn stage(candidate: &Path, wheel: &Path, distribution: &str) -> io::Result<PathBuf> {
     let name = wheel.file_name().ok_or_else(|| invalid("wheel name"))?;
     verify_wheel(wheel, distribution)?;
     let prepared = candidate.join(name);
-    fs::copy(wheel, &prepared)?;
-    // Windows flushes only through a writable handle.
-    fs::OpenOptions::new().write(true).open(&prepared)?.sync_all()?;
+    let mut staged = fs::File::create(&prepared)?;
+    io::copy(&mut fs::File::open(wheel)?, &mut staged)?;
+    staged.sync_all()?;
     Ok(prepared)
 }
 
@@ -1156,6 +1158,26 @@ mod tests {
         zip.write_all(b"COMMIT = \"e9baf7a4fe4b855009b2eb288c6dda336c1fe2f0\"\n").unwrap();
         zip.finish().unwrap();
         assert_eq!(build(&built, &"0".repeat(64)).unwrap(), "0.18.104+e9baf7a4", "a build names its commit");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A wheel fetched from PyPI is the store's read-only blob; staging copies it all the same.
+    #[test]
+    fn a_read_only_wheel_stages() {
+        let dir = std::env::temp_dir().join(format!("cozy-stage-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let candidate = dir.join("candidate");
+        fs::create_dir_all(&candidate).unwrap();
+        let fetched = wheel(&dir, "tensorfs", "0.11.0", None);
+        let mut permissions = fs::metadata(&fetched).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&fetched, permissions).unwrap();
+        let staged = stage(&candidate, &fetched, "tensorfs").unwrap();
+        assert_eq!(fs::read(&staged).unwrap(), fs::read(&fetched).unwrap());
+        let mut permissions = fs::metadata(&fetched).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        fs::set_permissions(&fetched, permissions).unwrap();
         fs::remove_dir_all(dir).unwrap();
     }
 
