@@ -189,7 +189,7 @@ def test_a_wheel_tagged_for_another_platform_stands_and_a_missed_requirement_ref
 
 def pypi_pair(directory: Path) -> list[Path]:
     """PyPI's newest Runtime and the TensorFS it accepts, wheels for this platform: a machine's pair."""
-    download = ["python3", "-m", "pip", "download", "-q", "--no-deps", "--only-binary=:all:", "--python-version", "3.12",
+    download = ["uvx", "--from", "pip", "pip", "download", "-q", "--no-deps", "--only-binary=:all:", "--python-version", "3.12",
                 "--platform", "manylinux_2_28_x86_64", "--platform", "manylinux_2_17_x86_64", "-d", str(directory)]
     subprocess.run([*download, "cozy-runtime"], check=True)
     runtime = next(directory.glob("cozy_runtime-*.whl"))
