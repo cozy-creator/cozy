@@ -1,478 +1,480 @@
-//! tfs: the Hub's TensorFS verifier, fixture writer and maintainer tool. `USAGE` lists the
-//! verbs; the library is the product path (TensorD links it).
+//! tfs: TensorFS v2 on the command line. With `--json` every command prints one JSON document,
+//! a failure as `{"error": {"code", "detail"}}`. The v1 verbs Tensorhub still execs live in
+//! `v1/` until it moves to v2 (xs-045 U11).
+
+mod dev;
+mod v1;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Instant;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
-use tensorfs_core::canon;
-use tensorfs_core::err::Refusal;
-use tensorfs_core::header::Header;
-use tensorfs_core::ids::ObjectRef;
-use tensorfs_core::store::{Fault, Store, FAULT_STAGES};
+use serde_json::{json, Map, Value as Json};
+use tensorfs_core::client::{self, ImportOptions, Named};
+use tensorfs_core::export;
+use tensorfs_core::failure::{fail, Failure, Kind, Result};
+use tensorfs_core::format::{Body, Dtype, ObjectRef};
+use tensorfs_core::store2::Store;
 
-type TfsResult<T> = tensorfs_core::err::Result<T>;
+const USAGE: &str = "usage: tfs [--store <dir>] [--json] <verb> ...
+  import <src>... [--name <org/name>] [--converter <table>] [--variant <variant>]
+      src: a file, a directory, hf://<org>/<repo>[@<rev>][/<path>], civitai://<version>[/<file>], a URL
+  pull <origin> <org/name[@release]> [--lane <lane>]   origin: a static origin's URL or directory
+  export <ref> <dir> --safetensors [--dequantize bf16|f16|f32]
+  export <ref> <dir> --origin
+  inspect <ref>
+  verify [<ref>]
+  gc [--older-than <7d|12h|30m|90s>]
+  dev ckpt [--name <org/name>] [--blocks <n>] [--scale <n>] [--plain] [--no-configs]
+<ref> is org/name[@release] (--lane names a lane, else the release's only one) or a manifest
+sha256. The store is --store, else $TENSORFS_HOME, else ~/.tensorfs; it is created when absent.";
 
-macro_rules! ok {
-    ($e:expr) => {
-        match $e {
-            Ok(v) => v,
-            Err(e) => return bail(e),
-        }
-    };
-}
-
-const USAGE: &str = "usage: tfs <verb> ...
-  version [--json]
-  key blob|manifest <sha256> | repo <org> <name>
-  cbor encode|decode|check <file> [--out <file>]
-  manifest build <entries.jsonl> --out <manifest.json>
-  manifest inspect <manifest.json> --refs <jsonl> [--header <h> --inventory <i> --closure <c>]
-  manifest get|walk <root> <sha256> ...
-  repo inspect <repo.json> --rows <jsonl>
-  repo apply <current.json|-> <mutation.json> --out <file> --rows <jsonl> [--manifest <m> --header <h> --inventory <i>]
-  store init <root> [--disk-budget <bytes> | --no-disk-budget]
-  store rebuild <census> --rows <jsonl>
-  gc headers <census> --out <jsonl>
-  gc plan <census> --holds <jsonl> --out <jsonl>
-  put|get <root> ..., reap <root>
-  fetch <root> <ref> --hub <base> [--lane <lane>]
-  checkpoint write <root> [--plain] [--blocks <n>] [--no-configs]";
-
-/// Flags that never take a value.
-const SWITCHES: &[&str] = &[
-    "allow-local", "dry-run", "json", "keys", "no-configs",
-    "no-disk-budget", "no-netns", "plain", "progress",
-];
-/// Flags that take the next token as their value; given last, or before another flag, they
-/// are present without one.
+const SWITCHES: &[&str] = &["json", "safetensors", "origin", "plain", "no-configs"];
 const VALUED: &[&str] = &[
-    "allow-hosts", "blocks", "ca-file", "carrier", "closure",
-    "config", "credential-file", "disk-budget", "expect", "expect-length", "fault",
-    "header", "holds", "hub", "inventory", "isolation-tier", "keep", "lane",
-    "manifest", "max-download-bytes", "max-download-objects", "max-redirects", "member",
-    "observed", "order", "out", "part-mib", "progress-bytes", "range", "ready", "refs",
-    "registry", "rlimit-as-mb", "rlimit-fsize-mb", "rows", "sample-seconds",
-    "scale", "session", "slow-ms", "source", "source-name", "source-plan", "source-profile",
-    "spec-variant", "step", "streams", "target", "tenant", "timeout",
+    "store",
+    "name",
+    "lane",
+    "dequantize",
+    "older-than",
+    "converter",
+    "variant",
+    "blocks",
+    "scale",
 ];
+const VERBS: &[&str] = &["import", "pull", "export", "inspect", "verify", "dev"];
 
-fn usage() -> ExitCode {
-    eprintln!("{USAGE}");
-    ExitCode::from(2)
+struct Args {
+    pos: Vec<String>,
+    flags: Vec<(String, String)>,
 }
 
-/// ONE spelling in both directions, on the POSITIONAL surface. Every id this tool prints is
-/// `sha256:<hex>`, and a positional digest used to be bare hex only, so an id copied out of
-/// one command could not be pasted into the next (job-001 stripped the prefix at every
-/// hand-off). A positional argument that is exactly a printed id is now accepted as itself.
-///
-/// FLAG values are deliberately untouched: `--pin` and its kind already take the prefixed
-/// spelling on the way in, so they were never the inconsistent half, and rewriting them
-/// broke a flag-carried digest the first time this was applied to the whole argv. And only
-/// the CLI is loosened either way — a canonical DOCUMENT still holds each field to its one
-/// spelling, which is what keeps digests stable.
-fn accept_printed_ids(args: Vec<String>) -> Vec<String> {
-    args.into_iter()
-        .map(|t| match t.strip_prefix("sha256:") {
-            Some(h) if tensorfs_core::ids::hex64("argument", h).is_ok() => h.to_string(),
-            _ => t,
-        })
-        .collect()
+impl Args {
+    fn parse(argv: &[String]) -> std::result::Result<Args, String> {
+        let (mut pos, mut flags) = (Vec::new(), Vec::new());
+        let mut it = argv.iter();
+        while let Some(token) = it.next() {
+            let Some(name) = token.strip_prefix("--") else {
+                pos.push(token.clone());
+                continue;
+            };
+            let (name, inline) = match name.split_once('=') {
+                Some((n, v)) => (n, Some(v.to_owned())),
+                None => (name, None),
+            };
+            let value = if SWITCHES.contains(&name) {
+                String::new()
+            } else if VALUED.contains(&name) {
+                match inline.or_else(|| it.next().cloned()) {
+                    Some(v) => v,
+                    None => return Err(format!("--{name} takes a value")),
+                }
+            } else {
+                return Err(format!("unknown flag --{name}"));
+            };
+            flags.push((name.to_owned(), value));
+        }
+        Ok(Args { pos, flags })
+    }
+
+    fn get(&self, name: &str) -> Option<&str> {
+        self.flags
+            .iter()
+            .rev()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.as_str())
+    }
+
+    fn on(&self, name: &str) -> bool {
+        self.get(name).is_some()
+    }
+
+    fn number(&self, name: &str, default: u64) -> Result<u64> {
+        match self.get(name) {
+            None => Ok(default),
+            Some(v) => v
+                .parse()
+                .or_else(|_| fail(Kind::Invalid, format!("--{name} {v:?} is not a number"))),
+        }
+    }
 }
 
 fn main() -> ExitCode {
-    tracing_subscriber::fmt().with_writer(std::io::stderr).init();
-    let (args, flags) = split_flags(std::env::args().skip(1).collect());
-    if let Some(path) = flag(&flags, "ca-file") {
-        let trusted = fs::read(path)
-            .map_err(|e| format!("IO_FAILED: read {path}: {e}"))
-            .and_then(|pem| {
-                tensorfs_core::transport::trust_roots(&pem).map_err(|r| format!("{r} ({path})"))
-            });
-        if let Err(refusal) = trusted {
-            eprintln!("REFUSED {refusal}");
-            return ExitCode::FAILURE;
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .init();
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    // The positionals as v2 reads them; `gc headers|plan` and every other verb are v1's.
+    let mut pos = Vec::new();
+    let mut it = argv.iter();
+    while let Some(token) = it.next() {
+        match token.strip_prefix("--") {
+            Some(name) if VALUED.contains(&name) => drop(it.next()),
+            Some(_) => {}
+            None => pos.push(token.as_str()),
         }
     }
-    let args = accept_printed_ids(args);
-    let a: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    match a.as_slice() {
-        ["version"] => cmd_version(flag_on(&flags, "json")),
-        ["store", "init", r] => cmd_store_init(Path::new(r), &flags),
-        ["store", "rebuild", r] => repo::cmd_rebuild(Path::new(r), &flags),
-        ["put", r, f] => cmd_put(Path::new(r), Path::new(f), &flags),
-        ["get", r, h] => cmd_get(Path::new(r), h, &flags),
-        ["reap", r] => cmd_reap(Path::new(r)),
-        ["checkpoint", "write", r] => ckpt::cmd_write(Path::new(r), &flags),
-        ["manifest", "get", r, h] => snap::cmd_get(Path::new(r), h, &flags),
-        ["manifest", "walk", r, h] => snap::cmd_walk(Path::new(r), h, &flags),
-        ["manifest", "build", entries] => repo::cmd_manifest_build(Path::new(entries), &flags),
-        ["manifest", "inspect", p] => repo::cmd_manifest_inspect(Path::new(p), &flags),
-        ["repo", "inspect", p] => repo::cmd_repo_inspect(Path::new(p), &flags),
-        ["repo", "apply", current, mutation] => {
-            repo::cmd_repo_apply(current, Path::new(mutation), &flags)
-        }
-        ["key", kind, rest @ ..] => repo::cmd_key(kind, rest),
-        ["gc", "headers", census] => repo::cmd_gc_headers(Path::new(census), &flags),
-        ["gc", "plan", census] => repo::cmd_gc_plan(Path::new(census), &flags),
-        ["fetch", r, refspec] => fetch::cmd_fetch(Path::new(r), refspec, &flags),
-        ["cbor", "encode", f] => cmd_cbor("encode", Path::new(f), &flags),
-        ["cbor", "decode", f] => cmd_cbor("decode", Path::new(f), &flags),
-        ["cbor", "check", f] => cmd_cbor("check", Path::new(f), &flags),
-        _ => usage(),
-    }
-}
-
-/// `tfs <version> sha256:<digest of this binary's own bytes>` — one line, machine-parsed by
-/// tensorhub and cozy-creator at startup (tfs-051). Byte-identical builds print the same
-/// digest; two builds stamped with one version cannot hide behind it.
-/// `tfs <version> sha256:<own digest>`, or with `--json` that and the Store contract.
-fn cmd_version(json: bool) -> ExitCode {
-    let bytes = match std::env::current_exe().and_then(fs::read) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            eprintln!("REFUSED IO_FAILED: read own binary: {error}");
-            return ExitCode::from(1);
-        }
+    let v2 = match pos.as_slice() {
+        ["gc"] => true,
+        [verb, ..] => VERBS.contains(verb),
+        [] => false,
     };
-    let digest = tensorfs_core::sha256::hex_digest(&bytes);
-    if json {
-        let record = serde_json::json!({
-            "version": env!("CARGO_PKG_VERSION"),
-            "sha256": digest,
-            "store_format": tensorfs_core::STORE_FORMAT,
-            "claim_protocol": tensorfs_core::CLAIM_PROTOCOL,
-        });
-        println!("{record}");
-    } else {
-        println!("tfs {} sha256:{digest}", env!("CARGO_PKG_VERSION"));
+    if !v2 {
+        return v1::main(argv);
     }
-    ExitCode::SUCCESS
-}
-
-// ------------------------------------------------------------------ store CLI
-
-/// `--key value` pairs and bare `--flag` switches, split out of the positionals.
-type Flags = Vec<(String, String)>;
-
-/// A switch never takes the next token. An unknown flag warns, and takes the next token as
-/// its value as every flag once did, so a caller's typo is visible and nothing it passes moves.
-fn split_flags(argv: Vec<String>) -> (Vec<String>, Flags) {
-    let (mut pos, mut flags) = (Vec::new(), Flags::new());
-    let mut it = argv.into_iter().peekable();
-    while let Some(t) = it.next() {
-        match t.strip_prefix("--") {
-            None => pos.push(t),
-            Some(k) => {
-                let switch = SWITCHES.contains(&k);
-                if !switch && !VALUED.contains(&k) {
-                    eprintln!("tfs: warning: unknown flag --{k}");
-                }
-                let v = match it.peek() {
-                    Some(n) if !switch && !n.starts_with("--") => it.next().unwrap(),
-                    _ => "1".to_string(),
-                };
-                flags.push((k.to_string(), v));
-            }
-        }
-    }
-    (pos, flags)
-}
-
-fn flag<'a>(f: &'a Flags, k: &str) -> Option<&'a str> {
-    f.iter().find(|(a, _)| a == k).map(|(_, v)| v.as_str())
-}
-fn flag_on(f: &Flags, k: &str) -> bool {
-    flag(f, k).is_some()
-}
-/// `--k <number>`, or `d` when absent. A value that is not a number is a usage error.
-fn flag_num<T: std::str::FromStr>(f: &Flags, k: &str, d: T) -> T {
-    match flag(f, k) {
-        None => d,
-        Some(v) => v.parse().unwrap_or_else(|_| {
-            eprintln!("tfs: --{k} {v:?} is not a number");
-            std::process::exit(2)
-        }),
-    }
-}
-
-fn bail(e: Refusal) -> ExitCode {
-    eprintln!("REFUSED {e}");
-    ExitCode::FAILURE
-}
-
-mod ckpt;
-mod fetch;
-mod repo;
-mod snap;
-
-/// `tfs store init <root>`, recording or clearing its disk budget.
-fn cmd_store_init(root: &Path, flags: &Flags) -> ExitCode {
-    let budget = match (flag(flags, "disk-budget"), flag_on(flags, "no-disk-budget")) {
-        (Some(_), true) => {
-            eprintln!("--disk-budget and --no-disk-budget say opposite things; pass one");
+    let args = match Args::parse(&argv) {
+        Ok(args) => args,
+        Err(why) => {
+            eprintln!("tfs: {why}\n{USAGE}");
             return ExitCode::from(2);
         }
-        (Some(value), false) => match value.parse::<u64>() {
-            Ok(bytes) => Some(Some(bytes)),
-            Err(_) => {
-                eprintln!("--disk-budget takes a byte count, not {value:?}");
-                return ExitCode::from(2);
-            }
-        },
-        (None, true) => Some(None),
-        (None, false) => None,
     };
-    let mut s = ok!(Store::init(root));
-    if let Some(budget) = budget {
-        s = ok!(s.bind_disk_budget(budget));
-    }
-    println!("root:       {}", s.root().display());
-    println!("blobs:      {}", ok!(s.objects()).len());
-    println!(
-        "disk-budget: {}",
-        match s.disk_budget() {
-            Some(bytes) => format!("{bytes} B, holding {} B", ok!(s.occupancy())),
-            None => "(none)".to_string(),
-        }
-    );
-    println!(
-        "durability: {} ({})",
-        s.disk_class().as_str(),
-        s.disk().kind
-    );
-    ExitCode::SUCCESS
-}
-
-fn fault_of(f: &Flags) -> Fault {
-    Fault {
-        stage: flag(f, "fault").map(|s| s.to_string()),
-        ready: flag(f, "ready").map(PathBuf::from),
-    }
-}
-
-/// `<off>:<len>` or `<off>:` (to the end) inside an object of `length` bytes.
-fn byte_range(range: &str, length: u64) -> TfsResult<(u64, u64)> {
-    let bad = || Refusal {
-        code: tensorfs_core::err::Code::RANGE_BOUNDS,
-        detail: format!("--range {range:?} is not <off>:<len> or <off>: inside {length} B"),
-    };
-    let (off, len) = range.split_once(':').ok_or_else(bad)?;
-    let off: u64 = off.parse().map_err(|_| bad())?;
-    let len: u64 = match len {
-        "" => length.checked_sub(off).ok_or_else(bad)?,
-        len => len.parse().map_err(|_| bad())?,
-    };
-    match off.checked_add(len) {
-        Some(end) if end <= length => Ok((off, len)),
-        _ => Err(bad()),
-    }
-}
-
-/// Stream a range of one verified object to stdout under a read lease, so a GC pass cannot
-/// take the object mid-read.
-fn get_leased(store: &Store, hex: &str, range: Option<&str>) -> TfsResult<()> {
-    use std::io::Write;
-    use tensorfs_core::read::{self, ObjectRange};
-    let length = store.open_verified(hex)?.len();
-    let (mut off, mut left) = match range {
-        Some(range) => byte_range(range, length)?,
-        None => (0, length),
-    };
-    let meta = tensorfs_core::meta::Meta::open(store)?;
-    let obj = ObjectRef {
-        sha256: hex.to_string(),
-        length,
-    };
-    let (lease, _) = read::acquire(store, &meta, "", vec![obj.clone()])?;
-    let mut out = std::io::stdout().lock();
-    let mut buf = vec![0u8; 1 << 20];
-    let streamed = (|| {
-        while left > 0 {
-            let n = left.min(buf.len() as u64);
-            let chunk = &mut buf[..n as usize];
-            let range = ObjectRange {
-                obj: obj.clone(),
-                off,
-                len: n,
-            };
-            read::read_into(&lease, &range, chunk)?;
-            out.write_all(chunk).map_err(|e| Refusal {
-                code: tensorfs_core::err::Code::IO_FAILED,
-                detail: format!("write stdout: {e}"),
-            })?;
-            (off, left) = (off + n, left - n);
-        }
-        out.flush().map_err(|e| Refusal {
-            code: tensorfs_core::err::Code::IO_FAILED,
-            detail: format!("write stdout: {e}"),
-        })
-    })();
-    lease.release(&meta)?;
-    streamed
-}
-
-fn cmd_put(root: &Path, src: &Path, f: &Flags) -> ExitCode {
-    let s = ok!(Store::open(root));
-    let expect = match (flag(f, "expect"), flag(f, "expect-length")) {
-        (None, _) => None,
-        (Some(_), None) => {
-            eprintln!("--expect requires --expect-length: an ObjectRef is length-bearing");
-            return ExitCode::from(2);
-        }
-        (Some(h), Some(l)) => Some(ObjectRef {
-            sha256: h.trim_start_matches("sha256:").to_string(),
-            length: l.parse().unwrap_or(u64::MAX),
-        }),
-    };
-    let fault = fault_of(f);
-    if let Some(st) = &fault.stage {
-        if !FAULT_STAGES.contains(&st.as_str()) {
-            eprintln!("--fault {st}: stages are {FAULT_STAGES:?}");
-            return ExitCode::from(2);
-        }
-    }
-    let p = ok!(s.put_file(src, expect.as_ref(), &fault));
-    println!(
-        "{} sha256:{} length={}",
-        if p.admitted {
-            "admitted"
-        } else {
-            "present (lost the admission race; this process claims nothing about its bytes)"
-        },
-        p.obj.sha256,
-        p.obj.length
-    );
-    ExitCode::SUCCESS
-}
-
-fn cmd_get(root: &Path, hex: &str, f: &Flags) -> ExitCode {
-    let s = ok!(Store::open(root));
-    if flag(f, "out") == Some("-") {
-        ok!(get_leased(&s, hex, flag(f, "range")));
-        return ExitCode::SUCCESS;
-    }
-    let t = Instant::now();
-    if let Some(r) = flag(f, "range") {
-        let (o, l) = r.split_once(':').unwrap_or((r, "1"));
-        let bytes = ok!(s.read_range(hex, o.parse().unwrap_or(0), l.parse().unwrap_or(1)));
-        println!(
-            "range {} bytes in {:.3} s, sha256:{}",
-            bytes.len(),
-            t.elapsed().as_secs_f64(),
-            tensorfs_core::sha256::hex_digest(&bytes)
-        );
-        return ExitCode::SUCCESS;
-    }
-    let mut sink: Box<dyn std::io::Write> = match flag(f, "out") {
-        Some(p) => Box::new(match fs::File::create(p) {
-            Ok(fh) => fh,
-            Err(e) => {
-                eprintln!("{p}: {e}");
-                return ExitCode::FAILURE;
-            }
-        }),
-        None => Box::new(Counting(0)),
-    };
-    let n = ok!(s.read_into(hex, &mut sink));
-    let secs = t.elapsed().as_secs_f64();
-    println!(
-        "read {n} verified bytes in {secs:.3} s ({:.1} MiB/s)",
-        n as f64 / secs / 1048576.0
-    );
-    ExitCode::SUCCESS
-}
-
-struct Counting(u64);
-impl std::io::Write for Counting {
-    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-        self.0 += b.len() as u64;
-        Ok(b.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-fn cmd_reap(root: &Path) -> ExitCode {
-    let s = ok!(Store::open(root));
-    let (gone, kept) = ok!(s.reap());
-    println!("reap: removed {gone} orphaned temps, kept {kept} with a live writer");
-    ExitCode::SUCCESS
-}
-
-fn peak_rss_kb() -> u64 {
-    cozy_platform::process::peak_resident().map_or(0, |bytes| bytes / 1024)
-}
-
-
-// ------------------------------------------------------------------ id
-
-fn write_cli(bytes: &[u8], flags: &Flags) -> ExitCode {
-    if let Some(path) = flag(flags, "out") {
-        match fs::write(path, bytes) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error) => {
-                eprintln!("{path}: {error}");
-                ExitCode::FAILURE
-            }
-        }
-    } else {
-        use std::io::Write;
-        match std::io::stdout().write_all(bytes) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error) => {
-                eprintln!("stdout: {error}");
-                ExitCode::FAILURE
-            }
-        }
-    }
-}
-
-fn cmd_cbor(action: &str, path: &Path, flags: &Flags) -> ExitCode {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            eprintln!("{}: {error}", path.display());
-            return ExitCode::FAILURE;
-        }
-    };
-    match action {
-        "encode" => {
-            let value =
-                ok!(canon::parse_with_depth(&bytes, tensorfs_core::limits::DOC_MAX_BYTES, 16));
-            let header = ok!(Header::from_diagnostic_value(&value));
-            if let Err(error) = header.validate_structure() {
-                return bail(error);
-            }
-            let encoded = ok!(header.canonical_bytes());
-            if let Err(error) = Header::parse(&encoded) {
-                return bail(error);
-            }
-            write_cli(&encoded, flags)
-        }
-        "decode" => {
-            let header = ok!(Header::parse(&bytes));
-            let value = ok!(header.diagnostic_value());
-            let mut rendered = canon::pretty(&value, 0).into_bytes();
-            rendered.push(b'\n');
-            write_cli(&rendered, flags)
-        }
-        "check" => {
-            let header = ok!(Header::parse(&bytes));
-            println!("header_digest {}", tensorfs_core::ids::object_id(&bytes));
-            println!("bytes {}", bytes.len());
-            println!("components {}", header.components.len());
-            println!("tensors {}", header.tensors().count());
-            for (component, tensors) in &header.components {
-                println!("component {component} {}", tensors.len());
-                for (index, (key, _)) in tensors.iter().enumerate() {
-                    println!("order {component} {index} {key}");
-                }
+    let json = args.on("json");
+    match run(&args) {
+        Ok(Some((doc, human))) => {
+            if json {
+                println!("{doc}");
+            } else {
+                println!("{human}");
             }
             ExitCode::SUCCESS
         }
-        _ => unreachable!(),
+        Ok(None) => {
+            eprintln!("{USAGE}");
+            ExitCode::from(2)
+        }
+        Err(Failed(f, doc)) => {
+            if json {
+                let mut out = json!({"error": {"code": f.kind.code(), "detail": f.detail}});
+                if let Some(doc) = doc {
+                    out.as_object_mut().expect("an object").extend(doc);
+                }
+                println!("{out}");
+            } else {
+                eprintln!("tfs: {f}");
+            }
+            ExitCode::FAILURE
+        }
     }
+}
+
+/// A failure, with whatever the command found before it.
+struct Failed(Failure, Option<Map<String, Json>>);
+
+impl From<Failure> for Failed {
+    fn from(f: Failure) -> Failed {
+        Failed(f, None)
+    }
+}
+
+impl From<tensorfs_core::store2::Error> for Failed {
+    fn from(e: tensorfs_core::store2::Error) -> Failed {
+        Failed(e.into(), None)
+    }
+}
+
+type Done = std::result::Result<Option<(Json, String)>, Failed>;
+
+fn store_root(args: &Args) -> Result<PathBuf> {
+    if let Some(dir) = args.get("store") {
+        return Ok(PathBuf::from(dir));
+    }
+    if let Some(dir) = std::env::var_os("TENSORFS_HOME").filter(|d| !d.is_empty()) {
+        return Ok(PathBuf::from(dir));
+    }
+    match std::env::var_os("HOME").filter(|d| !d.is_empty()) {
+        Some(home) => Ok(Path::new(&home).join(".tensorfs")),
+        None => fail(
+            Kind::Invalid,
+            "no store: pass --store, or set TENSORFS_HOME or HOME",
+        ),
+    }
+}
+
+fn object(o: &ObjectRef) -> Json {
+    json!({"sha256": o.sha256, "length": o.length})
+}
+
+fn named(n: &Named) -> Map<String, Json> {
+    let doc = json!({"manifest": object(&n.manifest), "name": n.name, "release": n.release, "lane": n.lane});
+    doc.as_object().expect("an object").clone()
+}
+
+fn label(n: &Named) -> String {
+    match (&n.name, &n.release, &n.lane) {
+        (Some(name), Some(release), Some(lane)) => {
+            format!("{name}@{release} lane {lane}: sha256:{}", n.manifest.sha256)
+        }
+        _ => format!("sha256:{}", n.manifest.sha256),
+    }
+}
+
+fn run(args: &Args) -> Done {
+    let pos: Vec<&str> = args.pos.iter().map(String::as_str).collect();
+    let lane = args.get("lane");
+    let store = || Store::open(store_root(args)?).map_err(Failure::from);
+    match pos.as_slice() {
+        ["import", sources @ ..] if !sources.is_empty() => {
+            let sources: Vec<String> = sources.iter().map(|s| s.to_string()).collect();
+            let quiet = args.on("json");
+            let last = Mutex::new((String::new(), Instant::now()));
+            let progress = |phase: &str, done: u64, total: u64| {
+                let mut last = last.lock().unwrap_or_else(|e| e.into_inner());
+                if quiet || (last.0 == phase && last.1.elapsed() < Duration::from_secs(2)) {
+                    return;
+                }
+                *last = (phase.to_owned(), Instant::now());
+                eprintln!("{phase} {done}/{total}");
+            };
+            let opts = ImportOptions {
+                name: args.get("name"),
+                converter: args.get("converter"),
+                variant: args.get("variant"),
+                progress: &progress,
+            };
+            let n = store()?.import_named(&sources, &opts)?;
+            Ok(Some((
+                Json::Object(named(&n)),
+                format!("imported {}", label(&n)),
+            )))
+        }
+        ["pull", origin, reference] => {
+            let p = store()?.pull(origin, reference, lane)?;
+            let mut doc = named(&p.named);
+            doc.extend([
+                ("objects".into(), p.objects.into()),
+                ("fetched".into(), p.fetched.into()),
+                ("held".into(), p.held.into()),
+            ]);
+            let human = format!(
+                "pulled {} ({} objects, {} bytes fetched, {} held)",
+                label(&p.named),
+                p.objects,
+                p.fetched,
+                p.held
+            );
+            Ok(Some((Json::Object(doc), human)))
+        }
+        ["export", reference, dir] => {
+            let store = store()?;
+            let n = store.resolve(reference, lane)?;
+            let dir = Path::new(dir);
+            let files = match (
+                args.on("safetensors"),
+                args.on("origin"),
+                args.get("dequantize"),
+            ) {
+                (true, false, dequantize) => {
+                    let dtype = dequantize.map(|d| Dtype::parse(&d.to_ascii_uppercase()));
+                    export::safetensors(&store.checkpoint(&n.manifest)?, dir, dtype.as_ref())?
+                }
+                (false, true, None) => client::export_origin(&store, &n, dir)?,
+                _ => return Ok(None),
+            };
+            let human = format!(
+                "exported {} into {}: {} files",
+                label(&n),
+                dir.display(),
+                files.len()
+            );
+            let mut doc = named(&n);
+            doc.insert("files".into(), files.into());
+            Ok(Some((Json::Object(doc), human)))
+        }
+        ["inspect", reference] => inspect(&store()?, reference, lane),
+        ["verify"] => verify(&store()?, None),
+        ["verify", reference] => verify(&store()?, Some((reference, lane))),
+        ["gc"] => {
+            let store = store()?;
+            let collected = match args.get("older-than") {
+                None => store.gc()?,
+                Some(text) => store.collect(u64::MAX, duration(text)?)?,
+            };
+            let doc = json!({"objects": collected.objects, "bytes": collected.bytes, "pins": collected.pins});
+            let human = format!(
+                "collected {} objects, {} bytes; dropped {} pins",
+                collected.objects,
+                collected.bytes,
+                collected.pins.len()
+            );
+            Ok(Some((doc, human)))
+        }
+        ["dev", "ckpt"] => {
+            let store = store()?;
+            let plain = args.on("plain");
+            let scale = args.number("scale", 1)?.max(1);
+            let manifest = dev::ckpt(
+                &store,
+                args.number("blocks", 12)?,
+                scale,
+                plain,
+                !args.on("no-configs"),
+            )?;
+            let name = args.get("name").unwrap_or("dev/ckpt");
+            let n = store.set_lane(
+                name,
+                "1",
+                Some(if plain { "bf16" } else { "mixed" }),
+                &manifest,
+            )?;
+            store.unpin(&manifest.sha256)?;
+            let ck = store.checkpoint(&manifest)?;
+            let mut objects: Vec<ObjectRef> = vec![manifest.clone()];
+            objects.extend(ck.manifest().files.values().cloned());
+            objects.extend(ck.header().chunks.iter().cloned());
+            objects.sort();
+            objects.dedup();
+            let mut doc = named(&n);
+            doc.insert("objects".into(), objects.iter().map(object).collect());
+            let human = format!("wrote {} ({} objects)", label(&n), objects.len());
+            Ok(Some((Json::Object(doc), human)))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// `7d`, `12h`, `30m`, `90s` or seconds.
+fn duration(text: &str) -> Result<Duration> {
+    let (number, unit) = text.split_at(text.trim_end_matches(char::is_alphabetic).len());
+    let scale = match unit {
+        "" | "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86400,
+        _ => 0,
+    };
+    match number.parse::<u64>() {
+        Ok(n) if scale > 0 => Ok(Duration::from_secs(n * scale)),
+        _ => fail(
+            Kind::Invalid,
+            format!("--older-than {text:?}: a number of s, m, h or d"),
+        ),
+    }
+}
+
+fn inspect(store: &Store, reference: &str, lane: Option<&str>) -> Done {
+    let n = store.resolve(reference, lane)?;
+    let ck = store.checkpoint(&n.manifest)?;
+    let header = ck.header();
+    let mut human = vec![label(&n)];
+    let mut components = Map::new();
+    for (name, c) in &header.components {
+        let mut tensors = Map::new();
+        let mut bytes = 0;
+        for (key, t) in &c.tensors {
+            let mut doc = json!({"dtype": t.dtype.name(), "shape": t.shape});
+            match &t.body {
+                Body::Data(at) => bytes += at.length,
+                Body::Encoded { encoding, parts } => {
+                    bytes += parts.values().map(|p| p.length).sum::<u64>();
+                    doc["encoding"] = json!({"scheme": encoding.scheme, "params": encoding.params});
+                }
+            }
+            tensors.insert(key.clone(), doc);
+        }
+        human.push(format!(
+            "  {name}: {} tensors, {bytes} bytes",
+            c.tensors.len()
+        ));
+        components.insert(name.clone(), json!({"bytes": bytes, "tensors": tensors}));
+    }
+    let chunk_bytes: u64 = header.chunks.iter().map(|c| c.length).sum();
+    human.push(format!(
+        "  {} chunks, {chunk_bytes} bytes; {} files",
+        header.chunks.len(),
+        ck.manifest().files.len()
+    ));
+    let files: Map<String, Json> = ck
+        .manifest()
+        .files
+        .iter()
+        .map(|(p, o)| (p.clone(), object(o)))
+        .collect();
+    let mut doc = named(&n);
+    doc.extend([
+        ("files".into(), Json::Object(files)),
+        ("chunks".into(), header.chunks.len().into()),
+        ("bytes".into(), chunk_bytes.into()),
+        ("metadata".into(), json!(header.metadata)),
+        ("components".into(), Json::Object(components)),
+    ]);
+    Ok(Some((Json::Object(doc), human.join("\n"))))
+}
+
+/// Rehashes every object (or a checkpoint's): a corrupt one is removed, to be fetched again.
+fn verify(store: &Store, reference: Option<(&str, Option<&str>)>) -> Done {
+    let objects: Vec<ObjectRef> = match reference {
+        Some((reference, lane)) => {
+            let n = store.resolve(reference, lane)?;
+            let ck = store.checkpoint(&n.manifest)?;
+            let mut all = vec![n.manifest.clone()];
+            all.extend(ck.manifest().files.values().cloned());
+            all.extend(ck.header().chunks.iter().cloned());
+            all.sort();
+            all.dedup();
+            all
+        }
+        None => blobs(store)?,
+    };
+    let (mut corrupt, mut missing, mut bytes) = (Vec::new(), Vec::new(), 0);
+    for o in &objects {
+        if !store.path(o)?.exists() {
+            missing.push(o.sha256.clone());
+        } else if store.verify(o)? {
+            bytes += o.length;
+        } else {
+            corrupt.push(o.sha256.clone());
+        }
+    }
+    let mut doc = Map::new();
+    doc.extend([
+        ("objects".into(), objects.len().into()),
+        ("bytes".into(), bytes.into()),
+        ("corrupt".into(), corrupt.clone().into()),
+        ("missing".into(), missing.clone().into()),
+    ]);
+    if corrupt.is_empty() && missing.is_empty() {
+        let human = format!("verified {} objects, {bytes} bytes", objects.len());
+        return Ok(Some((Json::Object(doc), human)));
+    }
+    let detail = format!(
+        "{} corrupt (removed) and {} missing of {} objects",
+        corrupt.len(),
+        missing.len(),
+        objects.len()
+    );
+    Err(Failed(
+        Failure {
+            kind: Kind::Integrity,
+            detail,
+        },
+        Some(doc),
+    ))
+}
+
+/// Every object file in the store, at its length on disk.
+fn blobs(store: &Store) -> Result<Vec<ObjectRef>> {
+    let mut out = Vec::new();
+    let list = |dir: &Path| -> Result<Vec<fs::DirEntry>> {
+        match fs::read_dir(dir) {
+            Ok(entries) => Ok(entries.flatten().collect()),
+            Err(e) => fail(Kind::Io, format!("{}: {e}", dir.display())),
+        }
+    };
+    for top in list(&store.root().join("blobs"))? {
+        for shard in list(&top.path())? {
+            for blob in list(&shard.path())? {
+                let sha256 = blob.file_name().to_string_lossy().into_owned();
+                if let Ok(m) = blob.metadata() {
+                    out.push(ObjectRef {
+                        sha256,
+                        length: m.len(),
+                    });
+                }
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
 }

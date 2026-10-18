@@ -1,0 +1,304 @@
+//! The `tfs` binary on v2 stores: a synthetic checkpoint with every scheme exports to
+//! safetensors bit-identical to its stored parts (and to the reference decode with
+//! `--dequantize`), exports as a static origin that pulls into a second store byte-identical,
+//! and `verify` removes a corrupted object that the next pull fetches again.
+
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use serde_json::Value as Json;
+use tensorfs_core::client::regions;
+use tensorfs_core::format::{decode, Body, Dtype, PartBytes};
+use tensorfs_core::store2::{Checkpoint, Store};
+
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new(name: &str) -> Scratch {
+        let path = Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("tfs-cli-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).unwrap();
+        Scratch(path)
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+/// `tfs --json <args>`: its exit success and its document.
+fn tfs(store: &Path, args: &[&str]) -> (bool, Json) {
+    let out = Command::new(env!("CARGO_BIN_EXE_tfs"))
+        .arg("--store")
+        .arg(store)
+        .arg("--json")
+        .args(args)
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    let doc = serde_json::from_str(text.trim()).unwrap_or_else(|e| {
+        panic!(
+            "tfs {args:?}: {e}\n{text}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        )
+    });
+    (out.status.success(), doc)
+}
+
+fn ok(store: &Path, args: &[&str]) -> Json {
+    let (success, doc) = tfs(store, args);
+    assert!(success, "tfs {args:?}: {doc}");
+    doc
+}
+
+/// Name -> dtype, shape, bytes.
+type Tensors = BTreeMap<String, (String, Vec<u64>, Vec<u8>)>;
+
+/// Each tensor of a safetensors file, and its `__metadata__`.
+fn safetensors(path: &Path) -> (Tensors, Json) {
+    let bytes = fs::read(path).unwrap();
+    let n = u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;
+    assert_eq!(n % 8, 0, "the header is padded to 8 bytes");
+    let header: serde_json::Map<String, Json> = serde_json::from_slice(&bytes[8..8 + n]).unwrap();
+    let data = &bytes[8 + n..];
+    let mut out = BTreeMap::new();
+    let mut end = 0;
+    for (name, t) in &header {
+        if name == "__metadata__" {
+            continue;
+        }
+        let at: Vec<usize> = serde_json::from_value(t["data_offsets"].clone()).unwrap();
+        end = end.max(at[1]);
+        let shape = serde_json::from_value(t["shape"].clone()).unwrap();
+        out.insert(
+            name.clone(),
+            (
+                t["dtype"].as_str().unwrap().to_owned(),
+                shape,
+                data[at[0]..at[1]].to_vec(),
+            ),
+        );
+    }
+    assert_eq!(end, data.len(), "no bytes past the last tensor");
+    (out, header["__metadata__"].clone())
+}
+
+fn raw(ck: &Checkpoint, at: &tensorfs_core::format::Location) -> Vec<u8> {
+    let mut buf = vec![0; at.length as usize];
+    ck.bytes_into(at, &mut buf).unwrap();
+    buf
+}
+
+fn blobs(root: &Path) -> BTreeMap<String, Vec<u8>> {
+    let mut out = BTreeMap::new();
+    for top in fs::read_dir(root.join("blobs")).unwrap().flatten() {
+        for shard in fs::read_dir(top.path()).unwrap().flatten() {
+            for blob in fs::read_dir(shard.path()).unwrap().flatten() {
+                out.insert(
+                    blob.file_name().to_string_lossy().into_owned(),
+                    fs::read(blob.path()).unwrap(),
+                );
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn a_synthetic_checkpoint_exports_pulls_and_verifies() {
+    let dir = Scratch::new("round-trip");
+    let (a, b) = (dir.0.join("a"), dir.0.join("b"));
+    let written = ok(
+        &a,
+        &[
+            "dev", "ckpt", "--blocks", "2", "--scale", "2", "--name", "acme/syn",
+        ],
+    );
+    assert_eq!(
+        (
+            written["name"].as_str(),
+            written["release"].as_str(),
+            written["lane"].as_str()
+        ),
+        (Some("acme/syn"), Some("1"), Some("mixed"))
+    );
+
+    let inspected = ok(&a, &["inspect", "acme/syn"]);
+    assert_eq!(inspected["manifest"], written["manifest"]);
+    let schemes: std::collections::BTreeSet<&str> = inspected["components"]["unet"]["tensors"]
+        .as_object()
+        .unwrap()
+        .values()
+        .filter_map(|t| t["encoding"]["scheme"].as_str())
+        .collect();
+    assert_eq!(
+        schemes.into_iter().collect::<Vec<_>>(),
+        ["fp8-rowwise", "int8-convrot", "nvfp4"]
+    );
+
+    let store = Store::open(&a).unwrap();
+    let manifest = serde_json::from_value(written["manifest"].clone()).unwrap();
+    let ck = store.checkpoint(&manifest).unwrap();
+    // A standalone part (the 32 MiB embedding) and packs, never across components.
+    assert!(ck.header().chunks.iter().any(|c| c.length == 32 << 20));
+    let grouped = regions(ck.header(), 4 << 20);
+    let mut seen: Vec<&String> = grouped.iter().flatten().collect();
+    assert_eq!(seen.len(), ck.tensors().count());
+    seen.sort();
+    seen.dedup();
+    assert_eq!(
+        seen.len(),
+        ck.tensors().count(),
+        "every tensor in exactly one region"
+    );
+    assert!(grouped.iter().all(|r| r
+        .iter()
+        .all(|k| k.split('/').next() == r[0].split('/').next())));
+
+    // Safetensors: plain tensors and encoded parts bit-identical, schemes in the metadata.
+    let out = dir.0.join("out");
+    let exported = ok(
+        &a,
+        &["export", "acme/syn", out.to_str().unwrap(), "--safetensors"],
+    );
+    assert!(exported["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|f| f == "unet/diffusion_pytorch_model.safetensors"));
+    assert_eq!(
+        fs::read(out.join("unet/config.json")).unwrap(),
+        ck.file("unet/config.json").unwrap()
+    );
+    let files = [
+        ("unet", "unet/diffusion_pytorch_model.safetensors"),
+        ("text_encoder", "text_encoder/model.safetensors"),
+        ("vae", "vae.safetensors"),
+    ];
+    let mut checked = 0;
+    for (component, file) in files {
+        let (tensors, meta) = safetensors(&out.join(file));
+        assert_eq!(meta["format"], "pt");
+        let encodings: Json = meta.get("cozytensors.encodings").map_or(Json::Null, |t| {
+            serde_json::from_str(t.as_str().unwrap()).unwrap()
+        });
+        for (key, t) in &ck.header().components[component].tensors {
+            match &t.body {
+                Body::Data(at) => {
+                    assert_eq!(
+                        tensors[key],
+                        (t.dtype.name().to_owned(), t.shape.clone(), raw(&ck, at)),
+                        "{key}"
+                    );
+                    checked += 1;
+                }
+                Body::Encoded { encoding, parts } => {
+                    assert_eq!(encodings[key]["scheme"], encoding.scheme.as_str());
+                    for (role, p) in parts {
+                        let name = encodings[key]["parts"][role].as_str().unwrap();
+                        assert_eq!(
+                            tensors[name],
+                            (
+                                p.dtype.name().to_owned(),
+                                p.shape.clone(),
+                                raw(&ck, &p.at())
+                            ),
+                            "{key} {role}"
+                        );
+                        checked += 1;
+                    }
+                    assert_eq!(
+                        tensors.contains_key(&format!("{key}_scale")),
+                        parts.contains_key("scale")
+                    );
+                }
+            }
+        }
+    }
+    assert!(checked > 20);
+
+    // Dequantized: each encoded tensor is the reference decode, rounded once to BF16.
+    let deq = dir.0.join("deq");
+    ok(
+        &a,
+        &[
+            "export",
+            "acme/syn",
+            deq.to_str().unwrap(),
+            "--safetensors",
+            "--dequantize",
+            "bf16",
+        ],
+    );
+    let (tensors, meta) = safetensors(&deq.join("unet/diffusion_pytorch_model.safetensors"));
+    assert!(meta.get("cozytensors.encodings").is_none());
+    for (key, t) in &ck.header().components["unet"].tensors {
+        if let Body::Encoded { encoding, parts } = &t.body {
+            let bytes: BTreeMap<&str, Vec<u8>> = parts
+                .iter()
+                .map(|(r, p)| (r.as_str(), raw(&ck, &p.at())))
+                .collect();
+            let views = parts
+                .iter()
+                .map(|(r, p)| {
+                    (
+                        r.as_str(),
+                        PartBytes {
+                            dtype: &p.dtype,
+                            shape: &p.shape,
+                            bytes: &bytes[r.as_str()],
+                        },
+                    )
+                })
+                .collect();
+            let want = decode(&Dtype::BF16, &t.shape, encoding, &views).unwrap();
+            assert_eq!(
+                tensors[key],
+                ("BF16".to_owned(), t.shape.clone(), want),
+                "{key}"
+            );
+        }
+    }
+
+    // A static origin, pulled into a second store byte-identical.
+    let origin = dir.0.join("origin");
+    ok(
+        &a,
+        &["export", "acme/syn", origin.to_str().unwrap(), "--origin"],
+    );
+    let pulled = ok(&b, &["pull", origin.to_str().unwrap(), "acme/syn@1"]);
+    assert_eq!(pulled["manifest"], written["manifest"]);
+    assert_eq!(blobs(&b), blobs(&a));
+    assert_eq!(
+        fs::read(b.join("refs/acme/syn.json")).unwrap(),
+        fs::read(a.join("refs/acme/syn.json")).unwrap()
+    );
+    assert_eq!(ok(&b, &["verify"])["corrupt"], serde_json::json!([]));
+
+    // A corrupted object is found, removed, and fetched again.
+    let chunk = &ck.header().chunks[0];
+    let path = Store::open(&b).unwrap().path(chunk).unwrap();
+    let mut bytes = fs::read(&path).unwrap();
+    bytes[100] ^= 0xff;
+    fs::remove_file(&path).unwrap();
+    fs::write(&path, &bytes).unwrap();
+    let (success, verified) = tfs(&b, &["verify", "acme/syn"]);
+    assert!(!success);
+    assert_eq!(verified["error"]["code"], "integrity");
+    assert_eq!(verified["corrupt"], serde_json::json!([chunk.sha256]));
+    assert!(!path.exists());
+    let again = ok(&b, &["pull", origin.to_str().unwrap(), "acme/syn"]);
+    assert_eq!(again["fetched"], chunk.length);
+    assert_eq!(blobs(&b), blobs(&a));
+
+    // Typed failures.
+    let (success, missing) = tfs(&b, &["inspect", "acme/none"]);
+    assert!(!success);
+    assert_eq!(missing["error"]["code"], "not_found");
+    assert_eq!(ok(&a, &["gc"])["objects"], 0, "everything is referenced");
+}

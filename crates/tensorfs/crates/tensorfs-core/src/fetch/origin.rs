@@ -78,6 +78,17 @@ pub(crate) fn pick(
         code: Code::UNKNOWN_FORMAT,
         detail: format!("{name}: {error}"),
     })?;
+    Ok(choose(&repo, release, lane)?.2)
+}
+
+/// `release` of `repo` (the latest when `None`), its lane `lane` (the only one when `None`) and
+/// that lane's manifest.
+pub fn choose(
+    repo: &Repo,
+    release: Option<&str>,
+    lane: Option<&str>,
+) -> Result<(String, String, ObjectRef)> {
+    let name = &repo.name;
     let releases = || {
         repo.releases
             .iter()
@@ -105,8 +116,8 @@ pub(crate) fn pick(
             )
         }
     };
-    match repo.lane(Some(&chosen.version), &lane) {
-        Some(manifest) => Ok(manifest.clone()),
+    match chosen.lanes.get(&lane) {
+        Some(manifest) => Ok((chosen.version.clone(), lane, manifest.clone())),
         None => refuse(
             Code::REF_NOT_FOUND,
             format!(

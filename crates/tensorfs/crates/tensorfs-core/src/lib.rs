@@ -18,6 +18,9 @@ mod cbor;
 pub mod checkpoint;
 #[cfg(feature = "store")]
 pub mod checkpoint_root;
+/// The v2 front door the `tfs` CLI and Python share (xs-045 U7).
+#[cfg(feature = "store")]
+pub mod client;
 #[cfg(feature = "store")]
 pub mod corpus;
 #[cfg(feature = "store")]
@@ -30,6 +33,10 @@ pub mod durability;
 #[cfg(feature = "store")]
 pub mod admission;
 pub mod err;
+#[cfg(feature = "store")]
+pub mod export;
+#[cfg(feature = "store")]
+pub mod failure;
 #[cfg(feature = "store")]
 pub mod fetch;
 #[cfg(feature = "store")]

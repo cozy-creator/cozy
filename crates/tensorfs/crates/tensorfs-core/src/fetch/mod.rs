@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub use net::Client;
-pub use origin::{HttpOrigin, Location, Origin};
+pub use origin::{choose, HttpOrigin, Location, Origin};
 pub use policy::SourcePolicy;
 pub use volume::VolumeOrigin;
 

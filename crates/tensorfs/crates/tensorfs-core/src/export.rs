@@ -1,0 +1,318 @@
+//! `tfs export --safetensors`: a checkpoint as the Diffusers/Transformers folder it came from.
+//!
+//! - Every manifest file but the header is written as it is: `model_index.json`, configs,
+//!   tokenizers.
+//! - A component in a folder (it has files there, or `model_index.json` lists it) is written to
+//!   `<component>/<weights>.safetensors`, where `<weights>` is `diffusion_pytorch_model` for a
+//!   Diffusers component and `model` otherwise. Any other component is `<component>.safetensors`
+//!   at the root, which for `model` is a Transformers folder.
+//! - Files are sharded at [`SHARD`] bytes as `<weights>-00001-of-0000N.safetensors` beside the
+//!   standard `<weights>.safetensors.index.json`.
+//! - An encoded tensor `x.weight` keeps its parts: `x.weight` (the `weight` part),
+//!   `x.weight_scale`, `x.weight_scale_2`, `x.input_scale`, and `__metadata__`'s
+//!   `cozytensors.encodings` names each one's scheme and params. With `dequantize`, it is decoded
+//!   into that dtype instead.
+
+use std::collections::BTreeMap;
+use std::fs::{self, File};
+use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
+use std::path::Path;
+
+use serde_json::{json, Map, Value as Json};
+
+use crate::client::io;
+use crate::failure::{fail, Kind, Result};
+use crate::format::layout::natural_cmp;
+use crate::format::{decode, Body, Dtype, Location, PartBytes, HEADER_PATH};
+use crate::store2::Checkpoint;
+
+/// The largest shard, as Diffusers and Transformers write them (20 GB).
+pub const SHARD: u64 = 20_000_000_000;
+
+/// Where one safetensors tensor's bytes come from.
+enum Bytes<'a> {
+    Stored(Location),
+    Decoded { key: &'a str, dtype: Dtype },
+}
+
+struct Entry<'a> {
+    name: String,
+    dtype: Dtype,
+    shape: Vec<u64>,
+    length: u64,
+    bytes: Bytes<'a>,
+}
+
+/// The safetensors name of part `role` of tensor `key`.
+fn part_name(key: &str, role: &str) -> String {
+    match role {
+        "weight" => key.to_owned(),
+        "input_scale" => match key.strip_suffix(".weight") {
+            Some(base) => format!("{base}.input_scale"),
+            None => format!("{key}_input_scale"),
+        },
+        role => format!("{key}_{role}"),
+    }
+}
+
+/// Writes `ck` into `dir` as a Diffusers/Transformers folder; the paths written, relative.
+pub fn safetensors(ck: &Checkpoint, dir: &Path, dequantize: Option<&Dtype>) -> Result<Vec<String>> {
+    if let Some(dtype) = dequantize {
+        if !matches!(dtype, Dtype::F32 | Dtype::BF16 | Dtype::F16) {
+            return fail(
+                Kind::Invalid,
+                format!("dequantize to {dtype}: one of F32, BF16, F16"),
+            );
+        }
+    }
+    let files = &ck.manifest().files;
+    let index: BTreeMap<String, Json> = match files.get("model_index.json") {
+        Some(_) => serde_json::from_slice(&ck.file("model_index.json")?).unwrap_or_default(),
+        None => BTreeMap::new(),
+    };
+    let mut written = Vec::new();
+    for path in files.keys().filter(|p| *p != HEADER_PATH) {
+        let dest = dir.join(path);
+        let parent = dest.parent().expect("a file has a directory");
+        fs::create_dir_all(parent).map_err(|e| io(parent, e))?;
+        fs::write(&dest, ck.file(path)?).map_err(|e| io(&dest, e))?;
+        written.push(path.clone());
+    }
+    for (component, c) in &ck.header().components {
+        let in_folder = index.contains_key(component)
+            || files
+                .keys()
+                .any(|p| p.starts_with(&format!("{component}/")));
+        let (folder, weights) = if in_folder {
+            (format!("{component}/"), weights_name(ck, &index, component))
+        } else {
+            (String::new(), component.clone())
+        };
+        let mut keys: Vec<&String> = c.tensors.keys().collect();
+        keys.sort_by(|a, b| natural_cmp(a, b));
+        let mut entries = Vec::new();
+        let mut encodings = Map::new();
+        for key in keys {
+            let t = &c.tensors[key];
+            match (&t.body, dequantize) {
+                (Body::Data(at), _) => entries.push(Entry {
+                    name: key.clone(),
+                    dtype: t.dtype.clone(),
+                    shape: t.shape.clone(),
+                    length: at.length,
+                    bytes: Bytes::Stored(*at),
+                }),
+                (Body::Encoded { .. }, Some(dtype)) => {
+                    let Some(length) = dtype.byte_len(&t.shape) else {
+                        return fail(
+                            Kind::Invalid,
+                            format!("{component}/{key}: {:?} overflows", t.shape),
+                        );
+                    };
+                    entries.push(Entry {
+                        name: key.clone(),
+                        dtype: dtype.clone(),
+                        shape: t.shape.clone(),
+                        length,
+                        bytes: Bytes::Decoded {
+                            key,
+                            dtype: dtype.clone(),
+                        },
+                    })
+                }
+                (Body::Encoded { encoding, parts }, None) => {
+                    let names: Map<String, Json> = parts
+                        .keys()
+                        .map(|role| (role.clone(), Json::from(part_name(key, role))))
+                        .collect();
+                    encodings.insert(
+                        key.clone(),
+                        json!({"scheme": encoding.scheme, "params": encoding.params, "parts": names}),
+                    );
+                    for (role, p) in parts {
+                        entries.push(Entry {
+                            name: part_name(key, role),
+                            dtype: p.dtype.clone(),
+                            shape: p.shape.clone(),
+                            length: p.length,
+                            bytes: Bytes::Stored(p.at()),
+                        });
+                    }
+                }
+            }
+        }
+        if let Some(e) = entries.iter().find(|e| matches!(e.dtype, Dtype::Other(_))) {
+            return fail(
+                Kind::Unsupported,
+                format!(
+                    "{component}/{}: safetensors has no dtype {}",
+                    e.name, e.dtype
+                ),
+            );
+        }
+        let mut seen = std::collections::HashSet::new();
+        if let Some(e) = entries.iter().find(|e| !seen.insert(e.name.as_str())) {
+            return fail(
+                Kind::Invalid,
+                format!("{component}: two tensors export as {}", e.name),
+            );
+        }
+        let mut metadata = Map::from_iter([("format".to_owned(), Json::from("pt"))]);
+        if !encodings.is_empty() {
+            let text = serde_json::to_string(&encodings).expect("JSON values serialize");
+            metadata.insert("cozytensors.encodings".to_owned(), Json::from(text));
+        }
+        let mut shards: Vec<Vec<Entry>> = vec![vec![]];
+        let mut size = 0;
+        for e in entries {
+            if size > 0 && size + e.length > SHARD {
+                shards.push(vec![]);
+                size = 0;
+            }
+            size += e.length;
+            shards.last_mut().expect("a shard is open").push(e);
+        }
+        let n = shards.len();
+        let mut weight_map = Map::new();
+        let mut total = 0;
+        for (i, shard) in shards.iter().enumerate() {
+            let file = match n {
+                1 => format!("{weights}.safetensors"),
+                _ => format!("{weights}-{:05}-of-{n:05}.safetensors", i + 1),
+            };
+            for e in shard {
+                weight_map.insert(e.name.clone(), Json::from(file.clone()));
+                total += e.length;
+            }
+            write_file(
+                ck,
+                component,
+                shard,
+                &metadata,
+                &dir.join(&folder).join(&file),
+            )?;
+            written.push(format!("{folder}{file}"));
+        }
+        if n > 1 {
+            let file = format!("{folder}{weights}.safetensors.index.json");
+            let doc = json!({"metadata": {"total_size": total}, "weight_map": weight_map});
+            let dest = dir.join(&file);
+            fs::write(&dest, serde_json::to_vec_pretty(&doc).expect("JSON"))
+                .map_err(|e| io(&dest, e))?;
+            written.push(file);
+        }
+    }
+    Ok(written)
+}
+
+/// `diffusion_pytorch_model` for a Diffusers component, `model` for any other.
+fn weights_name(ck: &Checkpoint, index: &BTreeMap<String, Json>, component: &str) -> String {
+    let diffusers = match index
+        .get(component)
+        .and_then(|v| v.get(0))
+        .and_then(Json::as_str)
+    {
+        Some(library) => library == "diffusers",
+        None => ck
+            .file(&format!("{component}/config.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Map<String, Json>>(&b).ok())
+            .is_some_and(|c| c.contains_key("_diffusers_version") || c.contains_key("_class_name")),
+    };
+    if diffusers {
+        "diffusion_pytorch_model"
+    } else {
+        "model"
+    }
+    .to_owned()
+}
+
+fn write_file(
+    ck: &Checkpoint,
+    component: &str,
+    entries: &[Entry],
+    metadata: &Map<String, Json>,
+    dest: &Path,
+) -> Result<()> {
+    let mut header = Map::from_iter([("__metadata__".to_owned(), Json::Object(metadata.clone()))]);
+    let mut offset = 0;
+    for e in entries {
+        header.insert(
+            e.name.clone(),
+            json!({"dtype": e.dtype.name(), "shape": e.shape, "data_offsets": [offset, offset + e.length]}),
+        );
+        offset += e.length;
+    }
+    let mut text = serde_json::to_vec(&header).expect("JSON");
+    text.resize(text.len().next_multiple_of(8), b' ');
+    let parent = dest.parent().expect("a file has a directory");
+    fs::create_dir_all(parent).map_err(|e| io(parent, e))?;
+    let temp = dest.with_extension(format!("tmp-{}", std::process::id()));
+    let mut out = BufWriter::with_capacity(8 << 20, File::create(&temp).map_err(|e| io(&temp, e))?);
+    let wrote = (|| -> Result<()> {
+        out.write_all(&(text.len() as u64).to_le_bytes())?;
+        out.write_all(&text)?;
+        for e in entries {
+            match &e.bytes {
+                Bytes::Stored(at) => copy(ck, at, &mut out)?,
+                Bytes::Decoded { key, dtype } => {
+                    out.write_all(&decode_as(ck, component, key, dtype)?)?
+                }
+            }
+        }
+        out.flush()?;
+        Ok(())
+    })();
+    drop(out);
+    if let Err(e) = wrote.and_then(|()| fs::rename(&temp, dest).map_err(|e| io(dest, e))) {
+        let _ = fs::remove_file(&temp);
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Streams the stored bytes at `at` from their chunk files.
+fn copy(ck: &Checkpoint, at: &Location, out: &mut impl Write) -> Result<()> {
+    for span in ck.header().spans(at) {
+        let path = &ck.chunk_paths()[span.chunk];
+        let mut file = ck.store().file(&ck.header().chunks[span.chunk])?;
+        file.seek(SeekFrom::Start(span.start))
+            .map_err(|e| io(path, e))?;
+        let n = io::copy(&mut file.take(span.length), out).map_err(|e| io(path, e))?;
+        if n != span.length {
+            return fail(
+                Kind::Integrity,
+                format!("{}: {n} of {} bytes", path.display(), span.length),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// An encoded tensor decoded into `dtype` (rounded once, from the scheme's f32 values).
+fn decode_as(ck: &Checkpoint, component: &str, key: &str, dtype: &Dtype) -> Result<Vec<u8>> {
+    let t = ck.tensor(component, key)?;
+    let Body::Encoded { encoding, parts } = &t.body else {
+        unreachable!("only encoded tensors are decoded")
+    };
+    let bytes = parts
+        .values()
+        .map(|p| {
+            let mut buf = vec![0; p.length as usize];
+            ck.bytes_into(&p.at(), &mut buf).map(|()| buf)
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let views = parts
+        .iter()
+        .zip(&bytes)
+        .map(|((role, p), b)| {
+            let view = PartBytes {
+                dtype: &p.dtype,
+                shape: &p.shape,
+                bytes: b,
+            };
+            (role.as_str(), view)
+        })
+        .collect();
+    Ok(decode(dtype, &t.shape, encoding, &views)?)
+}

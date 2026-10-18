@@ -7,7 +7,7 @@ use tensorfs_core::checkpoint;
 use tensorfs_core::ids::{hex64, Doc, ObjectRef};
 use tensorfs_core::store::Store;
 
-use crate::{bail, flag, Flags};
+use super::{bail, flag, Flags};
 
 fn open(root: &Path, hex: &str) -> tensorfs_core::err::Result<(Store, ObjectRef)> {
     let store = Store::open(root)?;

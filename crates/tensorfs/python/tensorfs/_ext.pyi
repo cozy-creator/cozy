@@ -62,6 +62,8 @@ __version__: str
 
 #: `tensorfs._ext.plane`, typed in full by `plane.pyi` (the `tensorfs.plane` facade).
 plane: ModuleType
+#: `tensorfs._ext.v2`, typed in full by `v2.pyi` (the `tensorfs.v2` facade).
+v2: ModuleType
 
 StrPath = str | PathLike[str]
 

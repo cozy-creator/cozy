@@ -14,7 +14,7 @@ use tensorfs_core::storage::{
     self, Census, CheckpointFacts as CensusCheckpointFacts, InventoryEntry, StagedCheckpoint,
 };
 
-use crate::{bail, flag, Flags};
+use super::{bail, flag, Flags};
 
 pub fn cmd_manifest_build(entries_path: &Path, flags: &Flags) -> ExitCode {
     let Some(output) = flag(flags, "out") else {

@@ -72,6 +72,43 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked -p tensorfs-core --test pull --test pull_tail -- --test-threads=1 --nocapture
 
+  # Release gate (xs-045): the v2 store and writer under kill -9, racing GC and forking children
+  # (strace counts the durability syscalls), and the `tfs` CLI over real stores.
+  store:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get install -y strace
+      - run: cargo test --locked -p tensorfs-core --features faults --test store_v2 --test writer --test tfs_cli -- --test-threads=2
+
+  # Release gate (xs-045): imports through the table engine, from local files, Hugging Face,
+  # GitHub and Civitai.
+  import:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked -p tensorfs-core --test import -- --test-threads=2
+
+  # Release gate (xs-045, design §11): the standalone e2e on the Linux wheel in a fresh venv, with no
+  # Cozy and no account: import a tiny HF SDXL, export it for Diffusers (same image as upstream),
+  # serve it as a static origin and pull it into a second store, by the CLI and by Python.
+  e2e:
+    needs: wheel
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheel-linux-x86_64
+          path: wheel
+      - uses: astral-sh/setup-uv@v7
+      - run: crates/tensorfs/scripts/e2e.sh wheel/*.whl "$RUNNER_TEMP/e2e"
+
   wheel:
     name: wheel ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
@@ -126,7 +163,7 @@ jobs:
         run: |
           python -m pip install dist/*.whl
           cd "$RUNNER_TEMP"
-          python -c 'import tensorfs, tensorfs.plane; print(tensorfs.__version__)'
+          python -c 'import tensorfs, tensorfs.plane, tensorfs.v2; print(tensorfs.__version__)'
           tfs version
       # The whole wheel's contract (version, executable, platform tag), where it is defined: Linux.
       - if: runner.os == 'Linux'
@@ -162,7 +199,7 @@ jobs:
       - run: |
           python -m pip install crates/tensorfs/dist/*.tar.gz
           cd "$RUNNER_TEMP"
-          python -c 'import tensorfs, tensorfs.plane; print(tensorfs.__version__)'
+          python -c 'import tensorfs, tensorfs.plane, tensorfs.v2; print(tensorfs.__version__)'
       - uses: actions/upload-artifact@v4
         with:
           name: wheel-sdist
@@ -173,7 +210,7 @@ jobs:
   # Every platform and the sdist, or nothing.
   publish:
     if: inputs.publish && !inputs.dev
-    needs: [gate, fetch-faults, download-tail, pull, wheel, sdist]
+    needs: [gate, fetch-faults, download-tail, pull, store, import, e2e, wheel, sdist]
     runs-on: ubuntu-24.04
     environment: pypi
     # Hang bound, not a work budget.

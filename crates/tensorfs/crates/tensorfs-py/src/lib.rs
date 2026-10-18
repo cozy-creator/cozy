@@ -17,6 +17,8 @@ mod readplan;
 mod serve;
 #[cfg(feature = "store")]
 mod store;
+#[cfg(feature = "store")]
+mod v2;
 
 use pyo3::prelude::*;
 
@@ -67,5 +69,5 @@ fn store_api(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<store::PyOperation>()?;
     m.add_class::<store::PyDerivedWriter>()?;
     m.add_class::<store::PyLease>()?;
-    Ok(())
+    v2::install(m)
 }

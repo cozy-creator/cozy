@@ -11,7 +11,7 @@ use tensorfs_core::fetch_v1::{self as fetch, FetchPlan, Fetcher, Plain, Priority
 use tensorfs_core::store::Store;
 use tensorfs_core::transport::{self, PullCancellation, SourcePolicy};
 
-use crate::{bail, flag, flag_num, flag_on, Flags};
+use super::{bail, flag, flag_num, flag_on, Flags};
 
 pub fn cmd_fetch(root: &Path, refspec: &str, flags: &Flags) -> ExitCode {
     let Some(hub) = flag(flags, "hub") else {

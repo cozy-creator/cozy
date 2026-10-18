@@ -21,7 +21,7 @@ use tensorfs_core::sha256;
 use tensorfs_core::spec::EncodingSpec;
 use tensorfs_core::store::Store;
 
-use crate::{bail, flag_num, flag_on, peak_rss_kb, Flags};
+use super::{bail, flag_num, flag_on, peak_rss_kb, Flags};
 
 // ------------------------------------------------------------------ tensor bytes
 

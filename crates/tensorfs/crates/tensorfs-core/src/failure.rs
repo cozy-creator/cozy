@@ -1,0 +1,166 @@
+//! The error families every v2 surface reports (the `tfs` CLI's `--json`, Python): eleven, each
+//! with a stable code. The cause stays in the detail.
+
+use crate::err::{Code, Refusal};
+use crate::{format, store2};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// A document, argument or tensor breaks the format or a grammar.
+    Invalid,
+    /// Another document kind or major version.
+    Format,
+    /// No such ref, release, lane, component, tensor, file or object.
+    NotFound,
+    /// Bytes that do not match their digest or length.
+    Integrity,
+    /// The tensor reads, but its scheme has no decoder here.
+    UnknownScheme,
+    /// A known scheme whose parts or params break its definition.
+    Decode,
+    Io,
+    /// The disk or a quota is full.
+    Full,
+    /// A transfer failed or stalled.
+    Network,
+    /// Refused: egress policy, credentials, TLS trust or the server.
+    Denied,
+    /// A source or target this build cannot represent.
+    Unsupported,
+}
+
+impl Kind {
+    pub const ALL: [Kind; 11] = [
+        Kind::Invalid,
+        Kind::Format,
+        Kind::NotFound,
+        Kind::Integrity,
+        Kind::UnknownScheme,
+        Kind::Decode,
+        Kind::Io,
+        Kind::Full,
+        Kind::Network,
+        Kind::Denied,
+        Kind::Unsupported,
+    ];
+
+    pub fn code(self) -> &'static str {
+        match self {
+            Kind::Invalid => "invalid",
+            Kind::Format => "format",
+            Kind::NotFound => "not_found",
+            Kind::Integrity => "integrity",
+            Kind::UnknownScheme => "unknown_scheme",
+            Kind::Decode => "decode",
+            Kind::Io => "io",
+            Kind::Full => "full",
+            Kind::Network => "network",
+            Kind::Denied => "denied",
+            Kind::Unsupported => "unsupported",
+        }
+    }
+}
+
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("{}: {detail}", kind.code())]
+pub struct Failure {
+    pub kind: Kind,
+    pub detail: String,
+}
+
+pub type Result<T> = std::result::Result<T, Failure>;
+
+pub fn fail<T>(kind: Kind, detail: impl Into<String>) -> Result<T> {
+    Err(Failure {
+        kind,
+        detail: detail.into(),
+    })
+}
+
+impl From<Refusal> for Failure {
+    fn from(r: Refusal) -> Failure {
+        use Code::*;
+        let kind = match r.code {
+            UNKNOWN_FORMAT | STORE_ERA => Kind::Format,
+            OBJECT_ABSENT | REF_NOT_FOUND | RELEASE_ABSENT | REPOSITORY_ABSENT
+            | CHECKPOINT_ABSENT | MISSING_TENSOR | MISSING_COMPONENT | STORE_ROOT_ABSENT
+            | ROOT_ABSENT => Kind::NotFound,
+            OBJECT_ID_MISMATCH
+            | OBJECT_CORRUPT
+            | LENGTH_MISMATCH
+            | WHOLE_DIGEST_MISMATCH
+            | PATH_DIGEST_MISMATCH
+            | SHORT_READ => Kind::Integrity,
+            UNKNOWN_ENCODING | UNREGISTERED_ENCODING => Kind::UnknownScheme,
+            ENCODING_MISMATCH => Kind::Decode,
+            IO_FAILED | NOT_REGULAR_FILE | PERMISSION_DENIED | FD_HEADROOM | STORE_BUSY => Kind::Io,
+            CAPACITY_EXHAUSTED | QUOTA_EXHAUSTED => Kind::Full,
+            TRANSFER_FAILED | HUB_UNREACHABLE | STALLED | DEADLINE_EXCEEDED => Kind::Network,
+            SOURCE_NOT_ALLOWED | REDIRECT_REFUSED | HUB_REFUSED | TLS_UNTRUSTED
+            | CREDENTIAL_REQUIRED => Kind::Denied,
+            PICKLE_REFUSED
+            | ARCHIVE_REFUSED
+            | GGUF_REFUSED
+            | AMBIGUOUS_CLASSIFICATION
+            | UNREGISTERED_FINGERPRINT
+            | CONVERTS_NOTHING
+            | MISSING_COMPANION_ROLE
+            | ADAPTER_TARGET_UNSUPPORTED
+            | CARRIER_HEADER_CAP
+            | CARRIER_GEOMETRY
+            | CARRIER_TRUNCATED
+            | CARRIER_OVERLAP => Kind::Unsupported,
+            _ => Kind::Invalid,
+        };
+        Failure {
+            kind,
+            detail: format!("{}: {}", r.code.as_str(), r.detail),
+        }
+    }
+}
+
+impl From<format::Error> for Failure {
+    fn from(e: format::Error) -> Failure {
+        let kind = match e {
+            format::Error::Invalid(_) => Kind::Invalid,
+            format::Error::Format { .. } => Kind::Format,
+            format::Error::UnknownScheme(_) => Kind::UnknownScheme,
+            format::Error::Decode(_) => Kind::Decode,
+        };
+        Failure {
+            kind,
+            detail: e.to_string(),
+        }
+    }
+}
+
+impl From<store2::Error> for Failure {
+    fn from(e: store2::Error) -> Failure {
+        let kind = match &e {
+            store2::Error::Format(f) => return f.clone().into(),
+            store2::Error::Io { .. } => Kind::Io,
+            store2::Error::Full { .. } => Kind::Full,
+            store2::Error::Absent(_) => Kind::NotFound,
+            store2::Error::Mismatch { .. } => Kind::Integrity,
+            store2::Error::Invalid { .. } => Kind::Invalid,
+        };
+        Failure {
+            kind,
+            detail: e.to_string(),
+        }
+    }
+}
+
+impl From<std::io::Error> for Failure {
+    fn from(e: std::io::Error) -> Failure {
+        let kind = match e.kind() {
+            std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded => Kind::Full,
+            std::io::ErrorKind::NotFound => Kind::NotFound,
+            _ => Kind::Io,
+        };
+        Failure {
+            kind,
+            detail: e.to_string(),
+        }
+    }
+}
