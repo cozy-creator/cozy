@@ -19,9 +19,8 @@ use std::{
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tensorfs_core::{
-    catalog::WriterGuard, ids::ObjectRef, object_roots, sha256, store::Fault, store::Store,
-};
+use crate::storage::{self, pin, Disk, Store};
+use tensorfs_core::{format::ObjectRef, sha256, store2::Error};
 
 /// The largest memoized result record this machine holds for reuse.
 const MEMO_RESULT_BYTES: usize = 48 << 10;
@@ -157,55 +156,42 @@ impl Objects {
     pub(crate) fn guard(&self) -> MutexGuard<'_, ()> {
         self.engine.object_custody.lock().unwrap()
     }
-    /// Excludes the store's GC between an object's put and its root.
-    pub(crate) fn writer_guard(&self) -> io::Result<WriterGuard> {
-        WriterGuard::acquire(self.store.root()).map_err(io::Error::other)
-    }
-    /// Roots `objects` in the store; called with `guard` and `writer_guard` held.
+    /// Pins `objects` in the store, last used now; called with `guard` held.
     pub(crate) fn retain(&self, objects: &[ObjectRef]) -> io::Result<()> {
         for object in objects {
-            object_roots::retain(&self.store, object).map_err(io::Error::other)?;
+            storage::hold(&self.store, &pin::object(&object.sha256), vec![object.clone()], None)?;
         }
         Ok(())
     }
 
-    /// Releases the roots of objects no unfinished run names and nothing used for the TTL,
+    /// Releases the pins of objects no unfinished run names and nothing used for the TTL,
     /// or for `IDLE` while the store's disk is low. Their bytes are then the store GC's.
     pub fn sweep(&self) -> io::Result<usize> {
-        let disk =
-            tensorfs_core::admission::Disk::measure(self.store.root()).map_err(io::Error::other)?;
-        self.release(match disk.short() {
+        self.release(match Disk::measure(self.store.root())?.short() {
             Some(_) => crate::reclaim::IDLE,
             None => crate::reclaim::TTL,
         })
     }
 
-    /// `sweep` over roots unused for `unused`. A root written just before a crash has no
-    /// journal row yet: it ages from its own mtime.
+    /// `sweep` over pins unused for `unused`. A pin written just before a crash has no journal
+    /// row yet: it ages from its own last use.
     pub fn release(&self, unused: Duration) -> io::Result<usize> {
         let _custody = self.guard();
         let before = SystemTime::now().checked_sub(unused).unwrap_or(UNIX_EPOCH);
-        let before_ms = before
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64;
+        let since = before.duration_since(UNIX_EPOCH).unwrap_or_default();
         let mut released = 0;
-        for object in object_roots::list(&self.store).map_err(io::Error::other)? {
-            let root = self
-                .store
-                .root()
-                .join("roots/objects")
-                .join(format!("{}.json", object.sha256));
-            if fs::metadata(root)?.modified()? >= before {
+        for (id, held) in self.store.pins().map_err(storage::io_error)? {
+            let Some(sha256) = id.strip_prefix("obj-") else {
+                continue;
+            };
+            if held.last_use > since.as_secs() {
                 continue;
             }
-            if self
-                .engine
-                .with_journal(|j| j.object_releasable(&object.sha256, before_ms))?
-                && object_roots::remove(&self.store, &object.sha256).map_err(io::Error::other)?
+            if self.engine.with_journal(|j| j.object_releasable(sha256, since.as_millis() as i64))?
+                && self.store.unpin_unused(&id, held.last_use).map_err(storage::io_error)?
             {
                 // A memo answered from this file cannot be answered any more.
-                self.engine.with_journal(|j| j.drop_held_memos(&object.sha256))?;
+                self.engine.with_journal(|j| j.drop_held_memos(sha256))?;
                 released += 1;
             }
         }
@@ -220,7 +206,7 @@ impl Objects {
         let Some(length) = self.engine.with_journal(|j| j.object(actor, &hex))? else {
             return Ok(None);
         };
-        let path = self.store.object_path(&hex);
+        let path = self.store.path(&ObjectRef { sha256: hex, length }).map_err(storage::io_error)?;
         Ok(path.is_file().then_some((path, length)))
     }
 
@@ -297,11 +283,8 @@ impl Objects {
     /// later run of that signer may be handed it.
     pub fn adopt(&self, actor: &str, parent: &str, file: &Path, object: &ObjectRef) -> io::Result<()> {
         let _custody = self.guard();
-        let _writer = self.writer_guard()?;
-        if !crate::products::held(&self.store, object) {
-            self.store
-                .put_file(file, Some(object), &Fault::default())
-                .map_err(io::Error::other)?;
+        if !self.store.reuse(object).map_err(storage::io_error)? {
+            self.store.put(File::open(file)?, Some(object)).map_err(storage::io_error)?;
         }
         self.retain(std::slice::from_ref(object))?;
         self.engine
@@ -324,7 +307,6 @@ impl Objects {
             sha256: digest["sha256:".len()..].to_string(),
             length,
         };
-        let _writer = self.writer_guard()?;
         self.retain(std::slice::from_ref(&object))?;
         self.engine.with_journal(|j| j.bind_object(actor, &object))?;
         Ok(Some(length))
@@ -382,8 +364,7 @@ impl Objects {
         };
         file.set_len(length)?;
         let missing = length - held.iter().map(|(s, e)| e - s).sum::<u64>();
-        self.store
-            .admits(missing)
+        storage::admits(&self.store, missing)
             .map_err(|e| refused("machine_disk_full", format!("no room for the object: {e}")))?;
         let landed = tokio::sync::watch::Sender::new(length - missing);
         let upload = Arc::new(Upload {
@@ -417,23 +398,21 @@ impl Objects {
             return Ok(held);
         }
         let _custody = self.guard();
-        let _writer = self.writer_guard()?;
         upload.ended.store(true, Ordering::Release);
         self.uploads.lock().unwrap().remove(&upload.part);
-        let stored = (self.store).put_file(&upload.part, Some(&upload.object), &Fault::default());
+        let stored = File::open(&upload.part).map_err(Refused::from).and_then(|part| {
+            self.store.put(part, Some(&upload.object)).map_err(|e| {
+                let code = match e {
+                    Error::Full { .. } => "machine_disk_full",
+                    Error::Mismatch { .. } => "object_digest_mismatch",
+                    _ => "object_storage_failed",
+                };
+                refused(code, e.to_string())
+            })
+        });
         let _ = fs::remove_file(&upload.part);
         let _ = fs::remove_file(held_path(&upload.part));
-        stored.map_err(|e| {
-            refused(
-                match e.code {
-                    tensorfs_core::err::Code::CAPACITY_EXHAUSTED => "machine_disk_full",
-                    tensorfs_core::err::Code::OBJECT_ID_MISMATCH
-                    | tensorfs_core::err::Code::LENGTH_MISMATCH => "object_digest_mismatch",
-                    _ => "object_storage_failed",
-                },
-                e.to_string(),
-            )
-        })?;
+        stored?;
         self.retain(std::slice::from_ref(&upload.object))?;
         self.engine
             .with_journal(|j| j.bind_object(&upload.actor, &upload.object))?;
@@ -476,7 +455,7 @@ mod tests {
     fn objects(root: &Path) -> Objects {
         let service =
             crate::service::Service::open(&root.join("state"), &root.join("g"), 1).unwrap();
-        let store = Arc::new(Store::ensure(&root.join("tensorfs")).unwrap());
+        let store = storage::open(&root.join("tensorfs")).unwrap();
         Objects::new(&root.join("writes"), store, service.engine.clone()).unwrap()
     }
 

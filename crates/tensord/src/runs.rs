@@ -17,7 +17,8 @@ use crate::{
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde_json::{json, Value};
-use tensorfs_core::{ids::ObjectRef, transport::PullCancellation};
+use crate::stop::Stop;
+use tensorfs_core::format::ObjectRef;
 use std::{
     collections::HashMap,
     io,
@@ -209,9 +210,8 @@ impl Runs {
                 "the payload is a JSON object of the function's parameters",
             ));
         }
-        // Store GC and root release stay out from validation through acceptance.
+        // Pin release stays out from validation through acceptance.
         let custody = self.objects.guard();
-        let writer = self.objects.writer_guard()?;
         let mut references = Vec::new();
         let unwritten = |input: &str| refused("input_unwritten", format!("input {input} was not written to this machine"));
         for input in &spec.inputs {
@@ -289,7 +289,6 @@ impl Runs {
                 io::ErrorKind::AlreadyExists => refused("run_id_conflict", e.to_string()),
                 _ => Refused::from(e),
             })?;
-        drop(writer);
         drop(custody);
         if new {
             let (this, actor, run) = (self.clone(), actor.to_string(), record.id.clone());
@@ -382,7 +381,7 @@ impl Runs {
                 (made.manifest, row)
             } else if let (Some(name), None) = (choice.repository.strip_prefix("local/"), &choice.manifest) {
                 // A local alias: the model this machine's store holds under that name.
-                let (manifest, _) = tensorfs_core::source_model::held(publisher.store(), name)
+                let manifest = crate::storage::local(publisher.store(), name)
                     .map_err(|e| refused("checkpoint_absent", e.to_string()))?
                     .ok_or_else(|| refused("checkpoint_absent", format!("this machine holds no local/{name}")))?;
                 let row = json!({"parameter": choice.parameter,
@@ -394,10 +393,10 @@ impl Runs {
                     refused("invalid_request", format!("model choice {:?} names no model", choice.parameter))
                 })?;
                 let sha256 = tensorfs_core::sha256::hex(&manifest.digest);
-                let length = std::fs::metadata(publisher.store().manifest_path(&sha256))
+                let held = crate::storage::held(publisher.store(), &sha256)
                     .map_err(|_| refused("checkpoint_absent", format!("this machine holds no checkpoint sha256:{sha256}")))?;
                 let row = json!({"parameter": choice.parameter, "manifest": format!("sha256:{sha256}")});
-                (ObjectRef { sha256, length: length.len() }, row)
+                (held, row)
             } else {
                 // A Hub checkpoint by name, or the owner's by hash; no lane is the one this
                 // machine's GPUs would run at the run's bits (`precision`).
@@ -410,26 +409,15 @@ impl Runs {
                 let (named, (hub, volume)) = publisher.download(&self.service, hub_access()?, named, &lanes, &spec.catalog_revision, stop, &|done, total| {
                     observe(&stage, done, total)
                 })?;
-                let sha256 = named.manifest.trim_start_matches("sha256:").to_string();
-                let length = std::fs::metadata(publisher.store().manifest_path(&sha256))?.len();
+                let held = crate::storage::held(publisher.store(), &named.manifest)?;
                 let row = json!({"parameter": choice.parameter, "repository": named.repository,
                     "release": named.release, "lane": named.lane, "manifest": named.manifest,
                     "bytes": {"hub": hub, "volume": volume}});
-                (ObjectRef { sha256, length }, row)
+                (held, row)
             };
             if let Some(name) = destination.strip_prefix("local/") {
                 // A local alias (`cozy model download … local/name`): the model, held by name.
-                let repo = tensorfs_core::repository::RepositoryName::new("local", name)
-                    .map_err(|e| refused("invalid_request", e.to_string()))?;
-                let current = std::fs::read(publisher.store().repository_path(&repo)).ok();
-                let mutation = tensorfs_core::repository::Mutation::ReplaceLocal {
-                    repo,
-                    version: manifest.sha256.clone(),
-                    manifest: manifest.clone(),
-                };
-                publisher
-                    .store()
-                    .apply_repository(current.as_deref(), &mutation, &Default::default())
+                crate::storage::set_local(publisher.store(), name, &manifest)
                     .map_err(|e| refused("local_alias_refused", e.to_string()))?;
                 row["published"] = json!({"destination": destination, "checkpoint": manifest.id(), "converged": false});
             } else if !destination.is_empty() {
@@ -444,7 +432,7 @@ impl Runs {
                 );
                 let stage = format!("uploading to {destination}");
                 // A cancel stops the push; only finalizing, which publishes, cannot be taken back.
-                let published = publishing.publish(&hub::Publication {
+                let published = publishing.publish(&crate::origin::Publication {
                     store: publisher.store(),
                     destination,
                     manifest: &manifest,
@@ -578,7 +566,7 @@ impl Runs {
         if let (false, Some(gpu)) = (spec.warm, self.service.gpu()) {
             ahead = plan.as_ref().zip(self.publisher.as_ref()).map(|(plan, publisher)| {
                 let order = self.service.engine.get(id).map_or(u64::MAX, |record| record.root_seq());
-                let fetch = crate::access::Fetch::new(publisher.store().clone(), hub.clone(), plan.manifests(), order);
+                let fetch = crate::access::Fetch::new(publisher.machine().clone(), hub.clone(), plan.manifests(), order);
                 if let Err(error) = fetch.ahead(&plan.upfront()) {
                     tracing::warn!("run {id}: its weights' early fetch: {error}");
                 }
@@ -632,7 +620,7 @@ impl Runs {
             // A function's warm run ends holding what its constructions read (`downloaded`).
             let mut moved = (0, 0);
             if let (Some(plan), Some(publisher)) = (&plan, &self.publisher) {
-                let fetch = crate::access::Fetch::new(publisher.store().clone(), hub.clone(), plan.manifests(), u64::MAX);
+                let fetch = crate::access::Fetch::new(publisher.machine().clone(), hub.clone(), plan.manifests(), u64::MAX);
                 let report = |done, total| observe("downloading its weights", done, total);
                 moved = fetch.download(&plan.upfront(), &stoppable.stop, &report).map_err(|e| match stoppable.stop.is_cancelled() {
                     true => refused(crate::published::CANCELED, "the run was canceled while it downloaded"),
@@ -811,7 +799,7 @@ impl Runs {
                 let held = self.service.catalog.resolve(&installation.generation)?;
                 // A member's weights come under the warm run's access, after every run's.
                 let fetch = self.publisher.as_ref().zip(plan.as_ref()).map(|(publisher, plan)| {
-                    crate::access::Fetch::new(publisher.store().clone(), hub.clone(), plan.manifests(), u64::MAX)
+                    crate::access::Fetch::new(publisher.machine().clone(), hub.clone(), plan.manifests(), u64::MAX)
                 });
                 members.push(Member::new(held, plan, item.level, fetch));
             }
@@ -950,7 +938,7 @@ impl Runs {
         choices: &[domain::ModelChoice],
         bits: u32,
         observe: Option<crate::published::Observer>,
-        stop: Option<&PullCancellation>,
+        stop: Option<&Stop>,
     ) -> Result<(Installation, Option<crate::gpu_service::Plan>, Vec<String>), Refused> {
         let needs_hub = held
             .as_ref()
@@ -1141,8 +1129,10 @@ impl Runs {
                         Ok(held) => {
                             // Its weights come after its root's own, under the child's access.
                             let hub = spec.hub.clone().or_else(|| runs.own_hub.clone());
-                            let fetch = crate::access::Fetch::new(gpu.store().clone(), hub, plan.manifests(), root);
-                            gpu.prefetch(&runs.service.engine, held, plan, (root, family.clone()), owner.clone(), fetch)
+                            if let Some(publisher) = &runs.publisher {
+                                let fetch = crate::access::Fetch::new(publisher.machine().clone(), hub, plan.manifests(), root);
+                                gpu.prefetch(&runs.service.engine, held, plan, (root, family.clone()), owner.clone(), fetch)
+                            }
                         }
                         Err(error) => tracing::warn!("prefetch of {entrypoint}: {error}"),
                     }
@@ -1224,7 +1214,7 @@ mod tests {
     use super::*;
     use crate::{api::install::InstallerConfig, execution::Engine, journal::State};
     use std::{fs, path::Path, process::Command, time::Duration};
-    use tensorfs_core::{sha256, store::Store};
+    use tensorfs_core::sha256;
 
     /// The store keeps every checkpoint an unfinished run's plan reads (its raw sources too);
     /// a plan that cannot be read stops store GC for that pass.
@@ -1232,8 +1222,8 @@ mod tests {
     fn unfinished_runs_keep_their_checkpoints_and_an_unreadable_plan_stops_store_gc_for_a_pass() {
         let root = std::env::temp_dir().join(format!("cm-keep-list-{}", uuid::Uuid::new_v4()));
         let service = Service::open(&root.join("state"), &root.join("generations"), 1).unwrap();
-        let store = Arc::new(Store::ensure(&root.join("store")).unwrap());
-        let publisher = Publisher::new(&root.join("published"), Default::default(), store.clone()).unwrap();
+        let store = crate::storage::open(&root.join("store")).unwrap();
+        let publisher = Publisher::new(&root.join("published"), Default::default(), crate::origin::Machine::new(store.clone(), None).unwrap()).unwrap();
         service.configure_publisher(publisher.clone());
         drop(store);
         service.engine.bind_installation(Installation {
@@ -1367,7 +1357,7 @@ mod tests {
             interface:serde_json::to_vec(&interface).unwrap(),
             hub: String::new(),
         }).unwrap();
-        let store = Arc::new(Store::ensure(&root.join("store")).unwrap());
+        let store = crate::storage::open(&root.join("store")).unwrap();
         let objects = Arc::new(Objects::new(&root.join("writes"), store, service.engine.clone()).unwrap());
         let runs = Runs { service: service.clone(), objects, publisher: None, local: None,
             own_hub: None, leaf: None, contexts: Default::default() };
@@ -1534,7 +1524,7 @@ mod tests {
             .unwrap();
         let state = root.join("state");
         let service = Service::open(&state, &root.join("generations"), 1).unwrap();
-        let store = Arc::new(Store::ensure(&state.join("tensorfs")).unwrap());
+        let store = crate::storage::open(&state.join("tensorfs")).unwrap();
         let objects =
             Arc::new(Objects::new(&root.join("writes"), store.clone(), service.engine.clone()).unwrap());
         let local = LocalSources::new(
@@ -1564,7 +1554,7 @@ mod tests {
         });
         let config = crate::gpu_service::GpuConfig::deviceless(&root.join("home")).unwrap();
         service.configure_pool(crate::gpu_service::Pool::new(&root.join("pool"), config, store.clone()).unwrap()).unwrap();
-        crate::calls::Calls::configure(&service, store, Some(&runs)).unwrap();
+        crate::calls::Calls::configure(&service, crate::origin::Machine::new(store, None).unwrap(), Some(&runs)).unwrap();
         (runs, objects)
     }
 
@@ -1746,7 +1736,7 @@ mod tests {
             "callees":[{"distribution":"callee","package":"second/callee","version":"2.0.0",
                 "application":"callee:app","interface":callee}]
         }).to_string()).unwrap();
-        let store = Arc::new(Store::ensure(&root.join("store")).unwrap());
+        let store = crate::storage::open(&root.join("store")).unwrap();
         let objects = Arc::new(Objects::new(&root.join("writes"), store, service.engine.clone()).unwrap());
         let runs = Runs { service: service.clone(), objects, publisher: None, local: None,
             own_hub: None, leaf: None, contexts: Default::default() };

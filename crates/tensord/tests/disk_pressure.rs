@@ -17,12 +17,8 @@ use std::{
     sync::Arc,
     time::SystemTime,
 };
-use tensorfs_core::{
-    ids::ObjectRef,
-    manifest::{Draft, Entry},
-    repository::{Mutation, RepositoryName},
-    store::{Fault, Store},
-};
+use tensord::storage::{self, Store};
+use tensorfs_core::format::{Manifest, Metadata, ObjectRef};
 
 const MIB: u64 = 1 << 20;
 const CAPACITY: u64 = 100 << 30;
@@ -43,7 +39,7 @@ impl Fixture {
         let kernels = KernelCaches {
             root: root.join("kernels"),
         };
-        let store = Store::ensure(&root.join("store")).unwrap();
+        let store = storage::open(&root.join("store")).unwrap().as_ref().clone().with_grace(std::time::Duration::ZERO);
         Self {
             root,
             engine,
@@ -95,44 +91,14 @@ impl Fixture {
         fs::write(&log, vec![4u8; MIB as usize]).unwrap();
         (result, log)
     }
-    /// A model the store cached from a Hub: one object under one repository.
+    /// A model the store cached from a Hub: one object, pinned as a pulled checkpoint.
     fn model(&self, name: &str, mib: u64) -> (ObjectRef, String) {
         let body = vec![name.as_bytes()[0]; (mib * MIB) as usize];
-        let object = self
-            .store
-            .put_stream(&mut body.as_slice(), None, &Fault::default())
-            .unwrap()
-            .obj;
-        let entries = vec![("model.bin".to_string(), Entry::File(object.clone()))];
-        let manifest = self
-            .store
-            .put_manifest(&Draft { entries }.seal().unwrap())
-            .unwrap()
-            .obj;
-        let repo = RepositoryName::new("acme", name).unwrap();
-        let put = Mutation::PutCheckpoint {
-            repo,
-            manifest: manifest.clone(),
-        };
-        self.store
-            .apply_repository(None, &put, &Fault::default())
-            .unwrap();
-        // The transport's receipt makes a repository a cache root. No Hub serves this test,
-        // so the receipt (the repository document's digest) is written here.
-        let document = fs::read(
-            self.store
-                .root()
-                .join("repos/acme")
-                .join(format!("{name}.json")),
-        )
-        .unwrap();
-        let receipt = self.store.root().join("tmp/cache-roots/acme");
-        fs::create_dir_all(&receipt).unwrap();
-        fs::write(
-            receipt.join(name),
-            tensorfs_core::sha256::hex_digest(&document),
-        )
-        .unwrap();
+        let object = self.store.put_bytes(&body).unwrap();
+        let files = [("model.bin".to_string(), object.clone())].into();
+        let manifest = Manifest { files, metadata: Metadata::new() };
+        let manifest = self.store.put_bytes(&manifest.to_json().unwrap()).unwrap();
+        storage::hold(&self.store, &storage::pin::model(&manifest.sha256), vec![manifest.clone()], None).unwrap();
         (object, manifest.id())
     }
     /// A disk `short` bytes from leaving its reserve, gaining whatever this fixture frees.
@@ -321,12 +287,8 @@ fn a_covering_plan_drops_results_logs_generations_then_kernels() {
 #[test]
 fn models_go_after_local_caches_and_before_kernels() {
     let fixture = Fixture::new();
-    let present = |object: &ObjectRef| fixture.store.object_path(&object.sha256).is_file();
-    let garbage = fixture
-        .store
-        .put_stream(&mut &[9u8; 4096][..], None, &Fault::default())
-        .unwrap()
-        .obj;
+    let present = |object: &ObjectRef| storage::present(&fixture.store, object);
+    let garbage = fixture.store.put_bytes(&[9u8; 4096]).unwrap();
     let (model, manifest) = fixture.model("unused", 4);
     let (generation, kernel) = (fixture.generation('a'), fixture.kernel("u1", "compiled"));
     // A model an unfinished run names is kept, and what remains cannot cover three

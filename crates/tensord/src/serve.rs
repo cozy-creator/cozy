@@ -6,10 +6,7 @@ use crate::{
 };
 use std::{io, path::PathBuf, process::ExitCode, sync::Arc};
 use fs2::FileExt;
-use tensorfs_core::{
-    fetch_v1::{Fetcher, Volume},
-    store::Store,
-};
+use crate::{origin::Machine, storage::Store};
 
 /// `cozy machine serve --rental|--persistent`, from the arguments after `machine`: this
 /// computer's or a pod's machine, until it stops.
@@ -168,6 +165,7 @@ pub fn dev(args: Dev) -> io::Result<()> {
     let root = args.state;
     let generations = args.generations.unwrap_or_else(|| root.join("generations"));
     let (_owned, store) = own(&root, &root.join("tensorfs"))?;
+    let machine = Machine::new(store.clone(), None)?;
     let service = crate::service::Service::open(&root, &generations, args.cpu_parallelism)?;
     let pool = match args.gpu_config {
         Some(config) => crate::gpu_service::GpuConfig::load(&config)?,
@@ -191,11 +189,11 @@ pub fn dev(args: Dev) -> io::Result<()> {
     match (args.machine_config, args.listen) {
         (Some(config), Some(listen)) => {
             let identity = crate::api::MachineIdentity::retained(&crate::api::identity::MachineConfig::load(&config)?)?;
-            start_api(&root, &generations, identity, std::net::TcpListener::bind(listen)?, &store, &service,
+            start_api(&root, &generations, identity, std::net::TcpListener::bind(listen)?, &store, &machine, &service,
                 args.installer_python, args.client_wheel, args.package_python, sdk, None, None)?
         }
         (None, None) => {
-            crate::calls::Calls::configure(&service, store.clone(), None)?;
+            crate::calls::Calls::configure(&service, machine.clone(), None)?;
         }
         _ => return Err(io::Error::other("--machine-config and --listen are required together")),
     }
@@ -215,7 +213,7 @@ fn own(root: &std::path::Path, store: &std::path::Path) -> io::Result<(std::fs::
     lock.try_lock_exclusive()
         .map_err(|_| io::Error::new(io::ErrorKind::AlreadyExists, "state already has a machine owner"))?;
     cozy_platform::durable::set_mode(root, 0o700)?;
-    Ok((lock, Arc::new(Store::ensure_owned(store).map_err(io::Error::other)?)))
+    Ok((lock, crate::storage::open(store)?))
 }
 
 /// `tensord version --json`: what a candidate binary declares to the machine's update.
@@ -282,12 +280,9 @@ fn run_machine(config: config::Config, mut ready: crate::machine::supervise::Rea
     identity.store = Some(layout.store.clone());
     let generations = engine.join("generations");
     let (_owned, store) = own(&engine, &layout.store)?;
-    // The machine's one Fetcher, held for its life: it reads the datacenter volume before the Hub
-    // and fills it. A variable naming no mount point (the volume was not delivered) is no volume.
-    let _fetcher = match layout.cache.as_ref().and_then(|cache| Volume::mounted(cache, crate::reclaim::TTL)) {
-        Some(volume) => Some(Fetcher::of(&store).map_err(io::Error::other)?.with_volume(volume)),
-        None => None,
-    };
+    // The machine's one downloader, held for its life: it reads the datacenter volume before the
+    // Hub and fills it. A variable naming no mount point (the volume was not delivered) is none.
+    let machine = Machine::new(store.clone(), layout.cache.as_deref())?;
     let service = crate::service::Service::open(&engine, &generations, 1)?;
     // The jobs this root held (a preparation the restart ended counts as ended now): Status
     // reports the true deadline from the first frame.
@@ -301,7 +296,7 @@ fn run_machine(config: config::Config, mut ready: crate::machine::supervise::Rea
             paths.clone(),
             Box::new(idle),
             Some(lifecycle.clone()),
-            Some(store.clone()),
+            Some(machine.clone()),
         )?
     };
     identity.updates = Some(updates.clone());
@@ -399,6 +394,7 @@ fn run_machine(config: config::Config, mut ready: crate::machine::supervise::Rea
         identity,
         api,
         &store,
+        &machine,
         &service,
         Some(crate::machine::client::helper_python(&engine)),
         Some(wheel),
@@ -443,6 +439,7 @@ fn start_api(
     identity: crate::api::MachineIdentity,
     listener: std::net::TcpListener,
     store: &Arc<Store>,
+    machine: &Arc<Machine>,
     service: &Arc<crate::service::Service>,
     helper: Option<PathBuf>,
     wheel: Option<PathBuf>,
@@ -463,7 +460,7 @@ fn start_api(
     let mut backend = NativeBackend::new(service.clone(), identity.authority.clone(), store.clone());
     backend.logs = logs;
     let publisher =
-        crate::published::Publisher::new(&root.join("published"), sdk, store.clone())?;
+        crate::published::Publisher::new(&root.join("published"), sdk, machine.clone())?;
     service.configure_publisher(publisher.clone());
     backend.publisher = Some(publisher);
     // Local packages install only with the helper; package environments get the client either way.
@@ -514,7 +511,7 @@ fn start_api(
         leaf: Some(Arc::new(leaf)),
         contexts: Default::default(),
     }));
-    crate::calls::Calls::configure(service, store.clone(), backend.runs.as_ref())?;
+    crate::calls::Calls::configure(service, machine.clone(), backend.runs.as_ref())?;
     listener.set_nonblocking(true)?;
     #[derive(serde::Serialize)]
     struct Ready<'a> {

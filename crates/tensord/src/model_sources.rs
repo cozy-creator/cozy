@@ -8,12 +8,17 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::{self, File},
-    io::{self, Read},
+    fs::File,
+    io,
     path::Path,
     sync::Arc,
 };
-use tensorfs_core::{header::Header, ids::ObjectRef, meta::Meta, read, store::Store};
+use crate::storage::{self, Store};
+use tensorfs_core::store2::Checkpoint;
+
+/// The `model_source` name of a checkpoint's manifest (`tensorfs.manifest/2`, its file list):
+/// `.` is never a manifest path.
+pub const LISTING: &str = ".";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SelectedManifest {
@@ -22,20 +27,23 @@ pub struct SelectedManifest {
 }
 
 struct Selection {
-    header: Header,
+    checkpoint: Checkpoint,
+    manifest_bytes: Vec<u8>,
     header_bytes: Vec<u8>,
     components: Vec<String>,
     encoded_bytes: u64,
-    manifest_length: u64,
 }
 
 pub struct ModelSources {
-    store: Arc<Store>,
     selected: BTreeMap<String, Selection>,
 }
 
 fn failure(error: impl std::fmt::Display) -> io::Error {
     io::Error::other(error.to_string())
+}
+
+fn outside() -> io::Error {
+    io::Error::new(io::ErrorKind::PermissionDenied, "manifest is outside selection")
 }
 
 fn digest(value: &str) -> io::Result<&str> {
@@ -55,143 +63,65 @@ fn digest(value: &str) -> io::Result<&str> {
 
 impl ModelSources {
     pub fn open(root: &Path, selections: &[SelectedManifest]) -> io::Result<Self> {
-        Self::open_shared(Arc::new(Store::open(root).map_err(failure)?), selections)
+        Self::open_shared(storage::open(root)?, selections)
     }
 
-    /// Public service and its upload/custody paths use the same owned store.
+    /// The machine's store, read for the selected checkpoints only.
     pub fn open_shared(store: Arc<Store>, selections: &[SelectedManifest]) -> io::Result<Self> {
         let mut selected = BTreeMap::new();
         for selection in selections {
             let manifest = digest(&selection.manifest)?.to_owned();
-            let length = fs::metadata(store.manifest_path(&manifest))?.len();
-            let snapshot = store
-                .read_manifest(&ObjectRef {
-                    sha256: manifest.clone(),
-                    length,
-                })
-                .map_err(failure)?;
-            let header_ref = snapshot
-                .header()
-                .ok_or_else(|| failure("selected snapshot has no model header"))?
-                .clone();
-            let mut header_bytes = Vec::new();
-            store
-                .open_verified(&header_ref.sha256)
-                .map_err(failure)?
-                .into_file()
-                .read_to_end(&mut header_bytes)?;
-            if header_bytes.len() as u64 != header_ref.length {
-                return Err(failure("selected header length differs from its manifest"));
-            }
-            let header = Header::from_stored(&header_bytes).map_err(failure)?;
+            let checkpoint = storage::checkpoint(&store, &manifest)?;
+            let header = checkpoint.manifest().header().ok_or_else(|| failure("selected snapshot has no model header"))?;
+            let header_bytes = store.read(header).map_err(storage::io_error)?;
+            let manifest_bytes = store.read(checkpoint.id()).map_err(storage::io_error)?;
             // No components named: all of them (a `Weights[M]` source, planned by Runtime).
-            let wanted: BTreeSet<&str> = match selection.components.is_empty() {
-                true => header.components.iter().map(|(name, _)| name.as_str()).collect(),
-                false => selection.components.iter().map(String::as_str).collect(),
+            let components: Vec<String> = match selection.components.is_empty() {
+                true => checkpoint.header().components().iter().map(|c| c.name.clone()).collect(),
+                false => selection.components.iter().cloned().collect::<BTreeSet<_>>().into_iter().collect(),
             };
-            let mut traversal = Vec::new();
-            for component in &wanted {
-                let tensors = header
-                    .components
-                    .iter()
-                    .find(|(name, _)| name == component)
-                    .ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::PermissionDenied,
-                            format!("selected component {component} is absent"),
-                        )
-                    })?;
-                traversal.extend(
-                    tensors
-                        .1
-                        .iter()
-                        .map(|(key, _)| ((*component).to_owned(), key.clone())),
-                );
+            let mut encoded_bytes = 0;
+            for component in &components {
+                let tensors = checkpoint.header().component(component).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::PermissionDenied, format!("selected component {component} is absent"))
+                })?;
+                encoded_bytes += (tensors.tensors.iter())
+                    .flat_map(|t| t.locations().into_iter().map(|(_, at)| at.length))
+                    .sum::<u64>();
             }
-            let components: Vec<String> = wanted.into_iter().map(str::to_owned).collect();
-            let encoded_bytes = read::plan_for_traversal(&header, &traversal, &components, 4 << 20)
-                .map_err(failure)?
-                .bytes;
-            if selected
-                .insert(
-                    manifest,
-                    Selection {
-                        header,
-                        header_bytes,
-                        components,
-                        encoded_bytes,
-                        manifest_length: length,
-                    },
-                )
-                .is_some()
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "duplicate manifest selection",
-                ));
+            let selection = Selection { checkpoint, manifest_bytes, header_bytes, components, encoded_bytes };
+            if selected.insert(manifest, selection).is_some() {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "duplicate manifest selection"));
             }
         }
-        Ok(Self { store, selected })
+        Ok(Self { selected })
     }
 
     /// Selected encoded source size, separate from prepared CPU-buffer and GPU residency.
     /// Runtime measures its real device footprint; callers cannot infer a fit from this.
     pub fn selected_facts(&self, manifest: &str) -> io::Result<(Vec<String>, u64, u64)> {
-        let selected = self.selected.get(digest(manifest)?).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "manifest is outside selection",
-            )
-        })?;
-        Ok((
-            selected.components.clone(),
-            selected.encoded_bytes,
-            selected.manifest_length,
-        ))
+        let selected = self.selected.get(digest(manifest)?).ok_or_else(outside)?;
+        Ok((selected.components.clone(), selected.encoded_bytes, selected.checkpoint.id().length))
     }
 
-    pub fn authorized_header(&self, manifest: &str) -> io::Result<Header> {
-        self.selected
-            .get(digest(manifest)?)
-            .map(|selection| selection.header.clone())
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "manifest is outside selection",
-                )
-            })
+    pub fn authorized(&self, manifest: &str) -> io::Result<Checkpoint> {
+        self.selected.get(digest(manifest)?).map(|s| s.checkpoint.clone()).ok_or_else(outside)
     }
 
-    /// One selected model's header (`name` empty) or one header-declared asset, verified:
-    /// assets through a read lease over their own objects only.
+    /// One selected model's header (`name` empty), stored bytes as written; its manifest
+    /// ([`LISTING`]), the checkpoint's file list; or one of its manifest's files (configs,
+    /// tokenizers).
     pub fn source(&self, manifest: &str, name: &str) -> io::Result<Vec<u8>> {
-        let manifest = digest(manifest)?;
-        let selection = self.selected.get(manifest).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "manifest is outside selection",
-            )
-        })?;
-        if name.is_empty() {
-            return Ok(selection.header_bytes.clone());
+        let selection = self.selected.get(digest(manifest)?).ok_or_else(outside)?;
+        match name {
+            "" => return Ok(selection.header_bytes.clone()),
+            LISTING => return Ok(selection.manifest_bytes.clone()),
+            _ => {}
         }
-        let (_, asset) = selection
-            .header
-            .assets
-            .iter()
-            .find(|(asset, _)| asset == name)
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "asset is outside the selected manifest",
-                )
-            })?;
-        let meta = Meta::open(&self.store).map_err(failure)?;
-        let (lease, _) =
-            read::acquire(&self.store, &meta, manifest, asset.segments.clone()).map_err(failure)?;
-        let bytes = read::read_asset(&lease, name, asset, asset.logical_length);
-        lease.release(&meta).map_err(failure)?;
-        bytes.map_err(failure)
+        if !selection.checkpoint.manifest().files.contains_key(name) || name.ends_with(".cozytensors") {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "asset is outside the selected manifest"));
+        }
+        selection.checkpoint.file(name).map_err(storage::io_error)
     }
 
     /// Answer a `model_source` request: the bytes in a file nobody can write, with their digest.

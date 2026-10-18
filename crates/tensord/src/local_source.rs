@@ -20,7 +20,8 @@ use std::{
     path::{Component, Path, PathBuf},
     sync::{Arc, Mutex},
 };
-use tensorfs_core::{ids::ObjectRef, sha256, store::Store, transport::PullCancellation};
+use crate::{stop::Stop, storage::Store};
+use tensorfs_core::{format::ObjectRef, sha256};
 
 /// The manifest object (JSON). Members are objects the same signer wrote.
 #[derive(Deserialize)]
@@ -282,7 +283,7 @@ impl LocalSources {
             let object = written_member(&self.objects, actor, file)?;
             fs::create_dir_all(target.parent().expect("a file inside the tree"))?;
             let incoming = home.join(".incoming");
-            fs::copy(self.store.object_path(&object.sha256), &incoming)?;
+            fs::copy(self.store.path(&object).map_err(crate::storage::io_error)?, &incoming)?;
             cozy_platform::durable::set_mode(&incoming, if file.executable { 0o755 } else { 0o644 }).map_err(std::io::Error::from)?;
             fs::rename(&incoming, &target)?;
         }
@@ -312,7 +313,7 @@ impl LocalSources {
         alias: String,
         manifest: Manifest,
         digest: &str,
-        stop: Option<&PullCancellation>,
+        stop: Option<&Stop>,
         stage: &dyn Fn(&str),
     ) -> Result<Installation, Refused> {
         let home = self.home(actor, &manifest.package)?;
@@ -351,7 +352,7 @@ impl LocalSources {
                     return Err(refused("local_source_invalid", format!("{:?} is not a wheel file name", wheel.name)));
                 }
                 let object = written_member(&self.objects, actor, wheel)?;
-                fs::copy(self.store.object_path(&object.sha256), carried.join(&wheel.name))?;
+                fs::copy(self.store.path(&object).map_err(crate::storage::io_error)?, carried.join(&wheel.name))?;
                 wheels.push(carried.join(&wheel.name));
             }
         }
@@ -437,7 +438,7 @@ impl LocalSources {
         service: &Service,
         actor: &str,
         digest: &str,
-        stop: Option<&PullCancellation>,
+        stop: Option<&Stop>,
         run: &str,
         stage: &dyn Fn(&str),
     ) -> Result<Installation, Refused> {
@@ -491,7 +492,7 @@ impl LocalSources {
         let requirements = match &manifest.requirements {
             Some(m) => {
                 let object = member(m)?;
-                fs::read(self.store.object_path(&object.sha256))?
+                fs::read(self.store.path(&object).map_err(crate::storage::io_error)?)?
             }
             None => Vec::new(),
         };
@@ -611,7 +612,7 @@ mod tests {
             .unwrap();
         let state = root.join("state");
         let service = Service::open(&state, &root.join("generations"), 1).unwrap();
-        let store = Arc::new(Store::ensure(&state.join("tensorfs")).unwrap());
+        let store = crate::storage::open(&state.join("tensorfs")).unwrap();
         let objects = Arc::new(
             Objects::new(&root.join("writes"), store.clone(), service.engine.clone()).unwrap(),
         );
@@ -947,7 +948,9 @@ mod tests {
         // Cached source is not a custody substitute after Store GC. A caller must write the
         // missing object before acceptance; doing so reopens the exact existing generation.
         let old = write(&m.objects, "alice", b"VALUE = 'old-code'\n");
-        fs::remove_file(m.store.object_path(old.digest.trim_start_matches("sha256:"))).unwrap();
+        let old_object = ObjectRef { sha256: old.digest.trim_start_matches("sha256:").into(), length: 19 };
+        let old_path = m.store.path(&old_object).unwrap();
+        fs::remove_file(old_path).unwrap();
         assert_eq!(sources.written("alice", &first).unwrap_err().code, "local_source_incomplete");
         write(&m.objects, "alice", b"VALUE = 'old-code'\n");
         assert_eq!(sources.written("alice", &first).unwrap().len(), files.len() + 1);

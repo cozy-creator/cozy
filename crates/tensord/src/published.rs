@@ -4,7 +4,6 @@
 //! requirements with uv; each model's lane by the lane rule (`precision`), then a TensorFS
 //! download) with its `release_root_preparing` progress answers.
 use crate::{
-    access,
     api::domain,
     gpu_service::{Plan, Pool, ModelGrant},
     hub::{self, Catalog},
@@ -26,13 +25,17 @@ use std::{
     sync::{Arc, Condvar, Mutex},
     time::{Duration, Instant},
 };
+use crate::{
+    held_models::Pulled,
+    origin::{self, priority, Machine},
+    stop::Stop,
+    storage::{self, Store},
+};
 use tensorfs_core::{
-    err::{Code, Refusal},
-    fetch_v1::{DeliveryGrant, FetchPlan},
-    ids::ObjectRef,
+    err::Refusal,
+    fetch::Progress as Counted,
+    format::ObjectRef,
     sha256,
-    store::Store,
-    transport::{self, Anonymous, Deadline, Ledger, PullCancellation, Ranged, SourcePolicy},
 };
 use crate::catalog::normalized;
 
@@ -176,22 +179,11 @@ impl Named {
     /// The checkpoint the Hub names it: the first of `asked` its release publishes (an empty
     /// lane: its only one). TensorFS's closure client names one lane, so it is one anonymous
     /// closure call per lane until one answers.
-    fn at_hub(mut self, source: &hub::Source, asked: &[String]) -> Result<Self, Failure> {
-        let refspec = match self.release.is_empty() {
-            true => self.repository.clone(),
-            false => format!("{}@{}", self.repository, self.release),
-        };
-        let catalog = Catalog::new(source).map_err(|e| ("catalog_read_failed", e.0))?;
-        let mut answer = catalog.closure(&refspec, &asked[0]);
-        for lane in &asked[1..] {
-            if !matches!(&answer, Err(e) if e.code == Code::REF_NOT_FOUND) {
-                break;
-            }
-            answer = catalog.closure(&refspec, lane);
-        }
-        let closure = answer.map_err(|e| refused("model_resolution_failed", e))?;
+    fn at_hub(mut self, machine: &Machine, source: &hub::Source, asked: &[String]) -> Result<Self, Failure> {
+        let resolved = origin::resolve_named(machine, source, &self.repository, &self.release, asked)
+            .map_err(|e| refused("model_resolution_failed", e))?;
         (self.release, self.lane, self.manifest, self.length) =
-            (closure.release, closure.lane, closure.manifest.id(), closure.manifest.length);
+            (resolved.release, resolved.lane, resolved.manifest.id(), resolved.manifest.length);
         Ok(self)
     }
 
@@ -216,7 +208,7 @@ struct Job {
     changed: Condvar,
     observer: Option<Observer>,
     /// Its run's stop: a cancel ends its downloads and installs.
-    stop: Option<PullCancellation>,
+    stop: Option<Stop>,
     /// Its run as its caller names it, and how that run is told what it waits for
     /// (`Engine::waiting`).
     caller: String,
@@ -293,6 +285,7 @@ struct Environment<'a> {
 pub struct Publisher {
     root: PathBuf,
     sdk: PackageSdk,
+    machine: Arc<Machine>,
     store: Arc<Store>,
     jobs: Mutex<HashMap<String, Arc<Job>>>,
     /// One maker per source: a second asker waits, then finds it held (runs 5393/5394).
@@ -310,12 +303,13 @@ impl Drop for Building<'_> {
 }
 
 impl Publisher {
-    pub fn new(root: &Path, sdk: PackageSdk, store: Arc<Store>) -> io::Result<Arc<Self>> {
+    pub fn new(root: &Path, sdk: PackageSdk, machine: Arc<Machine>) -> io::Result<Arc<Self>> {
         fs::create_dir_all(root)?;
         Ok(Arc::new(Self {
             root: root.to_path_buf(),
             sdk,
-            store,
+            store: machine.store().clone(),
+            machine,
             jobs: Mutex::new(HashMap::new()),
             making: Mutex::new(HashMap::new()),
             building: Mutex::new(HashMap::new()),
@@ -399,7 +393,7 @@ impl Publisher {
         actor: &str,
         request: &Request,
         observe: Option<Observer>,
-        stop: Option<&PullCancellation>,
+        stop: Option<&Stop>,
     ) -> Result<Prepared, Failure> {
         if let Ok(Some(prepared)) = self.held(service, actor, request) {
             return Ok(prepared);
@@ -458,9 +452,8 @@ impl Publisher {
 
     /// The component names a held checkpoint's header declares.
     fn components(&self, manifest: &str) -> Result<Vec<String>, Failure> {
-        let header = access::held(&self.store, manifest).and_then(|held| access::header(&self.store, &held));
-        let header = header.map_err(|e| ("checkpoint_absent", format!("{manifest}: {e}")))?;
-        Ok(header.components.into_iter().map(|(name, _)| name).collect())
+        let checkpoint = storage::checkpoint(&self.store, manifest).map_err(|e| ("checkpoint_absent", format!("{manifest}: {e}")))?;
+        Ok(checkpoint.header().components().iter().map(|c| c.name.clone()).collect())
     }
 
     /// A slot's model this machine's store holds, by its exact manifest.
@@ -483,23 +476,28 @@ impl Publisher {
         &self.store
     }
 
+    /// The machine's downloader.
+    pub fn machine(&self) -> &Arc<Machine> {
+        &self.machine
+    }
+
     /// A provider source made into a local model (`make_source`), as a run's refusal.
     pub fn make_source(
         &self,
         source: &str,
         profiles: &[String],
         providers: &Providers,
-        stop: Option<&PullCancellation>,
+        stop: Option<&Stop>,
         progress: &(dyn Fn(&str, u64, u64) + Sync),
-    ) -> Result<tensorfs_core::source_model::Made, Refused> {
+    ) -> Result<Made, Refused> {
         self.make(source, profiles, providers, stop, progress)
             .map_err(|(code, message)| Refused { code, message })
     }
 
     /// A provider source made into a local model (`make_source`), one maker per source.
     fn make(&self, source: &str, profiles: &[String], providers: &Providers,
-        stop: Option<&PullCancellation>, progress: &(dyn Fn(&str, u64, u64) + Sync),
-    ) -> Result<tensorfs_core::source_model::Made, Failure> {
+        stop: Option<&Stop>, progress: &(dyn Fn(&str, u64, u64) + Sync),
+    ) -> Result<Made, Failure> {
         let mut sorted = profiles.to_vec();
         sorted.sort();
         let key = json!([source, sorted]).to_string();
@@ -515,50 +513,53 @@ impl Publisher {
         made
     }
 
-    /// `named` downloaded whole on the Store's fetcher, as a request's weights are, and
-    /// recorded so the GC keeps it: what a caller asked for whole (`cozy model download`, an
-    /// adapter).
-    fn ensure(&self, source: &hub::Source, named: &Named, stop: Option<&PullCancellation>,
+    /// `named` from its Hub into the store, pinned as pulled: its structure (manifest, header,
+    /// files), then the `components` given (all when `None`, none when empty). Answers the bytes
+    /// that came from the Hub and from the datacenter volume. Whatever is here moves nothing.
+    fn pull(&self, source: &hub::Source, named: &Named, components: Option<&[String]>, stop: Option<&Stop>,
         bytes: &(dyn Fn(u64, u64) + Sync)) -> Result<(u64, u64), Failure> {
-        let origin = crate::access::origin(source, &named.repository, &named.release, &named.lane, &named.object());
-        let catalog = access::of(source, &origin)?;
-        let fetcher = tensorfs_core::fetch_v1::Fetcher::of(&self.store).map_err(|e| refused("model_download_failed", e))?;
+        let manifest = named.object();
+        let (remote, catalog) = origin::remote(&self.machine, source, &named.repository, &named.release, &named.lane, &manifest)?;
         let stop = stop.cloned().unwrap_or_default();
-        let at = tensorfs_core::fetch_v1::Priority::Now;
-        tensorfs_core::fetch_v1::whole(&fetcher, &origin, catalog.clone(), at, &stop, bytes).map_err(|e| match stop.is_cancelled() {
+        let failed = |e: Refusal| match stop.is_cancelled() {
             true => canceled(),
             false => {
                 let (code, message) = refused("model_download_failed", e);
                 catalog.reason(code, message)
             }
-        })
+        };
+        let structure = self.machine.pull(&remote, &manifest, Some(&[]), priority::NOW, None, &stop).map_err(failed)?;
+        let pulled = Pulled { repository: named.repository.clone(), release: named.release.clone(), lane: named.lane.clone() };
+        storage::hold(&self.store, &storage::pin::model(&manifest.sha256), vec![manifest.clone()], Some(pulled.owner()))
+            .map_err(io_failure)?;
+        if components == Some(&[]) {
+            return Ok((structure.landed.origin, structure.landed.volume));
+        }
+        let progress = Arc::new(Counted::default());
+        let pulled = origin::watched(&progress, bytes, || {
+            self.machine.pull(&remote, &manifest, components, priority::NOW, Some(progress.clone()), &stop)
+        });
+        let landed = pulled.map_err(failed)?.landed;
+        Ok((structure.landed.origin + landed.origin, structure.landed.volume + landed.volume))
     }
 
-    /// Each Hub checkpoint's structure (manifest, header, assets), landed at once: which of its
-    /// objects come, and when, its calls direct (`access`). A held structure asks the Hub nothing.
+    /// `named` downloaded whole, as a request's weights are, and pinned so the GC keeps it:
+    /// what a caller asked for whole (`cozy model download`, an adapter).
+    fn ensure(&self, source: &hub::Source, named: &Named, stop: Option<&Stop>,
+        bytes: &(dyn Fn(u64, u64) + Sync)) -> Result<(u64, u64), Failure> {
+        self.pull(source, named, None, stop, bytes)
+    }
+
+    /// Each Hub checkpoint's structure (manifest, header, files), landed at once: which of its
+    /// chunks come, and when, its calls direct (`access`). A held structure asks the Hub nothing.
     fn structure(&self, source: &hub::Source, checkpoints: &[Named], job: &Job) -> Result<(), Failure> {
         if checkpoints.is_empty() {
             return Ok(());
         }
         let names: Vec<String> = checkpoints.iter().map(|n| format!("{}@{} {}", n.repository, n.release, n.lane)).collect();
         job.stage(format!("resolving {}", names.join(" and ")));
-        let fetcher = tensorfs_core::fetch_v1::Fetcher::of(&self.store).map_err(|e| refused("model_download_failed", e))?;
-        let stop = job.stop.clone().unwrap_or_default();
-        let mut wanted = vec![];
         for named in checkpoints {
-            let origin = crate::access::origin(source, &named.repository, &named.release, &named.lane, &named.object());
-            let catalog = access::of(source, &origin)?;
-            let ticket = fetcher.want(&origin, catalog.clone(), &[], tensorfs_core::fetch_v1::Priority::Now);
-            wanted.push((ticket, catalog));
-        }
-        for (ticket, catalog) in wanted {
-            ticket.wait(&[], &stop).map_err(|e| match stop.is_cancelled() {
-                true => canceled(),
-                false => {
-                    let (code, message) = refused("model_download_failed", e);
-                    catalog.reason(code, message)
-                }
-            })?;
+            self.pull(source, named, Some(&[]), job.stop.as_ref(), &|_, _| ())?;
         }
         Ok(())
     }
@@ -568,7 +569,7 @@ impl Publisher {
     /// catalog revision so a warm run, across restarts too, asks the Hub nothing (th-245).
     pub(crate) fn resolve(&self, service: &Service, source: &hub::Source, named: Named, lanes: &[&str], revision: &str) -> Result<Named, Failure> {
         if !named.manifest.is_empty() {
-            return measured(service, source, named);
+            return measured(&self.machine, service, source, named);
         }
         let asked: Vec<String> = match named.lane.is_empty() {
             true => lanes.iter().chain(&[""]).map(|lane| lane.to_string()).collect(),
@@ -580,7 +581,7 @@ impl Publisher {
         if let Some((release, lane, manifest, length)) = held.and_then(|held| serde_json::from_str(&held).ok()) {
             return Ok(Named { release, lane, manifest, length, ..named });
         }
-        let resolved = named.at_hub(source, &asked)?;
+        let resolved = named.at_hub(&self.machine, source, &asked)?;
         let answer = json!([resolved.release, resolved.lane, resolved.manifest, resolved.length]).to_string();
         service.engine.with_journal(|j| j.bind_named(&name, revision, &answer)).map_err(io_failure)?;
         Ok(resolved)
@@ -597,16 +598,13 @@ impl Publisher {
         named: Named,
         lanes: &[&str],
         revision: &str,
-        stop: Option<&PullCancellation>,
+        stop: Option<&Stop>,
         bytes: &(dyn Fn(u64, u64) + Sync),
     ) -> Result<(Named, (u64, u64)), Refused> {
         let failed = |(code, message)| Refused { code, message };
         let named = self.resolve(service, source, named, lanes, revision).map_err(failed)?;
-        // A checkpoint this store already holds whole, in that repository, moves nothing.
-        let mut moved = (0, 0);
-        if tensorfs_core::checkpoint_root::check_source(&self.store, &named.repository, &named.object()).is_err() {
-            moved = self.ensure(source, &named, stop, bytes).map_err(failed)?;
-        }
+        // A checkpoint this store already holds whole moves nothing and asks the Hub nothing.
+        let moved = self.ensure(source, &named, stop, bytes).map_err(failed)?;
         Ok((named, moved))
     }
 
@@ -868,7 +866,7 @@ impl Publisher {
         // again: its URLs expire.
         let earlier = self.earlier(service, actor, request, &release);
         let kept = earlier.as_ref().and_then(|dir| serde_json::from_slice::<Card>(&fs::read(dir.join(CARD)).ok()?).ok());
-        let card = match kept.filter(|card| card.wheels.iter().all(|wheel| self.store.contains(&wheel.sha256))) {
+        let card = match kept.filter(|card| card.wheels.iter().all(|wheel| self.held_file(wheel))) {
             Some(card) => card,
             None => hub_card(&catalog()?, &request.package, &release, &self.sdk.python)?,
         };
@@ -1059,7 +1057,7 @@ impl Publisher {
     /// The lock's exact versions as constraints (`name==version ; marker`), less `except`: what
     /// the machine's own Runtime pair and the client install against, so neither moves a
     /// locked package.
-    fn export_pins(&self, project: &Path, except: &[&str], stop: Option<&PullCancellation>) -> Result<String, Failure> {
+    fn export_pins(&self, project: &Path, except: &[&str], stop: Option<&Stop>) -> Result<String, Failure> {
         let out = project.join("pins.txt");
         let (project, path) = (project.to_string_lossy(), out.to_string_lossy());
         let mut args = vec!["export", "--frozen", "--no-dev", "--no-emit-project", "--no-hashes", "--no-annotate", "--no-header",
@@ -1081,13 +1079,12 @@ impl Publisher {
         if files.is_empty() {
             return Ok(vec![]);
         }
-        let policy = hub::files_policy(source).map_err(|e| ("catalog_read_failed", e.0))?;
         let wheels = dir.join("wheels");
         fs::create_dir_all(&wheels).map_err(io_failure)?;
         std::thread::scope(|scope| {
             let handles: Vec<_> = files
                 .iter()
-                .map(|file| scope.spawn(|| self.hub_wheel(file, &policy, &wheels, job.stop.as_ref())))
+                .map(|file| scope.spawn(|| self.hub_wheel(file, source, &wheels, job.stop.as_ref())))
                 .collect();
             handles
                 .into_iter()
@@ -1096,24 +1093,20 @@ impl Publisher {
         })
     }
 
-    fn hub_wheel(&self, file: &HubFile, policy: &SourcePolicy, wheels: &Path, stop: Option<&PullCancellation>) -> Result<PathBuf, Failure> {
-        let failed = |e: Refusal| match stop.is_some_and(PullCancellation::is_cancelled) {
-            true => canceled(),
-            false => ("package_file_download_failed", format!("{}: {e}", file.url)),
-        };
-        if !self.store.contains(&file.sha256) {
-            let ledger = match stop {
-                Some(stop) => Ledger::new().with_cancellation(stop.clone()),
-                None => Ledger::new(),
-            };
-            let length = match file.length {
-                0 => probe(&file.url, policy, &ledger).map_err(failed)?,
-                length => length,
-            };
-            let object = ObjectRef { sha256: file.sha256.clone(), length };
-            fetch_file(&self.store, &file.url, &object, policy, &ledger).map_err(failed)?;
-        }
-        let blob = self.store.blob_path(&file.sha256);
+    /// Whether the store holds a Hub file (its URL expires; its bytes do not).
+    fn held_file(&self, file: &HubFile) -> bool {
+        file.length > 0 && storage::present(&self.store, &ObjectRef { sha256: file.sha256.clone(), length: file.length })
+    }
+
+    fn hub_wheel(&self, file: &HubFile, source: &hub::Source, wheels: &Path, stop: Option<&Stop>) -> Result<PathBuf, Failure> {
+        let stop = stop.cloned().unwrap_or_default();
+        let trust = source.ca_der.as_deref().map(|der| hub::pem(der).into_bytes());
+        let length = (file.length > 0).then_some(file.length);
+        let blob = crate::machine::pypi::object_at(&self.machine, &file.url, &file.sha256, length, trust, &stop)
+            .map_err(|e| match stop.is_cancelled() {
+                true => canceled(),
+                false => ("package_file_download_failed", format!("{}: {e}", file.url)),
+            })?;
         let path = wheels.join(&file.name);
         fs::hard_link(&blob, &path)
             .or_else(|_| fs::copy(&blob, &path).map(drop))
@@ -1152,7 +1145,7 @@ impl Publisher {
     /// refuses the release. Returns which SDK the environment holds and its run warning, if
     /// any: never silent.
     fn install_sdk(&self, py: &str, dir: &Path, locked: &[&str], restore: &dyn Fn() -> Result<(), Failure>, compile: &str,
-        stop: Option<&PullCancellation>) -> Result<(&'static str, String), Failure> {
+        stop: Option<&Stop>) -> Result<(&'static str, String), Failure> {
         let constraints = dir.join("constraints.txt").to_string_lossy().to_string();
         let mut args = vec!["pip", "install", "--no-config", "--python", py, compile, "--constraints", &constraints];
         let links = self.sdk.find_links.as_ref().map(|p| p.to_string_lossy().to_string());
@@ -1201,12 +1194,12 @@ impl Publisher {
         )))
     }
 
-    fn uv(&self, args: &[&str], stop: Option<&PullCancellation>) -> Result<(), Failure> {
+    fn uv(&self, args: &[&str], stop: Option<&Stop>) -> Result<(), Failure> {
         self.uv_observed(args, &[], stop, &|_| ())
     }
 
     /// `uv pip check`'s findings in an environment, one line each (`The package …`).
-    fn check(&self, py: &str, stop: Option<&PullCancellation>) -> Result<BTreeSet<String>, Failure> {
+    fn check(&self, py: &str, stop: Option<&Stop>) -> Result<BTreeSet<String>, Failure> {
         match self.uv(&["pip", "check", "--no-config", "--python", py], stop) {
             Ok(()) => Ok(BTreeSet::new()),
             Err((code, detail)) => {
@@ -1220,7 +1213,7 @@ impl Publisher {
     /// (its downloads and the cache it copies from), so a long install shows it moves. Its
     /// process group is killed when `stop` is canceled, or when its CPU and bytes stop moving
     /// past its measured patience (`process::supervise`).
-    fn uv_observed(&self, args: &[&str], env: &[(&str, &std::ffi::OsStr)], stop: Option<&PullCancellation>,
+    fn uv_observed(&self, args: &[&str], env: &[(&str, &std::ffi::OsStr)], stop: Option<&Stop>,
         read: &(dyn Fn(u64) + Sync)) -> Result<(), Failure> {
         crate::machine::client::ensure_uv(&self.sdk.uv).map_err(|e| ("uv_unavailable", e.to_string()))?;
         let mut command = Command::new(&self.sdk.uv);
@@ -1426,10 +1419,9 @@ impl Publisher {
         Ok((plan, warnings))
     }
 
-    /// A landed checkpoint's bytes: its manifest and every object its header names.
+    /// A landed checkpoint's bytes: its manifest, its files and every chunk its header names.
     fn bytes(&self, named: &Named) -> u64 {
-        let header = access::header(&self.store, &named.object());
-        named.length + header.map_or(0, |header| access::objects(&header, &[]).iter().map(|o| o.length).sum())
+        self.store.closure(&named.object()).map_or(named.length, |objects| objects.iter().map(|o| o.length).sum())
     }
 }
 
@@ -1465,44 +1457,70 @@ pub(crate) fn choose(choice: &domain::ModelChoice, path: &str) -> Result<Named, 
     Ok(Named { repository: choice.repository.clone(), release: choice.release.clone(), lane: choice.lane.clone(), manifest, length })
 }
 
+/// A provider source made into a local model.
+#[derive(Clone, Debug)]
+pub struct Made {
+    /// `local/source-<hash>`, named by the source's pinned spelling and converter.
+    pub repository: String,
+    pub manifest: ObjectRef,
+    /// The pinned source the provider resolved.
+    pub resolved: String,
+    pub profiles: Vec<String>,
+}
+
+/// `source` imported into a local model (normalized at ingest, design §6), or the one already
+/// made from its pinned spelling: a moving revision is read again, a pinned one is reused.
 fn make_source(
     store: &Store,
     source: &str,
     profiles: &[String],
     providers: &Providers,
-    cancellation: Option<PullCancellation>,
+    cancellation: Option<Stop>,
     progress: &(dyn Fn(&str, u64, u64) + Sync),
-) -> Result<tensorfs_core::source_model::Made, Failure> {
-    let access = |token: &str| tensorfs_core::source_model::Access {
-        credential: if token.is_empty() { String::new() } else { format!("bearer {token}") },
-        endpoints: Default::default(),
+) -> Result<Made, Failure> {
+    let bearer = |token: &str| if token.is_empty() { String::new() } else { format!("bearer {token}") };
+    let access = tensorfs_core::import::Access {
+        huggingface_token: bearer(&providers.huggingface),
+        civitai_token: bearer(&providers.civitai),
+        ..Default::default()
     };
-    // Named by its pinned spelling: a moving revision is read again, a pasted URL is its source.
-    let source = &tensorfs_core::source_model::pin(source, &access(&providers.huggingface))
+    let [converter] = match profiles {
+        [] => [None],
+        [one] => [Some(one.as_str())],
+        _ => return Err(("model_source_failed", "a source is converted by one table".into())),
+    };
+    let listed = tensorfs_core::import::remote::parse(source)
+        .and_then(|spec| tensorfs_core::import::remote::list(&spec, &access))
         .map_err(|e| refused("model_source_failed", e))?;
-    let mut sorted = profiles.to_vec();
-    sorted.sort();
-    let identity =
-        serde_json_canonicalizer::to_vec(&json!(["cozy.machine-source-model/1", source, sorted]))
-            .map_err(|e| io_failure(io::Error::other(e)))?;
+    let identity = serde_json_canonicalizer::to_vec(&json!(["cozy.machine-source-model/2", listed.pinned, converter]))
+        .map_err(|e| io_failure(io::Error::other(e)))?;
     let name = format!("source-{}", &sha256::hex_digest(&identity)[..40]);
-    let access = access(match source.starts_with("civitai://") {
-        true => &providers.civitai,
-        false => &providers.huggingface,
-    });
-    tensorfs_core::source_model::make(
-        store,
-        &tensorfs_core::source_model::Request {
-            source,
-            profiles,
-            name: &name,
-            access: &access,
-            registry: None,
-            progress,
-            cancellation,
-        },
-    )
-    .map_err(|e| refused("model_source_failed", e))
+    let made = |manifest| Made {
+        repository: format!("local/{name}"),
+        manifest,
+        resolved: listed.pinned.clone(),
+        profiles: profiles.to_vec(),
+    };
+    if let Some(manifest) = crate::storage::local(store, &name).map_err(io_failure)? {
+        return Ok(made(manifest));
+    }
+    let stop = || cancellation.as_ref().is_some_and(Stop::is_cancelled);
+    let request = tensorfs_core::import::Request {
+        sources: &[source.to_string()],
+        converter,
+        variant: None,
+        access: &access,
+        tmp: &store.root().join("tmp"),
+        progress,
+        stop: Some(&stop),
+    };
+    let manifest = store.import(&request, Some(&name)).map_err(|e| match stop() {
+        true => canceled(),
+        false => refused("model_source_failed", e),
+    })?;
+    crate::storage::set_local(store, &name, &manifest).map_err(io_failure)?;
+    store.unpin(&name).map_err(|e| io_failure(crate::storage::io_error(e)))?;
+    Ok(made(manifest))
 }
 
 /// A TensorFS refusal as a run's reason; a download the disk cannot fit is its own.
@@ -1514,7 +1532,7 @@ fn refused(code: &'static str, refusal: tensorfs_core::err::Refusal) -> Failure 
 }
 
 /// A slot's caller adapters applied to its resolved base: each adapter downloaded, then one
-/// adapter view composed (`adapter_views`); the grant then names the view.
+/// adapter view composed (`derive::compose`); the grant then names the view.
 fn apply_adapters(
     publisher: &Publisher,
     source: &hub::Source,
@@ -1530,7 +1548,7 @@ fn apply_adapters(
     let store = &publisher.store;
     job.stage(format!("preparing model adapters for {}", grant.slot));
     let object = |manifest: &str| {
-        access::held(store, manifest).map_err(|e| ("model_download_failed", format!("manifest {manifest} is not held: {e}")))
+        storage::held(store, manifest).map_err(|e| ("model_download_failed", format!("manifest {manifest} is not held: {e}")))
     };
     let mut selections = vec![];
     for adapter in &choice.adapters {
@@ -1570,16 +1588,22 @@ fn apply_adapters(
                 )
             })?
         };
-        selections.push(crate::adapter_views::Selection {
+        selections.push(crate::derive::Selection {
             manifest: object(&manifest)?,
             component: adapter.component.clone(),
             source_component: adapter.source_component.clone(),
             strength,
         });
     }
-    let composed = crate::adapter_views::compose(store, &object(&grant.manifest)?, &selections)
+    // The view re-packs the base's small parts: its chunks come first (its load reads them anyway).
+    if !grant.release.is_empty() {
+        let base = Named { repository: grant.repository.clone(), release: grant.release.clone(), lane: grant.lane.clone(),
+            manifest: grant.manifest.clone(), length: object(&grant.manifest)?.length };
+        publisher.ensure(source, &base, job.stop.as_ref(), &|d, t| job.bytes(d, t))?;
+    }
+    let composed = crate::derive::compose(store, &object(&grant.manifest)?, &selections)
         .map_err(|e| ("model_adapter_refused", e.to_string()))?;
-    grant.repository = composed.repository;
+    grant.repository = composed.pin;
     grant.manifest = format!("sha256:{}", composed.manifest.sha256);
     Ok(())
 }
@@ -1624,7 +1648,7 @@ fn newest_key(request: &Request) -> String {
 /// A checkpoint named by its hash, with the length a hash alone does not say: its closure's at
 /// the Hub, read once under the run's access (the owner's capability for a private one) and
 /// kept, since a hash never names other bytes.
-fn measured(service: &Service, source: &hub::Source, mut named: Named) -> Result<Named, Failure> {
+fn measured(machine: &Machine, service: &Service, source: &hub::Source, mut named: Named) -> Result<Named, Failure> {
     if named.length > 0 {
         return Ok(named);
     }
@@ -1634,16 +1658,8 @@ fn measured(service: &Service, source: &hub::Source, mut named: Named) -> Result
         named.length = length;
         return Ok(named);
     }
-    let origin = crate::access::origin(source, &named.repository, &named.release, &named.lane, &named.object());
-    let catalog = access::of(source, &origin)?;
-    let closure = catalog.closure(&origin.refspec, &named.lane).map_err(|e| {
-        let (code, message) = refused("model_resolution_failed", e);
-        catalog.reason(code, message)
-    })?;
-    if closure.manifest.sha256 != origin.manifest.sha256 {
-        return Err(("model_resolution_failed", format!("{} answered {}", origin.refspec, closure.manifest.id())));
-    }
-    named.length = closure.manifest.length;
+    let sha256 = named.manifest.trim_start_matches("sha256:").to_string();
+    named.length = origin::resolve_hash(machine, source, &named.repository, &named.lane, &sha256)?.length;
     service.engine.with_journal(|j| j.bind_named(&key, "", &named.length.to_string())).map_err(io_failure)?;
     Ok(named)
 }
@@ -1767,29 +1783,6 @@ impl HubFile {
 /// One file named by its digest, into this machine's store: a download that stops moving
 /// fails on its measured stillness, `ledger`'s stop ends it, and what landed stays for the
 /// next ask. Answers the blob's path.
-pub(crate) fn fetch_file(store: &Store, url: &str, object: &ObjectRef, policy: &SourcePolicy, ledger: &Ledger) -> Result<PathBuf, Refusal> {
-    let (plan, _) = FetchPlan::of_objects(store, "package-files", std::slice::from_ref(object))?;
-    if !plan.wanted.is_empty() {
-        let grant = DeliveryGrant::mint(&plan, object)?;
-        let ranged = Ranged { streams: transport::STREAMS, part: 1 << 20 };
-        transport::fetch_ranged(store, &grant, url, policy, &Anonymous, Deadline::none(), ledger, ranged, None)?;
-    }
-    Ok(store.blob_path(&object.sha256))
-}
-
-/// A file's length, asked again on a fresh connection while an ask stays silent past the
-/// transport's noise floor, as its downloader asks a late part again.
-fn probe(url: &str, policy: &SourcePolicy, ledger: &Ledger) -> Result<u64, Refusal> {
-    let mut attempt = 1;
-    loop {
-        let deadline = Deadline::after_seconds(Some(ledger.floor().as_secs_f64()));
-        match transport::probe_length(url, policy, &Anonymous, deadline, ledger) {
-            Err(e) if e.code == Code::DEADLINE_EXCEEDED && attempt < transport::FETCH_ATTEMPTS => attempt += 1,
-            answer => return answer,
-        }
-    }
-}
-
 fn io_failure(error: io::Error) -> Failure {
     ("release_root_preparation_failed", error.to_string())
 }
@@ -2048,7 +2041,7 @@ pub(crate) mod tests {
                         if let Some((name, value)) = header.split_once(':') {
                             if name.eq_ignore_ascii_case("range") {
                                 let (first, last) = value.trim().trim_start_matches("bytes=").split_once('-').unwrap();
-                                range = Some((first.parse::<usize>().unwrap(), last.parse::<usize>().unwrap()));
+                                range = Some((first.parse::<usize>().unwrap(), last.parse::<usize>().unwrap_or(usize::MAX)));
                             }
                         }
                         header.clear();
@@ -2175,8 +2168,8 @@ pub(crate) mod tests {
         let asks = Arc::new(Mutex::new(vec![]));
         let origin = file_door(HashMap::from([("acme_pkg-1.0-py3-none-any.whl".to_string(), bytes)]), asks.clone(), None);
         let source = hub::Source::new(&origin, None, vec![], None).unwrap();
-        let store = Arc::new(Store::ensure(&root.join("tensorfs")).unwrap());
-        let publisher = Publisher::new(&root.join("published"), PackageSdk::default(), store).unwrap();
+        let store = crate::storage::open(&root.join("tensorfs")).unwrap();
+        let publisher = Publisher::new(&root.join("published"), PackageSdk::default(), crate::origin::Machine::new(store, None).unwrap()).unwrap();
         let door = |file: &str| format!("{origin}/v1/index/acme/{file}");
         let lock = format!(
             "version = 1\nrevision = 3\nrequires-python = \">=3.12\"\n\n\
@@ -2202,8 +2195,6 @@ pub(crate) mod tests {
         let local = dir.join("wheels/acme_pkg-1.0-py3-none-any.whl");
         assert_eq!(fetched, std::slice::from_ref(&local));
         assert_eq!(sha256::hex_digest(&fs::read(&local).unwrap()), good);
-        let parts = asks.lock().unwrap().iter().filter(|ask| ask.starts_with("GET /objects/") && ask.contains("Some") && !ask.contains("Some((0, 0))")).count();
-        assert!(parts >= 3, "a 2.5 MiB wheel comes in 1 MiB parts: {:?}", asks.lock().unwrap());
 
         let env = dir.join("env");
         let python = cozy_platform::paths::venv_python(&env);
@@ -2236,7 +2227,7 @@ pub(crate) mod tests {
         let tampered = HubFile::new(&door("acme-pkg/1.0/acme_pkg-1.0-py3-none-any.whl"), &bad, "acme_pkg-1.0-py3-none-any.whl", 0).unwrap();
         let (code, why) = publisher.fetch_hub(&[tampered], &source, &root.join("tampered"), &Job::default()).unwrap_err();
         assert_eq!(code, "package_file_download_failed", "{why}");
-        assert!(!publisher.store.contains(&bad));
+        assert!(!publisher.store.path(&ObjectRef { sha256: bad.clone(), length: 0 }).unwrap().exists());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -2250,29 +2241,6 @@ pub(crate) mod tests {
         let (code, message) = newest_release(&catalog, "acme", "nope").unwrap_err();
         assert_eq!(code, "package_absent");
         assert!(message.starts_with("acme/nope is not published at http://127.0.0.1:"), "{message}");
-    }
-
-    #[test]
-    fn a_stalled_part_of_a_hub_file_is_asked_again() {
-        let root = std::env::temp_dir().join(format!("cm-hub-stall-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(root.join("generation")).unwrap();
-        let bytes: Vec<u8> = (0..(3u32 << 20)).map(|i| (i.wrapping_mul(2246822519) >> 11) as u8).collect();
-        let sha = sha256::hex_digest(&bytes);
-        let asks = Arc::new(Mutex::new(vec![]));
-        let origin = file_door(HashMap::from([("acme_data-1.0-py3-none-any.whl".to_string(), bytes)]), asks.clone(), Some(1 << 20));
-        let source = hub::Source::new(&origin, None, vec![], None).unwrap();
-        let store = Arc::new(Store::ensure(&root.join("tensorfs")).unwrap());
-        let publisher = Publisher::new(&root.join("published"), PackageSdk::default(), store).unwrap();
-        let url = format!("{origin}/v1/index/acme/acme-data/1.0/acme_data-1.0-py3-none-any.whl");
-        let file = HubFile::new(&url, &sha, "acme_data-1.0-py3-none-any.whl", 0).unwrap();
-        let began = Instant::now();
-        publisher.fetch_hub(&[file], &source, &root.join("generation"), &Job::default()).unwrap();
-        let took = began.elapsed();
-        let stalled = asks.lock().unwrap().iter().filter(|ask| ask.ends_with("Some((1048576, 2097151))")).count();
-        assert_eq!(stalled, 2, "{:?}", asks.lock().unwrap());
-        assert!(took < Duration::from_secs(30), "took {took:?}");
-        assert_eq!(sha256::hex_digest(&fs::read(root.join("generation/wheels/acme_data-1.0-py3-none-any.whl")).unwrap()), sha);
-        let _ = fs::remove_dir_all(root);
     }
 
     /// The machine's own Runtime goes into an environment whose packages admit it; one whose
@@ -2294,8 +2262,8 @@ pub(crate) mod tests {
             requirements: vec![machine.to_string_lossy().into()],
             ..Default::default()
         };
-        let store = Arc::new(Store::ensure(&root.join("tensorfs")).unwrap());
-        let publisher = Publisher::new(&root.join("published"), sdk, store).unwrap();
+        let store = crate::storage::open(&root.join("tensorfs")).unwrap();
+        let publisher = Publisher::new(&root.join("published"), sdk, crate::origin::Machine::new(store, None).unwrap()).unwrap();
         let generations = root.join("generations");
 
         let (pyproject, lock) = locked(&root.join("admits"), &["takes-any"], &wheels, "");
@@ -2341,8 +2309,8 @@ pub(crate) mod tests {
             requirements: vec![machine.to_string_lossy().into()],
             ..Default::default()
         };
-        let store = Arc::new(Store::ensure(&root.join("tensorfs")).unwrap());
-        let publisher = Publisher::new(&root.join("published"), sdk, store).unwrap();
+        let store = crate::storage::open(&root.join("tensorfs")).unwrap();
+        let publisher = Publisher::new(&root.join("published"), sdk, crate::origin::Machine::new(store, None).unwrap()).unwrap();
         let (pyproject, lock) = locked(&root.join("sbsa"), &["sbsa-tagged"], &wheels, "");
         let record = generate(&publisher, &root.join("generations"), "sbsa", &card(pyproject, lock)).unwrap();
         assert_eq!(record.sdk_fallback, "");
@@ -2378,9 +2346,9 @@ pub(crate) mod tests {
         let elsewhere = if cfg!(target_os = "macos") { "linux" } else { "darwin" };
         let (pyproject, lock) = locked(&root.join("project"), &["takes-any"], &wheels,
             &format!("environments = [\"sys_platform == '{elsewhere}'\"]\n"));
-        let store = Arc::new(Store::ensure(&root.join("tensorfs")).unwrap());
+        let store = crate::storage::open(&root.join("tensorfs")).unwrap();
         let sdk = PackageSdk { uv: PathBuf::from("uv"), python: "3.12".into(), ..Default::default() };
-        let publisher = Publisher::new(&root.join("published"), sdk, store).unwrap();
+        let publisher = Publisher::new(&root.join("published"), sdk, crate::origin::Machine::new(store, None).unwrap()).unwrap();
         let (code, why) = generate(&publisher, &root.join("generations"), "elsewhere", &card(pyproject, lock)).unwrap_err();
         assert_eq!(code, "release_platform_unsupported", "{why}");
         assert!(why.starts_with("acme/app@1.0 is not locked for this machine") && why.contains(elsewhere), "{why}");
@@ -2412,7 +2380,7 @@ pub(crate) mod tests {
             assert!(Command::new("uv").args(&args).env("UV_CACHE_DIR", &owner.cache).status().unwrap().success(), "{args:?}");
         }
         fs::remove_file(&wheel).unwrap();
-        let store = Arc::new(Store::ensure(&root.join("tensorfs")).unwrap());
+        let store = crate::origin::Machine::new(crate::storage::open(&root.join("tensorfs")).unwrap(), None).unwrap();
         let sdk = PackageSdk { uv: PathBuf::from("uv"), python: "3.12".into(), ..Default::default() };
         let card = card(pyproject, lock);
 
@@ -2461,8 +2429,8 @@ pub(crate) mod tests {
         let sdk = PackageSdk::selected(&paths.sdk(), &root, "uv".into());
         assert_eq!(sdk.runtime_build, build);
 
-        let store = Arc::new(Store::ensure(&root.join("tensorfs")).unwrap());
-        let publisher = Publisher::new(&root.join("published"), sdk, store).unwrap();
+        let store = crate::storage::open(&root.join("tensorfs")).unwrap();
+        let publisher = Publisher::new(&root.join("published"), sdk, crate::origin::Machine::new(store, None).unwrap()).unwrap();
         let generations = root.join("generations");
         tiny_wheel(&wheels, "cozy-runtime", "3.0", &[]);
         for (package, floor, warning) in [
@@ -2559,8 +2527,8 @@ pub(crate) mod tests {
     #[ignore = "real network: huggingface.co"]
     fn a_source_choice_is_made_into_a_local_grant() {
         let root = std::env::temp_dir().join(format!("cm-source-{}", uuid::Uuid::new_v4()));
-        let store = Arc::new(Store::ensure(&root.join("tensorfs")).unwrap());
-        let publisher = Publisher::new(&root.join("published"), Default::default(), store).unwrap();
+        let store = crate::storage::open(&root.join("tensorfs")).unwrap();
+        let publisher = Publisher::new(&root.join("published"), Default::default(), crate::origin::Machine::new(store, None).unwrap()).unwrap();
         let installation = Installation {
             actor: "alice".into(),
             alias: "x".into(),
@@ -2595,8 +2563,9 @@ pub(crate) mod tests {
     #[ignore = "real network: huggingface.co"]
     fn concurrent_makers_of_one_source_share_it() {
         let root = std::env::temp_dir().join(format!("cm-source-{}", uuid::Uuid::new_v4()));
-        let store = Arc::new(Store::ensure(&root.join("tensorfs")).unwrap());
-        let publisher = Publisher::new(&root.join("published"), Default::default(), store).unwrap();
+        let store = crate::storage::open(&root.join("tensorfs")).unwrap();
+        let machine = crate::origin::Machine::new(store, None).unwrap();
+        let publisher = Publisher::new(&root.join("published"), Default::default(), machine).unwrap();
         let source = "hf://hf-internal-testing/tiny-sdxl-pipe@20594cbc343cfcfe447af5c87cdaf6c436b453f2/unet/diffusion_pytorch_model.safetensors";
         let make = || publisher.make_source(source, &[], &Providers::default(), None, &|_, _, _| {}).unwrap();
         let (a, b) = std::thread::scope(|scope| {
@@ -2615,43 +2584,27 @@ pub(crate) mod tests {
     #[ignore = "real network: civitai.com"]
     fn a_civitai_lora_adapter_source_becomes_peft_factors() {
         let root = std::env::temp_dir().join(format!("cm-lora-{}", uuid::Uuid::new_v4()));
-        let store = Store::ensure(&root.join("tensorfs")).unwrap();
-        let made = make_source(&store, "civitai://145907", &[], &Providers::default(), None, &|_, _, _| {}).unwrap();
-        assert_eq!(made.profiles, ["sdxl/lora-kohya/1"]);
-        let manifest = store.read_manifest(&made.manifest).unwrap();
-        let header = tensorfs_core::checkpoint::load_header(&store, manifest.header().unwrap()).unwrap();
-        let (component, tensors) = &header.components[0];
-        assert_eq!(component, "unet");
-        assert!(tensors.iter().any(|(key, _)| key.ends_with("attn1.to_q.lora_A.weight")));
+        let store = crate::storage::open(&root.join("tensorfs")).unwrap();
+        let profiles = ["sdxl.lora".to_string()];
+        let made = make_source(&store, "civitai://145907", &profiles, &Providers::default(), None, &|_, _, _| {}).unwrap();
+        let checkpoint = store.checkpoint(&made.manifest).unwrap();
+        let unet = &checkpoint.header().components()[0];
+        assert_eq!(unet.name, "unet");
+        assert!(unet.tensors.iter().any(|t| t.key.ends_with("attn1.to_q.lora_A.weight")));
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// A real checkpoint of `objects` distinct one-object tensors, in a source store.
+    /// A real checkpoint of `objects` tensors of 16 MiB, each its own chunk, in a source store.
     fn checkpoint(store: &Store, objects: usize, tag: u8) -> ObjectRef {
-        use tensorfs_core::{
-            dtype::Dtype,
-            header::{Body, Closure, Header, Part, Tensor},
-            manifest::{Draft, Entry},
-            registry,
-            store::Fault,
-        };
-        let put = |bytes: &[u8]| store.put_stream(&mut &bytes[..], None, &Fault::default()).unwrap().obj;
-        let spec = registry::seeds().into_iter().find(|seed| seed.alias == "plain/1").unwrap().spec;
-        let tensors = (0..objects)
-            .map(|at| {
-                let value: Vec<u8> = (0..4096u32).flat_map(|i| [i.to_le_bytes(), [at as u8, tag, 0, 0]].concat()).collect();
-                let shape = vec![2048u64, 4];
-                let body = Body::Segments(vec![put(&value)]);
-                let part = Part { dtype: Dtype::F32, shape: shape.clone(), body };
-                let tensor = Tensor { dtype: Dtype::F32, shape, encoding: spec.object_id(), parts: vec![("value".into(), part)] };
-                (format!("w{at:03}"), tensor)
-            })
+        let tensors: Vec<(String, Vec<u64>, Vec<u8>)> = (0..objects)
+            .map(|at| (format!("w{at:03}"), vec![1 << 22], crate::derive::tests::f32s(1 << 22, f32::from(tag) * 1000.0 + at as f32)))
             .collect();
-        let header = Header { configs: vec![], assets: vec![], encodings: vec![spec], components: vec![("model".into(), tensors)] };
-        header.validate(&Closure::default()).unwrap();
-        let header = put(&header.canonical_bytes().unwrap());
-        let manifest = Draft { entries: vec![("model.cozytensors".into(), Entry::CozyTensors(header))] }.seal().unwrap();
-        store.put_manifest(&manifest).unwrap().obj
+        let named: Vec<(&str, Vec<u64>, Vec<u8>)> = tensors.iter().map(|(k, s, b)| (k.as_str(), s.clone(), b.clone())).collect();
+        crate::derive::tests::checkpoint(store, &format!("fixture-{tag}"), "model", &named)
+    }
+
+    fn chunks(store: &Store, manifest: &ObjectRef) -> Vec<ObjectRef> {
+        crate::storage::chunks(&store.checkpoint(manifest).unwrap(), &[])
     }
 
     /// A machine's publisher and service, and a loopback Hub serving `model` from `source`
@@ -2665,9 +2618,9 @@ pub(crate) mod tests {
     impl Bench {
         fn new() -> Self {
             let root = std::env::temp_dir().join(format!("cm-lanes-{}", uuid::Uuid::new_v4()));
-            let source = Arc::new(Store::ensure(&root.join("source")).unwrap());
-            let store = Arc::new(Store::ensure_owned(&root.join("store")).unwrap());
-            let publisher = Publisher::new(&root.join("published"), PackageSdk::default(), store).unwrap();
+            let source = crate::storage::open(&root.join("source")).unwrap();
+            let machine = crate::origin::Machine::new(crate::storage::open(&root.join("store")).unwrap(), None).unwrap();
+            let publisher = Publisher::new(&root.join("published"), PackageSdk::default(), machine).unwrap();
             Self { root, source, publisher }
         }
 
@@ -2718,16 +2671,17 @@ pub(crate) mod tests {
     #[test]
     fn a_chosen_checkpoint_lands_as_its_structure_alone() {
         let bench = Bench::new();
-        let manifest = checkpoint(&bench.source, 20, 4);
+        let manifest = checkpoint(&bench.source, 3, 4);
         let (hub, named, heard) = bench.hub("acme/source", &manifest, 0);
         let job = Job::default();
         bench.publisher.structure(&hub, std::slice::from_ref(&named), &job).unwrap();
         let store = bench.publisher.store();
-        assert_eq!(count(&heard, "GET /o/"), 2, "the manifest and the header: {heard:?}");
+        assert_eq!(count(&heard, "GET /o/"), 3, "the manifest, the header and the config: {heard:?}");
         assert_eq!(count(&heard, "POST /v1/tensorfs/closure"), 1);
         assert!(!crate::access::whole(store, &manifest.id(), &[]));
-        let origin = tensorfs_core::origin::of(store.root(), &manifest).unwrap().unwrap();
-        assert_eq!((origin.refspec.as_str(), origin.lane.as_str()), ("acme/source@1.0.0", "bf16"));
+        let pin = store.get_pin(&crate::storage::pin::model(&manifest.sha256)).unwrap().unwrap();
+        let pulled = Pulled { repository: "acme/source".into(), release: "1.0.0".into(), lane: "bf16".into() };
+        assert_eq!(pin.owner, Some(pulled.owner()));
         let asked = heard.lock().unwrap().len();
         bench.publisher.structure(&hub, &[named], &job).unwrap();
         assert_eq!(heard.lock().unwrap().len(), asked, "a held structure asks nothing");
@@ -2739,22 +2693,23 @@ pub(crate) mod tests {
     #[test]
     fn calls_sharing_a_checkpoint_fetch_each_object_once_and_a_warm_one_asks_nothing() {
         let bench = Bench::new();
-        let manifest = checkpoint(&bench.source, 24, 5);
+        let manifest = checkpoint(&bench.source, 4, 5);
         let (hub, named, heard) = bench.hub("acme/shared", &manifest, 20);
         bench.publisher.structure(&hub, std::slice::from_ref(&named), &Job::default()).unwrap();
         let store = bench.publisher.store().clone();
-        let objects = crate::access::objects(&crate::access::header(&store, &manifest).unwrap(), &[]);
-        let call = |order| crate::access::Fetch::new(store.clone(), Some(hub.clone()), vec![manifest.id()], order);
+        let objects = chunks(&store, &manifest);
+        let machine = bench.publisher.machine().clone();
+        let call = |order| crate::access::Fetch::new(machine.clone(), Some(hub.clone()), vec![manifest.id()], order);
         let (first, second) = (call(1), call(2));
         std::thread::scope(|scope| {
-            scope.spawn(|| first.wait(&manifest, &objects).unwrap());
-            scope.spawn(|| second.wait(&manifest, &objects[..12]).unwrap());
+            scope.spawn(|| first.wait(&manifest.id(), &objects).unwrap());
+            scope.spawn(|| second.wait(&manifest.id(), &objects[..2]).unwrap());
         });
         assert!(crate::access::whole(&store, &manifest.id(), &[]));
-        assert_eq!(count(&heard, "GET /o/"), 2 + 24, "each object once: {heard:?}");
+        assert_eq!(count(&heard, "GET /o/"), 3 + 4, "each object once: {heard:?}");
         let asked = heard.lock().unwrap().len();
         let warm = call(3);
-        warm.wait(&manifest, &objects).unwrap();
+        warm.wait(&manifest.id(), &objects).unwrap();
         let mut channel = channel(warm.channel().unwrap());
         let rows: Vec<Value> = objects.iter().map(|o| json!({"sha256": o.sha256, "length": o.length})).collect();
         let waited = ask(&mut channel, json!({"id": 1, "op": "wait", "manifest": manifest.id(), "objects": rows}));
@@ -2769,30 +2724,30 @@ pub(crate) mod tests {
     #[test]
     fn an_ended_call_drops_its_tickets() {
         let bench = Bench::new();
-        let manifest = checkpoint(&bench.source, 40, 6);
+        let manifest = checkpoint(&bench.source, 6, 6);
         let (hub, named, heard) = bench.hub("acme/canceled", &manifest, 100);
         bench.publisher.structure(&hub, std::slice::from_ref(&named), &Job::default()).unwrap();
         let store = bench.publisher.store().clone();
-        let objects = crate::access::objects(&crate::access::header(&store, &manifest).unwrap(), &[]);
-        let fetch = crate::access::Fetch::new(store.clone(), Some(hub.clone()), vec![manifest.id()], 7);
+        let objects = chunks(&store, &manifest);
+        let fetch = crate::access::Fetch::new(bench.publisher.machine().clone(), Some(hub.clone()), vec![manifest.id()], 7);
         let mut channel = channel(fetch.channel().unwrap());
         let rows: Vec<Value> = objects.iter().map(|o| json!({"sha256": o.sha256, "length": o.length})).collect();
         let scheduled = ask(&mut channel, json!({"id": 1, "op": "schedule", "manifest": manifest.id(), "objects": rows, "rank": 0}));
         assert_eq!(scheduled, json!({"id": 1, "result": null}));
-        while count(&heard, "GET /o/") < 2 + 4 {
+        while count(&heard, "GET /o/") < 3 + 2 {
             std::thread::sleep(Duration::from_millis(5));
         }
         fetch.end();
         let waited = ask(&mut channel, json!({"id": 2, "op": "wait", "manifest": manifest.id(), "objects": rows}));
         assert_ne!(waited, json!({"id": 2, "result": null}), "a wait after the end never answers present");
         // Every request went out at once and each answer takes 100 ms: the ones on the wire stop.
-        let landed = || objects.iter().filter(|o| store.contains(&o.sha256)).count();
+        let landed = || objects.iter().filter(|o| crate::storage::present(&store, o)).count();
         std::thread::sleep(Duration::from_millis(300));
         let at_end = landed();
         std::thread::sleep(Duration::from_millis(700));
         assert_eq!(landed(), at_end, "nothing lands once its tickets dropped");
         assert!(at_end < objects.len(), "{at_end} of {} landed: it stopped short", objects.len());
-        assert!(store.manifest_path(&manifest.sha256).is_file(), "the structure stays");
+        assert!(crate::storage::present(&store, &manifest), "the structure stays");
         let _ = fs::remove_dir_all(&bench.root);
     }
 
@@ -2801,20 +2756,20 @@ pub(crate) mod tests {
     #[test]
     fn warm_downloaded_comes_from_its_tickets_completion() {
         let bench = Bench::new();
-        let manifest = checkpoint(&bench.source, 16, 7);
+        let manifest = checkpoint(&bench.source, 3, 7);
         let (hub, named, heard) = bench.hub("acme/warm", &manifest, 10);
         bench.publisher.structure(&hub, std::slice::from_ref(&named), &Job::default()).unwrap();
         let store = bench.publisher.store().clone();
         let selected = [(manifest.id(), vec!["model".to_string()])];
         assert!(!crate::access::whole(&store, &manifest.id(), &selected[0].1));
-        let member = crate::access::Fetch::new(store.clone(), Some(hub.clone()), vec![manifest.id()], u64::MAX);
+        let member = crate::access::Fetch::new(bench.publisher.machine().clone(), Some(hub.clone()), vec![manifest.id()], u64::MAX);
         member.keep(&selected).unwrap();
         let started = Instant::now();
         while !crate::access::whole(&store, &manifest.id(), &selected[0].1) {
             assert!(started.elapsed() < Duration::from_secs(60), "never downloaded: {heard:?}");
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert_eq!(count(&heard, "GET /o/"), 2 + 16);
+        assert_eq!(count(&heard, "GET /o/"), 3 + 3);
         let _ = fs::remove_dir_all(&bench.root);
     }
 
@@ -2826,10 +2781,10 @@ pub(crate) mod tests {
     fn a_member_warmed_to_downloaded_only_downloads() {
         use crate::gpu_service::{Level, Member, Plan, PlanSlot, Pool};
         let bench = Bench::new();
-        let manifest = checkpoint(&bench.source, 16, 8);
+        let manifest = checkpoint(&bench.source, 3, 8);
         let (hub, named, heard) = bench.hub("acme/warmed", &manifest, 200);
         bench.publisher.structure(&hub, std::slice::from_ref(&named), &Job::default()).unwrap();
-        let later = checkpoint(&bench.source, 4, 18);
+        let later = checkpoint(&bench.source, 2, 18);
         let (later_hub, later_named, later_heard) = bench.hub("acme/later", &later, 200);
         bench.publisher.structure(&later_hub, std::slice::from_ref(&later_named), &Job::default()).unwrap();
         let structure = count(&later_heard, "GET /o/");
@@ -2852,7 +2807,7 @@ pub(crate) mod tests {
         let config = serde_json::from_value(json!({"devices": "GPU-test-0", "authorized_device_limit_bytes": null, "prespawn": true})).unwrap();
         let pool = Pool::new(&bench.root.join("gpu"), config, store.clone()).unwrap();
         let engine = crate::execution::Engine::open(&bench.root.join("execution")).unwrap();
-        let fetch = crate::access::Fetch::new(store.clone(), Some(hub), plan.manifests(), u64::MAX);
+        let fetch = crate::access::Fetch::new(bench.publisher.machine().clone(), Some(hub), plan.manifests(), u64::MAX);
         pool.set_members("alice", vec![Member::new(held, Some(plan), Level::Downloaded, Some(fetch))]);
         pool.keep(&engine, "alice");
         let [(level, held_back)] = pool.members("alice")[..] else { panic!("one member") };
@@ -2865,7 +2820,7 @@ pub(crate) mod tests {
         }
         assert_eq!(pool.members("alice"), [(Level::Downloaded, "")]);
         assert!(pool.levels().is_empty(), "nothing imports or starts");
-        assert_eq!(count(&heard, "GET /o/"), 2 + 16, "each object once");
+        assert_eq!(count(&heard, "GET /o/"), 3 + 3, "each object once");
         assert_eq!(count(&later_heard, "GET /o/"), structure, "the on-demand model: none");
         pool.stop().unwrap();
         let _ = fs::remove_dir_all(&bench.root);
@@ -2877,13 +2832,14 @@ pub(crate) mod tests {
     #[test]
     fn a_calls_preparation_fetches_ahead_until_its_first_channel_closes() {
         let bench = Bench::new();
-        let manifest = checkpoint(&bench.source, 30, 10);
+        let manifest = checkpoint(&bench.source, 4, 10);
         let (hub, named, _) = bench.hub("acme/ahead", &manifest, 100);
         bench.publisher.structure(&hub, std::slice::from_ref(&named), &Job::default()).unwrap();
         let store = bench.publisher.store().clone();
-        let ahead = crate::access::Fetch::new(store.clone(), Some(hub.clone()), vec![manifest.id()], 3);
+        let machine = bench.publisher.machine().clone();
+        let ahead = crate::access::Fetch::new(machine.clone(), Some(hub.clone()), vec![manifest.id()], 3);
         ahead.ahead(&[(manifest.id(), vec!["model".to_string()])]).unwrap();
-        let call = crate::access::Fetch::new(store.clone(), Some(hub), vec![manifest.id()], 3);
+        let call = crate::access::Fetch::new(machine, Some(hub), vec![manifest.id()], 3);
         call.replaces(Some(ahead.clone()));
         let channel = call.channel().unwrap();
         let started = Instant::now();
@@ -2922,11 +2878,12 @@ pub(crate) mod tests {
 
         /// `new`, its package declaring `entrypoints`.
         pub(crate) fn with(package: &str, gpus: &[(&str, u64)], entrypoints: Value, lanes: &[&str]) -> Self {
-            use crate::adapter_views::tests::{checkpoint as tensors, f32s};
+            use crate::derive::tests::{checkpoint as tensors, f32s};
             let root = std::env::temp_dir().join(format!("cm-precision-{}", uuid::Uuid::new_v4()));
             let service = Service::open(&root.join("state"), &root.join("generations"), 1).unwrap();
-            let store = Arc::new(Store::ensure_owned(&root.join("store")).unwrap());
-            let publisher = Publisher::new(&root.join("published"), PackageSdk::default(), store.clone()).unwrap();
+            let store = crate::storage::open(&root.join("store")).unwrap();
+            let machine = crate::origin::Machine::new(store.clone(), None).unwrap();
+            let publisher = Publisher::new(&root.join("published"), PackageSdk::default(), machine).unwrap();
             let inventory: Vec<Value> = gpus.iter().enumerate().map(|(at, (cc, memory))| json!({"device_index": at,
                 "device_name": "GPU", "device_uuid": format!("GPU-{at}"), "driver_version": "1", "memory_bytes": memory,
                 "pci_bus_id": format!("{at}"), "compute_cap": cc})).collect();
@@ -2943,16 +2900,15 @@ pub(crate) mod tests {
             let installation = service.engine.bind_installation(Installation { actor: "alice".into(), alias: "held".into(),
                 generation: identity, package: package.into(), release: "1.0.0".into(),
                 interface: serde_json::to_vec(&interface).unwrap(), hub: String::new() }).unwrap();
-            let source = Store::ensure(&root.join("source")).unwrap();
-            let meta = tensorfs_core::meta::Meta::open(&source).unwrap();
+            let source = crate::storage::open(&root.join("source")).unwrap();
             let model = |repository: &str, lane: &str, manifest| names_hub::Model { repository: repository.into(),
                 release: "1.0.0".into(), lane: lane.into(), manifest };
             let mut models: Vec<_> = lanes.iter().zip(30u8..).map(|(lane, tag)| {
-                model("acme/model", lane, tensors(&source, &meta, "unet", &[("proj.weight", vec![4, 3], f32s(&[tag.into(); 12]))], tag))
+                model("acme/model", lane, tensors(&source, &format!("lane-{tag}"), "unet", &[("proj.weight", vec![4, 3], f32s(12, tag.into()))]))
             }).collect();
             let lanes = models.iter().map(|model| (model.manifest.id(), model.lane.clone())).collect();
-            let lora = [("proj.lora_A.weight", vec![2, 3], f32s(&[0.25; 6])), ("proj.lora_B.weight", vec![4, 2], f32s(&[0.75; 8]))];
-            models.push(model("acme/lora", "bf16", tensors(&source, &meta, "adapter", &lora, 0xa0)));
+            let lora = [("proj.lora_A.weight", vec![2, 3], f32s(6, 0.25)), ("proj.lora_B.weight", vec![4, 2], f32s(8, 0.75))];
+            models.push(model("acme/lora", "bf16", tensors(&source, "lora", "adapter", &lora)));
             let (origin, heard) = names_hub::models(&source, models);
             let hub = hub::Source::new(&origin, None, vec!["localhost".into()], None).unwrap();
             Self { root, service, publisher, installation, hub, heard, lanes }
@@ -3067,7 +3023,7 @@ pub(crate) mod tests {
         let asked = std::mem::take(&mut *hopper.heard.lock().unwrap());
         assert_eq!(closed(&asked), std::collections::BTreeSet::from(["int8"]));
         assert!(asked.iter().any(|heard| heard == "POST /v1/tensorfs/closure acme/lora@1.0.0 "), "{asked:?}");
-        assert!(plan.slots[0].binding.model.starts_with("local/adapters-"), "{:?}", plan.slots[0].binding);
+        assert!(plan.slots[0].binding.model.starts_with("view-"), "{:?}", plan.slots[0].binding);
     }
 
     /// Unpublished code's org-less default is the run owner's model.

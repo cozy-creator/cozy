@@ -20,7 +20,7 @@ fn artifact() -> Value {
 fn prefetch_choices_cross_the_native_handler_and_keep_callee_authority() {
     let root = std::env::temp_dir().join(format!("cm-prefetch-{}", uuid::Uuid::new_v4()));
     let service = Service::open(&root.join("state"), &root.join("generations"), 1).unwrap();
-    let store = Arc::new(Store::ensure(&root.join("store")).unwrap());
+    let store = crate::storage::open(&root.join("store")).unwrap();
     let objects = Arc::new(
         Objects::new(&root.join("writes"), store.clone(), service.engine.clone()).unwrap(),
     );
@@ -33,7 +33,7 @@ fn prefetch_choices_cross_the_native_handler_and_keep_callee_authority() {
         leaf: None,
         contexts: Default::default(),
     });
-    let broker = Calls::configure(&service, store, Some(&runs)).unwrap();
+    let broker = Calls::configure(&service, crate::origin::Machine::new(store, None).unwrap(), Some(&runs)).unwrap();
     let interface = json!({"entrypoints": [{"name": "render", "models": [
         {"path": "render.models.network", "class": "fixture.Network"}
     ]}]});
@@ -133,7 +133,7 @@ fn prefetch_choices_cross_the_native_handler_and_keep_callee_authority() {
 
     let unsupported = Calls::configure(
         &service,
-        Arc::new(Store::open(&root.join("store")).unwrap()),
+        crate::origin::Machine::new(crate::storage::open(&root.join("store")).unwrap(), None).unwrap(),
         None,
     )
     .unwrap();

@@ -68,15 +68,10 @@ fn requiring(distribution: &str, version: &str, script: Option<&[u8]>, requires:
 /// object; answers its digest.
 fn hold(root: &Path, bytes: &[u8]) -> String {
     let engine = root.join("var/lib/cozy/tensord");
-    let store = tensorfs_core::store::Store::ensure(&root.join("var/lib/tensorfs")).unwrap();
-    let sha256 = tensorfs_core::sha256::hex(&tensorfs_core::sha256::digest(bytes));
-    let object = tensorfs_core::ids::ObjectRef {
-        sha256: sha256.clone(),
-        length: bytes.len() as u64,
-    };
-    store
-        .put_stream(&mut &bytes[..], Some(&object), &Default::default())
-        .unwrap();
+    let store = tensord::storage::open(&root.join("var/lib/tensorfs")).unwrap();
+    let object = store.put_bytes(bytes).unwrap();
+    tensord::storage::hold(&store, &tensord::storage::pin::object(&object.sha256), vec![object.clone()], None).unwrap();
+    let sha256 = object.sha256.clone();
     let owner = SigningKey::from_bytes(&OWNER).verifying_key();
     tensord::journal::Journal::open(&engine.join("execution"))
         .unwrap()

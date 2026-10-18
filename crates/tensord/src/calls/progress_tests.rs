@@ -8,8 +8,8 @@ use crate::{device_executor, journal::Invocation};
 fn a_relayed_child_stage_carries_its_download_bytes() {
     let root = std::env::temp_dir().join(format!("cm-relay-{}", uuid::Uuid::new_v4()));
     let service = Service::open(&root.join("state"), &root.join("generations"), 1).unwrap();
-    let store = Arc::new(Store::ensure(&root.join("store")).unwrap());
-    let broker = Calls::configure(&service, store, None).unwrap();
+    let store = crate::storage::open(&root.join("store")).unwrap();
+    let broker = Calls::configure(&service, crate::origin::Machine::new(store, None).unwrap(), None).unwrap();
     let engine = &service.engine;
     let accept = |id: &str| engine.accept_run("alice", id, id, Invocation::default()).unwrap().0.id;
     let (job, child) = (accept("job"), accept("job/0"));

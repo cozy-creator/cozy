@@ -7,102 +7,23 @@ use std::{fs, io};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 use tensorfs_core::{
-    dtype::Dtype,
-    header::{Asset, Header, Part, Tensor},
-    ids::ObjectRef,
-    manifest::{Draft, Entry},
-    registry,
-    store::{Fault, Store},
+    format::{Dtype, ObjectRef},
+    writer::{Data, Source},
 };
 
 fn fixture() -> (std::path::PathBuf, String, Vec<u8>, ObjectRef, ObjectRef) {
-    let root = std::env::temp_dir().join(format!(
-        "machine-source-{}-{}",
-        std::process::id(),
-        tensorfs_core::meta::now_nanos_unique()
-    ));
-    let store = Store::init(&root).unwrap();
-    let plain = registry::seeds()
-        .into_iter()
-        .find(|s| s.alias == "plain/1")
-        .unwrap()
-        .spec;
+    let root = std::env::temp_dir().join(format!("machine-source-{}", uuid::Uuid::new_v4()));
+    let store = tensord::storage::open(&root).unwrap();
     let data: Vec<u8> = (0..65540).map(|n| (n % 251) as u8).collect();
     let other = vec![9; 65540];
-    let object = ObjectRef::of(&data);
-    let denied = ObjectRef::of(&other);
-    store
-        .put_stream(&mut data.as_slice(), Some(&object), &Fault::default())
-        .unwrap();
-    store
-        .put_stream(&mut other.as_slice(), Some(&denied), &Fault::default())
-        .unwrap();
-    let asset_bytes = b"static tokenizer asset";
-    let asset_ref = ObjectRef::of(asset_bytes);
-    store
-        .put_stream(
-            &mut asset_bytes.as_slice(),
-            Some(&asset_ref),
-            &Fault::default(),
-        )
-        .unwrap();
-    let header = Header {
-        configs: vec![],
-        assets: vec![(
-            "tokenizer/vocab.json".into(),
-            Asset {
-                logical_sha256: asset_ref.sha256.clone(),
-                logical_length: asset_ref.length,
-                media_type: "application/json".into(),
-                segments: vec![asset_ref],
-            },
-        )],
-        encodings: vec![plain.clone()],
-        components: vec![
-            (
-                "allowed".into(),
-                vec![(
-                    "weight".into(),
-                    Tensor {
-                        dtype: Dtype::U8,
-                        shape: vec![data.len() as u64],
-                        encoding: plain.object_id(),
-                        parts: vec![(
-                            "value".into(),
-                            Part::plan(Dtype::U8, vec![data.len() as u64], &data),
-                        )],
-                    },
-                )],
-            ),
-            (
-                "denied".into(),
-                vec![(
-                    "weight".into(),
-                    Tensor {
-                        dtype: Dtype::U8,
-                        shape: vec![other.len() as u64],
-                        encoding: plain.object_id(),
-                        parts: vec![(
-                            "value".into(),
-                            Part::plan(Dtype::U8, vec![other.len() as u64], &other),
-                        )],
-                    },
-                )],
-            ),
-        ],
-    };
-    let bytes = header.canonical_bytes().unwrap();
-    let header_ref = ObjectRef::of(&bytes);
-    store
-        .put_stream(&mut bytes.as_slice(), Some(&header_ref), &Fault::default())
-        .unwrap();
-    let manifest = Draft {
-        entries: vec![("model".into(), Entry::CozyTensors(header_ref))],
+    let mut writer = store.writer(None, Some("fixture")).unwrap();
+    for (component, bytes) in [("allowed", &data), ("denied", &other)] {
+        let shape = [bytes.len() as u64];
+        writer.put(component, "weight", &Dtype::U8, &shape, Data::Plain(Source::Read(&mut bytes.as_slice()))).unwrap();
     }
-    .seal()
-    .unwrap();
-    store.put_manifest(&manifest).unwrap();
-    (root, manifest.manifest_id(), data, object, denied)
+    writer.file("tokenizer/vocab.json", b"static tokenizer asset").unwrap();
+    let manifest = writer.commit().unwrap();
+    (root, manifest.id(), data.clone(), ObjectRef::of(&data), ObjectRef::of(&other))
 }
 
 #[test]
@@ -116,16 +37,11 @@ fn a_selection_grants_its_headers_and_sizes_and_nothing_else() {
     let (components, encoded, _) = sources.selected_facts(&manifest).unwrap();
     assert_eq!(components, vec!["allowed".to_string()]);
     assert!(encoded >= data.len() as u64, "{encoded}");
-    assert!(sources
-        .authorized_header(&manifest)
-        .unwrap()
-        .components
-        .iter()
-        .any(|(c, _)| c == "allowed"));
+    assert!(sources.authorized(&manifest).unwrap().header().component("allowed").is_some());
     // Store presence is no authority: an unselected manifest, an absent component.
     let none = ModelSources::open(&root, &[]).unwrap();
     assert_eq!(
-        none.authorized_header(&manifest).err().unwrap().kind(),
+        none.authorized(&manifest).err().unwrap().kind(),
         io::ErrorKind::PermissionDenied
     );
     let absent = SelectedManifest {
@@ -144,8 +60,8 @@ fn frame(manifest: &str, name: &str) -> tensord::device_executor::Frame {
     .unwrap()
 }
 
-/// What `model_source` hands an executor: the header and each asset, verified, in a sealed
-/// read-only memfd with its digest; nothing outside the selection.
+/// What `model_source` hands an executor: the header, the manifest (the file list) and each
+/// asset, verified, in a sealed read-only memfd with its digest; nothing outside the selection.
 #[test]
 fn the_selection_serves_its_header_and_assets_sealed_and_nothing_else() {
     let (root, manifest, _, _, _) = fixture();
@@ -154,8 +70,15 @@ fn the_selection_serves_its_header_and_assets_sealed_and_nothing_else() {
         components: vec!["allowed".into()],
     };
     let sources = ModelSources::open(&root, std::slice::from_ref(&selected)).unwrap();
+    let listing = tensorfs_core::store2::Store::open(&root).unwrap().read(&tensorfs_core::format::ObjectRef {
+        sha256: manifest.trim_start_matches("sha256:").into(),
+        length: sources.authorized(&manifest).unwrap().id().length,
+    });
+    let listing = listing.unwrap();
+    assert!(tensorfs_core::format::Manifest::from_json(&listing).unwrap().files.contains_key("tokenizer/vocab.json"));
     for (name, want) in [
         ("", None),
+        (tensord::model_sources::LISTING, Some(listing.as_slice())),
         ("tokenizer/vocab.json", Some(&b"static tokenizer asset"[..])),
     ] {
         let (answer, file) = sources.serve(&frame(&manifest, name)).unwrap();
@@ -165,10 +88,7 @@ fn the_selection_serves_its_header_and_assets_sealed_and_nothing_else() {
         assert_eq!(answer.sha256, format!("{:x}", Sha256::digest(&got)));
         match want {
             Some(bytes) => assert_eq!(got, bytes),
-            None => assert!(
-                tensorfs_core::header::Header::parse(&got).is_ok(),
-                "the header"
-            ),
+            None => assert!(tensorfs_core::format::Header::from_cbor(&got).is_ok(), "the header"),
         }
         // SAFETY: scalar fcntl queries on a descriptor we hold.
         #[cfg(unix)]

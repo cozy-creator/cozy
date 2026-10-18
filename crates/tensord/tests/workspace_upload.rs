@@ -1,6 +1,5 @@
 use tensord::api::{auth::VerifiedActor, domain, workspaces::WorkspaceUploads};
 use std::{fs, io::Read, path::PathBuf, sync::Arc};
-use tensorfs_core::store::Store;
 
 struct Area(PathBuf);
 impl Area {
@@ -14,7 +13,7 @@ impl Area {
     fn uploads(&self) -> Arc<WorkspaceUploads> {
         WorkspaceUploads::open(
             &self.0.join("uploads"),
-            Arc::new(Store::ensure(&self.0.join("store")).unwrap()),
+            tensord::storage::open(&self.0.join("store")).unwrap(),
         )
         .unwrap()
     }
@@ -174,8 +173,8 @@ fn source_archive_is_statically_inspected_and_imported_into_tensorfs() {
         .read_to_end(&mut read)
         .unwrap();
     assert_eq!(read, bytes);
-    let native = Store::open(&area.0.join("store")).unwrap();
-    assert!(native.record_valid(&package.files[0].object.sha256).is_ok());
+    let native = tensord::storage::open(&area.0.join("store")).unwrap();
+    assert!(tensord::storage::present(&native, &package.files[0].object.reference()));
     assert_eq!(package.root.source_archive, "source.tar");
     uploads
         .release_after_install(actor(1), "static-source")

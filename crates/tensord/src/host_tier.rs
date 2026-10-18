@@ -27,11 +27,12 @@ use std::{
     },
     time::{Duration, Instant},
 };
+use crate::storage::{self, Store};
 use tensorfs_core::{
-    header::Header,
-    meta::Meta,
+    format,
+    ids,
     read::{self, Source as Item},
-    store::Store,
+    store2::Checkpoint,
 };
 use varena::{
     host::{self, OpenFill},
@@ -84,7 +85,7 @@ impl TierLimit for HalfOfHeadroom {
 #[derive(Clone)]
 pub struct HostGrant {
     pub manifest: String,
-    pub header: Header,
+    pub checkpoint: Checkpoint,
     pub components: BTreeSet<String>,
 }
 
@@ -240,7 +241,6 @@ impl State {
 
 pub struct HostTier {
     store: Arc<Store>,
-    meta: Arc<Meta>,
     config: HostTierConfig,
     limit: Box<dyn TierLimit>,
     state: Mutex<State>,
@@ -274,11 +274,9 @@ impl HostTier {
         config: HostTierConfig,
         limit: Box<dyn TierLimit>,
     ) -> io::Result<Arc<Self>> {
-        let meta = Arc::new(Meta::open(&store).map_err(failure)?);
         let (fills, jobs) = mpsc::channel::<Job>();
         let tier = Arc::new(Self {
             store,
-            meta,
             config,
             limit,
             state: Mutex::default(),
@@ -303,8 +301,8 @@ impl HostTier {
     pub fn prepare(self: &Arc<Self>, grants: Vec<HostGrant>) {
         // What is not here yet comes as its executor directs; only what is here is started on.
         let grants: Vec<HostGrant> = (grants.into_iter())
-            .filter(|g| crate::access::objects(&g.header, &g.components.iter().cloned().collect::<Vec<_>>())
-                .iter().all(|o| self.store.contains(&o.sha256)))
+            .filter(|g| storage::chunks(&g.checkpoint, &g.components.iter().cloned().collect::<Vec<_>>())
+                .iter().all(|o| storage::present(&self.store, o)))
             .collect();
         // Its executor stages only what streams and reads the rest from the files: warm the
         // page cache (reclaimable), allocate nothing.
@@ -312,7 +310,7 @@ impl HostTier {
         std::thread::spawn(move || {
             for grant in &grants {
                 for component in &grant.components {
-                    if let Ok(plan) = component_plan(&grant.header, component) {
+                    if let Ok(plan) = component_plan(&grant.checkpoint, component) {
                         tier.read_ahead(&plan);
                     }
                 }
@@ -324,7 +322,7 @@ impl HostTier {
     fn read_ahead(&self, plan: &read::ReadPlan) {
         for item in &plan.items {
             if let Item::Object(range) = &item.source {
-                if let Ok(file) = File::open(self.store.blob_path(&range.obj.sha256)) {
+                if let Ok(file) = self.store.path(&v2(&range.obj)).map_err(storage::io_error).and_then(File::open) {
                     // SAFETY: advice on a descriptor we hold.
                     #[cfg(target_os = "linux")]
                     unsafe {
@@ -403,13 +401,12 @@ impl HostTier {
         {
             return Err(denied("plan leaves the selected components"));
         }
-        let mut read_plan = read::plan_for_traversal(
-            &grant.header,
+        let mut read_plan = plan_for_traversal(
+            &grant.checkpoint,
             &plan.traversal,
             &plan.components,
             plan.window,
-        )
-        .map_err(failure)?;
+        )?;
         if !plan.parts.is_empty() {
             read_plan = read_plan.select(&plan.parts).map_err(failure)?;
         }
@@ -533,10 +530,10 @@ impl HostTier {
         // A window reads any region at any time: everything it may read is here first.
         if let Some(fetch) = fetch {
             let objects: Vec<_> = read_plan.items.iter().filter_map(|item| match &item.source {
-                Item::Object(range) => Some(range.obj.clone()),
+                Item::Object(range) => Some(v2(&range.obj)),
                 Item::Inline(_) => None,
             }).collect();
-            fetch.wait(&crate::access::held(&self.store, &plan.manifest)?, &objects)?;
+            fetch.wait(&plan.manifest, &objects)?;
         }
         let span = layout
             .regions
@@ -590,15 +587,10 @@ impl HostTier {
         state.ledger.windows_opened += 1;
         drop(state);
         self.filled.notify_all();
-        let (store, meta, threads) = (
-            self.store.clone(),
-            self.meta.clone(),
-            self.config.fill_threads,
-        );
-        let manifest = hex(&plan.manifest).to_string();
+        let (store, threads) = (self.store.clone(), self.config.fill_threads);
         std::thread::spawn(move || {
             if let Err(error) = serve(
-                &store, &meta, &manifest, &read_plan, &layout, open, threads, &tally, &stop,
+                &store, &read_plan, &layout, open, threads, &tally, &stop,
             ) {
                 // Dropping the window failed every region: its readers get the error.
                 tracing::warn!("host tier window stopped: {error}");
@@ -766,7 +758,7 @@ impl HostTier {
         fetch: Option<&Fetch>,
         copy: impl Fn(&[u32], &Source) -> varena::Result<()>,
     ) -> Result<(), (io::Error, Vec<u32>)> {
-        let objects = |batch: &[u32]| -> Vec<tensorfs_core::ids::ObjectRef> {
+        let objects = |batch: &[u32]| -> Vec<ids::ObjectRef> {
             let mut objects = BTreeMap::new();
             for &r in batch {
                 for item in &layout.regions[r as usize].items {
@@ -781,21 +773,16 @@ impl HostTier {
         while at < regions.len() {
             let rest = || regions[at..].to_vec();
             if let Some(fetch) = fetch {
-                let waited = crate::access::held(&self.store, manifest)
-                    .and_then(|held| fetch.wait(&held, &objects(&regions[at..=at])));
-                waited.map_err(|error| (error, rest()))?;
+                let wanted: Vec<_> = objects(&regions[at..=at]).iter().map(v2).collect();
+                fetch.wait(manifest, &wanted).map_err(|error| (error, rest()))?;
             }
-            let here = |r: &u32| objects(&[*r]).iter().all(|o| self.store.contains(&o.sha256));
+            let here = |r: &u32| objects(&[*r]).iter().all(|o| storage::present(&self.store, &v2(o)));
             let end = at + 1 + regions[at + 1..].iter().take_while(|r| here(r)).count();
             let batch = &regions[at..end];
             let copied = match objects(batch) {
                 listed if listed.is_empty() => copy(batch, &Source::files(Vec::new(), false, 0)).map_err(failure),
-                listed => read::acquire(&self.store, &self.meta, hex(manifest), listed)
-                    .map_err(failure)
-                    .and_then(|(lease, _)| {
-                        let source = Source::new(self.store.clone(), self.meta.clone(), lease, true, 0);
-                        copy(batch, &source).map_err(failure)
-                    }),
+                listed => files(&self.store, listed)
+                    .and_then(|files| copy(batch, &Source::files(files, true, 0)).map_err(failure)),
             };
             copied.map_err(|error| (error, rest()))?;
             at = end;
@@ -840,19 +827,10 @@ impl HostTier {
             }
         }
         if let Some(fetch) = fetch {
-            let all: Vec<_> = objects.values().cloned().collect();
-            fetch.wait(&crate::access::held(&self.store, &plan.manifest)?, &all)?;
+            let all: Vec<_> = objects.values().map(v2).collect();
+            fetch.wait(&plan.manifest, &all)?;
         }
-        objects
-            .into_values()
-            .map(|obj| {
-                let verified = self.store.open_verified(&obj.sha256).map_err(failure)?;
-                if verified.len() != obj.length {
-                    return Err(failure(format!("{}: length differs", obj.sha256)));
-                }
-                Ok((obj, verified.into_file()))
-            })
-            .collect()
+        files(&self.store, objects.into_values().collect())
     }
 
     /// Release unheld layouts, least recently used first, until `want` bytes were charged
@@ -1058,8 +1036,6 @@ impl HostTier {
 #[allow(clippy::too_many_arguments)]
 fn serve(
     store: &Arc<Store>,
-    meta: &Arc<Meta>,
-    manifest: &str,
     read_plan: &read::ReadPlan,
     layout: &Layout,
     open: OpenWindow,
@@ -1073,9 +1049,7 @@ fn serve(
             objects.insert(range.obj.sha256.clone(), range.obj.clone());
         }
     }
-    let (lease, _) =
-        read::acquire(store, meta, manifest, objects.into_values().collect()).map_err(failure)?;
-    let source = Source::new(store.clone(), meta.clone(), lease, true, 0);
+    let source = Source::files(files(store, objects.into_values().collect())?, true, 0);
     open.serve(layout, &source, threads, tally, stop)
         .map_err(failure)
 }
@@ -1098,20 +1072,81 @@ pub fn objects_digest(files: &[(tensorfs_core::ids::ObjectRef, File)]) -> String
     format!("{:x}", Sha256::digest(lines.as_bytes()))
 }
 
-/// One component's whole read plan, from its header.
-fn component_plan(header: &Header, component: &str) -> io::Result<read::ReadPlan> {
-    let traversal: Vec<(String, String)> = header
-        .components
-        .iter()
-        .filter(|(name, _)| name == component)
-        .flat_map(|(name, tensors)| {
-            tensors
-                .iter()
-                .map(move |(key, _)| (name.clone(), key.clone()))
-        })
+fn v1(object: &format::ObjectRef) -> ids::ObjectRef {
+    ids::ObjectRef { sha256: object.sha256.clone(), length: object.length }
+}
+
+fn v2(object: &ids::ObjectRef) -> format::ObjectRef {
+    format::ObjectRef { sha256: object.sha256.clone(), length: object.length }
+}
+
+/// `objects`' files, opened through the store, for the plane to read.
+fn files(store: &Store, objects: Vec<ids::ObjectRef>) -> io::Result<Vec<(ids::ObjectRef, File)>> {
+    objects
+        .into_iter()
+        .map(|object| Ok((store.file(&v2(&object)).map_err(storage::io_error)?, object)))
+        .map(|opened: io::Result<_>| opened.map(|(file, object)| (object, file)))
+        .collect()
+}
+
+/// One component's whole read plan.
+fn component_plan(checkpoint: &Checkpoint, component: &str) -> io::Result<read::ReadPlan> {
+    let traversal: Vec<(String, String)> = (checkpoint.header().component(component).into_iter())
+        .flat_map(|c| c.tensors.iter().map(|t| (component.to_string(), t.key.clone())))
         .collect();
-    read::plan_for_traversal(header, &traversal, &[component.to_string()], 4 << 20)
-        .map_err(failure)
+    plan_for_traversal(checkpoint, &traversal, &[component.to_string()], 4 << 20)
+}
+
+/// The plane's read plan over `checkpoint` in the executor's `traversal` order: every part of
+/// every tensor of the `requested` components, as ranges of the chunks that hold it, split at
+/// `window` (0: whole). A plain tensor's part is `value`. Completeness is per requested
+/// component: a traversal that omits a tensor of one, or names one outside them, refuses.
+pub fn plan_for_traversal(
+    checkpoint: &Checkpoint,
+    traversal: &[(String, String)],
+    requested: &[String],
+    window: u64,
+) -> io::Result<read::ReadPlan> {
+    let refuse = |why: String| Err(io::Error::new(io::ErrorKind::InvalidInput, why));
+    let header = checkpoint.header();
+    let scope: BTreeSet<&str> = requested.iter().map(String::as_str).collect();
+    if scope.is_empty() || scope.len() != requested.len() {
+        return refuse("a plan requests a set of components".into());
+    }
+    let mut carried: BTreeSet<(&str, &str)> = BTreeSet::new();
+    for component in &scope {
+        let Some(c) = header.component(component) else {
+            return refuse(format!("the checkpoint has no component {component:?}"));
+        };
+        carried.extend(c.tensors.iter().map(|t| (*component, t.key.as_str())));
+    }
+    let (mut items, mut dest) = (Vec::new(), 0u64);
+    for (component, key) in traversal {
+        if !carried.remove(&(component.as_str(), key.as_str())) {
+            return refuse(format!("the traversal names {component}/{key} twice or outside {scope:?}"));
+        }
+        let tensor = header.tensor(component, key).expect("a carried tensor");
+        for (role, at) in tensor.locations() {
+            let role = if role.is_empty() { "value" } else { role };
+            let what = format!("{component}/{key}#{role}");
+            for span in header.spans(&at) {
+                let mut off = 0;
+                while off < span.length {
+                    let len = match window {
+                        0 => span.length - off,
+                        window => window.min(span.length - off),
+                    };
+                    let range = read::ObjectRange { obj: v1(&header.chunks[span.chunk]), off: span.start + off, len };
+                    items.push(read::PlanItem { what: what.clone(), dest_off: dest, len, source: Item::Object(range) });
+                    (dest, off) = (dest + len, off + len);
+                }
+            }
+        }
+    }
+    if let Some((component, key)) = carried.into_iter().next() {
+        return refuse(format!("the traversal omits {component}/{key} of {scope:?}"));
+    }
+    Ok(read::ReadPlan { items, bytes: dest, io_bytes: dest, inline_parts: 0, order: read::Order::Destination })
 }
 
 #[cfg(test)]

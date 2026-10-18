@@ -13,7 +13,7 @@ use std::{
 
 use cozy_platform::tools;
 use cozy_proto::machine::{KernelVerdict, Toolchain};
-use tensorfs_core::transport::PullCancellation;
+use crate::stop::Stop;
 
 use crate::process::Supervised;
 
@@ -93,7 +93,7 @@ pub fn probe(dir: &Path, cuda_home: Option<&Path>, path: &[PathBuf]) -> Toolchai
 
 /// Installs the toolchain's wheels with the machine's pinned `uv` into a staging directory, then
 /// puts it in place whole. A stop ends it (Interrupted).
-pub fn install(dir: &Path, uv: &Path, stop: &PullCancellation) -> io::Result<()> {
+pub fn install(dir: &Path, uv: &Path, stop: &Stop) -> io::Result<()> {
     super::client::ensure_uv(uv)?;
     let staging = dir.with_extension("partial");
     let _ = fs::remove_dir_all(&staging);

@@ -17,7 +17,8 @@ use std::{
     time::{Duration, Instant},
 };
 use tensord::api::v1::client::Auth;
-use tensorfs_core::{ids::ObjectRef, sha256, store::Store};
+use tensord::storage::{self, Store};
+use tensorfs_core::{format::ObjectRef, sha256};
 
 const WORKER: &str = "root-test";
 const OWNER: [u8; 32] = [44; 32];
@@ -175,17 +176,13 @@ async fn the_named_store_is_the_machines_store() {
     let named = root.join("box/tensorfs");
     let kept = b"weights the box already holds".to_vec();
     let kept_hex = sha256::hex(&sha256::digest(&kept));
-    {
-        let store = Store::ensure(&named).unwrap();
-        let object = ObjectRef {
-            sha256: kept_hex.clone(),
-            length: kept.len() as u64,
-        };
-        store
-            .put_stream(&mut &kept[..], Some(&object), &Default::default())
-            .unwrap();
-    }
-    let blob = Store::open(&named).unwrap().object_path(&kept_hex);
+    let object = ObjectRef { sha256: kept_hex.clone(), length: kept.len() as u64 };
+    let blob = {
+        let store = storage::open(&named).unwrap();
+        store.put_bytes(&kept).unwrap();
+        storage::hold(&store, &storage::pin::object(&kept_hex), vec![object.clone()], None).unwrap();
+        store.path(&object).unwrap()
+    };
     let inode = FileId::at(&blob).unwrap();
 
     let machine_root = root.join("machine");
@@ -204,7 +201,8 @@ async fn the_named_store_is_the_machines_store() {
     assert_eq!(held, [(0, length)]);
 
     let store = Store::open(&named).unwrap();
-    assert!(store.contains(&written_hex), "the write went elsewhere");
+    let written = ObjectRef { sha256: written_hex, length };
+    assert!(storage::present(&store, &written), "the write went elsewhere");
     assert_eq!(std::fs::read(&blob).unwrap(), kept);
     assert_eq!(FileId::at(&blob).unwrap(), inode);
     assert!(

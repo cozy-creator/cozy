@@ -14,7 +14,7 @@ use std::{
     sync::{Arc, Condvar, Mutex, OnceLock, Weak},
     time::Duration,
 };
-use tensorfs_core::transport::PullCancellation;
+use crate::stop::Stop as Cancel;
 #[cfg(unix)]
 use std::{
     ffi::CString,
@@ -75,7 +75,7 @@ pub struct Engine {
     /// Held while a run takes object references, and while unneeded roots are released.
     pub(crate) object_custody: Mutex<()>,
     /// Each supervised attempt's stop.
-    active: Mutex<HashMap<String, Stop>>,
+    active: Mutex<HashMap<String, Halt>>,
     owned: Mutex<HashSet<String>>,
     progress: Mutex<HashMap<String, ProgressSnapshot>>,
     activity: Mutex<u64>,
@@ -83,7 +83,7 @@ pub struct Engine {
     /// What holds a memoizable run's success for its signer (`call_memo`), once configured.
     memo: OnceLock<Weak<crate::objects::Objects>>,
     /// Each preparing run's stop, and whether it has begun what cannot stop (`Stoppable`).
-    preparations: Mutex<HashMap<String, (PullCancellation, bool)>>,
+    preparations: Mutex<HashMap<String, (Cancel, bool)>>,
 }
 
 /// One run's preparation, registered while it lasts: its cancel stops `stop`, which ends the
@@ -91,7 +91,7 @@ pub struct Engine {
 pub struct Stoppable {
     engine: Arc<Engine>,
     id: String,
-    pub stop: PullCancellation,
+    pub stop: Cancel,
 }
 impl Stoppable {
     /// From here on the run cannot stop (an upload finalizing at its Hub): it refuses
@@ -113,7 +113,7 @@ impl Drop for Stoppable {
 
 /// A cancel of a preparing run past its point of no return is refused; any other stops it.
 fn stop_preparation(
-    preparations: &HashMap<String, (PullCancellation, bool)>,
+    preparations: &HashMap<String, (Cancel, bool)>,
     id: &str,
     journal: impl FnOnce() -> io::Result<Execution>,
 ) -> io::Result<Execution> {
@@ -130,7 +130,7 @@ fn stop_preparation(
     Ok(record)
 }
 
-type Stop = Arc<dyn Fn() -> io::Result<()> + Send + Sync>;
+type Halt = Arc<dyn Fn() -> io::Result<()> + Send + Sync>;
 
 impl Engine {
     pub fn open(root: &Path) -> io::Result<Arc<Self>> {
@@ -159,7 +159,7 @@ impl Engine {
     /// Registers run `id`'s preparation until the answer is dropped. A cancel journaled before
     /// it registered stops it at once.
     pub fn stoppable(self: &Arc<Self>, id: &str) -> Stoppable {
-        let stop = PullCancellation::default();
+        let stop = Cancel::default();
         self.preparations.lock().unwrap().insert(id.into(), (stop.clone(), false));
         if self.get(id).is_ok_and(|record| record.cancel_actor.is_some()) {
             stop.cancel();
@@ -437,7 +437,7 @@ impl Engine {
         id: &str,
         digest: &str,
         invocation: Invocation,
-        objects: &[tensorfs_core::ids::ObjectRef],
+        objects: &[tensorfs_core::format::ObjectRef],
     ) -> io::Result<(Execution, bool)> {
         let mut owned = self.owned.lock().unwrap();
         let (record, new) = self
@@ -907,7 +907,7 @@ impl Engine {
         self: &Arc<Self>,
         id: &str,
         birth: Birth,
-        cancel: Stop,
+        cancel: Halt,
     ) -> io::Result<()> {
         self.journal
             .lock()

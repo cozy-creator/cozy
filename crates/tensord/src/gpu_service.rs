@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     fs::{self, File},
-    io::{self, Read, Write},
+    io::{self, Write},
     path::{Path, PathBuf},
     sync::{
         atomic::Ordering,
@@ -35,7 +35,7 @@ use std::{
     },
     time::Instant,
 };
-use tensorfs_core::store::Store;
+use crate::storage::Store;
 
 fn threads() -> u32 {
     crate::launch_identity::DEFAULT_THREADS
@@ -1264,10 +1264,7 @@ impl Pool {
     }
     /// Whether the store holds the structure of every model `plan` binds.
     pub fn holds(&self, plan: &Plan) -> bool {
-        plan.selections().iter().all(|selected| {
-            let hex = selected.manifest.trim_start_matches("sha256:");
-            self.store.manifest_path(hex).exists()
-        })
+        plan.selections().iter().all(|selected| crate::storage::held(&self.store, &selected.manifest).is_ok())
     }
     /// Every object its constructions read up front is here: `downloaded`.
     pub fn downloaded(&self, plan: &Plan) -> bool {
@@ -1555,10 +1552,9 @@ impl Pool {
             }
             let grant = grants[0];
             if !constructed(model) {
-                let hex = grant.manifest.trim_start_matches("sha256:");
-                let length = fs::metadata(self.store.manifest_path(hex))
+                let length = crate::storage::held(&self.store, &grant.manifest)
                     .map_err(|_| invalid(&format!("the checkpoint of {path} is not held here")))?
-                    .len();
+                    .length;
                 if chosen.and_then(|c| c.manifest.as_ref()).is_some_and(|r| r.length != 0 && r.length != length) {
                     return Err(io::Error::new(io::ErrorKind::InvalidInput, "selected manifest length differs from cached bytes"));
                 }
@@ -1680,13 +1676,8 @@ impl Pool {
     fn held_grant(&self, package: &str, path: &str, reference: &crate::api::domain::Ref) -> io::Result<ModelGrant> {
         let sha = tensorfs_core::sha256::hex(&reference.digest);
         let absent = |why: String| io::Error::new(io::ErrorKind::NotFound, format!("checkpoint_absent: {path} names sha256:{sha}: {why}"));
-        let object = tensorfs_core::ids::ObjectRef { sha256: sha.clone(), length: reference.length };
-        let manifest = self.store.read_manifest(&object).map_err(|e| absent(e.to_string()))?;
-        let header = manifest
-            .header()
-            .map(|header| tensorfs_core::checkpoint::load_header(&self.store, header))
-            .transpose()
-            .map_err(|e| absent(e.to_string()))?;
+        let object = tensorfs_core::format::ObjectRef { sha256: sha.clone(), length: reference.length };
+        let checkpoint = self.store.checkpoint(&object).map_err(|e| absent(e.to_string()))?;
         Ok(ModelGrant {
             package: package.into(),
             slot: path.into(),
@@ -1694,7 +1685,7 @@ impl Pool {
             release: String::new(),
             lane: String::new(),
             manifest: format!("sha256:{sha}"),
-            components: header.map(|h| h.components.into_iter().map(|(name, _)| name).collect()).unwrap_or_default(),
+            components: checkpoint.header().components().iter().map(|c| c.name.clone()).collect(),
         })
     }
     fn permit(
@@ -2857,7 +2848,7 @@ impl Pool {
             .map(|selected| {
                 Ok(HostGrant {
                     manifest: selected.manifest.clone(),
-                    header: sources.authorized_header(&selected.manifest)?,
+                    checkpoint: sources.authorized(&selected.manifest)?,
                     components: selected.components.iter().cloned().collect(),
                 })
             })
@@ -4045,8 +4036,8 @@ fn copy_held(
     length: u64,
     local: &Path,
 ) -> io::Result<()> {
-    let sha = digest.strip_prefix("sha256:").unwrap_or(digest);
-    let mut source = store.open_verified(sha).map_err(io::Error::other)?.into_file();
+    let object = tensorfs_core::format::ObjectRef { sha256: digest.trim_start_matches("sha256:").into(), length };
+    let mut source = store.file(&object).map_err(crate::storage::io_error)?;
     let mut copy = cozy_platform::durable::Mode::mode(
         fs::OpenOptions::new().write(true).create_new(true),
         0o444,
@@ -4066,18 +4057,8 @@ fn copy_held(
 }
 
 fn held_bytes(store: &Store, digest: &str, length: u64) -> io::Result<Vec<u8>> {
-    let sha = digest.strip_prefix("sha256:").unwrap_or(digest);
-    let mut bytes = Vec::new();
-    store
-        .open_verified(sha)
-        .map_err(io::Error::other)?
-        .into_file()
-        .take(length + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() as u64 != length {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "a tree manifest changed length"));
-    }
-    Ok(bytes)
+    let object = tensorfs_core::format::ObjectRef { sha256: digest.trim_start_matches("sha256:").into(), length };
+    store.read(&object).map_err(crate::storage::io_error)
 }
 
 /// A tree manifest's files under `root`: each a relative path below it, each a held object.
@@ -4088,18 +4069,10 @@ fn materialize_tree(
     root: &Path,
 ) -> io::Result<()> {
     let invalid = |why: &str| io::Error::new(io::ErrorKind::InvalidData, format!("tree manifest: {why}"));
-    let document: serde_json::Value = serde_json::from_slice(manifest).map_err(|_| invalid("not JSON"))?;
-    let entries = document["entries"].as_array().ok_or_else(|| invalid("no entries"))?;
+    let document = crate::trees::parse(manifest).map_err(|_| invalid("not a tree of files"))?;
     fs::create_dir(root)?;
-    for entry in entries {
-        let (Some("file"), Some(path), Some(sha), Some(length)) = (
-            entry["kind"].as_str(),
-            entry["path"].as_str(),
-            entry["blob"]["sha256"].as_str(),
-            entry["blob"]["length"].as_u64(),
-        ) else {
-            return Err(invalid("an entry is not a file with a blob"));
-        };
+    for (path, object) in &document {
+        let (sha, length) = (&object.sha256, object.length);
         let relative = Path::new(path);
         let local = relative.components().all(|c| matches!(c, std::path::Component::Normal(_)));
         if !local || path.contains(['\\', '\0']) {
@@ -4815,7 +4788,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("gpu-integrated-{}", uuid::Uuid::new_v4()));
         let config: GpuConfig = serde_json::from_value(json!({"devices": "0",
             "authorized_device_limit_bytes": null, "prespawn": false})).unwrap();
-        let store = Arc::new(Store::ensure(&root.join("store")).unwrap());
+        let store = crate::storage::open(&root.join("store")).unwrap();
         let pool = Pool::new(&root.join("gpu"), config, store).unwrap();
         let host = cozy_platform::contain::host_memory::total();
         assert!(host > 0);
@@ -4851,7 +4824,7 @@ int nvmlDeviceGetDisplayActive(void *d, int *s) { *s = 0; return 0; }
         let devices: Vec<_> = (0..width).map(|gpu| format!("GPU-test-{gpu}")).collect();
         let config: GpuConfig = serde_json::from_value(json!({"devices": devices.join(","),
             "authorized_device_limit_bytes": null, "prespawn": false})).unwrap();
-        let store = Arc::new(Store::ensure(&root.join("store")).unwrap());
+        let store = crate::storage::open(&root.join("store")).unwrap();
         let pool = Pool::new(&root.join("gpu"), config, store).unwrap();
         let engine = Engine::open(&root.join("execution")).unwrap();
         (root, pool, engine)

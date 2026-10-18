@@ -1,5 +1,5 @@
 //! The machine's caches manage themselves, with no purge verb. Each expires a TTL after its
-//! last use. A disk is low when no more than its reserve is free (TensorFS `admission::Disk`).
+//! last use. A disk is low when no more than its reserve is free (`storage::Disk`).
 //! On a low disk a sweep frees what lifts it back above the reserve, but only when what it may
 //! drop together covers that; otherwise it drops only the store's garbage. The plan drops, in
 //! order: collected result copies, settled logs, memoized stages, downloaded wheels no
@@ -20,9 +20,9 @@ use std::{
     time::{Duration, SystemTime},
 };
 use cozy_platform::durable::{self, FileId};
-use tensorfs_core::store::Store;
+use crate::storage::{self, Store};
 
-pub use tensorfs_core::admission::Disk;
+pub use crate::storage::Disk;
 
 pub const TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// Installed or used within one sweep period counts as in use, even on a low disk: an
@@ -42,9 +42,9 @@ pub struct Swept {
     pub results: usize,
     pub kernels: usize,
     pub generations: usize,
-    /// Adapter views whose repositories went (`adapter_views::evict`).
+    /// Adapter views that expired.
     pub adapter_views: usize,
-    /// Bytes TensorFS's GC collected: garbage, and expired or evicted model caches.
+    /// Bytes the store's GC collected: garbage, and expired or evicted model caches.
     pub store_bytes: u64,
     /// Memoized stage results (`memo::Memo`).
     pub memo: usize,
@@ -396,18 +396,6 @@ fn unlinked_since(path: &Path) -> Option<SystemTime> {
     }
 }
 
-/// Bytes one store GC call freed, or None while a download holds the store: nothing of the
-/// store can be dropped this pass.
-fn collected(
-    report: tensorfs_core::err::Result<tensorfs_core::gc::Report>,
-) -> io::Result<Option<u64>> {
-    match report {
-        Ok(report) => Ok(Some(report.reclaimed_bytes)),
-        Err(busy) if busy.code == tensorfs_core::err::Code::STORE_BUSY => Ok(None),
-        Err(error) => Err(io::Error::other(error)),
-    }
-}
-
 /// TTL always; on a low disk, a covering plan or only garbage.
 pub fn sweep(caches: &Caches) -> io::Result<Swept> {
     let mut swept = Swept::default();
@@ -478,10 +466,9 @@ pub fn sweep(caches: &Caches) -> io::Result<Swept> {
     }
     // The TTL, low disk or not.
     if let Some(store) = &caches.store {
-        // Views share their closure with what they adapt: TTL only, never low-disk relief.
-        swept.adapter_views = crate::adapter_views::evict(store.store, &store.keep)?;
-        let expired = tensorfs_core::gc::collect_idle(store.store.root(), &store.keep, TTL);
-        swept.store_bytes += collected(expired)?.unwrap_or(0);
+        let expired = storage::expire(store.store, &store.keep, TTL)?;
+        swept.adapter_views = expired.pins.iter().filter(|id| id.starts_with("view-")).count();
+        swept.store_bytes += expired.bytes;
     }
     // Kernel namespaces stay locked from here until the sweep ends: an executor that starts
     // meanwhile waits for it.
@@ -508,8 +495,9 @@ pub fn sweep(caches: &Caches) -> io::Result<Swept> {
     // A store on its own filesystem is relieved under TensorFS's rule for it.
     let shared = match store {
         Some(store) if FileId::at(store.store.root())?.dev != filesystem => {
-            let relief = tensorfs_core::admission::relieve(store.store, &store.keep);
-            swept.store_bytes += relief.map_err(io::Error::other)?.collected_bytes;
+            if let Some(short) = Disk::measure(store.store.root())?.short() {
+                swept.store_bytes += storage::relieve(store.store, &store.keep, short)?.bytes;
+            }
             None
         }
         other => other,
@@ -520,11 +508,8 @@ pub fn sweep(caches: &Caches) -> io::Result<Swept> {
     // Garbage first: what nothing references costs nothing to drop.
     let mut models = 0;
     if let Some(store) = shared {
-        let root = store.store.root();
-        if let Some(garbage) = collected(tensorfs_core::gc::collect(root, false))? {
-            swept.store_bytes += garbage;
-            models = tensorfs_core::gc::reclaimable(root, &store.keep).map_err(io::Error::other)?;
-        }
+        swept.store_bytes += store.store.gc().map_err(storage::io_error)?.bytes;
+        models = storage::reclaimable(store.store, &store.keep)?.0.iter().map(|pin| pin.marginal).sum();
     }
     let Some(short) = (caches.disk)()?.short() else {
         return Ok(swept);
@@ -569,9 +554,7 @@ pub fn sweep(caches: &Caches) -> io::Result<Swept> {
     // Models after the local caches and before compiled kernels: the fewest least recently
     // used that cover what is still missing, or all of them when kernels must go too.
     if let (Some(store), Some(short)) = (shared.filter(|_| models > 0), (caches.disk)()?.short()) {
-        let (root, need) = (store.store.root(), short.min(models));
-        let report = tensorfs_core::gc::collect_cached_for(root, &store.keep, need);
-        swept.store_bytes += collected(report)?.unwrap_or(0);
+        swept.store_bytes += storage::relieve(store.store, &store.keep, short.min(models))?.bytes;
     }
     // Kernels go only if they alone cover what is still missing.
     let cover: u64 = kernels.iter().map(|(_, bytes)| bytes).sum();

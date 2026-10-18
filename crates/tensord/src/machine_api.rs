@@ -17,11 +17,8 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
-use tensorfs_core::{
-    ids::ObjectRef,
-    sha256,
-    store::Store,
-};
+use crate::storage::Store;
+use tensorfs_core::{format::ObjectRef, sha256};
 use cozy_proto::error::Error;
 
 pub struct NativeBackend {
@@ -506,11 +503,8 @@ impl MachineBackend for NativeBackend {
         let parts = refs
             .into_iter()
             .map(|r| {
-                let file = self
-                    .store
-                    .open_verified(&sha256::hex(&r.digest))
-                    .map_err(storage)?
-                    .into_file();
+                let object = ObjectRef { sha256: sha256::hex(&r.digest), length: r.length };
+                let file = self.store.file(&object).map_err(crate::storage::io_error).map_err(problem)?;
                 Ok((file, r.length))
             })
             .collect::<Result<Vec<_>, Error>>()?;
@@ -538,18 +532,13 @@ impl MachineBackend for NativeBackend {
         for (file, length) in tree.parts {
             file.take(length).read_to_end(&mut manifest).map_err(problem)?;
         }
-        let document: Value = serde_json::from_slice(&manifest)
-            .map_err(|_| Error::internal("custody_corrupt", "tree manifest is not JSON"))?;
-        let entry = document["entries"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .find(|entry| entry["path"] == member)
+        let document = crate::trees::parse(&manifest)
+            .map_err(|_| Error::internal("custody_corrupt", "tree manifest is invalid"))?;
+        let object = document
+            .get(member)
             .ok_or_else(|| Error::not_found("output_not_found", "the tree has no such member"))?;
-        let (Some(sha), Some(length)) = (entry["blob"]["sha256"].as_str(), entry["blob"]["length"].as_u64()) else {
-            return Err(Error::internal("custody_corrupt", "tree member names no blob"));
-        };
-        let file = self.store.open_verified(sha).map_err(storage)?.into_file();
+        let (sha, length) = (object.sha256.as_str(), object.length);
+        let file = self.store.file(object).map_err(storage)?;
         Ok(crate::api::backend::OutputSnapshot {
             parts: vec![(file, length)],
             length,
@@ -606,10 +595,11 @@ impl MachineBackend for NativeBackend {
             .engine
             .with_journal(|j| j.object(&actor_id(actor), sha256))
             .map_err(problem)?;
-        if held.is_none() {
+        let Some(length) = held else {
             return Err(Error::not_found("object_not_found", "this signer wrote no such object"));
-        }
-        Ok(self.store.open_verified(sha256).map_err(storage)?.into_file())
+        };
+        let object = ObjectRef { sha256: sha256.to_string(), length };
+        self.store.file(&object).map_err(storage)
     }
     fn list_packages(
         &self,
@@ -1289,7 +1279,7 @@ print(json.dumps({"identity": generation.identity}))
             "this test dispatches the run itself"
         );
         let engine = service.engine.clone();
-        let store = Arc::new(Store::ensure(&state.join("tensorfs")).unwrap());
+        let store = crate::storage::open(&state.join("tensorfs")).unwrap();
         let signer = ed25519_dalek::SigningKey::from_bytes(&[41; 32]);
         let machine = MachineIdentity::ephemeral(
             "products".into(),
@@ -1689,7 +1679,7 @@ mod terminal_tests {
         let root = std::env::temp_dir().join(format!("cm-terminal-{}", uuid::Uuid::new_v4()));
         let service = Service::open(&root.join("state"), &root.join("generations"), 1).unwrap();
         assert!(service.stop().unwrap(), "the test moves the run itself");
-        let store = Arc::new(Store::ensure(&root.join("store")).unwrap());
+        let store = crate::storage::open(&root.join("store")).unwrap();
         let signer = ed25519_dalek::SigningKey::from_bytes(&[44; 32]);
         let machine =
             crate::api::MachineIdentity::ephemeral("terminal".into(), vec![signer.verifying_key()], vec![7; 32]).unwrap();

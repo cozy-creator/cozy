@@ -17,7 +17,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 use crate::process::Supervised;
-use tensorfs_core::{store::Store, transport::PullCancellation};
+use crate::{origin::Machine, stop::Stop};
 
 /// The file in a selected pair naming its development Runtime build (`0.24.6+e9baf7a4`),
 /// which runs report: a named wheel file is not a published release.
@@ -337,10 +337,10 @@ pub struct Updates {
     status: Mutex<Option<Status>>,
     idle: Box<dyn Fn() -> bool + Send + Sync>,
     lifecycle: Option<Arc<super::lifecycle::Lifecycle>>,
-    /// Where published wheels land (`pypi::wheel`).
-    store: Option<Arc<Store>>,
+    /// The downloader published wheels land through (`pypi::wheel`).
+    machine: Option<Arc<Machine>>,
     /// The running update's stop: its cancel ends the download in flight.
-    stop: Mutex<PullCancellation>,
+    stop: Mutex<Stop>,
     /// The build toolchain as last probed: at start and after each install.
     toolchain: Mutex<Option<cozy_proto::machine::Toolchain>>,
 }
@@ -350,7 +350,7 @@ impl Updates {
         paths: Paths,
         idle: Box<dyn Fn() -> bool + Send + Sync>,
         lifecycle: Option<Arc<super::lifecycle::Lifecycle>>,
-        store: Option<Arc<Store>>,
+        machine: Option<Arc<Machine>>,
     ) -> io::Result<Arc<Self>> {
         fs::create_dir_all(paths.update("staged"))?;
         cozy_platform::durable::sync_dir(&paths.engine)?;
@@ -369,7 +369,7 @@ impl Updates {
             status: Mutex::new(status),
             idle,
             lifecycle,
-            store,
+            machine,
             stop: Mutex::default(),
             toolchain: Mutex::default(),
         }))
@@ -584,7 +584,7 @@ impl Updates {
         status.enter("waiting");
         write_json(&self.paths.update("status.json"), &status).map_err(server)?;
         *current = Some(status.clone());
-        *self.stop.lock().unwrap() = PullCancellation::default();
+        *self.stop.lock().unwrap() = Stop::default();
         drop(current);
         let updates = self.clone();
         std::thread::Builder::new()
@@ -886,10 +886,10 @@ impl Updates {
     /// PyPI, each with its digest checked.
     fn resolve(&self, distribution: &str, choice: &Choice) -> io::Result<PathBuf> {
         if !choice.url.is_empty() {
-            let store = self.store.as_ref().ok_or_else(|| invalid("this machine fetches no wheels"))?;
+            let machine = self.machine.as_ref().ok_or_else(|| invalid("this machine fetches no wheels"))?;
             let stop = self.stop.lock().unwrap().clone();
             let dir = self.paths.update("downloads");
-            return super::pypi::wheel_at(&choice.url, &choice.sha256, &choice.file, &dir, store, &stop);
+            return super::pypi::wheel_at(&choice.url, &choice.sha256, &choice.file, &dir, machine, &stop);
         }
         if !choice.file.is_empty() {
             let path = self
@@ -909,9 +909,9 @@ impl Updates {
         if choice.version.is_empty() {
             return Err(invalid("a pair member names a staged file or a version"));
         }
-        let store = self.store.as_ref().ok_or_else(|| invalid("this machine fetches no published wheels"))?;
+        let machine = self.machine.as_ref().ok_or_else(|| invalid("this machine fetches no published wheels"))?;
         let stop = self.stop.lock().unwrap().clone();
-        super::pypi::wheel(distribution, &choice.version, &self.paths.update("downloads"), store, &stop)
+        super::pypi::wheel(distribution, &choice.version, &self.paths.update("downloads"), machine, &stop)
     }
 }
 

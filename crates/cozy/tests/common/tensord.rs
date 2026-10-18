@@ -35,6 +35,11 @@ pub fn stranger() -> String {
 }
 
 impl Tensord {
+    /// Its store's root.
+    pub fn store(&self) -> std::path::PathBuf {
+        self.root.path().join("machine/var/lib/tensorfs")
+    }
+
     /// Starts a machine that admits the controllers holding `keys` (base64url Ed25519 public keys).
     pub fn start(keys: &[String]) -> Self {
         Self::start_with(keys, &[])

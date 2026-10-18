@@ -94,7 +94,7 @@ fn same_filename_activation_installs_new_runtime_and_retains_old_generation() {
         objects::Objects, service::Service,
     };
     use std::{path::PathBuf, process::Command, sync::Arc};
-    use tensorfs_core::{sha256, store::Store};
+    use tensorfs_core::sha256;
     assert_eq!(std::env::var("UV_OFFLINE").unwrap(), "1");
     let artifact = |name: &str| PathBuf::from(std::env::var(name).expect(name));
     let (a, b, tensorfs, report) = (
@@ -127,7 +127,7 @@ fn same_filename_activation_installs_new_runtime_and_retains_old_generation() {
     let client = client::wheel(&engine).unwrap();
     let helper = client::helper(&engine, Path::new("uv"), &client).unwrap();
     let service = Service::open(&engine, &generations, 1).unwrap();
-    let store = Arc::new(Store::ensure(&root.join("tensorfs")).unwrap());
+    let store = crate::storage::open(&root.join("tensorfs")).unwrap();
     let objects = Arc::new(
         Objects::new(&root.join("writes"), store.clone(), service.engine.clone()).unwrap(),
     );

@@ -20,13 +20,15 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
-use tensord::hub::{Capability, Catalog, Leaf, Op, Publication, Source};
-use tensorfs_core::{
-    err::Code,
-    ids::ObjectRef,
-    store::Store,
-    transport::{PullCancellation, SAMPLE_SECONDS},
+use tensord::{
+    hub::{Capability, Catalog, Leaf, Op, Source},
+    origin::Publication,
+    stop::Stop,
 };
+use tensorfs_core::{err::Code, format::ObjectRef, store2::Store};
+
+/// The patience a stopped publication is held to.
+const SAMPLE_SECONDS: f64 = 1.0;
 
 /// The most objects this Hub takes in one grant or verify request.
 const SELECTION: usize = 3;
@@ -235,12 +237,18 @@ fn weight(at: usize, size: usize) -> Vec<u8> {
     bytes
 }
 
-/// A store holding a checkpoint with one object per entry of `sizes` (bytes, multiples of 4).
+/// A store holding a checkpoint whose closure has one object per entry of `sizes` (a file of
+/// the manifest each), besides its header and chunk.
 fn store(name: &str, sizes: &[usize]) -> (std::path::PathBuf, Store, ObjectRef) {
+    use tensorfs_core::{format::Dtype, writer::{Data, Source}};
     let root = std::env::temp_dir().join(format!("td-publication-{name}-{}", uuid::Uuid::new_v4()));
-    let store = Store::ensure(&root).unwrap();
-    let weights: Vec<Vec<u8>> = sizes.iter().enumerate().map(|(at, size)| weight(at, *size)).collect();
-    let manifest = hub_oauth::tensors(&store, &weights.iter().map(Vec::as_slice).collect::<Vec<_>>());
+    let store = Store::open(&root).unwrap();
+    let mut writer = store.writer(None, None).unwrap();
+    writer.put("model", "weight", &Dtype::F32, &[1], Data::Plain(Source::Read(&mut &[0u8; 4][..]))).unwrap();
+    for (at, size) in sizes.iter().enumerate() {
+        writer.file(&format!("files/{at}"), &weight(at, *size)).unwrap();
+    }
+    let manifest = writer.commit().unwrap();
     (root, store, manifest)
 }
 
@@ -392,7 +400,7 @@ fn a_stopped_publication_finalizes_nothing_and_resumes() {
         state.blocked = blocked.clone();
     }
     let catalog = catalog(&source);
-    let stop = PullCancellation::default();
+    let stop = Stop::default();
     let (stopped, took) = std::thread::scope(|scope| {
         let running = scope.spawn(|| catalog.publish(&Publication { stop: Some(&stop), ..publication(&store, &manifest, "stopped") }));
         let started = Instant::now();

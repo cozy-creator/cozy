@@ -17,12 +17,8 @@ use std::{
     io::{self, Read},
     path::{Component, Path, PathBuf},
 };
-use tensorfs_core::{
-    ids::{ObjectRef, StoredDoc},
-    manifest::{Draft, Entry},
-    sha256, source_artifact,
-    store::{Fault, Store},
-};
+use crate::storage::{self, Store};
+use tensorfs_core::{format::ObjectRef, sha256};
 
 const MAX_PARTS: usize = 128;
 
@@ -30,8 +26,8 @@ fn storage(error: impl std::fmt::Display) -> io::Error {
     io::Error::other(error.to_string())
 }
 
-/// Retain one byte string as a sealed one-file native tree named by `owner`, bound to `actor`
-/// so a reader with that actor's capability can fetch it. Idempotent per owner.
+/// Retain one byte string as a one-file tree named by `owner`, bound to `actor` so a reader
+/// with that actor's capability can fetch it. Idempotent per owner.
 pub fn retain(
     store: &Store,
     engine: &Engine,
@@ -40,34 +36,19 @@ pub fn retain(
     source: &mut File,
     object: &ObjectRef,
 ) -> io::Result<domain::NativeByteRetentionRequest> {
-    let tree = Draft {
-        entries: vec![("payload".into(), Entry::File(object.clone()))],
+    // Bytes the store already holds (a product published while the run made it, a memoized
+    // or child result) are not read again.
+    if !store.reuse(object).map_err(storage::io_error)? {
+        store.put(source, Some(object)).map_err(storage::io_error)?;
     }
-    .seal()
-    .map_err(storage)?;
-    // The writer's shared guard excludes GC until its standing root records the member.
-    let mut writer =
-        source_artifact::Writer::open(store, owner, tree.object_ref().map_err(storage)?)
-            .map_err(storage)?;
-    if !writer.completed().map_err(storage)? {
-        // Bytes the store already holds verified (a product published while the run made
-        // it, a memoized or child result) are not read again.
-        if !held(store, object) {
-            store
-                .put_stream(source, Some(object), &Fault::default())
-                .map_err(storage)?;
-        }
-        writer.landed(object).map_err(storage)?;
-    }
-    let root = writer.finish(&tree).map_err(storage)?;
-    let receipt = root.receipt().map_err(storage)?;
+    let tree = crate::trees::put(store, owner, [("payload".to_string(), object.clone())].into())?;
     let native = domain::NativeByteRetentionRequest {
         source: Some(domain::NativeByteTreeRef {
-            producer_root_id: root.producer,
-            receipt_digest: sha256::digest(&receipt).to_vec(),
+            producer_root_id: tree.pin,
+            receipt_digest: unhex(&tree.manifest.sha256)?,
             manifest: Some(domain::Ref {
-                digest: unhex(&root.manifest.sha256)?,
-                length: root.manifest.length,
+                digest: unhex(&tree.manifest.sha256)?,
+                length: tree.manifest.length,
             }),
             content_bytes: object.length,
         }),
@@ -75,11 +56,6 @@ pub fn retain(
     };
     engine.bind_native_output(actor, owner, &crate::archive::encode_native_byte_retention_request(&native))?;
     Ok(native)
-}
-
-/// The store holds `object`'s exact bytes and trusts them without hashing them again.
-pub(crate) fn held(store: &Store, object: &ObjectRef) -> bool {
-    store.record_valid(&object.sha256).is_ok_and(|row| row.length == object.length)
 }
 
 fn unhex(text: &str) -> io::Result<Vec<u8>> {
@@ -336,7 +312,7 @@ fn commit(
 /// An adopted weights output as a product of its run's log: its bytes are the output's
 /// manifest (`weights::MANIFEST_MEDIA`), held in the machine's store; the same manifest
 /// adopted again adds nothing.
-pub fn record_manifest(engine: &Engine, id: &str, output: &str, manifest: &tensorfs_core::ids::ObjectRef) -> io::Result<u64> {
+pub fn record_manifest(engine: &Engine, id: &str, output: &str, manifest: &tensorfs_core::format::ObjectRef) -> io::Result<u64> {
     let content = domain::Ref {
         digest: unhex(&manifest.sha256)?,
         length: manifest.length,

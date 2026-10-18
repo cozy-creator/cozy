@@ -1,34 +1,42 @@
 //! A checkpoint put in a Hub repository's custody (the Hub's incremental publication): its
-//! closure is declared under one idempotent operation, only the objects the Hub lacks are
-//! pushed under its signed grants (TensorFS's mover carries the bytes) and verified, and the
-//! publication is finalized. The Hub's finalization job is the commit's only authority, so the
-//! call follows it to its end. A checkpoint the repository already holds converges with no
-//! transfer.
+//! closure (manifest, files, header, chunks) is declared under one idempotent operation, only the
+//! objects the Hub lacks are PUT to their presigned final keys and verified, and the publication
+//! is finalized. The Hub's finalization job is the commit's only authority, so the call follows it
+//! to its end. A checkpoint the repository already holds converges with no transfer.
 //!
-//! The caller may stop it until it finalizes: pushes in flight end within a sampling tick and
-//! nothing is finalized, so no checkpoint appears. The Hub keeps every object it verified (the
-//! publication's holds last until it idles out), so asking again resumes from there.
-use std::collections::BTreeMap;
-use std::future::Future;
-use std::sync::{mpsc, Mutex};
-use std::time::{Duration, Instant};
-
-use hub_client::{types, ResponseValue};
-use tensorfs_core::checkpoint::walk_cozytensors;
-use tensorfs_core::err::{refuse, Code, Refusal, Result};
-use tensorfs_core::ids::ObjectRef;
-use tensorfs_core::store::Store;
-use tensorfs_core::transport::{
-    push_object, Deadline, Ledger, PullCancellation, UploadGrant, FETCH_ATTEMPTS,
-    RETRYABLE_STATUS,
+//! U11: the Hub's finalize must decode the v2 manifest and header (JSON) to check this closure;
+//! today it walks a v1 checkpoint with `tfs`. The calls and their shapes stay as they are.
+//!
+//! The caller may stop it until it finalizes: PUTs in flight end within a tick and nothing is
+//! finalized. The Hub keeps every object it verified, so asking again resumes from there.
+use std::{
+    collections::BTreeMap,
+    future::Future,
+    sync::{mpsc, Mutex},
+    time::{Duration, Instant},
 };
 
-use super::{block, Catalog};
+use hub_client::{types, ResponseValue};
+use tensorfs_core::{
+    err::{refuse, Code, Refusal, Result},
+    format::ObjectRef,
+    store2::Store,
+};
+
+use crate::{
+    hub::{block, Catalog},
+    stop::Stop,
+};
 
 /// Renew stale authority at most twice per object; fresh permission refusals are terminal.
 const GRANT_RENEWALS: usize = 2;
+/// Asks of one Hub call, and sends of one object.
+const ATTEMPTS: u32 = 4;
+/// Statuses that mean "not now".
+const RETRYABLE: [u16; 7] = [408, 425, 429, 500, 502, 503, 504];
 /// How often a wait looks at the caller's stop.
 const TICK: Duration = Duration::from_millis(200);
+const FORBIDDEN: &str = "the object store answered HTTP 403 to the PUT";
 
 pub struct Publication<'a> {
     pub store: &'a Store,
@@ -39,10 +47,10 @@ pub struct Publication<'a> {
     pub operation: &'a str,
     /// Bytes the Hub holds of the closure, and its total.
     pub progress: &'a (dyn Fn(u64, u64) + Sync),
-    /// Pushes in flight.
+    /// PUTs in flight.
     pub streams: usize,
-    /// Stops the publication before it finalizes (the module note).
-    pub stop: Option<&'a PullCancellation>,
+    /// Stops the publication before it finalizes.
+    pub stop: Option<&'a Stop>,
     /// Asked once every object is held, just before finalizing, which cannot be taken back:
     /// false stops the publication there, as `stop` does.
     pub commit: &'a (dyn Fn() -> bool + Sync),
@@ -58,7 +66,8 @@ pub struct Published {
 }
 
 struct Grant {
-    upload: UploadGrant,
+    url: String,
+    headers: Vec<(String, String)>,
     received: Instant,
     lifetime: Option<Duration>,
 }
@@ -79,7 +88,7 @@ struct Heartbeat {
     next: Instant,
 }
 
-enum UploadEvent {
+enum Event {
     Granted(String, Option<Heartbeat>),
     Finished(String),
 }
@@ -89,6 +98,10 @@ fn heartbeat(grant: &Grant) -> Option<Heartbeat> {
         let period = (life / 2).max(Duration::from_millis(1));
         Heartbeat { period, next: grant.received + period }
     })
+}
+
+fn id(object: &ObjectRef) -> String {
+    format!("sha256:{}", object.sha256)
 }
 
 /// The Hub's answer to one selection: whether it already holds `id`, else its grant.
@@ -110,7 +123,8 @@ fn granted(answer: types::PublicationGrants, id: &str, received: Instant) -> Res
         grant.required_headers.into_iter().map(|(k, v)| (k.to_lowercase(), v)).collect();
     headers.sort();
     Ok(Some(Grant {
-        upload: UploadGrant { url: grant.url, headers },
+        url: grant.url,
+        headers,
         received,
         // Never compare the signer's time to our wall clock.
         lifetime: (server_time > 0 && grant.expires_at_unix > 0)
@@ -124,6 +138,10 @@ fn hub_refused(detail: impl Into<String>) -> Refusal {
 
 fn stopped<T>() -> Result<T> {
     refuse(Code::TRANSFER_FAILED, "the publication was stopped before it finalized; the Hub keeps what it verified")
+}
+
+fn is_stopped(stop: Option<&Stop>) -> bool {
+    stop.is_some_and(Stop::is_cancelled)
 }
 
 /// The destination's repository, as the Hub folds names.
@@ -145,66 +163,145 @@ fn repository(destination: &str) -> Result<(String, String)> {
 
 type Answer<T> = std::result::Result<ResponseValue<T>, hub_client::CallError>;
 
-impl Catalog {
-    /// One call of the publication, re-asked only while the Hub (or the link to it) says "not
-    /// now": no answer, an answer without the Hub's envelope (a tunnel or proxy in front of it),
-    /// or a status that means try again. Waits are the ledger's patience, a multiple of the gap
-    /// this publication has actually shown, and end at the caller's stop.
-    fn ask<T: Send, F: Future<Output = Answer<T>> + Send>(
-        &self,
-        what: &str,
-        stop: Option<&PullCancellation>,
-        ledger: &Ledger,
-        ask: impl Fn() -> F,
-    ) -> Result<ResponseValue<T>> {
-        let mut last = String::new();
-        for attempt in 1..=FETCH_ATTEMPTS {
-            if stop.is_some_and(PullCancellation::is_cancelled) {
-                return stopped();
-            }
-            let error = match block(ask()) {
-                Ok(answer) => return Ok(answer),
-                Err(error) => hub_client::Error::from(error),
-            };
-            let weather = match &error {
-                hub_client::Error::Call(_) => true,
-                hub_client::Error::Hub { status, code, .. } => {
-                    code.starts_with("http_") || RETRYABLE_STATUS.contains(status)
-                }
-                _ => false,
-            };
-            if !weather {
-                return Err(hub_refused(format!("{what}: {error}")));
-            }
-            last = format!("{what}: {error}");
-            if attempt < FETCH_ATTEMPTS {
-                pause(ledger.patience(), stop)?;
+/// One call of the publication, re-asked only while the Hub (or the link to it) says "not now":
+/// no answer, an answer without the Hub's envelope (a tunnel or proxy in front of it), or a
+/// status that means try again; at a doubling backoff, ended by the caller's stop.
+fn ask<T: Send, F: Future<Output = Answer<T>> + Send>(
+    what: &str,
+    stop: Option<&Stop>,
+    ask: impl Fn() -> F,
+) -> Result<ResponseValue<T>> {
+    let mut last = String::new();
+    let mut wait = Duration::from_secs(1);
+    for attempt in 1..=ATTEMPTS {
+        if is_stopped(stop) {
+            return stopped();
+        }
+        let error = match block(ask()) {
+            Ok(answer) => return Ok(answer),
+            Err(error) => hub_client::Error::from(error),
+        };
+        let weather = match &error {
+            hub_client::Error::Call(_) => true,
+            hub_client::Error::Hub { status, code, .. } => code.starts_with("http_") || RETRYABLE.contains(status),
+            _ => false,
+        };
+        if !weather {
+            return Err(hub_refused(format!("{what}: {error}")));
+        }
+        last = format!("{what}: {error}");
+        if attempt < ATTEMPTS {
+            pause(wait, stop)?;
+            wait *= 2;
+        }
+    }
+    refuse(Code::HUB_UNREACHABLE, format!("{last} — on all {ATTEMPTS} asks"))
+}
+
+/// Waits `wait`, ended early by the caller's stop.
+fn pause(wait: Duration, stop: Option<&Stop>) -> Result<()> {
+    let until = Instant::now() + wait;
+    while Instant::now() < until {
+        if is_stopped(stop) {
+            return stopped();
+        }
+        std::thread::sleep(TICK.min(until.saturating_duration_since(Instant::now())));
+    }
+    Ok(())
+}
+
+/// One verified object PUT to its grant: the URL and exactly the headers its signature covers.
+/// `If-None-Match: *` makes it idempotent (412 is an earlier send that landed). Re-sent on
+/// weather; a dead peer is found by TCP keepalive, a live slow one is waited for.
+fn put(http: &reqwest::Client, store: &Store, object: &ObjectRef, grant: &Grant, stop: Option<&Stop>) -> Result<()> {
+    let runtime = tensorfs_core::fetch::runtime()?;
+    let mut wait = Duration::from_secs(1);
+    let mut last = String::new();
+    for attempt in 1..=ATTEMPTS {
+        if is_stopped(stop) {
+            return stopped();
+        }
+        let file = store.file(object).map_err(|e| e.refusal())?;
+        let mut headers = vec![
+            ("content-type".to_string(), "application/octet-stream".to_string()),
+            ("content-length".to_string(), object.length.to_string()),
+            ("if-none-match".to_string(), "*".to_string()),
+        ];
+        for (name, value) in &grant.headers {
+            match headers.iter_mut().find(|(held, _)| held == name) {
+                Some(slot) => slot.1 = value.clone(),
+                None => headers.push((name.clone(), value.clone())),
             }
         }
-        refuse(Code::HUB_UNREACHABLE, format!("{last} — on all {FETCH_ATTEMPTS} asks"))
+        let mut request = http.put(&grant.url).body(reqwest::Body::from(tokio::fs::File::from_std(file)));
+        for (name, value) in &headers {
+            request = request.header(name, value);
+        }
+        let sent = runtime.block_on(async {
+            let stopped = async {
+                let mut tick = tokio::time::interval(TICK);
+                while !is_stopped(stop) {
+                    tick.tick().await;
+                }
+            };
+            tokio::select! {
+                answer = request.send() => Some(answer),
+                () = stopped => None,
+            }
+        });
+        let answer = match sent {
+            None => return stopped(),
+            Some(Ok(answer)) => answer,
+            Some(Err(error)) => {
+                last = format!("PUT {}: {error}", object.sha256);
+                if attempt < ATTEMPTS {
+                    pause(wait, stop)?;
+                    wait *= 2;
+                }
+                continue;
+            }
+        };
+        let status = answer.status().as_u16();
+        match status {
+            200..=299 | 412 => return Ok(()),
+            300..=399 => return refuse(Code::REDIRECT_REFUSED, format!("HTTP {status} tried to replace the exact granted URL")),
+            403 => return refuse(Code::TRANSFER_FAILED, FORBIDDEN),
+            _ if RETRYABLE.contains(&status) => {
+                let stated = answer.headers().get("retry-after").and_then(|v| v.to_str().ok()?.trim().parse().ok());
+                last = format!("the object store answered HTTP {status} to the PUT");
+                if attempt < ATTEMPTS {
+                    pause(stated.map_or(wait, Duration::from_secs), stop)?;
+                    wait *= 2;
+                }
+            }
+            _ => return refuse(Code::TRANSFER_FAILED, format!("the object store answered HTTP {status} to the PUT")),
+        }
     }
+    refuse(Code::TRANSFER_FAILED, format!("{last} — on all {ATTEMPTS} sends"))
+}
 
+impl Catalog {
     /// Put `p.manifest` in `p.destination`'s custody, under the run's capability.
     pub fn publish(&self, p: &Publication) -> Result<Published> {
-        let hub = self.run.as_ref().ok_or_else(|| hub_refused("the run's capability does not let it publish"))?;
-        let ledger = match p.stop {
-            Some(stop) => Ledger::new().with_cancellation(stop.clone()),
-            None => Ledger::new(),
-        };
+        let hub = self.run().ok_or_else(|| hub_refused("the run's capability does not let it publish"))?;
+        let http = crate::hub::fetch_http(self.ca()).map_err(|e| hub_refused(e.0))?;
         let (org, name) = repository(p.destination)?;
         let (org, name) = (org.as_str(), name.as_str());
-        let checkpoint = p.manifest.id();
+        let checkpoint = id(p.manifest);
         let operation = p.operation;
 
-        // The closure the checkpoint commits to: its manifest and everything its header reaches.
-        let manifest = p.store.read_manifest(p.manifest)?;
-        let mut objects: BTreeMap<String, ObjectRef> = BTreeMap::new();
-        objects.insert(p.manifest.id(), p.manifest.clone());
-        for reached in walk_cozytensors(p.store, &manifest)?.objects {
-            if objects.get(&reached.obj.id()).is_some_and(|held| held.length != reached.obj.length) {
-                return refuse(Code::LENGTH_MISMATCH, format!("{} is named with two lengths", reached.obj.id()));
+        // The closure the checkpoint commits to: its manifest, its files and its header's chunks.
+        let objects: BTreeMap<String, ObjectRef> = p
+            .store
+            .closure(p.manifest)
+            .map_err(|e| e.refusal())?
+            .into_iter()
+            .map(|o| (id(&o), o))
+            .collect();
+        for object in objects.values() {
+            if !p.store.reuse(object).map_err(|e| e.refusal())? {
+                return refuse(Code::OBJECT_ABSENT, format!("{} of {checkpoint} is not here", id(object)));
             }
-            objects.insert(reached.obj.id(), reached.obj);
         }
         let total: u64 = objects.values().map(|o| o.length).sum();
 
@@ -218,10 +315,10 @@ impl Catalog {
         let declared = types::PublicationDeclaration {
             objects: objects
                 .values()
-                .map(|o| types::DeclaredObject { object_id: o.id(), length: o.length as i64 })
+                .map(|o| types::DeclaredObject { object_id: id(o), length: o.length as i64 })
                 .collect(),
         };
-        let opened = self.ask("the publication's declaration", p.stop, &ledger, || {
+        let opened = ask("the publication's declaration", p.stop, || {
             hub.open_model_publication(org, name, operation, &declared)
         })?;
         let mut pending = vec![];
@@ -236,10 +333,9 @@ impl Catalog {
         let landed = Mutex::new(total - pending.iter().map(|id| objects[id].length).sum::<u64>());
         (p.progress)(*landed.lock().unwrap(), total);
 
-        // A worker asks for authority only for the object it can dispatch now: finishing a small
-        // tensor frees its slot at once, so a slow neighbour cannot hold a batch. The coordinator
-        // keeps active holds alive independently of PUTs and verification; its event queue and
-        // live grant set are bounded by the worker count.
+        // A worker asks for authority only for the object it can send now: finishing a small one
+        // frees its slot at once, so a slow neighbour cannot hold a batch. The coordinator keeps
+        // active holds alive independently of PUTs and verification.
         let slots = p.streams.clamp(1, 32).min(pending.len());
         let queue = Mutex::new(pending.into_iter());
         let failed: Mutex<Option<Refusal>> = Mutex::new(None);
@@ -248,17 +344,17 @@ impl Catalog {
         let grants = |id: &str| -> Result<(types::PublicationGrants, Instant)> {
             let received = Instant::now();
             let selected = select(id);
-            let answer = self.ask("the publication's grants", p.stop, &ledger, || {
+            let answer = ask("the publication's grants", p.stop, || {
                 hub.grant_publication_objects(org, name, operation, &selected)
             })?;
             Ok((answer.into_inner(), received))
         };
         std::thread::scope(|scope| {
             for _ in 0..slots {
-                let (send, queue, failed, landed, objects, grants, ledger) =
-                    (send.clone(), &queue, &failed, &landed, &objects, &grants, &ledger);
+                let (send, queue, failed, landed, objects, grants, http) =
+                    (send.clone(), &queue, &failed, &landed, &objects, &grants, &http);
                 scope.spawn(move || loop {
-                    if p.stop.is_some_and(PullCancellation::is_cancelled) {
+                    if is_stopped(p.stop) {
                         failed.lock().unwrap().get_or_insert_with(|| stopped::<()>().unwrap_err());
                     }
                     if failed.lock().unwrap().is_some() {
@@ -273,13 +369,12 @@ impl Catalog {
                         let Some(mut grant) = granted(answer, &id, received)? else {
                             return Ok(true);
                         };
-                        let _ = send.send(UploadEvent::Granted(id.clone(), heartbeat(&grant)));
+                        let _ = send.send(Event::Granted(id.clone(), heartbeat(&grant)));
                         let mut renewals = 0;
                         loop {
                             if failed.lock().unwrap().is_some() {
                                 return Ok(false);
                             }
-                            // This also rechecks authority after bounded event-queue backpressure.
                             if grant.stale() {
                                 if renewals == GRANT_RENEWALS {
                                     return Err(hub_refused("the Hub repeatedly issued stale upload grants"));
@@ -290,30 +385,13 @@ impl Catalog {
                                     return Ok(true);
                                 };
                                 grant = renewed;
-                                let _ = send.send(UploadEvent::Granted(id.clone(), heartbeat(&grant)));
+                                let _ = send.send(Event::Granted(id.clone(), heartbeat(&grant)));
                                 continue;
                             }
-                            match push_object(
-                                p.store,
-                                &object.sha256,
-                                object.sha256 == p.manifest.sha256,
-                                &grant.upload,
-                                self.policy(),
-                                self.credential(),
-                                Deadline::none(),
-                                ledger,
-                                "",
-                            ) {
-                                Ok(_) => return Ok(true),
-                                Err(refusal)
-                                    if grant.expired()
-                                        && renewals < GRANT_RENEWALS
-                                        && refusal.code == Code::TRANSFER_FAILED
-                                        && refusal.detail == "the object store answered HTTP 403 to the PUT" =>
-                                {
-                                    // Re-mint through the authority; fresh permission refusals stay terminal.
-                                    continue;
-                                }
+                            match put(http, p.store, object, &grant, p.stop) {
+                                Ok(()) => return Ok(true),
+                                // Re-mint through the authority; fresh permission refusals stay terminal.
+                                Err(refusal) if grant.expired() && renewals < GRANT_RENEWALS && refusal.detail == FORBIDDEN => continue,
                                 Err(refusal) => return Err(refusal),
                             }
                         }
@@ -325,9 +403,8 @@ impl Catalog {
                                 *landed += object.length;
                                 (p.progress)(*landed, total);
                             }
-                            // Verification is bounded by the slots too, without stopping the others.
                             let selected = select(&id);
-                            self.ask("the publication's verification", p.stop, ledger, || {
+                            ask("the publication's verification", p.stop, || {
                                 hub.verify_publication_objects(org, name, operation, &selected)
                             })?;
                         }
@@ -336,7 +413,7 @@ impl Catalog {
                     if let Err(refusal) = pushed {
                         failed.lock().unwrap().get_or_insert(refusal);
                     }
-                    let _ = send.send(UploadEvent::Finished(id));
+                    let _ = send.send(Event::Finished(id));
                 });
             }
             drop(send);
@@ -345,7 +422,7 @@ impl Catalog {
                 let due = active.iter().min_by_key(|(_, beat)| beat.next).map(|(id, beat)| (id.clone(), *beat));
                 if let Some((id, beat)) = &due {
                     if beat.next <= Instant::now() {
-                        // Before more completions: a stream of small tensors must not starve a
+                        // Before more completions: a stream of small objects must not starve a
                         // long PUT's heartbeat.
                         if let Err(refusal) = grants(id) {
                             failed.lock().unwrap().get_or_insert(refusal);
@@ -359,10 +436,10 @@ impl Catalog {
                     None => receive.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected),
                 };
                 match event {
-                    Ok(UploadEvent::Granted(id, Some(beat))) => {
+                    Ok(Event::Granted(id, Some(beat))) => {
                         active.insert(id, beat);
                     }
-                    Ok(UploadEvent::Granted(id, None) | UploadEvent::Finished(id)) => {
+                    Ok(Event::Granted(id, None) | Event::Finished(id)) => {
                         active.remove(&id);
                     }
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -373,15 +450,14 @@ impl Catalog {
         if let Some(refusal) = failed.into_inner().unwrap() {
             return Err(refusal);
         }
-        if p.stop.is_some_and(PullCancellation::is_cancelled) || !(p.commit)() {
+        if is_stopped(p.stop) || !(p.commit)() {
             return stopped();
         }
 
         // Finalize, then follow the Hub's finalization job to its end: committed, it is no
         // longer the caller's to stop.
-        let ledger = Ledger::new();
         let finalize = types::PublicationFinalize { manifest_id: checkpoint.clone(), manifest_length: p.manifest.length as i64 };
-        let mut view = self.ask("the publication's finalization", None, &ledger, || {
+        let mut view = ask("the publication's finalization", None, || {
             hub.finalize_model_publication(org, name, operation, &finalize)
         })?;
         loop {
@@ -398,7 +474,7 @@ impl Catalog {
                         .and_then(|v| v.to_str().ok())
                         .and_then(|v| v.trim().parse::<u64>().ok());
                     pause(Duration::from_secs(stated.unwrap_or(2).max(2)), None)?;
-                    view = self.ask("the publication's finalization", None, &ledger, || {
+                    view = ask("the publication's finalization", None, || {
                         hub.get_model_finalization(org, name, operation)
                     })?;
                 }
@@ -408,14 +484,15 @@ impl Catalog {
     }
 }
 
-/// Waits `wait`, ended early by the caller's stop.
-fn pause(wait: Duration, stop: Option<&PullCancellation>) -> Result<()> {
-    let until = Instant::now() + wait;
-    while Instant::now() < until {
-        if stop.is_some_and(PullCancellation::is_cancelled) {
-            return stopped();
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_destination_is_an_org_repository() {
+        assert_eq!(repository(" Acme/Model ").unwrap(), ("acme".into(), "model".into()));
+        for bad in ["local/mine", "acme", "acme/a/b", "/x", "acme/m?"] {
+            assert!(repository(bad).is_err(), "{bad}");
         }
-        std::thread::sleep(TICK.min(until.saturating_duration_since(Instant::now())));
     }
-    Ok(())
 }

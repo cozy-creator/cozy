@@ -23,7 +23,6 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex, Weak},
 };
-use tensorfs_core::store::Store;
 
 pub struct Calls {
     identity: Option<LaunchIdentity>,
@@ -34,7 +33,7 @@ pub struct Calls {
     parents: Mutex<HashMap<String, Arc<Parent>>>,
     /// Every attempt's weights sources and outputs (`weights_writer`).
     weights: crate::weights::Weights,
-    store: Arc<Store>,
+    machine: Arc<crate::origin::Machine>,
     /// Each live call's fetches, by run: its cancel ends them at once.
     fetches: Mutex<HashMap<String, Vec<Weak<crate::access::Fetch>>>>,
 }
@@ -159,7 +158,7 @@ impl Calls {
     /// The machine's call broker; `runs` prepares children (none: no children).
     pub fn configure(
         service: &Arc<Service>,
-        store: Arc<Store>,
+        machine: Arc<crate::origin::Machine>,
         runs: Option<&Arc<Runs>>,
     ) -> io::Result<Arc<Self>> {
         let calls = Arc::new(Self {
@@ -167,8 +166,8 @@ impl Calls {
             service: Arc::downgrade(service),
             runs: runs.map_or_else(Weak::new, Arc::downgrade),
             parents: Mutex::new(HashMap::new()),
-            weights: crate::weights::Weights::new(store.clone())?,
-            store,
+            weights: crate::weights::Weights::new(machine.store().clone())?,
+            machine,
             fetches: Mutex::default(),
         });
         if let Err(error) = calls.sweep_canceled_outputs(&service.engine) {
@@ -196,7 +195,7 @@ impl Calls {
     pub(crate) fn fetch(&self, record: &Execution, plan: &Plan) -> Arc<crate::access::Fetch> {
         let runs = self.runs.upgrade();
         let hub = runs.as_ref().and_then(|runs| runs.hub(&record.id));
-        let fetch = crate::access::Fetch::new(self.store.clone(), hub, plan.manifests(), record.root_seq());
+        let fetch = crate::access::Fetch::new(self.machine.clone(), hub, plan.manifests(), record.root_seq());
         fetch.replaces(runs.and_then(|runs| runs.ahead(&record.id)));
         let mut fetches = self.fetches.lock().unwrap();
         let live = fetches.entry(record.id.clone()).or_default();
@@ -863,7 +862,7 @@ fn child_inputs(
 /// A completed child's result as its parent receives it: each file leaf named by its bytes
 /// (`asset_ref` = `digest` = sha256) and granted at a copy in the parent's spool.
 /// The files a parent now holds from a child's result, to adopt as its own objects.
-type Held = Vec<(PathBuf, tensorfs_core::ids::ObjectRef)>;
+type Held = Vec<(PathBuf, tensorfs_core::format::ObjectRef)>;
 
 fn receive(
     root: &Path,
@@ -903,7 +902,7 @@ fn receive(
             Err(error) if error.kind() != io::ErrorKind::AlreadyExists => return Err(error),
             _ => (),
         }
-        let object = tensorfs_core::ids::ObjectRef { sha256: sha.into(), length };
+        let object = tensorfs_core::format::ObjectRef { sha256: sha.into(), length };
         held.push((local.to_path_buf(), object));
         Ok(())
     };
@@ -1169,8 +1168,8 @@ mod exact_tests {
         assert_eq!(calls[&("root".into(),"unrelated".into())], Some(("root:app".into(),"unrelated".into())));
         let root = std::env::temp_dir().join(format!("cm-ambiguous-{}", uuid::Uuid::new_v4()));
         let service = Service::open(&root.join("state"),&root.join("generations"),1).unwrap();
-        let store = Arc::new(Store::ensure(&root.join("store")).unwrap());
-        let broker = Calls::configure(&service,store,None).unwrap();
+        let store = crate::storage::open(&root.join("store")).unwrap();
+        let broker = Calls::configure(&service, crate::origin::Machine::new(store, None).unwrap(),None).unwrap();
         let parent = Parent { id:"parent".into(),request:"parent".into(),actor:"alice".into(),spool:root.clone(),
             callables:calls,pure:false,pure_callables:Default::default(),
             inputs:vec![],calls:Default::default() };
@@ -1191,11 +1190,11 @@ mod exact_tests {
     fn only_a_deviceless_root_releases_its_gpu_lane() {
         let root = std::env::temp_dir().join(format!("cm-release-{}", uuid::Uuid::new_v4()));
         let service = Service::open(&root.join("state"), &root.join("generations"), 1).unwrap();
-        let store = Arc::new(Store::ensure(&root.join("store")).unwrap());
+        let store = crate::storage::open(&root.join("store")).unwrap();
         let config = serde_json::from_value(json!({"devices": "GPU-test-release", "prespawn": false})).unwrap();
         let pool = crate::gpu_service::Pool::new(&root.join("gpu"), config, store.clone()).unwrap();
         service.configure_pool(pool.clone()).unwrap();
-        let broker = Calls::configure(&service, store, None).unwrap();
+        let broker = Calls::configure(&service, crate::origin::Machine::new(store, None).unwrap(), None).unwrap();
         let submit = |key: &str, parent: &str| service.engine.submit(key, crate::journal::Invocation {
             parent: parent.into(), ..Default::default()
         }).unwrap();

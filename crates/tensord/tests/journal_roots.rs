@@ -22,7 +22,8 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use tensorfs_core::{err::Code, sha256, store::Store};
+use tensord::storage::Store;
+use tensorfs_core::sha256;
 
 const ACTOR: &str = "alice";
 
@@ -68,7 +69,7 @@ fn tools(root: &Path) -> Tools {
 fn open(root: &Path, tools: &Tools) -> Machine {
     let state = root.join("state");
     let service = Service::open(&state, &root.join("generations"), 1).unwrap();
-    let store = Arc::new(Store::ensure_owned(&state.join("tensorfs")).unwrap());
+    let store = tensord::storage::open(&state.join("tensorfs")).unwrap();
     let objects =
         Arc::new(Objects::new(&root.join("writes"), store.clone(), service.engine.clone()).unwrap());
     service.engine.hold_memos(&objects);
@@ -103,7 +104,7 @@ fn open(root: &Path, tools: &Tools) -> Machine {
     });
     let config = GpuConfig::deviceless(&root.join("home")).unwrap();
     service.configure_pool(Pool::new(&root.join("pool"), config, store.clone()).unwrap()).unwrap();
-    Calls::configure(&service, store.clone(), Some(&runs)).unwrap();
+    Calls::configure(&service, tensord::origin::Machine::new(store.clone(), None).unwrap(), Some(&runs)).unwrap();
     Machine {
         service,
         store,
@@ -247,18 +248,9 @@ fn children(engine: &Engine, parent: &str) -> Vec<Execution> {
     all.filter(|record| record.invocation.parent == parent).collect()
 }
 
-/// The first tier of a pressured sweep: whatever nothing holds goes.
+/// The first tier of a pressured sweep: whatever nothing holds goes, at once.
 fn collect(store: &Store) {
-    let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        match tensorfs_core::gc::collect(store.root(), false) {
-            Ok(_) => return,
-            Err(busy) if busy.code == tensorfs_core::err::Code::STORE_BUSY && Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(100))
-            }
-            Err(error) => panic!("gc: {error}"),
-        }
-    }
+    store.clone().with_grace(Duration::ZERO).gc().unwrap();
 }
 
 /// A film canceled inside its second segment, then submitted again (after a restart, when
@@ -291,26 +283,7 @@ fn a_canceled_root_resubmitted_skips_its_finished_steps(restart: bool) {
 
     if restart {
         assert!(machine.service.stop().unwrap(), "the machine was not idle");
-        let store_root = machine.store.root().to_path_buf();
         drop(machine);
-        // stop() requests dispatch shutdown. Its thread may still retain the broker and the
-        // Store until it observes that request; an in-process restart must wait for that
-        // custody to end just as a process restart waits for the old process to exit. A
-        // successful claim observes the lock's release, including completion of destructors.
-        let deadline = Instant::now() + Duration::from_secs(60);
-        loop {
-            match Store::ensure_owned(&store_root) {
-                Ok(store) => {
-                    drop(store);
-                    break;
-                }
-                Err(error) if error.code == Code::STORE_BUSY => {
-                    assert!(Instant::now() < deadline, "the stopped dispatcher retains its Store: {error}");
-                    std::thread::yield_now();
-                }
-                Err(error) => panic!("reopen the stopped Store: {error}"),
-            }
-        }
         machine = open(&root, &tools);
     }
     collect(&machine.store);

@@ -623,6 +623,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "tensord",
+ "tensorfs-core",
  "tokio",
  "url",
  "vt100",
@@ -3929,6 +3930,7 @@ dependencies = [
 name = "tensord"
 version = "0.10.1"
 dependencies = [
+ "async-trait",
  "aws-lc-rs",
  "axum",
  "base64 0.22.1",

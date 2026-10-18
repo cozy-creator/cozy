@@ -11,7 +11,7 @@ use std::{
     process::{Command, Stdio},
     sync::Arc,
 };
-use tensorfs_core::transport::PullCancellation;
+use crate::stop::Stop;
 use cozy_proto::error::Error;
 use crate::triage::masked;
 
@@ -156,7 +156,7 @@ pub fn materialize_uploaded(
 pub fn prepare_uploaded(
     config: &InstallerConfig,
     uploaded: &UploadedPackage,
-    stop: Option<&PullCancellation>,
+    stop: Option<&Stop>,
 ) -> Result<PreparedGeneration, Error> {
     let materialized = materialize_uploaded(uploaded, &config.staging_root)?;
     let mut command = installer(config, &materialized.root_set)?;
@@ -183,7 +183,7 @@ pub fn prepare_editable(
     wheels: &[PathBuf],
     indexes: &std::collections::BTreeMap<String, String>,
     source_digest: &str,
-    stop: Option<&PullCancellation>,
+    stop: Option<&Stop>,
 ) -> Result<PreparedGeneration, Error> {
     let mut command = installer(config, root)?;
     command.arg("--project").arg(project).arg("--editable-environment").arg(environment);
@@ -261,7 +261,7 @@ fn installer(config: &InstallerConfig, root: &RootSet) -> Result<Command, Error>
 /// Run the helper to its exit and hold the generation it published. Its process group ends
 /// with its run's cancel (`stop`), or when it stops moving past its measured patience
 /// (`process::supervise`); a long install that moves is never killed.
-fn publish(config: &InstallerConfig, mut command: Command, stop: Option<&PullCancellation>) -> Result<PreparedGeneration, Error> {
+fn publish(config: &InstallerConfig, mut command: Command, stop: Option<&Stop>) -> Result<PreparedGeneration, Error> {
     let mut child = cozy_platform::process::own_group(&mut command)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

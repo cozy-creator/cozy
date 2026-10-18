@@ -6,10 +6,12 @@
 #[path = "common/hub_oauth.rs"]
 mod hub_oauth;
 
-use tensord::hub::{reason, Capability, Catalog, Leaf, Op, Publication, Source};
+use tensord::{
+    hub::{reason, Capability, Catalog, Leaf, Op, Source},
+    origin::Publication,
+};
 use serde_json::json;
 use std::{sync::Arc, thread::sleep, time::Duration};
-use tensorfs_core::transport::{Ask, CredentialProvider};
 
 /// A key as the machine's identity holds it: a P-256 PKCS#8 PEM.
 fn leaf() -> Arc<Leaf> {
@@ -21,8 +23,8 @@ fn leaf() -> Arc<Leaf> {
 
 fn publish(
     catalog: &Catalog,
-    store: &tensorfs_core::store::Store,
-    manifest: &tensorfs_core::ids::ObjectRef,
+    store: &tensorfs_core::store2::Store,
+    manifest: &tensorfs_core::format::ObjectRef,
     operation: &str,
 ) -> tensorfs_core::err::Result<()> {
     catalog
@@ -41,18 +43,32 @@ fn publish(
 
 const TINY: Op = Op::Publish { model: "acme/tiny" };
 
+/// One GET at `url` with `headers`, on a runtime of its own: the status and body.
+fn fetch(url: &str, headers: Vec<(String, String)>) -> (u16, Vec<u8>) {
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            runtime.block_on(async {
+                let mut request = reqwest::Client::new().get(url);
+                for (name, value) in headers {
+                    request = request.header(name, value);
+                }
+                let answer = request.send().await.unwrap();
+                (answer.status().as_u16(), answer.bytes().await.unwrap().to_vec())
+            })
+        })
+        .join()
+        .unwrap()
+    })
+}
+
 /// One JSON read at the catalog's Hub, presented as the catalog presents.
 fn get(catalog: &Catalog, path: &str) -> Result<serde_json::Value, String> {
-    let (body, _) = tensorfs_core::transport::api_get(
-        &format!("{}{path}", catalog.origin()),
-        catalog.policy(),
-        catalog.credential(),
-        1 << 20,
-        tensorfs_core::transport::Deadline::after_seconds(Some(30.0)),
-        &tensorfs_core::transport::Ledger::new(),
-    )
-    .map_err(|e| e.detail)?;
-    serde_json::from_slice(&body).map_err(|e| e.to_string())
+    let url = format!("{}{path}", catalog.origin());
+    match fetch(&url, catalog.present("GET", &url)) {
+        (200, body) => serde_json::from_slice(&body).map_err(|e| e.to_string()),
+        (status, body) => Err(format!("HTTP {status}: {}", String::from_utf8_lossy(&body))),
+    }
 }
 
 #[test]
@@ -82,7 +98,7 @@ fn a_run_capability_trades_once_for_exactly_what_it_names() {
     let signed = authkit.capability(&jkt, &ops, 600);
     let source = Source::new(&authkit.hub, None, hosts.clone(), Some(Capability::new(&signed, &authkit.token_endpoint, leaf.clone()).unwrap())).unwrap();
     let store_root = std::env::temp_dir().join(format!("cm-oauth-store-{}", uuid::Uuid::new_v4()));
-    let store = tensorfs_core::store::Store::ensure(&store_root).unwrap();
+    let store = tensorfs_core::store2::Store::open(&store_root).unwrap();
     let manifest = hub_oauth::checkpoint(&store, &[7; 8192]);
     assert_eq!(authkit.exchanges(), 0);
     let tiny = Catalog::for_op(&source, TINY).unwrap();
@@ -109,30 +125,15 @@ fn a_run_capability_trades_once_for_exactly_what_it_names() {
     assert_eq!(read.reason("catalog_read_failed", &refused).0, reason::EXCEEDED, "{refused:?}");
 
     // The token is bound to the leaf: presented with another key's proof, it reads nothing.
-    struct Thief {
-        key: hub_client::P256Key,
-        token: String,
-        origin: String,
-    }
-    impl CredentialProvider for Thief {
-        fn headers(&self, ask: &Ask) -> Vec<(String, String)> {
-            let htu = ask.htu();
-            let path = &htu[htu.find("://").map_or(0, |at| at + 3)..];
-            let htu = format!("{}{}", self.origin, &path[path.find('/').unwrap_or(path.len())..]);
-            let proof = self.key.proof(ask.method, &htu, Some(&self.token), None);
-            vec![("authorization".into(), format!("DPoP {}", self.token)), ("dpop".into(), proof)]
-        }
-    }
-    let thief = Thief { key: hub_client::P256Key::generate(), token: authkit.last_token(), origin: authkit.resource.clone() };
+    let (key, token) = (hub_client::P256Key::generate(), authkit.last_token());
+    let path = format!("/v1/models/acme/tiny/checkpoints/{}", manifest.id());
+    let proof = key.proof("GET", &format!("{}{path}", authkit.resource), Some(&token), None);
     let finalized = hub.lock().unwrap().finalized.len();
-    let stolen = tensorfs_core::transport::api_get(
-        &format!("{}/v1/models/acme/tiny/checkpoints/{}", authkit.hub, manifest.id()),
-        tiny.policy(),
-        &thief,
-        1 << 20,
-        tensorfs_core::transport::Deadline::after_seconds(Some(30.0)),
-        &tensorfs_core::transport::Ledger::new(),
-    );
+    let headers = vec![("authorization".into(), format!("DPoP {token}")), ("dpop".into(), proof)];
+    let stolen = match fetch(&format!("{}{path}", authkit.hub), headers) {
+        (200, _) => Ok(()),
+        (status, _) => Err(status),
+    };
     assert!(stolen.is_err(), "a stolen token without the key is refused");
     assert_eq!(hub.lock().unwrap().finalized.len(), finalized);
 

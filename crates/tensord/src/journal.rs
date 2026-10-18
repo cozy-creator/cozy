@@ -983,7 +983,7 @@ impl Journal {
     pub fn bind_object(
         &mut self,
         actor: &str,
-        object: &tensorfs_core::ids::ObjectRef,
+        object: &tensorfs_core::format::ObjectRef,
     ) -> io::Result<()> {
         let tx = self
             .connection
@@ -1004,7 +1004,7 @@ impl Journal {
         &mut self,
         actor: &str,
         parent: &str,
-        object: &tensorfs_core::ids::ObjectRef,
+        object: &tensorfs_core::format::ObjectRef,
     ) -> io::Result<()> {
         let tx = self
             .connection
@@ -1385,7 +1385,7 @@ impl Journal {
         id: &str,
         digest: &str,
         invocation: Invocation,
-        objects: &[tensorfs_core::ids::ObjectRef],
+        objects: &[tensorfs_core::format::ObjectRef],
     ) -> io::Result<(Execution, bool)> {
         validate_scope(actor, id, id)?;
         let key = format!("run:{}", encoded(&(actor, id))?);
@@ -1611,9 +1611,9 @@ fn hold_memo(tx: &rusqlite::Transaction<'_>, held: &HeldMemo) -> io::Result<()> 
 
 fn touch_object(
     tx: &rusqlite::Transaction<'_>,
-    object: &tensorfs_core::ids::ObjectRef,
+    object: &tensorfs_core::format::ObjectRef,
 ) -> io::Result<()> {
-    tensorfs_core::ids::hex64("run object", &object.sha256).map_err(db_error)?;
+    crate::storage::check_digest("run object", &object.sha256, false)?;
     tx.execute(
         "INSERT INTO object_uses(sha256,length,used_ms) VALUES(?1,?2,?3)
         ON CONFLICT(sha256) DO UPDATE SET used_ms=excluded.used_ms",
@@ -1625,7 +1625,7 @@ fn touch_object(
 fn reference_objects(
     tx: &rusqlite::Transaction<'_>,
     execution: &str,
-    objects: &[tensorfs_core::ids::ObjectRef],
+    objects: &[tensorfs_core::format::ObjectRef],
 ) -> io::Result<()> {
     for object in objects {
         touch_object(tx, object)?;
@@ -1661,7 +1661,7 @@ fn insert(
         .inputs
         .iter()
         .filter_map(|input| {
-            Some(tensorfs_core::ids::ObjectRef {
+            Some(tensorfs_core::format::ObjectRef {
                 sha256: input.digest.strip_prefix("sha256:")?.into(),
                 length: input.length,
             })
@@ -1848,7 +1848,7 @@ impl Journal {
         transaction: &str,
         slot: &str,
     ) -> io::Result<()> {
-        tensorfs_core::ids::prefixed("derived transaction", transaction).map_err(db_error)?;
+        crate::storage::check_digest("derived transaction", transaction, true)?;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)

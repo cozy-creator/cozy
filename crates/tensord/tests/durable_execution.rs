@@ -20,7 +20,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use tensorfs_core::store::Store;
+
 
 /// A journal over a fresh root, for checks that run no package.
 struct Fixture {
@@ -90,7 +90,7 @@ impl Machine {
         let root = std::env::temp_dir().join(format!("tensord-durable-pool-{}", uuid::Uuid::new_v4()));
         let (generations, _) = lifecycle();
         let service = Service::open(&root.join("state"), generations, 1).unwrap();
-        let store = Arc::new(Store::ensure(&root.join("store")).unwrap());
+        let store = tensord::storage::open(&root.join("store")).unwrap();
         let config = GpuConfig::deviceless(&root.join("home")).unwrap();
         service.configure_pool(Pool::new(&root.join("pool"), config, store).unwrap()).unwrap();
         Self { root, service }
@@ -395,7 +395,7 @@ fn cancel_before_dispatch_is_durable_and_never_executes_package() {
     // The machine that opens it next never starts it.
     let service = Service::open(&root.join("state"), &lifecycle().0, 1).unwrap();
     let config = GpuConfig::deviceless(&root.join("home")).unwrap();
-    let store = Arc::new(Store::ensure(&root.join("store")).unwrap());
+    let store = tensord::storage::open(&root.join("store")).unwrap();
     service.configure_pool(Pool::new(&root.join("pool"), config, store).unwrap()).unwrap();
     service.engine.notify_activity();
     let ended = service.engine.get(&record.id).unwrap();

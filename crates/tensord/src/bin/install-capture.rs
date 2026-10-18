@@ -5,8 +5,7 @@ use tensord::api::{
     domain,
     workspaces::WorkspaceUploads,
 };
-use std::{fs, io::Read, path::PathBuf, sync::Arc};
-use tensorfs_core::store::Store;
+use std::{fs, io::Read, path::PathBuf};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt().with_writer(std::io::stderr).init();
@@ -35,7 +34,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(&output)?;
     let archive = archive.ok_or("--archive is required")?;
     let length = fs::metadata(&archive)?.len();
-    let store = Arc::new(Store::ensure(&output.join("store"))?);
+    let store = tensord::storage::open(&output.join("store"))?;
     let uploads = WorkspaceUploads::open(&output.join("uploads"), store)?;
     let actor = VerifiedActor {
         public_key: [19; 32],

@@ -18,13 +18,11 @@ use std::{
     sync::{Arc, Barrier},
     time::Duration,
 };
+use tensord::storage::Store;
 use tensorfs_core::{
-    dtype::Dtype,
-    header::{Header, Part, Tensor},
-    ids::ObjectRef,
-    manifest::{Draft, Entry},
-    read, registry,
-    store::{Fault, Store},
+    format::{Dtype, ObjectRef},
+    store2::Checkpoint,
+    writer::{Data, Source},
 };
 use varena::{layout::Layout, Plane, PlaneConfig, Tier};
 
@@ -47,81 +45,27 @@ struct Fixture {
     root: PathBuf,
     store: Arc<Store>,
     manifest: String,
-    header: Header,
+    checkpoint: Checkpoint,
     tensors: Vec<(String, usize)>,
 }
 impl Fixture {
     fn new(tag: &str, sizes: &[usize]) -> Self {
-        let root = std::env::temp_dir().join(format!(
-            "machine-tier-{tag}-{}-{}",
-            std::process::id(),
-            tensorfs_core::meta::now_nanos_unique()
-        ));
-        let store = Store::init(&root).unwrap();
-        let plain = registry::seeds()
-            .into_iter()
-            .find(|e| e.alias == "plain/1")
-            .unwrap()
-            .spec;
-        let tensors: Vec<(String, usize)> = sizes
-            .iter()
-            .enumerate()
-            .map(|(i, n)| (format!("{tag}{i}.weight"), *n))
-            .collect();
-        let mut rows = Vec::new();
+        let root = std::env::temp_dir().join(format!("machine-tier-{tag}-{}", uuid::Uuid::new_v4()));
+        let store = tensord::storage::open(&root).unwrap();
+        let tensors: Vec<(String, usize)> = sizes.iter().enumerate().map(|(i, n)| (format!("{tag}{i}.weight"), *n)).collect();
+        let mut writer = store.writer(None, Some(tag)).unwrap();
         for (key, n) in &tensors {
             let data = bytes_of(key, *n);
-            let part = Part::plan(Dtype::U8, vec![*n as u64], &data);
-            if let tensorfs_core::header::Body::Segments(segments) = &part.body {
-                let mut at = 0;
-                for segment in segments {
-                    let chunk = &data[at..at + segment.length as usize];
-                    store
-                        .put_stream(&mut &chunk[..], Some(segment), &Fault::default())
-                        .unwrap();
-                    at += segment.length as usize;
-                }
-            }
-            rows.push((
-                key.clone(),
-                Tensor {
-                    dtype: Dtype::U8,
-                    shape: vec![*n as u64],
-                    encoding: plain.object_id(),
-                    parts: vec![("value".into(), part)],
-                },
-            ));
+            writer.put("unet", key, &Dtype::U8, &[*n as u64], Data::Plain(Source::Read(&mut data.as_slice()))).unwrap();
         }
-        let header = Header {
-            configs: vec![],
-            assets: vec![],
-            encodings: vec![plain],
-            components: vec![("unet".into(), rows)],
-        };
-        let header = Header::parse(&header.canonical_bytes().unwrap()).unwrap();
-        let bytes = header.canonical_bytes().unwrap();
-        let object = ObjectRef::of(&bytes);
-        store
-            .put_stream(&mut bytes.as_slice(), Some(&object), &Fault::default())
-            .unwrap();
-        let snapshot = Draft {
-            entries: vec![("model".into(), Entry::CozyTensors(object))],
-        }
-        .seal()
-        .unwrap();
-        store.put_manifest(&snapshot).unwrap();
-        Self {
-            root,
-            store: Arc::new(store),
-            manifest: snapshot.manifest_id(),
-            header,
-            tensors,
-        }
+        let manifest = writer.commit().unwrap();
+        let checkpoint = store.checkpoint(&manifest).unwrap();
+        Self { root, store, manifest: manifest.id(), checkpoint, tensors }
     }
     fn grant(&self) -> HostGrant {
         HostGrant {
             manifest: self.manifest.clone(),
-            header: self.header.clone(),
+            checkpoint: self.checkpoint.clone(),
             components: BTreeSet::from(["unet".to_string()]),
         }
     }
@@ -152,9 +96,7 @@ impl Fixture {
         )
     }
     fn layout(&self) -> Layout {
-        let plan =
-            read::plan_for_traversal(&self.header, &self.traversal(), &["unet".into()], 4 << 20)
-                .unwrap();
+        let plan = tensord::host_tier::plan_for_traversal(&self.checkpoint, &self.traversal(), &["unet".into()], 4 << 20).unwrap();
         Layout::build(&plan, &self.regions()).unwrap()
     }
     /// The executor's half: adopt read-only through TensorFS, wait per region, check every
@@ -171,9 +113,7 @@ impl Fixture {
             ..Default::default()
         })
         .unwrap();
-        let plan =
-            read::plan_for_traversal(&self.header, &self.traversal(), &["unet".into()], 4 << 20)
-                .unwrap();
+        let plan = tensord::host_tier::plan_for_traversal(&self.checkpoint, &self.traversal(), &["unet".into()], 4 << 20).unwrap();
         let pinned = plane
             .register_sealed("unet", &plan, &self.regions(), granted.as_raw_fd())
             .and_then(|ws| {
@@ -449,43 +389,11 @@ fn a_released_layout_something_still_holds_stays_charged() {
     holder.wait().unwrap();
 }
 
-/// Copy `from`'s objects and manifest into `into`'s store (as a download would put them).
+/// Copy `from`'s checkpoint into `into`'s store (as a download would put it).
 fn copy_store(from: &Fixture, into: &Fixture) {
-    let snapshot = from
-        .store
-        .read_manifest(&ObjectRef {
-            sha256: from.manifest.trim_start_matches("sha256:").into(),
-            length: fs::metadata(
-                from.store
-                    .manifest_path(from.manifest.trim_start_matches("sha256:")),
-            )
-            .unwrap()
-            .len(),
-        })
-        .unwrap();
-    into.store.put_manifest(&snapshot).unwrap();
-    for (key, n) in &from.tensors {
-        let data = bytes_of(key, *n);
-        let part = Part::plan(Dtype::U8, vec![*n as u64], &data);
-        if let tensorfs_core::header::Body::Segments(segments) = &part.body {
-            let mut at = 0;
-            for segment in segments {
-                let chunk = &data[at..at + segment.length as usize];
-                into.store
-                    .put_stream(&mut &chunk[..], Some(segment), &Fault::default())
-                    .unwrap();
-                at += segment.length as usize;
-            }
-        }
+    for object in from.store.closure(from.checkpoint.id()).unwrap() {
+        into.store.put_bytes(&from.store.read(&object).unwrap()).unwrap();
     }
-    let bytes = from.header.canonical_bytes().unwrap();
-    into.store
-        .put_stream(
-            &mut bytes.as_slice(),
-            Some(&ObjectRef::of(&bytes)),
-            &Fault::default(),
-        )
-        .unwrap();
 }
 
 #[test]
@@ -692,25 +600,19 @@ fn an_executor_adopts_its_layout_while_it_fills_and_waits_per_region() {
     assert!(facts.held_bytes >= 192 * MIB as u64, "{facts:?}");
 }
 
-/// A fill that fails (a corrupt object the verified read path refuses): the executor that
-/// adopted the layout early gets an error, never the bytes; the tier drops the layout, and the
-/// next ask fails the same way.
+/// A fill that fails (an object gone from the store): the executor that adopted the layout
+/// early gets an error, never the bytes; the tier drops the layout, and the next ask fails the
+/// same way.
 #[test]
 fn a_failed_fill_is_an_error_for_its_adopters_and_leaves_the_tier() {
-    let fx = Fixture::new("corrupt", &[8 * MIB, 8 * MIB]);
+    let fx = Fixture::new("gone", &[8 * MIB, 8 * MIB]);
     let layout = fx.layout();
     let last = layout.regions.last().unwrap().items.last().unwrap();
     let varena::layout::ItemSource::Object(range) = &last.source else {
         panic!("an object-backed tensor")
     };
-    let blob = fx.store.blob_path(&range.obj.sha256);
-    let mut perms = fs::metadata(&blob).unwrap().permissions();
-    #[allow(clippy::permissions_set_readonly_false)]
-    perms.set_readonly(false);
-    fs::set_permissions(&blob, perms).unwrap();
-    let file = fs::OpenOptions::new().write(true).open(&blob).unwrap();
-    file.write_all_at(b"corrupt", 1024).unwrap();
-    drop(file);
+    let blob = fx.store.path(&ObjectRef { sha256: range.obj.sha256.clone(), length: range.obj.length }).unwrap();
+    fs::remove_file(&blob).unwrap();
 
     let tier = tier(&fx, 1 << 30);
     let (_executor, a) = Executor::spawn(&tier);
@@ -994,23 +896,23 @@ fn concurrent_windows_never_spend_the_same_room() {
 /// object comes once, and what nobody read stays at the Hub.
 #[test]
 fn a_staged_region_waits_on_its_ticket_and_nothing_else_downloads() {
-    use tensorfs_core::{fetch_v1::{Fetcher, Priority}, transport::PullCancellation};
+    use tensord::{held_models::Pulled, origin::{self, priority, Machine}, stop::Stop, storage};
     let fx = Fixture::new("fetched", &[2 * MIB, 3 * MIB, MIB + 7, 5 * MIB]);
-    let hex = fx.manifest.trim_start_matches("sha256:").to_string();
-    let length = fs::metadata(fx.store.manifest_path(&hex)).unwrap().len();
-    let manifest = ObjectRef { sha256: hex, length };
+    let manifest = fx.checkpoint.id().clone();
     let model = names_hub::Model { repository: "acme/unet".into(), release: "1.0.0".into(), lane: "bf16".into(), manifest: manifest.clone() };
     let (origin, heard) = names_hub::paced(&fx.store, model, None, Duration::from_millis(30));
     let gets = || heard.lock().unwrap().iter().filter(|h| h.starts_with("GET /o/")).count();
-    let root = std::env::temp_dir().join(format!("machine-tier-partial-{}", tensorfs_core::meta::now_nanos_unique()));
-    let store = Arc::new(Store::ensure_owned(&root).unwrap());
+    let root = std::env::temp_dir().join(format!("machine-tier-partial-{}", uuid::Uuid::new_v4()));
+    let store = storage::open(&root).unwrap();
     let hub = tensord::hub::Source::new(&origin, None, vec!["localhost".into()], None).unwrap();
-    let at = tensord::access::origin(&hub, "acme/unet", "1.0.0", "bf16", &manifest);
-    let access = tensord::access::of(&hub, &at).unwrap();
-    Fetcher::of(&store).unwrap().want(&at, access, &[], Priority::Now).wait(&[], &PullCancellation::default()).unwrap();
+    let machine = Machine::new(store.clone(), None).unwrap();
+    let (remote, _) = origin::remote(&machine, &hub, "acme/unet", "1.0.0", "bf16", &manifest).unwrap();
+    machine.pull(&remote, &manifest, Some(&[]), priority::NOW, None, &Stop::default()).unwrap();
+    let pulled = Pulled { repository: "acme/unet".into(), release: "1.0.0".into(), lane: "bf16".into() };
+    storage::hold(&store, &storage::pin::model(&manifest.sha256), vec![manifest.clone()], Some(pulled.owner())).unwrap();
     let structure = gets();
     let tier = HostTier::new(store.clone(), HostTierConfig { fill_threads: 2, ttl: Duration::from_secs(3600) }, Box::new(Fixed(1 << 30))).unwrap();
-    let fetch = tensord::access::Fetch::new(store.clone(), Some(hub), vec![fx.manifest.clone()], 1);
+    let fetch = tensord::access::Fetch::new(machine, Some(hub), vec![fx.manifest.clone()], 1);
     let (_executor, a) = Executor::spawn(&tier);
     let (plan, sha256, length) = fx.plan(&["unet"]);
     let cold = SealedRequest { sha256: &sha256, length, stage: Some(&[]) };

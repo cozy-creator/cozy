@@ -13,7 +13,6 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
 };
-use tensorfs_core::transport::{self, Anonymous, Deadline, Ledger, SourcePolicy};
 
 pub struct AuthKit {
     child: Child,
@@ -42,14 +41,6 @@ fn harness() -> &'static PathBuf {
         assert!(built.success(), "building tests/hub-oauth");
         out
     })
-}
-
-fn local() -> SourcePolicy {
-    SourcePolicy {
-        allowed_hosts: vec!["127.0.0.1".into()],
-        allow_local: true,
-        ..Default::default()
-    }
 }
 
 impl AuthKit {
@@ -137,15 +128,15 @@ impl AuthKit {
     /// verified: method, path, owner, actor, token digest), `exchanges` (grant decisions),
     /// `owner` (the owner's user id) and `last_token`.
     pub fn seen(&self) -> Value {
-        let (body, _) = transport::api_get(
-            &format!("{}/seen", self.control),
-            &local(),
-            &Anonymous,
-            1 << 20,
-            Deadline::after_seconds(Some(60.0)),
-            &Ledger::new(),
-        )
-        .unwrap();
+        let url = format!("{}/seen", self.control);
+        let body = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+                runtime.block_on(async { reqwest::get(&url).await.unwrap().bytes().await.unwrap().to_vec() })
+            })
+            .join()
+            .unwrap()
+        });
         serde_json::from_slice(&body).unwrap()
     }
 
@@ -317,60 +308,20 @@ pub fn test_hub() -> (String, Arc<Mutex<Hub>>) {
 }
 
 /// A one-tensor checkpoint in `store`: what a machine publishes.
-pub fn checkpoint(
-    store: &tensorfs_core::store::Store,
-    weights: &[u8],
-) -> tensorfs_core::ids::ObjectRef {
+pub fn checkpoint(store: &tensorfs_core::store2::Store, weights: &[u8]) -> tensorfs_core::format::ObjectRef {
     tensors(store, &[weights])
 }
 
-/// A checkpoint in `store` with one tensor, and one object, per entry of `weights`.
-pub fn tensors(
-    store: &tensorfs_core::store::Store,
-    weights: &[&[u8]],
-) -> tensorfs_core::ids::ObjectRef {
-    use tensorfs_core::{
-        dtype::Dtype,
-        header::{Body, Closure, Header, Part, Tensor},
-        manifest::{Draft, Entry},
-        registry,
-        store::Fault,
-    };
-    let put = |bytes: &[u8]| {
-        store
-            .put_stream(&mut &bytes[..], None, &Fault::default())
-            .unwrap()
-            .obj
-    };
-    let spec = registry::seeds()
-        .into_iter()
-        .find(|seed| seed.alias == "plain/1")
-        .unwrap()
-        .spec;
-    let tensors = weights
-        .iter()
-        .enumerate()
-        .map(|(at, weights)| {
-            assert!(!weights.is_empty() && weights.len().is_multiple_of(4));
-            let shape = vec![(weights.len() / 4) as u64];
-            let part = Part { dtype: Dtype::F32, shape: shape.clone(), body: Body::Segments(vec![put(weights)]) };
-            let tensor = Tensor { dtype: Dtype::F32, shape, encoding: spec.object_id(), parts: vec![("value".into(), part)] };
-            let name = if at == 0 { "weight".to_string() } else { format!("weight{at}") };
-            (name, tensor)
-        })
-        .collect();
-    let header = Header {
-        configs: Vec::new(),
-        assets: Vec::new(),
-        encodings: vec![spec],
-        components: vec![("model".into(), tensors)],
-    };
-    header.validate(&Closure::default()).unwrap();
-    let header = put(&header.canonical_bytes().unwrap());
-    let manifest = Draft {
-        entries: vec![("model.cozytensors".into(), Entry::CozyTensors(header))],
+/// A checkpoint in `store` with one F32 tensor per entry of `weights` (16 MiB or more: its own
+/// chunks).
+pub fn tensors(store: &tensorfs_core::store2::Store, weights: &[&[u8]]) -> tensorfs_core::format::ObjectRef {
+    use tensorfs_core::{format::Dtype, writer::{Data, Source}};
+    let mut writer = store.writer(None, None).unwrap();
+    for (at, weights) in weights.iter().enumerate() {
+        assert!(!weights.is_empty() && weights.len().is_multiple_of(4));
+        let name = if at == 0 { "weight".to_string() } else { format!("weight{at}") };
+        let shape = [(weights.len() / 4) as u64];
+        writer.put("model", &name, &Dtype::F32, &shape, Data::Plain(Source::Read(&mut &weights[..]))).unwrap();
     }
-    .seal()
-    .unwrap();
-    store.put_manifest(&manifest).unwrap().obj
+    writer.commit().unwrap()
 }

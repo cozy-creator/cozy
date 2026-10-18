@@ -23,7 +23,6 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use tensorfs_core::store::Store;
 
 #[derive(Deserialize)]
 struct Package {
@@ -167,7 +166,7 @@ fn submitters_share_a_packages_executor_and_packages_share_a_checkpoints_weights
     let path = std::env::var("TENSORD_GPU_TENANCY").expect("plan path");
     let plan: Plan = serde_json::from_reader(File::open(path).unwrap()).unwrap();
     let service = Service::open(&plan.state, &plan.generations, 1).unwrap();
-    let store = Arc::new(Store::ensure(&plan.store).unwrap());
+    let store = tensord::storage::open(&plan.store).unwrap();
     let config = GpuConfig::load(&plan.gpu_config).unwrap();
     let gpu = Pool::new(&plan.state.join("gpu"), config, store).unwrap();
     service.configure_pool(gpu.clone()).unwrap();

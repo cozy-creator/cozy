@@ -15,6 +15,11 @@ use std::path::{Path, PathBuf};
 
 use common::{Home, Out};
 use serde_json::Value;
+use tensorfs_core::{
+    fetch::{Client, SourcePolicy, TensorhubOrigin},
+    format::ObjectRef,
+    store2::Store,
+};
 
 /// `cozy args` in `dir`. Each step is named, timestamped and flushed before it starts, and its
 /// output streams into the log as it comes, so the job's own timeout shows the step it stopped in.
@@ -110,6 +115,57 @@ fn publish_quantizer(home: &Home) {
 /// A machine added to this home; every Hub call it makes trusts the CA through the run's access.
 fn machine(home: &Home, name: &str) -> common::tensord::Tensord {
     common::tensord::added(home, name)
+}
+
+/// Every object `manifest` reaches in the store at `root` (TensorFS v2: manifest, files, header,
+/// chunks), with its bytes.
+fn closure(root: &Path, manifest: &str) -> Vec<(String, Vec<u8>)> {
+    let store = Store::open(root).unwrap();
+    let sha256 = manifest.trim_start_matches("sha256:").to_string();
+    let length = std::fs::metadata(store.path(&ObjectRef { sha256: sha256.clone(), length: 0 }).unwrap()).unwrap().len();
+    let mut objects: Vec<_> = (store.closure(&ObjectRef { sha256, length }).unwrap().into_iter())
+        .map(|object| (object.sha256.clone(), store.read(&object).unwrap()))
+        .collect();
+    objects.sort();
+    objects
+}
+
+/// TensorFS v2 end to end (xs-045 U9a): one machine imports a Hugging Face model into its store
+/// and puts it in the Hub's custody; a second, fresh machine pulls it by its digest under the
+/// run's capability, and the library's Tensorhub origin pulls it into a third store with the
+/// owner's bearer token (and is refused without one). Every store holds the same objects, byte
+/// for byte.
+#[test]
+fn a_model_uploaded_by_one_machine_is_pulled_bit_identical_by_another() {
+    let Some(home) = Home::with_hub() else { return };
+    let account = home.sign_in("modelv2@cozy.test");
+    let first = machine(&home, "m1");
+    let model = format!("{account}/tiny-v2");
+    let run = completed(&home, &cozy(&home, None, &["--json", "model", "upload", TINY, &model, "--on", "m1"]));
+    let made = &run["result"]["models"][0];
+    assert_eq!(made["published"]["destination"], model.as_str(), "{run}");
+    let source = made["published"]["checkpoint"].as_str().unwrap().to_owned();
+
+    let second = machine(&home, "m2");
+    let checkpoint = format!("{model}#{source}");
+    let run = completed(&home, &cozy(&home, None, &["--json", "model", "download", &checkpoint, "--on", "m2"]));
+    assert_eq!(run["result"]["models"][0]["manifest"], source.as_str(), "{run}");
+    let (made, pulled) = (closure(&first.store(), &source), closure(&second.store(), &source));
+    assert!(made.len() >= 3, "a manifest, a header and its chunks: {}", made.len());
+    assert!(made == pulled, "the pulled checkpoint differs from the uploaded one");
+
+    let ca = std::fs::read(std::env::var("TENSORHUB_CA").expect("the Hub's CA")).unwrap();
+    let url = std::env::var("TENSORHUB_ORIGIN").unwrap();
+    let policy = SourcePolicy { any_host: true, allow_local: true, max_redirects: 5, ..SourcePolicy::default() };
+    let client = Client::with_roots(policy, &ca).unwrap();
+    let (third, reference) = (tempfile::tempdir().unwrap(), format!("{model}@{source}"));
+    let store = Store::open(third.path()).unwrap();
+    let anonymous = store.pull_hub(client.clone(), TensorhubOrigin::new(&client, &url).unwrap(), &reference, None);
+    assert!(anonymous.is_err(), "an owner's checkpoint read anonymously: {anonymous:?}");
+    let hub = TensorhubOrigin::new(&client, &url).unwrap().bearer(home.token());
+    let library = store.pull_hub(client, hub, &reference, None).unwrap();
+    assert_eq!((library.named.manifest.id(), library.named.release), (source.clone(), None));
+    assert!(closure(third.path(), &source) == made, "the library's pull differs from the uploaded checkpoint");
 }
 
 #[test]

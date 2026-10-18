@@ -20,10 +20,8 @@ use std::{
     io::Write,
     path::PathBuf,
     process::Command,
-    sync::Arc,
     time::{Duration, Instant},
 };
-use tensorfs_core::store::Store;
 
 #[derive(Deserialize)]
 struct Model {
@@ -57,7 +55,7 @@ fn published_models_alternate_on_one_gpu_under_the_memory_policy() {
     let path = std::env::var("TENSORD_GPU_ALTERNATION").expect("plan path");
     let plan: Plan = serde_json::from_reader(File::open(path).unwrap()).unwrap();
     let service = Service::open(&plan.state, &plan.generations, 1).unwrap();
-    let store = Arc::new(Store::ensure(&plan.store).unwrap());
+    let store = tensord::storage::open(&plan.store).unwrap();
     let gpu = Pool::new(
         &plan.state.join("gpu"),
         GpuConfig::load(&plan.gpu_config).unwrap(),

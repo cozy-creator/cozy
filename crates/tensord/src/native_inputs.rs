@@ -8,13 +8,10 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
+use crate::{storage::{self, Store}, trees};
 use tensorfs_core::{
-    canon,
-    catalog::WriterGuard,
-    ids::{ObjectRef, StoredDoc},
-    manifest::Manifest,
-    sha256, source_artifact,
-    store::{Fault, Store},
+    format::ObjectRef,
+    sha256,
 };
 use cozy_proto::error::Error;
 
@@ -57,11 +54,10 @@ pub struct SourceIntake {
     store: Arc<Store>,
     journal: Arc<dyn IntakeJournal>,
     state: IntakeState,
-    manifest: Manifest,
+    manifest: BTreeMap<String, ObjectRef>,
     directory: PathBuf,
     objects: BTreeMap<String, ObjectRef>,
     partials: BTreeMap<String, Partial>,
-    _writer: WriterGuard,
 }
 impl Drop for SourceIntake {
     fn drop(&mut self) {
@@ -106,21 +102,11 @@ impl SourceIntake {
                 "input manifest bytes do not verify",
             ));
         }
-        let manifest = Manifest::parse(&header.manifest_canonical_bytes).map_err(native)?;
-        if manifest.header().is_some()
-            || manifest
-                .entries()
-                .iter()
-                .any(|(_, entry)| entry.kind() != "file")
-        {
-            return Err(Error::validation("invalid_request",
-                "input tree must contain ordinary files",
-            ));
-        }
+        let manifest = trees::parse(&header.manifest_canonical_bytes)
+            .map_err(|_| Error::validation("invalid_request", "input tree must contain ordinary files"))?;
         let content = manifest
-            .entries()
-            .iter()
-            .try_fold(0u64, |sum, (_, entry)| sum.checked_add(entry.blob().length))
+            .values()
+            .try_fold(0u64, |sum, file| sum.checked_add(file.length))
             .ok_or_else(|| Error::validation("invalid_request", "input content length overflow"))?;
         if content != header.content_bytes {
             return Err(Error::validation("invalid_request",
@@ -128,8 +114,7 @@ impl SourceIntake {
             ));
         }
         let mut objects = BTreeMap::new();
-        for (_, entry) in manifest.entries() {
-            let reference = entry.blob();
+        for reference in manifest.values() {
             if objects
                 .insert(reference.sha256.clone(), reference.clone())
                 .is_some_and(|prior: ObjectRef| prior.length != reference.length)
@@ -140,16 +125,12 @@ impl SourceIntake {
             }
         }
         let actor = sha256::hex(&actor.public_key);
-        let retention_id = format!(
-            "sha256:{}",
-            sha256::hex_digest(&canon::write(&canon::Value::obj(vec![
-                ("format", canon::Value::str("cozy.machine.input-intake/1")),
-                ("workspace", canon::Value::str(workspace)),
-                ("actor", canon::Value::str(&actor)),
-                ("request", canon::Value::str(&header.request_id)),
-                ("input", canon::Value::str(&header.input_id))
-            ])))
-        );
+        let subject = serde_json_canonicalizer::to_vec(&serde_json::json!({
+            "format": "cozy.machine.input-intake/1", "workspace": workspace, "actor": actor,
+            "request": header.request_id, "input": header.input_id,
+        }))
+        .map_err(|e| Error::internal("custody_corrupt", e.to_string()))?;
+        let retention_id = format!("sha256:{}", sha256::hex_digest(&subject));
         let spec = IntakeSpec {
             actor,
             request_id: header.request_id,
@@ -166,9 +147,6 @@ impl SourceIntake {
                 "input intake changed its immutable subject",
             ));
         }
-        // Acquire before trusting existing catalog objects, keeping GC excluded for
-        // the whole transfer. Source-artifact import adds its own durable liveness.
-        let writer = WriterGuard::acquire(store.root()).map_err(native)?;
         fs::create_dir_all(staging).map_err(database)?;
         let directory = staging.join(
             uuid::Uuid::new_v4().to_string(),
@@ -183,23 +161,21 @@ impl SourceIntake {
             directory,
             objects,
             partials: BTreeMap::new(),
-            _writer: writer,
         }))
     }
     fn result(&self, released: bool) -> Result<domain::NativeByteRetentionResult, Error> {
-        let root =
-            source_artifact::read(&self.store, &self.state.spec.retention_id).map_err(native)?;
-        let source = match root {
-            Some(root) if root.complete => Some(domain::NativeByteTreeRef {
-                producer_root_id: root.producer.clone(),
-                receipt_digest: sha256::digest(&root.receipt().map_err(native)?).to_vec(),
+        let tree = trees::read(&self.store, &self.state.spec.retention_id).map_err(native)?;
+        let source = match tree {
+            Some(tree) => Some(domain::NativeByteTreeRef {
+                producer_root_id: tree.pin,
+                receipt_digest: decode_hex(&tree.manifest.sha256)?,
                 manifest: Some(domain::Ref {
-                    digest: decode_hex(&root.manifest.sha256)?,
-                    length: root.manifest.length,
+                    digest: decode_hex(&tree.manifest.sha256)?,
+                    length: tree.manifest.length,
                 }),
                 content_bytes: self.state.spec.content_bytes,
             }),
-            _ => None,
+            None => None,
         };
         Ok(domain::NativeByteRetentionResult {
             source,
@@ -208,12 +184,7 @@ impl SourceIntake {
         })
     }
     fn release_native(&self) -> Result<(), Error> {
-        if source_artifact::read(&self.store, &self.state.spec.retention_id)
-            .map_err(native)?
-            .is_some()
-        {
-            source_artifact::release(&self.store, &self.state.spec.retention_id).map_err(native)?;
-        }
+        trees::release(&self.store, &self.state.spec.retention_id).map_err(native)?;
         Ok(())
     }
 }
@@ -286,8 +257,7 @@ impl InputTreeReceiver for SourceIntake {
             return Ok(result);
         }
         for reference in self.objects.values() {
-            if matches!(self.store.record_valid(&reference.sha256),Ok(row) if row.length==reference.length)
-            {
+            if self.store.reuse(reference).map_err(|e| native(storage::io_error(e)))? {
                 continue;
             }
             let partial = self
@@ -299,28 +269,18 @@ impl InputTreeReceiver for SourceIntake {
             }
             partial.file.sync_all().map_err(database)?;
         }
-        let files: Vec<_> = self
+        let files: Vec<(String, &Path, ObjectRef)> = self
             .manifest
-            .entries()
             .iter()
-            .map(|(path, entry)| {
-                (
-                    path.clone(),
-                    self.partials
-                        .get(&entry.blob().sha256)
-                        .map(|partial| partial.path.clone())
-                        .unwrap_or_else(|| self.directory.join(&entry.blob().sha256)),
-                )
+            .map(|(path, file)| {
+                let local = self.partials.get(&file.sha256).map_or(self.directory.as_path(), |p| p.path.as_path());
+                (path.clone(), local, file.clone())
             })
             .collect();
-        source_artifact::import_tree(
-            &self.store,
-            &self.state.spec.retention_id,
-            &self.manifest,
-            &files,
-            &Fault::default(),
-        )
-        .map_err(native)?;
+        trees::admit(&self.store, &files).map_err(native)?;
+        // The tree is the client's own manifest, whose digest the run names.
+        let manifest = self.store.put_bytes(&self.state.spec.manifest_canonical_bytes).map_err(|e| native(storage::io_error(e)))?;
+        trees::hold(&self.store, &self.state.spec.retention_id, manifest, &self.manifest).map_err(native)?;
         let result = self.result(false)?;
         let committed = self
             .journal

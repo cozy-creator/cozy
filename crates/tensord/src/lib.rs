@@ -2,16 +2,17 @@
 // costs nothing worth boxing it for.
 #![allow(clippy::result_large_err)]
 pub mod access;
-pub mod adapter_views;
 mod archive;
 pub mod api;
 mod boundary_json;
 mod call_memo;
 pub mod catalog;
 pub mod config;
+pub mod derive;
 pub mod child_launcher;
 pub mod device_executor;
 pub mod execution;
+pub mod frame;
 mod gpu_allocation;
 pub mod gpu_service;
 pub mod held_models;
@@ -33,6 +34,7 @@ pub mod memory;
 pub mod model_sources;
 pub mod native_inputs;
 pub mod objects;
+pub mod origin;
 pub mod output_capacity;
 pub mod precision;
 pub mod process;
@@ -54,4 +56,7 @@ mod scratch;
 mod sdk_selection_tests;
 pub mod serve;
 pub mod service;
+pub mod stop;
+pub mod storage;
 pub mod triage;
+pub mod trees;

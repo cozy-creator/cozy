@@ -15,7 +15,7 @@ use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
 };
-use tensorfs_core::{ids::ObjectRef, store::Store};
+use tensorfs_core::{format::ObjectRef, store2::Store};
 
 /// One released model: `repository` at `release` in `lane`, held in a source store.
 pub struct Model {
@@ -83,14 +83,11 @@ fn start(
 ) -> (String, Heard) {
     let mut bytes = HashMap::new();
     let models = models.into_iter().map(|model| {
-        let document = store.read_manifest(&model.manifest).unwrap();
-        let walked = tensorfs_core::checkpoint::walk_cozytensors(store, &document).unwrap();
         let objects: Vec<ObjectRef> =
-            walked.distinct().into_iter().filter(|o| o.sha256 != model.manifest.sha256).cloned().collect();
-        for object in &objects {
-            bytes.insert(object.sha256.clone(), std::fs::read(store.blob_path(&object.sha256)).unwrap());
+            store.closure(&model.manifest).unwrap().into_iter().filter(|o| *o != model.manifest).collect();
+        for object in objects.iter().chain([&model.manifest]) {
+            bytes.insert(object.sha256.clone(), store.read(object).unwrap());
         }
-        bytes.insert(model.manifest.sha256.clone(), std::fs::read(store.manifest_path(&model.manifest.sha256)).unwrap());
         (model, objects)
     }).collect();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -270,7 +267,7 @@ async fn answer(State(served): State<Arc<Served>>, method: Method, uri: Uri, hea
                 repository == model.repository
                     && (release.is_empty() || release == model.release)
                     && (lane.is_empty() || lane == model.lane)
-                    && (digest.is_empty() || digest == model.manifest.id())
+                    && (digest.is_empty() || digest == format!("sha256:{}", model.manifest.sha256))
             }).collect();
             // No lane names a release's only one.
             let Some((model, objects)) = named.first().filter(|_| !lane.is_empty() || named.len() == 1) else {

@@ -3,8 +3,14 @@
 //! a channel scoped to the call's checkpoints, and the machine's own readers wait for what they
 //! read. A release is read anonymously, the owner's checkpoint by hash under the run's
 //! capability. Credentials stay in this process, with the call that holds them: when it ends
-//! (or its run is canceled) its waits fail, its channels close and their tickets drop.
-use crate::hub;
+//! (or its run is canceled) its waits fail, its channels close and what it wanted drops.
+use crate::{
+    held_models::Pulled,
+    hub,
+    origin::{self, priority, Machine, Remote},
+    stop::Stop,
+    storage::{self, Store},
+};
 use std::{
     collections::BTreeSet,
     fs::File,
@@ -14,74 +20,27 @@ use std::{
 };
 use tensorfs_core::{
     err::{Code, Refusal},
-    fetch_v1::{self as fetch, Access, Fetcher, Origin, Priority, Ticket},
-    header::{Body, Header},
-    ids::ObjectRef,
-    store::Store,
-    transport::{CredentialProvider, PullCancellation, SourcePolicy},
+    format::ObjectRef,
+    store2::Checkpoint,
 };
 
-impl Access for hub::Catalog {
-    fn credential(&self) -> &dyn CredentialProvider {
-        hub::Catalog::credential(self)
-    }
-    fn policy(&self) -> &SourcePolicy {
-        hub::Catalog::policy(self)
-    }
-}
-
-/// `repository` at `source`'s Hub: a release's lane, or (no release) the owner's checkpoint by
-/// hash.
-pub fn origin(source: &hub::Source, repository: &str, release: &str, lane: &str, manifest: &ObjectRef) -> Origin {
-    let refspec = match release.is_empty() {
-        true => format!("{repository}@{}", manifest.id()),
-        false => format!("{repository}@{release}"),
+/// Where `manifest`, a checkpoint this machine pulled from `source`'s Hub, comes from: the Hub
+/// names it as its pin records (`held_models::Pulled`). None for one never pulled (local).
+pub fn remote(machine: &Machine, source: &hub::Source, manifest: &ObjectRef) -> io::Result<Option<Remote>> {
+    let pin = machine.store().get_pin(&storage::pin::model(&manifest.sha256)).map_err(storage::io_error)?;
+    let Some(pulled) = pin.and_then(|pin| serde_json::from_str::<Pulled>(pin.owner.as_deref()?).ok()) else {
+        return Ok(None);
     };
-    Origin { hub: source.origin.clone(), refspec, lane: lane.into(), manifest: manifest.clone() }
+    let found = origin::remote(machine, source, &pulled.repository, &pulled.release, &pulled.lane, manifest);
+    found.map(|(remote, _)| Some(remote)).map_err(|(_, why)| io::Error::other(why))
 }
 
-/// What fetches of `origin` present at `source`: the run's capability for the owner's
-/// checkpoint by hash when it names that read, else nothing. Nothing is traded until a fetch
-/// needs it.
-pub fn of(source: &hub::Source, origin: &Origin) -> Result<Arc<hub::Catalog>, (&'static str, String)> {
-    let catalog = match origin.refspec.split_once("@sha256:") {
-        Some((model, _)) => hub::Catalog::scoped(source, hub::Op::Read { model, manifest: &origin.manifest.id() })?,
-        None => hub::Catalog::new(source).map_err(|e| ("catalog_read_failed", e.0))?,
-    };
-    Ok(Arc::new(catalog))
+/// The checkpoint `id` (`sha256:<hex>`), its structure here.
+pub fn checkpoint(store: &Store, id: &str) -> io::Result<Checkpoint> {
+    storage::checkpoint(store, id)
 }
 
-/// The manifest `id` (`sha256:<hex>`) as the store holds it.
-pub fn held(store: &Store, id: &str) -> io::Result<ObjectRef> {
-    let sha256 = id.trim_start_matches("sha256:").to_string();
-    let length = std::fs::metadata(store.manifest_path(&sha256))?.len();
-    Ok(ObjectRef { sha256, length })
-}
-
-/// The header of a checkpoint whose structure is here.
-pub fn header(store: &Store, manifest: &ObjectRef) -> io::Result<Header> {
-    let held = store.read_manifest(manifest).map_err(io::Error::other)?;
-    let header = held.header().ok_or_else(|| io::Error::other(format!("{} has no model header", manifest.id())))?;
-    tensorfs_core::checkpoint::load_header(store, header).map_err(io::Error::other)
-}
-
-/// Every object `components` of `header` read (all of them when empty), each once, in header
-/// order.
-pub fn objects(header: &Header, components: &[String]) -> Vec<ObjectRef> {
-    let mut seen = BTreeSet::new();
-    (header.components.iter())
-        .filter(|(name, _)| components.is_empty() || components.contains(name))
-        .flat_map(|(_, tensors)| tensors.iter().flat_map(|(_, tensor)| tensor.parts.iter()))
-        .filter_map(|(_, part)| match &part.body {
-            Body::Segments(segments) => Some(segments.iter().cloned()),
-            Body::Inline(_) => None,
-        })
-        .flatten()
-        .filter(|object| seen.insert(object.sha256.clone()))
-        .collect()
-}
-
-/// Whether every object of `components` of `manifest` is here (`downloaded`). Once true it is
+/// Whether every chunk of `components` of `manifest` is here (`downloaded`). Once true it is
 /// remembered (Status asks every second); a later eviction is fetched again by its reader.
 pub fn whole(store: &Store, manifest: &str, components: &[String]) -> bool {
     static WHOLE: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
@@ -89,11 +48,8 @@ pub fn whole(store: &Store, manifest: &str, components: &[String]) -> bool {
     if WHOLE.lock().unwrap().contains(&key) {
         return true;
     }
-    let read = || -> io::Result<bool> {
-        let header = header(store, &held(store, manifest)?)?;
-        Ok(objects(&header, components).iter().all(|o| store.contains(&o.sha256)))
-    };
-    let whole = read().unwrap_or(false);
+    let whole = checkpoint(store, manifest)
+        .is_ok_and(|ck| storage::chunks(&ck, components).iter().all(|o| storage::present(store, o)));
     if whole {
         WHOLE.lock().unwrap().insert(key);
     }
@@ -108,83 +64,69 @@ pub fn failed(refusal: Refusal) -> io::Error {
     io::Error::other(format!("{code}: {refusal}"))
 }
 
-/// What the derived channel fetches a source with: the fetcher, the access, the call's stop.
-pub type Fetching = (Fetcher, Arc<dyn Access>, PullCancellation);
-
-/// One call's fetches: its checkpoints, the access each is fetched under, and what it holds.
+/// One call's fetches: its checkpoints, where each comes from, and what it wants held.
 pub struct Fetch {
-    store: Arc<Store>,
+    machine: Arc<Machine>,
     hub: Option<hub::Source>,
     /// Its schedules' order: the root run's acceptance, or after every run (no run).
     order: u64,
     manifests: Vec<String>,
-    stop: PullCancellation,
+    stop: Stop,
     channels: Mutex<Vec<cozy_platform::ipc::LocalStream>>,
-    kept: Mutex<Vec<Ticket>>,
+    kept: Mutex<Vec<tokio::task::JoinHandle<tensorfs_core::err::Result<tensorfs_core::fetch::Landed>>>>,
     /// What fetched for this call before it could ask: ended by its first channel.
     replaced: Mutex<Option<Arc<Fetch>>>,
 }
 
 impl Fetch {
     /// `manifests` (`sha256:<hex>`) fetched from `hub` for a run ordered `order`.
-    pub fn new(store: Arc<Store>, hub: Option<hub::Source>, manifests: Vec<String>, order: u64) -> Arc<Self> {
+    pub fn new(machine: Arc<Machine>, hub: Option<hub::Source>, manifests: Vec<String>, order: u64) -> Arc<Self> {
         Arc::new(Self {
-            store,
+            machine,
             hub,
             order,
             manifests,
-            stop: PullCancellation::default(),
+            stop: Stop::default(),
             channels: Mutex::default(),
             kept: Mutex::default(),
             replaced: Mutex::default(),
         })
     }
 
-    fn fetcher(&self) -> io::Result<Fetcher> {
-        Fetcher::of(&self.store).map_err(io::Error::other)
+    fn store(&self) -> &Arc<Store> {
+        self.machine.store()
     }
 
-    /// Where the absent objects of `manifest` come from, and under what.
-    fn source(&self, manifest: &ObjectRef) -> io::Result<Option<(Origin, Arc<dyn Access>)>> {
-        let Some(origin) = tensorfs_core::origin::of(self.store.root(), manifest).map_err(io::Error::other)? else {
+    /// Where the absent objects of `manifest` come from.
+    fn source(&self, manifest: &ObjectRef) -> io::Result<Option<Remote>> {
+        let Some(hub) = self.hub.as_ref() else {
             return Ok(None);
         };
-        let hub = self.hub.as_ref().ok_or_else(|| {
-            io::Error::other(format!("model_fetch_failed: {} is here in part and this call names no Hub", manifest.id()))
-        })?;
-        let access: Arc<dyn Access> = of(hub, &origin).map_err(|(_, why)| io::Error::other(why))?;
-        Ok(Some((origin, access)))
+        remote(&self.machine, hub, manifest)
     }
 
-    /// Wait until `objects` of `manifest` are here: a reader is blocked on them (Now).
-    pub fn wait(&self, manifest: &ObjectRef, objects: &[ObjectRef]) -> io::Result<()> {
-        let absent: Vec<ObjectRef> = objects.iter().filter(|o| !self.store.contains(&o.sha256)).cloned().collect();
+    /// Wait until `objects` of `manifest` (`sha256:<hex>`) are here: a reader is blocked on them.
+    pub fn wait(&self, manifest: &str, objects: &[ObjectRef]) -> io::Result<()> {
+        let absent: Vec<ObjectRef> = objects.iter().filter(|o| !storage::present(self.store(), o)).cloned().collect();
         if absent.is_empty() {
             return Ok(());
         }
-        let (origin, access) = self.source(manifest)?.ok_or_else(|| {
-            io::Error::other(format!("model_fetch_failed: {} lacks {} and no Hub holds it", manifest.id(), absent[0].id()))
+        let held = storage::held(self.store(), manifest)?;
+        let remote = self.source(&held)?.ok_or_else(|| {
+            io::Error::other(format!("model_fetch_failed: {manifest} lacks {} and no Hub holds it", absent[0].id()))
         })?;
-        let ticket = self.fetcher()?.want(&origin, access, &[], Priority::Now);
-        ticket.wait(&absent, &self.stop).map_err(failed)
+        self.machine.objects(&remote, &absent, priority::NOW, &self.stop).map(drop).map_err(failed)
     }
 
-    /// The derived channel's fetch of `manifest` (a `Weights[M]` source held in part).
-    pub fn fetching(&self, manifest: &ObjectRef) -> io::Result<Option<Fetching>> {
-        let Some((_, access)) = self.source(manifest)? else {
-            return Ok(None);
-        };
-        Ok(Some((self.fetcher()?, access, self.stop.clone())))
-    }
-
-    /// A fresh executor channel over the call's checkpoints held in part (`fetch::serve`): the
+    /// A fresh executor channel over the call's checkpoints held in part (`origin::serve`): the
     /// end to hand over. A checkpoint held whole is not on it: nothing of it is fetched.
     pub fn channel(&self) -> io::Result<File> {
-        let mut origins = vec![];
+        let mut checkpoints: Vec<(ObjectRef, Remote)> = vec![];
         for manifest in &self.manifests {
-            if let Some((origin, access)) = held(&self.store, manifest).and_then(|m| self.source(&m))? {
-                if !origins.iter().any(|(o, _): &(Origin, Arc<dyn Access>)| *o == origin) {
-                    origins.push((origin, access));
+            let held = storage::held(self.store(), manifest)?;
+            if let Some(remote) = self.source(&held)? {
+                if !checkpoints.iter().any(|(m, _)| *m == held) {
+                    checkpoints.push((held, remote));
                 }
             }
         }
@@ -194,12 +136,12 @@ impl Fetch {
             return Err(io::Error::other("the call ended"));
         }
         channels.push(server.try_clone()?);
-        let (fetcher, grant) = (self.fetcher()?, fetch::Grant { run: self.order, origins, stop: PullCancellation::default() });
+        let (machine, grant) = (self.machine.clone(), origin::Grant { run: self.order, checkpoints, stop: Stop::default() });
         // What fetched before the executor could ask lasts until its first channel closes:
         // by then a later one re-asserted, so nothing on the wire is dropped in between.
         let replaced = self.replaced.lock().unwrap().take();
         std::thread::Builder::new().name("fetch-channel".into()).spawn(move || {
-            if let Err(refusal) = fetch::serve(&fetcher, grant, server) {
+            if let Err(refusal) = origin::serve(&machine, grant, server) {
                 tracing::warn!("fetch channel: {refusal}");
             }
             if let Some(replaced) = replaced {
@@ -215,79 +157,76 @@ impl Fetch {
         *self.replaced.lock().unwrap() = previous;
     }
 
-    /// Want each of `selected`'s (manifest, components) components at Next before the call's
-    /// executor can ask, in Runtime's Start-pass order: the smallest component first, header
-    /// order inside. Held until the call's first channel closes, or the call ends.
+    /// Want each of `selected`'s (manifest, components) components next, before the call's
+    /// executor can ask, in Runtime's Start-pass order: the smallest component first. Held until
+    /// the call's first channel closes, or the call ends.
     pub fn ahead(&self, selected: &[(String, Vec<String>)]) -> io::Result<()> {
         let mut wanted = vec![];
         for (manifest, components) in selected {
-            let manifest = held(&self.store, manifest)?;
-            let Some((origin, access)) = self.source(&manifest)? else {
+            let checkpoint = checkpoint(self.store(), manifest)?;
+            let Some(remote) = self.source(checkpoint.id())? else {
                 continue;
             };
-            let header = header(&self.store, &manifest)?;
             for component in components {
-                let objects = objects(&header, std::slice::from_ref(component));
+                let objects = storage::chunks(&checkpoint, std::slice::from_ref(component));
                 let bytes: u64 = objects.iter().map(|o| o.length).sum();
-                wanted.push((bytes, origin.clone(), access.clone(), objects));
+                wanted.push((bytes, remote.clone(), objects));
             }
         }
         wanted.sort_by_key(|(bytes, ..)| *bytes);
-        let fetcher = self.fetcher()?;
         let mut kept = self.kept.lock().unwrap();
-        for (rank, (_, origin, access, objects)) in wanted.into_iter().enumerate() {
-            kept.push(fetcher.want(&origin, access, &objects, Priority::Next { run: self.order, rank: rank as u32 }));
+        for (rank, (_, remote, objects)) in wanted.into_iter().enumerate() {
+            kept.push(self.machine.want(&remote, objects, priority::next(self.order, rank as u32)).map_err(failed)?);
         }
         Ok(())
     }
 
-    /// Want `components` of each of `selected` (manifest, components) at Behind, held until the
-    /// call ends: a warm set member's `downloaded`.
+    /// Want `components` of each of `selected` (manifest, components) behind everything, held
+    /// until the call ends: a warm set member's `downloaded`.
     pub fn keep(&self, selected: &[(String, Vec<String>)]) -> io::Result<()> {
         let mut kept = self.kept.lock().unwrap();
         if !kept.is_empty() {
             return Ok(());
         }
         for (manifest, components) in selected {
-            let manifest = held(&self.store, manifest)?;
-            if let Some((origin, access)) = self.source(&manifest)? {
-                let objects = objects(&header(&self.store, &manifest)?, components);
-                kept.push(self.fetcher()?.want(&origin, access, &objects, Priority::Behind));
+            let checkpoint = checkpoint(self.store(), manifest)?;
+            if let Some(remote) = self.source(checkpoint.id())? {
+                let objects = storage::chunks(&checkpoint, components);
+                kept.push(self.machine.want(&remote, objects, priority::BEHIND).map_err(failed)?);
             }
         }
         Ok(())
     }
 
-    /// `keep`, then wait until it is all here, reporting its bytes (a warm run of a function):
-    /// the bytes that came from the Hub and from the datacenter volume.
-    pub fn download(&self, selected: &[(String, Vec<String>)], stop: &PullCancellation, progress: &(dyn Fn(u64, u64) + Sync)) -> io::Result<(u64, u64)> {
-        self.keep(selected)?;
-        let kept = self.kept.lock().unwrap();
-        std::thread::scope(|scope| {
-            let waits: Vec<_> = kept.iter().map(|ticket| scope.spawn(move || ticket.wait(&[], stop))).collect();
-            loop {
-                let sum = kept.iter().map(Ticket::progress).fold((0, 0), |(d, t), (dd, tt)| (d + dd, t + tt));
-                progress(sum.0, sum.1);
-                if waits.iter().all(|wait| wait.is_finished()) {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(250));
+    /// Every chunk of `selected` (manifest, components) here, reporting its bytes (a warm run
+    /// of a function): the bytes that came from the Hub and from the datacenter volume.
+    pub fn download(&self, selected: &[(String, Vec<String>)], stop: &Stop, progress: &(dyn Fn(u64, u64) + Sync)) -> io::Result<(u64, u64)> {
+        let counted = Arc::new(tensorfs_core::fetch::Progress::default());
+        origin::watched(&counted, progress, || {
+            let mut landed = (0, 0);
+            for (manifest, components) in selected {
+                let held = storage::held(self.store(), manifest)?;
+                let Some(remote) = self.source(&held)? else {
+                    continue;
+                };
+                let components = (!components.is_empty()).then_some(components.as_slice());
+                let pulled = self.machine.pull(&remote, &held, components, priority::BEHIND, Some(counted.clone()), stop).map_err(failed)?;
+                landed = (landed.0 + pulled.landed.origin, landed.1 + pulled.landed.volume);
             }
-            for wait in waits {
-                wait.join().map_err(|_| io::Error::other("a download wait panicked"))?.map_err(failed)?;
-            }
-            Ok(kept.iter().map(Ticket::landed).fold((0, 0), |(h, v), (hh, vv)| (h + hh, v + vv)))
+            Ok(landed)
         })
     }
 
-    /// Its waits fail, its channels close and every ticket it holds drops.
+    /// Its waits fail, its channels close and everything it wanted drops.
     pub fn end(&self) {
         let mut channels = self.channels.lock().unwrap();
         self.stop.cancel();
         for channel in channels.drain(..) {
             let _ = channel.shutdown(Shutdown::Both);
         }
-        self.kept.lock().unwrap().clear();
+        for want in self.kept.lock().unwrap().drain(..) {
+            want.abort();
+        }
         if let Some(replaced) = self.replaced.lock().unwrap().take() {
             replaced.end();
         }

@@ -24,6 +24,8 @@ pub struct Home {
     /// The `cozy` it runs: this build's or COZY_TEST_BINARY, unless a test chose another
     /// (`use_binary`).
     binary: std::cell::RefCell<PathBuf>,
+    /// The signed-in account's bearer token (`sign_in`).
+    token: std::cell::RefCell<String>,
 }
 
 /// What COZY_TEST_TENSORD names, for `needs`.
@@ -68,6 +70,7 @@ impl Home {
         Some(Self {
             dir: tempfile::tempdir().expect("a temp dir"),
             binary: binary.into(),
+            token: std::cell::RefCell::default(),
         })
     }
 
@@ -108,6 +111,7 @@ impl Home {
                 .expect("sign up");
             std::fs::create_dir_all(home.keys()).unwrap();
             key.save(&hub.device_key(&home)).unwrap();
+            *self.token.borrow_mut() = bearer.token.clone();
             let user = hub_client::Client::connect(
                 &url,
                 http,
@@ -118,6 +122,12 @@ impl Home {
                 .expect("an account name");
         });
         name
+    }
+
+    /// The signed-in account's bearer token at the Hub.
+    #[allow(dead_code)]
+    pub fn token(&self) -> String {
+        self.token.borrow().clone()
     }
 
     /// The cozy home: `~/.cozy` under the child's `HOME`.

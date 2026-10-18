@@ -93,19 +93,19 @@ async fn download(client: &Client, id: &str, hub: &str) -> serde_json::Value {
     result["models"][0].clone()
 }
 
-/// Files under the volume's `objects/`.
+/// Files under the volume's `blobs/`.
 fn on_volume(cache: &Path) -> usize {
     let dirs = |dir: &Path| std::fs::read_dir(dir).into_iter().flatten().flatten().map(|e| e.path()).collect::<Vec<_>>();
-    dirs(&cache.join("objects")).iter().flat_map(|a| dirs(a)).map(|b| dirs(&b).len()).sum()
+    dirs(&cache.join("blobs")).iter().flat_map(|a| dirs(a)).map(|b| dirs(&b).len()).sum()
 }
 
 /// A tmpfs mount named from a disk directory is Linux's.
 #[tokio::test]
 async fn a_second_machine_downloads_from_the_volume_the_first_filled() {
     let source = std::env::temp_dir().join(format!("tensord-volume-source-{}", uuid::Uuid::new_v4()));
-    let store = tensorfs_core::store::Store::ensure(&source).unwrap();
+    let store = tensorfs_core::store2::Store::open(&source).unwrap();
     let manifest = hub_oauth::checkpoint(&store, &vec![5; 1 << 20]);
-    let objects = store.objects().unwrap().len() + 1;
+    let objects = store.closure(&manifest).unwrap().len();
     let model = names_hub::Model {
         repository: "acme/model".into(),
         release: "1.0.0".into(),
@@ -137,8 +137,6 @@ async fn a_second_machine_downloads_from_the_volume_the_first_filled() {
     assert_eq!((&second["bytes"]["hub"], &second["bytes"]["volume"]), (&0.into(), &total.into()), "{second}");
     let asked = std::mem::take(&mut *heard.lock().unwrap());
     assert!(asked.iter().all(|heard| heard.starts_with("POST /v1/tensorfs/closure")), "{asked:?}");
-    let log = std::fs::read_to_string(b_root.join("var/lib/tensorfs/logs/transport.log")).unwrap();
-    assert!(log.contains(&format!("hub 0 B volume {total} B")), "{log}");
     drop(b);
 
     // No variable, no volume: the Hub, as before.

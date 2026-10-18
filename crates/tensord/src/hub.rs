@@ -11,15 +11,8 @@ use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
-use tensorfs_core::transport::{
-    self, Anonymous, Answer, Ask, Client, Closure, CredentialProvider, Deadline, Ledger,
-    SourcePolicy, SAMPLE_SECONDS, STILL_SAMPLES,
-};
 
 pub use hub_client::{types, Op};
-pub use publication::{Publication, Published};
-
-mod publication;
 
 /// A run's reasons when its capability does not carry it (th-241's typed refusals).
 pub mod reason {
@@ -86,15 +79,6 @@ pub fn publishes(source: &Source, url: &str) -> bool {
     origin_key(origin_of(url)).is_some_and(|key| origin_key(&source.origin) == Some(key))
 }
 
-/// Where its published files are read: the file door answers with one redirect to its
-/// object store.
-pub fn files_policy(source: &Source) -> Result<SourcePolicy, Refusal> {
-    Ok(SourcePolicy {
-        max_redirects: 1,
-        ..Catalog::new(source)?.policy
-    })
-}
-
 /// An absolute URL at a valid origin, without query or fragment.
 fn valid_url(url: &str) -> bool {
     valid_origin(origin_of(url)) && !url.contains(['?', '#'])
@@ -122,7 +106,7 @@ pub struct Refusal(pub String);
 /// mover asking for the token) hands the call to a helper thread instead.
 ///
 /// The seam xs-040 U11's runtime unification folds into TensorD's main runtime.
-fn block<T: Send>(call: impl Future<Output = T> + Send) -> T {
+pub(crate) fn block<T: Send>(call: impl Future<Output = T> + Send) -> T {
     static HUB: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
     let runtime = HUB.get_or_init(|| {
         tokio::runtime::Builder::new_current_thread()
@@ -142,11 +126,25 @@ fn block<T: Send>(call: impl Future<Output = T> + Send) -> T {
 }
 
 /// HTTPS to one Hub: the public roots and its granted CA, no redirects. A live Hub that is
-/// merely slow is waited for; a dead one is found by TCP keepalive at the transport's own
-/// resolution (probes after its noise floor of silence, a sample apart), as TensorFS's are.
+/// merely slow is waited for; a dead one is found by TCP keepalive (probes after 30 s of
+/// silence, 5 s apart), as TensorFS's downloader finds its own. For calls on the Hub runtime
+/// (`block`).
 pub fn http(ca_der: Option<&[u8]>) -> Result<reqwest::Client, Refusal> {
     static CLIENTS: Mutex<Vec<(Option<Vec<u8>>, reqwest::Client)>> = Mutex::new(Vec::new());
-    let mut clients = CLIENTS.lock().unwrap();
+    pooled(&CLIENTS, ca_der)
+}
+
+/// [`http`] for calls on TensorFS's fetch runtime: a client's connections live on the runtime
+/// that opened them, so each runtime has its own.
+pub(crate) fn fetch_http(ca_der: Option<&[u8]>) -> Result<reqwest::Client, Refusal> {
+    static CLIENTS: Mutex<Vec<(Option<Vec<u8>>, reqwest::Client)>> = Mutex::new(Vec::new());
+    pooled(&CLIENTS, ca_der)
+}
+
+type Pool = Mutex<Vec<(Option<Vec<u8>>, reqwest::Client)>>;
+
+fn pooled(pool: &Pool, ca_der: Option<&[u8]>) -> Result<reqwest::Client, Refusal> {
+    let mut clients = pool.lock().unwrap();
     if let Some((_, client)) = clients.iter().find(|(ca, _)| ca.as_deref() == ca_der) {
         return Ok(client.clone());
     }
@@ -166,12 +164,13 @@ pub fn http(ca_der: Option<&[u8]>) -> Result<reqwest::Client, Refusal> {
     .map_err(|e| unusable(e.to_string()))?
     .with_root_certificates(roots)
     .with_no_client_auth();
+    const PROBE: Duration = Duration::from_secs(5);
     let client = reqwest::Client::builder()
         .tls_backend_preconfigured(tls)
         .redirect(reqwest::redirect::Policy::none())
-        .tcp_keepalive(Duration::from_secs_f64(SAMPLE_SECONDS) * STILL_SAMPLES)
-        .tcp_keepalive_interval(Duration::from_secs_f64(SAMPLE_SECONDS))
-        .tcp_keepalive_retries(STILL_SAMPLES)
+        .tcp_keepalive(PROBE * 6)
+        .tcp_keepalive_interval(PROBE)
+        .tcp_keepalive_retries(6)
         .build()
         .map_err(|e| unusable(e.to_string()))?;
     clients.push((ca_der.map(<[u8]>::to_vec), client.clone()));
@@ -291,51 +290,32 @@ struct Presenter {
     forbidden: AtomicBool,
 }
 
-impl CredentialProvider for Presenter {
-    fn headers(&self, ask: &Ask) -> Vec<(String, String)> {
-        if !ask.url.host.eq_ignore_ascii_case(&self.host) {
+impl Presenter {
+    /// The capability's headers on `method host target`: nothing off the Hub host or without
+    /// a token.
+    fn present(&self, method: &str, host: &str, target: &str) -> Vec<(String, String)> {
+        if !host.eq_ignore_ascii_case(&self.host) {
             return Vec::new();
         }
         let Some(token) = self.capability.token(&self.http) else {
             return Vec::new();
         };
-        let path = ask
-            .url
-            .target
-            .split(['?', '#'])
-            .next()
-            .filter(|p| !p.is_empty())
-            .unwrap_or("/");
-        let presented = self
-            .capability
-            .run
-            .present(&token, ask.method, &self.host, path);
-        presented
-            .into_iter()
-            .map(|(name, value)| (name.to_string(), value))
-            .collect()
+        let path = target.split(['?', '#']).next().filter(|p| !p.is_empty()).unwrap_or("/");
+        let presented = self.capability.run.present(&token, method, &self.host, path);
+        presented.into_iter().map(|(name, value)| (name.to_string(), value)).collect()
     }
 
-    fn answered(&self, ask: &Ask, answer: &Answer) -> bool {
-        let token = answer
-            .presented("authorization")
-            .and_then(|v| v.strip_prefix("DPoP "));
-        let Some(token) = token.filter(|_| ask.url.host.eq_ignore_ascii_case(&self.host)) else {
+    /// Reads the Hub's answer to a request that presented `authorization`: true asks the
+    /// request again (a fresh DPoP nonce).
+    fn observe(&self, host: &str, authorization: Option<&str>, status: u16, nonce: Option<&str>, challenged: bool) -> bool {
+        let token = authorization.and_then(|v| v.strip_prefix("DPoP "));
+        let Some(token) = token.filter(|_| host.eq_ignore_ascii_case(&self.host)) else {
             return false;
         };
-        if answer.status == 403 {
+        if status == 403 {
             self.forbidden.store(true, Ordering::Relaxed);
         }
-        let challenged = answer
-            .header("www-authenticate")
-            .is_some_and(|v| v.contains("use_dpop_nonce"));
-        self.capability.run.observe(
-            &self.host,
-            token,
-            answer.status,
-            answer.header("dpop-nonce"),
-            challenged,
-        )
+        self.capability.run.observe(&self.host, token, status, nonce, challenged)
     }
 }
 
@@ -348,36 +328,23 @@ pub struct Catalog {
     /// The Hub as the run's capability, for an operation it names.
     run: Option<hub_client::Client>,
     credential: Option<Presenter>,
-    policy: SourcePolicy,
+    ca_der: Option<Vec<u8>>,
 }
 
 impl Catalog {
     /// Public reads: anonymous.
     pub fn new(source: &Source) -> Result<Self, Refusal> {
         let origin = source.origin.clone();
-        let host = transport::base_host(&origin).map_err(|e| Refusal(e.to_string()))?;
-        if let Some(der) = &source.ca_der {
-            transport::trust_roots(pem(der).as_bytes()).map_err(|e| Refusal(e.to_string()))?;
-        }
-        let mut allowed = vec![host.clone()];
-        allowed.extend(source.object_hosts.iter().cloned());
-        let policy = SourcePolicy {
-            allowed_hosts: allowed,
-            allow_local: origin_key(&origin).is_some_and(|key| loopback_host(&key)),
-            ..Default::default()
-        };
-        let hub = hub_client::Client::connect(
-            &origin,
-            http(source.ca_der.as_deref())?,
-            Credential::Anonymous,
-        );
+        let host = tensorfs_core::fetch::policy::base_host(&origin).map_err(|e| Refusal(e.to_string()))?;
+        let http = http(source.ca_der.as_deref())?;
+        let hub = hub_client::Client::connect(&origin, http, Credential::Anonymous);
         Ok(Self {
             origin,
             host,
             hub,
             run: None,
             credential: None,
-            policy,
+            ca_der: source.ca_der.clone(),
         })
     }
 
@@ -428,14 +395,39 @@ impl Catalog {
     pub fn origin(&self) -> &str {
         &self.origin
     }
-    pub fn credential(&self) -> &dyn CredentialProvider {
-        match &self.credential {
-            Some(presenter) => presenter,
-            None => &Anonymous,
-        }
+
+    /// Whether its calls present the run's capability.
+    pub(crate) fn presents(&self) -> bool {
+        self.credential.is_some()
     }
-    pub fn policy(&self) -> &SourcePolicy {
-        &self.policy
+
+    /// The CA the Hub's grant names, beyond the public roots (DER).
+    pub(crate) fn ca(&self) -> Option<&[u8]> {
+        self.ca_der.as_deref()
+    }
+
+    /// The Hub as the run's capability, when it names this operation.
+    pub(crate) fn run(&self) -> Option<&hub_client::Client> {
+        self.run.as_ref()
+    }
+
+    /// Headers presenting the capability on `method url`; none off the Hub host.
+    pub fn present(&self, method: &str, url: &str) -> Vec<(String, String)> {
+        let (Some(presenter), Ok(parsed)) = (&self.credential, reqwest::Url::parse(url)) else {
+            return Vec::new();
+        };
+        presenter.present(method, parsed.host_str().unwrap_or_default(), parsed.path())
+    }
+
+    /// Reads the Hub's answer to a request that sent `sent`: true asks it again.
+    pub(crate) fn observe(&self, url: &str, sent: &[(String, String)], status: u16, headers: &reqwest::header::HeaderMap) -> bool {
+        let (Some(presenter), Ok(parsed)) = (&self.credential, reqwest::Url::parse(url)) else {
+            return false;
+        };
+        let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+        let authorization = sent.iter().find(|(name, _)| name.eq_ignore_ascii_case("authorization")).map(|(_, v)| v.as_str());
+        let challenged = header("www-authenticate").is_some_and(|v| v.contains("use_dpop_nonce"));
+        presenter.observe(parsed.host_str().unwrap_or_default(), authorization, status, header("dpop-nonce"), challenged)
     }
 
     /// A package and its releases.
@@ -457,26 +449,6 @@ impl Catalog {
             let plan = self.hub.get_package_download_plan(org, name, python_version, Some(release), &empty).await?;
             Ok(plan.into_inner())
         })
-    }
-
-    /// What `refspec` (`org/name[@release][@sha256:<hex>]`) and `lane` name at the Hub: the
-    /// first page of its closure, which carries the release, lane and manifest it resolved.
-    pub fn closure(
-        &self,
-        refspec: &str,
-        lane: &str,
-    ) -> Result<Closure, tensorfs_core::err::Refusal> {
-        transport::closure(
-            &Client::new(),
-            &self.origin,
-            refspec,
-            lane,
-            "",
-            self.credential(),
-            &self.policy,
-            Deadline::none(),
-            &Ledger::new(),
-        )
     }
 
     /// A failed Hub call as a run's reason: the capability's typed refusal when it no longer
@@ -561,7 +533,7 @@ mod tests {
             (public.origin(), public.host.as_str()),
             ("https://hub.example", "hub.example")
         );
-        assert!(public.policy().allows_host("objects.example") && public.credential.is_none());
+        assert!(public.credential.is_none());
         let read =
             |model, manifest| Catalog::for_op(&source, Op::Read { model, manifest }).unwrap();
         assert!(read("alice/private", &manifest).credential.is_some());

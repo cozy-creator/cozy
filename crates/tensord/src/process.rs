@@ -359,7 +359,7 @@ pub enum Supervised {
 /// `Liveness`). The second is resolution, never a verdict.
 pub fn supervise(
     child: &mut Child,
-    stop: Option<&tensorfs_core::transport::PullCancellation>,
+    stop: Option<&crate::stop::Stop>,
     what: &str,
     read: &dyn Fn(u64),
 ) -> io::Result<Supervised> {

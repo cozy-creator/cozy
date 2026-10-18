@@ -10,12 +10,8 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
-use tensorfs_core::{
-    ids::ObjectRef,
-    manifest::{Draft, Entry},
-    sha256, source_artifact,
-    store::{Fault, Store, VerifiedFile},
-};
+use crate::{storage::Store, trees};
+use tensorfs_core::{format::ObjectRef, sha256};
 use cozy_proto::error::Error;
 
 const MAX_FILES: usize = 129;
@@ -83,10 +79,8 @@ impl UploadedFile {
         }
     }
     /// Verify and hold the exact inode through a descriptor, never resolve a caller path.
-    pub fn open(&self) -> Result<VerifiedFile, Error> {
-        self.store
-            .open_verified(&self.object.sha256)
-            .map_err(storage)
+    pub fn open(&self) -> Result<File, Error> {
+        self.store.file(&self.object.reference()).map_err(storage)
     }
 }
 
@@ -196,7 +190,7 @@ impl WorkspaceUploads {
             }
         };
         let payload = match &record.object {
-            Some(object) => self.store.open_nofollow(&object.sha256).map_err(storage)?,
+            Some(object) => self.store.file(&object.reference()).map_err(storage)?,
             None => cozy_platform::durable::open_nofollow(&directory.join(format!("{}.partial", record.carrier.filename)), OpenOptions::new().create(true).truncate(false).read(true).write(true).mode(0o600)).map_err(std::io::Error::from)
                 .map_err(disk)?,
         };
@@ -256,10 +250,7 @@ impl WorkspaceUploads {
             let Some(object) = record.object else {
                 return Ok(None);
             };
-            let verified = self.store.open_verified(&object.sha256).map_err(storage)?;
-            if verified.len() != object.length {
-                return Err(Error::internal("custody_corrupt", "uploaded package object length changed"));
-            }
+            self.store.file(&object.reference()).map_err(storage)?;
             files.push(UploadedFile {
                 filename: carrier.filename.clone(),
                 object,
@@ -290,7 +281,7 @@ impl WorkspaceUploads {
         let directory = self.directory(actor, operation)?;
         let _lock = lock(&directory)?;
         for record in records(&directory)? {
-            source_artifact::release(&self.store, &record.retention).map_err(storage)?;
+            trees::release(&self.store, &record.retention).map_err(storage)?;
         }
         fs::remove_dir_all(&directory).map_err(disk)?;
         sync_dir(directory.parent().expect("owned operation parent"))
@@ -371,24 +362,11 @@ impl UploadSession {
             sha256: sha256::hex(&digest),
             length: self.record.carrier.length,
         };
-        let tree = Draft {
-            entries: vec![(
-                self.record.carrier.filename.clone(),
-                Entry::File(object.clone()),
-            )],
-        }
-        .seal()
-        .map_err(storage)?;
-        source_artifact::import_tree(
+        let partial = self.directory.join(format!("{}.partial", self.record.carrier.filename));
+        trees::import(
             &self.uploads.store,
             &self.record.retention,
-            &tree,
-            &[(
-                self.record.carrier.filename.clone(),
-                self.directory
-                    .join(format!("{}.partial", self.record.carrier.filename)),
-            )],
-            &Fault::default(),
+            &[(self.record.carrier.filename.clone(), partial.as_path(), object.clone())],
         )
         .map_err(storage)?;
         self.record.object = Some(StoredObject {
@@ -406,16 +384,12 @@ impl UploadSession {
     }
     fn verify_retained(&self) -> Result<(), Error> {
         let object = self.record.object.as_ref().expect("completed carrier");
-        let file = self
-            .uploads
-            .store
-            .open_verified(&object.sha256)
-            .map_err(storage)?;
-        if file.len() != self.record.carrier.length {
+        if object.length != self.record.carrier.length {
             return Err(Error::internal("custody_corrupt",
                 "retained carrier length differs from accepted upload",
             ));
         }
+        self.uploads.store.file(&object.reference()).map_err(storage)?;
         Ok(())
     }
 }
@@ -641,6 +615,6 @@ fn sync_dir(path: &Path) -> Result<(), Error> {
 fn disk(error: std::io::Error) -> Error {
     Error::unavailable("unavailable", format!("package upload storage unavailable: {error}"))
 }
-fn storage(error: tensorfs_core::err::Refusal) -> Error {
+fn storage(error: impl std::fmt::Display) -> Error {
     Error::conflict("precondition_failed", format!("package upload TensorFS custody: {error}"))
 }

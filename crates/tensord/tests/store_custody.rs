@@ -1,4 +1,4 @@
-//! Write objects keep durable TensorFS roots while an unfinished run names them; the store's
+//! Write objects keep their pins while an unfinished run names them; the store's
 //! GC takes them only once released.
 use tensord::{
     execution::Engine,
@@ -6,7 +6,8 @@ use tensord::{
     objects::Objects,
 };
 use std::{fs, path::PathBuf, sync::Arc, time::Duration};
-use tensorfs_core::{ids::ObjectRef, object_roots, store::Store};
+use tensord::storage::{self, Store};
+use tensorfs_core::format::ObjectRef;
 
 struct Area {
     root: PathBuf,
@@ -17,7 +18,7 @@ struct Area {
 impl Area {
     fn new() -> Self {
         let root = std::env::temp_dir().join(format!("cm-custody-{}", uuid::Uuid::new_v4()));
-        let store = Arc::new(Store::ensure(&root.join("store")).unwrap());
+        let store = Arc::new(storage::open(&root.join("store")).unwrap().as_ref().clone().with_grace(Duration::ZERO));
         let engine = Engine::open(&root.join("state")).unwrap();
         let objects = Objects::new(&root.join("writes"), store.clone(), engine.clone()).unwrap();
         Self {
@@ -36,13 +37,13 @@ impl Area {
         object
     }
     fn present(&self, object: &ObjectRef) -> bool {
-        self.store.object_path(&object.sha256).is_file()
+        storage::present(&self.store, object)
     }
-    /// The store's first GC tier, then a release of every root nothing needs now.
+    /// A release of every pin nothing needs now, then the store's GC.
     fn collect(&self) -> usize {
         std::thread::sleep(Duration::from_millis(5));
         let released = self.objects.release(Duration::ZERO).unwrap();
-        tensorfs_core::gc::collect(self.store.root(), false).unwrap();
+        self.store.gc().unwrap();
         released
     }
 }
@@ -70,8 +71,8 @@ fn invocation(object: &ObjectRef) -> Invocation {
 fn an_acknowledged_write_survives_gc_until_its_run_ends() {
     let area = Area::new();
     let object = area.write(b"accepted run input");
-    // Rooted before the journal row: the store's GC alone never takes it.
-    tensorfs_core::gc::collect(area.store.root(), false).unwrap();
+    // Pinned before the journal row: the store's GC alone never takes it.
+    area.store.gc().unwrap();
     assert!(area.present(&object));
     let run = area.engine.submit("queued", invocation(&object)).unwrap();
     assert_eq!(run.state, State::Queued);
@@ -127,17 +128,9 @@ fn unsubmitted_writes_and_crash_orphans_age_out() {
     let unsubmitted = area.write(b"write never submitted");
     // Within the TTL an acknowledged Write waits for its run.
     assert_eq!(area.objects.release(tensord::reclaim::TTL).unwrap(), 0);
-    // A root written just before a crash, with no journal row.
-    let orphan = area
-        .store
-        .put_stream(
-            &mut &b"death between root and journal"[..],
-            None,
-            &Default::default(),
-        )
-        .unwrap()
-        .obj;
-    object_roots::retain(&area.store, &orphan).unwrap();
+    // A pin written just before a crash, with no journal row.
+    let orphan = area.store.put_bytes(b"death between pin and journal").unwrap();
+    storage::hold(&area.store, &storage::pin::object(&orphan.sha256), vec![orphan.clone()], None).unwrap();
     assert_eq!(
         area.objects.release(tensord::reclaim::IDLE).unwrap(),
         0
