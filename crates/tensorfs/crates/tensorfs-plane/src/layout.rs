@@ -3,9 +3,11 @@
 //! each maps independently; parts start on a 4 KiB boundary so O_DIRECT lands in place and a
 //! region moves in one copy.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
-use tensorfs_core::read::{ObjectRange, ReadPlan, Source};
+use tensorfs_core::format::{Body, Header, Location};
+use tensorfs_core::ids::ObjectRef;
+use tensorfs_core::read::{ObjectRange, Order, PlanItem, ReadPlan, Source};
 
 use crate::{Error, Result};
 
@@ -61,6 +63,47 @@ pub struct Layout {
     /// Identity of the layout: two layouts with the same digest place the same bytes at the
     /// same offsets. Guards adoption of a host memfd written by another process.
     pub digest: String,
+}
+
+/// The read plan of `components` of a cozytensors/2 checkpoint, in the header's order (its
+/// construction order): every part of every tensor, as ranges of the chunks that hold it,
+/// split at `window` bytes (0: whole). A part is `component/key#role`; a plain tensor's role
+/// is `value`. TensorD's host tier and the executor build the same plan from the same header.
+pub fn plan(header: &Header, components: &[String], window: u64) -> Result<ReadPlan> {
+    let wanted: BTreeSet<&str> = components.iter().map(String::as_str).collect();
+    if wanted.is_empty() || wanted.len() != components.len() {
+        return Err(Error::Invalid("a plan names a set of components".into()));
+    }
+    if let Some(absent) = wanted.iter().find(|c| !header.components.contains_key(**c)) {
+        return Err(Error::Invalid(format!("the checkpoint has no component {absent:?}")));
+    }
+    let (mut items, mut dest) = (Vec::new(), 0u64);
+    for (component, c) in header.components.iter().filter(|(name, _)| wanted.contains(name.as_str())) {
+        for (key, tensor) in &c.tensors {
+            let parts: Vec<(&str, Location)> = match &tensor.body {
+                Body::Data(at) => vec![("value", *at)],
+                Body::Encoded { parts, .. } => parts.iter().map(|(role, part)| (role.as_str(), part.at())).collect(),
+            };
+            for (role, at) in parts {
+                let what = format!("{component}/{key}#{role}");
+                for span in header.spans(&at) {
+                    let chunk = &header.chunks[span.chunk];
+                    let obj = ObjectRef { sha256: chunk.sha256.clone(), length: chunk.length };
+                    let mut off = 0;
+                    while off < span.length {
+                        let len = match window {
+                            0 => span.length - off,
+                            window => window.min(span.length - off),
+                        };
+                        let range = ObjectRange { obj: obj.clone(), off: span.start + off, len };
+                        items.push(PlanItem { what: what.clone(), dest_off: dest, len, source: Source::Object(range) });
+                        (dest, off) = (dest + len, off + len);
+                    }
+                }
+            }
+        }
+    }
+    Ok(ReadPlan { items, bytes: dest, io_bytes: dest, inline_parts: 0, order: Order::Destination })
 }
 
 fn tensor_of(what: &str) -> &str {

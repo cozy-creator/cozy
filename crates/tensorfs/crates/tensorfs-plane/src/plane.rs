@@ -1139,6 +1139,12 @@ impl Plane {
         Arc::new(Source::new(store, meta, lease, self.inner.cfg.direct_io, Arc::as_ptr(&self.inner) as usize))
     }
 
+    /// A byte source over verified object files (a checkpoint's chunks), read with this plane's
+    /// O_DIRECT setting. No lease and no store: the files are the only objects it reads.
+    pub fn files_source(&self, files: Vec<(ObjectRef, std::fs::File)>) -> Arc<Source> {
+        Arc::new(Source::files(files, self.inner.cfg.direct_io, Arc::as_ptr(&self.inner) as usize))
+    }
+
     /// Register one weight set: `plan`'s parts grouped into `regions`. `host_fd` adopts a
     /// memfd another process holds for the same layout; otherwise the plane creates one.
     pub fn register(
