@@ -5,6 +5,10 @@
 
 use std::ffi::{c_void, CStr};
 #[cfg(feature = "store")]
+use std::fs::File;
+#[cfg(feature = "store")]
+use std::os::fd::BorrowedFd;
+#[cfg(feature = "store")]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -12,6 +16,8 @@ use pyo3::exceptions::{PyBufferError, PyException};
 use pyo3::prelude::*;
 use pyo3::types::PyTuple;
 use pyo3::{create_exception, ffi};
+#[cfg(feature = "store")]
+use tensorfs_core::ids::ObjectRef;
 #[cfg(feature = "store")]
 use varena::io::Source;
 #[cfg(feature = "store")]
@@ -107,7 +113,7 @@ pub struct PyCounters {
     binds: u64,
     faults: u64,
     paged_in: u64,
-    slot_bytes: u64,
+    streamed_bytes: u64,
     evicted: u64,
     copy_ns: u64,
     stall_ns: u64,
@@ -116,7 +122,7 @@ pub struct PyCounters {
 
 impl From<Counters> for PyCounters {
     fn from(c: Counters) -> Self {
-        PyCounters { binds: c.binds, faults: c.faults, paged_in: c.paged_in, slot_bytes: c.slot_bytes, evicted: c.evicted, copy_ns: c.copy_ns, stall_ns: c.stall_ns, map_ns: c.map_ns }
+        PyCounters { binds: c.binds, faults: c.faults, paged_in: c.paged_in, streamed_bytes: c.streamed_bytes, evicted: c.evicted, copy_ns: c.copy_ns, stall_ns: c.stall_ns, map_ns: c.map_ns }
     }
 }
 
@@ -130,6 +136,7 @@ pub struct PySetStats {
     resident: u64,
     pinned: u64,
     pins: u32,
+    slot_bytes: u64,
     step: PyCounters,
     last: PyCounters,
     total: PyCounters,
@@ -137,7 +144,7 @@ pub struct PySetStats {
 
 impl From<SetStats> for PySetStats {
     fn from(s: SetStats) -> Self {
-        PySetStats { name: s.name, nbytes: s.nbytes, regions: s.regions, home: s.home, resident: s.resident, pinned: s.pinned, pins: s.pins, step: s.step.into(), last: s.last.into(), total: s.total.into() }
+        PySetStats { name: s.name, nbytes: s.nbytes, regions: s.regions, home: s.home, resident: s.resident, pinned: s.pinned, pins: s.pins, slot_bytes: s.slot_bytes, step: s.step.into(), last: s.last.into(), total: s.total.into() }
     }
 }
 
@@ -149,6 +156,7 @@ pub struct PyGpuStats {
     mapped: u64,
     idle: u64,
     slots: u32,
+    slot_bytes: u64,
     slot_span: u64,
     driver_free: u64,
     driver_total: u64,
@@ -164,6 +172,7 @@ impl From<GpuStats> for PyGpuStats {
             mapped: s.mapped,
             idle: s.idle,
             slots: s.slots,
+            slot_bytes: s.slot_bytes,
             slot_span: s.slot_span,
             driver_free: s.driver_free,
             driver_total: s.driver_total,
@@ -173,6 +182,19 @@ impl From<GpuStats> for PyGpuStats {
 }
 
 // ---------------------------------------------------------------- cores
+
+/// A grant's chunk files, `(sha256, length, fd)` each: every fd duplicated, the caller's kept.
+#[cfg(feature = "store")]
+fn granted(py: Python<'_>, files: Option<Vec<(String, u64, i32)>>) -> PyResult<Option<Vec<(ObjectRef, File)>>> {
+    let Some(files) = files else { return Ok(None) };
+    let mut out = Vec::with_capacity(files.len());
+    for (sha256, length, fd) in files {
+        // SAFETY: a descriptor the caller holds for the duration of this call.
+        let own = unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned().map_err(|e| err(py, Error::Io(format!("dup chunk fd {fd}: {e}"))))?;
+        out.push((ObjectRef { sha256, length }, File::from(own)));
+    }
+    Ok(Some(out))
+}
 
 #[pyclass(name = "Gpu", module = "tensorfs.varena", frozen)]
 pub struct PyGpu {
@@ -198,10 +220,10 @@ impl PyGpu {
     }
 
     #[cfg(feature = "store")]
-    #[pyo3(signature = (name, ck, regions, host_fd = None))]
-    fn register(&self, py: Python<'_>, name: String, ck: PyRef<'_, crate::v2::PyCheckpoint>, regions: Vec<Vec<String>>, host_fd: Option<i32>) -> PyResult<PyWeightSet> {
-        let (gpu, ck) = (&self.gpu, &ck.ck);
-        let ws = py.detach(|| gpu.register(&name, ck, &regions, host_fd)).or_raise(py)?;
+    #[pyo3(signature = (name, ck, regions, host_fd = None, files = None))]
+    fn register(&self, py: Python<'_>, name: String, ck: PyRef<'_, crate::v2::PyCheckpoint>, regions: Vec<Vec<String>>, host_fd: Option<i32>, files: Option<Vec<(String, u64, i32)>>) -> PyResult<PyWeightSet> {
+        let (gpu, ck, files) = (&self.gpu, &ck.ck, granted(py, files)?);
+        let ws = py.detach(|| gpu.register(&name, ck, &regions, host_fd, files)).or_raise(py)?;
         Ok(PyWeightSet::new(SetRef::Gpu(ws)))
     }
 
@@ -229,10 +251,10 @@ impl PyHost {
     }
 
     #[cfg(feature = "store")]
-    #[pyo3(signature = (name, ck, regions, host_fd = None))]
-    fn register(&self, py: Python<'_>, name: String, ck: PyRef<'_, crate::v2::PyCheckpoint>, regions: Vec<Vec<String>>, host_fd: Option<i32>) -> PyResult<PyWeightSet> {
-        let ck = &ck.ck;
-        let ws = py.detach(|| Host.register(&name, ck, &regions, host_fd)).or_raise(py)?;
+    #[pyo3(signature = (name, ck, regions, host_fd = None, files = None))]
+    fn register(&self, py: Python<'_>, name: String, ck: PyRef<'_, crate::v2::PyCheckpoint>, regions: Vec<Vec<String>>, host_fd: Option<i32>, files: Option<Vec<(String, u64, i32)>>) -> PyResult<PyWeightSet> {
+        let (ck, files) = (&ck.ck, granted(py, files)?);
+        let ws = py.detach(|| Host.register(&name, ck, &regions, host_fd, files)).or_raise(py)?;
         Ok(PyWeightSet::new(SetRef::Host(ws)))
     }
 }

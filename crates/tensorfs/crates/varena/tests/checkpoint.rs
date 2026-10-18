@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use tensorfs_core::client::regions;
 use tensorfs_core::format::Dtype;
+use tensorfs_core::ids::ObjectRef;
 use tensorfs_core::store2::{Checkpoint, Store};
 use tensorfs_core::writer::{Data, Source};
 use varena::{cuda, memory, Error, Gpu, Host, HostSet};
@@ -81,13 +82,24 @@ fn check(ws: &Arc<HostSet>) {
 fn a_v2_checkpoint_binds_on_the_host_exactly_from_its_chunk_files() {
     let fx = Fixture::new("host");
     let rs = regions(fx.ck.header(), 64 << 20, &[]);
-    let ws = Host.register("ck", &fx.ck, &rs, None).unwrap();
+    let ws = Host.register("ck", &fx.ck, &rs, None, None).unwrap();
     assert_eq!(ws.layout().regions.len(), rs.len());
     check(&ws);
     assert!(ws.bind(0).unwrap().writable);
     // One component alone is a weight set of its own tensors.
     let vae: Vec<Vec<String>> = rs.iter().filter(|r| r[0].starts_with("vae/")).cloned().collect();
-    assert!(Host.register("vae", &fx.ck, &vae, None).unwrap().parts().iter().all(|p| p.component == "vae"));
+    assert!(Host.register("vae", &fx.ck, &vae, None, None).unwrap().parts().iter().all(|p| p.component == "vae"));
+}
+
+#[test]
+fn a_v2_checkpoint_binds_from_the_chunk_files_a_grant_hands_over_and_no_others() {
+    let fx = Fixture::new("granted");
+    let rs = regions(fx.ck.header(), 64 << 20, &[]);
+    let chunks = fx.ck.header().chunks.iter().zip(fx.ck.chunk_paths());
+    let files = chunks.map(|(c, path)| (ObjectRef { sha256: c.sha256.clone(), length: c.length }, std::fs::File::open(path).unwrap())).collect();
+    check(&Host.register("granted", &fx.ck, &rs, None, Some(files)).unwrap());
+    let none = Host.register("none", &fx.ck, &rs, None, Some(Vec::new())).unwrap();
+    assert!((0..rs.len() as u32).any(|r| none.bind(r).is_err()), "an object no grant handed over is never read");
 }
 
 #[cfg(target_os = "linux")] // sealed host layouts are Linux-only
@@ -96,13 +108,13 @@ fn a_v2_checkpoint_binds_on_the_host_exactly_from_a_sealed_layout() {
     let fx = Fixture::new("sealed");
     let rs = regions(fx.ck.header(), 64 << 20, &[]);
     let fd = memory::seal(&fx.ck, &rs, "ck", 2).unwrap();
-    let ws = Host.register("ck", &fx.ck, &rs, Some(fd.as_raw_fd())).unwrap();
+    let ws = Host.register("ck", &fx.ck, &rs, Some(fd.as_raw_fd()), None).unwrap();
     check(&ws);
     assert!(!ws.bind(0).unwrap().writable, "views of the machine's layout are read-only");
     let mut moved = rs.clone();
     let tail = moved[0].pop().unwrap();
     moved[1].push(tail);
-    assert!(Host.register("ck", &fx.ck, &moved, Some(fd.as_raw_fd())).is_err(), "another grouping is refused");
+    assert!(Host.register("ck", &fx.ck, &moved, Some(fd.as_raw_fd()), None).is_err(), "another grouping is refused");
 }
 
 #[test]
