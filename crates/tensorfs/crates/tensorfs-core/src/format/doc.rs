@@ -448,7 +448,7 @@ impl Header {
                 self.chunks.len()
             ));
         };
-        if at.offset % ALIGN != 0 {
+        if !at.offset.is_multiple_of(ALIGN) {
             return invalid(format!("{}: offset {} is not 4 KiB aligned", what(), at.offset));
         }
         let room = rooms[at.chunk as usize];

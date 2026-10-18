@@ -77,7 +77,10 @@ impl GlobalScale {
 fn encoding(scheme: &str, params: &[(&str, Value)]) -> Encoding {
     Encoding {
         scheme: scheme.into(),
-        params: params.iter().map(|(k, v)| (k.to_string(), v.clone())).collect(),
+        params: params
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect(),
     }
 }
 
@@ -97,11 +100,17 @@ impl Encoding {
         encoding("int8.rowwise", &[("axis", axis.into())])
     }
     pub fn int8_convrot(rotation_size: u64) -> Encoding {
-        let p = [("rotation", "hadamard".into()), ("rotation_size", rotation_size.into())];
+        let p = [
+            ("rotation", "hadamard".into()),
+            ("rotation_size", rotation_size.into()),
+        ];
         encoding("int8.convrot", &p)
     }
     pub fn mxfp8(scale_layout: ScaleLayout) -> Encoding {
-        let p = [("block_size", 32u64.into()), ("scale_layout", scale_layout.name().into())];
+        let p = [
+            ("block_size", 32u64.into()),
+            ("scale_layout", scale_layout.name().into()),
+        ];
         encoding("mxfp8", &p)
     }
     pub fn nvfp4(global: GlobalScale, nibbles: NibbleOrder, layout: ScaleLayout) -> Encoding {
@@ -146,10 +155,15 @@ pub fn decode(
         return Err(fail(format!("missing part {role:?}")));
     }
     // Params drive the decode: one this reader does not know is a refusal, not a default.
-    if let Some(key) = encoding.params.keys().find(|k| !defined.contains(&k.as_str())) {
+    if let Some(key) = encoding
+        .params
+        .keys()
+        .find(|k| !defined.contains(&k.as_str()))
+    {
         return Err(fail(format!("unknown param {key:?}")));
     }
-    let text = |key: &str, allowed: &[&str]| match encoding.params.get(key).and_then(Value::as_str) {
+    let text = |key: &str, allowed: &[&str]| match encoding.params.get(key).and_then(Value::as_str)
+    {
         Some(v) if allowed.contains(&v) => Ok(v),
         _ => Err(fail(format!("param {key} is not one of {allowed:?}"))),
     };
@@ -169,12 +183,19 @@ pub fn decode(
         (_, Some(n)) if scheme.ends_with(".tensorwise") => (1, n as usize),
         ([.., c], Some(n)) if shape.len() >= 2 && *c > 0 => ((n / c) as usize, *c as usize),
         ([.., _], Some(0)) if shape.len() >= 2 => (0, 1),
-        _ => return Err(fail(format!("logical shape {shape:?} is not rank 2 or more"))),
+        _ => {
+            return Err(fail(format!(
+                "logical shape {shape:?} is not rank 2 or more"
+            )));
+        }
     };
     let part = |role: &str, dtypes: &[Dtype], want: Option<&[u64]>, count: u64| {
         let p = parts[role];
         if !dtypes.contains(p.dtype) {
-            return Err(fail(format!("part {role} is {}, not one of {dtypes:?}", p.dtype)));
+            return Err(fail(format!(
+                "part {role} is {}, not one of {dtypes:?}",
+                p.dtype
+            )));
         }
         let ok = p.dtype.byte_len(p.shape) == Some(p.bytes.len() as u64)
             && match want {
@@ -186,27 +207,33 @@ pub fn decode(
         }
         Ok(p)
     };
-    // Where block `b` of row `i` sits among the stored scales, and the stored shape.
-    let scales = |layout: &str, blocks: usize| -> (Vec<u64>, Box<dyn Fn(usize, usize) -> usize>) {
-        match layout {
-            "row_major" => {
-                let lead = &shape[..shape.len() - 1];
-                ([lead, &[blocks as u64]].concat(), Box::new(move |i, b| i * blocks + b))
-            }
-            _ => {
-                let (tiles_r, tiles_c) = (rows.div_ceil(128), blocks.div_ceil(4));
-                let at = move |i: usize, b: usize| {
-                    let tile = (i / 128) * tiles_c + b / 4;
-                    tile * 512 + (i % 32) * 16 + (i % 128 / 32) * 4 + b % 4
-                };
-                (vec![tiles_r as u64 * 128, tiles_c as u64 * 4], Box::new(at))
-            }
-        }
+    // The stored scale shape for `blocks` per row, and whether it is cuBLAS-tiled.
+    let scales = |layout: &str, blocks: usize| match layout {
+        "row_major" => (
+            [&shape[..shape.len() - 1], &[blocks as u64]].concat(),
+            false,
+        ),
+        _ => (
+            vec![
+                rows.div_ceil(128) as u64 * 128,
+                blocks.div_ceil(4) as u64 * 4,
+            ],
+            true,
+        ),
     };
     let fp8 = [F8_E4M3, F8_E5M2];
     let out: Vec<f32> = match scheme {
         "fp8.tensorwise" | "int8.tensorwise" => {
-            let w = part("weight", if scheme == "fp8.tensorwise" { &fp8 } else { &[I8] }, Some(shape), 0)?;
+            let w = part(
+                "weight",
+                if scheme == "fp8.tensorwise" {
+                    &fp8
+                } else {
+                    &[I8]
+                },
+                Some(shape),
+                0,
+            )?;
             let s = narrow(dtype, floats(part("scale", &[F32], None, 1)?)[0]);
             if parts.contains_key("input_scale") {
                 part("input_scale", &[F32], None, 1)?;
@@ -214,7 +241,12 @@ pub fn decode(
             floats(w).iter().map(|v| v * s).collect()
         }
         "fp8.rowwise" | "int8.rowwise" => {
-            let w = part("weight", if scheme == "fp8.rowwise" { &fp8 } else { &[I8] }, Some(shape), 0)?;
+            let w = part(
+                "weight",
+                if scheme == "fp8.rowwise" { &fp8 } else { &[I8] },
+                Some(shape),
+                0,
+            )?;
             let axis = uint("axis", &[0, 1])?;
             let s = floats(part("scale", &[F32], None, [rows, cols][axis] as u64)?);
             let at = |i: usize| if axis == 0 { i / cols } else { i % cols };
@@ -225,7 +257,9 @@ pub fn decode(
             text("rotation", &["hadamard"])?;
             let block = uint("rotation_size", &[4, 16, 64, 256, 1024, 4096, 16384, 65536])?;
             if cols % block != 0 {
-                return Err(fail(format!("{cols} columns are not whole blocks of {block}")));
+                return Err(fail(format!(
+                    "{cols} columns are not whole blocks of {block}"
+                )));
             }
             let w = part("weight", &[I8], Some(shape), 0)?.bytes;
             let s = floats(part("scale", &[F32], None, rows as u64)?);
@@ -242,20 +276,24 @@ pub fn decode(
         "mxfp8" => {
             uint("block_size", &[32])?;
             let blocks = cols.div_ceil(32);
-            let (stored, at) = scales(text("scale_layout", &["row_major", "cublas_128x4"])?, blocks);
+            let (stored, tiled) = scales(
+                text("scale_layout", &["row_major", "cublas_128x4"])?,
+                blocks,
+            );
             let s = floats(part("scale", &[F8_E8M0], Some(&stored), 0)?);
             let w = floats(part("weight", &fp8, Some(shape), 0)?);
-            w.iter()
-                .enumerate()
-                .map(|(i, v)| v * s[at(i / cols, i % cols / 32)])
-                .collect()
+            let at = |i: usize| scale_at(tiled, blocks, i / cols, i % cols / 32);
+            w.iter().enumerate().map(|(i, v)| v * s[at(i)]).collect()
         }
         "nvfp4" => {
             uint("block_size", &[16])?;
             if cols % 16 != 0 {
                 return Err(fail(format!("{cols} columns are not whole blocks of 16")));
             }
-            let (stored, at) = scales(text("scale_layout", &["row_major", "cublas_128x4"])?, cols / 16);
+            let (stored, tiled) = scales(
+                text("scale_layout", &["row_major", "cublas_128x4"])?,
+                cols / 16,
+            );
             let mut w = part("weight", &[F4], Some(shape), 0)?;
             let swapped: Vec<u8>;
             if text("nibble_order", &["low_first", "high_first"])? == "high_first" {
@@ -269,15 +307,35 @@ pub fn decode(
             }
             let multiply = text("global_scale", &["multiply", "divide"])? == "multiply";
             let w = floats(w);
-            let block = |i: usize| s[at(i / cols, i % cols / 16)];
+            let block = |i: usize| s[scale_at(tiled, cols / 16, i / cols, i % cols / 16)];
             match multiply {
-                true => w.iter().enumerate().map(|(i, v)| v * block(i) * g).collect(),
-                false => w.iter().enumerate().map(|(i, v)| v * (block(i) / g)).collect(),
+                true => w
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| v * block(i) * g)
+                    .collect(),
+                false => w
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| v * (block(i) / g))
+                    .collect(),
             }
         }
         _ => unreachable!("matched above"),
     };
     Ok(round(dtype, &out))
+}
+
+/// Where row `i`'s scale for block `b` sits, `blocks` to a row: row-major, or in cuBLAS's tiles
+/// of 128 rows by 4 blocks (spec §6).
+fn scale_at(tiled: bool, blocks: usize, i: usize, b: usize) -> usize {
+    match tiled {
+        false => i * blocks + b,
+        true => {
+            let tile = (i / 128) * blocks.div_ceil(4) + b / 4;
+            tile * 512 + (i % 32) * 16 + (i % 128 / 32) * 4 + b % 4
+        }
+    }
 }
 
 /// Element values of a part, as f32.
@@ -317,11 +375,7 @@ fn pow2(n: i32) -> f32 {
 }
 
 fn signed(byte: u8, sign_bit: u8, v: f32) -> f32 {
-    if byte & sign_bit != 0 {
-        -v
-    } else {
-        v
-    }
+    if byte & sign_bit != 0 { -v } else { v }
 }
 
 fn e4m3(b: u8) -> f32 {
