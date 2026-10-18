@@ -159,3 +159,75 @@ fn a_binary_for_another_platform_is_refused() {
     let shown = shown(&home, |s| s["dev"].is_boolean());
     assert_eq!(shown["status"]["dev"].as_bool(), Some(false), "{shown}");
 }
+
+/// On a rental (the CI Hub's docker provider booting this branch's worker image, Debian's glibc):
+/// a `cozy` linked on this newer runner is refused with both glibc versions named, and nothing
+/// drains; the image's own build (`COZY_TEST_WORKER_COZY`) swaps in, and the rental reports it as
+/// dev at this commit. The rental ends and leaves the list.
+#[test]
+fn a_rental_runs_a_dev_binary_and_refuses_one_its_glibc_cannot_load() {
+    let Some(home) = Home::with_hub() else { return };
+    let worker = PathBuf::from(std::env::var_os("COZY_TEST_WORKER_COZY").expect(
+        "COZY_TEST_WORKER_COZY: the branch worker image's cozy (tensorhub dev-build cozy_worker=branch)",
+    ));
+    home.sign_in("tensord@cozy.test");
+    let rented = home.json(["machine", "rent", "cpu", "--detach", "--json"]);
+    let id = rented["machine"]["rental_id"].as_str().unwrap().to_string();
+    let update = |binary: &Path| {
+        let binary = binary.to_str().unwrap();
+        let out = home.cozy(["machine", "update", &id, "--tensord", binary, "--json"]);
+        let last: Value = serde_json::from_str(out.stdout.lines().last().unwrap_or_default())
+            .unwrap_or_else(|e| panic!("{e}: {out:?}"));
+        (out, last)
+    };
+
+    // Sent while it boots: Calcifer holds the update until the rental serves.
+    let (out, last) = update(Path::new(env!("CARGO_BIN_EXE_cozy")));
+    assert_eq!(
+        (out.code, last["run"]["reason"]["code"].as_str()),
+        (1, Some("binary_incompatible")),
+        "{out:?}"
+    );
+    let message = last["run"]["reason"]["message"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        message.contains("needs glibc 2.") && message.contains("this machine has 2."),
+        "{message}"
+    );
+
+    let (out, last) = update(&worker);
+    assert_eq!(
+        (
+            out.code,
+            last["type"].as_str(),
+            last["run"]["result"]["to"]["cozy"].as_str()
+        ),
+        (0, Some("run.completed"), Some(env!("CARGO_PKG_VERSION"))),
+        "{out:?}"
+    );
+    let shown = loop {
+        let shown = home.json(["machine", "show", &id, "--json"]);
+        if shown["status"]["dev"] == true {
+            break shown;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    };
+    assert_eq!(
+        shown["status"]["commit"].as_str(),
+        Some(cozy_proto::COMMIT),
+        "{shown}"
+    );
+
+    let ended = home.json(["machine", "end", &id, "--json"]);
+    assert_eq!(ended["machine"]["state"].as_str(), Some("ended"), "{ended}");
+    let list = home.json(["machine", "list", "--json"]);
+    assert!(
+        !list["machines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["rental_id"] == id.as_str() && m["state"] != "ended"),
+        "{list}"
+    );
+}

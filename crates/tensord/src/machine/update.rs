@@ -640,10 +640,7 @@ impl Updates {
                 if let Err(error) = updates.run(&request, exit) {
                     let failed = updates.set(|s| {
                         if !s.terminal() {
-                            s.error = format!(
-                                "{error}; it keeps cozy {}, Runtime {} and TensorFS {}",
-                                s.from.cozy, s.from.runtime, s.from.tensorfs
-                            );
+                            s.error = format!("{error}; it keeps Runtime {} and TensorFS {}", s.from.runtime, s.from.tensorfs);
                             s.code = error.get_ref().and_then(|e| e.downcast_ref::<Coded>()).map_or("", |c| c.code).into();
                             s.enter("failed");
                         }
