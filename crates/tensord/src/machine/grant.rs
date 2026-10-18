@@ -1,40 +1,15 @@
-//! The machine's launch contract: the environment a Hub (rental) or this computer's launcher
-//! (persistent) gives it. Unknown names are reported and ignored, so a newer Hub never stops
-//! an older machine from booting.
+//! The machine's launch grant: what a Hub (rental) or this computer's home (persistent) gives
+//! it, judged once from [`crate::config`]'s load.
+use cozy_proto::config::MachineConfig;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use cozy_platform::paths::Home;
 use ed25519_dalek::VerifyingKey;
 use std::{
-    collections::HashMap,
     fs::{self, File},
     io::{self, Read},
     net::IpAddr,
-    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
 };
-
-const NAMES: &[&str] = &[
-    "COZY_MACHINE_LIFETIME",
-    "COZY_MACHINE_ROOT",
-    "COZY_TENSORFS_ROOT",
-    "COZY_TENSORFS_CACHE",
-    "COZY_LISTEN_HOST",
-    "COZY_WORKER_ID",
-    "COZY_WORKER_AUTH_TOKEN",
-    "COZY_WORKER_INTERNAL_PORT",
-    "COZY_WEBRTC_INTERNAL_PORT",
-    "COZY_WEBRTC_PUBLIC_ADDRESS",
-    "COZY_AUTHORIZED_KEYS",
-    "COZY_SSH_PUBLIC_KEY",
-    "COZY_RENTAL_IDLE_SECONDS",
-    super::provider::API_ORIGIN,
-    RECEIPT_KEY,
-    RECEIPT_KEY_FILE,
-    "TENSORHUB_ORIGIN",
-    "TENSORHUB_CA_DER_B64URL",
-    "TENSORHUB_OBJECT_STORAGE_HOSTS",
-];
-pub const RECEIPT_KEY: &str = "COZY_BOOTSTRAP_RECEIPT_HMAC_KEY_B64URL";
-pub const RECEIPT_KEY_FILE: &str = "COZY_BOOTSTRAP_RECEIPT_HMAC_KEY_FILE";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Lifetime {
@@ -59,7 +34,8 @@ pub struct Grant {
     pub layout: Layout,
     pub listen_host: IpAddr,
     pub worker_id: String,
-    pub worker_port: u16,
+    /// The API's port; None on this computer: any free port, kept across restarts.
+    pub worker_port: Option<u16>,
     pub webrtc_port: Option<u16>,
     /// Where browsers reach the WebRTC listener ([`super::player::reach`]).
     pub webrtc_reach: super::player::Reach,
@@ -67,15 +43,16 @@ pub struct Grant {
     pub authorized: Vec<VerifyingKey>,
     /// The one-shot readiness key; taken by the receipt and never kept elsewhere.
     pub receipt_key: Option<Vec<u8>>,
-    /// WORKER_MODE=development with COZY_SSH_PUBLIC_KEY (else PUBLIC_KEY, which a provider such as
-    /// vast may own): serve SSH maintenance.
+    /// A development rental's SSH key (`COZY_SSH_PUBLIC_KEY`, which the Hub sends only then):
+    /// serve SSH maintenance.
     pub developer_key: Option<String>,
     /// The pod's own provider credential, which ends it when the Hub cannot. Never read from the
     /// environment here: [`super::provider::ProviderSelf::take`] keeps it from everything else.
     pub provider: Option<super::provider::ProviderSelf>,
     /// How long a rental stays with no job before it releases itself (15 minutes).
     pub idle_ms: i64,
-    pub ignored: Vec<String>,
+    /// The user's cozy home, whose `keys/` this machine admits too.
+    pub home: Home,
 }
 
 /// The image's filesystem, rooted: "/" on a pod, a directory on an owned machine. The paths
@@ -110,158 +87,137 @@ impl Layout {
 }
 
 impl Grant {
-    /// A grant is present when the environment names a machine at all.
-    pub fn present(env: &HashMap<String, String>) -> bool {
-        env.contains_key("COZY_WORKER_ID")
-    }
-
-    pub fn read(env: &HashMap<String, String>) -> io::Result<Self> {
-        let get = |name: &str| env.get(name).map(String::as_str).filter(|v| !v.is_empty());
-        let mut ignored: Vec<String> = env
-            .keys()
-            .filter(|n| {
-                (n.starts_with("COZY_") || n.starts_with("TENSORHUB_"))
-                    && !NAMES.contains(&n.as_str())
-            })
-            .cloned()
-            .collect();
-        ignored.sort();
-        let root = PathBuf::from(get("COZY_MACHINE_ROOT").unwrap_or("/"));
+    pub fn new(lifetime: Lifetime, raw: &MachineConfig, webrtc_reach: super::player::Reach, home: &Home) -> io::Result<Self> {
+        fn get(text: &Option<String>) -> Option<&str> {
+            text.as_deref().filter(|v| !v.is_empty())
+        }
+        let rental = lifetime == Lifetime::Rental;
+        let root = match (&raw.root, rental) {
+            (None, true) => PathBuf::from("/"),
+            _ => raw.root(home),
+        };
         clean_absolute(&root, "COZY_MACHINE_ROOT")?;
-        let store = get("COZY_TENSORFS_ROOT").map(PathBuf::from);
-        if let Some(store) = &store {
-            clean_absolute(store, "COZY_TENSORFS_ROOT")?;
+        for (path, name) in [(&raw.store, "COZY_TENSORFS_ROOT"), (&raw.cache, "COZY_TENSORFS_CACHE")] {
+            if let Some(path) = path {
+                clean_absolute(path, name)?;
+            }
         }
-        let cache = get("COZY_TENSORFS_CACHE").map(PathBuf::from);
-        if let Some(cache) = &cache {
-            clean_absolute(cache, "COZY_TENSORFS_CACHE")?;
-        }
-        let listen_host: IpAddr = match get("COZY_LISTEN_HOST").unwrap_or("0.0.0.0") {
+        let listen_host: IpAddr = match get(&raw.listen_host).unwrap_or(if rental { "0.0.0.0" } else { "127.0.0.1" }) {
             host @ ("0.0.0.0" | "127.0.0.1") => host.parse().expect("literal address"),
             _ => return Err(invalid("COZY_LISTEN_HOST must be 0.0.0.0 or 127.0.0.1")),
         };
-        let worker_id = get("COZY_WORKER_ID").unwrap_or_default().to_owned();
+        let worker_id = get(&raw.worker_id).unwrap_or(if rental { "" } else { "local" }).to_owned();
         if worker_id.is_empty() || worker_id.len() > 256 || worker_id.trim() != worker_id {
-            return Err(invalid(
-                "COZY_WORKER_ID must be one identifier of at most 256 bytes",
-            ));
+            return Err(invalid("COZY_WORKER_ID must be one identifier of at most 256 bytes"));
         }
-        let lifetime = match get("COZY_MACHINE_LIFETIME").unwrap_or("rental") {
-            "rental" => Lifetime::Rental,
-            "persistent" => Lifetime::Persistent,
-            _ => {
-                return Err(invalid(
-                    "COZY_MACHINE_LIFETIME must be persistent or rental",
-                ))
-            }
-        };
-        let worker_port = port(
-            get("COZY_WORKER_INTERNAL_PORT"),
-            "COZY_WORKER_INTERNAL_PORT",
-        )?
-        .ok_or_else(|| invalid("COZY_WORKER_INTERNAL_PORT is required"))?;
-        let webrtc_port = port(
-            get("COZY_WEBRTC_INTERNAL_PORT"),
-            "COZY_WEBRTC_INTERNAL_PORT",
-        )?;
+        let worker_port = raw.port.filter(|p| *p > 0);
+        if rental && worker_port.is_none() {
+            return Err(invalid("COZY_WORKER_INTERNAL_PORT is required"));
+        }
+        let webrtc_port = raw.webrtc_port.filter(|p| *p > 0);
         let hub = match lifetime {
             Lifetime::Persistent => None,
             Lifetime::Rental => {
-                let token = get("COZY_WORKER_AUTH_TOKEN").unwrap_or_default();
+                let token = raw.worker_token.as_ref().map(|t| t.expose()).unwrap_or_default();
                 if URL_SAFE_NO_PAD.decode(token).map(|t| t.len()) != Ok(32) {
-                    return Err(invalid(
-                        "COZY_WORKER_AUTH_TOKEN must be 32 bytes of unpadded base64url",
-                    ));
+                    return Err(invalid("COZY_WORKER_AUTH_TOKEN must be 32 bytes of unpadded base64url"));
                 }
-                let ca_der = match get("TENSORHUB_CA_DER_B64URL") {
+                let ca_der = match get(&raw.hub_ca_der) {
                     None => None,
-                    Some(text) => Some(URL_SAFE_NO_PAD.decode(text).map_err(|_| {
-                        invalid("TENSORHUB_CA_DER_B64URL must be unpadded base64url DER")
-                    })?),
+                    Some(text) => Some(
+                        URL_SAFE_NO_PAD
+                            .decode(text)
+                            .map_err(|_| invalid("TENSORHUB_CA_DER_B64URL must be unpadded base64url DER"))?,
+                    ),
                 };
                 Some(HubGrant {
-                    origin: origin(get("TENSORHUB_ORIGIN"), "TENSORHUB_ORIGIN")?
+                    origin: origin(get(&raw.hub_origin), "TENSORHUB_ORIGIN")?
                         .ok_or_else(|| invalid("TENSORHUB_ORIGIN is required for a rental"))?,
                     worker_id: worker_id.clone(),
                     worker_token: token.into(),
                     ca_der,
-                    object_hosts: get("TENSORHUB_OBJECT_STORAGE_HOSTS")
-                        .map(|h| h.split(',').map(str::to_owned).collect())
-                        .unwrap_or_default(),
+                    object_hosts: raw.object_storage_hosts.clone(),
                 })
             }
         };
-        let authorized = match get("COZY_AUTHORIZED_KEYS") {
-            Some(text) => text.split(',').map(public_key).collect::<io::Result<_>>()?,
-            None => Vec::new(),
-        };
-        // On a rental the Hub lease replaces this boot value once it is read.
-        if authorized.is_empty() {
-            return Err(invalid(
-                "the grant authorizes no key: COZY_AUTHORIZED_KEYS is required",
-            ));
+        let authorized = raw.authorized_keys.iter().map(|k| public_key(k)).collect::<io::Result<Vec<_>>>()?;
+        if rental && authorized.is_empty() && home_keys(home)?.is_empty() {
+            return Err(invalid("the grant authorizes no key: COZY_AUTHORIZED_KEYS is required"));
         }
-        let receipt_key = match (get(RECEIPT_KEY), get(RECEIPT_KEY_FILE)) {
-            (Some(_), Some(_)) => {
-                return Err(invalid("specify only one bootstrap receipt key source"))
-            }
+        let receipt_key = match (raw.receipt_key.as_ref().map(|k| k.expose()), &raw.receipt_key_file) {
+            (Some(_), Some(_)) => return Err(invalid("specify only one bootstrap receipt key source")),
             (Some(text), None) => Some(text.trim().to_owned()),
-            (None, Some(path)) => Some(private_file(Path::new(path))?),
+            (None, Some(path)) => Some(private_file(path)?),
             (None, None) => None,
         };
         let receipt_key = match receipt_key {
             None => None,
             Some(text) => match URL_SAFE_NO_PAD.decode(&text) {
                 Ok(key) if key.len() == 32 => Some(key),
-                _ => {
-                    return Err(invalid(
-                        "bootstrap receipt key must be 32 bytes of unpadded base64url",
-                    ))
-                }
+                _ => return Err(invalid("bootstrap receipt key must be 32 bytes of unpadded base64url")),
             },
         };
-        let idle_ms = match get("COZY_RENTAL_IDLE_SECONDS").map(str::parse::<u32>) {
+        let idle_ms = match raw.rental_idle_seconds {
             None => super::lifecycle::IDLE_GRACE_MS,
-            Some(Ok(seconds)) if seconds > 0 => i64::from(seconds) * 1000,
-            Some(_) => return Err(invalid("COZY_RENTAL_IDLE_SECONDS must be a positive number of seconds")),
+            Some(seconds) if seconds > 0 => i64::from(seconds) * 1000,
+            Some(_) => return Err(invalid("rental_idle_seconds must be a positive number of seconds")),
         };
-        let developer_key = (env.get("WORKER_MODE").map(String::as_str) == Some("development"))
-            .then(|| {
-                get("COZY_SSH_PUBLIC_KEY")
-                    .or_else(|| get("PUBLIC_KEY"))
-                    .map(str::to_owned)
-            })
-            .flatten();
         Ok(Self {
             lifetime,
-            layout: Layout { cache, ..Layout::new(&root, store) },
+            layout: Layout { cache: raw.cache.clone(), ..Layout::new(&root, raw.store.clone()) },
             listen_host,
             worker_id,
             worker_port,
             webrtc_port,
-            webrtc_reach: super::player::reach(webrtc_port, env),
+            webrtc_reach,
             hub,
             authorized,
             receipt_key,
-            developer_key,
+            developer_key: rental.then(|| get(&raw.ssh_public_key).map(str::to_owned)).flatten(),
             provider: None,
             idle_ms,
-            ignored,
+            home: home.clone(),
         })
+    }
+
+    /// The keys this machine admits: the grant's and its home's. On a rental the Hub lease
+    /// replaces them once it is read; this computer's are read again when a signer is unknown.
+    pub fn keys(&self) -> io::Result<crate::api::auth::Keys> {
+        let (named, home) = (self.authorized.clone(), self.home.clone());
+        let admitted = move || Ok([named.clone(), home_keys(&home)?].concat());
+        match self.lifetime {
+            Lifetime::Rental => admitted().map(crate::api::auth::Keys::fixed),
+            Lifetime::Persistent => crate::api::auth::Keys::read(admitted),
+        }
     }
 }
 
-/// Reads the grant from this process's environment and removes the one-shot key from it.
-/// Call before any thread starts: no child may inherit the readiness key.
-pub fn from_process() -> io::Result<Option<Grant>> {
-    let env: HashMap<String, String> = std::env::vars().collect();
-    if !Grant::present(&env) {
-        return Ok(None);
+/// The controllers the home admits, besides those the grant names: the public half of its owner
+/// key (`keys/owner.pem`, this computer's Calcifer's signer) and one unpadded base64url Ed25519
+/// key per line of `keys/authorized` (`cozy machine authorize`; `#` starts a comment). Either
+/// may be absent.
+pub fn home_keys(home: &Home) -> io::Result<Vec<VerifyingKey>> {
+    use ed25519_dalek::{pkcs8::DecodePrivateKey, SigningKey};
+    let owner = home.keys().join("owner.pem");
+    let mut keys = match fs::read_to_string(&owner) {
+        Ok(pem) => vec![SigningKey::from_pkcs8_pem(&pem)
+            .map_err(|e| invalid(&format!("{}: {e}", owner.display())))?
+            .verifying_key()],
+        Err(e) if e.kind() == io::ErrorKind::NotFound => vec![],
+        Err(e) => return Err(e),
+    };
+    match fs::read_to_string(home.keys().join("authorized")) {
+        Ok(text) => {
+            for line in text.lines().map(|l| l.split('#').next().unwrap_or_default().trim()) {
+                if !line.is_empty() {
+                    keys.push(public_key(line)?);
+                }
+            }
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => (),
+        Err(e) => return Err(e),
     }
-    for name in [RECEIPT_KEY, RECEIPT_KEY_FILE] {
-        std::env::remove_var(name);
-    }
-    Grant::read(&env).map(Some)
+    Ok(keys)
 }
 
 fn public_key(spelled: &str) -> io::Result<VerifyingKey> {
@@ -275,16 +231,6 @@ fn public_key(spelled: &str) -> io::Result<VerifyingKey> {
             ))
         })?;
     VerifyingKey::from_bytes(&raw).map_err(|e| invalid(&e.to_string()))
-}
-
-fn port(text: Option<&str>, name: &str) -> io::Result<Option<u16>> {
-    match text {
-        None => Ok(None),
-        Some(text) => match text.parse::<u16>() {
-            Ok(n) if n > 0 && n.to_string() == text => Ok(Some(n)),
-            _ => Err(invalid(&format!("{name} must be one decimal TCP port"))),
-        },
-    }
 }
 
 fn origin(text: Option<&str>, name: &str) -> io::Result<Option<String>> {
@@ -317,7 +263,7 @@ fn private_file(path: &Path) -> io::Result<String> {
     let meta = file.metadata()?;
     if !path.is_absolute()
         || !meta.is_file()
-        || meta.mode() & 0o077 != 0
+        || cozy_platform::durable::mode(&meta).is_some_and(|mode| mode & 0o077 != 0)
         || fs::symlink_metadata(path)?.file_type().is_symlink()
     {
         return Err(invalid(
@@ -336,85 +282,133 @@ fn invalid(detail: &str) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{load_from, Config};
+    use std::collections::BTreeMap;
 
-    fn env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-        pairs
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect()
-    }
+    #[cfg(unix)]
     const TOKEN: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
     const KEY: &str = "O2onvM62pC1io6jQKm8Nc2UyFXcd4kOmOsBIoYtZ2ik";
 
+    /// A user home of its own, and the load over `pairs` as this process's environment.
+    struct Scratch(PathBuf);
+    impl Scratch {
+        fn new() -> Self {
+            Self(std::env::temp_dir().join(format!("tensord-grant-{}", uuid::Uuid::new_v4())))
+        }
+        fn home(&self) -> Home {
+            Home::under(&self.0)
+        }
+        fn load(&self, lifetime: Lifetime, pairs: &[(&str, &str)]) -> io::Result<Config> {
+            let env: BTreeMap<String, String> = pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+            load_from(lifetime, &env, self.0.clone())
+        }
+    }
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A rental is a pod: its root and cache are Unix paths.
+    #[cfg(unix)]
     #[test]
     fn rental_grant_matches_the_hub_environment() {
-        let grant = Grant::read(&env(&[
-            ("COZY_WORKER_ID", "ra-1"),
-            ("COZY_WORKER_AUTH_TOKEN", TOKEN),
-            ("COZY_WORKER_INTERNAL_PORT", "8443"),
-            ("COZY_WEBRTC_INTERNAL_PORT", "8445"),
-            ("COZY_AUTHORIZED_KEYS", KEY),
-            (RECEIPT_KEY, TOKEN),
-            ("TENSORHUB_ORIGIN", "https://hub.example"),
-            ("COZY_FUTURE_SETTING", "x"),
-            ("WORKER_MODE", "development"),
-            ("PUBLIC_KEY", "ssh-ed25519 AAAA"),
-            ("COZY_TENSORFS_CACHE", "/cache"),
-        ]))
-        .unwrap();
+        let config = Scratch::new()
+            .load(Lifetime::Rental, &[
+                ("COZY_WORKER_ID", "ra-1"),
+                ("COZY_WORKER_AUTH_TOKEN", TOKEN),
+                ("COZY_WORKER_INTERNAL_PORT", "8443"),
+                ("COZY_WEBRTC_INTERNAL_PORT", "8445"),
+                ("COZY_AUTHORIZED_KEYS", KEY),
+                ("COZY_BOOTSTRAP_RECEIPT_HMAC_KEY_B64URL", TOKEN),
+                ("TENSORHUB_ORIGIN", "https://hub.example"),
+                ("COZY_FUTURE_SETTING", "x"),
+                ("COZY_MACHINE_LIFETIME", "persistent"),
+                ("WORKER_MODE", "development"),
+                ("COZY_SSH_PUBLIC_KEY", "ssh-ed25519 AAAA"),
+                ("COZY_TENSORFS_CACHE", "/cache"),
+                ("CUDA_VISIBLE_DEVICES", "0"),
+                ("RUNPOD_PUBLIC_IP", "198.51.100.2"),
+                ("RUNPOD_TCP_PORT_8443", "40001"),
+            ])
+            .unwrap();
+        let grant = &config.grant;
         assert_eq!(grant.lifetime, Lifetime::Rental);
         assert_eq!(grant.layout.cache.as_deref(), Some(Path::new("/cache")));
         assert_eq!(grant.layout.state, Path::new("/var/lib/cozy/machine"));
-        assert_eq!((grant.worker_port, grant.webrtc_port), (8443, Some(8445)));
+        assert_eq!((grant.worker_port, grant.webrtc_port), (Some(8443), Some(8445)));
         assert_eq!(grant.receipt_key.as_deref(), Some(&[0u8; 32][..]));
-        assert_eq!(grant.hub.unwrap().origin, "https://hub.example");
-        assert_eq!(grant.ignored, ["COZY_FUTURE_SETTING"]);
+        assert_eq!(grant.hub.as_ref().unwrap().origin, "https://hub.example");
         assert_eq!(grant.developer_key.as_deref(), Some("ssh-ed25519 AAAA"));
+        assert_eq!(config.visible_devices.as_deref(), Some("0"));
+        assert_eq!(config.endpoint.unwrap().ports["8443"], 40001);
+        assert_eq!(config.logs, Path::new("/var/lib/cozy/machine/logs"));
+        // The lifetime is the command line's: the old variable is named and ignored.
+        assert_eq!(
+            config.warnings,
+            [
+                "ignoring COZY_FUTURE_SETTING, which this machine does not read",
+                "ignoring COZY_MACHINE_LIFETIME, which this machine does not read"
+            ]
+        );
     }
 
     #[test]
-    fn the_cozy_ssh_key_wins_over_a_providers_public_key() {
-        let grant = Grant::read(&env(&[
-            ("COZY_WORKER_ID", "ra-1"),
-            ("COZY_WORKER_AUTH_TOKEN", TOKEN),
-            ("COZY_WORKER_INTERNAL_PORT", "8443"),
-            ("COZY_AUTHORIZED_KEYS", KEY),
-            ("TENSORHUB_ORIGIN", "https://hub.example"),
-            ("WORKER_MODE", "development"),
-            ("PUBLIC_KEY", "ssh-ed25519 PROVIDER"),
-            ("COZY_SSH_PUBLIC_KEY", "ssh-ed25519 RENTER"),
-        ]))
-        .unwrap();
-        assert_eq!(grant.developer_key.as_deref(), Some("ssh-ed25519 RENTER"));
-        assert!(grant.ignored.is_empty());
-        assert_eq!(grant.layout.cache, None);
+    fn this_computers_machine_lives_in_the_home_and_admits_its_keys() {
+        use ed25519_dalek::{pkcs8::EncodePrivateKey, SigningKey};
+        let scratch = Scratch::new();
+        let home = scratch.home();
+        fs::create_dir_all(home.keys()).unwrap();
+        let owner = SigningKey::from_bytes(&[7; 32]);
+        fs::write(home.keys().join("owner.pem"), owner.to_pkcs8_pem(Default::default()).unwrap().as_bytes()).unwrap();
+        fs::write(home.keys().join("authorized"), format!("# another controller\n{KEY} # laptop\n")).unwrap();
+        fs::write(home.config(), "hub = \"tensorhub\"\n[machine]\nport = 7443\n").unwrap();
+        let config = scratch.load(Lifetime::Persistent, &[]).unwrap();
+        let grant = &config.grant;
+        assert_eq!(grant.layout.root, home.machine());
+        assert_eq!((grant.worker_id.as_str(), grant.worker_port), ("local", Some(7443)));
+        assert_eq!(grant.listen_host.to_string(), "127.0.0.1");
+        assert!(grant.authorized.is_empty());
+        let keys = grant.keys().unwrap();
+        assert_eq!(keys.admitted(), [owner.verifying_key(), public_key(KEY).unwrap()]);
+        // `cozy machine authorize` appends a line: the next unknown signer reads it.
+        let added = SigningKey::from_bytes(&[9; 32]).verifying_key();
+        let line = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(added.as_bytes());
+        fs::write(home.keys().join("authorized"), format!("{KEY}\n{line}\n")).unwrap();
+        let known = |k: &[VerifyingKey]| if k.contains(&added) { Ok(()) } else { Err(()) };
+        assert_eq!(keys.check(known), Ok(()));
+        assert!(keys.admitted().contains(&added));
+        assert!(grant.hub.is_none() && grant.developer_key.is_none() && grant.receipt_key.is_none());
+        assert!(config.warnings.is_empty(), "{:?}", config.warnings);
     }
 
+    #[cfg(unix)]
     #[test]
     fn malformed_grants_refuse_by_name() {
         let base = [
             ("COZY_WORKER_ID", "ra-1"),
+            ("COZY_WORKER_AUTH_TOKEN", TOKEN),
             ("COZY_WORKER_INTERNAL_PORT", "8443"),
-            ("COZY_MACHINE_LIFETIME", "persistent"),
             ("COZY_AUTHORIZED_KEYS", KEY),
+            ("TENSORHUB_ORIGIN", "https://hub.example"),
         ];
-        assert!(Grant::read(&env(&base)).is_ok());
+        let scratch = Scratch::new();
+        assert!(scratch.load(Lifetime::Rental, &base).is_ok());
         for (name, value) in [
-            ("COZY_WORKER_INTERNAL_PORT", "08443"),
+            ("COZY_WORKER_INTERNAL_PORT", "8443x"),
             ("COZY_MACHINE_ROOT", "relative"),
             ("COZY_TENSORFS_CACHE", "cache"),
             ("COZY_LISTEN_HOST", "::"),
             ("COZY_AUTHORIZED_KEYS", "short"),
+            ("TENSORHUB_ORIGIN", "http://hub.example"),
         ] {
-            let mut pairs = env(&base);
-            pairs.insert(name.into(), value.into());
-            assert!(Grant::read(&pairs).is_err(), "{name}={value}");
+            let mut pairs = base.to_vec();
+            pairs.retain(|(n, _)| *n != name);
+            pairs.push((name, value));
+            let error = scratch.load(Lifetime::Rental, &pairs).err().unwrap_or_else(|| panic!("{name}={value}"));
+            assert!(error.to_string().contains(name) || name == "COZY_AUTHORIZED_KEYS", "{name}: {error}");
         }
-        let mut rental = env(&base);
-        rental.insert("COZY_MACHINE_LIFETIME".into(), "rental".into());
-        assert!(
-            Grant::read(&rental).is_err(),
-            "a rental needs its worker token and Hub"
-        );
+        let without_token: Vec<_> = base.iter().filter(|(n, _)| *n != "COZY_WORKER_AUTH_TOKEN").copied().collect();
+        assert!(scratch.load(Lifetime::Rental, &without_token).is_err(), "a rental needs its worker token");
     }
 }

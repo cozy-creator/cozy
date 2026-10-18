@@ -6,14 +6,13 @@
 //! run's output events or, at startup, from the store. `serve` answers
 //! `GET /v1/runs/{id}/outputs/{name}` from the exported file.
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet},
     io::{Read as _, Seek as _, SeekFrom},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
 };
 
 use axum::{
@@ -26,36 +25,36 @@ use cozy_proto::{
     calcifer::{CHECKPOINT, Event, MachineState},
     error::Kind,
     ids::{Digest, RunId},
-    machine as v1,
+    machine::{
+        self as v1,
+        client::{self, Bulk},
+    },
 };
-use ed25519_dalek::{SigningKey, pkcs8::DecodePrivateKey as _};
+use futures_util::StreamExt as _;
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 use tokio::{
     io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _},
     sync::{Notify, broadcast::error::RecvError, watch},
-    task::{AbortHandle, Id, JoinSet},
 };
-use tonic::{Code, Status};
 use tracing::warn;
 
 use crate::{
     Calcifer, Error, Link, Pause,
     api::{self, Api, Refusal},
+    lanes::{self, Ranged},
+    link::LANES,
     lock,
-    store::{Endpoint, OutputRow, RunRow, State as RunState, StoreError},
+    store::{OutputRow, RunRow, State as RunState, StoreError},
 };
 
 /// A tree output's media type: its bytes are the manifest of its files.
 const TREE: &str = "application/vnd.cozy.tree-manifest";
-/// Bytes are read in ranges of this size, at most `LANES` side by side on their own connections.
+/// Bytes are read in ranges of `clamp(length / (RANGES_PER_LANE * LANES), 1 MiB, RANGE)`, at
+/// most `LANES` side by side on their own connections. More ranges than lanes, as an S3 client
+/// cuts parts: a lane that finishes early takes the next from the queue, so no lane trails alone.
 const RANGE: u64 = 8 << 20;
-const LANES: usize = 8;
-/// A range whose bytes come this many times slower than its peers' is asked again.
-const SLOW: f64 = 8.0;
-/// How often ranges in flight are measured, and the shortest window a rate is judged over.
-const SAMPLE: Duration = Duration::from_secs(1);
-const WINDOW: Duration = Duration::from_secs(2);
+const RANGES_PER_LANE: usize = 4;
 
 /// An output Calcifer still owes this computer: its run's number, its name and index, its length
 /// and the bytes of it in place.
@@ -91,6 +90,7 @@ pub(crate) struct Exports {
 }
 
 /// Why an export stopped short.
+#[derive(Clone)]
 enum Failure {
     /// A newer revision is recorded: that one is exported instead.
     Superseded,
@@ -174,12 +174,13 @@ impl Calcifer {
         self.spawn_task(async move { me.export_run(&id, &wake).await });
     }
 
-    /// Exports the run's outputs, each at its newest revision, until none is left. Paces retries
-    /// while nothing moves; never gives up without recording why.
+    /// Exports the run's outputs, each at its newest revision, until none is left: up to `LANES`
+    /// items side by side, so a run's many small outputs cost one round trip together, not one
+    /// each. Paces retries while nothing moves; never gives up without recording why.
     async fn export_run(&self, id: &RunId, wake: &Notify) {
-        let (mut pause, mut lanes) = (Pause::default(), Lanes::default());
+        let mut pause = Pause::default();
         loop {
-            let (run, item) = match self.next_export(id) {
+            let (run, items) = match self.next_exports(id) {
                 Ok(Some(next)) => next,
                 Ok(None) => return,
                 Err(e) => {
@@ -189,60 +190,66 @@ impl Calcifer {
                 }
             };
             let mut changed = None;
-            let exported = match self.reach(&run, &mut lanes, &mut changed) {
-                Ok(()) => (self.export_item(&run, &item, &mut lanes, wake, changed.as_mut())).await,
-                Err(failure) => Err(failure),
-            };
-            let exported = match exported {
-                Err(Failure::Refused(message)) if run.state == RunState::Settled => {
-                    Err(Failure::Lost(format!("the machine refused it ({message})")))
+            let exported = match self.reach(&run, &mut changed) {
+                Ok(link) => {
+                    let exports = (items.iter())
+                        .map(|item| self.export_item(&run, item, &link, changed.clone()));
+                    futures_util::future::join_all(exports).await
                 }
-                exported => exported,
+                Err(failure) => items.iter().map(|_| Err(failure.clone())).collect(),
             };
-            match exported {
-                Ok(()) => pause.reset(),
-                Err(Failure::Superseded) => {}
-                Err(Failure::Lost(reason)) => {
-                    warn!(run = %id, output = %item.name, rev = item.rev, "not exported: {reason}");
-                    let dest = (run.out_dir).join(file_name(
-                        run.number,
-                        &item.name,
-                        item.index,
-                        &item.media_type,
-                    ));
-                    remove(&suffixed(&dest, ".part"));
-                    remove(&suffixed(&dest, ".manifest.part"));
-                    let (name, index, rev) = (&item.name, item.index, item.rev);
-                    match self
-                        .store
-                        .export_failed(id.as_str(), name, index, rev, &reason)
-                    {
-                        Ok(events) => self.publish(id, events),
-                        Err(e) => {
-                            warn!(run = %id, "{e}");
-                            pause.wait(wake, None).await;
+            let mut again = false;
+            for (item, exported) in items.iter().zip(exported) {
+                let (name, index, rev) = (&item.name, item.index, item.rev);
+                let exported = match exported {
+                    Err(Failure::Refused(message)) if run.state == RunState::Settled => {
+                        Err(Failure::Lost(format!("the machine refused it ({message})")))
+                    }
+                    exported => exported,
+                };
+                match exported {
+                    Ok(()) | Err(Failure::Superseded) => {}
+                    Err(Failure::Lost(reason)) => {
+                        warn!(run = %id, output = %name, rev, "not exported: {reason}");
+                        let dest = (run.out_dir).join(file_name(
+                            run.number,
+                            name,
+                            index,
+                            &item.media_type,
+                        ));
+                        remove(&suffixed(&dest, ".part"));
+                        remove(&suffixed(&dest, ".manifest.part"));
+                        match (self.store).export_failed(id.as_str(), name, index, rev, &reason) {
+                            Ok(events) => self.publish(id, events),
+                            Err(e) => {
+                                warn!(run = %id, "{e}");
+                                again = true;
+                            }
                         }
                     }
+                    Err(Failure::Again(message) | Failure::Refused(message)) => {
+                        warn!(run = %id, output = %name, rev, "export waits: {message}");
+                        again = true;
+                    }
                 }
-                Err(Failure::Again(message) | Failure::Refused(message)) => {
-                    warn!(run = %id, output = %item.name, rev = item.rev, "export waits: {message}");
-                    pause.wait(wake, changed.as_mut()).await;
-                }
+            }
+            match again {
+                true => pause.wait(wake, changed.as_mut()).await,
+                false => pause.reset(),
             }
         }
     }
 
-    /// The run and its first output to export; none ends the exporter, under the lock `export`
-    /// takes, so an event after this starts another.
-    fn next_export(&self, id: &RunId) -> Result<Option<(RunRow, OutputRow)>, StoreError> {
+    /// The run and its first `LANES` outputs to export; none ends the exporter, under the lock
+    /// `export` takes, so an event after this starts another.
+    fn next_exports(&self, id: &RunId) -> Result<Option<(RunRow, Vec<OutputRow>)>, StoreError> {
         let mut runs = lock(&self.exports.runs);
         let next = match self.store.run(id.as_str())? {
-            Some(run) => (self
-                .store
-                .outputs_to_export(id.as_str())?
-                .into_iter()
-                .next())
-            .map(|item| (run, item)),
+            Some(run) => {
+                let mut items = self.store.outputs_to_export(id.as_str())?;
+                items.truncate(LANES);
+                Some((run, items)).filter(|(_, items)| !items.is_empty())
+            }
             None => None,
         };
         if next.is_none() {
@@ -252,38 +259,42 @@ impl Calcifer {
         Ok(next)
     }
 
-    /// Points `lanes` at the run's machine; `changed` is told when the machine changes.
+    /// The run's machine's connection, whose bulk lanes read; `changed` is told when the
+    /// machine changes.
     fn reach(
         &self,
         run: &RunRow,
-        lanes: &mut Lanes,
         changed: &mut Option<watch::Receiver<()>>,
-    ) -> Result<(), Failure> {
+    ) -> Result<Link, Failure> {
         let Some(name) = &run.machine else {
             return Err(Failure::Lost("the run never reached a machine".into()));
         };
-        let (machine, _, watch, _) = self.machine(name).map_err(Failure::Again)?;
+        let (machine, link, watch, _) = self.machine(name).map_err(Failure::Again)?;
         *changed = Some(watch);
         if machine.state == MachineState::Ended {
             let reason = machine.reason.as_deref().unwrap_or("no reason was given");
             return Err(Failure::Lost(format!("its machine {name} ended: {reason}")));
         }
-        let Some(endpoint) = machine.endpoint else {
-            return Err(Failure::Again(format!("waiting for {name} to start")));
-        };
-        lanes.point(endpoint, &machine.key).map_err(Failure::Again)
+        link.ok_or_else(|| Failure::Again(format!("waiting for {name} to start")))
     }
 
     /// Makes the item's file (a directory for a tree) this revision's bytes. A newer revision
-    /// stops it; so does its machine's end, which loses it.
+    /// stops it; so does its machine's end (`changed` tells of it), which loses it.
     async fn export_item(
         &self,
         run: &RunRow,
         item: &OutputRow,
-        lanes: &mut Lanes,
-        wake: &Notify,
-        mut changed: Option<&mut watch::Receiver<()>>,
+        link: &Link,
+        mut changed: Option<watch::Receiver<()>>,
     ) -> Result<(), Failure> {
+        let mut events = self.subscribe();
+        let superseded = || -> Result<bool, Failure> {
+            let now = self.store.output(run.id.as_str(), &item.name, item.index)?;
+            Ok(now.is_none_or(|now| now.rev != item.rev))
+        };
+        if superseded()? {
+            return Err(Failure::Superseded);
+        }
         let name = file_name(run.number, &item.name, item.index, &item.media_type);
         let dest = run.out_dir.join(name);
         let target = v1::OutputTarget {
@@ -300,28 +311,19 @@ impl Calcifer {
                 Failure::Again(format!("cannot create {}: {e}", run.out_dir.display()))
             })?;
             let staged = if item.media_type == TREE {
-                fetch_tree(lanes, &target, item, &dest, &moved).await?
+                fetch_tree(link, &target, item, &dest, &moved).await?
             } else {
                 let appended = (run.id.clone(), item_id(run.number, item), item.rev);
                 let appended = lock(&self.exports.appended).get(&appended).copied();
-                fetch_file(lanes, &target, item, &dest, appended, &moved).await?
+                fetch_file(link, &target, item, &dest, appended, &moved).await?
             };
             self.land(run, item, &staged, &dest)
         };
         tokio::pin!(work);
         let done = loop {
-            tokio::select! {
+            let told = tokio::select! {
                 done = &mut work => break done,
-                () = wake.notified() => {
-                    let now = self.store.output(run.id.as_str(), &item.name, item.index);
-                    match now {
-                        Ok(now) if now.as_ref().is_none_or(|now| now.rev != item.rev) => {
-                            break Err(Failure::Superseded);
-                        }
-                        Ok(_) => {}
-                        Err(e) => break Err(e.into()),
-                    }
-                }
+                told = events.recv() => told,
                 () = machine_changed(&mut changed) => {
                     if let Some(name) = &run.machine
                         && let Ok(Some(machine)) = self.store.machine(name)
@@ -330,7 +332,26 @@ impl Calcifer {
                         let reason = machine.reason.as_deref().unwrap_or("no reason was given");
                         break Err(Failure::Lost(format!("its machine {name} ended: {reason}")));
                     }
+                    continue;
                 }
+            };
+            let newer = match told {
+                Ok((id, event)) => {
+                    id == run.id
+                        && matches!(
+                            event,
+                            Event::OutputAdded { .. }
+                                | Event::OutputDelta { .. }
+                                | Event::OutputDone { .. }
+                        )
+                }
+                Err(RecvError::Lagged(_)) => true,
+                Err(RecvError::Closed) => break (&mut work).await,
+            };
+            match newer.then(superseded) {
+                Some(Ok(true)) => break Err(Failure::Superseded),
+                Some(Err(e)) => break Err(e),
+                _ => {}
             }
         };
         lock(&self.exports.moving).remove(&key);
@@ -576,7 +597,7 @@ fn item_id(number: u64, item: &OutputRow) -> String {
 }
 
 /// Resolves when the machine changes; never without a receiver or once its sender is gone.
-async fn machine_changed(changed: &mut Option<&mut watch::Receiver<()>>) {
+async fn machine_changed(changed: &mut Option<watch::Receiver<()>>) {
     let changed = match changed {
         Some(changed) => changed.changed().await.is_ok(),
         None => false,
@@ -599,12 +620,12 @@ fn remove(path: &Path) {
 /// This revision's bytes in `<file>.part`, checked against its digest. A revision that extends
 /// the one the file holds reads only its new tail.
 async fn fetch_file(
-    lanes: &mut Lanes,
+    link: &Link,
     target: &v1::OutputTarget,
     item: &OutputRow,
     dest: &Path,
     appended: Option<u64>,
-    moved: &AtomicU64,
+    moved: &Arc<AtomicU64>,
 ) -> Result<PathBuf, Failure> {
     let part = suffixed(dest, ".part");
     let follows = item.exported_rev.is_some_and(|held| held + 1 == item.rev);
@@ -626,7 +647,7 @@ async fn fetch_file(
             continue;
         }
         moved.store(from, Ordering::Relaxed);
-        fetch(lanes, target, item.rev, from, item.length, &part, moved).await?;
+        fetch(link, target, item.rev, from, item.length, &part, moved).await?;
         match check(&part, item.length, &item.digest).await {
             Ok(()) => return Ok(part),
             // The file did not hold the revision this one extends.
@@ -639,11 +660,11 @@ async fn fetch_file(
 /// This revision's tree in `<dir>.part/`: its manifest, then each file it names, each checked
 /// against its digest; a file the tree names twice is read once.
 async fn fetch_tree(
-    lanes: &mut Lanes,
+    link: &Link,
     target: &v1::OutputTarget,
     item: &OutputRow,
     dest: &Path,
-    moved: &AtomicU64,
+    moved: &Arc<AtomicU64>,
 ) -> Result<PathBuf, Failure> {
     let (stage, manifest) = (suffixed(dest, ".part"), suffixed(dest, ".manifest.part"));
     let unwritable =
@@ -657,7 +678,7 @@ async fn fetch_tree(
         }
     });
     prepared.await.map_err(unwritable)?;
-    fetch(lanes, target, item.rev, 0, item.length, &manifest, moved).await?;
+    fetch(link, target, item.rev, 0, item.length, &manifest, moved).await?;
     check(&manifest, item.length, &item.digest)
         .await
         .map_err(Failure::Again)?;
@@ -679,7 +700,7 @@ async fn fetch_tree(
             member: path,
             ..target.clone()
         };
-        fetch(lanes, &member, item.rev, 0, length, &file, moved).await?;
+        fetch(link, &member, item.rev, 0, length, &file, moved).await?;
         check(&file, length, &digest)
             .await
             .map_err(Failure::Again)?;
@@ -794,221 +815,62 @@ async fn check(path: &Path, length: u64, digest: &str) -> Result<(), String> {
     checked.await.unwrap_or_else(|e| Err(e.to_string()))
 }
 
-/// Connections that read one machine's outputs, apart from the one its runs' frames use, so a
-/// big read never holds a run's events up.
-#[derive(Default)]
-struct Lanes {
-    machine: Option<(Endpoint, SigningKey)>,
-    links: Vec<Option<Link>>,
-}
-
-impl Lanes {
-    fn point(&mut self, endpoint: Endpoint, key: &Path) -> Result<(), String> {
-        if self.machine.as_ref().is_some_and(|(at, _)| *at == endpoint) {
-            return Ok(());
-        }
-        let signer = std::fs::read_to_string(key)
-            .ok()
-            .and_then(|pem| SigningKey::from_pkcs8_pem(&pem).ok())
-            .ok_or_else(|| format!("cannot read the signing key {}", key.display()))?;
-        *self = Lanes {
-            machine: Some((endpoint, signer)),
-            links: vec![None; LANES],
-        };
-        Ok(())
-    }
-
-    /// Lane `i`'s connection, opened on first use and after `redial`.
-    fn link(&mut self, i: usize) -> Result<Link, String> {
-        let (endpoint, key) = self.machine.as_ref().expect("pointed at a machine");
-        if self.links[i].is_none() {
-            self.links[i] = Some(Link::new(endpoint, key.clone()).map_err(|e| e.to_string())?);
-        }
-        Ok(self.links[i].clone().expect("opened"))
-    }
-
-    fn redial(&mut self, i: usize) {
-        self.links[i] = None;
-    }
-}
-
-/// A range being read: its task and how far its bytes are in place.
-struct Flight {
-    lane: usize,
-    first: u64,
-    end: u64,
-    at: Arc<AtomicU64>,
-    began: Instant,
-    /// Since its first byte: the start of the window its rate is measured over, and `at` then.
-    window: Option<(Instant, u64)>,
-    slow: bool,
-    task: AbortHandle,
-}
-
-/// Why a range's read stopped.
-enum Ranged {
-    /// Asked again on a fresh connection.
-    Again(String),
-    /// The whole read stops.
-    Stop(Failure),
-}
-
-/// Reads bytes `[from, length)` of `target` at revision `rev` into `part` at their offsets, as an
-/// S3 client does: ranges of `RANGE` bytes, at most `LANES` side by side on their own
-/// connections. A range that fails, or whose bytes come `SLOW` times slower than its peers', is
-/// asked again from where its bytes stopped on a fresh connection. The read gives up only when
-/// every lane has failed since a byte last landed.
+/// Reads bytes `[from, length)` of `target` at revision `rev` into `part` at their offsets: ranges
+/// cut as `lanes::parts` cuts them (at most `RANGE`), `LANES` side by side on the machine's bulk
+/// lanes (`lanes::transfer`).
 async fn fetch(
-    lanes: &mut Lanes,
+    link: &Link,
     target: &v1::OutputTarget,
     rev: u64,
     from: u64,
     length: u64,
     part: &Path,
-    moved: &AtomicU64,
+    moved: &Arc<AtomicU64>,
 ) -> Result<(), Failure> {
-    let mut queue: VecDeque<(u64, u64)> = (from..length)
-        .step_by(RANGE as usize)
-        .map(|first| (first, (first + RANGE).min(length)))
-        .collect();
-    let (mut reads, mut flights) = (JoinSet::new(), HashMap::<Id, Flight>::new());
-    let (mut rates, mut waits) = (vec![], vec![]);
-    let (mut failures, mut landed, mut landed_then, mut told) = (0, 0, 0, 0);
-    let mut sample = tokio::time::interval(SAMPLE);
-    loop {
-        while flights.len() < LANES
-            && let Some((first, end)) = queue.pop_front()
-        {
-            let lane = (0..LANES)
-                .find(|lane| !flights.values().any(|f| f.lane == *lane))
-                .expect("a free lane");
-            let link = lanes.link(lane).map_err(Failure::Again)?;
-            let at = Arc::new(AtomicU64::new(first));
-            let range = (first, end, length);
-            let read = read_range(
-                link,
-                target.clone(),
-                rev,
-                range,
-                part.to_owned(),
-                at.clone(),
-            );
-            let task = reads.spawn(read);
-            let (began, window, slow) = (Instant::now(), None, false);
-            let flight = Flight {
-                lane,
-                first,
-                end,
-                at,
-                began,
-                window,
-                slow,
-                task,
-            };
-            flights.insert(flight.task.id(), flight);
+    let ranges = lanes::parts(&[(0, from)], length, RANGES_PER_LANE * LANES, RANGE);
+    let read = lanes::transfer(ranges, LANES, |leg| {
+        let lane = link.lane(leg.lane, leg.fresh);
+        let (target, part, moved) = (target.clone(), part.to_owned(), moved.clone());
+        async move {
+            let lane = lane.ok_or_else(|| Ranged::Again("no connection to the machine".into()))?;
+            let range = (leg.first, leg.end, length);
+            read_range(lane, target, rev, range, part, leg.at, &moved).await
         }
-        // Only bytes written count: a range's `at` moves past its bytes once they are in place.
-        let now = landed
-            + (flights.values())
-                .map(|f| f.at.load(Ordering::Relaxed) - f.first)
-                .sum::<u64>();
-        moved.fetch_add(now - told, Ordering::Relaxed);
-        told = now;
-        if flights.is_empty() {
-            return Ok(());
-        }
-        tokio::select! {
-            Some(joined) = reads.join_next_with_id() => {
-                let (id, read) = match joined {
-                    Ok((id, read)) => (id, read),
-                    Err(e) => (e.id(), Err(Ranged::Again(e.to_string()))),
-                };
-                let flight = flights.remove(&id).expect("a flight per read");
-                let at = flight.at.load(Ordering::Relaxed);
-                landed += at - flight.first;
-                match read {
-                    Ok(()) => {
-                        let seconds = flight.began.elapsed().as_secs_f64().max(1e-3);
-                        rates.push((flight.end - flight.first) as f64 / seconds);
-                    }
-                    Err(Ranged::Stop(failure)) => return Err(failure),
-                    Err(Ranged::Again(message)) => {
-                        lanes.redial(flight.lane);
-                        queue.push_front((at, flight.end));
-                        if !flight.slow {
-                            if landed > landed_then {
-                                (failures, landed_then) = (0, landed);
-                            }
-                            failures += 1;
-                            if failures > LANES {
-                                return Err(Failure::Again(message));
-                            }
-                        }
-                    }
-                }
-            }
-            _ = sample.tick() => judge(&mut flights, &rates, &mut waits),
-        }
-    }
-}
-
-/// Measures the ranges in flight and drops the one whose first byte waits `SLOW` times longer
-/// than its peers' did, or whose bytes come `SLOW` times slower than its peers' (finished ranges
-/// included) over its latest window; its rest is asked again.
-fn judge(flights: &mut HashMap<Id, Flight>, finished: &[f64], waits: &mut Vec<Duration>) {
-    let now = Instant::now();
-    let mut rates = finished.to_vec();
-    let mut judged = vec![];
-    for flight in flights.values_mut() {
-        let at = flight.at.load(Ordering::Relaxed);
-        match flight.window {
-            None if at > flight.first => {
-                waits.push(now - flight.began);
-                flight.window = Some((now, at));
-            }
-            None => {
-                waits.sort();
-                let typical = waits.get(waits.len() / 2).map(|wait| wait.mul_f64(SLOW));
-                flight.slow |= typical.is_some_and(|t| now - flight.began > t.max(WINDOW));
-            }
-            Some((since, seen)) if now - since >= WINDOW => {
-                let rate = (at - seen) as f64 / (now - since).as_secs_f64();
-                flight.window = Some((now, at));
-                rates.push(rate);
-                judged.push((flight.task.id(), rate));
-            }
-            Some(_) => {}
-        }
-    }
-    rates.sort_by(f64::total_cmp);
-    let typical = (rates.len() >= 2).then(|| rates[rates.len() / 2]);
-    for (id, rate) in judged {
-        if let (Some(typical), Some(flight)) = (typical, flights.get_mut(&id)) {
-            flight.slow |= rate * SLOW < typical;
-        }
-    }
-    for flight in flights.values().filter(|flight| flight.slow) {
-        flight.task.abort();
+    });
+    match read.await {
+        Ok(()) => Ok(()),
+        Err(Ranged::Stop(failure)) => Err(failure),
+        Err(Ranged::Again(message)) => Err(Failure::Again(message)),
     }
 }
 
 /// Reads `[first, end)` of an output `length` bytes long into `part`, moving `at` past each byte
 /// in place.
 async fn read_range(
-    link: Link,
+    lane: Bulk,
     target: v1::OutputTarget,
     rev: u64,
     (first, end, length): (u64, u64, u64),
     part: PathBuf,
     at: Arc<AtomicU64>,
-) -> Result<(), Ranged> {
-    let (head, mut frames) = (link.read(target, first, end - first, rev).await).map_err(refused)?;
-    if head.length != length {
+    moved: &AtomicU64,
+) -> Result<(), Ranged<Failure>> {
+    let mut output = lane
+        .get(&target, (first, end), rev)
+        .await
+        .map_err(refused)?;
+    if output.length != length {
         let held = format!(
             "the machine holds {} bytes of revision {rev}, not {length}",
-            head.length
+            output.length
         );
         return Err(Ranged::Stop(Failure::Lost(held)));
+    }
+    if output.range.0 != first {
+        return Err(Ranged::Again(format!(
+            "the machine answered bytes from {}, not {first}",
+            output.range.0
+        )));
     }
     let unwritable = |e: std::io::Error| {
         Ranged::Stop(Failure::Again(format!(
@@ -1026,40 +888,46 @@ async fn read_range(
         .map_err(unwritable)?;
     let mut done = first;
     while done < end {
-        let data = match frames.message().await {
-            Ok(Some(frame)) => frame.data,
-            Ok(None) => return Err(Ranged::Again("the machine ended the range early".into())),
-            Err(status) => return Err(refused(status)),
+        let data = match output.body.next().await {
+            Some(Ok(data)) => data,
+            Some(Err(e)) => return Err(Ranged::Again(e.to_string())),
+            None => return Err(Ranged::Again("the machine ended the range early".into())),
         };
         let data = &data[..data.len().min((end - done) as usize)];
         file.write_all(data).await.map_err(unwritable)?;
         file.flush().await.map_err(unwritable)?;
         done += data.len() as u64;
         at.store(done, Ordering::Relaxed);
+        // Only bytes in place count, each once: a range asked again starts where these stopped.
+        moved.fetch_add(data.len() as u64, Ordering::Relaxed);
     }
     Ok(())
 }
 
 /// A machine's refusal of a read, as the read acts on it.
-fn refused(status: Status) -> Ranged {
-    let message = format!("{:?}: {}", status.code(), status.message());
-    match status.code() {
-        Code::NotFound => Ranged::Stop(Failure::Lost(format!(
-            "the machine no longer holds it ({message})"
+fn refused(e: client::Error) -> Ranged<Failure> {
+    match e {
+        client::Error::Refused { status: 404, error } => Ranged::Stop(Failure::Lost(format!(
+            "the machine no longer holds it ({}: {})",
+            error.code, error.message
         ))),
-        // Definitive: the machine will not serve this read, or holds the output at another
-        // revision (while the run goes on, its frames bring the newer one; once it ended, none
-        // comes).
-        Code::OutOfRange | Code::PermissionDenied | Code::InvalidArgument | Code::Unimplemented => {
-            Ranged::Stop(Failure::Refused(message))
-        }
-        Code::FailedPrecondition if status.message().starts_with("the output is at revision") => {
-            Ranged::Stop(Failure::Refused(message))
-        }
-        // Anything else may pass (its store busy, its key not admitted yet, a restart): asked
+        // Definitive: the machine will not serve this read (403, 400, 416, 501) or holds the
+        // output at another revision (412). While the run goes on, its events bring the newer
+        // one; once it ended, none comes.
+        client::Error::Refused {
+            status: 400 | 403 | 412 | 416 | 501,
+            error,
+        } => Ranged::Stop(Failure::Refused(format!(
+            "{}: {}",
+            error.code, error.message
+        ))),
+        // Anything else may pass (its key not admitted yet, a refusal while it starts): asked
         // again, paced, until it serves or the machine ends, which loses the item.
-        Code::FailedPrecondition | Code::Unauthenticated => Ranged::Stop(Failure::Again(message)),
-        _ => Ranged::Again(message),
+        client::Error::Refused { status, error } if status < 500 => {
+            Ranged::Stop(Failure::Again(format!("{}: {}", error.code, error.message)))
+        }
+        client::Error::Answer(message) => Ranged::Stop(Failure::Again(message)),
+        e => Ranged::Again(e.to_string()),
     }
 }
 

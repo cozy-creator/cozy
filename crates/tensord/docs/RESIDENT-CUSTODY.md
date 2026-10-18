@@ -53,5 +53,5 @@ Rental proof that a CUDA-free holder keeps and frees the bytes:
 ## Wiring
 
 `GpuPool` holds custody unless its GPU drives a display (`nvidia-smi display_active`; unknown =
-off). `Load.device_weights` when the executor offers `weights.attach/1`; `share` after every
+off). `Load.device_weights`; `share` after every
 call; `GpuPool::resident()` and `GpuPool::revoke()` for the memory policy (B2) and package removal.

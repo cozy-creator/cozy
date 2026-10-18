@@ -76,12 +76,14 @@ fn open(root: &Path, tools: &Tools) -> Machine {
         objects.clone(),
         InstallerConfig {
             helper_python: tools.helper.clone(),
+            helper_engine: None,
             python: "3.12".into(),
             generations: root.join("generations"),
             client_wheel: tools.client.clone(),
             staging_root: root.join("staging"),
             // A Runtime wheel not yet published, installed as this machine's own (a dev build).
             sdk: std::env::var_os("COZY_TEST_RUNTIME_WHEEL").map(PathBuf::from).into_iter().collect(),
+            runtime_build: String::new(),
             uv: "uv".into(),
             seed_cache: None,
         },
@@ -109,9 +111,10 @@ fn open(root: &Path, tools: &Tools) -> Machine {
 
 fn write(objects: &Objects, bytes: &[u8]) -> (String, u64) {
     let digest = format!("sha256:{}", sha256::hex_digest(bytes));
-    let mut writer = objects.begin(ACTOR, &digest, bytes.len() as u64, 0).unwrap();
-    writer.append(bytes).unwrap();
-    writer.finish().unwrap();
+    if let Some(upload) = objects.upload(ACTOR, &digest, bytes.len() as u64).unwrap() {
+        upload.write_at(0, bytes).unwrap();
+        objects.settle(&upload).unwrap();
+    }
     (digest, bytes.len() as u64)
 }
 

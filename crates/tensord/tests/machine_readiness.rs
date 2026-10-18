@@ -1,11 +1,15 @@
 //! The real binary in machine mode, as a pod boots it: its readiness receipt verifies under
 //! the attempt key with the facts the Hub reads, and a restart keeps the boot and the bytes.
+#[path = "common/child.rs"]
+mod child;
+use child::BareEnv;
 mod common;
 
 use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
     Engine,
 };
+use cozy_platform::process;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::{
@@ -27,9 +31,9 @@ impl Drop for Machine {
 fn boot(root: &Path, port: u16, key: Option<&[u8]>) -> Machine {
     let mut command = Command::new(env!("CARGO_BIN_EXE_tensord"));
     command
-        .env_clear()
-        .env("PATH", "/usr/bin:/bin")
+        .bare_env()
         .env("COZY_MACHINE_ROOT", root)
+            .user_home(root.join("home"))
         .env("COZY_WORKER_ID", "ra-readiness-test")
         .env("COZY_WORKER_AUTH_TOKEN", URL_SAFE_NO_PAD.encode([1; 32]))
         .env("COZY_WORKER_INTERNAL_PORT", port.to_string())
@@ -67,10 +71,9 @@ fn awaited(machine: &mut Machine, root: &Path, port: u16) -> Vec<u8> {
 }
 
 fn children(pid: u32) -> Vec<u32> {
-    std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
-        .unwrap_or_default()
-        .split_whitespace()
-        .map(|p| p.parse().unwrap())
+    process::descendants(pid)
+        .into_iter()
+        .filter(|child| process::parent_of(*child).is_ok_and(|parent| parent == pid))
         .collect()
 }
 
@@ -100,14 +103,18 @@ fn receipt_verifies_and_a_restart_keeps_boot_and_bytes() {
     let envelope: Envelope = serde_json::from_slice(&sealed).unwrap();
     // The old receipt route is gone: the Hub sees a gRPC answer there and reads Status.
     let probed = Command::new("curl")
-        .args(["-s", "-o", "/dev/null", "-D", "-", "--cacert"])
+        .args(["-s", "-D", "-", "-o"])
+        .arg(root.join("probe.body"))
+        .arg("--cacert")
         .arg(root.join("run/cozy/bootstrap/tls.crt"))
         .args(["--resolve", &format!("cozy-worker:{port}:127.0.0.1")])
         .arg(format!("https://cozy-worker:{port}/v1/bootstrap/receipt"))
         .output()
         .unwrap();
     let headers = String::from_utf8(probed.stdout).unwrap().to_ascii_lowercase();
-    assert!(headers.contains("grpc-status: 12") || headers.starts_with("http/2 404"), "{headers}");
+    // A 404 over whichever HTTP the client speaks (Windows' curl stays on HTTP/1.1).
+    let not_found = headers.lines().next().is_some_and(|status| status.starts_with("http/") && status.contains(" 404"));
+    assert!(headers.contains("grpc-status: 12") || not_found, "{headers}");
     let payload = STANDARD.decode(&envelope.payload).unwrap();
     let mut mac = Hmac::<Sha256>::new_from_slice(&KEY).unwrap();
     mac.update(b"cozy.pod-readiness/1\0");
@@ -129,10 +136,7 @@ fn receipt_verifies_and_a_restart_keeps_boot_and_bytes() {
     // The supervisor starts a crashed service again: same boot, same bytes.
     let service = children(first.0.id());
     assert_eq!(service.len(), 1, "one service under its supervisor");
-    Command::new("kill")
-        .args(["-KILL", &service[0].to_string()])
-        .status()
-        .unwrap();
+    process::Exact::open(&process::Birth::of(service[0]).unwrap()).unwrap().unwrap().kill().unwrap();
     let start = Instant::now();
     while children(first.0.id())
         .first()

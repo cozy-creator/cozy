@@ -1,6 +1,5 @@
 //! The owner's day with cozy, end to end: the real binary, a real Calcifer and real TensorDs
-//! (COZY_TEST_TENSORD: the newest cozy-runtime wheel's, or this workspace's with
-//! COZY_TENSORD=workspace) against the CI Tensorhub that Tensorhub's `live-hub-client.sh` starts
+//! (COZY_TEST_TENSORD: this workspace's) against the CI Tensorhub that Tensorhub's `live-hub-client.sh` starts
 //! (TENSORHUB_ORIGIN, TENSORHUB_LOG; its docker provider rents CPU machines). `owner-day.yml`
 //! runs it, with the other scenario targets, on every release candidate. `h3-standin` has
 //! minimax-h3's request shape without torch. Each test has its own home, account and machines,
@@ -26,10 +25,7 @@ const PATIENCE: Duration = Duration::from_secs(600);
 /// the package. `None` off the job.
 fn owner(email: &str) -> Option<(Home, String, String)> {
     let home = Home::with_hub()?;
-    if std::env::var_os("COZY_TEST_TENSORD").is_none() {
-        eprintln!("skipped: no TensorD (COZY_TEST_TENSORD is unset)");
-        return None;
-    }
+    common::needs("COZY_TEST_TENSORD", common::TENSORD)?;
     let account = home.sign_in(email);
     let package = common::package::publish(&home, "h3-standin", "1.0.0");
     Some((home, account, package))
@@ -615,14 +611,15 @@ fn a_rental_ended_the_moment_its_run_returns_loses_nothing() {
 /// says how far the upload is as it moves, and completes with the clip whole on the machine.
 #[test]
 fn a_clip_uploads_over_a_slow_link_with_progress_and_the_run_completes() {
-    let (Ok(port), Ok(rate)) = (
-        std::env::var("COZY_TEST_SHAPED_PORT"),
-        std::env::var("COZY_TEST_SHAPED_BPS"),
+    const SHAPED: &str = "a shaped link: owner-day.yml shapes the loopback";
+    let (Some(port), Some(rate)) = (
+        common::needs("COZY_TEST_SHAPED_PORT", SHAPED),
+        common::needs("COZY_TEST_SHAPED_BPS", SHAPED),
     ) else {
-        eprintln!("skipped: no shaped link (COZY_TEST_SHAPED_PORT, COZY_TEST_SHAPED_BPS)");
         return;
     };
-    let (port, rate): (u16, f64) = (port.parse().unwrap(), rate.parse().unwrap());
+    let port: u16 = port.to_str().unwrap().parse().unwrap();
+    let rate: f64 = rate.to_str().unwrap().parse().unwrap();
     let Some((home, _, package)) = owner("slow@cozy.test") else {
         return;
     };

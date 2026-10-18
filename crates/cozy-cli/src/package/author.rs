@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
-use super::{PackageRef, registry};
+use super::{PackageRef, carried};
 use crate::{Context, context::hub_error, output};
 
 /// The uv index name a project's sources use for its own account's packages.
@@ -479,7 +479,7 @@ pub(super) async fn index_url(
     let origin = match client.get_protected_resource_metadata().await {
         Ok(metadata) => metadata.into_inner().resource,
         Err(e) => match hub_error(e) {
-            e if e.code == "capability.not_served" => hub.origin.clone(),
+            e if e.code == "capability.not_served" => hub.origin.to_string(),
             e => return Err(e),
         },
     };
@@ -704,13 +704,13 @@ pub async fn publish(ctx: &Context) -> Result<ExitCode, Error> {
             .arg(&dist),
         "build_failed",
     )?;
-    let (rows, git_wheels) = registry::dependencies(ctx, &stage, &python.full)?;
+    let git_wheels = carried::git_wheels(ctx, &stage, &python.request)?;
     let interface = describe(&stage, &python, after.get("cozy-runtime"), &account)?;
     let interface_path = stage.root.join("package-interface.json");
     fs::write(&interface_path, &interface).map_err(|e| refuse("stage_unavailable", e))?;
 
-    let wheel = registry::single(&dist, ".whl")?;
-    let sdist = registry::single(&dist, ".tar.gz")?;
+    let wheel = carried::single(&dist, ".whl")?;
+    let sdist = carried::single(&dist, ".tar.gz")?;
     let named = |dir: &str, local: &Path| {
         format!(
             "{dir}/{}",
@@ -749,7 +749,6 @@ pub async fn publish(ctx: &Context) -> Result<ExitCode, Error> {
     let finalize = types::PackageReleaseFinalize {
         publication_id: grants.publication_id.clone(),
         python_version: Some(python.full.clone()),
-        registry: Some(rows),
     };
     let mut state = client
         .finalize_package_release(org, name, release, &finalize)
@@ -884,14 +883,18 @@ fn describe(
     })
 }
 
-/// PUTs the files the Hub does not hold yet, 16 at a time; answers the bytes sent. A 412 means
-/// the store already holds those exact bytes.
+/// Sends each file the Hub does not hold to its grant, once per digest, sixteen at once; the bytes
+/// sent.
 async fn upload(
     http: &reqwest::Client,
     files: &[File],
     grants: &[types::PackageFileGrant],
 ) -> Result<u64, Error> {
-    let sends = grants.iter().filter(|g| !g.present).map(|grant| {
+    let mut digests = std::collections::BTreeSet::new();
+    let owed = grants
+        .iter()
+        .filter(|g| !g.present && digests.insert(g.digest.as_str()));
+    let sends = owed.map(|grant| {
         let http = http.clone();
         let file = files.iter().find(|f| f.path == grant.path);
         async move {
@@ -901,36 +904,114 @@ async fn upload(
                     format!("the Hub granted {} without an upload", grant.path),
                 ));
             };
-            let bytes = tokio::fs::read(&file.local)
-                .await
-                .map_err(|e| refuse("release_file_unreadable", e))?;
-            let length = bytes.len() as u64;
-            let mut request = http.put(&target.url).body(bytes);
-            for (name, value) in &target.required_headers {
-                request = request.header(name, value);
-            }
-            let answer = request.send().await.map_err(|e| {
-                Error::new(
-                    Kind::Unavailable,
-                    "release_upload_failed",
-                    format!("{}: {e}", file.path),
-                )
-            })?;
-            match answer.status().as_u16() {
-                200..=299 => Ok(length),
-                412 => Ok(0),
-                status => Err(Error::new(
-                    Kind::Unavailable,
-                    "release_upload_failed",
-                    format!("{}: the store answered HTTP {status}", file.path),
-                )),
-            }
+            put(&http, &file.path, &file.local, target).await
         }
     });
     futures_util::stream::iter(sends)
         .buffer_unordered(16)
         .try_fold(0, |sum, sent| async move { Ok::<u64, Error>(sum + sent) })
         .await
+}
+
+/// PUTs the file at `local` to a content-addressed `target`, whose signed `If-None-Match: *`
+/// makes a re-send safe. A send that ends with no answer, or with the store's 5xx (transient by
+/// design, as S3's SlowDown), goes again after a pause that doubles from a quarter second to 32
+/// seconds and starts over whenever a send carries the body further than any before. It gives up
+/// only when a whole such run passes with no send getting further: the store took nothing more.
+/// Another 4xx is final, and 412 is the object already there (0 bytes sent).
+async fn put(
+    http: &reqwest::Client,
+    path: &str,
+    local: &Path,
+    target: &types::PresignedUpload,
+) -> Result<u64, Error> {
+    let pace = (Duration::from_millis(250), Duration::from_secs(32));
+    put_paced(http, path, local, target, pace).await
+}
+
+/// `put` with its first pause and `ceiling` given.
+async fn put_paced(
+    http: &reqwest::Client,
+    path: &str,
+    local: &Path,
+    target: &types::PresignedUpload,
+    (first, ceiling): (Duration, Duration),
+) -> Result<u64, Error> {
+    let failed = |message: String| Error::new(Kind::Unavailable, "release_upload_failed", message);
+    let (mut furthest, mut pause, mut sends) = (0, first, 0u32);
+    loop {
+        let file = tokio::fs::File::open(local)
+            .await
+            .map_err(|e| refuse("release_file_unreadable", e))?;
+        let length = file
+            .metadata()
+            .await
+            .map_err(|e| refuse("release_file_unreadable", e))?
+            .len();
+        let carried = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut request = http
+            .put(&target.url)
+            .header(reqwest::header::CONTENT_LENGTH, length)
+            .body(counted(file, carried.clone()));
+        for (name, value) in &target.required_headers {
+            request = request.header(name, value);
+        }
+        sends += 1;
+        let why = match request.send().await {
+            Ok(answer) => match answer.status().as_u16() {
+                200..=299 => return Ok(length),
+                412 => return Ok(0),
+                status @ 500..=599 => format!("the store answered HTTP {status}"),
+                status => return Err(failed(format!("{path}: the store answered HTTP {status}"))),
+            },
+            Err(e) => chain(&e),
+        };
+        let reached = carried
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .min(length);
+        if reached > furthest {
+            (furthest, pause) = (reached, first);
+        } else if pause > ceiling {
+            return Err(failed(format!(
+                "{path}: {why}; {sends} sends, none carrying more than {furthest} of its {length} bytes since a pause of {}s",
+                ceiling.as_secs_f64()
+            )));
+        }
+        output::warn(&format!(
+            "{path}: {why}, after {reached} of {length} bytes; sending it again in {:.2}s",
+            pause.as_secs_f64()
+        ));
+        tokio::time::sleep(pause).await;
+        pause *= 2;
+    }
+}
+
+/// The file as a body, adding each part's length to `carried` as the transport takes it.
+fn counted(
+    file: tokio::fs::File,
+    carried: std::sync::Arc<std::sync::atomic::AtomicU64>,
+) -> reqwest::Body {
+    let parts = tokio_util::io::ReaderStream::with_capacity(file, 1 << 20);
+    reqwest::Body::wrap_stream(parts.inspect(move |part| {
+        if let Ok(part) = part {
+            carried.fetch_add(part.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+    }))
+}
+
+/// An error and each of its sources, as `error sending request: …: connection reset by peer`.
+fn chain(error: &dyn std::error::Error) -> String {
+    let mut said = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        let text = cause.to_string();
+        if !said.contains(&text) {
+            said.push_str(": ");
+            said.push_str(&text);
+        }
+        source = cause.source();
+    }
+    said
 }
 
 #[derive(Serialize)]
@@ -985,3 +1066,7 @@ pub async fn yank(ctx: &Context, package: &PackageRef) -> Result<ExitCode, Error
     }
     Ok(ExitCode::SUCCESS)
 }
+
+#[cfg(test)]
+#[path = "upload_tests.rs"]
+mod upload_tests;

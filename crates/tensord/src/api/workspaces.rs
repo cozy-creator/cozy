@@ -2,11 +2,11 @@
 use super::{auth::VerifiedActor, domain};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
+use cozy_platform::durable::Mode;
 use std::{
     collections::HashSet,
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -16,7 +16,7 @@ use tensorfs_core::{
     sha256, source_artifact,
     store::{Fault, Store, VerifiedFile},
 };
-use tonic::Status;
+use cozy_proto::error::Error;
 
 const MAX_FILES: usize = 129;
 const MAX_SET_BYTES: u64 = 1 << 30;
@@ -83,7 +83,7 @@ impl UploadedFile {
         }
     }
     /// Verify and hold the exact inode through a descriptor, never resolve a caller path.
-    pub fn open(&self) -> Result<VerifiedFile, Status> {
+    pub fn open(&self) -> Result<VerifiedFile, Error> {
         self.store
             .open_verified(&self.object.sha256)
             .map_err(storage)
@@ -124,15 +124,15 @@ pub struct UploadSession {
 }
 
 impl WorkspaceUploads {
-    pub fn open(root: &Path, store: Arc<Store>) -> Result<Arc<Self>, Status> {
+    pub fn open(root: &Path, store: Arc<Store>) -> Result<Arc<Self>, Error> {
         fs::create_dir_all(root).map_err(disk)?;
         let metadata = fs::symlink_metadata(root).map_err(disk)?;
         if !metadata.is_dir() || metadata.file_type().is_symlink() {
-            return Err(Status::failed_precondition(
+            return Err(Error::conflict("precondition_failed",
                 "upload root must be a real owned directory",
             ));
         }
-        fs::set_permissions(root, fs::Permissions::from_mode(0o700)).map_err(disk)?;
+        cozy_platform::durable::set_mode(root, 0o700).map_err(std::io::Error::from).map_err(disk)?;
         sync_dir(root)?;
         Ok(Arc::new(Self {
             root: root.to_owned(),
@@ -144,13 +144,13 @@ impl WorkspaceUploads {
         self: &Arc<Self>,
         actor: VerifiedActor,
         header: &domain::LocalPackageUploadHeader,
-    ) -> Result<UploadSession, Status> {
+    ) -> Result<UploadSession, Error> {
         valid_operation(&header.operation_id)?;
         let carrier = Carrier::from(
             header
                 .file
                 .as_ref()
-                .ok_or_else(|| Status::invalid_argument("upload requires one file header"))?,
+                .ok_or_else(|| Error::validation("invalid_request", "upload requires one file header"))?,
         );
         valid_carrier(&carrier)?;
         let directory = self.directory(actor, &header.operation_id)?;
@@ -159,7 +159,7 @@ impl WorkspaceUploads {
         let record = match read_record(&record_path)? {
             Some(record) if record.carrier == carrier => record,
             Some(_) => {
-                return Err(Status::failed_precondition(
+                return Err(Error::conflict("precondition_failed",
                     "upload identity changed under this operation and owner",
                 ))
             }
@@ -169,7 +169,7 @@ impl WorkspaceUploads {
                     .iter()
                     .try_fold(carrier.length, |sum, r| sum.checked_add(r.carrier.length));
                 if prior.len() >= MAX_FILES || total.is_none_or(|sum| sum > MAX_SET_BYTES) {
-                    return Err(Status::invalid_argument(
+                    return Err(Error::validation("invalid_request",
                         "captured package roster exceeds the deployed transfer bound",
                     ));
                 }
@@ -197,28 +197,25 @@ impl WorkspaceUploads {
         };
         let payload = match &record.object {
             Some(object) => self.store.open_nofollow(&object.sha256).map_err(storage)?,
-            None => OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .read(true)
-                .write(true)
-                .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW)
-                .open(directory.join(format!("{}.partial", record.carrier.filename)))
+            None => cozy_platform::durable::open_nofollow(&directory.join(format!("{}.partial", record.carrier.filename)), OpenOptions::new().create(true).truncate(false).read(true).write(true).mode(0o600)).map_err(std::io::Error::from)
                 .map_err(disk)?,
         };
         if !payload.metadata().map_err(disk)?.is_file() {
-            return Err(Status::failed_precondition(
+            return Err(Error::conflict("precondition_failed",
                 "upload payload must be a regular file",
             ));
         }
         let received = payload.metadata().map_err(disk)?.len();
         if received > record.carrier.length {
-            return Err(Status::failed_precondition(
+            return Err(Error::conflict("precondition_failed",
                 "retained upload prefix exceeds its accepted length",
             ));
         }
-        payload.sync_all().map_err(disk)?;
+        // A retained prefix is durable before it is reported; a stored object already is (and
+        // Windows flushes only a writable handle).
+        if record.object.is_none() {
+            payload.sync_all().map_err(disk)?;
+        }
         sync_dir(&directory)?;
         let mut session = UploadSession {
             uploads: self.clone(),
@@ -241,7 +238,7 @@ impl WorkspaceUploads {
         &self,
         actor: VerifiedActor,
         selected: &domain::DesiredLocalPackageSet,
-    ) -> Result<Option<UploadedPackage>, Status> {
+    ) -> Result<Option<UploadedPackage>, Error> {
         let root = root_set(selected)?;
         let directory = self.directory(actor, &root.operation_id)?;
         let _lock = lock(&directory)?;
@@ -252,7 +249,7 @@ impl WorkspaceUploads {
                 return Ok(None);
             };
             if record.carrier != *carrier {
-                return Err(Status::failed_precondition(
+                return Err(Error::conflict("precondition_failed",
                     "local package selection differs from accepted upload",
                 ));
             }
@@ -261,7 +258,7 @@ impl WorkspaceUploads {
             };
             let verified = self.store.open_verified(&object.sha256).map_err(storage)?;
             if verified.len() != object.length {
-                return Err(Status::data_loss("uploaded package object length changed"));
+                return Err(Error::internal("custody_corrupt", "uploaded package object length changed"));
             }
             files.push(UploadedFile {
                 filename: carrier.filename.clone(),
@@ -272,7 +269,7 @@ impl WorkspaceUploads {
         let path = directory.join("root-set.json");
         match read_json::<RootSet>(&path)? {
             Some(prior) if prior != root => {
-                return Err(Status::failed_precondition(
+                return Err(Error::conflict("precondition_failed",
                     "package metadata changed under this operation and owner",
                 ))
             }
@@ -288,7 +285,7 @@ impl WorkspaceUploads {
         &self,
         actor: VerifiedActor,
         operation: &str,
-    ) -> Result<(), Status> {
+    ) -> Result<(), Error> {
         valid_operation(operation)?;
         let directory = self.directory(actor, operation)?;
         let _lock = lock(&directory)?;
@@ -299,18 +296,18 @@ impl WorkspaceUploads {
         sync_dir(directory.parent().expect("owned operation parent"))
     }
 
-    fn directory(&self, actor: VerifiedActor, operation: &str) -> Result<PathBuf, Status> {
+    fn directory(&self, actor: VerifiedActor, operation: &str) -> Result<PathBuf, Error> {
         let owner = self.root.join(sha256::hex(&actor.public_key));
         let operation = owner.join(operation);
         for path in [&owner, &operation] {
             fs::create_dir_all(path).map_err(disk)?;
             let metadata = fs::symlink_metadata(path).map_err(disk)?;
             if !metadata.is_dir() || metadata.file_type().is_symlink() {
-                return Err(Status::failed_precondition(
+                return Err(Error::conflict("precondition_failed",
                     "upload namespace must be a real directory",
                 ));
             }
-            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(disk)?;
+            cozy_platform::durable::set_mode(path, 0o700).map_err(std::io::Error::from).map_err(disk)?;
             sync_dir(path.parent().expect("owned namespace parent"))?;
         }
         Ok(operation)
@@ -328,14 +325,14 @@ impl UploadSession {
     pub fn verified(&self) -> bool {
         self.record.object.is_some()
     }
-    pub fn append(&mut self, chunk: domain::LocalPackageUploadChunk) -> Result<(), Status> {
+    pub fn append(&mut self, chunk: domain::LocalPackageUploadChunk) -> Result<(), Error> {
         if self.verified()
             || chunk.data.is_empty()
             || chunk.data.len() > MAX_CHUNK
             || chunk.offset != self.received
             || chunk.data.len() as u64 > self.record.carrier.length - self.received
         {
-            return Err(Status::failed_precondition(
+            return Err(Error::conflict("precondition_failed",
                 "upload chunk must continue the exact durable prefix",
             ));
         }
@@ -350,7 +347,7 @@ impl UploadSession {
         }
         Ok(())
     }
-    fn finish(&mut self) -> Result<(), Status> {
+    fn finish(&mut self) -> Result<(), Error> {
         if self.record.carrier.filename == "source.tar" {
             validate_archive(&self.payload)?;
         }
@@ -366,7 +363,7 @@ impl UploadSession {
         }
         let digest = hash.finish();
         if !self.record.carrier.digest.is_empty() && self.record.carrier.digest != digest {
-            return Err(Status::failed_precondition(
+            return Err(Error::conflict("precondition_failed",
                 "captured wheel digest does not verify",
             ));
         }
@@ -407,7 +404,7 @@ impl UploadSession {
         sync_dir(&self.directory)?;
         Ok(())
     }
-    fn verify_retained(&self) -> Result<(), Status> {
+    fn verify_retained(&self) -> Result<(), Error> {
         let object = self.record.object.as_ref().expect("completed carrier");
         let file = self
             .uploads
@@ -415,7 +412,7 @@ impl UploadSession {
             .open_verified(&object.sha256)
             .map_err(storage)?;
         if file.len() != self.record.carrier.length {
-            return Err(Status::data_loss(
+            return Err(Error::internal("custody_corrupt",
                 "retained carrier length differs from accepted upload",
             ));
         }
@@ -423,7 +420,7 @@ impl UploadSession {
     }
 }
 
-fn valid_operation(value: &str) -> Result<(), Status> {
+fn valid_operation(value: &str) -> Result<(), Error> {
     if value.is_empty()
         || value.len() > 256
         || !value
@@ -434,13 +431,13 @@ fn valid_operation(value: &str) -> Result<(), Status> {
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
     {
-        return Err(Status::invalid_argument(
+        return Err(Error::validation("invalid_request",
             "invalid package upload operation ID",
         ));
     }
     Ok(())
 }
-fn valid_carrier(file: &Carrier) -> Result<(), Status> {
+fn valid_carrier(file: &Carrier) -> Result<(), Error> {
     let source =
         file.filename == "source.tar" && file.digest.is_empty() && file.length <= MAX_SET_BYTES;
     let wheel = file.filename.len() <= 255
@@ -457,18 +454,18 @@ fn valid_carrier(file: &Carrier) -> Result<(), Status> {
         && file.digest.len() == 32
         && file.length <= MAX_WHEEL_BYTES;
     if file.length == 0 || !(source || wheel) {
-        return Err(Status::invalid_argument(
+        return Err(Error::validation("invalid_request",
             "package carrier must be bounded source.tar or a checksummed wheel",
         ));
     }
     Ok(())
 }
-fn root_set(selected: &domain::DesiredLocalPackageSet) -> Result<RootSet, Status> {
+fn root_set(selected: &domain::DesiredLocalPackageSet) -> Result<RootSet, Error> {
     valid_operation(&selected.operation_id)?;
     let package = selected
         .package
         .as_ref()
-        .ok_or_else(|| Status::invalid_argument("local package metadata is required"))?;
+        .ok_or_else(|| Error::validation("invalid_request", "local package metadata is required"))?;
     if [&package.package, &package.release, &package.installation_id]
         .iter()
         .any(|s| s.is_empty() || s.len() > 256)
@@ -478,7 +475,7 @@ fn root_set(selected: &domain::DesiredLocalPackageSet) -> Result<RootSet, Status
         || selected.python_requires.len() > 4096
         || selected.python_version.len() > 64
     {
-        return Err(Status::invalid_argument(
+        return Err(Error::validation("invalid_request",
             "incomplete or unbounded local package selection",
         ));
     }
@@ -488,7 +485,7 @@ fn root_set(selected: &domain::DesiredLocalPackageSet) -> Result<RootSet, Status
         valid_carrier(file)?;
         total += file.length;
         if total > MAX_SET_BYTES || (index > 0 && files[index - 1].filename >= file.filename) {
-            return Err(Status::invalid_argument(
+            return Err(Error::validation("invalid_request",
                 "package files must be sorted, unique and within the deployed aggregate bound",
             ));
         }
@@ -497,7 +494,7 @@ fn root_set(selected: &domain::DesiredLocalPackageSet) -> Result<RootSet, Status
         && (selected.source_archive != "source.tar"
             || !files.iter().any(|f| f.filename == selected.source_archive))
     {
-        return Err(Status::invalid_argument(
+        return Err(Error::validation("invalid_request",
             "source archive must name the uploaded source.tar",
         ));
     }
@@ -515,7 +512,7 @@ fn root_set(selected: &domain::DesiredLocalPackageSet) -> Result<RootSet, Status
     })
 }
 
-fn validate_archive(file: &File) -> Result<(), Status> {
+fn validate_archive(file: &File) -> Result<(), Error> {
     // Bound extension allocations in a raw standard-library pass before allowing
     // the tar crate to resolve PAX/GNU names. No archive format implementation here.
     let mut input = file.try_clone().map_err(disk)?;
@@ -531,7 +528,7 @@ fn validate_archive(file: &File) -> Result<(), Status> {
             || ((kind.is_gnu_longname() || kind.is_pax_local_extensions())
                 && entry.size() > 64 << 10)
         {
-            return Err(Status::invalid_argument(
+            return Err(Error::validation("invalid_request",
                 "unsupported or unbounded source archive member",
             ));
         }
@@ -546,7 +543,7 @@ fn validate_archive(file: &File) -> Result<(), Status> {
         let mut entry = entry.map_err(disk)?;
         let raw = entry.path_bytes();
         let name = std::str::from_utf8(&raw)
-            .map_err(|_| Status::invalid_argument("source member path is not UTF-8"))?
+            .map_err(|_| Error::validation("invalid_request", "source member path is not UTF-8"))?
             .trim_end_matches('/')
             .to_owned();
         let kind = entry.header().entry_type();
@@ -561,69 +558,59 @@ fn validate_archive(file: &File) -> Result<(), Status> {
             || !seen.insert(name)
             || !(kind.is_file() || kind.is_dir())
         {
-            return Err(Status::invalid_argument(
+            return Err(Error::validation("invalid_request",
                 "unsafe or repeated source archive member",
             ));
         }
         total = total
             .checked_add(entry.size())
-            .ok_or_else(|| Status::invalid_argument("source archive expansion overflow"))?;
+            .ok_or_else(|| Error::validation("invalid_request", "source archive expansion overflow"))?;
         if seen.len() > 100_000 || total > MAX_SET_BYTES {
-            return Err(Status::invalid_argument(
+            return Err(Error::validation("invalid_request",
                 "source inventory exceeds the deployed archive bound",
             ));
         }
         let count = std::io::copy(&mut entry, &mut std::io::sink()).map_err(disk)?;
         if count != entry.size() {
-            return Err(Status::invalid_argument(
+            return Err(Error::validation("invalid_request",
                 "source archive member was truncated",
             ));
         }
     }
     if !project_file || !lock_file {
-        return Err(Status::invalid_argument(
+        return Err(Error::validation("invalid_request",
             "source archive requires pyproject.toml and uv.lock",
         ));
     }
     Ok(())
 }
 
-fn lock(directory: &Path) -> Result<File, Status> {
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(directory.join("operation.lock"))
+fn lock(directory: &Path) -> Result<File, Error> {
+    let file = cozy_platform::durable::open_nofollow(&directory.join("operation.lock"), OpenOptions::new().create(true).truncate(false).read(true).write(true).mode(0o600)).map_err(std::io::Error::from)
         .map_err(disk)?;
     file.try_lock_exclusive()
-        .map_err(|_| Status::aborted("this owner operation already has a live uploader"))?;
+        .map_err(|_| Error::conflict("aborted", "this owner operation already has a live uploader"))?;
     Ok(file)
 }
-fn read_record(path: &Path) -> Result<Option<Record>, Status> {
+fn read_record(path: &Path) -> Result<Option<Record>, Error> {
     read_json(path)
 }
-fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>, Status> {
-    match OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
+fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>, Error> {
+    match cozy_platform::durable::open_nofollow(path, OpenOptions::new().read(true)).map_err(std::io::Error::from)
     {
         Ok(file) => {
             if !file.metadata().map_err(disk)?.is_file() {
-                return Err(Status::data_loss("upload record is not a regular file"));
+                return Err(Error::internal("custody_corrupt", "upload record is not a regular file"));
             }
             serde_json::from_reader(file.take(8 << 20))
                 .map(Some)
-                .map_err(|_| Status::data_loss("retained upload record is invalid"))
+                .map_err(|_| Error::internal("custody_corrupt", "retained upload record is invalid"))
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(disk(error)),
     }
 }
-fn records(directory: &Path) -> Result<Vec<Record>, Status> {
+fn records(directory: &Path) -> Result<Vec<Record>, Error> {
     let mut records = Vec::new();
     for entry in fs::read_dir(directory).map_err(disk)? {
         let path = entry.map_err(disk)?.path();
@@ -637,29 +624,23 @@ fn records(directory: &Path) -> Result<Vec<Record>, Status> {
     }
     Ok(records)
 }
-fn atomic_record<T: Serialize>(path: &Path, record: &T) -> Result<(), Status> {
+fn atomic_record<T: Serialize>(path: &Path, record: &T) -> Result<(), Error> {
     let temporary = path.with_extension("pending");
     let bytes = serde_json::to_vec(record)
-        .map_err(|_| Status::internal("cannot encode typed upload record"))?;
-    let mut file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&temporary)
+        .map_err(|_| Error::internal("internal", "cannot encode typed upload record"))?;
+    let mut file = cozy_platform::durable::open_nofollow(&temporary, OpenOptions::new().create(true).truncate(true).write(true).mode(0o600)).map_err(std::io::Error::from)
         .map_err(disk)?;
     file.write_all(&bytes).map_err(disk)?;
     file.sync_all().map_err(disk)?;
     fs::rename(temporary, path).map_err(disk)?;
     sync_dir(path.parent().expect("owned record parent"))
 }
-fn sync_dir(path: &Path) -> Result<(), Status> {
-    File::open(path).and_then(|f| f.sync_all()).map_err(disk)
+fn sync_dir(path: &Path) -> Result<(), Error> {
+    cozy_platform::durable::sync_dir(path).map_err(|error| disk(error.into()))
 }
-fn disk(error: std::io::Error) -> Status {
-    Status::unavailable(format!("package upload storage unavailable: {error}"))
+fn disk(error: std::io::Error) -> Error {
+    Error::unavailable("unavailable", format!("package upload storage unavailable: {error}"))
 }
-fn storage(error: tensorfs_core::err::Refusal) -> Status {
-    Status::failed_precondition(format!("package upload TensorFS custody: {error}"))
+fn storage(error: tensorfs_core::err::Refusal) -> Error {
+    Error::conflict("precondition_failed", format!("package upload TensorFS custody: {error}"))
 }

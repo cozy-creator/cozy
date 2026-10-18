@@ -4,10 +4,10 @@ use std::{collections::BTreeMap, path::Path, process::ExitCode};
 
 use cozy_proto::{
     calcifer::{self, Environment, Machine, MachineState, On, Run, Status, SubmitRun},
+    config::Origin,
     error::{Error, Kind},
-    machine::{self as v1, run_spec::Source},
+    machine::{self as v1, Source},
 };
-use prost::Message as _;
 use serde::{Deserialize, Serialize};
 
 use super::{PackageRef, release_order};
@@ -17,14 +17,13 @@ use crate::{
     run,
 };
 
-fn spec(kind: v1::RunKind, source: Source, catalog_revision: String) -> Vec<u8> {
+fn spec(kind: v1::RunKind, source: Source, catalog_revision: String) -> v1::RunSpec {
     v1::RunSpec {
-        kind: kind as i32,
+        kind,
         source: Some(source),
         catalog_revision,
         ..Default::default()
     }
-    .encode_to_vec()
 }
 
 fn release(package: &str, release: &str) -> Source {
@@ -40,7 +39,7 @@ async fn submit(
     hub: &str,
     kind: calcifer::Kind,
     target: String,
-    spec: Vec<u8>,
+    spec: v1::RunSpec,
 ) -> Result<Run, Error> {
     let ask = SubmitRun {
         on,
@@ -127,7 +126,7 @@ pub async fn install_directory(
     );
     let ask = SubmitRun {
         on,
-        hub: ctx.hub()?.origin,
+        hub: ctx.hub()?.origin.into(),
         kind: calcifer::Kind::Warm,
         target: local.package.clone(),
         spec: warm,
@@ -204,7 +203,7 @@ pub(crate) fn named(on: &On) -> Result<&str, Error> {
 fn environments<'a>(ctx: &Context, machine: &'a Machine) -> Result<Vec<&'a Environment>, Error> {
     let narrowed = ctx.narrowed()?;
     let scope = |env: &Environment| match &narrowed {
-        Some(hub) => env.hub.is_empty() || same_origin(&env.hub, &hub.origin),
+        Some(hub) => env.hub.is_empty() || origin(&env.hub).as_ref() == Some(&hub.origin),
         None => true,
     };
     Ok(machine
@@ -215,24 +214,29 @@ fn environments<'a>(ctx: &Context, machine: &'a Machine) -> Result<Vec<&'a Envir
         .collect())
 }
 
-fn same_origin(a: &str, b: &str) -> bool {
-    a.trim_end_matches('/')
-        .eq_ignore_ascii_case(b.trim_end_matches('/'))
+/// An installation's Hub in its one spelling (a machine may write `https://tensorhub.com:443`);
+/// none for local code.
+fn origin(hub: &str) -> Option<Origin> {
+    Origin::parse(hub).ok()
+}
+
+/// What a run on an installation's Hub names it: its one spelling, or as the machine wrote it.
+fn canonical(hub: &str) -> String {
+    origin(hub).map_or_else(|| hub.to_owned(), String::from)
 }
 
 /// A Hub origin as this computer names it; local code has none.
-fn hub_label(ctx: &Context, origin: &str) -> String {
-    if origin.is_empty() {
+fn hub_label(ctx: &Context, hub: &str) -> String {
+    if hub.is_empty() {
         return "local".into();
     }
-    let known = ctx
-        .config
-        .hubs()
-        .into_iter()
-        .find(|hub| same_origin(&hub.origin, origin));
+    let Some(origin) = origin(hub) else {
+        return hub.to_owned();
+    };
+    let known = ctx.config.hubs().into_iter().find(|h| h.origin == origin);
     known
         .map(|hub| hub.label().to_owned())
-        .unwrap_or_else(|| origin.to_owned())
+        .unwrap_or_else(|| origin.to_string())
 }
 
 /// Refuses a name the machine does not hold, before any run.
@@ -353,10 +357,10 @@ pub async fn remove(ctx: &Context, names: &[String], on: On) -> Result<ExitCode,
     let envs = environments(ctx, &machine)?;
     held(names, &envs, &machine.name)?;
     let default_hub = ctx.hub()?.origin;
-    let mut targets: Vec<(&str, &str)> = envs
+    let mut targets: Vec<(&str, String)> = envs
         .iter()
         .filter(|env| names.contains(&env.package))
-        .map(|env| (env.package.as_str(), env.hub.as_str()))
+        .map(|env| (env.package.as_str(), canonical(&env.hub)))
         .collect();
     targets.sort();
     targets.dedup();
@@ -365,7 +369,7 @@ pub async fn remove(ctx: &Context, names: &[String], on: On) -> Result<ExitCode,
         let hub = if hub.is_empty() {
             default_hub.as_str()
         } else {
-            hub
+            hub.as_str()
         };
         let spec = spec(v1::RunKind::Remove, release(package, ""), String::new());
         let on = On::Machine(machine.name.clone());
@@ -443,19 +447,20 @@ pub async fn update(ctx: &Context, names: &[String], on: On) -> Result<ExitCode,
     let machine = machines(ctx, Some(&on)).await?.remove(0);
     let envs = environments(ctx, &machine)?;
     held(names, &envs, &machine.name)?;
-    let mut groups: BTreeMap<(&str, &str), Vec<&Environment>> = BTreeMap::new();
+    let mut groups: BTreeMap<(&str, String), Vec<&Environment>> = BTreeMap::new();
     for env in envs
         .iter()
         .filter(|env| names.is_empty() || names.contains(&env.package))
     {
         groups
-            .entry((&env.package, &env.hub))
+            .entry((&env.package, canonical(&env.hub)))
             .or_default()
             .push(env);
     }
     let on = || On::Machine(machine.name.clone());
     let mut rows = vec![];
     for ((package, hub), held) in groups {
+        let hub = hub.as_str();
         let mut row = Updated {
             package: package.to_owned(),
             hub: hub_label(ctx, hub),

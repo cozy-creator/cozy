@@ -2,8 +2,10 @@
 //! seals, handed between processes by descriptor and claimed region by region with
 //! open-file-description locks. macOS has neither memfd nor seals; the Apple tier (AP) designs its
 //! own, and until then every call answers `Unsupported` (a Mac's host tier is its page cache).
+//! Windows has only `frozen`: its host tier is off.
 #[cfg_attr(target_os = "linux", path = "linux.rs")]
-#[cfg_attr(not(target_os = "linux"), path = "unsupported.rs")]
+#[cfg_attr(all(unix, not(target_os = "linux")), path = "unsupported.rs")]
+#[cfg_attr(windows, path = "windows.rs")]
 mod imp;
 
 pub use imp::*;
@@ -27,12 +29,14 @@ pub const NO_WRITE_SEALS: i32 = RESIZE_SEALS | SEAL_WRITE;
 
 /// A byte-range lock request on an open file description.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(unix)]
 pub enum Region {
     Read,
     Write,
     Unlock,
 }
 
+#[cfg(unix)]
 pub fn page_size() -> usize {
     // SAFETY: sysconf reads a constant.
     (unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize).max(4096)
@@ -41,6 +45,7 @@ pub fn page_size() -> usize {
 /// Faults in every page of `[base, base+len)` for writing, in `threads` slices: pages a memfd
 /// lacks are allocated, pages it has are only mapped. Without MADV_POPULATE_WRITE (Linux
 /// before 5.14, other OSes) each page is touched instead, writing the zero it reads as.
+#[cfg(unix)]
 pub fn populate(base: *mut u8, len: usize, threads: usize) {
     let page = page_size();
     let threads = threads.max(1);

@@ -1,15 +1,13 @@
-//! The real `tensord serve` process behind its TLS/gRPC API, called as the CLI calls it.
+//! The real `tensord serve` process behind its HTTPS machine API, called as Calcifer calls it.
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use tensord::journal::Journal;
 use ed25519_dalek::SigningKey;
 use std::{
     fs,
-    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
 };
-use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
 
 #[path = "common/hub_oauth.rs"]
 mod hub_oauth;
@@ -40,14 +38,16 @@ impl Machine {
         let root = std::env::temp_dir().join(format!("cm-surface-{}", uuid::Uuid::new_v4()));
         let config = root.join("config");
         fs::create_dir_all(&config).unwrap();
-        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&root, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
         let keys = [SIGNER, OTHER].map(|key| {
             URL_SAFE_NO_PAD.encode(SigningKey::from_bytes(&key).verifying_key().to_bytes())
         });
         let write = |name: &str, value: serde_json::Value| {
             let path = config.join(name);
             fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            #[cfg(unix)]
+            fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
         };
         write(
             "keys.json",
@@ -115,7 +115,7 @@ fn launch_in(root: &Path, extra: &[std::ffi::OsString], scope: &[&str]) -> (Chil
         .arg(&state)
         .arg("--machine-config")
         .arg(root.join("config/machine.json"))
-        .args(["--listen", "127.0.0.1:0", "--host-bytes", "0"])
+        .args(["--listen", "127.0.0.1:0"])
         .args(extra)
         .stdout(Stdio::null())
         .spawn()
@@ -194,7 +194,8 @@ mod v1_api {
         capability::{mint, Grant, MACHINE},
         v1,
     };
-    use tonic::metadata::MetadataValue;
+    use tensord::api::v1::client::{Auth, Error as ClientError, Machine as Client};
+    use tokio_stream::{Stream, StreamExt};
 
     fn cap(scope: Grant) -> String {
         cap_by(&SIGNER, scope)
@@ -213,142 +214,255 @@ mod v1_api {
             },
         )
     }
-    fn authorized<T>(message: T, cap: &str) -> tonic::Request<T> {
-        let mut request = tonic::Request::new(message);
-        request.metadata_mut().insert(
-            "authorization",
-            MetadataValue::try_from(format!("Cozy-Cap {cap}")).unwrap(),
-        );
-        request
-    }
-    /// One Status frame as `token`'s holder sees it.
-    async fn status_frame(
-        client: &mut v1::machine_client::MachineClient<Channel>,
-        token: &str,
-    ) -> v1::StatusFrame {
-        let request = authorized(v1::StatusRequest { keepalive: false }, token);
-        let mut frames = client.status(request).await.unwrap().into_inner();
-        frames.message().await.unwrap().unwrap()
-    }
-
-    async fn client(machine: &Machine) -> v1::machine_client::MachineClient<Channel> {
+    /// A client of `machine`'s published endpoint, pinned to its leaf.
+    fn client(machine: &Machine) -> Client {
         let ready: serde_json::Value =
             serde_json::from_slice(&fs::read(machine.root.join("state/api-ready.json")).unwrap())
                 .unwrap();
-        let channel = Endpoint::from_shared(format!("https://{}", machine.address))
-            .unwrap()
-            .initial_stream_window_size(16 << 20)
-            .initial_connection_window_size(32 << 20)
-            .tls_config(
-                ClientTlsConfig::new()
-                    .ca_certificate(Certificate::from_pem(ready["cert_pem"].as_str().unwrap()))
-                    .domain_name("localhost"),
-            )
-            .unwrap()
-            .connect()
-            .await
-            .unwrap();
-        v1::machine_client::MachineClient::new(channel).max_decoding_message_size(16 << 20)
+        let pem = ready["cert_pem"].as_str().unwrap();
+        let leaf = rustls_pemfile::certs(&mut pem.as_bytes()).next().unwrap().unwrap();
+        Client::new(&machine.address, tensorfs_core::sha256::digest(&leaf), Auth::None).unwrap()
     }
-    async fn collect(
-        stream: tonic::Streaming<v1::RunEvent>,
-    ) -> Result<Vec<v1::RunEvent>, tonic::Status> {
-        let mut stream = stream;
+    fn by(client: &Client, cap: &str) -> Client {
+        client.with_auth(Auth::Token(cap.into()))
+    }
+    /// One Status frame as `token`'s holder sees it.
+    async fn status_frame(client: &Client, token: &str) -> v1::StatusFrame {
+        by(client, token).status().await.unwrap()
+    }
+    /// Status as `token`'s holder watches it.
+    async fn watch(client: &Client, token: &str) -> Events<v1::StatusFrame> {
+        Box::pin(by(client, token).watch().await.unwrap())
+    }
+
+    type Events<T = v1::RunEvent> = std::pin::Pin<Box<dyn Stream<Item = Result<T, ClientError>> + Send>>;
+    /// A submit (with a spec) and an attach after `after`, as one call.
+    struct RunRequest {
+        id: String,
+        after: u64,
+        spec: Option<v1::RunSpec>,
+    }
+    /// Submits `request.spec` when it names one, then follows the run's events.
+    async fn run_events(client: &Client, cap: &str, request: RunRequest) -> Result<Events, ClientError> {
+        let client = by(client, cap);
+        if let Some(spec) = request.spec {
+            client.submit(&v1::RunRequest { id: request.id.clone(), spec }).await?;
+        }
+        Ok(Box::pin(client.events(&request.id, request.after).await?))
+    }
+    /// `request` as `cap`'s holder makes it.
+    fn authorized(request: RunRequest, cap: &str) -> (RunRequest, String) {
+        (request, cap.into())
+    }
+    async fn run_as(client: &Client, (request, cap): (RunRequest, String)) -> Result<Events, ClientError> {
+        run_events(client, &cap, request).await
+    }
+    async fn cancel(client: &Client, cap: &str, id: &str) -> Result<v1::RunState, ClientError> {
+        by(client, cap).cancel(id).await
+    }
+    async fn collect(mut stream: Events) -> Result<Vec<v1::RunEvent>, ClientError> {
         let mut events = vec![];
-        while let Some(event) = stream.message().await? {
+        while let Some(event) = stream.next().await.transpose()? {
             events.push(event);
         }
         Ok(events)
     }
+    /// A result or measurements as JSON (null when absent).
+    fn json(raw: &Option<v1::Json>) -> serde_json::Value {
+        serde_json::from_str(raw.as_ref().map_or("null", |raw| raw.get())).unwrap()
+    }
+    fn raw(value: &serde_json::Value) -> Option<v1::Json> {
+        v1::Json::parse(value.to_string()).ok()
+    }
     fn spec(iterations: u64) -> v1::RunSpec {
         v1::RunSpec {
-            source: Some(v1::run_spec::Source::Installation("fixture".into())),
+            source: Some(v1::Source::Installation("fixture".into())),
             entrypoint: "classify".into(),
-            payload: serde_json::to_vec(&serde_json::json!({
+            payload: raw(&serde_json::json!({
                 "samples": [[5.1, 3.5, 1.4, 0.2], [6.0, 2.7, 5.1, 1.6]],
                 "iterations": iterations,
-            }))
-            .unwrap(),
+            })),
             ..Default::default()
         }
     }
-    async fn read(
-        client: &mut v1::machine_client::MachineClient<Channel>,
-        cap: &str,
-        request: v1::ReadRequest,
-    ) -> Result<(v1::ReadFrame, Vec<u8>), tonic::Status> {
-        let mut stream = client.read(authorized(request, cap)).await?.into_inner();
-        let meta = stream.message().await?.unwrap();
+    /// What a test reads: one output (from `offset`, `length` bytes, refused unless at `if_rev`)
+    /// or a machine log's newest `tail` lines.
+    #[derive(Clone, Default)]
+    struct ReadRequest {
+        target: Option<Target>,
+        offset: u64,
+        length: u64,
+        if_rev: u64,
+        tail: u64,
+    }
+    #[derive(Clone)]
+    enum Target {
+        Output(v1::OutputTarget),
+        Log(String),
+    }
+    /// An output's revision and whole length, and the digest of the bytes read.
+    #[derive(Debug)]
+    struct Meta {
+        rev: u64,
+        length: u64,
+        digest: String,
+    }
+    async fn read(client: &Client, cap: &str, request: ReadRequest) -> Result<(Meta, Vec<u8>), ClientError> {
+        let client = by(client, cap);
+        let target = match request.target.expect("a read names a target") {
+            Target::Log(name) => return Ok((Meta { rev: 0, length: 0, digest: String::new() }, client.log(&name, request.tail).await?.to_vec())),
+            Target::Output(target) => target,
+        };
+        let range = match (request.offset, request.length) {
+            (0, 0) => (0, 0),
+            (offset, 0) => (offset, u64::MAX),
+            (offset, length) => (offset, offset + length),
+        };
+        let output = client.bulk()?.get(&target, range, request.if_rev).await?;
+        let mut body = output.body;
         let mut data = vec![];
-        while let Some(frame) = stream.message().await? {
-            assert!(!frame.data.is_empty() && frame.data.len() <= 1 << 20);
-            data.extend(frame.data);
+        while let Some(chunk) = body.next().await {
+            data.extend_from_slice(&chunk?);
         }
-        Ok((meta, data))
+        let digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&data));
+        Ok((Meta { rev: output.rev, length: output.length, digest }, data))
     }
 
-    /// Read returns the store's transport and memory logs, each's rotated part first, or a tail
-    /// from a line start; only a machine capability reads them.
+    /// Read returns the store's transport and memory logs, each's rotated part first, or its
+    /// newest lines; only a machine capability reads them.
     #[tokio::test]
-    async fn read_returns_the_stores_logs_with_rotation_and_tail() {
+    async fn read_returns_the_stores_logs_with_rotation_and_newest_lines() {
         let machine = Machine::start().await;
-        let mut client = client(&machine).await;
+        let client = client(&machine);
         let owner = cap(Grant { action: MACHINE.into(), ..Default::default() });
-        let log = |name: &str, tail| v1::ReadRequest {
-            target: Some(v1::read_request::Target::Log(name.into())),
+        let log = |name: &str, tail| ReadRequest {
+            target: Some(Target::Log(name.into())),
             tail,
             ..Default::default()
         };
         let logs = machine.store().join("logs");
-        for (name, file) in [("tensorfs-transport", "transport.log"), ("memory", "memory.log")] {
-            assert!(read(&mut client, &owner, log(name, 0)).await.unwrap().1.is_empty());
-            fs::create_dir_all(&logs).unwrap();
-            fs::write(logs.join(format!("{file}.1")), "1.000 pull a 1 old\n").unwrap();
-            let current: String = (0..3000).map(|n| format!("{n}.000 hedge object-{n} 4096 grant\n")).collect();
-            fs::write(logs.join(file), &current).unwrap();
-            let (_, whole) = read(&mut client, &owner, log(name, 0)).await.unwrap();
-            assert_eq!(whole, format!("1.000 pull a 1 old\n{current}").into_bytes());
-            let (_, tail) = read(&mut client, &owner, log(name, 100)).await.unwrap();
-            let tail = String::from_utf8(tail).unwrap();
-            assert!(tail.len() <= 100 && tail.ends_with("2999.000 hedge object-2999 4096 grant\n"));
-            assert!(current.ends_with(&tail) && current.as_bytes()[current.len() - tail.len() - 1] == b'\n');
-            let run = cap(Grant { run: "1".into(), ..Default::default() });
-            assert_eq!(read(&mut client, &run, log(name, 0)).await.unwrap_err().code(), tonic::Code::PermissionDenied);
+        let rotated = "1.000 pull a 1 old\n";
+        let current: String = (0..3000).map(|n| format!("{n}.000 hedge object-{n} 4096 grant\n")).collect();
+        let written = format!("{rotated}{current}").into_bytes();
+        // Nothing here fetches, so the transport log is the test's alone: its reads are exact.
+        assert!(read(&client, &owner, log("tensorfs-transport", 0)).await.unwrap().1.is_empty());
+        fs::create_dir_all(&logs).unwrap();
+        fs::write(logs.join("transport.log.1"), rotated).unwrap();
+        fs::write(logs.join("transport.log"), &current).unwrap();
+        let (_, whole) = read(&client, &owner, log("tensorfs-transport", 0)).await.unwrap();
+        assert_eq!(whole, written);
+        let (_, newest) = read(&client, &owner, log("tensorfs-transport", 2)).await.unwrap();
+        assert_eq!(newest, b"2998.000 hedge object-2998 4096 grant\n2999.000 hedge object-2999 4096 grant\n");
+        let (_, all) = read(&client, &owner, log("tensorfs-transport", 3001)).await.unwrap();
+        assert_eq!(all, whole, "lines reach back into the rotated part");
+        // The memory log is the machine's own: a loaded host's pressure watcher may append a line
+        // to it at any moment, so it reads as what was written, then whole lines.
+        fs::write(logs.join("memory.log.1"), rotated).unwrap();
+        fs::write(logs.join("memory.log"), &current).unwrap();
+        let (_, whole) = read(&client, &owner, log("memory", 0)).await.unwrap();
+        assert!(whole.starts_with(&written) && whole.ends_with(b"\n"), "{}", String::from_utf8_lossy(&whole[written.len().min(whole.len())..]));
+        let run = cap(Grant { run: "1".into(), ..Default::default() });
+        for name in ["tensorfs-transport", "memory"] {
+            assert_eq!(read(&client, &run, log(name, 0)).await.unwrap_err().status(), Some(403));
         }
-        let unknown = read(&mut client, &owner, log("other", 0)).await.unwrap_err();
-        assert_eq!(unknown.code(), tonic::Code::NotFound);
+        let unknown = read(&client, &owner, log("other", 0)).await.unwrap_err();
+        assert_eq!(unknown.status(), Some(404));
+    }
+
+    /// A follow sends the kept lines, then each line as it is written, across two rotations with
+    /// none missed or repeated; one resumed from a batch's place goes on with the next line.
+    #[tokio::test]
+    async fn a_followed_log_crosses_rotations_and_resumes_where_it_left() {
+        let machine = Machine::start().await;
+        let (client, owner) = (client(&machine), cap(Grant { action: MACHINE.into(), ..Default::default() }));
+        let follower = by(&client, &owner);
+        let logs = machine.store().join("logs");
+        fs::create_dir_all(&logs).unwrap();
+        let line = |n: usize| format!("{n}.000 pull object-{n} 4096\n");
+        let write = |n: usize| {
+            use std::io::Write as _;
+            if n > 0 && n.is_multiple_of(50) {
+                fs::rename(logs.join("transport.log"), logs.join("transport.log.1")).unwrap();
+            }
+            let mut log = fs::OpenOptions::new().create(true).append(true).open(logs.join("transport.log")).unwrap();
+            log.write_all(line(n).as_bytes()).unwrap();
+        };
+        async fn until(lines: &mut (impl Stream<Item = Result<v1::LogLines, ClientError>> + Unpin), count: usize) -> (String, String) {
+            let (mut text, mut after) = (String::new(), String::new());
+            while text.lines().count() < count {
+                let batch = tokio::time::timeout(Duration::from_secs(30), lines.next()).await;
+                let batch = batch.expect("lines arrive as written").expect("the follow stays open").unwrap();
+                text.push_str(&batch.text);
+                after = batch.after;
+            }
+            (text, after)
+        }
+
+        write(0);
+        let mut follow = Box::pin(follower.follow_log("tensorfs-transport", 0, None).await.unwrap());
+        (1..120).for_each(write);
+        let (text, after) = until(&mut follow, 120).await;
+        assert_eq!(text, (0..120).map(line).collect::<String>());
+        drop(follow);
+
+        (120..125).for_each(write);
+        let mut resumed = Box::pin(follower.follow_log("tensorfs-transport", 0, Some(&after)).await.unwrap());
+        assert_eq!(until(&mut resumed, 5).await.0, (120..125).map(line).collect::<String>());
+    }
+
+    /// An upload followed from before its first byte says what the machine holds as its parts
+    /// land, after each MiB more, and ends at the whole object; a stored object answers at once.
+    #[tokio::test]
+    async fn an_upload_followed_says_what_lands_and_ends_whole() {
+        let machine = Machine::start().await;
+        let (client, owner) = (client(&machine), cap(Grant { action: MACHINE.into(), ..Default::default() }));
+        let body: Vec<u8> = (0..4u32 << 20).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+        let (digest, length) = (format!("sha256:{}", tensorfs_core::sha256::hex_digest(&body)), body.len() as u64);
+        let follower = by(&client, &owner);
+        let mut held = Box::pin(follower.follow_held(&digest, length).await.unwrap());
+        assert_eq!(held.next().await.unwrap().unwrap(), 0, "nothing held before the first part");
+        let mut seen = vec![];
+        for part in body.chunks(1 << 20).enumerate() {
+            let (index, data) = part;
+            write(&client, &owner, &digest, length, (index << 20) as u64, data).await.unwrap();
+            let now = tokio::time::timeout(Duration::from_secs(30), held.next()).await;
+            seen.push(now.expect("held follows each part").unwrap().unwrap());
+        }
+        assert_eq!(seen, [1 << 20, 2 << 20, 3 << 20, 4 << 20], "after each MiB, to the whole");
+        assert!(held.next().await.is_none(), "the stream ends at the whole object");
+        let mut stored = Box::pin(follower.follow_held(&digest, length).await.unwrap());
+        assert_eq!(stored.next().await.unwrap().unwrap(), length, "a stored object answers whole");
+        assert!(stored.next().await.is_none());
     }
 
     #[tokio::test]
     async fn run_streams_a_real_run_to_its_outcome_and_read_returns_its_output() {
         let machine = Machine::start_with(hold_classifier).await;
-        let mut client = client(&machine).await;
+        let client = client(&machine);
         let all = cap(Grant {
             action: MACHINE.into(),
             ..Default::default()
         });
-        let request = |spec: Option<v1::RunSpec>, after| v1::RunRequest {
+        let request = |spec: Option<v1::RunSpec>, after| RunRequest {
             id: "run-1".into(),
             after,
             spec,
         };
         let events = collect(
-            client
-                .run(authorized(request(Some(spec(3)), 0), &all))
+            run_events(&client, &all, request(Some(spec(3)), 0))
                 .await
-                .unwrap()
-                .into_inner(),
+                .unwrap(),
         )
         .await
         .unwrap();
         // The first frame is the run's state (a snapshot, sequence 0); the log ends at the outcome.
-        let Some(v1::run_event::Event::State(first)) = &events[0].event else {
+        let v1::Event::State(first) = &events[0].event else {
             panic!("{events:?}")
         };
         assert_eq!((events[0].sequence, first.id.as_str()), (0, "run-1"));
         let number = first.number;
         assert!(number > 0);
-        let Some(v1::run_event::Event::Outcome(outcome)) = &events.last().unwrap().event else {
+        let v1::Event::Outcome(outcome) = &events.last().unwrap().event else {
             panic!("{events:?}")
         };
         assert_eq!(outcome.status, "succeeded", "{outcome:?}");
@@ -357,13 +471,13 @@ mod v1_api {
         let running = events
             .iter()
             .find(|e| {
-                matches!(&e.event, Some(v1::run_event::Event::State(s)) if s.state == "running")
+                matches!(&e.event, v1::Event::State(s) if s.state == "running")
             })
             .expect("the run is seen running");
         let finished = events.last().unwrap().at_ms;
         assert!(running.at_ms > 0 && running.at_ms <= finished, "{events:?}");
         assert!(outcome.execution_ms <= (finished - running.at_ms) as u64 + 1, "{outcome:?}");
-        let result: serde_json::Value = serde_json::from_slice(&outcome.result).unwrap();
+        let result: serde_json::Value = json(&outcome.result);
         assert_eq!(result["predictions"], serde_json::json!([0, 2]));
         assert_eq!(result["iterations"], 3);
         let report = outcome
@@ -376,8 +490,8 @@ mod v1_api {
         assert!(logged.windows(2).all(|w| w[0] < w[1]), "{logged:?}");
 
         // Read: the output's bytes, digest and revision; an offset resumes.
-        let target = |offset| v1::ReadRequest {
-            target: Some(v1::read_request::Target::Output(v1::OutputTarget {
+        let target = |offset| ReadRequest {
+            target: Some(Target::Output(v1::OutputTarget {
                 run: "run-1".into(),
                 output: "report".into(),
                 index: 0,
@@ -386,7 +500,7 @@ mod v1_api {
             offset,
             ..Default::default()
         };
-        let (meta, bytes) = read(&mut client, &all, target(0)).await.unwrap();
+        let (meta, bytes) = read(&client, &all, target(0)).await.unwrap();
         assert_eq!((meta.rev, meta.length), (1, bytes.len() as u64));
         assert_eq!(meta.length, report.length);
         let digest = format!(
@@ -399,43 +513,36 @@ mod v1_api {
         );
         let report_json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(report_json["predictions"], serde_json::json!([0, 2]));
-        let (_, tail) = read(&mut client, &all, target(5)).await.unwrap();
+        let (_, tail) = read(&client, &all, target(5)).await.unwrap();
         assert_eq!(tail, bytes[5..]);
         let stale = read(
-            &mut client,
+            &client,
             &all,
-            v1::ReadRequest {
+            ReadRequest {
                 if_rev: 7,
                 ..target(0)
             },
         )
         .await
         .unwrap_err();
-        assert_eq!(stale.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(stale.status(), Some(412));
 
         // The same id and spec again is the same run; attach without a spec replays the log.
         let again = collect(
-            client
-                .run(authorized(request(Some(spec(3)), 0), &all))
+            run_events(&client, &all, request(Some(spec(3)), 0))
                 .await
-                .unwrap()
-                .into_inner(),
+                .unwrap(),
         )
         .await
         .unwrap();
-        let Some(v1::run_event::Event::State(state)) = &again[0].event else {
+        let v1::Event::State(state) = &again[0].event else {
             panic!()
         };
         assert_eq!(state.number, number);
         let tail_log = collect(
-            client
-                .run(authorized(
-                    request(None, events[events.len() - 2].sequence),
-                    &all,
-                ))
+            run_events(&client, &all, request(None, events[events.len() - 2].sequence))
                 .await
-                .unwrap()
-                .into_inner(),
+                .unwrap(),
         )
         .await
         .unwrap();
@@ -451,43 +558,28 @@ mod v1_api {
             ..Default::default()
         });
         assert!(collect(
-            client
-                .run(authorized(request(None, 0), &scoped))
+            run_events(&client, &scoped, request(None, 0))
                 .await
                 .unwrap()
-                .into_inner()
         )
         .await
         .is_ok());
-        assert!(read(&mut client, &scoped, target(0)).await.is_ok());
-        let submit = client
-            .run(authorized(
-                v1::RunRequest {
+        assert!(read(&client, &scoped, target(0)).await.is_ok());
+        let submit = run_events(&client, &scoped, RunRequest {
                     id: "run-2".into(),
                     after: 0,
                     spec: Some(spec(1)),
-                },
-                &scoped,
-            ))
+                })
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(submit.status(), Some(403));
+        let cancel = cancel(&client, &scoped, "run-1")
             .await
             .unwrap_err();
-        assert_eq!(submit.code(), tonic::Code::PermissionDenied);
-        let cancel = client
-            .control(authorized(
-                v1::ControlRequest {
-                    id: "run-1".into(),
-                    action: v1::Action::Cancel as i32,
-                },
-                &scoped,
-            ))
-            .await
-            .unwrap_err();
-        assert_eq!(cancel.code(), tonic::Code::PermissionDenied);
-        let bare = client
-            .run(tonic::Request::new(request(None, 0)))
-            .await
-            .unwrap_err();
-        assert_eq!(bare.code(), tonic::Code::Unauthenticated);
+        assert_eq!(cancel.status(), Some(403));
+        let bare = client.events("run-1", 0).await.err().unwrap();
+        assert_eq!(bare.status(), Some(401));
     }
 
     #[tokio::test]
@@ -505,7 +597,7 @@ mod v1_api {
                 .unwrap();
         })
         .await;
-        let mut client = client(&machine).await;
+        let client = client(&machine);
         let whole = |key| {
             cap_by(
                 key,
@@ -516,7 +608,7 @@ mod v1_api {
             )
         };
         let (ours, theirs) = (whole(&SIGNER), whole(&OTHER));
-        let request = |id: &str, spec| v1::RunRequest {
+        let request = |id: &str, spec| RunRequest {
             id: id.into(),
             after: 0,
             spec,
@@ -525,25 +617,25 @@ mod v1_api {
         let mut settled = vec![];
         for (cap, iterations) in [(&ours, 3), (&theirs, 4)] {
             let run = request("run-1", Some(spec(iterations)));
-            let events = collect(client.run(authorized(run, cap)).await.unwrap().into_inner())
+            let events = collect(run_events(&client, cap, run).await.unwrap())
                 .await
                 .unwrap();
-            let Some(v1::run_event::Event::State(state)) = &events[0].event else {
+            let v1::Event::State(state) = &events[0].event else {
                 panic!("{events:?}")
             };
-            let Some(v1::run_event::Event::Outcome(outcome)) = &events.last().unwrap().event else {
+            let v1::Event::Outcome(outcome) = &events.last().unwrap().event else {
                 panic!("{events:?}")
             };
             assert_eq!(outcome.status, "succeeded", "{outcome:?}");
-            let result: serde_json::Value = serde_json::from_slice(&outcome.result).unwrap();
+            let result: serde_json::Value = json(&outcome.result);
             assert_eq!(result["iterations"], iterations);
             settled.push(state.number);
         }
         let (our_run, their_run) = (settled[0], settled[1]);
         assert_ne!(our_run, their_run, "two runs, not one shared record");
         // Reading "run-1" answers each submitter with its own run's output.
-        let target = v1::ReadRequest {
-            target: Some(v1::read_request::Target::Output(v1::OutputTarget {
+        let target = ReadRequest {
+            target: Some(Target::Output(v1::OutputTarget {
                 run: "run-1".into(),
                 output: "report".into(),
                 index: 0,
@@ -552,31 +644,28 @@ mod v1_api {
             ..Default::default()
         };
         for (cap, iterations) in [(&ours, 3), (&theirs, 4)] {
-            let (_, bytes) = read(&mut client, cap, target.clone()).await.unwrap();
+            let (_, bytes) = read(&client, cap, target.clone()).await.unwrap();
             let report: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(report["iterations"], iterations);
         }
         // A run only one of them submitted does not exist for the other: attach, read, control.
         let only_ours = request("only-ours", Some(spec(2)));
         collect(
-            client
-                .run(authorized(only_ours, &ours))
+            run_events(&client, &ours, only_ours)
                 .await
-                .unwrap()
-                .into_inner(),
+                .unwrap(),
         )
         .await
         .unwrap();
-        let attach = client
-            .run(authorized(request("only-ours", None), &theirs))
+        let attach = run_events(&client, &theirs, request("only-ours", None))
             .await;
         let attached = match attach {
-            Ok(stream) => collect(stream.into_inner()).await.map(drop),
+            Ok(stream) => collect(stream).await.map(drop),
             Err(status) => Err(status),
         };
-        assert_eq!(attached.unwrap_err().code(), tonic::Code::NotFound);
-        let other = v1::ReadRequest {
-            target: Some(v1::read_request::Target::Output(v1::OutputTarget {
+        assert_eq!(attached.unwrap_err().status(), Some(404));
+        let other = ReadRequest {
+            target: Some(Target::Output(v1::OutputTarget {
                 run: "only-ours".into(),
                 output: "report".into(),
                 index: 0,
@@ -584,30 +673,22 @@ mod v1_api {
             })),
             ..Default::default()
         };
-        let refused = read(&mut client, &theirs, other).await.unwrap_err();
-        assert_eq!(refused.code(), tonic::Code::NotFound);
+        let refused = read(&client, &theirs, other).await.unwrap_err();
+        assert_eq!(refused.status(), Some(404));
         // Their cancel of the id fences it in their own namespace (canceled before acceptance)
         // and never reaches our run, which stays succeeded.
-        let cancel = v1::ControlRequest {
-            id: "only-ours".into(),
-            action: v1::Action::Cancel as i32,
-        };
-        let fenced = client
-            .control(authorized(cancel, &theirs))
+        let fenced = cancel(&client, &theirs, "only-ours")
             .await
-            .unwrap()
-            .into_inner();
+            .unwrap();
         assert_eq!(fenced.state, "canceled", "{fenced:?}");
         let ours_after = collect(
-            client
-                .run(authorized(request("only-ours", None), &ours))
+            run_events(&client, &ours, request("only-ours", None))
                 .await
-                .unwrap()
-                .into_inner(),
+                .unwrap(),
         )
         .await
         .unwrap();
-        let Some(v1::run_event::Event::State(state)) = &ours_after[0].event else {
+        let v1::Event::State(state) = &ours_after[0].event else {
             panic!("{ours_after:?}")
         };
         assert_ne!(state.number, fenced.number, "their fence is a record of their own");
@@ -617,51 +698,38 @@ mod v1_api {
     #[tokio::test]
     async fn control_cancels_a_running_run_cooperatively() {
         let machine = Machine::start_with(hold_classifier).await;
-        let mut client = client(&machine).await;
+        let client = client(&machine);
         let all = cap(Grant {
             action: MACHINE.into(),
             ..Default::default()
         });
-        let mut stream = client
-            .run(authorized(
-                v1::RunRequest {
+        let mut stream = run_events(&client, &all, RunRequest {
                     id: "long".into(),
                     after: 0,
                     spec: Some(spec(50_000_000)),
-                },
-                &all,
-            ))
+                })
             .await
-            .unwrap()
-            .into_inner();
+            .unwrap();
         // Cancel once the running run reports progress: it is executing package code.
         let mut running = false;
         loop {
             let event = stream
-                .message()
-                .await
+                .next().await.transpose()
                 .unwrap()
                 .expect("run ended before progress");
             match event.event {
-                Some(v1::run_event::Event::State(state)) if state.state == "running" => {
+                v1::Event::State(state) if state.state == "running" => {
                     running = true
                 }
-                Some(v1::run_event::Event::Progress(_)) if running => break,
+                v1::Event::Progress(_) if running => break,
                 _ => {}
             }
         }
-        client
-            .control(authorized(
-                v1::ControlRequest {
-                    id: "long".into(),
-                    action: v1::Action::Cancel as i32,
-                },
-                &all,
-            ))
+        cancel(&client, &all, "long")
             .await
             .unwrap();
         let rest = collect(stream).await.unwrap();
-        let Some(v1::run_event::Event::Outcome(outcome)) = &rest.last().unwrap().event else {
+        let v1::Event::Outcome(outcome) = &rest.last().unwrap().event else {
             panic!("{rest:?}")
         };
         assert_eq!(outcome.status, "canceled", "{outcome:?}");
@@ -671,38 +739,32 @@ mod v1_api {
     #[tokio::test]
     async fn status_lists_the_callers_live_runs_and_held_environments() {
         let machine = Machine::start_with(hold_classifier).await;
-        let mut client = client(&machine).await;
+        let client = client(&machine);
         let all = cap(Grant {
             action: MACHINE.into(),
             ..Default::default()
         });
-        let request = v1::RunRequest {
+        let request = RunRequest {
             id: "live".into(),
             after: 0,
             spec: Some(spec(50_000_000)),
         };
-        let mut stream = client
-            .run(authorized(request, &all))
+        let mut stream = run_events(&client, &all, request)
             .await
-            .unwrap()
-            .into_inner();
+            .unwrap();
         // Progress once it runs (a run also reports progress while it prepares).
         let mut running = false;
         loop {
-            match stream.message().await.unwrap().expect("run ended").event {
-                Some(v1::run_event::Event::State(state)) if state.state == "running" => {
+            match stream.next().await.transpose().unwrap().expect("run ended").event {
+                v1::Event::State(state) if state.state == "running" => {
                     running = true
                 }
-                Some(v1::run_event::Event::Progress(_)) if running => break,
+                v1::Event::Progress(_) if running => break,
                 _ => {}
             }
         }
-        let mut status = client
-            .status(authorized(v1::StatusRequest { keepalive: false }, &all))
-            .await
-            .unwrap()
-            .into_inner();
-        let frame = status.message().await.unwrap().unwrap();
+        let mut status = watch(&client, &all).await;
+        let frame = status.next().await.transpose().unwrap().unwrap();
         let live: Vec<_> = frame
             .runs
             .iter()
@@ -715,16 +777,12 @@ mod v1_api {
             .map(|e| e.installation.as_str())
             .collect();
         assert_eq!(held, ["fixture"], "{frame:?}");
-        let cancel = v1::ControlRequest {
-            id: "live".into(),
-            action: v1::Action::Cancel as i32,
-        };
-        client.control(authorized(cancel, &all)).await.unwrap();
+        cancel(&client, &all, "live").await.unwrap();
         collect(stream).await.unwrap();
         // The held Status stream sends the change: no live run remains.
         let until = Instant::now() + Duration::from_secs(30);
         loop {
-            let next = tokio::time::timeout_at(until.into(), status.message())
+            let next = tokio::time::timeout_at(until.into(), status.next())
                 .await
                 .expect("Status sent no frame without the run")
                 .unwrap()
@@ -735,26 +793,22 @@ mod v1_api {
         }
     }
 
+    /// Lands `data` at `offset` of the object (`digest`, `length` bytes); nothing asks what is
+    /// held. Answers the bytes held from its start.
     async fn write(
-        client: &mut v1::machine_client::MachineClient<Channel>,
+        client: &Client,
         cap: &str,
         digest: &str,
         length: u64,
         offset: u64,
         data: &[u8],
-    ) -> Result<u64, tonic::Status> {
-        let mut frames = vec![v1::WriteFrame {
-            digest: digest.into(),
-            length,
-            offset,
-            data: vec![],
-        }];
-        frames.extend(data.chunks(64 << 10).map(|chunk| v1::WriteFrame {
-            data: chunk.to_vec(),
-            ..Default::default()
-        }));
-        let request = authorized(tokio_stream::iter(frames), cap);
-        Ok(client.write(request).await?.into_inner().held)
+    ) -> Result<u64, ClientError> {
+        let client = by(client, cap);
+        let held = match data.is_empty() && length > 0 {
+            true => client.held(digest).await?,
+            false => client.bulk()?.put(digest, (offset, data.len() as u64, length), data.to_vec()).await?,
+        };
+        Ok(held.first().filter(|(start, _)| *start == 0).map_or(0, |(_, end)| *end))
     }
 
     /// A serve process that installs unpublished code (the client wheel built from this repo).
@@ -828,7 +882,7 @@ mod v1_api {
 
     /// A live project's files written with Write, as `cozy run ./dir` sends them: its manifest.
     async fn write_live(
-        client: &mut v1::machine_client::MachineClient<Channel>,
+        client: &Client,
         cap: &str,
         project: &Path,
         package: &str,
@@ -862,7 +916,7 @@ mod v1_api {
 
     /// A fixture package written with Write: its manifest's digest.
     async fn write_package(
-        client: &mut v1::machine_client::MachineClient<Channel>,
+        client: &Client,
         cap: &str,
         fixture: &str,
         package: &str,
@@ -921,51 +975,42 @@ mod v1_api {
         use tensorfs_core::{derived, meta::Meta, store::Store};
         for phase in ["checkpoint", "commit", "adopt"] {
             let (mut machine, tools) = installing_machine().await;
-            let mut peer = client(&machine).await;
+            let mut peer = client(&machine);
             let all = cap(Grant {
                 action: MACHINE.into(),
                 ..Default::default()
             });
             let manifest = write_package(
-                &mut peer,
+                &peer,
                 &all,
                 "cpu_weights",
                 "local/tensord-cpu-weights",
             )
             .await;
-            let mut stream = peer
-                .run(authorized(
-                    v1::RunRequest {
+            let mut stream = run_events(&peer, &all, RunRequest {
                         id: "native-cancel".into(),
                         after: 0,
                         spec: Some(v1::RunSpec {
-                            kind: v1::RunKind::Call as i32,
-                            source: Some(v1::run_spec::Source::Local(v1::LocalSource { manifest })),
+                            kind: v1::RunKind::Call,
+                            source: Some(v1::Source::Local(v1::LocalSource { manifest })),
                             entrypoint: "table".into(),
-                            payload: serde_json::to_vec(
-                                &serde_json::json!({"size":64,"hold":phase}),
-                            )
-                            .unwrap(),
+                            payload: raw(&serde_json::json!({"size":64,"hold":phase})),
                             owner: "alice".into(),
                             ..Default::default()
                         }),
-                    },
-                    &all,
-                ))
+                    })
                 .await
-                .unwrap()
-                .into_inner();
+                .unwrap();
             loop {
                 let event = stream
-                    .message()
-                    .await
+                    .next().await.transpose()
                     .unwrap()
                     .expect("job ended before native phase");
-                if matches!(event.event,Some(v1::run_event::Event::Progress(ref p)) if p.stage==format!("native {phase}"))
+                if matches!(event.event,v1::Event::Progress(ref p) if p.stage==format!("native {phase}"))
                 {
                     break;
                 }
-                if let Some(v1::run_event::Event::Outcome(done)) = event.event {
+                if let v1::Event::Outcome(done) = event.event {
                     panic!("job ended before native {phase}: {done:?}");
                 }
             }
@@ -975,15 +1020,6 @@ mod v1_api {
             let bindings = journal.derived_outputs(&record.id).unwrap();
             assert_eq!(bindings.len(), 1);
             let transaction = bindings[0].transaction.clone();
-            let control = |action: v1::Action| {
-                authorized(
-                    v1::ControlRequest {
-                        id: "native-cancel".into(),
-                        action: action as i32,
-                    },
-                    &all,
-                )
-            };
             if phase == "checkpoint" {
                 // Observer disconnect and a stopped machine preserve progress. The explicit
                 // cancel is durable while the daemon is down; startup must finish its native
@@ -1004,10 +1040,10 @@ mod v1_api {
                 let (child, address) = launch(&machine.root, &installing_args(&tools));
                 machine.child = child;
                 machine.address = address;
-                peer = client(&machine).await;
-                until(&mut peer, &all, "native-cancel", "canceled").await;
+                peer = client(&machine);
+                until(&peer, &all, "native-cancel", "canceled").await;
             } else {
-                peer.control(control(v1::Action::Cancel)).await.unwrap();
+                cancel(&peer, &all, "native-cancel").await.unwrap();
                 let ended = collect(stream).await.unwrap();
                 assert_eq!(outcome(&ended).status, "canceled", "{ended:?}");
                 drop(journal);
@@ -1066,26 +1102,26 @@ mod v1_api {
     #[tokio::test]
     async fn a_job_writes_a_weights_output_kept_under_a_local_alias() {
         let (machine, tools) = installing_machine().await;
-        let mut client = client(&machine).await;
+        let client = client(&machine);
         let all = cap(Grant {
             action: MACHINE.into(),
             ..Default::default()
         });
-        let manifest = write_package(&mut client, &all, "cpu_weights", "local/tensord-cpu-weights").await;
+        let manifest = write_package(&client, &all, "cpu_weights", "local/tensord-cpu-weights").await;
         let job = v1::RunSpec {
-            kind: v1::RunKind::Call as i32,
-            source: Some(v1::run_spec::Source::Local(v1::LocalSource { manifest })),
+            kind: v1::RunKind::Call,
+            source: Some(v1::Source::Local(v1::LocalSource { manifest })),
             entrypoint: "table".into(),
-            payload: br#"{"size":64}"#.to_vec(),
+            payload: v1::Json::parse(r#"{"size":64}"#).ok(),
             owner: "alice".into(),
             ..Default::default()
         };
-        let run = |id: &str, spec: v1::RunSpec| v1::RunRequest {
+        let run = |id: &str, spec: v1::RunSpec| RunRequest {
             id: id.into(),
             after: 0,
             spec: Some(spec),
         };
-        let events = collect(client.run(authorized(run("weights", job.clone()), &all)).await.unwrap().into_inner())
+        let events = collect(run_events(&client, &all, run("weights", job.clone())).await.unwrap())
             .await
             .unwrap();
         let done = outcome(&events);
@@ -1096,12 +1132,12 @@ mod v1_api {
             .find(|p| p.output == "model")
             .unwrap_or_else(|| panic!("{done:?}"));
         assert_eq!(written.media_type, "application/vnd.cozy.model-manifest");
-        let result: serde_json::Value = serde_json::from_slice(&done.result).unwrap();
+        let result: serde_json::Value = json(&done.result);
         assert!(result.to_string().contains(&written.digest), "{result} names {written:?}");
         // A writer is never memoized: the same call runs again. Its derivation replays the
         // committed transaction of the same code and declaration, so its output is the same.
         assert!(!done.memoized && done.computation_digest.is_empty(), "{done:?}");
-        let events = collect(client.run(authorized(run("weights-again", job.clone()), &all)).await.unwrap().into_inner())
+        let events = collect(run_events(&client, &all, run("weights-again", job.clone())).await.unwrap())
             .await
             .unwrap();
         let again = outcome(&events);
@@ -1127,7 +1163,7 @@ mod v1_api {
         // The held checkpoint kept under a local alias, as `cozy model download … local/tiny`
         // keeps a model: no Hub, no publication.
         let keep = v1::RunSpec {
-            kind: v1::RunKind::Warm as i32,
+            kind: v1::RunKind::Warm,
             models: vec![v1::ModelChoice {
                 parameter: "model".into(),
                 manifest: written.digest.clone(),
@@ -1138,18 +1174,18 @@ mod v1_api {
             owner: "alice".into(),
             ..Default::default()
         };
-        let events = collect(client.run(authorized(run("keep", keep), &all)).await.unwrap().into_inner())
+        let events = collect(run_events(&client, &all, run("keep", keep)).await.unwrap())
             .await
             .unwrap();
         let done = outcome(&events);
         assert_eq!(done.status, "succeeded", "{done:?}");
-        let result: serde_json::Value = serde_json::from_slice(&done.result).unwrap();
+        let result: serde_json::Value = json(&done.result);
         assert_eq!(result["models"][0]["published"]["destination"], "local/tiny", "{result}");
         assert_eq!(result["models"][0]["published"]["checkpoint"], written.digest, "{result}");
 
         // A file that was never written is refused at submit: the run takes custody of none.
         let unwritten = v1::RunSpec {
-            kind: v1::RunKind::Warm as i32,
+            kind: v1::RunKind::Warm,
             models: vec![v1::ModelChoice {
                 parameter: "model".into(),
                 source: format!("object://sha256:{}/stray.safetensors", "0".repeat(64)),
@@ -1159,11 +1195,11 @@ mod v1_api {
             owner: "alice".into(),
             ..Default::default()
         };
-        let refused = match client.run(authorized(run("unwritten", unwritten), &all)).await {
-            Ok(stream) => collect(stream.into_inner()).await.unwrap_err(),
+        let refused = match run_events(&client, &all, run("unwritten", unwritten)).await {
+            Ok(stream) => collect(stream).await.unwrap_err(),
             Err(status) => status,
         };
-        assert!(refused.message().contains("was not written to this machine"), "{refused:?}");
+        assert!(refused.to_string().contains("was not written to this machine"), "{refused:?}");
 
         let _ = fs::remove_dir_all(tools);
     }
@@ -1173,23 +1209,23 @@ mod v1_api {
     #[tokio::test]
     async fn a_second_deviceless_call_reuses_its_executor() {
         let (machine, tools) = installing_machine().await;
-        let mut client = client(&machine).await;
+        let client = client(&machine);
         let all = cap(Grant { action: MACHINE.into(), ..Default::default() });
-        let manifest = write_package(&mut client, &all, "cpu_memo", "local/tensord-cpu-memo").await;
+        let manifest = write_package(&client, &all, "cpu_memo", "local/tensord-cpu-memo").await;
         let mut served = vec![];
         for id in ["process-1", "process-2"] {
             let spec = v1::RunSpec {
-                kind: v1::RunKind::Call as i32,
-                source: Some(v1::run_spec::Source::Local(v1::LocalSource { manifest: manifest.clone() })),
+                kind: v1::RunKind::Call,
+                source: Some(v1::Source::Local(v1::LocalSource { manifest: manifest.clone() })),
                 entrypoint: "process".into(),
-                payload: serde_json::to_vec(&serde_json::json!({"text": id})).unwrap(),
+                payload: raw(&serde_json::json!({"text": id})),
                 owner: "alice".into(),
                 ..Default::default()
             };
-            let request = v1::RunRequest { id: id.into(), after: 0, spec: Some(spec) };
-            let done = outcome(&collect(client.run(authorized(request, &all)).await.unwrap().into_inner()).await.unwrap());
+            let request = RunRequest { id: id.into(), after: 0, spec: Some(spec) };
+            let done = outcome(&collect(run_events(&client, &all, request).await.unwrap()).await.unwrap());
             assert_eq!(done.status, "succeeded", "{done:?}");
-            let result: serde_json::Value = serde_json::from_slice(&done.result).unwrap();
+            let result: serde_json::Value = json(&done.result);
             served.push((result["pid"].as_u64().unwrap(), result["served"].as_u64().unwrap()));
         }
         assert_eq!(served[0].0, served[1].0, "one executor served both calls: {served:?}");
@@ -1199,24 +1235,24 @@ mod v1_api {
 
     /// One run of `function` of the package `manifest` names, to its outcome: its result.
     async fn call(
-        client: &mut v1::machine_client::MachineClient<Channel>,
+        client: &Client,
         cap: &str,
         manifest: &str,
         (id, function): (&str, &str),
         payload: serde_json::Value,
     ) -> serde_json::Value {
         let spec = v1::RunSpec {
-            kind: v1::RunKind::Call as i32,
-            source: Some(v1::run_spec::Source::Local(v1::LocalSource { manifest: manifest.into() })),
+            kind: v1::RunKind::Call,
+            source: Some(v1::Source::Local(v1::LocalSource { manifest: manifest.into() })),
             entrypoint: function.into(),
-            payload: serde_json::to_vec(&payload).unwrap(),
+            payload: raw(&payload),
             owner: "alice".into(),
             ..Default::default()
         };
-        let request = authorized(v1::RunRequest { id: id.into(), after: 0, spec: Some(spec) }, cap);
-        let done = outcome(&collect(client.run(request).await.unwrap().into_inner()).await.unwrap());
+        let request = authorized(RunRequest { id: id.into(), after: 0, spec: Some(spec) }, cap);
+        let done = outcome(&collect(run_as(client, request).await.unwrap()).await.unwrap());
         assert_eq!(done.status, "succeeded", "{id}: {done:?}");
-        serde_json::from_slice(&done.result).unwrap()
+        json(&done.result)
     }
 
     /// On a GPU machine every call runs where its declaration puts it, on pooled executors: a
@@ -1238,12 +1274,12 @@ mod v1_api {
         let mut args = installing_args(&tools);
         args.extend(["--gpu-config".into(), config.into_os_string()]);
         let machine = Machine::start_args(|_, _| (), &args).await;
-        let mut client = client(&machine).await;
+        let client = client(&machine);
         let all = cap(Grant { action: MACHINE.into(), ..Default::default() });
-        let manifest = write_package(&mut client, &all, "gpu_calls", "local/tensord-gpu-calls").await;
+        let manifest = write_package(&client, &all, "gpu_calls", "local/tensord-gpu-calls").await;
         let hold = serde_json::json!({"hold_s": 0.5});
 
-        let deviceless = call(&mut client, &all, &manifest, ("cpu-root", "cpu_root"), hold.clone()).await;
+        let deviceless = call(&client, &all, &manifest, ("cpu-root", "cpu_root"), hold.clone()).await;
         assert_eq!((deviceless["root"]["device"].as_str(), deviceless["child"]["device"].as_str()), (Some("cpu"), Some("cuda")));
         assert_eq!(deviceless["child"]["total"], 8192.0);
         let root = deviceless["root"]["pid"].as_u64().unwrap();
@@ -1252,16 +1288,16 @@ mod v1_api {
         let maps = fs::read_to_string(format!("/proc/{root}/maps")).unwrap();
         assert!(!maps.contains("libcuda"), "a deviceless executor opened CUDA");
 
-        let on_gpu = call(&mut client, &all, &manifest, ("gpu-root", "gpu_root"), hold).await;
+        let on_gpu = call(&client, &all, &manifest, ("gpu-root", "gpu_root"), hold).await;
         assert_eq!((on_gpu["root"]["device"].as_str(), on_gpu["child"]["device"].as_str()), (Some("cuda"), Some("cuda")));
         assert_ne!(on_gpu["root"]["pid"], on_gpu["child"]["pid"]);
 
         let none = serde_json::json!({});
-        let warm = call(&mut client, &all, &manifest, ("warm-1", "warm"), none.clone()).await;
-        let raw = call(&mut client, &all, &manifest, ("raw", "raw"), none.clone()).await;
+        let warm = call(&client, &all, &manifest, ("warm-1", "warm"), none.clone()).await;
+        let raw = call(&client, &all, &manifest, ("raw", "raw"), none.clone()).await;
         assert_eq!(raw["device"], "cuda");
         assert_ne!(raw["pid"], warm["pid"]);
-        let again = call(&mut client, &all, &manifest, ("warm-2", "warm"), none).await;
+        let again = call(&client, &all, &manifest, ("warm-2", "warm"), none).await;
         assert_eq!((&again["pid"], again["served"].as_u64()), (&warm["pid"], Some(2)), "the warm executor was ended");
         let _ = fs::remove_dir_all(tools);
     }
@@ -1306,31 +1342,31 @@ mod v1_api {
                     "repository": "local/tiny", "release": "1", "lane": "f32",
                     "manifest": manifest.id(), "components": ["model"]}]}).to_string()).unwrap();
         }, &args).await;
-        let mut client = client(&machine).await;
+        let client = client(&machine);
         let all = cap(Grant { action: MACHINE.into(), ..Default::default() });
-        let manifest = write_package(&mut client, &all, "gpu_calls", "local/tensord-gpu-calls").await;
+        let manifest = write_package(&client, &all, "gpu_calls", "local/tensord-gpu-calls").await;
         for (id, gpus, hold_s) in [("job-2", 2, 0.5), ("job-4", 4, 0.4)] {
             let spec = v1::RunSpec {
-                kind: v1::RunKind::Call as i32,
-                source: Some(v1::run_spec::Source::Local(v1::LocalSource { manifest: manifest.clone() })),
+                kind: v1::RunKind::Call,
+                source: Some(v1::Source::Local(v1::LocalSource { manifest: manifest.clone() })),
                 entrypoint: "cpu_job".into(),
-                payload: serde_json::to_vec(&serde_json::json!({"hold_s": hold_s})).unwrap(),
+                payload: raw(&serde_json::json!({"hold_s": hold_s})),
                 owner: "alice".into(),
                 gpus,
                 ..Default::default()
             };
-            let request = authorized(v1::RunRequest { id: id.into(), after: 0, spec: Some(spec) }, &all);
-            let events = collect(client.run(request).await.unwrap().into_inner()).await.unwrap();
+            let request = authorized(RunRequest { id: id.into(), after: 0, spec: Some(spec) }, &all);
+            let events = collect(run_as(&client, request).await.unwrap()).await.unwrap();
             let done = outcome(&events);
             assert_eq!(done.status, "succeeded", "{id}: {done:?}");
-            let result: serde_json::Value = serde_json::from_slice(&done.result).unwrap();
+            let result: serde_json::Value = json(&done.result);
             let children = result["children"].as_array().unwrap();
             assert_eq!(children.len(), 2, "{result}");
             assert!(children.iter().all(|c| c["device"].as_str().unwrap().starts_with("cuda")), "{result}");
             // Each call names the model it ran as the machine resolved it (`run show`).
             for event in &events {
-                if let Some(v1::run_event::Event::Call(call)) = &event.event {
-                    let measured: serde_json::Value = serde_json::from_slice(&call.measurements).unwrap();
+                if let v1::Event::Call(call) = &event.event {
+                    let measured = json(&call.measurements);
                     assert_eq!((&measured["models"][0]["repository"], &measured["models"][0]["lane"]),
                         (&"local/tiny".into(), &"f32".into()), "{measured}");
                 }
@@ -1381,31 +1417,31 @@ mod v1_api {
                     "repository": "local/weight", "release": "1", "lane": "f32",
                     "manifest": manifest.id(), "components": ["model"]}]}).to_string()).unwrap();
         }, &args).await;
-        let mut client = client(&machine).await;
+        let client = client(&machine);
         let all = cap(Grant { action: MACHINE.into(), ..Default::default() });
-        let manifest = write_package(&mut client, &all, "gpu_calls", "local/tensord-gpu-calls").await;
+        let manifest = write_package(&client, &all, "gpu_calls", "local/tensord-gpu-calls").await;
         let (pid, idle_mib) = (machine.child.id(), gpu_used_mib());
         let idle_fds = driver_fds(pid);
 
         // The second call ends with its executor's weights offered to custody, if the first did not.
         for id in ["resident-1", "resident-2"] {
-            let ran = call(&mut client, &all, &manifest, (id, "resident"), serde_json::json!({})).await;
+            let ran = call(&client, &all, &manifest, (id, "resident"), serde_json::json!({})).await;
             assert_eq!(ran["device"], "cuda:0", "{ran}");
         }
         assert!(driver_fds(pid) > idle_fds, "custody kept none of the executor's weights");
         assert!(gpu_used_mib() >= idle_mib + WEIGHT_MIB);
 
         let spec = v1::RunSpec {
-            kind: v1::RunKind::Remove as i32,
-            source: Some(v1::run_spec::Source::Release(v1::Release {
+            kind: v1::RunKind::Remove,
+            source: Some(v1::Source::Release(v1::Release {
                 package: "local/tensord-gpu-calls".into(),
                 ..Default::default()
             })),
             owner: "alice".into(),
             ..Default::default()
         };
-        let request = authorized(v1::RunRequest { id: "remove".into(), after: 0, spec: Some(spec) }, &all);
-        let done = outcome(&collect(client.run(request).await.unwrap().into_inner()).await.unwrap());
+        let request = authorized(RunRequest { id: "remove".into(), after: 0, spec: Some(spec) }, &all);
+        let done = outcome(&collect(run_as(&client, request).await.unwrap()).await.unwrap());
         assert_eq!(done.status, "succeeded", "{done:?}");
         // The ended executor's context leaves with its process; the weights with custody's fds.
         assert_eq!(driver_fds(pid), idle_fds, "custody still holds the removed package's weights");
@@ -1442,13 +1478,13 @@ mod v1_api {
         let mut args = installing_args(&tools);
         args.extend(["--gpu-config".into(), config.into_os_string()]);
         let machine = Machine::start_args(|_, _| (), &args).await;
-        let mut client = client(&machine).await;
+        let client = client(&machine);
         let all = cap(Grant { action: MACHINE.into(), ..Default::default() });
         // The release's interface as the machine describes the code it installs.
-        let local = write_package(&mut client, &all, FIXTURE.0, &format!("local/{}", FIXTURE.1)).await;
-        let install = v1::RunSpec { kind: v1::RunKind::Warm as i32, owner: "alice".into(),
-            source: Some(v1::run_spec::Source::Local(v1::LocalSource { manifest: local })), ..Default::default() };
-        assert_eq!(settle(&mut client, &all, "describe", install).await.status, "succeeded");
+        let local = write_package(&client, &all, FIXTURE.0, &format!("local/{}", FIXTURE.1)).await;
+        let install = v1::RunSpec { kind: v1::RunKind::Warm, owner: "alice".into(),
+            source: Some(v1::Source::Local(v1::LocalSource { manifest: local })), ..Default::default() };
+        assert_eq!(settle(&client, &all, "describe", install).await.status, "succeeded");
         let generation = fs::read_dir(machine.root.join("state/generations")).unwrap().flatten()
             .find_map(|g| fs::read(g.path().join("generation.json")).ok()).unwrap();
         let interface = serde_json::from_slice::<serde_json::Value>(&generation).unwrap()["interface"].clone();
@@ -1470,32 +1506,32 @@ mod v1_api {
         };
         let (origin, _) = names_hub::serve(&store, model, [release("0.1.0"), release("0.2.0")]);
         let spec = |kind: v1::RunKind, release: &str, entrypoint: &str| v1::RunSpec {
-            kind: kind as i32, entrypoint: entrypoint.into(), owner: "alice".into(),
-            source: Some(v1::run_spec::Source::Release(v1::Release { package: format!("acme/{}", FIXTURE.1), release: release.into() })),
+            kind, entrypoint: entrypoint.into(), owner: "alice".into(),
+            source: Some(v1::Source::Release(v1::Release { package: format!("acme/{}", FIXTURE.1), release: release.into() })),
             models: vec![v1::ModelChoice { parameter: "model".into(), repository: "acme/weight".into(),
                 release: "1".into(), lane: "f32".into(), ..Default::default() }],
             hub: Some(v1::HubAccess { origin: origin.clone(), object_hosts: vec!["localhost".into()], ..Default::default() }),
             catalog_revision: "r1".into(),
             ..Default::default()
         };
-        let memory = |done: &v1::Outcome| serde_json::from_slice::<serde_json::Value>(&done.measurements).unwrap()["memory"].clone();
+        let memory = |done: &v1::Outcome| json(&done.measurements)["memory"].clone();
 
         // 0.1.0 warm and idle: its executor keeps the weights on the GPU.
         for id in ["old-1", "old-2"] {
-            let done = settle(&mut client, &all, id, spec(v1::RunKind::Call, "0.1.0", "resident")).await;
+            let done = settle(&client, &all, id, spec(v1::RunKind::Call, "0.1.0", "resident")).await;
             assert_eq!(done.status, "succeeded", "{done:?}");
         }
         // 0.2.0 installs beside it; both stay installed.
-        let done = settle(&mut client, &all, "update", spec(v1::RunKind::Warm, "0.2.0", "")).await;
+        let done = settle(&client, &all, "update", spec(v1::RunKind::Warm, "0.2.0", "")).await;
         assert_eq!(done.status, "succeeded", "{done:?}");
-        let releases: Vec<String> = status_frame(&mut client, &all).await.environments.into_iter()
+        let releases: Vec<String> = status_frame(&client, &all).await.environments.into_iter()
             .filter(|e| e.package == format!("acme/{}", FIXTURE.1)).map(|e| e.release).collect();
         assert_eq!(releases, ["0.1.0", "0.2.0"]);
 
         // 0.2.0's request takes the idle tenant's room: every weight resident, nothing paged
         // out; its next request pages nothing in.
         for (id, first) in [("new-1", true), ("new-2", false)] {
-            let done = settle(&mut client, &all, id, spec(v1::RunKind::Call, "0.2.0", "resident")).await;
+            let done = settle(&client, &all, id, spec(v1::RunKind::Call, "0.2.0", "resident")).await;
             assert_eq!(done.status, "succeeded", "{done:?}");
             let memory = memory(&done);
             assert!(memory["budget_bytes"].as_u64() >= memory["weights_bytes"].as_u64(), "{id}: {memory}");
@@ -1517,15 +1553,15 @@ mod v1_api {
         let authkit = hub_oauth::AuthKit::start(&upstream);
         let (machine, tools) = installing_machine().await;
         let jkt = leaf_jkt(&machine);
-        let mut client = client(&machine).await;
+        let client = client(&machine);
         let all = cap(Grant { action: MACHINE.into(), ..Default::default() });
-        let manifest = write_package(&mut client, &all, "cpu_weights", "local/tensord-cpu-weights").await;
+        let manifest = write_package(&client, &all, "cpu_weights", "local/tensord-cpu-weights").await;
         let ops = serde_json::json!([{"type": "tensorhub_model_publish", "model": "acme/tiny"}]);
         let spec = v1::RunSpec {
-            kind: v1::RunKind::Call as i32,
-            source: Some(v1::run_spec::Source::Local(v1::LocalSource { manifest })),
+            kind: v1::RunKind::Call,
+            source: Some(v1::Source::Local(v1::LocalSource { manifest })),
             entrypoint: "table".into(),
-            payload: br#"{"size":128}"#.to_vec(),
+            payload: v1::Json::parse(r#"{"size":128}"#).ok(),
             weights_destination: "acme/tiny".into(),
             hub: Some(v1::HubAccess {
                 origin: authkit.hub.clone(),
@@ -1537,14 +1573,14 @@ mod v1_api {
             owner: "alice".into(),
             ..Default::default()
         };
-        let request = v1::RunRequest { id: "published-table".into(), after: 0, spec: Some(spec) };
-        let events = collect(client.run(authorized(request, &all)).await.unwrap().into_inner()).await.unwrap();
+        let request = RunRequest { id: "published-table".into(), after: 0, spec: Some(spec) };
+        let events = collect(run_events(&client, &all, request).await.unwrap()).await.unwrap();
         let done = outcome(&events);
         assert_eq!(done.status, "succeeded", "{done:?}");
         let written = done.outputs.iter().find(|p| p.output == "model").unwrap();
         assert_eq!(hub.lock().unwrap().finalized, std::slice::from_ref(&written.digest));
         let uploads: Vec<_> = events.iter().filter_map(|e| match &e.event {
-            Some(v1::run_event::Event::Call(call)) if call.function.ends_with("upload_checkpoint") => Some(call.status.clone()),
+            v1::Event::Call(call) if call.function.ends_with("upload_checkpoint") => Some(call.status.clone()),
             _ => None,
         }).collect();
         assert_eq!(uploads, ["succeeded"]);
@@ -1577,17 +1613,17 @@ mod v1_api {
         .await;
         let manifest = held.unwrap();
         let jkt = leaf_jkt(&machine);
-        let mut client = client(&machine).await;
+        let client = client(&machine);
         let all = cap(Grant {
             action: MACHINE.into(),
             ..Default::default()
         });
         let ops = serde_json::json!([{"type": "tensorhub_model_publish", "model": "acme/tiny"}]);
-        let upload = |id: &str, capability: String| v1::RunRequest {
+        let upload = |id: &str, capability: String| RunRequest {
             id: id.into(),
             after: 0,
             spec: Some(v1::RunSpec {
-                kind: v1::RunKind::Warm as i32,
+                kind: v1::RunKind::Warm,
                 models: vec![v1::ModelChoice {
                     parameter: "model".into(),
                     repository: "local/tiny".into(),
@@ -1606,16 +1642,16 @@ mod v1_api {
             }),
         };
         let done = |events: Vec<v1::RunEvent>| outcome(&events);
-        let refused = done(collect(client.run(authorized(upload("upload-0", String::new()), &all)).await.unwrap().into_inner()).await.unwrap());
+        let refused = done(collect(run_events(&client, &all, upload("upload-0", String::new())).await.unwrap()).await.unwrap());
         assert_eq!(refused.status, "failed", "{refused:?}");
         assert_eq!(refused.reason.unwrap().code, "capability_required");
         assert_eq!(authkit.exchanges(), 0);
 
         for id in ["upload-1", "upload-2"] {
             let signed = authkit.capability(&jkt, &ops, 600);
-            let done = done(collect(client.run(authorized(upload(id, signed), &all)).await.unwrap().into_inner()).await.unwrap());
+            let done = done(collect(run_events(&client, &all, upload(id, signed)).await.unwrap()).await.unwrap());
             assert_eq!(done.status, "succeeded", "{id}: {done:?}");
-            let result: serde_json::Value = serde_json::from_slice(&done.result).unwrap();
+            let result: serde_json::Value = json(&done.result);
             assert_eq!(result["models"][0]["published"]["checkpoint"], manifest, "{result}");
         }
         {
@@ -1630,7 +1666,7 @@ mod v1_api {
 
         let signed = authkit.capability(&jkt, &ops, 600);
         authkit.revoke_device_key();
-        let revoked = done(collect(client.run(authorized(upload("upload-3", signed), &all)).await.unwrap().into_inner()).await.unwrap());
+        let revoked = done(collect(run_events(&client, &all, upload("upload-3", signed)).await.unwrap()).await.unwrap());
         assert_eq!(revoked.status, "failed", "{revoked:?}");
         assert_eq!(revoked.reason.unwrap().code, "capability_refused");
         assert_eq!(hub.lock().unwrap().finalized.len(), 2);
@@ -1660,13 +1696,13 @@ mod v1_api {
 
     /// One warm run to its outcome.
     async fn settle(
-        client: &mut v1::machine_client::MachineClient<Channel>,
+        client: &Client,
         cap: &str,
         id: &str,
         spec: v1::RunSpec,
     ) -> v1::Outcome {
-        let request = v1::RunRequest { id: id.into(), after: 0, spec: Some(spec) };
-        outcome(&collect(client.run(authorized(request, cap)).await.unwrap().into_inner()).await.unwrap())
+        let request = RunRequest { id: id.into(), after: 0, spec: Some(spec) };
+        outcome(&collect(run_events(client, cap, request).await.unwrap()).await.unwrap())
     }
 
     /// th-245: a run names its release and model and the machine resolves both at its Hub by
@@ -1696,12 +1732,12 @@ mod v1_api {
         };
         let (origin, heard) = names_hub::serve(&store, model, Some(package));
         let machine = Machine::start().await;
-        let mut client = client(&machine).await;
+        let client = client(&machine);
         let all = cap(Grant { action: MACHINE.into(), ..Default::default() });
         let spec = |release: Option<&str>, choice: v1::ModelChoice, revision: &str| v1::RunSpec {
-            kind: v1::RunKind::Warm as i32,
+            kind: v1::RunKind::Warm,
             source: release.map(|release| {
-                v1::run_spec::Source::Release(v1::Release { package: "acme/pkg".into(), release: release.into() })
+                v1::Source::Release(v1::Release { package: "acme/pkg".into(), release: release.into() })
             }),
             models: vec![v1::ModelChoice { parameter: "model".into(), ..choice }],
             hub: Some(v1::HubAccess {
@@ -1722,9 +1758,9 @@ mod v1_api {
         let take = || std::mem::take(&mut *heard.lock().unwrap());
 
         // Cold: the newest release installs by name; the model resolves and downloads by name.
-        let done = settle(&mut client, &all, "names-1", spec(Some(""), named.clone(), "r1")).await;
+        let done = settle(&client, &all, "names-1", spec(Some(""), named.clone(), "r1")).await;
         assert_eq!(done.status, "succeeded", "{done:?}");
-        let result: serde_json::Value = serde_json::from_slice(&done.result).unwrap();
+        let result: serde_json::Value = json(&done.result);
         let row = &result["models"][0];
         assert_eq!(result["release"], "1.0.0");
         assert_eq!((&row["release"], &row["lane"], &row["manifest"]), (&"1.0.0".into(), &"bf16".into(), &manifest.id().into()));
@@ -1741,32 +1777,32 @@ mod v1_api {
 
         // Warm: the release's installation and the name's resolution are held, across a
         // restart too.
-        let done = settle(&mut client, &all, "names-2", spec(Some("1.0.0"), named.clone(), "r1")).await;
+        let done = settle(&client, &all, "names-2", spec(Some("1.0.0"), named.clone(), "r1")).await;
         assert_eq!(done.status, "succeeded", "{done:?}");
         assert_eq!(take(), Vec::<String>::new());
         let mut machine = machine;
         machine.stop();
         (machine.child, machine.address) = launch(&machine.root, &[]);
-        let mut client = self::client(&machine).await;
-        let done = settle(&mut client, &all, "names-2b", spec(Some("1.0.0"), named.clone(), "r1")).await;
+        let client = self::client(&machine);
+        let done = settle(&client, &all, "names-2b", spec(Some("1.0.0"), named.clone(), "r1")).await;
         assert_eq!(done.status, "succeeded", "{done:?}");
         assert_eq!(take(), Vec::<String>::new());
         // A run naming no release runs the one the Hub named under its revision: not asked again.
-        let done = settle(&mut client, &all, "names-2c", spec(Some(""), named.clone(), "r1")).await;
+        let done = settle(&client, &all, "names-2c", spec(Some(""), named.clone(), "r1")).await;
         assert_eq!(done.status, "succeeded", "{done:?}");
         assert_eq!(take(), Vec::<String>::new());
 
         // A name alone is the newest release in the lane this machine's GPUs run (none here:
         // bf16): one closure, nothing to move.
         let bare = v1::ModelChoice { repository: "acme/model".into(), ..Default::default() };
-        let done = settle(&mut client, &all, "names-3", spec(None, bare, "r1")).await;
+        let done = settle(&client, &all, "names-3", spec(None, bare, "r1")).await;
         assert_eq!(done.status, "succeeded", "{done:?}");
-        let result: serde_json::Value = serde_json::from_slice(&done.result).unwrap();
+        let result: serde_json::Value = json(&done.result);
         assert_eq!((&result["models"][0]["release"], &result["models"][0]["lane"]), (&"1.0.0".into(), &"bf16".into()));
         assert_eq!(take(), ["POST /v1/tensorfs/closure acme/model bf16"]);
 
         // A revision the caller moved resolves the name once more; the bytes are held.
-        let done = settle(&mut client, &all, "names-4", spec(Some("1.0.0"), named.clone(), "r2")).await;
+        let done = settle(&client, &all, "names-4", spec(Some("1.0.0"), named.clone(), "r2")).await;
         assert_eq!(done.status, "succeeded", "{done:?}");
         assert_eq!(take(), ["POST /v1/tensorfs/closure acme/model@1.0.0 bf16"]);
 
@@ -1776,22 +1812,22 @@ mod v1_api {
         fs::create_dir_all(&links).unwrap();
         machine.stop();
         (machine.child, machine.address) = launch(&machine.root, &["--package-find-links".into(), links.into()]);
-        let mut client = self::client(&machine).await;
-        let done = settle(&mut client, &all, "names-4b", spec(Some("1.0.0"), named.clone(), "r2")).await;
+        let client = self::client(&machine);
+        let done = settle(&client, &all, "names-4b", spec(Some("1.0.0"), named.clone(), "r2")).await;
         assert_eq!(done.status, "succeeded", "{done:?}");
         assert_eq!(take(), Vec::<String>::new());
         let generations = fs::read_dir(machine.root.join("state/generations")).unwrap().flatten();
         let kept = generations.filter(|g| g.path().join("release.json").is_file()).count();
         assert_eq!(kept, 2, "each environment of the release keeps its card");
         // A moved revision asks once more which release is newest, and nothing else.
-        let done = settle(&mut client, &all, "names-4c", spec(Some(""), named, "r2")).await;
+        let done = settle(&client, &all, "names-4c", spec(Some(""), named, "r2")).await;
         assert_eq!(done.status, "succeeded", "{done:?}");
         assert_eq!(take(), ["GET /v1/packages/acme/pkg"]);
 
         // A hash alone is the owner's: absent without the run's capability.
         let other = format!("sha256:{}", "ab".repeat(32));
         let hashed = v1::ModelChoice { repository: "acme/model".into(), manifest: other.clone(), manifest_length: 9, ..Default::default() };
-        let done = settle(&mut client, &all, "names-5", spec(None, hashed, "r2")).await;
+        let done = settle(&client, &all, "names-5", spec(None, hashed, "r2")).await;
         assert_eq!(done.status, "failed", "{done:?}");
         assert_eq!(take(), [format!("POST /v1/tensorfs/closure acme/model@{other} ")]);
         let _ = fs::remove_dir_all(source);
@@ -1828,11 +1864,11 @@ mod v1_api {
         let mut machine = Machine::start().await;
         machine.stop();
         (machine.child, machine.address) = launch_in(&machine.root, &[], &scope);
-        let client = client(&machine).await;
+        let client = client(&machine);
         let all = cap(Grant { action: MACHINE.into(), ..Default::default() });
         let download = |at: usize, name: &str| {
             let spec = v1::RunSpec {
-                kind: v1::RunKind::Warm as i32,
+                kind: v1::RunKind::Warm,
                 models: vec![v1::ModelChoice {
                     parameter: "model".into(),
                     repository: name.into(),
@@ -1844,8 +1880,8 @@ mod v1_api {
                 owner: "alice".into(),
                 ..Default::default()
             };
-            let (mut client, all, id) = (client.clone(), all.clone(), format!("tasks-{at}"));
-            async move { settle(&mut client, &all, &id, spec).await }
+            let (client, all, id) = (client.clone(), all.clone(), format!("tasks-{at}"));
+            async move { settle(&client, &all, &id, spec).await }
         };
         // Test harness bound on a wedged preparation; the product has no such limit.
         let both = tokio::time::timeout(Duration::from_secs(120), async {
@@ -1875,10 +1911,10 @@ mod v1_api {
         let (upstream, heard) = names_hub::serve(&store, model, None);
         let authkit = hub_oauth::AuthKit::start(&upstream);
         let machine = Machine::start().await;
-        let mut client = client(&machine).await;
+        let client = client(&machine);
         let all = cap(Grant { action: MACHINE.into(), ..Default::default() });
         let spec = |capability: String| v1::RunSpec {
-            kind: v1::RunKind::Warm as i32,
+            kind: v1::RunKind::Warm,
             models: vec![v1::ModelChoice {
                 parameter: "model".into(),
                 repository: "acme/private".into(),
@@ -1900,12 +1936,12 @@ mod v1_api {
         let jkt = leaf_jkt(&machine);
 
         let other = authkit.capability(&jkt, &read(&format!("sha256:{}", "ab".repeat(32))), 600);
-        let done = settle(&mut client, &all, "private-1", spec(other)).await;
+        let done = settle(&client, &all, "private-1", spec(other)).await;
         assert_eq!(done.status, "failed", "{done:?}");
         assert_eq!(authkit.exchanges(), 0);
 
         let named = authkit.capability(&jkt, &read(&manifest.id()), 600);
-        let done = settle(&mut client, &all, "private-2", spec(named)).await;
+        let done = settle(&client, &all, "private-2", spec(named)).await;
         assert_eq!(done.status, "succeeded", "{done:?}");
         assert_eq!(authkit.exchanges(), 1);
         let verified = authkit.verified();
@@ -1914,14 +1950,13 @@ mod v1_api {
         assert_eq!(closures.len(), 2, "{closures:?}");
 
         let forged = authkit.capability(&hub_client::P256Key::generate().thumbprint(), &read(&manifest.id()), 600);
-        let request = v1::RunRequest { id: "private-3".into(), after: 0, spec: Some(spec(forged)) };
-        let refused = client.run(authorized(request, &all)).await;
+        let request = RunRequest { id: "private-3".into(), after: 0, spec: Some(spec(forged)) };
+        let refused = run_events(&client, &all, request).await;
         let refused = match refused {
             Err(status) => status,
-            Ok(stream) => collect(stream.into_inner()).await.unwrap_err(),
+            Ok(stream) => collect(stream).await.unwrap_err(),
         };
-        let code = refused.metadata().get("cozy-error-code").and_then(|v| v.to_str().ok());
-        assert_eq!(code, Some("hub_access_invalid"), "{refused:?}");
+        assert_eq!(refused.code(), Some("hub_access_invalid"), "{refused:?}");
         let _ = fs::remove_dir_all(source);
     }
 
@@ -1936,13 +1971,13 @@ mod v1_api {
         let machine = Machine::start().await;
         let ops = serde_json::json!([{"type": "tensorhub_model_publish", "model": "acme/tiny"}]);
         let capability = authkit.capability(&leaf_jkt(&machine), &ops, 600);
-        let mut client = client(&machine).await;
+        let client = client(&machine);
         let all = cap(Grant {
             action: MACHINE.into(),
             ..Default::default()
         });
         let spec = v1::RunSpec {
-            kind: v1::RunKind::Warm as i32,
+            kind: v1::RunKind::Warm,
             models: vec![v1::ModelChoice {
                 parameter: "model".into(),
                 source: "hf://hf-internal-testing/tiny-sdxl-pipe@20594cbc343cfcfe447af5c87cdaf6c436b453f2/unet/diffusion_pytorch_model.safetensors".into(),
@@ -1959,17 +1994,17 @@ mod v1_api {
             owner: "alice".into(),
             ..Default::default()
         };
-        let request = v1::RunRequest {
+        let request = RunRequest {
             id: "upload-1".into(),
             after: 0,
             spec: Some(spec),
         };
-        let events = collect(client.run(authorized(request, &all)).await.unwrap().into_inner())
+        let events = collect(run_events(&client, &all, request).await.unwrap())
             .await
             .unwrap();
         let done = outcome(&events);
         assert_eq!(done.status, "succeeded", "{done:?}");
-        let result: serde_json::Value = serde_json::from_slice(&done.result).unwrap();
+        let result: serde_json::Value = json(&done.result);
         let model = &result["models"][0];
         assert_eq!(model["published"]["destination"], "acme/tiny");
         assert_eq!(model["published"]["checkpoint"], model["manifest"]);
@@ -1991,7 +2026,7 @@ mod v1_api {
     #[ignore = "real network: huggingface.co"]
     async fn a_written_file_is_made_and_kept_under_a_local_alias() {
         let machine = Machine::start().await;
-        let mut client = client(&machine).await;
+        let client = client(&machine);
         let all = cap(Grant {
             action: MACHINE.into(),
             ..Default::default()
@@ -2003,12 +2038,12 @@ mod v1_api {
         assert!(file.status.success());
         let sha256 = tensorfs_core::sha256::hex_digest(&file.stdout);
         let length = file.stdout.len() as u64;
-        let held = write(&mut client, &all, &format!("sha256:{sha256}"), length, 0, &file.stdout)
+        let held = write(&client, &all, &format!("sha256:{sha256}"), length, 0, &file.stdout)
             .await
             .unwrap();
         assert_eq!(held, length);
         let spec = v1::RunSpec {
-            kind: v1::RunKind::Warm as i32,
+            kind: v1::RunKind::Warm,
             models: vec![v1::ModelChoice {
                 parameter: "model".into(),
                 source: format!("object://sha256:{sha256}/unet.safetensors"),
@@ -2018,17 +2053,17 @@ mod v1_api {
             owner: "alice".into(),
             ..Default::default()
         };
-        let request = v1::RunRequest {
+        let request = RunRequest {
             id: "keep-file".into(),
             after: 0,
             spec: Some(spec),
         };
-        let events = collect(client.run(authorized(request, &all)).await.unwrap().into_inner())
+        let events = collect(run_events(&client, &all, request).await.unwrap())
             .await
             .unwrap();
         let done = outcome(&events);
         assert_eq!(done.status, "succeeded", "{done:?}");
-        let result: serde_json::Value = serde_json::from_slice(&done.result).unwrap();
+        let result: serde_json::Value = json(&done.result);
         let model = &result["models"][0];
         assert_eq!(model["published"]["destination"], "local/unet", "{result}");
         let store = tensorfs_core::store::Store::open(&machine.store()).unwrap();
@@ -2042,31 +2077,31 @@ mod v1_api {
     #[tokio::test]
     async fn a_written_input_tree_reaches_the_callable_as_a_directory() {
         let (machine, tools) = installing_machine().await;
-        let mut client = client(&machine).await;
+        let client = client(&machine);
         let all = cap(Grant {
             action: MACHINE.into(),
             ..Default::default()
         });
-        let manifest = write_package(&mut client, &all, "cpu_tree", "local/tensord-cpu-tree").await;
+        let manifest = write_package(&client, &all, "cpu_tree", "local/tensord-cpu-tree").await;
         let files: [(&str, &[u8]); 2] = [("a.txt", b"alpha"), ("nested/b.bin", b"\x00\x01beta")];
         let mut entries = vec![];
         for (path, body) in files {
             let digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(body));
             let length = body.len() as u64;
-            assert_eq!(write(&mut client, &all, &digest, length, 0, body).await.unwrap(), length);
+            assert_eq!(write(&client, &all, &digest, length, 0, body).await.unwrap(), length);
             entries.push(serde_json::json!({"kind": "file", "path": path,
                 "blob": {"sha256": digest.trim_start_matches("sha256:"), "length": length}}));
         }
         let tree = serde_json::to_vec(&serde_json::json!({"entries": entries})).unwrap();
         let tree_digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&tree));
         let size = tree.len() as u64;
-        assert_eq!(write(&mut client, &all, &tree_digest, size, 0, &tree).await.unwrap(), size);
+        assert_eq!(write(&client, &all, &tree_digest, size, 0, &tree).await.unwrap(), size);
         let spec = v1::RunSpec {
-            kind: v1::RunKind::Call as i32,
-            source: Some(v1::run_spec::Source::Local(v1::LocalSource { manifest })),
+            kind: v1::RunKind::Call,
+            source: Some(v1::Source::Local(v1::LocalSource { manifest })),
             entrypoint: "count".into(),
             // As `cozy run --asset data=<dir>` sends it: the payload names the tree's manifest.
-            payload: serde_json::to_vec(&serde_json::json!({ "data": tree_digest })).unwrap(),
+            payload: raw(&serde_json::json!({ "data": tree_digest })),
             inputs: vec![v1::InputFile {
                 field: "data".into(),
                 digest: tree_digest.clone(),
@@ -2077,17 +2112,17 @@ mod v1_api {
             owner: "alice".into(),
             ..Default::default()
         };
-        let request = v1::RunRequest {
+        let request = RunRequest {
             id: "tree".into(),
             after: 0,
             spec: Some(spec),
         };
-        let events = collect(client.run(authorized(request, &all)).await.unwrap().into_inner())
+        let events = collect(run_events(&client, &all, request).await.unwrap())
             .await
             .unwrap();
         let done = outcome(&events);
         assert_eq!(done.status, "succeeded", "{done:?}");
-        let result: serde_json::Value = serde_json::from_slice(&done.result).unwrap();
+        let result: serde_json::Value = json(&done.result);
         assert_eq!(result["files"], serde_json::json!(["a.txt", "nested/b.bin"]), "{result}");
         let mut whole = b"alpha".to_vec();
         whole.extend_from_slice(b"\x00\x01beta");
@@ -2097,6 +2132,7 @@ mod v1_api {
 
     /// An executor holds no descriptor the machine did not hand it: not one the machine itself
     /// inherited (as a service inherits its parent's readiness, key and credential pipes).
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn an_executor_inherits_no_descriptor_the_machine_did_not_hand_it() {
         use std::os::fd::AsRawFd;
@@ -2112,31 +2148,31 @@ mod v1_api {
             .filter_map(|e| fs::read_link(e.unwrap().path()).ok())
             .any(|t| t.to_string_lossy() == target);
         assert!(held, "the machine did not inherit the planted pipe {target}");
-        let mut client = client(&machine).await;
+        let client = client(&machine);
         let all = cap(Grant {
             action: MACHINE.into(),
             ..Default::default()
         });
-        let manifest = write_package(&mut client, &all, "cpu_tree", "local/tensord-cpu-tree").await;
+        let manifest = write_package(&client, &all, "cpu_tree", "local/tensord-cpu-tree").await;
         let spec = v1::RunSpec {
-            kind: v1::RunKind::Call as i32,
-            source: Some(v1::run_spec::Source::Local(v1::LocalSource { manifest })),
+            kind: v1::RunKind::Call,
+            source: Some(v1::Source::Local(v1::LocalSource { manifest })),
             entrypoint: "descriptors".into(),
-            payload: b"{}".to_vec(),
+            payload: v1::Json::parse("{}").ok(),
             owner: "alice".into(),
             ..Default::default()
         };
-        let request = v1::RunRequest {
+        let request = RunRequest {
             id: "descriptors".into(),
             after: 0,
             spec: Some(spec),
         };
-        let events = collect(client.run(authorized(request, &all)).await.unwrap().into_inner())
+        let events = collect(run_events(&client, &all, request).await.unwrap())
             .await
             .unwrap();
         let done = outcome(&events);
         assert_eq!(done.status, "succeeded", "{done:?}");
-        let result: serde_json::Value = serde_json::from_slice(&done.result).unwrap();
+        let result: serde_json::Value = json(&done.result);
         let targets = result["targets"].as_array().unwrap();
         assert!(!targets.is_empty(), "{result}");
         assert!(
@@ -2152,33 +2188,33 @@ mod v1_api {
     #[tokio::test]
     async fn a_childs_tree_is_handed_on_and_returned_as_the_jobs_output() {
         let (machine, tools) = installing_machine().await;
-        let mut client = client(&machine).await;
+        let client = client(&machine);
         let all = cap(Grant {
             action: MACHINE.into(),
             ..Default::default()
         });
-        let manifest = write_package(&mut client, &all, "cpu_tree", "local/tensord-cpu-tree").await;
+        let manifest = write_package(&client, &all, "cpu_tree", "local/tensord-cpu-tree").await;
         let spec = v1::RunSpec {
-            kind: v1::RunKind::Call as i32,
-            source: Some(v1::run_spec::Source::Local(v1::LocalSource { manifest })),
+            kind: v1::RunKind::Call,
+            source: Some(v1::Source::Local(v1::LocalSource { manifest })),
             entrypoint: "survey".into(),
-            payload: serde_json::to_vec(&serde_json::json!({ "text": "verified" })).unwrap(),
+            payload: raw(&serde_json::json!({ "text": "verified" })),
             owner: "alice".into(),
             ..Default::default()
         };
-        let request = v1::RunRequest { id: "survey".into(), after: 0, spec: Some(spec) };
-        let events = collect(client.run(authorized(request, &all)).await.unwrap().into_inner())
+        let request = RunRequest { id: "survey".into(), after: 0, spec: Some(spec) };
+        let events = collect(run_events(&client, &all, request).await.unwrap())
             .await
             .unwrap();
         let done = outcome(&events);
         assert_eq!(done.status, "succeeded", "{done:?}");
-        let result: serde_json::Value = serde_json::from_slice(&done.result).unwrap();
+        let result: serde_json::Value = json(&done.result);
         assert_eq!(result["files"], serde_json::json!(["b.txt", "empty.txt", "nested/a.txt"]), "{result}");
         let product = done.outputs.iter().find(|p| p.output == "tree").expect("the tree is an output");
         assert_eq!(product.media_type, "application/vnd.cozy.tree-manifest");
         assert_eq!(result["tree"]["digest"], product.digest, "{result}");
-        let target = |member: &str| v1::ReadRequest {
-            target: Some(v1::read_request::Target::Output(v1::OutputTarget {
+        let target = |member: &str| ReadRequest {
+            target: Some(Target::Output(v1::OutputTarget {
                 run: "survey".into(),
                 output: "tree".into(),
                 index: 0,
@@ -2186,22 +2222,22 @@ mod v1_api {
             })),
             ..Default::default()
         };
-        let (meta, tree) = read(&mut client, &all, target("")).await.unwrap();
+        let (meta, tree) = read(&client, &all, target("")).await.unwrap();
         assert_eq!(meta.digest, product.digest);
         let tree: serde_json::Value = serde_json::from_slice(&tree).unwrap();
         let paths: Vec<_> = tree["entries"].as_array().unwrap().iter().map(|e| e["path"].clone()).collect();
         assert_eq!(paths, ["b.txt", "empty.txt", "nested/a.txt"], "{tree}");
-        let (meta, member) = read(&mut client, &all, target("nested/a.txt")).await.unwrap();
+        let (meta, member) = read(&client, &all, target("nested/a.txt")).await.unwrap();
         assert_eq!(member, b"verified");
         assert_eq!(meta.digest, format!("sha256:{}", tensorfs_core::sha256::hex_digest(b"verified")));
-        assert_eq!(read(&mut client, &all, target("empty.txt")).await.unwrap().1, b"");
-        assert_eq!(read(&mut client, &all, target("absent")).await.unwrap_err().code(), tonic::Code::NotFound);
+        assert_eq!(read(&client, &all, target("empty.txt")).await.unwrap().1, b"");
+        assert_eq!(read(&client, &all, target("absent")).await.unwrap_err().status(), Some(404));
         let _ = fs::remove_dir_all(tools);
     }
 
     fn outcome(events: &[v1::RunEvent]) -> v1::Outcome {
         match &events.last().unwrap().event {
-            Some(v1::run_event::Event::Outcome(outcome)) => outcome.clone(),
+            v1::Event::Outcome(outcome) => outcome.clone(),
             _ => panic!("{events:?}"),
         }
     }
@@ -2214,20 +2250,20 @@ mod v1_api {
     #[tokio::test]
     async fn a_warm_install_of_local_code_returns_its_interface() {
         let (machine, tools) = installing_machine().await;
-        let mut client = client(&machine).await;
+        let client = client(&machine);
         let all = cap(Grant { action: MACHINE.into(), ..Default::default() });
-        let mut runner = client.clone();
-        let mut installed = async |id: &str, manifest: &str| -> serde_json::Value {
+        let runner = client.clone();
+        let installed = async |id: &str, manifest: &str| -> serde_json::Value {
             let spec = v1::RunSpec {
-                kind: v1::RunKind::Warm as i32,
-                source: Some(v1::run_spec::Source::Local(v1::LocalSource { manifest: manifest.into() })),
+                kind: v1::RunKind::Warm,
+                source: Some(v1::Source::Local(v1::LocalSource { manifest: manifest.into() })),
                 owner: "alice".into(),
                 ..Default::default()
             };
-            let request = authorized(v1::RunRequest { id: id.into(), after: 0, spec: Some(spec) }, &all);
-            let done = outcome(&collect(runner.run(request).await.unwrap().into_inner()).await.unwrap());
+            let request = authorized(RunRequest { id: id.into(), after: 0, spec: Some(spec) }, &all);
+            let done = outcome(&collect(run_as(&runner, request).await.unwrap()).await.unwrap());
             assert_eq!(done.status, "succeeded", "{done:?}");
-            serde_json::from_slice(&done.result).unwrap()
+            json(&done.result)
         };
         let names = |result: &serde_json::Value| -> Vec<String> {
             let rows = result["interface"]["entrypoints"].as_array().unwrap_or_else(|| panic!("{result}"));
@@ -2238,7 +2274,7 @@ mod v1_api {
         let files = ["pyproject.toml", "package.toml", "cpu_memo/__init__.py"];
         let dir = project("cpu_memo", &files);
         let package = "local/tensord-cpu-memo";
-        let manifest = write_live(&mut client, &all, &dir, package, &files).await;
+        let manifest = write_live(&client, &all, &dir, package, &files).await;
         let first = installed("dir-1", &manifest).await;
         assert_eq!((first["package"].as_str(), first["release"].as_str()), (Some(package), Some("0.1.0")), "{first}");
         assert!(names(&first).contains(&"measure".to_string()), "{first}");
@@ -2247,7 +2283,7 @@ mod v1_api {
         let code = dir.join("cpu_memo/__init__.py");
         let added = "\n\nasync def tally(ctx: Context, payload: Probe) -> Measured:\n    return Measured(square=0)\n\n\napp.entrypoint(tally, accelerator=False)\n";
         fs::write(&code, fs::read_to_string(&code).unwrap() + added).unwrap();
-        let edited = write_live(&mut client, &all, &dir, package, &files).await;
+        let edited = write_live(&client, &all, &dir, package, &files).await;
         assert_ne!(edited, manifest);
         let second = installed("dir-2", &edited).await;
         assert!(names(&second).contains(&"tally".to_string()) && !names(&first).contains(&"tally".to_string()), "{second}");
@@ -2273,11 +2309,11 @@ mod v1_api {
         }
         let files: Vec<&str> = generated.iter().map(|(name, _)| *name).collect();
         let package = "local/cozy-script-0123456789ab";
-        let manifest = write_live(&mut client, &all, &script, package, &files).await;
+        let manifest = write_live(&client, &all, &script, package, &files).await;
         let third = installed("script-1", &manifest).await;
         assert_eq!(names(&third), ["main"], "{third}");
         fs::write(script.join("cozy_script.py"), generated[3].1.replace("-> int:\n    return 1", "-> str:\n    return \"one\"")).unwrap();
-        let edited = write_live(&mut client, &all, &script, package, &files).await;
+        let edited = write_live(&client, &all, &script, package, &files).await;
         let fourth = installed("script-2", &edited).await;
         assert_eq!(names(&fourth), ["main"], "{fourth}");
         assert_ne!(third["interface"], fourth["interface"], "the edited return type");
@@ -2291,43 +2327,40 @@ mod v1_api {
     #[tokio::test]
     async fn a_memoized_call_is_answered_from_this_machines_memo() {
         let (machine, tools) = installing_machine().await;
-        let mut client = client(&machine).await;
+        let client = client(&machine);
         let all = cap(Grant {
             action: MACHINE.into(),
             ..Default::default()
         });
         let manifest =
-            write_package(&mut client, &all, "cpu_memo", "local/tensord-cpu-memo").await;
+            write_package(&client, &all, "cpu_memo", "local/tensord-cpu-memo").await;
         let counter = machine.root.join("measured");
         let survey = |id: &str, values: &[i64]| {
             let spec = v1::RunSpec {
-                kind: v1::RunKind::Call as i32,
-                source: Some(v1::run_spec::Source::Local(v1::LocalSource {
+                kind: v1::RunKind::Call,
+                source: Some(v1::Source::Local(v1::LocalSource {
                     manifest: manifest.clone(),
                 })),
                 entrypoint: "survey".into(),
-                payload: serde_json::to_vec(
-                    &serde_json::json!({"values": values, "counter": counter}),
-                )
-                .unwrap(),
+                payload: raw(&serde_json::json!({"values": values, "counter": counter})),
                 owner: "alice".into(),
                 ..Default::default()
             };
-            authorized(v1::RunRequest { id: id.into(), after: 0, spec: Some(spec) }, &all)
+            authorized(RunRequest { id: id.into(), after: 0, spec: Some(spec) }, &all)
         };
         let measured = || std::fs::read_to_string(&counter).unwrap().parse::<u32>().unwrap();
         let squares = |events: &[v1::RunEvent]| {
             let done = outcome(events);
             assert_eq!(done.status, "succeeded", "{done:?}");
-            serde_json::from_slice::<serde_json::Value>(&done.result).unwrap()["squares"].clone()
+            json(&done.result)["squares"].clone()
         };
-        let first = collect(client.run(survey("survey-1", &[3, 4])).await.unwrap().into_inner())
+        let first = collect(run_as(&client, survey("survey-1", &[3, 4])).await.unwrap())
             .await
             .unwrap();
         assert_eq!(squares(&first), serde_json::json!([9, 16]));
         assert_eq!(measured(), 2);
         // The call for 3 is answered from the machine's memo; the one for 5 runs.
-        let second = collect(client.run(survey("survey-2", &[3, 5])).await.unwrap().into_inner())
+        let second = collect(run_as(&client, survey("survey-2", &[3, 5])).await.unwrap())
             .await
             .unwrap();
         assert_eq!(squares(&second), serde_json::json!([9, 25]));
@@ -2338,7 +2371,7 @@ mod v1_api {
             events
                 .iter()
                 .filter_map(|e| match &e.event {
-                    Some(v1::run_event::Event::Call(call)) => Some((call.memoized, call.computation_digest.clone())),
+                    v1::Event::Call(call) => Some((call.memoized, call.computation_digest.clone())),
                     _ => None,
                 })
                 .collect()
@@ -2357,37 +2390,37 @@ mod v1_api {
     #[tokio::test]
     async fn a_memoized_function_run_directly_is_answered_from_this_machines_memo() {
         let (machine, tools) = installing_machine().await;
-        let mut client = client(&machine).await;
+        let client = client(&machine);
         let all = cap(Grant { action: MACHINE.into(), ..Default::default() });
         let names = ["pyproject.toml", "package.toml", "cpu_memo/__init__.py"];
         let project = project("cpu_memo", &names);
         let package = "local/tensord-cpu-memo";
-        let mut manifest = write_live(&mut client, &all, &project, package, &names).await;
+        let mut manifest = write_live(&client, &all, &project, package, &names).await;
         let (counter, noted) = (machine.root.join("measured"), machine.root.join("noted"));
-        let mut runner = client.clone();
-        let mut run = async |id: &str, manifest: &str, kind: v1::RunKind, entrypoint: &str, payload: serde_json::Value| {
+        let runner = client.clone();
+        let run = async |id: &str, manifest: &str, kind: v1::RunKind, entrypoint: &str, payload: serde_json::Value| {
             let spec = v1::RunSpec {
-                kind: kind as i32,
-                source: Some(v1::run_spec::Source::Local(v1::LocalSource { manifest: manifest.into() })),
+                kind,
+                source: Some(v1::Source::Local(v1::LocalSource { manifest: manifest.into() })),
                 entrypoint: entrypoint.into(),
-                payload: serde_json::to_vec(&payload).unwrap(),
+                payload: raw(&payload),
                 owner: "alice".into(),
                 ..Default::default()
             };
-            let request = authorized(v1::RunRequest { id: id.into(), after: 0, spec: Some(spec) }, &all);
-            collect(runner.run(request).await.unwrap().into_inner()).await.unwrap()
+            let request = authorized(RunRequest { id: id.into(), after: 0, spec: Some(spec) }, &all);
+            collect(run_as(&runner, request).await.unwrap()).await.unwrap()
         };
         let probe = |value: i64, counter: &Path| serde_json::json!({"payload": {"value": value, "counter": counter}});
         let count = |path: &Path| fs::read_to_string(path).unwrap();
         let ran = |events: &[v1::RunEvent]| {
-            events.iter().any(|e| matches!(&e.event, Some(v1::run_event::Event::State(s)) if s.state == "running"))
+            events.iter().any(|e| matches!(&e.event, v1::Event::State(s) if s.state == "running"))
         };
         let entrypoint = v1::RunKind::Call;
         let first = run("direct-1", &manifest, entrypoint, "measure", probe(3, &counter)).await;
         let computed = outcome(&first);
         assert_eq!(computed.status, "succeeded", "{computed:?}");
         assert!(!computed.memoized && computed.computation_digest.starts_with("sha256:"), "{computed:?}");
-        assert_eq!(serde_json::from_slice::<serde_json::Value>(&computed.result).unwrap(), serde_json::json!({"square": 9}));
+        assert_eq!(json(&computed.result), serde_json::json!({"square": 9}));
         assert_eq!(count(&counter), "1");
         // The same request: answered from the memo, nothing started.
         let second = run("direct-2", &manifest, entrypoint, "measure", probe(3, &counter)).await;
@@ -2409,8 +2442,8 @@ mod v1_api {
             let done = outcome(&events);
             assert_eq!(done.status, "succeeded", "{done:?}");
             let target = v1::OutputTarget { run: id.into(), output: "file".into(), ..Default::default() };
-            let request = v1::ReadRequest { target: Some(v1::read_request::Target::Output(target)), ..Default::default() };
-            notes.push((done.memoized, read(&mut client, &all, request).await.unwrap().1));
+            let request = ReadRequest { target: Some(Target::Output(target)), ..Default::default() };
+            notes.push((done.memoized, read(&client, &all, request).await.unwrap().1));
         }
         assert_eq!(notes, [(false, b"note 5".to_vec()), (true, b"note 5".to_vec())]);
         assert_eq!(count(&noted), "1", "the answered job ran");
@@ -2431,7 +2464,7 @@ mod v1_api {
         // An edit of the package is another computation: it runs, then its own memo answers.
         let source = project.join("cpu_memo/__init__.py");
         fs::write(&source, fs::read_to_string(&source).unwrap() + "\nEDITED = True\n").unwrap();
-        manifest = write_live(&mut client, &all, &project, package, &names).await;
+        manifest = write_live(&client, &all, &project, package, &names).await;
         let edited = outcome(&run("edited-1", &manifest, entrypoint, "measure", probe(3, &counter)).await);
         assert!(!edited.memoized && edited.computation_digest != computed.computation_digest, "{edited:?}");
         assert_eq!(count(&counter), "3");
@@ -2448,24 +2481,24 @@ mod v1_api {
     #[tokio::test]
     async fn a_call_is_memoized_only_when_it_gives_the_seed_its_author_requires() {
         let (machine, tools) = installing_machine().await;
-        let mut client = client(&machine).await;
+        let client = client(&machine);
         let all = cap(Grant { action: MACHINE.into(), ..Default::default() });
         let names = ["pyproject.toml", "package.toml", "cpu_seeded/__init__.py"];
         let project = project("cpu_seeded", &names);
-        let manifest = write_live(&mut client, &all, &project, "local/tensord-cpu-seeded", &names).await;
+        let manifest = write_live(&client, &all, &project, "local/tensord-cpu-seeded", &names).await;
         let counter = machine.root.join("painted");
-        let mut runner = client.clone();
-        let mut run = async |id: &str, kind: v1::RunKind, entrypoint: &str, payload: serde_json::Value| {
+        let runner = client.clone();
+        let run = async |id: &str, kind: v1::RunKind, entrypoint: &str, payload: serde_json::Value| {
             let spec = v1::RunSpec {
-                kind: kind as i32,
-                source: Some(v1::run_spec::Source::Local(v1::LocalSource { manifest: manifest.clone() })),
+                kind,
+                source: Some(v1::Source::Local(v1::LocalSource { manifest: manifest.clone() })),
                 entrypoint: entrypoint.into(),
-                payload: serde_json::to_vec(&payload).unwrap(),
+                payload: raw(&payload),
                 owner: "alice".into(),
                 ..Default::default()
             };
-            let request = authorized(v1::RunRequest { id: id.into(), after: 0, spec: Some(spec) }, &all);
-            collect(runner.run(request).await.unwrap().into_inner()).await.unwrap()
+            let request = authorized(RunRequest { id: id.into(), after: 0, spec: Some(spec) }, &all);
+            collect(run_as(&runner, request).await.unwrap()).await.unwrap()
         };
         let count = || fs::read_to_string(&counter).unwrap();
         let paint = |prompt: &str, seed: Option<u64>| {
@@ -2493,7 +2526,7 @@ mod v1_api {
             let done = outcome(&run(id, entrypoint, "paint", paint("fox", None)).await);
             assert_eq!(done.status, "succeeded", "{done:?}");
             assert!(!done.memoized && done.computation_digest.is_empty() && done.unmemoized == "seed not given", "{done:?}");
-            seeds.push(serde_json::from_slice::<serde_json::Value>(&done.result).unwrap()["seed"].clone());
+            seeds.push(json(&done.result)["seed"].clone());
         }
         assert_ne!(seeds[0], seeds[1], "each unseeded run drew its own seed");
         assert_eq!(count(), "4");
@@ -2502,7 +2535,7 @@ mod v1_api {
             events
                 .iter()
                 .filter_map(|e| match &e.event {
-                    Some(v1::run_event::Event::Call(call)) => Some((call.memoized, call.unmemoized.clone())),
+                    v1::Event::Call(call) => Some((call.memoized, call.unmemoized.clone())),
                     _ => None,
                 })
                 .collect()
@@ -2528,7 +2561,7 @@ mod v1_api {
     #[tokio::test]
     async fn a_job_calls_a_package_its_environment_depends_on() {
         let (machine, tools) = installing_machine().await;
-        let mut client = client(&machine).await;
+        let client = client(&machine);
         let all = cap(Grant {
             action: MACHINE.into(),
             ..Default::default()
@@ -2547,7 +2580,7 @@ mod v1_api {
             .find(|p| p.extension().is_some_and(|e| e == "whl")).unwrap();
         let bytes = fs::read(&wheel).unwrap();
         let wheel_digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&bytes));
-        write(&mut client, &all, &wheel_digest, bytes.len() as u64, 0, &bytes).await.unwrap();
+        write(&client, &all, &wheel_digest, bytes.len() as u64, 0, &bytes).await.unwrap();
         let mut archive = tar::Builder::new(Vec::new());
         for name in ["pyproject.toml", "package.toml", "cpu_caller/__init__.py"] {
             archive
@@ -2556,7 +2589,7 @@ mod v1_api {
         }
         let source = archive.into_inner().unwrap();
         let digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&source));
-        write(&mut client, &all, &digest, source.len() as u64, 0, &source).await.unwrap();
+        write(&client, &all, &digest, source.len() as u64, 0, &source).await.unwrap();
         let manifest = serde_json::to_vec(&serde_json::json!({
             "package": "local/tensord-cpu-caller", "release": "0.1.0", "python_version": "3.12",
             "source": {"digest": digest, "length": source.len()},
@@ -2564,33 +2597,32 @@ mod v1_api {
             "callees": {"tensord-cpu-memo": "local/tensord-cpu-memo"}}))
         .unwrap();
         let manifest_digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&manifest));
-        write(&mut client, &all, &manifest_digest, manifest.len() as u64, 0, &manifest).await.unwrap();
+        write(&client, &all, &manifest_digest, manifest.len() as u64, 0, &manifest).await.unwrap();
         let counter = machine.root.join("measured");
         let spec = v1::RunSpec {
-            kind: v1::RunKind::Call as i32,
-            source: Some(v1::run_spec::Source::Local(v1::LocalSource {
+            kind: v1::RunKind::Call,
+            source: Some(v1::Source::Local(v1::LocalSource {
                 manifest: manifest_digest,
             })),
             entrypoint: "relay".into(),
-            payload: serde_json::to_vec(&serde_json::json!({"values": [3, 4], "counter": counter}))
-                .unwrap(),
+            payload: raw(&serde_json::json!({"values": [3, 4], "counter": counter})),
             owner: "alice".into(),
             ..Default::default()
         };
         let request = authorized(
-            v1::RunRequest {
+            RunRequest {
                 id: "relay-1".into(),
                 after: 0,
                 spec: Some(spec.clone()),
             },
             &all,
         );
-        let events = collect(client.run(request).await.unwrap().into_inner())
+        let events = collect(run_as(&client, request).await.unwrap())
             .await
             .unwrap();
         let done = outcome(&events);
         assert_eq!(done.status, "succeeded", "{done:?}");
-        let result: serde_json::Value = serde_json::from_slice(&done.result).unwrap();
+        let result: serde_json::Value = json(&done.result);
         assert_eq!(result["squares"], serde_json::json!([9, 16]));
         assert_eq!(result["greeting"], "squared squared", "{result}");
         assert_eq!(fs::read_to_string(&counter).unwrap(), "2");
@@ -2598,7 +2630,7 @@ mod v1_api {
         let calls: Vec<_> = events
             .iter()
             .filter_map(|e| match &e.event {
-                Some(v1::run_event::Event::Call(call)) => Some(call.function.clone()),
+                v1::Event::Call(call) => Some(call.function.clone()),
                 _ => None,
             })
             .collect();
@@ -2607,7 +2639,7 @@ mod v1_api {
         let logs: Vec<_> = events
             .iter()
             .filter_map(|e| match &e.event {
-                Some(v1::run_event::Event::Log(line)) => Some((line.level.clone(), line.text.clone())),
+                v1::Event::Log(line) => Some((line.level.clone(), line.text.clone())),
                 _ => None,
             })
             .collect();
@@ -2623,16 +2655,16 @@ mod v1_api {
         // returns as its own output the moment it exists, and returns them all at the end.
         let mut sitting = spec.clone();
         sitting.entrypoint = "portrait".into();
-        sitting.payload = serde_json::to_vec(&serde_json::json!({"names": ["Lighthouse", "Keeper"]})).unwrap();
-        let events = collect(client.run(authorized(v1::RunRequest {
+        sitting.payload = raw(&serde_json::json!({"names": ["Lighthouse", "Keeper"]}));
+        let events = collect(run_events(&client, &all, RunRequest {
             id: "portrait-1".into(), after: 0, spec: Some(sitting),
-        }, &all)).await.unwrap().into_inner()).await.unwrap();
+        }).await.unwrap()).await.unwrap();
         let done = outcome(&events);
         assert_eq!(done.status, "succeeded", "{done:?}");
         let calls: Vec<_> = events
             .iter()
             .filter_map(|e| match &e.event {
-                Some(v1::run_event::Event::Call(call)) => Some(call.function.clone()),
+                v1::Event::Call(call) => Some(call.function.clone()),
                 _ => None,
             })
             .collect();
@@ -2640,19 +2672,19 @@ mod v1_api {
         let shown: Vec<_> = events
             .iter()
             .filter_map(|e| match &e.event {
-                Some(v1::run_event::Event::Product(p)) if p.output == "references" => Some(p.label.clone()),
+                v1::Event::Product(p) if p.output == "references" => Some(p.label.clone()),
                 _ => None,
             })
             .collect();
         assert_eq!(shown, ["Reference: Lighthouse", "Reference: Keeper"], "{events:?}");
-        let returned = String::from_utf8_lossy(&done.result).into_owned();
+        let returned = done.result.as_ref().map(|r| r.get().to_string()).unwrap_or_default();
         let mut seen = Vec::new();
         for index in 1..=2u32 {
             let (_, image) = read(
-                &mut client,
+                &client,
                 &all,
-                v1::ReadRequest {
-                    target: Some(v1::read_request::Target::Output(v1::OutputTarget {
+                ReadRequest {
+                    target: Some(Target::Output(v1::OutputTarget {
                         run: "portrait-1".into(),
                         output: "references".into(),
                         index,
@@ -2673,21 +2705,21 @@ mod v1_api {
         // another package's model with the Runtime's `quantize`, as a child run of its own.
         let mut requantize = spec.clone();
         requantize.entrypoint = "requantize".into();
-        requantize.payload = b"{}".to_vec();
-        let events = collect(client.run(authorized(v1::RunRequest {
+        requantize.payload = v1::Json::parse("{}").ok();
+        let events = collect(run_events(&client, &all, RunRequest {
             id: "requantize-1".into(), after: 0, spec: Some(requantize),
-        }, &all)).await.unwrap().into_inner()).await.unwrap();
+        }).await.unwrap()).await.unwrap();
         let done = outcome(&events);
         assert_eq!(done.status, "succeeded", "{done:?}");
         let calls: Vec<_> = events
             .iter()
             .filter_map(|e| match &e.event {
-                Some(v1::run_event::Event::Call(call)) => Some(call.function.clone()),
+                v1::Event::Call(call) => Some(call.function.clone()),
                 _ => None,
             })
             .collect();
         assert_eq!(calls, ["produce", "quantize"], "{events:?}");
-        let result: serde_json::Value = serde_json::from_slice(&done.result).unwrap();
+        let result: serde_json::Value = json(&done.result);
         let (source, quantized) = (result["source"].as_str().unwrap(), result["result"].as_str().unwrap());
         assert!(source.starts_with("sha256:") && quantized.starts_with("sha256:"), "{result}");
         assert_ne!(source, quantized, "quantize wrote a model of its own");
@@ -2698,16 +2730,16 @@ mod v1_api {
         for id in ["weigh-1", "weigh-2"] {
             let mut spec = spec.clone();
             spec.entrypoint = "derive_and_weigh".into();
-            spec.payload = serde_json::to_vec(&serde_json::json!({"values": [], "counter": weighed})).unwrap();
-            let events = collect(client.run(authorized(v1::RunRequest { id: id.into(), after: 0, spec: Some(spec) }, &all))
-                .await.unwrap().into_inner()).await.unwrap();
+            spec.payload = raw(&serde_json::json!({"values": [], "counter": weighed}));
+            let events = collect(run_events(&client, &all, RunRequest { id: id.into(), after: 0, spec: Some(spec) })
+                .await.unwrap()).await.unwrap();
             let done = outcome(&events);
             assert_eq!(done.status, "succeeded", "{done:?}");
             let calls: Vec<_> = events.iter().filter_map(|e| match &e.event {
-                Some(v1::run_event::Event::Call(call)) => Some((call.function.clone(), call.memoized)),
+                v1::Event::Call(call) => Some((call.function.clone(), call.memoized)),
                 _ => None,
             }).collect();
-            derived.push((serde_json::from_slice::<serde_json::Value>(&done.result).unwrap(), calls));
+            derived.push((json(&done.result), calls));
         }
         assert_ne!(derived[0].0["producer"], derived[1].0["producer"], "{derived:?}");
         assert_eq!(derived[0].0["length"], derived[1].0["length"], "{derived:?}");
@@ -2719,18 +2751,18 @@ mod v1_api {
         let annotate = |id: &str| {
             let mut spec = spec.clone();
             spec.entrypoint = "annotate".into();
-            spec.payload = serde_json::to_vec(&serde_json::json!({"values": [5, 6], "counter": noted})).unwrap();
-            authorized(v1::RunRequest { id: id.into(), after: 0, spec: Some(spec) }, &all)
+            spec.payload = raw(&serde_json::json!({"values": [5, 6], "counter": noted}));
+            authorized(RunRequest { id: id.into(), after: 0, spec: Some(spec) }, &all)
         };
         let mut notes = vec![];
         for id in ["annotate-1", "annotate-2"] {
-            let events = collect(client.run(annotate(id)).await.unwrap().into_inner()).await.unwrap();
+            let events = collect(run_as(&client, annotate(id)).await.unwrap()).await.unwrap();
             assert_eq!(outcome(&events).status, "succeeded", "{events:?}");
             let mut files = vec![];
             for index in 1..=2u32 {
                 let target = v1::OutputTarget { run: id.into(), output: "files".into(), index, ..Default::default() };
-                let request = v1::ReadRequest { target: Some(v1::read_request::Target::Output(target)), ..Default::default() };
-                files.push(read(&mut client, &all, request).await.unwrap().1);
+                let request = ReadRequest { target: Some(Target::Output(target)), ..Default::default() };
+                files.push(read(&client, &all, request).await.unwrap().1);
             }
             notes.push(files);
         }
@@ -2747,36 +2779,36 @@ mod v1_api {
             })
             .expect("the note's bytes are in the store");
         fs::remove_file(blob).unwrap();
-        let events = collect(client.run(annotate("annotate-3")).await.unwrap().into_inner()).await.unwrap();
+        let events = collect(run_as(&client, annotate("annotate-3")).await.unwrap()).await.unwrap();
         assert_eq!(outcome(&events).status, "succeeded", "{events:?}");
         assert_eq!(fs::read_to_string(&noted).unwrap(), "3", "only the call whose file is gone ran");
         let mut nested = spec.clone();
         nested.entrypoint = "relay_nested".into();
-        let events = collect(client.run(authorized(v1::RunRequest {
+        let events = collect(run_events(&client, &all, RunRequest {
             id: "relay-nested".into(), after: 0, spec: Some(nested),
-        }, &all)).await.unwrap().into_inner()).await.unwrap();
+        }).await.unwrap()).await.unwrap();
         let done = outcome(&events);
         assert_eq!(done.status, "succeeded", "{done:?}");
-        let result: serde_json::Value = serde_json::from_slice(&done.result).unwrap();
+        let result: serde_json::Value = json(&done.result);
         assert_eq!(result["squares"], serde_json::json!([9, 16]));
         assert_eq!(fs::read_to_string(&counter).unwrap(), "4");
         // A served entrypoint calls children as a job does: each a child run that truly runs.
         let mut served = spec.clone();
-        (served.kind, served.entrypoint) = (v1::RunKind::Call as i32, "relay_served".into());
-        served.payload = serde_json::to_vec(&serde_json::json!({"values": [5, 6], "counter": counter})).unwrap();
-        let events = collect(client.run(authorized(v1::RunRequest {
+        (served.kind, served.entrypoint) = (v1::RunKind::Call, "relay_served".into());
+        served.payload = raw(&serde_json::json!({"values": [5, 6], "counter": counter}));
+        let events = collect(run_events(&client, &all, RunRequest {
             id: "relay-served".into(), after: 0, spec: Some(served),
-        }, &all)).await.unwrap().into_inner()).await.unwrap();
+        }).await.unwrap()).await.unwrap();
         let done = outcome(&events);
         assert_eq!(done.status, "succeeded", "{done:?}");
-        let result: serde_json::Value = serde_json::from_slice(&done.result).unwrap();
+        let result: serde_json::Value = json(&done.result);
         assert_eq!(result["squares"], serde_json::json!([25, 36]));
         assert_eq!(fs::read_to_string(&counter).unwrap(), "6");
         let mut restricted = spec;
         restricted.entrypoint = "relay_restricted".into();
-        let events = collect(client.run(authorized(v1::RunRequest {
+        let events = collect(run_events(&client, &all, RunRequest {
             id: "relay-restricted".into(), after: 0, spec: Some(restricted),
-        }, &all)).await.unwrap().into_inner()).await.unwrap();
+        }).await.unwrap()).await.unwrap();
         assert_eq!(outcome(&events).status, "failed", "{events:?}");
         assert_eq!(fs::read_to_string(&counter).unwrap(), "6", "a foreign internal export must run no effects");
         // A published release's environment is described the same way, inside it.
@@ -2801,7 +2833,7 @@ mod v1_api {
             .map(|entry| entry.path()).find(|path| path.file_name().unwrap().to_str().unwrap().starts_with("tensord_cpu_caller-")).unwrap();
         let root_bytes = fs::read(&root_wheel).unwrap();
         let root_digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&root_bytes));
-        write(&mut client, &all, &root_digest, root_bytes.len() as u64, 0, &root_bytes).await.unwrap();
+        write(&client, &all, &root_digest, root_bytes.len() as u64, 0, &root_bytes).await.unwrap();
         let manifest = serde_json::to_vec(&serde_json::json!({
             "package":"local/tensord-cpu-caller","release":"0.1.0","python_version":"3.12",
             "wheels":[
@@ -2810,16 +2842,16 @@ mod v1_api {
             "callees":{"tensord-cpu-memo":"local/tensord-cpu-memo"}
         })).unwrap();
         let manifest_digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&manifest));
-        write(&mut client, &all, &manifest_digest, manifest.len() as u64, 0, &manifest).await.unwrap();
+        write(&client, &all, &manifest_digest, manifest.len() as u64, 0, &manifest).await.unwrap();
         let wheel_counter = machine.root.join("wheel-measured");
-        let events = collect(client.run(authorized(v1::RunRequest {
+        let events = collect(run_events(&client, &all, RunRequest {
             id:"relay-wheels".into(),after:0,spec:Some(v1::RunSpec {
-                kind:v1::RunKind::Call as i32,entrypoint:"relay".into(),owner:"alice".into(),
-                source:Some(v1::run_spec::Source::Local(v1::LocalSource { manifest:manifest_digest })),
-                payload:serde_json::to_vec(&serde_json::json!({"values":[3,4],"counter":wheel_counter})).unwrap(),
+                kind:v1::RunKind::Call,entrypoint:"relay".into(),owner:"alice".into(),
+                source:Some(v1::Source::Local(v1::LocalSource { manifest:manifest_digest })),
+                payload:raw(&serde_json::json!({"values":[3,4],"counter":wheel_counter})),
                 ..Default::default()
             }),
-        }, &all)).await.unwrap().into_inner()).await.unwrap();
+        }).await.unwrap()).await.unwrap();
         let done = outcome(&events);
         assert_eq!(done.status, "succeeded", "{done:?}");
         assert_eq!(fs::read_to_string(&wheel_counter).unwrap(), "2");
@@ -2834,7 +2866,7 @@ mod v1_api {
     #[tokio::test]
     async fn a_published_release_calls_its_hub_callee_under_the_callees_own_name() {
         let (machine, tools) = installing_machine().await;
-        let mut client = client(&machine).await;
+        let client = client(&machine);
         let all = cap(Grant { action: MACHINE.into(), ..Default::default() });
         let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
         let built = tools.join("hub-wheels");
@@ -2873,23 +2905,23 @@ mod v1_api {
         };
         let (origin, _) = names_hub::serve(&store, model, Some(package));
         let counter = machine.root.join("published-measured");
-        let events = collect(client.run(authorized(v1::RunRequest {
+        let events = collect(run_events(&client, &all, RunRequest {
             id: "published-relay".into(), after: 0, spec: Some(v1::RunSpec {
-                kind: v1::RunKind::Call as i32, entrypoint: "relay".into(), owner: "alice".into(),
-                source: Some(v1::run_spec::Source::Release(v1::Release {
+                kind: v1::RunKind::Call, entrypoint: "relay".into(), owner: "alice".into(),
+                source: Some(v1::Source::Release(v1::Release {
                     package: "acme/tensord-cpu-caller".into(), release: "0.1.0".into() })),
-                payload: serde_json::to_vec(&serde_json::json!({"values": [3, 4], "counter": counter})).unwrap(),
+                payload: raw(&serde_json::json!({"values": [3, 4], "counter": counter})),
                 hub: Some(v1::HubAccess { origin, object_hosts: vec!["localhost".into()], ..Default::default() }),
                 catalog_revision: "r1".into(),
                 ..Default::default()
             }),
-        }, &all)).await.unwrap().into_inner()).await.unwrap();
+        }).await.unwrap()).await.unwrap();
         let done = outcome(&events);
         assert_eq!(done.status, "succeeded", "{done:?}");
-        let result: serde_json::Value = serde_json::from_slice(&done.result).unwrap();
+        let result: serde_json::Value = json(&done.result);
         assert_eq!(result["squares"], serde_json::json!([9, 16]));
         let calls: Vec<_> = events.iter().filter_map(|e| match &e.event {
-            Some(v1::run_event::Event::Call(call)) => Some(call.function.clone()),
+            v1::Event::Call(call) => Some(call.function.clone()),
             _ => None,
         }).collect();
         assert_eq!(calls, ["measure", "measure", "greet"], "{events:?}");
@@ -2905,12 +2937,12 @@ mod v1_api {
         let _ = fs::remove_dir_all(tools);
     }
 
-    /// Write and run sources on the real serve process: an object resumes from what is held,
-    /// and unpublished code written with Write prepares inside its run (warm, then a call).
+    /// Uploads and run sources on the real serve process: an object resumes from what is held,
+    /// and unpublished code uploaded to the machine prepares inside its run (warm, then a call).
     #[tokio::test]
     async fn written_local_code_prepares_inside_its_run() {
         let (machine, tools) = installing_machine().await;
-        let mut client = client(&machine).await;
+        let client = client(&machine);
         let all = cap(Grant {
             action: MACHINE.into(),
             ..Default::default()
@@ -2930,9 +2962,9 @@ mod v1_api {
         let source = archive.into_inner().unwrap();
         let digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&source));
         let length = source.len() as u64;
-        // A probe holds nothing; half, then the rest from the held offset.
+        // A probe holds nothing; half, then the rest from the held ranges.
         assert_eq!(
-            write(&mut client, &all, &digest, length, 0, &[])
+            write(&client, &all, &digest, length, 0, &[])
                 .await
                 .unwrap(),
             0
@@ -2940,7 +2972,7 @@ mod v1_api {
         let half = length / 2;
         assert_eq!(
             write(
-                &mut client,
+                &client,
                 &all,
                 &digest,
                 length,
@@ -2951,16 +2983,13 @@ mod v1_api {
             .unwrap(),
             half
         );
-        let ahead = write(&mut client, &all, &digest, length, half + 1, b"x")
-            .await
-            .unwrap_err();
-        assert_eq!(
-            ahead.metadata().get("cozy-error-code").unwrap(),
-            "object_offset_ahead"
-        );
+        // A part past a gap lands too: the held ranges say so, and the gap is sent after it.
+        let bulk = by(&client, &all).bulk().unwrap();
+        let ahead = bulk.put(&digest, (half + 1, 1, length), source[half as usize + 1..][..1].to_vec()).await;
+        assert_eq!(ahead.unwrap(), [(0, half), (half + 1, half + 2)]);
         assert_eq!(
             write(
-                &mut client,
+                &client,
                 &all,
                 &digest,
                 length,
@@ -2978,33 +3007,31 @@ mod v1_api {
         let manifest_digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&manifest));
         let size = manifest.len() as u64;
         assert_eq!(
-            write(&mut client, &all, &manifest_digest, size, 0, &manifest)
+            write(&client, &all, &manifest_digest, size, 0, &manifest)
                 .await
                 .unwrap(),
             size
         );
 
         let local = |kind: v1::RunKind| v1::RunSpec {
-            kind: kind as i32,
-            source: Some(v1::run_spec::Source::Local(v1::LocalSource {
+            kind,
+            source: Some(v1::Source::Local(v1::LocalSource {
                 manifest: manifest_digest.clone(),
             })),
             entrypoint: "steps".into(),
-            payload: br#"{"steps":2,"seconds":0.01}"#.to_vec(),
+            payload: v1::Json::parse(r#"{"steps":2,"seconds":0.01}"#).ok(),
             owner: "alice".into(),
             ..Default::default()
         };
-        let run = |id: &str, spec: v1::RunSpec| v1::RunRequest {
+        let run = |id: &str, spec: v1::RunSpec| RunRequest {
             id: id.into(),
             after: 0,
             spec: Some(spec),
         };
         let warm = collect(
-            client
-                .run(authorized(run("warm-1", local(v1::RunKind::Warm)), &all))
+            run_events(&client, &all, run("warm-1", local(v1::RunKind::Warm)))
                 .await
-                .unwrap()
-                .into_inner(),
+                .unwrap(),
         )
         .await
         .unwrap();
@@ -3012,89 +3039,78 @@ mod v1_api {
         // A warm run naming no entrypoint installs the code alone (`cozy package install`).
         let mut install = local(v1::RunKind::Warm);
         install.entrypoint.clear();
-        install.payload.clear();
+        install.payload = None;
         let installed = collect(
-            client
-                .run(authorized(run("warm-2", install), &all))
+            run_events(&client, &all, run("warm-2", install))
                 .await
-                .unwrap()
-                .into_inner(),
+                .unwrap(),
         )
         .await
         .unwrap();
         let installed = outcome(&installed);
         assert_eq!(installed.status, "succeeded", "{installed:?}");
-        let result: serde_json::Value = serde_json::from_slice(&installed.result).unwrap();
+        let result: serde_json::Value = json(&installed.result);
         assert_eq!(result["package"], "local/tensord-cpu-lifecycle");
         assert_eq!(result["models"], serde_json::json!([]));
         // A warm run's set is the caller's warm set: Status shows each member as it was sent,
         // with what it holds now. This function binds no model, so it holds its code.
-        let frame = status_frame(&mut client, &all).await;
+        let frame = status_frame(&client, &all).await;
         assert!(frame.capabilities.iter().any(|c| c == "warm/2"), "{frame:?}");
         let member = |entrypoint: &str| v1::WarmItem {
-            source: Some(v1::warm_item::Source::Installation(
+            source: Some(v1::WarmSource::Installation(
                 frame.environments[0].installation.clone(),
             )),
             entrypoint: entrypoint.into(),
-            level: v1::WarmLevel::Host as i32,
+            level: v1::WarmLevel::Host,
             ..Default::default()
         };
         let set = |items: Vec<v1::WarmItem>| v1::RunSpec {
-            kind: v1::RunKind::Warm as i32,
+            kind: v1::RunKind::Warm,
             set: Some(v1::WarmSet { items }),
             owner: "alice".into(),
             ..Default::default()
         };
-        let kept = client.run(authorized(run("set-1", set(vec![member("steps")])), &all));
-        let kept = collect(kept.await.unwrap().into_inner()).await.unwrap();
+        let kept = run_events(&client, &all, run("set-1", set(vec![member("steps")])));
+        let kept = collect(kept.await.unwrap()).await.unwrap();
         assert_eq!(outcome(&kept).status, "succeeded", "{kept:?}");
-        let result: serde_json::Value = serde_json::from_slice(&outcome(&kept).result).unwrap();
+        let result: serde_json::Value = json(&outcome(&kept).result);
         assert_eq!(result["set"][0]["level"], "installed", "{result}");
-        let frame = status_frame(&mut client, &all).await;
+        let frame = status_frame(&client, &all).await;
         let [shown] = &frame.warm[..] else {
             panic!("one member: {frame:?}")
         };
         assert_eq!(
             (shown.entrypoint.as_str(), shown.level, shown.holds.as_str()),
-            ("steps", v1::WarmLevel::Host as i32, "installed")
+            ("steps", v1::WarmLevel::Host, "installed")
         );
         assert!(shown.held_back.contains("binds no model"), "{shown:?}");
         assert_eq!(frame.environments[0].level, "installed");
         // A member naming no entrypoint of its package refuses the whole set: the last one stays.
-        let unknown = client.run(authorized(run("set-2", set(vec![member("absent")])), &all));
-        let unknown = collect(unknown.await.unwrap().into_inner()).await.unwrap();
+        let unknown = run_events(&client, &all, run("set-2", set(vec![member("absent")])));
+        let unknown = collect(unknown.await.unwrap()).await.unwrap();
         assert_eq!(outcome(&unknown).status, "failed", "{unknown:?}");
-        assert_eq!(status_frame(&mut client, &all).await.warm.len(), 1);
+        assert_eq!(status_frame(&client, &all).await.warm.len(), 1);
         // An empty set clears it.
-        let cleared = client.run(authorized(run("set-3", set(vec![])), &all));
-        let cleared = collect(cleared.await.unwrap().into_inner()).await.unwrap();
+        let cleared = run_events(&client, &all, run("set-3", set(vec![])));
+        let cleared = collect(cleared.await.unwrap()).await.unwrap();
         assert_eq!(outcome(&cleared).status, "succeeded", "{cleared:?}");
-        assert!(status_frame(&mut client, &all).await.warm.is_empty());
+        assert!(status_frame(&client, &all).await.warm.is_empty());
         let called = collect(
-            client
-                .run(authorized(run("call-1", local(v1::RunKind::Call)), &all))
+            run_events(&client, &all, run("call-1", local(v1::RunKind::Call)))
                 .await
-                .unwrap()
-                .into_inner(),
+                .unwrap(),
         )
         .await
         .unwrap();
         let done = outcome(&called);
         assert_eq!(done.status, "succeeded", "{done:?}");
-        let result: serde_json::Value = serde_json::from_slice(&done.result).unwrap();
+        let result: serde_json::Value = json(&done.result);
         assert_eq!(result["steps"], 2);
         // The id names that spec: another spec under it is refused.
         let mut other = local(v1::RunKind::Call);
-        other.payload = br#"{"steps":3}"#.to_vec();
-        let conflict = client
-            .run(authorized(run("call-1", other), &all))
-            .await
-            .unwrap()
-            .into_inner()
-            .message()
-            .await
-            .unwrap_err();
-        assert_eq!(conflict.code(), tonic::Code::AlreadyExists);
+        other.payload = v1::Json::parse(r#"{"steps":3}"#).ok();
+        let conflict = run_events(&client, &all, run("call-1", other)).await.err().unwrap();
+        assert_eq!((conflict.status(), conflict.code()), (Some(409), Some("run_id_conflict")));
         let _ = fs::remove_dir_all(tools);
     }
 
@@ -3104,13 +3120,13 @@ mod v1_api {
     #[tokio::test]
     async fn a_job_renders_its_segments_through_child_runs() {
         let (machine, tools) = installing_machine().await;
-        let mut client = client(&machine).await;
+        let client = client(&machine);
         let all = cap(Grant {
             action: MACHINE.into(),
             ..Default::default()
         });
         let manifest = write_package(
-            &mut client,
+            &client,
             &all,
             "cpu_longform",
             "local/tensord-cpu-longform",
@@ -3129,20 +3145,17 @@ mod v1_api {
         let digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&reference));
         let length = reference.len() as u64;
         assert_eq!(
-            write(&mut client, &all, &digest, length, 0, &reference)
+            write(&client, &all, &digest, length, 0, &reference)
                 .await
                 .unwrap(),
             length
         );
         let segments = ["a dawn", "a storm", "a calm"];
         let spec = v1::RunSpec {
-            kind: v1::RunKind::Call as i32,
-            source: Some(v1::run_spec::Source::Local(v1::LocalSource { manifest })),
+            kind: v1::RunKind::Call,
+            source: Some(v1::Source::Local(v1::LocalSource { manifest })),
             entrypoint: "long_form".into(),
-            payload: serde_json::to_vec(
-                &serde_json::json!({"reference": digest, "segments": segments}),
-            )
-            .unwrap(),
+            payload: raw(&serde_json::json!({"reference": digest, "segments": segments})),
             inputs: vec![v1::InputFile {
                 field: "reference".into(),
                 digest: digest.clone(),
@@ -3154,28 +3167,23 @@ mod v1_api {
             ..Default::default()
         };
         let events = collect(
-            client
-                .run(authorized(
-                    v1::RunRequest {
+            run_events(&client, &all, RunRequest {
                         id: "film".into(),
                         after: 0,
                         spec: Some(spec.clone()),
-                    },
-                    &all,
-                ))
+                    })
                 .await
-                .unwrap()
-                .into_inner(),
+                .unwrap(),
         )
         .await
         .unwrap();
         let done = outcome(&events);
         assert_eq!(done.status, "succeeded", "{done:?}");
-        let result: serde_json::Value = serde_json::from_slice(&done.result).unwrap();
+        let result: serde_json::Value = json(&done.result);
         assert_eq!(result["segments"], 3, "{result}");
         // What the job's executor measured comes with its outcome, as `run show` lists it: the
         // stage it bracketed and its steps, each with a count and a time.
-        let measured: serde_json::Value = serde_json::from_slice(&done.measurements).unwrap();
+        let measured: serde_json::Value = json(&done.measurements);
         let assemble = &measured["attribution"]["stages"]["assemble"];
         assert_eq!(assemble["count"], 3, "{measured}");
         assert!(assemble["total_ms"].as_f64().unwrap() > 0.0, "{measured}");
@@ -3196,7 +3204,7 @@ mod v1_api {
         let calls: Vec<_> = events
             .iter()
             .filter_map(|e| match &e.event {
-                Some(v1::run_event::Event::Call(call)) => Some(call.clone()),
+                v1::Event::Call(call) => Some(call.clone()),
                 _ => None,
             })
             .collect();
@@ -3214,14 +3222,14 @@ mod v1_api {
             assert!(call.run.ends_with(&format!("/{}", call.index)), "{call:?}");
             assert!(call.finished_at_ms >= call.called_at_ms && call.called_at_ms > 0, "{call:?}");
             assert!(call.reason.is_none(), "{call:?}");
-            let measured: serde_json::Value = serde_json::from_slice(&call.measurements).unwrap();
+            let measured = json(&call.measurements);
             assert_eq!(measured["models"], serde_json::json!([]), "a call with no model slot ran none");
         }
         // The film after every segment is a product of the job's `video` output.
         let products: Vec<_> = events
             .iter()
             .filter_map(|e| match &e.event {
-                Some(v1::run_event::Event::Product(p)) if p.output == "video" => Some(p.clone()),
+                v1::Event::Product(p) if p.output == "video" => Some(p.clone()),
                 _ => None,
             })
             .collect();
@@ -3238,10 +3246,10 @@ mod v1_api {
             "{events:?}"
         );
         let (meta, bytes) = read(
-            &mut client,
+            &client,
             &all,
-            v1::ReadRequest {
-                target: Some(v1::read_request::Target::Output(v1::OutputTarget {
+            ReadRequest {
+                target: Some(Target::Output(v1::OutputTarget {
                     run: "film".into(),
                     output: "video".into(),
                     index: 0,
@@ -3258,7 +3266,7 @@ mod v1_api {
         let rendered: Vec<_> = events
             .iter()
             .filter_map(|e| match &e.event {
-                Some(v1::run_event::Event::Product(p)) if p.output == "rendered" => Some(p.label.clone()),
+                v1::Event::Product(p) if p.output == "rendered" => Some(p.label.clone()),
                 _ => None,
             })
             .collect();
@@ -3270,10 +3278,10 @@ mod v1_api {
         let bodies: Vec<&str> = film.split_inclusive('\n').collect();
         for (index, body) in bodies.iter().enumerate() {
             let (_, bytes) = read(
-                &mut client,
+                &client,
                 &all,
-                v1::ReadRequest {
-                    target: Some(v1::read_request::Target::Output(v1::OutputTarget {
+                ReadRequest {
+                    target: Some(Target::Output(v1::OutputTarget {
                         run: "film".into(),
                         output: "rendered".into(),
                         // A list item's index is 1-based.
@@ -3291,58 +3299,45 @@ mod v1_api {
         // Every child is a run of its own under the job, settled.
         for index in 0..3 {
             let child = collect(
-                client
-                    .run(authorized(
-                        v1::RunRequest {
+                run_events(&client, &all, RunRequest {
                             id: format!("film/{index}"),
                             after: 0,
                             spec: None,
-                        },
-                        &all,
-                    ))
+                        })
                     .await
-                    .unwrap()
-                    .into_inner(),
+                    .unwrap(),
             )
             .await
             .unwrap();
             let child = outcome(&child);
             assert_eq!(child.status, "succeeded", "{child:?}");
             // A call's measurements name the process that executed it.
-            let measured: serde_json::Value = serde_json::from_slice(&child.measurements).unwrap();
+            let measured: serde_json::Value = json(&child.measurements);
             assert!(measured["execution"]["ranks"][0]["pid"].as_u64() > Some(0), "{measured}");
         }
 
         // A canceled job ends its running child with it.
         let mut held = spec.clone();
-        held.payload = serde_json::to_vec(
-            &serde_json::json!({"reference": digest, "segments": segments, "hold": 60.0}),
-        )
-        .unwrap();
-        let stream = client
-            .run(authorized(
-                v1::RunRequest {
+        held.payload = raw(&serde_json::json!({"reference": digest, "segments": segments, "hold": 60.0}));
+        let stream = run_events(&client, &all, RunRequest {
                     id: "held".into(),
                     after: 0,
                     spec: Some(held),
-                },
-                &all,
-            ))
+                })
             .await
-            .unwrap()
-            .into_inner();
-        let watch = |id: &str| v1::RunRequest {
+            .unwrap();
+        let watch = |id: &str| RunRequest {
             id: id.into(),
             after: 0,
             spec: None,
         };
         let until = Instant::now() + Duration::from_secs(60);
         loop {
-            let child = client.run(authorized(watch("held/0"), &all)).await;
+            let child = run_events(&client, &all, watch("held/0")).await;
             let running = match child {
-                Ok(child) => match child.into_inner().message().await {
+                Ok(mut child) => match child.next().await.transpose() {
                     Ok(Some(v1::RunEvent {
-                        event: Some(v1::run_event::Event::State(s)),
+                        event: v1::Event::State(s),
                         ..
                     })) => s.state == "running",
                     _ => false,
@@ -3355,19 +3350,13 @@ mod v1_api {
             assert!(Instant::now() < until, "the first child never ran");
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        let cancel = v1::ControlRequest {
-            id: "held".into(),
-            action: v1::Action::Cancel as i32,
-        };
-        client.control(authorized(cancel, &all)).await.unwrap();
+        cancel(&client, &all, "held").await.unwrap();
         let parent = collect(stream).await.unwrap();
         assert_eq!(outcome(&parent).status, "canceled", "{parent:?}");
         let child = collect(
-            client
-                .run(authorized(watch("held/0"), &all))
+            run_events(&client, &all, watch("held/0"))
                 .await
-                .unwrap()
-                .into_inner(),
+                .unwrap(),
         )
         .await
         .unwrap();
@@ -3382,45 +3371,36 @@ mod v1_api {
                 repository: "alice/model".into(),
                 ..Default::default()
             }];
-            v1::RunRequest {
+            RunRequest {
                 id: id.into(),
                 after: 0,
                 spec: Some(chosen),
             }
         };
         let stray = collect(
-            client
-                .run(authorized(chose("stray", "nope.models.base"), &all))
+            run_events(&client, &all, chose("stray", "nope.models.base"))
                 .await
-                .unwrap()
-                .into_inner(),
+                .unwrap(),
         )
         .await
         .unwrap();
         // A choice naming no slot anywhere is a warning, never a refusal: the run goes on.
         let warned = stray.iter().any(|e| matches!(&e.event,
-            Some(v1::run_event::Event::Log(l)) if l.level == "warning" && l.text.contains("nope.models.base")));
+            v1::Event::Log(l) if l.level == "warning" && l.text.contains("nope.models.base")));
         let stray = outcome(&stray);
         assert_eq!(stray.status, "succeeded", "{stray:?}");
         assert!(warned, "the stray choice is not in the run's log as a warning");
         collect(
-            client
-                .run(authorized(
-                    chose("chosen", "render_segment.models.base"),
-                    &all,
-                ))
+            run_events(&client, &all, chose("chosen", "render_segment.models.base"))
                 .await
-                .unwrap()
-                .into_inner(),
+                .unwrap(),
         )
         .await
         .unwrap();
         let child = collect(
-            client
-                .run(authorized(watch("chosen/0"), &all))
+            run_events(&client, &all, watch("chosen/0"))
                 .await
-                .unwrap()
-                .into_inner(),
+                .unwrap(),
         )
         .await
         .unwrap();
@@ -3432,19 +3412,19 @@ mod v1_api {
 
     /// The run's state as Run's first frame (a snapshot); None while it does not exist.
     async fn snapshot(
-        client: &mut v1::machine_client::MachineClient<Channel>,
+        client: &Client,
         cap: &str,
         id: &str,
     ) -> Option<v1::RunState> {
-        let request = v1::RunRequest {
+        let request = RunRequest {
             id: id.into(),
             after: 0,
             spec: None,
         };
-        match client.run(authorized(request, cap)).await {
-            Ok(stream) => match stream.into_inner().message().await {
+        match run_events(client, cap, request).await {
+            Ok(mut stream) => match stream.next().await.transpose() {
                 Ok(Some(v1::RunEvent {
-                    event: Some(v1::run_event::Event::State(state)),
+                    event: v1::Event::State(state),
                     ..
                 })) => Some(state),
                 _ => None,
@@ -3455,7 +3435,7 @@ mod v1_api {
 
     /// Polls until the run shows `wanted`.
     async fn until(
-        client: &mut v1::machine_client::MachineClient<Channel>,
+        client: &Client,
         cap: &str,
         id: &str,
         wanted: &str,
@@ -3478,13 +3458,13 @@ mod v1_api {
     #[tokio::test]
     async fn a_canceled_film_submitted_again_skips_its_finished_segments() {
         let (mut machine, tools) = installing_machine().await;
-        let mut client = client(&machine).await;
+        let client = client(&machine);
         let all = cap(Grant {
             action: MACHINE.into(),
             ..Default::default()
         });
         let manifest = write_package(
-            &mut client,
+            &client,
             &all,
             "cpu_longform",
             "local/tensord-cpu-longform",
@@ -3502,17 +3482,16 @@ mod v1_api {
         }
         let digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&reference));
         let length = reference.len() as u64;
-        write(&mut client, &all, &digest, length, 0, &reference)
+        write(&client, &all, &digest, length, 0, &reference)
             .await
             .unwrap();
         let segments = ["a dawn", "a storm", "a calm"];
         let spec = v1::RunSpec {
-            kind: v1::RunKind::Call as i32,
-            source: Some(v1::run_spec::Source::Local(v1::LocalSource { manifest })),
+            kind: v1::RunKind::Call,
+            source: Some(v1::Source::Local(v1::LocalSource { manifest })),
             entrypoint: "long_form".into(),
-            payload: serde_json::to_vec(&serde_json::json!({
-                "reference": digest, "segments": segments, "hold": 4.0, "hold_at": 1}))
-            .unwrap(),
+            payload: raw(&serde_json::json!({
+                "reference": digest, "segments": segments, "hold": 4.0, "hold_at": 1})),
             inputs: vec![v1::InputFile {
                 field: "reference".into(),
                 digest: digest.clone(),
@@ -3525,7 +3504,7 @@ mod v1_api {
         };
         let submit = |id: &str| {
             authorized(
-                v1::RunRequest {
+                RunRequest {
                     id: id.into(),
                     after: 0,
                     spec: Some(spec.clone()),
@@ -3533,21 +3512,16 @@ mod v1_api {
                 &all,
             )
         };
-        client.run(submit("film")).await.unwrap();
-        until(&mut client, &all, "film/1", "running").await;
-        let canceled = client
-            .control(authorized(
-                v1::ControlRequest { id: "film".into(), action: v1::Action::Cancel as i32 },
-                &all,
-            ))
+        drop(run_as(&client, submit("film")).await.unwrap());
+        until(&client, &all, "film/1", "running").await;
+        let canceled = cancel(&client, &all, "film")
             .await
-            .unwrap()
-            .into_inner();
+            .unwrap();
         assert!(["running", "canceled"].contains(&canceled.state.as_str()), "{canceled:?}");
-        until(&mut client, &all, "film", "canceled").await;
-        until(&mut client, &all, "film/1", "canceled").await;
-        assert_eq!(snapshot(&mut client, &all, "film/0").await.unwrap().state, "succeeded");
-        assert!(snapshot(&mut client, &all, "film/2").await.is_none());
+        until(&client, &all, "film", "canceled").await;
+        until(&client, &all, "film/1", "canceled").await;
+        assert_eq!(snapshot(&client, &all, "film/0").await.unwrap().state, "succeeded");
+        assert!(snapshot(&client, &all, "film/2").await.is_none());
 
         // The memo is the machine's: a restart keeps it.
         machine.stop();
@@ -3555,28 +3529,28 @@ mod v1_api {
         let (child, address) = launch(&machine.root, &extra);
         machine.child = child;
         machine.address = address;
-        let mut client = self::client(&machine).await;
-        let events = collect(client.run(submit("again")).await.unwrap().into_inner())
+        let client = self::client(&machine);
+        let events = collect(run_as(&client, submit("again")).await.unwrap())
             .await
             .unwrap();
         let done = outcome(&events);
         assert_eq!(done.status, "succeeded", "{done:?}");
-        let result: serde_json::Value = serde_json::from_slice(&done.result).unwrap();
+        let result: serde_json::Value = json(&done.result);
         assert_eq!(result["segments"].as_u64(), Some(3), "{result}");
         let calls: Vec<_> = events
             .iter()
             .filter_map(|e| match &e.event {
-                Some(v1::run_event::Event::Call(call)) => Some((call.index, call.memoized)),
+                v1::Event::Call(call) => Some((call.index, call.memoized)),
                 _ => None,
             })
             .collect();
         assert_eq!(calls, [(0, true), (1, false), (2, false)], "only the finished segment is answered");
         for (index, memoized) in [(0, true), (1, false), (2, false)] {
             let attached = authorized(
-                v1::RunRequest { id: format!("again/{index}"), after: 0, spec: None },
+                RunRequest { id: format!("again/{index}"), after: 0, spec: None },
                 &all,
             );
-            let child = collect(client.run(attached).await.unwrap().into_inner()).await.unwrap();
+            let child = collect(run_as(&client, attached).await.unwrap()).await.unwrap();
             let ended = outcome(&child);
             assert_eq!((ended.status.as_str(), ended.memoized), ("succeeded", memoized), "{ended:?}");
         }
@@ -3588,10 +3562,10 @@ mod v1_api {
             film.push_str(&body);
         }
         let (_, bytes) = read(
-            &mut client,
+            &client,
             &all,
-            v1::ReadRequest {
-                target: Some(v1::read_request::Target::Output(v1::OutputTarget {
+            ReadRequest {
+                target: Some(Target::Output(v1::OutputTarget {
                     run: "again".into(),
                     output: "video".into(),
                     index: 0,
@@ -3612,13 +3586,13 @@ mod v1_api {
     #[tokio::test]
     async fn a_job_waits_through_a_segment_longer_than_its_own_patience() {
         let (machine, tools) = installing_machine().await;
-        let mut client = client(&machine).await;
+        let client = client(&machine);
         let all = cap(Grant {
             action: MACHINE.into(),
             ..Default::default()
         });
         let manifest = write_package(
-            &mut client,
+            &client,
             &all,
             "cpu_longform",
             "local/tensord-cpu-longform",
@@ -3636,17 +3610,14 @@ mod v1_api {
         }
         let digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&reference));
         let length = reference.len() as u64;
-        write(&mut client, &all, &digest, length, 0, &reference)
+        write(&client, &all, &digest, length, 0, &reference)
             .await
             .unwrap();
         let spec = v1::RunSpec {
-            kind: v1::RunKind::Call as i32,
-            source: Some(v1::run_spec::Source::Local(v1::LocalSource { manifest })),
+            kind: v1::RunKind::Call,
+            source: Some(v1::Source::Local(v1::LocalSource { manifest })),
             entrypoint: "long_form".into(),
-            payload: serde_json::to_vec(
-                &serde_json::json!({"reference": digest, "segments": ["a long night"], "hold": 50.0}),
-            )
-            .unwrap(),
+            payload: raw(&serde_json::json!({"reference": digest, "segments": ["a long night"], "hold": 50.0})),
             inputs: vec![v1::InputFile {
                 field: "reference".into(),
                 digest: digest.clone(),
@@ -3658,18 +3629,13 @@ mod v1_api {
             ..Default::default()
         };
         let events = collect(
-            client
-                .run(authorized(
-                    v1::RunRequest {
+            run_events(&client, &all, RunRequest {
                         id: "patient".into(),
                         after: 0,
                         spec: Some(spec),
-                    },
-                    &all,
-                ))
+                    })
                 .await
-                .unwrap()
-                .into_inner(),
+                .unwrap(),
         )
         .await
         .unwrap();
@@ -3685,13 +3651,13 @@ mod v1_api {
     #[tokio::test]
     async fn a_failed_segment_fails_the_job_and_keeps_the_film_so_far() {
         let (machine, tools) = installing_machine().await;
-        let mut client = client(&machine).await;
+        let client = client(&machine);
         let all = cap(Grant {
             action: MACHINE.into(),
             ..Default::default()
         });
         let manifest = write_package(
-            &mut client,
+            &client,
             &all,
             "cpu_longform",
             "local/tensord-cpu-longform",
@@ -3709,18 +3675,15 @@ mod v1_api {
         }
         let digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&reference));
         let length = reference.len() as u64;
-        write(&mut client, &all, &digest, length, 0, &reference)
+        write(&client, &all, &digest, length, 0, &reference)
             .await
             .unwrap();
         let segments = ["a dawn", "a storm", "a calm"];
         let spec = v1::RunSpec {
-            kind: v1::RunKind::Call as i32,
-            source: Some(v1::run_spec::Source::Local(v1::LocalSource { manifest })),
+            kind: v1::RunKind::Call,
+            source: Some(v1::Source::Local(v1::LocalSource { manifest })),
             entrypoint: "long_form".into(),
-            payload: serde_json::to_vec(
-                &serde_json::json!({"reference": digest, "segments": segments, "fail_at": 1}),
-            )
-            .unwrap(),
+            payload: raw(&serde_json::json!({"reference": digest, "segments": segments, "fail_at": 1})),
             inputs: vec![v1::InputFile {
                 field: "reference".into(),
                 digest: digest.clone(),
@@ -3732,18 +3695,13 @@ mod v1_api {
             ..Default::default()
         };
         let events = collect(
-            client
-                .run(authorized(
-                    v1::RunRequest {
+            run_events(&client, &all, RunRequest {
                         id: "broken".into(),
                         after: 0,
                         spec: Some(spec),
-                    },
-                    &all,
-                ))
+                    })
                 .await
-                .unwrap()
-                .into_inner(),
+                .unwrap(),
         )
         .await
         .unwrap();
@@ -3755,27 +3713,23 @@ mod v1_api {
         assert!(reason.message.contains("segment 2 of 3"), "{reason:?}");
         // The child that failed is a failed run with the authored reason; the one before it
         // succeeded; no third segment ran.
-        let watch = |id: &str| v1::RunRequest {
+        let watch = |id: &str| RunRequest {
             id: id.into(),
             after: 0,
             spec: None,
         };
         let first = collect(
-            client
-                .run(authorized(watch("broken/0"), &all))
+            run_events(&client, &all, watch("broken/0"))
                 .await
-                .unwrap()
-                .into_inner(),
+                .unwrap(),
         )
         .await
         .unwrap();
         assert_eq!(outcome(&first).status, "succeeded", "{first:?}");
         let second = collect(
-            client
-                .run(authorized(watch("broken/1"), &all))
+            run_events(&client, &all, watch("broken/1"))
                 .await
-                .unwrap()
-                .into_inner(),
+                .unwrap(),
         )
         .await
         .unwrap();
@@ -3789,15 +3743,15 @@ mod v1_api {
             "{failed:?}"
         );
         // No third segment ran.
-        match client.run(authorized(watch("broken/2"), &all)).await {
+        match run_events(&client, &all, watch("broken/2")).await {
             Err(_) => {}
-            Ok(stream) => assert!(collect(stream.into_inner()).await.is_err()),
+            Ok(stream) => assert!(collect(stream).await.is_err()),
         }
         // The film through the first segment was published and stays readable.
         let labels: Vec<_> = events
             .iter()
             .filter_map(|e| match &e.event {
-                Some(v1::run_event::Event::Product(p)) if p.output == "video" => {
+                v1::Event::Product(p) if p.output == "video" => {
                     Some(p.label.clone())
                 }
                 _ => None,
@@ -3806,10 +3760,10 @@ mod v1_api {
         assert_eq!(labels, ["Video (segments 1-1)"], "{events:?}");
         let seen = tensorfs_core::sha256::hex_digest(&reference);
         let (meta, bytes) = read(
-            &mut client,
+            &client,
             &all,
-            v1::ReadRequest {
-                target: Some(v1::read_request::Target::Output(v1::OutputTarget {
+            ReadRequest {
+                target: Some(Target::Output(v1::OutputTarget {
                     run: "broken".into(),
                     output: "video".into(),
                     index: 0,

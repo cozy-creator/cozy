@@ -56,25 +56,6 @@ fn read(path: PathBuf) -> String {
     std::fs::read_to_string(path).unwrap()
 }
 
-/// Points `home` at its Hub's listen address (`TENSORHUB_URL`, plain HTTP on loopback) instead of
-/// its public origin, keeping the device key it signed in with. Answers that address.
-fn at_listen_address(home: &Home) -> String {
-    let listen = std::env::var("TENSORHUB_URL").expect("the Tensorhub's listen address");
-    let paths = cozy_platform::paths::Home::at(home.root());
-    let hub = |url: &str| cozy_proto::config::Hub {
-        name: Some("ci".into()),
-        origin: cozy_proto::config::origin(url).unwrap(),
-    };
-    let public = std::env::var("TENSORHUB_ORIGIN").unwrap();
-    std::fs::copy(
-        hub(&public).device_key(&paths),
-        hub(&listen).device_key(&paths),
-    )
-    .unwrap();
-    home.write_config(&format!("hub = \"ci\"\n[hubs]\nci = \"{listen}\"\n"));
-    listen
-}
-
 /// The uv.lock the Hub holds for `account/name@release`, as a machine's install plan carries it.
 fn published_lock(url: &str, account: &str, name: &str, release: &str) -> String {
     use base64::Engine as _;
@@ -220,7 +201,7 @@ fn packages_lock_publish_and_yank_on_a_real_hub() {
     // The first account addressing its Hub where the Hub listens (TENSORHUB_URL), as a laptop names
     // its local Hub: the index it locks against is still the one at the Hub's public origin, and
     // a lock made against the listen address is relocked to it on publish.
-    let listen = at_listen_address(&home);
+    let listen = home.at_listen_address();
     let pyproject = authored.replace("version = \"0.1.0\"", "version = \"0.2.0\"");
     std::fs::write(user.join("pyproject.toml"), &pyproject).unwrap();
     let locked = json(&home, &user, &["package", "lock"]);

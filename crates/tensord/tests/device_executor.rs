@@ -60,7 +60,6 @@ fn prepared(version: &str, generation_path: &str) -> (DeviceExecutor, PathBuf) {
     let mut executor = DeviceExecutor::spawn(config).unwrap();
     assert_eq!(executor.hello.runtime_version, version); // fixture provenance, not admission
     assert!(!executor.hello.torch_loaded);
-    assert!(executor.hello.executor_protocol_revision > 0);
     assert!(!executor.hello.tensorfs_version.is_empty());
     let maps = fs::read_to_string(format!("/proc/{}/maps", executor.birth.pid)).unwrap();
     assert!(!maps.contains("libcuda.so"));
@@ -147,7 +146,6 @@ fn invoke(
                 deadline_s: None,
                 attention_kernel: String::new(),
                 bits: 0,
-                plane_budget_bytes: -1,
                 cap_bytes: None,
                 inputs: Default::default(),
                 trees: Default::default(),
@@ -234,19 +232,6 @@ fn credential_refusal_and_result_mutation_are_operation_local() {
         )
         .unwrap_err();
     assert_eq!(secret.kind(), std::io::ErrorKind::PermissionDenied);
-    assert!(!executor.hello.offers("stage/1"));
-    assert!(!executor.hello.offers("weight_plane/1"));
-    let unsupported = executor
-        .command(
-            &DeviceCommand::Budget {
-                vram_bytes: 0,
-                pinned_bytes: 0,
-                cap_bytes: None,
-            },
-            &mut Baseline,
-        )
-        .unwrap_err();
-    assert_eq!(unsupported.kind(), std::io::ErrorKind::Unsupported);
     let reply = invoke(&mut executor, &root, "valid", 2, &mut Baseline);
     assert!(read_result(&root.join("valid"), &reply).is_ok());
     fs::write(root.join("valid/result.canonical"), b"mutated").unwrap();
@@ -289,7 +274,6 @@ fn stock_executor_deferred_webp_reuses_sdk_encoder_and_exact_asset_binding() {
                 deadline_s: None,
                 attention_kernel: String::new(),
                 bits: 0,
-                plane_budget_bytes: -1,
                 cap_bytes: None,
                 inputs: Default::default(),
                 trees: Default::default(),

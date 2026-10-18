@@ -5,15 +5,15 @@ use tensord::api::{
     MachineIdentity,
 };
 use ed25519_dalek::SigningKey;
-use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf};
+use cozy_platform::durable::set_mode;
+use std::{fs, path::PathBuf};
 
 struct Area(PathBuf);
 impl Area {
     fn new() -> Self {
-        let id = fs::read_to_string("/proc/sys/kernel/random/uuid").unwrap();
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("target/identity-tests")
-            .join(id.trim());
+            .join(uuid::Uuid::new_v4().to_string());
         fs::create_dir_all(&path).unwrap();
         Self(path)
     }
@@ -47,7 +47,7 @@ impl Drop for Area {
 }
 fn private(path: &std::path::Path, value: &impl serde::Serialize) {
     fs::write(path, serde_json::to_vec(value).unwrap()).unwrap();
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    set_mode(path, 0o600).unwrap();
 }
 fn capability(identity: &MachineIdentity, key: &SigningKey) -> String {
     capability::mint(
@@ -121,22 +121,21 @@ fn unsafe_secret_modes_and_changed_worker_identity_preserve_existing_state() {
     changed.worker_id = "different-worker".into();
     assert!(MachineIdentity::retained(&changed).is_err());
     assert_eq!(fs::read(&path).unwrap(), original);
-    fs::set_permissions(
-        &config.readiness_hmac_key_file,
-        fs::Permissions::from_mode(0o644),
-    )
-    .unwrap();
-    assert!(MachineIdentity::retained(&config).is_err());
-    fs::set_permissions(
-        &config.readiness_hmac_key_file,
-        fs::Permissions::from_mode(0o600),
-    )
-    .unwrap();
+    // Modes are Unix's: Windows keeps an ACL, which the profile owns.
+    #[cfg(unix)]
+    {
+        set_mode(&config.readiness_hmac_key_file, 0o644).unwrap();
+        assert!(MachineIdentity::retained(&config).is_err());
+        set_mode(&config.readiness_hmac_key_file, 0o600).unwrap();
+    }
     assert_eq!(
         MachineIdentity::retained(&config).unwrap().cert_der,
         first.cert_der
     );
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
-    assert!(MachineIdentity::retained(&config).is_err());
-    assert_eq!(fs::read(&path).unwrap(), original);
+    #[cfg(unix)]
+    {
+        set_mode(&path, 0o644).unwrap();
+        assert!(MachineIdentity::retained(&config).is_err());
+        assert_eq!(fs::read(&path).unwrap(), original);
+    }
 }

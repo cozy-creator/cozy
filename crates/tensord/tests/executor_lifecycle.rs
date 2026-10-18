@@ -1,6 +1,8 @@
 //! Executor lifecycle on real Runtime executors (the shipped SDK's generations of
 //! `tests/fixtures/cpu_lifecycle`), no doubles. CUDA is hidden by the seal; no torch.
 //! `TENSORD_LIFECYCLE_GENERATIONS` names the installed generations directory.
+//! Unix until the Runtime's Windows executor channel lands.
+#![cfg(unix)]
 use cozy_platform::process::Exact;
 use tensord::{
     device_executor::{
@@ -145,7 +147,6 @@ fn invoke(
             deadline_s: None,
             attention_kernel: String::new(),
             bits: 0,
-            plane_budget_bytes: -1,
             cap_bytes: None,
             inputs: Default::default(),
             trees: Default::default(),
@@ -555,7 +556,6 @@ fn foreign_identity_executor_is_contained_and_keeps_its_hold_and_caches() {
                 deadline_s: None,
                 attention_kernel: String::new(),
                 bits: 0,
-                plane_budget_bytes: -1,
                 cap_bytes: None,
                 floor_bytes: None,
                 activation_bytes: Default::default(),

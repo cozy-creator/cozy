@@ -1,5 +1,6 @@
 //! The machine role on a pod or this computer: its launch grant, lifetime identity,
 //! readiness receipt and rental lifecycle. Contracts are the Go agent's and the Hub's.
+pub mod binary;
 pub mod client;
 pub mod endpoint;
 pub mod grant;
@@ -14,4 +15,5 @@ pub mod pypi;
 pub mod receipt;
 pub mod ssh;
 pub mod supervise;
+pub mod toolchain;
 pub mod update;

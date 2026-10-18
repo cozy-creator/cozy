@@ -36,7 +36,23 @@ pub(super) fn install(dir: &Path, spec: &ServiceSpec) -> Result<()> {
 
 /// Whether the unit kept here is `spec`'s, as `install` wrote it (and linked it).
 pub(super) fn current(dir: &Path, spec: &ServiceSpec) -> bool {
-    fs::read(dir.join(unit(&spec.name))).is_ok_and(|kept| kept == render(spec).as_bytes())
+    let kept =
+        fs::read(dir.join(unit(&spec.name))).is_ok_and(|kept| kept == render(spec).as_bytes());
+    // The manager's link too: a person's `systemctl --user disable` removes it, not the file.
+    kept && systemctl()
+        .args(["is-enabled", "--quiet", &unit(&spec.name)])
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// Whether the service failed to start: the manager gave up on it, or restarted it.
+pub(super) fn failed(name: &str) -> bool {
+    let shown =
+        output(systemctl().args(["show", &unit(name), "-p", "ActiveState", "-p", "NRestarts"]))
+            .unwrap_or_default();
+    shown.lines().any(|line| {
+        line == "ActiveState=failed" || line.strip_prefix("NRestarts=").is_some_and(|n| n != "0")
+    })
 }
 
 pub(super) fn start(_: &Path, spec: &ServiceSpec) -> Result<()> {
@@ -66,6 +82,24 @@ pub(super) fn uninstall(dir: &Path, name: &str) -> Result<()> {
         return Err(Error::io("remove", path)(error));
     }
     run(MANAGER, systemctl().arg("daemon-reload"))
+}
+
+/// A manager command's stdout; its stderr is the error.
+fn output(command: &mut Command) -> Result<String> {
+    let out = command.output().map_err(|error| Error::Service {
+        manager: MANAGER,
+        detail: format!("{command:?}: {error}"),
+    })?;
+    if !out.status.success() {
+        return Err(Error::Service {
+            manager: MANAGER,
+            detail: format!(
+                "{command:?}: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ),
+        });
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 fn systemctl() -> Command {

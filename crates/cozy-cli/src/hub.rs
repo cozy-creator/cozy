@@ -87,7 +87,7 @@ fn list(ctx: &Context) -> Result<ExitCode, Error> {
         table = table.row([
             if row.current { "*" } else { "" },
             row.hub.name.as_deref().unwrap_or(""),
-            &row.hub.origin,
+            row.hub.origin.as_str(),
             if row.logged_in { "yes" } else { "no" },
         ]);
     }
@@ -100,7 +100,7 @@ fn list(ctx: &Context) -> Result<ExitCode, Error> {
 
 fn select(ctx: &Context, text: &str) -> Result<ExitCode, Error> {
     let hub = ctx.config.resolve(text)?;
-    let spelled = hub.name.clone().unwrap_or_else(|| hub.origin.clone());
+    let spelled = hub.name.clone().unwrap_or_else(|| hub.origin.to_string());
     edit(ctx, |doc| {
         doc["hub"] = value(spelled);
         Ok(())
@@ -134,7 +134,7 @@ fn add(ctx: &Context, name: &str, url: &str) -> Result<ExitCode, Error> {
             format!("{name:?} is not letters, digits, '.', '_' or '-'"),
         ));
     }
-    let origin = config::origin(url)?;
+    let origin = config::Origin::parse(url)?;
     edit(ctx, |doc| {
         let hubs = hubs_table(doc);
         // The same name in another case is the same Hub.

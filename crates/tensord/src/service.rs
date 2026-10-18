@@ -315,7 +315,7 @@ impl Service {
         let entry = interface["entrypoints"].as_array()
             .and_then(|rows| rows.iter().find(|row| row["name"] == invocation.entrypoint.as_str()))
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "this application declares no such entrypoint"))?;
-        Ok(self.pool().map_or(0, |pool| pool.degree(entry, invocation.gpus)))
+        self.pool().map_or(Ok(0), |pool| pool.degree(entry, invocation.gpus))
     }
     fn retain(&self, record: &Execution, hold: Arc<File>) {
         if !record.state.terminal() {
@@ -472,7 +472,14 @@ impl Service {
                 continue;
             }
             let invocation = &record.invocation;
-            if (invocation.degree == 0 && room == 0) || (invocation.degree > 0 && gpu_fenced) {
+            if invocation.degree == 0 && room == 0 {
+                let busy = format!("waiting for an executor slot ({} busy)", self.parallelism);
+                if let Err(error) = self.engine.waiting(&record.id, Some(busy)) {
+                    tracing::warn!("run {}: its waiting reason was not shown: {error}", record.id);
+                }
+                continue;
+            }
+            if invocation.degree > 0 && gpu_fenced {
                 continue;
             }
             let plan = match record.submission.as_ref().map(|s| s.preparation_id.as_str()) {

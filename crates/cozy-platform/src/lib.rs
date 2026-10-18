@@ -11,13 +11,13 @@ pub mod gpu;
 pub mod handles;
 pub mod ipc;
 pub mod lock;
-pub mod net;
 pub mod paths;
 pub mod process;
 pub mod service;
-#[cfg(unix)]
 pub mod shm;
+pub mod tail;
 pub mod tools;
+pub mod watch;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -105,7 +105,7 @@ pub enum Seam {
     Gpu,
     Service,
     Paths,
-    Network,
+    FileWatch,
 }
 
 impl fmt::Display for Seam {
@@ -122,7 +122,7 @@ impl fmt::Display for Seam {
             Self::Gpu => "GPU probe",
             Self::Service => "user services",
             Self::Paths => "paths",
-            Self::Network => "socket options",
+            Self::FileWatch => "file watching",
         })
     }
 }

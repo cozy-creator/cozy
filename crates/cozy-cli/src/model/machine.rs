@@ -10,7 +10,6 @@ use cozy_proto::calcifer::{Kind as RunKind, Run, StagedInput, Status, SubmitRun}
 use cozy_proto::error::{Error, Kind};
 use cozy_proto::ids::Digest;
 use cozy_proto::machine::{ModelChoice, RunKind as SpecKind, RunSpec};
-use prost::Message as _;
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
@@ -91,17 +90,17 @@ async fn warm(
     destination: String,
 ) -> Result<ExitCode, Error> {
     let spec = RunSpec {
-        kind: SpecKind::Warm as i32,
+        kind: SpecKind::Warm,
         models: vec![choice],
         weights_destination: destination,
         ..Default::default()
     };
     let submit = SubmitRun {
         on: placement.on(),
-        hub: ctx.hub()?.origin,
+        hub: ctx.hub()?.origin.into(),
         kind: RunKind::Warm,
         target,
-        spec: spec.encode_to_vec(),
+        spec,
         inputs: staged.into_iter().collect(),
         out: None,
         warnings: vec![],

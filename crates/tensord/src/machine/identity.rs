@@ -7,11 +7,11 @@ use cozy_platform::{
 use super::grant::Layout;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, OpenOptions},
     io::{self, Write},
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::Path,
 };
+use cozy_platform::durable::Mode;
 
 /// The one DNS name of every machine leaf; clients pin the leaf itself.
 pub const SERVER_NAME: &str = "cozy-worker";
@@ -150,10 +150,13 @@ pub fn write_atomic(target: &Path, data: &[u8], mode: u32) -> io::Result<()> {
             .mode(0o600)
             .open(&temp)?;
         file.write_all(data)?;
-        file.set_permissions(fs::Permissions::from_mode(mode))?;
+        cozy_platform::durable::set_file_mode(&file, mode)?;
         file.sync_all()?;
+        // Closed before it is named: an executable written here runs at once, and an open
+        // writer (this one, or a fork's copy of it) makes exec fail with ETXTBSY.
+        drop(file);
         fs::rename(&temp, target)?;
-        File::open(dir)?.sync_all()
+        Ok(cozy_platform::durable::sync_dir(dir)?)
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temp);
@@ -168,9 +171,12 @@ fn invalid(detail: &str) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
     use std::io::Read;
 
-    /// A holder just killed is waited out, never refused; a live one is refused.
+    /// A holder just killed is waited out, never refused; a live one is refused. Its holder
+    /// writes a Linux birth (/proc); cozy-platform's seams prove the lock on every OS.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_killed_holder_is_waited_out_and_a_live_one_refused() {
         const HOLD: &str = "import fcntl, json, os, sys, time; f = open(sys.argv[1], 'a'); \

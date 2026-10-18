@@ -48,10 +48,9 @@ fn copy(from: &Path, to: &Path) {
 #[test]
 fn local_code_runs_on_a_real_machine_and_runs_again_as_edited() {
     let Some(home) = Home::new() else { return };
-    if std::env::var_os("COZY_TEST_TENSORD").is_none() {
-        eprintln!("skipped: no TensorD (COZY_TEST_TENSORD is unset)");
+    let Some(_) = common::needs("COZY_TEST_TENSORD", common::TENSORD) else {
         return;
-    }
+    };
     let _machine = common::tensord::added(&home, "m1");
     let work = home.path().join("work");
     std::fs::create_dir_all(&work).unwrap();
@@ -123,10 +122,9 @@ fn local_code_runs_on_a_real_machine_and_runs_again_as_edited() {
 #[test]
 fn a_local_wheel_a_path_source_names_is_carried_to_the_machine() {
     let Some(home) = Home::new() else { return };
-    if std::env::var_os("COZY_TEST_TENSORD").is_none() {
-        eprintln!("skipped: no TensorD (COZY_TEST_TENSORD is unset)");
+    let Some(_) = common::needs("COZY_TEST_TENSORD", common::TENSORD) else {
         return;
-    }
+    };
     let _machine = common::tensord::added(&home, "m1");
     let work = home.path().join("work");
     let write = |path: &str, text: &str| {
@@ -216,10 +214,9 @@ fn a_local_wheel_a_path_source_names_is_carried_to_the_machine() {
 fn a_followed_run_returns_only_once_its_outputs_landed() {
     use sha2::{Digest as _, Sha256};
     let Some(home) = Home::new() else { return };
-    if std::env::var_os("COZY_TEST_TENSORD").is_none() {
-        eprintln!("skipped: no TensorD (COZY_TEST_TENSORD is unset)");
+    let Some(_) = common::needs("COZY_TEST_TENSORD", common::TENSORD) else {
         return;
-    }
+    };
     let _machine = common::tensord::added(&home, "m1");
     let work = home.path().join("work");
     std::fs::create_dir_all(&work).unwrap();
@@ -276,10 +273,9 @@ fn a_followed_run_returns_only_once_its_outputs_landed() {
 #[test]
 fn outputs_land_in_their_packages_folder_unless_the_run_names_one() {
     let Some(home) = Home::new() else { return };
-    if std::env::var_os("COZY_TEST_TENSORD").is_none() {
-        eprintln!("skipped: no TensorD (COZY_TEST_TENSORD is unset)");
+    let Some(_) = common::needs("COZY_TEST_TENSORD", common::TENSORD) else {
         return;
-    }
+    };
     let _machine = common::tensord::added(&home, "m1");
     let work = home.path().join("work");
     std::fs::create_dir_all(&work).unwrap();
@@ -310,6 +306,16 @@ fn outputs_land_in_their_packages_folder_unless_the_run_names_one() {
     );
 }
 
+/// The `--json` follow's stages (`run.progress`).
+fn stages(out: &Out) -> Vec<String> {
+    out.stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|e| e["type"] == "run.progress")
+        .filter_map(|e| e["progress"]["stage"].as_str().map(str::to_owned))
+        .collect()
+}
+
 /// The targets of the home's warm runs, oldest first.
 fn warm_targets(home: &Home, dir: &Path) -> Vec<String> {
     let listed = cozy(home, dir, &["--json", "run", "list"]);
@@ -329,10 +335,9 @@ fn warm_targets(home: &Home, dir: &Path) -> Vec<String> {
 #[test]
 fn unchanged_local_code_is_called_at_once_and_an_edit_only_syncs() {
     let Some(home) = Home::new() else { return };
-    if std::env::var_os("COZY_TEST_TENSORD").is_none() {
-        eprintln!("skipped: no TensorD (COZY_TEST_TENSORD is unset)");
+    let Some(_) = common::needs("COZY_TEST_TENSORD", common::TENSORD) else {
         return;
-    }
+    };
     let _machine = common::tensord::added(&home, "m1");
     let work = home.path().join("work");
     copy(
@@ -353,13 +358,18 @@ fn unchanged_local_code_is_called_at_once_and_an_edit_only_syncs() {
         );
         let run = completed(&out);
         assert_eq!(run["result"]["text"], text, "{run}");
-        run
+        let installing: Vec<String> = stages(&out)
+            .into_iter()
+            .filter(|s| s.contains("install") || s.contains("sync"))
+            .collect();
+        (run, installing)
     };
     call("first");
     assert_eq!(warm_targets(&home, &work), ["install local/tiny"]);
 
     let began = std::time::Instant::now();
-    let run = call("again");
+    let (run, installing) = call("again");
+    assert!(installing.is_empty(), "{installing:?}");
     let started = run["accepted_at_ms"].as_i64().unwrap() - run["created_at_ms"].as_i64().unwrap();
     eprintln!(
         "unchanged resubmit: accepted {started} ms after creation, completed in {:?}",
@@ -411,10 +421,9 @@ fn unchanged_local_code_is_called_at_once_and_an_edit_only_syncs() {
 #[test]
 fn a_waiting_run_says_why_and_stops_saying_it_once_it_no_longer_waits() {
     let Some(home) = Home::new() else { return };
-    if std::env::var_os("COZY_TEST_TENSORD").is_none() {
-        eprintln!("skipped: no TensorD (COZY_TEST_TENSORD is unset)");
+    let Some(_) = common::needs("COZY_TEST_TENSORD", common::TENSORD) else {
         return;
-    }
+    };
     let _machine = common::tensord::added(&home, "m1");
     let work = home.path().join("work");
     copy(
@@ -507,10 +516,9 @@ fn a_waiting_run_says_why_and_stops_saying_it_once_it_no_longer_waits() {
 #[test]
 fn a_runs_adjustments_reach_its_record() {
     let Some(home) = Home::new() else { return };
-    if std::env::var_os("COZY_TEST_TENSORD").is_none() {
-        eprintln!("skipped: no TensorD (COZY_TEST_TENSORD is unset)");
+    let Some(_) = common::needs("COZY_TEST_TENSORD", common::TENSORD) else {
         return;
-    }
+    };
     let _machine = common::tensord::added(&home, "m1");
     let work = home.path().join("work");
     copy(
@@ -535,7 +543,11 @@ fn a_runs_adjustments_reach_its_record() {
         "{run}"
     );
 
-    let shown = cozy(&home, &work, &["run", "./tiny-adjusted/steps", "--on", "m1"]);
+    let shown = cozy(
+        &home,
+        &work,
+        &["run", "./tiny-adjusted/steps", "--on", "m1"],
+    );
     assert_eq!(shown.code, 0, "{shown:?}");
     eprintln!("{}", shown.stdout);
     for line in [
@@ -544,4 +556,300 @@ fn a_runs_adjustments_reach_its_record() {
     ] {
         assert!(shown.stdout.contains(line), "{line:?} not in {shown:?}");
     }
+}
+
+/// `--attention-kernel` reaches the executor: the run records the pin it was sent, `run show`
+/// says it, and a pin no call could apply (this function has no attention) warns in its log. A
+/// malformed pin is refused before anything is sent.
+#[test]
+fn an_attention_kernel_pin_reaches_the_executor_and_run_show() {
+    let Some(home) = Home::new() else { return };
+    let Some(_) = common::needs("COZY_TEST_TENSORD", common::TENSORD) else {
+        return;
+    };
+    let _machine = common::tensord::added(&home, "m1");
+    let work = home.path().join("work");
+    copy(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/package/tiny-adjusted"),
+        &work.join("tiny-adjusted"),
+    );
+    let pin = "model/unet=sdpa";
+    let steps = [
+        "run",
+        "./tiny-adjusted/steps",
+        "--on",
+        "m1",
+        "--attention-kernel",
+    ];
+
+    let run = completed(&cozy(
+        &home,
+        &work,
+        &[&["--json"], &steps[..], &[pin]].concat(),
+    ));
+    let id = run["id"].as_str().unwrap();
+    let full = cozy(&home, &work, &["--json", "run", "show", id]);
+    let full: Value = serde_json::from_str(&full.stdout).unwrap_or_else(|_| panic!("{full:?}"));
+    // A Runtime before 0.28 names its GPUs `ranks`.
+    let execution = &full["measurements"]["execution"];
+    let first = execution["gpus"]
+        .get(0)
+        .or_else(|| execution["ranks"].get(0));
+    assert_eq!(
+        first.unwrap_or_else(|| panic!("{full}"))["attention"]["requested"],
+        pin,
+        "{full}"
+    );
+
+    let shown = cozy(&home, &work, &["run", "show", id]);
+    eprintln!("{}", shown.stdout);
+    let said = |line: &str| {
+        shown
+            .stdout
+            .lines()
+            .any(|l| l.contains(line) && l.contains(pin))
+    };
+    assert!(said("attention kernel"), "{shown:?}");
+    assert!(said("was never applied"), "{shown:?}");
+
+    let refused = cozy(&home, &work, &[&steps[..], &["unet=a=b"]].concat());
+    assert_eq!(refused.code, 2, "{refused:?}");
+    assert!(
+        refused.stderr.contains("[SLOT/]COMPONENT=KERNEL"),
+        "{refused:?}"
+    );
+}
+
+/// `--asset-fidelity` puts its hint on the attached asset its label or index names, and the
+/// package reads it from the input its machine received; one naming no attached asset is refused
+/// before the run is submitted.
+#[test]
+fn asset_fidelity_reaches_the_package_by_label_or_index() {
+    let Some(home) = Home::new() else { return };
+    let Some(_) = common::needs("COZY_TEST_TENSORD", common::TENSORD) else {
+        return;
+    };
+    let _machine = common::tensord::added(&home, "m1");
+    let work = home.path().join("work");
+    copy(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/package/tiny"),
+        &work.join("tiny"),
+    );
+    let code = work.join("tiny/tiny/__init__.py");
+    let fidelity = "\n\nfrom cozy_runtime.author import Assets, ImageAsset\n\n\n\
+                    class FidelityInput(msgspec.Struct):\n    note: str = \"\"\n\n\n\
+                    class FidelityOutput(msgspec.Struct):\n    fidelity: dict[str, str]\n\n\n\
+                    @app.entrypoint(accelerator=False)\n\
+                    def fidelity(payload: FidelityInput, assets: Assets[ImageAsset]) -> FidelityOutput:\n    \
+                    infos = [assets.info(i) for i in range(len(assets))]\n    \
+                    return FidelityOutput({i.label or str(i.position): i.fidelity for i in infos})\n";
+    let mut text = std::fs::read_to_string(&code).unwrap();
+    text.push_str(fidelity);
+    std::fs::write(&code, text).unwrap();
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/media/azul.png"),
+        work.join("azul.png"),
+    )
+    .unwrap();
+    let run = |second: &str| {
+        let args = [
+            "--json",
+            "run",
+            "./tiny/fidelity",
+            "--asset",
+            "woman=./azul.png",
+            "--asset",
+            "./azul.png",
+            "--asset",
+            "./azul.png",
+            "--asset-fidelity",
+            "woman=high",
+            "--asset-fidelity",
+            second,
+            "--on",
+            "m1",
+        ];
+        cozy(&home, &work, &args)
+    };
+
+    let done = completed(&run("1=low"));
+    assert_eq!(
+        done["result"]["fidelity"],
+        serde_json::json!({"woman": "high", "1": "low", "2": "auto"}),
+        "{done}"
+    );
+
+    let refused = run("3=low");
+    assert_eq!(refused.code, 2, "{refused:?}");
+    assert!(
+        refused.stdout.contains("asset_fidelity_unmatched"),
+        "{refused:?}"
+    );
+}
+
+/// Counts the bytes sent to `target` through it: a TCP relay a machine is added behind.
+struct Relay {
+    address: String,
+    sent: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl Relay {
+    fn to(target: &str) -> Self {
+        use std::{
+            io::{Read as _, Write as _},
+            net::{Shutdown, TcpListener, TcpStream},
+            sync::{
+                Arc,
+                atomic::{AtomicU64, Ordering},
+            },
+        };
+        fn pump(mut from: TcpStream, mut to: TcpStream, count: Option<Arc<AtomicU64>>) {
+            let mut buffer = vec![0; 64 << 10];
+            while let Ok(read @ 1..) = from.read(&mut buffer) {
+                if to.write_all(&buffer[..read]).is_err() {
+                    break;
+                }
+                if let Some(count) = &count {
+                    count.fetch_add(read as u64, Ordering::Relaxed);
+                }
+            }
+            let _ = to.shutdown(Shutdown::Write);
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let sent = Arc::new(AtomicU64::new(0));
+        let (target, counted) = (target.to_owned(), sent.clone());
+        std::thread::spawn(move || {
+            for client in listener.incoming().flatten() {
+                let Ok(machine) = TcpStream::connect(&target) else {
+                    continue;
+                };
+                let (back, forth) = (machine.try_clone().unwrap(), client.try_clone().unwrap());
+                let counted = counted.clone();
+                std::thread::spawn(move || pump(client, machine, Some(counted)));
+                std::thread::spawn(move || pump(back, forth, None));
+            }
+        });
+        Self { address, sent }
+    }
+
+    fn sent(&self) -> u64 {
+        self.sent.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// Owner: "inputs that were already uploaded shouldn't be uploaded again by the client". A second
+/// run with the same video and image to the same machine sends none of their bytes (counted on
+/// the way to the machine) and says it reused them; the client read each file once, its digest
+/// remembered by the file's path, length and time.
+#[test]
+fn a_second_run_reuses_the_video_and_image_its_machine_holds() {
+    let Some(home) = Home::new() else { return };
+    let Some(_) = common::needs("COZY_TEST_TENSORD", common::TENSORD) else {
+        return;
+    };
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let mut machine =
+        common::tensord::Tensord::start_on(Some(port), &[common::tensord::stranger()], &[]);
+    let relay = Relay::to(&machine.address);
+    let fingerprint = machine.fingerprint.clone();
+    let add = || {
+        home.cozy([
+            "machine",
+            "add",
+            "m1",
+            &relay.address,
+            "--fingerprint",
+            &fingerprint,
+            "--json",
+        ])
+    };
+    machine.restart(&[common::tensord::key_to_authorize(&add())]);
+    let added = add();
+    assert_eq!(added.code, 0, "{added:?}");
+
+    let work = home.path().join("work");
+    copy(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/package/tiny"),
+        &work.join("tiny"),
+    );
+    let code = work.join("tiny/tiny/__init__.py");
+    let reuse = "\n\nfrom cozy_runtime.author import FileAsset\n\n\n\
+                 class ReuseInput(msgspec.Struct):\n    video: FileAsset\n    image: FileAsset\n\n\n\
+                 class ReuseOutput(msgspec.Struct):\n    video: int\n    image: int\n\n\n\
+                 @app.entrypoint(accelerator=False)\n\
+                 def reuse(payload: ReuseInput) -> ReuseOutput:\n    \
+                 return ReuseOutput(len(payload.video.read_bytes()), len(payload.image.read_bytes()))\n";
+    let mut text = std::fs::read_to_string(&code).unwrap();
+    text.push_str(reuse);
+    std::fs::write(&code, text).unwrap();
+    let video: Vec<u8> = (0..16u32 << 20)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    std::fs::write(work.join("clip.mp4"), &video).unwrap();
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/media/azul.png"),
+        work.join("azul.png"),
+    )
+    .unwrap();
+
+    let run = || {
+        let before = relay.sent();
+        let args = [
+            "--json",
+            "run",
+            "./tiny/reuse",
+            "--asset",
+            "video=./clip.mp4",
+            "--asset",
+            "image=./azul.png",
+            "--on",
+            "m1",
+        ];
+        let out = cozy(&home, &work, &args);
+        let run = completed(&out);
+        assert_eq!(run["result"]["video"], 16 << 20, "{run}");
+        let said: Vec<String> = out
+            .stdout
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter_map(|e| match e["type"].as_str() {
+                Some("run.waiting") => e["reason"].as_str().map(str::to_owned),
+                Some("run.log") => {
+                    Some(format!("{}: {}", e["level"].as_str()?, e["text"].as_str()?))
+                }
+                _ => None,
+            })
+            .collect();
+        (run["number"].to_string(), said, relay.sent() - before)
+    };
+    let (_, first, sent) = run();
+    assert!(
+        sent > 16 << 20,
+        "the first run sent {sent} bytes: {first:?}"
+    );
+
+    let (number, second, sent) = run();
+    assert!(
+        sent < 1 << 20,
+        "the second run sent {sent} bytes, its files among them: {second:?}"
+    );
+    assert!(
+        !second.iter().any(|r| r.starts_with("uploading ")),
+        "{second:?}"
+    );
+    // The run's log keeps it: its follower and `run show` say it, however late they look.
+    let reused = "inputs: reused image, video (16.0 MiB): m1 already holds them";
+    assert!(second.iter().any(|r| r == reused), "{second:?}");
+    let shown = cozy(&home, &work, &["run", "show", &number]);
+    assert!(shown.stdout.contains(reused), "{shown:?}");
+    // Each file was read once on this computer: its digest is remembered.
+    let remembered = std::fs::read_dir(home.root().join("cache/digests"))
+        .unwrap()
+        .count();
+    assert_eq!(remembered, 2);
 }

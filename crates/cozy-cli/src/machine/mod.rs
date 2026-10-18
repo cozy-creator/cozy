@@ -14,6 +14,8 @@ use crate::{Context, output};
 mod end;
 mod list;
 pub(crate) mod live;
+mod local;
+pub(crate) use local::{Adopted, adopt};
 mod rent;
 
 pub(crate) use list::status_fields;
@@ -67,13 +69,19 @@ enum Verb {
     Update {
         name: String,
         /// Install this cozy-runtime wheel instead of the Hub's target: a local file, or
-        /// https://…/<wheel>#sha256=<hex>, which the machine fetches itself.
+        /// https://…/<wheel>#sha256=<hex>, which the machine fetches itself. Alone, the machine
+        /// keeps its tensorfs when the wheel accepts it, else installs PyPI's newest that it does.
         #[arg(long, value_name = "FILE|URL")]
         runtime_wheel: Option<std::path::PathBuf>,
         /// Install this tensorfs wheel instead of the Hub's target: a local file, or
         /// https://…/<wheel>#sha256=<hex>, which the machine fetches itself.
         #[arg(long, value_name = "FILE|URL")]
         tensorfs_wheel: Option<std::path::PathBuf>,
+    },
+    /// A machine's build toolchain, for cards no prebuilt kernel serves.
+    Toolchain {
+        #[command(subcommand)]
+        verb: ToolchainVerb,
     },
     /// Add another computer's machine by its address and TLS fingerprint.
     Add {
@@ -90,6 +98,16 @@ enum Verb {
     Disable,
     /// On this computer: let the controller with this public key use this machine.
     Authorize { public_key: String },
+}
+
+#[derive(Subcommand, Debug)]
+enum ToolchainVerb {
+    /// Install CUDA's compiler, its headers and ninja on the machine (about 130 MB), as a run.
+    Install {
+        /// The machine.
+        #[arg(long, default_value = "local")]
+        on: String,
+    },
 }
 
 pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
@@ -110,10 +128,12 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
             runtime_wheel,
             tensorfs_wheel,
         } => end::update(ctx, &name, runtime_wheel, tensorfs_wheel).await,
-        // This computer's machine role needs TensorD inside the binary.
-        Verb::Enable => Err(crate::not_ported("machine enable")),
-        Verb::Disable => Err(crate::not_ported("machine disable")),
-        Verb::Authorize { .. } => Err(crate::not_ported("machine authorize")),
+        Verb::Toolchain {
+            verb: ToolchainVerb::Install { on },
+        } => end::toolchain(ctx, &on).await,
+        Verb::Enable => local::enable(ctx).await,
+        Verb::Disable => local::disable(ctx).await,
+        Verb::Authorize { public_key } => local::authorize(ctx, &public_key),
     }
 }
 

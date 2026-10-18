@@ -187,6 +187,13 @@ pub(super) fn parent_of(pid: u32) -> io::Result<u32> {
 
 /// Every process with its parent.
 pub(super) fn parents() -> Vec<(u32, u32)> {
+    pids()
+        .into_iter()
+        .filter_map(|pid| Some((pid, info(pid).ok()?.pbi_ppid)))
+        .collect()
+}
+
+fn pids() -> Vec<u32> {
     // SAFETY: a null buffer asks for the count.
     let count = unsafe { libc::proc_listallpids(ptr::null_mut(), 0) };
     if count <= 0 {
@@ -198,23 +205,58 @@ pub(super) fn parents() -> Vec<(u32, u32)> {
     // SAFETY: a writable buffer of the length given.
     let listed = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
     pids.truncate(listed.max(0) as usize);
-    pids.into_iter()
-        .filter(|pid| *pid > 0)
-        .filter_map(|pid| Some((pid as u32, info(pid as u32).ok()?.pbi_ppid)))
+    pids.into_iter().filter(|pid| *pid > 0).map(|pid| pid as u32).collect()
+}
+
+pub(super) fn group_members(leader: &Birth) -> Vec<Birth> {
+    pids()
+        .into_iter()
+        .filter(|pid| *pid != leader.pid)
+        .filter_map(|pid| {
+            let info = info(pid).ok()?;
+            (info.pbi_pgid == leader.pid && start(&info) >= leader.start_ticks).then(|| Birth {
+                pid,
+                boot_id: String::new(),
+                start_ticks: start(&info),
+            })
+        })
         .collect()
 }
 
-/// Groups and meters are read only on Linux so far: unreadable here, which decides nothing.
-pub(super) fn group_members(_: &Birth) -> Vec<Birth> {
-    Vec::new()
+/// CPU nanoseconds and disk bytes moved. macOS keeps no time a thread waited runnable, and
+/// counts disk bytes, not every byte read and written as Linux does.
+pub(super) fn meter(pid: u32) -> Option<(u64, u64)> {
+    let usage = rusage(pid)?;
+    let cpu = nanoseconds(usage.ri_user_time.saturating_add(usage.ri_system_time));
+    Some((cpu, usage.ri_diskio_bytesread.saturating_add(usage.ri_diskio_byteswritten)))
 }
 
-pub(super) fn meter(_: u32) -> Option<(u64, u64)> {
-    None
+/// Disk bytes read.
+pub(super) fn read_bytes(pid: u32) -> Option<u64> {
+    Some(rusage(pid)?.ri_diskio_bytesread)
 }
 
-pub(super) fn read_bytes(_: u32) -> Option<u64> {
-    None
+fn rusage(pid: u32) -> Option<libc::rusage_info_v2> {
+    // SAFETY: plain-old-data the call fills.
+    let mut usage: libc::rusage_info_v2 = unsafe { mem::zeroed() };
+    let buffer = (&mut usage as *mut libc::rusage_info_v2).cast::<libc::rusage_info_t>();
+    // SAFETY: a writable record of the flavor named.
+    (unsafe { libc::proc_pid_rusage(pid as libc::c_int, libc::RUSAGE_INFO_V2, buffer) } == 0)
+        .then_some(usage)
+}
+
+/// `rusage_info` times are Mach ticks (not nanoseconds on Apple silicon). libc marks the timebase
+/// deprecated in favor of the mach2 crate; this one call is all it takes.
+#[allow(deprecated)]
+fn nanoseconds(ticks: u64) -> u64 {
+    static TIMEBASE: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+    let (numer, denom) = *TIMEBASE.get_or_init(|| {
+        let mut base = libc::mach_timebase_info { numer: 0, denom: 0 };
+        // SAFETY: a writable timebase record.
+        unsafe { libc::mach_timebase_info(&mut base) };
+        (u64::from(base.numer.max(1)), u64::from(base.denom.max(1)))
+    });
+    (u128::from(ticks) * u128::from(numer) / u128::from(denom)) as u64
 }
 
 pub(super) fn become_subreaper() -> crate::Result<()> {

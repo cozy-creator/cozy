@@ -108,6 +108,8 @@ struct Gpu {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct Attention {
+    /// The request's pin ("" = the machine's own selection).
+    requested: String,
     kernels: Vec<Kernel>,
 }
 
@@ -175,7 +177,6 @@ pub async fn exec(ctx: &Context, id: &str, once: bool) -> Result<ExitCode, Error
         output::json(&run);
         return Ok(ExitCode::SUCCESS);
     }
-    follow::fields(ctx, &run).print(ctx);
     let execution = run
         .settled_at_ms
         .zip(run.execution_ms)
@@ -184,6 +185,11 @@ pub async fn exec(ctx: &Context, id: &str, once: bool) -> Result<ExitCode, Error
         run.measurements.as_ref().map(|m| (m, execution)),
         &run.calls,
     );
+    let mut fields = follow::fields(ctx, &run);
+    if let Some(pin) = requested(&measured) {
+        fields = fields.field("attention kernel", pin);
+    }
+    fields.print(ctx);
     let stages = grid(&["STAGE", "TIME", "DETAIL"], &measured, stage_rows);
     stages.print(ctx, "stages");
     grid(&["SLOT", "MODEL", "LANE"], &measured, model_rows).print(ctx, "models");
@@ -242,8 +248,9 @@ pub async fn exec(ctx: &Context, id: &str, once: bool) -> Result<ExitCode, Error
             }
         }
     }
-    if !follow::settled(&run) {
-        follow::next(ctx, &run);
+    match follow::settled(&run) {
+        true => follow::toolchain_offer(ctx, &run),
+        false => follow::next(ctx, &run),
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -436,6 +443,19 @@ fn component_rows(measured: &Measured) -> Vec<Vec<String>> {
         vec![component.to_owned(), or_dash(&attention), or_dash(&gemm)]
     };
     components.into_iter().map(row).collect()
+}
+
+/// The attention kernel the run pinned, as its executors recorded it.
+fn requested(measured: &[Measured]) -> Option<String> {
+    let mut pins: Vec<&str> = measured
+        .iter()
+        .flat_map(|m| m.m.execution.gpus.iter().chain(&m.m.execution.ranks))
+        .map(|gpu| gpu.attention.requested.as_str())
+        .filter(|pin| !pin.is_empty())
+        .collect();
+    pins.sort_unstable();
+    pins.dedup();
+    (!pins.is_empty()).then(|| pins.join(", "))
 }
 
 /// Every GPU's attention kernels: the one that served, and the others with why not.

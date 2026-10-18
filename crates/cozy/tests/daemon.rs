@@ -2,8 +2,12 @@
 //! `down` (which stops no work), replaced when killed, and a refusal to start said in its own words.
 mod common;
 
-#[cfg(unix)]
-use std::io::Write as _;
+use std::{
+    io::{BufRead as _, BufReader, Write as _},
+    process::Stdio,
+    sync::mpsc,
+    time::Duration,
+};
 
 use common::Home;
 use serde_json::Value;
@@ -92,6 +96,64 @@ fn up_without_systemctl_serves_and_warns_once() {
     assert_eq!(home.json(["down", "--json"])["changed"], true);
 }
 
+/// `cozy logs calcifer --follow` prints each line once as it is written, across two rotations to
+/// `calcifer.log.1`: woken by a watch on the log's directory, on every OS.
+#[test]
+fn calcifer_s_log_is_followed_across_rotations_without_a_line_missed_or_repeated() {
+    let Some(home) = Home::new() else { return };
+    let dir = home.root().join("calcifer");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("calcifer.log");
+    let open = || {
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).append(true).open(&path).unwrap()
+    };
+    // Written as Calcifer writes it: line by line through a handle it keeps open, which a
+    // rotation leaves on the renamed file.
+    let mut file = open();
+    let mut write = |n: usize| {
+        if n > 0 && n.is_multiple_of(400) {
+            std::fs::rename(&path, dir.join("calcifer.log.1")).unwrap();
+            file = open();
+        }
+        file.write_all(format!("line {n}\n").as_bytes()).unwrap();
+    };
+    write(0);
+    let mut follower = home
+        .command()
+        .args(["logs", "calcifer", "--follow"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let (sent, read) = mpsc::channel();
+    let out = BufReader::new(follower.stdout.take().unwrap());
+    std::thread::spawn(move || {
+        for line in out.lines() {
+            if sent.send(line.unwrap()).is_err() {
+                break;
+            }
+        }
+    });
+    // A hang bound for a follower that stopped; the product waits without one.
+    let next = || read.recv_timeout(Duration::from_secs(60)).ok();
+    assert_eq!(
+        next().as_deref(),
+        Some("line 0"),
+        "the follower printed the log"
+    );
+    (1..1000).for_each(write);
+    let mut got = vec![];
+    while got.len() < 999
+        && let Some(line) = next()
+    {
+        got.push(line);
+    }
+    follower.kill().unwrap();
+    follower.wait().unwrap();
+    let expected: Vec<String> = (1..1000).map(|n| format!("line {n}")).collect();
+    assert_eq!(got, expected);
+}
+
 /// A Calcifer killed before it could erase its record is not mistaken for a live one.
 #[test]
 fn a_killed_calcifer_is_replaced() {
@@ -163,13 +225,9 @@ fn commands_racing_down_reach_a_live_calcifer() {
 #[test]
 fn status_shows_the_machines() {
     let Some(home) = Home::new() else { return };
-    if std::env::var_os("COZY_TEST_TENSORD").is_none() {
-        let _ = writeln!(
-            std::io::stderr(),
-            "skipped: no TensorD (COZY_TEST_TENSORD is unset)"
-        );
+    let Some(_) = common::needs("COZY_TEST_TENSORD", common::TENSORD) else {
         return;
-    }
+    };
     let _machine = common::tensord::added(&home, "box");
     let status = home.json(["status", "--json"]);
     let machines = status["machines"].as_array().unwrap();

@@ -218,12 +218,20 @@ fn hand_on(inner: &Arc<Inner>, c: &mut Core, id: u64, k: u64, freed: Option<EvRe
     pump(inner, c, id)
 }
 
-/// A streamed lease ended: its bytes are reusable after `ev`.
-pub(crate) fn release_ring(inner: &Arc<Inner>, c: &mut Core, id: u64, k: u64, ev: EvRef) -> Result<()> {
-    c.cursors.get_mut(&id).ok_or_else(|| closed(id))?.live -= 1;
-    hand_on(inner, c, id, k, Some(ev))?;
+/// A streamed lease ended: its ring bytes are reusable as `freed` says (None: not before close).
+/// The books are settled before the next copies are queued; Err is only that queueing.
+pub(crate) fn release_ring(inner: &Arc<Inner>, c: &mut Core, id: u64, k: u64, freed: Option<Option<EvRef>>) -> Result<()> {
+    let Some(cur) = c.cursors.get_mut(&id) else { return Ok(()) };
+    cur.live -= 1;
+    let pumped = match freed {
+        Some(ev) => hand_on(inner, c, id, k, ev),
+        None => {
+            cur.done += 1;
+            Ok(())
+        }
+    };
     reap(inner, c, id);
-    Ok(())
+    pumped
 }
 
 /// Finish an orphaned cursor once nothing uses its ring.
@@ -240,9 +248,18 @@ fn reap(inner: &Arc<Inner>, c: &mut Core, id: u64) {
 /// failed copy is drained before it is reported). A poisoned plane keeps the ring mapped.
 fn finish(inner: &Arc<Inner>, c: &mut Core, id: u64) -> Result<()> {
     c.check()?;
-    let cur = c.cursors.remove(&id).ok_or_else(|| closed(id))?;
-    let d = cur.dev;
+    let d = c.cursors.get(&id).ok_or_else(|| closed(id))?.dev;
     let _g = inner.devices[d].bind()?;
+    let cur = c.cursors.remove(&id).unwrap();
+    if let Ok(w) = c.ws_mut(cur.ws) {
+        if let Some(dw) = w.devs[d].as_mut() {
+            for (i, &r) in cur.order.iter().enumerate() {
+                if cur.home[i] {
+                    dw.regs[r as usize].holds -= 1;
+                }
+            }
+        }
+    }
     let freed = cur.placed.iter().filter_map(|p| p.freed.as_ref().and_then(Option::as_ref));
     if let Err(e) = cur.ready.values().flatten().chain(freed).try_for_each(|e| e.sync()) {
         return Err(c.poison(format!("waiting for a ring's copies and readers failed: {e}")));
@@ -254,15 +271,6 @@ fn finish(inner: &Arc<Inner>, c: &mut Core, id: u64) -> Result<()> {
         c.arenas[d].mapped -= cur.ring_len;
         c.arenas[d].put_idle(cur.ring_chunks);
         device::free_va(cur.ring_base, cur.ring_len)?;
-    }
-    if let Ok(w) = c.ws_mut(cur.ws) {
-        if let Some(dw) = w.devs[d].as_mut() {
-            for (i, &r) in cur.order.iter().enumerate() {
-                if cur.home[i] {
-                    dw.regs[r as usize].holds -= 1;
-                }
-            }
-        }
     }
     c.arenas[d].trim()?;
     Ok(())

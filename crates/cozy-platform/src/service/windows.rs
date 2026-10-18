@@ -149,3 +149,8 @@ fn registry(op: &'static str, status: u32) -> Result<()> {
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(iter::once(0)).collect()
 }
+
+/// Only a manager that restarts services can say one failed to start.
+pub(super) fn failed(_: &str) -> bool {
+    false
+}

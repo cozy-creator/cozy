@@ -1,6 +1,7 @@
 //! The machine's sealed host tier on the real path: a real TensorFS store, TensorFS's verified
 //! fill, real executor stand-in processes (their pidfds hold layouts), and TensorFS's own
 //! read-only adoption (`Plane::register_sealed`) checking every byte.
+#![cfg(target_os = "linux")]
 use cozy_platform::contain::host_memory::HostMemory;
 use tensord::host_tier::{HostGrant, HostTier, HostTierConfig, SealedRequest, TierLimit};
 use sha2::{Digest, Sha256};
@@ -235,18 +236,11 @@ fn sealed(body: &[u8]) -> File {
 struct Executor(Child);
 impl Executor {
     fn spawn(tier: &HostTier) -> (Self, u64) {
-        Self::spawn_as(tier, false)
-    }
-    /// One that reads a layout's holes from object files (`host_tiers.staged/1`).
-    fn spawn_staged(tier: &HostTier) -> (Self, u64) {
-        Self::spawn_as(tier, true)
-    }
-    fn spawn_as(tier: &HostTier, staged: bool) -> (Self, u64) {
         let child = Command::new("sleep").arg("1000").spawn().unwrap();
         // SAFETY: pidfd_open of our own live child.
         let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id() as libc::c_int, 0) };
         assert!(pidfd >= 0);
-        let peer = tier.register_peer(unsafe { File::from_raw_fd(pidfd as i32) }, staged);
+        let peer = tier.register_peer(unsafe { File::from_raw_fd(pidfd as i32) });
         (Self(child), peer)
     }
     fn exit(mut self) {
@@ -274,7 +268,6 @@ fn tier(fx: &Fixture, limit: u64) -> Arc<HostTier> {
         HostTierConfig {
             fill_threads: 3,
             ttl: Duration::from_secs(3600),
-            plans: None,
         },
         Box::new(Fixed(limit)),
     )
@@ -366,7 +359,6 @@ fn unheld_layouts_go_oldest_first_and_held_ones_never() {
         HostTierConfig {
             fill_threads: 2,
             ttl: Duration::from_secs(3600),
-            plans: None,
         },
         Box::new(Fixed(size + size / 2)),
     )
@@ -416,7 +408,6 @@ fn a_released_layout_something_still_holds_stays_charged() {
         HostTierConfig {
             fill_threads: 2,
             ttl: Duration::from_secs(3600),
-            plans: None,
         },
         Box::new(Fixed(size + size / 2)),
     )
@@ -670,73 +661,6 @@ fn inside_a_256_mib_scope() {
     );
 }
 
-/// A machine restart (a new tier, empty) refills a model's layouts from the plans it
-/// remembered while that model's executor starts; the executor's ask then finds them filled.
-#[test]
-fn remembered_plans_refill_layouts_before_the_executor_asks() {
-    let fx = Fixture::new("prefill", &[3 * MIB, 40 * MIB]);
-    let plans = fx.root.join("plans");
-    let config = HostTierConfig {
-        fill_threads: 2,
-        ttl: Duration::from_secs(3600),
-        plans: Some(plans.clone()),
-    };
-    let first = HostTier::new(fx.store.clone(), config.clone(), Box::new(Fixed(1 << 30))).unwrap();
-    let (executor, a) = Executor::spawn(&first);
-    fx.adopt(&ask(&first, a, &fx).unwrap());
-    settled(&first); // remembered once filled
-    executor.exit();
-    drop(first);
-    assert_eq!(fs::read_dir(&plans).unwrap().count(), 1);
-
-    let second = HostTier::new(fx.store.clone(), config, Box::new(Fixed(1 << 30))).unwrap();
-    second.prepare(vec![fx.grant()], false);
-    // The executor would be importing now; its ask waits for the fill under way, or hits.
-    let (_executor, b) = Executor::spawn(&second);
-    fx.adopt(&ask(&second, b, &fx).expect("prefilled"));
-    let facts = settled(&second);
-    assert_eq!(
-        (
-            facts.ledger.fills.len(),
-            facts.ledger.prefills,
-            facts.entries
-        ),
-        (1, 1, 1),
-        "{facts:?}"
-    );
-}
-
-/// A first-ever model: no plan yet, so at admission the tier allocates each component's
-/// memory from the manifest; the executor's plan then fills into it (and frees the excess).
-#[test]
-fn a_first_load_fills_into_memory_reserved_at_admission() {
-    let fx = Fixture::new("reserve", &[3 * MIB, 40 * MIB]);
-    let tier = tier(&fx, 1 << 30);
-    tier.prepare(vec![fx.grant()], false);
-    // prepare reserves on its own thread; the scenario asks once that allocation is under way.
-    while tier.facts().reserved_bytes == 0 {
-        std::thread::sleep(std::time::Duration::from_millis(1));
-    }
-    let (_executor, a) = Executor::spawn(&tier);
-    // The ask waits for an allocation under way rather than allocating again.
-    let granted = ask(&tier, a, &fx).expect("room");
-    fx.adopt(&granted);
-    let facts = tier.facts();
-    assert_eq!(
-        (
-            facts.ledger.reserved,
-            facts.ledger.reserved_used,
-            facts.reserved_bytes
-        ),
-        (1, 1, 0),
-        "{facts:?}"
-    );
-    assert!(
-        facts.charged_bytes < (43 * MIB + (4 << 20)) as u64,
-        "the excess was freed: {facts:?}"
-    );
-}
-
 /// A first load with nothing filled: the executor gets its layout the moment it is created and
 /// each region the moment it is in, so its load never waits for the whole fill; an older
 /// executor asking for the same layout gets it complete.
@@ -940,7 +864,7 @@ fn staged_ask(tier: &HostTier, peer: u64, fx: &Fixture, stage: &[u32]) -> File {
 fn a_staged_executor_gets_only_what_it_streams_staged_and_object_files_for_the_rest() {
     let fx = Fixture::new("staged", &[8 * MIB; 4]);
     let tier = tier(&fx, 1 << 30);
-    let (_executor, a) = Executor::spawn_staged(&tier);
+    let (_executor, a) = Executor::spawn(&tier);
     let granted = staged_ask(&tier, a, &fx, &[0]);
     let layout = fx.layout();
     let host = varena::host::HostMem::adopt_sealed(granted.as_raw_fd(), &layout).unwrap();
@@ -997,7 +921,7 @@ fn a_staged_executor_gets_only_what_it_streams_staged_and_object_files_for_the_r
 fn without_room_a_staged_executor_reads_every_region_from_the_files() {
     let fx = Fixture::new("staged-none", &[8 * MIB; 4]);
     let tier = tier(&fx, MIB as u64);
-    let (_executor, a) = Executor::spawn_staged(&tier);
+    let (_executor, a) = Executor::spawn(&tier);
     let granted = staged_ask(&tier, a, &fx, &[0, 1, 2, 3]);
     let host = varena::host::HostMem::adopt_sealed(granted.as_raw_fd(), &fx.layout()).unwrap();
     assert!((0..4).all(|r| host.hole(r)));
@@ -1014,7 +938,7 @@ fn a_whole_reader_takes_a_window_when_a_layout_staged_in_part_cannot_grow() {
     let fx = Fixture::new("sparse-to-whole", &[8 * MIB; 4]);
     let limit = 24 * MIB as u64;
     let tier = tier(&fx, limit);
-    let (_staged, a) = Executor::spawn_staged(&tier);
+    let (_staged, a) = Executor::spawn(&tier);
     let sparse = staged_ask(&tier, a, &fx, &[0]);
     let layout = fx.layout();
     let host = varena::host::HostMem::adopt_sealed(sparse.as_raw_fd(), &layout).unwrap();
@@ -1085,9 +1009,9 @@ fn a_staged_region_waits_on_its_ticket_and_nothing_else_downloads() {
     let access = tensord::access::of(&hub, &at).unwrap();
     Fetcher::of(&store).unwrap().want(&at, access, &[], Priority::Now).wait(&[], &PullCancellation::default()).unwrap();
     let structure = gets();
-    let tier = HostTier::new(store.clone(), HostTierConfig { fill_threads: 2, ttl: Duration::from_secs(3600), plans: None }, Box::new(Fixed(1 << 30))).unwrap();
+    let tier = HostTier::new(store.clone(), HostTierConfig { fill_threads: 2, ttl: Duration::from_secs(3600) }, Box::new(Fixed(1 << 30))).unwrap();
     let fetch = tensord::access::Fetch::new(store.clone(), Some(hub), vec![fx.manifest.clone()], 1);
-    let (_executor, a) = Executor::spawn_staged(&tier);
+    let (_executor, a) = Executor::spawn(&tier);
     let (plan, sha256, length) = fx.plan(&["unet"]);
     let cold = SealedRequest { sha256: &sha256, length, stage: Some(&[]) };
     let granted = tier.seal(a, &[fx.grant()], cold, plan, Some(&fetch)).unwrap().expect("a layout with nothing staged");

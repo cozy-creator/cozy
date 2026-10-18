@@ -57,7 +57,7 @@ pub fn hubs(current: &OsStr) -> Vec<CompletionCandidate> {
         .filter_map(|hub| {
             let name = hub.name?;
             name.starts_with(&prefix)
-                .then(|| CompletionCandidate::new(name).help(Some(hub.origin.into())))
+                .then(|| CompletionCandidate::new(name).help(Some(hub.origin.to_string().into())))
         })
         .collect()
 }

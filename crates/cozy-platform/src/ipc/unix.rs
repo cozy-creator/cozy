@@ -21,6 +21,11 @@ impl LocalListener {
             .map_err(Error::io("listen", path))
     }
 
+    /// Every dialer, one at a time, as `UnixListener::incoming` gives them.
+    pub fn incoming(&self) -> impl Iterator<Item = Result<LocalStream>> + '_ {
+        std::iter::repeat_with(|| self.accept())
+    }
+
     pub fn accept(&self) -> Result<LocalStream> {
         Ok(self.0.accept().map_err(Error::os("accept"))?.0)
     }

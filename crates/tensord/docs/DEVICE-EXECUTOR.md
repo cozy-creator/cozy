@@ -65,19 +65,8 @@ allocations, but that executor still needs its own model objects and CUDA contex
 
 ## Capabilities
 
-`Hello.memory` lists offered capabilities. A missing one fails only that command with `Unsupported`.
-
-| Command field | Requires |
-|---|---|
-| `Start.import_only` | `import_only` |
-| `Budget` | `weight_plane/1` |
-| `Load.device_weights`, `share` | `weights.attach/1` |
-| `revoke` | `weights.revoke/1` |
-| `Load.descriptor_sources` | `model_sources.descriptors/1` and degree 1 |
-| `Load.sealed_tiers` | `host_tiers.sealed/1` and `weight_plane/1` |
-| `Load.pinned_bytes` | `load_pinned/1` and `weight_plane/1` |
-
-Hello's version and revision fields are provenance only. There is no SDK or TensorFS version gate.
+The oldest Runtime is 0.27.0, which takes every command and field here; `Hello.memory` is not
+read. Hello's version fields are provenance only. There is no SDK or TensorFS version gate.
 
 ## Observations
 

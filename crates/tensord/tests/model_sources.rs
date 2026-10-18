@@ -2,10 +2,10 @@
 //! header and assets it serves an executor that reads no store.
 use tensord::model_sources::{ModelSources, SelectedManifest};
 use sha2::{Digest, Sha256};
-use std::{
-    fs, io,
-    os::{fd::AsRawFd, unix::fs::FileExt},
-};
+use cozy_platform::durable::FileAt as _;
+use std::{fs, io};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use tensorfs_core::{
     dtype::Dtype,
     header::{Asset, Header, Part, Tensor},
@@ -133,6 +133,7 @@ fn a_selection_grants_its_headers_and_sizes_and_nothing_else() {
         components: vec!["absent".into()],
     };
     assert!(ModelSources::open(&root, &[absent]).is_err());
+    drop((sources, none));
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -170,17 +171,22 @@ fn the_selection_serves_its_header_and_assets_sealed_and_nothing_else() {
             ),
         }
         // SAFETY: scalar fcntl queries on a descriptor we hold.
+        #[cfg(unix)]
         unsafe {
             assert_eq!(
                 libc::fcntl(file.as_raw_fd(), libc::F_GETFL) & libc::O_ACCMODE,
                 libc::O_RDONLY
             );
+            #[cfg(target_os = "linux")]
             assert_eq!(
                 libc::fcntl(file.as_raw_fd(), libc::F_GET_SEALS) & 0x8,
                 0x8,
                 "write-sealed"
             );
         }
+        // Windows: the handle is read-only, so a write through it is refused.
+        #[cfg(windows)]
+        assert!(std::io::Write::write_all(&mut &file, b"x").is_err(), "read-only");
     }
     assert!(
         sources.serve(&frame(&manifest, "../tfs.sqlite")).is_err(),
@@ -191,5 +197,6 @@ fn the_selection_serves_its_header_and_assets_sealed_and_nothing_else() {
         sources.serve(&frame(&other, "")).is_err(),
         "only selected manifests"
     );
+    drop(sources);
     fs::remove_dir_all(root).unwrap();
 }

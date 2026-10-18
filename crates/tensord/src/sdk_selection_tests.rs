@@ -1,6 +1,6 @@
-use tensord::published::PackageSdk;
-use tensord::machine::update::Paths;
-use std::{fs, os::unix::fs::symlink, path::Path};
+use crate::published::PackageSdk;
+use crate::machine::update::{relink, Paths};
+use std::{fs, path::Path};
 
 const RUNTIME: &str = "cozy_runtime-0.21.1-py3-none-any.whl";
 const TENSORFS: &str = "tensorfs-0.6.1-cp312-abi3-linux_x86_64.whl";
@@ -22,7 +22,7 @@ fn an_activated_sdk_selection_survives_a_same_filename_link_switch() {
     pair(&first, b"first Runtime build");
     pair(&second, b"second Runtime build");
     let link = engine.join("sdk/current");
-    symlink(&first, &link).unwrap();
+    relink(&link, Some(&first)).unwrap();
     let paths = Paths::new(&engine, &root);
     let before = PackageSdk::selected(&paths.sdk(), &root, "uv".into());
     let before_runtime = before
@@ -34,9 +34,7 @@ fn an_activated_sdk_selection_survives_a_same_filename_link_switch() {
 
     // The real update path atomically selects a new immutable candidate. Filenames
     // and version labels are unchanged, as in a rebuilt unpublished candidate.
-    let replacement = engine.join("sdk/next");
-    symlink(&second, &replacement).unwrap();
-    fs::rename(replacement, &link).unwrap();
+    relink(&link, Some(&second)).unwrap();
     let after = PackageSdk::selected(&paths.sdk(), &root, "uv".into());
     // Both the local installer and published installer consume these exact paths;
     // their cache keys must describe the bytes the helper will later open.
@@ -56,8 +54,8 @@ fn an_activated_sdk_selection_survives_a_same_filename_link_switch() {
         .find(|p| p.ends_with(RUNTIME))
         .unwrap();
     assert_eq!(fs::read(after_runtime).unwrap(), b"second Runtime build");
-    assert_eq!(before.find_links, Some(first.canonicalize().unwrap()));
-    assert_eq!(after.find_links, Some(second.canonicalize().unwrap()));
+    assert_eq!(before.find_links, Some(cozy_platform::durable::canonical(&first).unwrap()));
+    assert_eq!(after.find_links, Some(cozy_platform::durable::canonical(&second).unwrap()));
     let repeated = PackageSdk::selected(&paths.sdk(), &root, "uv".into());
     assert_eq!(repeated.requirements, after.requirements);
     assert_eq!(repeated.find_links, after.find_links);
@@ -77,7 +75,7 @@ fn image_sdk_selection_preserves_baked_and_absent_pair_behavior() {
     pair(&baked, b"baked Runtime");
     let paths = Paths::new(&engine, &root);
     let selected = PackageSdk::selected(&paths.sdk(), &root, "uv".into());
-    assert_eq!(selected.find_links, Some(baked.canonicalize().unwrap()));
+    assert_eq!(selected.find_links, Some(cozy_platform::durable::canonical(&baked).unwrap()));
     assert_eq!(selected.requirements.len(), 2);
     fs::remove_file(baked.join(TENSORFS)).unwrap();
     let incomplete = PackageSdk::selected(&paths.sdk(), &root, "uv".into());
@@ -91,7 +89,7 @@ fn image_sdk_selection_preserves_baked_and_absent_pair_behavior() {
 #[test]
 #[ignore = "requires COZY_SDK_TEST_RUNTIME_A/B, COZY_SDK_TEST_TENSORFS, COZY_SDK_TEST_REPORT and cached offline uv dependencies"]
 fn same_filename_activation_installs_new_runtime_and_retains_old_generation() {
-    use tensord::{
+    use crate::{
         api::install::InstallerConfig, local_source::LocalSources, machine::client,
         objects::Objects, service::Service,
     };
@@ -124,7 +122,7 @@ fn same_filename_activation_installs_new_runtime_and_retains_old_generation() {
         fs::copy(&tensorfs, dir.join(tensorfs.file_name().unwrap())).unwrap();
     }
     let link = engine.join("sdk/current");
-    symlink(&first, &link).unwrap();
+    relink(&link, Some(&first)).unwrap();
     let paths = Paths::new(&engine, &root);
     let client = client::wheel(&engine).unwrap();
     let helper = client::helper(&engine, Path::new("uv"), &client).unwrap();
@@ -135,11 +133,7 @@ fn same_filename_activation_installs_new_runtime_and_retains_old_generation() {
     );
     let write = |bytes: &[u8]| {
         let digest = format!("sha256:{}", sha256::hex_digest(bytes));
-        let mut writer = objects
-            .begin("alice", &digest, bytes.len() as u64, 0)
-            .unwrap();
-        writer.append(bytes).unwrap();
-        writer.finish().unwrap();
+        objects.write("alice", &digest, bytes).unwrap();
         serde_json::json!({"digest":digest,"length":bytes.len()})
     };
     let mut archive = tar::Builder::new(Vec::new());
@@ -162,11 +156,12 @@ fn same_filename_activation_installs_new_runtime_and_retains_old_generation() {
     );
     let manifest = manifest["digest"].as_str().unwrap();
     let selected = || PackageSdk::selected(&paths.sdk(), &root, "uv".into());
-    let local = |sdk: &tensord::published::PackageSdk| {
+    let local = |sdk: &crate::published::PackageSdk| {
         LocalSources::new(
             objects.clone(),
             InstallerConfig {
                 helper_python: helper.clone(),
+                helper_engine: None,
                 python: "3.12".into(),
                 generations: generations.clone(),
                 client_wheel: client.clone(),
@@ -174,6 +169,7 @@ fn same_filename_activation_installs_new_runtime_and_retains_old_generation() {
                 sdk: sdk.requirements.iter().map(PathBuf::from).collect(),
                 uv: "uv".into(),
                 seed_cache: None,
+                runtime_build: String::new(),
             },
             store.clone(),
         )
@@ -192,21 +188,19 @@ fn same_filename_activation_installs_new_runtime_and_retains_old_generation() {
     };
     let old_sdk = selected();
     let old_sources = local(&old_sdk);
-    let old = old_sources.install(&service, "alice", manifest, None).unwrap();
+    let old = old_sources.install(&service, "alice", manifest, None, "", &|_| ()).unwrap();
     let old_provenance = provenance(&old.generation);
     assert_eq!(
         old_sources
-            .install(&service, "alice", manifest, None)
+            .install(&service, "alice", manifest, None, "", &|_| ())
             .unwrap()
             .generation,
         old.generation
     );
-    let next = engine.join("sdk/next");
-    symlink(&second, &next).unwrap();
-    fs::rename(next, &link).unwrap();
+    relink(&link, Some(&second)).unwrap();
     let new_sdk = selected();
     let new_sources = local(&new_sdk);
-    let new = new_sources.install(&service, "alice", manifest, None).unwrap();
+    let new = new_sources.install(&service, "alice", manifest, None, "", &|_| ()).unwrap();
     assert_ne!(
         old.alias, new.alias,
         "new SDK activation reopened the old local alias"
@@ -230,7 +224,7 @@ fn same_filename_activation_installs_new_runtime_and_retains_old_generation() {
     );
     assert_eq!(
         new_sources
-            .install(&service, "alice", manifest, None)
+            .install(&service, "alice", manifest, None, "", &|_| ())
             .unwrap()
             .generation,
         new.generation

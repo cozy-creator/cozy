@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 import tomllib
 
+from tensord_client import layout
 from tensord_client.captured_packages import conflicts, install_captured, installed_description
 from tensord_client.packages import GenerationHold, PackageError
 from tensord_client.package_records import GENERATION_DECODER
@@ -103,7 +104,7 @@ def test_installer_only_helper_uses_locked_sdk_and_static_reader_skips_pth(captu
     root, source, client, frozen = capture
     helper = root / "installer-only-helper"
     subprocess.run(["uv", "venv", "--python", "3.14", str(helper)], check=True)
-    python = helper / "bin/python"
+    python = layout.interpreter(helper)
     subprocess.run(["uv", "pip", "install", "--python", str(python), str(client), "packaging"], check=True)
     subprocess.run([str(python), "-c", "import importlib.util;assert importlib.util.find_spec('cozy_runtime') is None"], check=True)
     process = subprocess.run([str(python), "-m", "tensord_client.installer", "install-captured",
@@ -111,7 +112,7 @@ def test_installer_only_helper_uses_locked_sdk_and_static_reader_skips_pth(captu
         "--distribution", "tensord-cpu-classifier", "--release", "0.1.0", "--python", "3.12"], check=True, capture_output=True)
     generation = GENERATION_DECODER.decode(process.stdout)
     assert {row.name: row.version for row in generation.dependencies}["cozy-runtime"] == locked_sdk(source)
-    site = next(Path(generation.python).parents[1].glob("lib/python*/site-packages"))
+    site, = layout.site_packages(Path(generation.python).parents[1])
     sentinel = root / "pth-must-not-run-during-static-description"
     pth = site / "authored-startup.pth"
     pth.write_text(f"import pathlib;pathlib.Path({str(sentinel)!r}).write_text('executed')\n")
@@ -170,7 +171,7 @@ def test_a_dependency_conflict_fails_the_installation_naming_it(capture):
 def test_a_wheel_tagged_for_another_platform_stands_and_a_missed_requirement_refuses(tmp_path):
     """uv's real check of an environment holding both (NVIDIA's aarch64 cusparseLt wheel says sbsa)."""
     subprocess.run(["uv", "venv", "--python", "3.12", str(tmp_path / "env")], check=True)
-    site = next((tmp_path / "env").glob("lib/python*/site-packages"))
+    site, = layout.site_packages(tmp_path / "env")
     for name, version, tag, requires in [("numpy", "2.0.0", "cp312-cp312-manylinux_2_17_x86_64", ""),
                                          ("conflicted_app", "0.1.0", "py3-none-any", "Requires-Dist: numpy==1.0.0\n"),
                                          ("nvidia_cusparselt_cu12", "0.6.3", "py3-none-manylinux2014_sbsa", "")]:
@@ -179,7 +180,7 @@ def test_a_wheel_tagged_for_another_platform_stands_and_a_missed_requirement_ref
         (info / "METADATA").write_text(f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n{requires}")
         (info / "WHEEL").write_text(f"Wheel-Version: 1.0\nRoot-Is-Purelib: false\nTag: {tag}\n")
         (info / "RECORD").write_text(f"{info.name}/METADATA,,\n")
-    python = tmp_path / "env/bin/python"
+    python = layout.interpreter(tmp_path / "env")
     check = subprocess.run(["uv", "pip", "check", "--python", str(python)], capture_output=True, text=True)
     assert "The package `nvidia-cusparselt-cu12` was built for a different platform" in check.stdout + check.stderr
     assert conflicts(python) == {"The package `conflicted-app` requires `numpy==1.0.0`, but `2.0.0` is installed"}

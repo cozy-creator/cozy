@@ -86,6 +86,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let prepared = prepare_uploaded(
         &InstallerConfig {
             helper_python: helper.ok_or("--helper-python is required")?,
+            helper_engine: None,
             python,
             generations: output.join("generations"),
             client_wheel: client.ok_or("--client-wheel is required")?,
@@ -93,6 +94,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             sdk: vec![],
             uv: "uv".into(),
             seed_cache: None,
+            runtime_build: String::new(),
         },
         &uploaded,
         None,

@@ -38,6 +38,8 @@ pub struct Terms {
     pub input_file: Option<PathBuf>,
     /// `--asset [field.path=|label=]FILE`.
     pub assets: Vec<String>,
+    /// `--asset-fidelity label-or-index=auto|low|medium|high`.
+    pub fidelities: Vec<String>,
     /// `--lora slot:component=ref[,strength]`.
     pub loras: Vec<String>,
     /// The run's idempotency key, which an omitted integer `seed` derives from.
@@ -45,6 +47,8 @@ pub struct Terms {
     /// Where relative paths start, and what `~` means.
     pub cwd: PathBuf,
     pub user_home: PathBuf,
+    /// Where input files' digests are remembered across runs; None reads each file every time.
+    pub digests: Option<PathBuf>,
 }
 
 #[derive(Debug, Default, PartialEq)]
@@ -95,8 +99,9 @@ impl Bound {
 
 impl Bound {
     /// The payload's canonical JSON: sorted keys, no whitespace, exact integers.
-    pub fn canonical_payload(&self) -> Vec<u8> {
-        canonical(&Value::Object(self.payload.clone())).into_bytes()
+    pub fn canonical_payload(&self) -> cozy_proto::machine::Json {
+        let text = canonical(&Value::Object(self.payload.clone()));
+        cozy_proto::machine::Json::parse(text).expect("canonical JSON is JSON")
     }
 }
 
@@ -139,6 +144,7 @@ pub fn warm_choices(callable: &Callable, terms: &Terms) -> Result<Vec<Choice>, E
         || !binder.document.is_empty()
         || !binder.files.is_empty()
         || !terms.assets.is_empty()
+        || !terms.fidelities.is_empty()
         || terms.input_file.is_some()
     {
         return Err(usage(
@@ -174,6 +180,7 @@ pub fn bind(
     binder.primary(positional)?;
     binder.loras()?;
     let files = binder.attach()?;
+    binder.fidelities()?;
     binder.seed();
     let ignored = validate(target, release, callable, &mut binder.document)?;
     Ok(Bound {
@@ -703,7 +710,7 @@ impl Binder<'_> {
                     ),
                 ));
             }
-            let digest = digest(&path)?;
+            let digest = super::digests::of(self.terms.digests.as_deref(), &path)?;
             set_path(
                 &mut self.document,
                 &parts,
@@ -726,6 +733,50 @@ impl Binder<'_> {
         self.count_kinds(&files)?;
         files.sort_by(|a, b| a.field.cmp(&b.field));
         Ok(files)
+    }
+
+    /// `--asset-fidelity`: each hint goes on the Assets occurrence its label or index names, for
+    /// the package to read.
+    fn fidelities(&mut self) -> Result<(), Error> {
+        if self.terms.fidelities.is_empty() {
+            return Ok(());
+        }
+        let Some(assets) = &self.callable.assets else {
+            return Err(usage(
+                "assets_undeclared",
+                format!(
+                    "{} declares no Assets input for --asset-fidelity",
+                    self.callable.name
+                ),
+            ));
+        };
+        let mut none = vec![];
+        let list = match self.document.get_mut(&assets.parameter) {
+            Some(Value::Array(list)) => list,
+            _ => &mut none,
+        };
+        let mut given = BTreeSet::new();
+        for term in &self.terms.fidelities {
+            let (key, fidelity) = term.rsplit_once('=').expect("clap checked its form");
+            let index = list.iter().position(|e| e["label"] == key).or_else(|| {
+                let index = key.parse().ok().filter(|i: &usize| i.to_string() == key)?;
+                (index < list.len()).then_some(index)
+            });
+            let Some(index) = index.filter(|i| list[*i].is_object()) else {
+                return Err(usage(
+                    "asset_fidelity_unmatched",
+                    format!("--asset-fidelity {key:?} names no attached asset"),
+                ));
+            };
+            if !given.insert(index) {
+                return Err(usage(
+                    "asset_fidelity_repeated",
+                    format!("asset {key:?} was given a fidelity more than once"),
+                ));
+            }
+            list[index]["fidelity"] = fidelity.into();
+        }
+        Ok(())
     }
 
     /// `field.path=file` names an input (a list of files named whole takes its next slot);
@@ -1640,25 +1691,6 @@ fn sniff(path: &Path) -> Result<Sniffed, Error> {
         length,
         media_type: media_type.to_owned(),
     })
-}
-
-fn digest(path: &Path) -> Result<Digest, Error> {
-    let mut file = File::open(path).map_err(|e| {
-        Error::new(
-            Kind::NotFound,
-            "input_file_unreadable",
-            format!("input file {}: {e}", path.display()),
-        )
-    })?;
-    let mut hasher = Sha256::new();
-    std::io::copy(&mut file, &mut hasher).map_err(|e| {
-        Error::new(
-            Kind::Internal,
-            "input_file_unreadable",
-            format!("input file {}: {e}", path.display()),
-        )
-    })?;
-    Ok(Digest::from_bytes(hasher.finalize().into()))
 }
 
 /// A LoRA strength as a canonical decimal string: finite, `0` for zero.

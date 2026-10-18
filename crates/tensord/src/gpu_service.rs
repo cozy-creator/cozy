@@ -28,7 +28,6 @@ use std::{
     collections::BTreeMap,
     fs::{self, File},
     io::{self, Read, Write},
-    os::fd::{AsRawFd, OwnedFd},
     path::{Path, PathBuf},
     sync::{
         atomic::Ordering,
@@ -95,6 +94,10 @@ pub struct GpuConfig {
     /// Explicitly configured locations; the executor seal is imposed on top of them.
     #[serde(default)]
     pub environment: BTreeMap<String, String>,
+    /// The machine's build toolchain (`cozy machine toolchain install`): once it holds nvcc,
+    /// executors started after find it through CUDA_HOME and PATH.
+    #[serde(default)]
+    pub toolchain: Option<PathBuf>,
     /// `OMP_NUM_THREADS` the seal imposes. torch's allocator is the Runtime's, set in code.
     #[serde(default = "threads")]
     pub threads: u32,
@@ -413,7 +416,7 @@ struct Session {
     followers: Vec<cozy_platform::process::Exact>,
     loaded: bool,
     executor: DeviceExecutor,
-    /// Budget cells by rank: rank 0's own, and each follower's (`rank_cells/1`).
+    /// Budget cells by rank: rank 0's own, and each follower's.
     budget_cells: BTreeMap<u32, File>,
     /// Its selected models' headers and assets, served on `model_source`.
     sources: Arc<ModelSources>,
@@ -700,7 +703,6 @@ impl Pool {
                     .host
                     .ttl_seconds
                     .map_or(defaults.ttl, std::time::Duration::from_secs),
-                plans: Some(root.join("host-plans")),
             },
             // The machine's one pinned host total: executors' pinned budgets split it too.
             Box::new(crate::host_tier::HalfOfHeadroom),
@@ -708,10 +710,11 @@ impl Pool {
         // Fill leases and GPU custody hold one descriptor per object or chunk.
         cozy_platform::process::raise_fd_limit();
         let envelope = config.envelope();
-        // Degree 2 is world-one, on the first device; off where it drives a display.
+        // Degree 2 is world-one, on the first device; off where it drives a display, and
+        // outside Unix, where one executor's device memory cannot be handed to another.
         let custody = envelope
             .first()
-            .filter(|first| !display_active(first))
+            .filter(|first| cfg!(unix) && !display_active(first))
             .map(|_| Mutex::new(ResidentCustody::default()));
         let incarnation = uuid::Uuid::new_v4().simple().to_string();
         crate::launch_identity::remove_stale_jit(root, &incarnation);
@@ -940,16 +943,13 @@ impl Pool {
         if degree == 0 {
             return Ok(&[]);
         }
-        let wanted = degree as usize;
-        self.devices.get(start..start + wanted).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::Unsupported,
-                format!(
-                    "gpu_count_unavailable: a {wanted}-GPU group on a machine with {} GPU(s)",
-                    self.devices.len()
-                ),
-            )
-        })
+        self.devices.get(start..start + degree as usize).ok_or_else(|| self.unavailable(degree))
+    }
+    fn unavailable(&self, wanted: u32) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("gpu_count_unavailable: {wanted} GPUs asked of a machine with {}", self.devices.len()),
+        )
     }
     fn lane_devices(&self, start: usize, degree: u32) -> io::Result<String> {
         Ok(self
@@ -1141,9 +1141,8 @@ impl Pool {
         if plan.degree != 1 {
             return Ok("a group of GPUs maps its weights at its first call");
         }
-        let offers = |s: &Session| s.executor.hello.offers("weights.map/1");
-        if !self.sessions.lock().unwrap().get(&plan.construction).is_some_and(offers) {
-            return Ok("its Runtime maps no weights ahead of a request");
+        if !self.sessions.lock().unwrap().contains_key(&plan.construction) {
+            return Ok("its executor ended");
         }
         let step = |step: &Step| self.carry_out(0, step);
         let Some(cap) = self.first().admit_member(&plan.construction, true, || self.holdings(), step)? else {
@@ -1430,16 +1429,21 @@ impl Pool {
     }
 
     /// A call's degree as its declaration and this machine set it: 0 for `accelerator=False`
-    /// or a machine with no GPU, else its constructed slots' group (one GPU without any).
-    pub fn degree(&self, entry: &serde_json::Value, wanted: u32) -> u32 {
+    /// or a machine with no GPU, else its constructed slots' group, or the GPUs a call that
+    /// constructs nothing asks for (one by default); more than the machine has is refused.
+    pub fn degree(&self, entry: &serde_json::Value, wanted: u32) -> io::Result<u32> {
         let models = entry.get("models").and_then(serde_json::Value::as_array).cloned().unwrap_or_default();
         let constructed: Vec<_> = models.into_iter().filter(constructed).collect();
-        match entry.get("accelerator").and_then(serde_json::Value::as_bool) {
+        Ok(match entry.get("accelerator").and_then(serde_json::Value::as_bool) {
             Some(false) => 0,
             _ if self.devices.is_empty() => 0,
-            _ if constructed.is_empty() => 1,
+            _ if constructed.is_empty() && wanted as usize > self.devices.len() => {
+                return Err(self.unavailable(wanted))
+            }
+            // It constructs nothing (a script): the GPUs it asks for, held by its one process.
+            _ if constructed.is_empty() => wanted.max(1),
             _ => group_degree(&constructed, wanted, self.devices.len()),
-        }
+        })
     }
 
     /// Derive each model slot's binding from the installed SDK's real static interface and
@@ -1505,7 +1509,7 @@ impl Pool {
                 ));
             }
         }
-        let degree = self.degree(entry, degree);
+        let degree = self.degree(entry, degree)?;
         let (mut planned, mut sources) = (vec![], vec![]);
         for (model, (path, parameter)) in models.iter().zip(&slots) {
             let class = model
@@ -2381,15 +2385,6 @@ impl Pool {
                 |_, _| Ok(()),
             )?;
             executor.retain_until_exit(directory);
-            if !executor.hello.offers(device_executor::FORK)
-                || !executor.hello.offers("import_only")
-            {
-                executor.shutdown()?;
-                return Ok(ZygoteState::Off(format!(
-                    "Runtime {} does not fork executors",
-                    held.record.identity
-                )));
-            }
             let interface = self.interface_file(&executor, held)?;
             let reply = executor.command(
                 &DeviceCommand::Start {
@@ -2427,13 +2422,12 @@ impl Pool {
     fn executor_endpoint(&self) -> io::Result<(PathBuf, PathBuf, File)> {
         let root = self.root.join(uuid::Uuid::new_v4().simple().to_string());
         fs::create_dir(&root)?;
-        let directory = File::open(&root)?;
+        let directory = cozy_platform::durable::open_dir(&root)?;
         let socket = if self.config.identity.is_some() {
             // Another UID cannot traverse this owner's /proc/fd magic link.
             // A deliberately short owned state root is required for this operation.
             let socket = root.join("executor");
-            use std::os::unix::ffi::OsStrExt;
-            if socket.as_os_str().as_bytes().len() > 107 {
+            if socket.as_os_str().len() > 107 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "configured identity needs a short owned executor socket path (Linux sun_path)",
@@ -2441,11 +2435,17 @@ impl Pool {
             }
             socket
         } else {
-            PathBuf::from(format!(
+            // Linux names it through this process's descriptor of the root; elsewhere it is the
+            // root's own, or a short private one when that is too long.
+            #[cfg(target_os = "linux")]
+            let socket = PathBuf::from(format!(
                 "/proc/{}/fd/{}/executor",
                 std::process::id(),
-                directory.as_raw_fd()
-            ))
+                std::os::fd::AsRawFd::as_raw_fd(&directory)
+            ));
+            #[cfg(not(target_os = "linux"))]
+            let socket = crate::device_executor::socket_path(&root, "executor")?;
+            socket
         };
         Ok((root, socket, directory))
     }
@@ -2472,7 +2472,10 @@ impl Pool {
             python: held.record.python.clone(),
             root,
             socket,
-            environment: self.config.environment.clone(),
+            environment: match &self.config.toolchain {
+                Some(dir) => crate::machine::toolchain::environment(&self.config.environment, dir, ""),
+                None => self.config.environment.clone(),
+            },
             seal,
             generation_hold: Some(held.retention()),
             identity: self.config.identity,
@@ -2563,17 +2566,13 @@ impl Pool {
                     holding.generation,
                     *bytes,
                 );
-                // Every reader must be an executor here that trims (`weights.trim/1`); an
-                // older one, or a reader this service does not hold, gets the whole revoke.
-                let trims = |s: &Session| s.executor.hello.offers("weights.trim/1");
+                // Every reader must be an executor this service holds; else the whole revoke.
                 let mut sessions = self.sessions.lock().unwrap();
                 let readers = sessions
                     .values()
                     .filter(|s| holding.readers.contains(&s.executor.birth))
-                    .collect::<Vec<_>>();
-                let Some(regions) = regions.filter(|_| {
-                    readers.len() == holding.readers.len() && readers.iter().all(|s| trims(s))
-                }) else {
+                    .count();
+                let Some(regions) = regions.filter(|_| readers == holding.readers.len()) else {
                     drop(sessions);
                     return self.carry_out(device, &Step::Revoke(id.clone()));
                 };
@@ -2625,20 +2624,18 @@ impl Pool {
         };
         if let Step::Unmap(_) = step {
             let session = sessions.get_mut(&key).expect("found above");
-            if session.executor.hello.offers("weight_plane/1") {
-                let reply = session.executor.command(
-                    &DeviceCommand::Budget {
-                        vram_bytes: 0,
-                        pinned_bytes: -1,
-                        cap_bytes: None,
-                    },
-                    &mut device_executor::Baseline,
-                );
-                if let Some(reply) = reply.ok().filter(|reply| reply.ok) {
-                    let facts = plane_facts(reply.plane.as_ref());
-                    self.observe(plan, session.start, session.degree, facts, &reply.rank_planes, Some(false));
-                    return Ok(true);
-                }
+            let reply = session.executor.command(
+                &DeviceCommand::Budget {
+                    vram_bytes: 0,
+                    pinned_bytes: -1,
+                    cap_bytes: None,
+                },
+                &mut device_executor::Baseline,
+            );
+            if let Some(reply) = reply.ok().filter(|reply| reply.ok) {
+                let facts = plane_facts(reply.plane.as_ref());
+                self.observe(plan, session.start, session.degree, facts, &reply.rank_planes, Some(false));
+                return Ok(true);
             }
         }
         let session = sessions.remove(&key).expect("found above");
@@ -2774,8 +2771,7 @@ impl Pool {
     }
 
     /// Launch an executor for `plan` (fork from its generation's import-only executor, else
-    /// spawn) and open its selected metadata sources and CPU-buffer grants. The advertised
-    /// capabilities select sealed-tier delivery or the supported legacy peer route.
+    /// spawn) and open its selected metadata sources and CPU-buffer grants.
     fn new_session(
         &self,
         engine: &Arc<Engine>,
@@ -2854,9 +2850,8 @@ impl Pool {
             id,
         });
         let sources = Arc::new(ModelSources::open_shared(self.store.clone(), &selections)?);
-        // An executor that reads holes from object files gets only what it streams staged.
-        let staged = executor.hello.offers("host_tiers.staged/1");
-        let peer = self.host.register_peer(executor.observer_pidfd()?, staged);
+        // The executor reads holes from object files: it gets only what it streams staged.
+        let peer = self.host.register_peer(executor.observer_pidfd()?);
         let grants = selections
             .iter()
             .map(|selected| {
@@ -2869,7 +2864,7 @@ impl Pool {
             .collect::<io::Result<Vec<_>>>()?;
         // Weights come from the machine's sealed host tier, filled through TensorFS (what is
         // here, while Runtime imports and constructs the model; the rest as it lands).
-        self.host.prepare(grants.clone(), staged);
+        self.host.prepare(grants.clone());
         Ok(Session {
             plan: plan.construction.clone(),
             start,
@@ -2914,9 +2909,12 @@ impl Pool {
             session.executor.begin_request();
         }
         // Every rank of a group reads its own GPU's cap and cell (`rank_cells/1`).
-        let ranked = degree > 1;
+        // A group runs one rank per GPU; a plan that constructs nothing holds its GPUs in one
+        // process (the Runtime refuses a group without constructed models).
+        let ranks = if plan.slots.is_empty() { 1 } else { degree.max(1) };
+        let ranked = ranks > 1;
         if !session.loaded {
-            session.sharing = self.degree2(&construction, start, degree, &session.executor)?;
+            session.sharing = self.degree2(&construction, start, degree)?;
         }
         let sharing = session.sharing;
         let lane = self.lane_devices(start, degree)?;
@@ -2956,7 +2954,7 @@ impl Pool {
                     devices: lane.clone(),
                     application: held.record.application.clone(),
                     package_interface: interface_path.clone(),
-                    sequence_parallel_degree: degree.max(1),
+                    sequence_parallel_degree: ranks,
                     import_only: false,
                     call_interfaces: crate::calls::call_interfaces(held, &interface_path),
                     constructions,
@@ -2967,7 +2965,7 @@ impl Pool {
                 },
                 &mut callbacks,
             )?)?;
-            if ranked && (1..degree).any(|rank| !callbacks.cells.contains_key(&rank)) {
+            if ranked && (1..ranks).any(|rank| !callbacks.cells.contains_key(&rank)) {
                 return Err(io::Error::other(Refused {
                     code: "group_unformed".into(),
                     detail: "a follower's budget cell did not reach the machine".into(),
@@ -2993,7 +2991,7 @@ impl Pool {
             session.launch.start_ms = starting.elapsed().as_secs_f64() * 1e3;
             session.launch.start =
                 serde_json::from_value(started.stages.clone()).unwrap_or_default();
-            if started.follower_pids.len() + 1 != degree.max(1) as usize {
+            if started.follower_pids.len() + 1 != ranks as usize {
                 return Err(io::Error::other(Refused {
                     code: "group_unformed".into(),
                     detail: format!(
@@ -3014,10 +3012,9 @@ impl Pool {
             for (device, pid) in gpus.iter().skip(1).zip(&started.follower_pids) {
                 device.memory.with(|gpu| gpu.spawned(&construction, *pid));
             }
-            let (load_cap, load_group) = rank_grant(load_caps);
-            // Its pinned budget, the Load's when the executor takes it there (`load_pinned/1`).
-            let plane = !plan.slots.is_empty() && session.executor.hello.offers("weight_plane/1");
-            let at_load = plane && session.executor.hello.offers("load_pinned/1");
+            let (load_cap, load_group) = rank_grant(&load_caps[..load_caps.len().min(ranks as usize)]);
+            // Its pinned budget, applied by the Load before any weight set registers.
+            let plane = !plan.slots.is_empty();
             let pinned = (degree > 0)
                 .then(|| self.pinned_budgets(&construction, start))
                 .flatten()
@@ -3028,7 +3025,7 @@ impl Pool {
                 None => DeviceCommand::Load {
                     construction: construction.clone(),
                     devices: lane.clone(),
-                    sequence_parallel_degree: degree.max(1),
+                    sequence_parallel_degree: ranks,
                     binding: Box::new(Binding {
                         application: held.record.application.clone(),
                         package_interface: interface_path.to_string_lossy().into_owned(),
@@ -3067,22 +3064,20 @@ impl Pool {
                     DeviceCommand::Load {
                         construction: construction.clone(),
                         devices: lane.clone(),
-                        sequence_parallel_degree: degree.max(1),
+                        sequence_parallel_degree: ranks,
                         binding: Box::new(first.binding),
                         budgets: first.budgets,
                         models,
                         authorized_device_limit_bytes: self.device_limit(gpus),
                         // The request it loads for names a kernel: its build is imported first.
-                        attention_pin: match load_only
-                            || !session.executor.hello.offers("attention.load_pin/1")
-                        {
+                        attention_pin: match load_only {
                             true => String::new(),
                             false => engine.get(id)?.invocation.attention_kernel,
                         },
                         sealed_tiers: true,
                         model_sources: true,
                         staged_tiers: true,
-                        pinned_bytes: at_load.then_some(pinned),
+                        pinned_bytes: plane.then_some(pinned),
                         device_weights: sharing,
                         cap_bytes: load_cap,
                     }
@@ -3111,16 +3106,6 @@ impl Pool {
                 session.executor.birth.pid,
                 &session.launch,
             )?;
-            if plane && !at_load {
-                command_ok(session.executor.command(
-                    &DeviceCommand::Budget {
-                        vram_bytes: -1,
-                        pinned_bytes: pinned,
-                        cap_bytes: None,
-                    },
-                    &mut callbacks,
-                )?)?;
-            }
             command_ok(session.executor.command(
                 &DeviceCommand::Activate {
                     construction: construction.clone(),
@@ -3231,8 +3216,7 @@ impl Pool {
         // Degree 2 per call: on while the whole construction and its activations fit beside the
         // other tenants now. A sharing executor that no longer fits lets go of what it maps
         // first, so this call streams privately and the ladder can reclaim those holdings.
-        let attaches = session.executor.hello.offers("weights.attach/1");
-        let share = self.degree2(&construction, start, degree, &session.executor)?;
+        let share = self.degree2(&construction, start, degree)?;
         if session.sharing && !share {
             if let Some(custody) = &self.custody {
                 detach(custody, &mut session.executor, &self.notes)?;
@@ -3246,10 +3230,9 @@ impl Pool {
         // A real grant for the whole call: one tenant needs no per-stage turns.
         // A group's cap holds on every GPU of it (each rank caps its own process).
         let caps = self.decide(&construction, start, degree, false)?;
-        let (cap, group) = rank_grant(&caps);
-        // Every executor of the cohort caps its whole process (`process_cap/1`): the plane
-        // derives its budget inside the cap.
-        let (plane_budget_bytes, cap_bytes) = (-1, cap);
+        let (cap, group) = rank_grant(&caps[..caps.len().min(ranks as usize)]);
+        // Every executor caps its whole process: the plane derives its budget inside the cap.
+        let cap_bytes = cap;
         // Each GPU's floor watchdog writes the cell of its own rank's process.
         for ((rank, device), own) in (0u32..).zip(gpus).zip(&caps) {
             if let Some(own) = *own {
@@ -3287,14 +3270,13 @@ impl Pool {
                 deadline_s: None,
                 attention_kernel: record.invocation.attention_kernel.clone(),
                 bits: record.invocation.bits,
-                plane_budget_bytes,
                 cap_bytes,
                 inputs: inputs.inputs,
                 trees: inputs.trees,
                 floor_bytes: gpu.and_then(GpuMemory::floor),
                 activation_bytes: gpu.map(|gpu| gpu.with(|gpu| gpu.seeds(&construction))).unwrap_or_default(),
                 squeezed_bytes: gpu.map(|gpu| gpu.with(|gpu| gpu.squeezed(&construction))).unwrap_or_default(),
-                device_weights: attaches.then_some(share),
+                device_weights: Some(share),
                 sources: plan.sources.iter().map(|s| (s.parameter.clone(), s.manifest.clone())).collect(),
                 weights: grant.as_ref().map(|grant| grant.outputs.clone()).unwrap_or_default(),
             },
@@ -3388,7 +3370,7 @@ impl Pool {
         }
         // Degree 2 once this call measured that the construction fits: an executor loaded
         // without it (its plan never ran here) offers everything it holds at this boundary.
-        if !session.sharing && self.degree2(&construction, start, degree, &session.executor)? {
+        if !session.sharing && self.degree2(&construction, start, degree)? {
             session.sharing = true;
             callbacks.custody = self.custody.as_ref();
         }
@@ -3419,10 +3401,9 @@ impl Pool {
     /// it reads, so only when the whole construction and its activations fit beside the other
     /// tenants, as measured here or in an earlier run (unmeasured: Degree 1, where stages
     /// evict each other). World-one on the first GPU only: a group or a replica shares nothing.
-    fn degree2(&self, plan: &str, start: usize, degree: u32, executor: &DeviceExecutor) -> io::Result<bool> {
+    fn degree2(&self, plan: &str, start: usize, degree: u32) -> io::Result<bool> {
         Ok(self.custody.is_some()
             && (start, degree) == (0, 1)
-            && executor.hello.offers("weights.attach/1")
             && self.first().fits_resident(plan, || self.holdings()))
     }
 
@@ -3531,9 +3512,7 @@ impl Pool {
             let Some(share) = split.get(&session_key(other, session.start)).copied() else {
                 continue;
             };
-            if !session.executor.hello.offers("weight_plane/1")
-                || budget.is_none_or(|budget| share >= budget)
-            {
+            if budget.is_none_or(|budget| share >= budget) {
                 continue;
             }
             let reply = session.executor.command(
@@ -3952,6 +3931,11 @@ pub(crate) fn settle(engine: &Arc<Engine>, id: &str, error: &io::Error) -> io::R
         keep_lifecycle_triage(engine, id, pid, &ended.to_string(), &ended.stderr_tail);
     }
     let outcome = if record.cancel_actor.is_some() {
+        // Canceled: the reason its executor ended (it ignored the cancel and was killed, say)
+        // is the run's last log line.
+        if let Err(log) = engine.append_log(id, "warn", &format!("canceled; its executor ended: {error}")) {
+            tracing::warn!("run {id}: {log}");
+        }
         Outcome::Canceled
     } else if let Some(refusal) = refused(error) {
         // The executor's own reason, typed: a group's first fault names its GPU.
@@ -4063,7 +4047,7 @@ fn copy_held(
 ) -> io::Result<()> {
     let sha = digest.strip_prefix("sha256:").unwrap_or(digest);
     let mut source = store.open_verified(sha).map_err(io::Error::other)?.into_file();
-    let mut copy = std::os::unix::fs::OpenOptionsExt::mode(
+    let mut copy = cozy_platform::durable::Mode::mode(
         fs::OpenOptions::new().write(true).create_new(true),
         0o444,
     )
@@ -4381,8 +4365,8 @@ impl Services for Callbacks<'_> {
     fn device_tier(
         &mut self,
         frame: &Frame,
-        fds: Vec<OwnedFd>,
-    ) -> io::Result<(Answer, Vec<OwnedFd>)> {
+        fds: Vec<cozy_platform::handles::Owned>,
+    ) -> io::Result<(Answer, Vec<cozy_platform::handles::Owned>)> {
         let mut answer = Answer::unavailable(frame.seq);
         let Some(custody) = self.custody else {
             return Ok((answer, Vec::new()));
@@ -4601,6 +4585,7 @@ impl Services for Callbacks<'_> {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[cfg(unix)]
     use std::os::unix::process::ExitStatusExt;
 
     /// Runs 5313/5318/5319 ended `executor_poisoned: ; the executor did not settle quiescent
@@ -4673,6 +4658,7 @@ mod tests {
         assert_eq!(kept, ["attention.selected", "gemm.selected"]);
     }
 
+    #[cfg(unix)]
     #[test]
     fn an_executor_that_ended_on_its_own_names_its_exit() {
         let ended = |status: i32| device_executor::Ended {
@@ -4839,6 +4825,7 @@ mod tests {
 
     /// NVML for one integrated GPU: every call the memory sampler makes, and memory info
     /// NotSupported (3), as GB10's driver answers.
+    #[cfg(target_os = "linux")]
     const FAKE_NVML: &str = r#"
 #include <stdio.h>
 static int gpu;
@@ -4914,7 +4901,7 @@ int nvmlDeviceGetDisplayActive(void *d, int *s) { *s = 0; return 0; }
         drop(held);
         assert_eq!(place(&film, 9, &mut [None; 4]).unwrap().0, 0);
         pool.stop().unwrap();
-        fs::remove_dir_all(root).unwrap();
+        crate::scratch::remove(&root);
     }
 
     #[test]
@@ -4930,7 +4917,7 @@ int nvmlDeviceGetDisplayActive(void *d, int *s) { *s = 0; return 0; }
         assert_eq!(place(3).unwrap().0, 0);
         drop(second);
         pool.stop().unwrap();
-        fs::remove_dir_all(root).unwrap();
+        crate::scratch::remove(&root);
     }
 
     /// A deviceless root accepted as request `key`, ready to dispatch.
@@ -5009,7 +4996,7 @@ int nvmlDeviceGetDisplayActive(void *d, int *s) { *s = 0; return 0; }
         ]);
         assert!(pool.place(&engine, &plan("other", 4), (9, None), None, &mut [None; 4]).is_some(), "exits end the lanes");
         pool.stop().unwrap();
-        fs::remove_dir_all(root).unwrap();
+        crate::scratch::remove(&root);
     }
 
     /// An older root still downloading its weights claims no GPU: a younger ready root runs
@@ -5044,7 +5031,7 @@ int nvmlDeviceGetDisplayActive(void *d, int *s) { *s = 0; return 0; }
         ]);
         drop(holds);
         pool.stop().unwrap();
-        fs::remove_dir_all(root).unwrap();
+        crate::scratch::remove(&root);
     }
 
     /// A waiting root's wait names its current blocker: a new entry when it changes.
@@ -5066,7 +5053,7 @@ int nvmlDeviceGetDisplayActive(void *d, int *s) { *s = 0; return 0; }
         ]);
         drop(holds);
         pool.stop().unwrap();
-        fs::remove_dir_all(root).unwrap();
+        crate::scratch::remove(&root);
     }
 
     /// Gate (f), runs 5673/5674 on one GPU: the older root's two ready first steps wait behind
@@ -5095,7 +5082,7 @@ int nvmlDeviceGetDisplayActive(void *d, int *s) { *s = 0; return 0; }
         ]);
         drop(holds);
         pool.stop().unwrap();
-        fs::remove_dir_all(root).unwrap();
+        crate::scratch::remove(&root);
     }
 
     #[test]
@@ -5119,7 +5106,7 @@ int nvmlDeviceGetDisplayActive(void *d, int *s) { *s = 0; return 0; }
         assert_eq!(pool.place(&engine, &group, (9, None), None, &mut [None; 4]).unwrap().0, 0);
         drop(other);
         pool.stop().unwrap();
-        fs::remove_dir_all(root).unwrap();
+        crate::scratch::remove(&root);
     }
 
     /// A fresh pod's burst of one unlearned plan: its first call starts on GPU 0, the second at
@@ -5139,7 +5126,7 @@ int nvmlDeviceGetDisplayActive(void *d, int *s) { *s = 0; return 0; }
         assert_eq!(claims, [Some(3), Some(3)]);
         drop((first, second));
         pool.stop().unwrap();
-        fs::remove_dir_all(root).unwrap();
+        crate::scratch::remove(&root);
     }
 
     /// Host admission counts executors admitted and not loaded yet; pinned budgets are shared
@@ -5182,6 +5169,6 @@ int nvmlDeviceGetDisplayActive(void *d, int *s) { *s = 0; return 0; }
         let keys: Vec<_> = split.keys().map(String::as_str).collect();
         assert_eq!(keys, ["film", "image", "image@2"]);
         pool.stop().unwrap();
-        fs::remove_dir_all(root).unwrap();
+        crate::scratch::remove(&root);
     }
 }

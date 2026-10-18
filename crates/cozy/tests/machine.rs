@@ -141,18 +141,36 @@ fn an_added_machine_is_checked_before_it_is_recorded_then_listed_shown_checked_a
     assert_eq!(listed(&home, "again").expect("added")["state"], "ready");
 }
 
+/// `machine authorize` adds a controller's key to `keys/authorized` once, at 0600; TensorD reads it
+/// again when a signer is unknown.
+#[test]
+fn authorize_adds_a_controllers_key_once() {
+    let Some(home) = Home::new() else { return };
+    let key = tensord::stranger();
+    let first = home.json(["machine", "authorize", key.as_str(), "--json"]);
+    let again = home.json(["machine", "authorize", key.as_str(), "--json"]);
+    assert_eq!(
+        (first["changed"].as_bool(), again["changed"].as_bool()),
+        (Some(true), Some(false))
+    );
+    let path = home.root().join("keys/authorized");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), format!("{key}\n"));
+    use std::os::unix::fs::PermissionsExt as _;
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+}
+
 #[test]
 fn machine_refusals_say_what_to_do_instead() {
     let Some(home) = Home::new() else { return };
-    let stranger = tensord::stranger();
     for (args, exit, code) in [
-        // This computer's machine role comes with TensorD inside the binary.
-        (vec!["machine", "enable"], 2, "not_ported"),
-        (vec!["machine", "disable"], 2, "not_ported"),
+        // A controller's key is 32 bytes of unpadded base64url.
         (
-            vec!["machine", "authorize", stranger.as_str()],
-            2,
-            "not_ported",
+            vec!["machine", "authorize", "not-a-key"],
+            1,
+            "public_key_invalid",
         ),
         // `local` is ended by disabling it.
         (vec!["machine", "end", "local"], 1, "machine_local"),
@@ -167,6 +185,16 @@ fn machine_refusals_say_what_to_do_instead() {
             "{args:?}: {out:?}"
         );
     }
+    // A bad key's next step starts on the controller's computer: installing cozy there.
+    let next = home
+        .cozy(["machine", "authorize", "not-a-key", "--json"])
+        .refusal()["next"][0]
+        .clone();
+    assert!(
+        next.as_str()
+            .is_some_and(|n| n.contains("https://tensorhub.com/install.sh")),
+        "{next}"
+    );
     // Rental options without a product, and a malformed fingerprint, are usage errors.
     for args in [
         vec!["machine", "rent", "--gpus", "2"],
@@ -216,9 +244,10 @@ fn an_update_installs_the_hubs_target_and_then_has_nothing_to_do() {
     );
 }
 
-/// PyPI's Runtime and TensorFS wheels for this platform, downloaded into `dir`.
+/// PyPI's newest Runtime and the TensorFS it accepts (a newer TensorFS may be out first), wheels
+/// for this platform, downloaded into `dir`.
 fn downloaded(dir: &Path) -> (PathBuf, PathBuf) {
-    for requirement in ["cozy-runtime", "tensorfs"] {
+    let download = |requirement: &str| {
         let fetched = std::process::Command::new("python3")
             .args([
                 "-m",
@@ -242,7 +271,7 @@ fn downloaded(dir: &Path) -> (PathBuf, PathBuf) {
             .status()
             .unwrap();
         assert!(fetched.success(), "pip download {requirement}");
-    }
+    };
     let wheel = |prefix: &str| {
         std::fs::read_dir(dir)
             .unwrap()
@@ -250,7 +279,39 @@ fn downloaded(dir: &Path) -> (PathBuf, PathBuf) {
             .find(|p| p.file_name().unwrap().to_str().unwrap().starts_with(prefix))
             .unwrap_or_else(|| panic!("no {prefix} wheel"))
     };
-    (wheel("cozy_runtime-"), wheel("tensorfs-"))
+    download("cozy-runtime");
+    let runtime = wheel("cozy_runtime-");
+    download(&requirement(&runtime, "tensorfs"));
+    (runtime, wheel("tensorfs-"))
+}
+
+/// The requirement a wheel's metadata names for `name`, without extras (`tensorfs<0.11,>=0.10`).
+fn requirement(wheel: &Path, name: &str) -> String {
+    const READ: &str = r#"
+import re, sys, zipfile
+wheel, name = sys.argv[1:]
+archive = zipfile.ZipFile(wheel)
+metadata = next(n for n in archive.namelist() if n.endswith(".dist-info/METADATA"))
+for line in archive.read(metadata).decode().splitlines():
+    if line.startswith("Requires-Dist: ") and "extra ==" not in line:
+        requirement = line.removeprefix("Requires-Dist: ").replace(" ", "")
+        if re.match(re.escape(name) + r"[^A-Za-z0-9._-]", requirement):
+            print(requirement)
+            break
+"#;
+    let out = std::process::Command::new("python3")
+        .args(["-I", "-c", READ])
+        .arg(wheel)
+        .arg(name)
+        .output()
+        .unwrap();
+    let requirement = String::from_utf8(out.stdout).unwrap().trim().to_owned();
+    assert!(
+        !requirement.is_empty(),
+        "{} names no {name}",
+        wheel.display()
+    );
+    requirement
 }
 
 /// A wheel's version, from its file name.
@@ -303,78 +364,6 @@ fn an_update_installs_local_wheels() {
     assert_eq!(
         (out.code, out.refusal()["code"].clone()),
         (1, "wheel_refused".into()),
-        "{out:?}"
-    );
-}
-
-/// A PyPI wheel URL names its release: the CLI checks with PyPI that the release holds that file at
-/// that sha256 and sends the release, which the machine fetches from PyPI. A digest PyPI does not
-/// list is refused before anything is sent.
-#[test]
-fn an_update_names_a_published_wheel_by_its_pypi_url() {
-    let Some(home) = Home::new() else { return };
-    let _machine = tensord::added(&home, "pypi");
-    let wheel = |project: &str| {
-        let listed = std::process::Command::new("curl")
-            .args([
-                "-sSfL",
-                &format!("https://pypi.org/pypi/{project}/json"),
-            ])
-            .output()
-            .unwrap();
-        let listed: Value = serde_json::from_slice(&listed.stdout).unwrap();
-        let file = listed["urls"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|f| {
-                let name = f["filename"].as_str().unwrap();
-                name.ends_with(".whl") && name.contains("manylinux") && name.contains("x86_64")
-            })
-            .cloned()
-            .unwrap_or_else(|| panic!("{project}'s newest has no manylinux x86_64 wheel"));
-        let (url, sha256) = (
-            file["url"].as_str().unwrap(),
-            file["digests"]["sha256"].as_str().unwrap(),
-        );
-        let release = listed["info"]["version"].as_str().unwrap().to_owned();
-        (format!("{url}#sha256={sha256}"), url.to_owned(), release)
-    };
-    let (runtime, runtime_url, release) = wheel("cozy-runtime");
-    let (tensorfs, _, _) = wheel("tensorfs");
-    let wrong = format!("{runtime_url}#sha256={}", "ab".repeat(32));
-    let out = home.cozy([
-        "machine",
-        "update",
-        "pypi",
-        "--runtime-wheel",
-        wrong.as_str(),
-        "--json",
-    ]);
-    assert_eq!(
-        (out.code, out.refusal()["code"].clone()),
-        (1, "wheel_digest_mismatch".into()),
-        "{out:?}"
-    );
-    let out = home.cozy([
-        "machine",
-        "update",
-        "pypi",
-        "--runtime-wheel",
-        runtime.as_str(),
-        "--tensorfs-wheel",
-        tensorfs.as_str(),
-        "--json",
-    ]);
-    let last: Value = serde_json::from_str(out.stdout.lines().last().unwrap_or_default())
-        .unwrap_or_else(|e| panic!("{e}: {out:?}"));
-    assert_eq!(
-        (
-            out.code,
-            last["type"].as_str(),
-            last["run"]["result"]["to"]["runtime"].as_str()
-        ),
-        (0, Some("run.completed"), Some(release.as_str())),
         "{out:?}"
     );
 }
@@ -474,5 +463,91 @@ fn an_update_fetches_wheels_by_url_held_to_their_digests() {
     assert!(
         server.served.load(Ordering::Relaxed) > 0,
         "the machine fetched the wheels"
+    );
+}
+
+/// `machine update --runtime-wheel` alone: the machine keeps its TensorFS when the Runtime resolves
+/// with it, else installs the one uv resolves for the Runtime over the index (PyPI's newest it
+/// accepts), held to PyPI's digest. A Runtime no published TensorFS satisfies fails naming
+/// `--tensorfs-wheel`, and the machine keeps its software.
+#[test]
+fn a_runtime_wheel_alone_brings_the_tensorfs_it_accepts() {
+    let Some(home) = Home::new() else { return };
+    let (dir, trust) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (runtime, tensorfs) = downloaded(dir.path());
+    let server = Https::serve(dir.path());
+    // The machine's bundle: the runner's roots and the server's.
+    let ca = trust.path().join("ca.pem");
+    let system = std::fs::read_to_string("/etc/ssl/certs/ca-certificates.crt").unwrap_or_default();
+    std::fs::write(&ca, system + &server.ca).unwrap();
+    let _machine = tensord::added_with(&home, "paired", &[("SSL_CERT_FILE", ca.to_str().unwrap())]);
+    let update = |wheel: &str| {
+        let out = home.cozy([
+            "machine",
+            "update",
+            "paired",
+            "--runtime-wheel",
+            wheel,
+            "--json",
+        ]);
+        let last: Value = serde_json::from_str(out.stdout.lines().last().unwrap_or_default())
+            .unwrap_or_else(|e| panic!("{e}: {out:?}"));
+        (out, last)
+    };
+    let running = || home.json(["machine", "show", "paired", "--json"])["status"].clone();
+    let before = running();
+
+    // A Runtime that needs a TensorFS PyPI has never published.
+    let unpaired = trust.path().join("cozy_runtime-0.0.1-py3-none-any.whl");
+    let made = std::process::Command::new("python3")
+        .args([
+            "-I",
+            "-c",
+            "import sys, zipfile\n\
+             with zipfile.ZipFile(sys.argv[1], 'w') as w:\n\
+             \x20   w.writestr('cozy_runtime-0.0.1.dist-info/METADATA', \
+             'Metadata-Version: 2.1\\nName: cozy-runtime\\nVersion: 0.0.1\\nRequires-Dist: tensorfs>=999\\n')",
+        ])
+        .arg(&unpaired)
+        .status()
+        .unwrap();
+    assert!(made.success());
+    let (out, last) = update(unpaired.to_str().unwrap());
+    let reason = &last["run"]["reason"];
+    assert_eq!(
+        (out.code, last["type"].as_str(), reason["code"].as_str()),
+        (1, Some("run.failed"), Some("tensorfs_unresolved")),
+        "{out:?}"
+    );
+    assert!(
+        reason["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("--tensorfs-wheel")),
+        "{out:?}"
+    );
+    let after = running();
+    assert_eq!(
+        (&after["runtime"], &after["tensorfs"]),
+        (&before["runtime"], &before["tensorfs"])
+    );
+
+    // The machine runs no TensorFS the Runtime accepts: it installs PyPI's newest that it does.
+    let name = runtime.file_name().unwrap().to_str().unwrap();
+    let sha256 = hex::encode(Sha256::digest(std::fs::read(&runtime).unwrap()));
+    let (out, last) = update(&format!("{}/to/{name}#sha256={sha256}", server.base));
+    assert_eq!(
+        (
+            out.code,
+            last["type"].as_str(),
+            last["run"]["result"]["to"]["tensorfs"].as_str()
+        ),
+        (0, Some("run.completed"), Some(version(&tensorfs).as_str())),
+        "{out:?}"
+    );
+    let status = running();
+    assert_eq!(
+        (&status["runtime"], &status["tensorfs"]),
+        (&version(&runtime).into(), &version(&tensorfs).into()),
+        "{status}"
     );
 }

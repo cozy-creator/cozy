@@ -1,11 +1,6 @@
 //! `cozy up|down|status|logs`: Calcifer's lifecycle. Stopping Calcifer never stops work: machines
 //! run what they accepted, and the next Calcifer resumes what it owed.
-use std::{
-    io::{self, Read as _, Seek as _, SeekFrom},
-    path::Path,
-    process::ExitCode,
-    time::Duration,
-};
+use std::{path::Path, process::ExitCode};
 
 use clap::ValueEnum;
 use cozy_proto::{
@@ -15,10 +10,9 @@ use cozy_proto::{
 use jiff::{SignedDuration, Timestamp};
 use serde_json::json;
 
-use crate::{Context, calcifer_client::Client, output};
+use cozy_platform::tail::{Log, Start};
 
-/// How often a followed log is read again: a sampling period.
-const FOLLOW: Duration = Duration::from_millis(250);
+use crate::{Context, calcifer_client::Client, output};
 
 #[derive(clap::Args, Debug)]
 pub struct Up {}
@@ -223,12 +217,9 @@ fn since(text: &str) -> Result<SignedDuration, String> {
         .map_err(|_| format!("{text:?} is not a duration such as 90s, 30m or 2h"))
 }
 
-/// One read's worth while following: more than a busy machine writes between two reads.
-const FOLLOW_TAIL: u64 = 256 << 10;
-
-/// A machine's log through Calcifer: its newest lines, then, with `--follow`, each line as it
-/// appears, read again every sampling period. A machine keeps its logs, so reading never needs
-/// it to have run anything here.
+/// A machine's log through Calcifer: its newest lines, then, with `--follow`, each line as the
+/// machine writes it. A machine keeps its logs, so reading never needs it to have run anything
+/// here.
 pub(crate) async fn machine_log(
     ctx: &Context,
     name: &str,
@@ -236,86 +227,61 @@ pub(crate) async fn machine_log(
 ) -> Result<ExitCode, Error> {
     let path = format!("{}/logs/{}", crate::machine::route(name)?, q.log.as_str());
     let calcifer = ctx.calcifer().await?;
-    // Lines run to a few hundred bytes: read generously, then keep the newest N.
-    let tail = match q.lines {
-        0 => 0,
-        n => (n as u64).saturating_mul(512).max(64 << 10),
+    let mut shown = Shown {
+        since: q
+            .since
+            .map(|window| Timestamp::now().saturating_sub(window).unwrap_or_default()),
+        any: false,
     };
-    let text = calcifer.text(&format!("{path}?tail_bytes={tail}")).await?;
-    let read = whole_lines(&text);
-    let mut shown = match q.since {
-        Some(window) => from(
-            &read,
-            Timestamp::now().saturating_sub(window).unwrap_or_default(),
-        ),
-        None => &read[..],
-    };
-    if q.lines > 0 && shown.len() > q.lines {
-        shown = &shown[shown.len() - q.lines..];
-    }
-    if shown.is_empty() && !q.follow {
-        output::say(
-            ctx,
-            &format!("{name} has logged nothing in its {} log", q.log.as_str()),
-        );
-    }
-    for line in shown {
-        print_log_line(ctx, name, q.log, line);
-    }
     if !q.follow {
+        let text = calcifer.text(&format!("{path}?lines={}", q.lines)).await?;
+        shown.print(ctx, name, q.log, &text);
+        if !shown.any {
+            output::say(
+                ctx,
+                &format!("{name} has logged nothing in its {} log", q.log.as_str()),
+            );
+        }
         return Ok(ExitCode::SUCCESS);
     }
-    let mut last = read.last().map(|l| l.to_string());
+    let mut lines = calcifer.follow_log(&path, q.lines as u64);
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => return Ok(ExitCode::SUCCESS),
-            () = tokio::time::sleep(FOLLOW) => {}
-        }
-        let text = calcifer
-            .text(&format!("{path}?tail_bytes={FOLLOW_TAIL}"))
-            .await?;
-        let read = whole_lines(&text);
-        // The lines after the last one printed; all of them when it rolled out of the tail.
-        let fresh = match &last {
-            Some(last) => match read.iter().rposition(|l| l == last) {
-                Some(at) => &read[at + 1..],
-                None => &read[..],
-            },
-            None => &read[..],
-        };
-        for line in fresh {
-            print_log_line(ctx, name, q.log, line);
-        }
-        if let Some(line) = read.last() {
-            last = Some(line.to_string());
+            batch = lines.next() => shown.print(ctx, name, q.log, &batch?.text),
         }
     }
 }
 
-/// The complete lines of a read: one still being written waits for its end.
-fn whole_lines(text: &str) -> Vec<&str> {
-    let complete = text.rfind('\n').map_or("", |end| &text[..end]);
-    complete.lines().filter(|l| !l.is_empty()).collect()
+/// Lines printed so far, and the cutoff the first one shown must be stamped at or after. A
+/// line's stamp is its first word: an RFC 3339 instant (TensorD's own log) or Unix seconds (the
+/// TensorFS and memory logs). A line without one goes with the line before it.
+struct Shown {
+    since: Option<Timestamp>,
+    any: bool,
 }
 
-/// The lines from the first one stamped at or after `cutoff`. A line's stamp is its first word:
-/// an RFC 3339 instant (TensorD's own log) or Unix seconds (the TensorFS and memory logs). A
-/// line without one goes with the line before it.
-fn from<'a>(lines: &'a [&'a str], cutoff: Timestamp) -> &'a [&'a str] {
-    let stamp = |line: &&str| -> Option<Timestamp> {
-        let word = line.split_whitespace().next()?;
-        word.parse().ok().or_else(|| {
-            let seconds: f64 = word.parse().ok()?;
-            Timestamp::from_millisecond((seconds * 1000.0) as i64).ok()
-        })
-    };
-    match lines
-        .iter()
-        .position(|line| stamp(line).is_some_and(|at| at >= cutoff))
-    {
-        Some(at) => &lines[at..],
-        None => &[],
+impl Shown {
+    fn print(&mut self, ctx: &Context, machine: &str, log: LogName, text: &str) {
+        for line in text.lines().filter(|l| !l.is_empty()) {
+            if let Some(cutoff) = self.since {
+                if stamp(line).is_none_or(|at| at < cutoff) {
+                    continue;
+                }
+                self.since = None;
+            }
+            self.any = true;
+            print_log_line(ctx, machine, log, line);
+        }
     }
+}
+
+fn stamp(line: &str) -> Option<Timestamp> {
+    let word = line.split_whitespace().next()?;
+    word.parse().ok().or_else(|| {
+        let seconds: f64 = word.parse().ok()?;
+        Timestamp::from_millisecond((seconds * 1000.0) as i64).ok()
+    })
 }
 
 fn print_log_line(ctx: &Context, machine: &str, log: LogName, line: &str) {
@@ -326,59 +292,60 @@ fn print_log_line(ctx: &Context, machine: &str, log: LogName, line: &str) {
     }
 }
 
-/// Calcifer's log, read from its file: there whether or not Calcifer is.
+/// Calcifer's log, read from its file: there whether or not Calcifer is. Followed, each line as
+/// it is written, woken by a watch on its directory (`tail -F`, across a rotation to
+/// `calcifer.log.1`).
 async fn calcifer_log(ctx: &Context, follow: bool) -> Result<ExitCode, Error> {
     let path = ctx.home.calcifer_log();
-    let unreadable = |e: io::Error| {
+    if !path.exists() {
+        return Err(Error::new(
+            Kind::NotFound,
+            "log_not_found",
+            format!(
+                "no Calcifer has run here: {} does not exist",
+                path.display()
+            ),
+        )
+        .next("cozy up"));
+    }
+    let unreadable = |e: &dyn std::fmt::Display| {
         Error::new(
             Kind::Internal,
             "log_unreadable",
             format!("{}: {e}", path.display()),
         )
     };
-    let mut file = match std::fs::File::open(&path) {
-        Ok(file) => file,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            return Err(Error::new(
-                Kind::NotFound,
-                "log_not_found",
-                format!(
-                    "no Calcifer has run here: {} does not exist",
-                    path.display()
-                ),
-            )
-            .next("cozy up"));
-        }
-        Err(e) => return Err(unreadable(e)),
-    };
-    let mut pending = String::new();
+    let log = Log::rotated(ctx.home.calcifer(), "calcifer.log");
+    if !follow {
+        let text = log.read(Start::Last(0)).map_err(|e| unreadable(&e))?;
+        text.lines().for_each(|line| print_line(ctx, line));
+        return Ok(ExitCode::SUCCESS);
+    }
+    let follow = log
+        .follow(Start::Last(0))
+        .map_err(|e| match e.is_unsupported() {
+            true => Error::new(Kind::Unavailable, "log_follow_unsupported", e.to_string()),
+            false => unreadable(&e),
+        })?;
+    let (sender, mut batches) = tokio::sync::mpsc::channel(16);
+    let reading = tokio::task::spawn_blocking(move || {
+        follow.run(
+            |batch| sender.blocking_send(batch).is_ok(),
+            || !sender.is_closed(),
+        )
+    });
     loop {
-        let mut chunk = vec![];
-        file.read_to_end(&mut chunk).map_err(unreadable)?;
-        pending.push_str(&String::from_utf8_lossy(&chunk));
-        // Whole lines only: a line still being written waits for its end.
-        while let Some(end) = pending.find('\n') {
-            let line: String = pending.drain(..=end).collect();
-            print_line(ctx, line.trim_end_matches(['\n', '\r']));
-        }
-        if !follow {
-            if !pending.is_empty() {
-                print_line(ctx, &pending);
-            }
-            return Ok(ExitCode::SUCCESS);
-        }
         tokio::select! {
             _ = tokio::signal::ctrl_c() => return Ok(ExitCode::SUCCESS),
-            () = tokio::time::sleep(FOLLOW) => {}
-        }
-        // A rotation replaces the file under the same name: carry on from the new one's start.
-        let position = file.stream_position().map_err(unreadable)?;
-        let length = std::fs::metadata(&path)
-            .map(|m| m.len())
-            .unwrap_or(position);
-        if length < position {
-            file = std::fs::File::open(&path).map_err(unreadable)?;
-            file.seek(SeekFrom::Start(0)).map_err(unreadable)?;
+            batch = batches.recv() => match batch {
+                Some(batch) => batch.text.lines().for_each(|line| print_line(ctx, line)),
+                None => {
+                    return match reading.await {
+                        Ok(Err(e)) => Err(unreadable(&e)),
+                        _ => Ok(ExitCode::SUCCESS),
+                    };
+                }
+            },
         }
     }
 }
