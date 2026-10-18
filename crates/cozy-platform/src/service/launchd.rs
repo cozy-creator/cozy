@@ -113,6 +113,24 @@ fn escape(text: &str) -> String {
         .replace('>', "&gt;")
 }
 
+/// Only systemd ran an older cozy's machine.
+pub(super) fn legacy(_: &Path) -> Result<Option<super::Legacy>> {
+    Ok(None)
+}
+
+pub(super) fn retire(_: &str) -> Result<()> {
+    Ok(())
+}
+
+pub(super) fn revive(_: &super::Legacy) -> Result<()> {
+    Ok(())
+}
+
+/// Only a manager that restarts services can say one failed to start.
+pub(super) fn failed(_: &str) -> bool {
+    false
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

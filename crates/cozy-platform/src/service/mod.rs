@@ -5,6 +5,7 @@
 //! starts, so `stop` finds it however it was started.
 use crate::{Result, paths::Home};
 use std::{
+    collections::BTreeMap,
     ffi::OsString,
     path::{Path, PathBuf},
 };
@@ -22,6 +23,19 @@ pub struct ServiceSpec {
     pub args: Vec<OsString>,
     /// Where its stdout and stderr append: what it says before its own log is open.
     pub log: Option<PathBuf>,
+}
+
+/// A TensorD an older cozy started as a transient `tensord-*` unit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Legacy {
+    pub unit: String,
+    pub program: PathBuf,
+    /// Its arguments after the program.
+    pub args: Vec<String>,
+    pub working_directory: Option<PathBuf>,
+    pub active: bool,
+    /// The environment it was started with: its root, store, ports, worker id and keys.
+    pub environment: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug)]
@@ -46,6 +60,12 @@ impl Services {
     /// test's, a second HOME) has none: its programs run detached instead.
     pub fn available(&self) -> bool {
         self.login && sys::available()
+    }
+
+    /// Whether a user service manager answers at all, whatever the home: where an older cozy's
+    /// machine unit is looked for.
+    pub fn reachable(&self) -> bool {
+        sys::available()
     }
 
     /// Writes the definition and enables it at login, without starting it.
@@ -85,6 +105,28 @@ impl Services {
     pub fn uninstall(&self, name: &str) -> Result<()> {
         sys::stop(&self.dir, name)?;
         sys::uninstall(&self.dir, name)
+    }
+
+    /// The TensorD an older cozy started whose program lies under `under`, if one is known to
+    /// this session's manager.
+    pub fn legacy(&self, under: &Path) -> Result<Option<Legacy>> {
+        sys::legacy(under)
+    }
+
+    /// Stops `legacy` and removes it from the manager so nothing starts it again; its program and
+    /// files are kept.
+    pub fn retire(&self, legacy: &Legacy) -> Result<()> {
+        sys::retire(&legacy.unit)
+    }
+
+    /// Starts `legacy` again as it ran, when what replaced it did not start.
+    pub fn revive(&self, legacy: &Legacy) -> Result<()> {
+        sys::revive(legacy)
+    }
+
+    /// Whether the service failed to start: its manager gave up on it or restarted it.
+    pub fn failed(&self, name: &str) -> bool {
+        sys::failed(name)
     }
 }
 

@@ -297,13 +297,14 @@ impl Machines {
                 abandoned: vec![],
             });
         }
+        // `cozy machine disable`: its runs here end, its files stay, and enable records it again.
         if row.kind == MachineKind::Local {
-            return Err(Error::new(
-                Kind::Conflict,
-                "machine_local",
-                "local is this computer's machine: it is disabled, not ended",
-            )
-            .next("cozy machine disable"));
+            self.ended(&row.name, "disabled on this computer");
+            return Ok(Ended {
+                machine: self.picture(&self.row(&row.name)?)?,
+                changed: true,
+                abandoned: vec![],
+            });
         }
         let owed = self.calcifer.owed_on(&row.name).map_err(internal)?;
         if !owed.is_empty() && !force {
@@ -499,7 +500,7 @@ impl Machines {
             .calcifer
             .link(name)?
             .ok_or_else(|| "it has no address".to_string())?;
-        let mut frames = link.watch().await.map_err(|e| e.to_string())?;
+        let mut frames = link.watch().await.map_err(|e| unwatched(name, e))?;
         loop {
             match frames.next().await {
                 Some(Ok(frame)) => {
@@ -511,7 +512,7 @@ impl Machines {
                     }
                 }
                 None => return Err("the machine closed its Status stream".into()),
-                Some(Err(e)) => return Err(e.to_string()),
+                Some(Err(e)) => return Err(unwatched(name, e)),
             }
         }
     }
@@ -837,6 +838,11 @@ pub(crate) async fn create(
         } => {
             let added = api.machines.add(&name, &address, &fingerprint).await;
             Ok(Json(added.map_err(Refusal)?).into_response())
+        }
+        NewMachine::Local { root } => {
+            let ready = root.join("var/lib/cozy/tensord/api-ready.json");
+            let local = api.machines.put_local(endpoint_of(&ready).map_err(Refusal)?);
+            Ok(Json(local.map_err(Refusal)?).into_response())
         }
     }
 }
@@ -1199,10 +1205,21 @@ fn refusal(name: &str, e: LinkError) -> Error {
     }
 }
 
+/// Why a machine's Status is not read: an outdated one says so first (`outdated:`), with what
+/// to do about it.
+fn unwatched(name: &str, e: LinkError) -> String {
+    match e {
+        LinkError::Refused { code, message } if code == OUTDATED => {
+            format!("outdated: {message}; {}", link::outdated_remedy(name))
+        }
+        e => e.to_string(),
+    }
+}
+
 /// A machine from before the HTTP API, which this controller never drives.
 fn outdated(name: &str, message: String) -> Error {
     Error::new(Kind::Conflict, OUTDATED, format!("{name}: {message}"))
-        .remedy(format!("end it: cozy machine end {name}"))
+        .remedy(link::outdated_remedy(name))
 }
 
 pub(crate) fn not_found(text: &str) -> Error {
