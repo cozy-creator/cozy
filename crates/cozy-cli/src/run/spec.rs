@@ -138,14 +138,12 @@ impl Call<'_> {
             _ => RunKind::Call,
         };
         let inputs = bound.map_or_else(Vec::new, |b| {
-            b.files
-                .iter()
-                .map(|f| StagedInput {
-                    path: f.path.clone(),
-                    digest: f.digest,
-                    length: f.length,
-                })
-                .collect()
+            let files = b.files.iter().map(|f| StagedInput {
+                path: f.path.clone(),
+                digest: f.digest,
+                length: f.length,
+            });
+            files.chain(b.tree_files.iter().cloned()).collect()
         });
         let warnings = bound
             .and_then(|b| b.warning(&target))

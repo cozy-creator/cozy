@@ -27,6 +27,7 @@ mod play;
 mod show;
 mod spec;
 mod target;
+mod tree;
 mod upload;
 
 #[derive(clap::Args, Debug)]
@@ -395,6 +396,7 @@ fn terms(ctx: &Context, args: &RunArgs) -> Result<Terms, Error> {
         cwd,
         user_home: ctx.user_home.clone(),
         digests: Some(ctx.home.root().join("cache").join("digests")),
+        manifests: Some(ctx.home.root().join("cache").join("trees")),
     })
 }
 

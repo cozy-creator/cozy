@@ -652,6 +652,7 @@ dependencies = [
  "supports-hyperlinks",
  "tar",
  "tempfile",
+ "tensorfs-core",
  "tokio",
  "tokio-util",
  "toml",
