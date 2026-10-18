@@ -71,9 +71,8 @@ c.acquire(region, stream); c.home; c.ring_ptr; c.ring_nbytes; c.passes; c.close(
 ## Facts
 
 ```python
-p.stats() -> {"devices": [{ordinal, uuid, granularity, exportable, mapped, leased, shared_bytes,
-                           copies, misses, host_copy_bytes/ns, bounce_copy_bytes/ns,
-                           disk_copy_bytes/ns}],
+p.stats() -> {"devices": [{ordinal, uuid, granularity, mapped, leased, copies, misses,
+                           host_copy_bytes/ns, bounce_copy_bytes/ns, disk_copy_bytes/ns}],
               "regions": [{ws, device, region, bytes, state, live, last_use}],   # mapped only
               "io": {direct_bytes, cached_bytes, buffered_bytes, direct_refused, register_failed},
               "now", "events_dropped", "poisoned"}
@@ -82,7 +81,7 @@ p.events() -> [{kind, ws, region, device, bytes, detail}]   # drains
 
 `last_use` and `now` are plane-clock nanoseconds: a fact for the caller choosing what to drop,
 not a priority. Event kinds: `fill_failed`, `release_synced`, `release_unconfirmed`,
-`prefetch_failed`, `exported`, `attached`, `detached`.
+`prefetch_failed`.
 
 ## Errors
 
@@ -91,9 +90,3 @@ not a priority. Event kinds: `fill_failed`, `release_synced`, `release_unconfirm
 failed copy is reported only after its stream drained; one that cannot drain is `Poisoned`, and a
 poisoned plane never unmaps (its copies may still touch its ranges) until it is collected after
 its devices ran all queued work.
-
-## Device memory across processes (custody)
-
-`p.device_sharing(device)`, `p.export_device(ws, device, regions=None)` and
-`p.attach_device(ws, device, region, chunks, digest)` share Ready regions read-only between
-processes on one GPU. They stay until owner decision D3 deletes them.

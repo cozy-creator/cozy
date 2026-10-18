@@ -21,7 +21,7 @@ pub mod plane;
 
 pub use cursor::Cursor;
 pub use layout::Layout;
-pub use plane::{Exported, Host, Lease, Plane, PlaneConfig, Stats, Ticket, WsId};
+pub use plane::{Host, Lease, Plane, PlaneConfig, Stats, Ticket, WsId};
 
 use thiserror::Error;
 

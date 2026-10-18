@@ -1,6 +1,6 @@
 //! Device paths on a real GPU: fills from chunk files (O_DIRECT cold, page cache warm) and from a
 //! sealed layout, drops that give memory back to the driver, `DeviceFull`/`Floor`, leases as the
-//! only pin, the streaming ring under a slow consumer, custody, and the copy path's faults.
+//! only pin, the streaming ring under a slow consumer, and the copy path's faults.
 //! Ignored by default; one GPU operator at a time:
 //! `cargo test -p varena --features faults --test gpu -- --ignored --test-threads 1`
 #![cfg(target_os = "linux")]
@@ -8,7 +8,7 @@
 mod common;
 
 use std::ffi::c_void;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
+use std::os::fd::AsRawFd;
 
 use common::*;
 use varena::cuda::{self, CUstream, CtxGuard};
@@ -380,75 +380,6 @@ fn a_dropped_cursor_closes_itself_once_its_last_lease_is_released() {
     }
     assert!(p.stats().poisoned.is_none());
     p.close().unwrap();
-}
-
-/// The driver's access flags for this process at `va`.
-fn access(va: u64) -> u64 {
-    let d = cuda::driver().unwrap();
-    let get = d.mem_get_access.expect("cuMemGetAccess");
-    let loc = cuda::MemLocation { kind: cuda::MEM_LOCATION_TYPE_DEVICE, id: DEV };
-    let mut flags = 0u64;
-    cuda::check("cuMemGetAccess", unsafe { get(&mut flags, &loc, va) }).unwrap();
-    flags
-}
-
-#[test]
-#[ignore = "GPU"]
-fn shared_regions_attach_read_only_and_outlive_their_exporter() {
-    let fx = Fixture::new("gpu-share");
-    let a = plane();
-    if !a.device_sharing(DEV).unwrap() {
-        eprintln!("device {DEV} cannot share memory: nothing to test");
-        return;
-    }
-    let wa = a.register(&fx.ck, &fx.regions(), PAGE).unwrap();
-    let s = Stream::new();
-    let spans: Vec<u64> = a.layout(wa).unwrap().regions.iter().map(|r| r.span).collect();
-    let total: u64 = spans.iter().sum();
-    a.want(wa, DEV, None).unwrap().wait().unwrap();
-    // A leased region is skipped; the rest become shared and read-only.
-    let held = a.acquire(wa, DEV, 2, s.raw()).unwrap();
-    let mut exported = a.export_device(wa, DEV, None).unwrap();
-    assert_eq!(exported.iter().map(|e| e.region).collect::<Vec<_>>(), vec![0, 1, 3]);
-    held.release(s.raw()).unwrap();
-    exported.extend(a.export_device(wa, DEV, None).unwrap());
-    assert_eq!(exported.len(), 4);
-    assert!(a.export_device(wa, DEV, None).unwrap().is_empty(), "shared regions export once");
-    assert_eq!(a.stats().devices[0].shared_bytes, total);
-    let la = resident(&a, wa, &s, 0);
-    assert_eq!(access(la.ptr), u64::from(cuda::MEM_ACCESS_PROT_READ), "the exporter maps it read-only too");
-    la.release(s.raw()).unwrap();
-    // Another plane attaches the same layout's regions without a copy.
-    let b = plane();
-    let wb = b.register(&fx.ck, &fx.regions(), PAGE).unwrap();
-    let digest = a.layout(wa).unwrap().digest.clone();
-    assert_eq!(digest, b.layout(wb).unwrap().digest);
-    let first: Vec<(u64, BorrowedFd)> = exported[0].chunks.iter().map(|(n, fd)| (*n, fd.as_fd())).collect();
-    assert!(matches!(b.attach_device(wb, DEV, exported[0].region, &first, &"0".repeat(digest.len())), Err(Error::Invalid(_))));
-    for e in &exported {
-        let chunks: Vec<(u64, BorrowedFd)> = e.chunks.iter().map(|(n, fd)| (*n, fd.as_fd())).collect();
-        b.attach_device(wb, DEV, e.region, &chunks, &digest).unwrap();
-    }
-    assert!(matches!(b.attach_device(wb, DEV, 0, &first, &digest), Err(Error::Invalid(_))));
-    // The exporter and every fd go; the attached handles keep the bytes.
-    drop(exported);
-    a.close().unwrap();
-    drop(a);
-    for r in 0..4 {
-        let l = resident(&b, wb, &s, r);
-        assert_eq!(access(l.ptr), u64::from(cuda::MEM_ACCESS_PROT_READ));
-        l.release(s.raw()).unwrap();
-    }
-    let st = b.stats();
-    assert_eq!((st.devices[0].mapped, st.devices[0].counters.copies), (0, 0), "attached, never copied");
-    assert_eq!(st.devices[0].shared_bytes, total);
-    // A drop releases a shared region; the next use fills a private copy.
-    assert_eq!(b.drop_regions(wb, DEV, Some(&[1])).unwrap(), spans[1]);
-    resident(&b, wb, &s, 1).release(s.raw()).unwrap();
-    let st = b.stats();
-    assert_eq!((st.devices[0].counters.misses, st.devices[0].mapped), (1, spans[1]));
-    s.sync();
-    b.close().unwrap();
 }
 
 /// Copy failures with copies of the same job still queued on the device (Xid 31: a copy engine

@@ -6,7 +6,7 @@
 //! until dropped, and only a live lease keeps a drop from unmapping it.
 
 use std::collections::{HashMap, VecDeque};
-use std::os::fd::{BorrowedFd, OwnedFd, RawFd};
+use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Instant;
@@ -65,13 +65,6 @@ pub enum Host {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct WsId(pub u32);
 
-/// One region's shared device memory: its physical handles in VA order, (bytes, fd) each.
-#[derive(Debug)]
-pub struct Exported {
-    pub region: u32,
-    pub chunks: Vec<(u64, OwnedFd)>,
-}
-
 #[derive(Debug, Clone)]
 pub struct Event {
     pub kind: &'static str,
@@ -97,9 +90,6 @@ pub(crate) enum DState {
 
 pub(crate) struct DReg {
     pub mem: Vec<Chunk>,
-    /// Shared device memory (exported here or attached from another process): mapped
-    /// read-only, released rather than refilled.
-    pub shared: bool,
     pub state: DState,
     pub live: u32,
     /// Release events of finished leases the device may not have reached.
@@ -167,7 +157,6 @@ pub(crate) struct DeviceRt {
     pub dev: CUdevice,
     pub ctx: CUcontext,
     pub uuid: String,
-    pub exportable: bool,
     pub granularity: u64,
     pub prop: AllocationProp,
     pub movers: Vec<Mover>,
@@ -280,7 +269,7 @@ pub(crate) fn devws(c: &mut Core, ws: WsId, d: usize) -> Result<&mut DevWs> {
     if w.devs[d].is_none() {
         let base = device::reserve_va(w.layout.nbytes)?;
         let regs = (0..w.layout.regions.len())
-            .map(|_| DReg { mem: Vec::new(), shared: false, state: DState::Absent, live: 0, pending: Vec::new(), last_use: 0 })
+            .map(|_| DReg { mem: Vec::new(), state: DState::Absent, live: 0, pending: Vec::new(), last_use: 0 })
             .collect();
         w.devs[d] = Some(DevWs { base, regs, views: 0, epoch: 1 });
     }
@@ -369,7 +358,6 @@ impl Inner {
 
     /// Unmap one unleased region once its copies and readers are past: release its memory.
     pub(crate) fn unmap_region(self: &Arc<Self>, c: &mut Core, ws: WsId, d: usize, r: u32) -> Result<u64> {
-        let ordinal = self.devices[d].ordinal;
         let span = c.ws(ws)?.layout.regions[r as usize].span;
         let offset = c.ws(ws)?.layout.regions[r as usize].offset;
         let dw = c.ws_mut(ws)?.devs[d].as_mut().expect("a mapped region has a reservation");
@@ -382,7 +370,6 @@ impl Inner {
         }
         .and_then(|_| reg.pending.drain(..).try_for_each(|e| e.sync()));
         let mem = std::mem::take(&mut reg.mem);
-        let shared = std::mem::take(&mut reg.shared);
         reg.state = DState::Absent;
         if let Err(e) = waited.and_then(|_| device::unmap_span(base + offset, span)) {
             return Err(c.poison(format!("unmapping region {r} of weight set {} failed: {e}", ws.0)));
@@ -392,11 +379,7 @@ impl Inner {
                 return Err(c.poison(format!("releasing region {r} of weight set {} failed: {e}", ws.0)));
             }
         }
-        if shared {
-            c.event("detached", ws, r, ordinal, span, String::new());
-        } else {
-            c.mapped[d] -= span;
-        }
+        c.mapped[d] -= span;
         Ok(span)
     }
 
@@ -540,8 +523,7 @@ impl Plane {
             if cuda::attribute(dev, cuda::ATTR_VMM_SUPPORTED)? != 1 {
                 return Err(Error::Invalid(format!("device {ordinal} has no virtual memory management")));
             }
-            let exportable = cuda::attribute(dev, cuda::ATTR_POSIX_FD_SUPPORTED)? == 1;
-            let prop = AllocationProp::device(dev, exportable);
+            let prop = AllocationProp::device(dev);
             let d = cuda::driver()?;
             let mut g = 0usize;
             // SAFETY: out-param.
@@ -559,7 +541,7 @@ impl Plane {
                     Mover::start(format!("tfs-gpu-copy-{ordinal}.{i}"), m)
                 })
                 .collect::<Result<Vec<_>>>()?;
-            devices.push(DeviceRt { ordinal, dev, ctx, uuid: cuda::uuid(dev)?, exportable, granularity: g, prop, movers, next_mover: AtomicUsize::new(0) });
+            devices.push(DeviceRt { ordinal, dev, ctx, uuid: cuda::uuid(dev)?, granularity: g, prop, movers, next_mover: AtomicUsize::new(0) });
             pools.push(events);
         }
         let n = devices.len();
@@ -678,123 +660,6 @@ impl Plane {
         Ok(freed)
     }
 
-    // ------------------------------------------------------------ device sharing
-
-    /// This device can export and attach shared regions (POSIX-fd VMM and the driver symbols).
-    pub fn device_sharing(&self, ordinal: i32) -> Result<bool> {
-        let d = self.dev(ordinal)?;
-        Ok(self.inner.devices[d].exportable && device::sharing_symbols())
-    }
-
-    /// Share the Ready, unleased, unshared `regions` (all when None) on a device: export each
-    /// region's physical handles as close-on-exec fds and make the mapping read-only. Shared
-    /// regions are never refilled; dropping one releases this process's references. Regions
-    /// not Ready or leased are skipped. All-or-nothing: an export failure changes nothing.
-    pub fn export_device(&self, ws: WsId, ordinal: i32, regions: Option<&[u32]>) -> Result<Vec<Exported>> {
-        let d = self.dev(ordinal)?;
-        if !self.device_sharing(ordinal)? {
-            return Err(cuda::unavailable(format!("device {ordinal} cannot share memory")));
-        }
-        let dev = &self.inner.devices[d];
-        let _g = dev.bind()?;
-        let mut c = self.lock();
-        c.check()?;
-        let regions = Self::regions_or_all(&c, ws, regions)?;
-        let layout = c.ws(ws)?.layout.clone();
-        let Some(dw) = c.ws_mut(ws)?.devs[d].as_mut() else { return Ok(Vec::new()) };
-        let mut out = Vec::new();
-        for r in regions {
-            let reg = &mut dw.regs[r as usize];
-            commit(reg)?;
-            if reg.shared || reg.mem.is_empty() || !matches!(reg.state, DState::Ready) || reg.live > 0 {
-                continue;
-            }
-            reg.pending.drain(..).try_for_each(|e| e.sync())?;
-            let mut chunks = Vec::with_capacity(reg.mem.len());
-            for ch in &reg.mem {
-                chunks.push((ch.size, device::export_fd(ch.handle)?));
-            }
-            out.push(Exported { region: r, chunks });
-        }
-        let base = dw.base;
-        for e in &out {
-            let region = &layout.regions[e.region as usize];
-            if let Err(err) = device::set_access(base + region.offset, region.span, dev.dev, cuda::MEM_ACCESS_PROT_READ) {
-                return Err(c.poison(format!("read-only access for shared region {} failed: {err}", e.region)));
-            }
-            c.ws_mut(ws)?.devs[d].as_mut().unwrap().regs[e.region as usize].shared = true;
-            c.mapped[d] -= region.span;
-            c.event("exported", ws, e.region, ordinal, region.span, String::new());
-        }
-        Ok(out)
-    }
-
-    /// Map another process's shared region read-only at its place in this weight set: `chunks`
-    /// are (bytes, fd) in VA order, as `export_device` gave them, and `digest` is the layout the
-    /// holder says those bytes have; it must be this weight set's, checked before any fd is
-    /// imported. The fds stay the caller's. The region is Ready without a copy.
-    pub fn attach_device(&self, ws: WsId, ordinal: i32, r: u32, chunks: &[(u64, BorrowedFd<'_>)], digest: &str) -> Result<()> {
-        let d = self.dev(ordinal)?;
-        if !self.device_sharing(ordinal)? {
-            return Err(cuda::unavailable(format!("device {ordinal} cannot share memory")));
-        }
-        let dev = &self.inner.devices[d];
-        let _g = dev.bind()?;
-        let mut c = self.lock();
-        c.check()?;
-        let layout = c.ws(ws)?.layout.clone();
-        if digest != layout.digest {
-            return Err(Error::Invalid(format!("shared region {r}: the holder's layout {digest} is not this weight set's {}", layout.digest)));
-        }
-        let region = layout.region(r)?.clone();
-        let total: u64 = chunks.iter().map(|(n, _)| *n).sum();
-        if total != region.span || chunks.iter().any(|(n, _)| *n == 0 || !n.is_multiple_of(dev.granularity)) {
-            return Err(Error::Invalid(format!("shared region {r}: chunks of {total} bytes for a {}-byte span", region.span)));
-        }
-        let dw = devws(&mut c, ws, d)?;
-        let reg = &dw.regs[r as usize];
-        if !reg.mem.is_empty() || matches!(reg.state, DState::Queued) {
-            return Err(Error::Invalid(format!("region {r} is already on device {ordinal}")));
-        }
-        let base = dw.base;
-        let mut handles: Vec<Chunk> = Vec::with_capacity(chunks.len());
-        let mut failed = None;
-        for (size, fd) in chunks {
-            match device::import_fd(*fd, dev.dev) {
-                Ok(handle) => handles.push(Chunk { handle, size: *size }),
-                Err(e) => {
-                    failed = Some(e);
-                    break;
-                }
-            }
-        }
-        let failed = match failed {
-            Some(e) => Some(e),
-            None => device::map_span(base + region.offset, &handles, dev.dev, cuda::MEM_ACCESS_PROT_READ).err(),
-        };
-        if let Some(e) = failed {
-            if let Error::Poisoned(p) = e {
-                return Err(c.poison(p));
-            }
-            for h in handles {
-                if let Err(re) = device::release(h.handle) {
-                    return Err(c.poison(format!("release after a failed attach ({e}) failed: {re}")));
-                }
-            }
-            return Err(e);
-        }
-        let now = self.inner.now();
-        let reg = &mut devws(&mut c, ws, d)?.regs[r as usize];
-        reg.mem = handles;
-        reg.shared = true;
-        reg.state = DState::Ready;
-        reg.last_use = now;
-        c.event("attached", ws, r, ordinal, region.span, String::new());
-        drop(c);
-        self.inner.cv.notify_all();
-        Ok(())
-    }
-
     // ------------------------------------------------------------ access
 
     /// A stream-scoped lease on region `r` in place; an unmapped region is a miss and is filled
@@ -882,7 +747,6 @@ impl Plane {
                 ordinal: dev.ordinal,
                 uuid: dev.uuid.clone(),
                 granularity: dev.granularity,
-                exportable: dev.exportable,
                 mapped: c.mapped[d],
                 counters: c.dstats[d].clone(),
                 ..Default::default()
@@ -901,9 +765,6 @@ impl Plane {
                     let span = w.layout.regions[r].span;
                     if reg.live > 0 {
                         devices[d].leased += span;
-                    }
-                    if reg.shared {
-                        devices[d].shared_bytes += span;
                     }
                     let state = match reg.state {
                         DState::Absent | DState::Queued | DState::Filling(_) => "filling",
@@ -1007,13 +868,10 @@ pub struct DevStats {
     pub ordinal: i32,
     pub uuid: String,
     pub granularity: u64,
-    pub exportable: bool,
-    /// Bytes mapped: regions and rings (shared regions excluded).
+    /// Bytes mapped: regions and rings.
     pub mapped: u64,
     /// Bytes of regions a live lease holds.
     pub leased: u64,
-    /// Mapped shared regions (exported or attached).
-    pub shared_bytes: u64,
     pub counters: DevCounters,
 }
 

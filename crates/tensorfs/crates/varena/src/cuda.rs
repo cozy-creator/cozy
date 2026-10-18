@@ -33,13 +33,10 @@ pub const MEMHOSTREGISTER_READ_ONLY: c_uint = 0x8;
 pub const MEMHOSTALLOC_PORTABLE: c_uint = 0x1;
 
 pub const ATTR_VMM_SUPPORTED: c_int = 102;
-pub const ATTR_POSIX_FD_SUPPORTED: c_int = 103;
 
 pub const MEM_ALLOCATION_TYPE_PINNED: u32 = 1;
 pub const MEM_LOCATION_TYPE_DEVICE: u32 = 1;
 pub const MEM_HANDLE_TYPE_NONE: u32 = 0;
-pub const MEM_HANDLE_TYPE_POSIX_FD: u32 = 1;
-pub const MEM_ACCESS_PROT_READ: u32 = 1;
 pub const MEM_ACCESS_PROT_READWRITE: u32 = 3;
 pub const MEM_GRANULARITY_MINIMUM: u32 = 0;
 
@@ -70,15 +67,11 @@ pub struct AllocationProp {
 }
 
 impl AllocationProp {
-    /// Pinned device memory on `device`, POSIX-fd exportable when the device supports it.
-    pub fn device(device: CUdevice, exportable: bool) -> Self {
+    /// Pinned device memory on `device`.
+    pub fn device(device: CUdevice) -> Self {
         AllocationProp {
             kind: MEM_ALLOCATION_TYPE_PINNED,
-            requested_handle_types: if exportable {
-                MEM_HANDLE_TYPE_POSIX_FD
-            } else {
-                MEM_HANDLE_TYPE_NONE
-            },
+            requested_handle_types: MEM_HANDLE_TYPE_NONE,
             location: MemLocation {
                 kind: MEM_LOCATION_TYPE_DEVICE,
                 id: device,
@@ -142,12 +135,6 @@ pub struct Driver {
     pub mem_unmap: unsafe extern "C" fn(CUdeviceptr, usize) -> CUresult,
     pub mem_set_access:
         unsafe extern "C" fn(CUdeviceptr, usize, *const AccessDesc, usize) -> CUresult,
-    /// Device sharing (`Plane::export_device`/`attach_device`). Optional: a driver without
-    /// them still runs every other path.
-    pub mem_export_to_shareable_handle: Option<unsafe extern "C" fn(*mut c_void, Handle, u32, u64) -> CUresult>,
-    pub mem_import_from_shareable_handle: Option<unsafe extern "C" fn(*mut Handle, *mut c_void, u32) -> CUresult>,
-    pub mem_get_allocation_properties: Option<unsafe extern "C" fn(*mut AllocationProp, Handle) -> CUresult>,
-    pub mem_get_access: Option<unsafe extern "C" fn(*mut u64, *const MemLocation, CUdeviceptr) -> CUresult>,
 }
 
 // The table is immutable after load and the driver entry points are thread-safe.
@@ -179,13 +166,6 @@ macro_rules! load {
         *unsafe { $lib.get::<_>($name) }.map_err(|e| {
             unavailable(format!("{}: {e}", String::from_utf8_lossy($name)))
         })?
-    };
-}
-
-macro_rules! optional {
-    ($lib:expr, $name:literal) => {
-        // SAFETY: as `load!`; an absent symbol is `None`.
-        unsafe { $lib.get::<_>($name) }.ok().map(|f| *f)
     };
 }
 
@@ -232,10 +212,6 @@ impl Driver {
             mem_map: load!(lib, b"cuMemMap"),
             mem_unmap: load!(lib, b"cuMemUnmap"),
             mem_set_access: load!(lib, b"cuMemSetAccess"),
-            mem_export_to_shareable_handle: optional!(lib, b"cuMemExportToShareableHandle"),
-            mem_import_from_shareable_handle: optional!(lib, b"cuMemImportFromShareableHandle"),
-            mem_get_allocation_properties: optional!(lib, b"cuMemGetAllocationPropertiesFromHandle"),
-            mem_get_access: optional!(lib, b"cuMemGetAccess"),
             _lib: lib,
         };
         // SAFETY: documented as safe to call repeatedly; flags must be 0.

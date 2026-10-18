@@ -5,7 +5,6 @@
 //! views that keep the VA (never the pages) alive.
 
 use std::ffi::{c_void, CStr};
-use std::os::fd::{BorrowedFd, IntoRawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -79,8 +78,7 @@ fn stats<'p>(py: Python<'p>, s: Stats) -> PyResult<Bound<'p, PyDict>> {
         let c = &d.counters;
         devices.append(dict!(py;
             "ordinal" => d.ordinal, "uuid" => &d.uuid, "granularity" => d.granularity,
-            "exportable" => d.exportable, "mapped" => d.mapped, "leased" => d.leased,
-            "shared_bytes" => d.shared_bytes, "copies" => c.copies, "misses" => c.misses,
+            "mapped" => d.mapped, "leased" => d.leased, "copies" => c.copies, "misses" => c.misses,
             "host_copy_bytes" => c.host_copy_bytes, "host_copy_ns" => c.host_copy_ns,
             "bounce_copy_bytes" => c.bounce_copy_bytes, "bounce_copy_ns" => c.bounce_copy_ns,
             "disk_copy_bytes" => c.disk_copy_bytes, "disk_copy_ns" => c.disk_copy_ns,
@@ -225,39 +223,6 @@ impl PyPlane {
     fn drop_regions(&self, py: Python<'_>, ws: PyRef<'_, PyWeightSet>, device: i32, regions: Option<Vec<u32>>) -> PyResult<u64> {
         let (id, plane) = (self.id(py, &ws)?, &self.plane);
         py.detach(|| plane.drop_regions(id, device, regions.as_deref())).or_raise(py)
-    }
-
-    /// This device can export and attach shared regions.
-    fn device_sharing(&self, py: Python<'_>, device: i32) -> PyResult<bool> {
-        self.plane.device_sharing(device).or_raise(py)
-    }
-
-    /// Share the Ready, unleased regions (all when None) on `device`: they become read-only.
-    /// Returns `[{"region": int, "chunks": [(bytes, fd), ...]}]`; the caller owns every fd.
-    #[pyo3(signature = (ws, device, regions = None))]
-    fn export_device<'p>(&self, py: Python<'p>, ws: PyRef<'_, PyWeightSet>, device: i32, regions: Option<Vec<u32>>) -> PyResult<Bound<'p, PyList>> {
-        let (id, plane) = (self.id(py, &ws)?, &self.plane);
-        let exported = py.detach(|| plane.export_device(id, device, regions.as_deref())).or_raise(py)?;
-        let out = PyList::empty(py);
-        for e in exported {
-            let chunks: Vec<(u64, i32)> = e.chunks.into_iter().map(|(n, fd)| (n, fd.into_raw_fd())).collect();
-            out.append(dict!(py; "region" => e.region, "chunks" => chunks))?;
-        }
-        Ok(out)
-    }
-
-    /// Map another process's shared `region` read-only, without a copy: `chunks` are
-    /// `(bytes, fd)` in VA order, from `export_device`; `digest` must equal `ws.digest`. The fds
-    /// stay the caller's to close.
-    fn attach_device(&self, py: Python<'_>, ws: PyRef<'_, PyWeightSet>, device: i32, region: u32, chunks: Vec<(u64, i32)>, digest: String) -> PyResult<()> {
-        let id = self.id(py, &ws)?;
-        if chunks.iter().any(|(_, fd)| *fd < 0) {
-            return Err(err(py, Error::Invalid("a negative fd".into())));
-        }
-        // SAFETY: the caller keeps these fds open for the call.
-        let borrowed: Vec<(u64, BorrowedFd<'_>)> = chunks.iter().map(|(n, fd)| (*n, unsafe { BorrowedFd::borrow_raw(*fd) })).collect();
-        let plane = &self.plane;
-        py.detach(|| plane.attach_device(id, device, region, &borrowed, &digest)).or_raise(py)
     }
 
     /// A lease on `region` in place; an unmapped region is filled first (a miss).

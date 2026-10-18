@@ -7,7 +7,6 @@
 //! as soon as its slot is full. Pieces of later jobs start while earlier ones are still reading,
 //! so the disk always has every free slot's request in flight.
 
-use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
@@ -204,85 +203,6 @@ pub fn map_span(va: u64, chunks: &[Chunk], device: i32, access: u32) -> Result<(
         at += c.size;
     }
     Err(e)
-}
-
-/// Change `device`'s access to a mapped span: shared bytes become read-only for their filler.
-pub fn set_access(va: u64, len: u64, device: i32, access: u32) -> Result<()> {
-    let d = cuda::driver()?;
-    let desc = AccessDesc {
-        location: cuda::MemLocation {
-            kind: cuda::MEM_LOCATION_TYPE_DEVICE,
-            id: device,
-        },
-        flags: access,
-    };
-    // SAFETY: a span we mapped; no use is in flight (the caller checked its leases).
-    cuda::check("cuMemSetAccess", unsafe { (d.mem_set_access)(va, len as usize, &desc, 1) })
-}
-
-/// The driver can export and import device memory as POSIX fds.
-pub fn sharing_symbols() -> bool {
-    cuda::driver().is_ok_and(|d| {
-        d.mem_export_to_shareable_handle.is_some()
-            && d.mem_import_from_shareable_handle.is_some()
-            && d.mem_get_allocation_properties.is_some()
-    })
-}
-
-/// A close-on-exec POSIX fd naming `h`'s physical memory. Every fd, imported handle and
-/// mapping is a reference: the memory lives until the last one is gone, in any process.
-pub fn export_fd(h: Handle) -> Result<OwnedFd> {
-    let d = cuda::driver()?;
-    let export = d
-        .mem_export_to_shareable_handle
-        .ok_or_else(|| cuda::unavailable("cuMemExportToShareableHandle".into()))?;
-    let mut raw: i32 = -1;
-    // SAFETY: a POSIX-fd handle is one int written through the out-pointer; flags are 0.
-    cuda::check("cuMemExportToShareableHandle", unsafe {
-        export(&mut raw as *mut i32 as *mut libc::c_void, h, cuda::MEM_HANDLE_TYPE_POSIX_FD, 0)
-    })?;
-    if raw < 0 {
-        return Err(Error::Invalid("the driver exported no fd".into()));
-    }
-    // SAFETY: the export handed us this new fd exactly once.
-    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-    // SAFETY: fcntl on our own fd.
-    let flags = unsafe { libc::fcntl(raw, libc::F_GETFD) };
-    if flags < 0 || unsafe { libc::fcntl(raw, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
-        return Err(Error::Io(format!("cloexec on an exported fd: {}", std::io::Error::last_os_error())));
-    }
-    Ok(fd)
-}
-
-/// Import a shared fd as a handle of pinned memory on `dev` (this process's device numbering).
-/// The fd stays the caller's; the handle is a separate reference the caller must release.
-pub fn import_fd(fd: BorrowedFd<'_>, dev: cuda::CUdevice) -> Result<Handle> {
-    let d = cuda::driver()?;
-    let (import, props) = match (d.mem_import_from_shareable_handle, d.mem_get_allocation_properties) {
-        (Some(i), Some(p)) => (i, p),
-        _ => return Err(cuda::unavailable("cuMemImportFromShareableHandle".into())),
-    };
-    let mut h: Handle = 0;
-    // SAFETY: a POSIX fd travels as the fd number cast to a pointer, not a pointer to it.
-    cuda::check("cuMemImportFromShareableHandle", unsafe {
-        import(&mut h, fd.as_raw_fd() as usize as *mut libc::c_void, cuda::MEM_HANDLE_TYPE_POSIX_FD)
-    })?;
-    let mut p = AllocationProp::device(0, false);
-    // SAFETY: a live imported handle and a correctly sized out-record.
-    let rc = unsafe { props(&mut p, h) };
-    let wrong = rc != cuda::SUCCESS
-        || p.kind != cuda::MEM_ALLOCATION_TYPE_PINNED
-        || p.location.kind != cuda::MEM_LOCATION_TYPE_DEVICE
-        || p.location.id != dev;
-    if wrong {
-        let _ = release(h);
-        cuda::check("cuMemGetAllocationPropertiesFromHandle", rc)?;
-        return Err(Error::Invalid(format!(
-            "shared memory is not pinned memory of this device (kind {}, location {}:{})",
-            p.kind, p.location.kind, p.location.id
-        )));
-    }
-    Ok(h)
 }
 
 /// Release one handle reference. A failure is ambiguous driver state: the caller poisons.
