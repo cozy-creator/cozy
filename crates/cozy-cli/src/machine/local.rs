@@ -29,7 +29,7 @@ const REPORT: Duration = Duration::from_secs(10);
 /// A service runs only for the login home under a user service manager; otherwise the machine
 /// runs detached, with one warning. Enabling an enabled machine changes nothing and says its state.
 pub async fn enable(ctx: &Context) -> Result<ExitCode, Error> {
-    let services = services(ctx)?;
+    let services = services(ctx);
     let managed = services.available();
     let calcifer = ctx.calcifer().await?;
     let root = machine_root(ctx)?;
@@ -112,7 +112,7 @@ pub async fn enable(ctx: &Context) -> Result<ExitCode, Error> {
 /// `cozy machine disable`: stops this computer's machine once its runs end, and keeps every file
 /// it holds; enable starts it again on them.
 pub async fn disable(ctx: &Context) -> Result<ExitCode, Error> {
-    let services = services(ctx)?;
+    let services = services(ctx);
     let calcifer = ctx.calcifer().await?;
     let root = machine_root(ctx)?;
     let was = !free(&root);
@@ -147,23 +147,22 @@ pub async fn disable(ctx: &Context) -> Result<ExitCode, Error> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// A session without a user manager: Linux only (launchd and the `Run` key always answer).
 const UNMANAGED: &str = "no service manager: the local machine won't restart after logout or \
      reboot; `sudo loginctl enable-linger $USER` (see `cozy doctor`)";
 const FOREIGN_HOME: &str = "this home is not your login home's: the local machine runs detached \
      and won't restart after logout or reboot (see `cozy doctor`)";
+/// What makes the machine this computer's service, which a detached start is not.
+const AS_A_SERVICE: &str = match cfg!(target_os = "linux") {
+    true => "sudo loginctl enable-linger $USER, then cozy machine enable",
+    false => "cozy machine enable as this computer's user, from your login home",
+};
 
-/// This computer's services. The machine runs as one only for the login home under a user
-/// service manager (`Services::available`); otherwise it runs detached.
-fn services(ctx: &Context) -> Result<Services, Error> {
-    if std::env::consts::OS != "linux" {
-        return Err(Error::new(
-            Kind::Usage,
-            "machine_unsupported",
-            "this computer's machine runs on Linux for now",
-        )
-        .next("cozy machine rent"));
-    }
-    Ok(Services::new(&ctx.home, &ctx.user_home))
+/// This computer's services: a systemd user unit, a launchd LaunchAgent or the HKCU `Run` key.
+/// The machine runs as one only for the login home under its user's manager
+/// (`Services::available`); otherwise it runs detached.
+fn services(ctx: &Context) -> Services {
+    Services::new(&ctx.home, &ctx.user_home)
 }
 
 /// The service: this cozy as `machine serve --persistent`, saying anything before its own log
@@ -187,8 +186,7 @@ fn start_log(root: &Path) -> PathBuf {
 /// whose HOME is the one enabling it), saying anything before its own log opens into its start log.
 fn detach(spec: &ServiceSpec) -> Result<cozy_platform::process::Detached, Error> {
     cozy_platform::process::detach(&spec.program, &spec.args, spec.log.as_deref()).map_err(|e| {
-        Error::new(Kind::Unavailable, "machine_start_failed", e.to_string())
-            .remedy("sudo loginctl enable-linger $USER, then cozy machine enable")
+        Error::new(Kind::Unavailable, "machine_start_failed", e.to_string()).remedy(AS_A_SERVICE)
     })
 }
 
