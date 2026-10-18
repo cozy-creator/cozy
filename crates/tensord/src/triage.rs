@@ -5,11 +5,11 @@
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, OpenOptions},
     io::{self, Write},
-    os::unix::fs::OpenOptionsExt,
     path::Path,
 };
+use cozy_platform::durable::Mode;
 use tensorfs_core::sha256;
 
 /// `TriageBundleRef.length` is bounded at 1 MiB by the protocol; fields are capped well below.
@@ -138,7 +138,7 @@ pub fn write(
     file.write_all(&bytes)?;
     file.sync_all()?;
     fs::rename(&pending, &path)?;
-    File::open(&directory)?.sync_all()?;
+    cozy_platform::durable::sync_dir(&directory)?;
     Ok(TriageRef {
         subject_id,
         sha256: sha256::hex(&sha256::digest(&bytes)),

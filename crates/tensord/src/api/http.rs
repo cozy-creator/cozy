@@ -754,22 +754,25 @@ mod tests {
                 .unwrap();
             assert_eq!(read, whole[offset as usize..], "from {offset}");
         }
-        // This thread's read syscalls carry the tail, not the 4 MiB before it.
-        let read_bytes = || {
-            let io = std::fs::read_to_string("/proc/thread-self/io").unwrap();
-            let line = io.lines().find(|l| l.starts_with("rchar:")).unwrap();
-            line[6..].trim().parse::<u64>().unwrap()
-        };
-        let opened = parts();
-        let before = read_bytes();
-        let mut tail = vec![];
-        from_offset(opened, total - 5)
-            .unwrap()
-            .read_to_end(&mut tail)
-            .unwrap();
-        let read = read_bytes() - before;
-        assert!(read < 4096, "a read of 5 bytes read {read}");
-        assert_eq!(tail, whole[whole.len() - 5..]);
+        // This thread's read syscalls carry the tail, not the 4 MiB before it (Linux counts
+        // them per thread).
+        if cfg!(target_os = "linux") {
+            let read_bytes = || {
+                let io = std::fs::read_to_string("/proc/thread-self/io").unwrap();
+                let line = io.lines().find(|l| l.starts_with("rchar:")).unwrap();
+                line[6..].trim().parse::<u64>().unwrap()
+            };
+            let opened = parts();
+            let before = read_bytes();
+            let mut tail = vec![];
+            from_offset(opened, total - 5)
+                .unwrap()
+                .read_to_end(&mut tail)
+                .unwrap();
+            let read = read_bytes() - before;
+            assert!(read < 4096, "a read of 5 bytes read {read}");
+            assert_eq!(tail, whole[whole.len() - 5..]);
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 

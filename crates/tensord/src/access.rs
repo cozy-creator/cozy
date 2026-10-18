@@ -10,7 +10,6 @@ use std::{
     fs::File,
     io,
     net::Shutdown,
-    os::{fd::OwnedFd, unix::net::UnixStream},
     sync::{Arc, Mutex},
 };
 use tensorfs_core::{
@@ -120,7 +119,7 @@ pub struct Fetch {
     order: u64,
     manifests: Vec<String>,
     stop: PullCancellation,
-    channels: Mutex<Vec<UnixStream>>,
+    channels: Mutex<Vec<cozy_platform::ipc::LocalStream>>,
     kept: Mutex<Vec<Ticket>>,
     /// What fetched for this call before it could ask: ended by its first channel.
     replaced: Mutex<Option<Arc<Fetch>>>,
@@ -189,7 +188,7 @@ impl Fetch {
                 }
             }
         }
-        let (client, server) = UnixStream::pair()?;
+        let (client, server) = cozy_platform::ipc::pair()?;
         let mut channels = self.channels.lock().unwrap();
         if self.stop.is_cancelled() {
             return Err(io::Error::other("the call ended"));
@@ -207,7 +206,7 @@ impl Fetch {
                 replaced.end();
             }
         })?;
-        Ok(File::from(OwnedFd::from(client)))
+        Ok(File::from(cozy_platform::handles::Owned::from(client)))
     }
 
     /// `previous` (a run's preparation's fetches) ends when this call's first channel closes, or

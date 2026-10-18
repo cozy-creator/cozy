@@ -11,7 +11,6 @@ use sha2::{Digest, Sha256};
 use std::{
     fs,
     io::{self, Read, Write},
-    os::unix::{fs::symlink, process::CommandExt},
     path::{Path, PathBuf},
     process::Stdio,
     sync::{Arc, Mutex},
@@ -252,7 +251,7 @@ fn read_pending(paths: &Paths) -> io::Result<Option<Pending>> {
 
 fn remove_pending(paths: &Paths) -> io::Result<()> {
     fs::remove_file(paths.update("pending.json"))?;
-    fs::File::open(paths.update(""))?.sync_all()
+    cozy_platform::durable::sync_dir(&paths.update("")).map_err(io::Error::from)
 }
 
 /// The activation's status as last written (its later steps), else as it was when pending.
@@ -289,7 +288,7 @@ impl Updates {
         store: Option<Arc<Store>>,
     ) -> io::Result<Arc<Self>> {
         fs::create_dir_all(paths.update("staged"))?;
-        fs::File::open(&paths.engine)?.sync_all()?;
+        cozy_platform::durable::sync_dir(&paths.engine)?;
         let mut status = fs::read(paths.update("status.json"))
             .ok()
             .and_then(|raw| serde_json::from_slice::<Status>(&raw).ok());
@@ -596,7 +595,7 @@ impl Updates {
         let sdk = self.paths.engine.join("sdk");
         fs::create_dir_all(&sdk)?;
         // On the first update this also created engine/sdk; persist that parent entry.
-        fs::File::open(&self.paths.engine)?.sync_all()?;
+        cozy_platform::durable::sync_dir(&self.paths.engine)?;
         // Caller operation IDs are receipt identities, never filesystem paths. Every attempt
         // prepares a fresh immutable generation, including a historical operation's retry.
         let candidate = sdk.join(format!("candidate-{}", hex(&super::identity::random::<16>()?)));
@@ -672,7 +671,7 @@ impl Updates {
                 }
             }
         }
-        fs::File::open(candidate)?.sync_all()?;
+        cozy_platform::durable::sync_dir(candidate)?;
         let to = identified(candidate)?;
         self.set(|s| s.to = to.clone())?;
         // No new work is admitted from here; work admitted before drains first.
@@ -722,9 +721,9 @@ impl Updates {
     fn compile(&self, wheels: &[PathBuf]) -> io::Result<Result<String, String>> {
         let input: String = wheels.iter().map(|p| p.display().to_string() + "\n").collect();
         super::client::ensure_uv(&self.paths.uv)?;
-        let mut child = std::process::Command::new(&self.paths.uv)
+        let mut command = std::process::Command::new(&self.paths.uv);
+        let mut child = cozy_platform::process::own_group(&mut command)
             .args(["pip", "compile", "--quiet", "--no-config", "--no-cache", "--no-header", "--no-annotate", "--python", "3.12", "-"])
-            .process_group(0)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -795,7 +794,8 @@ fn stage(candidate: &Path, wheel: &Path, distribution: &str) -> io::Result<PathB
     verify_wheel(wheel, distribution)?;
     let prepared = candidate.join(name);
     fs::copy(wheel, &prepared)?;
-    fs::File::open(&prepared)?.sync_all()?;
+    // Windows flushes only through a writable handle.
+    fs::OpenOptions::new().write(true).open(&prepared)?.sync_all()?;
     Ok(prepared)
 }
 
@@ -915,11 +915,13 @@ fn previous_link(link: &Path) -> io::Result<Option<PathBuf>> {
     }
 }
 
-/// Points `link` at `target` atomically, or removes it.
-fn relink(link: &Path, target: Option<&Path>) -> io::Result<()> {
+/// Points `link` at `target` atomically, or removes it. Windows renames nothing over a directory
+/// link, so there the old link goes first; a crash between leaves no link, and the pending
+/// activation's recovery links it again.
+pub(crate) fn relink(link: &Path, target: Option<&Path>) -> io::Result<()> {
     let Some(target) = target else {
-        return match fs::remove_file(link) {
-            Ok(()) => fs::File::open(link.parent().expect("link has a parent"))?.sync_all(),
+        return match unlink(link) {
+            Ok(()) => Ok(cozy_platform::durable::sync_dir(link.parent().expect("link has a parent"))?),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e),
         };
@@ -929,11 +931,25 @@ fn relink(link: &Path, target: Option<&Path>) -> io::Result<()> {
         .ok_or_else(|| invalid("a link needs a directory"))?;
     fs::create_dir_all(dir)?;
     // The first activation creates the link's directory. Its entry must survive with the link.
-    fs::File::open(dir.parent().ok_or_else(|| invalid("a link directory needs a parent"))?)?.sync_all()?;
+    cozy_platform::durable::sync_dir(dir.parent().ok_or_else(|| invalid("a link directory needs a parent"))?)?;
     let temp = dir.join(format!(".link-{}", hex(&super::identity::random::<8>()?)));
-    symlink(target, &temp)?;
+    cozy_platform::durable::symlink(target, &temp)?;
+    #[cfg(windows)]
+    match unlink(link) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
     fs::rename(&temp, link)?;
-    fs::File::open(dir)?.sync_all()
+    Ok(cozy_platform::durable::sync_dir(dir)?)
+}
+
+/// Removes the link itself, never its target: a Windows directory link is a directory entry.
+fn unlink(link: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    if std::os::windows::fs::FileTypeExt::is_symlink_dir(&fs::symlink_metadata(link)?.file_type()) {
+        return fs::remove_dir(link);
+    }
+    fs::remove_file(link)
 }
 
 fn write_json<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {

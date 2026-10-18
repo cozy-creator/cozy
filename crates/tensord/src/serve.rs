@@ -6,13 +6,10 @@ use crate::{
     owner::{Owner, Shared},
     protocol::{self, Body, Command, Reply, CAPS},
 };
+use cozy_platform::ipc::{LocalListener, LocalStream};
 use std::{
     collections::HashSet,
     io::{self, Write},
-    os::unix::{
-        fs::PermissionsExt,
-        net::{UnixListener, UnixStream},
-    },
     path::PathBuf,
     process::ExitCode,
     sync::{
@@ -32,14 +29,18 @@ pub fn main(args: impl IntoIterator<Item = std::ffi::OsString>) -> ExitCode {
     struct Serve {
         #[command(flatten)]
         flags: Flags,
+        /// Windows: the readiness pipe a stable parent handed the service it started.
+        #[arg(long, hide = true)]
+        service_ready: Option<u64>,
     }
-    let flags = <Serve as clap::Parser>::parse_from(args).flags;
-    machine(flags.lifetime().expect("clap requires one"))
+    let serve = <Serve as clap::Parser>::parse_from(args);
+    machine(serve.flags.lifetime().expect("clap requires one"), serve.service_ready)
 }
 
-/// The machine: its stable parent, then the service it forks. Exits the process on failure.
-pub fn machine(lifetime: Lifetime) -> ExitCode {
-    if let Err(error) = run(lifetime) {
+/// The machine: its stable parent, then the service it starts (`service_ready`: this is that
+/// service, on Windows). Exits the process on failure.
+pub fn machine(lifetime: Lifetime, service_ready: Option<u64>) -> ExitCode {
+    if let Err(error) = run(lifetime, service_ready) {
         config::init_logs(None);
         tracing::error!("{error}");
         std::process::exit(1);
@@ -47,7 +48,7 @@ pub fn machine(lifetime: Lifetime) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn run(lifetime: Lifetime) -> io::Result<()> {
+fn run(lifetime: Lifetime, service_ready: Option<u64>) -> io::Result<()> {
     use crate::machine::{identity, provider::ProviderSelf, ssh, supervise, update};
     // Linux names the calling thread: this one, before any other starts.
     if let Err(error) = cozy_platform::process::set_name("tensord") {
@@ -56,14 +57,26 @@ fn run(lifetime: Lifetime) -> io::Result<()> {
         }
     }
     // Whatever this process inherited (its own re-execution's credential pipe) reaches nothing
-    // it starts; descriptors it hands on are handed explicitly.
-    cozy_platform::process::cloexec_from(3);
-    hold_handed_descriptors();
+    // it starts; descriptors it hands on are handed explicitly. Windows hands on none.
+    #[cfg(unix)]
+    {
+        cozy_platform::process::cloexec_from(3);
+        hold_handed_descriptors();
+    }
     let mut config = config::load(lifetime)?;
     config::init_logs(Some(&config.logs));
     for warning in &config.warnings {
         tracing::warn!("{warning}");
     }
+    // Windows forks nothing: this process is the stable parent until the service it starts as
+    // this executable again returns here.
+    #[cfg(windows)]
+    let ready = supervise::supervise(
+        &update::Paths::new(&config.grant.layout.engine(), &config.grant.layout.root),
+        service_ready,
+    )?;
+    #[cfg(unix)]
+    let _ = service_ready;
     let grant = &mut config.grant;
     // A pod's provider credential, kept from everything this machine starts: on its first start
     // this re-executes the machine without the key in its environment, before any thread.
@@ -79,12 +92,14 @@ fn run(lifetime: Lifetime) -> io::Result<()> {
     }
     let paths = update::Paths::new(&grant.layout.engine(), &grant.layout.root);
     update::retire_agent(&paths);
+    #[cfg(unix)]
     let ready = supervise::supervise(&paths)?;
     run_machine(config, ready)
 }
 
 /// Descriptor 5 carries a re-executed machine's credential pipe. Until it is read, nothing else
 /// may take 3 to 5: a log file at 5 would be read as the pipe.
+#[cfg(unix)]
 fn hold_handed_descriptors() {
     for fd in 3..=5 {
         // SAFETY: plain syscalls on this process's own descriptor table, before any thread.
@@ -92,7 +107,8 @@ fn hold_handed_descriptors() {
             if libc::fcntl(fd, libc::F_GETFD) < 0 {
                 let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
                 if null >= 0 && null != fd {
-                    libc::dup3(null, fd, libc::O_CLOEXEC);
+                    libc::dup2(null, fd);
+                    libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
                     libc::close(null);
                 }
             }
@@ -154,6 +170,7 @@ pub fn dev(args: Dev) -> io::Result<()> {
             return Err(io::Error::other(format!("cannot set TensorD process name: {error}")));
         }
     }
+    #[cfg(unix)]
     cozy_platform::process::cloexec_from(3);
     machine_runtime()?;
     let root = args.state;
@@ -514,28 +531,31 @@ fn start_api(
         })?;
     Ok(())
 }
-fn bind_control(owner: &Shared) -> io::Result<(UnixListener, UnixListener)> {
+fn bind_control(owner: &Shared) -> io::Result<(LocalListener, LocalListener)> {
     let (weights, admin) = {
         let owner = owner.lock().unwrap();
         (owner.socket.clone(), owner.admin.clone())
     };
     Ok((bind_private(&weights)?, bind_private(&admin)?))
 }
-fn bind_private(path: &std::path::Path) -> io::Result<UnixListener> {
+fn bind_private(path: &std::path::Path) -> io::Result<LocalListener> {
     // Only the singleton owner can remove a stale socket; no active peer store is touched.
     match std::fs::remove_file(path) {
         Ok(()) => (),
         Err(e) if e.kind() == io::ErrorKind::NotFound => (),
         Err(e) => return Err(e),
     }
-    let listener = UnixListener::bind(path)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    let listener = LocalListener::bind(path)?;
+    // A Unix socket is a file its mode keeps private; a Windows pipe's access list admits only
+    // this user.
+    #[cfg(unix)]
+    cozy_platform::durable::set_mode(path, 0o600)?;
     Ok(listener)
 }
 fn serve(
     owner: Shared,
     service: Arc<crate::service::Service>,
-    (listener, admin): (UnixListener, UnixListener),
+    (listener, admin): (LocalListener, LocalListener),
 ) -> io::Result<()> {
     let paths = {
         let owner = owner.lock().unwrap();
@@ -635,17 +655,21 @@ fn serve(
             }
         });
     }
+    // A Unix socket leaves its file; a Windows pipe leaves none.
     for path in paths.iter() {
-        std::fs::remove_file(path)?;
+        match std::fs::remove_file(path) {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+            _ => (),
+        }
     }
     Ok(())
 }
-fn os_peer_outside(stream: &UnixStream) -> io::Result<bool> {
+fn os_peer_outside(stream: &LocalStream) -> io::Result<bool> {
     Ok(!cozy_platform::handles::peer_descends_from_machine(stream)?)
 }
 /// `peer` is a registered weight peer; `None` is the owner's admin connection.
 fn client(
-    mut stream: UnixStream,
+    mut stream: LocalStream,
     peer: Option<u64>,
     owner: &Shared,
     stopped: &AtomicBool,
@@ -853,7 +877,7 @@ fn client(
                     );
                     stopped.store(true, Ordering::Release);
                     for path in paths {
-                        let _ = UnixStream::connect(path);
+                        let _ = cozy_platform::ipc::connect(path);
                     }
                     return acknowledgement;
                 }

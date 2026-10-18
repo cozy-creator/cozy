@@ -1354,7 +1354,7 @@ print(json.dumps({"identity": generation.identity}))
                         ExecutorConfig {
                             python: held.record.python.clone(),
                             root: executor_root.clone(),
-                            socket: executor_root.join("e.sock"),
+                            socket: crate::device_executor::socket_path(&executor_root, "e.sock")?,
                             environment: BTreeMap::from([("PATH".into(), "/usr/bin:/bin".into())]),
                             // No device is visible (empty devices): this package never imports torch.
                             seal: {

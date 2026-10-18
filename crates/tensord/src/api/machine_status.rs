@@ -220,10 +220,9 @@ fn held_or_none<T>(listed: Result<Vec<T>, Error>) -> Result<Vec<T>, Error> {
 }
 
 fn disk(path: &std::path::Path) -> Option<v1::Disk> {
-    let stat = nix::sys::statvfs::statvfs(path).ok()?;
-    let block = stat.fragment_size() as u64;
+    let space = cozy_platform::durable::space(path).ok()?;
     Some(v1::Disk {
-        total_bytes: stat.blocks() as u64 * block,
-        free_bytes: stat.blocks_available() as u64 * block,
+        total_bytes: space.total,
+        free_bytes: space.free,
     })
 }

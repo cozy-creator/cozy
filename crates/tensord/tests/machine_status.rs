@@ -1,6 +1,9 @@
 //! `GET /v1/status` on the real binary in machine mode: anyone gets identity and the sealed
 //! receipt (the bytes the Hub verifies); a machine cap gets the whole picture as it changes; an
 //! open stream is not activity and only `keepalive` moves the idle deadline.
+#[path = "common/child.rs"]
+mod child;
+use child::BareEnv;
 mod common;
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -35,10 +38,9 @@ fn boot(root: &Path, port: u16, lifetime: &str) -> Machine {
     let owner = SigningKey::from_bytes(&OWNER).verifying_key();
     Machine(
         Command::new(env!("CARGO_BIN_EXE_tensord"))
-            .env_clear()
-            .env("PATH", "/usr/bin:/bin")
+            .bare_env()
             .env("COZY_MACHINE_ROOT", root)
-            .env("HOME", root.join("home"))
+            .user_home(root.join("home"))
             .env("COZY_WORKER_ID", WORKER)
             .env("COZY_WORKER_AUTH_TOKEN", URL_SAFE_NO_PAD.encode([1; 32]))
             .env("COZY_WORKER_INTERNAL_PORT", port.to_string())

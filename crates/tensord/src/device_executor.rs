@@ -8,22 +8,24 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use cozy_platform::{
+    durable::Mode as _,
+    handles::Owned,
+    ipc::{LocalListener, LocalStream},
+};
 use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
-    os::{
-        fd::AsRawFd,
-        unix::{
-            fs::{OpenOptionsExt, PermissionsExt},
-            net::{UnixListener, UnixStream},
-            process::{CommandExt, ExitStatusExt},
-        },
-    },
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     sync::{Arc, Mutex},
     time::Duration,
+};
+#[cfg(unix)]
+use std::os::{
+    fd::AsRawFd,
+    unix::process::{CommandExt, ExitStatusExt},
 };
 
 /// Chunks of one weight set's shared GPU regions crossing in one exchange.
@@ -936,8 +938,8 @@ pub trait Services {
     fn device_tier(
         &mut self,
         frame: &Frame,
-        fds: Vec<std::os::fd::OwnedFd>,
-    ) -> io::Result<(Answer, Vec<std::os::fd::OwnedFd>)> {
+        fds: Vec<Owned>,
+    ) -> io::Result<(Answer, Vec<Owned>)> {
         drop(fds);
         Ok((Answer::unavailable(frame.seq), Vec::new()))
     }
@@ -961,7 +963,7 @@ pub struct DeviceExecutor {
     /// Forked from an import-only executor (`fork/1`), which is its parent and reaps it.
     forked: bool,
     exact: Exact,
-    stream: UnixStream,
+    stream: LocalStream,
     pub birth: Birth,
     pub hello: Hello,
     /// Sampling resolution of the wedge rule. Tests shorten it; nothing else changes it.
@@ -1007,7 +1009,7 @@ impl Cancellation {
             identity.readable(&temporary)?;
         }
         fs::rename(temporary, self.root.join("executor.cancel"))?;
-        File::open(&self.root)?.sync_all()?;
+        cozy_platform::durable::sync_dir(&self.root)?;
         if let Some(watch) = self.watched.lock().unwrap().as_ref() {
             watch.canceled();
         }
@@ -1028,36 +1030,87 @@ pub enum Forked {
     Lost(Box<ExecutorConfig>, String),
 }
 
+/// An exit status from its code.
+fn exit_status(code: i32) -> ExitStatus {
+    #[cfg(unix)]
+    return ExitStatus::from_raw(code);
+    #[cfg(windows)]
+    return std::os::windows::process::ExitStatusExt::from_raw(code as u32);
+}
+
 /// A forked executor's wait status while it is its parent's zombie (`/proc` `exit_code`).
+/// Windows forks nothing, so there is none.
+#[cfg(windows)]
+fn zombie_status(_: &Birth) -> Option<ExitStatus> {
+    None
+}
+
+/// A forked executor's wait status while it is its parent's zombie (`/proc` `exit_code`).
+#[cfg(unix)]
 fn zombie_status(birth: &Birth) -> Option<ExitStatus> {
     let stat = fs::read_to_string(format!("/proc/{}/stat", birth.pid)).ok()?;
     let fields: Vec<&str> = stat.rsplit_once(')')?.1.split_whitespace().collect();
     let start: u64 = fields.get(19)?.parse().ok()?;
     let code: i32 = fields.get(49)?.parse().ok()?;
-    (fields.first() == Some(&"Z") && start == birth.start_ticks).then(|| ExitStatus::from_raw(code))
+    (fields.first() == Some(&"Z") && start == birth.start_ticks).then(|| exit_status(code))
 }
 
 /// The executor's root and listening socket, and the sealed environment it starts with.
-fn endpoint(config: &ExecutorConfig) -> io::Result<(UnixListener, BTreeMap<String, String>)> {
+fn endpoint(config: &ExecutorConfig) -> io::Result<(LocalListener, BTreeMap<String, String>)> {
     fs::create_dir_all(&config.root)?;
-    fs::set_permissions(&config.root, fs::Permissions::from_mode(0o700))?;
+    cozy_platform::durable::set_mode(&config.root, 0o700)?;
     if let Some(identity) = config.identity {
         identity.own(&config.root)?;
     }
-    let listener = UnixListener::bind(&config.socket)?;
-    fs::set_permissions(&config.socket, fs::Permissions::from_mode(0o600))?;
+    let listener = LocalListener::bind(&config.socket)?;
+    // A Unix socket is a file whose mode and owner admit the executor; a Windows pipe's own
+    // access list admits only this user.
+    #[cfg(unix)]
+    cozy_platform::durable::set_mode(&config.socket, 0o600)?;
     if let Some(identity) = config.identity {
         identity.socket(&config.socket)?;
     }
     Ok((listener, config.seal.environment(&config.environment)))
 }
 
+/// Where an executor dials the listener at `root/name`. A Unix socket path has a short limit
+/// (`sun_path`: 104 bytes on macOS); past it, the socket lives in this user's private directory
+/// under /tmp, named by the hash of the path it stands for. A Windows pipe takes any path.
+pub fn socket_path(root: &Path, name: &str) -> io::Result<PathBuf> {
+    let natural = root.join(name);
+    #[cfg(all(unix, not(target_os = "linux")))]
+    if natural.as_os_str().len() > 100 {
+        use std::os::unix::fs::MetadataExt;
+        let dir = PathBuf::from(format!("/tmp/cozy-{}", crate::launch_identity::euid()));
+        cozy_platform::durable::private_dir(&dir)?;
+        let metadata = fs::symlink_metadata(&dir)?;
+        if !metadata.is_dir() || metadata.uid() != crate::launch_identity::euid() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "the short socket directory belongs to another user",
+            ));
+        }
+        let digest = tensorfs_core::sha256::hex_digest(natural.as_os_str().as_encoded_bytes());
+        return Ok(dir.join(&digest[..24]));
+    }
+    Ok(natural)
+}
+
+/// The executor's containment scope, when its config names one. No scopes on this OS (macOS,
+/// Windows until its Job Object backend): none, and the executor's tree ends by its group.
+fn scope(config: &ExecutorConfig) -> io::Result<Option<Arc<cozy_platform::contain::Scope>>> {
+    let Some(namespace) = &config.cgroup_namespace else {
+        return Ok(None);
+    };
+    match cozy_platform::contain::Scope::create(namespace) {
+        Ok(scope) => Ok(Some(Arc::new(scope))),
+        Err(error) if error.is_unsupported() => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn parent_of(pid: u32) -> io::Result<u32> {
-    fs::read_to_string(format!("/proc/{pid}/status"))?
-        .lines()
-        .find_map(|line| line.strip_prefix("PPid:"))
-        .and_then(|value| value.trim().parse().ok())
-        .ok_or_else(|| io::Error::other("process status names no parent"))
+    Ok(cozy_platform::process::parent_of(pid)?)
 }
 
 /// The executor's end of the channel is gone: a write broke or no reply came.
@@ -1127,6 +1180,7 @@ impl Codec {
         }
     }
     fn spawn(&self) -> io::Result<CodecHelper> {
+        #[cfg(unix)]
         let hold = self
             .config
             .generation_hold
@@ -1152,6 +1206,7 @@ impl Codec {
                     .open(&self.log)?,
             );
         // SAFETY: only async-signal-safe fcntl on the retained generation hold.
+        #[cfg(unix)]
         unsafe {
             command.pre_exec(move || {
                 if let Some(descriptor) = hold {
@@ -1466,12 +1521,10 @@ fn encode_native(spool: &Path, reply: &Frame) -> io::Result<Option<Vec<AssetBind
         }
         let name = blob(&frame.handle)?;
         let temporary = spool.join(format!(".codec-{}", uuid::Uuid::new_v4().simple()));
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&temporary)?;
+        let mut file = cozy_platform::durable::open_nofollow(
+            &temporary,
+            OpenOptions::new().write(true).create_new(true).mode(0o600),
+        )?;
         file.write_all(&encoded)?;
         fs::rename(&temporary, spool.join(&name))?;
         media.insert(
@@ -1537,10 +1590,7 @@ impl DeviceExecutor {
         on_birth: impl FnOnce(&Birth, &Cancellation) -> io::Result<()>,
     ) -> io::Result<Self> {
         let (listener, environment) = endpoint(&config)?;
-        let scope = match &config.cgroup_namespace {
-            Some(namespace) => Some(Arc::new(cozy_platform::contain::Scope::create(namespace)?)),
-            None => None,
-        };
+        let scope = scope(&config)?;
         let mut command =
             crate::launch_identity::trampoline(&config.python, config.identity, scope.as_deref())?;
         command
@@ -1551,6 +1601,7 @@ impl DeviceExecutor {
             .env_clear()
             .envs(&environment)
             .envs(scope.as_deref().and_then(cozy_platform::contain::Scope::environment))
+            .envs(crate::launch_identity::interpreter_environment(&config.python)?)
             .stdin(Stdio::null())
             .stdout(File::create(config.root.join("stdout.log"))?)
             .stderr(File::create(config.root.join("stderr.log"))?);
@@ -1565,6 +1616,18 @@ impl DeviceExecutor {
         let child = match launcher {
             Some(launcher) => launcher.spawn(command)?,
             None => command.spawn()?,
+        };
+        // Windows has no trampoline to join the scope before anything runs: the executor joins
+        // it at once, before its first child (the executor starts none until it is ready).
+        #[cfg(windows)]
+        let child = match scope.as_deref().map(|scope| scope.adopt(child.id())) {
+            Some(Err(error)) => {
+                let mut child = child;
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error.into());
+            }
+            _ => child,
         };
         let launched = Unready {
             pid: child.id(),
@@ -1586,10 +1649,7 @@ impl DeviceExecutor {
         on_birth: impl FnOnce(&Birth, &Cancellation) -> io::Result<()>,
     ) -> io::Result<Forked> {
         let (listener, environment) = endpoint(&config)?;
-        let scope = match &config.cgroup_namespace {
-            Some(namespace) => Some(Arc::new(cozy_platform::contain::Scope::create(namespace)?)),
-            None => None,
-        };
+        let scope = scope(&config)?;
         let mut forked = environment.clone();
         if let Some((name, token)) = scope.as_deref().and_then(cozy_platform::contain::Scope::environment) {
             forked.insert(name.into(), token.into());
@@ -1642,7 +1702,7 @@ impl DeviceExecutor {
     /// authored has run, so no measurement is needed to end it.
     fn connect(
         config: ExecutorConfig,
-        listener: UnixListener,
+        listener: LocalListener,
         environment: BTreeMap<String, String>,
         mut unready: Unready,
         on_birth: impl FnOnce(&Birth, &Cancellation) -> io::Result<()>,
@@ -1678,60 +1738,21 @@ impl DeviceExecutor {
             },
         )?;
         // Wait for connection OR observed process death. No elapsed-time startup kill.
-        let mut poll = [
-            libc::pollfd {
-                fd: listener.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: std::os::fd::AsFd::as_fd(&exact).as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            },
-        ];
-        loop {
-            let result = unsafe { libc::poll(poll.as_mut_ptr(), 2, -1) };
-            if result < 0 {
-                let error = io::Error::last_os_error();
-                if error.kind() == io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return Err(error);
-            }
-            if poll[0].revents & libc::POLLIN != 0 {
-                break;
-            }
-            if poll[1].revents != 0 {
-                let status = unready.ended()?;
-                return Err(io::Error::other(EndedBeforeStart {
-                    status,
-                    stderr_tail: tail(&config.root.join("stderr.log")),
-                }));
-            }
-        }
-        let (stream, _) = listener.accept()?;
-        let mut credential: libc::ucred = unsafe { std::mem::zeroed() };
-        let mut size = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-        if unsafe {
-            libc::getsockopt(
-                stream.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_PEERCRED,
-                (&mut credential as *mut libc::ucred).cast(),
-                &mut size,
-            )
-        } < 0
-        {
-            return Err(io::Error::last_os_error());
-        }
+        let Some(stream) = listener.accept_unless(&exact)? else {
+            let status = unready.ended()?;
+            return Err(io::Error::other(EndedBeforeStart {
+                status,
+                stderr_tail: tail(&config.root.join("stderr.log")),
+            }));
+        };
+        let credential = cozy_platform::handles::peer(&stream)?;
         let expected_uid = config
             .identity
-            .map_or_else(|| unsafe { libc::geteuid() }, |identity| identity.uid);
+            .map_or_else(crate::launch_identity::euid, |identity| identity.uid);
         let expected_gid = config
             .identity
-            .map_or_else(|| unsafe { libc::getegid() }, |identity| identity.gid);
-        if credential.pid != pid as i32
+            .map_or_else(crate::launch_identity::egid, |identity| identity.gid);
+        if credential.pid != pid
             || credential.uid != expected_uid
             || credential.gid != expected_gid
         {
@@ -2113,7 +2134,7 @@ impl Unready {
                 .birth
                 .as_ref()
                 .and_then(zombie_status)
-                .unwrap_or_else(|| ExitStatus::from_raw(0))),
+                .unwrap_or_else(|| exit_status(0))),
         }
     }
 }
@@ -2233,7 +2254,7 @@ fn is_false(value: &bool) -> bool {
 }
 
 fn write_frame(
-    stream: &mut std::os::unix::net::UnixStream,
+    stream: &mut LocalStream,
     value: &impl Serialize,
 ) -> io::Result<()> {
     let value = serde_json::to_value(value)?;
@@ -2241,7 +2262,7 @@ fn write_frame(
     protocol::write_body(stream, &serde_json::to_vec(&value)?)
 }
 /// SDK control framing shared with the CPU source-qualification receiver.
-pub fn read_frame(stream: &mut std::os::unix::net::UnixStream) -> io::Result<Option<Frame>> {
+pub fn read_frame(stream: &mut LocalStream) -> io::Result<Option<Frame>> {
     protocol::read_body(stream)?.map(|bytes| decode_frame(&bytes)).transpose()
 }
 
@@ -2280,7 +2301,7 @@ fn decode_frame(bytes: &[u8]) -> io::Result<Frame> {
 /// A request this machine cannot decode is refused alone, under its own sequence number,
 /// after the fds it announced are taken off the socket: the executor's call goes on.
 fn refuse_malformed(
-    stream: &mut std::os::unix::net::UnixStream,
+    stream: &mut LocalStream,
     frame: &Frame,
 ) -> io::Result<()> {
     if frame.descriptors > MAX_SHARED_FDS {
@@ -2293,7 +2314,7 @@ fn refuse_malformed(
     write_frame(stream, &answer)
 }
 pub fn write_answer(
-    stream: &mut std::os::unix::net::UnixStream,
+    stream: &mut LocalStream,
     answer: &Answer,
 ) -> io::Result<()> {
     write_frame(stream, answer)
@@ -2342,7 +2363,7 @@ mod codec_tests {
             "steps",
             row("warn", &long),
         ]});
-        let (mut runtime, mut machine) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (mut runtime, mut machine) = cozy_platform::ipc::pair().unwrap();
         write_frame(&mut runtime, &reply).unwrap();
         let frame = read_frame(&mut machine).unwrap().unwrap();
         assert!(frame.ok && frame.reply == "invoke");
@@ -2369,7 +2390,7 @@ mod codec_tests {
             "call_request": null, "size_bytes": null, "ok": null, "parts": null, "attribution": null,
         }))
         .unwrap();
-        let (mut runtime, mut machine) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (mut runtime, mut machine) = cozy_platform::ipc::pair().unwrap();
         runtime.write_all(&(body.len() as u32).to_be_bytes()).unwrap();
         runtime.write_all(&body).unwrap();
         let frame = read_frame(&mut machine).unwrap().unwrap();
@@ -2387,7 +2408,7 @@ mod codec_tests {
         let reply = serde_json::json!({"reply": "load", "ok": true,
             "facts": {"ignored_extra_keys": keys, "filled_bytes": 7}});
         assert!(serde_json::to_vec(&reply).unwrap().len() > 512 << 10);
-        let (mut runtime, mut machine) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (mut runtime, mut machine) = cozy_platform::ipc::pair().unwrap();
         let writer = std::thread::spawn(move || write_frame(&mut runtime, &reply).map(|()| runtime));
         let frame = read_frame(&mut machine).unwrap().unwrap();
         let mut runtime = writer.join().unwrap().unwrap();
@@ -2403,11 +2424,11 @@ mod codec_tests {
     /// progress frame is dropped; the next frame reads as before.
     #[test]
     fn a_request_that_does_not_decode_is_refused_alone() {
-        let (mut runtime, mut machine) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (mut runtime, mut machine) = cozy_platform::ipc::pair().unwrap();
         let malformed = serde_json::json!({"event": "request", "kind": "device_room", "seq": 9,
             "free_bytes": -23068672, "holding_bytes": 1, "descriptor": true});
         write_frame(&mut runtime, &malformed).unwrap();
-        cozy_platform::handles::send_fd(&runtime, &File::open("/dev/null").unwrap()).unwrap();
+        cozy_platform::handles::send_fd(&runtime, &File::open(std::env::current_exe().unwrap()).unwrap()).unwrap();
         let frame = read_frame(&mut machine).unwrap().unwrap();
         assert_eq!((frame.event, frame.seq), (Some(Event::Request), 9));
         assert!(frame.malformed.contains("expected u64"), "{}", frame.malformed);

@@ -72,15 +72,35 @@ pub fn endpoint(port: u16, reach: &Reach, cert_der: &[u8]) -> v1::WebRtc {
 
 /// This computer's IPv4 addresses (LAN, Tailscale; loopback last) at `port`.
 fn interfaces(port: u16) -> Vec<String> {
-    let mut found: Vec<Ipv4Addr> = nix::ifaddrs::getifaddrs()
+    let mut found: Vec<Ipv4Addr> = addresses()
         .into_iter()
-        .flatten()
-        .filter_map(|interface| interface.address?.as_sockaddr_in().map(|v4| v4.ip()))
         .filter(|ip| !ip.is_unspecified() && !ip.is_multicast())
         .collect();
     found.sort_by_key(|ip| (ip.is_loopback(), *ip));
     found.dedup();
     found.into_iter().map(|ip| SocketAddr::new(ip.into(), port).to_string()).collect()
+}
+
+#[cfg(unix)]
+fn addresses() -> Vec<Ipv4Addr> {
+    (nix::ifaddrs::getifaddrs().into_iter().flatten())
+        .filter_map(|interface| interface.address?.as_sockaddr_in().map(|v4| v4.ip()))
+        .collect()
+}
+
+/// Where this computer's default route leaves from, and loopback: Windows has no getifaddrs,
+/// and a UDP socket's connect only consults the route, sending nothing.
+#[cfg(not(unix))]
+fn addresses() -> Vec<Ipv4Addr> {
+    let routed = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).and_then(|socket| {
+        socket.connect((Ipv4Addr::new(192, 0, 2, 1), 9))?;
+        socket.local_addr()
+    });
+    let routed = routed.ok().and_then(|address| match address.ip() {
+        std::net::IpAddr::V4(v4) => Some(v4),
+        std::net::IpAddr::V6(_) => None,
+    });
+    routed.into_iter().chain([Ipv4Addr::LOCALHOST]).collect()
 }
 
 #[cfg(test)]

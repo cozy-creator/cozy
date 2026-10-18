@@ -1269,7 +1269,7 @@ mod tests {
         journal.execute("UPDATE preparations SET record=?1 WHERE id='plan-a'", [plan]).unwrap();
         assert_eq!(publisher.caches(&service).unwrap().keep, [kept("a"), kept("b")]);
         drop(queued);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::scratch::remove(&root);
     }
 
     fn write(objects: &Objects, actor: &str, bytes: &[u8]) -> (String, u64) {
@@ -1350,8 +1350,7 @@ mod tests {
         let service = Service::open(&root.join("state"), &root.join("generations"), 1).unwrap();
         let generation = "a".repeat(32);
         let directory = service.catalog.root().join(&generation);
-        fs::create_dir_all(directory.join("env/bin")).unwrap();
-        std::os::unix::fs::symlink("/usr/bin/python3", directory.join("env/bin/python")).unwrap();
+        let python = crate::scratch::interpreter(&directory.join("env"));
         fs::write(directory.join(".hold"), "").unwrap();
         let interface = json!({
             "application":"fixture:app",
@@ -1359,7 +1358,7 @@ mod tests {
         });
         fs::write(directory.join("generation.json"), json!({
             "identity":generation,"package":"fixture","version":"2.0.0",
-            "application":"fixture:app","python":directory.join("env/bin/python"),
+            "application":"fixture:app","python":python,
             "interface":interface
         }).to_string()).unwrap();
         service.engine.bind_installation(Installation {
@@ -1732,8 +1731,7 @@ mod tests {
         let service = Service::open(&root.join("state"), &root.join("generations"), 1).unwrap();
         let generation = "a".repeat(32);
         let directory = service.catalog.root().join(&generation);
-        fs::create_dir_all(directory.join("env/bin")).unwrap();
-        std::os::unix::fs::symlink("/usr/bin/python3", directory.join("env/bin/python")).unwrap();
+        let python = crate::scratch::interpreter(&directory.join("env"));
         fs::write(directory.join(".hold"), "").unwrap();
         let callee = json!({"application":"callee:app","entrypoints":[{
             "name":"render","models":[{"path":"render.models.network","class":"callee.Model"}]
@@ -1743,7 +1741,7 @@ mod tests {
         }]});
         fs::write(directory.join("generation.json"), json!({
             "identity":generation,"package":"caller","version":"1.0.0","application":"caller:app",
-            "python":directory.join("env/bin/python"),"interface":caller,
+            "python":python,"interface":caller,
             "callees":[{"distribution":"callee","package":"second/callee","version":"2.0.0",
                 "application":"callee:app","interface":callee}]
         }).to_string()).unwrap();
@@ -1768,12 +1766,11 @@ mod tests {
         assert_eq!(service.catalog.resolve(&generation).unwrap().record.interface, caller);
         let legacy_id = "b".repeat(32);
         let legacy = service.catalog.root().join(&legacy_id);
-        fs::create_dir_all(legacy.join("env/bin")).unwrap();
-        std::os::unix::fs::symlink("/usr/bin/python3",legacy.join("env/bin/python")).unwrap();
+        let legacy_python = crate::scratch::interpreter(&legacy.join("env"));
         fs::write(legacy.join(".hold"),"").unwrap();
         fs::write(legacy.join("generation.json"),json!({
             "identity":legacy_id,"package":"caller","version":"1.0.0","application":"caller:app",
-            "python":legacy.join("env/bin/python"),"interface":caller,"callees":[{
+            "python":legacy_python,"interface":caller,"callees":[{
                 "distribution":"CALLEE__Lib.Name","version":"2.0.0","application":"callee:app","interface":callee
             }]
         }).to_string()).unwrap();
@@ -1818,7 +1815,7 @@ mod tests {
         runs.contexts.lock().unwrap().get_mut("7").unwrap().models.clear();
         assert!(runs.child_spec("alice", "7", "callee:app", "render", json!({}), vec![], "", &[]).unwrap().models.is_empty(),
             "without inherited/explicit choices the normal resolver owns captured defaults");
-        fs::remove_dir_all(root).unwrap();
+        crate::scratch::remove(&root);
     }
 
     /// A preparing run's stages are observed like a running attempt's.

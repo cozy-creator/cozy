@@ -17,7 +17,6 @@ use serde::Deserialize;
 use std::{
     collections::{BTreeMap, HashSet},
     fs,
-    os::unix::fs::PermissionsExt,
     path::{Component, Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -138,7 +137,8 @@ fn keyed(name: &str, prefix: &str, length: usize) -> bool {
 
 /// Only this layout's environments leave. Unknown entries in a package home are preserved.
 fn collect_environments(home: &Path, named: &HashSet<PathBuf>) -> usize {
-    let root = fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+    // In the spelling Python writes (Windows' canonicalize says \\?\C:\…), as `named` is.
+    let root = cozy_platform::durable::canonical(home).unwrap_or_else(|_| home.to_path_buf());
     // A named but missing environment still retains its source for recovery.
     let kept = named.iter().filter(|env| env.parent() == Some(root.as_path())).count();
     for entry in fs::read_dir(home).into_iter().flatten().flatten() {
@@ -146,7 +146,7 @@ fn collect_environments(home: &Path, named: &HashSet<PathBuf>) -> usize {
         if !keyed(&entry.file_name().to_string_lossy(), "env-", 16) || !path.is_dir() {
             continue;
         }
-        if !named.contains(&fs::canonicalize(&path).unwrap_or_else(|_| path.clone())) {
+        if !named.contains(&cozy_platform::durable::canonical(&path).unwrap_or_else(|_| path.clone())) {
             let _ = fs::remove_dir_all(&path);
             let _ = fs::remove_file(path.with_extension("constraints.txt"));
             let _ = fs::remove_dir_all(path.with_extension("wheels"));
@@ -283,7 +283,7 @@ impl LocalSources {
             fs::create_dir_all(target.parent().expect("a file inside the tree"))?;
             let incoming = home.join(".incoming");
             fs::copy(self.store.object_path(&object.sha256), &incoming)?;
-            fs::set_permissions(&incoming, fs::Permissions::from_mode(if file.executable { 0o755 } else { 0o644 }))?;
+            cozy_platform::durable::set_mode(&incoming, if file.executable { 0o755 } else { 0o644 }).map_err(std::io::Error::from)?;
             fs::rename(&incoming, &target)?;
         }
         for gone in held.keys().filter(|name| !next.contains_key(*name)) {
@@ -403,7 +403,7 @@ impl LocalSources {
         for generation in generations {
             let env = generation.path().join("env");
             match fs::read_link(&env) {
-                Ok(target) => { named.insert(target); }
+                Ok(target) => { named.insert(cozy_platform::durable::canonical(&target).unwrap_or(target)); }
                 // Published generations own an ordinary environment directory.
                 Err(error) if error.kind() == std::io::ErrorKind::InvalidInput && env.is_dir() => {}
                 Err(_) => return,
@@ -773,7 +773,7 @@ mod tests {
         let unavailable = m.root.join("unavailable-generations");
         fs::rename(&m.installer.generations, &unavailable).unwrap();
         sources.collect("alice", "local/tensord-cpu-input");
-        assert!(environment.join("bin/python").is_file());
+        assert!(cozy_platform::paths::venv_python(&environment).is_file());
         assert!(first_home.join("tree/notes.txt").is_file());
         fs::rename(&unavailable, &m.installer.generations).unwrap();
         // The environment imports the tree itself: nothing of the project was copied into it.
@@ -1099,7 +1099,7 @@ mod tests {
         let manifest = write(&m.objects, "alice", manifest.to_string().as_bytes());
         let installed = sources.install(&m.service, "alice", &manifest.digest, None, "", &|_| ()).unwrap();
         let python = m.service.catalog.resolve(&installed.generation).unwrap().record.python;
-        let site = python.parent().unwrap().parent().unwrap().join("lib/python3.12/site-packages");
+        let site = cozy_platform::paths::venv_site_packages(python.parent().unwrap().parent().unwrap()).unwrap();
         // A locked dependency links into the seed; the App the Runtime describes is copied.
         let dependency = site.join("msgspec/__init__.py");
         assert!(fs::symlink_metadata(&dependency).unwrap().file_type().is_symlink(), "msgspec was copied into the environment");
@@ -1132,7 +1132,7 @@ mod tests {
         let installed = sources.install(&m.service, "alice", &manifest.digest, None, "", &|_| ()).unwrap();
         let held = m.service.catalog.resolve(&installed.generation).unwrap();
         assert!(held.record.callees.iter().any(|c| c.distribution == "tensord-cpu-memo"), "{:?}", held.record.callees);
-        let site = held.record.python.parent().unwrap().parent().unwrap().join("lib/python3.12/site-packages");
+        let site = cozy_platform::paths::venv_site_packages(held.record.python.parent().unwrap().parent().unwrap()).unwrap();
         assert!(!fs::symlink_metadata(site.join("cpu_memo/__init__.py")).unwrap().file_type().is_symlink());
         assert!(fs::symlink_metadata(site.join("msgspec/__init__.py")).unwrap().file_type().is_symlink());
 
@@ -1158,7 +1158,7 @@ mod tests {
         let installed = sources.install(&m.service, "alice", &manifest.digest, None, "", &|_| ()).unwrap();
         let held = m.service.catalog.resolve(&installed.generation).unwrap();
         assert!(held.record.callees.iter().any(|c| c.distribution == "tensord-cpu-memo"), "{:?}", held.record.callees);
-        let site = held.record.python.parent().unwrap().parent().unwrap().join("lib/python3.12/site-packages");
+        let site = cozy_platform::paths::venv_site_packages(held.record.python.parent().unwrap().parent().unwrap()).unwrap();
         for copied in ["cpu_caller/__init__.py", "cpu_memo/__init__.py"] {
             assert!(!fs::symlink_metadata(site.join(copied)).unwrap().file_type().is_symlink(), "{copied} is linked");
         }

@@ -5,10 +5,9 @@ use tensorfs_core::store::Store;
 struct Area(PathBuf);
 impl Area {
     fn new() -> Self {
-        let uuid = fs::read_to_string("/proc/sys/kernel/random/uuid").unwrap();
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("target/workspace-tests")
-            .join(uuid.trim());
+            .join(uuid::Uuid::new_v4().to_string());
         fs::create_dir_all(&path).unwrap();
         Self(path)
     }

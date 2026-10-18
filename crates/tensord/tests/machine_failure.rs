@@ -1,5 +1,8 @@
 //! A call that raises: its traceback travels with the run, in its log lines and its outcome's
 //! `reason.detail`, so `cozy run show` explains it once the machine is gone.
+#[path = "common/child.rs"]
+mod child;
+use child::BareEnv;
 use ed25519_dalek::{pkcs8::EncodePrivateKey, SigningKey};
 use std::{
     path::Path,
@@ -31,9 +34,8 @@ async fn a_raising_calls_traceback_travels_with_its_run() {
     let mut machine = Machine(
         Command::new(env!("CARGO_BIN_EXE_tensord"))
             .arg("--persistent")
-            .env_clear()
-            .env("PATH", "/usr/bin:/bin")
-            .env("HOME", home.path())
+            .bare_env()
+            .user_home(home.path())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
             .spawn()

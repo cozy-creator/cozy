@@ -4,6 +4,8 @@
 //! beside it, never read, and a fresh journal starts. The machine keeps its identity (leaf,
 //! worker id, owner key), its store and its installed environment, whose code runs again with
 //! no reinstall.
+//! A pre-cohort Linux home (`sh`, `/usr/local/bin`, process groups) restarted in place.
+#![cfg(unix)]
 use ed25519_dalek::{pkcs8::EncodePrivateKey, SigningKey};
 use std::{
     collections::BTreeSet,

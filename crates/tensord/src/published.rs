@@ -22,7 +22,6 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
-    os::unix::process::CommandExt,
     process::{Command, Stdio},
     sync::{Arc, Condvar, Mutex},
     time::{Duration, Instant},
@@ -61,17 +60,20 @@ impl PackageSdk {
         // An activation replaces sdk/current, not the immutable candidate directory. Freeze
         // that selection once: both cache identity and the installer's actual wheel inputs
         // must name the same build even when filenames/version labels repeat.
-        let wheels = wheels.canonicalize().unwrap_or_else(|_| wheels.to_path_buf());
-        let mut pair: Vec<String> = fs::read_dir(&wheels)
+        let wheels = cozy_platform::durable::canonical(wheels).unwrap_or_else(|_| wheels.to_path_buf());
+        let found: Vec<PathBuf> = fs::read_dir(&wheels)
             .into_iter()
             .flatten()
             .flatten()
             .map(|entry| entry.path())
             .filter(|path| path.extension().is_some_and(|e| e == "whl"))
-            .map(|path| path.display().to_string())
             .collect();
+        let named = |prefix: &str| {
+            found.iter().any(|w| w.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with(prefix)))
+        };
+        let complete = named("cozy_runtime-") && named("tensorfs-");
+        let mut pair: Vec<String> = found.iter().map(|path| path.display().to_string()).collect();
         pair.sort();
-        let complete = pair.iter().any(|w| w.contains("/cozy_runtime-")) && pair.iter().any(|w| w.contains("/tensorfs-"));
         let seed = root.join("opt/cozy/dependency-seed/uv-cache");
         Self {
             uv,
@@ -942,7 +944,7 @@ impl Publisher {
         }
         let wheels = self.fetch_hub(&files, source, &dir, job)?;
         let env = dir.join("env");
-        let interpreter = env.join("bin/python");
+        let interpreter = cozy_platform::paths::venv_python(&env);
         let py = interpreter.to_string_lossy().to_string();
         next();
         self.uv(&["venv", "--no-project", "--no-config", "--python", &card.python, &env.to_string_lossy()], job.stop.as_ref())?;
@@ -1021,12 +1023,9 @@ impl Publisher {
             .and_then(|_| file.sync_all())
             .map_err(io_failure)?;
         fs::rename(&staged, dir.join("generation.json")).map_err(io_failure)?;
-        File::open(&dir)
-            .and_then(|d| d.sync_all())
-            .map_err(io_failure)?;
-        File::open(generations)
-            .and_then(|d| d.sync_all())
-            .map_err(io_failure)
+        cozy_platform::durable::sync_dir(&dir)
+            .and_then(|()| cozy_platform::durable::sync_dir(generations))
+            .map_err(|error| io_failure(error.into()))
     }
 
     /// The lock's exact versions as constraints (`name==version ; marker`), less `except`: what
@@ -1200,7 +1199,7 @@ impl Publisher {
         crate::machine::client::ensure_uv(&self.sdk.uv).map_err(|e| ("uv_unavailable", e.to_string()))?;
         let mut command = Command::new(&self.sdk.uv);
         command.args(args).env_clear().envs(env.iter().copied()).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
-        command.process_group(0);
+        cozy_platform::process::own_group(&mut command);
         for name in ["PATH", "SSL_CERT_FILE", "SSL_CERT_DIR", "LANG"] {
             if let Some(value) = cozy_proto::config::environment().get(name) {
                 command.env(name, value);
@@ -1839,7 +1838,7 @@ pub fn describe_environment(
     // -S keeps authored .pth startup code out; only the venv's own site-packages are added.
     const BOOTSTRAP: &str = "import pathlib,runpy,sys;\
         root=pathlib.Path(sys.executable).absolute().parent.parent;\
-        sys.path[:0]=[str(p) for p in (root/'lib').glob('python*/site-packages')];\
+        sys.path[:0]=[str(p) for p in (*(root/'lib').glob('python*/site-packages'),root/'Lib'/'site-packages') if p.is_dir()];\
         runpy.run_module('tensord_client.runtime_describe',run_name='__main__')";
     let described = Command::new(python)
         .args(["-I", "-S", "-c", BOOTSTRAP])
@@ -1875,11 +1874,9 @@ fn pair_bound(line: &str) -> bool {
 
 /// The Runtime and TensorFS an environment holds, by their installed distribution names.
 fn installed_sdk(env: &Path) -> Vec<Value> {
-    let mut found: Vec<Value> = fs::read_dir(env.join("lib"))
+    let mut found: Vec<Value> = cozy_platform::paths::venv_site_packages(env)
         .into_iter()
-        .flatten()
-        .flatten()
-        .flat_map(|python| fs::read_dir(python.path().join("site-packages")).into_iter().flatten().flatten())
+        .flat_map(|site| fs::read_dir(site).into_iter().flatten().flatten())
         .filter_map(|entry| {
             let name = entry.file_name().into_string().ok()?;
             let (distribution, version) = name.strip_suffix(".dist-info")?.split_once('-')?;
@@ -2181,7 +2178,7 @@ pub(crate) mod tests {
         assert!(parts >= 3, "a 2.5 MiB wheel comes in 1 MiB parts: {:?}", asks.lock().unwrap());
 
         let env = dir.join("env");
-        let python = env.join("bin/python");
+        let python = cozy_platform::paths::venv_python(&env);
         for args in [
             vec!["venv", "-q", "--python", "3.12", env.to_str().unwrap()],
             vec!["pip", "install", "-q", "--offline", "--no-config", "--python", python.to_str().unwrap(), "--no-deps", local.to_str().unwrap()],
@@ -2625,7 +2622,17 @@ pub(crate) mod tests {
 
     /// One channel request answered (frames: a kind byte, a u32 length, JSON); Null once the
     /// channel is closed.
-    fn ask(channel: &mut std::os::unix::net::UnixStream, request: Value) -> Value {
+    /// The channel a file carries, as the executor adopts it.
+    fn channel(file: std::fs::File) -> cozy_platform::ipc::LocalStream {
+        #[cfg(unix)]
+        let raw = std::os::fd::IntoRawFd::into_raw_fd(file) as i64;
+        #[cfg(windows)]
+        let raw = std::os::windows::io::IntoRawHandle::into_raw_handle(file) as i64;
+        // SAFETY: a connected stream this test owns and hands over.
+        unsafe { cozy_platform::ipc::adopt(raw) }
+    }
+
+    fn ask(channel: &mut cozy_platform::ipc::LocalStream, request: Value) -> Value {
         use std::io::{Read, Write};
         let body = serde_json::to_vec(&request).unwrap();
         let frame = [&[0u8][..], &(body.len() as u32).to_be_bytes(), &body].concat();
@@ -2680,7 +2687,7 @@ pub(crate) mod tests {
         let asked = heard.lock().unwrap().len();
         let warm = call(3);
         warm.wait(&manifest, &objects).unwrap();
-        let mut channel = std::os::unix::net::UnixStream::from(std::os::fd::OwnedFd::from(warm.channel().unwrap()));
+        let mut channel = channel(warm.channel().unwrap());
         let rows: Vec<Value> = objects.iter().map(|o| json!({"sha256": o.sha256, "length": o.length})).collect();
         let waited = ask(&mut channel, json!({"id": 1, "op": "wait", "manifest": manifest.id(), "objects": rows}));
         assert_eq!(waited, json!({"id": 1, "result": null}));
@@ -2700,7 +2707,7 @@ pub(crate) mod tests {
         let store = bench.publisher.store().clone();
         let objects = crate::access::objects(&crate::access::header(&store, &manifest).unwrap(), &[]);
         let fetch = crate::access::Fetch::new(store.clone(), Some(hub.clone()), vec![manifest.id()], 7);
-        let mut channel = std::os::unix::net::UnixStream::from(std::os::fd::OwnedFd::from(fetch.channel().unwrap()));
+        let mut channel = channel(fetch.channel().unwrap());
         let rows: Vec<Value> = objects.iter().map(|o| json!({"sha256": o.sha256, "length": o.length})).collect();
         let scheduled = ask(&mut channel, json!({"id": 1, "op": "schedule", "manifest": manifest.id(), "objects": rows, "rank": 0}));
         assert_eq!(scheduled, json!({"id": 1, "result": null}));
@@ -2762,13 +2769,12 @@ pub(crate) mod tests {
         let generations = crate::catalog::Catalog::new(&bench.root.join("generations")).unwrap();
         let identity = "ab".repeat(16);
         let dir = generations.root().join(&identity);
-        fs::create_dir_all(dir.join("env/bin")).unwrap();
-        fs::write(dir.join("env/bin/python"), "").unwrap();
+        let python = crate::scratch::interpreter(&dir.join("env"));
         File::create(dir.join(".hold")).unwrap();
         let interface = json!({"application": "pkg:app", "entrypoints": [{"name": "render",
             "models": [{"path": "render.models.model", "class": "M"}]}]});
         fs::write(dir.join("generation.json"), json!({"identity": identity, "package": "acme/pkg", "version": "1.0.0",
-            "application": "pkg:app", "python": dir.join("env/bin/python"), "interface": interface}).to_string()).unwrap();
+            "application": "pkg:app", "python": python, "interface": interface}).to_string()).unwrap();
         let held = generations.resolve(&identity).unwrap();
         let slot = |manifest: &ObjectRef, on_demand| PlanSlot { selected_encoded_bytes: 0, on_demand, lane: String::new(),
             binding: crate::device_executor::Binding { snapshot: manifest.id(), components: vec!["model".into()], ..Default::default() } };
@@ -2861,12 +2867,11 @@ pub(crate) mod tests {
             service.configure_pool(Pool::new(&root.join("gpu"), serde_json::from_value(config).unwrap(), store).unwrap()).unwrap();
             let identity = "cd".repeat(16);
             let dir = service.catalog.root().join(&identity);
-            fs::create_dir_all(dir.join("env/bin")).unwrap();
-            fs::write(dir.join("env/bin/python"), "").unwrap();
+            let python = crate::scratch::interpreter(&dir.join("env"));
             File::create(dir.join(".hold")).unwrap();
             let interface = json!({"application": "pkg:app", "entrypoints": entrypoints});
             fs::write(dir.join("generation.json"), json!({"identity": identity, "package": package, "version": "1.0.0",
-                "application": "pkg:app", "python": dir.join("env/bin/python"), "interface": interface}).to_string()).unwrap();
+                "application": "pkg:app", "python": python, "interface": interface}).to_string()).unwrap();
             let installation = service.engine.bind_installation(Installation { actor: "alice".into(), alias: "held".into(),
                 generation: identity, package: package.into(), release: "1.0.0".into(),
                 interface: serde_json::to_vec(&interface).unwrap(), hub: String::new() }).unwrap();

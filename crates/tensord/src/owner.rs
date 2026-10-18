@@ -1,16 +1,10 @@
 use crate::protocol::{Body, Object};
 use fs2::FileExt;
+use cozy_platform::ipc::LocalStream;
 use std::{
     collections::{HashMap, HashSet},
     fs::{File, OpenOptions},
-    io::{self, Seek, SeekFrom, Write},
-    os::{
-        fd::AsRawFd,
-        unix::{
-            fs::{MetadataExt, PermissionsExt},
-            net::UnixStream,
-        },
-    },
+    io::{self, Seek, SeekFrom},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -27,8 +21,18 @@ struct Cached {
     clock: u64,
 }
 struct Peer {
+    /// Its process, to see it end (a pidfd); a Windows peer ends by disconnecting.
+    #[cfg(unix)]
     pidfd: File,
     disconnected: bool,
+}
+impl Peer {
+    fn ended(&self) -> bool {
+        #[cfg(unix)]
+        return cozy_platform::process::ended(&self.pidfd);
+        #[cfg(not(unix))]
+        false
+    }
 }
 struct Lease {
     peer: u64,
@@ -75,7 +79,7 @@ impl Owner {
                 "state already has a machine owner",
             )
         })?;
-        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700))?;
+        cozy_platform::durable::set_mode(root, 0o700)?;
         // TensorFS retains the exclusive store claim with every borrowed Store and read
         // lease, and lets this owner's GC run while those leases pin individual objects.
         let store = Arc::new(Store::ensure_owned(store).map_err(io::Error::other)?);
@@ -108,9 +112,12 @@ impl Owner {
         self.next_id += 1;
         id
     }
-    pub fn connect(&mut self, stream: &UnixStream) -> io::Result<u64> {
+    pub fn connect(&mut self, stream: &LocalStream) -> io::Result<u64> {
         self.accepting()?;
+        #[cfg(unix)]
         let pidfd = cozy_platform::handles::peer_pidfd(stream)?;
+        #[cfg(not(unix))]
+        let _ = stream;
         self.reap();
         if self.peers.len() >= 64 {
             return Err(io::Error::other("64 active client limit reached"));
@@ -119,6 +126,7 @@ impl Owner {
         self.peers.insert(
             id,
             Peer {
+                #[cfg(unix)]
                 pidfd,
                 disconnected: false,
             },
@@ -142,7 +150,7 @@ impl Owner {
         let dead: HashSet<_> = self
             .peers
             .iter()
-            .filter(|(_, p)| cozy_platform::process::ended(&p.pidfd))
+            .filter(|(_, p)| p.ended())
             .map(|(id, _)| *id)
             .collect();
         self.leases.retain(|_, lease| !dead.contains(&lease.peer));
@@ -160,6 +168,7 @@ impl Owner {
         self.cache
             .retain(|id, c| held.contains(id) || c.last_used.elapsed() < ttl);
     }
+    #[cfg(unix)]
     fn held(&self, id: &str) -> bool {
         self.leases
             .values()
@@ -171,7 +180,7 @@ impl Owner {
             .map(|c| {
                 c.file
                     .metadata()
-                    .map(|m| m.blocks() * 512)
+                    .map(|m| cozy_platform::durable::allocated(&m))
                     .unwrap_or(u64::MAX)
             })
             .sum()
@@ -179,9 +188,7 @@ impl Owner {
     pub fn import(&mut self, object: Object, mut file: File) -> io::Result<Body> {
         self.accepting()?;
         validate(&object)?;
-        if cozy_platform::shm::seals(std::os::fd::AsFd::as_fd(&file))? & cozy_platform::shm::NO_WRITE_SEALS != cozy_platform::shm::NO_WRITE_SEALS {
-            return Err(failure("input fd must have full immutable seals"));
-        }
+        sealed(&file)?;
         if file.metadata()?.len() != object.length {
             return Err(failure("input length differs"));
         }
@@ -211,7 +218,8 @@ impl Owner {
         if source.len() != object.length {
             return Err(failure("stored object length differs"));
         }
-        let mut source = source.into_file();
+        let source = source.into_file();
+        #[cfg(unix)]
         if !self.cache.contains_key(&object.sha256) && object.length <= self.budget {
             // Charges page-rounded backing, not the logical byte count.
             // SAFETY: sysconf takes a scalar key and returns the kernel's page size.
@@ -241,8 +249,9 @@ impl Owner {
             }
             if self.host_bytes().saturating_add(pages) <= self.budget {
                 let cached = (|| -> io::Result<File> {
+                    use std::io::Write;
                     let mut file = cozy_platform::shm::memfd_named("tensord-weights").map(std::fs::File::from)?;
-                    io::copy(&mut source, &mut file)?;
+                    io::copy(&mut &source, &mut file)?;
                     file.flush()?;
                     cozy_platform::shm::seal_with(std::os::fd::AsFd::as_fd(&file), cozy_platform::shm::NO_WRITE_SEALS)?;
                     Ok(file)
@@ -259,7 +268,7 @@ impl Owner {
                 } else {
                     // Optional cache failure does not refuse the object. The
                     // failed backing is dropped, and the verified inode remains.
-                    source.seek(SeekFrom::Start(0))?;
+                    (&source).seek(SeekFrom::Start(0))?;
                 }
             }
         }
@@ -267,8 +276,7 @@ impl Owner {
             Some(cached) => {
                 cached.clock = self.clock;
                 cached.last_used = Instant::now();
-                let fd = File::open(format!("/proc/self/fd/{}", cached.file.as_raw_fd()))?;
-                ("host", fd)
+                ("host", reopen(&cached.file)?)
             }
             None => ("disk", source),
         };
@@ -330,7 +338,46 @@ impl Owner {
         true
     }
 }
+/// A peer's import is a sealed memfd: its bytes cannot change under the store. Windows has no
+/// such file, so nothing is imported there.
+fn sealed(file: &File) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use cozy_platform::shm::{NO_WRITE_SEALS, seals};
+        if seals(std::os::fd::AsFd::as_fd(file))? & NO_WRITE_SEALS != NO_WRITE_SEALS {
+            return Err(failure("input fd must have full immutable seals"));
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = file;
+        Err(io::Error::new(io::ErrorKind::Unsupported, "sealed imports are a Unix machine's"))
+    }
+}
+
+/// A cached object for one more reader: its own open file description (offset), the same bytes.
+#[cfg(unix)]
+fn reopen(file: &File) -> io::Result<File> {
+    File::open(format!("/proc/self/fd/{}", std::os::fd::AsRawFd::as_raw_fd(file)))
+}
+
+/// Nothing is cached off Unix.
+#[cfg(not(unix))]
+fn reopen(file: &File) -> io::Result<File> {
+    file.try_clone()
+}
+
+/// A control endpoint's path. Unix sockets take a path of at most 107 bytes: a long root's
+/// endpoint lives in a private runtime directory instead. A Windows pipe has no such limit.
+#[cfg(not(unix))]
 fn control_socket(root: &Path, name: &str) -> io::Result<PathBuf> {
+    Ok(root.join(format!("{name}.sock")))
+}
+
+#[cfg(unix)]
+fn control_socket(root: &Path, name: &str) -> io::Result<PathBuf> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let path = root.join(format!("{name}.sock"));
     if std::os::unix::net::SocketAddr::from_pathname(&path).is_ok() {
         return Ok(path);

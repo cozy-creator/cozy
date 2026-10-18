@@ -4,7 +4,6 @@ use tensord::journal::Journal;
 use ed25519_dalek::SigningKey;
 use std::{
     fs,
-    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
@@ -39,14 +38,16 @@ impl Machine {
         let root = std::env::temp_dir().join(format!("cm-surface-{}", uuid::Uuid::new_v4()));
         let config = root.join("config");
         fs::create_dir_all(&config).unwrap();
-        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&root, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
         let keys = [SIGNER, OTHER].map(|key| {
             URL_SAFE_NO_PAD.encode(SigningKey::from_bytes(&key).verifying_key().to_bytes())
         });
         let write = |name: &str, value: serde_json::Value| {
             let path = config.join(name);
             fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            #[cfg(unix)]
+            fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
         };
         write(
             "keys.json",
@@ -2106,6 +2107,7 @@ mod v1_api {
 
     /// An executor holds no descriptor the machine did not hand it: not one the machine itself
     /// inherited (as a service inherits its parent's readiness, key and credential pipes).
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn an_executor_inherits_no_descriptor_the_machine_did_not_hand_it() {
         use std::os::fd::AsRawFd;

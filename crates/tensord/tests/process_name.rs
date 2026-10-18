@@ -1,4 +1,6 @@
 //! The actual CPU service keeps its name when launched through update/proc executable aliases.
+//! Linux: the name and executable are read from `/proc`.
+#![cfg(target_os = "linux")]
 use std::{
     fs,
     io::{BufRead, BufReader},

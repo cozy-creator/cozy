@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
-use std::os::unix::net::UnixStream;
+use cozy_platform::ipc::LocalStream;
 
 /// Not a size rule: the most one length prefix may make a reader allocate, on this socket
 /// and the executor seam alike (Runtime's `seam.MAX_FRAME`). Load replies grow with their
@@ -108,17 +108,17 @@ pub enum Body {
         detail: String,
     },
 }
-pub fn read(stream: &mut UnixStream) -> io::Result<Option<Request>> {
+pub fn read(stream: &mut LocalStream) -> io::Result<Option<Request>> {
     read_body(stream)?
         .map(|bytes| serde_json::from_slice(&bytes).map_err(io::Error::other))
         .transpose()
 }
-pub fn write(stream: &mut UnixStream, reply: &Reply) -> io::Result<()> {
+pub fn write(stream: &mut LocalStream, reply: &Reply) -> io::Result<()> {
     write_body(stream, &serde_json::to_vec(reply)?)
 }
 /// One frame's body, read as it arrives: a prefix is never trusted with an allocation. EOF is
 /// clean only between frames.
-pub fn read_body(stream: &mut UnixStream) -> io::Result<Option<Vec<u8>>> {
+pub fn read_body(stream: &mut LocalStream) -> io::Result<Option<Vec<u8>>> {
     let mut header = [0; 4];
     if stream.read(&mut header[..1])? == 0 {
         return Ok(None);
@@ -138,7 +138,7 @@ pub fn read_body(stream: &mut UnixStream) -> io::Result<Option<Vec<u8>>> {
     }
     Ok(Some(bytes))
 }
-pub fn write_body(stream: &mut UnixStream, bytes: &[u8]) -> io::Result<()> {
+pub fn write_body(stream: &mut LocalStream, bytes: &[u8]) -> io::Result<()> {
     if bytes.len() > MAX_FRAME {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,

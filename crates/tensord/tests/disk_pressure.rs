@@ -9,10 +9,10 @@ use tensord::{
     launch_identity::Seal,
     reclaim::{self, Caches, Disk, KernelCaches, StoreCaches, Swept},
 };
+use cozy_platform::durable;
 use std::{
     collections::HashSet,
     fs, io,
-    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     sync::Arc,
     time::SystemTime,
@@ -64,7 +64,7 @@ impl Fixture {
         fs::create_dir_all(&path).unwrap();
         fs::write(path.join(".hold"), b"").unwrap();
         let used = SystemTime::now() - reclaim::IDLE - std::time::Duration::from_secs(1);
-        let hold = fs::File::open(path.join(".hold")).unwrap();
+        let hold = fs::OpenOptions::new().write(true).open(path.join(".hold")).unwrap();
         hold.set_modified(used).unwrap();
         fs::write(path.join("weights"), vec![2u8; MIB as usize]).unwrap();
         path
@@ -220,15 +220,18 @@ fn reserve() -> u64 {
     disk(0).reserve()
 }
 
-/// Bytes on disk under `path`, each inode once.
-fn allocated(path: &Path, seen: &mut HashSet<u64>) -> u64 {
+/// Bytes on disk under `path`, each file once.
+fn allocated(path: &Path, seen: &mut HashSet<durable::FileId>) -> u64 {
     let Ok(metadata) = fs::symlink_metadata(path) else {
         return 0;
     };
-    let own = if seen.insert(metadata.ino()) {
-        metadata.blocks() * 512
-    } else {
-        0
+    // A symlink is its own entry; anything else is counted once, however many names it has.
+    let own = match metadata.file_type().is_symlink() {
+        true => durable::allocated(&metadata),
+        false => match durable::FileId::at(path) {
+            Ok(id) if seen.insert(id) => durable::allocated(&metadata),
+            _ => 0,
+        },
     };
     let children = if metadata.is_dir() {
         fs::read_dir(path).ok()
@@ -267,10 +270,13 @@ fn held_linked_and_open_bytes_do_not_make_a_plan_cover() {
     let run = fs::File::open(held.join(".hold")).unwrap();
     fs2::FileExt::lock_shared(&run).unwrap();
     fs::hard_link(linked.join("weights"), fixture.root.join("uv-cache")).unwrap();
-    // A collected result this process is still serving.
-    let (result, log) = fixture.collected("served");
-    fs::remove_file(&log).unwrap();
-    let serving = fs::File::open(result.join("body")).unwrap();
+    // A collected result this process is still serving: Linux lists the files it holds open.
+    let served = cfg!(target_os = "linux").then(|| {
+        let (result, log) = fixture.collected("served");
+        fs::remove_file(&log).unwrap();
+        let serving = fs::File::open(result.join("body")).unwrap();
+        (result, serving)
+    });
     // A kernel namespace a live executor holds, and one reached through a link.
     let kernel = fixture.kernel("u1", "in-use");
     let executor = reclaim::kernel_hold(&fixture.kernels.root, "u1").unwrap();
@@ -278,16 +284,13 @@ fn held_linked_and_open_bytes_do_not_make_a_plan_cover() {
     let outside = fixture.root.join("outside/triton/foreign");
     fs::create_dir_all(&outside).unwrap();
     fs::write(outside.join("kernel"), vec![1u8; MIB as usize]).unwrap();
-    std::os::unix::fs::symlink(
-        fixture.root.join("outside"),
-        fixture.kernels.root.join("u2"),
-    )
-    .unwrap();
+    durable::symlink(&fixture.root.join("outside"), &fixture.kernels.root.join("u2")).unwrap();
     // Counted by size alone these would cover half a mebibyte many times over.
     assert_eq!(fixture.sweep(None, &fixture.low(MIB / 2)), Swept::default());
-    assert!(held.exists() && linked.exists() && result.exists() && kernel.exists());
+    assert!(held.exists() && linked.exists() && kernel.exists());
+    assert!(served.as_ref().is_none_or(|(result, _)| result.exists()));
     assert!(outside.join("kernel").exists());
-    drop((run, serving, executor));
+    drop((run, served, executor));
 }
 
 #[test]
@@ -416,7 +419,7 @@ fn the_uv_cache_drops_wheels_no_environment_links_before_generations_and_never_m
     assert_eq!((swept.uv_cache, swept.generations), (1, 0), "{swept:?}");
     assert_eq!(unpacked(), 1);
     assert!(generation.exists() && module.exists());
-    assert_eq!(fs::metadata(&module).unwrap().nlink(), 2);
+    assert_eq!(durable::links(&module).unwrap(), 2);
     // A removed entry is a cache miss: uv unpacks the wheel again.
     let again = fixture.root.join("env-again");
     fixture.install("beta", &again);

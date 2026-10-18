@@ -12,9 +12,6 @@ publish.workspace = true
 [dependencies]
 calcifer.workspace = true
 cozy-cli.workspace = true
-
-# This computer's machine runs on Linux; elsewhere `cozy machine serve` refuses.
-[target.'cfg(target_os = "linux")'.dependencies]
 tensord.workspace = true
 
 [dev-dependencies]

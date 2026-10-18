@@ -1,7 +1,8 @@
 //! Executors forked from an import-only executor (`fork/1`) on real Runtime processes of
 //! `tests/fixtures/cpu_lifecycle`, no doubles. CUDA is hidden by the seal; the GPU half is
 //! proven on a rental. `TENSORD_FORK_GENERATIONS` names installed generations whose
-//! Runtime offers `fork/1`.
+//! Runtime offers `fork/1`. Unix only: a Windows executor is spawned, never forked.
+#![cfg(unix)]
 use cozy_platform::process::Exact;
 use tensord::{
     device_executor::{

@@ -15,6 +15,11 @@ pub mod execution;
 mod gpu_allocation;
 pub mod gpu_service;
 pub mod held_models;
+#[cfg(target_os = "linux")]
+pub mod host_tier;
+/// Off where the OS has no sealed shared memory: weights are read from the page cache.
+#[cfg(not(target_os = "linux"))]
+#[path = "host_tier_off.rs"]
 pub mod host_tier;
 pub mod hub;
 pub mod calls;
@@ -36,9 +41,16 @@ pub mod products;
 pub mod protocol;
 pub mod published;
 pub mod reclaim;
+#[cfg(target_os = "linux")]
+pub mod resident_custody;
+/// Off where the OS cannot share an executor's device memory by handle.
+#[cfg(not(target_os = "linux"))]
+#[path = "resident_custody_off.rs"]
 pub mod resident_custody;
 pub mod runs;
 pub mod weights;
+#[cfg(test)]
+mod scratch;
 #[cfg(test)]
 mod sdk_selection_tests;
 pub mod serve;

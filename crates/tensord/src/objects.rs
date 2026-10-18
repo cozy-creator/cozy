@@ -7,11 +7,11 @@ use crate::{
     execution::Engine,
     journal::{Artifact, Execution, HeldMemo, ResultRecord},
 };
+use cozy_platform::durable::FileAt;
 use std::{
     collections::HashMap,
     fs::{self, File, OpenOptions},
     io,
-    os::unix::fs::FileExt,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
