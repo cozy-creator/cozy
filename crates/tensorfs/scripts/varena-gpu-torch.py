@@ -2,7 +2,7 @@
 """The weight plane under a real consumer, on one GPU: torch kernels read plane bytes through
 DLPack views on the consumer's own stream.
 
-A 1 + L region model (common + L linear layers, bf16) lives in a real store. The pinned tier
+A 1 + L region model (common + L linear layers, bf16) lives in a real TensorFS v2 store. The pinned tier
 holds it; a spread resident set is wanted on the device; the rest streams through the ring.
 Every step's output must equal the all-resident reference bit for bit. Prints step times
 (streamed vs resident), stalls and per-region GPU compute from `stats()`.
@@ -13,7 +13,6 @@ Runs with any python that has torch (CUDA) and `PYTHONPATH=<worktree>/python`.
 """
 
 import argparse
-import io
 import random
 import sys
 import tempfile
@@ -22,8 +21,7 @@ from pathlib import Path
 
 import torch
 
-import tensorfs
-from tensorfs import varena
+from tensorfs import v2, varena
 
 MIB = 1 << 20
 results: list[bool] = []
@@ -35,23 +33,18 @@ def check(name, ok, detail=""):
 
 
 def build(root: Path, layers: int, dim: int):
-    """Store + manifest holding `embed` and `layerN.{w,b}` in bf16; returns the torch tensors."""
+    """A v2 store holding `embed` and `layerN.{w,b}` in bf16; returns its checkpoint and the
+    torch tensors."""
     g = torch.Generator().manual_seed(0)
     tensors = {"embed": torch.randn(64, dim, generator=g).bfloat16()}
     for i in range(layers):
         tensors[f"layer{i}.w"] = (torch.randn(dim, dim, generator=g) / dim**0.5).bfloat16()
         tensors[f"layer{i}.b"] = (torch.randn(dim, generator=g) / 10).bfloat16()
-    store = tensorfs.Store.init(root)
-    plain = next(v for n, v in tensorfs.seed_digests() if n == "plain/1")
-    add = {k: {"logical_dtype": "bf16", "shape": list(t.shape), "encoding": plain,
-               "parts": {"value": {"dtype": "bf16", "shape": list(t.shape)}}} for k, t in tensors.items()}
-    order = [("model", k) for k in tensors]
-    total = sum(t.numel() * 2 for t in tensors.values())
-    w = store.begin_derived("sha256:" + "b2" * 32, 1, {}, {"model": {"drop": [], "add": add}}, {}, order,
-                            2 * total + MIB, work_fingerprint="sha256:" + "6b" * 32)
-    for _, k in order:
-        w.add_part("model", k, "value", io.BytesIO(tensors[k].view(torch.uint8).numpy().tobytes()))
-    return store, w.commit()["manifest"]["sha256"], tensors
+    store = v2.Store(root)
+    w = store.writer()
+    for k, t in tensors.items():
+        w.put("model", k, "BF16", list(t.shape), t.view(torch.uint8).numpy().tobytes())
+    return store.checkpoint(w.commit()), tensors
 
 
 def main() -> int:
@@ -66,18 +59,14 @@ def main() -> int:
     ap.add_argument("--no-pinned", action="store_true", help="empty pinned tier: every streamed copy is disk-staged")
     a = ap.parse_args()
     root = Path(a.workdir or tempfile.mkdtemp(prefix="plane-gpu-")) / "store"
-    store, manifest, tensors = build(root, a.layers, a.dim)
-    header = store.manifest(manifest)["header"]
-    rplan = tensorfs.plan(header, [("model", k) for k in tensors], ["model"])
+    ck, tensors = build(root, a.layers, a.dim)
     regions = [["model/embed"]] + [[f"model/layer{i}.w", f"model/layer{i}.b"] for i in range(a.layers)]
 
     dev = torch.device("cuda", 0)
     torch.cuda.init()
     s = torch.cuda.Stream(dev)
     p = varena.Plane(devices=[0], readers=4)
-    src = p.source(store, store.acquire_cozytensors(manifest))
-    ws = p.register("smoke/model", src, rplan, regions)
-    del src
+    ws = p.register_checkpoint("smoke/model", ck, regions)
     reg = ws.regions
     parts = {x["what"]: x for x in ws.parts}
     total = sum(r["span"] for r in reg)
