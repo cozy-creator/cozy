@@ -4,7 +4,7 @@ name: release-smoke
 # The CPU smoke of design §6.4 on every release runner, against this run's own artifacts served from a local
 # mirror (COZY_DOWNLOAD_URL is the release location for the installers and `cozy update` alike): install
 # script, --version, PATH, up, status, hub list, package search (tensorhub.com, anonymous), the local machine
-# (enable, show, disable on Linux; refused elsewhere), update to this release, down. A verb answering not_ported is skipped, so the smoke grows as the verbs land.
+# (enable as a user service, show, disable on Linux; refused elsewhere), update to this release, down. A verb answering not_ported is skipped, so the smoke grows as the verbs land.
 on:
   workflow_call:
     inputs:
@@ -153,19 +153,18 @@ jobs:
             printf '%s\n' "$out"
             if [ "$code" = 0 ]; then ran=1; else echo "::error::cozy $* exited $code"; fail=1; fi
           }
-          # `cozy --json <words…>` must be refused with code $1; skipped like `step`.
+          # `cozy --json <words…>` must succeed: these verbs are in every release, never skipped.
+          must() {
+            code=0
+            out=$("$cozy" --json "$@") || code=$?
+            printf '%s\n' "$out"
+            [ "$code" = 0 ] || { echo "::error::cozy $* exited $code"; fail=1; }
+          }
+          # `cozy --json <words…>` must be refused with code $1.
           refuses() {
             want=$1 code=0
             shift
-            if ! "$cozy" "$@" --help > /dev/null 2>&1; then
-              echo "skipped, not in the grammar yet: cozy $*"
-              return
-            fi
             out=$("$cozy" --json "$@") || code=$?
-            if printf '%s' "$out" | grep -Eq '"code": *"not_ported"'; then
-              echo "skipped, not ported: cozy $*"
-              return
-            fi
             printf '%s\n' "$out"
             [ "$code" != 0 ] && printf '%s' "$out" | grep -Eq "\"code\": *\"$want\"" \
               || { echo "::error::cozy $* answered $code, not $want"; fail=1; }
@@ -177,13 +176,16 @@ jobs:
           step package search sdxl
           # The local machine: `enable` returns once `local` is ready (Linux); elsewhere it is refused.
           if [ "$RUNNER_OS" = Linux ]; then
-            step machine enable
-            if [ "$ran" = 1 ]; then
-              step machine show local
-              step machine disable
-            fi
+            # A user service manager, as a desktop login has: the runner's user lingers, with its bus.
+            sudo loginctl enable-linger "$(id -un)"
+            export XDG_RUNTIME_DIR=/run/user/$(id -u)
+            until [ -S "$XDG_RUNTIME_DIR/bus" ]; do sleep 1; done
+            export DBUS_SESSION_BUS_ADDRESS=unix:path=$XDG_RUNTIME_DIR/bus
+            must machine enable
+            must machine show local
+            must machine disable
           else
-            refuses machine_role_unsupported machine enable
+            refuses machine_unsupported machine enable
           fi
           before=$(ls -i "$cozy")
           step update "$VERSION"
