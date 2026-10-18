@@ -24,7 +24,7 @@ use crate::error::{Envelope, Error, Kind};
     modifiers(&CozyCap),
     security(("cozy_cap" = [])),
     paths(
-        health, status, keepalive, submit, events, cancel, output, triage, log, head_object, put_object,
+        health, status, keepalive, submit, events, cancel, output, triage, log, head_object, follow_object, put_object,
         held_objects
     ),
     components(schemas(Envelope, Error, Kind))
@@ -169,6 +169,17 @@ pub fn log() {}
         ("Cozy-Held" = String, description = "`first-last,…` inclusive; empty: nothing"))),
 ))]
 pub fn head_object() {}
+
+/// What this signer's upload of the object holds as its parts land, as SSE `held` events after
+/// each MiB more, ending once it holds all `length` bytes. A stored object answers at once.
+#[utoipa::path(get, path = path::OBJECT, params(
+    ("digest" = String, Path, description = "`sha256:<hex>`"),
+    ("length" = u64, Query, description = "The object's length"),
+), responses(
+    (status = 200, description = "SSE `event: held`", body = HeldBytes, content_type = "text/event-stream"),
+    (status = 507, description = "`machine_disk_full`", body = Envelope),
+))]
+pub fn follow_object() {}
 
 /// Lands one part of the object: the body is `Content-Range`'s bytes (without it, the whole
 /// object). Parts may go side by side, in any order. Once the held ranges cover the object, the

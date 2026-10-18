@@ -62,6 +62,8 @@ pub struct Upload {
     part: PathBuf,
     file: File,
     held: Mutex<Ranges>,
+    /// The bytes held, for those following the upload as it lands.
+    landed: tokio::sync::watch::Sender<u64>,
     /// One settle at a time records what landed.
     settling: Mutex<()>,
     /// Stored or dropped: later writes to it land nowhere, and a new upload starts afresh.
@@ -82,8 +84,15 @@ impl Upload {
             return Ok(());
         }
         self.file.write_all_at(data, offset)?;
-        insert(&mut self.held.lock().unwrap(), (offset, end));
+        let mut held = self.held.lock().unwrap();
+        insert(&mut held, (offset, end));
+        self.landed.send_replace(held.iter().map(|(s, e)| e - s).sum());
         Ok(())
+    }
+
+    /// The bytes held, now and as more land.
+    pub fn follow(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.landed.subscribe()
     }
 
     /// What has landed, synced or not.
@@ -376,12 +385,14 @@ impl Objects {
         self.store
             .admits(missing)
             .map_err(|e| refused("machine_disk_full", format!("no room for the object: {e}")))?;
+        let landed = tokio::sync::watch::Sender::new(length - missing);
         let upload = Arc::new(Upload {
             actor: actor.to_string(),
             object: ObjectRef { sha256: hex, length },
             part: part.clone(),
             file,
             held: Mutex::new(held),
+            landed,
             settling: Mutex::default(),
             ended: AtomicBool::new(false),
         });

@@ -24,7 +24,7 @@ use sha2::{Digest as _, Sha256};
 use url::Url;
 
 use super::{
-    Event, HELD, HeldAnswer, HeldObject, HeldRequest, LogLines, OutputTarget, Ranges, RunEvent,
+    Event, HELD, HeldAnswer, HeldBytes, HeldObject, HeldRequest, LogLines, OutputTarget, Ranges, RunEvent,
     RunRequest, RunState, StatusFrame, parse_held, path,
 };
 use crate::{
@@ -266,6 +266,27 @@ impl Machine {
     /// object is held whole.
     pub async fn held(&self, digest: &str) -> Result<Ranges, Error> {
         held(&send(self.request(Method::HEAD, path::OBJECT, &[digest])).await?)
+    }
+
+    /// What the machine holds of the object (`sha256:<hex>`, `length` bytes) as its upload lands,
+    /// until it holds all of it.
+    pub async fn follow_held(
+        &self,
+        digest: &str,
+        length: u64,
+    ) -> Result<impl Stream<Item = Result<u64, Error>> + Send + 'static, Error> {
+        let request = self.request(Method::GET, path::OBJECT, &[digest]);
+        let request = request.query(&[("length", length)]);
+        let events = sse(send(request.header(header::ACCEPT, "text/event-stream")).await?)?;
+        Ok(events.filter_map(|event| async move {
+            match event {
+                Ok(event) if event.event == "held" => {
+                    Some(parse::<HeldBytes>(&event.data).map(|h| h.held))
+                }
+                Ok(_) => None,
+                Err(e) => Some(Err(e)),
+            }
+        }))
     }
 
     /// What the machine holds of each of `digests`, in one request, in the order asked.

@@ -123,6 +123,14 @@ pub struct HeldObject {
     pub ranges: Ranges,
 }
 
+/// What an upload holds, as `GET /v1/objects/sha256:<hex>?length=N` streams it (`event: held`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct HeldBytes {
+    /// Bytes landed, synced or not; the last event says all N.
+    pub held: u64,
+}
+
 /// Whole lines of a machine log, as `GET /v1/logs/{name}` streams them (`event: lines`).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(default)]

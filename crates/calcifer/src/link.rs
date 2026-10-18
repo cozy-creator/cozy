@@ -9,7 +9,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use cozy_proto::{
@@ -35,8 +35,6 @@ pub(crate) const LANES: usize = 8;
 const UPLOAD_LANES: usize = 4;
 /// The most one upload part carries.
 const PART: u64 = 64 << 20;
-/// How often an upload asks the machine what it holds, which is its progress.
-const TELL_EVERY: Duration = Duration::from_secs(1);
 /// What an upload reads from its file at a time.
 const FRAME: usize = 64 << 10;
 
@@ -213,9 +211,9 @@ impl Link {
     }
 
     /// Uploads the object at `path`: what the machine does not hold yet (`held`, as it last
-    /// said), in parts side by side (`lanes`). `progress` hears what the machine holds, from a HEAD about once a second while
-    /// parts fly, with the rate; an object the machine already holds is not written and
-    /// `progress` hears nothing. A failed or stalled part resumes on a fresh connection; the
+    /// said), in parts side by side (`lanes`). `progress` hears what the machine holds as its
+    /// stream says it lands, with the rate; an object the machine already holds is not written
+    /// and `progress` hears nothing. A failed or stalled part resumes on a fresh connection; the
     /// upload gives up only when every lane has failed since a byte last moved, or a whole pass
     /// landed nothing.
     pub async fn write(
@@ -236,7 +234,7 @@ impl Link {
             Some(now.saturating_sub(from) as f64 / seconds)
         };
         progress(from, None);
-        // The most the machine has said it holds, by a HEAD or a part's answer.
+        // The most the machine has said it holds, by its stream or a part's answer.
         let landed = Arc::new(AtomicU64::new(from));
         loop {
             let before = v1::held_bytes(&held);
@@ -246,21 +244,20 @@ impl Link {
                 put(lane, name.clone(), path.to_owned(), length, leg, landed.clone())
             });
             let tell = async {
-                let mut tick = tokio::time::interval(TELL_EVERY);
-                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                tick.tick().await;
-                loop {
-                    tick.tick().await;
-                    if let Ok(now) = self.machine.held(&name).await {
-                        landed.fetch_max(v1::held_bytes(&now), Ordering::Relaxed);
+                // The machine says what it holds as bytes land; a machine that cannot say so is
+                // heard only through its parts' answers.
+                if let Ok(held) = self.machine.follow_held(&name, length).await {
+                    let mut held = std::pin::pin!(held);
+                    while let Some(Ok(now)) = held.next().await {
+                        let now = landed.fetch_max(now, Ordering::Relaxed).max(now);
+                        progress(now, rate(now));
                     }
-                    let now = landed.load(Ordering::Relaxed);
-                    progress(now, rate(now));
                 }
+                std::future::pending::<()>().await
             };
             let sent = tokio::select! {
                 sent = sent => sent,
-                _ = tell => unreachable!("it tells until the parts end"),
+                () = tell => unreachable!("it tells until the parts end"),
             };
             // A part answered with the whole object held: it is stored, with no HEAD to ask.
             let mut now = landed.load(Ordering::Relaxed);

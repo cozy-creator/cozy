@@ -130,6 +130,8 @@ async fn an_input_uploads_near_the_link_rate_over_a_long_round_trip() {
         ahead <= AHEAD,
         "progress ran {ahead:.0} B ahead of what the link carried"
     );
+    // Progress comes from the machine's held stream: nothing polls, and the parts alone (64 MiB
+    // each, four side by side) answer at most four times for these 20 MiB.
     assert!(
         seen.len() >= 10,
         "progress moved as the bytes did: {} events",

@@ -86,7 +86,7 @@ pub(super) fn router<B: MachineBackend>(identity: Arc<MachineIdentity>, backend:
         .route(path::OUTPUT, get(output::<B>))
         .route(path::TRIAGE, get(triage::<B>))
         .route(path::LOG, get(log::<B>))
-        .route(path::OBJECT, put(put_object::<B>).head(head_object::<B>))
+        .route(path::OBJECT, put(put_object::<B>).head(head_object::<B>).get(follow_object::<B>))
         .route(path::OBJECTS_HELD, post(held_objects::<B>).layer(DefaultBodyLimit::max(16 << 20)))
         .route(path::HEALTH, get(health))
         .fallback(|| async { Refusal::from(Error::not_found("route_not_found", "this machine serves no such path")) })
@@ -563,6 +563,51 @@ async fn head_object<B: MachineBackend>(State(m): State<Machine<B>>, Path(digest
     Ok((StatusCode::OK, [(v1::HELD, held(&ranges))]).into_response())
 }
 
+#[derive(Deserialize)]
+struct Length {
+    length: u64,
+}
+
+/// `GET /v1/objects/sha256:<hex>?length=N` as SSE: `held` events, the bytes this signer's upload of
+/// the object holds as they land (after each MiB more), ending once it holds all N. A stored object
+/// answers N at once.
+async fn follow_object<B: MachineBackend>(
+    State(m): State<Machine<B>>,
+    Path(digest): Path<String>,
+    length: Result<Query<Length>, QueryRejection>,
+    headers: HeaderMap,
+) -> Answer {
+    let caller = m.caller(&headers)?;
+    caller.machine()?;
+    let length = query(length)?.length;
+    let (runs, actor) = (runs_of(&m)?, crate::machine_api::actor_id(caller.actor));
+    let upload = blocking(&runs, move |runs| runs.objects.upload(&actor, &digest, length).map_err(Into::into)).await?;
+    let mut landed = match &upload {
+        Some(upload) => upload.follow(),
+        None => tokio::sync::watch::channel(length).1,
+    };
+    let (sender, held) = tokio::sync::mpsc::channel(4);
+    tokio::spawn(async move {
+        // Joined while it is followed; let go once its follower is.
+        let _upload = upload;
+        let mut sent = None;
+        loop {
+            let now = *landed.borrow_and_update();
+            if sent.is_none_or(|sent| now >= length || now >= sent + (1 << 20)) {
+                if sender.send(event("held", &v1::HeldBytes { held: now })).await.is_err() || now >= length {
+                    return;
+                }
+                sent = Some(now);
+            }
+            tokio::select! {
+                changed = landed.changed() => if changed.is_err() { return },
+                () = sender.closed() => return,
+            }
+        }
+    });
+    Ok(sse(m.authority(&caller), tokio_stream::wrappers::ReceiverStream::new(held)))
+}
+
 /// `POST /v1/objects/held`: `HEAD`'s answer for many objects in one request, in the order asked.
 async fn held_objects<B: MachineBackend>(State(m): State<Machine<B>>, headers: HeaderMap, body: Bytes) -> Answer {
     let caller = m.caller(&headers)?;
@@ -721,7 +766,7 @@ mod tests {
                 routed += 1;
             }
         }
-        assert_eq!(routed, 12, "the spec's routes");
+        assert_eq!(routed, 13, "the spec's routes");
     }
 
     /// A read from any offset answers exactly the bytes after it, across parts, and reads
