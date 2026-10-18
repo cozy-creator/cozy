@@ -218,9 +218,13 @@ class Gpu:
     def register(
         self, name: str, ck: Checkpoint, regions: Sequence[Sequence[str]], host_fd: int | None = None
     ) -> WeightSet:
-        """`host_fd`: a sealed host layout of the same regions, such as TensorD's grant or
-        `seal()`. Copies come from it. Without one, they come from the chunk files through the
-        page cache."""
+        """`regions`: `tensorfs.v2.regions(ck, max_bytes, boundaries)`, every part of the
+        components they name. `host_fd`: a sealed host layout of exactly these regions, filled
+        by the owner (TensorD) with the same layout function (`seal()` here, Rust
+        `varena::memory::open_checkpoint` + `host::open_sealed`). Its digest is checked; a
+        layout of other regions is refused. The core reopens the descriptor and closes nothing
+        the caller passed. Copies come from it, a region its owner left a hole from the chunk
+        files; without `host_fd`, every copy comes from the chunk files through the page cache."""
     def trim(self) -> int:
         """Idle chunks and unneeded slots go back to the driver. Returns the bytes released."""
     def step(self) -> None:
@@ -233,7 +237,9 @@ class Host:
     def __init__(self) -> None: ...
     def register(
         self, name: str, ck: Checkpoint, regions: Sequence[Sequence[str]], host_fd: int | None = None
-    ) -> WeightSet: ...
+    ) -> WeightSet:
+        """As `Gpu.register`. Binds are views of the sealed layout (read-only), or private
+        memory read once from the chunk files."""
 
 def hold_tier(fd: int) -> int:
     """A claim on every region of the host-tier memfd `fd`, for an owner that maps none of it

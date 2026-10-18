@@ -1410,8 +1410,11 @@ pub struct HostPinned {
 
 // ---------------------------------------------------------------- helpers
 
+/// The one layout of `regions` of `ck`, and its chunk files: what `register` maps and what a
+/// sealed host layout for it holds. An owner fills one with this (or `seal`), so the two agree
+/// by construction; `HostMem::adopt_sealed` checks the digest.
 #[cfg(feature = "store")]
-fn open_checkpoint(ck: &Checkpoint, regions: &[Vec<String>], direct_io: bool) -> Result<(Layout, Source)> {
+pub fn open_checkpoint(ck: &Checkpoint, regions: &[Vec<String>], direct_io: bool) -> Result<(Layout, Source)> {
     let components: Vec<&str> = regions.iter().flatten().filter_map(|t| t.split_once('/').map(|(c, _)| c)).collect();
     let plan = crate::checkpoint::read_plan(ck.header(), &components);
     let files = crate::checkpoint::chunk_files(ck, &plan)?;
