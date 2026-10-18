@@ -100,7 +100,7 @@ takes its root as an argument. Nor does a
 writer marker create the root it locks, so no command lays down a skeleton Store in whatever
 directory it happened to be run from.
 
-Python opens a cozytensors/2 store by root, creating it when absent:
+Python opens a cozytensors/1 store by root, creating it when absent:
 
 ```python
 import tensorfs

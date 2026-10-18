@@ -62,7 +62,7 @@ proofs do not imply release or installed/deployed adoption.
 
 ## The Python facade
 
-`tensorfs` exports cozytensors/2's `Store`, `Writer`, `Checkpoint` (`Checkpoint.parse` reads a
+`tensorfs` exports cozytensors/1's `Store`, `Writer`, `Checkpoint` (`Checkpoint.parse` reads a
 granted header), `Manifest` and the typed errors, plus `tensorfs.varena`. A managed executor
 never opens the Store: TensorD serves its sources and outputs over channels Runtime speaks.
 

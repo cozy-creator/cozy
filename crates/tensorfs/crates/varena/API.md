@@ -11,7 +11,7 @@ The plane applies caller-supplied budgets, regions and priorities; it does not m
 free memory or reorder the caller's execution schedule. TensorFS is a library on both
 sides, with no separate daemon. The Python facade ships in the `tensorfs` wheel
 (`from tensorfs import varena`). Managed Runtime uses supplied buffers and verified object
-descriptors, described by a `ReadPlan`. A byte source over a cozytensors/2 `Store` is not built:
+descriptors, described by a `ReadPlan`. A byte source over a cozytensors/1 `Store` is not built:
 v1's `source(store, lease)` and `fill_sealed` went with the v1 Python Store.
 Changes to this file are announced in its changelog below.
 
@@ -53,7 +53,7 @@ instead adopt the shared CPU layouts through `register_sealed`, or attach retain
 allocations as described below; they do not open the managed Store for missing sources.
 
 ```python
-src = ...                    # a plane.Source; over a cozytensors/2 Store: not built yet
+src = ...                    # a plane.Source; over a cozytensors/1 Store: not built yet
 ws = p.register(
     name,                    # content id; every stats/events row names the weight set by it
     src,                     # a plane.Source (shared by the manifest's components)
