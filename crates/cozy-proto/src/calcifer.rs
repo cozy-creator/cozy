@@ -495,6 +495,9 @@ pub struct Rental {
     /// Since when the Hub cannot reach it, though its provider reports it running.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unreachable_since_ms: Option<i64>,
+    /// The worker image it boots, by digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_worker_image_digest: Option<String>,
 }
 
 /// A machine's `Status`, as it last sent it.
@@ -712,6 +715,10 @@ pub enum NewMachine {
         gpus: Option<u32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         disk_gb: Option<u32>,
+        /// A Hub admin's worker image, `sha256:<hex>`, in place of the machine kind's current
+        /// one; the Hub refuses anyone else.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        image: Option<String>,
     },
     Add {
         name: String,

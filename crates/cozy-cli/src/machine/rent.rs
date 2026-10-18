@@ -27,6 +27,23 @@ pub struct Rent {
     /// Resume this paid order instead of placing a new one.
     #[arg(long, requires = "sku")]
     idempotency_key: Option<String>,
+    /// A Hub admin's worker image by digest (sha256:<hex>), for a gated image bake.
+    #[arg(long, requires = "sku", hide = true, value_parser = image_digest)]
+    image_digest: Option<String>,
+}
+
+fn image_digest(digest: &str) -> Result<String, String> {
+    match digest.strip_prefix("sha256:") {
+        Some(hex)
+            if hex.len() == 64
+                && hex
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) =>
+        {
+            Ok(digest.to_owned())
+        }
+        _ => Err("name a worker image as sha256:<64 lowercase hex>".to_owned()),
+    }
 }
 
 pub async fn exec(ctx: &Context, rent: Rent) -> Result<ExitCode, Error> {
@@ -43,6 +60,7 @@ pub async fn exec(ctx: &Context, rent: Rent) -> Result<ExitCode, Error> {
         hub: hub.origin.to_string(),
         gpus: rent.gpus,
         disk_gb: rent.disk_gb,
+        image: rent.image_digest,
     };
     let rented: Rented = match ctx
         .calcifer()
