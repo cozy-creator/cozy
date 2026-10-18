@@ -55,7 +55,7 @@ macro_rules! refused {
     )*};
 }
 
-refused!(hold_tier, release_tier, reserve, fill_sealed);
+refused!(hold_tier, release_tier, reserve);
 
 pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     let py = parent.py();
@@ -70,7 +70,6 @@ pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(hold_tier, &m)?)?;
     m.add_function(wrap_pyfunction!(release_tier, &m)?)?;
     m.add_function(wrap_pyfunction!(reserve, &m)?)?;
-    m.add_function(wrap_pyfunction!(fill_sealed, &m)?)?;
     m.add("SEALED_WHILE_FILLING", false)?;
     m.add("SEALED_HOLES", false)?;
     macro_rules! add_errors {

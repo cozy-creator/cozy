@@ -38,7 +38,8 @@ from fastsafetensors import SafeTensorsFileLoader
 from fastsafetensors import cpp as fstcpp
 from fastsafetensors.frameworks import get_framework_op
 from safetensors import safe_open
-from tensorfs import v2, varena
+import tensorfs
+from tensorfs import varena
 
 # fastsafetensors dlopens an unversioned libcudart.so; torch's wheels ship only the versioned one.
 _cudart = sorted(glob.glob(os.path.join(os.path.dirname(torch.__file__), "..", "nvidia", "**", "libcudart.so*"), recursive=True))
@@ -105,7 +106,7 @@ def blocks(ck):
 
 def write_v2(parts, root):
     """The lane through TensorFS's own writer, each part a U8 tensor `key#role`: the manifest digest."""
-    w = v2.Store(root).writer()
+    w = tensorfs.Store(root).writer()
     for p in parts:
         w.put(p[0], f"{p[1]}#{p[2]}", "U8", [p[3]], part_bytes(p))
     return w.commit().sha256
@@ -236,12 +237,12 @@ class Model:
             open(done, "w").write(digest)
         self.manifest = open(done).read()
         ck = self.checkpoint()
-        self.chunks = ck.chunks
+        self.chunks = [(path, length) for path, (_, length) in zip(ck.chunk_paths, ck.chunks)]
         self.blocks = blocks(ck)  # the model's structure, known before any load
         self.st = [os.path.join(self.dir, "st", f) for f in sorted(os.listdir(os.path.join(self.dir, "st")))]
 
     def checkpoint(self):
-        return v2.Store(self.store).checkpoint(f"sha256:{self.manifest}")
+        return tensorfs.Store(self.store).checkpoint(f"sha256:{self.manifest}")
 
     def in_window(self, comp, key):
         return comp == self.wcomp and key.startswith(self.wprefix)
@@ -268,7 +269,7 @@ class Model:
         plane.set_vram_budget(0, torch.cuda.mem_get_info()[0] - (1 << 30))
         t0 = time.perf_counter()
         ck = self.checkpoint()
-        ws = plane.register_checkpoint(self.name, ck, v2.regions(ck, 64 << 20, self.blocks))
+        ws = plane.register_checkpoint(self.name, ck, tensorfs.regions(ck, 64 << 20, self.blocks))
         self.register_s = time.perf_counter() - t0  # open, regions and register: the part before any read
         picked = sorted({p["region"] for p in ws.parts if self.in_window(*p["what"].split("#")[0].split("/", 1))}) if window else None
         plane.want(ws, 0, picked).wait()
