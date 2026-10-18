@@ -160,7 +160,7 @@ fn price(sku: &str, q: &Quote) -> String {
 
 /// Follows the boot over Calcifer's machine events until the machine is ready, saying the Hub's
 /// phase as it changes. Ctrl-C stops watching only (`None`): the order goes on in Calcifer.
-async fn follow(
+pub(crate) async fn follow(
     ctx: &Context,
     booting: Machine,
     mut notices: Notices,

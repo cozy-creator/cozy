@@ -207,6 +207,75 @@ fn an_unversioned_install_takes_the_hubs_newest_release() {
     );
 }
 
+/// R's sequence (tensorhub 39107019882): `package update --on` right after `machine rent --detach`
+/// was refused while the rental booted. Each verb sent to a booting rental (the CI Hub's docker
+/// provider) now waits for it: update, list and remove say so and answer once it starts, and an
+/// install queues and lands.
+#[test]
+fn package_verbs_sent_to_a_booting_rental_wait_for_it() {
+    let Some(home) = Home::with_hub() else { return };
+    home.sign_in("booting@cozy.test");
+    let package = package::publish(&home, "tiny", "0.1.0");
+    let dir = package::project(&home, "tiny");
+    let rent = || {
+        let rented = json(&home, &dir, &["machine", "rent", "cpu", "--detach"]);
+        assert_eq!(rented["machine"]["state"], "booting", "{rented}");
+        rented["machine"]["rental_id"].as_str().unwrap().to_owned()
+    };
+    // Each verb on its own rental, sent the moment it is rented; all four boot at once.
+    let start = |verb: &[&str]| {
+        let rental = rent();
+        let child = home
+            .command()
+            .current_dir(&dir)
+            .args([verb, &["--on", &rental]].concat())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        (rental, child)
+    };
+    let started = [
+        start(&["package", "update"]),
+        start(&["package", "list", "--once"]),
+        start(&["package", "remove", &package]),
+        start(&["--json", "package", "install", &package]),
+    ];
+    let (rentals, outs): (Vec<String>, Vec<Out>) = started
+        .into_iter()
+        .map(|(rental, child)| (rental, common::out(child.wait_with_output().unwrap())))
+        .unzip();
+    let [update, list, remove, install] = &outs[..] else {
+        unreachable!()
+    };
+    for out in [update, list, remove] {
+        assert!(out.stderr.contains(" to start"), "it did not wait: {out:?}");
+    }
+    assert_eq!(update.code, 0, "{update:?}");
+    assert!(
+        update.stdout.contains("Model downloads: skipped"),
+        "{update:?}"
+    );
+    assert_eq!(list.code, 0, "{list:?}");
+    assert!(list.stdout.contains("No packages installed"), "{list:?}");
+    assert_eq!(remove.code, 1, "{remove:?}");
+    assert!(remove.stderr.contains("is not installed on"), "{remove:?}");
+    let last: Option<Value> =
+        (install.stdout.lines().rev()).find_map(|l| serde_json::from_str(l).ok());
+    assert_eq!(
+        (install.code, last.as_ref().and_then(|l| l["type"].as_str())),
+        (0, Some("run.completed")),
+        "{install:?}"
+    );
+    let listed = json(&home, &dir, &["package", "list", "--on", &rentals[3]]);
+    assert_eq!(listed["packages"][0]["release"], "0.1.0", "{listed}");
+
+    for rental in rentals {
+        let ended = json(&home, &dir, &["machine", "end", &rental]);
+        assert_eq!(ended["machine"]["state"], "ended", "{ended}");
+    }
+}
+
 /// A laptop names its local Hub where it listens, while machines read that Hub at its public
 /// origin and record their installations there (8819 recorded `https://cozy-e2e-6.ngrok.app:443`
 /// for the Hub this computer calls `http://127.0.0.1:8819`). The install is still the configured
