@@ -1,6 +1,7 @@
 //! `cozy update` installs only what it can prove: a release whose archive matches the sha256 its
-//! manifest names and carries an attestation of this repo's release workflow. Anything else is
-//! refused before the binary is touched. The happy path runs in release-smoke.yml on every OS.
+//! manifest names and carries an attestation of this repo's release workflow. Anything else, like a
+//! binary Homebrew owns, is refused before the binary is touched. The happy path runs in
+//! release-smoke.yml on every OS.
 mod common;
 
 use common::Home;
@@ -97,4 +98,28 @@ fn an_archive_without_its_own_attestation_is_refused() {
         return;
     };
     assert_eq!(refusal["code"], "unattested", "{refusal}");
+}
+
+/// A `cozy` in a Homebrew Cellar is brew's: `cozy update` names `brew upgrade cozy` and touches nothing.
+#[test]
+fn a_homebrew_install_is_left_to_brew() {
+    let Some(home) = Home::new() else {
+        return;
+    };
+    let bin = home
+        .path()
+        .join("homebrew/Cellar/cozy")
+        .join(VERSION)
+        .join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let cozy = bin.join(format!("cozy{}", std::env::consts::EXE_SUFFIX));
+    std::fs::copy(env!("CARGO_BIN_EXE_cozy"), &cozy).unwrap();
+    let before = std::fs::read(&cozy).unwrap();
+    home.use_binary(&cozy);
+    let out = home.cozy(["--json", "update"]);
+    assert_ne!(out.code, 0, "{out:?}");
+    let refusal = out.refusal();
+    assert_eq!(refusal["code"], "homebrew_install", "{refusal}");
+    assert_eq!(refusal["next"][0], "brew upgrade cozy", "{refusal}");
+    assert_eq!(std::fs::read(&cozy).unwrap(), before, "the binary changed");
 }

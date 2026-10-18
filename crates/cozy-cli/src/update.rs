@@ -216,14 +216,27 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// This binary's own file, through any link to it.
+/// This binary's own file, through any link to it. One in a Homebrew Cellar is brew's to replace.
 fn installed() -> Result<PathBuf, Error> {
     let exe = std::env::current_exe().map_err(|e| local("find this binary", e))?;
     // On Windows, canonicalize answers a `\\?\` path.
-    if cfg!(windows) {
-        return Ok(exe);
+    let exe = match cfg!(windows) {
+        true => exe,
+        false => exe
+            .canonicalize()
+            .map_err(|e| local("find this binary", e))?,
+    };
+    if exe.components().any(|c| c.as_os_str() == "Cellar") {
+        return Err(Error {
+            next: vec!["brew upgrade cozy".into()],
+            ..Error::new(
+                Kind::Conflict,
+                "homebrew_install",
+                format!("{} is Homebrew's to update", exe.display()),
+            )
+        });
     }
-    exe.canonicalize().map_err(|e| local("find this binary", e))
+    Ok(exe)
 }
 
 /// The release workflow run that signed `archive`, from the bundles the release carries beside it
