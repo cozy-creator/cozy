@@ -246,6 +246,7 @@ class Model:
     def rust(self, plane, window):
         """Checkpoint, register (its default regions) and want on the device: v2 weights read
         through the plane's register path."""
+        plane.set_vram_budget(0, torch.cuda.mem_get_info()[0] - (1 << 30))
         ws = plane.register_checkpoint(self.name, self.checkpoint())
         picked = sorted({p["region"] for p in ws.parts if self.in_window(*p["what"].split("#")[0].split("/", 1))}) if window else None
         plane.want(ws, 0, picked).wait()
@@ -284,6 +285,7 @@ class Model:
             regions = ws.regions
             moved = sum(regions[i]["nbytes"] for i in (picked if picked is not None else range(len(regions))))
             ws.close()
+            readers["plane"].set_vram_budget(0, 0)  # the plane's idle handles go back to the driver
         torch.cuda.empty_cache()
         return s, moved
 
@@ -365,7 +367,6 @@ def main(work, out_path, build_only=False, plane=None):
     resource.setrlimit(resource.RLIMIT_NOFILE, (hard if 0 <= hard < 1 << 20 else 1 << 20, hard))
     readers = {"T64": Reader(), "T64+fst": Engine(), "plane": varena.Plane(devices=[0], **(plane or {}))}
     env["plane"] = plane or {}
-    readers["plane"].set_vram_budget(0, torch.cuda.mem_get_info()[0] - (1 << 30))
     out = {"env": env, "models": {}}
     for name in LANES:
         model = Model(name, root, work)

@@ -1,4 +1,4 @@
-# Speed gate: cozytensors/2 against safetensors (xs-045 F1)
+# Speed gate: cozytensors/2 against safetensors (xs-045 F1, U8)
 
 Requirement: cozytensors must be at least as fast as safetensors. Measured disk → pinned host → GPU on a
 rented card, with real lane bytes, from first open to the last byte resident on the GPU.
@@ -6,38 +6,61 @@ rented card, with real lane bytes, from first open to the last byte resident on 
 ```
 cozy model download fidika/sdxl@1.0.0/int8 --on <machine>
 cozy model download fidika/qwen-image-2.1@0.1.0/int8 --on <machine>
-cozy run crates/tensorfs/gates/speed/speedgate.py --on <machine>
-cozy run show <run> --json > result.json && python pullmodel.py result.json
+python speedgate.py <work dir> <result.json>   # on the machine: torch, fastsafetensors 0.5.0, a tensorfs dev wheel
 ```
 
-## Layouts and readers
+`speedgate.py` writes each lane from the machine's v1 store into a TensorFS v2 store with the v2 writer (the real
+chunk layout) and into one safetensors file per component, then times four readers in interleaved
+repetitions:
 
-All layouts hold the same bytes in execution order, built on the machine from its v1 store.
+- `T64+rust`: `tensorfs.varena`, the plane's Rust chunk reader: checkpoint, `register_checkpoint`, want, wait.
+- `T64+fst`: the same chunk files through fastsafetensors' own C++ engine.
+- `T64`: F1's Python reader over the same chunk files (16 threads, 16 MiB requests).
+- `fastsafetensors`: fastsafetensors 0.5.0 over the safetensors files: the gate's reference.
 
-- `v1`: today's per-part objects, read in place.
-- `T16`, `T64`: the design §2 writer rule with 16 or 64 MiB packs. Its other constants are fixed: 16 MiB
-  standalone threshold, 64 MiB grid, 4 KiB alignment, block-closed packs. `T64-open` has no block closing.
-  `T32` is not built: block closing makes it T64 (SDXL identical, Qwen 8 of 544 chunks differ).
-- `contiguous`: the safetensors file below, read with our reader.
-- `st-cuda`, `st-cpu-cuda`: `safetensors.safe_open` 0.8, `device="cuda"`, or `"cpu"` then `.to("cuda")`. One file
-  per component, parts as U8 tensors in execution order (the best case for a window).
-- `fastsafetensors`: 0.5.0, nogds, one loader over every file.
+Cells: cold (`POSIX_FADV_DONTNEED` first) and warm (the second of two reads); full (the whole checkpoint) and
+window (SDXL `unet.up_blocks.1`, Qwen `transformer.transformer_blocks.30`).
 
-Readers:
+## U8: the Rust reader
 
-- Our reader (Python): 16 threads, 16 MiB O_DIRECT requests (buffered when warm), pinned slots, one H2D
-  copy per slot.
-- `+fst`: the same plan read by fastsafetensors' own C++ engine. It differs from `fastsafetensors` in layout
-  only.
+The plane reads a want's regions as 1 MiB pieces, 32 pinned slots across 16 reader threads, each piece one
+read (O_DIRECT where the page cache lacks it) and one copy, pieces of later regions in flight while earlier
+ones finish. Request size decides the cold rate: on an RTX 3090 pod (run 11532, full cold, median of 3,
+seconds):
 
-Cells:
+| requests (slots) | Qwen-Image int8 19.2 GB | SDXL int8 4.08 GB |
+|---|---:|---:|
+| 512 KiB (32) | 2.597 | 0.553 |
+| 1 MiB (32) | 2.596 | 0.553 |
+| 2 MiB (32) | 2.595 | 0.555 |
+| 4 MiB (32) | 2.881 | 0.603 |
+| 16 MiB (32) | 3.186 | 0.619 |
+| fastsafetensors' engine, same chunks (512 KiB blocks) | 2.618 | 0.546 |
 
-- cold: `POSIX_FADV_DONTNEED` on every file first;
-- warm: the second of two buffered reads;
-- full: the whole checkpoint resident;
-- window: SDXL `unet.up_blocks.1`, or Qwen `transformer.transformer_blocks.30`.
+At 16 MiB the plane equals the pod's raw O_DIRECT rate at that size (Python, 16 threads, no GPU: 2.779 /
+0.609 s, run 11522); smaller requests are the whole gap. fastsafetensors' nogds engine splits its 16 MiB
+bounce budget into 32 blocks of 512 KiB.
 
-## Results
+Run 11545, RTX PRO 4000 Blackwell (48 CPUs), the gate with `register_checkpoint` (ms, median (best) of 5):
+
+| SDXL int8 | full cold | full warm | window cold | window warm |
+|---|---:|---:|---:|---:|
+| T64+rust | 575 (565) | 587 (586) | 80 (79) | 79 (77) |
+| T64+fst | 567 (558) | 322 (315) | 53 (53) | 39 (38) |
+| T64 | 568 (567) | 228 (218) | 55 (54) | 40 (40) |
+| fastsafetensors | 661 (656) | 659 (655) | 131 (126) | 113 (98) |
+
+**Gate: pass on SDXL in every cell** against fastsafetensors (full cold +15%, warm +12%, window +63% / +44%).
+The Rust reader is within 1% of fastsafetensors' engine on the same chunks cold; warm and window it pays for
+reading whole regions (window 248 MB against the engine's 211) and copying resident chunks through the
+staging slots. The Qwen half of run 11545 did not run: the harness let the plane keep its released VRAM as
+idle handles, so the next reader's 18 GB allocation failed; the gate now returns them between readers.
+
+## F1 results
+
+F1's harness (in git history at `a1ae376df`) built the layouts itself: `v1` per-part objects, `T16`/`T64` packs
+by the design §2 rule (`T64-open` without block closing), `contiguous` (the safetensors file, read by the
+Python reader), `+fst` (fastsafetensors' engine on that layout), `st-cuda`/`st-cpu-cuda` (`safe_open`).
 
 Run 11100: RTX 4000 Ada (rtx-4000-ada, RunPod RO), local NVMe about 2.9 GB/s, PCIe 26 GB/s pinned. Times are
 ms, median (best) of 5 interleaved repetitions.
