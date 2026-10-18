@@ -41,20 +41,39 @@ At 16 MiB the plane equals the pod's raw O_DIRECT rate at that size (Python, 16 
 0.609 s, run 11522); smaller requests are the whole gap. fastsafetensors' nogds engine splits its 16 MiB
 bounce budget into 32 blocks of 512 KiB.
 
-Run 11545, RTX PRO 4000 Blackwell (48 CPUs), the gate with `register_checkpoint` (ms, median (best) of 5):
+Final gate, run 11566: NVIDIA L4 (ryuusui, 64 CPUs, 388 GB RAM). Times are ms, median (best) of 5 interleaved
+repetitions; the gate compares `T64+rust` with the best safetensors path in each cell.
 
-| SDXL int8 | full cold | full warm | window cold | window warm |
+SDXL int8, 4.08 GB, window 187 MB:
+
+| reader | full cold | full warm | window cold | window warm |
 |---|---:|---:|---:|---:|
-| T64+rust | 575 (565) | 587 (586) | 80 (79) | 79 (77) |
-| T64+fst | 567 (558) | 322 (315) | 53 (53) | 39 (38) |
-| T64 | 568 (567) | 228 (218) | 55 (54) | 40 (40) |
-| fastsafetensors | 661 (656) | 659 (655) | 131 (126) | 113 (98) |
+| **T64+rust** | **306** (303) | **344** (342) | **39** (37) | **35** (34) |
+| T64+fst | 321 (321) | 444 (433) | 28 (26) | 19 (17) |
+| T64 | 245 (244) | 326 (312) | 28 (27) | 19 (18) |
+| fastsafetensors | 392 (383) | 405 (401) | 104 (76) | 76 (74) |
+| st-cuda | 2012 (1939) | 872 (844) | 113 (100) | 46 (46) |
+| st-cpu-cuda | 996 (993) | 703 (671) | 86 (85) | 42 (41) |
+| gate | pass +28% | pass +18% | pass +119% | pass +18% |
 
-**Gate: pass on SDXL in every cell** against fastsafetensors (full cold +15%, warm +12%, window +63% / +44%).
-The Rust reader is within 1% of fastsafetensors' engine on the same chunks cold; warm and window it pays for
-reading whole regions (window 248 MB against the engine's 211) and copying resident chunks through the
-staging slots. The Qwen half of run 11545 did not run: the harness let the plane keep its released VRAM as
-idle handles, so the next reader's 18 GB allocation failed; the gate now returns them between readers.
+Qwen-Image int8, 19.2 GB, window 218 MB:
+
+| reader | full cold | full warm | window cold | window warm |
+|---|---:|---:|---:|---:|
+| **T64+rust** | **1384** (1364) | **1684** (1677) | **41** (40) | **41** (40) |
+| T64+fst | 1724 (1492) | 2175 (2143) | 29 (28) | 16 (15) |
+| T64 | 1155 (1144) | 1567 (1550) | 32 (31) | 26 (25) |
+| fastsafetensors | 1659 (1648) | 2019 (2013) | 426 (425) | 426 (422) |
+| st-cuda | 6675 (6326) | 3859 (3803) | 90 (89) | 42 (41) |
+| st-cpu-cuda | 6407 (4960) | 4680 (2829) | 90 (81) | 33 (33) |
+| gate | pass +20% | pass +20% | pass +118% | **fail -19%** |
+
+- Full cold and warm pass on both lanes against fastsafetensors (+18% to +28%).
+- The one failing cell is Qwen's warm window: the plane reads whole regions, 294 MB against the window's
+  218 MB, because `tensorfs.v2.regions` merges neighbouring chunks up to 64 MiB without block boundaries.
+  Regions cut at the Runtime's blocks read about the window's bytes (the engine reads 227 MB).
+- On this pod's storage the F1 Python reader (`T64`, 16 MiB requests) is the fastest full read; on the 3090
+  pod's NVMe 16 MiB requests were the slowest. Request size is a per-disk trade-off; 1 MiB holds up on both.
 
 ## F1 results
 
