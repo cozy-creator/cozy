@@ -24,6 +24,7 @@ from collections.abc import Iterator
 import numpy as np
 import torch
 from diffusers import StableDiffusionXLPipeline
+from huggingface_hub import hf_hub_download
 
 import tensorfs.v2 as tfs
 
@@ -53,6 +54,17 @@ def same_image(folder: pathlib.Path, reference: np.ndarray) -> None:
     diff = float(np.abs(image - reference).max())
     print(f"render {folder.name}: {image.shape}, max |diff| vs upstream {diff}")
     assert diff == 0.0, f"{folder}: the image differs from upstream's by {diff}"
+
+
+def same_files(folder: pathlib.Path) -> None:
+    """Every exported weights file is the repository's own, byte for byte: export lays a file out
+    as safetensors writes it, so its tensors sit where upstream's do (CPU kernels round
+    differently on differently aligned weights)."""
+    files = sorted(p for p in folder.rglob("*.safetensors"))
+    for p in files:
+        upstream = pathlib.Path(hf_hub_download(REPO, str(p.relative_to(folder))))
+        assert p.read_bytes() == upstream.read_bytes(), f"{p} differs from {REPO}'s"
+    print(f"export: {len(files)} weights files byte-identical to upstream")
 
 
 @contextlib.contextmanager
@@ -102,8 +114,10 @@ def main() -> None:
     imported = cli(a, "import", f"hf://{REPO}", "--name", NAME)
     assert imported["name"] == NAME and imported["release"] == "1", imported
     inspected = cli(a, "inspect", NAME)
-    assert set(inspected["components"]) == {"text_encoder", "text_encoder_2", "unet", "vae"}, inspected["components"].keys()
+    names = [c["name"] for c in inspected["components"]]  # header order (#624)
+    assert set(names) == {"text_encoder", "text_encoder_2", "unet", "vae"}, names
     cli(a, "export", NAME, str(work / "out"), "--safetensors")
+    same_files(work / "out")
     same_image(work / "out", reference)
     cli(a, "export", NAME, str(work / "origin"), "--origin")
     with serve(work / "origin") as url:

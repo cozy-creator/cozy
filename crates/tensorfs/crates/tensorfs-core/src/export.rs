@@ -8,6 +8,11 @@
 //!   at the root, which for `model` is a Transformers folder.
 //! - Files are sharded at [`SHARD`] bytes as `<weights>-00001-of-0000N.safetensors` beside the
 //!   standard `<weights>.safetensors.index.json`.
+//! - Each file is laid out as the safetensors library writes one: tensors by dtype (in its order,
+//!   descending), then by name; the header lists them in that order with fields `dtype`, `shape`,
+//!   `data_offsets`. A folder safetensors wrote is reproduced byte for byte, so its tensors sit at
+//!   the same offsets: CPU kernels round differently on differently aligned weights, and a render
+//!   from the export must equal upstream's exactly. Construction order stays in the checkpoint.
 //! - An encoded tensor `x.weight` keeps its parts: `x.weight` (the `weight` part),
 //!   `x.weight_scale`, `x.weight_scale_2`, `x.input_scale`, and `__metadata__`'s
 //!   `cozytensors.encodings` names each one's scheme and params. With `dequantize`, it is decoded
@@ -88,7 +93,6 @@ pub fn safetensors(ck: &Checkpoint, dir: &Path, dequantize: Option<&Dtype>) -> R
         } else {
             (String::new(), component.clone())
         };
-        // Header (construction) order, which is also the order of the files' data.
         let mut entries = Vec::new();
         let mut encodings = Map::new();
         for t in &c.tensors {
@@ -149,6 +153,8 @@ pub fn safetensors(ck: &Checkpoint, dir: &Path, dequantize: Option<&Dtype>) -> R
                 ),
             );
         }
+        // The safetensors writer's own order (its `prepare`): dtype descending, then name.
+        entries.sort_by(|a, b| b.dtype.cmp(&a.dtype).then_with(|| a.name.cmp(&b.name)));
         let mut seen = std::collections::HashSet::new();
         if let Some(e) = entries.iter().find(|e| !seen.insert(e.name.as_str())) {
             return fail(
@@ -233,16 +239,26 @@ fn write_file(
     metadata: &Map<String, Json>,
     dest: &Path,
 ) -> Result<()> {
-    let mut header = Map::from_iter([("__metadata__".to_owned(), Json::Object(metadata.clone()))]);
+    // As safetensors serializes its header: `__metadata__`, then each tensor in data order as
+    // `{"dtype","shape","data_offsets"}`, padded with spaces to a multiple of 8.
+    let string = |s: &str| serde_json::to_string(s).expect("a string serializes");
+    let mut text = format!(
+        "{{\"__metadata__\":{}",
+        serde_json::to_string(metadata).expect("JSON")
+    );
     let mut offset = 0;
     for e in entries {
-        header.insert(
-            e.name.clone(),
-            json!({"dtype": e.dtype.name(), "shape": e.shape, "data_offsets": [offset, offset + e.length]}),
+        let shape = serde_json::to_string(&e.shape).expect("JSON");
+        let end = offset + e.length;
+        text += &format!(
+            ",{}:{{\"dtype\":{},\"shape\":{shape},\"data_offsets\":[{offset},{end}]}}",
+            string(&e.name),
+            string(e.dtype.name())
         );
-        offset += e.length;
+        offset = end;
     }
-    let mut text = serde_json::to_vec(&header).expect("JSON");
+    text.push('}');
+    let mut text = text.into_bytes();
     text.resize(text.len().next_multiple_of(8), b' ');
     let parent = dest.parent().expect("a file has a directory");
     fs::create_dir_all(parent).map_err(|e| io(parent, e))?;
