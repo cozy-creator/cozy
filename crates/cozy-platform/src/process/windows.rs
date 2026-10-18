@@ -169,7 +169,7 @@ pub(super) fn kill_group(group: &Group, _: &Child) -> io::Result<()> {
 }
 
 /// The tree's job ends every member when its last handle closes, the spawner's death included.
-fn job() -> io::Result<OwnedHandle> {
+pub(crate) fn job() -> io::Result<OwnedHandle> {
     // SAFETY: default security, unnamed.
     let job = owned(unsafe { CreateJobObjectW(ptr::null(), ptr::null()) })?;
     let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
@@ -444,6 +444,29 @@ pub(super) fn peak_resident() -> io::Result<u64> {
         return Err(io::Error::last_os_error());
     }
     Ok(counters.PeakWorkingSetSize as u64)
+}
+
+/// Marks `handle` inheritable: std hands a child every inheritable handle.
+pub(super) fn hand_on(handle: &impl AsRawHandle) -> io::Result<u64> {
+    // SAFETY: a live handle the caller owns.
+    if unsafe { SetHandleInformation(handle.as_raw_handle(), HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(handle.as_raw_handle() as usize as u64)
+}
+
+/// Takes a handle this process inherited, no longer inheritable: it goes no further.
+///
+/// # Safety
+/// `value` must name a handle this process inherited and nothing else owns.
+pub(super) unsafe fn handed(value: u64) -> io::Result<OwnedHandle> {
+    // SAFETY: the caller's promise.
+    let handle = unsafe { OwnedHandle::from_raw_handle(value as usize as _) };
+    // SAFETY: a live handle this process owns.
+    if unsafe { SetHandleInformation(handle.as_raw_handle(), HANDLE_FLAG_INHERIT, 0) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(handle)
 }
 
 pub(super) fn parent_of(pid: u32) -> io::Result<u32> {

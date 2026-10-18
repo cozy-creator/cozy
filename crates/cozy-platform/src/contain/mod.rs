@@ -1,13 +1,15 @@
 //! An executor's containment and the host's memory, moved from TensorD (`scope.rs`,
-//! `host_memory.rs`, `host_pressure.rs`). Linux only so far: elsewhere a scope and a pressure
-//! trigger answer `Unsupported`, and host memory reads as unreadable (-1).
+//! `host_memory.rs`, `host_pressure.rs`). A scope is a cgroup or token on Linux and a Job Object
+//! on Windows; elsewhere a scope and a pressure trigger answer `Unsupported`, and host memory
+//! reads as unreadable (-1).
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
 pub mod host_memory;
 pub mod host_pressure;
 #[cfg_attr(target_os = "linux", path = "scope.rs")]
-#[cfg_attr(not(target_os = "linux"), path = "scope_unsupported.rs")]
+#[cfg_attr(windows, path = "scope_windows.rs")]
+#[cfg_attr(not(any(target_os = "linux", windows)), path = "scope_unsupported.rs")]
 mod scope;
 
 pub use scope::Scope;

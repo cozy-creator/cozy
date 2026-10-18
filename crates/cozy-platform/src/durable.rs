@@ -83,6 +83,23 @@ pub fn sync_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// A handle on the directory `path`, held to keep naming it (Linux reaches a directory through its
+/// descriptor). Windows opens a directory only with backup semantics.
+pub fn open_dir(path: &Path) -> Result<File> {
+    #[cfg(unix)]
+    let opened = File::open(path);
+    #[cfg(windows)]
+    let opened = {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+    };
+    opened.map_err(Error::io("open directory", path))
+}
+
 /// Creates `path` (and its parents) and makes it private to this user: 0700 on Unix; on Windows
 /// the profile's ACL already is.
 pub fn private_dir(path: &Path) -> Result<()> {
@@ -384,6 +401,25 @@ pub fn links(path: &Path) -> Result<u64> {
         }
         Ok(info.nNumberOfLinks as u64)
     }
+}
+
+/// Sets a file's or a directory's times through a handle opened only for that: Windows sets
+/// them only through attribute-write access, which Unix never needs (a 0444 file's owner can).
+pub fn set_times(path: &Path, times: fs::FileTimes) -> Result<()> {
+    #[cfg(unix)]
+    let file = File::open(path)?;
+    #[cfg(windows)]
+    let file = {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_WRITE_ATTRIBUTES,
+        };
+        OpenOptions::new()
+            .access_mode(FILE_WRITE_ATTRIBUTES)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)?
+    };
+    Ok(file.set_times(times)?)
 }
 
 /// When `path` itself last changed status: a link, an unlink, its mode or its bytes. Unix
