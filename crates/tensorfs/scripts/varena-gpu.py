@@ -168,6 +168,7 @@ def test_oom(gpu, ck, rs, stream, facts):
     torch.cuda.synchronize()
     gpu.trim()
     resident = next(s for s in gpu.stats().sets if s.name == "oom").resident
+    torch.cuda.empty_cache()  # torch's cached blocks would otherwise satisfy the retry
     free = gpu.stats().driver_free
     ballast = torch.empty(free - 256 * MiB, dtype=torch.uint8, device="cuda")
     need = 256 * MiB + resident // 2
