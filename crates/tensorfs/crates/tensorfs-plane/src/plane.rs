@@ -2073,40 +2073,81 @@ impl Lease {
     }
 
     /// Record the release event on `stream`. The bytes (resident or in the ring) are reusable once the
-    /// device passes it; the span from acquire to here is the region's GPU-timed use.
+    /// device passes it; the span from acquire to here is the region's GPU-timed use. Fails only
+    /// on a second release: a driver failure never leaves the lease counted. Without an event
+    /// the stream is synchronized instead (`release_synced`); when that fails too the bytes are
+    /// never reused (`release_unconfirmed`): a resident region turns Invalid (evictable, refilled
+    /// on its next acquire), a ring slot stays held until the cursor closes.
     pub fn release(&self, stream: u64) -> Result<()> {
         if self.released.swap(true, Ordering::SeqCst) {
             return Err(Error::Invalid("lease released twice".into()));
         }
         let rt = &self.inner.devices[self.dev];
-        let _g = rt.bind()?;
-        let ev = rt.events.get(true)?;
-        ev.record(stream as CUstream)?;
+        let s = stream as CUstream;
+        let g = rt.bind();
+        let recorded = g.as_ref().map_err(Error::clone).and_then(|_| {
+            crate::faults::hit("release-event")?;
+            let ev = rt.events.get(true)?;
+            ev.record(s)?;
+            Ok(ev)
+        });
+        // As a ring slot's `freed`: Some(Some(ev)) after ev, Some(None) at once, None never.
+        let (freed, report) = match recorded {
+            Ok(ev) => (Some(Some(ev)), None),
+            Err(e) => {
+                let synced = crate::faults::hit("release-sync").and_then(|_| {
+                    let d = cuda::driver()?;
+                    // SAFETY: the consumer's stream, in its bound context.
+                    cuda::check("cuStreamSynchronize", unsafe { (d.stream_synchronize)(s) })
+                });
+                match synced {
+                    Ok(()) => (Some(None), Some(("release_synced", e.to_string()))),
+                    Err(e2) => (None, Some(("release_unconfirmed", format!("{e}; {e2}")))),
+                }
+            }
+        };
+        drop(g);
         let start = self.start.lock().unwrap().take();
         let mut c = self.inner.core.lock().unwrap();
         resolve_timings(&mut c, false);
-        if let Some(a) = start {
+        if let (Some(a), Some(Some(b))) = (start, &freed) {
             c.timings.push_back(Timing {
                 dev: self.dev,
                 ws: self.ws.0,
                 kind: TimingKind::Compute { tag: self.tag.clone(), region: self.region },
                 a,
-                b: ev.clone(),
+                b: b.clone(),
                 bytes: self.nbytes,
             });
         }
+        let mut events = Vec::from_iter(report);
         match self.kind {
             LeaseKind::Home => {
-                let w = c.ws_mut(self.ws)?;
-                let gone = || Error::Closed(format!("weight set {:?} left device slot {}", w.name, self.dev));
-                let reg = &mut w.devs[self.dev].as_mut().ok_or_else(gone)?.regs[self.region as usize];
-                reg.live -= 1;
-                prune(&mut reg.pending);
-                reg.pending.push(ev);
-                Ok(())
+                // Always there: a live lease keeps its weight set open and on the device.
+                if let Some(dw) = c.ws_mut(self.ws).ok().and_then(|w| w.devs[self.dev].as_mut()) {
+                    let reg = &mut dw.regs[self.region as usize];
+                    reg.live -= 1;
+                    match freed {
+                        Some(Some(ev)) => {
+                            prune(&mut reg.pending);
+                            reg.pending.push(ev);
+                        }
+                        Some(None) => {}
+                        None => reg.state = DState::Invalid(Error::Invalid("a release the device could not confirm".into())),
+                    }
+                }
             }
-            LeaseKind::Ring { cursor, k } => crate::cursor::release_ring(&self.inner, &mut c, cursor, k, ev),
+            LeaseKind::Ring { cursor, k } => {
+                if let Err(e) = crate::cursor::release_ring(&self.inner, &mut c, cursor, k, freed) {
+                    events.push(("prefetch_failed", e.to_string()));
+                }
+            }
         }
+        let name = c.names.get(self.ws.0 as usize).cloned();
+        for (kind, detail) in events {
+            c.event(Event::new(kind, name.clone(), Some(self.region), Some(rt.ordinal), self.nbytes, 0, detail));
+        }
+        Ok(())
     }
 
     /// Diagnostic: compare this lease's device bytes with the source, part by part, and return

@@ -873,6 +873,76 @@ mod copy_faults {
         healthy();
         unsafe { libc::close(kept) };
     }
+
+    /// A release whose event the driver refuses (cuEventCreate on a card with a few MB free)
+    /// synchronizes its stream instead; when that fails too, its bytes are never served again
+    /// as they are. Either way the lease leaves the books and the plane stays healthy.
+    #[test]
+    #[ignore = "GPU"]
+    fn a_release_without_its_event_still_ends_the_lease() {
+        let fx = Fixture::new("gpu-release");
+        let p = plane();
+        let ws = fx.register(&p, None);
+        let s = Stream::new();
+        p.set_vram_budget(DEV, 1 << 30).unwrap();
+        let kinds = |p: &Plane| p.events().into_iter().map(|e| e.kind).filter(|k| k.starts_with("release")).collect::<Vec<_>>();
+        let leased = |p: &Plane| p.stats().devices[0].leased_bytes;
+        let misses = |p: &Plane| p.stats().devices[0].counters.misses;
+
+        // Resident, synced: the consumer's stalled read is complete when release returns.
+        let l = p.acquire(ws, DEV, 1, s.raw(), None).unwrap();
+        s.stall(200);
+        let read = s.read_async(l.ptr, l.nbytes);
+        faults::arm("release-event", 1);
+        l.release(s.raw()).unwrap();
+        check_region(&p, ws, 1, read.bytes());
+        assert_eq!(kinds(&p), ["release_synced"]);
+        assert_eq!(leased(&p), 0);
+        assert!(p.drop_regions(ws, Tier::Device(DEV), Some(&[1])).unwrap() > 0, "evictable");
+        assert!(matches!(l.release(s.raw()), Err(Error::Invalid(_))), "released twice");
+
+        // Streamed, synced: the slot is free at once and the ring keeps cycling.
+        let cur = p.stream(ws, DEV, &[0, 1, 2], 2, 2, 0, "ring", None).unwrap();
+        for (i, r) in [0u32, 1, 2, 0, 1, 2].into_iter().enumerate() {
+            let l = cur.acquire(r, s.raw()).unwrap();
+            check_region(&p, ws, r, &s.read(l.ptr, l.nbytes));
+            if i == 1 {
+                faults::arm("release-event", 1);
+            }
+            l.release(s.raw()).unwrap();
+        }
+        assert_eq!(kinds(&p), ["release_synced"]);
+        cur.close().unwrap();
+
+        // Resident, unconfirmed: the next acquire refills it (a miss); it stays evictable.
+        let unconfirmed = |l: Lease| {
+            faults::arm("release-event", 1);
+            faults::arm("release-sync", 1);
+            l.release(s.raw()).unwrap();
+        };
+        unconfirmed(p.acquire(ws, DEV, 1, s.raw(), None).unwrap());
+        assert_eq!(kinds(&p), ["release_unconfirmed"]);
+        assert_eq!(leased(&p), 0);
+        let before = misses(&p);
+        resident(&p, ws, &s, 1).release(s.raw()).unwrap();
+        assert_eq!(misses(&p), before + 1, "an unconfirmed region is refilled, not served");
+        unconfirmed(p.acquire(ws, DEV, 1, s.raw(), None).unwrap());
+        assert!(p.drop_regions(ws, Tier::Device(DEV), Some(&[1])).unwrap() > 0, "evictable");
+
+        // Streamed, unconfirmed: the slot stays held (a 4 MiB ring has no room for the next
+        // region), and the cursor still closes.
+        let cur = p.stream(ws, DEV, &[0, 2], 1, 1, 0, "held", None).unwrap();
+        unconfirmed(cur.acquire(0, s.raw()).unwrap());
+        assert!(matches!(cur.acquire(2, s.raw()), Err(Error::Invalid(_))), "the held slot was reused");
+        cur.close().unwrap();
+        assert_eq!(kinds(&p), ["release_unconfirmed", "release_unconfirmed"]);
+
+        s.sync();
+        assert_eq!(p.stats().devices[0].leased_bytes, 0);
+        assert!(p.stats().poisoned.is_none());
+        p.close().unwrap();
+        healthy();
+    }
 }
 
 #[test]
