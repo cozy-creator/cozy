@@ -29,6 +29,7 @@ use serde_json::{json, Map, Value as Json};
 use crate::failure::{fail, Kind, Result};
 use crate::format::layout::{ALIGN, GRID, STANDALONE};
 use crate::format::{Body, Dtype, Encoding, Location, ObjectRef, Value, HEADER_PATH};
+use crate::import::order::{self, constructor_order};
 use crate::import::tables;
 use crate::sha256::hex_digest;
 use crate::store2::Store;
@@ -175,7 +176,9 @@ fn migrate(
         }
     }
     r.doc.insert("encodings".into(), json!(encodings));
-    r.doc.insert("order".into(), order(&h));
+    let mut names = Names::of(&h);
+    let (order_doc, expected) = ordering(&h, &names);
+    r.doc.insert("order".into(), order_doc);
     r.doc.insert("schemes".into(), json!(schemes));
     if !dropped.is_empty() {
         r.doc.insert("dropped_schemes".into(), json!(dropped));
@@ -198,7 +201,6 @@ fn migrate(
         return Ok(false);
     }
 
-    let mut names = Names::of(&h);
     let files = files(&m, &h, &mut names)?;
     if let Some(doc) = names.report() {
         r.doc.insert("renames".into(), doc);
@@ -219,18 +221,20 @@ fn migrate(
     };
     let key = format!("migrate-{}", lane.manifest.sha256);
     let mut w = store.writer(None, Some(&key))?;
-    let kept: Vec<(&String, &v1::Tensor, String, String)> = all()
-        .filter(|(c, t)| !names.dropped.contains(&((*c).clone(), t.key.clone())))
-        .map(|(c, t)| (c, t, names.component(c), names.key(c, &t.key)))
+    let kept: Vec<(&v1::Tensor, String, String)> = (expected.iter())
+        .map(|(c, i)| {
+            let (component, tensors) = &h.components[*c];
+            let t = &tensors[*i];
+            (t, names.component(component), names.key(component, &t.key))
+        })
         .collect();
-    // v1's tensor order is the execution order.
     let order: Vec<(&str, &str)> = kept
         .iter()
-        .map(|(.., c2, k2)| (c2.as_str(), k2.as_str()))
+        .map(|(_, c2, k2)| (c2.as_str(), k2.as_str()))
         .collect();
     w.set_order(&order);
     let mut digests = HashMap::new();
-    for (_, t, c2, k2) in &kept {
+    for (t, c2, k2) in &kept {
         if !w.has(c2, k2) {
             put(&mut w, src, c2, k2, t, mappings[t.spec].1, &mut digests)?;
         }
@@ -282,7 +286,7 @@ fn migrate(
         ("reused".into(), count(&reused)),
     ]);
     let verified = verify(
-        src, store, &manifest, &h, &names, &mappings, &digests, &files,
+        src, store, &manifest, &h, &names, &mappings, &digests, &files, &order,
     );
     if dry_run {
         store.unpin(&key)?;
@@ -292,26 +296,103 @@ fn migrate(
     Ok(true)
 }
 
-/// How v1 ordered each component's tensors. A sort leaves almost no lexical descents (one per
-/// shard it was read from) and puts `.bias` before `.weight`; construction order has many and puts
-/// `.weight` first. `sorted` components take a constructor-order reference; `constructor` keep v1's.
-fn order(h: &v1::Header) -> Json {
+/// The order v2 writes, as `(component, tensor)` indices into the v1 header, and its report.
+/// Components keep v1's order. Within one, v1's tensor order stands when v1 built it; when v1
+/// sorted it (`order_class`), the component's class gives its construction order
+/// ([`constructor_order`]), keys it does not know keeping v1's order. Renamed keys keep their
+/// place; dropped ones leave.
+fn ordering(h: &v1::Header, names: &Names) -> (Json, Vec<(usize, usize)>) {
     let mut components = Map::new();
-    let mut classes = BTreeSet::new();
-    for (name, tensors) in &h.components {
-        let keys: Vec<&str> = tensors.iter().map(|t| t.key.as_str()).collect();
-        let (class, why) = order_class(&keys);
+    let (mut classes, mut out) = (BTreeSet::new(), Vec::new());
+    for (c, (name, tensors)) in h.components.iter().enumerate() {
+        let kept: Vec<usize> = (0..tensors.len())
+            .filter(|i| {
+                !names
+                    .dropped
+                    .contains(&(name.clone(), tensors[*i].key.clone()))
+            })
+            .collect();
+        let v1_keys: Vec<&str> = tensors.iter().map(|t| t.key.as_str()).collect();
+        let (class, evidence) = order_class(&v1_keys);
         if class != "unknown" {
             classes.insert(class);
         }
-        components.insert(name.clone(), json!({"class": class, "evidence": why}));
+        let mut doc = json!({"class": class, "evidence": evidence});
+        let mut order = kept.clone();
+        if class == "sorted" {
+            let keys: Vec<String> = kept
+                .iter()
+                .map(|i| names.key(name, &tensors[*i].key))
+                .collect();
+            let indexed: Vec<(&str, usize)> = keys.iter().map(String::as_str).zip(0..).collect();
+            // An adapter's keys end in factors its class lacks: count its modules instead.
+            let (model, unknown) = match model_class(h, name) {
+                Some(model) => (Some(model), None),
+                None => probed_class(&keys).map_or((None, None), |(c, n)| (Some(c), Some(n))),
+            };
+            let ordered = constructor_order(model.as_deref(), &indexed);
+            order = ordered.order.iter().map(|i| kept[*i]).collect();
+            doc["reference"] = json!(model);
+            doc["unreferenced"] = unknown.unwrap_or(ordered.unknown.len()).into();
+            doc["head"] = json!(ordered
+                .order
+                .iter()
+                .take(4)
+                .map(|i| &keys[*i])
+                .collect::<Vec<_>>());
+        }
+        out.extend(order.into_iter().map(|i| (c, i)));
+        components.insert(name.clone(), doc);
     }
     let class = match classes.len() {
         0 => "unknown",
         1 => classes.first().copied().unwrap_or("unknown"),
         _ => "mixed",
     };
-    json!({"class": class, "components": components})
+    (json!({"class": class, "components": components}), out)
+}
+
+/// A component's model class, from v1's inline configs: its own, its entry in a `model` config
+/// holding every component's, or a single component's `model` config.
+fn model_class(h: &v1::Header, component: &str) -> Option<String> {
+    let config = |name: &str| {
+        let bytes = &h.configs.iter().find(|c| c.0 == name)?.1;
+        serde_json::from_slice::<Json>(bytes).ok()
+    };
+    let class = |doc: &Json| {
+        let name = doc
+            .get("_class_name")
+            .or_else(|| doc.get("architectures")?.get(0));
+        name.and_then(Json::as_str).map(str::to_owned)
+    };
+    if let Some(doc) = config(component) {
+        return class(&doc);
+    }
+    let model = config("model")?;
+    class(&model[component]).or_else(|| (h.components.len() == 1).then(|| class(&model))?)
+}
+
+/// LoRA factors (and their PEFT adapter name) under a module of the class they adapt.
+const FACTORS: [&str; 5] = ["lora_A", "lora_B", "lora_down", "lora_up", "alpha"];
+
+/// The class whose construction order holds the modules of `keys` (an adapter carries no
+/// config): the one that knows all but under a tenth of them, as `<module>.weight`, and how
+/// many it does not know.
+fn probed_class(keys: &[String]) -> Option<(String, usize)> {
+    let probes: Vec<String> = (keys.iter())
+        .map(|k| {
+            let segments: Vec<&str> = k.split('.').collect();
+            match segments.iter().position(|s| FACTORS.contains(s)) {
+                Some(i) => format!("{}.weight", segments[..i].join(".")),
+                None => k.clone(),
+            }
+        })
+        .collect();
+    let indexed: Vec<(&str, usize)> = probes.iter().map(String::as_str).zip(0..).collect();
+    let (best, unknown) = order::classes()
+        .map(|c| (c, constructor_order(Some(c), &indexed).unknown.len()))
+        .min_by_key(|(_, unknown)| *unknown)?;
+    (unknown * 10 < keys.len()).then(|| (best.to_owned(), unknown))
 }
 
 fn order_class(keys: &[&str]) -> (&'static str, String) {
@@ -538,8 +619,11 @@ fn encoding(scheme: &str) -> Encoding {
     }
 }
 
-/// Each v1 part's v2 role, dtype and shape, in v1 order. nvfp4's weight is U8 `[R, C/2]` in v1
-/// and F4 `[R, C]` in v2: the same bytes.
+/// Owner question (d): a packed nvfp4 weight as dtype `F4 [R, C]`. Until the F4 dtype is
+/// approved it stays v1's `U8 [R, C/2]` (the #624 form); the bytes are the same either way.
+const NVFP4_AS_F4: bool = false;
+
+/// Each v1 part's v2 role, dtype and shape, in v1 order.
 fn v2_parts(t: &v1::Tensor, mapping: &Mapping) -> Result<Vec<(String, Dtype, Vec<u64>)>> {
     let what = &t.key;
     match mapping {
@@ -561,7 +645,11 @@ fn v2_parts(t: &v1::Tensor, mapping: &Mapping) -> Result<Vec<(String, Dtype, Vec
                     ("nvfp4", "weight", [rows, cols])
                         if p.dtype == Dtype::U8 && p.shape == [*rows, cols / 2] =>
                     {
-                        Ok((role.to_string(), Dtype::F4, vec![*rows, *cols]))
+                        let (dtype, shape) = match NVFP4_AS_F4 {
+                            true => (Dtype::F4, vec![*rows, *cols]),
+                            false => (Dtype::U8, p.shape.clone()),
+                        };
+                        Ok((role.to_string(), dtype, shape))
                     }
                     ("nvfp4", "weight", _) => {
                         fail(Kind::Invalid, format!("{what}: nvfp4 weight {:?}", p.shape))
@@ -618,7 +706,10 @@ fn conforms(
             want("scale", &[F32], &|s| numel(s) == rows)
         }
         "nvfp4" if cols % 16 == 0 => {
-            want("weight", &[F4], &|s| s == [rows, cols])?;
+            match NVFP4_AS_F4 {
+                true => want("weight", &[F4], &|s| s == [rows, cols])?,
+                false => want("weight", &[U8], &|s| s == [rows, cols / 2])?,
+            }
             want("scale", &[F8_E4M3], &|s| s == [rows, cols / 16])?;
             want("scale_2", &[F32], &|s| numel(s) == 1)?;
             optional("input_scale")
@@ -774,11 +865,11 @@ fn verify(
     mappings: &[(String, &Mapping)],
     digests: &Digests,
     files: &BTreeMap<String, File>,
+    expected: &[(&str, &str)],
 ) -> Result<Json> {
     let ck = store.checkpoint(manifest)?;
     let header = ck.header();
     let (mut tensors, mut reused, mut packed, mut packed_bytes) = (0usize, 0u64, 0u64, 0u64);
-    let mut order: Vec<(String, String)> = Vec::new();
     let mut misordered_parts = None;
     for (component, ts) in &h.components {
         for t in ts {
@@ -798,7 +889,7 @@ fn verify(
                     if *e == encoding(s) && parts.len() == t.parts.len() =>
                 {
                     (parts.iter())
-                        .map(|(role, p)| (role.as_str(), &p.dtype, p.shape.as_slice(), p.at()))
+                        .map(|p| (p.role.as_str(), &p.dtype, p.shape.as_slice(), p.at()))
                         .collect()
                 }
                 _ => return integrity(format!("{what}: its v2 body or scheme differs")),
@@ -849,7 +940,6 @@ fn verify(
                 }
             }
             tensors += 1;
-            order.push((c2, k2));
         }
     }
     if ck.tensors().count() != tensors {
@@ -858,12 +948,12 @@ fn verify(
             ck.tensors().count()
         ));
     }
-    // Order is data: v2 lists components, tensors and parts in v1's order.
-    let stored = ck.tensors().map(|(c, k, _)| (c.to_owned(), k.to_owned()));
-    if let Some((i, (v2, v1))) = stored.zip(&order).enumerate().find(|(_, (a, b))| a != *b) {
+    // Order is data: v2 lists tensors in the expected order and parts in v1's.
+    let stored = ck.tensors().map(|(c, t)| (c, t.key.as_str()));
+    if let Some((i, (v2, want))) = stored.zip(expected).enumerate().find(|(_, (a, b))| a != *b) {
         return integrity(format!(
-            "order: tensor {i} is {}/{} in v2, {}/{} in v1",
-            v2.0, v2.1, v1.0, v1.1
+            "order: tensor {i} is {}/{} in v2, {}/{} expected",
+            v2.0, v2.1, want.0, want.1
         ));
     }
     if let Some(what) = misordered_parts {

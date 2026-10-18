@@ -800,7 +800,7 @@ fn encoded(w: &mut Writer, component: &str, key: &str, roles: &[&str]) {
             role: role.to_string(),
             dtype: Dtype::U8,
             shape: vec![4],
-            data,
+            data: Source::Read(data),
         })
         .collect();
     let encoding = Encoding {
@@ -935,7 +935,7 @@ fn real_v1_lanes_keep_their_order() {
                         role: role.to_string(),
                         dtype: stand_in.clone(),
                         shape: vec![],
-                        data,
+                        data: Source::Read(data),
                     })
                     .collect();
                 let encoding = Encoding {
