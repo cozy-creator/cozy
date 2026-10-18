@@ -81,12 +81,13 @@ impl Tensord {
         let binary = std::env::var_os("COZY_TEST_TENSORD")
             .expect("COZY_TEST_TENSORD names the tensord binary these tests run against");
         let mut child = Command::new(binary)
-            .arg("run")
+            .args(["run", "--persistent"])
             .env_remove("COZY_TEST_TENSORD")
+            // A home of its own: this computer's keys and config are not the test machine's.
+            .env("HOME", self.root.path())
             .env("COZY_MACHINE_ROOT", &root)
             .env("COZY_LISTEN_HOST", "127.0.0.1")
             .env("COZY_WORKER_ID", "cli-test")
-            .env("COZY_MACHINE_LIFETIME", "persistent")
             .env("COZY_WORKER_INTERNAL_PORT", port.to_string())
             .env("COZY_AUTHORIZED_KEYS", keys.join(","))
             .env("COZY_BOOTSTRAP_RECEIPT_HMAC_KEY_FILE", &key_file)
