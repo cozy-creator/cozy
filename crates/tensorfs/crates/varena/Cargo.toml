@@ -3,7 +3,7 @@ name = "varena"
 version = "0.11.0"
 edition = "2021"
 publish.workspace = true
-description = "The TensorFS weight plane: pinned host tier, per-GPU VMM arenas, copy streams, streaming cursors. Mechanism only."
+description = "The memory of the process computing with model weights: GPU pages, slots and pins; the sealed host tier."
 
 [dependencies]
 cozy-platform.workspace = true
@@ -15,9 +15,9 @@ thiserror.workspace = true
 tracing.workspace = true
 
 [features]
-# Store-backed sources (fills from a TensorFS store). Without it: sealed layouts only (a
-# plane-only executor adopts what its machine filled and links no store code).
+# Store-backed sources (checkpoints and fills from a TensorFS store). Without it: sealed host
+# layouts only.
 default = ["store"]
 store = ["tensorfs-core/store"]
-# Test-only fault points on the copy path (tests/gpu.rs drives them).
+# Test-only fault points on the host tier.
 faults = []
