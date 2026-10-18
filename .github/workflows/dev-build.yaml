@@ -118,7 +118,9 @@ jobs:
             sh -c 'curl -sSf https://sh.rustup.rs | sh -s -- -y -q --profile minimal --default-toolchain 1.99.1 >&2 && PATH=/tmp/.cargo/bin:$PATH CARGO_HOME=/cargo cargo build --release --locked --offline --target-dir /target -p cozy --bin cozy'
           rm -rf "$target/rustup" && git checkout -- Cargo.toml Cargo.lock
           install -m 0755 "$target/release/cozy" "dist/cozy/cozy-linux-$arch"
-          (cd dist/cozy && sha256sum "cozy-linux-$arch" > "cozy-linux-$arch.sha256" && "./cozy-linux-$arch" --version)
+          (cd dist/cozy && sha256sum "cozy-linux-$arch" > "cozy-linux-$arch.sha256")
+          said=$("dist/cozy/cozy-linux-$arch" --version)
+          case $said in *"+dev.g${sha:0:8}") echo "$said" ;; *) echo "::error::the dev cozy says $said"; exit 1 ;; esac
           echo "COZY_TEST_DEV_BINARY=$PWD/dist/cozy/cozy-linux-$arch" >> "$GITHUB_ENV"
       - if: contains(inputs.build, 'cozy')
         uses: actions/upload-artifact@v4

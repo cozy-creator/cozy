@@ -45,6 +45,23 @@ fn tensord(home: &Home, binary: &Path) -> (Out, Value) {
     (out, last)
 }
 
+/// A build of this checkout that the machines here run (`COZY_TEST_DEV_BINARY`): dev-build's
+/// `build=cozy` (`<version>+dev.g<sha8>`), or the worker image's own cozy in Tensorhub's live job.
+fn dev_binary() -> (PathBuf, String) {
+    let provides =
+        "a cozy the machines here run (dev-build build=cozy, tensorhub cozy_worker=branch)";
+    let dev = PathBuf::from(common::needs("COZY_TEST_DEV_BINARY", provides).unwrap());
+    let said = Command::new(&dev).arg("--version").output().unwrap().stdout;
+    let said = String::from_utf8(said).unwrap();
+    let version = said.trim().strip_prefix("cozy ").unwrap_or_default();
+    assert!(
+        !version.is_empty(),
+        "{} --version said {said:?}",
+        dev.display()
+    );
+    (dev, version.to_owned())
+}
+
 /// `machine show local`, once its status says `done`: Calcifer hears a restarted machine when
 /// its link reconnects.
 fn shown(home: &Home, done: impl Fn(&Value) -> bool) -> Value {
@@ -57,25 +74,14 @@ fn shown(home: &Home, done: impl Fn(&Value) -> bool) -> Value {
     }
 }
 
-/// The dev build (dev-build `build=cozy`: `<version>+dev.g<sha8>`) replaces the machine's binary.
-/// The machine restarts on it and reports its version and commit as dev; the release it replaced
-/// is kept beside it as `.cozy-release`; this computer's cozy is the dev build too.
+/// A dev build replaces the machine's binary. The machine restarts on it and reports its version
+/// and commit as dev; the release it replaced is kept beside it as `.cozy-release`; this
+/// computer's cozy is the dev build too.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_dev_binary_runs_as_the_machine_and_reports_its_version_and_commit() {
     let Some(home) = Home::new() else { return };
-    let dev = PathBuf::from(
-        std::env::var_os("COZY_TEST_DEV_BINARY")
-            .expect("COZY_TEST_DEV_BINARY: the dev cozy (dev-build build=cozy)"),
-    );
-    let said = Command::new(&dev).arg("--version").output().unwrap().stdout;
-    let said = String::from_utf8(said).unwrap();
-    let version = said
-        .trim()
-        .strip_prefix("cozy ")
-        .unwrap_or_default()
-        .to_owned();
-    assert!(version.contains("+dev.g"), "{said}");
+    let (dev, version) = dev_binary();
     let launch = enabled(&home);
     let _disabled = Disabled(&home);
     let release = std::fs::read(&launch).unwrap();
@@ -162,14 +168,12 @@ fn a_binary_for_another_platform_is_refused() {
 
 /// On a rental (the CI Hub's docker provider booting this branch's worker image, Debian's glibc):
 /// a `cozy` linked on this newer runner is refused with both glibc versions named, and nothing
-/// drains; the image's own build (`COZY_TEST_WORKER_COZY`) swaps in, and the rental reports it as
+/// drains; the image's own build (`COZY_TEST_DEV_BINARY`) swaps in, and the rental reports it as
 /// dev at this commit. The rental ends and leaves the list.
 #[test]
 fn a_rental_runs_a_dev_binary_and_refuses_one_its_glibc_cannot_load() {
     let Some(home) = Home::with_hub() else { return };
-    let worker = PathBuf::from(std::env::var_os("COZY_TEST_WORKER_COZY").expect(
-        "COZY_TEST_WORKER_COZY: the branch worker image's cozy (tensorhub dev-build cozy_worker=branch)",
-    ));
+    let (worker, version) = dev_binary();
     home.sign_in("tensord@cozy.test");
     let rented = home.json(["machine", "rent", "cpu", "--detach", "--json"]);
     let id = rented["machine"]["rental_id"].as_str().unwrap().to_string();
@@ -203,7 +207,7 @@ fn a_rental_runs_a_dev_binary_and_refuses_one_its_glibc_cannot_load() {
             last["type"].as_str(),
             last["run"]["result"]["to"]["cozy"].as_str()
         ),
-        (0, Some("run.completed"), Some(env!("CARGO_PKG_VERSION"))),
+        (0, Some("run.completed"), Some(version.as_str())),
         "{out:?}"
     );
     let shown = loop {
