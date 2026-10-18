@@ -15,6 +15,7 @@ mod end;
 mod list;
 pub(crate) mod live;
 mod local;
+pub(crate) use local::{Adopted, adopt};
 mod rent;
 
 pub(crate) use list::status_fields;

@@ -13,9 +13,11 @@ use cozy_platform::{
     service::{ServiceSpec, Services},
 };
 use cozy_proto::{
-    calcifer::{Event, Machine, NewMachine, RunList},
+    calcifer::{self, Event, Machine, NewMachine, On, Run, RunList, Status, SubmitRun},
     error::{Error, Kind},
+    machine as v1,
 };
+use serde::Serialize;
 
 use crate::{Context, calcifer_client::Client, output};
 
@@ -351,6 +353,122 @@ async fn idle(ctx: &Context, calcifer: &Client) -> Result<(), Error> {
                 _ => {}
             }
         }
+    }
+}
+
+/// What this computer's machine did with the binary `cozy update` installed (design §5).
+#[derive(Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub(crate) enum Adopted {
+    NotEnabled,
+    /// None runs now: it starts on the new binary.
+    NotRunning,
+    Restarted {
+        version: String,
+    },
+    /// It ends the `runs` it accepted first, then restarts itself: update run `run`.
+    Waits {
+        runs: u64,
+        run: u64,
+    },
+    /// It kept its binary: rolled back, refused, or a machine that predates binary updates.
+    Kept {
+        code: String,
+        message: String,
+        run: Option<u64>,
+    },
+}
+
+/// Asks this computer's machine to run the binary `cozy update` installed: an update run on
+/// `local` closes admission, waits for the runs it accepted, restarts the service on the new
+/// binary and rolls back to `.cozy-previous` if that never serves. Followed until it serves on it
+/// or says how many runs it waits for.
+pub(crate) async fn adopt(ctx: &Context, version: &str) -> Adopted {
+    match adopting(ctx, version).await {
+        Ok(adopted) => adopted,
+        Err(e) => Adopted::Kept {
+            code: e.code,
+            message: e.message,
+            run: None,
+        },
+    }
+}
+
+async fn adopting(ctx: &Context, version: &str) -> Result<Adopted, Error> {
+    let calcifer = ctx.calcifer().await?;
+    let local: Machine = match calcifer.get("/v1/machines/local").await {
+        Ok(local) => local,
+        Err(e) if e.kind == Kind::NotFound => return Ok(Adopted::NotEnabled),
+        Err(e) => return Err(e),
+    };
+    if free(&machine_root(ctx)?) {
+        return Ok(Adopted::NotRunning);
+    }
+    let hub = match local.hub.as_str() {
+        "" => ctx.hub()?,
+        origin => ctx.config.resolve(origin)?,
+    };
+    let payload = serde_json::json!({ "cozy": version });
+    let submit = SubmitRun {
+        on: On::Machine(local.name),
+        hub: hub.origin.to_string(),
+        kind: calcifer::Kind::Update,
+        target: format!("cozy {version}"),
+        spec: v1::RunSpec {
+            kind: v1::RunKind::Update,
+            payload: Some(v1::Json::parse(payload.to_string()).expect("JSON")),
+            ..Default::default()
+        },
+        inputs: vec![],
+        out: None,
+        warnings: vec![],
+    };
+    let run = crate::run::submit(ctx, submit, None).await?.run;
+    let mut events = calcifer.events(run.id.as_str(), 0);
+    while let Some(event) = events.next().await {
+        match event? {
+            Event::Progress { progress }
+                if progress.stage == "waiting_activation"
+                    && progress.total > progress.completed =>
+            {
+                let runs = progress.total - progress.completed;
+                return Ok(Adopted::Waits {
+                    runs,
+                    run: run.number,
+                });
+            }
+            Event::Completed { run, .. }
+            | Event::Failed { run, .. }
+            | Event::Canceled { run, .. } => {
+                return Ok(settled(run));
+            }
+            _ => {}
+        }
+    }
+    Ok(settled(calcifer.run(run.id.as_str()).await?))
+}
+
+/// An update run's end: the version its machine serves on (`to.cozy`, which the new binary
+/// reports once it serves), or why it kept the binary it had.
+fn settled(run: Run) -> Adopted {
+    let to = run.result.as_ref().and_then(|r| r["to"]["cozy"].as_str());
+    match (&run.status, to, run.reason) {
+        (Status::Completed, Some(version), _) => Adopted::Restarted { version: version.into() },
+        (Status::Completed, None, _) => Adopted::Kept {
+            code: "binary_update_unsupported".into(),
+            message: "the machine predates binary updates; `cozy machine disable` and `cozy machine enable` restart it".into(),
+            run: Some(run.number),
+        },
+        (Status::Failed | Status::Canceled, _, Some(reason)) => Adopted::Kept {
+            code: reason.code,
+            message: reason.message,
+            run: Some(run.number),
+        },
+        (status, _, _) => Adopted::Kept {
+            code: "update_unsettled".into(),
+            message: format!("the update run is {status:?}"),
+            run: Some(run.number),
+        },
     }
 }
 
