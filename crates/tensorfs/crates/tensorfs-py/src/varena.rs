@@ -23,8 +23,6 @@ use varena::{
 
 use crate::errors::to_py;
 use crate::readplan::PyPlan;
-#[cfg(feature = "store")]
-use crate::store::{PyLease, PyStore};
 
 create_exception!(tensorfs.varena, PlaneError, PyException, "A weight-plane error; `.code` names its class.");
 create_exception!(tensorfs.varena, BudgetExceeded, PlaneError);
@@ -232,14 +230,6 @@ impl PyPlane {
         self.plane.devices()
     }
 
-    /// Wrap a TensorFS lease (CONSUMED) as a byte source for a manifest's weight sets. The
-    /// lease ends when the last weight set using it closes and the source is dropped.
-    #[cfg(feature = "store")]
-    fn source(&self, py: Python<'_>, store: PyRef<'_, PyStore>, lease: PyRef<'_, PyLease>) -> PyResult<PySource> {
-        let lease = lease.take_for_plane(py)?;
-        Ok(PySource { source: self.plane.source(store.store.clone(), store.meta.clone(), lease) })
-    }
-
     #[cfg(feature = "store")]
     #[pyo3(signature = (name, source, plan, regions, host_fd = None))]
     fn register(
@@ -261,7 +251,7 @@ impl PyPlane {
         Ok(PyWeightSet { plane: self.plane.clone(), id, name, layout })
     }
 
-    /// Register `regions` (`tensorfs.v2.regions(ck)` when None) of a v2 checkpoint as one
+    /// Register `regions` (`tensorfs.regions(ck)` when None) of a v2 checkpoint as one
     /// weight set: its header, in order, is the read plan and its chunk files the source.
     #[cfg(feature = "store")]
     #[pyo3(signature = (name, ck, regions = None, host_fd = None))]
@@ -269,11 +259,11 @@ impl PyPlane {
         &self,
         py: Python<'_>,
         name: String,
-        ck: PyRef<'_, crate::v2::PyCheckpoint>,
+        ck: PyRef<'_, crate::store::PyCheckpoint>,
         regions: Option<Vec<Vec<String>>>,
         host_fd: Option<i32>,
     ) -> PyResult<PyWeightSet> {
-        let (ck, plane) = (&ck.ck, &self.plane);
+        let (ck, plane) = (ck.stored(py)?, &self.plane);
         let regions = regions.unwrap_or_else(|| tensorfs_core::client::regions(ck.header(), 64 << 20, &[]));
         let (id, layout) = py
             .detach(|| {
@@ -284,7 +274,7 @@ impl PyPlane {
         Ok(PyWeightSet { plane: self.plane.clone(), id, name, layout })
     }
 
-    /// Register one weight set over a sealed layout (`fill_sealed`, or one still filling: each
+    /// Register one weight set over a sealed layout (filled by its machine, or still filling: each
     /// region is used once Ready); `fd` stays the caller's. `files`: `(sha256, length, fd)` per
     /// object, the verified object files its owner supplied for regions not staged in that
     /// shared CPU layout (each fd is duplicated; the caller keeps and closes its own).
@@ -885,50 +875,7 @@ fn release_tier(py: Python<'_>, hold: i32) -> PyResult<u64> {
     varena::host::release_hold(hold).or_raise(py)
 }
 
-/// Fill a shared CPU weight layout through the verified read path and seal it (the owner's
-/// half of buffer sharing; `Plane.register_sealed` adopts it). TensorD uses the corresponding
-/// Rust host-buffer APIs. This does not construct a model or transfer it to a GPU.
-/// CONSUMES `lease`. Returns the
-/// sealed memfd (the caller's) and each read mode's bytes. `staged`: only those regions, the
-/// rest holes an adopter reads from the object files (`Plane.register_sealed(files=)`).
-#[cfg(feature = "store")]
-#[pyfunction]
-#[pyo3(signature = (store, lease, plan, regions, name, threads = 8, reserved = None, staged = None))]
-#[allow(clippy::too_many_arguments)]
-fn fill_sealed<'p>(
-    py: Python<'p>,
-    store: PyRef<'_, PyStore>,
-    lease: PyRef<'_, PyLease>,
-    plan: PyRef<'_, PyPlan>,
-    regions: Vec<Vec<String>>,
-    name: String,
-    threads: usize,
-    reserved: Option<i32>,
-    staged: Option<Vec<u32>>,
-) -> PyResult<(i32, Bound<'p, PyDict>)> {
-    // SAFETY: the caller hands over a descriptor `reserve` returned.
-    let reserved = reserved.map(|fd| unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) });
-    let lease = lease.take_for_plane(py)?;
-    let (store, meta, p) = (store.store.clone(), store.meta.clone(), &plan.plan);
-    let tally = varena::io::IoTally::default();
-    let fd = py
-        .detach(|| {
-            let layout = Layout::build(p, &regions)?;
-            let source = Source::new(store, meta, lease, true, 0);
-            let (fd, open) = varena::host::open_sealed(&name, &layout, reserved, staged.as_deref())?;
-            open.run(&layout, &source, threads, &tally)?;
-            Ok::<_, varena::Error>(fd)
-        })
-        .or_raise(py)?;
-    let read = |n: &std::sync::atomic::AtomicU64| n.load(Ordering::Relaxed);
-    let facts = dict!(py;
-        "cached_bytes" => read(&tally.cached_bytes), "direct_bytes" => read(&tally.direct_bytes),
-        "buffered_bytes" => read(&tally.buffered_bytes), "inline_bytes" => read(&tally.inline_bytes),
-    );
-    Ok((std::os::fd::IntoRawFd::into_raw_fd(fd), facts))
-}
-
-/// A memfd of `nbytes` whose pages are allocated now (`fill_sealed(reserved=)` then copies).
+/// A memfd of `nbytes` whose pages are allocated now.
 #[pyfunction]
 #[pyo3(signature = (name, nbytes, threads = 8))]
 fn reserve(py: Python<'_>, name: String, nbytes: u64, threads: usize) -> PyResult<i32> {
@@ -951,8 +898,6 @@ pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyDeviceView>()?;
     m.add_function(wrap_pyfunction!(hold_tier, &m)?)?;
     m.add_function(wrap_pyfunction!(release_tier, &m)?)?;
-    #[cfg(feature = "store")]
-    m.add_function(wrap_pyfunction!(fill_sealed, &m)?)?;
     m.add_function(wrap_pyfunction!(reserve, &m)?)?;
     // `register_sealed` adopts a layout its machine is still filling (waits per region).
     m.add("SEALED_WHILE_FILLING", true)?;

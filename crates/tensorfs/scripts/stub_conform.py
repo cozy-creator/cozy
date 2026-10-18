@@ -261,11 +261,6 @@ def inherited(surface: dict[str, Any], name: str, seen: frozenset[str] = frozens
     return members
 
 
-#: False for a plane-only extension: the stub types the full build, and the store surface it
-#: declares is absent by design there. Every export of the plane-only build is still checked.
-FULL_BUILD = True
-
-
 def compare(runtime: dict[str, Any], stub: dict[str, Any], scope: str, faults: list[str]) -> None:
     for name in sorted(set(runtime) - set(stub)):
         faults.append(
@@ -276,7 +271,7 @@ def compare(runtime: dict[str, Any], stub: dict[str, Any], scope: str, faults: l
         # A bare annotation may describe an INSTANCE attribute, which no class-level
         # introspection can see; `Refusal.detail` is one. The direction that matters —
         # an export the stub does not cover — stays absolute above.
-        if stub[name].get("kind") == "value" or not FULL_BUILD:
+        if stub[name].get("kind") == "value":
             continue
         faults.append(
             f"{scope}{name}: the stub declares it and the extension does not export it "
@@ -393,8 +388,6 @@ def main() -> int:
         print(f"the extension is not importable, so nothing was checked: {exc}", file=sys.stderr)
         return 2
 
-    global FULL_BUILD
-    FULL_BUILD = bool(getattr(_ext, "STORE", True))
     runtime = read_extension(_ext)
     if args.emit:
         print(emit(runtime))

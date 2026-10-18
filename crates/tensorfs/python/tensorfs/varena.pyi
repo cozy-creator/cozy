@@ -12,8 +12,7 @@ TypedDicts describe returned rows only; they do not exist at runtime.
 from collections.abc import Sequence
 from typing import Literal, Self, TypedDict
 
-from ._ext import ReadLease, ReadPlan, Store
-from .v2 import Checkpoint
+from ._ext import Checkpoint, ReadPlan
 
 #: `"pinned"` or a CUDA ordinal.
 type Tier = Literal["pinned"] | int
@@ -228,7 +227,7 @@ class Cursor:
     def __exit__(self, *_args: object) -> bool: ...
 
 class Source:
-    """A manifest's byte source: one TensorFS lease shared by its weight sets."""
+    """A byte source for `register`; varena (U8) replaces registration with checkpoints."""
 
 class WeightSet:
     @property
@@ -260,7 +259,6 @@ class Plane:
     ) -> None: ...
     @property
     def devices(self) -> list[tuple[int, str]]: ...
-    def source(self, store: Store, lease: ReadLease) -> Source: ...
     def register(
         self,
         name: str,
@@ -276,7 +274,7 @@ class Plane:
         regions: Sequence[Sequence[str]] | None = None,
         host_fd: int | None = None,
     ) -> WeightSet:
-        """Register `regions` (`tensorfs.v2.regions(ck)` when None) of a v2 checkpoint: its
+        """Register `regions` (`tensorfs.regions(ck)` when None) of a stored checkpoint: its
         header, in order, is the read plan and its chunk files the source."""
     def register_sealed(
         self,
@@ -286,7 +284,7 @@ class Plane:
         fd: int,
         files: Sequence[tuple[str, int, int]] | None = None,
     ) -> WeightSet:
-        """Adopt the owner's shared CPU layout (`fill_sealed`, possibly still filling),
+        """Adopt the owner's shared CPU layout (possibly still filling),
         using each region once Ready. This opens no Store and neither fills nor reclaims
         that CPU layout. Regions not staged there copy from the granted `files`
         (`(sha256, length, fd)` per verified object file). GPU operations run in this plane."""
@@ -356,31 +354,10 @@ def release_tier(hold: int) -> int:
     """End a `hold_tier` claim (closes `hold`): punches every Ready region no plane claims and
     returns the bytes punched."""
 
-class SealedFill(TypedDict):
-    cached_bytes: int
-    direct_bytes: int
-    buffered_bytes: int
-    inline_bytes: int
-
 #: `Plane.register_sealed` adopts a layout still filling (absent in older releases).
 SEALED_WHILE_FILLING: bool
 #: `Plane.register_sealed` takes a layout its machine staged in part, the rest from `files`.
 SEALED_HOLES: bool
 
-def fill_sealed(
-    store: Store,
-    lease: ReadLease,
-    plan: ReadPlan,
-    regions: Sequence[Sequence[str]],
-    name: str,
-    threads: int = 8,
-    reserved: int | None = None,
-    staged: Sequence[int] | None = None,
-) -> tuple[int, SealedFill]:
-    """Prepare a shared CPU layout through verified reads and seal it; CONSUMES `lease`.
-    This is an owner-side byte operation, not Python model construction or a GPU transfer.
-    Returns the sealed memfd (the caller's) and each read mode's bytes. `staged`: only those
-    regions, the rest holes an adopter reads from object files."""
-
 def reserve(name: str, nbytes: int, threads: int = 8) -> int:
-    """A memfd of `nbytes` whose pages are allocated now; `fill_sealed(reserved=)` consumes it."""
+    """A memfd of `nbytes` whose pages are allocated now."""

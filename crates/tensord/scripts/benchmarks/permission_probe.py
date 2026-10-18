@@ -87,7 +87,7 @@ def main() -> None:
     legacy = root / "legacy-store"
     # Only this new owned store may be opened/mutated by the fixture.
     init = subprocess.run([config.python, "-I", "-c",
-                           "import sys,tensorfs;tensorfs.Store.init(sys.argv[1])", str(legacy)],
+                           "import sys,tensorfs;tensorfs.Store(sys.argv[1])", str(legacy)],
                           capture_output=True)
     (root / "store-init.stderr").write_bytes(init.stderr)
     if init.returncode:
