@@ -23,20 +23,20 @@ A reader MUST check the length and digest of every object before using its bytes
 
 ## 2. Documents
 
-Manifests, headers and repos are documents. Each is a map with a `format` tag `<kind>/<major>` or
-`<kind>/<major>.<minor>`, where major and minor are decimal digits:
+Manifests, headers and repos are documents. Each carries a `format` tag `<kind>/<major>` or `<kind>/<major>.<minor>`,
+where major and minor are decimal digits:
 
-| Document | `format` kind | Usual name |
-|---|---|---|
-| manifest | `tensorfs.manifest` | an object, cited by a repo |
-| header | `cozytensors` | the manifest file `model.cozytensors` |
-| repo | `tensorfs.repo` | `refs/<org>/<name>.json` |
+| Document | `format` kind | Encoding (§9) | Usual name |
+|---|---|---|---|
+| manifest | `tensorfs.manifest` | JSON object | an object, cited by a repo |
+| header | `cozytensors` | CBOR array | the manifest file `model.cozytensors` |
+| repo | `tensorfs.repo` | JSON object | `refs/<org>/<name>.json` |
 
 - A reader MUST refuse a document whose kind differs or whose major is not `1`. It MUST accept any minor.
-- A reader MUST ignore fields it does not know, at every level. A writer MAY add fields; adding a field never needs a
-  new major.
-- Values are null, booleans, integers in [−2^63, 2^64), strings, lists and maps with string keys. There are no
-  floating-point numbers anywhere in a document. A map MUST NOT repeat a key.
+- A reader MUST ignore what a later minor adds: unknown fields of a JSON document, at every level, and trailing
+  elements of the header's records (§4). Adding them never needs a new major.
+- Values are booleans, integers in [−2^63, 2^64), strings, lists and maps with string keys. There are no null values
+  and no floating-point numbers anywhere in a document. A map MUST NOT repeat a key.
 - `metadata`, where allowed, is a free-form map of such values.
 
 **Names.** A *segment* is a non-empty string that is not `.` or `..` and contains no `/`, `\` or NUL. A *path* is one
@@ -54,31 +54,43 @@ or more segments joined by `/`.
 
 ## 4. Header
 
+A header is an array of records, each an array whose fields are known by position (CDDL:
+[`../conformance/schema/header.cddl`](../conformance/schema/header.cddl)):
+
 ```
-{format: "cozytensors/1", chunks: [object-ref], components: [{name, tensors: [tensor]}], metadata?}
+header    = [format, chunks: [* chunk], encodings: [* encoding], components: [* component], metadata]
+chunk     = [sha256: bytes(32), length]
+encoding  = [scheme, params: {* name => value}]
+component = [name, tensors: [* tensor]]
+tensor    = [key, dtype, shape, 0, location]                 ; plain
+          / [key, dtype, shape, encoding_index, [+ part]]    ; encoded, index ≥ 1
+part      = [role, dtype, shape, location]
+location  = [chunk_index, offset, length]
 ```
 
-- **Construction order is data.** `components`, each component's `tensors` and each encoded tensor's `parts` are
+- **Construction order is data.** `components`, each component's `tensors` and each encoded tensor's parts are
   arrays in construction order: the order in which the model builds and fills them (its `state_dict()` order). The
   order is part of the header's bytes, so reordering changes its digest. A writer MUST take the order from its
   producer (a converter's rows, a base checkpoint, a source's constructor order) and MUST NOT sort names. Readers
   iterate in this order and look names up through an index.
-- Component `name`s MUST be segments (they name folders on export) and unique. Tensor `key`s MUST be non-empty and
-  unique within their component; they are the state-dict names within the component.
-- A **tensor** has a `key`, a logical `dtype` (§5) and `shape` (a list of non-negative integers; `[]` is a scalar),
-  and exactly one body:
-  - **plain**: `data`, a location of its bytes; or
-  - **encoded**: `encoding: {scheme, params?}` with a non-empty scheme name, and a non-empty array `parts` (§6).
-- A **part** is `{role, dtype, shape, chunk, offset, length}`: a non-empty role unique within the tensor, the part's
-  own dtype and shape, and its location.
-- A **location** `{chunk, offset, length}` names bytes in the chunks. `chunk` indexes `chunks`. The range starts at
-  `offset` in that chunk and, when `length` exceeds the rest of the chunk, continues at offset 0 of the following
-  chunks in list order.
-- For every location with `length > 0`, a reader MUST refuse the header unless `chunk` is in range,
-  `offset < chunks[chunk].length`, and `offset + length` is at most the summed lengths of `chunks[chunk..]`. A
-  zero-length location reads no bytes (writers emit `{0, 0, 0}`).
-- When the dtype is known, `length` MUST equal the byte size of the dtype and shape (§5), for plain data and for
-  every part.
+- **Later fields.** A record MAY have more elements than listed; a reader MUST skip them (they are a later minor's).
+  A reader MUST refuse a record with fewer.
+- `chunks` lists the chunk objects (§1) by their 32-byte SHA-256 and length.
+- `encodings` lists each distinct encoding (§6) once, in order of first citation by the tensors; every entry MUST be
+  cited. A tensor's `encoding_index` `i ≥ 1` cites `encodings[i − 1]`; `0` marks a plain tensor.
+- Component names MUST be segments (they name folders on export) and unique. Tensor keys MUST be non-empty and unique
+  within their component; they are the state-dict names within the component. Roles MUST be non-empty and unique
+  within their tensor.
+- A **tensor** has a key, a logical dtype (§5) and shape (non-negative integers; `[]` is a scalar). A plain tensor's
+  bytes are at its location. An encoded tensor's parts, each with its own dtype, shape and location, become the
+  tensor through its encoding.
+- A **location** `[chunk_index, offset, length]` names bytes in the chunks. The range starts at `offset` in
+  `chunks[chunk_index]` and, when `length` exceeds the rest of the chunk, continues at offset 0 of the following chunks
+  in list order. For every location with `length > 0`, a reader MUST refuse the header unless `chunk_index` is in
+  range, `offset` is a multiple of 4096, `offset < chunks[chunk_index].length`, and `offset + length` is at most the
+  summed lengths of `chunks[chunk_index..]`. A zero-length location reads no bytes (writers emit `[0, 0, 0]`).
+- When the dtype is known, `length` MUST equal the byte size of the dtype and shape (§5).
+- Locations MAY overlap: parts of different tensors may cite the same bytes (a shared codebook, a shared factor).
 
 Tensor bytes are row-major (C order) and little-endian. Writers fill gaps between ranges with zeros; readers never
 read them.
@@ -117,8 +129,9 @@ The known dtypes are the 22 safetensors 0.8 names:
 - Sub-byte elements pack from the low bits: `F4` element 2k is bits 0–3 of byte k and element 2k+1 bits 4–7; `F6`
   elements fill bits continuously from bit 0 of byte 0.
 - `BOOL` is one byte, 0 or 1. `C64` is two `F32` (real, imaginary).
-- A dtype is any non-empty name. A name outside this table is a newer dtype: a reader still reads the document and
-  checks bounds, takes the `length` as written, and refuses only a typed view of the bytes or a decode that needs it.
+- Dtypes are these names everywhere in a header. A dtype is any non-empty name; a name outside this table is a newer
+  dtype: a reader still reads the document and checks bounds, takes the `length` as written, and refuses only a
+  typed view of the bytes or a decode that needs it.
 
 Element formats used by the schemes:
 
@@ -132,75 +145,63 @@ Element formats used by the schemes:
 
 ## 6. Encodings
 
-An encoded tensor cites an **encoding**: a scheme name and its params. With this section they fully define how the
-parts become the logical tensor; no decode depends on anything outside the header, its chunks and this spec.
+An encoded tensor cites an **encoding** `[scheme, params]`. With this section they fully define how the parts become
+the logical tensor; no decode depends on anything outside the header, its chunks and this spec.
 
-**Names** are `family.variant` in lowercase: the element family (`fp8`, `int8`; later `int4`, …) and the method or scale
-granularity (`rowwise`, `tensorwise`, `convrot`; later `gptq`, `awq`, `block`). A format with an established name keeps
-it: `mxfp8` (OCP Microscaling), `nvfp4` (NVIDIA ModelOpt).
+**Names** are `family.variant` in lowercase, in the words of the ecosystem that made the format: generic scaled
+formats are `element.granularity` (`fp8.tensorwise`, `int8.rowwise`; later `fp8.blockwise`), a producer's own format
+is `producer.type` with the producer's type name verbatim (later `gguf.q4_k`, `gptq.int4`, `bnb.nf4`), and a
+vendor-neutral standard keeps its bare name (`mxfp8`, `nvfp4`; later `mxfp4`).
 
-**Params** are complete: every param a scheme defines is written, even where the name implies its value, so the params
-alone tell a reader the decode. Keys and text values are snake_case; dtypes are §5's names, the one dtype vocabulary of
-a header, in parts and params alike.
+**Params** are snake_case keys in the producer's vocabulary (`axis`, `block_size`, `rotation`, `rotation_size`,
+`global_scale`, `nibble_order`, `scale_layout`). Every param the decode reads is required and none has a default, so
+the encoding shows the whole recipe; nothing a part's dtype or shape already says is repeated.
 
-| Param | Meaning |
-|---|---|
-| `weight_dtype` | The `weight` part's dtype. |
-| `scale` | The `scale` part's granularity: `per_tensor` (one), `per_row` (one per row `i`), `per_block` (one per row and block of `block` columns). |
-| `scale_dtype` | The `scale` part's dtype. |
-| `block` | Columns per block: of a `per_block` scale, or of a rotation group. |
-| `rotation` | The transform applied to each block before quantizing: `hadamard`. |
-| `global_scale`, `global_scale_dtype` | A second, per-tensor scale (the `global_scale` part) and its dtype. |
-
-No scheme here has a zero point.
+**Four rules** bring any format in without new grammar:
+1. *Keep the producer's bytes.* Parts are the producer's packed bytes (int words, nibbles, block structs, swizzled
+   scales); the scheme fixes the bit order and params name what varies, so import and export are copies.
+2. *Fixed codebooks are spec tables.* A constant of a scheme (a lookup table, a lattice grid) is given in an appendix
+   of this spec with its SHA-256; a learned codebook is a part.
+3. *Extra terms are parts.* Low-rank factors, per-channel factors (`pre_quant_scale`), permutations (`g_idx`) and
+   float constants are named parts that the scheme's formula uses.
+4. *Nesting only for sparsity.* A sparsity scheme MAY carry an inner `[scheme, params]` in its params; nothing else
+   nests.
 
 **Reading and decoding.**
 - A tensor with an unknown scheme still reads: its parts are located and verified like any other. Only decoding
   refuses, and the refusal MUST name the scheme.
 - A decoder MUST refuse a known scheme when a required part is missing, a part not listed for the scheme is present,
-  a param the scheme defines is missing or has another value, a part's dtype or shape breaks the scheme's rule, or the
-  logical dtype is not `F32`, `BF16` or `F16`. It MUST ignore params the scheme does not define.
+  a param is missing, unknown or has a value not listed, a part's dtype or shape breaks the scheme's rule, or the
+  logical dtype is not `F32`, `BF16` or `F16`. Params drive the decode, so an unknown one is a refusal, never ignored.
 
-**Arithmetic.** Each formula is evaluated element by element in IEEE-754 binary32 (`f32`): every `×` is one f32
-multiplication rounded to nearest even, applied left to right as written; element formats (§5) convert to f32 exactly.
+**Shapes.** The tensorwise schemes take any logical shape. The others take rank 2 or more and view the tensor as
+`[R, C]`: `C` is the last extent and `R` the product of the others, so an expert stack `[E, N, K]` is `R = E·N` rows of
+`K`. `i` indexes rows and `j` columns; block schemes act along `j`.
+
+**Arithmetic.** Each formula is evaluated element by element in IEEE-754 binary32 (`f32`): every `×` and `÷` is one f32
+operation rounded to nearest even, applied left to right as written; element formats (§5) convert to f32 exactly.
 The result is then rounded once to the logical dtype `L`, written `round_L`:
 - `F32`: unchanged; `BF16`, `F16`: round to nearest, ties to even, keeping subnormals; `F16` overflows to ±infinity.
 - Any NaN result is written as the canonical quiet NaN: `0x7FC00000` (`F32`), `0x7FC0` (`BF16`), `0x7E00` (`F16`).
 
-`R × C` below is the logical shape `[R, C]`; `i` indexes rows and `j` columns. `input_scale` (optional where listed,
-`F32`, one element) is the activation scale of a quantized matmul; it never enters a decode.
+`input_scale` (optional where listed, `F32`, one element) is the activation scale of a quantized matmul; it never
+enters a decode.
 
-### `fp8.rowwise`
-
-| | |
-|---|---|
-| Params | `scale: per_row`, `scale_dtype: F32`, `weight_dtype: F8_E4M3` or `F8_E5M2`. |
-| Parts | `weight`: `weight_dtype`, `[R, C]`. `scale`: `F32`, `R` elements (`[R]` or `[R, 1]`). |
-| Decode | `value[i, j] = round_L(weight[i, j] × scale[i])` |
-
-### `fp8.tensorwise`
-
-| | |
-|---|---|
-| Params | `scale: per_tensor`, `scale_dtype: F32`, `weight_dtype: F8_E4M3` or `F8_E5M2`. |
-| Parts | `weight`: `weight_dtype`, the logical shape (any rank). `scale`: `F32`, one element. `input_scale` (optional). |
-| Decode | `value = round_L(weight × s)` where `s` is `scale` rounded to `L` and read back as f32 (`s = scale` when `L` is `F32`). |
-
-### `int8.rowwise`
-
-| | |
-|---|---|
-| Params | `scale: per_row`, `scale_dtype: F32`, `weight_dtype: I8`. |
-| Parts | `weight`: `I8`, `[R, C]`. `scale`: `F32`, `R` elements. |
-| Decode | `value[i, j] = round_L(weight[i, j] × scale[i])` |
+| Scheme | Params | Parts | Decode |
+|---|---|---|---|
+| `fp8.tensorwise` | none | `weight`: `F8_E4M3` or `F8_E5M2`, the logical shape. `scale`: `F32`, one element. `input_scale`. | `round_L(weight × s)`, `s` = `scale` rounded to `L` and read back as f32 |
+| `int8.tensorwise` | none | `weight`: `I8`, the logical shape. `scale`: `F32`, one element. `input_scale`. | as `fp8.tensorwise` |
+| `fp8.rowwise` | `axis`: `0` or `1` | `weight`: `F8_E4M3` or `F8_E5M2`, the logical shape. `scale`: `F32`, `R` elements (`axis: 0`) or `C` (`axis: 1`), any shape. | `round_L(weight[i, j] × scale[axis = 0 ? i : j])` |
+| `int8.rowwise` | `axis`: `0` or `1` | `weight`: `I8`, the logical shape. `scale` as `fp8.rowwise`. | as `fp8.rowwise` |
+| `int8.convrot` | `rotation: "hadamard"`, `rotation_size: B` | `weight`: `I8`, the logical shape. `scale`: `F32`, `R` elements. | below |
+| `mxfp8` | `block_size: 32`, `scale_layout` | `weight`: `F8_E4M3` or `F8_E5M2`, the logical shape. `scale`: `F8_E8M0`, `⌈C/32⌉` per row (below). | `round_L(weight[i, j] × scale(i, ⌊j/32⌋))` |
+| `nvfp4` | `block_size: 16`, `global_scale`, `nibble_order`, `scale_layout` | `weight`: `F4`, the logical shape, `C` a multiple of 16. `scale`: `F8_E4M3`, `C/16` per row. `scale_2`: `F32`, one element. `input_scale`. | `multiply`: `round_L((weight[i, j] × scale(i, ⌊j/16⌋)) × scale_2)`; `divide`: `round_L(weight[i, j] × (scale(i, ⌊j/16⌋) ÷ scale_2))` |
 
 ### `int8.convrot`
 
-| | |
-|---|---|
-| Params | `block: B = 4^k`, `1 ≤ k ≤ 8` (256 in practice), with `C` a multiple of `B`. `rotation: hadamard`, `scale: per_row`, `scale_dtype: F32`, `weight_dtype: I8`. |
-| Parts | `weight`: `I8`, `[R, C]`. `scale`: `F32`, `R` elements. |
-| Decode | `value[i, gB + j] = round_L((y[i, g, j] × scale[i]) × 2^−k)`, with `y[i, g, ·] = weight[i, gB : gB + B] · H_B` |
+`B = 4^k`, `1 ≤ k ≤ 8` (256 in practice), and `C` MUST be a multiple of `B`:
+
+`value[i, gB + j] = round_L((y[i, g, j] × scale[i]) × 2^−k)`, with `y[i, g, ·] = weight[i, gB : gB + B] · H_B`
 
 `H_B = H₄ ⊗ … ⊗ H₄` (`k` factors) with entries ±1, where
 
@@ -215,26 +216,30 @@ H₄ = [[ 1,  1,  1, -1],
 quantizing each row. `y` is an exact integer (|y| ≤ 128·B ≤ 2^23), so its conversion to f32 is exact. One way to
 compute it: view each group of `B` as `k` base-4 digits (most significant first) and apply `H₄` along every digit.
 
-### `mxfp8`
+### Block scales: `scale_layout`
 
-| | |
-|---|---|
-| Params | `block: 32`, `scale: per_block`, `scale_dtype: F8_E8M0`, `weight_dtype: F8_E4M3` or `F8_E5M2`. |
-| Parts | `weight`: `weight_dtype`, `[R, C]`. `scale`: `F8_E8M0`, `[R, ⌈C/32⌉]` (the last block may be short). |
-| Decode | `value[i, j] = round_L(weight[i, j] × scale[i, ⌊j/32⌋])` |
-
-This is the OCP Microscaling MXFP8 format: a power-of-two scale per 32 consecutive elements of a row.
+`scale(i, b)` is row `i`'s scale for block `b`, with `W` blocks per row (`⌈C/32⌉` for `mxfp8`, `C/16` for `nvfp4`):
+- `row_major`: the `scale` part has the logical shape with its last extent replaced by `W` (`[R, W]` for a matrix), and
+  `scale(i, b)` is element `i·W + b`.
+- `cublas_128x4`: cuBLAS's block-scaling layout, as ComfyUI stores it. The `scale` part is
+  `[128·⌈R/128⌉, 4·⌈W/4⌉]`, zero-padded, in tiles of 128 rows × 4 blocks; `scale(i, b)` is element
+  `512·(⌊i/128⌋·⌈W/4⌉ + ⌊b/4⌋) + 16·(i mod 32) + 4·⌊(i mod 128)/32⌋ + (b mod 4)`.
 
 ### `nvfp4`
 
-| | |
-|---|---|
-| Params | `block: 16`, `global_scale: per_tensor`, `global_scale_dtype: F32`, `scale: per_block`, `scale_dtype: F8_E4M3`, `weight_dtype: F4`. `C` MUST be a multiple of 16. |
-| Parts | `weight`: `F4`, `[R, C]` (two elements per byte, §5). `scale`: `F8_E4M3`, `[R, C/16]`. `global_scale`: `F32`, one element. `input_scale` (optional). |
-| Decode | `value[i, j] = round_L((weight[i, j] × scale[i, ⌊j/16⌋]) × global_scale)` |
+NVIDIA's NVFP4: an E2M1 element per weight, an E4M3 scale per 16 consecutive elements of a row, and a per-tensor
+`scale_2`.
+- `nibble_order`: which nibble of a byte holds the even element of each pair. `low_first` is §5's `F4` packing
+  (ModelOpt, compressed-tensors); `high_first` swaps the nibbles of every byte (ComfyUI).
+- `global_scale`: `multiply` (ModelOpt's `weight_scale_2`) or `divide` (compressed-tensors' `weight_global_scale`,
+  which is `1 / weight_scale_2`).
+- ModelOpt's `weight` (`uint8 [R, C/2]`), `weight_scale` and `weight_scale_2` are `weight`, `scale` and `scale_2`
+  here; ModelOpt and compressed-tensors write `low_first`, `row_major`; ComfyUI writes `high_first`, `cublas_128x4`.
 
-This is NVIDIA ModelOpt's NVFP4 layout: ModelOpt's `weight` (`uint8 [R, C/2]`, element 2k in the low nibble),
-`weight_scale` and `weight_scale_2` are `weight`, `scale` and `global_scale` here.
+### `mxfp8`
+
+The OCP Microscaling MXFP8 format: a power-of-two `F8_E8M0` scale per 32 consecutive elements of a row (the last
+block of a row may be short). ComfyUI stores its scales `cublas_128x4`, others `row_major`.
 
 ### Plain tensors
 
@@ -268,32 +273,39 @@ reader that needs only some components MAY fetch only the chunks their locations
 
 ## 8. Versioning
 
-- Minor versions add fields or values whose absence keeps the old meaning; readers of the same major read them.
+- Minor versions add fields, trailing record elements, schemes and dtypes; their absence keeps the old meaning, and
+  readers of the same major read them.
 - A new scheme or dtype is a minor change: every location carries its `length`, so an old reader reads the document,
-  locates and verifies every byte, and refuses only a decode or typed view of the tensors that use it.
+  locates and verifies every byte, and refuses only a decode or typed view of the tensors that use it. A new param of
+  an existing scheme is too: an old decoder refuses the tensors whose params it does not know (§6).
 - A change that alters the meaning of an existing field, scheme or param is a new major.
 
 ## 9. Encoding
 
-Documents are UTF-8 JSON (RFC 8259) whose top level is an object; §2's values map to JSON in the obvious way.
+**Header: deterministic CBOR.** A header is CBOR (RFC 8949) in core deterministic encoding (§4.2.1), so equal headers
+have equal bytes and equal object refs. A reader MUST refuse:
+- anything but unsigned and negative integers, byte and text strings, arrays, maps with text keys, `true` and
+  `false`: tags, floats, `null`, `undefined` and other simple values are refused;
+- a head that is not in its shortest form, an indefinite length, map keys out of the bytewise order of their
+  encodings or repeated, invalid UTF-8, and bytes after the root;
+- a byte string anywhere but a chunk's SHA-256 (and later fields);
+- an integer outside [−2^63, 2^64).
 
-**Reading.** A reader MUST refuse:
-- invalid UTF-8 or JSON, or a top level that is not an object;
-- a repeated key in any object;
-- any number with a fraction or exponent, `NaN` or `Infinity`, and any integer outside [−2^63, 2^64);
-- a field of the wrong JSON type (for example `null` for `metadata` or `params`; a JSON `null` for `data`,
-  `encoding` or `parts` counts as absent).
+Decoding and re-encoding a header of this version reproduces its bytes. A header that fails to read and is a
+**pre-cut** layout, the provisional JSON (first byte `{`) or a well-formed root of exactly five elements whose fifth is
+an array, MUST be refused as such ("pre-cut cozytensors header (old layout); re-import or migrate"): the tag is the
+same, so only the structure tells them apart.
 
-Whitespace between tokens is allowed.
-
-**Writing.** A writer MUST produce the canonical form, so equal documents have equal bytes and equal object refs:
+**Manifest and repo: JSON.** UTF-8 JSON (RFC 8259) whose top level is an object; §2's values map to JSON in the obvious
+way. A reader MUST refuse invalid UTF-8 or JSON, a top level that is not an object, a repeated key in any object, any
+number with a fraction or exponent, `NaN` or `Infinity`, any integer outside [−2^63, 2^64), `null`, and a field of the
+wrong JSON type. Whitespace between tokens is allowed. A writer MUST produce the canonical form:
 - object keys sorted by their UTF-8 bytes; no whitespace;
 - integers in shortest decimal (no `+`, no leading zeros, `-` only for negatives);
 - strings with `"` and `\` escaped as `\"` and `\\`, the controls U+0008, U+0009, U+000A, U+000C and U+000D as `\b`,
   `\t`, `\n`, `\f`, `\r`, other controls below U+0020 as `\u00XX` (lowercase hex), and every other character as its
   UTF-8 bytes (Python: `json.dumps(doc, sort_keys=True, separators=(",", ":"), ensure_ascii=False)`);
-- optional fields at their default omitted: empty `metadata`, `params` and `checkpoints`, `yanked: false`,
-  `revision: 0`.
+- optional fields at their default omitted: empty `metadata` and `checkpoints`, `yanked: false`, `revision: 0`.
 
 ## 10. Chunks (informative)
 

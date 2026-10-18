@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
-"""An independent cozytensors/1 reader: Python stdlib and numpy only, written from the spec.
+"""An independent cozytensors/1 reader and header encoder, written from the spec: Python, numpy and cbor2.
 
     python reader.py <vectors-dir>     run the conformance vectors (exit 1 on any failure)
 
-As a library: `Store(root).checkpoint("org/name", lane="x")` -> (manifest, header), and
-`read(store, header, component, key)` -> the tensor's logical bytes.
+As a library: `Store(root).checkpoint("org/name", lane="x")` -> (manifest, header),
+`read(store, header, component, key)` -> the tensor's logical bytes, `parse_header(bytes)` and
+`encode(projection)`: a header's diagnostic projection (the CBOR tree as JSON, byte strings as
+{"hex": ...}) to its canonical bytes.
 """
 
 from __future__ import annotations
 
 import base64
 import hashlib
+import itertools
 import json
 import sys
 from pathlib import Path
 
+import cbor2
 import numpy as np
 
 HEADER, MANIFEST, REPO = "cozytensors/1", "tensorfs.manifest/1", "tensorfs.repo/1"
@@ -23,6 +27,7 @@ BITS = {
     "F8_E8M0": 8, "F8_E4M3FNUZ": 8, "F8_E5M2FNUZ": 8, "I16": 16, "U16": 16, "F16": 16, "BF16": 16,
     "I32": 32, "U32": 32, "F32": 32, "C64": 64, "F64": 64, "I64": 64, "U64": 64,
 }
+PRE_CUT = "pre-cut cozytensors header (old layout); re-import or migrate"
 
 
 class Refused(Exception):
@@ -35,7 +40,20 @@ def invalid(detail: str) -> Refused:
     return Refused("invalid", detail)
 
 
-# ---------------------------------------------------------------- documents
+def need(ok: bool, detail: str):
+    if not ok:
+        raise invalid(detail)
+
+
+def check_format(tag, expected: str):
+    need(isinstance(tag, str), "no format tag")
+    name, _, version = tag.partition("/")
+    major, dot, minor = version.partition(".")
+    if f"{name}/{major}" != expected or (dot and not (minor.isascii() and minor.isdigit())):
+        raise Refused("format", f"{tag!r} is not {expected}")
+
+
+# ---------------------------------------------------------------- JSON documents
 
 
 def load(data: bytes, expected: str) -> dict:
@@ -61,25 +79,21 @@ def load(data: bytes, expected: str) -> dict:
                          parse_int=integer, parse_constant=no_float)
     except (ValueError, UnicodeDecodeError) as e:
         raise invalid(str(e)) from None
-    if not isinstance(doc, dict):
-        raise invalid("the document is not an object")
-    tag = doc.get("format")
-    if not isinstance(tag, str):
-        raise invalid("no format tag")
-    name, _, version = tag.partition("/")
-    major, dot, minor = version.partition(".")
-    if f"{name}/{major}" != expected or (dot and not (minor.isascii() and minor.isdigit())):
-        raise Refused("format", f"{tag!r} is not {expected}")
+    need(isinstance(doc, dict), "the document is not an object")
+    check_format(doc.get("format"), expected)
+    no_null(doc)
     return doc
 
 
+def no_null(v):
+    if v is None:
+        raise invalid("null")
+    for x in v.values() if isinstance(v, dict) else v if isinstance(v, list) else ():
+        no_null(x)
+
+
 def uint(v) -> bool:
-    return isinstance(v, int) and not isinstance(v, bool) and 0 <= v < 2**64
-
-
-def need(ok: bool, detail: str):
-    if not ok:
-        raise invalid(detail)
+    return type(v) is int and 0 <= v < 2**64
 
 
 def field(doc: dict, name: str, kind, optional=False):
@@ -104,8 +118,8 @@ def object_ref(v) -> dict:
 
 def byte_len(dtype, shape) -> int | None:
     """Bytes of a known dtype and shape; None for an unknown dtype (its length stands)."""
-    need(isinstance(dtype, str) and dtype != "", f"bad dtype {dtype!r}")
-    need(isinstance(shape, list) and all(uint(x) for x in shape), f"bad shape {shape!r}")
+    need(type(dtype) is str and dtype != "", f"bad dtype {dtype!r}")
+    need(type(shape) is list and all(uint(x) for x in shape), f"bad shape {shape!r}")
     if dtype not in BITS:
         return None
     bits = BITS[dtype]
@@ -152,63 +166,155 @@ def release(repo: dict, version: str | None) -> dict:
     return next(r for r in repo["releases"] if r["version"] == version)
 
 
-def parse_location(v: dict, dtype, shape, chunks, what) -> dict:
-    loc = {k: field(v, k, int) for k in ("chunk", "offset", "length")}
+# ---------------------------------------------------------------- the CBOR header
+
+
+def strict(data: bytes):
+    """The CBOR item of a header, refusing anything but its one deterministic encoding (spec §9):
+    the canonical re-encoding must reproduce the bytes, which rules out non-preferred heads,
+    indefinite lengths, unordered or repeated map keys and trailing bytes; then only integers in
+    [-2^63, 2^64), byte and text strings, arrays, maps with text keys, true and false remain."""
+    try:
+        item = cbor2.loads(data)
+        same = cbor2.dumps(item, canonical=True) == data
+    except Exception as e:  # cbor2 raises several kinds on malformed bytes
+        raise invalid(f"not CBOR: {e}") from None
+    need(same, "not the deterministic encoding (RFC 8949 §4.2.1)")
+    stack = [item]
+    while stack:
+        v = stack.pop()
+        t = type(v)
+        if t is list:
+            stack.extend(v)
+        elif t is dict:
+            need(all(type(k) is str for k in v), "a map key that is not text")
+            stack.extend(v.values())
+        elif t is int:
+            need(-(2**63) <= v < 2**64, f"{v} is outside [-2^63, 2^64)")
+        else:
+            need(t in (str, bytes, bool), f"a {t.__name__} item")
+    return item
+
+
+def record(v, n: int, what: str) -> list:
+    """An array of at least `n` fields; fields after them are a later version's and are skipped."""
+    need(type(v) is list and len(v) >= n, f"{what} is not an array of at least {n}")
+    return v
+
+
+def location(v, dtype, shape, chunks, rooms, what) -> dict:
+    chunk, offset, length = record(v, 3, f"{what} location")[:3]
+    need(uint(chunk) and uint(offset) and uint(length), f"{what}: location is not three uints")
     size = byte_len(dtype, shape)
-    need(size in (None, loc["length"]), f"{what}: length disagrees with dtype and shape")
-    if loc["length"]:
-        c = loc["chunk"]
-        need(c < len(chunks), f"{what}: chunk {c} of {len(chunks)}")
-        room = sum(x["length"] for x in chunks[c:])
-        need(loc["offset"] < chunks[c]["length"] and loc["offset"] + loc["length"] <= room,
+    need(size in (None, length), f"{what}: length disagrees with dtype and shape")
+    if length:
+        need(chunk < len(chunks), f"{what}: chunk {chunk} of {len(chunks)}")
+        need(offset % 4096 == 0, f"{what}: offset {offset} is not 4 KiB aligned")
+        need(offset < chunks[chunk]["length"] and offset + length <= rooms[chunk],
              f"{what}: range runs past the chunks")
-    return loc
-
-
-def named(items, field_name: str, what: str) -> list:
-    """An array of objects, each named by `field_name`, with no name repeated."""
-    need(isinstance(items, list) and all(isinstance(x, dict) for x in items), f"{what} is not an array of objects")
-    names = [field(x, field_name, str) for x in items]
-    need(len(set(names)) == len(names), f"a repeated {field_name} in {what}")
-    return items
+    return {"chunk": chunk, "offset": offset, "length": length}
 
 
 def parse_header(data: bytes) -> dict:
     """Components, tensors and parts as dicts, which keep the header's (construction) order."""
-    doc = load(data, HEADER)
-    chunks = [object_ref(c) for c in field(doc, "chunks", list)]
-    components = {}
-    for comp in named(field(doc, "components", list), "name", "components"):
-        name = comp["name"]
-        need(segment(name), f"bad component name {name!r}")
+    if data[:1] == b"{":
+        raise Refused("pre_cut", PRE_CUT)
+    root = strict(data)
+    try:
+        return header(root)
+    except Refused:
+        # The first CBOR layout: exactly five fields, the fifth the components array.
+        if type(root) is list and len(root) == 5 and type(root[4]) is list:
+            raise Refused("pre_cut", PRE_CUT) from None
+        raise
+
+
+def header(root) -> dict:
+    tag, chunk_rows, encoding_rows, component_rows, meta = record(root, 5, "the header")[:5]
+    check_format(tag, HEADER)
+    need(type(chunk_rows) is list, "chunks is not an array")
+    chunks = []
+    for c in chunk_rows:
+        sha, length = record(c, 2, "a chunk")[:2]
+        need(type(sha) is bytes and len(sha) == 32 and uint(length), "a chunk is not [bstr .size 32, uint]")
+        chunks.append({"sha256": sha.hex(), "length": length})
+    rooms = list(itertools.accumulate((c["length"] for c in reversed(chunks))))[::-1]  # bytes of chunks[i:]
+    need(type(encoding_rows) is list, "encodings is not an array")
+    encodings, seen = [], set()
+    for e in encoding_rows:
+        scheme, params = record(e, 2, "an encoding")[:2]
+        need(type(scheme) is str and scheme != "" and type(params) is dict, "an encoding is not [scheme, params]")
+        identity = cbor2.dumps([scheme, params], canonical=True)
+        need(identity not in seen, f"encoding {scheme} is listed twice")
+        seen.add(identity)
+        encodings.append({"scheme": scheme, "params": params})
+    need(type(component_rows) is list, "components is not an array")
+    components, cited = {}, 0
+    for c in component_rows:
+        name, tensor_rows = record(c, 2, "a component")[:2]
+        need(segment(name) and name not in components, f"bad or repeated component name {name!r}")
+        need(type(tensor_rows) is list, f"{name}: tensors is not an array")
         tensors = {}
-        for t in named(field(comp, "tensors", list), "key", f"{name} tensors"):
-            key = t["key"]
-            need(key != "", f"{name}: an empty tensor key")
-            dtype, shape = field(t, "dtype", str), field(t, "shape", list)
+        for t in tensor_rows:
+            key, dtype, shape, index, body = record(t, 5, f"a {name} tensor")[:5]
+            need(type(key) is str and key != "" and key not in tensors, f"{name}: bad or repeated key {key!r}")
             byte_len(dtype, shape)
-            data_, enc, parts = t.get("data"), t.get("encoding"), t.get("parts")
+            what = f"{name}/{key}"
+            need(uint(index), f"{what}: the encoding index is not a uint")
             out = {"dtype": dtype, "shape": shape}
-            if data_ is not None and enc is None and parts is None:
-                need(isinstance(data_, dict), "data is not an object")
-                out["data"] = parse_location(data_, dtype, shape, chunks, f"{name}/{key}")
-            elif data_ is None and isinstance(enc, dict) and isinstance(parts, list) and parts:
-                scheme = field(enc, "scheme", str)
-                need(scheme != "", "empty scheme")
-                out["encoding"] = {"scheme": scheme, "params": field(enc, "params", dict, optional=True)}
-                out["parts"] = {}
-                for p in named(parts, "role", f"{name}/{key} parts"):
-                    role = p["role"]
-                    need(role != "", f"{name}/{key}: an empty role")
-                    pd, ps = field(p, "dtype", str), field(p, "shape", list)
-                    loc = parse_location(p, pd, ps, chunks, f"{name}/{key} part {role}")
-                    out["parts"][role] = {"dtype": pd, "shape": ps, **loc}
+            if index == 0:
+                out["data"] = location(body, dtype, shape, chunks, rooms, what)
             else:
-                raise invalid(f"{name}/{key}: not data xor encoding+parts")
+                need(index <= len(encodings) and index - 1 <= cited, f"{what}: encoding {index} out of range or order")
+                cited = max(cited, index)
+                need(type(body) is list and body, f"{what}: no parts")
+                out["encoding"], out["parts"] = encodings[index - 1], {}
+                for p in body:
+                    role, pd, ps, loc = record(p, 4, f"{what} part")[:4]
+                    need(type(role) is str and role != "" and role not in out["parts"], f"{what}: bad or repeated role")
+                    byte_len(pd, ps)
+                    loc = location(loc, pd, ps, chunks, rooms, f"{what} part {role}")
+                    out["parts"][role] = {"dtype": pd, "shape": ps, **loc}
             tensors[key] = out
         components[name] = tensors
-    meta = field(doc, "metadata", dict, optional=True)
+    need(cited == len(encodings), f"{cited} of {len(encodings)} encodings are cited")
+    need(type(meta) is dict, "metadata is not a map")
+    for v in [meta, *(e["params"] for e in encodings)]:
+        no_bytes(v)
     return {"chunks": chunks, "components": components, "metadata": meta}
+
+
+def no_bytes(v):
+    """Metadata and params hold values: no byte strings (only later fields may)."""
+    need(type(v) is not bytes, "a byte string value")
+    for x in v.values() if type(v) is dict else v if type(v) is list else ():
+        no_bytes(x)
+
+
+def project(item):
+    """The diagnostic projection: the CBOR tree as JSON, byte strings as {"hex": ...}."""
+    if type(item) is bytes:
+        return {"hex": item.hex()}
+    if type(item) is list:
+        return [project(x) for x in item]
+    if type(item) is dict:
+        return {k: project(v) for k, v in item.items()}
+    return item
+
+
+def unproject(item):
+    if type(item) is dict and list(item) == ["hex"]:
+        return bytes.fromhex(item["hex"])
+    if type(item) is list:
+        return [unproject(x) for x in item]
+    if type(item) is dict:
+        return {k: unproject(v) for k, v in item.items()}
+    return item
+
+
+def encode(projection) -> bytes:
+    """A header's canonical bytes from its projection."""
+    return cbor2.dumps(unproject(projection), canonical=True)
 
 
 # ------------------------------------------------------------------- store
@@ -272,13 +378,16 @@ E5M2 = (np.arange(256, dtype=np.uint16) << 8).view(np.float16).astype(np.float32
 E2M1 = np.array([0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6], np.float32)
 
 
+E8M0 = np.array([2.0 ** (b - 127) if b < 255 else np.nan for b in range(256)], np.float32)
+
+
 def values(dtype: str, data: bytes) -> np.ndarray:
     raw = np.frombuffer(data, np.uint8)
     if dtype == "F32":
         return np.frombuffer(data, "<f4").astype(np.float32)
     if dtype == "F4":
         return E2M1[np.stack([raw & 15, raw >> 4], -1).reshape(-1)]
-    return {"F8_E4M3": E4M3, "F8_E5M2": E5M2}[dtype][raw]
+    return {"F8_E4M3": E4M3, "F8_E5M2": E5M2, "F8_E8M0": E8M0}[dtype][raw]
 
 
 def to_dtype(dtype: str, x: np.ndarray) -> bytes:
@@ -319,11 +428,23 @@ def hadamard(x: np.ndarray, k: int) -> np.ndarray:
 
 
 SCHEMES = {  # scheme: (required parts, optional parts, params)
-    "fp8-rowwise": ({"weight", "scale"}, set(), {"axis"}),
-    "fp8-tensorwise": ({"weight", "scale"}, {"input_scale"}, set()),
-    "int8-convrot": ({"weight", "scale"}, set(), {"block", "rotation"}),
-    "nvfp4": ({"weight", "scale", "scale_2"}, {"input_scale"}, {"block"}),
+    "fp8.tensorwise": ({"weight", "scale"}, {"input_scale"}, set()),
+    "fp8.rowwise": ({"weight", "scale"}, set(), {"axis"}),
+    "int8.tensorwise": ({"weight", "scale"}, {"input_scale"}, set()),
+    "int8.rowwise": ({"weight", "scale"}, set(), {"axis"}),
+    "int8.convrot": ({"weight", "scale"}, set(), {"rotation", "rotation_size"}),
+    "mxfp8": ({"weight", "scale"}, set(), {"block_size", "scale_layout"}),
+    "nvfp4": ({"weight", "scale", "scale_2"}, {"input_scale"},
+              {"block_size", "global_scale", "nibble_order", "scale_layout"}),
 }
+FP8 = ("F8_E4M3", "F8_E5M2")
+
+
+def blocked(rows: int, blocks: int) -> np.ndarray:
+    """Where cuBLAS's 128x4-tiled layout stores block scale (i, b), for every i and b."""
+    i, b = np.arange(rows)[:, None], np.arange(blocks)[None, :]
+    tiles = -(-blocks // 4)
+    return ((i // 128) * tiles + b // 4) * 512 + (i % 32) * 16 + (i % 128 // 32) * 4 + b % 4
 
 
 def decode(dtype: str, shape: list, encoding: dict, parts: dict) -> bytes:
@@ -342,13 +463,24 @@ def _decode(dtype: str, shape: list, encoding: dict, parts: dict) -> bytes:
     required, optional, names = SCHEMES[scheme]
     if not required <= parts.keys() <= required | optional:
         raise fail(f"parts {sorted(parts)}")
-    if not params.keys() <= names:
+    if not params.keys() <= names:  # params drive the decode: an unknown one is refused
         raise fail(f"params {sorted(params)}")
+
+    def param(name, allowed):
+        if params.get(name) not in allowed or type(params.get(name)) is bool:
+            raise fail(f"param {name}={params.get(name)!r}")
+        return params[name]
+
     if dtype not in ("F32", "BF16", "F16"):
         raise fail(f"logical dtype {dtype}")
-    if scheme != "fp8-tensorwise" and len(shape) != 2:
+    numel = int(np.prod(shape, dtype=np.int64))
+    if scheme.endswith(".tensorwise"):
+        rows, cols = 1, numel
+    elif len(shape) >= 2:  # the last axis, and every leading axis as rows
+        cols = shape[-1]
+        rows = numel // cols if cols else 0
+    else:
         raise fail(f"shape {shape}")
-    rows, cols = shape if len(shape) == 2 else (1, int(np.prod(shape, dtype=np.int64)))
 
     def part(role, dtypes, want=None, count=None):
         pd, ps, data = parts[role]
@@ -357,42 +489,58 @@ def _decode(dtype: str, shape: list, encoding: dict, parts: dict) -> bytes:
             raise fail(f"part {role} is {pd} {ps}")
         return np.frombuffer(data, np.int8).astype(np.int64) if pd == "I8" else values(pd, data)
 
-    def param(name):
-        v = params.get(name)
-        return v if uint(v) else None
+    def scales(blocks, dtype_):
+        """Block scale (i, b) for every row i and block b, from either layout."""
+        if param("scale_layout", ("row_major", "cublas_128x4")) == "row_major":
+            return part("scale", (dtype_,), want=[*shape[:-1], blocks]).reshape(rows, blocks)
+        stored = [128 * -(-rows // 128), 4 * -(-blocks // 4)]
+        return part("scale", (dtype_,), want=stored)[blocked(rows, blocks)]
 
-    fp8 = ("F8_E4M3", "F8_E5M2")
-    if scheme == "fp8-rowwise":
-        axis = param("axis")
-        if axis not in (0, 1):
-            raise fail("axis")
-        w = part("weight", fp8, want=shape).reshape(rows, cols)
-        s = part("scale", ("F32",), count=shape[axis])
-        out = w * (s.reshape(rows, 1) if axis == 0 else s.reshape(1, cols))
-    elif scheme == "fp8-tensorwise":
-        w = part("weight", fp8, want=shape)
+    if scheme.endswith(".tensorwise"):
+        w = part("weight", FP8 if scheme == "fp8.tensorwise" else ("I8",), want=shape)
         s = narrow(dtype, part("scale", ("F32",), count=1)[0])
         if "input_scale" in parts:
             part("input_scale", ("F32",), count=1)
-        out = w * s
-    elif scheme == "int8-convrot":
-        block = param("block") or 0
-        k = next((k for k in range(1, 9) if 4**k == block), None)
-        if k is None or params.get("rotation") != "hadamard" or cols % block:
-            raise fail(f"block {block}, rotation {params.get('rotation')!r}, {cols} columns")
-        w = part("weight", ("I8",), want=shape).reshape(rows, cols // block, block)
+        out = w.astype(np.float32) * s
+    elif scheme.endswith(".rowwise"):
+        w = part("weight", FP8 if scheme == "fp8.rowwise" else ("I8",), want=shape)
+        axis = param("axis", (0, 1))
+        s = part("scale", ("F32",), count=(rows, cols)[axis])
+        w = w.astype(np.float32).reshape(rows, cols)
+        out = w * (s.reshape(rows, 1) if axis == 0 else s.reshape(1, cols))
+    elif scheme == "int8.convrot":
+        param("rotation", ("hadamard",))
+        b = param("rotation_size", [4**k for k in range(1, 9)])
+        if cols % b:
+            raise fail(f"{cols} columns in blocks of {b}")
+        k = b.bit_length() // 2
+        w = part("weight", ("I8",), want=shape).reshape(rows, cols // b, b)
         s = part("scale", ("F32",), count=rows)
         h = hadamard(w, k).astype(np.float32).reshape(rows, cols)
         out = (h * s.reshape(rows, 1)) * np.float32(2.0**-k)
+    elif scheme == "mxfp8":
+        param("block_size", (32,))
+        n = -(-cols // 32)
+        s = scales(n, "F8_E8M0")
+        w = part("weight", FP8, want=shape).reshape(rows, cols)
+        out = w * np.repeat(s, 32, axis=1)[:, :cols]
     else:  # nvfp4
-        if param("block") != 16 or cols % 16:
-            raise fail("block")
+        param("block_size", (16,))
+        if cols % 16:
+            raise fail(f"{cols} columns in blocks of 16")
+        pd, ps, data = parts["weight"]
+        if param("nibble_order", ("low_first", "high_first")) == "high_first":
+            raw = np.frombuffer(data, np.uint8)
+            parts = {**parts, "weight": (pd, ps, ((raw << 4) | (raw >> 4)).astype(np.uint8).tobytes())}
         w = part("weight", ("F4",), want=shape).reshape(rows, cols // 16, 16)
-        s = part("scale", ("F8_E4M3",), want=[rows, cols // 16]).reshape(rows, cols // 16, 1)
-        s2 = part("scale_2", ("F32",), count=1)[0]
+        s = scales(cols // 16, "F8_E4M3").reshape(rows, cols // 16, 1)
+        g = part("scale_2", ("F32",), count=1)[0]
         if "input_scale" in parts:
             part("input_scale", ("F32",), count=1)
-        out = (w * s) * s2
+        if param("global_scale", ("multiply", "divide")) == "multiply":
+            out = (w * s) * g
+        else:
+            out = w * (s / g)
     return to_dtype(dtype, out)
 
 
@@ -434,12 +582,21 @@ def check(vectors: Path) -> int:
         failures.append("an explicit yanked version")
     parsers = {"header": parse_header, "manifest": parse_manifest, "repo": parse_repo}
     for verdict in ("green", "red"):
-        for path in sorted((vectors / verdict).glob("*.json")):
+        for path in sorted((vectors / verdict).iterdir()):
+            kind = path.name.split("-")[0]
+            if kind == "header" and path.suffix == ".json":
+                continue  # a green header's projection, checked with its bytes
+            data = path.read_bytes()
             try:
-                parsers[path.name.split("-")[0]](path.read_bytes())
+                parsers[kind](data)
                 ok = verdict == "green"
-            except Refused:
-                ok = verdict == "red"
+            except Refused as e:
+                ok = verdict == "red" and (e.code == "pre_cut") == path.name.startswith("header-pre-cut")
+            if ok and verdict == "green" and kind == "header":
+                projection = json.loads(path.with_suffix(".json").read_text())
+                # Decode to the projection; encode the projection to the same bytes (or, for a
+                # later version's fields, decode only: this writer drops them).
+                ok = project(strict(data)) == projection and encode(projection) == data
             passed += ok
             if not ok:
                 failures.append(f"{verdict}/{path.name}")

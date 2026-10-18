@@ -9,10 +9,11 @@ use std::path::{Path, PathBuf};
 
 use base64::Engine;
 use serde::Deserialize;
+use serde_json::Value as Json;
 use tensorfs_core::format::layout::{self, Item};
 use tensorfs_core::format::{
     repo_key, Body, Component, Dtype, Encoding, Error, Header, Location, Manifest, ObjectRef, Part,
-    Release, Repo, Tensor, HEADER_PATH,
+    Release, Repo, Tensor, HEADER_FORMAT, HEADER_PATH,
 };
 
 #[derive(Deserialize)]
@@ -301,6 +302,92 @@ fn reader_decodes_every_case() {
     assert!(checked >= 46, "{checked}");
 }
 
+/// A green header's projection (its CBOR tree as JSON, byte strings as `{"hex": ...}`) as a
+/// header, and whether it holds what this writer does not write (a minor tag, later fields).
+fn from_projection(p: &Json) -> (Header, bool) {
+    let list = |v: &Json| v.as_array().unwrap().clone();
+    let uint = |v: &Json| v.as_u64().unwrap();
+    let text = |v: &Json| v.as_str().unwrap().to_owned();
+    let root = list(p);
+    let mut later = root.len() > 5 || root[0] != HEADER_FORMAT;
+    let mut chunks = Vec::new();
+    for c in list(&root[1]) {
+        let c = list(&c);
+        later |= c.len() > 2;
+        chunks.push(ObjectRef {
+            sha256: text(&c[0]["hex"]),
+            length: uint(&c[1]),
+        });
+    }
+    let mut encodings = Vec::new();
+    for e in list(&root[2]) {
+        let e = list(&e);
+        later |= e.len() > 2;
+        encodings.push(Encoding {
+            scheme: text(&e[0]),
+            params: serde_json::from_value(e[1].clone()).unwrap(),
+        });
+    }
+    // A location, and whether it has later fields.
+    let at = |v: &Json| {
+        let v = list(v);
+        let l = Location {
+            chunk: uint(&v[0]),
+            offset: uint(&v[1]),
+            length: uint(&v[2]),
+        };
+        (l, v.len() > 3)
+    };
+    let mut components = Vec::new();
+    for c in list(&root[3]) {
+        let c = list(&c);
+        later |= c.len() > 2;
+        let mut tensors = Vec::new();
+        for t in list(&c[1]) {
+            let t = list(&t);
+            later |= t.len() > 5;
+            let shape = |v: &Json| list(v).iter().map(uint).collect::<Vec<u64>>();
+            let body = match uint(&t[3]) {
+                0 => {
+                    let (l, more) = at(&t[4]);
+                    later |= more;
+                    Body::Data(l)
+                }
+                i => Body::Encoded {
+                    encoding: encodings[i as usize - 1].clone(),
+                    parts: (list(&t[4]).iter())
+                        .map(|p| {
+                            let p = list(p);
+                            let (l, more) = at(&p[3]);
+                            later |= p.len() > 4 || more;
+                            Part {
+                                role: text(&p[0]),
+                                dtype: Dtype::parse(&text(&p[1])),
+                                shape: shape(&p[2]),
+                                chunk: l.chunk,
+                                offset: l.offset,
+                                length: l.length,
+                            }
+                        })
+                        .collect(),
+                },
+            };
+            tensors.push(Tensor {
+                key: text(&t[0]),
+                dtype: Dtype::parse(&text(&t[1])),
+                shape: shape(&t[2]),
+                body,
+            });
+        }
+        components.push(Component {
+            name: text(&c[0]),
+            tensors,
+        });
+    }
+    let metadata = serde_json::from_value(root[4].clone()).unwrap();
+    (Header::new(chunks, components, metadata).unwrap(), later)
+}
+
 #[test]
 fn green_documents_read_and_red_documents_refuse() {
     for (dir, green) in [("green", true), ("red", false)] {
@@ -308,12 +395,27 @@ fn green_documents_read_and_red_documents_refuse() {
         for entry in fs::read_dir(vectors().join(dir)).unwrap() {
             let path = entry.unwrap().path();
             let name = path.file_name().unwrap().to_string_lossy().to_string();
+            if name.starts_with("header-") && name.ends_with(".json") {
+                continue; // a green header's projection, checked with its bytes
+            }
             let bytes = fs::read(&path).unwrap();
             let read = match name.split('-').next().unwrap() {
                 "header" if name.starts_with("header-pre-cut") => {
                     let err = Header::from_cbor(&bytes).unwrap_err();
                     assert_eq!(err.code(), "pre_cut", "{name}: {err}");
                     Err(err)
+                }
+                "header" if green => {
+                    // Both ways: the bytes read as the projection says, and (unless they hold
+                    // what this writer does not write) the projection writes these bytes.
+                    let p: Json = serde_json::from_slice(&fs::read(path.with_extension("json")).unwrap()).unwrap();
+                    let (want, later) = from_projection(&p);
+                    let got = Header::from_cbor(&bytes);
+                    assert_eq!(got.as_ref().ok(), Some(&want), "{name}");
+                    if !later {
+                        assert!(want.to_cbor().unwrap() == bytes, "{name}: the writer's bytes differ");
+                    }
+                    got.map(drop)
                 }
                 "header" => Header::from_cbor(&bytes).map(drop),
                 "manifest" => Manifest::from_json(&bytes).map(drop),
