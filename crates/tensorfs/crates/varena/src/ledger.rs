@@ -23,7 +23,7 @@ pub const ROWS: u32 = 64;
 const HEADER: usize = 256;
 const ROW: usize = 256;
 const UUID: usize = 64;
-const FACTS: usize = 10;
+const FACTS: usize = 11;
 
 const FREE: u64 = 0;
 const LIVE: u64 = 1;
@@ -85,6 +85,8 @@ facts! {
     resident,
     /// Resident pages no `use` holds and nothing pins: an ask evicts them.
     cold,
+    /// The warm set's (`keep`) part of `cold`: asked for after every other row's cold bytes.
+    kept,
     /// Resident pages live tensors pin.
     pinned,
     torch_reserved,
@@ -119,10 +121,12 @@ impl Facts {
         sum(&[self.context, self.resident.saturating_sub(self.cold), self.activations()])
     }
 
-    /// The cold weights an ask evicts, and the rest it frees first (idle chunks, caches, slack).
-    fn reclaim(&self) -> (u64, u64) {
+    /// What an ask frees, in the order the owner frees it: idle chunks, caches and slack; cold
+    /// weights outside the warm set; the warm set's cold weights.
+    fn reclaim(&self) -> [u64; 3] {
         let cold = self.cold.min(self.resident);
-        (self.held().saturating_sub(self.unevictable()).saturating_sub(cold), cold)
+        let kept = self.kept.min(cold);
+        [self.held().saturating_sub(self.unevictable()).saturating_sub(cold), cold - kept, kept]
     }
 }
 
@@ -515,8 +519,9 @@ impl Ledger {
         (0..self.t.rows).filter_map(|i| self.t.read(i).transpose()).collect()
     }
 
-    /// Asks other live rows for `need` bytes: idle bytes first, then cold weights, least recently
-    /// used first, net of what others already asked of them. Sets each victim's want and rings
+    /// Asks other live rows for `need` bytes: idle bytes, then cold weights outside warm sets, then
+    /// warm sets' cold weights, each least recently used first, net of what others already asked
+    /// of them. Sets each victim's want and rings
     /// it. The victims may cover less than `need`.
     pub fn ask(&self, from: Option<u32>, need: u64) -> Result<Vec<Victim>> {
         let (mut victims, _) = pick(&self.snapshot()?, from, need);
@@ -622,20 +627,23 @@ impl Ledger {
 fn pick(rows: &[RowFacts], from: Option<u32>, need: u64) -> (Vec<Victim>, u64) {
     let mut lru: Vec<&RowFacts> = rows.iter().filter(|r| r.state == State::Live && Some(r.slot) != from).collect();
     lru.sort_by_key(|r| r.facts.last_use);
-    // A victim frees its quick bytes first, then cold weights; what it was already asked takes
-    // them in that order.
-    let avail: Vec<(u64, u64)> = lru
+    // What a victim was already asked takes its tiers in the order it frees them.
+    let avail: Vec<[u64; 3]> = lru
         .iter()
         .map(|r| {
-            let (quick, cold) = r.facts.reclaim();
-            (quick.saturating_sub(r.want), cold.saturating_sub(r.want.saturating_sub(quick)))
+            let mut asked = r.want;
+            r.facts.reclaim().map(|t| {
+                let taken = asked.min(t);
+                asked -= taken;
+                t - taken
+            })
         })
         .collect();
     let mut asked = vec![0u64; lru.len()];
     let mut left = need;
-    for pass in 0..2 {
-        for (a, (quick, cold)) in asked.iter_mut().zip(&avail) {
-            let take = left.min(if pass == 0 { *quick } else { *cold });
+    for tier in 0..3 {
+        for (a, avail) in asked.iter_mut().zip(&avail) {
+            let take = left.min(avail[tier]);
             *a += take;
             left -= take;
         }
