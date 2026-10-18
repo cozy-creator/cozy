@@ -54,6 +54,9 @@ struct RunArgs {
     /// Weight precision for every model; absent, the machine's rules choose per GPU.
     #[arg(long, value_parser = ["16", "8", "4"])]
     bits: Option<String>,
+    /// Pin an attention kernel for this run: everywhere, or at one `[slot/]component`.
+    #[arg(long, value_name = "[[SLOT/]COMPONENT=]KERNEL", value_parser = attention_pin, conflicts_with = "warm")]
+    attention_kernel: Option<String>,
     /// The whole payload from a JSON or YAML file; inline inputs override it.
     #[arg(long = "input", value_name = "FILE")]
     input_file: Option<PathBuf>,
@@ -305,6 +308,7 @@ pub(crate) async fn call(
         placement: placement.clone(),
         gpus: None,
         bits: None,
+        attention_kernel: None,
         input_file: None,
         assets: vec![],
         loras: vec![],
@@ -346,6 +350,7 @@ async fn invoke(
             callable,
             gpus: 0,
             bits,
+            attention_kernel: "",
         };
         let submission = call.submission(on, &hub.origin, &call.warm(level, &models)?, None, None);
         return send(ctx, submission, &terms.key, args.detach).await;
@@ -362,6 +367,7 @@ async fn invoke(
         callable,
         gpus,
         bits,
+        attention_kernel: args.attention_kernel.as_deref().unwrap_or_default(),
     };
     let out = args.out.map(|dir| terms.cwd.join(dir));
     let submission = call.submission(on, &hub.origin, &call.spec(&bound)?, Some(&bound), out);
@@ -392,6 +398,19 @@ fn bits(args: &RunArgs) -> u32 {
     args.bits
         .as_deref()
         .map_or(0, |b| b.parse().expect("clap admits 16, 8 or 4"))
+}
+
+/// `--attention-kernel`, in the grammar the Runtime reads (`KERNEL` or `[SLOT/]COMPONENT=KERNEL`,
+/// no whitespace); the Runtime judges the names.
+fn attention_pin(pin: &str) -> Result<String, String> {
+    let formed = match pin.split_once('=') {
+        None => !pin.is_empty(),
+        Some((scope, kernel)) => !scope.is_empty() && !kernel.is_empty() && !kernel.contains('='),
+    };
+    match formed && !pin.contains(char::is_whitespace) {
+        true => Ok(pin.to_owned()),
+        false => Err("use KERNEL or [SLOT/]COMPONENT=KERNEL, with no whitespace".into()),
+    }
 }
 
 /// Submits, then follows the run (or prints it at once with `detach`).
