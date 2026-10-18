@@ -63,6 +63,9 @@ struct RunArgs {
     /// Attach a file: `field.path=FILE`, `label=FILE`, or `FILE` into the declared assets.
     #[arg(long = "asset", value_name = "[NAME=]FILE")]
     assets: Vec<String>,
+    /// A hint for one attached asset: `label-or-index=auto|low|medium|high`.
+    #[arg(long = "asset-fidelity", value_name = "ASSET=FIDELITY", value_parser = fidelity)]
+    fidelities: Vec<String>,
     /// Apply a LoRA: `slot:component=ref[,strength]`, in order.
     #[arg(long = "lora", value_name = "SLOT:COMPONENT=REF")]
     loras: Vec<String>,
@@ -311,6 +314,7 @@ pub(crate) async fn call(
         attention_kernel: None,
         input_file: None,
         assets: vec![],
+        fidelities: vec![],
         loras: vec![],
         out: None,
         detach,
@@ -382,6 +386,7 @@ fn terms(ctx: &Context, args: &RunArgs) -> Result<Terms, Error> {
         inputs: args.inputs.clone(),
         input_file: args.input_file.clone(),
         assets: args.assets.clone(),
+        fidelities: args.fidelities.clone(),
         loras: args.loras.clone(),
         key: args
             .idempotency_key
@@ -410,6 +415,14 @@ fn attention_pin(pin: &str) -> Result<String, String> {
     match formed && !pin.contains(char::is_whitespace) {
         true => Ok(pin.to_owned()),
         false => Err("use KERNEL or [SLOT/]COMPONENT=KERNEL, with no whitespace".into()),
+    }
+}
+
+/// `--asset-fidelity`'s form; which asset it names is checked as the run binds.
+fn fidelity(term: &str) -> Result<String, String> {
+    match term.rsplit_once('=') {
+        Some((asset, "auto" | "low" | "medium" | "high")) if !asset.is_empty() => Ok(term.into()),
+        _ => Err("use LABEL-OR-INDEX=auto|low|medium|high".into()),
     }
 }
 

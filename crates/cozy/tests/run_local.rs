@@ -628,6 +628,74 @@ fn an_attention_kernel_pin_reaches_the_executor_and_run_show() {
     );
 }
 
+/// `--asset-fidelity` puts its hint on the attached asset its label or index names, and the
+/// package reads it from the input its machine received; one naming no attached asset is refused
+/// before the run is submitted.
+#[test]
+fn asset_fidelity_reaches_the_package_by_label_or_index() {
+    let Some(home) = Home::new() else { return };
+    if std::env::var_os("COZY_TEST_TENSORD").is_none() {
+        eprintln!("skipped: no TensorD (COZY_TEST_TENSORD is unset)");
+        return;
+    }
+    let _machine = common::tensord::added(&home, "m1");
+    let work = home.path().join("work");
+    copy(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/package/tiny"),
+        &work.join("tiny"),
+    );
+    let code = work.join("tiny/tiny/__init__.py");
+    let fidelity = "\n\nfrom cozy_runtime.author import Assets, ImageAsset\n\n\n\
+                    class FidelityInput(msgspec.Struct):\n    note: str = \"\"\n\n\n\
+                    class FidelityOutput(msgspec.Struct):\n    fidelity: dict[str, str]\n\n\n\
+                    @app.entrypoint(accelerator=False)\n\
+                    def fidelity(payload: FidelityInput, assets: Assets[ImageAsset]) -> FidelityOutput:\n    \
+                    infos = [assets.info(i) for i in range(len(assets))]\n    \
+                    return FidelityOutput({i.label or str(i.position): i.fidelity for i in infos})\n";
+    let mut text = std::fs::read_to_string(&code).unwrap();
+    text.push_str(fidelity);
+    std::fs::write(&code, text).unwrap();
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/media/azul.png"),
+        work.join("azul.png"),
+    )
+    .unwrap();
+    let run = |second: &str| {
+        let args = [
+            "--json",
+            "run",
+            "./tiny/fidelity",
+            "--asset",
+            "woman=./azul.png",
+            "--asset",
+            "./azul.png",
+            "--asset",
+            "./azul.png",
+            "--asset-fidelity",
+            "woman=high",
+            "--asset-fidelity",
+            second,
+            "--on",
+            "m1",
+        ];
+        cozy(&home, &work, &args)
+    };
+
+    let done = completed(&run("1=low"));
+    assert_eq!(
+        done["result"]["fidelity"],
+        serde_json::json!({"woman": "high", "1": "low", "2": "auto"}),
+        "{done}"
+    );
+
+    let refused = run("3=low");
+    assert_eq!(refused.code, 2, "{refused:?}");
+    assert!(
+        refused.stdout.contains("asset_fidelity_unmatched"),
+        "{refused:?}"
+    );
+}
+
 /// Counts the bytes sent to `target` through it: a TCP relay a machine is added behind.
 struct Relay {
     address: String,
