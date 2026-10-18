@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use super::{PackageRef, release_order};
 use crate::{
     Context,
+    machine::{Notices, route, until_ready},
     output::{self, Table},
     run,
 };
@@ -179,7 +180,8 @@ async fn installed(
 }
 
 /// The machines this command reads: `on` alone, read from the machine now (so a run that just
-/// settled shows), or every ready one as Calcifer last saw it.
+/// settled shows), or every ready one as Calcifer last saw it. A booting `on` is waited for, as a
+/// run sent to it waits.
 async fn machines(ctx: &Context, on: Option<&On>) -> Result<Vec<Machine>, Error> {
     let calcifer = ctx.calcifer().await?;
     let Some(on) = on else {
@@ -189,7 +191,20 @@ async fn machines(ctx: &Context, on: Option<&On>) -> Result<Vec<Machine>, Error>
             .filter(|m| m.state == MachineState::Ready)
             .collect());
     };
-    let path = format!("/v1/machines/{}", named(on)?.to_ascii_lowercase());
+    let mut machine: Machine = calcifer
+        .get(&route(&named(on)?.to_ascii_lowercase())?)
+        .await?;
+    if machine.state == MachineState::Booting {
+        let name = machine.name.clone();
+        output::say(ctx, &format!("waiting for {name} to start"));
+        machine = until_ready(ctx, machine, Notices::default())
+            .await?
+            .ok_or_else(|| {
+                let message = format!("{name} has not started; nothing was sent to it");
+                Error::new(Kind::Unavailable, "machine_booting", message)
+            })?;
+    }
+    let path = route(&machine.name.to_ascii_lowercase())?;
     let machine: Machine = calcifer.get_query(&path, &[("fresh", "true")]).await?;
     Ok(vec![machine])
 }

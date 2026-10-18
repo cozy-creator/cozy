@@ -24,6 +24,43 @@ fn json(home: &Home, dir: &Path, args: &[&str]) -> Value {
     serde_json::from_str(&out.stdout).unwrap_or_else(|e| panic!("{e}: {out:?}"))
 }
 
+/// Runs `args` and answers what it printed. One still running after `minutes` is killed and fails
+/// the test with its output so far: a hang bound for the test, never the product's.
+fn bounded(home: &Home, dir: &Path, args: &[&str], minutes: u64) -> Out {
+    let file = |name: &str| home.path().join(format!("bounded.{name}"));
+    let mut child = home
+        .command()
+        .current_dir(dir)
+        .args(args)
+        .stdout(std::fs::File::create(file("out")).unwrap())
+        .stderr(std::fs::File::create(file("err")).unwrap())
+        .spawn()
+        .unwrap();
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(minutes * 60);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if std::time::Instant::now() > until {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    };
+    let read = |name: &str| std::fs::read_to_string(file(name)).unwrap_or_default();
+    let out = Out {
+        code: status.and_then(|s| s.code()).unwrap_or(-1),
+        stdout: read("out"),
+        stderr: read("err"),
+    };
+    assert!(
+        status.is_some(),
+        "{args:?} still ran after {minutes} min: {out:?}"
+    );
+    out
+}
+
 /// What a person debugging this test wants: the runs and the machine as Calcifer holds them.
 fn state(home: &Home, dir: &Path) -> String {
     let runs = cozy(home, dir, &["--json", "run", "list"]);
@@ -204,6 +241,63 @@ fn an_unversioned_install_takes_the_hubs_newest_release() {
         ),
         (Some("run.completed"), Some("0.1.2")),
         "{submitted}\n{watched:?}"
+    );
+}
+
+/// R's sequence (tensorhub 39107019882): `package update --on` right after `machine rent --detach`
+/// was refused while the rental booted. Each verb sent the moment its rental is rented (the CI
+/// Hub's docker provider) now waits for it: update, list and remove say so and answer once it
+/// starts, and an install queues and lands.
+#[test]
+fn package_verbs_sent_to_a_booting_rental_wait_for_it() {
+    let Some(home) = Home::with_hub() else { return };
+    home.sign_in("booting@cozy.test");
+    let package = package::publish(&home, "tiny", "0.1.0");
+    let dir = package::project(&home, "tiny");
+    // R's sequence for each verb: rent, then the verb at once, while the rental boots. The CI
+    // Hub's docker provider boots one container at a time, so each rental ends before the next.
+    let sent = |verb: &[&str], after: &dyn Fn(&str)| {
+        let rented = json(&home, &dir, &["machine", "rent", "cpu", "--detach"]);
+        assert_eq!(rented["machine"]["state"], "booting", "{rented}");
+        let rental = rented["machine"]["rental_id"].as_str().unwrap().to_owned();
+        eprintln!("{verb:?} --on {rental}, booting");
+        let out = bounded(&home, &dir, &[verb, &["--on", &rental]].concat(), 10);
+        eprintln!("{out:?}");
+        after(&rental);
+        let ended = json(&home, &dir, &["machine", "end", &rental]);
+        assert_eq!(ended["machine"]["state"], "ended", "{ended}");
+        out
+    };
+    let nothing = |_: &str| {};
+    let update = sent(&["package", "update"], &nothing);
+    let list = sent(&["package", "list", "--once"], &nothing);
+    let remove = sent(&["package", "remove", &package], &nothing);
+    let holds = |rental: &str| {
+        let listed = json(&home, &dir, &["package", "list", "--on", rental]);
+        assert_eq!(listed["packages"][0]["release"], "0.1.0", "{listed}");
+    };
+    let install = sent(&["--json", "package", "install", &package], &holds);
+    for out in [&update, &list, &remove] {
+        assert!(out.stderr.contains(" to start"), "it did not wait: {out:?}");
+    }
+    assert_eq!(update.code, 0, "{update:?}");
+    assert!(
+        update.stdout.contains("Model downloads: skipped"),
+        "{update:?}"
+    );
+    assert_eq!(list.code, 0, "{list:?}");
+    assert!(list.stdout.contains("No packages installed"), "{list:?}");
+    assert_eq!(remove.code, 1, "{remove:?}");
+    assert!(
+        remove.stdout.contains("(package_not_installed)"),
+        "{remove:?}"
+    );
+    let last: Option<Value> =
+        (install.stdout.lines().rev()).find_map(|l| serde_json::from_str(l).ok());
+    assert_eq!(
+        (install.code, last.as_ref().and_then(|l| l["type"].as_str())),
+        (0, Some("run.completed")),
+        "{install:?}"
     );
 }
 
