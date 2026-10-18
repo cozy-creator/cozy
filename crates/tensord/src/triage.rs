@@ -5,11 +5,11 @@
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, OpenOptions},
     io::{self, Write},
-    os::unix::fs::OpenOptionsExt,
     path::Path,
 };
+use cozy_platform::durable::Mode;
 use tensorfs_core::sha256;
 
 /// `TriageBundleRef.length` is bounded at 1 MiB by the protocol; fields are capped well below.
@@ -51,6 +51,40 @@ pub fn ends(text: &str, limit: usize) -> String {
     let head = limit / 4;
     let tail = limit.saturating_sub(head + MARK.len());
     text.chars().take(head).chain(MARK.chars()).chain(text.chars().skip(count - tail)).collect()
+}
+
+/// `scheme://user:secret@host` becomes `scheme://***@host`.
+pub fn masked(text: &str) -> String {
+    let (mut out, mut rest) = (String::new(), text);
+    while let Some(at) = rest.find("://") {
+        let (head, after) = rest.split_at(at + 3);
+        out.push_str(head);
+        let authority = after.find(|c: char| c.is_whitespace() || c == '/').unwrap_or(after.len());
+        rest = match after[..authority].rfind('@') {
+            Some(user) => {
+                out.push_str("***");
+                &after[user..]
+            }
+            None => after,
+        };
+    }
+    out + rest
+}
+
+/// What travels with a failed run (its log and `Reason.detail`): its bundle's traceback, else
+/// its executor's stderr, the last `DETAIL_LINES` lines within `DETAIL_BYTES`, secrets masked.
+pub fn detail(bundle: &[u8]) -> Option<String> {
+    const DETAIL_LINES: usize = 40;
+    const DETAIL_BYTES: usize = 8 << 10;
+    let bundle: serde_json::Value = serde_json::from_slice(bundle).ok()?;
+    let text = [&bundle["terminal"]["traceback"], &bundle["executor"]["stderr_tail"]]
+        .into_iter()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::trim)
+        .find(|text| !text.is_empty())?;
+    let lines: Vec<&str> = text.lines().collect();
+    let tail = lines[lines.len().saturating_sub(DETAIL_LINES)..].join("\n");
+    Some(masked(capped(&tail, DETAIL_BYTES)))
 }
 
 fn capped(text: &str, limit: usize) -> &str {
@@ -104,7 +138,7 @@ pub fn write(
     file.write_all(&bytes)?;
     file.sync_all()?;
     fs::rename(&pending, &path)?;
-    File::open(&directory)?.sync_all()?;
+    cozy_platform::durable::sync_dir(&directory)?;
     Ok(TriageRef {
         subject_id,
         sha256: sha256::hex(&sha256::digest(&bytes)),
@@ -136,4 +170,24 @@ pub fn read(root: &Path, triage: &TriageRef) -> io::Result<Vec<u8>> {
         ));
     }
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The traceback's last lines, secrets masked; an empty traceback falls back to stderr.
+    #[test]
+    fn a_failures_detail_is_its_traceback_tail_masked() {
+        let lines: Vec<String> = (0..60).map(|n| format!("  frame {n}")).collect();
+        let traceback = format!("{}\nValueError: fetch https://user:tok@hub.example/x failed", lines.join("\n"));
+        let bundle = json!({"terminal": {"traceback": traceback}, "executor": {"stderr_tail": "ignored"}});
+        let tail = detail(bundle.to_string().as_bytes()).unwrap();
+        assert_eq!(tail.lines().count(), 40, "{tail}");
+        assert!(tail.ends_with("ValueError: fetch https://***@hub.example/x failed"), "{tail}");
+        assert!(!tail.contains("frame 20\n"), "{tail}");
+        let crashed = json!({"terminal": {"traceback": ""}, "executor": {"stderr_tail": "Fatal Python error: Segmentation fault\n"}});
+        assert_eq!(detail(crashed.to_string().as_bytes()).unwrap(), "Fatal Python error: Segmentation fault");
+        assert_eq!(detail(json!({"terminal": {}, "executor": {}}).to_string().as_bytes()), None);
+    }
 }

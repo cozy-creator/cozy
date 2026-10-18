@@ -5,9 +5,9 @@ use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File, OpenOptions},
     io,
-    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     sync::Arc,
+    time::SystemTime,
 };
 
 /// The package a Runtime's built-in operations run as: every environment holds them.
@@ -54,16 +54,11 @@ pub struct Callee {
     pub interface: serde_json::Value,
     #[serde(default)]
     pub source_digest: String,
-    #[serde(default)]
     pub package: String,
 }
 impl Generation {
-    /// A legacy bare distribution names the same local App, without changing an accepted
-    /// invocation or pretending it is a published package.
     pub(crate) fn owns(&self, application: &str, package: &str) -> bool {
-        self.app(application).is_some_and(|(expected, ..)| {
-            expected == package || (!package.contains('/') && expected == format!("local/{}", normalized(package)))
-        })
+        self.app(application).is_some_and(|(expected, ..)| expected == package)
     }
 
     /// The widest GPU group any constructing entrypoint of this environment (its own App's or
@@ -120,7 +115,7 @@ impl Catalog {
     pub fn new(root: &Path) -> io::Result<Self> {
         fs::create_dir_all(root)?;
         Ok(Self {
-            root: root.canonicalize()?,
+            root: cozy_platform::durable::canonical(root)?,
         })
     }
     pub fn resolve(&self, identity: &str) -> io::Result<HeldGeneration> {
@@ -135,41 +130,40 @@ impl Catalog {
         }
         let directory = self.root.join(identity);
         if directory.symlink_metadata()?.file_type().is_symlink()
-            || directory.canonicalize()? != directory
+            || cozy_platform::durable::canonical(&directory)? != directory
         {
             return Err(invalid(
                 "generation directory must not be an alias or symlink",
             ));
         }
-        let hold = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(directory.join(".hold"))?;
+        let hold = cozy_platform::durable::open_nofollow(&directory.join(".hold"), OpenOptions::new().read(true))?;
         FileExt::lock_shared(&hold)?;
         // Last use, for least-recently-used eviction of unheld generations.
-        // SAFETY: a live descriptor; a null time sets both times to now.
-        unsafe { libc::futimens(std::os::fd::AsRawFd::as_raw_fd(&hold), std::ptr::null()) };
-        let manifest = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(directory.join("generation.json"))?;
-        let mut record: Generation = serde_json::from_reader(manifest).map_err(io::Error::other)?;
-        // Older generations recorded only the distribution. That is local code, never a
-        // bare identity to send to the Hub's package-binding route.
-        for callee in &mut record.callees {
-            if callee.package.is_empty() {
-                callee.package = format!("local/{}", normalized(&callee.distribution));
-            }
-        }
+        let now = SystemTime::now();
+        let times = fs::FileTimes::new().set_accessed(now).set_modified(now);
+        let _ = cozy_platform::durable::set_times(&directory.join(".hold"), times);
+        let manifest = cozy_platform::durable::open_nofollow(&directory.join("generation.json"), OpenOptions::new().read(true))?;
+        let record: Generation = serde_json::from_reader(manifest).map_err(io::Error::other)?;
         if record.identity != identity {
             return Err(invalid("generation identity differs from its installation"));
         }
         let expected = cozy_platform::paths::venv_python(&directory.join("env"));
         // The venv's interpreter may be a symlink into uv's immutable interpreter store.
-        if record.python != expected || !record.python.is_file() {
-            return Err(invalid(
-                "generation interpreter does not name its held environment",
-            ));
+        if record.python != expected {
+            return Err(invalid(&format!(
+                "generation interpreter {} does not name its held environment's {}",
+                record.python.display(),
+                expected.display()
+            )));
+        }
+        match fs::metadata(&record.python) {
+            Ok(metadata) if metadata.is_file() => (),
+            found => {
+                return Err(invalid(&format!(
+                    "generation interpreter {} is not a file: {found:?}",
+                    record.python.display()
+                )))
+            }
         }
         Ok(HeldGeneration {
             record,

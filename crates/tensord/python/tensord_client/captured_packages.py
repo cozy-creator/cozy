@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import configparser
 import email.parser
+import itertools
 import os
 import shutil
 import subprocess
@@ -17,6 +18,7 @@ from packaging.specifiers import SpecifierSet
 from packaging.utils import canonicalize_name
 from packaging.version import Version
 
+from . import layout
 from .package_records import Dependency, Describe, DescribeInstalled, DESCRIPTION_DECODER, PackageMetadata
 from .packages import PackageError, in_environment, publish_generation, read_metadata
 
@@ -60,7 +62,7 @@ def linked_applications(interpreter: Path) -> list[str]:
     """Installed distributions that declare an App and were linked, not copied: the Runtime's
     static reader describes only copied ones (a callee package among the locked dependencies)."""
     names = []
-    for site in interpreter.parents[1].glob("lib/python*/site-packages"):
+    for site in layout.site_packages(interpreter.parents[1]):
         for metadata in site.glob("*.dist-info"):
             entries = metadata / "entry_points.txt"
             if entries.is_symlink() and "[cozy.application]" in entries.read_text():
@@ -81,11 +83,24 @@ def conflicts(interpreter: Path, step: subprocess.CompletedProcess | None = None
     return {line for line in lines if line.startswith("The package") and not line.endswith("was built for a different platform")}
 
 
-def machine_sdk(interpreter: Path, sdk: list[Path], capture) -> str:
+SDK = {"cozy-runtime", "tensorfs"}
+
+
+def pair_bound(finding: str) -> bool:
+    """Whether a check finding (`The package `x` requires `tensorfs==0.10.0`, but ...`) is a
+    bound on the Runtime or TensorFS."""
+    required = finding.partition("` requires `")[2]
+    return canonicalize_name("".join(itertools.takewhile(lambda c: c.isalnum() or c in "-_.", required)) or "-") in SDK
+
+
+def machine_sdk(interpreter: Path, sdk: list[Path], capture, runtime_build: str = "") -> str:
     """The machine's own Runtime/TensorFS pair over the captured closure, every other selected
     version constrained, where every installed requirement admits it (uv's check). Else the
     capture's own pair (a vendored dev Runtime, say) is restored: a package's bounds are never
-    overridden. Returns "" for the machine's pair, else why and what runs instead; never silent."""
+    overridden, except by a development Runtime an update named (`--runtime-wheel`,
+    `runtime_build`): the operator's choice runs whatever the package's bounds on the pair, which
+    the warning names, and one that cannot install refuses the package, as for a release.
+    Returns "" for the machine's pair, else why and what runs instead; never silent."""
     pair = {canonicalize_name(wheel.name.split("-")[0]) for wheel in sdk}
     # A conflict the capture already has is not the pair's doing: the pair is refused only for one it adds.
     before = conflicts(interpreter)
@@ -97,10 +112,19 @@ def machine_sdk(interpreter: Path, sdk: list[Path], capture) -> str:
     sys.stderr.write(step.stderr)
     if step.returncode == 0:
         step = subprocess.run(["uv", "pip", "check", "--python", str(interpreter)], capture_output=True, text=True)
-        if step.returncode == 0 or conflicts(interpreter, step) <= before:
+        added = conflicts(interpreter, step) - before
+        if step.returncode == 0 or not added:
             return ""
+        if runtime_build and all(map(pair_bound, added)):
+            regardless = (f"{'; '.join(sorted(added))}; this machine's development Runtime {runtime_build} "
+                          "(`--runtime-wheel`) runs it regardless")
+            print(regardless, file=sys.stderr)
+            return regardless
     reason = [line.strip() for line in ((step.stdout or "") + step.stderr).splitlines()
               if line.strip() and not line.startswith(("Using Python", "Checked "))][-12:]
+    if runtime_build:
+        raise PackageError("package_installation_uv_failed",
+                           f"this machine's development Runtime {runtime_build} cannot run this package: {' | '.join(reason)[:2000]}")
     capture()
     own = ", ".join(f"{row.name}=={row.version}" for row in inventory(interpreter) if canonicalize_name(row.name) in pair)
     fallback = (f"this machine's own Runtime and TensorFS did not install ({' '.join(map(str, step.args[:3]))}: "
@@ -120,16 +144,17 @@ def interpreter_for(python: str, python_requires: str, python_version: str) -> s
     return python
 
 
-def add_client(interpreter: Path, constraints: Path, client_wheel: Path) -> None:
+def add_client(interpreter: Path, constraints: Path, client_wheel: Path, runtime_build: str = "") -> None:
     """The machine client beside a selected closure: it may add its own dependencies only
-    without changing one already selected package or SDK version (uv reports any conflict)."""
+    without changing one already selected package or SDK version (uv reports any conflict). A
+    development Runtime's misses of the package's bounds on the pair are the operator's choice."""
     locked = inventory(interpreter)
     constraints.write_text("".join(f"{row.name}=={row.version}\n" for row in locked))
     subprocess.run(["uv", "pip", "install", *COPY, "--python", str(interpreter), "-c", str(constraints), str(client_wheel)], check=True)
     after = {canonicalize_name(row.name): row.version for row in inventory(interpreter)}
     if any(after.get(canonicalize_name(row.name)) != row.version for row in locked):
         raise PackageError("package_lock_changed", "client installation changed the captured dependency closure")
-    if found := sorted(conflicts(interpreter)):
+    if found := sorted(f for f in conflicts(interpreter) if not (runtime_build and pair_bound(f))):
         raise PackageError("package_dependency_conflict", "; ".join(found)[:2000])
 
 
@@ -138,7 +163,7 @@ def live_paths(environment: Path) -> None:
     all the same, and the Runtime's static reader, which never interprets such a line, reads the
     environment's installed packages without following the project out of it: the project is
     described from its own directory."""
-    for path in environment.glob("lib/python*/site-packages/*.pth"):
+    for path in (pth for site in layout.site_packages(environment) for pth in site.glob("*.pth")):
         lines = path.read_text().splitlines()
         live = [line for line in lines if line and not line.startswith(("#", "import ", "import\t"))
                 and not (path.parent / line.rstrip()).resolve().is_relative_to(environment.resolve())]
@@ -148,7 +173,7 @@ def live_paths(environment: Path) -> None:
 
 def install_editable(*, project: Path, environment: Path, wheels: list[Path], distribution: str, release: str,
                      python_requires: str, python_version: str, generations: Path, client_wheel: Path,
-                     python: str, sdk: list[Path] = (), callees: dict[str, str] | None = None,
+                     python: str, sdk: list[Path] = (), runtime_build: str = "", callees: dict[str, str] | None = None,
                      indexes: list[str] = (), source_digest: str = ""):
     """Install editable in the controller's source home and environment. Remote captures keep
     separate source homes/environments; direct local paths reuse their live environment while
@@ -162,7 +187,7 @@ def install_editable(*, project: Path, environment: Path, wheels: list[Path], di
     metadata = read_metadata(project)
     if canonicalize_name(metadata.name) != canonicalize_name(distribution) or Version(metadata.version) != Version(release):
         raise PackageError("package_metadata_changed", "the live project declares another package release")
-    interpreter, ready = environment / "bin" / "python", environment / ".ready"
+    interpreter, ready = layout.interpreter(environment), environment / ".ready"
     if not ready.is_file():
         shutil.rmtree(environment, ignore_errors=True)  # a build that never finished
         environment.parent.mkdir(parents=True, exist_ok=True)
@@ -170,7 +195,9 @@ def install_editable(*, project: Path, environment: Path, wheels: list[Path], di
         def capture(machine: set[str] = frozenset()):
             """The project's own selection, without the `machine` SDK distributions the machine's pair
             replaces next (the lock's may not install here: TensorFS has no aarch64 wheel on PyPI).
-            Run again with none, it restores what the machine's pair replaced."""
+            An unlocked project resolves with the pair's wheels offered, where its bounds admit
+            them: PyPI's may not install here either (no macOS TensorFS wheel). Run again with
+            none, it restores what the machine's pair replaced."""
             if (project / "uv.lock").is_file():
                 # Each carried distribution at the version the lock selected, from its own
                 # files (uv picks the one this platform takes); the lock installs the rest,
@@ -195,12 +222,15 @@ def install_editable(*, project: Path, environment: Path, wheels: list[Path], di
                 subprocess.run(["uv", "venv", "--allow-existing", "--python", python, str(environment)], check=True)
                 found = ["--find-links", str(wheels[0].parent)] if wheels else []
                 named = [f"--index={index}" for index in indexes]
-                subprocess.run(["uv", "pip", "install", "--python", str(interpreter), *found, *named, "--editable", str(project)], check=True)
+                install = ["uv", "pip", "install", "--python", str(interpreter), *found, *named, "--editable", str(project)]
+                offered = [str(wheel) for wheel in sdk] if machine else []
+                if not offered or subprocess.run([*install, *offered]).returncode != 0:
+                    subprocess.run(install, check=True)
             live_paths(environment)
 
         capture({canonicalize_name(wheel.name.split("-")[0]) for wheel in sdk})
-        fallback = machine_sdk(interpreter, sdk, capture) if sdk else ""
-        add_client(interpreter, environment.parent / (environment.name + ".constraints.txt"), client_wheel)
+        fallback = machine_sdk(interpreter, sdk, capture, runtime_build) if sdk else ""
+        add_client(interpreter, environment.parent / (environment.name + ".constraints.txt"), client_wheel, runtime_build)
         ready.write_text(fallback)
     generations.mkdir(parents=True, exist_ok=True)
     root = generations.resolve() / uuid.uuid4().hex
@@ -208,7 +238,7 @@ def install_editable(*, project: Path, environment: Path, wheels: list[Path], di
     try:
         (root / "env").symlink_to(environment.resolve(), target_is_directory=True)
         # Described by the environment's own Runtime, from the project's directory.
-        live = root / "env" / "bin" / "python"
+        live = layout.interpreter(root / "env")
         interface = in_environment(live, Describe(str(project), str(live)), DESCRIPTION_DECODER).interface
         return publish_generation(root, metadata, interface, callees, ready.read_text(), source_digest)
     except BaseException:
@@ -219,7 +249,7 @@ def install_editable(*, project: Path, environment: Path, wheels: list[Path], di
 def install_captured(*, project: Path | None, wheels: list[Path], requirements: Path | None,
                      distribution: str, release: str, python_requires: str, python_version: str,
                      generations: Path, client_wheel: Path, python: str, sdk: list[Path] = (),
-                     callees: dict[str, str] | None = None):
+                     runtime_build: str = "", callees: dict[str, str] | None = None):
     python = interpreter_for(python, python_requires, python_version)
     project = project.resolve() if project else None
     wheels = [wheel.resolve(strict=True) for wheel in wheels]
@@ -247,7 +277,7 @@ def install_captured(*, project: Path | None, wheels: list[Path], requirements: 
     root = generations.resolve() / uuid.uuid4().hex
     root.mkdir(); (root / ".hold").touch()
     try:
-        interpreter = root / "env" / "bin" / "python"
+        interpreter = layout.interpreter(root / "env")
         frozen = project and (project / "uv.lock").is_file()
         if frozen:
             source = root / "source"
@@ -290,8 +320,8 @@ def install_captured(*, project: Path | None, wheels: list[Path], requirements: 
                 subprocess.run(["uv", "pip", "install", *COPY, "--python", str(interpreter), *map(str,wheels)], check=True)
 
         capture()
-        fallback = machine_sdk(interpreter, sdk, capture) if sdk else ""
-        add_client(interpreter, root / "captured-constraints.txt", client_wheel)
+        fallback = machine_sdk(interpreter, sdk, capture, runtime_build) if sdk else ""
+        add_client(interpreter, root / "captured-constraints.txt", client_wheel, runtime_build)
         return publish_generation(root, metadata, None, callees, fallback)
     except BaseException:
         shutil.rmtree(root)  # uniquely owned unpublished generation, never dispatched

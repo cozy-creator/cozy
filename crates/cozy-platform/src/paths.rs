@@ -112,6 +112,18 @@ pub fn venv_tool(venv: &Path, name: &str) -> PathBuf {
     venv.join(dir).join(exe(name))
 }
 
+/// A venv's site-packages: `lib/python3.X/site-packages`, or `Lib\site-packages` on Windows.
+pub fn venv_site_packages(venv: &Path) -> Option<PathBuf> {
+    if cfg!(windows) {
+        return Some(venv.join("Lib").join("site-packages"));
+    }
+    std::fs::read_dir(venv.join("lib"))
+        .ok()?
+        .flatten()
+        .map(|python| python.path().join("site-packages"))
+        .find(|site| site.is_dir())
+}
+
 /// This OS user's own home, from the account database (never the environment): `pw_dir` on
 /// Unix, the profile directory on Windows. `None` when it cannot be read.
 pub fn login_home() -> Option<PathBuf> {

@@ -1,2 +1,0 @@
-/proto/cozy/machine/v1/machine.proto is the source of cozy.machine.v1. It came from TensorD (PR #307, xs-042), which
-now lives in this workspace (crates/tensord) and builds against this crate. Vendored copies elsewhere pin this path.

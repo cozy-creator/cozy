@@ -54,7 +54,18 @@ fn main() {
             a_hard_link_counts_and_changes_its_file,
             false,
         ),
+        (
+            "times_are_set_on_a_read_only_file_and_a_directory",
+            times_are_set_on_a_read_only_file_and_a_directory,
+            false,
+        ),
         ("a_tree_dies_whole", a_tree_dies_whole, false),
+        #[cfg(any(target_os = "linux", windows))]
+        (
+            "a_scope_ends_the_tree_it_holds",
+            a_scope_ends_the_tree_it_holds,
+            false,
+        ),
         #[cfg(unix)]
         (
             "a_child_watching_its_parent_dies_with_it",
@@ -142,6 +153,11 @@ fn child(args: &[String]) {
                 held
             };
             ready_and_wait();
+        }
+        ["tree-when-told", file] => {
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line).unwrap();
+            child(&["tree".into(), file.into()]);
         }
         ["tree", file] => {
             // Never waited for: it dies with its tree.
@@ -350,6 +366,25 @@ fn a_hard_link_counts_and_changes_its_file() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+fn times_are_set_on_a_read_only_file_and_a_directory() {
+    let dir = scratch("times");
+    let file = dir.join("file");
+    fs::write(&file, b"bytes").unwrap();
+    let mut permissions = fs::metadata(&file).unwrap().permissions();
+    permissions.set_readonly(true);
+    fs::set_permissions(&file, permissions.clone()).unwrap();
+    let when = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+    let times = fs::FileTimes::new().set_accessed(when).set_modified(when);
+    for path in [&file, &dir] {
+        durable::set_times(path, times).unwrap();
+        assert_eq!(fs::metadata(path).unwrap().modified().unwrap(), when, "{path:?}");
+    }
+    #[allow(clippy::permissions_set_readonly_false)]
+    permissions.set_readonly(false);
+    fs::set_permissions(&file, permissions).unwrap();
+    let _ = fs::remove_dir_all(&dir);
+}
+
 fn a_tree_dies_whole() {
     let file = scratch("tree").join("grandchild");
     let mut tree = process::spawn(child_command(&["tree", file.to_str().unwrap()])).unwrap();
@@ -365,6 +400,33 @@ fn a_tree_dies_whole() {
     // Its exit, seen through the handle that names it and nothing else.
     grandchild.wait().unwrap();
     assert!(grandchild.ended());
+}
+
+/// What an executor's scope holds ends with it: the process adopted and the child it started after.
+#[cfg(any(target_os = "linux", windows))]
+fn a_scope_ends_the_tree_it_holds() {
+    let dir = scratch("scope");
+    use cozy_platform::contain::{Scope, namespace};
+    let scope = Scope::create(&namespace(&dir)).unwrap();
+    let file = dir.join("grandchild");
+    let mut command = child_command(&["tree-when-told", file.to_str().unwrap()]);
+    command.stdin(Stdio::piped());
+    if let Some((name, token)) = scope.environment() {
+        command.env(name, token);
+    }
+    let mut leader = command.spawn().unwrap();
+    scope.adopt(leader.id()).unwrap();
+    leader.stdin.take().unwrap().write_all(b"go\n").unwrap();
+    ready(leader.stdout.take().unwrap());
+    let pid: u32 = fs::read_to_string(&file).unwrap().parse().unwrap();
+    let grandchild = Exact::open(&Birth::of(pid).unwrap())
+        .unwrap()
+        .expect("the grandchild runs");
+    assert_eq!(scope.processes().unwrap(), 2);
+    assert_eq!(scope.end().unwrap(), 2);
+    grandchild.wait().unwrap();
+    assert!(!leader.wait().unwrap().success());
+    let _ = fs::remove_dir_all(&dir);
 }
 
 fn an_owned_tree_ends_with_its_handle() {

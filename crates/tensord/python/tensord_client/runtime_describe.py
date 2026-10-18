@@ -41,7 +41,7 @@ def environment(root: str, packages: dict[str, str], interface: bool = False) ->
                               msgspec.Raw(msgspec.json.encode(document)), record_digest(distribution),
                               package_name(distribution, packages)))
     runtime = found.get("cozy-runtime")
-    if runtime is not None and hasattr(static_interface, "build_builtin"):
+    if runtime is not None:
         # The Runtime's own operations (quantize, prepare_model) are an App every environment
         # holds: a job calls them as child runs, keyed by this Runtime's exact install.
         document = static_interface.build_builtin("operations")

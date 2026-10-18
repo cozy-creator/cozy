@@ -12,10 +12,9 @@ use serde_json::Value;
 #[test]
 fn an_unnamed_release_is_the_hubs_newest_even_on_a_machine_holding_an_older_one() {
     let Some(home) = Home::with_hub() else { return };
-    if std::env::var_os("COZY_TEST_TENSORD").is_none() {
-        eprintln!("skipped: no TensorD (COZY_TEST_TENSORD is unset)");
+    let Some(_) = common::needs("COZY_TEST_TENSORD", common::TENSORD) else {
         return;
-    }
+    };
     home.sign_in("releases@cozy.test");
     let package = common::package::publish(&home, "tiny-release", "1.0.0");
     let echo = format!("{package}/echo");

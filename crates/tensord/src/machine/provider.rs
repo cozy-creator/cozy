@@ -10,15 +10,17 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::{Method, Request, StatusCode};
 use hyper_util::rt::TokioIo;
-use nix::fcntl::OFlag;
 use std::{
-    collections::HashMap,
-    fs::File,
-    io::{self, Read, Write},
-    os::fd::FromRawFd,
+    collections::BTreeMap,
+    io,
     path::Path,
     sync::Arc,
     time::Duration,
+};
+#[cfg(target_os = "linux")]
+use std::{
+    fs::File,
+    io::{Read, Write},
 };
 use tokio_rustls::rustls::{self, pki_types::ServerName, RootCertStore};
 
@@ -26,13 +28,8 @@ use tokio_rustls::rustls::{self, pki_types::ServerName, RootCertStore};
 /// accepted for a loopback stand-in only.
 pub const API_ORIGIN: &str = "COZY_PROVIDER_API_ORIGIN";
 const CALL_BUDGET: Duration = Duration::from_secs(30);
-/// The fd a re-executed machine, or an activated service, reads the credential from: open only
-/// when its parent placed it there.
+/// The fd a re-executed machine reads the credential from: open only when it placed it there.
 pub const CREDENTIAL_FD: i32 = 5;
-/// What a machine binary declares in `version --json` when it reads the credential on
-/// CREDENTIAL_FD and closes it. A binary that does not is never handed it: it would leave the
-/// pipe open for everything it starts.
-pub const CREDENTIAL_CAPABILITY: &str = "provider-credential/1";
 /// The provider keys a pod's environment carries.
 const KEYS: [&str; 2] = ["RUNPOD_API_KEY", "CONTAINER_API_KEY"];
 /// Files, under the machine root, a provider's tooling may copy the environment into for shells.
@@ -63,13 +60,12 @@ pub enum ProviderSelf {
 impl ProviderSelf {
     /// This machine's provider credential, kept by this process alone. With the key still in the
     /// environment (a pod's boot) it scrubs the key's copies under `root` and re-executes this
-    /// program without it, and does not return unless that fails; a re-executed machine or an
-    /// activated service reads it from CREDENTIAL_FD. Call before any thread starts.
-    pub fn take(root: &Path) -> Option<Self> {
+    /// program without it, and does not return unless that fails; the re-executed machine reads
+    /// it from CREDENTIAL_FD. Call before any thread starts.
+    pub fn take(root: &Path, env: &BTreeMap<String, String>) -> Option<Self> {
         if let Some(own) = inherited() {
             return Some(own);
         }
-        let env: HashMap<String, String> = std::env::vars().collect();
         let secrets: Vec<&str> = KEYS
             .iter()
             .filter_map(|name| env.get(*name).map(String::as_str))
@@ -78,7 +74,7 @@ impl ProviderSelf {
         if secrets.is_empty() {
             return None;
         }
-        let own = Self::from_env(&env);
+        let own = Self::from_env(env);
         for copy in copies(root) {
             match scrub(&copy, &secrets) {
                 Ok(true) => tracing::info!(
@@ -101,7 +97,7 @@ impl ProviderSelf {
     }
 
     /// The pod's own provider credential, when its provider gave one.
-    pub fn from_env(env: &HashMap<String, String>) -> Option<Self> {
+    pub fn from_env(env: &BTreeMap<String, String>) -> Option<Self> {
         let get = |name: &str| env.get(name).filter(|v| !v.is_empty()).cloned();
         let origin = |default: &str| get(API_ORIGIN).unwrap_or_else(|| default.to_owned());
         if let (Some(pod), Some(key)) = (get("RUNPOD_POD_ID"), get("RUNPOD_API_KEY")) {
@@ -164,8 +160,25 @@ impl ProviderSelf {
     }
 }
 
+/// A provider credential is a Linux pod's: elsewhere nothing is handed on or re-executed.
+#[cfg(not(target_os = "linux"))]
+fn reexec(_own: Option<&ProviderSelf>) -> io::Error {
+    io::Error::new(io::ErrorKind::Unsupported, "a provider credential is a Linux pod's")
+}
+
+#[cfg(not(target_os = "linux"))]
+fn inherited() -> Option<ProviderSelf> {
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn hand_on(_own: &ProviderSelf) -> bool {
+    false
+}
+
 /// Runs this program again in this process with the same arguments, the provider keys dropped
 /// from its environment and the credential on CREDENTIAL_FD. Returns only on failure.
+#[cfg(target_os = "linux")]
 fn reexec(own: Option<&ProviderSelf>) -> io::Error {
     use std::os::unix::process::CommandExt;
     if own.is_some_and(|own| !hand_on(own)) {
@@ -183,13 +196,11 @@ fn reexec(own: Option<&ProviderSelf>) -> io::Error {
     command.exec()
 }
 
-fn pipe2_cloexec() -> io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
-    nix::unistd::pipe2(OFlag::O_CLOEXEC).map_err(io::Error::from)
-}
-
 /// The credential a parent handed this process on CREDENTIAL_FD, read once (the fd is then
 /// closed); None when it handed none.
+#[cfg(target_os = "linux")]
 fn inherited() -> Option<ProviderSelf> {
+    use std::os::fd::FromRawFd;
     // SAFETY: CREDENTIAL_FD is the parent's pipe, or not open (F_GETFD then fails).
     if unsafe { libc::fcntl(CREDENTIAL_FD, libc::F_GETFD) } < 0 {
         return None;
@@ -205,33 +216,12 @@ fn inherited() -> Option<ProviderSelf> {
 
 /// Places the credential on CREDENTIAL_FD for the program this process execs next. It fits a
 /// pipe's buffer: written and closed before the exec.
+#[cfg(target_os = "linux")]
 pub fn hand_on(own: &ProviderSelf) -> bool {
-    pipe2_cloexec()
+    super::supervise::cloexec_pipe()
         .and_then(|(read, write)| {
             File::from(write).write_all(&serde_json::to_vec(own)?)?;
             Ok(super::supervise::inherit(read, CREDENTIAL_FD))
-        })
-        .unwrap_or(false)
-}
-
-/// Whether the machine binary at `binary` declares CREDENTIAL_CAPABILITY.
-pub fn reads_credential(binary: &Path) -> bool {
-    std::process::Command::new(binary)
-        .args(["version", "--json"])
-        .env_clear()
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()
-        .and_then(|out| serde_json::from_slice::<serde_json::Value>(&out.stdout).ok())
-        .and_then(|version| {
-            Some(
-                version
-                    .get("capabilities")?
-                    .as_array()?
-                    .iter()
-                    .any(|c| c == CREDENTIAL_CAPABILITY),
-            )
         })
         .unwrap_or(false)
 }

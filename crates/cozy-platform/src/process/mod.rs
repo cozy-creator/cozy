@@ -185,7 +185,6 @@ impl Exact {
     }
 
     /// The handle as a file a caller keeps: readable (Unix) or signaled (Windows) once it exits.
-    #[cfg(unix)]
     pub fn into_file(self) -> std::fs::File {
         self.handle.0.into()
     }
@@ -253,14 +252,13 @@ pub fn descendants(pid: u32) -> Vec<u32> {
 }
 
 /// Every process in `leader`'s process group born with or after it: a leader's followers. A
-/// group number is not reused while a member lives. Empty where it cannot be read (only Linux
-/// reads groups so far).
+/// group number is not reused while a member lives. Empty on Windows, whose trees are Job Objects.
 pub fn group_members(leader: &Birth) -> Vec<Birth> {
     sys::group_members(leader)
 }
 
 /// CPU nanoseconds used or owed (time runnable but waiting for a CPU) and bytes moved, the
-/// measure of a process's progress. `None`: unreadable, which decides nothing (Linux only so far).
+/// measure of a process's progress. `None`: unreadable, which decides nothing (Windows so far).
 pub fn meter(pid: u32) -> Option<(u64, u64)> {
     sys::meter(pid)
 }
@@ -294,6 +292,24 @@ pub fn die_with_parent(parent: u32) -> Result<bool> {
     sys::die_with_parent(parent)
 }
 
+/// Windows: `handle` goes to the next child this process starts (std hands a child every
+/// inheritable handle), named there by the value returned; the caller drops its own once that
+/// child runs. The child takes it with [`handed`].
+#[cfg(windows)]
+pub fn hand_on(handle: &impl std::os::windows::io::AsRawHandle) -> Result<u64> {
+    sys::hand_on(handle).map_err(Error::os("hand on a handle"))
+}
+
+/// Windows: the handle `value` names, as [`hand_on`] handed it to this process; it goes no further.
+///
+/// # Safety
+/// `value` must name a handle this process inherited and nothing else owns.
+#[cfg(windows)]
+pub unsafe fn handed(value: u64) -> Result<std::os::windows::io::OwnedHandle> {
+    // SAFETY: the caller's promise.
+    unsafe { sys::handed(value) }.map_err(Error::os("take a handed handle"))
+}
+
 /// An OS shortage that may clear by itself; nothing else justifies requeueing a launch.
 pub fn transient(error: &io::Error) -> bool {
     sys::transient(error)
@@ -301,6 +317,8 @@ pub fn transient(error: &io::Error) -> bool {
 
 #[cfg(windows)]
 pub(crate) use sys::command_line;
+#[cfg(windows)]
+pub(crate) use sys::job;
 #[cfg(unix)]
 pub use unix::cloexec_from;
 

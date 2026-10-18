@@ -4,7 +4,9 @@ name: release-smoke
 # The CPU smoke of design §6.4 on every release runner, against this run's own artifacts served from a local
 # mirror (COZY_DOWNLOAD_URL is the release location for the installers and `cozy update` alike): install
 # script, --version, PATH, up, status, hub list, package search (tensorhub.com, anonymous), the local machine
-# (enable, show, disable on Linux; refused elsewhere), update to this release, down. A verb answering not_ported is skipped, so the smoke grows as the verbs land.
+# (enabled as a user service and shown, on every OS), update to this release (the machine restarts on the new
+# binary), disable, down. A verb answering not_ported is skipped, so the smoke grows as the
+# verbs land.
 on:
   workflow_call:
     inputs:
@@ -16,6 +18,10 @@ jobs:
   mirror:
     # build-global-artifacts builds the installers beside this job; this builds the same ones.
     runs-on: ubuntu-24.04
+    # bash -eo pipefail: a failing command anywhere in a pipe fails the step.
+    defaults:
+      run:
+        shell: bash
     outputs:
       version: ${{ steps.mirror.outputs.version }}
     steps:
@@ -58,8 +64,9 @@ jobs:
                 *.zip) unzip -p "$f" cozy.exe > bin ;;
                 *) tar -xzOf "$f" "$(tar -tzf "$f" | grep -E '/cozy$')" > bin ;;
               esac
-              glibc=$(readelf -W --version-info bin 2>/dev/null | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)
-              echo "| ${f#mirror/} | $(du -k "$f" | awk '{printf "%.1f", $1/1024}') | $(du -k bin | awk '{printf "%.1f", $1/1024}') | ${glibc:--} |"
+              glibc=-
+              case $f in *linux*) glibc=$(readelf -W --version-info bin | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1) ;; esac
+              echo "| ${f#mirror/} | $(du -k "$f" | awk '{printf "%.1f", $1/1024}') | $(du -k bin | awk '{printf "%.1f", $1/1024}') | $glibc |"
             done
             rm bin
           } | tee -a "$GITHUB_STEP_SUMMARY"
@@ -153,19 +160,18 @@ jobs:
             printf '%s\n' "$out"
             if [ "$code" = 0 ]; then ran=1; else echo "::error::cozy $* exited $code"; fail=1; fi
           }
-          # `cozy --json <words…>` must be refused with code $1; skipped like `step`.
+          # `cozy --json <words…>` must succeed: these verbs are in every release, never skipped.
+          must() {
+            code=0
+            out=$("$cozy" --json "$@") || code=$?
+            printf '%s\n' "$out"
+            [ "$code" = 0 ] || { echo "::error::cozy $* exited $code"; fail=1; }
+          }
+          # `cozy --json <words…>` must be refused with code $1.
           refuses() {
             want=$1 code=0
             shift
-            if ! "$cozy" "$@" --help > /dev/null 2>&1; then
-              echo "skipped, not in the grammar yet: cozy $*"
-              return
-            fi
             out=$("$cozy" --json "$@") || code=$?
-            if printf '%s' "$out" | grep -Eq '"code": *"not_ported"'; then
-              echo "skipped, not ported: cozy $*"
-              return
-            fi
             printf '%s\n' "$out"
             [ "$code" != 0 ] && printf '%s' "$out" | grep -Eq "\"code\": *\"$want\"" \
               || { echo "::error::cozy $* answered $code, not $want"; fail=1; }
@@ -175,21 +181,29 @@ jobs:
           step status
           step hub list
           step package search sdxl
-          # The local machine: `enable` returns once `local` is ready (Linux); elsewhere it is refused.
+          # The local machine, on every OS: `enable` returns once `local` is ready.
           if [ "$RUNNER_OS" = Linux ]; then
-            step machine enable
-            if [ "$ran" = 1 ]; then
-              step machine show local
-              step machine disable
-            fi
-          else
-            refuses machine_role_unsupported machine enable
+            # A user service manager, as a desktop login has: the runner's user lingers, with its bus.
+            sudo loginctl enable-linger "$(id -un)"
+            export XDG_RUNTIME_DIR=/run/user/$(id -u)
+            until [ -S "$XDG_RUNTIME_DIR/bus" ]; do sleep 1; done
+            export DBUS_SESSION_BUS_ADDRESS=unix:path=$XDG_RUNTIME_DIR/bus
           fi
+          must machine enable
+          must machine show local
           before=$(ls -i "$cozy")
           step update "$VERSION"
           if [ "$ran" = 1 ]; then
             [ "$(ls -i "$cozy")" != "$before" ] || { echo "::error::cozy update $VERSION left the binary in place"; fail=1; }
             [ "$("$cozy" --version)" = "cozy $VERSION" ] || { echo "::error::the updated binary is not cozy $VERSION"; fail=1; }
+            # The machine takes the new binary (a new file, though the same version) and serves on it.
+            if [ "$(printf '%s' "$out" | jq -r .machine.state)" = restarted ]; then
+              # Calcifer hears the restarted machine's status when its link reconnects.
+              until [ "$("$cozy" --json machine show local | jq -r .status.version)" = "$VERSION" ]; do sleep 2; done
+            else
+              echo "::error::the machine did not restart on the new binary"; fail=1
+            fi
           fi
+          must machine disable
           step down
           exit $fail

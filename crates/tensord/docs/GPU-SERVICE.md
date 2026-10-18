@@ -91,7 +91,7 @@ Acceptance, journal, progress and output custody stay in `Engine`; scheduling st
   and forms its followers inside `Start` (Runtime `RankGroup`); the machine never talks to a follower.
   Every command's watch meters rank 0 plus its process-group members, so formation ends only on
   measured lack of progress. Each GPU of the group is admitted by its own memory decision (device
-  order). With `rank_cells/1` each rank gets its own GPU's cap (`rank_caps`) and its own budget cell
+  order). Each rank gets its own GPU's cap (`rank_caps`) and its own budget cell
   (rank 0 hands the machine one per follower at formation), so every GPU's floor watchdog lowers the
   process on that GPU. Followers' pids from `Start` name their GPU's tenant for NVML.
   Teardown waits for every group member's exit. Startup fences GPU dispatch until a previous
@@ -102,11 +102,10 @@ Acceptance, journal, progress and output custody stay in `Engine`; scheduling st
   by rank 0.
 - A cold session is admitted first: its context estimate (twice the largest measured here, else
   1 GiB) and known first working set are reserved, making room by the ladder below. It is spawned by
-  the pool's `ChildLauncher`, which journals the birth, then sent Start, Load (with that cap),
-  `Budget` (pinned, if `weight_plane/1`) and Activate once. Each request sends PrepareRequest and
+  the pool's `ChildLauncher`, which journals the birth, then sent Start, Load (with that cap and
+  its pinned budget) and Activate once. Each request sends PrepareRequest and
   Invoke. Executors of other plans stay; the policy decides what they keep on the device.
-- Each Invoke carries a real grant: `cap_bytes` (whole process: context + torch + plane) to
-  `process_cap/1` executors, else a plane budget derived from it.
+- Each Invoke carries a real grant: `cap_bytes` (whole process: context + torch + plane).
 - Making room, in order: idle executors unmap (`Budget{vram 0}`, LRU), idle executors end (only
   while the lowest rung is unmet), a running call shrinks through its budget cell. Never refused by
   size: with nothing left, the cap is what there is.
@@ -158,10 +157,6 @@ thread.
 
 - Groups always take the first K envelope GPUs. Degree 2 custody, warm members and import-only
   parents live on the first GPU; replicas elsewhere never share GPU weights. No adapters.
-- Per-rank caps and cells need an executor with `rank_cells/1` and `process_cap/1`; otherwise every
-  rank takes the smallest cap and only rank 0's GPU has a floor watchdog cell.
-- Executors before `process_cap/1` get only a plane budget: their context and activations are
-  estimated, not capped.
 - One Python post helper per request.
 - Each executor gets its own scope: a cgroup-v2 where the host delegates one (laptop systemd
   scopes, rootful hosts), else a token (containers with a read-only or v1 hierarchy, RunPod).

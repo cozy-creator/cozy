@@ -1,9 +1,10 @@
 //! A software update, as `Run kind: update` on `cozy.machine.v1` and (until cutover)
 //! `runtime-update/1` behind the CLI's maintenance routes: stage and verify a Runtime/TensorFS
-//! pair, wait for measured idleness, then restart the service on it in place. Executors' package environments take the new pair; a candidate Runtime wheel that
-//! bundles TensorD also replaces the service binary (the stable parent runs it). The
-//! previous pair and binary stay installed; a candidate that never proves readiness is rolled
-//! back by the parent. Boot id, leaf, journal and outputs are kept. A cancel ends an update
+//! pair, wait for measured idleness, then restart the service on it in place. Executors' package
+//! environments take the new pair. A `cozy` binary renamed over the launch path (`cozy update`)
+//! activates with any update: the parent execs it (`super::binary`). The previous pair and
+//! binary stay; a candidate that never proves readiness is rolled back by the parent. Boot id,
+//! leaf, journal and outputs are kept. A cancel ends an update
 //! that has not begun activating (`canceled`); a pair the machine already runs is unchanged:
 //! the same version, or for a wheel file the same bytes (sha256), never just the same version.
 use serde::{Deserialize, Serialize};
@@ -11,7 +12,6 @@ use sha2::{Digest, Sha256};
 use std::{
     fs,
     io::{self, Read, Write},
-    os::unix::{fs::{symlink, PermissionsExt}, process::CommandExt},
     path::{Path, PathBuf},
     process::Stdio,
     sync::{Arc, Mutex},
@@ -23,8 +23,10 @@ use tensorfs_core::{store::Store, transport::PullCancellation};
 /// which runs report: a named wheel file is not a published release.
 pub const RUNTIME_BUILD: &str = "runtime-build";
 
-/// The service's exit status asking its parent to exec the selected application.
+/// The service's exit status asking its parent to start the service again on the selected pair.
 pub const REPLACE_EXIT: i32 = 75;
+/// This binary's release, which an update's `from` and `to` name as `cozy`.
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_WHEEL_BYTES: u64 = 256 << 20;
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -36,6 +38,9 @@ pub struct Pair {
     pub runtime_sha256: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub tensorfs_sha256: String,
+    /// The `cozy` binary's release, in an update's from/to only.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub cozy: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -52,6 +57,12 @@ pub struct Status {
     pub to: Pair,
     #[serde(default)]
     pub pinned: bool,
+    /// A toolchain install, not a software pair.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub toolchain: bool,
+    /// While `waiting_activation`: the admitted runs still in flight.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub waiting_for: u32,
     /// Every state it passed through: the update's run log.
     #[serde(default)]
     pub history: Vec<Step>,
@@ -60,6 +71,16 @@ pub struct Status {
 pub struct Step {
     pub state: String,
     pub at_ms: i64,
+    /// A `waiting_activation` step's runs: those admitted when admission closed, and how many
+    /// of them have ended since.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub total: u32,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub completed: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 impl Status {
     pub fn terminal(&self) -> bool {
@@ -71,6 +92,7 @@ impl Status {
             self.history.push(Step {
                 state: state.into(),
                 at_ms: super::lifecycle::now_ms(),
+                ..Default::default()
             });
         }
     }
@@ -125,11 +147,16 @@ impl std::error::Error for Coded {}
 pub struct Request {
     pub operation: String,
     #[serde(default)]
-    pub agent: String,
-    #[serde(default)]
     pub pin: Option<bool>,
     pub runtime: Option<Choice>,
     pub tensorfs: Option<Choice>,
+    /// The `cozy` release the caller installed at the launch path (`cozy update`): a guard,
+    /// checked before anything drains. A swapped binary activates with or without it.
+    #[serde(default)]
+    pub cozy: Option<String>,
+    /// Install the build toolchain (`super::toolchain`) instead of a software pair.
+    #[serde(default)]
+    pub toolchain: bool,
 }
 
 /// The activation in flight: what a rollback restores.
@@ -137,7 +164,20 @@ pub struct Request {
 struct Pending {
     status: Status,
     sdk_before: Option<PathBuf>,
-    agent_before: Option<PathBuf>,
+    /// A binary activation's launch path, whose `.cozy-previous` a rollback renames back.
+    #[serde(default)]
+    binary: Option<PathBuf>,
+}
+
+/// What the stable parent does after recovering or rolling back an activation.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Recovered {
+    /// There was none.
+    Nothing,
+    /// Links (and a binary) were restored; this image starts its service.
+    Restored,
+    /// The binary at this launch path is not this image's and was selected: exec it.
+    Exec(PathBuf),
 }
 
 /// Where the machine keeps its software: everything under its own engine directory.
@@ -168,9 +208,6 @@ impl Paths {
     fn current_sdk_link(&self) -> PathBuf {
         self.engine.join("sdk/current")
     }
-    fn current_agent_link(&self) -> PathBuf {
-        self.engine.join("agent/current")
-    }
     /// The executors' Runtime/TensorFS wheels: the last activated pair, else the image's.
     pub fn sdk(&self) -> PathBuf {
         let link = self.current_sdk_link();
@@ -182,56 +219,84 @@ impl Paths {
     }
 }
 
-/// The machine binary an activated update installed, which the parent runs as its service.
-pub fn activated_binary(paths: &Paths) -> io::Result<Option<PathBuf>> {
-    let link = paths.current_agent_link();
-    // A dangling activation is still the selected candidate. Its exec must fail and roll back,
-    // rather than silently starting the original binary and committing the candidate as ready.
-    match fs::symlink_metadata(&link) {
-        Ok(_) => Ok(Some(link)),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error),
+/// A pre-cohort machine update may have activated the TensorD its Runtime wheel bundled
+/// (`agent/current`). This machine is the cozy binary and never runs another: the activation
+/// is removed, once.
+pub fn retire_agent(paths: &Paths) {
+    let agent = paths.engine.join("agent");
+    if fs::symlink_metadata(&agent).is_err() {
+        return;
+    }
+    match fs::remove_dir_all(&agent) {
+        Ok(()) => tracing::info!("retired the TensorD a pre-cohort update activated ({})", agent.display()),
+        Err(error) => tracing::warn!("{}: {error}; it is never run", agent.display()),
     }
 }
 
-/// Restores what a failed activation replaced. True when there was one to undo.
-pub fn rollback_pending(paths: &Paths, cause: &str) -> io::Result<bool> {
+/// Restores what a failed activation replaced: the SDK link, and a binary activation's previous
+/// binary, renamed back over the launch path.
+pub fn rollback_pending(paths: &Paths, cause: &str) -> io::Result<Recovered> {
     let Some(pending) = read_pending(paths)? else {
-        return Ok(false);
+        return Ok(Recovered::Nothing);
     };
     let mut status = latest(paths, pending.status)?;
     status.error = cause.into();
     status.enter("rolled_back");
-    // Persist the decision before changing either link. A crash during rollback then resumes
+    // Persist the decision before changing the link. A crash during rollback then resumes
     // rollback, even when the candidate had already published its starting marker.
     write_json(&paths.update("status.json"), &status)?;
     relink(&paths.current_sdk_link(), pending.sdk_before.as_deref())?;
-    relink(&paths.current_agent_link(), pending.agent_before.as_deref())?;
+    if let Some(launch) = &pending.binary {
+        // Gone once renamed: a rollback resumed after this step finds the launch path restored.
+        match fs::rename(super::binary::previous(launch), launch) {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+            _ => fs::File::open(launch.parent().unwrap_or(Path::new("/")))?.sync_all()?,
+        }
+    }
     remove_pending(paths)?;
-    Ok(true)
+    Ok(match pending.binary.filter(|_| swapped()) {
+        Some(launch) => Recovered::Exec(launch),
+        None => Recovered::Restored,
+    })
 }
 
-/// Recovers a publication interrupted before its durable `starting` marker. The parent calls
-/// this before choosing its service binary; a new service also calls it when an older parent
-/// launched it. True means links were restored and that child must let its parent select again.
-/// A succeeded marker means readiness already committed the update: only its cleanup remains.
-pub fn recover_activation(paths: &Paths) -> io::Result<bool> {
+/// `pair` as this binary runs it.
+fn this_binary(pair: Pair) -> Pair {
+    Pair { cozy: VERSION.into(), ..pair }
+}
+
+/// Whether the file at this process's launch path is not this image.
+fn swapped() -> bool {
+    super::binary::launch().is_some_and(super::binary::Launch::swapped)
+}
+
+/// Recovers a publication interrupted before its durable `starting` marker; the parent calls
+/// this before each service it forks. A succeeded marker means readiness already committed the
+/// update: only its cleanup remains. A published binary activation this image has not yet
+/// handed to is `Exec`.
+pub fn recover_activation(paths: &Paths) -> io::Result<Recovered> {
     let Some(pending) = read_pending(paths)? else {
-        return Ok(false);
+        return Ok(Recovered::Nothing);
     };
     let status = latest(paths, pending.status)?;
     match status.state.as_str() {
         "starting" => {
-            for distribution in ["cozy_runtime", "tensorfs"] {
-                if let Err(error) = existing_wheel(&paths.current_sdk_link(), distribution) {
-                    return rollback_pending(paths, &format!("activated SDK unavailable: {error}"));
+            // A binary activation alone leaves the SDK link as it was.
+            if previous_link(&paths.current_sdk_link())? != pending.sdk_before {
+                for distribution in ["cozy_runtime", "tensorfs"] {
+                    if let Err(error) = existing_wheel(&paths.current_sdk_link(), distribution) {
+                        return rollback_pending(paths, &format!("activated SDK unavailable: {error}"));
+                    }
                 }
             }
-            Ok(false)
+            Ok(match pending.binary.filter(|_| swapped()) {
+                Some(launch) => Recovered::Exec(launch),
+                None => Recovered::Nothing,
+            })
         },
         "succeeded" => {
             remove_pending(paths)?;
-            Ok(false)
+            Ok(Recovered::Nothing)
         }
         "rolled_back" => rollback_pending(paths, &status.error),
         "waiting" | "preparing" | "waiting_activation" | "installing" | "failed" | "canceled" => {
@@ -251,7 +316,7 @@ fn read_pending(paths: &Paths) -> io::Result<Option<Pending>> {
 
 fn remove_pending(paths: &Paths) -> io::Result<()> {
     fs::remove_file(paths.update("pending.json"))?;
-    fs::File::open(paths.update(""))?.sync_all()
+    cozy_platform::durable::sync_dir(&paths.update("")).map_err(io::Error::from)
 }
 
 /// The activation's status as last written (its later steps), else as it was when pending.
@@ -276,6 +341,8 @@ pub struct Updates {
     store: Option<Arc<Store>>,
     /// The running update's stop: its cancel ends the download in flight.
     stop: Mutex<PullCancellation>,
+    /// The build toolchain as last probed: at start and after each install.
+    toolchain: Mutex<Option<cozy_proto::machine::Toolchain>>,
 }
 
 impl Updates {
@@ -286,7 +353,7 @@ impl Updates {
         store: Option<Arc<Store>>,
     ) -> io::Result<Arc<Self>> {
         fs::create_dir_all(paths.update("staged"))?;
-        fs::File::open(&paths.engine)?.sync_all()?;
+        cozy_platform::durable::sync_dir(&paths.engine)?;
         let mut status = fs::read(paths.update("status.json"))
             .ok()
             .and_then(|raw| serde_json::from_slice::<Status>(&raw).ok());
@@ -304,7 +371,42 @@ impl Updates {
             lifecycle,
             store,
             stop: Mutex::default(),
+            toolchain: Mutex::default(),
         }))
+    }
+
+    /// The build toolchain, probed once and again after each install.
+    pub fn toolchain(&self) -> cozy_proto::machine::Toolchain {
+        let mut held = self.toolchain.lock().unwrap();
+        if held.is_none() {
+            *held = Some(self.probe_toolchain());
+        }
+        let mut toolchain = held.clone().unwrap_or_default();
+        if let Some(status) = self.status.lock().unwrap().as_ref().filter(|s| s.toolchain) {
+            match status.state.as_str() {
+                "failed" => toolchain.detail.clone_from(&status.error),
+                state if !status.terminal() && state != "waiting" => toolchain.state = "installing".into(),
+                _ => {}
+            }
+        }
+        toolchain
+    }
+
+    fn probe_toolchain(&self) -> cozy_proto::machine::Toolchain {
+        let environment = cozy_proto::config::environment();
+        let path: Vec<PathBuf> = environment.get("PATH").map(|p| std::env::split_paths(p).collect()).unwrap_or_default();
+        let cuda_home = environment.get("CUDA_HOME").map(PathBuf::from);
+        super::toolchain::probe(&super::toolchain::dir(&self.paths.engine), cuda_home.as_deref(), &path)
+    }
+
+    /// Each kernel's verdict on this machine, as the Runtime keeps them under its kernel store.
+    pub fn kernels(&self) -> Vec<cozy_proto::machine::KernelVerdict> {
+        super::toolchain::verdicts(&self.paths.engine.join("gpu/kernels"))
+    }
+
+    /// Where the machine's toolchain lives, which executors find through their environment.
+    pub fn toolchain_dir(&self) -> PathBuf {
+        super::toolchain::dir(&self.paths.engine)
     }
 
     /// After this process proved readiness: an activation in flight is committed.
@@ -328,7 +430,7 @@ impl Updates {
         if !matches!(status.state.as_str(), "starting" | "succeeded") {
             return Err(invalid("cannot commit an update before software publication finished"));
         }
-        status.to = identified(&self.paths.sdk())?;
+        status.to = this_binary(identified(&self.paths.sdk())?);
         status.error.clear();
         status.enter("succeeded");
         self.commit_status(status)
@@ -446,14 +548,9 @@ impl Updates {
                 .operation
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
-            && matches!(request.agent.as_str(), "" | "bundled" | "explicit")
-            && (request.runtime.is_some() || request.tensorfs.is_some());
+            && (request.runtime.is_some() || request.tensorfs.is_some() || request.cozy.is_some()) != request.toolchain;
         if !valid {
-            return Err((
-                400,
-                "an update requires operation, valid agent selection, and a Runtime or TensorFS"
-                    .into(),
-            ));
+            return Err((400, "an update requires operation and a Runtime, TensorFS or cozy, or the toolchain alone".into()));
         }
         let mut current = self.status.lock().unwrap();
         if let Some(status) = current.as_ref() {
@@ -476,10 +573,11 @@ impl Updates {
         // An update is not a job: a released or activating machine refuses it, and preparing it
         // never holds the rental's idle release. Activation then closes admission.
         drop(self.lifecycle.as_ref().map(|l| l.admit()).transpose()
-            .map_err(|refused| (503, refused.message().to_string()))?);
+            .map_err(|refused| (503, refused.to_string()))?);
         let mut status = Status {
             operation: request.operation.clone(),
-            from: identified(&self.paths.sdk()).map_err(server)?,
+            toolchain: request.toolchain,
+            from: this_binary(identified(&self.paths.sdk()).map_err(server)?),
             pinned: request.pin.unwrap_or(false),
             ..Status::default()
         };
@@ -528,7 +626,19 @@ impl Updates {
     }
 
     fn run(&self, request: &Request, exit: fn(i32)) -> io::Result<()> {
-        let from = identified(&self.paths.sdk())?;
+        let from = this_binary(identified(&self.paths.sdk())?);
+        // A toolchain is installed beside the software, which keeps running: nothing restarts.
+        if request.toolchain {
+            self.set(|s| {
+                s.to = from.clone();
+                s.enter("installing");
+            })?;
+            let stop = self.stop.lock().unwrap().clone();
+            let installed = super::toolchain::install(&self.toolchain_dir(), &self.paths.uv, &stop);
+            *self.toolchain.lock().unwrap() = Some(self.probe_toolchain());
+            installed?;
+            return self.set(|s| s.enter("succeeded"));
+        }
         // A named wheel file is compared by its bytes: a rebuilt wheel at the running version
         // is installed, the very wheel the machine runs is not.
         let running = |choice: &Option<Choice>, version: &str, sha256: &str| {
@@ -537,42 +647,58 @@ impl Updates {
                 false => c.sha256 == sha256,
             })
         };
-        if running(&request.runtime, &from.runtime, &from.runtime_sha256)
-            && running(&request.tensorfs, &from.tensorfs, &from.tensorfs_sha256)
-        {
-            // Nothing to install: the machine already runs this pair.
+        // A binary renamed over the launch path activates too, once it runs and is the release
+        // the caller named, and its previous one is kept to roll back to.
+        let binary = self.binary(request)?;
+        let pair = !(running(&request.runtime, &from.runtime, &from.runtime_sha256)
+            && running(&request.tensorfs, &from.tensorfs, &from.tensorfs_sha256));
+        if !pair && binary.is_none() {
+            // Nothing to install: the machine already runs this pair and binary.
             return self.set(|s| {
                 s.to = from.clone();
                 s.enter("succeeded");
             });
         }
-        self.set(|s| s.enter("preparing"))?;
-        let sdk = self.paths.engine.join("sdk");
-        fs::create_dir_all(&sdk)?;
-        // On the first update this also created engine/sdk; persist that parent entry.
-        fs::File::open(&self.paths.engine)?.sync_all()?;
-        // Caller operation IDs are receipt identities, never filesystem paths. Every attempt
-        // prepares a fresh immutable generation, including a historical operation's retry.
-        let candidate = sdk.join(format!("candidate-{}", hex(&super::identity::random::<16>()?)));
-        fs::create_dir(&candidate)?;
-        let prepared = self
-            .prepare(request, &candidate)
-            .and_then(|prepared| self.set(|s| s.enter("installing")).map(|_| prepared));
-        if prepared.is_err() {
+        let candidate = match pair {
+            true => {
+                self.set(|s| s.enter("preparing"))?;
+                let sdk = self.paths.engine.join("sdk");
+                fs::create_dir_all(&sdk)?;
+                // On the first update this also created engine/sdk; persist that parent entry.
+                cozy_platform::durable::sync_dir(&self.paths.engine)?;
+                // Caller operation IDs are receipt identities, never filesystem paths. Every
+                // attempt prepares a fresh immutable generation, a historical operation's retry too.
+                let candidate = sdk.join(format!("candidate-{}", hex(&super::identity::random::<16>()?)));
+                fs::create_dir(&candidate)?;
+                Some(candidate)
+            }
+            false => None,
+        };
+        let prepared = (|| -> io::Result<_> {
+            let mut to = match &candidate {
+                Some(candidate) => self.prepare(request, candidate)?,
+                None => from.clone(),
+            };
+            to.cozy = binary.as_ref().map_or_else(|| from.cozy.clone(), |(_, version)| version.clone());
+            self.set(|s| s.to = to.clone())?;
+            let activation = self.drain()?;
+            self.set(|s| s.enter("installing"))?;
+            Ok((to, activation))
+        })();
+        if let (Err(_), Some(candidate)) = (&prepared, &candidate) {
             // Never selected: nothing refers to it.
-            let _ = fs::remove_dir_all(&candidate);
+            let _ = fs::remove_dir_all(candidate);
         }
-        let (agent, to, _activation) = prepared?;
+        let (to, _activation) = prepared?;
         let pending = Pending {
             status: self.status.lock().unwrap().clone().unwrap_or_default(),
             sdk_before: previous_link(&self.paths.current_sdk_link())?,
-            agent_before: previous_link(&self.paths.current_agent_link())?,
+            binary: binary.as_ref().map(|(launch, _)| launch.clone()),
         };
         let publication = (|| {
             write_json(&self.paths.update("pending.json"), &pending)?;
-            relink(&self.paths.current_sdk_link(), Some(&candidate))?;
-            if let Some(binary) = agent {
-                relink(&self.paths.current_agent_link(), Some(&binary))?;
+            if let Some(candidate) = &candidate {
+                relink(&self.paths.current_sdk_link(), Some(candidate))?;
             }
             self.set(|s| s.enter("starting"))
         })();
@@ -580,10 +706,10 @@ impl Updates {
             // Admission is still closed. Do not leave a partial SDK/binary pair available to
             // newly accepted work, and do not overwrite a truthful rolled_back outcome.
             match rollback_pending(&self.paths, &format!("software publication failed: {error}")) {
-                Ok(true) => {
+                Ok(Recovered::Nothing) => {}
+                Ok(_) => {
                     *self.status.lock().unwrap() = Some(latest(&self.paths, pending.status)?);
                 }
-                Ok(false) => {}
                 Err(rollback) => {
                     tracing::error!("update publication: {error}; rollback: {rollback}");
                     // The links cannot be trusted. Restart while admission remains closed;
@@ -594,98 +720,164 @@ impl Updates {
             return Err(error);
         }
         tracing::info!(
-            "Runtime update {}: restarting on {} / {}",
-            request.operation, to.runtime, to.tensorfs
+            "update {}: restarting on cozy {}, Runtime {} / TensorFS {}",
+            request.operation, to.cozy, to.runtime, to.tensorfs
         );
-        exit(REPLACE_EXIT);
+        exit(if binary.is_some() { super::binary::EXEC_EXIT } else { REPLACE_EXIT });
         Ok(())
     }
 
-    /// Stages and verifies the pair in `candidate`, then closes admission and waits for the
-    /// work admitted before to drain. A cancel ends it at any step (Interrupted).
-    fn prepare(
-        &self,
-        request: &Request,
-        candidate: &Path,
-    ) -> io::Result<(Option<PathBuf>, Pair, Option<super::lifecycle::Activation>)> {
-        let mut agent = None;
-        for (distribution, choice) in [
-            ("cozy_runtime", &request.runtime),
-            ("tensorfs", &request.tensorfs),
-        ] {
-            let wheel = match choice {
-                Some(choice) => self.resolve(distribution, choice)?,
-                None => existing_wheel(&self.paths.sdk(), distribution)?,
+    /// The binary this update activates, with its release: the launch path's, when it is not this
+    /// image. Refused before anything drains when it does not run, is not the release `cozy`
+    /// names, or has no previous binary beside it to roll back to.
+    fn binary(&self, request: &Request) -> io::Result<Option<(PathBuf, String)>> {
+        let coded = |code, message| io::Error::other(Coded { code, message });
+        let Some(launch) = super::binary::launch().filter(|l| l.swapped()) else {
+            return match &request.cozy {
+                Some(named) if named != VERSION => Err(coded(
+                    "binary_mismatch",
+                    format!("this machine runs cozy {VERSION} from its launch path, not {named}"),
+                )),
+                _ => Ok(None),
             };
-            let name = wheel
-                .file_name()
-                .and_then(|n| n.to_str())
-                .ok_or_else(|| invalid("wheel name"))?
-                .to_owned();
-            let bundled = verify_wheel(&wheel, distribution)?;
-            let prepared = candidate.join(&name);
-            fs::copy(&wheel, &prepared)?;
-            fs::File::open(prepared)?.sync_all()?;
-            if let Some(file) = choice.as_ref().filter(|c| distribution == "cozy_runtime" && !c.file.is_empty()) {
-                fs::write(candidate.join(RUNTIME_BUILD), build(&wheel, &file.sha256)?)?;
-            }
-            if let Some(binary) = bundled.filter(|_| request.agent != "explicit") {
-                agent = bundled_tensord(&binary, candidate)?;
-            }
+        };
+        let version = super::binary::version(&launch.path).map_err(|e| coded("binary_mismatch", e.to_string()))?;
+        if let Some(named) = request.cozy.as_ref().filter(|named| **named != version) {
+            return Err(coded("binary_mismatch", format!("{} is cozy {version}, not {named}", launch.path.display())));
         }
-        self.resolves(candidate)?;
-        fs::File::open(candidate)?.sync_all()?;
-        let to = identified(candidate)?;
-        self.set(|s| s.to = to.clone())?;
-        // No new work is admitted from here; work admitted before drains first.
-        let activation = self.lifecycle.as_ref().map(|l| l.activate()).transpose()
-            .map_err(|refused| io::Error::other(refused.message().to_string()))?;
-        if !(self.idle)() {
-            self.set(|s| s.enter("waiting_activation"))?;
-            while !(self.idle)() {
-                // Waiting makes no progress of its own: the work it waits on is judged by its own.
-                if self.status.lock().unwrap().as_ref().is_some_and(Status::terminal) {
-                    return Err(io::Error::new(io::ErrorKind::Interrupted, "the update was canceled"));
-                }
-                std::thread::sleep(std::time::Duration::from_secs(1));
-            }
+        let previous = super::binary::previous(&launch.path);
+        if !previous.is_file() {
+            return Err(coded(
+                "binary_unrecoverable",
+                format!("{} is missing: nothing to roll back to", previous.display()),
+            ));
         }
-        Ok((agent, to, activation))
+        Ok(Some((launch.path.clone(), version)))
     }
 
-    /// The pair resolves as a package environment installs it (uv, over the index), or the
-    /// update fails with uv's reason: the machine never selects a pair its environments would
-    /// set aside for a release's locked Runtime.
-    fn resolves(&self, candidate: &Path) -> io::Result<()> {
-        let pair: Vec<String> = wheels(candidate).into_iter().map(|(_, _, p)| p.display().to_string() + "\n").collect();
-        let mut child = std::process::Command::new(&self.paths.uv)
-            .args(["pip", "compile", "--quiet", "--no-config", "--no-cache", "--no-header", "--python", "3.12", "-"])
-            .current_dir(candidate)
-            .process_group(0)
+    /// Closes admission and waits for the work admitted before to drain, saying how many runs
+    /// it waits on as they end. A cancel ends it (Interrupted).
+    fn drain(&self) -> io::Result<Option<super::lifecycle::Activation>> {
+        // No new work is admitted from here; work admitted before drains first.
+        let activation = self.lifecycle.as_ref().map(|l| l.activate()).transpose()
+            .map_err(|refused| io::Error::other(refused.to_string()))?;
+        let admitted = || self.lifecycle.as_ref().map_or(0, |l| l.admitted() as u32);
+        let total = admitted();
+        let mut seen = None;
+        while !(self.idle)() {
+            let left = admitted();
+            if seen != Some(left) {
+                seen = Some(left);
+                self.set(|s| {
+                    s.state = "waiting_activation".into();
+                    s.waiting_for = left;
+                    s.history.push(Step {
+                        state: "waiting_activation".into(),
+                        at_ms: super::lifecycle::now_ms(),
+                        total,
+                        completed: total.saturating_sub(left),
+                    });
+                })?;
+            }
+            // Waiting makes no progress of its own: the work it waits on is judged by its own.
+            if self.status.lock().unwrap().as_ref().is_some_and(Status::terminal) {
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "the update was canceled"));
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+        self.set(|s| s.waiting_for = 0)?;
+        Ok(activation)
+    }
+
+    /// Stages and verifies the pair in `candidate`: what the update's `to` names.
+    fn prepare(&self, request: &Request, candidate: &Path) -> io::Result<Pair> {
+        let runtime = match &request.runtime {
+            Some(choice) => self.resolve("cozy_runtime", choice)?,
+            None => existing_wheel(&self.paths.sdk(), "cozy_runtime")?,
+        };
+        let runtime = stage(candidate, &runtime, "cozy_runtime")?;
+        if let Some(file) = request.runtime.as_ref().filter(|c| !c.file.is_empty()) {
+            fs::write(candidate.join(RUNTIME_BUILD), build(&runtime, &file.sha256)?)?;
+        }
+        match &request.tensorfs {
+            None if request.runtime.is_some() => self.pair(candidate, &runtime)?,
+            choice => {
+                let tensorfs = match choice {
+                    Some(choice) => self.resolve("tensorfs", choice)?,
+                    None => existing_wheel(&self.paths.sdk(), "tensorfs")?,
+                };
+                let tensorfs = stage(candidate, &tensorfs, "tensorfs")?;
+                if let Err(reason) = self.compile(&[runtime, tensorfs])? {
+                    let names: Vec<String> = wheels(candidate).into_iter().map(|(d, v, _)| format!("{d} {v}")).collect();
+                    return Err(invalid(&format!("{} do not install together: {reason}", names.join(" and "))));
+                }
+            }
+        }
+        cozy_platform::durable::sync_dir(candidate)?;
+        identified(candidate)
+    }
+
+    /// A Runtime named alone keeps the machine's TensorFS when the two resolve together, else takes
+    /// the TensorFS uv resolves for the Runtime over the index, fetched from PyPI held to its digest.
+    /// One that resolves none names `--tensorfs-wheel`.
+    fn pair(&self, candidate: &Path, runtime: &Path) -> io::Result<()> {
+        if let Ok(current) = existing_wheel(&self.paths.sdk(), "tensorfs") {
+            if self.compile(&[runtime.to_owned(), current.clone()])?.is_ok() {
+                return stage(candidate, &current, "tensorfs").map(drop);
+            }
+        }
+        let name = runtime.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        let unresolved = |why: String| {
+            io::Error::other(Coded {
+                code: "tensorfs_unresolved",
+                message: format!("{name} resolves no TensorFS over the index ({why}); name one with --tensorfs-wheel"),
+            })
+        };
+        let resolved = self.compile(&[runtime.to_owned()])?.map_err(unresolved)?;
+        let version = resolved
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("tensorfs=="))
+            .ok_or_else(|| unresolved("it requires none".into()))?;
+        let choice = Choice { version: version.into(), ..Default::default() };
+        stage(candidate, &self.resolve("tensorfs", &choice)?, "tensorfs").map(drop)
+    }
+
+    /// Resolves `wheels` as a package environment installs them (uv, over the index): the pinned
+    /// requirements, or uv's reason they do not resolve. The machine never selects a pair its
+    /// environments would set aside for a release's locked Runtime.
+    fn compile(&self, wheels: &[PathBuf]) -> io::Result<Result<String, String>> {
+        let input: String = wheels.iter().map(|p| p.display().to_string() + "\n").collect();
+        super::client::ensure_uv(&self.paths.uv)?;
+        let mut command = std::process::Command::new(&self.paths.uv);
+        let mut child = cozy_platform::process::own_group(&mut command)
+            .args(["pip", "compile", "--quiet", "--no-config", "--no-cache", "--no-header", "--no-annotate", "--python", "3.12", "-"])
             .stdin(Stdio::piped())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
-        // uv's own exit says why, should it stop before reading the pair.
-        let _ = child.stdin.take().expect("piped stdin").write_all(pair.concat().as_bytes());
-        let mut stderr = child.stderr.take().expect("piped stderr");
+        // uv's own exit says why, should it stop before reading the input.
+        let _ = child.stdin.take().expect("piped stdin").write_all(input.as_bytes());
+        let (stdout, stderr) = (child.stdout.take().expect("piped stdout"), child.stderr.take().expect("piped stderr"));
         let stop = self.stop.lock().unwrap().clone();
-        let (ended, reason) = std::thread::scope(|scope| {
-            let drained = scope.spawn(move || {
-                let mut text = String::new();
-                let _ = stderr.read_to_string(&mut text);
-                text
-            });
-            (crate::process::supervise(&mut child, Some(&stop), "uv", &|_| ()), drained.join().unwrap_or_default())
+        let (ended, out, reason) = std::thread::scope(|scope| {
+            let drain = |mut pipe: Box<dyn Read + Send>| {
+                scope.spawn(move || {
+                    let mut text = String::new();
+                    let _ = pipe.read_to_string(&mut text);
+                    text
+                })
+            };
+            let (out, reason) = (drain(Box::new(stdout)), drain(Box::new(stderr)));
+            let ended = crate::process::supervise(&mut child, Some(&stop), "uv", &|_| ());
+            (ended, out.join().unwrap_or_default(), reason.join().unwrap_or_default())
         });
         match ended? {
-            Supervised::Exited(status) if status.success() => Ok(()),
+            Supervised::Exited(status) if status.success() => Ok(Ok(out)),
             Supervised::Canceled => Err(io::Error::new(io::ErrorKind::Interrupted, "the update was canceled")),
             Supervised::Wedged(verdict) => Err(io::Error::other(format!("uv pip compile: {verdict}"))),
             Supervised::Exited(_) => {
                 let reason: Vec<&str> = reason.split_whitespace().filter(|w| !matches!(*w, "×" | "╰─▶")).collect();
-                let names: Vec<String> = wheels(candidate).into_iter().map(|(d, v, _)| format!("{d} {v}")).collect();
-                Err(invalid(&format!("{} do not install together: {}", names.join(" and "), reason.join(" ").trim_end_matches('.'))))
+                Ok(Err(reason.join(" ").trim_end_matches('.').to_owned()))
             }
         }
     }
@@ -723,6 +915,19 @@ impl Updates {
     }
 }
 
+/// Copies a verified `distribution` wheel into `candidate`, durably: where it is now. The copy is
+/// written and flushed through its own handle, since a wheel from the store is read-only (a copy
+/// keeps that) and Windows flushes only through a writable handle.
+fn stage(candidate: &Path, wheel: &Path, distribution: &str) -> io::Result<PathBuf> {
+    let name = wheel.file_name().ok_or_else(|| invalid("wheel name"))?;
+    verify_wheel(wheel, distribution)?;
+    let prepared = candidate.join(name);
+    let mut staged = fs::File::create(&prepared)?;
+    io::copy(&mut fs::File::open(wheel)?, &mut staged)?;
+    staged.sync_all()?;
+    Ok(prepared)
+}
+
 fn existing_wheel(dir: &Path, distribution: &str) -> io::Result<PathBuf> {
     wheels(dir)
         .into_iter()
@@ -731,9 +936,10 @@ fn existing_wheel(dir: &Path, distribution: &str) -> io::Result<PathBuf> {
         .ok_or_else(|| invalid(&format!("no installed {distribution} wheel")))
 }
 
-/// Checks the wheel's METADATA names the distribution and version its file name does; returns
-/// a bundled `tensord` executable when a Runtime wheel carries one.
-fn verify_wheel(path: &Path, distribution: &str) -> io::Result<Option<Vec<u8>>> {
+/// Checks the wheel's METADATA names the distribution and version its file name does. A
+/// `tensord` a Runtime wheel still bundles is never this machine's: its binary moves only with the
+/// `cozy` release.
+fn verify_wheel(path: &Path, distribution: &str) -> io::Result<()> {
     let name = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -764,13 +970,7 @@ fn verify_wheel(path: &Path, distribution: &str) -> io::Result<Option<Vec<u8>>> 
             "{name} METADATA names another distribution or version"
         )));
     }
-    let script = format!("{distribution}-{version}.data/scripts/tensord");
-    let Ok(mut entry) = archive.by_name(&script) else {
-        return Ok(None);
-    };
-    let mut binary = Vec::new();
-    entry.read_to_end(&mut binary)?;
-    Ok(Some(binary))
+    Ok(())
 }
 
 /// A development Runtime wheel's version and build: the source commit it embeds, else its
@@ -786,32 +986,6 @@ fn build(path: &Path, sha256: &str) -> io::Result<String> {
     let commit = provenance.lines().find_map(|l| l.strip_prefix("COMMIT = ")).map(|c| c.trim().trim_matches('"'));
     let id = commit.filter(|c| c.len() >= 8 && c.chars().all(|c| c.is_ascii_hexdigit())).unwrap_or(sha256);
     Ok(format!("{version}+{}", &id[..8]))
-}
-
-/// The bundled executable when it is TensorD (its `version --json` says so). A wheel bundling
-/// anything else leaves this one running.
-fn bundled_tensord(binary: &[u8], dir: &Path) -> io::Result<Option<PathBuf>> {
-    let path = dir.join("tensord");
-    fs::write(&path, binary)?;
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
-    let output = std::process::Command::new(&path)
-        .args(["version", "--json"])
-        .output();
-    #[derive(Deserialize)]
-    struct Identity {
-        name: String,
-    }
-    let tensord = output
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| serde_json::from_slice::<Identity>(&o.stdout).ok())
-        .is_some_and(|i| i.name == "tensord");
-    if !tensord {
-        fs::remove_file(&path)?;
-        return Ok(None);
-    }
-    fs::File::open(&path)?.sync_all()?;
-    Ok(Some(path))
 }
 
 /// `cozy_runtime-0.18.102-cp312-…whl` → ("cozy_runtime", "0.18.102").
@@ -870,11 +1044,13 @@ fn previous_link(link: &Path) -> io::Result<Option<PathBuf>> {
     }
 }
 
-/// Points `link` at `target` atomically, or removes it.
-fn relink(link: &Path, target: Option<&Path>) -> io::Result<()> {
+/// Points `link` at `target` atomically, or removes it. Windows renames nothing over a directory
+/// link, so there the old link goes first; a crash between leaves no link, and the pending
+/// activation's recovery links it again.
+pub(crate) fn relink(link: &Path, target: Option<&Path>) -> io::Result<()> {
     let Some(target) = target else {
-        return match fs::remove_file(link) {
-            Ok(()) => fs::File::open(link.parent().expect("link has a parent"))?.sync_all(),
+        return match unlink(link) {
+            Ok(()) => Ok(cozy_platform::durable::sync_dir(link.parent().expect("link has a parent"))?),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e),
         };
@@ -883,12 +1059,26 @@ fn relink(link: &Path, target: Option<&Path>) -> io::Result<()> {
         .parent()
         .ok_or_else(|| invalid("a link needs a directory"))?;
     fs::create_dir_all(dir)?;
-    // The first activation creates engine/agent. Its entry must survive along with the link.
-    fs::File::open(dir.parent().ok_or_else(|| invalid("a link directory needs a parent"))?)?.sync_all()?;
+    // The first activation creates the link's directory. Its entry must survive with the link.
+    cozy_platform::durable::sync_dir(dir.parent().ok_or_else(|| invalid("a link directory needs a parent"))?)?;
     let temp = dir.join(format!(".link-{}", hex(&super::identity::random::<8>()?)));
-    symlink(target, &temp)?;
+    cozy_platform::durable::symlink(target, &temp)?;
+    #[cfg(windows)]
+    match unlink(link) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
     fs::rename(&temp, link)?;
-    fs::File::open(dir)?.sync_all()
+    Ok(cozy_platform::durable::sync_dir(dir)?)
+}
+
+/// Removes the link itself, never its target: a Windows directory link is a directory entry.
+fn unlink(link: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    if std::os::windows::fs::FileTypeExt::is_symlink_dir(&fs::symlink_metadata(link)?.file_type()) {
+        return fs::remove_dir(link);
+    }
+    fs::remove_file(link)
 }
 
 fn write_json<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
@@ -946,19 +1136,14 @@ mod tests {
     }
 
     #[test]
-    fn wheels_verify_by_metadata_and_a_bundled_tensord_is_recognized() {
+    fn wheels_verify_by_metadata() {
         let dir = std::env::temp_dir().join(format!("cozy-update-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
+        // A Runtime wheel that still bundles a tensord verifies; the bundled one is never run.
         let script = b"#!/bin/sh\necho '{\"name\":\"tensord\"}'\n";
         let runtime = wheel(&dir, "cozy_runtime", "0.18.103", Some(script));
-        let binary = verify_wheel(&runtime, "cozy_runtime").unwrap().unwrap();
-        assert!(bundled_tensord(&binary, &dir).unwrap().is_some());
-        let other = b"#!/bin/sh\necho '{\"name\":\"other\",\"version\":\"0.18.103\"}'\n";
-        assert!(
-            bundled_tensord(other, &dir).unwrap().is_none(),
-            "another executable leaves this machine running"
-        );
+        verify_wheel(&runtime, "cozy_runtime").unwrap();
         assert!(verify_wheel(&runtime, "tensorfs").is_err());
         let wrong = dir.join("tensorfs-0.3.94-py3-none-any.whl");
         fs::copy(wheel(&dir, "tensorfs", "0.3.93", None), &wrong).unwrap();
@@ -973,6 +1158,26 @@ mod tests {
         zip.write_all(b"COMMIT = \"e9baf7a4fe4b855009b2eb288c6dda336c1fe2f0\"\n").unwrap();
         zip.finish().unwrap();
         assert_eq!(build(&built, &"0".repeat(64)).unwrap(), "0.18.104+e9baf7a4", "a build names its commit");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A wheel fetched from PyPI is the store's read-only blob; staging copies it all the same.
+    #[test]
+    fn a_read_only_wheel_stages() {
+        let dir = std::env::temp_dir().join(format!("cozy-stage-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let candidate = dir.join("candidate");
+        fs::create_dir_all(&candidate).unwrap();
+        let fetched = wheel(&dir, "tensorfs", "0.11.0", None);
+        let mut permissions = fs::metadata(&fetched).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&fetched, permissions).unwrap();
+        let staged = stage(&candidate, &fetched, "tensorfs").unwrap();
+        assert_eq!(fs::read(&staged).unwrap(), fs::read(&fetched).unwrap());
+        let mut permissions = fs::metadata(&fetched).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        fs::set_permissions(&fetched, permissions).unwrap();
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -995,22 +1200,20 @@ mod tests {
             &Pending {
                 status,
                 sdk_before: Some(old.clone()),
-                agent_before: None,
+                binary: None,
             },
         )
         .unwrap();
         relink(&paths.current_sdk_link(), Some(&new)).unwrap();
-        relink(&paths.current_agent_link(), Some(&new.join("tensord"))).unwrap();
-        assert!(rollback_pending(&paths, "candidate never became ready").unwrap());
+        assert_eq!(rollback_pending(&paths, "candidate never became ready").unwrap(), Recovered::Restored);
         assert_eq!(fs::read_link(paths.current_sdk_link()).unwrap(), old);
-        assert!(fs::symlink_metadata(paths.current_agent_link()).is_err());
         let status: Status =
             serde_json::from_slice(&fs::read(paths.update("status.json")).unwrap()).unwrap();
         assert_eq!(
             (status.state.as_str(), status.error.as_str()),
             ("rolled_back", "candidate never became ready")
         );
-        assert!(!rollback_pending(&paths, "again").unwrap());
+        assert_eq!(rollback_pending(&paths, "again").unwrap(), Recovered::Nothing);
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1043,9 +1246,13 @@ mod tests {
         let file = candidate.file_name().unwrap().to_str().unwrap().to_owned();
         let (sha256, _) = updates.stage(&file, &mut fs::File::open(&candidate).unwrap()).unwrap();
         let runtime = Some(Choice { file, sha256, ..Default::default() });
-        let request = Request { operation: "u1".into(), agent: "explicit".into(), pin: None, runtime, tensorfs: None };
+        let request = Request { operation: "u1".into(), pin: None, runtime, tensorfs: None, cozy: None, toolchain: false };
         updates.request(request, |code| assert_eq!(code, REPLACE_EXIT)).unwrap();
         state(&updates, "u1", "waiting_activation");
+        // It says how many runs it waits on: the run, and its event, count them.
+        let waiting = updates.update("u1").unwrap();
+        let step = waiting.history.last().unwrap();
+        assert_eq!((waiting.waiting_for, step.total, step.completed), (1, 1, 0), "{waiting:?}");
         assert!(lifecycle.admit().is_err(), "a new run was admitted during activation");
         assert!(!paths.update("pending.json").is_file());
         drop(earlier);
@@ -1102,9 +1309,11 @@ mod tests {
         wheel(&paths.image_wheels, "tensorfs", "0.1.0", None);
         let updates = Updates::open(paths.clone(), Box::new(|| true), None, None).unwrap();
         let request = Request {
-            operation: "same".into(), agent: "bundled".into(), pin: None,
+            operation: "same".into(), pin: None,
             runtime: Some(Choice { version: "0.1.0".into(), ..Default::default() }),
             tensorfs: Some(Choice { version: "0.1.0".into(), ..Default::default() }),
+            cozy: None,
+            toolchain: false,
         };
         updates.request(request, |_| panic!("an unchanged update restarted the service")).unwrap();
         loop {
@@ -1151,17 +1360,15 @@ mod tests {
                 fs::create_dir_all(dir).unwrap();
                 wheel(dir, "cozy_runtime", version, None);
                 wheel(dir, "tensorfs", version, None);
-                fs::write(dir.join("tensord"), b"executable").unwrap();
             }
             relink(&paths.current_sdk_link(), Some(&old)).unwrap();
-            relink(&paths.current_agent_link(), Some(&old.join("tensord"))).unwrap();
             let mut status = Status { operation: "transaction".into(), ..Default::default() };
             status.enter("installing");
             write_json(&paths.update("status.json"), &status).unwrap();
             write_json(&paths.update("pending.json"), &Pending {
                 status,
                 sdk_before: Some(old.clone()),
-                agent_before: Some(old.join("tensord")),
+                binary: None,
             }).unwrap();
             Self { root, paths, old, new }
         }
@@ -1172,7 +1379,6 @@ mod tests {
         }
         fn links(&self, dir: &Path) {
             assert_eq!(fs::read_link(self.paths.current_sdk_link()).unwrap(), dir);
-            assert_eq!(fs::read_link(self.paths.current_agent_link()).unwrap(), dir.join("tensord"));
         }
     }
     impl Drop for Activation {
@@ -1181,24 +1387,21 @@ mod tests {
 
     #[test]
     fn every_unpublished_activation_boundary_rolls_back_before_service_selection() {
-        // Process death after pending, after the SDK link, or after both links but before the
-        // durable starting marker: none may be reported as successfully activated.
-        for changed_links in 0..=2 {
+        // Process death after pending, or after the SDK link but before the durable starting
+        // marker: neither may be reported as successfully activated.
+        for changed_link in [false, true] {
             let transaction = Activation::prepare();
-            if changed_links >= 1 {
+            if changed_link {
                 relink(&transaction.paths.current_sdk_link(), Some(&transaction.new)).unwrap();
-            }
-            if changed_links >= 2 {
-                relink(&transaction.paths.current_agent_link(), Some(&transaction.new.join("tensord"))).unwrap();
             }
             let updates = Updates::open(transaction.paths.clone(), Box::new(|| true), None, None).unwrap();
             assert!(updates.commit().is_err(), "unpublished state committed");
-            assert!(recover_activation(&transaction.paths).unwrap());
+            assert_eq!(recover_activation(&transaction.paths).unwrap(), Recovered::Restored);
             transaction.links(&transaction.old);
             assert!(!transaction.paths.update("pending.json").exists());
             let recovered = Updates::open(transaction.paths.clone(), Box::new(|| true), None, None).unwrap();
             assert_eq!(recovered.update("transaction").unwrap().state, "rolled_back");
-            assert!(!recover_activation(&transaction.paths).unwrap());
+            assert_eq!(recover_activation(&transaction.paths).unwrap(), Recovered::Nothing);
         }
     }
 
@@ -1206,9 +1409,8 @@ mod tests {
     fn published_activation_waits_for_readiness_and_committed_cleanup_keeps_it() {
         let transaction = Activation::prepare();
         relink(&transaction.paths.current_sdk_link(), Some(&transaction.new)).unwrap();
-        relink(&transaction.paths.current_agent_link(), Some(&transaction.new.join("tensord"))).unwrap();
         transaction.state("starting");
-        assert!(!recover_activation(&transaction.paths).unwrap());
+        assert_eq!(recover_activation(&transaction.paths).unwrap(), Recovered::Nothing);
         assert!(transaction.paths.update("pending.json").exists());
         transaction.links(&transaction.new);
         let updates = Updates::open(transaction.paths.clone(), Box::new(|| true), None, None).unwrap();
@@ -1217,7 +1419,7 @@ mod tests {
         updates.commit().unwrap();
         assert_eq!(updates.update("transaction").unwrap().state, "succeeded");
         fs::write(transaction.paths.update("pending.json"), pending).unwrap();
-        assert!(!recover_activation(&transaction.paths).unwrap());
+        assert_eq!(recover_activation(&transaction.paths).unwrap(), Recovered::Nothing);
         transaction.links(&transaction.new);
         assert!(!transaction.paths.update("pending.json").exists());
     }
@@ -1229,7 +1431,7 @@ mod tests {
         rollback_pending(&transaction.paths, "candidate could not start").unwrap();
         let settled = fs::read(transaction.paths.update("status.json")).unwrap();
         fs::write(transaction.paths.update("pending.json"), pending).unwrap();
-        assert!(recover_activation(&transaction.paths).unwrap());
+        assert_eq!(recover_activation(&transaction.paths).unwrap(), Recovered::Restored);
         transaction.links(&transaction.old);
         let expected: Status = serde_json::from_slice(&settled).unwrap();
         let actual: Status = serde_json::from_slice(&fs::read(transaction.paths.update("status.json")).unwrap()).unwrap();
@@ -1243,13 +1445,12 @@ mod tests {
         for restored_links in 0..=1 {
             let transaction = Activation::prepare();
             relink(&transaction.paths.current_sdk_link(), Some(&transaction.new)).unwrap();
-            relink(&transaction.paths.current_agent_link(), Some(&transaction.new.join("tensord"))).unwrap();
-            transaction.state("starting");
+                transaction.state("starting");
             transaction.state("rolled_back");
             if restored_links == 1 {
                 relink(&transaction.paths.current_sdk_link(), Some(&transaction.old)).unwrap();
             }
-            assert!(recover_activation(&transaction.paths).unwrap());
+            assert_eq!(recover_activation(&transaction.paths).unwrap(), Recovered::Restored);
             transaction.links(&transaction.old);
             assert!(!transaction.paths.update("pending.json").exists());
         }
@@ -1282,9 +1483,11 @@ mod tests {
         let persisted: Status = serde_json::from_slice(&fs::read(transaction.paths.update("status.json")).unwrap()).unwrap();
         assert_eq!(persisted.state, "succeeded");
         let next = Request {
-            operation: "next".into(), agent: "explicit".into(), pin: None,
+            operation: "next".into(), pin: None,
             runtime: Some(Choice { version: "0.2.0".into(), ..Default::default() }),
             tensorfs: None,
+            cozy: None,
+            toolchain: false,
         };
         let rejected = updates.request(next, |_| panic!("unsettled cleanup started an update")).unwrap_err();
         assert_eq!(rejected.0, 500);
@@ -1317,8 +1520,8 @@ mod tests {
         let file = wheel.file_name().unwrap().to_str().unwrap().to_owned();
         let (sha256, _) = updates.stage(&file, &mut fs::File::open(wheel).unwrap()).unwrap();
         Request {
-            operation: id.into(), agent: "explicit".into(), pin: None,
-            runtime: Some(Choice { file, sha256, ..Default::default() }), tensorfs: None,
+            operation: id.into(), pin: None,
+            runtime: Some(Choice { file, sha256, ..Default::default() }), tensorfs: None, cozy: None, toolchain: false,
         }
     }
 
@@ -1409,7 +1612,11 @@ mod tests {
         wheel(&paths.image_wheels, "tensorfs", "0.1.0", None);
         let updates = Updates::open(paths.clone(), Box::new(|| true), None, None).unwrap();
         let candidate = requiring(&root, "cozy_runtime", "0.2.0", None, "Requires-Dist: tensorfs>=0.2\n");
-        updates.request(update_request(&updates, "u1", &candidate), |_| panic!("an unresolved pair activated")).unwrap();
+        let mut request = update_request(&updates, "u1", &candidate);
+        let tensorfs = wheel(&root, "tensorfs", "0.1.0", None);
+        let (sha256, _) = updates.stage("tensorfs-0.1.0-py3-none-any.whl", &mut fs::File::open(tensorfs).unwrap()).unwrap();
+        request.tensorfs = Some(Choice { file: "tensorfs-0.1.0-py3-none-any.whl".into(), sha256, ..Default::default() });
+        updates.request(request, |_| panic!("an unresolved pair activated")).unwrap();
         let failed = loop {
             match updates.update("u1").unwrap() {
                 status if status.terminal() => break status,
@@ -1421,6 +1628,31 @@ mod tests {
         assert!(failed.error.contains("tensorfs>=0.2"), "{}", failed.error);
         assert!(failed.error.ends_with("; it keeps Runtime 0.1.0 and TensorFS 0.1.0"), "{}", failed.error);
         assert!(fs::symlink_metadata(paths.current_sdk_link()).is_err(), "an unresolved pair was selected");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A Runtime named alone whose TensorFS neither the machine's nor any over the index meets
+    /// fails naming `--tensorfs-wheel`, and selects nothing.
+    #[test]
+    fn a_runtime_alone_that_resolves_no_tensorfs_names_the_flag() {
+        let root = std::env::temp_dir().join(format!("cm-unpaired-update-{}", uuid::Uuid::new_v4()));
+        let paths = Paths::new(&root.join("engine"), &root);
+        fs::create_dir_all(&paths.image_wheels).unwrap();
+        wheel(&paths.image_wheels, "cozy_runtime", "0.1.0", None);
+        wheel(&paths.image_wheels, "tensorfs", "0.1.0", None);
+        let updates = Updates::open(paths.clone(), Box::new(|| true), None, None).unwrap();
+        let candidate = requiring(&root, "cozy_runtime", "0.2.0", None, "Requires-Dist: tensorfs>=999\n");
+        updates.request(update_request(&updates, "u1", &candidate), |_| panic!("an unpaired Runtime activated")).unwrap();
+        let failed = loop {
+            match updates.update("u1").unwrap() {
+                status if status.terminal() => break status,
+                _ => std::thread::sleep(std::time::Duration::from_millis(10)),
+            }
+        };
+        assert_eq!((failed.state.as_str(), failed.code.as_str()), ("failed", "tensorfs_unresolved"), "{}", failed.error);
+        assert!(failed.error.contains("name one with --tensorfs-wheel"), "{}", failed.error);
+        assert!(failed.error.ends_with("; it keeps Runtime 0.1.0 and TensorFS 0.1.0"), "{}", failed.error);
+        assert!(fs::symlink_metadata(paths.current_sdk_link()).is_err(), "an unpaired Runtime was selected");
         fs::remove_dir_all(root).unwrap();
     }
 

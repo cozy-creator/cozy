@@ -113,6 +113,11 @@ fn escape(text: &str) -> String {
         .replace('>', "&gt;")
 }
 
+/// Only a manager that restarts services can say one failed to start.
+pub(super) fn failed(_: &str) -> bool {
+    false
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

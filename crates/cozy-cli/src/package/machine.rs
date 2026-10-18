@@ -4,27 +4,27 @@ use std::{collections::BTreeMap, path::Path, process::ExitCode};
 
 use cozy_proto::{
     calcifer::{self, Environment, Machine, MachineState, On, Run, Status, SubmitRun},
+    config::Origin,
     error::{Error, Kind},
-    machine::{self as v1, run_spec::Source},
+    machine::{self as v1, Source},
 };
-use prost::Message as _;
 use serde::{Deserialize, Serialize};
 
 use super::{PackageRef, release_order};
 use crate::{
     Context,
+    machine::{Notices, route, until_ready},
     output::{self, Table},
     run,
 };
 
-fn spec(kind: v1::RunKind, source: Source, catalog_revision: String) -> Vec<u8> {
+fn spec(kind: v1::RunKind, source: Source, catalog_revision: String) -> v1::RunSpec {
     v1::RunSpec {
-        kind: kind as i32,
+        kind,
         source: Some(source),
         catalog_revision,
         ..Default::default()
     }
-    .encode_to_vec()
 }
 
 fn release(package: &str, release: &str) -> Source {
@@ -40,7 +40,7 @@ async fn submit(
     hub: &str,
     kind: calcifer::Kind,
     target: String,
-    spec: Vec<u8>,
+    spec: v1::RunSpec,
 ) -> Result<Run, Error> {
     let ask = SubmitRun {
         on,
@@ -84,8 +84,8 @@ struct Installed {
     interface: serde_json::Value,
 }
 
-/// A warm run naming the release (none: the machine reads the Hub's newest, unless it holds one)
-/// and no function: the package environment only, no weights.
+/// A warm run naming the release (none: the Hub's newest, as `cozy run` takes it) and no
+/// function: the package environment only, no weights.
 pub async fn install(
     ctx: &Context,
     package: &PackageRef,
@@ -93,21 +93,15 @@ pub async fn install(
     detach: bool,
 ) -> Result<ExitCode, Error> {
     let hub = ctx.hub()?;
-    let wanted = release(
-        &package.package(),
-        package.release.as_deref().unwrap_or_default(),
-    );
-    let warm = spec(v1::RunKind::Warm, wanted, String::new());
-    let submitted = submit(
-        ctx,
-        on,
-        &hub.origin,
-        calcifer::Kind::Warm,
-        package.to_string(),
-        warm,
-    )
-    .await?;
-    installed(ctx, submitted, &package.package(), detach).await
+    let name = package.package();
+    let chosen = match &package.release {
+        Some(chosen) => chosen.clone(),
+        None => run::latest(ctx, &hub, &name).await?,
+    };
+    let warm = spec(v1::RunKind::Warm, release(&name, &chosen), String::new());
+    let target = format!("{name}@{chosen}");
+    let submitted = submit(ctx, on, &hub.origin, calcifer::Kind::Warm, target, warm).await?;
+    installed(ctx, submitted, &name, detach).await
 }
 
 /// A directory or a PEP 723 script, installed live: the next run reads its files as they are
@@ -127,7 +121,7 @@ pub async fn install_directory(
     );
     let ask = SubmitRun {
         on,
-        hub: ctx.hub()?.origin,
+        hub: ctx.hub()?.origin.into(),
         kind: calcifer::Kind::Warm,
         target: local.package.clone(),
         spec: warm,
@@ -161,6 +155,19 @@ async fn installed(
             ctx,
             &format!("{package}@{} is installed on {machine}", installed.release),
         );
+        if !package.starts_with("local/") {
+            let on = On::Machine(machine.clone());
+            let held = machines(ctx, Some(&on)).await?.remove(0);
+            let older: Vec<&str> = (environments(ctx, &held)?.into_iter())
+                .filter(|env| env.package == package && env.release != installed.release)
+                .map(|env| env.release.as_str())
+                .collect();
+            if !older.is_empty() {
+                let older = older.join(", ");
+                output::say(ctx, &format!("{machine} also holds {package}@{older}"));
+                next.insert(0, format!("cozy package update {package} --on {machine}"));
+            }
+        }
         let first = run::interface::Interface::parse(&installed.interface)
             .ok()
             .and_then(|interface| interface.public().first().map(|name| name.to_string()));
@@ -173,7 +180,8 @@ async fn installed(
 }
 
 /// The machines this command reads: `on` alone, read from the machine now (so a run that just
-/// settled shows), or every ready one as Calcifer last saw it.
+/// settled shows), or every ready one as Calcifer last saw it. A booting `on` is waited for, as a
+/// run sent to it waits.
 async fn machines(ctx: &Context, on: Option<&On>) -> Result<Vec<Machine>, Error> {
     let calcifer = ctx.calcifer().await?;
     let Some(on) = on else {
@@ -183,7 +191,20 @@ async fn machines(ctx: &Context, on: Option<&On>) -> Result<Vec<Machine>, Error>
             .filter(|m| m.state == MachineState::Ready)
             .collect());
     };
-    let path = format!("/v1/machines/{}", named(on)?.to_ascii_lowercase());
+    let mut machine: Machine = calcifer
+        .get(&route(&named(on)?.to_ascii_lowercase())?)
+        .await?;
+    if machine.state == MachineState::Booting {
+        let name = machine.name.clone();
+        output::say(ctx, &format!("waiting for {name} to start"));
+        machine = until_ready(ctx, machine, Notices::default())
+            .await?
+            .ok_or_else(|| {
+                let message = format!("{name} has not started; nothing was sent to it");
+                Error::new(Kind::Unavailable, "machine_booting", message)
+            })?;
+    }
+    let path = route(&machine.name.to_ascii_lowercase())?;
     let machine: Machine = calcifer.get_query(&path, &[("fresh", "true")]).await?;
     Ok(vec![machine])
 }
@@ -204,7 +225,7 @@ pub(crate) fn named(on: &On) -> Result<&str, Error> {
 fn environments<'a>(ctx: &Context, machine: &'a Machine) -> Result<Vec<&'a Environment>, Error> {
     let narrowed = ctx.narrowed()?;
     let scope = |env: &Environment| match &narrowed {
-        Some(hub) => env.hub.is_empty() || same_origin(&env.hub, &hub.origin),
+        Some(hub) => env.hub.is_empty() || origin(&env.hub).as_ref() == Some(&hub.origin),
         None => true,
     };
     Ok(machine
@@ -215,24 +236,29 @@ fn environments<'a>(ctx: &Context, machine: &'a Machine) -> Result<Vec<&'a Envir
         .collect())
 }
 
-fn same_origin(a: &str, b: &str) -> bool {
-    a.trim_end_matches('/')
-        .eq_ignore_ascii_case(b.trim_end_matches('/'))
+/// An installation's Hub in its one spelling (a machine may write `https://tensorhub.com:443`);
+/// none for local code.
+fn origin(hub: &str) -> Option<Origin> {
+    Origin::parse(hub).ok()
+}
+
+/// What a run on an installation's Hub names it: its one spelling, or as the machine wrote it.
+fn canonical(hub: &str) -> String {
+    origin(hub).map_or_else(|| hub.to_owned(), String::from)
 }
 
 /// A Hub origin as this computer names it; local code has none.
-fn hub_label(ctx: &Context, origin: &str) -> String {
-    if origin.is_empty() {
+fn hub_label(ctx: &Context, hub: &str) -> String {
+    if hub.is_empty() {
         return "local".into();
     }
-    let known = ctx
-        .config
-        .hubs()
-        .into_iter()
-        .find(|hub| same_origin(&hub.origin, origin));
+    let Some(origin) = origin(hub) else {
+        return hub.to_owned();
+    };
+    let known = ctx.config.hubs().into_iter().find(|h| h.origin == origin);
     known
         .map(|hub| hub.label().to_owned())
-        .unwrap_or_else(|| origin.to_owned())
+        .unwrap_or_else(|| origin.to_string())
 }
 
 /// Refuses a name the machine does not hold, before any run.
@@ -353,10 +379,10 @@ pub async fn remove(ctx: &Context, names: &[String], on: On) -> Result<ExitCode,
     let envs = environments(ctx, &machine)?;
     held(names, &envs, &machine.name)?;
     let default_hub = ctx.hub()?.origin;
-    let mut targets: Vec<(&str, &str)> = envs
+    let mut targets: Vec<(&str, String)> = envs
         .iter()
         .filter(|env| names.contains(&env.package))
-        .map(|env| (env.package.as_str(), env.hub.as_str()))
+        .map(|env| (env.package.as_str(), canonical(&env.hub)))
         .collect();
     targets.sort();
     targets.dedup();
@@ -365,7 +391,7 @@ pub async fn remove(ctx: &Context, names: &[String], on: On) -> Result<ExitCode,
         let hub = if hub.is_empty() {
             default_hub.as_str()
         } else {
-            hub
+            hub.as_str()
         };
         let spec = spec(v1::RunKind::Remove, release(package, ""), String::new());
         let on = On::Machine(machine.name.clone());
@@ -443,19 +469,20 @@ pub async fn update(ctx: &Context, names: &[String], on: On) -> Result<ExitCode,
     let machine = machines(ctx, Some(&on)).await?.remove(0);
     let envs = environments(ctx, &machine)?;
     held(names, &envs, &machine.name)?;
-    let mut groups: BTreeMap<(&str, &str), Vec<&Environment>> = BTreeMap::new();
+    let mut groups: BTreeMap<(&str, String), Vec<&Environment>> = BTreeMap::new();
     for env in envs
         .iter()
         .filter(|env| names.is_empty() || names.contains(&env.package))
     {
         groups
-            .entry((&env.package, &env.hub))
+            .entry((&env.package, canonical(&env.hub)))
             .or_default()
             .push(env);
     }
     let on = || On::Machine(machine.name.clone());
     let mut rows = vec![];
     for ((package, hub), held) in groups {
+        let hub = hub.as_str();
         let mut row = Updated {
             package: package.to_owned(),
             hub: hub_label(ctx, hub),

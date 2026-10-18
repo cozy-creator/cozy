@@ -2,8 +2,8 @@
 //! link, and the addresses Status reports for it. No relay: a viewer behind NAT is refused.
 use crate::api::v1;
 use std::{
-    collections::HashMap,
-    fs, io,
+    collections::BTreeMap,
+    io,
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener},
     path::Path,
 };
@@ -23,28 +23,15 @@ pub enum Reach {
 /// while the control API stays where the grant puts it. A rental listens on its granted port;
 /// this computer's machine keeps the port it first took, so a play link survives restarts.
 pub fn listen(state: &Path, granted: Option<u16>, persistent: bool) -> io::Result<Option<TcpListener>> {
-    let bind = |port| TcpListener::bind((Ipv4Addr::UNSPECIFIED, port));
-    if let Some(port) = granted {
-        return bind(port).map(Some);
-    }
-    if !persistent {
+    if granted.is_none() && !persistent {
         return Ok(None);
     }
-    let saved = state.join("webrtc-port");
-    let kept = fs::read_to_string(&saved).ok().and_then(|text| text.trim().parse::<u16>().ok());
-    let listener = match kept.map(bind) {
-        Some(Ok(listener)) => listener,
-        _ => bind(0)?,
-    };
-    if kept != Some(listener.local_addr()?.port()) {
-        super::identity::write_atomic(&saved, listener.local_addr()?.port().to_string().as_bytes(), 0o600)?;
-    }
-    Ok(Some(listener))
+    super::net::kept_listener(&state.join("webrtc-port"), Ipv4Addr::UNSPECIFIED.into(), granted).map(Some)
 }
 
 /// The launch environment's mapping of a granted port: `COZY_WEBRTC_PUBLIC_ADDRESS`, else
 /// RunPod's or vast.ai's public IP and external port for it.
-pub fn reach(granted: Option<u16>, env: &HashMap<String, String>) -> Reach {
+pub fn reach(granted: Option<u16>, env: &BTreeMap<String, String>) -> Reach {
     let ipv4 = |address: SocketAddr, what: &str| match address.is_ipv4() && address.port() != 0 {
         true => Reach::Mapped(address),
         false => Reach::Invalid(format!("{what} must name an IPv4 address and a nonzero port")),
@@ -85,10 +72,8 @@ pub fn endpoint(port: u16, reach: &Reach, cert_der: &[u8]) -> v1::WebRtc {
 
 /// This computer's IPv4 addresses (LAN, Tailscale; loopback last) at `port`.
 fn interfaces(port: u16) -> Vec<String> {
-    let mut found: Vec<Ipv4Addr> = nix::ifaddrs::getifaddrs()
+    let mut found: Vec<Ipv4Addr> = addresses()
         .into_iter()
-        .flatten()
-        .filter_map(|interface| interface.address?.as_sockaddr_in().map(|v4| v4.ip()))
         .filter(|ip| !ip.is_unspecified() && !ip.is_multicast())
         .collect();
     found.sort_by_key(|ip| (ip.is_loopback(), *ip));
@@ -96,9 +81,32 @@ fn interfaces(port: u16) -> Vec<String> {
     found.into_iter().map(|ip| SocketAddr::new(ip.into(), port).to_string()).collect()
 }
 
+#[cfg(unix)]
+fn addresses() -> Vec<Ipv4Addr> {
+    (nix::ifaddrs::getifaddrs().into_iter().flatten())
+        .filter_map(|interface| interface.address?.as_sockaddr_in().map(|v4| v4.ip()))
+        .collect()
+}
+
+/// Where this computer's default route leaves from, and loopback: Windows has no getifaddrs,
+/// and a UDP socket's connect only consults the route, sending nothing.
+#[cfg(not(unix))]
+fn addresses() -> Vec<Ipv4Addr> {
+    let routed = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).and_then(|socket| {
+        socket.connect((Ipv4Addr::new(192, 0, 2, 1), 9))?;
+        socket.local_addr()
+    });
+    let routed = routed.ok().and_then(|address| match address.ip() {
+        std::net::IpAddr::V4(v4) => Some(v4),
+        std::net::IpAddr::V6(_) => None,
+    });
+    routed.into_iter().chain([Ipv4Addr::LOCALHOST]).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     /// This computer's machine keeps its port across restarts, and takes another if that one
     /// is now in use; every address it reports accepts a connection.
@@ -127,7 +135,7 @@ mod tests {
     /// is reported, never guessed around.
     #[test]
     fn a_rental_reports_its_provider_mapping() {
-        let env = |pairs: &[(&str, &str)]| -> HashMap<String, String> {
+        let env = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
             pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
         };
         let vast = env(&[("PUBLIC_IPADDR", "203.0.113.7"), ("VAST_TCP_PORT_8085", "30001")]);

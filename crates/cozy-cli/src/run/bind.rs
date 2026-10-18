@@ -12,6 +12,7 @@ use std::{
 };
 
 use cozy_proto::{
+    calcifer::StagedInput,
     error::{Error, Kind},
     ids::Digest,
 };
@@ -38,6 +39,8 @@ pub struct Terms {
     pub input_file: Option<PathBuf>,
     /// `--asset [field.path=|label=]FILE`.
     pub assets: Vec<String>,
+    /// `--asset-fidelity label-or-index=auto|low|medium|high`.
+    pub fidelities: Vec<String>,
     /// `--lora slot:component=ref[,strength]`.
     pub loras: Vec<String>,
     /// The run's idempotency key, which an omitted integer `seed` derives from.
@@ -45,6 +48,10 @@ pub struct Terms {
     /// Where relative paths start, and what `~` means.
     pub cwd: PathBuf,
     pub user_home: PathBuf,
+    /// Where input files' digests are remembered across runs; None reads each file every time.
+    pub digests: Option<PathBuf>,
+    /// Where input trees' manifests are written for the run to send; None: the temp directory.
+    pub manifests: Option<PathBuf>,
 }
 
 #[derive(Debug, Default, PartialEq)]
@@ -56,6 +63,8 @@ pub struct Bound {
     pub destination: Option<String>,
     /// Undeclared fields that were dropped, as people read their paths.
     pub ignored: Vec<String>,
+    /// The files of input trees, sent with the run; their manifests (in `files`) name them.
+    pub tree_files: Vec<StagedInput>,
 }
 
 /// A local file bound to a payload field, whose value is its digest.
@@ -95,8 +104,9 @@ impl Bound {
 
 impl Bound {
     /// The payload's canonical JSON: sorted keys, no whitespace, exact integers.
-    pub fn canonical_payload(&self) -> Vec<u8> {
-        canonical(&Value::Object(self.payload.clone())).into_bytes()
+    pub fn canonical_payload(&self) -> cozy_proto::machine::Json {
+        let text = canonical(&Value::Object(self.payload.clone()));
+        cozy_proto::machine::Json::parse(text).expect("canonical JSON is JSON")
     }
 }
 
@@ -139,6 +149,7 @@ pub fn warm_choices(callable: &Callable, terms: &Terms) -> Result<Vec<Choice>, E
         || !binder.document.is_empty()
         || !binder.files.is_empty()
         || !terms.assets.is_empty()
+        || !terms.fidelities.is_empty()
         || terms.input_file.is_some()
     {
         return Err(usage(
@@ -173,7 +184,9 @@ pub fn bind(
     let positional = binder.read_terms(&inputs)?;
     binder.primary(positional)?;
     binder.loras()?;
-    let files = binder.attach()?;
+    let mut files = binder.attach()?;
+    binder.fidelities()?;
+    let tree_files = binder.trees(&mut files)?;
     binder.seed();
     let ignored = validate(target, release, callable, &mut binder.document)?;
     Ok(Bound {
@@ -182,6 +195,7 @@ pub fn bind(
         models: binder.choices.into_values().collect(),
         destination,
         ignored,
+        tree_files,
     })
 }
 
@@ -703,7 +717,7 @@ impl Binder<'_> {
                     ),
                 ));
             }
-            let digest = digest(&path)?;
+            let digest = super::digests::of(self.terms.digests.as_deref(), &path)?;
             set_path(
                 &mut self.document,
                 &parts,
@@ -726,6 +740,92 @@ impl Binder<'_> {
         self.count_kinds(&files)?;
         files.sort_by(|a, b| a.field.cmp(&b.field));
         Ok(files)
+    }
+
+    /// Each local directory at a Tree input becomes a TensorFS manifest naming its files: the field
+    /// names the manifest by its digest, as the machine materializes the tree; the files go too.
+    fn trees(&mut self, files: &mut Vec<InputFile>) -> Result<Vec<StagedInput>, Error> {
+        let mut found = vec![];
+        for field in &self.callable.request.fields {
+            if let Some(value) = self.document.get(&field.name) {
+                tree_dirs(&field.ty, value, &field.name, &mut found);
+            }
+        }
+        let manifests = (self.terms.manifests.clone())
+            .unwrap_or_else(|| std::env::temp_dir().join("cozy-trees"));
+        let mut members = vec![];
+        for (field, source) in found {
+            let root = self.resolve(Path::new(&source));
+            if !root.is_dir() {
+                return Err(usage(
+                    "tree_not_a_directory",
+                    format!("{field}: {} is not a directory", root.display()),
+                ));
+            }
+            let staged = super::tree::stage(&root, self.terms.digests.as_deref(), &manifests)?;
+            let parts: Vec<String> = field.split('.').map(str::to_owned).collect();
+            let digest = staged.manifest.digest;
+            set_path(
+                &mut self.document,
+                &parts,
+                Value::String(digest.to_string()),
+            )?;
+            files.push(InputFile {
+                field,
+                path: staged.manifest.path,
+                digest,
+                length: staged.manifest.length,
+                media_type: super::tree::MEDIA.into(),
+                order: 0,
+            });
+            members.extend(staged.files);
+        }
+        files.sort_by(|a, b| a.field.cmp(&b.field));
+        Ok(members)
+    }
+
+    /// `--asset-fidelity`: each hint goes on the Assets occurrence its label or index names, for
+    /// the package to read.
+    fn fidelities(&mut self) -> Result<(), Error> {
+        if self.terms.fidelities.is_empty() {
+            return Ok(());
+        }
+        let Some(assets) = &self.callable.assets else {
+            return Err(usage(
+                "assets_undeclared",
+                format!(
+                    "{} declares no Assets input for --asset-fidelity",
+                    self.callable.name
+                ),
+            ));
+        };
+        let mut none = vec![];
+        let list = match self.document.get_mut(&assets.parameter) {
+            Some(Value::Array(list)) => list,
+            _ => &mut none,
+        };
+        let mut given = BTreeSet::new();
+        for term in &self.terms.fidelities {
+            let (key, fidelity) = term.rsplit_once('=').expect("clap checked its form");
+            let index = list.iter().position(|e| e["label"] == key).or_else(|| {
+                let index = key.parse().ok().filter(|i: &usize| i.to_string() == key)?;
+                (index < list.len()).then_some(index)
+            });
+            let Some(index) = index.filter(|i| list[*i].is_object()) else {
+                return Err(usage(
+                    "asset_fidelity_unmatched",
+                    format!("--asset-fidelity {key:?} names no attached asset"),
+                ));
+            };
+            if !given.insert(index) {
+                return Err(usage(
+                    "asset_fidelity_repeated",
+                    format!("asset {key:?} was given a fidelity more than once"),
+                ));
+            }
+            list[index]["fidelity"] = fidelity.into();
+        }
+        Ok(())
     }
 
     /// `field.path=file` names an input (a list of files named whole takes its next slot);
@@ -1144,10 +1244,39 @@ fn embedded_files(ty: &Type, value: &Value, path: &str, out: &mut Vec<Spec>) -> 
     Ok(())
 }
 
+/// Local directories at Tree positions: each field's path and the directory as written.
+fn tree_dirs(ty: &Type, value: &Value, path: &str, out: &mut Vec<(String, String)>) {
+    match (ty, value) {
+        (Type::Tree, Value::String(source))
+            if !source.starts_with("sha256:") && !source.is_empty() =>
+        {
+            out.push((path.to_owned(), source.clone()));
+        }
+        (Type::Union { branches, .. }, value) => {
+            for branch in branches {
+                tree_dirs(branch, value, path, out);
+            }
+        }
+        (Type::List(item), Value::Array(values)) => {
+            for (i, value) in values.iter().enumerate() {
+                tree_dirs(item, value, &format!("{path}.{i}"), out);
+            }
+        }
+        (Type::Struct(s), Value::Object(object)) => {
+            for field in &s.fields {
+                if let Some(value) = object.get(&field.name) {
+                    tree_dirs(&field.ty, value, &format!("{path}.{}", field.name), out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Rewrites relative file names at input-file positions against `base`.
 fn relative_files(ty: &Type, value: &mut Value, base: &Path) {
     match (ty, value) {
-        (Type::Asset(_), Value::String(source))
+        (Type::Asset(_) | Type::Tree, Value::String(source))
             if !source.contains("://")
                 && !source.starts_with("sha256:")
                 && !is_explicit_path(source)
@@ -1155,7 +1284,7 @@ fn relative_files(ty: &Type, value: &mut Value, base: &Path) {
         {
             *source = base.join(&*source).to_string_lossy().into_owned();
         }
-        (Type::Asset(_), Value::String(source))
+        (Type::Asset(_) | Type::Tree, Value::String(source))
             if source.starts_with("./") || source.starts_with("../") =>
         {
             *source = base.join(&*source).to_string_lossy().into_owned();
@@ -1640,25 +1769,6 @@ fn sniff(path: &Path) -> Result<Sniffed, Error> {
         length,
         media_type: media_type.to_owned(),
     })
-}
-
-fn digest(path: &Path) -> Result<Digest, Error> {
-    let mut file = File::open(path).map_err(|e| {
-        Error::new(
-            Kind::NotFound,
-            "input_file_unreadable",
-            format!("input file {}: {e}", path.display()),
-        )
-    })?;
-    let mut hasher = Sha256::new();
-    std::io::copy(&mut file, &mut hasher).map_err(|e| {
-        Error::new(
-            Kind::Internal,
-            "input_file_unreadable",
-            format!("input file {}: {e}", path.display()),
-        )
-    })?;
-    Ok(Digest::from_bytes(hasher.finalize().into()))
 }
 
 /// A LoRA strength as a canonical decimal string: finite, `0` for zero.

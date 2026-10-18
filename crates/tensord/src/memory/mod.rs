@@ -8,10 +8,10 @@ pub mod policy;
 
 use policy::{Decision, Facts, Gpu, Holding, Round, Sample, Step};
 use serde::Deserialize;
+use cozy_platform::durable::FileAt;
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, Write},
-    os::unix::fs::FileExt,
     path::PathBuf,
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
@@ -21,7 +21,7 @@ use std::{
 const ROTATE_BYTES: u64 = 4 << 20;
 
 /// Budget-cell `wanted` at or below this asks for a process cap of `CAP - wanted` bytes
-/// (Runtime `budget_cell.CAP`, `process_cap/1`).
+/// (Runtime `budget_cell.CAP`).
 const CELL_CAP: i64 = -2;
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -496,9 +496,9 @@ mod tests {
 
     #[test]
     fn room_grants_reach_each_rank_without_borrowing_another_gpus_cap() {
-        let leader = cozy_platform::shm::memfd_named("tensord-weights").map(std::fs::File::from).unwrap();
+        let leader = tempfile::tempfile().unwrap();
         leader.set_len(32).unwrap();
-        let follower = cozy_platform::shm::memfd_named("tensord-weights").map(std::fs::File::from).unwrap();
+        let follower = tempfile::tempfile().unwrap();
         follower.set_len(32).unwrap();
         let leader_memory = memory();
         let follower_memory = memory();
@@ -545,7 +545,7 @@ mod tests {
     fn a_room_grant_below_the_floor_never_raises_the_cap_the_watchdog_lowered() {
         // Run 5424 (an 8 GB laptop card): the executor held its cap, the card was below its
         // floor, and the grant answered with what the process held, above the watchdog's cap.
-        let cell = cozy_platform::shm::memfd_named("tensord-weights").map(std::fs::File::from).unwrap();
+        let cell = tempfile::tempfile().unwrap();
         cell.set_len(32).unwrap();
         let memory = memory();
         memory.observe(
@@ -581,7 +581,7 @@ mod tests {
 
     #[test]
     fn an_unmeasured_gpu_publishes_no_room_grant() {
-        let cell = cozy_platform::shm::memfd_named("tensord-weights").map(std::fs::File::from).unwrap();
+        let cell = tempfile::tempfile().unwrap();
         cell.set_len(32).unwrap();
         let memory = memory();
         assert_eq!(
@@ -598,9 +598,10 @@ mod tests {
 
     #[test]
     fn a_failed_room_cell_does_not_record_an_unpublished_cap() {
-        let cell = cozy_platform::shm::memfd_named("tensord-weights").map(std::fs::File::from).unwrap();
-        cell.set_len(32).unwrap();
-        cozy_platform::shm::seal_with(std::os::fd::AsFd::as_fd(&cell), cozy_platform::shm::NO_WRITE_SEALS).unwrap();
+        // A cell that takes no writes: a read-only open of a zeroed one.
+        let written = tempfile::NamedTempFile::new().unwrap();
+        written.as_file().set_len(32).unwrap();
+        let cell = File::open(written.path()).unwrap();
         let memory = memory();
         assert!(memory.grant_room("plan", &sample(30), Some(&cell)).is_err());
         assert_eq!(memory.with(|gpu| gpu.tenant("plan").unwrap().cap), 0);

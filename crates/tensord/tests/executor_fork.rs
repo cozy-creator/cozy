@@ -1,11 +1,12 @@
 //! Executors forked from an import-only executor (`fork/1`) on real Runtime processes of
 //! `tests/fixtures/cpu_lifecycle`, no doubles. CUDA is hidden by the seal; the GPU half is
 //! proven on a rental. `TENSORD_FORK_GENERATIONS` names installed generations whose
-//! Runtime offers `fork/1`.
+//! Runtime offers `fork/1`. Unix only: a Windows executor is spawned, never forked.
+#![cfg(unix)]
 use cozy_platform::process::Exact;
 use tensord::{
     device_executor::{
-        Baseline, Binding, Budgets, DeviceCommand, DeviceExecutor, ExecutorConfig, Forked, FORK,
+        Baseline, Binding, Budgets, DeviceCommand, DeviceExecutor, ExecutorConfig, Forked,
     },
     launch_identity::Seal,
     
@@ -82,7 +83,6 @@ fn parent(generation: &Generation, hold: &File) -> (DeviceExecutor, PathBuf, Pat
     )
     .unwrap();
     let mut parent = DeviceExecutor::spawn(config(generation, hold, &root, "parent")).unwrap();
-    assert!(parent.hello.offers(FORK));
     let started = parent
         .command(&start(generation, &interface, true), &mut Baseline)
         .unwrap();
@@ -171,7 +171,6 @@ fn a_forked_executor_is_sealed_serves_and_is_reaped_with_its_status() {
                     deadline_s: None,
                     attention_kernel: String::new(),
                     bits: 0,
-                    plane_budget_bytes: -1,
                     cap_bytes: None,
                     inputs: Default::default(),
                     trees: Default::default(),

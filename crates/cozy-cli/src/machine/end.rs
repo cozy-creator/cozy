@@ -13,7 +13,6 @@ use cozy_proto::{
     ids::Digest,
     machine as v1,
 };
-use prost::Message as _;
 
 use super::{Following, clock, machine, now_ms, route, usd};
 use crate::{
@@ -208,8 +207,8 @@ pub async fn keepalive(ctx: &Context, name: &str) -> Result<ExitCode, Error> {
 }
 
 /// Updates a machine's Runtime and TensorFS: to wheels when named (a local file is written to the
-/// machine with the run; an `https://…#sha256=<hex>` URL the machine fetches itself; a member not
-/// named keeps the machine's own), else to its Hub's target. A numbered run of kind update, which
+/// machine with the run; an `https://…#sha256=<hex>` URL the machine fetches itself; a TensorFS not
+/// named is the machine's own, or the one uv resolves for the Runtime), else to its Hub's target. A numbered run of kind update, which
 /// waits for the work the machine accepted and is followed like any run.
 pub async fn update(
     ctx: &Context,
@@ -225,12 +224,7 @@ pub async fn update(
     ] {
         let Some(path) = path else { continue };
         if let Some(at) = path.to_str().filter(|p| p.contains("://")) {
-            let (file, mut fetched) = fetched(at, distribution)?;
-            // A published wheel is named by its release, which every machine fetches from PyPI
-            // held to the index's digest: the one this URL names, checked here.
-            if let Some(release) = published(ctx, &fetched, &file, distribution).await? {
-                fetched = release.into();
-            }
+            let (file, fetched) = fetched(at, distribution)?;
             named.push(format!("{member} {file}"));
             payload.insert(member.into(), fetched);
             continue;
@@ -275,18 +269,65 @@ pub async fn update(
     }
     payload.insert("agent".into(), "bundled".into());
     let spec = v1::RunSpec {
-        kind: v1::RunKind::Update as i32,
-        payload: serde_json::to_vec(&payload).expect("JSON serializes"),
+        kind: v1::RunKind::Update,
+        payload: Some(
+            v1::Json::parse(serde_json::Value::Object(payload).to_string()).expect("JSON"),
+        ),
         inputs,
         ..Default::default()
     };
     let submit = SubmitRun {
         on: On::Machine(m.name.clone()),
-        hub: hub.origin,
+        hub: hub.origin.into(),
         kind: calcifer::Kind::Update,
         target: named.join(", "),
-        spec: spec.encode_to_vec(),
+        spec,
         inputs: staged,
+        out: None,
+        warnings: vec![],
+    };
+    let submitted = crate::run::submit(ctx, submit, None).await?;
+    let run = crate::run::follow(ctx, submitted.run, false).await?;
+    Ok(crate::run::exit_code(&run))
+}
+
+/// `cozy machine toolchain install`: CUDA's compiler, headers and ninja onto a machine, as an
+/// update run, so cards without a prebuilt kernel compile their own. Never run on its own: a run
+/// that would have used it says so and names this command.
+pub async fn toolchain(ctx: &Context, name: &str) -> Result<ExitCode, Error> {
+    let m = machine(ctx, name).await?;
+    if let Some(toolchain) = m.status.as_ref().and_then(|s| s.toolchain.as_ref())
+        && toolchain.state == "ready"
+    {
+        if ctx.json {
+            output::json(
+                &serde_json::json!({"machine": m.name, "changed": false, "toolchain": toolchain}),
+            );
+        } else {
+            output::say(
+                ctx,
+                &format!("{}'s toolchain is ready: {}", m.name, toolchain.nvcc),
+            );
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+    let hub = match m.hub.as_str() {
+        "" => ctx.hub()?,
+        origin => ctx.config.resolve(origin)?,
+    };
+    let payload = serde_json::json!({"toolchain": "install"});
+    let spec = v1::RunSpec {
+        kind: v1::RunKind::Update,
+        payload: Some(v1::Json::parse(payload.to_string()).expect("JSON")),
+        ..Default::default()
+    };
+    let submit = SubmitRun {
+        on: On::Machine(m.name.clone()),
+        hub: hub.origin.into(),
+        kind: calcifer::Kind::Update,
+        target: "toolchain (CUDA 13.0 compiler, ninja)".into(),
+        spec,
+        inputs: vec![],
         out: None,
         warnings: vec![],
     };
@@ -321,73 +362,6 @@ fn fetched(at: &str, distribution: &str) -> Result<(String, serde_json::Value), 
     }
     let member = serde_json::json!({"url": url, "sha256": sha256.to_ascii_lowercase()});
     Ok((file.to_owned(), member))
-}
-
-/// The release a PyPI wheel URL names, once PyPI says that release holds `file` at the URL's
-/// sha256; `None` for a URL elsewhere. Machines of every version take a release, and fetch their
-/// own platform's wheel of it from PyPI, held to the index's digest.
-async fn published(
-    ctx: &Context,
-    member: &serde_json::Value,
-    file: &str,
-    distribution: &str,
-) -> Result<Option<String>, Error> {
-    let (Some(url), Some(sha256)) = (member["url"].as_str(), member["sha256"].as_str()) else {
-        return Ok(None);
-    };
-    if !url.starts_with("https://files.pythonhosted.org/") {
-        return Ok(None);
-    }
-    let release = file.split('-').nth(1).unwrap_or_default();
-    let project = distribution.replace('_', "-");
-    let index = format!("https://pypi.org/pypi/{project}/{release}/json");
-    let unavailable = |e: String| {
-        Error::new(
-            Kind::Unavailable,
-            "pypi_unavailable",
-            format!("{index}: {e}"),
-        )
-    };
-    #[derive(serde::Deserialize)]
-    struct File {
-        filename: String,
-        digests: Digests,
-    }
-    #[derive(serde::Deserialize)]
-    struct Digests {
-        sha256: String,
-    }
-    #[derive(serde::Deserialize)]
-    struct Release {
-        urls: Vec<File>,
-    }
-    let answer = ctx
-        .http()
-        .get(&index)
-        .send()
-        .await
-        .and_then(reqwest::Response::error_for_status)
-        .map_err(|e| unavailable(e.to_string()))?;
-    let listed: Release = answer
-        .json()
-        .await
-        .map_err(|e| unavailable(e.to_string()))?;
-    match listed.urls.iter().find(|f| f.filename == file) {
-        Some(f) if f.digests.sha256.eq_ignore_ascii_case(sha256) => Ok(Some(release.to_owned())),
-        Some(f) => Err(Error::new(
-            Kind::Validation,
-            "wheel_digest_mismatch",
-            format!(
-                "PyPI lists {file} as sha256:{}, not sha256:{sha256}",
-                f.digests.sha256
-            ),
-        )),
-        None => Err(Error::new(
-            Kind::NotFound,
-            "wheel_unpublished",
-            format!("{project} {release} on PyPI holds no {file}"),
-        )),
-    }
 }
 
 /// A local wheel of `distribution`, measured once: its file name and what the run stages.

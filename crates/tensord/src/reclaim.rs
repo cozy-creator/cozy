@@ -16,10 +16,10 @@ use std::{
     collections::{HashMap, HashSet},
     fs::{self, File},
     io,
-    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime},
 };
+use cozy_platform::durable::{self, FileId};
 use tensorfs_core::store::Store;
 
 pub use tensorfs_core::admission::Disk;
@@ -144,6 +144,18 @@ impl Entry {
         // Once renamed no resolve can find it; the lock is held until it is gone.
         let name = self.path.file_name().unwrap().to_string_lossy();
         let doomed = self.path.with_file_name(format!(".collect-{name}"));
+        // Windows renames no directory with a file open under it, its own hold included: the
+        // lock proved no holder, and a resolve that takes the hold in between is refused the
+        // same way, so a refused rename is a held generation.
+        #[cfg(windows)]
+        {
+            self.hold = None;
+            match fs::rename(&self.path, &doomed) {
+                Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return Ok(false),
+                renamed => renamed?,
+            }
+        }
+        #[cfg(not(windows))]
         fs::rename(&self.path, &doomed)?;
         fs::remove_dir_all(&doomed)?;
         Ok(true)
@@ -155,7 +167,7 @@ impl Entry {
 /// it is held (an executor of it still runs); reclaim removes it once nothing names it.
 pub fn remove_generation(generations: &Path, identity: &str) -> io::Result<Option<u64>> {
     let path = generations.join(identity);
-    let Ok(filesystem) = fs::metadata(&path).map(|m| m.dev()) else {
+    let Ok(filesystem) = FileId::at(&path).map(|id| id.dev) else {
         return Ok(Some(0));
     };
     let bytes = releasable(&path, filesystem, &open_files()).unwrap_or(0);
@@ -209,30 +221,34 @@ fn remove(path: &Path) -> bool {
     }
 }
 
-/// Files this process holds open, by (device, inode): unlinking one frees nothing yet.
-fn open_files() -> HashSet<(u64, u64)> {
+/// Files this process holds open: unlinking one frees nothing yet. Linux lists them; elsewhere
+/// none are known, and an open file unlinked there frees its bytes once it closes.
+fn open_files() -> HashSet<FileId> {
     let Ok(descriptors) = fs::read_dir("/proc/self/fd") else {
         return HashSet::new();
     };
     descriptors
         .flatten()
-        .filter_map(|fd| fs::metadata(fd.path()).ok())
-        .map(|m| (m.dev(), m.ino()))
+        .filter_map(|fd| FileId::at(&fd.path()).ok())
         .collect()
 }
 
 /// Bytes unlinking `path` frees on `filesystem`, or None when something under it is open
 /// here. Multiply linked files free nothing (uv environments share payload with a cache);
 /// symlinks are not followed and another mount is never counted.
-fn releasable(path: &Path, filesystem: u64, open: &HashSet<(u64, u64)>) -> Option<u64> {
+fn releasable(path: &Path, filesystem: u64, open: &HashSet<FileId>) -> Option<u64> {
     let metadata = fs::symlink_metadata(path).ok()?;
-    if metadata.dev() != filesystem || metadata.file_type().is_symlink() {
+    if metadata.file_type().is_symlink() {
         return Some(0);
     }
-    if open.contains(&(metadata.dev(), metadata.ino())) {
+    let id = FileId::at(path).ok()?;
+    if id.dev != filesystem {
+        return Some(0);
+    }
+    if open.contains(&id) {
         return None;
     }
-    let own = metadata.blocks() * 512;
+    let own = durable::allocated(&metadata);
     if metadata.is_dir() {
         fs::read_dir(path)
             .ok()?
@@ -240,7 +256,7 @@ fn releasable(path: &Path, filesystem: u64, open: &HashSet<(u64, u64)>) -> Optio
             .try_fold(own, |total, entry| {
                 Some(total + releasable(&entry.path(), filesystem, open)?)
             })
-    } else if metadata.nlink() == 1 {
+    } else if durable::links(path).ok()? == 1 {
         Some(own)
     } else {
         Some(0)
@@ -318,8 +334,9 @@ fn uv_entries(cache: &Path) -> (Vec<UvEntry>, Option<File>) {
     (entries, Some(lock))
 }
 
-/// The symlinks under `dir` into `archive-v0`, by the archive's name: uv's pointers to an
-/// unpacked wheel. Each has sidecars beside it (`<pointer>.rev`, `.http`, `.msgpack`).
+/// uv's pointers under `dir` to an unpacked wheel in `archive-v0`, by the archive's name: a
+/// symlink, or where uv makes none (Windows) a file whose whole text is `archive-v0/<id>`. Each
+/// has sidecars beside it (`<pointer>.rev`, `.http`, `.msgpack`).
 fn uv_pointers(dir: &Path, found: &mut HashMap<std::ffi::OsString, Vec<PathBuf>>) {
     for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
         let Ok(kind) = entry.file_type() else {
@@ -327,17 +344,23 @@ fn uv_pointers(dir: &Path, found: &mut HashMap<std::ffi::OsString, Vec<PathBuf>>
         };
         if kind.is_dir() {
             uv_pointers(&entry.path(), found);
-        } else if let Ok(target) = kind
-            .is_symlink()
-            .then(|| fs::read_link(entry.path()))
-            .transpose()
-        {
-            let archive = target
-                .as_deref()
-                .filter(|t| t.parent().and_then(Path::file_name) == Some("archive-v0".as_ref()));
-            if let Some(name) = archive.and_then(Path::file_name) {
-                found.entry(name.to_owned()).or_default().push(entry.path());
-            }
+            continue;
+        }
+        let target = if kind.is_symlink() {
+            fs::read_link(entry.path()).ok()
+        } else {
+            entry
+                .metadata()
+                .is_ok_and(|m| m.len() < 256)
+                .then(|| fs::read_to_string(entry.path()).ok())
+                .flatten()
+                .map(|text| PathBuf::from(text.trim()))
+        };
+        let archive = target
+            .as_deref()
+            .filter(|t| t.parent().and_then(Path::file_name) == Some("archive-v0".as_ref()));
+        if let Some(name) = archive.and_then(Path::file_name) {
+            found.entry(name.to_owned()).or_default().push(entry.path());
         }
     }
 }
@@ -360,14 +383,13 @@ fn remove_pointer(pointer: &Path) {
 /// has another link, or cannot be read.
 fn unlinked_since(path: &Path) -> Option<SystemTime> {
     let metadata = fs::symlink_metadata(path).ok()?;
-    let nanos = Duration::new(metadata.ctime().max(0) as u64, metadata.ctime_nsec() as u32);
-    let changed = UNIX_EPOCH + nanos;
+    let changed = durable::changed(path).ok()?;
     if metadata.is_dir() {
         let children = fs::read_dir(path).ok()?.flatten();
         children
             .map(|entry| unlinked_since(&entry.path()))
             .try_fold(changed, |newest, child| Some(newest.max(child?)))
-    } else if metadata.is_file() && metadata.nlink() > 1 {
+    } else if metadata.is_file() && durable::links(path).ok()? > 1 {
         None
     } else {
         Some(changed)
@@ -481,11 +503,11 @@ pub fn sweep(caches: &Caches) -> io::Result<Swept> {
         }
     }
 
-    let filesystem = fs::metadata(root)?.dev();
+    let filesystem = FileId::at(root)?.dev;
     let store = caches.store.as_ref();
     // A store on its own filesystem is relieved under TensorFS's rule for it.
     let shared = match store {
-        Some(store) if fs::metadata(store.store.root())?.dev() != filesystem => {
+        Some(store) if FileId::at(store.store.root())?.dev != filesystem => {
             let relief = tensorfs_core::admission::relieve(store.store, &store.keep);
             swept.store_bytes += relief.map_err(io::Error::other)?.collected_bytes;
             None

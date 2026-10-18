@@ -1,0 +1,2355 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "cozy machine API",
+    "description": "One machine's API on its pinned-TLS port (design/machine-http-api.md). Every request carries `authorization: Cozy-Cap <token>`; refusals are the error envelope; unknown fields are ignored.",
+    "license": {
+      "name": "MIT",
+      "identifier": "MIT"
+    },
+    "version": "1"
+  },
+  "paths": {
+    "/v1/health": {
+      "get": {
+        "tags": [],
+        "summary": "Answers 204 when nothing authorizes the request, 401 when something does: a probe that the\nlistener is up.",
+        "operationId": "health",
+        "responses": {
+          "204": {
+            "description": "Up"
+          },
+          "401": {
+            "description": "The request carried a credential"
+          }
+        },
+        "security": [
+          {}
+        ]
+      }
+    },
+    "/v1/keepalive": {
+      "post": {
+        "tags": [],
+        "summary": "Starts a rental's idle clock over and answers the frame with the new deadline.",
+        "operationId": "keepalive",
+        "responses": {
+          "200": {
+            "description": "The frame",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatusFrame"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "This machine has no idle deadline",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/logs/{name}": {
+      "get": {
+        "tags": [],
+        "summary": "A log the machine keeps (`tensorfs-transport`, `memory`, `tensord`): its whole lines. With\n`Accept: text/event-stream`, those and then each batch as it is appended, across rotations.",
+        "operationId": "log",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "The log's name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "lines",
+            "in": "query",
+            "description": "Its newest N whole lines; absent or 0: all",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "Last-Event-ID",
+            "in": "header",
+            "description": "Follow on from this event's place",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The lines, or SSE `event: lines` with the place after them as id",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "text/event-stream": {
+                "schema": {
+                  "$ref": "#/components/schemas/LogLines"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such log",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`log_follow_unsupported`: this machine's OS cannot follow",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/objects/held": {
+      "post": {
+        "tags": [],
+        "summary": "What the machine holds of many objects in one request, in the order asked: each stored object\nwhole (renewed, as a `HEAD` renews it), else the ranges its upload has landed.",
+        "operationId": "held_objects",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HeldRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Each object's held ranges",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HeldAnswer"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A digest that is not `sha256:<hex>`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/objects/{digest}": {
+      "get": {
+        "tags": [],
+        "summary": "What this signer's upload of the object holds as its parts land, as SSE `held` events after\neach MiB more, ending once it holds all `length` bytes. A stored object answers at once.",
+        "operationId": "follow_object",
+        "parameters": [
+          {
+            "name": "digest",
+            "in": "path",
+            "description": "`sha256:<hex>`",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "length",
+            "in": "query",
+            "description": "The object's length",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "SSE `event: held`",
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "$ref": "#/components/schemas/HeldBytes"
+                }
+              }
+            }
+          },
+          "507": {
+            "description": "`machine_disk_full`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [],
+        "summary": "Lands one part of the object: the body is `Content-Range`'s bytes (without it, the whole\nobject). Parts may go side by side, in any order. Once the held ranges cover the object, the\nmachine verifies its sha256 and stores it for the signer; bytes that differ are dropped\n(`object_digest_mismatch`).",
+        "operationId": "put_object",
+        "parameters": [
+          {
+            "name": "digest",
+            "in": "path",
+            "description": "`sha256:<hex>`",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Content-Range",
+            "in": "header",
+            "description": "`bytes first-last/length`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "type": "array",
+                "items": {
+                  "type": "integer",
+                  "format": "int32",
+                  "minimum": 0
+                }
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Landed",
+            "headers": {
+              "Cozy-Held": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "What is held now"
+              }
+            }
+          },
+          "400": {
+            "description": "`object_digest_mismatch`, `object_length_exceeded`, an invalid range",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            }
+          },
+          "507": {
+            "description": "`machine_disk_full`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            }
+          }
+        }
+      },
+      "head": {
+        "tags": [],
+        "summary": "The byte ranges of the object the machine holds for this signer, in `Cozy-Held`. A stored\nobject is held whole, and asking renews it, so a run sent next finds it.",
+        "operationId": "head_object",
+        "parameters": [
+          {
+            "name": "digest",
+            "in": "path",
+            "description": "`sha256:<hex>`",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "What is held",
+            "headers": {
+              "Cozy-Held": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "`first-last,…` inclusive; empty: nothing"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/runs": {
+      "post": {
+        "tags": [],
+        "summary": "Submits a run, idempotent on its id per signer: the same id with the same spec answers its\nstate; with another spec, `run_id_conflict`. An update's activation and a rental's idle\nrelease wait for it.",
+        "operationId": "submit",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RunRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Already accepted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunState"
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "Accepted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunState"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "An invalid spec",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`run_id_conflict`, or a refusal of the run",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`machine_updating` or `machine_released`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/runs/{id}/cancel": {
+      "post": {
+        "tags": [],
+        "summary": "Cancels the run. An id the machine never received is recorded canceled, so a late submit of\nit answers that.",
+        "operationId": "cancel",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The run id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Its state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunState"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/runs/{id}/events": {
+      "get": {
+        "tags": [],
+        "summary": "The run's log after `Last-Event-ID` as SSE: first `state` (the snapshot), then `progress`,\n`product`, `log`, `call`, `gpu` and finally `outcome`, after which the stream ends. Durable\nevents carry `id: <sequence>`; live ones none. Closing it never cancels the run.",
+        "operationId": "events",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The run id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Last-Event-ID",
+            "in": "header",
+            "description": "Resume after this sequence",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "after",
+            "in": "query",
+            "description": "As `Last-Event-ID`",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "SSE: `event: <variant>`, data the whole event",
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunEvent"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such run",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/runs/{id}/outputs/{output}": {
+      "get": {
+        "tags": [],
+        "summary": "An output's current bytes, readable while it grows (each revision is a `product` event).",
+        "operationId": "output",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The run id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "output",
+            "in": "path",
+            "description": "The output's name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "index",
+            "in": "query",
+            "description": "A list item's 1-based index; absent for a single output",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "member",
+            "in": "query",
+            "description": "One file of a tree output, by its manifest path",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Range",
+            "in": "header",
+            "description": "One range, `bytes=first-[last]`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "If-Match",
+            "in": "header",
+            "description": "`\"<rev>\"`: refuse once the output moved past it",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "All of it",
+            "headers": {
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "`\"<rev>\"`"
+              }
+            },
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "integer",
+                    "format": "int32",
+                    "minimum": 0
+                  }
+                }
+              }
+            }
+          },
+          "206": {
+            "description": "The range",
+            "headers": {
+              "Content-Range": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "`bytes first-last/length`"
+              },
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "`\"<rev>\"`"
+              }
+            },
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "integer",
+                    "format": "int32",
+                    "minimum": 0
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such run or output",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "`output_revision_moved`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            }
+          },
+          "416": {
+            "description": "`range_unsatisfiable`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/runs/{id}/triage": {
+      "get": {
+        "tags": [],
+        "summary": "A failed attempt's retained triage bundle.",
+        "operationId": "triage",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The run id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The bundle",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "None retained",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/status": {
+      "get": {
+        "tags": [],
+        "summary": "The machine's picture. Without a machine-scope cap: identity, version, capabilities and the\nsealed readiness receipt only (what a Hub reads). With one: all of it, and with `Accept:\ntext/event-stream` an SSE stream of `status` events, each the whole frame, sent again when it\nchanges.",
+        "operationId": "status",
+        "responses": {
+          "200": {
+            "description": "The frame, or SSE `event: status` frames",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatusFrame"
+                }
+              },
+              "text/event-stream": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatusFrame"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "A credential this machine does not admit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {},
+          {
+            "cozy_cap": []
+          }
+        ]
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "Adapter": {
+        "type": "object",
+        "properties": {
+          "component": {
+            "type": "string",
+            "default": ""
+          },
+          "lane": {
+            "type": "string",
+            "default": ""
+          },
+          "manifest": {
+            "type": "string",
+            "description": "`sha256:<hex>`, the owner's checkpoint by hash; else `model` at `release`, `lane`.",
+            "default": ""
+          },
+          "model": {
+            "type": "string",
+            "default": ""
+          },
+          "profiles": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": []
+          },
+          "release": {
+            "type": "string",
+            "default": ""
+          },
+          "scale": {
+            "type": "string",
+            "description": "Canonical decimal; empty means 1.",
+            "default": ""
+          },
+          "source": {
+            "type": "string",
+            "description": "A provider source (`civitai://<version>`, `hf://…`) made here and normalized at ingest,\nunder these reviewed `profiles` (none: the one its headers select); never with `model`.",
+            "default": ""
+          }
+        }
+      },
+      "Adjustment": {
+        "type": "object",
+        "description": "One request field served other than as sent.",
+        "properties": {
+          "applied": {
+            "type": "string",
+            "default": ""
+          },
+          "field": {
+            "type": "string",
+            "description": "Its path in the request: `steps`, `assets.2.asset`.",
+            "default": ""
+          },
+          "kind": {
+            "type": "string",
+            "description": "`adjusted`, `clamp` or `warn`.",
+            "default": ""
+          },
+          "reason": {
+            "type": "string",
+            "default": ""
+          },
+          "requested": {
+            "type": "string",
+            "default": ""
+          },
+          "source": {
+            "type": "string",
+            "description": "`handler`, or what the Runtime applied: `policy`, `checkpoint:…`, `adapter:…`.",
+            "default": ""
+          }
+        }
+      },
+      "Call": {
+        "type": "object",
+        "description": "One settled call the run made: a child run, or an effect such as its weights publication.",
+        "properties": {
+          "called_at_ms": {
+            "type": "integer",
+            "format": "int64",
+            "default": 0
+          },
+          "computation_digest": {
+            "type": "string",
+            "description": "A memoized call's computation (`sha256:<hex>`), ran or answered.",
+            "default": ""
+          },
+          "finished_at_ms": {
+            "type": "integer",
+            "format": "int64",
+            "default": 0
+          },
+          "function": {
+            "type": "string",
+            "default": ""
+          },
+          "index": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Its index among the run's calls.",
+            "default": 0,
+            "minimum": 0
+          },
+          "label": {
+            "type": "string",
+            "description": "The author's label for it.",
+            "default": ""
+          },
+          "measurements": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Json",
+                "description": "Its executor's, as [`Outcome::measurements`]."
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "memoized": {
+            "type": "boolean",
+            "description": "Answered from a result this machine held; nothing ran.",
+            "default": false
+          },
+          "reason": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Reason",
+                "description": "Why it did not succeed."
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "run": {
+            "type": "string",
+            "description": "The child run's id.",
+            "default": ""
+          },
+          "status": {
+            "type": "string",
+            "description": "succeeded, failed, canceled",
+            "default": ""
+          },
+          "unmemoized": {
+            "type": "string",
+            "description": "Why a memoizable call was neither looked up nor held (\"seed not given\").",
+            "default": ""
+          }
+        }
+      },
+      "Checkpoint": {
+        "type": "object",
+        "properties": {
+          "lane": {
+            "type": "string",
+            "default": ""
+          },
+          "manifest": {
+            "type": "string",
+            "description": "`sha256:<hex>`",
+            "default": ""
+          },
+          "release": {
+            "type": "string",
+            "description": "Empty for a local alias.",
+            "default": ""
+          },
+          "yanked": {
+            "type": "boolean",
+            "default": false
+          }
+        }
+      },
+      "Disk": {
+        "type": "object",
+        "properties": {
+          "free_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "default": 0,
+            "minimum": 0
+          },
+          "total_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "default": 0,
+            "minimum": 0
+          }
+        }
+      },
+      "Envelope": {
+        "type": "object",
+        "description": "The HTTP body of a refusal.",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "$ref": "#/components/schemas/Error"
+          }
+        }
+      },
+      "Environment": {
+        "type": "object",
+        "properties": {
+          "entrypoints": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": []
+          },
+          "hub": {
+            "type": "string",
+            "description": "The Hub origin a published installation came from; empty for local code.",
+            "default": ""
+          },
+          "installation": {
+            "type": "string",
+            "description": "[`Source::Installation`] names it.",
+            "default": ""
+          },
+          "level": {
+            "type": "string",
+            "description": "What it holds now (as [`WarmItem::holds`]), in a warm set or not.",
+            "default": ""
+          },
+          "package": {
+            "type": "string",
+            "default": ""
+          },
+          "release": {
+            "type": "string",
+            "default": ""
+          },
+          "runtime": {
+            "type": "string",
+            "description": "The cozy-runtime installed in it.",
+            "default": ""
+          },
+          "warning": {
+            "type": "string",
+            "description": "Why it does not run the machine's own Runtime; empty when it does.",
+            "default": ""
+          }
+        }
+      },
+      "Error": {
+        "type": "object",
+        "required": [
+          "kind",
+          "code",
+          "message"
+        ],
+        "properties": {
+          "cause": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The originating component's own stable code (a machine's or the Hub's), when not ours."
+          },
+          "code": {
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/Kind"
+          },
+          "message": {
+            "type": "string"
+          },
+          "next": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Commands to try next; at most two."
+          },
+          "remedy": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "Event": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "state"
+            ],
+            "properties": {
+              "state": {
+                "$ref": "#/components/schemas/RunState"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "progress"
+            ],
+            "properties": {
+              "progress": {
+                "$ref": "#/components/schemas/Progress"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "product"
+            ],
+            "properties": {
+              "product": {
+                "$ref": "#/components/schemas/Product"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "log"
+            ],
+            "properties": {
+              "log": {
+                "$ref": "#/components/schemas/LogLine"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "outcome"
+            ],
+            "properties": {
+              "outcome": {
+                "$ref": "#/components/schemas/Outcome"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "call"
+            ],
+            "properties": {
+              "call": {
+                "$ref": "#/components/schemas/Call"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "gpu"
+            ],
+            "properties": {
+              "gpu": {
+                "$ref": "#/components/schemas/GpuAllocation"
+              }
+            }
+          }
+        ]
+      },
+      "Gpu": {
+        "type": "object",
+        "properties": {
+          "driver": {
+            "type": "string",
+            "default": ""
+          },
+          "family": {
+            "type": "string",
+            "description": "The tensor-core row by compute capability (\"sm90\"); empty: unread.",
+            "default": ""
+          },
+          "index": {
+            "type": "integer",
+            "format": "int32",
+            "default": 0,
+            "minimum": 0
+          },
+          "memory_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "default": 0,
+            "minimum": 0
+          },
+          "memory_class": {
+            "type": "string",
+            "description": "discrete, coherent (GH200, GB200), unified (GB10); empty: unread.",
+            "default": ""
+          },
+          "name": {
+            "type": "string",
+            "default": ""
+          },
+          "pci_bus_id": {
+            "type": "string",
+            "default": ""
+          },
+          "uuid": {
+            "type": "string",
+            "default": ""
+          }
+        }
+      },
+      "GpuAllocation": {
+        "type": "object",
+        "description": "A root run's GPU allocation changed: `grant` binds its lane, `wait` queues it behind `behind`\n(a run id), `release` ends its lane (`Context.release_gpus()` or its exit).",
+        "properties": {
+          "behind": {
+            "type": "string",
+            "default": ""
+          },
+          "gpus": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            },
+            "description": "The lane, as machine GPU indices.",
+            "default": []
+          },
+          "state": {
+            "type": "string",
+            "default": ""
+          },
+          "width": {
+            "type": "integer",
+            "format": "int32",
+            "default": 0,
+            "minimum": 0
+          }
+        }
+      },
+      "HeldAnswer": {
+        "type": "object",
+        "description": "What the machine holds of each object asked, in the order asked; a stored object is held\nwhole, and asking renews it, as a `HEAD` does.",
+        "properties": {
+          "held": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/HeldObject"
+            },
+            "default": []
+          }
+        }
+      },
+      "HeldBytes": {
+        "type": "object",
+        "description": "What an upload holds, as `GET /v1/objects/sha256:<hex>?length=N` streams it (`event: held`).",
+        "properties": {
+          "held": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Bytes landed, synced or not; the last event says all N.",
+            "default": 0,
+            "minimum": 0
+          }
+        }
+      },
+      "HeldObject": {
+        "type": "object",
+        "properties": {
+          "digest": {
+            "type": "string",
+            "default": ""
+          },
+          "ranges": {
+            "type": "array",
+            "items": {
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              }
+            },
+            "description": "Byte ranges `[start, end)`; none: nothing held.",
+            "default": []
+          }
+        }
+      },
+      "HeldRequest": {
+        "type": "object",
+        "description": "`POST /v1/objects/held`: which of these objects (`sha256:<hex>`) the machine holds for this\nsigner.",
+        "properties": {
+          "digests": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": []
+          }
+        }
+      },
+      "Hub": {
+        "type": "object",
+        "properties": {
+          "machine_id": {
+            "type": "string",
+            "description": "This machine's worker id there.",
+            "default": ""
+          },
+          "origin": {
+            "type": "string",
+            "default": ""
+          }
+        }
+      },
+      "HubAccess": {
+        "type": "object",
+        "description": "A Hub a run reads. Public content is read anonymously.",
+        "properties": {
+          "ca_der": {
+            "type": "string",
+            "format": "byte",
+            "description": "An origin's private CA (DER, base64), when it has one.",
+            "default": []
+          },
+          "capability": {
+            "type": "string",
+            "description": "The owner's capability for this run's private operations (th-241): a compact JWS its\ndevice key signed for this machine's leaf (`cnf.jkt`) and the Hub's resource (`aud`),\nnaming each operation in `authorization_details`. The machine trades it once, at the run's\nfirst private operation, at `token_endpoint`. Empty: a public-only run.",
+            "default": ""
+          },
+          "object_hosts": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The Hub's object-storage hosts downloads may follow.",
+            "default": []
+          },
+          "origin": {
+            "type": "string",
+            "default": ""
+          },
+          "token_endpoint": {
+            "type": "string",
+            "description": "The Hub's authorization server's, as its metadata names it.",
+            "default": ""
+          }
+        }
+      },
+      "InputFile": {
+        "type": "object",
+        "properties": {
+          "digest": {
+            "type": "string",
+            "description": "`sha256:<hex>`",
+            "default": ""
+          },
+          "field": {
+            "type": "string",
+            "description": "The payload field path, list index included.",
+            "default": ""
+          },
+          "length": {
+            "type": "integer",
+            "format": "int64",
+            "default": 0,
+            "minimum": 0
+          },
+          "media_type": {
+            "type": "string",
+            "default": ""
+          },
+          "order": {
+            "type": "integer",
+            "format": "int32",
+            "default": 0,
+            "minimum": 0
+          }
+        }
+      },
+      "Json": {
+        "type": "object"
+      },
+      "KernelVerdict": {
+        "type": "object",
+        "description": "One kernel's verification on this machine (the Runtime's `verify_op`), keyed by its\nartifact, the card's architecture and the driver.",
+        "properties": {
+          "artifact": {
+            "type": "string",
+            "default": ""
+          },
+          "detail": {
+            "type": "string",
+            "description": "What was measured, or why it failed.",
+            "default": ""
+          },
+          "driver": {
+            "type": "string",
+            "default": ""
+          },
+          "kernel": {
+            "type": "string",
+            "default": ""
+          },
+          "ok": {
+            "type": "boolean",
+            "default": false
+          },
+          "sm": {
+            "type": "integer",
+            "format": "int32",
+            "default": 0,
+            "minimum": 0
+          }
+        }
+      },
+      "Kind": {
+        "type": "string",
+        "enum": [
+          "usage",
+          "validation",
+          "not_found",
+          "credential",
+          "forbidden",
+          "conflict",
+          "capacity",
+          "unavailable",
+          "internal"
+        ]
+      },
+      "LocalSource": {
+        "type": "object",
+        "description": "Local code: `manifest` names a JSON object written with `PUT /v1/objects`:\n`{package: \"local/<dist>\", release, python_requires, python_version, callees: {distribution:\npackage}}` and its code. A live project is installed editable from `files: [{name, digest,\nlength, executable}]`: the project and the path dependencies its lock names, each file under\ntheir common directory, with `project` the project's directory there. The machine keeps one\nsuch tree and one environment per signer and package. `path` names that common directory on\nthis computer's machine, which reads it in place. `wheels: [{name, digest, length}]` are locked\ndependencies the caller carries because the machine cannot fetch them. Members are objects the\nsame signer wrote.",
+        "properties": {
+          "manifest": {
+            "type": "string",
+            "description": "`sha256:<hex>` of the manifest object.",
+            "default": ""
+          }
+        }
+      },
+      "LogLine": {
+        "type": "object",
+        "properties": {
+          "level": {
+            "type": "string",
+            "default": ""
+          },
+          "text": {
+            "type": "string",
+            "default": ""
+          }
+        }
+      },
+      "LogLines": {
+        "type": "object",
+        "description": "Whole lines of a machine log, as `GET /v1/logs/{name}` streams them (`event: lines`).",
+        "properties": {
+          "after": {
+            "type": "string",
+            "description": "The place after them, also the event's id: a follow resumed there goes on with the next line.",
+            "default": ""
+          },
+          "text": {
+            "type": "string",
+            "default": ""
+          }
+        }
+      },
+      "Model": {
+        "type": "object",
+        "properties": {
+          "checkpoints": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Checkpoint"
+            },
+            "default": []
+          },
+          "repository": {
+            "type": "string",
+            "description": "org/name; org \"local\" is a local alias.",
+            "default": ""
+          },
+          "total_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Everything this repository reaches.",
+            "default": 0,
+            "minimum": 0
+          },
+          "unique_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Reached by no other held repository.",
+            "default": 0,
+            "minimum": 0
+          }
+        }
+      },
+      "ModelChoice": {
+        "type": "object",
+        "description": "One model slot's choice, by name (th-245: the machine resolves it at the Hub). A Hub model is\n`repository` at `release` (empty: the newest) in `lane`, else in the lane the machine's rules\npick (xs-042). `manifest` names a checkpoint by hash only: the owner's private one at the Hub\n(with `repository`; the run's capability names it) or one this machine holds (without). A slot\nwith no choice takes its declared default release, a callee's included (`<package>/<path>`).",
+        "properties": {
+          "adapters": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Adapter"
+            },
+            "description": "Each by name, a hash of the owner's, or a provider source.",
+            "default": []
+          },
+          "lane": {
+            "type": "string",
+            "default": ""
+          },
+          "manifest": {
+            "type": "string",
+            "description": "`sha256:<hex>`",
+            "default": ""
+          },
+          "manifest_length": {
+            "type": "integer",
+            "format": "int64",
+            "default": 0,
+            "minimum": 0
+          },
+          "parameter": {
+            "type": "string",
+            "description": "A root slot parameter or full slot path.",
+            "default": ""
+          },
+          "profiles": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": []
+          },
+          "release": {
+            "type": "string",
+            "default": ""
+          },
+          "repository": {
+            "type": "string",
+            "default": ""
+          },
+          "source": {
+            "type": "string",
+            "description": "A provider source (`hf://<org>/<repo>@<rev>[/member]`, `civitai://<version>[/file]`) the\nmachine makes the slot's model from, under these reviewed `profiles` (none: the one its\nheaders select); never with repository or manifest.",
+            "default": ""
+          }
+        }
+      },
+      "Outcome": {
+        "type": "object",
+        "properties": {
+          "adjustments": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Adjustment"
+            },
+            "description": "How its executor served the request other than as sent, in the executor's order. Advisory.",
+            "default": []
+          },
+          "computation_digest": {
+            "type": "string",
+            "description": "A memoizable callable's computation (`sha256:<hex>`), whether it ran or was answered.",
+            "default": ""
+          },
+          "execution_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Its own time running its callable, every attempt summed; 0: unknown.",
+            "default": 0,
+            "minimum": 0
+          },
+          "measurements": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Json",
+                "description": "What its executor measured, canonical JSON: `attribution` (stage and step tracks),\n`execution` (degree, ranks with the GPU and attention each served, executor boot,\nconstruction load and warm) and `observations` (attention rows). None for a run that ran\non no device."
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "memoized": {
+            "type": "boolean",
+            "description": "Answered from a result this machine held: nothing ran.",
+            "default": false
+          },
+          "outputs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Product"
+            },
+            "default": []
+          },
+          "reason": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Reason"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "result": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Json",
+                "description": "The result, canonical JSON, assets as digests."
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "status": {
+            "type": "string",
+            "description": "succeeded, failed, canceled",
+            "default": ""
+          },
+          "triage": {
+            "type": "boolean",
+            "description": "`GET /v1/runs/{id}/triage` answers its bundle.",
+            "default": false
+          },
+          "unmemoized": {
+            "type": "string",
+            "description": "Why it was neither looked up nor held (its author's condition unmet, e.g. \"seed not given\").",
+            "default": ""
+          }
+        }
+      },
+      "Product": {
+        "type": "object",
+        "description": "One revision of an output: a single output is replaced by each, a list output grows. Its bytes\nare `GET /v1/runs/{id}/outputs/{output}`.",
+        "properties": {
+          "appended_from": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "These bytes extend the previous revision's, from here.",
+            "default": null,
+            "minimum": 0
+          },
+          "digest": {
+            "type": "string",
+            "description": "`sha256:<hex>` of these bytes.",
+            "default": ""
+          },
+          "duration_us": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Media time, for a growing video.",
+            "default": 0,
+            "minimum": 0
+          },
+          "index": {
+            "type": "integer",
+            "format": "int32",
+            "description": "A list item's 1-based index; 0 for a single output.",
+            "default": 0,
+            "minimum": 0
+          },
+          "label": {
+            "type": "string",
+            "default": ""
+          },
+          "length": {
+            "type": "integer",
+            "format": "int64",
+            "default": 0,
+            "minimum": 0
+          },
+          "media_type": {
+            "type": "string",
+            "default": ""
+          },
+          "output": {
+            "type": "string",
+            "default": ""
+          },
+          "rev": {
+            "type": "integer",
+            "format": "int64",
+            "default": 0,
+            "minimum": 0
+          }
+        }
+      },
+      "Progress": {
+        "type": "object",
+        "properties": {
+          "bytes_done": {
+            "type": "integer",
+            "format": "int64",
+            "default": 0,
+            "minimum": 0
+          },
+          "bytes_total": {
+            "type": "integer",
+            "format": "int64",
+            "default": 0,
+            "minimum": 0
+          },
+          "completed": {
+            "type": "integer",
+            "format": "int64",
+            "default": 0,
+            "minimum": 0
+          },
+          "fraction": {
+            "type": "number",
+            "format": "double",
+            "description": "-1: unknown.",
+            "default": 0.0
+          },
+          "stage": {
+            "type": "string",
+            "default": ""
+          },
+          "stage_fraction": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "How far this stage is, when it says.",
+            "default": null
+          },
+          "step_ms": {
+            "type": "number",
+            "format": "double",
+            "description": "The latest step's time, while a stage steps.",
+            "default": 0.0
+          },
+          "total": {
+            "type": "integer",
+            "format": "int64",
+            "default": 0,
+            "minimum": 0
+          }
+        }
+      },
+      "ProviderAccess": {
+        "type": "object",
+        "description": "The caller's provider tokens, for models a run makes from a provider source.",
+        "properties": {
+          "civitai": {
+            "type": "string",
+            "default": ""
+          },
+          "huggingface": {
+            "type": "string",
+            "default": ""
+          }
+        }
+      },
+      "Reason": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "default": ""
+          },
+          "detail": {
+            "type": "string",
+            "description": "A failed call's traceback, else its executor's stderr: the last lines, secrets masked.\nIt explains the failure after its machine is gone.",
+            "default": ""
+          },
+          "message": {
+            "type": "string",
+            "default": ""
+          },
+          "origin": {
+            "type": "string",
+            "description": "request, runtime, author, machine",
+            "default": ""
+          }
+        }
+      },
+      "Release": {
+        "type": "object",
+        "description": "A published release by name (th-245): a machine that holds no installation of it reads its\ncard and locked requirements at the Hub by name.",
+        "properties": {
+          "package": {
+            "type": "string",
+            "description": "org/name",
+            "default": ""
+          },
+          "release": {
+            "type": "string",
+            "description": "Empty: the Hub's newest.",
+            "default": ""
+          }
+        }
+      },
+      "RunEvent": {
+        "type": "object",
+        "description": "One entry of a run's log, as `GET /v1/runs/{id}/events` sends it: SSE `event: <variant>`,\n`id: <sequence>` for durable entries.",
+        "required": [
+          "event"
+        ],
+        "properties": {
+          "at_ms": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "event": {
+            "$ref": "#/components/schemas/Event"
+          },
+          "sequence": {
+            "type": "integer",
+            "format": "int64",
+            "description": "0: a frame that is not in the log (the snapshot, progress before acceptance, live state).",
+            "minimum": 0
+          }
+        }
+      },
+      "RunKind": {
+        "type": "string",
+        "enum": [
+          "call",
+          "warm",
+          "update",
+          "remove"
+        ]
+      },
+      "RunRequest": {
+        "type": "object",
+        "description": "`POST /v1/runs`: submits when `id` is new (idempotent on id per signer); the same id with\nanother spec is `run_id_conflict`.",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "The caller's run id, 1-256 bytes.",
+            "default": ""
+          },
+          "spec": {
+            "$ref": "#/components/schemas/RunSpec",
+            "default": {
+              "attention_kernel": "",
+              "bits": 0,
+              "catalog_revision": "",
+              "entrypoint": "",
+              "gpus": 0,
+              "inputs": [],
+              "kind": "call",
+              "models": [],
+              "owner": "",
+              "weights_destination": ""
+            }
+          }
+        }
+      },
+      "RunSpec": {
+        "type": "object",
+        "properties": {
+          "attention_kernel": {
+            "type": "string",
+            "default": ""
+          },
+          "bits": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The run's weight precision: 16, 8 or 4. 0: the machine's rules choose each slot's lane.\nChildren inherit it.",
+            "default": 0,
+            "minimum": 0
+          },
+          "catalog_revision": {
+            "type": "string",
+            "description": "The catalog revision the caller made its choices under (th-245): a held resolution is\nreused only under the same one, so a publish, yank, bind or retarget the caller knows of\nresolves once more at the Hub.",
+            "default": ""
+          },
+          "entrypoint": {
+            "type": "string",
+            "default": ""
+          },
+          "gpus": {
+            "type": "integer",
+            "format": "int32",
+            "description": "0: widest group every model slot supports on this machine. Positive: at most this many\nGPUs, for the run and its children.",
+            "default": 0,
+            "minimum": 0
+          },
+          "hub": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/HubAccess",
+                "description": "Where the run reads, and its capability there."
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "inputs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/InputFile"
+            },
+            "description": "Objects uploaded with `PUT /v1/objects`, bound to payload fields.",
+            "default": []
+          },
+          "kind": {
+            "$ref": "#/components/schemas/RunKind",
+            "default": "call"
+          },
+          "models": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ModelChoice"
+            },
+            "default": []
+          },
+          "owner": {
+            "type": "string",
+            "description": "The account that org-relative references of local code name.",
+            "default": ""
+          },
+          "payload": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Json",
+                "description": "The function's parameters, a JSON object."
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "providers": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ProviderAccess",
+                "description": "Provider tokens for source models, memory only like `hub`."
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "set": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/WarmSet",
+                "description": "`warm/2`: the caller's whole warm set, replacing its previous one; no items clears it.\nThe run installs and downloads every member, and its result lists each one's `level` and\n`held_back`. Absent: the set is left as it is."
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "source": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Source"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "weights_destination": {
+            "type": "string",
+            "description": "org/name: the requester's repository for the call's weights outputs, or a warm run's\nsource model.",
+            "default": ""
+          }
+        }
+      },
+      "RunState": {
+        "type": "object",
+        "properties": {
+          "attempt": {
+            "type": "integer",
+            "format": "int32",
+            "default": 0,
+            "minimum": 0
+          },
+          "id": {
+            "type": "string",
+            "default": ""
+          },
+          "number": {
+            "type": "integer",
+            "format": "int64",
+            "description": "This machine's run number.",
+            "default": 0,
+            "minimum": 0
+          },
+          "sequence": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The log's head.",
+            "default": 0,
+            "minimum": 0
+          },
+          "state": {
+            "type": "string",
+            "description": "queued, preparing, running, succeeded, failed, canceled",
+            "default": ""
+          },
+          "waiting": {
+            "type": "string",
+            "description": "Why a queued run waits, for people.",
+            "default": ""
+          }
+        }
+      },
+      "Source": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "release"
+            ],
+            "properties": {
+              "release": {
+                "$ref": "#/components/schemas/Release"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "An installation this machine already holds for the signer.",
+            "required": [
+              "installation"
+            ],
+            "properties": {
+              "installation": {
+                "type": "string",
+                "description": "An installation this machine already holds for the signer."
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "local"
+            ],
+            "properties": {
+              "local": {
+                "$ref": "#/components/schemas/LocalSource"
+              }
+            }
+          }
+        ],
+        "description": "What a run runs."
+      },
+      "StatusFrame": {
+        "type": "object",
+        "description": "The machine's picture. Without a machine-scope cap, `GET /v1/status` answers identity,\nversion, capabilities and the sealed readiness `receipt` only. With one it answers all of it,\nand as SSE (`Accept: text/event-stream`) sends the whole frame again whenever it changes. An\nopen stream is not activity.",
+        "properties": {
+          "boot_id": {
+            "type": "string",
+            "default": ""
+          },
+          "capabilities": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": []
+          },
+          "disk": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Disk",
+                "description": "The filesystem holding the machine's store."
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "driver_floor": {
+            "type": "string",
+            "description": "The oldest NVIDIA driver this machine's kernels run on; empty: no GPU stack.",
+            "default": ""
+          },
+          "environments": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Environment"
+            },
+            "description": "The caller's held package installations.",
+            "default": []
+          },
+          "gpus": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Gpu"
+            },
+            "description": "Measured at boot.",
+            "default": []
+          },
+          "hubs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Hub"
+            },
+            "default": []
+          },
+          "idle_deadline_unix_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "An idle rental's release, 15 min after its last job; 0: none (a job is queued or running,\nor it never releases).",
+            "default": 0
+          },
+          "kernels": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/KernelVerdict"
+            },
+            "description": "Each native kernel's verdict on this machine's cards, as the Runtime keeps it.",
+            "default": []
+          },
+          "models": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Model"
+            },
+            "description": "The models the machine's store holds.",
+            "default": []
+          },
+          "models_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Their bytes together, shared content counted once.",
+            "default": 0,
+            "minimum": 0
+          },
+          "phase": {
+            "type": "string",
+            "description": "booting, ready, releasing",
+            "default": ""
+          },
+          "platform": {
+            "type": "string",
+            "description": "os/arch",
+            "default": ""
+          },
+          "receipt": {
+            "type": "string",
+            "format": "byte",
+            "description": "The sealed readiness envelope (base64); empty until sealed.",
+            "default": []
+          },
+          "runs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RunState"
+            },
+            "description": "The caller's live runs.",
+            "default": []
+          },
+          "runtime": {
+            "type": "string",
+            "description": "The executors' cozy-runtime.",
+            "default": ""
+          },
+          "started_at_unix_ms": {
+            "type": "integer",
+            "format": "int64",
+            "default": 0
+          },
+          "tensorfs": {
+            "type": "string",
+            "default": ""
+          },
+          "toolchain": {
+            "$ref": "#/components/schemas/Toolchain",
+            "description": "What builds kernels here when no prebuilt one serves the card.",
+            "default": {
+              "detail": "",
+              "host_compiler": "",
+              "install": "",
+              "missing": [],
+              "nvcc": "",
+              "state": ""
+            }
+          },
+          "version": {
+            "type": "string",
+            "description": "This machine's release.",
+            "default": ""
+          },
+          "warm": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/WarmItem"
+            },
+            "description": "The caller's warm set, each with what it holds now.",
+            "default": []
+          },
+          "webrtc": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/WebRtc",
+                "description": "The direct player endpoint, when the machine listens."
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "worker_id": {
+            "type": "string",
+            "default": ""
+          }
+        }
+      },
+      "Toolchain": {
+        "type": "object",
+        "description": "The machine's build toolchain: CUDA's compiler and a host C/C++ compiler.",
+        "properties": {
+          "detail": {
+            "type": "string",
+            "description": "Why the last install failed.",
+            "default": ""
+          },
+          "host_compiler": {
+            "type": "string",
+            "description": "The host compiler's first version line; empty: none found.",
+            "default": ""
+          },
+          "install": {
+            "type": "string",
+            "description": "The OS's own command for a missing host compiler; empty when none is missing or known.",
+            "default": ""
+          },
+          "missing": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "What it lacks: `nvcc`, `cc`, `ninja`.",
+            "default": []
+          },
+          "nvcc": {
+            "type": "string",
+            "description": "`nvcc --version`'s release line; empty: none found.",
+            "default": ""
+          },
+          "state": {
+            "type": "string",
+            "description": "ready, absent, installing, failed",
+            "default": ""
+          }
+        }
+      },
+      "WarmItem": {
+        "type": "object",
+        "description": "One member of a caller's warm set: a function the machine keeps ready up to `level`. It is\nthe last idle thing to give its memory to a request, and comes back when room returns.",
+        "properties": {
+          "bits": {
+            "type": "integer",
+            "format": "int32",
+            "description": "As [`RunSpec::bits`].",
+            "default": 0,
+            "minimum": 0
+          },
+          "entrypoint": {
+            "type": "string",
+            "default": ""
+          },
+          "held_back": {
+            "type": "string",
+            "description": "Status only: why that is lower than `level`.",
+            "default": ""
+          },
+          "holds": {
+            "type": "string",
+            "description": "Status only: the level it holds now (installed, downloaded, imported, host, gpu).",
+            "default": ""
+          },
+          "level": {
+            "$ref": "#/components/schemas/WarmLevel",
+            "default": "off"
+          },
+          "models": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ModelChoice"
+            },
+            "description": "None: the slots' defaults, as for a run.",
+            "default": []
+          },
+          "source": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/WarmSource"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          }
+        }
+      },
+      "WarmLevel": {
+        "type": "string",
+        "description": "How far a function is kept ready; each level includes the ones before it.",
+        "enum": [
+          "off",
+          "installed",
+          "downloaded",
+          "imported",
+          "host",
+          "gpu"
+        ]
+      },
+      "WarmSet": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/WarmItem"
+            },
+            "default": []
+          }
+        }
+      },
+      "WarmSource": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "release"
+            ],
+            "properties": {
+              "release": {
+                "$ref": "#/components/schemas/Release"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "installation"
+            ],
+            "properties": {
+              "installation": {
+                "type": "string"
+              }
+            }
+          }
+        ],
+        "description": "What a warm set's member keeps ready."
+      },
+      "WebRtc": {
+        "type": "object",
+        "properties": {
+          "addresses": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "host:port to dial: own interfaces, or the provider's mapping.",
+            "default": []
+          },
+          "fingerprint": {
+            "type": "string",
+            "description": "SHA-256 hex of the certificate its DTLS presents.",
+            "default": ""
+          },
+          "port": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The listener; a persistent machine keeps it across restarts.",
+            "default": 0,
+            "minimum": 0
+          },
+          "unavailable_reason": {
+            "type": "string",
+            "description": "Why no address is reported (a malformed mapping).",
+            "default": ""
+          }
+        }
+      }
+    },
+    "securitySchemes": {
+      "cozy_cap": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "authorization",
+        "description": "`Cozy-Cap <token>`: machine scope does everything as its signer; run scope reads one run's events and its granted outputs."
+      }
+    }
+  },
+  "security": [
+    {
+      "cozy_cap": []
+    }
+  ]
+}

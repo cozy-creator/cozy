@@ -35,9 +35,9 @@ Plan of record and workstream IDs (A–F):
 ## Process picture
 
 ```
-cozy CLI ──TLS/gRPC (Cozy-Cap)──> api::server ─> machine_api::NativeBackend
+Calcifer ──HTTPS (Cozy-Cap)──> api::http ─> machine_api::NativeBackend
                                                         │
-machine.sock (weight peers) / admin.sock ─> main.rs ▼
+                                                        ▼
                                           service::Service (dispatch policy)
                                            │ journal + supervision: execution::Engine / journal::Journal
                                            │
@@ -64,26 +64,25 @@ What belongs to a submitter is in the journal and the API: installations, prepar
 inputs, outputs, triage and controls are read by actor; a run's spool lives only for its call,
 and a failure quotes only the stderr its own request wrote.
 
-Local sockets, both 0600 and announced on start as `READY <machine.sock>` then
-`ADMIN <admin.sock>`: `machine.sock` serves weight peers (hello, import, attach, release, stats);
-`admin.sock` serves the owner (submit, executions, cancel, results, shutdown) and refuses any peer
-that descends from the machine. Same-UID package code is still not sandboxed.
+The HTTPS machine API is the only way in; there is no local control socket. Same-UID package
+code is still not sandboxed.
 
 ## Module map
 
 | Module | Owns | Main types | Owner |
 |---|---|---|---|
-| `main.rs` | `serve`/`version` commands, weight-peer socket and owner-only admin socket, wiring | — | E (admin socket split), D2 (rental config) |
-| `api/server.rs` | TLS listener: `cozy.machine.v1`, health, retired worker.v1 answers | `MachineIdentity`, `serve` | D1 |
+| `main.rs`, `serve.rs` | `serve`/`version` commands, the state root's owner lock and store claim, wiring | — | D2 (rental config) |
+| `api/server.rs` | The pinned-TLS listener (h2 and http/1.1) and the readiness self-probe | `MachineIdentity`, `serve` | D1 |
+| `api/http.rs` | The machine API's Router (`MACHINE-API.md`): auth, refusals as the error envelope, SSE, ranged outputs, object parts | `router`, `Refusal` | H |
 | `api/auth.rs` | Admitted keys (a rental's Hub lease) and each open stream's authority | `Authority`, `Keys`, `StreamAuthority` | D1 |
 | `api/identity.rs` | Persistent P-256 TLS identity, typed machine config, readiness secret | `MachineConfig`, `AuthorizedKeys`, `ReadinessSecret` | D2 |
 | `api/domain.rs` | Current typed native execution/backend values; no RPC or version identity | Native queries, state, model and custody values | APIM |
 | `archive.rs` | Private stored model/product/intake/terminal codecs, preserving existing byte tags | Stored records and codec functions | APIM |
 | `api/backend.rs` | The one backend trait the server calls | `MachineBackend`, `InputTreeReceiver`, `Observation` | D1 |
 | `api/workspaces.rs` | Resumable package uploads, scoped by owner key | `WorkspaceUploads`, `UploadSession`, `UploadedPackage` | D1 |
-| `api/machine_v1.rs` | `cozy.machine.v1` (`proto/cozy/machine/v1/machine.proto`, `MACHINE-API.md`): Run, Control, Read under one `Cozy-Cap`; Write (D1) to come | `MachineV1` | G |
-| `api/machine_status.rs` | Status: identity and receipt to anyone, the whole machine to a machine cap as it changes, `keepalive` | `status` | D2 |
-| `api/machine_update.rs` | `Run kind: update`: a software cohort from versions or held wheel objects; its log is the update's state history | `run`, `owns` | D2 |
+| `api/machine_runs.rs` | Runs: submit (idempotent per signer), the engine's pages as a run's events | `submit`, `follow` | G |
+| `api/machine_status.rs` | Status: identity and receipt to anyone, the whole machine to a machine cap as it changes | `frame`, `watch` | D2 |
+| `api/machine_update.rs` | Runs of `kind: update`: a software cohort from versions or held wheel objects; its log is the update's state history | `submit`, `events`, `owns` | D2 |
 | `api/capability.rs` | `Cozy-Cap` grants (the Go agent's token) for run outputs and maintenance | `Grant`, `verify`, `mint` | G |
 | `api/install.rs` | Materialize uploaded packages, run the uv installer helper | `InstallerConfig`, `PreparedGeneration` | D1 |
 | `machine_api.rs` | `MachineBackend` implementation: submit, events, collect, list, inventory | `NativeBackend` | D1 |
@@ -96,7 +95,7 @@ that descends from the machine. Same-UID package code is still not sandboxed.
 | `adapter_views.rs` | Caller LoRA adapters as a zero-copy TensorFS derivation | — | D1 |
 | `runs.rs` | Run sources and preparation inside a run: accepted at once, install/download as its progress, the Hub capability in memory only. A warm run with no entrypoint installs and fetches its choices; one with no code makes provider sources and uploads to its weights destination | `Runs`, `Spec`, `Source` | D1 |
 | `weights.rs` | An attempt's weights: `weights_writer` sources and outputs over TensorFS's native channels; an adopted output kept in a local repository, recorded as a manifest product, published to the run's weights destination | `Weights`, `Grant` | D1 |
-| `objects.rs` | Write: resumable content-addressed objects into the store, recorded per signer | `Objects`, `Writer` | D1 |
+| `objects.rs` | Uploaded objects: byte ranges in any order, resumable, verified once whole into the store, per signer | `Objects`, `Upload` | D1 |
 | `local_source.rs` | A run's local source: each remote manifest owns its source tree and editable environment; explicit local paths read the directory in place | `LocalSources`, `Manifest` | D1 |
 | `machine/` | Launch grant, lifetime identity, readiness receipt, rental lifecycle, supervision, SSH, runtime update, the direct player endpoint (`player.rs`), the embedded Python client and installer helper (`client.rs`) | `Grant`, `Readiness`, `Lifecycle` | D2 |
 | `native_inputs.rs` | Native input custody into TensorFS + journal | `SourceIntake`, `IntakeJournal` | D1 |
@@ -114,8 +113,7 @@ that descends from the machine. Same-UID package code is still not sandboxed.
 | `reclaim.rs` | Self-managing caches: TTL and storage pressure for spools, logs, collected results, generations | `Disk`, `Swept`, `sweep` | E |
 | `child_launcher.rs` | Pool-owned spawn thread (PDEATHSIG follows the creating thread) | `ChildLauncher` | E |
 | `os.rs` | memfd, seals, peer credentials (`SO_PEERPIDFD`, `pidfd_open` fallback), pidfd exit | — | E |
-| `owner.rs` | Weight peers, import, sealed memfd cache (LRU/TTL), leases per pidfd; store claim through TensorFS `ensure_owned` | `Owner` | B1 |
-| `protocol.rs` | Private control-socket protocol (length-prefixed JSON + `SCM_RIGHTS`) | `Request`, `Command`, `Reply` | E |
+| `protocol.rs` | Length-prefixed frames of the executor seam | `read_body`, `write_body` | E |
 | `host_tier.rs` | Degree 1 host tier: machine-filled sealed layouts, adopted read-only, sized by live headroom; a region's absent objects are fetched (Now) and copied as they land | `HostTier`, `HostGrant`, `TierLimit`, `HostTierFacts` | B1 |
 | `host_memory.rs` | Live host headroom (cgroup v1/v2 path, `MemAvailable`) | `HostMemory` | B1 |
 | `model_sources.rs` | Selected model headers/assets as verified bytes and sealed read-only descriptors; component byte facts for planning | `ModelSources`, `SelectedManifest` | B1 |
@@ -129,7 +127,6 @@ that descends from the machine. Same-UID package code is still not sandboxed.
 |---|---|
 | `packages.py`, `captured_packages.py`, `installer.py`, `package_records.py`, `runtime_describe.py` | Static description and uv generation install (`python -m tensord_client.installer`) |
 | `device_codec.py` | Output encoder, embedded into `device_executor.rs` with `include_str!` |
-| `client.py`, `protocol.py`, `linux.py`, `execution_client.py`, `cpu_gate.py` | Private control-socket client and the CPU component gate |
 
 ## Development tools (not proof; see PLAN decision 5)
 
@@ -140,7 +137,6 @@ that descends from the machine. Same-UID package code is still not sandboxed.
 | `src/bin/install-capture.rs` | Run the installer path on a captured archive (used by Python tests) | D1 |
 | `scripts/gate/` | Matched ComfyUI vs TensorD gate through ordinary `cozy run` | F |
 | `scripts/benchmarks/permission_probe.py` | CPU executor permission probe | E |
-| `scripts/service_cpu_gate.py` | CPU service end-to-end gate over the admin socket, including machine kill and restart | E |
 
 ## Contracts
 

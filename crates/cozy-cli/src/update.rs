@@ -19,11 +19,11 @@ use sigstore_verify::{
     types::Bundle,
 };
 
-use crate::Context;
+use crate::{Context, machine::Adopted};
 
 const RELEASES: &str = "https://github.com/cozy-creator/cozy-creator/releases";
 const ISSUER: &str = "https://token.actions.githubusercontent.com";
-/// This repo's GitHub id (releases through v0.9.6 were signed under its old name, `cozy-creator/cozy`).
+/// This repo's GitHub id, which a rename keeps.
 const REPOSITORY_ID: &str = "1345607976";
 /// Its release workflow, on any ref.
 const WORKFLOW: &str = "/.github/workflows/release.yml@";
@@ -81,7 +81,7 @@ struct Updated {
     sha256: String,
     signer: String,
     calcifer: Step,
-    machine: Step,
+    machine: Adopted,
 }
 
 #[derive(Serialize)]
@@ -167,6 +167,7 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
             ),
         ));
     }
+    keep_previous(&binary).map_err(|e| local("keep the binary it replaces", e))?;
     self_replace::self_replace(&new).map_err(|e| local("replace this binary", e))?;
 
     let calcifer = match crate::daemon::restart(ctx, &binary).await {
@@ -183,6 +184,7 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
             });
         }
     };
+    let machine = crate::machine::adopt(ctx, &version).await;
     let updated = Updated {
         from: current,
         to: version,
@@ -191,9 +193,9 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
         sha256,
         signer,
         calcifer,
-        // The local machine's UPDATE run arrives with TensorD in the binary (xs-043 T).
-        machine: Step::NotPorted,
+        machine,
     };
+    let kept = matches!(updated.machine, Adopted::Kept { .. });
     if ctx.json {
         println!(
             "{}",
@@ -211,9 +213,24 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
             updated.archive, updated.sha256, updated.signer
         );
         println!("  calcifer: {}", step(&updated.calcifer));
-        println!("  machine: {}", step(&updated.machine));
+        println!("  machine: {}", adopted(&updated.machine));
     }
-    Ok(ExitCode::SUCCESS)
+    Ok(if kept {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
+/// Keeps the binary being replaced beside it as `.cozy-previous`, a machine's rollback when the
+/// new one never serves (design §5).
+fn keep_previous(binary: &Path) -> io::Result<()> {
+    let previous = binary.with_file_name(".cozy-previous");
+    match std::fs::remove_file(&previous) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+    std::fs::hard_link(binary, &previous).or_else(|_| std::fs::copy(binary, &previous).map(drop))
 }
 
 /// This binary's own file, through any link to it.
@@ -360,6 +377,21 @@ fn newer(version: &str, current: &str) -> bool {
     }
 }
 
+fn adopted(adopted: &Adopted) -> String {
+    match adopted {
+        Adopted::NotEnabled => "not enabled".into(),
+        Adopted::NotRunning => "not running; it starts on the new binary".into(),
+        Adopted::Restarted { version } => format!("restarted on {version}"),
+        Adopted::Waits { runs, run } => {
+            format!("waits for its {runs} runs; restarts when idle (`cozy run watch {run}`)")
+        }
+        Adopted::Kept { code, message, run } => match run {
+            Some(run) => format!("{code}: {message} (`cozy run show {run}`)"),
+            None => format!("{code}: {message}"),
+        },
+    }
+}
+
 fn step(step: &Step) -> &'static str {
     match step {
         Step::Restarted => "restarted on the new binary",
@@ -392,15 +424,15 @@ mod tests {
         Artifact::from_digest(Sha256Hash::from_hex(hex).unwrap())
     }
 
-    /// v0.9.6 was signed under the repo's old name; its certificate still names this repository id.
+    /// v0.10.0's own bundle for its x86_64 Linux archive.
     #[test]
-    fn a_release_signed_before_the_rename_verifies() {
-        let lines = include_str!("../tests/fixtures/sigstore/cozy-v0.9.6.jsonl");
-        let archive = sha256("05f72ee7e573691e20bad0676c8d222a57b293b34d2a71b25d5fcf68e220df63");
-        let signer = super::signer("v0.9.6", lines, archive).unwrap();
+    fn a_release_of_this_repo_verifies() {
+        let lines = include_str!("../tests/fixtures/sigstore/cozy-v0.10.0.jsonl");
+        let archive = sha256("28ec835fdef1d0a1eaf231cfa05d76bdef207ee6387bcb5ae8bf11c3ebc1017c");
+        let signer = super::signer("v0.10.0", lines, archive).unwrap();
         assert_eq!(
             signer,
-            "https://github.com/cozy-creator/cozy/.github/workflows/release.yml@refs/heads/release-v0.9.6"
+            "https://github.com/cozy-creator/cozy-creator/.github/workflows/release.yml@refs/heads/release-v0.10.0"
         );
     }
 

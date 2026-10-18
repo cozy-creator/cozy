@@ -140,6 +140,24 @@ fn addressed(parameter: &str, package: &str, interface: &Value) -> Option<String
         .then(|| path.to_string())
 }
 
+/// `installation`'s internal functions that construct a model: what a function loading none
+/// itself calls.
+fn internal_models(installation: &Installation) -> Result<Vec<String>, Refused> {
+    let interface: Value = serde_json::from_slice(&installation.interface)
+        .map_err(|_| refused("package_interface_invalid", "held interface is corrupt"))?;
+    let constructs = |entry: &Value| {
+        let models = entry["models"].as_array().into_iter().flatten();
+        models.into_iter().any(crate::gpu_service::constructed)
+    };
+    Ok(interface["entrypoints"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|entry| entry["internal"].as_bool() == Some(true) && constructs(entry))
+        .filter_map(|entry| entry["name"].as_str().map(str::to_owned))
+        .collect())
+}
+
 /// Whether `installation` declares a public entrypoint `name` for a warm set.
 fn declares(installation: &Installation, name: &str) -> Result<bool, Refused> {
     let interface: Value = serde_json::from_slice(&installation.interface)
@@ -483,7 +501,7 @@ impl Runs {
             return self.remove(actor, &spec).map(Some);
         }
         if let Some(items) = &spec.set {
-            return self.warm_set(actor, &spec, items, &observe, stoppable);
+            return self.warm_set(actor, id, &spec, items, &observe, stoppable);
         }
         if let Source::Models = spec.source {
             let models = self.warm_models(actor, id, &spec, &*observe, stoppable)?;
@@ -505,11 +523,11 @@ impl Runs {
                     })?,
             ),
             Source::Local(digest) => {
-                observe("installing the local package", 0, 0);
                 let local = self.local.as_ref().ok_or_else(|| {
                     refused("capability_unavailable", "this machine installs no local packages")
                 })?;
-                let installed = local.install(&self.service, actor, digest, Some(&stoppable.stop))?;
+                let stage = |stage: &str| observe(stage, 0, 0);
+                let installed = local.install(&self.service, actor, digest, Some(&stoppable.stop), id, &stage)?;
                 self.supersede(actor, &installed)?;
                 local.collect(actor, &installed.package);
                 // A call's imports start as soon as its code is installed, as a release's do.
@@ -536,6 +554,7 @@ impl Runs {
         };
         let (installation, plan, precision) = self.resolve(
             actor,
+            id,
             held,
             release,
             hub.clone(),
@@ -633,7 +652,9 @@ impl Runs {
         let entry = declared.expect("checked above");
         let degree = match (&plan, self.service.pool()) {
             (Some(plan), _) => plan.degree,
-            (None, Some(pool)) => pool.degree(entry, spec.gpus),
+            (None, Some(pool)) => pool
+                .degree(entry, spec.gpus)
+                .map_err(|e| refused("gpu_count_unavailable", e.to_string().replace("gpu_count_unavailable: ", "")))?,
             (None, None) => 0,
         };
         // A memoized callable's run is answered from the success this machine holds for its
@@ -710,6 +731,7 @@ impl Runs {
     fn warm_set(
         &self,
         actor: &str,
+        id: &str,
         spec: &Spec,
         items: &[SetItem],
         observe: &Arc<impl Fn(&str, u64, u64) + Send + Sync + 'static>,
@@ -735,6 +757,7 @@ impl Runs {
             let report = observe.clone();
             let (installation, plan, _) = self.resolve(
                 actor,
+                id,
                 held,
                 release,
                 hub.clone(),
@@ -751,21 +774,47 @@ impl Runs {
                     format!("{} declares no entrypoint {:?}", installation.package, item.entrypoint),
                 ));
             }
-            kept.push(serde_json::to_string(&KeptMember {
-                installation: installation.alias.clone(),
-                level: item.level.name().into(),
-                preparation: plan.as_ref().map(|plan| plan.id.clone()).unwrap_or_default(),
-                item: STANDARD.encode(&item.sent),
-            })
-            .map_err(io::Error::other)?);
-            rows.push(json!({"package": installation.package, "release": installation.release,
-                "entrypoint": item.entrypoint}));
-            let held = self.service.catalog.resolve(&installation.generation)?;
-            // A member's weights come under the warm run's access, after every run's.
-            let fetch = self.publisher.as_ref().zip(plan.as_ref()).map(|(publisher, plan)| {
-                crate::access::Fetch::new(publisher.store().clone(), hub.clone(), plan.manifests(), u64::MAX)
-            });
-            members.push(Member::new(held, plan, item.level, fetch));
+            // A function that loads no model itself (an orchestrator) runs on the ones it calls.
+            // The interface names no call graph, and internal functions exist only to be called:
+            // it brings its package's internal functions' models, each a member of its own.
+            let mut plans = vec![plan];
+            if item.level > Level::Installed && plans[0].is_none() {
+                for callee in internal_models(&installation)? {
+                    let own: Vec<_> = item.models.iter().filter(|c| own_choice(c, &callee)).cloned().collect();
+                    let report = observe.clone();
+                    let (_, plan, _) = self.resolve(
+                        actor,
+                        id,
+                        Some(installation.clone()),
+                        None,
+                        hub.clone(),
+                        spec,
+                        &callee,
+                        &own,
+                        item.bits,
+                        Some(Box::new(move |stage: &str, done: u64, total: u64| report(stage, done, total))),
+                        Some(&stoppable.stop),
+                    )?;
+                    plans.push(plan);
+                }
+            }
+            rows.push((json!({"package": installation.package, "release": installation.release,
+                "entrypoint": item.entrypoint}), plans.len()));
+            for plan in plans {
+                kept.push(serde_json::to_string(&KeptMember {
+                    installation: installation.alias.clone(),
+                    level: item.level.name().into(),
+                    preparation: plan.as_ref().map(|plan| plan.id.clone()).unwrap_or_default(),
+                    item: STANDARD.encode(&item.sent),
+                })
+                .map_err(io::Error::other)?);
+                let held = self.service.catalog.resolve(&installation.generation)?;
+                // A member's weights come under the warm run's access, after every run's.
+                let fetch = self.publisher.as_ref().zip(plan.as_ref()).map(|(publisher, plan)| {
+                    crate::access::Fetch::new(publisher.store().clone(), hub.clone(), plan.manifests(), u64::MAX)
+                });
+                members.push(Member::new(held, plan, item.level, fetch));
+            }
         }
         self.service
             .engine
@@ -779,12 +828,21 @@ impl Runs {
             }
             None => members.iter().map(|member| without_gpus(member.level)).collect(),
         };
-        for (row, (level, held_back)) in rows.iter_mut().zip(holds) {
-            row["level"] = level.name().into();
-            if !held_back.is_empty() {
-                row["held_back"] = held_back.into();
-            }
-        }
+        // An item's level is its lowest member's, and why that one is held back.
+        let mut holds = holds.into_iter();
+        let rows: Vec<Value> = rows
+            .into_iter()
+            .map(|(mut row, count)| {
+                let lowest = holds.by_ref().take(count).min_by_key(|(level, _)| *level);
+                if let Some((level, held_back)) = lowest {
+                    row["level"] = level.name().into();
+                    if !held_back.is_empty() {
+                        row["held_back"] = held_back.into();
+                    }
+                }
+                row
+            })
+            .collect();
         Ok(Some(ResultRecord {
             value: json!({"set": rows}),
             artifacts: vec![],
@@ -883,6 +941,7 @@ impl Runs {
     fn resolve(
         &self,
         actor: &str,
+        id: &str,
         held: Option<Installation>,
         release: Option<Published>,
         hub: Option<hub::Source>,
@@ -900,6 +959,7 @@ impl Runs {
             (Some(source), Some(publisher)) if needs_hub => {
                 let (package, release) = release.unwrap_or_default();
                 let request = Request {
+                    run: id.into(),
                     source,
                     package,
                     release,
@@ -1072,7 +1132,7 @@ impl Runs {
                         None => None,
                     };
                     let (hub, models) = (spec.hub.clone(), spec.models.clone());
-                    runs.resolve(&actor, held, None, hub, &spec, &spec.entrypoint, &models, spec.bits, None, None)
+                    runs.resolve(&actor, "", held, None, hub, &spec, &spec.entrypoint, &models, spec.bits, None, None)
                 })();
             match prepared {
                 Ok((installation, Some(plan), _)) if plan.degree > 0 && !plan.slots.is_empty() => {
@@ -1209,14 +1269,12 @@ mod tests {
         journal.execute("UPDATE preparations SET record=?1 WHERE id='plan-a'", [plan]).unwrap();
         assert_eq!(publisher.caches(&service).unwrap().keep, [kept("a"), kept("b")]);
         drop(queued);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::scratch::remove(&root);
     }
 
     fn write(objects: &Objects, actor: &str, bytes: &[u8]) -> (String, u64) {
         let digest = format!("sha256:{}", sha256::hex_digest(bytes));
-        let mut writer = objects.begin(actor, &digest, bytes.len() as u64, 0).unwrap();
-        writer.append(bytes).unwrap();
-        writer.finish().unwrap();
+        objects.write(actor, &digest, bytes).unwrap();
         (digest, bytes.len() as u64)
     }
 
@@ -1255,14 +1313,44 @@ mod tests {
         }
     }
 
+    /// The 4090 bench: `cozy run …/ref2va_turbo --warm=downloaded` downloaded nothing, since that
+    /// function loads no model itself; the internal ones it calls do. Warming it now brings their
+    /// models onto the machine's disk, and its warm set still shows the one function asked for.
+    #[test]
+    fn warming_a_function_that_loads_no_model_downloads_its_internal_functions_models() {
+        let entrypoints = json!([
+            {"name": "render", "accelerator": false},
+            {"name": "generate", "internal": true,
+                "models": [{"path": "generate.models.model", "class": "M", "default": "model@1.0.0"}]}]);
+        let machine = crate::published::tests::Machine::with("acme/pkg", &[("8.9", 24 << 30)], entrypoints, &["bf16"]);
+        let store = machine.publisher.store().clone();
+        let objects = Arc::new(Objects::new(&machine.root.join("writes"), store.clone(), machine.service.engine.clone()).unwrap());
+        let runs = Runs { service: machine.service.clone(), objects, publisher: Some(machine.publisher.clone()), local: None,
+            own_hub: None, leaf: None, contexts: Default::default() };
+        let mut warm = spec(Source::Models, true, "set");
+        (warm.hub, warm.owner, warm.catalog_revision) = (Some(machine.hub.clone()), "acme".into(), "r1".into());
+        warm.set = Some(vec![SetItem {
+            source: Source::Installation(machine.installation.alias.clone()), entrypoint: "render".into(),
+            models: vec![], bits: 0, level: Level::Downloaded, sent: b"render".to_vec(),
+        }]);
+        let set = runs.prepare("alice", "set", warm, &runs.service.engine.stoppable("set")).unwrap().unwrap();
+        assert_eq!(set.value["set"].as_array().map(Vec::len), Some(1), "{}", set.value);
+        assert_eq!(set.value["set"][0]["entrypoint"], "render");
+        let manifest = machine.lanes.keys().next().unwrap().clone();
+        let started = std::time::Instant::now();
+        while !crate::access::whole(&store, &manifest, &[]) {
+            assert!(started.elapsed() < Duration::from_secs(60), "generate's model never reached the disk");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     #[test]
     fn resolved_internal_callables_refuse_roots_but_allow_managed_children() {
         let root = std::env::temp_dir().join(format!("cm-private-call-{}", uuid::Uuid::new_v4()));
         let service = Service::open(&root.join("state"), &root.join("generations"), 1).unwrap();
         let generation = "a".repeat(32);
         let directory = service.catalog.root().join(&generation);
-        fs::create_dir_all(directory.join("env/bin")).unwrap();
-        std::os::unix::fs::symlink("/usr/bin/python3", directory.join("env/bin/python")).unwrap();
+        let python = crate::scratch::interpreter(&directory.join("env"));
         fs::write(directory.join(".hold"), "").unwrap();
         let interface = json!({
             "application":"fixture:app",
@@ -1270,7 +1358,7 @@ mod tests {
         });
         fs::write(directory.join("generation.json"), json!({
             "identity":generation,"package":"fixture","version":"2.0.0",
-            "application":"fixture:app","python":directory.join("env/bin/python"),
+            "application":"fixture:app","python":python,
             "interface":interface
         }).to_string()).unwrap();
         service.engine.bind_installation(Installation {
@@ -1453,6 +1541,7 @@ mod tests {
             objects.clone(),
             InstallerConfig {
                 helper_python: String::from_utf8(helper.stdout).unwrap().trim().into(),
+                helper_engine: None,
                 python: "3.12".into(),
                 generations: root.join("generations"),
                 client_wheel: client,
@@ -1460,6 +1549,7 @@ mod tests {
                 sdk: vec![],
                 uv: "uv".into(),
                 seed_cache: None,
+                runtime_build: String::new(),
             },
             store.clone(),
         );
@@ -1642,8 +1732,7 @@ mod tests {
         let service = Service::open(&root.join("state"), &root.join("generations"), 1).unwrap();
         let generation = "a".repeat(32);
         let directory = service.catalog.root().join(&generation);
-        fs::create_dir_all(directory.join("env/bin")).unwrap();
-        std::os::unix::fs::symlink("/usr/bin/python3", directory.join("env/bin/python")).unwrap();
+        let python = crate::scratch::interpreter(&directory.join("env"));
         fs::write(directory.join(".hold"), "").unwrap();
         let callee = json!({"application":"callee:app","entrypoints":[{
             "name":"render","models":[{"path":"render.models.network","class":"callee.Model"}]
@@ -1653,7 +1742,7 @@ mod tests {
         }]});
         fs::write(directory.join("generation.json"), json!({
             "identity":generation,"package":"caller","version":"1.0.0","application":"caller:app",
-            "python":directory.join("env/bin/python"),"interface":caller,
+            "python":python,"interface":caller,
             "callees":[{"distribution":"callee","package":"second/callee","version":"2.0.0",
                 "application":"callee:app","interface":callee}]
         }).to_string()).unwrap();
@@ -1676,24 +1765,6 @@ mod tests {
         assert_eq!(projected.record.application, "callee:app");
         assert_eq!(projected.record.interface, callee);
         assert_eq!(service.catalog.resolve(&generation).unwrap().record.interface, caller);
-        let legacy_id = "b".repeat(32);
-        let legacy = service.catalog.root().join(&legacy_id);
-        fs::create_dir_all(legacy.join("env/bin")).unwrap();
-        std::os::unix::fs::symlink("/usr/bin/python3",legacy.join("env/bin/python")).unwrap();
-        fs::write(legacy.join(".hold"),"").unwrap();
-        fs::write(legacy.join("generation.json"),json!({
-            "identity":legacy_id,"package":"caller","version":"1.0.0","application":"caller:app",
-            "python":legacy.join("env/bin/python"),"interface":caller,"callees":[{
-                "distribution":"CALLEE__Lib.Name","version":"2.0.0","application":"callee:app","interface":callee
-            }]
-        }).to_string()).unwrap();
-        let legacy = service.catalog.resolve(&legacy_id).unwrap();
-        assert_eq!(legacy.record.app("caller:app").unwrap().0,"caller");
-        assert_eq!(legacy.record.app("callee:app").unwrap().0,"local/callee-lib-name");
-        assert_eq!(legacy.application("callee:app").unwrap().record.package,"local/callee-lib-name");
-        assert!(legacy.record.owns("callee:app","CALLEE__Lib.Name"));
-        assert!(!legacy.record.owns("callee:app","unrelated"));
-        assert!(!legacy.record.owns("callee:app","other/callee-lib-name"));
 
         let source = hub::Source::new("https://hub.example", None, vec![], None).unwrap();
         runs.contexts.lock().unwrap().insert("7".into(), RunContext {
@@ -1728,7 +1799,7 @@ mod tests {
         runs.contexts.lock().unwrap().get_mut("7").unwrap().models.clear();
         assert!(runs.child_spec("alice", "7", "callee:app", "render", json!({}), vec![], "", &[]).unwrap().models.is_empty(),
             "without inherited/explicit choices the normal resolver owns captured defaults");
-        fs::remove_dir_all(root).unwrap();
+        crate::scratch::remove(&root);
     }
 
     /// A preparing run's stages are observed like a running attempt's.

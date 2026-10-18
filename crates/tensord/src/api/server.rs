@@ -1,15 +1,15 @@
 use super::{auth::Authority, backend::MachineBackend};
 use crate::machine::receipt::{self, Readiness};
-use axum::{
-    http::{HeaderMap, StatusCode},
-    routing::get,
+use hyper_util::{
+    rt::{TokioExecutor, TokioIo, TokioTimer},
+    server::conn::auto,
+    service::TowerToHyperService,
 };
 use std::{
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tokio_stream::{wrappers::TcpListenerStream, Stream};
-use tonic::transport::{Identity, Server, ServerTlsConfig};
+use tokio_rustls::{rustls, TlsAcceptor};
 
 pub struct MachineIdentity {
     pub authority: Authority,
@@ -31,6 +31,8 @@ pub struct MachineIdentity {
     pub(crate) webrtc_port: Option<u16>,
     /// The store's directory; Status reports its filesystem. None on development front doors.
     pub store: Option<std::path::PathBuf>,
+    /// The GPUs this boot measured, which its readiness receipt names.
+    pub gpus: Vec<receipt::Gpu>,
 }
 
 impl MachineIdentity {
@@ -62,6 +64,7 @@ impl MachineIdentity {
             hubs: vec![],
             updates: None,
             store: None,
+            gpus: vec![],
             webrtc: None,
             player: Default::default(),
             webrtc_port: None,
@@ -90,68 +93,96 @@ pub async fn serve<B: MachineBackend>(
     let mut measured = MeasuredIdentity::of(&identity);
     measured.webrtc_port = identity.webrtc_port;
     tokio::spawn(prove_readiness(port, readiness, measured));
-    let tls =
-        ServerTlsConfig::new().identity(Identity::from_pem(&identity.cert_pem, &identity.key_pem));
+    let tls = TlsAcceptor::from(Arc::new(tls(&identity)?));
     let identity = Arc::new(identity);
     if let Some(listener) = webrtc {
         let media = super::cozy1::Media::new(identity.clone(), backend.clone())?;
         tokio::spawn(super::cozy1::serve(media, listener));
     }
-    let machine = super::machine_v1::MachineV1 {
-        identity: identity.clone(),
-        backend,
-    };
-    let mut routes = tonic::service::Routes::new(
-        super::v1::machine_server::MachineServer::new(machine)
-            .max_decoding_message_size(16 << 20)
-            .max_encoding_message_size(16 << 20),
-    );
-    // A client that still speaks cozy.worker.v1 is told to upgrade, not that this machine is old.
-    *routes.axum_router_mut() = super::retired::worker_v1(routes.axum_router_mut().clone())
-        .route(
-            "/v1/health",
-            get(|headers: HeaderMap| async move {
-                if headers.contains_key("authorization") {
-                    StatusCode::UNAUTHORIZED
-                } else {
-                    StatusCode::NO_CONTENT
-                }
-            }),
-        );
-    Server::builder()
-        .accept_http1(true)
-        // Fixed receive windows (Write's uploads): BDP probing from 64 KiB lost 16% to a fixed
-        // window on a lossy 160 ms link (G/read-bench); 16 MiB covers 150 Mbit/s at 800 ms.
-        // A ping every 20 s keeps NAT mappings on a client's path alive through a quiet run, and
-        // one left unanswered for 20 s ends a dead connection (its runs go on; a Run attaches).
-        .http2_keepalive_interval(Some(std::time::Duration::from_secs(20)))
-        .http2_keepalive_timeout(Some(std::time::Duration::from_secs(20)))
-        .initial_stream_window_size(Some(16 << 20))
-        .initial_connection_window_size(Some(32 << 20))
-        .tls_config(tls)?
-        .add_routes(routes)
-        .serve_with_incoming(no_delay(listener))
-        .await?;
-    Ok(())
+    let service = TowerToHyperService::new(super::http::router(identity, backend));
+    let mut http = auto::Builder::new(TokioExecutor::new());
+    // A ping every 20 s keeps NAT mappings on a client's path alive through a quiet run, and one
+    // left unanswered for 20 s ends a dead connection (its runs go on; a client attaches again).
+    http.http2()
+        .timer(TokioTimer::new())
+        .keep_alive_interval(LIVENESS)
+        .keep_alive_timeout(LIVENESS);
+    let http = Arc::new(http);
+    loop {
+        let stream = match listener.accept().await {
+            Ok((stream, _)) => stream,
+            // Out of descriptors, say: accept fails again at once, so pause rather than spin.
+            Err(_) => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+        live(&stream);
+        let (tls, http, service) = (tls.clone(), http.clone(), service.clone());
+        tokio::spawn(async move {
+            if let Ok(stream) = tls.accept(stream).await {
+                let _ = http.serve_connection(TokioIo::new(stream), service).await;
+            }
+        });
+    }
+}
+
+const LIVENESS: Duration = Duration::from_secs(20);
+
+/// The machine's leaf, offering HTTP/2 for control and HTTP/1.1 for bulk lanes.
+fn tls(identity: &MachineIdentity) -> std::io::Result<rustls::ServerConfig> {
+    let key = rustls_pemfile::private_key(&mut identity.key_pem.as_bytes())?
+        .ok_or_else(|| std::io::Error::other("the machine leaf has no private key"))?;
+    let leaf = rustls::pki_types::CertificateDer::from(identity.cert_der.clone());
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let mut config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .and_then(|config| config.with_no_client_auth().with_single_cert(vec![leaf], key))
+        .map_err(std::io::Error::other)?;
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(config)
+}
+
+/// Nagle off, as Go's net package sets every TCP connection: a response's small trailing frames
+/// otherwise wait for the ACK of the frames before them, one round trip each on a far link. TCP
+/// keepalive judges an HTTP/1.1 peer as PINGs judge an HTTP/2 one, so a lane whose client
+/// vanished ends.
+fn live(stream: &tokio::net::TcpStream) {
+    let _ = stream.set_nodelay(true);
+    #[cfg(unix)]
+    keepalive(stream);
+}
+
+#[cfg(unix)]
+fn keepalive(stream: &tokio::net::TcpStream) {
+    use nix::sys::socket::{setsockopt, sockopt};
+    let seconds = LIVENESS.as_secs() as u32;
+    let _ = setsockopt(stream, sockopt::KeepAlive, &true);
+    #[cfg(target_os = "linux")]
+    let _ = setsockopt(stream, sockopt::TcpKeepIdle, &seconds);
+    #[cfg(target_os = "macos")]
+    let _ = setsockopt(stream, sockopt::TcpKeepAlive, &seconds);
+    let _ = setsockopt(stream, sockopt::TcpKeepInterval, &seconds);
+    let _ = setsockopt(stream, sockopt::TcpKeepCount, &1);
 }
 
 struct MeasuredIdentity {
     worker_id: String,
     boot_id: String,
-    cert_pem: String,
     cert_der: Vec<u8>,
     webrtc_port: Option<u16>,
     capabilities: Vec<String>,
+    gpus: Vec<receipt::Gpu>,
 }
 impl MeasuredIdentity {
     fn of(identity: &MachineIdentity) -> Self {
         Self {
             worker_id: identity.authority.worker_id.clone(),
             boot_id: identity.authority.boot_id.clone(),
-            cert_pem: identity.cert_pem.clone(),
             cert_der: identity.cert_der.clone(),
             webrtc_port: None,
             capabilities: super::machine_status::capabilities(identity),
+            gpus: identity.gpus.clone(),
         }
     }
 }
@@ -161,28 +192,24 @@ impl MeasuredIdentity {
 async fn prove_readiness(port: u16, readiness: Arc<Readiness>, id: MeasuredIdentity) {
     let listener_bound = crate::machine::probe::presents_leaf(port, &id.cert_der).await;
     let foreign_credential_refused =
-        crate::machine::probe::refuses_foreign_capability(port, &id.cert_pem, &id.worker_id).await;
+        crate::machine::probe::refuses_foreign_capability(port, &id.cert_der, &id.worker_id).await;
     let gpus = match readiness.measures_gpus() {
-        false => Ok(vec![]),
-        true => tokio::task::spawn_blocking(receipt::gpus)
-            .await
-            .unwrap_or_else(|e| Err(std::io::Error::other(e))),
+        false => vec![],
+        true => id.gpus,
     };
-    let result = gpus.and_then(|gpus| {
-        readiness.seal(
-            receipt::Measured {
-                boot_id: &id.boot_id,
-                worker_port: port,
-                cert_der: &id.cert_der,
-                gpus,
-                listener_bound,
-                foreign_credential_refused,
-                capabilities: id.capabilities,
-                webrtc_port: id.webrtc_port,
-            }
-            .payload(),
-        )
-    });
+    let result = readiness.seal(
+        receipt::Measured {
+            boot_id: &id.boot_id,
+            worker_port: port,
+            cert_der: &id.cert_der,
+            gpus,
+            listener_bound,
+            foreign_credential_refused,
+            capabilities: id.capabilities,
+            webrtc_port: id.webrtc_port,
+        }
+        .payload(),
+    );
     match result {
         Ok(true) => tracing::info!("readiness sealed (listener {listener_bound}, foreign capability refused {foreign_credential_refused})"),
         Ok(false) => tracing::info!("this boot's retained readiness still holds"),
@@ -194,25 +221,6 @@ async fn prove_readiness(port: u16, readiness: Arc<Readiness>, id: MeasuredIdent
             std::process::exit(78);
         }
     }
-}
-
-/// Accepted connections with Nagle off, as Go's net package sets every TCP connection: a
-/// response's small trailing frames otherwise wait for the ACK of the frames before them, one
-/// round trip each on a far link.
-fn no_delay(
-    listener: tokio::net::TcpListener,
-) -> impl Stream<Item = std::io::Result<tokio::net::TcpStream>> {
-    use tokio_stream::StreamExt;
-    TcpListenerStream::new(listener).then(|accepted| async move {
-        match &accepted {
-            Ok(stream) => {
-                let _ = stream.set_nodelay(true);
-            }
-            // Out of descriptors, say: tonic accepts again at once, so pause rather than spin.
-            Err(_) => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
-        }
-        accepted
-    })
 }
 
 fn now_ms() -> u64 {

@@ -2,60 +2,122 @@
 //! PID 1 must), forwards stop signals and starts the service again after an abnormal exit, as
 //! the Go guardian restarts its request plane. A clean exit (a stop or an accepted release)
 //! ends it, and so does a second consecutive exit before readiness: measured progress, no timer.
-//! The parent is never replaced: an activated Runtime update runs as the service child
-//! (`tensord service`, readiness pipe on fd 3, this boot's readiness key on fd 4, the
-//! provider credential on fd 5), and a candidate that never proves readiness is rolled back by
-//! this same parent.
+//! The service is this executable, forked; an activated Runtime update is a new service on the
+//! activated SDK. An activated binary (`super::binary`) is exec'd in place, same PID and arguments,
+//! and its own parent forks the service. A candidate that never proves readiness is rolled back by
+//! the parent then running: a binary by renaming the previous one back and exec'ing it.
+//!
+//! Windows forks nothing: the stable parent starts the service from the launch path, with its
+//! arguments and `--service-ready`, the inherited pipe the service reports readiness on. An
+//! activated or restored binary is simply the next service it starts. The service's Job Object
+//! ends its tree with the parent; Windows has no orphans to reap.
+#[cfg(unix)]
 use nix::{
     errno::Errno,
-    fcntl::OFlag,
     sys::{
         signal::{kill, SigSet, Signal},
         wait::{waitpid, WaitPidFlag, WaitStatus},
     },
-    unistd::{fork, pipe2, ForkResult, Pid},
+    unistd::{fork, ForkResult, Pid},
 };
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
 use std::{
     fs::File,
     io::{self, Read, Write},
-    os::fd::{AsRawFd, FromRawFd},
 };
 
-/// The fd an exec'd service reports readiness on.
-const READY_FD: i32 = 3;
-/// The fd an exec'd service reads this boot's readiness key from: open only when the parent
-/// placed the key there. The key is never in an environment or an argument, the service closes
-/// the fd once it has read it, and a service that predates it ignores it.
-const KEY_FD: i32 = 4;
+use super::{provider::ProviderSelf, update::Recovered};
 
-/// Forks the service. Returns only in a service child that runs this executable, with the pipe
-/// it reports readiness on; the parent exits with the service's final status. An activated
-/// binary's service gets the readiness `key` on KEY_FD: it proves this boot as the first
-/// service would have.
+/// Returns only in the service, with the pipe it reports readiness on: `service_ready`, the
+/// handle its stable parent handed it. Without one this is the parent, which starts the service
+/// and exits with its final status. Windows rents nothing, so it hands on no provider credential.
+#[cfg(windows)]
 pub fn supervise(
     paths: &super::update::Paths,
-    key: Option<&[u8]>,
-    provider: Option<&super::provider::ProviderSelf>,
+    _provider: Option<ProviderSelf>,
+    service_ready: Option<u64>,
 ) -> io::Result<Ready> {
+    if let Some(handle) = service_ready {
+        // SAFETY: the stable parent handed this pipe end to this process alone.
+        let pipe = unsafe { cozy_platform::process::handed(handle) }?;
+        return Ok(Ready(Some(File::from(pipe))));
+    }
+    let program = std::env::current_exe()?;
+    let arguments: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    let mut failures_before_ready = 0;
+    loop {
+        // A published binary activation needs nothing more here: the service starts from the
+        // launch path, which holds it.
+        super::update::recover_activation(paths)?;
+        let (mut read, write) = std::io::pipe()?;
+        let mut command = std::process::Command::new(&program);
+        command
+            .args(&arguments)
+            .arg("--service-ready")
+            .arg(cozy_platform::process::hand_on(&write)?.to_string());
+        let mut service = cozy_platform::process::spawn(command)?;
+        drop(write);
+        let code = service.wait()?.code().unwrap_or(1);
+        // What the service left running ends with it.
+        drop(service);
+        let ready = read.read(&mut [0u8; 1]).unwrap_or(0) == 1;
+        if code == 0 {
+            std::process::exit(0);
+        }
+        if code == super::update::REPLACE_EXIT || code == super::binary::EXEC_EXIT {
+            tracing::info!("starting the service on its updated software");
+            failures_before_ready = 0;
+            continue;
+        }
+        failures_before_ready = if ready { 0 } else { failures_before_ready + 1 };
+        if failures_before_ready >= 2 {
+            let cause = format!("the service exited twice before readiness ({code})");
+            if let Recovered::Nothing = super::update::rollback_pending(paths, &cause)? {
+                tracing::error!("{cause}; stopping");
+                std::process::exit(code);
+            }
+            tracing::warn!("{cause}; update rolled back");
+            failures_before_ready = 0;
+            continue;
+        }
+        tracing::warn!("the service exited ({code}); starting it again");
+    }
+}
+
+/// Forks the service. Returns only in the service child, with the pipe it reports readiness
+/// on; the parent exits with the service's final status, or execs an activated binary, handing
+/// on a rental's `provider` credential.
+#[cfg(unix)]
+pub fn supervise(paths: &super::update::Paths, provider: Option<ProviderSelf>) -> io::Result<Ready> {
     let mut signals = SigSet::empty();
     for signal in [Signal::SIGTERM, Signal::SIGINT, Signal::SIGCHLD] {
         signals.add(signal);
     }
+    // macOS discards a signal whose default is to be ignored (SIGCHLD) as it is raised, blocked
+    // or not, unless something catches it: a handler that does nothing keeps it for sigwait.
+    #[cfg(target_os = "macos")]
+    {
+        use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler};
+        extern "C" fn noted(_: nix::libc::c_int) {}
+        let action = SigAction::new(SigHandler::Handler(noted), SaFlags::empty(), SigSet::empty());
+        // SAFETY: the handler does nothing, so it is async-signal-safe.
+        unsafe { sigaction(Signal::SIGCHLD, &action) }.map_err(io::Error::from)?;
+    }
     signals.thread_block().map_err(io::Error::from)?;
-    // Orphans of the service reparent here, not to a PID 1 that may not reap them.
-    cozy_platform::process::become_subreaper()?;
+    // Orphans of the service reparent here, not to a PID 1 that may not reap them. Elsewhere
+    // (macOS) they reparent to launchd, which reaps them, and executor trees end by group.
+    match cozy_platform::process::become_subreaper() {
+        Err(error) if error.is_unsupported() => {}
+        other => other?,
+    }
     let parent = nix::unistd::getpid();
     let mut failures_before_ready = 0;
     loop {
-        super::update::recover_activation(paths)?;
-        let activated = super::update::activated_binary(paths)?;
-        // An activated binary that does not read the credential is never handed it.
-        let credential = provider.filter(|_| {
-            activated
-                .as_deref()
-                .is_some_and(super::provider::reads_credential)
-        });
-        let (read, write) = pipe2(OFlag::O_CLOEXEC).map_err(io::Error::from)?;
+        if let Recovered::Exec(launch) = super::update::recover_activation(paths)? {
+            exec(paths, &launch, provider.as_ref(), &signals)?;
+        }
+        let (read, write) = cloexec_pipe()?;
         // SAFETY: no thread exists yet in this process; the child continues single-threaded.
         let child = match unsafe { fork() }.map_err(io::Error::from)? {
             ForkResult::Child => {
@@ -65,10 +127,7 @@ pub fn supervise(
                     std::process::exit(1);
                 }
                 SigSet::empty().thread_set_mask().map_err(io::Error::from)?;
-                let Some(binary) = activated else {
-                    return Ok(Ready(Some(File::from(write))));
-                };
-                exec_service(&binary, write, key, credential);
+                return Ok(Ready(Some(File::from(write))));
             }
             ForkResult::Parent { child } => child,
         };
@@ -84,7 +143,8 @@ pub fn supervise(
         if stopping || code == 0 {
             std::process::exit(code);
         }
-        if code == super::update::REPLACE_EXIT {
+        // An activated binary is exec'd as the loop recovers its published activation.
+        if code == super::update::REPLACE_EXIT || code == super::binary::EXEC_EXIT {
             tracing::info!("starting the service on its updated software");
             failures_before_ready = 0;
             continue;
@@ -92,59 +152,38 @@ pub fn supervise(
         failures_before_ready = if ready { 0 } else { failures_before_ready + 1 };
         if failures_before_ready >= 2 {
             let cause = format!("the service exited twice before readiness ({code})");
-            if super::update::rollback_pending(paths, &cause)? {
-                tracing::warn!("{cause}; Runtime update rolled back");
-                failures_before_ready = 0;
-                continue;
+            match super::update::rollback_pending(paths, &cause)? {
+                Recovered::Nothing => {
+                    tracing::error!("{cause}; stopping");
+                    std::process::exit(code);
+                }
+                Recovered::Restored => tracing::warn!("{cause}; update rolled back"),
+                Recovered::Exec(launch) => {
+                    tracing::warn!("{cause}; update rolled back to the previous binary");
+                    exec(paths, &launch, provider.as_ref(), &signals)?;
+                }
             }
-            tracing::error!("{cause}; stopping");
-            std::process::exit(code);
+            failures_before_ready = 0;
+            continue;
         }
         tracing::warn!("the service exited ({code}); starting it again");
     }
 }
 
-/// Runs an activated machine binary as this service child; never returns.
-fn exec_service(
-    binary: &std::path::Path,
-    ready: std::os::fd::OwnedFd,
-    key: Option<&[u8]>,
-    provider: Option<&super::provider::ProviderSelf>,
-) -> ! {
-    use std::os::unix::process::CommandExt;
-    if !inherit(ready, READY_FD) {
-        std::process::exit(1);
-    }
-    match key {
-        Some(key) => {
-            // The whole key fits a pipe's buffer: written and closed before the exec.
-            let Ok((read, write)) = pipe2(OFlag::O_CLOEXEC) else {
-                std::process::exit(1)
-            };
-            if File::from(write).write_all(key).is_err() || !inherit(read, KEY_FD) {
-                std::process::exit(1);
-            }
-        }
-        // Whatever this process inherited there is not a key.
-        // SAFETY: closing an fd nothing in this single-threaded child uses.
-        None => unsafe {
-            libc::close(KEY_FD);
-        },
-    }
-    match provider {
-        Some(provider) if !super::provider::hand_on(provider) => std::process::exit(1),
-        Some(_) => (),
-        // SAFETY: as above.
-        None => unsafe {
-            libc::close(super::provider::CREDENTIAL_FD);
-        },
-    }
-    let error = std::process::Command::new(binary).arg("service").exec();
-    tracing::error!("cannot run {}: {error}", binary.display());
-    std::process::exit(1)
+/// Replaces this parent with the binary at `launch`. One that will not exec is rolled back, and
+/// this image serves on.
+#[cfg(unix)]
+fn exec(paths: &super::update::Paths, launch: &std::path::Path, provider: Option<&ProviderSelf>, signals: &SigSet) -> io::Result<()> {
+    tracing::info!("running {}", launch.display());
+    let error = super::binary::exec(launch, provider);
+    signals.thread_block().map_err(io::Error::from)?;
+    let cause = format!("cannot run {}: {error}", launch.display());
+    tracing::error!("{cause}");
+    super::update::rollback_pending(paths, &cause).map(drop)
 }
 
-/// Places `fd` at `at` for the exec'd service to inherit (dup2 clears close-on-exec on the copy).
+/// Places `fd` at `at` for the re-executed machine to inherit (dup2 clears close-on-exec on the copy).
+#[cfg(target_os = "linux")]
 pub(super) fn inherit(fd: std::os::fd::OwnedFd, at: i32) -> bool {
     // SAFETY: plain fd calls in a single-threaded child.
     let placed = unsafe {
@@ -160,30 +199,8 @@ pub(super) fn inherit(fd: std::os::fd::OwnedFd, at: i32) -> bool {
     placed >= 0
 }
 
-/// The readiness key the parent handed this exec'd service, read once (the fd is then closed);
-/// None when it handed none.
-pub fn inherited_key() -> Option<Vec<u8>> {
-    // SAFETY: KEY_FD is the parent's key pipe, or not open (F_GETFD then fails).
-    if unsafe { libc::fcntl(KEY_FD, libc::F_GETFD) } < 0 {
-        return None;
-    }
-    // SAFETY: the open fd is owned by nothing else in this process. The pipe was written and
-    // closed before the exec, so a read never waits on it.
-    let mut pipe = unsafe { File::from_raw_fd(KEY_FD) };
-    unsafe { libc::fcntl(KEY_FD, libc::F_SETFL, libc::O_NONBLOCK) };
-    let mut key = vec![0u8; 33];
-    let read = pipe.read(&mut key).ok()?;
-    key.truncate(read);
-    (read == 32).then_some(key)
-}
-
-/// The readiness pipe an exec'd service inherited from its parent.
-pub fn inherited() -> Ready {
-    // SAFETY: the parent placed the pipe's write end at READY_FD before exec.
-    Ready(Some(unsafe { File::from_raw_fd(READY_FD) }))
-}
-
 /// Waits for the service to end, reaping every orphan meanwhile and forwarding stop signals.
+#[cfg(unix)]
 fn wait_service(child: Pid, signals: &SigSet) -> io::Result<(WaitStatus, bool)> {
     let mut stopping = false;
     loop {
@@ -212,4 +229,11 @@ impl Ready {
             let _ = pipe.write_all(b"r");
         }
     }
+}
+
+/// A pipe whose ends close on exec (std makes it so on every Unix).
+#[cfg(unix)]
+pub(crate) fn cloexec_pipe() -> io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
+    let (read, write) = std::io::pipe()?;
+    Ok((read.into(), write.into()))
 }

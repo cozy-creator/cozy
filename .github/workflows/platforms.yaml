@@ -18,6 +18,14 @@ on:
         description: Optional command run with bash after the build; empty runs none
         type: string
         default: ''
+      runtime_ref:
+        description: cozy-runtime branch, tag or SHA built into a wheel for the test (COZY_TEST_RUNTIME_WHEEL); empty builds none
+        type: string
+        default: ''
+      tensorfs_wheel:
+        description: Build this ref's TensorFS wheel on the runner for the test (COZY_TEST_TENSORFS_WHEEL)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -60,6 +68,42 @@ jobs:
         continue-on-error: true
         run: cargo test -p cozy-platform --test seams --locked -- --include-ignored 2>&1 | tee seams.txt; exit "${PIPESTATUS[0]}"
 
+      # The committed machine API spec is what cozy-proto's types generate (xs-044): drift fails the run.
+      - name: Machine API spec
+        id: spec
+        if: runner.os == 'Linux'
+        continue-on-error: true
+        run: cargo test -p cozy-proto --locked --lib machine::api 2>&1 | tee spec.txt; exit "${PIPESTATUS[0]}"
+
+      - uses: actions/checkout@v5
+        if: inputs.runtime_ref != ''
+        with:
+          repository: cozy-creator/cozy-runtime
+          ref: ${{ inputs.runtime_ref }}
+          ssh-key: ${{ secrets.COZY_RUNTIME_READ_KEY }}
+          path: .runtime
+
+      - uses: astral-sh/setup-uv@v7
+        if: inputs.runtime_ref != '' || inputs.tensorfs_wheel
+
+      - name: Runtime wheel
+        if: inputs.runtime_ref != ''
+        run: |
+          uv run --no-project python .runtime/scripts/stamp-build-provenance.py "$(git -C .runtime rev-parse HEAD)"
+          uv build --wheel --out-dir "$RUNNER_TEMP/runtime" .runtime
+          echo "COZY_TEST_RUNTIME_WHEEL=$(ls "$RUNNER_TEMP"/runtime/cozy_runtime-*.whl)" >> "$GITHUB_ENV"
+
+      # The wheel carries `tfs`, built first into its scripts directory, as the release does.
+      - name: TensorFS wheel
+        if: inputs.tensorfs_wheel
+        run: |
+          exe=; [ "$RUNNER_OS" != Windows ] || exe=.exe
+          cargo build --release --locked -p tensorfs-core --bin tfs
+          mkdir -p crates/tensorfs/wheel-data/scripts
+          cp "target/release/tfs$exe" crates/tensorfs/wheel-data/scripts/
+          (cd crates/tensorfs && uvx maturin@1.15.0 build --release --out "$RUNNER_TEMP/tensorfs")
+          echo "COZY_TEST_TENSORFS_WHEEL=$(ls "$RUNNER_TEMP"/tensorfs/tensorfs-*.whl)" >> "$GITHUB_ENV"
+
       - name: Test
         if: inputs.test != ''
         id: test
@@ -73,10 +117,10 @@ jobs:
         run: |
           {
             echo "## ${{ matrix.os }}"
-            echo "rust=${{ steps.rust.outcome }} seams=${{ steps.seams.outcome }} test=${{ steps.test.outcome }} imported=${{ steps.imported.outcome }}"
+            echo "rust=${{ steps.rust.outcome }} seams=${{ steps.seams.outcome }} spec=${{ steps.spec.outcome }} test=${{ steps.test.outcome }} imported=${{ steps.imported.outcome }}"
             echo '```'
             # The tail of each: where errors are. `head` would end the pipe early (SIGPIPE under pipefail).
-            for f in rust.txt imported.txt seams.txt; do [ ! -f "$f" ] || tail -n 50 "$f"; done
+            for f in rust.txt imported.txt seams.txt spec.txt; do [ ! -f "$f" ] || tail -n 50 "$f"; done
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
@@ -88,13 +132,14 @@ jobs:
             rust.txt
             imported.txt
             seams.txt
+            spec.txt
             test.txt
           if-no-files-found: ignore
           retention-days: 30
 
       - name: Verdict
         if: always()
-        run: test "${{ steps.rust.outcome }}/${{ steps.seams.outcome }}" = success/success && test "${{ steps.test.outcome }}" != failure
+        run: test "${{ steps.rust.outcome }}/${{ steps.seams.outcome }}" = success/success && test "${{ steps.test.outcome }}" != failure && test "${{ steps.spec.outcome }}" != failure
 
   # Generated data CI regenerates and compares byte for byte: TensorFS's constructor orders and
   # converter tables, from pinned Diffusers/Transformers on the meta device (CPU, no weights).

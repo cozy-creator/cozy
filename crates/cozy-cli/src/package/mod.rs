@@ -11,11 +11,11 @@ use cozy_proto::error::{Error, Kind};
 use crate::{Context, run::Placement};
 
 mod author;
+mod carried;
 mod catalog;
 pub(crate) mod live;
 pub(crate) mod local;
 mod machine;
-mod registry;
 
 #[derive(clap::Args, Debug)]
 pub struct Args {

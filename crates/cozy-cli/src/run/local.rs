@@ -15,7 +15,6 @@ use cozy_proto::{
     error::{Error, Kind},
     machine as v1,
 };
-use prost::Message as _;
 
 use super::{
     RunArgs, describe,
@@ -28,7 +27,7 @@ use crate::{Context, output, package::local::Local};
 /// What the machine installed: the package's interface and where the call must go.
 struct Installed {
     interface: Interface,
-    /// The machine's name for the installation; an older machine names none.
+    /// The machine's name for the installation; none for a kept interface.
     installation: Option<String>,
     /// Where it was installed; none for a kept interface.
     machine: Option<String>,
@@ -94,6 +93,7 @@ pub async fn run(
         callable,
         gpus: args.gpus.unwrap_or(0),
         bits: super::bits(&args),
+        attention_kernel: args.attention_kernel.as_deref().unwrap_or_default(),
     };
     // The call goes where the code was installed, with its files once more: a machine that
     // dropped them meanwhile is sent only what it lacks, and installs them in the call.
@@ -120,8 +120,8 @@ async fn install(ctx: &Context, hub: &str, on: On, local: &Local) -> Result<Inst
         false => format!("install {}", local.package),
     };
     let spec = v1::RunSpec {
-        kind: v1::RunKind::Warm.into(),
-        source: Some(v1::run_spec::Source::Local(local.source.clone())),
+        kind: v1::RunKind::Warm,
+        source: Some(v1::Source::Local(local.source.clone())),
         ..Default::default()
     };
     let submission = SubmitRun {
@@ -129,7 +129,7 @@ async fn install(ctx: &Context, hub: &str, on: On, local: &Local) -> Result<Inst
         hub: hub.to_owned(),
         kind: RunKind::Warm,
         target,
-        spec: spec.encode_to_vec(),
+        spec,
         inputs: local.inputs.clone(),
         out: None,
         warnings: vec![],

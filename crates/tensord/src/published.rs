@@ -22,7 +22,6 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
-    os::unix::process::CommandExt,
     process::{Command, Stdio},
     sync::{Arc, Condvar, Mutex},
     time::{Duration, Instant},
@@ -49,9 +48,32 @@ pub struct PackageSdk {
     pub client_wheel: Option<PathBuf>,
     /// An image's baked uv cache (expanded wheels, index records), linked rather than copied.
     pub seed_cache: Option<PathBuf>,
+    /// On a local machine, its owner's uv cache and managed Pythons (what the owner's own and
+    /// local-package installs use), so a release's Torch stack is fetched and kept once.
+    pub owner_uv: Option<OwnerUv>,
     /// The development Runtime an update named by its wheel file (`0.24.6+e9baf7a4`): the
     /// operator's choice, which runs every package whatever its own bounds on the pair.
     pub runtime_build: String,
+}
+
+/// Where uv keeps its cache and managed Pythons for the owner whose environment `env` is: as
+/// uv itself resolves them (its variables, then XDG, then the home directory's defaults).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OwnerUv {
+    pub cache: PathBuf,
+    pub python: PathBuf,
+}
+
+impl OwnerUv {
+    pub fn of(env: &BTreeMap<String, String>) -> Option<Self> {
+        let path = |name: &str| env.get(name).map(PathBuf::from).filter(|p| p.is_absolute());
+        let home = path("HOME");
+        let base = |xdg: &str, default: &str| path(xdg).or_else(|| home.as_ref().map(|h| h.join(default)));
+        Some(Self {
+            cache: path("UV_CACHE_DIR").or_else(|| Some(base("XDG_CACHE_HOME", ".cache")?.join("uv")))?,
+            python: path("UV_PYTHON_INSTALL_DIR").or_else(|| Some(base("XDG_DATA_HOME", ".local/share")?.join("uv/python")))?,
+        })
+    }
 }
 
 impl PackageSdk {
@@ -61,17 +83,20 @@ impl PackageSdk {
         // An activation replaces sdk/current, not the immutable candidate directory. Freeze
         // that selection once: both cache identity and the installer's actual wheel inputs
         // must name the same build even when filenames/version labels repeat.
-        let wheels = wheels.canonicalize().unwrap_or_else(|_| wheels.to_path_buf());
-        let mut pair: Vec<String> = fs::read_dir(&wheels)
+        let wheels = cozy_platform::durable::canonical(wheels).unwrap_or_else(|_| wheels.to_path_buf());
+        let found: Vec<PathBuf> = fs::read_dir(&wheels)
             .into_iter()
             .flatten()
             .flatten()
             .map(|entry| entry.path())
             .filter(|path| path.extension().is_some_and(|e| e == "whl"))
-            .map(|path| path.display().to_string())
             .collect();
+        let named = |prefix: &str| {
+            found.iter().any(|w| w.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with(prefix)))
+        };
+        let complete = named("cozy_runtime-") && named("tensorfs-");
+        let mut pair: Vec<String> = found.iter().map(|path| path.display().to_string()).collect();
         pair.sort();
-        let complete = pair.iter().any(|w| w.contains("/cozy_runtime-")) && pair.iter().any(|w| w.contains("/tensorfs-"));
         let seed = root.join("opt/cozy/dependency-seed/uv-cache");
         Self {
             uv,
@@ -84,6 +109,7 @@ impl PackageSdk {
             requirements: if complete { pair } else { vec![] },
             client_wheel: None,
             seed_cache: seed.is_dir().then_some(seed),
+            owner_uv: None,
         }
     }
 }
@@ -107,6 +133,8 @@ pub enum Progress {
 }
 
 pub struct Request {
+    /// The run this prepares for: a run waiting on its install is told so by this id.
+    pub run: String,
     pub source: hub::Source,
     pub package: String,
     /// Empty: the Hub's newest, as it named it under `catalog_revision`.
@@ -189,6 +217,10 @@ struct Job {
     observer: Option<Observer>,
     /// Its run's stop: a cancel ends its downloads and installs.
     stop: Option<PullCancellation>,
+    /// Its run as its caller names it, and how that run is told what it waits for
+    /// (`Engine::waiting`).
+    caller: String,
+    waiting: Option<Box<dyn Fn(Option<String>) + Send + Sync>>,
 }
 impl Default for Progress {
     fn default() -> Self {
@@ -208,6 +240,11 @@ impl Job {
         }
         *self.progress.lock().unwrap() = progress;
         self.changed.notify_all();
+    }
+    fn waiting(&self, reason: Option<String>) {
+        if let Some(waiting) = &self.waiting {
+            waiting(reason);
+        }
     }
     fn stage(&self, stage: String) {
         self.set(Progress::Preparing {
@@ -260,6 +297,16 @@ pub struct Publisher {
     jobs: Mutex<HashMap<String, Arc<Job>>>,
     /// One maker per source: a second asker waits, then finds it held (runs 5393/5394).
     making: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// The run building each environment identity, which a second run waits for.
+    building: Mutex<HashMap<String, String>>,
+}
+
+/// An identity's builder, forgotten however the build ends.
+struct Building<'a>(&'a Mutex<HashMap<String, String>>, String);
+impl Drop for Building<'_> {
+    fn drop(&mut self) {
+        self.0.lock().unwrap().remove(&self.1);
+    }
 }
 
 impl Publisher {
@@ -271,6 +318,7 @@ impl Publisher {
             store,
             jobs: Mutex::new(HashMap::new()),
             making: Mutex::new(HashMap::new()),
+            building: Mutex::new(HashMap::new()),
         }))
     }
 
@@ -356,9 +404,19 @@ impl Publisher {
         if let Ok(Some(prepared)) = self.held(service, actor, request) {
             return Ok(prepared);
         }
+        let engine = service.engine.clone();
+        let run = request.run.clone();
         let job = Job {
             observer: observe,
             stop: stop.cloned(),
+            caller: service.engine.caller_id(&run),
+            waiting: (!run.is_empty()).then(|| {
+                Box::new(move |reason| {
+                    if let Err(error) = engine.waiting(&run, reason) {
+                        tracing::warn!("run {run}: its waiting reason was not shown: {error}");
+                    }
+                }) as Box<dyn Fn(Option<String>) + Send + Sync>
+            }),
             ..Default::default()
         };
         self.work(service, actor, request, &job)
@@ -589,22 +647,26 @@ impl Publisher {
         if let Some(installed) = &request.installed {
             return Ok(installed.alias.clone());
         }
-        let release = match request.release.is_empty() {
-            true => service.engine.with_journal(|j| j.named(&newest_key(request), &request.catalog_revision))?.unwrap_or_default(),
-            false => request.release.clone(),
+        let release = match (request.release.is_empty(), request.catalog_revision.is_empty()) {
+            (true, false) => service.engine.with_journal(|j| j.named(&newest_key(request), &request.catalog_revision))?.unwrap_or_default(),
+            _ => request.release.clone(),
         };
         Ok(self.release_alias(request, &release))
     }
 
     /// The Hub's newest release of the request's package, journaled per catalog revision as a
-    /// model's name is (`resolve`): a moved revision asks once more.
+    /// model's name is (`resolve`): a moved revision asks once more. No revision names no catalog
+    /// state, so that ask is the Hub's every time: kept, its first answer would stand forever.
     fn newest(&self, service: &Service, request: &Request, catalog: &Catalog, org: &str, name: &str) -> Result<String, Failure> {
-        let key = newest_key(request);
-        if let Some(held) = service.engine.with_journal(|j| j.named(&key, &request.catalog_revision)).map_err(io_failure)? {
+        let (key, revision) = (newest_key(request), &request.catalog_revision);
+        if revision.is_empty() {
+            return newest_release(catalog, org, name);
+        }
+        if let Some(held) = service.engine.with_journal(|j| j.named(&key, revision)).map_err(io_failure)? {
             return Ok(held);
         }
         let release = newest_release(catalog, org, name)?;
-        service.engine.with_journal(|j| j.bind_named(&key, &request.catalog_revision, &release)).map_err(io_failure)?;
+        service.engine.with_journal(|j| j.bind_named(&key, revision, &release)).map_err(io_failure)?;
         Ok(release)
     }
 
@@ -871,7 +933,17 @@ impl Publisher {
         let locks = generations.join(".locks");
         fs::create_dir_all(&locks).map_err(io_failure)?;
         let lock = File::create(locks.join(format!("{identity}.lock"))).map_err(io_failure)?;
-        lock.lock_exclusive().map_err(io_failure)?;
+        if lock.try_lock_exclusive().is_err() {
+            let holder = self.building.lock().unwrap().get(identity).cloned();
+            job.waiting(Some(match holder {
+                Some(run) => format!("waiting for run {run} to install {package} {release}"),
+                None => format!("waiting for another run's install of {package} {release}"),
+            }));
+            lock.lock_exclusive().map_err(io_failure)?;
+            job.waiting(None);
+        }
+        self.building.lock().unwrap().insert(identity.into(), job.caller.clone());
+        let _building = Building(&self.building, identity.into());
         let dir = generations.join(identity);
         if dir.join("generation.json").is_file() {
             return Ok(());
@@ -900,7 +972,7 @@ impl Publisher {
         }
         let wheels = self.fetch_hub(&files, source, &dir, job)?;
         let env = dir.join("env");
-        let interpreter = env.join("bin/python");
+        let interpreter = cozy_platform::paths::venv_python(&env);
         let py = interpreter.to_string_lossy().to_string();
         next();
         self.uv(&["venv", "--no-project", "--no-config", "--python", &card.python, &env.to_string_lossy()], job.stop.as_ref())?;
@@ -979,12 +1051,9 @@ impl Publisher {
             .and_then(|_| file.sync_all())
             .map_err(io_failure)?;
         fs::rename(&staged, dir.join("generation.json")).map_err(io_failure)?;
-        File::open(&dir)
-            .and_then(|d| d.sync_all())
-            .map_err(io_failure)?;
-        File::open(generations)
-            .and_then(|d| d.sync_all())
-            .map_err(io_failure)
+        cozy_platform::durable::sync_dir(&dir)
+            .and_then(|()| cozy_platform::durable::sync_dir(generations))
+            .map_err(|error| io_failure(error.into()))
     }
 
     /// The lock's exact versions as constraints (`name==version ; marker`), less `except`: what
@@ -1053,12 +1122,10 @@ impl Publisher {
     }
 
     /// This machine's own uv cache, which `reclaim` manages; None when an image's seeded cache
-    /// serves installs (environments symlink into it, so nothing there is ever removed).
+    /// serves installs (environments symlink into it, so nothing there is ever removed) or the
+    /// owner's does (uv and its owner manage that one).
     pub fn uv_cache(&self) -> Option<PathBuf> {
-        self.sdk
-            .seed_cache
-            .is_none()
-            .then(|| self.root.join("uv-cache"))
+        (self.sdk.seed_cache.is_none() && self.sdk.owner_uv.is_none()).then(|| self.root.join("uv-cache"))
     }
 
     /// Held shared through one environment build, so `reclaim` removes nothing from the cache
@@ -1155,24 +1222,27 @@ impl Publisher {
     /// past its measured patience (`process::supervise`).
     fn uv_observed(&self, args: &[&str], env: &[(&str, &std::ffi::OsStr)], stop: Option<&PullCancellation>,
         read: &(dyn Fn(u64) + Sync)) -> Result<(), Failure> {
+        crate::machine::client::ensure_uv(&self.sdk.uv).map_err(|e| ("uv_unavailable", e.to_string()))?;
         let mut command = Command::new(&self.sdk.uv);
         command.args(args).env_clear().envs(env.iter().copied()).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
-        command.process_group(0);
+        cozy_platform::process::own_group(&mut command);
         for name in ["PATH", "SSL_CERT_FILE", "SSL_CERT_DIR", "LANG"] {
-            if let Some(value) = std::env::var_os(name) {
+            if let Some(value) = cozy_proto::config::environment().get(name) {
                 command.env(name, value);
             }
         }
+        let owner = self.sdk.owner_uv.as_ref();
         command
             .env("HOME", self.root.join("home"))
-            .env("UV_PYTHON_INSTALL_DIR", self.root.join("python"));
+            .env("UV_PYTHON_INSTALL_DIR", owner.map_or_else(|| self.root.join("python"), |o| o.python.clone()));
         // As the Python worker: an image's seeded cache, symlinked so overlayfs never copies
-        // the baked Torch payload into each environment; else this machine's own cache.
-        match &self.sdk.seed_cache {
-            Some(seed) => command
+        // the baked Torch payload into each environment; else the owner's, else this machine's.
+        match (&self.sdk.seed_cache, owner) {
+            (Some(seed), _) => command
                 .env("UV_CACHE_DIR", seed)
                 .env("UV_LINK_MODE", "symlink"),
-            None => command.env("UV_CACHE_DIR", self.root.join("uv-cache")),
+            (None, Some(owner)) => command.env("UV_CACHE_DIR", &owner.cache),
+            (None, None) => command.env("UV_CACHE_DIR", self.root.join("uv-cache")),
         };
         let mut child = command.spawn().map_err(|e| {
             (
@@ -1796,7 +1866,7 @@ pub fn describe_environment(
     // -S keeps authored .pth startup code out; only the venv's own site-packages are added.
     const BOOTSTRAP: &str = "import pathlib,runpy,sys;\
         root=pathlib.Path(sys.executable).absolute().parent.parent;\
-        sys.path[:0]=[str(p) for p in (root/'lib').glob('python*/site-packages')];\
+        sys.path[:0]=[str(p) for p in (*(root/'lib').glob('python*/site-packages'),root/'Lib'/'site-packages') if p.is_dir()];\
         runpy.run_module('tensord_client.runtime_describe',run_name='__main__')";
     let described = Command::new(python)
         .args(["-I", "-S", "-c", BOOTSTRAP])
@@ -1832,11 +1902,9 @@ fn pair_bound(line: &str) -> bool {
 
 /// The Runtime and TensorFS an environment holds, by their installed distribution names.
 fn installed_sdk(env: &Path) -> Vec<Value> {
-    let mut found: Vec<Value> = fs::read_dir(env.join("lib"))
+    let mut found: Vec<Value> = cozy_platform::paths::venv_site_packages(env)
         .into_iter()
-        .flatten()
-        .flatten()
-        .flat_map(|python| fs::read_dir(python.path().join("site-packages")).into_iter().flatten().flatten())
+        .flat_map(|site| fs::read_dir(site).into_iter().flatten().flatten())
         .filter_map(|entry| {
             let name = entry.file_name().into_string().ok()?;
             let (distribution, version) = name.strip_suffix(".dist-info")?.split_once('-')?;
@@ -1922,7 +1990,7 @@ fn platform(failure: Failure, package: &str, release: &str) -> Failure {
 pub(crate) mod names_hub;
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// A wheel with nothing but its metadata: `name` `version`, requiring `requires`.
@@ -2138,7 +2206,7 @@ mod tests {
         assert!(parts >= 3, "a 2.5 MiB wheel comes in 1 MiB parts: {:?}", asks.lock().unwrap());
 
         let env = dir.join("env");
-        let python = env.join("bin/python");
+        let python = cozy_platform::paths::venv_python(&env);
         for args in [
             vec!["venv", "-q", "--python", "3.12", env.to_str().unwrap()],
             vec!["pip", "install", "-q", "--offline", "--no-config", "--python", python.to_str().unwrap(), "--no-deps", local.to_str().unwrap()],
@@ -2319,6 +2387,46 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    /// On a local machine a release installs through its owner's uv cache: a wheel the owner's own
+    /// install cached serves it after its file is gone, where a machine with a cache of its own
+    /// finds nothing; that cache is never the machine's to reclaim. Real uv and lock; no network.
+    #[test]
+    fn a_local_machine_installs_through_its_owners_uv_cache() {
+        let root = std::env::temp_dir().join(format!("cm-owner-uv-{}", uuid::Uuid::new_v4()));
+        let wheels = root.join("wheels");
+        fs::create_dir_all(&wheels).unwrap();
+        let wheel = tiny_wheel(&wheels, "takes-any", "1.0", &[]);
+        let (pyproject, lock) = locked(&root.join("project"), &["takes-any"], &wheels, "");
+        let owner = OwnerUv::of(&BTreeMap::from([("HOME".into(), root.join("home").display().to_string())])).unwrap();
+        assert_eq!(owner, OwnerUv { cache: root.join("home/.cache/uv"), python: root.join("home/.local/share/uv/python") });
+        let named = BTreeMap::from([("HOME".into(), "/h".into()), ("XDG_CACHE_HOME".into(), "/x".into()),
+            ("XDG_DATA_HOME".into(), "relative".into()), ("UV_PYTHON_INSTALL_DIR".into(), "/p".into())]);
+        assert_eq!(OwnerUv::of(&named), Some(OwnerUv { cache: "/x/uv".into(), python: "/p".into() }));
+        // The owner's own install fills the cache; then the wheel's file goes.
+        let seeded = root.join("seeded");
+        for args in [
+            vec!["venv", "-q", "--python", "3.12", seeded.to_str().unwrap()],
+            vec!["pip", "install", "-q", "--python", seeded.join("bin/python").to_str().unwrap(), "--no-index",
+                "--find-links", wheels.to_str().unwrap(), "takes-any"],
+        ] {
+            assert!(Command::new("uv").args(&args).env("UV_CACHE_DIR", &owner.cache).status().unwrap().success(), "{args:?}");
+        }
+        fs::remove_file(&wheel).unwrap();
+        let store = Arc::new(Store::ensure(&root.join("tensorfs")).unwrap());
+        let sdk = PackageSdk { uv: PathBuf::from("uv"), python: "3.12".into(), ..Default::default() };
+        let card = card(pyproject, lock);
+
+        let own = Publisher::new(&root.join("own/published"), sdk.clone(), store.clone()).unwrap();
+        let (_, why) = generate(&own, &root.join("own/generations"), "app", &card).unwrap_err();
+        assert!(why.contains("takes_any-1.0-py3-none-any.whl"), "a cache of its own holds nothing: {why}");
+        let local = Publisher::new(&root.join("published"), PackageSdk { owner_uv: Some(owner), ..sdk }, store).unwrap();
+        let record = generate(&local, &root.join("generations"), "app", &card).unwrap();
+        assert!(Command::new(&record.python).args(["-I", "-c", "import takes_any"]).status().unwrap().success());
+        assert_eq!(local.uv_cache(), None);
+        assert!(!root.join("published/uv-cache").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
     /// A Runtime wheel an update named (`cozy machine update --runtime-wheel`) runs every
     /// package: one whose floor it meets without a word, one whose floor it misses regardless,
     /// its runs warned with that floor and the build. Real update and uv, no network.
@@ -2338,7 +2446,7 @@ mod tests {
         let file = named.file_name().unwrap().to_string_lossy().to_string();
         let (digest, _) = updates.stage(&file, &mut File::open(&named).unwrap()).unwrap();
         let runtime = Some(Choice { file, sha256: digest.clone(), ..Default::default() });
-        let request = Request { operation: "dev".into(), agent: "explicit".into(), pin: None, runtime, tensorfs: None };
+        let request = Request { operation: "dev".into(), pin: None, runtime, tensorfs: None, cozy: None, toolchain: false };
         updates.request(request, |_| ()).unwrap();
         loop {
             let status = updates.update("dev").unwrap();
@@ -2405,6 +2513,7 @@ mod tests {
     #[test]
     fn an_explicit_gpu_count_and_bits_have_their_own_preparation_cache_key() {
         let mut request = Request {
+            run: String::new(),
             source: hub::Source::new("https://hub.example", None, vec![], None).unwrap(),
             package: "org/package".into(), release: "1".into(), installed: None,
             owner: "org".into(), catalog_revision: String::new(), providers: Providers::default(),
@@ -2581,7 +2690,17 @@ mod tests {
 
     /// One channel request answered (frames: a kind byte, a u32 length, JSON); Null once the
     /// channel is closed.
-    fn ask(channel: &mut std::os::unix::net::UnixStream, request: Value) -> Value {
+    /// The channel a file carries, as the executor adopts it.
+    fn channel(file: std::fs::File) -> cozy_platform::ipc::LocalStream {
+        #[cfg(unix)]
+        let raw = std::os::fd::IntoRawFd::into_raw_fd(file) as i64;
+        #[cfg(windows)]
+        let raw = std::os::windows::io::IntoRawHandle::into_raw_handle(file) as i64;
+        // SAFETY: a connected stream this test owns and hands over.
+        unsafe { cozy_platform::ipc::adopt(raw) }
+    }
+
+    fn ask(channel: &mut cozy_platform::ipc::LocalStream, request: Value) -> Value {
         use std::io::{Read, Write};
         let body = serde_json::to_vec(&request).unwrap();
         let frame = [&[0u8][..], &(body.len() as u32).to_be_bytes(), &body].concat();
@@ -2636,7 +2755,7 @@ mod tests {
         let asked = heard.lock().unwrap().len();
         let warm = call(3);
         warm.wait(&manifest, &objects).unwrap();
-        let mut channel = std::os::unix::net::UnixStream::from(std::os::fd::OwnedFd::from(warm.channel().unwrap()));
+        let mut channel = channel(warm.channel().unwrap());
         let rows: Vec<Value> = objects.iter().map(|o| json!({"sha256": o.sha256, "length": o.length})).collect();
         let waited = ask(&mut channel, json!({"id": 1, "op": "wait", "manifest": manifest.id(), "objects": rows}));
         assert_eq!(waited, json!({"id": 1, "result": null}));
@@ -2656,7 +2775,7 @@ mod tests {
         let store = bench.publisher.store().clone();
         let objects = crate::access::objects(&crate::access::header(&store, &manifest).unwrap(), &[]);
         let fetch = crate::access::Fetch::new(store.clone(), Some(hub.clone()), vec![manifest.id()], 7);
-        let mut channel = std::os::unix::net::UnixStream::from(std::os::fd::OwnedFd::from(fetch.channel().unwrap()));
+        let mut channel = channel(fetch.channel().unwrap());
         let rows: Vec<Value> = objects.iter().map(|o| json!({"sha256": o.sha256, "length": o.length})).collect();
         let scheduled = ask(&mut channel, json!({"id": 1, "op": "schedule", "manifest": manifest.id(), "objects": rows, "rank": 0}));
         assert_eq!(scheduled, json!({"id": 1, "result": null}));
@@ -2718,13 +2837,12 @@ mod tests {
         let generations = crate::catalog::Catalog::new(&bench.root.join("generations")).unwrap();
         let identity = "ab".repeat(16);
         let dir = generations.root().join(&identity);
-        fs::create_dir_all(dir.join("env/bin")).unwrap();
-        fs::write(dir.join("env/bin/python"), "").unwrap();
+        let python = crate::scratch::interpreter(&dir.join("env"));
         File::create(dir.join(".hold")).unwrap();
         let interface = json!({"application": "pkg:app", "entrypoints": [{"name": "render",
             "models": [{"path": "render.models.model", "class": "M"}]}]});
         fs::write(dir.join("generation.json"), json!({"identity": identity, "package": "acme/pkg", "version": "1.0.0",
-            "application": "pkg:app", "python": dir.join("env/bin/python"), "interface": interface}).to_string()).unwrap();
+            "application": "pkg:app", "python": python, "interface": interface}).to_string()).unwrap();
         let held = generations.resolve(&identity).unwrap();
         let slot = |manifest: &ObjectRef, on_demand| PlanSlot { selected_encoded_bytes: 0, on_demand, lane: String::new(),
             binding: crate::device_executor::Binding { snapshot: manifest.id(), components: vec!["model".into()], ..Default::default() } };
@@ -2786,19 +2904,24 @@ mod tests {
     /// A machine on the GPUs its inventory names (compute capability, memory) holding `package`,
     /// whose `render` declares `slots`, and a Hub publishing `acme/model@1.0.0` in `lanes` and the
     /// LoRA `acme/lora@1.0.0`.
-    struct Machine {
-        root: PathBuf,
-        service: Arc<Service>,
-        publisher: Arc<Publisher>,
-        installation: Installation,
-        hub: hub::Source,
+    pub(crate) struct Machine {
+        pub root: PathBuf,
+        pub service: Arc<Service>,
+        pub publisher: Arc<Publisher>,
+        pub installation: Installation,
+        pub hub: hub::Source,
         heard: names_hub::Heard,
         /// Each published manifest's lane.
-        lanes: HashMap<String, String>,
+        pub lanes: HashMap<String, String>,
     }
 
     impl Machine {
         fn new(package: &str, gpus: &[(&str, u64)], slots: Value, lanes: &[&str]) -> Self {
+            Self::with(package, gpus, json!([{"name": "render", "models": slots}]), lanes)
+        }
+
+        /// `new`, its package declaring `entrypoints`.
+        pub(crate) fn with(package: &str, gpus: &[(&str, u64)], entrypoints: Value, lanes: &[&str]) -> Self {
             use crate::adapter_views::tests::{checkpoint as tensors, f32s};
             let root = std::env::temp_dir().join(format!("cm-precision-{}", uuid::Uuid::new_v4()));
             let service = Service::open(&root.join("state"), &root.join("generations"), 1).unwrap();
@@ -2812,12 +2935,11 @@ mod tests {
             service.configure_pool(Pool::new(&root.join("gpu"), serde_json::from_value(config).unwrap(), store).unwrap()).unwrap();
             let identity = "cd".repeat(16);
             let dir = service.catalog.root().join(&identity);
-            fs::create_dir_all(dir.join("env/bin")).unwrap();
-            fs::write(dir.join("env/bin/python"), "").unwrap();
+            let python = crate::scratch::interpreter(&dir.join("env"));
             File::create(dir.join(".hold")).unwrap();
-            let interface = json!({"application": "pkg:app", "entrypoints": [{"name": "render", "models": slots}]});
+            let interface = json!({"application": "pkg:app", "entrypoints": entrypoints});
             fs::write(dir.join("generation.json"), json!({"identity": identity, "package": package, "version": "1.0.0",
-                "application": "pkg:app", "python": dir.join("env/bin/python"), "interface": interface}).to_string()).unwrap();
+                "application": "pkg:app", "python": python, "interface": interface}).to_string()).unwrap();
             let installation = service.engine.bind_installation(Installation { actor: "alice".into(), alias: "held".into(),
                 generation: identity, package: package.into(), release: "1.0.0".into(),
                 interface: serde_json::to_vec(&interface).unwrap(), hub: String::new() }).unwrap();
@@ -2838,7 +2960,7 @@ mod tests {
 
         /// `render` prepared for `acme`'s run at `bits` with `choices`.
         fn prepare(&self, bits: u32, choices: Vec<domain::ModelChoice>) -> Prepared {
-            let request = Request { source: self.hub.clone(), package: self.installation.package.clone(), release: "1.0.0".into(),
+            let request = Request { run: String::new(), source: self.hub.clone(), package: self.installation.package.clone(), release: "1.0.0".into(),
                 installed: Some(self.installation.clone()), owner: "acme".into(), catalog_revision: "r1".into(),
                 providers: Providers::default(), entrypoint: "render".into(), choices, gpus: 0, bits, imports: false };
             self.publisher.prepare_now(&self.service, "alice", &request, None, None).unwrap()

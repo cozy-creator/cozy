@@ -5,7 +5,6 @@ use crate::api::v1;
 use serde::Deserialize;
 use std::{
     fs, io,
-    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     sync::Mutex,
 };
@@ -19,7 +18,7 @@ pub struct Listing {
 }
 
 /// The repository documents a listing was read from: path, modification time and length.
-type Seen = Vec<(PathBuf, i64, i64, u64)>;
+type Seen = Vec<(PathBuf, Option<std::time::SystemTime>, u64)>;
 
 static LAST: Mutex<Option<(PathBuf, Seen, Listing)>> = Mutex::new(None);
 
@@ -57,7 +56,7 @@ fn seen(root: &Path) -> io::Result<Seen> {
         for document in fs::read_dir(org?.path())? {
             let document = document?;
             let meta = document.metadata()?;
-            seen.push((document.path(), meta.mtime(), meta.mtime_nsec(), meta.len()));
+            seen.push((document.path(), meta.modified().ok(), meta.len()));
         }
     }
     seen.sort();

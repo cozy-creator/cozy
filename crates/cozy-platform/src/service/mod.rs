@@ -48,6 +48,12 @@ impl Services {
         self.login && sys::available()
     }
 
+    /// Whether a user service manager answers at all, whatever the home: a home without one
+    /// (`available` false) is then another home than the login's, not a session without one.
+    pub fn reachable(&self) -> bool {
+        sys::available()
+    }
+
     /// Writes the definition and enables it at login, without starting it.
     pub fn install(&self, spec: &ServiceSpec) -> Result<()> {
         sys::install(&self.dir, spec)
@@ -85,6 +91,11 @@ impl Services {
     pub fn uninstall(&self, name: &str) -> Result<()> {
         sys::stop(&self.dir, name)?;
         sys::uninstall(&self.dir, name)
+    }
+
+    /// Whether the service failed to start: its manager gave up on it or restarted it.
+    pub fn failed(&self, name: &str) -> bool {
+        sys::failed(name)
     }
 }
 

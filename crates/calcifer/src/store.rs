@@ -12,26 +12,18 @@ use cozy_proto::{
         CHECKPOINT, Call, Event, ItemStatus, Kind, Machine, MachineKind, MachineState, OutputItem,
         Reason, Run, Status, Warning,
     },
+    config::Origin,
     ids::{Digest, RunId},
-    machine as v1, machine_json as json,
+    machine as v1,
 };
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
-use rusqlite_migration::{M, Migrations};
-
-/// The schema; its version is `PRAGMA user_version`.
-fn migrations() -> Migrations<'static> {
-    let mut all: Vec<M> = MIGRATIONS.to_vec();
-    // xs-044: a run's spec and outcome are kept as the JSON the HTTP machine API sends (v0.10).
-    all.push(M::up_with_hook("", |tx: &Transaction| json_rows(tx)));
-    Migrations::new(all)
-}
 
 /// The version at which runs' specs and outcomes are JSON.
-const JSON_ROWS: usize = 5;
-
-const MIGRATIONS: &[M] = &[
-    M::up(
-        "CREATE TABLE machines (
+/// The store's version (`PRAGMA user_version`), and the schema a new store is made with. A store
+/// at an older version is from before cozy 0.9.4, which this cozy does not read.
+const VERSION: i64 = 5;
+const SCHEMA: &str = "
+    CREATE TABLE machines (
         name TEXT PRIMARY KEY,
         kind TEXT NOT NULL CHECK (kind IN ('local', 'rental', 'added')),
         hub TEXT NOT NULL DEFAULT '',
@@ -43,9 +35,11 @@ const MIGRATIONS: &[M] = &[
         state TEXT NOT NULL CHECK (state IN ('booting', 'ready', 'ended')),
         served INTEGER NOT NULL DEFAULT 0,
         reason TEXT,
-        created_at INTEGER NOT NULL
+        created_at INTEGER NOT NULL,
+        alias TEXT
     ) STRICT;
     CREATE UNIQUE INDEX machines_rental ON machines (rental_id) WHERE rental_id IS NOT NULL;
+    CREATE UNIQUE INDEX machines_alias ON machines (alias) WHERE alias IS NOT NULL;
     CREATE TABLE runs (
         id TEXT PRIMARY KEY,
         number INTEGER NOT NULL UNIQUE,
@@ -71,7 +65,10 @@ const MIGRATIONS: &[M] = &[
         state_seq INTEGER NOT NULL DEFAULT 1,
         created_at INTEGER NOT NULL,
         accepted_at INTEGER,
-        settled_at INTEGER
+        settled_at INTEGER,
+        warnings TEXT NOT NULL DEFAULT '[]',
+        inputs TEXT NOT NULL DEFAULT '[]',
+        wants TEXT
     ) STRICT;
     CREATE INDEX runs_owed ON runs (machine) WHERE state <> 'settled';
     CREATE TABLE outputs (
@@ -89,6 +86,8 @@ const MIGRATIONS: &[M] = &[
         exported_rev INTEGER,
         created_seq INTEGER NOT NULL,
         seq INTEGER NOT NULL,
+        failed_rev INTEGER,
+        export_error TEXT,
         PRIMARY KEY (run, name, idx)
     ) STRICT, WITHOUT ROWID;
     CREATE INDEX outputs_unexported ON outputs (run) WHERE exported_rev IS NOT rev;
@@ -108,50 +107,25 @@ const MIGRATIONS: &[M] = &[
         machine TEXT,
         state TEXT NOT NULL CHECK (state IN ('pending', 'done', 'failed')),
         reason TEXT,
-        created_at INTEGER NOT NULL
-    ) STRICT;",
-    ),
-    // What the CLI noticed when binding the run, and the objects the run's machine is written.
-    M::up(
-        "ALTER TABLE runs ADD COLUMN warnings TEXT NOT NULL DEFAULT '[]';
-        ALTER TABLE runs ADD COLUMN inputs TEXT NOT NULL DEFAULT '[]';",
-    ),
-    // The output revision Calcifer gave up exporting, and why.
-    M::up(
-        "ALTER TABLE outputs ADD COLUMN failed_rev INTEGER;
-        ALTER TABLE outputs ADD COLUMN export_error TEXT;",
-    ),
-    // Machines and rentals: a renamed machine's old name, where an unpinned run may go, and
-    // which run an ask was made for.
-    M::up(
-        "ALTER TABLE machines ADD COLUMN alias TEXT;
-        CREATE UNIQUE INDEX machines_alias ON machines (alias) WHERE alias IS NOT NULL;
-        ALTER TABLE runs ADD COLUMN wants TEXT;
-        ALTER TABLE asks ADD COLUMN kind TEXT NOT NULL DEFAULT 'rent' CHECK (kind IN ('rent', 'end'));
-        ALTER TABLE asks ADD COLUMN run TEXT REFERENCES runs (id);",
-    ),
-];
+        created_at INTEGER NOT NULL,
+        kind TEXT NOT NULL DEFAULT 'rent' CHECK (kind IN ('rent', 'end')),
+        run TEXT REFERENCES runs (id)
+    ) STRICT;";
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("Calcifer's store: {0}")]
     Sqlite(#[from] rusqlite::Error),
-    #[error("Calcifer's store cannot migrate: {0}")]
-    Migration(#[from] rusqlite_migration::Error),
+    #[error(
+        "Calcifer's store is at version {0}: this cozy reads version 5, the stores of cozy 0.9.4 on"
+    )]
+    Version(i64),
     #[error("idempotency key {0:?} already names another submission")]
     Conflict(String),
     #[error("no machine named {0:?}")]
     UnknownMachine(String),
     #[error("Calcifer's store holds a row it cannot read: {0}")]
     Corrupt(String),
-    #[error(
-        "Calcifer could not rewrite its store's runs as JSON ({reason}); the store is as it was, and \
-         a copy of it is at {}",
-        backup.display()
-    )]
-    Conversion { backup: PathBuf, reason: String },
-    #[error("Calcifer's store already holds runs or machines; an import needs an empty one")]
-    NotEmpty,
 }
 
 type Result<T> = std::result::Result<T, StoreError>;
@@ -174,11 +148,13 @@ pub struct RunRow {
     pub number: u64,
     pub kind: Kind,
     pub target: String,
-    pub hub: String,
+    /// The run's Hub; none for local code.
+    pub hub: Option<Origin>,
     pub machine: Option<String>,
     /// The caller named the machine: the run is never placed elsewhere.
     pub pinned: bool,
-    pub spec: Vec<u8>,
+    /// The spec as it is sent.
+    pub spec: v1::RunSpec,
     pub out_dir: PathBuf,
     pub state: State,
     pub cancel_requested: bool,
@@ -215,10 +191,10 @@ pub struct NewRun {
     pub id: RunId,
     pub kind: Kind,
     pub target: String,
-    pub hub: String,
+    pub hub: Option<Origin>,
     pub machine: Option<String>,
     pub pinned: bool,
-    pub spec: Vec<u8>,
+    pub spec: v1::RunSpec,
     pub out_dir: PathBuf,
     pub warnings: Vec<Warning>,
     pub inputs: Vec<(Digest, u64)>,
@@ -323,23 +299,16 @@ impl Store {
         writer.pragma_update(None, "journal_mode", "WAL")?;
         writer.pragma_update(None, "synchronous", "FULL")?;
         writer.pragma_update(None, "foreign_keys", "ON")?;
-        let migrations = migrations();
-        let version: usize = migrations.current_version(&writer)?.into();
-        if version < JSON_ROWS && version > 0 {
-            // A copy of the store as it was, beside it, before its rows are rewritten.
-            let backup = path.with_extension(format!("db.pre-json-{}", now_ms()));
-            writer.backup(rusqlite::MAIN_DB, &backup, None)?;
-            migrations
-                .to_latest(&mut writer)
-                .map_err(|e| StoreError::Conversion {
-                    backup,
-                    reason: match e {
-                        rusqlite_migration::Error::Hook(reason) => reason,
-                        e => e.to_string(),
-                    },
-                })?;
+        match writer.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))? {
+            0 => {
+                let tx = writer.transaction()?;
+                tx.execute_batch(SCHEMA)?;
+                tx.pragma_update(None, "user_version", VERSION)?;
+                tx.commit()?;
+            }
+            VERSION => {}
+            other => return Err(StoreError::Version(other)),
         }
-        migrations.to_latest(&mut writer)?;
         let reader = Connection::open(path)?;
         reader.pragma_update(None, "query_only", "ON")?;
         Ok(Self {
@@ -612,12 +581,12 @@ impl Store {
                     new.id.as_str(),
                     key,
                     digest,
-                    new.hub,
+                    new.hub.as_deref().unwrap_or_default(),
                     new.kind.as_str(),
                     new.target,
                     machine,
                     new.pinned,
-                    spec_json(&new.spec)?,
+                    serde_json::to_vec(&new.spec).expect("serializes"),
                     new.out_dir.to_string_lossy(),
                     now_ms(),
                     serde_json::to_string(&new.warnings).expect("serializes"),
@@ -725,7 +694,8 @@ impl Store {
             run.measurements = row
                 .outcome
                 .as_ref()
-                .and_then(|outcome| serde_json::from_slice(&outcome.measurements).ok());
+                .and_then(|outcome| outcome.measurements.as_ref())
+                .and_then(|measurements| serde_json::from_str(measurements.get()).ok());
             let mut statement = conn.prepare(
                 "SELECT text FROM run_logs WHERE run = ?1 AND level = 'call' ORDER BY seq",
             )?;
@@ -805,6 +775,22 @@ impl Store {
         })
     }
 
+    /// A line of Calcifer's own in the run's log, whatever its machine has said yet (the inputs it
+    /// reused); none once it settled.
+    pub fn note(&self, id: &str, level: &str, text: &str) -> Result<Vec<Event>> {
+        self.write(|tx| {
+            if run_in(tx, id)?.is_none_or(|row| row.state == State::Settled) {
+                return Ok(vec![]);
+            }
+            let (seq, at_ms) = (next_seq(tx, id)?, now_ms());
+            tx.execute(
+                "INSERT INTO run_logs (run, seq, at_ms, level, text) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![id, seq as i64, at_ms, level, text],
+            )?;
+            Ok(vec![log_event(seq, at_ms, level.to_owned(), text.to_owned())])
+        })
+    }
+
     /// Ends an accepted run with its machine's outcome.
     pub fn settle(&self, id: &str, outcome: &v1::Outcome, cursor: u64) -> Result<Vec<Event>> {
         self.write(|tx| {
@@ -830,7 +816,11 @@ impl Store {
                 });
             tx.execute(
                 "UPDATE runs SET cursor = MAX(cursor, ?2), outcome = ?3 WHERE id = ?1",
-                params![id, cursor as i64, outcome_json(outcome)?],
+                params![
+                    id,
+                    cursor as i64,
+                    serde_json::to_vec(outcome).expect("serializes")
+                ],
             )?;
             events.extend(end(tx, id, status, reason)?);
             Ok(events)
@@ -1208,6 +1198,7 @@ const RUN_COLUMNS: &str = "id, number, kind, target, hub, machine, pinned, spec,
 fn run_row(r: &Row) -> rusqlite::Result<Result<RunRow>> {
     let id: String = r.get(0)?;
     let kind: String = r.get(2)?;
+    let hub: String = r.get(4)?;
     let state: String = r.get(9)?;
     let status: Option<String> = r.get(13)?;
     let reason_code: Option<String> = r.get(14)?;
@@ -1215,6 +1206,7 @@ fn run_row(r: &Row) -> rusqlite::Result<Result<RunRow>> {
     let out_dir: String = r.get(8)?;
     let warnings: String = r.get(20)?;
     let inputs: String = r.get(21)?;
+    let spec: Vec<u8> = r.get(7)?;
     let outcome: Option<Vec<u8>> = r.get(22)?;
     Ok((|| {
         Ok(RunRow {
@@ -1222,10 +1214,14 @@ fn run_row(r: &Row) -> rusqlite::Result<Result<RunRow>> {
             number: r.get::<_, i64>(1)? as u64,
             kind: Kind::parse(&kind).ok_or_else(|| corrupt("a run kind"))?,
             target: r.get(3)?,
-            hub: r.get(4)?,
+            // One spelling, whatever an older Calcifer recorded (`https://tensorhub.com:443`).
+            hub: (!hub.is_empty())
+                .then(|| Origin::parse(&hub))
+                .transpose()
+                .map_err(|_| corrupt("a run's Hub"))?,
             machine: r.get(5)?,
             pinned: r.get(6)?,
-            spec: spec_pb(&r.get::<_, Vec<u8>>(7)?)?,
+            spec: serde_json::from_slice(&spec).map_err(|_| corrupt("a run's spec"))?,
             out_dir: PathBuf::from(out_dir),
             state: match state.as_str() {
                 "queued" => State::Queued,
@@ -1254,10 +1250,9 @@ fn run_row(r: &Row) -> rusqlite::Result<Result<RunRow>> {
             warnings: serde_json::from_str(&warnings).map_err(|_| corrupt("a run's warnings"))?,
             inputs: serde_json::from_str(&inputs).map_err(|_| corrupt("a run's inputs"))?,
             outcome: match outcome {
-                Some(bytes) => Some(v1::Outcome::from(
-                    &serde_json::from_slice::<json::Outcome>(&bytes)
-                        .map_err(|_| corrupt("an outcome"))?,
-                )),
+                Some(bytes) => {
+                    Some(serde_json::from_slice(&bytes).map_err(|_| corrupt("an outcome"))?)
+                }
                 None => None,
             },
         })
@@ -1657,7 +1652,7 @@ fn record(conn: &Connection, row: &RunRow) -> Result<Run> {
         number: row.number,
         kind: row.kind,
         target: row.target.clone(),
-        hub: row.hub.clone(),
+        hub: row.hub.clone().map(String::from).unwrap_or_default(),
         machine: row.machine.clone(),
         status: match (row.state, row.status) {
             (State::Settled, Some(status)) => status,
@@ -1677,13 +1672,13 @@ fn record(conn: &Connection, row: &RunRow) -> Result<Run> {
         adjustments: row
             .outcome
             .iter()
-            .flat_map(|outcome| &outcome.adjustments)
-            .map(Into::into)
+            .flat_map(|outcome| outcome.adjustments.iter().cloned())
             .collect(),
         result: row
             .outcome
             .as_ref()
-            .and_then(|outcome| serde_json::from_slice(&outcome.result).ok()),
+            .and_then(|outcome| outcome.result.as_ref())
+            .and_then(|result| serde_json::from_str(result.get()).ok()),
         execution_ms: row
             .outcome
             .as_ref()
@@ -1694,75 +1689,6 @@ fn record(conn: &Connection, row: &RunRow) -> Result<Run> {
     })
 }
 
-/// Rewrites every protobuf spec and outcome as JSON, in the migration's transaction. An empty spec
-/// (a run imported from the Go CLI) stays empty. A row that is not protobuf stops the migration:
-/// the store is left as it was, beside its copy.
-fn json_rows(tx: &Transaction) -> rusqlite_migration::HookResult {
-    use rusqlite_migration::HookError;
-    let mut rows = tx.prepare("SELECT id, spec, outcome FROM runs")?;
-    let rows: Vec<(String, Vec<u8>, Option<Vec<u8>>)> = rows
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
-        .collect::<rusqlite::Result<_>>()?;
-    let unreadable =
-        |id: &str, what: &str, e: String| HookError::Hook(format!("run {id}'s {what}: {e}"));
-    let mut left_out = 0;
-    for (id, spec, outcome) in rows {
-        let spec = spec_json(&spec).map_err(|e| unreadable(&id, "spec", e.to_string()))?;
-        let outcome = match outcome {
-            Some(bytes) => {
-                let pb: v1::Outcome = prost::Message::decode(bytes.as_slice())
-                    .map_err(|e| unreadable(&id, "outcome", e.to_string()))?;
-                let json = json::Outcome::try_from(&pb)
-                    .map_err(|e| unreadable(&id, "outcome", e.to_string()))?;
-                let lost =
-                    |bytes: &[u8], kept: &Option<json::Json>| !bytes.is_empty() && kept.is_none();
-                if lost(&pb.result, &json.result) || lost(&pb.measurements, &json.measurements) {
-                    left_out += 1;
-                }
-                Some(serde_json::to_vec(&json).expect("serializes"))
-            }
-            None => None,
-        };
-        tx.execute(
-            "UPDATE runs SET spec = ?2, outcome = ?3 WHERE id = ?1",
-            params![id, spec, outcome],
-        )?;
-    }
-    if left_out > 0 {
-        tracing::warn!(
-            "{left_out} runs' results or measurements were not JSON, so their JSON rows leave them out; \
-             the store's copy beside it (state.db.pre-json-*) keeps those bytes"
-        );
-    }
-    Ok(())
-}
-
-/// A spec as the store keeps it: protobuf (as the wire sends it) in, JSON out.
-fn spec_json(spec: &[u8]) -> Result<Vec<u8>> {
-    if spec.is_empty() {
-        return Ok(vec![]);
-    }
-    let pb: v1::RunSpec = prost::Message::decode(spec).map_err(|_| corrupt("a run's spec"))?;
-    let json = json::RunSpec::try_from(&pb)
-        .map_err(|e| StoreError::Corrupt(format!("a run's spec: {e}")))?;
-    Ok(serde_json::to_vec(&json).expect("serializes"))
-}
-
-/// A kept spec as the wire sends it.
-fn spec_pb(spec: &[u8]) -> Result<Vec<u8>> {
-    if spec.is_empty() {
-        return Ok(vec![]);
-    }
-    let json: json::RunSpec = serde_json::from_slice(spec).map_err(|_| corrupt("a run's spec"))?;
-    Ok(prost::Message::encode_to_vec(&v1::RunSpec::from(&json)))
-}
-
-fn outcome_json(outcome: &v1::Outcome) -> Result<Vec<u8>> {
-    let json = json::Outcome::try_from(outcome)
-        .map_err(|e| StoreError::Corrupt(format!("an outcome: {e}")))?;
-    Ok(serde_json::to_vec(&json).expect("serializes"))
-}
-
 fn corrupt(what: &str) -> StoreError {
     StoreError::Corrupt(what.into())
 }
@@ -1771,142 +1697,4 @@ pub(crate) fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as i64)
-}
-
-/// A run another controller recorded, as `cozy migrate` imports it: never sent again (its spec is
-/// not kept), so it is never queued.
-#[derive(Clone, Debug)]
-pub struct ImportedRun {
-    pub id: RunId,
-    pub number: u64,
-    pub kind: Kind,
-    pub target: String,
-    pub hub: String,
-    pub machine: Option<String>,
-    pub out_dir: PathBuf,
-    pub state: State,
-    pub cancel_requested: bool,
-    pub cursor: u64,
-    pub machine_number: Option<u64>,
-    pub machine_state: Option<String>,
-    pub status: Option<Status>,
-    pub reason: Option<Reason>,
-    pub outcome: Option<v1::Outcome>,
-    pub created_at_ms: i64,
-    pub accepted_at_ms: Option<i64>,
-    pub settled_at_ms: Option<i64>,
-    pub outputs: Vec<ImportedOutput>,
-}
-
-/// One output item at its newest revision; with a path, that revision is already exported there.
-#[derive(Clone, Debug)]
-pub struct ImportedOutput {
-    pub name: String,
-    pub index: u32,
-    pub rev: u64,
-    pub length: u64,
-    pub digest: String,
-    pub media_type: String,
-    pub label: String,
-    pub duration_us: u64,
-    pub done: bool,
-    pub path: Option<PathBuf>,
-}
-
-impl Store {
-    /// Records `machines` and `runs` in one transaction, into a store that holds neither.
-    pub fn import(&self, machines: &[MachineRow], runs: &[ImportedRun]) -> Result<()> {
-        self.write(|tx| {
-            let held: bool = tx.query_row(
-                "SELECT EXISTS (SELECT 1 FROM runs) OR EXISTS (SELECT 1 FROM machines)",
-                [],
-                |r| r.get(0),
-            )?;
-            if held {
-                return Err(StoreError::NotEmpty);
-            }
-            for machine in machines {
-                put_machine_in(tx, machine)?;
-            }
-            for run in runs {
-                import_run(tx, run)?;
-            }
-            Ok(())
-        })
-    }
-}
-
-fn import_run(tx: &Transaction, run: &ImportedRun) -> Result<()> {
-    let id = run.id.as_str();
-    let state = match run.state {
-        State::Queued => return Err(StoreError::Corrupt(format!("imported run {id} is queued"))),
-        State::Sent => "sent",
-        State::Accepted => "accepted",
-        State::Settled => "settled",
-    };
-    let status = run.status.map(|status| match status {
-        Status::Completed => "completed",
-        Status::Canceled => "canceled",
-        _ => "failed",
-    });
-    // Sequence 1 is the run's creation, then one per output item, then its current state.
-    let state_seq = run.outputs.len() as i64 + 2;
-    tx.execute(
-        "INSERT INTO runs (id, number, idempotency_key, digest, hub, kind, target, machine, pinned, spec, out_dir,
-             state, cancel_requested, cursor, machine_number, machine_state, status, reason_code, reason, outcome,
-             seq, state_seq, created_at, accepted_at, settled_at)
-         VALUES (?1, ?2, ?3, '', ?4, ?5, ?6, ?7, 1, x'', ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?18,
-             ?19, ?20, ?21)",
-        params![
-            id,
-            run.number as i64,
-            format!("import:{id}"),
-            run.hub,
-            run.kind.as_str(),
-            run.target,
-            run.machine,
-            run.out_dir.to_string_lossy(),
-            state,
-            run.cancel_requested,
-            run.cursor as i64,
-            run.machine_number.map(|n| n as i64),
-            run.machine_state,
-            status,
-            run.reason.as_ref().map(|r| &r.code),
-            run.reason.as_ref().map(|r| &r.message),
-            run.outcome.as_ref().map(outcome_json).transpose()?,
-            state_seq,
-            run.created_at_ms,
-            run.accepted_at_ms,
-            run.settled_at_ms,
-        ],
-    )?;
-    for (seq, output) in (2_i64..).zip(&run.outputs) {
-        let path = output.path.as_ref().map(|p| p.to_string_lossy());
-        // A settled run's item with no file stays without one: its machine is gone.
-        let lost = path.is_none() && run.state == State::Settled;
-        tx.execute(
-            "INSERT INTO outputs (run, name, idx, rev, length, digest, media_type, label, duration_us, done, path,
-                 exported_rev, failed_rev, export_error, created_seq, seq)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?15)",
-            params![
-                id,
-                output.name,
-                i64::from(output.index),
-                output.rev as i64,
-                output.length as i64,
-                output.digest,
-                output.media_type,
-                output.label,
-                output.duration_us as i64,
-                output.done,
-                path,
-                path.is_some().then_some(output.rev as i64),
-                lost.then_some(output.rev as i64),
-                lost.then_some("not kept across the migration"),
-                seq,
-            ],
-        )?;
-    }
-    Ok(())
 }

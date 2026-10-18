@@ -40,7 +40,7 @@ pub async fn exec(ctx: &Context, rent: Rent) -> Result<ExitCode, Error> {
     let key = rent.idempotency_key.unwrap_or_else(mint_key);
     let ask = NewMachine::Rent {
         sku: sku.clone(),
-        hub: hub.origin.clone(),
+        hub: hub.origin.to_string(),
         gpus: rent.gpus,
         disk_gb: rent.disk_gb,
     };
@@ -160,7 +160,7 @@ fn price(sku: &str, q: &Quote) -> String {
 
 /// Follows the boot over Calcifer's machine events until the machine is ready, saying the Hub's
 /// phase as it changes. Ctrl-C stops watching only (`None`): the order goes on in Calcifer.
-async fn follow(
+pub(crate) async fn follow(
     ctx: &Context,
     booting: Machine,
     mut notices: Notices,

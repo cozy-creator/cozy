@@ -12,7 +12,7 @@ use std::{
 
 use calcifer::{
     Calcifer, Link, LinkError,
-    store::{ImportedRun, State, Store},
+    store::State,
 };
 use common::{SilentHub, Tensord, until};
 use cozy_proto::{
@@ -20,7 +20,6 @@ use cozy_proto::{
     ids::RunId,
     machine as v1,
 };
-use prost::Message as _;
 
 /// Calcifer on `home`, taking up what an earlier one left, as `serve` does once it serves.
 fn open(home: &Path) -> Arc<Calcifer> {
@@ -29,7 +28,11 @@ fn open(home: &Path) -> Arc<Calcifer> {
     calcifer
 }
 
-fn submit(on: &str, spec: Vec<u8>, inputs: Vec<cozy_proto::calcifer::StagedInput>) -> SubmitRun {
+fn submit(
+    on: &str,
+    spec: v1::RunSpec,
+    inputs: Vec<cozy_proto::calcifer::StagedInput>,
+) -> SubmitRun {
     SubmitRun {
         on: On::from(on.to_owned()),
         hub: "https://tensorhub.com".into(),
@@ -74,7 +77,7 @@ async fn settled(calcifer: &Calcifer, id: &RunId) {
 /// The machine's own answer about the run, with a link of the test's.
 async fn on_machine(machine: &Tensord, id: &RunId) -> Result<String, LinkError> {
     let link = Link::new(&machine.endpoint, common::key())?;
-    link.run(id.as_str(), 0, None)
+    link.attach(id.as_str(), 0)
         .await
         .map(|(state, _)| state.state)
 }
@@ -264,8 +267,8 @@ async fn a_sent_run_its_machine_never_got_is_sent_again_after_a_restart() {
         .unwrap();
     // The spec names no Hub: the run's own Hub is filled in at the send.
     let spec = v1::RunSpec {
-        kind: v1::RunKind::Warm as i32,
-        source: Some(v1::run_spec::Source::Release(v1::Release {
+        kind: v1::RunKind::Warm,
+        source: Some(v1::Source::Release(v1::Release {
             package: "cozy-test/held".into(),
             release: String::new(),
         })),
@@ -273,7 +276,7 @@ async fn a_sent_run_its_machine_never_got_is_sent_again_after_a_restart() {
     };
     let submitted = SubmitRun {
         hub: hub.origin(),
-        ..submit("m", spec.encode_to_vec(), vec![])
+        ..submit("m", spec, vec![])
     };
     let id = first.submit("k", submitted).await.unwrap().run.id;
     first.close();
@@ -375,76 +378,6 @@ async fn a_run_lost_after_acceptance_fails_and_is_not_run_again() {
     calcifer.close();
 }
 
-/// Runs imported from the Go CLI keep no spec: one its machine holds is followed from its cursor
-/// and ends with the machine's own outcome; one its machine never got settles failed, never sent.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn imported_runs_are_followed_and_never_sent() {
-    let home = tempfile::tempdir().unwrap();
-    let key = common::key_file(home.path());
-    let machine = Tensord::start();
-    let hub = SilentHub::new();
-    let held = RunId::try_from("req-held".to_owned()).unwrap();
-    let never = RunId::try_from("req-never".to_owned()).unwrap();
-    // The Go CLI sent this one and its machine accepted it.
-    let spec = v1::RunSpec::decode(common::warm_spec(&hub.origin(), vec![]).as_slice()).unwrap();
-    let link = Link::new(&machine.endpoint, common::key()).unwrap();
-    link.run(held.as_str(), 0, Some(spec)).await.unwrap();
-    let imported = |id: &RunId, number: u64, state: State| ImportedRun {
-        id: id.clone(),
-        number,
-        kind: Kind::Warm,
-        target: "cozy-test/held".into(),
-        hub: hub.origin(),
-        machine: Some("m".into()),
-        out_dir: home.path().join("outputs"),
-        state,
-        cancel_requested: false,
-        cursor: 0,
-        machine_number: None,
-        machine_state: None,
-        status: None,
-        reason: None,
-        outcome: None,
-        created_at_ms: 1,
-        accepted_at_ms: None,
-        settled_at_ms: None,
-        outputs: vec![],
-    };
-    Store::open(&home.path().join("calcifer/state.db"))
-        .unwrap()
-        .import(
-            &[machine.row("m", &key)],
-            &[
-                imported(&held, 41, State::Accepted),
-                imported(&never, 42, State::Sent),
-            ],
-        )
-        .unwrap();
-    let calcifer = open(home.path());
-    let mut events = calcifer.subscribe();
-    settled(&calcifer, &never).await;
-    let row = calcifer.store().run(never.as_str()).unwrap().unwrap();
-    assert_eq!(row.reason.unwrap().code, "spec_not_kept");
-    assert!(
-        matches!(on_machine(&machine, &never).await, Err(LinkError::NotFound)),
-        "never sent"
-    );
-    calcifer.cancel(&held).unwrap();
-    let end = until(&mut events, &held, |e| e.is_terminal()).await;
-    assert_eq!(
-        reason_of(&end),
-        "canceled",
-        "the machine's own outcome: {end:?}"
-    );
-    assert_eq!(
-        calcifer.store().run(held.as_str()).unwrap().unwrap().number,
-        41
-    );
-    calcifer.close();
-}
-
-/// A run's inputs reach its machine as a visible stage, in steps of what the machine holds, and an
-/// object two runs name is written to one machine once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn inputs_are_written_as_a_visible_stage_and_once_per_machine() {
     let home = tempfile::tempdir().unwrap();
@@ -488,8 +421,8 @@ async fn inputs_are_written_as_a_visible_stage_and_once_per_machine() {
         "one run wrote the object, the other found it held: {writing:?}"
     );
     let shown = writing.values().next().unwrap();
+    // What the machine holds, asked about once a second (shaped.rs shows it move on a slow link).
     assert_eq!(shown[0], "uploading image: 0 B/24.0 MiB", "{shown:?}");
-    assert!(shown.len() >= 2, "from nothing to all of it: {shown:?}");
     assert!(
         shown
             .last()

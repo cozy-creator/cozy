@@ -13,7 +13,6 @@ use cozy_proto::{
     config, machine as v1,
 };
 use hub_client::{Client, Credential, DeviceKey, P256Key, RunToken, UserSession, testing, types};
-use prost::Message as _;
 use sha2::{Digest as _, Sha256};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -21,14 +20,13 @@ async fn a_hub_is_listed_signed_in_and_a_rent_it_will_not_price_records_nothing(
     let var = |name| std::env::var(name).ok().filter(|v: &String| !v.is_empty());
     // The job's SSL_CERT_FILE trusts the Hub's origin.
     let (Some(url), Some(log)) = (var("TENSORHUB_ORIGIN"), var("TENSORHUB_LOG")) else {
-        eprintln!("skipped: TENSORHUB_ORIGIN and TENSORHUB_LOG name no hub");
-        return;
+        return no_hub();
     };
     let home = tempfile::tempdir().unwrap();
-    let origin = config::origin(&url).unwrap();
+    let origin = config::Origin::parse(&url).unwrap().to_string();
     let hub = config::Hub {
         name: Some("ci".into()),
-        origin: origin.clone(),
+        origin: config::Origin::parse(&origin).unwrap(),
     };
     let nonce = format!(
         "{:x}",
@@ -99,14 +97,13 @@ async fn a_hub_is_listed_signed_in_and_a_rent_it_will_not_price_records_nothing(
                 kind: Kind::Call,
                 target: "cozy-test/held/generate".into(),
                 spec: v1::RunSpec {
-                    source: Some(v1::run_spec::Source::Release(v1::Release {
+                    source: Some(v1::Source::Release(v1::Release {
                         package: "cozy-test/held".into(),
                         release: String::new(),
                     })),
                     entrypoint: "generate".into(),
                     ..Default::default()
-                }
-                .encode_to_vec(),
+                },
                 inputs: vec![],
                 out: None,
                 warnings: vec![],
@@ -156,11 +153,10 @@ async fn a_runs_capability_is_bound_to_its_machine_and_traded_at_its_hub() {
     let var = |name| std::env::var(name).ok().filter(|v: &String| !v.is_empty());
     // The job's SSL_CERT_FILE trusts the Hub's origin, which machines read too.
     let (Some(url), Some(log)) = (var("TENSORHUB_ORIGIN"), var("TENSORHUB_LOG")) else {
-        eprintln!("skipped: TENSORHUB_ORIGIN and TENSORHUB_LOG name no hub");
-        return;
+        return no_hub();
     };
     let home = tempfile::tempdir().unwrap();
-    let origin = config::origin(&url).unwrap();
+    let origin = config::Origin::parse(&url).unwrap().to_string();
     let nonce = format!(
         "{:x}",
         Sha256::digest(home.path().to_string_lossy().as_bytes())
@@ -173,7 +169,7 @@ async fn a_runs_capability_is_bound_to_its_machine_and_traded_at_its_hub() {
         .unwrap();
     let hub = config::Hub {
         name: None,
-        origin: origin.clone(),
+        origin: config::Origin::parse(&origin).unwrap(),
     };
     let key_path = hub.device_key(&Home::at(home.path()));
     key.save(&key_path).unwrap();
@@ -196,7 +192,7 @@ async fn a_runs_capability_is_bound_to_its_machine_and_traded_at_its_hub() {
     let machines = Machines::start(calcifer.clone(), Home::at(home.path()), &Default::default());
     let submit = |key: &'static str, destination: String| {
         let spec = v1::RunSpec {
-            kind: v1::RunKind::Warm as i32,
+            kind: v1::RunKind::Warm,
             weights_destination: destination,
             ..Default::default()
         };
@@ -207,7 +203,7 @@ async fn a_runs_capability_is_bound_to_its_machine_and_traded_at_its_hub() {
                 hub: origin.clone(),
                 kind: Kind::Warm,
                 target: "upload".into(),
-                spec: spec.encode_to_vec(),
+                spec,
                 inputs: vec![],
                 out: None,
                 warnings: vec![],
@@ -233,6 +229,46 @@ async fn a_runs_capability_is_bound_to_its_machine_and_traded_at_its_hub() {
         .unwrap();
     assert_eq!(public_access.origin, access.origin);
     assert!(public_access.capability.is_empty() && public_access.token_endpoint.is_empty());
+
+    // A machine writes its installations' Hub its own way (`https://tensorhub.com:443`), and
+    // `package update` submits under that spelling: the run is still this Hub's, read with the
+    // sign-in and object hosts a run under the configured spelling gets.
+    let respelled = calcifer
+        .submit(
+            "k-respelled",
+            SubmitRun {
+                on: On::Machine("m".into()),
+                hub: machine_spelling(&origin),
+                kind: Kind::Warm,
+                target: "update".into(),
+                spec: v1::RunSpec {
+                    kind: v1::RunKind::Warm,
+                    ..Default::default()
+                },
+                inputs: vec![],
+                out: None,
+                warnings: vec![],
+            },
+        )
+        .await
+        .unwrap()
+        .run;
+    assert_eq!(respelled.hub, origin);
+    let row = calcifer
+        .store()
+        .run(respelled.id.as_str())
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.hub.as_deref(), Some(origin.as_str()));
+    let respelled_access = machines.hub_access(&respelled.id, "m").await.unwrap();
+    assert_eq!(
+        respelled_access.map(|a| (a.origin, a.object_hosts)),
+        Some((
+            public_access.origin.clone(),
+            public_access.object_hosts.clone()
+        )),
+        "the run reads its Hub as a run under the configured spelling does"
+    );
 
     // As the machine: trade it with the leaf's key, then publish where it names, and only there.
     let leaf = Arc::new(P256Key::from_pkcs8(&tensord.leaf_key()).unwrap());
@@ -267,7 +303,7 @@ async fn a_runs_capability_is_bound_to_its_machine_and_traded_at_its_hub() {
         hub: origin.clone(),
         kind: Kind::Warm,
         target: "local/hello".into(),
-        spec: local.encode_to_vec(),
+        spec: local.clone(),
         inputs: vec![staged],
         out: None,
         warnings: vec![],
@@ -293,4 +329,27 @@ async fn a_runs_capability_is_bound_to_its_machine_and_traded_at_its_hub() {
     assert!(!common::holds_as(&link, &id, sent("")).await);
     machines.close();
     calcifer.close();
+}
+
+/// `origin` as a machine may write it: the scheme in capitals, the default port spelled out, and
+/// a trailing slash.
+fn machine_spelling(origin: &str) -> String {
+    let (scheme, rest) = origin.split_once("://").unwrap();
+    let port = match (rest.contains(':'), scheme) {
+        (true, _) => "",
+        (false, "https") => ":443",
+        (false, _) => ":80",
+    };
+    format!("{}://{rest}{port}/", scheme.to_uppercase())
+}
+
+/// A hosted job without a Hub fails the test, so a green run means it ran: tensorhub's cozy_ref
+/// job names one. Elsewhere it skips, saying why.
+fn no_hub() {
+    assert!(
+        std::env::var_os("GITHUB_ACTIONS").is_none(),
+        "TENSORHUB_ORIGIN and TENSORHUB_LOG are unset; the job must provide a Tensorhub: \
+         run it in tensorhub's dev-build cozy_ref job"
+    );
+    eprintln!("skipped: TENSORHUB_ORIGIN and TENSORHUB_LOG name no hub");
 }

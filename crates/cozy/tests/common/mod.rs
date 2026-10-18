@@ -26,6 +26,25 @@ pub struct Home {
     binary: std::cell::RefCell<PathBuf>,
 }
 
+/// What COZY_TEST_TENSORD names, for `needs`.
+pub const TENSORD: &str = "a TensorD: this workspace's `cargo build -p tensord` (owner-day.yml and \
+     tensorhub's cozy_ref job build it)";
+
+/// What the job must provide for a test to run. On a hosted runner a missing one fails the test,
+/// naming it, so a green run means every test ran; on any other computer the test skips, saying
+/// why. An empty value is missing.
+pub fn needs(var: &str, provides: &str) -> Option<std::ffi::OsString> {
+    if let Some(value) = std::env::var_os(var).filter(|v| !v.is_empty()) {
+        return Some(value);
+    }
+    assert!(
+        std::env::var_os("GITHUB_ACTIONS").is_none(),
+        "{var} is unset; the job must provide {provides}"
+    );
+    let _ = writeln!(std::io::stderr(), "skipped: {var} is unset ({provides})");
+    None
+}
+
 /// One finished `cozy` process.
 #[derive(Debug)]
 pub struct Out {
@@ -53,16 +72,13 @@ impl Home {
     }
 
     /// A fresh home whose current Hub is the job's Tensorhub at its public origin
-    /// (`TENSORHUB_ORIGIN`, Tensorhub's dev-build `cozy_ref` job, trusted through the job's
-    /// `SSL_CERT_FILE`), as a person's names tensorhub.com; `None` without one.
+    /// (`TENSORHUB_ORIGIN`, trusted through the job's `SSL_CERT_FILE`), as a person's names
+    /// tensorhub.com. A hosted job without one fails the test (`needs`).
     pub fn with_hub() -> Option<Self> {
-        let Some(url) = std::env::var_os("TENSORHUB_ORIGIN") else {
-            let _ = writeln!(
-                std::io::stderr(),
-                "skipped: no Tensorhub (TENSORHUB_ORIGIN is unset)"
-            );
-            return None;
-        };
+        let url = needs(
+            "TENSORHUB_ORIGIN",
+            "a Tensorhub: run it in tensorhub's dev-build cozy_ref job or owner-day.yml",
+        )?;
         let home = Self::new()?;
         home.write_config(&format!(
             "hub = \"ci\"\n[hubs]\nci = \"{}\"\n",
@@ -78,7 +94,7 @@ impl Home {
         let log = std::env::var("TENSORHUB_LOG").expect("the Tensorhub's log");
         let hub = cozy_proto::config::Hub {
             name: Some("ci".into()),
-            origin: cozy_proto::config::origin(&url).unwrap(),
+            origin: cozy_proto::config::Origin::parse(&url).unwrap(),
         };
         let home = cozy_platform::paths::Home::at(self.root());
         let name = email.split('@').next().unwrap().to_owned();
@@ -120,6 +136,26 @@ impl Home {
 
     pub fn config(&self) -> String {
         std::fs::read_to_string(self.config_path()).unwrap_or_default()
+    }
+
+    /// Points this home at its Hub's listen address (`TENSORHUB_URL`, plain HTTP on loopback)
+    /// instead of its public origin, as a laptop names its local Hub, keeping the device key it
+    /// signed in with. Answers that address.
+    pub fn at_listen_address(&self) -> String {
+        let listen = std::env::var("TENSORHUB_URL").expect("the Tensorhub's listen address");
+        let public = std::env::var("TENSORHUB_ORIGIN").expect("a Tensorhub");
+        std::fs::copy(self.device_key(&public), self.device_key(&listen)).unwrap();
+        self.write_config(&format!("hub = \"ci\"\n[hubs]\nci = \"{listen}\"\n"));
+        listen
+    }
+
+    /// Where `cozy` keeps this home's device key for the Hub at `url`.
+    pub fn device_key(&self, url: &str) -> PathBuf {
+        let hub = cozy_proto::config::Hub {
+            name: None,
+            origin: cozy_proto::config::Origin::parse(url).unwrap(),
+        };
+        hub.device_key(&cozy_platform::paths::Home::at(self.root()))
     }
 
     /// `cozy` with this home, no inherited credentials and no user service manager: a Calcifer

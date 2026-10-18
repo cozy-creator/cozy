@@ -1,31 +1,34 @@
 //! Materialize verified package carriers and call the trusted Python/uv installer.
 //! The service commits actor/installation aliases in its one execution journal.
 use super::workspaces::{RootSet, UploadedPackage};
+use cozy_platform::durable::Mode;
 use fs2::FileExt;
 use serde::Deserialize;
 use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
-    os::unix::{
-        fs::{OpenOptionsExt, PermissionsExt},
-        process::CommandExt,
-    },
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::Arc,
 };
 use tensorfs_core::transport::PullCancellation;
-use tonic::Status;
+use cozy_proto::error::Error;
+use crate::triage::masked;
 
 #[derive(Clone)]
 pub struct InstallerConfig {
     pub helper_python: PathBuf,
+    /// The engine whose helper `helper_python` is, made at the first install that needs it.
+    pub helper_engine: Option<PathBuf>,
     pub python: String,
     pub generations: PathBuf,
     pub client_wheel: PathBuf,
     pub staging_root: PathBuf,
     /// The machine's own Runtime/TensorFS wheels: a local package runs this pair too.
     pub sdk: Vec<PathBuf>,
+    /// The development Runtime an update named (`--runtime-wheel`, `PackageSdk::runtime_build`):
+    /// it runs a local package whatever the package's own bounds on the pair, as a release.
+    pub runtime_build: String,
     /// The machine's uv (`machine::client::uv`): the helper runs it, whatever PATH the machine had.
     pub uv: PathBuf,
     /// An image's baked uv cache: local environments symlink into it as published ones do, so
@@ -70,11 +73,11 @@ impl Drop for MaterializedPackage {
 pub fn materialize_uploaded(
     uploaded: &UploadedPackage,
     staging: &Path,
-) -> Result<MaterializedPackage, Status> {
+) -> Result<MaterializedPackage, Error> {
     fs::create_dir_all(staging).map_err(storage)?;
     let root = staging.join(uuid::Uuid::new_v4().to_string());
     fs::create_dir(&root).map_err(storage)?;
-    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).map_err(storage)?;
+    cozy_platform::durable::set_mode(&root, 0o700).map_err(std::io::Error::from).map_err(storage)?;
     let hold = OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -106,7 +109,7 @@ pub fn materialize_uploaded(
                     || !(entry.header().entry_type().is_file()
                         || entry.header().entry_type().is_dir())
                 {
-                    return Err(Status::failed_precondition(
+                    return Err(Error::conflict("precondition_failed",
                         "unsafe source archive member during materialization",
                     ));
                 }
@@ -117,30 +120,17 @@ pub fn materialize_uploaded(
                 }
                 fs::create_dir_all(target.parent().expect("source member parent"))
                     .map_err(storage)?;
-                let mut output = OpenOptions::new()
-                    .create_new(true)
-                    .write(true)
-                    .mode(0o600)
-                    .custom_flags(libc::O_NOFOLLOW)
-                    .open(&target)
+                let mut output = cozy_platform::durable::open_nofollow(&target, OpenOptions::new().create_new(true).write(true).mode(0o600)).map_err(std::io::Error::from)
                     .map_err(storage)?;
                 std::io::copy(&mut entry, &mut output).map_err(storage)?;
                 output.sync_all().map_err(storage)?;
-                fs::set_permissions(
-                    &target,
-                    fs::Permissions::from_mode(entry.header().mode().map_err(storage)? & 0o777),
-                )
+                cozy_platform::durable::set_mode(&target, entry.header().mode().map_err(storage)? & 0o777).map_err(std::io::Error::from)
                 .map_err(storage)?;
             }
             materialized.project = Some(project);
         } else {
             let path = materialized.root.join(&carrier.filename);
-            let mut output = OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW)
-                .open(&path)
+            let mut output = cozy_platform::durable::open_nofollow(&path, OpenOptions::new().create_new(true).write(true).mode(0o600)).map_err(std::io::Error::from)
                 .map_err(storage)?;
             std::io::copy(&mut { file }, &mut output).map_err(storage)?;
             output.sync_all().map_err(storage)?;
@@ -167,7 +157,7 @@ pub fn prepare_uploaded(
     config: &InstallerConfig,
     uploaded: &UploadedPackage,
     stop: Option<&PullCancellation>,
-) -> Result<PreparedGeneration, Status> {
+) -> Result<PreparedGeneration, Error> {
     let materialized = materialize_uploaded(uploaded, &config.staging_root)?;
     let mut command = installer(config, &materialized.root_set)?;
     if let Some(project) = &materialized.project {
@@ -194,7 +184,7 @@ pub fn prepare_editable(
     indexes: &std::collections::BTreeMap<String, String>,
     source_digest: &str,
     stop: Option<&PullCancellation>,
-) -> Result<PreparedGeneration, Status> {
+) -> Result<PreparedGeneration, Error> {
     let mut command = installer(config, root)?;
     command.arg("--project").arg(project).arg("--editable-environment").arg(environment);
     command.arg("--source-digest").arg(source_digest);
@@ -209,7 +199,7 @@ pub fn prepare_editable(
 
 /// The trusted helper's command for one package: this machine's interpreter, SDK pair,
 /// description client and generations, and what the package declares of itself.
-fn installer(config: &InstallerConfig, root: &RootSet) -> Result<Command, Status> {
+fn installer(config: &InstallerConfig, root: &RootSet) -> Result<Command, Error> {
     let captured_python = &root.python_version;
     let python = if !captured_python.is_empty() {
         let parts: Vec<_> = captured_python.split('.').collect();
@@ -218,7 +208,7 @@ fn installer(config: &InstallerConfig, root: &RootSet) -> Result<Command, Status
                 .iter()
                 .any(|part| part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()))
         {
-            return Err(Status::invalid_argument(
+            return Err(Error::validation("invalid_request",
                 "captured Python selection must be a numeric major.minor[.patch]",
             ));
         }
@@ -226,6 +216,10 @@ fn installer(config: &InstallerConfig, root: &RootSet) -> Result<Command, Status
     } else {
         &config.python
     };
+    if let Some(engine) = &config.helper_engine {
+        crate::machine::client::helper(engine, &config.uv, &config.client_wheel)
+            .map_err(|e| Error::unavailable("unavailable", format!("the installer helper: {e}")))?;
+    }
     let mut command = Command::new(&config.helper_python);
     cozy_platform::process::inherit_nothing(&mut command);
     // The uploaded build backend runs here: it gets the machine's environment without
@@ -250,6 +244,7 @@ fn installer(config: &InstallerConfig, root: &RootSet) -> Result<Command, Status
                 .iter()
                 .flat_map(|wheel| [std::ffi::OsStr::new("--sdk-wheel"), wheel.as_os_str()]),
         )
+        .arg(format!("--runtime-build={}", config.runtime_build))
         .arg("--python")
         .arg(python)
         .arg("--distribution")
@@ -257,7 +252,7 @@ fn installer(config: &InstallerConfig, root: &RootSet) -> Result<Command, Status
         .arg("--release")
         .arg(&root.release)
         .arg("--callees")
-        .arg(serde_json::to_string(&root.callees).map_err(|error| Status::internal(error.to_string()))?)
+        .arg(serde_json::to_string(&root.callees).map_err(|error| Error::internal("internal", error.to_string()))?)
         .arg(format!("--python-requires={}", root.python_requires))
         .arg(format!("--python-version={}", root.python_version));
     Ok(command)
@@ -266,9 +261,8 @@ fn installer(config: &InstallerConfig, root: &RootSet) -> Result<Command, Status
 /// Run the helper to its exit and hold the generation it published. Its process group ends
 /// with its run's cancel (`stop`), or when it stops moving past its measured patience
 /// (`process::supervise`); a long install that moves is never killed.
-fn publish(config: &InstallerConfig, mut command: Command, stop: Option<&PullCancellation>) -> Result<PreparedGeneration, Status> {
-    let mut child = command
-        .process_group(0)
+fn publish(config: &InstallerConfig, mut command: Command, stop: Option<&PullCancellation>) -> Result<PreparedGeneration, Error> {
+    let mut child = cozy_platform::process::own_group(&mut command)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -285,13 +279,13 @@ fn publish(config: &InstallerConfig, mut command: Command, stop: Option<&PullCan
         Ok::<_, std::io::Error>(output)
     });
     let ended = crate::process::supervise(&mut child, stop, "the package installer", &|_| ()).map_err(storage)?;
-    let output = output.join().map_err(|_| Status::internal("installer output reader panicked"))?.map_err(storage)?;
+    let output = output.join().map_err(|_| Error::internal("internal", "installer output reader panicked"))?.map_err(storage)?;
     let exited = match ended {
         crate::process::Supervised::Exited(status) => status,
         crate::process::Supervised::Canceled => {
-            return Err(Status::cancelled("the run was canceled while its package installed"))
+            return Err(Error::conflict(crate::published::CANCELED, "the run was canceled while its package installed"))
         }
-        crate::process::Supervised::Wedged(verdict) => return Err(Status::aborted(verdict)),
+        crate::process::Supervised::Wedged(verdict) => return Err(Error::conflict("package_installation_stalled", verdict)),
     };
     let tail = tail.join().unwrap_or_default();
     if !exited.success() {
@@ -310,25 +304,25 @@ fn publish(config: &InstallerConfig, mut command: Command, stop: Option<&PullCan
             None => format!("package_installation_failed: the trusted Python/uv installer stopped ({exited}):\n{tail}"),
         };
         return Err(match failure {
-            Some(f) if f.code.ends_with("_unsupported") => Status::unimplemented(message),
-            _ => Status::failed_precondition(message),
+            Some(f) if f.code.ends_with("_unsupported") => Error::not_found("capability_unavailable", message),
+            _ => Error::conflict("precondition_failed", message),
         });
     }
     if output.len() > 8 << 20 {
-        return Err(Status::resource_exhausted(
+        return Err(Error::capacity("exhausted",
             "prepared package interface exceeds its control-record bound",
         ));
     }
     let returned: GenerationRecord = serde_json::from_slice(&output)
-        .map_err(|_| Status::data_loss("installer returned an invalid typed generation record"))?;
-    let generations = config.generations.canonicalize().map_err(storage)?;
+        .map_err(|_| Error::internal("custody_corrupt", "installer returned an invalid typed generation record"))?;
+    let generations = cozy_platform::durable::canonical(&config.generations).map_err(std::io::Error::from).map_err(storage)?;
     if returned.identity.len() != 32
         || !returned
             .identity
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
     {
-        return Err(Status::data_loss(
+        return Err(Error::internal("custody_corrupt",
             "installer returned an invalid native generation identity",
         ));
     }
@@ -338,30 +332,24 @@ fn publish(config: &InstallerConfig, mut command: Command, stop: Option<&PullCan
         .map_err(storage)?
         .file_type()
         .is_symlink()
-        || directory.canonicalize().map_err(storage)? != directory
+        || cozy_platform::durable::canonical(&directory).map_err(std::io::Error::from).map_err(storage)? != directory
     {
-        return Err(Status::data_loss(
+        return Err(Error::internal("custody_corrupt",
             "published generation path is not an owned native directory",
         ));
     }
-    let hold = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(directory.join(".hold"))
+    let hold = cozy_platform::durable::open_nofollow(&directory.join(".hold"), OpenOptions::new().read(true)).map_err(std::io::Error::from)
         .map_err(storage)?;
     hold.lock_shared().map_err(storage)?;
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(directory.join("generation.json"))
+    let file = cozy_platform::durable::open_nofollow(&directory.join("generation.json"), OpenOptions::new().read(true)).map_err(std::io::Error::from)
         .map_err(storage)?;
     let record: GenerationRecord = serde_json::from_reader(file.take(8 << 20))
-        .map_err(|_| Status::data_loss("published generation manifest is invalid"))?;
+        .map_err(|_| Error::internal("custody_corrupt", "published generation manifest is invalid"))?;
     if record.identity != returned.identity
         || record.python != cozy_platform::paths::venv_python(&directory.join("env"))
         || !record.python.is_file()
     {
-        return Err(Status::data_loss(
+        return Err(Error::internal("custody_corrupt",
             "published generation does not name its native interpreter",
         ));
     }
@@ -372,8 +360,8 @@ fn publish(config: &InstallerConfig, mut command: Command, stop: Option<&PullCan
         hold: Arc::new(hold),
     })
 }
-fn storage(error: std::io::Error) -> Status {
-    Status::unavailable(format!(
+fn storage(error: std::io::Error) -> Error {
+    Error::unavailable("unavailable", format!(
         "package installation storage/process unavailable: {error}"
     ))
 }
@@ -412,23 +400,6 @@ pub(crate) fn stderr_tail(stderr: &[u8]) -> String {
     masked(String::from_utf8_lossy(tail).trim())
 }
 
-/// `scheme://user:secret@host` becomes `scheme://***@host`.
-fn masked(text: &str) -> String {
-    let (mut out, mut rest) = (String::new(), text);
-    while let Some(at) = rest.find("://") {
-        let (head, after) = rest.split_at(at + 3);
-        out.push_str(head);
-        let authority = after.find(|c: char| c.is_whitespace() || c == '/').unwrap_or(after.len());
-        rest = match after[..authority].rfind('@') {
-            Some(user) => {
-                out.push_str("***");
-                &after[user..]
-            }
-            None => after,
-        };
-    }
-    out + rest
-}
 
 /// The helper's PATH: the machine's uv's directory first, then the machine's own PATH. The helper
 /// calls `uv` by name, and a machine started with no PATH still installs local packages.
@@ -440,7 +411,8 @@ fn helper_path(uv: &Path) -> std::ffi::OsString {
         .into_iter()
         .collect();
     dirs.extend(
-        std::env::var_os("PATH")
+        cozy_proto::config::environment()
+            .get("PATH")
             .iter()
             .flat_map(std::env::split_paths),
     );
@@ -463,6 +435,7 @@ mod tests {
     fn a_failed_install_quotes_the_installers_stderr_tail() {
         let config = super::InstallerConfig {
             helper_python: "python3".into(),
+            helper_engine: None,
             python: "3.12".into(),
             generations: std::env::temp_dir(),
             client_wheel: Default::default(),
@@ -470,12 +443,13 @@ mod tests {
             sdk: vec![],
             uv: "uv".into(),
             seed_cache: None,
+            runtime_build: String::new(),
         };
         let mut helper = std::process::Command::new("sh");
         helper.args(["-c", r#"echo '{"kind":"install_failed","code":"package_dependency_operation_failed","detail":"uv pip install"}'
             i=0; while [ $i -lt 40 ]; do echo "  uv line $i https://user:tok@hub.example/simple" >&2; i=$((i+1)); done; exit 1"#]);
         let refused = super::publish(&config, helper, None).err().expect("the helper failed");
-        let message = refused.message();
+        let message = &refused.message;
         assert!(message.starts_with("package_dependency_operation_failed: uv pip install:\nuv line 0 "), "{message}");
         assert!(message.ends_with("uv line 39 https://***@hub.example/simple") && message.lines().count() == 41, "{message}");
 
@@ -488,12 +462,10 @@ mod tests {
 
     #[test]
     fn the_helper_finds_the_machines_uv_first() {
-        let path = super::helper_path(std::path::Path::new("/machine/usr/local/bin/uv"));
+        let uv = crate::machine::client::uv(&std::env::temp_dir().join("machine"));
+        let path = super::helper_path(&uv);
         let first = std::env::split_paths(&path).next();
-        assert_eq!(
-            first.as_deref(),
-            Some(std::path::Path::new("/machine/usr/local/bin"))
-        );
+        assert_eq!(first.as_deref(), uv.parent());
         // A bare `uv` (no root copy) leaves the machine's own PATH as it is.
         assert_eq!(
             super::helper_path(std::path::Path::new("uv")),
