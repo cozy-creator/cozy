@@ -224,7 +224,7 @@ pub struct Encoding {
     pub params: Metadata,
 }
 
-/// `int8.convrot {block: 256, rotation: hadamard, scale: per_row, ...}`: params in key order.
+/// `nvfp4 {block_size: 16, global_scale: "multiply", ...}`: params in key order.
 impl std::fmt::Display for Encoding {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(f, "{} {}", self.scheme, Value::Map(self.params.clone()))
@@ -253,6 +253,14 @@ impl Header {
             metadata,
             index: HashMap::new(),
         };
+        // rooms[i]: the bytes of chunks[i..].
+        let mut rooms: Vec<u128> = header.chunks.iter().rev()
+            .scan(0u128, |sum, c| {
+                *sum += c.length as u128;
+                Some(*sum)
+            })
+            .collect();
+        rooms.reverse();
         for (ci, component) in components.iter().enumerate() {
             let name = &component.name;
             if !segment(name) {
@@ -268,27 +276,23 @@ impl Header {
                         "component {name:?}: tensor key {key:?} is empty or repeated"
                     ));
                 }
-                let at = |what: &str| format!("{name}/{key}{what}");
                 match &t.body {
-                    Body::Data(loc) => header.check(loc, &t.dtype, &t.shape, &at(""))?,
+                    Body::Data(loc) => {
+                        header.check(&rooms, loc, &t.dtype, &t.shape, || format!("{name}/{key}"))?
+                    }
                     Body::Encoded { encoding, parts } => {
                         if encoding.scheme.is_empty() || parts.is_empty() {
-                            return invalid(format!("{}: no scheme or no parts", at("")));
+                            return invalid(format!("{name}/{key}: no scheme or no parts"));
                         }
                         for (i, p) in parts.iter().enumerate() {
                             let role = &p.role;
                             if role.is_empty() || parts[..i].iter().any(|o| &o.role == role) {
                                 return invalid(format!(
-                                    "{}: part role {role:?} is empty or repeated",
-                                    at("")
+                                    "{name}/{key}: part role {role:?} is empty or repeated"
                                 ));
                             }
-                            header.check(
-                                &p.at(),
-                                &p.dtype,
-                                &p.shape,
-                                &at(&format!(" part {role}")),
-                            )?;
+                            let what = || format!("{name}/{key} part {role}");
+                            header.check(&rooms, &p.at(), &p.dtype, &p.shape, what)?;
                         }
                     }
                 }
@@ -406,20 +410,30 @@ impl Header {
         }
     }
 
-    /// Sizes known dtypes; an unknown dtype's `length` stands as written.
-    fn check(&self, at: &Location, dtype: &Dtype, shape: &[u64], what: &str) -> Result<()> {
+    /// Sizes known dtypes; an unknown dtype's `length` stands as written. `rooms[i]` is the
+    /// bytes of `chunks[i..]`.
+    fn check(
+        &self,
+        rooms: &[u128],
+        at: &Location,
+        dtype: &Dtype,
+        shape: &[u64],
+        what: impl Fn() -> String,
+    ) -> Result<()> {
         match (dtype.bits(), dtype.byte_len(shape)) {
             (None, _) => {}
             (_, Some(n)) if n == at.length => {}
             (_, Some(n)) => {
                 return invalid(format!(
-                    "{what}: length {} but {dtype} {shape:?} is {n} bytes",
+                    "{}: length {} but {dtype} {shape:?} is {n} bytes",
+                    what(),
                     at.length
                 ))
             }
             (_, None) => {
                 return invalid(format!(
-                    "{what}: {dtype} {shape:?} overflows or is not whole bytes"
+                    "{}: {dtype} {shape:?} overflows or is not whole bytes",
+                    what()
                 ))
             }
         }
@@ -428,22 +442,22 @@ impl Header {
         }
         let Some(first) = self.chunks.get(at.chunk as usize) else {
             return invalid(format!(
-                "{what}: chunk {} of {}",
+                "{}: chunk {} of {}",
+                what(),
                 at.chunk,
                 self.chunks.len()
             ));
         };
-        let room: u128 = self.chunks[at.chunk as usize..]
-            .iter()
-            .map(|c| c.length as u128)
-            .sum();
         if at.offset % ALIGN != 0 {
-            return invalid(format!("{what}: offset {} is not 4 KiB aligned", at.offset));
+            return invalid(format!("{}: offset {} is not 4 KiB aligned", what(), at.offset));
         }
+        let room = rooms[at.chunk as usize];
         if at.offset >= first.length || at.offset as u128 + at.length as u128 > room {
             return invalid(format!(
-                "{what}: bytes {}+{} run past the chunks",
-                at.offset, at.length
+                "{}: bytes {}+{} run past the chunks",
+                what(),
+                at.offset,
+                at.length
             ));
         }
         Ok(())

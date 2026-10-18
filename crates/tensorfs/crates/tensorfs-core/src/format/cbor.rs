@@ -8,8 +8,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::{
-    check_format, invalid, Body, Error, Component, Dtype, Encoding, Header, Location, Metadata,
-    ObjectRef, Part, Result, Tensor, Value, HEADER_FORMAT,
+    Body, Component, Dtype, Encoding, Error, HEADER_FORMAT, Header, Location, Metadata, ObjectRef,
+    Part, Result, Tensor, Value, check_format, invalid,
 };
 
 /// The deepest nesting a value may use.
@@ -158,6 +158,14 @@ pub(crate) fn write(h: &Header) -> Result<Vec<u8>> {
     Ok(w.0)
 }
 
+fn hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let digits = bytes
+        .iter()
+        .flat_map(|b| [DIGITS[(b >> 4) as usize], DIGITS[(b & 15) as usize]]);
+    String::from_utf8(digits.collect()).expect("hex is ASCII")
+}
+
 /// A lowercase hex digit's value ([`ObjectRef`] holds only those).
 fn nibble(c: u8) -> u8 {
     match c {
@@ -193,7 +201,7 @@ impl<'a> Reader<'a> {
             0xf7 => return invalid(format!("undefined at byte {at}")),
             0xf9..=0xfb => return invalid(format!("a float at byte {at}")),
             _ if major == SIMPLE => {
-                return invalid(format!("simple value {first:#x} at byte {at}"))
+                return invalid(format!("simple value {first:#x} at byte {at}"));
             }
             _ if major == 6 => return invalid(format!("a tag at byte {at}")),
             _ => {}
@@ -267,7 +275,7 @@ impl<'a> Reader<'a> {
                     }
                 }
                 (NINT, n) if n > i64::MAX as u64 => {
-                    return invalid(format!("an integer below -2^63 at byte {at}"))
+                    return invalid(format!("an integer below -2^63 at byte {at}"));
                 }
                 _ => {}
             }
@@ -313,7 +321,11 @@ impl<'a> Reader<'a> {
                 self.at = at;
                 Value::Str(self.text("a string")?.to_owned())
             }
-            ARRAY => Value::List((0..n).map(|_| self.value(depth + 1)).collect::<Result<_>>()?),
+            ARRAY => Value::List(
+                (0..n)
+                    .map(|_| self.value(depth + 1))
+                    .collect::<Result<_>>()?,
+            ),
             MAP => {
                 self.at = at;
                 Value::Map(self.map(depth)?)
@@ -385,7 +397,7 @@ fn parse(bytes: &[u8]) -> Result<Header> {
         if sha != 32 {
             return invalid(format!("a chunk's sha256 is {sha} bytes"));
         }
-        let sha256 = r.take(32)?.iter().map(|b| format!("{b:02x}")).collect();
+        let sha256 = hex(r.take(32)?);
         let length = r.uint("a chunk's length")?;
         r.skip(fields, 2)?;
         chunks.push(ObjectRef { sha256, length });
@@ -419,7 +431,10 @@ fn parse(bytes: &[u8]) -> Result<Header> {
         components.push(Component { name, tensors });
     }
     if cited != encodings.len() {
-        return invalid(format!("{cited} of {} encodings are cited", encodings.len()));
+        return invalid(format!(
+            "{cited} of {} encodings are cited",
+            encodings.len()
+        ));
     }
     let metadata: Metadata = r.map(0)?;
     r.skip(more, 1)?;
@@ -440,7 +455,10 @@ fn tensor(r: &mut Reader, encodings: &[Encoding], cited: &mut usize) -> Result<T
         i => {
             let i = usize::try_from(i - 1).unwrap_or(usize::MAX);
             if i > *cited || i >= encodings.len() {
-                return invalid(format!("{key}: encoding {} is out of range or order", i + 1));
+                return invalid(format!(
+                    "{key}: encoding {} is out of range or order",
+                    i + 1
+                ));
             }
             *cited = (*cited).max(i + 1);
             let n = r.list("parts")?;
@@ -453,11 +471,26 @@ fn tensor(r: &mut Reader, encodings: &[Encoding], cited: &mut usize) -> Result<T
                 let at = r.location()?;
                 r.skip(more, 4)?;
                 let (chunk, offset, length) = (at.chunk, at.offset, at.length);
-                parts.push(Part { role, dtype, shape, chunk, offset, length });
+                parts.push(Part {
+                    role,
+                    dtype,
+                    shape,
+                    chunk,
+                    offset,
+                    length,
+                });
             }
-            Body::Encoded { encoding: encodings[i].clone(), parts }
+            Body::Encoded {
+                encoding: encodings[i].clone(),
+                parts,
+            }
         }
     };
     r.skip(fields, 3)?;
-    Ok(Tensor { key, dtype, shape, body })
+    Ok(Tensor {
+        key,
+        dtype,
+        shape,
+        body,
+    })
 }
