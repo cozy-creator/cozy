@@ -186,6 +186,12 @@ pub fn added_on(
     machine
 }
 
+/// A TensorD added as `name` without the job's named Runtime: the software a machine has before
+/// any update, for a test of what an update to the Hub's target does.
+pub fn added_unupdated(home: &super::Home, name: &str) -> Tensord {
+    joined(home, name, None, &[])
+}
+
 /// A TensorD that `home`'s Calcifer added as `name`.
 fn joined(home: &super::Home, name: &str, port: Option<u16>, env: &[(&str, &str)]) -> Tensord {
     let mut machine = Tensord::start_on(port, &[stranger()], env);
