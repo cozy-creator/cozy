@@ -83,8 +83,8 @@ struct Installed {
     interface: serde_json::Value,
 }
 
-/// A warm run naming the release (none: the machine reads the Hub's newest, unless it holds one)
-/// and no function: the package environment only, no weights.
+/// A warm run naming the release (none: the Hub's newest, as `cozy run` takes it) and no
+/// function: the package environment only, no weights.
 pub async fn install(
     ctx: &Context,
     package: &PackageRef,
@@ -92,21 +92,15 @@ pub async fn install(
     detach: bool,
 ) -> Result<ExitCode, Error> {
     let hub = ctx.hub()?;
-    let wanted = release(
-        &package.package(),
-        package.release.as_deref().unwrap_or_default(),
-    );
-    let warm = spec(v1::RunKind::Warm, wanted, String::new());
-    let submitted = submit(
-        ctx,
-        on,
-        &hub.origin,
-        calcifer::Kind::Warm,
-        package.to_string(),
-        warm,
-    )
-    .await?;
-    installed(ctx, submitted, &package.package(), detach).await
+    let name = package.package();
+    let chosen = match &package.release {
+        Some(chosen) => chosen.clone(),
+        None => run::latest(ctx, &hub, &name).await?,
+    };
+    let warm = spec(v1::RunKind::Warm, release(&name, &chosen), String::new());
+    let target = format!("{name}@{chosen}");
+    let submitted = submit(ctx, on, &hub.origin, calcifer::Kind::Warm, target, warm).await?;
+    installed(ctx, submitted, &name, detach).await
 }
 
 /// A directory or a PEP 723 script, installed live: the next run reads its files as they are
@@ -160,6 +154,19 @@ async fn installed(
             ctx,
             &format!("{package}@{} is installed on {machine}", installed.release),
         );
+        if !package.starts_with("local/") {
+            let on = On::Machine(machine.clone());
+            let held = machines(ctx, Some(&on)).await?.remove(0);
+            let older: Vec<&str> = (environments(ctx, &held)?.into_iter())
+                .filter(|env| env.package == package && env.release != installed.release)
+                .map(|env| env.release.as_str())
+                .collect();
+            if !older.is_empty() {
+                let older = older.join(", ");
+                output::say(ctx, &format!("{machine} also holds {package}@{older}"));
+                next.insert(0, format!("cozy package update {package} --on {machine}"));
+            }
+        }
         let first = run::interface::Interface::parse(&installed.interface)
             .ok()
             .and_then(|interface| interface.public().first().map(|name| name.to_string()));

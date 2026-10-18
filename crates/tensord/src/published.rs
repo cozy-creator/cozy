@@ -647,22 +647,26 @@ impl Publisher {
         if let Some(installed) = &request.installed {
             return Ok(installed.alias.clone());
         }
-        let release = match request.release.is_empty() {
-            true => service.engine.with_journal(|j| j.named(&newest_key(request), &request.catalog_revision))?.unwrap_or_default(),
-            false => request.release.clone(),
+        let release = match (request.release.is_empty(), request.catalog_revision.is_empty()) {
+            (true, false) => service.engine.with_journal(|j| j.named(&newest_key(request), &request.catalog_revision))?.unwrap_or_default(),
+            _ => request.release.clone(),
         };
         Ok(self.release_alias(request, &release))
     }
 
     /// The Hub's newest release of the request's package, journaled per catalog revision as a
-    /// model's name is (`resolve`): a moved revision asks once more.
+    /// model's name is (`resolve`): a moved revision asks once more. No revision names no catalog
+    /// state, so that ask is the Hub's every time: kept, its first answer would stand forever.
     fn newest(&self, service: &Service, request: &Request, catalog: &Catalog, org: &str, name: &str) -> Result<String, Failure> {
-        let key = newest_key(request);
-        if let Some(held) = service.engine.with_journal(|j| j.named(&key, &request.catalog_revision)).map_err(io_failure)? {
+        let (key, revision) = (newest_key(request), &request.catalog_revision);
+        if revision.is_empty() {
+            return newest_release(catalog, org, name);
+        }
+        if let Some(held) = service.engine.with_journal(|j| j.named(&key, revision)).map_err(io_failure)? {
             return Ok(held);
         }
         let release = newest_release(catalog, org, name)?;
-        service.engine.with_journal(|j| j.bind_named(&key, &request.catalog_revision, &release)).map_err(io_failure)?;
+        service.engine.with_journal(|j| j.bind_named(&key, revision, &release)).map_err(io_failure)?;
         Ok(release)
     }
 
