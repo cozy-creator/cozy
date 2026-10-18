@@ -256,7 +256,12 @@ impl Names {
                 }
                 None => component.clone(),
             };
-            let Some((table, renames, drop)) = table_keys(&name, &keys) else {
+            let Some(Fit {
+                table,
+                renames,
+                drop,
+            }) = table_keys(&name, &keys)
+            else {
                 continue;
             };
             if let Some((from, to)) = renames.first() {
@@ -324,12 +329,16 @@ fn canonical_component(component: &str, keys: &[&str]) -> Option<String> {
     }
 }
 
-/// The renames and drops that make `keys` a table component's canonical keys, when one fits:
-/// `(table, [(v1 key, v2 key)], [dropped key])`.
-fn table_keys(
-    component: &str,
-    keys: &[&str],
-) -> Option<(String, Vec<(String, String)>, Vec<String>)> {
+/// How a v1 component's keys become a table component's canonical keys.
+struct Fit {
+    table: String,
+    /// `(v1 key, v2 key)`.
+    renames: Vec<(String, String)>,
+    drop: Vec<String>,
+}
+
+/// The renames and drops that make `keys` a table component's canonical keys, when one fits.
+fn table_keys(component: &str, keys: &[&str]) -> Option<Fit> {
     for t in tables().iter().filter(|t| t.lora.is_none()) {
         let named = |c: &&crate::import::engine::Component| {
             c.name == component || c.folders.values().any(|f| f == component)
@@ -361,7 +370,11 @@ fn table_keys(
                 let renames = (missing.iter())
                     .map(|k| (k.to_string(), format!("{prefix}{k}")))
                     .collect();
-                return Some((t.name.clone(), renames, drop));
+                return Some(Fit {
+                    table: t.name.clone(),
+                    renames,
+                    drop,
+                });
             }
         }
     }
