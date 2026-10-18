@@ -114,3 +114,58 @@ fn packages_install_update_and_remove_on_a_machine() {
     assert_eq!(gone.code, 1, "{gone:?}");
     assert_eq!(gone.refusal()["code"], "package_not_installed", "{gone:?}");
 }
+
+/// A laptop names its local Hub where it listens, while machines read that Hub at its public
+/// origin and record their installations there (8819 recorded `https://cozy-e2e-6.ngrok.app:443`
+/// for the Hub this computer calls `http://127.0.0.1:8819`). The install is still the configured
+/// Hub's: listed under its name, and `update` reaches its object store with no sign-in at the
+/// public origin.
+#[test]
+fn an_install_recorded_at_the_hubs_public_origin_is_the_configured_hubs() {
+    let Some(home) = Home::with_hub() else { return };
+    home.sign_in("aliased@cozy.test");
+    let public = std::env::var("TENSORHUB_ORIGIN").unwrap();
+    home.at_listen_address();
+    std::fs::remove_file(home.device_key(&public)).unwrap();
+    let package = package::publish(&home, "tiny", "0.1.0");
+    let _machine = tensord::added(&home, "t1");
+    let dir = package::project(&home, "tiny");
+
+    let (code, last) = install(&home, &dir, &package);
+    assert_eq!(
+        (code, last["type"].as_str()),
+        (0, Some("run.completed")),
+        "{last}\n{}",
+        state(&home, &dir)
+    );
+    let scoped = ["package", "list", "--on", "t1", "--tensorhub", "ci"];
+    let listed = json(&home, &dir, &scoped);
+    let rows = listed["packages"].as_array().unwrap();
+    let row = rows.iter().find(|r| r["package"] == package.as_str());
+    assert_eq!(
+        row.map(|r| (r["release"].as_str(), r["hub"].as_str())),
+        Some((Some("0.1.0"), Some("ci"))),
+        "{listed}"
+    );
+
+    package::publish(&home, "tiny", "0.2.0");
+    let update = [
+        "package",
+        "update",
+        &package,
+        "--on",
+        "t1",
+        "--tensorhub",
+        "ci",
+    ];
+    let updated = json(&home, &dir, &update);
+    let row = &updated["packages"][0];
+    let moved = (row["to"].as_str(), row["status"].as_str());
+    assert_eq!(
+        moved,
+        (Some("0.2.0"), Some("updated")),
+        "{updated}\n{}",
+        state(&home, &dir)
+    );
+    assert_eq!(held(&home, &dir, &package), ["0.2.0"], "{updated}");
+}

@@ -181,7 +181,16 @@ impl Machines {
             && let Ok(Some(link)) = self.calcifer.link(&row.name)
         {
             match link.status().await {
-                Ok(frame) => self.observe(&row.name, frame),
+                Ok(frame) => {
+                    // A Hub its installations name that no configured Hub's facts read so far do.
+                    let unnamed = (frame.environments.iter())
+                        .filter_map(|env| config::Origin::parse(&env.hub).ok())
+                        .any(|hub| self.hubs.configured(&hub).is_none());
+                    if unnamed {
+                        self.hubs.learn().await;
+                    }
+                    self.observe(&row.name, frame);
+                }
                 Err(e) => self.unreachable(&row.name, e.to_string()),
             }
         }
@@ -411,7 +420,7 @@ impl Machines {
             machine.state = MachineState::Ending;
         }
         if let Some(seen) = lock(&self.seen).get(&row.name) {
-            machine.status = seen.frame.as_ref().map(status);
+            machine.status = seen.frame.as_ref().map(|frame| status(frame, &self.hubs));
             machine.unreachable.clone_from(&seen.unreachable);
             machine.boot.clone_from(&seen.boot);
         }
@@ -1007,7 +1016,7 @@ pub(crate) fn merge_warm(current: &mut Vec<v1::WarmItem>, spec: &mut v1::RunSpec
     *current = set.items.clone();
 }
 
-fn status(frame: &v1::StatusFrame) -> MachineStatus {
+fn status(frame: &v1::StatusFrame, hubs: &Hubs) -> MachineStatus {
     let level = |level: v1::WarmLevel| match level {
         v1::WarmLevel::Off => "",
         v1::WarmLevel::Installed => "installed",
@@ -1070,7 +1079,7 @@ fn status(frame: &v1::StatusFrame) -> MachineStatus {
                 installation: env.installation.clone(),
                 package: env.package.clone(),
                 release: env.release.clone(),
-                hub: env.hub.clone(),
+                hub: hubs.named(&env.hub),
                 level: env.level.clone(),
                 warning: env.warning.clone(),
             })
