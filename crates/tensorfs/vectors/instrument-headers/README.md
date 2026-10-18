@@ -18,6 +18,5 @@ Eval owns the remaining preparation: Qwen constructor rotary buffers and the 2B 
 output destination, Whisper F32-to-F16 conversion and its tied output destination,
 and all processor/tokenizer/model configuration. Those rules do not live here.
 
-Run `python3 scripts/rebank-instruments.py --tfs target/debug/tfs` and
-`cargo test -p tensorfs-core --test instrument_profiles -- --test-threads=1` to check
-the native bank, exact profile assignment/order and refused incomplete/foreign inputs.
+`cargo test -p tensorfs-core --test instrument_profiles -- --test-threads=1` checks the
+profile assignment/order and refused incomplete/foreign inputs.

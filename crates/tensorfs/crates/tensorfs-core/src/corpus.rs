@@ -9,7 +9,6 @@ use crate::err::{refuse, Code, Result};
 use crate::header::{Closure, Header};
 use crate::ids::{Doc, Plain};
 use crate::ingest::transaction::IngestSession;
-use crate::ingest::{IngestProfile, IngestSubject, IngestVerificationReceipt};
 use crate::manifest::Manifest;
 use crate::registry;
 use crate::spec::EncodingSpec;
@@ -32,11 +31,7 @@ pub const DOC_KINDS: &[&str] = &[
     "encoding",
     "vectors",
     "manifest",
-    "profile",
-    "subject",
     "session",
-    "receipt",
-    "stamp",
     "machine_capability",
 ];
 
@@ -71,14 +66,7 @@ pub fn run_doc(
         // A decode IS the path law now: `Manifest` cannot exist unvalidated, so
         // parsing is the whole check and there is no second validate() to forget.
         "manifest" => Manifest::parse(bytes).map(|m| (None, Some(m.manifest_id())))?,
-        "profile" => IngestProfile::parse(bytes).and_then(|p| {
-            p.validate(platform)?;
-            Ok((None, None))
-        })?,
-        "subject" => IngestSubject::parse(bytes).map(|_| (None, None))?,
         "session" => IngestSession::parse(bytes).map(|_| (None, None))?,
-        "receipt" => IngestVerificationReceipt::parse(bytes).map(|_| (None, None))?,
-        "stamp" => crate::ingest::stamp::Stamp::parse(bytes).map(|_| (None, None))?,
         "machine_capability" => {
             crate::machine::check_surface(doc, bytes)?;
             (None, None)

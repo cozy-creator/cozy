@@ -45,6 +45,8 @@ pub mod header;
 pub mod home;
 pub mod ids;
 #[cfg(feature = "store")]
+pub mod import;
+#[cfg(feature = "store")]
 pub mod ingest;
 pub mod jcs;
 pub mod limits;

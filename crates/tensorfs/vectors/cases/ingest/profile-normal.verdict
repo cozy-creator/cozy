@@ -1,4 +1,0 @@
-doc: profile
-expect: ok
-id: sha256:044946acd80c561843f08486824db0f07cd121cbfc24b168685b5ea99573907d
-note: normal profile over platform-aliased digests

@@ -13,8 +13,6 @@ use tensorfs_core::dtype::Dtype;
 use tensorfs_core::err::Refusal;
 use tensorfs_core::header::{Asset, Body, Closure, Header, Part, Tensor};
 use tensorfs_core::ids::{Doc, ObjectRef, Plain};
-use tensorfs_core::ingest::stamp::Stamp;
-use tensorfs_core::ingest::{Evidence, IngestProfile, IngestSubject, IngestVerificationReceipt};
 use tensorfs_core::manifest::{Draft, Entry, Manifest};
 use tensorfs_core::registry;
 use tensorfs_core::spec::EncodingSpec;
@@ -213,83 +211,6 @@ fn manifest_checkpoint(header: &Header, extra_file: bool) -> TfsResult<Manifest>
     Draft { entries }.seal()
 }
 
-fn profile_normal(allowed: Vec<ObjectRef>, dialect: &str) -> IngestProfile {
-    IngestProfile {
-        class: "normal".to_string(),
-        source_dialect: dialect.to_string(),
-        converter_build: tensorfs_core::ids::object_id(b"converter-build-v1"),
-        converter_recipe: ObjectRef::of(b"recipe"),
-        expected_tensor_schema_digest: tensorfs_core::ids::object_id(b"tensor-schema"),
-        allowed_encodings: allowed,
-        max_source_bytes: 1 << 40,
-        max_tensors: 100_000,
-    }
-}
-
-fn subject(profile: &IngestProfile, header: &Header, tenant: &str) -> TfsResult<IngestSubject> {
-    Ok(IngestSubject {
-        profile: profile.object_ref(),
-        tenant: tenant.to_string(),
-        sources: vec![(tensorfs_core::ids::object_id(b"hf://acme/model@rev1"), 1)],
-        proposed_header: header.object_ref()?,
-        candidates: vec![ObjectRef::of(b"candidate")],
-    })
-}
-
-/// The corpus twin of what `ingest::stamp::stamp` mints. The vector exists so the LEDGER's
-/// canonical bytes are frozen alongside the receipt that names them.
-fn stamp_doc(
-    prof: &IngestProfile,
-    sub: &IngestSubject,
-    snap: &Manifest,
-    header: &Header,
-) -> TfsResult<Stamp> {
-    Ok(Stamp {
-        subject: sub.object_ref(),
-        profile: prof.object_ref(),
-        header: header.object_ref()?,
-        manifest: snap.object_ref(),
-        tensor_schema_digest: header.tensor_schema_digest(),
-        converter_build: prof.converter_build.clone(),
-        converter_recipe: prof.converter_recipe.clone(),
-        candidate_set: tensorfs_core::ingest::stamp::candidate_set_digest(
-            &sub.candidates.iter().map(|c| c.id()).collect::<Vec<_>>(),
-        ),
-        golden: tensorfs_core::ingest::stamp::GOLDEN_PASS.to_string(),
-        isolation_tier: 1,
-        sources: sub.sources.clone(),
-        accounting: vec![
-            ("bytes_written".to_string(), 1 << 20),
-            ("tensors".to_string(), 2),
-        ],
-    })
-}
-
-fn receipt(
-    sub: &IngestSubject,
-    snap: &Manifest,
-    header: &Header,
-    stamp: &Stamp,
-    signer: &str,
-) -> TfsResult<IngestVerificationReceipt> {
-    Ok(IngestVerificationReceipt {
-        subject: sub.object_ref(),
-        manifest: snap.object_ref(),
-        header: header.object_ref()?,
-        stamp: stamp.object_ref(),
-        evidence: Evidence::ApprovedProducer {
-            implementation: tensorfs_core::ids::object_id(b"converter-impl"),
-            recipe: ObjectRef::of(b"recipe"),
-        },
-        signer: signer.to_string(),
-        signature: "ed25519:AAAA".to_string(),
-        observations: vec![
-            ("source_bytes".to_string(), 1 << 20),
-            ("tensors".to_string(), 2),
-        ],
-    })
-}
-
 // ------------------------------------------------------------------ vector files
 
 struct Case {
@@ -357,7 +278,6 @@ fn build_corpus() -> TfsResult<(Vec<Case>, Vec<EncodingSpec>)> {
     let ha_bytes = ha.conformance_bytes()?;
     let (hn, _) = header_nvfp4();
     let plain = seed_spec("plain/1", 0);
-    let fp8 = seed_spec("fp8-rowwise/1", 0);
     let svdq = seed_spec("svdq-microscale/1", 0);
     // the corpus closure ships the WHOLE platform namespace, not only the cited specs
     let mut specs: Vec<EncodingSpec> = registry::seeds().into_iter().map(|s| s.spec).collect();
@@ -470,42 +390,6 @@ fn build_corpus() -> TfsResult<(Vec<Case>, Vec<EncodingSpec>)> {
         "manifest",
         snap2.canonical_bytes(),
         "one more sibling file: new manifest_id, same header id",
-    ));
-
-    let prof = profile_normal(
-        vec![plain.object_ref(), fp8.object_ref()],
-        "safetensors.diffusers",
-    );
-    let sub_doc = subject(&prof, &ha, "acme")?;
-    let stmp = stamp_doc(&prof, &sub_doc, &snap, &ha)?;
-    let rcpt = receipt(&sub_doc, &snap, &ha, &stmp, "platform-key-1")?;
-    cases.push(ok_case(
-        "ingest",
-        "profile-normal",
-        "profile",
-        prof.canonical_bytes(),
-        "normal profile over platform-aliased digests",
-    ));
-    cases.push(ok_case(
-        "ingest",
-        "subject",
-        "subject",
-        sub_doc.canonical_bytes(),
-        "tenant + exact source generations",
-    ));
-    cases.push(ok_case(
-        "ingest",
-        "stamp",
-        "stamp",
-        stmp.canonical_bytes(),
-        "the verified ledger: tensor schema, candidate set, converter, golden, accounting",
-    ));
-    cases.push(ok_case(
-        "ingest",
-        "receipt",
-        "receipt",
-        rcpt.canonical_bytes(),
-        "one evidence arm; signer in the envelope; binds its stamp",
     ));
 
     // --- the two request-time machine results retained by TensorFS.
@@ -1111,41 +995,6 @@ fn build_corpus() -> TfsResult<(Vec<Case>, Vec<EncodingSpec>)> {
         "KEY_GRAMMAR",
         "a session id is an ASCII name, never free text",
     ));
-    let refused_dialect = profile_normal(vec![plain.object_ref()], "pickle");
-    cases.push(red_case(
-        g,
-        "pickle-normal-profile",
-        "profile",
-        refused_dialect.canonical_bytes(),
-        "PICKLE_REFUSED",
-        "pickle always refuses normal ingest",
-    ));
-    let foreign = profile_normal(
-        vec![ObjectRef::of(b"a spec the platform never aliased")],
-        "safetensors.diffusers",
-    );
-    cases.push(red_case(
-        g,
-        "unregistered-encoding",
-        "profile",
-        foreign.canonical_bytes(),
-        "UNREGISTERED_ENCODING",
-        "launch border admits platform-aliased digests only",
-    ));
-    let two_arms = sub(
-        &rcpt.canonical_bytes(),
-        "\"evidence\":[",
-        "\"evidence\":[{\"report\":{\"length\":6,\"sha256\":\"0000000000000000000000000000000000000000000000000000000000000000\"},\"t\":\"independent_numerical\",\"verifier_build\":\"sha256:0000000000000000000000000000000000000000000000000000000000000000\"},",
-    );
-    cases.push(red_case(
-        g,
-        "two-evidence-arms",
-        "receipt",
-        two_arms,
-        "EVIDENCE_ARM_AMBIGUOUS",
-        "exactly one evidence arm",
-    ));
-
     // --- one-byte mutants of every positive
     let positives: Vec<(String, &'static str, Vec<u8>, String)> = cases
         .iter()
@@ -1446,28 +1295,6 @@ fn verify(dir: &Path) -> bool {
         "one more sibling file flips manifest_id only".into(),
         cpof("manifest/checkpoint") != cpof("manifest/checkpoint-extra-file"),
         cpof("manifest/checkpoint-extra-file"),
-    ));
-    let (cha, _) = header_a(Some(config_bytes()));
-    let csnap = ok!(manifest_checkpoint(&cha, false));
-    let cprof = profile_normal(
-        vec![seed_spec("plain/1", 0).object_ref()],
-        "safetensors.diffusers",
-    );
-    let csub = ok!(subject(&cprof, &cha, "acme"));
-    let cstamp = ok!(stamp_doc(&cprof, &csub, &csnap, &cha));
-    let crcpt = ok!(receipt(&csub, &csnap, &cha, &cstamp, "platform-key-1"));
-    cross.push((
-        "receipt binds its exact subject/manifest/header/stamp".into(),
-        crcpt.binds(&csub, &csnap, &cha, &cstamp).is_ok(),
-        String::new(),
-    ));
-    let other = ok!(subject(&cprof, &cha, "other-tenant"));
-    let replay = crcpt.binds(&other, &csnap, &cha, &cstamp);
-    cross.push((
-        "cross-subject replay refuses".into(),
-        replay.as_ref().err().map(|e| e.code)
-            == Some(tensorfs_core::err::Code::CROSS_SUBJECT_REPLAY),
-        replay.err().map(|e| e.detail).unwrap_or_default(),
     ));
     let seeds_match = registry::seeds()
         .iter()
