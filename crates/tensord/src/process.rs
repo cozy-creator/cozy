@@ -97,6 +97,18 @@ impl Pace {
     pub fn patience(&self, floor: Duration) -> Duration {
         (self.worst_pause * Self::STILL_FACTOR).max(floor)
     }
+    /// Why a canceled subject was killed: it did not stop within the patience its own pace
+    /// earned before the cancel.
+    pub fn ignored(&self, since: Duration, floor: Duration) -> String {
+        format!(
+            "it did not stop for its cancel in {:.1} s; its longest pause before the cancel was \
+             {:.1} s over {} advance(s), so it was given {:.1} s",
+            since.as_secs_f64(),
+            self.worst_pause.as_secs_f64(),
+            self.changes,
+            self.patience(floor).as_secs_f64()
+        )
+    }
     pub fn verdict(&self, still: Duration, floor: Duration) -> String {
         format!(
             "no measurable progress for {:.1} s; its longest earlier pause was {:.1} s over {} \
@@ -113,7 +125,7 @@ impl Pace {
 pub enum Meter {
     /// CPU plus bytes moved by the process (Runtime `ExecutorChild.watched`).
     Burn,
-    /// Frames of the running invocation, judged only after a cancel (Runtime `cancel_stall`).
+    /// Frames of the running invocation; a canceled one must stop within its pace's patience.
     Frames,
 }
 
@@ -150,6 +162,22 @@ impl Watch {
         let mut state = self.state.lock().unwrap();
         while !state.done {
             let now = Instant::now();
+            // Canceled, the subject must stop: frames it still sends, the machine serving it and
+            // its waits on other work no longer count as progress (run 11093 stayed canceling
+            // for two hours on them). Its patience is what its pace earned before the cancel.
+            if let Some(canceled) = state.canceled_at {
+                let since = now - canceled;
+                if since > pace.patience(floor) {
+                    let verdict = format!("canceled during {what}: {}", pace.ignored(since, floor));
+                    match exact.kill() {
+                        Ok(()) => state.killed = Some(verdict),
+                        Err(error) => tracing::warn!("{verdict}; kill failed: {error}"),
+                    }
+                    return;
+                }
+                state = self.changed.wait_timeout(state, liveness.sample).unwrap().0;
+                continue;
+            }
             let reading = match self.meter {
                 Meter::Burn => group_burn(exact.birth()),
                 Meter::Frames => Some(state.frames),
@@ -159,13 +187,8 @@ impl Watch {
                 pace.excuse(now);
             }
             state.worst_gap = pace.worst_pause;
-            let since = match self.meter {
-                Meter::Burn => pace.still_since(),
-                Meter::Frames => state
-                    .canceled_at
-                    .map(|at| pace.still_since().map_or(at, |moved| moved.max(at))),
-            };
-            if let Some(since) = since {
+            // Frames are judged only after a cancel (above); CPU and bytes always.
+            if let (Meter::Burn, Some(since)) = (self.meter, pace.still_since()) {
                 let still = now - since;
                 if still > pace.patience(floor) {
                     let verdict = format!("wedged during {what}: {}", pace.verdict(still, floor));
@@ -497,6 +520,48 @@ mod tests {
         assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGKILL));
         let killed = watching.finish().0.unwrap();
         assert!(killed.contains("wedged during run_job"), "{killed}");
+    }
+
+
+    /// A canceled call that keeps sending frames (or that the machine serves, or that waits on
+    /// other work) still has to stop: it is killed once its pace's patience after the cancel
+    /// is spent, with a verdict naming the cancel (run 11093).
+    #[test]
+    fn a_canceled_subject_is_killed_however_busy_it_looks() {
+        for excuse in ["frames", "serving", "waits"] {
+            let mut child = Command::new("/bin/sleep")
+                .arg("1000")
+                .process_group(0)
+                .stdin(Stdio::null())
+                .spawn()
+                .unwrap();
+            let birth = Birth::of(child.id()).unwrap();
+            let exact = Exact::open(&birth).unwrap().unwrap();
+            let liveness = Liveness { sample: Duration::from_millis(20) };
+            let waits: Option<Waits> = (excuse == "waits").then(|| Arc::new(|| true) as Waits);
+            let meter = if excuse == "waits" { Meter::Burn } else { Meter::Frames };
+            let watching = Watching::start(exact, meter, liveness, Duration::ZERO, waits, "invoke").unwrap();
+            let watch = watching.watch();
+            watch.serving(excuse == "serving");
+            let busy = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let frames = {
+                let (watch, busy) = (watch.clone(), busy.clone());
+                std::thread::spawn(move || {
+                    while busy.load(std::sync::atomic::Ordering::Acquire) {
+                        watch.frame();
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                })
+            };
+            std::thread::sleep(liveness.floor() * 2);
+            assert!(!birth.ended().unwrap(), "{excuse}: killed before any cancel");
+            watch.canceled();
+            assert_eq!(std::os::unix::process::ExitStatusExt::signal(&child.wait().unwrap()), Some(libc::SIGKILL), "{excuse}");
+            busy.store(false, std::sync::atomic::Ordering::Release);
+            frames.join().unwrap();
+            let killed = watching.finish().0.unwrap();
+            assert!(killed.contains("canceled during invoke: it did not stop for its cancel"), "{excuse}: {killed}");
+        }
     }
 
 }

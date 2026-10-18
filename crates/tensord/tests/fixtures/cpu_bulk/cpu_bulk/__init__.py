@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 
 import msgspec
 
@@ -58,3 +59,15 @@ async def devices(ctx: Context, *, payload: Which) -> Seen:
 
 
 app.entrypoint(devices)
+
+
+def stubborn(ctx: Context, *, payload: Which) -> Seen:
+    """Never stops for a cancel: its thread sleeps where no cancel reaches it, once it has
+    written its process id to `label`."""
+    with open(payload.label, "w") as file:
+        file.write(str(os.getpid()))
+    while True:
+        time.sleep(3600)
+
+
+app.entrypoint(stubborn)

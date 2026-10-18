@@ -1,5 +1,7 @@
-//! A call that constructs no model (a script) is given the GPUs it asks for, all in its one
-//! process; a count wider than the machine is refused by name.
+//! A machine's GPU lanes, on a runner whose envelope names two devices: a call that constructs
+//! no model (a script) is given the GPUs it asks for, all in its one process, and a count wider
+//! than the machine is refused by name; a call that ignores its cancel is killed once its
+//! patience is spent, ends CANCELED saying so, and its GPU serves the next run.
 use ed25519_dalek::{pkcs8::EncodePrivateKey, SigningKey};
 use std::{
     path::Path,
@@ -118,4 +120,47 @@ async fn a_script_holds_the_gpus_it_asks_for_in_its_one_process() {
     let three = run(&client, &manifest, "three", 3).await;
     let reason = three.reason.as_ref().map(|r| (r.code.as_str(), r.message.as_str()));
     assert!(three.status != "succeeded" && format!("{reason:?}").contains("gpu_count_unavailable"), "{three:?}");
+}
+
+#[tokio::test]
+async fn a_call_that_ignores_its_cancel_is_killed_and_its_gpu_serves_the_next_run() {
+    let home = tempfile::tempdir().unwrap();
+    let (_machine, client) = boot(home.path());
+    let manifest = tree(&client).await;
+    let pidfile = home.path().join("stubborn.pid");
+    let spec = v1::RunSpec {
+        kind: v1::RunKind::Call,
+        source: Some(v1::Source::Local(v1::LocalSource { manifest: manifest.clone() })),
+        entrypoint: "stubborn".into(),
+        payload: Some(v1::Json::parse(&serde_json::json!({"label": pidfile}).to_string()).unwrap()),
+        ..Default::default()
+    };
+    client.submit(&v1::RunRequest { id: "stuck".into(), spec }).await.unwrap();
+    let start = Instant::now();
+    let pid: i32 = loop {
+        if let Some(pid) = std::fs::read_to_string(&pidfile).ok().and_then(|text| text.trim().parse().ok()) {
+            break pid;
+        }
+        assert!(start.elapsed() < Duration::from_secs(600), "the stubborn call never started");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    client.cancel("stuck").await.unwrap();
+    let mut events = Box::pin(client.events("stuck", 0).await.unwrap());
+    let (mut lines, mut outcome) = (vec![], None);
+    while let Some(event) = events.next().await {
+        match event.unwrap().event {
+            v1::Event::Log(line) => lines.push(line.text),
+            v1::Event::Outcome(ended) => {
+                outcome = Some(ended);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let outcome = outcome.expect("an outcome");
+    assert_eq!(outcome.status, "canceled", "{outcome:?}");
+    assert!(lines.iter().any(|l| l.contains("it did not stop for its cancel")), "{lines:?}");
+    assert!(!Path::new(&format!("/proc/{pid}")).exists(), "the stubborn executor still runs");
+    // Its GPU is free: the next call takes it.
+    assert_eq!(devices(&run(&client, &manifest, "after", 0).await), "0");
 }
