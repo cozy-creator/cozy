@@ -144,16 +144,17 @@ def interpreter_for(python: str, python_requires: str, python_version: str) -> s
     return python
 
 
-def add_client(interpreter: Path, constraints: Path, client_wheel: Path) -> None:
+def add_client(interpreter: Path, constraints: Path, client_wheel: Path, runtime_build: str = "") -> None:
     """The machine client beside a selected closure: it may add its own dependencies only
-    without changing one already selected package or SDK version (uv reports any conflict)."""
+    without changing one already selected package or SDK version (uv reports any conflict). A
+    development Runtime's misses of the package's bounds on the pair are the operator's choice."""
     locked = inventory(interpreter)
     constraints.write_text("".join(f"{row.name}=={row.version}\n" for row in locked))
     subprocess.run(["uv", "pip", "install", *COPY, "--python", str(interpreter), "-c", str(constraints), str(client_wheel)], check=True)
     after = {canonicalize_name(row.name): row.version for row in inventory(interpreter)}
     if any(after.get(canonicalize_name(row.name)) != row.version for row in locked):
         raise PackageError("package_lock_changed", "client installation changed the captured dependency closure")
-    if found := sorted(conflicts(interpreter)):
+    if found := sorted(f for f in conflicts(interpreter) if not (runtime_build and pair_bound(f))):
         raise PackageError("package_dependency_conflict", "; ".join(found)[:2000])
 
 
@@ -229,7 +230,7 @@ def install_editable(*, project: Path, environment: Path, wheels: list[Path], di
 
         capture({canonicalize_name(wheel.name.split("-")[0]) for wheel in sdk})
         fallback = machine_sdk(interpreter, sdk, capture, runtime_build) if sdk else ""
-        add_client(interpreter, environment.parent / (environment.name + ".constraints.txt"), client_wheel)
+        add_client(interpreter, environment.parent / (environment.name + ".constraints.txt"), client_wheel, runtime_build)
         ready.write_text(fallback)
     generations.mkdir(parents=True, exist_ok=True)
     root = generations.resolve() / uuid.uuid4().hex
@@ -320,7 +321,7 @@ def install_captured(*, project: Path | None, wheels: list[Path], requirements: 
 
         capture()
         fallback = machine_sdk(interpreter, sdk, capture, runtime_build) if sdk else ""
-        add_client(interpreter, root / "captured-constraints.txt", client_wheel)
+        add_client(interpreter, root / "captured-constraints.txt", client_wheel, runtime_build)
         return publish_generation(root, metadata, None, callees, fallback)
     except BaseException:
         shutil.rmtree(root)  # uniquely owned unpublished generation, never dispatched
