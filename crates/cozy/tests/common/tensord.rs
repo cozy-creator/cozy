@@ -178,6 +178,16 @@ pub fn added_on(
     port: Option<u16>,
     env: &[(&str, &str)],
 ) -> Tensord {
+    let machine = joined(home, name, port, env);
+    if std::env::var_os("COZY_TEST_RUNTIME_WHEEL").is_some() {
+        named_runtime(home, name);
+        PROBED.get_or_init(probe);
+    }
+    machine
+}
+
+/// A TensorD that `home`'s Calcifer added as `name`.
+fn joined(home: &super::Home, name: &str, port: Option<u16>, env: &[(&str, &str)]) -> Tensord {
     let mut machine = Tensord::start_on(port, &[stranger()], env);
     let add = |machine: &Tensord| {
         home.cozy([
@@ -193,49 +203,69 @@ pub fn added_on(
     machine.restart(&[key_to_authorize(&add(&machine))]);
     let out = add(&machine);
     assert_eq!(out.code, 0, "{out:?}");
-    dev_runtime(home, name);
     machine
 }
+
+/// The Runtime wheel the job names (`COZY_TEST_RUNTIME_WHEEL`, with `COZY_TEST_TENSORFS_WHEEL` when
+/// it built one) installed on `name` as a person installs a development Runtime: `cozy machine
+/// update --runtime-wheel`. The update must end on that version.
+fn named_runtime(home: &super::Home, name: &str) {
+    let runtime = std::env::var_os("COZY_TEST_RUNTIME_WHEEL").expect("a named Runtime wheel");
+    let mut update: Vec<std::ffi::OsString> = vec![
+        "--json".into(),
+        "machine".into(),
+        "update".into(),
+        name.into(),
+        "--runtime-wheel".into(),
+        runtime.clone(),
+    ];
+    if let Some(tensorfs) = std::env::var_os("COZY_TEST_TENSORFS_WHEEL") {
+        update.extend(["--tensorfs-wheel".into(), tensorfs]);
+    }
+    let out = home.cozy(&update);
+    let version = Path::new(&runtime)
+        .file_name()
+        .and_then(|n| n.to_str()?.split('-').nth(1));
+    let completed = out
+        .stdout
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .rfind(|e| e["type"] == "run.completed");
+    let to = completed
+        .as_ref()
+        .and_then(|e| e["run"]["result"]["to"]["runtime"].as_str());
+    assert!(
+        out.code == 0 && to.is_some() && to == version,
+        "installing {runtime:?} on {name} (want {version:?}, have {to:?}): {out:?}"
+    );
+}
+
+/// Once per test process.
+static PROBED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 
 /// A script that answers the commit of the Runtime it runs on.
 const PROVENANCE: &str = "# /// script\n# requires-python = \">=3.12\"\n# dependencies = [\"cozy-runtime\"]\n\
     # [tool.cozy]\n# accelerator = false\n# ///\nfrom cozy_runtime._build_provenance import COMMIT\n\n\n\
     def main() -> str:\n    return COMMIT\n";
 
-/// The Runtime wheel the job names (`COZY_TEST_RUNTIME_WHEEL`, with `COZY_TEST_TENSORFS_WHEEL` when
-/// it built one), installed on `name` as a person installs a development Runtime (`cozy machine
-/// update --runtime-wheel`); the Runtime its packages then load must be that build, by the commit
-/// stamped in it (`cozy_runtime._build_provenance.COMMIT`). Without the variable, nothing.
-fn dev_runtime(home: &super::Home, name: &str) {
-    let Some(runtime) = std::env::var_os("COZY_TEST_RUNTIME_WHEEL") else {
-        return;
-    };
+/// The Runtime a machine updated to the named wheel loads is that build, by the commit stamped in
+/// it (`cozy_runtime._build_provenance.COMMIT`); a wheel without one proves nothing. On a machine
+/// of its own, in a home of its own, so no test's machine holds the probe's script.
+fn probe() {
+    let runtime = std::env::var_os("COZY_TEST_RUNTIME_WHEEL").expect("a named Runtime wheel");
     let want = stamped(Path::new(&runtime));
     assert!(
         !want.is_empty() && want != "unknown",
         "{runtime:?} names no commit (COMMIT = {want:?}): a wheel without provenance proves nothing"
     );
-    let mut update: Vec<std::ffi::OsString> = vec![
-        "--json".into(),
-        "machine".into(),
-        "update".into(),
-        name.into(),
-    ];
-    update.extend(["--runtime-wheel".into(), runtime.clone()]);
-    if let Some(tensorfs) = std::env::var_os("COZY_TEST_TENSORFS_WHEEL") {
-        update.extend(["--tensorfs-wheel".into(), tensorfs]);
-    }
-    let out = home.cozy(&update);
-    assert!(
-        out.code == 0 && out.stdout.contains("\"run.completed\""),
-        "installing {runtime:?} on {name}: {out:?}"
-    );
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("provenance.py"), PROVENANCE).unwrap();
+    let home = super::Home::new().expect("a home where the named wheel is");
+    let _machine = joined(&home, "provenance", None, &[]);
+    named_runtime(&home, "provenance");
+    std::fs::write(home.root().join("provenance.py"), PROVENANCE).unwrap();
     let probe = super::out(
         home.command()
-            .current_dir(dir.path())
-            .args(["--json", "run", "provenance.py", "--on", name])
+            .current_dir(home.root())
+            .args(["--json", "run", "provenance.py", "--on", "provenance"])
             .output()
             .unwrap(),
     );
@@ -248,7 +278,7 @@ fn dev_runtime(home: &super::Home, name: &str) {
     assert_eq!(
         loaded.as_deref(),
         Some(want.as_str()),
-        "{name} runs another Runtime than {runtime:?}: {probe:?}"
+        "a machine updated to {runtime:?} runs another Runtime: {probe:?}"
     );
 }
 

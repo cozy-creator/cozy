@@ -822,21 +822,28 @@ mod v1_api {
             .status()
             .unwrap()
             .success());
+        NAMED_RUNTIME.get_or_init(|| named_runtime_loads(&tools)).await;
         let machine = Machine::start_args(|_, _| (), &installing_args(&tools)).await;
-        // A named Runtime wheel is the one its packages load, by the commit stamped in it.
-        if let Some(wheel) = std::env::var_os("COZY_TEST_RUNTIME_WHEEL") {
-            let want = stamped(Path::new(&wheel));
-            assert!(
-                !want.is_empty() && want != "unknown",
-                "{wheel:?} names no commit (COMMIT = {want:?}): a wheel without provenance proves nothing"
-            );
-            let client = client(&machine);
-            let all = cap(Grant { action: MACHINE.into(), ..Default::default() });
-            let manifest = write_package(&client, &all, "cpu_bulk", "local/tensord-cpu-bulk").await;
-            let built = call(&client, &all, &manifest, ("provenance", "provenance"), serde_json::json!({})).await;
-            assert_eq!(built["commit"], want.as_str(), "the machine loaded another Runtime than {wheel:?}");
-        }
         (machine, tools)
+    }
+
+    /// Once per test process: a named Runtime wheel (`COZY_TEST_RUNTIME_WHEEL`) is the one an
+    /// installing machine's packages load, by the commit stamped in it, on a machine of its own so
+    /// no test's machine holds the probe's package.
+    static NAMED_RUNTIME: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+    async fn named_runtime_loads(tools: &Path) {
+        let Some(wheel) = std::env::var_os("COZY_TEST_RUNTIME_WHEEL") else { return };
+        let want = stamped(Path::new(&wheel));
+        assert!(
+            !want.is_empty() && want != "unknown",
+            "{wheel:?} names no commit (COMMIT = {want:?}): a wheel without provenance proves nothing"
+        );
+        let machine = Machine::start_args(|_, _| (), &installing_args(tools)).await;
+        let client = client(&machine);
+        let all = cap(Grant { action: MACHINE.into(), ..Default::default() });
+        let manifest = write_package(&client, &all, "cpu_bulk", "local/tensord-cpu-bulk").await;
+        let built = call(&client, &all, &manifest, ("provenance", "provenance"), serde_json::json!({})).await;
+        assert_eq!(built["commit"], want.as_str(), "the machine loaded another Runtime than {wheel:?}");
     }
 
     /// The TensorFS wheel a Runtime wheel accepts, from PyPI, into `dir`.
