@@ -691,7 +691,7 @@ fn asset_fidelity_reaches_the_package_by_label_or_index() {
     let refused = run("3=low");
     assert_eq!(refused.code, 2, "{refused:?}");
     assert!(
-        refused.stderr.contains("names no attached asset"),
+        refused.stdout.contains("asset_fidelity_unmatched"),
         "{refused:?}"
     );
 }
