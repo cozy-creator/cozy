@@ -636,7 +636,12 @@ impl Engine {
                 {
                     engine.active.lock().unwrap().remove(&thread_id);
                 }
-                engine.progress.lock().unwrap().remove(&thread_id);
+                // A run its preparation left queued may already be told what it waits for.
+                let mut progress = engine.progress.lock().unwrap();
+                if progress.get(&thread_id).is_none_or(|held| held.waiting.is_none()) {
+                    progress.remove(&thread_id);
+                }
+                drop(progress);
                 engine.owned.lock().unwrap().remove(&thread_id);
                 engine.notify_activity();
             });
@@ -710,6 +715,51 @@ impl Engine {
         self.journal.lock().unwrap().children(parent)
     }
 
+    /// Run `id` as its caller names it (the id it was submitted under), else as this machine does.
+    pub fn caller_id(&self, id: &str) -> String {
+        self.get(id)
+            .ok()
+            .and_then(|record| record.submission.map(|s| s.request_id))
+            .filter(|request| !request.is_empty())
+            .unwrap_or_else(|| id.to_string())
+    }
+
+    /// Why queued run `id` waits, for people (another run's install, an executor slot); `None`
+    /// once it no longer does. Shown in the run's state while it is queued; nothing durable is
+    /// written.
+    pub fn waiting(&self, id: &str, reason: Option<String>) -> io::Result<()> {
+        let mut progress = self.progress.lock().unwrap();
+        if progress.get(id).map_or(reason.is_none(), |held| held.waiting == reason) {
+            return Ok(());
+        }
+        let mut journal = self.journal.lock().unwrap();
+        let mut record = journal.get(id)?;
+        if record.state != State::Queued {
+            return Ok(());
+        }
+        if let Some(snapshot) = progress.get(id) {
+            snapshot.overlay(&mut record);
+        }
+        if record.revision >= record.revision_ceiling {
+            record = journal.reserve_observations(id, progress.get(id))?;
+        }
+        progress.insert(
+            id.into(),
+            ProgressSnapshot {
+                completed_units: record.completed_units,
+                detail: record.progress.clone().unwrap_or_default(),
+                waiting: reason,
+                revision: record
+                    .revision
+                    .checked_add(1)
+                    .ok_or_else(|| io::Error::other("execution observation cursor exhausted"))?,
+            },
+        );
+        drop((progress, journal));
+        self.notify_activity();
+        Ok(())
+    }
+
     pub fn observe_progress(
         &self,
         id: &str,
@@ -752,6 +802,7 @@ impl Engine {
             ProgressSnapshot {
                 completed_units,
                 detail,
+                waiting: None,
                 revision: record
                     .revision
                     .checked_add(1)
@@ -918,6 +969,14 @@ impl Engine {
             .and_then(|triage| self.journal.lock().unwrap().bind_triage(id, &triage));
         if let Err(error) = result {
             tracing::warn!("execution {id}: triage bundle not kept: {error}");
+        }
+        // Its traceback's end travels with the run, in its log.
+        let detail = self.triage(id).ok().flatten().and_then(|(_, bundle)| crate::triage::detail(&bundle));
+        for line in detail.iter().flat_map(|detail| detail.lines()) {
+            if let Err(error) = self.append_log(id, "error", line) {
+                tracing::warn!("execution {id}: its failure is not in its log: {error}");
+                break;
+            }
         }
     }
     /// The run's triage bundle bytes and their reference, if it kept one.

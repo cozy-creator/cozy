@@ -10,7 +10,6 @@ members = [
     "crates/cozy-platform",
     "crates/cozy-proto",
     "crates/hub-client",
-    "crates/migrate",
     "crates/tensord",
     "crates/tensorfs/crates/tensorfs-core",
     "crates/tensorfs/crates/tensorfs-plane",
@@ -32,7 +31,6 @@ cozy-cli = { path = "crates/cozy-cli" }
 cozy-platform = { path = "crates/cozy-platform" }
 cozy-proto = { path = "crates/cozy-proto" }
 hub-client = { path = "crates/hub-client" }
-migrate = { path = "crates/migrate" }
 portable-pty = "0.9.0"
 tensord = { path = "crates/tensord" }
 tensorfs-core = { path = "crates/tensorfs/crates/tensorfs-core", default-features = false }
@@ -49,6 +47,7 @@ clap_complete = { version = "4.6.11", features = ["unstable-dynamic"] }
 comfy-table = "8.0.1"
 crossterm = { version = "0.29", features = ["event-stream"] }
 ed25519-dalek = "2"
+eventsource-stream = "0.2.3"
 figment = { version = "0.10.19", features = ["env", "toml"] }
 flate2 = "1.1"
 fs2 = "0.4"
@@ -71,8 +70,6 @@ prettyplease = "0.2"
 progenitor = { version = "0.15.1", default-features = false }
 pep508_rs = "0.9"
 progenitor-client = "0.15.1"
-prost = "0.14"
-protoc-bin-vendored = "3"
 quote = "1"
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
@@ -102,14 +99,12 @@ tokio-util = { version = "0.7", features = ["io"] }
 # figment's toml 0.8 already builds this one.
 toml = "0.8"
 toml_edit = "0.22.27"
-tonic = { version = "0.14.6", default-features = false, features = ["codegen"] }
-tonic-prost = "0.14.6"
-tonic-prost-build = "0.14.6"
 tower = { version = "0.5", default-features = false, features = ["util"] }
 tracing = "0.1"
 tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std"] }
 url = { version = "2.5.8", features = ["serde"] }
+utoipa = { version = "6.0.0", default-features = false, features = ["macros"] }
 vt100 = "0.16.2"
 webpki-roots = "1"
 windows-sys = "0.61"

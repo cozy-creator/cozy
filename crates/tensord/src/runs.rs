@@ -483,7 +483,7 @@ impl Runs {
             return self.remove(actor, &spec).map(Some);
         }
         if let Some(items) = &spec.set {
-            return self.warm_set(actor, &spec, items, &observe, stoppable);
+            return self.warm_set(actor, id, &spec, items, &observe, stoppable);
         }
         if let Source::Models = spec.source {
             let models = self.warm_models(actor, id, &spec, &*observe, stoppable)?;
@@ -509,7 +509,7 @@ impl Runs {
                     refused("capability_unavailable", "this machine installs no local packages")
                 })?;
                 let stage = |stage: &str| observe(stage, 0, 0);
-                let installed = local.install(&self.service, actor, digest, Some(&stoppable.stop), &stage)?;
+                let installed = local.install(&self.service, actor, digest, Some(&stoppable.stop), id, &stage)?;
                 self.supersede(actor, &installed)?;
                 local.collect(actor, &installed.package);
                 // A call's imports start as soon as its code is installed, as a release's do.
@@ -536,6 +536,7 @@ impl Runs {
         };
         let (installation, plan, precision) = self.resolve(
             actor,
+            id,
             held,
             release,
             hub.clone(),
@@ -710,6 +711,7 @@ impl Runs {
     fn warm_set(
         &self,
         actor: &str,
+        id: &str,
         spec: &Spec,
         items: &[SetItem],
         observe: &Arc<impl Fn(&str, u64, u64) + Send + Sync + 'static>,
@@ -735,6 +737,7 @@ impl Runs {
             let report = observe.clone();
             let (installation, plan, _) = self.resolve(
                 actor,
+                id,
                 held,
                 release,
                 hub.clone(),
@@ -883,6 +886,7 @@ impl Runs {
     fn resolve(
         &self,
         actor: &str,
+        id: &str,
         held: Option<Installation>,
         release: Option<Published>,
         hub: Option<hub::Source>,
@@ -900,6 +904,7 @@ impl Runs {
             (Some(source), Some(publisher)) if needs_hub => {
                 let (package, release) = release.unwrap_or_default();
                 let request = Request {
+                    run: id.into(),
                     source,
                     package,
                     release,
@@ -1072,7 +1077,7 @@ impl Runs {
                         None => None,
                     };
                     let (hub, models) = (spec.hub.clone(), spec.models.clone());
-                    runs.resolve(&actor, held, None, hub, &spec, &spec.entrypoint, &models, spec.bits, None, None)
+                    runs.resolve(&actor, "", held, None, hub, &spec, &spec.entrypoint, &models, spec.bits, None, None)
                 })();
             match prepared {
                 Ok((installation, Some(plan), _)) if plan.degree > 0 && !plan.slots.is_empty() => {
@@ -1214,9 +1219,7 @@ mod tests {
 
     fn write(objects: &Objects, actor: &str, bytes: &[u8]) -> (String, u64) {
         let digest = format!("sha256:{}", sha256::hex_digest(bytes));
-        let mut writer = objects.begin(actor, &digest, bytes.len() as u64, 0).unwrap();
-        writer.append(bytes).unwrap();
-        writer.finish().unwrap();
+        objects.write(actor, &digest, bytes).unwrap();
         (digest, bytes.len() as u64)
     }
 

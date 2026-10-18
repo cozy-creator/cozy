@@ -39,8 +39,7 @@ use ed25519_dalek::{
     SigningKey,
     pkcs8::{DecodePrivateKey as _, EncodePrivateKey as _},
 };
-use futures_util::Stream;
-use prost::Message as _;
+use futures_util::{Stream, StreamExt as _};
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 use tokio::{
@@ -52,7 +51,7 @@ use tracing::warn;
 use crate::{
     Calcifer,
     api::{Api, Refusal, parse},
-    link::{self, Link, LinkError},
+    link::{self, Link, LinkError, OUTDATED},
     rentals::Hubs,
     store::{AskKind, Endpoint, MachineRow, Store},
 };
@@ -181,7 +180,7 @@ impl Machines {
         if row.state != MachineState::Ended
             && let Ok(Some(link)) = self.calcifer.link(&row.name)
         {
-            match first(link.status(false)).await {
+            match link.status().await {
                 Ok(frame) => self.observe(&row.name, frame),
                 Err(e) => self.unreachable(&row.name, e.to_string()),
             }
@@ -208,12 +207,13 @@ impl Machines {
             )
             .next(format!("cozy machine show {name}")));
         }
-        let unreachable = |e: LinkError| {
-            Error::new(
+        let unreachable = |e: LinkError| match e {
+            LinkError::Refused { code, message } if code == OUTDATED => outdated(address, message),
+            e => Error::new(
                 Kind::Unavailable,
                 "machine_unreachable",
                 format!("{address}: {e}"),
-            )
+            ),
         };
         let leaf: [u8; 32] =
             Sha256::digest(link::presented_leaf(address).await.map_err(unreachable)?).into();
@@ -247,7 +247,7 @@ impl Machines {
         };
         let link =
             Link::new(row.endpoint.as_ref().expect("set"), signer(&key)?).map_err(unreachable)?;
-        let frame = first(link.status(false)).await.map_err(|e| match e {
+        let frame = link.status().await.map_err(|e| match e {
             LinkError::Unauthorized(_) => match self.controller_key() {
                 Ok(public) => Error::new(
                     Kind::Credential,
@@ -327,7 +327,8 @@ impl Machines {
     /// Starts a rental's 15-minute idle clock over, once the machine acknowledges it.
     pub async fn keepalive(&self, text: &str) -> Result<Keepalive, Error> {
         let (row, link) = self.linked(text)?;
-        let frame = first(link.status(true))
+        let frame = link
+            .keepalive()
             .await
             .map_err(|e| refusal(&row.name, e))?;
         let idle_deadline_ms = deadline(&frame);
@@ -338,27 +339,25 @@ impl Machines {
         })
     }
 
-    /// The last `tail` bytes (0: all) of a log the machine keeps; empty when it keeps none.
-    pub async fn logs(&self, text: &str, log: MachineLog, tail: u64) -> Result<Vec<u8>, Error> {
+    /// The newest `lines` whole lines (0: all) of a log the machine keeps.
+    pub async fn logs(&self, text: &str, log: MachineLog, lines: u64) -> Result<Vec<u8>, Error> {
         let (row, link) = self.linked(text)?;
-        let name = match log {
-            MachineLog::Tensord => "tensord",
-            MachineLog::Tensorfs => "tensorfs-transport",
-            MachineLog::Memory => "memory",
-        };
-        match link.read_log(name, tail).await {
-            // A TensorD before its own log could be read (0.7.x) keeps none to serve.
-            Err(LinkError::NotFound) if log == MachineLog::Tensord => Err(Error::new(
-                Kind::NotFound,
-                "machine_log_unsupported",
-                format!("{}'s TensorD serves no log of its own", row.name),
-            )
-            .remedy("update its TensorD; its tensorfs and memory logs read today")
-            .next(format!("cozy machine logs {} tensorfs", row.name))
-            .next(format!("cozy machine update {}", row.name))),
-            Err(LinkError::NotFound) => Ok(vec![]),
-            read => read.map_err(|e| refusal(&row.name, e)),
-        }
+        let read = link.read_log(log_name(log), lines).await;
+        read.map_err(|e| log_refusal(&row.name, log, e))
+    }
+
+    /// As `logs`, or the lines after `after` (a batch's place), then each batch as the machine
+    /// appends it.
+    pub async fn follow_logs(
+        &self,
+        text: &str,
+        log: MachineLog,
+        lines: u64,
+        after: Option<&str>,
+    ) -> Result<crate::link::Live<v1::LogLines>, Error> {
+        let (row, link) = self.linked(text)?;
+        let lines = link.follow_log(log_name(log), lines, after).await;
+        lines.map_err(|e| log_refusal(&row.name, log, e))
     }
 
     pub(crate) fn row(&self, name: &str) -> Result<MachineRow, Error> {
@@ -500,10 +499,10 @@ impl Machines {
             .calcifer
             .link(name)?
             .ok_or_else(|| "it has no address".to_string())?;
-        let mut frames = link.status(false).await.map_err(|e| e.to_string())?;
+        let mut frames = link.watch().await.map_err(|e| e.to_string())?;
         loop {
-            match frames.message().await {
-                Ok(Some(frame)) => {
+            match frames.next().await {
+                Some(Ok(frame)) => {
                     *pause = Duration::ZERO;
                     let released = frame.phase == "releasing";
                     self.observe(name, frame);
@@ -511,8 +510,8 @@ impl Machines {
                         return Ok(());
                     }
                 }
-                Ok(None) => return Err("the machine closed its Status stream".into()),
-                Err(status) => return Err(link::classify(status).to_string()),
+                None => return Err("the machine closed its Status stream".into()),
+                Some(Err(e)) => return Err(e.to_string()),
             }
         }
     }
@@ -568,7 +567,7 @@ impl Machines {
             Err(e) => return warn!("reading unplaced runs: {e}"),
         };
         for (run, wants) in unplaced {
-            let gpus = v1::RunSpec::decode(run.spec.as_slice()).map_or(0, |spec| spec.gpus);
+            let gpus = run.spec.as_ref().map_or(0, |spec| spec.gpus);
             let placed = match wants.as_str() {
                 // It waits for a rental that fits while none does.
                 "any" => match self.fitting(gpus) {
@@ -781,7 +780,7 @@ async fn fresh(machines: &Arc<Machines>, text: &str) -> Result<Machine, Error> {
     }
     let link = machines.calcifer.link(&row.name).map_err(unavailable)?;
     let link = link.ok_or_else(|| unavailable("it has no address yet".into()))?;
-    match first(link.status(false)).await {
+    match link.status().await {
         Ok(frame) => machines.observe(&row.name, frame),
         Err(e) => {
             machines.unreachable(&row.name, e.to_string());
@@ -875,15 +874,21 @@ pub(crate) async fn keepalive(
 }
 
 #[derive(Deserialize)]
-pub(crate) struct Tail {
+pub(crate) struct LogQuery {
+    /// The newest N whole lines; 0: all it keeps.
     #[serde(default)]
-    tail_bytes: u64,
+    lines: u64,
+    /// Following: on from this batch's place.
+    after: Option<String>,
 }
 
+/// A machine's log: its whole lines, or with `Accept: text/event-stream` those and then each
+/// batch as the machine appends it, as `lines` events whose id (`after`) resumes the follow.
 pub(crate) async fn logs(
     State(api): State<Arc<Api>>,
     UrlPath((name, log)): UrlPath<(String, String)>,
-    query: Result<Query<Tail>, QueryRejection>,
+    query: Result<Query<LogQuery>, QueryRejection>,
+    headers: HeaderMap,
 ) -> Result<Response, Refusal> {
     let Query(query) = query.map_err(|e| Refusal(usage(e.body_text())))?;
     let log = match log.as_str() {
@@ -898,12 +903,35 @@ pub(crate) async fn logs(
             )));
         }
     };
-    let bytes = api
+    let follows = headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.contains("text/event-stream"));
+    if !follows {
+        let bytes = api
+            .machines
+            .logs(&name, log, query.lines)
+            .await
+            .map_err(Refusal)?;
+        return Ok(([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], bytes).into_response());
+    }
+    let lines = api
         .machines
-        .logs(&name, log, query.tail_bytes)
+        .follow_logs(&name, log, query.lines, query.after.as_deref())
         .await
         .map_err(Refusal)?;
-    Ok(([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], bytes).into_response())
+    // Ends when the machine's stream does, or Calcifer stops: the follower resumes from its id.
+    let events = lines
+        .take_while(|batch| std::future::ready(batch.is_ok()))
+        .filter_map(|batch| async move {
+            let batch = batch.ok()?;
+            let event = sse::Event::default().event("lines").id(&batch.after);
+            event.json_data(&batch).ok().map(Ok::<_, Infallible>)
+        })
+        .take_until(api.stopped());
+    Ok(Sse::new(events)
+        .keep_alive(KeepAlive::default())
+        .into_response())
 }
 
 fn usage(message: String) -> Error {
@@ -951,7 +979,7 @@ pub(crate) fn pin_of(pem: &str) -> Option<[u8; 32]> {
 /// spec then names the whole set. Level 0 removes an item. The merged set is what the machine
 /// holds once it takes the run, so the next warm run merges into it.
 pub(crate) fn merge_warm(current: &mut Vec<v1::WarmItem>, spec: &mut v1::RunSpec) {
-    if spec.kind != v1::RunKind::Warm as i32 {
+    if spec.kind != v1::RunKind::Warm {
         return;
     }
     let Some(set) = spec.set.as_mut() else {
@@ -959,7 +987,7 @@ pub(crate) fn merge_warm(current: &mut Vec<v1::WarmItem>, spec: &mut v1::RunSpec
     };
     for item in std::mem::take(&mut set.items) {
         current.retain(|held| (&held.source, &held.entrypoint) != (&item.source, &item.entrypoint));
-        if item.level != v1::WarmLevel::Unspecified as i32 {
+        if item.level != v1::WarmLevel::Off {
             current.push(item);
         }
     }
@@ -975,14 +1003,13 @@ pub(crate) fn merge_warm(current: &mut Vec<v1::WarmItem>, spec: &mut v1::RunSpec
 }
 
 fn status(frame: &v1::StatusFrame) -> MachineStatus {
-    let level = |level: i32| {
-        v1::WarmLevel::try_from(level)
-            .map(|l| {
-                l.as_str_name()
-                    .trim_start_matches("WARM_LEVEL_")
-                    .to_ascii_lowercase()
-            })
-            .unwrap_or_default()
+    let level = |level: v1::WarmLevel| match level {
+        v1::WarmLevel::Off => "",
+        v1::WarmLevel::Installed => "installed",
+        v1::WarmLevel::Downloaded => "downloaded",
+        v1::WarmLevel::Imported => "imported",
+        v1::WarmLevel::Host => "host",
+        v1::WarmLevel::Gpu => "gpu",
     };
     MachineStatus {
         worker_id: frame.worker_id.clone(),
@@ -1001,8 +1028,8 @@ fn status(frame: &v1::StatusFrame) -> MachineStatus {
                 name: gpu.name.clone(),
                 memory_bytes: gpu.memory_bytes,
                 driver: gpu.driver.clone(),
-                family: None,
-                memory_class: None,
+                family: Some(gpu.family.clone()).filter(|f| !f.is_empty()),
+                memory_class: Some(gpu.memory_class.clone()).filter(|c| !c.is_empty()),
             })
             .collect(),
         disk_total_bytes: frame.disk.as_ref().map_or(0, |d| d.total_bytes),
@@ -1045,17 +1072,13 @@ fn status(frame: &v1::StatusFrame) -> MachineStatus {
             .iter()
             .map(|item| wire::WarmItem {
                 source: match &item.source {
-                    Some(v1::warm_item::Source::Release(r)) if r.release.is_empty() => {
-                        r.package.clone()
-                    }
-                    Some(v1::warm_item::Source::Release(r)) => {
-                        format!("{}@{}", r.package, r.release)
-                    }
-                    Some(v1::warm_item::Source::Installation(id)) => id.clone(),
+                    Some(v1::WarmSource::Release(r)) if r.release.is_empty() => r.package.clone(),
+                    Some(v1::WarmSource::Release(r)) => format!("{}@{}", r.package, r.release),
+                    Some(v1::WarmSource::Installation(id)) => id.clone(),
                     None => String::new(),
                 },
                 entrypoint: item.entrypoint.clone(),
-                level: level(item.level),
+                level: level(item.level).into(),
                 holds: item.holds.clone(),
                 held_back: item.held_back.clone(),
             })
@@ -1065,18 +1088,6 @@ fn status(frame: &v1::StatusFrame) -> MachineStatus {
 
 fn deadline(frame: &v1::StatusFrame) -> Option<i64> {
     (frame.idle_deadline_unix_ms > 0).then_some(frame.idle_deadline_unix_ms)
-}
-
-/// The first frame of a Status stream.
-async fn first(
-    stream: impl Future<Output = Result<tonic::Streaming<v1::StatusFrame>, LinkError>>,
-) -> Result<v1::StatusFrame, LinkError> {
-    stream
-        .await?
-        .message()
-        .await
-        .map_err(link::classify)?
-        .ok_or_else(|| LinkError::Unreachable("the machine sent no Status".into()))
 }
 
 /// A machine name: 1-32 of `a-z0-9-`, a letter first; `local`, `any` and `new` are taken.
@@ -1133,9 +1144,32 @@ pub(crate) fn signer(path: &Path) -> Result<SigningKey, Error> {
         })
 }
 
+fn log_name(log: MachineLog) -> &'static str {
+    match log {
+        MachineLog::Tensord => "tensord",
+        MachineLog::Tensorfs => "tensorfs-transport",
+        MachineLog::Memory => "memory",
+    }
+}
+
+fn log_refusal(name: &str, log: MachineLog, e: LinkError) -> Error {
+    match e {
+        // A TensorD serving in dev mode logs to its stderr only.
+        LinkError::NotFound if log == MachineLog::Tensord => Error::new(
+            Kind::NotFound,
+            "machine_log_unsupported",
+            format!("{name}'s TensorD keeps no log of its own"),
+        )
+        .remedy("its tensorfs and memory logs read")
+        .next(format!("cozy machine logs {name} tensorfs")),
+        e => refusal(name, e),
+    }
+}
+
 /// A machine's refusal, as the API answers it.
 fn refusal(name: &str, e: LinkError) -> Error {
     match e {
+        LinkError::Refused { code, message } if code == OUTDATED => outdated(name, message),
         LinkError::Refused { code, message } => Error::new(
             Kind::Conflict,
             "machine_refused",
@@ -1163,6 +1197,12 @@ fn refusal(name: &str, e: LinkError) -> Error {
             format!("{name}: {message}"),
         ),
     }
+}
+
+/// A machine from before the HTTP API, which this controller never drives.
+fn outdated(name: &str, message: String) -> Error {
+    Error::new(Kind::Conflict, OUTDATED, format!("{name}: {message}"))
+        .remedy(format!("end it: cozy machine end {name}"))
 }
 
 pub(crate) fn not_found(text: &str) -> Error {
@@ -1210,19 +1250,19 @@ mod tests {
 
     fn item(package: &str, entrypoint: &str, level: v1::WarmLevel) -> v1::WarmItem {
         v1::WarmItem {
-            source: Some(v1::warm_item::Source::Release(v1::Release {
+            source: Some(v1::WarmSource::Release(v1::Release {
                 package: package.into(),
                 release: String::new(),
             })),
             entrypoint: entrypoint.into(),
-            level: level as i32,
+            level,
             ..Default::default()
         }
     }
 
     fn warm(items: Vec<v1::WarmItem>) -> v1::RunSpec {
         v1::RunSpec {
-            kind: v1::RunKind::Warm as i32,
+            kind: v1::RunKind::Warm,
             set: Some(v1::WarmSet { items }),
             ..Default::default()
         }
@@ -1247,7 +1287,7 @@ mod tests {
             "Status-only fields are not sent"
         );
         let mut second = warm(vec![
-            item("a/sdxl", "generate", v1::WarmLevel::Unspecified),
+            item("a/sdxl", "generate", v1::WarmLevel::Off),
             item("a/flux", "generate", v1::WarmLevel::Gpu),
         ]);
         merge_warm(&mut held, &mut second);

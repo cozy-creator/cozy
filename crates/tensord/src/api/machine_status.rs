@@ -1,14 +1,12 @@
 //! Status (G/API.md, D2). Anyone who reaches the machine gets one identity frame with the sealed
 //! readiness receipt; a machine-scope cap gets the whole picture, sent again whenever it changes.
 //! An open stream is not activity: only `keepalive` resets the idle deadline, once.
-use super::{auth::VerifiedActor, backend::MachineBackend, domain, v1, MachineIdentity};
-use std::{pin::Pin, sync::Arc, time::Duration};
-use tokio_stream::Stream;
-use tonic::Status;
+use super::{auth::VerifiedActor, backend::MachineBackend, domain, http::blocking, v1, MachineIdentity};
+use cozy_proto::error::Error;
+use std::{sync::Arc, time::Duration};
+use tokio_stream::{wrappers::IntervalStream, Stream, StreamExt};
 
-pub(super) type Frames = Pin<Box<dyn Stream<Item = Result<v1::StatusFrame, Status>> + Send>>;
-
-/// What this machine serves on `cozy.machine.v1`, for clients that adapt to it.
+/// What this machine serves, for clients that adapt to it.
 /// `run-gpus/1`: a run may request an exact GPU group, inherited and reserved by its calls.
 /// `warm/1`: a warm run with no entrypoint installs its code and makes its model choices
 /// present. `warm/2`: a warm run's `set` replaces the caller's warm set, and Status reports the
@@ -38,66 +36,28 @@ pub const CAPABILITIES: &[&str] = &[
 
 const LIVE: [&str; 3] = ["queued", "starting", "running"];
 
-pub(super) async fn status<B: MachineBackend>(
+/// The whole picture, sent again whenever it changes, until the caller leaves.
+pub(super) fn watch<B: MachineBackend>(
     identity: Arc<MachineIdentity>,
     backend: Arc<B>,
-    caller: Option<VerifiedActor>,
-    keepalive: bool,
-) -> Result<Frames, Status> {
-    let Some(actor) = caller else {
-        if keepalive {
-            return Err(Status::permission_denied(
-                "keepalive needs a machine-scope Cozy-Cap",
-            ));
-        }
-        return Ok(Box::pin(tokio_stream::once(Ok(identity_frame(&identity)))));
-    };
-    if keepalive {
-        identity
-            .lifecycle
-            .as_ref()
-            .ok_or_else(|| Status::failed_precondition("this machine has no idle deadline"))?
-            .renew()?;
-    }
-    let first = frame(&identity, &backend, actor).await?;
-    let (sender, receiver) = tokio::sync::mpsc::channel(4);
-    tokio::spawn(async move {
-        let revoked = identity.authority.keys.revoked(actor.public_key);
-        tokio::pin!(revoked);
-        let mut last = first.clone();
-        if sender.send(Ok(first)).await.is_err() {
-            return;
-        }
-        let mut tick = tokio::time::interval(Duration::from_secs(1));
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        tick.tick().await;
-        loop {
-            tokio::select! {
-                _ = &mut revoked => {
-                    let _ = sender.send(Err(Status::unauthenticated("the key that opened this stream no longer authorizes it"))).await;
-                    return;
-                }
-                _ = sender.closed() => return,
-                _ = tick.tick() => {}
+    actor: VerifiedActor,
+) -> impl Stream<Item = Result<v1::StatusFrame, Error>> + Send {
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last: Option<v1::StatusFrame> = None;
+    IntervalStream::new(tick)
+        .then(move |_| {
+            let (identity, backend) = (identity.clone(), backend.clone());
+            async move { frame(&identity, &backend, actor).await }
+        })
+        .filter_map(move |next| match next {
+            Ok(next) if last.as_ref().is_some_and(|last| !changed(last, &next)) => None,
+            Ok(next) => {
+                last = Some(next.clone());
+                Some(Ok(next))
             }
-            let next = match frame(&identity, &backend, actor).await {
-                Ok(next) => next,
-                Err(status) => {
-                    let _ = sender.send(Err(status)).await;
-                    return;
-                }
-            };
-            if changed(&last, &next) {
-                last = next.clone();
-                if sender.send(Ok(next)).await.is_err() {
-                    return;
-                }
-            }
-        }
-    });
-    Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(
-        receiver,
-    )))
+            Err(error) => Some(Err(error)),
+        })
 }
 
 /// Disk use moves all the time; it alone is news once it moved by a hundredth of the disk.
@@ -116,7 +76,7 @@ fn changed(last: &v1::StatusFrame, next: &v1::StatusFrame) -> bool {
         }
 }
 
-fn identity_frame(identity: &MachineIdentity) -> v1::StatusFrame {
+pub(super) fn identity_frame(identity: &MachineIdentity) -> v1::StatusFrame {
     v1::StatusFrame {
         worker_id: identity.authority.worker_id.clone(),
         boot_id: identity.authority.boot_id.clone(),
@@ -137,19 +97,18 @@ pub(super) fn capabilities(identity: &MachineIdentity) -> Vec<String> {
         .collect()
 }
 
-async fn frame<B: MachineBackend>(
+pub(super) async fn frame<B: MachineBackend>(
     identity: &Arc<MachineIdentity>,
     backend: &Arc<B>,
     actor: VerifiedActor,
-) -> Result<v1::StatusFrame, Status> {
-    let (backend, store) = (backend.clone(), identity.store.clone());
-    let ((runs, environments), warm, models) = tokio::task::spawn_blocking(move || {
+) -> Result<v1::StatusFrame, Error> {
+    let store = identity.store.clone();
+    let ((runs, environments), warm, models) = blocking(backend, move |backend| {
         let models = store.as_deref().map(crate::held_models::listing);
-        let held = held(&*backend, actor)?;
-        Ok::<_, Status>((held, backend.warm_set(actor)?, models.unwrap_or_default()))
+        let held = held(backend, actor)?;
+        Ok((held, backend.warm_set(actor)?, models.unwrap_or_default()))
     })
-    .await
-    .map_err(|_| Status::internal("machine operation stopped"))??;
+    .await?;
     let software = identity
         .updates
         .as_ref()
@@ -168,16 +127,20 @@ async fn frame<B: MachineBackend>(
         platform: format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH),
         started_at_unix_ms: identity.started_at_ms as i64,
         gpus: identity
-            .readiness
-            .gpus()
-            .into_iter()
+            .gpus
+            .iter()
             .map(|g| v1::Gpu {
                 index: g.device_index,
-                name: g.device_name,
-                uuid: g.device_uuid,
-                pci_bus_id: g.pci_bus_id,
+                name: g.device_name.clone(),
+                uuid: g.device_uuid.clone(),
+                pci_bus_id: g.pci_bus_id.clone(),
                 memory_bytes: g.memory_bytes,
-                driver: g.driver_version,
+                driver: g.driver_version.clone(),
+                family: match g.compute_cap.as_str() {
+                    "" => String::new(),
+                    cc => crate::precision::Gpus::of(&[cc]).name,
+                },
+                memory_class: g.memory_class.clone(),
             })
             .collect(),
         hubs: identity
@@ -205,7 +168,7 @@ async fn frame<B: MachineBackend>(
 fn held(
     backend: &impl MachineBackend,
     actor: VerifiedActor,
-) -> Result<(Vec<v1::RunState>, Vec<v1::Environment>), Status> {
+) -> Result<(Vec<v1::RunState>, Vec<v1::Environment>), Error> {
     let query = domain::MachineExecutionListQuery {
         limit: 256,
         states: LIVE.map(String::from).to_vec(),
@@ -213,7 +176,7 @@ fn held(
     };
     let runs = held_or_none(backend.list(actor, query).map(|l| l.executions))?
         .iter()
-        .map(|run| super::machine_v1::state(&run.request_id, run))
+        .map(|run| super::machine_runs::state(&run.request_id, run))
         .collect();
     let packages = held_or_none(
         backend
@@ -243,9 +206,9 @@ fn held(
 }
 
 /// A backend that keeps no such record holds none.
-fn held_or_none<T>(listed: Result<Vec<T>, Status>) -> Result<Vec<T>, Status> {
+fn held_or_none<T>(listed: Result<Vec<T>, Error>) -> Result<Vec<T>, Error> {
     match listed {
-        Err(status) if status.code() == tonic::Code::Unimplemented => Ok(vec![]),
+        Err(error) if error.code == "capability_unavailable" => Ok(vec![]),
         other => other,
     }
 }

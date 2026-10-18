@@ -34,13 +34,12 @@ pub fn main(args: impl IntoIterator<Item = std::ffi::OsString>) -> ExitCode {
         flags: Flags,
     }
     let flags = <Serve as clap::Parser>::parse_from(args).flags;
-    machine(flags.lifetime().expect("clap requires one"), false)
+    machine(flags.lifetime().expect("clap requires one"))
 }
 
-/// The machine, as its stable parent (or, with `service`, as the service an activated binary
-/// runs under that parent). Exits the process on failure.
-pub fn machine(lifetime: Lifetime, service: bool) -> ExitCode {
-    if let Err(error) = run(lifetime, service) {
+/// The machine: its stable parent, then the service it forks. Exits the process on failure.
+pub fn machine(lifetime: Lifetime) -> ExitCode {
+    if let Err(error) = run(lifetime) {
         config::init_logs(None);
         tracing::error!("{error}");
         std::process::exit(1);
@@ -48,7 +47,7 @@ pub fn machine(lifetime: Lifetime, service: bool) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn run(lifetime: Lifetime, service: bool) -> io::Result<()> {
+fn run(lifetime: Lifetime) -> io::Result<()> {
     use crate::machine::{identity, provider::ProviderSelf, ssh, supervise, update};
     // Linux names the calling thread: this one, before any other starts.
     if let Err(error) = cozy_platform::process::set_name("tensord") {
@@ -56,8 +55,8 @@ fn run(lifetime: Lifetime, service: bool) -> io::Result<()> {
             return Err(io::Error::other(format!("cannot set TensorD process name: {error}")));
         }
     }
-    // Whatever this process inherited (a parent's readiness, key or credential pipe) reaches
-    // nothing it starts; descriptors it hands on are handed explicitly.
+    // Whatever this process inherited (its own re-execution's credential pipe) reaches nothing
+    // it starts; descriptors it hands on are handed explicitly.
     cozy_platform::process::cloexec_from(3);
     hold_handed_descriptors();
     let mut config = config::load(lifetime)?;
@@ -72,25 +71,20 @@ fn run(lifetime: Lifetime, service: bool) -> io::Result<()> {
         grant.provider = ProviderSelf::take(&grant.layout.root, &config.provider);
     }
     config::forget_receipt_key();
-    let ready = if service {
-        // The parent's key pipe is read and closed whether or not the grant has a key.
-        let inherited = supervise::inherited_key();
-        grant.receipt_key = grant.receipt_key.take().or(inherited);
-        supervise::inherited()
-    } else {
-        identity::hold(&grant.layout)?;
-        if let Some(key) = grant.developer_key.as_deref().filter(|_| nix::unistd::geteuid().is_root()) {
-            ssh::start(key)?;
+    identity::hold(&grant.layout)?;
+    if let Some(key) = grant.developer_key.as_deref() {
+        if let Err(error) = ssh::start(key) {
+            tracing::warn!("{error}");
         }
-        let paths = update::Paths::new(&grant.layout.engine(), &grant.layout.root);
-        supervise::supervise(&paths, lifetime, grant.receipt_key.as_deref(), grant.provider.as_ref())?
-    };
+    }
+    let paths = update::Paths::new(&grant.layout.engine(), &grant.layout.root);
+    update::retire_agent(&paths);
+    let ready = supervise::supervise(&paths)?;
     run_machine(config, ready)
 }
 
-/// Descriptors 3, 4 and 5 carry a parent's readiness, key and credential pipes. Until they are
-/// read, nothing else may take those numbers: the log file there would be read as a pipe, or a
-/// forked service's log written into the readiness pipe.
+/// Descriptor 5 carries a re-executed machine's credential pipe. Until it is read, nothing else
+/// may take 3 to 5: a log file at 5 would be read as the pipe.
 fn hold_handed_descriptors() {
     for fd in 3..=5 {
         // SAFETY: plain syscalls on this process's own descriptor table, before any thread.
@@ -104,6 +98,20 @@ fn hold_handed_descriptors() {
             }
         }
     }
+}
+
+/// The machine's one async runtime: its API, its lifecycle and TensorFS's transport, where every
+/// object request in flight is a task, never a thread. Made in the service, after the stable
+/// parent's fork and before anything fetches.
+fn machine_runtime() -> io::Result<&'static tokio::runtime::Runtime> {
+    static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    if let Some(runtime) = RUNTIME.get() {
+        return Ok(runtime);
+    }
+    // The API's two threads and the transport's two, together.
+    let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(4).thread_name("tensord").enable_all().build()?;
+    tensorfs_core::transport::use_runtime(runtime.handle().clone());
+    Ok(RUNTIME.get_or_init(|| runtime))
 }
 
 /// `tensord serve`: a machine on a state directory with no grant, for tests.
@@ -147,6 +155,7 @@ pub fn dev(args: Dev) -> io::Result<()> {
         }
     }
     cozy_platform::process::cloexec_from(3);
+    machine_runtime()?;
     let root = args.state;
     let generations = args.generations.unwrap_or_else(|| root.join("generations"));
     let owner = Owner::new(&root, &root.join("tensorfs"), args.host_bytes, Duration::from_secs(args.cache_ttl_seconds))?;
@@ -193,7 +202,6 @@ pub fn version() -> io::Result<()> {
     let capabilities = crate::api::CAPABILITIES
         .iter()
         .chain(CAPS)
-        .chain(&[crate::machine::provider::CREDENTIAL_CAPABILITY])
         .copied()
         .collect();
     let record = Version {
@@ -211,6 +219,7 @@ pub fn version() -> io::Result<()> {
 /// under `var/lib/cozy/tensord`, the API on the granted port.
 fn run_machine(config: config::Config, mut ready: crate::machine::supervise::Ready) -> io::Result<()> {
     let config::Config { mut grant, visible_devices, endpoint, logs, .. } = config;
+    let runtime = machine_runtime()?;
     use crate::machine::{identity, receipt};
     // An older stable parent may have selected a partially published candidate. Restore the
     // links before opening services, then let that parent select the restored executable.
@@ -289,7 +298,12 @@ fn run_machine(config: config::Config, mut ready: crate::machine::supervise::Rea
     // A machine serves every package on its pool: its GPUs (the envelope, sorted by index; a
     // degree-K plan uses the first K) and deviceless executors, with the executor environment
     // the pod proofs used.
-    let gpus = receipt::gpus(visible_devices.as_deref())?;
+    let mut gpus = receipt::gpus(visible_devices.as_deref())?;
+    // A driver below CUDA 13.0's floor serves no GPU; the machine stays for CPU work.
+    if let Some(why) = gpus.first().and_then(|gpu| cozy_platform::gpu::below_floor(&gpu.driver_version)) {
+        tracing::error!("{why}; this machine offers no GPU");
+        gpus.clear();
+    }
     identity.gpus = gpus.clone();
     {
         let devices: Vec<String> = gpus.iter().map(|g| g.device_index.to_string()).collect();
@@ -328,10 +342,6 @@ fn run_machine(config: config::Config, mut ready: crate::machine::supervise::Rea
         std::thread::Builder::new()
             .name("rental-lifecycle".into())
             .spawn(move || {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("a lifecycle runtime");
                 runtime.block_on(async {
                     tokio::spawn(crate::machine::lifecycle::keep_authority(
                         hub.clone(),
@@ -485,10 +495,7 @@ fn start_api(
         cert_pem: &identity.cert_pem,
     })?;
     crate::machine::identity::write_atomic(&root.join("api-ready.json"), &ready, 0o600)?;
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()?;
+    let runtime = machine_runtime()?;
     std::thread::Builder::new()
         .name("machine-api".into())
         .spawn(move || {
@@ -878,7 +885,7 @@ fn client(
 /// report only saves the provider's lag: after a few misses the provider's view serves.
 fn report_endpoint(grant: crate::machine::grant::HubGrant, endpoint: crate::machine::endpoint::Endpoint) {
     use crate::machine::hub::{Hub, Refusal};
-    let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+    let runtime = match machine_runtime() {
         Ok(runtime) => runtime,
         Err(error) => return tracing::warn!("endpoint report: {error}"),
     };

@@ -26,13 +26,8 @@ use tokio_rustls::rustls::{self, pki_types::ServerName, RootCertStore};
 /// accepted for a loopback stand-in only.
 pub const API_ORIGIN: &str = "COZY_PROVIDER_API_ORIGIN";
 const CALL_BUDGET: Duration = Duration::from_secs(30);
-/// The fd a re-executed machine, or an activated service, reads the credential from: open only
-/// when its parent placed it there.
+/// The fd a re-executed machine reads the credential from: open only when it placed it there.
 pub const CREDENTIAL_FD: i32 = 5;
-/// What a machine binary declares in `version --json` when it reads the credential on
-/// CREDENTIAL_FD and closes it. A binary that does not is never handed it: it would leave the
-/// pipe open for everything it starts.
-pub const CREDENTIAL_CAPABILITY: &str = "provider-credential/1";
 /// The provider keys a pod's environment carries.
 const KEYS: [&str; 2] = ["RUNPOD_API_KEY", "CONTAINER_API_KEY"];
 /// Files, under the machine root, a provider's tooling may copy the environment into for shells.
@@ -63,8 +58,8 @@ pub enum ProviderSelf {
 impl ProviderSelf {
     /// This machine's provider credential, kept by this process alone. With the key still in the
     /// environment (a pod's boot) it scrubs the key's copies under `root` and re-executes this
-    /// program without it, and does not return unless that fails; a re-executed machine or an
-    /// activated service reads it from CREDENTIAL_FD. Call before any thread starts.
+    /// program without it, and does not return unless that fails; the re-executed machine reads
+    /// it from CREDENTIAL_FD. Call before any thread starts.
     pub fn take(root: &Path, env: &BTreeMap<String, String>) -> Option<Self> {
         if let Some(own) = inherited() {
             return Some(own);
@@ -209,28 +204,6 @@ pub fn hand_on(own: &ProviderSelf) -> bool {
         .and_then(|(read, write)| {
             File::from(write).write_all(&serde_json::to_vec(own)?)?;
             Ok(super::supervise::inherit(read, CREDENTIAL_FD))
-        })
-        .unwrap_or(false)
-}
-
-/// Whether the machine binary at `binary` declares CREDENTIAL_CAPABILITY.
-pub fn reads_credential(binary: &Path) -> bool {
-    std::process::Command::new(binary)
-        .args(["version", "--json"])
-        .env_clear()
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()
-        .and_then(|out| serde_json::from_slice::<serde_json::Value>(&out.stdout).ok())
-        .and_then(|version| {
-            Some(
-                version
-                    .get("capabilities")?
-                    .as_array()?
-                    .iter()
-                    .any(|c| c == CREDENTIAL_CAPABILITY),
-            )
         })
         .unwrap_or(false)
 }

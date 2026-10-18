@@ -9,12 +9,12 @@ use std::{
     io,
     path::PathBuf,
     sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tonic::Status;
+use cozy_proto::error::Error;
 
 /// A rental's idle window, `RentalIdleTimeoutSeconds` in the CLI.
 pub const IDLE_GRACE_MS: i64 = 900_000;
@@ -51,6 +51,8 @@ pub struct Lifecycle {
     state: Mutex<State>,
     admissions: AtomicUsize,
     epoch: AtomicU64,
+    /// When an output read last moved bytes (unix ms).
+    transferred: AtomicI64,
 }
 
 /// Holds the release while a call that may queue a job is in flight.
@@ -97,6 +99,7 @@ impl Lifecycle {
             state: Mutex::new(State { ledger, jobs: Jobs::default(), sampled: 0, activating: false }),
             admissions: AtomicUsize::new(0),
             epoch: AtomicU64::new(0),
+            transferred: AtomicI64::new(0),
         });
         lifecycle.save(&lifecycle.state.lock().unwrap().ledger)?;
         Ok(lifecycle)
@@ -106,10 +109,17 @@ impl Lifecycle {
         super::identity::write_atomic(&self.path, &serde_json::to_vec(ledger)?, 0o600)
     }
 
-    /// When the idle clock runs out: 15 minutes after the later of its start and the last
-    /// job's end.
+    /// When the idle clock runs out: 15 minutes after the latest of its start, the last job's end
+    /// and the last bytes an output read moved.
     fn idle_end(&self, state: &State) -> i64 {
-        state.ledger.idle_since_ms.max(state.jobs.ended_ms) + self.grace
+        let used = state.jobs.ended_ms.max(self.transferred.load(Ordering::Acquire));
+        state.ledger.idle_since_ms.max(used) + self.grace
+    }
+
+    /// An output read moved bytes: the rental is in use, and its idle clock starts again now. A
+    /// read that stalls moves nothing, so it never holds the rental past one window.
+    pub fn transferred(&self) {
+        self.transferred.fetch_max(now_ms(), Ordering::AcqRel);
     }
 
     fn due(&self, state: &State, now: i64) -> bool {
@@ -126,16 +136,18 @@ impl Lifecycle {
         }
     }
 
-    pub fn admit(self: &Arc<Self>) -> Result<Admission, Status> {
+    pub fn admit(self: &Arc<Self>) -> Result<Admission, Error> {
         let state = self.state.lock().unwrap();
         if state.activating {
-            return Err(Status::unavailable(
-                "machine_updating: the machine is activating an update; submit again once it is back",
+            return Err(Error::unavailable(
+                "machine_updating",
+                "the machine is activating an update; submit again once it is back",
             ));
         }
         if self.rental && self.due(&state, now_ms()) {
-            return Err(Status::unavailable(
-                "machine_released: this rental released itself after 15 minutes idle",
+            return Err(Error::unavailable(
+                "machine_released",
+                "this rental released itself after 15 minutes idle",
             ));
         }
         self.admissions.fetch_add(1, Ordering::AcqRel);
@@ -145,10 +157,11 @@ impl Lifecycle {
 
     /// Closes admission under the lock `admit` takes: a call is either admitted (and counted)
     /// before activation or refused after it, never accepted while the service exits.
-    pub fn activate(self: &Arc<Self>) -> Result<Activation, Status> {
+    pub fn activate(self: &Arc<Self>) -> Result<Activation, Error> {
         let mut state = self.state.lock().unwrap();
         if state.activating || state.ledger.released {
-            return Err(Status::unavailable(
+            return Err(Error::unavailable(
+                "machine_updating",
                 "the machine is already activating or released",
             ));
         }
@@ -173,22 +186,23 @@ impl Lifecycle {
         self.state.lock().unwrap().jobs.ended_ms
     }
 
-    /// `Status{keepalive}`: restarts the idle clock once; answers the new deadline.
-    pub fn renew(&self) -> Result<i64, Status> {
+    /// `POST /v1/keepalive`: restarts the idle clock once; answers the new deadline.
+    pub fn renew(&self) -> Result<i64, Error> {
         if !self.rental {
             return Ok(0);
         }
         let now = now_ms();
         let mut state = self.state.lock().unwrap();
         if self.due(&state, now) {
-            return Err(Status::failed_precondition(
+            return Err(Error::unavailable(
+                "machine_released",
                 "this rental's idle release is already due or committed",
             ));
         }
         let mut ledger = state.ledger.clone();
         ledger.idle_since_ms = ledger.idle_since_ms.max(now);
         self.save(&ledger).map_err(|e| {
-            Status::unavailable(format!("the idle ledger could not be written: {e}"))
+            Error::unavailable("idle_ledger_unwritable", format!("the idle ledger could not be written: {e}"))
         })?;
         state.ledger = ledger;
         Ok(self.deadline(&state))
