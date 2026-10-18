@@ -254,22 +254,29 @@ fn package_verbs_sent_to_a_booting_rental_wait_for_it() {
     home.sign_in("booting@cozy.test");
     let package = package::publish(&home, "tiny", "0.1.0");
     let dir = package::project(&home, "tiny");
-    // R's sequence for each verb: rent, then the verb at once, while the rental boots.
-    let mut rentals = vec![];
-    let mut sent = |verb: &[&str]| {
+    // R's sequence for each verb: rent, then the verb at once, while the rental boots. The CI
+    // Hub's docker provider boots one container at a time, so each rental ends before the next.
+    let sent = |verb: &[&str], after: &dyn Fn(&str)| {
         let rented = json(&home, &dir, &["machine", "rent", "cpu", "--detach"]);
         assert_eq!(rented["machine"]["state"], "booting", "{rented}");
         let rental = rented["machine"]["rental_id"].as_str().unwrap().to_owned();
         eprintln!("{verb:?} --on {rental}, booting");
         let out = bounded(&home, &dir, &[verb, &["--on", &rental]].concat(), 10);
         eprintln!("{out:?}");
-        rentals.push(rental.clone());
-        (rental, out)
+        after(&rental);
+        let ended = json(&home, &dir, &["machine", "end", &rental]);
+        assert_eq!(ended["machine"]["state"], "ended", "{ended}");
+        out
     };
-    let (_, update) = sent(&["package", "update"]);
-    let (_, list) = sent(&["package", "list", "--once"]);
-    let (_, remove) = sent(&["package", "remove", &package]);
-    let (installed_on, install) = sent(&["--json", "package", "install", &package]);
+    let nothing = |_: &str| {};
+    let update = sent(&["package", "update"], &nothing);
+    let list = sent(&["package", "list", "--once"], &nothing);
+    let remove = sent(&["package", "remove", &package], &nothing);
+    let holds = |rental: &str| {
+        let listed = json(&home, &dir, &["package", "list", "--on", rental]);
+        assert_eq!(listed["packages"][0]["release"], "0.1.0", "{listed}");
+    };
+    let install = sent(&["--json", "package", "install", &package], &holds);
     for out in [&update, &list, &remove] {
         assert!(out.stderr.contains(" to start"), "it did not wait: {out:?}");
     }
@@ -289,13 +296,6 @@ fn package_verbs_sent_to_a_booting_rental_wait_for_it() {
         (0, Some("run.completed")),
         "{install:?}"
     );
-    let listed = json(&home, &dir, &["package", "list", "--on", &installed_on]);
-    assert_eq!(listed["packages"][0]["release"], "0.1.0", "{listed}");
-
-    for rental in rentals {
-        let ended = json(&home, &dir, &["machine", "end", &rental]);
-        assert_eq!(ended["machine"]["state"], "ended", "{ended}");
-    }
 }
 
 /// A laptop names its local Hub where it listens, while machines read that Hub at its public
