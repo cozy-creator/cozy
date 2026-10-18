@@ -579,7 +579,7 @@ async fn a_slow_output_read_holds_the_rental_until_its_last_bytes() {
     let product = outcome.outputs.first().unwrap_or_else(|| panic!("{outcome:?}"));
     assert_eq!(product.length, SIZE);
 
-    // About 4 MiB a second: three idle windows and more.
+    // About 4 MiB a second, paced so the read spans at least three idle windows.
     let target = v1::OutputTarget { run: "bulk".into(), output: product.output.clone(), index: product.index, member: String::new() };
     let mut output = bulk.get(&target, (0, 0), 0).await.unwrap();
     let started = now_ms();
@@ -591,7 +591,7 @@ async fn a_slow_output_read_holds_the_rental_until_its_last_bytes() {
     }
     let finished = now_ms();
     assert_eq!(read, SIZE);
-    assert!(finished - started > 3 * i64::from(WINDOW) * 1000, "the read took {} ms", finished - started);
+    assert!(finished - started >= 3 * i64::from(WINDOW) * 1000, "the read took {} ms", finished - started);
     assert!(received.try_recv().is_err(), "the rental released itself while its output was being read");
     received
         .recv_timeout(Duration::from_millis(u64::from(WINDOW) * 1000 + 15_000))
