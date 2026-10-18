@@ -650,28 +650,28 @@ impl Updates {
         request: &Request,
         candidate: &Path,
     ) -> io::Result<(Pair, Option<super::lifecycle::Activation>)> {
-        for (distribution, choice) in [
-            ("cozy_runtime", &request.runtime),
-            ("tensorfs", &request.tensorfs),
-        ] {
-            let wheel = match choice {
-                Some(choice) => self.resolve(distribution, choice)?,
-                None => existing_wheel(&self.paths.sdk(), distribution)?,
-            };
-            let name = wheel
-                .file_name()
-                .and_then(|n| n.to_str())
-                .ok_or_else(|| invalid("wheel name"))?
-                .to_owned();
-            verify_wheel(&wheel, distribution)?;
-            let prepared = candidate.join(&name);
-            fs::copy(&wheel, &prepared)?;
-            fs::File::open(prepared)?.sync_all()?;
-            if let Some(file) = choice.as_ref().filter(|c| distribution == "cozy_runtime" && !c.file.is_empty()) {
-                fs::write(candidate.join(RUNTIME_BUILD), build(&wheel, &file.sha256)?)?;
+        let runtime = match &request.runtime {
+            Some(choice) => self.resolve("cozy_runtime", choice)?,
+            None => existing_wheel(&self.paths.sdk(), "cozy_runtime")?,
+        };
+        let runtime = stage(candidate, &runtime, "cozy_runtime")?;
+        if let Some(file) = request.runtime.as_ref().filter(|c| !c.file.is_empty()) {
+            fs::write(candidate.join(RUNTIME_BUILD), build(&runtime, &file.sha256)?)?;
+        }
+        match &request.tensorfs {
+            None if request.runtime.is_some() => self.pair(candidate, &runtime)?,
+            choice => {
+                let tensorfs = match choice {
+                    Some(choice) => self.resolve("tensorfs", choice)?,
+                    None => existing_wheel(&self.paths.sdk(), "tensorfs")?,
+                };
+                let tensorfs = stage(candidate, &tensorfs, "tensorfs")?;
+                if let Err(reason) = self.compile(&[runtime, tensorfs])? {
+                    let names: Vec<String> = wheels(candidate).into_iter().map(|(d, v, _)| format!("{d} {v}")).collect();
+                    return Err(invalid(&format!("{} do not install together: {reason}", names.join(" and "))));
+                }
             }
         }
-        self.resolves(candidate)?;
         fs::File::open(candidate)?.sync_all()?;
         let to = identified(candidate)?;
         self.set(|s| s.to = to.clone())?;
@@ -691,40 +691,67 @@ impl Updates {
         Ok((to, activation))
     }
 
-    /// The pair resolves as a package environment installs it (uv, over the index), or the
-    /// update fails with uv's reason: the machine never selects a pair its environments would
-    /// set aside for a release's locked Runtime.
-    fn resolves(&self, candidate: &Path) -> io::Result<()> {
-        let pair: Vec<String> = wheels(candidate).into_iter().map(|(_, _, p)| p.display().to_string() + "\n").collect();
+    /// A Runtime named alone keeps the machine's TensorFS when the two resolve together, else takes
+    /// the TensorFS uv resolves for the Runtime over the index, fetched from PyPI held to its digest.
+    /// One that resolves none names `--tensorfs-wheel`.
+    fn pair(&self, candidate: &Path, runtime: &Path) -> io::Result<()> {
+        if let Ok(current) = existing_wheel(&self.paths.sdk(), "tensorfs") {
+            if self.compile(&[runtime.to_owned(), current.clone()])?.is_ok() {
+                return stage(candidate, &current, "tensorfs").map(drop);
+            }
+        }
+        let name = runtime.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        let unresolved = |why: String| {
+            io::Error::other(Coded {
+                code: "tensorfs_unresolved",
+                message: format!("{name} resolves no TensorFS over the index ({why}); name one with --tensorfs-wheel"),
+            })
+        };
+        let resolved = self.compile(&[runtime.to_owned()])?.map_err(unresolved)?;
+        let version = resolved
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("tensorfs=="))
+            .ok_or_else(|| unresolved("it requires none".into()))?;
+        let choice = Choice { version: version.into(), ..Default::default() };
+        stage(candidate, &self.resolve("tensorfs", &choice)?, "tensorfs").map(drop)
+    }
+
+    /// Resolves `wheels` as a package environment installs them (uv, over the index): the pinned
+    /// requirements, or uv's reason they do not resolve. The machine never selects a pair its
+    /// environments would set aside for a release's locked Runtime.
+    fn compile(&self, wheels: &[PathBuf]) -> io::Result<Result<String, String>> {
+        let input: String = wheels.iter().map(|p| p.display().to_string() + "\n").collect();
         super::client::ensure_uv(&self.paths.uv)?;
         let mut child = std::process::Command::new(&self.paths.uv)
-            .args(["pip", "compile", "--quiet", "--no-config", "--no-cache", "--no-header", "--python", "3.12", "-"])
-            .current_dir(candidate)
+            .args(["pip", "compile", "--quiet", "--no-config", "--no-cache", "--no-header", "--no-annotate", "--python", "3.12", "-"])
             .process_group(0)
             .stdin(Stdio::piped())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
-        // uv's own exit says why, should it stop before reading the pair.
-        let _ = child.stdin.take().expect("piped stdin").write_all(pair.concat().as_bytes());
-        let mut stderr = child.stderr.take().expect("piped stderr");
+        // uv's own exit says why, should it stop before reading the input.
+        let _ = child.stdin.take().expect("piped stdin").write_all(input.as_bytes());
+        let (stdout, stderr) = (child.stdout.take().expect("piped stdout"), child.stderr.take().expect("piped stderr"));
         let stop = self.stop.lock().unwrap().clone();
-        let (ended, reason) = std::thread::scope(|scope| {
-            let drained = scope.spawn(move || {
-                let mut text = String::new();
-                let _ = stderr.read_to_string(&mut text);
-                text
-            });
-            (crate::process::supervise(&mut child, Some(&stop), "uv", &|_| ()), drained.join().unwrap_or_default())
+        let (ended, out, reason) = std::thread::scope(|scope| {
+            let drain = |mut pipe: Box<dyn Read + Send>| {
+                scope.spawn(move || {
+                    let mut text = String::new();
+                    let _ = pipe.read_to_string(&mut text);
+                    text
+                })
+            };
+            let (out, reason) = (drain(Box::new(stdout)), drain(Box::new(stderr)));
+            let ended = crate::process::supervise(&mut child, Some(&stop), "uv", &|_| ());
+            (ended, out.join().unwrap_or_default(), reason.join().unwrap_or_default())
         });
         match ended? {
-            Supervised::Exited(status) if status.success() => Ok(()),
+            Supervised::Exited(status) if status.success() => Ok(Ok(out)),
             Supervised::Canceled => Err(io::Error::new(io::ErrorKind::Interrupted, "the update was canceled")),
             Supervised::Wedged(verdict) => Err(io::Error::other(format!("uv pip compile: {verdict}"))),
             Supervised::Exited(_) => {
                 let reason: Vec<&str> = reason.split_whitespace().filter(|w| !matches!(*w, "×" | "╰─▶")).collect();
-                let names: Vec<String> = wheels(candidate).into_iter().map(|(d, v, _)| format!("{d} {v}")).collect();
-                Err(invalid(&format!("{} do not install together: {}", names.join(" and "), reason.join(" ").trim_end_matches('.'))))
+                Ok(Err(reason.join(" ").trim_end_matches('.').to_owned()))
             }
         }
     }
@@ -760,6 +787,16 @@ impl Updates {
         let stop = self.stop.lock().unwrap().clone();
         super::pypi::wheel(distribution, &choice.version, &self.paths.update("downloads"), store, &stop)
     }
+}
+
+/// Copies a verified `distribution` wheel into `candidate`, durably: where it is now.
+fn stage(candidate: &Path, wheel: &Path, distribution: &str) -> io::Result<PathBuf> {
+    let name = wheel.file_name().ok_or_else(|| invalid("wheel name"))?;
+    verify_wheel(wheel, distribution)?;
+    let prepared = candidate.join(name);
+    fs::copy(wheel, &prepared)?;
+    fs::File::open(&prepared)?.sync_all()?;
+    Ok(prepared)
 }
 
 fn existing_wheel(dir: &Path, distribution: &str) -> io::Result<PathBuf> {
@@ -1402,7 +1439,11 @@ mod tests {
         wheel(&paths.image_wheels, "tensorfs", "0.1.0", None);
         let updates = Updates::open(paths.clone(), Box::new(|| true), None, None).unwrap();
         let candidate = requiring(&root, "cozy_runtime", "0.2.0", None, "Requires-Dist: tensorfs>=0.2\n");
-        updates.request(update_request(&updates, "u1", &candidate), |_| panic!("an unresolved pair activated")).unwrap();
+        let mut request = update_request(&updates, "u1", &candidate);
+        let tensorfs = wheel(&root, "tensorfs", "0.1.0", None);
+        let (sha256, _) = updates.stage("tensorfs-0.1.0-py3-none-any.whl", &mut fs::File::open(tensorfs).unwrap()).unwrap();
+        request.tensorfs = Some(Choice { file: "tensorfs-0.1.0-py3-none-any.whl".into(), sha256, ..Default::default() });
+        updates.request(request, |_| panic!("an unresolved pair activated")).unwrap();
         let failed = loop {
             match updates.update("u1").unwrap() {
                 status if status.terminal() => break status,
@@ -1414,6 +1455,31 @@ mod tests {
         assert!(failed.error.contains("tensorfs>=0.2"), "{}", failed.error);
         assert!(failed.error.ends_with("; it keeps Runtime 0.1.0 and TensorFS 0.1.0"), "{}", failed.error);
         assert!(fs::symlink_metadata(paths.current_sdk_link()).is_err(), "an unresolved pair was selected");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A Runtime named alone whose TensorFS neither the machine's nor any over the index meets
+    /// fails naming `--tensorfs-wheel`, and selects nothing.
+    #[test]
+    fn a_runtime_alone_that_resolves_no_tensorfs_names_the_flag() {
+        let root = std::env::temp_dir().join(format!("cm-unpaired-update-{}", uuid::Uuid::new_v4()));
+        let paths = Paths::new(&root.join("engine"), &root);
+        fs::create_dir_all(&paths.image_wheels).unwrap();
+        wheel(&paths.image_wheels, "cozy_runtime", "0.1.0", None);
+        wheel(&paths.image_wheels, "tensorfs", "0.1.0", None);
+        let updates = Updates::open(paths.clone(), Box::new(|| true), None, None).unwrap();
+        let candidate = requiring(&root, "cozy_runtime", "0.2.0", None, "Requires-Dist: tensorfs>=999\n");
+        updates.request(update_request(&updates, "u1", &candidate), |_| panic!("an unpaired Runtime activated")).unwrap();
+        let failed = loop {
+            match updates.update("u1").unwrap() {
+                status if status.terminal() => break status,
+                _ => std::thread::sleep(std::time::Duration::from_millis(10)),
+            }
+        };
+        assert_eq!((failed.state.as_str(), failed.code.as_str()), ("failed", "tensorfs_unresolved"), "{}", failed.error);
+        assert!(failed.error.contains("name one with --tensorfs-wheel"), "{}", failed.error);
+        assert!(failed.error.ends_with("; it keeps Runtime 0.1.0 and TensorFS 0.1.0"), "{}", failed.error);
+        assert!(fs::symlink_metadata(paths.current_sdk_link()).is_err(), "an unpaired Runtime was selected");
         fs::remove_dir_all(root).unwrap();
     }
 
