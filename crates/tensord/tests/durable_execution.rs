@@ -231,11 +231,12 @@ fn deterministic_launch_failure_fails_once_with_its_reason() {
     fs::create_dir_all(&directory).unwrap();
     fs::write(directory.join(".hold"), b"").unwrap();
     // Its interpreter is a file the kernel cannot execute.
-    fs::create_dir_all(directory.join("env/bin")).unwrap();
-    fs::write(directory.join("env/bin/python"), b"not an interpreter").unwrap();
+    let python = cozy_platform::paths::venv_python(&directory.join("env"));
+    fs::create_dir_all(python.parent().unwrap()).unwrap();
+    fs::write(&python, b"not an interpreter").unwrap();
     let mut record: Value = serde_json::from_slice(&fs::read(generations.join(identity).join("generation.json")).unwrap()).unwrap();
     record["identity"] = broken.clone().into();
-    record["python"] = directory.join("env/bin/python").to_string_lossy().into_owned().into();
+    record["python"] = python.to_string_lossy().into_owned().into();
     fs::write(directory.join("generation.json"), serde_json::to_vec(&record).unwrap()).unwrap();
     let id = machine.service.submit("unlaunchable", &broken, "steps", json!({})).unwrap().id;
     let failed = machine.wait(&id, |record| record.state.terminal());

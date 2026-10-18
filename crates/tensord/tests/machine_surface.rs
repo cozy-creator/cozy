@@ -848,7 +848,7 @@ mod v1_api {
         uv(&["venv".as_ref(), "--python".as_ref(), "3.12".as_ref(), env.as_os_str()]);
         uv(&["export".as_ref(), "--locked".as_ref(), "--extra".as_ref(), "test".as_ref(), "--no-emit-project".as_ref(),
             "--no-hashes".as_ref(), "-o".as_ref(), requirements.as_os_str()]);
-        let python = env.join("bin/python");
+        let python = cozy_platform::paths::venv_python(&env);
         uv(&["pip".as_ref(), "install".as_ref(), "--python".as_ref(), python.as_os_str(), "-r".as_ref(), requirements.as_os_str()]);
         uv(&["pip".as_ref(), "install".as_ref(), "--python".as_ref(), python.as_os_str(), runtime.as_os_str(),
             "-e".as_ref(), repo.as_os_str()]);
@@ -2790,7 +2790,7 @@ mod v1_api {
         let python = fs::read_dir(machine.root.join("state/generations"))
             .unwrap()
             .flatten()
-            .map(|g| g.path().join("env/bin/python"))
+            .map(|g| cozy_platform::paths::venv_python(&g.path().join("env")))
             .find(|p| p.exists())
             .unwrap();
         let (digest, callees) = tensord::published::describe_environment(

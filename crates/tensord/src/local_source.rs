@@ -773,7 +773,7 @@ mod tests {
         assert_eq!(fs::read_to_string(first_home.join("tree/notes.txt")).unwrap(), "dropped by the edit");
         let held = m.service.catalog.resolve(&installed.generation).unwrap();
         let environment = fs::read_link(m.installer.generations.join(&installed.generation).join("env")).unwrap();
-        assert!(environment.starts_with(fs::canonicalize(&first_home).unwrap()), "{environment:?}");
+        assert!(environment.starts_with(cozy_platform::durable::canonical(&first_home).unwrap()), "{environment:?}");
         // Published generations have a directory, not an editable env symlink. They remain
         // ordinary inventory entries; a failed directory read must retain every live source.
         fs::create_dir_all(m.installer.generations.join("published/env")).unwrap();
@@ -785,7 +785,7 @@ mod tests {
         fs::rename(&unavailable, &m.installer.generations).unwrap();
         // The environment imports the tree itself: nothing of the project was copied into it.
         let imported = run(Command::new(&held.record.python).args(["-I", "-c", "import cpu_input; print(cpu_input.__file__)"]));
-        assert_eq!(Path::new(&imported), fs::canonicalize(first_home.join("tree/cpu_input/__init__.py")).unwrap());
+        assert_eq!(fs::canonicalize(&imported).unwrap(), fs::canonicalize(first_home.join("tree/cpu_input/__init__.py")).unwrap());
 
         // Unchanged objects are cached, but acceptance retains every captured member.
         let source = fs::read_to_string(project.join("cpu_input/__init__.py")).unwrap();
@@ -831,7 +831,7 @@ mod tests {
         let placed = sources.install(&m.service, "carol", &live, None, "", &|_| ()).unwrap();
         let python = m.service.catalog.resolve(&placed.generation).unwrap().record.python;
         let imported = run(Command::new(&python).args(["-I", "-c", "import cpu_input; print(cpu_input.__file__)"]));
-        assert_eq!(Path::new(&imported), fs::canonicalize(project.join("cpu_input/__init__.py")).unwrap());
+        assert_eq!(fs::canonicalize(&imported).unwrap(), fs::canonicalize(project.join("cpu_input/__init__.py")).unwrap());
         assert!(!sources.home("carol", "local/tensord-cpu-input").unwrap().join("tree").exists());
 
         // An environment no generation names leaves; a package with none left leaves whole.
