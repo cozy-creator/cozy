@@ -559,7 +559,7 @@ fn installer_refusal(error: cozy_proto::error::Error) -> Refused {
 mod tests {
     use super::*;
     use std::{
-        io::Read,
+        io::{Read, Write as _},
         path::{Path, PathBuf},
         process::Command,
     };
@@ -660,6 +660,7 @@ mod tests {
             "{wheel:?} names no commit (COMMIT = {want:?}): a wheel without provenance proves nothing");
         let loaded = run(Command::new(python).args(["-I", "-c", "from cozy_runtime._build_provenance import COMMIT; print(COMMIT)"]));
         assert_eq!(loaded, want, "{python:?} loads another Runtime than {wheel:?}");
+        let _ = writeln!(std::io::stderr(), "named Runtime (commit {want}) loads: asserted in {python:?}");
     }
 
     /// Its stdout, trimmed; a failure names the command and its stderr.

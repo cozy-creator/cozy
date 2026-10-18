@@ -17,6 +17,7 @@ use tensord::{
 use serde_json::json;
 use std::{
     fs,
+    io::Write as _,
     path::{Path, PathBuf},
     process::Command,
     sync::Arc,
@@ -160,6 +161,7 @@ fn named_runtime_loaded(generations: &Path) {
         let loaded = output(Command::new(&python).args(["-I", "-c", "from cozy_runtime._build_provenance import COMMIT; print(COMMIT)"]));
         assert_eq!(loaded, want, "{python:?} loads another Runtime than {wheel:?}");
     }
+    let _ = writeln!(std::io::stderr(), "named Runtime (commit {want}) loads: asserted in {generations:?}");
 }
 
 fn write(objects: &Objects, bytes: &[u8]) -> (String, u64) {

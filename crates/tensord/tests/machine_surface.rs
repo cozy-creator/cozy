@@ -4,6 +4,7 @@ use tensord::journal::Journal;
 use ed25519_dalek::SigningKey;
 use std::{
     fs,
+    io::Write as _,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
@@ -83,7 +84,66 @@ impl Machine {
 impl Drop for Machine {
     fn drop(&mut self) {
         self.stop();
+        if !std::thread::panicking() {
+            named_runtime_loaded(&self.root);
+        }
         let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+/// The named Runtime wheel's (`COZY_TEST_RUNTIME_WHEEL`) version and the commit stamped in it, read
+/// once; none unnamed. A wheel without a commit fails: it proves nothing.
+fn named_runtime() -> Option<&'static (String, String)> {
+    static NAMED: std::sync::OnceLock<Option<(String, String)>> = std::sync::OnceLock::new();
+    NAMED
+        .get_or_init(|| {
+            let wheel = PathBuf::from(std::env::var_os("COZY_TEST_RUNTIME_WHEEL")?);
+            let commit = stamped(&wheel);
+            assert!(
+                !commit.is_empty() && commit != "unknown",
+                "{wheel:?} names no commit (COMMIT = {commit:?}): a wheel without provenance proves nothing"
+            );
+            let version = wheel.file_name()?.to_str()?.split('-').nth(1)?.to_owned();
+            Some((version, commit))
+        })
+        .as_ref()
+}
+
+/// The commit a Runtime wheel was built from: its `cozy_runtime._build_provenance.COMMIT`.
+fn stamped(wheel: &Path) -> String {
+    let read = "import re, sys, zipfile\n\
+        text = zipfile.ZipFile(sys.argv[1]).read('cozy_runtime/_build_provenance.py').decode()\n\
+        print(re.search(r'^COMMIT = \"([^\"]*)\"', text, re.M).group(1))\n";
+    let out = Command::new("python3").args(["-I", "-c", read]).arg(wheel).output().unwrap();
+    assert!(out.status.success(), "reading {wheel:?}: {out:?}");
+    String::from_utf8(out.stdout).unwrap().trim().to_owned()
+}
+
+/// With a named Runtime, every package environment the machine at `root` built loads that build,
+/// by its commit; the log says so, since a silent pass reads as missing.
+fn named_runtime_loaded(root: &Path) {
+    let Some((version, commit)) = named_runtime() else { return };
+    let pythons: Vec<PathBuf> = fs::read_dir(root.join("state/generations"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|generation| generation.path().join("env/bin/python"))
+        .filter(|python| python.exists())
+        .collect();
+    for python in &pythons {
+        let out = Command::new(python)
+            .args(["-I", "-c", "from cozy_runtime._build_provenance import COMMIT; print(COMMIT)"])
+            .output()
+            .unwrap();
+        let loaded = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        assert_eq!(&loaded, commit, "{python:?} loads another Runtime than the named {version}: {out:?}");
+    }
+    if !pythons.is_empty() {
+        let _ = writeln!(
+            std::io::stderr(),
+            "named Runtime {version} (commit {commit}) loads: asserted in {} environments",
+            pythons.len()
+        );
     }
 }
 
@@ -190,6 +250,7 @@ print(json.dumps({"identity": generation.identity}))
 
 mod v1_api {
     use super::*;
+    use std::io::Write as _;
     use tensord::api::{
         capability::{mint, Grant, MACHINE},
         v1,
@@ -832,18 +893,15 @@ mod v1_api {
     /// no test's machine holds the probe's package.
     static NAMED_RUNTIME: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
     async fn named_runtime_loads(tools: &Path) {
-        let Some(wheel) = std::env::var_os("COZY_TEST_RUNTIME_WHEEL") else { return };
-        let want = stamped(Path::new(&wheel));
-        assert!(
-            !want.is_empty() && want != "unknown",
-            "{wheel:?} names no commit (COMMIT = {want:?}): a wheel without provenance proves nothing"
-        );
+        let Some((version, want)) = named_runtime() else { return };
+        let wheel = std::env::var_os("COZY_TEST_RUNTIME_WHEEL");
         let machine = Machine::start_args(|_, _| (), &installing_args(tools)).await;
         let client = client(&machine);
         let all = cap(Grant { action: MACHINE.into(), ..Default::default() });
         let manifest = write_package(&client, &all, "cpu_bulk", "local/tensord-cpu-bulk").await;
         let built = call(&client, &all, &manifest, ("provenance", "provenance"), serde_json::json!({})).await;
         assert_eq!(built["commit"], want.as_str(), "the machine loaded another Runtime than {wheel:?}");
+        let _ = writeln!(std::io::stderr(), "named Runtime {version} (commit {want}) loads: asserted");
     }
 
     /// The TensorFS wheel a Runtime wheel accepts, from PyPI, into `dir`.
@@ -857,16 +915,6 @@ subprocess.run([sys.executable, '-m', 'pip', 'download', '-q', '--no-deps', '--o
                 '--platform', 'manylinux_2_28_x86_64', '--platform', 'manylinux_2_17_x86_64', '-d', str(out), req], check=True)
 print(next(out.glob('tensorfs-*.whl')))
 ";
-
-    /// The commit a Runtime wheel was built from: its `cozy_runtime._build_provenance.COMMIT`.
-    fn stamped(wheel: &Path) -> String {
-        let read = "import re, sys, zipfile\n\
-            text = zipfile.ZipFile(sys.argv[1]).read('cozy_runtime/_build_provenance.py').decode()\n\
-            print(re.search(r'^COMMIT = \"([^\"]*)\"', text, re.M).group(1))\n";
-        let out = Command::new("python3").args(["-I", "-c", read]).arg(wheel).output().unwrap();
-        assert!(out.status.success(), "reading {wheel:?}: {out:?}");
-        String::from_utf8(out.stdout).unwrap().trim().to_owned()
-    }
 
     /// `serve`'s installer arguments: the test helper Python and the client wheel in `tools`.
     fn installing_args(tools: &Path) -> Vec<std::ffi::OsString> {
