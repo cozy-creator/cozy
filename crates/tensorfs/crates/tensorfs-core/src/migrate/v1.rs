@@ -110,7 +110,7 @@ const TENSORWISE: &[(&str, &str)] = &[
 const NVFP4: &[(&str, &str)] = &[
     ("weight", "weight"),
     ("weight_scale", "scale"),
-    ("weight_scale_2", "global_scale"),
+    ("weight_scale_2", "scale_2"),
     ("input_scale", "input_scale"),
 ];
 

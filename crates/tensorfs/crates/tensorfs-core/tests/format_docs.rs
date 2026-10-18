@@ -32,7 +32,7 @@ fn tensors() -> Vec<Tensor> {
         dtype: Dtype::F32,
         shape: vec![4, 1024],
         body: Body::Encoded {
-            encoding: Encoding::fp8_rowwise(&Dtype::F8_E4M3),
+            encoding: Encoding::fp8_rowwise(0),
             parts: vec![
                 part("weight", Dtype::F8_E4M3, vec![4, 1024], 0, 4096, 4096),
                 part("scale", Dtype::F32, vec![4], 1, 0, 16),

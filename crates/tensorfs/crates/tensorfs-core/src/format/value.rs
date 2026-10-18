@@ -31,13 +31,13 @@ impl Value {
     }
 }
 
-/// Strings bare, lists `[a, b]`, maps `{k: v}`: for reading, not parsing.
+/// Strings quoted, lists `[a, b]`, maps `{k: v}` with bare keys: for reading, not parsing.
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Value::Bool(b) => write!(f, "{b}"),
             Value::Int(i) => write!(f, "{i}"),
-            Value::Str(s) => f.write_str(s),
+            Value::Str(s) => f.write_str(&serde_json::to_string(s).map_err(|_| fmt::Error)?),
             Value::List(items) => {
                 f.write_str("[")?;
                 for (i, v) in items.iter().enumerate() {

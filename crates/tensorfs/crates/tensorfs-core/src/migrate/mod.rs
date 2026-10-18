@@ -29,7 +29,8 @@ use serde_json::{json, Map, Value as Json};
 use crate::failure::{fail, Kind, Result};
 use crate::format::layout::{ALIGN, GRID, STANDALONE};
 use crate::format::{
-    Body, Dtype, Encoding, Location, ObjectRef, Release, Repo, Value, HEADER_PATH,
+    Body, Dtype, Encoding, GlobalScale, Location, NibbleOrder, ObjectRef, Release, Repo,
+    ScaleLayout, Value, HEADER_PATH,
 };
 use crate::import::order::{self, constructor_order};
 use crate::import::tables;
@@ -657,13 +658,14 @@ fn digest(p: &v1::Part, b: &[u8]) -> String {
     }
 }
 
-/// The scheme's complete encoding; `weight` is the weight part's dtype.
-fn encoding(scheme: &str, weight: &Dtype) -> Encoding {
+/// The scheme's complete encoding.
+fn encoding(scheme: &str) -> Encoding {
     match scheme {
-        "fp8.rowwise" => Encoding::fp8_rowwise(weight),
-        "fp8.tensorwise" => Encoding::fp8_tensorwise(weight),
+        "fp8.rowwise" => Encoding::fp8_rowwise(0),
+        "fp8.tensorwise" => Encoding::fp8_tensorwise(),
         "int8.convrot" => Encoding::int8_convrot(256),
-        "nvfp4" => Encoding::nvfp4(),
+        // v1's nvfp4 is ModelOpt's layout: its border never took ComfyUI's.
+        "nvfp4" => Encoding::nvfp4(GlobalScale::Multiply, NibbleOrder::LowFirst, ScaleLayout::RowMajor),
         other => unreachable!("v1 maps to no {other}"),
     }
 }
@@ -750,7 +752,7 @@ fn conforms(
         "nvfp4" if cols % 16 == 0 => {
             want("weight", &[F4], &|s| s == [rows, cols])?;
             want("scale", &[F8_E4M3], &|s| s == [rows, cols / 16])?;
-            want("global_scale", &[F32], &|s| numel(s) == 1)?;
+            want("scale_2", &[F32], &|s| numel(s) == 1)?;
             optional("input_scale")
         }
         _ => Err(format!("{cols} columns do not fit {scheme}")),
@@ -797,7 +799,7 @@ fn put(
     }
     let data = match mapping {
         Mapping::Scheme(scheme, _) => Data::Encoded {
-            encoding: encoding(scheme, &parts.iter().find(|p| p.role == "weight").expect("conforms() checked the weight").dtype),
+            encoding: encoding(scheme),
             parts,
         },
         _ => Data::Plain(parts.pop().expect("a plain tensor has one part").data),
@@ -925,9 +927,7 @@ fn verify(
             let stored: Vec<(&str, &Dtype, &[u64], Location)> = match (&t2.body, mapping) {
                 (Body::Data(at), Mapping::Plain) => vec![("", &t2.dtype, &t2.shape, *at)],
                 (Body::Encoded { encoding: e, parts }, Mapping::Scheme(s, _))
-                    if parts.len() == t.parts.len()
-                        && (parts.iter().find(|p| p.role == "weight"))
-                            .is_some_and(|w| *e == encoding(s, &w.dtype)) =>
+                    if *e == encoding(s) && parts.len() == t.parts.len() =>
                 {
                     (parts.iter())
                         .map(|p| (p.role.as_str(), &p.dtype, p.shape.as_slice(), p.at()))

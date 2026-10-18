@@ -51,7 +51,6 @@ struct Entry<'a> {
 fn part_name(key: &str, role: &str) -> String {
     match role {
         "weight" => key.to_owned(),
-        "global_scale" => format!("{key}_scale_2"),
         "input_scale" => match key.strip_suffix(".weight") {
             Some(base) => format!("{base}.input_scale"),
             None => format!("{key}_input_scale"),

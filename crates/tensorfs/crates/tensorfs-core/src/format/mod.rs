@@ -10,7 +10,7 @@ mod json;
 pub mod layout;
 mod value;
 
-pub use decode::{decode, PartBytes, SCHEMES};
+pub use decode::{decode, GlobalScale, NibbleOrder, PartBytes, ScaleLayout, SCHEMES};
 pub use doc::{
     repo_key, Body, Component, Encoding, Header, Location, Manifest, Metadata, ObjectRef, Part,
     Release, Repo, Span, Tensor,

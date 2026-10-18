@@ -264,7 +264,7 @@ fn copy_and_a_base_share_the_large_parts_objects() {
     let scale: Vec<u8> = (0..rows)
         .flat_map(|r| (1.0f32 / (r + 1) as f32).to_le_bytes())
         .collect();
-    let encoding = Encoding::fp8_rowwise(&Dtype::F8_E4M3);
+    let encoding = Encoding::fp8_rowwise(0);
     let (mut weight_src, mut scale_src) = (&weight[..], &scale[..]);
     let parts = vec![
         PartData {

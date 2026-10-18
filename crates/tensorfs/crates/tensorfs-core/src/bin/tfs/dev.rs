@@ -7,7 +7,7 @@
 use std::io::Read;
 
 use tensorfs_core::failure::Result;
-use tensorfs_core::format::{Dtype, Encoding, ObjectRef};
+use tensorfs_core::format::{Dtype, Encoding, GlobalScale, NibbleOrder, ObjectRef, ScaleLayout};
 use tensorfs_core::store2::Store;
 use tensorfs_core::writer::{Data, PartData, Source};
 
@@ -77,6 +77,7 @@ enum Scheme {
     Plain,
     Fp8Rowwise,
     Fp8Tensorwise,
+    Int8Tensorwise,
     Int8Rowwise,
     Int8Convrot,
     Mxfp8,
@@ -150,8 +151,15 @@ fn plan(blocks: u64, scale: u64, plain: bool) -> Vec<Item> {
             "unet",
             k("attn2.to_k.weight"),
             Dtype::BF16,
-            square,
+            square.clone(),
             Scheme::Int8Rowwise,
+        ));
+        v.push(item(
+            "unet",
+            k("attn2.to_v.weight"),
+            Dtype::BF16,
+            square,
+            Scheme::Int8Tensorwise,
         ));
         v.push(item(
             "unet",
@@ -249,8 +257,8 @@ pub fn ckpt(store: &Store, blocks: u64, scale: u64, plain: bool, files: bool) ->
             }
             Scheme::Fp8Rowwise | Scheme::Fp8Tensorwise => (
                 match it.scheme {
-                    Scheme::Fp8Rowwise => Encoding::fp8_rowwise(&Dtype::F8_E4M3),
-                    _ => Encoding::fp8_tensorwise(&Dtype::F8_E4M3),
+                    Scheme::Fp8Rowwise => Encoding::fp8_rowwise(0),
+                    _ => Encoding::fp8_tensorwise(),
                 },
                 vec![
                     part(
@@ -260,17 +268,25 @@ pub fn ckpt(store: &Store, blocks: u64, scale: u64, plain: bool, files: bool) ->
                         fp8(&seed("weight"), numel),
                     ),
                     match it.scheme {
-                        Scheme::Fp8Rowwise => {
-                            part("scale", Dtype::F32, vec![rows], scales(&seed("scale"), rows))
-                        }
+                        Scheme::Fp8Rowwise => part(
+                            "scale",
+                            Dtype::F32,
+                            vec![rows],
+                            scales(&seed("scale"), rows),
+                        ),
                         _ => part("scale", Dtype::F32, vec![], scales(&seed("scale"), 1)),
                     },
                 ],
             ),
             Scheme::Mxfp8 => (
-                Encoding::mxfp8(&Dtype::F8_E4M3),
+                Encoding::mxfp8(ScaleLayout::RowMajor),
                 vec![
-                    part("weight", Dtype::F8_E4M3, it.shape.clone(), fp8(&seed("weight"), numel)),
+                    part(
+                        "weight",
+                        Dtype::F8_E4M3,
+                        it.shape.clone(),
+                        fp8(&seed("weight"), numel),
+                    ),
                     part(
                         "scale",
                         Dtype::F8_E8M0,
@@ -281,9 +297,10 @@ pub fn ckpt(store: &Store, blocks: u64, scale: u64, plain: bool, files: bool) ->
                     ),
                 ],
             ),
-            Scheme::Int8Rowwise | Scheme::Int8Convrot => (
+            Scheme::Int8Tensorwise | Scheme::Int8Rowwise | Scheme::Int8Convrot => (
                 match it.scheme {
-                    Scheme::Int8Rowwise => Encoding::int8_rowwise(),
+                    Scheme::Int8Tensorwise => Encoding::int8_tensorwise(),
+                    Scheme::Int8Rowwise => Encoding::int8_rowwise(0),
                     _ => Encoding::int8_convrot(256),
                 },
                 vec![
@@ -293,16 +310,25 @@ pub fn ckpt(store: &Store, blocks: u64, scale: u64, plain: bool, files: bool) ->
                         it.shape.clone(),
                         Noise::bytes(&seed("weight"), numel),
                     ),
-                    part(
-                        "scale",
-                        Dtype::F32,
-                        vec![rows],
-                        scales(&seed("scale"), rows),
-                    ),
+                    match it.scheme {
+                        Scheme::Int8Tensorwise => {
+                            part("scale", Dtype::F32, vec![], scales(&seed("scale"), 1))
+                        }
+                        _ => part(
+                            "scale",
+                            Dtype::F32,
+                            vec![rows],
+                            scales(&seed("scale"), rows),
+                        ),
+                    },
                 ],
             ),
             Scheme::Nvfp4 => (
-                Encoding::nvfp4(),
+                Encoding::nvfp4(
+                    GlobalScale::Multiply,
+                    NibbleOrder::LowFirst,
+                    ScaleLayout::RowMajor,
+                ),
                 vec![
                     part(
                         "weight",
@@ -316,7 +342,7 @@ pub fn ckpt(store: &Store, blocks: u64, scale: u64, plain: bool, files: bool) ->
                         vec![rows, cols / 16],
                         fp8(&seed("scale"), numel / 16),
                     ),
-                    part("global_scale", Dtype::F32, vec![], scales(&seed("global_scale"), 1)),
+                    part("scale_2", Dtype::F32, vec![], scales(&seed("scale_2"), 1)),
                 ],
             ),
         };
