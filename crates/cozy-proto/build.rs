@@ -4,8 +4,13 @@
 use std::process::Command;
 
 fn main() {
+    // Any owner: a container build reads a checkout mounted from another user.
     let git = |args: &[&str]| {
-        let out = Command::new("git").args(args).output().ok()?;
+        let out = Command::new("git")
+            .args(["-c", "safe.directory=*"])
+            .args(args)
+            .output()
+            .ok()?;
         out.status
             .success()
             .then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned())
