@@ -2,9 +2,10 @@
 //! PID 1 must), forwards stop signals and starts the service again after an abnormal exit, as
 //! the Go guardian restarts its request plane. A clean exit (a stop or an accepted release)
 //! ends it, and so does a second consecutive exit before readiness: measured progress, no timer.
-//! The service is always this executable, forked; an activated Runtime update is a new service
-//! on the activated SDK, and a candidate that never proves readiness is rolled back by this same
-//! parent.
+//! The service is this executable, forked; an activated Runtime update is a new service on the
+//! activated SDK. An activated binary (`super::binary`) is exec'd in place, same PID and arguments,
+//! and its own parent forks the service. A candidate that never proves readiness is rolled back by
+//! the parent then running: a binary by renaming the previous one back and exec'ing it.
 use nix::{
     errno::Errno,
     fcntl::OFlag,
@@ -20,9 +21,12 @@ use std::{
     os::fd::AsRawFd,
 };
 
+use super::{provider::ProviderSelf, update::Recovered};
+
 /// Forks the service. Returns only in the service child, with the pipe it reports readiness
-/// on; the parent exits with the service's final status.
-pub fn supervise(paths: &super::update::Paths) -> io::Result<Ready> {
+/// on; the parent exits with the service's final status, or execs an activated binary, handing
+/// on a rental's `provider` credential.
+pub fn supervise(paths: &super::update::Paths, provider: Option<ProviderSelf>) -> io::Result<Ready> {
     let mut signals = SigSet::empty();
     for signal in [Signal::SIGTERM, Signal::SIGINT, Signal::SIGCHLD] {
         signals.add(signal);
@@ -33,7 +37,9 @@ pub fn supervise(paths: &super::update::Paths) -> io::Result<Ready> {
     let parent = nix::unistd::getpid();
     let mut failures_before_ready = 0;
     loop {
-        super::update::recover_activation(paths)?;
+        if let Recovered::Exec(launch) = super::update::recover_activation(paths)? {
+            exec(paths, &launch, provider.as_ref(), &signals)?;
+        }
         let (read, write) = pipe2(OFlag::O_CLOEXEC).map_err(io::Error::from)?;
         // SAFETY: no thread exists yet in this process; the child continues single-threaded.
         let child = match unsafe { fork() }.map_err(io::Error::from)? {
@@ -60,7 +66,8 @@ pub fn supervise(paths: &super::update::Paths) -> io::Result<Ready> {
         if stopping || code == 0 {
             std::process::exit(code);
         }
-        if code == super::update::REPLACE_EXIT {
+        // An activated binary is exec'd as the loop recovers its published activation.
+        if code == super::update::REPLACE_EXIT || code == super::binary::EXEC_EXIT {
             tracing::info!("starting the service on its updated software");
             failures_before_ready = 0;
             continue;
@@ -68,16 +75,33 @@ pub fn supervise(paths: &super::update::Paths) -> io::Result<Ready> {
         failures_before_ready = if ready { 0 } else { failures_before_ready + 1 };
         if failures_before_ready >= 2 {
             let cause = format!("the service exited twice before readiness ({code})");
-            if super::update::rollback_pending(paths, &cause)? {
-                tracing::warn!("{cause}; Runtime update rolled back");
-                failures_before_ready = 0;
-                continue;
+            match super::update::rollback_pending(paths, &cause)? {
+                Recovered::Nothing => {
+                    tracing::error!("{cause}; stopping");
+                    std::process::exit(code);
+                }
+                Recovered::Restored => tracing::warn!("{cause}; update rolled back"),
+                Recovered::Exec(launch) => {
+                    tracing::warn!("{cause}; update rolled back to the previous binary");
+                    exec(paths, &launch, provider.as_ref(), &signals)?;
+                }
             }
-            tracing::error!("{cause}; stopping");
-            std::process::exit(code);
+            failures_before_ready = 0;
+            continue;
         }
         tracing::warn!("the service exited ({code}); starting it again");
     }
+}
+
+/// Replaces this parent with the binary at `launch`. One that will not exec is rolled back, and
+/// this image serves on.
+fn exec(paths: &super::update::Paths, launch: &std::path::Path, provider: Option<&ProviderSelf>, signals: &SigSet) -> io::Result<()> {
+    tracing::info!("running {}", launch.display());
+    let error = super::binary::exec(launch, provider);
+    signals.thread_block().map_err(io::Error::from)?;
+    let cause = format!("cannot run {}: {error}", launch.display());
+    tracing::error!("{cause}");
+    super::update::rollback_pending(paths, &cause).map(drop)
 }
 
 /// Places `fd` at `at` for the re-executed machine to inherit (dup2 clears close-on-exec on the copy).

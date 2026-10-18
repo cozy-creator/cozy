@@ -213,6 +213,7 @@ async fn canceled_ids_refuse_updates_and_another_actors_update_never_shadows_the
         history: vec![tensord::machine::update::Step {
             state: "succeeded".into(),
             at_ms: 1,
+            ..Default::default()
         }],
         ..Default::default()
     };

@@ -36,7 +36,11 @@ pub fn machine(lifetime: Lifetime) -> ExitCode {
 }
 
 fn run(lifetime: Lifetime) -> io::Result<()> {
-    use crate::machine::{identity, provider::ProviderSelf, ssh, supervise, update};
+    use crate::machine::{binary, identity, provider::ProviderSelf, ssh, supervise, update};
+    // Where this binary was started from, before anything can rename another over it.
+    if let Err(error) = binary::record() {
+        eprintln!("cannot record this binary's launch path ({error}): it never activates another");
+    }
     // Linux names the calling thread: this one, before any other starts.
     if let Err(error) = cozy_platform::process::set_name("tensord") {
         if !error.is_unsupported() {
@@ -67,7 +71,7 @@ fn run(lifetime: Lifetime) -> io::Result<()> {
     }
     let paths = update::Paths::new(&grant.layout.engine(), &grant.layout.root);
     update::retire_agent(&paths);
-    let ready = supervise::supervise(&paths)?;
+    let ready = supervise::supervise(&paths, grant.provider.clone())?;
     run_machine(config, ready)
 }
 
