@@ -24,6 +24,43 @@ fn json(home: &Home, dir: &Path, args: &[&str]) -> Value {
     serde_json::from_str(&out.stdout).unwrap_or_else(|e| panic!("{e}: {out:?}"))
 }
 
+/// Runs `args` and answers what it printed. One still running after `minutes` is killed and fails
+/// the test with its output so far: a hang bound for the test, never the product's.
+fn bounded(home: &Home, dir: &Path, args: &[&str], minutes: u64) -> Out {
+    let file = |name: &str| home.path().join(format!("bounded.{name}"));
+    let mut child = home
+        .command()
+        .current_dir(dir)
+        .args(args)
+        .stdout(std::fs::File::create(file("out")).unwrap())
+        .stderr(std::fs::File::create(file("err")).unwrap())
+        .spawn()
+        .unwrap();
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(minutes * 60);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if std::time::Instant::now() > until {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    };
+    let read = |name: &str| std::fs::read_to_string(file(name)).unwrap_or_default();
+    let out = Out {
+        code: status.and_then(|s| s.code()).unwrap_or(-1),
+        stdout: read("out"),
+        stderr: read("err"),
+    };
+    assert!(
+        status.is_some(),
+        "{args:?} still ran after {minutes} min: {out:?}"
+    );
+    out
+}
+
 /// What a person debugging this test wants: the runs and the machine as Calcifer holds them.
 fn state(home: &Home, dir: &Path) -> String {
     let runs = cozy(home, dir, &["--json", "run", "list"]);
@@ -208,47 +245,32 @@ fn an_unversioned_install_takes_the_hubs_newest_release() {
 }
 
 /// R's sequence (tensorhub 39107019882): `package update --on` right after `machine rent --detach`
-/// was refused while the rental booted. Each verb sent to a booting rental (the CI Hub's docker
-/// provider) now waits for it: update, list and remove say so and answer once it starts, and an
-/// install queues and lands.
+/// was refused while the rental booted. Each verb sent the moment its rental is rented (the CI
+/// Hub's docker provider) now waits for it: update, list and remove say so and answer once it
+/// starts, and an install queues and lands.
 #[test]
 fn package_verbs_sent_to_a_booting_rental_wait_for_it() {
     let Some(home) = Home::with_hub() else { return };
     home.sign_in("booting@cozy.test");
     let package = package::publish(&home, "tiny", "0.1.0");
     let dir = package::project(&home, "tiny");
-    let rent = || {
+    // R's sequence for each verb: rent, then the verb at once, while the rental boots.
+    let mut rentals = vec![];
+    let mut sent = |verb: &[&str]| {
         let rented = json(&home, &dir, &["machine", "rent", "cpu", "--detach"]);
         assert_eq!(rented["machine"]["state"], "booting", "{rented}");
-        rented["machine"]["rental_id"].as_str().unwrap().to_owned()
+        let rental = rented["machine"]["rental_id"].as_str().unwrap().to_owned();
+        eprintln!("{verb:?} --on {rental}, booting");
+        let out = bounded(&home, &dir, &[verb, &["--on", &rental]].concat(), 10);
+        eprintln!("{out:?}");
+        rentals.push(rental.clone());
+        (rental, out)
     };
-    // Each verb on its own rental, sent the moment it is rented; all four boot at once.
-    let start = |verb: &[&str]| {
-        let rental = rent();
-        let child = home
-            .command()
-            .current_dir(&dir)
-            .args([verb, &["--on", &rental]].concat())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
-        (rental, child)
-    };
-    let started = [
-        start(&["package", "update"]),
-        start(&["package", "list", "--once"]),
-        start(&["package", "remove", &package]),
-        start(&["--json", "package", "install", &package]),
-    ];
-    let (rentals, outs): (Vec<String>, Vec<Out>) = started
-        .into_iter()
-        .map(|(rental, child)| (rental, common::out(child.wait_with_output().unwrap())))
-        .unzip();
-    let [update, list, remove, install] = &outs[..] else {
-        unreachable!()
-    };
-    for out in [update, list, remove] {
+    let (_, update) = sent(&["package", "update"]);
+    let (_, list) = sent(&["package", "list", "--once"]);
+    let (_, remove) = sent(&["package", "remove", &package]);
+    let (installed_on, install) = sent(&["--json", "package", "install", &package]);
+    for out in [&update, &list, &remove] {
         assert!(out.stderr.contains(" to start"), "it did not wait: {out:?}");
     }
     assert_eq!(update.code, 0, "{update:?}");
@@ -267,7 +289,7 @@ fn package_verbs_sent_to_a_booting_rental_wait_for_it() {
         (0, Some("run.completed")),
         "{install:?}"
     );
-    let listed = json(&home, &dir, &["package", "list", "--on", &rentals[3]]);
+    let listed = json(&home, &dir, &["package", "list", "--on", &installed_on]);
     assert_eq!(listed["packages"][0]["release"], "0.1.0", "{listed}");
 
     for rental in rentals {
