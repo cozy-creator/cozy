@@ -35,7 +35,7 @@ impl Pin {
 }
 
 /// ASCII letters, digits, `.`, `_` and `-`, not leading `.`.
-fn is_name(text: &str, max: usize) -> bool {
+pub(crate) fn is_name(text: &str, max: usize) -> bool {
     !text.is_empty()
         && text.len() <= max
         && !text.starts_with('.')

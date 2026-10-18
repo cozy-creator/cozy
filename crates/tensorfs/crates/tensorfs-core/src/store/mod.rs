@@ -12,11 +12,14 @@
 //! - Processes share a store with no leases, markers or boot-time rehash: a torn write never has
 //!   a name, and an open descriptor outlives an unlink.
 
+mod checkpoint;
 mod gc;
 mod records;
 
+pub use checkpoint::{Checkpoint, ChunkRead, Piece, Placed, ReadPlan};
 pub use gc::{Collected, PinUsage, Usage};
 pub use records::Pin;
+pub(crate) use records::is_name;
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -27,7 +30,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cozy_platform::durable::{self, DiskClass, FileId};
 
-use crate::format::ObjectRef;
+use crate::err::{Code, Refusal};
+use crate::fetch;
+use crate::format::{self, ObjectRef};
 use crate::sha256::{hex, Sha256};
 
 const FORMAT: &str = "tensorfs.store/2";
@@ -80,6 +85,9 @@ pub enum Error {
     Mismatch { expected: ObjectRef, got: String },
     #[error("{}: {why}", path.display())]
     Invalid { path: PathBuf, why: String },
+    /// A document, or a tensor written or read, breaks cozytensors/2.
+    #[error(transparent)]
+    Format(#[from] format::Error),
 }
 
 impl Error {
@@ -90,6 +98,28 @@ impl Error {
             Error::Absent(_) => "absent",
             Error::Mismatch { .. } => "mismatch",
             Error::Invalid { .. } => "invalid",
+            Error::Format(error) => error.code(),
+        }
+    }
+}
+
+impl Error {
+    /// The refusal the fetch and import layers speak.
+    pub fn refusal(self) -> Refusal {
+        let code = match &self {
+            Error::Io { .. } => Code::IO_FAILED,
+            Error::Full { .. } => Code::CAPACITY_EXHAUSTED,
+            Error::Absent(_) => Code::OBJECT_ABSENT,
+            Error::Mismatch { .. } => Code::OBJECT_ID_MISMATCH,
+            Error::Invalid { .. } => Code::UNKNOWN_FORMAT,
+            Error::Format(format::Error::UnknownScheme(_)) => Code::UNKNOWN_ENCODING,
+            Error::Format(format::Error::Decode(_)) => Code::ENCODING_MISMATCH,
+            Error::Format(format::Error::Format { .. }) => Code::UNKNOWN_FORMAT,
+            Error::Format(format::Error::Invalid(_)) => Code::TENSOR_SCHEMA_MISMATCH,
+        };
+        Refusal {
+            code,
+            detail: self.to_string(),
         }
     }
 }
@@ -213,6 +243,11 @@ impl Store {
 
     pub fn durability(&self) -> Durability {
         self.durability
+    }
+
+    /// How long an unreferenced object outlives its last write or reuse.
+    pub fn grace(&self) -> Duration {
+        self.grace
     }
 
     /// Where `object` lives. A malformed digest has no path.
@@ -378,7 +413,7 @@ impl Store {
         synced.map_err(fail("syncfs", &self.root))
     }
 
-    fn flushes(&self) -> bool {
+    pub(crate) fn flushes(&self) -> bool {
         self.durability == Durability::Durable
     }
 
@@ -596,8 +631,39 @@ impl Drop for Admission {
     }
 }
 
-fn sync_dir(dir: &Path) -> Result<()> {
+pub(crate) fn sync_dir(dir: &Path) -> Result<()> {
     durable::sync_dir(dir).map_err(platform("sync directory", dir))
+}
+
+/// The fetcher admits through the store's one door (design §5).
+impl fetch::ObjectStore for Store {
+    fn has(&self, object: &ObjectRef) -> bool {
+        self.reuse(object).unwrap_or(false)
+    }
+
+    fn open(&self, object: &ObjectRef) -> io::Result<File> {
+        self.file(object).map_err(|error| match error {
+            Error::Absent(_) => io::Error::new(io::ErrorKind::NotFound, error.to_string()),
+            Error::Io { source, .. } => source,
+            other => io::Error::other(other.to_string()),
+        })
+    }
+
+    fn admit(&self, object: &ObjectRef) -> crate::err::Result<Box<dyn fetch::Admission>> {
+        let admission = Store::admit(self, Some(object)).map_err(Error::refusal)?;
+        Ok(Box::new(admission))
+    }
+}
+
+impl fetch::Admission for Admission {
+    fn write(&mut self, bytes: &[u8]) -> crate::err::Result<()> {
+        self.write_all(bytes)
+            .map_err(|error| self.refusal(error).refusal())
+    }
+
+    fn commit(self: Box<Self>) -> crate::err::Result<()> {
+        self.finish().map(drop).map_err(Error::refusal)
+    }
 }
 
 /// Makes an existing file young for GC; `None` when it is absent.
@@ -663,7 +729,7 @@ pub mod fault {
 }
 
 #[cfg(not(feature = "faults"))]
-mod fault {
+pub(crate) mod fault {
     #[inline(always)]
     pub(crate) fn point(_: &str) {}
 }

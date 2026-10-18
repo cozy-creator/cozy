@@ -93,6 +93,8 @@ pub mod transport;
 #[cfg(feature = "store")]
 pub mod unsynced;
 pub mod vectors;
+#[cfg(feature = "store")]
+pub mod writer;
 
 
 /// This TensorFS's release version.
