@@ -130,7 +130,7 @@ mod imp {
             self.0.pid()
         }
 
-        #[pyo3(signature = (*, context = 0, resident = 0, cold = 0, pinned = 0, torch_reserved = 0,
+        #[pyo3(signature = (*, context = 0, resident = 0, cold = 0, kept = 0, pinned = 0, torch_reserved = 0,
             torch_allocated = 0, cache = 0, idle = 0, active_peak = 0, last_use = 0))]
         #[allow(clippy::too_many_arguments)]
         fn publish(
@@ -138,6 +138,7 @@ mod imp {
             context: u64,
             resident: u64,
             cold: u64,
+            kept: u64,
             pinned: u64,
             torch_reserved: u64,
             torch_allocated: u64,
@@ -150,6 +151,7 @@ mod imp {
                 context,
                 resident,
                 cold,
+                kept,
                 pinned,
                 torch_reserved,
                 torch_allocated,
@@ -221,6 +223,7 @@ mod imp {
         context: u64,
         resident: u64,
         cold: u64,
+        kept: u64,
         pinned: u64,
         torch_reserved: u64,
         torch_allocated: u64,
@@ -251,6 +254,7 @@ mod imp {
                 context: f.context,
                 resident: f.resident,
                 cold: f.cold,
+                kept: f.kept,
                 pinned: f.pinned,
                 torch_reserved: f.torch_reserved,
                 torch_allocated: f.torch_allocated,

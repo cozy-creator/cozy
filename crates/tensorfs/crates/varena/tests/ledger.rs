@@ -78,7 +78,7 @@ impl Proc {
 
 fn publish(f: &Facts) -> String {
     let w = [
-        f.context, f.resident, f.cold, f.pinned, f.torch_reserved, f.torch_allocated, f.cache, f.idle,
+        f.context, f.resident, f.cold, f.kept, f.pinned, f.torch_reserved, f.torch_allocated, f.cache, f.idle,
         f.active_peak, f.last_use,
     ];
     format!("publish {}", w.map(|n| n.to_string()).join(" "))
@@ -98,6 +98,7 @@ fn counted(k: u64) -> Facts {
         context: k,
         resident: k,
         cold: k,
+        kept: k,
         pinned: k,
         torch_reserved: k,
         torch_allocated: k,
@@ -130,10 +131,10 @@ fn child() {
                 out
             }
             "publish" => {
-                let [context, resident, cold, pinned, torch_reserved, torch_allocated, cache, idle, active_peak, last_use] =
+                let [context, resident, cold, kept, pinned, torch_reserved, torch_allocated, cache, idle, active_peak, last_use] =
                     w[..].try_into().unwrap();
                 facts = Facts {
-                    context, resident, cold, pinned, torch_reserved, torch_allocated, cache, idle, active_peak, last_use,
+                    context, resident, cold, kept, pinned, torch_reserved, torch_allocated, cache, idle, active_peak, last_use,
                 };
                 row.as_ref().unwrap().publish(&facts);
                 vec![]
@@ -172,6 +173,7 @@ fn two_processes_publish_and_a_third_reads_exact_snapshots() {
         context: 500 * MIB,
         resident: 10 * GIB,
         cold: 4 * GIB,
+        kept: 0,
         pinned: GIB,
         torch_reserved: 3 * GIB,
         torch_allocated: 2 * GIB,
@@ -184,6 +186,7 @@ fn two_processes_publish_and_a_third_reads_exact_snapshots() {
         context: 450 * MIB,
         resident: 2 * GIB,
         cold: 0,
+        kept: 0,
         pinned: 2 * GIB,
         torch_reserved: GIB,
         torch_allocated: GIB,
@@ -363,6 +366,30 @@ fn a_victim_that_never_progresses_is_stalled() {
     assert!(victims.iter().all(|v| ledger.answered(v).unwrap()));
     b.kill9();
     c.kill9();
+}
+
+/// A warm-set (`keep`) row's cold bytes are asked for only after every other row's, however
+/// long ago it was used; its idle bytes are not held back.
+#[test]
+fn kept_cold_bytes_are_asked_last() {
+    let (ledger, _fd) = Ledger::create("GPU-kept", 24 * GIB).unwrap();
+    let rows = [
+        (30, Facts { resident: 2 * GIB, cold: 2 * GIB, kept: 2 * GIB, idle: 256 * MIB, last_use: 1, ..Facts::default() }),
+        (31, Facts { resident: GIB, cold: GIB, last_use: 5, ..Facts::default() }),
+        (32, Facts { resident: 3 * GIB, cold: 2 * GIB, kept: GIB, last_use: 9, ..Facts::default() }),
+    ];
+    let held: Vec<_> = rows.iter().map(|(pid, f)| {
+        let row = ledger.claim(*pid).unwrap();
+        row.publish(f);
+        row
+    }).collect();
+    let order = |victims: &[varena::ledger::Victim]| victims.iter().map(|v| (v.pid, v.bytes)).collect::<Vec<_>>();
+    let all_but_kept = 256 * MIB + GIB + GIB;
+    let Admit::After { victims, short } = ledger.admit(24 * GIB - (6 * GIB + 256 * MIB) + all_but_kept).unwrap() else { panic!() };
+    assert_eq!((order(&victims), short), (vec![(30, 256 * MIB), (31, GIB), (32, GIB)], 0));
+    let victims = ledger.ask(None, all_but_kept + 2 * GIB + 512 * MIB).unwrap();
+    assert_eq!(order(&victims), [(30, 256 * MIB + 2 * GIB), (31, GIB), (32, GIB + 512 * MIB)]);
+    drop(held);
 }
 
 /// 11405: an idle executor kept 7.27 GiB in torch after a failed request. TensorD unmapped plane

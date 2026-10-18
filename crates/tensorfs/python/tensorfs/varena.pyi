@@ -429,6 +429,8 @@ class RowFacts:
     @property
     def cold(self) -> int: ...
     @property
+    def kept(self) -> int: ...
+    @property
     def pinned(self) -> int: ...
     @property
     def torch_reserved(self) -> int: ...
@@ -468,6 +470,7 @@ class Row:
         context: int = 0,
         resident: int = 0,
         cold: int = 0,
+        kept: int = 0,
         pinned: int = 0,
         torch_reserved: int = 0,
         torch_allocated: int = 0,
