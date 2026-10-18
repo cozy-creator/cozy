@@ -1,32 +1,91 @@
 //! Construction order for a source already in the canonical layout (spec §10). Safetensors files
-//! sort their keys, so the order comes from a generated reference (`converters/orders.json`,
-//! `scripts/orders.py`): for each parent pattern of a model class, its children in the order the
-//! class's `state_dict()` gives them. Nothing here sorts names.
+//! sort their keys, so the order comes from the model class's generated reference
+//! (`orders/<class>.json`, `scripts/orders.py`): for each parent pattern, its children in the
+//! order the class's `state_dict()` gives them. Nothing here sorts names.
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use serde::Deserialize;
 
-#[derive(Deserialize)]
-struct Doc {
-    references: Vec<Reference>,
+macro_rules! orders {
+    ($($class:literal),* $(,)?) => {
+        [$(($class, include_str!(concat!("../../orders/", $class, ".json")))),*]
+    };
 }
+
+/// Every class with a reference, by its `_class_name` (Diffusers) or `architectures[0]`
+/// (Transformers).
+const ORDERS: [(&str, &str); 13] = orders![
+    "AnimaTextConditioner",
+    "AutoencoderKL",
+    "AutoencoderKLQwenImage",
+    "CLIPTextModel",
+    "CLIPTextModelWithProjection",
+    "CosmosTransformer3DModel",
+    "MiniMaxH3Transformer3DModel",
+    "Qwen2_5_VLForConditionalGeneration",
+    "Qwen3Model",
+    "Qwen3VLForConditionalGeneration",
+    "Qwen3_5ForConditionalGeneration",
+    "QwenImageTransformer2DModel",
+    "UNet2DConditionModel",
+];
 
 #[derive(Deserialize)]
 struct Reference {
-    name: String,
     /// Parent pattern (digit segments `#`, `""` for the root) → its children in order.
     children: HashMap<String, Vec<String>>,
 }
 
-fn references() -> &'static [Reference] {
-    static REFS: OnceLock<Vec<Reference>> = OnceLock::new();
-    REFS.get_or_init(|| {
-        let doc: Doc = serde_json::from_str(include_str!("../../converters/orders.json"))
-            .expect("orders.json is generated");
-        doc.references
-    })
+fn reference(class: &str) -> Option<&'static Reference> {
+    static REFS: OnceLock<HashMap<&'static str, Reference>> = OnceLock::new();
+    let refs = REFS.get_or_init(|| {
+        (ORDERS.iter())
+            .map(|(class, json)| {
+                let parsed = serde_json::from_str(json).expect("orders are generated");
+                (*class, parsed)
+            })
+            .collect()
+    });
+    refs.get(class)
+}
+
+/// The classes with a reference.
+pub fn classes() -> impl Iterator<Item = &'static str> {
+    ORDERS.iter().map(|(class, _)| *class)
+}
+
+/// `keys` in a class's construction order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ordered {
+    /// Positions into the keys, in construction order.
+    pub order: Vec<usize>,
+    /// Positions of keys whose path the reference does not hold (or every key, without a
+    /// reference): they keep the source's data order after the known children of their parent.
+    pub unknown: Vec<usize>,
+}
+
+/// `keys` in `class`'s construction order. `data` is each key's place in the source (the order
+/// of its bytes). Indices ascend; a child the reference lacks, or every key of a class without
+/// a reference, keeps the data order and is reported in `unknown`.
+pub fn constructor_order<D: Ord + Copy>(class: Option<&str>, keys: &[(&str, D)]) -> Ordered {
+    let reference = class.and_then(reference);
+    let paths: Vec<Vec<&str>> = keys.iter().map(|(k, _)| k.split('.').collect()).collect();
+    let mut order = Vec::with_capacity(keys.len());
+    arrange(
+        keys,
+        &paths,
+        (0..keys.len()).collect(),
+        0,
+        "",
+        reference,
+        &mut order,
+    );
+    let unknown = (0..keys.len())
+        .filter(|i| reference.is_none_or(|r| !r.covers(&paths[*i])))
+        .collect();
+    Ordered { order, unknown }
 }
 
 fn index(segment: &str) -> bool {
@@ -49,12 +108,10 @@ fn join(parent: &str, segment: &str) -> String {
 }
 
 impl Reference {
-    /// Whether every step of `key`'s path is a child the reference knows.
-    fn covers(&self, key: &str) -> bool {
+    fn covers(&self, path: &[&str]) -> bool {
         let mut parent = String::new();
-        for segment in key.split('.') {
-            let known = self.children.get(&parent);
-            if !known.is_some_and(|c| c.iter().any(|c| c == child(segment))) {
+        for segment in path {
+            if self.rank(&parent, segment).is_none() {
                 return false;
             }
             parent = join(&parent, segment);
@@ -66,31 +123,6 @@ impl Reference {
         let children = self.children.get(parent)?;
         children.iter().position(|c| c == child(segment))
     }
-}
-
-/// The positions of `keys` in construction order, and the reference that gave it. `data` is
-/// each key's place in the source's data. The reference is the one covering most keys, when it
-/// covers more than half; children it does not know follow the known ones in data order, and
-/// without a reference the whole source keeps its data order.
-pub fn order<D: Ord + Copy>(keys: &[(&str, D)]) -> (Vec<usize>, Option<&'static str>) {
-    let best = references()
-        .iter()
-        .map(|r| (keys.iter().filter(|(k, _)| r.covers(k)).count(), r))
-        .max_by_key(|(n, _)| *n)
-        .filter(|(n, _)| 2 * n > keys.len())
-        .map(|(_, r)| r);
-    let paths: Vec<Vec<&str>> = keys.iter().map(|(k, _)| k.split('.').collect()).collect();
-    let mut out = Vec::with_capacity(keys.len());
-    arrange(
-        keys,
-        &paths,
-        (0..keys.len()).collect(),
-        0,
-        "",
-        best,
-        &mut out,
-    );
-    (out, best.map(|r| r.name.as_str()))
 }
 
 /// Emits `members` (keys sharing their first `depth` segments) in order: a key ending here,

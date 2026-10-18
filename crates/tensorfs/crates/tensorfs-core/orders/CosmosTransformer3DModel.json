@@ -1,0 +1,166 @@
+{
+ "class": "CosmosTransformer3DModel",
+ "sources": [
+  "hf://circlestone-labs/Anima-Base-v1.0-Diffusers@073c3a9db359c31ad0e8aa268d15775473c2176c/transformer"
+ ],
+ "generator": "scripts/orders.py",
+ "diffusers": "0.41.0.dev0",
+ "transformers": "5.20.0",
+ "children": {
+  "": [
+   "patch_embed",
+   "time_embed",
+   "transformer_blocks",
+   "norm_out",
+   "proj_out"
+  ],
+  "patch_embed": [
+   "proj"
+  ],
+  "patch_embed.proj": [
+   "weight"
+  ],
+  "time_embed": [
+   "t_embedder",
+   "norm"
+  ],
+  "time_embed.t_embedder": [
+   "linear_1",
+   "linear_2"
+  ],
+  "time_embed.t_embedder.linear_1": [
+   "weight"
+  ],
+  "time_embed.t_embedder.linear_2": [
+   "weight"
+  ],
+  "time_embed.norm": [
+   "weight"
+  ],
+  "transformer_blocks": [
+   "#"
+  ],
+  "transformer_blocks.#": [
+   "norm1",
+   "attn1",
+   "norm2",
+   "attn2",
+   "norm3",
+   "ff"
+  ],
+  "transformer_blocks.#.norm1": [
+   "linear_1",
+   "linear_2"
+  ],
+  "transformer_blocks.#.norm1.linear_1": [
+   "weight"
+  ],
+  "transformer_blocks.#.norm1.linear_2": [
+   "weight"
+  ],
+  "transformer_blocks.#.attn1": [
+   "norm_q",
+   "norm_k",
+   "to_q",
+   "to_k",
+   "to_v",
+   "to_out"
+  ],
+  "transformer_blocks.#.attn1.norm_q": [
+   "weight"
+  ],
+  "transformer_blocks.#.attn1.norm_k": [
+   "weight"
+  ],
+  "transformer_blocks.#.attn1.to_q": [
+   "weight"
+  ],
+  "transformer_blocks.#.attn1.to_k": [
+   "weight"
+  ],
+  "transformer_blocks.#.attn1.to_v": [
+   "weight"
+  ],
+  "transformer_blocks.#.attn1.to_out": [
+   "#"
+  ],
+  "transformer_blocks.#.attn1.to_out.#": [
+   "weight"
+  ],
+  "transformer_blocks.#.norm2": [
+   "linear_1",
+   "linear_2"
+  ],
+  "transformer_blocks.#.norm2.linear_1": [
+   "weight"
+  ],
+  "transformer_blocks.#.norm2.linear_2": [
+   "weight"
+  ],
+  "transformer_blocks.#.attn2": [
+   "norm_q",
+   "norm_k",
+   "to_q",
+   "to_k",
+   "to_v",
+   "to_out"
+  ],
+  "transformer_blocks.#.attn2.norm_q": [
+   "weight"
+  ],
+  "transformer_blocks.#.attn2.norm_k": [
+   "weight"
+  ],
+  "transformer_blocks.#.attn2.to_q": [
+   "weight"
+  ],
+  "transformer_blocks.#.attn2.to_k": [
+   "weight"
+  ],
+  "transformer_blocks.#.attn2.to_v": [
+   "weight"
+  ],
+  "transformer_blocks.#.attn2.to_out": [
+   "#"
+  ],
+  "transformer_blocks.#.attn2.to_out.#": [
+   "weight"
+  ],
+  "transformer_blocks.#.norm3": [
+   "linear_1",
+   "linear_2"
+  ],
+  "transformer_blocks.#.norm3.linear_1": [
+   "weight"
+  ],
+  "transformer_blocks.#.norm3.linear_2": [
+   "weight"
+  ],
+  "transformer_blocks.#.ff": [
+   "net"
+  ],
+  "transformer_blocks.#.ff.net": [
+   "#"
+  ],
+  "transformer_blocks.#.ff.net.#": [
+   "proj",
+   "weight"
+  ],
+  "transformer_blocks.#.ff.net.#.proj": [
+   "weight"
+  ],
+  "norm_out": [
+   "linear_1",
+   "linear_2"
+  ],
+  "norm_out.linear_1": [
+   "weight"
+  ],
+  "norm_out.linear_2": [
+   "weight"
+  ],
+  "proj_out": [
+   "weight"
+  ]
+ }
+}

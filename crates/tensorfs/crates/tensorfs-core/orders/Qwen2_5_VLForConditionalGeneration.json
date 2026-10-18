@@ -1,0 +1,149 @@
+{
+ "class": "Qwen2_5_VLForConditionalGeneration",
+ "sources": [
+  "hf://Qwen/Qwen-Image@75e0b4be04f60ec59a75f475837eced720f823b6/text_encoder"
+ ],
+ "generator": "scripts/orders.py",
+ "diffusers": "0.41.0.dev0",
+ "transformers": "5.20.0",
+ "children": {
+  "": [
+   "visual",
+   "model",
+   "lm_head"
+  ],
+  "visual": [
+   "patch_embed",
+   "blocks",
+   "merger"
+  ],
+  "visual.patch_embed": [
+   "proj"
+  ],
+  "visual.patch_embed.proj": [
+   "weight"
+  ],
+  "visual.blocks": [
+   "#"
+  ],
+  "visual.blocks.#": [
+   "norm1",
+   "norm2",
+   "attn",
+   "mlp"
+  ],
+  "visual.blocks.#.norm1": [
+   "weight"
+  ],
+  "visual.blocks.#.norm2": [
+   "weight"
+  ],
+  "visual.blocks.#.attn": [
+   "qkv",
+   "proj"
+  ],
+  "visual.blocks.#.attn.qkv": [
+   "weight",
+   "bias"
+  ],
+  "visual.blocks.#.attn.proj": [
+   "weight",
+   "bias"
+  ],
+  "visual.blocks.#.mlp": [
+   "gate_proj",
+   "up_proj",
+   "down_proj"
+  ],
+  "visual.blocks.#.mlp.gate_proj": [
+   "weight",
+   "bias"
+  ],
+  "visual.blocks.#.mlp.up_proj": [
+   "weight",
+   "bias"
+  ],
+  "visual.blocks.#.mlp.down_proj": [
+   "weight",
+   "bias"
+  ],
+  "visual.merger": [
+   "ln_q",
+   "mlp"
+  ],
+  "visual.merger.ln_q": [
+   "weight"
+  ],
+  "visual.merger.mlp": [
+   "#"
+  ],
+  "visual.merger.mlp.#": [
+   "weight",
+   "bias"
+  ],
+  "model": [
+   "embed_tokens",
+   "layers",
+   "norm"
+  ],
+  "model.embed_tokens": [
+   "weight"
+  ],
+  "model.layers": [
+   "#"
+  ],
+  "model.layers.#": [
+   "self_attn",
+   "mlp",
+   "input_layernorm",
+   "post_attention_layernorm"
+  ],
+  "model.layers.#.self_attn": [
+   "q_proj",
+   "k_proj",
+   "v_proj",
+   "o_proj"
+  ],
+  "model.layers.#.self_attn.q_proj": [
+   "weight",
+   "bias"
+  ],
+  "model.layers.#.self_attn.k_proj": [
+   "weight",
+   "bias"
+  ],
+  "model.layers.#.self_attn.v_proj": [
+   "weight",
+   "bias"
+  ],
+  "model.layers.#.self_attn.o_proj": [
+   "weight"
+  ],
+  "model.layers.#.mlp": [
+   "gate_proj",
+   "up_proj",
+   "down_proj"
+  ],
+  "model.layers.#.mlp.gate_proj": [
+   "weight"
+  ],
+  "model.layers.#.mlp.up_proj": [
+   "weight"
+  ],
+  "model.layers.#.mlp.down_proj": [
+   "weight"
+  ],
+  "model.layers.#.input_layernorm": [
+   "weight"
+  ],
+  "model.layers.#.post_attention_layernorm": [
+   "weight"
+  ],
+  "model.norm": [
+   "weight"
+  ],
+  "lm_head": [
+   "weight"
+  ]
+ }
+}

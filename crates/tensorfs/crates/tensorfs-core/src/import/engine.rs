@@ -703,15 +703,25 @@ pub fn plan(
             }
         }
     }
-    // Unclaimed groups are stored as they are, in their model's construction order when a
-    // generated reference covers them, else in the order of their bytes in the source.
+    // Unclaimed groups are stored as they are, in the construction order of the class their
+    // config names; keys its reference lacks keep the order of their bytes in the source.
     for &g in &r.unclaimed {
         let group = &set.groups[g];
         let name = identity(group);
         let keys: Vec<(&str, (usize, u64))> = (group.tensors.iter())
             .map(|(k, t)| (k.as_str(), (t.file, t.start)))
             .collect();
-        for i in super::order::order(&keys).0 {
+        let class = set.class_of(group);
+        let ordered = super::constructor_order(class.as_deref(), &keys);
+        if !ordered.unknown.is_empty() {
+            tracing::warn!(
+                "{name}: {} of {} tensors have no constructor order for {}; they keep the source's order",
+                ordered.unknown.len(),
+                keys.len(),
+                class.as_deref().unwrap_or("an unnamed class"),
+            );
+        }
+        for i in ordered.order {
             let key = keys[i].0;
             out.push(planned(
                 &name,

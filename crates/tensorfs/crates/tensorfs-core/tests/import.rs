@@ -963,9 +963,20 @@ fn a_tiny_hf_sdxl_imports_end_to_end() {
 
 /// The generated references order a source's sorted keys into the constructor order that the
 /// converter tables (generated from the same classes' state_dict) list, for every SDXL and
-/// Anima component.
+/// Anima component: two independent generators agree.
 #[test]
 fn references_reproduce_the_tables_constructor_order() {
+    let class = |table: &str, component: &str| match (table, component) {
+        (_, "unet") => "UNet2DConditionModel",
+        ("sdxl.single_file", "vae") => "AutoencoderKL",
+        ("sdxl.single_file", "text_encoder") => "CLIPTextModel",
+        (_, "text_encoder_2") => "CLIPTextModelWithProjection",
+        ("anima.single_file", "vae") => "AutoencoderKLQwenImage",
+        ("anima.single_file", "text_encoder") => "Qwen3Model",
+        (_, "text_conditioner") => "AnimaTextConditioner",
+        (_, "transformer") => "CosmosTransformer3DModel",
+        other => panic!("{other:?}"),
+    };
     let mut checked = 0;
     for table in import::tables()
         .iter()
@@ -978,27 +989,55 @@ fn references_reproduce_the_tables_constructor_order() {
             stored.sort_unstable();
             let keys: Vec<(&str, usize)> =
                 stored.iter().enumerate().map(|(i, k)| (*k, i)).collect();
-            let (order, reference) = import::order::order(&keys);
-            assert!(
-                reference.is_some(),
-                "{}/{}: no reference",
-                table.name,
-                c.name
-            );
-            let got: Vec<&str> = order.iter().map(|i| keys[*i].0).collect();
-            assert_eq!(got, built, "{}/{} by {reference:?}", table.name, c.name);
+            let ordered = import::constructor_order(Some(class(&table.name, &c.name)), &keys);
+            let unknown: Vec<&str> = ordered.unknown.iter().map(|i| keys[*i].0).collect();
+            assert!(unknown.is_empty(), "{}/{}: {unknown:?}", table.name, c.name);
+            let got: Vec<&str> = ordered.order.iter().map(|i| keys[*i].0).collect();
+            assert_eq!(got, built, "{}/{}", table.name, c.name);
             checked += 1;
         }
     }
     assert_eq!(checked, 8, "SDXL's and Anima's four components each");
+
+    // H3's transformer, from the h3.native table (its rows are the transformer's census).
+    let h3 = import::tables()
+        .iter()
+        .find(|t| t.name == "h3.native")
+        .unwrap();
+    let built: Vec<&str> = h3.components[0]
+        .rows
+        .iter()
+        .map(|r| r.target.as_str())
+        .collect();
+    let mut stored = built.clone();
+    stored.sort_unstable();
+    let keys: Vec<(&str, usize)> = stored.iter().enumerate().map(|(i, k)| (*k, i)).collect();
+    let ordered = import::constructor_order(Some("MiniMaxH3Transformer3DModel"), &keys);
+    assert!(ordered.unknown.is_empty());
+    let got: Vec<&str> = ordered.order.iter().map(|i| keys[*i].0).collect();
+    assert_eq!(got, built, "h3.native");
 }
 
 /// A layout no reference covers keeps its source's data order.
 #[test]
 fn an_unknown_layout_keeps_its_data_order() {
     let keys = [("zeta.weight", 2), ("alpha.weight", 0), ("mid.0.bias", 1)];
-    let (order, reference) = import::order::order(&keys);
-    assert_eq!((order, reference), (vec![1, 2, 0], None));
+    let unnamed = import::constructor_order(None, &keys);
+    assert_eq!(unnamed.order, [1, 2, 0]);
+    assert_eq!(unnamed.unknown, [0, 1, 2], "every key is reported");
+    // A class with a reference: what it knows first, in its order; the rest in data order.
+    let keys = [
+        ("zeta.weight", 0),
+        ("conv_in.bias", 1),
+        ("conv_in.weight", 2),
+    ];
+    let unet = import::constructor_order(Some("UNet2DConditionModel"), &keys);
+    assert_eq!(
+        unet.order,
+        [2, 1, 0],
+        "weight before bias, then the unknown key"
+    );
+    assert_eq!(unet.unknown, [0]);
 }
 
 /// network: GitHub (SeedVR's conditioning constants, 1.2 MB).

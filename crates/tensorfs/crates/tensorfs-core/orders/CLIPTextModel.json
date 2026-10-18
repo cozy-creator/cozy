@@ -1,0 +1,87 @@
+{
+ "class": "CLIPTextModel",
+ "sources": [
+  "hf://stabilityai/stable-diffusion-xl-base-1.0@462165984030d82259a11f4367a4eed129e94a7b/text_encoder"
+ ],
+ "generator": "scripts/orders.py",
+ "diffusers": "0.41.0.dev0",
+ "transformers": "5.20.0",
+ "children": {
+  "": [
+   "text_model"
+  ],
+  "text_model": [
+   "embeddings",
+   "encoder",
+   "final_layer_norm"
+  ],
+  "text_model.embeddings": [
+   "token_embedding",
+   "position_embedding"
+  ],
+  "text_model.embeddings.token_embedding": [
+   "weight"
+  ],
+  "text_model.embeddings.position_embedding": [
+   "weight"
+  ],
+  "text_model.encoder": [
+   "layers"
+  ],
+  "text_model.encoder.layers": [
+   "#"
+  ],
+  "text_model.encoder.layers.#": [
+   "self_attn",
+   "layer_norm1",
+   "mlp",
+   "layer_norm2"
+  ],
+  "text_model.encoder.layers.#.self_attn": [
+   "k_proj",
+   "v_proj",
+   "q_proj",
+   "out_proj"
+  ],
+  "text_model.encoder.layers.#.self_attn.k_proj": [
+   "weight",
+   "bias"
+  ],
+  "text_model.encoder.layers.#.self_attn.v_proj": [
+   "weight",
+   "bias"
+  ],
+  "text_model.encoder.layers.#.self_attn.q_proj": [
+   "weight",
+   "bias"
+  ],
+  "text_model.encoder.layers.#.self_attn.out_proj": [
+   "weight",
+   "bias"
+  ],
+  "text_model.encoder.layers.#.layer_norm1": [
+   "weight",
+   "bias"
+  ],
+  "text_model.encoder.layers.#.mlp": [
+   "fc1",
+   "fc2"
+  ],
+  "text_model.encoder.layers.#.mlp.fc1": [
+   "weight",
+   "bias"
+  ],
+  "text_model.encoder.layers.#.mlp.fc2": [
+   "weight",
+   "bias"
+  ],
+  "text_model.encoder.layers.#.layer_norm2": [
+   "weight",
+   "bias"
+  ],
+  "text_model.final_layer_norm": [
+   "weight",
+   "bias"
+  ]
+ }
+}

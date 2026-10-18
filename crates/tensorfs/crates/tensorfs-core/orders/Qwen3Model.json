@@ -1,0 +1,77 @@
+{
+ "class": "Qwen3Model",
+ "sources": [
+  "hf://circlestone-labs/Anima-Base-v1.0-Diffusers@073c3a9db359c31ad0e8aa268d15775473c2176c/text_encoder"
+ ],
+ "generator": "scripts/orders.py",
+ "diffusers": "0.41.0.dev0",
+ "transformers": "5.20.0",
+ "children": {
+  "": [
+   "embed_tokens",
+   "layers",
+   "norm"
+  ],
+  "embed_tokens": [
+   "weight"
+  ],
+  "layers": [
+   "#"
+  ],
+  "layers.#": [
+   "self_attn",
+   "mlp",
+   "input_layernorm",
+   "post_attention_layernorm"
+  ],
+  "layers.#.self_attn": [
+   "q_proj",
+   "k_proj",
+   "v_proj",
+   "o_proj",
+   "q_norm",
+   "k_norm"
+  ],
+  "layers.#.self_attn.q_proj": [
+   "weight"
+  ],
+  "layers.#.self_attn.k_proj": [
+   "weight"
+  ],
+  "layers.#.self_attn.v_proj": [
+   "weight"
+  ],
+  "layers.#.self_attn.o_proj": [
+   "weight"
+  ],
+  "layers.#.self_attn.q_norm": [
+   "weight"
+  ],
+  "layers.#.self_attn.k_norm": [
+   "weight"
+  ],
+  "layers.#.mlp": [
+   "gate_proj",
+   "up_proj",
+   "down_proj"
+  ],
+  "layers.#.mlp.gate_proj": [
+   "weight"
+  ],
+  "layers.#.mlp.up_proj": [
+   "weight"
+  ],
+  "layers.#.mlp.down_proj": [
+   "weight"
+  ],
+  "layers.#.input_layernorm": [
+   "weight"
+  ],
+  "layers.#.post_attention_layernorm": [
+   "weight"
+  ],
+  "norm": [
+   "weight"
+  ]
+ }
+}

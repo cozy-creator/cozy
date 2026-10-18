@@ -1,0 +1,281 @@
+{
+ "class": "AutoencoderKL",
+ "sources": [
+  "hf://stabilityai/stable-diffusion-xl-base-1.0@462165984030d82259a11f4367a4eed129e94a7b/vae"
+ ],
+ "generator": "scripts/orders.py",
+ "diffusers": "0.41.0.dev0",
+ "transformers": "5.20.0",
+ "children": {
+  "": [
+   "encoder",
+   "decoder",
+   "quant_conv",
+   "post_quant_conv"
+  ],
+  "encoder": [
+   "conv_in",
+   "down_blocks",
+   "mid_block",
+   "conv_norm_out",
+   "conv_out"
+  ],
+  "encoder.conv_in": [
+   "weight",
+   "bias"
+  ],
+  "encoder.down_blocks": [
+   "#"
+  ],
+  "encoder.down_blocks.#": [
+   "resnets",
+   "downsamplers"
+  ],
+  "encoder.down_blocks.#.resnets": [
+   "#"
+  ],
+  "encoder.down_blocks.#.resnets.#": [
+   "norm1",
+   "conv1",
+   "norm2",
+   "conv2",
+   "conv_shortcut"
+  ],
+  "encoder.down_blocks.#.resnets.#.norm1": [
+   "weight",
+   "bias"
+  ],
+  "encoder.down_blocks.#.resnets.#.conv1": [
+   "weight",
+   "bias"
+  ],
+  "encoder.down_blocks.#.resnets.#.norm2": [
+   "weight",
+   "bias"
+  ],
+  "encoder.down_blocks.#.resnets.#.conv2": [
+   "weight",
+   "bias"
+  ],
+  "encoder.down_blocks.#.downsamplers": [
+   "#"
+  ],
+  "encoder.down_blocks.#.downsamplers.#": [
+   "conv"
+  ],
+  "encoder.down_blocks.#.downsamplers.#.conv": [
+   "weight",
+   "bias"
+  ],
+  "encoder.down_blocks.#.resnets.#.conv_shortcut": [
+   "weight",
+   "bias"
+  ],
+  "encoder.mid_block": [
+   "attentions",
+   "resnets"
+  ],
+  "encoder.mid_block.attentions": [
+   "#"
+  ],
+  "encoder.mid_block.attentions.#": [
+   "group_norm",
+   "to_q",
+   "to_k",
+   "to_v",
+   "to_out"
+  ],
+  "encoder.mid_block.attentions.#.group_norm": [
+   "weight",
+   "bias"
+  ],
+  "encoder.mid_block.attentions.#.to_q": [
+   "weight",
+   "bias"
+  ],
+  "encoder.mid_block.attentions.#.to_k": [
+   "weight",
+   "bias"
+  ],
+  "encoder.mid_block.attentions.#.to_v": [
+   "weight",
+   "bias"
+  ],
+  "encoder.mid_block.attentions.#.to_out": [
+   "#"
+  ],
+  "encoder.mid_block.attentions.#.to_out.#": [
+   "weight",
+   "bias"
+  ],
+  "encoder.mid_block.resnets": [
+   "#"
+  ],
+  "encoder.mid_block.resnets.#": [
+   "norm1",
+   "conv1",
+   "norm2",
+   "conv2"
+  ],
+  "encoder.mid_block.resnets.#.norm1": [
+   "weight",
+   "bias"
+  ],
+  "encoder.mid_block.resnets.#.conv1": [
+   "weight",
+   "bias"
+  ],
+  "encoder.mid_block.resnets.#.norm2": [
+   "weight",
+   "bias"
+  ],
+  "encoder.mid_block.resnets.#.conv2": [
+   "weight",
+   "bias"
+  ],
+  "encoder.conv_norm_out": [
+   "weight",
+   "bias"
+  ],
+  "encoder.conv_out": [
+   "weight",
+   "bias"
+  ],
+  "decoder": [
+   "conv_in",
+   "up_blocks",
+   "mid_block",
+   "conv_norm_out",
+   "conv_out"
+  ],
+  "decoder.conv_in": [
+   "weight",
+   "bias"
+  ],
+  "decoder.up_blocks": [
+   "#"
+  ],
+  "decoder.up_blocks.#": [
+   "resnets",
+   "upsamplers"
+  ],
+  "decoder.up_blocks.#.resnets": [
+   "#"
+  ],
+  "decoder.up_blocks.#.resnets.#": [
+   "norm1",
+   "conv1",
+   "norm2",
+   "conv2",
+   "conv_shortcut"
+  ],
+  "decoder.up_blocks.#.resnets.#.norm1": [
+   "weight",
+   "bias"
+  ],
+  "decoder.up_blocks.#.resnets.#.conv1": [
+   "weight",
+   "bias"
+  ],
+  "decoder.up_blocks.#.resnets.#.norm2": [
+   "weight",
+   "bias"
+  ],
+  "decoder.up_blocks.#.resnets.#.conv2": [
+   "weight",
+   "bias"
+  ],
+  "decoder.up_blocks.#.upsamplers": [
+   "#"
+  ],
+  "decoder.up_blocks.#.upsamplers.#": [
+   "conv"
+  ],
+  "decoder.up_blocks.#.upsamplers.#.conv": [
+   "weight",
+   "bias"
+  ],
+  "decoder.up_blocks.#.resnets.#.conv_shortcut": [
+   "weight",
+   "bias"
+  ],
+  "decoder.mid_block": [
+   "attentions",
+   "resnets"
+  ],
+  "decoder.mid_block.attentions": [
+   "#"
+  ],
+  "decoder.mid_block.attentions.#": [
+   "group_norm",
+   "to_q",
+   "to_k",
+   "to_v",
+   "to_out"
+  ],
+  "decoder.mid_block.attentions.#.group_norm": [
+   "weight",
+   "bias"
+  ],
+  "decoder.mid_block.attentions.#.to_q": [
+   "weight",
+   "bias"
+  ],
+  "decoder.mid_block.attentions.#.to_k": [
+   "weight",
+   "bias"
+  ],
+  "decoder.mid_block.attentions.#.to_v": [
+   "weight",
+   "bias"
+  ],
+  "decoder.mid_block.attentions.#.to_out": [
+   "#"
+  ],
+  "decoder.mid_block.attentions.#.to_out.#": [
+   "weight",
+   "bias"
+  ],
+  "decoder.mid_block.resnets": [
+   "#"
+  ],
+  "decoder.mid_block.resnets.#": [
+   "norm1",
+   "conv1",
+   "norm2",
+   "conv2"
+  ],
+  "decoder.mid_block.resnets.#.norm1": [
+   "weight",
+   "bias"
+  ],
+  "decoder.mid_block.resnets.#.conv1": [
+   "weight",
+   "bias"
+  ],
+  "decoder.mid_block.resnets.#.norm2": [
+   "weight",
+   "bias"
+  ],
+  "decoder.mid_block.resnets.#.conv2": [
+   "weight",
+   "bias"
+  ],
+  "decoder.conv_norm_out": [
+   "weight",
+   "bias"
+  ],
+  "decoder.conv_out": [
+   "weight",
+   "bias"
+  ],
+  "quant_conv": [
+   "weight",
+   "bias"
+  ],
+  "post_quant_conv": [
+   "weight",
+   "bias"
+  ]
+ }
+}

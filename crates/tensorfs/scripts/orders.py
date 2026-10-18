@@ -1,7 +1,11 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["diffusers==0.40.0", "transformers==5.16.1", "torch>=2.11"]
+# dependencies = [
+#   "diffusers @ git+https://github.com/huggingface/diffusers@7ecb1e1b4fe500be7fb7381a7bb79a24d7fa3941",
+#   "transformers==5.20.0",
+#   "torch>=2.11",
+# ]
 # [[tool.uv.index]]
 # name = "pytorch-cpu"
 # url = "https://download.pytorch.org/whl/cpu"
@@ -9,25 +13,28 @@
 # [tool.uv.sources]
 # torch = { index = "pytorch-cpu" }
 # ///
-"""Generate the constructor-order references (`crates/tensorfs-core/converters/orders.json`).
+"""Generate the constructor-order references (`crates/tensorfs-core/orders/<class>.json`).
 
-    uv run scripts/orders.py           # regenerate and compare byte for byte
-    uv run scripts/orders.py --write   # rewrite them
+    task -d crates/tensorfs orders        # rewrite them (uv run scripts/orders.py --write)
+    uv run scripts/orders.py              # regenerate and compare byte for byte
 
 A Diffusers or Transformers folder carries no tensor order (safetensors sorts its keys), so an
-import orders it by the `state_dict()` order of the constructed model (spec §10). Each reference
-here is that order for one pinned component config, built on the meta device, named as the
-repository stores the keys, and kept as a tree: for each parent pattern (digit segments written
-`#`), its children in order, merged over every instance of that parent (a down block with
-attentions and one without agree on `attentions` < `resnets` < `downsamplers`).
-`vectors/orders/*.json` holds full key orders of other pinned models, which the import tests
-compare against.
+import orders it by the `state_dict()` order of the model class its config names (spec §10).
+Each reference is that order for one class, built on the meta device from pinned configs, named
+as the checkpoints store the keys, and kept as a tree: for each parent pattern (digit segments
+`#`), its children in order, merged over every instance of that parent and every config (a down
+block with attentions and one without agree on `attentions` < `resnets` < `downsamplers`).
+`vectors/orders/*.json` holds full key orders of models the tests import; never references.
+Gated repositories need `HF_TOKEN`.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
+import importlib.util
 import json
+import os
 import struct
 import sys
 import tempfile
@@ -42,130 +49,139 @@ from transformers.conversion_mapping import get_model_conversion_mapping
 from transformers.core_model_loading import WeightConverter, WeightRenaming, rename_source_key
 
 ROOT = Path(__file__).resolve().parents[1]
-OUT = ROOT / "crates" / "tensorfs-core" / "converters" / "orders.json"
+OUT = ROOT / "crates" / "tensorfs-core" / "orders"
 TESTS = ROOT / "crates" / "tensorfs-core" / "vectors" / "orders"
-PINS = {"diffusers": "0.40.0", "transformers": "5.16.1"}
+DIFFUSERS = "0.41.0.dev0"  # git 7ecb1e1b: Flux3 is in Diffusers main only
+TRANSFORMERS = "5.20.0"
 
-# (name, repo, revision, component folders): the references imports are ordered by.
-REFERENCES = [
-    ("sdxl", "stabilityai/stable-diffusion-xl-base-1.0", "462165984030d82259a11f4367a4eed129e94a7b",
-     ["unet", "vae", "text_encoder", "text_encoder_2"]),
-    ("anima", "circlestone-labs/Anima-Base-v1.0-Diffusers", "073c3a9db359c31ad0e8aa268d15775473c2176c",
-     ["transformer", "text_encoder", "text_conditioner", "vae"]),
-    ("qwen-image", "Qwen/Qwen-Image", "75e0b4be04f60ec59a75f475837eced720f823b6",
-     ["transformer", "vae", "text_encoder"]),
+SDXL = ("stabilityai/stable-diffusion-xl-base-1.0", "462165984030d82259a11f4367a4eed129e94a7b")
+ANIMA = ("circlestone-labs/Anima-Base-v1.0-Diffusers", "073c3a9db359c31ad0e8aa268d15775473c2176c")
+QWEN_IMAGE = ("Qwen/Qwen-Image", "75e0b4be04f60ec59a75f475837eced720f823b6")
+QWEN3_VL = ("Qwen/Qwen3-VL-2B-Instruct", "89644892e4d85e24eaac8bacfd4f463576704203")
+QWEN3_5 = ("Qwen/Qwen3.5-9B", "c202236235762e1c871ad0ccb60c8ee5ba337b9a")
+KLEIN = ("black-forest-labs/flux-3-image-klein", "8454017f9ebaada30c998fccd9f67a80c7580f68")
+# MiniMax-H3's transformer has no Diffusers config upstream; diffusers' converter defines it.
+H3_SCRIPT = (
+    "https://raw.githubusercontent.com/huggingface/diffusers/c60830ee365d520ab52b110dda562dd26f7b4d7f/"
+    "scripts/convert_minimax_h3_to_diffusers.py",
+    "86f61f62934d1eccf2a76ec57b6d072e2c23767c6e49d96aa1cf24d40422b42c",
+)
+
+# Component configs (repo, revision, folder) each class's reference is built from.
+SOURCES = [
+    (SDXL, "unet"), (SDXL, "vae"), (SDXL, "text_encoder"), (SDXL, "text_encoder_2"),
+    (ANIMA, "transformer"), (ANIMA, "text_encoder"), (ANIMA, "text_conditioner"), (ANIMA, "vae"),
+    (QWEN_IMAGE, "transformer"), (QWEN_IMAGE, "vae"), (QWEN_IMAGE, "text_encoder"),
+    (QWEN3_VL, ""), (QWEN3_5, ""),
+    # (KLEIN, "transformer"), (KLEIN, "vae"): gated; waits for an HF_TOKEN here and in CI.
 ]
 # Models the tests import; their full orders are never references.
-CHECKS = [
-    ("tiny-sdxl-pipe", "hf-internal-testing/tiny-sdxl-pipe", "20594cbc343cfcfe447af5c87cdaf6c436b453f2",
-     ["unet", "vae", "text_encoder", "text_encoder_2"]),
-]
+CHECKS = [("tiny-sdxl-pipe", ("hf-internal-testing/tiny-sdxl-pipe", "20594cbc343cfcfe447af5c87cdaf6c436b453f2"),
+           ["unet", "vae", "text_encoder", "text_encoder_2"])]
 
 
-def get(repo: str, revision: str, path: str, first: int | None = None, last: int | None = None) -> bytes:
-    url = f"https://huggingface.co/{repo}/resolve/{revision}/{path}"
+def get(url: str, first: int | None = None, last: int | None = None) -> bytes:
     req = urllib.request.Request(url)
+    if token := os.environ.get("HF_TOKEN"):
+        req.add_header("Authorization", f"Bearer {token}")
     if first is not None:
         req.add_header("Range", f"bytes={first}-{last}")
-    with urllib.request.urlopen(req, timeout=60) as r:
+    with urllib.request.urlopen(req, timeout=120) as r:
         return r.read()
 
 
-def fetch(repo: str, revision: str, path: str) -> dict:
-    return json.loads(get(repo, revision, path))
+def hub(repo: tuple[str, str], path: str) -> str:
+    return f"https://huggingface.co/{repo[0]}/resolve/{repo[1]}/{path}"
 
 
-def disk_keys(repo: str, revision: str, component: str) -> list[str]:
-    """The tensor names the repository stores for `component` (index or safetensors header)."""
+def join(folder: str, name: str) -> str:
+    return f"{folder}/{name}" if folder else name
+
+
+def stored_keys(repo: tuple[str, str], folder: str) -> list[str]:
+    """The tensor names the repository stores for a component (index or safetensors header)."""
     for name in ("diffusion_pytorch_model.safetensors", "model.safetensors"):
         try:
-            return list(fetch(repo, revision, f"{component}/{name}.index.json")["weight_map"])
+            return list(json.loads(get(hub(repo, join(folder, name + ".index.json"))))["weight_map"])
         except urllib.error.HTTPError:
             pass
         try:
-            n = struct.unpack("<Q", get(repo, revision, f"{component}/{name}", 0, 7))[0]
+            n = struct.unpack("<Q", get(hub(repo, join(folder, name)), 0, 7))[0]
         except urllib.error.HTTPError:
             continue
-        header = json.loads(get(repo, revision, f"{component}/{name}", 8, 7 + n))
+        header = json.loads(get(hub(repo, join(folder, name)), 8, 7 + n))
         return [k for k in header if k != "__metadata__"]
-    raise SystemExit(f"{repo}: no weights for {component}")
+    raise SystemExit(f"{repo[0]}: no weights for {folder!r}")
 
 
-def on_disk(keys: list[str], disk: list[str]) -> list[str]:
-    """`state_dict()` keys renamed to the stored names, where the two differ by a prefix (a
-    Transformers class whose checkpoint keeps `text_model.`). Every stored name must appear."""
-    stored, keyset = set(disk), set(keys)
-    added: dict[str, int] = {}
-    for d in stored - keyset:
-        segs = d.split(".")
-        for i in range(1, len(segs)):
-            if ".".join(segs[i:]) in keyset:
-                prefix = ".".join(segs[:i]) + "."
-                added[prefix] = added.get(prefix, 0) + 1
-                break
-
-    def name(k: str) -> str:
-        if k in stored:
-            return k
-        for prefix in sorted(added, key=added.get, reverse=True):
-            if prefix + k in stored:
-                return prefix + k
-        segs = k.split(".")
-        for i in range(1, len(segs)):
-            if ".".join(segs[i:]) in stored:
-                return ".".join(segs[i:])
-        return k  # a buffer or tied weight the checkpoint does not store
-
-    named = [name(k) for k in keys]
-    missing = stored - set(named)
-    if missing:
-        raise SystemExit(f"stored names the constructor lacks: {sorted(missing)[:5]}")
+def stored_names(model, keys: list[str], stored: list[str]) -> list[str]:
+    """`state_dict()` keys under the names checkpoints store them by: Transformers renames on
+    load, and its reversed transforms give the saved names. Stored names the class lacks (an
+    MTP head it does not build) are reported; they keep their source order at import."""
+    candidates = [keys]
+    if isinstance(model, transformers.PreTrainedModel):
+        for legacy in (True, False):
+            transforms = [t.reverse_transform() for t in get_model_conversion_mapping(model, add_legacy=legacy)[::-1]]
+            renamings = [t for t in transforms if isinstance(t, WeightRenaming)]
+            converters = [t for t in transforms if isinstance(t, WeightConverter)]
+            candidates.append([rename_source_key(k, renamings, converters, reverse=True)[0] for k in keys])
+    named = max(candidates, key=lambda c: len(set(c) & set(stored)))
+    lacking = sorted(set(stored) - set(named))
+    if 2 * len(lacking) > len(stored):
+        raise SystemExit(f"{type(model).__name__}: most stored names are unknown: {lacking[:5]}")
+    if lacking:
+        print(f"{type(model).__name__}: {len(lacking)} stored names the class lacks, e.g. {lacking[:3]}", file=sys.stderr)
     return named
 
 
-def state_dict_order(config: dict, stored: list[str]) -> tuple[str, list[str]]:
-    """The class and the `state_dict()` keys of the model `config` builds, on the meta device,
-    under the names the checkpoint stores them by."""
+def construct(config: dict):
+    """The class name and model `config` builds, on the meta device."""
     if "_class_name" in config:
-        cls = getattr(diffusers, config["_class_name"])
+        name = config["_class_name"]
         with torch.device("meta"):
-            model = cls.from_config(config)
-        return config["_class_name"], on_disk(list(model.state_dict()), stored)
+            return name, getattr(diffusers, name).from_config(config)
     name = config["architectures"][0]
     with tempfile.TemporaryDirectory() as d:
         (Path(d) / "config.json").write_text(json.dumps(config))
         conf = transformers.AutoConfig.from_pretrained(d)
     with torch.device("meta"):
-        model = getattr(transformers, name)(conf)
-    keys = list(model.state_dict())
-    # Transformers renames checkpoint keys on load; its reversed transforms give the saved names.
-    for legacy in (True, False):
-        transforms = [t.reverse_transform() for t in get_model_conversion_mapping(model, add_legacy=legacy)[::-1]]
-        renamings = [t for t in transforms if isinstance(t, WeightRenaming)]
-        converters = [t for t in transforms if isinstance(t, WeightConverter)]
-        named = [rename_source_key(k, renamings, converters, reverse=True)[0] for k in keys]
-        if set(stored) <= set(named):
-            return name, named
-    return name, on_disk(keys, stored)
+        return name, getattr(transformers, name)(conf)
+
+
+def h3_transformer() -> tuple[str, str, list[str]]:
+    url, digest = H3_SCRIPT
+    body = get(url)
+    if hashlib.sha256(body).hexdigest() != digest:
+        raise SystemExit(f"{url}: sha256 differs from the pinned {digest}")
+    with tempfile.NamedTemporaryFile("wb", suffix=".py") as f:
+        f.write(body)
+        f.flush()
+        spec = importlib.util.spec_from_file_location("convert_minimax_h3_to_diffusers", f.name)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    with torch.device("meta"):
+        model = diffusers.MiniMaxH3Transformer3DModel(**module.MINIMAX_H3_TRANSFORMER_CONFIG)
+    return "MiniMaxH3Transformer3DModel", url, list(model.state_dict())
 
 
 def pattern(key: str) -> str:
     return ".".join("#" if s.isdigit() else s for s in key.split("."))
 
 
-def tree(keys: list[str]) -> dict[str, list[str]]:
-    """Parent pattern -> its children in order, merged over the parent's instances: each
-    instance's order is a constraint; ties go to the first appearance."""
-    instances: dict[str, list[str]] = {}
-    for k in keys:
-        segs = k.split(".")
-        for d in range(len(segs)):
-            child = "#" if segs[d].isdigit() else segs[d]
-            seen = instances.setdefault(".".join(segs[:d]), [])
-            if child not in seen:
-                seen.append(child)
+def tree(orders: list[list[str]]) -> dict[str, list[str]]:
+    """Parent pattern -> its children in order, merged over the parent's instances in every
+    order: each instance's order is a constraint; ties go to the first appearance."""
+    instances: dict[tuple[int, str], list[str]] = {}
+    for n, keys in enumerate(orders):
+        for k in keys:
+            segs = k.split(".")
+            for d in range(len(segs)):
+                child = "#" if segs[d].isdigit() else segs[d]
+                seen = instances.setdefault((n, ".".join(segs[:d])), [])
+                if child not in seen:
+                    seen.append(child)
     by_pattern: dict[str, list[list[str]]] = {}
-    for parent, children in instances.items():
+    for (_, parent), children in instances.items():
         by_pattern.setdefault(pattern(parent), []).append(children)
     out = {}
     for parent, seqs in by_pattern.items():
@@ -173,7 +189,7 @@ def tree(keys: list[str]) -> dict[str, list[str]]:
         for seq in seqs:
             for c in seq:
                 first.setdefault(c, len(first))
-        after = {c: set() for c in first}
+        after: dict[str, set[str]] = {c: set() for c in first}
         for seq in seqs:
             for a, b in zip(seq, seq[1:]):
                 after[a].add(b)
@@ -190,42 +206,53 @@ def tree(keys: list[str]) -> dict[str, list[str]]:
     return out
 
 
-def build() -> tuple[bytes, dict[str, bytes]]:
-    for package, version in PINS.items():
-        have = sys.modules[package].__version__
-        if have != version:
-            raise SystemExit(f"{package} {have} is not the pinned {version}")
-    references = []
-    for name, repo, revision, components in REFERENCES:
-        for component in components:
-            stored = disk_keys(repo, revision, component)
-            cls, keys = state_dict_order(fetch(repo, revision, f"{component}/config.json"), stored)
-            references.append({"name": f"{name}/{component}", "class": cls,
-                               "source": f"hf://{repo}@{revision}/{component}", "children": tree(keys)})
-    doc = {"generator": "scripts/orders.py", **PINS, "references": references}
-    checks = {}
-    for name, repo, revision, components in CHECKS:
-        orders = {c: state_dict_order(fetch(repo, revision, f"{c}/config.json"),
-                                      disk_keys(repo, revision, c))[1] for c in components}
-        checks[f"{name}.json"] = (json.dumps({"source": f"hf://{repo}@{revision}", "components": orders},
-                                             indent=1) + "\n").encode()
-    return (json.dumps(doc, indent=1) + "\n").encode(), checks
+def dump(doc: dict) -> bytes:
+    return (json.dumps(doc, indent=1) + "\n").encode()
+
+
+def build() -> dict[Path, bytes]:
+    for module, version in ((diffusers, DIFFUSERS), (transformers, TRANSFORMERS)):
+        if module.__version__ != version:
+            raise SystemExit(f"{module.__name__} {module.__version__} is not the pinned {version}")
+    by_class: dict[str, tuple[list[str], list[list[str]]]] = {}
+    for repo, folder in SOURCES:
+        name, model = construct(json.loads(get(hub(repo, join(folder, "config.json")))))
+        keys = stored_names(model, list(model.state_dict()), stored_keys(repo, folder))
+        sources, orders = by_class.setdefault(name, ([], []))
+        sources.append(f"hf://{repo[0]}@{repo[1]}/{folder}".rstrip("/"))
+        orders.append(keys)
+    name, source, keys = h3_transformer()
+    by_class[name] = ([source], [keys])
+    out = {}
+    for name, (sources, orders) in sorted(by_class.items()):
+        doc = {"class": name, "sources": sources, "generator": "scripts/orders.py",
+               "diffusers": DIFFUSERS, "transformers": TRANSFORMERS, "children": tree(orders)}
+        out[OUT / f"{name}.json"] = dump(doc)
+    for test, repo, folders in CHECKS:
+        orders = {}
+        for folder in folders:
+            _, model = construct(json.loads(get(hub(repo, join(folder, "config.json")))))
+            orders[folder] = stored_names(model, list(model.state_dict()), stored_keys(repo, folder))
+        out[TESTS / f"{test}.json"] = dump({"source": f"hf://{repo[0]}@{repo[1]}", "components": orders})
+    return out
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--write", action="store_true")
     write = ap.parse_args().write
-    table, checks = build()
-    outputs = {OUT: table, **{TESTS / n: b for n, b in checks.items()}}
+    outputs = build()
     stale = [p for p, b in outputs.items() if not p.exists() or p.read_bytes() != b]
+    extra = [p for p in OUT.glob("*.json") if p not in outputs]
     if write:
         for p in stale:
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_bytes(outputs[p])
-    for p in stale:
-        print(("wrote " if write else "differs: ") + str(p.relative_to(ROOT)))
-    if stale and not write:
+        for p in extra:
+            p.unlink()
+    for p in stale + extra:
+        print(("rewrote " if write else "differs: ") + str(p.relative_to(ROOT)))
+    if (stale or extra) and not write:
         sys.exit(1)
 
 
