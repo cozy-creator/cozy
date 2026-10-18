@@ -12,6 +12,7 @@ use cozy_proto::{
         CHECKPOINT, Call, Event, ItemStatus, Kind, Machine, MachineKind, MachineState, OutputItem,
         Reason, Run, Status, Warning,
     },
+    config::Origin,
     ids::{Digest, RunId},
     machine as v1,
 };
@@ -147,7 +148,8 @@ pub struct RunRow {
     pub number: u64,
     pub kind: Kind,
     pub target: String,
-    pub hub: String,
+    /// The run's Hub; none for local code.
+    pub hub: Option<Origin>,
     pub machine: Option<String>,
     /// The caller named the machine: the run is never placed elsewhere.
     pub pinned: bool,
@@ -189,7 +191,7 @@ pub struct NewRun {
     pub id: RunId,
     pub kind: Kind,
     pub target: String,
-    pub hub: String,
+    pub hub: Option<Origin>,
     pub machine: Option<String>,
     pub pinned: bool,
     pub spec: v1::RunSpec,
@@ -579,7 +581,7 @@ impl Store {
                     new.id.as_str(),
                     key,
                     digest,
-                    new.hub,
+                    new.hub.as_deref().unwrap_or_default(),
                     new.kind.as_str(),
                     new.target,
                     machine,
@@ -1196,6 +1198,7 @@ const RUN_COLUMNS: &str = "id, number, kind, target, hub, machine, pinned, spec,
 fn run_row(r: &Row) -> rusqlite::Result<Result<RunRow>> {
     let id: String = r.get(0)?;
     let kind: String = r.get(2)?;
+    let hub: String = r.get(4)?;
     let state: String = r.get(9)?;
     let status: Option<String> = r.get(13)?;
     let reason_code: Option<String> = r.get(14)?;
@@ -1211,7 +1214,11 @@ fn run_row(r: &Row) -> rusqlite::Result<Result<RunRow>> {
             number: r.get::<_, i64>(1)? as u64,
             kind: Kind::parse(&kind).ok_or_else(|| corrupt("a run kind"))?,
             target: r.get(3)?,
-            hub: r.get(4)?,
+            // One spelling, whatever an older Calcifer recorded (`https://tensorhub.com:443`).
+            hub: (!hub.is_empty())
+                .then(|| Origin::parse(&hub))
+                .transpose()
+                .map_err(|_| corrupt("a run's Hub"))?,
             machine: r.get(5)?,
             pinned: r.get(6)?,
             spec: serde_json::from_slice(&spec).map_err(|_| corrupt("a run's spec"))?,
@@ -1645,7 +1652,7 @@ fn record(conn: &Connection, row: &RunRow) -> Result<Run> {
         number: row.number,
         kind: row.kind,
         target: row.target.clone(),
-        hub: row.hub.clone(),
+        hub: row.hub.clone().map(String::from).unwrap_or_default(),
         machine: row.machine.clone(),
         status: match (row.state, row.status) {
             (State::Settled, Some(status)) => status,

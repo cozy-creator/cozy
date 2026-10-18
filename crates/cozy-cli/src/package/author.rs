@@ -479,7 +479,7 @@ pub(super) async fn index_url(
     let origin = match client.get_protected_resource_metadata().await {
         Ok(metadata) => metadata.into_inner().resource,
         Err(e) => match hub_error(e) {
-            e if e.code == "capability.not_served" => hub.origin.clone(),
+            e if e.code == "capability.not_served" => hub.origin.to_string(),
             e => return Err(e),
         },
     };

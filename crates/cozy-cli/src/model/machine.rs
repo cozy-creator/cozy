@@ -97,7 +97,7 @@ async fn warm(
     };
     let submit = SubmitRun {
         on: placement.on(),
-        hub: ctx.hub()?.origin,
+        hub: ctx.hub()?.origin.into(),
         kind: RunKind::Warm,
         target,
         spec,

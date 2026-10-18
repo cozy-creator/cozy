@@ -38,7 +38,7 @@ pub(crate) struct Hubs {
     configured: Vec<config::Hub>,
     listings: Mutex<HashMap<String, Listing>>,
     /// This computer's account at each Hub, for runs' capabilities.
-    pub(crate) facts: Mutex<HashMap<String, crate::access::Facts>>,
+    pub(crate) facts: Mutex<HashMap<config::Origin, crate::access::Facts>>,
 }
 
 /// A Hub's last word: its listing, and every rental read since by id.
@@ -65,7 +65,7 @@ impl Hubs {
     pub(crate) fn client(&self, origin: &str) -> Result<Client, Error> {
         let hub = config::Hub {
             name: None,
-            origin: origin.to_owned(),
+            origin: config::Origin::parse(origin).map_err(|_| signed_out(origin))?,
         };
         let key = DeviceKey::load(&hub.device_key(&self.home)).map_err(|_| signed_out(origin))?;
         let session = UserSession::new(key, Some(hub.bearer(&self.home)));
@@ -163,7 +163,7 @@ impl Hubs {
 
     /// Every Hub the config names and every Hub a rental was asked of.
     fn origins(&self, rows: &[MachineRow]) -> Vec<String> {
-        let mut origins: Vec<String> = self.configured.iter().map(|h| h.origin.clone()).collect();
+        let mut origins: Vec<String> = self.configured.iter().map(|h| h.origin.to_string()).collect();
         for row in rows
             .iter()
             .filter(|r| r.kind == MachineKind::Rental && r.state != MachineState::Ended)
@@ -238,7 +238,7 @@ impl Machines {
         disk_gb: Option<u32>,
         run: Option<RunId>,
     ) -> Result<(Ask, bool), Error> {
-        let origin = config::origin(hub)?;
+        let origin = config::Origin::parse(hub)?;
         let intent =
             serde_json::json!({"hub": origin, "sku": sku, "gpus": gpus, "disk_gb": disk_gb});
         let digest = hex::encode(Sha256::digest(intent.to_string()));
@@ -287,7 +287,7 @@ impl Machines {
         let ask = Ask {
             key: key.to_owned(),
             kind: AskKind::Rent,
-            hub: origin,
+            hub: origin.into(),
             digest,
             body: serde_json::to_vec(&RentBody { request, quote }).expect("serializes"),
             machine: Some(alias),
@@ -441,7 +441,8 @@ impl Machines {
                     Some(sku) => (sku, (gpus > 0).then_some(gpus)),
                     None => me.placed(&run).await?,
                 };
-                let asked = me.ask_rent(&key, &run.hub, &sku, gpus, None, Some(run.id.clone()));
+                let hub = run.hub.as_deref().unwrap_or_default();
+                let asked = me.ask_rent(&key, hub, &sku, gpus, None, Some(run.id.clone()));
                 Ok(asked.await?.0)
             };
             let rented = match asked.await {
@@ -497,11 +498,12 @@ impl Machines {
                 .map_err(|e| Error::new(Kind::Validation, "bits_invalid", e.to_string()))?,
             gpus: std::num::NonZeroU64::new(spec.gpus.into()),
         };
-        let client = self.hubs.client(&run.hub)?;
+        let hub = run.hub.as_deref().unwrap_or_default();
+        let client = self.hubs.client(hub)?;
         let placement = match client.place_rental(&request).await {
             Ok(placement) => placement.into_inner(),
             Err(e) => {
-                return Err(match asked(&run.hub, e.into()) {
+                return Err(match asked(hub, e.into()) {
                     Asked::Refused(e) | Asked::Unanswered(e) => e,
                 });
             }

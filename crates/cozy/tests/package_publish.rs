@@ -63,7 +63,7 @@ fn at_listen_address(home: &Home) -> String {
     let paths = cozy_platform::paths::Home::at(home.root());
     let hub = |url: &str| cozy_proto::config::Hub {
         name: Some("ci".into()),
-        origin: cozy_proto::config::origin(url).unwrap(),
+        origin: cozy_proto::config::Origin::parse(url).unwrap(),
     };
     let public = std::env::var("TENSORHUB_ORIGIN").unwrap();
     std::fs::copy(

@@ -6,6 +6,7 @@ use std::{path::Path, sync::Arc};
 use calcifer::store::{Acceptance, Batch, NewRun, RunFilter, State, Store, StoreError};
 use cozy_proto::{
     calcifer::{Call, Event, ItemStatus, Kind, Status, Warning},
+    config::Origin,
     ids::{Digest, RunId},
     machine as v1,
 };
@@ -15,7 +16,7 @@ fn new_run(n: u8, machine: Option<&str>, pinned: bool) -> NewRun {
         id: RunId::mint([n; 12]),
         kind: Kind::Call,
         target: "fidika/sdxl/generate".into(),
-        hub: "https://tensorhub.com".into(),
+        hub: Some(Origin::parse("https://tensorhub.com").unwrap()),
         machine: machine.map(str::to_owned),
         pinned,
         spec: common::warm_spec("https://tensorhub.com", vec![]),

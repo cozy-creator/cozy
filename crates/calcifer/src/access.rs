@@ -11,7 +11,7 @@ use std::time::Duration;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use cozy_proto::{
     calcifer::Reason,
-    config,
+    config::{self, Origin},
     error::{Error, Kind},
     ids::RunId,
     machine as v1,
@@ -66,14 +66,17 @@ impl Machines {
     pub(crate) async fn access(&self, run: &RunRow, machine: &str) -> Result<Access, Denied> {
         let providers = self.providers.clone();
         let spec = &run.spec;
-        if run.hub.is_empty() || (self.device_key(&run.hub).is_err() && !private(spec)) {
+        let Some(origin) = run.hub.as_ref().filter(|origin| {
+            // Signed out, a public run reads at its Hub's origin (lib's finish_spec).
+            self.device_key(origin).is_ok() || private(spec)
+        }) else {
             return Ok(Access {
                 hub: None,
                 providers,
                 owner: None,
             });
-        }
-        let facts = self.hubs.facts(&run.hub).await?;
+        };
+        let facts = self.hubs.facts(origin).await?;
         let operations = match private(spec) {
             true => operations(&facts.account, spec),
             false => vec![],
@@ -85,7 +88,7 @@ impl Machines {
             ..Default::default()
         };
         if !operations.is_empty() {
-            hub.capability = self.capability(run, machine, &facts, operations).await?;
+            hub.capability = (self.capability(run, origin, machine, &facts, operations)).await?;
             hub.token_endpoint = facts.token_endpoint;
         }
         Ok(Access {
@@ -122,6 +125,7 @@ impl Machines {
     async fn capability(
         &self,
         run: &RunRow,
+        origin: &Origin,
         machine: &str,
         facts: &Facts,
         operations: Vec<Value>,
@@ -143,7 +147,7 @@ impl Machines {
         }
         let machine = hub_client::leaf_thumbprint(&leaf)
             .map_err(|e| refused("machine_key_unsupported", format!("{machine}: {e}")))?;
-        let key = self.device_key(&run.hub)?;
+        let key = self.device_key(origin)?;
         Ok(key.sign_run_capability(&RunCapability {
             user_id: facts.user_id.clone(),
             hub: facts.public.clone(),
@@ -154,10 +158,10 @@ impl Machines {
         }))
     }
 
-    fn device_key(&self, origin: &str) -> Result<DeviceKey, Denied> {
+    fn device_key(&self, origin: &Origin) -> Result<DeviceKey, Denied> {
         let hub = config::Hub {
             name: None,
-            origin: origin.to_owned(),
+            origin: origin.clone(),
         };
         DeviceKey::load(&hub.device_key(&self.home)).map_err(|_| needs_sign_in(origin))
     }
@@ -166,7 +170,7 @@ impl Machines {
 impl Hubs {
     /// This computer's account at `origin`, where machines read it, and where they trade a
     /// capability: read once, then kept for the life of this Calcifer.
-    pub(crate) async fn facts(&self, origin: &str) -> Result<Facts, Denied> {
+    pub(crate) async fn facts(&self, origin: &Origin) -> Result<Facts, Denied> {
         if let Some(facts) = lock(&self.facts).get(origin) {
             return Ok(facts.clone());
         }
@@ -216,7 +220,7 @@ impl Hubs {
                 format!("{origin} names no user for account {}", facts.account),
             ));
         }
-        lock(&self.facts).insert(origin.to_owned(), facts.clone());
+        lock(&self.facts).insert(origin.clone(), facts.clone());
         Ok(facts)
     }
 }
