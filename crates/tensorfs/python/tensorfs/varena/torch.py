@@ -39,6 +39,8 @@ from . import DeviceFull, Gpu, Host, Ledger, Pinned, Row, WeightSet
 _WHOLE = 1 << 62
 #: Blocks copied ahead of the one entered, in the recorded order.
 _AHEAD = 2
+#: A streamed model's scratch slots, in its largest blocks (the core keeps 2-3).
+_SLOTS = 3
 #: TensorFS dtype names; an `F4` part is u8 pairs.
 DTYPES: dict[str, torch.dtype] = {
     "F64": torch.float64,
@@ -331,6 +333,8 @@ class Model:
         #: home blocks whose pages are resident now
         self.loaded: set[int] = set()
         self.lowered = False
+        #: its last use repeats (a denoise loop): restored before models used once
+        self.repeating = False
         self.uses = 0
         self.held = 0
         self.kept = False
@@ -519,6 +523,7 @@ class Memory:
         with self.lock:
             if model.uses == 0:
                 self._plan(model, repeats)
+                model.repeating = repeats
             model.uses += 1
             self.clock += 1
             model.last_use = self.clock
@@ -943,20 +948,28 @@ class Memory:
 
     def _restore(self, gpu: int) -> None:
         """After the last request on `gpu`: each model's reserve is what that request measured,
-        every watermark rises again, and pages copy home into free room beside the largest
-        reserve, warm models first. Restore never evicts. The copies are prefetches: an ask
-        evicts them again at once."""
+        and every watermark rises again. Pages copy home in priority order (the warm set, then
+        models whose use repeats, then the rest, most recently used first): a model takes free
+        room, then cold pages of models after it, always leaving the largest reserve and a
+        streamed model's slots. The copies are prefetches: an ask evicts them again at once."""
         models = [m for m in self.models.values() if m.gpu == gpu]
         for model in models:
             if model.peak:
                 model.reserve, model.peak = model.peak, 0
             model.lowered = False
-        room = _free(gpu) - max((max(m.reserve, 0) for m in models), default=0)
-        for model in sorted(models, key=lambda m: (not m.kept, -m.last_use)):
+        ranked = sorted(models, key=lambda m: (not m.kept, not m.repeating, -m.last_use))
+        slots = max((_SLOTS * _largest(m) for m in models if not m.repeating), default=0)
+        room = _free(gpu) - max((max(m.reserve, 0) for m in models), default=0) - slots
+        for i, model in enumerate(ranked):
+            lower = [m for m in ranked[i + 1 :] if not m.uses and not m.held]
             for b in model.order:
                 if b in model.home and b in model.loaded:
                     continue
                 block = model.blocks[b]
+                while room < block.nbytes and lower:
+                    room += self._evict(lower[-1], "restore", 2, block.nbytes - room)
+                    if room < block.nbytes:  # it gave all it had
+                        lower.pop()
                 if room < block.nbytes:
                     return
                 room -= block.nbytes
@@ -1205,6 +1218,10 @@ def _home_regions(model: Model) -> list[int]:
         *model.common.regions,
         *(r for b in sorted(model.home) for r in model.blocks[b].regions),
     ]
+
+
+def _largest(model: Model) -> int:
+    return max((b.nbytes for b in model.blocks), default=0)
 
 
 def _free(gpu: int) -> int:
