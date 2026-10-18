@@ -9,7 +9,7 @@ use std::os::unix::fs::FileExt;
 use tensorfs_core::client::regions;
 use tensorfs_core::format::Dtype;
 use tensorfs_core::store2::{Checkpoint, Store};
-use tensorfs_core::writer::Data;
+use tensorfs_core::writer::{Data, Source};
 use varena::cuda::{self, CUstream, CtxGuard};
 use varena::{Plane, PlaneConfig, Tier, WsId};
 
@@ -45,7 +45,7 @@ impl Fixture {
         let mut w = store.writer(None, None).unwrap();
         for &(component, key, n) in TENSORS {
             let b = bytes_of(key, n);
-            w.put(component, key, &Dtype::U8, &[n as u64], Data::Plain(&mut &b[..])).unwrap();
+            w.put(component, key, &Dtype::U8, &[n as u64], Data::Plain(Source::Read(&mut &b[..]))).unwrap();
         }
         let ck = store.checkpoint(&w.commit().unwrap()).unwrap();
         Fixture { root, ck }
@@ -80,7 +80,7 @@ fn check(p: &Plane, ws: WsId, region: Option<u32>, read: impl Fn(u64, usize) -> 
 fn a_v2_checkpoint_fills_the_pinned_tier_exactly() {
     let fx = Fixture::new("pinned");
     let p = Plane::open(PlaneConfig { readers: 2, ..Default::default() }).unwrap();
-    let rs = regions(fx.ck.header(), 64 << 20);
+    let rs = regions(fx.ck.header(), 64 << 20, &[]);
     let ws = p.register_checkpoint("ck", &fx.ck, &rs, None).unwrap();
     assert_eq!(p.layout(ws).unwrap().regions.len(), rs.len());
     p.set_pinned_budget(1 << 30).unwrap();
@@ -101,6 +101,24 @@ fn a_v2_checkpoint_fills_the_pinned_tier_exactly() {
 }
 
 #[test]
+fn regions_never_span_a_boundary_unless_a_chunk_does() {
+    let fx = Fixture::new("boundaries");
+    let h = fx.ck.header();
+    let unet = |rs: Vec<Vec<String>>| rs.into_iter().filter(|r| r[0].starts_with("unet/")).collect::<Vec<_>>();
+    assert_eq!(unet(regions(h, 128 << 20, &[])).len(), 1, "without boundaries the unet fits one region");
+    let blocks: Vec<String> = (0..3).map(|i| format!("unet/blocks.{i}")).collect();
+    let rs = unet(regions(h, 128 << 20, &blocks));
+    let keys = |r: &Vec<String>| r.iter().map(|k| k.trim_start_matches("unet/").to_owned()).collect::<Vec<_>>();
+    assert_eq!(rs.iter().map(keys).collect::<Vec<_>>(), vec![
+        // An empty tensor has no bytes: it rides in the first region.
+        vec!["blocks.0.a", "blocks.0.b", "empty"],
+        vec!["blocks.1.w"],
+        // blocks.2 and norm share a pack: a chunk keeps them together.
+        vec!["blocks.2.a", "blocks.2.b", "norm.weight"],
+    ]);
+}
+
+#[test]
 #[ignore = "GPU"]
 fn a_v2_checkpoint_reaches_the_device_exactly() {
     let fx = Fixture::new("device");
@@ -110,7 +128,7 @@ fn a_v2_checkpoint_reaches_the_device_exactly() {
     let mut s: CUstream = std::ptr::null_mut();
     cuda::check("cuStreamCreate", unsafe { (d.stream_create)(&mut s, cuda::STREAM_NON_BLOCKING) }).unwrap();
     let p = Plane::open(PlaneConfig { devices: vec![0], ..Default::default() }).unwrap();
-    let ws = p.register_checkpoint("ck", &fx.ck, &regions(fx.ck.header(), 64 << 20), None).unwrap();
+    let ws = p.register_checkpoint("ck", &fx.ck, &regions(fx.ck.header(), 64 << 20, &[]), None).unwrap();
     p.set_vram_budget(0, 1 << 30).unwrap();
     p.want(ws, Tier::Device(0), None, 0, false).unwrap().wait().unwrap();
     let layout = p.layout(ws).unwrap();

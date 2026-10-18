@@ -1,6 +1,7 @@
 """TensorFS speed gate: cozytensors/2 against safetensors, disk -> pinned -> GPU (xs-045 F1, U8).
 
     python speedgate.py <work dir> <result.json> [--build-only] [--plane=readers=16,staging_buffers=32]
+        [--readers=T64+rust,st-cuda] [--cells=window]
 
 The machine's v1 store supplies the real SDXL int8 and Qwen-Image int8 lane bytes. Each lane is
 written once into a TensorFS v2 store by its writer (the real chunk layout) and once as one
@@ -9,7 +10,7 @@ cold (pages dropped) and warm, the whole checkpoint and one paging window, from 
 the last byte resident on the GPU.
 
 Readers:
-- `T64+rust`: `tensorfs.varena` (the plane's Rust chunk reader): checkpoint,
+- `T64+rust`: `tensorfs.varena` (the plane's Rust chunk reader): checkpoint, regions cut at blocks,
   `register_checkpoint`, want, wait.
 - `T64+fst`: the same chunk files read by fastsafetensors' own C++ engine.
 - `T64`: the F1 Python reader over the same chunk files.
@@ -87,6 +88,19 @@ def v1_parts(root, manifest, wcomp, wprefix):
 
 def part_bytes(p):
     return p[4] if p[4] is not None else b"".join(open(path, "rb").read() for path, _ in p[5])
+
+
+def blocks(ck):
+    """Every `<component>/<key prefix>` up to a key's first numbered segment (`unet/up_blocks.1`,
+    `transformer/transformer_blocks.30`): the blocks regions are cut at."""
+    out = set()
+    for comp, ts in ck.tensors.items():
+        for key in ts:
+            seg = key.split("#")[0].split(".")
+            i = next((i for i, x in enumerate(seg) if i and x.isdigit()), None)
+            if i is not None:
+                out.add(f"{comp}/{'.'.join(seg[: i + 1])}")
+    return sorted(out)
 
 
 def write_v2(parts, root):
@@ -248,10 +262,11 @@ class Model:
         return self.st if layout in SAFETENSORS else [p for p, _ in self.chunks]
 
     def rust(self, plane, window):
-        """Checkpoint, register (its default regions) and want on the device: v2 weights read
-        through the plane's register path."""
+        """Checkpoint, regions cut at blocks (what the Runtime passes), register and want on the
+        device: v2 weights read through the plane's register path."""
         plane.set_vram_budget(0, torch.cuda.mem_get_info()[0] - (1 << 30))
-        ws = plane.register_checkpoint(self.name, self.checkpoint())
+        ck = self.checkpoint()
+        ws = plane.register_checkpoint(self.name, ck, v2.regions(ck, 64 << 20, blocks(ck)))
         picked = sorted({p["region"] for p in ws.parts if self.in_window(*p["what"].split("#")[0].split("/", 1))}) if window else None
         plane.want(ws, 0, picked).wait()
         return picked, ws
@@ -311,13 +326,13 @@ def drop(paths):
         os.close(fd)
 
 
-def bench(model, readers, log, warm_full):
+def bench(model, readers, log, warm_full, layouts=LAYOUTS, scopes=("full", "window")):
     res = {}
     for rep in range(model.reps):
-        order = LAYOUTS[rep % len(LAYOUTS) :] + LAYOUTS[: rep % len(LAYOUTS)]
+        order = layouts[rep % len(layouts) :] + layouts[: rep % len(layouts)]
         for layout in order:
             files = model.files(layout)
-            for scope, window in (("full", False), ("window", True)):
+            for scope, window in ((x, x == "window") for x in scopes):
                 for cold in (True, False):
                     if not cold and scope == "full" and not warm_full:
                         continue
@@ -334,12 +349,12 @@ def bench(model, readers, log, warm_full):
     return res
 
 
-def summary(model, res):
+def summary(model, res, layouts=LAYOUTS):
     cells = sorted({k.split(" ", 1)[1] for k in res}, key=lambda c: ("window" in c, "warm" in c))
     lines = [f"{model.name}: {model.bytes / 1e9:.2f} GB in {len(model.chunks)} chunks, window {model.window_bytes / 1e6:.0f} MB; ms median (best)"]
     lines.append("reader | " + " | ".join(cells))
     med = lambda xs: statistics.median(x[0] for x in xs)
-    for layout in LAYOUTS:
+    for layout in layouts:
         row = []
         for cell in cells:
             xs = sorted(res.get(f"{layout} {cell}", []))
@@ -350,12 +365,10 @@ def summary(model, res):
         rust = med(res[f"T64+rust {cell}"])
         st = {l: med(res[f"{l} {cell}"]) for l in SAFETENSORS if res.get(f"{l} {cell}")}
         best = min(st, key=st.get)
-        engine = med(res[f"T64+fst {cell}"])
         gate[cell] = {"rust_ms": round(1000 * rust), "safetensors": best, "safetensors_ms": round(1000 * st[best]),
-                      "engine_ms": round(1000 * engine), "margin": round(st[best] / rust - 1, 3), "pass": rust <= st[best]}
+                      "margin": round(st[best] / rust - 1, 3), "pass": rust <= st[best]}
         lines.append(f"gate {cell}: T64+rust {1000 * rust:.0f} ms vs best safetensors ({best}) {1000 * st[best]:.0f} ms "
-                     f"({100 * (st[best] / rust - 1):+.0f}%), vs fastsafetensors' engine on the same chunks {1000 * engine:.0f} ms "
-                     f"({100 * (engine / rust - 1):+.0f}%) -> {'PASS' if rust <= st[best] else 'FAIL'}")
+                     f"({100 * (st[best] / rust - 1):+.0f}%) -> {'PASS' if rust <= st[best] else 'FAIL'}")
     return lines, gate
 
 
@@ -371,7 +384,7 @@ def environment(root, work):
             "store": root, "work": work}
 
 
-def main(work, out_path, build_only=False, plane=None):
+def main(work, out_path, build_only=False, plane=None, layouts=LAYOUTS, scopes=("full", "window")):
     root = store_root()
     os.makedirs(work, exist_ok=True)
     env = environment(root, work)
@@ -393,8 +406,8 @@ def main(work, out_path, build_only=False, plane=None):
             json.dump(out, open(out_path, "w"))
             continue
         warm_full = env["mem_available"] > 1.3 * model.bytes + 2 * SLOT * THREADS
-        res = bench(model, readers, log, warm_full)
-        lines, gate = summary(model, res)
+        res = bench(model, readers, log, warm_full, layouts, scopes)
+        lines, gate = summary(model, res, layouts)
         for line in lines:
             log(line)
         out["models"][name] = {"bytes": model.bytes, "chunks": len(model.chunks), "window_bytes": model.window_bytes,
@@ -407,4 +420,6 @@ def main(work, out_path, build_only=False, plane=None):
 if __name__ == "__main__":
     opts = sys.argv[3:]
     plane = next((dict((k, int(v)) for k, v in (kv.split("=") for kv in o.removeprefix("--plane=").split(","))) for o in opts if o.startswith("--plane=")), None)
-    main(sys.argv[1], sys.argv[2], build_only="--build-only" in opts, plane=plane)
+    arg = lambda name, default: next((tuple(o.split("=", 1)[1].split(",")) for o in opts if o.startswith(f"--{name}=")), default)
+    main(sys.argv[1], sys.argv[2], build_only="--build-only" in opts, plane=plane,
+         layouts=arg("readers", LAYOUTS), scopes=arg("cells", ("full", "window")))

@@ -274,7 +274,7 @@ impl PyPlane {
         host_fd: Option<i32>,
     ) -> PyResult<PyWeightSet> {
         let (ck, plane) = (&ck.ck, &self.plane);
-        let regions = regions.unwrap_or_else(|| tensorfs_core::client::regions(ck.header(), 64 << 20));
+        let regions = regions.unwrap_or_else(|| tensorfs_core::client::regions(ck.header(), 64 << 20, &[]));
         let (id, layout) = py
             .detach(|| {
                 let id = plane.register_checkpoint(&name, ck, &regions, host_fd)?;

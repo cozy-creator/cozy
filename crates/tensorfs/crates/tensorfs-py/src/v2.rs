@@ -586,9 +586,9 @@ impl PyCheckpoint {
 /// Groups `ck`'s tensors into `<component>/<key>` regions for a weight plane: tensors sharing a
 /// chunk stay together, and neighbours merge while their chunks total at most `max_bytes`.
 #[pyfunction]
-#[pyo3(signature = (ck, max_bytes = 64 << 20))]
-fn regions(ck: &PyCheckpoint, max_bytes: u64) -> Vec<Vec<String>> {
-    client::regions(ck.ck.header(), max_bytes)
+#[pyo3(signature = (ck, max_bytes = 64 << 20, boundaries = None))]
+fn regions(ck: &PyCheckpoint, max_bytes: u64, boundaries: Option<Vec<String>>) -> Vec<Vec<String>> {
+    client::regions(ck.ck.header(), max_bytes, &boundaries.unwrap_or_default())
 }
 
 // ---------------------------------------------------------------- arrays

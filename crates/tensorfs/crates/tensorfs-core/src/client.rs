@@ -422,8 +422,11 @@ pub(crate) fn io(path: &Path, e: std::io::Error) -> crate::failure::Failure {
 /// `header`'s tensors grouped into regions for a weight plane, as `<component>/<key>` names.
 /// Tensors sharing a chunk stay in one group, its members in header order; groups follow the
 /// header order of their first tensor, and neighbouring groups merge while their chunks total
-/// at most `max_bytes` (a larger group is a region alone). A region never spans components.
-pub fn regions(header: &Header, max_bytes: u64) -> Vec<Vec<String>> {
+/// at most `max_bytes` (a larger group is a region alone) and they hold the same `boundaries`.
+/// A boundary is a `<component>/<key prefix>` module path (`prefix` or `prefix.*`), such as a
+/// block: a region never holds tensors of two of them, or of one and of none, unless a shared
+/// chunk does. A region never spans components.
+pub fn regions(header: &Header, max_bytes: u64, boundaries: &[String]) -> Vec<Vec<String>> {
     let mut out = Vec::new();
     for c in header.components() {
         let name = |key: &str| format!("{}/{key}", c.name);
@@ -469,24 +472,36 @@ pub fn regions(header: &Header, max_bytes: u64) -> Vec<Vec<String>> {
                 owner.insert(k, g);
             }
         }
-        let mut regions: Vec<(Vec<String>, u64)> = Vec::new();
+        // The deepest boundary holding a key, if any.
+        let label = |key: &str| -> Option<&str> {
+            boundaries
+                .iter()
+                .filter_map(|b| b.split_once('/'))
+                .filter(|(bc, p)| *bc == c.name && (key == *p || key.strip_prefix(p).is_some_and(|rest| rest.starts_with('.'))))
+                .map(|(_, p)| p)
+                .max_by_key(|p| p.len())
+        };
+        // (names, chunk bytes, the boundaries its tensors are in)
+        type Region<'b> = (Vec<String>, u64, BTreeSet<Option<&'b str>>);
+        let mut regions: Vec<Region> = Vec::new();
         for (members, used) in groups.into_iter().filter(|g| !g.0.is_empty()) {
             let n: u64 = used.iter().map(|k| header.chunks[*k].length).sum();
+            let labels: BTreeSet<Option<&str>> = members.iter().map(|&i| label(&c.tensors[i].key)).collect();
             let keys = members.into_iter().map(|i| name(&c.tensors[i].key));
             match regions.last_mut() {
-                Some((r, bytes)) if *bytes + n <= max_bytes => {
+                Some((r, bytes, l)) if *bytes + n <= max_bytes && *l == labels => {
                     r.extend(keys);
                     *bytes += n;
                 }
-                _ => regions.push((keys.collect(), n)),
+                _ => regions.push((keys.collect(), n, labels)),
             }
         }
         match regions.first_mut() {
-            Some((r, _)) => r.extend(empty),
-            None if !empty.is_empty() => regions.push((empty, 0)),
+            Some((r, _, _)) => r.extend(empty),
+            None if !empty.is_empty() => regions.push((empty, 0, BTreeSet::new())),
             None => {}
         }
-        out.extend(regions.into_iter().map(|(r, _)| r));
+        out.extend(regions.into_iter().map(|(r, _, _)| r));
     }
     out
 }

@@ -148,7 +148,7 @@ fn a_synthetic_checkpoint_exports_pulls_and_verifies() {
     let ck = store.checkpoint(&manifest).unwrap();
     // A standalone part (the 32 MiB embedding) and packs, never across components.
     assert!(ck.header().chunks.iter().any(|c| c.length == 32 << 20));
-    let grouped = regions(ck.header(), 4 << 20);
+    let grouped = regions(ck.header(), 4 << 20, &[]);
     let mut seen: Vec<&String> = grouped.iter().flatten().collect();
     assert_eq!(seen.len(), ck.tensors().count());
     seen.sort();
