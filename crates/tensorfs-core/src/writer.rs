@@ -1015,6 +1015,16 @@ impl Sink for Writer {
         self.set_metadata("normalized", imported.normalized.into());
         self.set_metadata("converters", list(&imported.converters));
         self.set_metadata("sources", list(&imported.sources));
+        if !imported.file_metadata.is_empty() {
+            let strings = |m: &BTreeMap<String, String>| {
+                let pairs = m.iter().map(|(k, v)| (k.clone(), Value::Str(v.clone())));
+                Value::Map(pairs.collect())
+            };
+            let by_component = (imported.file_metadata.iter())
+                .map(|(c, m)| (c.clone(), strings(m)))
+                .collect();
+            self.set_metadata(import::FILE_METADATA, Value::Map(by_component));
+        }
         Writer::commit(self).map(drop).map_err(Error::refusal)
     }
 }

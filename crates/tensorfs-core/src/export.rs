@@ -7,7 +7,8 @@
 //!   Diffusers component and `model` otherwise. Any other component is `<component>.safetensors`
 //!   at the root, which for `model` is a Transformers folder.
 //! - Files are sharded at [`SHARD`] bytes as `<weights>-00001-of-0000N.safetensors` beside the
-//!   standard `<weights>.safetensors.index.json`.
+//!   standard `<weights>.safetensors.index.json`. Each file's `__metadata__` is its component's
+//!   source `__metadata__` ([`crate::import::FILE_METADATA`]), with `format: pt` when it has none.
 //! - Each file is laid out as the safetensors library writes one: tensors by dtype (in its order,
 //!   descending), then by name; the header lists them in that order with fields `dtype`, `shape`,
 //!   `data_offsets`. A folder safetensors wrote is reproduced byte for byte, so its tensors sit at
@@ -27,7 +28,8 @@ use serde_json::{json, Map, Value as Json};
 
 use crate::client::io;
 use crate::failure::{fail, Kind, Result};
-use crate::format::{decode, Body, Dtype, Location, PartBytes, HEADER_PATH};
+use crate::format::{decode, Body, Dtype, Location, PartBytes, Value, HEADER_PATH};
+use crate::import::FILE_METADATA;
 use crate::store2::Checkpoint;
 
 /// The largest shard, as Diffusers and Transformers write them (20 GB).
@@ -73,6 +75,10 @@ pub fn safetensors(ck: &Checkpoint, dir: &Path, dequantize: Option<&Dtype>) -> R
     let index: BTreeMap<String, Json> = match files.get("model_index.json") {
         Some(_) => serde_json::from_slice(&ck.file("model_index.json")?).unwrap_or_default(),
         None => BTreeMap::new(),
+    };
+    let file_metadata = match ck.header().metadata.get(FILE_METADATA) {
+        Some(Value::Map(m)) => m.clone(),
+        _ => BTreeMap::new(),
     };
     let mut written = Vec::new();
     for path in files.keys().filter(|p| *p != HEADER_PATH) {
@@ -162,7 +168,13 @@ pub fn safetensors(ck: &Checkpoint, dir: &Path, dequantize: Option<&Dtype>) -> R
                 format!("{component}: two tensors export as {}", e.name),
             );
         }
-        let mut metadata = Map::from_iter([("format".to_owned(), Json::from("pt"))]);
+        let mut metadata: Map<String, Json> = match file_metadata.get(component) {
+            Some(Value::Map(m)) => (m.iter())
+                .filter_map(|(k, v)| Some((k.clone(), Json::from(v.as_str()?))))
+                .collect(),
+            _ => Map::new(),
+        };
+        metadata.entry("format").or_insert(Json::from("pt"));
         if !encodings.is_empty() {
             let text = serde_json::to_string(&encodings).expect("JSON values serialize");
             metadata.insert("cozytensors.encodings".to_owned(), Json::from(text));

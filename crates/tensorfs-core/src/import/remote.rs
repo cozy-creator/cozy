@@ -494,7 +494,10 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<Member>) -> Result<()> {
     entries.sort_by_key(|e| e.file_name());
     for entry in entries {
         let path = entry.path();
-        if entry.file_name().to_string_lossy().starts_with('.') {
+        // Hidden folders are tools' state (`.git`, `.cache`); hidden files (`.gitattributes`)
+        // are the model's.
+        let hidden = entry.file_name().to_string_lossy().starts_with('.');
+        if path.is_dir() && hidden {
             continue;
         }
         if path.is_dir() {
@@ -513,15 +516,42 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<Member>) -> Result<()> {
 
 // ------------------------------------------------------------------------------ selection
 
-/// Weights, and the documents a model is built from.
-fn wanted(path: &str) -> bool {
+/// Weights in a format the import does not read: other serializations of the weights it
+/// converts from safetensors. They are the only files of a source a model does not keep.
+const OTHER_WEIGHTS: [&str; 11] = [
+    ".bin", ".pt", ".pth", ".ckpt", ".onnx", ".onnx_data", ".msgpack", ".h5", ".gguf", ".ot",
+    ".tflite",
+];
+
+/// A safetensors weights file, or its index.
+pub fn weights(path: &str) -> bool {
+    path.contains(".safetensors")
+}
+
+/// Other serializations of the weights, and their indexes (`pytorch_model.bin.index.json`).
+fn other_weights(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    (OTHER_WEIGHTS.iter()).any(|e| lower.ends_with(e) || lower.contains(&format!("{e}.index")))
+}
+
+/// A configuration a converter's reference supplies: configs, tokenizers, templates, licenses.
+fn config(path: &str) -> bool {
     let name = path.rsplit('/').next().unwrap_or(path);
     let lower = name.to_ascii_lowercase();
-    lower.ends_with(".safetensors")
-        || [".json", ".txt", ".model", ".jinja", ".tiktoken"]
-            .iter()
-            .any(|e| lower.ends_with(e))
+    [".json", ".txt", ".model", ".jinja", ".tiktoken"]
+        .iter()
+        .any(|e| lower.ends_with(e))
         || lower.starts_with("license")
+}
+
+/// What `select` keeps besides the weights.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Files {
+    /// Every other file of the source, byte-exact: configs, tokenizers, README, LICENSE, code,
+    /// assets. Only other serializations of the weights are dropped.
+    All,
+    /// The configurations beside the selected weights (a converter's reference).
+    Configs,
 }
 
 /// `Some(variant)` of a Diffusers/Transformers weights file or index:
@@ -619,12 +649,13 @@ fn index_folders(doc: &[u8]) -> Result<Vec<String>> {
     Ok(folders)
 }
 
-/// What the import takes: the named file, else the layout under the root (a Diffusers
-/// pipeline's indexed components, a Transformers model's root files, or every weights file
-/// and document), one weights variant per folder.
+/// What the import takes: the named file, else the weights of the layout under the root (a
+/// Diffusers pipeline's indexed components, a Transformers model's root files, or every weights
+/// file), one variant per folder, and the other files `files` asks for.
 pub fn select(
     listing: Listing,
     variant: Option<&str>,
+    files: Files,
     read: &dyn Fn(&Member) -> Result<Vec<u8>>,
 ) -> Result<Vec<Member>> {
     if listing.exact {
@@ -669,14 +700,13 @@ pub fn select(
     let members = listing
         .members
         .into_iter()
-        .filter(|m| wanted(&m.path) && keep(&m.path))
+        .filter(|m| match files {
+            _ if weights(&m.path) => keep(&m.path),
+            Files::All => !other_weights(&m.path),
+            Files::Configs => config(&m.path) && keep(&m.path),
+        })
         .collect();
     Ok(one_variant(members, variant))
-}
-
-/// A document the model carries as a file: configs, tokenizers, templates, licenses.
-pub fn document(path: &str) -> bool {
-    wanted(path) && !path.contains(".safetensors")
 }
 
 // ------------------------------------------------------------------------------ download
