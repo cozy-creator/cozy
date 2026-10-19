@@ -527,8 +527,8 @@ class Memory:
         self.evictions = 0
         self.memo = cuts.Memo()
         cuts.serve(self.memo, self)
-        #: bytes given back in this process, for its requests waiting on room
-        self.frees = 0
+        #: bytes given back in this process, and its requests waiting for room (§2)
+        self.frees = self.waiting = 0
         self.freeing = threading.Condition()
         #: each module's model, and host tiers sealed here for the executor to deposit
         self.by_module: dict[nn.Module, Model] = {}
@@ -974,27 +974,44 @@ class Memory:
         return max(_free(gpu) - before, 0)
 
     def _wait_room(self, gpu: int) -> bool:
-        """§2's safety net, never under the lock: another request holds the room, so wait
-        for bytes to free (the ledger's freed generation, or this process's). False when no
-        other request runs on the device: nothing would free them."""
+        """§2's safety net, never under the lock: another request holds the room, so wait for
+        bytes to free (the ledger's freed generation, or this process's). It waits only while
+        another request on the device runs and is not itself waiting. When every one waits,
+        the lowest row gives up: its `Exhausted` frees its bytes and wakes the rest. No timer."""
         held = self.rows.get(gpu)
         with self.freeing:
-            seen = self.frees
-            gen = held[0].freed_gen() if held is not None else 0
-            mine = sum(gpu in r.gpus for r in list(self.active)) > 1
-        others = held is not None and any(
-            f.state == "live" and f.slot != held[1].id and f.active_peak > 0
-            for f in held[0].snapshot()
-        )
-        if not (mine or others):
-            return False
-        if held is not None:
+            here = sum(gpu in r.gpus for r in list(self.active)) - 1 - self.waiting
+            if here <= 0 and not self._elsewhere(held):
+                return False
+            seen, gen = self.frees, held[0].freed_gen() if held is not None else 0
+            self.waiting += 1
+        try:
+            self._publish(gpu)
+            if held is None:
+                with self.freeing:
+                    while self.frees == seen:
+                        self.freeing.wait()
+                return True
+            if here <= 0 and not self._elsewhere(held):  # they began waiting meanwhile
+                return False
             held[0].wait_freed(gen)
             return True
-        with self.freeing:
-            while self.frees == seen:
-                self.freeing.wait()
-        return True
+        finally:
+            with self.freeing:
+                self.waiting -= 1
+            self._publish(gpu)
+
+    def _elsewhere(self, held: tuple[Ledger, Row] | None) -> bool:
+        """Whether another row runs a request that is not waiting for room, or, with every
+        active row waiting (this one included), this row is not the lowest of them."""
+        if held is None:
+            return False
+        table, row = held
+        active = [f for f in table.snapshot() if f.state == "live" and len(f.running) > 0]
+        if any(f.slot != row.id and len(f.running) > f.waiting for f in active):
+            return True
+        waiting = [f.slot for f in active if f.slot != row.id] + [row.id]
+        return len(waiting) > 1 and row.id != min(waiting)
 
     def _freed(self, gpu: int) -> None:
         """Bytes went back: wake whoever waits for room, here and in TensorD."""
@@ -1044,6 +1061,7 @@ class Memory:
             idle=reserved - allocated,
             active_peak=torch.cuda.max_memory_allocated(gpu) if self._in_request(gpu) else 0,
             last_use=self.last_use,
+            waiting=self.waiting,
         )
 
     def _running(self, gpu: int) -> None:
