@@ -10,6 +10,7 @@ mod plan;
 mod probe;
 
 pub use plan::Target;
+pub use device::DeviceBuffer;
 pub use probe::{ceiling, disk, Ceiling};
 
 use std::fs::File;
