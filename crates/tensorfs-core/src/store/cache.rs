@@ -845,7 +845,27 @@ mod tests {
         let owner = store.cache_directory(&path).unwrap();
         fs::create_dir_all(&path).unwrap();
         fs::hard_link(store.path(&object).unwrap(), path.join("weight")).unwrap();
-        let sample = sampled(store, std::slice::from_ref(&object), 4096);
+        // The sample observes payload allocation, so a directory/record-only plan must
+        // not satisfy it. Require real fixture allocation on both sides of this deficit.
+        let deficit = 16 << 10;
+        let allocated = |path: &Path| platform::durable::allocated(&fs::metadata(path).unwrap());
+        let metadata = allocated(&path)
+            + allocated(&store.cache_entry(&path).unwrap().1)
+            + allocated(
+                &store
+                    .root
+                    .join("pins")
+                    .join(format!("cache-{}.json", object.sha256)),
+            );
+        assert!(
+            metadata < deficit,
+            "snapshot metadata alone covers the sample"
+        );
+        assert!(
+            allocated(&store.path(&object).unwrap()) > deficit,
+            "the payload cannot cover the sample"
+        );
+        let sample = sampled(store, std::slice::from_ref(&object), deficit);
         assert!(!store.cache_maintain_with(0, now_secs(), &sample).unwrap());
         assert!(path.join("weight").exists());
         assert!(store
