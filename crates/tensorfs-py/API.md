@@ -62,12 +62,20 @@ A `Pipeline` has `cls` and `config`. A `Component` exposes:
 | `cls` | Model class identifier. |
 | `config` | Parsed JSON configuration as a dictionary. |
 | `tensors` | A `Tensors` mapping, described below. |
-| `assets` | Asset names mapped to `(sha256_hex, byte_length)` references. |
-| `asset(name)` | The named asset's bytes. |
+| `assets` | Supporting filenames mapped to `(sha256_hex, byte_length)` references; this does not load file contents. |
+| `asset(name)` | Read a supporting file, fetching it if needed; returns `bytes`. |
 | `path` | A folder containing this component's configuration and assets; obtaining it does not fetch tensor weights. |
 
-For example, a tokenizer that needs files can use
-`checkpoint.components["tokenizer"].path`.
+An asset is a supporting file needed by the component, such as a tokenizer's
+`tokenizer.json`, `vocab.json` or `merges.txt`. It is stored by content hash alongside the
+tensor data. Read a file directly or give a library a materialized directory:
+
+```python
+tokenizer = checkpoint.components["tokenizer"]
+print(list(tokenizer.assets))
+tokenizer_bytes = tokenizer.asset("tokenizer.json")
+tokenizer_folder = tokenizer.path
+```
 
 For import/export compatibility, a component also retains `config_file`, the filename to
 use when recreating its configuration file. For example, a scheduler can require
