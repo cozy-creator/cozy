@@ -80,6 +80,7 @@ pub static ENCODERS: &[&Encoder] = &[
     &bnb::NF4,
     &bnb::FP4,
     &bnb::INT8,
+
     // comfy.*
 ];
 

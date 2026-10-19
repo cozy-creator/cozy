@@ -85,6 +85,7 @@ pub static SCHEMES: &[&Scheme] = &[
     &bnb::NF4,
     &bnb::FP4,
     &bnb::INT8,
+
     // comfy.*
 ];
 
