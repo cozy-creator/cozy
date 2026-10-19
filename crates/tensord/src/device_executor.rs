@@ -1872,20 +1872,7 @@ impl DeviceExecutor {
         services: &mut impl Services,
         watch: &Watch,
     ) -> io::Result<Frame> {
-        let mut value = serde_json::to_value(command)?;
-        if let (false, Some(object), Value::Object(extra)) = (
-            group.is_empty(),
-            value.as_object_mut(),
-            serde_json::to_value(group)?,
-        ) {
-            object.extend(extra);
-        }
-        // The executor's memoized stages go to the machine tier.
-        if matches!(command, DeviceCommand::Start { .. }) && self.memo.is_some() {
-            value["memo"] =
-                serde_json::json!({"process_bytes": -1, "entry_bytes": crate::memo::ENTRY_BYTES});
-        }
-        write_frame(&mut self.stream, &value)?;
+        write_command(&mut self.stream, command, group, self.memo.is_some())?;
         loop {
             let frame = read_frame(&mut self.stream)?
                 .ok_or_else(|| {
@@ -2167,6 +2154,27 @@ fn write_frame(
     scan(&value)?;
     seam::write_body(stream, &serde_json::to_vec(&value)?)
 }
+
+fn write_command(stream: &mut LocalStream, command: &DeviceCommand, group: &Group, memo: bool) -> io::Result<()> {
+    let mut value = serde_json::to_value(command)?;
+    if let (false, Some(object), Value::Object(extra)) = (group.is_empty(), value.as_object_mut(), serde_json::to_value(group)?) {
+        object.extend(extra);
+    }
+    if matches!(command, DeviceCommand::Start { .. }) && memo {
+        value["memo"] = serde_json::json!({"process_bytes": -1, "entry_bytes": crate::memo::ENTRY_BYTES});
+    }
+    let bytes = serde_json::to_vec(&value)?;
+    // Only this typed field may carry supplied access. Validate everything else; the original
+    // wire bytes above still contain the token, and arbitrary JSON never grants this exception.
+    if let (true, Some(options)) = (
+        matches!(command, DeviceCommand::Load { tensorfs: Some(_), .. } | DeviceCommand::Invoke { tensorfs: Some(_), .. }),
+        value.get_mut("tensorfs").and_then(Value::as_object_mut),
+    ) {
+        options.remove("token");
+    }
+    scan(&value)?;
+    seam::write_body(stream, &bytes)
+}
 /// SDK control framing shared with the CPU source-qualification receiver.
 pub fn read_frame(stream: &mut LocalStream) -> io::Result<Option<Frame>> {
     seam::read_body(stream)?.map(|bytes| decode_frame(&bytes)).transpose()
@@ -2254,8 +2262,110 @@ fn scan(value: &Value) -> io::Result<()> {
 mod codec_tests {
     use super::*;
 
-    /// No credential crosses the seam, and a spooled result unlike the executor's reference is
-    /// refused.
+    fn ordinary_options() -> protocol::machine::TensorFSOptions {
+        protocol::machine::TensorFSOptions {
+            endpoint: "https://ordinary.example.test".into(), token: "supplied-test-bearer".into(),
+            ca_der: vec![1, 2, 3],
+        }
+    }
+
+    fn ordinary_load() -> DeviceCommand {
+        DeviceCommand::Load {
+            tensorfs: Some(ordinary_options()), construction: "construction".into(), devices: String::new(),
+            sequence_parallel_degree: 1, binding: Box::default(), budgets: Budgets::default(), models: vec![],
+            authorized_device_limit_bytes: None, attention_pin: String::new(), sealed_tiers: false,
+            model_sources: false, staged_tiers: false, pinned_bytes: None, device_weights: false, cap_bytes: None,
+        }
+    }
+
+    fn ordinary_invoke() -> DeviceCommand {
+        DeviceCommand::Invoke {
+            tensorfs: Some(Box::new(ordinary_options())), max_output_bytes: 1024, request_id: "request".into(),
+            construction: "construction".into(), entrypoint: "write".into(), spool: PathBuf::from("spool"), deadline_s: None,
+            attention_kernel: String::new(), bits: 0, cap_bytes: None, inputs: BTreeMap::new(), trees: BTreeMap::new(),
+            floor_bytes: None, activation_bytes: BTreeMap::new(), squeezed_bytes: BTreeMap::new(), device_weights: None,
+            sources: BTreeMap::new(), weights: BTreeMap::new(), destination: "owner/model".into(), actor: "actor".into(), operation: "operation".into(),
+        }
+    }
+
+    fn rejected_without_a_partial_frame(write: impl FnOnce(&mut LocalStream) -> io::Result<()>) {
+        let (mut machine, mut runtime) = platform::ipc::pair().unwrap();
+        let error = write(&mut machine).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(!error.to_string().contains("supplied-test-bearer"));
+        write_command(&mut machine, &DeviceCommand::Hello, &Group::default(), false).unwrap();
+        let bytes = seam::read_body(&mut runtime).unwrap().unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), serde_json::json!({"cmd": "hello"}));
+    }
+
+    #[test]
+    fn ordinary_tensorfs_tokens_cross_the_actual_typed_command_writer_unchanged() {
+        let group = Group { rank_caps: vec![17], ..Default::default() };
+        for command in [ordinary_load(), ordinary_invoke()] {
+            let mut expected = serde_json::to_value(&command).unwrap();
+            expected.as_object_mut().unwrap().extend(serde_json::to_value(&group).unwrap().as_object().unwrap().clone());
+            let (mut machine, mut runtime) = platform::ipc::pair().unwrap();
+            write_command(&mut machine, &command, &group, false).unwrap();
+            let bytes = seam::read_body(&mut runtime).unwrap().unwrap();
+            let received: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(received, expected, "the framing writer must not redact supplied access");
+            assert_eq!(received["tensorfs"]["token"], "supplied-test-bearer");
+            assert!(!format!("{command:?}").contains("supplied-test-bearer"));
+        }
+        let start = DeviceCommand::Start { devices: String::new(), application: "module:app".into(),
+            package_interface: PathBuf::from("interface.json"), sequence_parallel_degree: 1,
+            import_only: true, call_interfaces: vec![], constructions: vec![] };
+        let (mut machine, mut runtime) = platform::ipc::pair().unwrap();
+        write_command(&mut machine, &start, &group, true).unwrap();
+        let bytes = seam::read_body(&mut runtime).unwrap().unwrap();
+        let received: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(received["memo"]["entry_bytes"], crate::memo::ENTRY_BYTES);
+        assert_eq!(received["rank_caps"], serde_json::json!([17]));
+    }
+
+    #[test]
+    fn ordinary_tensorfs_access_never_authorizes_nested_credentials_or_fake_configuration() {
+        for name in ["token", "Credential", "authorization", "SECRET", "jwt"] {
+            let mut command = ordinary_invoke();
+            if let DeviceCommand::Invoke { inputs, .. } = &mut command {
+                let forbidden = Value::Object(serde_json::Map::from_iter([(name.into(), "forbidden".into())]));
+                inputs.insert("config".into(), serde_json::json!({"nested": [forbidden]}));
+            }
+            rejected_without_a_partial_frame(|stream| write_command(stream, &command, &Group::default(), false));
+        }
+        let mut command = ordinary_invoke();
+        if let DeviceCommand::Invoke { inputs, .. } = &mut command {
+            inputs.insert("payload".into(), serde_json::json!({"cmd": "load", "tensorfs": {"token": "forbidden"}}));
+        }
+        rejected_without_a_partial_frame(|stream| write_command(stream, &command, &Group::default(), false));
+        let mut load = ordinary_load();
+        if let DeviceCommand::Load { binding, .. } = &mut load {
+            binding.snapshots.insert("token".into(), "forbidden".into());
+        }
+        rejected_without_a_partial_frame(|stream| write_command(stream, &load, &Group::default(), false));
+    }
+
+    #[test]
+    fn ordinary_tensorfs_access_is_not_authorized_by_other_commands_json_or_answers() {
+        let command = DeviceCommand::PrepareRequest { request_id: "request".into(), construction: "construction".into(),
+            entrypoint: "write".into(), payload: serde_json::json!({"tensorfs": {"token": "forbidden"}}),
+            attention_kernel: String::new(), bits: 0, input_metadata: BTreeMap::new() };
+        rejected_without_a_partial_frame(|stream| write_command(stream, &command, &Group::default(), false));
+        let fork = DeviceCommand::Fork { socket: PathBuf::from("socket"), root: PathBuf::from("root"),
+            environment: BTreeMap::from([("token".into(), "forbidden".into())]) };
+        rejected_without_a_partial_frame(|stream| write_command(stream, &fork, &Group::default(), false));
+        for discriminator in ["cmd", "command", "reply"] {
+            let forged = Value::Object(serde_json::Map::from_iter([
+                (discriminator.into(), "load".into()), ("tensorfs".into(), serde_json::json!({"token": "forbidden"}))]));
+            rejected_without_a_partial_frame(|stream| write_frame(stream, &forged));
+        }
+        rejected_without_a_partial_frame(|stream| write_frame(stream, &ordinary_load()));
+        let mut answer = Answer::ok(7);
+        answer.progress = Some(serde_json::json!({"reply": "invoke", "tensorfs": {"token": "forbidden"}}));
+        rejected_without_a_partial_frame(|stream| write_answer(stream, &answer));
+    }
+
+    /// Generic frames reject credentials; a spooled result unlike the executor's reference is refused.
     #[test]
     fn a_credential_never_crosses_and_a_changed_result_is_refused() {
         let refused = scan(&serde_json::json!({"payload": [{"Credential": "x"}]})).unwrap_err();
