@@ -21,6 +21,7 @@ mod checkpoint;
 mod folder;
 mod gc;
 mod records;
+pub(crate) mod retention;
 
 pub use checkpoint::{wanted, Checkpoint, ChunkRead, Piece, Placed, ReadPlan};
 pub use gc::{Collected, PinUsage, Usage};

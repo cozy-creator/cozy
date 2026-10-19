@@ -5,6 +5,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+#[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -164,12 +165,15 @@ impl Buf {
 
 /// Drops `ck`'s chunks from the page cache: the next read is cold.
 fn evict(ck: &Checkpoint) {
+    #[cfg(target_os = "linux")]
     for i in 0..ck.header().chunks.len() {
         let f = ck.chunk(i).unwrap();
         f.sync_all().unwrap();
         // SAFETY: an advisory call on our own descriptor.
         assert_eq!(unsafe { libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) }, 0);
     }
+    #[cfg(not(target_os = "linux"))]
+    let _ = ck;
 }
 
 fn direct_ok(ck: &Checkpoint) -> bool {
