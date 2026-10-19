@@ -81,6 +81,8 @@ pub struct Uploaded {
     pub objects: usize,
     pub sent: usize,
     pub bytes: u64,
+    /// The requested repo update was already present, independent of blob deduplication.
+    pub converged: bool,
 }
 
 /// An answer read whole.
@@ -625,8 +627,13 @@ pub async fn upload_tree_with(endpoint: &Endpoint, name: &str, tree: &ObjectRef,
     if (control.cancelled)() || !(control.commit)() {
         return Err(stopped());
     }
-    let repo = endpoint.update_repo(name, |old| Ok(Some(with_tree(old, name, tree, version)))).await?;
-    Ok(Uploaded { repo, objects, sent, bytes })
+    let mut converged = false;
+    let repo = endpoint.update_repo(name, |old| {
+        let new = with_tree(old.clone(), name, tree, version);
+        converged = old.as_ref() == Some(&new);
+        Ok(Some(new))
+    }).await?;
+    Ok(Uploaded { repo, objects, sent, bytes, converged })
 }
 
 /// Replaces `<root>/<key>` with `bytes` under the store's record lock while it has ETag `etag`.
