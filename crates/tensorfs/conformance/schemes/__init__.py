@@ -12,6 +12,8 @@ from . import mxfp8
 from . import nvfp4
 
 # fp8.blockwise, mxfp4
+from . import fp8_blockwise
+from . import mxfp4
 
 # gguf
 
@@ -30,6 +32,8 @@ FAMILIES = (
     nvfp4,
 
     # fp8.blockwise, mxfp4
+    fp8_blockwise,
+    mxfp4,
 
     # gguf
 

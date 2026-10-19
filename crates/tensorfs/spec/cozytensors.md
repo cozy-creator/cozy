@@ -150,9 +150,9 @@ An encoded tensor cites an **encoding** `[scheme, params]`. With this section th
 the logical tensor; no decode depends on anything outside the header, its chunks and this spec.
 
 **Names** are `family.variant` in lowercase, in the words of the ecosystem that made the format: generic scaled
-formats are `element.granularity` (`fp8.tensorwise`, `int8.rowwise`; later `fp8.blockwise`), a producer's own format
+formats are `element.granularity` (`fp8.tensorwise`, `int8.rowwise`, `fp8.blockwise`), a producer's own format
 is `producer.type` with the producer's type name verbatim (later `gguf.q4_k`, `gptq.int4`, `bnb.nf4`), and a
-vendor-neutral standard keeps its bare name (`mxfp8`, `nvfp4`; later `mxfp4`).
+vendor-neutral standard keeps its bare name (`mxfp4`, `mxfp8`, `nvfp4`).
 
 **Params** are snake_case keys in the producer's vocabulary (`axis`, `block_size`, `rotation`, `rotation_size`,
 `global_scale`, `nibble_order`, `scale_layout`, `scale_dtype`). Every param the decode reads is required and none has a
@@ -208,8 +208,9 @@ built from the building blocks that follow.
 | row | `R` elements, any shape | `s[i]` |
 | column | `C` elements, any shape | `s[j]` |
 | row blocks of `B` | `W = ⌈C/B⌉` per row, in a layout below | `s(i, b)`: `b = ⌊j/B⌋`, or `b = g_idx[j]` where the scheme has a `g_idx` |
+| tiles of `Bᵣ × B_c` | `[lead…, ⌈N/Bᵣ⌉, ⌈C/B_c⌉]`: the logical shape with its last two extents, `N` and `C`, counted in tiles | `s[m, ⌊r/Bᵣ⌋, ⌊j/B_c⌋]`, where row `i = m·N + r` is row `r` of matrix `m` |
 
-The last block of a row may be short. A `g_idx` holds `C` values, each below `W`. Row blocks are stored:
+The last block of a row, and the last tile of a matrix's rows or columns, may be short. A `g_idx` holds `C` values, each below `W`. Row blocks are stored:
 - `row_major`: the logical shape with its last extent replaced by `W` (`[R, W]` for a matrix); `s(i, b)` is element
   `i·W + b`.
 - `transposed`: `[W, R]`; `s(i, b)` is element `b·R + i` (GPTQ's and AWQ's `[K/g, N]`).
@@ -306,7 +307,31 @@ scheme (a later minor may add one, rule 3). ModelOpt's `weight` (`uint8 [R, C/2]
 `weight_scale_2` are `weight`, `scale` and `scale_2` here; ModelOpt and compressed-tensors write `low_first`,
 `row_major`; ComfyUI writes `high_first`, `cublas_128x4`.
 
-<!-- fp8.blockwise, mxfp4 -->
+### `fp8.blockwise`
+
+FP8 elements and one scale per tile of each matrix (DeepSeek-V3 and later, Qwen3-FP8, Kimi-K2, MiniMax-M2, GLM-5-FP8;
+compressed-tensors' block strategy).
+- Params: `block_size: [Bᵣ, B_c]`, two positive integers (`[128, 128]` in practice); `scale_dtype`: `F32`, `BF16`,
+  `F16` or `F8_E8M0`, as the producer stored the scale.
+- Parts: `weight`: `F8_E4M3`, the logical shape. `scale`: `scale_dtype`, on tiles of `Bᵣ × B_c`.
+- Decode: `round_L(weight[i, j] × s(i, j))`.
+
+The scale multiplies. DeepSeek's and transformers' `weight_scale_inv` (the inverse of the factor the weight was
+multiplied by when quantized; DeepSeek-V4 names it `scale`) and compressed-tensors' `weight_scale` are this `scale`.
+Under `scale_fmt: ue8m0` every scale is a power of two, stored `F32` (DeepSeek-V3.1) or `F8_E8M0` (DeepSeek-V4).
+
+### `mxfp4`
+
+The OCP Microscaling MXFP4 format: an E2M1 element per weight and a power-of-two scale per 32 consecutive elements of
+a row (the last block of a row may be short).
+- Params: `block_size: 32`.
+- Parts: `weight`: `F4`, the logical shape (§5's packing). `scale`: `F8_E8M0` on row blocks of 32, `row_major`.
+- Decode, with `T` the 16 E2M1 values (§5): `round_L(T[q] × s(i, j))`.
+
+Every producer seen writes these bytes, the even element in the low nibble and the scales row-major: gpt-oss's
+`<module>_blocks` (`U8 [lead…, C/32, 16]`, a row's blocks in order) and `<module>_scales`, compressed-tensors'
+`weight_packed` and `weight_scale`, AMD Quark's `weight` and `weight_scale` (`pack_method: reorder`), MLX's `weight`
+(`U32` words, little-endian) and `scales`, and DeepSeek-V4's FP4 experts (`weight` `I8`, `scale`).
 
 <!-- gguf.* -->
 

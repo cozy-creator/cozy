@@ -44,3 +44,9 @@ hold the same values as their mined twins in the other nibble order, scale tilin
 (per-column scales, `F8_E5M2` weights, `BF16`/`F16` tensorwise scales, `int8.tensorwise`, `int8.rowwise`, a ragged `mxfp8` block, a divided global
 scale, rounding of 3,072 f32 patterns to BF16/F16, plain and unknown dtypes, refusals) were computed exactly from the
 spec's formulas.
+
+`fp8_blockwise` and `mxfp4` are mined by `mine/<family>.py` from transformers' FineGrainedFP8, compressed-tensors,
+gpt-oss's triton_kernels and torchao on CPU, each producer's own dequantize giving the expected bytes, plus rows of
+real checkpoints read by HTTP range at pinned revisions (DeepSeek-V3.1 and V4, Qwen3, RedHatAI, gpt-oss, AMD Quark,
+MLX, compressed-tensors). A case with `source` holds the `F32` values its producer quantized; TensorFS's encoder
+reproduces its parts bit for bit (`tests/format_encode.rs`).

@@ -23,6 +23,8 @@ mod mxfp8;
 mod nvfp4;
 
 // fp8.blockwise, mxfp4
+mod fp8_blockwise;
+mod mxfp4;
 
 // gguf
 
@@ -42,7 +44,8 @@ pub static SCHEMES: &[&Scheme] = &[
     &mxfp8::MXFP8,
     &nvfp4::NVFP4,
     // fp8.blockwise, mxfp4
-
+    &fp8_blockwise::BLOCKWISE,
+    &mxfp4::MXFP4,
     // gguf.*
 
     // gptq.*, awq.*, ct.*
@@ -169,6 +172,11 @@ impl<'a> Ctx<'a> {
     }
     pub fn uint(&self, key: &str) -> usize {
         self.params[key].as_u64().expect("checked against the row") as usize
+    }
+    /// A param of the row as stored, for params of no text or integer kind (checked before the
+    /// decode runs).
+    pub fn param(&self, key: &str) -> &'a Value {
+        &self.params[key]
     }
     pub fn flag(&self, key: &str) -> bool {
         matches!(self.params[key], Value::Bool(true))

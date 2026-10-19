@@ -46,6 +46,13 @@ pub enum Grid<'a> {
         layout: ScaleLayout,
         index: Option<&'a [u32]>,
     },
+    /// Tiles of `rows × cols` over each matrix of `height` rows (the logical shape's second-last
+    /// extent), stored `[lead…, ⌈height/rows⌉, ⌈C/cols⌉]`; edge tiles may be short.
+    Tiles {
+        rows: usize,
+        cols: usize,
+        height: usize,
+    },
 }
 
 impl Grid<'_> {
@@ -64,6 +71,11 @@ impl Grid<'_> {
                         vec![c.rows.div_ceil(128) as u64 * 128, w.div_ceil(4) * 4]
                     }
                 })
+            }
+            Grid::Tiles { rows, cols, height } => {
+                let (lead, c) = (&c.shape[..c.shape.len() - 2], c.shape[c.shape.len() - 1]);
+                let tiles = [height.div_ceil(rows) as u64, c.div_ceil(cols as u64)];
+                Shape::Exact([lead, &tiles].concat())
             }
         })
     }
@@ -89,6 +101,14 @@ impl Grid<'_> {
                         tile * 512 + (i % 32) * 16 + (i % 128 / 32) * 4 + b % 4
                     }
                 }
+            }
+            Grid::Tiles {
+                rows: br,
+                cols: bc,
+                height,
+            } => {
+                let (matrix, r) = (i / height, i % height);
+                (matrix * height.div_ceil(br) + r / br) * cols.div_ceil(bc) + j / bc
             }
         }
     }
@@ -140,5 +160,13 @@ mod tests {
         };
         assert_eq!(t.at(3, 8, 2, 0), 3 + 2);
         assert_eq!(t.at(3, 8, 2, 1), 2);
+        // Two matrices of 3 rows × 5 in 2×2 tiles: [2, 2, 3] scales; row 4 is matrix 1's row 1.
+        let tiles = Grid::Tiles {
+            rows: 2,
+            cols: 2,
+            height: 3,
+        };
+        assert_eq!(tiles.at(6, 5, 4, 4), 2 * 3 + 2);
+        assert_eq!(tiles.at(6, 5, 2, 1), 3);
     }
 }
