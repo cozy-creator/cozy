@@ -20,6 +20,7 @@ weight binds once.
 from __future__ import annotations
 
 import gc
+import hashlib
 import math
 import threading
 import time
@@ -37,7 +38,8 @@ from torch.utils._python_dispatch import _disable_current_modes
 from torch.utils._pytree import tree_map_only
 from torch.utils.hooks import RemovableHandle
 
-from . import DeviceFull, Gpu, Host, Ledger, Pinned, Row, WeightSet, cuts, seal
+from . import Copy as CopyRun
+from . import DeviceFull, Gpu, Host, Ledger, Pinned, Row, WeightSet, copies, cuts, seal
 
 #: Blocks copied ahead of the one entered, in the recorded order.
 _AHEAD = 2
@@ -70,7 +72,8 @@ class Level(Enum):
 @dataclass(frozen=True, slots=True)
 class WeightGrant:
     """TensorD's grant for one component: its header, the binding's manifest, the sealed host
-    layout or the chunk files `(sha256, length, fd)`, and the stored tensors the module builds."""
+    layout or the chunk files `(sha256, length, fd)`, and the stored tensors the module builds.
+    With a held layout, GPU pages a gone executor kept of it, `(region, fd)`, and what they hold."""
 
     ck: tensorfs.Checkpoint
     component: str
@@ -78,6 +81,8 @@ class WeightGrant:
     host_fd: int | None = None
     keys: Collection[str] | None = None
     files: Sequence[tuple[str, int, int]] = ()
+    pages: Sequence[tuple[int, int]] = ()
+    fingerprint: str = ""
 
     @property
     def key(self) -> str:
@@ -188,6 +193,36 @@ class Peak:
 
 
 @dataclass(frozen=True, slots=True)
+class Copy:
+    """A run of weight copies since the last request (`varena.copies()`): a restore, refill or
+    fill (`h2d`), or a host layout read from disk (`disk`), against the measured `ceiling` GB/s.
+    `busy_s` is the GPU's copy time, `pin_s` the host's page locking."""
+
+    kind: str
+    gpu: int
+    bytes: int
+    seconds: float
+    gbps: float
+    ceiling: float
+    pct: float
+    link: str
+    busy_s: float
+    pin_s: float
+    staged: int
+    cached: int
+
+
+def _copy(c: CopyRun) -> Copy:
+    gbps = c.bytes / c.ns if c.ns else 0.0
+    pct = round(100 * gbps / c.ceiling, 1) if c.ceiling else 0.0
+    seconds, busy, pin = c.ns / 1e9, c.busy_ns / 1e9, c.pin_ns / 1e9
+    ceiling = round(c.ceiling, 2)
+    return Copy(
+        c.kind, c.gpu, c.bytes, seconds, round(gbps, 2), ceiling, pct, c.link, busy, pin, c.staged, c.cached
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class RequestStats:
     id: str
     steps: tuple[Step, ...]
@@ -200,6 +235,7 @@ class RequestStats:
     peaks: tuple[Peak, ...] = ()
     #: its declared plan (`Memory.plan`), each step's models by component name
     plan: tuple[tuple[str, ...], ...] = ()
+    copies: tuple[Copy, ...] = ()
 
 
 # ------------------------------------------------------------------------ placeholders
@@ -368,6 +404,15 @@ class Model:
     def close(self) -> None:
         self.memory._close(self)
 
+    def kept(self) -> tuple[str, list[tuple[int, int, int]]]:
+        """Its landed home pages not handed out yet, kept past this process for TensorD, and what
+        they hold: `(region, span, fd)`, each fd the caller's. None when a fill (a LoRA bake)
+        writes them."""
+        if self.fill is not None or self.host or not self.memory.granted:
+            return "", []
+        pages = self.ws.kept()
+        return (_fingerprint(self.key, self.ws) if pages else ""), pages
+
 
 class Hold:
     def __init__(self, model: Model, cache: Cache) -> None:
@@ -469,6 +514,8 @@ class Memory:
         self.landing: dict[Model, set[int]] = {}
         #: host tiers sealed here for the executor to deposit
         self.deposits: list[tuple[Model, int]] = []
+        #: granted host tiers adopted before their modules exist (`adopt`), by grant key
+        self.adopted: dict[str, WeightSet] = {}
         #: its requests waiting for room (§2), counted under `freeing`
         self.waiting = 0
         self.freeing = threading.Lock()
@@ -541,6 +588,52 @@ class Memory:
         self._publish()
         return model
 
+    def adopt(self, grant: WeightGrant) -> None:
+        """Before its module is built: the host tier granted for it (`grant.host_fd`), registered
+        from the regions it carries, its copies to the GPU started into free room. `load` binds
+        the module to it when the module's regions are the same; else it is a miss, and the
+        module loads as if nothing were granted."""
+        if grant.host_fd is None:
+            return
+        with self.lock:
+            files = list(grant.files) or None
+            ws = self.core.adopt(self._name(grant.key), grant.ck, grant.host_fd, files)
+            self._share(ws, grant)
+            self.adopted[grant.key] = ws
+            room = self._free() if self.cuda else 0
+            for region, span in enumerate(ws.spans):
+                if span > room:
+                    break
+                try:
+                    ws.prefetch(region)
+                except DeviceFull:
+                    break
+                room -= span
+        self._publish()
+
+    def unclaimed(self) -> None:
+        """Let go of what `adopt` took that no `load` bound."""
+        with self.lock:
+            adopted, self.adopted = self.adopted, {}
+        for ws in adopted.values():
+            ws.close()
+        self._publish()
+
+    def _share(self, ws: WeightSet, grant: WeightGrant) -> None:
+        """Under TensorD, a set's home pages can be kept past this process; pages a gone
+        executor kept for it map now, no copy, when they hold what this set holds."""
+        if self.cuda and self.granted and ws.shareable() and grant.pages:
+            if grant.fingerprint == _fingerprint(grant.key, ws):
+                ws.adopt_pages(list(grant.pages))
+
+    def _name(self, key: str) -> str:
+        taken = {*self.models, *(ws.name for ws in self.adopted.values())}
+        name, n = key, 1
+        while name in taken:
+            n += 1
+            name = f"{key}#{n}"
+        return name
+
     def sealed(self) -> list[tuple[Model, int]]:
         """Host tiers sealed since the last call, each fd the caller's to deposit and close."""
         with self.lock:
@@ -553,31 +646,38 @@ class Memory:
         if grant is None:
             raise Unbound(f"{type(module).__name__}: no weights attached (`Declared.weights`)")
         paths, regions = blocks_of(module), regions_of(module)
-        name, n = grant.key, 1
-        while name in self.models:
-            n += 1
-            name = f"{grant.key}#{n}"
         files, host_fd = list(grant.files) or None, grant.host_fd
-        if host_fd is None and self.cuda and self.granted:
-            host_fd = seal(grant.ck, regions, name, files=files)
-        ws = self.core.register(name, grant.ck, regions, host_fd, files)
-        model = Model(self, name, grant.key, module, ws, declared)
-        if host_fd is not None and grant.host_fd is None:
-            self.deposits.append((model, host_fd))
+        ws = self.adopted.pop(grant.key, None)
+        if ws is None and host_fd is not None:
+            ws = self.core.adopt(self._name(grant.key), grant.ck, host_fd, files)
+            self._share(ws, grant)
+        if ws is not None and ws.regions != regions:
+            ws.close()  # granted for other regions: a miss, and its layout is sealed anew
+            ws, host_fd = None, None
+        sealed = None
+        if ws is None:
+            name = self._name(grant.key)
+            if host_fd is None and self.cuda and self.granted:
+                host_fd = sealed = seal(grant.ck, regions, name, files=files)
+            ws = self.core.register(name, grant.ck, regions, host_fd, files)
+            self._share(ws, grant)
+        model = Model(self, ws.name, grant.key, module, ws, declared)
+        if sealed is not None:
+            self.deposits.append((model, sealed))
         _layout(model, f"{grant.component}/", paths, regions)
         model.sites = _sites(module)
         _install(model)
         model.order = [b.index for b in model.blocks]
         model.position = {b: i for i, b in enumerate(model.order)}
         model.home = set(model.order)
-        self.models[name], self.by_module[module] = model, model
+        self.models[model.name], self.by_module[module] = model, model
         if model.host:
             _bind_host(model)
             return model
         model.ws.home(_home_regions(model))
         for b in model.blocks:
             b.site = cuts.Site(
-                (name, b.index), self.device, model.track, b.module, module, declared.state
+                (model.name, b.index), self.device, model.track, b.module, module, declared.state
             )
             _hook(b)
         cuts.install(module)
@@ -1095,14 +1195,15 @@ class Memory:
         resident = {s.name: int(s.resident) for s in self.core.stats().sets}  # type: ignore[union-attr]
         models = list(self.models.values())
         bytes_of = lambda ms: sum(resident.get(m.name, 0) for m in ms)  # noqa: E731
+        adopted = sum(resident.get(ws.name, 0) for ws in self.adopted.values())
         cold = [m for m in models if not m.flight and not m.held]
         reserved, allocated = torch.cuda.memory_reserved(gpu), torch.cuda.memory_allocated(gpu)
         row.publish(
             context=self.context,
-            resident=bytes_of(models),
+            resident=bytes_of(models) + adopted,
             cold=bytes_of(cold),
             kept=bytes_of(m for m in cold if m.level is Level.GPU),
-            pinned=bytes_of(m for m in models if m.flight or m.held),
+            pinned=bytes_of(m for m in models if m.flight or m.held) + adopted,
             torch_reserved=reserved,
             torch_allocated=allocated,
             cache=sum(c.nbytes for c in list(self.caches)),
@@ -1252,8 +1353,9 @@ class Memory:
         steps, evictions = tuple(request.steps), tuple(request.evictions)
         declared = self.plans.get(request.id)
         plan = () if declared is None else tuple(self._names(s) for s in declared.steps)
+        runs = tuple(_copy(c) for c in copies())
         request.stats = RequestStats(
-            request.id, steps, evictions, leftover, copied, retries, peaks, plan
+            request.id, steps, evictions, leftover, copied, retries, peaks, plan, runs
         )
         if request.key is not None and self.row is not None:
             self.row[0].set_peak(request.key, request.peak)
@@ -1433,6 +1535,16 @@ def _runs(model: Model, plan: _Plan, step: int) -> bool:
 def _declared(module: nn.Module) -> Declared:
     found = vars(module).get("_varena")
     return found if isinstance(found, Declared) else Declared()
+
+
+def _fingerprint(key: str, ws: WeightSet) -> str:
+    """What `ws`'s kept pages hold: its checkpoint and component, and each part's place and
+    encoding."""
+    parts = sorted(
+        (p.region, p.offset, p.nbytes, p.component, p.key, p.role, p.dtype, tuple(p.shape))
+        for p in ws.parts
+    )
+    return hashlib.sha256(repr((key, ws.spans, parts)).encode()).hexdigest()
 
 
 def blocks_of(module: nn.Module) -> list[str]:

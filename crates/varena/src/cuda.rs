@@ -33,10 +33,15 @@ pub const MEMHOSTREGISTER_READ_ONLY: c_uint = 0x8;
 pub const MEMHOSTALLOC_PORTABLE: c_uint = 0x1;
 
 pub const ATTR_VMM_SUPPORTED: c_int = 102;
+pub const ATTR_PCI_BUS_ID: c_int = 33;
+pub const ATTR_PCI_DEVICE_ID: c_int = 34;
+pub const ATTR_PCI_DOMAIN_ID: c_int = 50;
+pub const ATTR_POSIX_FD_SUPPORTED: c_int = 103;
 
 pub const MEM_ALLOCATION_TYPE_PINNED: u32 = 1;
 pub const MEM_LOCATION_TYPE_DEVICE: u32 = 1;
 pub const MEM_HANDLE_TYPE_NONE: u32 = 0;
+pub const MEM_HANDLE_TYPE_POSIX_FD: u32 = 1;
 pub const MEM_ACCESS_PROT_READWRITE: u32 = 3;
 pub const MEM_GRANULARITY_MINIMUM: u32 = 0;
 
@@ -67,11 +72,11 @@ pub struct AllocationProp {
 }
 
 impl AllocationProp {
-    /// Pinned device memory on `device`, never shared with another process.
-    pub fn device(device: CUdevice) -> Self {
+    /// Pinned device memory on `device`; `handles`: another process may hold it by a POSIX fd.
+    pub fn device(device: CUdevice, handles: u32) -> Self {
         AllocationProp {
             kind: MEM_ALLOCATION_TYPE_PINNED,
-            requested_handle_types: MEM_HANDLE_TYPE_NONE,
+            requested_handle_types: handles,
             location: MemLocation { kind: MEM_LOCATION_TYPE_DEVICE, id: device },
             win32_handle_meta_data: std::ptr::null_mut(),
             alloc_flags: AllocFlags::default(),
@@ -116,6 +121,8 @@ pub struct Driver {
     pub mem_host_unregister: F<*mut c_void>,
     pub mem_host_alloc: unsafe extern "C" fn(*mut *mut c_void, usize, c_uint) -> CUresult,
     pub mem_free_host: F<*mut c_void>,
+    pub mem_alloc: unsafe extern "C" fn(*mut CUdeviceptr, usize) -> CUresult,
+    pub mem_free: F<CUdeviceptr>,
     pub mem_get_allocation_granularity:
         unsafe extern "C" fn(*mut usize, *const AllocationProp, u32) -> CUresult,
     pub mem_address_reserve:
@@ -127,6 +134,8 @@ pub struct Driver {
     pub mem_unmap: unsafe extern "C" fn(CUdeviceptr, usize) -> CUresult,
     pub mem_set_access:
         unsafe extern "C" fn(CUdeviceptr, usize, *const AccessDesc, usize) -> CUresult,
+    pub mem_export: unsafe extern "C" fn(*mut c_void, Handle, u32, u64) -> CUresult,
+    pub mem_import: unsafe extern "C" fn(*mut Handle, *mut c_void, u32) -> CUresult,
 }
 
 // The table is immutable after load and the driver entry points are thread-safe.
@@ -188,6 +197,8 @@ impl Driver {
             mem_host_unregister: load!(lib, b"cuMemHostUnregister"),
             mem_host_alloc: load!(lib, b"cuMemHostAlloc"),
             mem_free_host: load!(lib, b"cuMemFreeHost"),
+            mem_alloc: load!(lib, b"cuMemAlloc_v2"),
+            mem_free: load!(lib, b"cuMemFree_v2"),
             mem_get_allocation_granularity: load!(lib, b"cuMemGetAllocationGranularity"),
             mem_address_reserve: load!(lib, b"cuMemAddressReserve"),
             mem_address_free: load!(lib, b"cuMemAddressFree"),
@@ -196,6 +207,8 @@ impl Driver {
             mem_map: load!(lib, b"cuMemMap"),
             mem_unmap: load!(lib, b"cuMemUnmap"),
             mem_set_access: load!(lib, b"cuMemSetAccess"),
+            mem_export: load!(lib, b"cuMemExportToShareableHandle"),
+            mem_import: load!(lib, b"cuMemImportFromShareableHandle"),
             _lib: lib,
         };
         // SAFETY: documented as safe to call repeatedly; flags must be 0.

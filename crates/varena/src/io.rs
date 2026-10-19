@@ -131,6 +131,12 @@ impl Source {
         Ok(cached(&fds, 0, obj.length))
     }
 
+    /// The O_DIRECT read GB/s of the volume holding `objects` (`ceiling::disk`).
+    pub fn disk_ceiling(&self, objects: &[&ObjectRef], tally: &IoTally) -> Option<f64> {
+        let fds: Vec<Arc<Fds>> = objects.iter().take(64).filter_map(|o| self.fds(o, tally).ok()).collect();
+        crate::ceiling::disk(&fds.iter().map(|f| &f.buffered).collect::<Vec<_>>())
+    }
+
     /// End the TensorFS lease. Runs when the last weight set and handle drop the source.
     fn release(&self) -> Result<()> {
         self.fds.lock().unwrap().clear();

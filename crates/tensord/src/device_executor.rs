@@ -309,6 +309,8 @@ pub enum Kind {
     ReadGrant,
     /// A sealed host layout the executor filled, for the next executor of its weights.
     Deposit,
+    /// GPU pages of weight regions the executor kept, held past its end (`descriptors` follow).
+    KeepPages,
     Publish,
     StageMemoLookup,
     StageMemoStore,
@@ -444,9 +446,14 @@ pub struct Frame {
     pub seq: u64,
     pub kind: Kind,
     pub descriptor: bool,
+    /// `keep_pages`: the fds that follow, one per page.
+    pub descriptors: u64,
     pub name: String,
     /// `read_grant`/`deposit`: the sealed host layout's digest.
     pub layout: String,
+    /// `keep_pages`: what its pages hold, checked by the executor that maps them.
+    pub fingerprint: String,
+    pub pages: Vec<Page>,
     pub manifest: String,
     pub sha256: String,
     pub length: u64,
@@ -539,6 +546,14 @@ impl Frame {
     }
 }
 
+/// One kept GPU page: a home region and the bytes its allocation spans.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct Page {
+    pub region: u32,
+    pub nbytes: u64,
+}
+
 /// One part of a composite product: a spool file and the media time it adds.
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
@@ -610,6 +625,11 @@ pub struct Answer {
     /// UNet: about 1,700 objects).
     #[serde(skip_serializing_if = "String::is_empty")]
     pub objects_sha256: String,
+    /// A held `read_grant`: GPU pages kept for it, whose fds follow the layout's.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub fingerprint: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub pages: Vec<Page>,
 }
 fn is_zero_ms(value: &f64) -> bool {
     *value == 0.0
@@ -646,6 +666,8 @@ impl Answer {
             stored: false,
             reason: String::new(),
             objects_sha256: String::new(),
+            fingerprint: String::new(),
+            pages: Vec::new(),
         }
     }
     pub fn ok(seq: u64) -> Self {
@@ -684,6 +706,11 @@ pub trait Services {
     ) -> io::Result<(Answer, Vec<File>)> {
         drop(plan);
         Ok((Answer::unavailable(frame.seq), Vec::new()))
+    }
+    /// `keep_pages`: its fds, one per page.
+    fn keep_pages(&mut self, frame: &Frame, pages: Vec<File>) -> Answer {
+        drop(pages);
+        Answer::unavailable(frame.seq)
     }
 }
 
@@ -1681,6 +1708,11 @@ impl DeviceExecutor {
                     for file in &out {
                         platform::handles::send_fd(&self.stream, file)?;
                     }
+                }
+                Some(Event::Request) if frame.kind == Kind::KeepPages => {
+                    let pages = (0..frame.descriptors).map(|_| cozy_platform::handles::recv_fd(&self.stream).map(File::from));
+                    let pages = pages.collect::<Result<Vec<_>, _>>()?;
+                    write_frame(&mut self.stream, &services.keep_pages(&frame, pages))?;
                 }
                 Some(Event::Request) => {
                     // The machine's own answer time is not the executor's stillness.

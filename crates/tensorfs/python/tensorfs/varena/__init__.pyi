@@ -188,6 +188,9 @@ class WeightSet:
     def spans(self) -> list[int]:
         """Bytes each region maps."""
     @property
+    def regions(self) -> list[list[str]]:
+        """The regions it was registered with (`Gpu.adopt`: those its sealed layout carries)."""
+    @property
     def device(self) -> int | None:
         """The CUDA ordinal; None on the host."""
     @property
@@ -212,6 +215,17 @@ class WeightSet:
     def busy(self, busy: bool) -> None:
         """Whether a forward of its model is in flight (from its first forward's start to its
         last one's end): another process's ask never takes a busy set's pages."""
+    def shareable(self) -> bool:
+        """Home regions map as one shareable allocation each from now on, so their pages can be
+        kept past this process (`kept`); False where the device cannot share them."""
+    def kept(self) -> list[tuple[int, int, int]]:
+        """Landed home regions not handed out yet: `(region, span, fd)`, each fd a container of
+        the region's pages for TensorD to hold, the caller's to close. Unmapping a region here
+        frees it at once; only this process's death leaves its pages to TensorD."""
+    def adopt_pages(self, pages: Sequence[tuple[int, int]]) -> int:
+        """Home regions `(region, fd)` mapped from pages a dead process kept: imported, no copy.
+        Each fd is duplicated; the caller closes its own. A page that will not map fills as
+        usual. Returns the bytes adopted."""
     def evict(self, regions: Sequence[int] | None = None) -> int:
         """Unmap these regions at home (all when None): only those unpinned whose fill and
         release events completed. Returns the bytes unmapped. The chunks go idle; past a small
@@ -223,8 +237,9 @@ class WeightSet:
 class Gpu:
     """One per (process, device): VA, the chunk cache, a copy stream and the scratch slots."""
 
-    def __init__(self, device: int, chunk: int = 2 << 20) -> None:
-        """`chunk`: the physical page size, a multiple of 2 MiB."""
+    def __init__(self, device: int, chunk: int = 64 << 20) -> None:
+        """`chunk`: the physical allocation size, a multiple of 2 MiB; a full device maps its last
+        pages 2 MiB at a time. 2 MiB chunks map at about 30 GB/s, below an H2D ceiling."""
     @property
     def device(self) -> int: ...
     @property
@@ -246,6 +261,16 @@ class Gpu:
         the chunk files through the page cache. `files`: the chunk files a grant hands over,
         `(sha256, length, fd)` each, the only ones read; without it, the store's chunk files.
         The core duplicates every descriptor it keeps and closes nothing the caller passed."""
+    def adopt(
+        self,
+        name: str,
+        ck: Checkpoint,
+        host_fd: int,
+        files: Sequence[tuple[str, int, int]] | None = None,
+    ) -> WeightSet:
+        """`register` of the sealed host layout `host_fd` with the regions it carries, before
+        any module exists: `prefetch` starts its copies while the module is built. A module
+        whose `regions` differ cannot use it."""
     def trim(self) -> int:
         """Idle chunks and unneeded slots go back to the driver. Returns the bytes released."""
     def give(self, nbytes: int) -> list[tuple[str, int]]:
@@ -275,6 +300,33 @@ class Host:
     ) -> WeightSet:
         """As `Gpu.register`. Binds are views of the sealed layout (read-only), or private
         memory read once from the chunk files."""
+    def adopt(
+        self,
+        name: str,
+        ck: Checkpoint,
+        host_fd: int,
+        files: Sequence[tuple[str, int, int]] | None = None,
+    ) -> WeightSet:
+        """As `Gpu.adopt`."""
+
+class Copy:
+    """A run of weight copies: `h2d`, a GPU's copy stream from its first job to its last
+    landing; `disk`, a host layout filled from chunk files. `ceiling` is the measured GB/s it
+    is held against (pinned H2D on that GPU, the volume's O_DIRECT read), 0 when unmeasured."""
+
+    kind: str
+    gpu: int
+    bytes: int
+    ns: int
+    ceiling: float
+    link: str
+    busy_ns: int
+    pin_ns: int
+    staged: int
+    cached: int
+
+def copies() -> list[Copy]:
+    """Every copy run since the last call."""
 
 def hold_tier(fd: int) -> int:
     """A claim on every region of the host-tier memfd `fd`, for an owner that maps none of it
