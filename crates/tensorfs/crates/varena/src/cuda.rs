@@ -33,6 +33,9 @@ pub const MEMHOSTREGISTER_READ_ONLY: c_uint = 0x8;
 pub const MEMHOSTALLOC_PORTABLE: c_uint = 0x1;
 
 pub const ATTR_VMM_SUPPORTED: c_int = 102;
+pub const ATTR_PCI_BUS_ID: c_int = 33;
+pub const ATTR_PCI_DEVICE_ID: c_int = 34;
+pub const ATTR_PCI_DOMAIN_ID: c_int = 50;
 
 pub const MEM_ALLOCATION_TYPE_PINNED: u32 = 1;
 pub const MEM_LOCATION_TYPE_DEVICE: u32 = 1;
@@ -116,6 +119,8 @@ pub struct Driver {
     pub mem_host_unregister: F<*mut c_void>,
     pub mem_host_alloc: unsafe extern "C" fn(*mut *mut c_void, usize, c_uint) -> CUresult,
     pub mem_free_host: F<*mut c_void>,
+    pub mem_alloc: unsafe extern "C" fn(*mut CUdeviceptr, usize) -> CUresult,
+    pub mem_free: F<CUdeviceptr>,
     pub mem_get_allocation_granularity:
         unsafe extern "C" fn(*mut usize, *const AllocationProp, u32) -> CUresult,
     pub mem_address_reserve:
@@ -188,6 +193,8 @@ impl Driver {
             mem_host_unregister: load!(lib, b"cuMemHostUnregister"),
             mem_host_alloc: load!(lib, b"cuMemHostAlloc"),
             mem_free_host: load!(lib, b"cuMemFreeHost"),
+            mem_alloc: load!(lib, b"cuMemAlloc_v2"),
+            mem_free: load!(lib, b"cuMemFree_v2"),
             mem_get_allocation_granularity: load!(lib, b"cuMemGetAllocationGranularity"),
             mem_address_reserve: load!(lib, b"cuMemAddressReserve"),
             mem_address_free: load!(lib, b"cuMemAddressFree"),

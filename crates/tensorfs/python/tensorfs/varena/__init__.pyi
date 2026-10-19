@@ -276,6 +276,25 @@ class Host:
         """As `Gpu.register`. Binds are views of the sealed layout (read-only), or private
         memory read once from the chunk files."""
 
+class Copy:
+    """A run of weight copies: `h2d`, a GPU's copy stream from its first job to its last
+    landing; `disk`, a host layout filled from chunk files. `ceiling` is the measured GB/s it
+    is held against (pinned H2D on that GPU, the volume's O_DIRECT read), 0 when unmeasured."""
+
+    kind: str
+    gpu: int
+    bytes: int
+    ns: int
+    ceiling: float
+    link: str
+    busy_ns: int
+    pin_ns: int
+    staged: int
+    cached: int
+
+def copies() -> list[Copy]:
+    """Every copy run since the last call."""
+
 def hold_tier(fd: int) -> int:
     """A claim on every region of the host-tier memfd `fd`, for an owner that maps none of it
     (TensorD). Returns a new descriptor. End it with `release_tier`."""

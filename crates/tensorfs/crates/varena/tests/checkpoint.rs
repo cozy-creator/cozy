@@ -158,3 +158,45 @@ fn regions_never_span_a_boundary_unless_a_chunk_does() {
         vec!["blocks.2.a", "blocks.2.b", "norm.weight"],
     ]);
 }
+
+#[test]
+fn a_seal_logs_its_disk_copy() {
+    let fx = Fixture::new("logged");
+    let rs = regions(fx.ck.header(), 64 << 20, &[]);
+    memory::seal(&fx.ck, &rs, "logged", 2, None).unwrap();
+    let all: u64 = TENSORS.iter().map(|t| t.2 as u64).sum();
+    let copies = varena::ceiling::take();
+    assert!(copies.iter().any(|c| c.kind == "disk" && c.bytes == all && c.ns > 0), "{copies:?}");
+}
+
+/// On a GPU only: `give` takes a slot of a set in use that no bound block holds, never a bound
+/// one, and the next stream maps a slot again.
+#[test]
+fn give_takes_a_busy_sets_unbound_slot_never_a_bound_one() {
+    if !cuda::available() {
+        return;
+    }
+    let fx = Fixture::new("give");
+    let rs = regions(fx.ck.header(), 64 << 20, &[]);
+    let gpu = Gpu::open(0, 2 << 20).unwrap();
+    let ws = gpu.register("give", &fx.ck, &rs, None, None).unwrap();
+    ws.home(&[]).unwrap();
+    ws.busy(true);
+    let slots = || gpu.stats().unwrap().slots;
+    let sync = || {
+        let (_, ctx) = cuda::primary_context(0).unwrap();
+        let _c = cuda::CtxGuard::enter(ctx).unwrap();
+        // SAFETY: the legacy stream of our current context.
+        cuda::check("cuStreamSynchronize", unsafe { (cuda::driver().unwrap().stream_synchronize)(std::ptr::null_mut()) }).unwrap();
+    };
+    let pin = ws.bind(0, 0).unwrap();
+    sync();
+    gpu.give(u64::MAX).unwrap();
+    assert_eq!(slots(), 1, "a bound slot is never given");
+    drop(pin);
+    sync();
+    gpu.give(u64::MAX).unwrap();
+    assert_eq!(slots(), 0, "an unbound slot of a busy set is given");
+    let _pin = ws.bind(0, 0).unwrap();
+    assert_eq!(slots(), 1, "the next stream maps one again");
+}

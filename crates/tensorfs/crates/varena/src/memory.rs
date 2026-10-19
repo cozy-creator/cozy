@@ -19,6 +19,7 @@ use tensorfs_core::{format::Header, ids::ObjectRef};
 
 #[cfg(feature = "store")]
 use crate::checkpoint::Ck;
+use crate::ceiling::{self, Copy};
 use crate::cuda::{self, AccessDesc, AllocationProp, CUcontext, CUevent, CUstream, CtxGuard, Handle};
 use crate::host::HostMem;
 use crate::io::{IoTally, Mode, Readers, Source};
@@ -271,6 +272,16 @@ struct Job {
     fill: Arc<Fill>,
 }
 
+/// The copy stream busy from its first job to its last copy landing.
+#[derive(Default)]
+struct Run {
+    t0: Option<Instant>,
+    bytes: u64,
+    staged: u64,
+    pin_ns: u64,
+    copies: Vec<(EvRef, EvRef)>,
+}
+
 #[derive(Default)]
 struct Jobs {
     q: VecDeque<Job>,
@@ -450,6 +461,9 @@ impl State {
 struct Inner {
     ordinal: i32,
     ctx: CUcontext,
+    /// PCI address (sysfs) and measured pinned H2D GB/s, 0 when unmeasured.
+    pci: String,
+    ceiling: f64,
     prop: AllocationProp,
     chunk: u64,
     events: Arc<Events>,
@@ -486,6 +500,9 @@ impl Gpu {
         if g == 0 || !REGION_ALIGN.is_multiple_of(g as u64) {
             return Err(Error::Invalid(format!("device {ordinal}: granularity {g} does not divide {REGION_ALIGN}")));
         }
+        let attr = |a| cuda::attribute(dev, a);
+        let pci = format!("{:04x}:{:02x}:{:02x}.0", attr(cuda::ATTR_PCI_DOMAIN_ID)?, attr(cuda::ATTR_PCI_BUS_ID)?, attr(cuda::ATTR_PCI_DEVICE_ID)?);
+        let ceiling = ceiling::h2d(&cuda::uuid(dev)?).map_or(0.0, |c| c.0);
         let mut s: CUstream = std::ptr::null_mut();
         call!("cuStreamCreate", stream_create(&mut s, cuda::STREAM_NON_BLOCKING))?;
         let mut bufs = Vec::with_capacity(STAGING);
@@ -497,6 +514,8 @@ impl Gpu {
         let inner = Arc::new(Inner {
             ordinal,
             ctx,
+            pci,
+            ceiling,
             prop,
             chunk,
             events: Arc::new(Events { ctx, free: Mutex::default() }),
@@ -537,21 +556,14 @@ impl Gpu {
     pub fn trim(&self) -> Result<u64> {
         let g = &self.inner;
         g.with(|st| {
-            let span = st.slot_span;
-            let mut live = st.slots.iter().flatten().count();
-            for i in 0..st.slots.len() {
-                let Some(s) = st.slots[i].as_mut() else { continue };
-                if (span == 0 || s.m.span < span || live > SLOTS) && s.m.quiet()? {
-                    g.drop_slot(st, i)?;
-                    live -= 1;
-                }
-            }
+            g.shed(st, SLOTS)?;
             g.keep_idle(st, 0)
         })
     }
 
     /// Frees up to `want` for an ask (design §5.2): idle chunks and slots (under ""), then home
-    /// pages of sets as `Set::used` orders them. Returns what each gave.
+    /// pages of sets as `Set::used` orders them, then the slots no bound block uses, which the
+    /// next streamed block maps again. Returns what each gave.
     pub fn give(&self, want: u64) -> Result<Vec<(String, u64)>> {
         let trimmed = self.trim()?;
         let g = &self.inner;
@@ -571,6 +583,12 @@ impl Gpu {
                 if n > 0 {
                     gave.push((st.set(id).w.name.clone(), n));
                     freed += n;
+                }
+            }
+            if freed < want {
+                let n = g.shed(st, 0)?;
+                if n > 0 {
+                    gave.push((String::new(), n));
                 }
             }
             g.keep_idle(st, IDLE_KEEP)?;
@@ -672,15 +690,21 @@ impl Inner {
             // SAFETY: binding this thread to our retained primary context.
             unsafe { (d.ctx_set_current)(self.ctx) };
         }
+        let mut run: Option<Run> = None;
         loop {
-            let job = {
-                let mut j = self.jobs.1.wait_while(self.jobs.0.lock().unwrap(), |j| j.q.is_empty() && !j.stop).unwrap();
-                match j.q.pop_front() {
-                    Some(job) => job,
-                    None => return,
-                }
+            let j = self.jobs.0.lock().unwrap();
+            if let (true, Some(r)) = (j.q.is_empty(), run.take()) {
+                drop(j);
+                run = self.land(r);
+                continue;
+            }
+            let job = match self.jobs.1.wait_while(j, |j| j.q.is_empty() && !j.stop).unwrap().q.pop_front() {
+                Some(job) => job,
+                None => return,
             };
-            let filled = self.run(&job).map(|(a, b)| {
+            let r = run.get_or_insert_with(|| Run { t0: Some(Instant::now()), ..Default::default() });
+            let filled = self.run(&job, r).map(|(a, b)| {
+                r.copies.push((a.clone(), b.clone()));
                 let mut st = self.lock();
                 let step = st.steps;
                 st.timings.push(Timing { set: job.set, step, field: |c| &mut c.copy_ns, a, b: b.clone() });
@@ -688,6 +712,32 @@ impl Inner {
             });
             job.fill.set(filled.map_err(|e| self.drained(e)));
         }
+    }
+
+    /// Run `r` once its last copy landed: logged against the ceiling, unless jobs came meanwhile
+    /// (then it goes on).
+    fn land(&self, r: Run) -> Option<Run> {
+        if let Some((_, last)) = r.copies.last() {
+            let _ = last.sync();
+        }
+        if !self.jobs.0.lock().unwrap().q.is_empty() {
+            return Some(r);
+        }
+        if r.bytes > 0 {
+            ceiling::record(Copy {
+                kind: "h2d",
+                gpu: self.ordinal,
+                bytes: r.bytes,
+                ns: r.t0.map_or(0, |t| t.elapsed().as_nanos() as u64),
+                ceiling: self.ceiling,
+                link: ceiling::link(&self.pci).map_or_else(String::new, |l| l.to_string()),
+                busy_ns: r.copies.iter().map(|(a, b)| b.since(a).unwrap_or(0)).sum(),
+                pin_ns: r.pin_ns,
+                staged: r.staged,
+                cached: 0,
+            });
+        }
+        None
     }
 
     /// A failure is reported once nothing it queued is in flight.
@@ -698,7 +748,7 @@ impl Inner {
         }
     }
 
-    fn run(self: &Arc<Self>, job: &Job) -> Result<(EvRef, EvRef)> {
+    fn run(self: &Arc<Self>, job: &Job, run: &mut Run) -> Result<(EvRef, EvRef)> {
         let s = self.copy;
         for w in &job.waits {
             wait_in(s, w)?;
@@ -711,15 +761,23 @@ impl Inner {
                 h.wait_ready(r)?;
                 // SAFETY: inside the live mapping the source keeps; the region is complete.
                 let p = unsafe { h.base().add(reg.offset as usize) } as *const u8;
-                if h.pin_region(r, reg.offset, align_up(n, PART_ALIGN)).0 {
+                let t = Instant::now();
+                let pinned = h.pin_region(r, reg.offset, align_up(n, PART_ALIGN)).0;
+                run.pin_ns += t.elapsed().as_nanos() as u64;
+                if pinned {
                     call!("cuMemcpyHtoDAsync", memcpy_htod_async(job.dst, p as *const c_void, n as usize, s))?;
                 } else {
                     self.staged(job, Some(p as usize))?;
+                    run.staged += n;
                 }
             }
-            _ if n > 0 => self.staged(job, None)?,
+            _ if n > 0 => {
+                self.staged(job, None)?;
+                run.staged += n;
+            }
             _ => {}
         }
+        run.bytes += n;
         Ok((start, self.events.record(s, true)?))
     }
 
@@ -853,6 +911,21 @@ impl Inner {
             }
             call!("cuMemRelease", mem_release(h))?;
             freed += size;
+        }
+        Ok(freed)
+    }
+
+    /// Unmaps quiet slots: undersized ones, all once nothing streams, else beyond `keep` live.
+    fn shed(&self, st: &mut State, keep: usize) -> Result<u64> {
+        let span = st.slot_span;
+        let (mut live, mut freed) = (st.slots.iter().flatten().count(), 0);
+        for i in 0..st.slots.len() {
+            let Some(s) = st.slots[i].as_mut() else { continue };
+            if (span == 0 || s.m.span < span || live > keep) && s.m.quiet()? {
+                freed += s.m.span;
+                self.drop_slot(st, i)?;
+                live -= 1;
+            }
         }
         Ok(freed)
     }

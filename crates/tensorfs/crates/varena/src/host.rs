@@ -27,10 +27,12 @@ use std::collections::HashMap;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::sync::atomic::{fence, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 
 use tensorfs_core::ids::ObjectRef;
 use cozy_platform::shm::{self, Region, RESIZE_SEALS, WRITE_SEALS};
 
+use crate::ceiling::Copy;
 use crate::cuda;
 use crate::io::{IoTally, Mode, Source};
 use crate::layout::{ItemSource, Layout, PART_ALIGN};
@@ -892,8 +894,11 @@ impl OpenFill {
         Ok(taken.iter().map(|&r| layout.regions[r as usize].span).sum())
     }
 
+    /// Logged as a `disk` copy run against the volume's ceiling.
     fn copy(&self, layout: &Layout, wanted: &[u32], source: &Source, threads: usize, tally: &IoTally) -> Result<()> {
-        let host = &self.host;
+        let (t, host) = (Instant::now(), &self.host);
+        let counts = || [&tally.cached_bytes, &tally.direct_bytes, &tally.buffered_bytes, &tally.inline_bytes].map(|c| c.load(Ordering::Relaxed));
+        let before = counts();
         let mut region_of = Vec::new();
         for &r in wanted {
             region_of.extend(std::iter::repeat_n(r as usize, layout.regions[r as usize].items.len()));
@@ -955,10 +960,20 @@ impl OpenFill {
                 });
             }
         });
-        match failed.into_inner().unwrap() {
-            Some(e) => Err(e),
-            None => Ok(()),
+        if let Some(e) = failed.into_inner().unwrap() {
+            return Err(e);
         }
+        let moved = counts().iter().zip(before).map(|(a, b)| a - b).collect::<Vec<_>>();
+        crate::ceiling::record(Copy {
+            kind: "disk",
+            gpu: -1,
+            bytes: moved.iter().sum(),
+            ns: t.elapsed().as_nanos() as u64,
+            ceiling: source.disk_ceiling(&objects, tally).unwrap_or(0.0),
+            cached: moved[0],
+            ..Default::default()
+        });
+        Ok(())
     }
 }
 
