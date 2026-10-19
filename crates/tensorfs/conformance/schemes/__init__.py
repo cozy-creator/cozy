@@ -18,8 +18,12 @@ from . import mxfp4
 from . import gguf
 
 # gptq, awq, ct
+from . import gptq
+from . import awq
+from . import ct
 
 # bnb
+from . import bnb
 
 # comfy
 
@@ -38,8 +42,12 @@ FAMILIES = (
     gguf,
 
     # gptq, awq, ct
+    gptq,
+    awq,
+    ct,
 
     # bnb
+    bnb,
 
     # comfy
 )

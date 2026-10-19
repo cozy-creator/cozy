@@ -1,0 +1,11 @@
+{
+  "architectures": [
+    "Toy"
+  ],
+  "torch_dtype": "bfloat16",
+  "quantization_config": {
+    "quant_method": "bitsandbytes",
+    "load_in_8bit": true,
+    "llm_int8_threshold": 6.0
+  }
+}

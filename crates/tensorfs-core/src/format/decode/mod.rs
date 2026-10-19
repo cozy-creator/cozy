@@ -30,8 +30,12 @@ mod mxfp4;
 pub mod gguf;
 
 // gptq, awq, ct
+pub(crate) mod awq;
+pub(crate) mod ct;
+pub(crate) mod gptq;
 
 // bnb
+pub(crate) mod bnb;
 
 // comfy
 
@@ -64,8 +68,23 @@ pub static SCHEMES: &[&Scheme] = &[
     &gguf::Q1_0,
     &gguf::Q2_0,
     // gptq.*, awq.*, ct.*
-
+    &gptq::INT2,
+    &gptq::INT3,
+    &gptq::INT4,
+    &gptq::INT8,
+    &awq::INT4,
+    &ct::INT1,
+    &ct::INT2,
+    &ct::INT3,
+    &ct::INT4,
+    &ct::INT5,
+    &ct::INT6,
+    &ct::INT7,
+    &ct::INT8,
     // bnb.*
+    &bnb::NF4,
+    &bnb::FP4,
+    &bnb::INT8,
 
     // comfy.*
 ];
@@ -223,22 +242,44 @@ pub fn decode(
     encoding: &Encoding,
     parts: &BTreeMap<&str, PartBytes>,
 ) -> Result<Vec<u8>> {
+    checked(dtype, shape, encoding, parts, true)
+}
+
+/// Refuses what `decode` would refuse before reading a byte: the scheme, its params, the logical
+/// dtype and shape, and each part's role, dtype and shape (the parts' `bytes` are not read).
+pub fn check(
+    dtype: &Dtype,
+    shape: &[u64],
+    encoding: &Encoding,
+    parts: &BTreeMap<&str, PartBytes>,
+) -> Result<()> {
+    checked(dtype, shape, encoding, parts, false).map(drop)
+}
+
+fn checked(
+    dtype: &Dtype,
+    shape: &[u64],
+    encoding: &Encoding,
+    parts: &BTreeMap<&str, PartBytes>,
+    read: bool,
+) -> Result<Vec<u8>> {
     let name = encoding.scheme.as_str();
     let Some(scheme) = SCHEMES.iter().find(|s| s.name == name) else {
         return Err(Error::UnknownScheme(name.into()));
     };
-    checked(scheme, dtype, shape, &encoding.params, parts).map_err(|e| match e {
+    run(scheme, dtype, shape, &encoding.params, parts, read).map_err(|e| match e {
         Error::Decode(detail) => Error::Decode(format!("{name}: {detail}")),
         e => e,
     })
 }
 
-fn checked(
+fn run(
     scheme: &'static Scheme,
     dtype: &Dtype,
     shape: &[u64],
     params: &BTreeMap<String, Value>,
     parts: &BTreeMap<&str, PartBytes>,
+    read: bool,
 ) -> Result<Vec<u8>> {
     let fail = Error::Decode;
     for role in parts.keys() {
@@ -319,9 +360,12 @@ fn checked(
             Shape::Exact(want) => p.shape == want.as_slice(),
             Shape::Count(n) => p.shape.iter().try_fold(1u64, |a, b| a.checked_mul(*b)) == Some(n),
         };
-        if !fits || p.dtype.byte_len(p.shape) != Some(p.bytes.len() as u64) {
+        if !fits || (read && p.dtype.byte_len(p.shape) != Some(p.bytes.len() as u64)) {
             return Err(fail(format!("part {} has shape {:?}", rule.role, p.shape)));
         }
+    }
+    if !read {
+        return Ok(Vec::new());
     }
     let out = (scheme.decode)(&ctx)?;
     debug_assert_eq!(out.len(), rows * cols);

@@ -12,7 +12,7 @@ pub mod layout;
 mod repo;
 mod value;
 
-pub use decode::{decode, grid::ScaleLayout, PartBytes, SCHEMES};
+pub use decode::{check, decode, grid::ScaleLayout, PartBytes, SCHEMES};
 pub use doc::{
     Body, Component, Encoding, Header, Location, Metadata, ObjectRef, Part, Span, Tensor,
 };
