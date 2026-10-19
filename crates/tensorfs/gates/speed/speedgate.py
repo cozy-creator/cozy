@@ -61,6 +61,10 @@ def natkey(key):
     return [int(part) if part.isdigit() else part for part in re.split(r"(\d+)", key)]
 
 
+def safetensors_key(component, key, role):
+    return f"{component}/{key}#{role}"
+
+
 def copy_rows():
     """Drain existing shared-engine observations; this does not initiate a probe."""
     names = ("kind", "gpu", "bytes", "ns", "ceiling", "link", "busy_ns", "pin_ns", "staged", "cached")
@@ -98,7 +102,7 @@ class Model:
         self.window_bytes = sum(part[3] for part in self.parts if self.in_window(part[0], part[1]))
         if not self.bytes or not self.window_bytes:
             raise ValueError(f"{name}: full payload and declared F1 window must both exist")
-        names = [f"{key}#{role}" for _, key, role, *_ in self.parts]
+        names = [safetensors_key(component, key, role) for component, key, role, *_ in self.parts]
         if len(names) != len(set(names)):
             raise ValueError(f"{name}: safetensors' shared key namespace has duplicate part names")
         self.geometry = hashlib.sha256(canonical(self.parts)).hexdigest()
@@ -112,7 +116,7 @@ class Model:
     def build(self, log):
         """Both formats receive the same public host-read buffer for each stored part."""
         marker = self.dir / "DONE.json"
-        identity = {"format": "tensorfs.speed-fixture/2", "source": self.source.id,
+        identity = {"format": "tensorfs.speed-fixture/3", "source": self.source.id,
                     "geometry": self.geometry, "extension_sha256": digest(tensorfs._ext.__file__)}
         if marker.exists():
             record = json.loads(marker.read_bytes())
@@ -131,8 +135,10 @@ class Model:
                 parts = [part for part in self.parts if part[0] == component]
                 meta, offset = {}, 0
                 for _, key, role, length, *_ in parts:
-                    meta[f"{key}#{role}"] = {"dtype": "U8", "shape": [length],
-                                              "data_offsets": [offset, offset + length]}
+                    meta[safetensors_key(component, key, role)] = {
+                        "dtype": "U8", "shape": [length],
+                        "data_offsets": [offset, offset + length],
+                    }
                     offset += length
                 header = json.dumps(meta, separators=(",", ":")).encode()
                 header += b" " * (-len(header) % 8)
@@ -192,7 +198,7 @@ class Model:
         return moved, opened, (arrays, ck)
 
     def safetensors(self, layout, window):
-        keys = [f"{key}#{role}" for component, key, role, *_ in self.parts
+        keys = [safetensors_key(component, key, role) for component, key, role, *_ in self.parts
                 if not window or self.in_window(component, key)]
         started, opened = time.perf_counter(), 0.0
         if layout == "fastsafetensors":
@@ -209,7 +215,7 @@ class Model:
             arrays, cleanup = [], ()
             for path in self.st:
                 component = path.stem
-                names = [f"{key}#{role}" for comp, key, role, *_ in self.parts
+                names = [safetensors_key(comp, key, role) for comp, key, role, *_ in self.parts
                          if comp == component and (not window or self.in_window(comp, key))]
                 started = time.perf_counter()
                 with safe_open(path, framework="pt", device="cuda:0" if layout == "st-cuda" else "cpu") as source:
