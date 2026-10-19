@@ -7,3 +7,10 @@ tasks:
     dir: "{{.TASKFILE_DIR}}"
     cmds:
       - uv run --script scripts/orders.py --write
+
+  vectors:
+    desc: Regenerate every conformance vector in one run (header vectors, case files, then the store)
+    dir: "{{.TASKFILE_DIR}}"
+    cmds:
+      - uv run --no-project --python 3.12 --with numpy --with cbor2==6.1.4 python -I conformance/make_vectors.py
+      - cargo test -p tensorfs-core --no-default-features --test format_conformance -- --ignored regenerate

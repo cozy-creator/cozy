@@ -3,7 +3,8 @@
 //!
 //! The lock is `flock` on an `O_CLOEXEC` descriptor: held by its open file description, waited
 //! for, never inspected. A child forked meanwhile holds it only until it execs. Nothing else in
-//! the store locks; GC and puts take no lock at all.
+//! the store locks; a short shared acquisition fence also spans root publication so GC cannot
+//! delete bytes between metadata read and ownership publication.
 
 use std::fs;
 use std::io;
@@ -59,7 +60,7 @@ fn json(path: &Path, value: &impl Serialize) -> Result<Vec<u8>> {
 }
 
 impl Store {
-    fn lock(&self, dir: &str) -> Result<lock::DirLock> {
+    pub(super) fn lock(&self, dir: &str) -> Result<lock::DirLock> {
         let path = self.root.join(dir);
         lock::dir(&path).map_err(platform("lock", path))
     }
@@ -92,6 +93,7 @@ impl Store {
     /// Creates or replaces pin `id`.
     pub fn pin(&self, id: &str, pin: &Pin) -> Result<()> {
         let path = self.pin_path(id)?;
+        let _acquisition = super::retention::acquire(self)?;
         let _lock = self.lock("pins")?;
         let old = parse::<Pin>(&path)?.map_or_else(Vec::new, |old| old.roots);
         self.retain(pin.roots.iter().filter(|root| !old.contains(root)))?;
@@ -118,6 +120,19 @@ impl Store {
     pub fn unpin(&self, id: &str) -> Result<bool> {
         let path = self.pin_path(id)?;
         let _lock = self.lock("pins")?;
+        if super::retention::protected(self, id)? {
+            return Ok(false);
+        }
+        self.remove_record(&path)
+    }
+
+    /// Only the retention reaper calls this after proving the hold fence is unowned.
+    pub(super) fn remove_hold_pin(&self, id: &str) -> Result<bool> {
+        if !id.starts_with("hold-") {
+            return Err(invalid(self.root.join("pins"), "not a retention hold"));
+        }
+        let path = self.pin_path(id)?;
+        let _lock = self.lock("pins")?;
         self.remove_record(&path)
     }
 
@@ -126,6 +141,9 @@ impl Store {
         // `id` names a file `pins()` listed, so it needs no grammar check.
         let path = self.root.join("pins").join(format!("{id}.json"));
         let _lock = self.lock("pins")?;
+        if super::retention::protected(self, id)? {
+            return Ok(false);
+        }
         match parse::<Pin>(&path)? {
             Some(pin) if pin.last_use == last_use => self.remove_record(&path),
             _ => Ok(false),
@@ -188,7 +206,9 @@ impl Store {
         change: impl FnOnce(Option<Repo>) -> Option<Repo>,
     ) -> Result<Option<Repo>> {
         let path = self.ref_path(name)?;
+        let _acquisition = super::retention::acquire(self)?;
         let _lock = self.lock("refs")?;
+        let promoted = self.clear_cached_ref(name)?;
         let old = Self::parse_ref(&path)?;
         let lanes = |repo: &Option<Repo>| -> Vec<ObjectRef> {
             repo.iter().flat_map(Repo::roots).cloned().collect()
@@ -206,7 +226,11 @@ impl Store {
         }
         let bytes = new.to_json().map_err(|error| invalid(&path, error))?;
         let after = lanes(&Some(new.clone()));
-        self.retain(after.iter().filter(|lane| !before.contains(lane)))?;
+        self.retain(
+            after
+                .iter()
+                .filter(|lane| promoted || !before.contains(lane)),
+        )?;
         self.commit(&path, &bytes, true)?;
         Ok(Some(new))
     }

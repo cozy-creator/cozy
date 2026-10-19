@@ -151,7 +151,7 @@ fn convert(old: &Path, new: &Path, tensors: &[Tensor]) -> (migrate::Adopted, Pat
     let adopted = migrate::adopt(&src, &store, &closure).unwrap();
     assert_eq!(migrate::adopt(&src, &store, &closure).unwrap(), migrate::Adopted::default(), "a rerun moves nothing");
     // Every tensor reads back from the new store alone.
-    let ck = store.checkpoint(&made).unwrap();
+    let ck = store.variant(&made, Some("")).unwrap();
     for (key, _, bytes, _) in tensors {
         let Body::Data(at) = &ck.tensor("migrate_test", key).unwrap().body else { panic!("{key} is plain") };
         let mut read = vec![0; at.length as usize];

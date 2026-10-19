@@ -1,1 +1,1 @@
-{"format":"tensorfs.repo/1","name":"Conformance/int8","releases":[{"lanes":{"all":{"length":253,"sha256":"2943f46bdb58653927ba1e880bbc3d9d2f10db5543e91d6e90448eeb5c378c81"}},"version":"1"}]}
+{"format":"tensorfs.repo/1","name":"Conformance/int8","releases":[{"tree":{"length":253,"sha256":"497ee8c01274e4e0a330f8769d2e4d3b8e91f9b919b321204aef517e5e42f2f4"},"version":"1"}]}

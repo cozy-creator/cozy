@@ -12,8 +12,8 @@ use serde::Deserialize;
 use serde_json::Value as Json;
 use tensorfs_core::format::layout::{self, Item};
 use tensorfs_core::format::{
-    repo_key, Body, Component, Dtype, Encoding, Error, Header, Location, Manifest, ObjectRef, Part,
-    Release, Repo, Tensor, HEADER_FORMAT, HEADER_PATH,
+    repo_key, Body, Component, Config, Dtype, Encoding, Error, Header, Location, ObjectRef, Part,
+    Pipeline, Release, Repo, Tensor, Tree, HEADER_FORMAT,
 };
 
 #[derive(Deserialize)]
@@ -93,9 +93,19 @@ fn write_family(files: &mut BTreeMap<String, Vec<u8>>, family: &str, cases: &[Ca
         files.insert(r.key(), bytes);
         r
     };
-    let mut lanes = BTreeMap::new();
+    // Each variant's header, by name; the tree of a set of them carries the LICENSE.
+    let mut variants: BTreeMap<String, ObjectRef> = BTreeMap::new();
+    let tree = |put: &mut dyn FnMut(Vec<u8>) -> ObjectRef, of: &[(&str, &ObjectRef)]| {
+        let mut t = Tree {
+            files: BTreeMap::from([("LICENSE".to_string(), put(LICENSE.to_vec()))]),
+        };
+        for (variant, header) in of {
+            t.set_variant(variant, (*header).clone());
+        }
+        put(t.to_json().unwrap())
+    };
 
-    // Lane "all": every case in file order (components by first appearance), laid out by the
+    // Variant "all": every case in file order (components by first appearance), laid out by the
     // chunk rule.
     let mut grouped: Vec<(&str, Vec<&Case>)> = Vec::new();
     for c in cases.iter().filter(|c| c.lane == "all") {
@@ -160,26 +170,20 @@ fn write_family(files: &mut BTreeMap<String, Vec<u8>>, family: &str, cases: &[Ca
         .map(|(name, list)| Component {
             name: name.to_string(),
             tensors: list.iter().map(|c| tensor(c)).collect(),
+            ..Default::default()
         })
         .collect();
-    let header = Header::new(chunks, components, Default::default()).unwrap();
-    let manifest = Manifest {
-        files: BTreeMap::from([
-            (HEADER_PATH.into(), put(header.to_cbor().unwrap())),
-            ("LICENSE".into(), put(LICENSE.to_vec())),
-        ]),
-        metadata: Default::default(),
-    };
-    lanes.insert("all".to_string(), put(manifest.to_json().unwrap()));
+    let header = Header::new(chunks, None, components, Default::default()).unwrap();
+    variants.insert("all".to_string(), put(header.to_cbor().unwrap()));
 
-    // Lane "spans" (core): one plain tensor at offset 4096 of chunk 0, continuing through
-    // chunk 2; release 2 swaps the lanes and is yanked, so unversioned lookups land on 1.
+    // Variant "spans" (core): one plain tensor at offset 4096 of chunk 0, continuing through
+    // chunk 2; release 2 swaps the variants and is yanked, so unversioned lookups land on 1.
     let Some(span) = cases.iter().find(|c| c.lane == "spans") else {
         let repo = Repo {
             name: repo_name(family),
             releases: vec![Release {
                 version: "1".into(),
-                lanes,
+                tree: tree(&mut put, &[("all", &variants["all"])]),
                 yanked: false,
                 revision: 0,
             }],
@@ -208,29 +212,24 @@ fn write_family(files: &mut BTreeMap<String, Vec<u8>>, family: &str, cases: &[Ca
     let component = Component {
         name: span.component.clone(),
         tensors: vec![tensor],
+        ..Default::default()
     };
-    let header = Header::new(chunks, vec![component], Default::default()).unwrap();
-    let manifest = Manifest {
-        files: BTreeMap::from([(HEADER_PATH.into(), put(header.to_cbor().unwrap()))]),
-        metadata: Default::default(),
-    };
-    lanes.insert("spans".to_string(), put(manifest.to_json().unwrap()));
-
-    let swapped = BTreeMap::from([
-        ("all".to_string(), lanes["spans"].clone()),
-        ("spans".to_string(), lanes["all"].clone()),
-    ]);
-    let checkpoints = vec![lanes["spans"].clone()];
-    let release = |version: &str, lanes, yanked, revision| Release {
+    let header = Header::new(chunks, None, vec![component], Default::default()).unwrap();
+    variants.insert("spans".to_string(), put(header.to_cbor().unwrap()));
+    let (all, spans) = (&variants["all"], &variants["spans"]);
+    let first = tree(&mut put, &[("all", all), ("spans", spans)]);
+    let swapped = tree(&mut put, &[("all", spans), ("spans", all)]);
+    let checkpoints = vec![tree(&mut put, &[("spans", spans)])];
+    let release = |version: &str, tree, yanked, revision| Release {
         version: version.into(),
-        lanes,
+        tree,
         yanked,
         revision,
     };
     let repo = Repo {
         name: repo_name(family),
         releases: vec![
-            release("1", lanes, false, 3),
+            release("1", first, false, 3),
             release("2", swapped, true, 0),
         ],
         checkpoints,
@@ -303,19 +302,19 @@ fn reader_decodes_every_case() {
         assert_eq!(repo_key(&name), format!("refs/conformance/{family}.json"));
         let repo = Repo::from_json(&fs::read(root.join(repo_key(&name))).unwrap()).unwrap();
         assert_eq!(repo.name, name);
+        let tree = |version| Tree::from_json(&blob(&root, &repo.release(version).unwrap().tree)).unwrap();
         if family == "core" {
             assert_eq!(repo.release(None).unwrap().version, "1", "release 2 is yanked");
             assert_eq!(
-                repo.lane(Some("2"), "all"),
-                repo.lane(None, "spans"),
+                tree(Some("2")).header("all"),
+                tree(None).header("spans"),
                 "an explicit version still resolves"
             );
-            assert_eq!(repo.roots().count(), 5);
+            assert_eq!(repo.roots().count(), 3);
         }
         for c in cases {
-            let manifest =
-                Manifest::from_json(&blob(&root, repo.lane(None, &c.lane).unwrap())).unwrap();
-            let header = Header::from_cbor(&blob(&root, manifest.header().unwrap())).unwrap();
+            let latest = tree(None);
+            let header = Header::from_cbor(&blob(&root, latest.variant(Some(&c.lane)).unwrap().1)).unwrap();
             let got = header.read(&c.component, &c.key, |i| {
                 Ok::<_, Error>(blob(&root, &header.chunks[i]))
             });
@@ -333,23 +332,74 @@ fn reader_decodes_every_case() {
     assert!(checked >= 80, "{checked}");
 }
 
+/// Real prebuilt execution, not a mock driver or a Triton runtime. Run only on an allocated
+/// CUDA worker after building with the required AOT catalog.
+#[cfg(feature = "store")]
+#[test]
+#[ignore = "requires a CUDA GPU and the prebuilt AOT catalog"]
+fn cuda_decodes_every_encoded_green_vector_and_logical_windows() {
+    use tensorfs_core::format::PartBytes;
+    use tensorfs_core::io::{self, Copy, Dst, ReadOpts, Src};
+    let mut checked = 0;
+    for (family, cases) in families() {
+        for case in cases {
+            let (Some(encoding), Some(expected)) = (&case.encoding, &case.expect) else { continue };
+            let storage: Vec<_> = case.parts.iter().map(|p| b64(&p.bits)).collect();
+            let parts = case.parts.iter().zip(&storage).map(|(p, bytes)| (
+                p.role.as_str(), PartBytes { dtype: &p.dtype, shape: &p.shape, bytes },
+            )).collect();
+            let total: u64 = case.shape.iter().product();
+            let expected = b64(expected);
+            let mut windows = vec![(0, total)];
+            if total > 3 { windows.push((1, total - 2)); }
+            for (begin, count) in windows {
+                let gpu = io::decode::read(&case.dtype, &case.shape, encoding, &parts, 0, begin, count)
+                    .unwrap_or_else(|e| panic!("{family}/{} {begin}+{count}: {e}", case.key));
+                let mut bytes = vec![0; gpu.len()];
+                let copy = Copy { src: Src::Device { device: 0, ptr: gpu.ptr(), stream: 0 }, dst: Dst::host(&mut bytes) };
+                // SAFETY: both owned buffers remain live until the engine drains.
+                unsafe { io::read(&[copy], &ReadOpts::default()) }.unwrap();
+                let width = case.dtype.byte_len(&[1]).unwrap() as usize;
+                assert_eq!(bytes, expected[begin as usize * width..(begin + count) as usize * width], "{family}/{} {begin}+{count}", case.key);
+                checked += 1;
+            }
+        }
+    }
+    assert!(checked > 50, "only {checked} encoded vector windows were checked");
+}
+
 /// A green header's projection (its CBOR tree as JSON, byte strings as `{"hex": ...}`) as a
 /// header, and whether it holds what this writer does not write (a minor tag, later fields).
 fn from_projection(p: &Json) -> (Header, bool) {
     let list = |v: &Json| v.as_array().unwrap().clone();
     let uint = |v: &Json| v.as_u64().unwrap();
     let text = |v: &Json| v.as_str().unwrap().to_owned();
+    let config = |v: &Json| serde_json::from_value::<Config>(v.clone()).unwrap();
     let root = list(p);
-    let mut later = root.len() > 5 || root[0] != HEADER_FORMAT;
-    let mut chunks = Vec::new();
-    for c in list(&root[1]) {
-        let c = list(&c);
+    let mut later = root.len() > 6 || root[0] != HEADER_FORMAT;
+    let mut object = |v: &Json| {
+        let c = list(v);
         later |= c.len() > 2;
-        chunks.push(ObjectRef {
+        ObjectRef {
             sha256: text(&c[0]["hex"]),
             length: uint(&c[1]),
-        });
+        }
+    };
+    let chunks: Vec<ObjectRef> = list(&root[1]).iter().map(&mut object).collect();
+    let mut components = Vec::new();
+    for c in list(&root[4]) {
+        let c = list(&c);
+        let assets = (c[4].as_object().unwrap().iter())
+            .map(|(k, v)| (k.clone(), object(v)))
+            .collect();
+        components.push((c, assets));
     }
+    let pipeline = list(&root[3]);
+    later |= pipeline.len() > 2;
+    let pipeline = (!pipeline.is_empty()).then(|| Pipeline {
+        class: text(&pipeline[0]),
+        config: config(&pipeline[1]),
+    });
     let mut encodings = Vec::new();
     for e in list(&root[2]) {
         let e = list(&e);
@@ -369,12 +419,10 @@ fn from_projection(p: &Json) -> (Header, bool) {
         };
         (l, v.len() > 3)
     };
-    let mut components = Vec::new();
-    for c in list(&root[3]) {
-        let c = list(&c);
-        later |= c.len() > 2;
+    let components = components.into_iter().map(|(c, assets)| {
+        later |= c.len() > 6;
         let mut tensors = Vec::new();
-        for t in list(&c[1]) {
+        for t in list(&c[3]) {
             let t = list(&t);
             later |= t.len() > 5;
             let shape = |v: &Json| list(v).iter().map(uint).collect::<Vec<u64>>();
@@ -410,13 +458,18 @@ fn from_projection(p: &Json) -> (Header, bool) {
                 body,
             });
         }
-        components.push(Component {
+        Component {
             name: text(&c[0]),
+            class: text(&c[1]),
+            config: config(&c[2]),
             tensors,
-        });
-    }
-    let metadata = serde_json::from_value(root[4].clone()).unwrap();
-    (Header::new(chunks, components, metadata).unwrap(), later)
+            assets,
+            config_file: c.get(5).map(text).filter(|f| c.len() == 6 || f != "config.json"),
+        }
+    });
+    let components = components.collect();
+    let metadata = serde_json::from_value(root[5].clone()).unwrap();
+    (Header::new(chunks, pipeline, components, metadata).unwrap(), later)
 }
 
 #[test]
@@ -449,7 +502,7 @@ fn green_documents_read_and_red_documents_refuse() {
                     got.map(drop)
                 }
                 "header" => Header::from_cbor(&bytes).map(drop),
-                "manifest" => Manifest::from_json(&bytes).map(drop),
+                "tree" => Tree::from_json(&bytes).map(drop),
                 "repo" => Repo::from_json(&bytes).map(drop),
                 other => panic!("{name}: unknown kind {other}"),
             };
