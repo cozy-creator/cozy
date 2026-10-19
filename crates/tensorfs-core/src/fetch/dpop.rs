@@ -84,6 +84,11 @@ impl DPoP {
         b64(digest(canonical.as_bytes()))
     }
 
+    /// The token already held, if any. Observing it never redeems a grant.
+    pub async fn issued_token(&self) -> Option<String> {
+        self.token.lock().await.clone()
+    }
+
     /// A compact ES256 JWS of `claims` under `header`.
     fn sign(&self, mut header: Value, claims: &Value) -> String {
         header["alg"] = "ES256".into();
