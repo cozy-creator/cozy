@@ -6,9 +6,10 @@ tasks:
   # (`task machine MACHINE=<cozy checkout>/crates/tensord`). The container's glibc 2.28 is the floor that wheel's
   # manylinux_2_28 tag promises.
   release:
-    desc: Release build of tensord for this machine's Linux arch (x86_64 or aarch64) into OUT (default dist), stamped with HEAD
+    desc: Release build of tensord for this machine's Linux arch (x86_64 or aarch64) into OUT (default dist), stamped with HEAD; FEATURES=migrate makes a dev build (xs-045 U12), never a release
     vars:
       OUT: '{{.OUT | default "dist"}}'
+      FEATURES: '{{.FEATURES | default ""}}'
     cmds:
       - |
         set -eu; test -z "$(git status --porcelain)" || { echo "commit first: the build is stamped with HEAD" >&2; exit 1; }
@@ -18,5 +19,5 @@ tasks:
         (cd "$root" && cargo fetch --locked)  # the container builds offline
         docker run --rm --runtime=runc -e CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}" --user "$(id -u):$(id -g)" -e HOME=/tmp -e RUSTUP_HOME=/target/rustup -e COZY_COMMIT="$(git rev-parse HEAD)" \
           -v "$home/registry:/cargo/registry" -v "$home/git:/cargo/git" -v "$root:/src:ro" -v "$target:/target" -w /src quay.io/pypa/manylinux_2_28_$arch:2026.10.03-1 \
-          sh -c 'curl -sSf https://sh.rustup.rs | sh -s -- -y -q --profile minimal --default-toolchain 1.99.1 >&2 && PATH=/tmp/.cargo/bin:$PATH CARGO_HOME=/cargo cargo build --release --locked --offline --target-dir /target -p tensord --bin tensord'
+          sh -c 'curl -sSf https://sh.rustup.rs | sh -s -- -y -q --profile minimal --default-toolchain 1.99.1 >&2 && PATH=/tmp/.cargo/bin:$PATH CARGO_HOME=/cargo cargo build --release --locked --offline --target-dir /target -p tensord --bin tensord --features "{{.FEATURES}}"'
         install -m 0755 "$target/release/tensord" "$out/tensord-linux-$arch" && "$out/tensord-linux-$arch" version --json

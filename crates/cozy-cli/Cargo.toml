@@ -50,5 +50,9 @@ flate2.workspace = true
 tar.workspace = true
 
 
+[features]
+# Dev builds only (xs-045 U12): the hidden `cozy model migrate`. Never in a release.
+migrate = ["cozy-proto/migrate", "hub-client/migrate"]
+
 [lints]
 workspace = true
