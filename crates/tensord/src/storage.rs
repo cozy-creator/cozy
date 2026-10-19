@@ -88,6 +88,28 @@ pub fn claim(root: &Path) -> io::Result<std::fs::File> {
 /// The machine's claim on its store (`claim`).
 const OWNER_LOCK: &str = "owner.lock";
 
+/// Past this the transport log rotates to `transport.log.1`, so it holds at most twice this.
+const TRANSPORT_ROTATE: u64 = 4 << 20;
+
+/// One line of the store's transport log (`cozy machine logs <m> tensorfs`): what a download or
+/// import did, or why it failed: `<unix seconds> <kind> <subject> <detail>`, one per completed
+/// fetch, never per object. Never fatal.
+pub fn transport(store: &Store, kind: &str, subject: &str, detail: &str) {
+    use std::io::Write as _;
+    let dir = store.root().join("logs");
+    let path = dir.join("transport.log");
+    let _ = std::fs::create_dir_all(&dir);
+    if std::fs::metadata(&path).is_ok_and(|meta| meta.len() > TRANSPORT_ROTATE) {
+        let _ = std::fs::rename(&path, dir.join("transport.log.1"));
+    }
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
+    let at = now.map_or(0.0, |since| since.as_secs_f64());
+    let line = format!("{at:.3} {kind} {subject} {detail}\n");
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = file.write_all(line.as_bytes());
+    }
+}
+
 /// A rental's store from before TensorFS 0.12's format cut (an older image's machine made it at
 /// boot): its models re-pull, so its contents go and a fresh store takes their place. A
 /// computer's machine keeps refusing one (`open`): its local models need the one-time migrate.
