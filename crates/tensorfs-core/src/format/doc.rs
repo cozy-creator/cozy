@@ -1,6 +1,5 @@
-//! The three documents and the tensor model. The manifest and repo parse through a `Wire` twin
-//! that carries the `format` tag, the header through `cbor`; validation happens once, in
-//! `TryFrom<Wire>` and [`Header::new`].
+//! Objects, the header and the tensor model. The header parses through `cbor`; validation
+//! happens once, in [`Header::new`].
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -8,10 +7,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::layout::ALIGN;
-use super::{
-    cbor, check_format, decode, invalid, json, Config, Dtype, Error, PartBytes, Result, Value,
-    HEADER_PATH, MANIFEST_FORMAT, REPO_FORMAT,
-};
+use super::{cbor, decode, invalid, Config, Dtype, Error, PartBytes, Result, Value};
 
 /// Free-form metadata, and a scheme's params.
 pub type Metadata = BTreeMap<String, Value>;
@@ -66,62 +62,6 @@ impl ObjectRef {
     pub fn key(&self) -> String {
         let h = &self.sha256;
         format!("blobs/{}/{}/{h}", &h[..2], &h[2..4])
-    }
-}
-
-/// `tensorfs.manifest/1`: a checkpoint as a file tree. `model.cozytensors` is its header.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-#[serde(try_from = "ManifestWire", into = "ManifestWire")]
-pub struct Manifest {
-    pub files: BTreeMap<String, ObjectRef>,
-    pub metadata: Metadata,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-struct ManifestWire {
-    format: String,
-    files: BTreeMap<String, ObjectRef>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    metadata: Metadata,
-}
-
-impl TryFrom<ManifestWire> for Manifest {
-    type Error = Error;
-    fn try_from(w: ManifestWire) -> Result<Self> {
-        check_format(&w.format, MANIFEST_FORMAT)?;
-        for path in w.files.keys() {
-            if !path.split('/').all(segment) {
-                return invalid(format!(
-                    "file path {path:?} is not a relative path of plain segments"
-                ));
-            }
-        }
-        Ok(Manifest {
-            files: w.files,
-            metadata: w.metadata,
-        })
-    }
-}
-
-impl From<Manifest> for ManifestWire {
-    fn from(m: Manifest) -> Self {
-        ManifestWire {
-            format: MANIFEST_FORMAT.into(),
-            files: m.files,
-            metadata: m.metadata,
-        }
-    }
-}
-
-impl Manifest {
-    pub fn from_json(bytes: &[u8]) -> Result<Manifest> {
-        json::read(bytes, MANIFEST_FORMAT)
-    }
-    pub fn to_json(&self) -> Result<Vec<u8>> {
-        json::write(self)
-    }
-    pub fn header(&self) -> Option<&ObjectRef> {
-        self.files.get(HEADER_PATH)
     }
 }
 
@@ -550,124 +490,11 @@ impl Header {
     }
 }
 
-/// `refs/<org>/<name>.json`, ASCII-lowercased: repo names are case-insensitive, one identity.
-pub fn repo_key(name: &str) -> String {
-    format!("refs/{}.json", name.to_ascii_lowercase())
-}
-
-/// `tensorfs.repo/1`: a model's releases, each mapping lanes to manifests, and its unreleased
-/// checkpoints. Kept at [`repo_key`]; releases are in publication order.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-#[serde(try_from = "RepoWire", into = "RepoWire")]
-pub struct Repo {
-    pub name: String,
-    pub releases: Vec<Release>,
-    /// Uploaded checkpoints no release cites yet. GC roots, like release lanes.
-    pub checkpoints: Vec<ObjectRef>,
-}
-
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-pub struct Release {
-    pub version: String,
-    pub lanes: BTreeMap<String, ObjectRef>,
-    /// Skipped by an unversioned lookup; an explicit version still resolves it.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub yanked: bool,
-    /// The release's expected-revision counter: each change to it increments this.
-    #[serde(default, skip_serializing_if = "is_zero")]
-    pub revision: u64,
-}
-
-fn is_false(b: &bool) -> bool {
-    !b
-}
-
-fn is_zero(n: &u64) -> bool {
-    *n == 0
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-struct RepoWire {
-    format: String,
-    name: String,
-    releases: Vec<Release>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    checkpoints: Vec<ObjectRef>,
-}
-
-impl TryFrom<RepoWire> for Repo {
-    type Error = Error;
-    fn try_from(w: RepoWire) -> Result<Self> {
-        check_format(&w.format, REPO_FORMAT)?;
-        match w.name.split_once('/') {
-            Some((org, name)) if segment(org) && segment(name) => {}
-            _ => return invalid(format!("repo name {:?} is not <org>/<name>", w.name)),
-        }
-        let mut seen = std::collections::HashSet::new();
-        for r in &w.releases {
-            if r.version.is_empty() || !seen.insert(&r.version) {
-                return invalid(format!(
-                    "release version {:?} is empty or repeated",
-                    r.version
-                ));
-            }
-            if r.lanes.keys().any(String::is_empty) {
-                return invalid(format!("release {:?} has an empty lane name", r.version));
-            }
-        }
-        Ok(Repo {
-            name: w.name,
-            releases: w.releases,
-            checkpoints: w.checkpoints,
-        })
-    }
-}
-
-impl From<Repo> for RepoWire {
-    fn from(r: Repo) -> Self {
-        RepoWire {
-            format: REPO_FORMAT.into(),
-            name: r.name,
-            releases: r.releases,
-            checkpoints: r.checkpoints,
-        }
-    }
-}
-
-impl Repo {
-    pub fn from_json(bytes: &[u8]) -> Result<Repo> {
-        json::read(bytes, REPO_FORMAT)
-    }
-    pub fn to_json(&self) -> Result<Vec<u8>> {
-        json::write(self)
-    }
-    /// The repo's key in a store or static origin: [`repo_key`] of its name.
-    pub fn key(&self) -> String {
-        repo_key(&self.name)
-    }
-    /// Release `version`, yanked or not; with `None`, the newest release that is not yanked.
-    pub fn release(&self, version: Option<&str>) -> Option<&Release> {
-        match version {
-            Some(v) => self.releases.iter().find(|r| r.version == v),
-            None => self.releases.iter().rev().find(|r| !r.yanked),
-        }
-    }
-    /// A lane's manifest in [`Repo::release`]`(version)`.
-    pub fn lane(&self, version: Option<&str>, lane: &str) -> Option<&ObjectRef> {
-        self.release(version)?.lanes.get(lane)
-    }
-    /// Every manifest the repo keeps alive: each release's lanes (yanked too) and each checkpoint.
-    pub fn roots(&self) -> impl Iterator<Item = &ObjectRef> {
-        let lanes = self.releases.iter().flat_map(|r| r.lanes.values());
-        lanes.chain(&self.checkpoints)
-    }
-}
-
-fn segment(s: &str) -> bool {
+pub(super) fn segment(s: &str) -> bool {
     !s.is_empty() && s != "." && s != ".." && !s.contains(['/', '\\', '\0'])
 }
 
 /// One or more segments joined by `/`.
-fn path(s: &str) -> bool {
+pub(super) fn path(s: &str) -> bool {
     s.split('/').all(segment)
 }

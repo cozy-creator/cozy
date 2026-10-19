@@ -1,4 +1,4 @@
-//! Where objects come from. An origin names a model's manifest (`resolve`) and says where its
+//! Where objects come from. An origin names a model's tree (`resolve`) and says where its
 //! objects can be read (`locate`); the Fetcher downloads, verifies and admits them.
 
 use std::path::PathBuf;
@@ -8,20 +8,20 @@ use async_trait::async_trait;
 
 use super::net::Client;
 use crate::err::{refuse, Code, Refusal, Result};
-use crate::format::{repo_key, ObjectRef, Repo};
+use crate::format::{repo_key, ObjectRef, Repo, Tree};
 
 /// The most bytes a refs document may have.
 const REPO_BYTES: u64 = 16 << 20;
 
 #[async_trait]
 pub trait Origin: Send + Sync {
-    /// The manifest of `name` (`<org>/<model>`) at `release` (the latest when `None`) and
-    /// `lane` (the release's only lane when `None`).
+    /// The tree of `name` (`<org>/<model>`) at `release` (the latest when `None`), for its
+    /// `variant` (an origin that serves one variant's closure needs it).
     async fn resolve(
         &self,
         name: &str,
         release: Option<&str>,
-        lane: Option<&str>,
+        variant: Option<&str>,
     ) -> Result<ObjectRef>;
 
     /// Where each of `objects` can be read, in order. The Fetcher asks once per object as it
@@ -67,66 +67,64 @@ pub(crate) fn split_name(name: &str) -> Result<(&str, &str)> {
     }
 }
 
-/// A refs document's manifest for `release` and `lane`.
-pub(crate) fn pick(
-    name: &str,
-    bytes: &[u8],
-    release: Option<&str>,
-    lane: Option<&str>,
-) -> Result<ObjectRef> {
+/// A refs document's tree for `release`.
+pub(crate) fn pick(name: &str, bytes: &[u8], release: Option<&str>) -> Result<ObjectRef> {
     let repo = Repo::from_json(bytes).map_err(|error| Refusal {
         code: Code::UNKNOWN_FORMAT,
         detail: format!("{name}: {error}"),
     })?;
-    Ok(choose(&repo, release, lane)?.2)
+    Ok(release_of(&repo, release)?.1)
 }
 
-/// `release` of `repo` (the newest not yanked when `None`), its lane `lane` (the only one when `None`) and
-/// that lane's manifest.
-pub fn choose(
-    repo: &Repo,
-    release: Option<&str>,
-    lane: Option<&str>,
-) -> Result<(String, String, ObjectRef)> {
-    let name = &repo.name;
-    let releases = || {
-        repo.releases
-            .iter()
-            .map(|r| r.version.as_str())
-            .collect::<Vec<_>>()
-    };
+/// `release` of `repo` (the newest not yanked when `None`): its version and tree.
+pub fn release_of(repo: &Repo, release: Option<&str>) -> Result<(String, ObjectRef)> {
     let Some(chosen) = repo.release(release) else {
+        let has: Vec<&str> = repo.releases.iter().map(|r| r.version.as_str()).collect();
         let wanted = release.unwrap_or("that is not yanked");
         return refuse(
             Code::RELEASE_ABSENT,
-            format!("{name} has no release {wanted} (has {:?})", releases()),
+            format!("{} has no release {wanted} (has {has:?})", repo.name),
         );
     };
     if chosen.yanked {
-        tracing::warn!("{name}@{} is yanked", chosen.version);
+        tracing::warn!("{}@{} is yanked", repo.name, chosen.version);
     }
-    let lanes = || chosen.lanes.keys().cloned().collect::<Vec<_>>();
-    let lane = match lane {
-        Some(lane) => lane.to_string(),
-        None if chosen.lanes.len() == 1 => lanes().remove(0),
-        None => {
-            return refuse(
-                Code::REF_NOT_FOUND,
-                format!("{name}@{}: name a lane (has {:?})", chosen.version, lanes()),
-            )
-        }
-    };
-    match chosen.lanes.get(&lane) {
-        Some(manifest) => Ok((chosen.version.clone(), lane, manifest.clone())),
-        None => refuse(
-            Code::REF_NOT_FOUND,
-            format!(
-                "{name}@{} has no lane {lane:?} (has {:?})",
-                chosen.version,
-                lanes()
-            ),
-        ),
+    Ok((chosen.version.clone(), chosen.tree.clone()))
+}
+
+/// `variant` of `tree` (its only one when `None`): its name and header.
+pub fn variant_of_tree(tree: &Tree, variant: Option<&str>) -> Result<(String, ObjectRef)> {
+    match tree.variant(variant) {
+        Ok((v, header)) => Ok((v.to_owned(), header.clone())),
+        Err(e) => refuse(Code::REF_NOT_FOUND, e.to_string()),
     }
+}
+
+/// What a name resolves to: a release, its tree, and the chosen variant's header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Chosen {
+    pub version: String,
+    pub tree: ObjectRef,
+    pub variant: String,
+    pub header: ObjectRef,
+}
+
+/// `release` of `repo` (the newest not yanked when `None`), its tree (read by `tree`), and
+/// that tree's `variant` (its only one when `None`).
+pub fn choose(
+    repo: &Repo,
+    release: Option<&str>,
+    variant: Option<&str>,
+    tree: impl FnOnce(&ObjectRef) -> Result<Tree>,
+) -> Result<Chosen> {
+    let (version, at) = release_of(repo, release)?;
+    let (variant, header) = variant_of_tree(&tree(&at)?, variant)?;
+    Ok(Chosen {
+        version,
+        tree: at,
+        variant,
+        header,
+    })
 }
 
 /// A static origin over HTTP: `{base}/refs/<org>/<model>.json` (lowercase) and `{base}/blobs/<aa>/<bb>/<sha256>`.
@@ -164,19 +162,14 @@ impl HttpOrigin {
 
 #[async_trait]
 impl Origin for HttpOrigin {
-    async fn resolve(
-        &self,
-        name: &str,
-        release: Option<&str>,
-        lane: Option<&str>,
-    ) -> Result<ObjectRef> {
+    async fn resolve(&self, name: &str, release: Option<&str>, _: Option<&str>) -> Result<ObjectRef> {
         split_name(name)?;
         let url = format!("{}/{}", self.base, repo_key(name));
         let bytes = self
             .client
             .document(&url, &self.headers(), REPO_BYTES)
             .await?;
-        pick(name, &bytes, release, lane)
+        pick(name, &bytes, release)
     }
 
     async fn locate(&self, objects: &[ObjectRef]) -> Result<Vec<Location>> {

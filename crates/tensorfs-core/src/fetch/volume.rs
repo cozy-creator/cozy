@@ -268,7 +268,7 @@ impl Origin for VolumeOrigin {
         &self,
         name: &str,
         release: Option<&str>,
-        lane: Option<&str>,
+        _: Option<&str>,
     ) -> Result<ObjectRef> {
         split_name(name)?;
         let path = self.0.root.join(repo_key(name));
@@ -286,7 +286,7 @@ impl Origin for VolumeOrigin {
             },
             detail: format!("{}: {error}", path.display()),
         })?;
-        pick(name, &bytes, release, lane)
+        pick(name, &bytes, release)
     }
 
     async fn locate(&self, objects: &[ObjectRef]) -> Result<Vec<Location>> {
