@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 """Writes the header vectors: vectors/green/header-*.{cbor,json} from the projections below, and
-vectors/red/header-*.cbor, each a green's twin or a single defect. Deterministic; run from anywhere:
+vectors/red/header-*.cbor, each a green's twin or a single defect. Then checks every decode-case
+file, vectors/cases/<family>.json (its cases come from the family's producer, mine/<family>.py),
+and rewrites it in its one form: one case per line, keys sorted. Deterministic; run from anywhere:
 
-    uv run --with numpy --with cbor2==6.1.4 python -I conformance/make_vectors.py
+    uv run --no-project --with numpy --with cbor2==6.1.4 python -I conformance/make_vectors.py
+
+`cargo test -p tensorfs-core --test format_conformance -- --ignored regenerate` then writes each
+family's repo, Conformance/<family>, into vectors/store.
 """
 
 from __future__ import annotations
@@ -246,6 +251,25 @@ def reds() -> dict[str, bytes]:
     return out
 
 
+def check_cases(path: Path) -> list:
+    """A family's decode cases: each names its component and key once per lane, holds its parts'
+    (or a plain tensor's) bits, and expects bytes or a refusal code."""
+    cases = json.loads(path.read_text())["cases"]
+    seen = set()
+    for c in cases:
+        where = f"{path.name}: {c.get('component')}/{c.get('key')}"
+        ident = (c.get("lane", "all"), c["component"], c["key"])
+        assert ident not in seen, f"{where} is listed twice"
+        seen.add(ident)
+        assert ("expect" in c) != ("refuse" in c), f"{where}: one of expect and refuse"
+        assert ("encoding" in c) == ("parts" in c) != ("bits" in c), f"{where}: parts with an encoding, else bits"
+        for p in c.get("parts", []):
+            assert {"role", "dtype", "shape", "bits"} <= p.keys(), f"{where}: part {p.get('role')}"
+    path.write_text('{"cases":[\n' + ",\n".join(json.dumps(c, sort_keys=True, separators=(",", ":")) for c in cases)
+                    + "\n]}\n")
+    return cases
+
+
 def main():
     green, red = HERE / "vectors" / "green", HERE / "vectors" / "red"
     for path in [*green.glob("header-*"), *red.glob("header-*")]:
@@ -257,6 +281,8 @@ def main():
     for name, data in reds().items():
         (red / f"header-{name}.cbor").write_bytes(data)
     print(f"{len(GREEN)} green and {len(reds())} red header vectors")
+    for path in sorted((HERE / "vectors" / "cases").glob("*.json")):
+        print(f"{path.stem}: {len(check_cases(path))} decode cases")
 
 
 if __name__ == "__main__":

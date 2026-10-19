@@ -1,7 +1,7 @@
 //! The cozytensors/1 conformance vectors (`crates/tensorfs/conformance/vectors`): the Rust writer
-//! reproduces the store byte for byte from `cases.json`, the Rust reader decodes every case to
-//! its expected bytes or refuses it with its code, and green/red documents read or refuse.
-//! `cargo test ... -- --ignored regenerate` rewrites the store after a deliberate change.
+//! reproduces the store byte for byte from `cases/<family>.json`, the Rust reader decodes every
+//! case to its expected bytes or refuses it with its code, and green/red documents read or
+//! refuse. `cargo test ... -- --ignored regenerate` rewrites the store after a deliberate change.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -57,19 +57,37 @@ fn vectors() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../conformance/vectors")
 }
 
-fn cases() -> Vec<Case> {
-    let c: Cases =
-        serde_json::from_slice(&fs::read(vectors().join("cases.json")).unwrap()).unwrap();
-    c.cases
+/// Each `cases/<family>.json`, by family name, in name order.
+fn families() -> Vec<(String, Vec<Case>)> {
+    let mut out = Vec::new();
+    for entry in fs::read_dir(vectors().join("cases")).unwrap() {
+        let path = entry.unwrap().path();
+        let family = path.file_stem().unwrap().to_string_lossy().to_string();
+        let c: Cases = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        out.push((family, c.cases));
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
 }
 
-const REPO: &str = "Conformance/Schemes";
+/// A family's repo: `Conformance/<family>`, at `refs/conformance/<family>.json`.
+fn repo_name(family: &str) -> String {
+    format!("Conformance/{family}")
+}
+
 const LICENSE: &[u8] = b"MIT\n";
 
-/// Every file of the store, by path, as the Rust writer produces it from `cases.json`.
+/// Every file of the store, by path, as the Rust writer produces it from the cases: one repo per
+/// family, so families add files without touching each other's.
 fn write_store() -> BTreeMap<String, Vec<u8>> {
-    let cases = cases();
     let mut files = BTreeMap::new();
+    for (family, cases) in families() {
+        write_family(&mut files, &family, &cases);
+    }
+    files
+}
+
+fn write_family(files: &mut BTreeMap<String, Vec<u8>>, family: &str, cases: &[Case]) {
     let mut put = |bytes: Vec<u8>| {
         let r = ObjectRef::of(&bytes);
         files.insert(r.key(), bytes);
@@ -77,8 +95,8 @@ fn write_store() -> BTreeMap<String, Vec<u8>> {
     };
     let mut lanes = BTreeMap::new();
 
-    // Lane "all": every case in cases.json order (components by first appearance), laid out by
-    // the chunk rule.
+    // Lane "all": every case in file order (components by first appearance), laid out by the
+    // chunk rule.
     let mut grouped: Vec<(&str, Vec<&Case>)> = Vec::new();
     for c in cases.iter().filter(|c| c.lane == "all") {
         match grouped.iter_mut().find(|(name, _)| *name == c.component) {
@@ -154,8 +172,22 @@ fn write_store() -> BTreeMap<String, Vec<u8>> {
     };
     lanes.insert("all".to_string(), put(manifest.to_json().unwrap()));
 
-    // Lane "spans": one plain tensor at offset 4096 of chunk 0, continuing through chunk 2.
-    let span = cases.iter().find(|c| c.lane == "spans").unwrap();
+    // Lane "spans" (core): one plain tensor at offset 4096 of chunk 0, continuing through
+    // chunk 2; release 2 swaps the lanes and is yanked, so unversioned lookups land on 1.
+    let Some(span) = cases.iter().find(|c| c.lane == "spans") else {
+        let repo = Repo {
+            name: repo_name(family),
+            releases: vec![Release {
+                version: "1".into(),
+                lanes,
+                yanked: false,
+                revision: 0,
+            }],
+            checkpoints: vec![],
+        };
+        files.insert(repo.key(), repo.to_json().unwrap());
+        return;
+    };
     let bytes = b64(span.bits.as_ref().unwrap());
     let first = [vec![0u8; 4096], bytes[..3996].to_vec()].concat();
     let chunks = vec![
@@ -184,7 +216,6 @@ fn write_store() -> BTreeMap<String, Vec<u8>> {
     };
     lanes.insert("spans".to_string(), put(manifest.to_json().unwrap()));
 
-    // Release 2 swaps the lanes and is yanked: unversioned lookups must land on release 1.
     let swapped = BTreeMap::from([
         ("all".to_string(), lanes["spans"].clone()),
         ("spans".to_string(), lanes["all"].clone()),
@@ -197,7 +228,7 @@ fn write_store() -> BTreeMap<String, Vec<u8>> {
         revision,
     };
     let repo = Repo {
-        name: REPO.into(),
+        name: repo_name(family),
         releases: vec![
             release("1", lanes, false, 3),
             release("2", swapped, true, 0),
@@ -205,7 +236,6 @@ fn write_store() -> BTreeMap<String, Vec<u8>> {
         checkpoints,
     };
     files.insert(repo.key(), repo.to_json().unwrap());
-    files
 }
 
 fn read_tree(root: &Path) -> BTreeMap<String, Vec<u8>> {
@@ -267,39 +297,40 @@ fn blob(root: &Path, r: &ObjectRef) -> Vec<u8> {
 #[test]
 fn reader_decodes_every_case() {
     let root = vectors().join("store");
-    assert_eq!(repo_key(REPO), "refs/conformance/schemes.json");
-    let repo = Repo::from_json(&fs::read(root.join(repo_key(REPO))).unwrap()).unwrap();
-    assert_eq!(repo.name, REPO);
-    assert_eq!(
-        repo.release(None).unwrap().version,
-        "1",
-        "release 2 is yanked"
-    );
-    assert_eq!(
-        repo.lane(Some("2"), "all"),
-        repo.lane(None, "spans"),
-        "an explicit version still resolves"
-    );
-    assert_eq!(repo.roots().count(), 5);
     let mut checked = 0;
-    for c in cases() {
-        let manifest =
-            Manifest::from_json(&blob(&root, repo.lane(None, &c.lane).unwrap())).unwrap();
-        let header = Header::from_cbor(&blob(&root, manifest.header().unwrap())).unwrap();
-        let got = header.read(&c.component, &c.key, |i| {
-            Ok::<_, Error>(blob(&root, &header.chunks[i]))
-        });
-        let name = format!("{}/{}", c.component, c.key);
-        match (&c.expect, &c.refuse, got) {
-            (Some(want), None, Ok(bytes)) => {
-                assert!(bytes == b64(want), "{name}: decoded bytes differ")
-            }
-            (None, Some(code), Err(e)) => assert_eq!(e.code(), code, "{name}: {e}"),
-            (_, _, got) => panic!("{name}: {got:?}"),
+    for (family, cases) in families() {
+        let name = repo_name(&family);
+        assert_eq!(repo_key(&name), format!("refs/conformance/{family}.json"));
+        let repo = Repo::from_json(&fs::read(root.join(repo_key(&name))).unwrap()).unwrap();
+        assert_eq!(repo.name, name);
+        if family == "core" {
+            assert_eq!(repo.release(None).unwrap().version, "1", "release 2 is yanked");
+            assert_eq!(
+                repo.lane(Some("2"), "all"),
+                repo.lane(None, "spans"),
+                "an explicit version still resolves"
+            );
+            assert_eq!(repo.roots().count(), 5);
         }
-        checked += 1;
+        for c in cases {
+            let manifest =
+                Manifest::from_json(&blob(&root, repo.lane(None, &c.lane).unwrap())).unwrap();
+            let header = Header::from_cbor(&blob(&root, manifest.header().unwrap())).unwrap();
+            let got = header.read(&c.component, &c.key, |i| {
+                Ok::<_, Error>(blob(&root, &header.chunks[i]))
+            });
+            let name = format!("{family}:{}/{}", c.component, c.key);
+            match (&c.expect, &c.refuse, got) {
+                (Some(want), None, Ok(bytes)) => {
+                    assert!(bytes == b64(want), "{name}: decoded bytes differ")
+                }
+                (None, Some(code), Err(e)) => assert_eq!(e.code(), code, "{name}: {e}"),
+                (_, _, got) => panic!("{name}: {got:?}"),
+            }
+            checked += 1;
+        }
     }
-    assert!(checked >= 46, "{checked}");
+    assert!(checked >= 80, "{checked}");
 }
 
 /// A green header's projection (its CBOR tree as JSON, byte strings as `{"hex": ...}`) as a

@@ -125,7 +125,7 @@ impl From<format::Error> for Failure {
             format::Error::Invalid(_) => Kind::Invalid,
             format::Error::Format { .. } | format::Error::PreCut => Kind::Format,
             format::Error::UnknownScheme(_) => Kind::UnknownScheme,
-            format::Error::Decode(_) => Kind::Decode,
+            format::Error::Decode(_) | format::Error::Encode(_) => Kind::Decode,
         };
         Failure {
             kind,

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """An independent cozytensors/1 reader and header encoder, written from the spec: Python, numpy and cbor2.
+Scheme decoders are in schemes/, one module per family.
 
     python reader.py <vectors-dir>     run the conformance vectors (exit 1 on any failure)
 
@@ -19,7 +20,12 @@ import sys
 from pathlib import Path
 
 import cbor2
+
 import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # schemes/, also under python -I
+from schemes import affine, blocks, decode, grid, table  # noqa: E402
+from schemes.base import Refused  # noqa: E402
 
 HEADER, MANIFEST, REPO = "cozytensors/1", "tensorfs.manifest/1", "tensorfs.repo/1"
 BITS = {
@@ -28,12 +34,6 @@ BITS = {
     "I32": 32, "U32": 32, "F32": 32, "C64": 64, "F64": 64, "I64": 64, "U64": 64,
 }
 PRE_CUT = "pre-cut cozytensors header (old layout); re-import or migrate"
-
-
-class Refused(Exception):
-    def __init__(self, code: str, detail: str):
-        super().__init__(f"{code}: {detail}")
-        self.code = code
 
 
 def invalid(detail: str) -> Refused:
@@ -361,220 +361,48 @@ def read(store: Store, header: dict, component: str, key: str) -> bytes:
     return decode(t["dtype"], t["shape"], t["encoding"], parts)
 
 
-# ------------------------------------------------------------------ decode
-
-
-def _e4m3() -> np.ndarray:
-    out = np.empty(256, np.float32)
-    for b in range(256):
-        e, m = (b >> 3) & 15, b & 7
-        v = np.nan if (e, m) == (15, 7) else (m * 2.0**-9 if e == 0 else (1 + m / 8) * 2.0 ** (e - 7))
-        out[b] = -v if b & 0x80 else v
-    return out
-
-
-E4M3 = _e4m3()
-E5M2 = (np.arange(256, dtype=np.uint16) << 8).view(np.float16).astype(np.float32)
-E2M1 = np.array([0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6], np.float32)
-
-
-E8M0 = np.array([2.0 ** (b - 127) if b < 255 else np.nan for b in range(256)], np.float32)
-
-
-def values(dtype: str, data: bytes) -> np.ndarray:
-    raw = np.frombuffer(data, np.uint8)
-    if dtype == "F32":
-        return np.frombuffer(data, "<f4").astype(np.float32)
-    if dtype == "F4":
-        return E2M1[np.stack([raw & 15, raw >> 4], -1).reshape(-1)]
-    if dtype == "BF16":
-        return (np.frombuffer(data, "<u2").astype(np.uint32) << 16).view(np.float32)
-    if dtype == "F16":
-        return np.frombuffer(data, "<f2").astype(np.float32)
-    return {"F8_E4M3": E4M3, "F8_E5M2": E5M2, "F8_E8M0": E8M0}[dtype][raw]
-
-
-def to_dtype(dtype: str, x: np.ndarray) -> bytes:
-    x = x.astype(np.float32).reshape(-1)
-    nan = np.isnan(x)
-    if dtype == "F32":
-        bits = x.view(np.uint32).copy()
-        bits[nan] = 0x7FC00000
-        return bits.astype("<u4").tobytes()
-    if dtype == "BF16":
-        u = x.view(np.uint32).astype(np.uint64)
-        bits = ((u + 0x7FFF + ((u >> 16) & 1)) >> 16).astype(np.uint16)
-        bits[nan] = 0x7FC0
-        return bits.astype("<u2").tobytes()
-    with np.errstate(over="ignore"):
-        bits = x.astype(np.float16).view(np.uint16).copy()
-    bits[nan] = 0x7E00
-    return bits.astype("<u2").tobytes()
-
-
-def hadamard(x: np.ndarray, k: int) -> np.ndarray:
-    """Rows of x (int64, last axis 4**k) times H4 (x) ... (x) H4, unnormalized."""
-    shape = x.shape
-    x = x.reshape(-1, *([4] * k))
-    for axis in range(1, k + 1):
-        a, b, c, d = (np.take(x, i, axis=axis) for i in range(4))
-        x = np.stack([a + b + c - d, a + b - c + d, a - b + c + d, b + c + d - a], axis=axis)
-    return x.reshape(shape)
-
-
-SCHEMES = {  # scheme: (required parts, optional parts, params)
-    "fp8.tensorwise": ({"weight", "scale"}, {"input_scale"}, {"scale_dtype"}),
-    "fp8.rowwise": ({"weight", "scale"}, set(), {"axis"}),
-    "int8.tensorwise": ({"weight", "scale"}, {"input_scale"}, {"scale_dtype"}),
-    "int8.rowwise": ({"weight", "scale"}, set(), {"axis"}),
-    "int8.convrot": ({"weight", "scale"}, set(), {"rotation", "rotation_size"}),
-    "mxfp8": ({"weight", "scale"}, set(), {"block_size", "scale_layout"}),
-    "nvfp4": ({"weight", "scale", "scale_2"}, {"input_scale"},
-              {"block_size", "global_scale", "nibble_order", "scale_layout"}),
-}
-FP8 = ("F8_E4M3", "F8_E5M2")
-
-
-def blocked(rows: int, blocks: int) -> np.ndarray:
-    """Where cuBLAS's 128x4-tiled layout stores block scale (i, b), for every i and b."""
-    i, b = np.arange(rows)[:, None], np.arange(blocks)[None, :]
-    tiles = -(-blocks // 4)
-    return ((i // 128) * tiles + b // 4) * 512 + (i % 32) * 16 + (i % 128 // 32) * 4 + b % 4
-
-
-def decode(dtype: str, shape: list, encoding: dict, parts: dict) -> bytes:
-    with np.errstate(all="ignore"):  # NaN and infinity are values here, not errors
-        return _decode(dtype, shape, encoding, parts)
-
-
-def _decode(dtype: str, shape: list, encoding: dict, parts: dict) -> bytes:
-    scheme, params = encoding["scheme"], encoding["params"]
-    if scheme not in SCHEMES:
-        raise Refused("unknown_scheme", scheme)
-
-    def fail(detail):
-        return Refused("decode", f"{scheme}: {detail}")
-
-    required, optional, names = SCHEMES[scheme]
-    if not required <= parts.keys() <= required | optional:
-        raise fail(f"parts {sorted(parts)}")
-    if not params.keys() <= names:  # params drive the decode: an unknown one is refused
-        raise fail(f"params {sorted(params)}")
-
-    def param(name, allowed):
-        if params.get(name) not in allowed or type(params.get(name)) is bool:
-            raise fail(f"param {name}={params.get(name)!r}")
-        return params[name]
-
-    if dtype not in ("F32", "BF16", "F16"):
-        raise fail(f"logical dtype {dtype}")
-    numel = int(np.prod(shape, dtype=np.int64))
-    if scheme.endswith(".tensorwise"):
-        rows, cols = 1, numel
-    elif len(shape) >= 2:  # the last axis, and every leading axis as rows
-        cols = shape[-1]
-        rows = numel // cols if cols else 0
-    else:
-        raise fail(f"shape {shape}")
-
-    def part(role, dtypes, want=None, count=None):
-        pd, ps, data = parts[role]
-        if pd not in dtypes or (want is not None and ps != list(want)) or (
-                count is not None and int(np.prod(ps, dtype=np.int64)) != count):
-            raise fail(f"part {role} is {pd} {ps}")
-        return np.frombuffer(data, np.int8).astype(np.int64) if pd == "I8" else values(pd, data)
-
-    def scales(blocks, dtype_):
-        """Block scale (i, b) for every row i and block b, from either layout."""
-        if param("scale_layout", ("row_major", "cublas_128x4")) == "row_major":
-            return part("scale", (dtype_,), want=[*shape[:-1], blocks]).reshape(rows, blocks)
-        stored = [128 * -(-rows // 128), 4 * -(-blocks // 4)]
-        return part("scale", (dtype_,), want=stored)[blocked(rows, blocks)]
-
-    if scheme.endswith(".tensorwise"):
-        w = part("weight", FP8 if scheme == "fp8.tensorwise" else ("I8",), want=shape)
-        s = part("scale", (param("scale_dtype", ("F32", "BF16", "F16")),), count=1)[0]  # exact, never rounded
-        if "input_scale" in parts:
-            part("input_scale", ("F32",), count=1)
-        out = w.astype(np.float32) * s
-    elif scheme.endswith(".rowwise"):
-        w = part("weight", FP8 if scheme == "fp8.rowwise" else ("I8",), want=shape)
-        axis = param("axis", (0, 1))
-        s = part("scale", ("F32",), count=(rows, cols)[axis])
-        w = w.astype(np.float32).reshape(rows, cols)
-        out = w * (s.reshape(rows, 1) if axis == 0 else s.reshape(1, cols))
-    elif scheme == "int8.convrot":
-        param("rotation", ("hadamard",))
-        b = param("rotation_size", [4**k for k in range(1, 9)])
-        if cols % b:
-            raise fail(f"{cols} columns in blocks of {b}")
-        k = b.bit_length() // 2
-        w = part("weight", ("I8",), want=shape).reshape(rows, cols // b, b)
-        s = part("scale", ("F32",), count=rows)
-        h = hadamard(w, k).astype(np.float32).reshape(rows, cols)
-        out = (h * s.reshape(rows, 1)) * np.float32(2.0**-k)
-    elif scheme == "mxfp8":
-        param("block_size", (32,))
-        n = -(-cols // 32)
-        s = scales(n, "F8_E8M0")
-        w = part("weight", FP8, want=shape).reshape(rows, cols)
-        out = w * np.repeat(s, 32, axis=1)[:, :cols]
-    else:  # nvfp4
-        param("block_size", (16,))
-        if cols % 16:
-            raise fail(f"{cols} columns in blocks of 16")
-        pd, ps, data = parts["weight"]
-        if param("nibble_order", ("low_first", "high_first")) == "high_first":
-            raw = np.frombuffer(data, np.uint8)
-            parts = {**parts, "weight": (pd, ps, ((raw << 4) | (raw >> 4)).astype(np.uint8).tobytes())}
-        w = part("weight", ("F4",), want=shape).reshape(rows, cols // 16, 16)
-        s = scales(cols // 16, "F8_E4M3").reshape(rows, cols // 16, 1)
-        g = part("scale_2", ("F32",), count=1)[0]
-        if "input_scale" in parts:
-            part("input_scale", ("F32",), count=1)
-        if param("global_scale", ("multiply", "divide")) == "multiply":
-            out = (w * s) * g
-        else:
-            out = w * (s / g)
-    return to_dtype(dtype, out)
-
-
 # ------------------------------------------------------------- conformance
 
 
 def check(vectors: Path) -> int:
     failures, passed = [], 0
-    cases = load_cases(vectors / "cases.json")
     store = Store(vectors / "store")
-    for lane in ("all", "spans"):
-        _, header = store.checkpoint("Conformance/Schemes", lane=lane)
-        for comp, tensors in header["components"].items():
-            for key in tensors:
-                case = cases.get((lane, comp, key))
-                try:
-                    got = read(store, header, comp, key)
-                    ok = case is not None and "expect" in case and got == base64.b64decode(case["expect"])
-                except Refused as e:
-                    ok = case is not None and case.get("refuse") == e.code
-                passed += ok
-                if not ok:
-                    failures.append(f"{lane}:{comp}/{key}")
-        missing = [k for k in cases if k[0] == lane and k[2] not in header["components"].get(k[1], {})]
-        failures += [f"{lane}:{c}/{k} missing from the store" for _, c, k in missing]
-        # Order is data: components by first appearance, tensors and parts as cases.json lists them.
-        want = [(c, k, [p["role"] for p in case.get("parts", [])]) for (ln, c, k), case in cases.items() if ln == lane]
-        want = [w for comp in dict.fromkeys(c for c, _, _ in want) for w in want if w[0] == comp]
-        got = [(c, k, list(t.get("parts", {}))) for c, ts in header["components"].items() for k, t in ts.items()]
-        ok = got == want
-        passed += ok
-        if not ok:
-            failures.append(f"{lane}: header order differs from cases.json")
-    # Release 2 is yanked and swaps the lanes: only an explicit version reaches it.
-    _, yanked = store.checkpoint("Conformance/Schemes", version="2", lane="all")
+    for path in sorted((vectors / "cases").glob("*.json")):
+        family = path.stem
+        cases = load_cases(path)
+        repo = f"Conformance/{family}"
+        for lane in dict.fromkeys(ln for ln, _, _ in cases):
+            _, header = store.checkpoint(repo, lane=lane)
+            for comp, tensors in header["components"].items():
+                for key in tensors:
+                    case = cases.get((lane, comp, key))
+                    try:
+                        got = read(store, header, comp, key)
+                        ok = case is not None and "expect" in case and got == base64.b64decode(case["expect"])
+                    except Refused as e:
+                        ok = case is not None and case.get("refuse") == e.code
+                    passed += ok
+                    if not ok:
+                        failures.append(f"{family}:{lane}:{comp}/{key}")
+            missing = [k for k in cases if k[0] == lane and k[2] not in header["components"].get(k[1], {})]
+            failures += [f"{family}:{lane}:{c}/{k} missing from the store" for _, c, k in missing]
+            # Order is data: components by first appearance, tensors and parts as the file lists them.
+            want = [(c, k, [p["role"] for p in case.get("parts", [])]) for (ln, c, k), case in cases.items() if ln == lane]
+            want = [w for comp in dict.fromkeys(c for c, _, _ in want) for w in want if w[0] == comp]
+            got = [(c, k, list(t.get("parts", {}))) for c, ts in header["components"].items() for k, t in ts.items()]
+            ok = got == want
+            passed += ok
+            if not ok:
+                failures.append(f"{family}:{lane}: header order differs from {path.name}")
+    # Core's release 2 is yanked and swaps its lanes: only an explicit version reaches it.
+    _, yanked = store.checkpoint("Conformance/core", version="2", lane="all")
     ok = list(yanked["components"]) == ["spans"]
     passed += ok
     if not ok:
         failures.append("an explicit yanked version")
+    core_failures = check_cores(vectors / "cores.json")
+    failures += core_failures
+    passed += len(json.loads((vectors / "cores.json").read_text())["cases"]) - len(core_failures)
     parsers = {"header": parse_header, "manifest": parse_manifest, "repo": parse_repo}
     for verdict in ("green", "red"):
         for path in sorted((vectors / verdict).iterdir()):
@@ -599,6 +427,43 @@ def check(vectors: Path) -> int:
         print("FAIL", f)
     print(f"cozytensors/1 conformance: {passed} passed, {len(failures)} failed")
     return 1 if failures else 0
+
+
+def core_case(case: dict) -> np.ndarray:
+    """A cores.json case's values (spec §6, building blocks)."""
+    rows, cols = case["rows"], case["cols"]
+    data = lambda k: base64.b64decode(case[k])  # noqa: E731
+    f32 = lambda k: np.frombuffer(data(k), "<f4")  # noqa: E731
+    if case["core"] == "blocks":
+        # gguf's q4_0 {f16 d; u8 qs[16]}: element j in qs[j]'s low nibble, j + 16 in its high one,
+        # (q - 8) x d; q8_0 {f16 d; i8 qs[32]}: q x d.
+        s = blocks.structs(data("blocks"), case["size"])
+        d = blocks.f16(s, 0)
+        if case["type"] == "q4_0":
+            q = affine.Packing(4, 8, fill="planar").lanes(s[:, 2:], case["elements"])
+            return (q.astype(np.float32) - np.float32(8)) * d
+        return s[:, 2:].view(np.int8).astype(np.float32) * d
+    p = case["packing"]
+    order = tuple(p["order"]) if isinstance(p.get("order"), list) else p.get("order", "low_first")
+    packing = affine.Packing(**{**p, "order": order})
+    g = case["grid"]
+    index = np.array(g["index"]) if "index" in g else None
+    g = grid.Grid(g["kind"], g.get("size", 0), g.get("layout", "row_major"), index)
+    q = packing.unpack(data("words"), rows, cols)
+    if case["core"] == "table":
+        return table.decode(q, f32("table"), f32("scale"), g, rows, cols)
+    zero = f32("zero") if "zero" in case else None
+    bias = f32("bias") if "bias" in case else None
+    return affine.dequant(q, f32("scale"), g, zero=zero, bias=bias)
+
+
+def check_cores(path: Path) -> list:
+    failures = []
+    for case in json.loads(path.read_text())["cases"]:
+        got = np.asarray(core_case(case), np.float32).reshape(-1)
+        if got.astype("<f4").tobytes() != base64.b64decode(case["expect"]):
+            failures.append(f"cores: {case['name']}")
+    return failures
 
 
 def load_cases(path: Path) -> dict:

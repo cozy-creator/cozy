@@ -1,0 +1,67 @@
+//! `fp8.tensorwise` and `fp8.rowwise` (spec §6 `fp8.tensorwise`, `fp8.rowwise`): FP8 elements times one scale for the
+//! tensor, or one per row or column.
+
+use super::grid::Grid;
+use super::{elem, logical, one, table, Allowed, Ctx, Dtypes, Param, Part, Scheme, Shape, View};
+use crate::format::Result;
+
+const FP8: Dtypes = Dtypes::Of(&["F8_E4M3", "F8_E5M2"]);
+
+pub const TENSORWISE: Scheme = Scheme {
+    name: "fp8.tensorwise",
+    view: View::Flat,
+    params: &[Param {
+        key: "scale_dtype",
+        allowed: Allowed::Text(&["F32", "BF16", "F16"]),
+    }],
+    parts: &[
+        Part::req("weight", FP8, logical),
+        Part::req("scale", Dtypes::Param("scale_dtype"), one),
+        Part::opt("input_scale", Dtypes::Of(&["F32"]), one),
+    ],
+    decode: |c| scaled(c, &Grid::Tensor),
+};
+
+pub const ROWWISE: Scheme = Scheme {
+    name: "fp8.rowwise",
+    view: View::Matrix,
+    params: &[AXIS],
+    parts: &[
+        Part::req("weight", FP8, logical),
+        Part::req("scale", Dtypes::Of(&["F32"]), per_axis),
+    ],
+    decode: |c| scaled(c, &axis_grid(c)),
+};
+
+/// `axis` 0: a scale per row; 1: per column.
+pub const AXIS: Param = Param {
+    key: "axis",
+    allowed: Allowed::Uint(&[0, 1]),
+};
+
+pub fn axis_grid(c: &Ctx) -> Grid<'static> {
+    if c.uint("axis") == 0 {
+        Grid::Row
+    } else {
+        Grid::Col
+    }
+}
+
+/// One scale per row (`axis: 0`) or column (`axis: 1`), any shape.
+pub fn per_axis(c: &Ctx) -> Result<Shape> {
+    axis_grid(c).shape(c)
+}
+
+/// `weight × s(i, j)`: the element table looked up by the weight's bytes.
+fn scaled(c: &Ctx, grid: &Grid) -> Result<Vec<f32>> {
+    let w = c.part("weight");
+    let t = elem::table(w.dtype).expect("an 8-bit element format");
+    table::decode(
+        &table::bytes(w.bytes),
+        &t,
+        &c.floats("scale"),
+        grid,
+        c.rows,
+        c.cols,
+    )
+}

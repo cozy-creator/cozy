@@ -8,7 +8,7 @@ describes every tensor in them, plain or encoded, by component. A **repo** docum
 to checkpoints. Everything a reader needs to read and decode a tensor is in these documents and this spec.
 
 The key words MUST, MUST NOT, SHOULD and MAY are used as in RFC 2119. §1–§8 define meaning; §9 defines the byte encoding
-of documents; §10 is informative writer guidance.
+of documents; §10 is informative writer guidance. Appendix A holds the schemes' fixed tables.
 
 ## 1. Objects
 
@@ -142,6 +142,7 @@ Element formats used by the schemes:
 | `F4` (E2M1) | sign bit 3; bits 0–2 index `0, 0.5, 1, 1.5, 2, 3, 4, 6`. |
 | `F8_E8M0` | `2^(b−127)` for `b < 255`; `255` is NaN. |
 | `I8` | two's complement. |
+| UE4M3 (ggml, inside structs) | bits 3–6 exponent (bias 7), bits 0–2 mantissa, bit 7 ignored; `0x7F` is zero and there is no NaN. `e = 0`: `m × 2^−9`; otherwise `(1 + m/8) × 2^(e−7)`. |
 
 ## 6. Encodings
 
@@ -175,14 +176,15 @@ refuse a mismatch.
   a param is missing, unknown or has a value not listed, a part's dtype or shape breaks the scheme's rule, or the
   logical dtype is not `F32`, `BF16` or `F16`. Params drive the decode, so an unknown one is a refusal, never ignored.
 
-**Shapes.** The tensorwise schemes take any logical shape. The others take rank 2 or more and view the tensor as
-`[R, C]`: `C` is the last extent and `R` the product of the others, so an expert stack `[E, N, K]` is `R = E·N` rows of
-`K`. `i` indexes rows and `j` columns; block schemes act along `j`.
+**Shapes.** The tensorwise schemes take any logical shape, as one row of every element (`R = 1`). The others take
+rank 2 or more and view the tensor as `[R, C]`: `C` is the last extent and `R` the product of the others, so an expert
+stack `[E, N, K]` is `R = E·N` rows of `K`. `i` indexes rows and `j` columns; block schemes act along `j`. The
+ecosystem's `[N, K]` weight is `R = N` output rows of `K` inputs.
 
-**Arithmetic.** Each formula is evaluated element by element in IEEE-754 binary32 (`f32`): every `×` and `÷` is one f32
-operation rounded to nearest even, applied left to right as written; element formats (§5) and stored scales convert to
-f32 exactly, and no scale is rounded before use. The result is then rounded once to the logical dtype `L`, written
-`round_L`:
+**Arithmetic.** Each formula is evaluated element by element in IEEE-754 binary32 (`f32`): every `+`, `−`, `×` and `÷`
+is one f32 operation rounded to nearest even, applied left to right as written; element formats (§5), codes and stored
+scales convert to f32 exactly, and no scale is rounded before use. The result is then rounded once to the logical
+dtype `L`, written `round_L`:
 - `F32`: unchanged; `BF16`, `F16`: round to nearest, ties to even, keeping subnormals; `F16` overflows to ±infinity.
 - Any NaN result is written as the canonical quiet NaN: `0x7FC00000` (`F32`), `0x7FC0` (`BF16`), `0x7E00` (`F16`).
 
@@ -193,66 +195,140 @@ the format promises, and readers follow this spec.
 `input_scale` (optional where listed, `F32`, one element) is the activation scale of a quantized matmul; it never
 enters a decode. It applies as `global_scale` says for `nvfp4`, and multiplies elsewhere.
 
-| Scheme | Params | Parts | Decode |
-|---|---|---|---|
-| `fp8.tensorwise` | `scale_dtype`: `F32`, `BF16` or `F16`, as the producer stored it | `weight`: `F8_E4M3` or `F8_E5M2`, the logical shape. `scale`: `scale_dtype`, one element. `input_scale`. | `round_L(weight × scale)` |
-| `int8.tensorwise` | `scale_dtype`, as above | `weight`: `I8`, the logical shape. `scale`: `scale_dtype`, one element. `input_scale`. | `round_L(weight × scale)` |
-| `fp8.rowwise` | `axis`: `0` or `1` | `weight`: `F8_E4M3` or `F8_E5M2`, the logical shape. `scale`: `F32`, `R` elements (`axis: 0`) or `C` (`axis: 1`), any shape. | `round_L(weight[i, j] × scale[axis = 0 ? i : j])` |
-| `int8.rowwise` | `axis`: `0` or `1` | `weight`: `I8`, the logical shape. `scale` as `fp8.rowwise`. | as `fp8.rowwise` |
-| `int8.convrot` | `rotation: "hadamard"`, `rotation_size: B` | `weight`: `I8`, the logical shape. `scale`: `F32`, `R` elements. | below |
-| `mxfp8` | `block_size: 32`, `scale_layout` | `weight`: `F8_E4M3` or `F8_E5M2`, the logical shape. `scale`: `F8_E8M0`, `⌈C/32⌉` per row (below). | `round_L(weight[i, j] × scale(i, ⌊j/32⌋))` |
-| `nvfp4` | `block_size: 16`, `global_scale`, `nibble_order`, `scale_layout` | `weight`: `F4`, the logical shape, `C` a multiple of 16. `scale`: `F8_E4M3`, `C/16` per row. `scale_2`: `F32`, one element. `input_scale`. | `multiply`: `round_L((weight[i, j] × scale(i, ⌊j/16⌋)) × scale_2)`; `divide`: `round_L(weight[i, j] × (scale(i, ⌊j/16⌋) ÷ scale_2))` |
+Each scheme below lists its params (with their allowed values), its parts (role, dtypes, stored shape) and its decode,
+built from the building blocks that follow.
+
+### Building blocks
+
+**Scale grids.** A part on a grid (a scale, a zero or a bias) gives element `(i, j)` the value `s(i, j)`:
+
+| Grid | Stored | `s(i, j)` |
+|---|---|---|
+| tensor | one element, any shape | `s[0]` |
+| row | `R` elements, any shape | `s[i]` |
+| column | `C` elements, any shape | `s[j]` |
+| row blocks of `B` | `W = ⌈C/B⌉` per row, in a layout below | `s(i, b)`: `b = ⌊j/B⌋`, or `b = g_idx[j]` where the scheme has a `g_idx` |
+
+The last block of a row may be short. A `g_idx` holds `C` values, each below `W`. Row blocks are stored:
+- `row_major`: the logical shape with its last extent replaced by `W` (`[R, W]` for a matrix); `s(i, b)` is element
+  `i·W + b`.
+- `transposed`: `[W, R]`; `s(i, b)` is element `b·R + i` (GPTQ's and AWQ's `[K/g, N]`).
+- `cublas_128x4`: cuBLAS's block-scaling layout, as ComfyUI stores it. The part is `[128·⌈R/128⌉, 4·⌈W/4⌉]`,
+  zero-padded, in tiles of 128 rows × 4 blocks; `s(i, b)` is element
+  `512·(⌊i/128⌋·⌈W/4⌉ + ⌊b/4⌋) + 16·(i mod 32) + 4·⌊(i mod 128)/32⌋ + (b mod 4)`.
+
+**Bit packing.** A packed part holds the codes `q[i, j]` of the `[R, C]` view, stored as `[R, C]` or, where the
+scheme says *transposed*, as `[C, R]`. Along one axis of that stored array, the *pack axis*, each lane of `n` codes
+is held in words of `w` bits: `w` is 8, 16 or 32 (the part's dtype `U8`/`I8`, `U16`/`I16` or `U32`/`I32`),
+little-endian, its bits read unsigned. The part's shape is the stored array's with the pack axis counted in words
+(a view stored as is and packed along its last axis keeps the logical leading extents). With `b` bits per code
+(1 ≤ `b` ≤ 8) and `p = ⌊w/b⌋` codes to a word, the *fill* places code `t` of a lane:
+- `word`: in word `⌊t/p⌋`, slot `σ(t mod p)`; the lane takes `⌈n/p⌉` words.
+- `planar`: in word `t mod m`, slot `σ(⌊t/m⌋)`, where `m = n/p` words (`n` MUST be a multiple of `p`).
+- `dense`: the lane's words form one bit stream, word `k` holding stream bits `k·w … k·w + w − 1` (bit 0 first); code
+  `t` is stream bits `t·b … t·b + b − 1`, crossing words; the lane takes `⌈n·b/w⌉` words.
+
+Slot `s` is bits `s·b … s·b + b − 1` of its word. Bits in no used slot are ignored by readers and zero from writers.
+The *order* `σ` takes a code's index within its word to its slot: `low_first` `σ(e) = e`; `high_first`
+`σ(e) = p − 1 − e`; or a permutation `π` listed by the scheme, slot `s` holding code `π[s]` (AWQ:
+`[0, 2, 4, 6, 1, 3, 5, 7]`). A dense stream is always low first. A slot's bits `r` are the code: `q = r − o` for an
+unsigned code with offset `o`, or `r` as a `b`-bit two's complement integer for a signed one.
+
+**Affine.** `value(i, j) = (q − z(i, j)) × s(i, j)`, `q × s(i, j) + c(i, j)` or `q × s(i, j)`, where `q` is the packed
+code and the scale `s`, zero `z` and bias `c` are parts on one grid. Codes and integer zeros convert to f32 exactly.
+
+**Table.** `value(i, j) = T[q] × s(i, j)`: `T` is a fixed table (an element format's codes, or one in Appendix A) or a
+part, indexed by the code; a code outside `T` refuses the decode.
+
+**Block structs.** A `U8 [lead…, C/n, S]` part of fixed-size structs of `S` bytes, each holding `n` consecutive
+elements of a row in order (`C` a multiple of `n`; the leading extents are the logical shape's). The scheme defines
+each struct's little-endian fields and the formula of its `n` elements, using the blocks above within the struct.
+
+### `fp8.tensorwise`
+
+- Params: `scale_dtype`: `F32`, `BF16` or `F16`, as the producer stored the scale.
+- Parts: `weight`: `F8_E4M3` or `F8_E5M2`, the logical shape. `scale`: `scale_dtype`, one element. `input_scale`
+  (optional).
+- Decode, any shape: `round_L(weight × scale)`.
+
+### `fp8.rowwise`
+
+- Params: `axis`: `0` or `1`.
+- Parts: `weight`: `F8_E4M3` or `F8_E5M2`, the logical shape. `scale`: `F32` on the row grid (`axis: 0`) or the
+  column grid (`axis: 1`).
+- Decode: `round_L(weight[i, j] × s(i, j))`.
+
+### `int8.tensorwise`
+
+- Params, parts and decode as `fp8.tensorwise`, with `weight` `I8`.
+
+### `int8.rowwise`
+
+- Params, parts and decode as `fp8.rowwise`, with `weight` `I8`.
 
 ### `int8.convrot`
 
-`B = 4^k`, `1 ≤ k ≤ 8` (256 in practice), and `C` MUST be a multiple of `B`:
+- Params: `rotation: "hadamard"`; `rotation_size: B`, `B = 4^k`, `1 ≤ k ≤ 8` (256 in practice).
+- Parts: `weight`: `I8`, the logical shape; `C` MUST be a multiple of `B`. `scale`: `F32` on the row grid.
+- Decode: `value[i, gB + j] = round_L((y[i, g, j] × scale[i]) × 2^−k)`, with
+  `y[i, g, ·] = weight[i, gB : gB + B] · H_B`.
 
-`value[i, gB + j] = round_L((y[i, g, j] × scale[i]) × 2^−k)`, with `y[i, g, ·] = weight[i, gB : gB + B] · H_B`
+`H_B = H₄ ⊗ … ⊗ H₄` (`k` factors) with entries ±1, `H₄` as Appendix A.1. `H_B` is symmetric and `H_B · H_B = B · I`, so
+`2^−k · H_B` is the orthonormal rotation ComfyUI's ConvRot applies before quantizing each row. `y` is an exact integer
+(|y| ≤ 128·B ≤ 2^23), so its conversion to f32 is exact. One way to compute it: view each group of `B` as `k` base-4
+digits (most significant first) and apply `H₄` along every digit.
 
-`H_B = H₄ ⊗ … ⊗ H₄` (`k` factors) with entries ±1, where
+### `mxfp8`
 
-```
-H₄ = [[ 1,  1,  1, -1],
-      [ 1,  1, -1,  1],
-      [ 1, -1,  1,  1],
-      [-1,  1,  1,  1]]
-```
-
-`H_B` is symmetric and `H_B · H_B = B · I`, so `2^−k · H_B` is the orthonormal rotation ComfyUI's ConvRot applies before
-quantizing each row. `y` is an exact integer (|y| ≤ 128·B ≤ 2^23), so its conversion to f32 is exact. One way to
-compute it: view each group of `B` as `k` base-4 digits (most significant first) and apply `H₄` along every digit.
-
-### Block scales: `scale_layout`
-
-`scale(i, b)` is row `i`'s scale for block `b`, with `W` blocks per row (`⌈C/32⌉` for `mxfp8`, `C/16` for `nvfp4`):
-- `row_major`: the `scale` part has the logical shape with its last extent replaced by `W` (`[R, W]` for a matrix), and
-  `scale(i, b)` is element `i·W + b`.
-- `cublas_128x4`: cuBLAS's block-scaling layout, as ComfyUI stores it. The `scale` part is
-  `[128·⌈R/128⌉, 4·⌈W/4⌉]`, zero-padded, in tiles of 128 rows × 4 blocks; `scale(i, b)` is element
-  `512·(⌊i/128⌋·⌈W/4⌉ + ⌊b/4⌋) + 16·(i mod 32) + 4·⌊(i mod 128)/32⌋ + (b mod 4)`.
+The OCP Microscaling MXFP8 format: a power-of-two scale per 32 consecutive elements of a row (the last block of a row
+may be short).
+- Params: `block_size: 32`; `scale_layout`: `row_major` or `cublas_128x4` (ComfyUI's).
+- Parts: `weight`: `F8_E4M3` or `F8_E5M2`, the logical shape. `scale`: `F8_E8M0` on row blocks of 32, stored
+  `scale_layout`.
+- Decode: `round_L(weight[i, j] × s(i, j))`.
 
 ### `nvfp4`
 
 NVIDIA's NVFP4: an E2M1 element per weight, an E4M3 scale per 16 consecutive elements of a row, and a per-tensor
 `scale_2`.
-- `nibble_order`: which nibble of a byte holds the even element of each pair. `low_first` is §5's `F4` packing
-  (ModelOpt, compressed-tensors); `high_first` swaps the nibbles of every byte (ComfyUI).
-- `global_scale`: how both per-tensor scales, `scale_2` and `input_scale`, apply: `multiply` (ModelOpt's
-  `weight_scale_2` and `input_scale`, ComfyUI) or `divide` (compressed-tensors' `weight_global_scale` and
-  `input_global_scale`, each the reciprocal).
-- `scale_2` is one element for the whole tensor; a pre-quantization factor (`pre_quant_scale`) is not a part of this
-  scheme (a later minor may add one, rule 3).
-- ModelOpt's `weight` (`uint8 [R, C/2]`), `weight_scale` and `weight_scale_2` are `weight`, `scale` and `scale_2`
-  here; ModelOpt and compressed-tensors write `low_first`, `row_major`; ComfyUI writes `high_first`, `cublas_128x4`.
+- Params: `block_size: 16`; `global_scale`: `multiply` or `divide`; `nibble_order`: `low_first` or `high_first`;
+  `scale_layout`: `row_major` or `cublas_128x4`.
+- Parts: `weight`: `F4`, the logical shape, `C` a multiple of 16; its bytes are 4-bit codes packed `word`-fill in `U8`
+  words along the last axis, `nibble_order` being the order (`low_first` is §5's `F4` packing). `scale`: `F8_E4M3` on
+  row blocks of 16, stored `scale_layout`. `scale_2`: `F32`, one element. `input_scale` (optional).
+- Decode, with `T` the 16 E2M1 values (§5): `multiply`:
+  `round_L((T[q] × s(i, j)) × scale_2)`; `divide`: `round_L(T[q] × (s(i, j) ÷ scale_2))`.
 
-### `mxfp8`
+`global_scale` says how both per-tensor scales, `scale_2` and `input_scale`, apply: multiplied (ModelOpt's
+`weight_scale_2` and `input_scale`, ComfyUI) or divided (compressed-tensors' `weight_global_scale` and
+`input_global_scale`, each the reciprocal). A pre-quantization factor (`pre_quant_scale`) is not a part of this
+scheme (a later minor may add one, rule 3). ModelOpt's `weight` (`uint8 [R, C/2]`), `weight_scale` and
+`weight_scale_2` are `weight`, `scale` and `scale_2` here; ModelOpt and compressed-tensors write `low_first`,
+`row_major`; ComfyUI writes `high_first`, `cublas_128x4`.
 
-The OCP Microscaling MXFP8 format: a power-of-two `F8_E8M0` scale per 32 consecutive elements of a row (the last
-block of a row may be short). ComfyUI stores its scales `cublas_128x4`, others `row_major`.
+<!-- fp8.blockwise, mxfp4 -->
+
+<!-- gguf.* -->
+
+<!-- gptq.*, awq.*, ct.* -->
+
+<!-- bnb.* -->
+
+<!-- comfy.* -->
 
 ### Plain tensors
 
 A plain tensor's bytes are its value; reading it is a copy, whatever its dtype.
+
+### Adding a scheme
+
+A new scheme is a minor version (§8). It ships:
+1. a `### <scheme>` subsection here (params and their values, parts with the producer's role names, dtypes and shapes,
+   the decode in the building blocks' terms), and any fixed table in Appendix A with its SHA-256;
+2. a reference decoder in `tensorfs-core` (`format/decode/<family>.rs`, one row in `SCHEMES`) and in the
+   independent reader (`conformance/schemes/<family>.py`, one row in `FAMILIES`);
+3. conformance vectors mined from the real producer, `conformance/vectors/cases/<family>.json`, with refusals;
+4. encoders (`format/encode/<family>.rs`, one row in `ENCODERS`) and an importer row for its native container.
 
 ## 7. Repo, store and origin
 
@@ -346,3 +422,25 @@ order, generated on the meta device and checked in as data (`crates/tensorfs-cor
   `#`), merged over every instance of that parent; indices ascend;
 - a child the reference does not hold, or every key of a class without a reference, keeps the source's data order
   after the known children, and is reported.
+
+## Appendix A. Fixed tables
+
+A scheme's constants (rule 2). Each table is listed in row-major order with its dtype and shape; its SHA-256 is that
+of its little-endian bytes in that dtype, and a reader MAY check its copy against it.
+
+### A.1 `H₄` (`int8.convrot`)
+
+`I8 [4, 4]`, SHA-256 `8f2b2e629d1df5e0be97981cbf4b4d117c320dfec29a7cd72b2f497dcb680cea`:
+
+```
+[[ 1,  1,  1, -1],
+ [ 1,  1, -1,  1],
+ [ 1, -1,  1,  1],
+ [-1,  1,  1,  1]]
+```
+
+<!-- gguf tables -->
+
+<!-- bnb tables -->
+
+<!-- comfy tables -->

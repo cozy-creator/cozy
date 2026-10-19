@@ -113,7 +113,7 @@ impl Error {
             Error::Mismatch { .. } => Code::OBJECT_ID_MISMATCH,
             Error::Invalid { .. } => Code::UNKNOWN_FORMAT,
             Error::Format(format::Error::UnknownScheme(_)) => Code::UNKNOWN_ENCODING,
-            Error::Format(format::Error::Decode(_)) => Code::ENCODING_MISMATCH,
+            Error::Format(format::Error::Decode(_) | format::Error::Encode(_)) => Code::ENCODING_MISMATCH,
             Error::Format(format::Error::Format { .. } | format::Error::PreCut) => {
                 Code::UNKNOWN_FORMAT
             }
