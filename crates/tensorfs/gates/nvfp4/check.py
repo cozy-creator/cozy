@@ -23,7 +23,7 @@ import urllib.request
 from pathlib import Path
 
 import numpy as np
-from tensorfs import v2
+import tensorfs
 
 PASS, WRONG = 0.15, 0.25
 BAND = 128
@@ -71,7 +71,7 @@ class Lane:
     """A lane: its manifest and header in a scratch store, where the library parses them; its
     chunks are read by range from presigned URLs."""
 
-    def __init__(self, hub: Hub, store: v2.Store, ref: str, lane: str):
+    def __init__(self, hub: Hub, store: tensorfs.Store, ref: str, lane: str):
         page = hub.call("/v1/tensorfs/closure", {"ref": ref, "lane": lane})
         self.hub, self.store, self.root = hub, store, Path(store.root)
         self.manifest = page["manifest"]
@@ -83,7 +83,7 @@ class Lane:
             sys.exit(f"{self.name}: manifest {self.manifest['sha256']} is not tensorfs.manifest/1")
         self.whole(doc["files"]["model.cozytensors"])
         self.ck = store.checkpoint(f"sha256:{self.manifest['sha256']}")
-        self.chunks = [(Path(path).name, length) for path, length in self.ck.chunks]
+        self.chunks = self.ck.chunks
 
     def presign(self, digests) -> None:
         missing = sorted({d for d in digests if d not in self.urls})
@@ -102,7 +102,7 @@ class Lane:
         path.write_bytes(data)
         return data
 
-    def spans(self, part: v2.Part, start: int, length: int):
+    def spans(self, part: tensorfs.Part, start: int, length: int):
         """Where bytes [start, start + length) of `part` live: it runs on into later chunks."""
         chunk, offset = part.chunk, part.offset + start
         while offset >= self.chunks[chunk][1]:
@@ -114,7 +114,7 @@ class Lane:
             yield digest, offset, n
             chunk, offset, length = chunk + 1, 0, length - n
 
-    def read(self, part: v2.Part, start: int = 0, length: int | None = None) -> bytes:
+    def read(self, part: tensorfs.Part, start: int = 0, length: int | None = None) -> bytes:
         length = part.length - start if length is None else length
         spans = list(self.spans(part, start, length))
         self.presign(d for d, _, _ in spans)
@@ -128,7 +128,7 @@ def band(shape) -> tuple[int, int, int]:
     return start, min(BAND, rows), int(shape[-1])
 
 
-def nvfp4_band(lane: Lane, info: v2.Info) -> tuple[dict, list[int]]:
+def nvfp4_band(lane: Lane, info: tensorfs.Info) -> tuple[dict, list[int]]:
     """The band's parts, a valid nvfp4 tensor of their own: weight rows, their block scales
     (row-major rows, or the 128-row band of cuBLAS tiles), and `scale_2`."""
     start, rows, cols = band(info.shape)
@@ -155,7 +155,7 @@ def floats(dtype: str, data: bytes) -> np.ndarray:
     return np.frombuffer(data, {"F16": "<f2", "F32": "<f4"}[dtype]).astype(np.float64)
 
 
-def check(hub: Hub, store: v2.Store, ref: str, lane: str, reference: str, samples: int) -> tuple[str, list]:
+def check(hub: Hub, store: tensorfs.Store, ref: str, lane: str, reference: str, samples: int) -> tuple[str, list]:
     q, r = Lane(hub, store, ref, lane), Lane(hub, store, ref, reference)
     found = [
         (c, k, info)
@@ -205,7 +205,7 @@ def main() -> int:
     report, failed = [], False
     try:
         for ref in args.refs:
-            store = v2.Store(work / ref.replace("/", "_").replace("@", "_"))
+            store = tensorfs.Store(work / ref.replace("/", "_").replace("@", "_"))
             title, results = check(hub, store, ref, args.lane, args.reference_lane, args.samples)
             errors = [rel for _, rel, _ in results if rel is not None]
             median = statistics.median(errors) if errors else None

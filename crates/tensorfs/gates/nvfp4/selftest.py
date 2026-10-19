@@ -15,7 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import numpy as np
-from tensorfs import v2
+import tensorfs
 
 E2M1 = np.array([0, 0.5, 1, 1.5, 2, 3, 4, 6])
 E4M3 = np.array([m * 2.0**-9 if c >> 3 == 0 else (1 + m / 8) * 2.0 ** ((c >> 3) - 7) for c in range(127) for m in [c & 7]])
@@ -124,7 +124,7 @@ def serve(store, lanes):
 
 def main():
     with tempfile.TemporaryDirectory() as tmp:
-        store = v2.Store(Path(tmp) / "hub")
+        store = tensorfs.Store(Path(tmp) / "hub")
         server = serve(store, lanes(store))
         url = f"http://127.0.0.1:{server.server_port}"
         check = Path(__file__).with_name("check.py")
