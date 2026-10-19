@@ -96,7 +96,10 @@ fn submission(run: &Run, item: &OutputItem, machine: String, destination: &Repo)
         },
         None => ModelChoice {
             parameter: item.name.clone(),
-            manifest: item.sha256.expect("a final legacy output carries its digest").to_string(),
+            manifest: item
+                .sha256
+                .expect("a final legacy output carries its digest")
+                .to_string(),
             manifest_length: item.length,
             ..Default::default()
         },
@@ -220,15 +223,20 @@ mod tests {
         assert_eq!(sent.on, On::Machine("original-machine".into()));
         assert_eq!(sent.spec.kind, v1::RunKind::Warm);
         let choice = &sent.spec.models[0];
-        assert_eq!((&choice.repository, &choice.manifest, &choice.lane),
-            (&reference.repo_id, &reference.revision, &reference.variant));
+        assert_eq!(
+            (&choice.repository, &choice.manifest, &choice.lane),
+            (&reference.repo_id, &reference.revision, &reference.variant)
+        );
         assert!(choice.release.is_empty());
         assert_eq!(choice.manifest_length, 0);
         assert!(sent.spec.source.is_none());
         let mut legacy = run(&[("old", CHECKPOINT, true)]).output.remove(0);
         legacy.name = "old".into();
         held.output.push(legacy);
-        assert_eq!(weights(&held, None).unwrap_err().code, "run_output_ambiguous");
+        assert_eq!(
+            weights(&held, None).unwrap_err().code,
+            "run_output_ambiguous"
+        );
         assert!(weights(&held, Some("old")).unwrap().checkpoint.is_none());
     }
 }

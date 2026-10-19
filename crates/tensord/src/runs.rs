@@ -484,7 +484,7 @@ impl Runs {
                         false => refused("upload_failed", error.to_string()),
                     })?;
                     row["published"] = json!({"destination": destination, "tree": tree.id(),
-                        "checkpoint": header.id(), "converged": uploaded.sent == 0});
+                        "checkpoint": header.id(), "converged": uploaded.converged});
                     models.push(row);
                     continue;
                 }
