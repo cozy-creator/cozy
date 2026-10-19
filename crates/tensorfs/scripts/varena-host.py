@@ -15,11 +15,12 @@ import sys
 import tempfile
 from pathlib import Path
 
-from tensorfs import v2, varena
+import tensorfs
+from tensorfs import varena
 
 
 def main(root: Path) -> None:
-    store = v2.Store(root)
+    store = tensorfs.Store(root)
     w = store.writer()
     want: dict[str, bytes] = {}
     for b in range(3):
@@ -28,7 +29,7 @@ def main(root: Path) -> None:
             w.put("unet", f"blocks.{b}.p{p}", "U8", [len(data)], data)
             want[f"blocks.{b}.p{p}"] = data
     ck = store.checkpoint(w.commit())
-    rs = v2.regions(ck, 1 << 20, [f"unet/blocks.{b}" for b in range(3)])
+    rs = tensorfs.regions(ck, 1 << 20, [f"unet/blocks.{b}" for b in range(3)])
     def grant() -> list[tuple[str, int, int]]:
         return [(Path(p).name, n, os.open(p, os.O_RDONLY)) for p, n in ck.chunks]
 

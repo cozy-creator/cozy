@@ -14,8 +14,7 @@ name and parameter for parameter.
 
 from collections.abc import Sequence
 
-from .._ext import ReadLease, ReadPlan, Store
-from ..v2 import Checkpoint
+from .._ext import Checkpoint
 
 class VarenaError(Exception):
     code: str
@@ -179,7 +178,7 @@ class Pinned:
 
 class WeightSet:
     """A checkpoint's regions on one GPU (or the host). The regions are
-    `tensorfs.v2.regions(ck, max_bytes, boundaries)`."""
+    `tensorfs.regions(ck, max_bytes, boundaries)`."""
 
     @property
     def name(self) -> str: ...
@@ -238,7 +237,7 @@ class Gpu:
         host_fd: int | None = None,
         files: Sequence[tuple[str, int, int]] | None = None,
     ) -> WeightSet:
-        """`regions`: `tensorfs.v2.regions(ck, max_bytes, boundaries)`, every part of the
+        """`regions`: `tensorfs.regions(ck, max_bytes, boundaries)`, every part of the
         components they name. `host_fd`: a sealed host layout of exactly these regions, filled
         by the owner (TensorD) with the same layout function (`seal()` here, Rust
         `varena::memory::open_checkpoint` + `host::open_sealed`). Its digest is checked; a
@@ -285,19 +284,6 @@ def release_tier(hold: int) -> int:
     """End a `hold_tier` claim (closes `hold`). Punches every Ready region nobody claims and
     returns the bytes punched."""
 
-def fill_sealed(
-    store: Store,
-    lease: ReadLease,
-    plan: ReadPlan,
-    regions: Sequence[Sequence[str]],
-    name: str,
-    threads: int = 8,
-    reserved: int | None = None,
-    staged: Sequence[int] | None = None,
-) -> tuple[int, dict[str, int]]:
-    """A v1 read plan's sealed host layout, filled through verified reads; CONSUMES `lease`.
-    Returns the memfd and each read mode's bytes."""
-
 def seal(
     ck: Checkpoint,
     regions: Sequence[Sequence[str]],
@@ -309,9 +295,6 @@ def seal(
     chunk files (`files`, as in `register`, else the checkpoint's own paths). The result is what
     `register(host_fd=)` adopts, the same layout by construction; deposit it with TensorD as an
     opaque fd. Returns the memfd (the caller's)."""
-
-def reserve(name: str, nbytes: int, threads: int = 8) -> int:
-    """A memfd of `nbytes` whose pages are allocated now. `fill_sealed(reserved=)` consumes it."""
 
 # ------------------------------------------------------------ the per-GPU ledger (§5.6)
 # One memfd table per GPU, one row per process holding bytes on it. A row's lock dies with its

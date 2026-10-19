@@ -6,9 +6,6 @@ host memory where there is no GPU. `Ledger` is the per-GPU table every process's
 The host tier functions are the machine's (TensorD's) half.
 """
 
-from typing import TYPE_CHECKING
-
-from .._ext import STORE as _STORE
 from .._ext.varena import (
     Closed,
     Counters,
@@ -28,14 +25,9 @@ from .._ext.varena import (
     WeightSet,
     hold_tier,
     release_tier,
-    reserve,
+    seal,
 )
 from .._ext.varena import Admit, Ledger, LedgerError, Row, RowFacts, Victim
-
-# Checkpoint-backed sets and owner-side fills need the native store feature, enabled in every
-# supported Python wheel.
-if TYPE_CHECKING or _STORE:
-    from .._ext.varena import fill_sealed, seal
 
 __all__ = [
     "Closed",
@@ -56,8 +48,6 @@ __all__ = [
     "WeightSet",
     "hold_tier",
     "release_tier",
-    "reserve",
+    "seal",
 ]
 __all__ += ["Admit", "Ledger", "LedgerError", "Row", "RowFacts", "Victim"]
-if _STORE:
-    __all__ += ["fill_sealed", "seal"]
