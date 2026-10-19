@@ -31,6 +31,7 @@ from diffusers import StableDiffusionXLPipeline
 from huggingface_hub import HfApi, hf_hub_download, snapshot_download
 
 import tensorfs as tfs
+from tensorfs import varena
 
 REPO = "hf-internal-testing/tiny-sdxl-pipe"
 #: Sources whose export keeps every file and imports as a fixed point, and their variant.
@@ -191,7 +192,7 @@ def main() -> None:
     want_np = upstream.unet.state_dict()["conv_in.weight"].numpy()
     assert np.array_equal(np.from_dlpack(conv), want_np), "numpy reads it too"
     assert conv.tobytes() == want_np.tobytes()
-    grouped = tfs.regions(ck, 1 << 20)
+    grouped = varena.regions(ck, 1 << 20)
     names = [n for r in grouped for n in r]
     assert sorted(names) == sorted(f"{c}/{k}" for c, component in ck.components.items() for k in component.tensors), "every tensor in one region"
     print(f"Python: {compared} tensors equal upstream's through DLPack; {len(grouped)} regions")

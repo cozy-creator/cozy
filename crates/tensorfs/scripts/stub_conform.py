@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import importlib.util
 import inspect
 import pathlib
 import sys
@@ -398,9 +399,11 @@ def check_error_families(ext: Any) -> list[str]:
     import tensorfs
 
     faults = []
-    for obsolete in ("Refusal", "CODES"):
+    for obsolete in ("Refusal", "CODES", "Closure", "ReadPlan", "parse_header", "plan", "regions"):
         if hasattr(ext, obsolete) or hasattr(tensorfs, obsolete):
-            faults.append(f"{obsolete}: legacy refusal surface remains exported")
+            faults.append(f"{obsolete}: removed legacy surface remains exported")
+    if importlib.util.find_spec("tensorfs.records") is not None:
+        faults.append("tensorfs.records: removed legacy header projection remains importable")
     expected = {"invalid", "format", "not_found", "integrity", "unknown_scheme", "decode",
                 "io", "full", "network", "denied", "unsupported", "conflict"}
     live = {name: getattr(ext, name) for name in dir(ext)
@@ -412,14 +415,14 @@ def check_error_families(ext: Any) -> list[str]:
         if getattr(tensorfs, name, None) is not cls:
             faults.append(f"tensorfs.{name} does not re-export its native error family")
     try:
-        ext.parse_header(b"not a header")
+        ext.Checkpoint.parse(b"not a header")
     except ext.Error as error:
-        if error.code not in expected or not isinstance(error.detail, str):
-            faults.append("parse_header did not preserve its common typed failure")
+        if error.code != "invalid" or not isinstance(error.detail, str):
+            faults.append("Checkpoint.parse did not preserve its common typed failure")
     except Exception as error:
-        faults.append(f"parse_header escaped the common Error boundary: {type(error).__name__}")
+        faults.append(f"Checkpoint.parse escaped the common Error boundary: {type(error).__name__}")
     else:
-        faults.append("parse_header accepted invalid CBOR")
+        faults.append("Checkpoint.parse accepted invalid CBOR")
     return faults
 
 

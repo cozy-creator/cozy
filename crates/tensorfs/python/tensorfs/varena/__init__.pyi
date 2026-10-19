@@ -17,6 +17,16 @@ from typing import Literal
 
 from .._ext import Checkpoint
 
+def regions(
+    ck: Checkpoint,
+    max_bytes: int = ...,
+    boundaries: Sequence[str] | None = None,
+    only: Sequence[str] | None = None,
+) -> list[list[str]]:
+    """`<component>/<key>` regions: chunk-sharing tensors together, up to `max_bytes` each, never
+    across a `<component>/<key prefix>` boundary (a block) unless a shared chunk does. `only`
+    (blocks or tensors, in the same form) limits the result to them and tensors sharing their chunks."""
+
 class VarenaError(Exception):
     code: str
 
@@ -179,7 +189,7 @@ class Pinned:
 
 class WeightSet:
     """A checkpoint's regions on one GPU (or the host). The regions are
-    `tensorfs.regions(ck, max_bytes, boundaries)`."""
+    `tensorfs.varena.regions(ck, max_bytes, boundaries)`."""
 
     @property
     def name(self) -> str: ...
@@ -257,7 +267,7 @@ class Gpu:
         host_fd: int | None = None,
         files: Sequence[tuple[str, int, int]] | None = None,
     ) -> WeightSet:
-        """`regions`: `tensorfs.regions(ck, max_bytes, boundaries, only)`; the set is the parts
+        """`regions`: `tensorfs.varena.regions(ck, max_bytes, boundaries, only)`; the set is the parts
         they name and nothing else of the checkpoint. `host_fd`: a sealed host layout of exactly
         these regions, filled by the owner (TensorD) with the same layout function (`seal()`
         here, Rust `varena::memory::open_checkpoint` + `host::open_sealed`). Its digest is

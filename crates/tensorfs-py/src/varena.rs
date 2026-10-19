@@ -803,6 +803,8 @@ pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
         VarenaError, DeviceFull, CudaError, CudaUnavailable, Invalid, IoError, Closed, Unsupported, LedgerError);
     #[cfg(feature = "store")]
     add!(; seal;);
+    #[cfg(feature = "store")]
+    m.add_function(wrap_pyfunction!(crate::store::regions, &m)?)?;
     parent.add_submodule(&m)?;
     py.import("sys")?.getattr("modules")?.set_item("tensorfs._ext.varena", &m)
 }
