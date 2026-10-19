@@ -9,6 +9,8 @@ import ctypes
 import gc
 import json
 import os
+import select
+import signal
 import sys
 import tempfile
 import time
@@ -100,10 +102,39 @@ if pid == 0:
     os._exit(0 if result["ok"] else 1)
 os.close(write_fd)
 chunks = []
-while data := os.read(read_fd, 8192):
-    chunks.append(data)
-os.close(read_fd)
-_, status = os.waitpid(pid, 0)
+status = None
+deadline = time.monotonic() + 60
+try:
+    os.set_blocking(read_fd, False)
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not select.select([read_fd], [], [], remaining)[0]:
+            raise TimeoutError("the owned CUDA child did not finish its cleanup proof within 60 seconds")
+        data = os.read(read_fd, 8192)
+        if not data:
+            break
+        chunks.append(data)
+    while status is None:
+        ended, result = os.waitpid(pid, os.WNOHANG)
+        if ended == pid:
+            status = result
+        elif time.monotonic() >= deadline:
+            raise TimeoutError("the owned CUDA child wrote its proof but did not exit")
+        else:
+            time.sleep(0.01)
+finally:
+    os.close(read_fd)
+    if status is None:
+        # This exact PID is the child created above; never signal another process. Reap
+        # it before this parent exits. The paid-worker wrapper also bounds the process
+        # group in case a broken kernel/driver cannot complete SIGKILL teardown.
+        try:
+            ended, _ = os.waitpid(pid, os.WNOHANG)
+            if ended == 0:
+                os.kill(pid, signal.SIGKILL)
+                os.waitpid(pid, 0)
+        except ChildProcessError:
+            pass
 result = json.loads(b"".join(chunks))
 assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0 and result["ok"], result
 print(f"CUDA fork cleanup: CPU-only parent import, child allocation/capsule release recovered {result['recovered_bytes']} bytes")
