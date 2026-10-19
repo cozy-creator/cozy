@@ -287,6 +287,7 @@ def environment(cache_dir, work):
                               capture_output=True, text=True, check=True).stdout.strip()
     volume = subprocess.run(["df", "-T", str(work)], capture_output=True, text=True, check=True).stdout.strip()
     return {"gpu": torch.cuda.get_device_name(0), "gpu_identity": identity, "volume": volume,
+            "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"), "cuda_ordinal": 0,
             "torch": str(torch.__version__), "cuda": torch.version.cuda,
             "versions": {name: importlib.metadata.version(name) for name in ("tensorfs", "safetensors", "fastsafetensors")},
             "extension_sha256": digest(tensorfs._ext.__file__), "harness_sha256": digest(__file__),
