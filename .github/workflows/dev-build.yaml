@@ -11,9 +11,10 @@ name: dev-build
 # (TENSORFS_TEST_PYTHON) and its wheel (COZY_TEST_TENSORFS_WHEEL) when it was built, and a Runtime
 # wheel (COZY_TEST_RUNTIME_WHEEL): the newest published one, or runtime_ref's, stamped with its commit.
 # Machines the tests start install that pair. No whole-suite default: `test` is empty unless given.
+# ci.yaml calls it on every PR and master push.
 on:
-  workflow_dispatch:
-    inputs:
+  workflow_call:
+    inputs: &inputs
       ref:
         description: Branch, tag or SHA to build
         type: string
@@ -42,6 +43,8 @@ on:
         description: Caller's id, shown in the run name so the caller can find its run
         type: string
         default: ''
+  workflow_dispatch:
+    inputs: *inputs
 run-name: dev-build ${{ inputs.ref }} ${{ inputs.build }} ${{ inputs.runtime_ref }} ${{ inputs.nonce }}
 
 permissions:
