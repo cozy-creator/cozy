@@ -142,7 +142,8 @@ pub(crate) async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
             let mut audit = json!({"model": repo.to_string(), "hub": hub.origin.to_string(), "old": manifest,
                 "rows": named.iter().map(|r| json!({"release": r.release, "lane": r.lane, "revision": r.revision,
                     "yanked": r.yanked})).collect::<Vec<_>>(),
-                "run": ran.number, "machine": ran.machine, "migration": model["migrated"], "repointed": []});
+                "run": ran.number, "machine": ran.machine, "migration": model["migrated"],
+                "fetched_bytes": model["fetched_bytes"], "repointed": []});
             match made {
                 Some(made) => {
                     audit["new"] = made.into();

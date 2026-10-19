@@ -80,6 +80,22 @@ pub fn lane(src: &v1::Source, store: Option<&Store>, lane: &v1::Lane, dry_run: b
     r
 }
 
+/// The old objects a migration of `h` reads: the parts it repacks and the segments of assets it
+/// joins. Large parts on the old grid and whole files are reused by digest, unread.
+pub fn reads(h: &v1::Header) -> Vec<ObjectRef> {
+    let mut out: Vec<ObjectRef> = (h.components.iter().flat_map(|c| &c.1).flat_map(|t| &t.parts))
+        .filter(|p| reusable(p).is_none())
+        .flat_map(|p| match &p.body {
+            v1::Body::Objects(objects) => objects.clone(),
+            v1::Body::Inline(_) => vec![],
+        })
+        .collect();
+    out.extend((h.assets.iter()).filter(|a| a.segments != [a.object.clone()]).flat_map(|a| a.segments.clone()));
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// What [`adopt`] moved into a store, in objects and bytes.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Adopted {

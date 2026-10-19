@@ -1,7 +1,7 @@
 //! A checkpoint put in a Hub repository's custody (the Hub's incremental publication): its
 //! closure (manifest, files, header, chunks) is declared under one idempotent operation, only the
 //! objects the Hub lacks are PUT to their presigned final keys and verified, and the publication
-//! is finalized. The Hub's finalization job is the commit's only authority, so the call follows it
+//! is finalized. Only those need be here. The Hub's finalization job is the commit's only authority, so the call follows it
 //! to its end. A checkpoint the repository already holds converges with no transfer.
 //!
 //! U11: the Hub's finalize decodes the manifest and header itself to check this closure, with
@@ -298,11 +298,6 @@ impl Catalog {
             .into_iter()
             .map(|o| (id(&o), o))
             .collect();
-        for object in objects.values() {
-            if !p.store.reuse(object).map_err(|e| e.refusal())? {
-                return refuse(Code::OBJECT_ABSENT, format!("{} of {checkpoint} is not here", id(object)));
-            }
-        }
         let total: u64 = objects.values().map(|o| o.length).sum();
 
         // A repository that already holds this checkpoint converges with no transfer.
@@ -328,6 +323,13 @@ impl Catalog {
             }
             if !matches!(row.state.as_str(), "accepted" | "verifying") {
                 pending.push(row.object_id.clone());
+            }
+        }
+        // Only what the Hub lacks must be here: what it holds (large parts other checkpoints
+        // share) is neither read nor sent.
+        for id in &pending {
+            if !p.store.reuse(&objects[id]).map_err(|e| e.refusal())? {
+                return refuse(Code::OBJECT_ABSENT, format!("{id} of {checkpoint} is not here"));
             }
         }
         let landed = Mutex::new(total - pending.iter().map(|id| objects[id].length).sum::<u64>());
