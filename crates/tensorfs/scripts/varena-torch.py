@@ -143,9 +143,9 @@ def main() -> int:
     steps = r.stats.steps
     check("cold and warm passes equal the reference", same)
     check(
-        "the first pass copies the model home",
-        steps[0].paged_in >= model.nbytes - model.common.nbytes,
-        str(steps),
+        "the model is home after its load and first pass",
+        resident(model.name) >= model.nbytes,
+        f"{resident(model.name)} < {model.nbytes}",
     )
     check(
         "the warm pass copies nothing",
@@ -329,6 +329,7 @@ def main() -> int:
         net(x), net2(x)
     before = resident(model.name), resident(model2.name)
     with mem.request("rung2"):
+        mem._idle()  # rung 1's bytes first: torch's slack and the core's idle chunks
         fill_up = torch.cuda.mem_get_info(0)[0] + block
         junk = torch.empty(fill_up, dtype=torch.uint8, device=dev)
         after = resident(model.name), resident(model2.name)

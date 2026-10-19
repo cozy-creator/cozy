@@ -1163,10 +1163,13 @@ class Memory:
             for name, passes in request.passes.items():
                 if (ran := self.models.get(name)) is not None:
                     ran.repeats = passes
-            if not self.active:  # each model's reserve is what this request measured
+            if not self.active:  # reserves are what it measured; watermarks rise, nothing copies
                 for model in self.models.values():
                     if model.peak:
                         model.reserve, model.peak = model.peak, 0
+                    if self.cuda and not model.host and len(model.home) < len(model.blocks):
+                        model.home = set(model.order)
+                        model.ws.home(_home_regions(model))
             self._advance()
         self._running()
         self._publish()
