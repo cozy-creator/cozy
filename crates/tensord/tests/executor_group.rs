@@ -88,7 +88,7 @@ fn start(
         call_interfaces: vec![],
         constructions: Vec::new(),
         ledgers: 0,
-        memory_mode: "shared",
+        memory_mode: tensord::device_executor::MemoryMode::Shared,
     }
 }
 
@@ -243,7 +243,7 @@ fn a_forked_rank_zero_takes_the_group_seal_and_spawns_its_follower() {
                 call_interfaces: vec![],
                 constructions: Vec::new(),
                 ledgers: 0,
-                memory_mode: "shared",
+                memory_mode: tensord::device_executor::MemoryMode::Shared,
             },
             &mut Baseline,
         )
@@ -300,7 +300,7 @@ fn a_forked_rank_zero_takes_the_group_seal_and_spawns_its_follower() {
                 call_interfaces: vec![],
                 constructions: Vec::new(),
                 ledgers: 0,
-                memory_mode: "shared",
+                memory_mode: tensord::device_executor::MemoryMode::Shared,
             },
             &mut Baseline,
         )
