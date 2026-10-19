@@ -16,11 +16,10 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
-use hyper::HeaderMap;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::net::Client;
+use super::net::{Client, HeaderMap};
 use super::origin::{split_name, Location, Origin};
 use crate::err::{refuse, Code, Refusal, Result};
 use crate::format::ObjectRef;
