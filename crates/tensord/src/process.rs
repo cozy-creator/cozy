@@ -126,7 +126,30 @@ pub enum Meter {
     Burn,
     /// Frames of the running invocation; a canceled one must stop within its pace's patience.
     Frames,
+    /// A GPU invocation's work, judged while it runs: its frames, the bytes its group moved and
+    /// its GPUs' kernels and copies. Never CPU, which a spin burns (runs 11818, 11822).
+    Work,
 }
+
+/// GPU work seen so far (a count of busy readings); None while it cannot be read, which judges
+/// nothing.
+pub type Activity = Arc<dyn Fn() -> Option<u64> + Send + Sync>;
+
+/// The bytes the leader and its group members moved (`meter`'s second part).
+fn group_moved(leader: &Birth) -> Option<u64> {
+    let moved = |pid| meter(pid).map(|(_, moved)| moved);
+    Some(group_members(leader).iter().filter_map(|member| moved(member.pid)).fold(moved(leader.pid)?, u64::saturating_add))
+}
+
+/// A measured wedge's verdict, as the error of the command it ended.
+#[derive(Debug)]
+pub struct Wedged(pub String);
+impl std::fmt::Display for Wedged {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+impl std::error::Error for Wedged {}
 
 #[derive(Default)]
 struct WatchState {
@@ -147,6 +170,7 @@ pub type Waits = Arc<dyn Fn() -> bool + Send + Sync>;
 pub struct Watch {
     meter: Meter,
     waits: Option<Waits>,
+    activity: Option<Activity>,
     state: Mutex<WatchState>,
     changed: Condvar,
 }
@@ -155,7 +179,7 @@ impl Watch {
         let floor = liveness.floor();
         // Frame gaps teach only the frame meter; CPU-plus-bytes starts its own pace.
         let mut pace = match self.meter {
-            Meter::Frames => Pace::seeded(worst_gap),
+            Meter::Frames | Meter::Work => Pace::seeded(worst_gap),
             Meter::Burn => Pace::default(),
         };
         let mut state = self.state.lock().unwrap();
@@ -180,14 +204,18 @@ impl Watch {
             let reading = match self.meter {
                 Meter::Burn => group_burn(exact.birth()),
                 Meter::Frames => Some(state.frames),
+                Meter::Work => self.activity.as_ref().and_then(|activity| activity())
+                    .map(|gpu| gpu + state.frames + group_moved(exact.birth()).unwrap_or(0)),
             };
             pace.observe(reading, now);
-            if state.serving || self.waits.as_ref().is_some_and(|waits| waits()) {
+            let unread = self.meter == Meter::Work && reading.is_none();
+            if unread || state.serving || self.waits.as_ref().is_some_and(|waits| waits()) {
                 pace.excuse(now);
             }
             state.worst_gap = pace.worst_pause;
-            // Frames are judged only after a cancel (above); CPU and bytes always.
-            if let (Meter::Burn, Some(since)) = (self.meter, pace.still_since()) {
+            // Frames alone are judged only after a cancel (above); CPU and bytes, and a GPU
+            // call's work, always.
+            if let (Meter::Burn | Meter::Work, Some(since)) = (self.meter, pace.still_since()) {
                 let still = now - since;
                 if still > pace.patience(floor) {
                     let verdict = format!("wedged during {what}: {}", pace.verdict(still, floor));
@@ -227,11 +255,13 @@ impl Watching {
         liveness: Liveness,
         worst_gap: Duration,
         waits: Option<Waits>,
+        activity: Option<Activity>,
         what: &'static str,
     ) -> io::Result<Self> {
         let watch = Arc::new(Watch {
             meter,
             waits,
+            activity,
             state: Mutex::new(WatchState::default()),
             changed: Condvar::new(),
         });
@@ -489,6 +519,41 @@ mod tests {
         assert!(group_members(&birth).is_empty());
     }
 
+    /// A GPU call is judged while it runs on its work, never its CPU: one spinning with no
+    /// frames, no bytes and idle GPUs is killed (runs 11818, 11822); one that moves bytes or
+    /// whose GPUs work is not, nor one whose GPUs cannot be read.
+    #[cfg(unix)]
+    #[test]
+    fn a_gpu_call_spinning_without_work_is_killed_and_working_ones_are_not() {
+        let cases: [(&str, &str, Option<Activity>, bool); 4] = [
+            ("spins", "while :; do :; done", Some(Arc::new(|| Some(0))), true),
+            ("moves bytes", "while :; do echo work; done > /dev/null", Some(Arc::new(|| Some(0))), false),
+            ("GPU works", "while :; do :; done", {
+                let busy = std::sync::atomic::AtomicU64::new(0);
+                Some(Arc::new(move || Some(busy.fetch_add(1, std::sync::atomic::Ordering::Relaxed))))
+            }, false),
+            ("GPU unread", "while :; do :; done", Some(Arc::new(|| None)), false),
+        ];
+        for (case, script, activity, killed) in cases {
+            let mut child = Command::new("/bin/sh").args(["-c", script]).process_group(0).stdin(Stdio::null()).spawn().unwrap();
+            let birth = Birth::of(child.id()).unwrap();
+            let exact = Exact::open(&birth).unwrap().unwrap();
+            let liveness = Liveness { sample: Duration::from_millis(20) };
+            let watching = Watching::start(exact, Meter::Work, liveness, Duration::ZERO, None, activity, "invoke").unwrap();
+            // Long past the floor (0.12 s): only measured stillness ends it.
+            std::thread::sleep(liveness.floor() * 25);
+            assert_eq!(birth.ended().unwrap(), killed, "{case}");
+            let verdict = watching.finish().0;
+            assert_eq!(verdict.is_some(), killed, "{case}: {verdict:?}");
+            if killed {
+                assert!(verdict.unwrap().contains("wedged during invoke: no measurable progress"), "{case}");
+            } else {
+                let _ = child.kill();
+            }
+            let _ = child.wait();
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_subject_waiting_on_watched_work_is_still_only_once_that_work_ends() {
@@ -514,6 +579,7 @@ mod tests {
             Some(Arc::new(move || {
                 waits.load(std::sync::atomic::Ordering::Acquire)
             })),
+            None,
             "run_job",
         )
         .unwrap();
@@ -545,7 +611,7 @@ mod tests {
             let liveness = Liveness { sample: Duration::from_millis(20) };
             let waits: Option<Waits> = (excuse == "waits").then(|| Arc::new(|| true) as Waits);
             let meter = if excuse == "waits" { Meter::Burn } else { Meter::Frames };
-            let watching = Watching::start(exact, meter, liveness, Duration::ZERO, waits, "invoke").unwrap();
+            let watching = Watching::start(exact, meter, liveness, Duration::ZERO, waits, None, "invoke").unwrap();
             let watch = watching.watch();
             watch.serving(excuse == "serving");
             let busy = Arc::new(std::sync::atomic::AtomicBool::new(true));
