@@ -31,7 +31,7 @@ def main(root: Path) -> None:
     ck = store.checkpoint(w.commit())
     rs = tensorfs.regions(ck, 1 << 20, [f"unet/blocks.{b}" for b in range(3)])
     def grant() -> list[tuple[str, int, int]]:
-        return [(Path(p).name, n, os.open(p, os.O_RDONLY)) for p, n in ck.chunks]
+        return [(sha, n, os.open(p, os.O_RDONLY)) for (sha, n), p in zip(ck.chunks, ck.chunk_paths, strict=True)]
 
     sealed_from = grant()
     fd = varena.seal(ck, rs, "host-smoke", files=sealed_from)
