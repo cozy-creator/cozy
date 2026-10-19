@@ -196,6 +196,13 @@ async fn concurrent_writers_all_land_and_wrong_bytes_never_do() {
     assert_eq!(wrong.code, Code::OBJECT_ID_MISMATCH, "{wrong}");
     assert!(!endpoint.has(&claimed).await.unwrap());
 
+    // Raw bytes, for documents of another layout: a stale ETag is refused, the current one lands.
+    let Fresh::Doc(bytes, etag) = endpoint.repo_bytes("acme/many", None).await.unwrap() else { panic!("present") };
+    assert!(!endpoint.put_repo_bytes("acme/many", b"{}".to_vec(), Some("\"sha256:stale\"")).await.unwrap());
+    assert!(!endpoint.put_repo_bytes("acme/many", b"{}".to_vec(), None).await.unwrap(), "a create finds it there");
+    assert!(endpoint.put_repo_bytes("acme/many", bytes.clone(), Some(&etag)).await.unwrap());
+
     let deleted = endpoint.update_repo("acme/many", |_| Ok(None)).await.unwrap();
-    assert!(deleted.checkpoints.is_empty() && endpoint.repo("acme/many").await.unwrap().is_none());
+    assert_eq!(endpoint.repo("acme/many").await.unwrap().unwrap().0, deleted);
+    assert!(deleted.releases.is_empty() && deleted.checkpoints.is_empty(), "deleting is a document of nothing");
 }

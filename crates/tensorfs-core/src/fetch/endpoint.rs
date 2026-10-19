@@ -13,7 +13,7 @@
 //!   doubling wait, until nothing has moved for the Fetcher's stall rule.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
@@ -61,10 +61,10 @@ enum At {
 
 /// A repo document as read: unchanged since the ETag asked with, absent, or it and its ETag.
 #[derive(Debug, Clone, PartialEq)]
-pub enum Fresh {
+pub enum Fresh<T = Repo> {
     Unchanged,
     Absent,
-    Repo(Repo, String),
+    Doc(T, String),
 }
 
 /// An object's bytes for an upload.
@@ -138,13 +138,28 @@ impl Endpoint {
     /// The repo document `name` and its ETag; `None` when there is none.
     pub async fn repo(&self, name: &str) -> Result<Option<(Repo, String)>> {
         Ok(match self.repo_since(name, None).await? {
-            Fresh::Repo(repo, etag) => Some((repo, etag)),
+            Fresh::Doc(repo, etag) => Some((repo, etag)),
             _ => None,
         })
     }
 
     /// The repo document `name`, or `Unchanged` while it still has ETag `etag`.
     pub async fn repo_since(&self, name: &str, etag: Option<&str>) -> Result<Fresh> {
+        let (bytes, etag) = match self.repo_bytes(name, etag).await? {
+            Fresh::Doc(bytes, etag) => (bytes, etag),
+            Fresh::Unchanged => return Ok(Fresh::Unchanged),
+            Fresh::Absent => return Ok(Fresh::Absent),
+        };
+        let what = format!("{}/{}", self.url, repo_key(name));
+        let repo = Repo::from_json(&bytes).map_err(|e| Refusal { code: Code::UNKNOWN_FORMAT, detail: format!("{what}: {e}") })?;
+        match repo.name.eq_ignore_ascii_case(name) {
+            true => Ok(Fresh::Doc(repo, etag)),
+            false => refuse(Code::UNKNOWN_FORMAT, format!("{what} names {:?}", repo.name)),
+        }
+    }
+
+    /// The repo document `name` as its bytes, unparsed, or `Unchanged` while it has ETag `etag`.
+    pub async fn repo_bytes(&self, name: &str, etag: Option<&str>) -> Result<Fresh<Vec<u8>>> {
         split_name(name)?;
         let key = repo_key(name);
         let (bytes, tag) = match &self.at {
@@ -171,53 +186,52 @@ impl Endpoint {
                 }
             }
         };
-        if etag == Some(tag.as_str()) {
-            return Ok(Fresh::Unchanged);
-        }
-        let repo = Repo::from_json(&bytes).map_err(|e| Refusal { code: Code::UNKNOWN_FORMAT, detail: format!("{}/{key}: {e}", self.url) })?;
-        if !repo.name.eq_ignore_ascii_case(name) {
-            return refuse(Code::UNKNOWN_FORMAT, format!("{}/{key} names {:?}", self.url, repo.name));
-        }
-        Ok(Fresh::Repo(repo, tag))
+        Ok(match etag == Some(tag.as_str()) {
+            true => Fresh::Unchanged,
+            false => Fresh::Doc(bytes, tag),
+        })
     }
 
-    /// Changes the repo document `name` to what `change` makes of it (`None`: none, or a
-    /// document with no releases and no checkpoints, which deletes the model). Over HTTP it is
-    /// a conditional PUT, applied again to the document as it is when another writer won.
+    /// Writes `bytes` as the repo document `name` while it still has ETag `etag` (`None`: while
+    /// there is none); false when it has changed (`412`). A server checks the bytes.
+    pub async fn put_repo_bytes(&self, name: &str, bytes: Vec<u8>, etag: Option<&str>) -> Result<bool> {
+        split_name(name)?;
+        let key = repo_key(name);
+        let base = match &self.at {
+            At::Http(base) => base,
+            At::Dir(root, _) => {
+                let (root, etag) = (root.clone(), etag.map(str::to_owned));
+                let put = tokio::task::spawn_blocking(move || put_dir(&root, &key, &bytes, etag.as_deref()));
+                return put.await.map_err(|e| Refusal { code: Code::IO_FAILED, detail: e.to_string() })?;
+            }
+        };
+        let url = format!("{base}/{key}");
+        let precondition = match etag {
+            Some(etag) => ("if-match".to_owned(), etag.to_owned()),
+            None => ("if-none-match".to_owned(), "*".to_owned()),
+        };
+        let headers = vec![("content-type".to_owned(), "application/json".to_owned()), precondition];
+        let payload = hex_digest(&bytes);
+        let bytes = Bytes::from(bytes);
+        let body = move || Ok(Payload::Bytes(bytes.clone()));
+        let reply = self.exchange(Ask { method: "PUT", url: &url, headers, body: Some(&body), payload: Some(&payload), auth: true }).await?;
+        match reply.status {
+            200 | 201 | 204 => Ok(true),
+            // S3 answers a race of conditional writes 409 ConditionalRequestConflict.
+            412 => Ok(false),
+            409 if envelope(&reply.body).is_none() => Ok(false),
+            _ => Err(refusal(&reply, "PUT")),
+        }
+    }
+
+    /// Changes the repo document `name` to what `change` makes of it (`None`: a document with
+    /// no releases and no checkpoints, which deletes the model): a conditional write, with
+    /// `change` applied again to the document as it is whenever another writer won.
     pub async fn update_repo(
         &self,
         name: &str,
         mut change: impl FnMut(Option<Repo>) -> Result<Option<Repo>>,
     ) -> Result<Repo> {
-        split_name(name)?;
-        let mut apply = |old: Option<Repo>| -> Result<Repo> {
-            let new = change(old)?.unwrap_or_else(|| Repo::new(name));
-            match new.name.eq_ignore_ascii_case(name) {
-                true => Ok(new),
-                false => refuse(Code::KEY_GRAMMAR, format!("repo {:?} cannot be {name}", new.name)),
-            }
-        };
-        let base = match &self.at {
-            At::Http(base) => base,
-            At::Dir(..) => {
-                let store = self.store()?;
-                let mut out = None;
-                store
-                    .update_ref(name, |old| {
-                        let new = apply(old.clone());
-                        let keep = match &new {
-                            Ok(new) if new.releases.is_empty() && new.checkpoints.is_empty() => None,
-                            Ok(new) => Some(new.clone()),
-                            Err(_) => old,
-                        };
-                        out = Some(new);
-                        keep
-                    })
-                    .map_err(crate::store2::Error::refusal)?;
-                return out.expect("the change ran");
-            }
-        };
-        let url = format!("{base}/{}", repo_key(name));
         let mut sent: Option<Repo> = None;
         loop {
             let (old, etag) = match self.repo(name).await? {
@@ -228,27 +242,19 @@ impl Endpoint {
             if sent.is_some() && old == sent {
                 return Ok(sent.expect("compared"));
             }
-            let new = apply(old.clone())?;
-            if old.as_ref() == Some(&new) || (old.is_none() && new.releases.is_empty() && new.checkpoints.is_empty()) {
+            let new = change(old.clone())?.unwrap_or_else(|| Repo::new(name));
+            if !new.name.eq_ignore_ascii_case(name) {
+                return refuse(Code::KEY_GRAMMAR, format!("repo {:?} cannot be {name}", new.name));
+            }
+            let empty = new.releases.is_empty() && new.checkpoints.is_empty();
+            if old.as_ref() == Some(&new) || (old.is_none() && empty) {
                 return Ok(new);
             }
-            let bytes = Bytes::from(new.to_json().map_err(|e| Refusal { code: Code::UNKNOWN_FORMAT, detail: e.to_string() })?);
-            let precondition = match etag {
-                Some(etag) => ("if-match".to_owned(), etag),
-                None => ("if-none-match".to_owned(), "*".to_owned()),
-            };
-            let headers = vec![("content-type".to_owned(), "application/json".to_owned()), precondition];
-            let payload = hex_digest(&bytes);
-            let body = move || Ok(Payload::Bytes(bytes.clone()));
-            let ask = Ask { method: "PUT", url: &url, headers, body: Some(&body), payload: Some(&payload), auth: true };
-            let reply = self.exchange(ask).await?;
-            match reply.status {
-                200 | 201 | 204 => return Ok(new),
-                // S3 answers a race of conditional writes 409 ConditionalRequestConflict.
-                412 => sent = Some(new),
-                409 if envelope(&reply.body).is_none() => sent = Some(new),
-                _ => return Err(refusal(&reply, "PUT")),
+            let bytes = new.to_json().map_err(|e| Refusal { code: Code::UNKNOWN_FORMAT, detail: e.to_string() })?;
+            if self.put_repo_bytes(name, bytes, etag.as_deref()).await? {
+                return Ok(new);
             }
+            sent = Some(new);
         }
     }
 
@@ -517,6 +523,27 @@ pub async fn upload_tree(endpoint: &Endpoint, name: &str, tree: &ObjectRef, stor
     }
     let repo = endpoint.update_repo(name, |old| Ok(Some(with_tree(old, name, tree, version)))).await?;
     Ok(Uploaded { repo, objects, sent, bytes })
+}
+
+/// Replaces `<root>/<key>` with `bytes` under the store's record lock while it has ETag `etag`.
+fn put_dir(root: &Path, key: &str, bytes: &[u8], etag: Option<&str>) -> Result<bool> {
+    let (path, refs) = (root.join(key), root.join("refs"));
+    let io = |what: &Path| {
+        let what = what.display().to_string();
+        move |e: std::io::Error| crate::err::classify_io(what, e)
+    };
+    fs::create_dir_all(path.parent().expect("a ref has a directory")).map_err(io(&path))?;
+    let _lock = platform::lock::dir(&refs).map_err(|e| io(&refs)(e.into()))?;
+    let now = match fs::read(&path) {
+        Ok(bytes) => Some(etag_of(&bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(io(&path)(e)),
+    };
+    if now.as_deref() != etag {
+        return Ok(false);
+    }
+    platform::durable::replace(&path, bytes, 0o644).map_err(|e| io(&path)(e.into()))?;
+    Ok(true)
 }
 
 /// The ETag a directory (or a server that sends none) gives a document: `"sha256:<hex>"`.
