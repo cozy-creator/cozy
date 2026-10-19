@@ -10,11 +10,12 @@ One `Memory` per process decides where every weight byte of its device lives. A 
 are views of its region's pages only while the block runs: its forward binds them (the view is
 the pin) and puts zero-byte placeholders back after, so no tensor can point at an unmapped page.
 An op on a placeholder outside a forward binds its block for that op. Bytes rank in use (a
-forward of the model, its root or a direct child, runs) > warm (loaded at GPU level) > idle,
-models run once before repeating ones within each, then least recently used. Room is made in one order (§5.2): idle bytes, cold
-weights and caches by rank, then the hot model's watermark, which falls only within a request
-and refills toward each model's level after it. varena seals the host tier itself; the executor
-deposits it with TensorD. On a CPU or Apple device every weight binds once, at load.
+forward of the model, its root or a direct child, runs) > warm (loaded at GPU level) > idle;
+within each, models run once go before repeating ones, then least recently used. Room is made
+in one order (§5.2): idle bytes, cold weights and caches by rank, then the hot model's
+watermark, which falls only within a request and refills toward each model's level after it.
+varena seals the host tier itself; the executor deposits it with TensorD. On a CPU or Apple
+device every weight binds once, at load.
 """
 
 from __future__ import annotations
