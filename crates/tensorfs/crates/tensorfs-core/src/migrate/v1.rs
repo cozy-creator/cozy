@@ -397,20 +397,6 @@ fn object(doc: &Json) -> Result<ObjectRef> {
     })
 }
 
-/// Every object a checkpoint names besides its manifest: header, files, asset segments, parts.
-pub fn objects(m: &Manifest, h: &Header) -> Vec<ObjectRef> {
-    let mut out: Vec<ObjectRef> = m.header.iter().chain(m.files.iter().map(|f| &f.1)).cloned().collect();
-    out.extend(h.assets.iter().flat_map(|a| a.segments.iter().cloned()));
-    for p in h.components.iter().flat_map(|c| &c.1).flat_map(|t| &t.parts) {
-        if let Body::Objects(objects) = &p.body {
-            out.extend(objects.iter().cloned());
-        }
-    }
-    out.sort();
-    out.dedup();
-    out
-}
-
 /// `{"entries": [{"path", "kind", "blob"}]}`: the header entry and ordinary files.
 pub fn manifest(bytes: &[u8]) -> Result<Manifest> {
     let doc: Json = serde_json::from_slice(bytes).or_else(|e| bad(format!("v1 manifest: {e}")))?;

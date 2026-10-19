@@ -344,6 +344,8 @@ fn an_old_model_migrates_by_its_own_rows_and_pulls_bit_identical() {
         let row = checkpoints.iter().find(|c| c["old"] == old_id.as_str()).unwrap_or_else(|| panic!("{summary}"));
         assert_eq!(row["removed"], true, "{row}");
         assert!(row["migration"]["verified"]["tensors"] == 4, "{row}");
+        // The 16 MiB part it reuses stays at the Hub: neither fetched nor sent.
+        assert!(row["fetched_bytes"].as_u64().unwrap() < 1 << 20, "{row}");
         assert!(audit.join(&account).join("legacy").join(format!("{}.json", old.manifests[m].0)).is_file());
         (row["new"].as_str().unwrap().to_owned(), row.clone())
     };
@@ -379,6 +381,8 @@ fn an_old_model_migrates_by_its_own_rows_and_pulls_bit_identical() {
         false => (&unreleased, &released),
     };
     assert!(!held(first) && held(second), "the first migration's checkpoint is still held");
+    let big = &old.objects.iter().find(|o| o.1.len() == 16 << 20).unwrap().0;
+    assert!(!held(big), "the reused 16 MiB part came down to the migrating machine");
 
     // Again: nothing is old any more.
     let again = cozy(&home, &["--json", "model", "migrate", &model, "--on", "m1", "--audit", &audit_arg]);

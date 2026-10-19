@@ -3,10 +3,10 @@
 //! (the last reader of the old format) and checked tensor by tensor.
 //!
 //! - [`checkpoint`]: an old checkpoint at the run's Hub, on a machine that does nothing else (a
-//!   rental). Its objects land in the store as plain blobs, where the migration reads them; the
-//!   run then puts the result in its weights destination like any upload. Today's publish wants
-//!   the whole closure here, so every old object comes down, the large ones the new checkpoint
-//!   reuses included. Each migration first drops what the previous one left.
+//!   rental). The old objects it repacks land in the store as plain blobs, where the migration
+//!   reads them; the large ones the new checkpoint reuses stay at the Hub, which holds them, so
+//!   the run's publish neither fetches nor sends them. Each migration first drops what the
+//!   previous one left.
 //! - [`local`]: every `local/` model of a pre-cut store on this machine, under the same name; the
 //!   old objects it reuses move in by hard link (a copy only across filesystems), so the
 //!   conversion costs only its new bytes.
@@ -85,7 +85,7 @@ pub fn checkpoint(
     .map_err(|(code, message)| refused(code, message))?;
     let (store, never) = (publisher.store(), Stop::default());
     clear(store)?;
-    let fetch = |objects: &[ObjectRef], stage: &str| -> Result<(), Refused> {
+    let fetch = |objects: &[ObjectRef], stage: &str| -> Result<u64, Refused> {
         let absent: Vec<ObjectRef> = objects.iter().filter(|o| !storage::present(store, o)).cloned().collect();
         let bytes = absent.iter().map(|o| o.length).sum::<u64>();
         if bytes > 0 && storage::admits(store, bytes).is_err() {
@@ -100,16 +100,16 @@ pub fn checkpoint(
                 refused(code, message)
             })?;
         observe(stage, bytes, bytes);
-        Ok(())
+        Ok(bytes)
     };
     let src = v1::Source::new(store.root());
     let read = |object: &ObjectRef| src.read(object).map_err(|f| refused("migration_failed", f.detail));
-    fetch(std::slice::from_ref(&manifest), "fetching the old manifest")?;
+    let mut fetched = fetch(std::slice::from_ref(&manifest), "fetching the old manifest")?;
     let old = v1::manifest(&read(&manifest)?).map_err(|f| refused("migration_failed", f.detail))?;
     let header = old.header.clone().ok_or_else(|| refused("migration_failed", "the old manifest has no header"))?;
-    fetch(std::slice::from_ref(&header), "fetching the old header")?;
+    fetched += fetch(std::slice::from_ref(&header), "fetching the old header")?;
     let h = v1::header(&read(&header)?).map_err(|f| refused("migration_failed", f.detail))?;
-    fetch(&v1::objects(&old, &h), &format!("fetching {}", choice.repository))?;
+    fetched += fetch(&migrate::reads(&h), &format!("fetching {}", choice.repository))?;
     observe(&format!("migrating {}", choice.repository), 0, 0);
     let named = match choice.release.is_empty() {
         true => format!("{}#{}", choice.repository, manifest.id()),
@@ -117,7 +117,7 @@ pub fn checkpoint(
     };
     let (made, doc) = rewrite(&src, store, v1::Lane { manifest, names: vec![named] })?;
     let row = json!({"parameter": choice.parameter, "repository": choice.repository,
-        "manifest": made.id(), "migrated": doc});
+        "manifest": made.id(), "migrated": doc, "fetched_bytes": fetched});
     Ok((made, row))
 }
 
