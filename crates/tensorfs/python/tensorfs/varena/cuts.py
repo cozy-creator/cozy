@@ -91,6 +91,10 @@ class Shape:
     shape: str
     peak: int = -1
     cuts: dict[str, int] = field(default_factory=dict)
+    #: the cuts its passes ran: key -> (total, finest, shrink), what `finer` steps
+    scopes: dict[tuple[object, ...], tuple[int, int, Callable[[int], int]]] = field(
+        default_factory=dict
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -237,6 +241,9 @@ def _settle[T](
     if scope is not None:
         size = min(memo.sizes.get(key, total), total)  # type: ignore[arg-type]
         _local.scopes.append(scope)
+        site = _local.site
+        if site is not None and site.track.shape is not None:
+            site.track.shape.scopes[key] = (total, finest, shrink)  # type: ignore[index]
     again = scope is not None or size <= finest if again is None else again
     try:
         while True:
@@ -275,6 +282,22 @@ def _settle[T](
         memo.sizes[key] = size
         _note(name, size)
     return size, out
+
+
+def finer(shape: Shape | None) -> bool:
+    """Rung 3 ahead of the planner's rung 4: every cut a shape's passes ran goes one step finer,
+    and its peak waits to be measured again. False when each is at its finest already."""
+    if shape is None:
+        return False
+    memo, moved = _served.memo, False
+    for key, (total, finest, shrink) in shape.scopes.items():
+        size = min(memo.sizes.get(key, total), total)
+        if size > finest:
+            memo.sizes[key] = max(finest, shrink(size))
+            moved = True
+    if moved:
+        shape.peak = -1
+    return moved
 
 
 def _halve(align: int, size: int) -> int:

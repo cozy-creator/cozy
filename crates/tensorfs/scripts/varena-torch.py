@@ -33,7 +33,7 @@ import torch
 from torch import nn
 
 import tensorfs
-from tensorfs.varena import Ledger
+from tensorfs.varena import Ledger, cuts
 from tensorfs.varena.torch import (
     Declared,
     Exhausted,
@@ -62,6 +62,36 @@ class Block(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x + self.lin(self.norm(x))
+
+
+class Wide(Block):
+    """A block whose tokens run in `cuts.split` windows with a temporary `WIDE` times its
+    output: the coarser the cut, the higher its peak."""
+
+    WIDE = 16
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        def rows(most: int) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for at in range(0, x.shape[0], most):
+                y = self.lin(self.norm(x[at : at + most]))
+                out[at : at + most] = y.unsqueeze(-1).expand(-1, -1, self.WIDE).contiguous().mean(-1)
+            return x + out
+
+        return cuts.split("wide", "wide", x.device, x.shape[0], max(x.shape[0] // 16, 1), rows)
+
+
+class WideNet(nn.Module):
+    _no_split_modules = ["Wide"]
+
+    def __init__(self, dim: int, blocks: int) -> None:
+        super().__init__()
+        self.blocks = nn.ModuleList(Wide(dim) for _ in range(blocks))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        for block in self.blocks:
+            x = block(x)
+        return x
 
 
 class Net(nn.Module):
@@ -387,8 +417,54 @@ def main() -> int:
 
     model2.close()
     model.close()
+    finer_first(root.parent, dev)
     print(f"{sum(results)}/{len(results)} checks passed")
     return 0 if all(results) else 1
+
+
+def finer_first(root: Path, dev: torch.device) -> None:
+    """A model whose peak fits beside its whole home only cut finer stays wholly at home: the
+    planner cuts finer (rung 3) before it lowers the watermark (rung 4)."""
+    dim, count, tokens = 4096, 16, 4096
+    torch.manual_seed(0)
+    plain = WideNet(dim, count).bfloat16()
+    store = tensorfs.Store(root / "wide")
+    w = store.writer()
+    for key, t in plain.state_dict().items():
+        t = t.detach().contiguous()
+        w.put("wide", key, "BF16", list(t.shape), t.view(torch.uint8).numpy().tobytes())
+    ck = store.checkpoint(w.commit())
+    weights = sum(t.numel() * t.element_size() for t in plain.state_dict().values())
+    coarse = tokens * dim * Wide.WIDE * 2  # the temporary of one uncut window
+    torch.cuda.empty_cache()
+    mem = Memory.open(dev, limit=torch.cuda.memory_reserved(dev) + weights + coarse * 3 // 4)
+    with torch.device("meta"):
+        net = WideNet(dim, count).bfloat16()
+    model = mem.load(net, ck=ck)
+    x = torch.randn(tokens, dim, generator=torch.Generator().manual_seed(3)).bfloat16().to(dev)
+    with torch.no_grad():
+        want = plain.to(dev)(x)
+    plain.cpu()
+    torch.cuda.empty_cache()
+    for request in range(2):
+        with torch.no_grad(), mem.request(f"wide {request}") as r:
+            outs = [net(x) for _ in range(4)]
+            same = all(torch.allclose(o, want, atol=1e-2) for o in outs)
+            del outs
+    last = r.stats.steps[-1]
+    size = _served_size(("split", "wide"))
+    check("a model that fits only cut finer equals the reference", same)
+    check(
+        "it stays wholly at home, cut finer (rung 3 before rung 4)",
+        model.home_bytes() >= weights and size is not None and size < tokens,
+        f"home {model.home_bytes()} of {weights}, split {size}",
+    )
+    check("its last pass moves no bytes", last.paged_in == 0 and last.streamed == 0, str(last))
+    model.close()
+
+
+def _served_size(key: tuple[object, ...]) -> int | None:
+    return cuts._served.memo.sizes.get(key)
 
 
 if __name__ == "__main__":
