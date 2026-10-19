@@ -186,7 +186,7 @@ class Checkpoint:
 
     @staticmethod
     def parse(header: bytes) -> Checkpoint:
-        """A `cozytensors/1` header's pipeline, components and metadata, with no store: `read`,
+        """A `cozytensors/1` header's pipeline, components and metadata, with no store: component reads,
         `missing`, `chunk_paths` and `Component.asset` refuse (`UnsupportedError`)."""
     @property
     def id(self) -> str | None:
@@ -221,15 +221,10 @@ class Checkpoint:
     def chunk_paths(self) -> list[str]:
         """Each chunk's file in the store, in header order; a parsed header raises."""
     @property
-    def tensors(self) -> dict[str, dict[str, Info]]:
-        """`tensors[component][key]`."""
-    @property
     def metadata(self) -> dict[str, Any]: ...
     def missing(self, components: Sequence[str] | None = None) -> list[tuple[str, int]]:
         """The chunks and assets of `components` (all when None) not here."""
     def fetch(self, components: Sequence[str] | None = None, *, priority: int = 0, progress: Any = None) -> None: ...
-    def read(self, component: str, key: str) -> Array:
-        """Logical bytes; an encoded tensor goes through the reference decode."""
 
 class ComponentWriter:
     @property
