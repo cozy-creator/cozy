@@ -1,12 +1,12 @@
 //! Weights on one GPU, for the process computing with them (design memory-varena §5.1).
 //!
 //! A weight set reserves one VA range per GPU laid out like its host layout; a region maps at
-//! its home offset in physical chunks. Regions outside the home set stream through a few
-//! scratch slots the size of the largest of them. A `Pinned` is a region's bytes in use: while
-//! one lives its pages stay mapped, and its drop records a release event on its stream.
-//! Eviction unmaps only unpinned pages whose fill and release events completed. Copies run on
-//! this GPU's own stream, from a sealed host layout (one DMA once page-locked) or from the
-//! chunk files through pinned staging; a consumer waits on an event, the host never syncs.
+//! its home offset in physical chunks, or, outside the home set, streams through a few scratch
+//! slots the size of the largest such region. A `Pinned` is a region's bytes in use: while one
+//! lives its pages stay mapped, and its drop records a release event on its stream. Eviction
+//! unmaps only unpinned pages whose fill and release events completed. Copies run on this GPU's
+//! own stream, from a sealed host layout or from the chunk files through pinned staging; a
+//! consumer waits on an event, the host never syncs.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::c_void;
@@ -14,7 +14,7 @@ use std::ffi::c_void;
 use std::fs::File;
 #[cfg(feature = "store")]
 use std::os::fd::{OwnedFd, RawFd};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
@@ -23,7 +23,6 @@ use tensorfs_core::{format::Header, ids::ObjectRef};
 
 #[cfg(feature = "store")]
 use crate::checkpoint::Ck;
-
 use crate::cuda::{self, AccessDesc, AllocationProp, CUcontext, CUevent, CUstream, CtxGuard, Handle};
 use crate::host::HostMem;
 use crate::io::{IoTally, Mode, Readers, Source};
@@ -31,12 +30,20 @@ use crate::layout::{align_up, Item, ItemSource, Layout, PART_ALIGN, REGION_ALIGN
 use crate::{Error, Result};
 
 /// Scratch slots kept while a region streams; more exist only while every one is pinned.
-pub const SLOTS: usize = 3;
+const SLOTS: usize = 3;
 /// Idle chunks kept after an eviction for the next map; the rest go back to the driver.
 const IDLE_KEEP: u64 = 64 << 20;
 const STAGING: usize = 16;
 const STAGING_BYTES: u64 = 2 << 20;
 const READERS: usize = 8;
+
+/// A checked driver call on handles this core made, in its context.
+macro_rules! call {
+    ($op:literal, $f:ident($($a:expr),* $(,)?)) => {
+        // SAFETY: live handles of our context; out-params point at live locals.
+        cuda::check($op, unsafe { (cuda::driver()?.$f)($($a),*) })
+    };
+}
 
 // ---------------------------------------------------------------- events
 
@@ -51,27 +58,22 @@ type EvRef = Arc<Ev>;
 
 impl Ev {
     fn done(&self) -> Result<bool> {
-        let d = cuda::driver()?;
         // SAFETY: a live event of our context.
-        match unsafe { (d.event_query)(self.raw) } {
+        match unsafe { (cuda::driver()?.event_query)(self.raw) } {
             cuda::SUCCESS => Ok(true),
             cuda::ERROR_NOT_READY => Ok(false),
             rc => cuda::check("cuEventQuery", rc).map(|_| false),
         }
     }
+
     fn sync(&self) -> Result<()> {
-        // SAFETY: a live event.
-        cuda::check("cuEventSynchronize", unsafe { (cuda::driver()?.event_synchronize)(self.raw) })
+        call!("cuEventSynchronize", event_synchronize(self.raw))
     }
-    fn record(&self, s: CUstream) -> Result<()> {
-        // SAFETY: an event and a stream of the same context.
-        cuda::check("cuEventRecord", unsafe { (cuda::driver()?.event_record)(self.raw, s) })
-    }
+
     /// Nanoseconds from `start` to this event, both completed timing events.
     fn since(&self, start: &Ev) -> Result<u64> {
         let mut ms = 0f32;
-        // SAFETY: two completed timing events.
-        cuda::check("cuEventElapsedTime", unsafe { (cuda::driver()?.event_elapsed_time)(&mut ms, start.raw, self.raw) })?;
+        call!("cuEventElapsedTime", event_elapsed_time(&mut ms, start.raw, self.raw))?;
         Ok((ms as f64 * 1e6) as u64)
     }
 }
@@ -91,19 +93,20 @@ unsafe impl Send for Events {}
 unsafe impl Sync for Events {}
 
 impl Events {
-    fn get(self: &Arc<Self>, timing: bool) -> Result<EvRef> {
+    /// An event recorded on `stream` now.
+    fn record(self: &Arc<Self>, stream: CUstream, timing: bool) -> Result<EvRef> {
         let raw = match self.free.lock().unwrap()[timing as usize].pop() {
             Some(raw) => raw,
             None => {
                 let _c = CtxGuard::enter(self.ctx)?;
                 let mut e: CUevent = std::ptr::null_mut();
-                let flags = if timing { cuda::EVENT_DEFAULT } else { cuda::EVENT_DISABLE_TIMING };
-                // SAFETY: out-param, context bound.
-                cuda::check("cuEventCreate", unsafe { (cuda::driver()?.event_create)(&mut e, flags) })?;
+                call!("cuEventCreate", event_create(&mut e, if timing { cuda::EVENT_DEFAULT } else { cuda::EVENT_DISABLE_TIMING }))?;
                 e
             }
         };
-        Ok(Arc::new(Ev { raw, timing, pool: self.clone() }))
+        let e = Arc::new(Ev { raw, timing, pool: self.clone() });
+        call!("cuEventRecord", event_record(e.raw, stream))?;
+        Ok(e)
     }
 }
 
@@ -120,20 +123,13 @@ impl Drop for Events {
 
 /// Wait on `ev` in `stream` (enqueued; the host does not wait).
 fn wait_in(stream: CUstream, ev: &Ev) -> Result<()> {
-    // SAFETY: an event and a stream of the same context.
-    cuda::check("cuStreamWaitEvent", unsafe { (cuda::driver()?.stream_wait_event)(stream, ev.raw, 0) })
+    call!("cuStreamWaitEvent", stream_wait_event(stream, ev.raw, 0))
 }
 
 /// Keeps the events not yet passed; true when none is left.
 fn passed(events: &mut Vec<EvRef>) -> Result<bool> {
     let mut err = None;
-    events.retain(|e| match e.done() {
-        Ok(done) => !done,
-        Err(x) => {
-            err.get_or_insert(x);
-            true
-        }
-    });
+    events.retain(|e| e.done().map(|done| !done).unwrap_or_else(|x| err.get_or_insert(x).is_ok()));
     err.map_or(Ok(events.is_empty()), Err)
 }
 
@@ -143,28 +139,13 @@ fn passed(events: &mut Vec<EvRef>) -> Result<bool> {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Counters {
     pub binds: u64,
-    /// Binds that found their region absent and waited for its fill.
     pub faults: u64,
-    /// Bytes filled at home.
     pub paged_in: u64,
-    /// Bytes copied into scratch slots.
     pub streamed_bytes: u64,
     pub evicted: u64,
-    /// Copy stream time of the fills, GPU-timed.
     pub copy_ns: u64,
-    /// Consumer streams' wait for fills not yet landed at bind, GPU-timed.
     pub stall_ns: u64,
-    /// Host time creating and mapping chunks.
     pub map_ns: u64,
-}
-
-impl Counters {
-    fn add(&mut self, kind: Kind, ns: u64) {
-        match kind {
-            Kind::Copy => self.copy_ns += ns,
-            Kind::Stall => self.stall_ns += ns,
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -172,15 +153,10 @@ pub struct SetStats {
     pub name: String,
     pub nbytes: u64,
     pub regions: u32,
-    /// Bytes of the home set.
     pub home: u64,
-    /// Bytes mapped at home.
     pub resident: u64,
-    /// Bytes mapped at home and pinned.
     pub pinned: u64,
-    /// Live pins, at home and in slots.
     pub pins: u32,
-    /// Bytes of the slots that hold this set's regions now.
     pub slot_bytes: u64,
     pub step: Counters,
     pub last: Counters,
@@ -192,12 +168,9 @@ pub struct GpuStats {
     pub device: i32,
     pub chunk: u64,
     pub steps: u64,
-    /// Bytes mapped: homes and slots.
     pub mapped: u64,
-    /// Chunks held unmapped for reuse.
     pub idle: u64,
     pub slots: u32,
-    /// Bytes the slots map now.
     pub slot_bytes: u64,
     pub slot_span: u64,
     pub driver_free: u64,
@@ -205,104 +178,103 @@ pub struct GpuStats {
     pub sets: Vec<SetStats>,
 }
 
-/// One stored part: where its bytes sit in its region, and what they are.
+/// One stored part: where its bytes sit in its region (`offset` from its start), and what they
+/// are; `role` is `""` for a plain tensor's data.
 #[derive(Debug, Clone)]
 pub struct Part {
     pub component: String,
     pub key: String,
-    /// `""` for a plain tensor's data, else the encoded tensor's part.
     pub role: String,
     pub dtype: String,
     pub shape: Vec<u64>,
     pub region: u32,
-    /// From the start of its region.
     pub offset: u64,
     pub nbytes: u64,
 }
 
-/// Each part of `layout` with its dtype and shape from `header`.
-#[cfg(feature = "store")]
-pub fn parts(header: &Header, layout: &Layout) -> Vec<Part> {
-    layout
-        .parts
-        .iter()
-        .filter_map(|p| {
-            let (tensor, role) = p.what.rsplit_once('#')?;
-            let (component, key) = tensor.split_once('/')?;
-            let t = header.tensor(component, key)?;
-            let role = if role == "value" { "" } else { role };
-            let (dtype, shape) = match t.part(role) {
-                Some(part) => (part.dtype.name().to_string(), part.shape.clone()),
-                None => (t.dtype.name().to_string(), t.shape.clone()),
-            };
-            let offset = p.offset - layout.regions[p.region as usize].offset;
-            Some(Part { component: component.into(), key: key.into(), role: role.into(), dtype, shape, region: p.region, offset, nbytes: p.nbytes })
-        })
-        .collect()
-}
-
-// ---------------------------------------------------------------- fills
-
-enum FillState {
-    Queued,
-    Running,
-    Done(EvRef),
-    Failed(Error),
-}
-
-/// One region's copy: queued, then running on the mover, then enqueued on the copy stream
-/// (`Done`, with the event that marks it landed) or failed with nothing left in flight.
-struct Fill {
-    state: Mutex<FillState>,
-    cv: Condvar,
-}
-
-impl Fill {
-    fn new() -> Arc<Fill> {
-        Arc::new(Fill { state: Mutex::new(FillState::Queued), cv: Condvar::new() })
-    }
-    fn set(&self, s: FillState) {
-        *self.state.lock().unwrap() = s;
-        self.cv.notify_all();
-    }
-    /// Until the copies are enqueued: the host waits only for reads that feed them.
-    fn wait(&self) -> Result<EvRef> {
-        let mut s = self.state.lock().unwrap();
-        while matches!(*s, FillState::Queued | FillState::Running) {
-            s = self.cv.wait(s).unwrap();
-        }
-        match &*s {
-            FillState::Done(ready) => Ok(ready.clone()),
-            FillState::Failed(e) => Err(e.clone()),
-            _ => unreachable!(),
-        }
-    }
-    fn busy(&self) -> bool {
-        matches!(*self.state.lock().unwrap(), FillState::Queued | FillState::Running)
-    }
-    fn failed(&self) -> bool {
-        matches!(*self.state.lock().unwrap(), FillState::Failed(_))
-    }
-    /// Nothing of it is in flight on the device.
-    fn landed(&self) -> Result<bool> {
-        match &*self.state.lock().unwrap() {
-            FillState::Done(ready) => ready.done(),
-            FillState::Failed(_) => Ok(true),
-            _ => Ok(false),
-        }
-    }
-}
-
-/// A weight set's bytes: its layout, its chunk files, and its sealed host layout if granted.
-struct Src {
-    layout: Arc<Layout>,
+/// A registered checkpoint's regions: its layout and parts, and what copies read from (its chunk
+/// files, and its sealed host layout if granted).
+pub struct Weights {
+    pub name: String,
+    pub layout: Layout,
+    pub parts: Vec<Part>,
     source: Source,
     host: Option<HostMem>,
 }
 
+#[cfg(feature = "store")]
+impl Weights {
+    /// With `host_fd`, a sealed host layout of the same regions (TensorD's grant) serves the
+    /// copies; without, the chunk files do: `files` (a grant's descriptors), or the checkpoint's
+    /// own paths.
+    fn open(name: &str, ck: Ck<'_>, regions: &[Vec<String>], host_fd: Option<RawFd>, files: Option<Vec<(ObjectRef, File)>>) -> Result<Weights> {
+        if host_fd.is_none() && files.is_none() && ck.paths.is_none() {
+            return Err(Error::Invalid("a header parsed alone reads only a grant: chunk files or a sealed layout".into()));
+        }
+        let (layout, source) = open_checkpoint(ck, regions, false, files)?;
+        let host = host_fd.map(|fd| HostMem::adopt_sealed(fd, &layout)).transpose()?;
+        if host.as_ref().is_some_and(|h| h.window().is_some()) {
+            return Err(Error::Invalid("a streamed host layout: register takes a whole sealed layout".into()));
+        }
+        Ok(Weights { name: name.into(), parts: parts(ck.header, &layout), layout, source, host })
+    }
+}
+
+/// Each part of `layout` with its dtype and shape from `header`.
+#[cfg(feature = "store")]
+fn parts(header: &Header, layout: &Layout) -> Vec<Part> {
+    let part = |p: &crate::layout::Part| {
+        let (tensor, role) = p.what.rsplit_once('#')?;
+        let (component, key) = tensor.split_once('/')?;
+        let t = header.tensor(component, key)?;
+        let role = if role == "value" { "" } else { role };
+        let (dtype, shape) = match t.part(role) {
+            Some(part) => (part.dtype.name().to_string(), part.shape.clone()),
+            None => (t.dtype.name().to_string(), t.shape.clone()),
+        };
+        let offset = p.offset - layout.regions[p.region as usize].offset;
+        Some(Part { component: component.into(), key: key.into(), role: role.into(), dtype, shape, region: p.region, offset, nbytes: p.nbytes })
+    };
+    layout.parts.iter().filter_map(part).collect()
+}
+
+// ---------------------------------------------------------------- fills
+
+/// One region's copy: pending until it is enqueued on the copy stream (`Ok`, with the event that
+/// marks it landed) or failed with nothing left in flight.
+struct Fill {
+    state: Mutex<Option<Result<EvRef>>>,
+    cv: Condvar,
+}
+
+impl Fill {
+    fn set(&self, r: Result<EvRef>) {
+        *self.state.lock().unwrap() = Some(r);
+        self.cv.notify_all();
+    }
+
+    /// Until the copies are enqueued: the host waits only for reads that feed them.
+    fn wait(&self) -> Result<EvRef> {
+        self.cv.wait_while(self.state.lock().unwrap(), |s| s.is_none()).unwrap().clone().unwrap()
+    }
+
+    fn busy(&self) -> bool {
+        self.state.lock().unwrap().is_none()
+    }
+
+    /// Nothing of it is in flight on the device.
+    fn landed(&self) -> Result<bool> {
+        match &*self.state.lock().unwrap() {
+            Some(Ok(ready)) => ready.done(),
+            Some(Err(_)) => Ok(true),
+            None => Ok(false),
+        }
+    }
+}
+
 struct Job {
     set: usize,
-    src: Arc<Src>,
+    w: Arc<Weights>,
     region: u32,
     dst: u64,
     waits: Vec<EvRef>,
@@ -313,30 +285,6 @@ struct Job {
 struct Jobs {
     q: VecDeque<Job>,
     stop: bool,
-}
-
-/// A set of reader jobs with one result: the first error.
-struct Latch {
-    left: Mutex<(usize, Option<Error>)>,
-    cv: Condvar,
-}
-
-impl Latch {
-    fn done(&self, r: Result<()>) {
-        let mut l = self.left.lock().unwrap();
-        l.0 -= 1;
-        if let Err(e) = r {
-            l.1.get_or_insert(e);
-        }
-        self.cv.notify_all();
-    }
-    fn wait(&self) -> Result<()> {
-        let mut l = self.left.lock().unwrap();
-        while l.0 > 0 {
-            l = self.cv.wait(l).unwrap();
-        }
-        l.1.take().map_or(Ok(()), Err)
-    }
 }
 
 struct Buf {
@@ -353,20 +301,16 @@ struct Staging {
 
 impl Staging {
     fn take(&self) -> Result<Buf> {
-        let mut free = self.free.lock().unwrap();
-        while free.is_empty() {
-            free = self.cv.wait(free).unwrap();
-        }
-        let mut buf = free.pop().unwrap();
-        drop(free);
-        if let Some(last) = buf.last.take() {
-            if let Err(e) = last.sync() {
+        let mut buf = self.cv.wait_while(self.free.lock().unwrap(), |f| f.is_empty()).unwrap().pop().unwrap();
+        match buf.last.take().map_or(Ok(()), |last| last.sync()) {
+            Ok(()) => Ok(buf),
+            Err(e) => {
                 self.put(buf);
-                return Err(e);
+                Err(e)
             }
         }
-        Ok(buf)
     }
+
     fn put(&self, buf: Buf) {
         self.free.lock().unwrap().push(buf);
         self.cv.notify_one();
@@ -381,25 +325,55 @@ struct Chunk {
     size: u64,
 }
 
+/// Chunks mapped at `va`, the fill that put bytes there, and the pins on them.
+#[derive(Default)]
 struct Mapping {
+    va: u64,
+    span: u64,
     chunks: Vec<Chunk>,
-    fill: Arc<Fill>,
+    fill: Option<Arc<Fill>>,
     /// Filled and not yet bound.
     fresh: bool,
-}
-
-#[derive(Default)]
-struct Reg {
-    home: bool,
-    map: Option<Mapping>,
     pins: u32,
     released: Vec<EvRef>,
 }
 
+impl Mapping {
+    fn settled(&self) -> bool {
+        self.pins == 0 && self.fill.as_ref().is_none_or(|f| !f.busy())
+    }
+
+    /// Nothing pins it and nothing is in flight on it.
+    fn quiet(&mut self) -> Result<bool> {
+        Ok(self.settled() && self.fill.as_ref().map_or(Ok(true), |f| f.landed())? && passed(&mut self.released)?)
+    }
+
+    /// A fill that failed, which nothing pins: it holds no bytes.
+    fn dead(&self) -> bool {
+        self.pins == 0 && self.fill.as_ref().is_some_and(|f| matches!(*f.state.lock().unwrap(), Some(Err(_))))
+    }
+
+    /// A new fill of it, and the releases its copies must wait for.
+    fn refill(&mut self) -> (Arc<Fill>, Vec<EvRef>) {
+        let fill = Arc::new(Fill { state: Mutex::new(None), cv: Condvar::new() });
+        (self.fill, self.fresh) = (Some(fill.clone()), true);
+        (fill, std::mem::take(&mut self.released))
+    }
+
+    fn pin(&mut self) -> (u64, Arc<Fill>, bool) {
+        self.pins += 1;
+        (self.va, self.fill.clone().expect("a bound mapping has a fill"), std::mem::take(&mut self.fresh))
+    }
+}
+
+struct Reg {
+    home: bool,
+    map: Option<Mapping>,
+}
+
 struct Set {
-    name: String,
+    w: Arc<Weights>,
     base: u64,
-    src: Arc<Src>,
     regs: Vec<Reg>,
     step: Counters,
     last: Counters,
@@ -420,41 +394,19 @@ impl Set {
 }
 
 struct Slot {
-    va: u64,
-    span: u64,
-    chunks: Vec<Chunk>,
+    m: Mapping,
     /// (set, region) whose bytes it holds or is filling.
     holds: Option<(usize, u32)>,
-    fill: Option<Arc<Fill>>,
-    /// Filled and not yet bound.
-    fresh: bool,
-    pins: u32,
-    released: Vec<EvRef>,
     /// Prefetched and not yet bound.
     pending: bool,
     used: u64,
 }
 
-impl Slot {
-    fn settled(&self) -> bool {
-        self.pins == 0 && self.fill.as_ref().is_none_or(|f| !f.busy())
-    }
-    fn quiet(&mut self) -> Result<bool> {
-        Ok(self.settled() && self.fill.as_ref().map_or(Ok(true), |f| f.landed())? && passed(&mut self.released)?)
-    }
-}
-
-#[derive(Clone, Copy)]
-enum Kind {
-    Copy,
-    Stall,
-}
-
-/// A GPU-timed interval, read once both events completed.
+/// A GPU-timed interval, read into `field` once both events completed.
 struct Timing {
     set: usize,
     step: u64,
-    kind: Kind,
+    field: fn(&mut Counters) -> &mut u64,
     a: EvRef,
     b: EvRef,
 }
@@ -476,16 +428,21 @@ impl State {
     fn set(&mut self, id: usize) -> &mut Set {
         self.sets[id].as_mut().expect("a live weight set")
     }
+
     fn reg(&mut self, id: usize, r: u32) -> Result<&mut Reg> {
-        let n = self.set(id).regs.len();
-        self.set(id).regs.get_mut(r as usize).ok_or_else(|| Error::Invalid(format!("region {r} of {n}")))
+        let regs = &mut self.set(id).regs;
+        let n = regs.len();
+        regs.get_mut(r as usize).ok_or_else(|| Error::Invalid(format!("region {r} of {n}")))
     }
+
     fn slot(&mut self, i: usize) -> &mut Slot {
         self.slots[i].as_mut().expect("a live slot")
     }
+
     fn idle_bytes(&self) -> u64 {
         self.idle.iter().map(|(s, v)| s * v.len() as u64).sum()
     }
+
     fn resolve(&mut self) {
         let (sets, steps) = (&mut self.sets, self.steps);
         self.timings.retain(|t| {
@@ -496,11 +453,11 @@ impl State {
             }
             let ns = t.b.since(&t.a).unwrap_or(0);
             if let Some(Some(s)) = sets.get_mut(t.set) {
-                s.total.add(t.kind, ns);
+                *(t.field)(&mut s.total) += ns;
                 if t.step == steps {
-                    s.step.add(t.kind, ns);
+                    *(t.field)(&mut s.step) += ns;
                 } else if t.step + 1 == steps {
-                    s.last.add(t.kind, ns);
+                    *(t.field)(&mut s.last) += ns;
                 }
             }
             false
@@ -534,7 +491,7 @@ unsafe impl Sync for Inner {}
 /// One GPU of this process: its VA, chunk cache, copy stream and scratch slots.
 pub struct Gpu {
     inner: Arc<Inner>,
-    mover: Mutex<Option<JoinHandle<()>>>,
+    mover: Option<JoinHandle<()>>,
 }
 
 impl Gpu {
@@ -548,22 +505,18 @@ impl Gpu {
         if cuda::attribute(dev, cuda::ATTR_VMM_SUPPORTED)? != 1 {
             return Err(Error::Invalid(format!("device {ordinal} has no virtual memory management")));
         }
-        let d = cuda::driver()?;
         let prop = AllocationProp::device(dev);
         let mut g = 0usize;
-        // SAFETY: out-param.
-        cuda::check("cuMemGetAllocationGranularity", unsafe { (d.mem_get_allocation_granularity)(&mut g, &prop, cuda::MEM_GRANULARITY_MINIMUM) })?;
+        call!("cuMemGetAllocationGranularity", mem_get_allocation_granularity(&mut g, &prop, cuda::MEM_GRANULARITY_MINIMUM))?;
         if g == 0 || !REGION_ALIGN.is_multiple_of(g as u64) {
             return Err(Error::Invalid(format!("device {ordinal}: granularity {g} does not divide {REGION_ALIGN}")));
         }
         let mut s: CUstream = std::ptr::null_mut();
-        // SAFETY: out-param, context bound.
-        cuda::check("cuStreamCreate", unsafe { (d.stream_create)(&mut s, cuda::STREAM_NON_BLOCKING) })?;
+        call!("cuStreamCreate", stream_create(&mut s, cuda::STREAM_NON_BLOCKING))?;
         let mut bufs = Vec::with_capacity(STAGING);
         for _ in 0..STAGING {
             let mut p: *mut c_void = std::ptr::null_mut();
-            // SAFETY: out-param; pinned, portable host memory.
-            cuda::check("cuMemHostAlloc", unsafe { (d.mem_host_alloc)(&mut p, STAGING_BYTES as usize, cuda::MEMHOSTALLOC_PORTABLE) })?;
+            call!("cuMemHostAlloc", mem_host_alloc(&mut p, STAGING_BYTES as usize, cuda::MEMHOSTALLOC_PORTABLE))?;
             bufs.push(Buf { ptr: p as *mut u8, last: None });
         }
         let inner = Arc::new(Inner {
@@ -571,20 +524,17 @@ impl Gpu {
             ctx,
             prop,
             chunk,
-            events: Arc::new(Events { ctx, free: Mutex::new([Vec::new(), Vec::new()]) }),
+            events: Arc::new(Events { ctx, free: Mutex::default() }),
             copy: Stream(s),
             readers: Readers::new(READERS),
             tally: IoTally::default(),
             staging: Staging { free: Mutex::new(bufs), cv: Condvar::new() },
-            jobs: (Mutex::new(Jobs::default()), Condvar::new()),
-            st: Mutex::new(State::default()),
+            jobs: Default::default(),
+            st: Mutex::default(),
         });
         let m = inner.clone();
-        let mover = std::thread::Builder::new()
-            .name(format!("varena-copy-{ordinal}"))
-            .spawn(move || m.mover())
-            .map_err(|e| Error::Io(format!("spawn copy thread: {e}")))?;
-        Ok(Arc::new(Gpu { inner, mover: Mutex::new(Some(mover)) }))
+        let mover = std::thread::Builder::new().name(format!("varena-copy-{ordinal}")).spawn(move || m.mover());
+        Ok(Arc::new(Gpu { inner, mover: Some(mover.map_err(|e| Error::Io(format!("spawn copy thread: {e}")))?) }))
     }
 
     pub fn device(&self) -> i32 {
@@ -595,85 +545,65 @@ impl Gpu {
         self.inner.chunk
     }
 
-    /// `regions` (`tensorfs_core::client::regions`) of a v2 checkpoint as one weight set. With
-    /// `host_fd`, a sealed host layout of the same regions (TensorD's grant) serves the copies;
-    /// without, the chunk files do, through the page cache: `files` (a grant's descriptors), or
-    /// the checkpoint's own paths.
+    /// `regions` (`tensorfs_core::client::regions`) of a v2 checkpoint as one weight set; its
+    /// copies read as `Weights::open` says.
     #[cfg(feature = "store")]
     pub fn register<'c>(self: &Arc<Self>, name: &str, ck: impl Into<Ck<'c>>, regions: &[Vec<String>], host_fd: Option<RawFd>, files: Option<Vec<(ObjectRef, File)>>) -> Result<Arc<WeightSet>> {
-        let ck = ck.into();
-        if host_fd.is_none() && files.is_none() && ck.paths.is_none() {
-            return Err(Error::Invalid("a header parsed alone reads only a grant: chunk files or a sealed layout".into()));
-        }
-        let (layout, source) = open_checkpoint(ck, regions, false, files)?;
-        let host = host_fd.map(|fd| HostMem::adopt_sealed(fd, &layout)).transpose()?;
-        if host.as_ref().is_some_and(|h| h.window().is_some()) {
-            return Err(Error::Invalid("a streamed host layout: register takes a whole sealed layout".into()));
-        }
-        let parts = parts(ck.header, &layout);
-        self.insert(name, layout, source, host, parts)
-    }
-
-    fn insert(self: &Arc<Self>, name: &str, layout: Layout, source: Source, host: Option<HostMem>, parts: Vec<Part>) -> Result<Arc<WeightSet>> {
+        let weights = Arc::new(Weights::open(name, ck.into(), regions, host_fd, files)?);
         let g = &self.inner;
         let _c = CtxGuard::enter(g.ctx)?;
-        let base = reserve_va(layout.nbytes.max(REGION_ALIGN))?;
-        let layout = Arc::new(layout);
-        let regs = (0..layout.regions.len()).map(|_| Reg { home: true, ..Default::default() }).collect();
-        let src = Arc::new(Src { layout: layout.clone(), source, host });
+        let base = reserve_va(weights.layout.nbytes.max(REGION_ALIGN))?;
+        let regs = weights.layout.regions.iter().map(|_| Reg { home: true, map: None }).collect();
+        let (w, z) = (weights.clone(), Counters::default());
         let mut st = g.lock();
-        st.sets.push(Some(Set {
-            name: name.into(),
-            base,
-            src,
-            regs,
-            step: Counters::default(),
-            last: Counters::default(),
-            total: Counters::default(),
-            used: 0,
-            warm: true,
-            busy: false,
-        }));
-        let id = st.sets.len() - 1;
-        Ok(Arc::new(WeightSet { gpu: self.clone(), id, base, name: name.into(), layout, parts }))
+        st.sets.push(Some(Set { w, base, regs, step: z, last: z, total: z, used: 0, warm: true, busy: false }));
+        Ok(Arc::new(WeightSet { gpu: self.clone(), id: st.sets.len() - 1, base, weights }))
     }
 
     /// Idle chunks and unneeded slots back to the driver; returns the bytes released.
     pub fn trim(&self) -> Result<u64> {
         let g = &self.inner;
-        let _c = CtxGuard::enter(g.ctx)?;
-        let mut st = g.lock();
-        let span = st.slot_span;
-        let mut live = st.slots.iter().flatten().count();
-        for i in 0..st.slots.len() {
-            let Some(s) = st.slots[i].as_mut() else { continue };
-            if (span == 0 || s.span < span || live > SLOTS) && s.quiet()? {
-                g.drop_slot(&mut st, i)?;
-                live -= 1;
+        g.with(|st| {
+            let span = st.slot_span;
+            let mut live = st.slots.iter().flatten().count();
+            for i in 0..st.slots.len() {
+                let Some(s) = st.slots[i].as_mut() else { continue };
+                if (span == 0 || s.m.span < span || live > SLOTS) && s.m.quiet()? {
+                    g.drop_slot(st, i)?;
+                    live -= 1;
+                }
             }
-        }
-        g.keep_idle(&mut st, 0)
+            g.keep_idle(st, 0)
+        })
     }
 
-    /// Bytes for another process's ask (design §5.2), answered on this process's own thread with
-    /// no Python: idle chunks and unneeded slots, then unpinned home pages, idle sets before warm
-    /// ones, least recently bound first, until `want`. Busy sets and pinned pages stay.
-    pub fn give(&self, want: u64) -> Result<u64> {
-        let mut freed = self.trim()?;
+    /// Bytes for an ask (design §5.2), another process's (`serve`) or this one's: idle chunks and
+    /// unneeded slots (under ""), then unpinned home pages, idle sets before warm ones, least
+    /// recently bound first, until `want`. Busy sets and pinned pages stay. Returns what each gave.
+    pub fn give(&self, want: u64) -> Result<Vec<(String, u64)>> {
+        let trimmed = self.trim()?;
         let g = &self.inner;
-        let _c = CtxGuard::enter(g.ctx)?;
-        let mut st = g.lock();
-        let mut order: Vec<(bool, u64, usize)> =
-            st.sets.iter().enumerate().filter_map(|(id, s)| s.as_ref().filter(|s| !s.busy).map(|s| (s.warm, s.used, id))).collect();
-        order.sort_unstable();
-        for (_, _, id) in order {
-            if freed >= want {
-                break;
+        g.with(|st| {
+            let (mut gave, mut freed) = (vec![], trimmed);
+            if trimmed > 0 {
+                gave.push((String::new(), trimmed));
             }
-            freed += g.evict(&mut st, id, None, want - freed)?;
-        }
-        g.keep_idle(&mut st, IDLE_KEEP)?;
-        Ok(freed)
+            let live = st.sets.iter().enumerate().filter_map(|(id, s)| Some((id, s.as_ref().filter(|s| !s.busy)?)));
+            let mut order: Vec<(bool, u64, usize)> = live.map(|(id, s)| (s.warm, s.used, id)).collect();
+            order.sort_unstable();
+            for (_, _, id) in order {
+                if freed >= want {
+                    break;
+                }
+                let n = g.evict(st, id, None, want - freed)?;
+                if n > 0 {
+                    gave.push((st.set(id).w.name.clone(), n));
+                    freed += n;
+                }
+            }
+            g.keep_idle(st, IDLE_KEEP)?;
+            Ok(gave)
+        })
     }
 
     /// Ends a step: the counters of the step under way become the last step's.
@@ -688,48 +618,43 @@ impl Gpu {
 
     pub fn stats(&self) -> Result<GpuStats> {
         let g = &self.inner;
-        let _c = CtxGuard::enter(g.ctx)?;
-        let (mut free, mut total) = (0usize, 0usize);
-        // SAFETY: out-params, context bound.
-        cuda::check("cuMemGetInfo", unsafe { (cuda::driver()?.mem_get_info)(&mut free, &mut total) })?;
-        let mut st = g.lock();
-        st.resolve();
-        let held: Vec<(usize, u32, u64)> = st.slots.iter().flatten().filter_map(|s| s.holds.map(|(set, _)| (set, s.pins, s.span))).collect();
-        let sets = st
-            .sets
-            .iter()
-            .enumerate()
-            .filter_map(|(id, s)| s.as_ref().map(|s| (id, s)))
-            .map(|(id, s)| {
-                let regions = &s.src.layout.regions;
+        g.with(|st| {
+            let (mut free, mut total) = (0usize, 0usize);
+            call!("cuMemGetInfo", mem_get_info(&mut free, &mut total))?;
+            st.resolve();
+            let held: Vec<(usize, u32, u64)> = st.slots.iter().flatten().filter_map(|s| s.holds.map(|(set, _)| (set, s.m.pins, s.m.span))).collect();
+            let set = |(id, s): (usize, &Set)| {
+                let regions = &s.w.layout.regions;
                 let sum = |f: &dyn Fn(&Reg) -> bool| s.regs.iter().zip(regions).filter(|(r, _)| f(r)).map(|(_, x)| x.span).sum();
+                let mine = || held.iter().filter(move |h| h.0 == id);
                 SetStats {
-                    name: s.name.clone(),
-                    nbytes: s.src.layout.nbytes,
+                    name: s.w.name.clone(),
+                    nbytes: s.w.layout.nbytes,
                     regions: regions.len() as u32,
                     home: sum(&|r| r.home),
                     resident: sum(&|r| r.map.is_some()),
-                    pinned: sum(&|r| r.map.is_some() && r.pins > 0),
-                    pins: s.regs.iter().map(|r| r.pins).sum::<u32>() + held.iter().filter(|h| h.0 == id).map(|h| h.1).sum::<u32>(),
-                    slot_bytes: held.iter().filter(|h| h.0 == id).map(|h| h.2).sum(),
+                    pinned: sum(&|r| r.map.as_ref().is_some_and(|m| m.pins > 0)),
+                    pins: s.regs.iter().filter_map(|r| r.map.as_ref()).map(|m| m.pins).sum::<u32>() + mine().map(|h| h.1).sum::<u32>(),
+                    slot_bytes: mine().map(|h| h.2).sum(),
                     step: s.step,
                     last: s.last,
                     total: s.total,
                 }
+            };
+            let sets = st.sets.iter().enumerate().filter_map(|(id, s)| Some((id, s.as_ref()?))).map(set).collect();
+            Ok(GpuStats {
+                device: g.ordinal,
+                chunk: g.chunk,
+                steps: st.steps,
+                mapped: st.mapped,
+                idle: st.idle_bytes(),
+                slots: st.slots.iter().flatten().count() as u32,
+                slot_bytes: st.slots.iter().flatten().map(|s| s.m.span).sum(),
+                slot_span: st.slot_span,
+                driver_free: free as u64,
+                driver_total: total as u64,
+                sets,
             })
-            .collect();
-        Ok(GpuStats {
-            device: g.ordinal,
-            chunk: g.chunk,
-            steps: st.steps,
-            mapped: st.mapped,
-            idle: st.idle_bytes(),
-            slots: st.slots.iter().flatten().count() as u32,
-            slot_bytes: st.slots.iter().flatten().map(|s| s.span).sum(),
-            slot_span: st.slot_span,
-            driver_free: free as u64,
-            driver_total: total as u64,
-            sets,
         })
     }
 }
@@ -738,7 +663,7 @@ impl Drop for Gpu {
     fn drop(&mut self) {
         self.inner.jobs.0.lock().unwrap().stop = true;
         self.inner.jobs.1.notify_all();
-        if let Some(t) = self.mover.lock().unwrap().take() {
+        if let Some(t) = self.mover.take() {
             let _ = t.join();
         }
     }
@@ -747,6 +672,12 @@ impl Drop for Gpu {
 impl Inner {
     fn lock(&self) -> MutexGuard<'_, State> {
         self.st.lock().unwrap()
+    }
+
+    /// `f` on the books, with our context current.
+    fn with<T>(&self, f: impl FnOnce(&mut State) -> Result<T>) -> Result<T> {
+        let _c = CtxGuard::enter(self.ctx)?;
+        f(&mut *self.lock())
     }
 
     fn submit(&self, job: Job, urgent: bool) {
@@ -772,38 +703,25 @@ impl Inner {
         }
         loop {
             let job = {
-                let mut j = self.jobs.0.lock().unwrap();
-                loop {
-                    if let Some(job) = j.q.pop_front() {
-                        break job;
-                    }
-                    if j.stop {
-                        return;
-                    }
-                    j = self.jobs.1.wait(j).unwrap();
+                let mut j = self.jobs.1.wait_while(self.jobs.0.lock().unwrap(), |j| j.q.is_empty() && !j.stop).unwrap();
+                match j.q.pop_front() {
+                    Some(job) => job,
+                    None => return,
                 }
             };
-            job.fill.set(FillState::Running);
-            let state = match self.run(&job) {
-                Ok((start, ready)) => {
-                    let mut st = self.lock();
-                    let step = st.steps;
-                    st.timings.push(Timing { set: job.set, step, kind: Kind::Copy, a: start, b: ready.clone() });
-                    FillState::Done(ready)
-                }
-                Err(e) => FillState::Failed(self.drained(e)),
-            };
-            job.fill.set(state);
+            let filled = self.run(&job).map(|(a, b)| {
+                let mut st = self.lock();
+                let step = st.steps;
+                st.timings.push(Timing { set: job.set, step, field: |c| &mut c.copy_ns, a, b: b.clone() });
+                b
+            });
+            job.fill.set(filled.map_err(|e| self.drained(e)));
         }
     }
 
     /// A failure is reported once nothing it queued is in flight.
     fn drained(&self, e: Error) -> Error {
-        let synced = cuda::driver().and_then(|d| {
-            // SAFETY: our own stream.
-            cuda::check("cuStreamSynchronize", unsafe { (d.stream_synchronize)(self.copy.0) })
-        });
-        match synced {
+        match call!("cuStreamSynchronize", stream_synchronize(self.copy.0)) {
             Ok(()) => e,
             Err(s) => Error::Io(format!("{e}; and the copy stream could not drain: {s}")),
         }
@@ -814,19 +732,16 @@ impl Inner {
         for w in &job.waits {
             wait_in(s, w)?;
         }
-        let start = self.events.get(true)?;
-        start.record(s)?;
-        let r = job.region;
-        let reg = job.src.layout.region(r)?;
+        let start = self.events.record(s, true)?;
+        let (r, reg) = (job.region, job.w.layout.region(job.region)?);
         let n = reg.nbytes;
-        match job.src.host.as_ref().filter(|h| !h.hole(r)) {
+        match job.w.host.as_ref().filter(|h| !h.hole(r)) {
             Some(h) if n > 0 => {
                 h.wait_ready(r)?;
                 // SAFETY: inside the live mapping the source keeps; the region is complete.
                 let p = unsafe { h.base().add(reg.offset as usize) } as *const u8;
                 if h.pin_region(r, reg.offset, align_up(n, PART_ALIGN)).0 {
-                    // SAFETY: `n` page-locked bytes kept by the source; the destination is mapped.
-                    cuda::check("cuMemcpyHtoDAsync", unsafe { (cuda::driver()?.memcpy_htod_async)(job.dst, p as *const c_void, n as usize, s) })?;
+                    call!("cuMemcpyHtoDAsync", memcpy_htod_async(job.dst, p as *const c_void, n as usize, s))?;
                 } else {
                     self.staged(job, Some(p as usize))?;
                 }
@@ -834,45 +749,43 @@ impl Inner {
             _ if n > 0 => self.staged(job, None)?,
             _ => {}
         }
-        let ready = self.events.get(true)?;
-        ready.record(s)?;
-        Ok((start, ready))
+        Ok((start, self.events.record(s, true)?))
     }
 
     /// The region through the staging buffers, a buffer per piece, read on the reader threads:
     /// from host memory at `host`, else from the chunk files through the page cache.
     fn staged(self: &Arc<Self>, job: &Job, host: Option<usize>) -> Result<()> {
-        let n = job.src.layout.region(job.region)?.nbytes;
-        let pieces = n.div_ceil(STAGING_BYTES);
-        let latch = Arc::new(Latch { left: Mutex::new((pieces as usize, None)), cv: Condvar::new() });
-        for i in 0..pieces {
-            let (g, src, latch, r, dst) = (self.clone(), job.src.clone(), latch.clone(), job.region, job.dst);
-            let (at, len) = (i * STAGING_BYTES, STAGING_BYTES.min(n - i * STAGING_BYTES));
-            self.readers.submit(true, move || latch.done(g.piece(&src, r, dst, at, len, host)));
+        let n = job.w.layout.region(job.region)?.nbytes;
+        let (tx, rx) = mpsc::channel();
+        for at in (0..n).step_by(STAGING_BYTES as usize) {
+            let (g, w, tx, r, dst) = (self.clone(), job.w.clone(), tx.clone(), job.region, job.dst);
+            self.readers.submit(true, move || drop(tx.send(g.piece(&w, r, dst, at, STAGING_BYTES.min(n - at), host))));
         }
-        latch.wait()
+        drop(tx);
+        let done: Vec<Result<()>> = rx.iter().collect();
+        if done.len() < n.div_ceil(STAGING_BYTES) as usize {
+            return Err(Error::Io("a staged read never ran".into()));
+        }
+        done.into_iter().collect()
     }
 
-    fn piece(&self, src: &Src, r: u32, dst: u64, at: u64, len: u64, host: Option<usize>) -> Result<()> {
+    fn piece(&self, w: &Weights, r: u32, dst: u64, at: u64, len: u64, host: Option<usize>) -> Result<()> {
         let mut buf = self.staging.take()?;
         let res = (|| {
             match host {
                 // SAFETY: `len` bytes inside the region the source keeps mapped; the buffer is ours.
                 Some(p) => unsafe { std::ptr::copy_nonoverlapping((p as *const u8).add(at as usize), buf.ptr, len as usize) },
                 None => {
-                    let reg = src.layout.region(r)?;
+                    let reg = w.layout.region(r)?;
                     for it in slice_items(&reg.items, reg.offset + at, reg.offset + at + len) {
                         // SAFETY: a buffered read writes `it.len` bytes, inside this buffer.
-                        unsafe { src.source.read_item(&it, buf.ptr.add((it.offset - reg.offset - at) as usize), Mode::Buffered, &self.tally)? };
+                        unsafe { w.source.read_item(&it, buf.ptr.add((it.offset - reg.offset - at) as usize), Mode::Buffered, &self.tally)? };
                     }
                 }
             }
             let _c = CtxGuard::enter(self.ctx)?;
-            // SAFETY: pinned host bytes we filled; the destination is mapped.
-            cuda::check("cuMemcpyHtoDAsync", unsafe { (cuda::driver()?.memcpy_htod_async)(dst + at, buf.ptr as *const c_void, len as usize, self.copy.0) })?;
-            let e = self.events.get(false)?;
-            e.record(self.copy.0)?;
-            buf.last = Some(e);
+            call!("cuMemcpyHtoDAsync", memcpy_htod_async(dst + at, buf.ptr as *const c_void, len as usize, self.copy.0))?;
+            buf.last = Some(self.events.record(self.copy.0, false)?);
             Ok(())
         })();
         self.staging.put(buf);
@@ -889,17 +802,17 @@ impl Inner {
         }
     }
 
-    /// Map `span` bytes at `va` in chunks: idle ones first, then new ones. A driver refusal is
+    /// Maps `span` bytes at `va` in chunks: idle ones first, then new ones. A driver refusal is
     /// `DeviceFull`, with nothing left mapped.
-    fn map(&self, st: &mut State, va: u64, span: u64) -> Result<Vec<Chunk>> {
+    fn map(&self, st: &mut State, va: u64, span: u64) -> Result<Mapping> {
         let mut sizes = vec![self.chunk; (span / self.chunk) as usize];
         if !span.is_multiple_of(self.chunk) {
             sizes.push(span % self.chunk);
         }
-        let mut got: Vec<Chunk> = Vec::with_capacity(sizes.len());
+        let mut chunks: Vec<Chunk> = Vec::with_capacity(sizes.len());
         for (i, &size) in sizes.iter().enumerate() {
             if let Some(handle) = st.idle.get_mut(&size).and_then(Vec::pop) {
-                got.push(Chunk { handle, size });
+                chunks.push(Chunk { handle, size });
                 continue;
             }
             let mut h = self.create(size)?;
@@ -908,19 +821,17 @@ impl Inner {
                 h = self.create(size)?;
             }
             match h {
-                Some(handle) => got.push(Chunk { handle, size }),
+                Some(handle) => chunks.push(Chunk { handle, size }),
                 None => {
-                    self.give_back(st, got);
+                    self.give_back(st, chunks);
                     return Err(Error::DeviceFull { need: span, deficit: sizes[i..].iter().sum() });
                 }
             }
         }
-        let d = cuda::driver()?;
         let mut at = va;
         let mut failure = None;
-        for c in &got {
-            // SAFETY: inside a reservation we own; the handle is unmapped.
-            if let Err(e) = cuda::check("cuMemMap", unsafe { (d.mem_map)(at, c.size as usize, 0, c.handle, 0) }) {
+        for c in &chunks {
+            if let Err(e) = call!("cuMemMap", mem_map(at, c.size as usize, 0, c.handle, 0)) {
                 failure = Some(e);
                 break;
             }
@@ -928,27 +839,24 @@ impl Inner {
         }
         if failure.is_none() {
             let desc = AccessDesc { location: self.prop.location, flags: cuda::MEM_ACCESS_PROT_READWRITE };
-            // SAFETY: the span was just mapped.
-            failure = cuda::check("cuMemSetAccess", unsafe { (d.mem_set_access)(va, span as usize, &desc, 1) }).err();
+            failure = call!("cuMemSetAccess", mem_set_access(va, span as usize, &desc, 1)).err();
         }
         if let Some(e) = failure {
             if at > va {
-                // SAFETY: undoing our own mappings.
-                cuda::check("cuMemUnmap", unsafe { (d.mem_unmap)(va, (at - va) as usize) })?;
+                call!("cuMemUnmap", mem_unmap(va, (at - va) as usize))?;
             }
-            self.give_back(st, got);
+            self.give_back(st, chunks);
             return Err(e);
         }
         st.mapped += span;
-        Ok(got)
+        Ok(Mapping { va, span, chunks, ..Default::default() })
     }
 
-    /// Unmap a span nothing in flight touches; its chunks go idle.
-    fn unmap(&self, st: &mut State, va: u64, span: u64, chunks: Vec<Chunk>) -> Result<()> {
-        // SAFETY: a mapping we made, unpinned, its copies and releases passed.
-        cuda::check("cuMemUnmap", unsafe { (cuda::driver()?.mem_unmap)(va, span as usize) })?;
-        st.mapped -= span;
-        self.give_back(st, chunks);
+    /// Unmaps a mapping nothing in flight touches; its chunks go idle.
+    fn unmap(&self, st: &mut State, m: Mapping) -> Result<()> {
+        call!("cuMemUnmap", mem_unmap(m.va, m.span as usize))?;
+        st.mapped -= m.span;
+        self.give_back(st, m.chunks);
         Ok(())
     }
 
@@ -958,7 +866,6 @@ impl Inner {
         }
     }
 
-    /// Release idle chunks, largest first, until at most `keep` bytes are idle.
     /// Unmaps set `id`'s `regions` (all when None) at home that no pin holds and whose fill and
     /// release events completed, until `budget` bytes; returns the bytes unmapped.
     fn evict(&self, st: &mut State, id: usize, regions: Option<&[u32]>, budget: u64) -> Result<u64> {
@@ -969,30 +876,28 @@ impl Inner {
                 break;
             }
             let reg = st.reg(id, r)?;
-            let Some(m) = &reg.map else { continue };
-            if reg.pins > 0 || !m.fill.landed()? || !passed(&mut reg.released)? {
+            if !reg.map.as_mut().map_or(Ok(false), Mapping::quiet)? {
                 continue;
             }
             let m = reg.map.take().unwrap();
-            let (base, x) = (st.set(id).base, st.set(id).src.layout.region(r)?.clone());
-            self.unmap(st, base + x.offset, x.span, m.chunks)?;
-            st.set(id).count(|c| c.evicted += x.span);
-            freed += x.span;
+            let span = m.span;
+            self.unmap(st, m)?;
+            st.set(id).count(|c| c.evicted += span);
+            freed += span;
         }
         Ok(freed)
     }
 
+    /// Releases idle chunks, largest first, until at most `keep` bytes are idle.
     fn keep_idle(&self, st: &mut State, keep: u64) -> Result<u64> {
-        let d = cuda::driver()?;
         let mut freed = 0;
         while st.idle_bytes() > keep {
-            let size = *st.idle.keys().next_back().unwrap();
-            let h = st.idle.get_mut(&size).unwrap().pop().unwrap();
-            if st.idle[&size].is_empty() {
-                st.idle.remove(&size);
+            let mut last = st.idle.last_entry().unwrap();
+            let (size, h) = (*last.key(), last.get_mut().pop().unwrap());
+            if last.get().is_empty() {
+                last.remove();
             }
-            // SAFETY: an unmapped handle we created.
-            cuda::check("cuMemRelease", unsafe { (d.mem_release)(h) })?;
+            call!("cuMemRelease", mem_release(h))?;
             freed += size;
         }
         Ok(freed)
@@ -1000,90 +905,74 @@ impl Inner {
 
     fn new_slot(&self, st: &mut State, span: u64) -> Result<usize> {
         for i in 0..st.slots.len() {
-            if st.slots[i].as_mut().is_some_and(|s| s.span < span) && st.slot(i).quiet()? {
+            if st.slots[i].as_ref().is_some_and(|s| s.m.span < span) && st.slot(i).m.quiet()? {
                 self.drop_slot(st, i)?;
             }
         }
         let va = reserve_va(span)?;
-        let chunks = self.map(st, va, span).inspect_err(|_| {
-            let _ = free_va(va, span);
-        })?;
-        let slot = Slot { va, span, chunks, holds: None, fill: None, fresh: false, pins: 0, released: Vec::new(), pending: false, used: 0 };
-        let i = st.slots.iter().position(Option::is_none).unwrap_or(st.slots.len());
-        if i == st.slots.len() {
-            st.slots.push(None);
+        let m = self.map(st, va, span).inspect_err(|_| drop(free_va(va, span)))?;
+        let slot = Some(Slot { m, holds: None, pending: false, used: 0 });
+        match st.slots.iter().position(Option::is_none) {
+            Some(i) => st.slots[i] = slot,
+            None => st.slots.push(slot),
         }
-        st.slots[i] = Some(slot);
-        Ok(i)
+        Ok(st.slots.iter().position(|s| s.as_ref().is_some_and(|s| s.m.va == va)).unwrap())
     }
 
     fn drop_slot(&self, st: &mut State, i: usize) -> Result<()> {
-        let s = st.slots[i].take().expect("a live slot");
-        self.unmap(st, s.va, s.span, s.chunks)?;
-        free_va(s.va, s.span)
+        let m = st.slots[i].take().expect("a live slot").m;
+        let (va, span) = (m.va, m.span);
+        self.unmap(st, m)?;
+        free_va(va, span)
     }
 
     /// A slot for streamed region `r`: the one holding it, else a settled one (empty, then
     /// consumed, then, for a bind, a prefetch not yet bound), else a new one. A prefetch makes a
     /// new one only below `SLOTS`, and otherwise does nothing (None).
     fn slot_for(&self, st: &mut State, set: usize, r: u32, urgent: bool) -> Result<Option<usize>> {
-        let (span, nbytes) = {
-            let reg = st.set(set).src.layout.region(r)?;
-            (reg.span, reg.nbytes)
-        };
+        let (w, span) = (st.set(set).w.clone(), st.slot_span);
+        let x = w.layout.region(r)?;
         let held = st.slots.iter().position(|s| s.as_ref().is_some_and(|s| s.holds == Some((set, r))));
         let i = match held {
-            Some(i) if !(st.slot(i).pins == 0 && st.slot(i).fill.as_ref().is_some_and(|f| f.failed())) => return Ok(Some(i)),
+            Some(i) if !st.slot(i).m.dead() => return Ok(Some(i)),
             Some(i) => i,
             None => {
-                let pick = st
-                    .slots
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, s)| s.as_ref().map(|s| (i, s)))
-                    .filter(|(_, s)| s.settled() && s.span >= span && (urgent || !s.pending))
-                    .min_by_key(|(_, s)| (s.holds.is_some(), s.pending, s.used))
-                    .map(|(i, _)| i);
-                match pick {
+                let live = st.slots.iter().enumerate().filter_map(|(i, s)| Some((i, s.as_ref()?)));
+                let settled = live.filter(|(_, s)| s.m.settled() && s.m.span >= x.span && (urgent || !s.pending));
+                match settled.min_by_key(|(_, s)| (s.holds.is_some(), s.pending, s.used)).map(|(i, _)| i) {
                     Some(i) => i,
-                    None if urgent || st.slots.iter().flatten().count() < SLOTS => self.new_slot(st, span.max(st.slot_span))?,
+                    None if urgent || st.slots.iter().flatten().count() < SLOTS => self.new_slot(st, x.span.max(span))?,
                     None => return Ok(None),
                 }
             }
         };
         let clock = st.clock;
-        let src = st.set(set).src.clone();
         let s = st.slot(i);
-        let fill = Fill::new();
-        let waits = std::mem::take(&mut s.released);
-        (s.fill, s.fresh, s.holds, s.pending, s.used) = (Some(fill.clone()), true, Some((set, r)), !urgent, clock);
-        let dst = s.va;
+        (s.holds, s.pending, s.used) = (Some((set, r)), !urgent, clock);
+        let ((fill, waits), dst) = (s.m.refill(), s.m.va);
         st.set(set).count(|c| {
-            c.streamed_bytes += nbytes;
+            c.streamed_bytes += x.nbytes;
             c.faults += urgent as u64;
         });
-        self.submit(Job { set, src, region: r, dst, waits, fill }, urgent);
+        self.submit(Job { set, w, region: r, dst, waits, fill }, urgent);
         Ok(Some(i))
     }
 
-    /// Map region `r` at home and queue its fill.
+    /// Maps region `r` at home and queues its fill.
     fn map_home(&self, st: &mut State, set: usize, r: u32, urgent: bool) -> Result<()> {
-        let s = st.set(set);
-        let reg = s.src.layout.region(r)?;
-        let (va, span, nbytes, src) = (s.base + reg.offset, reg.span, reg.nbytes, s.src.clone());
+        let (w, base) = (st.set(set).w.clone(), st.set(set).base);
+        let x = w.layout.region(r)?;
         let t = Instant::now();
-        let chunks = self.map(st, va, span)?;
+        let mut m = self.map(st, base + x.offset, x.span)?;
         let ns = t.elapsed().as_nanos() as u64;
-        let fill = Fill::new();
-        let reg = st.reg(set, r)?;
-        let waits = std::mem::take(&mut reg.released);
-        reg.map = Some(Mapping { chunks, fill: fill.clone(), fresh: true });
+        let ((fill, waits), dst) = (m.refill(), m.va);
+        st.reg(set, r)?.map = Some(m);
         st.set(set).count(|c| {
             c.map_ns += ns;
-            c.paged_in += nbytes;
+            c.paged_in += x.nbytes;
             c.faults += urgent as u64;
         });
-        self.submit(Job { set, src, region: r, dst: va, waits, fill }, urgent);
+        self.submit(Job { set, w, region: r, dst, waits, fill }, urgent);
         Ok(())
     }
 }
@@ -1097,10 +986,8 @@ impl Drop for Inner {
         unsafe { (d.stream_synchronize)(self.copy.0) };
         let mut st = std::mem::take(self.st.get_mut().unwrap());
         for i in 0..st.slots.len() {
-            if let Some(s) = st.slots[i].as_mut() {
-                for e in &s.released {
-                    let _ = e.sync();
-                }
+            if let Some(s) = &st.slots[i] {
+                s.m.released.iter().for_each(|e| drop(e.sync()));
                 let _ = self.drop_slot(&mut st, i);
             }
         }
@@ -1121,21 +1008,10 @@ pub struct WeightSet {
     gpu: Arc<Gpu>,
     id: usize,
     base: u64,
-    name: String,
-    layout: Arc<Layout>,
-    parts: Vec<Part>,
+    pub weights: Arc<Weights>,
 }
 
 impl WeightSet {
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-    pub fn layout(&self) -> &Layout {
-        &self.layout
-    }
-    pub fn parts(&self) -> &[Part] {
-        &self.parts
-    }
     pub fn device(&self) -> i32 {
         self.gpu.inner.ordinal
     }
@@ -1143,23 +1019,16 @@ impl WeightSet {
     /// The watermark: `regions` live at their home VA, the rest stream through slots. A region
     /// left out stays mapped until evicted, and serves binds from home meanwhile.
     pub fn home(&self, regions: &[u32]) -> Result<()> {
-        let g = &self.gpu.inner;
-        let _c = CtxGuard::enter(g.ctx)?;
-        let mut st = g.lock();
-        let n = self.layout.regions.len() as u32;
+        let n = self.weights.layout.regions.len() as u32;
         if let Some(r) = regions.iter().find(|&&r| r >= n) {
             return Err(Error::Invalid(format!("region {r} of {n}")));
         }
+        let mut st = self.gpu.inner.lock();
         for (r, reg) in st.set(self.id).regs.iter_mut().enumerate() {
             reg.home = regions.contains(&(r as u32));
         }
-        st.slot_span = st
-            .sets
-            .iter()
-            .flatten()
-            .flat_map(|s| s.regs.iter().zip(&s.src.layout.regions).filter(|(r, _)| !r.home).map(|(_, x)| x.span))
-            .max()
-            .unwrap_or(0);
+        let streamed = st.sets.iter().flatten().flat_map(|s| s.regs.iter().zip(&s.w.layout.regions).filter(|(r, _)| !r.home));
+        st.slot_span = streamed.map(|(_, x)| x.span).max().unwrap_or(0);
         Ok(())
     }
 
@@ -1175,80 +1044,76 @@ impl WeightSet {
                 st.resolve();
             }
             let clock = st.clock;
-            st.set(self.id).used = clock;
-            st.set(self.id).count(|c| c.binds += 1);
+            let set = st.set(self.id);
+            set.used = clock;
+            set.count(|c| c.binds += 1);
             let reg = st.reg(self.id, region)?;
-            if reg.pins == 0 && reg.map.as_ref().is_some_and(|m| m.fill.failed()) {
+            if reg.map.as_ref().is_some_and(Mapping::dead) {
                 let m = reg.map.take().unwrap();
-                let (va, span) = self.span(region);
-                g.unmap(&mut st, va, span, m.chunks)?;
+                g.unmap(&mut st, m)?;
             }
             let reg = st.reg(self.id, region)?;
             if reg.map.is_some() || reg.home {
                 if reg.map.is_none() {
                     g.map_home(&mut st, self.id, region, true)?;
                 }
-                let reg = st.reg(self.id, region)?;
-                reg.pins += 1;
-                let m = reg.map.as_mut().unwrap();
-                (At::Home, self.span(region).0, m.fill.clone(), std::mem::take(&mut m.fresh))
+                let (ptr, fill, fresh) = st.reg(self.id, region)?.map.as_mut().unwrap().pin();
+                (At::Home, ptr, fill, fresh)
             } else {
                 let i = g.slot_for(&mut st, self.id, region, true)?.expect("a bind always gets a slot");
                 let s = st.slot(i);
-                s.pins += 1;
                 s.pending = false;
-                (At::Slot(i), s.va, s.fill.clone().expect("a held slot has a fill"), std::mem::take(&mut s.fresh))
+                let (ptr, fill, fresh) = s.m.pin();
+                (At::Slot(i), ptr, fill, fresh)
             }
         };
         g.hurry(&fill);
-        let ready = match fill.wait() {
-            Ok(ready) => ready,
-            Err(e) => {
-                self.release(at, region, None);
-                return Err(e);
-            }
-        };
-        if !ready.done()? {
+        let ready = fill.wait().inspect_err(|_| self.release(at, region, None))?;
+        let nbytes = self.weights.layout.regions[region as usize].nbytes;
+        let pinned = Pinned { ws: self.clone(), at, region, ptr, nbytes, fresh, stream, ready };
+        if !pinned.ready.done()? {
             let s = stream as CUstream;
-            let (a, b) = (g.events.get(true)?, g.events.get(true)?);
-            a.record(s)?;
-            wait_in(s, &ready)?;
-            b.record(s)?;
+            let a = g.events.record(s, true)?;
+            wait_in(s, &pinned.ready)?;
+            let b = g.events.record(s, true)?;
             let mut st = g.lock();
             let step = st.steps;
-            st.timings.push(Timing { set: self.id, step, kind: Kind::Stall, a, b });
+            st.timings.push(Timing { set: self.id, step, field: |c| &mut c.stall_ns, a, b });
         }
-        let nbytes = self.layout.regions[region as usize].nbytes;
-        Ok(Pinned { ws: self.clone(), at, region, ptr, nbytes, fresh, stream, ready })
+        Ok(pinned)
     }
 
     /// Start filling region `r` ahead of its bind: at home, or into a free slot. Never waits.
     pub fn prefetch(&self, region: u32) -> Result<()> {
         let g = &self.gpu.inner;
-        let _c = CtxGuard::enter(g.ctx)?;
-        let mut st = g.lock();
-        let reg = st.reg(self.id, region)?;
-        if reg.map.is_some() {
-            return Ok(());
-        }
-        if reg.home {
-            g.map_home(&mut st, self.id, region, false)?;
-        } else {
-            g.slot_for(&mut st, self.id, region, false)?;
-        }
-        Ok(())
+        g.with(|st| {
+            let reg = st.reg(self.id, region)?;
+            if reg.map.is_none() {
+                if reg.home {
+                    g.map_home(st, self.id, region, false)?;
+                } else {
+                    g.slot_for(st, self.id, region, false)?;
+                }
+            }
+            Ok(())
+        })
     }
 
-    /// Unmap `regions` (all when None) at home, those unpinned whose fill and release events
-    /// completed; returns the bytes unmapped. Their chunks go idle, beyond a small cache back
-    /// to the driver.
+    /// Unmaps `regions` (all when None) at home, those unpinned whose fill and release events
+    /// completed; returns the bytes unmapped. Their chunks go idle, beyond a small cache back to
+    /// the driver.
     pub fn evict(&self, regions: Option<&[u32]>) -> Result<u64> {
         let g = &self.gpu.inner;
-        let _c = CtxGuard::enter(g.ctx)?;
-        let mut st = g.lock();
-        let freed = g.evict(&mut st, self.id, regions, u64::MAX)?;
-        g.keep_idle(&mut st, IDLE_KEEP)?;
-        Ok(freed)
+        g.with(|st| {
+            let freed = g.evict(st, self.id, regions, u64::MAX)?;
+            g.keep_idle(st, IDLE_KEEP)?;
+            Ok(freed)
+        })
+    }
+
+    /// Region `r` is mapped at home with bytes there or on their way.
+    pub fn resident(&self, region: u32) -> Result<bool> {
+        Ok(self.gpu.inner.lock().reg(self.id, region)?.map.as_ref().is_some_and(|m| !m.dead()))
     }
 
     /// Whether its model is warm (loaded at GPU level): an ask takes idle sets first.
@@ -1261,30 +1126,19 @@ impl WeightSet {
         self.gpu.inner.lock().set(self.id).busy = busy;
     }
 
-    fn span(&self, r: u32) -> (u64, u64) {
-        let reg = &self.layout.regions[r as usize];
-        (self.base + reg.offset, reg.span)
-    }
-
     fn release(&self, at: At, region: u32, ev: Option<EvRef>) {
         let mut st = self.gpu.inner.lock();
-        let released = match at {
+        let m = match at {
             At::Home => match st.reg(self.id, region) {
-                Ok(reg) => {
-                    reg.pins -= 1;
-                    &mut reg.released
-                }
-                Err(_) => return,
+                Ok(Reg { map: Some(m), .. }) => m,
+                _ => return,
             },
-            At::Slot(i) => {
-                let s = st.slot(i);
-                s.pins -= 1;
-                &mut s.released
-            }
+            At::Slot(i) => &mut st.slot(i).m,
         };
+        m.pins -= 1;
         if let Some(e) = ev {
-            let _ = passed(released);
-            released.push(e);
+            let _ = passed(&mut m.released);
+            m.released.push(e);
         }
     }
 }
@@ -1295,32 +1149,25 @@ impl Drop for WeightSet {
         let Ok(_c) = CtxGuard::enter(g.ctx) else { return };
         let set = {
             let mut st = g.lock();
-            for s in st.slots.iter_mut().flatten() {
-                if s.holds.is_some_and(|(set, _)| set == self.id) {
-                    s.holds = None;
-                }
+            for s in st.slots.iter_mut().flatten().filter(|s| s.holds.is_some_and(|(set, _)| set == self.id)) {
+                s.holds = None;
             }
             st.sets[self.id].take()
         };
-        let Some(mut set) = set else { return };
-        for reg in &set.regs {
-            if let Some(m) = &reg.map {
-                if let Ok(ready) = m.fill.wait() {
-                    let _ = ready.sync();
-                }
+        let Some(set) = set else { return };
+        let maps: Vec<Mapping> = set.regs.into_iter().filter_map(|r| r.map).collect();
+        for m in &maps {
+            if let Some(Ok(ready)) = m.fill.as_ref().map(|f| f.wait()) {
+                let _ = ready.sync();
             }
-            for e in &reg.released {
-                let _ = e.sync();
-            }
+            m.released.iter().for_each(|e| drop(e.sync()));
         }
         let mut st = g.lock();
-        for (reg, x) in set.regs.iter_mut().zip(&self.layout.regions) {
-            if let Some(m) = reg.map.take() {
-                let _ = g.unmap(&mut st, set.base + x.offset, x.span, m.chunks);
-            }
+        for m in maps {
+            let _ = g.unmap(&mut st, m);
         }
         let _ = g.keep_idle(&mut st, IDLE_KEEP);
-        let _ = free_va(set.base, self.layout.nbytes.max(REGION_ALIGN));
+        let _ = free_va(self.base, self.weights.layout.nbytes.max(REGION_ALIGN));
     }
 }
 
@@ -1348,9 +1195,11 @@ impl Pinned {
     pub fn home(&self) -> bool {
         matches!(self.at, At::Home)
     }
+
     pub fn device(&self) -> i32 {
         self.ws.device()
     }
+
     /// Make `stream` wait for the bytes too (a consumer other than the bind stream).
     pub fn wait_on(&self, stream: u64) -> Result<()> {
         if stream == self.stream || self.ready.done()? {
@@ -1364,12 +1213,7 @@ impl Pinned {
 impl Drop for Pinned {
     fn drop(&mut self) {
         let g = &self.ws.gpu.inner;
-        let ev = CtxGuard::enter(g.ctx).and_then(|_c| {
-            let e = g.events.get(false)?;
-            e.record(self.stream as CUstream)?;
-            Ok(e)
-        });
-        match ev {
+        match CtxGuard::enter(g.ctx).and_then(|_c| g.events.record(self.stream as CUstream, false)) {
             Ok(e) => self.ws.release(self.at, self.region, Some(e)),
             // No event to order the release by: the pin stays, and the pages with it.
             Err(e) => tracing::warn!("varena: a release could not be recorded, region {} stays pinned: {e}", self.region),
@@ -1385,60 +1229,38 @@ pub struct Host;
 /// A weight set's regions in host memory: views of a sealed host layout (read-only, shared),
 /// or private memory read once from the chunk files and kept until the set goes.
 pub struct HostSet {
-    name: String,
-    parts: Vec<Part>,
-    src: Src,
+    pub weights: Weights,
     regs: Mutex<Vec<(Option<Arc<Anon>>, bool)>>,
 }
 
 impl Host {
     #[cfg(feature = "store")]
     pub fn register<'c>(&self, name: &str, ck: impl Into<Ck<'c>>, regions: &[Vec<String>], host_fd: Option<RawFd>, files: Option<Vec<(ObjectRef, File)>>) -> Result<Arc<HostSet>> {
-        let ck = ck.into();
-        if host_fd.is_none() && files.is_none() && ck.paths.is_none() {
-            return Err(Error::Invalid("a header parsed alone reads only a grant: chunk files or a sealed layout".into()));
-        }
-        let (layout, source) = open_checkpoint(ck, regions, false, files)?;
-        let host = host_fd.map(|fd| HostMem::adopt_sealed(fd, &layout)).transpose()?;
-        if host.as_ref().is_some_and(|h| h.window().is_some()) {
-            return Err(Error::Invalid("a streamed host layout: register takes a whole sealed layout".into()));
-        }
-        let parts = parts(ck.header, &layout);
-        let regs = Mutex::new(vec![(None, false); layout.regions.len()]);
-        Ok(Arc::new(HostSet { name: name.into(), parts, src: Src { layout: Arc::new(layout), source, host }, regs }))
+        let weights = Weights::open(name, ck.into(), regions, host_fd, files)?;
+        Ok(Arc::new(HostSet { regs: Mutex::new(vec![(None, false); weights.layout.regions.len()]), weights }))
     }
 }
 
 impl HostSet {
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-    pub fn layout(&self) -> &Layout {
-        &self.src.layout
-    }
-    pub fn parts(&self) -> &[Part] {
-        &self.parts
-    }
-
     pub fn bind(self: &Arc<Self>, region: u32) -> Result<HostPinned> {
-        let reg = self.src.layout.region(region)?;
-        let mut regs = self.regs.lock().unwrap();
+        let (w, mut regs) = (&self.weights, self.regs.lock().unwrap());
+        let reg = w.layout.region(region)?;
         let (buf, bound) = &mut regs[region as usize];
-        let (ptr, buf) = match self.src.host.as_ref().filter(|h| !h.hole(region)) {
+        let sealed = w.host.as_ref().filter(|h| !h.hole(region));
+        let (ptr, buf) = match sealed {
             Some(h) => {
                 h.wait_ready(region)?;
                 (h.base() as u64 + reg.offset, None)
             }
             None => {
                 if buf.is_none() {
-                    *buf = Some(Arc::new(Anon::read(&self.src, region)?));
+                    *buf = Some(Arc::new(Anon::read(w, region)?));
                 }
-                let b = buf.clone().unwrap();
-                (b.ptr as u64, Some(b))
+                (buf.as_ref().unwrap().ptr as u64, buf.clone())
             }
         };
         let fresh = !std::mem::replace(bound, true);
-        Ok(HostPinned { _set: self.clone(), _buf: buf, region, ptr, nbytes: reg.nbytes, fresh, writable: self.src.host.as_ref().is_none_or(|h| h.hole(region)) })
+        Ok(HostPinned { _set: self.clone(), _buf: buf, region, ptr, nbytes: reg.nbytes, fresh, writable: sealed.is_none() })
     }
 }
 
@@ -1451,8 +1273,8 @@ unsafe impl Send for Anon {}
 unsafe impl Sync for Anon {}
 
 impl Anon {
-    fn read(src: &Src, r: u32) -> Result<Anon> {
-        let reg = src.layout.region(r)?;
+    fn read(w: &Weights, r: u32) -> Result<Anon> {
+        let reg = w.layout.region(r)?;
         let len = align_up(reg.nbytes.max(1), PART_ALIGN) as usize;
         // SAFETY: a fresh private anonymous mapping.
         let ptr = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0) };
@@ -1460,10 +1282,9 @@ impl Anon {
             return Err(Error::Io(format!("map {len} bytes: {}", std::io::Error::last_os_error())));
         }
         let a = Anon { ptr: ptr as *mut u8, len };
-        let tally = IoTally::default();
         for it in &reg.items {
             // SAFETY: a buffered read writes `it.len` bytes inside the mapping.
-            unsafe { src.source.read_item(it, a.ptr.add((it.offset - reg.offset) as usize), Mode::Buffered, &tally)? };
+            unsafe { w.source.read_item(it, a.ptr.add((it.offset - reg.offset) as usize), Mode::Buffered, &IoTally::default())? };
         }
         Ok(a)
     }
@@ -1491,11 +1312,10 @@ pub struct HostPinned {
 // ---------------------------------------------------------------- helpers
 
 /// The one layout of `regions` of `ck`, and its chunk files (`files`, else the checkpoint's own
-/// paths): what `register` maps and what a sealed host layout for it holds. An owner fills one
-/// with this (or `seal`), so the two agree by construction; `HostMem::adopt_sealed` checks the
-/// digest.
+/// paths): what `register` maps and what a sealed host layout for it holds, the same by
+/// construction; `HostMem::adopt_sealed` checks the digest.
 #[cfg(feature = "store")]
-pub fn open_checkpoint(ck: Ck<'_>, regions: &[Vec<String>], direct_io: bool, files: Option<Vec<(ObjectRef, File)>>) -> Result<(Layout, Source)> {
+fn open_checkpoint(ck: Ck<'_>, regions: &[Vec<String>], direct_io: bool, files: Option<Vec<(ObjectRef, File)>>) -> Result<(Layout, Source)> {
     let components: Vec<&str> = regions.iter().flatten().filter_map(|t| t.split_once('/').map(|(c, _)| c)).collect();
     let plan = crate::checkpoint::read_plan(ck.header, &components);
     let files = match (files, ck.paths) {
@@ -1507,8 +1327,7 @@ pub fn open_checkpoint(ck: Ck<'_>, regions: &[Vec<String>], direct_io: bool, fil
 }
 
 /// `regions` of `ck` in a sealed host layout, filled in this process from the chunk files
-/// (`files`, else the checkpoint's paths): the memfd `register(host_fd=)` adopts, the same
-/// layout by construction.
+/// (`files`, else the checkpoint's paths): the memfd `register(host_fd=)` adopts.
 #[cfg(feature = "store")]
 pub fn seal<'c>(ck: impl Into<Ck<'c>>, regions: &[Vec<String>], name: &str, threads: usize, files: Option<Vec<(ObjectRef, File)>>) -> Result<OwnedFd> {
     let (layout, source) = open_checkpoint(ck.into(), regions, true, files)?;
@@ -1517,14 +1336,12 @@ pub fn seal<'c>(ck: impl Into<Ck<'c>>, regions: &[Vec<String>], name: &str, thre
 
 fn reserve_va(size: u64) -> Result<u64> {
     let mut base = 0u64;
-    // SAFETY: out-param; size is a granularity multiple.
-    cuda::check("cuMemAddressReserve", unsafe { (cuda::driver()?.mem_address_reserve)(&mut base, size as usize, REGION_ALIGN as usize, 0, 0) })?;
+    call!("cuMemAddressReserve", mem_address_reserve(&mut base, size as usize, REGION_ALIGN as usize, 0, 0))?;
     Ok(base)
 }
 
 fn free_va(base: u64, size: u64) -> Result<()> {
-    // SAFETY: a reservation we made, fully unmapped.
-    cuda::check("cuMemAddressFree", unsafe { (cuda::driver()?.mem_address_free)(base, size as usize) })
+    call!("cuMemAddressFree", mem_address_free(base, size as usize))
 }
 
 /// The parts of `items` inside layout range `[lo, hi)`, split at the edges.

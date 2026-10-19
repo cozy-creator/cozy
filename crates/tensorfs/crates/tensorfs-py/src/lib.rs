@@ -12,7 +12,6 @@ mod docs;
 mod errors;
 #[cfg_attr(windows, path = "varena_windows.rs")]
 mod varena;
-mod varena_ledger;
 mod readplan;
 #[cfg(feature = "store")]
 mod serve;
@@ -57,7 +56,6 @@ fn _ext(m: &Bound<'_, PyModule>) -> PyResult<()> {
     #[cfg(feature = "store")]
     store_api(m)?;
     varena::install(m)?;
-    varena_ledger::install(m)?;
     Ok(())
 }
 

@@ -1,133 +1,54 @@
-//! The per-GPU ledger (design memory-varena §5.6): one memfd table, one row per process
-//! holding bytes on the GPU.
+//! The per-GPU ledger (design memory-varena §5.6): one memfd table, one row per process holding
+//! bytes on the GPU, then a peaks table any process writes (`<package>|<shape>` → bytes) and a
+//! dispatch table TensorD writes (request id → that key).
 //!
-//! A row has one writer, its process, which claims it with an OFD lock on the row's bytes. The
-//! kernel drops the lock at death, so anyone can tell a dead row by probing the lock. Rows hold
-//! atomics only. Facts are a latch (two copies under one sequence): a reader never tears and
-//! never waits on a writer that died mid-publish. Asks are cumulative counters. An asker adds
-//! to `asked`; the owner answers by raising `handled` to what it saw and adding what it freed.
-//! Nothing here touches CUDA or keeps time: stalls are judged by progress counters.
-//!
-//! For TensorD's `fits` (design §5.6): each row also publishes its running requests with their
-//! remaining measured peaks (a latch like the facts); after the rows, a peaks table any process
-//! writes (`<package>|<shape>` → bytes) and a dispatch table TensorD alone writes (request id →
-//! that key). Freed bytes bump a futex generation and signal an eventfd beside the table.
+//! A row has one writer, its process, which claims it with an OFD lock the kernel drops at death.
+//! Rows hold atomics only; a row's facts and running requests are a latch (two copies under one
+//! sequence), so a reader never tears and never waits on a writer that died mid-write. Asks are
+//! cumulative: an asker adds to `asked`, the owner raises `handled` to what it saw and adds what
+//! it freed. Freed bytes bump a futex generation and signal an eventfd beside the table. Nothing
+//! here touches CUDA or keeps time: stalls are judged by progress counters.
 
 use std::collections::HashMap;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
 use std::sync::atomic::{fence, AtomicU32, AtomicU64};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use cozy_platform::shm::{self, Region, RESIZE_SEALS};
 
 use crate::{Error, Result};
 
-const MAGIC: u64 = u64::from_le_bytes(*b"vledger2");
+const MAGIC: u64 = u64::from_le_bytes(*b"vledger3");
 pub const ROWS: u32 = 64;
+/// Bytes of a request id and of a peaks key; running requests a row names.
+pub const REQUEST_ID: usize = 64;
+pub const PEAK_KEY: usize = 120;
+pub const RUNNING: usize = 8;
 const HEADER: usize = 256;
 const ROW: usize = 1536;
-const UUID: usize = 64;
+const PEAKS: usize = 512;
+const DISPATCH: usize = 64;
 const FACTS: usize = 12;
+const ID: usize = REQUEST_ID / 8;
+const KEY: usize = PEAK_KEY / 8;
+/// The latch: the facts, the running count, then (id, remaining) per request.
+const WORDS: usize = FACTS + 1 + RUNNING * (ID + 1);
+const LEN: usize = HEADER + ROWS as usize * ROW + PEAKS * size_of::<Peak>() + DISPATCH * size_of::<Dispatch>();
 
 const FREE: u64 = 0;
 const LIVE: u64 = 1;
 const REAPING: u64 = 2;
-
-#[repr(C)]
-struct Header {
-    magic: u64,
-    rows: u32,
-    /// The free generation: a futex word `freed` bumps.
-    freed: AtomicU32,
-    capacity: u64,
-    uuid: [u8; UUID],
-}
-
-/// A request id's bytes, a peaks key's bytes, the running requests a row names, and the entries
-/// of the peaks and dispatch tables.
-pub const REQUEST_ID: usize = 64;
-pub const PEAK_KEY: usize = 120;
-pub const RUNNING: usize = 8;
-const PEAKS: usize = 512;
-const DISPATCH: usize = 64;
-const ID_WORDS: usize = REQUEST_ID / 8;
-const KEY_WORDS: usize = PEAK_KEY / 8;
-const RUN_WORDS: usize = 1 + RUNNING * (ID_WORDS + 1);
-
 const CLAIMING: u64 = 1;
 const READY: u64 = 2;
 
 #[repr(C)]
-struct PeakSlot {
-    /// 0 free, else `hash << 2 | CLAIMING or READY`.
-    word: AtomicU64,
-    key: [AtomicU64; KEY_WORDS],
-    peak: AtomicU64,
-}
-
-#[repr(C)]
-struct DispatchSlot {
-    /// 0 free, else `gen << 1 | 1` once its words are written.
-    state: AtomicU64,
-    id: [AtomicU64; ID_WORDS],
-    key: [AtomicU64; KEY_WORDS],
-}
-
-const fn table_len(rows: usize) -> usize {
-    HEADER + rows * ROW + PEAKS * size_of::<PeakSlot>() + DISPATCH * size_of::<DispatchSlot>()
-}
-
-/// `text` as zero-padded words; None when it is longer than the words hold or holds a NUL.
-fn pack<const N: usize>(text: &str) -> Option<[u64; N]> {
-    if text.len() > N * 8 || text.contains('\0') {
-        return None;
-    }
-    let mut words = [0u64; N];
-    for (i, chunk) in text.as_bytes().chunks(8).enumerate() {
-        let mut word = [0u8; 8];
-        word[..chunk.len()].copy_from_slice(chunk);
-        words[i] = u64::from_le_bytes(word);
-    }
-    Some(words)
-}
-
-fn unpack(words: &[u64]) -> String {
-    let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-    String::from_utf8_lossy(&bytes[..bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len())]).into_owned()
-}
-
-fn load<const N: usize>(words: &[AtomicU64; N]) -> [u64; N] {
-    std::array::from_fn(|i| words[i].load(Relaxed))
-}
-
-/// A key's probe start and tag: FNV-1a, never 0.
-fn hash(key: &str) -> u64 {
-    let h = key.bytes().fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3));
-    (h >> 2).max(1)
-}
-
-/// The latch both facts and running use: copy 0 is written while `seq` is odd, copy 1 while it
-/// is even; a reader reads the other, so it never waits on a writer that died mid-write.
-fn latch_write<const N: usize>(seq: &AtomicU64, copies: &[[AtomicU64; N]; 2], words: [u64; N]) {
-    let s = seq.load(Relaxed);
-    seq.store(s + 1, Relaxed);
-    fence(Release);
-    copies[0].iter().zip(words).for_each(|(a, v)| a.store(v, Relaxed));
-    seq.store(s + 2, Release);
-    fence(Release);
-    copies[1].iter().zip(words).for_each(|(a, v)| a.store(v, Relaxed));
-}
-
-fn latch_read<const N: usize>(seq: &AtomicU64, copies: &[[AtomicU64; N]; 2]) -> [u64; N] {
-    loop {
-        let s = seq.load(Acquire);
-        let words = load(&copies[(s & 1) as usize]);
-        fence(Acquire);
-        if seq.load(Relaxed) == s {
-            return words;
-        }
-    }
+struct Header {
+    magic: u64,
+    /// The free generation: a futex word `freed` bumps.
+    freed: AtomicU32,
+    capacity: u64,
+    uuid: [u64; 8],
 }
 
 #[repr(C, align(256))]
@@ -144,65 +65,96 @@ struct Slot {
     freed: AtomicU64,
     progress: AtomicU64,
     reaping: AtomicU64,
-    facts: [[AtomicU64; FACTS]; 2],
-    /// The running requests' latch: a count, then (id words, remaining) per request.
-    running_seq: AtomicU64,
-    running: [[AtomicU64; RUN_WORDS]; 2],
+    latch: [[AtomicU64; WORDS]; 2],
+}
+
+/// Filled in a prefix, never freed: 0, then `CLAIMING` while its words are written, then `READY`.
+#[repr(C)]
+struct Peak {
+    word: AtomicU64,
+    key: [AtomicU64; KEY],
+    peak: AtomicU64,
+}
+
+#[repr(C)]
+struct Dispatch {
+    /// `gen << 1 | 1` while it names a request; each fill and clear moves it.
+    state: AtomicU64,
+    id: [AtomicU64; ID],
+    key: [AtomicU64; KEY],
 }
 
 const _: () = assert!(size_of::<Slot>() == ROW && size_of::<Header>() <= HEADER);
 
-macro_rules! facts {
-    ($($(#[$doc:meta])* $field:ident),* $(,)?) => {
-        /// What a row's process publishes: bytes on this GPU, and `last_use` in CLOCK_MONOTONIC
-        /// ns (`time.monotonic_ns()`).
-        #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-        pub struct Facts {
-            $($(#[$doc])* pub $field: u64,)*
-        }
-
-        impl Facts {
-            fn words(&self) -> [u64; FACTS] {
-                [$(self.$field),*]
-            }
-
-            fn from_words([$($field),*]: [u64; FACTS]) -> Facts {
-                Facts { $($field),* }
-            }
-        }
-    };
+/// `text` as zero-padded words; None when longer than they hold or holding a NUL.
+fn pack<const N: usize>(text: &str) -> Option<[u64; N]> {
+    if text.len() > N * 8 || text.contains('\0') {
+        return None;
+    }
+    let mut words = [0u64; N];
+    for (w, chunk) in words.iter_mut().zip(text.as_bytes().chunks(8)) {
+        let mut b = [0u8; 8];
+        b[..chunk.len()].copy_from_slice(chunk);
+        *w = u64::from_le_bytes(b);
+    }
+    Some(words)
 }
 
-facts! {
-    /// CUDA context, NCCL buffers and library handles.
-    context,
-    /// Weight pages mapped.
-    resident,
-    /// Resident pages no `use` holds and nothing pins: an ask evicts them.
-    cold,
-    /// The warm set's (`keep`) part of `cold`: asked for after every other row's cold bytes.
-    kept,
-    /// Resident pages live tensors pin.
-    pinned,
-    torch_reserved,
-    torch_allocated,
-    /// Torch bytes in caches shed on an ask (part of `torch_allocated`).
-    cache,
-    /// varena's idle chunks.
-    idle,
-    /// The measured torch-allocated peak of the active requests; 0 when idle.
-    active_peak,
-    last_use,
-    /// Its requests waiting for room now: a request waits only while another row runs more
-    /// than it waits.
-    waiting,
+fn packed<const N: usize>(what: &str, text: &str) -> Result<[u64; N]> {
+    pack(text).ok_or_else(|| Error::Invalid(format!("{what} {text:?}: at most {} bytes, no NUL", N * 8)))
 }
 
-fn sum(xs: &[u64]) -> u64 {
-    xs.iter().fold(0, |s, x| s.saturating_add(*x))
+fn unpack(words: &[u64]) -> String {
+    let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    String::from_utf8_lossy(&bytes[..bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len())]).into_owned()
+}
+
+fn load<const N: usize>(words: &[AtomicU64; N]) -> [u64; N] {
+    std::array::from_fn(|i| words[i].load(Relaxed))
+}
+
+fn store(atomics: &[AtomicU64], words: &[u64]) {
+    atomics.iter().zip(words).for_each(|(a, v)| a.store(*v, Relaxed));
+}
+
+fn sum(xs: impl IntoIterator<Item = u64>) -> u64 {
+    xs.into_iter().fold(0, u64::saturating_add)
+}
+
+/// What a row's process publishes: bytes on this GPU, and `last_use` in CLOCK_MONOTONIC ns
+/// (`time.monotonic_ns()`). `context`: CUDA context, NCCL buffers, library handles. `cold`:
+/// resident pages nothing uses or pins, which an ask evicts; `kept` is the warm set's part of
+/// them, asked for after every other row's. `cache`: torch bytes in caches shed on an ask (part
+/// of `torch_allocated`). `idle`: varena's idle chunks. `active_peak`: the active requests'
+/// measured torch peak, 0 when idle. `waiting`: its requests waiting for room now.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Facts {
+    pub context: u64,
+    pub resident: u64,
+    pub cold: u64,
+    pub kept: u64,
+    pub pinned: u64,
+    pub torch_reserved: u64,
+    pub torch_allocated: u64,
+    pub cache: u64,
+    pub idle: u64,
+    pub active_peak: u64,
+    pub last_use: u64,
+    pub waiting: u64,
 }
 
 impl Facts {
+    fn words(&self) -> [u64; FACTS] {
+        let f = self;
+        [f.context, f.resident, f.cold, f.kept, f.pinned, f.torch_reserved, f.torch_allocated, f.cache, f.idle, f.active_peak, f.last_use, f.waiting]
+    }
+
+    fn from_words(w: &[u64]) -> Facts {
+        let [context, resident, cold, kept, pinned, torch_reserved, torch_allocated, cache, idle, active_peak, last_use, waiting] =
+            w[..FACTS].try_into().unwrap();
+        Facts { context, resident, cold, kept, pinned, torch_reserved, torch_allocated, cache, idle, active_peak, last_use, waiting }
+    }
+
     /// Torch bytes no ask frees: live tensors outside caches, or the active peak if higher.
     fn activations(&self) -> u64 {
         self.torch_allocated.saturating_sub(self.cache).max(self.active_peak)
@@ -210,13 +162,12 @@ impl Facts {
 
     /// Every byte the process holds now or will for its active requests.
     pub fn held(&self) -> u64 {
-        let torch = self.torch_reserved.max(self.activations().saturating_add(self.cache));
-        sum(&[self.context, self.resident, self.idle, torch])
+        sum([self.context, self.resident, self.idle, self.torch_reserved.max(self.activations().saturating_add(self.cache))])
     }
 
     /// What no ask frees: the context, weights in use or pinned, and activations.
     pub fn unevictable(&self) -> u64 {
-        sum(&[self.context, self.resident.saturating_sub(self.cold), self.activations()])
+        sum([self.context, self.resident.saturating_sub(self.cold), self.activations()])
     }
 
     /// What an ask frees, in the order the owner frees it: idle chunks, caches and slack; cold
@@ -257,18 +208,12 @@ pub struct RowFacts {
 
 impl RowFacts {
     pub fn held(&self) -> u64 {
-        match self.state {
-            State::Reaping => self.reaping,
-            _ => self.facts.held(),
-        }
+        if self.state == State::Reaping { self.reaping } else { self.facts.held() }
     }
 
     /// Bytes an ask can get from this row: only a live one answers.
     pub fn reclaimable(&self) -> u64 {
-        match self.state {
-            State::Live => self.facts.held().saturating_sub(self.facts.unevictable()),
-            _ => 0,
-        }
+        if self.state == State::Live { self.facts.held().saturating_sub(self.facts.unevictable()) } else { 0 }
     }
 
     pub fn unevictable(&self) -> u64 {
@@ -296,135 +241,40 @@ pub enum Admit {
     After { victims: Vec<Victim>, short: u64 },
 }
 
-struct Table {
-    /// This process's own description: mapped and probed, never locked.
-    fd: OwnedFd,
-    base: *mut u8,
-    len: usize,
-    rows: u32,
-}
-
-// SAFETY: the mapping is only reached through atomics (rows) or read-only data (the header).
-unsafe impl Send for Table {}
-// SAFETY: as above.
-unsafe impl Sync for Table {}
-
-impl Drop for Table {
-    fn drop(&mut self) {
-        // SAFETY: our mapping; no reference into it outlives the Table (rows hold an Arc).
-        unsafe { libc::munmap(self.base.cast(), self.len) };
-    }
+/// A table at a glance (TensorD's `status`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Status {
+    pub capacity: u64,
+    pub freed: u64,
+    pub rows: Vec<RowFacts>,
+    pub peaks: Vec<(String, u64)>,
+    pub dispatched: Vec<(String, String)>,
 }
 
 fn io(what: &str) -> Error {
     Error::Io(format!("{what}: {}", std::io::Error::last_os_error()))
 }
 
-impl Table {
-    fn map(fd: OwnedFd, len: usize) -> Result<Table> {
-        // SAFETY: a shared mapping of a memfd whose size is (or is about to be) sealed.
-        let base = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                fd.as_raw_fd(),
-                0,
-            )
-        };
-        if base == libc::MAP_FAILED {
-            return Err(io("map ledger"));
-        }
-        Ok(Table { fd, base: base.cast(), len, rows: 0 })
-    }
-
-    fn header(&self) -> &Header {
-        // SAFETY: the header is written once, before the memfd is handed out.
-        unsafe { &*(self.base as *const Header) }
-    }
-
-    fn slot(&self, i: u32) -> &Slot {
-        debug_assert!(i < self.rows);
-        // SAFETY: inside the mapping, 256-aligned; every field is atomic.
-        unsafe { &*(self.base.add(HEADER + i as usize * ROW) as *const Slot) }
-    }
-
-    fn peaks(&self) -> &[PeakSlot] {
-        // SAFETY: after the rows, inside the mapping, 8-aligned; every field is atomic.
-        unsafe { std::slice::from_raw_parts(self.base.add(HEADER + self.rows as usize * ROW) as *const PeakSlot, PEAKS) }
-    }
-
-    fn dispatch(&self) -> &[DispatchSlot] {
-        let at = HEADER + self.rows as usize * ROW + PEAKS * size_of::<PeakSlot>();
-        // SAFETY: after the peaks, inside the mapping, 8-aligned; every field is atomic.
-        unsafe { std::slice::from_raw_parts(self.base.add(at) as *const DispatchSlot, DISPATCH) }
-    }
-
-    fn alive(&self, i: u32) -> Result<bool> {
-        Ok(shm::region_holder(self.fd.as_fd(), HEADER + i as usize * ROW, ROW)
-            .map_err(crate::os("probe ledger row"))?
-            .is_some())
-    }
-
-    fn read(&self, i: u32) -> Result<Option<RowFacts>> {
-        let s = self.slot(i);
-        loop {
-            let w = s.word.load(Acquire);
-            if w & 3 == FREE {
-                return Ok(None);
-            }
-            let state = match w & 3 {
-                REAPING => State::Reaping,
-                _ if self.alive(i)? => State::Live,
-                _ => State::Dead,
-            };
-            let facts = s.facts();
-            let running = s.running();
-            let (pid, asked, handled) = (s.pid.load(Relaxed), s.asked.load(Relaxed), s.handled.load(Relaxed));
-            let (freed, progress, reaping) = (s.freed.load(Relaxed), s.progress.load(Relaxed), s.reaping.load(Relaxed));
-            fence(Acquire);
-            if s.word.load(Relaxed) == w {
-                return Ok(Some(RowFacts {
-                    slot: i,
-                    gen: w >> 2,
-                    pid,
-                    state,
-                    facts,
-                    want: asked.saturating_sub(handled),
-                    acked: freed,
-                    progress,
-                    reaping,
-                    running,
-                }));
-            }
-        }
-    }
+/// The latch's two copies: copy 0 is written while `seq` is odd, copy 1 while it is even, and a
+/// reader reads the other one.
+fn latch_write(seq: &AtomicU64, copies: &[[AtomicU64; WORDS]; 2], words: &[u64; WORDS]) {
+    let s = seq.load(Relaxed);
+    seq.store(s + 1, Relaxed);
+    fence(Release);
+    store(&copies[0], words);
+    seq.store(s + 2, Release);
+    fence(Release);
+    store(&copies[1], words);
 }
 
-impl Slot {
-    fn publish(&self, f: &Facts) {
-        latch_write(&self.seq, &self.facts, f.words());
-    }
-
-    fn facts(&self) -> Facts {
-        Facts::from_words(latch_read(&self.seq, &self.facts))
-    }
-
-    fn running(&self) -> Vec<(String, i64)> {
-        let words = latch_read(&self.running_seq, &self.running);
-        let n = (words[0] as usize).min(RUNNING);
-        (0..n)
-            .map(|i| {
-                let at = 1 + i * (ID_WORDS + 1);
-                (unpack(&words[at..at + ID_WORDS]), words[at + ID_WORDS] as i64)
-            })
-            .collect()
-    }
-
-    fn ring(&self) {
-        self.bell.fetch_add(1, Release);
-        wake(&self.bell);
+fn latch_read(seq: &AtomicU64, copies: &[[AtomicU64; WORDS]; 2]) -> [u64; WORDS] {
+    loop {
+        let s = seq.load(Acquire);
+        let words = load(&copies[(s & 1) as usize]);
+        fence(Acquire);
+        if seq.load(Relaxed) == s {
+            return words;
+        }
     }
 }
 
@@ -442,132 +292,20 @@ fn wake(word: &AtomicU32) {
 
 // Elsewhere no ledger can be created (no memfd), so these are never reached.
 #[cfg(not(target_os = "linux"))]
-fn wait(_: &AtomicU32, _: u32) {
-    std::thread::yield_now();
-}
+fn wait(_: &AtomicU32, _: u32) {}
 
 #[cfg(not(target_os = "linux"))]
 fn wake(_: &AtomicU32) {}
 
-/// One process's row. Dropping it releases the lock, so the row reads dead until reaped: its
-/// bytes stay counted until its process is gone and the caller confirms them back.
-pub struct Row {
-    t: Arc<Table>,
-    slot: u32,
-    gen: u64,
-    pid: u32,
-    _lock: OwnedFd,
-    seen: AtomicU64,
-    writer: Mutex<()>,
-}
-
-impl Row {
-    pub fn id(&self) -> u32 {
-        self.slot
-    }
-
-    pub fn gen(&self) -> u64 {
-        self.gen
-    }
-
-    pub fn pid(&self) -> u32 {
-        self.pid
-    }
-
-    pub fn publish(&self, f: &Facts) {
-        let _one = self.writer.lock().unwrap_or_else(|e| e.into_inner());
-        let s = self.t.slot(self.slot);
-        s.publish(f);
-        s.progress.fetch_add(1, Release);
-    }
-
-    /// Bytes others asked of this row and it has not answered.
-    pub fn want(&self) -> u64 {
-        let s = self.t.slot(self.slot);
-        let asked = s.asked.load(Acquire);
-        self.seen.fetch_max(asked, Relaxed);
-        asked.saturating_sub(s.handled.load(Relaxed))
-    }
-
-    /// Blocks until something is asked of this row; returns `want()`.
-    pub fn wait_want(&self) -> u64 {
-        let s = self.t.slot(self.slot);
-        loop {
-            let bell = s.bell.load(Acquire);
-            let w = self.want();
-            if w > 0 {
-                return w;
-            }
-            wait(&s.bell, bell);
+/// Blocks on futex `word` until `done` answers.
+fn until<T>(word: &AtomicU32, mut done: impl FnMut() -> Option<T>) -> T {
+    loop {
+        let seen = word.load(Acquire);
+        if let Some(x) = done() {
+            return x;
         }
+        wait(word, seen);
     }
-
-    /// Answers asks of this row on a thread of its own, with no Python: `answer(want)` frees
-    /// what it can and returns it, and each answer moves the row's progress, so a process busy
-    /// in one long kernel is never named stalled while this thread runs.
-    pub fn serve(self: &Arc<Self>, answer: impl Fn(u64) -> u64 + Send + 'static) -> Result<std::thread::JoinHandle<()>> {
-        let row = self.clone();
-        std::thread::Builder::new()
-            .name("varena-ask".into())
-            .spawn(move || loop {
-                let want = row.wait_want();
-                row.ack(answer(want));
-            })
-            .map_err(|e| Error::Io(format!("spawn the ask thread: {e}")))
-    }
-
-    /// Its requests running now and the most each still needs beyond what the process holds:
-    /// their measured remaining peak, -1 when never measured. Replaces the last list; at most
-    /// `RUNNING`, ids of at most `REQUEST_ID` bytes.
-    pub fn running(&self, requests: &[(String, i64)]) -> Result<()> {
-        if requests.len() > RUNNING {
-            return Err(Error::Invalid(format!("{} running requests: at most {RUNNING}", requests.len())));
-        }
-        let mut words = [0u64; RUN_WORDS];
-        words[0] = requests.len() as u64;
-        for (i, (id, remaining)) in requests.iter().enumerate() {
-            let at = 1 + i * (ID_WORDS + 1);
-            let packed: [u64; ID_WORDS] = pack(id)
-                .ok_or_else(|| Error::Invalid(format!("request id {id:?}: at most {REQUEST_ID} bytes, no NUL")))?;
-            words[at..at + ID_WORDS].copy_from_slice(&packed);
-            words[at + ID_WORDS] = *remaining as u64;
-        }
-        let _one = self.writer.lock().unwrap_or_else(|e| e.into_inner());
-        let s = self.t.slot(self.slot);
-        latch_write(&s.running_seq, &s.running, words);
-        s.progress.fetch_add(1, Release);
-        Ok(())
-    }
-
-    /// Answers every ask `want()` saw, having freed `freed` bytes for them.
-    pub fn ack(&self, freed: u64) {
-        let s = self.t.slot(self.slot);
-        s.handled.fetch_max(self.seen.load(Relaxed), Release);
-        s.freed.fetch_add(freed, Release);
-        s.progress.fetch_add(1, Release);
-        s.ring();
-    }
-}
-
-/// One GPU's table, mapped in this process, and the eventfd beside it.
-pub struct Ledger {
-    t: Arc<Table>,
-    /// `stalled`'s last look: (slot, gen) -> progress.
-    looks: Mutex<HashMap<(u32, u64), u64>>,
-    events: Option<OwnedFd>,
-    /// One writer of the dispatch table in this process (TensorD is its only writer).
-    dispatching: Mutex<u64>,
-}
-
-/// A table at a glance (TensorD's `status`): its capacity, free generation, rows, measured peaks
-/// and dispatched requests.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Status {
-    pub capacity: u64,
-    pub freed: u64,
-    pub rows: Vec<RowFacts>,
-    pub peaks: Vec<(String, u64)>,
-    pub dispatched: Vec<(String, String)>,
 }
 
 #[cfg(target_os = "linux")]
@@ -586,58 +324,227 @@ fn eventfd() -> Result<OwnedFd> {
     Err(Error::Invalid("the ledger's eventfd is Linux's".into()))
 }
 
-impl Ledger {
-    /// A new table in a sealed-size memfd, with an eventfd beside it (`events`); returns it and
-    /// the memfd to hand to other processes.
-    pub fn create(gpu_uuid: &str, capacity: u64) -> Result<(Ledger, OwnedFd)> {
-        if gpu_uuid.len() > UUID || gpu_uuid.contains('\0') {
-            return Err(Error::Invalid(format!("gpu uuid {gpu_uuid:?}: at most {UUID} bytes, no NUL")));
+impl Slot {
+    fn ring(&self) {
+        self.bell.fetch_add(1, Release);
+        wake(&self.bell);
+    }
+}
+
+struct Table {
+    /// This process's own description: mapped and probed, never locked.
+    fd: OwnedFd,
+    base: *mut u8,
+}
+
+// SAFETY: the mapping is only reached through atomics (rows) or read-only data (the header).
+unsafe impl Send for Table {}
+// SAFETY: as above.
+unsafe impl Sync for Table {}
+
+impl Drop for Table {
+    fn drop(&mut self) {
+        // SAFETY: our mapping; no reference into it outlives the Table (rows hold an Arc).
+        unsafe { libc::munmap(self.base.cast(), LEN) };
+    }
+}
+
+impl Table {
+    fn map(fd: OwnedFd) -> Result<Table> {
+        // SAFETY: a shared mapping of a memfd whose size is (or is about to be) sealed.
+        let base = unsafe { libc::mmap(std::ptr::null_mut(), LEN, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd.as_raw_fd(), 0) };
+        if base == libc::MAP_FAILED {
+            return Err(io("map ledger"));
         }
+        Ok(Table { fd, base: base.cast() })
+    }
+
+    fn header(&self) -> &Header {
+        // SAFETY: the header is written once, before the memfd is handed out.
+        unsafe { &*(self.base as *const Header) }
+    }
+
+    fn slot(&self, i: u32) -> &Slot {
+        // SAFETY: inside the mapping, 256-aligned; every field is atomic.
+        unsafe { &*(self.base.add(HEADER + i as usize * ROW) as *const Slot) }
+    }
+
+    fn peaks(&self) -> &[Peak] {
+        // SAFETY: after the rows, inside the mapping, 8-aligned; every field is atomic.
+        unsafe { std::slice::from_raw_parts(self.base.add(HEADER + ROWS as usize * ROW) as *const Peak, PEAKS) }
+    }
+
+    fn dispatch(&self) -> &[Dispatch] {
+        let at = HEADER + ROWS as usize * ROW + PEAKS * size_of::<Peak>();
+        // SAFETY: after the peaks, inside the mapping, 8-aligned; every field is atomic.
+        unsafe { std::slice::from_raw_parts(self.base.add(at) as *const Dispatch, DISPATCH) }
+    }
+
+    fn alive(&self, i: u32) -> Result<bool> {
+        let holder = shm::region_holder(self.fd.as_fd(), HEADER + i as usize * ROW, ROW).map_err(crate::os("probe ledger row"))?;
+        Ok(holder.is_some())
+    }
+
+    fn read(&self, i: u32) -> Result<Option<RowFacts>> {
+        let s = self.slot(i);
+        loop {
+            let w = s.word.load(Acquire);
+            let state = match w & 3 {
+                FREE => return Ok(None),
+                REAPING => State::Reaping,
+                _ if self.alive(i)? => State::Live,
+                _ => State::Dead,
+            };
+            let words = latch_read(&s.seq, &s.latch);
+            let (pid, asked, handled) = (s.pid.load(Relaxed), s.asked.load(Relaxed), s.handled.load(Relaxed));
+            let (acked, progress, reaping) = (s.freed.load(Relaxed), s.progress.load(Relaxed), s.reaping.load(Relaxed));
+            fence(Acquire);
+            if s.word.load(Relaxed) != w {
+                continue;
+            }
+            let running = words[FACTS + 1..].chunks(ID + 1).take((words[FACTS] as usize).min(RUNNING));
+            let running = running.map(|r| (unpack(&r[..ID]), r[ID] as i64)).collect();
+            let (facts, want) = (Facts::from_words(&words), asked.saturating_sub(handled));
+            return Ok(Some(RowFacts { slot: i, gen: w >> 2, pid, state, facts, want, acked, progress, reaping, running }));
+        }
+    }
+}
+
+/// One process's row. Dropping it releases the lock, so the row reads dead until reaped: its
+/// bytes stay counted until its process is gone and the caller confirms them back.
+pub struct Row {
+    t: Arc<Table>,
+    slot: u32,
+    gen: u64,
+    pid: u32,
+    _lock: OwnedFd,
+    seen: AtomicU64,
+    /// The latch's words as last written; one writer at a time.
+    words: Mutex<[u64; WORDS]>,
+}
+
+impl Row {
+    pub fn id(&self) -> u32 {
+        self.slot
+    }
+
+    pub fn gen(&self) -> u64 {
+        self.gen
+    }
+
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    fn write(&self, at: usize, part: &[u64]) {
+        let mut words = self.words.lock().unwrap_or_else(PoisonError::into_inner);
+        words[at..at + part.len()].copy_from_slice(part);
+        let s = self.t.slot(self.slot);
+        latch_write(&s.seq, &s.latch, &*words);
+        s.progress.fetch_add(1, Release);
+    }
+
+    pub fn publish(&self, f: &Facts) {
+        self.write(0, &f.words());
+    }
+
+    /// Its requests running now and the most each still needs beyond what the process holds:
+    /// their measured remaining peak, -1 when never measured. Replaces the last list.
+    pub fn running(&self, requests: &[(String, i64)]) -> Result<()> {
+        if requests.len() > RUNNING {
+            return Err(Error::Invalid(format!("{} running requests: at most {RUNNING}", requests.len())));
+        }
+        let mut words = [0u64; WORDS - FACTS];
+        words[0] = requests.len() as u64;
+        for ((id, left), w) in requests.iter().zip(words[1..].chunks_mut(ID + 1)) {
+            w[..ID].copy_from_slice(&packed::<ID>("request id", id)?);
+            w[ID] = *left as u64;
+        }
+        self.write(FACTS, &words);
+        Ok(())
+    }
+
+    /// Bytes others asked of this row and it has not answered.
+    pub fn want(&self) -> u64 {
+        let s = self.t.slot(self.slot);
+        let asked = s.asked.load(Acquire);
+        self.seen.fetch_max(asked, Relaxed);
+        asked.saturating_sub(s.handled.load(Relaxed))
+    }
+
+    /// Blocks until something is asked of this row; returns `want()`.
+    pub fn wait_want(&self) -> u64 {
+        until(&self.t.slot(self.slot).bell, || Some(self.want()).filter(|w| *w > 0))
+    }
+
+    /// Answers every ask `want()` saw, having freed `freed` bytes for them.
+    pub fn ack(&self, freed: u64) {
+        let s = self.t.slot(self.slot);
+        s.handled.fetch_max(self.seen.load(Relaxed), Release);
+        s.freed.fetch_add(freed, Release);
+        s.progress.fetch_add(1, Release);
+        s.ring();
+    }
+
+    /// Answers asks on a thread of its own, with no Python: `answer(want)` frees what it can
+    /// and returns it. Each answer moves the row's progress, so a process busy in one long
+    /// kernel is never named stalled.
+    pub fn serve(self: &Arc<Self>, answer: impl Fn(u64) -> u64 + Send + 'static) -> Result<std::thread::JoinHandle<()>> {
+        let row = self.clone();
+        let serve = move || loop {
+            row.ack(answer(row.wait_want()));
+        };
+        std::thread::Builder::new().name("varena-ask".into()).spawn(serve).map_err(|e| Error::Io(format!("spawn the ask thread: {e}")))
+    }
+}
+
+/// One GPU's table, mapped in this process, and the eventfd beside it.
+pub struct Ledger {
+    t: Arc<Table>,
+    /// `stalled`'s last look: (slot, gen) -> progress.
+    looks: Mutex<HashMap<(u32, u64), u64>>,
+    events: Option<OwnedFd>,
+    /// One writer of the dispatch table in this process (TensorD is its only writer).
+    dispatching: Mutex<()>,
+}
+
+impl Ledger {
+    fn new(t: Table, events: Option<OwnedFd>) -> Ledger {
+        Ledger { t: Arc::new(t), looks: Mutex::default(), events, dispatching: Mutex::default() }
+    }
+
+    /// A new table in a sealed-size memfd, with an eventfd beside it; returns it and the memfd
+    /// to hand to other processes.
+    pub fn create(gpu_uuid: &str, capacity: u64) -> Result<(Ledger, OwnedFd)> {
+        let uuid = packed("gpu uuid", gpu_uuid)?;
         let fd = shm::memfd_named(&format!("varena-ledger:{gpu_uuid}")).map_err(crate::os("memfd_create"))?;
-        let len = table_len(ROWS as usize);
         // SAFETY: sizing a memfd only we hold.
-        if unsafe { libc::ftruncate(fd.as_raw_fd(), len as libc::off_t) } != 0 {
+        if unsafe { libc::ftruncate(fd.as_raw_fd(), LEN as libc::off_t) } != 0 {
             return Err(io("size ledger"));
         }
-        let own = shm::reopen(fd.as_fd(), true).map_err(crate::os("reopen ledger"))?;
-        let mut t = Table::map(own, len)?;
-        let mut uuid = [0u8; UUID];
-        uuid[..gpu_uuid.len()].copy_from_slice(gpu_uuid.as_bytes());
+        let t = Table::map(shm::reopen(fd.as_fd(), true).map_err(crate::os("reopen ledger"))?)?;
         // SAFETY: nobody else holds this memfd yet.
-        unsafe {
-            (t.base as *mut Header).write(Header { magic: MAGIC, rows: ROWS, freed: AtomicU32::new(0), capacity, uuid });
-        }
-        t.rows = ROWS;
+        unsafe { (t.base as *mut Header).write(Header { magic: MAGIC, freed: AtomicU32::new(0), capacity, uuid }) };
         shm::seal_with(fd.as_fd(), RESIZE_SEALS).map_err(crate::os("seal ledger"))?;
-        let events = Some(eventfd()?);
-        Ok((Ledger { t: Arc::new(t), looks: Mutex::default(), events, dispatching: Mutex::default() }, fd))
+        Ok((Ledger::new(t, Some(eventfd()?)), fd))
     }
 
     /// The table behind `fd` (any description of it), mapped through a description of its own,
     /// with the eventfd beside it when the caller has it (`freed` signals it).
     pub fn adopt(fd: BorrowedFd<'_>, events: Option<BorrowedFd<'_>>) -> Result<Ledger> {
-        let seals = shm::seals(fd).map_err(crate::os("read ledger seals"))?;
-        if seals & RESIZE_SEALS != RESIZE_SEALS {
+        if shm::seals(fd).map_err(crate::os("read ledger seals"))? & RESIZE_SEALS != RESIZE_SEALS {
             return Err(Error::Invalid("not a ledger: its size is not sealed".into()));
         }
-        let own = shm::reopen(fd, true).map_err(crate::os("reopen ledger"))?;
-        // SAFETY: fstat into a zeroed struct.
-        let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        if unsafe { libc::fstat(own.as_raw_fd(), &mut st) } != 0 {
-            return Err(io("stat ledger"));
+        let own = std::fs::File::from(shm::reopen(fd, true).map_err(crate::os("reopen ledger"))?);
+        if own.metadata().map_err(|e| Error::Io(format!("stat ledger: {e}")))?.len() != LEN as u64 {
+            return Err(Error::Invalid("not a varena ledger: its size".into()));
         }
-        let len = st.st_size as usize;
-        if len < HEADER {
-            return Err(Error::Invalid(format!("not a ledger: {len} bytes")));
-        }
-        let mut t = Table::map(own, len)?;
-        let h = t.header();
-        if h.magic != MAGIC || len != table_len(h.rows as usize) {
+        let t = Table::map(own.into())?;
+        if t.header().magic != MAGIC {
             return Err(Error::Invalid("not a varena ledger".into()));
         }
-        t.rows = h.rows;
         let events = events.map(|e| e.try_clone_to_owned()).transpose().map_err(|e| Error::Io(format!("dup eventfd: {e}")))?;
-        Ok(Ledger { t: Arc::new(t), looks: Mutex::default(), events, dispatching: Mutex::default() })
+        Ok(Ledger::new(t, events))
     }
 
     /// The eventfd `freed` signals: TensorD polls it, and hands it to executors beside the memfd.
@@ -651,8 +558,7 @@ impl Ledger {
     }
 
     pub fn gpu_uuid(&self) -> String {
-        let u = &self.t.header().uuid;
-        String::from_utf8_lossy(&u[..u.iter().position(|&b| b == 0).unwrap_or(UUID)]).into_owned()
+        unpack(&self.t.header().uuid)
     }
 
     pub fn capacity(&self) -> u64 {
@@ -665,11 +571,8 @@ impl Ledger {
             return Err(Error::Invalid(format!("pid {pid} already holds row {}", r.slot)));
         }
         let lock = shm::reopen(self.t.fd.as_fd(), true).map_err(crate::os("reopen ledger"))?;
-        let range = |i: u32, region| {
-            shm::region_lock(lock.as_fd(), HEADER + i as usize * ROW, ROW, region, false)
-                .map_err(crate::os("lock ledger row"))
-        };
-        for i in 0..self.t.rows {
+        let range = |i: u32, region| shm::region_lock(lock.as_fd(), HEADER + i as usize * ROW, ROW, region, false).map_err(crate::os("lock ledger row"));
+        for i in 0..ROWS {
             let s = self.t.slot(i);
             let w = s.word.load(Acquire);
             if w & 3 != FREE || !range(i, Region::Write)? {
@@ -682,33 +585,29 @@ impl Ledger {
             fence(Release);
             let gen = (w >> 2) + 1;
             s.pid.store(pid, Relaxed);
-            // A writer that died mid-publish left `seq` odd: start the new one even.
+            // A writer that died mid-write left `seq` odd: start the new one even.
             s.seq.store((s.seq.load(Relaxed) | 1) + 1, Relaxed);
-            s.facts.iter().flatten().for_each(|a| a.store(0, Relaxed));
-            s.running_seq.store((s.running_seq.load(Relaxed) | 1) + 1, Relaxed);
-            s.running.iter().flatten().for_each(|a| a.store(0, Relaxed));
-            for a in [&s.asked, &s.handled, &s.freed, &s.progress, &s.reaping] {
-                a.store(0, Relaxed);
-            }
+            s.latch.iter().flatten().for_each(|a| a.store(0, Relaxed));
+            [&s.asked, &s.handled, &s.freed, &s.progress, &s.reaping].iter().for_each(|a| a.store(0, Relaxed));
             if s.word.compare_exchange(w, gen << 2 | LIVE, Release, Relaxed).is_err() {
                 range(i, Region::Unlock)?;
                 continue;
             }
-            let t = self.t.clone();
-            return Ok(Row { t, slot: i, gen, pid, _lock: lock, seen: AtomicU64::new(0), writer: Mutex::new(()) });
+            let (t, seen, words) = (self.t.clone(), AtomicU64::new(0), Mutex::new([0; WORDS]));
+            return Ok(Row { t, slot: i, gen, pid, _lock: lock, seen, words });
         }
-        Err(Error::Invalid(format!("ledger {} is full: {} rows", self.gpu_uuid(), self.t.rows)))
+        Err(Error::Invalid(format!("ledger {} is full: {ROWS} rows", self.gpu_uuid())))
     }
 
     /// Every row in use: live, dead or reaping.
     pub fn snapshot(&self) -> Result<Vec<RowFacts>> {
-        (0..self.t.rows).filter_map(|i| self.t.read(i).transpose()).collect()
+        (0..ROWS).filter_map(|i| self.t.read(i).transpose()).collect()
     }
 
-    /// Asks other live rows for `need` bytes: idle bytes, then cold weights outside warm sets, then
-    /// warm sets' cold weights, each least recently used first, net of what others already asked
-    /// of them. Sets each victim's want and rings
-    /// it. The victims may cover less than `need`.
+    /// Asks other live rows for `need` bytes: idle bytes, then cold weights outside warm sets,
+    /// then warm sets' cold weights, each least recently used first, net of what others already
+    /// asked of them. Sets each victim's want and rings it. The victims may cover less than
+    /// `need`.
     pub fn ask(&self, from: Option<u32>, need: u64) -> Result<Vec<Victim>> {
         let (mut victims, _) = pick(&self.snapshot()?, from, need);
         victims.retain_mut(|v| {
@@ -726,29 +625,18 @@ impl Ledger {
     /// The victim answered the ask, or its row is dead or gone.
     pub fn answered(&self, v: &Victim) -> Result<bool> {
         let s = self.t.slot(v.slot);
-        Ok(s.word.load(Acquire) != v.gen << 2 | LIVE
-            || s.handled.load(Acquire) >= v.until
-            || !self.t.alive(v.slot)?)
+        Ok(s.word.load(Acquire) != v.gen << 2 | LIVE || s.handled.load(Acquire) >= v.until || !self.t.alive(v.slot)?)
     }
 
-    /// Blocks until `answered`. A victim that dies without answering ends the wait when it is
-    /// reaped.
+    /// Blocks until `answered`. A victim that dies without answering ends the wait when reaped.
     pub fn wait(&self, v: &Victim) -> Result<()> {
-        let s = self.t.slot(v.slot);
-        loop {
-            let bell = s.bell.load(Acquire);
-            if self.answered(v)? {
-                return Ok(());
-            }
-            wait(&s.bell, bell);
-        }
+        until(&self.t.slot(v.slot).bell, || self.answered(v).map(|done| done.then_some(())).transpose())
     }
 
     /// `Now` only if `need` bytes are free beside every byte the rows hold. Never below need.
     pub fn admit(&self, need: u64) -> Result<Admit> {
         let rows = self.snapshot()?;
-        let held = rows.iter().fold(0u64, |s, r| s.saturating_add(r.held()));
-        let free = self.capacity().saturating_sub(held);
+        let free = self.capacity().saturating_sub(sum(rows.iter().map(RowFacts::held)));
         if free >= need {
             return Ok(Admit::Now);
         }
@@ -759,19 +647,16 @@ impl Ledger {
     /// Marks `pid`'s dead rows reaping and returns the bytes they held, which stay counted until
     /// `returned`. Refuses a pid whose only rows are live.
     pub fn reap(&self, pid: u32) -> Result<u64> {
-        let rows: Vec<_> = self.snapshot()?.into_iter().filter(|r| r.pid == pid).collect();
-        let dead: Vec<_> = rows.iter().filter(|r| r.state == State::Dead).collect();
-        if dead.is_empty() {
-            if let Some(r) = rows.iter().find(|r| r.state == State::Live) {
-                return Err(Error::Invalid(format!("pid {pid} is alive: it holds row {}", r.slot)));
-            }
+        let rows: Vec<RowFacts> = self.snapshot()?.into_iter().filter(|r| r.pid == pid).collect();
+        let dead: Vec<&RowFacts> = rows.iter().filter(|r| r.state == State::Dead).collect();
+        if let Some(r) = rows.iter().find(|r| r.state == State::Live).filter(|_| dead.is_empty()) {
+            return Err(Error::Invalid(format!("pid {pid} is alive: it holds row {}", r.slot)));
         }
         let mut held = 0;
         for r in dead {
             let s = self.t.slot(r.slot);
             s.reaping.store(r.facts.held(), Relaxed);
-            let live = r.gen << 2 | LIVE;
-            if s.word.compare_exchange(live, r.gen << 2 | REAPING, AcqRel, Relaxed).is_ok() {
+            if s.word.compare_exchange(r.gen << 2 | LIVE, r.gen << 2 | REAPING, AcqRel, Relaxed).is_ok() {
                 held += r.facts.held();
                 s.ring();
             }
@@ -782,8 +667,7 @@ impl Ledger {
     /// `pid`'s reaped bytes are back on the GPU (NVML shows them): its rows are free.
     pub fn returned(&self, pid: u32) -> Result<()> {
         let mut back = false;
-        for i in 0..self.t.rows {
-            let s = self.t.slot(i);
+        for s in (0..ROWS).map(|i| self.t.slot(i)) {
             let w = s.word.load(Acquire);
             if w & 3 == REAPING && s.pid.load(Relaxed) == pid && s.word.compare_exchange(w, w & !3, Release, Relaxed).is_ok() {
                 s.ring();
@@ -800,21 +684,13 @@ impl Ledger {
     /// look. The first look at an ask only records it.
     pub fn stalled(&self) -> Result<Vec<u32>> {
         let rows = self.snapshot()?;
-        let mut looks = self.looks.lock().unwrap_or_else(|e| e.into_inner());
-        let mut next = HashMap::new();
-        let mut stalled = Vec::new();
-        for r in rows.iter().filter(|r| r.state == State::Live && r.want > 0) {
-            if looks.get(&(r.slot, r.gen)) == Some(&r.progress) {
-                stalled.push(r.pid);
-            }
-            next.insert((r.slot, r.gen), r.progress);
-        }
-        *looks = next;
+        let mut looks = self.looks.lock().unwrap_or_else(PoisonError::into_inner);
+        let asked: Vec<&RowFacts> = rows.iter().filter(|r| r.state == State::Live && r.want > 0).collect();
+        let stalled = asked.iter().filter(|r| looks.get(&(r.slot, r.gen)) == Some(&r.progress)).map(|r| r.pid).collect();
+        *looks = asked.iter().map(|r| ((r.slot, r.gen), r.progress)).collect();
         Ok(stalled)
     }
-}
 
-impl Ledger {
     /// Bytes freed on this GPU (a request ended, an ask answered, a trim, a row returned): the
     /// free generation moves and the eventfd is signalled.
     pub fn freed(&self) {
@@ -835,120 +711,84 @@ impl Ledger {
 
     /// Blocks until the free generation is other than `seen`; returns it.
     pub fn wait_freed(&self, seen: u64) -> u64 {
-        let word = &self.t.header().freed;
-        loop {
-            let now = word.load(Acquire);
-            if now as u64 != seen {
-                return now as u64;
-            }
-            wait(word, now);
-        }
+        until(&self.t.header().freed, || Some(self.freed_gen()).filter(|g| *g != seen))
     }
 
     /// The measured peak of `key` (`<package>|<shape>`), if any process recorded one.
     pub fn peak(&self, key: &str) -> Option<u64> {
-        let words: [u64; KEY_WORDS] = pack(key)?;
-        let (h, peaks) = (hash(key), self.t.peaks());
-        for i in 0..PEAKS {
-            let slot = &peaks[(h as usize + i) % PEAKS];
-            let w = slot.word.load(Acquire);
-            if w == 0 {
-                return None;
-            }
-            if w == h << 2 | READY && load(&slot.key) == words {
-                return Some(slot.peak.load(Acquire));
-            }
-        }
-        None
+        self.peaks().into_iter().find(|(k, _)| k == key).map(|(_, peak)| peak)
     }
 
     /// Records `key`'s measured peak (any process; the latest write stands).
     pub fn set_peak(&self, key: &str, bytes: u64) -> Result<()> {
-        let words: [u64; KEY_WORDS] =
-            pack(key).ok_or_else(|| Error::Invalid(format!("peak key {key:?}: at most {PEAK_KEY} bytes, no NUL")))?;
-        let (h, peaks) = (hash(key), self.t.peaks());
+        let (words, peaks): ([u64; KEY], _) = (packed("peak key", key)?, self.t.peaks());
         let mut i = 0;
-        while i < PEAKS {
-            let slot = &peaks[(h as usize + i) % PEAKS];
-            let w = slot.word.load(Acquire);
-            if w == h << 2 | READY && load(&slot.key) == words {
-                slot.peak.store(bytes, Release);
-                return Ok(());
-            }
-            if w == 0 {
-                if slot.word.compare_exchange(0, h << 2 | CLAIMING, AcqRel, Acquire).is_err() {
-                    continue;
+        while let Some(slot) = peaks.get(i) {
+            match slot.word.load(Acquire) {
+                READY if load(&slot.key) == words => {
+                    slot.peak.store(bytes, Release);
+                    return Ok(());
                 }
-                slot.key.iter().zip(words).for_each(|(a, v)| a.store(v, Relaxed));
-                slot.peak.store(bytes, Relaxed);
-                slot.word.store(h << 2 | READY, Release);
-                return Ok(());
+                0 if slot.word.compare_exchange(0, CLAIMING, AcqRel, Acquire).is_ok() => {
+                    store(&slot.key, &words);
+                    slot.peak.store(bytes, Relaxed);
+                    slot.word.store(READY, Release);
+                    return Ok(());
+                }
+                0 => {}
+                _ => i += 1,
             }
-            i += 1;
         }
         Err(Error::Invalid(format!("ledger peaks are full: {PEAKS} keys")))
     }
 
     /// Every recorded peak.
     pub fn peaks(&self) -> Vec<(String, u64)> {
-        let ready = self.t.peaks().iter().filter(|s| s.word.load(Acquire) & 3 == READY);
+        let ready = self.t.peaks().iter().filter(|s| s.word.load(Acquire) == READY);
         ready.map(|s| (unpack(&load(&s.key)), s.peak.load(Acquire))).collect()
-    }
-
-    /// The largest recorded peak among `package`'s shapes.
-    fn widest(&self, package: &str) -> Option<u64> {
-        let prefix = format!("{package}|");
-        self.peaks().into_iter().filter(|(key, _)| key.starts_with(&prefix)).map(|(_, peak)| peak).max()
     }
 
     /// Names the key a request's peak is recorded under (TensorD's write, before it runs).
     pub fn dispatch(&self, request_id: &str, key: &str) -> Result<()> {
-        let id: [u64; ID_WORDS] = pack(request_id)
-            .ok_or_else(|| Error::Invalid(format!("request id {request_id:?}: at most {REQUEST_ID} bytes, no NUL")))?;
-        let words: [u64; KEY_WORDS] =
-            pack(key).ok_or_else(|| Error::Invalid(format!("peak key {key:?}: at most {PEAK_KEY} bytes, no NUL")))?;
-        let mut generation = self.dispatching.lock().unwrap_or_else(|e| e.into_inner());
-        self.clear(id);
-        let slot = self.t.dispatch().iter().find(|s| s.state.load(Acquire) == 0).ok_or_else(|| {
-            Error::Invalid(format!("ledger dispatch table is full: {DISPATCH} requests"))
-        })?;
-        slot.id.iter().zip(id).for_each(|(a, v)| a.store(v, Relaxed));
-        slot.key.iter().zip(words).for_each(|(a, v)| a.store(v, Relaxed));
-        *generation += 1;
-        slot.state.store(*generation << 1 | 1, Release);
+        let (id, key) = (packed::<ID>("request id", request_id)?, packed::<KEY>("peak key", key)?);
+        let _one = self.dispatching.lock().unwrap_or_else(PoisonError::into_inner);
+        self.clear(&id);
+        let free = self.t.dispatch().iter().find(|s| s.state.load(Acquire) & 1 == 0);
+        let slot = free.ok_or_else(|| Error::Invalid(format!("ledger dispatch table is full: {DISPATCH} requests")))?;
+        // Its words change only after the clear that freed it is visible.
+        fence(Release);
+        store(&slot.id, &id);
+        store(&slot.key, &key);
+        slot.state.fetch_add(3, Release);
         Ok(())
     }
 
     /// The request's entry goes (TensorD's write, once it ended).
     pub fn undispatch(&self, request_id: &str) {
-        let _one = self.dispatching.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(id) = pack::<ID_WORDS>(request_id) {
-            self.clear(id);
+        let _one = self.dispatching.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(id) = pack(request_id) {
+            self.clear(&id);
         }
     }
 
-    fn clear(&self, id: [u64; ID_WORDS]) {
-        for slot in self.t.dispatch().iter().filter(|s| s.state.load(Acquire) & 1 == 1 && load(&s.id) == id) {
-            slot.state.store(0, Release);
+    fn clear(&self, id: &[u64; ID]) {
+        for slot in self.t.dispatch().iter().filter(|s| s.state.load(Acquire) & 1 == 1 && load(&s.id) == *id) {
+            slot.state.fetch_sub(1, Release);
         }
     }
 
     /// The key TensorD named for `request_id`, if it is dispatched.
     pub fn dispatched(&self, request_id: &str) -> Option<String> {
-        let id: [u64; ID_WORDS] = pack(request_id)?;
-        self.dispatched_all().into_iter().find(|(entry, _)| pack::<ID_WORDS>(entry) == Some(id)).map(|(_, key)| key)
+        self.dispatched_all().into_iter().find(|(id, _)| id == request_id).map(|(_, key)| key)
     }
 
     fn dispatched_all(&self) -> Vec<(String, String)> {
         let mut entries = vec![];
         for slot in self.t.dispatch() {
             let state = slot.state.load(Acquire);
-            if state & 1 == 0 {
-                continue;
-            }
             let (id, key) = (load(&slot.id), load(&slot.key));
             fence(Acquire);
-            if slot.state.load(Relaxed) == state {
+            if state & 1 == 1 && slot.state.load(Relaxed) == state {
                 entries.push((unpack(&id), unpack(&key)));
             }
         }
@@ -962,38 +802,27 @@ impl Ledger {
     /// `spawn`: it starts a process too, whose context is the largest one here.
     pub fn fits(&self, package: &str, shape: Option<&str>, spawn: bool) -> Result<bool> {
         let rows = self.snapshot()?;
-        if rows.iter().any(|r| r.state != State::Live) {
+        let left: Vec<i64> = rows.iter().flat_map(|r| r.running.iter().map(|(_, left)| *left)).collect();
+        if rows.iter().any(|r| r.state != State::Live) || left.iter().any(|l| *l < 0) {
             return Ok(false);
         }
-        let remaining: Vec<i64> = rows.iter().flat_map(|r| r.running.iter().map(|(_, left)| *left)).collect();
-        if remaining.iter().any(|left| *left < 0) {
-            return Ok(false);
-        }
+        let prefix = format!("{package}|");
         let peak = match shape {
-            Some(shape) => self.peak(&format!("{package}|{shape}")),
-            None => self.widest(package),
+            Some(shape) => self.peak(&format!("{prefix}{shape}")),
+            None => self.peaks().into_iter().filter(|(key, _)| key.starts_with(&prefix)).map(|(_, peak)| peak).max(),
         };
         let Some(peak) = peak else {
-            return Ok(remaining.is_empty());
+            return Ok(left.is_empty());
         };
-        let context = match spawn {
-            true => rows.iter().map(|r| r.facts.context).max().unwrap_or(0),
-            false => 0,
-        };
-        let unevictable = rows.iter().fold(0u64, |sum, r| sum.saturating_add(r.unevictable()));
-        let reserved = remaining.iter().fold(unevictable, |sum, left| sum.saturating_add(*left as u64));
-        Ok(sum(&[reserved, context, peak]) <= self.capacity())
+        let context = if spawn { rows.iter().map(|r| r.facts.context).max().unwrap_or(0) } else { 0 };
+        let reserved = rows.iter().map(RowFacts::unevictable).chain(left.iter().map(|l| *l as u64));
+        Ok(sum(reserved.chain([context, peak])) <= self.capacity())
     }
 
     /// The table at a glance, for `machine show` and telemetry.
     pub fn status(&self) -> Result<Status> {
-        Ok(Status {
-            capacity: self.capacity(),
-            freed: self.freed_gen(),
-            rows: self.snapshot()?,
-            peaks: self.peaks(),
-            dispatched: self.dispatched_all(),
-        })
+        let (capacity, freed, peaks, dispatched) = (self.capacity(), self.freed_gen(), self.peaks(), self.dispatched_all());
+        Ok(Status { capacity, freed, rows: self.snapshot()?, peaks, dispatched })
     }
 }
 
@@ -1013,8 +842,7 @@ fn pick(rows: &[RowFacts], from: Option<u32>, need: u64) -> (Vec<Victim>, u64) {
             })
         })
         .collect();
-    let mut asked = vec![0u64; lru.len()];
-    let mut left = need;
+    let (mut asked, mut left) = (vec![0u64; lru.len()], need);
     for tier in 0..3 {
         for (a, avail) in asked.iter_mut().zip(&avail) {
             let take = left.min(avail[tier]);
@@ -1022,11 +850,6 @@ fn pick(rows: &[RowFacts], from: Option<u32>, need: u64) -> (Vec<Victim>, u64) {
             left -= take;
         }
     }
-    let victims = lru
-        .iter()
-        .zip(asked)
-        .filter(|(_, bytes)| *bytes > 0)
-        .map(|(r, bytes)| Victim { slot: r.slot, gen: r.gen, pid: r.pid, bytes, until: 0 })
-        .collect();
-    (victims, left)
+    let victims = lru.iter().zip(asked).filter(|(_, bytes)| *bytes > 0);
+    (victims.map(|(r, bytes)| Victim { slot: r.slot, gen: r.gen, pid: r.pid, bytes, until: 0 }).collect(), left)
 }

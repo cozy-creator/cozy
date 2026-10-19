@@ -15,6 +15,7 @@ create_exception!(tensorfs.varena, Invalid, VarenaError);
 create_exception!(tensorfs.varena, IoError, VarenaError);
 create_exception!(tensorfs.varena, Closed, VarenaError);
 create_exception!(tensorfs.varena, Unsupported, VarenaError);
+create_exception!(tensorfs.varena, LedgerError, PyException, "A ledger error; `.code` names its class.");
 
 fn unsupported(py: Python<'_>) -> PyErr {
     let error = Unsupported::new_err("varena has no Windows tier yet; read objects through Store leases");
@@ -39,7 +40,26 @@ macro_rules! unconstructible {
 }
 
 unconstructible!(Gpu = "Gpu", Host = "Host", WeightSet = "WeightSet", Pinned = "Pinned", Part = "Part",
-    Counters = "Counters", SetStats = "SetStats", GpuStats = "GpuStats");
+    Counters = "Counters", SetStats = "SetStats", GpuStats = "GpuStats", Row = "Row", Victim = "Victim", Admit = "Admit",
+    RowFacts = "RowFacts");
+
+#[pyclass(name = "Ledger", module = "tensorfs.varena", frozen)]
+struct Ledger;
+
+#[pymethods]
+impl Ledger {
+    #[staticmethod]
+    #[pyo3(signature = (*_args, **_kwargs))]
+    fn create(py: Python<'_>, _args: &Bound<'_, PyTuple>, _kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<()> {
+        Err(unsupported(py))
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = (*_args, **_kwargs))]
+    fn adopt(py: Python<'_>, _args: &Bound<'_, PyTuple>, _kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<()> {
+        Err(unsupported(py))
+    }
+}
 
 macro_rules! refused {
     ($($name:ident),*) => {$(
@@ -64,6 +84,11 @@ pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Counters>()?;
     m.add_class::<SetStats>()?;
     m.add_class::<GpuStats>()?;
+    m.add_class::<Ledger>()?;
+    m.add_class::<Row>()?;
+    m.add_class::<Victim>()?;
+    m.add_class::<Admit>()?;
+    m.add_class::<RowFacts>()?;
     m.add_function(wrap_pyfunction!(hold_tier, &m)?)?;
     m.add_function(wrap_pyfunction!(release_tier, &m)?)?;
     m.add_function(wrap_pyfunction!(reserve, &m)?)?;
@@ -72,7 +97,7 @@ pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     macro_rules! add_errors {
         ($($e:ident),*) => { $(m.add(stringify!($e), py.get_type::<$e>())?;)* };
     }
-    add_errors!(VarenaError, DeviceFull, CudaError, CudaUnavailable, Invalid, IoError, Closed, Unsupported);
+    add_errors!(VarenaError, DeviceFull, CudaError, CudaUnavailable, Invalid, IoError, Closed, Unsupported, LedgerError);
     parent.add_submodule(&m)?;
     py.import("sys")?.getattr("modules")?.set_item("tensorfs._ext.varena", &m)
 }
