@@ -216,6 +216,7 @@ pub async fn update(
     runtime_wheel: Option<PathBuf>,
     tensorfs_wheel: Option<PathBuf>,
     tensord: Option<PathBuf>,
+    gpu_memory_limit: Option<u64>,
 ) -> Result<ExitCode, Error> {
     let mut payload = serde_json::Map::new();
     let (mut staged, mut inputs, mut named) = (vec![], vec![], vec![]);
@@ -249,17 +250,25 @@ pub async fn update(
         payload.insert(member.into(), file.into());
         staged.push(input);
     }
+    if let Some(limit) = gpu_memory_limit {
+        named.push(match limit {
+            0 => "no GPU memory limit".into(),
+            bytes => format!("a GPU memory limit of {}", output::bytes(bytes)),
+        });
+        payload.insert("gpu_memory_limit".into(), limit.into());
+    }
     let m = machine(ctx, name).await?;
     let hub = match m.hub.as_str() {
         "" => ctx.hub()?,
         origin => ctx.config.resolve(origin)?,
     };
-    if dev
+    // A dev binary swaps and a limit restarts the machine: either way its warm models reload.
+    if (dev || gpu_memory_limit.is_some())
         && m.status
             .as_ref()
             .is_some_and(|s| s.warm.iter().any(|w| !w.level.is_empty()))
     {
-        output::warn(&format!("{}'s warm models reload after the swap", m.name));
+        output::warn(&format!("{}'s warm models reload after it restarts", m.name));
     }
     if payload.is_empty() {
         let Some(status) = &m.status else {

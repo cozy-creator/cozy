@@ -95,13 +95,15 @@ fn drain(fd: i32) -> bool {
 }
 
 impl GpuLedger {
-    /// `entry`'s ledger, sized by NVML's total, else `capacity`; None when neither says. `shared`
-    /// leaves a display its floor.
+    /// `entry`'s ledger, sized by NVML's total, else `capacity`, and never above `limit` (a larger
+    /// card standing in for a smaller one); None when neither says. `shared` leaves a display its
+    /// floor.
     pub fn start(
         entry: &str,
         shared: bool,
         floor_bytes: u64,
         capacity: Option<u64>,
+        limit: Option<u64>,
         liveness: Liveness,
         log: MemoryLog,
     ) -> io::Result<Option<Self>> {
@@ -109,9 +111,11 @@ impl GpuLedger {
             .map_err(|error| tracing::warn!("memory: NVML unavailable for {entry:?}: {error}"))
             .ok();
         let reading = device.as_ref().and_then(read);
-        let Some(total) = reading.as_ref().map(|r| r.total).or(capacity) else {
+        let Some(card) = reading.as_ref().map(|r| r.total).or(capacity) else {
             return Ok(None);
         };
+        let total = limit.map_or(card, |limit| card.min(limit));
+        log.note(serde_json::json!({"event": "ledger", "gpu": entry, "card": card, "capacity": total}));
         let uuid = device.as_ref().and_then(|d| d.key().split('/').next().map(str::to_owned)).unwrap_or_else(|| entry.into());
         let display = reading.as_ref().is_some_and(|r| r.display);
         let floor = match shared && display {

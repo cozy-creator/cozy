@@ -757,6 +757,8 @@ pub struct Gpu {
     pub family: String,
     /// discrete, coherent (GH200, GB200), unified (GB10); empty: unread.
     pub memory_class: String,
+    /// The most of `memory_bytes` this machine uses (`machine.gpu_memory_limit`); 0: all of it.
+    pub memory_limit_bytes: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, ToSchema)]

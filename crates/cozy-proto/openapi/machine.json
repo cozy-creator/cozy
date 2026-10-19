@@ -1135,6 +1135,13 @@
             "description": "discrete, coherent (GH200, GB200), unified (GB10); empty: unread.",
             "default": ""
           },
+          "memory_limit_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The most of `memory_bytes` this machine uses (`machine.gpu_memory_limit`); 0: all of it.",
+            "default": 0,
+            "minimum": 0
+          },
           "name": {
             "type": "string",
             "default": ""

@@ -143,6 +143,7 @@ pub(super) async fn frame<B: MachineBackend>(
                     cc => crate::precision::Gpus::of(&[cc]).name,
                 },
                 memory_class: g.memory_class.clone(),
+                memory_limit_bytes: identity.gpu_memory_limit.filter(|&l| l < g.memory_bytes).unwrap_or(0),
             })
             .collect(),
         hubs: identity

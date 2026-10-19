@@ -82,6 +82,10 @@ pub struct GpuConfig {
     pub inventory: Vec<crate::machine::receipt::Gpu>,
     /// Load's device limit where NVML cannot read the device total.
     pub authorized_device_limit_bytes: Option<u64>,
+    /// The most memory each GPU offers (`machine.gpu_memory_limit`): its ledger's capacity and the
+    /// lane rule's memory are never more.
+    #[serde(default)]
+    pub gpu_memory_limit: Option<u64>,
     #[serde(default)]
     pub memory: MemoryConfig,
     /// Explicitly configured locations; the executor seal is imposed on top of them.
@@ -698,7 +702,8 @@ impl Pool {
                 .find(|g| g.device_index.to_string() == *entry || g.device_uuid == *entry)
                 .map(|g| g.memory_bytes)
                 .or(config.authorized_device_limit_bytes);
-            let memory = GpuLedger::start(entry, shared, config.memory.floor_bytes, capacity, Default::default(), notes.clone())
+            let limit = config.gpu_memory_limit;
+            let memory = GpuLedger::start(entry, shared, config.memory.floor_bytes, capacity, limit, Default::default(), notes.clone())
                 .unwrap_or_else(|error| {
                     tracing::warn!("memory: GPU {entry} has no ledger: {error}");
                     None
@@ -935,6 +940,7 @@ impl Pool {
     pub fn budget(&self, degree: u32) -> Option<u64> {
         let lane = &self.devices[..self.devices.len().min(degree as usize)];
         let memory = lane.iter().map(|d| self.inventory(&d.entry).map(|g| g.memory_bytes)).min()??;
+        let memory = self.config.gpu_memory_limit.map_or(memory, |limit| memory.min(limit));
         Some(memory - memory / 4)
     }
     fn inventory(&self, entry: &str) -> Option<&crate::machine::receipt::Gpu> {
