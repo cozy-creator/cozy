@@ -1166,11 +1166,49 @@ impl Aligned {
     }
 }
 
-/// A tensor's bytes on the CPU. `torch.from_dlpack(a)` and `numpy.from_dlpack(a)` view them
-/// without a copy; an unknown dtype reads (`tobytes`) but has no DLPack type.
+/// An owned host or device allocation, also retained by every exported DLPack capsule.
+#[derive(Clone)]
+pub(crate) enum ArrayBuffer {
+    Host(Arc<Aligned>),
+    Device(Arc<tensorfs_core::io::DeviceBuffer>),
+}
+
+impl ArrayBuffer {
+    pub(crate) fn len(&self) -> usize {
+        match self { Self::Host(b) => b.len, Self::Device(b) => b.len() }
+    }
+    pub(crate) fn host(&self) -> Option<&[u8]> {
+        match self { Self::Host(b) => Some(b.bytes()), Self::Device(_) => None }
+    }
+    fn ptr(&self) -> *mut c_void {
+        match self { Self::Host(b) => b.ptr() as _, Self::Device(b) => b.ptr() as usize as _ }
+    }
+    fn device(&self) -> (i32, i32) {
+        match self { Self::Host(_) => (KDL_CPU, 0), Self::Device(b) => (KDL_CUDA, b.device()) }
+    }
+    fn duplicate(&self) -> Result<Self, Failure> {
+        use tensorfs_core::io::{self, Copy, Dst, ReadOpts, Src};
+        Ok(match self {
+            Self::Host(b) => {
+                let mut copy = Aligned::new(b.len);
+                copy.bytes_mut().copy_from_slice(b.bytes());
+                Self::Host(Arc::new(copy))
+            }
+            Self::Device(b) => {
+                let copy = io::DeviceBuffer::new(b.device(), b.len())?;
+                let request = Copy { src: Src::Device { device: b.device(), ptr: b.ptr(), stream: 0 }, dst: Dst::Device { device: b.device(), ptr: copy.ptr(), len: copy.len(), stream: 0 } };
+                // SAFETY: both allocations remain held until the copy completes.
+                unsafe { io::read(&[request], &ReadOpts::default()) }.map_err(|e| Failure::from(e.source))?;
+                Self::Device(Arc::new(copy))
+            }
+        })
+    }
+}
+
+/// A tensor's bytes. Consumers view them through DLPack without a framework dependency.
 #[pyclass(name = "Array", module = "tensorfs", frozen)]
 pub struct PyArray {
-    pub(crate) buf: Arc<Aligned>,
+    pub(crate) buf: ArrayBuffer,
     pub(crate) dtype: Dtype,
     pub(crate) shape: Vec<u64>,
 }
@@ -1213,7 +1251,7 @@ struct DLManagedTensor {
 /// What a consumer's tensor owns: its shape cells and the bytes.
 struct Held {
     shape: Vec<i64>,
-    _buf: Arc<Aligned>,
+    _buf: ArrayBuffer,
 }
 
 /// DLPack 1.1's type code and bits for `dtype`.
@@ -1278,10 +1316,19 @@ impl PyArray {
     }
     #[getter]
     fn nbytes(&self) -> usize {
-        self.buf.len
+        self.buf.len()
     }
-    fn tobytes<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
-        PyBytes::new(py, self.buf.bytes())
+    fn tobytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        if let Some(bytes) = self.buf.host() { return Ok(PyBytes::new(py, bytes)); }
+        let ArrayBuffer::Device(buffer) = &self.buf else { unreachable!() };
+        let bytes = py.detach(|| -> Result<Vec<u8>, Failure> {
+            use tensorfs_core::io::{self, Copy, Dst, ReadOpts, Src};
+            let mut bytes = vec![0; buffer.len()];
+            let request = Copy { src: Src::Device { device: buffer.device(), ptr: buffer.ptr(), stream: 0 }, dst: Dst::host(&mut bytes) };
+            unsafe { io::read(&[request], &ReadOpts::default()) }.map_err(|e| Failure::from(e.source))?;
+            Ok(bytes)
+        }).or_raise(py)?;
+        Ok(PyBytes::new(py, &bytes))
     }
 
     #[pyo3(signature = (*, stream = None, max_version = None, dl_device = None, copy = None))]
@@ -1293,13 +1340,22 @@ impl PyArray {
         dl_device: Option<(i32, i32)>,
         copy: Option<bool>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let _ = (stream, max_version);
-        if dl_device.is_some_and(|d| d != (KDL_CPU, 0)) {
+        let _ = max_version;
+        let device = self.buf.device();
+        if let Some(stream) = stream {
+            let value = stream.extract::<i64>()?;
+            if device.0 == KDL_CPU || value == 0 || value < -1 {
+                return Err(invalid(py, "DLPack stream must be a CUDA stream, 1/2 for default streams, or -1"));
+            }
+            // Every TensorFS read/launch drains before returning. The allocation is ready
+            // on every consumer stream, including the DLPack default-stream sentinels.
+        }
+        if dl_device.is_some_and(|d| d != device) {
             return Err(raise(
                 py,
                 Failure {
                     kind: Kind::Unsupported,
-                    detail: "an Array lives on the CPU (1, 0)".into(),
+                    detail: format!("this Array lives on DLPack device {device:?}"),
                 },
             ));
         }
@@ -1313,13 +1369,11 @@ impl PyArray {
             ));
         };
         let buf = if copy == Some(true) {
-            let mut buf = Aligned::new(self.buf.len);
-            buf.bytes_mut().copy_from_slice(self.buf.bytes());
-            Arc::new(buf)
+            py.detach(|| self.buf.duplicate()).or_raise(py)?
         } else {
             self.buf.clone()
         };
-        let data = buf.ptr() as *mut c_void;
+        let data = buf.ptr();
         let held = Box::into_raw(Box::new(Held {
             shape: self.shape.iter().map(|&d| d as i64).collect(),
             _buf: buf,
@@ -1329,8 +1383,8 @@ impl PyArray {
             dl_tensor: DLTensor {
                 data,
                 device: DLDevice {
-                    device_type: KDL_CPU,
-                    device_id: 0,
+                    device_type: device.0,
+                    device_id: device.1,
                 },
                 ndim: self.shape.len() as i32,
                 dtype: DLDataType {
@@ -1361,7 +1415,7 @@ impl PyArray {
     }
 
     fn __dlpack_device__(&self) -> (i32, i32) {
-        (KDL_CPU, 0)
+        self.buf.device()
     }
 
     fn __repr__(&self) -> String {

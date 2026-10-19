@@ -8,6 +8,8 @@ mod device;
 mod host;
 mod plan;
 mod probe;
+#[cfg(feature = "store")]
+pub mod decode;
 
 pub use plan::Target;
 pub use device::DeviceBuffer;
