@@ -247,9 +247,9 @@ def compare_params(
 def inherited(surface: dict[str, Any], name: str, seen: frozenset[str] = frozenset()) -> dict[str, Any]:
     """A class's members plus every member it inherits from bases declared in this surface.
 
-    `Refusal.detail` is set on the INSTANCE, and each subclass carries its own `code`. Both
+    `Error.detail` is set on the INSTANCE, and each subclass carries its own `code`. Both
     spellings have to compare equal to one declaration on the base, or the stub would have
-    to repeat two lines 149 times and the repetition would be the drift.
+    to repeat two lines for every family and the repetition would be the drift.
     """
     entry = surface.get(name)
     if entry is None or entry.get("kind") != "class" or name in seen:
@@ -269,7 +269,7 @@ def compare(runtime: dict[str, Any], stub: dict[str, Any], scope: str, faults: l
         )
     for name in sorted(set(stub) - set(runtime)):
         # A bare annotation may describe an INSTANCE attribute, which no class-level
-        # introspection can see; `Refusal.detail` is one. The direction that matters —
+        # introspection can see; `Error.detail` is one. The direction that matters —
         # an export the stub does not cover — stays absolute above.
         if stub[name].get("kind") == "value":
             continue
@@ -351,28 +351,33 @@ def emit(runtime: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def check_errors_reexports(ext: Any) -> list[str]:
-    """`tensorfs.errors` names every refusal class, one at a time.
+def check_error_families(ext: Any) -> list[str]:
+    """Every native seat exposes the same twelve error families on tensorfs.Error."""
+    import tensorfs
 
-    The same defect in miniature: this module was one `__getattr__ -> type[BaseException]`,
-    so `except errors.SortOder` type-checked and raised `AttributeError` at the moment the
-    refusal it was written to catch arrived. The list is generated from Rust and mechanical;
-    what keeps it true is being compared here rather than being remembered.
-    """
-    from tensorfs import errors
-
-    base = ext.Refusal
-    live = {n for n in dir(ext) if isinstance(getattr(ext, n), type) and issubclass(getattr(ext, n), base)}
-    named = set(getattr(errors, "__all__", [])) - {"CODES"}
-    faults = [
-        f"tensorfs.errors: {name} is a refusal class the extension exports and this module "
-        f"does not re-export — `except errors.{name}` is an AttributeError that type-checks"
-        for name in sorted(live - named)
-    ]
-    faults += [
-        f"tensorfs.errors: __all__ names {name}, which the extension does not export"
-        for name in sorted(named - live)
-    ]
+    faults = []
+    for obsolete in ("Refusal", "CODES"):
+        if hasattr(ext, obsolete) or hasattr(tensorfs, obsolete):
+            faults.append(f"{obsolete}: legacy refusal surface remains exported")
+    expected = {"invalid", "format", "not_found", "integrity", "unknown_scheme", "decode",
+                "io", "full", "network", "denied", "unsupported", "conflict"}
+    live = {name: getattr(ext, name) for name in dir(ext)
+            if isinstance(getattr(ext, name), type) and issubclass(getattr(ext, name), ext.Error)
+            and getattr(ext, name) is not ext.Error}
+    if {cls.code for cls in live.values()} != expected:
+        faults.append("Error subclasses do not expose exactly the twelve public families")
+    for name, cls in live.items():
+        if getattr(tensorfs, name, None) is not cls:
+            faults.append(f"tensorfs.{name} does not re-export its native error family")
+    try:
+        ext.parse_header(b"not a header")
+    except ext.Error as error:
+        if error.code not in expected or not isinstance(error.detail, str):
+            faults.append("parse_header did not preserve its common typed failure")
+    except Exception as error:
+        faults.append(f"parse_header escaped the common Error boundary: {type(error).__name__}")
+    else:
+        faults.append("parse_header accepted invalid CBOR")
     return faults
 
 
@@ -410,7 +415,7 @@ def main() -> int:
         )
     if not hatches:
         compare(runtime, declared, "", faults)
-    faults.extend(check_errors_reexports(_ext))
+    faults.extend(check_error_families(_ext))
     # A compiled submodule (`_ext.varena`) is typed by the stub of the facade module that
     # re-exports it (`varena.pyi`), and is held to it the same way.
     for name in sorted(n for n in runtime if isinstance(getattr(_ext, n), types.ModuleType)):
