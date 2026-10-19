@@ -5,15 +5,16 @@ A small block model (embed, N blocks, head; `_no_split_modules`) lives in a real
 and runs through `Memory`. Every check compares against the same model built from ordinary
 tensors, bit for bit:
 
-- cold, then warm: the warm pass copies nothing (sticky);
+- cold, then warm: the warm pass copies nothing (sticky), and two passes make it repeat;
 - a block's params are placeholders outside its forward, and an op on one binds it for that op;
-- the watermark falls inside a request (`room`), the streamed passes stay exact, and it is
-  restored after;
+- out of memory inside its forward, the watermark falls (rung 4), the streamed passes stay
+  exact, and it rises after the request;
 - a view a hook keeps is its page's pin: eviction leaves it;
 - a failed request leaves no bytes; two threads run one model at once;
-- a hold keeps every page for a CUDA graph; `fill` runs once per page-in; `bind` makes the
-  module's tensors; `Exhausted` leaves the memory usable;
-- the ledger row carries the facts.
+- a cache's hold keeps every page for a CUDA graph; `fill` runs once per page-in and again
+  when its `prepare()` changes; `bind` makes the module's tensors; `Exhausted` leaves the
+  memory usable;
+- TensorD's targets: a non-target's cold pages go before a target's; the row carries the facts.
 
     flock <locks>/gpu.lock python scripts/varena-torch.py [workdir] [--blocks N] [--dim D]
 Runs with any python that has torch (CUDA) and `PYTHONPATH=<worktree>/python`.
@@ -29,14 +30,17 @@ import torch
 from torch import nn
 
 import tensorfs
-from tensorfs.varena import Ledger
+from tensorfs.varena import Ledger, Target
 from tensorfs.varena.torch import (
+    Declared,
     Exhausted,
     LedgerGrant,
     Memory,
     Placeholder,
     WeightGrant,
 )
+
+MANIFEST = "sha256:" + "0" * 64
 
 results: list[bool] = []
 
@@ -109,17 +113,21 @@ def main() -> int:
     table = Ledger.create(
         str(torch.cuda.get_device_properties(0).uuid), torch.cuda.mem_get_info(0)[1]
     )
-    mem = Memory.open([0], [LedgerGrant(0, table.fd)])
+    table.set_targets([Target(f"{MANIFEST}/net", "gpu", 5)])
+    mem = Memory.open(dev, LedgerGrant(0, table.fd))
     net = meta(a.dim, a.blocks)
-    model = mem.register("net", net, WeightGrant(ck, "net"), 0)
+    model = mem.register(net, WeightGrant(ck, "net", MANIFEST))
     ref = reference(tensors, a.dim, a.blocks, dev)
     x = torch.randn(a.batch, a.dim, generator=torch.Generator().manual_seed(1)).bfloat16().to(dev)
     with torch.no_grad():
         want = ref(x)
     block = model.blocks[0].nbytes
 
-    # cold, then warm: one request, one repeating use, two passes
-    with torch.no_grad(), mem.request("cold-warm", [0]) as r, mem.use([model], repeats=True):
+    def stats(name: str) -> object:
+        return next(s for s in mem.stats(False).models if s.name == name)
+
+    # cold, then warm: one request, two passes
+    with torch.no_grad(), mem.request("cold-warm") as r:
         cold, warm = net(x), net(x)
     steps = r.stats.steps
     check(
@@ -136,6 +144,8 @@ def main() -> int:
         steps[-1].paged_in == 0 and steps[-1].streamed == 0,
         str(steps[-1]),
     )
+    check("two passes in a request make it repeat", model.repeats == 2, str(model.repeats))
+    check("its target's priority is read", stats(model.name).priority == 5, str(stats(model.name)))
     check("a request leaves nothing behind", r.stats.leftover == ((0, 0),), str(r.stats.leftover))
 
     # placeholders outside the forward; an op on one binds its block for that op
@@ -155,13 +165,23 @@ def main() -> int:
         isinstance(net.blocks[3].lin.weight, Placeholder),
     )
 
-    # the watermark falls inside a request, the streamed passes stay exact, and is restored
+    # out of memory inside its forward: the watermark falls, then rises after the request
     total = sum(b.nbytes for b in model.blocks)
-    with torch.no_grad(), mem.request("lowered", [0]) as r, mem.use([model], repeats=True):
-        mem.room(0, torch.cuda.mem_get_info(0)[0] + total // 2)
+    ballast: list[torch.Tensor] = []
+
+    def crowd(*_: object) -> None:
+        if not ballast:
+            need = torch.cuda.mem_get_info(0)[0] + total // 2
+            ballast.append(torch.empty(need, dtype=torch.uint8, device=dev))
+
+    hook = net.register_forward_pre_hook(crowd)
+    with torch.no_grad(), mem.request("lowered") as r:
+        a1 = net(x)
         lowered = model.home_bytes() - model.common.nbytes
-        a1, a2 = net(x), net(x)
-    check("room lowers the hot model's watermark", lowered < total, f"{lowered} of {total}")
+        hook.remove()
+        a2 = net(x)
+        ballast.clear()
+    check("out of memory lowers the hot model's watermark", lowered < total, f"{lowered}/{total}")
     check("streamed passes equal the reference", torch.equal(a1, want) and torch.equal(a2, want))
     check(
         "the lowered blocks stream", sum(s.streamed for s in r.stats.steps) > 0, str(r.stats.steps)
@@ -180,41 +200,35 @@ def main() -> int:
     # a view a hook keeps is its page's pin
     kept: list[torch.Tensor] = []
     hook = net.blocks[5].lin.register_forward_hook(lambda m, i, o: kept.append(m.weight))
-    with torch.no_grad(), mem.request("kept", [0]), mem.use([model]):
+    with torch.no_grad(), mem.request("kept"):
         net(x)
     hook.remove()
     torch.cuda.synchronize()
     model.evict()
-    stats = next(s for s in mem.stats().models if s.name == "net")
-    check("a kept view's page survives eviction", stats.resident >= block, str(stats))
+    check("a kept view's page survives eviction", stats(model.name).resident >= block)
     check(
         "the kept view still reads its weights",
         torch.equal(kept[0], tensors["blocks.5.lin.weight"].to(dev)),
     )
     kept.clear()
     model.evict()
-    stats = next(s for s in mem.stats().models if s.name == "net")
-    check("the page goes once the view does", stats.resident < block, str(stats))
+    check("the page goes once the view does", stats(model.name).resident < block)
 
     # a failed request frees what it allocated
     try:
-        with mem.request("fails", [0]) as r:
-            ballast = torch.empty(256 << 20, dtype=torch.uint8, device=dev)
+        with mem.request("fails") as r:
+            junk = torch.empty(256 << 20, dtype=torch.uint8, device=dev)
             raise RuntimeError("a package fault")
     except RuntimeError:
         pass
-    del ballast
+    del junk
     check("a failed request leaves no bytes", r.stats.leftover == ((0, 0),), str(r.stats.leftover))
 
     # two threads, one model, at once
     outs: list[bool] = []
 
     def run() -> None:
-        with (
-            torch.no_grad(),
-            mem.request(f"t{threading.get_ident()}", [0]),
-            mem.use([model], repeats=True),
-        ):
+        with torch.no_grad(), mem.request(f"t{threading.get_ident()}"):
             outs.extend(torch.equal(net(x), want) for _ in range(3))
 
     threads = [threading.Thread(target=run) for _ in range(2)]
@@ -223,9 +237,11 @@ def main() -> int:
     for t in threads:
         t.join()
     check("two threads run one model at once, exactly", outs == [True] * 6, str(outs))
+    check("no forward is in flight after them", stats(model.name).flight == 0)
 
-    # a hold keeps every page at its address for a CUDA graph
-    hold = model.hold()
+    # a cache's hold keeps every page at its address for a CUDA graph
+    pool = mem.register_cache("graphs:net", 0, lambda n: 0)
+    hold = pool.hold(model)
     graph, static = torch.cuda.CUDAGraph(), x.clone()
     with torch.no_grad():
         side = torch.cuda.Stream()
@@ -239,46 +255,79 @@ def main() -> int:
     graph.replay()
     check("a held model's graph replays exactly after an evict", torch.equal(out, want))
     hold.close()
+    pool.close()
     del graph, out
 
-    # fill once per page-in; bind makes the module's tensors
-    fills = [0]
+    # fill once per page-in, again when what it adds changes; bind makes the module's tensors
+    class Bias:
+        def __init__(self) -> None:
+            self.add, self.fills = 1.0, 0
 
-    def fill(blk: object, parts: dict[str, dict[str, torch.Tensor]]) -> None:
-        if "blocks.1.lin.bias" in parts:
-            parts["blocks.1.lin.bias"]["value"].add_(1)
-            fills[0] += 1
+        def __call__(self, blk: object, parts: dict[str, dict[str, torch.Tensor]]) -> None:
+            if "blocks.1.lin.bias" in parts:
+                parts["blocks.1.lin.bias"]["value"].add_(self.add)
+                self.fills += 1
+
+        def prepare(self) -> float:
+            return self.add
 
     def bind(key: str, parts: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         if key == "head.weight":
             return {key: parts["value"].float().bfloat16()}  # made here, lives for the bind
         return {key: parts["value"]}
 
+    fill = Bias()
     net2 = meta(a.dim, a.blocks)
-    model2 = mem.register("net-filled", net2, WeightGrant(ck, "net"), 0, fill=fill, bind=bind)
-    changed = dict(tensors, **{"blocks.1.lin.bias": tensors["blocks.1.lin.bias"] + 1})
+    net2._varena = Declared(fill=fill, bind=bind)
+    model2 = mem.register(net2, WeightGrant(ck, "net", "sha256:" + "1" * 64))
+
+    def biased(add: float) -> torch.Tensor:
+        changed = dict(tensors, **{"blocks.1.lin.bias": tensors["blocks.1.lin.bias"] + add})
+        return reference(changed, a.dim, a.blocks, dev)(x)
+
     with torch.no_grad():
-        want2 = reference(changed, a.dim, a.blocks, dev)(x)
-        with mem.request("filled", [0]), mem.use([model2], repeats=True):
+        want1, want2 = biased(1.0), biased(2.0)
+        with mem.request("filled"):
             f1, f2 = net2(x), net2(x)
-        model2.evict()
-        with mem.request("refilled", [0]), mem.use([model2]):
+        with mem.request("warm"):
             f3 = net2(x)
+            fills = fill.fills
+            f4 = net2(x)
+        fill.add = 2.0
+        with mem.request("prepared"):
+            f5 = net2(x)
     check(
         "fill runs on page-in and bind makes the tensors",
-        torch.equal(f1, want2) and torch.equal(f2, want2),
+        all(torch.equal(f, want1) for f in (f1, f2, f3, f4)),
     )
+    check("a resident page is not filled again", fill.fills == fills, str(fill.fills))
+    check("a new prepare() refills the pages", torch.equal(f5, want2))
+
+    # rung 2 takes a non-target's cold pages before a target's
+    torch.cuda.synchronize()
+    table.set_targets([Target(f"{MANIFEST}/net", "gpu", 5)])
+    with torch.no_grad(), mem.request("cold"):
+        net(x), net2(x)
+    before = stats(model.name).resident, stats(model2.name).resident
+    with mem.request("rung2"):
+        fill_up = torch.cuda.mem_get_info(0)[0] + block
+        junk = torch.empty(fill_up, dtype=torch.uint8, device=dev)
+        after = stats(model.name).resident, stats(model2.name).resident
+        del junk
     check(
-        "fill runs once per page-in", fills[0] == 2 and torch.equal(f3, want2), f"{fills[0]} fills"
+        "the non-target's cold pages go first",
+        after[1] < before[1] and after[0] == before[0],
+        f"{before} -> {after}",
     )
 
     # Exhausted leaves the memory usable
     try:
-        mem.room(0, torch.cuda.mem_get_info(0)[1] * 2)
-        check("an impossible room raises Exhausted", False)
+        with mem.request("impossible"):
+            torch.empty(torch.cuda.mem_get_info(0)[1] * 2, dtype=torch.uint8, device=dev)
+        check("an impossible allocation raises Exhausted", False)
     except Exhausted as exc:
-        check("an impossible room raises Exhausted", exc.gpu == 0 and exc.need > 0)
-    with torch.no_grad(), mem.request("after", [0]), mem.use([model]):
+        check("an impossible allocation raises Exhausted", exc.gpu == 0 and exc.need > 0)
+    with torch.no_grad(), mem.request("after"):
         check("the memory serves after Exhausted", torch.equal(net(x), want))
 
     # the ledger row carries the facts

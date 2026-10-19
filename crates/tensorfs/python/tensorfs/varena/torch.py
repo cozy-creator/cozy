@@ -1,17 +1,19 @@
 """varena's memory for torch modules (memory-varena.md §2, §5).
 
-    mem = Memory.open([0])
-    unet = mem.register("unet", module, WeightGrant(ck, "unet", host_fd), 0)
-    with mem.request("r1", [0]), mem.use([unet], repeats=True):
-        module(x)
+    mem = Memory.open(torch.device("cuda", 0), LedgerGrant(0, fd))
+    mem.register(unet, WeightGrant(ck, "unet", "sha256:…"))
+    with mem.request("r1"):
+        unet(x)
 
-One `Memory` per process decides where every weight byte of its GPUs lives. A block's params
+One `Memory` per process decides where every weight byte of its device lives. A block's params
 are views of its region's pages only while the block runs: its forward binds them (the view is
 the pin) and puts zero-byte placeholders back after, so no tensor can point at an unmapped page.
-An op on a placeholder outside a forward binds its block for that op. Room is made in one order
-(§5.2): idle bytes, cold weights, then the hot model's watermark, which falls only within a
-request and is restored into free room after it. On a CPU or Apple device every weight binds
-once, at registration.
+An op on a placeholder outside a forward binds its block for that op. A model is in use while a
+forward of it (its root or a direct child) runs, and repeats when it runs several passes in a
+request. What to keep is TensorD's targets, read from the ledger. Room is made in one order
+(§5.2): idle bytes, cold weights and caches from the lowest rank up, then the hot model's
+watermark, which falls only within a request and refills toward the targets after it. On a CPU
+or Apple device every weight binds once, at registration.
 """
 
 from __future__ import annotations
@@ -20,8 +22,8 @@ import gc
 import threading
 import time
 import traceback
-from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from collections.abc import Callable, Collection, Hashable, Iterator, Mapping, Sequence
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Protocol
@@ -31,6 +33,7 @@ import torch
 from torch import Tensor, nn
 from torch.utils._python_dispatch import _disable_current_modes
 from torch.utils._pytree import tree_map_only
+from torch.utils.hooks import RemovableHandle
 
 from . import DeviceFull, Gpu, Host, Ledger, Pinned, Row, WeightSet, cuts
 
@@ -66,20 +69,26 @@ class Mode(Enum):
 
 @dataclass(frozen=True, slots=True)
 class WeightGrant:
-    """TensorD's read grant for one component: its header, the sealed host-cache memfd or the
-    chunk files (`(sha256, length, fd)`), and the stored tensors the module builds (None: all
-    of the component's)."""
+    """TensorD's read grant for one component: its header, the binding's manifest
+    (`sha256:<hex>`), the sealed host-cache memfd or the chunk files (`(sha256, length, fd)`),
+    and the stored tensors the module builds (None: all of the component's)."""
 
     ck: tensorfs.Checkpoint
     component: str
+    manifest: str
     host_fd: int | None = None
     keys: Collection[str] | None = None
     files: Sequence[tuple[str, int, int]] = ()
 
+    @property
+    def key(self) -> str:
+        """Its key in TensorD's targets."""
+        return f"{self.manifest}/{self.component}"
+
 
 @dataclass(frozen=True, slots=True)
 class LedgerGrant:
-    """This executor's row in one GPU's ledger (§5.6)."""
+    """This executor's row in its GPU's ledger (§5.6)."""
 
     gpu: int
     fd: int
@@ -100,12 +109,34 @@ class Unbound(Exception):
 #: `bind(key, parts)`: a stored tensor's typed part views -> the module tensors they become, by
 #: dotted name. What it makes lives for that bind only.
 type Bind = Callable[[str, Mapping[str, Tensor]], Mapping[str, Tensor]]
-#: `fill(block, parts)`: on page-in, before any use, `parts[key][role]` over the fresh bytes.
-type Fill = Callable[["Block", Mapping[str, Mapping[str, Tensor]]], None]
+
+
+class Fill(Protocol):
+    """A page-in transform (a LoRA bake): `fill(block, parts)` runs on fresh bytes before any
+    use, `parts[key][role]` over them. `prepare()` runs as each forward of the model starts:
+    it readies the module for what filling adds now and names it; pages filled under another
+    name refill, after the caches holding them are shed."""
+
+    def __call__(self, block: Block, parts: Mapping[str, Mapping[str, Tensor]], /) -> None: ...
+
+    def prepare(self) -> Hashable: ...
 
 
 class Shed(Protocol):
     def __call__(self, nbytes: int, /) -> int: ...
+
+
+@dataclass(frozen=True, slots=True)
+class Declared:
+    """What a module declares about itself, as `module._varena`: its blocks (default: the
+    innermost `_no_split_modules`), attribute paths under it that a retried block puts back
+    (`state`), its page-in transform (`fill`), and how stored parts become its tensors (`bind`;
+    default: a plain part as itself)."""
+
+    blocks: Sequence[str] | None = None
+    state: tuple[str, ...] = ()
+    fill: Fill | None = None
+    bind: Bind | None = None
 
 
 # ------------------------------------------------------------------------------- stats
@@ -138,8 +169,8 @@ class Eviction:
 
 @dataclass(frozen=True, slots=True)
 class ModelStats:
-    """A model now (bytes at home, resident) and since it registered (copied home, streamed,
-    prefetch stall)."""
+    """A model now (bytes at home, resident, forwards in flight, passes in its last request,
+    its target priority or -1) and since it registered (copied home, streamed, stall)."""
 
     name: str
     gpu: int
@@ -149,8 +180,9 @@ class ModelStats:
     paged_in: int
     streamed: int
     stall_ns: int
-    uses: int
-    kept: bool
+    flight: int
+    repeats: int
+    priority: int
     reserve: int
 
 
@@ -326,21 +358,16 @@ class Model:
         self,
         memory: Memory,
         name: str,
+        key: str,
         module: nn.Module,
         gpu: int,
         device: torch.device,
         ws: WeightSet,
-        fill: Fill | None,
-        bind: Bind | None,
+        declared: Declared,
     ) -> None:
-        self.memory, self.name, self.module, self.gpu, self.device = (
-            memory,
-            name,
-            module,
-            gpu,
-            device,
-        )
-        self.ws, self.fill, self.bind = ws, fill, bind
+        self.memory, self.name, self.key, self.module = memory, name, key, module
+        self.gpu, self.device, self.ws = gpu, device, ws
+        self.fill, self.bind = declared.fill, declared.bind
         self.sites: dict[str, list[_Site]] = {}
         self.sizes: dict[int, int] = {}
         self.blocks: list[Block] = []
@@ -354,12 +381,18 @@ class Model:
         #: home blocks whose pages are resident now
         self.loaded: set[int] = set()
         self.lowered = False
-        #: its last use repeats (a denoise loop): restored before models used once
-        self.repeating = False
-        self.uses = 0
+        #: forwards of it running now (its root or a direct child), and whether the first bound
+        #: common for them
+        self.flight = 0
+        self.aloft = False
+        #: passes in the last request that ran it (this one's so far, if more)
+        self.repeats = 0
         self.held = 0
-        self.kept = False
         self.last_use = 0
+        #: the request epoch its watermark was last planned in
+        self.planned = -1
+        #: what its pages were filled under (`Fill.prepare`)
+        self.filled: Hashable | None = None
         #: torch bytes its passes allocated above their start in its last request; -1 unmeasured
         self.reserve = -1
         self.peak = 0
@@ -367,10 +400,9 @@ class Model:
         self.mark = (0, 0, 0)
         self.base = 0
         self.closed = False
+        self.handles: list[RemovableHandle] = []
         #: its pass now: the memo entry of the shape it runs at
         self.track = cuts.Track(name)
-        #: its open use repeats, for a pass's plan
-        self.repeats = False
 
     @property
     def host(self) -> bool:
@@ -383,11 +415,6 @@ class Model:
     def home_bytes(self) -> int:
         return self.common.nbytes + sum(self.blocks[b].nbytes for b in self.home)
 
-    def hold(self) -> Hold:
-        """Every block bound until the hold closes: what a CUDA graph captured stays mapped.
-        Only a model wholly at home can be held (a slot's address moves)."""
-        return self.memory._hold(self)
-
     def evict(self) -> int:
         """Give back every resident page nobody is using: they refill, and `fill` runs again."""
         with self.memory.lock:
@@ -398,29 +425,39 @@ class Model:
 
 
 class Hold:
-    def __init__(self, model: Model) -> None:
-        self.model, self.open = model, True
+    def __init__(self, model: Model, cache: Cache) -> None:
+        self.model, self.cache, self.open = model, cache, True
 
     def close(self) -> None:
         if self.open:
             self.open = False
-            self.model.memory._release(self.model)
+            self.model.memory._release(self.model, self.cache)
 
 
 class Cache:
-    """Device bytes an owner keeps for speed (KV slots, graph pools): counted, shed on ask."""
+    """Long-lived device bytes outside a forward (KV slots, graph pools, a held model): counted
+    in the ledger as `nbytes`, shed through `shed` at `priority` among cold weights (§5.2)."""
 
-    def __init__(self, memory: Memory, owner: str, gpu: int, shed: Shed) -> None:
-        self.memory, self.owner, self.gpu, self.shed = memory, owner, gpu, shed
+    def __init__(self, memory: Memory, owner: str, gpu: int, priority: int, shed: Shed) -> None:
+        self.memory, self.owner, self.gpu, self.priority, self.shed = (
+            memory,
+            owner,
+            gpu,
+            priority,
+            shed,
+        )
         self.nbytes = 0
+        #: models it holds bound, and how many times
+        self.holding: dict[Model, int] = {}
 
-    def resize(self, nbytes: int) -> bool:
-        """Whether the owner may hold `nbytes` now. Growing takes idle and cold bytes, never a
-        hot model's; False pauses the owner, and nothing waits."""
-        if nbytes > self.nbytes and not self.memory._grant(self, nbytes - self.nbytes):
-            return False
-        self.nbytes = nbytes
-        return True
+    def serving(self) -> AbstractContextManager[None]:
+        """The owner's own loop, outside any request: its ops are caught like a request's."""
+        return cuts.caught()
+
+    def hold(self, model: Model) -> Hold:
+        """Every block of `model` bound until the hold closes: what a CUDA graph captured stays
+        mapped. Only a model wholly at home can be held (a slot's address moves)."""
+        return self.memory._hold(model, self)
 
     def close(self) -> None:
         with self.memory.lock:
@@ -436,6 +473,8 @@ class Request:
     copies: dict[str, int]
     steps: list[Step] = field(default_factory=list)
     evictions: list[Eviction] = field(default_factory=list)
+    #: each model's passes in it
+    passes: dict[str, int] = field(default_factory=dict)
     stats: RequestStats | None = None
     #: the memo's retries when it started
     retried: int = 0
@@ -446,15 +485,16 @@ class Request:
 
 
 class Memory:
-    """This process's devices: every registered model, cache and request on them."""
+    """This process's device: every registered model, cache and request on it."""
 
-    def __init__(self, gpus: Sequence[int], ledger: Sequence[LedgerGrant], mode: Mode) -> None:
-        self.mode = mode
-        self.gpus = {gpu: Gpu(gpu) for gpu in gpus}
+    def __init__(self, device: torch.device, ledger: LedgerGrant | None, mode: Mode) -> None:
+        self.mode, self.device = mode, device
+        cuda = device.type == "cuda"
+        self.gpus = {device.index or 0: Gpu(device.index or 0)} if cuda else {}
+        self.host = None if cuda else Host()
         #: this process's device bytes outside torch and the weights (its CUDA context)
         self.context = 0
         self.last_use = 0
-        self.host: Host | None = None
         self.models: dict[str, Model] = {}
         self.caches: dict[Cache, None] = {}
         self.lock = threading.RLock()
@@ -462,68 +502,50 @@ class Memory:
         self.active: dict[Request, None] = {}
         self.ended: list[RequestStats] = []
         self.clock = 0
+        self.epoch = 0
         self.evictions = 0
         self.memo = cuts.Memo()
         cuts.serve(self.memo, self)
-        #: each GPU's ledger and this process's row in it, held for the process's life (§5.6)
+        #: the ledger and this process's row in it, held for the process's life (§5.6)
         self.rows: dict[int, tuple[Ledger, Row]] = {}
-        for grant in ledger:
-            table = Ledger.adopt(grant.fd)
+        #: TensorD's targets: key -> (priority, tier)
+        self.targets: dict[str, tuple[int, str]] = {}
+        if ledger is not None:
+            table = Ledger.adopt(ledger.fd)
             row = table.claim()
-            self.rows[grant.gpu] = (table, row)
-            threading.Thread(
-                target=self._answer, args=(grant.gpu, row), name="varena-ledger", daemon=True
-            ).start()
+            self.rows[ledger.gpu] = (table, row)
+            self._read_targets(table)
+            for loop in (self._answer, self._reconcile):
+                threading.Thread(
+                    target=loop, args=(ledger.gpu, table, row), name="varena", daemon=True
+                ).start()
 
     @classmethod
     def open(
-        cls, gpus: Sequence[int], ledger: Sequence[LedgerGrant] = (), mode: Mode = Mode.SHARED
+        cls, device: torch.device, ledger: LedgerGrant | None = None, mode: Mode = Mode.SHARED
     ) -> Memory:
-        return cls(gpus, ledger, mode)
+        return cls(device, ledger, mode)
 
     # -- registration
 
-    def register(
-        self,
-        name: str,
-        module: nn.Module,
-        weights: WeightGrant,
-        gpu: int | torch.device,
-        blocks: Sequence[str] | None = None,
-        fill: Fill | None = None,
-        bind: Bind | None = None,
-        state: Sequence[str] = (),
-    ) -> Model:
-        """Register `module`, built on meta, over its stored weights. On a GPU its blocks
-        (default: the innermost `_no_split_modules`) bind per forward and run in the catch
-        (`cuts.run`), its FFNs cut in tokens; on a CPU or Apple device every weight binds once,
-        here. `state`: attribute paths under `module` a block's forward may change, put back
-        before a block that ran out of memory runs again."""
-        paths = list(blocks) if blocks is not None else innermost_blocks(module)
-        prefix = f"{weights.component}/"
-        regions = regions_of(weights, paths)
-        if isinstance(gpu, torch.device):
-            if self.host is None:
-                self.host = Host()
-            device, index, core = gpu, -1, self.host
-        else:
-            device, index, core = torch.device("cuda", gpu), gpu, self.gpus[gpu]
+    def register(self, module: nn.Module, grant: WeightGrant) -> Model:
+        """Register `module`, built on meta, over its stored weights, with what it declares
+        (`module._varena`). On a GPU its blocks bind per forward and run in the catch
+        (`cuts.run`), its FFNs cut in tokens; on a CPU or Apple device every weight binds
+        once, here."""
+        declared = _declared(module)
+        paths = blocks_of(module)
+        regions = regions_of(module, grant)
         with self.lock:
-            if name in self.models:
-                raise ValueError(f"a model named {name!r} is registered already")
-            model = Model(
-                self,
-                name,
-                module,
-                index,
-                device,
-                core.register(
-                    name, weights.ck, regions, weights.host_fd, list(weights.files) or None
-                ),
-                fill,
-                bind,
-            )
-            _layout(model, prefix, paths, regions)
+            name, n = grant.key, 1
+            while name in self.models:
+                n += 1
+                name = f"{grant.key}#{n}"
+            core = self.host if self.host is not None else self.gpus[self.device.index or 0]
+            gpu = -1 if self.host is not None else self.device.index or 0
+            ws = core.register(name, grant.ck, regions, grant.host_fd, list(grant.files) or None)
+            model = Model(self, name, grant.key, module, gpu, self.device, ws, declared)
+            _layout(model, f"{grant.component}/", paths, regions)
             model.sites = _sites(module)
             _install(model)
             model.order = [b.index for b in model.blocks]
@@ -536,60 +558,68 @@ class Memory:
                 model.ws.home(_home_regions(model))
                 for block in model.blocks:
                     block.site = cuts.Site(
-                        (name, block.index), device, model.track, block.module, module, tuple(state)
+                        (name, block.index),
+                        self.device,
+                        model.track,
+                        block.module,
+                        module,
+                        tuple(declared.state),
                     )
                     _hook(block)
                 cuts.install(module)
+                _fly(model)
         return model
 
-    # -- needed now
+    # -- in use: a forward of the model runs
 
-    @contextmanager
-    def use(self, models: Sequence[Model], repeats: bool = False) -> Iterator[Sequence[Model]]:
-        """These models are needed now: a shared count, never exclusive. Their common weights
-        stay bound, and cold-weight eviction passes them by. `repeats`: called again and again
-        (a denoise loop), so worth keeping at home."""
-        opened: list[Model] = []
-        try:
-            for model in models:
-                if not model.host:
-                    self._open_use(model, repeats)
-                    opened.append(model)
-            yield models
-        finally:
-            for model in reversed(opened):
-                self._close_use(model)
-
-    def _open_use(self, model: Model, repeats: bool) -> None:
+    def _start(self, model: Model) -> None:
+        """A forward of the model starts: the first readies its fill and binds common. A raise
+        here still lands (`always_call`)."""
         with self.lock:
-            if model.uses == 0:
-                self._plan(model, repeats)
-                model.repeats = repeats
-                model.repeating = repeats
-            model.uses += 1
+            model.flight += 1
+            if model.flight > 1:
+                return
             self.clock += 1
             model.last_use = self.clock
             self.last_use = time.monotonic_ns()
-        self._enter(model.common)
+            self._fresh(model)
+            self._enter(model.common, record=False)
+            model.aloft = True
         self._publish(model.gpu)
-        cuts.enter()
 
-    def _close_use(self, model: Model) -> None:
-        cuts.leave()
-        self._exit(model.common)
+    def _land(self, model: Model) -> None:
         with self.lock:
-            model.uses -= 1
-            if model.uses == 0 and model.seen:
+            model.flight -= 1
+            if model.flight:
+                return
+            if model.seen:
                 self._step(model)
+            if model.aloft:
+                model.aloft = False
+                self._exit(model.common)
         self._publish(model.gpu)
 
-    def _plan(self, model: Model, repeats: bool) -> None:
-        """The watermark as a model's use opens, from its measured reserve. A repeating model is
-        wholly at home when it fits beside its reserve and the cold weights it may evict, else a
-        spread set; one used once takes only free room and streams the rest. A model never
+    def _fresh(self, model: Model) -> None:
+        """Pages filled under another `prepare()` refill; the caches holding them shed first."""
+        if model.fill is None:
+            return
+        version = model.fill.prepare()
+        if version == model.filled:
+            return
+        if model.filled is not None:
+            for cache in [c for c in self.caches if model in c.holding]:
+                self._shed(cache, cache.nbytes)
+            self._evict(model, "refill", 0)
+        model.filled = version
+
+    def _plan(self, model: Model) -> None:
+        """The watermark as a pass starts, from the model's measured reserve. A repeating model
+        is wholly at home when it fits beside its reserve and the cold weights ranked below it,
+        else a spread set; one run once takes only free room and streams the rest. A model never
         measured is wholly at home if it repeats, else keeps only what is resident (it evicts
         nothing to become resident). Within a request the watermark never rises."""
-        if not model.blocks or (model.reserve < 0 and repeats):
+        repeating = model.repeats >= 2
+        if not model.blocks or (model.reserve < 0 and repeating):
             return
         if model.reserve < 0:
             want = model.home & model.loaded
@@ -598,8 +628,13 @@ class Memory:
             free = torch.cuda.mem_get_info(gpu)[0] + torch.cuda.memory_reserved(gpu)
             room = free - torch.cuda.memory_allocated(gpu) + _resident(model)
             room -= model.common.nbytes + model.reserve
-            if repeats:
-                room += sum(_resident(m) for m in self._cold(gpu) if m is not model)
+            if repeating:
+                value = self._value(model)
+                room += sum(
+                    _resident(m)
+                    for m in self._cold(gpu)
+                    if m is not model and self._value(m) < value
+                )
             sizes = [model.blocks[b].nbytes for b in model.order]
             if sum(sizes) <= room:
                 want = set(model.order)
@@ -684,25 +719,28 @@ class Memory:
 
     def _passed(self, block: Block, call: tuple[Sequence[object], Mapping[str, object]]) -> None:
         """A block run again starts the model's next pass (step), at the shape of its first
-        block's arguments."""
+        block's arguments; the watermark is planned once a request, or when its reserve moves."""
         model = block.model
         if block.index in model.seen:
             self._step(model)
         if not model.seen:
             model.base = torch.cuda.memory_allocated(model.device)
             torch.cuda.reset_peak_memory_stats(model.device)
-            self._shape(model, cuts.shape_of(*call))
+            if self._shape(model, cuts.shape_of(*call)) or model.planned != self.epoch:
+                model.planned = self.epoch
+                self._plan(model)
         model.seen[block.index] = None
 
-    def _shape(self, model: Model, key: str) -> None:
+    def _shape(self, model: Model, key: str) -> bool:
         """A pass starts at shape `key`: its cuts are noted there, and the peak the memo measured
-        for it is the reserve the watermark plans by (inside a request, only lowering it)."""
+        for it is the reserve the watermark plans by. Whether that reserve moved."""
         shape = model.track.shape = self.memo.shape(model.name, key)
         for request in self._requests(model.gpu):
             request.shapes[(model.name, key)] = shape
         if shape.peak >= 0 and shape.peak != model.reserve:
             model.reserve = shape.peak
-            self._plan(model, model.repeats)
+            return True
+        return False
 
     def _step(self, model: Model) -> None:
         if not model.steps:  # the first pass fixes the order prefetch follows
@@ -729,6 +767,8 @@ class Memory:
         model.steps += 1
         for request in self._requests(model.gpu):
             request.steps.append(step)
+            passes = request.passes[model.name] = request.passes.get(model.name, 0) + 1
+            model.repeats = max(model.repeats, passes)
 
     def _prefetch(self, block: Block) -> None:
         """Copy the next blocks of the recorded order now, unless they are resident."""
@@ -751,18 +791,6 @@ class Memory:
 
     # -- room (§5.2)
 
-    def room(self, gpu: int, nbytes: int) -> int:
-        """Make `nbytes` free on `gpu` for torch, in §5.2's order; returns what was freed. Raises
-        `Exhausted` when everything evictable is gone and it still does not fit."""
-        with self.lock:
-            before = torch.cuda.mem_get_info(gpu)[0]
-            if before < nbytes and not self._make_room(gpu, nbytes, "room", None):
-                raise Exhausted(gpu, nbytes - before, "room", self.stats(False))
-            after = torch.cuda.mem_get_info(gpu)[0]
-            if after < nbytes:
-                raise Exhausted(gpu, nbytes - after, "room", self.stats(False))
-            return max(after - before, 0)
-
     def _make_room(self, gpu: int, target: int, why: str, asking: Model | None) -> bool:
         """Free bytes on `gpu` until `target` are free: rungs 1-2, then rung 4 (the catch cuts
         the op between them, rung 3). False when nothing could be freed."""
@@ -770,15 +798,16 @@ class Memory:
         return self._lower_until(gpu, target, why, asking) or freed
 
     def _free_upto(self, gpu: int, target: int, why: str) -> bool:
-        """Idle bytes (rung 1), then cold weights least recently used first, warm ones last, in
-        this process and others (rung 2), until `target` bytes are free."""
-        freed = self._idle(gpu, target, None)
+        """Idle bytes (rung 1), then cold weights and caches from the lowest rank up, in this
+        process and others (rung 2), until `target` bytes are free."""
+        freed = self._idle(gpu)
+        for victim in self._victims(gpu):
+            short = target - _free(gpu)
+            if short <= 0:
+                return True
+            freed += self._take(victim, short, why)
         if _free(gpu) >= target:
             return True
-        for model in self._cold(gpu):
-            freed += self._evict(model, why, 2, target - _free(gpu))
-            if _free(gpu) >= target:
-                return True
         freed += self._ask(gpu, target)
         return freed > 0 or _free(gpu) >= target
 
@@ -788,8 +817,8 @@ class Memory:
         if _free(gpu) >= target:
             return False
         freed = 0
-        hot = [m for m in self.models.values() if m.gpu == gpu and m.uses and not m.held]
-        for model in sorted(hot, key=lambda m: (m is asking, m.kept, m.last_use)):
+        hot = [m for m in self.models.values() if m.gpu == gpu and m.flight and not m.held]
+        for model in sorted(hot, key=lambda m: (m is asking, self._value(m))):
             while model.home and _free(gpu) < target:
                 freed += self._lower(model, why)
             if _free(gpu) >= target:
@@ -821,25 +850,51 @@ class Memory:
     def exhausted(self, device: torch.device, need: int, op: str) -> Exception:
         return Exhausted(device.index or 0, need, op, self.stats(False))
 
-    def _idle(self, gpu: int, target: int, asking: Cache | None) -> int:
-        """Rung 1: torch's slack, the core's idle chunks, then caches whose owners give them."""
+    def _idle(self, gpu: int) -> int:
+        """Rung 1: torch's slack and the core's idle chunks."""
         reserved = torch.cuda.memory_reserved(gpu)
         torch.cuda.empty_cache()
-        freed = reserved - torch.cuda.memory_reserved(gpu) + int(self.gpus[gpu].trim())
-        for cache in list(self.caches):
-            short = target - _free(gpu)
-            if short <= 0:
-                break
-            if cache.gpu == gpu and cache is not asking and cache.nbytes:
-                shed = min(int(cache.shed(min(short, cache.nbytes))), cache.nbytes)
-                cache.nbytes -= shed
-                freed += shed
-                torch.cuda.empty_cache()
-        return freed
+        return reserved - torch.cuda.memory_reserved(gpu) + int(self.gpus[gpu].trim())
+
+    def _rank(self, model: Model) -> int:
+        """Its GPU target's priority, -1 outside every GPU target. Without a ledger the process
+        has the device to itself, and every model is a target."""
+        if not self.rows:
+            return 0
+        target = self.targets.get(model.key)
+        return target[0] if target is not None and target[1] == "gpu" else -1
+
+    def _value(self, model: Model) -> tuple[int, int, int]:
+        """What keeping it is worth: its rank, then its passes per request, then recency."""
+        return (self._rank(model), model.repeats, model.last_use)
 
     def _cold(self, gpu: int) -> list[Model]:
-        cold = [m for m in list(self.models.values()) if m.gpu == gpu and not m.uses and not m.held]
-        return sorted(cold, key=lambda m: (m.kept, m.last_use))
+        """Models no forward is running and nothing holds, least worth keeping first."""
+        cold = [
+            m for m in list(self.models.values()) if m.gpu == gpu and not m.flight and not m.held
+        ]
+        return sorted(cold, key=self._value)
+
+    def _victims(self, gpu: int) -> list[Model | Cache]:
+        """Rung 2's order: cold models and caches by rank, non-targets first; within a rank,
+        weights before caches."""
+        cold: list[tuple[int, int, Model | Cache]] = [
+            (self._rank(m), 0, m) for m in self._cold(gpu)
+        ]
+        cold += [(c.priority, 1, c) for c in list(self.caches) if c.gpu == gpu and c.nbytes]
+        return [v for _, _, v in sorted(cold, key=lambda r: r[:2])]
+
+    def _take(self, victim: Model | Cache, short: int, why: str) -> int:
+        if isinstance(victim, Model):
+            return self._evict(victim, why, 2, short)
+        freed = self._shed(victim, short)
+        torch.cuda.empty_cache()
+        return freed
+
+    def _shed(self, cache: Cache, nbytes: int) -> int:
+        freed = min(int(cache.shed(min(nbytes, cache.nbytes))), cache.nbytes)
+        cache.nbytes -= freed
+        return freed
 
     def _ask(self, gpu: int, target: int) -> int:
         """Rung 2 across processes: the ledger asks other rows for their cold bytes, each
@@ -853,36 +908,54 @@ class Memory:
             table.wait(victim)
         return max(_free(gpu) - before, 0)
 
-    def _answer(self, gpu: int, row: Row) -> None:
-        """Another process's ask of this row: idle bytes and cold weights go, the facts are
-        published, then the ask is acked. It takes no lock: pages in use are pinned, and a
-        model a use opens meanwhile only refaults."""
+    def _answer(self, gpu: int, table: Ledger, row: Row) -> None:
+        """Another process's ask of this row: idle bytes, then rung 2's order, the facts
+        published, then the ask acked. It takes no lock: pages in use are pinned, and a model
+        a forward starts meanwhile only refaults."""
         with torch.cuda.device(gpu):
             while True:
                 want = row.wait_want()
-                freed = self._idle(gpu, _free(gpu) + want, None)
-                for model in self._cold(gpu):
+                freed = self._idle(gpu)
+                for victim in self._victims(gpu):
                     if freed >= want:
                         break
-                    freed += self._evict(model, "asked", 2, want - freed)
+                    freed += self._take(victim, want - freed, "asked")
                 self._publish(gpu)
                 row.ack(freed)
 
+    def _reconcile(self, gpu: int, table: Ledger, row: Row) -> None:
+        """TensorD's targets, read as they change; an idle device fills toward them."""
+        seen = 0
+        with torch.cuda.device(gpu):
+            while True:
+                seen = table.wait_targets(seen)
+                self._read_targets(table)
+                with self.lock:
+                    if not self._in_request(gpu):
+                        self._restore(gpu)
+                self._publish(gpu)
+
+    def _read_targets(self, table: Ledger) -> None:
+        _, listed = table.targets()
+        self.targets = {t.key: (int(t.priority), str(t.tier)) for t in listed}
+
     def _publish(self, gpu: int) -> None:
-        """This row's facts: at use boundaries, request ends and after an ask (§5.6)."""
+        """This row's facts: as forwards start and land, at request ends and after an ask
+        (§5.6). `kept`: the cold bytes of GPU targets, asked for last."""
         held = self.rows.get(gpu)
         if held is None:
             return
         models = [m for m in list(self.models.values()) if m.gpu == gpu]
-        resident = {m.name: _resident(m) for m in models}
-        cold = [m for m in models if not m.uses and not m.held]
+        sets = {s.name: int(s.resident) for s in self.gpus[gpu].stats().sets}
+        resident = {m.name: sets.get(m.name, 0) for m in models}
+        cold = [m for m in models if not m.flight and not m.held]
         reserved, allocated = torch.cuda.memory_reserved(gpu), torch.cuda.memory_allocated(gpu)
         held[1].publish(
             context=self.context,
             resident=sum(resident.values()),
             cold=sum(resident[m.name] for m in cold),
-            kept=sum(resident[m.name] for m in cold if m.kept),
-            pinned=sum(resident[m.name] for m in models if m.uses or m.held),
+            kept=sum(resident[m.name] for m in cold if self._rank(m) >= 0),
+            pinned=sum(resident[m.name] for m in models if m.flight or m.held),
             torch_reserved=reserved,
             torch_allocated=allocated,
             cache=sum(c.nbytes for c in list(self.caches) if c.gpu == gpu),
@@ -938,40 +1011,21 @@ class Memory:
         for request in self._requests(model.gpu):
             request.evictions.append(eviction)
 
-    def _grant(self, cache: Cache, grow: int) -> bool:
-        """A cache grows into free, idle or cold bytes (rungs 1-2), never a hot model's."""
-        gpu = cache.gpu
-        with self.lock:
-            idle = torch.cuda.memory_reserved(gpu) - torch.cuda.memory_allocated(gpu)
-            if _free(gpu) + idle >= grow:
-                return True
-            self._idle(gpu, grow, cache)
-            for model in self._cold(gpu):
-                if _free(gpu) >= grow:
-                    break
-                self._evict(model, cache.owner, 2, grow - _free(gpu))
-            return _free(gpu) >= grow
+    # -- caches and holds
 
-    # -- caches, warm set, holds
-
-    def cache(self, owner: str, gpu: int, shed: Shed) -> Cache:
-        cache = Cache(self, owner, gpu, shed)
+    def register_cache(self, owner: str, priority: int, shed: Shed) -> Cache:
+        """Long-lived bytes outside a forward, shed at `priority` (TensorD's targets' scale)."""
+        cache = Cache(self, owner, next(iter(self.gpus), -1), priority, shed)
         with self.lock:
             self.caches[cache] = None
         return cache
 
-    def keep(self, models: Sequence[Model]) -> None:
-        """The controller's warm set: evicted last, restored first."""
-        kept = {id(m) for m in models}
-        with self.lock:
-            for model in self.models.values():
-                model.kept = id(model) in kept
-
-    def _hold(self, model: Model) -> Hold:
+    def _hold(self, model: Model, cache: Cache) -> Hold:
         with self.lock:
             if model.host or len(model.home) != len(model.blocks):
                 raise Unbound(f"{model.name} streams part of its weights: it cannot be held")
             model.held += 1
+            cache.holding[model] = cache.holding.get(model, 0) + 1
             entered: list[Block] = []
             try:
                 for block in (model.common, *model.blocks):
@@ -980,15 +1034,21 @@ class Memory:
             except BaseException:
                 for block in entered:
                     self._exit(block)
-                model.held -= 1
+                self._unhold(model, cache)
                 raise
-        return Hold(model)
+        return Hold(model, cache)
 
-    def _release(self, model: Model) -> None:
+    def _release(self, model: Model, cache: Cache) -> None:
         with self.lock:
             for block in (model.common, *model.blocks):
                 self._exit(block)
-            model.held -= 1
+            self._unhold(model, cache)
+
+    def _unhold(self, model: Model, cache: Cache) -> None:
+        model.held -= 1
+        cache.holding[model] -= 1
+        if not cache.holding[model]:
+            del cache.holding[model]
 
     def _close(self, model: Model) -> None:
         with self.lock:
@@ -996,6 +1056,8 @@ class Memory:
                 return
             model.closed = True
             self.models.pop(model.name, None)
+            for handle in model.handles:
+                handle.remove()
             for block in (model.common, *model.blocks):
                 _unhook(block)
                 block.count = 0
@@ -1005,28 +1067,35 @@ class Memory:
     # -- requests (§5.7)
 
     @contextmanager
-    def request(self, id: str, gpus: Sequence[int]) -> Iterator[Request]:
-        """Everything the request allocates is freed on exit, failed or not. A capacity failure
-        never poisons; bytes package state still holds show as `leftover`."""
-        mine = tuple(g for g in gpus if g in self.gpus)
+    def request(self, id: str) -> Iterator[Request]:
+        """Everything the request allocates is freed on exit, failed or not; its ops are caught
+        (`cuts.caught`). A capacity failure never poisons; bytes package state still holds show
+        as `leftover`."""
+        gpus = tuple(self.gpus)
         request = Request(
-            id, mine, {g: torch.cuda.memory_allocated(g) for g in mine}, self._copies(mine)
+            id, gpus, {g: torch.cuda.memory_allocated(g) for g in gpus}, self._copies(gpus)
         )
         request.retried = self.memo.retries
         with self.lock:
             self.active[request] = None
+            self.epoch += 1
         stack: list[Request] = self.local.__dict__.setdefault("requests", [])
         stack.append(request)
         try:
-            yield request
+            with cuts.caught() if gpus else nullcontext():
+                yield request
         except BaseException as exc:
             _clear_frames(exc)
             raise
         finally:
-            stack.remove(request)
-            self._end(request)
+            self._end(request, stack)
 
-    def _end(self, request: Request) -> None:
+    def _end(self, request: Request, stack: list[Request]) -> None:
+        with self.lock:  # passes no forward landed (blocks run directly) end with it
+            for model in list(self.models.values()):
+                if model.gpu in request.gpus and model.seen and not model.flight:
+                    self._step(model)
+        stack.remove(request)
         gc.collect()
         for gpu in request.gpus:
             torch.cuda.synchronize(gpu)
@@ -1049,6 +1118,10 @@ class Memory:
         with self.lock:
             self.active.pop(request, None)
             self.ended.append(request.stats)
+            self.epoch += 1
+            for name, passes in request.passes.items():
+                if (model := self.models.get(name)) is not None:
+                    model.repeats = passes
             for gpu in request.gpus:
                 if not self._in_request(gpu):
                     self._restore(gpu)
@@ -1057,28 +1130,22 @@ class Memory:
 
     def _restore(self, gpu: int) -> None:
         """After the last request on `gpu`: each model's reserve is what that request measured,
-        and every watermark rises again. Pages copy home in priority order (the warm set, then
-        models whose use repeats, then the rest, most recently used first): a model takes free
-        room, then cold pages of models after it, always leaving the largest reserve and a
-        streamed model's slots. The copies are prefetches: an ask evicts them again at once."""
+        and every watermark rises again. Pages of GPU targets copy home into free room, most
+        worth keeping first (`_value`), always leaving the largest reserve and a streamed
+        model's slots. The copies are prefetches: an ask evicts them again at once."""
         models = [m for m in self.models.values() if m.gpu == gpu]
         for model in models:
             if model.peak:
                 model.reserve, model.peak = model.peak, 0
             model.lowered = False
-        ranked = sorted(models, key=lambda m: (not m.kept, not m.repeating, -m.last_use))
-        slots = max((_SLOTS * _largest(m) for m in models if not m.repeating), default=0)
+        ranked = sorted((m for m in models if self._rank(m) >= 0), key=self._value, reverse=True)
+        slots = max((_SLOTS * _largest(m) for m in models if m.repeats < 2), default=0)
         room = _free(gpu) - max((max(m.reserve, 0) for m in models), default=0) - slots
-        for i, model in enumerate(ranked):
-            lower = [m for m in ranked[i + 1 :] if not m.uses and not m.held]
+        for model in ranked:
             for b in model.order:
                 if b in model.home and b in model.loaded:
                     continue
                 block = model.blocks[b]
-                while room < block.nbytes and lower:
-                    room += self._evict(lower[-1], "restore", 2, block.nbytes - room)
-                    if room < block.nbytes:  # it gave all it had
-                        lower.pop()
                 if room < block.nbytes:
                     return
                 room -= block.nbytes
@@ -1114,8 +1181,9 @@ class Memory:
                     m.nbytes,
                     m.home_bytes(),
                     *_counters(m),
-                    m.uses,
-                    m.kept,
+                    m.flight,
+                    m.repeats,
+                    self._rank(m),
                     m.reserve,
                 )
                 for m in self.models.values()
@@ -1151,14 +1219,34 @@ class _Reading:
 # ----------------------------------------------------------------------------- binding
 
 
-def regions_of(weights: WeightGrant, blocks: Sequence[str]) -> list[list[str]]:
-    """The component's weight-set regions, cut at `blocks`: what `register` maps and what a
-    sealed host layout of it must hold."""
-    prefix = f"{weights.component}/"
-    keys = None if weights.keys is None else set(weights.keys)
+def _declared(module: nn.Module) -> Declared:
+    found = vars(module).get("_varena")
+    return found if isinstance(found, Declared) else Declared()
+
+
+def blocks_of(module: nn.Module) -> list[str]:
+    """Its declared blocks, else the innermost instances of its `_no_split_modules` (or of a
+    subclass of one)."""
+    declared = _declared(module).blocks
+    if declared is not None:
+        return list(declared)
+    names = set(getattr(module, "_no_split_modules", None) or ())
+    found = [
+        path
+        for path, sub in module.named_modules()
+        if path and any(kind.__name__ in names for kind in type(sub).__mro__)
+    ]
+    return [a for a in found if not any(b.startswith(a + ".") for b in found)]
+
+
+def regions_of(module: nn.Module, grant: WeightGrant) -> list[list[str]]:
+    """The component's weight-set regions, cut at the module's blocks: what `register` maps and
+    what a sealed host layout of it must hold."""
+    prefix = f"{grant.component}/"
+    keys = None if grant.keys is None else set(grant.keys)
     return [
         kept
-        for region in tensorfs.regions(weights.ck, _WHOLE, [prefix + b for b in blocks])
+        for region in tensorfs.regions(grant.ck, _WHOLE, [prefix + b for b in blocks_of(module)])
         if (
             kept := [
                 n
@@ -1167,17 +1255,6 @@ def regions_of(weights: WeightGrant, blocks: Sequence[str]) -> list[list[str]]:
             ]
         )
     ]
-
-
-def innermost_blocks(module: nn.Module) -> list[str]:
-    """The innermost instances of the root's `_no_split_modules` (or of a subclass of one)."""
-    names = set(getattr(module, "_no_split_modules", None) or ())
-    found = [
-        path
-        for path, sub in module.named_modules()
-        if path and any(kind.__name__ in names for kind in type(sub).__mro__)
-    ]
-    return [a for a in found if not any(b.startswith(a + ".") for b in found)]
 
 
 def _layout(
@@ -1246,6 +1323,22 @@ def _install(model: Model) -> None:
             held = nn.Parameter(held, requires_grad=False)
         for site in group:
             site.table[site.attr] = held
+
+
+def _fly(model: Model) -> None:
+    """A forward of the root or of a direct child (`vae.decode` calls `decoder`) is the model
+    in use: counted, so concurrent forwards share it (cr-202)."""
+    memory = model.memory
+
+    def start(*_: object) -> None:
+        memory._start(model)
+
+    def land(*_: object) -> None:
+        memory._land(model)
+
+    for module in (model.module, *model.module.children()):
+        model.handles.append(module.register_forward_pre_hook(start))
+        model.handles.append(module.register_forward_hook(land, always_call=True))
 
 
 def _hook(block: Block) -> None:
