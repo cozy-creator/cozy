@@ -193,6 +193,13 @@ fn spec_of(mut spec: v1::RunSpec) -> Result<(crate::runs::Spec, Option<v1::HubAc
             endpoint: options.endpoint.trim_end_matches('/').into(),
             ..Default::default()
         });
+        // Auto transport for the existing Hub is the same run as the older caller's None.
+        // A genuinely distinct endpoint remains part of the identity.
+        if identity.tensorfs.as_ref().is_some_and(|options| {
+            identity.hub.as_ref().is_some_and(|hub| hub.origin == options.endpoint)
+        }) {
+            identity.tensorfs = None;
+        }
         // A JSON value's objects are sorted maps and its numbers exact: one spelling per spec.
         let mut identity = serde_json::to_value(&identity).expect("a run spec serializes");
         identity["payload"] = input.clone();
@@ -747,6 +754,88 @@ mod tests {
         assert_ne!(spec_of(sent).unwrap().0.digest, first.digest);
     }
 
+    #[test]
+    fn same_hub_tensorfs_transport_preserves_the_previous_run_identity() {
+        let original = authored();
+        let old = spec_of(original.clone()).unwrap().0.digest;
+        let mut resent = original.clone();
+        resent.tensorfs = Some(v1::TensorFSOptions {
+            endpoint: "https://hub.example.test".into(),
+            token: "ordinary-first".into(),
+            ca_der: vec![2],
+        });
+        let forwarded = spec_of(resent.clone()).unwrap().0;
+        assert_eq!(forwarded.digest, old);
+        assert_eq!(forwarded.tensorfs, resent.tensorfs);
+        resent.tensorfs = Some(v1::TensorFSOptions {
+            endpoint: "https://hub.example.test/".into(),
+            token: "ordinary-replacement".into(),
+            ca_der: vec![3],
+        });
+        let rotated = spec_of(resent.clone()).unwrap().0;
+        assert_eq!(rotated.digest, old);
+        assert_eq!(rotated.tensorfs, resent.tensorfs);
+        resent.tensorfs.as_mut().unwrap().endpoint = "https://distinct.example.test".into();
+        assert_ne!(spec_of(resent).unwrap().0.digest, old);
+        let mut no_hub = original;
+        no_hub.hub = None;
+        let no_endpoint = spec_of(no_hub.clone()).unwrap().0.digest;
+        no_hub.tensorfs = Some(v1::TensorFSOptions {
+            endpoint: "https://hub.example.test".into(),
+            ..Default::default()
+        });
+        assert_ne!(spec_of(no_hub).unwrap().0.digest, no_endpoint);
+    }
+
+    #[test]
+    fn same_hub_tensorfs_resend_finds_the_accepted_run_after_journal_reopen() {
+        use crate::{journal::Invocation, objects::Objects, runs::Runs, service::Service};
+
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state");
+        let generations = temp.path().join("generations");
+        let original = authored();
+        let parsed = spec_of(original.clone()).unwrap().0;
+        let service = Service::open(&state, &generations, 1).unwrap();
+        let draft = Invocation {
+            package: "org/package".into(), entrypoint: "render".into(),
+            input: parsed.input.clone(), ..Default::default()
+        };
+        let (accepted, _) = service
+            .engine
+            .accept_run("alice", "lost-ack", &parsed.digest, draft)
+            .unwrap();
+        drop(service);
+        let service = Service::open(&state, &generations, 1).unwrap();
+        let store = crate::storage::open(&temp.path().join("store")).unwrap();
+        let objects =
+            Arc::new(Objects::new(&temp.path().join("writes"), store, service.engine.clone()).unwrap());
+        let runs = Arc::new(Runs {
+            service,
+            objects,
+            publisher: None,
+            local: None,
+            own_hub: None,
+            leaf: None,
+            contexts: Default::default(),
+        });
+        let mut resent = original;
+        resent.tensorfs = Some(v1::TensorFSOptions {
+            endpoint: "https://hub.example.test".into(),
+            token: "ordinary-replacement".into(),
+            ca_der: vec![4],
+        });
+        let replayed = runs
+            .submit("alice", "lost-ack", spec_of(resent.clone()).unwrap().0)
+            .unwrap();
+        assert_eq!(replayed.id, accepted.id);
+        resent.tensorfs.as_mut().unwrap().endpoint = "https://distinct.example.test".into();
+        let conflict = runs
+            .submit("alice", "lost-ack", spec_of(resent).unwrap().0)
+            .err()
+            .unwrap();
+        assert_eq!(conflict.code, "run_id_conflict");
+    }
     #[test]
     fn checkpoint_references_reach_the_run_log_without_fabricated_byte_metadata() {
         let checkpoint = v1::CheckpointRef {

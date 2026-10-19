@@ -309,6 +309,38 @@ fn ordinary_tensorfs_needed(spec: &v1::RunSpec, operations: &[Value]) -> bool {
     spec.tensorfs.is_none() && !operations.is_empty()
 }
 
+/// Transport for public model reads uses the Hub already selected for the outbound spec.
+/// A blank model choice can resolve to a Hub default; known local headers/aliases and
+/// provider-only choices need no Hub transport. This descriptor acquires no credential.
+pub(crate) fn anonymous_tensorfs(spec: &v1::RunSpec) -> Option<v1::TensorFSOptions> {
+    let hub_model = |repository: &str, manifest: &str, source: &str| {
+        source.is_empty()
+            && !repository.starts_with("local/")
+            && (!repository.is_empty() || manifest.is_empty())
+    };
+    let mut choices = spec.models.iter().chain(
+        spec.set
+            .iter()
+            .flat_map(|set| set.items.iter().flat_map(|item| item.models.iter())),
+    );
+    let needs_hub = choices.any(|choice| {
+        hub_model(&choice.repository, &choice.manifest, &choice.source)
+            || choice
+                .adapters
+                .iter()
+                .any(|adapter| hub_model(&adapter.model, &adapter.manifest, &adapter.source))
+    });
+    let hub = spec
+        .hub
+        .as_ref()
+        .filter(|hub| !hub.origin.is_empty() && needs_hub)?;
+    Some(v1::TensorFSOptions {
+        endpoint: hub.origin.clone(),
+        ca_der: hub.ca_der.clone(),
+        ..Default::default()
+    })
+}
+
 fn hub_denied(origin: &Origin, error: hub_client::Error) -> Denied {
     match &error {
         hub_client::Error::Hub { status, .. } if *status < 500 => {
@@ -492,6 +524,203 @@ mod tests {
             !needs(&v1::RunSpec::default()),
             "local Writer calls need no Hub sign-in"
         );
+    }
+
+    #[test]
+    fn ordinary_public_transport_keeps_the_selected_hub_without_a_bearer() {
+        let hub = v1::HubAccess {
+            origin: "https://selected.example.test".into(),
+            ca_der: vec![4, 5],
+            ..Default::default()
+        };
+        let map = |models| {
+            anonymous_tensorfs(&v1::RunSpec {
+                hub: Some(hub.clone()),
+                models,
+                ..Default::default()
+            })
+        };
+        for model in [
+            choice("public/model", "1", ""),
+            v1::ModelChoice {
+                parameter: "default".into(),
+                ..Default::default()
+            },
+        ] {
+            let options = map(vec![model]).unwrap();
+            assert_eq!(
+                (options.endpoint, options.ca_der),
+                (hub.origin.clone(), hub.ca_der.clone())
+            );
+            assert!(options.token.is_empty());
+        }
+        let mut local = choice("local/base", "", "");
+        local.adapters.push(v1::Adapter {
+            model: "public/adapter".into(),
+            release: "1".into(),
+            ..Default::default()
+        });
+        assert!(map(vec![local]).is_some());
+        for model in [
+            choice("local/base", "", ""),
+            choice("", "", "sha256:local-header"),
+            v1::ModelChoice {
+                source: "hf://owner/model".into(),
+                ..Default::default()
+            },
+        ] {
+            assert!(map(vec![model]).is_none());
+        }
+        assert!(map(vec![]).is_none(), "a source-free Writer stays local");
+        let warm = v1::RunSpec {
+            hub: Some(hub),
+            set: Some(v1::WarmSet {
+                items: vec![v1::WarmItem {
+                    models: vec![v1::ModelChoice::default()],
+                    ..Default::default()
+                }],
+            }),
+            ..Default::default()
+        };
+        assert!(anonymous_tensorfs(&warm).unwrap().token.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ordinary_public_transport_reads_cold_bytes_from_the_selected_anonymous_endpoint() {
+        use crate::{Calcifer, store::NewRun};
+        use axum::{
+            Router, extract::Path as Route, http::HeaderMap, response::IntoResponse, routing::get,
+        };
+        use std::sync::{Arc, Mutex};
+        use tensorfs_core::{
+            fetch::{
+                Client, Config, Endpoint, Fetcher, ObjectStore, SourcePolicy, Want, upload_tree,
+            },
+            format::{Config as HeaderConfig, Dtype, Tree},
+            store2::Store,
+            writer::{Data, Source},
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let source = Store::open(temp.path().join("source")).unwrap();
+        let data = vec![19u8; 16384];
+        let mut writer = source.writer(None, None).unwrap();
+        let config: HeaderConfig = serde_json::from_str("{}").unwrap();
+        writer
+            .component("model", "conformance.Fixture", config, None)
+            .unwrap()
+            .put(
+                "weight",
+                &Dtype::U8,
+                &[data.len() as u64],
+                Data::Plain(Source::Read(&mut &data[..])),
+            )
+            .unwrap();
+        let header = writer.commit().unwrap();
+        let mut tree = Tree::default();
+        tree.set_variant("f32", header.clone());
+        let tree = source.put_tree(&tree).unwrap();
+        let client = Client::new(SourcePolicy {
+            any_host: true,
+            allow_local: true,
+            max_redirects: 5,
+            ..Default::default()
+        });
+        let files = temp.path().join("endpoint");
+        let seed = Endpoint::new(&client, &format!("file://{}", files.display()), None).unwrap();
+        upload_tree(&seed, "public/model", &tree, &source, Some("1"))
+            .await
+            .unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let observed = requests.clone();
+        let app = Router::new().route(
+            "/{*path}",
+            get(move |Route(path): Route<String>, headers: HeaderMap| {
+                let files = files.clone();
+                let observed = observed.clone();
+                async move {
+                    assert!(
+                        !headers.contains_key("authorization"),
+                        "an anonymous read carried a credential"
+                    );
+                    observed.lock().unwrap().push(path.clone());
+                    match std::fs::read(files.join(path)) {
+                        Ok(bytes) => bytes.into_response(),
+                        Err(_) => axum::http::StatusCode::NOT_FOUND.into_response(),
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let selected = format!("http://{}", listener.local_addr().unwrap());
+        let serving = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let calcifer =
+            Calcifer::open(&temp.path().join("calcifer"), &temp.path().join("outputs")).unwrap();
+        let (row, _) = calcifer
+            .store()
+            .submit(
+                "public",
+                "d",
+                NewRun {
+                    id: RunId::mint([31; 12]),
+                    kind: protocol::calcifer::Kind::Call,
+                    target: "public/read".into(),
+                    hub: Some(Origin::parse(&selected).unwrap()),
+                    machine: None,
+                    pinned: false,
+                    spec: v1::RunSpec {
+                        models: vec![choice("public/model", "1", "")],
+                        ..Default::default()
+                    },
+                    out_dir: temp.path().join("outputs"),
+                    warnings: vec![],
+                    inputs: vec![],
+                    wants: None,
+                },
+            )
+            .unwrap();
+        let mut sent = row.spec.clone();
+        calcifer.finish_spec(&row, &mut sent, Access::default());
+        let options = sent.tensorfs.unwrap();
+        assert_eq!(options.endpoint, selected);
+        assert!(options.token.is_empty());
+        let cold = Store::open(temp.path().join("cold-reader")).unwrap();
+        assert!(
+            !cold.has(&tree) && !cold.has(&header),
+            "the read must begin without cached metadata"
+        );
+        let endpoint: Arc<dyn tensorfs_core::fetch::Origin> =
+            Arc::new(Endpoint::new(&client, &options.endpoint, None).unwrap());
+        let fetcher = Fetcher::new(
+            Arc::new(cold.clone()) as Arc<dyn ObjectStore>,
+            client,
+            None,
+            Config::default(),
+        );
+        let pulled = fetcher
+            .pull(
+                &endpoint,
+                "public/model",
+                Some("1"),
+                Some("f32"),
+                &Want::default(),
+            )
+            .await
+            .unwrap();
+        fetcher.settled().await;
+        assert_eq!(pulled.header, header);
+        assert_eq!(
+            cold.checkpoint(&header)
+                .unwrap()
+                .read("model", "weight")
+                .unwrap(),
+            data
+        );
+        assert!(
+            !requests.lock().unwrap().is_empty(),
+            "a warm cache masked the selected endpoint"
+        );
+        serving.abort();
     }
 
     #[tokio::test]

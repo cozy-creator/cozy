@@ -944,6 +944,9 @@ impl Calcifer {
         {
             machines::merge_warm(warm, spec);
         }
+        if spec.tensorfs.is_none() {
+            spec.tensorfs = access::anonymous_tensorfs(spec);
+        }
     }
 
     /// Deletes the staged inputs of a settled run that no unsettled run names.
