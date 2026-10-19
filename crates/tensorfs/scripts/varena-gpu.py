@@ -9,7 +9,9 @@ files and from a sealed host layout. The script checks, and prints one JSON line
   b. a view a caller keeps blocks its page's eviction; once it dies, eviction frees the bytes;
   c. layers streamed through slots with prefetch: bit-exact with all-home; stall < copy time;
   d. a torch OOM beside home pages: evict + trim, then the retry succeeds in-process;
-  e. bind/unbind per region of ~20 params (M2), and page-in at 2 MiB vs 64 MiB chunks.
+  e. bind/unbind per region of ~20 params (M2), and page-in at 2 MiB vs 64 MiB chunks;
+  f. adopt: the sealed layout registered from the regions it carries, prefetched whole before
+     any module exists, is bit-exact.
 """
 
 import json
@@ -236,6 +238,19 @@ def test_costs(ck, rs, host_fd, stream, facts):
     ws.close()
 
 
+def test_adopt(gpu, ck, rs, host_fd, stream, facts):
+    ws = gpu.adopt("adopt", ck, host_fd)
+    assert ws.regions == rs, "a sealed layout carries the regions it was built from"
+    t0 = time.perf_counter()
+    for r in range(len(ws.spans)):
+        ws.prefetch(r)
+    torch.cuda.synchronize()
+    facts["f_prefetch_ms"] = round((time.perf_counter() - t0) * 1e3, 1)
+    facts["f_adopt_bytes"] = exact(ws, ck, stream)
+    ws.close()
+    gpu.trim()
+
+
 def main(work: Path) -> int:
     torch.use_deterministic_algorithms(True)
     ck = write(work / "store")
@@ -252,6 +267,7 @@ def main(work: Path) -> int:
         ("c", lambda: test_stream(gpu, ck, rs, fd, stream, facts)),
         ("d", lambda: test_oom(gpu, ck, rs, stream, facts)),
         ("e", lambda: test_costs(ck, rs, fd, stream, facts)),
+        ("f", lambda: test_adopt(gpu, ck, rs, fd, stream, facts)),
     ):
         try:
             run()

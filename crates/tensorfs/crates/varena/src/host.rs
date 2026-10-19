@@ -36,11 +36,12 @@ use crate::io::{IoTally, Mode, Source};
 use crate::layout::{ItemSource, Layout, PART_ALIGN};
 use crate::{Error, Result};
 
-const MAGIC: u64 = u64::from_le_bytes(*b"TFSPLN02");
+const MAGIC: u64 = u64::from_le_bytes(*b"TFSPLN03");
 const MAGIC_WINDOW: u64 = u64::from_le_bytes(*b"TFSWIN01");
 /// The state page, at `data` (the layout's nbytes): magic, region count, digest (64 hex bytes),
-/// one u32 word per region, then each region's (offset, span); the file's last 8 bytes repeat
-/// `data`, so a holder without the layout (`release_hold`) finds the page.
+/// one u32 word per region, each region's (offset, span), then the regions the layout was built
+/// from (`names_off`); the file's last 8 bytes repeat `data`, so a holder without the layout
+/// (`release_hold`, `sealed_regions`) finds the page.
 const WORDS_OFF: usize = 8 + 8 + 64;
 const READY: u32 = 1;
 /// A sealed layout's region its filler could not fill: whoever waits for it gets an error.
@@ -59,8 +60,80 @@ fn ext_off(regions: usize) -> usize {
     (WORDS_OFF + 4 * regions).next_multiple_of(8)
 }
 
-fn meta_len(regions: usize) -> usize {
-    (ext_off(regions) + 16 * regions + 8).next_multiple_of(PART_ALIGN as usize)
+/// The names section: its byte length, then per region a u32 name count and each name as a u32
+/// length and its bytes.
+fn names_off(regions: usize) -> usize {
+    ext_off(regions) + 16 * regions
+}
+
+fn meta_len(regions: usize, names: usize) -> usize {
+    (names_off(regions) + 8 + names + 8).next_multiple_of(PART_ALIGN as usize)
+}
+
+fn encode_names(names: &[Vec<String>]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for region in names {
+        out.extend((region.len() as u32).to_le_bytes());
+        for n in region {
+            out.extend((n.len() as u32).to_le_bytes());
+            out.extend(n.as_bytes());
+        }
+    }
+    out
+}
+
+fn decode_names(mut b: &[u8], regions: usize) -> Option<Vec<Vec<String>>> {
+    let u32_of = |b: &mut &[u8]| -> Option<usize> {
+        let (n, rest) = b.split_first_chunk::<4>()?;
+        *b = rest;
+        Some(u32::from_le_bytes(*n) as usize)
+    };
+    let mut out = Vec::with_capacity(regions);
+    for _ in 0..regions {
+        let count = u32_of(&mut b)?;
+        let mut region = Vec::with_capacity(count.min(b.len() / 4));
+        for _ in 0..count {
+            let len = u32_of(&mut b)?;
+            let (name, rest) = b.split_at_checked(len)?;
+            region.push(String::from_utf8(name.to_vec()).ok()?);
+            b = rest;
+        }
+        out.push(region);
+    }
+    b.is_empty().then_some(out)
+}
+
+fn read_at(fd: RawFd, buf: &mut [u8], at: usize) -> bool {
+    // SAFETY: a read into our own buffer.
+    unsafe { libc::pread(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), at as libc::off_t) == buf.len() as isize }
+}
+
+fn u64_at(fd: RawFd, at: usize) -> Option<u64> {
+    let mut b = [0u8; 8];
+    read_at(fd, &mut b, at).then(|| u64::from_le_bytes(b))
+}
+
+/// The state page's names section length, when `data + meta_len` is exactly `size`.
+fn names_len(fd: RawFd, data: usize, regions: usize, size: usize) -> Option<usize> {
+    let len = usize::try_from(u64_at(fd, data.checked_add(names_off(regions))?)?).ok()?;
+    (len < size && data.checked_add(meta_len(regions, len)) == Some(size)).then_some(len)
+}
+
+/// The regions a sealed layout (`fill_sealed`, `open_sealed`) was built from, read from its own
+/// state page: what rebuilds its layout without the module (`Gpu::adopt`). Adoption checks the
+/// rebuilt layout's digest, so the names are trusted no further than that.
+pub fn sealed_regions(fd: RawFd) -> Result<Vec<Vec<String>>> {
+    let bad = || Error::Invalid("host fd is not a sealed weight-set layout".into());
+    let size = file_size(fd)?;
+    let data = size.checked_sub(8).and_then(|t| u64_at(fd, t)).and_then(|d| usize::try_from(d).ok()).ok_or_else(bad)?;
+    let (magic, n) = (u64_at(fd, data).ok_or_else(bad)?, u64_at(fd, data + 8).ok_or_else(bad)?);
+    let n = usize::try_from(n).ok().filter(|&n| magic == MAGIC && n < size).ok_or_else(bad)?;
+    let len = names_len(fd, data, n, size).ok_or_else(bad)?;
+    let mut buf = vec![0u8; len];
+    if !read_at(fd, &mut buf, data + names_off(n) + 8) {
+        return Err(bad());
+    }
+    decode_names(&buf, n).ok_or_else(bad)
 }
 
 /// A streamed layout's window section, after the extents: slot count, slot span, then one u64
@@ -175,7 +248,7 @@ pub fn release_hold(hold: OwnedFd) -> Result<u64> {
         return Ok(0);
     }
     let n = u64::from_le_bytes(head[8..].try_into().unwrap()) as usize;
-    if u64::from_le_bytes(head[..8].try_into().unwrap()) != MAGIC || data.checked_add(meta_len(n)) != Some(size) {
+    if u64::from_le_bytes(head[..8].try_into().unwrap()) != MAGIC || n >= size || names_len(fd, data, n, size).is_none() {
         return Ok(0);
     }
     let mut words = vec![0u8; 4 * n];
@@ -525,24 +598,21 @@ impl HostMem {
     fn adopt_owned(fd: OwnedFd, layout: &Layout, sealed: bool, init: bool) -> Result<HostMem> {
         let regions = layout.regions.len();
         let data = layout.nbytes as usize;
-        let map_len = data + meta_len(regions);
-        // SAFETY: fstat into a zeroed struct.
-        let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0 {
-            return Err(os("fstat host fd"));
-        }
-        let fresh = (init || st.st_size == 0) && !sealed;
-        if fresh {
+        let size = file_size(fd.as_raw_fd())?;
+        let fresh = (init || size == 0) && !sealed;
+        let names = if fresh { encode_names(&layout.names) } else { Vec::new() };
+        let map_len = if fresh {
+            let map_len = data + meta_len(regions, names.len());
             // SAFETY: sizing our own descriptor; a sparse file costs no RAM until written.
             if unsafe { libc::ftruncate(fd.as_raw_fd(), map_len as libc::off_t) } != 0 {
                 return Err(os("ftruncate host fd"));
             }
-        } else if st.st_size as usize != map_len {
-            return Err(Error::Invalid(format!(
-                "host fd is {} bytes, this layout needs {map_len}",
-                st.st_size
-            )));
-        }
+            map_len
+        } else if names_len(fd.as_raw_fd(), data, regions, size).is_some() {
+            size
+        } else {
+            return Err(Error::Invalid(format!("host fd is {size} bytes, not this layout's {data} and its state page")));
+        };
         // SAFETY: shared mapping of a descriptor we hold, length checked above.
         let ptr = unsafe {
             libc::mmap(
@@ -584,7 +654,10 @@ impl HostMem {
                     e.write_unaligned(reg.offset.to_le());
                     e.add(1).write_unaligned(reg.span.to_le());
                 }
-                (page.add(meta_len(regions) - 8) as *mut u64).write_unaligned((data as u64).to_le());
+                let at = page.add(names_off(regions));
+                (at as *mut u64).write_unaligned((names.len() as u64).to_le());
+                std::ptr::copy_nonoverlapping(names.as_ptr(), at.add(8), names.len());
+                (page.add(map_len - data - 8) as *mut u64).write_unaligned((data as u64).to_le());
             }
             head.1.copy_from_slice(layout.digest.as_bytes());
             head.0[1] = regions as u64;

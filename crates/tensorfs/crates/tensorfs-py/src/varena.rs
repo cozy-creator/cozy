@@ -163,6 +163,14 @@ impl PyGpu {
         Ok(PyWeightSet::new(SetRef::Gpu(py.detach(|| self.0.register(&name, ck, &regions, host_fd, files)).or_raise(py)?)))
     }
 
+    /// The sealed host layout `host_fd` registered from the regions it carries, before any module.
+    #[cfg(feature = "store")]
+    #[pyo3(signature = (name, ck, host_fd, files = None))]
+    fn adopt(&self, py: Python<'_>, name: String, ck: PyRef<'_, PyCheckpoint>, host_fd: i32, files: Option<Vec<(String, u64, i32)>>) -> PyResult<PyWeightSet> {
+        let (ck, files) = (ck_of(&ck), granted(py, files)?);
+        Ok(PyWeightSet::new(SetRef::Gpu(py.detach(|| self.0.adopt(&name, ck, host_fd, files)).or_raise(py)?)))
+    }
+
     fn trim(&self, py: Python<'_>) -> PyResult<u64> {
         py.detach(|| self.0.trim()).or_raise(py)
     }
@@ -222,6 +230,8 @@ pub struct PyWeightSet {
     #[pyo3(get)]
     spans: Vec<u64>,
     #[pyo3(get)]
+    regions: Vec<Vec<String>>,
+    #[pyo3(get)]
     device: Option<i32>,
     parts: Vec<Part>,
     set: Mutex<Option<SetRef>>,
@@ -234,7 +244,8 @@ impl PyWeightSet {
             SetRef::Host(hs) => (&hs.weights, None),
         };
         let spans = w.layout.regions.iter().map(|r| r.span).collect();
-        PyWeightSet { name: w.name.clone(), nbytes: w.layout.nbytes, spans, device, parts: w.parts.clone(), set: Mutex::new(Some(set)) }
+        let regions = w.layout.names.clone();
+        PyWeightSet { name: w.name.clone(), nbytes: w.layout.nbytes, spans, regions, device, parts: w.parts.clone(), set: Mutex::new(Some(set)) }
     }
 
     fn set(&self, py: Python<'_>) -> PyResult<SetRef> {
