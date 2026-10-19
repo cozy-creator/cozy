@@ -150,7 +150,7 @@ impl Checkpoint {
         let config = dir.join(c.config_file.as_deref().unwrap_or("config.json"));
         let bytes = serde_json::to_vec(&c.config).map_err(|e| invalid(&config, e.to_string()))?;
         write_view(&config, &bytes)?;
-        for (name, _) in &c.assets {
+        for name in c.assets.keys() {
             write_view(&dir.join(name), &self.asset(&c.name, name)?)?;
         }
         Ok(dir)

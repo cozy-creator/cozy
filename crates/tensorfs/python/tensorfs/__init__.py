@@ -14,12 +14,10 @@ from ._ext import (
     Checkpoint,
     Closure,
     Component,
-    ComponentWriter,
     DecodeError,
     DeniedError,
     DiskFullError,
     DPoP,
-    Endpoint,
     Encoding,
     Error,
     FormatError,
@@ -34,13 +32,12 @@ from ._ext import (
     Store,
     UnknownSchemeError,
     UnsupportedError,
-    Writer,
     __version__,
     parse_header,
     plan,
     regions,
 )
-from .api import ComponentWriter, Writer, configure, convert, export, hub_download, open, resolve_source, snapshot_download, upload_folder
+from .api import ComponentWriter, Endpoint, Writer, configure, convert, export, hub_download, open, resolve_source, snapshot_download, upload_folder
 
 __all__ = [
     "Array",
