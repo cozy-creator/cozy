@@ -515,6 +515,9 @@ fn start_api(
         contexts: Default::default(),
     }));
     crate::calls::Calls::configure(service, store.clone(), backend.runs.as_ref())?;
+    if let Some(runs) = &backend.runs {
+        crate::api::machine_runs::resume(runs)?;
+    }
     listener.set_nonblocking(true)?;
     #[derive(serde::Serialize)]
     struct Ready<'a> {

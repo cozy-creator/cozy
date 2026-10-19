@@ -855,7 +855,7 @@ impl MachineBackend for NativeBackend {
             // A run preparing inside itself (`runs`) shows its stage and bytes as progress.
             let preparing = record.state == State::Queued
                 && record.waiting_reason.as_deref() == Some(crate::journal::PREPARING);
-            // What a queued run waits for (another run's install, an executor slot) is its state.
+            // What a queued run waits for (another run's install, its place in the queue) is its state.
             let waiting = record.waiting.clone().filter(|_| record.state == State::Queued);
             if let Some(progress) = record.progress.as_ref().filter(|_| (running || preparing) && waiting.is_none()) {
                 let payload = serde_json::from_str::<Value>(progress)

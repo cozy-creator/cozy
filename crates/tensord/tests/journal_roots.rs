@@ -174,6 +174,7 @@ fn film(manifest: &str, reference: &(String, u64), segments: &[&str], hold_at: i
         catalog_revision: String::new(),
         application: String::new(),
         digest: format!("{}-{hold_at}", reference.0),
+        journaled: vec![],
     }
 }
 

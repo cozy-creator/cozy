@@ -288,7 +288,7 @@ pub struct Execution {
     pub attempt: u32,
     #[serde(default)]
     pub waiting_reason: Option<String>,
-    /// Why a queued run waits, for people (another run's install, an executor slot): an
+    /// Why a queued run waits, for people (another run's install, its place in the queue): an
     /// observation the engine overlays, never journaled.
     #[serde(skip)]
     pub waiting: Option<String>,
@@ -528,6 +528,8 @@ impl Journal {
         fs::create_dir_all(root)?;
         let archived = archive_older(root)?;
         let mut connection = Connection::open(root.join(FILE)).map_err(db_error)?;
+        // It holds runs' Hub capabilities (`run_specs`); its WAL and index take this mode too.
+        cozy_platform::durable::set_mode(&root.join(FILE), 0o600)?;
         connection
             .execute_batch(
                 "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;
@@ -584,6 +586,7 @@ impl Journal {
             CREATE TABLE IF NOT EXISTS object_uses(sha256 TEXT PRIMARY KEY,length INTEGER NOT NULL,used_ms INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS run_objects(execution INTEGER NOT NULL REFERENCES executions(id),sha256 TEXT NOT NULL,length INTEGER NOT NULL,PRIMARY KEY(execution,sha256));
             CREATE INDEX IF NOT EXISTS run_objects_digest ON run_objects(sha256);
+            CREATE TABLE IF NOT EXISTS run_specs(execution INTEGER PRIMARY KEY REFERENCES executions(id),spec BLOB NOT NULL);
             DROP TABLE IF EXISTS job_contexts;
             CREATE TABLE IF NOT EXISTS held_memos(actor TEXT NOT NULL,computation TEXT NOT NULL,record BLOB NOT NULL,used_ms INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(actor,computation));
             CREATE TABLE IF NOT EXISTS held_memo_objects(actor TEXT NOT NULL,computation TEXT NOT NULL,sha256 TEXT NOT NULL,PRIMARY KEY(actor,computation,sha256));
@@ -1375,10 +1378,11 @@ impl Journal {
         digest: &str,
         invocation: Invocation,
     ) -> io::Result<(Execution, bool)> {
-        self.accept_run_objects(actor, id, digest, invocation, &[])
+        self.accept_run_objects(actor, id, digest, invocation, &[], &[])
     }
 
-    /// `accept_run`, also referencing `objects` (tree members, a local source) the run needs.
+    /// `accept_run`, also referencing `objects` (tree members, a local source) the run needs, and
+    /// keeping `spec` (empty: none) until its preparation ends, for a restart to prepare it again.
     pub fn accept_run_objects(
         &mut self,
         actor: &str,
@@ -1386,6 +1390,7 @@ impl Journal {
         digest: &str,
         invocation: Invocation,
         objects: &[tensorfs_core::ids::ObjectRef],
+        spec: &[u8],
     ) -> io::Result<(Execution, bool)> {
         validate_scope(actor, id, id)?;
         let key = format!("run:{}", encoded(&(actor, id))?);
@@ -1434,6 +1439,9 @@ impl Journal {
         };
         let execution = insert(&tx, &key, invocation, Some(context), "", Some(PREPARING))?;
         reference_objects(&tx, &execution.id, objects)?;
+        if !spec.is_empty() {
+            tx.execute("INSERT INTO run_specs(execution,spec) VALUES(?1,?2)", params![execution.id, spec]).map_err(db_error)?;
+        }
         tx.commit().map_err(db_error)?;
         Ok((execution, true))
     }
@@ -1549,14 +1557,14 @@ impl Journal {
         })
     }
 
-    /// A restarted machine holds no preparation and no run's Hub token: each preparing run
-    /// ends FAILED (nothing of it was started). A job an older machine parked to wait ends
-    /// FAILED with the reason it waited on.
+    /// A restarted machine holds no preparation: a preparing run it kept the spec of prepares
+    /// again (`interrupted`); any other ends FAILED (nothing of it was started). A job an older
+    /// machine parked to wait ends FAILED with the reason it waited on.
     pub(crate) fn interrupt_preparations(&mut self) -> io::Result<()> {
         let waiting: Vec<(String, String)> = {
             let mut statement = self
                 .connection
-                .prepare("SELECT id, json_extract(record,'$.waiting_reason') FROM executions WHERE state='queued' AND json_extract(record,'$.waiting_reason') IS NOT NULL")
+                .prepare("SELECT id, json_extract(record,'$.waiting_reason') FROM executions WHERE state='queued' AND json_extract(record,'$.waiting_reason') IS NOT NULL AND id NOT IN (SELECT execution FROM run_specs)")
                 .map_err(db_error)?;
             let rows = statement
                 .query_map([], |row| Ok((row.get::<_, i64>(0)?.to_string(), row.get::<_, String>(1)?)))
@@ -1578,6 +1586,13 @@ impl Journal {
             self.end_preparation(&id, Outcome::Failed(failure))?;
         }
         Ok(())
+    }
+
+    /// The preparing runs a restart interrupted, each with its signer and kept spec.
+    pub(crate) fn interrupted(&self) -> io::Result<Vec<(String, String, Vec<u8>)>> {
+        let mut statement = self.connection.prepare("SELECT id, actor, spec FROM executions JOIN run_specs ON execution=id WHERE state='queued' AND json_extract(record,'$.waiting_reason')=?1 ORDER BY id").map_err(db_error)?;
+        let rows = statement.query_map([PREPARING], |row| Ok((row.get::<_, i64>(0)?.to_string(), row.get(1)?, row.get(2)?))).map_err(db_error)?;
+        rows.collect::<Result<_, _>>().map_err(db_error)
     }
 }
 
@@ -2036,6 +2051,8 @@ impl Journal {
             ));
         }
         let was_terminal = record.state.terminal();
+        let preparing = |record: &Execution| record.state == State::Queued && record.waiting_reason.as_deref() == Some(PREPARING);
+        let was_preparing = preparing(&record);
         let running_since = (record.state == State::Running).then_some(record.started_at_ms);
         let changed = change(&mut record)?;
         if let Some(since) = running_since.filter(|&s| s > 0 && record.state != State::Running) {
@@ -2068,6 +2085,9 @@ impl Journal {
                 params![encoded(&record)?, record.state.name(), timestamp(), id],
             )
             .map_err(db_error)?;
+            if was_preparing && !preparing(&record) {
+                tx.execute("DELETE FROM run_specs WHERE execution=?1", [id]).map_err(db_error)?;
+            }
             also(&tx, &record)?;
         }
         tx.commit().map_err(db_error)?;

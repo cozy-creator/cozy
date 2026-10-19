@@ -50,7 +50,7 @@ pub struct Service {
     /// This machine's birth: a fenced leader's group members born before it are its
     /// previous incarnation's followers.
     started_ticks: u64,
-    swept: Mutex<std::time::Instant>,
+    queue: Mutex<crate::queue::Queue>,
 }
 /// Held while one preparation runs; the machine is not idle meanwhile.
 pub struct Preparing(Arc<Service>);
@@ -124,7 +124,7 @@ impl Service {
             startup_gpu_births: Mutex::new(startup_gpu_births),
             preparing: std::sync::atomic::AtomicUsize::new(0),
             started_ticks,
-            swept: Mutex::new(std::time::Instant::now()),
+            queue: Default::default(),
         });
         service.engine.reconcile()?;
         service.reclaim();
@@ -145,6 +145,10 @@ impl Service {
         std::thread::Builder::new()
             .name("machine-dispatch".into())
             .spawn(move || owner.dispatch_loop())?;
+        let weak = Arc::downgrade(&service);
+        std::thread::Builder::new()
+            .name("machine-reclaim".into())
+            .spawn(move || Self::reclaim_loop(weak))?;
         Ok(service)
     }
     /// The executor pool every run runs on, once configured.
@@ -371,16 +375,22 @@ impl Service {
             if let Err(error) = self.dispatch_ready() {
                 tracing::warn!("dispatch observation: {error}");
             }
-            if self.swept.lock().unwrap().elapsed() >= SWEEP_EVERY {
-                self.reclaim();
+            // Dispatch wakes on events only: an arrival, an exit, a cancel, freed room.
+            self.engine.wait_activity(epoch, None);
+        }
+    }
+    /// Caches expire by their TTL on a thread of their own, apart from dispatch.
+    fn reclaim_loop(weak: std::sync::Weak<Self>) {
+        loop {
+            std::thread::sleep(SWEEP_EVERY);
+            match weak.upgrade() {
+                Some(service) if !*service.stopped.lock().unwrap() => drop(service.reclaim()),
+                _ => return,
             }
-            // The wait bounds only how long caches go unswept; it ends nothing.
-            self.engine.wait_activity(epoch, Some(SWEEP_EVERY));
         }
     }
     /// Caches manage themselves (`reclaim`): a TTL and a low disk, never a purge verb.
     pub fn reclaim(&self) -> crate::reclaim::Swept {
-        *self.swept.lock().unwrap() = std::time::Instant::now();
         // Released Write roots first, so the store's GC can collect their bytes.
         if let Some(calls) = self.calls() {
             if let Err(error) = calls.sweep_canceled_outputs(&self.engine) {
@@ -432,9 +442,10 @@ impl Service {
             }
         }
     }
-    /// One pass over the ready runs, by root acceptance (Slurm FIFO): an older request with a
-    /// ready GPU step keeps the GPUs it waits for (`claims`) from younger ones. A deviceless call
-    /// takes CPU room; one waiting on its own call takes none.
+    /// One pass over the ready runs in the queue's order (`queue`). An older request with a
+    /// ready GPU step keeps the GPUs it waits for (`claims`) from later offers (Slurm). A deviceless
+    /// call takes CPU room; one waiting on its own call takes none. Each root left queued shows
+    /// its place in line.
     fn dispatch_ready(&self) -> io::Result<()> {
         let stopped = self.stopped.lock().unwrap();
         if *stopped {
@@ -457,51 +468,55 @@ impl Service {
         let mut room = self.parallelism.saturating_sub(
             active.iter().filter(|r| !gpu(r) && !waits(r)).count(),
         );
-        for record in self.engine.ready()? {
-            let held = match self.catalog.resolve(&record.invocation.generation) {
-                Ok(held) => held,
-                Err(error) => {
-                    self.engine.fail_unstarted(&record.id, "environment_unavailable",
-                        format!("held generation unavailable: {error}"))?;
-                    continue;
-                }
-            };
-            if !held.record.owns(&record.invocation.module, &record.invocation.package) {
-                self.engine.fail_unstarted(&record.id, "environment_unavailable",
-                    "held package identity differs from accepted invocation")?;
-                continue;
-            }
+        // A run whose plan cannot be read is its own model; its offer reports why.
+        let model = |r: &Execution| self.plan(&pool, r).map_or_else(|_| r.id.clone(), |plan| plan.construction);
+        let ready = self.queue.lock().unwrap().order(self.engine.ready()?, model);
+        let mut place = 0;
+        for record in ready {
             let invocation = &record.invocation;
-            if invocation.degree == 0 && room == 0 {
-                let busy = format!("waiting for an executor slot ({} busy)", self.parallelism);
-                if let Err(error) = self.engine.waiting(&record.id, Some(busy)) {
-                    tracing::warn!("run {}: its waiting reason was not shown: {error}", record.id);
-                }
-                continue;
-            }
-            if invocation.degree > 0 && gpu_fenced {
-                continue;
-            }
-            let plan = match record.submission.as_ref().map(|s| s.preparation_id.as_str()) {
-                None | Some("") => Plan::weightless(&invocation.generation, &invocation.module, &invocation.entrypoint, invocation.degree),
-                Some(id) => {
-                    let actor = record.submission.as_ref().map(|s| s.actor.as_str()).unwrap_or_default();
-                    let preparation = self.engine.preparation(actor, id)?.ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::InvalidData, "accepted preparation is absent")
-                    })?;
-                    pool.plan(&preparation)?
-                }
-            };
-            let held = held.application(&invocation.module)?;
-            let deviceless = plan.degree == 0;
-            if pool.dispatch(&self.engine, &record, held, plan, &mut claims, calls.clone())? && deviceless {
-                room -= 1;
-            }
-            if room == 0 && (gpu_fenced || claims.iter().all(Option::is_some)) {
-                return Ok(());
+            let full = room == 0 && (invocation.degree == 0 || claims.iter().all(Option::is_some));
+            if !(full || invocation.degree > 0 && gpu_fenced) && self.offer(&pool, &record, &mut claims, calls.clone())? {
+                room -= usize::from(invocation.degree == 0);
+            } else if invocation.parent.is_empty() {
+                place += 1;
+                let shown = self.engine.waiting(&record.id, Some(format!("position {place} in the queue")));
+                shown.unwrap_or_else(|error| tracing::warn!("run {}: its place was not shown: {error}", record.id));
             }
         }
         Ok(())
+    }
+    /// The plan `record` runs: its journaled preparation's, else a weightless call's.
+    fn plan(&self, pool: &Pool, record: &Execution) -> io::Result<Plan> {
+        let invocation = &record.invocation;
+        match record.submission.as_ref().map(|s| s.preparation_id.as_str()) {
+            None | Some("") => Ok(Plan::weightless(&invocation.generation, &invocation.module, &invocation.entrypoint, invocation.degree)),
+            Some(id) => {
+                let actor = record.submission.as_ref().map(|s| s.actor.as_str()).unwrap_or_default();
+                let preparation = self.engine.preparation(actor, id)?.ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "accepted preparation is absent")
+                })?;
+                pool.plan(&preparation)
+            }
+        }
+    }
+    /// Start `record` if it can start now: false leaves it queued (or failed, when its
+    /// environment is gone).
+    fn offer(&self, pool: &Arc<Pool>, record: &Execution, claims: &mut [Option<u64>], calls: Option<Arc<crate::calls::Calls>>) -> io::Result<bool> {
+        let held = match self.catalog.resolve(&record.invocation.generation) {
+            Ok(held) => held,
+            Err(error) => {
+                self.engine.fail_unstarted(&record.id, "environment_unavailable",
+                    format!("held generation unavailable: {error}"))?;
+                return Ok(false);
+            }
+        };
+        if !held.record.owns(&record.invocation.module, &record.invocation.package) {
+            self.engine.fail_unstarted(&record.id, "environment_unavailable",
+                "held package identity differs from accepted invocation")?;
+            return Ok(false);
+        }
+        let plan = self.plan(pool, record)?;
+        pool.dispatch(&self.engine, record, held.application(&record.invocation.module)?, plan, claims, calls)
     }
 }
 

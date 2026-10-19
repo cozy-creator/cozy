@@ -5,7 +5,7 @@ mod cozy1;
 mod http;
 pub mod identity;
 pub mod install;
-mod machine_runs;
+pub(crate) mod machine_runs;
 mod machine_status;
 mod machine_update;
 mod server;

@@ -167,6 +167,9 @@ fn spec_of(mut spec: v1::RunSpec) -> Result<(crate::runs::Spec, Option<v1::HubAc
         v1::RunKind::Remove => (false, true),
         v1::RunKind::Update => return Err(Error::validation("invalid_kind", "an update is not a run of code")),
     };
+    // Kept while it prepares, for a restart to prepare it again; provider tokens stay in memory.
+    let tokens = spec.providers.as_ref().is_some_and(|p| !p.huggingface.is_empty() || !p.civitai.is_empty());
+    let journaled = if tokens { vec![] } else { serde_json::to_vec(&spec).unwrap_or_default() };
     let input: Value = match &spec.payload {
         None => serde_json::json!({}),
         Some(payload) => crate::boundary_json::parse(payload.get().as_bytes())
@@ -245,6 +248,7 @@ fn spec_of(mut spec: v1::RunSpec) -> Result<(crate::runs::Spec, Option<v1::HubAc
         catalog_revision: spec.catalog_revision,
         application: String::new(),
         digest: identity_digest,
+        journaled,
     }, hub))
 }
 
@@ -462,10 +466,16 @@ impl Log {
 /// Accepts a run, or answers the one a re-sent spec already names (false). The run reads its
 /// Hub's public content anonymously; its capability, if any, is traded at its first private
 /// operation.
-fn accept(runs: &Arc<crate::runs::Runs>, actor: &str, id: &str, mut spec: crate::runs::Spec, hub: Option<v1::HubAccess>) -> Result<bool, Error> {
+fn accept(runs: &Arc<crate::runs::Runs>, actor: &str, id: &str, spec: crate::runs::Spec, hub: Option<v1::HubAccess>) -> Result<bool, Error> {
     if runs.existing(actor, id, &spec.digest)?.is_some() {
         return Ok(false);
     }
+    runs.submit(actor, id, reach(runs, spec, hub)?)?;
+    Ok(true)
+}
+
+/// `spec` reading `hub` under its capability, if any.
+fn reach(runs: &crate::runs::Runs, mut spec: crate::runs::Spec, hub: Option<v1::HubAccess>) -> Result<crate::runs::Spec, Error> {
     if let Some(hub) = hub {
         let invalid = |e: crate::hub::Refusal| refused("hub_access_invalid", &e.0);
         let capability = match (hub.capability.is_empty(), &runs.leaf) {
@@ -476,8 +486,30 @@ fn accept(runs: &Arc<crate::runs::Runs>, actor: &str, id: &str, mut spec: crate:
         let ca = Some(hub.ca_der).filter(|der| !der.is_empty());
         spec.hub = Some(crate::hub::Source::new(&hub.origin, ca, hub.object_hosts, capability).map_err(invalid)?);
     }
-    runs.submit(actor, id, spec)?;
-    Ok(true)
+    Ok(spec)
+}
+
+/// The runs a restart interrupted while they prepared: each prepares again from its journaled
+/// spec, or ends FAILED with why it cannot.
+pub(crate) fn resume(runs: &Arc<crate::runs::Runs>) -> std::io::Result<()> {
+    for (run, actor, sent) in runs.service.engine.interrupted()? {
+        let spec = serde_json::from_slice(&sent)
+            .map_err(|e| refused("preparation_interrupted", format!("its kept spec is unreadable: {e}")))
+            .and_then(spec_of)
+            .and_then(|(spec, hub)| reach(runs, spec, hub));
+        let failure = match spec {
+            Ok(spec) if spec.hub.as_ref().and_then(|hub| hub.capability.as_ref()).is_some_and(|c| c.expired()) => {
+                crate::journal::Failure::machine("capability_expired", "the machine restarted while this run prepared, and its Hub capability has expired since; run it again")
+            }
+            Ok(spec) => {
+                runs.prepare_later(&actor, &run, spec)?;
+                continue;
+            }
+            Err(error) => crate::journal::Failure::machine(&error.code, error.message),
+        };
+        runs.service.engine.end_preparation(&run, crate::journal::Outcome::Failed(failure))?;
+    }
+    Ok(())
 }
 
 /// Accepts the run `request` names: whether it is new, and its state.

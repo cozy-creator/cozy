@@ -82,6 +82,9 @@ pub struct Spec {
     pub application: String,
     /// The spec's identity (its access excluded): a resubmitted id must carry the same.
     pub digest: String,
+    /// The spec as sent, kept in the journal while it prepares so a restart prepares it again;
+    /// empty for one that cannot (a child run, provider tokens, which live in memory only).
+    pub journaled: Vec<u8>,
 }
 
 pub struct Runs {
@@ -284,7 +287,7 @@ impl Runs {
         let (record, new) = self
             .service
             .engine
-            .accept_run_objects(actor, id, &spec.digest, draft, &references)
+            .accept_run_objects(actor, id, &spec.digest, draft, &references, &spec.journaled)
             .map_err(|e| match e.kind() {
                 io::ErrorKind::AlreadyExists => refused("run_id_conflict", e.to_string()),
                 _ => Refused::from(e),
@@ -292,53 +295,39 @@ impl Runs {
         drop(writer);
         drop(custody);
         if new {
-            let (this, actor, run) = (self.clone(), actor.to_string(), record.id.clone());
-            std::thread::Builder::new()
-                .name(format!("prepare-{run}"))
-                .spawn(move || {
-                    let stoppable = this.service.engine.stoppable(&run);
-                    // A panic (a thread the container's task cap refused) ends the run FAILED:
-                    // no preparation outlives the thread that would end it.
-                    let prepared = std::panic::AssertUnwindSafe(|| this.prepare(&actor, &run, spec, &stoppable));
-                    let outcome = std::panic::catch_unwind(prepared).unwrap_or_else(|panic| {
-                        let text = panic.downcast_ref::<String>().cloned()
-                            .or_else(|| panic.downcast_ref::<&str>().map(|text| text.to_string()));
-                        Err(refused("preparation_failed", text.unwrap_or_else(|| "the preparation panicked".into())))
-                    });
-                    let ended = match outcome {
-                        Ok(None) => Ok(()),
-                        Ok(Some(result)) => this
-                            .service
-                            .engine
-                            .end_preparation(&run, Outcome::Completed(result))
-                            .map(drop),
-                        Err(refusal) => {
-                            let failure = Failure {
-                                status: 3,
-                                cause: 7,
-                                origin: if refusal.code.starts_with("invalid")
-                                    || refusal.code.ends_with("_absent")
-                                {
-                                    6
-                                } else {
-                                    3
-                                },
-                                code: refusal.code.into(),
-                                message: refusal.message,
-                            };
-                            this.service
-                                .engine
-                                .end_preparation(&run, Outcome::Failed(failure))
-                                .map(drop)
-                        }
-                    };
-                    if let Err(error) = ended {
-                        tracing::warn!("run {run} preparation: {error}");
-                    }
-                })
-                .map_err(Refused::from)?;
+            self.prepare_later(actor, &record.id, spec).map_err(Refused::from)?;
         }
         Ok(record)
+    }
+
+    /// Prepare accepted run `run` on a thread of its own, which ends the run unless it binds.
+    pub(crate) fn prepare_later(self: &Arc<Self>, actor: &str, run: &str, spec: Spec) -> io::Result<()> {
+        let (this, actor, run) = (self.clone(), actor.to_string(), run.to_string());
+        let thread = std::thread::Builder::new().name(format!("prepare-{run}"));
+        thread.spawn(move || {
+            let stoppable = this.service.engine.stoppable(&run);
+            // A panic (a thread the container's task cap refused) ends the run FAILED: no
+            // preparation outlives the thread that would end it.
+            let prepared = std::panic::AssertUnwindSafe(|| this.prepare(&actor, &run, spec, &stoppable));
+            let outcome = std::panic::catch_unwind(prepared).unwrap_or_else(|panic| {
+                let text = panic.downcast_ref::<String>().cloned()
+                    .or_else(|| panic.downcast_ref::<&str>().map(|text| text.to_string()));
+                Err(refused("preparation_failed", text.unwrap_or_else(|| "the preparation panicked".into())))
+            });
+            let ended = match outcome {
+                Ok(None) => Ok(()),
+                Ok(Some(result)) => this.service.engine.end_preparation(&run, Outcome::Completed(result)).map(drop),
+                Err(Refused { code, message }) => {
+                    let origin = if code.starts_with("invalid") || code.ends_with("_absent") { 6 } else { 3 };
+                    let failure = Failure { status: 3, cause: 7, origin, code: code.into(), message };
+                    this.service.engine.end_preparation(&run, Outcome::Failed(failure)).map(drop)
+                }
+            };
+            if let Err(error) = ended {
+                tracing::warn!("run {run} preparation: {error}");
+            }
+        })?;
+        Ok(())
     }
 
     /// A warm run's model choices made present when it names no entrypoint (`cozy package
@@ -1091,6 +1080,7 @@ impl Runs {
             catalog_revision: context.catalog_revision,
             application: application.into(),
             digest: digest.into(),
+            journaled: vec![],
         };
         // Both demand and prefetch overlay explicit artifacts on the same inherited
         // choices. Declaration and data-access validation stay in the existing resolver.
@@ -1310,6 +1300,7 @@ mod tests {
             catalog_revision: String::new(),
             application: String::new(),
             digest: digest.into(),
+            journaled: vec![],
         }
     }
 
