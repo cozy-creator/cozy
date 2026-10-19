@@ -401,7 +401,7 @@ pub struct Adapter {
 }
 
 /// A Hub a run reads. Public content is read anonymously.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, ToSchema)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(default)]
 pub struct HubAccess {
     pub origin: String,
@@ -423,6 +423,12 @@ pub struct HubAccess {
     pub access_token: String,
     /// The Hub's authorization server's, as its metadata names it.
     pub token_endpoint: String,
+}
+
+impl std::fmt::Debug for HubAccess {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HubAccess").field("origin", &self.origin).finish_non_exhaustive()
+    }
 }
 
 /// One entry of a run's log, as `GET /v1/runs/{id}/events` sends it: SSE `event: <variant>`,
