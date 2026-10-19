@@ -1130,22 +1130,30 @@ class Memory:
 
     def _restore(self, gpu: int) -> None:
         """After the last request on `gpu`: each model's reserve is what that request measured,
-        and every watermark rises again. Pages of GPU targets copy home into free room, most
-        worth keeping first (`_value`), always leaving the largest reserve and a streamed
-        model's slots. The copies are prefetches: an ask evicts them again at once."""
+        and every watermark rises again. Pages of GPU targets copy home, most worth keeping
+        first (`_value`): into free room, then into cold pages of this process's models worth
+        less, always leaving the largest reserve and a streamed model's slots. The copies are
+        prefetches: an ask evicts them again at once."""
         models = [m for m in self.models.values() if m.gpu == gpu]
         for model in models:
             if model.peak:
                 model.reserve, model.peak = model.peak, 0
             model.lowered = False
-        ranked = sorted((m for m in models if self._rank(m) >= 0), key=self._value, reverse=True)
+        ranked = sorted(models, key=self._value, reverse=True)
         slots = max((_SLOTS * _largest(m) for m in models if m.repeats < 2), default=0)
         room = _free(gpu) - max((max(m.reserve, 0) for m in models), default=0) - slots
-        for model in ranked:
+        for i, model in enumerate(ranked):
+            if self._rank(model) < 0:
+                return
+            lower = [m for m in ranked[i + 1 :] if not m.flight and not m.held]
             for b in model.order:
                 if b in model.home and b in model.loaded:
                     continue
                 block = model.blocks[b]
+                while room < block.nbytes and lower:
+                    room += self._evict(lower[-1], "restore", 2, block.nbytes - room)
+                    if room < block.nbytes:  # it gave all it had
+                        lower.pop()
                 if room < block.nbytes:
                     return
                 room -= block.nbytes
