@@ -39,8 +39,8 @@ with torch.no_grad():
     with mem.request("r1") as r:
         got = net(x)
 assert torch.equal(got, want), (got - want).abs().max()
-s = mem.stats()
-print("stats", [(m.name, m.resident, m.level) for m in s.models], r.stats)
+print("resident", mem.resident(), r.stats)
+assert mem.resident()[model.name] == model.nbytes
 mem.load(net, "ram"); assert model.level is Level.RAM
 model.close()
 print("OK")
