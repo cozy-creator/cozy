@@ -2,10 +2,12 @@
 //! objects can be read (`locate`); the Fetcher downloads, verifies and admits them.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use async_trait::async_trait;
 
+use super::token::TokenProvider;
 use crate::err::{refuse, Code, Refusal, Result};
 use crate::format::{ObjectRef, Repo, Tree};
 
@@ -31,13 +33,18 @@ pub trait Origin: Send + Sync {
 }
 
 /// Where one object can be read.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum Location {
     /// An HTTP(S) GET, with the headers it needs, valid until `expires`.
     Url {
         url: String,
         headers: Vec<(String, String)>,
         expires: Option<SystemTime>,
+    },
+    /// A provider presents each GET afresh, including same-origin redirects and restarts.
+    Authenticated {
+        url: String,
+        provider: Arc<dyn TokenProvider>,
     },
     /// A file on a mounted volume.
     File(PathBuf),
@@ -46,6 +53,24 @@ pub enum Location {
 impl Location {
     pub(crate) fn expired(&self) -> bool {
         matches!(self, Location::Url { expires: Some(at), .. } if *at <= SystemTime::now())
+    }
+
+    pub(crate) fn http(&self) -> Option<(&str, &[(String, String)], Option<&dyn TokenProvider>)> {
+        match self {
+            Self::Url { url, headers, .. } => Some((url, headers, None)),
+            Self::Authenticated { url, provider } => Some((url, &[], Some(provider.as_ref()))),
+            Self::File(_) => None,
+        }
+    }
+}
+
+impl std::fmt::Debug for Location {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::File(path) => f.debug_tuple("File").field(path).finish(),
+            Self::Url { url, expires, .. } => f.debug_struct("Url").field("url", url).field("expires", expires).finish_non_exhaustive(),
+            Self::Authenticated { url, .. } => f.debug_struct("Authenticated").field("url", url).finish_non_exhaustive(),
+        }
     }
 }
 

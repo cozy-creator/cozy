@@ -25,6 +25,7 @@ use tokio::net::TcpStream;
 use tokio::task::JoinSet;
 
 use super::policy::{CheckedUrl, SourcePolicy};
+use super::token::{Request as Presented, TokenProvider};
 use crate::err::{refuse, Code, Refusal, Result};
 
 /// The headers of an answer, for the fetch modules beside the client: hyper is named only here.
@@ -180,13 +181,27 @@ impl Client {
     /// GET `url`, following redirects the policy allows, each hop checked again. Credentials
     /// go only to the origin they were given for: another origin gets only the `range`.
     pub(crate) async fn get(&self, url: &str, headers: &[(String, String)]) -> Result<Answer> {
+        self.get_authorized(url, headers, None).await
+    }
+
+    pub(crate) async fn get_authorized(&self, url: &str, headers: &[(String, String)], mut provider: Option<&dyn TokenProvider>) -> Result<Answer> {
         let mut url = url.to_string();
         let mut headers = headers.to_vec();
         let (mut hops, mut until) = (0, None::<Instant>);
+        let mut challenged = false;
         loop {
-            let response = self.send("GET", &url, &headers, None).await?.response;
+            let mut presented = headers.clone();
+            if let Some(provider) = provider {
+                presented.extend(provider.headers(&Presented { method: "GET", url: &url, headers: &headers, payload: None }).await?);
+            }
+            let response = self.send("GET", &url, &presented, None).await?.response;
             let uri: Uri = url.parse().expect("sent");
             let status = response.status().as_u16();
+            let sent = Presented { method: "GET", url: &url, headers: &presented, payload: None };
+            if provider.is_some_and(|provider| provider.retry(&sent, status, response.headers())) && !challenged {
+                challenged = true;
+                continue;
+            }
             if matches!(status, 301 | 302 | 303 | 307 | 308) {
                 let Some(next) = response
                     .headers()
@@ -209,11 +224,9 @@ impl Client {
                         ),
                     );
                 }
-                let same_origin = Uri::try_from(next.as_str()).ok().is_some_and(|next| {
-                    next.scheme_str() == uri.scheme_str() && next.authority() == uri.authority()
-                });
-                if !same_origin {
+                if !same_origin(&url, &next) {
                     headers.retain(|(name, _)| name.eq_ignore_ascii_case("range"));
+                    provider = None;
                 }
                 let age = max_age(response.headers()).map(|age| Instant::now() + age);
                 until = match (until, age) {
@@ -221,6 +234,7 @@ impl Client {
                     (a, b) => a.or(b),
                 };
                 url = next;
+                challenged = false;
                 continue;
             }
             if let Some(encoding) = response
@@ -299,6 +313,11 @@ impl Client {
             body,
         })
     }
+}
+
+pub(crate) fn same_origin(a: &str, b: &str) -> bool {
+    let origin = |url: &str| url.parse::<Uri>().ok().map(|url| (url.scheme_str().map(str::to_owned), url.authority().cloned()));
+    origin(a) == origin(b)
 }
 
 /// A response's `Cache-Control: max-age`.

@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -25,7 +25,7 @@ use futures::StreamExt;
 use hyper::Uri;
 use serde_json::Value;
 
-use super::net::{join, Body, Client, HeaderMap};
+use super::net::{join, same_origin, Body, Client, HeaderMap};
 use super::origin::{release_of, split_name, Location, Origin};
 use super::policy::is_loopback_origin;
 use super::token::{default_for, s3_base, Request, TokenProvider};
@@ -139,6 +139,12 @@ impl Endpoint {
 
     pub fn url(&self) -> &str {
         &self.url
+    }
+
+    /// Public reads only, even when the environment configures credentials for this host.
+    pub fn anonymous(mut self) -> Self {
+        self.token = None;
+        self
     }
 
     /// The repo document `name` and its ETag; `None` when there is none.
@@ -507,10 +513,10 @@ impl Origin for Endpoint {
                 At::Dir(root, _) => Location::File(root.join(object.key())),
                 At::Http(base) => {
                     let url = format!("{base}/{}", object.key());
-                    let headers = self.authorize("GET", &url, &[], None).await?;
-                    // A signature or proof is made fresh for a later ask.
-                    let expires = (!headers.is_empty()).then(|| SystemTime::now() + STILL * 2);
-                    Location::Url { url, headers, expires }
+                    match &self.token {
+                        Some(provider) => Location::Authenticated { url, provider: Arc::clone(provider) },
+                        None => Location::Url { url, headers: vec![], expires: None },
+                    }
                 }
             });
         }
@@ -714,11 +720,6 @@ fn held(reply: &Reply, object: &ObjectRef) -> Result<()> {
         ),
         _ => Ok(()),
     }
-}
-
-fn same_origin(a: &str, b: &str) -> bool {
-    let origin = |u: &str| u.parse::<Uri>().ok().map(|u| (u.scheme_str().map(str::to_owned), u.authority().cloned()));
-    origin(a) == origin(b)
 }
 
 fn decode_hex(text: &str) -> Vec<u8> {
