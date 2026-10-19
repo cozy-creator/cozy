@@ -39,6 +39,10 @@ on:
         description: Existing dev-build run whose TensorFS wheel the targeted tests install
         type: string
         default: ''
+      tensorhub_ref:
+        description: Optional Tensorhub source to check out at .tensorhub for targeted live tests
+        type: string
+        default: ''
       runner:
         description: Runner label
         type: string
@@ -219,6 +223,14 @@ jobs:
             --platform manylinux_2_28_x86_64 --dest "$RUNNER_TEMP/runtime" cozy-runtime
       - if: inputs.test != '' || inputs.runtime_ref != ''
         run: echo "COZY_TEST_RUNTIME_WHEEL=$(ls "$RUNNER_TEMP"/runtime/cozy_runtime-*.whl)" >> "$GITHUB_ENV"
+      - if: inputs.tensorhub_ref != ''
+        uses: actions/checkout@v5
+        with:
+          repository: cozy-creator/tensorhub
+          ref: ${{ inputs.tensorhub_ref }}
+          ssh-key: ${{ secrets.TENSORHUB_READ_KEY }}
+          persist-credentials: false
+          path: .tensorhub
       # The machine's executor containment needs a delegated cgroup subtree.
       - if: inputs.test != ''
         env:
