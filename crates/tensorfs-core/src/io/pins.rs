@@ -92,19 +92,31 @@ impl PinnedRanges {
             },
         }
     }
-    pub fn unpin_region(&self, region: u32, off: u64) {
+    fn release(inner: &mut Inner, off: u64) -> cuda::Result<()> {
+        if let Some(guard) = inner.guards.get_mut(&off) {
+            guard.release()?;
+        }
+        inner.guards.remove(&off);
+        Ok(())
+    }
+    pub fn unpin_region(&self, region: u32, off: u64) -> cuda::Result<()> {
         let mut inner = self.inner.lock().unwrap();
+        Self::release(&mut inner, off)?;
         if let Some(state) = inner.regions.get_mut(region as usize) {
             *state = State::Fresh;
         }
-        inner.guards.remove(&off);
+        Ok(())
     }
-    pub fn unregister(&self, off: u64) {
-        self.inner.lock().unwrap().guards.remove(&off);
+    pub fn unregister(&self, off: u64) -> cuda::Result<()> {
+        Self::release(&mut self.inner.lock().unwrap(), off)
     }
-    pub fn clear(&self) {
+    pub fn clear(&self) -> cuda::Result<()> {
         let mut inner = self.inner.lock().unwrap();
-        inner.guards.clear();
+        let offsets = inner.guards.keys().copied().collect::<Vec<_>>();
+        for off in offsets {
+            Self::release(&mut inner, off)?;
+        }
         inner.regions.fill(State::Fresh);
+        Ok(())
     }
 }

@@ -758,16 +758,21 @@ impl HostMem {
         self.registrations.pin_region(region, off, len)
     }
     pub fn unpin_region(&self, region: u32, off: u64) -> Result<()> {
-        self.registrations.unpin_region(region, off); Ok(())
+        self.registrations.unpin_region(region, off).map_err(Into::into)
     }
-    pub fn unpin_all(&self) -> Result<()> { self.registrations.clear(); Ok(()) }
-    pub fn unregister(&self, off: u64) -> Result<()> { self.registrations.unregister(off); Ok(()) }
+    pub fn unpin_all(&self) -> Result<()> { self.registrations.clear().map_err(Into::into) }
+    pub fn unregister(&self, off: u64) -> Result<()> { self.registrations.unregister(off).map_err(Into::into) }
 
 }
 
 impl Drop for HostMem {
     fn drop(&mut self) {
-        self.registrations.clear();
+        if let Err(error) = self.registrations.clear() {
+            // A failed unregister still names these pages. Keep the mapping alive rather
+            // than leave the driver with a stale address; the process owns it until exit.
+            tracing::warn!("varena: retained host mapping after unregister failure: {error}");
+            return;
+        }
         // SAFETY: unmapping our own mapping, now unregistered.
         unsafe { libc::munmap(self.ptr as *mut libc::c_void, self.map_len) };
     }

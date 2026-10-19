@@ -4,7 +4,6 @@
 //! core's proof runs on a rental (`scripts/varena-gpu.py`).
 #![cfg(target_os = "linux")]
 
-use tensorfs_core::import::Sink;
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
 
@@ -52,7 +51,7 @@ impl Fixture {
         let mut w = store.writer(None, None).unwrap();
         for &(component, key, n) in TENSORS {
             let b = bytes_of(key, n);
-            w.put(component, key, &Dtype::U8, &[n as u64], Data::Plain(Source::Read(&mut &b[..]))).unwrap();
+            w.get(component).put(key, &Dtype::U8, &[n as u64], Data::Plain(Source::Read(&mut &b[..]))).unwrap();
         }
         let ck = store.checkpoint(&w.commit().unwrap()).unwrap();
         Fixture { root, ck }
