@@ -6,7 +6,9 @@
 //!   blobs, where the migration reads them; the run then puts the result in its weights
 //!   destination like any upload. Today's publish wants the whole closure here, so every old
 //!   object comes down, the large ones the new checkpoint reuses included.
-//! - [`local`]: every `local/` model of a pre-cut store on this machine, under the same name.
+//! - [`local`]: every `local/` model of a pre-cut store on this machine, under the same name; the
+//!   old objects it reuses move in by hard link (a copy only across filesystems), so the
+//!   conversion costs only its new bytes.
 use serde_json::{json, Value};
 use tensorfs_core::{
     format::ObjectRef,
@@ -111,7 +113,7 @@ pub fn checkpoint(
 }
 
 /// Every `local/` model of the pre-cut store at `root` (read only), migrated into this
-/// machine's store under its name, with the old objects it reuses copied in: one row each.
+/// machine's store under its name, with the old objects it reuses linked in: one row each.
 pub fn local(publisher: &Publisher, root: &str, observe: &(dyn Fn(&str, u64, u64) + Sync)) -> Result<Vec<Value>, Refused> {
     let (src, store) = (v1::Source::new(root), publisher.store());
     let failed = |f: tensorfs_core::failure::Failure| refused("migration_failed", f.detail);
@@ -124,14 +126,12 @@ pub fn local(publisher: &Publisher, root: &str, observe: &(dyn Fn(&str, u64, u64
         observe(&format!("migrating local/{name}"), i as u64, models.len() as u64);
         let lane = v1::Lane { manifest: (*manifest).clone(), names: vec![format!("local/{name}")] };
         let (made, doc) = rewrite(&src, store, lane)?;
-        for object in store.closure(&made).map_err(storage::io_error).map_err(|e| refused("migration_failed", e.to_string()))? {
-            if !storage::present(store, &object) {
-                let file = src.file(&object).map_err(failed)?;
-                store.put(file, Some(&object)).map_err(|e| refused("migration_failed", e.to_string()))?;
-            }
-        }
+        let closure = store.closure(&made).map_err(|e| refused("migration_failed", e.to_string()))?;
+        let adopted = migrate::adopt(&src, store, &closure).map_err(failed)?;
         storage::set_local(store, name, &made).map_err(|e| refused("local_alias_refused", e.to_string()))?;
-        rows.push(json!({"repository": format!("local/{name}"), "manifest": made.id(), "migrated": doc}));
+        rows.push(json!({"repository": format!("local/{name}"), "manifest": made.id(), "migrated": doc,
+            "linked": {"objects": adopted.linked.0, "bytes": adopted.linked.1},
+            "copied": {"objects": adopted.copied.0, "bytes": adopted.copied.1}}));
     }
     Ok(rows)
 }

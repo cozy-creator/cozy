@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use serde_json::{json, Map, Value as Json};
 
-use crate::failure::{fail, Kind, Result};
+use crate::failure::{fail, Failure, Kind, Result};
 use crate::format::layout::{self, GRID, STANDALONE};
 use crate::format::{
     Body, Dtype, Encoding, GlobalScale, Location, NibbleOrder, ObjectRef, Release, Repo,
@@ -78,6 +78,46 @@ pub fn lane(src: &v1::Source, store: Option<&Store>, lane: &v1::Lane, dry_run: b
     }
     r.doc.insert("pass".into(), r.pass.into());
     r
+}
+
+/// What [`adopt`] moved into a store, in objects and bytes.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Adopted {
+    pub linked: (u64, u64),
+    pub copied: (u64, u64),
+}
+
+/// Puts `objects`, which `src` holds, into `store`: a hard link where both lie on one
+/// filesystem, so they cost no new disk (the old store checked them at admission); a copy
+/// through the store's door across filesystems. Those `store` holds already are left.
+pub fn adopt(src: &v1::Source, store: &Store, objects: &[ObjectRef]) -> Result<Adopted> {
+    let mut adopted = Adopted::default();
+    for object in objects {
+        if store.reuse(object)? {
+            continue;
+        }
+        let Some(from) = src.path(object) else {
+            return fail(Kind::NotFound, format!("v1 object {} is not in {}", object.sha256, src.root().display()));
+        };
+        let to = store.path(object)?;
+        let dir = to.parent().expect("a blob has a directory");
+        let io = |e: std::io::Error| Failure { kind: Kind::Io, detail: format!("{}: {e}", to.display()) };
+        std::fs::create_dir_all(dir).map_err(io)?;
+        match std::fs::hard_link(&from, &to) {
+            Ok(()) => {
+                std::fs::File::open(dir).and_then(|d| d.sync_all()).map_err(io)?;
+                adopted.linked = (adopted.linked.0 + 1, adopted.linked.1 + object.length);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
+                let file = std::fs::File::open(&from).map_err(io)?;
+                store.put(file, Some(object))?;
+                adopted.copied = (adopted.copied.0 + 1, adopted.copied.1 + object.length);
+            }
+            Err(e) => return Err(io(e)),
+        }
+    }
+    Ok(adopted)
 }
 
 /// Totals over checkpoints; an object several share counts once.
