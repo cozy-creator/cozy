@@ -170,14 +170,17 @@ fn config_to_py<'py>(py: Python<'py>, v: &ConfigValue) -> PyResult<Bound<'py, Py
     Ok(match v {
         ConfigValue::Null => py.None().into_bound(py),
         ConfigValue::Bool(b) => PyBool::new(py, *b).to_owned().into_any(),
-        ConfigValue::Int(i) => to_py(py, &Value::Int(*i))?,
-        ConfigValue::Float(f) => PyFloat::new(py, *f).into_any(),
-        ConfigValue::Str(s) => PyString::new(py, s).into_any(),
-        ConfigValue::List(items) => {
+        ConfigValue::Number(n) => match (n.as_i64(), n.as_u64(), n.as_f64()) {
+            (Some(i), _, _) => i.into_pyobject(py)?.into_any(),
+            (_, Some(u), _) => u.into_pyobject(py)?.into_any(),
+            (_, _, f) => PyFloat::new(py, f.unwrap_or(f64::NAN)).into_any(),
+        },
+        ConfigValue::String(s) => PyString::new(py, s).into_any(),
+        ConfigValue::Array(items) => {
             let items = items.iter().map(|v| config_to_py(py, v)).collect::<PyResult<Vec<_>>>()?;
             PyList::new(py, items)?.into_any()
         }
-        ConfigValue::Map(map) => config_dict(py, map)?.into_any(),
+        ConfigValue::Object(map) => config_dict(py, map)?.into_any(),
     })
 }
 
@@ -190,26 +193,35 @@ fn config_dict<'py>(py: Python<'py>, map: &Config) -> PyResult<Bound<'py, PyDict
 }
 
 fn config_from_py(obj: &Bound<'_, PyAny>) -> PyResult<ConfigValue> {
+    let py = obj.py();
     if obj.is_none() {
         return Ok(ConfigValue::Null);
     }
+    if let Ok(b) = obj.cast::<PyBool>() {
+        return Ok(ConfigValue::Bool(b.is_true()));
+    }
     if let Ok(f) = obj.cast::<PyFloat>() {
-        return Ok(ConfigValue::Float(f.value()));
+        return match f.value() {
+            v if v.is_finite() => Ok(ConfigValue::from(v)),
+            _ => Err(invalid(py, format!("{f}: configs hold finite floats"))),
+        };
+    }
+    if let Ok(n) = obj.extract::<i64>() {
+        return Ok(ConfigValue::from(n));
+    }
+    if let Ok(n) = obj.extract::<u64>() {
+        return Ok(ConfigValue::from(n));
+    }
+    if let Ok(s) = obj.extract::<String>() {
+        return Ok(ConfigValue::String(s));
     }
     if let Ok(d) = obj.cast::<PyDict>() {
-        return Ok(ConfigValue::Map(config_map(d)?));
+        return Ok(ConfigValue::Object(config_map(d)?));
     }
-    if !obj.is_instance_of::<PyString>() {
-        if let Ok(items) = obj.extract::<Vec<Bound<'_, PyAny>>>() {
-            return Ok(ConfigValue::List(items.iter().map(config_from_py).collect::<PyResult<_>>()?));
-        }
+    match obj.extract::<Vec<Bound<'_, PyAny>>>() {
+        Ok(items) => Ok(ConfigValue::Array(items.iter().map(config_from_py).collect::<PyResult<_>>()?)),
+        Err(_) => Err(invalid(py, format!("{obj}: a config holds None, bool, int, float, str, list or dict"))),
     }
-    Ok(match from_py(obj)? {
-        Value::Bool(b) => ConfigValue::Bool(b),
-        Value::Int(i) => ConfigValue::Int(i),
-        Value::Str(s) => ConfigValue::Str(s),
-        _ => unreachable!("lists and dicts are taken above"),
-    })
 }
 
 fn config_map(d: &Bound<'_, PyDict>) -> PyResult<Config> {
@@ -441,19 +453,24 @@ pub struct PyPipeline {
 }
 
 /// One component: its class, config, tensors and assets.
-#[pyclass(name = "Component", module = "tensorfs", frozen, get_all)]
+#[pyclass(name = "Component", module = "tensorfs", frozen)]
 pub struct PyComponent {
+    #[pyo3(get)]
     name: String,
     /// `<library>.<Class>`, `""` when unknown.
+    #[pyo3(get)]
     cls: String,
+    #[pyo3(get)]
     config: Py<PyDict>,
     /// The config's file name when it isn't `config.json`.
+    #[pyo3(get)]
     config_file: Option<String>,
     /// `key -> Info`, in construction order.
+    #[pyo3(get)]
     tensors: Py<PyDict>,
     /// `name -> (sha256, length)`: run data in the component's folder.
+    #[pyo3(get)]
     assets: Py<PyDict>,
-    #[pyo3(get, name = "_stored")]
     ck: Option<Py<PyCheckpoint>>,
 }
 

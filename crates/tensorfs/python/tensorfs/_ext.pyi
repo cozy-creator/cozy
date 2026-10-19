@@ -141,8 +141,6 @@ class Component:
     @property
     def assets(self) -> dict[str, tuple[str, int]]:
         """`name -> (sha256, length)`: run data in the component's folder."""
-    @property
-    def _stored(self) -> Checkpoint | None: ...
     def asset(self, name: str) -> bytes:
         """An asset's bytes; a parsed header raises `UnsupportedError`."""
 
