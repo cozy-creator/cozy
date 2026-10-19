@@ -11,7 +11,7 @@ are views of its region's pages only while the block runs: its forward binds the
 the pin) and puts zero-byte placeholders back after, so no tensor can point at an unmapped page.
 An op on a placeholder outside a forward binds its block for that op. Bytes rank in use (a
 forward of the model, its root or a direct child, runs) > warm (loaded at GPU level) > idle,
-least recently used first within each. Room is made in one order (§5.2): idle bytes, cold
+models run once before repeating ones within each, then least recently used. Room is made in one order (§5.2): idle bytes, cold
 weights and caches by rank, then the hot model's watermark, which falls only within a request
 and refills toward each model's level after it. varena seals the host tier itself; the executor
 deposits it with TensorD. On a CPU or Apple device every weight binds once, at load.
@@ -924,9 +924,10 @@ class Memory:
             return 2
         return 1 if model.level is Level.GPU else 0
 
-    def _value(self, model: Model) -> tuple[int, int]:
-        """What keeping it is worth: its class, then recency."""
-        return (self._class(model), model.last_use)
+    def _value(self, model: Model) -> tuple[int, bool, int]:
+        """What keeping it is worth: its class, then whether it repeats (a denoise loop goes
+        after models run once), then recency."""
+        return (self._class(model), model.repeats >= 2, model.last_use)
 
     def _cold(self, gpu: int) -> list[Model]:
         """Models no forward is running and nothing holds, least worth keeping first."""
@@ -936,11 +937,14 @@ class Memory:
         return sorted(cold, key=self._value)
 
     def _victims(self, gpu: int) -> list[Model | Cache]:
-        """Rung 2's order: idle, then warm (a cache is warm), least recently used first."""
-        cold: list[tuple[tuple[int, int], Model | Cache]] = [
+        """Rung 2's order: idle, then warm (a cache is warm and runs once), least worth
+        keeping first."""
+        cold: list[tuple[tuple[int, bool, int], Model | Cache]] = [
             (self._value(m), m) for m in self._cold(gpu)
         ]
-        cold += [((1, c.last_use), c) for c in list(self.caches) if c.gpu == gpu and c.nbytes]
+        cold += [
+            ((1, False, c.last_use), c) for c in list(self.caches) if c.gpu == gpu and c.nbytes
+        ]
         return [v for _, v in sorted(cold, key=lambda r: r[0])]
 
     def _take(self, victim: Model | Cache, short: int, why: str) -> int:
