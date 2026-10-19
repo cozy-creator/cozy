@@ -583,10 +583,14 @@ class Memory:
         level = Level(level)
         declared = _declared(module)
         if ck is not None and declared.weights is None:
-            names = [component] if component is not None else list(ck.tensors)
-            if len(names) != 1 or ck.manifest is None:
-                raise Unbound(f"name the component of {sorted(ck.tensors)} to load (`component=`)")
-            grant = WeightGrant(ck, names[0], f"sha256:{ck.manifest.sha256}")
+            components = ck.components
+            names = [component] if component is not None else list(components)
+            if len(names) != 1 or names[0] not in components:
+                raise Unbound(f"name the component of {sorted(components)} to load (`component=`)")
+            identity = ck.id
+            if identity is None:
+                raise Unbound("load needs an opened checkpoint with a byte source")
+            grant = WeightGrant(ck, names[0], identity)
             vars(module)["_varena"] = replace(declared, weights=grant)
         with self.lock:
             model = self.by_module.get(module) or self._register(module)
@@ -667,7 +671,7 @@ class Memory:
                 self._share(ws, grant)
         if ws is not None and ws.regions != regions:
             ws.close()
-            if grant.ck.manifest is None and not files:
+            if grant.ck.id is None and not files:
                 raise LayoutChanged("a held layout of other regions needs its chunk-file grant")
             ws, host_fd = None, None
         sealed = None
@@ -1592,7 +1596,7 @@ def regions_of(module: nn.Module) -> list[list[str]]:
     keys = None if grant.keys is None else set(grant.keys)
     prefix, paths = f"{grant.component}/", blocks_of(module)
     runs: list[tuple[str | None, list[str]]] = []
-    for key in grant.ck.tensors.get(grant.component, {}):
+    for key in grant.ck.components[grant.component].tensors:
         if keys is not None and key not in keys:
             continue
         home = _block_of(key, paths)
