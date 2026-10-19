@@ -319,9 +319,8 @@ class Model:
         self.order: list[int] = []
         self.position: dict[int, int] = {}
         self.seen: dict[int, None] = {}
-        #: blocks at their home VA (the rest stream through slots), and those resident now
+        #: blocks at their home VA (the rest stream through slots)
         self.home: set[int] = set()
-        self.loaded: set[int] = set()
         self.level, self.closed = Level.GPU, False
         #: forwards running now, and whether the first bound common for them
         self.flight, self.aloft, self.held = 0, False, 0
@@ -562,12 +561,13 @@ class Memory:
         if not model.blocks or (model.reserve < 0 and repeating):
             return
         if model.reserve < 0:
-            want = model.home & model.loaded
+            want = {b for b in model.home if _resident(model, b)}
         else:
             room = self.available() + _set(model)[0] - model.common.nbytes - model.reserve
             if repeating:
                 value = self._value(model)
-                room += sum(_set(m)[0] for m in self._cold() if self._value(m) < value)
+                cold = (m for m in self.models.values() if not m.flight and not m.held)
+                room += sum(_set(m)[0] for m in cold if self._value(m) < value)
             sizes = [model.blocks[b].nbytes for b in model.order]
             fits = sum(sizes) <= room
             want = set(model.order if fits else _spread(model.order, sizes, room - 2 * max(sizes)))
@@ -617,7 +617,6 @@ class Memory:
         model, block.stream = block.model, stream
         views: dict[str, dict[str, Tensor]] = {}
         fresh: dict[str, dict[str, Tensor]] = {}
-        home = True
         try:
             for region in block.regions:
                 pinned = self._pin(model, region, stream.cuda_stream)
@@ -625,7 +624,6 @@ class Memory:
                 block.pins.append(base)
                 parts = block.parts(region, base)
                 views.update(parts)
-                home = home and pinned.home
                 if pinned.fresh:
                     fresh.update(parts)
             if fresh and model.fill is not None:
@@ -637,8 +635,6 @@ class Memory:
         except BaseException:
             _unbind(block)
             raise
-        if home and block.index >= 0:
-            model.loaded.add(block.index)
 
     def _pin(self, model: Model, region: int, stream: int) -> Pinned:
         """The region's pages, room made in §5.2's order until they map."""
@@ -700,7 +696,7 @@ class Memory:
             return
         for ahead in range(1, _AHEAD + 1):
             nxt = model.order[(at + ahead) % len(model.order)]
-            if nxt in model.loaded and nxt in model.home or model.blocks[nxt].count:
+            if model.blocks[nxt].count or nxt in model.home and _resident(model, nxt):
                 continue
             try:
                 for region in model.blocks[nxt].regions:
@@ -737,18 +733,20 @@ class Memory:
         return self._lower_until(target, why, asking) or freed
 
     def _free_upto(self, target: int, why: str) -> bool:
-        """Idle bytes (rung 1), cold weights and caches by rank, here and in other processes
+        """Idle bytes (rung 1); cold weights by the core's own order (`Gpu.give`: idle before
+        warm, least recently bound first, never a busy set), then caches; then other processes
         (rung 2), until `target` bytes are free."""
         freed = self._idle()
-        for victim in self._victims():
+        if self._free() < target:
+            for name, n in self.core.give(target - self._free()):  # type: ignore[union-attr]
+                freed += n
+                if name in self.models:
+                    self._evicted(self.models[name], 2, why, n)
+        for cache in [c for c in list(self.caches) if c.nbytes]:
             if self._free() >= target:
                 return True
-            short = target - self._free()
-            if isinstance(victim, Model):
-                freed += self._evict(victim, why, 2, short)
-            else:
-                freed += self._shrink(victim, short)
-                torch.cuda.empty_cache()
+            freed += self._shrink(cache, target - self._free())
+            torch.cuda.empty_cache()
         if self._free() >= target:
             return True
         if self.row is not None:  # other rows, each evicting in its own process
@@ -833,19 +831,6 @@ class Memory:
         """Its class (in use 2, warm 1, idle 0), then recency."""
         use = 2 if model.flight or model.held else 1 if model.level is Level.GPU else 0
         return (use, model.last_use)
-
-    def _cold(self) -> list[Model]:
-        """Models no forward runs and nothing holds, least worth keeping first."""
-        cold = [m for m in list(self.models.values()) if not m.flight and not m.held]
-        return sorted(cold, key=self._value)
-
-    def _victims(self) -> list[Model | Cache]:
-        """Rung 2's order: cold models and caches (warm), least worth keeping first."""
-        ranked: list[tuple[tuple[int, ...], Model | Cache]] = [
-            (self._value(m), m) for m in self._cold()
-        ]
-        ranked += [((1, c.last_use), c) for c in list(self.caches) if c.nbytes]
-        return [v for _, v in sorted(ranked, key=lambda r: r[0])]
 
     def _shrink(self, cache: Cache, nbytes: int) -> int:
         freed = min(int(cache.shrink(min(nbytes, cache.nbytes))), cache.nbytes)
@@ -944,12 +929,10 @@ class Memory:
             for b in reversed(_spread(model.order, _sizes(model), model.nbytes)):
                 if freed >= need:
                     break
-                if b in model.loaded and not model.blocks[b].count:
+                if not model.blocks[b].count:
                     freed += int(model.ws.evict(model.blocks[b].regions))
-                    model.loaded.discard(b)
         if need is None or freed < need:
             freed += int(model.ws.evict(None))
-            model.loaded = {b for b in model.loaded if model.blocks[b].count}
         if freed:
             self._evicted(model, rung, why, freed)
         return freed
@@ -963,7 +946,6 @@ class Memory:
         if not gone:
             return 0
         freed = int(model.ws.evict([r for b in gone for r in model.blocks[b].regions]))
-        model.loaded -= {b for b in gone if not model.blocks[b].count}
         if freed:
             self._evicted(model, rung, why, freed)
         return freed
@@ -1093,7 +1075,7 @@ class Memory:
             lower = [m for m in ranked[i + 1 :] if not m.flight and not m.held]
             for b in model.order:
                 block = model.blocks[b]
-                if b in model.home and b in model.loaded:
+                if b in model.home and _resident(model, b):
                     continue
                 while room < block.nbytes and lower:
                     room += self._evict(lower[-1], "restore", 2, block.nbytes - room)
@@ -1109,7 +1091,6 @@ class Memory:
                         model.ws.prefetch(region)
                 except DeviceFull:
                     return
-                model.loaded.add(b)
 
     def _copies(self) -> dict[str, int]:
         """Each model's weight bytes copied since it loaded, home or through slots."""
@@ -1312,6 +1293,10 @@ def _home_regions(model: Model) -> list[int]:
         *model.common.regions,
         *(r for b in sorted(model.home) for r in model.blocks[b].regions),
     ]
+
+
+def _resident(model: Model, b: int) -> bool:
+    return all(model.ws.resident(r) for r in model.blocks[b].regions)
 
 
 def _sizes(model: Model) -> list[int]:
