@@ -528,10 +528,10 @@ impl Store {
     fn commit(&self, path: &Path, bytes: &[u8], flush: bool) -> Result<()> {
         let flush = flush && self.flushes();
         let (temp, mut file) = self.temp("record")?;
+        file.lock_shared().map_err(fail("lock", &temp))?;
         let written = file
             .write_all(bytes)
             .and_then(|()| if flush { file.sync_data() } else { Ok(()) });
-        drop(file);
         if let Err(error) = written {
             let _ = fs::remove_file(&temp);
             return Err(fail("write", &temp)(error));
