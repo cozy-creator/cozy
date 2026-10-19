@@ -631,6 +631,7 @@ class Memory:
             self.clock += 1
             model.last_use = self.clock
             self.last_use = time.monotonic_ns()
+            model.ws.busy(True)  # another process's ask never takes a model in use
             self._fresh(model)
         self._enter(model.common, record=False)
         with self.lock:
@@ -642,6 +643,7 @@ class Memory:
             model.flight -= 1
             if model.flight:
                 return
+            model.ws.busy(False)
             if model.seen:
                 self._step(model)
             if model.aloft:
