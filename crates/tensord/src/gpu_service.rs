@@ -2563,6 +2563,7 @@ impl Pool {
         };
         executor.retain_until_exit(directory);
         executor.retain_until_exit(WakeOnExit(Arc::downgrade(engine)));
+        executor.activity = gpu_work(self.lane(start, plan.degree)?);
         executor.keep_memo(self.memo.clone());
         if plan.degree > 0 {
             let exact = Exact::open(&executor.birth)?.ok_or_else(|| io::Error::other("executor exited before its start"))?;
@@ -3105,6 +3106,24 @@ fn unsettled(reply: &Frame, lost: &str) -> Refused {
     Refused { code, detail }
 }
 
+/// Work on `gpus` (kernels or copies), as a count of readings that saw it; None without GPUs
+/// or while NVML cannot tell.
+fn gpu_work(gpus: &[Device]) -> Option<crate::process::Activity> {
+    let opened = gpus.iter().map(|gpu| platform::gpu::Device::open(&gpu.entry).ok());
+    let devices: Vec<_> = opened.collect::<Option<_>>().filter(|devices: &Vec<_>| !devices.is_empty())?;
+    let state = Mutex::new((vec![0; devices.len()], 0));
+    Some(Arc::new(move || {
+        let mut state = state.lock().unwrap();
+        let (seen, readings) = &mut *state;
+        let mut worked = false;
+        for (device, seen) in devices.iter().zip(seen.iter_mut()) {
+            worked |= device.worked_since(seen).ok()?;
+        }
+        *readings += u64::from(worked);
+        Some(*readings)
+    }))
+}
+
 /// Every error ends the run once its executor is gone: FAILED with the reason, or CANCELED
 /// when a cancel was journaled. Nothing returns to the queue to fail again.
 pub(crate) fn settle(engine: &Arc<Engine>, id: &str, error: &io::Error) -> io::Result<()> {
@@ -3140,6 +3159,8 @@ pub(crate) fn settle(engine: &Arc<Engine>, id: &str, error: &io::Error) -> io::R
         Outcome::Failed(
             Failure::executor("failed", "runtime", &refusal.code, &refusal.detail),
         )
+    } else if let Some(wedged) = error.get_ref().and_then(|inner| inner.downcast_ref::<crate::process::Wedged>()) {
+        Outcome::Failed(Failure::machine("no_progress", wedged.to_string()))
     } else if record.state == State::Starting {
         Outcome::Failed(
             Failure::abandoned(&format!("device executor did not start: {error}")),
