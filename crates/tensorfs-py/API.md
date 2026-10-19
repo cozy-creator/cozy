@@ -70,8 +70,9 @@ An asset is a supporting file needed by the component, such as a tokenizer's
 `tokenizer.json`, `vocab.json` or `merges.txt`. All of these files belong to the checkpoint;
 they are stored by content hash alongside the tensor data. `component.path` creates a local
 view of those included files for libraries that expect a directory, such as a tokenizer's
-`from_pretrained(path)`. It is not a second source or an additional model download. Read a
-file directly when the consumer accepts bytes, or request the compatible directory:
+`from_pretrained(path)`. The files come from the checkpoint itself; materializing the
+directory fetches any missing asset bytes. Read a file directly when the consumer accepts
+bytes, or request the compatible directory:
 
 ```python
 tokenizer = checkpoint.components["tokenizer"]
