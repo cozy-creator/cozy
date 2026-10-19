@@ -1,0 +1,11 @@
+{
+ "quantization_config": {
+  "modules_to_not_convert": [
+   "model.layers.*.self_attn",
+   "model.layers.*.mlp.router",
+   "model.embed_tokens",
+   "lm_head"
+  ],
+  "quant_method": "mxfp4"
+ }
+}
