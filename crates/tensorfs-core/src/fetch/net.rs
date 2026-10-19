@@ -209,11 +209,10 @@ impl Client {
                         ),
                     );
                 }
-                if Uri::try_from(next.as_str())
-                    .ok()
-                    .and_then(|n| n.authority().cloned())
-                    != uri.authority().cloned()
-                {
+                let same_origin = Uri::try_from(next.as_str()).ok().is_some_and(|next| {
+                    next.scheme_str() == uri.scheme_str() && next.authority() == uri.authority()
+                });
+                if !same_origin {
                     headers.retain(|(name, _)| name.eq_ignore_ascii_case("range"));
                 }
                 let age = max_age(response.headers()).map(|age| Instant::now() + age);
