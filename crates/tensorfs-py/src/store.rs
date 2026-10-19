@@ -1196,14 +1196,9 @@ impl std::ops::Deref for DeviceArray {
 
 impl Drop for DeviceArray {
     fn drop(&mut self) {
-        let mut buffer = self.0.take();
-        // A DLPack consumer may invoke its deleter from a foreign thread. Do not attach
-        // that thread just to free native storage. When Python calls the last deleter,
-        // release its GIL: cuMemFree may synchronize another consumer's pending work.
-        if unsafe { ffi::Py_IsInitialized() != 0 && ffi::PyGILState_Check() != 0 } {
-            Python::try_attach(|py| py.detach(|| drop(buffer.take())));
-        }
-        drop(buffer);
+        // cuMemFree may synchronize pending work. Move its actual final owner to the
+        // native cleanup worker, also when a foreign DLPack consumer calls the deleter.
+        crate::cleanup::defer(self.0.take());
     }
 }
 
