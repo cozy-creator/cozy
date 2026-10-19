@@ -9,7 +9,9 @@ pub type Freed = Box<dyn Fn() + Send + Sync>;
 
 pub enum GpuLedger {}
 
-pub struct Active<'a>(&'a GpuLedger);
+pub struct Active<'a> {
+    _ledger: &'a GpuLedger,
+}
 
 impl GpuLedger {
     pub fn start(_: &str, _: bool, _: u64, _: Option<u64>, _: Option<u64>, _: Liveness, _: MemoryLog) -> io::Result<Option<Self>> {

@@ -401,7 +401,7 @@ pub struct PyPinned {
 impl PyPinned {
     fn gpu(p: Pinned) -> Self {
         let (home, dl) = (p.home(), (KDL_CUDA, p.device()));
-        PyPinned { region: p.region, ptr: p.ptr, nbytes: p.nbytes, home, fresh: p.fresh, writable: true, dl, pin: Arc::new(Pin { gpu: Some(p), _host: None }) }
+        PyPinned { region: p.region, ptr: p.ptr, nbytes: p.nbytes, home, fresh: p.fresh, writable: p.writable, dl, pin: Arc::new(Pin { gpu: Some(p), _host: None }) }
     }
 
     fn host(p: HostPinned) -> Self {

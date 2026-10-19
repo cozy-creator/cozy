@@ -337,6 +337,7 @@ struct Mapping {
     kept: Option<UnixStream>,
     /// `kept` was handed out (`WeightSet::kept`).
     deposited: bool,
+    read_only: bool,
 }
 
 impl Mapping {
@@ -908,7 +909,7 @@ impl Inner {
     fn import(&self, va: u64, span: u64, fd: &OwnedFd) -> Result<Handle> {
         let mut h: Handle = 0;
         call!("cuMemImportFromShareableHandle", mem_import(&mut h, fd.as_raw_fd() as usize as *mut c_void, cuda::MEM_HANDLE_TYPE_POSIX_FD))?;
-        let desc = AccessDesc { location: self.prop.location, flags: cuda::MEM_ACCESS_PROT_READWRITE };
+        let desc = AccessDesc { location: self.prop.location, flags: cuda::MEM_ACCESS_PROT_READ };
         let mapped = call!("cuMemMap", mem_map(va, span as usize, 0, h, 0));
         let access = match &mapped {
             Ok(()) => call!("cuMemSetAccess", mem_set_access(va, span as usize, &desc, 1)),
@@ -1131,7 +1132,7 @@ impl WeightSet {
     pub fn bind(self: &Arc<Self>, region: u32, stream: u64) -> Result<Pinned> {
         let g = &self.gpu.inner;
         let _c = CtxGuard::enter(g.ctx)?;
-        let (at, ptr, fill, fresh) = {
+        let (at, ptr, fill, fresh, writable) = {
             let mut st = g.lock();
             st.clock += 1;
             if st.timings.len() > 256 {
@@ -1151,20 +1152,21 @@ impl WeightSet {
                 if reg.map.is_none() {
                     g.map_home(&mut st, self.id, region, true)?;
                 }
-                let (ptr, fill, fresh) = st.reg(self.id, region)?.map.as_mut().unwrap().pin();
-                (At::Home, ptr, fill, fresh)
+                let m = st.reg(self.id, region)?.map.as_mut().unwrap();
+                let (ptr, fill, fresh) = m.pin();
+                (At::Home, ptr, fill, fresh, !m.read_only)
             } else {
                 let i = g.slot_for(&mut st, self.id, region, true)?.expect("a bind always gets a slot");
                 let s = st.slot(i);
                 s.pending = false;
                 let (ptr, fill, fresh) = s.m.pin();
-                (At::Slot(i), ptr, fill, fresh)
+                (At::Slot(i), ptr, fill, fresh, !s.m.read_only)
             }
         };
         g.hurry(&fill);
         let ready = fill.wait().inspect_err(|_| self.release(at, region, None))?;
         let nbytes = self.weights.layout.regions[region as usize].nbytes;
-        let pinned = Pinned { ws: self.clone(), at, region, ptr, nbytes, fresh, stream, ready };
+        let pinned = Pinned { ws: self.clone(), at, region, ptr, nbytes, fresh, writable, stream, ready };
         if !pinned.ready.done()? {
             let s = stream as CUstream;
             let a = g.events.record(s, true)?;
@@ -1230,8 +1232,14 @@ impl WeightSet {
             let mut out = vec![];
             for (r, reg) in st.set(self.id).regs.iter_mut().enumerate() {
                 let Some(m) = reg.map.as_mut().filter(|m| m.chunks.len() == 1 && m.chunks[0].shared && !m.deposited) else { continue };
+                if !m.quiet()? {
+                    continue;
+                }
                 let filled = m.fill.as_ref().and_then(|f| f.state.lock().unwrap().clone());
                 if m.kept.is_none() && filled.map_or(Ok(false), |f| f.map_or(Ok(false), |ev| ev.done()))? {
+                    let desc = AccessDesc { location: g.prop.location, flags: cuda::MEM_ACCESS_PROT_READ };
+                    call!("cuMemSetAccess", mem_set_access(m.va, m.span as usize, &desc, 1))?;
+                    m.read_only = true;
                     let mut fd: c_int = -1;
                     call!("cuMemExportToShareableHandle", mem_export(&mut fd as *mut c_int as *mut c_void, m.chunks[0].handle, cuda::MEM_HANDLE_TYPE_POSIX_FD, 0))?;
                     // SAFETY: the driver just opened this descriptor for us.
@@ -1263,7 +1271,7 @@ impl WeightSet {
                     Ok(handle) => {
                         let fill = Arc::new(Fill { state: Mutex::new(Some(g.events.record(g.copy, false))), cv: Condvar::new() });
                         let chunks = vec![Chunk { handle, size: x.span, shared: true }];
-                        let m = Mapping { va: base + x.offset, span: x.span, chunks, fill: Some(fill), fresh: true, kept: Some(contain(fd)?), ..Default::default() };
+                        let m = Mapping { va: base + x.offset, span: x.span, chunks, fill: Some(fill), fresh: true, kept: Some(contain(fd)?), read_only: true, ..Default::default() };
                         st.reg(self.id, r)?.map = Some(m);
                         st.mapped += x.span;
                         adopted += x.nbytes;
@@ -1339,6 +1347,7 @@ pub struct Pinned {
     pub nbytes: u64,
     /// This bind is the first since a copy put the bytes there.
     pub fresh: bool,
+    pub writable: bool,
     stream: u64,
     ready: EvRef,
 }

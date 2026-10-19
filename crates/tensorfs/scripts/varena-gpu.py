@@ -18,6 +18,7 @@ files and from a sealed host layout. The script checks, and prints one JSON line
      this process imports and maps them with no copy, bit-exact; closing them frees them.
 """
 
+import ctypes
 import json
 import os
 import signal
@@ -297,6 +298,19 @@ def test_adopt(gpu, ck, rs, host_fd, stream, facts):
     gpu.trim()
 
 
+class Location(ctypes.Structure):
+    _fields_ = [("kind", ctypes.c_int), ("id", ctypes.c_int)]
+
+
+def access(pin: varena.Pinned) -> int:
+    flags = ctypes.c_ulonglong()
+    location = Location(1, 0)
+    get_access = ctypes.CDLL("libcuda.so.1").cuMemGetAccess
+    get_access.argtypes = [ctypes.POINTER(ctypes.c_ulonglong), ctypes.POINTER(Location), ctypes.c_ulonglong]
+    assert get_access(ctypes.byref(flags), ctypes.byref(location), pin.ptr) == 0
+    return flags.value
+
+
 def keeper(store: str, sha256: str, fd: int) -> None:
     """h's first process: every region filled at home, its pages handed over, then it waits for
     its kill."""
@@ -308,6 +322,10 @@ def keeper(store: str, sha256: str, fd: int) -> None:
         ws.bind(r, stream)
     torch.cuda.synchronize()
     kept = ws.kept()
+    for r, _, _ in kept:
+        pin = ws.bind(r, stream)
+        assert not pin.writable and access(pin) == 1, "exported mappings are CUDA read-only"
+        del pin
     meta = json.dumps([(r, span) for r, span, _ in kept]).encode()
     socket.send_fds(socket.socket(fileno=fd), [meta], [f for _, _, f in kept])
     signal.pause()
@@ -318,11 +336,15 @@ def test_survive(gpu, ck, rs, store, stream, facts):
     argv = [sys.executable, __file__, "--keep", str(store), ck.manifest.sha256, str(theirs.fileno())]
     child = subprocess.Popen(argv, pass_fds=[theirs.fileno()])
     theirs.close()
-    meta, containers, _, _ = socket.recv_fds(ours, 1 << 16, 256)
-    meta = json.loads(meta)
-    assert len(meta) == len(rs), f"every region kept, got {len(meta)} of {len(rs)}"
-    child.send_signal(signal.SIGKILL)
-    child.wait()
+    try:
+        meta, containers, _, _ = socket.recv_fds(ours, 1 << 16, 256)
+        meta = json.loads(meta)
+        assert len(meta) == len(rs), f"every region kept, got {len(meta)} of {len(rs)}"
+    finally:
+        if child.poll() is None:
+            child.kill()
+        child.wait()
+        ours.close()
     pages = []
     for (r, _), c in zip(meta, containers, strict=True):
         with socket.socket(fileno=c) as s:
@@ -337,7 +359,13 @@ def test_survive(gpu, ck, rs, store, stream, facts):
     want = sum(p.nbytes for p in ws.parts)
     assert adopted >= want, f"adopted {adopted} of {want}"
     facts["h_exact_bytes"] = exact(ws, ck, stream)
+    for r, _ in meta:
+        pin = ws.bind(r, stream)
+        assert not pin.writable and access(pin) == 1, "imported mappings are CUDA read-only"
+        del pin
+    facts["h_access"] = "read-only"
     assert counters(gpu, "kept-b").paged_in == 0, "kept pages are mapped, never copied"
+    torch.cuda.synchronize()
     again = ws.kept()
     for _, _, f in again:
         os.close(f)
