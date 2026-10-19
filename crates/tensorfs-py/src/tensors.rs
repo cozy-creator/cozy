@@ -10,10 +10,12 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyIterator};
 use tensorfs_core::failure::{Failure, Kind};
 use tensorfs_core::format::{decode, Body, Dtype, Encoding, PartBytes};
-use tensorfs_core::io::{Dst, ReadOpts, Target};
+use tensorfs_core::io::{DeviceBuffer, Dst, ReadOpts, Target};
 use tensorfs_core::store2::{Checkpoint, Error};
 
-use crate::store::{invalid, metadata, raise, Aligned, FetchTensor, OrRaise, PyArray, CheckpointAccess};
+use crate::store::{
+    invalid, metadata, raise, Aligned, ArrayBuffer, CheckpointAccess, FetchTensor, OrRaise, PyArray,
+};
 
 /// A component's tensors: a mapping of key to `Info`, with the reads.
 #[pyclass(name = "Tensors", module = "tensorfs", frozen, mapping)]
@@ -38,6 +40,7 @@ struct Want {
     dtype: Dtype,
     shape: Vec<u64>,
     buf: Aligned,
+    device: Option<DeviceBuffer>,
 }
 
 impl PyTensors {
@@ -72,10 +75,21 @@ impl PyTensors {
         py: Python<'py>,
         keys: &[String],
         decode_: bool,
+        device: Option<i32>,
     ) -> PyResult<Vec<Bound<'py, PyAny>>> {
         let ck = self.checkpoint(py)?;
-        let reads: Vec<FetchTensor> = keys.iter().map(|key| FetchTensor { key, role: None, range: None }).collect();
-        self.ck.as_ref().unwrap().fetch_tensors(py, &self.component, &reads)?;
+        let reads: Vec<FetchTensor> = keys
+            .iter()
+            .map(|key| FetchTensor {
+                key,
+                role: None,
+                range: None,
+            })
+            .collect();
+        self.ck
+            .as_ref()
+            .unwrap()
+            .fetch_tensors(py, &self.component, &reads)?;
         let mut wants = Vec::new();
         for (i, key) in keys.iter().enumerate() {
             let t = ck.tensor(&self.component, key).or_raise(py)?;
@@ -87,13 +101,20 @@ impl PyTensors {
                     .collect(),
             };
             for (role, dtype, shape, length) in parts {
-                let buf = Aligned::new(length as usize);
+                let length = usize::try_from(length)
+                    .map_err(|_| invalid(py, "stored tensor exceeds address space"))?;
+                let direct = device.filter(|_| !decode_ || matches!(t.body, Body::Data(_)));
+                let gpu = direct
+                    .map(|device| py.detach(|| DeviceBuffer::new(device, length)).or_raise(py))
+                    .transpose()?;
+                let buf = Aligned::new(if gpu.is_some() { 0 } else { length });
                 wants.push(Want {
                     key: i,
                     role: role.to_owned(),
                     dtype: dtype.clone(),
                     shape: shape.to_vec(),
                     buf,
+                    device: gpu,
                 });
             }
         }
@@ -103,9 +124,18 @@ impl PyTensors {
                 key: &keys[w.key],
                 role: &w.role,
                 offset: 0,
-                dst: Dst::Host {
-                    ptr: w.buf.as_mut_ptr(),
-                    len: w.buf.len,
+                dst: if let Some(gpu) = &w.device {
+                    Dst::Device {
+                        device: gpu.device(),
+                        ptr: gpu.ptr(),
+                        len: gpu.len(),
+                        stream: 0,
+                    }
+                } else {
+                    Dst::Host {
+                        ptr: w.buf.as_mut_ptr(),
+                        len: w.buf.len,
+                    }
                 },
             })
             .collect();
@@ -118,7 +148,10 @@ impl PyTensors {
             by_key[w.key].push(w);
         }
         let array = |w: Want| PyArray {
-            buf: Arc::new(w.buf),
+            buf: match w.device {
+                Some(device) => ArrayBuffer::Device(Arc::new(device)),
+                None => ArrayBuffer::Host(Arc::new(w.buf)),
+            },
             dtype: w.dtype,
             shape: w.shape,
         };
@@ -130,13 +163,43 @@ impl PyTensors {
                 continue;
             };
             if decode_ {
+                if let Some(device) = device {
+                    let buffer = py
+                        .detach(|| {
+                            let views = views(&parts);
+                            let count = t
+                                .shape
+                                .iter()
+                                .try_fold(1u64, |n, d| n.checked_mul(*d))
+                                .ok_or_else(|| Failure {
+                                    kind: Kind::Invalid,
+                                    detail: "logical tensor size overflow".into(),
+                                })?;
+                            tensorfs_core::io::decode::read(
+                                &t.dtype, &t.shape, encoding, &views, device, 0, count,
+                            )
+                        })
+                        .or_raise(py)?;
+                    out.push(
+                        Bound::new(
+                            py,
+                            PyArray {
+                                buf: ArrayBuffer::Device(Arc::new(buffer)),
+                                dtype: t.dtype.clone(),
+                                shape: t.shape.clone(),
+                            },
+                        )?
+                        .into_any(),
+                    );
+                    continue;
+                }
                 let bytes = py
                     .detach(|| decoded(&t.dtype, &t.shape, encoding, &parts))
                     .or_raise(py)?;
                 let mut buf = Aligned::new(bytes.len());
                 buf.bytes_mut().copy_from_slice(&bytes);
                 let a = PyArray {
-                    buf: Arc::new(buf),
+                    buf: ArrayBuffer::Host(Arc::new(buf)),
                     dtype: t.dtype.clone(),
                     shape: t.shape.clone(),
                 };
@@ -164,7 +227,11 @@ fn decoded(
     encoding: &Encoding,
     parts: &[Want],
 ) -> Result<Vec<u8>, Error> {
-    let views: BTreeMap<&str, PartBytes> = (parts.iter())
+    Ok(decode(dtype, shape, encoding, &views(parts))?)
+}
+
+fn views(parts: &[Want]) -> BTreeMap<&str, PartBytes<'_>> {
+    (parts.iter())
         .map(|w| {
             (
                 w.role.as_str(),
@@ -175,8 +242,7 @@ fn decoded(
                 },
             )
         })
-        .collect();
-    Ok(decode(dtype, shape, encoding, &views)?)
+        .collect()
 }
 
 #[pymethods]
@@ -221,7 +287,7 @@ impl PyTensors {
     /// One tensor on the CPU: an `Array` (decoded), or `Encoded` with `decode=False`.
     #[pyo3(signature = (key, *, decode = true))]
     fn read<'py>(&self, py: Python<'py>, key: String, decode: bool) -> PyResult<Bound<'py, PyAny>> {
-        Ok(self.load(py, &[key], decode)?.remove(0))
+        Ok(self.load(py, &[key], decode, None)?.remove(0))
     }
 
     /// `keys` (all when None, in construction order) read at once: `{key: Array | Encoded}`.
@@ -233,24 +299,27 @@ impl PyTensors {
         device: &str,
         decode: bool,
     ) -> PyResult<Bound<'py, PyDict>> {
-        if device != "cpu" {
-            let detail = format!(
-                "device {device:?}: CUDA arrays come with the CUDA engine; read on \"cpu\""
-            );
-            return Err(raise(
-                py,
-                Failure {
-                    kind: Kind::Unsupported,
-                    detail,
-                },
-            ));
-        }
+        let device = match device {
+            "cpu" => None,
+            "cuda" => Some(0),
+            text => Some(
+                text.strip_prefix("cuda:")
+                    .and_then(|n| n.parse::<i32>().ok())
+                    .filter(|n| *n >= 0)
+                    .ok_or_else(|| {
+                        invalid(
+                            py,
+                            format!("device {text:?}: expected cpu, cuda, or cuda:N"),
+                        )
+                    })?,
+            ),
+        };
         let keys = match keys {
             Some(keys) => keys,
             None => self.infos.bind(py).keys().extract()?,
         };
         let out = PyDict::new(py);
-        for (key, value) in keys.iter().zip(self.load(py, &keys, decode)?) {
+        for (key, value) in keys.iter().zip(self.load(py, &keys, decode, device)?) {
             out.set_item(key, value)?;
         }
         Ok(out)
@@ -281,15 +350,24 @@ impl PyTensors {
         let ck = self.checkpoint(py)?;
         let t = ck.tensor(&self.component, &key).or_raise(py)?;
         if role.is_none() && matches!(t.body, Body::Encoded { .. }) {
-            let length = t.dtype.byte_len(&t.shape).ok_or_else(|| invalid(py, "unknown logical byte length"))?;
-            if offset.checked_add(len as u64).is_none_or(|end| end > length) {
-                return Err(invalid(py, format!("{key}: {len} bytes from {offset} of {length}")));
+            let length = t
+                .dtype
+                .byte_len(&t.shape)
+                .ok_or_else(|| invalid(py, "unknown logical byte length"))?;
+            if offset
+                .checked_add(len as u64)
+                .is_none_or(|end| end > length)
+            {
+                return Err(invalid(
+                    py,
+                    format!("{key}: {len} bytes from {offset} of {length}"),
+                ));
             }
             let array = self
-                .load(py, std::slice::from_ref(&key), true)?
+                .load(py, std::slice::from_ref(&key), true, None)?
                 .remove(0)
                 .cast_into::<PyArray>()?;
-            let bytes = array.get().buf.bytes();
+            let bytes = array.get().buf.host().expect("read on CPU");
             let Some(range) = usize::try_from(offset)
                 .ok()
                 .and_then(|at| bytes.get(at..))
@@ -307,9 +385,18 @@ impl PyTensors {
             }
             return Ok(());
         }
-        let end = offset.checked_add(len as u64).ok_or_else(|| invalid(py, "read range overflow"))?;
-        let read = FetchTensor { key: &key, role: Some(role.as_deref().unwrap_or("")), range: Some(offset..end) };
-        self.ck.as_ref().unwrap().fetch_tensors(py, &self.component, &[read])?;
+        let end = offset
+            .checked_add(len as u64)
+            .ok_or_else(|| invalid(py, "read range overflow"))?;
+        let read = FetchTensor {
+            key: &key,
+            role: Some(role.as_deref().unwrap_or("")),
+            range: Some(offset..end),
+        };
+        self.ck
+            .as_ref()
+            .unwrap()
+            .fetch_tensors(py, &self.component, &[read])?;
         let target = Target {
             component: &self.component,
             key: &key,
