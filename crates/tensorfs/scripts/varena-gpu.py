@@ -9,7 +9,9 @@ files and from a sealed host layout. The script checks, and prints one JSON line
   b. a view a caller keeps blocks its page's eviction; once it dies, eviction frees the bytes;
   c. layers streamed through slots with prefetch: bit-exact with all-home; stall < copy time;
   d. a torch OOM beside home pages: evict + trim, then the retry succeeds in-process;
-  e. bind/unbind per region of ~20 params (M2), and page-in at 2 MiB vs 64 MiB chunks.
+  e. bind/unbind per region of ~20 params (M2), and page-in at 2 MiB vs 64 MiB chunks;
+  g. a refill from the sealed layout is logged against the measured H2D ceiling and link, and a
+     set in use gives a slot no bound block holds.
 """
 
 import json
@@ -236,6 +238,45 @@ def test_costs(ck, rs, host_fd, stream, facts):
     ws.close()
 
 
+def test_ceiling(ck, rs, host_fd, stream, facts):
+    gpu = varena.Gpu(0)
+    ws = gpu.register("ceiling", ck, rs, host_fd)
+    varena.copies()
+    ws.home(list(range(len(ws.spans))))
+    for r in range(len(ws.spans)):
+        ws.prefetch(r)
+    pins = [ws.bind(r, stream) for r in range(len(ws.spans))]
+    torch.cuda.synchronize()
+    runs: list = []
+    while not runs:  # the copy thread logs a run once its last copy landed
+        runs = [c for c in varena.copies() if c.kind == "h2d"]
+        time.sleep(0.01)
+    nbytes = sum(p.nbytes for p in ws.parts)
+    got, ns = sum(c.bytes for c in runs), sum(c.ns for c in runs)
+    pct = 100 * got / ns / runs[0].ceiling
+    assert got >= nbytes and runs[0].ceiling > 0, f"{got} B logged for {nbytes}, ceiling {runs[0].ceiling}"
+    assert pct >= 50, f"a refill at {pct:.0f}% of the H2D ceiling"
+    facts["g_refill"] = dict(gb=round(got / 1e9, 3), gbps=round(got / ns, 2), ceiling=round(runs[0].ceiling, 2), pct=round(pct, 1),
+                             link=runs[0].link, staged_gb=round(sum(c.staged for c in runs) / 1e9, 3), runs=len(runs))
+    del pins
+    torch.cuda.synchronize()
+    ws.home([])
+    ws.evict()
+    ws.busy(True)
+    pin = ws.bind(0, stream)
+    torch.cuda.synchronize()
+    gpu.give(1 << 62)
+    assert gpu.stats().slots == 1, "a bound slot is never given"
+    del pin
+    torch.cuda.synchronize()
+    gpu.give(1 << 62)
+    assert gpu.stats().slots == 0, "a slot no bound block holds is given"
+    ws.bind(1, stream)
+    torch.cuda.synchronize()
+    assert gpu.stats().slots == 1, "the next streamed block maps a slot again"
+    ws.close()
+
+
 def main(work: Path) -> int:
     torch.use_deterministic_algorithms(True)
     ck = write(work / "store")
@@ -252,6 +293,7 @@ def main(work: Path) -> int:
         ("c", lambda: test_stream(gpu, ck, rs, fd, stream, facts)),
         ("d", lambda: test_oom(gpu, ck, rs, stream, facts)),
         ("e", lambda: test_costs(ck, rs, fd, stream, facts)),
+        ("g", lambda: test_ceiling(ck, rs, fd, stream, facts)),
     ):
         try:
             run()

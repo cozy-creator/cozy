@@ -223,8 +223,9 @@ class WeightSet:
 class Gpu:
     """One per (process, device): VA, the chunk cache, a copy stream and the scratch slots."""
 
-    def __init__(self, device: int, chunk: int = 2 << 20) -> None:
-        """`chunk`: the physical page size, a multiple of 2 MiB."""
+    def __init__(self, device: int, chunk: int = 64 << 20) -> None:
+        """`chunk`: the physical allocation size, a multiple of 2 MiB; a full device maps its last
+        pages 2 MiB at a time. 2 MiB chunks map at about 30 GB/s, below an H2D ceiling."""
     @property
     def device(self) -> int: ...
     @property

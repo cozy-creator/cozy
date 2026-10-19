@@ -502,7 +502,7 @@ impl Gpu {
         }
         let attr = |a| cuda::attribute(dev, a);
         let pci = format!("{:04x}:{:02x}:{:02x}.0", attr(cuda::ATTR_PCI_DOMAIN_ID)?, attr(cuda::ATTR_PCI_BUS_ID)?, attr(cuda::ATTR_PCI_DEVICE_ID)?);
-        let ceiling = ceiling::h2d(&cuda::uuid(dev)?).map_or(0.0, |c| c.0);
+        let ceiling = ceiling::h2d(ordinal).map_or(0.0, |c| c.0);
         let mut s: CUstream = std::ptr::null_mut();
         call!("cuStreamCreate", stream_create(&mut s, cuda::STREAM_NON_BLOCKING))?;
         let mut bufs = Vec::with_capacity(STAGING);
@@ -693,9 +693,9 @@ impl Inner {
         let mut run: Option<Run> = None;
         loop {
             let j = self.jobs.0.lock().unwrap();
-            if let (true, Some(r)) = (j.q.is_empty(), run.take()) {
+            if j.q.is_empty() && run.is_some() {
                 drop(j);
-                run = self.land(r);
+                run = self.land(run.take().unwrap());
                 continue;
             }
             let job = match self.jobs.1.wait_while(j, |j| j.q.is_empty() && !j.stop).unwrap().q.pop_front() {
@@ -762,7 +762,7 @@ impl Inner {
                 // SAFETY: inside the live mapping the source keeps; the region is complete.
                 let p = unsafe { h.base().add(reg.offset as usize) } as *const u8;
                 let t = Instant::now();
-                let pinned = h.pin_region(r, reg.offset, align_up(n, PART_ALIGN)).0;
+                let pinned = h.pin_region(r, reg.offset, align_up(n, PART_ALIGN));
                 run.pin_ns += t.elapsed().as_nanos() as u64;
                 if pinned {
                     call!("cuMemcpyHtoDAsync", memcpy_htod_async(job.dst, p as *const c_void, n as usize, s))?;
@@ -838,14 +838,23 @@ impl Inner {
     }
 
     /// Maps `span` bytes at `va`, idle chunks first; a refusal is `DeviceFull` with nothing mapped.
+    /// A device too full for a whole chunk maps its last pages one by one.
     fn map(&self, st: &mut State, va: u64, span: u64) -> Result<Mapping> {
         let mut m = Mapping { va, ..Default::default() };
+        let mut chunk = self.chunk;
         let mapped = (|| {
             while m.span < span {
-                let size = self.chunk.min(span - m.span);
+                let size = chunk.min(span - m.span);
                 let handle = match st.idle.get_mut(&size).and_then(Vec::pop) {
                     Some(h) => h,
-                    None => self.create(st, size)?.ok_or(Error::DeviceFull { need: span, deficit: span - m.span })?,
+                    None => match self.create(st, size)? {
+                        Some(h) => h,
+                        None if size > REGION_ALIGN => {
+                            chunk = REGION_ALIGN;
+                            continue;
+                        }
+                        None => return Err(Error::DeviceFull { need: span, deficit: span - m.span }),
+                    },
                 };
                 m.chunks.push(Chunk { handle, size });
                 call!("cuMemMap", mem_map(va + m.span, size as usize, 0, handle, 0))?;

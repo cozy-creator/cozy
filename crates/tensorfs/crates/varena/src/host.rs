@@ -52,10 +52,12 @@ const FAILED: u32 = 2;
 /// it later (`OpenFill::stage`), which clears the bit before the first byte lands.
 const HOLE: u32 = 4;
 
-/// A region's page lock in this process (`HostMem::pin_region`): not tried, registered, refused.
+/// A region's page lock in this process (`HostMem::pin_region`): never copied, registered,
+/// refused, copied once unlocked.
 const PIN_NONE: u8 = 0;
 const PIN_YES: u8 = 1;
 const PIN_REFUSED: u8 = 2;
+const PIN_ONCE: u8 = 3;
 
 fn ext_off(regions: usize) -> usize {
     (WORDS_OFF + 4 * regions).next_multiple_of(8)
@@ -713,33 +715,36 @@ impl HostMem {
         Ok(())
     }
 
-    /// Page-lock region `r` (`[off, off + len)`) once, so its copies to a device are one DMA,
-    /// and keep it until `unpin_region` or the layout closes. Returns (locked, refused now): a
-    /// refused region is never asked again and its copies go through the staging buffers,
-    /// never as pageable memory. A sealed layout is mapped read-only, so only a driver that
-    /// locks read-only memory can lock it (an RTX 4070 answers NOT_SUPPORTED): that answer
-    /// holds for the whole layout. Only a region whose bytes exist (Ready): a hole's pages
-    /// would be allocated by the lock. The caller binds a context first.
-    pub fn pin_region(&self, r: u32, off: u64, len: u64) -> (bool, bool) {
+    /// Whether region `r` (`[off, off + len)`) copies to a device as one DMA: page-locked on
+    /// its second copy, and kept until `unpin_region` or the layout closes. A first copy (a
+    /// refill) goes through the staging buffers: locking 4 KiB pages runs at about 15 GB/s and
+    /// does not scale with threads (4090 host, run 11942), below a GPU's H2D ceiling; a region
+    /// copied again (streamed) pays it once. A refused region is never asked again. A sealed
+    /// layout is mapped read-only, so only a driver that locks read-only memory can lock it (an
+    /// RTX 4070 or 4090 answers NOT_SUPPORTED): that answer holds for the whole layout. Only a
+    /// region whose bytes exist (Ready). The caller binds a context first.
+    pub fn pin_region(&self, r: u32, off: u64, len: u64) -> bool {
         let state = &self.pinned[r as usize];
         let _g = self.pinning.lock().unwrap();
         match state.load(Ordering::Acquire) {
-            PIN_YES => (true, false),
-            PIN_REFUSED => (false, false),
+            PIN_YES => true,
+            PIN_REFUSED => false,
+            PIN_NONE => {
+                state.store(PIN_ONCE, Ordering::Release);
+                false
+            }
             _ => match crate::faults::hit("pin").and_then(|_| self.register(off, len)) {
                 Ok(()) => {
                     state.store(PIN_YES, Ordering::Release);
-                    (true, false)
+                    true
                 }
                 Err(Error::Cuda { code: cuda::ERROR_NOT_SUPPORTED, .. }) if self.sealed => {
-                    for state in &self.pinned {
-                        let _ = state.compare_exchange(PIN_NONE, PIN_REFUSED, Ordering::AcqRel, Ordering::Acquire);
-                    }
-                    (false, true)
+                    self.pinned.iter().for_each(|s| s.store(PIN_REFUSED, Ordering::Release));
+                    false
                 }
                 Err(_) => {
                     state.store(PIN_REFUSED, Ordering::Release);
-                    (false, true)
+                    false
                 }
             },
         }

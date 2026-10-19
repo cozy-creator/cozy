@@ -153,7 +153,7 @@ pub struct PyGpu(Arc<Gpu>);
 #[pymethods]
 impl PyGpu {
     #[new]
-    #[pyo3(signature = (device, chunk = 2 << 20))]
+    #[pyo3(signature = (device, chunk = 64 << 20))]
     fn new(py: Python<'_>, device: i32, chunk: u64) -> PyResult<Self> {
         Ok(PyGpu(py.detach(|| Gpu::open(device, chunk)).or_raise(py)?))
     }

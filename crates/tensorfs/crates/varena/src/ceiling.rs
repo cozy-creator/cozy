@@ -107,11 +107,13 @@ pub fn link(pci: &str) -> Option<Link> {
     Some(Link { gen: gen("current_link_speed")?, width: width("current_link_width")?, max_gen: gen("max_link_speed")?, max_width: width("max_link_width")? })
 }
 
-/// Pinned host→device GB/s on the current context's device (`uuid`), and the streams that
-/// reached it: measured once per GPU and driver.
-pub(crate) fn h2d(uuid: &str) -> Option<(f64, u32)> {
+/// Pinned host→device GB/s on CUDA device `device`, and the streams that reached it: measured
+/// once per GPU and driver, on its primary context.
+pub fn h2d(device: i32) -> Option<(f64, u32)> {
+    let (dev, ctx) = cuda::primary_context(device).ok()?;
+    let _c = cuda::CtxGuard::enter(ctx).ok()?;
     let driver = std::fs::read_to_string("/sys/module/nvidia/version").unwrap_or_default();
-    let key = format!("h2d {uuid} {}", driver.trim());
+    let key = format!("h2d {} {}", cuda::uuid(dev).ok()?, driver.trim());
     if let Some(&[gbps, streams]) = cached(&key).as_deref() {
         return Some((gbps, streams as u32));
     }
