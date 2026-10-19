@@ -288,7 +288,7 @@ pub struct Execution {
     pub attempt: u32,
     #[serde(default)]
     pub waiting_reason: Option<String>,
-    /// Why a queued run waits, for people (another run's install, an executor slot): an
+    /// Why a queued run waits, for people (another run's install, its place in the queue): an
     /// observation the engine overlays, never journaled.
     #[serde(skip)]
     pub waiting: Option<String>,
@@ -1590,8 +1590,8 @@ impl Journal {
 
     /// The preparing runs a restart interrupted, each with its signer and kept spec.
     pub(crate) fn interrupted(&self) -> io::Result<Vec<(String, String, Vec<u8>)>> {
-        let mut statement = self.connection.prepare("SELECT id, actor, spec FROM executions JOIN run_specs ON execution=id ORDER BY id").map_err(db_error)?;
-        let rows = statement.query_map([], |row| Ok((row.get::<_, i64>(0)?.to_string(), row.get(1)?, row.get(2)?))).map_err(db_error)?;
+        let mut statement = self.connection.prepare("SELECT id, actor, spec FROM executions JOIN run_specs ON execution=id WHERE state='queued' AND json_extract(record,'$.waiting_reason')=?1 ORDER BY id").map_err(db_error)?;
+        let rows = statement.query_map([PREPARING], |row| Ok((row.get::<_, i64>(0)?.to_string(), row.get(1)?, row.get(2)?))).map_err(db_error)?;
         rows.collect::<Result<_, _>>().map_err(db_error)
     }
 }

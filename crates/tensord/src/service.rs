@@ -50,7 +50,6 @@ pub struct Service {
     /// This machine's birth: a fenced leader's group members born before it are its
     /// previous incarnation's followers.
     started_ticks: u64,
-    swept: Mutex<std::time::Instant>,
     queue: Mutex<crate::queue::Queue>,
 }
 /// Held while one preparation runs; the machine is not idle meanwhile.
@@ -125,7 +124,6 @@ impl Service {
             startup_gpu_births: Mutex::new(startup_gpu_births),
             preparing: std::sync::atomic::AtomicUsize::new(0),
             started_ticks,
-            swept: Mutex::new(std::time::Instant::now()),
             queue: Default::default(),
         });
         service.engine.reconcile()?;
@@ -383,19 +381,16 @@ impl Service {
     }
     /// Caches expire by their TTL on a thread of their own, apart from dispatch.
     fn reclaim_loop(weak: std::sync::Weak<Self>) {
-        while let Some(service) = weak.upgrade().filter(|s| !*s.stopped.lock().unwrap()) {
-            let left = SWEEP_EVERY.saturating_sub(service.swept.lock().unwrap().elapsed());
-            if left.is_zero() {
-                service.reclaim();
-                continue;
+        loop {
+            std::thread::sleep(SWEEP_EVERY);
+            match weak.upgrade() {
+                Some(service) if !*service.stopped.lock().unwrap() => drop(service.reclaim()),
+                _ => return,
             }
-            drop(service);
-            std::thread::sleep(left);
         }
     }
     /// Caches manage themselves (`reclaim`): a TTL and a low disk, never a purge verb.
     pub fn reclaim(&self) -> crate::reclaim::Swept {
-        *self.swept.lock().unwrap() = std::time::Instant::now();
         // Released Write roots first, so the store's GC can collect their bytes.
         if let Some(calls) = self.calls() {
             if let Err(error) = calls.sweep_canceled_outputs(&self.engine) {

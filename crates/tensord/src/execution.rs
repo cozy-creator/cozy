@@ -735,7 +735,7 @@ impl Engine {
             .unwrap_or_else(|| id.to_string())
     }
 
-    /// Why queued run `id` waits, for people (another run's install, an executor slot); `None`
+    /// Why queued run `id` waits, for people (another run's install, its place in the queue); `None`
     /// once it no longer does. Shown in the run's state while it is queued; nothing durable is
     /// written.
     pub fn waiting(&self, id: &str, reason: Option<String>) -> io::Result<()> {
