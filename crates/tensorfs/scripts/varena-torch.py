@@ -117,7 +117,7 @@ def main() -> int:
     table = Ledger.create(
         str(torch.cuda.get_device_properties(0).uuid), torch.cuda.mem_get_info(0)[1]
     )
-    mem = Memory.open(dev, LedgerGrant(0, table.fd, table.events))
+    mem = Memory.open(dev, LedgerGrant(0, table.fd, table.events_fd))
     net = meta(a.dim, a.blocks)
     net._varena = Declared(WeightGrant(ck, "net", MANIFEST))
     model = mem.load(net)

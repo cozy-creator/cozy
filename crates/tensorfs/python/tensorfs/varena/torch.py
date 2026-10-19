@@ -1074,14 +1074,22 @@ class Memory:
             )
 
     def _remaining(self, request: Request) -> int:
+        """What the request still needs beyond what this process holds now (`fits` adds it to
+        the row's unevictable bytes): its key's measured peak still to come, less what it has
+        allocated since it began. -1 when never measured."""
         if request.key is None:
             return -1
         profile = self.profiles.get(request.key)
         if profile is not None:
-            return max(profile[len(request.profile) :], default=0)
-        held = next(iter(self.rows.values()), None)
-        whole = held[0].peak(request.key) if held is not None else None
-        return -1 if whole is None else int(whole)
+            ahead = max(profile[len(request.profile) :], default=0)
+        else:
+            held = next(iter(self.rows.values()), None)
+            whole = held[0].peak(request.key) if held is not None else None
+            if whole is None:
+                return -1
+            ahead = int(whole)
+        taken = sum(max(torch.cuda.memory_allocated(g) - request.start[g], 0) for g in request.gpus)
+        return max(ahead - taken, 0)
 
     def _evict(self, model: Model, why: str, rung: int, need: int | None = None) -> int:
         """Pages of `model` nobody is using: all of them, or with `need` its lowest-ranked
