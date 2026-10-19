@@ -1,13 +1,16 @@
-"""A quantizer's shape without torch: a CPU function writes one weights output through its
-owner's derive channel, adopts it and returns the model."""
+"""A quantizer's shape without torch: Runtime writes one declared output directly through
+public TensorFS in the configured store and returns its model reference."""
 from __future__ import annotations
 
 import asyncio
+import os
+from pathlib import Path
+from typing import Any
 
 import msgspec
 
-from cozy_runtime.author import App, Context, ModelArtifact, Telemetry, WeightsOutput
-from cozy_runtime.tensord_channels import Derivation
+from cozy_runtime.author import App, Context, ModelArtifact, Telemetry, Weights, WeightsOutput
+from cozy_runtime.weights_store import Derivation
 
 app = App()
 
@@ -15,6 +18,7 @@ app = App()
 class TableInput(msgspec.Struct):
     size: int = 64
     hold: str = ""
+    count: bool = False
 
 
 async def table(ctx: Context, payload: TableInput, tel: Telemetry) -> ModelArtifact:
@@ -28,11 +32,27 @@ async def table(ctx: Context, payload: TableInput, tel: Telemetry) -> ModelArtif
     output = ctx.output("model", Derivation(None, order=(("model", "table"),)))
     if not output.has("model", "table"):
         output.put("model", "table", "F32", [payload.size], bytes(range(256)) * (payload.size // 64))
-        await hold("checkpoint")  # TensorD journals each put: the write is resumable from here
+        await hold("checkpoint")  # TensorFS retains the keyed Writer's resumable state
     await hold("commit")
-    result = ctx.adopt_model(output)  # commits, then TensorD checks and keeps the manifest
+    result = ctx.adopt_model(output)  # Runtime commits, then reports a checkpoint reference
     await hold("adopt")
     return result
 
 
 app.entrypoint(table, weights=(WeightsOutput("model", max_new_bytes=1 << 20),), accelerator=False)
+
+
+async def convert(
+    ctx: Context, payload: TableInput, tel: Telemetry, *, source: Weights[Any]
+) -> ModelArtifact:
+    """The same CPU Writer behind the CLI's existing source/destination conversion syntax."""
+    values = ctx.tensorfs_source(source).components["model"].tensors.read_all()
+    assert values["seed"].tobytes() == bytes(4)
+    if payload.count:
+        # A bounded test observation: a code-less upload must not execute this function again.
+        with (Path(os.environ["TENSORFS_HOME"]) / "test-convert-invocations").open("ab") as stream:
+            stream.write(b"invoked\n")
+    return await table(ctx, payload, tel)
+
+
+app.entrypoint(convert, weights=(WeightsOutput("model", max_new_bytes=1 << 20),), accelerator=False)
