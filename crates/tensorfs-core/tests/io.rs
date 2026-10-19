@@ -52,6 +52,17 @@ fn noise(seed: u64, n: usize) -> Vec<u8> {
 }
 
 #[test]
+fn zero_source_changes_only_the_lent_host_gap() {
+    let mut bytes = [0xa5; 37];
+    let copy = Copy { src: Src::Zero, dst: Dst::host(&mut bytes[7..29]) };
+    let stats = unsafe { io::read(&[copy], &ReadOpts::default()) }.unwrap();
+    assert_eq!(stats.bytes, 22);
+    assert_eq!(&bytes[..7], &[0xa5; 7]);
+    assert_eq!(&bytes[7..29], &[0; 22]);
+    assert_eq!(&bytes[29..], &[0xa5; 8]);
+}
+
+#[test]
 #[ignore = "requires an allocated CUDA GPU; no mock driver"]
 fn cuda_staging_pins_device_copies_and_chunk_spans_keep_exact_bytes() {
     let scratch = Scratch::new("cuda");
@@ -78,14 +89,21 @@ fn cuda_staging_pins_device_copies_and_chunk_spans_keep_exact_bytes() {
     let copy = Copy { src: Src::Host(source), dst: Dst::Device { device: 0, ptr: gpu.ptr(), len: gpu.len(), stream: 0 } };
     for _ in 0..2 { unsafe { io::read(&[copy], &opts) }.unwrap(); }
     let _context = io::cuda::CtxGuard::enter(gpu.context()).unwrap();
-    let pin = unsafe { io::cuda::pin_region(source.cast_mut(), host.len, true) }.unwrap();
+    let mut pin = unsafe { io::cuda::pin_region(source.cast_mut(), host.len, true) }.unwrap();
     unsafe { io::read(&[copy], &opts) }.unwrap();
     assert!(unsafe { io::cuda::registered(source) }.unwrap());
     unsafe { io::read(&[Copy { src: Src::Device { device: 0, ptr: gpu.ptr(), stream: 0 }, dst: Dst::Device { device: 0, ptr: other.ptr(), len: other.len(), stream: 0 } }], &opts) }.unwrap();
     let mut bytes = vec![0; other.len()];
     unsafe { io::read(&[Copy { src: Src::Device { device: 0, ptr: other.ptr(), stream: 0 }, dst: Dst::host(&mut bytes) }], &opts) }.unwrap();
     assert_eq!(bytes, expected);
-    drop(pin);
+    let zero = Copy { src: Src::Zero, dst: Dst::Device { device: 0, ptr: other.ptr() + 17, len: 9, stream: 0 } };
+    unsafe { io::read(&[zero], &opts) }.unwrap();
+    unsafe { io::read(&[Copy { src: Src::Device { device: 0, ptr: other.ptr(), stream: 0 }, dst: Dst::host(&mut bytes) }], &opts) }.unwrap();
+    assert_eq!(&bytes[..17], &expected[..17]);
+    assert_eq!(&bytes[17..26], &[0; 9]);
+    assert_eq!(&bytes[26..], &expected[26..]);
+    pin.release().unwrap();
+    pin.release().unwrap();
     assert!(!unsafe { io::cuda::registered(source) }.unwrap());
 }
 
