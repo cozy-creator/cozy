@@ -27,7 +27,7 @@ use serde_json::Value;
 use super::net::{join, Body, Client, HeaderMap};
 use super::origin::{release_of, split_name, Location, Origin};
 use super::policy::is_loopback_origin;
-use super::token::{default_for, Request, TokenProvider};
+use super::token::{default_for, s3_base, Request, TokenProvider};
 use crate::err::{refuse, Code, Refusal, Result};
 use crate::format::{repo_key, Header, ObjectRef, Repo};
 use crate::sha256::{digest, hex, hex_digest};
@@ -107,16 +107,21 @@ struct Ask<'a> {
 }
 
 impl Endpoint {
-    /// The endpoint at `url`: `https://…`, `http://` on loopback, or a directory (`file:///dir`
-    /// or a path). With no `token`, the default chain's provider for its host, if any.
+    /// The endpoint at `url`: `https://…`, `http://` on loopback, `s3://<bucket>[/<prefix>]`
+    /// (SigV4), or a directory (`file:///dir` or a path). With no `token`, the default chain's
+    /// provider for it, if any.
     pub fn new(client: &Client, url: &str, token: Option<Arc<dyn TokenProvider>>) -> Result<Endpoint> {
         let url = url.trim_end_matches('/').to_owned();
-        let at = if url.starts_with("https://") || url.starts_with("http://") {
-            if url.starts_with("http://") && !is_loopback_origin(&url) {
-                return refuse(Code::SOURCE_NOT_ALLOWED, format!("{url}: plain http only on loopback"));
+        let at = if url.starts_with("https://") || url.starts_with("http://") || url.starts_with("s3://") {
+            let base = match url.starts_with("s3://") {
+                true => s3_base(&url)?,
+                false => url.clone(),
+            };
+            if base.starts_with("http://") && !is_loopback_origin(&base) {
+                return refuse(Code::SOURCE_NOT_ALLOWED, format!("{base}: plain http only on loopback"));
             }
-            client.policy().admit(&url)?;
-            At::Http(url.clone())
+            client.policy().admit(&base)?;
+            At::Http(base)
         } else {
             let path = url.strip_prefix("file://").unwrap_or(&url);
             if !path.starts_with('/') {
@@ -355,22 +360,30 @@ impl Endpoint {
         let mut stated_most = Duration::ZERO;
         loop {
             let mut headers = ask.headers.clone();
-            if ask.auth {
-                headers.extend(self.authorize(ask.method, ask.url, &ask.headers, ask.payload).await?);
-            }
-            let moved = Arc::new(AtomicU64::new(0));
-            let body = match ask.body {
-                Some(make) => Some(match make()? {
-                    Payload::Bytes(bytes) => Body::Bytes(bytes),
-                    Payload::File(file) => {
-                        let length = file.metadata().map_err(|e| crate::err::classify_io(ask.url, e))?.len();
-                        Body::File { file, length, sent: Arc::clone(&moved) }
-                    }
-                }),
-                None => None,
+            let (moved, began) = (Arc::new(AtomicU64::new(0)), Instant::now());
+            let authorized = match ask.auth {
+                true => self.authorize(ask.method, ask.url, &ask.headers, ask.payload).await,
+                false => Ok(vec![]),
             };
-            let began = Instant::now();
-            let outcome = self.watched(self.round_trip(ask.method, ask.url, &headers, body, &moved), &moved).await;
+            let outcome = match authorized {
+                Ok(auth) => {
+                    headers.extend(auth);
+                    let body = match ask.body {
+                        Some(make) => Some(match make()? {
+                            Payload::Bytes(bytes) => Body::Bytes(bytes),
+                            Payload::File(file) => {
+                                let length = file.metadata().map_err(|e| crate::err::classify_io(ask.url, e))?.len();
+                                Body::File { file, length, sent: Arc::clone(&moved) }
+                            }
+                        }),
+                        None => None,
+                    };
+                    self.watched(self.round_trip(ask.method, ask.url, &headers, body, &moved), &moved).await
+                }
+                Err(e) => Err(e),
+            };
+            // Bytes that moved before a transport failure are progress; a "not now" is not.
+            let progressed = outcome.is_err() && moved.load(Ordering::Relaxed) > 0;
             let (why, stated) = match outcome {
                 Ok(reply) => {
                     self.slowest.fetch_max(began.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -389,7 +402,7 @@ impl Endpoint {
                 Err(e) if matches!(e.code, Code::TRANSFER_FAILED | Code::FD_HEADROOM | Code::STALLED) => (e.detail, None),
                 Err(e) => return Err(e),
             };
-            if moved.load(Ordering::Relaxed) > 0 {
+            if progressed {
                 still = Instant::now();
             }
             stated_most = stated_most.max(stated.unwrap_or_default());

@@ -8,6 +8,7 @@
 //! downloader serve every origin.
 
 mod download;
+mod dpop;
 mod endpoint;
 mod net;
 mod origin;
@@ -22,12 +23,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+pub use dpop::{DPoP, JwtBearer};
 pub use endpoint::{upload_tree, with_tree, Endpoint, Fresh, Payload, Uploaded};
 pub use net::Client;
 pub use origin::{choose, release_of, variant_of_tree, Chosen, Location, Origin};
 pub use policy::SourcePolicy;
 pub use tensorhub::{Resolved, TensorhubOrigin, TENSORHUB};
-pub use token::TokenProvider;
+pub use token::{bearer, SigV4, TokenProvider};
 pub use volume::VolumeOrigin;
 
 use crate::err::{refuse, Code, Refusal, Result};
