@@ -128,7 +128,7 @@ class OfflineCache(unittest.TestCase):
         for mode, expected in (
             ("denied", tensorfs.DeniedError),
             ("missing", tensorfs.NotFoundError),
-            ("invalid", tensorfs.InvalidError),
+            ("invalid", tensorfs.FormatError),
         ):
             with self.subTest(mode=mode):
                 self.mode = mode

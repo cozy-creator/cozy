@@ -242,6 +242,7 @@ impl Remote {
     }
 
     fn fetch_progress(&self, objects: &[ObjectRef], priority: u64, report: &(dyn Fn(u64, u64) -> Result<(), Failure> + Sync)) -> Result<(), Failure> {
+        let _hold = self.store.cache_hold(objects)?;
         let total = objects.iter().map(|object| object.length).sum();
         report(0, total)?;
         if self.offline {
@@ -352,6 +353,7 @@ impl PyStore {
         let remote = Remote { store: self.store.clone(), client, endpoint, offline: false };
         let named = py.detach(|| -> Result<Named, Failure> {
             let (root, version) = remote.root(&repo_id, revision.as_deref())?;
+            let _hold = self.store.cache_hold(std::slice::from_ref(&root))?;
             remote.fetch(std::slice::from_ref(&root), 0)?;
             let bytes = self.store.read(&root)?;
             let (tree, header, chosen) = match Tree::from_json(&bytes) {
@@ -440,6 +442,7 @@ impl PyStore {
         let remote = Remote { store: self.store.clone(), client, endpoint, offline: local_files_only || repo_id.starts_with("local/") };
         py.detach(|| -> Result<PathBuf, Failure> {
             let (root, version) = remote.root(repo_id, revision.as_deref())?;
+            let _root_hold = self.store.cache_hold(std::slice::from_ref(&root))?;
             remote.fetch(std::slice::from_ref(&root), 0)?;
             let tree = self.store.tree(&root)?;
             let chosen: Vec<_> = match variant.as_deref() {
@@ -447,20 +450,26 @@ impl PyStore {
                 None => tree.variants().collect(),
             };
             let headers: Vec<_> = chosen.iter().map(|(_, h)| (*h).clone()).collect();
+            let _header_hold = self.store.cache_hold(&headers)?;
             remote.fetch(&headers, 0)?;
             let mut objects: Vec<_> = tree.repo_files().map(|(_, r)| r.clone()).collect();
             for header in headers {
                 let header = Header::from_cbor(&self.store.read(&header)?)?;
                 objects.extend(tensorfs_core::store2::wanted(&header, components.as_deref())?);
             }
+            let _object_hold = self.store.cache_hold(&objects)?;
             remote.fetch(&objects, 0)?;
             if let Some(version) = version {
                 self.store.update_ref(repo_id, |old| Some(fetch::with_tree(old, repo_id, &root, Some(&version))))?;
                 self.store.cache_ref(repo_id)?;
             }
+            let internal = local_dir.is_none();
             let dest = local_dir.unwrap_or_else(|| self.store.root().join("snapshots").join(&root.sha256));
             let variants: Option<Vec<_>> = variant.map(|v| vec![v]);
             self.store.snapshot(&root, &dest, variants.as_deref())?;
+            if internal { self.store.cache_snapshot(&dest)?; }
+            self.store.cache_touch(&root)?;
+            let _ = self.store.cache_maintain(0)?;
             Ok(dest)
         }).or_raise(py)
     }
@@ -473,6 +482,7 @@ impl PyStore {
         let remote = Remote { store: self.store.clone(), client, endpoint, offline: local_files_only || repo_id.starts_with("local/") };
         py.detach(|| -> Result<PathBuf, Failure> {
             let (root, version) = remote.root(repo_id, revision.as_deref())?;
+            let _root_hold = self.store.cache_hold(std::slice::from_ref(&root))?;
             remote.fetch(std::slice::from_ref(&root), 0)?;
             let tree = self.store.tree(&root)?;
             let object = tree.files.get(filename).ok_or_else(|| Failure { kind: Kind::NotFound, detail: format!("no file {filename}") })?;
@@ -481,8 +491,13 @@ impl PyStore {
                 self.store.update_ref(repo_id, |old| Some(fetch::with_tree(old, repo_id, &root, Some(&version))))?;
                 self.store.cache_ref(repo_id)?;
             }
-            let dest = local_dir.unwrap_or_else(|| self.store.root().join("snapshots").join(&root.sha256)).join(filename);
+            let internal = local_dir.is_none();
+            let folder = local_dir.unwrap_or_else(|| self.store.root().join("snapshots").join(&root.sha256));
+            let dest = folder.join(filename);
             self.store.materialize(object, &dest)?;
+            if internal { self.store.cache_snapshot(&folder)?; }
+            self.store.cache_touch(&root)?;
+            let _ = self.store.cache_maintain(0)?;
             Ok(dest)
         }).or_raise(py)
     }

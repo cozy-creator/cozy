@@ -23,6 +23,8 @@ mod gc;
 mod records;
 pub(crate) mod retention;
 
+#[doc(hidden)]
+pub use cache::CacheGuard;
 pub use checkpoint::{wanted, Checkpoint, ChunkRead, Piece, Placed, ReadPlan};
 pub use gc::{Collected, PinUsage, Usage};
 pub(crate) use records::is_name;
