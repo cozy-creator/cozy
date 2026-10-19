@@ -195,7 +195,7 @@ async fn a_user_and_a_machine_at_a_real_hub() {
     let capability = session.key().sign_run_capability(&RunCapability {
         user_id: me.user_id.clone(),
         hub: hub.origin.clone(),
-        machine: leaf.thumbprint(),
+        key_jkt: leaf.thumbprint(),
         run: format!("run-{nonce}"),
         operations: vec![
             json!({"type": "tensorhub_model_publish", "model": format!("{account}/model")}),

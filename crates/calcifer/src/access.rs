@@ -2,16 +2,16 @@
 //! own word, kept per Hub: in a dev or CI Hub it is not the origin this computer dials), and, for
 //! a run that publishes into its weights destination or reads one of its owner's checkpoints by
 //! digest, the owner's capability for exactly that, signed offline with this computer's device
-//! key and bound to the machine's TLS leaf (th-241). The machine trades it at the Hub's token
+//! key and bound to a fresh per-send P-256 key. Its holder trades it at the Hub's token
 //! endpoint at its first private operation. The machine's spec digest leaves the capability out,
 //! so a resend with a fresh one names the same run. Signed out, a public run reads at its Hub's
 //! origin.
-//! Ordinary TensorFS access uses this computer's existing user Bearer at send time; it is never
-//! added to the stored submission.
+//! Explicit ordinary TensorFS credentials remain supported; scoped sends never acquire the
+//! owner's broad Bearer as a substitute for the request capability.
 use std::time::Duration;
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use hub_client::{Credential, DeviceKey, RunCapability};
+use hub_client::{DeviceKey, P256Key, RunCapability};
 use protocol::{
     calcifer::Reason,
     config::{self, Origin},
@@ -20,10 +20,8 @@ use protocol::{
     machine as v1,
 };
 use serde_json::{Value, json};
-use sha2::{Digest as _, Sha256};
 
 use crate::{
-    link,
     machines::{Machines, internal, lock},
     rentals::{Hubs, hub_refusal, signed_out},
     store::RunRow,
@@ -68,7 +66,7 @@ pub(crate) struct Facts {
 
 impl Machines {
     /// The Hub access and provider tokens the run's send to `machine` carries.
-    pub(crate) async fn access(&self, run: &RunRow, machine: &str) -> Result<Access, Denied> {
+    pub(crate) async fn access(&self, run: &RunRow, _machine: &str) -> Result<Access, Denied> {
         let providers = self.providers.clone();
         let spec = &run.spec;
         let origin = match &run.hub {
@@ -92,7 +90,6 @@ impl Machines {
             true => operations(&facts.account, spec),
             false => vec![],
         };
-        let ordinary = ordinary_tensorfs_needed(spec, &operations);
         let mut hub = v1::HubAccess {
             origin: facts.reads.clone(),
             object_hosts: facts.object_hosts.clone(),
@@ -100,17 +97,15 @@ impl Machines {
             ..Default::default()
         };
         if !operations.is_empty() {
-            hub.capability = (self.capability(run, origin, machine, &facts, operations)).await?;
+            let key = P256Key::generate();
+            hub.capability = self.capability(run, origin, &facts, operations, &key)?;
+            hub.key = key.private_jwk();
             hub.token_endpoint = facts.token_endpoint.clone();
         }
-        let tensorfs = match ordinary {
-            true => Some(self.hubs.ordinary_tensorfs(origin, &facts).await?),
-            false => None,
-        };
         Ok(Access {
             hub: Some(hub),
             providers,
-            tensorfs,
+            tensorfs: None,
             owner: Some(facts.account.clone()),
         })
     }
@@ -138,37 +133,20 @@ impl Machines {
         }
     }
 
-    /// The owner's capability for `operations`, bound to the leaf `machine` presents.
-    async fn capability(
+    /// The owner's capability for `operations`, bound to this send's key without a machine probe.
+    fn capability(
         &self,
         run: &RunRow,
         origin: &Origin,
-        machine: &str,
         facts: &Facts,
         operations: Vec<Value>,
+        run_key: &P256Key,
     ) -> Result<String, Denied> {
-        let row = self
-            .store()
-            .machine(machine)
-            .map_err(|e| unreachable(e.to_string()))?;
-        let endpoint = row
-            .and_then(|row| row.endpoint)
-            .ok_or_else(|| unreachable(format!("{machine} has no address")))?;
-        let leaf = link::presented_leaf(&endpoint.address)
-            .await
-            .map_err(|e| unreachable(e.to_string()))?;
-        if Sha256::digest(&leaf).as_slice() != endpoint.pin {
-            return Err(unreachable(format!(
-                "{machine} presented another TLS leaf than the one pinned"
-            )));
-        }
-        let machine = hub_client::leaf_thumbprint(&leaf)
-            .map_err(|e| refused("machine_key_unsupported", format!("{machine}: {e}")))?;
         let key = self.device_key(origin)?;
         Ok(key.sign_run_capability(&RunCapability {
             user_id: facts.user_id.clone(),
             hub: facts.public.clone(),
-            machine,
+            key_jkt: run_key.thumbprint(),
             run: run.id.to_string(),
             operations,
             lifetime: CAPABILITY_LIFE,
@@ -185,28 +163,6 @@ impl Machines {
 }
 
 impl Hubs {
-    /// Uses the normal cached user session. The key stays on this computer; only its ordinary
-    /// Bearer and the Hub's existing machine-reachable endpoint/CA travel with this send.
-    async fn ordinary_tensorfs(
-        &self,
-        origin: &Origin,
-        facts: &Facts,
-    ) -> Result<v1::TensorFSOptions, Denied> {
-        let client = self.client(origin).map_err(|_| needs_sign_in(origin))?;
-        let Credential::User(session) = client.credential() else {
-            return Err(needs_sign_in(origin));
-        };
-        let token = session
-            .bearer(&client.anonymous())
-            .await
-            .map_err(|error| hub_denied(origin, error))?;
-        Ok(v1::TensorFSOptions {
-            endpoint: facts.reads.clone(),
-            token,
-            ca_der: facts.ca_der.clone(),
-        })
-    }
-
     /// This computer's account at `origin`, where machines read it, and where they trade a
     /// capability: read once, then kept for the life of this Calcifer.
     pub(crate) async fn facts(&self, origin: &Origin) -> Result<Facts, Denied> {
@@ -303,12 +259,6 @@ impl Hubs {
     }
 }
 
-/// The existing private-read/write decision also decides whether ordinary TensorFS needs this
-/// Hub's owner credential. Explicit caller options remain authoritative.
-fn ordinary_tensorfs_needed(spec: &v1::RunSpec, operations: &[Value]) -> bool {
-    spec.tensorfs.is_none() && !operations.is_empty()
-}
-
 /// The existing outbound Hub context also names public model defaults resolved later by
 /// TensorD. Copying its transport acquires no credential and makes no network call.
 pub(crate) fn anonymous_tensorfs(spec: &v1::RunSpec) -> Option<v1::TensorFSOptions> {
@@ -355,7 +305,7 @@ fn operations(owner: &str, spec: &v1::RunSpec) -> Vec<Value> {
         let owned = model
             .split_once('/')
             .is_some_and(|(org, _)| org.eq_ignore_ascii_case(owner));
-        let read = json!({"type": "tensorhub_model_read", "model": model.to_ascii_lowercase(), "manifest": manifest});
+        let read = json!({"type": "tensorhub_model_read", "model": model.to_ascii_lowercase(), "revision": manifest});
         if owned && by_digest(release, manifest) && !operations.contains(&read) {
             operations.push(read);
         }
@@ -369,7 +319,7 @@ fn operations(owner: &str, spec: &v1::RunSpec) -> Vec<Value> {
     let destination = destination(spec);
     if !destination.is_empty() {
         operations.push(
-            json!({"type": "tensorhub_model_publish", "model": destination.to_ascii_lowercase()}),
+            json!({"type": "tensorhub_model_upload", "model": destination.to_ascii_lowercase()}),
         );
     }
     operations
@@ -447,9 +397,9 @@ mod tests {
         assert_eq!(
             operations("fidika", &spec),
             vec![
-                json!({"type": "tensorhub_model_read", "model": "fidika/sdxl", "manifest": "sha256:aa"}),
-                json!({"type": "tensorhub_model_read", "model": "fidika/lora", "manifest": "sha256:dd"}),
-                json!({"type": "tensorhub_model_publish", "model": "fidika/out"}),
+                json!({"type": "tensorhub_model_read", "model": "fidika/sdxl", "revision": "sha256:aa"}),
+                json!({"type": "tensorhub_model_read", "model": "fidika/lora", "revision": "sha256:dd"}),
+                json!({"type": "tensorhub_model_upload", "model": "fidika/out"}),
             ]
         );
         assert_eq!(spec.models[0].repository, "Fidika/sdxl");
@@ -462,49 +412,6 @@ mod tests {
         assert!(
             !private(&public),
             "a release and a local destination are public"
-        );
-    }
-
-    #[test]
-    fn ordinary_tensorfs_uses_existing_private_reads_and_writes_without_overriding_options() {
-        let needs = |spec: &v1::RunSpec| ordinary_tensorfs_needed(spec, &operations("owner", spec));
-        let mut read = v1::RunSpec {
-            models: vec![choice("owner/private", "", "sha256:tree")],
-            ..Default::default()
-        };
-        assert!(needs(&read));
-        read.models = vec![choice("public/base", "1", "")];
-        read.models[0].adapters.push(v1::Adapter {
-            model: "owner/adapter".into(),
-            manifest: "sha256:adapter".into(),
-            ..Default::default()
-        });
-        assert!(needs(&read));
-        let mut write = v1::RunSpec {
-            weights_destination: "owner/output".into(),
-            ..Default::default()
-        };
-        assert!(needs(&write));
-        write.tensorfs = Some(v1::TensorFSOptions {
-            endpoint: "https://explicit.example.test".into(),
-            ..Default::default()
-        });
-        assert!(
-            !needs(&write),
-            "an explicit endpoint must not receive this Hub's credential"
-        );
-        let public = v1::RunSpec {
-            models: vec![
-                choice("public/base", "1", ""),
-                choice("other/digest", "", "sha256:public"),
-            ],
-            weights_destination: "local/derived".into(),
-            ..Default::default()
-        };
-        assert!(!needs(&public));
-        assert!(
-            !needs(&v1::RunSpec::default()),
-            "local Writer calls need no Hub sign-in"
         );
     }
 
@@ -724,51 +631,17 @@ mod tests {
         serving.abort();
     }
 
-    #[tokio::test]
-    async fn an_ordinary_bearer_is_added_only_to_the_outbound_spec_after_restart() {
+    #[test]
+    fn supplied_ordinary_access_is_outbound_only_and_preserves_explicit_options() {
         use crate::{Calcifer, store::NewRun};
-        use platform::paths::Home;
 
         let temp = tempfile::tempdir().unwrap();
-        let home = Home::at(temp.path());
         let origin = Origin::parse("https://configured.example.test").unwrap();
-        let hub = config::Hub {
-            name: None,
-            origin: origin.clone(),
-        };
-        platform::durable::private_dir(&home.keys()).unwrap();
-        // A synthetic test sign-in, never a real user's key. The normal session must use its
-        // live cached Bearer, so no network or alternate credential mechanism is involved.
-        let key = serde_json::to_vec(&json!({
-            "version": 1, "hub": origin.as_str(), "email": "test@example.test",
-            "device_key_id": "ordinary-test-device", "private_key": URL_SAFE_NO_PAD.encode([17u8; 32])
-        }))
-        .unwrap();
-        platform::durable::replace(&hub.device_key(&home), &key, 0o600).unwrap();
-        let keep = |token: &str| {
-            let bearer = hub_client::Bearer {
-                token: token.into(),
-                expires: u64::MAX,
-                device_key_id: "ordinary-test-device".into(),
-            };
-            platform::durable::replace(
-                &hub.bearer(&home),
-                &serde_json::to_vec(&bearer).unwrap(),
-                0o600,
-            )
-            .unwrap();
-        };
-        let facts = Facts {
-            account: "owner".into(),
-            user_id: "owner-id".into(),
-            reads: "https://machine-reachable.example.test".into(),
-            public: origin.to_string(),
-            names: vec![],
-            object_hosts: vec![],
+        let supplied = |token: &str| v1::TensorFSOptions {
+            endpoint: "https://machine-reachable.example.test".into(),
             ca_der: vec![1, 2, 3],
-            token_endpoint: String::new(),
+            token: token.into(),
         };
-        let hubs = Hubs::new(&home, vec![hub.clone()]);
         let calcifer_home = temp.path().join("calcifer");
         let calcifer = Calcifer::open(&calcifer_home, &temp.path().join("outputs")).unwrap();
         let id = RunId::mint([19; 12]);
@@ -795,14 +668,7 @@ mod tests {
                 },
             )
             .unwrap();
-        keep("ordinary-cache-first");
-        let first = match hubs.ordinary_tensorfs(&origin, &facts).await {
-            Ok(value) => value,
-            Err(_) => panic!("the normal cached user sign-in was not used"),
-        };
-        assert_eq!(first.endpoint, facts.reads);
-        assert_eq!(first.ca_der, facts.ca_der);
-        assert_eq!(first.token, "ordinary-cache-first");
+        let first = supplied("ordinary-cache-first");
         let mut sent = row.spec.clone();
         calcifer.finish_spec(
             &row,
@@ -832,11 +698,7 @@ mod tests {
         let calcifer = Calcifer::open(&calcifer_home, &temp.path().join("outputs")).unwrap();
         let replay = calcifer.store().run(id.as_str()).unwrap().unwrap();
         assert!(replay.spec.tensorfs.is_none());
-        keep("ordinary-cache-replacement");
-        let next = match hubs.ordinary_tensorfs(&origin, &facts).await {
-            Ok(value) => value,
-            Err(_) => panic!("the replacement normal cached sign-in was not used"),
-        };
+        let next = supplied("ordinary-cache-replacement");
         let mut resent = replay.spec.clone();
         calcifer.finish_spec(
             &replay,

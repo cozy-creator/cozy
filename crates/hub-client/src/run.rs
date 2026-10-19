@@ -119,10 +119,10 @@ impl RunToken {
             Op::Read { model, manifest } => {
                 named["type"] == "tensorhub_model_read"
                     && named["model"] == model
-                    && named["manifest"] == manifest
+                    && (named["revision"] == manifest || named["manifest"] == manifest)
             }
             Op::Publish { model } => {
-                named["type"] == "tensorhub_model_publish" && named["model"] == model
+                (named["type"] == "tensorhub_model_upload" || named["type"] == "tensorhub_model_publish") && named["model"] == model
             }
         })
     }
