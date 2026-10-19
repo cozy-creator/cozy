@@ -77,6 +77,10 @@ enum Verb {
         /// https://…/<wheel>#sha256=<hex>, which the machine fetches itself.
         #[arg(long, value_name = "FILE|URL")]
         tensorfs_wheel: Option<std::path::PathBuf>,
+        /// Use at most this much of each GPU's memory (`8GiB`), as a smaller card would; `off`
+        /// lifts it. The machine keeps it in its config, across updates and restarts.
+        #[arg(long, value_name = "SIZE|off", value_parser = gpu_memory_limit)]
+        gpu_memory_limit: Option<u64>,
     },
     /// A machine's build toolchain, for cards no prebuilt kernel serves.
     Toolchain {
@@ -127,13 +131,25 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
             name,
             runtime_wheel,
             tensorfs_wheel,
-        } => end::update(ctx, &name, runtime_wheel, tensorfs_wheel).await,
+            gpu_memory_limit,
+        } => end::update(ctx, &name, runtime_wheel, tensorfs_wheel, gpu_memory_limit).await,
         Verb::Toolchain {
             verb: ToolchainVerb::Install { on },
         } => end::toolchain(ctx, &on).await,
         Verb::Enable => local::enable(ctx).await,
         Verb::Disable => local::disable(ctx).await,
         Verb::Authorize { public_key } => local::authorize(ctx, &public_key),
+    }
+}
+
+/// `--gpu-memory-limit`: a size, or `off` (0, which the machine reads as no limit).
+fn gpu_memory_limit(text: &str) -> Result<u64, String> {
+    match text {
+        "off" => Ok(0),
+        size => match cozy_proto::config::parse_size(size)? {
+            0 => Err("a limit of 0 bytes: write `off` to lift it".into()),
+            bytes => Ok(bytes),
+        },
     }
 }
 
@@ -218,4 +234,26 @@ fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as i64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_gpu_memory_limit_is_a_size_or_off_and_shows_beside_the_card() {
+        assert_eq!(gpu_memory_limit("8GiB"), Ok(8 << 30));
+        assert_eq!(gpu_memory_limit("off"), Ok(0));
+        assert!(gpu_memory_limit("0").is_err() && gpu_memory_limit("8GB").is_err());
+        let gpu = |limit| cozy_proto::calcifer::Gpu {
+            index: 0,
+            name: "RTX 5070".into(),
+            memory_bytes: 12 << 30,
+            memory_limit_bytes: limit,
+            ..Default::default()
+        };
+        let status = cozy_proto::calcifer::MachineStatus { gpus: vec![gpu(8 << 30), gpu(0)], ..Default::default() };
+        let cells: Vec<String> = status_fields(&status).into_iter().filter(|(k, _)| k == "GPU 0").map(|(_, v)| v).collect();
+        assert_eq!(cells, ["RTX 5070 · 12 GiB · limited to 8.0 GiB", "RTX 5070 · 12 GiB"]);
+    }
 }

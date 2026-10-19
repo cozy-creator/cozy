@@ -239,6 +239,10 @@ pub fn status_fields(status: &MachineStatus) -> Vec<(String, String)> {
     }
     for gpu in &status.gpus {
         let mut cell = format!("{} · {} GiB", gpu.name, gpu.memory_bytes >> 30);
+        if gpu.memory_limit_bytes > 0 {
+            // The card's own size stays: a limited card is not mistaken for a smaller one.
+            cell += &format!(" · limited to {}", crate::output::bytes(gpu.memory_limit_bytes));
+        }
         for part in [&gpu.family, &gpu.memory_class].into_iter().flatten() {
             cell += &format!(" · {part}");
         }
