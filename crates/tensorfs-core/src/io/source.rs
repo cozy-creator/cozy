@@ -205,6 +205,21 @@ impl Source {
         let mut intervals = items
             .iter()
             .map(|item| {
+                if let ItemSource::Object(range) = &item.source {
+                    if range.len != item.len
+                        || range
+                            .off
+                            .checked_add(range.len)
+                            .is_none_or(|n| n > range.obj.length)
+                    {
+                        return Err(invalid("object range exceeds its verified source"));
+                    }
+                }
+                if let ItemSource::Inline(bytes) = &item.source {
+                    if bytes.len() as u64 != item.len {
+                        return Err(invalid("inline length differs from item"));
+                    }
+                }
                 let start = item
                     .offset
                     .checked_sub(origin)
@@ -254,14 +269,6 @@ impl Source {
         let mut files = HashMap::new();
         for item in items {
             if let ItemSource::Object(range) = &item.source {
-                if range.len != item.len
-                    || range
-                        .off
-                        .checked_add(range.len)
-                        .is_none_or(|n| n > range.obj.length)
-                {
-                    return Err(invalid("object range exceeds its verified source"));
-                }
                 #[cfg(feature = "store")]
                 if let Some(lease) = lease.as_ref() {
                     lease.covers(range).map_err(Failure::from)?;
@@ -287,9 +294,6 @@ impl Source {
             let src = match &item.source {
                 ItemSource::Object(range) => Src::File(&files[&range.obj.sha256], range.off),
                 ItemSource::Inline(bytes) => {
-                    if bytes.len() as u64 != item.len {
-                        return Err(invalid("inline length differs from item"));
-                    }
                     inline += item.len;
                     Src::Host(bytes.as_ptr())
                 }
