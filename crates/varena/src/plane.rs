@@ -1180,12 +1180,14 @@ impl Plane {
     }
 
     /// Register `regions` of a TensorFS v2 checkpoint (`tensorfs_core::client::regions`) as one
-    /// weight set: its header, in order, is the read plan, and its chunk files are the source.
+    /// weight set: the parts they name, in header order, are the read plan, and their chunk
+    /// files the source. Only those: a window's regions register a set as small as the window,
+    /// and the checkpoint's other tensors register as their own sets when a load first wants them.
     #[cfg(feature = "store")]
     pub fn register_checkpoint(&self, name: &str, ck: &Checkpoint, regions: &[Vec<String>], host_fd: Option<RawFd>) -> Result<WsId> {
-        let components: Vec<&str> = regions.iter().flatten().filter_map(|t| t.split_once('/').map(|(c, _)| c)).collect();
-        let plan = crate::checkpoint::read_plan(ck.header(), &components);
-        let source = Arc::new(Source::files(crate::checkpoint::chunk_files(ck, &plan)?, self.inner.cfg.direct_io, Arc::as_ptr(&self.inner) as usize));
+        let (plan, chunks) = crate::checkpoint::read_plan(ck.header(), regions)?;
+        let files = crate::checkpoint::chunk_files(ck, &chunks)?;
+        let source = Arc::new(Source::files(files, self.inner.cfg.direct_io, Arc::as_ptr(&self.inner) as usize));
         self.register(name, source, &plan, regions, host_fd)
     }
 

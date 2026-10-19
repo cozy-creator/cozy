@@ -264,12 +264,12 @@ impl Store {
                 format!("{sha256:?} is not a sha256 digest"),
             ));
         }
-        Ok(self
-            .root
-            .join("blobs")
-            .join(&sha256[..2])
-            .join(&sha256[2..4])
-            .join(sha256))
+        Ok(self.object_path(sha256))
+    }
+
+    /// Where the object `sha256`, a digest already checked, lives.
+    pub(crate) fn object_path(&self, sha256: &str) -> PathBuf {
+        (self.root.join("blobs").join(&sha256[..2]).join(&sha256[2..4])).join(sha256)
     }
 
     /// The one door. Bytes written to the [`Admission`] become an object at

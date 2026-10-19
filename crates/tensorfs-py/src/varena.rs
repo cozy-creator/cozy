@@ -252,7 +252,8 @@ impl PyPlane {
     }
 
     /// Register `regions` (`tensorfs.regions(ck)` when None) of a stored checkpoint as one
-    /// weight set: its header, in order, is the read plan and its chunk files the source.
+    /// weight set: the parts they name, in header order, are the read plan and their chunk
+    /// files the source.
     #[cfg(feature = "store")]
     #[pyo3(signature = (name, ck, regions = None, host_fd = None))]
     fn register_checkpoint(
@@ -264,7 +265,7 @@ impl PyPlane {
         host_fd: Option<i32>,
     ) -> PyResult<PyWeightSet> {
         let (ck, plane) = (ck.stored(py)?, &self.plane);
-        let regions = regions.unwrap_or_else(|| tensorfs_core::client::regions(ck.header(), 64 << 20, &[]));
+        let regions = regions.unwrap_or_else(|| tensorfs_core::client::regions(ck.header(), 64 << 20, &[], &[]));
         let (id, layout) = py
             .detach(|| {
                 let id = plane.register_checkpoint(&name, ck, &regions, host_fd)?;

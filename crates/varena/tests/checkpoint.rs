@@ -15,6 +15,10 @@ use varena::{Plane, PlaneConfig, Tier, WsId};
 
 const MIB: usize = 1 << 20;
 
+fn blocks() -> Vec<String> {
+    (0..3).map(|i| format!("unet/blocks.{i}")).collect()
+}
+
 /// (component, key, bytes), written in this order (the header's).
 const TENSORS: &[(&str, &str, usize)] = &[
     ("unet", "blocks.0.a", 9 * MIB + 100),
@@ -80,7 +84,7 @@ fn check(p: &Plane, ws: WsId, region: Option<u32>, read: impl Fn(u64, usize) -> 
 fn a_v2_checkpoint_fills_the_pinned_tier_exactly() {
     let fx = Fixture::new("pinned");
     let p = Plane::open(PlaneConfig { readers: 2, ..Default::default() }).unwrap();
-    let rs = regions(fx.ck.header(), 64 << 20, &[]);
+    let rs = regions(fx.ck.header(), 64 << 20, &[], &[]);
     let ws = p.register_checkpoint("ck", &fx.ck, &rs, None).unwrap();
     assert_eq!(p.layout(ws).unwrap().regions.len(), rs.len());
     p.set_pinned_budget(1 << 30).unwrap();
@@ -97,6 +101,21 @@ fn a_v2_checkpoint_fills_the_pinned_tier_exactly() {
     let vae: Vec<Vec<String>> = rs.iter().filter(|r| r[0].starts_with("vae/")).cloned().collect();
     let wv = p.register_checkpoint("vae", &fx.ck, &vae, None).unwrap();
     assert!(p.layout(wv).unwrap().parts.iter().all(|x| x.what.starts_with("vae/")));
+    // A window is a weight set of its regions' parts alone, filled exactly.
+    let window = regions(fx.ck.header(), 64 << 20, &blocks(), &["unet/blocks.2".into()]);
+    let ww = p.register_checkpoint("window", &fx.ck, &window, None).unwrap();
+    let parts: Vec<String> = p.layout(ww).unwrap().parts.iter().map(|x| x.what.clone()).collect();
+    assert_eq!(parts, ["unet/blocks.2.a#value", "unet/blocks.2.b#value", "unet/norm.weight#value"]);
+    p.want(ww, Tier::Pinned, None, 0, false).unwrap().wait().unwrap();
+    let fd = p.host_fd(ww).unwrap();
+    // SAFETY: as above.
+    let f = std::mem::ManuallyDrop::new(unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(fd) });
+    check(&p, ww, None, |off, n| {
+        let mut got = vec![0u8; n];
+        f.read_exact_at(&mut got, off).unwrap();
+        got
+    });
+    assert!(p.register_checkpoint("bad", &fx.ck, &[vec!["unet/blocks.9".into()]], None).is_err());
     p.close().unwrap();
 }
 
@@ -105,9 +124,8 @@ fn regions_never_span_a_boundary_unless_a_chunk_does() {
     let fx = Fixture::new("boundaries");
     let h = fx.ck.header();
     let unet = |rs: Vec<Vec<String>>| rs.into_iter().filter(|r| r[0].starts_with("unet/")).collect::<Vec<_>>();
-    assert_eq!(unet(regions(h, 128 << 20, &[])).len(), 1, "without boundaries the unet fits one region");
-    let blocks: Vec<String> = (0..3).map(|i| format!("unet/blocks.{i}")).collect();
-    let rs = unet(regions(h, 128 << 20, &blocks));
+    assert_eq!(unet(regions(h, 128 << 20, &[], &[])).len(), 1, "without boundaries the unet fits one region");
+    let rs = unet(regions(h, 128 << 20, &blocks(), &[]));
     let keys = |r: &Vec<String>| r.iter().map(|k| k.trim_start_matches("unet/").to_owned()).collect::<Vec<_>>();
     assert_eq!(rs.iter().map(keys).collect::<Vec<_>>(), vec![
         // An empty tensor has no bytes: it rides in the first region.
@@ -116,6 +134,30 @@ fn regions_never_span_a_boundary_unless_a_chunk_does() {
         // blocks.2 and norm share a pack: a chunk keeps them together.
         vec!["blocks.2.a", "blocks.2.b", "norm.weight"],
     ]);
+}
+
+#[test]
+fn a_window_gets_the_regions_the_full_call_gives_its_tensors() {
+    let fx = Fixture::new("window");
+    let h = fx.ck.header();
+    for max in [MIB as u64, 64 << 20, 128 << 20] {
+        let full = regions(h, max, &blocks(), &[]);
+        for only in ["unet/blocks.0", "unet/blocks.1", "unet/blocks.2", "vae/conv.weight"] {
+            // The full call's regions holding a tensor of `only` (the empty tensor is no window's).
+            let want: Vec<Vec<String>> = full
+                .iter()
+                .filter(|r| r.iter().any(|t| t == only || t.starts_with(&format!("{only}."))))
+                .map(|r| r.iter().filter(|t| *t != "unet/empty").cloned().collect())
+                .collect();
+            assert_eq!(regions(h, max, &blocks(), &[only.into()]), want, "{only} at {max}");
+        }
+    }
+    // blocks.2 shares a pack with norm: a window of it reads the whole chunk, so holds norm too.
+    assert!(regions(h, 64 << 20, &blocks(), &["unet/blocks.2".into()]).concat().contains(&"unet/norm.weight".to_owned()));
+    // Two windows: each block's regions, never one across them.
+    let two = regions(h, 128 << 20, &blocks(), &["unet/blocks.0".into(), "unet/blocks.1".into()]);
+    assert_eq!(two, [vec!["unet/blocks.0.a", "unet/blocks.0.b"], vec!["unet/blocks.1.w"]]);
+    assert!(regions(h, 64 << 20, &blocks(), &["unet/nothing".into()]).is_empty());
 }
 
 #[test]
@@ -128,7 +170,7 @@ fn a_v2_checkpoint_reaches_the_device_exactly() {
     let mut s: CUstream = std::ptr::null_mut();
     cuda::check("cuStreamCreate", unsafe { (d.stream_create)(&mut s, cuda::STREAM_NON_BLOCKING) }).unwrap();
     let p = Plane::open(PlaneConfig { devices: vec![0], ..Default::default() }).unwrap();
-    let ws = p.register_checkpoint("ck", &fx.ck, &regions(fx.ck.header(), 64 << 20, &[]), None).unwrap();
+    let ws = p.register_checkpoint("ck", &fx.ck, &regions(fx.ck.header(), 64 << 20, &[], &[]), None).unwrap();
     p.set_vram_budget(0, 1 << 30).unwrap();
     p.want(ws, Tier::Device(0), None, 0, false).unwrap().wait().unwrap();
     let layout = p.layout(ws).unwrap();

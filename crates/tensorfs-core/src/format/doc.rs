@@ -329,8 +329,14 @@ impl Header {
     }
 
     pub fn tensor(&self, component: &str, key: &str) -> Option<&Tensor> {
+        let (ci, ti) = self.position(component, key)?;
+        Some(&self.components[ci].tensors[ti])
+    }
+
+    /// Where a tensor is in construction order: (its component's index, its index there).
+    pub fn position(&self, component: &str, key: &str) -> Option<(usize, usize)> {
         let (ci, keys) = self.index.get(component)?;
-        Some(&self.components[*ci].tensors[*keys.get(key)?])
+        Some((*ci, *keys.get(key)?))
     }
 
     /// Every tensor with its component's name, in construction order.

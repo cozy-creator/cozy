@@ -581,7 +581,7 @@ impl PyCheckpoint {
     #[getter]
     fn chunk_paths(&self, py: Python<'_>) -> PyResult<Vec<String>> {
         let ck = self.stored(py)?;
-        Ok(ck.chunk_paths().iter().map(|p| p.display().to_string()).collect())
+        Ok((0..ck.header().chunks.len()).map(|i| ck.chunk_path(i).display().to_string()).collect())
     }
 
     /// `tensors[component][key] -> Info`.
@@ -646,10 +646,11 @@ impl PyCheckpoint {
 /// Groups `ck`'s tensors into `<component>/<key>` regions for a weight plane: tensors sharing a
 /// chunk stay together, and neighbours merge while their chunks total at most `max_bytes`,
 /// never across a `<component>/<key prefix>` boundary (a block) unless a shared chunk does.
+/// `only` limits the work and the result to the tensors a load wants.
 #[pyfunction]
-#[pyo3(signature = (ck, max_bytes = 64 << 20, boundaries = None))]
-fn regions(ck: &PyCheckpoint, max_bytes: u64, boundaries: Option<Vec<String>>) -> Vec<Vec<String>> {
-    client::regions(&ck.header, max_bytes, &boundaries.unwrap_or_default())
+#[pyo3(signature = (ck, max_bytes = 64 << 20, boundaries = None, only = None))]
+fn regions(ck: &PyCheckpoint, max_bytes: u64, boundaries: Option<Vec<String>>, only: Option<Vec<String>>) -> Vec<Vec<String>> {
+    client::regions(&ck.header, max_bytes, &boundaries.unwrap_or_default(), &only.unwrap_or_default())
 }
 
 // ---------------------------------------------------------------- arrays

@@ -517,7 +517,7 @@ fn a_merged_plan_fills_a_buffer_with_o_direct() {
         let file = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_DIRECT)
-            .open(&ck.chunk_paths()[read.chunk])
+            .open(ck.chunk_path(read.chunk))
             .unwrap();
         let want = read.length.min(read.object.length - read.offset) as usize;
         let at = read.dest as usize;
