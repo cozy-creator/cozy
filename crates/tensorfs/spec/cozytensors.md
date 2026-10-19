@@ -450,6 +450,7 @@ A new scheme is a minor version (§8). It ships:
   `A`–`Z` lowered (`refs/acme/sdxl.json`); the document's `name` keeps the writer's spelling.
 - A **store** or **static origin** is a directory, bucket or HTTP prefix holding `refs/<org>/<name>.json` and
   `blobs/…` (§1). A reader resolves name → release → lane → manifest → header → chunks, verifying every object.
+- Reading and publishing at an endpoint over HTTP, S3 or a directory: [distribution.md](distribution.md).
 
 **Closure.** A checkpoint's closure is its manifest, every object its `files` cite, and, for `model.cozytensors`,
 every object in the header's `chunks`. A copy of a checkpoint is complete when its whole closure is present. A

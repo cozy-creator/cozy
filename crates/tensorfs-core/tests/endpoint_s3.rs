@@ -90,4 +90,12 @@ async fn a_bucket_serves_the_protocol_under_sigv4() {
     let refused = Endpoint::new(&client, "s3://", None).err().map(|e| e.code);
     assert_eq!(refused, Some(Code::SOURCE_NOT_ALLOWED));
     let _ = std::fs::remove_dir_all(&scratch);
+
+    // The conformance suite, through the CLI: a bucket fails only the server-side SHOULDs.
+    let url = format!("s3://repo/tfs-conform-{}", std::process::id());
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_tfs")).args(["conform", "endpoint", &url, "--write", "--json"]).output().unwrap();
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(out.status.success() && doc["failed"] == 0, "{doc:#}");
+    let warned: Vec<&str> = (doc["cases"].as_array().unwrap().iter()).filter(|c| c["ok"] == false).filter_map(|c| c["case"].as_str()).collect();
+    assert_eq!(warned, ["refs: no precondition is 428 (servers)", "refs: an incomplete closure is 409 closure_incomplete (servers)"]);
 }

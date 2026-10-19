@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use tensorfs_core::err::Code;
 use tensorfs_core::fetch::{
-    upload_tree, Client, Config, Endpoint, Fetcher, Fresh, ObjectStore, Origin, Payload, SourcePolicy, Want,
+    upload_tree, Client, Config, Endpoint, Fetcher, Fresh, ObjectStore, Origin, Payload, SourcePolicy, Stream, Want,
 };
 use tensorfs_core::format::{ConfigValue, Dtype, ObjectRef, Tree};
 use tensorfs_core::store2::Store;
@@ -205,4 +205,84 @@ async fn concurrent_writers_all_land_and_wrong_bytes_never_do() {
     let deleted = endpoint.update_repo("acme/many", |_| Ok(None)).await.unwrap();
     assert_eq!(endpoint.repo("acme/many").await.unwrap().unwrap().0, deleted);
     assert!(deleted.releases.is_empty() && deleted.checkpoints.is_empty(), "deleting is a document of nothing");
+}
+
+#[test]
+fn a_streaming_writer_tees_to_the_store_before_publishing() {
+    let scratch = Scratch::new("stream");
+    let runtime = tensorfs_core::fetch::runtime().unwrap();
+    let dir = scratch.0.join("endpoint");
+    let endpoint = Arc::new(Endpoint::new(&client(), dir.to_str().unwrap(), None).unwrap());
+    let local = Store::open(scratch.0.join("local")).unwrap();
+    let stream = Arc::new(Stream::new(Arc::clone(&endpoint), runtime.handle().clone()));
+    let mut w = local.streaming_writer(Arc::clone(&stream), "acme/streamed", "int8", None).unwrap();
+    let big = noise(9, 70 * MIB);
+    let mut c = w.component("unet", "diffusers.Thing", BTreeMap::new(), None).unwrap();
+    c.put("big", &Dtype::U8, &[big.len() as u64], Data::Plain(Source::Read(&mut &big[..]))).unwrap();
+    c.put("small", &Dtype::U8, &[5], Data::Plain(Source::Read(&mut &b"small"[..]))).unwrap();
+    stream.flush().unwrap();
+    assert!(runtime.block_on(endpoint.has(&ObjectRef::of(&big[..64 * MIB]))).unwrap());
+    assert!(runtime.block_on(endpoint.repo("acme/streamed")).unwrap().is_none(), "no checkpoint before commit");
+    w.repo_file("README.md", b"# streamed").unwrap();
+    let header = w.commit().unwrap();
+
+    assert!(local.checkpoint(&header).unwrap().read("unet", "big").unwrap() == big);
+    let (repo, _) = runtime.block_on(endpoint.repo("acme/streamed")).unwrap().unwrap();
+    assert_eq!((repo.releases.len(), repo.checkpoints.len()), (0, 1), "an unreleased checkpoint");
+    let into = Store::open(scratch.0.join("into")).unwrap();
+    runtime.block_on(async {
+        let fetcher = Fetcher::new(Arc::new(into.clone()) as Arc<dyn ObjectStore>, client(), None, Config::default());
+        let origin: Arc<dyn Origin> = endpoint.clone();
+        let pulled = fetcher.pull_tree(&origin, &repo.checkpoints[0], None, &Want::default()).await.unwrap();
+        fetcher.settled().await;
+        assert_eq!((pulled.header, pulled.variant.as_str()), (header.clone(), "int8"));
+    });
+    assert!(into.checkpoint(&header).unwrap().read("unet", "big").unwrap() == big);
+}
+
+#[test]
+fn an_upload_failure_keeps_the_local_checkpoint_and_stays_failed() {
+    let scratch = Scratch::new("stream-failure");
+    let served = scratch.0.join("static");
+    Store::open(&served).unwrap();
+    let server = HttpServer::start(&served);
+    let runtime = tensorfs_core::fetch::runtime().unwrap();
+    let endpoint = Arc::new(Endpoint::new(&client(), &server.1, None).unwrap());
+    let local = Store::open(scratch.0.join("local")).unwrap();
+    let stream = Arc::new(Stream::new(Arc::clone(&endpoint), runtime.handle().clone()));
+    let mut w = local.streaming_writer(Arc::clone(&stream), "acme/failed", "int8", None).unwrap();
+    w.component("unet", "diffusers.Thing", BTreeMap::new(), None).unwrap()
+        .put("w", &Dtype::U8, &[5], Data::Plain(Source::Read(&mut &b"saved"[..]))).unwrap();
+    assert!(w.commit().is_err(), "the real read-only server refuses PUT");
+    let header = w.committed().expect("the local commit precedes upload").clone();
+    assert_eq!(local.checkpoint(&header).unwrap().read("unet", "w").unwrap(), b"saved");
+    assert!(stream.flush().is_err(), "the first upload failure is sticky");
+    assert!(runtime.block_on(endpoint.repo("acme/failed")).unwrap().is_none());
+}
+
+/// `tfs conform endpoint <url> [--write] --json`: (its exit success, its failed MUST count, its cases).
+fn conform(url: &str, write: bool) -> (bool, u64, Vec<serde_json::Value>) {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_tfs"));
+    cmd.args(["conform", "endpoint", url, "--json"]);
+    if write {
+        cmd.arg("--write");
+    }
+    let out = cmd.output().unwrap();
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|_| panic!("{}", String::from_utf8_lossy(&out.stderr)));
+    (out.status.success(), doc["failed"].as_u64().unwrap(), doc["cases"].as_array().unwrap().clone())
+}
+
+#[test]
+fn a_directory_and_a_static_server_conform() {
+    let scratch = Scratch::new("conform");
+    let dir = scratch.0.join("endpoint");
+    let (ok, failed, cases) = conform(&format!("file://{}", dir.display()), true);
+    assert!(ok && failed == 0, "{cases:#?}");
+    assert!(cases.len() >= 12);
+    let server = HttpServer::start(&dir);
+    let (ok, failed, cases) = conform(&server.1, false);
+    assert!(ok && failed == 0, "{cases:#?}");
+    // python -m http.server sends no ETag and ignores Range: SHOULDs it fails.
+    let warned: Vec<&str> = (cases.iter()).filter(|c| c["ok"] == false).filter_map(|c| c["case"].as_str()).collect();
+    assert_eq!(warned, ["refs: an ETag", "refs: If-None-Match is 304", "blobs: Range gives 206 with that byte (or redirects)"]);
 }
