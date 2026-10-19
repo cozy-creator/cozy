@@ -3,19 +3,24 @@
     mem = Memory.open(torch.device("cuda", 0), LedgerGrant(0, fd, events))
     unet._varena = Declared(WeightGrant(ck, "unet", "sha256:…"))  # the author API's
     mem.load(unet)
-    with mem.request("r1"):
+    with mem.request("r1", plan=["text_encoder", "unet", "vae"]):
         unet(x)
 
 A block's params are views of its region's pages only while the block runs (the view is the
 pin); zero-byte placeholders stand in otherwise, and an op on one binds its block for that op.
-Bytes rank in use > warm (loaded at GPU level) > idle, least recently used first within each.
-Room is made in §5.2's order; the hot watermark falls only within a request and refills after
-it. On a CPU or Apple device every weight binds once.
+A request may declare its plan: the ordered steps it will run, each a model or a set of models
+used together. Under declared plans, pages not in use go by their next declared use (Belady over
+every planned request in the process; none declared goes first) and come back in declared order
+on the copy stream. With none, bytes rank in use > warm (loaded at GPU level) > idle, least
+recently used first within each, and nothing is restored beyond an explicit `load`. Room is made
+in §5.2's order; the hot watermark falls only within a request. On a CPU or Apple device every
+weight binds once.
 """
 
 from __future__ import annotations
 
 import gc
+import math
 import threading
 import time
 import traceback
@@ -23,7 +28,7 @@ from collections.abc import Callable, Collection, Hashable, Iterator, Mapping, S
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from enum import Enum
-from typing import Protocol
+from typing import Protocol, TypeAlias
 
 import tensorfs
 import torch
@@ -309,6 +314,7 @@ class Model:
         declared: Declared,
     ) -> None:
         self.memory, self.name, self.key, self.module, self.ws = memory, name, key, module, ws
+        self.component = declared.weights.component if declared.weights is not None else name
         self.gpu, self.device = memory.gpu, memory.device
         self.fill, self.bind = declared.fill, declared.bind
         self.sites: dict[str, list[_Site]] = {}
@@ -404,6 +410,25 @@ class Request:
     peak: int = 0
     shapes: dict[tuple[str, str], cuts.Shape] = field(default_factory=dict)
     stats: RequestStats | None = None
+    memory: Memory | None = None
+
+    def plan(self, steps: Sequence[PlanStep] | None) -> None:
+        """Replace its plan (`Memory.plan`)."""
+        if self.memory is not None:
+            self.memory.plan(self.id, steps)
+
+
+#: A plan's step: one model (its `Model`, module or component name) or a set of them used
+#: together, such as a UNet and its ControlNet. A plan carries no sizes or durations.
+PlanStep: TypeAlias = "Model | nn.Module | str | Collection[Model | nn.Module | str]"
+
+
+@dataclass(slots=True)
+class _Plan:
+    steps: list[frozenset[object]]
+    #: the step running now: a model first running a later step moves it there
+    cursor: int = 0
+    started: bool = False
 
 
 # --------------------------------------------------------------------------- the memory
@@ -425,6 +450,8 @@ class Memory:
         self.caches: dict[Cache, None] = {}
         self.lock, self.local = threading.RLock(), threading.local()
         self.active: dict[Request, None] = {}
+        #: declared plans by request id, started or dispatched (§5.2)
+        self.plans: dict[str, _Plan] = {}
         #: host tiers sealed here for the executor to deposit
         self.deposits: list[tuple[Model, int]] = []
         #: its requests waiting for room (§2), counted under `freeing`
@@ -558,6 +585,8 @@ class Memory:
         self._enter(model.common, record=False)
         with self.lock:
             model.aloft = True
+            if self._cursor(model):
+                self._advance()
         self._publish()
 
     def _land(self, model: Model) -> None:
@@ -571,6 +600,7 @@ class Memory:
             if model.aloft:
                 model.aloft = False
                 self._exit(model.common)
+            self._advance()
         self._publish()
 
     def _fresh(self, model: Model) -> None:
@@ -596,9 +626,9 @@ class Memory:
         else:
             room = self.available() + _set(model)[0] - model.common.nbytes - model.reserve
             if repeating:
-                value = self._value(model)
+                keep = self._keep(model)
                 cold = (m for m in self.models.values() if not m.flight and not m.held)
-                room += sum(_set(m)[0] for m in cold if self._value(m) < value)
+                room += sum(_set(m)[0] for m in cold if self._keep(m) < keep)
             sizes = [model.blocks[b].nbytes for b in model.order]
             fits = sum(sizes) <= room
             want = set(model.order if fits else _spread(model.order, sizes, room - 2 * max(sizes)))
@@ -683,7 +713,8 @@ class Memory:
         model = block.model
         if block.index in model.seen:
             self._step(model)
-        if not model.seen:
+        if not model.seen:  # a pass counts its own copies, not a restore landing before it
+            model.mark = _set(model)[1:]
             model.base = torch.cuda.memory_allocated(model.device)
             torch.cuda.reset_peak_memory_stats(model.device)
             key = cuts.shape_of(*call)
@@ -764,10 +795,17 @@ class Memory:
         return self._lower_until(target, why, asking) or freed
 
     def _free_upto(self, target: int, why: str) -> bool:
-        """Idle bytes (rung 1); cold weights by the core's own order (`Gpu.give`: idle before
-        warm, least recently bound first, never a busy set), then caches; then other processes
-        (rung 2), until `target` bytes are free."""
+        """Idle bytes (rung 1); cold weights by their next declared use (none first, then the
+        furthest), then by the core's own order (`Gpu.give`: idle before warm, least recently
+        bound first, never a busy set), then caches; then other processes (rung 2), until
+        `target` bytes are free."""
         freed = self._idle()
+        if self.plans:
+            cold = [m for m in self.models.values() if not (m.flight or m.held or m.host)]
+            for model in sorted(cold, key=self._keep):
+                if self._free() >= target:
+                    break
+                freed += self._evict(model, why, 2, target - self._free())
         if self._free() < target:
             for name, n in self.core.give(target - self._free()):  # type: ignore[union-attr]
                 freed += n
@@ -791,7 +829,7 @@ class Memory:
         """Rung 4: the hot watermarks fall from the top of their spread sets, the asker's last."""
         freed = 0
         hot = [m for m in self.models.values() if m.flight and not m.held]
-        for model in sorted(hot, key=lambda m: (m is asking, self._value(m))):
+        for model in sorted(hot, key=lambda m: (m is asking, self._keep(m))):
             while model.home and self._free() < target:
                 ranked = _spread(model.order, _sizes(model), model.nbytes)
                 last = next(b for b in reversed(ranked) if b in model.home)
@@ -858,10 +896,49 @@ class Memory:
         torch.cuda.empty_cache()
         return reserved - torch.cuda.memory_reserved(self.gpu) + int(self.core.trim())  # type: ignore[union-attr]
 
-    def _value(self, model: Model) -> tuple[int, int]:
-        """Its class (in use 2, warm 1, idle 0), then recency."""
-        use = 2 if model.flight or model.held else 1 if model.level is Level.GPU else 0
-        return (use, model.last_use)
+    def _keep(self, model: Model) -> tuple[int, float, int]:
+        """Higher is kept longer: in use, then the nearest declared use (Belady) when a plan is
+        declared, else warm before idle; then recency."""
+        use = 1 if model.flight or model.held else 0
+        if self.plans:
+            return (use, -self._distance(model), model.last_use)
+        return (use, 1 if model.level is Level.GPU else 0, model.last_use)
+
+    def _distance(self, model: Model) -> float:
+        """Steps until a declared plan next runs it; inf with none. A plan not yet started counts
+        after every running one."""
+        behind = max((len(p.steps) - p.cursor for p in self.plans.values() if p.started), default=0)
+        near = math.inf
+        for plan in self.plans.values():
+            at = next((j for j in range(plan.cursor, len(plan.steps)) if _runs(model, plan, j)), None)
+            if at is not None:
+                near = min(near, at - plan.cursor + (0 if plan.started else behind))
+        return near
+
+    def _cursor(self, model: Model) -> bool:
+        """A model first running a later step of its request's plan moves the plan there."""
+        moved = False
+        for request in self._requests():
+            plan = self.plans.get(request.id)
+            if plan is None:
+                continue
+            at = next((j for j in range(plan.cursor, len(plan.steps)) if _runs(model, plan, j)), None)
+            if at is not None and at > plan.cursor:
+                plan.cursor, moved = at, True
+        return moved
+
+    def plan(self, id: str, steps: Sequence[PlanStep] | None) -> None:
+        """Declare or replace request `id`'s plan: the ordered steps it will run, each a model
+        (its `Model`, module or component name) or a set of models used together. Steps name
+        models by identity, never size. A request not started yet (dispatched) counts after the
+        running ones; `None` drops its plan."""
+        with self.lock:
+            if steps is None:
+                self.plans.pop(id, None)
+                return
+            started = any(r.id == id for r in self.active)
+            self.plans[id] = _Plan(_steps(steps), started=started)
+            self._advance()
 
     def _shrink(self, cache: Cache, nbytes: int) -> int:
         freed = min(int(cache.shrink(min(nbytes, cache.nbytes))), cache.nbytes)
@@ -1031,16 +1108,21 @@ class Memory:
     # -- requests (§5.7)
 
     @contextmanager
-    def request(self, id: str) -> Iterator[Request]:
+    def request(self, id: str, plan: Sequence[PlanStep] | None = None) -> Iterator[Request]:
         """Everything the request allocates is freed on exit, failed or not; its ops are caught
         (`cuts.caught`). A capacity failure never poisons; what package state still holds shows
-        as `leftover`."""
+        as `leftover`. `plan`: its declared steps (`Memory.plan`), else one declared at dispatch."""
         start = torch.cuda.memory_allocated(self.gpu) if self.cuda else 0
         key = self.row[0].dispatched(id) if self.row is not None else None
-        request = Request(id, start, self._copies(), key, self.memo.retries)
+        request = Request(id, start, self._copies(), key, self.memo.retries, memory=self)
         with self.lock:
             self.active[request] = None
             self.epoch += 1
+            if plan is not None:
+                self.plans[id] = _Plan(_steps(plan))
+            if id in self.plans:
+                self.plans[id].started = True
+                self._advance()
         self._running()
         stack: list[Request] = self.local.__dict__.setdefault("requests", [])
         stack.append(request)
@@ -1076,30 +1158,31 @@ class Memory:
             self.row[0].set_peak(request.key, request.peak)
         with self.lock:
             self.active.pop(request, None)
+            self.plans.pop(request.id, None)
             self.epoch += 1
             for name, passes in request.passes.items():
                 if (ran := self.models.get(name)) is not None:
                     ran.repeats = passes
-            if self.cuda and not self.active:
-                self._restore()
+            if not self.active:  # each model's reserve is what this request measured
+                for model in self.models.values():
+                    if model.peak:
+                        model.reserve, model.peak = model.peak, 0
+            self._advance()
         self._running()
         self._publish()
         self._freed()
 
     def _restore(self) -> None:
-        """Between requests, or at a load: each model's reserve is what that request measured,
-        and the watermarks rise. Warm models refill most worth keeping first, into free room and
-        then cold pages of this process's models worth less, always leaving the largest reserve
-        and a streamed model's slots. The copies are prefetches: an ask evicts them at once."""
+        """At an explicit load: the watermarks rise. Warm models refill most worth keeping
+        first, into free room and then cold pages of this process's models worth less, always
+        leaving the largest reserve and a streamed model's slots. The copies are prefetches: an
+        ask evicts them at once."""
         models = list(self.models.values())
-        for model in models:
-            if model.peak:
-                model.reserve, model.peak = model.peak, 0
         slots = max(
             (_SLOTS * max(_sizes(m), default=0) for m in models if m.repeats < 2), default=0
         )
         room = self._free() - max((max(m.reserve, 0) for m in models), default=0) - slots
-        ranked = sorted(models, key=self._value, reverse=True)
+        ranked = sorted(models, key=self._keep, reverse=True)
         for i, model in enumerate(ranked):
             if model.level is not Level.GPU:
                 return
@@ -1117,6 +1200,48 @@ class Memory:
                 room -= block.nbytes
                 model.home.add(b)
                 model.ws.home(_home_regions(model))
+                try:
+                    for region in block.regions:
+                        model.ws.prefetch(region)
+                except DeviceFull:
+                    return
+
+    def _advance(self) -> None:
+        """Pages come back in declared order (§5.2): each model not in use by its next declared
+        use, common then its blocks in recorded order, into free room beyond what models in use
+        still page in and the planned reserves, then pages with a later declared use or none.
+        The copies run on the core's copy stream; an ask evicts them at once."""
+        if not self.cuda or not self.plans:
+            return
+        models = [m for m in self.models.values() if not (m.host or m.closed)]
+        near = {m: self._distance(m) for m in models}
+        owed = sum(
+            b.nbytes
+            for m in models
+            if m.flight
+            for b in (m.common, *(m.blocks[i] for i in m.home))
+            if not all(m.ws.resident(r) for r in b.regions)
+        )
+        reserve = max((max(m.reserve, 0) for m in models if near[m] < math.inf), default=0)
+        room = self._free() - owed - reserve
+        for model in sorted((m for m in models if near[m] < math.inf and not m.flight), key=near.get):
+            victims = sorted(
+                (v for v in models if near[v] > near[model] and not (v.flight or v.held)),
+                key=self._keep,
+            )
+            for block in (model.common, *(model.blocks[b] for b in model.order)):
+                if all(model.ws.resident(r) for r in block.regions):
+                    continue
+                while room < block.nbytes and victims:
+                    room += self._evict(victims[0], "restore", 2, block.nbytes - room)
+                    if room < block.nbytes:  # it gave all it had
+                        victims.pop(0)
+                if room < block.nbytes:
+                    return
+                room -= block.nbytes
+                if block.index >= 0 and block.index not in model.home:
+                    model.home.add(block.index)
+                    model.ws.home(_home_regions(model))
                 try:
                     for region in block.regions:
                         model.ws.prefetch(region)
@@ -1145,6 +1270,20 @@ class Memory:
 
 
 # ----------------------------------------------------------------------------- binding
+
+
+def _steps(plan: Sequence[PlanStep]) -> list[frozenset[object]]:
+    return [
+        frozenset([s] if isinstance(s, (str, Model, nn.Module)) else s)  # type: ignore[arg-type]
+        for s in plan
+    ]
+
+
+def _runs(model: Model, plan: _Plan, step: int) -> bool:
+    return any(
+        e is model or e is model.module or e in (model.name, model.component)
+        for e in plan.steps[step]
+    )
 
 
 def _declared(module: nn.Module) -> Declared:
