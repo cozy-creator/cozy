@@ -93,9 +93,10 @@
       "formats": ["float8_e4m3fn", "float8_e5m2"],
       "parts": [
         {"suffix": "weight", "role": "weight", "dtypes": ["F8_E4M3", "F8_E5M2"], "shape": "logical"},
-        {"suffix": "weight_scale", "role": "scale", "dtypes": ["F32"], "shape": "rows"}
+        {"suffix": "weight_scale", "role": "scale", "dtypes": ["F32", "BF16", "F16"], "shape": "rows"}
       ],
-      "encoding": {"scheme": "fp8.rowwise", "params": {"axis": 0}}
+      "encoding": {"scheme": "fp8.rowwise", "params": {"axis": 0}},
+      "dtype_params": {"scale_dtype": "scale"}
     },
     {
       "producer": "comfy",
@@ -123,9 +124,10 @@
       "formats": ["int8_tensorwise"],
       "parts": [
         {"suffix": "weight", "role": "weight", "dtypes": ["I8"], "shape": "logical"},
-        {"suffix": "weight_scale", "role": "scale", "dtypes": ["F32"], "shape": "rows"}
+        {"suffix": "weight_scale", "role": "scale", "dtypes": ["F32", "BF16", "F16"], "shape": "rows"}
       ],
-      "encoding": {"scheme": "int8.rowwise", "params": {"axis": 0}}
+      "encoding": {"scheme": "int8.rowwise", "params": {"axis": 0}},
+      "dtype_params": {"scale_dtype": "scale"}
     },
     {
       "producer": "comfy",
@@ -133,10 +135,11 @@
       "convrot": true,
       "parts": [
         {"suffix": "weight", "role": "weight", "dtypes": ["I8"], "shape": "logical"},
-        {"suffix": "weight_scale", "role": "scale", "dtypes": ["F32"], "shape": "rows"}
+        {"suffix": "weight_scale", "role": "scale", "dtypes": ["F32", "BF16", "F16"], "shape": "rows"}
       ],
       "encoding": {"scheme": "int8.convrot", "params": {"rotation": "hadamard"}},
-      "marker_params": {"rotation_size": ["convrot_groupsize", 256]}
+      "marker_params": {"rotation_size": ["convrot_groupsize", 256]},
+      "dtype_params": {"scale_dtype": "scale"}
     }
   ]
 }

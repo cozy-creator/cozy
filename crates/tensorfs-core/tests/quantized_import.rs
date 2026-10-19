@@ -462,7 +462,7 @@ fn comfy_fp8_tensorwise_rowwise_and_legacy() {
             },
             Want {
                 key: "attn.to_k.weight",
-                encoding: "fp8.rowwise {axis: 0}",
+                encoding: r#"fp8.rowwise {axis: 0, scale_dtype: "F32"}"#,
                 parts: &[
                     ("weight", "F8_E4M3", &[32, 64], "weight"),
                     ("scale", "F32", &[32, 1], "weight_scale"),
@@ -509,7 +509,7 @@ fn comfy_int8_tensorwise_rowwise_and_convrot() {
             },
             Want {
                 key: "ff.gate.weight",
-                encoding: "int8.rowwise {axis: 0}",
+                encoding: r#"int8.rowwise {axis: 0, scale_dtype: "F32"}"#,
                 parts: &[
                     ("weight", "I8", &[32, 64], "weight"),
                     ("scale", "F32", &[32, 1], "weight_scale"),
@@ -519,7 +519,7 @@ fn comfy_int8_tensorwise_rowwise_and_convrot() {
             },
             Want {
                 key: "ff.down.weight",
-                encoding: r#"int8.convrot {rotation: "hadamard", rotation_size: 64}"#,
+                encoding: r#"int8.convrot {rotation: "hadamard", rotation_size: 64, scale_dtype: "F32"}"#,
                 parts: &[
                     ("weight", "I8", &[16, 128], "weight"),
                     ("scale", "F32", &[16, 1], "weight_scale"),
@@ -649,10 +649,10 @@ fn every_carrier_names_a_complete_encoding() {
             ("mxfp8", Producer::Comfy) => Encoding::mxfp8(Cublas128x4),
             ("mxfp8", _) => Encoding::mxfp8(RowMajor),
             ("fp8.tensorwise", _) => Encoding::fp8_tensorwise(&Dtype::F32),
-            ("fp8.rowwise", _) => Encoding::fp8_rowwise(0),
+            ("fp8.rowwise", _) => Encoding::fp8_rowwise(0, &Dtype::F32),
             ("int8.tensorwise", _) => Encoding::int8_tensorwise(&Dtype::F32),
-            ("int8.rowwise", _) => Encoding::int8_rowwise(0),
-            ("int8.convrot", _) => Encoding::int8_convrot(256),
+            ("int8.rowwise", _) => Encoding::int8_rowwise(0, &Dtype::F32),
+            ("int8.convrot", _) => Encoding::int8_convrot(256, &Dtype::F32),
             other => panic!("{other:?}"),
         };
         let mut encoding = c.encoding.clone();
@@ -883,7 +883,7 @@ fn comfy_marker_params_are_read_or_refused() {
     };
     assert_eq!(
         encoding.to_string(),
-        r#"int8.convrot {rotation: "hadamard", rotation_size: 64}"#
+        r#"int8.convrot {rotation: "hadamard", rotation_size: 64, scale_dtype: "F32"}"#
     );
 }
 
