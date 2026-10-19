@@ -6,15 +6,17 @@
 pub mod cuda;
 pub mod pins;
 #[cfg(unix)]
+pub mod source;
+#[cfg(feature = "store")]
+pub mod view;
+#[cfg(unix)]
 pub mod metrics;
 mod device;
 mod host;
 mod plan;
-#[cfg(unix)]
-pub mod source;
 mod probe;
 #[cfg(feature = "store")]
-pub mod view;
+pub mod decode;
 
 pub use plan::Target;
 pub use device::DeviceBuffer;

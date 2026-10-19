@@ -51,6 +51,44 @@ fn noise(seed: u64, n: usize) -> Vec<u8> {
     out
 }
 
+#[test]
+#[ignore = "requires an allocated CUDA GPU; no mock driver"]
+fn cuda_staging_pins_device_copies_and_chunk_spans_keep_exact_bytes() {
+    let scratch = Scratch::new("cuda");
+    let (ck, _, _) = spanning(&scratch.0.join("folder"));
+    let opts = ReadOpts { streams: 4, ..ReadOpts::default() };
+    for (component, key, role, location) in ranges(&ck) {
+        let expected = stored(&ck, &location);
+        let gpu = io::DeviceBuffer::new(0, expected.len()).unwrap();
+        let target = Target { component: &component, key: &key, role: &role, offset: 0,
+            dst: Dst::Device { device: 0, ptr: gpu.ptr(), len: gpu.len(), stream: 0 } };
+        unsafe { ck.read_into(&[target], &opts) }.unwrap();
+        let mut bytes = vec![0; expected.len()];
+        unsafe { io::read(&[Copy { src: Src::Device { device: 0, ptr: gpu.ptr(), stream: 0 }, dst: Dst::host(&mut bytes) }], &opts) }.unwrap();
+        assert_eq!(bytes, expected, "{component}/{key}#{role}");
+    }
+    // Unaligned bytes larger than the staging piece, then source reuse and an externally
+    // registered page-aligned range. The engine must not unregister the caller's pin.
+    let mut host = Buf::new(5 * MIB + 17, 0);
+    let expected = noise(73, host.len);
+    host.mem[host.at..host.at + host.len].copy_from_slice(&expected);
+    let gpu = io::DeviceBuffer::new(0, host.len).unwrap();
+    let other = io::DeviceBuffer::new(0, host.len).unwrap();
+    let source = host.bytes().as_ptr();
+    let copy = Copy { src: Src::Host(source), dst: Dst::Device { device: 0, ptr: gpu.ptr(), len: gpu.len(), stream: 0 } };
+    for _ in 0..2 { unsafe { io::read(&[copy], &opts) }.unwrap(); }
+    let _context = io::cuda::CtxGuard::enter(gpu.context()).unwrap();
+    let pin = unsafe { io::cuda::pin_region(source.cast_mut(), host.len, true) }.unwrap();
+    unsafe { io::read(&[copy], &opts) }.unwrap();
+    assert!(unsafe { io::cuda::registered(source) }.unwrap());
+    unsafe { io::read(&[Copy { src: Src::Device { device: 0, ptr: gpu.ptr(), stream: 0 }, dst: Dst::Device { device: 0, ptr: other.ptr(), len: other.len(), stream: 0 } }], &opts) }.unwrap();
+    let mut bytes = vec![0; other.len()];
+    unsafe { io::read(&[Copy { src: Src::Device { device: 0, ptr: other.ptr(), stream: 0 }, dst: Dst::host(&mut bytes) }], &opts) }.unwrap();
+    assert_eq!(bytes, expected);
+    drop(pin);
+    assert!(!unsafe { io::cuda::registered(source) }.unwrap());
+}
+
 /// A destination `skew` bytes past a page boundary (0: O_DIRECT lands in place).
 struct Buf {
     mem: Vec<u8>,

@@ -22,8 +22,30 @@ pub(crate) fn client(url: &str, ca_der: Option<&[u8]>) -> Result<Client> {
     }
 }
 
-fn failed(_: PyErr) -> Refusal {
-    Refusal { code: Code::CREDENTIAL_REQUIRED, detail: "the Python token provider failed".into() }
+fn failed(error: PyErr) -> Refusal {
+    Python::attach(|py| {
+        if !error.is_instance_of::<crate::errors::Error>(py) {
+            return Refusal { code: Code::CREDENTIAL_REQUIRED, detail: "the Python token provider failed".into() };
+        }
+        let value = error.value(py);
+        let family: String = value.getattr("code").and_then(|code| code.extract()).unwrap_or_default();
+        let code = match family.as_str() {
+            "invalid" => Code::KEY_GRAMMAR,
+            "format" => Code::UNKNOWN_FORMAT,
+            "not_found" => Code::REF_NOT_FOUND,
+            "integrity" => Code::OBJECT_CORRUPT,
+            "unknown_scheme" => Code::UNKNOWN_ENCODING,
+            "decode" => Code::ENCODING_MISMATCH,
+            "io" => Code::IO_FAILED,
+            "full" => Code::CAPACITY_EXHAUSTED,
+            "network" => Code::TRANSFER_FAILED,
+            "unsupported" => Code::ADAPTER_TARGET_UNSUPPORTED,
+            "conflict" => Code::REPOSITORY_CONFLICT,
+            _ => Code::CREDENTIAL_REQUIRED,
+        };
+        let detail = value.getattr("detail").and_then(|detail| detail.extract()).unwrap_or_else(|_| error.to_string());
+        Refusal { code, detail }
+    })
 }
 
 struct PythonProvider(Py<PyAny>);
@@ -43,7 +65,7 @@ impl TokenProvider for PythonProvider {
         }).map_err(failed)
     }
 
-    fn retry(&self, sent: &Request<'_>, status: u16, headers: &HeaderMap) -> bool {
+    fn retry(&self, sent: &Request<'_>, status: u16, headers: &HeaderMap) -> Result<bool> {
         Python::attach(|py| -> PyResult<bool> {
             let provider = self.0.bind(py);
             if !provider.hasattr("retry")? { return Ok(false); }
@@ -54,7 +76,7 @@ impl TokenProvider for PythonProvider {
             let request = PyDict::new(py);
             for (name, value) in sent.headers { request.set_item(name, value)?; }
             provider.call_method1("retry", (sent.method, sent.url, request, sent.payload, status, answer))?.extract()
-        }).unwrap_or(false)
+        }).map_err(failed)
     }
 }
 

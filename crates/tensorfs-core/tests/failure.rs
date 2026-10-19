@@ -13,3 +13,14 @@ fn transport_causes_keep_their_public_family_through_a_writer_error() {
         assert!(failure.detail.contains(code.as_str()));
     }
 }
+
+#[test]
+fn a_wrapped_cuda_allocation_failure_keeps_its_family_and_driver_cause() {
+    let cuda = tensorfs_core::io::cuda::Error::Cuda {
+        op: "cuMemHostAlloc", code: 2, name: "CUDA_ERROR_OUT_OF_MEMORY".into(),
+    };
+    let error = Error::Io { op: "read", path: "tensor".into(), source: std::io::Error::other(cuda) };
+    let failure = Failure::from(error);
+    assert_eq!(failure.kind, Kind::Full);
+    assert!(failure.detail.contains("cuMemHostAlloc") && failure.detail.contains("2") && failure.detail.contains("CUDA_ERROR_OUT_OF_MEMORY"));
+}
