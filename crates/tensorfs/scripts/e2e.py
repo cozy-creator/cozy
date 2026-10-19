@@ -27,21 +27,18 @@ from collections.abc import Iterator
 import numpy as np
 import torch
 from diffusers import StableDiffusionXLPipeline
-from huggingface_hub import hf_hub_download, snapshot_download
+from huggingface_hub import HfApi, hf_hub_download, snapshot_download
 
 import tensorfs as tfs
 
 REPO = "hf-internal-testing/tiny-sdxl-pipe"
-#: Sources an export reproduces file for file: the repository, its `tfs import` flags, and what
-#: the import leaves out (other serializations of the weights, the other variant).
+#: Sources an export reproduces file for file, and their variant.
 SOURCES = [
-    ("hf-internal-testing/tiny-random-LlamaForCausalLM", [], ["*.onnx"]),
-    ("hf-internal-testing/tiny-random-bert-sharded-safetensors", [], ["*.bin"]),
-    ("hf-internal-testing/tiny-stable-diffusion-pipe-variants-right-format", ["--variant", "fp16"],
-     ["*.bin", "*.bin.index*.json", "*.msgpack", "safety_checker/model.safetensors", "text_encoder/model-*",
-      "text_encoder/model.safetensors.index.json", "unet/diffusion_pytorch_model-*",
-      "unet/diffusion_pytorch_model.safetensors.index.json"]),
+    ("hf-internal-testing/tiny-random-LlamaForCausalLM", None),
+    ("hf-internal-testing/tiny-random-bert-sharded-safetensors", None),
+    ("hf-internal-testing/tiny-stable-diffusion-pipe-variants-right-format", "fp16"),
 ]
+OTHER_WEIGHTS = (".bin", ".onnx", ".msgpack", ".h5")
 NAME = "local/tiny-sdxl"
 TFS = str(pathlib.Path(sys.executable).with_name("tfs"))
 DTYPES = {"F32": torch.float32, "F16": torch.float16, "BF16": torch.bfloat16, "I64": torch.int64}
@@ -69,12 +66,18 @@ def same_image(folder: pathlib.Path, reference: np.ndarray) -> None:
     assert diff == 0.0, f"{folder}: the image differs from upstream's by {diff}"
 
 
-def same_folder(folder: pathlib.Path, repo: str, dropped: list[str]) -> None:
+def same_folder(folder: pathlib.Path, repo: str, variant: str | None) -> None:
     """The export is the repository, `diff -r` empty: every file, byte for byte, the weights
-    too, apart from other serializations of the weights."""
-    upstream = pathlib.Path(snapshot_download(repo, ignore_patterns=dropped))
+    too, apart from other serializations of the weights and the other variant."""
+    def kept(path: str) -> bool:
+        other = path.endswith(OTHER_WEIGHTS) or ".bin.index" in path
+        elsewise = variant is not None and ".safetensors" in path and f".{variant}" not in path
+        return not (other or elsewise)
+
+    allow = [p for p in HfApi().list_repo_files(repo) if kept(p)]
+    upstream = pathlib.Path(snapshot_download(repo, allow_patterns=allow))
     tree_a = {str(p.relative_to(folder)): p.read_bytes() for p in folder.rglob("*") if p.is_file()}
-    tree_b = {str(p.relative_to(upstream)): p.read_bytes() for p in upstream.rglob("*") if p.is_file()}
+    tree_b = {p: (upstream / p).read_bytes() for p in allow}
     assert sorted(tree_a) == sorted(tree_b), f"{repo}: {sorted(tree_a)} != {sorted(tree_b)}"
     differ = [p for p in tree_b if tree_a[p] != tree_b[p]]
     assert not differ, f"{repo}: {differ} differ from upstream's"
@@ -143,11 +146,12 @@ def main() -> None:
     assert set(names) == {"text_encoder", "text_encoder_2", "unet", "vae"}, names
     cli(a, "export", NAME, str(work / "out"), "--safetensors")
     same_files(work / "out")
-    same_folder(work / "out", REPO, [])
-    for i, (repo, flags, dropped) in enumerate(SOURCES):
+    same_folder(work / "out", REPO, None)
+    for i, (repo, variant) in enumerate(SOURCES):
+        flags = ["--variant", variant] if variant else []
         cli(work / "sources", "import", f"hf://{repo}", "--name", f"local/source-{i}", *flags)
         cli(work / "sources", "export", f"local/source-{i}", str(work / f"source-{i}"), "--safetensors")
-        same_folder(work / f"source-{i}", repo, dropped)
+        same_folder(work / f"source-{i}", repo, variant)
     same_image(work / "out", reference)
     cli(a, "export", NAME, str(work / "origin"), "--origin")
     with serve(work / "origin") as url:
