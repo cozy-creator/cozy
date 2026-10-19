@@ -3,6 +3,7 @@
 //! (tab-separated `key value…` lines; the last for a key wins).
 
 use std::collections::BTreeMap;
+use std::cmp::Reverse;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -63,7 +64,7 @@ pub fn disk(path: &Path) -> io::Result<(f64, bool)> {
     }
     let mut found = Vec::new();
     files(path, volume, &mut found)?;
-    found.sort_by(|a, b| b.0.cmp(&a.0));
+    found.sort_by_key(|f| Reverse(f.0));
     let (mut opened, mut blocks, mut total) = (Vec::new(), Vec::new(), 0);
     for (len, p) in found.into_iter().take_while(|(len, _)| *len > 0) {
         if total >= PROBE {
