@@ -370,6 +370,31 @@ def main() -> int:
         f"{before} -> {after}",
     )
 
+    # a later step's resident pages are room for this step's binds, the furthest first
+    torch.cuda.synchronize()
+    net3 = meta(a.dim, a.blocks)
+    net3._varena = Declared(WeightGrant(ck, "net", "sha256:" + "2" * 64))
+    model3 = mem.load(net3)
+    for m in (model, model2, model3):
+        m.evict()
+    with torch.no_grad(), mem.request("homes"):
+        net2(x), net3(x)  # the later steps' models wholly at home
+    model.evict()
+    torch.cuda.empty_cache()
+    junk = torch.empty(torch.cuda.mem_get_info(0)[0] - model.nbytes // 2, dtype=torch.uint8, device=dev)
+    before = resident(model2.name), resident(model3.name)
+    with torch.no_grad(), mem.request("step one", plan=[net, net2, net3]) as r:
+        ran = torch.equal(net(x), want)
+        after = resident(model2.name), resident(model3.name)
+    del junk
+    check(
+        "a later step's pages are room for this step's binds, the furthest first",
+        ran and after[1] < before[1] and (after[0] == before[0] or after[1] == 0),
+        f"{before} -> {after}",
+    )
+    check("the declared plan is in its stats", r.stats.plan == (("net",), ("net",), ("net",)), r.stats.plan)
+    model3.close()
+
     # a request short of room waits for another's bytes, without a timer
     holding, done = threading.Event(), threading.Event()
     waited: list[int] = []
