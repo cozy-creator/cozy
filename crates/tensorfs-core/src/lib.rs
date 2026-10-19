@@ -34,6 +34,7 @@ pub mod err;
 #[cfg(feature = "store")]
 pub mod export;
 pub mod failure;
+pub use failure::{Failure, Kind, Result};
 #[cfg(feature = "store")]
 pub mod fetch;
 #[cfg(feature = "store")]
