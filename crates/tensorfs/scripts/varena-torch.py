@@ -25,10 +25,12 @@ Runs with any python that has torch (CUDA) and `PYTHONPATH=<worktree>/python`.
 
 import argparse
 import os
+import socket
 import sys
 import tempfile
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import torch
@@ -450,6 +452,20 @@ def main() -> int:
     return 0 if all(results) else 1
 
 
+class Touch:
+    def __init__(self) -> None:
+        self.fills = 0
+
+    def __call__(self, block: object, parts: dict[str, dict[str, torch.Tensor]]) -> None:
+        for roles in parts.values():
+            for value in roles.values():
+                value.add_(0)
+        self.fills += 1
+
+    def prepare(self) -> int:
+        return 0
+
+
 def adopted(mem: Memory, ck: tensorfs.Checkpoint, held: int, a: argparse.Namespace, want: torch.Tensor, x: torch.Tensor) -> None:
     """The deposit adopted before any module: its copies start at once, the load binds to it."""
     grant = WeightGrant(ck, "net", "sha256:" + "2" * 64, host_fd=held)
@@ -462,7 +478,37 @@ def adopted(mem: Memory, ck: tensorfs.Checkpoint, held: int, a: argparse.Namespa
     check("the load binds the adopted tier", model.ws is ws and not mem.adopted and not mem.sealed())
     with torch.no_grad(), mem.request("adopted"):
         check("the adopted model equals the reference", torch.equal(net(x), want))
+    torch.cuda.synchronize()
+    fingerprint, containers = model.kept()
+    pages = []
+    for region, _, fd in containers:
+        with socket.socket(fileno=fd) as container:
+            pages.append((region, socket.recv_fds(container, 1, 1)[1][0]))
+    assert pages, "the fill regression needs retained GPU pages"
     model.close()
+    kept = replace(grant, pages=tuple(pages), fingerprint=fingerprint)
+    try:
+        mem.adopt(kept)
+        imported = mem.adopted[kept.key]
+        pin = imported.bind(0, torch.cuda.current_stream().cuda_stream)
+        assert not pin.writable, "the early adopted pages are read-only"
+        del pin
+        touch = Touch()
+        net = meta(a.dim, a.blocks)
+        net._varena = Declared(kept, fill=touch)
+        model = mem.load(net)
+        check("a fill drops the read-only early GPU adoption", model.ws is not imported)
+        pin = model.ws.bind(0, torch.cuda.current_stream().cuda_stream)
+        assert pin.writable, "a fill's fresh mapping is writable before any mutation"
+        del pin
+        with torch.no_grad(), mem.request("adopted-fill"):
+            check("a fill after early adoption serves correctly", torch.equal(net(x), want))
+        check("the replacement mapping ran its fill", touch.fills > 0)
+        check("filled pages are never retained", not model.kept()[1])
+        model.close()
+    finally:
+        for _, fd in pages:
+            os.close(fd)
 
     mem.adopt(grant)
     net = meta(a.dim, a.blocks)
