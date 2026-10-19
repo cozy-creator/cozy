@@ -3,10 +3,11 @@ public TensorFS in the configured store and returns its model reference."""
 from __future__ import annotations
 
 import asyncio
+from typing import Any
 
 import msgspec
 
-from cozy_runtime.author import App, Context, ModelArtifact, Telemetry, WeightsOutput
+from cozy_runtime.author import App, Context, ModelArtifact, Telemetry, Weights, WeightsOutput
 from cozy_runtime.weights_store import Derivation
 
 app = App()
@@ -36,3 +37,15 @@ async def table(ctx: Context, payload: TableInput, tel: Telemetry) -> ModelArtif
 
 
 app.entrypoint(table, weights=(WeightsOutput("model", max_new_bytes=1 << 20),), accelerator=False)
+
+
+async def convert(
+    ctx: Context, payload: TableInput, tel: Telemetry, *, source: Weights[Any]
+) -> ModelArtifact:
+    """The same CPU Writer behind the CLI's existing source/destination conversion syntax."""
+    # Opening the admitted local source also proves this fixture needs no provider download.
+    ctx.tensorfs_source(source)
+    return await table(ctx, payload, tel)
+
+
+app.entrypoint(convert, weights=(WeightsOutput("model", max_new_bytes=1 << 20),), accelerator=False)

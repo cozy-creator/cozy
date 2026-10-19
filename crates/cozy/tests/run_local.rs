@@ -176,6 +176,220 @@ fn runtime_checkpoint_writes_replay_and_survive_calcifer_restart() {
     assert_eq!(first["result"]["transaction"], replayed["result"]["transaction"]);
 }
 
+/// Public CLI conversion -> ephemeral ordinary owner Bearer -> Runtime Writer -> real Hub.
+/// The output remains local, and a separate cold store fetches its private remote bytes.
+#[test]
+fn runtime_checkpoint_uploads_with_the_ordinary_owner_credential() {
+    use std::sync::Arc;
+    use tensorfs_core::{
+        fetch::{
+            Client, Config, Endpoint, Fetcher, ObjectStore, Origin, SourcePolicy, Want, bearer,
+        },
+        format::Dtype,
+        store2::Store,
+        writer::{Data, Source},
+    };
+
+    let Some(home) = Home::with_hub() else { return };
+    let Some(_) = common::needs("COZY_TEST_TENSORD", common::TENSORD) else {
+        return;
+    };
+    let account = home.sign_in("cli-writer-upload@cozy.test");
+    let destination = format!("{account}/writer-output");
+    let store_path = home.path().join("shared-tensorfs");
+    let seed = {
+        let store = Store::open(&store_path).unwrap();
+        let mut writer = store.writer(None, None).unwrap();
+        writer
+            .get("model")
+            .put(
+                "seed",
+                &Dtype::F32,
+                &[1],
+                Data::Plain(Source::Read(&mut &[0u8; 4][..])),
+            )
+            .unwrap();
+        let header = writer.commit().unwrap();
+        tensord::storage::set_local(&store, "seed", &header, &Default::default()).unwrap();
+        header
+    };
+    let _machine = common::tensord::added_with(
+        &home,
+        "m1",
+        &[("COZY_TENSORFS_ROOT", store_path.to_str().unwrap())],
+    );
+    let work = home.path().join("work");
+    copy(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("../tensord/tests/fixtures/cpu_weights"),
+        &work.join("cpu_weights"),
+    );
+    let run = || {
+        completed(&cozy(
+            &home,
+            &work,
+            &[
+                "--json",
+                "run",
+                "./cpu_weights/convert",
+                "local/seed",
+                &destination,
+                "size=64",
+                "--on",
+                "m1",
+            ],
+        ))
+    };
+    let reference = |run: &Value| {
+        let output = run["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|output| output["name"] == "model")
+            .unwrap();
+        assert_eq!(output["status"], "completed", "{output}");
+        for field in ["path", "sha256", "export_error"] {
+            assert!(output.get(field).is_none_or(Value::is_null), "{output}");
+        }
+        let reference = output["checkpoint"].clone();
+        assert_eq!(reference["repo_id"], destination, "{reference}");
+        assert!(
+            reference["revision"]
+                .as_str()
+                .unwrap()
+                .starts_with("sha256:")
+        );
+        reference
+    };
+    let first = run();
+    let remote = reference(&first);
+    let again = run();
+    assert_eq!(
+        reference(&again),
+        remote,
+        "repeated work republishes the same tree"
+    );
+    assert_eq!(
+        first["result"]["transaction"],
+        again["result"]["transaction"]
+    );
+
+    let expected: Vec<u8> = (0u8..=255).collect();
+    let local = Store::open(&store_path).unwrap();
+    assert_eq!(
+        local
+            .checkpoint(&seed)
+            .unwrap()
+            .read("model", "seed")
+            .unwrap(),
+        [0u8; 4]
+    );
+    let header =
+        tensord::storage::held(&local, first["result"]["checkpoint"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        local
+            .checkpoint(&header)
+            .unwrap()
+            .read("model", "table")
+            .unwrap(),
+        expected
+    );
+
+    let origin = std::env::var("TENSORHUB_ORIGIN").unwrap();
+    let ca = std::fs::read(std::env::var("TENSORHUB_CA").unwrap()).unwrap();
+    let client = Client::with_roots(
+        SourcePolicy {
+            any_host: true,
+            allow_local: true,
+            max_redirects: 5,
+            ..Default::default()
+        },
+        &ca,
+    )
+    .unwrap();
+    let cold = tempfile::tempdir().unwrap();
+    let downloaded = Store::open(cold.path()).unwrap();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let anonymous = Endpoint::new(&client, &origin, None).unwrap().anonymous();
+        assert!(
+            anonymous.repo(&destination).await.unwrap().is_none(),
+            "private output is public"
+        );
+        let endpoint: Arc<dyn Origin> =
+            Arc::new(Endpoint::new(&client, &origin, Some(bearer(home.token()))).unwrap());
+        let fetcher = Fetcher::new(
+            Arc::new(downloaded.clone()) as Arc<dyn ObjectStore>,
+            client.clone(),
+            None,
+            Config::default(),
+        );
+        let pulled = fetcher
+            .pull(
+                &endpoint,
+                &destination,
+                remote["revision"].as_str(),
+                None,
+                &Want::default(),
+            )
+            .await
+            .unwrap();
+        fetcher.settled().await;
+        assert_eq!(pulled.header, header);
+        assert_eq!(
+            pulled.tree.as_ref().unwrap().id(),
+            remote["revision"].as_str().unwrap()
+        );
+        assert_eq!(
+            downloaded
+                .checkpoint(&pulled.header)
+                .unwrap()
+                .read("model", "table")
+                .unwrap(),
+            expected
+        );
+    });
+
+    let down = home.cozy(["down"]);
+    assert_eq!(down.code, 0, "{down:?}");
+    let db_path = home.root().join("calcifer/state.db");
+    let db = calcifer::store::Store::open(&db_path).unwrap();
+    for run in [&first, &again] {
+        let stored = db.run(run["id"].as_str().unwrap()).unwrap().unwrap();
+        assert!(
+            stored.spec.tensorfs.is_none(),
+            "send-time credential entered stored spec"
+        );
+        assert!(
+            stored.spec.hub.is_none(),
+            "send-time legacy access entered stored spec"
+        );
+    }
+    drop(db);
+    let token = home.token();
+    let bytes = std::fs::read(db_path).unwrap();
+    assert!(
+        !bytes
+            .windows(token.len())
+            .any(|part| part == token.as_bytes()),
+        "owner token entered SQLite"
+    );
+    let shown = home.json([
+        "--json",
+        "run",
+        "show",
+        &first["number"].as_u64().unwrap().to_string(),
+    ]);
+    assert_eq!(
+        reference(&shown),
+        remote,
+        "remote reference survives Calcifer restart"
+    );
+    assert!(
+        !serde_json::to_string(&shown).unwrap().contains(&token),
+        "owner token entered public history"
+    );
+}
+
 /// A wheel no index serves (an unpublished build, as cozy-kernels before its release), named by a
 /// path source: the machine installs it as a carried wheel, for a script (resolved on the machine)
 /// and for a locked project (`uv sync` leaves it to the carried file), and the code imports it.
