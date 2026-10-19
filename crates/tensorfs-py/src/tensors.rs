@@ -70,7 +70,7 @@ impl PyTensors {
         }
     }
 
-    fn into_destination(
+    fn fill_target(
         &self,
         py: Python<'_>,
         key: String,
@@ -459,7 +459,7 @@ impl PyTensors {
         if out.hasattr("__dlpack__")? {
             let held = crate::store::Dlpack::of(py, out, None, None)?;
             let result =
-                self.into_destination(py, key, role.as_deref(), offset, held.destination());
+                self.fill_target(py, key, role.as_deref(), offset, held.destination());
             py.detach(move || drop(held));
             return result;
         }
@@ -480,6 +480,6 @@ impl PyTensors {
             ptr: buf.buf_ptr() as *mut u8,
             len: buf.len_bytes(),
         };
-        self.into_destination(py, key, role.as_deref(), offset, dst)
+        self.fill_target(py, key, role.as_deref(), offset, dst)
     }
 }
