@@ -45,7 +45,7 @@ impl Fixture {
     }
 
     /// The output's channel and its transaction.
-    fn open(&self) -> (String, Channel<cozy_platform::ipc::LocalStream>) {
+    fn open(&self) -> (String, Channel<platform::ipc::LocalStream>) {
         let (answer, channel, _) = self.owner.answer(&self.grant, &self.output);
         assert!(answer.ok, "{answer:?}");
         #[cfg(unix)]
@@ -53,7 +53,7 @@ impl Fixture {
         #[cfg(windows)]
         let raw = std::os::windows::io::IntoRawHandle::into_raw_handle(channel.unwrap()) as i64;
         // SAFETY: the connected stream the answer handed over, now this test's.
-        let stream = unsafe { cozy_platform::ipc::adopt(raw) };
+        let stream = unsafe { platform::ipc::adopt(raw) };
         (answer.transaction, Channel(stream))
     }
 
@@ -78,7 +78,7 @@ impl Drop for Fixture {
     }
 }
 
-fn ask(channel: &mut Channel<cozy_platform::ipc::LocalStream>, request: Value) -> Value {
+fn ask(channel: &mut Channel<platform::ipc::LocalStream>, request: Value) -> Value {
     channel.send(&request).unwrap();
     match channel.receive().unwrap() {
         Some(Wire::Json(answer)) => answer,
@@ -86,7 +86,7 @@ fn ask(channel: &mut Channel<cozy_platform::ipc::LocalStream>, request: Value) -
     }
 }
 
-fn put(channel: &mut Channel<cozy_platform::ipc::LocalStream>) {
+fn put(channel: &mut Channel<platform::ipc::LocalStream>) {
     channel.send(&json!({"op": "put", "component": "model", "key": "weight", "dtype": "F32", "shape": [2], "length": 8})).unwrap();
     channel.data(&[1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
     assert_eq!(channel.receive().unwrap(), Some(Wire::Json(json!({"result": null}))));

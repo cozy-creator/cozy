@@ -3,7 +3,7 @@
 //! `TENSORD_LIFECYCLE_GENERATIONS` names the installed generations directory.
 //! Unix until the Runtime's Windows executor channel lands.
 #![cfg(unix)]
-use cozy_platform::process::Exact;
+use platform::process::Exact;
 use tensord::{
     device_executor::{
         Baseline, Binding, DeviceCommand, DeviceExecutor, EndedBeforeStart,
@@ -358,7 +358,7 @@ fn a_setsid_descendant_is_killed_with_its_executor_scope() {
         let pid = tensord::device_executor::read_result(&spool, &reply).unwrap()["pid"]
             .as_u64()
             .unwrap() as u32;
-        let daemon = cozy_platform::process::Birth::of(pid).unwrap();
+        let daemon = platform::process::Birth::of(pid).unwrap();
         // Its own session: a process-group kill would miss it.
         let session = |pid: u32| {
             fs::read_to_string(format!("/proc/{pid}/stat")).unwrap().rsplit_once(") ").unwrap().1

@@ -1,5 +1,5 @@
 use super::*;
-use cozy_platform::ipc::LocalStream;
+use platform::ipc::LocalStream;
 use std::time::Duration;
 use tensorfs_core::format::Value as Meta;
 
@@ -63,7 +63,7 @@ impl Client {
 }
 
 fn serve(store: &Store, transaction: &str, derivation: &Derivation, client: impl FnOnce(&mut Client)) -> io::Result<Option<ObjectRef>> {
-    let (near, far) = cozy_platform::ipc::pair().unwrap();
+    let (near, far) = platform::ipc::pair().unwrap();
     let (current, ensure) = (|| true, |_: &[ObjectRef]| Ok(()));
     let hooks = Hooks { current: &current, ensure: &ensure };
     std::thread::scope(|scope| {
@@ -204,7 +204,7 @@ fn a_source_channel_reads_and_fetches_what_it_lacks() {
         store.put(saved.as_slice(), Some(&absent[0])).map(drop).map_err(storage::io_error)
     };
     let hooks = Hooks { current: &current, ensure: &ensure };
-    let (near, far) = cozy_platform::ipc::pair().unwrap();
+    let (near, far) = platform::ipc::pair().unwrap();
     std::thread::scope(|scope| {
         let served = scope.spawn(|| serve_source(&store, &source, far, &hooks));
         let mut c = Client(Channel(near));

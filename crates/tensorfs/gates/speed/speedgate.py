@@ -10,13 +10,16 @@ cold (pages dropped) and warm, the whole checkpoint and one paging window, from 
 the last byte resident on the GPU.
 
 Readers:
-- `T64+rust`: `tensorfs.varena`: checkpoint, regions cut at blocks, `Gpu.register`, bind every
-  region, synchronize.
+- `T64+rust`: `tensorfs.varena`: open the checkpoint, regions for what the load wants (the window's
+  block, or everything) cut at blocks, `Gpu.register` of those alone; then bind every region and
+  synchronize.
 - `T64+fst`: the same chunk files read by fastsafetensors' own C++ engine.
 - `T64`: the F1 Python reader over the same chunk files.
 - `fastsafetensors`: fastsafetensors 0.5.0 over the safetensors files.
 - `st-cuda`, `st-cpu-cuda`: `safetensors.safe_open` 0.8 onto the GPU, or onto the CPU then `.to("cuda")`.
-The gate compares `T64+rust` with the best of the three safetensors paths in each cell.
+The gate compares `T64+rust` with the best of the three safetensors paths in each cell, on the
+whole time. Each cell also reports its open (up to the first byte read: header parses, regions,
+registration) and its read (the rest) for the readers that have one.
 """
 
 import ctypes
@@ -264,16 +267,17 @@ class Model:
         return self.st if layout in SAFETENSORS else [p for p, _ in self.chunks]
 
     def rust(self, gpu, window):
-        """Checkpoint, regions cut at blocks (what the Runtime passes), register and bind on the
-        device: v2 weights read through varena's register path."""
+        """Open the checkpoint, take regions for what the load wants (the window's block, or every
+        tensor) cut at blocks, and register those alone: the open. Bind every region on the
+        device and synchronize: the read."""
         t0 = time.perf_counter()
         ck = self.checkpoint()
-        ws = gpu.register(self.name, ck, tensorfs.regions(ck, 64 << 20, self.blocks))
-        self.register_s = time.perf_counter() - t0  # open, regions and register: the part before any read
-        picked = sorted({p.region for p in ws.parts if self.in_window(p.component, p.key)}) if window else range(len(ws.spans))
-        pins = [ws.bind(r) for r in picked]
+        only = [f"{self.wcomp}/{self.wprefix.rstrip('.')}"] if window else None
+        ws = gpu.register(self.name, ck, tensorfs.regions(ck, 64 << 20, self.blocks, only))
+        opened = time.perf_counter() - t0
+        pins = [ws.bind(r) for r in range(len(ws.spans))]
         torch.cuda.synchronize()
-        return sum(p.nbytes for p in ws.parts if p.region in picked), ws, pins
+        return opened, sum(p.nbytes for p in ws.parts), ws, pins
 
     def spans(self, window):
         ck = self.checkpoint()
@@ -284,12 +288,14 @@ class Model:
         """fastsafetensors (one loader over every file), or `safe_open` per file onto the GPU
         (`st-cuda`) or onto the CPU and then `.to("cuda")` (`st-cpu-cuda`)."""
         keys = [f"{p[1]}#{p[2]}" for p in self.parts if p[6] or not window]
+        t0, opened = time.perf_counter(), 0.0
         if layout == "fastsafetensors":
             loader = SafeTensorsFileLoader(None, "cuda:0", nogds=True)
             if window:
                 keep = set(keys)
                 loader.set_tensor_filter(lambda n: n in keep)
             loader.add_filenames({0: self.st})
+            opened = time.perf_counter() - t0
             fb = loader.copy_files_to_device()
             out = [fb.get_tensor(k) for k in keys]
             fb.close()
@@ -299,17 +305,21 @@ class Model:
             for path in self.st:
                 comp = os.path.basename(path).removesuffix(".safetensors")
                 names = [f"{p[1]}#{p[2]}" for p in self.parts if p[0] == comp and (p[6] or not window)]
+                t0 = time.perf_counter()
                 with safe_open(path, framework="pt", device="cuda:0" if layout == "st-cuda" else "cpu") as f:
+                    opened += time.perf_counter() - t0
                     out += [f.get_tensor(k) if layout == "st-cuda" else f.get_tensor(k).to("cuda:0") for k in names]
         torch.cuda.synchronize()
-        return sum(t.numel() for t in out)
+        return sum(t.numel() for t in out), opened
 
     def once(self, readers, layout, window, cold):
+        """(seconds, of them the open's or None, bytes moved)"""
+        opened = None
         t0 = time.perf_counter()
         if layout in SAFETENSORS:
-            moved = self.safetensors(layout, window)
+            moved, opened = self.safetensors(layout, window)
         elif layout == "T64+rust":
-            moved, ws, pins = self.rust(readers["plane"], window)
+            opened, moved, ws, pins = self.rust(readers["plane"], window)
         else:
             moved = readers[layout].run(self.spans(window), direct=cold)
         s = time.perf_counter() - t0
@@ -318,7 +328,7 @@ class Model:
             ws.close()
             readers["plane"].trim()  # the idle chunks go back to the driver
         torch.cuda.empty_cache()
-        return s, moved
+        return s, opened, moved
 
 
 def drop(paths):
@@ -342,11 +352,11 @@ def bench(model, readers, log, warm_full, layouts=LAYOUTS, scopes=("full", "wind
                         drop(files)
                     else:
                         model.once(readers, layout, window, cold=False)  # populate the page cache
-                    s, moved = model.once(readers, layout, window, cold=cold)
+                    s, opened, moved = model.once(readers, layout, window, cold=cold)
                     cell = f"{layout} {scope} {'cold' if cold else 'warm'}"
-                    res.setdefault(cell, []).append((s, moved))
-                    reg = f" (register {1000 * model.register_s:.1f} ms)" if layout == "T64+rust" else ""
-                    log(f"{model.name} {cell}: {1000 * s:.0f} ms {moved / 1e6:.0f} MB{reg}")
+                    res.setdefault(cell, []).append((s, moved, opened))
+                    split = f" (open {1000 * opened:.1f}, read {1000 * (s - opened):.1f})" if opened is not None else ""
+                    log(f"{model.name} {cell}: {1000 * s:.0f} ms{split} {moved / 1e6:.0f} MB")
             drop(files)
         log(f"{model.name}: rep {rep + 1}/{model.reps} done")
     return res
@@ -354,23 +364,31 @@ def bench(model, readers, log, warm_full, layouts=LAYOUTS, scopes=("full", "wind
 
 def summary(model, res, layouts=LAYOUTS):
     cells = sorted({k.split(" ", 1)[1] for k in res}, key=lambda c: ("window" in c, "warm" in c))
-    lines = [f"{model.name}: {model.bytes / 1e9:.2f} GB in {len(model.chunks)} chunks, window {model.window_bytes / 1e6:.0f} MB; ms median (best)"]
+    lines = [f"{model.name}: {model.bytes / 1e9:.2f} GB in {len(model.chunks)} chunks, window {model.window_bytes / 1e6:.0f} MB; "
+             "ms median (best), bytes moved, and the medians of open and read"]
     lines.append("reader | " + " | ".join(cells))
     med = lambda xs: statistics.median(x[0] for x in xs)
+    split = lambda xs: (statistics.median(x[2] for x in xs), statistics.median(x[0] - x[2] for x in xs)) if xs[0][2] is not None else None
     for layout in layouts:
         row = []
         for cell in cells:
-            xs = sorted(res.get(f"{layout} {cell}", []))
-            row.append(f"{1000 * med(xs):.0f} ({1000 * xs[0][0]:.0f}) {xs[0][1] / 1e6:.0f}MB" if xs else "-")
+            xs = sorted(res.get(f"{layout} {cell}", []), key=lambda x: x[0])
+            parts = split(xs) if xs else None
+            row.append((f"{1000 * med(xs):.0f} ({1000 * xs[0][0]:.0f}) {xs[0][1] / 1e6:.0f}MB"
+                        + (f" open {1000 * parts[0]:.1f} read {1000 * parts[1]:.1f}" if parts else "")) if xs else "-")
         lines.append(f"{layout} | " + " | ".join(row))
     gate = {}
     for cell in cells:
         rust = med(res[f"T64+rust {cell}"])
         st = {l: med(res[f"{l} {cell}"]) for l in SAFETENSORS if res.get(f"{l} {cell}")}
         best = min(st, key=st.get)
-        gate[cell] = {"rust_ms": round(1000 * rust), "safetensors": best, "safetensors_ms": round(1000 * st[best]),
+        (ro, rr), (so, sr) = split(res[f"T64+rust {cell}"]), split(res[f"{best} {cell}"])
+        gate[cell] = {"rust_ms": round(1000 * rust), "rust_open_ms": round(1000 * ro, 1), "rust_read_ms": round(1000 * rr, 1),
+                      "safetensors": best, "safetensors_ms": round(1000 * st[best]),
+                      "safetensors_open_ms": round(1000 * so, 1), "safetensors_read_ms": round(1000 * sr, 1),
                       "margin": round(st[best] / rust - 1, 3), "pass": rust <= st[best]}
-        lines.append(f"gate {cell}: T64+rust {1000 * rust:.0f} ms vs best safetensors ({best}) {1000 * st[best]:.0f} ms "
+        lines.append(f"gate {cell}: T64+rust {1000 * rust:.0f} ms (open {1000 * ro:.1f}, read {1000 * rr:.1f}) vs best safetensors "
+                     f"({best}) {1000 * st[best]:.0f} ms (open {1000 * so:.1f}, read {1000 * sr:.1f}) "
                      f"({100 * (st[best] / rust - 1):+.0f}%) -> {'PASS' if rust <= st[best] else 'FAIL'}")
     return lines, gate
 
@@ -415,7 +433,7 @@ def main(work, out_path, build_only=False, plane=None, layouts=LAYOUTS, scopes=(
             log(line)
         out["models"][name] = {"bytes": model.bytes, "chunks": len(model.chunks), "window_bytes": model.window_bytes,
                                "manifest": model.manifest, "store": model.store,
-                               "results": {k: [[round(s, 4), b] for s, b in v] for k, v in res.items()}, "table": lines, "gate": gate}
+                               "results": {k: [[round(s, 4), b, o and round(o, 4)] for s, b, o in v] for k, v in res.items()}, "table": lines, "gate": gate}
         json.dump(out, open(out_path, "w"))
     return out
 

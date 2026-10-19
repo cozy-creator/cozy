@@ -9,7 +9,7 @@
 //! asks `fits`.
 use super::{MemoryLog, Sample};
 use crate::process::Liveness;
-use cozy_platform::{gpu::Device, process::Birth};
+use platform::{gpu::Device, process::Birth};
 use std::{
     fs::File,
     io,

@@ -34,7 +34,7 @@ nice -n 19 cargo build --release --locked -p tensorfs-core --bin tfs
 # The cozy workspace's target directory, not this tree's.
 target=$(cargo metadata --format-version 1 --no-deps | "$py" -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')
 
-version=$(sed -n 's/^version = "\(.*\)"$/\1/p' crates/tensorfs-py/Cargo.toml | head -1)
+version=$(sed -n 's/^version = "\(.*\)"$/\1/p' ../tensorfs-py/Cargo.toml | head -1)
 said=$("$target"/release/tfs version)
 case "$said" in
     "tfs $version sha256:"*) ;;

@@ -1,0 +1,42 @@
+[package]
+name = "protocol"
+description = "The wire types every cozy process shares: the machine API and its client, Cozy-Cap, the error envelope, ids and config.toml"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+base64.workspace = true
+bytes.workspace = true
+platform.workspace = true
+ed25519-dalek.workspace = true
+eventsource-stream.workspace = true
+figment.workspace = true
+futures-util.workspace = true
+hex.workspace = true
+reqwest.workspace = true
+rustls.workspace = true
+serde.workspace = true
+serde_ignored.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+url.workspace = true
+utoipa.workspace = true
+
+[features]
+# Dev builds only (xs-045 U12): `RunSpec::migrate`. Never in a release.
+migrate = []
+
+[dev-dependencies]
+axum = { workspace = true, features = ["http2"] }
+hyper-util = { workspace = true, features = ["server-auto", "service", "http1", "http2"] }
+rcgen.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

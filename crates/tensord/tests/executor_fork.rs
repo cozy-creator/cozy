@@ -3,7 +3,7 @@
 //! proven on a rental. `TENSORD_FORK_GENERATIONS` names installed generations whose
 //! Runtime offers `fork/1`. Unix only: a Windows executor is spawned, never forked.
 #![cfg(unix)]
-use cozy_platform::process::Exact;
+use platform::process::Exact;
 use tensord::{
     device_executor::{
         Baseline, Binding, DeviceCommand, DeviceExecutor, ExecutorConfig, Forked,

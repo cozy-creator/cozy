@@ -2,7 +2,7 @@
 //! header and assets it serves an executor that reads no store.
 use tensord::model_sources::{ModelSources, SelectedManifest};
 use sha2::{Digest, Sha256};
-use cozy_platform::durable::FileAt as _;
+use platform::durable::FileAt as _;
 use std::{fs, io};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;

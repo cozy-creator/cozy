@@ -1,6 +1,6 @@
 //! The machine's downloader and the executor's fetch channel against a real static origin: a
 //! store's own tree (`refs/`, `blobs/`) served by `python3 -m http.server`.
-use cozy_platform::ipc::LocalStream;
+use platform::ipc::LocalStream;
 use std::{
     collections::BTreeMap,
     fs,
@@ -152,7 +152,7 @@ fn the_fetch_channel_schedules_waits_and_answers_presence_for_its_checkpoints_on
     let closure = origin.closure(&manifest).unwrap();
     let id = format!("sha256:{}", manifest.sha256);
 
-    let (client, server) = cozy_platform::ipc::pair().unwrap();
+    let (client, server) = platform::ipc::pair().unwrap();
     let grant = Grant { run: 7, checkpoints: vec![(manifest.clone(), remote)], stop: Stop::default() };
     let served = {
         let machine = machine.clone();

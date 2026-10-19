@@ -11,18 +11,18 @@ publish.workspace = true
 
 [dependencies]
 calcifer.workspace = true
-cozy-cli.workspace = true
+cli.workspace = true
 tensord.workspace = true
 
 [features]
 # Dev builds only (xs-045 U12): `cozy model migrate` and the machine's migration runs. Never in
 # a release.
-migrate = ["cozy-cli/migrate", "tensord/migrate"]
+migrate = ["cli/migrate", "tensord/migrate"]
 
 [dev-dependencies]
 base64.workspace = true
-cozy-platform.workspace = true
-cozy-proto.workspace = true
+platform.workspace = true
+protocol.workspace = true
 ed25519-dalek.workspace = true
 hex.workspace = true
 hub-client = { workspace = true, features = ["testing"] }

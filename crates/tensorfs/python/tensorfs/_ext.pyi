@@ -213,10 +213,15 @@ class Store:
     def gc(self, older_than: float | None = None) -> dict[str, Any]: ...
 
 def regions(
-    ck: Checkpoint, max_bytes: int = ..., boundaries: Sequence[str] | None = None
+    ck: Checkpoint,
+    max_bytes: int = ...,
+    boundaries: Sequence[str] | None = None,
+    only: Sequence[str] | None = None,
 ) -> list[list[str]]:
     """`<component>/<key>` regions: chunk-sharing tensors together, up to `max_bytes` each, never
-    across a `<component>/<key prefix>` boundary (a block) unless a shared chunk does."""
+    across a `<component>/<key prefix>` boundary (a block) unless a shared chunk does. `only`
+    (blocks or tensors, in the same form) limits the work and the result to those tensors and
+    the ones sharing a chunk with them."""
 
 # ------------------------------------------------------------------------- the CBOR header
 

@@ -16,7 +16,7 @@ use std::{
 
 use calcifer::Calcifer;
 use common::{SilentHub, Tensord};
-use cozy_proto::calcifer::{Event, Kind, On, OutputItem, SubmitRun};
+use protocol::calcifer::{Event, Kind, On, OutputItem, SubmitRun};
 
 /// The machine's port the shaping names.
 const SHAPED: &str = "127.0.0.1:47123";
@@ -121,7 +121,7 @@ async fn an_input_uploads_near_the_link_rate_over_a_long_round_trip() {
         at(&|done| done >= total as f64),
     );
     let link = calcifer::Link::new(&machine.endpoint, common::key()).unwrap();
-    let digest = cozy_proto::ids::Digest::of(&bytes);
+    let digest = protocol::ids::Digest::of(&bytes);
     assert_eq!(
         link.held(&digest, total as u64).await.unwrap(),
         total as u64
@@ -237,10 +237,10 @@ async fn inputs_the_machine_holds_are_asked_about_once_over_a_long_round_trip() 
             let bytes = format!("input {i}").into_bytes();
             let path = home.path().join(format!("input-{i}"));
             std::fs::write(&path, &bytes).unwrap();
-            let digest = cozy_proto::ids::Digest::of(&bytes);
+            let digest = protocol::ids::Digest::of(&bytes);
             let length = bytes.len() as u64;
-            let staged = cozy_proto::calcifer::StagedInput { path, digest, length };
-            let spec = cozy_proto::machine::InputFile {
+            let staged = protocol::calcifer::StagedInput { path, digest, length };
+            let spec = protocol::machine::InputFile {
                 field: format!("images[{i}]"),
                 digest: digest.to_string(),
                 length,
@@ -251,7 +251,7 @@ async fn inputs_the_machine_holds_are_asked_about_once_over_a_long_round_trip() 
         })
         .collect();
     // Sent, then accepted: how long a run takes from its submit to its machine's acceptance.
-    let mut sent = async |key: &str, inputs: &[(cozy_proto::calcifer::StagedInput, cozy_proto::machine::InputFile)]| {
+    let mut sent = async |key: &str, inputs: &[(protocol::calcifer::StagedInput, protocol::machine::InputFile)]| {
         let submit = SubmitRun {
             on: On::from("m".to_owned()),
             hub: "https://tensorhub.com".into(),

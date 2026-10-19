@@ -8,7 +8,7 @@ use tensord::api::{
     capability::{self, Grant},
     domain, v1, MachineBackend, MachineIdentity,
 };
-use cozy_proto::error::Error;
+use protocol::error::Error;
 use ed25519_dalek::SigningKey;
 use std::{
     io::{Seek, Write},

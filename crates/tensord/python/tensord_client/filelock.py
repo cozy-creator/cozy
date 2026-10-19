@@ -1,5 +1,5 @@
 """Advisory whole-file locks that end with their holder: `flock(2)` on POSIX, `LockFileEx` on
-Windows on the byte at 2**63 - 2, as `cozy_platform::lock` takes it, so the lock never blocks a
+Windows on the byte at 2**63 - 2, as `platform::lock` takes it, so the lock never blocks a
 reader or writer of its contents. A lock that is not free raises `BlockingIOError` when the
 caller will not wait, as `fcntl.flock` does."""
 

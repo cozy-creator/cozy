@@ -43,7 +43,7 @@ fn run(lifetime: Lifetime, service_ready: Option<u64>) -> io::Result<()> {
         eprintln!("cannot record this binary's launch path ({error}): it never activates another");
     }
     // Linux names the calling thread: this one, before any other starts.
-    if let Err(error) = cozy_platform::process::set_name("tensord") {
+    if let Err(error) = platform::process::set_name("tensord") {
         if !error.is_unsupported() {
             return Err(io::Error::other(format!("cannot set TensorD process name: {error}")));
         }
@@ -52,7 +52,7 @@ fn run(lifetime: Lifetime, service_ready: Option<u64>) -> io::Result<()> {
     // it starts; descriptors it hands on are handed explicitly. Windows hands on none.
     #[cfg(unix)]
     {
-        cozy_platform::process::cloexec_from(3);
+        platform::process::cloexec_from(3);
         hold_handed_descriptors();
     }
     let mut config = config::load(lifetime)?;
@@ -155,13 +155,13 @@ pub struct Dev {
 
 pub fn dev(args: Dev) -> io::Result<()> {
     config::init_logs(None);
-    if let Err(error) = cozy_platform::process::set_name("tensord") {
+    if let Err(error) = platform::process::set_name("tensord") {
         if !error.is_unsupported() {
             return Err(io::Error::other(format!("cannot set TensorD process name: {error}")));
         }
     }
     #[cfg(unix)]
-    cozy_platform::process::cloexec_from(3);
+    platform::process::cloexec_from(3);
     machine_runtime()?;
     let root = args.state;
     let generations = args.generations.unwrap_or_else(|| root.join("generations"));
@@ -213,7 +213,7 @@ fn own(root: &std::path::Path, store: &std::path::Path) -> io::Result<(std::fs::
         .open(root.join("owner.lock"))?;
     lock.try_lock_exclusive()
         .map_err(|_| io::Error::new(io::ErrorKind::AlreadyExists, "state already has a machine owner"))?;
-    cozy_platform::durable::set_mode(root, 0o700)?;
+    platform::durable::set_mode(root, 0o700)?;
     Ok((lock, crate::storage::open(store)?))
 }
 
@@ -233,7 +233,7 @@ pub fn version() -> io::Result<()> {
     let record = Version {
         name: "tensord",
         version: env!("CARGO_PKG_VERSION"),
-        commit: Some(cozy_proto::COMMIT),
+        commit: Some(protocol::COMMIT),
         api: ["cozy.machine.v1"],
         capabilities,
     };
@@ -321,7 +321,7 @@ fn run_machine(config: config::Config, mut ready: crate::machine::supervise::Rea
     // the pod proofs used.
     let mut gpus = receipt::gpus(visible_devices.as_deref())?;
     // A driver below CUDA 13.0's floor serves no GPU; the machine stays for CPU work.
-    if let Some(why) = gpus.first().and_then(|gpu| cozy_platform::gpu::below_floor(&gpu.driver_version)) {
+    if let Some(why) = gpus.first().and_then(|gpu| platform::gpu::below_floor(&gpu.driver_version)) {
         tracing::error!("{why}; this machine offers no GPU");
         gpus.clear();
     }
@@ -390,7 +390,7 @@ fn run_machine(config: config::Config, mut ready: crate::machine::supervise::Rea
     // A local machine installs releases through its owner's uv cache, as its local packages do;
     // a cache of its own from before is no longer read (environments keep their linked files).
     if !rental {
-        sdk.owner_uv = crate::published::OwnerUv::of(cozy_proto::config::environment());
+        sdk.owner_uv = crate::published::OwnerUv::of(protocol::config::environment());
         if sdk.owner_uv.is_some() {
             let _ = std::fs::remove_dir_all(engine.join("published/uv-cache"));
         }

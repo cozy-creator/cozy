@@ -15,7 +15,7 @@ use calcifer::{
     store::State,
 };
 use common::{SilentHub, Tensord, until};
-use cozy_proto::{
+use protocol::{
     calcifer::{Event, Kind, On, Status, SubmitRun},
     ids::RunId,
     machine as v1,
@@ -31,7 +31,7 @@ fn open(home: &Path) -> Arc<Calcifer> {
 fn submit(
     on: &str,
     spec: v1::RunSpec,
-    inputs: Vec<cozy_proto::calcifer::StagedInput>,
+    inputs: Vec<protocol::calcifer::StagedInput>,
 ) -> SubmitRun {
     SubmitRun {
         on: On::from(on.to_owned()),

@@ -17,17 +17,16 @@ import pathlib
 import re
 import sys
 
-ROOT = pathlib.Path(__file__).resolve().parent.parent
+ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 DENY = ["torch", "cudarc", "cust", "tch", "reqwest", "hyper", "ureq", "curl", "openssl",
         "rustls", "native-tls", "webpki", "sqlx", "postgres", "tensorhub-v2",
-        "cozy-creator-v2", "cozy-runtime-v2", "worker-protocol-v2"]
+        "cozy-creator-v2", "cozy-runtime-v2"]
 #: The one client's carve-out: these tokens are legal ONLY here.
-CLIENT = ("crates/tensorfs-core/Cargo.toml", "crates/tensorfs-core/src/fetch/net.rs",
-          "crates/tensorfs-core/src/transport/")
+CLIENT = ("tensorfs-core/Cargo.toml", "tensorfs-core/src/fetch/net.rs", "tensorfs-core/src/transport/")
 ALLOW = {"rustls": CLIENT, "webpki": CLIENT, "hyper": CLIENT}
-SCAN = ["crates/*/Cargo.toml", "crates/*/src/**/*.rs"]
 RANK = {"tensorfs-core": 0, "varena": 1, "tensorfs-py": 2}
+SCAN = [f"{crate}/{files}" for crate in RANK for files in ("Cargo.toml", "src/**/*.rs")]
 
 
 def rel(p):
@@ -58,7 +57,7 @@ def fence_dependencies():
 def fence_layering():
     bad = []
     for crate, rank in sorted(RANK.items()):
-        d = ROOT / "crates" / crate
+        d = ROOT / crate
         higher = {c: r for c, r in RANK.items() if r >= rank and c != crate}
         for p in sorted([d / "Cargo.toml"] + list(d.glob("src/**/*.rs"))):
             if not p.is_file():

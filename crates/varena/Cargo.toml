@@ -1,0 +1,23 @@
+[package]
+name = "varena"
+version = "0.11.0"
+edition = "2021"
+publish.workspace = true
+description = "The memory of the process computing with model weights: GPU pages, slots and pins; the sealed host tier."
+
+[dependencies]
+platform.workspace = true
+tensorfs-core.workspace = true
+libc.workspace = true
+# libcuda is dlopen'd at first use: the workspace builds and tests with no CUDA toolkit.
+libloading = "0.9"
+thiserror.workspace = true
+tracing.workspace = true
+
+[features]
+# Store-backed sources (checkpoints and fills from a TensorFS store). Without it: sealed host
+# layouts only.
+default = ["store"]
+store = ["tensorfs-core/store"]
+# Test-only fault points on the host tier.
+faults = []

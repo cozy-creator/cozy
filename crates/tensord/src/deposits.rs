@@ -42,8 +42,8 @@ impl Deposits {
 /// (varena seals a layout it filled with future-write, its own mapping still open).
 #[cfg(target_os = "linux")]
 fn sealed(file: &File) -> io::Result<()> {
-    use cozy_platform::shm::{RESIZE_SEALS, WRITE_SEALS};
-    let seals = cozy_platform::shm::seals(std::os::fd::AsFd::as_fd(file))?;
+    use platform::shm::{RESIZE_SEALS, WRITE_SEALS};
+    let seals = platform::shm::seals(std::os::fd::AsFd::as_fd(file))?;
     match seals & RESIZE_SEALS == RESIZE_SEALS && seals & WRITE_SEALS != 0 {
         true => Ok(()),
         false => Err(io::Error::new(io::ErrorKind::InvalidInput, "a deposited layout must be sealed against writes and resizing")),
@@ -79,11 +79,11 @@ mod tests {
     #[test]
     fn a_layout_varena_sealed_is_kept_and_an_unsealed_one_refused() {
         let deposits = Deposits::default();
-        let unsealed = File::from(cozy_platform::shm::memfd_named("unsealed").unwrap());
+        let unsealed = File::from(platform::shm::memfd_named("unsealed").unwrap());
         assert!(deposits.deposit("sha256:m", "l", unsealed).is_err());
-        let layout = File::from(cozy_platform::shm::memfd_named("layout").unwrap());
+        let layout = File::from(platform::shm::memfd_named("layout").unwrap());
         layout.set_len(4096).unwrap();
-        cozy_platform::shm::seal(std::os::fd::AsFd::as_fd(&layout)).unwrap();
+        platform::shm::seal(std::os::fd::AsFd::as_fd(&layout)).unwrap();
         deposits.deposit("sha256:m", "l", layout).unwrap();
         let granted = deposits.grant("m", "l").expect("held");
         assert_eq!(granted.metadata().unwrap().len(), 4096);

@@ -1,14 +1,14 @@
 //! Existing Runtime device-executor control seam. Models and codecs remain in Python SDK.
-use cozy_platform::process::{Birth, Exact};
+use platform::process::{Birth, Exact};
 use crate::{
     execution::open_artifact,
     launch_identity::{LaunchIdentity, Seal},
     process::{reap_group, tail, Liveness, Meter, Watch, Watching},
-    protocol,
+    seam,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use cozy_platform::{
+use platform::{
     durable::Mode as _,
     ipc::{LocalListener, LocalStream},
 };
@@ -743,7 +743,7 @@ impl Cancellation {
             identity.readable(&temporary)?;
         }
         fs::rename(temporary, self.root.join("executor.cancel"))?;
-        cozy_platform::durable::sync_dir(&self.root)?;
+        platform::durable::sync_dir(&self.root)?;
         if let Some(watch) = self.watched.lock().unwrap().as_ref() {
             watch.canceled();
         }
@@ -789,7 +789,7 @@ fn zombie_status(birth: &Birth) -> Option<ExitStatus> {
 /// The executor's root and listening socket, and the sealed environment it starts with.
 fn endpoint(config: &ExecutorConfig) -> io::Result<(LocalListener, BTreeMap<String, String>)> {
     fs::create_dir_all(&config.root)?;
-    cozy_platform::durable::set_mode(&config.root, 0o700)?;
+    platform::durable::set_mode(&config.root, 0o700)?;
     if let Some(identity) = config.identity {
         identity.own(&config.root)?;
     }
@@ -797,7 +797,7 @@ fn endpoint(config: &ExecutorConfig) -> io::Result<(LocalListener, BTreeMap<Stri
     // A Unix socket is a file whose mode and owner admit the executor; a Windows pipe's own
     // access list admits only this user.
     #[cfg(unix)]
-    cozy_platform::durable::set_mode(&config.socket, 0o600)?;
+    platform::durable::set_mode(&config.socket, 0o600)?;
     if let Some(identity) = config.identity {
         identity.socket(&config.socket)?;
     }
@@ -813,7 +813,7 @@ pub fn socket_path(root: &Path, name: &str) -> io::Result<PathBuf> {
     if natural.as_os_str().len() > 100 {
         use std::os::unix::fs::MetadataExt;
         let dir = PathBuf::from(format!("/tmp/cozy-{}", crate::launch_identity::euid()));
-        cozy_platform::durable::private_dir(&dir)?;
+        platform::durable::private_dir(&dir)?;
         let metadata = fs::symlink_metadata(&dir)?;
         if !metadata.is_dir() || metadata.uid() != crate::launch_identity::euid() {
             return Err(io::Error::new(
@@ -829,11 +829,11 @@ pub fn socket_path(root: &Path, name: &str) -> io::Result<PathBuf> {
 
 /// The executor's containment scope, when its config names one. No scopes on this OS (macOS,
 /// Windows until its Job Object backend): none, and the executor's tree ends by its group.
-fn scope(config: &ExecutorConfig) -> io::Result<Option<Arc<cozy_platform::contain::Scope>>> {
+fn scope(config: &ExecutorConfig) -> io::Result<Option<Arc<platform::contain::Scope>>> {
     let Some(namespace) = &config.cgroup_namespace else {
         return Ok(None);
     };
-    match cozy_platform::contain::Scope::create(namespace) {
+    match platform::contain::Scope::create(namespace) {
         Ok(scope) => Ok(Some(Arc::new(scope))),
         Err(error) if error.is_unsupported() => Ok(None),
         Err(error) => Err(error.into()),
@@ -841,7 +841,7 @@ fn scope(config: &ExecutorConfig) -> io::Result<Option<Arc<cozy_platform::contai
 }
 
 fn parent_of(pid: u32) -> io::Result<u32> {
-    Ok(cozy_platform::process::parent_of(pid)?)
+    Ok(platform::process::parent_of(pid)?)
 }
 
 /// The executor's end of the channel is gone: a write broke or no reply came.
@@ -918,7 +918,7 @@ impl Codec {
             .as_ref()
             .map(|hold| hold.as_raw_fd());
         let mut command = Command::new(&self.config.python);
-        cozy_platform::process::inherit_nothing(&mut command);
+        platform::process::inherit_nothing(&mut command);
         command
             .args([
                 "-I",
@@ -1252,7 +1252,7 @@ fn encode_native(spool: &Path, reply: &Frame) -> io::Result<Option<Vec<AssetBind
         }
         let name = blob(&frame.handle)?;
         let temporary = spool.join(format!(".codec-{}", uuid::Uuid::new_v4().simple()));
-        let mut file = cozy_platform::durable::open_nofollow(
+        let mut file = platform::durable::open_nofollow(
             &temporary,
             OpenOptions::new().write(true).create_new(true).mode(0o600),
         )?;
@@ -1331,7 +1331,7 @@ impl DeviceExecutor {
             .arg(&config.root)
             .env_clear()
             .envs(&environment)
-            .envs(scope.as_deref().and_then(cozy_platform::contain::Scope::environment))
+            .envs(scope.as_deref().and_then(platform::contain::Scope::environment))
             .envs(crate::launch_identity::interpreter_environment(&config.python)?)
             .stdin(Stdio::null())
             .stdout(File::create(config.root.join("stdout.log"))?)
@@ -1382,7 +1382,7 @@ impl DeviceExecutor {
         let (listener, environment) = endpoint(&config)?;
         let scope = scope(&config)?;
         let mut forked = environment.clone();
-        if let Some((name, token)) = scope.as_deref().and_then(cozy_platform::contain::Scope::environment) {
+        if let Some((name, token)) = scope.as_deref().and_then(platform::contain::Scope::environment) {
             forked.insert(name.into(), token.into());
         }
         let reply = self.command(
@@ -1399,7 +1399,7 @@ impl DeviceExecutor {
                 drop(listener);
                 fs::remove_file(&config.socket)?;
                 // A child the parent made before its channel failed carries the token too.
-                if let Err(error) = scope.as_deref().map_or(Ok(0), cozy_platform::contain::Scope::end) {
+                if let Err(error) = scope.as_deref().map_or(Ok(0), platform::contain::Scope::end) {
                     tracing::warn!("refused fork's scope not ended: {error}");
                 }
                 return Ok(match refused {
@@ -1476,7 +1476,7 @@ impl DeviceExecutor {
                 stderr_tail: tail(&config.root.join("stderr.log")),
             }));
         };
-        let credential = cozy_platform::handles::peer(&stream)?;
+        let credential = platform::handles::peer(&stream)?;
         let expected_uid = config
             .identity
             .map_or_else(crate::launch_identity::euid, |identity| identity.uid);
@@ -1639,7 +1639,7 @@ impl DeviceExecutor {
         }
         write_frame(&mut self.stream, &value)?;
         for fd in fds {
-            cozy_platform::handles::send_fd(&self.stream, fd)?;
+            platform::handles::send_fd(&self.stream, fd)?;
         }
         loop {
             let frame = read_frame(&mut self.stream)?
@@ -1667,7 +1667,7 @@ impl DeviceExecutor {
                 }
                 Some(Event::Request) if frame.kind == Kind::ReadGrant => {
                     let plan = if frame.descriptor {
-                        Some(File::from(cozy_platform::handles::recv_fd(&self.stream)?))
+                        Some(File::from(platform::handles::recv_fd(&self.stream)?))
                     } else {
                         None
                     };
@@ -1681,7 +1681,7 @@ impl DeviceExecutor {
                     answer.descriptors = out.len() as u64;
                     write_frame(&mut self.stream, &answer)?;
                     for file in &out {
-                        cozy_platform::handles::send_fd(&self.stream, file)?;
+                        platform::handles::send_fd(&self.stream, file)?;
                     }
                 }
                 Some(Event::Request) => {
@@ -1700,7 +1700,7 @@ impl DeviceExecutor {
 
     fn answer(&mut self, frame: &Frame, services: &mut impl Services) -> io::Result<()> {
         let descriptor = if frame.descriptor {
-            Some(File::from(cozy_platform::handles::recv_fd(&self.stream)?))
+            Some(File::from(platform::handles::recv_fd(&self.stream)?))
         } else {
             None
         };
@@ -1710,7 +1710,7 @@ impl DeviceExecutor {
         answer.descriptor = descriptor.is_some();
         write_frame(&mut self.stream, &answer)?;
         if let Some(descriptor) = descriptor {
-            cozy_platform::handles::send_fd(&self.stream, &descriptor)?;
+            platform::handles::send_fd(&self.stream, &descriptor)?;
         }
         Ok(())
     }
@@ -1765,7 +1765,7 @@ struct Unready {
     exact: Option<Exact>,
     birth: Option<Birth>,
     /// Its own scope, ended with it if it never becomes an executor.
-    scope: Option<Arc<cozy_platform::contain::Scope>>,
+    scope: Option<Arc<platform::contain::Scope>>,
 }
 impl Unready {
     /// Its exit status, once the process is seen to have exited.
@@ -1906,11 +1906,11 @@ fn write_frame(
 ) -> io::Result<()> {
     let value = serde_json::to_value(value)?;
     scan(&value)?;
-    protocol::write_body(stream, &serde_json::to_vec(&value)?)
+    seam::write_body(stream, &serde_json::to_vec(&value)?)
 }
 /// SDK control framing shared with the CPU source-qualification receiver.
 pub fn read_frame(stream: &mut LocalStream) -> io::Result<Option<Frame>> {
-    protocol::read_body(stream)?.map(|bytes| decode_frame(&bytes)).transpose()
+    seam::read_body(stream)?.map(|bytes| decode_frame(&bytes)).transpose()
 }
 
 /// Every field of a frame is optional, and the Runtime spells an absent one as null as often as
@@ -1950,7 +1950,7 @@ fn refuse_malformed(
     frame: &Frame,
 ) -> io::Result<()> {
     if frame.descriptor {
-        drop(cozy_platform::handles::recv_fd(stream)?);
+        drop(platform::handles::recv_fd(stream)?);
     }
     let answer = Answer::refused(frame.seq, "malformed_request", frame.malformed.clone());
     write_frame(stream, &answer)
@@ -1990,6 +1990,24 @@ fn scan(value: &Value) -> io::Result<()> {
 mod codec_tests {
     use super::*;
 
+    /// No credential crosses the seam, and a spooled result unlike the executor's reference is
+    /// refused.
+    #[test]
+    fn a_credential_never_crosses_and_a_changed_result_is_refused() {
+        let refused = scan(&serde_json::json!({"payload": [{"Credential": "x"}]})).unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied);
+        let spool = tempfile::tempdir().unwrap();
+        let bytes = br#"{"predictions":[0,2,1]}"#;
+        fs::write(spool.path().join(RESULT_DOCUMENT), bytes).unwrap();
+        let digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(bytes));
+        let reply: Frame = serde_json::from_value(serde_json::json!({"ok": true, "quiescent": true,
+            "outcome": {"terminal": "succeeded"}, "result_ref": {"digest": digest, "length": bytes.len()}}))
+        .unwrap();
+        assert_eq!(read_result(spool.path(), &reply).unwrap()["predictions"][2], 1);
+        fs::write(spool.path().join(RESULT_DOCUMENT), b"mutated").unwrap();
+        assert_eq!(read_result(spool.path(), &reply).unwrap_err().kind(), io::ErrorKind::InvalidData);
+    }
+
     /// An invoke reply's adjustment rows are advisory: each malformed one is skipped and the
     /// reply, the run and the other rows stand, in the executor's order, each text bounded.
     #[test]
@@ -2005,7 +2023,7 @@ mod codec_tests {
             "steps",
             row("warn", &long),
         ]});
-        let (mut runtime, mut machine) = cozy_platform::ipc::pair().unwrap();
+        let (mut runtime, mut machine) = platform::ipc::pair().unwrap();
         write_frame(&mut runtime, &reply).unwrap();
         let frame = read_frame(&mut machine).unwrap().unwrap();
         assert!(frame.ok && frame.reply == "invoke");
@@ -2041,7 +2059,7 @@ mod codec_tests {
             "call_request": null, "size_bytes": null, "ok": null, "parts": null, "attribution": null,
         }))
         .unwrap();
-        let (mut runtime, mut machine) = cozy_platform::ipc::pair().unwrap();
+        let (mut runtime, mut machine) = platform::ipc::pair().unwrap();
         runtime.write_all(&(body.len() as u32).to_be_bytes()).unwrap();
         runtime.write_all(&body).unwrap();
         let frame = read_frame(&mut machine).unwrap().unwrap();
@@ -2059,13 +2077,13 @@ mod codec_tests {
         let reply = serde_json::json!({"reply": "load", "ok": true,
             "facts": {"ignored_extra_keys": keys, "filled_bytes": 7}});
         assert!(serde_json::to_vec(&reply).unwrap().len() > 512 << 10);
-        let (mut runtime, mut machine) = cozy_platform::ipc::pair().unwrap();
+        let (mut runtime, mut machine) = platform::ipc::pair().unwrap();
         let writer = std::thread::spawn(move || write_frame(&mut runtime, &reply).map(|()| runtime));
         let frame = read_frame(&mut machine).unwrap().unwrap();
         let mut runtime = writer.join().unwrap().unwrap();
         assert!(frame.ok && frame.reply == "load");
         assert_eq!(frame.facts.unwrap().filled_bytes, Some(7));
-        runtime.write_all(&(protocol::MAX_FRAME as u32 + 1).to_be_bytes()).unwrap();
+        runtime.write_all(&(seam::MAX_FRAME as u32 + 1).to_be_bytes()).unwrap();
         let refused = read_frame(&mut machine).unwrap_err();
         assert_eq!(refused.kind(), io::ErrorKind::InvalidData, "{refused}");
     }
@@ -2075,11 +2093,11 @@ mod codec_tests {
     /// progress frame is dropped; the next frame reads as before.
     #[test]
     fn a_request_that_does_not_decode_is_refused_alone() {
-        let (mut runtime, mut machine) = cozy_platform::ipc::pair().unwrap();
+        let (mut runtime, mut machine) = platform::ipc::pair().unwrap();
         let malformed = serde_json::json!({"event": "request", "kind": "read_grant", "seq": 9,
             "length": -23068672, "descriptor": true});
         write_frame(&mut runtime, &malformed).unwrap();
-        cozy_platform::handles::send_fd(&runtime, &File::open(std::env::current_exe().unwrap()).unwrap()).unwrap();
+        platform::handles::send_fd(&runtime, &File::open(std::env::current_exe().unwrap()).unwrap()).unwrap();
         let frame = read_frame(&mut machine).unwrap().unwrap();
         assert_eq!((frame.event, frame.seq), (Some(Event::Request), 9));
         assert!(frame.malformed.contains("expected u64"), "{}", frame.malformed);

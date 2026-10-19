@@ -237,15 +237,15 @@ class Gpu:
         host_fd: int | None = None,
         files: Sequence[tuple[str, int, int]] | None = None,
     ) -> WeightSet:
-        """`regions`: `tensorfs.regions(ck, max_bytes, boundaries)`, every part of the
-        components they name. `host_fd`: a sealed host layout of exactly these regions, filled
-        by the owner (TensorD) with the same layout function (`seal()` here, Rust
-        `varena::memory::open_checkpoint` + `host::open_sealed`). Its digest is checked; a
-        layout of other regions is refused. Copies come from it, and a region its owner left a
-        hole comes from the chunk files. Without `host_fd`, every copy comes from the chunk files
-        through the page cache. `files`: the chunk files a grant hands over, `(sha256, length,
-        fd)` each, the only ones read; without it, the checkpoint's own paths. The core
-        duplicates every descriptor it keeps and closes nothing the caller passed."""
+        """`regions`: `tensorfs.regions(ck, max_bytes, boundaries, only)`; the set is the parts
+        they name and nothing else of the checkpoint. `host_fd`: a sealed host layout of exactly
+        these regions, filled by the owner (TensorD) with the same layout function (`seal()`
+        here, Rust `varena::memory::open_checkpoint` + `host::open_sealed`). Its digest is
+        checked; a layout of other regions is refused. Copies come from it, and a region its
+        owner left a hole comes from the chunk files. Without `host_fd`, every copy comes from
+        the chunk files through the page cache. `files`: the chunk files a grant hands over,
+        `(sha256, length, fd)` each, the only ones read; without it, the store's chunk files.
+        The core duplicates every descriptor it keeps and closes nothing the caller passed."""
     def trim(self) -> int:
         """Idle chunks and unneeded slots go back to the driver. Returns the bytes released."""
     def give(self, nbytes: int) -> list[tuple[str, int]]:

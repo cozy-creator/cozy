@@ -28,7 +28,7 @@ use std::{
     time::Duration,
 };
 
-use cozy_proto::{
+use protocol::{
     calcifer::{Event, On, Progress, Reason, Run, StagedInput, SubmitRun, Submitted},
     config::Origin,
     ids::{Digest, RunId},
@@ -356,7 +356,7 @@ impl Calcifer {
     }
 
     /// Adds a warning to an unsettled run.
-    pub fn warn(&self, id: &RunId, warning: &cozy_proto::calcifer::Warning) -> Result<(), Error> {
+    pub fn warn(&self, id: &RunId, warning: &protocol::calcifer::Warning) -> Result<(), Error> {
         let events = self.store.warn(id.as_str(), warning)?;
         self.publish(id, events);
         Ok(())
@@ -504,7 +504,7 @@ impl Calcifer {
                     continue;
                 }
             };
-            if machine.state == cozy_proto::calcifer::MachineState::Ended {
+            if machine.state == protocol::calcifer::MachineState::Ended {
                 let reason = machine.reason.unwrap_or_else(|| "it ended".into());
                 if let Err(e) = self.machine_ended(&name, &reason) {
                     warn!(run = %id, "{e}");
@@ -731,7 +731,7 @@ impl Calcifer {
             match frame.event {
                 Frame::Log(line) => batch.logs.push((frame.at_ms, line.level, line.text)),
                 Frame::Call(call) => {
-                    let call = cozy_proto::calcifer::Call {
+                    let call = protocol::calcifer::Call {
                         run: call.run,
                         index: call.index,
                         function: call.function,

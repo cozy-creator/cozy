@@ -45,7 +45,7 @@ it holds, making room in other executors through the GPU's ledger (design memory
 
 ## Wire
 
-- 4-byte big-endian length + JSON, any size. `protocol::MAX_FRAME` (256 MiB, as Runtime's
+- 4-byte big-endian length + JSON, any size. `seam::MAX_FRAME` (256 MiB, as Runtime's
   `seam.MAX_FRAME`) refuses only a corrupt or hostile prefix. Bulk data goes through the spool.
 - Any outgoing object key named `token`, `credential`, `authorization`, `secret` or `jwt` is
   refused. Credentials cannot cross the seam.

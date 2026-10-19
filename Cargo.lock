@@ -352,13 +352,13 @@ version = "0.10.2"
 dependencies = [
  "axum",
  "base64 0.22.1",
- "cozy-platform",
- "cozy-proto",
  "ed25519-dalek",
  "futures-util",
  "getrandom 0.3.4",
  "hex",
  "hub-client",
+ "platform",
+ "protocol",
  "reqwest",
  "rusqlite",
  "serde",
@@ -499,6 +499,50 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
 
 [[package]]
+name = "cli"
+version = "0.10.2"
+dependencies = [
+ "anstream",
+ "anstyle",
+ "base64 0.22.1",
+ "clap",
+ "clap_complete",
+ "comfy-table",
+ "crossterm",
+ "ed25519-dalek",
+ "flate2",
+ "futures-util",
+ "getrandom 0.3.4",
+ "hex",
+ "hub-client",
+ "indicatif",
+ "infer",
+ "jiff",
+ "platform",
+ "progenitor-client",
+ "protocol",
+ "ratatui",
+ "reqwest",
+ "self-replace",
+ "semver",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2",
+ "sigstore-verify",
+ "supports-hyperlinks",
+ "tar",
+ "tempfile",
+ "tensorfs-core",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "toml_edit",
+ "url",
+ "zip 9.0.4",
+]
+
+[[package]]
 name = "cmake"
 version = "0.1.58"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -609,13 +653,13 @@ version = "0.10.2"
 dependencies = [
  "base64 0.22.1",
  "calcifer",
- "cozy-cli",
- "cozy-platform",
- "cozy-proto",
+ "cli",
  "ed25519-dalek",
  "hex",
  "hub-client",
+ "platform",
  "portable-pty",
+ "protocol",
  "rcgen",
  "reqwest",
  "rustls",
@@ -627,96 +671,6 @@ dependencies = [
  "tokio",
  "url",
  "vt100",
-]
-
-[[package]]
-name = "cozy-cli"
-version = "0.10.2"
-dependencies = [
- "anstream",
- "anstyle",
- "base64 0.22.1",
- "clap",
- "clap_complete",
- "comfy-table",
- "cozy-platform",
- "cozy-proto",
- "crossterm",
- "ed25519-dalek",
- "flate2",
- "futures-util",
- "getrandom 0.3.4",
- "hex",
- "hub-client",
- "indicatif",
- "infer",
- "jiff",
- "progenitor-client",
- "ratatui",
- "reqwest",
- "self-replace",
- "semver",
- "serde",
- "serde_json",
- "serde_yaml",
- "sha2",
- "sigstore-verify",
- "supports-hyperlinks",
- "tar",
- "tempfile",
- "tensorfs-core",
- "tokio",
- "tokio-util",
- "toml",
- "toml_edit",
- "url",
- "zip 9.0.4",
-]
-
-[[package]]
-name = "cozy-platform"
-version = "0.10.2"
-dependencies = [
- "getrandom 0.3.4",
- "hex",
- "libc",
- "libloading 0.9.0",
- "nvml-wrapper",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror 2.0.21",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "cozy-proto"
-version = "0.10.2"
-dependencies = [
- "axum",
- "base64 0.22.1",
- "bytes",
- "cozy-platform",
- "ed25519-dalek",
- "eventsource-stream",
- "figment",
- "futures-util",
- "hex",
- "hyper-util",
- "rcgen",
- "reqwest",
- "rustls",
- "serde",
- "serde_ignored",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror 2.0.21",
- "tokio",
- "tokio-rustls",
- "url",
- "utoipa",
 ]
 
 [[package]]
@@ -2486,6 +2440,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
+name = "platform"
+version = "0.10.2"
+dependencies = [
+ "getrandom 0.3.4",
+ "hex",
+ "libc",
+ "libloading 0.9.0",
+ "nvml-wrapper",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.21",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "png"
 version = "0.17.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2634,6 +2605,35 @@ dependencies = [
  "thiserror 2.0.21",
  "typify",
  "unicode-ident",
+]
+
+[[package]]
+name = "protocol"
+version = "0.10.2"
+dependencies = [
+ "axum",
+ "base64 0.22.1",
+ "bytes",
+ "ed25519-dalek",
+ "eventsource-stream",
+ "figment",
+ "futures-util",
+ "hex",
+ "hyper-util",
+ "platform",
+ "rcgen",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_ignored",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-rustls",
+ "url",
+ "utoipa",
 ]
 
 [[package]]
@@ -3936,8 +3936,6 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "clap",
- "cozy-platform",
- "cozy-proto",
  "ed25519-dalek",
  "flate2",
  "fs2",
@@ -3950,7 +3948,9 @@ dependencies = [
  "image-webp",
  "libc",
  "nix 0.31.3",
+ "platform",
  "png",
+ "protocol",
  "rcgen",
  "reqwest",
  "rusqlite",
@@ -3989,7 +3989,6 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "bytes",
- "cozy-platform",
  "fuser",
  "futures",
  "http-body-util",
@@ -3997,6 +3996,7 @@ dependencies = [
  "hyper-util",
  "libc",
  "minicbor",
+ "platform",
  "rcgen",
  "rusqlite",
  "rustix",
@@ -4018,7 +4018,7 @@ dependencies = [
 name = "tensorfs-py"
 version = "0.11.0"
 dependencies = [
- "cozy-platform",
+ "platform",
  "pyo3",
  "tensorfs-core",
  "tracing",
@@ -4537,9 +4537,9 @@ dependencies = [
 name = "varena"
 version = "0.11.0"
 dependencies = [
- "cozy-platform",
  "libc",
  "libloading 0.9.0",
+ "platform",
  "tensorfs-core",
  "thiserror 2.0.21",
  "tracing",

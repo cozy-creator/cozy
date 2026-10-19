@@ -128,7 +128,7 @@ pub(crate) fn call_interfaces(held: &HeldGeneration, interface: &Path) -> Vec<Ca
 #[derive(Default)]
 struct CallTable {
     /// The parent's nudge socket (`child_events`): a byte when one of its calls may have moved.
-    watcher: Option<cozy_platform::ipc::LocalStream>,
+    watcher: Option<platform::ipc::LocalStream>,
     by_index: HashMap<u64, ChildCall>,
     /// Child files granted to the parent, by digest: later children may be handed them.
     received: HashMap<String, Received>,
@@ -577,12 +577,12 @@ impl Calls {
                 Ok(Answer::ok(frame.seq))
             }
             Kind::ChildEvents => {
-                let (ours, theirs) = cozy_platform::ipc::pair()?;
+                let (ours, theirs) = platform::ipc::pair()?;
                 ours.set_nonblocking(true)?;
                 parent.calls.lock().unwrap().watcher = Some(ours);
                 return Ok((
                     Answer::ok(frame.seq),
-                    Some(File::from(cozy_platform::handles::Owned::from(theirs))),
+                    Some(File::from(platform::handles::Owned::from(theirs))),
                 ));
             }
             // A hint about a future call: TensorD may prepare its weights and ask Runtime

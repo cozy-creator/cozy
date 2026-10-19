@@ -9,7 +9,7 @@
 //! outcome.
 use super::{auth::VerifiedActor, backend::MachineBackend, v1, MachineIdentity};
 use crate::machine::update::{Choice, Request, Status as Update, Updates, BINARY};
-use cozy_proto::error::Error;
+use protocol::error::Error;
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use tokio_stream::{wrappers::ReceiverStream, Stream};
 

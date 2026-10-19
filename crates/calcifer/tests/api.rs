@@ -15,11 +15,11 @@ use calcifer::{
     store::{MachineRow, NewRun, Store},
 };
 use common::{SilentHub, Tensord};
-use cozy_platform::{
+use platform::{
     lock::{Kind as LockKind, LockFile},
     paths::Home,
 };
-use cozy_proto::{
+use protocol::{
     calcifer::{Down, Event, Holder, Play, Run, RunList, Status, Submitted},
     capability,
     config::{Config, Loaded},
@@ -35,7 +35,7 @@ const PATIENCE: Duration = Duration::from_secs(120);
 
 /// A serving Calcifer on `home`, and a client of it.
 struct Calcifer {
-    task: JoinHandle<Result<Stopped, cozy_proto::error::Error>>,
+    task: JoinHandle<Result<Stopped, protocol::error::Error>>,
     holder: Holder,
     client: Client,
 }
@@ -226,7 +226,7 @@ fn held(on: &str, hub: &SilentHub) -> serde_json::Value {
     submission(on, &common::warm_spec(&hub.origin(), vec![]))
 }
 
-fn submission(on: &str, spec: &cozy_proto::machine::RunSpec) -> serde_json::Value {
+fn submission(on: &str, spec: &protocol::machine::RunSpec) -> serde_json::Value {
     json!({
         "on": on,
         "hub": "https://tensorhub.com",
@@ -590,7 +590,7 @@ async fn calcifer_answers_within_a_second_on_a_big_store_while_a_commit_is_stuck
     let store = Store::open(&db).unwrap();
     let new = NewRun {
         id: RunId::mint([1; 12]),
-        kind: cozy_proto::calcifer::Kind::Warm,
+        kind: protocol::calcifer::Kind::Warm,
         target: "cozy-test/held".into(),
         hub: None,
         machine: None,

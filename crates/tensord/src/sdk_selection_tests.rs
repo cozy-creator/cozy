@@ -54,8 +54,8 @@ fn an_activated_sdk_selection_survives_a_same_filename_link_switch() {
         .find(|p| p.ends_with(RUNTIME))
         .unwrap();
     assert_eq!(fs::read(after_runtime).unwrap(), b"second Runtime build");
-    assert_eq!(before.find_links, Some(cozy_platform::durable::canonical(&first).unwrap()));
-    assert_eq!(after.find_links, Some(cozy_platform::durable::canonical(&second).unwrap()));
+    assert_eq!(before.find_links, Some(platform::durable::canonical(&first).unwrap()));
+    assert_eq!(after.find_links, Some(platform::durable::canonical(&second).unwrap()));
     let repeated = PackageSdk::selected(&paths.sdk(), &root, "uv".into());
     assert_eq!(repeated.requirements, after.requirements);
     assert_eq!(repeated.find_links, after.find_links);
@@ -75,7 +75,7 @@ fn image_sdk_selection_preserves_baked_and_absent_pair_behavior() {
     pair(&baked, b"baked Runtime");
     let paths = Paths::new(&engine, &root);
     let selected = PackageSdk::selected(&paths.sdk(), &root, "uv".into());
-    assert_eq!(selected.find_links, Some(cozy_platform::durable::canonical(&baked).unwrap()));
+    assert_eq!(selected.find_links, Some(platform::durable::canonical(&baked).unwrap()));
     assert_eq!(selected.requirements.len(), 2);
     fs::remove_file(baked.join(TENSORFS)).unwrap();
     let incomplete = PackageSdk::selected(&paths.sdk(), &root, "uv".into());

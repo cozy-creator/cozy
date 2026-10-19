@@ -14,7 +14,7 @@ use std::{
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use cozy_proto::error::Error;
+use protocol::error::Error;
 
 /// A rental's idle window, `RentalIdleTimeoutSeconds` in the CLI.
 pub const IDLE_GRACE_MS: i64 = 900_000;

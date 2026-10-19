@@ -6,7 +6,7 @@ use super::Home;
 
 const CARDS: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../cozy-cli/tests/fixtures/cards"
+    "/../cli/tests/fixtures/cards"
 );
 
 pub struct SilentHub {

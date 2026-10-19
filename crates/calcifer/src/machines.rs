@@ -24,8 +24,8 @@ use axum::{
     },
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use cozy_platform::{durable, paths::Home};
-use cozy_proto::{
+use platform::{durable, paths::Home};
+use protocol::{
     calcifer::{
         self as wire, Ended, Event, Keepalive, Machine, MachineKind, MachineList, MachineLog,
         MachineState, MachineStatus, MachinesEvent, NewMachine,

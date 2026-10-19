@@ -4,7 +4,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use ed25519_dalek::VerifyingKey;
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
-use cozy_platform::durable::Mode;
+use platform::durable::Mode;
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, BufReader, Read, Write},
@@ -68,7 +68,7 @@ impl MachineIdentity {
         config.validate()?;
         config.validate()?;
         private_directory(&config.identity_directory)?;
-        let lock = cozy_platform::durable::open_nofollow(&config.identity_directory.join("identity.lock"), OpenOptions::new().create(true).truncate(false).read(true).write(true).mode(0o600)).map_err(std::io::Error::from)?;
+        let lock = platform::durable::open_nofollow(&config.identity_directory.join("identity.lock"), OpenOptions::new().create(true).truncate(false).read(true).write(true).mode(0o600)).map_err(std::io::Error::from)?;
         check_file(&lock, true)?;
         lock.lock_exclusive()?;
         let path = config.identity_directory.join("identity.json");
@@ -99,7 +99,7 @@ impl MachineIdentity {
             }
             write_private(&pending, &retained)?;
             fs::rename(&pending, &path)?;
-            cozy_platform::durable::sync_dir(&config.identity_directory)?;
+            platform::durable::sync_dir(&config.identity_directory)?;
             retained
         };
         if retained.worker_id != config.worker_id {
@@ -215,7 +215,7 @@ impl MachineIdentity {
 /// and records accepted before a restart remain addressable. Format as the Hub requires.
 fn retained_boot_id(directory: &Path) -> io::Result<String> {
     let path = directory.join("boot-id");
-    match cozy_platform::durable::open_nofollow(&path, OpenOptions::new().read(true)).map_err(std::io::Error::from)
+    match platform::durable::open_nofollow(&path, OpenOptions::new().read(true)).map_err(std::io::Error::from)
     {
         Ok(file) => {
             check_file(&file, true)?;
@@ -241,9 +241,9 @@ fn private_directory(path: &Path) -> io::Result<()> {
     match fs::symlink_metadata(path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             fs::create_dir_all(path)?;
-            cozy_platform::durable::set_mode(path, 0o700).map_err(std::io::Error::from)?;
+            platform::durable::set_mode(path, 0o700).map_err(std::io::Error::from)?;
             if let Some(parent) = path.parent() {
-                cozy_platform::durable::sync_dir(parent)?;
+                platform::durable::sync_dir(parent)?;
             }
         }
         Err(error) => return Err(error),
@@ -266,12 +266,12 @@ fn check_file(file: &File, private: bool) -> io::Result<()> {
     Ok(())
 }
 fn read_json<T: serde::de::DeserializeOwned>(path: &Path, private: bool) -> io::Result<T> {
-    let file = cozy_platform::durable::open_nofollow(path, OpenOptions::new().read(true)).map_err(std::io::Error::from)?;
+    let file = platform::durable::open_nofollow(path, OpenOptions::new().read(true)).map_err(std::io::Error::from)?;
     check_file(&file, private)?;
     serde_json::from_reader(file.take(64 << 10)).map_err(other)
 }
 fn write_private<T: Serialize>(path: &Path, record: &T) -> io::Result<()> {
-    let mut file = cozy_platform::durable::open_nofollow(path, OpenOptions::new().create(true).truncate(true).write(true).mode(0o600)).map_err(std::io::Error::from)?;
+    let mut file = platform::durable::open_nofollow(path, OpenOptions::new().create(true).truncate(true).write(true).mode(0o600)).map_err(std::io::Error::from)?;
     check_file(&file, true)?;
     file.write_all(&serde_json::to_vec(record).map_err(other)?)?;
     file.sync_all()

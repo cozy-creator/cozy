@@ -1,7 +1,7 @@
 //! CPU birth/journal proof only: this does not qualify a GPU or ordinary CLI inference.
 //! Its executors are Unix processes (a shell, `setsid`, signals).
 #![cfg(unix)]
-use cozy_platform::process::Birth;
+use platform::process::Birth;
 use tensord::{
     journal::{
         Installation, Invocation, Journal, Outcome, Preparation, ResultRecord,
@@ -126,7 +126,7 @@ fn complete_device(journal: &mut Journal, n: usize, generation: &str, birth: Bir
 #[cfg(target_os = "linux")]
 #[test]
 fn restart_ends_processes_left_in_earlier_executor_scopes() {
-    use cozy_platform::contain::{namespace, Scope};
+    use platform::contain::{namespace, Scope};
     use std::io::{Read, Write};
     let root = std::env::temp_dir().join(format!("machine-scope-sweep-{}", uuid::Uuid::new_v4()));
     let state = root.join("state");
@@ -147,7 +147,7 @@ fn restart_ends_processes_left_in_earlier_executor_scopes() {
     let mut daemon = String::new();
     leader.stdout.take().unwrap().read_to_string(&mut daemon).unwrap();
     assert!(leader.wait().unwrap().success());
-    let daemon = cozy_platform::process::Birth::of(daemon.trim().parse().unwrap()).unwrap();
+    let daemon = platform::process::Birth::of(daemon.trim().parse().unwrap()).unwrap();
     assert_eq!(scope.processes().unwrap(), 1);
     // That machine is gone: nothing in this process claims the scope any more.
     let cgroup = scope.cgroup_relative().map(|relative| format!("/sys/fs/cgroup{relative}"));

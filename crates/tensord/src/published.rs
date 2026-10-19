@@ -86,7 +86,7 @@ impl PackageSdk {
         // An activation replaces sdk/current, not the immutable candidate directory. Freeze
         // that selection once: both cache identity and the installer's actual wheel inputs
         // must name the same build even when filenames/version labels repeat.
-        let wheels = cozy_platform::durable::canonical(wheels).unwrap_or_else(|_| wheels.to_path_buf());
+        let wheels = platform::durable::canonical(wheels).unwrap_or_else(|_| wheels.to_path_buf());
         let found: Vec<PathBuf> = fs::read_dir(&wheels)
             .into_iter()
             .flatten()
@@ -970,7 +970,7 @@ impl Publisher {
         }
         let wheels = self.fetch_hub(&files, source, &dir, job)?;
         let env = dir.join("env");
-        let interpreter = cozy_platform::paths::venv_python(&env);
+        let interpreter = platform::paths::venv_python(&env);
         let py = interpreter.to_string_lossy().to_string();
         next();
         self.uv(&["venv", "--no-project", "--no-config", "--python", &card.python, &env.to_string_lossy()], job.stop.as_ref())?;
@@ -1049,8 +1049,8 @@ impl Publisher {
             .and_then(|_| file.sync_all())
             .map_err(io_failure)?;
         fs::rename(&staged, dir.join("generation.json")).map_err(io_failure)?;
-        cozy_platform::durable::sync_dir(&dir)
-            .and_then(|()| cozy_platform::durable::sync_dir(generations))
+        platform::durable::sync_dir(&dir)
+            .and_then(|()| platform::durable::sync_dir(generations))
             .map_err(|error| io_failure(error.into()))
     }
 
@@ -1218,9 +1218,9 @@ impl Publisher {
         crate::machine::client::ensure_uv(&self.sdk.uv).map_err(|e| ("uv_unavailable", e.to_string()))?;
         let mut command = Command::new(&self.sdk.uv);
         command.args(args).env_clear().envs(env.iter().copied()).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
-        cozy_platform::process::own_group(&mut command);
+        platform::process::own_group(&mut command);
         for name in ["PATH", "SSL_CERT_FILE", "SSL_CERT_DIR", "LANG"] {
-            if let Some(value) = cozy_proto::config::environment().get(name) {
+            if let Some(value) = protocol::config::environment().get(name) {
                 command.env(name, value);
             }
         }
@@ -1886,7 +1886,7 @@ fn pair_bound(line: &str) -> bool {
 
 /// The Runtime and TensorFS an environment holds, by their installed distribution names.
 fn installed_sdk(env: &Path) -> Vec<Value> {
-    let mut found: Vec<Value> = cozy_platform::paths::venv_site_packages(env)
+    let mut found: Vec<Value> = platform::paths::venv_site_packages(env)
         .into_iter()
         .flat_map(|site| fs::read_dir(site).into_iter().flatten().flatten())
         .filter_map(|entry| {
@@ -2188,7 +2188,7 @@ pub(crate) mod tests {
         assert_eq!(sha256::hex_digest(&fs::read(&local).unwrap()), good);
 
         let env = dir.join("env");
-        let python = cozy_platform::paths::venv_python(&env);
+        let python = platform::paths::venv_python(&env);
         for args in [
             vec!["venv", "-q", "--python", "3.12", env.to_str().unwrap()],
             vec!["pip", "install", "-q", "--offline", "--no-config", "--python", python.to_str().unwrap(), "--no-deps", local.to_str().unwrap()],
@@ -2635,16 +2635,16 @@ pub(crate) mod tests {
     /// One channel request answered (frames: a kind byte, a u32 length, JSON); Null once the
     /// channel is closed.
     /// The channel a file carries, as the executor adopts it.
-    fn channel(file: std::fs::File) -> cozy_platform::ipc::LocalStream {
+    fn channel(file: std::fs::File) -> platform::ipc::LocalStream {
         #[cfg(unix)]
         let raw = std::os::fd::IntoRawFd::into_raw_fd(file) as i64;
         #[cfg(windows)]
         let raw = std::os::windows::io::IntoRawHandle::into_raw_handle(file) as i64;
         // SAFETY: a connected stream this test owns and hands over.
-        unsafe { cozy_platform::ipc::adopt(raw) }
+        unsafe { platform::ipc::adopt(raw) }
     }
 
-    fn ask(channel: &mut cozy_platform::ipc::LocalStream, request: Value) -> Value {
+    fn ask(channel: &mut platform::ipc::LocalStream, request: Value) -> Value {
         use std::io::{Read, Write};
         let body = serde_json::to_vec(&request).unwrap();
         let frame = [&[0u8][..], &(body.len() as u32).to_be_bytes(), &body].concat();

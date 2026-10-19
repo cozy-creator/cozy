@@ -19,7 +19,7 @@ use std::{
     path::{Path, PathBuf},
     time::{Duration, SystemTime},
 };
-use cozy_platform::durable::{self, FileId};
+use platform::durable::{self, FileId};
 use crate::storage::{self, Store};
 
 pub use crate::storage::Disk;

@@ -1,6 +1,6 @@
 //! The machine lifetime: its boot id and TLS leaf, persisted with the root so a restarted
 //! service is the same machine. Files and formats are the Go agent's (`layout.go`).
-use cozy_platform::{
+use platform::{
     lock::{Kind, LockFile},
     process::{Birth, State},
 };
@@ -11,7 +11,7 @@ use std::{
     io::{self, Write},
     path::Path,
 };
-use cozy_platform::durable::Mode;
+use platform::durable::Mode;
 
 /// The one DNS name of every machine leaf; clients pin the leaf itself.
 pub const SERVER_NAME: &str = "cozy-worker";
@@ -150,13 +150,13 @@ pub fn write_atomic(target: &Path, data: &[u8], mode: u32) -> io::Result<()> {
             .mode(0o600)
             .open(&temp)?;
         file.write_all(data)?;
-        cozy_platform::durable::set_file_mode(&file, mode)?;
+        platform::durable::set_file_mode(&file, mode)?;
         file.sync_all()?;
         // Closed before it is named: an executable written here runs at once, and an open
         // writer (this one, or a fork's copy of it) makes exec fail with ETXTBSY.
         drop(file);
         fs::rename(&temp, target)?;
-        Ok(cozy_platform::durable::sync_dir(dir)?)
+        Ok(platform::durable::sync_dir(dir)?)
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temp);
@@ -175,7 +175,7 @@ mod tests {
     use std::io::Read;
 
     /// A holder just killed is waited out, never refused; a live one is refused. Its holder
-    /// writes a Linux birth (/proc); cozy-platform's seams prove the lock on every OS.
+    /// writes a Linux birth (/proc); platform's seams prove the lock on every OS.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_killed_holder_is_waited_out_and_a_live_one_refused() {

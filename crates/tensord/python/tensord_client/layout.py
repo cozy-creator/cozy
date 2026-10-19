@@ -1,4 +1,4 @@
-"""A venv's layout on this OS, as cozy_platform::paths spells it: `bin/python` and
+"""A venv's layout on this OS, as platform::paths spells it: `bin/python` and
 `lib/python3.X/site-packages`, or `Scripts\\python.exe` and `Lib\\site-packages` on Windows."""
 
 from __future__ import annotations

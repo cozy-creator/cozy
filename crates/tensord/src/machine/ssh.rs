@@ -41,7 +41,7 @@ fn launch(public_key: &str, keygen: PathBuf, sshd: PathBuf) -> io::Result<()> {
         ));
     }
     fs::create_dir_all(KEY_DIR)?;
-    cozy_platform::durable::set_mode(std::path::Path::new(KEY_DIR), 0o700).map_err(std::io::Error::from)?;
+    platform::durable::set_mode(std::path::Path::new(KEY_DIR), 0o700).map_err(std::io::Error::from)?;
     fs::OpenOptions::new()
         .write(true)
         .create(true)

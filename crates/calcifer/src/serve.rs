@@ -10,14 +10,14 @@ use std::{
     time::Instant,
 };
 
-use cozy_platform::{
+use platform::{
     durable,
     lock::{Kind as LockKind, LockFile},
     paths::Home,
     process,
     service::Services,
 };
-use cozy_proto::{
+use protocol::{
     calcifer::{Holder, REFUSED},
     config::{self, Flags, Loaded},
     error::{Envelope, Error, Kind},

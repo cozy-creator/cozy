@@ -55,7 +55,7 @@ from diffusers.loaders import single_file_utils
 
 PINS = {"diffusers": "0.40.0", "transformers": "5.16.1"}
 ROOT = Path(__file__).resolve().parents[1]
-OUT = ROOT / "crates" / "tensorfs-core" / "converters"
+OUT = ROOT.parent / "tensorfs-core" / "converters"
 VECTORS = ROOT / "vectors"
 HF = "https://huggingface.co"
 H3_SCRIPT = (

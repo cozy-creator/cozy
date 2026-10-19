@@ -7,7 +7,7 @@ use axum::{
     Json,
     extract::{Path, Query, State, rejection::QueryRejection},
 };
-use cozy_proto::{
+use protocol::{
     calcifer::Play,
     capability::{self, Grant},
     error::{Error, Kind},

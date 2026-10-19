@@ -194,9 +194,9 @@ fn id(path: &Path) -> (u64, u64) {
 
 /// The file the machine on `root` runs: its lock holder's executable.
 fn running(root: &Path) -> (u64, u64) {
-    let lock = cozy_platform::lock::LockFile::new(root.join("var/lib/cozy/machine/agent.lock"));
+    let lock = platform::lock::LockFile::new(root.join("var/lib/cozy/machine/agent.lock"));
     let record = lock.holder().unwrap().expect("a machine holds its root");
-    let birth: cozy_platform::process::Birth = serde_json::from_slice(&record).unwrap();
+    let birth: platform::process::Birth = serde_json::from_slice(&record).unwrap();
     id(Path::new(&format!("/proc/{}/exe", birth.pid)))
 }
 
