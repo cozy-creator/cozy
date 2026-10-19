@@ -657,7 +657,14 @@ fn runtime_checkpoint_uploads_local_alias_on_disk() {
             .unwrap(),
         (0u8..=255).collect::<Vec<_>>()
     );
-    let named = store.resolve("local/output", None).unwrap();
+    let repo = store.get_ref("local/output").unwrap().unwrap();
+    assert!(
+        repo.checkpoints.contains(&tree),
+        "local repository lost its checkpoint"
+    );
+    let named = store
+        .resolve(&tree.id(), (!variant.is_empty()).then_some(variant))
+        .unwrap();
     assert_eq!(named.tree, Some(tree));
     assert_eq!(named.header, header);
     assert!(
