@@ -484,6 +484,7 @@ impl Store {
         };
         self.cache_reap_fences()?;
         if due(read(&stamp)?) {
+            self.sweep_writers(TTL)?;
             let cutoff = now.saturating_sub(TTL.as_secs());
             for (id, pin) in self.pins()? {
                 if id.starts_with("cache-") && pin.last_use <= cutoff {
@@ -868,6 +869,102 @@ mod tests {
             .unwrap()
             .is_some());
         assert!(store.path(&object).unwrap().exists());
+    }
+
+    #[test]
+    fn periodic_maintenance_reaps_abandoned_work_but_keeps_active_and_recent_resume() {
+        use crate::writer::{Data, Source, Writer};
+        use std::time::SystemTime;
+
+        fn write(writer: &mut Writer) {
+            writer
+                .get("model")
+                .put(
+                    "weight",
+                    &Dtype::U8,
+                    &[32768],
+                    Data::Plain(Source::Read(&mut &vec![11; 32768][..])),
+                )
+                .unwrap();
+        }
+        fn age(path: &Path, old: SystemTime) {
+            if path.is_dir() {
+                for entry in fs::read_dir(path).unwrap() {
+                    age(&entry.unwrap().path(), old);
+                }
+            }
+            platform::durable::set_times(path, fs::FileTimes::new().set_modified(old)).unwrap();
+        }
+
+        let scratch = Scratch::new();
+        let store = &scratch.0;
+        let writers = store.root.join("tmp/writers");
+        let mut dead = store.writer(None, Some("dead-aged")).unwrap();
+        write(&mut dead);
+        drop(dead);
+        let mut live = store.writer(None, Some("active-aged")).unwrap();
+        write(&mut live);
+        let mut recent = store.writer(None, Some("recent-resume")).unwrap();
+        write(&mut recent);
+        drop(recent);
+        let mut anonymous = store.writer(None, None).unwrap();
+        write(&mut anonymous);
+        drop(anonymous);
+        let anonymous = fs::read_dir(&writers)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".anon-")
+            })
+            .unwrap();
+        let imports = store.root.join("tmp/import");
+        let abandoned_import = imports.join("abandoned");
+        let active_import = imports.join("active");
+        for dir in [&abandoned_import, &active_import] {
+            fs::create_dir_all(dir).unwrap();
+            fs::write(dir.join("source"), vec![12; 32768]).unwrap();
+        }
+        File::create(imports.join("abandoned.lock")).unwrap();
+        let import_fence = File::create(imports.join("active.lock")).unwrap();
+        import_fence.lock().unwrap();
+        let old = SystemTime::now() - TTL - Duration::from_secs(60);
+        for path in [
+            writers.join("dead-aged"),
+            writers.join("active-aged"),
+            anonymous.clone(),
+            abandoned_import.clone(),
+            active_import.clone(),
+        ] {
+            age(&path, old);
+            assert!(fs::metadata(&path).unwrap().modified().unwrap() < SystemTime::now() - TTL);
+        }
+        assert!(writers.join("recent-resume").is_dir());
+        store
+            .cache_write(
+                &store.cache_state().join("sweep.json"),
+                &Used { last_use: 0 },
+            )
+            .unwrap();
+        assert!(store
+            .cache_maintain_with(0, now_secs(), &|| Ok(ample()))
+            .unwrap());
+        assert!(!writers.join("dead-aged").exists());
+        assert!(!anonymous.exists());
+        assert!(!abandoned_import.exists());
+        assert!(writers.join("active-aged").exists());
+        assert!(active_import.join("source").exists());
+        assert!(live.has("model", "weight"));
+        let recent = store.writer(None, Some("recent-resume")).unwrap();
+        assert!(
+            recent.has("model", "weight"),
+            "the recent keyed journal still resumes"
+        );
+        drop(recent);
+        drop(live);
+        drop(import_fence);
     }
 
     #[test]
