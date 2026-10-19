@@ -31,8 +31,9 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{watch, Notify, Semaphore};
 
-use super::net::Client;
+use super::net::{same_origin, Client};
 use super::origin::{Location, Origin};
+use super::token::TokenProvider;
 use super::volume::{blocking, VolumeOrigin, Wrote, STEP};
 use super::{Admission, ObjectStore, Tier};
 use crate::err::{refuse, Code, Refusal, Result};
@@ -749,17 +750,21 @@ impl Shared {
                     },
                     FileRead::Failed(refusal) => Attempt::Fatal(refusal),
                 },
-                Location::Url { url, headers, .. } => {
+                http => {
+                    let (url, headers, provider) = http.http().expect("a URL location");
                     delivery = delivery.filter(|(_, until)| until.is_none_or(|u| u > Instant::now()));
                     let (delivered, asked) = (
                         delivery.is_some(),
-                        delivery.clone().map_or_else(|| url.clone(), |(at, _)| at),
+                        delivery.clone().map_or_else(|| url.to_owned(), |(at, _)| at),
                     );
+                    let same = same_origin(url, &asked);
+                    let headers: Vec<_> = headers.iter().filter(|(name, _)| same || name.eq_ignore_ascii_case("range")).cloned().collect();
                     self.request(
                         task,
                         &mut sink,
                         &asked,
-                        headers,
+                        &headers,
+                        if same { provider } else { None },
                         doublings,
                         delivered,
                         &mut delivery,
@@ -887,6 +892,7 @@ impl Shared {
         sink: &mut Sink<'_>,
         url: &str,
         headers: &[(String, String)],
+        provider: Option<&dyn TokenProvider>,
         doublings: u32,
         delivered: bool,
         delivery: &mut Option<Delivery>,
@@ -903,7 +909,7 @@ impl Shared {
             ));
         }
         let answer = tokio::select! {
-            answer = self.client.get(url, &headers) => answer,
+            answer = self.client.get_authorized(url, &headers, provider) => answer,
             () = flight.aborted() => return Shared::dropped(flight),
         };
         let mut answer = match answer {

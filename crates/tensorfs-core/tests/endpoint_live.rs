@@ -114,7 +114,9 @@ async fn a_capability_is_traded_once_and_proves_each_request() {
     // credentials would conflict with its SigV4 query authentication.
     let into = Store::open(scratch.join("pulled")).unwrap();
     let fetcher = Fetcher::new(Arc::new(into.clone()) as Arc<dyn ObjectStore>, client.clone(), None, Config::default());
-    let source: Arc<dyn Origin> = endpoint.clone();
+    // Go's real ServeMux cleans /./ with a same-origin redirect first. Each hop must get a
+    // new proof naming its actual path before the Hub redirects to MinIO.
+    let source: Arc<dyn Origin> = Arc::new(Endpoint::new(&client, &format!("{reach}/."), Some(provider.clone())).unwrap());
     let pulled = fetcher.pull_tree(&source, &tree, Some("int8"), &Want::default()).await.unwrap();
     fetcher.settled().await;
     assert_eq!(pulled.header, header);
