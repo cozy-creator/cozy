@@ -613,7 +613,7 @@ pub struct Pool {
     /// Set (under `sessions`) once the pool stops: an executor coming back then is ended.
     stopped: std::sync::atomic::AtomicBool,
     /// Host bytes admitted for executors still starting, by `session_key`, until their load.
-    admitted: Mutex<BTreeMap<String, (u64, u64, Option<Birth>)>>,
+    admitted: Mutex<BTreeMap<String, Admission>>,
     /// Live executor lane leaders, including running sessions removed from `sessions`.
     leaders: Mutex<BTreeMap<u32, (Birth, String, usize)>>,
     /// Serializes the current exact owner with every mutation of a plan-keyed GPU charge.
@@ -647,6 +647,12 @@ pub struct Pool {
     // Drop session/resource custody before ending the actual spawning thread.
     launcher: crate::child_launcher::ChildLauncher,
 }
+struct Admission {
+    bytes: u64,
+    reservation: u64,
+    birth: Option<Birth>,
+}
+
 struct ChargeOwner {
     reservation: u64,
     birth: Option<Birth>,
@@ -1011,7 +1017,7 @@ impl Pool {
         }
         drop(levels);
         let mut admitted = self.admitted.lock().unwrap();
-        if admitted.get(&key).and_then(|(_, _, owner)| owner.as_ref()).is_some_and(|owner| gone.contains(owner)) {
+        if admitted.get(&key).and_then(|admission| admission.birth.as_ref()).is_some_and(|owner| gone.contains(owner)) {
             admitted.remove(&key);
         }
         drop(admitted);
@@ -1039,9 +1045,9 @@ impl Pool {
             owners.insert((plan.to_owned(), index), ChargeOwner { reservation, birth: None });
             device.memory.with(|gpu| gpu.starting(plan, gpu.spawn_need(plan)));
         }
-        if let Some((_, generation, owner)) = self.admitted.lock().unwrap().get_mut(&session_key(plan, start)) {
-            *generation = reservation;
-            *owner = None;
+        if let Some(admission) = self.admitted.lock().unwrap().get_mut(&session_key(plan, start)) {
+            admission.reservation = reservation;
+            admission.birth = None;
         }
         reservation
     }
@@ -1068,7 +1074,7 @@ impl Pool {
         }
         let key = session_key(plan, start);
         let mut admitted = self.admitted.lock().unwrap();
-        if admitted.get(&key).is_some_and(|(_, generation, owner)| *generation == reservation && owner.is_none()) {
+        if admitted.get(&key).is_some_and(|admission| admission.reservation == reservation && admission.birth.is_none()) {
             admitted.remove(&key);
         }
     }
@@ -1089,10 +1095,10 @@ impl Pool {
                 }
             }
         }
-        if let Some((_, generation, owner)) = self.admitted.lock().unwrap().get_mut(&session_key(plan, start)) {
-            if expected.is_none() || *generation == reservation {
-                *generation = reservation;
-                *owner = Some(birth.clone());
+        if let Some(admission) = self.admitted.lock().unwrap().get_mut(&session_key(plan, start)) {
+            if expected.is_none() || admission.reservation == reservation {
+                admission.reservation = reservation;
+                admission.birth = Some(birth.clone());
             }
         }
         self.leaders.lock().unwrap().insert(birth.pid, (birth.clone(), plan.to_owned(), start));
@@ -3377,7 +3383,7 @@ impl Pool {
             let _owners = self.accounting.lock().unwrap();
             let mut admitted = self.admitted.lock().unwrap();
             let key = session_key(&construction, start);
-            if admitted.get(&key).and_then(|(_, _, owner)| owner.as_ref()) == Some(&session.executor.birth) {
+            if admitted.get(&key).and_then(|admission| admission.birth.as_ref()) == Some(&session.executor.birth) {
                 admitted.remove(&key);
             }
         }
@@ -3698,10 +3704,10 @@ impl Pool {
             };
             let key = session_key(plan, start);
             let mut admitted = self.admitted.lock().unwrap();
-            let others: u64 = admitted.iter().filter(|(k, _)| **k != key).map(|(_, (bytes, _, _))| bytes).sum();
+            let others: u64 = admitted.iter().filter(|(k, _)| **k != key).map(|(_, admission)| admission.bytes).sum();
             let available = available.map(|available| available.saturating_sub(others));
             if available.is_none_or(|available| available >= need) {
-                admitted.insert(key, (need, 0, None));
+                admitted.insert(key, Admission { bytes: need, reservation: 0, birth: None });
                 return true;
             }
             drop(admitted);
@@ -3716,7 +3722,7 @@ impl Pool {
                 "need": need, "available": available, "released": released, "ended": ended}));
             if released == 0 && !ended {
                 if !spare {
-                    self.admitted.lock().unwrap().insert(key, (need, 0, None));
+                    self.admitted.lock().unwrap().insert(key, Admission { bytes: need, reservation: 0, birth: None });
                 }
                 return false;
             }
