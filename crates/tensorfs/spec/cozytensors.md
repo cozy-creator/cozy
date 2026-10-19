@@ -481,6 +481,7 @@ A new scheme is a minor version (§8). It ships:
 - A **store** or **static origin** is a directory, bucket or HTTP prefix holding `refs/<org>/<name>.json` and
   `blobs/…` (§1). A reader resolves name → release → tree → variant header → chunks and assets, verifying every object
   where it enters.
+- Reading and publishing at an endpoint over HTTP, S3 or a directory: [distribution.md](distribution.md).
 
 **Closure.** A cozytensors' closure is its header's closure (§4): the header and every object it cites, its `chunks`
 and each component's assets. A tree's closure is the tree, every object its `files` cite, and each variant's closure.

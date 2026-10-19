@@ -82,7 +82,7 @@ impl DeviceKey {
         let header = json!({"alg": "EdDSA", "typ": "authkit-capability+jwt", "kid": self.id});
         let issued = now();
         let claims = json!({
-            "sub": capability.user_id, "aud": capability.hub, "cnf": {"jkt": capability.machine},
+            "sub": capability.user_id, "aud": capability.hub, "cnf": {"jkt": capability.key_jkt},
             "run": capability.run, "jti": jti(), "iat": issued,
             "exp": issued + capability.lifetime.as_secs(),
             "authorization_details": capability.operations,
@@ -96,12 +96,12 @@ impl DeviceKey {
 }
 
 /// What one run may do at a Hub for its owner: the operations (RFC 9396
-/// `authorization_details`) the machine whose leaf thumbprint is `machine` performs for `run`.
+/// `authorization_details`) bound to the per-run key's thumbprint `key_jkt`.
 pub struct RunCapability {
     pub user_id: String,
     /// The Hub's public origin, the token's audience.
     pub hub: String,
-    pub machine: String,
+    pub key_jkt: String,
     pub run: String,
     pub operations: Vec<Value>,
     pub lifetime: Duration,
@@ -346,7 +346,7 @@ mod tests {
         let jws = loaded.sign_run_capability(&RunCapability {
             user_id: "u1".into(),
             hub: "https://hub.example".into(),
-            machine: "jkt".into(),
+            key_jkt: "jkt".into(),
             run: "r1".into(),
             operations: vec![json!({"type": "tensorhub_model_publish", "model": "a/b"})],
             lifetime: Duration::from_secs(60),

@@ -2,16 +2,14 @@
 //! objects can be read (`locate`); the Fetcher downloads, verifies and admits them.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use async_trait::async_trait;
 
-use super::net::Client;
+use super::token::TokenProvider;
 use crate::err::{refuse, Code, Refusal, Result};
-use crate::format::{repo_key, ObjectRef, Repo, Tree};
-
-/// The most bytes a refs document may have.
-const REPO_BYTES: u64 = 16 << 20;
+use crate::format::{ObjectRef, Repo, Tree};
 
 #[async_trait]
 pub trait Origin: Send + Sync {
@@ -35,13 +33,18 @@ pub trait Origin: Send + Sync {
 }
 
 /// Where one object can be read.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum Location {
     /// An HTTP(S) GET, with the headers it needs, valid until `expires`.
     Url {
         url: String,
         headers: Vec<(String, String)>,
         expires: Option<SystemTime>,
+    },
+    /// A provider presents each GET afresh, including same-origin redirects and restarts.
+    Authenticated {
+        url: String,
+        provider: Arc<dyn TokenProvider>,
     },
     /// A file on a mounted volume.
     File(PathBuf),
@@ -50,6 +53,24 @@ pub enum Location {
 impl Location {
     pub(crate) fn expired(&self) -> bool {
         matches!(self, Location::Url { expires: Some(at), .. } if *at <= SystemTime::now())
+    }
+
+    pub(crate) fn http(&self) -> Option<(&str, &[(String, String)], Option<&dyn TokenProvider>)> {
+        match self {
+            Self::Url { url, headers, .. } => Some((url, headers, None)),
+            Self::Authenticated { url, provider } => Some((url, &[], Some(provider.as_ref()))),
+            Self::File(_) => None,
+        }
+    }
+}
+
+impl std::fmt::Debug for Location {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::File(path) => f.debug_tuple("File").field(path).finish(),
+            Self::Url { url, expires, .. } => f.debug_struct("Url").field("url", url).field("expires", expires).finish_non_exhaustive(),
+            Self::Authenticated { url, .. } => f.debug_struct("Authenticated").field("url", url).finish_non_exhaustive(),
+        }
     }
 }
 
@@ -125,65 +146,4 @@ pub fn choose(
         variant,
         header,
     })
-}
-
-/// A static origin over HTTP: `{base}/refs/<org>/<model>.json` (lowercase) and `{base}/blobs/<aa>/<bb>/<sha256>`.
-/// Any HTTP server, bucket or repository holding that layout serves it.
-pub struct HttpOrigin {
-    client: Client,
-    base: String,
-    bearer: Option<String>,
-}
-
-impl HttpOrigin {
-    pub fn new(client: &Client, base: &str) -> Result<HttpOrigin> {
-        let base = base.trim_end_matches('/').to_string();
-        client.policy().admit(&base)?;
-        Ok(HttpOrigin {
-            client: client.clone(),
-            base,
-            bearer: None,
-        })
-    }
-
-    /// Sends `Authorization: Bearer <token>`; the origin is then private.
-    pub fn bearer(mut self, token: impl Into<String>) -> HttpOrigin {
-        self.bearer = Some(token.into());
-        self
-    }
-
-    fn headers(&self) -> Vec<(String, String)> {
-        self.bearer
-            .iter()
-            .map(|token| ("authorization".to_string(), format!("Bearer {token}")))
-            .collect()
-    }
-}
-
-#[async_trait]
-impl Origin for HttpOrigin {
-    async fn resolve(&self, name: &str, release: Option<&str>, _: Option<&str>) -> Result<ObjectRef> {
-        split_name(name)?;
-        let url = format!("{}/{}", self.base, repo_key(name));
-        let bytes = self
-            .client
-            .document(&url, &self.headers(), REPO_BYTES)
-            .await?;
-        pick(name, &bytes, release)
-    }
-
-    async fn locate(&self, objects: &[ObjectRef]) -> Result<Vec<Location>> {
-        let headers = self.headers();
-        Ok((objects.iter())
-            .map(|object| Location::Url {
-                url: format!("{}/{}", self.base, object.key()),
-                headers: headers.clone(),
-                expires: None,
-            })
-            .collect())
-    }
-
-    fn public(&self) -> bool {
-        self.bearer.is_none()
-    }
 }

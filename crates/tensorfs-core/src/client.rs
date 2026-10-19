@@ -8,19 +8,16 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
 
 use crate::failure::{fail, Kind, Result};
-use crate::fetch::{self, policy, Client, Config, Fetcher, HttpOrigin, ObjectStore, Origin};
-use crate::fetch::{SourcePolicy, TensorhubOrigin, VolumeOrigin, Want, TENSORHUB};
+use crate::fetch::{self, policy, Client, Config, Endpoint, Fetcher, ObjectStore, Origin};
+use crate::fetch::{SourcePolicy, TensorhubOrigin, Want, TENSORHUB};
 use crate::format::{repo_key, Body, Component, Header, ObjectRef, Release, Repo, Tensor, Tree};
 use crate::import::{self, Access};
 use crate::store2::Store;
 
 /// The release an import names.
 pub const IMPORT_RELEASE: &str = "1";
-/// The most bytes a refs document may have.
-const REPO_BYTES: u64 = 16 << 20;
 
 /// A cozytensors, and the tree, repo, release and variant that name it, when one does.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -392,46 +389,28 @@ pub struct Pulled {
     pub held: u64,
 }
 
-/// The origin `spec` names and its refs document for `name`.
+/// The origin `spec` names (a URL or a directory) and its refs document for `name`.
 async fn open(spec: &str, name: &str) -> Result<(Arc<dyn Origin>, Client, Repo)> {
-    let key = repo_key(name);
-    let (origin, client, bytes): (Arc<dyn Origin>, Client, Vec<u8>) =
-        if spec.starts_with("https://") || spec.starts_with("http://") {
-            // The origin is the one the caller named; its objects are held to their digests
-            // wherever a redirect sends them. Plaintext is for loopback only.
-            let client = Client::new(SourcePolicy {
-                any_host: true,
-                allow_local: policy::is_loopback_origin(spec),
-                max_redirects: 5,
-                ..SourcePolicy::default()
-            });
-            let origin = HttpOrigin::new(&client, spec)?;
-            let url = format!("{}/{key}", spec.trim_end_matches('/'));
-            let bytes = client.document(&url, &[], REPO_BYTES).await?;
-            (Arc::new(origin), client, bytes)
-        } else {
-            let dir = Path::new(spec.strip_prefix("file://").unwrap_or(spec));
-            let bytes = match fs::read(dir.join(&key)) {
-                Ok(bytes) => bytes,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    return fail(
-                        Kind::NotFound,
-                        format!("no ref {name} at {}", dir.display()),
-                    )
-                }
-                Err(e) => return fail(Kind::Io, format!("{}: {e}", dir.join(&key).display())),
-            };
-            let origin = VolumeOrigin::new(dir, Duration::from_secs(7 * 86400));
-            (
-                Arc::new(origin),
-                Client::new(SourcePolicy::default()),
-                bytes,
-            )
-        };
-    Ok((origin, client, Repo::from_json(&bytes)?))
+    // The origin is the one the caller named; its objects are held to their digests wherever a
+    // redirect sends them. Plaintext is for loopback only.
+    let client = Client::new(SourcePolicy {
+        any_host: true,
+        allow_local: policy::is_loopback_origin(spec),
+        max_redirects: 5,
+        ..SourcePolicy::default()
+    });
+    let url = match spec.contains("://") {
+        true => spec.to_owned(),
+        false => std::path::absolute(spec).map_err(|e| io(Path::new(spec), e))?.display().to_string(),
+    };
+    let endpoint = Endpoint::new(&client, &url, None)?;
+    let Some((repo, _)) = endpoint.repo(name).await? else {
+        return fail(Kind::NotFound, format!("no ref {name} at {spec}"));
+    };
+    Ok((Arc::new(endpoint), client, repo))
 }
 
-/// The origin layout `HttpOrigin` reads: `name`'s refs document gains `named`'s release, and
+/// The endpoint layout ([`Endpoint`]): `name`'s refs document gains `named`'s release, and
 /// `blobs/` every object of its tree's closure here (`named`'s variant whole). Objects are hard-linked when they can be.
 pub fn export_origin(store: &Store, named: &Named, dir: &Path) -> Result<Vec<String>> {
     let (Some(tree), Some(name), Some(version)) = (&named.tree, &named.name, &named.release) else {

@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Map, Value as Json};
 use tensorfs_core::client::{self, ImportOptions, Named};
 use tensorfs_core::export;
+use tensorfs_core::fetch;
 use tensorfs_core::failure::{fail, Failure, Kind, Result};
 use tensorfs_core::format::{Body, Dtype, ObjectRef};
 use tensorfs_core::migrate::{self, v1 as old};
@@ -32,6 +33,8 @@ const USAGE: &str = "usage: tfs [--store <dir>] [--json] <verb> ...
   inspect <ref>
   verify [<ref>]
   gc [--older-than <7d|12h|30m|90s>]
+  conform endpoint <url> [--write] [--token-env <VAR>]
+      checks an endpoint against the distribution spec; --write uploads the fixture first
   dev ckpt [--name <org/name>] [--blocks <n>] [--scale <n>] [--plain] [--no-configs]
   dev migrate <v1-dir> [<manifest-sha256>|<org/name>]... [--dry-run | --plan]
       v1-dir: a v1 store (read only) or a directory of a v1 manifest and its objects;
@@ -50,6 +53,7 @@ const SWITCHES: &[&str] = &[
     "no-configs",
     "dry-run",
     "plan",
+    "write",
 ];
 const VALUED: &[&str] = &[
     "store",
@@ -61,8 +65,9 @@ const VALUED: &[&str] = &[
     "variant",
     "blocks",
     "scale",
+    "token-env",
 ];
-const VERBS: &[&str] = &["import", "pull", "export", "inspect", "verify", "dev"];
+const VERBS: &[&str] = &["import", "pull", "export", "inspect", "verify", "dev", "conform"];
 
 struct Args {
     pos: Vec<String>,
@@ -324,6 +329,7 @@ fn run(args: &Args) -> Done {
             Ok(Some((Json::Object(doc), human)))
         }
         ["inspect", reference] => inspect(&store()?, reference, lane),
+        ["conform", "endpoint", url] => conform(url, args.on("write"), args.get("token-env"), args.on("json")),
         ["verify"] => verify(&store()?, None),
         ["verify", reference] => verify(&store()?, Some((reference, lane))),
         ["gc"] => {
@@ -661,4 +667,48 @@ fn blobs(store: &Store) -> Result<Vec<ObjectRef>> {
     }
     out.sort();
     Ok(out)
+}
+
+/// `tfs conform endpoint`: every case, and a failure when a MUST failed.
+fn conform(url: &str, write: bool, token_env: Option<&str>, json: bool) -> Done {
+    let token = match token_env {
+        Some(var) => match std::env::var(var).ok().filter(|t| !t.is_empty()) {
+            Some(token) => Some(fetch::bearer(token)),
+            None => return Err(Failure { kind: Kind::Invalid, detail: format!("${var} is unset") }.into()),
+        },
+        None => None,
+    };
+    let scratch = std::env::temp_dir().join(format!("tfs-conform-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&scratch);
+    let cases = fetch::runtime().map_err(Failure::from)?.block_on(async {
+        let policy = fetch::SourcePolicy {
+            any_host: true,
+            allow_local: fetch::policy::is_loopback_origin(url),
+            max_redirects: 5,
+            ..Default::default()
+        };
+        let client = fetch::Client::new(policy);
+        let endpoint = std::sync::Arc::new(fetch::Endpoint::new(&client, url, token)?);
+        fetch::conform::endpoint(endpoint, &client, write, &scratch).await
+    });
+    let _ = fs::remove_dir_all(&scratch);
+    let cases = cases.map_err(Failure::from)?;
+    let mark = |c: &fetch::conform::Case| match (c.ok, c.must) {
+        (None, _) => "n/a ",
+        (Some(true), _) => "pass",
+        (Some(false), true) => "FAIL",
+        (Some(false), false) => "warn",
+    };
+    let human: Vec<String> = cases.iter().map(|c| format!("{}  {}  {}", mark(c), c.name, c.detail).trim_end().to_owned()).collect();
+    let docs: Vec<Json> = cases.iter().map(|c| json!({"case": c.name, "must": c.must, "ok": c.ok, "detail": c.detail})).collect();
+    let failed = cases.iter().filter(|c| c.must && c.ok == Some(false)).count();
+    let doc = json!({"endpoint": url, "cases": docs, "failed": failed});
+    if failed == 0 {
+        return Ok(Some((doc, human.join("\n"))));
+    }
+    if !json {
+        eprintln!("{}", human.join("\n"));
+    }
+    let failure = Failure { kind: Kind::Invalid, detail: format!("{url}: {failed} MUST case(s) failed") };
+    Err(Failed(failure, doc.as_object().cloned()))
 }

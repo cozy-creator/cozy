@@ -2,8 +2,8 @@
 //! and variant (its wire's `lane`; its `manifest` is the tree) and lists its closure
 //! (`POST /v1/tensorfs/closure`), then presigns its objects (`POST /v1/tensorfs/presign`); the
 //! Fetcher reads them from the presigned URLs, which see no credential. Public releases are
-//! read anonymously; a bearer token, or a caller's own [`Credential`], reads the private trees
-//! it grants.
+//! read anonymously; a bearer token, or a caller's own [`TokenProvider`], reads the private
+//! trees it grants.
 //!
 //! Wire: closure `{"ref":"org/name[@release][@sha256:<hex>]","lane","after"?}` →
 //! `{complete, lane, manifest, model, objects[], presign_max_digests, public, release, scope}`,
@@ -20,8 +20,9 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::net::{Client, HeaderMap};
+use super::net::Client;
 use super::origin::{split_name, Location, Origin};
+use super::token::{bearer, Request, TokenProvider};
 use crate::err::{refuse, Code, Refusal, Result};
 use crate::format::ObjectRef;
 
@@ -33,29 +34,6 @@ const ATTEMPTS: u32 = 4;
 const RETRYABLE: [u16; 7] = [408, 425, 429, 500, 502, 503, 504];
 /// The most bytes one Hub answer may have.
 const ANSWER_BYTES: u64 = 16 << 20;
-
-/// What a request to the Hub presents: a bearer token, or a proof made per request (DPoP).
-#[async_trait]
-pub trait Credential: Send + Sync {
-    /// Headers for `method url`, a Hub URL.
-    async fn present(&self, method: &str, url: &str) -> Vec<(String, String)>;
-
-    /// The Hub answered `status` and `headers` to a request that sent `sent`: true asks it once
-    /// more (a fresh nonce).
-    fn observe(&self, url: &str, sent: &[(String, String)], status: u16, headers: &HeaderMap) -> bool {
-        let _ = (url, sent, status, headers);
-        false
-    }
-}
-
-struct Bearer(String);
-
-#[async_trait]
-impl Credential for Bearer {
-    async fn present(&self, _: &str, _: &str) -> Vec<(String, String)> {
-        vec![("authorization".into(), format!("Bearer {}", self.0))]
-    }
-}
 
 /// What the Hub named: the model, the release and variant it chose (both empty for a tree
 /// asked by hash) and their tree.
@@ -110,7 +88,7 @@ struct State {
 pub struct TensorhubOrigin {
     client: Client,
     base: String,
-    credential: Option<Arc<dyn Credential>>,
+    credential: Option<Arc<dyn TokenProvider>>,
     public: AtomicBool,
     state: tokio::sync::Mutex<State>,
 }
@@ -131,11 +109,11 @@ impl TensorhubOrigin {
 
     /// Sends `Authorization: Bearer <token>` to the Hub.
     pub fn bearer(self, token: impl Into<String>) -> TensorhubOrigin {
-        self.credential(Arc::new(Bearer(token.into())))
+        self.credential(bearer(token))
     }
 
     /// Presents `credential` on every Hub call.
-    pub fn credential(mut self, credential: Arc<dyn Credential>) -> TensorhubOrigin {
+    pub fn credential(mut self, credential: Arc<dyn TokenProvider>) -> TensorhubOrigin {
         self.credential = Some(credential);
         self
     }
@@ -259,7 +237,10 @@ impl TensorhubOrigin {
         let mut retried = false;
         loop {
             let sent = match &self.credential {
-                Some(credential) => credential.present("POST", url).await,
+                Some(credential) => {
+                    let request = Request { method: "POST", url, headers: &[], payload: None };
+                    credential.headers(&request).await.map_err(Ask::Final)?
+                }
                 None => Vec::new(),
             };
             let answer = match self.client.post(url, &sent, body.to_vec(), ANSWER_BYTES).await {
@@ -267,7 +248,8 @@ impl TensorhubOrigin {
                 Err(e) if matches!(e.code, Code::TRANSFER_FAILED | Code::FD_HEADROOM) => return Err(Ask::Weather(e.detail, None)),
                 Err(e) => return Err(Ask::Final(e)),
             };
-            let again = (self.credential.as_ref()).is_some_and(|c| c.observe(url, &sent, answer.status, &answer.headers));
+            let request = Request { method: "POST", url, headers: &sent, payload: None };
+            let again = (self.credential.as_ref()).is_some_and(|c| c.retry(&request, answer.status, &answer.headers));
             if again && !retried {
                 retried = true;
                 continue;
