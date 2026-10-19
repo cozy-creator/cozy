@@ -15,7 +15,7 @@ from . import nvfp4
 from . import fp8_blockwise
 from . import mxfp4
 
-# gguf
+from . import gguf
 
 # gptq, awq, ct
 
@@ -35,7 +35,7 @@ FAMILIES = (
     fp8_blockwise,
     mxfp4,
 
-    # gguf
+    gguf,
 
     # gptq, awq, ct
 

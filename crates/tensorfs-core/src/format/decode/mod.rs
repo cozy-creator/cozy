@@ -27,6 +27,7 @@ mod fp8_blockwise;
 mod mxfp4;
 
 // gguf
+pub mod gguf;
 
 // gptq, awq, ct
 
@@ -48,7 +49,20 @@ pub static SCHEMES: &[&Scheme] = &[
     &mxfp4::MXFP4,
 
     // gguf.*
-
+    &gguf::Q4_0,
+    &gguf::Q4_1,
+    &gguf::Q5_0,
+    &gguf::Q5_1,
+    &gguf::Q8_0,
+    &gguf::Q2_K,
+    &gguf::Q3_K,
+    &gguf::Q4_K,
+    &gguf::Q5_K,
+    &gguf::Q6_K,
+    &gguf::MXFP4,
+    &gguf::NVFP4,
+    &gguf::Q1_0,
+    &gguf::Q2_0,
     // gptq.*, awq.*, ct.*
 
     // bnb.*
