@@ -89,11 +89,14 @@ class LedgerGrant:
 
 
 class Exhausted(Exception):
-    """It still does not fit with every other evictable byte gone: §2's one memory error."""
+    """It still does not fit with every other evictable byte gone: §2's one memory error, with
+    each model's resident bytes and the memo's peaks then."""
 
-    def __init__(self, gpu: int, need: int, op: str, stats: Stats) -> None:
+    def __init__(
+        self, gpu: int, need: int, op: str, resident: Mapping[str, int], peaks: tuple[Peak, ...]
+    ) -> None:
         super().__init__(f"GPU {gpu}: {op} needs {need} B more and nothing else can be freed")
-        self.gpu, self.need, self.op, self.stats = gpu, need, op, stats
+        self.gpu, self.need, self.op, self.resident, self.peaks = gpu, need, op, resident, peaks
 
 
 class Unbound(Exception):
@@ -163,22 +166,6 @@ class Eviction:
 
 
 @dataclass(frozen=True, slots=True)
-class ModelStats:
-    name: str
-    gpu: int
-    nbytes: int
-    home: int
-    resident: int
-    paged_in: int
-    streamed: int
-    stall_ns: int
-    flight: int
-    repeats: int
-    level: str
-    reserve: int
-
-
-@dataclass(frozen=True, slots=True)
 class Peak:
     """A model's activation peak at one shape key (-1: unmeasured) and its cuts in force."""
 
@@ -199,14 +186,6 @@ class RequestStats:
     copied: int
     retries: int = 0
     peaks: tuple[Peak, ...] = ()
-
-
-@dataclass(frozen=True, slots=True)
-class Stats:
-    models: tuple[ModelStats, ...]
-    evictions: int
-    peaks: tuple[Peak, ...] = ()
-    retries: int = 0
 
 
 # ------------------------------------------------------------------------ placeholders
@@ -422,9 +401,8 @@ class Request:
     steps: list[Step] = field(default_factory=list)
     evictions: list[Eviction] = field(default_factory=list)
     passes: dict[str, int] = field(default_factory=dict)
-    #: its peak above its start, and that peak at each pass's end (its key's profile)
+    #: its peak above its start, what its key's next run's `fits` reserves
     peak: int = 0
-    profile: list[int] = field(default_factory=list)
     shapes: dict[tuple[str, str], cuts.Shape] = field(default_factory=dict)
     stats: RequestStats | None = None
 
@@ -446,9 +424,8 @@ class Memory:
         self.caches: dict[Cache, None] = {}
         self.lock, self.local = threading.RLock(), threading.local()
         self.active: dict[Request, None] = {}
-        #: host tiers sealed here for the executor to deposit; each request key's last profile
+        #: host tiers sealed here for the executor to deposit
         self.deposits: list[tuple[Model, int]] = []
-        self.profiles: dict[str, list[int]] = {}
         #: its requests waiting for room (§2), counted under `freeing`
         self.waiting = 0
         self.freeing = threading.Lock()
@@ -623,7 +600,7 @@ class Memory:
             except _Short as short:
                 need, op = short.args
                 if not (wait and self._wait_room()):
-                    raise Exhausted(self.gpu, need, op, self.stats()) from None
+                    raise self._exhausted(need, op) from None
         if record and block.index >= 0 and not model.held:
             self._prefetch(block)
 
@@ -712,9 +689,7 @@ class Memory:
             request.steps.append(step)
             passes = request.passes[model.name] = request.passes.get(model.name, 0) + 1
             model.repeats = max(model.repeats, passes)
-            above = max(model.base + activations - request.start, 0)
-            request.profile.append(above)
-            request.peak = max(request.peak, above)
+            request.peak = max(request.peak, model.base + activations - request.start)
         self._running()
 
     def _prefetch(self, block: Block) -> None:
@@ -846,7 +821,7 @@ class Memory:
         )
 
     def exhausted(self, device: torch.device, need: int, op: str) -> Exception:
-        return Exhausted(self.gpu, need, op, self.stats())
+        return self._exhausted(need, op)
 
     def _idle(self) -> int:
         """Rung 1: torch's slack and the core's idle chunks."""
@@ -951,21 +926,16 @@ class Memory:
         )
 
     def _running(self) -> None:
-        """This row's running requests and what each still needs beyond what this process holds
-        (§5.6's `fits`): its key's measured peak still to come, less what it has allocated since
-        it began; -1 when never measured."""
+        """This row's running requests and what each may still need beyond what this process
+        holds (§5.6's `fits`): its key's measured peak less what it has taken; -1 unmeasured."""
         if self.row is None:
             return
         table, row = self.row
-        running = []
-        for r in list(self.active):
-            profile = self.profiles.get(r.key) if r.key is not None else None
-            ahead = table.peak(r.key) if r.key is not None and profile is None else None
-            if profile is not None:
-                ahead = max(profile[len(r.profile) :], default=0)
-            taken = max(torch.cuda.memory_allocated(self.gpu) - r.start, 0)
-            running.append((r.id, -1 if ahead is None else max(ahead - taken, 0)))
-        row.running(running)
+        taken = torch.cuda.memory_allocated(self.gpu)
+        peaks = {r: table.peak(r.key) if r.key is not None else None for r in list(self.active)}
+        row.running(
+            [(r.id, -1 if p is None else max(p - taken + r.start, 0)) for r, p in peaks.items()]
+        )
 
     def _evict(self, model: Model, why: str, rung: int, need: int | None = None) -> int:
         """Pages nobody uses: all, or with `need` its lowest-ranked blocks until that many bytes
@@ -1082,9 +1052,8 @@ class Memory:
         if self.cuda:
             torch.cuda.synchronize(self.gpu)
             torch.cuda.empty_cache()
-            tail = max(torch.cuda.max_memory_allocated(self.gpu) - request.start, 0)
+            tail = torch.cuda.max_memory_allocated(self.gpu) - request.start
             request.peak = max(request.peak, tail)
-            request.profile.append(tail)
             leftover = ((self.gpu, max(torch.cuda.memory_allocated(self.gpu) - request.start, 0)),)
         copied = sum(n - request.copies.get(name, 0) for name, n in self._copies().items())
         retries = self.memo.retries - request.retried
@@ -1092,7 +1061,6 @@ class Memory:
         steps, evictions = tuple(request.steps), tuple(request.evictions)
         request.stats = RequestStats(request.id, steps, evictions, leftover, copied, retries, peaks)
         if request.key is not None and self.row is not None:
-            self.profiles[request.key] = request.profile
             self.row[0].set_peak(request.key, request.peak)
         with self.lock:
             self.active.pop(request, None)
@@ -1155,24 +1123,14 @@ class Memory:
 
     # -- stats (§5.8)
 
-    def stats(self) -> Stats:
+    def resident(self) -> dict[str, int]:
+        """Each model's resident bytes."""
         with self.lock:
-            models = tuple(
-                ModelStats(
-                    m.name,
-                    m.gpu,
-                    m.nbytes,
-                    m.home_bytes(),
-                    *_set(m),
-                    m.flight,
-                    m.repeats,
-                    m.level.value,
-                    m.reserve,
-                )  # fmt: skip
-                for m in self.models.values()
-            )
-            peaks = tuple(_peak(s) for s in list(self.memo.shapes.values()))
-            return Stats(models, self.evictions, peaks, self.memo.retries)
+            return {m.name: _set(m)[0] for m in self.models.values()}
+
+    def _exhausted(self, need: int, op: str) -> Exhausted:
+        peaks = tuple(_peak(s) for s in list(self.memo.shapes.values()))
+        return Exhausted(self.gpu, need, op, self.resident(), peaks)
 
 
 # ----------------------------------------------------------------------------- binding
