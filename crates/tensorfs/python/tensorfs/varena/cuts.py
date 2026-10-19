@@ -538,10 +538,17 @@ def _tensors(value: object, depth: int = 3) -> list[Tensor]:
 
 
 def _device(args: Args, kwargs: Kwargs) -> torch.device | None:
+    """Where the op allocates: its `device` argument (a copy to the GPU from a CPU tensor),
+    else its first tensor's."""
+    device = kwargs.get("device")
+    if isinstance(device, str | torch.device):
+        device = torch.device(device)
+        if device.type == "cuda" and device.index is None:
+            device = torch.device("cuda", torch.cuda.current_device())
+        return device
     for t in _tensors((args, kwargs)):
         return t.device
-    device = kwargs.get("device")
-    return torch.device(device) if isinstance(device, str | torch.device) else None
+    return None
 
 
 def _generators(func: OpOverload, args: Args, kwargs: Kwargs) -> list[torch.Generator]:
