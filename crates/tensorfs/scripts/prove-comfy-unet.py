@@ -4,7 +4,7 @@
 This does not run a ComfyUI graph, server, GUI, sampler or visual workflow. Supply
 an unmodified upstream checkout at COMFY_COMMIT and an installed TensorFS wheel.
 CPU is the default; --device cuda:N requires the coherent CUDA native wheel.
-Hosted dependencies: torch 2.14.0, numpy, einops, safetensors, Pillow, scipy,
+Hosted dependencies: torch 2.14.0, numpy, einops, safetensors, Pillow, scipy, packaging,
 tqdm, psutil, pyyaml, comfy-kitchen==0.2.39 and comfy-aimdo==0.5.6. The last two
 versions match the pinned upstream requirements. No pretrained model is loaded.
 """
