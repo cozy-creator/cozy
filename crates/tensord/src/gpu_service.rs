@@ -2734,7 +2734,7 @@ impl Pool {
         let fresh = plan.clone();
         let error = {
             let mut session = session;
-            let fetch = calls.map(|calls| engine.get(id).map(|record| calls.fetch(&record, &plan))).transpose()?;
+            let fetch = calls.map(|calls| engine.get(id).map(|record| calls.fetch(&record))).transpose()?;
             match self.call(engine, id, &held, plan, &load_caps, &mut session, false, calls, fetch) {
                 Ok(true) => {
                     self.keep_idle(session);
@@ -2930,7 +2930,6 @@ impl Pool {
             store: &self.store,
             spool: None,
             caller: None,
-            weights: None,
             fetch: fetch.as_ref(),
             raw: &plan.sources,
         };
@@ -3243,11 +3242,6 @@ impl Pool {
         let interface = session.executor.root_path().join("package-interface.json");
         let caller = calls.map(|calls| calls.caller(&record, held, document, &interface, &spool).0);
         callbacks.caller = caller.as_ref();
-        let grant = match (calls, &fetch) {
-            (Some(calls), Some(fetch)) => calls.grant(engine, &record, &plan, document, &spool, fetch)?,
-            _ => None,
-        };
-        callbacks.weights = calls.zip(grant.as_ref()).map(|(calls, grant)| (calls.weights(), grant));
         session.executor.waits = caller.as_ref().map(|caller| caller.waits(engine));
         let invoked = Instant::now();
         let first = !session.invoked;
@@ -3270,7 +3264,6 @@ impl Pool {
                 squeezed_bytes: gpu.map(|gpu| gpu.with(|gpu| gpu.squeezed(&construction))).unwrap_or_default(),
                 device_weights: Some(share),
                 sources: plan.sources.iter().map(|s| (s.parameter.clone(), s.manifest.clone())).collect(),
-                weights: grant.as_ref().map(|grant| grant.outputs.clone()).unwrap_or_default(),
             },
             &group,
             &mut callbacks,
@@ -4253,31 +4246,6 @@ fn constructions(plan: &Plan) -> Vec<Construction> {
     plan.slots.iter().map(slot).collect()
 }
 
-/// A call's `fetch_channel` answers: a fresh channel over its checkpoints held in part.
-struct Ahead<'a>(Option<&'a crate::access::Fetch>);
-impl Services for Ahead<'_> {
-    fn request(&mut self, frame: &Frame, descriptor: Option<File>) -> io::Result<(Answer, Option<File>)> {
-        drop(descriptor);
-        let mut answer = Answer::unavailable(frame.seq);
-        let (Kind::FetchChannel, Some(fetch)) = (frame.kind, self.0) else {
-            return Ok((answer, None));
-        };
-        Ok(match fetch.channel() {
-            Ok(channel) => {
-                (answer.ok, answer.descriptor) = (true, true);
-                answer.code.clear();
-                answer.detail.clear();
-                (answer, Some(channel))
-            }
-            Err(error) => {
-                answer.code = "fetch_channel_refused".into();
-                answer.detail = error.to_string();
-                (answer, None)
-            }
-        })
-    }
-}
-
 struct Callbacks<'a> {
     engine: &'a Arc<Engine>,
     id: &'a str,
@@ -4303,9 +4271,7 @@ struct Callbacks<'a> {
     spool: Option<PathBuf>,
     /// The invoking request as a caller: its child-call frames.
     caller: Option<&'a crate::calls::Caller>,
-    /// Its weights broker and grant: its `Weights[M]` sources and weights outputs.
-    weights: Option<(&'a crate::weights::Weights, &'a crate::weights::Grant)>,
-    /// The call's fetches: its readers wait on them, and its executor asks for channels.
+    /// The call's fetches: its readers wait on them.
     fetch: Option<&'a Arc<crate::access::Fetch>>,
     /// Its `Weights[M]` sources, whose headers and assets `model_source` answers too.
     raw: &'a [crate::gpu_service::PlanSource],
@@ -4457,9 +4423,6 @@ impl Services for Callbacks<'_> {
             }
             return Ok((answer, None));
         }
-        if frame.kind == Kind::FetchChannel {
-            return Ahead(self.fetch.map(|fetch| &**fetch)).request(frame, descriptor);
-        }
         if frame.kind == Kind::ModelSource {
             drop(descriptor);
             // A refusal is an answer: that executor fails its load with the reason.
@@ -4491,22 +4454,6 @@ impl Services for Callbacks<'_> {
                 None => Answer::unavailable(frame.seq),
             };
             return Ok((answer, None));
-        }
-        if frame.kind == Kind::WeightsWriter {
-            drop(descriptor);
-            let Some((weights, grant)) = self.weights else {
-                return Ok((Answer::unavailable(frame.seq), None));
-            };
-            let (mut answer, channel, adopted) = weights.answer(grant, frame);
-            for upload in grant.take_uploads() {
-                crate::calls::record_upload(self.engine, self.id, &upload);
-            }
-            if let Some(adopted) = adopted {
-                if let Err(error) = crate::products::record_manifest(self.engine, self.id, &adopted.output, &adopted.manifest) {
-                    answer = Answer::refused(frame.seq, "publish_refused", error.to_string());
-                }
-            }
-            return Ok((answer, channel));
         }
         let mut answer = Answer::unavailable(frame.seq);
         match frame.kind {

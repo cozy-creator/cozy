@@ -155,7 +155,6 @@ fn invoke(
             squeezed_bytes: Default::default(),
             device_weights: None,
             sources: Default::default(),
-            weights: Default::default(),
         },
         &mut Baseline,
     )
@@ -562,7 +561,6 @@ fn foreign_identity_executor_is_contained_and_keeps_its_hold_and_caches() {
                 squeezed_bytes: Default::default(),
                 device_weights: None,
                 sources: Default::default(),
-                weights: Default::default(),
             },
             &mut Baseline,
         )

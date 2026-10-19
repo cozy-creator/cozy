@@ -179,7 +179,6 @@ fn a_forked_executor_is_sealed_serves_and_is_reaped_with_its_status() {
                     squeezed_bytes: Default::default(),
                     device_weights: None,
                     sources: Default::default(),
-                    weights: Default::default(),
                 },
                 &mut Baseline,
             )

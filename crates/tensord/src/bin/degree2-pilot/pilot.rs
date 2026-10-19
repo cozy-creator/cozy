@@ -280,7 +280,6 @@ fn exec(
                 squeezed_bytes: Default::default(),
                 device_weights: None,
                 sources: Default::default(),
-                weights: Default::default(),
             },
             &mut pilot,
         )?;

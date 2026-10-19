@@ -1457,7 +1457,6 @@ print(json.dumps({"identity": generation.identity}))
                             squeezed_bytes: Default::default(),
                             device_weights: None,
                             sources: Default::default(),
-                            weights: Default::default(),
                         },
                         &mut Publisher {
                             store: &task_store,
