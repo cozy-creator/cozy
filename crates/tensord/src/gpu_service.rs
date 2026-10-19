@@ -433,6 +433,16 @@ struct Session {
     counted: device_executor::PlaneFacts,
 }
 
+/// What this call proved about the executor it returned. A cache handoff is never inferred
+/// from the pool map later: another call in its family may already have borrowed it.
+#[derive(Default)]
+enum Disposition {
+    #[default]
+    Unknown,
+    Cached,
+    ProvenEnded(Vec<Birth>),
+}
+
 /// How a session's executor came to exist, for the load record.
 #[derive(Clone, Debug, Serialize)]
 struct Launch {
@@ -1215,24 +1225,30 @@ impl Pool {
     }
     /// Keep an executor idle for its next call, noting what a loaded one holds for Status.
     /// Once the pool stopped it ends instead.
-    fn keep_idle(&self, session: Session) -> io::Result<()> {
+    fn keep_idle(&self, session: Session) -> io::Result<Disposition> {
+        self.finish_lane(&session.plan, session.start, session.degree);
         let key = session_key(&session.plan, session.start);
         if session.degree == 0 {
             let mut idle = self.deviceless.lock().unwrap();
             if !self.stopped.load(Ordering::Acquire) {
                 idle.push(session);
-                return Ok(());
+                return Ok(Disposition::Cached);
             }
             drop(idle);
-            return session.executor.shutdown();
+            let births = executor_births(&session.executor.birth, &session.followers);
+            let (plan, start, degree) = (session.plan.clone(), session.start, session.degree);
+            session.executor.shutdown()?;
+            self.retire_returned(&plan, start, degree, &births);
+            return Ok(Disposition::ProvenEnded(births));
         }
         let mut sessions = self.sessions.lock().unwrap();
         if self.stopped.load(Ordering::Acquire) {
             drop(sessions);
             let (plan, start, degree) = (session.plan.clone(), session.start, session.degree);
+            let births = executor_births(&session.executor.birth, &session.followers);
             session.executor.shutdown()?;
-            self.ended(&plan, start, degree);
-            return Ok(());
+            self.retire_returned(&plan, start, degree, &births);
+            return Ok(Disposition::ProvenEnded(births));
         }
         if session.loaded {
             let mapped = |gpu: &mut crate::memory::policy::Gpu| {
@@ -1246,17 +1262,55 @@ impl Pool {
             self.levels.lock().unwrap().insert(key.clone(), noted);
         }
         sessions.insert(key, session);
-        Ok(())
+        Ok(Disposition::Cached)
     }
     /// A lane's turn is over: its GPUs run nothing, and an executor not kept idle is gone.
-    fn settle_lane(&self, plan: &str, start: usize, degree: u32) {
+    fn finish_lane(&self, plan: &str, start: usize, degree: u32) {
         for device in self.lane(start, degree).unwrap_or_default() {
             device.memory.finished(plan);
         }
+    }
+    fn settle_lane(&self, plan: &str, start: usize, degree: u32) {
+        self.finish_lane(plan, start, degree);
         if !self.sessions.lock().unwrap().contains_key(&session_key(plan, start)) {
             self.ended(plan, start, degree);
         }
     }
+    fn retire_returned(&self, plan: &str, start: usize, degree: u32, births: &[Birth]) {
+        let key = session_key(plan, start);
+        let cached_elsewhere = self.sessions.lock().unwrap().get(&key)
+            .is_some_and(|session| !births.contains(&session.executor.birth));
+        let newer = self.lane(start, degree).unwrap_or_default().iter().any(|device| {
+            device.memory.with(|gpu| gpu.tenant(plan)
+                .is_some_and(|tenant| !births.iter().any(|birth| birth.pid == tenant.pid)))
+        });
+        if !cached_elsewhere && !newer {
+            self.ended(plan, start, degree);
+        }
+    }
+
+    /// Complete the old call's bookkeeping before publishing, using its explicit return fact.
+    /// In particular a Cached executor may already be running for another family member.
+    fn finish_returned(
+        &self, engine: &Arc<Engine>, id: &str, plan: &str, start: usize, degree: u32,
+        disposition: &Disposition,
+    ) -> io::Result<()> {
+        match disposition {
+            Disposition::Cached => (),
+            Disposition::ProvenEnded(births) => self.retire_returned(plan, start, degree, births),
+            Disposition::Unknown => {
+                if let Some(pending) = engine.get(id)?.pending_completion {
+                    await_pending_exit(engine, &pending);
+                    self.retire_returned(plan, start, degree, &pending.processes);
+                } else {
+                    self.settle_lane(plan, start, degree);
+                }
+            }
+        }
+        // A journal error here cannot turn a known cache handoff into an unknown teardown.
+        engine.finish_pending(id)
+    }
+
     pub fn store(&self) -> &Arc<Store> {
         &self.store
     }
@@ -2498,16 +2552,9 @@ impl Pool {
         calls: Option<&Arc<crate::calls::Calls>>,
     ) -> io::Result<()> {
         let (key, degree) = (plan.construction.clone(), plan.degree);
-        let result = self.run_on(engine, id, held, plan, start, calls);
-        // A known outcome with failed cleanup retains this run's permit and lane until
-        // exact exit. Dropping the permit first would dispatch over an unproven receiver.
-        if result.is_err() {
-            if let Some(pending) = engine.get(id)?.pending_completion {
-                await_pending_exit(engine, &pending);
-                engine.finish_pending(id)?;
-            }
-        }
-        self.settle_lane(&key, start, degree);
+        let mut disposition = Disposition::Unknown;
+        let result = self.run_on(engine, id, held, plan, start, calls, &mut disposition);
+        self.finish_returned(engine, id, &key, start, degree, &disposition)?;
         result
     }
 
@@ -2649,6 +2696,7 @@ impl Pool {
 
     /// One call on the lane from `start` (none, deviceless): an idle executor of its plan there
     /// leaves the pool for the call (or one starts), and comes back once it served it.
+    #[allow(clippy::too_many_arguments)]
     fn run_on(
         &self,
         engine: &Arc<Engine>,
@@ -2657,6 +2705,7 @@ impl Pool {
         plan: Plan,
         start: usize,
         calls: Option<&Arc<crate::calls::Calls>>,
+        disposition: &mut Disposition,
     ) -> io::Result<()> {
         // A cancel ends the call's children with it.
         let stops = |cancel: Cancellation| {
@@ -2731,7 +2780,7 @@ impl Pool {
         };
         let facts = crate::journal::ExecutorFacts::observed(session.executor.birth.pid, runtime, hello.tensorfs_version.clone());
         if !engine.authorize_managed(id, Some(facts))? {
-            self.keep_idle(session)?;
+            *disposition = self.keep_idle(session)?;
             engine.finish_stopped(id)?;
             return Ok(());
         }
@@ -2743,13 +2792,12 @@ impl Pool {
                 Ok(reusable) => {
                     // A caller can submit again as soon as finish publishes. Its predecessor
                     // must already be idle, or gone if it cannot be reused.
-                    let returned = if reusable {
+                    *disposition = if reusable {
                         self.keep_idle(session)
                     } else {
-                        session.executor.terminate().map(drop)
-                    };
-                    returned?;
-                    engine.finish_pending(id)?;
+                        let births = executor_births(&session.executor.birth, &session.followers);
+                        session.executor.terminate().map(|_| Disposition::ProvenEnded(births))
+                    }?;
                     return Ok(());
                 }
                 Err(error) => {
@@ -2774,7 +2822,7 @@ impl Pool {
         if !engine.redeliver(id)? {
             return Ok(()); // canceled meanwhile
         }
-        self.run_on(engine, id, held, fresh, start, calls)
+        self.run_on(engine, id, held, fresh, start, calls, disposition)
     }
 
     /// Launch an executor for `plan` (fork from its generation's import-only executor, else
@@ -3878,14 +3926,18 @@ fn await_pending_exit(engine: &Arc<Engine>, pending: &crate::journal::PendingCom
     }
 }
 
+fn executor_births(leader: &Birth, followers: &[platform::process::Exact]) -> Vec<Birth> {
+    let mut processes = platform::process::group_members(leader);
+    processes.extend(followers.iter().map(|exact| exact.birth().clone()));
+    processes.push(leader.clone());
+    processes
+}
+
 fn defer_completion(
     engine: &Arc<Engine>, id: &str, leader: &Birth,
     followers: &[platform::process::Exact], outcome: Outcome,
 ) -> io::Result<()> {
-    let mut processes = platform::process::group_members(leader);
-    processes.extend(followers.iter().map(|exact| exact.birth().clone()));
-    processes.push(leader.clone());
-    engine.defer_completion(id, outcome, processes)
+    engine.defer_completion(id, outcome, executor_births(leader, followers))
 }
 
 /// An error ends its executor; the exact exit is observed before the run settles, and a
@@ -4916,6 +4968,78 @@ int nvmlDeviceGetDisplayActive(void *d, int *s) { *s = 0; return 0; }
             sources: vec![],
             degree,
         }
+    }
+
+    /// A family can take the cached executor while its predecessor still holds its permit.
+    /// The absent cache entry then means borrowed, not dead. A rejected journal finish also
+    /// cannot turn this known handoff into a wait for that live executor's exit.
+    #[test]
+    fn a_same_family_cached_handoff_keeps_the_live_executor_on_finish_error_too() {
+        let (root, pool, engine) = pool_of(1);
+        for reject_finish in [false, true] {
+            let mut child = crate::scratch::until_stdin_closes()
+                .stdin(std::process::Stdio::piped()).spawn().unwrap();
+            let birth = Birth::of(child.id()).unwrap();
+            let owned_birth = birth.clone();
+            let id = engine.submit(&format!("cached-handoff-{reject_finish}"), crate::journal::Invocation::default()).unwrap().id;
+            let (done, finished) = std::sync::mpsc::channel();
+            let serving = pool.clone();
+            assert!(engine.dispatch_managed(&id, move |engine, id| {
+                engine.register_managed(&id, owned_birth.clone(), Arc::new(|| Ok(())))?;
+                assert!(engine.authorize_managed(&id, None)?);
+                let model = plan("handoff", 1);
+                serving.leaders.lock().unwrap().insert((model.construction.clone(), 0));
+                serving.levels.lock().unwrap().insert(model.construction.clone(), (("g".into(), "app".into()), Level::Host));
+                serving.devices[0].memory.with(|gpu| {
+                    gpu.starting(&model.construction, 0);
+                    gpu.spawned(&model.construction, owned_birth.pid);
+                });
+                let mut claims = [None];
+                let root = id.parse::<u64>().unwrap();
+                let (first_gpu, _first) = serving.place(&engine, &model, (root, Some("same-family")), None, &mut claims).unwrap();
+                let (next_gpu, _next) = serving.place(&engine, &model, (root + 100, Some("same-family")), None, &mut claims).unwrap();
+                assert_eq!((first_gpu, next_gpu), (0, 0));
+                assert!(serving.permit(&engine, Some(root + 200), Some("stranger"), 0..1, &claims).is_none());
+                // The next call already took the cache entry; its exact process still lives.
+                assert!(serving.sessions.lock().unwrap().is_empty());
+                let outcome = if reject_finish {
+                    // The journal's real cancellation-authority check supplies a deterministic
+                    // finish error, with no production failpoint or timing assumption.
+                    Outcome::Canceled
+                } else {
+                    Outcome::Completed(crate::journal::ResultRecord {
+                        value: json!({"answer": 42}), artifacts: vec![], asset_bindings: vec![], adjustments: vec![],
+                    })
+                };
+                engine.defer_completion(&id, outcome, vec![owned_birth.clone()])?;
+                let result = serving.finish_returned(&engine, &id, &model.construction, 0, 1, &Disposition::Cached);
+                let preserved = result.is_err() == reject_finish
+                    && !owned_birth.ended()?
+                    && serving.leaders.lock().unwrap().contains(&(model.construction.clone(), 0))
+                    && serving.levels.lock().unwrap().contains_key(&model.construction)
+                    && serving.devices[0].memory.with(|gpu| gpu.tenant(&model.construction).is_some_and(|tenant| tenant.pid == owned_birth.pid));
+                if reject_finish {
+                    assert_eq!(engine.get(&id)?.state, State::Running);
+                    assert!(engine.get(&id)?.result.is_none());
+                    engine.cancel(&id, "test")?;
+                    engine.finish_pending(&id)?;
+                } else {
+                    assert_eq!(engine.get(&id)?.state, State::Completed);
+                }
+                done.send(preserved).unwrap();
+                Ok(())
+            }).unwrap());
+            // Only a failure backstop: the ordering is established by real family permits and
+            // the completion channel. Always close/reap this test's child before asserting.
+            let proof = finished.recv_timeout(std::time::Duration::from_secs(30));
+            drop(child.stdin.take());
+            child.wait().unwrap();
+            pool.retire_returned("handoff", 0, 1, &[birth]);
+            assert!(proof.unwrap(), "the old call retired a borrowed live executor");
+        }
+        pool.stop().unwrap();
+        drop((pool, engine));
+        crate::scratch::remove(&root);
     }
 
     #[test]
