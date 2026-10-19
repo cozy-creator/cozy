@@ -1717,9 +1717,12 @@ impl DeviceExecutor {
                     }
                 }
                 Some(Event::Request) if frame.kind == Kind::KeepPages => {
+                    watch.serving(true);
                     let pages = (0..frame.descriptors).map(|_| platform::handles::recv_fd(&self.stream).map(File::from));
                     let pages = pages.collect::<Result<Vec<_>, _>>()?;
-                    write_frame(&mut self.stream, &services.keep_pages(&frame, pages))?;
+                    let answer = services.keep_pages(&frame, pages);
+                    watch.serving(false);
+                    write_frame(&mut self.stream, &answer)?;
                 }
                 Some(Event::Request) => {
                     // The machine's own answer time is not the executor's stillness.
