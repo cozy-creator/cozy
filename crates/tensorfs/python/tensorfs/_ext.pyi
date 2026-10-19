@@ -133,8 +133,8 @@ class Component:
     @property
     def config(self) -> dict[str, Any]: ...
     @property
-    def config_file(self) -> str | None:
-        """The config's file name when it isn't `config.json`."""
+    def config_file(self) -> str:
+        """The rendered config's file name (`config.json` by default)."""
     @property
     def tensors(self) -> dict[str, Info]:
         """`key -> Info`, in construction order."""

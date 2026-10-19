@@ -713,7 +713,7 @@ pub struct PyComponent {
     config: Py<PyDict>,
     /// The config's file name when it isn't `config.json`.
     #[pyo3(get)]
-    config_file: Option<String>,
+    config_file: String,
     /// `key -> Info`, in construction order.
     #[pyo3(get)]
     tensors: Py<PyDict>,
@@ -947,7 +947,7 @@ impl PyCheckpoint {
                 name: c.name.clone(),
                 cls: c.class.clone(),
                 config: config_dict(py, &c.config)?.unbind(),
-                config_file: c.config_file.clone(),
+                config_file: c.config_file.clone().unwrap_or_else(|| "config.json".into()),
                 tensors: this.tensor_dict(py, c)?,
                 assets: assets.unbind(),
                 ck: this.stored.is_some().then(|| slf.clone().unbind()),
