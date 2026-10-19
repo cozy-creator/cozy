@@ -5,6 +5,7 @@ __pycache__/
 dist/
 *.egg-info/
 *.exe
+crates/tensorfs-core/kernels/aot/
 
 # Agent task and ownership notes stay out of history
 .task/
