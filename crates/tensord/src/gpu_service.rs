@@ -1288,15 +1288,21 @@ impl Pool {
             Disposition::Cached => (),
             Disposition::ProvenEnded(births) => self.retire_returned(plan, start, degree, births),
             Disposition::Unknown(owned) => {
-                let record = engine.get(id)?;
-                let births = match record.pending_completion {
-                    Some(pending) => pending.processes,
-                    None if owned.is_empty() => record.process.into_iter()
-                        .flat_map(|birth| executor_births(&birth, &[])).collect(),
-                    None => owned.clone(),
-                };
+                // Registration may have failed before persisting these owned processes.
+                // A second journal error cannot authorize releasing their live lane.
+                let record = engine.get(id);
+                let mut births = owned.clone();
+                if let Ok(record) = &record {
+                    if let Some(pending) = &record.pending_completion {
+                        births.extend(pending.processes.iter().cloned());
+                    }
+                    if births.is_empty() {
+                        births.extend(record.process.iter().flat_map(|birth| executor_births(birth, &[])));
+                    }
+                }
                 await_executor_exit(engine, &births);
                 self.retire_returned(plan, start, degree, &births);
+                record?;
             }
         }
         // A journal error here cannot turn a known cache handoff into an unknown teardown.
@@ -4233,6 +4239,36 @@ int nvmlDeviceGetDisplayActive(void *d, int *s) { *s = 0; return 0; }
         assert!(pool.hosting(&model.construction).is_empty());
         pool.stop().unwrap();
         drop((pool, engine));
+        crate::scratch::remove(&root);
+    }
+
+    /// The journal can be unreadable after registration fails; the owned process still
+    /// determines when its lane can be retired, and the read error is then preserved.
+    #[test]
+    fn an_unreadable_journal_still_retires_the_exited_owned_process() {
+        let (root, pool, engine) = pool_of(1);
+        let mut child = crate::scratch::until_stdin_closes()
+            .stdin(std::process::Stdio::piped()).spawn().unwrap();
+        let birth = Birth::of(child.id()).unwrap();
+        let exact = Exact::open(&birth).unwrap().unwrap();
+        let id = engine.submit("unreadable-retirement", crate::journal::Invocation::default()).unwrap().id;
+        pool.leaders.lock().unwrap().insert(birth.pid, (birth.clone(), "unreadable".into(), 0));
+        pool.tenants.lock().unwrap().insert(birth.pid, Tenant { plan: "unreadable".into(), start: 0, exact });
+        pool.levels.lock().unwrap().insert("unreadable".into(), (("g".into(), "app".into()), Level::Host, birth.clone()));
+        // Corrupt only this test's real SQLite record, without a production failpoint.
+        let db = rusqlite::Connection::open(engine.root.join("executions.sqlite3")).unwrap();
+        assert_eq!(db.execute("UPDATE executions SET record='{' WHERE id=?1", [&id]).unwrap(), 1);
+        let expected = engine.get(&id).unwrap_err();
+        drop(child.stdin.take());
+        assert!(child.wait().unwrap().success());
+        let error = pool.finish_returned(&engine, &id, "unreadable", 0, 1,
+            &Disposition::Unknown(vec![birth.clone()])).unwrap_err();
+        assert_eq!(error.to_string(), expected.to_string());
+        assert!(!pool.tenants.lock().unwrap().contains_key(&birth.pid));
+        assert!(pool.hosting("unreadable").is_empty());
+        assert!(pool.level("unreadable").is_none());
+        pool.stop().unwrap();
+        drop((pool, engine, db));
         crate::scratch::remove(&root);
     }
 
