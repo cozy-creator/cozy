@@ -1,4 +1,4 @@
-//! One machine's API through `cozy_proto::machine::client`: TLS that admits only the machine's
+//! One machine's API through `protocol::machine::client`: TLS that admits only the machine's
 //! pinned leaf, every request carrying a fresh machine-scope Cozy-Cap signed by the key the
 //! machine scopes its runs to. Control and SSE share one HTTP/2 connection; inputs upload as
 //! ranged PUTs side by side on HTTP/1.1 lanes of their own.
@@ -12,7 +12,7 @@ use std::{
     time::Instant,
 };
 
-use cozy_proto::{
+use protocol::{
     ids::Digest,
     machine::{
         self as v1,
@@ -329,5 +329,5 @@ async fn put(
 
 /// The TLS leaf (DER) the machine at `address` presents, whatever it is.
 pub async fn presented_leaf(address: &str) -> Result<Vec<u8>, LinkError> {
-    Ok(cozy_proto::machine::client::presented_leaf(address).await?)
+    Ok(protocol::machine::client::presented_leaf(address).await?)
 }

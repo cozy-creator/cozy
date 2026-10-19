@@ -1,7 +1,6 @@
 //! The journal's stored values: the domain values themselves as JSON, bytes in base64. Measured
 //! on the stored kinds (a model choice, a product, an intake receipt, a terminal page) JSON is
-//! 3–5× protobuf's bytes, a few hundred bytes a record. A journal written before (protobuf) is
-//! archived when it opens and never read (journal.rs).
+//! 3–5× protobuf's bytes, a few hundred bytes a record.
 use crate::api::domain;
 use serde::{de::DeserializeOwned, Serialize};
 

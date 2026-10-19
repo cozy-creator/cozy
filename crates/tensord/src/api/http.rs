@@ -7,7 +7,7 @@ use super::{
     capability::{self, Grant},
     domain, v1, MachineIdentity,
 };
-use cozy_platform::tail as logs;
+use platform::tail as logs;
 use axum::{
     body::{Body, Bytes},
     extract::{rejection::QueryRejection, DefaultBodyLimit, Path, Query, State},
@@ -19,7 +19,7 @@ use axum::{
     routing::{get, post, put},
     Json, Router,
 };
-use cozy_proto::error::{Envelope, Error};
+use protocol::error::{Envelope, Error};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{
     io::{Read, Seek, SeekFrom},

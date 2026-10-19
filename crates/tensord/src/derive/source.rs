@@ -1,5 +1,5 @@
 //! The source channel: one granted checkpoint's files and bytes (module doc of `derive`).
-use cozy_platform::ipc::LocalStream;
+use platform::ipc::LocalStream;
 use std::io;
 
 use serde::Deserialize;

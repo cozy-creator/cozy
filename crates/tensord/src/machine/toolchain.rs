@@ -11,8 +11,8 @@ use std::{
     sync::Mutex,
 };
 
-use cozy_platform::tools;
-use cozy_proto::machine::{KernelVerdict, Toolchain};
+use platform::tools;
+use protocol::machine::{KernelVerdict, Toolchain};
 use crate::stop::Stop;
 
 use crate::process::Supervised;

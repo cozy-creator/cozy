@@ -12,9 +12,9 @@ use super::{
     machine_runs::{follow, query},
     v1, MachineIdentity,
 };
-use cozy_proto::error::{Error, Kind};
+use protocol::error::{Error, Kind};
 use serde_json::{json, Value};
-use cozy_platform::durable::FileAt;
+use platform::durable::FileAt;
 use std::{
     collections::{HashMap, VecDeque},
     fs::File,

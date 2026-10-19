@@ -11,8 +11,8 @@ mod machine_update;
 mod server;
 pub mod workspaces;
 
-/// The machine API's types and Cozy-Cap live in `cozy-proto`, shared with Calcifer and the CLI.
-pub use cozy_proto::{capability, machine as v1};
+/// The machine API's types and Cozy-Cap live in `protocol`, shared with Calcifer and the CLI.
+pub use protocol::{capability, machine as v1};
 
 pub use backend::MachineBackend;
 pub(crate) use http::refused;

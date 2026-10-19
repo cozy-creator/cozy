@@ -119,7 +119,7 @@ pub struct Disk {
 
 impl Disk {
     pub fn measure(root: &Path) -> io::Result<Disk> {
-        let space = cozy_platform::durable::space(root).map_err(|error| {
+        let space = platform::durable::space(root).map_err(|error| {
             io::Error::other(format!("cannot measure the filesystem under {}: {error}", root.display()))
         })?;
         Ok(Disk {

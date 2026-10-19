@@ -5,7 +5,7 @@ use tensord::api::{
     MachineIdentity,
 };
 use ed25519_dalek::SigningKey;
-use cozy_platform::durable::set_mode;
+use platform::durable::set_mode;
 use std::{fs, path::PathBuf};
 
 struct Area(PathBuf);

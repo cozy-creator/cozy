@@ -7,7 +7,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use cozy_proto::{
+use protocol::{
     calcifer::{
         CHECKPOINT, Call, Event, ItemStatus, Kind, Machine, MachineKind, MachineState, OutputItem,
         Reason, Run, Status, Warning,

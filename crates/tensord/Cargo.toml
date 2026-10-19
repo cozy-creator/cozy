@@ -6,9 +6,9 @@ publish.workspace = true
 
 [dependencies]
 clap.workspace = true
-cozy-platform.workspace = true
+platform.workspace = true
 getrandom.workspace = true
-cozy-proto.workspace = true
+protocol.workspace = true
 str0m = { version = "0.24", default-features = false, features = ["aws-lc-rs"] }
 hub-client.workspace = true
 reqwest.workspace = true
@@ -54,7 +54,7 @@ tracing-subscriber.workspace = true
 
 [features]
 # Dev builds only (xs-045 U12): migration runs (src/migrate.rs). Never in a release.
-migrate = ["cozy-proto/migrate"]
+migrate = ["protocol/migrate"]
 
 [dev-dependencies]
 tower.workspace = true

@@ -127,7 +127,7 @@ impl ModelSources {
     /// Answer a `model_source` request: the bytes in a file nobody can write, with their digest.
     pub fn serve(&self, frame: &Frame) -> io::Result<(Answer, File)> {
         let bytes = self.source(&frame.manifest, &frame.name)?;
-        let file = cozy_platform::shm::frozen("tensord-weights", &bytes)?;
+        let file = platform::shm::frozen("tensord-weights", &bytes)?;
         let mut answer = Answer::unavailable(frame.seq);
         (answer.ok, answer.held) = (true, true);
         answer.code.clear();

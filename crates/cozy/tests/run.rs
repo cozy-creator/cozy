@@ -7,7 +7,7 @@ use serde_json::Value;
 
 const CARDS: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../cozy-cli/tests/fixtures/cards"
+    "/../cli/tests/fixtures/cards"
 );
 
 /// Points this home at a Hub that never answers and keeps a real release card for it, as a Hub

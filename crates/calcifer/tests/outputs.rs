@@ -18,8 +18,8 @@ use calcifer::{
     store::{Batch, NewRun, Store},
 };
 use common::{Tensord, installing_machine, package_run};
-use cozy_platform::{lock::LockFile, paths::Home};
-use cozy_proto::{
+use platform::{lock::LockFile, paths::Home};
+use protocol::{
     calcifer::{
         CHECKPOINT, Event, Holder, Kind, MachinesEvent, OutputItem, Run, RunsEvent, Status,
         SubmitRun,
@@ -43,7 +43,7 @@ const PATIENCE: Duration = Duration::from_secs(900);
 
 /// `cozy calcifer` serving a home, and a client of its API.
 struct Served {
-    task: JoinHandle<Result<Stopped, cozy_proto::error::Error>>,
+    task: JoinHandle<Result<Stopped, protocol::error::Error>>,
     holder: Holder,
     client: Client,
 }
@@ -103,7 +103,7 @@ impl Served {
         let response = request.header("idempotency-key", key).json(submit);
         let response = response.send().await.unwrap();
         assert_eq!(response.status(), StatusCode::ACCEPTED);
-        let submitted: cozy_proto::calcifer::Submitted = response.json().await.unwrap();
+        let submitted: protocol::calcifer::Submitted = response.json().await.unwrap();
         submitted.run
     }
 
@@ -609,7 +609,7 @@ async fn a_fresh_machine_read_shows_what_a_settled_warm_run_installed() {
         .await
         .unwrap();
     assert_eq!(fresh.status(), StatusCode::OK);
-    let fresh: cozy_proto::calcifer::Machine = fresh.json().await.unwrap();
+    let fresh: protocol::calcifer::Machine = fresh.json().await.unwrap();
     let status = fresh.status.expect("a Status read now");
     assert!(
         status
@@ -727,7 +727,7 @@ async fn ending_a_machine_waits_for_its_runs_outputs_and_force_gives_them_up() {
     // `force` ends it mid-export: the output is given up, recorded lost, and no part remains.
     let out = home.path().join("forced");
     let mut forced = package_run(home.path(), &gate, 64 << 20);
-    forced.on = cozy_proto::calcifer::On::Machine("n".into());
+    forced.on = protocol::calcifer::On::Machine("n".into());
     forced.out = Some(out.clone());
     let run = served.submit_as("forced", &forced).await;
     let mut events = served.events(&run.id).await;

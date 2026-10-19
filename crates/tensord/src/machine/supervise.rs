@@ -40,7 +40,7 @@ pub fn supervise(
 ) -> io::Result<Ready> {
     if let Some(handle) = service_ready {
         // SAFETY: the stable parent handed this pipe end to this process alone.
-        let pipe = unsafe { cozy_platform::process::handed(handle) }?;
+        let pipe = unsafe { platform::process::handed(handle) }?;
         return Ok(Ready(Some(File::from(pipe))));
     }
     let program = std::env::current_exe()?;
@@ -55,8 +55,8 @@ pub fn supervise(
         command
             .args(&arguments)
             .arg("--service-ready")
-            .arg(cozy_platform::process::hand_on(&write)?.to_string());
-        let mut service = cozy_platform::process::spawn(command)?;
+            .arg(platform::process::hand_on(&write)?.to_string());
+        let mut service = platform::process::spawn(command)?;
         drop(write);
         let code = service.wait()?.code().unwrap_or(1);
         // What the service left running ends with it.
@@ -107,7 +107,7 @@ pub fn supervise(paths: &super::update::Paths, provider: Option<ProviderSelf>) -
     signals.thread_block().map_err(io::Error::from)?;
     // Orphans of the service reparent here, not to a PID 1 that may not reap them. Elsewhere
     // (macOS) they reparent to launchd, which reaps them, and executor trees end by group.
-    match cozy_platform::process::become_subreaper() {
+    match platform::process::become_subreaper() {
         Err(error) if error.is_unsupported() => {}
         other => other?,
     }
@@ -123,7 +123,7 @@ pub fn supervise(paths: &super::update::Paths, provider: Option<ProviderSelf>) -
             ForkResult::Child => {
                 drop(read);
                 // The service never outlives its supervisor.
-                if !cozy_platform::process::die_with_parent(parent.as_raw() as u32)? {
+                if !platform::process::die_with_parent(parent.as_raw() as u32)? {
                     std::process::exit(1);
                 }
                 SigSet::empty().thread_set_mask().map_err(io::Error::from)?;

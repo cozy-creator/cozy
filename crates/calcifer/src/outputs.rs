@@ -21,7 +21,7 @@ use axum::{
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::Response,
 };
-use cozy_proto::{
+use protocol::{
     calcifer::{CHECKPOINT, Event, MachineState},
     error::Kind,
     ids::{Digest, RunId},
@@ -404,7 +404,7 @@ impl Calcifer {
                 }
             }
             if let Some(directory) = dest.parent() {
-                let _ = cozy_platform::durable::sync_dir(directory);
+                let _ = platform::durable::sync_dir(directory);
             }
             let (id, name, index, rev) = (run.id.as_str(), &item.name, item.index, item.rev);
             self.publish(&run.id, self.store.exported(id, name, index, rev, dest)?);

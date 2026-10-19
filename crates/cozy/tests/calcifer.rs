@@ -7,8 +7,8 @@ use std::{
 };
 
 use common::Home;
-use cozy_platform::{durable, lock::LockFile, paths};
-use cozy_proto::calcifer::{Down, Holder};
+use platform::{durable, lock::LockFile, paths};
+use protocol::calcifer::{Down, Holder};
 
 /// `cozy calcifer` is named `calcifer`, serves its home, and exits 0 on `down`.
 #[test]

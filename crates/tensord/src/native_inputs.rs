@@ -13,7 +13,7 @@ use tensorfs_core::{
     format::ObjectRef,
     sha256,
 };
-use cozy_proto::error::Error;
+use protocol::error::Error;
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct IntakeSpec {
@@ -152,7 +152,7 @@ impl SourceIntake {
             uuid::Uuid::new_v4().to_string(),
         );
         fs::create_dir(&directory).map_err(database)?;
-        cozy_platform::durable::set_mode(&directory, 0o700).map_err(|error| database(error.into()))?;
+        platform::durable::set_mode(&directory, 0o700).map_err(|error| database(error.into()))?;
         Ok(Box::new(Self {
             store,
             journal,
@@ -215,9 +215,9 @@ impl InputTreeReceiver for SourceIntake {
             std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
             std::collections::btree_map::Entry::Vacant(entry) => {
                 let path = self.directory.join(&hash);
-                let file = cozy_platform::durable::open_nofollow(
+                let file = platform::durable::open_nofollow(
                     &path,
-                    cozy_platform::durable::Mode::mode(OpenOptions::new().create_new(true).read(true).write(true), 0o600),
+                    platform::durable::Mode::mode(OpenOptions::new().create_new(true).read(true).write(true), 0o600),
                 )
                 .map_err(|error| database(error.into()))?;
                 entry.insert(Partial {

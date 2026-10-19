@@ -3,7 +3,7 @@
 //! (no torch is installed, so no device is touched) in the executor's own words, and teardown
 //! leaves no member of the group. `TENSORD_GROUP_GENERATIONS` names the installed
 //! generations directory.
-use cozy_platform::process::{Birth, group_members};
+use platform::process::{Birth, group_members};
 use tensord::{
     device_executor::{Baseline, DeviceCommand, DeviceExecutor, ExecutorConfig},
     launch_identity::Seal,

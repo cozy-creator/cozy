@@ -42,7 +42,7 @@ fn a_relayed_child_stage_carries_its_download_bytes() {
         // The Runtime always sends the key: null when the frame names no child (run 5257).
         event["call_request"] = call.map_or(Value::Null, Value::from);
         let body = serde_json::to_vec(&event).unwrap();
-        let (mut runtime, mut machine) = cozy_platform::ipc::pair().unwrap();
+        let (mut runtime, mut machine) = platform::ipc::pair().unwrap();
         runtime.write_all(&(body.len() as u32).to_be_bytes()).unwrap();
         runtime.write_all(&body).unwrap();
         observe(engine, &job, &mut completed, &device_executor::read_frame(&mut machine).unwrap().unwrap(), Some(&caller));
@@ -84,7 +84,7 @@ fn package_log_lines_reach_the_root_log_and_stop_at_its_bound() {
         let event = json!({"event": "progress", "request_id": request, "kind": "log", "name": message,
             "value": level, "fields": fields, "seq": 1, "at_unix_ms": 1});
         let body = serde_json::to_vec(&event).unwrap();
-        let (mut runtime, mut machine) = cozy_platform::ipc::pair().unwrap();
+        let (mut runtime, mut machine) = platform::ipc::pair().unwrap();
         runtime.write_all(&(body.len() as u32).to_be_bytes()).unwrap();
         runtime.write_all(&body).unwrap();
         observe(engine, seam, &mut 0, &device_executor::read_frame(&mut machine).unwrap().unwrap(), None);
@@ -102,7 +102,7 @@ fn package_log_lines_reach_the_root_log_and_stop_at_its_bound() {
     send(own, &child, "not mine", "info", json!({}));
     let body = serde_json::to_vec(&json!({"event": "progress", "request_id": job, "kind": "metric",
         "name": "steps", "value": 3, "fields": {}})).unwrap();
-    let (mut runtime, mut machine) = cozy_platform::ipc::pair().unwrap();
+    let (mut runtime, mut machine) = platform::ipc::pair().unwrap();
     runtime.write_all(&(body.len() as u32).to_be_bytes()).unwrap();
     runtime.write_all(&body).unwrap();
     observe(engine, own, &mut 0, &device_executor::read_frame(&mut machine).unwrap().unwrap(), None);

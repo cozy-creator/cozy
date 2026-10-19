@@ -41,7 +41,7 @@ pub mod output_capacity;
 pub mod precision;
 pub mod process;
 pub mod products;
-pub mod protocol;
+pub mod seam;
 pub mod published;
 pub mod reclaim;
 #[cfg(target_os = "linux")]

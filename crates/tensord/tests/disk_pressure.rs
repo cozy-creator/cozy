@@ -9,7 +9,7 @@ use tensord::{
     launch_identity::Seal,
     reclaim::{self, Caches, Disk, KernelCaches, StoreCaches, Swept},
 };
-use cozy_platform::durable;
+use platform::durable;
 use std::{
     collections::HashSet,
     fs, io,

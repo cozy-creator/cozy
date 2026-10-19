@@ -5,7 +5,7 @@ and a run's own child runs. A laptop's machine and a rental's are the same.
 
 **HTTP + JSON** on the machine's one pinned-TLS listener (`api/server.rs`, `api/http.rs`):
 control and SSE over HTTP/2, bulk bytes over HTTP/1.1. The routes, bodies and events are
-`crates/cozy-proto/openapi/machine.json`, generated from `cozy_proto::machine`; how each former
+`crates/protocol/openapi/machine.json`, generated from `protocol::machine`; how each former
 gRPC call maps onto them is `~/cozy_v2/tracker/design/machine-http-api.md` §2. In short:
 
 - `GET /v1/status` (identity and readiness receipt without a cap; the whole picture, as SSE on

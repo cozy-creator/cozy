@@ -46,9 +46,9 @@ import transformers
 from transformers.conversion_mapping import get_model_conversion_mapping
 from transformers.core_model_loading import WeightConverter, WeightRenaming, rename_source_key
 
-ROOT = Path(__file__).resolve().parents[1]
-OUT = ROOT / "crates" / "tensorfs-core" / "orders"
-TESTS = ROOT / "crates" / "tensorfs-core" / "vectors" / "orders"
+ROOT = Path(__file__).resolve().parents[2]
+OUT = ROOT / "tensorfs-core" / "orders"
+TESTS = ROOT / "tensorfs-core" / "vectors" / "orders"
 DIFFUSERS = "0.41.0.dev0"  # git 7ecb1e1b: Flux3 is in Diffusers main only
 TRANSFORMERS = "5.20.0"
 

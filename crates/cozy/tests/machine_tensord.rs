@@ -111,7 +111,7 @@ fn a_dev_binary_runs_as_the_machine_and_reports_its_version_and_commit() {
             shown["status"]["commit"].as_str(),
             shown["status"]["dev"].as_bool()
         ),
-        (Some(cozy_proto::COMMIT), Some(true)),
+        (Some(protocol::COMMIT), Some(true)),
         "{shown}"
     );
     assert_eq!(
@@ -219,7 +219,7 @@ fn a_rental_runs_a_dev_binary_and_refuses_one_its_glibc_cannot_load() {
     };
     assert_eq!(
         shown["status"]["commit"].as_str(),
-        Some(cozy_proto::COMMIT),
+        Some(protocol::COMMIT),
         "{shown}"
     );
 

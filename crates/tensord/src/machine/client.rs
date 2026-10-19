@@ -15,7 +15,7 @@ const WHEEL_NAME: &str = env!("COZY_CLIENT_WHEEL_NAME");
 
 /// The uv every machine runs when its image brought none: one version, fetched on first need.
 pub const UV: &str = "0.12.24";
-/// That release's archive for each OS and CPU, and its sha256 (cozy_platform::tools' pins):
+/// That release's archive for each OS and CPU, and its sha256 (platform::tools' pins):
 /// a tar.gz holding `<archive>/uv`, or on Windows a zip holding `uv.exe`.
 const UV_ARCHIVES: [(&str, &str, &str, &str); 6] = [
     ("linux", "x86_64", "uv-x86_64-unknown-linux-gnu", "b4dfaef47d491a7296981f8374a4595f55dbf84e8937c8ecd2983574d8bb3da6"),
@@ -28,7 +28,7 @@ const UV_ARCHIVES: [(&str, &str, &str, &str); 6] = [
 
 /// The root's own uv: an image's, or the pinned one [`ensure_uv`] fetches there.
 pub fn uv(root: &Path) -> PathBuf {
-    root.join("usr/local/bin").join(cozy_platform::paths::exe("uv"))
+    root.join("usr/local/bin").join(platform::paths::exe("uv"))
 }
 
 /// Fetches the pinned uv to `uv` when it is absent, verified by its sha256. A bare name is the
@@ -121,7 +121,7 @@ pub fn wheel(engine: &Path) -> io::Result<PathBuf> {
 
 /// The installer helper's interpreter under `engine`.
 pub fn helper_python(engine: &Path) -> PathBuf {
-    cozy_platform::paths::venv_python(&engine.join("helper"))
+    platform::paths::venv_python(&engine.join("helper"))
 }
 
 /// The installer helper: an environment over Python 3.12 holding the client with its installer
@@ -162,7 +162,7 @@ pub fn helper(engine: &Path, uv: &Path, wheel: &Path) -> io::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cozy_platform::durable::FileId;
+    use platform::durable::FileId;
 
     /// A root with no uv gets the pinned one, verified, once; a bare name is the PATH's.
     #[test]

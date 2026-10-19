@@ -208,8 +208,8 @@ fn judge(flights: &mut HashMap<Id, Flight>, finished: &[f64], waits: &mut Vec<Du
 /// What `held` leaves of `[0, length)`, cut into parts of `clamp(missing / lanes, 1 MiB, most)`
 /// bytes, so every lane ramps on its own connection.
 pub(crate) fn parts(held: &[(u64, u64)], length: u64, lanes: usize, most: u64) -> Vec<(u64, u64)> {
-    let missing = cozy_proto::machine::missing(held, length);
-    let total = cozy_proto::machine::held_bytes(&missing);
+    let missing = protocol::machine::missing(held, length);
+    let total = protocol::machine::held_bytes(&missing);
     let size = (total / lanes as u64).clamp(1 << 20, most);
     missing
         .into_iter()

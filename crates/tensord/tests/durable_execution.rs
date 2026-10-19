@@ -6,7 +6,7 @@ mod child;
 #[path = "common/named_runtime.rs"]
 mod named_runtime;
 use child::until_stdin_closes;
-use cozy_platform::process::Birth;
+use platform::process::Birth;
 use tensord::{
     execution::Engine,
     gpu_service::{GpuConfig, Pool},
@@ -615,7 +615,7 @@ fn a_newer_or_damaged_row_never_hides_the_rest_of_the_journal() {
 fn age(path: &std::path::Path, days: u64) {
     let when = std::time::SystemTime::now() - Duration::from_secs(days * 24 * 60 * 60);
     let times = fs::FileTimes::new().set_accessed(when).set_modified(when);
-    cozy_platform::durable::set_times(path, times).unwrap();
+    platform::durable::set_times(path, times).unwrap();
 }
 
 #[test]

@@ -264,11 +264,11 @@ fn submitters_share_a_packages_executor_and_packages_share_a_checkpoints_weights
     // nothing.
     let birth = second.process.clone().unwrap();
     assert_eq!(
-        cozy_platform::process::Birth::of(birth.pid).unwrap(),
+        platform::process::Birth::of(birth.pid).unwrap(),
         birth
     );
     // The exact process this test's pool started, by its recorded birth.
-    cozy_platform::process::Exact::open(&birth).unwrap().expect("it runs").kill().unwrap();
+    platform::process::Exact::open(&birth).unwrap().expect("it runs").kill().unwrap();
     while !birth.ended().unwrap() {
         std::thread::sleep(Duration::from_millis(20));
     }

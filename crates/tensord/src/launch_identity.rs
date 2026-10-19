@@ -172,10 +172,10 @@ pub(crate) fn egid() -> u32 {
 pub fn trampoline(
     python: &Path,
     identity: Option<LaunchIdentity>,
-    scope: Option<&cozy_platform::contain::Scope>,
+    scope: Option<&platform::contain::Scope>,
 ) -> io::Result<Command> {
     let mut command = Command::new(python);
-    cozy_platform::process::inherit_nothing(&mut command);
+    platform::process::inherit_nothing(&mut command);
     command
         .args([
             "-I",
@@ -213,13 +213,13 @@ pub fn trampoline(
 pub fn trampoline(
     python: &Path,
     identity: Option<LaunchIdentity>,
-    _scope: Option<&cozy_platform::contain::Scope>,
+    _scope: Option<&platform::contain::Scope>,
 ) -> io::Result<Command> {
     if let Some(identity) = identity {
         identity.validate()?;
     }
     let mut command = Command::new(venv_home(python)?.map_or_else(|| python.into(), |home| home.join("python.exe")));
-    cozy_platform::process::inherit_nothing(&mut command);
+    platform::process::inherit_nothing(&mut command);
     Ok(command)
 }
 
@@ -292,7 +292,7 @@ pub fn credential_name(name: &str) -> bool {
 /// The process environment every machine-launched package process starts from: the
 /// machine's own environment without credentials or names the seal owns.
 pub fn inherited() -> BTreeMap<String, String> {
-    cozy_proto::config::environment()
+    protocol::config::environment()
         .iter()
         .filter(|(name, _)| {
             !credential_name(name) && !ERASED_PREFIXES.iter().any(|p| name.starts_with(p))
@@ -378,7 +378,7 @@ impl Seal {
             }
             match identity {
                 Some(identity) => identity.own(&path)?,
-                None => cozy_platform::durable::set_mode(&path, 0o700)?,
+                None => platform::durable::set_mode(&path, 0o700)?,
             }
             Ok(path)
         };
@@ -512,7 +512,7 @@ fn boundary_directory(path: &Path) -> io::Result<()> {
             "seal boundary is not an owner directory",
         ));
     }
-    Ok(cozy_platform::durable::set_mode(path, 0o711)?)
+    Ok(platform::durable::set_mode(path, 0o711)?)
 }
 
 #[cfg(all(test, unix))]

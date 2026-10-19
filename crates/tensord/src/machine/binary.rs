@@ -4,7 +4,7 @@
 //! path with the same arguments. A binary that never proves readiness is renamed back. Windows
 //! has no exec: its stable parent starts each service from the launch path, so the next service
 //! is the activated (or restored) binary.
-use cozy_platform::durable::FileId;
+use platform::durable::FileId;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt as _;
 use std::{
