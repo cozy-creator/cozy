@@ -3260,7 +3260,7 @@ impl Pool {
         session.invoked = true;
         let reply = session.executor.command_with(
             &DeviceCommand::Invoke {
-                tensorfs: calls.and_then(|calls| calls.tensorfs(id)),
+                tensorfs: calls.and_then(|calls| calls.tensorfs(id)).map(Box::new),
                 weights,
                 destination: calls.map(|calls| calls.destination(id)).unwrap_or_default(),
                 actor: record.submission.as_ref().map(|submission| submission.actor.clone()).unwrap_or_default(),

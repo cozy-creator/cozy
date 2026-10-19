@@ -244,7 +244,7 @@ pub enum DeviceCommand {
     },
     Invoke {
         #[serde(skip_serializing_if = "Option::is_none")]
-        tensorfs: Option<protocol::machine::TensorFSOptions>,
+        tensorfs: Option<Box<protocol::machine::TensorFSOptions>>,
         /// Retained asset capacity derived from the actual installed result schema.
         max_output_bytes: u64,
         request_id: String,
