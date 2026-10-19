@@ -152,7 +152,7 @@ struct Received {
 }
 
 impl Calls {
-    pub(crate) fn hub_access(&self, id: &str) -> Option<Value> {
+    pub(crate) fn hub_access(&self, id: &str) -> Option<crate::hub::RuntimeHubAccess> {
         self.runs.upgrade()?.hub(id).map(|hub| hub.runtime_access())
     }
 

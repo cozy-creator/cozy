@@ -1,6 +1,6 @@
 //! A run's capability against a real AuthKit (th-241): public reads go anonymous; the first
 //! private operation trades the owner's device-key-signed capability, once, through the
-//! JWT-bearer grant (an assertion the leaf signs, DPoP from the same key); every proof is
+//! JWT-bearer grant (an assertion the request key signs, DPoP from the same key); every proof is
 //! checked by AuthKit's resource verifier, and the Hub's narrowing, a revoked device key and
 //! the capability's expiry each end the run's private work with a typed reason.
 #[path = "common/hub_oauth.rs"]
@@ -68,8 +68,8 @@ fn a_request_key_trades_once_without_the_machine_leaf() {
     ]);
     let signed = authkit.capability(&jkt, &ops, 600);
     let source = Source::new(&authkit.hub, None, hosts.clone(), Some(Capability::new(&signed, &authkit.token_endpoint, &run_key.private_jwk()).unwrap())).unwrap();
-    assert_eq!(source.runtime_access()["key"], run_key.private_jwk());
-    assert_eq!(source.runtime_access()["capability"], signed);
+    assert_eq!(source.runtime_access().key, run_key.private_jwk());
+    assert_eq!(source.runtime_access().capability, signed);
     assert_eq!(authkit.exchanges(), 0);
     let tiny = Catalog::for_op(&source, TINY).unwrap();
     assert_eq!(authkit.exchanges(), 0, "a scoped provider does not trade until its first I/O");

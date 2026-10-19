@@ -1,10 +1,5 @@
-//! Hub access (th-241, th-245). Released content is read anonymously, by name. A run's private
-//! operations (reading one of the owner's unpublished checkpoints, publishing to the owner's
-//! repositories) are named by a capability the owner's CLI signed with its device key for this
-//! run's own key. At the run's first private operation the machine trades it, once, for a
-//! DPoP-bound token (hub-client's `RunToken`: AuthKit's JWT-bearer grant, an assertion the leaf
-//! signs). TensorFS's mover carries the bytes; it presents the token, proved per request, to
-//! the Hub host only.
+//! Per-request Hub access. Package runs pass their capability and key to the Runtime.
+//! Code-less runs use TensorFS's lazy DPoP provider and distribution endpoint themselves.
 use base64::Engine as _;
 use hub_client::Credential;
 use serde_json::{Value, json};
@@ -139,13 +134,6 @@ pub(crate) fn block<T: Send>(call: impl Future<Output = T> + Send) -> T {
 /// silence, 5 s apart), as TensorFS's downloader finds its own. For calls on the Hub runtime
 /// (`block`).
 pub fn http(ca_der: Option<&[u8]>) -> Result<reqwest::Client, Refusal> {
-    static CLIENTS: Mutex<Vec<(Option<Vec<u8>>, reqwest::Client)>> = Mutex::new(Vec::new());
-    pooled(&CLIENTS, ca_der)
-}
-
-/// [`http`] for calls on TensorFS's fetch runtime: a client's connections live on the runtime
-/// that opened them, so each runtime has its own.
-pub(crate) fn fetch_http(ca_der: Option<&[u8]>) -> Result<reqwest::Client, Refusal> {
     static CLIENTS: Mutex<Vec<(Option<Vec<u8>>, reqwest::Client)>> = Mutex::new(Vec::new());
     pooled(&CLIENTS, ca_der)
 }
@@ -311,6 +299,24 @@ impl std::fmt::Debug for Capability {
     }
 }
 
+/// The request access passed on the executor control channel, never process credentials.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct RuntimeHubAccess {
+    pub endpoint: String,
+    pub capability: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub key: String,
+    pub token_endpoint: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ca_der: Option<String>,
+}
+
+impl std::fmt::Debug for RuntimeHubAccess {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RuntimeHubAccess").field("endpoint", &self.endpoint).finish_non_exhaustive()
+    }
+}
+
 /// Where a run reads a Hub, and the owner's capability there, if the run has private work.
 #[derive(Clone)]
 pub struct Source {
@@ -337,18 +343,12 @@ impl Source {
     }
 
     /// The original per-request access, passed through to the Runtime without a trade.
-    pub fn runtime_access(&self) -> Value {
-        let mut access = self
-            .capability
-            .as_ref()
-            .map(|c| c.access.clone())
-            .unwrap_or_default();
-        access.origin = self.origin.clone();
-        access.ca_der = self.ca_der.clone().unwrap_or_default();
-        let mut wire = serde_json::to_value(access).expect("Hub access serializes");
-        wire["endpoint"] = wire.as_object_mut().unwrap().remove("origin").unwrap();
-        wire.as_object_mut().unwrap().remove("object_hosts");
-        wire
+    pub fn runtime_access(&self) -> RuntimeHubAccess {
+        let access = self.capability.as_ref().map(|c| c.access.clone()).unwrap_or_default();
+        RuntimeHubAccess {
+            endpoint: self.origin.clone(), capability: access.capability, key: access.key, token_endpoint: access.token_endpoint,
+            ca_der: self.ca_der.as_ref().map(|der| base64::engine::general_purpose::STANDARD.encode(der)),
+        }
     }
 
     /// Public prefetch never redeems a package run's capability.
@@ -436,10 +436,7 @@ impl Catalog {
         })
     }
 
-    /// `op` under the run's capability when it names it; a read it does not name is public.
-    /// A publication it does not name is refused before the Hub hears of it. The token is
-    /// traded here, so a capability the Hub refused, or that expired, ends the operation
-    /// before any request goes out without it.
+    /// Scope a lazy provider to the operation without trading its capability.
     pub fn for_op(source: &Source, op: Op) -> Result<Self, (&'static str, String)> {
         let catalog = Self::scoped(source, op)?;
         if let Some(ended) = catalog
@@ -508,21 +505,6 @@ impl Catalog {
             return Vec::new();
         };
         block(presenter.headers(&Request { method, url, headers: &[], payload: None })).unwrap_or_default()
-    }
-
-    /// Reads the Hub's answer to a request that sent `sent`: true asks it again.
-    pub(crate) fn observe(
-        &self,
-        url: &str,
-        sent: &[(String, String)],
-        status: u16,
-        headers: &reqwest::header::HeaderMap,
-    ) -> bool {
-        let (Some(presenter), Ok(parsed)) = (&self.credential, reqwest::Url::parse(url)) else {
-            return false;
-        };
-        let _ = parsed;
-        presenter.retry(&Request { method: "GET", url, headers: sent, payload: None }, status, headers)
     }
 
     /// A package and its releases.

@@ -189,7 +189,7 @@ pub enum DeviceCommand {
     },
     Load {
         #[serde(skip_serializing_if = "Option::is_none")]
-        hub: Option<Value>,
+        hub: Option<crate::hub::RuntimeHubAccess>,
         construction: String,
         devices: String,
         sequence_parallel_degree: u32,
@@ -244,7 +244,7 @@ pub enum DeviceCommand {
     },
     Invoke {
         #[serde(skip_serializing_if = "Option::is_none")]
-        hub: Option<Value>,
+        hub: Option<crate::hub::RuntimeHubAccess>,
         /// Retained asset capacity derived from the actual installed result schema.
         max_output_bytes: u64,
         request_id: String,
