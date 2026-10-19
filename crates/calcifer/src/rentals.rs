@@ -185,8 +185,14 @@ impl Machines {
         sku: &str,
         gpus: Option<u32>,
         disk_gb: Option<u32>,
+        image: Option<String>,
     ) -> Result<Rented, Error> {
-        let (ask, fresh) = self.ask_rent(key, hub, sku, gpus, disk_gb, None).await?;
+        let shape = Shape {
+            gpus,
+            disk_gb,
+            image,
+        };
+        let (ask, fresh) = self.ask_rent(key, hub, sku, shape, None).await?;
         let quote = quote_of(&RentBody::of(&ask)?.quote);
         let row = match ask.state {
             AskState::Done => {
@@ -234,13 +240,21 @@ impl Machines {
         key: &str,
         hub: &str,
         sku: &str,
-        gpus: Option<u32>,
-        disk_gb: Option<u32>,
+        shape: Shape,
         run: Option<RunId>,
     ) -> Result<(Ask, bool), Error> {
+        let Shape {
+            gpus,
+            disk_gb,
+            image,
+        } = shape;
         let origin = config::Origin::parse(hub)?;
-        let intent =
+        let mut intent =
             serde_json::json!({"hub": origin, "sku": sku, "gpus": gpus, "disk_gb": disk_gb});
+        // Only an image joins the intent, so a key asked before images keeps its digest.
+        if let Some(image) = &image {
+            intent["image"] = image.as_str().into();
+        }
         let digest = hex::encode(Sha256::digest(intent.to_string()));
         if let Some(asked) = self.store().ask(key).map_err(internal)? {
             if asked.digest != digest || asked.kind != AskKind::Rent {
@@ -266,7 +280,11 @@ impl Machines {
             creator_public_key: URL_SAFE_NO_PAD.encode(signer.verifying_key().to_bytes()),
             development: None,
             excluded_provider_machines: vec![],
-            image: None,
+            image: image.map(|image| image.try_into()).transpose().map_err(
+                |e: types::error::ConversionError| {
+                    Error::new(Kind::Usage, "image_invalid", e.to_string())
+                },
+            )?,
             // The Hub holds a media plane's token hash; machines serve bytes over Read instead.
             media_token_sha256: hex::encode(Sha256::digest(&random[4..36])),
             name: alias.clone(),
@@ -442,7 +460,12 @@ impl Machines {
                     None => me.placed(&run).await?,
                 };
                 let hub = run.hub.as_deref().unwrap_or_default();
-                let asked = me.ask_rent(&key, hub, &sku, gpus, None, Some(run.id.clone()));
+                let shape = Shape {
+                    gpus,
+                    disk_gb: None,
+                    image: None,
+                };
+                let asked = me.ask_rent(&key, hub, &sku, shape, Some(run.id.clone()));
                 Ok(asked.await?.0)
             };
             let rented = match asked.await {
@@ -1029,7 +1052,16 @@ fn view(rental: &types::Rental, sku: Option<String>) -> Rental {
         placement_note: rental.placement_note.clone().filter(|n| !n.is_empty()),
         provider_warning: rental.provider_warning.clone().filter(|w| !w.is_empty()),
         unreachable_since_ms: rental.unreachable_since.as_deref().and_then(ms),
+        base_worker_image_digest: Some(rental.base_worker_image_digest.clone())
+            .filter(|d| !d.is_empty()),
     }
+}
+
+/// The machine a rent asks for, beyond its SKU.
+struct Shape {
+    gpus: Option<u32>,
+    disk_gb: Option<u32>,
+    image: Option<String>,
 }
 
 /// An RFC 3339 time of the Hub's, in unix milliseconds.

@@ -3,6 +3,8 @@
 //! first tier of every pressured sweep (`gc::collect`, run here in the process that owns the
 //! store, as the machine runs it), after a restart too, keeps what the memo and the second run
 //! need.
+#[path = "common/named_runtime.rs"]
+mod named_runtime;
 use tensord::{
     api::install::InstallerConfig,
     calls::Calls,
@@ -84,10 +86,8 @@ fn open(root: &Path, tools: &Tools) -> Machine {
             staging_root: root.join("staging"),
             // A Runtime wheel not yet published, installed as this machine's own (a dev build),
             // the operator's choice as an update's `--runtime-wheel` is.
-            sdk: named_pair(root),
-            runtime_build: std::env::var_os("COZY_TEST_RUNTIME_WHEEL")
-                .and_then(|w| Some(PathBuf::from(w).file_name()?.to_str()?.split('-').nth(1)?.to_owned()))
-                .unwrap_or_default(),
+            sdk: named_runtime::pair().to_vec(),
+            runtime_build: named_runtime::named().map(|(version, _)| version.clone()).unwrap_or_default(),
             uv: "uv".into(),
             seed_cache: None,
         },
@@ -110,56 +110,6 @@ fn open(root: &Path, tools: &Tools) -> Machine {
         store,
         objects,
         runs,
-    }
-}
-
-/// The TensorFS wheel a Runtime wheel accepts, from PyPI, into `dir`.
-const ACCEPTED_TENSORFS: &str = "import re, subprocess, sys, zipfile, pathlib
-wheel, out = sys.argv[1], pathlib.Path(sys.argv[2])
-archive = zipfile.ZipFile(wheel)
-meta = next(n for n in archive.namelist() if n.endswith('.dist-info/METADATA'))
-req = next(l[15:].split(';')[0].replace(' ', '') for l in archive.read(meta).decode().splitlines()
-           if re.match(r'Requires-Dist: tensorfs[^A-Za-z0-9._-]', l))
-subprocess.run([sys.executable, '-m', 'pip', 'download', '-q', '--no-deps', '--only-binary=:all:', '--python-version', '3.12',
-                '--platform', 'manylinux_2_28_x86_64', '--platform', 'manylinux_2_17_x86_64', '-d', str(out), req], check=True)
-print(next(out.glob('tensorfs-*.whl')))
-";
-
-/// The named Runtime wheel (`COZY_TEST_RUNTIME_WHEEL`) with the TensorFS it accepts, as an update
-/// that names a Runtime brings: COZY_TEST_TENSORFS_WHEEL, else PyPI's. None named, none.
-fn named_pair(root: &Path) -> Vec<PathBuf> {
-    let Some(runtime) = std::env::var_os("COZY_TEST_RUNTIME_WHEEL").map(PathBuf::from) else {
-        return vec![];
-    };
-    let tensorfs = std::env::var_os("COZY_TEST_TENSORFS_WHEEL").map(PathBuf::from).unwrap_or_else(|| {
-        let out = Command::new("python3").args(["-I", "-c", ACCEPTED_TENSORFS]).arg(&runtime).arg(root.join("tensorfs-wheel")).output().unwrap();
-        assert!(out.status.success(), "the TensorFS {runtime:?} accepts: {out:?}");
-        PathBuf::from(String::from_utf8(out.stdout).unwrap().trim())
-    });
-    vec![runtime, tensorfs]
-}
-
-/// With a named Runtime wheel (`COZY_TEST_RUNTIME_WHEEL`), every environment under `generations`
-/// loads that build, by the commit stamped in it; a wheel without one proves nothing.
-fn named_runtime_loaded(generations: &Path) {
-    let Some(wheel) = std::env::var_os("COZY_TEST_RUNTIME_WHEEL") else { return };
-    let output = |command: &mut Command| {
-        let out = command.output().unwrap();
-        assert!(out.status.success(), "{command:?}: {out:?}");
-        String::from_utf8(out.stdout).unwrap().trim().to_owned()
-    };
-    let read = "import re, sys, zipfile\n\
-        text = zipfile.ZipFile(sys.argv[1]).read('cozy_runtime/_build_provenance.py').decode()\n\
-        print(re.search(r'^COMMIT = \"([^\"]*)\"', text, re.M).group(1))\n";
-    let want = output(Command::new("python3").args(["-I", "-c", read]).arg(&wheel));
-    assert!(!want.is_empty() && want != "unknown",
-        "{wheel:?} names no commit (COMMIT = {want:?}): a wheel without provenance proves nothing");
-    let pythons: Vec<PathBuf> = std::fs::read_dir(generations).unwrap().flatten()
-        .map(|entry| entry.path().join("env/bin/python")).filter(|python| python.exists()).collect();
-    assert!(!pythons.is_empty(), "no environment under {generations:?}");
-    for python in pythons {
-        let loaded = output(Command::new(&python).args(["-I", "-c", "from cozy_runtime._build_provenance import COMMIT; print(COMMIT)"]));
-        assert_eq!(loaded, want, "{python:?} loads another Runtime than {wheel:?}");
     }
 }
 
@@ -279,7 +229,7 @@ fn a_canceled_root_resubmitted_skips_its_finished_steps(restart: bool) {
     let (done, stopped) = (engine.get(&ended[0].id).unwrap(), engine.get(&ended[1].id).unwrap());
     assert_eq!((done.state, stopped.state), (State::Completed, State::Canceled));
     assert!(!done.memo.computation.is_empty() && !done.memo.memoized, "{:?}", done.memo);
-    named_runtime_loaded(&root.join("generations"));
+    named_runtime::loaded(&named_runtime::environments(&root.join("generations")), "the journal's machine");
 
     if restart {
         assert!(machine.service.stop().unwrap(), "the machine was not idle");

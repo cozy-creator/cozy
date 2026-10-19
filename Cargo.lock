@@ -348,7 +348,7 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
 name = "calcifer"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -605,7 +605,7 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "cozy"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "base64 0.22.1",
  "calcifer",
@@ -631,7 +631,7 @@ dependencies = [
 
 [[package]]
 name = "cozy-cli"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "anstream",
  "anstyle",
@@ -675,7 +675,7 @@ dependencies = [
 
 [[package]]
 name = "cozy-platform"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "getrandom 0.3.4",
  "hex",
@@ -692,7 +692,7 @@ dependencies = [
 
 [[package]]
 name = "cozy-proto"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -1555,7 +1555,7 @@ checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 
 [[package]]
 name = "hub-client"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "aws-lc-rs",
  "base64 0.22.1",
@@ -3928,7 +3928,7 @@ dependencies = [
 
 [[package]]
 name = "tensord"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "async-trait",
  "aws-lc-rs",

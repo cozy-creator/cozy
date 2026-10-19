@@ -1144,6 +1144,11 @@ fn output_entries(products: &[domain::RunProduct]) -> Result<Vec<Value>, Error> 
 
 /// The SDK's `Outputs.publish` against the real Runtime executor of a real installed package:
 /// products stream on the run's log while it runs, and its result adds only what is new.
+/// The Runtime a hosted job names, which the fixtures here install.
+#[cfg(test)]
+#[path = "../tests/common/named_runtime.rs"]
+mod named_runtime;
+
 #[cfg(test)]
 mod product_log_tests {
     use super::*;
@@ -1169,7 +1174,8 @@ from pathlib import Path
 from tensord_client.packages import install
 fixture, out = Path(sys.argv[1]), Path(sys.argv[2])
 subprocess.run(["uv", "build", "--wheel", "--out-dir", str(out / "client"), "."], check=True, capture_output=True)
-generation = install(fixture, out / "generations", next((out / "client").glob("*.whl")), python="3.12")
+generation = install(fixture, out / "generations", next((out / "client").glob("*.whl")), python="3.12",
+                     sdk=[Path(wheel) for wheel in sys.argv[3:]])
 print(json.dumps({"identity": generation.identity}))
 "#;
 
@@ -1186,6 +1192,8 @@ print(json.dumps({"identity": generation.identity}))
             ])
             .arg(repo.join("tests/fixtures").join(name))
             .arg(root)
+            // The named Runtime, as a machine runs it.
+            .args(named_runtime::pair())
             .output()
             .expect("uv runs the repository's installer");
         assert!(
@@ -1193,6 +1201,7 @@ print(json.dumps({"identity": generation.identity}))
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
+        named_runtime::loaded(&named_runtime::environments(&root.join("generations")), name);
         let line = String::from_utf8(output.stdout).unwrap();
         let value: Value = serde_json::from_str(line.lines().last().unwrap()).unwrap();
         value["identity"].as_str().unwrap().to_owned()

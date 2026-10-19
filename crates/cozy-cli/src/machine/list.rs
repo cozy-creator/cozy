@@ -176,6 +176,9 @@ pub(crate) fn record(ctx: &Context, m: &Machine) -> output::Record {
         if let Some(warning) = &r.provider_warning {
             record = record.field("provider", warning);
         }
+        if let Some(digest) = &r.base_worker_image_digest {
+            record = record.field("image", digest);
+        }
     }
     if let Some(since) = unreachable_since(m) {
         record = record.note(format!(

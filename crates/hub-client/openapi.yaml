@@ -2787,7 +2787,7 @@ components:
         image:
           type: string
           maxLength: 512
-          description: A registered worker image (digest, tag, reference or kind) in place of the default.
+          description: "An admin's sign-in only: a kind, a tag, either pinned @sha256:<digest>, or a bare sha256:<digest> of the machine kind's tag, in place of the default."
         accelerator_count:
           type: integer
           format: int64
