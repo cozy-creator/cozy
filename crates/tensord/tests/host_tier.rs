@@ -1,6 +1,6 @@
 //! The machine's sealed host tier on the real path: a real TensorFS store, TensorFS's verified
 //! fill, real executor stand-in processes (their pidfds hold layouts), and TensorFS's own
-//! read-only adoption (`Plane::register_sealed`) checking every byte.
+//! read-only host adoption and TensorFS's shared host read engine checking every byte.
 #![cfg(target_os = "linux")]
 use platform::contain::host_memory::HostMemory;
 use tensord::host_tier::{HostGrant, HostTier, HostTierConfig, SealedRequest, TierLimit};
@@ -21,10 +21,11 @@ use std::{
 use tensord::storage::Store;
 use tensorfs::{
     format::{Dtype, ObjectRef},
+    io::{self, Copy, Dst, ReadOpts, Src},
     store2::Checkpoint,
     writer::{Data, Source},
 };
-use varena::{layout::Layout, Plane, PlaneConfig, Tier};
+use varena::{host::HostMem, layout::Layout};
 
 #[path = "common/names_hub.rs"]
 mod names_hub;
@@ -56,7 +57,7 @@ impl Fixture {
         let mut writer = store.writer(None, Some(tag)).unwrap();
         for (key, n) in &tensors {
             let data = bytes_of(key, *n);
-            writer.put("unet", key, &Dtype::U8, &[*n as u64], Data::Plain(Source::Read(&mut data.as_slice()))).unwrap();
+            writer.get("unet").put(key, &Dtype::U8, &[*n as u64], Data::Plain(Source::Read(&mut data.as_slice()))).unwrap();
         }
         let manifest = writer.commit().unwrap();
         let checkpoint = store.checkpoint(&manifest).unwrap();
@@ -99,38 +100,56 @@ impl Fixture {
         let plan = tensord::host_tier::plan_for_traversal(&self.checkpoint, &self.traversal(), &["unet".into()], 4 << 20).unwrap();
         Layout::build(&plan, &self.regions()).unwrap()
     }
-    /// The executor's half: adopt read-only through TensorFS, wait per region, check every
-    /// byte.
+    /// The executor's half: adopt the sealed placement metadata read-only, wait per region,
+    /// and check every byte copied through TensorFS.
     fn adopt(&self, granted: &File) {
         assert!(self.adopt_filling(granted), "the layout's fill failed");
     }
-    /// An executor that waits per region: adopt a layout still filling, pin it (each region
-    /// once its filler marks it Ready), then check every byte. Never reads the store. False
-    /// when the fill failed.
+    /// Adopt while filling: varena holds the read-only mapping and Ready/region claims;
+    /// TensorFS copies only each region's ready host bytes. Never opens the store. False
+    /// when adoption or a region's fill failed.
     fn adopt_filling(&self, granted: &File) -> bool {
-        let plane = Plane::open(PlaneConfig {
-            readers: 2,
-            ..Default::default()
-        })
-        .unwrap();
-        let plan = tensord::host_tier::plan_for_traversal(&self.checkpoint, &self.traversal(), &["unet".into()], 4 << 20).unwrap();
-        let pinned = plane
-            .register_sealed("unet", &plan, &self.regions(), granted.as_raw_fd())
-            .and_then(|ws| {
-                plane.set_pinned_budget(1 << 30)?;
-                plane.want(ws, Tier::Pinned, None, 0, false)?.wait()?;
-                Ok(ws)
+        let layout = self.layout();
+        let Ok(host) = HostMem::adopt_sealed(granted.as_raw_fd(), &layout) else {
+            return false;
+        };
+        assert!(host.sealed(), "the executor only adopts read-only mappings");
+        let opts = ReadOpts { threads: 2, ..ReadOpts::default() };
+        let mut copied = 0;
+        for (r, region) in layout.regions.iter().enumerate() {
+            let read = host.with_region(r as u32, |source| {
+                for part in layout.parts.iter().filter(|p| p.region as usize == r) {
+                    let key = part.what.trim_start_matches("unet/").trim_end_matches("#value");
+                    let n = self.tensors.iter().find(|(k, _)| k == key).unwrap().1;
+                    let offset = (part.offset - region.offset) as usize;
+                    assert!(offset + n <= region.span as usize);
+                    let mut got = vec![0; n];
+                    // SAFETY: with_region keeps these immutable bytes ready and claimed;
+                    // the checked range lies inside it, and `got` is exclusively borrowed.
+                    let stats = unsafe {
+                        io::read(
+                            &[Copy { src: Src::Host(source.add(offset)), dst: Dst::host(&mut got) }],
+                            &opts,
+                        )
+                    }?;
+                    assert_eq!(stats.bytes, n as u64);
+                    assert_eq!(
+                        (stats.direct, stats.cached, stats.bounced),
+                        (0, 0, 0),
+                        "waited, never filled from the store",
+                    );
+                    assert!(got == bytes_of(key, n), "{} differs after the shared host read", part.what);
+                    copied += stats.bytes;
+                }
+                Ok(())
             });
-        if let Ok(ws) = pinned {
-            self.check(granted, &plane.layout(ws).unwrap());
-            assert_eq!(
-                plane.stats().host.counters.fill_bytes,
-                0,
-                "waited, never read"
-            );
+            if read.is_err() {
+                return false;
+            }
         }
-        let _ = plane.close();
-        pinned.is_ok()
+        assert_eq!(copied, self.tensors.iter().map(|(_, n)| *n as u64).sum::<u64>());
+        self.check(granted, &layout);
+        true
     }
     fn check(&self, granted: &File, layout: &Layout) {
         for part in &layout.parts {
@@ -641,7 +660,7 @@ fn a_failed_fill_is_an_error_for_its_adopters_and_leaves_the_tier() {
     );
 }
 
-/// Read every region of a streamed layout as an executor's plane does (`with_region`), in
+/// Read every region of a streamed layout under the executor's region claim (`with_region`), in
 /// order, `passes` times, checking every byte; returns the bytes checked.
 fn stream_through(fx: &Fixture, granted: &File, passes: usize) -> u64 {
     let layout = fx.layout();
@@ -899,20 +918,21 @@ fn a_staged_region_waits_on_its_ticket_and_nothing_else_downloads() {
     use tensord::{held_models::Pulled, origin::{self, priority, Machine}, stop::Stop, storage};
     let fx = Fixture::new("fetched", &[2 * MIB, 3 * MIB, MIB + 7, 5 * MIB]);
     let manifest = fx.checkpoint.id().clone();
-    let model = names_hub::Model { repository: "acme/unet".into(), release: "1.0.0".into(), lane: "bf16".into(), manifest: manifest.clone() };
+    let model = names_hub::Model { repository: "acme/unet".into(), release: "1.0.0".into(), lane: "bf16".into(), header: manifest.clone() };
+    let tree = names_hub::trees(&fx.store, std::slice::from_ref(&model)).remove(0);
     let (origin, heard) = names_hub::paced(&fx.store, model, None, Duration::from_millis(30));
     let gets = || heard.lock().unwrap().iter().filter(|h| h.starts_with("GET /o/")).count();
     let root = std::env::temp_dir().join(format!("machine-tier-partial-{}", uuid::Uuid::new_v4()));
     let store = storage::open(&root).unwrap();
     let hub = tensord::hub::Source::new(&origin, None, vec!["localhost".into()], None).unwrap();
     let machine = Machine::new(store.clone(), None).unwrap();
-    let (remote, _) = origin::remote(&machine, &hub, "acme/unet", "1.0.0", "bf16", &manifest).unwrap();
+    let (remote, _) = origin::remote(&machine, &hub, "acme/unet", "1.0.0", "bf16", &tree).unwrap();
     machine.pull(&remote, &manifest, Some(&[]), priority::NOW, None, &Stop::default()).unwrap();
-    let pulled = Pulled { repository: "acme/unet".into(), release: "1.0.0".into(), lane: "bf16".into() };
+    let pulled = Pulled { repository: "acme/unet".into(), release: "1.0.0".into(), lane: "bf16".into(), tree: Some(tree) };
     storage::hold(&store, &storage::pin::model(&manifest.sha256), vec![manifest.clone()], Some(pulled.owner())).unwrap();
     let structure = gets();
     let tier = HostTier::new(store.clone(), HostTierConfig { fill_threads: 2, ttl: Duration::from_secs(3600) }, Box::new(Fixed(1 << 30))).unwrap();
-    let fetch = tensord::access::Fetch::new(machine, Some(hub), vec![fx.manifest.clone()], 1);
+    let fetch = tensord::access::Fetch::new(machine, Some(hub), 1);
     let (_executor, a) = Executor::spawn(&tier);
     let (plan, sha256, length) = fx.plan(&["unet"]);
     let cold = SealedRequest { sha256: &sha256, length, stage: Some(&[]) };

@@ -41,11 +41,11 @@ def build(root: Path, layers: int, dim: int):
     for i in range(layers):
         tensors[f"layer{i}.w"] = (torch.randn(dim, dim, generator=g) / dim**0.5).bfloat16()
         tensors[f"layer{i}.b"] = (torch.randn(dim, generator=g) / 10).bfloat16()
-    store = tensorfs.Store(root)
-    w = store.writer()
+    w = tensorfs.Writer(cache_dir=root)
+    component = w.component("model", cls="", config={})
     for k, t in tensors.items():
-        w.put("model", k, "BF16", list(t.shape), t.view(torch.uint8).numpy().tobytes())
-    return store.checkpoint(w.commit()), tensors
+        component.put(k, t)
+    return w.commit(), tensors
 
 
 def main() -> int:

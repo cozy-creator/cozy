@@ -31,12 +31,16 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{watch, Notify, Semaphore};
 
-use super::net::Client;
-use super::origin::{Location, Origin};
+use super::net::{same_origin, Client};
+use super::origin::{HttpLocation, Location, Origin};
+use super::token::TokenProvider;
 use super::volume::{blocking, VolumeOrigin, Wrote, STEP};
 use super::{Admission, ObjectStore, Tier};
 use crate::err::{refuse, Code, Refusal, Result};
 use crate::format::ObjectRef;
+
+/// Where an origin redirected an object's GET, reused for restarts until the redirect's max-age.
+type Delivery = (String, Option<Instant>);
 
 /// How many times slower than its peers a request may run, or longer than their answer it may
 /// wait, before it is dropped. Also how much longer than the fetch's longest recovered stillness
@@ -693,7 +697,7 @@ impl Shared {
     /// The origin's copy, asked again from the byte reached until it lands or ends.
     async fn from_origin(self: &Arc<Self>, task: &Arc<Task>) -> Result<()> {
         let mut sink = Sink::open(self, task)?;
-        let (mut location, mut delivery, mut relocated) = (None::<Location>, None::<String>, false);
+        let (mut location, mut delivery, mut relocated) = (None::<Location>, None::<Delivery>, false);
         let (mut doublings, mut wrong) = (0, None::<String>);
         loop {
             if !task.wanted() {
@@ -746,16 +750,21 @@ impl Shared {
                     },
                     FileRead::Failed(refusal) => Attempt::Fatal(refusal),
                 },
-                Location::Url { url, headers, .. } => {
+                http => {
+                    let HttpLocation { url, headers, provider } = http.http().expect("a URL location");
+                    delivery = delivery.filter(|(_, until)| until.is_none_or(|u| u > Instant::now()));
                     let (delivered, asked) = (
                         delivery.is_some(),
-                        delivery.clone().unwrap_or_else(|| url.clone()),
+                        delivery.clone().map_or_else(|| url.to_owned(), |(at, _)| at),
                     );
+                    let same = same_origin(url, &asked);
+                    let headers: Vec<_> = headers.iter().filter(|(name, _)| same || name.eq_ignore_ascii_case("range")).cloned().collect();
                     self.request(
                         task,
                         &mut sink,
                         &asked,
-                        headers,
+                        &headers,
+                        if same { provider } else { None },
                         doublings,
                         delivered,
                         &mut delivery,
@@ -883,9 +892,10 @@ impl Shared {
         sink: &mut Sink<'_>,
         url: &str,
         headers: &[(String, String)],
+        provider: Option<&dyn TokenProvider>,
         doublings: u32,
         delivered: bool,
-        delivery: &mut Option<String>,
+        delivery: &mut Option<Delivery>,
     ) -> Attempt {
         let object = &task.object;
         let flying = self.fly(task, false, doublings);
@@ -899,7 +909,7 @@ impl Shared {
             ));
         }
         let answer = tokio::select! {
-            answer = self.client.get(url, &headers) => answer,
+            answer = self.client.get_authorized(url, &headers, provider) => answer,
             () = flight.aborted() => return Shared::dropped(flight),
         };
         let mut answer = match answer {
@@ -917,7 +927,7 @@ impl Shared {
         flight.moved();
         flight.stretch_begins();
         if answer.url != url {
-            *delivery = Some(answer.url.clone());
+            *delivery = Some((answer.url.clone(), answer.until));
         }
         let status = answer.status();
         let what = || format!("{}: {status} from {url}", object.sha256);
