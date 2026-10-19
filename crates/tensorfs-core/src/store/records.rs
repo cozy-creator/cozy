@@ -3,7 +3,8 @@
 //!
 //! The lock is `flock` on an `O_CLOEXEC` descriptor: held by its open file description, waited
 //! for, never inspected. A child forked meanwhile holds it only until it execs. Nothing else in
-//! the store locks; GC and puts take no lock at all.
+//! the store locks; a short shared acquisition fence also spans root publication so GC cannot
+//! delete bytes between metadata read and ownership publication.
 
 use std::fs;
 use std::io;
@@ -12,7 +13,7 @@ use std::path::{Path, PathBuf};
 use platform::lock;
 use serde::{Deserialize, Serialize};
 
-use super::{Error, Result, Store, fail, invalid, now_secs, platform};
+use super::{fail, invalid, now_secs, platform, Error, Result, Store};
 use crate::format::{ObjectRef, Repo};
 
 /// `pins/<id>.json`: what keeps objects alive, and when it was last used (unix seconds).
@@ -204,8 +205,9 @@ impl Store {
         change: impl FnOnce(Option<Repo>) -> Option<Repo>,
     ) -> Result<Option<Repo>> {
         let path = self.ref_path(name)?;
+        let _acquisition = super::retention::acquire(self)?;
         let _lock = self.lock("refs")?;
-        self.clear_cached_ref(name)?;
+        let promoted = self.clear_cached_ref(name)?;
         let old = Self::parse_ref(&path)?;
         let lanes = |repo: &Option<Repo>| -> Vec<ObjectRef> {
             repo.iter().flat_map(Repo::roots).cloned().collect()
@@ -223,7 +225,11 @@ impl Store {
         }
         let bytes = new.to_json().map_err(|error| invalid(&path, error))?;
         let after = lanes(&Some(new.clone()));
-        self.retain(after.iter().filter(|lane| !before.contains(lane)))?;
+        self.retain(
+            after
+                .iter()
+                .filter(|lane| promoted || !before.contains(lane)),
+        )?;
         self.commit(&path, &bytes, true)?;
         Ok(Some(new))
     }

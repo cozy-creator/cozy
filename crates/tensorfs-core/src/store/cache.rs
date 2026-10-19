@@ -142,6 +142,12 @@ impl Store {
         self.root.join("tmp").join("cache")
     }
 
+    fn cache_lock(&self) -> Result<platform::lock::DirLock> {
+        let state = self.cache_state();
+        fs::create_dir_all(&state).map_err(fail("create cache state", &state))?;
+        platform::lock::dir(&state).map_err(platform("lock cache maintenance", state))
+    }
+
     fn cache_write(&self, path: &Path, value: &impl Serialize) -> Result<()> {
         let parent = path.parent().expect("a cache record has a parent");
         fs::create_dir_all(parent).map_err(fail("create cache records", parent))?;
@@ -183,11 +189,11 @@ impl Store {
     }
 
     /// Called under the ref directory lock by every explicit ref mutation, even raw stores.
-    pub(super) fn clear_cached_ref(&self, name: &str) -> Result<()> {
+    pub(super) fn clear_cached_ref(&self, name: &str) -> Result<bool> {
         let path = self.cached_ref_path(name);
         match fs::remove_file(&path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
             Err(e) => Err(fail("clear cached ref classification", path)(e)),
         }
     }
@@ -239,6 +245,7 @@ impl Store {
             None
         };
         if let Some((entry, record)) = self.cache_entry(path) {
+            let _classification = self.cache_lock()?;
             let old = read::<FolderUse>(&record)?;
             if !old.as_ref().is_some_and(|record| record.owned)
                 && (old.is_some() || !entry.exists())
@@ -264,15 +271,14 @@ impl Store {
             None
         };
         if let Some((_, record)) = self.cache_entry(path) {
-            if read::<FolderUse>(&record)?.is_some() {
-                self.cache_write(
-                    &record,
-                    &FolderUse {
-                        last_use: now_secs(),
-                        owned: true,
-                    },
-                )?;
-            }
+            let _classification = self.cache_lock()?;
+            self.cache_write(
+                &record,
+                &FolderUse {
+                    last_use: now_secs(),
+                    owned: true,
+                },
+            )?;
         }
         Ok(())
     }
