@@ -359,10 +359,6 @@ fn copy_and_a_base_share_the_large_parts_objects() {
     ]);
     let logical = decode(&Dtype::BF16, &[rows, cols], &encoding, &views).unwrap();
     assert!(b.read("transformer", "blocks.1.mlp.weight").unwrap() == logical);
-    let mut buf = vec![0; logical.len()];
-    b.read_into("transformer", "blocks.1.mlp.weight", &mut buf)
-        .unwrap();
-    assert!(buf == logical);
     assert!(b.read("transformer", "blocks.1.norm.weight").unwrap() == renorm);
 
     // Lane C from base A: one tensor replaced, everything else carried; the unchanged large

@@ -1,0 +1,348 @@
+//! The read engine on real chunk files: every tensor of a tiny HF SDXL through `read_into`
+//! equals `read`; locations spanning chunk ends, read whole and in pieces; many destinations at
+//! once from a writer's folder, cold (O_DIRECT) and warm; the disk probe.
+
+use std::collections::BTreeMap;
+use std::fs;
+use std::os::fd::AsRawFd;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
+
+use tensorfs_core::format::{Body, Component, Dtype, Encoding, Header, Location, ObjectRef, Part, Tensor, CHUNKS_DIR};
+use tensorfs_core::import::{Access, Request};
+use tensorfs_core::io::{self, Copy, Dst, ReadOpts, ReadStats, Src, Target};
+use tensorfs_core::store2::{Checkpoint, Store};
+use tensorfs_core::writer::{Data, PartData, Source, Writer};
+
+const MIB: usize = 1 << 20;
+
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new(name: &str) -> Scratch {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let path = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("io-{name}-{}-{n}", std::process::id()));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).unwrap();
+        Scratch(path)
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn noise(seed: u64, n: usize) -> Vec<u8> {
+    let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    let mut out = Vec::with_capacity(n + 8);
+    while out.len() < n {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        out.extend_from_slice(&state.to_le_bytes());
+    }
+    out.truncate(n);
+    out
+}
+
+/// A destination `skew` bytes past a page boundary (0: O_DIRECT lands in place).
+struct Buf {
+    mem: Vec<u8>,
+    at: usize,
+    len: usize,
+}
+
+impl Buf {
+    fn new(len: usize, skew: usize) -> Buf {
+        let mem = vec![0xA5; len + 8192 + skew];
+        let at = (4096 - mem.as_ptr() as usize % 4096) % 4096 + skew;
+        Buf { mem, at, len }
+    }
+    fn bytes(&self) -> &[u8] {
+        &self.mem[self.at..self.at + self.len]
+    }
+    fn dst(&mut self) -> Dst {
+        Dst::host(&mut self.mem[self.at..self.at + self.len])
+    }
+}
+
+/// Drops `ck`'s chunks from the page cache: the next read is cold.
+fn evict(ck: &Checkpoint) {
+    for i in 0..ck.header().chunks.len() {
+        let f = ck.chunk(i).unwrap();
+        f.sync_all().unwrap();
+        // SAFETY: an advisory call on our own descriptor.
+        assert_eq!(unsafe { libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) }, 0);
+    }
+}
+
+fn direct_ok(ck: &Checkpoint) -> bool {
+    platform::durable::open_direct(&ck.chunk(0).unwrap()).unwrap().is_some()
+}
+
+/// Every stored range of `ck`: (component, key, role), a plain tensor's data with role `""`.
+fn ranges(ck: &Checkpoint) -> Vec<(String, String, String, Location)> {
+    let mut out = Vec::new();
+    for (c, t) in ck.tensors() {
+        for (role, at) in t.locations() {
+            out.push((c.to_owned(), t.key.clone(), role.to_owned(), at));
+        }
+    }
+    out
+}
+
+fn stored(ck: &Checkpoint, at: &Location) -> Vec<u8> {
+    let mut want = vec![0; at.length as usize];
+    ck.bytes_into(at, &mut want).unwrap();
+    want
+}
+
+/// Reads every range of `ck` in one engine call into `skew`ed destinations and checks each
+/// against `read` (plain) or the part's stored bytes.
+fn read_everything(ck: &Checkpoint, skew: usize, opts: &ReadOpts) -> ReadStats {
+    let all = ranges(ck);
+    let mut bufs: Vec<Buf> = all.iter().map(|r| Buf::new(r.3.length as usize, skew)).collect();
+    let targets: Vec<Target> = (all.iter().zip(&mut bufs))
+        .map(|((c, k, role, _), b)| Target { component: c, key: k, role, offset: 0, dst: b.dst() })
+        .collect();
+    // SAFETY: each destination is its own live buffer.
+    let stats = unsafe { ck.read_into(&targets, opts) }.unwrap();
+    for ((c, k, role, at), b) in all.iter().zip(&bufs) {
+        let want = if role.is_empty() { ck.read(c, k).unwrap() } else { stored(ck, at) };
+        assert!(b.bytes() == want, "{c}/{k}#{role} skew {skew} {opts:?}");
+    }
+    let total: u64 = all.iter().map(|r| r.3.length).sum();
+    assert_eq!((stats.bytes, stats.direct + stats.cached), (total, total), "{stats:?}");
+    stats
+}
+
+fn sweep(ck: &Checkpoint, what: &str) {
+    let small = ReadOpts { threads: 3, request: 64 << 10, ..ReadOpts::default() };
+    let buffered = ReadOpts { direct: false, ..ReadOpts::default() };
+    for opts in [ReadOpts::default(), small, buffered] {
+        for skew in [0, 1, 4095] {
+            evict(ck);
+            let cold = read_everything(ck, skew, &opts);
+            let warm = read_everything(ck, skew, &opts);
+            println!("{what} skew {skew} {opts:?}\n  cold {cold:?}\n  warm {warm:?}");
+            if opts.direct && direct_ok(ck) {
+                assert!(cold.direct > 0, "a cold read goes O_DIRECT: {cold:?}");
+                assert_eq!(warm.direct, 0, "a warm read stays in the page cache: {warm:?}");
+            } else {
+                assert_eq!(cold.direct, 0);
+            }
+        }
+    }
+}
+
+/// network: Hugging Face.
+#[test]
+fn every_tensor_of_a_tiny_sdxl_reads_through_the_engine_as_read_does() {
+    let scratch = Scratch::new("tiny-sdxl");
+    let store = Store::open(scratch.0.join("store")).unwrap();
+    let sources = ["hf://hf-internal-testing/tiny-sdxl-pipe".to_string()];
+    let access = Access::default();
+    let request = Request {
+        sources: &sources,
+        converter: None,
+        variant: None,
+        access: &access,
+        tmp: &store.root().join("tmp"),
+        progress: &|_, _, _| {},
+        stop: None,
+    };
+    let (header, _) = store.import(&request, Some("io-tiny-sdxl")).unwrap();
+    let ck = store.checkpoint(&header).unwrap();
+    assert!(ck.tensors().count() > 100);
+    sweep(&ck, "tiny-sdxl");
+}
+
+/// A folder whose chunks have odd lengths, with locations that start mid-chunk (on 4 KiB) and run
+/// on into the following chunks; `stream` is the chunks end to end.
+fn spanning(dir: &Path) -> (Checkpoint, Vec<u8>, BTreeMap<String, u64>) {
+    let chunks = [noise(1, 10_000), noise(2, 3 * 4096 + 17), noise(3, 70_001)];
+    let starts = [0u64, 10_000, 10_000 + 3 * 4096 + 17];
+    fs::create_dir_all(dir.join(CHUNKS_DIR)).unwrap();
+    let refs: Vec<ObjectRef> = chunks.iter().map(|c| ObjectRef::of(c)).collect();
+    for (c, r) in chunks.iter().zip(&refs) {
+        fs::write(dir.join(CHUNKS_DIR).join(&r.sha256), c).unwrap();
+    }
+    let at = |chunk: u64, offset: u64, length: u64| Location { chunk, offset, length };
+    let plain = |key: &str, l: Location| Tensor { key: key.into(), dtype: Dtype::U8, shape: vec![l.length], body: Body::Data(l) };
+    let part = |role: &str, l: Location| Part { role: role.into(), dtype: Dtype::U8, shape: vec![l.length], chunk: l.chunk, offset: l.offset, length: l.length };
+    let tensors = vec![
+        plain("a", at(0, 4096, 20_000)),
+        plain("b", at(1, 12_288, 100)),
+        Tensor {
+            key: "c".into(),
+            dtype: Dtype::U8,
+            shape: vec![38_041],
+            body: Body::Encoded {
+                encoding: Encoding { scheme: "acme-q".into(), params: Default::default() },
+                parts: vec![part("w", at(2, 40_960, 29_041)), part("s", at(0, 8_192, 9_000))],
+            },
+        },
+        plain("z", at(0, 0, 0)),
+    ];
+    let component = Component { name: "m".into(), tensors, ..Component::default() };
+    let header = Header::new(refs, None, vec![component], Default::default()).unwrap();
+    fs::write(dir.join("model.cozytensors"), header.to_cbor().unwrap()).unwrap();
+    let ck = Checkpoint::folder(dir, None, None).unwrap();
+    let mut first = BTreeMap::new();
+    for (_, k, role, l) in ranges(&ck) {
+        first.insert(format!("{k}#{role}"), starts[l.chunk as usize] + l.offset);
+    }
+    (ck, chunks.concat(), first)
+}
+
+#[test]
+fn locations_spanning_chunk_ends_read_whole_and_in_pieces() {
+    let scratch = Scratch::new("spanning");
+    let (ck, stream, first) = spanning(&scratch.0);
+    let a = ck.tensor("m", "a").unwrap();
+    let Body::Data(a_at) = a.body else { unreachable!() };
+    assert_eq!(ck.header().spans(&a_at).len(), 3, "a runs through all three chunks");
+    sweep(&ck, "spanning");
+
+    // Pieces of ranges, across chunk ends, all in one call.
+    let asks = [("a", "", 1_900, 7_000), ("a", "", 17_000, 3_000), ("c", "s", 1_805, 6), ("c", "w", 0, 29_041), ("b", "", 3, 97), ("z", "", 0, 0)];
+    for skew in [0, 7] {
+        for opts in [ReadOpts::default(), ReadOpts { threads: 4, request: 4096, ..ReadOpts::default() }] {
+            evict(&ck);
+            let mut bufs: Vec<Buf> = asks.iter().map(|a| Buf::new(a.3, skew)).collect();
+            let targets: Vec<Target> = (asks.iter().zip(&mut bufs))
+                .map(|(&(key, role, offset, _), b)| Target { component: "m", key, role, offset, dst: b.dst() })
+                .collect();
+            // SAFETY: each destination is its own live buffer.
+            unsafe { ck.read_into(&targets, &opts) }.unwrap();
+            for (&(key, role, offset, len), b) in asks.iter().zip(&bufs) {
+                let from = (first[&format!("{key}#{role}")] + offset) as usize;
+                assert!(b.bytes() == &stream[from..from + len], "{key}#{role} {offset}+{len}");
+            }
+        }
+    }
+
+    // What a target cannot name.
+    for (key, role, offset) in [("a", "", 19_995), ("c", "", 0), ("c", "x", 0), ("nope", "", 0)] {
+        let mut buf = Buf::new(10, 0);
+        let t = Target { component: "m", key, role, offset, dst: buf.dst() };
+        // SAFETY: a live buffer.
+        let e = unsafe { ck.read_into(&[t], &ReadOpts::default()) }.unwrap_err();
+        assert_eq!(e.code(), "invalid", "{key}#{role}: {e}");
+    }
+    let device = Target { component: "m", key: "a", role: "", offset: 0, dst: Dst::Device { device: 0, ptr: 0, len: 10, stream: 0 } };
+    // SAFETY: refused before any byte moves.
+    let e = unsafe { ck.read_into(&[device], &ReadOpts::default()) }.unwrap_err();
+    assert!(e.to_string().contains("CUDA"), "{e}");
+
+    // Host memory to host memory: the refill path's source, no file.
+    let mut out = Buf::new(stream.len() - 3, 1);
+    let copy = Copy { src: Src::Host(stream[3..].as_ptr()), dst: out.dst() };
+    // SAFETY: both live; the source outlives the call.
+    let s = unsafe { io::read(&[copy], &ReadOpts { request: 4096, ..ReadOpts::default() }) }.unwrap();
+    assert!(out.bytes() == &stream[3..] && s.bytes == stream.len() as u64 - 3);
+}
+
+/// A writer's folder: `n` small tensors of varied sizes, an encoded tensor, and one standalone
+/// tensor past the 64 MiB grid (two chunks).
+fn written(dir: &Path, n: usize) -> Checkpoint {
+    let mut w = Writer::folder(dir, "", None, false).unwrap();
+    let mut c = w.component("unet", "diffusers.UNet2DConditionModel", Default::default(), None).unwrap();
+    for i in 0..n {
+        let bytes = noise(i as u64, 1 + (i * 7919) % (300 << 10));
+        c.put(&format!("blocks.{}.w{i}", i / 16), &Dtype::U8, &[bytes.len() as u64], Data::Plain(Source::Read(&mut &bytes[..]))).unwrap();
+    }
+    let (w8, scale) = (noise(7, 3 * MIB + 5), noise(8, 4096 * 3));
+    let (mut w8_bytes, mut scale_bytes) = (&w8[..], &scale[..]);
+    let parts = vec![
+        PartData { role: "weight".into(), dtype: Dtype::U8, shape: vec![w8.len() as u64], data: Source::Read(&mut w8_bytes) },
+        PartData { role: "scale".into(), dtype: Dtype::U8, shape: vec![scale.len() as u64], data: Source::Read(&mut scale_bytes) },
+    ];
+    let encoding = Encoding { scheme: "acme-q".into(), params: Default::default() };
+    c.put("quantized", &Dtype::U8, &[1], Data::Encoded { encoding, parts }).unwrap();
+    let big = noise(9, 64 * MIB + 12_345);
+    c.put("big", &Dtype::U8, &[big.len() as u64], Data::Plain(Source::Read(&mut &big[..]))).unwrap();
+    w.commit().unwrap();
+    Checkpoint::folder(dir, None, None).unwrap()
+}
+
+#[test]
+fn many_destinations_at_once_from_a_writers_folder() {
+    let scratch = Scratch::new("many");
+    let ck = written(&scratch.0, 400);
+    let Body::Data(big) = ck.tensor("unet", "big").unwrap().body else { unreachable!() };
+    assert_eq!(ck.header().spans(&big).len(), 2, "past the grid, big spans two chunks");
+    sweep(&ck, "many");
+    evict(&ck);
+    let cold = read_everything(&ck, 0, &ReadOpts::default());
+    if direct_ok(&ck) {
+        assert!(cold.direct - cold.bounced > big.length - MIB as u64, "big lands in place: {cold:?}");
+    }
+
+    let (gbps, direct) = io::disk(&scratch.0).unwrap();
+    println!("disk probe: {gbps:.2} GB/s, direct {direct}");
+    assert!(gbps > 0.0 && direct == direct_ok(&ck));
+    assert_eq!(io::ceiling(None, &scratch.0).unwrap().disk_gbps, gbps, "measured once per volume");
+    assert_eq!(io::ceiling(Some(0), &scratch.0).unwrap_err().kind(), std::io::ErrorKind::Unsupported);
+}
+
+/// Host read GB/s on this machine against `cat` and `dd iflag=direct` over the same chunk files
+/// (`TENSORFS_IO_BENCH_GB`, default 4). Run with `--ignored --nocapture`.
+#[test]
+#[ignore]
+fn host_read_speed() {
+    let gb: usize = std::env::var("TENSORFS_IO_BENCH_GB").map_or(4, |v| v.parse().unwrap());
+    let scratch = Scratch::new("speed");
+    let mut w = Writer::folder(&scratch.0, "", None, false).unwrap();
+    let mut c = w.component("transformer", "", Default::default(), None).unwrap();
+    let block = noise(1, 48 * MIB);
+    for i in 0..gb * 1024 / 48 {
+        let mut bytes = block.clone();
+        bytes[..8].copy_from_slice(&(i as u64).to_le_bytes());
+        c.put(&format!("blocks.{i}.weight"), &Dtype::U8, &[bytes.len() as u64], Data::Plain(Source::Read(&mut &bytes[..]))).unwrap();
+        for j in 0..8 {
+            let small = noise((i * 8 + j) as u64, 512 << 10);
+            c.put(&format!("blocks.{i}.norm{j}"), &Dtype::U8, &[small.len() as u64], Data::Plain(Source::Read(&mut &small[..]))).unwrap();
+        }
+    }
+    w.commit().unwrap();
+    let ck = Checkpoint::folder(&scratch.0, None, None).unwrap();
+    let all = ranges(&ck);
+    let total: u64 = all.iter().map(|r| r.3.length).sum();
+    let files: Vec<String> = (0..ck.header().chunks.len()).map(|i| ck.chunk_path(i).display().to_string()).collect();
+    let rate = |secs: f64| total as f64 / secs / 1e9;
+    let shell = |cmd: &str| {
+        evict(&ck);
+        let t = Instant::now();
+        assert!(Command::new("bash").arg("-c").arg(cmd).status().unwrap().success(), "{cmd}");
+        t.elapsed().as_secs_f64()
+    };
+    let list = files.join(" ");
+    println!("bench: {:.2} GB in {} chunks", total as f64 / 1e9, files.len());
+    println!("cat (cold): {:.2} GB/s", rate(shell(&format!("cat {list} > /dev/null"))));
+    println!("dd iflag=direct bs=16M, one file at a time (cold): {:.2} GB/s", rate(shell(&format!("for f in {list}; do dd if=$f of=/dev/null bs=16M iflag=direct status=none; done"))));
+    println!("disk probe: {:?}", io::disk(&scratch.0).unwrap());
+    let mut bufs: Vec<Buf> = all.iter().map(|r| Buf::new(r.3.length as usize, 0)).collect();
+    for (threads, request) in [(16, MIB), (16, 512 << 10), (16, 4 * MIB), (16, 16 * MIB), (8, MIB), (32, MIB), (4, MIB)] {
+        let opts = ReadOpts { threads, request, ..ReadOpts::default() };
+        let targets: Vec<Target> = (all.iter().zip(&mut bufs))
+            .map(|((c, k, role, _), b)| Target { component: c, key: k, role, offset: 0, dst: b.dst() })
+            .collect();
+        for cell in ["cold", "warm"] {
+            if cell == "cold" {
+                evict(&ck);
+            }
+            // SAFETY: each destination is its own live buffer.
+            let s = unsafe { ck.read_into(&targets, &opts) }.unwrap();
+            println!("engine {cell} threads {threads} request {} KiB: {:.2} GB/s ({s:?})", request >> 10, s.gbps());
+        }
+    }
+    for (b, (c, k, _, _)) in bufs.iter().zip(&all).step_by(97) {
+        assert!(b.bytes() == ck.read(c, k).unwrap(), "{c}/{k}");
+    }
+}

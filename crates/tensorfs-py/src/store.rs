@@ -633,8 +633,8 @@ impl PyCheckpoint {
         };
         let (dtype, shape) = (t.dtype.clone(), t.shape.clone());
         let mut buf = Aligned::new(length as usize);
-        py.detach(|| ck.read_into(&component, &key, buf.bytes_mut()))
-            .or_raise(py)?;
+        let bytes = py.detach(|| ck.read(&component, &key)).or_raise(py)?;
+        buf.bytes_mut().copy_from_slice(&bytes);
         Ok(PyArray {
             buf: Arc::new(buf),
             dtype,
