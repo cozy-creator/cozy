@@ -1048,11 +1048,22 @@ impl Pool {
 
     fn clear_unborn(&self, plan: &str, start: usize, degree: u32, reservation: u64) {
         let mut owners = self.accounting.lock().unwrap();
+        let survivor = self.leaders.lock().unwrap().values()
+            .find(|(birth, p, lane)| p == plan && *lane == start && !birth.ended().unwrap_or(false))
+            .map(|(birth, _, _)| birth.clone());
         for (index, device) in (start..).zip(self.lane(start, degree).unwrap_or_default()) {
             let key = (plan.to_owned(), index);
             if owners.get(&key).is_some_and(|owner| owner.reservation == reservation && owner.birth.is_none()) {
-                device.memory.with(|gpu| gpu.ended(plan));
-                owners.remove(&key);
+                if let Some(survivor) = &survivor {
+                    owners.get_mut(&key).unwrap().birth = Some(survivor.clone());
+                    if index == start {
+                        device.memory.with(|gpu| gpu.spawned(plan, survivor.pid));
+                    }
+                } else {
+                    device.memory.finished(plan);
+                    device.memory.with(|gpu| gpu.ended(plan));
+                    owners.remove(&key);
+                }
             }
         }
         let key = session_key(plan, start);
@@ -3883,7 +3894,7 @@ fn known(value: Option<i64>) -> Option<u64> {
 fn rank_context(reply: &Frame, rank: usize) -> Option<u64> {
     let own = match rank {
         0 => reply.plane.as_ref(),
-        _ => reply.rank_planes.get(rank - 1).and_then(|owner| owner.birth.as_ref()),
+        _ => reply.rank_planes.get(rank - 1).and_then(Option::as_ref),
     };
     own.and_then(|plane| known(plane.context_bytes))
 }
@@ -3914,7 +3925,7 @@ fn rank_facts(
     };
     let mut each = vec![facts];
     for rank in 1..degree.max(1) as usize {
-        each.push(match ranks.get(rank - 1).and_then(|owner| owner.birth.as_ref()) {
+        each.push(match ranks.get(rank - 1).and_then(Option::as_ref) {
             Some(own) => Facts {
                 weights: facts.weights,
                 weights_floor: facts.weights_floor,
@@ -5198,6 +5209,11 @@ int nvmlDeviceGetDisplayActive(void *d, int *s) { *s = 0; return 0; }
             pool.starting(&model.construction, 0, 1);
             pool.born(&model.construction, 0, 1, birth);
         }
+        let failed_start = pool.starting(&model.construction, 0, 1);
+        pool.clear_unborn(&model.construction, 0, 1, failed_start);
+        assert!(pool.accounting.lock().unwrap().get(&(model.construction.clone(), 0))
+            .is_some_and(|owner| owner.birth.is_some()), "a failed spawn cannot erase a live sibling");
+        pool.born(&model.construction, 0, 1, &live.birth);
         pool.observe(&model.construction, 0, 1, &live.birth,
             Facts { process: Some(128), weights: Some(64), ..Default::default() }, &[], Some(true));
         assert!(ledger.snapshot().unwrap().iter().any(|row| row.pid == live.birth.pid && row.facts.resident == 64));
